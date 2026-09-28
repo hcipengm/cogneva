@@ -250,6 +250,19 @@ metric_names! {
     // to the producer, not here.
     AUDITED_LLM_REQUESTS_TOTAL => "audited_llm_requests_total",
 
+    // cog-gateway — the notification signing face.
+    //
+    // The gateway is the only holder of the platform robots' signing keys, and
+    // this counts what each request for a signature got. Labelled by `outlet`
+    // and `outcome`, and every outcome is published at zero as well: a cell of
+    // zero says the path ran and had nothing to do, an absent cell says it never
+    // ran -- and a signing face nothing calls and one that refuses everything
+    // render the same on the delivery readings alone (neither sends a message).
+    // The outlet label holds a known outlet name or the literal `unknown`; the
+    // asked-for name itself stays out of it, because the one request that
+    // carries a name from outside this process is the one that is not an outlet.
+    NOTIFICATION_SIGN_TOTAL => "cogneva_notification_sign_total",
+
     // cog-orchestrator — task delivery.
     DAG_STALLED_SCHEDULED_RECLAIMED => "cogneva_dag_stalled_scheduled_reclaimed_total",
 

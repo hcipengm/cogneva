@@ -96,6 +96,10 @@ const COUNTER_HELP: &[(&str, &str)] = &[
         "Total LLM upstream failures, excluding rate limits",
     ),
     (
+        crate::metric_names::NOTIFICATION_SIGN_TOTAL.as_str(),
+        "Requests to the notification signing face, by outlet and outcome.          `signed` is a signature handed out, `unknown_outlet` a name that is not          one of the outlets the signing rules cover, and `not_configured` an          outlet this deployment holds no key for. The last two are refusals and          they are different people's to fix: a name nothing covers is ours, a          missing key is the operator's. Read it beside the delivery readings --          a signature that is never asked for and one that is always refused both          end with no message sent, and only this series says which happened",
+    ),
+    (
         crate::metric_names::AUDITED_LLM_REQUESTS_TOTAL.as_str(),
         "Requests offered to the audited document channel, by outcome. Every \
          cell is published at zero on purpose: without the zero, a channel the \

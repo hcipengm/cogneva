@@ -183,6 +183,12 @@ spec:
             - name: COGNEVA_GITEE_API_BASE
               value: "http://cogneva-security-gateway:8081/gitee"
             # git 传输（PR 发布 clone/push）走网关 HTTPS 代理。
+            # 通知机器人签名借用面：机器人报文要签名时向安全网关借一对
+            # (timestamp, sign)，平台密钥不出网关。本 Pod 跑的是同一个二进制、
+            # 装的是同一套插件，所以这条与主应用那份必须同源——少一条，这个
+            # 进程发出的通知就退回未签名，而平台会以「签名校验失败」拒收。
+            - name: COGNEVA_NOTIFICATION_SIGN_BASE
+              value: "http://cogneva-security-gateway:8081"
             - name: COGNEVA_GIT_PROXY_BASE
               value: "http://cogneva-security-gateway:8081/git"
             # 实例身份指纹：身份的规范来源，安装期生成、升级复用。身份决定

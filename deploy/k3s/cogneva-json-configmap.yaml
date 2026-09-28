@@ -158,6 +158,7 @@ data:
         "COGNEVA_NOTIFICATION_DINGTALK_URL": "gateway.notification_dingtalk.webhook_url",
         "COGNEVA_NOTIFICATION_FEISHU_URL": "gateway.notification_feishu.webhook_url",
         "COGNEVA_NOTIFICATION_WECHAT_WORK_URL": "gateway.notification_wechat_work.webhook_url",
+        "COGNEVA_NOTIFICATION_SIGN_BASE": "gateway.notification_sign_base",
         "COGNEVA_STREAM_CAPACITY": "tuning.stream_capacity",
         "COGNEVA_HIGH_WATERMARK": "tuning.high_watermark",
         "COGNEVA_LOW_WATERMARK": "tuning.low_watermark",
@@ -306,7 +307,8 @@ data:
         "notification_webhook_url": null,
         "notification_dingtalk": null,
         "notification_feishu": null,
-        "notification_wechat_work": null
+        "notification_wechat_work": null,
+        "notification_sign_base": null
       },
       "metrics": {
         "enabled": true,

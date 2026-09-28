@@ -12,12 +12,17 @@ fn address(address: &Option<String>) -> Option<&str> {
     address.as_deref().filter(|a| !a.is_empty())
 }
 
-/// The address and secret behind a platform robot config, if it carries an
-/// address. A robot config without a URL is not an outlet.
-fn platform_parts(cfg: &Option<cog_core::PlatformWebhookConfig>) -> Option<(&str, Option<&str>)> {
+/// The address behind a platform robot config, if it carries one. A robot
+/// config without a URL is not an outlet.
+///
+/// The address is all this module reads from a robot config: the platform's
+/// signing key is not here and cannot be — it lives behind the security
+/// gateway, and a dispatcher asks the gateway for a signature instead (see
+/// [`crate::sign`]).
+fn robot_url(cfg: &Option<cog_core::PlatformWebhookConfig>) -> Option<&str> {
     cfg.as_ref()
         .filter(|c| !c.webhook_url.is_empty())
-        .map(|c| (c.webhook_url.as_str(), c.secret.as_deref()))
+        .map(|c| c.webhook_url.as_str())
 }
 
 /// The name of each outlet, in registration order.
@@ -74,13 +79,13 @@ fn enabled_outlets(config: &cog_core::Config) -> Vec<&'static str> {
     if address(&gateway.notification_webhook_url).is_some() {
         outlets.push("webhook");
     }
-    if platform_parts(&gateway.notification_dingtalk).is_some() {
+    if robot_url(&gateway.notification_dingtalk).is_some() {
         outlets.push("dingtalk");
     }
-    if platform_parts(&gateway.notification_feishu).is_some() {
+    if robot_url(&gateway.notification_feishu).is_some() {
         outlets.push("feishu");
     }
-    if platform_parts(&gateway.notification_wechat_work).is_some() {
+    if robot_url(&gateway.notification_wechat_work).is_some() {
         outlets.push("wechat-work");
     }
     outlets
@@ -122,6 +127,16 @@ impl cog_core::SystemPlugin for NotificationPlugin {
 
         let http_client = ctx.require_service::<dyn cog_core::HttpClient>()?;
 
+        // 签名者：这个部署把签名端点指到哪儿，机器人报文就去哪儿借签名。没指＝
+        // 不签名（机器人用关键词安全是合法形态），两条平台出口照常投递。
+        let signer: Option<Arc<dyn crate::sign::NotificationSigner>> =
+            address(&config.gateway.notification_sign_base).map(|base| {
+                Arc::new(crate::sign::GatewaySigner::new(
+                    http_client.clone(),
+                    base.to_string(),
+                )) as Arc<dyn crate::sign::NotificationSigner>
+            });
+
         if let Some(url) = address(&config.gateway.notification_webhook_url) {
             let webhook =
                 crate::WebhookDispatcher::new(http_client.clone(), url.to_string(), OUTLET_WEBHOOK);
@@ -129,29 +144,29 @@ impl cog_core::SystemPlugin for NotificationPlugin {
             info!(webhook_url = %url, "Generic notification webhook dispatcher enabled");
         }
 
-        if let Some((url, secret)) = platform_parts(&config.gateway.notification_dingtalk) {
+        if let Some(url) = robot_url(&config.gateway.notification_dingtalk) {
             let d = crate::DingTalkDispatcher::new(
                 http_client.clone(),
                 url.to_string(),
-                secret.map(str::to_string),
+                signer.clone(),
                 OUTLET_DINGTALK,
             );
             dispatcher = dispatcher.add(Arc::new(d));
             info!("DingTalk notification dispatcher enabled");
         }
 
-        if let Some((url, secret)) = platform_parts(&config.gateway.notification_feishu) {
+        if let Some(url) = robot_url(&config.gateway.notification_feishu) {
             let d = crate::FeishuDispatcher::new(
                 http_client.clone(),
                 url.to_string(),
-                secret.map(str::to_string),
+                signer.clone(),
                 OUTLET_FEISHU,
             );
             dispatcher = dispatcher.add(Arc::new(d));
             info!("Feishu notification dispatcher enabled");
         }
 
-        if let Some((url, _)) = platform_parts(&config.gateway.notification_wechat_work) {
+        if let Some(url) = robot_url(&config.gateway.notification_wechat_work) {
             let d = crate::WeChatWorkDispatcher::new(
                 http_client.clone(),
                 url.to_string(),
@@ -219,10 +234,9 @@ mod tests {
         Some(url.to_string())
     }
 
-    fn robot(url: &str, secret: Option<&str>) -> Option<cog_core::PlatformWebhookConfig> {
+    fn robot(url: &str) -> Option<cog_core::PlatformWebhookConfig> {
         Some(cog_core::PlatformWebhookConfig {
             webhook_url: url.to_string(),
-            secret: secret.map(str::to_string),
         })
     }
 
@@ -242,7 +256,7 @@ mod tests {
     fn empty_addresses_are_not_outlets() {
         let mut config = cog_core::Config::default();
         config.gateway.notification_webhook_url = webhook("");
-        config.gateway.notification_dingtalk = robot("", None);
+        config.gateway.notification_dingtalk = robot("");
         assert!(enabled_outlets(&config).is_empty());
     }
 
@@ -258,9 +272,9 @@ mod tests {
     #[test]
     fn every_platform_robot_is_reported() {
         let mut config = cog_core::Config::default();
-        config.gateway.notification_dingtalk = robot("https://example.invalid/dt", Some("s"));
-        config.gateway.notification_feishu = robot("https://example.invalid/fs", None);
-        config.gateway.notification_wechat_work = robot("https://example.invalid/wx", None);
+        config.gateway.notification_dingtalk = robot("https://example.invalid/dt");
+        config.gateway.notification_feishu = robot("https://example.invalid/fs");
+        config.gateway.notification_wechat_work = robot("https://example.invalid/wx");
         assert_eq!(
             enabled_outlets(&config),
             vec!["dingtalk", "feishu", "wechat-work"]
@@ -272,9 +286,9 @@ mod tests {
     #[test]
     fn robot_without_address_is_not_an_outlet() {
         let mut config = cog_core::Config::default();
-        config.gateway.notification_feishu = robot("", Some("s"));
+        config.gateway.notification_feishu = robot("");
         assert!(enabled_outlets(&config).is_empty());
-        assert_eq!(platform_parts(&config.gateway.notification_feishu), None);
+        assert_eq!(robot_url(&config.gateway.notification_feishu), None);
     }
 
     /// Each declared path, written through the loader's own setter on the

@@ -2,14 +2,14 @@
 //!
 //! 一个通知发出去了还是没发出去，从进程外面读是**同一个样子**：都没有人收到。
 //! 出口配错了地址、被 NetworkPolicy 拦掉、平台以"关键词不匹配"这类自己的错误码
-//! 拒收——三种成因在调用方那侧全都只表现为"连接器返回成功"（[`crate::MultiDispatcher`]
-//! 过去把每个子出口的失败都吞掉返 `Ok(())`），于是告警发不出去这件事只能靠人去
-//! 翻某一台容器的日志。
+//! 拒收、报文要签名而签名没拿到——这些成因在调用方那侧全都只表现为"连接器返回
+//! 成功"（[`crate::MultiDispatcher`] 过去把每个子出口的失败都吞掉返 `Ok(())`），
+//! 于是告警发不出去这件事只能靠人去翻某一台容器的日志。
 //!
 //! 这里的读数就是补上这一面：每个出口每次投递的结果各计一次，
-//! `result` 把三种成因分开——它们的原因与处置人不同（网络路径 / 接收方拒绝 /
-//! 平台以报文里的错误码拒收），合并成一个标量会让最需要区分的那次失败变成
-//! "投递失败"四个字。
+//! `result` 把成因分开——它们的原因与处置人不同（网络路径 / 接收方拒绝 /
+//! 平台以报文里的错误码拒收 / 我们自己没拿到签名），合并成一个标量会让最需要
+//! 区分的那次失败变成"投递失败"四个字。
 //!
 //! 读数按进程计数（与 [`cog_core::loop_health`] 同形），所以判据读的是**增量**
 //! 而不是绝对值：一条"失败总数 > 0"的规则在第一次失败后会永远响下去，而这条
@@ -23,7 +23,7 @@ use cog_core::{DimensionSpec, Observable, RawMetric, SFResult, TraceFragment};
 /// 每次投递尝试落进的计数器，无论结果。
 ///
 /// 两个标签：`outlet`（`webhook` / `dingtalk` / `feishu` / `wechat-work`）与
-/// `result`（[`DeliveryResult`] 的四种）。标签名是**写死在渲染处的字面量**而不是
+/// `result`（[`DeliveryResult`] 的每一种）。标签名是**写死在渲染处的字面量**而不是
 /// 常量：部署侧那条"规则摘要只许点名存在的标签"的门禁按 `.with_label("...")` 的
 /// 字面量收集词汇表，写成常量它收集不到——一个拼错的标签名会一路走到读者面前变成
 /// `{result}` 这样的空占位符，而列表里没有它就没人发现。
@@ -31,7 +31,7 @@ pub const DELIVERY_TOTAL: &str = "cogneva_notification_delivery_total";
 
 /// 一次投递尝试的结果。
 ///
-/// 四种取值对应四种不同的成因与处置，标签里只放这个分类，不放平台返回的自由
+/// 五种取值对应五种不同的成因与处置，标签里只放这个分类，不放平台返回的自由
 /// 文本：文本无界，而标签是身份。平台自己那句话进日志。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DeliveryResult {
@@ -45,6 +45,12 @@ pub enum DeliveryResult {
     /// 的 `errcode` / `code` 非 0，例如"关键词不匹配"、"签名校验失败"）。
     /// 这一种最像"已送达"：HTTP 层全绿，而消息根本没进群。
     EnvelopeError,
+    /// 这个出口的报文要签名，而签名没拿到——**报文没有发出去**。
+    ///
+    /// 单列一格而不是并进 `Unreachable`：这一格的处置人在我们这侧（安全网关不可达、
+    /// 或网关说这个出口没有密钥），不是接收方；而且没有这一格的话，「签名没拿到」
+    /// 与「这条通知本来就不需要签名」在读数上同形（都没有报文出门）。
+    SignError,
 }
 
 impl DeliveryResult {
@@ -54,6 +60,7 @@ impl DeliveryResult {
             Self::Unreachable => "unreachable",
             Self::HttpError => "http_error",
             Self::EnvelopeError => "envelope_error",
+            Self::SignError => "sign_error",
         }
     }
 }
@@ -64,13 +71,14 @@ impl std::fmt::Display for DeliveryResult {
     }
 }
 
-/// 一次投递结果的全部取值。渲染时每个出口把四种都报出来（没发生的是 0），
+/// 一次投递结果的全部取值。渲染时每个出口把五种都报出来（没发生的是 0），
 /// 序列从第一次抓取就存在——判据读增量，而增量要有个起点。
-pub const ALL_RESULTS: [DeliveryResult; 4] = [
+pub const ALL_RESULTS: [DeliveryResult; 5] = [
     DeliveryResult::Ok,
     DeliveryResult::Unreachable,
     DeliveryResult::HttpError,
     DeliveryResult::EnvelopeError,
+    DeliveryResult::SignError,
 ];
 
 /// 本进程每个出口每种结果的累计次数。
@@ -200,7 +208,7 @@ mod tests {
         }
     }
 
-    /// 结果分开计：同一个出口的三种失败互不覆盖，成功也不加进失败那一格。
+    /// 结果分开计：同一个出口的每种失败互不覆盖，成功也不加进失败那一格。
     #[tokio::test]
     async fn results_are_counted_apart() {
         let health = DeliveryHealth::default();
@@ -242,7 +250,7 @@ mod tests {
         );
     }
 
-    /// 结果标签的取值域是闭集，四种各一个拼写，不重不漏。
+    /// 结果标签的取值域是闭集，每种各一个拼写，不重不漏。
     #[test]
     fn the_result_label_domain_is_a_closed_set() {
         let mut seen: Vec<&str> = ALL_RESULTS.iter().map(|r| r.as_str()).collect();

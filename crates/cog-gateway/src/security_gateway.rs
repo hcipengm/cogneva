@@ -21,6 +21,9 @@ use axum::{
     Router,
 };
 use chrono::{DateTime, Datelike, Utc};
+use cog_core::contract::platform_sign::{
+    platform_signature, PlatformOutlet, SignRefusal, SignRequest, SIGN_PATH,
+};
 use cog_core::contract::transport::{Credential, Operation, Transport};
 use cog_core::MetricsBackend;
 use cog_observability::alert_store::{AlertTransition, NewAlert, PostgresAlertStore};
@@ -149,6 +152,15 @@ pub struct SecurityGatewayConfig {
     /// Gitee webhook 口令（COGNEVA_GITEE_WEBHOOK_TOKEN）：匹配
     /// X-Gitee-Token 头或 password query 参数。未配置一律 503。
     pub gitee_webhook_token: Option<String>,
+    /// 平台机器人出口的验签密钥，按出口各一把
+    /// （`COGNEVA_NOTIFICATION_DINGTALK_SECRET` / `_FEISHU_SECRET`）。
+    ///
+    /// 密钥住在本进程，是因为只有这里够得着：业务侧零带外凭证，而主应用的
+    /// 配置面根本没有它的投递键，所以「业务自己配一把密钥来签」在部署上是不可达的。
+    /// 出口要签名时经 [`SIGN_PATH`] 借一次。未配置＝这个出口的报文不签名
+    /// （机器人用关键词安全是合法形态），端点对此**具名**拒绝而不是回一个空签名。
+    pub notification_dingtalk_secret: Option<String>,
+    pub notification_feishu_secret: Option<String>,
     /// 网关→主应用内部转发的 HMAC 签名密钥（COGNEVA_WEBHOOK_INTERNAL_SECRET）。
     /// 主应用只认这个签名，平台 secret 不出本进程。未配置时 webhook
     /// 端点一律 503（验了平台签名也无法安全转发）。
@@ -192,6 +204,17 @@ impl SecurityGatewayConfig {
         Some((id, secret))
     }
 
+    /// 某个出口的签名密钥。取值域是闭集（[`PlatformOutlet`]），所以这个 match
+    /// 是穷尽的：签名面以后多一个出口，编译器会在这里拦一次，而不是让新出口
+    /// 悄悄答"我没有密钥"——那与"没配密钥"在读数上同形。
+    fn notification_secret(&self, outlet: PlatformOutlet) -> Option<&str> {
+        let secret = match outlet {
+            PlatformOutlet::DingTalk => self.notification_dingtalk_secret.as_deref(),
+            PlatformOutlet::Feishu => self.notification_feishu_secret.as_deref(),
+        };
+        secret.filter(|s| !s.is_empty())
+    }
+
     pub fn from_env() -> Self {
         let list = |key: &str| {
             std::env::var(key)
@@ -229,6 +252,9 @@ impl SecurityGatewayConfig {
             ),
             github_webhook_secret: token("COGNEVA_GITHUB_WEBHOOK_SECRET"),
             gitee_webhook_token: token("COGNEVA_GITEE_WEBHOOK_TOKEN"),
+            // 投递键由出口表生成：名字散在各处手写就多了一处会漂的地方。
+            notification_dingtalk_secret: token(PlatformOutlet::DingTalk.secret_env()),
+            notification_feishu_secret: token(PlatformOutlet::Feishu.secret_env()),
             webhook_internal_secret: token("COGNEVA_WEBHOOK_INTERNAL_SECRET"),
             webhook_forward_url: std::env::var("COGNEVA_WEBHOOK_FORWARD_URL")
                 .unwrap_or_else(|_| "http://cogneva:9091".into()),
@@ -1415,6 +1441,45 @@ async fn publish_usage_vocabulary(state: &AppState) {
             )
             .await;
         }
+    }
+}
+
+/// 签名面上一次成功发放的结果名。
+const SIGN_OUTCOME_SIGNED: &str = "signed";
+
+/// 签名面能落进的所有格子（出口 × 结果）。
+///
+/// 声明在产出侧旁边，与 [`USAGE_OUTCOMES`] 同理：新加一个结果就不可能不被列进
+/// 这里。出口那一维只有闭集里的两个名字加上 `unknown`——问了一个不在签名面上的
+/// 名字时落进 `unknown`，问的那个名字本身是外来文本，只进日志。
+const SIGN_CELLS: [(&str, &str); 5] = [
+    (PlatformOutlet::DingTalk.as_str(), SIGN_OUTCOME_SIGNED),
+    (
+        PlatformOutlet::DingTalk.as_str(),
+        SignRefusal::NotConfigured.code(),
+    ),
+    (PlatformOutlet::Feishu.as_str(), SIGN_OUTCOME_SIGNED),
+    (
+        PlatformOutlet::Feishu.as_str(),
+        SignRefusal::NotConfigured.code(),
+    ),
+    ("unknown", SignRefusal::UnknownOutlet.code()),
+];
+
+/// 启动时把签名面的格子按零摆出来。
+///
+/// 「没人来借过签名」和「来借了但每次都拒」在只数成功时同形（两者都没有签名
+/// 发出去），差别只在格子存不存在。先把格子摆出来，第二种就是一个在涨的计数，
+/// 而不是一格凭空出现的序列。
+async fn publish_sign_vocabulary(state: &AppState) {
+    for (outlet, outcome) in SIGN_CELLS {
+        record_counter_add(
+            state,
+            cog_core::metric_names::NOTIFICATION_SIGN_TOTAL,
+            0.0,
+            &[("outlet", outlet), ("outcome", outcome)],
+        )
+        .await;
     }
 }
 
@@ -3295,6 +3360,82 @@ async fn gitee_oauth_exchange_handler(
     }
 }
 
+/// POST /v1/notification/sign — 业务侧借一次机器人报文签名。
+///
+/// 请求体只说出口；时间戳由本进程的时钟取，与签名同源。挂在代码平台通道那条
+/// 借用面上（与 `/v1/oauth/*` 同一条），因为它的性质相同：业务要的东西在这里，
+/// 而这里的东西不出这个进程。
+///
+/// 两种拒绝都具名（有界短码过边界）：问了一个不在签名面上的出口是**我们**的事，
+/// 手上没有这个出口的密钥是**运维**的事。合成一句「签名不可用」会把这两件事
+/// 的处置人一起弄丢。
+async fn notification_sign_handler(
+    State(state): State<AppState>,
+    Json(body): Json<SignRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(outlet) = PlatformOutlet::from_name(&body.outlet) else {
+        // 出口名是外来文本：进标签的只能是闭集里的名字，这里落成字面量
+        // `unknown`，问的那个名字进日志。
+        tracing::warn!(asked = %body.outlet, "签名：问了一个没有签名口径的出口");
+        record_counter(
+            &state,
+            cog_core::metric_names::NOTIFICATION_SIGN_TOTAL,
+            &[
+                ("outlet", "unknown"),
+                ("outcome", SignRefusal::UnknownOutlet.code()),
+            ],
+        )
+        .await;
+        return sign_refusal_response(SignRefusal::UnknownOutlet);
+    };
+
+    let Some(secret) = state.config.notification_secret(outlet) else {
+        record_counter(
+            &state,
+            cog_core::metric_names::NOTIFICATION_SIGN_TOTAL,
+            &[
+                ("outlet", outlet.as_str()),
+                ("outcome", SignRefusal::NotConfigured.code()),
+            ],
+        )
+        .await;
+        return sign_refusal_response(SignRefusal::NotConfigured);
+    };
+
+    let signature = platform_signature(outlet, secret, Utc::now());
+    let Ok(value) = serde_json::to_value(&signature) else {
+        // 两个字符串组成的结构到此不会失败；真失败了也不能回一个空签名——
+        // 对端会把它当"签过了"，而平台会说签名校验失败。按网关内部错误回，
+        // 于是对端不签也不发（fail-closed）。
+        tracing::error!("签名：算出来的签名无法序列化");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "signature not representable"})),
+        );
+    };
+    record_counter(
+        &state,
+        cog_core::metric_names::NOTIFICATION_SIGN_TOTAL,
+        &[("outlet", outlet.as_str()), ("outcome", "signed")],
+    )
+    .await;
+    (StatusCode::OK, Json(value))
+}
+
+/// 一次签名拒绝的响应体。短码是过边界的那个词，hint 说清该动哪里。
+fn sign_refusal_response(refusal: SignRefusal) -> (StatusCode, Json<serde_json::Value>) {
+    let status = match refusal {
+        // 问的名字不是出口：调用方写错了。
+        SignRefusal::UnknownOutlet => StatusCode::BAD_REQUEST,
+        // 这个部署没配这个出口的密钥：与 `/v1/oauth/*` 的未配置同形。
+        SignRefusal::NotConfigured => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    (
+        status,
+        Json(serde_json::json!({"refusal": refusal.code(), "hint": refusal.hint()})),
+    )
+}
+
 #[derive(Deserialize)]
 struct GiteeOAuthRefreshBody {
     refresh_token: String,
@@ -4175,6 +4316,7 @@ fn code_channel_router() -> Router<AppState> {
             "/v1/oauth/github/exchange",
             post(github_oauth_exchange_handler),
         )
+        .route(SIGN_PATH, post(notification_sign_handler))
         .route(
             "/git/github/{*path}",
             axum::routing::any(git_github_passthrough),
@@ -4570,6 +4712,8 @@ pub async fn run(
     // upstream that answers without usage reads as a count that climbs rather
     // than as a series nobody can tell from one that was never called.
     publish_usage_vocabulary(&state).await;
+    // 同理：签名面的格子也先摆出来。
+    publish_sign_vocabulary(&state).await;
     tracing::info!(
         egress = %egress_addr,
         llm = %llm_addr,
@@ -5024,6 +5168,8 @@ mod tests {
             metrics_port: 9090,
             github_webhook_secret: None,
             gitee_webhook_token: None,
+            notification_dingtalk_secret: None,
+            notification_feishu_secret: None,
             webhook_internal_secret: None,
             webhook_forward_url: "http://cogneva:9091".into(),
             // The audited channel's settings take the same values as the deployment
@@ -6842,6 +6988,135 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
 
         let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(logged.is_empty(), "4xx 不该留痕：{logged}");
+    }
+
+    /// 走一次真实的签名路由，读回状态与 JSON 体。
+    async fn sign_call(app: Router, outlet: &str) -> (StatusCode, serde_json::Value) {
+        use tower::ServiceExt;
+        let req = axum::extract::Request::builder()
+            .uri(SIGN_PATH)
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::json!({"outlet": outlet}).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// 签名面上当前的每一格（出口, 结果）与它的计数。
+    async fn sign_cells(state: &AppState) -> std::collections::BTreeMap<(String, String), f64> {
+        state
+            .pool_obs
+            .metrics
+            .query_counter_totals(cog_core::metric_names::NOTIFICATION_SIGN_TOTAL.as_str())
+            .await
+            .expect("sign counter reading")
+            .into_iter()
+            .map(|s| {
+                (
+                    (
+                        s.labels.get("outlet").cloned().unwrap_or_default(),
+                        s.labels.get("outcome").cloned().unwrap_or_default(),
+                    ),
+                    s.value,
+                )
+            })
+            .collect()
+    }
+
+    /// 两个出口的时间戳单位是这条边界上唯一的差，而调用方**无法自查**（它自己
+    /// 没有口径）。这两位数字就是那两个平台的读数。
+    #[tokio::test(flavor = "current_thread")]
+    async fn each_signing_outlet_answers_in_its_own_timestamp_unit() {
+        let mut state = test_state(Vec::new());
+        state.config.notification_dingtalk_secret = Some("s3cr3t".into());
+        state.config.notification_feishu_secret = Some("s3cr3t".into());
+        let app = router(state, true);
+
+        let (status, ding) = sign_call(app.clone(), "dingtalk").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            ding["timestamp"].as_str().unwrap_or_default().len(),
+            13,
+            "钉钉是毫秒：{ding}"
+        );
+        assert!(!ding["sign"].as_str().unwrap_or_default().is_empty());
+
+        let (status, fei) = sign_call(app, "feishu").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            fei["timestamp"].as_str().unwrap_or_default().len(),
+            10,
+            "飞书是秒：{fei}"
+        );
+        assert_ne!(
+            fei["sign"], ding["sign"],
+            "同一把密钥、不同待签文本，签名不该相同"
+        );
+    }
+
+    /// 两种拒绝都具名，而且**按出口**：问一个不在签名面上的名字是调用方写错了
+    /// （400），手上没有这个出口的密钥是运维的事（503）；只给钉钉配了密钥不会
+    /// 把飞书的投递一起弄没。
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_signing_refusal_says_which_of_the_two_it_is() {
+        let mut state = test_state(Vec::new());
+        state.config.notification_dingtalk_secret = Some("s3cr3t".into());
+        let app = router(state, true);
+
+        let (status, body) = sign_call(app.clone(), "wechat-work").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["refusal"], "unknown_outlet");
+
+        let (status, body) = sign_call(app.clone(), "feishu").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["refusal"], "not_configured");
+
+        let (status, _) = sign_call(app, "dingtalk").await;
+        assert_eq!(status, StatusCode::OK, "另一个出口不受影响");
+    }
+
+    /// 格子从启动起就按零摆着，一次调用只动一格。没有这一步，"没人来借过签名"
+    /// 与"来借了但每次都拒"在只数成功时是同形的——两者都没有签名发出去。
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_signing_vocabulary_is_published_at_zero_and_moves_one_cell() {
+        let mut state = test_state(Vec::new());
+        state.config.notification_dingtalk_secret = Some("s3cr3t".into());
+        publish_sign_vocabulary(&state).await;
+
+        let before = sign_cells(&state).await;
+        assert_eq!(before.len(), SIGN_CELLS.len(), "每个格子都在：{before:?}");
+        assert!(
+            before.values().all(|v| *v == 0.0),
+            "先按零摆出来：{before:?}"
+        );
+
+        let app = router(state.clone(), true);
+        let (_, refused) = sign_call(app.clone(), "feishu").await;
+        assert_eq!(refused["refusal"], "not_configured");
+        let (status, _) = sign_call(app, "dingtalk").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let after = sign_cells(&state).await;
+        let cell = |outlet: &str, outcome: &str| {
+            *after
+                .get(&(outlet.to_string(), outcome.to_string()))
+                .unwrap_or_else(|| panic!("没有 {outlet}/{outcome} 这一格：{after:?}"))
+        };
+        assert_eq!(cell("dingtalk", "signed"), 1.0);
+        assert_eq!(cell("feishu", SignRefusal::NotConfigured.code()), 1.0);
+        assert_eq!(cell("feishu", "signed"), 0.0);
+        assert_eq!(cell("dingtalk", SignRefusal::NotConfigured.code()), 0.0);
+        assert_eq!(cell("unknown", SignRefusal::UnknownOutlet.code()), 0.0);
     }
 
     /// 桩上游：记录收到的请求头，供"标识有没有真的发出去"这类断言使用。

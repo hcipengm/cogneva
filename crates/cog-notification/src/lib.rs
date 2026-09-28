@@ -5,15 +5,13 @@
 //! touching consumers.
 
 use async_trait::async_trait;
-use base64::Engine as _;
 use cog_core::{Notification, NotificationFilter, NotificationList, NotificationStore, SFResult};
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 pub mod delivery;
+pub mod sign;
 
 /// 一次 HTTP 投递的结果，除了报文里那层判断之外的全部。
 ///
@@ -360,14 +358,14 @@ impl cog_core::NotificationDispatcher for MultiDispatcher {
 
 // ─── Platform-specific webhook dispatchers ───
 
-fn hmac_sha256_base64(secret: &str, data: &str) -> String {
-    type HmacSha256 = Hmac<Sha256>;
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
-    mac.update(data.as_bytes());
-    let result = mac.finalize();
-    let bytes = result.into_bytes();
-    base64::engine::general_purpose::STANDARD.encode(bytes)
+/// 把签名里的三种字符按查询串的写法转义。
+///
+/// base64 的字母表里有 `+` `/` `=`，直接进查询串会被对端读成空格、路径分隔与赋值，
+/// 而平台是**先解码再验签**的——不转义的症状就是「签名校验失败」，看着像密钥不对。
+fn encode_query(sign: &str) -> String {
+    sign.replace('+', "%2B")
+        .replace('/', "%2F")
+        .replace('=', "%3D")
 }
 
 /// DingTalk (钉钉) robot webhook dispatcher.
@@ -375,7 +373,8 @@ fn hmac_sha256_base64(secret: &str, data: &str) -> String {
 pub struct DingTalkDispatcher {
     http_client: Arc<dyn cog_core::HttpClient>,
     webhook_url: String,
-    secret: Option<String>,
+    /// 签名从安全网关借（密钥不在本进程）；`None` 表示这个部署不签名。
+    signer: Option<Arc<dyn sign::NotificationSigner>>,
     outlet: &'static str,
 }
 
@@ -383,13 +382,13 @@ impl DingTalkDispatcher {
     pub fn new(
         http_client: Arc<dyn cog_core::HttpClient>,
         webhook_url: impl Into<String>,
-        secret: Option<String>,
+        signer: Option<Arc<dyn sign::NotificationSigner>>,
         outlet: &'static str,
     ) -> Self {
         Self {
             http_client,
             webhook_url: webhook_url.into(),
-            secret,
+            signer,
             outlet,
         }
     }
@@ -399,14 +398,29 @@ impl DingTalkDispatcher {
 impl cog_core::NotificationDispatcher for DingTalkDispatcher {
     async fn dispatch(&self, notification: &cog_core::Notification) -> cog_core::SFResult<()> {
         let mut url = self.webhook_url.clone();
-        if let Some(ref secret) = self.secret {
-            let timestamp = chrono::Utc::now().timestamp_millis();
-            let sign = hmac_sha256_base64(secret, &format!("{}\n{}", timestamp, secret));
-            let sign_encoded = sign
-                .replace('+', "%2B")
-                .replace('/', "%2F")
-                .replace('=', "%3D");
-            url.push_str(&format!("&timestamp={}&sign={}", timestamp, sign_encoded));
+        // 钉钉把 `(timestamp, sign)` 放进 URL 查询串。
+        match sign::signature_for(
+            &self.signer,
+            cog_core::contract::platform_sign::PlatformOutlet::DingTalk,
+        )
+        .await
+        {
+            sign::SignAttempt::Signed(signature) => {
+                url.push_str(&format!(
+                    "&timestamp={}&sign={}",
+                    signature.timestamp,
+                    encode_query(&signature.sign)
+                ));
+            }
+            sign::SignAttempt::Unsigned => {}
+            sign::SignAttempt::Failed(e) => {
+                delivery::record(self.outlet, delivery::DeliveryResult::SignError);
+                return Err(delivery_error(
+                    self.outlet,
+                    delivery::DeliveryResult::SignError,
+                    e,
+                ));
+            }
         }
 
         let payload = serde_json::json!({
@@ -436,7 +450,8 @@ impl cog_core::NotificationDispatcher for DingTalkDispatcher {
 pub struct FeishuDispatcher {
     http_client: Arc<dyn cog_core::HttpClient>,
     webhook_url: String,
-    secret: Option<String>,
+    /// 签名从安全网关借（密钥不在本进程）；`None` 表示这个部署不签名。
+    signer: Option<Arc<dyn sign::NotificationSigner>>,
     outlet: &'static str,
 }
 
@@ -444,13 +459,13 @@ impl FeishuDispatcher {
     pub fn new(
         http_client: Arc<dyn cog_core::HttpClient>,
         webhook_url: impl Into<String>,
-        secret: Option<String>,
+        signer: Option<Arc<dyn sign::NotificationSigner>>,
         outlet: &'static str,
     ) -> Self {
         Self {
             http_client,
             webhook_url: webhook_url.into(),
-            secret,
+            signer,
             outlet,
         }
     }
@@ -459,14 +474,30 @@ impl FeishuDispatcher {
 #[async_trait]
 impl cog_core::NotificationDispatcher for FeishuDispatcher {
     async fn dispatch(&self, notification: &cog_core::Notification) -> cog_core::SFResult<()> {
-        let timestamp = chrono::Utc::now().timestamp().to_string();
-        let sign = self
-            .secret
-            .as_ref()
-            .map(|secret| hmac_sha256_base64(secret, &format!("{}\n{}", timestamp, secret)));
+        // 飞书把 `(timestamp, sign)` 放进请求体，时间戳是秒（钉钉是毫秒进查询串）——
+        // 这一处差异由契约层按出口算好，这里只负责摆位置。
+        let (timestamp, sign) = match sign::signature_for(
+            &self.signer,
+            cog_core::contract::platform_sign::PlatformOutlet::Feishu,
+        )
+        .await
+        {
+            sign::SignAttempt::Signed(signature) => {
+                (Some(signature.timestamp), Some(signature.sign))
+            }
+            sign::SignAttempt::Unsigned => (None, None),
+            sign::SignAttempt::Failed(e) => {
+                delivery::record(self.outlet, delivery::DeliveryResult::SignError);
+                return Err(delivery_error(
+                    self.outlet,
+                    delivery::DeliveryResult::SignError,
+                    e,
+                ));
+            }
+        };
 
         let payload = serde_json::json!({
-            "timestamp": &timestamp,
+            "timestamp": timestamp,
             "sign": sign,
             "msg_type": "text",
             "content": {
@@ -664,6 +695,118 @@ mod tests {
             assert_eq!(counted(name, expected), before + 1, "{name}");
             assert_eq!(counted(name, delivery::DeliveryResult::Ok), 0, "{name}");
         }
+    }
+
+    /// 记录发出去的那一条请求，供"签名摆在哪"这类断言使用。
+    #[derive(Debug)]
+    struct RecordingUpstream {
+        sent: std::sync::Mutex<Vec<cog_core::HttpRequest>>,
+    }
+
+    #[async_trait]
+    impl cog_core::HttpClient for RecordingUpstream {
+        async fn execute(
+            &self,
+            req: cog_core::HttpRequest,
+        ) -> cog_core::SFResult<cog_core::HttpResponse> {
+            self.sent.lock().unwrap().push(req);
+            Ok(cog_core::HttpResponse {
+                status: 200,
+                headers: std::collections::HashMap::new(),
+                body: br#"{"errcode":0}"#.to_vec(),
+            })
+        }
+    }
+
+    /// 照着给定的一对签名回答的签名者。
+    ///
+    /// 要断的是"业务侧把这一对摆到了哪儿"，签名本身怎么算出来的是契约层的测试
+    /// 在断（那里对着一个独立实现算的定值），这里再用它算一遍只会证明代码与它
+    /// 自己一致。
+    #[derive(Debug)]
+    struct FixedSigner(cog_core::contract::platform_sign::PlatformSignature);
+
+    #[async_trait]
+    impl crate::sign::NotificationSigner for FixedSigner {
+        async fn sign(
+            &self,
+            _outlet: cog_core::contract::platform_sign::PlatformOutlet,
+        ) -> Result<cog_core::contract::platform_sign::PlatformSignature, crate::sign::SignError>
+        {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn fixed_signer(
+        timestamp: &str,
+        sign: &str,
+    ) -> Option<Arc<dyn crate::sign::NotificationSigner>> {
+        Some(Arc::new(FixedSigner(
+            cog_core::contract::platform_sign::PlatformSignature {
+                timestamp: timestamp.into(),
+                sign: sign.into(),
+            },
+        )))
+    }
+
+    /// 钉钉把签名摆进 URL 查询串，且 base64 里那三个字符按查询串的写法转义——
+    /// 不转义的症状是平台回一句「签名校验失败」，从外面看像密钥不对。
+    #[tokio::test]
+    async fn a_dingtalk_signature_lands_encoded_in_the_query_string() {
+        const OUTLET: &str = "test-sign-dingtalk";
+        let upstream = Arc::new(RecordingUpstream {
+            sent: std::sync::Mutex::new(Vec::new()),
+        });
+        let d = DingTalkDispatcher::new(
+            upstream.clone(),
+            "https://example.invalid/hook",
+            fixed_signer("1700000000123", "a+b/c="),
+            OUTLET,
+        );
+        d.dispatch(&make_notification("n8", false))
+            .await
+            .expect("平台收了");
+
+        let sent = upstream.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert!(
+            sent[0]
+                .url
+                .ends_with("&timestamp=1700000000123&sign=a%2Bb%2Fc%3D"),
+            "签名要进查询串且按查询串转义：{}",
+            sent[0].url
+        );
+    }
+
+    /// 飞书把同一对摆进请求体，且原样不转义（转义是查询串那边的写法）。同一对
+    /// 签名放错地方，两个平台都不会说"位置错了"，只会说签名不对。
+    #[tokio::test]
+    async fn a_feishu_signature_lands_in_the_body_verbatim() {
+        const OUTLET: &str = "test-sign-feishu";
+        let upstream = Arc::new(RecordingUpstream {
+            sent: std::sync::Mutex::new(Vec::new()),
+        });
+        let d = FeishuDispatcher::new(
+            upstream.clone(),
+            "https://example.invalid/hook",
+            fixed_signer("1700000000", "a+b/c="),
+            OUTLET,
+        );
+        d.dispatch(&make_notification("n9", false))
+            .await
+            .expect("平台收了");
+
+        let sent = upstream.sent.lock().unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(sent[0].body.as_deref().unwrap_or_default())
+                .expect("报文是 JSON");
+        assert_eq!(body["timestamp"], "1700000000");
+        assert_eq!(body["sign"], "a+b/c=");
+        assert!(
+            !sent[0].url.contains("sign="),
+            "飞书的签名不进查询串：{}",
+            sent[0].url
+        );
     }
 
     /// 报文读不懂不算拒收：那是我们解析不了，不是平台说没收到。判错这个方向会

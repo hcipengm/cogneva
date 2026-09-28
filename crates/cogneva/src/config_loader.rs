@@ -424,6 +424,16 @@ fn default_env_mappings() -> HashMap<String, String> {
         "COGNEVA_NOTIFICATION_WECHAT_WORK_URL".into(),
         "gateway.notification_wechat_work.webhook_url".into(),
     );
+    // 以上四条都只是地址。平台机器人的**验签密钥**没有投递键，也不该有：密钥只
+    // 住在安全网关，业务侧要签名时向网关借。这里能配的是一个借签名的地方。
+    //
+    // 键名取自契约里的常量而不是在这里再写一遍：那个常量是这条借用面在 Rust 侧
+    // 唯一的拼写，部署清单里的字面量由它钉住（有门禁读它俩比对），在这里手写一份
+    // 就多了一处会漂的拼写。
+    m.insert(
+        cog_core::contract::platform_sign::SIGN_BASE_ENV.into(),
+        "gateway.notification_sign_base".into(),
+    );
     // tuning
     // agent_pool
     // multi_backend_consumer

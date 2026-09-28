@@ -96,6 +96,10 @@ spec:
               value: "http://cogneva-security-gateway:8081/gitee"
             # git 传输（PR 发布 clone/push）走网关 HTTPS 代理，网关注入
             # 凭证；本 Pod 不再持有 deploy key 或平台 token。
+            # 通知机器人签名借用面：机器人报文要签名时向安全网关借一对
+            # (timestamp, sign)，平台密钥不出网关。未配置＝这个部署不签名。
+            - name: COGNEVA_NOTIFICATION_SIGN_BASE
+              value: "http://cogneva-security-gateway:8081"
             - name: COGNEVA_GIT_PROXY_BASE
               value: "http://cogneva-security-gateway:8081/git"
             # git 身份自举的基线仓库（owner/name）。自举循环跑在**本进程**：

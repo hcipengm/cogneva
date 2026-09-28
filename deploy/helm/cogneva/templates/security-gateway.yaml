@@ -182,6 +182,22 @@ spec:
                   name: cogneva-secrets
                   key: gitee-webhook-token
                   optional: true
+            # 通知出口机器人报文签名（钉钉/飞书各一把）：业务 Pod 零持有，
+            # 出口要签名时经 /v1/notification/sign 借一次。未配置＝该出口的报文
+            # 不签名（机器人用关键词安全是合法形态），端点具名拒绝。真实值带外
+            # 写入（kubectl edit secret cogneva-secrets），不入库。
+            - name: COGNEVA_NOTIFICATION_DINGTALK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: notification-dingtalk-secret
+                  optional: true
+            - name: COGNEVA_NOTIFICATION_FEISHU_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: notification-feishu-secret
+                  optional: true
             - name: COGNEVA_WEBHOOK_INTERNAL_SECRET
               valueFrom:
                 secretKeyRef:

@@ -398,22 +398,17 @@ impl Default for DagExecutorConfig {
 }
 
 /// Per-platform webhook configuration (DingTalk / Feishu / WeChat Work).
-/// `secret` 在 Debug 输出中脱敏。
-#[derive(Clone, Serialize, Deserialize)]
+///
+/// **只有地址。** 曾经这里还有一个 `secret`，用来自算机器人报文的签名——那条路
+/// 已废：密钥住在安全网关，业务侧要签名时向网关借一对 `(timestamp, sign)`。
+/// 字段留着比删掉更坏：它没有任何消费方，却让「把平台密钥写进配置清单」看起来
+/// 是一件被支持的事，而部署面根本没有它的投递键（`config_loader` 的映射里只有
+/// 地址三条）。
+#[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 #[derive(Default)]
 pub struct PlatformWebhookConfig {
     pub webhook_url: String,
-    pub secret: Option<String>,
-}
-
-impl std::fmt::Debug for PlatformWebhookConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PlatformWebhookConfig")
-            .field("webhook_url", &self.webhook_url)
-            .field("secret", &redacted_opt(&self.secret))
-            .finish()
-    }
 }
 
 /// Built-in access-token TTL when the config leaves it at 0. Both the JWT
@@ -470,6 +465,12 @@ pub struct GatewayConfig {
     /// WeChat Work (企业微信) robot webhook configuration.
     #[serde(default)]
     pub notification_wechat_work: Option<PlatformWebhookConfig>,
+    /// 通知出口要签名时借签名的地方（安全网关的 `/v1/notification/sign`）。
+    ///
+    /// 与 `COGNEVA_GITHUB_API_BASE` 同形：业务 Pod 零凭证，向网关借一次签名。
+    /// 未配置＝这个部署不签名（机器人用关键词安全，是合法形态）。
+    #[serde(default)]
+    pub notification_sign_base: Option<String>,
 }
 
 impl GatewayConfig {

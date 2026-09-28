@@ -531,6 +531,11 @@ secrets:
   # 平台后台轮换，写进 values 就等于进了仓库（含历史）。留空时授权码通道
   # fail-closed；设备流不需要它，不受影响。
   githubOauthClientSecret: ""
+  # 通知机器人（钉钉/飞书）的签名密钥：与上面两条同类——平台后台发给那个机器人，
+  # 不是本实例生成的，写进 values 就等于进了仓库。出口要签名时向安全网关借，
+  # 密钥只在网关进程里；留空时那些出口的报文按未签名发（用关键词安全是合法形态）。
+  notificationDingtalkSecret: ""
+  notificationFeishuSecret: ""
 
 # 贡献通道（向导第二步）：GitHub OAuth 设备流的 client_id 是 OAuth App 的
 # 公开标识（非密钥），留空时设备流不可用、向导自动回退手动 PAT；Gitee 走

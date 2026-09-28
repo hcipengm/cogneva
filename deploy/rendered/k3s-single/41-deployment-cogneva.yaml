@@ -92,6 +92,10 @@ spec:
               value: "http://cogneva-security-gateway:8081/github"
             - name: COGNEVA_GITEE_API_BASE
               value: "http://cogneva-security-gateway:8081/gitee"
+            # 通知机器人签名借用面：机器人报文要签名时向安全网关借一对
+            # (timestamp, sign)，平台密钥不出网关。未配置＝这个部署不签名。
+            - name: COGNEVA_NOTIFICATION_SIGN_BASE
+              value: "http://cogneva-security-gateway:8081"
             - name: COGNEVA_GIT_PROXY_BASE
               value: "http://cogneva-security-gateway:8081/git"
             # git 身份自举的基线仓库（owner/name）。自举循环跑在**本进程**：
