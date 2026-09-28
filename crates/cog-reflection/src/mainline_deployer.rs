@@ -921,6 +921,22 @@ fn is_image_source_unavailable(msg: &str) -> bool {
     msg.contains(IMAGE_SOURCE_UNAVAILABLE_MARKER)
 }
 
+/// 整段预算里新版本**一个 Pod 都没建成**（`updatedReplicas` 一直是 0）。
+///
+/// 这不是版本结论：控制器建 Pod 发生在新版本的任何容器跑起来之前，所以这一档
+/// 比"新副本卡在拉取上"还要早一步——那时候至少有个 Pod 可以看它的等待原因，
+/// 这里连 Pod 都没有。真正能在这里发生的只有控制面自己的事：旧副本还没退场
+/// （`maxSurge:0` 下控制器要等它先消失）、控制器自己还没轮到。判成版本类会把
+/// 一次"还没轮到"记成"这一版坏了"，并触发一次没有任何证据支持的回滚。
+///
+/// 措辞只说"没建成"，不说为什么——为什么在这条判定里读不到，编一个原因是
+/// 把猜测写成读数。
+const NEW_REVISION_NEVER_RAN_MARKER: &str = "no pod of the new revision was ever created";
+
+fn is_new_revision_never_ran(msg: &str) -> bool {
+    msg.contains(NEW_REVISION_NEVER_RAN_MARKER)
+}
+
 /// 这次失败**坏在哪**。类别说"这次失败说不说得出新版本的问题"，落点说的是
 /// "坏在哪一处"——后者是判"同 rev 反复失败是不是同一处坏"的证据。
 ///
@@ -940,6 +956,12 @@ enum FailureLocus {
     AuthDenied,
     /// 镜像源没供上镜像：新副本卡在拉取上，一次都没跑起来。
     ImageSource,
+    /// 这一版**一个 Pod 都没建成**：整段预算里 `updatedReplicas` 一直是 0，看不到
+    /// 任何属于新版本的现场（没有 Pod 可看等待原因、没有 RS 条件可看拒绝原因）。
+    /// 控制器来不及建——旧副本还没退场、或它自己没轮到——都不是这一版的属性：
+    /// 建成 Pod 发生在任何新版本的容器跑起来之前，所以这条预算到期说不出新版本
+    /// 的好坏（见 NEW_REVISION_NEVER_RAN_MARKER）。
+    NeverRan,
     /// 判定进程没走到自己的判定就被杀了：它既没写签名也没选类别，这一档由**读
     /// 的那一侧**（部署器）从 Pod 状态里读出来。三种杀法在退出码上是同一个 137，
     /// 只在 Pod 状态里分得开，所以原因跟着落点走，而不是折成一个"被杀"。
@@ -976,13 +998,14 @@ impl KilledReason {
 
 impl FailureLocus {
     /// 全部落点，供读回签名时校验值域用。
-    const ALL: [FailureLocus; 11] = [
+    const ALL: [FailureLocus; 12] = [
         FailureLocus::Unreachable,
         FailureLocus::Admission,
         FailureLocus::Placement,
         FailureLocus::Tool,
         FailureLocus::AuthDenied,
         FailureLocus::ImageSource,
+        FailureLocus::NeverRan,
         FailureLocus::Killed(KilledReason::Oom),
         FailureLocus::Killed(KilledReason::Evicted),
         FailureLocus::Killed(KilledReason::Deadline),
@@ -998,6 +1021,7 @@ impl FailureLocus {
             FailureLocus::Tool => "tool",
             FailureLocus::AuthDenied => "auth",
             FailureLocus::ImageSource => "image-source",
+            FailureLocus::NeverRan => "never-ran",
             FailureLocus::Killed(reason) => reason.as_str(),
             FailureLocus::Observed => "observed",
         }
@@ -1012,6 +1036,9 @@ impl FailureLocus {
     /// 配额"那一支也读成环境类，那一个真坏的版本就再也等不到回滚。
     ///
     /// 镜像源同理属环境：它说的是"新版本一次都没跑起来"，不是版本好坏。
+    ///
+    /// "新版本一个 Pod 都没建成"同理：控制器建 Pod 发生在新版本的任何容器跑起来
+    /// 之前，所以它连"没跑起来"都不是——是**还没轮到它**。
     ///
     /// 被杀这一档**两个阶段都按版本类**，尽管它同样是"说不出新版本好坏"。理由是
     /// 上限里装的可能是新版本自己的二进制：容器吃爆上限时，说不清是上限太小还是
@@ -1028,6 +1055,7 @@ impl FailureLocus {
                     | FailureLocus::Placement
                     | FailureLocus::Tool
                     | FailureLocus::ImageSource
+                    | FailureLocus::NeverRan
             )
         };
         if environment {
@@ -1444,12 +1472,25 @@ fn rollout_converged(out: &str) -> bool {
     let gen: u64 = parts[0].parse().unwrap_or(0);
     let obs: u64 = parts[1].parse().unwrap_or(0);
     let spec: u32 = parts[2].parse().unwrap_or(0);
-    let updated: u32 = parts[3].parse().unwrap_or(0);
+    let updated = updated_pod_count(out);
     let ready: u32 = parts[4].parse().unwrap_or(0);
     // unavailable 必须为 0：RollingUpdate 新旧副本并存时，旧副本仍 ready 会让
     // ready==spec 提前成立，但新崩溃副本计入 unavailable，不能判完成。
     let unavailable: u32 = parts.get(5).and_then(|v| v.parse().ok()).unwrap_or(0);
     obs >= gen && gen > 0 && updated == spec && ready == spec && unavailable == 0 && spec > 0
+}
+
+/// 部署态读数里 `updatedReplicas`（第 3 段）的值：控制器为新版本**建成**了几个
+/// Pod。缺字段（omitempty）与解析不出都是 0——这里问的是"有没有"，不是"有几个"，
+/// 读不到就是没读到有。
+///
+/// 它和 `rollout_converged` 读同一份读数、同一段，所以两处不能各写一份下标：
+/// 那会让"收敛"与"新版本建成过没有"在同一次读取上给出互相矛盾的答案。
+fn updated_pod_count(out: &str) -> u32 {
+    out.split('|')
+        .nth(3)
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 /// Pod 双标签选择器：主应用/网关/执行器的 name 标签都是 `cogneva`，
@@ -6674,6 +6715,10 @@ impl RolloutExecutor {
         // 回滚指令。
         let mut observed_ever = false;
         let mut last_unreachable = String::new();
+        // 整段预算里有没有见过属于新版本的一个 Pod。没有的话，超时那一刻能采到的
+        // 现场（Pod 等待原因、RS 拒绝条件）全是**旧版本**的，下面那几条环境判据
+        // 一条都够不着——预算到期只会走到最后的通用分支，被记成"这一版坏了"。
+        let mut new_pod_seen = false;
         loop {
             // 拿不到观测时沿用当前相位计预算：还没进就绪阶段就仍然是启动阶段。
             let mut starting = readiness_deadline.is_none();
@@ -6695,6 +6740,7 @@ impl RolloutExecutor {
             {
                 Ok(out) => {
                     observed_ever = true;
+                    new_pod_seen |= updated_pod_count(&out) > 0;
                     if rollout_converged(&out) {
                         let samples = self.sample_rollout_pods(t).await;
                         match rollout_pods_ready(&samples) {
@@ -6820,6 +6866,18 @@ impl RolloutExecutor {
                          complete within {}s ({phase} phase) — its pod(s) are still waiting on the \
                          image (waiting={reason}) and the new revision has not run once, so this \
                          failure says nothing about it (last: {note}{suffix})",
+                        t.deployment, budget
+                    ))
+                } else if !new_pod_seen {
+                    // 整段预算里没建成过新版本的 Pod：能采到的现场都是旧版本的，
+                    // 上面几条（排不上队、准入被拒、拉取卡住）都要求有一个属于
+                    // 新版本的现场才能成立。这一档说不出新版本的好坏——没有回滚
+                    // 对象，也没有任何新版本的证据——所以按环境类处置、不回滚。
+                    SFError::IO(format!(
+                        "{NEW_REVISION_NEVER_RAN_MARKER}: rollout of deployment/{} did not \
+                         complete within {}s and its updatedReplicas never left 0 — no pod of \
+                         the new revision was ever created, so this timeout says nothing about \
+                         it (last: {note}{suffix})",
                         t.deployment, budget
                     ))
                 } else if starting {
@@ -7598,6 +7656,21 @@ impl RolloutExecutor {
                 stage,
                 target,
                 FailureLocus::ImageSource,
+                false,
+                e,
+            ));
+        }
+        if is_new_revision_never_ran(&msg) {
+            warn!(
+                error = %e,
+                "no pod of the new revision was ever created, so this timeout says nothing \
+                 about it; keeping the new revision (no rollback) — the controller had not got \
+                 round to it, and rolling back would spend a rollback on no evidence at all"
+            );
+            return Err(RolloutFailure::at(
+                stage,
+                target,
+                FailureLocus::NeverRan,
                 false,
                 e,
             ));
@@ -12498,8 +12571,10 @@ exit 0
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().to_path_buf();
         // 快照（.image jsonpath）返回各部署当前镜像；rollout 查询（generation
-        // jsonpath）：第一个目标 security-gateway 永远不完成（observedGeneration
-        // 落后），其余正常。set image 都成功。
+        // jsonpath）：第一个目标 security-gateway 永远不完成——**它的新副本建成过**
+        // （updatedReplicas=1）却一直不 ready，所以这是版本类的超时、要回滚；写成
+        // updatedReplicas=0 会落到"新版本一个 Pod 都没建成"那一档（环境类、不回滚），
+        // 那是另一个用例的事。其余正常。set image 都成功。
         let log = bin_dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
@@ -12517,7 +12592,7 @@ done
 case "$*" in
   *generation*)
     case "$*" in
-      *cogneva-security-gateway*) echo "1|0|1|0|0|" ;;
+      *cogneva-security-gateway*) echo "1|1|1|1|0|" ;;
       *) echo "1|1|1|1|1|" ;;
     esac ;;
   *"initContainers"*) ;;
@@ -12554,6 +12629,74 @@ exit 0
         assert!(
             calls.contains("set image deployment/cogneva-security-gateway security-gateway=localhost:30500/cogneva:main-new"),
             "rollout should set failed target to new pull-endpoint tag: {calls}"
+        );
+    }
+
+    /// 整段预算里新版本**一个 Pod 都没建成**：读数永远是 `1|1|1|||1`
+    /// （`updatedReplicas` 缺席），所以超时那一刻能采到的现场全是旧版本的——
+    /// 没有 Pod 可看等待原因、RS 上也没有拒绝条件。这一档说不出新版本的好坏，
+    /// 必须记成环境类且**不回滚**：判成版本类会把一次"还没轮到"记成"这一版坏了"，
+    /// 再花一次没有任何证据支持的回滚。
+    #[tokio::test]
+    async fn a_rollout_that_never_created_a_pod_of_the_new_revision_is_not_a_version_verdict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let log = bin_dir.join("kubectl.log");
+        // `updatedReplicas` 一直是空（缺席）——`1|1|1|||1` 就是现场那条读数。
+        // 其余（快照、init 容器、pods、events）与"能收敛"的那份替身一致。
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    case "$a" in
+      jsonpath=*) ;;
+      *) echo "error: unable to match a printer suitable for the output format \"$a\"" >&2; exit 2 ;;
+    esac
+  fi
+  prev="$a"
+done
+case "$*" in
+  *generation*) echo "1|1|1|||1" ;;
+  *"initContainers"*) ;;
+  *".image"*) echo "localhost:30500/cogneva:main-old" ;;
+  *"get pods"*) echo "0 true " ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display()
+        );
+        write_fake_bin(&bin_dir, "fake-kubectl", &script);
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            0,
+            1,
+            1,
+            1,
+        );
+        let cfg = MainlineDeployerConfig::default();
+        let plan = RolloutPlan::from_config(&cfg, "localhost:30500/cogneva:main-new".into());
+        let err = executor.run(&plan).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(NEW_REVISION_NEVER_RAN_MARKER),
+            "a timeout with no pod of the new revision must be recorded as that, not as a \
+             revision defect: {msg}"
+        );
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        // 新版本照样 apply 出去了（不带证据的判词不该反过来拦住上线）。
+        assert!(
+            calls.contains("set image deployment/cogneva-security-gateway security-gateway=localhost:30500/cogneva:main-new"),
+            "the rollout still applies the new revision: {calls}"
+        );
+        // 但没有任何 `set image …main-old`：没有证据就不回滚。
+        assert!(
+            !calls.contains("main-old"),
+            "no evidence about the new revision means no rollback: {calls}"
         );
     }
 
@@ -12898,7 +13041,9 @@ exit 0
         .unwrap();
         let log = bin_dir.join("kubectl.log");
         // 目标永远不收敛（`observedGeneration` 落后），其余照旧；支撑工作负载的代数
-        // 不变，所以没有支撑等待。
+        // 不变，所以没有支撑等待。`updatedReplicas=1`：这一档要的是"新副本建成过、
+        // 但没起来"的版本类失败；写成 0 会落到"新版本一个 Pod 都没建成"（环境类、
+        // 不回滚），那是另一个用例的事。
         let script = format!(
             r#"#!/bin/sh
 echo "$@" >> '{log}'
@@ -12911,7 +13056,7 @@ case "$*" in
   *"get statefulset -o"*) ;;
   *"get configmap -o"*) echo '{{"items":[]}}' ;;
   *"jsonpath={{.spec}}"*) echo '{{"replicas":1}}' ;;
-  *generation*) echo "1|0|1|0|0|" ;;
+  *generation*) echo "1|0|1|1|0|" ;;
   *".image"*) echo "localhost:30500/cogneva:main-old" ;;
   *"get pods"*) echo "0 true " ;;
   *) echo ok ;;
@@ -12963,6 +13108,8 @@ exit 0
         let log = bin_dir.join("kubectl.log");
         // security-gateway rollout 永不完成且新 Pod CrashLoopBackOff：
         // wait_rollout_complete 必须在首轮轮询即致命态早退，而不是等满超时。
+        // `updatedReplicas=1`：崩溃的 Pod 是新版本的副本，读数要与"有一个 Pod 在
+        // 崩溃"这个前提自洽（缺席的 updatedReplicas 说的是另一个场景）。
         let script = format!(
             r#"#!/bin/sh
 echo "$@" >> '{log}'
@@ -12979,7 +13126,7 @@ done
 case "$*" in
   *generation*)
     case "$*" in
-      *cogneva-security-gateway*) echo "1|0|1|0|0|" ;;
+      *cogneva-security-gateway*) echo "1|1|1|1|0|" ;;
       *) echo "1|1|1|1|1|" ;;
     esac ;;
   *".image"*) echo "localhost:30500/cogneva:main-old" ;;
