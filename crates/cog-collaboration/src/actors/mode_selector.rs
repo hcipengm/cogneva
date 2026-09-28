@@ -22,12 +22,16 @@ use crate::profile::{
 ///
 /// MetaLearningEngine is treated as advisory context for the LLM, never
 /// as a hard override.
+///
+/// No self-review runs here. The decision is one word taken out of the model's
+/// reply, and the stages above it are deterministic — a review of that reply
+/// could only ask the rewrite question the actor then has to ignore, so the
+/// purchase has no consumer and this actor does not offer the knob.
 #[derive(Clone)]
 pub struct ModeSelectorActor {
     agent: Option<Arc<dyn Agent>>,
     meta_learning: Option<Arc<dyn cog_core::MetaLearning>>,
     knowledge: Option<Arc<dyn cog_core::KnowledgeBackend>>,
-    self_review: Option<cog_core::SelfReviewConfig>,
 }
 
 impl ModeSelectorActor {
@@ -36,7 +40,6 @@ impl ModeSelectorActor {
             agent: None,
             meta_learning: None,
             knowledge: None,
-            self_review: None,
         }
     }
 
@@ -52,11 +55,6 @@ impl ModeSelectorActor {
 
     pub fn with_knowledge(mut self, knowledge: Arc<dyn cog_core::KnowledgeBackend>) -> Self {
         self.knowledge = Some(knowledge);
-        self
-    }
-
-    pub fn with_self_review(mut self, config: cog_core::SelfReviewConfig) -> Self {
-        self.self_review = Some(config);
         self
     }
 
@@ -302,15 +300,10 @@ impl ModeSelectorActor {
             Some(tid) => agent.prompt_for_task(tid, input).await.ok()?,
             None => agent.prompt(input).await.ok()?,
         };
-        let result_str = serde_json::to_string_pretty(&result).unwrap_or_default();
-        crate::actors::maybe_self_review(
-            agent,
-            &self.self_review,
-            &result_str,
-            "mode_selector",
-            crate::actors::ReviewBasis::HeldTo(goal.to_string()),
-        )
-        .await;
+        // Read straight out of the reply: one word, and the stages above this
+        // one already declined to decide it. A review here would buy a rewrite
+        // of that word and then read the original, so nothing is reviewed and
+        // the reply is the only purchase this actor makes.
         let text = Self::extract_text(&result);
 
         debug!(raw_response = %text, "ModeSelectorAgent LLM raw response");
