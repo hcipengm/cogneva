@@ -844,8 +844,25 @@ impl AgentRuntime {
         })
         .await?;
 
+        // The stable half of the input document (the answer contract) is hoisted
+        // to the front on its own. The whole document serializes in JSON key
+        // order, and the fields that change every attempt (`context.attempt` and
+        // friends) are exactly the ones that sort first — flattened together, the
+        // first byte already differs and the upstream prefix cache loses the
+        // entire prompt, while this contract is byte-identical throughout. See
+        // `cog_core::contract::prompt`.
+        let (contract, payload) = cog_core::contract::prompt::split_contract(input);
+        if let Some(contract) = contract {
+            // One agent is reused by the same role across turns (one turn per
+            // attempt). A contract already in this position is not inserted a
+            // second time: the same text appearing mid-conversation is paid for
+            // twice and pushes the stable prefix off the head.
+            if !self.context.starts_with_system(&contract) {
+                self.context.prepend_message(Message::system(contract));
+            }
+        }
         self.context.add_message(Message::user(
-            serde_json::to_string(&input).unwrap_or_default(),
+            serde_json::to_string(&payload).unwrap_or_default(),
         ));
 
         for iteration in 0..self.config.max_iterations {
@@ -2776,5 +2793,175 @@ mod tests {
         assert_eq!(run_usage.prompt_tokens, 400);
         assert_eq!(run_usage.completion_tokens, 300);
         assert_eq!(run_usage.llm_calls, 3);
+    }
+
+    /// Records the messages each call was sent. It answers with JSON so that one
+    /// run costs exactly one billed call (a non-JSON first draft would trigger a
+    /// second, reformat call).
+    #[derive(Default)]
+    struct RecordingLlm {
+        calls: std::sync::Mutex<Vec<Vec<Message>>>,
+    }
+
+    impl RecordingLlm {
+        fn calls(&self) -> Vec<Vec<Message>> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmClient for RecordingLlm {
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            _options: &cog_core::ChatOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            self.calls.lock().unwrap().push(messages.to_vec());
+            let (stream, producer) = cog_core::EventStream::with_capacity(4);
+            let text = r#"{"content":"ok","artifacts":[]}"#.to_string();
+            tokio::spawn(async move {
+                let mut producer = producer;
+                let _ = producer
+                    .push(AssistantMessageEvent::TextDelta {
+                        content_index: 0,
+                        delta: text.clone(),
+                        timestamp: chrono::Utc::now(),
+                    })
+                    .await;
+                producer.end(cog_core::ChatResponse {
+                    content: vec![ContentBlock::Text {
+                        text,
+                        text_signature: None,
+                    }],
+                    api: "mock".into(),
+                    provider: "mock".into(),
+                    model: "mock".into(),
+                    response_id: None,
+                    usage: cog_core::Usage::default(),
+                    stop_reason: cog_core::StopReason::Stop,
+                    error_message: None,
+                    upstream_failure: None,
+                    retry_after_secs: None,
+                    timestamp: chrono::Utc::now(),
+                });
+            });
+            Ok(stream)
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!()
+        }
+
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _options: &cog_core::ChatOptions,
+        ) -> SFResult<cog_core::ChatResponse> {
+            unimplemented!()
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    fn contract_input(attempt: u32, contract_text: &str) -> serde_json::Value {
+        serde_json::json!({
+            cog_core::contract::prompt::PROMPT_CONTRACT_KEY: {"instructions": contract_text},
+            "task": {"id": "t1"},
+            "context": {"attempt": attempt},
+        })
+    }
+
+    /// The stable half lands where the model reads first, and the user message
+    /// carries no second copy of it.
+    #[tokio::test]
+    async fn the_contract_is_hoisted_to_the_front_of_the_prompt() {
+        let llm = RecordingLlm::default();
+        let mut runtime = census_runtime("contract-front");
+        runtime
+            .run(contract_input(1, "You are the Generator"), &llm)
+            .await
+            .expect("the run delivers");
+
+        let calls = llm.calls();
+        let first = &calls[0];
+        let Message::System { content, .. } = &first[0] else {
+            panic!(
+                "the first message must be the stable half, got {:?}",
+                first[0].role()
+            );
+        };
+        assert!(
+            content.contains("You are the Generator"),
+            "the stable half itself: {content}"
+        );
+        // The varying half stays in the user message; the contract is not repeated.
+        let user = first
+            .iter()
+            .find(|m| matches!(m, Message::User { .. }))
+            .expect("a user message")
+            .content();
+        assert!(user.contains("\"attempt\":1"));
+        assert!(
+            !user.contains("You are the Generator"),
+            "sending one contract twice is paying for it twice: {user}"
+        );
+    }
+
+    /// Across two attempts of one agent, the bytes the model reads first must be
+    /// identical: a prefix cache compares from the first byte, and every byte
+    /// after the first changed one is bought again at full price. This is also
+    /// this change's reading — obtainable without quota, because it measures the
+    /// requests themselves rather than the upstream's ledger.
+    #[tokio::test]
+    async fn two_attempts_share_the_bytes_the_model_reads_first() {
+        let llm = RecordingLlm::default();
+        let mut runtime = census_runtime("contract-stable");
+        for attempt in [1, 2] {
+            runtime
+                .run(contract_input(attempt, "Emit JSON only"), &llm)
+                .await
+                .expect("the run delivers");
+        }
+
+        let calls = llm.calls();
+        let head_of = |call: &Vec<Message>| match &call[0] {
+            Message::System { content, .. } => content.clone(),
+            other => panic!(
+                "the first message must be the stable half, got {:?}",
+                other.role()
+            ),
+        };
+        assert_eq!(
+            head_of(&calls[0]),
+            head_of(&calls[1]),
+            "the first message of two attempts must be identical byte for byte"
+        );
+        // The varying half did vary — otherwise the assertion above is just
+        // another way of saying nothing happened.
+        let attempt_of = |call: &Vec<Message>| {
+            call.iter()
+                .rev()
+                .find(|m| matches!(m, Message::User { .. }))
+                .expect("a user message")
+                .content()
+        };
+        assert_ne!(attempt_of(&calls[0]), attempt_of(&calls[1]));
+        // The second attempt continues the conversation, with the contract still
+        // at the head and present exactly once.
+        assert_eq!(calls[1].len(), 4, "system message plus each round's own");
+        let systems = calls[1]
+            .iter()
+            .filter(|m| matches!(m, Message::System { .. }))
+            .count();
+        assert_eq!(
+            systems, 1,
+            "the contract must not reappear mid-conversation"
+        );
     }
 }

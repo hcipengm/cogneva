@@ -31,6 +31,32 @@ impl ContextWindow {
         self.trim_if_needed();
     }
 
+    /// Put a message at the very front.
+    ///
+    /// The stable half of the prompt (the answer contract) has to sit where the
+    /// model reads first, and only the head of the conversation is that place.
+    /// Appending it instead makes the same text appear again in the middle of the
+    /// conversation — paid for twice — and moves it out of the cacheable prefix.
+    pub fn prepend_message(&mut self, message: Message) {
+        let message = bound_tool_result(message, self.max_tokens);
+        self.current_tokens += estimate_tokens(&message.content());
+        self.messages.insert(0, message);
+        self.trim_if_needed();
+    }
+
+    /// Whether the context begins with exactly this system message.
+    ///
+    /// One agent is reused by the same role across turns (one turn per attempt),
+    /// so a contract inserted unconditionally becomes a second copy in the middle
+    /// of the conversation. "Already there" is read from the message itself, not
+    /// from a counter that could drift out of step with it.
+    pub fn starts_with_system(&self, content: &str) -> bool {
+        matches!(
+            self.messages.first(),
+            Some(Message::System { content: head, .. }) if head == content
+        )
+    }
+
     pub fn messages(&self) -> &[Message] {
         &self.messages
     }

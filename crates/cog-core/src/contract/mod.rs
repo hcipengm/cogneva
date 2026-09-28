@@ -28,6 +28,7 @@ pub mod outcome;
 pub mod platform_sign;
 pub mod plugin;
 pub mod promotion;
+pub mod prompt;
 pub mod protocol;
 pub mod quota;
 pub mod reflection;

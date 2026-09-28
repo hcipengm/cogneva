@@ -200,9 +200,20 @@ impl ExternalSkillRegistry for SkillRegistryImpl {
         })
     }
 
+    /// The skill list in id order.
+    ///
+    /// The cache is a HashMap, so its iteration order is arbitrary — and a hot
+    /// reload (`load_all` clearing the map and refilling it) is enough to change
+    /// it. This list is rendered into the first system message of the agent
+    /// prompt, where the model reads first, so a reshuffle invalidates the
+    /// upstream prefix cache for the whole prompt. Order comes from the content
+    /// (the ids), not from the container.
     async fn list(&self) -> SFResult<Vec<SkillMetadata>> {
         let cache = self.cache.read().await;
-        Ok(cache.values().map(|c| c.def.metadata.clone()).collect())
+        let mut skills: Vec<SkillMetadata> =
+            cache.values().map(|c| c.def.metadata.clone()).collect();
+        skills.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(skills)
     }
 
     async fn load_resource(&self, skill_id: &str, resource_path: &str) -> SFResult<String> {
@@ -507,5 +518,56 @@ mod tests {
                 "{id} schema missing {required_key}"
             );
         }
+    }
+
+    /// The rendered skill list must be in id order, and a hot reload must leave
+    /// it that way.
+    ///
+    /// The cache is a HashMap and `load_all` clears and refills it — precisely
+    /// the moment the iteration order can change. The list is rendered into the
+    /// first system message of the agent prompt, so a reshuffle there invalidates
+    /// the upstream prefix cache for the entire prompt. Enough skills that the
+    /// cache order matching the id order by luck is negligible.
+    #[tokio::test]
+    async fn the_skill_list_is_in_id_order_and_a_hot_reload_does_not_reshuffle_it() {
+        const COUNT: usize = 12;
+        let dir = tempfile::tempdir().unwrap();
+        let mut expected = Vec::new();
+        for i in 0..COUNT {
+            let id = format!("skill_{i:02}");
+            let skill_dir = dir.path().join(&id);
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                format!(
+                    "---\nname: Skill {i}\ndescription: synthetic skill {i}\n---\n\nbody {i}\n"
+                ),
+            )
+            .unwrap();
+            expected.push(id);
+        }
+        expected.sort();
+
+        let registry = SkillRegistryImpl::new(SkillConfig {
+            directories: vec![dir.path().to_path_buf()],
+            hot_reload_interval_secs: 60,
+        });
+
+        let ids = |skills: Vec<SkillMetadata>| -> Vec<String> {
+            skills.into_iter().map(|m| m.id).collect()
+        };
+
+        registry.load_all().await.unwrap();
+        let first = ids(registry.list().await.unwrap());
+        assert_eq!(first, expected, "the list must be in id order");
+
+        // The hot reload is the writing side of this reading: it empties the map
+        // and fills it again, which is where an unordered list would move.
+        registry.load_all().await.unwrap();
+        let second = ids(registry.list().await.unwrap());
+        assert_eq!(
+            second, first,
+            "a hot reload must not reshuffle what the prompt renders"
+        );
     }
 }

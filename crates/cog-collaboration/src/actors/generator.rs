@@ -108,20 +108,27 @@ impl GeneratorActor {
             },
         );
 
+        // The stable half: the answer contract. The change-format contract is the
+        // heaviest part of it here (it spells out how the gate will judge the
+        // diff), and it is identical byte for byte across attempts and across
+        // tasks — yet flattened into the same map as `attempt` it never reached
+        // the cacheable prefix. See `actor_input`.
+        let mut contract = serde_json::json!({});
+
         // Inject self-evolution change-generation instructions when requested.
         let is_self_evolution = task.is_self_evolution();
 
         if is_self_evolution {
-            ctx["change_generation"] = change_generation_contract();
+            contract["change_generation"] = change_generation_contract();
         } else if self.output_schema.is_none() && self.prompt_skill.is_none() {
             // Built-in contract for standard execution. Lowest precedence:
             // operator schema > prompt skill > built-in.
-            ctx["response_format"] = serde_json::json!("json");
-            ctx["output_schema"] = serde_json::json!({
+            contract["response_format"] = serde_json::json!("json");
+            contract["output_schema"] = serde_json::json!({
                 "content": "string: the produced result — the actual answer or deliverable for the goal",
                 "artifacts": [{"name": "string", "content": "string", "artifact_type": "string"}]
             });
-            ctx["instructions"] = serde_json::json!(
+            contract["instructions"] = serde_json::json!(
                 "You are the Generator actor in a Plan-Generate-Evaluate pipeline. \
                  Execute the plan in context.plan against the goal in context.goal and produce the deliverable. \
                  Put the primary result in content (the real answer, not a description of what you would do). \
@@ -133,13 +140,13 @@ impl GeneratorActor {
         // A configured output schema takes precedence over built-in prompt
         // contracts: operators own the contract.
         if let Some(ref schema) = self.output_schema {
-            ctx["output_schema"] = schema.clone();
-            ctx["response_format"] = serde_json::json!("json");
+            contract["output_schema"] = schema.clone();
+            contract["response_format"] = serde_json::json!("json");
         }
 
         // Prompt skill（SKILL.md 模板 + schema 指导）：算子 schema 优先于 skill schema。
         if let Some(ref skill) = self.prompt_skill {
-            crate::actors::apply_prompt_skill(&mut ctx, skill, self.output_schema.as_ref());
+            crate::actors::apply_prompt_skill(&mut contract, skill, self.output_schema.as_ref());
         }
 
         // Inject reference implementations if knowledge backend is wired.
@@ -160,10 +167,7 @@ impl GeneratorActor {
             }
         }
 
-        let input = serde_json::json!({
-            "task": task,
-            "context": ctx,
-        });
+        let input = crate::actors::actor_input(task, contract, ctx);
 
         let (mut output, review_basis) = match self.agent.prompt_for_task(&task.id, input).await {
             Ok(result) => {

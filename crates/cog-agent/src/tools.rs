@@ -93,12 +93,24 @@ impl ToolRegistry {
         self.tools.read().unwrap().get(name).cloned()
     }
 
+    /// The tool list in name order.
+    ///
+    /// The definitions live in a HashMap, whose iteration order is arbitrary:
+    /// stable within one process, reshuffled by the next. This list is serialized
+    /// into every LLM request, so a reshuffle re-sends a block that did not
+    /// change and loses the upstream prefix cache for everything that follows it.
+    /// Order is not part of what the tool set *is*, so it comes from the content
+    /// (the names) rather than from the container.
     pub fn list(&self) -> Vec<Tool> {
-        self.tools.read().unwrap().values().cloned().collect()
+        let mut tools: Vec<Tool> = self.tools.read().unwrap().values().cloned().collect();
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        tools
     }
 
     pub fn names(&self) -> Vec<String> {
-        self.tools.read().unwrap().keys().cloned().collect()
+        let mut names: Vec<String> = self.tools.read().unwrap().keys().cloned().collect();
+        names.sort();
+        names
     }
 
     pub async fn execute(
@@ -427,6 +439,41 @@ mod tests {
             .unwrap();
         assert_eq!(out["content"], "hello");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The tool list a request carries must come out in name order, whatever
+    /// order the definitions were registered in.
+    ///
+    /// The definitions live in a HashMap, so the order it yields is arbitrary and
+    /// changes with the process. This list is serialized into every LLM request:
+    /// a reshuffle re-sends a block that did not change and costs the upstream
+    /// prefix cache for everything after it. A small set of names can hash into
+    /// alphabetical order by luck, which would make this test pass without the
+    /// ordering; enough names makes that coincidence negligible.
+    #[test]
+    fn the_tool_list_is_in_name_order_whatever_the_registration_order() {
+        const COUNT: usize = 32;
+        let names = |i: usize| format!("tool_{i:02}");
+        let tool = |i: usize| {
+            let mut tool = builtins::read_file();
+            tool.name = names(i);
+            tool.description = format!("synthetic tool {i}");
+            tool
+        };
+
+        let registry = ToolRegistry::new();
+        // Registered in a scrambled order, so the result cannot be right by
+        // matching the insertion order either.
+        for step in 0..COUNT {
+            cog_core::ToolRegistry::register(&registry, tool((step * 7) % COUNT));
+        }
+
+        let listed: Vec<String> = registry.list().iter().map(|t| t.name.clone()).collect();
+        let expected: Vec<String> = (0..COUNT).map(names).collect();
+        assert_eq!(
+            listed, expected,
+            "the serialized tool definitions must be in name order"
+        );
     }
 
     /// In-process backend for tests: mirrors the production executor for all

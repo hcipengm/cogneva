@@ -104,6 +104,13 @@ impl PlannerActor {
             },
         );
 
+        // The stable half: the answer contract (this role's instructions, output
+        // schema, format). None of it depends on this attempt, so it must be
+        // assembled apart from `ctx` — flattened into one map, key order sorts
+        // `attempt` to the front and the contract never reaches the cacheable
+        // prefix. See `actor_input`.
+        let mut contract = serde_json::json!({});
+
         // For self-evolution tasks, the planner must emit a JSON plan that the
         // downstream PGE pipeline can parse. Change artifacts are produced by the
         // Generator later, so we explicitly tell the planner not to emit XML or
@@ -111,19 +118,19 @@ impl PlannerActor {
         let is_self_evolution = task.is_self_evolution();
 
         if is_self_evolution {
-            ctx["evolution_mode"] = serde_json::json!("generate_change");
-            ctx["response_format"] = serde_json::json!("json");
-            ctx["output_schema"] = serde_json::json!({
+            contract["evolution_mode"] = serde_json::json!("generate_change");
+            contract["response_format"] = serde_json::json!("json");
+            contract["output_schema"] = serde_json::json!({
                 "summary": "string: concise plan summary",
                 "plan": "object: structured plan details (may be empty for self-evolution execution)",
                 "sub_tasks": "array: empty for self-evolution execution, otherwise TaskSpec objects"
             });
-            ctx["example"] = serde_json::json!({
+            contract["example"] = serde_json::json!({
                 "summary": "Print the Cogneva version at startup by reading the version from Cargo.toml in main.rs",
                 "plan": { "approach": "add a version log line in the binary entry point" },
                 "sub_tasks": []
             });
-            ctx["instructions"] = serde_json::json!(
+            contract["instructions"] = serde_json::json!(
                 "You are the Planner actor. Your job is to produce a plan, NOT the change. \
                  Emit ONLY a single JSON object matching the output_schema. No markdown, no XML, no code fences, no change content. \
                  Do not output artifact tags or unified diffs; the Generator actor will create the change later."
@@ -131,8 +138,8 @@ impl PlannerActor {
         } else if self.output_schema.is_none() && self.prompt_skill.is_none() {
             // Built-in contract for standard goal decomposition. Lowest
             // precedence: operator schema > prompt skill > built-in.
-            ctx["response_format"] = serde_json::json!("json");
-            ctx["output_schema"] = serde_json::json!({
+            contract["response_format"] = serde_json::json!("json");
+            contract["output_schema"] = serde_json::json!({
                 "summary": "string: one-sentence summary of the plan",
                 "plan": {"approach": "string", "steps": ["string"]},
                 "sub_tasks": [{
@@ -144,7 +151,7 @@ impl PlannerActor {
                 }],
                 "acceptance_criteria": ["string: one verifiable criterion per entry; each must be checkable as true/false against the final output"]
             });
-            ctx["instructions"] = serde_json::json!(
+            contract["instructions"] = serde_json::json!(
                 "You are the Planner actor in a Plan-Generate-Evaluate pipeline. \
                  Read context.goal and decompose it into a small set of atomic, independently executable sub_tasks. \
                  Every sub-task must be self-contained: its input.query carries everything the executor needs. \
@@ -160,13 +167,13 @@ impl PlannerActor {
         // A configured output schema takes precedence over the built-in
         // self-evolution schema: operators own the contract.
         if let Some(ref schema) = self.output_schema {
-            ctx["output_schema"] = schema.clone();
-            ctx["response_format"] = serde_json::json!("json");
+            contract["output_schema"] = schema.clone();
+            contract["response_format"] = serde_json::json!("json");
         }
 
         // Prompt skill（SKILL.md 模板 + schema 指导）：算子 schema 优先于 skill schema。
         if let Some(ref skill) = self.prompt_skill {
-            crate::actors::apply_prompt_skill(&mut ctx, skill, self.output_schema.as_ref());
+            crate::actors::apply_prompt_skill(&mut contract, skill, self.output_schema.as_ref());
         }
 
         // Inject historical decomposition patterns if knowledge backend is wired.
@@ -192,10 +199,7 @@ impl PlannerActor {
             }
         }
 
-        let input = serde_json::json!({
-            "task": task,
-            "context": ctx,
-        });
+        let input = crate::actors::actor_input(task, contract, ctx);
 
         let mut output = match self.agent.prompt_for_task(&task.id, input).await {
             Ok(result) => {

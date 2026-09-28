@@ -140,17 +140,22 @@ impl EvaluatorActor {
             return output;
         }
 
+        // The stable half: the answer contract. See `actor_input` — the contract
+        // and this attempt's content must be assembled apart, or key order sorts
+        // `attempt` first and the contract never reaches the cacheable prefix.
+        let mut contract = serde_json::json!({});
+
         // Built-in contract for standard evaluation. Lowest precedence:
         // operator schema > prompt skill > built-in.
         if self.output_schema.is_none() && self.prompt_skill.is_none() {
-            ctx["response_format"] = serde_json::json!("json");
-            ctx["output_schema"] = serde_json::json!({
+            contract["response_format"] = serde_json::json!("json");
+            contract["output_schema"] = serde_json::json!({
                 "verdict": "pass | partial | fail",
                 "feedback": "string: what is good and what must improve",
                 "score": "integer 0-100",
                 "criteria": [{"name": "string", "score": "integer 0-100", "comment": "string"}]
             });
-            ctx["instructions"] = serde_json::json!(
+            contract["instructions"] = serde_json::json!(
                 "You are the Evaluator actor in a Plan-Generate-Evaluate pipeline. \
                  Judge whether context.generation correctly and completely accomplishes context.goal \
                  following context.plan. Score 80-100 for correct and complete results, \
@@ -167,13 +172,13 @@ impl EvaluatorActor {
         // A configured output schema takes precedence over built-in prompt
         // contracts: operators own the contract.
         if let Some(ref schema) = self.output_schema {
-            ctx["output_schema"] = schema.clone();
-            ctx["response_format"] = serde_json::json!("json");
+            contract["output_schema"] = schema.clone();
+            contract["response_format"] = serde_json::json!("json");
         }
 
         // Prompt skill（SKILL.md 模板 + schema 指导）：算子 schema 优先于 skill schema。
         if let Some(ref skill) = self.prompt_skill {
-            crate::actors::apply_prompt_skill(&mut ctx, skill, self.output_schema.as_ref());
+            crate::actors::apply_prompt_skill(&mut contract, skill, self.output_schema.as_ref());
         }
 
         // Inject common failure patterns if knowledge backend is wired.
@@ -190,10 +195,7 @@ impl EvaluatorActor {
             }
         }
 
-        let input = serde_json::json!({
-            "task": task,
-            "context": ctx,
-        });
+        let input = crate::actors::actor_input(task, contract, ctx);
 
         let (mut output, review_basis) = match self.agent.prompt_for_task(&task.id, input).await {
             Ok(result) => {
