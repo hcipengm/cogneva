@@ -16,104 +16,30 @@ metadata:
     app.kubernetes.io/component: config
 data:
   default.yaml: |-
+    # 启动兜底的 prompt 集：只放「进程起来时就必须有」的那几条。
+    # 与 system_prompts.yaml 一起被 cogneva-prompts 挂进 /etc/cogneva/prompts。
+    # 两个文件的 key 不许重名：registry 是覆盖写（`PromptRegistry::register`），
+    # 重名等于其中一份声明被静默顶掉——门禁 `prompt-keys-reconcile.test.sh` 判重。
     prompts:
       agent:default:
         content: "You are a helpful assistant."
-        version: "1.0.0"
-      agent:reflection_engine:
-        content: |
-          You are a reflection engine. Analyze the following conversation summaries
-          and generate higher-order insights such as cross-session patterns,
-          user preferences, and emerging persona traits.
-    
-          Summaries:
-          {{ summaries }}
-    
-          Return your insights as JSON conforming to the provided schema.
-          Each insight should have a category, text, importance (1-10), and confidence (0.0-1.0).
         version: "1.0.0"
     
   system_prompts.yaml: |-
     # Cogneva System Prompts
     # 所有 system prompt 集中管理，支持运行时热加载。
-    # 代码中禁止出现任何硬编码 prompt 字符串。
+    #
+    # 本文件的每一条声明都必须有读者。`deploy/scripts/tests/prompt-keys-reconcile.test.sh`
+    # 双向核对「代码里被请求的 key」与「这里声明的 key」：多一条、少一条都判红。
+    # 一条没人读的声明会让读者以为改这里就等于改行为——那比没有这条声明更坏。
+    # 启动兜底的那一条（agent:default）在 default.yaml，两个文件不许重名：
+    # registry 是覆盖写，重名就是其中一份声明被静默顶掉。
+    #
+    # 无 prompt 管理器时（进程里没装配 prompt 插件）调用方会退回代码里的兜底文本，
+    # 兜底写在 `crates/cog-reflection/src/{evolution,extractor}.rs`。同一个 key 的
+    # 两处正文必须说同一件事：只改一侧就是被读到的那一侧说了算、另一侧悄悄变旧。
     
     prompts:
-      # ==========================================================================
-      # cog-agent
-      # ==========================================================================
-      agent:default:
-        content: |
-          You are a helpful assistant.
-        version: "1.0.0"
-        description: "Default system prompt for generic agent tasks"
-        tags: ["agent", "default"]
-        active: true
-    
-      agent:reflection_engine:
-        content: |
-          You are a reflection engine. Analyze the following conversation summaries
-          and generate higher-order insights such as cross-session patterns,
-          user preferences, and emerging persona traits.
-    
-          Summaries:
-          {{ summaries }}
-    
-          Return your insights as JSON conforming to the provided schema.
-          Each insight should have a category, text, importance (1-10), and confidence (0.0-1.0).
-        version: "1.0.0"
-        description: "Reflection engine prompt for cross-session insight generation"
-        tags: ["agent", "reflection"]
-        active: true
-    
-      agent:planner:
-        content: |
-          You are a custom planning expert.
-        version: "1.0.0"
-        description: "Planner agent system prompt"
-        tags: ["agent", "planning"]
-        active: true
-    
-      agent:evaluator:
-        content: |
-          Evaluate quickly.
-        version: "1.0.0"
-        description: "Fast evaluator system prompt"
-        tags: ["agent", "evaluation"]
-        active: true
-    
-      # ==========================================================================
-      # cog-memory
-      # ==========================================================================
-      memory:extract:
-        content: |
-          Extract structured information from the following conversation or text.
-          Identify entities, relations between them, and any events mentioned.
-          Rate the importance of each extracted item on a scale of 1-10,
-          where 10 is critical information that will be valuable in future conversations,
-          and 1 is trivial.
-    
-          {{ text }}
-        version: "1.0.0"
-        description: "Memory extractor prompt for structured information extraction"
-        tags: ["memory", "extraction"]
-        active: true
-    
-      memory:summarize:
-        content: |
-          Summarize the following conversation or text, focusing on key decisions,
-          lessons learned, user preferences, and actionable insights.
-          Keep the summary concise (1-3 sentences).
-          Rate the importance of the summary on a scale of 1-10,
-          where 10 is critical information that will be valuable in future conversations,
-          and 1 is trivial.
-    
-          {{ text }}
-        version: "1.0.0"
-        description: "Memory summarizer prompt for concise summary generation"
-        tags: ["memory", "summarization"]
-        active: true
-    
       # ==========================================================================
       # cog-reflection
       # ==========================================================================
@@ -152,6 +78,9 @@ data:
         tags: ["reflection", "evolution"]
         active: true
     
+      # 答案的形状必须抄读者的解析器：生成的正文由 `EvolutionEngine::extract_unified_diff`
+      # 读，它只认 `diff --git ` / `--- a/` 起始的行，读不到就把整段作答当「概念性回答」丢掉
+      # （`.diff` 不落盘、流水线不消费）。要求 Markdown 代码块会让这条链自己踩自己的读者。
       reflection:evolution_change:
         content: |
           You are an expert Rust engineer improving an AI agent system.
@@ -160,11 +89,14 @@ data:
           {{ learning_context }}
     
           Requirement:
-          {{ module_description }}
+          {{ module_description }}{% if compile_errors is defined %}
     
-          Generate a Rust code change (or a complete small module) that
-          addresses the requirement. Output the result as a Markdown code block
-          with the filename as the header.
+          Previous attempt failed validation. Errors:
+          {{ compile_errors }}
+    
+          Please fix these errors and regenerate the change.{% endif %}
+    
+          Generate a change that addresses the requirement. Output ONLY a unified diff (starting with 'diff --git a/... b/...'), with no markdown fences and no prose. This is a Rust workspace; modify only source files under crates/**/*.rs.
         version: "1.0.0"
         description: "EvolutionEngine code change generation prompt"
         tags: ["reflection", "evolution"]
@@ -172,102 +104,38 @@ data:
     
       reflection:evolution_change_system:
         content: |
-          Respond with a Markdown code block containing the code change as a
-          unified git diff.
+          Respond with a single unified diff change and nothing else.
         version: "1.0.0"
         description: "EvolutionEngine change system instruction"
         tags: ["reflection", "evolution"]
         active: true
     
-      reflection:detector_correction:
+      reflection:evolution_tool:
         content: |
-          Review the corrected output and update best practices or system prompts accordingly.
+          You are a tool design expert for an AI agent system.
+    
+          Existing tool: {{ tool_name }}
+    
+          Observed error patterns:
+          - {{ error_patterns }}
+    
+          Generate an improved tool variant as JSON with these fields:
+          - name: tool name (suggest a new name like {{ tool_name }}_v2 or {{ tool_name }}_improved)
+          - description: concise description of what the tool does
+          - parameters: valid JSON Schema object describing input parameters
+          - implementation_hint: string describing implementation approach (e.g., "native", "wasm", "rhai")
+    
+          Respond with ONLY the JSON object.
         version: "1.0.0"
-        description: "LearningDetector correction action prompt"
-        tags: ["reflection", "detection"]
+        description: "EvolutionEngine tool variant prompt"
+        tags: ["reflection", "evolution"]
         active: true
     
-      reflection:detector_insight:
+      reflection:evolution_tool_system:
         content: |
-          Document the missing knowledge or add it to the skill registry / system prompts.
+          Respond with valid JSON tool definition only.
         version: "1.0.0"
-        description: "LearningDetector insight action prompt"
-        tags: ["reflection", "detection"]
-        active: true
-    
-      reflection:detector_feature:
-        content: |
-          Evaluate feasibility and prioritize in the product backlog.
-        version: "1.0.0"
-        description: "LearningDetector feature request action prompt"
-        tags: ["reflection", "detection"]
-        active: true
-    
-      reflection:detector_tool_error:
-        content: |
-          Review tool usage pattern; consider adding a tool-use best practice or improving tool descriptions.
-        version: "1.0.0"
-        description: "LearningDetector tool error action prompt"
-        tags: ["reflection", "detection"]
-        active: true
-    
-      reflection:discovery_success:
-        content: |
-          Produces a coherent result
-        version: "1.0.0"
-        description: "DiscoveryEngine success criterion"
-        tags: ["reflection", "discovery"]
-        active: true
-    
-      reflection:discovery_failure:
-        content: |
-          Produces a meaningful error or fallback
-        version: "1.0.0"
-        description: "DiscoveryEngine failure criterion"
-        tags: ["reflection", "discovery"]
-        active: true
-    
-      reflection:discovery_evaluate:
-        content: |
-          Extract as new skill or best practice
-        version: "1.0.0"
-        description: "DiscoveryEngine evaluation action"
-        tags: ["reflection", "discovery"]
-        active: true
-    
-      reflection:squad_misalignment:
-        content: |
-          Review planner instructions or add constraints to align generator with planner intent.
-        version: "1.0.0"
-        description: "SquadReflection misalignment action prompt"
-        tags: ["reflection", "squad"]
-        active: true
-    
-      # ==========================================================================
-      # cog-collaboration
-      # ==========================================================================
-      collaboration:evaluator:
-        content: |
-          You are an Evaluator agent. Assess the generated output against the specification.
-          Also evaluate the following boundary dimensions:
-          {% for rule in boundary_rules %}
-          - {{ rule.name }}: {{ rule.description }}{% if rule.threshold %} (threshold: {{ rule.threshold }}){% endif %}
-          {% endfor %}
-          - OutputQuality: 生成输出必须满足以下质量标准——1) 代码必须包含单元测试 2) 文档必须完整 3) 无已知安全漏洞
-          Respond with valid JSON containing: score (number 0-100), passed (boolean),
-          feedback (string), criteria (array of {name, score, comment}).
-        version: "2.1.0"
-        description: "EvaluatorActor system prompt with dynamic hard rules + embedded soft quality criteria"
-        tags: ["collaboration", "evaluation", "boundary"]
-        active: true
-    
-      collaboration:generator:
-        content: |
-          You are a Generator agent. Produce implementation based on the specification.
-          Respond with valid JSON containing: code (string), tests (string),
-          documentation (string), artifacts (array of {name, content, type}).
-        version: "1.0.0"
-        description: "GeneratorActor system prompt"
-        tags: ["collaboration", "generation"]
+        description: "EvolutionEngine tool variant system instruction"
+        tags: ["reflection", "evolution"]
         active: true
     

@@ -297,38 +297,31 @@ impl EvolutionEngine {
         action_outcomes: &[String],
     ) -> SFResult<Option<EvolutionResult>> {
         let outcomes_text = action_outcomes.join("\n- ");
-        let prompt = {
-            let mut vars = std::collections::HashMap::new();
-            vars.insert("event_pattern".to_string(), event_pattern.to_string());
-            vars.insert("action_outcomes".to_string(), outcomes_text.clone());
-            self.prompt_manager
-                .as_ref()
-                .and_then(|pm| pm.render("reflection:evolution_hook", &vars).ok())
-                .unwrap_or_else(|| format!(
-                    "You are a hook synthesis expert for an AI agent system.\n\n\
-                     Observed event pattern:\n{}\n\n\
-                     Action outcomes:\n- {}\n\n\
-                     Generate a hook definition as JSON with these fields:\n\
-                     - id: unique hook identifier (use only lowercase, numbers, hyphens)\n\
-                     - trigger: one of [on_agent_start, on_agent_end, on_task_complete, on_task_fail, on_crew_complete, on_ralph_pass, on_ralph_unrecoverable, on_squad_retry]\n\
-                     - scope: one of [global, crew, squad] (default: global)\n\
-                     - action: object with \"type\" and required fields. Types:\n\
-                       - webhook {{url, headers?}}\n\
-                       - redis_stream {{channel}}\n\
-                       - log {{level: trace|debug|info|warn|error}}\n\
-                       - notify {{user_id}}\n\
-                     - rate_limit: optional {{burst, per_second}}\n\
-                     - timeout_ms: optional integer\n\n\
-                     Respond with ONLY the JSON object.",
-                    event_pattern, outcomes_text
-                ))
-        };
+        // 这条提示词只有一个持有者，就是这里。它**不**进 `prompts/system_prompts.yaml`：
+        // 正文里指令要模型照抄的动作参数形状（`{url, headers?}`、`{channel}`…）与模板
+        // 引擎的变量起始符同形，抄进 YAML 就不再是同一段字——它会先被当成表达式。那时
+        // 要么改正文（那是改行为），要么留下一份永远渲染失败的声明（那是假声明）。
+        // 此前的调用正是后者：key 从未被声明 ⇒ `render` 每次都失败 ⇒ 这里每次都执行。
+        let prompt = format!(
+            "You are a hook synthesis expert for an AI agent system.\n\n\
+             Observed event pattern:\n{}\n\n\
+             Action outcomes:\n- {}\n\n\
+             Generate a hook definition as JSON with these fields:\n\
+             - id: unique hook identifier (use only lowercase, numbers, hyphens)\n\
+             - trigger: one of [on_agent_start, on_agent_end, on_task_complete, on_task_fail, on_crew_complete, on_ralph_pass, on_ralph_unrecoverable, on_squad_retry]\n\
+             - scope: one of [global, crew, squad] (default: global)\n\
+             - action: object with \"type\" and required fields. Types:\n\
+               - webhook {{url, headers?}}\n\
+               - redis_stream {{channel}}\n\
+               - log {{level: trace|debug|info|warn|error}}\n\
+               - notify {{user_id}}\n\
+             - rate_limit: optional {{burst, per_second}}\n\
+             - timeout_ms: optional integer\n\n\
+             Respond with ONLY the JSON object.",
+            event_pattern, outcomes_text
+        );
 
-        let system_prompt = self
-            .prompt_manager
-            .as_ref()
-            .and_then(|pm| pm.get("reflection:evolution_hook_system"))
-            .unwrap_or_else(|| "Respond with valid JSON HookDef only.".into());
+        let system_prompt = "Respond with valid JSON HookDef only.".to_string();
 
         let messages = vec![Message::system(system_prompt), Message::user(prompt)];
 
