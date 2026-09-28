@@ -135,12 +135,18 @@ spec:
           # 模式"只能由命令行说出来，不能靠镜像默认。
           command: ["/opt/cogneva/cogneva"]
           args: ["volume-walker"]
-          # 不用 Always（浮动签的默认策略）：本 Pod 的另一个容器就是那个 registry，
-          # Always 等于让这个 Pod 起来之前先向自己拉镜像——Recreate 时旧 Pod 已删，
-          # 拉取必然失败，Pod 永远起不来，整条镜像分发通道跟着断。节点缓存由分发面
-          # 保证（元启动播种 + 每节点 importer），而这份清单只会由正在运行新 rev 的
-          # 进化 Pod 应用，那一刻节点已持有该镜像。
-          imagePullPolicy: IfNotPresent
+          # 浮动签必须配 Always。这不是风格问题——`local` 这个名字由分发面在一轮
+          # 收敛之后重指，新 rev 的二进制就挂在这个名字下，而 IfNotPresent 让节点
+          # 内容库成为无人更新的权威：清单一字不差、Pod 也 Running，跑在里面的却是
+          # 上一个 rev 的二进制。2026-09-29 实测：本容器因此长期跑着不含
+          # volume-walker 子命令的旧二进制，起来就退，卷占用那条序列整条消失，部署
+          # 器的容量维护读不到数。
+          # 会不会自锁（同 Pod 的 registry 就是本容器要拉的那个服务）？不会：那个
+          # 容器自己的镜像是 registry:2、策略 IfNotPresent，从节点缓存起，它的启动
+          # 不依赖本容器就绪；Service 又开了 publishNotReadyAddresses，路由在 Pod 一
+          # 出现就存在，所以拉不到只是几秒后的一次重试。签被推进后，重试即拿到新
+          # 二进制。
+          imagePullPolicy: Always
           env:
             # 声明照卷族既有格式写（`claim=路径`），量出来的数挂在同名卷上，
             # 与其它工作负载自量挂载产出的是同一条序列。
@@ -202,12 +208,12 @@ spec:
   type: NodePort
   # 端点不看就绪：这个 Service 分发的是节点要拉取的镜像，而 Pod 的就绪还取决于
   # 走查边车那个容器。边车要跑的是"带 volume-walker 子命令的二进制"，而清单可能
-  # 先于节点缓存到达（部署器先推进裸仓、再滚四部署，GitOps 拉取端在这中间就会
-  # apply 本文件），此刻它只能拿到旧二进制、起来就退，Pod 因此 NotReady——没有
-  # 端点，节点拉不到新层，而新层正是让边车能起来的那份，分发通道被自己的边缘
-  # 卡死。放开这一个字段，边车起不来只是"读数暂时没有"：registry 照常服务，
-  # 节点缓存被 importer 推进后，边车下一次重试就拿到新二进制。就绪与否仍照常
-  # 记在 Deployment 上，容器在 CrashLoop，问题没有被藏起来。
+  # 先于 registry 里的浮动签到达（部署器先推进裸仓、再滚四部署，GitOps 拉取端在
+  # 这中间就会 apply 本文件），此刻它拉到的还是旧二进制、起来就退，Pod 因此
+  # NotReady——没有端点，节点拉不到新层，而新层正是让边车能起来的那份，分发通道
+  # 被自己的边缘卡死。放开这一个字段，边车起不来只是"读数暂时没有"：registry 照常
+  # 服务，签被分发面推进后，边车下一次拉取重试就拿到新二进制。就绪与否仍照常记在
+  # Deployment 上，容器在 CrashLoop，问题没有被藏起来。
   publishNotReadyAddresses: true
   selector:
     app.kubernetes.io/name: cogneva
