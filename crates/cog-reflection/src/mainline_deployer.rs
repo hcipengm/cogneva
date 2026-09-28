@@ -4666,6 +4666,37 @@ fn image_repository(reference: &str) -> &str {
     }
 }
 
+/// Whether this workload is the one that serves the images a rollout delivers.
+///
+/// A reference to the build inside it has to stay on the floating tag, and the
+/// reason is not taste. The cluster registry is the tag server every other
+/// container resolves against at start, and it is a single replica with a
+/// `Recreate` strategy on a ReadWriteOnce volume: moving any image in its pod
+/// template replaces the tag server. Its next start also runs a garbage
+/// collection over the whole store before it serves again — read at more than
+/// fifteen minutes on a 5.3 GB store — and every other container that (re)starts
+/// in that window fails to start, because a delivered image reference is
+/// `Always`: kubelet re-resolves the tag against the registry even when the
+/// bytes are already on the node, which is what the node's own event log
+/// recorded while the registry was being replaced. Two consecutive revisions
+/// were failed by exactly that window, one with redis's `aof-repair` init and
+/// one with the evolution pod's `seed-source` stuck in `ImagePullBackOff`. So
+/// pinning this workload means a delivery takes down the face that delivers it.
+/// What is left behind instead is a reading sidecar on the floating tag, which
+/// the node's cache advances on its own.
+///
+/// The identity is read off the workload's own label rather than a name list
+/// here, so the exemption travels with the manifest that declares what it is.
+fn serves_the_delivered_images(doc: &serde_yaml::Value) -> bool {
+    const COMPONENT_LABEL: &str = "app.kubernetes.io/component";
+    const CLUSTER_REGISTRY: &str = "cluster-registry";
+    doc.get("metadata")
+        .and_then(|m| m.get("labels"))
+        .and_then(|l| l.get(COMPONENT_LABEL))
+        .and_then(|c| c.as_str())
+        == Some(CLUSTER_REGISTRY)
+}
+
 /// Rewrite every container image in a document that belongs to *this*
 /// repository to the reference this rollout delivers, and report how many
 /// actually moved — a reference already carrying exactly this rollout's image
@@ -4682,7 +4713,9 @@ fn image_repository(reference: &str) -> &str {
 /// to come back and extend the list, and the reference that gets left out is
 /// exactly the one that stays on the floating tag and never picks up a new
 /// binary. Images from other repositories (redis, node-exporter, buildah) are
-/// left alone because their repository differs.
+/// left alone because their repository differs, and so is the workload that
+/// serves the delivered images, on its own declared label; see
+/// [`serves_the_delivered_images`].
 fn pin_app_image_refs(v: &mut serde_yaml::Value, repo: &str, image: &str) -> usize {
     const POD_LISTS: [&str; 2] = ["containers", "initContainers"];
     match v {
@@ -5006,13 +5039,25 @@ pub fn build_rollout_bundle(
                 // already knows both `deploy` and `statefulset`, picks it up.
                 // Left on the floating tag, such a reference only ever moves
                 // when the node happens to drop its cached layer, and the pod
-                // that owns it may never restart at all.
+                // that owns it may never restart at all. The one workload this
+                // must not be done to is the one serving those images — see
+                // [`serves_the_delivered_images`].
                 let mut pinned = 0usize;
+                let mut left_alone = 0usize;
                 for d in docs.iter_mut() {
+                    if serves_the_delivered_images(d) {
+                        left_alone += 1;
+                        continue;
+                    }
                     pinned += pin_app_image_refs(d, repo, image);
                 }
-                if pinned > 0 {
-                    info!(origin = %res, pinned, "support manifest: pinned every reference to this build");
+                if pinned > 0 || left_alone > 0 {
+                    info!(
+                        origin = %res,
+                        pinned,
+                        left_alone,
+                        "support manifest: pinned every reference to this build, except in the workload that serves it"
+                    );
                 }
                 support_docs.extend(docs);
             }
@@ -14116,6 +14161,50 @@ spec:
         assert!(bundle.support_yaml.contains("image: redis:7-alpine"));
     }
 
+    /// The workload that serves the delivered images keeps its references on
+    /// the floating tag, because moving one of them replaces the tag server and
+    /// every container that restarts in that window fails to pull. Both sides
+    /// are asserted, so the exemption cannot pass by stopping the pin.
+    #[test]
+    fn build_rollout_bundle_leaves_the_image_servers_own_references_alone() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "deployment.yaml".to_string(),
+            deployment_yaml("cogneva", "cogneva"),
+        );
+        files.insert(
+            "evolution-deployment.yaml".to_string(),
+            deployment_yaml("cogneva-evolution", "cogneva"),
+        );
+        files.insert(
+            "cluster-registry.yaml".to_string(),
+            "kind: Deployment\nmetadata:\n  name: cogneva-registry\n  labels:\n    \
+             app.kubernetes.io/component: cluster-registry\nspec:\n  template:\n    spec:\n      \
+             containers:\n        - name: registry\n          image: registry:2\n        \
+             - name: volume-walker\n          image: reg/cogneva:local\n"
+                .to_string(),
+        );
+        files.insert(
+            "redis-deployment.yaml".to_string(),
+            "kind: StatefulSet\nmetadata:\n  name: redis\nspec:\n  template:\n    spec:\n      \
+             initContainers:\n        - name: aof-repair\n          image: reg/cogneva:local\n      \
+             containers:\n        - name: redis\n          image: redis:7-alpine\n"
+                .to_string(),
+        );
+        let set = ReleaseSet::from_flat_dir(files);
+        let bundle = build_rollout_bundle(&set, &bundle_targets(), "reg/cogneva:main-x").unwrap();
+        assert!(
+            bundle.support_yaml.contains("image: reg/cogneva:local"),
+            "the tag server's own reference was pinned: {}",
+            bundle.support_yaml
+        );
+        assert!(
+            bundle.support_yaml.contains("image: reg/cogneva:main-x"),
+            "the pin stopped pinning altogether, not just the tag server: {}",
+            bundle.support_yaml
+        );
+    }
+
     fn bundle_targets() -> Vec<RolloutTargetConfig> {
         vec![
             RolloutTargetConfig {
@@ -14869,12 +14958,31 @@ exit 0
             // restarts it. The judgement reads the repository off this very
             // release set instead of a name list, so one more reference on the
             // producing side is one more assertion here.
-            let mut delivered: Vec<(String, String)> =
-                vec![("support.yaml".to_string(), bundle.support_yaml.clone())];
+            // The workload that serves these images is taken out of the walk on
+            // the same declaration the pin reads, for the same reason: a
+            // reference inside it cannot be moved without replacing the tag
+            // server. What the exemption leaves behind is asserted below, so
+            // the two sides cannot drift into "nothing is pinned and nobody
+            // noticed".
+            let needle = format!("{repo}:");
+            let mut delivered: Vec<(String, String)> = Vec::new();
+            let mut left_floating = 0usize;
+            for doc in serde_yaml::Deserializer::from_str(&bundle.support_yaml) {
+                let Ok(v) = serde_yaml::Value::deserialize(doc) else {
+                    continue;
+                };
+                let Ok(text) = serde_yaml::to_string(&v) else {
+                    continue;
+                };
+                if serves_the_delivered_images(&v) {
+                    left_floating += text.matches(&needle).count();
+                    continue;
+                }
+                delivered.push(("support.yaml".to_string(), text));
+            }
             for t in &bundle.targets {
                 delivered.push((t.key.clone(), t.yaml.clone()));
             }
-            let needle = format!("{repo}:");
             for (origin, text) in &delivered {
                 for (i, _) in text.match_indices(&needle) {
                     assert!(
@@ -14891,9 +14999,19 @@ exit 0
             // The reverse has to hold too, or the walk above passes by reading
             // nothing at all.
             assert!(
-                bundle.support_yaml.contains(&needle),
+                delivered.iter().any(|(_, text)| text.contains(&needle)),
                 "{profile}: {dir} — nothing outside the rolled containers references this \
                  build, so this check read nothing"
+            );
+            // And the exemption has to be seen landing on the workload that
+            // serves the images: if it stopped carrying a reference to this
+            // build, the walk would be exempting the wrong workload and this
+            // check would go on passing.
+            assert!(
+                left_floating > 0,
+                "{profile}: {dir} — the workload serving the delivered images carries no \
+                 reference this rollout would pin, so the exemption is reading the wrong \
+                 workload and the walk above is checking the wrong one"
             );
             checked.push((profile, dir));
         }
