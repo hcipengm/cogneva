@@ -3107,7 +3107,14 @@ impl MainlineDeployer {
                     self.report_rollout_resources(&job).await;
                     let target_tag = main_image(&self.pull_endpoint(), &inflight.rev);
                     warn!(rev = %rev12(&inflight.rev), "rollout job complete but deployments not on target tag (reverted by an apply?); redispatching");
-                    self.dispatch_job(&inflight.rev, &target_tag).await?;
+                    // Re-dispatch asks the same question. An external revert and
+                    // an upstream advance are often two faces of one event (what
+                    // gets reverted is the revision someone just reverted), so
+                    // re-dispatching without asking buys a rollout Job for a
+                    // revision the upstream has already left — while the next
+                    // round starts on the new tip anyway.
+                    self.roll_out(&mut state, &inflight.rev, &target_tag)
+                        .await?;
                     return Ok(());
                 }
                 Some(JobStatus::Failed) => {
@@ -3268,7 +3275,9 @@ impl MainlineDeployer {
                 phase: Phase::Pushed,
             });
             self.save_state(&state)?;
-            self.dispatch_job(&bare, &pull_tag).await?;
+            if !self.roll_out(&mut state, &bare, &pull_tag).await? {
+                return Ok(());
+            }
             state.in_flight = Some(InFlight {
                 rev: bare.clone(),
                 phase: Phase::Dispatched,
@@ -3329,7 +3338,9 @@ impl MainlineDeployer {
 
         // 4. 派滚动 Job（explosion radius 外；新镜像 smoke test）。Job 启动后
         // 自己快照各部署当前镜像作为回滚目标，无需部署器推导 prev。
-        self.dispatch_job(&bare, &pull_tag).await?;
+        if !self.roll_out(&mut state, &bare, &pull_tag).await? {
+            return Ok(());
+        }
         state.in_flight = Some(InFlight {
             rev: bare.clone(),
             phase: Phase::Dispatched,
@@ -3337,6 +3348,80 @@ impl MainlineDeployer {
         self.save_state(&state)?;
         info!(rev = %rev12(&bare), tag = %pull_tag, "mainline rollout job dispatched");
         Ok(())
+    }
+
+    /// Roll `rev` out, unless the upstream has moved past it while this round
+    /// was working on it.
+    ///
+    /// The advance decision is taken against the tip read at the top of the
+    /// round, and the round's own work sits between that decision and the
+    /// dispatch — a cold release build on the main path, the rollout that was
+    /// reverted on the re-dispatch path. That window is long enough for the
+    /// upstream to land the very change this revision reverts, and rolling it
+    /// anyway converges the deployments onto a revision the upstream has
+    /// already left — the next round then pays a second rollout Job and a
+    /// second set of workload restarts to reach a tip that was already known.
+    /// Asking again here costs one git read.
+    ///
+    /// Returns whether the rollout was dispatched. A tip that could not be read
+    /// is not an advance: holding a rollout on an unread upstream would trade a
+    /// wasted cycle for a stalled mainline, which is the worse of the two. Nor
+    /// is a tip that does not contain this revision one — a rewritten upstream
+    /// is a divergence, and the round's own advance judgement is where that
+    /// belongs.
+    async fn roll_out(
+        &self,
+        state: &mut MainlineState,
+        rev: &str,
+        pull_tag: &str,
+    ) -> SFResult<bool> {
+        let tip = match self.bare_main_rev().await {
+            Ok(tip) => match self.refresh_upstream(&tip).await {
+                Some(advanced) => advanced,
+                None => tip,
+            },
+            Err(e) => {
+                warn!(rev = %rev12(rev), error = %e, "could not re-read upstream before dispatching; rolling the revision this round decided on");
+                rev.to_string()
+            }
+        };
+        if tip != rev && self.is_ancestor(rev, &tip).await {
+            info!(
+                rev = %rev12(rev),
+                tip = %rev12(&tip),
+                "upstream moved past this revision while the round was working on it; leaving it unrolled and taking the new tip next round"
+            );
+            state.in_flight = None;
+            self.save_state(state)?;
+            self.record_supersession_reading(true).await;
+            return Ok(false);
+        }
+        self.record_supersession_reading(false).await;
+        self.dispatch_job(rev, pull_tag).await?;
+        Ok(true)
+    }
+
+    /// The guard's own reading, published on every round it runs.
+    ///
+    /// A guard whose call site is deleted leaves no evidence in any other
+    /// reading: the rollouts it would have skipped never happen, so nothing
+    /// else counts differently. Counting only the skips would leave that edit
+    /// invisible as well — no skip this round and no guard at all produce the
+    /// same absent cell. Recording the zeros too is what separates them: a cell
+    /// holding zero says the question was asked and the answer was no, an
+    /// absent cell says it was never asked.
+    async fn record_supersession_reading(&self, skipped: bool) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        use cog_core::metric_names;
+        let _ = metrics
+            .record_counter(
+                metric_names::MAINLINE_SUPERSEDED_ROLLOUT_TOTAL,
+                if skipped { 1.0 } else { 0.0 },
+                std::collections::HashMap::new(),
+            )
+            .await;
     }
 
     /// 把部署器独占的工作树对齐到目标 rev。这里没有守卫也没有"忙则跳过"：
@@ -8991,19 +9076,79 @@ exit 0
         assert_eq!(deployer.upstream_note(), "off");
     }
 
+    /// The real cargo: the first `cargo` on PATH that is not this module's
+    /// double.
+    ///
+    /// Resolved while PATH is still pristine. Every test here that prepends a
+    /// bin dir to PATH holds [`ENV_LOCK`], so a caller inside the lock sees the
+    /// environment the run started with rather than a sibling's window.
+    fn real_cargo_elsewhere(bin_dir: &Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let own = bin_dir.join("cargo");
+        std::env::var("PATH")
+            .unwrap_or_default()
+            .split(':')
+            .filter(|d| !d.is_empty())
+            .map(|d| Path::new(d).join("cargo"))
+            .find(|p| {
+                *p != own
+                    && std::fs::metadata(p)
+                        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                        .unwrap_or(false)
+            })
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    }
+
+    /// What every cargo double in this module answers before it answers as
+    /// itself: any call that is not its owner's build goes to the real cargo.
+    ///
+    /// The bin dir is first on the *process-wide* PATH for as long as its test
+    /// holds [`ENV_LOCK`], so it does not only catch the deployer's
+    /// `cargo build`: every `cargo` any test in this binary looks up by name
+    /// lands here — `change_pipeline` runs `cargo test`, the format check runs
+    /// `cargo fmt`. A double that answers those with its own exit 0 and no
+    /// output does not fail loudly, it replaces a real verdict with a passing
+    /// one: the change pipeline's baseline run then reports no failures at all,
+    /// and the change under test is refused for failures the tree already had.
+    /// That is a worse reading than a red test, so the double answers only the
+    /// one call it stands for — the release build, the only cargo invocation in
+    /// the deployer and the only one that carries `COGNEVA_GIT_REVISION` — and
+    /// hands the rest over.
+    ///
+    /// The two filenames are resolved at write time rather than at run time
+    /// because a delegated call may arrive with a cleared environment (the
+    /// verification environment is an allowlist) and nothing to look itself up
+    /// with. When no real cargo can be found the double refuses loudly instead
+    /// of answering.
+    fn cargo_double_preamble(bin_dir: &Path) -> String {
+        format!(
+            r#"real='{real}'
+if [ "$1" != build ] || [ -z "$COGNEVA_GIT_REVISION" ]; then
+  if [ -n "$real" ]; then exec "$real" "$@"; fi
+  echo "fake cargo: no real cargo beside {bin} to hand '$*' to" >&2
+  exit 127
+fi
+"#,
+            real = real_cargo_elsewhere(bin_dir),
+            bin = bin_dir.display()
+        )
+    }
+
     /// fake cargo：build_binary 靠 PATH 查找 "cargo"，假二进制必须叫这个名。
     /// 产物写进外置的共享 target 目录（工作树里不再有 target/）；接收的
     /// COGNEVA_GIT_REVISION 落盘（构建侧必须显式注入完整 rev）。
     fn fake_cargo(dir: &Path, target_dir: &Path) {
         let script = format!(
             r#"#!/bin/sh
-echo "$@" >> '{log}'
+{preamble}echo "$@" >> '{log}'
 echo "$COGNEVA_GIT_REVISION" >> '{envlog}'
 mkdir -p '{target}/release'
 echo 'fake-binary' > '{target}/release/cogneva'
 chmod +x '{target}/release/cogneva'
 exit 0
 "#,
+            preamble = cargo_double_preamble(dir),
             log = dir.join("cargo.log").display(),
             envlog = dir.join("cargo-env.log").display(),
             target = target_dir.display()
@@ -9013,6 +9158,93 @@ exit 0
 
     fn fake_strip(dir: &Path) {
         write_fake_bin(dir, "strip", "#!/bin/sh\nexit 0\n");
+    }
+
+    /// The cargo double's contract, asserted on the double itself: it answers
+    /// its owner's build and hands everything else to the real cargo.
+    ///
+    /// This is the reading behind [`cargo_double_preamble`]. The defect it
+    /// guards against is invisible from where it happens — the caller that gets
+    /// hijacked is another test's `cargo test`, inside a suite that has no idea
+    /// this binary prepends a bin dir to PATH — so the pair of calls below is
+    /// the only place the difference shows: a foreign call that *should* fail
+    /// has to fail, and the double's log has to stay empty of it.
+    ///
+    /// The lock is held for the write, not for a PATH mutation of our own: the
+    /// delegation target is resolved from PATH, and a sibling's window would
+    /// make us resolve theirs.
+    #[tokio::test]
+    async fn the_cargo_double_hands_every_foreign_call_to_the_real_cargo() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let target = tmp.path().join("target");
+        fake_cargo(&bin_dir, &target);
+        let double = bin_dir.join("cargo");
+        // A caller that reaches the double by name, as the deployer and every
+        // other cargo-invoking test do.
+        let path = format!(
+            "{}:{}",
+            bin_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let foreign = |args: &[&str]| {
+            let mut cmd = tokio::process::Command::new(&double);
+            cmd.args(args)
+                .env("PATH", &path)
+                .env_remove("COGNEVA_GIT_REVISION")
+                .current_dir(tmp.path());
+            cmd
+        };
+
+        // A foreign call answered by the real cargo: silent success would be
+        // the double speaking.
+        let version = foreign(&["--version"]).output().await.unwrap();
+        assert!(
+            version.status.success(),
+            "a delegated call must succeed: {}",
+            String::from_utf8_lossy(&version.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&version.stdout).starts_with("cargo "),
+            "this is not the real cargo's answer: {:?}",
+            String::from_utf8_lossy(&version.stdout)
+        );
+
+        // The hijack the double used to be: a `cargo test` looking up `cargo`
+        // by name, run where there is nothing to test. The real cargo refuses
+        // it; the double would have reported a green run.
+        let test_run = foreign(&["test"]).output().await.unwrap();
+        assert!(
+            !test_run.status.success(),
+            "a foreign cargo test was answered by the double instead of failing: {}",
+            String::from_utf8_lossy(&test_run.stdout)
+        );
+
+        // The owner's call is still answered here, or the delegation has eaten
+        // the build the deployer's tests are about.
+        let owner = tokio::process::Command::new(&double)
+            .args(["build", "--release", "--bin", "cogneva"])
+            .env("PATH", &path)
+            .env("COGNEVA_GIT_REVISION", "000000000000")
+            .current_dir(tmp.path())
+            .output()
+            .await
+            .unwrap();
+        assert!(owner.status.success(), "the owner's build must be answered");
+        assert!(
+            target.join("release/cogneva").is_file(),
+            "the owner's build produced no artifact"
+        );
+
+        let log = std::fs::read_to_string(bin_dir.join("cargo.log")).unwrap_or_default();
+        assert_eq!(
+            log.lines().count(),
+            1,
+            "the double answered more than its owner's build: {log}"
+        );
+        assert!(log.contains("build --release --bin cogneva"), "{log}");
     }
 
     #[tokio::test]
@@ -9265,6 +9497,171 @@ exit 0
             )
             .await
         );
+    }
+
+    /// A revision the upstream passes while this round is building it must not
+    /// be rolled out.
+    ///
+    /// The tip read at the top of the round fixes the round's target; a cold
+    /// release build follows, and the upstream can land the very change that
+    /// reverts this revision inside that window (measured: land→revert 10.7
+    /// minutes apart, so the window catches it every time). Rolling it anyway
+    /// converges the deployments onto a revision the upstream has left, and the
+    /// next round pays a second rollout Job and a second set of workload
+    /// restarts to reach a tip that was already known.
+    ///
+    /// The measured shape is reproduced by a cargo double that moves the bare
+    /// main at the moment it "compiles" the round's revision.
+    #[tokio::test]
+    // ENV_LOCK 是进程级 PATH 串行锁：PATH 是进程全局状态，必须跨 await 持有
+    // 直到被测命令跑完。
+    async fn a_rev_the_upstream_passed_while_building_is_not_rolled() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, rev_a, rev_b) = setup_repos(root).await;
+        // The round starts with the bare main at A, the revision it will decide
+        // on and build; A is an ancestor of B.
+        real_git(
+            root,
+            &[
+                "--git-dir",
+                bare.to_str().unwrap(),
+                "update-ref",
+                "refs/heads/main",
+                &rev_a,
+            ],
+        )
+        .await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, rev12(&rev_a));
+        let kubectl = fake_kubectl(&bin_dir, "reg.local:5000/cogneva:local");
+        let ws = test_workspaces(root, &bare);
+        // cargo that advances the upstream to B while it "builds" A.
+        let script = format!(
+            r#"#!/bin/sh
+{preamble}git --git-dir '{bare}' update-ref refs/heads/main {rev_b}
+mkdir -p '{target}/release'
+echo 'fake-binary' > '{target}/release/cogneva'
+chmod +x '{target}/release/cogneva'
+exit 0
+"#,
+            preamble = cargo_double_preamble(&bin_dir),
+            bare = bare.display(),
+            rev_b = rev_b,
+            target = ws.target_dir().display()
+        );
+        write_fake_bin(&bin_dir, "cargo", &script);
+        fake_strip(&bin_dir);
+
+        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let deployer = MainlineDeployer::new(cfg, ws).with_metrics(metrics.clone());
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
+        deployer.poll_once().await.unwrap();
+        std::env::set_var("PATH", old_path);
+
+        // The round really did reach the build: without this the test would pass
+        // green on a round that never started.
+        let buildah_calls =
+            std::fs::read_to_string(bin_dir.join("buildah.log")).unwrap_or_default();
+        let push_tag = main_image("reg.local:5000", &rev_a);
+        assert!(
+            buildah_calls.contains(&format!("commit ctr-test-123 {push_tag}")),
+            "this round has to have built the revision under test: {buildah_calls}"
+        );
+
+        // The compile and the push are already paid; asking before the dispatch
+        // is the whole saving.
+        let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap_or_default();
+        assert!(
+            !calls.contains(&rev12(&rev_a)),
+            "the upstream has passed this revision; no rollout job may be dispatched for it: {calls}"
+        );
+        assert!(
+            !calls.contains("apply -f -"),
+            "a revision the upstream has passed gets no manifest applied: {calls}"
+        );
+        let state = deployer.load_state();
+        assert!(
+            state.in_flight.is_none(),
+            "a skipped round must not leave the revision as its in-flight rollout: {:?}",
+            state.in_flight
+        );
+        let skipped = metrics
+            .query_counter_totals(
+                cog_core::metric_names::MAINLINE_SUPERSEDED_ROLLOUT_TOTAL.as_str(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            skipped.len(),
+            1,
+            "a skip has to leave a reading; otherwise it is indistinguishable from a round that asked and had nothing to skip: {skipped:?}"
+        );
+        assert_eq!(skipped[0].value, 1.0);
+    }
+
+    /// The guard must not hold a round whose revision is still the tip.
+    ///
+    /// This and the test above are the pair that makes the reading
+    /// distinguishable: on the skip half alone, a guard written to never
+    /// dispatch at all passes just as green.
+    #[tokio::test]
+    // 同上：ENV_LOCK 串行化进程级 PATH 修改，需跨 await 持有。
+    async fn a_rev_that_is_still_the_tip_is_rolled_out() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, rev_a, _rev_b) = setup_repos(root).await;
+        real_git(
+            root,
+            &[
+                "--git-dir",
+                bare.to_str().unwrap(),
+                "update-ref",
+                "refs/heads/main",
+                &rev_a,
+            ],
+        )
+        .await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, rev12(&rev_a));
+        let kubectl = fake_kubectl(&bin_dir, "reg.local:5000/cogneva:local");
+        let ws = test_workspaces(root, &bare);
+        fake_cargo(&bin_dir, ws.target_dir());
+        fake_strip(&bin_dir);
+
+        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let deployer = MainlineDeployer::new(cfg, ws).with_metrics(metrics.clone());
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
+        deployer.poll_once().await.unwrap();
+        std::env::set_var("PATH", old_path);
+
+        let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap_or_default();
+        assert!(
+            calls.contains(&job_name(&rev_a)),
+            "the revision is still the tip; this round must dispatch as usual: {calls}"
+        );
+        let asked = metrics
+            .query_counter_totals(
+                cog_core::metric_names::MAINLINE_SUPERSEDED_ROLLOUT_TOTAL.as_str(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            asked.len(),
+            1,
+            "the guard ran, so it leaves a reading (zero this round) — absent and asked-but-nothing-to-skip must be distinguishable: {asked:?}"
+        );
+        assert_eq!(asked[0].value, 0.0);
     }
 
     /// 回归：四部署镜像被外部写入弄成不一致（清单部分重下发、手工 set image），

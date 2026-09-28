@@ -188,6 +188,21 @@ metric_names! {
     // previous run left standing — the way these two go stale is by a run that
     // died before it could report.
     ROLLOUT_JOB_READING_UNIX => "cogneva_rollout_job_reading_unix",
+    // Rounds the deployer stopped before rolling, because the upstream landed a
+    // new tip while the revision it was about to roll was still being built —
+    // or, on the re-dispatch path, between the revision's own rollout and the
+    // re-dispatch an external apply forced.
+    //
+    // Published at zero as well as at a value, and here the zero is the whole
+    // point: every other reading of a skipped rollout is silent, so "the
+    // upstream never passed a rev mid-round" and "the guard that would notice
+    // is not wired" are the same absent cell — and a guard whose call site was
+    // deleted is exactly the second one. A cell of zero says the question was
+    // asked and the round was rolled; an absent series says nothing ever asked.
+    // The saving it counts is one rollout Job and one set of workload restarts:
+    // the compile and the image push for the superseded rev are already paid by
+    // the time the question can be asked.
+    MAINLINE_SUPERSEDED_ROLLOUT_TOTAL => "cogneva_mainline_superseded_rollout_total",
 
     // cog-gateway — request accounting.
     HTTP_REQUESTS_TOTAL => "http_requests_total",
