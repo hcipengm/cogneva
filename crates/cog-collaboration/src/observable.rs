@@ -54,11 +54,12 @@ pub const SELF_REVIEW_REVISION_UNCHANGED: &str = "unchanged";
 /// How the pipeline's independent-review gate ended for one authoring verdict.
 ///
 /// The gate is a second evaluator call asked to confirm a `Pass`, and it is the
-/// fattest prompt in the chain. Two of these cells are verdicts and two are
-/// savings, and all four are needed together: a `rejected` count on its own says
-/// nothing about how often the second call was not spent, and a series with only
-/// the two verdicts cannot be told from a deleted call site, because a call that
-/// never happens writes no cell at all.
+/// fattest prompt in the chain. Two of these cells are verdicts, two are
+/// savings, and one is the failure face of the call itself. All five are needed
+/// together: a `rejected` count on its own says nothing about how often the
+/// second call was not spent, and a series with only the two verdicts cannot be
+/// told from a deleted call site, because a call that never happens writes no
+/// cell at all.
 ///
 /// `not_asked_no_prior_verdict` is the saving: the gate asks a fresh judge to
 /// confirm a verdict the authoring evaluator reached while holding no history at
@@ -67,18 +68,67 @@ pub const SELF_REVIEW_REVISION_UNCHANGED: &str = "unchanged";
 /// verdict cannot be independent of a question that was never asked differently.
 /// `not_asked_disabled` is the same skip for the other reason: the gate is
 /// configured off in this deployment.
+///
+/// `not_answered` is what the call itself bought when it failed: the reviewer
+/// was paid and returned no verdict, so the `Pass` it was asked to confirm
+/// stands with nothing behind it. It is neither a verdict nor a saving, and
+/// without it that call would be visible only as a run that ended early.
+///
+/// Both PGE executors hold this gate (the retry pipeline and the roundtable) and
+/// both write here. The cells name the outcome, not the executor: a deployment
+/// runs one of the two for a given task, and the count of times the fat call was
+/// not spent is the same question either way. What they cover is the gate's own
+/// decisions, taken where its premise holds — a `Pass` in hand. An attempt or a
+/// round that never produced one does not reach the gate and writes nothing
+/// here; those are counted by the attempt and round readings, and summing these
+/// cells is not a count of attempts.
 pub const INDEPENDENT_REVIEW_AGREED: &str = "agreed";
 pub const INDEPENDENT_REVIEW_REJECTED: &str = "rejected";
+pub const INDEPENDENT_REVIEW_NOT_ANSWERED: &str = "not_answered";
 pub const INDEPENDENT_REVIEW_NOT_ASKED_NO_PRIOR_VERDICT: &str = "not_asked_no_prior_verdict";
 pub const INDEPENDENT_REVIEW_NOT_ASKED_DISABLED: &str = "not_asked_disabled";
 
 /// Every cell of the independent-review outcome, published at zero as well. See
 /// [`INDEPENDENT_REVIEW_AGREED`].
-pub const INDEPENDENT_REVIEW_OUTCOMES: [&str; 4] = [
+pub const INDEPENDENT_REVIEW_OUTCOMES: [&str; 5] = [
     INDEPENDENT_REVIEW_AGREED,
     INDEPENDENT_REVIEW_REJECTED,
+    INDEPENDENT_REVIEW_NOT_ANSWERED,
     INDEPENDENT_REVIEW_NOT_ASKED_NO_PRIOR_VERDICT,
     INDEPENDENT_REVIEW_NOT_ASKED_DISABLED,
+];
+
+/// What the roundtable's moderator was asked, and what it decided.
+///
+/// The moderator is consulted at the end of every round that did not reach
+/// consensus, and it is the one role handed the whole debate: one full
+/// iteration per round, so the document it reads grows with the run. Four of
+/// these cells are its decisions. The fifth counts the rounds where no
+/// moderator was configured at all, and it is the one that makes the other four
+/// readable — a deployment without a moderator writes no decision cell, which
+/// is indistinguishable from a moderator that was consulted and had nothing to
+/// say, unless the skip has a cell of its own.
+///
+/// Summed over a debate, the cells also count rounds: every round the moderator
+/// was consulted for lands in exactly one of them. A round that stopped before
+/// reaching it — a deterministic failure, a stalled loop, or a second
+/// consecutive `Pass` — leaves none of these cells, and must not look like one:
+/// each of those endings is already carried by its own reading, and folding
+/// them in here would put four different causes in one cell.
+pub const MODERATOR_CONTINUE: &str = "continue";
+pub const MODERATOR_CHANGE_STRATEGY: &str = "change_strategy";
+pub const MODERATOR_ACCEPT_PARTIAL: &str = "accept_partial";
+pub const MODERATOR_ESCALATE: &str = "escalate";
+pub const MODERATOR_NOT_ASKED_DISABLED: &str = "not_asked_disabled";
+
+/// Every cell of the moderator consultation, published at zero as well. See
+/// [`MODERATOR_CONTINUE`].
+pub const MODERATOR_OUTCOMES: [&str; 5] = [
+    MODERATOR_CONTINUE,
+    MODERATOR_CHANGE_STRATEGY,
+    MODERATOR_ACCEPT_PARTIAL,
+    MODERATOR_ESCALATE,
+    MODERATOR_NOT_ASKED_DISABLED,
 ];
 
 /// The two ends of the history a failure analysis is shown, summed in bytes of
@@ -256,6 +306,15 @@ pub struct CollaborationObservable {
     /// only these cells and their zeros do. Keyed by a `&'static str` so the
     /// cells are the constants above and a typo cannot open a fifth.
     independent_reviews: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
+    /// What the roundtable's moderator decided, over [`MODERATOR_OUTCOMES`].
+    ///
+    /// The moderator is the only role in a debate that is asked the whole
+    /// debate, so it is the one call whose document grows with the run, and it
+    /// is consulted on rounds — one iteration each — that no other reading
+    /// covers. Without these cells "the moderator had nothing to say", "no
+    /// moderator is configured" and "the round never got that far" are the same
+    /// absence. Keyed by a `&'static str` so a typo cannot open a sixth cell.
+    moderators: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
 }
 
 impl CollaborationObservable {
@@ -353,6 +412,19 @@ impl CollaborationObservable {
     pub fn record_independent_review(&self, outcome: &'static str) {
         let mut map = self
             .independent_reviews
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *map.entry(outcome).or_insert(0) += 1;
+    }
+
+    /// Record how one round of debate ended for the moderator: what it decided,
+    /// or that there was no moderator to ask.
+    ///
+    /// Synchronous because the cells are the only witness that the moderator ran
+    /// at all: a dropped count would read as rounds the moderator never saw.
+    pub fn record_moderator_consulted(&self, outcome: &'static str) {
+        let mut map = self
+            .moderators
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *map.entry(outcome).or_insert(0) += 1;
@@ -539,7 +611,7 @@ impl Observable for CollaborationObservable {
                 );
             }
 
-            // The independent-review gate's face, every cell published. The two
+            // The independent-review gate's face, every cell published. The
             // savings cells are the reason: "the gate was never asked" and "the
             // call site that asks it is gone" write the same (no) series, and
             // the second is exactly what a deleted guard looks like.
@@ -552,6 +624,22 @@ impl Observable for CollaborationObservable {
                 let count = independent.get(outcome).copied().unwrap_or(0);
                 metrics.push(
                     RawMetric::new("pge_independent_review_total", count as f64)
+                        .with_label("outcome", outcome),
+                );
+            }
+
+            // The moderator's face, every cell published. Without them the
+            // decision leaves no trace at all: whether the moderator continued,
+            // was never configured, or was never reached are the same absence.
+            let moderators = self
+                .moderators
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            for outcome in MODERATOR_OUTCOMES {
+                let count = moderators.get(outcome).copied().unwrap_or(0);
+                metrics.push(
+                    RawMetric::new("pge_moderator_consulted_total", count as f64)
                         .with_label("outcome", outcome),
                 );
             }
@@ -1244,6 +1332,7 @@ mod tests {
 
         obs.record_independent_review(INDEPENDENT_REVIEW_NOT_ASKED_NO_PRIOR_VERDICT);
         obs.record_independent_review(INDEPENDENT_REVIEW_NOT_ASKED_NO_PRIOR_VERDICT);
+        obs.record_independent_review(INDEPENDENT_REVIEW_NOT_ANSWERED);
         obs.record_independent_review(INDEPENDENT_REVIEW_AGREED);
         obs.record_independent_review(INDEPENDENT_REVIEW_REJECTED);
 
@@ -1255,10 +1344,60 @@ mod tests {
         assert_eq!(cell(&metrics, INDEPENDENT_REVIEW_AGREED), 1.0);
         assert_eq!(cell(&metrics, INDEPENDENT_REVIEW_REJECTED), 1.0);
         assert_eq!(
+            cell(&metrics, INDEPENDENT_REVIEW_NOT_ANSWERED),
+            1.0,
+            "a reviewer that was paid and answered nothing is not a saving and not a verdict"
+        );
+        assert_eq!(
             cell(&metrics, INDEPENDENT_REVIEW_NOT_ASKED_DISABLED),
             0.0,
             "a saving for one reason must not be counted as a saving for another"
         );
+    }
+
+    /// Every cell of the moderator's face is published, and each counts its own
+    /// outcome. The `not_asked_disabled` cell is the reason the others are
+    /// readable: without it, "the moderator was never configured" and "the
+    /// moderator decided Continue every round" are the same absence.
+    #[tokio::test]
+    async fn every_moderator_cell_is_published_and_counted_apart() {
+        let obs = CollaborationObservable::new();
+        let cell = |metrics: &[RawMetric], outcome: &str| {
+            metrics
+                .iter()
+                .find(|m| {
+                    m.name == "pge_moderator_consulted_total"
+                        && m.labels.get("outcome").map(String::as_str) == Some(outcome)
+                })
+                .map(|m| m.value)
+                .unwrap_or_else(|| {
+                    panic!("pge_moderator_consulted_total{{outcome=\"{outcome}\"}} must be published, at 0 when nothing was recorded")
+                })
+        };
+
+        let metrics = obs.collect_metrics("D8").await.unwrap();
+        for outcome in MODERATOR_OUTCOMES {
+            assert_eq!(
+                cell(&metrics, outcome),
+                0.0,
+                "{outcome} must be published even with nothing recorded into it"
+            );
+        }
+
+        obs.record_moderator_consulted(MODERATOR_CONTINUE);
+        obs.record_moderator_consulted(MODERATOR_CONTINUE);
+        obs.record_moderator_consulted(MODERATOR_ACCEPT_PARTIAL);
+
+        let metrics = obs.collect_metrics("D8").await.unwrap();
+        assert_eq!(cell(&metrics, MODERATOR_CONTINUE), 2.0);
+        assert_eq!(cell(&metrics, MODERATOR_ACCEPT_PARTIAL), 1.0);
+        assert_eq!(
+            cell(&metrics, MODERATOR_NOT_ASKED_DISABLED),
+            0.0,
+            "a round that was moderated must not be counted as one that had no moderator"
+        );
+        assert_eq!(cell(&metrics, MODERATOR_CHANGE_STRATEGY), 0.0);
+        assert_eq!(cell(&metrics, MODERATOR_ESCALATE), 0.0);
     }
 
     /// The extractor reads both spellings the chart uses, so a rule that moves

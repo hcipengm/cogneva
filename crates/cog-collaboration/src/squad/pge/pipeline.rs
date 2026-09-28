@@ -571,6 +571,12 @@ impl PgePipeline {
                     // reviewer never reached, and a review that answered nothing is
                     // not one of the two verdict cells either.
                     if let Some(reason) = review.terminal_env_failure_reason() {
+                        // The call was paid for and came back with no verdict.
+                        // Neither verdict cell may claim it, and it is the only
+                        // record that this failure cost a call at all.
+                        crate::observable::global_observable().record_independent_review(
+                            crate::observable::INDEPENDENT_REVIEW_NOT_ANSWERED,
+                        );
                         tracing::warn!(
                             attempt,
                             "Independent reviewer reported terminal environment failure; aborting pipeline"
@@ -1595,6 +1601,7 @@ mod tests {
             "INDEPENDENT_REVIEW_NOT_ASKED_NO_PRIOR_VERDICT",
             "INDEPENDENT_REVIEW_AGREED",
             "INDEPENDENT_REVIEW_REJECTED",
+            "INDEPENDENT_REVIEW_NOT_ANSWERED",
         ] {
             assert!(
                 gate.contains(name),

@@ -30,9 +30,13 @@ pub struct PgeRoundtableConfig {
     /// single-process tests or [`RedisContextBoard`](crate::squad::pge::RedisContextBoard)
     /// for production multi-agent debates.
     pub board_store: Option<Arc<dyn ContextBoard>>,
-    /// Optional moderator agent that reviews the full debate history when
-    /// consensus is slow to emerge (iteration >= 3) and decides whether to
-    /// continue, change strategy, accept a partial result, or escalate.
+    /// Optional moderator agent. When set, it is consulted at the end of every
+    /// round that did not end on a consensus, a deterministic stop, or a stall;
+    /// it reviews the full debate history and decides whether to continue,
+    /// change strategy, accept a partial result, or escalate. There is no
+    /// iteration threshold: the rounds that need a moderator are usually the
+    /// early ones, and those are exactly the rounds whose history is still
+    /// small enough to send whole.
     pub moderator: Option<ModeratorActor>,
     /// Optional unified knowledge backend for historical pattern retrieval.
     pub knowledge_backend: Option<Arc<dyn cog_core::KnowledgeBackend>>,
@@ -355,6 +359,28 @@ impl PgeRoundtable {
                     decision = ?mod_output.decision,
                     "Moderator decision"
                 );
+                // Mapped before the effects so every decision has to be named
+                // here: a new variant breaks the build rather than silently
+                // going uncounted. Only rounds that reach this block write a
+                // cell — one that ended earlier (a deterministic stop, a stall,
+                // a second consecutive Pass) reached no moderator at all, and
+                // writing it as one would file a round's own ending under the
+                // moderator's name.
+                let outcome = match mod_output.decision {
+                    crate::actors::moderator::ModeratorDecision::Continue => {
+                        crate::observable::MODERATOR_CONTINUE
+                    }
+                    crate::actors::moderator::ModeratorDecision::ChangeStrategy => {
+                        crate::observable::MODERATOR_CHANGE_STRATEGY
+                    }
+                    crate::actors::moderator::ModeratorDecision::AcceptPartial => {
+                        crate::observable::MODERATOR_ACCEPT_PARTIAL
+                    }
+                    crate::actors::moderator::ModeratorDecision::Escalate => {
+                        crate::observable::MODERATOR_ESCALATE
+                    }
+                };
+                crate::observable::global_observable().record_moderator_consulted(outcome);
                 match mod_output.decision {
                     crate::actors::moderator::ModeratorDecision::AcceptPartial => {
                         consensus_reached = true;
@@ -373,6 +399,14 @@ impl PgeRoundtable {
                     }
                     crate::actors::moderator::ModeratorDecision::Continue => {}
                 }
+            } else {
+                // The other reason a round ends with no moderator decision: the
+                // deployment has none configured. Without this cell the four
+                // decisions above would be unreadable — a debate with no
+                // moderator and a moderator that always said Continue write the
+                // same (no) series.
+                crate::observable::global_observable()
+                    .record_moderator_consulted(crate::observable::MODERATOR_NOT_ASKED_DISABLED);
             }
 
             if let Some(judgement) = outcome.judgement() {
@@ -412,47 +446,78 @@ impl PgeRoundtable {
         // accepted as a partial is not a Pass, and a round nobody judged has no
         // claim to re-check: in both cases there is nothing to confirm and the
         // fresh-context judge is not paid for.
-        if consensus_reached && self.config.independent_review {
+        if consensus_reached {
             if let RoundOutcome::Judged { evaluation } = &mut last.outcome {
                 if matches!(evaluation.verdict, Verdict::Pass) {
-                    let criteria: Vec<&str> = last
-                        .plan
-                        .acceptance_criteria
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect();
-                    let mut review = self
-                        .evaluator
-                        .evaluate(
-                            task,
-                            &serde_json::to_value(&last.plan).unwrap_or_default(),
-                            &serde_json::to_value(&last.generation).unwrap_or_default(),
-                            &[],
-                            &criteria,
-                            Some(&board),
-                        )
-                        .await;
-                    review.enforce_criteria_evidence(!criteria.is_empty());
-                    let review_json = serde_json::to_value(&review).unwrap_or_default();
-                    if let Some(reason) = review.terminal_env_failure_reason() {
-                        tracing::warn!(
-                            "Roundtable independent reviewer reported terminal environment failure"
+                    let observable = crate::observable::global_observable();
+                    if !self.config.independent_review {
+                        observable.record_independent_review(
+                            crate::observable::INDEPENDENT_REVIEW_NOT_ASKED_DISABLED,
                         );
-                        consensus_reached = false;
-                        evaluation.verdict = Verdict::Fail;
-                        evaluation.feedback = crate::squad::classify::declare_for(reason.clone());
-                        terminal_reason = Some(reason);
-                    } else if !matches!(review.verdict, Verdict::Pass) {
-                        consensus_reached = false;
-                        evaluation.verdict = Verdict::Fail;
-                        evaluation.feedback = format!(
-                            "independent reviewer rejected the consensus: {}",
-                            review.feedback
-                        );
+                    } else {
+                        let criteria: Vec<&str> = last
+                            .plan
+                            .acceptance_criteria
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect();
+                        // Fresh context means fresh: the board is withheld, not
+                        // just the history. Every round writes its plan, its
+                        // generation and its verdict into the board before the
+                        // review is reached, and the evaluator's context builder
+                        // hands the whole board to whichever evaluator runs — so
+                        // a reviewer given the board is handed the consensus it
+                        // is supposed to be checking, independently of the
+                        // history argument right above.
+                        let mut review = self
+                            .evaluator
+                            .evaluate(
+                                task,
+                                &serde_json::to_value(&last.plan).unwrap_or_default(),
+                                &serde_json::to_value(&last.generation).unwrap_or_default(),
+                                &[],
+                                &criteria,
+                                None,
+                            )
+                            .await;
+                        review.enforce_criteria_evidence(!criteria.is_empty());
+                        let review_json = serde_json::to_value(&review).unwrap_or_default();
+                        if let Some(reason) = review.terminal_env_failure_reason() {
+                            tracing::warn!(
+                                "Roundtable independent reviewer reported terminal environment failure"
+                            );
+                            // Paid for and answered nothing: neither verdict cell
+                            // may claim it, and without this one the call would
+                            // be invisible except as the run's terminal reason.
+                            observable.record_independent_review(
+                                crate::observable::INDEPENDENT_REVIEW_NOT_ANSWERED,
+                            );
+                            consensus_reached = false;
+                            evaluation.verdict = Verdict::Fail;
+                            evaluation.feedback =
+                                crate::squad::classify::declare_for(reason.clone());
+                            terminal_reason = Some(reason);
+                        } else {
+                            let agreed = matches!(review.verdict, Verdict::Pass);
+                            observable.record_independent_review(if agreed {
+                                crate::observable::INDEPENDENT_REVIEW_AGREED
+                            } else {
+                                crate::observable::INDEPENDENT_REVIEW_REJECTED
+                            });
+                            if !agreed {
+                                consensus_reached = false;
+                                evaluation.verdict = Verdict::Fail;
+                                evaluation.feedback = format!(
+                                    "independent reviewer rejected the consensus: {}",
+                                    review.feedback
+                                );
+                            }
+                        }
+                        let mut details =
+                            evaluation.details.take().unwrap_or(serde_json::json!({}));
+                        details["independent_review"] = review_json;
+                        evaluation.details = Some(details);
                     }
-                    let mut details = evaluation.details.take().unwrap_or(serde_json::json!({}));
-                    details["independent_review"] = review_json;
-                    evaluation.details = Some(details);
                 }
             }
         }
@@ -1238,6 +1303,10 @@ mod tests {
         /// How many times this actor was asked for anything. The only way to
         /// observe "this role was never paid for" from outside.
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// What each call was handed. The actor decides which document a role
+        /// reads, so "what did this role actually receive" is observable here
+        /// and nowhere else.
+        inputs: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     }
 
     impl MockAgent {
@@ -1246,6 +1315,7 @@ mod tests {
             Self {
                 responses: std::sync::Mutex::new(std::collections::VecDeque::from([value])),
                 calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                inputs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
@@ -1254,11 +1324,19 @@ mod tests {
             Self {
                 responses: std::sync::Mutex::new(values.into()),
                 calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                inputs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
         fn calls(&self) -> usize {
             self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn inputs(&self) -> Vec<serde_json::Value> {
+            self.inputs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
         }
 
         fn next_response(&self) -> serde_json::Value {
@@ -1277,7 +1355,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl cog_core::Agent for MockAgent {
-        async fn prompt(&self, _input: serde_json::Value) -> cog_core::SFResult<serde_json::Value> {
+        async fn prompt(&self, input: serde_json::Value) -> cog_core::SFResult<serde_json::Value> {
+            self.inputs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(input);
             Ok(self.next_response())
         }
         async fn start(&self) {}
@@ -1755,6 +1837,134 @@ mod tests {
             .is_some());
     }
 
+    /// The fresh-context judge has to be fresh in the document it reads, not
+    /// only in the history argument. The board carries `latest_outcome` — the
+    /// consensus this review exists to check independently — and it is written
+    /// before the review is reached. What the reviewer was actually handed is
+    /// only observable from the agent side, so the assertion is on the input
+    /// the evaluator's agent received, against the one the round judge got.
+    #[tokio::test]
+    async fn the_fresh_context_reviewer_is_not_handed_the_board() {
+        let planner = PlannerActor::new(std::sync::Arc::new(MockAgent::fixed(serde_json::json!({
+            "summary": "s",
+            "plan": {},
+            "sub_tasks": []
+        }))));
+        let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent::fixed(
+            serde_json::json!({"content": {"code": "fn main() {}"}, "artifacts": []}),
+        )));
+        let agent = std::sync::Arc::new(MockAgent::fixed(
+            serde_json::json!({"verdict": "pass", "score": 90, "feedback": "ok", "criteria": []}),
+        ));
+        let rt = PgeRoundtable::new(
+            PgeRoundtableConfig {
+                max_iterations: 5,
+                consensus_threshold: 0.5,
+                stall_threshold: 0,
+                independent_review: true,
+                ..Default::default()
+            },
+            planner,
+            generator,
+            EvaluatorActor::new(agent.clone()),
+        );
+        let task = cog_core::Task::new(
+            "t-review-context".to_string(),
+            cog_core::TaskType::Custom("test".into()),
+            serde_json::json!({"goal": "g"}),
+        );
+
+        let result = rt.debate(&task, serde_json::json!({})).await;
+        assert!(result.consensus_reached);
+
+        let inputs = agent.inputs();
+        assert_eq!(
+            inputs.len(),
+            3,
+            "two rounds judged, then one independent review"
+        );
+        assert!(
+            inputs[0]["context"].get("context_board").is_some(),
+            "the round's own judge reads the board"
+        );
+        let review_input = &inputs[2]["context"];
+        assert!(
+            review_input.get("context_board").is_none(),
+            "the reviewer was handed the board, which carries this round's own verdict — \
+             the judgement it is supposed to reach independently"
+        );
+        assert_eq!(
+            review_input["history"],
+            serde_json::json!([]),
+            "and the history it is asked to read stays empty"
+        );
+    }
+
+    /// The moderator's mapping names every decision and has no catch-all, so a
+    /// decision added later cannot be filed as `continue` and leave the four
+    /// cells looking complete.
+    #[test]
+    fn every_moderator_decision_is_mapped_to_its_own_cell() {
+        let source = include_str!("roundtable.rs");
+        let production = source
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("the file always has a first segment");
+        let anchor = "let outcome = match mod_output.decision {";
+        let start = production
+            .find(anchor)
+            .expect("the moderator's decision is no longer mapped to the recorded cells");
+        let mapping = &production[start..];
+        let record_at = mapping
+            .find("record_moderator_consulted(outcome);")
+            .expect("the mapping no longer feeds the recorders");
+        let mapping = &mapping[..record_at + "record_moderator_consulted(outcome);".len()];
+        assert!(
+            !mapping.contains("_ =>"),
+            "a catch-all arm files every future decision as one of the existing cells"
+        );
+        for name in [
+            "MODERATOR_CONTINUE",
+            "MODERATOR_CHANGE_STRATEGY",
+            "MODERATOR_ACCEPT_PARTIAL",
+            "MODERATOR_ESCALATE",
+            "record_moderator_consulted",
+        ] {
+            assert!(
+                mapping.contains(name),
+                "the moderator's cells no longer mention `{name}`"
+            );
+        }
+
+        let block = &production[start..];
+        let block = &block[..block
+            .find("\n            if let Some(judgement) = outcome.judgement() {")
+            .expect("the moderator block no longer ends where the verdict carries over")];
+        assert!(
+            block.contains("MODERATOR_NOT_ASKED_DISABLED"),
+            "a deployment with no moderator writes no decision cell; without the skip's \
+             own cell it reads exactly like a moderator that was never consulted"
+        );
+    }
+
+    /// One cell of a global series, read from the process-wide observable.
+    /// Tests share that observable, so a reading is only usable as a delta
+    /// against the value taken before the run.
+    async fn cell(name: &'static str, outcome: &str) -> f64 {
+        use cog_core::observability::Observable;
+        let metrics = crate::observable::global_observable()
+            .collect_metrics("D8")
+            .await
+            .unwrap();
+        metrics
+            .iter()
+            .find(|m| {
+                m.name == name && m.labels.get("outcome").map(String::as_str) == Some(outcome)
+            })
+            .map(|m| m.value)
+            .unwrap_or(0.0)
+    }
+
     /// A partial the moderator accepted is a consensus, but it is not a Pass,
     /// so there is no consensus claim for the fresh-context judge to confirm.
     /// Running the review anyway would judge a claim nobody made — and a code
@@ -1793,7 +2003,22 @@ mod tests {
             serde_json::json!({"goal": "g"}),
         );
 
+        let before = cell(
+            "pge_moderator_consulted_total",
+            crate::observable::MODERATOR_ACCEPT_PARTIAL,
+        )
+        .await;
         let result = rt.debate(&task, serde_json::json!({})).await;
+        let after = cell(
+            "pge_moderator_consulted_total",
+            crate::observable::MODERATOR_ACCEPT_PARTIAL,
+        )
+        .await;
+        assert!(
+            after > before,
+            "the round ended on the moderator's decision, and has to be readable as one: \
+             {before} -> {after}"
+        );
 
         assert!(
             result.consensus_reached,
