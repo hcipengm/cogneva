@@ -169,6 +169,49 @@ fn workflow() -> String {
         .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()))
 }
 
+/// The names the base branch goes by, in the order they are tried.
+///
+/// The name differs by checkout and the difference means nothing: CI's checkout
+/// calls it `origin/main`, the deployer's clone keeps the base branch as a local
+/// `main` and names the forge it pulls from `upstream`, and a developer's clone
+/// has `origin`. Every one of them is the base branch, so the first that
+/// resolves is the one to read.
+const BASE_NAMES: &[&str] = &["origin/main", "main", "upstream/main", "local/main"];
+
+/// The declaration as it stands on the base branch.
+///
+/// `workflow()` reads the tree under judgment, and so do the tables above: they
+/// answer a question that the change itself asked. A change that drops a job
+/// from `release-tag.needs` and drops its row from the tables removes the
+/// question and the answer in one edit, and every test in this file still
+/// passes while a gate CI used to run has stopped running. The declaration on
+/// the base branch is the one this change did not write.
+///
+/// Not resolving it is a failure rather than a fallback to the tree under
+/// judgment: a contract that reads nothing agrees with everything.
+fn base_workflow() -> String {
+    let root = workspace_root();
+    for name in BASE_NAMES {
+        let out = std::process::Command::new("git")
+            .current_dir(&root)
+            .args(["show", &format!("{name}:{WORKFLOW}")])
+            .output()
+            .unwrap_or_else(|e| panic!("could not run git in {}: {e}", root.display()));
+        if out.status.success() {
+            return String::from_utf8(out.stdout)
+                .unwrap_or_else(|e| panic!("{name}:{WORKFLOW} is not utf-8: {e}"));
+        }
+    }
+    panic!(
+        "none of {BASE_NAMES:?} resolves {WORKFLOW} in {}; this contract judges a \
+         change against the gating set the base branch declares, so a checkout \
+         that cannot see the base branch cannot tell whether the change dropped \
+         one of its jobs. Fetch the base branch rather than letting the contract \
+         pass by reading nothing.",
+        root.display()
+    );
+}
+
 #[test]
 fn every_gating_job_is_answered_before_the_commit() {
     let workflow = workflow();
@@ -207,6 +250,35 @@ fn every_gating_job_is_answered_before_the_commit() {
             );
         }
     }
+}
+
+/// The gating set grows with a change; it does not shrink with one.
+///
+/// The tests above read the declaration from the tree under judgment, which is
+/// also the tree the tables above were written in. A change that drops a job
+/// from `release-tag.needs` and drops its row from those tables is therefore
+/// internally consistent, and the only thing that would notice the job is no
+/// longer gating is the base branch's copy of the declaration.
+///
+/// So a job cannot be dropped by the change that stops answering for it: doing
+/// that takes an edit to this assertion in the same commit, which is not a
+/// consequence of some other line but the decision itself, made where a reviewer
+/// reads it. Adding a job stays what it was — one line in `release-tag.needs`
+/// and one row below, or a red test until someone writes the row.
+#[test]
+fn the_gating_set_does_not_shrink_with_a_change() {
+    let base = gating_jobs(&base_workflow());
+    let head = gating_jobs(&workflow());
+    let dropped: Vec<&str> = base.difference(&head).map(String::as_str).collect();
+    assert!(
+        dropped.is_empty(),
+        "{dropped:?} gate on the base branch and this change drops them. A job \
+         that stops gating stops being run, and the declaration is the only place \
+         the gating set is written down, so nothing else would have noticed. A \
+         drop is a decision, and it has to be taken here -- in this assertion, \
+         where a reviewer reads it -- rather than in a `needs:` list, where it \
+         looks like tidying."
+    );
 }
 
 /// A job name that appears in both tables means the two lists disagree about

@@ -46,7 +46,14 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
+      # Full history: the gate parity contract reads the gating set from the base
+      # branch as well as from the tree under judgment, and a depth-one checkout
+      # has no base branch for it to read. A contract that cannot see the base
+      # branch refuses rather than agrees, so the environment has to be able to
+      # answer it -- and a pull request's checkout is not the one that can.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       # rustfmt is requested rather than inherited: the pipeline's format gate
       # runs `cargo fmt --check`, and its tests run it here. Whether the action's
       # default profile happens to carry rustfmt is not something a gate that
