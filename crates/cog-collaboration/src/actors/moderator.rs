@@ -86,6 +86,11 @@ impl ModeratorActor {
     }
 
     /// Run the Moderator phase: review debate history and render a decision.
+    ///
+    /// `consensus_threshold` travels as context, not as a decision the moderator
+    /// owns: the debate applies it to every round's own score before asking, so
+    /// what it is being asked is what to do about a debate that did not confirm
+    /// — never whether it did.
     pub async fn moderate(
         &self,
         task: &cog_core::Task,

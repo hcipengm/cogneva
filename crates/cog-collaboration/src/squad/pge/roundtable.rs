@@ -6,15 +6,22 @@ use crate::squad::pge::stall::{
     degenerate_loop_feedback, ProgressSignals, StallDetector, StallVerdict,
 };
 use crate::squad::pge::types::{
-    best_scored, Artifact, BranchMergeStrategy, Criterion, EvaluationResult, GeneratorOutput,
-    MergeSummary, PgeBranchResult, PgeRoundtableIteration, PlannerOutput, RoundOutcome, StopCause,
-    StoppedProduct, Verdict,
+    best_scored, Artifact, BranchMergeStrategy, ConsensusFloor, Criterion, EvaluationResult,
+    GeneratorOutput, MergeSummary, PgeBranchResult, PgeRoundtableIteration, PlannerOutput,
+    RoundOutcome, StopCause, StoppedProduct, Verdict,
 };
 use std::sync::Arc;
 use tracing::info;
 
 pub struct PgeRoundtableConfig {
     pub max_iterations: u32,
+    /// The score a `Pass` must reach for the debate to confirm, as a fraction
+    /// of 100: two consecutive rounds passing with each score at or above it.
+    /// Applied to the judgement's own score, so a `Pass` below the bar — and a
+    /// `Pass` that reported no score, which cannot be shown to reach it — does
+    /// not confirm and the debate keeps going. At the default 0.8 this is the
+    /// same bar the evaluator is asked to pass on, so it changes nothing until
+    /// it is raised, and raising it means exactly this: harder to end early.
     pub consensus_threshold: f64,
     /// Skill IDs for dynamic agent creation.
     pub skill_ids: Vec<String>,
@@ -208,7 +215,11 @@ impl PgeRoundtable {
         let mut stall = StallDetector::new(self.config.stall_threshold);
 
         let mut last_judgement: Option<EvaluationResult> = None;
-        let mut prev_verdict: Option<Verdict> = None;
+        // The previous round's answer to the consensus question, whatever it
+        // was: a round that confirmed, or one that did not, resets it. A round
+        // that reached no judgement is not a round that agreed with the one
+        // before it, so it does not carry a confirmation across the gap.
+        let mut prev_confirmed = false;
         let mut board = self.init_board().await;
         let mut terminal_reason: Option<String> = None;
 
@@ -335,19 +346,33 @@ impl PgeRoundtable {
             // carries none, and cannot carry the debate. The moderator below
             // still sees it — a generator that keeps answering with nothing is
             // exactly the moment its ChangeStrategy / Escalate call matters.
-            if let Some(judgement) = outcome.judgement() {
-                // Consensus: require Verdict::Pass for at least 2 consecutive iterations.
-                let verdict_stable = if let Some(ref prev) = prev_verdict {
-                    matches!(judgement.verdict, Verdict::Pass) && matches!(prev, Verdict::Pass)
-                } else {
-                    false
-                };
-
-                if matches!(judgement.verdict, Verdict::Pass) && verdict_stable {
-                    consensus_reached = true;
-                    break;
+            //
+            // Consensus is a reading of the round's own judgement, so the
+            // configured threshold is applied here rather than left as a line
+            // in the moderator's prompt: two consecutive rounds must pass, and
+            // each pass must clear the floor those two rounds declare. A pass
+            // the evaluator itself scored below the bar cannot confirm the
+            // debate, and neither can one that reported no score to compare —
+            // in both cases the threshold says the debate is not over yet.
+            let confirmed = match outcome.judgement() {
+                Some(judgement) => {
+                    let floor = judgement.consensus_floor(self.config.consensus_threshold);
+                    crate::observable::global_observable()
+                        .record_consensus_floor(consensus_floor_cell(floor));
+                    floor == ConsensusFloor::Met
                 }
+                None => {
+                    crate::observable::global_observable()
+                        .record_consensus_floor(crate::observable::CONSENSUS_FLOOR_NOT_JUDGED);
+                    false
+                }
+            };
+
+            if confirmed && prev_confirmed {
+                consensus_reached = true;
+                break;
             }
+            prev_confirmed = confirmed;
 
             // --- Moderator intervention ---
             if let Some(ref moderator) = self.config.moderator {
@@ -427,9 +452,10 @@ impl PgeRoundtable {
             }
 
             if let Some(judgement) = outcome.judgement() {
-                prev_verdict = Some(judgement.verdict);
                 // 一轮没有判定不该抹掉上一轮的判词：下一轮的计划者要看的
-                // 是最后一次真实的评价，不是"这一轮什么都没说"。
+                // 是最后一次真实的评价，不是"这一轮什么都没说"。共识那边
+                // 相反：确认必须来自相邻两轮，中间的空白轮由上面那段的
+                // `prev_confirmed` 归零，不留着旧值跨过去。
                 last_judgement = Some(judgement.clone());
             }
         }
@@ -1369,6 +1395,18 @@ pub fn parse_evaluation_result(value: &serde_json::Value) -> EvaluationResult {
     result
 }
 
+/// The cell a round's consensus-floor reading is published under. Exhaustive on
+/// purpose: a new reading of the floor has to be named here rather than
+/// silently folded into an existing cell.
+fn consensus_floor_cell(floor: ConsensusFloor) -> &'static str {
+    match floor {
+        ConsensusFloor::Met => crate::observable::CONSENSUS_FLOOR_MET,
+        ConsensusFloor::NotMet => crate::observable::CONSENSUS_FLOOR_NOT_MET,
+        ConsensusFloor::ScoreAbsent => crate::observable::CONSENSUS_FLOOR_SCORE_ABSENT,
+        ConsensusFloor::NotAPass => crate::observable::CONSENSUS_FLOOR_NOT_A_PASS,
+    }
+}
+
 /// What one board field costs the document: the field's own bytes, key
 /// included. The punctuation around it is not counted — what the reading is
 /// for is "how much did the prompt shrink", and every removed field takes the
@@ -1953,6 +1991,208 @@ mod tests {
             .and_then(|e| e.details.as_ref())
             .and_then(|d| d.get("independent_review"))
             .is_some());
+    }
+
+    /// The threshold is a gate, not a hint: the mock passes every round and the
+    /// debate still must not confirm, because the pass it reports is below the
+    /// bar the debate declared. The verdict itself is left alone — it is the
+    /// judge's reading of the work, and it keeps saying what it said.
+    #[tokio::test]
+    async fn a_pass_below_the_floor_does_not_confirm_the_debate() {
+        let planner = PlannerActor::new(std::sync::Arc::new(MockAgent::fixed(serde_json::json!({
+            "summary": "s",
+            "plan": {},
+            "sub_tasks": []
+        }))));
+        let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent::fixed(
+            serde_json::json!({"content": {"code": "fn main() {}"}, "artifacts": []}),
+        )));
+        let evaluator_agent = std::sync::Arc::new(MockAgent::fixed(serde_json::json!({
+            "verdict": "pass", "score": 70, "feedback": "close enough", "criteria": []
+        })));
+        let rt = PgeRoundtable::new(
+            PgeRoundtableConfig {
+                max_iterations: 3,
+                consensus_threshold: 0.8,
+                stall_threshold: 0,
+                independent_review: true,
+                ..Default::default()
+            },
+            planner,
+            generator,
+            EvaluatorActor::new(evaluator_agent.clone()),
+        );
+        let task = cog_core::Task::new(
+            "t-floor".to_string(),
+            cog_core::TaskType::Custom("test".into()),
+            serde_json::json!({"goal": "g"}),
+        );
+
+        let below_before = cell(
+            "pge_consensus_floor_total",
+            crate::observable::CONSENSUS_FLOOR_NOT_MET,
+        )
+        .await;
+        let result = rt.debate(&task, serde_json::json!({})).await;
+
+        assert!(
+            !result.consensus_reached,
+            "a pass the judge itself scored below the declared floor cannot confirm the debate"
+        );
+        assert_eq!(
+            result.iterations, 3,
+            "no round confirmed, so the debate spends its whole budget"
+        );
+        assert_eq!(
+            evaluator_agent.calls(),
+            3,
+            "a debate that never confirmed has no consensus for the fresh-context judge to check"
+        );
+        let judgement = result
+            .final_outcome
+            .judgement()
+            .expect("every round here reached a judgement");
+        assert_eq!(
+            judgement.verdict,
+            Verdict::Pass,
+            "the floor decides whether the debate stops; it does not overrule the judge"
+        );
+        assert_eq!(judgement.score, Some(70));
+        assert!(
+            cell(
+                "pge_consensus_floor_total",
+                crate::observable::CONSENSUS_FLOOR_NOT_MET
+            )
+            .await
+                - below_before
+                >= 3.0,
+            "each round the floor refused has to be readable, or a strict floor and a floor \
+             nothing consults look the same"
+        );
+    }
+
+    /// A pass that reports no score cannot be shown to clear the floor, so it
+    /// does not. The cell keeps it apart from a pass that *was* below the bar:
+    /// a missing reading and a low one are different facts about the run, and
+    /// only one of them is fixed by a better evaluator.
+    #[tokio::test]
+    async fn a_pass_with_no_score_does_not_confirm_the_debate() {
+        let planner = PlannerActor::new(std::sync::Arc::new(MockAgent::fixed(serde_json::json!({
+            "summary": "s",
+            "plan": {},
+            "sub_tasks": []
+        }))));
+        let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent::fixed(
+            serde_json::json!({"content": {"code": "fn main() {}"}, "artifacts": []}),
+        )));
+        let evaluator = EvaluatorActor::new(std::sync::Arc::new(MockAgent::fixed(
+            serde_json::json!({"verdict": "pass", "feedback": "looks fine", "criteria": []}),
+        )));
+        let rt = PgeRoundtable::new(
+            PgeRoundtableConfig {
+                max_iterations: 2,
+                consensus_threshold: 0.1,
+                stall_threshold: 0,
+                independent_review: false,
+                ..Default::default()
+            },
+            planner,
+            generator,
+            evaluator,
+        );
+        let task = cog_core::Task::new(
+            "t-noscore".to_string(),
+            cog_core::TaskType::Custom("test".into()),
+            serde_json::json!({"goal": "g"}),
+        );
+
+        let absent_before = cell(
+            "pge_consensus_floor_total",
+            crate::observable::CONSENSUS_FLOOR_SCORE_ABSENT,
+        )
+        .await;
+        let result = rt.debate(&task, serde_json::json!({})).await;
+
+        assert!(
+            !result.consensus_reached,
+            "nothing about a scoreless pass shows it cleared the floor, however low the floor is"
+        );
+        assert_eq!(result.iterations, 2);
+        assert!(
+            cell(
+                "pge_consensus_floor_total",
+                crate::observable::CONSENSUS_FLOOR_SCORE_ABSENT
+            )
+            .await
+                - absent_before
+                >= 2.0
+        );
+    }
+
+    /// Confirmation has to come from two *adjacent* rounds. A round that judged
+    /// nothing did not agree with the round before it, so it breaks the pair
+    /// instead of being skipped over: carrying the older pass across the gap
+    /// would read two passes with a hole between them as a consensus.
+    #[tokio::test]
+    async fn a_round_that_judged_nothing_breaks_the_pair() {
+        let planner = PlannerActor::new(std::sync::Arc::new(MockAgent::fixed(serde_json::json!({
+            "summary": "s",
+            "plan": {},
+            "sub_tasks": []
+        }))));
+        let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent::sequence(vec![
+            serde_json::json!({"content": {"code": "fn main() {}"}, "artifacts": []}),
+            serde_json::json!({"content": null, "artifacts": []}),
+            serde_json::json!({"content": {"code": "fn main() {}"}, "artifacts": []}),
+        ])));
+        let evaluator_agent = std::sync::Arc::new(MockAgent::fixed(serde_json::json!({
+            "verdict": "pass", "score": 90, "feedback": "ok", "criteria": []
+        })));
+        let rt = PgeRoundtable::new(
+            PgeRoundtableConfig {
+                max_iterations: 3,
+                consensus_threshold: 0.5,
+                stall_threshold: 0,
+                independent_review: false,
+                ..Default::default()
+            },
+            planner,
+            generator,
+            EvaluatorActor::new(evaluator_agent.clone()),
+        );
+        let task = cog_core::Task::new(
+            "t-gap".to_string(),
+            cog_core::TaskType::Custom("test".into()),
+            serde_json::json!({"goal": "g"}),
+        );
+
+        let unjudged_before = cell(
+            "pge_consensus_floor_total",
+            crate::observable::CONSENSUS_FLOOR_NOT_JUDGED,
+        )
+        .await;
+        let result = rt.debate(&task, serde_json::json!({})).await;
+
+        assert_eq!(result.iterations, 3);
+        assert!(
+            !result.consensus_reached,
+            "a round nobody judged cannot be the second half of a pair"
+        );
+        assert_eq!(
+            evaluator_agent.calls(),
+            2,
+            "the empty round produced nothing to judge and the debate stopped before a third pass"
+        );
+        assert!(
+            cell(
+                "pge_consensus_floor_total",
+                crate::observable::CONSENSUS_FLOOR_NOT_JUDGED
+            )
+            .await
+                - unjudged_before
+                >= 1.0,
+            "a round that reached no judgement is a sighting of the gate, not an absence of one"
+        );
     }
 
     /// The fresh-context judge has to be fresh in the document it reads, not

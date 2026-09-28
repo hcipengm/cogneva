@@ -131,6 +131,38 @@ pub const MODERATOR_OUTCOMES: [&str; 5] = [
     MODERATOR_NOT_ASKED_DISABLED,
 ];
 
+/// What one round's judgement contributed to consensus: the configured
+/// threshold applied to it as a deterministic floor.
+///
+/// Consensus is two consecutive rounds whose judgement is a `Pass` clearing
+/// `consensus_threshold` (a fraction of 100). Three of these cells are the
+/// floor's answers about a `Pass`: the score clears it, the score is below it,
+/// or the evaluator passed without reporting a score at all — which cannot be
+/// shown to clear anything, so it does not, and it is kept apart from the other
+/// two because a reading that is missing and a reading that is low are not the
+/// same fact. The fourth is a judgement that was not a `Pass`, and the fifth is
+/// a round that reached no judgement: both leave consensus unconfirmed, but
+/// only one of them had a judgement at all.
+///
+/// Every round that gets as far as the consensus check lands in exactly one
+/// cell, which is what makes an all-zero family readable as "no round ever got
+/// that far" instead of as a debate whose rounds all passed.
+pub const CONSENSUS_FLOOR_MET: &str = "met";
+pub const CONSENSUS_FLOOR_NOT_MET: &str = "not_met";
+pub const CONSENSUS_FLOOR_SCORE_ABSENT: &str = "score_absent";
+pub const CONSENSUS_FLOOR_NOT_A_PASS: &str = "not_a_pass";
+pub const CONSENSUS_FLOOR_NOT_JUDGED: &str = "not_judged";
+
+/// Every cell of the consensus floor, published at zero as well. See
+/// [`CONSENSUS_FLOOR_MET`].
+pub const CONSENSUS_FLOOR_OUTCOMES: [&str; 5] = [
+    CONSENSUS_FLOOR_MET,
+    CONSENSUS_FLOOR_NOT_MET,
+    CONSENSUS_FLOOR_SCORE_ABSENT,
+    CONSENSUS_FLOOR_NOT_A_PASS,
+    CONSENSUS_FLOOR_NOT_JUDGED,
+];
+
 /// The two ends of the board mirror a role is shown, summed in bytes.
 ///
 /// `dropped` is what the de-duplication removed: a round the role already reads
@@ -338,6 +370,16 @@ pub struct CollaborationObservable {
     /// moderator is configured" and "the round never got that far" are the same
     /// absence. Keyed by a `&'static str` so a typo cannot open a sixth cell.
     moderators: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
+    /// How the debate's own threshold fell on each round's judgement, over
+    /// [`CONSENSUS_FLOOR_OUTCOMES`].
+    ///
+    /// The threshold decides when a debate stops early, and until this face
+    /// existed it was only ever a line in the moderator's prompt — a number no
+    /// code read. The reading that has to survive is which of the two the
+    /// debates were actually decided by, so a round whose `Pass` does not clear
+    /// the floor is counted, not quietly ignored. Keyed by a `&'static str` so
+    /// the cells are the constants above and a typo cannot open a sixth.
+    consensus_floors: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
 }
 
 impl CollaborationObservable {
@@ -448,6 +490,20 @@ impl CollaborationObservable {
     pub fn record_moderator_consulted(&self, outcome: &'static str) {
         let mut map = self
             .moderators
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *map.entry(outcome).or_insert(0) += 1;
+    }
+
+    /// Record what one round's judgement contributed to consensus, over
+    /// [`CONSENSUS_FLOOR_OUTCOMES`].
+    ///
+    /// Synchronous for the same reason as the moderator's cells: a dropped
+    /// count would read as a round the floor never saw, which is the one thing
+    /// an all-zero family is supposed to mean.
+    pub fn record_consensus_floor(&self, outcome: &'static str) {
+        let mut map = self
+            .consensus_floors
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *map.entry(outcome).or_insert(0) += 1;
@@ -675,6 +731,24 @@ impl Observable for CollaborationObservable {
                 let count = moderators.get(outcome).copied().unwrap_or(0);
                 metrics.push(
                     RawMetric::new("pge_moderator_consulted_total", count as f64)
+                        .with_label("outcome", outcome),
+                );
+            }
+
+            // The consensus floor, every cell published. The threshold decides
+            // whether a debate stops early, and the rounds it refused are the
+            // ones a reader has to see: without the cells, a floor that denies
+            // every consensus and a floor nothing ever consulted are the same
+            // absence.
+            let consensus_floors = self
+                .consensus_floors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            for outcome in CONSENSUS_FLOOR_OUTCOMES {
+                let count = consensus_floors.get(outcome).copied().unwrap_or(0);
+                metrics.push(
+                    RawMetric::new("pge_consensus_floor_total", count as f64)
                         .with_label("outcome", outcome),
                 );
             }
@@ -1481,6 +1555,56 @@ mod tests {
         );
         assert_eq!(cell(&metrics, MODERATOR_CHANGE_STRATEGY), 0.0);
         assert_eq!(cell(&metrics, MODERATOR_ESCALATE), 0.0);
+    }
+
+    /// Every cell of the consensus floor is published, and the three that are
+    /// not "met" stay apart: a floor that refuses a low score, a floor that had
+    /// no score to read, and a round that never reached a judgement are three
+    /// different facts about the debate, and folding them into one cell would
+    /// let a broken threshold look like a debate that ended early.
+    #[tokio::test]
+    async fn every_consensus_floor_cell_is_published_and_counted_apart() {
+        let obs = CollaborationObservable::new();
+        let cell = |metrics: &[RawMetric], outcome: &str| {
+            metrics
+                .iter()
+                .find(|m| {
+                    m.name == "pge_consensus_floor_total"
+                        && m.labels.get("outcome").map(String::as_str) == Some(outcome)
+                })
+                .map(|m| m.value)
+                .unwrap_or_else(|| {
+                    panic!("pge_consensus_floor_total{{outcome=\"{outcome}\"}} must be published, at 0 when nothing was recorded")
+                })
+        };
+
+        let metrics = obs.collect_metrics("D8").await.unwrap();
+        for outcome in CONSENSUS_FLOOR_OUTCOMES {
+            assert_eq!(
+                cell(&metrics, outcome),
+                0.0,
+                "{outcome} must be published even with nothing recorded into it"
+            );
+        }
+
+        obs.record_consensus_floor(CONSENSUS_FLOOR_MET);
+        obs.record_consensus_floor(CONSENSUS_FLOOR_MET);
+        obs.record_consensus_floor(CONSENSUS_FLOOR_SCORE_ABSENT);
+
+        let metrics = obs.collect_metrics("D8").await.unwrap();
+        assert_eq!(cell(&metrics, CONSENSUS_FLOOR_MET), 2.0);
+        assert_eq!(
+            cell(&metrics, CONSENSUS_FLOOR_SCORE_ABSENT),
+            1.0,
+            "a Pass with no score is not a Pass below the floor"
+        );
+        assert_eq!(
+            cell(&metrics, CONSENSUS_FLOOR_NOT_MET),
+            0.0,
+            "nothing was recorded below the floor, so that cell must stay flat"
+        );
+        assert_eq!(cell(&metrics, CONSENSUS_FLOOR_NOT_A_PASS), 0.0);
+        assert_eq!(cell(&metrics, CONSENSUS_FLOOR_NOT_JUDGED), 0.0);
     }
 
     /// The extractor reads both spellings the chart uses, so a rule that moves

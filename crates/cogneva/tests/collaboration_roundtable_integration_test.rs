@@ -1,5 +1,5 @@
 use cog_collaboration::actors::{EvaluatorActor, GeneratorActor, PlannerActor};
-use cog_collaboration::{PgeRoundtable, PgeRoundtableConfig};
+use cog_collaboration::{PgeRoundtable, PgeRoundtableConfig, Verdict};
 use cog_core::Task;
 use std::sync::Arc;
 
@@ -180,6 +180,10 @@ async fn test_roundtable_debate_reaches_consensus() {
         "Should complete at least one iteration"
     );
     assert!(
+        result.consensus_reached,
+        "Two consecutive passes scoring 85 clear a floor of 50"
+    );
+    assert!(
         !result.final_plan.sub_tasks.is_empty(),
         "Should produce a plan with tasks"
     );
@@ -304,7 +308,7 @@ async fn test_roundtable_context_board_populated() {
 }
 
 #[tokio::test]
-async fn test_roundtable_evaluator_veto_blocks_consensus() {
+async fn test_roundtable_consensus_clears_the_floor_at_the_boundary() {
     let config = PgeRoundtableConfig {
         max_iterations: 3,
         consensus_threshold: 0.8,
@@ -318,7 +322,39 @@ async fn test_roundtable_evaluator_veto_blocks_consensus() {
 
     assert!(
         result.consensus_reached,
-        "Stub evaluator (passed=true, score=85) should allow consensus"
+        "the stub evaluator (passed=true, score=85) is above the floor of 80"
+    );
+}
+
+/// The same mock as above, judged against a floor it does not reach. Without
+/// this pair the threshold would read as decorative: the previous tests all
+/// confirmed whether it was 0.1 or 0.8, which is what a number no code reads
+/// looks like.
+#[tokio::test]
+async fn test_roundtable_consensus_is_denied_above_the_floor() {
+    let config = PgeRoundtableConfig {
+        max_iterations: 3,
+        consensus_threshold: 0.9,
+        ..Default::default()
+    };
+    let roundtable = make_roundtable(config);
+
+    let result = roundtable
+        .debate(&test_task("any goal"), serde_json::json!({}))
+        .await;
+
+    assert!(
+        !result.consensus_reached,
+        "a stub that passes with 85 cannot confirm a debate that asks for 90"
+    );
+    assert_eq!(
+        result.iterations, 3,
+        "the debate runs out its own budget instead of confirming"
+    );
+    assert_eq!(
+        result.final_outcome.judgement().map(|e| e.verdict),
+        Some(Verdict::Pass),
+        "the floor decides the debate, not the judge's verdict"
     );
 }
 

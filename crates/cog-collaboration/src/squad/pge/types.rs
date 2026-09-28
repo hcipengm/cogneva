@@ -347,6 +347,32 @@ impl<'de> serde::Deserialize<'de> for Verdict {
     }
 }
 
+/// What one judgement contributes to consensus: the debate's own threshold
+/// applied to it.
+///
+/// The threshold is a fraction of 100, and it is a gate rather than a hint: a
+/// debate that would otherwise stop on two consecutive `Pass`es must not stop
+/// on two passes the evaluator itself scored below the bar the debate declared.
+/// Kept as four answers rather than a boolean because the reasons a judgement
+/// fails to confirm consensus are separate observations — a `Pass` below the
+/// floor, a `Pass` that reported no score to compare at all, and a judgement
+/// that was not a `Pass` — and a caller that published one number for all three
+/// could not tell a broken floor from a strict one.
+///
+/// A `Pass` with no score does not confirm: nothing about it shows it cleared
+/// the floor, and a missing reading is not a satisfied one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsensusFloor {
+    /// A `Pass` whose score is at or above the configured fraction of 100.
+    Met,
+    /// A `Pass` whose score is below it.
+    NotMet,
+    /// A `Pass` that carried no score at all.
+    ScoreAbsent,
+    /// A judgement that was not a `Pass`, so the floor was never the question.
+    NotAPass,
+}
+
 /// Result of a single evaluation.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct EvaluationResult {
@@ -406,6 +432,26 @@ impl EvaluationResult {
             self.feedback = format!("{defect}; original feedback: {}", self.feedback);
         } else if !self.feedback.contains(&defect) {
             self.feedback = format!("{}; {defect}", self.feedback);
+        }
+    }
+
+    /// Whether this judgement may be counted towards consensus, and when it may
+    /// not, which of the reasons it was. See [`ConsensusFloor`].
+    ///
+    /// Deliberately a reading and not a rewrite: a `Pass` below the floor is
+    /// still what the evaluator judged, and it keeps saying so in the history,
+    /// on the board and to everything that learns from the run. The threshold
+    /// is the debate's bar for confirming early, not the artifact's acceptance
+    /// gate, and downgrading the verdict here would erase a judgement to record
+    /// a decision about the debate.
+    pub fn consensus_floor(&self, threshold: f64) -> ConsensusFloor {
+        if self.verdict != Verdict::Pass {
+            return ConsensusFloor::NotAPass;
+        }
+        match self.score {
+            None => ConsensusFloor::ScoreAbsent,
+            Some(score) if f64::from(score) >= threshold * 100.0 => ConsensusFloor::Met,
+            Some(_) => ConsensusFloor::NotMet,
         }
     }
 }
@@ -870,6 +916,50 @@ mod tests {
         let mut result = pass_result(Vec::new());
         result.enforce_criteria_evidence(false);
         assert_eq!(result.verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn the_floor_is_the_boundary_itself() {
+        // 0.8 of 100 is 80, and 80 clears it: a bar stated as "at or above" that
+        // refused its own boundary would make the shipped default stricter than
+        // the evaluator's own pass rule, which names the same 80.
+        let mut result = pass_result(Vec::new());
+        result.score = Some(80);
+        assert_eq!(result.consensus_floor(0.8), ConsensusFloor::Met);
+
+        result.score = Some(79);
+        assert_eq!(result.consensus_floor(0.8), ConsensusFloor::NotMet);
+    }
+
+    #[test]
+    fn a_pass_with_no_score_does_not_clear_the_floor() {
+        let mut result = pass_result(Vec::new());
+        result.score = None;
+        assert_eq!(result.consensus_floor(0.1), ConsensusFloor::ScoreAbsent);
+    }
+
+    #[test]
+    fn a_judgement_that_is_not_a_pass_is_not_a_floor_question() {
+        let mut result = pass_result(Vec::new());
+        result.verdict = Verdict::Fail;
+        // A score far above the bar does not make a Fail clear the floor: the
+        // verdict is the evaluator's reading of the work, and consensus is
+        // built out of passes, not out of high scores attached to failures.
+        result.score = Some(95);
+        assert_eq!(result.consensus_floor(0.8), ConsensusFloor::NotAPass);
+    }
+
+    #[test]
+    fn the_floor_does_not_rewrite_the_verdict_it_reads() {
+        let mut result = pass_result(Vec::new());
+        result.score = Some(10);
+        assert_eq!(result.consensus_floor(0.8), ConsensusFloor::NotMet);
+        assert_eq!(
+            result.verdict,
+            Verdict::Pass,
+            "the floor decides whether the debate confirms; it does not overrule the judge"
+        );
+        assert_eq!(result.score, Some(10));
     }
 
     #[test]

@@ -1398,8 +1398,8 @@ mod tests {
 
         match verdict {
             RalphVerdict::Passed { iterations, .. } => {
-                // 第一次 internal iteration 因 prev_score=-1 不会 break，
-                // 第二次因 score 差值 <5 达成 consensus，Ralph 总迭代应为 1。
+                // roundtable 第 2 个 internal iteration 确认共识：连续两轮 Pass 且每轮
+                // score 92 都高过 0.3 的地板（30），Ralph 外层因此一轮就结束。
                 assert_eq!(iterations, 1);
             }
             other => panic!("Expected Passed with low threshold, got {:?}", other),
@@ -1412,8 +1412,8 @@ mod tests {
             max_iterations: 2,
             ..Default::default()
         });
-        // consensus_threshold=1.0 要求 score=100，mock evaluator 返回 92 分 → 无法 consensus。
-        // Ralph 两轮后耗尽迭代预算。
+        // roundtable 只给一轮，凑不出「连续两轮」这个前提，共识无从谈起——地板
+        // （1.0 要 100 分，mock 返回 92）只是又拦一道。Ralph 两轮后耗尽迭代预算。
         let config = PgeRoundtableConfig {
             max_iterations: 1,
             consensus_threshold: 1.0,
