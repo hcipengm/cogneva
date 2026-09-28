@@ -636,6 +636,32 @@ fn the_outlet_table_is_a_usable_premise() {
     );
 }
 
+/// 每个要签名的出口，名字都得是通知侧真的会注册的那个出口。
+///
+/// 契约层那张表（`PlatformOutlet`）是它自己的声明——"这两个出口要签名"；出口清单在
+/// `cog-notification` 的地址表里。契约 crate 不能反过来依赖通知 crate（依赖方向是
+/// 上层依赖 core），所以两边一致这件事只能在这里判，判的是**方向单侧**的：签名口径里
+/// 的每个名字都要在出口清单里找得到。
+///
+/// 对不上时运行期没有任何读数：签名请求会落在一个没有出口认的名字上，而与"这个出口
+/// 没配地址"是同一个静默（都只是一行 warn）。反向（出口清单里多一个要签名而契约没列
+/// 的出口）在这里判不了——那需要第二份"哪个出口要签名"的声明，而多一份声明就多一处
+/// 会分叉的地方；真要漏，症状是那个出口的报文没有签名，由投递读数里的
+/// `envelope_error` 说。
+#[test]
+fn every_signable_outlet_is_an_outlet_the_plugin_can_register() {
+    let registered: BTreeSet<&str> = OUTLET_ADDRESS_PATHS.iter().map(|(o, _)| *o).collect();
+    for outlet in cog_core::contract::platform_sign::PlatformOutlet::ALL {
+        assert!(
+            registered.contains(outlet.as_str()),
+            "签名口径里的出口 `{}` 不在通知侧注册的出口清单里（清单：{:?}）：\
+             它的签名请求会落在一个没有出口认的名字上",
+            outlet.as_str(),
+            registered
+        );
+    }
+}
+
 /// 每个出口都得从部署面拿到地址：配置文档给名字、ConfigMap 送名字、values 存值。
 #[test]
 fn every_outlet_the_plugin_can_register_is_reachable_from_the_deploy_surface() {
