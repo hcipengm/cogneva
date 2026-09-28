@@ -82,16 +82,24 @@ impl MergerActor {
             input["response_format"] = serde_json::json!("json");
         }
 
-        let mut output = match self.agent.prompt_for_task(&task.id, input).await {
+        let (mut output, review_basis) = match self.agent.prompt_for_task(&task.id, input).await {
             Ok(result) => {
                 if let Some(ref schema) = self.output_schema {
                     crate::actors::validate_against_schema(schema, &result.to_string(), "merger");
                 }
-                parse_merge_result(&result, branches)
+                (
+                    parse_merge_result(&result, branches),
+                    crate::actors::ReviewBasis::HeldTo(crate::actors::review_spec(task, &[])),
+                )
             }
             Err(e) => {
                 tracing::warn!("Merger prompt failed: {}", e);
-                fallback_best_branch(branches)
+                (
+                    fallback_best_branch(branches),
+                    crate::actors::ReviewBasis::Skipped(
+                        crate::observable::SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE,
+                    ),
+                )
             }
         };
         let output_str = serde_json::to_string_pretty(&output).unwrap_or_default();
@@ -100,6 +108,7 @@ impl MergerActor {
             &self.self_review,
             &output_str,
             "merger",
+            review_basis,
         )
         .await
         {

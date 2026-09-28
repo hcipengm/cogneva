@@ -303,8 +303,14 @@ impl ModeSelectorActor {
             None => agent.prompt(input).await.ok()?,
         };
         let result_str = serde_json::to_string_pretty(&result).unwrap_or_default();
-        crate::actors::maybe_self_review(agent, &self.self_review, &result_str, "mode_selector")
-            .await;
+        crate::actors::maybe_self_review(
+            agent,
+            &self.self_review,
+            &result_str,
+            "mode_selector",
+            crate::actors::ReviewBasis::HeldTo(goal.to_string()),
+        )
+        .await;
         let text = Self::extract_text(&result);
 
         debug!(raw_response = %text, "ModeSelectorAgent LLM raw response");

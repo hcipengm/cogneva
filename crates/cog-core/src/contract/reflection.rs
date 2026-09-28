@@ -20,7 +20,11 @@ pub struct SkillOutcome {
     /// Task type fingerprint (e.g. "backend:api:migration").
     pub task_signature: String,
     pub success: bool,
-    /// Self-review score (0.0–1.0) if available.
+    /// The score the producing squad reported for the run, when it reported
+    /// one; callers that encode the outcome instead set 1.0 on success and 0.0
+    /// on failure. It is neither produced by the self-review loop nor read by
+    /// any gate — it is what the producer said about its own work, which is the
+    /// only thing a run's outcome can carry across the process boundary.
     pub score: Option<f32>,
     /// Wall-clock latency in milliseconds.
     pub latency_ms: u64,
@@ -87,6 +91,12 @@ pub struct GeneratedChange {
     pub affected_files: Vec<String>,
     pub rationale: Option<String>,
     pub pge_mode: String,
+    /// The score the producing squad reported for the run that produced this
+    /// change. Nothing compares it to a threshold: whether a change lands is
+    /// decided elsewhere, so this is a reading of what the producer said and
+    /// never evidence that the change passed a gate. The self-review loop's own
+    /// score is a different number and lives in
+    /// [`crate::SelfReviewResult`].
     pub self_review_score: Option<f32>,
     /// Public issue this change resolves, when the intent came from a tracked
     /// issue. Sinks use it to link the PR back (`Fixes #N`) so competing

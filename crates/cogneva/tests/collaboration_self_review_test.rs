@@ -15,6 +15,11 @@ struct DummyProvider {
     /// Actor header of every call, in order, so a test can assert which
     /// component a review's token spend was charged to.
     actors: std::sync::Mutex<Vec<String>>,
+    /// The user message of every call, in order. The payload is the only place
+    /// the standard a review was held to is visible from outside: the score it
+    /// returns is the same number whether it was judged against a specification
+    /// or against nothing at all.
+    payloads: std::sync::Mutex<Vec<String>>,
 }
 
 impl DummyProvider {
@@ -22,11 +27,32 @@ impl DummyProvider {
         Self {
             responses: std::sync::Mutex::new(responses),
             actors: std::sync::Mutex::new(Vec::new()),
+            payloads: std::sync::Mutex::new(Vec::new()),
         }
     }
 
     fn actors(&self) -> Vec<String> {
         self.actors.lock().unwrap().clone()
+    }
+
+    fn payloads(&self) -> Vec<String> {
+        self.payloads.lock().unwrap().clone()
+    }
+
+    fn note_call(&self, messages: &[Message], options: &ChatOptions) {
+        self.actors.lock().unwrap().push(
+            options
+                .headers
+                .get(cog_core::LLM_ACTOR_HEADER)
+                .cloned()
+                .unwrap_or_else(|| "none".into()),
+        );
+        let text = messages
+            .iter()
+            .map(|m| m.content())
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.payloads.lock().unwrap().push(text);
     }
 
     fn pop_response(&self) -> String {
@@ -40,14 +66,8 @@ impl DummyProvider {
 
 #[async_trait]
 impl cog_core::LlmClient for DummyProvider {
-    async fn chat(&self, _messages: &[Message], options: &ChatOptions) -> SFResult<ChatResponse> {
-        self.actors.lock().unwrap().push(
-            options
-                .headers
-                .get(cog_core::LLM_ACTOR_HEADER)
-                .cloned()
-                .unwrap_or_else(|| "none".into()),
-        );
+    async fn chat(&self, messages: &[Message], options: &ChatOptions) -> SFResult<ChatResponse> {
+        self.note_call(messages, options);
         let text = self.pop_response();
         Ok(ChatResponse {
             content: vec![ContentBlock::text(text)],
@@ -66,9 +86,10 @@ impl cog_core::LlmClient for DummyProvider {
 
     async fn chat_stream(
         &self,
-        _messages: &[Message],
-        _options: &ChatOptions,
+        messages: &[Message],
+        options: &ChatOptions,
     ) -> SFResult<AssistantMessageEventStream> {
+        self.note_call(messages, options);
         let (stream, mut producer) =
             AssistantMessageEventStream::with_capacity(cog_core::DEFAULT_STREAM_CAPACITY);
         let text = self.pop_response();
@@ -153,13 +174,48 @@ async fn test_compare_parses_llm_json() {
         strengths: vec!["strength1".into()],
         raw: "raw".into(),
     };
-    let comparison = SelfReviewLoop::compare(&critique, &[], "self_review", &provider)
+    let comparison = SelfReviewLoop::compare(&critique, "", &[], "self_review", &provider)
         .await
         .unwrap();
 
     assert_eq!(comparison.gaps, vec!["gap1"]);
     assert_eq!(comparison.aligned, vec!["aligned1"]);
     assert!((comparison.score - 0.75).abs() < f32::EPSILON);
+}
+
+/// The step that produces the score is held to the same standard as the step
+/// that finds the defects.
+///
+/// A specification handed to the critique step and withheld from the comparison
+/// step leaves the score resting on the reviewer's own findings: the number is
+/// what the pass/fail decision reads, and nothing the caller declared can
+/// contradict it. Both payloads are asserted, because the two steps are only
+/// distinguishable from the outside by what they were sent.
+#[tokio::test]
+async fn test_the_comparison_step_is_held_to_the_specification() {
+    let provider = DummyProvider::new(vec![
+        r#"{"issues":[],"missing":[],"strengths":[]}"#.into(),
+        r#"{"gaps":[],"aligned":[],"score":1.0}"#.into(),
+    ]);
+    let config = SelfReviewConfig {
+        spec: Some("acceptance criteria: no rollback step, no test".into()),
+        ..SelfReviewConfig::default()
+    };
+
+    let _ = SelfReviewLoop::new(config).review("draft", &provider).await;
+
+    let payloads = provider.payloads();
+    assert_eq!(payloads.len(), 2, "critique and compare, one call each");
+    assert!(
+        payloads[0].contains("no rollback step"),
+        "the critique step is held to the specification: {}",
+        payloads[0]
+    );
+    assert!(
+        payloads[1].contains("no rollback step"),
+        "and so is the step that scores against it: {}",
+        payloads[1]
+    );
 }
 
 /// Self-review runs on behalf of every agent, so its spend has to be charged
@@ -204,6 +260,16 @@ async fn test_review_without_a_caller_names_the_component_alone() {
     );
 }
 
+/// A critique with the given findings and nothing else, for the decide tests.
+fn critique_of(issues: &[&str], missing: &[&str]) -> Critique {
+    Critique {
+        issues: issues.iter().map(|s| s.to_string()).collect(),
+        missing: missing.iter().map(|s| s.to_string()).collect(),
+        strengths: Vec::new(),
+        raw: "raw".into(),
+    }
+}
+
 #[tokio::test]
 async fn test_decide_pass_when_above_threshold() {
     let comparison = Comparison {
@@ -212,7 +278,7 @@ async fn test_decide_pass_when_above_threshold() {
         score: 0.85,
         raw: "raw".into(),
     };
-    let result = SelfReviewLoop::decide(&comparison, 0.8);
+    let result = SelfReviewLoop::decide(&critique_of(&[], &[]), &comparison, 0.8);
 
     assert!(
         matches!(result, SelfReviewResult::Pass { score, .. } if (score - 0.85).abs() < f32::EPSILON)
@@ -227,11 +293,43 @@ async fn test_decide_need_revision_when_below_threshold() {
         score: 0.5,
         raw: "raw".into(),
     };
-    let result = SelfReviewLoop::decide(&comparison, 0.8);
+    let result = SelfReviewLoop::decide(&critique_of(&[], &[]), &comparison, 0.8);
 
     assert!(
-        matches!(result, SelfReviewResult::NeedRevision { critique, score, .. } if critique == "missing docs" && (score - 0.5).abs() < f32::EPSILON)
+        matches!(result, SelfReviewResult::NeedRevision { critique, score, .. } if critique == "missing docs" && (score - 0.5).abs() < f32::EPSILON),
+        "a critique that found nothing leaves the gap restatement as the instruction"
     );
+}
+
+/// The revision is told what the critique step found, not a coarser restatement
+/// of it: the issues and missing items name the defect in more detail than the
+/// gaps derived from them, and a revision that is told less than the call before
+/// it is a revision that misses on the first round and buys another one.
+#[tokio::test]
+async fn a_revision_is_told_the_findings_the_critique_step_named() {
+    let comparison = Comparison {
+        gaps: vec!["the plan is thin".into()],
+        aligned: vec![],
+        score: 0.4,
+        raw: "raw".into(),
+    };
+    let result = SelfReviewLoop::decide(
+        &critique_of(&["no rollback step"], &["no test"]),
+        &comparison,
+        0.8,
+    );
+
+    match result {
+        SelfReviewResult::NeedRevision {
+            critique,
+            suggestions,
+            ..
+        } => {
+            assert_eq!(critique, "no rollback step; no test");
+            assert_eq!(suggestions, vec!["the plan is thin".to_string()]);
+        }
+        other => panic!("a score below the threshold asks for a revision, got {other:?}"),
+    }
 }
 
 #[tokio::test]

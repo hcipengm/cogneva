@@ -165,7 +165,7 @@ impl GeneratorActor {
             "context": ctx,
         });
 
-        let mut output = match self.agent.prompt_for_task(&task.id, input).await {
+        let (mut output, review_basis) = match self.agent.prompt_for_task(&task.id, input).await {
             Ok(result) => {
                 let effective_schema = self.output_schema.as_ref().or_else(|| {
                     self.prompt_skill
@@ -179,7 +179,10 @@ impl GeneratorActor {
                         "generator",
                     );
                 }
-                crate::squad::pge::parse_generator_output(&result)
+                (
+                    crate::squad::pge::parse_generator_output(&result),
+                    crate::actors::ReviewBasis::HeldTo(crate::actors::review_spec(task, &[])),
+                )
             }
             Err(e) => {
                 tracing::warn!("Generator prompt failed: {}", e);
@@ -189,29 +192,39 @@ impl GeneratorActor {
                 // so the pipeline still stops instead of paying for identical
                 // retries, while feedback and the learning chain name the actual
                 // cause instead of a generator defect that is not there.
-                GeneratorOutput {
-                    content: serde_json::Value::String(format!("environment_error: {e}")),
-                    artifacts: Vec::new(),
-                }
+                (
+                    GeneratorOutput {
+                        content: serde_json::Value::String(format!("environment_error: {e}")),
+                        artifacts: Vec::new(),
+                    },
+                    crate::actors::ReviewBasis::Skipped(
+                        crate::observable::SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE,
+                    ),
+                )
             }
         };
         let output_str = serde_json::to_string_pretty(&output).unwrap_or_default();
         // Skip self-review for self-evolution change generation. Reasoning-only
         // models often return natural-language explanations instead of strict
         // JSON, so the self-review reformat step can hang for the full timeout
-        // without adding value once the change has been extracted.
-        if !is_self_evolution {
-            if let Some(revised) = crate::actors::maybe_self_review(
-                self.agent.as_ref(),
-                &self.self_review,
-                &output_str,
-                "generator",
-            )
-            .await
-            {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&revised) {
-                    output = crate::squad::pge::parse_generator_output(&value);
-                }
+        // without adding value once the change has been extracted. The skip is
+        // named so the calls it saves are a reading rather than an absence.
+        let review_basis = if is_self_evolution {
+            crate::actors::ReviewBasis::Skipped(crate::observable::SELF_REVIEW_SKIP_SELF_EVOLUTION)
+        } else {
+            review_basis
+        };
+        if let Some(revised) = crate::actors::maybe_self_review(
+            self.agent.as_ref(),
+            &self.self_review,
+            &output_str,
+            "generator",
+            review_basis,
+        )
+        .await
+        {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&revised) {
+                output = crate::squad::pge::parse_generator_output(&value);
             }
         }
         output

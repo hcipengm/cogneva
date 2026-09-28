@@ -228,18 +228,27 @@ impl PlannerActor {
         // 上游已经失败时不能再走自审：那会为同一个不可用的上游再买一次调用，
         // 而且改写的输出会把上面带下来的真因覆盖掉，降级重新变得无声。
         let output_str = serde_json::to_string_pretty(&output).unwrap_or_default();
-        if !output.is_terminal_env_failure() {
-            if let Some(revised) = crate::actors::maybe_self_review(
-                self.agent.as_ref(),
-                &self.self_review,
-                &output_str,
-                "planner",
+        // 上游已经失败时不能再走自审：那会为同一个不可用的上游再买一次调用，
+        // 而且改写的输出会把上面带下来的真因覆盖掉，降级重新变得无声。理由
+        // 交给自审漏斗，于是「这次没审」和「这次审了」一样有读数。
+        let review_basis = if output.is_terminal_env_failure() {
+            crate::actors::ReviewBasis::Skipped(
+                crate::observable::SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE,
             )
-            .await
-            {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&revised) {
-                    output = crate::squad::pge::parse_planner_output(&value, goal);
-                }
+        } else {
+            crate::actors::ReviewBasis::HeldTo(crate::actors::review_spec(task, &[]))
+        };
+        if let Some(revised) = crate::actors::maybe_self_review(
+            self.agent.as_ref(),
+            &self.self_review,
+            &output_str,
+            "planner",
+            review_basis,
+        )
+        .await
+        {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&revised) {
+                output = crate::squad::pge::parse_planner_output(&value, goal);
             }
         }
         output

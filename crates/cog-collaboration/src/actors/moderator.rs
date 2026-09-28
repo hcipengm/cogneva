@@ -128,7 +128,7 @@ impl ModeratorActor {
             }
         }
 
-        let mut output = match self.agent.prompt_for_task(&task.id, input).await {
+        let (mut output, review_basis) = match self.agent.prompt_for_task(&task.id, input).await {
             Ok(result) => {
                 if let Some(ref schema) = self.output_schema {
                     crate::actors::validate_against_schema(
@@ -137,11 +137,19 @@ impl ModeratorActor {
                         "moderator",
                     );
                 }
-                parse_moderator_output(&result)
+                (
+                    parse_moderator_output(&result),
+                    crate::actors::ReviewBasis::HeldTo(crate::actors::review_spec(task, &[])),
+                )
             }
             Err(e) => {
                 tracing::warn!("Moderator prompt failed: {}", e);
-                ModeratorOutput::default()
+                (
+                    ModeratorOutput::default(),
+                    crate::actors::ReviewBasis::Skipped(
+                        crate::observable::SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE,
+                    ),
+                )
             }
         };
         let output_str = serde_json::to_string_pretty(&output).unwrap_or_default();
@@ -150,6 +158,7 @@ impl ModeratorActor {
             &self.self_review,
             &output_str,
             "moderator",
+            review_basis,
         )
         .await
         {

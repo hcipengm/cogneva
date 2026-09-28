@@ -18,6 +18,30 @@ pub const ROUTING_DECLARATION_FACE_GONE_RULE: &str = "routing_declaration_face_g
 
 static GLOBAL: OnceLock<Arc<CollaborationObservable>> = OnceLock::new();
 
+/// 自审的判定取值域。三个值都是结局，不是过程：`failed` 这一格存在的理由与
+/// 另外两格相同——只按成功发布结局的族没有失败面，一次都答不上来的自审会
+/// 与「没有自审」在读数上完全同形。
+pub const SELF_REVIEW_VERDICT_PASS: &str = "pass";
+pub const SELF_REVIEW_VERDICT_NEED_REVISION: &str = "need_revision";
+pub const SELF_REVIEW_VERDICT_FAILED: &str = "failed";
+
+/// 判据面：自审这次比对有没有外部判据（配置里的 spec、best_practices，或调用点
+/// 交上来的任务说明）。`absent` 不是错误态，是「这次打分的输入只有它自己上一步
+/// 写出来的文本」——分数能不能被反驳，全看这一格。
+pub const SELF_REVIEW_CRITERIA_DECLARED: &str = "declared";
+pub const SELF_REVIEW_CRITERIA_ABSENT: &str = "absent";
+
+/// 自审被跳过的原因取值域。与判定面分开一处：跳过不是一次判定，读「门说了不」
+/// 的那一格不能把「门根本没开」算进去。
+///
+/// `upstream_unavailable`：actor 自己都没到上游，输出是占位符——省下的是两次
+/// 注定无效的调用（判据：输出来自 fallback 分支）。`disabled`：这段输出整个
+/// 不属于自审覆盖的面（配置没开）。`self_evolution`：自进化产出按记录在案的
+/// 理由不审（推理型模型会吐自然语言，改写步会挂满超时）。
+pub const SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE: &str = "upstream_unavailable";
+pub const SELF_REVIEW_SKIP_DISABLED: &str = "disabled";
+pub const SELF_REVIEW_SKIP_SELF_EVOLUTION: &str = "self_evolution";
+
 pub fn global_observable() -> Arc<CollaborationObservable> {
     GLOBAL
         .get_or_init(|| Arc::new(CollaborationObservable::new()))
@@ -25,6 +49,12 @@ pub fn global_observable() -> Arc<CollaborationObservable> {
 }
 
 use tokio::sync::Mutex;
+
+/// 自审判定的单元：(stage, criteria, verdict)。三段都取自闭集，所以单元数有界。
+type SelfReviewCell = (String, String, String);
+
+/// 自审跳过的单元：(stage, reason)。
+type SelfReviewSkipCell = (String, String);
 
 /// Collaboration-layer observable state.
 #[derive(Default)]
@@ -74,6 +104,25 @@ pub struct CollaborationObservable {
     /// along; when one stops, the rows still come back and only this face says
     /// they now name the run instead of the work.
     goal_class_sources: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    /// Self-review verdicts, keyed by (stage, criteria, verdict).
+    ///
+    /// The three faces answer three different questions a review's log line
+    /// cannot: which stages review at all, how often the gate said no (the
+    /// count of iterations, and therefore of LLM calls, follows from it), and
+    /// whether the comparison had anything outside the review to compare
+    /// against. That last one is the only way to tell a reviewing stage from a
+    /// stage that reviews its own text with no standard — the two look
+    /// identical from the score alone, which is why the score alone was never
+    /// enough to decide whether the gate was doing anything.
+    self_review_verdicts: Arc<std::sync::Mutex<HashMap<SelfReviewCell, u64>>>,
+    /// Self-review skips, keyed by (stage, reason).
+    ///
+    /// A review that is not run is a saving, and an unread saving is not one:
+    /// two calls per skipped review are the difference between the review
+    /// surface costing what it is supposed to and costing double while it
+    /// closes nothing. Kept apart from the verdict cells so "the gate objected"
+    /// and "the gate never opened" never add up to the same number.
+    self_review_skips: Arc<std::sync::Mutex<HashMap<SelfReviewSkipCell, u64>>>,
     /// Resume outcomes, over the closed set in [`crate::resume::RESUME_OUTCOMES`].
     /// The chain whose absence this measures is silent by construction: a task
     /// whose progress was never resumed simply starts again, which is what a
@@ -116,6 +165,44 @@ impl CollaborationObservable {
         if let Ok(mut map) = self.change_yields.try_lock() {
             *map.entry(outcome.to_string()).or_insert(0) += 1;
         }
+    }
+
+    /// Record one self-review verdict.
+    ///
+    /// A synchronous lock: this counter is the evidence of how often the quality
+    /// gate said no — and a dropped count would read as a gate that never
+    /// objected, which is precisely the state the counter exists to rule out.
+    pub fn record_self_review_verdict(
+        &self,
+        stage: &str,
+        config: &cog_core::SelfReviewConfig,
+        verdict: &str,
+    ) {
+        let criteria = if config.has_external_criterion() {
+            SELF_REVIEW_CRITERIA_DECLARED
+        } else {
+            SELF_REVIEW_CRITERIA_ABSENT
+        };
+        let mut map = self
+            .self_review_verdicts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *map.entry((stage.to_string(), criteria.to_string(), verdict.to_string()))
+            .or_insert(0) += 1;
+    }
+
+    /// Record one self-review that was not run, and why.
+    ///
+    /// Synchronous for the same reason as the verdict counter: a dropped count
+    /// would read as reviews that were run, and the calls they cost, coming
+    /// back.
+    pub fn record_self_review_skip(&self, stage: &str, reason: &str) {
+        let mut map = self
+            .self_review_skips
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *map.entry((stage.to_string(), reason.to_string()))
+            .or_insert(0) += 1;
     }
 
     /// Record one route decision. A synchronous lock, because the cell is the
@@ -225,6 +312,31 @@ impl Observable for CollaborationObservable {
                 metrics.push(
                     RawMetric::new("self_evolution_change_yield_total", *count as f64)
                         .with_label("outcome", outcome),
+                );
+            }
+            let reviews = self
+                .self_review_verdicts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            for ((stage, criteria, verdict), count) in reviews.iter() {
+                metrics.push(
+                    RawMetric::new("self_review_verdict_total", *count as f64)
+                        .with_label("stage", stage)
+                        .with_label("criteria", criteria)
+                        .with_label("verdict", verdict),
+                );
+            }
+            let skips = self
+                .self_review_skips
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            for ((stage, reason), count) in skips.iter() {
+                metrics.push(
+                    RawMetric::new("self_review_skipped_total", *count as f64)
+                        .with_label("stage", stage)
+                        .with_label("reason", reason),
                 );
             }
 
@@ -359,6 +471,47 @@ mod tests {
 
     fn metric(metrics: &[RawMetric], name: &str) -> Option<RawMetric> {
         metrics.iter().find(|m| m.name == name).cloned()
+    }
+
+    /// 判据面与判定面一起发布。一次「有外部判据」的自审和一次「只有自己上一步
+    /// 写出来的文本」的自审，在分数、日志、调用次数上完全同形；只有这一格能把
+    /// 它们分开，而这一步是不是在给东西打分，全看它。
+    #[tokio::test]
+    async fn a_review_is_counted_by_the_standard_it_was_held_to() {
+        let obs = CollaborationObservable::new();
+        let held_to_a_standard = cog_core::SelfReviewConfig {
+            spec: Some("the task's own words".into()),
+            ..Default::default()
+        };
+        obs.record_self_review_verdict("planner", &held_to_a_standard, SELF_REVIEW_VERDICT_PASS);
+        obs.record_self_review_verdict(
+            "moderator",
+            &cog_core::SelfReviewConfig::default(),
+            SELF_REVIEW_VERDICT_NEED_REVISION,
+        );
+
+        let metrics = obs.collect_metrics("D8").await.unwrap();
+        let reviews: Vec<&RawMetric> = metrics
+            .iter()
+            .filter(|m| m.name == "self_review_verdict_total")
+            .collect();
+        assert_eq!(reviews.len(), 2);
+        let cell = |stage: &str, criteria: &str, verdict: &str| {
+            reviews
+                .iter()
+                .find(|m| {
+                    m.labels.get("stage").map(String::as_str) == Some(stage)
+                        && m.labels.get("criteria").map(String::as_str) == Some(criteria)
+                        && m.labels.get("verdict").map(String::as_str) == Some(verdict)
+                })
+                .map(|m| m.value)
+                .unwrap_or_else(|| panic!("{stage}/{criteria}/{verdict} is reported"))
+        };
+        assert_eq!(cell("planner", SELF_REVIEW_CRITERIA_DECLARED, "pass"), 1.0);
+        assert_eq!(
+            cell("moderator", SELF_REVIEW_CRITERIA_ABSENT, "need_revision"),
+            1.0
+        );
     }
 
     #[tokio::test]

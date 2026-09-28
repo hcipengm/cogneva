@@ -1586,7 +1586,12 @@ fn commit_message(identity: &BotIdentityConfig, change: &GeneratedChange) -> Str
         body.push_str(&format!("\n## Rationale\n\n{rationale}\n"));
     }
     if let Some(score) = change.self_review_score {
-        body.push_str(&format!("\nSelf-review score: {score:.2}\n"));
+        // 行文必须自己说清它不是门：这个值没有任何阈值比较，落地与否由别的
+        // 判定决定。写成 "Self-review score" 时，读提交体的人会以为这条变更
+        // 通过了一次质量门——而那个门在别处，且不看这个数。
+        body.push_str(&format!(
+            "\nScore the producing squad reported: {score:.2} (informational; no gate reads it)\n"
+        ));
     }
     if !change.affected_files.is_empty() {
         body.push_str(&format!(

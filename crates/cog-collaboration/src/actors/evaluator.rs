@@ -130,7 +130,12 @@ impl EvaluatorActor {
             // Self-review for self-evolution is skipped: the deterministic change
             // validation already gives a reliable verdict, and reasoning-only
             // models frequently fail structured JSON extraction, causing the
-            // reformat step to hang for the full timeout.
+            // reformat step to hang for the full timeout. Counted, so the calls
+            // this early return saves are a reading rather than an absence.
+            crate::actors::note_self_review_skip(
+                "evaluator",
+                crate::observable::SELF_REVIEW_SKIP_SELF_EVOLUTION,
+            );
             let _ = output_str;
             return output;
         }
@@ -190,7 +195,7 @@ impl EvaluatorActor {
             "context": ctx,
         });
 
-        let mut output = match self.agent.prompt_for_task(&task.id, input).await {
+        let (mut output, review_basis) = match self.agent.prompt_for_task(&task.id, input).await {
             Ok(result) => {
                 let effective_schema = self.output_schema.as_ref().or_else(|| {
                     self.prompt_skill
@@ -204,17 +209,25 @@ impl EvaluatorActor {
                         "evaluator",
                     );
                 }
-                crate::squad::pge::parse_evaluation_result(&result)
+                (
+                    crate::squad::pge::parse_evaluation_result(&result),
+                    crate::actors::ReviewBasis::HeldTo(crate::actors::review_spec(task, criteria)),
+                )
             }
             Err(e) => {
                 tracing::warn!("Evaluator prompt failed: {}", e);
-                EvaluationResult {
-                    verdict: Verdict::Fail,
-                    feedback: "Evaluation failed".into(),
-                    score: None,
-                    criteria: Vec::new(),
-                    details: None,
-                }
+                (
+                    EvaluationResult {
+                        verdict: Verdict::Fail,
+                        feedback: "Evaluation failed".into(),
+                        score: None,
+                        criteria: Vec::new(),
+                        details: None,
+                    },
+                    crate::actors::ReviewBasis::Skipped(
+                        crate::observable::SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE,
+                    ),
+                )
             }
         };
         let output_str = serde_json::to_string_pretty(&output).unwrap_or_default();
@@ -223,6 +236,7 @@ impl EvaluatorActor {
             &self.self_review,
             &output_str,
             "evaluator",
+            review_basis,
         )
         .await
         {

@@ -131,12 +131,18 @@ impl SelfReviewLoop {
             let critique = SelfReviewLoop::critique(&observation, spec, &self.actor, llm).await?;
 
             // Step 3: Compare
-            let comparison =
-                SelfReviewLoop::compare(&critique, &self.config.best_practices, &self.actor, llm)
-                    .await?;
+            let comparison = SelfReviewLoop::compare(
+                &critique,
+                spec,
+                &self.config.best_practices,
+                &self.actor,
+                llm,
+            )
+            .await?;
 
             // Step 4: Decide
-            let result = SelfReviewLoop::decide(&comparison, self.config.quality_threshold);
+            let result =
+                SelfReviewLoop::decide(&critique, &comparison, self.config.quality_threshold);
 
             match &result {
                 SelfReviewResult::Pass { .. } => {
@@ -199,9 +205,15 @@ impl SelfReviewLoop {
         })
     }
 
-    /// Step 3: Compare — compare critique against best practices.
+    /// Step 3: Compare — compare critique against the standard in force.
+    ///
+    /// The specification is part of this step's input, not only the critique
+    /// step's: this is where the score is produced, and a score judged against
+    /// nothing but the reviewer's own findings is a number no caller can
+    /// contradict — the loop's pass/fail would rest on it either way.
     pub async fn compare(
         critique: &Critique,
+        spec: &str,
         best_practices: &[String],
         actor: &str,
         llm: &dyn LlmClient,
@@ -210,6 +222,7 @@ impl SelfReviewLoop {
             "issues": critique.issues,
             "missing": critique.missing,
             "strengths": critique.strengths,
+            "spec": spec,
             "best_practices": best_practices,
         });
         let user_msg = Message::user(user_payload.to_string());
@@ -227,7 +240,11 @@ impl SelfReviewLoop {
     }
 
     /// Step 4: Decide — PASS or NEED_REVISION based on score vs threshold.
-    pub fn decide(comparison: &Comparison, threshold: f32) -> SelfReviewResult {
+    pub fn decide(
+        critique: &Critique,
+        comparison: &Comparison,
+        threshold: f32,
+    ) -> SelfReviewResult {
         if comparison.score >= threshold {
             SelfReviewResult::Pass {
                 score: comparison.score,
@@ -240,8 +257,25 @@ impl SelfReviewLoop {
                 ),
             }
         } else {
+            // The revision is told what the critique step found, not a
+            // restatement of it: `issues`/`missing` name what is wrong in more
+            // detail than the gaps derived from them, and handing `revise` the
+            // coarser text left it less informed than the call before it. The
+            // gap restatement stays as the fallback, so a critique that found
+            // nothing is not an empty instruction.
+            let findings: Vec<String> = critique
+                .issues
+                .iter()
+                .chain(critique.missing.iter())
+                .cloned()
+                .collect();
+            let critique_text = if findings.is_empty() {
+                comparison.gaps.join("; ")
+            } else {
+                findings.join("; ")
+            };
             SelfReviewResult::NeedRevision {
-                critique: comparison.gaps.join("; "),
+                critique: critique_text,
                 suggestions: comparison.gaps.clone(),
                 score: comparison.score,
             }
