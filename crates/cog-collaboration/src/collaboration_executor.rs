@@ -5,6 +5,7 @@ use tracing::info;
 
 use crate::{
     actors::ModeSelectorActor,
+    observable::{global_observable, BOUNDARY_NO_HARD_RULES, BOUNDARY_PASSED, BOUNDARY_VIOLATED},
     profile::derive_task_profile,
     squad::{SquadConfig, SquadExecutor, SquadResult},
 };
@@ -557,6 +558,7 @@ impl CollaborationExecutor {
 
         info!(task_id=%task.id, "Collaboration decomposition succeeded");
         let atomic_tasks = Self::extract_atomic_tasks(&result);
+        self.enforce_boundaries(task, &result, &atomic_tasks)?;
         let score = Self::extract_score(&result);
         let sub_task_types = Self::sub_task_types(&atomic_tasks);
 
@@ -833,6 +835,113 @@ impl CollaborationExecutor {
     /// become the root cause the Evaluator reads back for this class of task.
     /// A run that states no reason leaves the field empty — "no cause recorded"
     /// is a reading, "something failed" is not.
+    /// Read the configured boundary rules against the decomposition that was
+    /// just produced, at the one point where the declaration and the tasks it
+    /// is about are both in hand.
+    ///
+    /// The rules arrive from the `/boundary` configuration section and are the
+    /// only place a task-size budget is declared. They are read here rather
+    /// than handed to an agent because a rule typed `hard` is the one kind with
+    /// a concrete check in code — passing an oversized plan to a model and
+    /// asking whether it is oversized makes the answer a second opinion rather
+    /// than a verdict, and a budget that only a sampled judgement enforces is
+    /// not a budget.
+    ///
+    /// A violation refuses the decomposition: the plan is not delivered, the
+    /// refused run is archived with the violation as its feedback, and the
+    /// error carries the same text. That is what makes the rule actionable —
+    /// the planner is the one that chose the sub-tasks and their inputs, so the
+    /// refusal has to name the dimension, the task and the number for the retry
+    /// to have anything to work from. A refusal that only logged would leave
+    /// the same oversized plan to be produced again.
+    ///
+    /// Skill definitions are not part of the shape this path decomposes — the
+    /// plan carries task specs, not the skill graph `SkillBoundary` compares
+    /// against — so that dimension finds nothing to look up and reports no
+    /// verdict. It is an absent reading, not a passing one, and no other
+    /// dimension is affected by the empty registry.
+    fn enforce_boundaries(
+        &self,
+        task: &Task,
+        result: &SquadResult,
+        atomic_tasks: &[AtomicTask],
+    ) -> SFResult<()> {
+        let observability = global_observable();
+        let rules = match self.boundary_config.as_ref() {
+            Some(config) => config.rules.as_slice(),
+            None => &[],
+        };
+        // Only a rule that is enabled *and* hard has a check to run; a soft one
+        // is the evaluator's, and a disabled one is a declaration the operator
+        // has switched off. Neither is a reason to refuse, and neither is a
+        // reason to say the plan was checked.
+        if !rules
+            .iter()
+            .any(|rule| rule.enabled && rule.rule_type == cog_core::RuleType::Hard)
+        {
+            observability.record_boundary_evaluation(BOUNDARY_NO_HARD_RULES);
+            return Ok(());
+        }
+
+        let skills = cog_core::SkillRegistry::new();
+        let report = cog_core::detect_boundaries(atomic_tasks, &skills, rules);
+        if report.passed {
+            observability.record_boundary_evaluation(BOUNDARY_PASSED);
+            return Ok(());
+        }
+
+        observability.record_boundary_evaluation(BOUNDARY_VIOLATED);
+        for violation in &report.violations {
+            observability.record_boundary_violation(&violation.dimension);
+        }
+        let reason = Self::boundary_refusal(&report);
+        tracing::warn!(task_id=%task.id, rules=rules.len(), violations=report.violations.len(),
+            "Boundary rules refused the decomposition");
+        let mut metadata = TaskResultMetadata::new("collaboration");
+        metadata = metadata.with_feedback(&reason);
+        self.archive_execution(
+            task,
+            &TaskResult {
+                success: false,
+                output: serde_json::json!({
+                    "atomic_tasks": atomic_tasks,
+                    "squad_result": result,
+                    "boundary_report": &report,
+                }),
+                metadata,
+            },
+        );
+        Err(SFError::Agent(reason))
+    }
+
+    /// The text a boundary refusal hands back as failure feedback: every
+    /// violation named by dimension, task and measured value, followed by the
+    /// evaluator's own suggestion for each. A refusal a retry cannot act on is
+    /// only a stall.
+    fn boundary_refusal(report: &cog_core::BoundaryReport) -> String {
+        let violations = report
+            .violations
+            .iter()
+            .map(|violation| {
+                format!(
+                    "{}: task '{}': {}",
+                    violation.dimension, violation.task_id, violation.message
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let mut reason = format!(
+            "Boundary rules refused the decomposition, {} violation(s): {}",
+            report.violations.len(),
+            violations
+        );
+        if !report.suggestions.is_empty() {
+            reason.push_str(". Fix: ");
+            reason.push_str(&report.suggestions.join("; "));
+        }
+        reason
+    }
+
     fn fail_run(
         &self,
         task: &Task,
@@ -1132,11 +1241,29 @@ impl CollaborationExecutor {
         }
     }
 
+    /// Ceiling on [`Self::estimate_tokens`], so a pathological input cannot
+    /// produce an absurd estimate.
+    ///
+    /// It has to sit above every threshold a boundary rule may declare. The
+    /// estimate is the only reading the `TokenBudget` rule compares against, so
+    /// a cap below a declared threshold makes that threshold unreachable by
+    /// construction: the rule is declared, enabled, evaluated — and can never
+    /// fire, which is indistinguishable from a plan that never exceeded it.
+    /// Twice the largest threshold the shipped configurations declare.
+    const TOKEN_ESTIMATE_CAP: u64 = 200_000;
+
     /// Rough token estimate: ~4 chars per token plus 2 000 token overhead for
-    /// prompt wrapping / reasoning. Capped at 50 000.
+    /// prompt wrapping / reasoning, capped at [`Self::TOKEN_ESTIMATE_CAP`].
+    ///
+    /// The cap is the outer bound, not the expected size: it binds only above
+    /// 792 000 characters of serialized input, and it used to sit at 50 000,
+    /// below the declared budget — which is a cap that saturates exactly in the
+    /// regime the budget is about.
     fn estimate_tokens(input: &serde_json::Value) -> u64 {
         let chars = input.to_string().len() as u64;
-        (chars / 4).saturating_add(2_000).min(50_000)
+        (chars / 4)
+            .saturating_add(2_000)
+            .min(Self::TOKEN_ESTIMATE_CAP)
     }
 
     /// Rough time estimate based on task name heuristics and input size.
@@ -1158,6 +1285,7 @@ impl CollaborationExecutor {
 #[cfg(test)]
 mod tests {
     use super::CollaborationExecutor;
+    use cog_core::Observable;
 
     /// Keeps the envelopes the archive is handed, so a test can read back how a
     /// run ended without a store behind it.
@@ -1642,5 +1770,387 @@ mod tests {
             error.to_string().contains("stream ended without a reply"),
             "the wording is the only evidence there is: {error}"
         );
+    }
+
+    // ---- the boundary declaration and the producer it governs -------------
+
+    /// One task spec whose input serializes large enough that the estimator
+    /// reports more tokens than `threshold`.
+    fn oversized_spec(id: &str, threshold: u64) -> crate::TaskSpec {
+        // estimate_tokens is chars/4 + 2000, so this needs more than
+        // 4 * (threshold - 2000) characters.
+        let chars = (threshold as usize).saturating_mul(4).saturating_add(4_000);
+        crate::TaskSpec {
+            id: id.to_string(),
+            name: "implement the thing".to_string(),
+            task_type: "generator".to_string(),
+            input: serde_json::json!({ "body": "x".repeat(chars) }),
+            blocked_by: Vec::new(),
+        }
+    }
+
+    fn hard_token_budget(threshold: u64, enabled: bool) -> cog_core::BoundaryRule {
+        cog_core::BoundaryRule {
+            name: "TokenBudget".into(),
+            rule_type: cog_core::RuleType::Hard,
+            threshold: Some(threshold),
+            description: "no task may be estimated above the threshold".into(),
+            enabled,
+        }
+    }
+
+    fn successful_squad() -> crate::squad::SquadResult {
+        crate::squad::SquadResult {
+            squad_id: "squad-1".into(),
+            success: true,
+            result: None,
+            retry_count: 0,
+            error: None,
+            pge_mode: crate::profile::PgeMode::PlanOnly,
+            reflection: None,
+        }
+    }
+
+    fn boundary_task() -> cog_core::Task {
+        cog_core::Task::new(
+            "task-boundary",
+            cog_core::TaskType::Generator,
+            serde_json::json!({}),
+        )
+    }
+
+    /// Reads one boundary cell off the process-wide observable. Counters are
+    /// monotonic and shared by every test in this binary, so callers compare a
+    /// value read before an action against one read after it rather than
+    /// asserting a total.
+    async fn boundary_cell(name: &str, label: &str, value: &str) -> f64 {
+        let metrics = crate::observable::global_observable()
+            .collect_metrics("D8")
+            .await
+            .unwrap();
+        metrics
+            .iter()
+            .find(|m| m.name == name && m.labels.get(label).map(String::as_str) == Some(value))
+            .map(|m| m.value)
+            .unwrap_or(0.0)
+    }
+
+    /// The declaration reaches the producer: a hard rule declared in `/boundary`
+    /// is read against the decomposition, and a plan that breaks it is refused
+    /// with the dimension, the task and the measured value in the text.
+    ///
+    /// This is the join the earlier defect was missing — the config was loaded,
+    /// threaded and stored, and nothing read it, so the two ends could drift
+    /// apart with every test still green.
+    #[tokio::test]
+    async fn a_declared_hard_rule_that_the_decomposition_breaks_is_refused() {
+        let threshold = 3_000;
+        let archive = std::sync::Arc::new(RecordingArchive::default());
+        let executor = CollaborationExecutor::new()
+            .with_knowledge_backend(archive.clone())
+            .with_boundary_config(crate::BoundaryConfig {
+                rules: vec![hard_token_budget(threshold, true)],
+            });
+        let spec = oversized_spec("t1", threshold);
+        let tasks = vec![CollaborationExecutor::task_spec_to_atomic(&spec)];
+        assert!(
+            tasks[0].estimated_tokens > threshold,
+            "the fixture has to actually break the rule: {} vs {threshold}",
+            tasks[0].estimated_tokens
+        );
+        let before: f64 = boundary_cell(
+            "collab_boundary_evaluation_total",
+            "outcome",
+            crate::observable::BOUNDARY_VIOLATED,
+        )
+        .await;
+
+        let error = executor
+            .enforce_boundaries(&boundary_task(), &successful_squad(), &tasks)
+            .expect_err("a plan over a declared hard budget must not be delivered");
+
+        let reason = error.to_string();
+        assert!(
+            reason.contains("TokenBudget"),
+            "the dimension is missing: {reason}"
+        );
+        assert!(
+            reason.contains("t1"),
+            "the offending task is missing: {reason}"
+        );
+        assert!(
+            reason.contains(&tasks[0].estimated_tokens.to_string())
+                && reason.contains(&threshold.to_string()),
+            "the refusal has to carry the number it refused over: {reason}"
+        );
+        assert!(
+            reason.contains("Fix:"),
+            "the retry needs the evaluator's own suggestion, not just the refusal: {reason}"
+        );
+
+        let envelope = archive.archived().await;
+        assert!(!envelope.success);
+        let feedback = envelope
+            .metadata
+            .feedback
+            .clone()
+            .expect("a refused run has to be archived with its reason");
+        // The archived text is the refusal itself; the error the caller reads
+        // wraps that same text in the variant's own wording.
+        assert!(
+            reason.ends_with(&feedback),
+            "the archive and the caller have to read the same refusal: {feedback:?} vs {reason:?}"
+        );
+        assert!(feedback.contains("TokenBudget") && feedback.contains("t1"));
+
+        let after: f64 = boundary_cell(
+            "collab_boundary_evaluation_total",
+            "outcome",
+            crate::observable::BOUNDARY_VIOLATED,
+        )
+        .await;
+        assert!(
+            after >= before + 1.0,
+            "the refusal has to leave its own reading"
+        );
+        assert!(
+            boundary_cell(
+                "collab_boundary_violation_total",
+                "dimension",
+                "TokenBudget"
+            )
+            .await
+                > 0.0,
+            "the dimension that refused has to be countable"
+        );
+    }
+
+    /// The same rule, a plan that fits. Without this the check above would pass
+    /// on a gate that refuses everything.
+    #[tokio::test]
+    async fn a_plan_inside_the_declared_budget_passes() {
+        let executor = CollaborationExecutor::new().with_boundary_config(crate::BoundaryConfig {
+            rules: vec![hard_token_budget(1_000_000, true)],
+        });
+        let spec = oversized_spec("t1", 3_000);
+        let tasks = vec![CollaborationExecutor::task_spec_to_atomic(&spec)];
+        let before = boundary_cell(
+            "collab_boundary_evaluation_total",
+            "outcome",
+            crate::observable::BOUNDARY_PASSED,
+        )
+        .await;
+
+        executor
+            .enforce_boundaries(&boundary_task(), &successful_squad(), &tasks)
+            .expect("a plan under the declared budget is delivered");
+
+        let after = boundary_cell(
+            "collab_boundary_evaluation_total",
+            "outcome",
+            crate::observable::BOUNDARY_PASSED,
+        )
+        .await;
+        assert!(after >= before + 1.0);
+    }
+
+    /// A rule the operator switched off is not read — and the reading says so,
+    /// rather than reporting a plan that was checked. The plan here breaks the
+    /// threshold on purpose, so a disabled rule that still fired would fail.
+    #[tokio::test]
+    async fn a_disabled_hard_rule_is_not_read() {
+        let threshold = 3_000;
+        let executor = CollaborationExecutor::new().with_boundary_config(crate::BoundaryConfig {
+            rules: vec![hard_token_budget(threshold, false)],
+        });
+        let spec = oversized_spec("t1", threshold);
+        let tasks = vec![CollaborationExecutor::task_spec_to_atomic(&spec)];
+        let before = boundary_cell(
+            "collab_boundary_evaluation_total",
+            "outcome",
+            crate::observable::BOUNDARY_NO_HARD_RULES,
+        )
+        .await;
+
+        executor
+            .enforce_boundaries(&boundary_task(), &successful_squad(), &tasks)
+            .expect("a disabled rule is a declaration, not a check");
+
+        let after = boundary_cell(
+            "collab_boundary_evaluation_total",
+            "outcome",
+            crate::observable::BOUNDARY_NO_HARD_RULES,
+        )
+        .await;
+        assert!(after >= before + 1.0);
+    }
+
+    /// A soft rule is the evaluator's, not the code's. Trusting a `soft` name to
+    /// mean "check this in Rust" would turn a dimension meant for the model's
+    /// judgement into a refusal the operator never asked for.
+    #[tokio::test]
+    async fn a_soft_rule_is_not_the_code_verdict() {
+        let threshold = 3_000;
+        let mut rule = hard_token_budget(threshold, true);
+        rule.rule_type = cog_core::RuleType::Soft;
+        let executor = CollaborationExecutor::new()
+            .with_boundary_config(crate::BoundaryConfig { rules: vec![rule] });
+        let spec = oversized_spec("t1", threshold);
+        let tasks = vec![CollaborationExecutor::task_spec_to_atomic(&spec)];
+
+        executor
+            .enforce_boundaries(&boundary_task(), &successful_squad(), &tasks)
+            .expect("only a hard rule has a check in code");
+    }
+
+    /// No `/boundary` section at all: nothing to read, and the reading says
+    /// exactly that instead of "the plan passed".
+    #[tokio::test]
+    async fn a_plan_is_not_reported_as_checked_when_no_rule_was_read() {
+        let executor = CollaborationExecutor::new();
+        let tasks = vec![CollaborationExecutor::task_spec_to_atomic(&oversized_spec(
+            "t1", 3_000,
+        ))];
+        let before = boundary_cell(
+            "collab_boundary_evaluation_total",
+            "outcome",
+            crate::observable::BOUNDARY_NO_HARD_RULES,
+        )
+        .await;
+
+        executor
+            .enforce_boundaries(&boundary_task(), &successful_squad(), &tasks)
+            .expect("an unconfigured boundary section cannot refuse anything");
+
+        let after = boundary_cell(
+            "collab_boundary_evaluation_total",
+            "outcome",
+            crate::observable::BOUNDARY_NO_HARD_RULES,
+        )
+        .await;
+        assert!(after >= before + 1.0);
+    }
+
+    /// The declaration and the producer are joined: every `TokenBudget` the
+    /// shipped configurations declare has to be a threshold the estimator can
+    /// exceed, otherwise the rule is evaluated on every decomposition and can
+    /// never fire — which reads exactly like a plan that never broke it.
+    ///
+    /// All three carriers of the same declaration are walked, because a
+    /// threshold lowered in one and left unreachable in another is the drift
+    /// this is here to catch. The k3s carrier is YAML, so its embedded document
+    /// is extracted the way the delivery check extracts it.
+    #[test]
+    fn the_estimator_reaches_every_token_budget_the_shipped_configs_declare() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let carriers = [
+            "cogneva.example.json",
+            "deploy/helm/cogneva/files/cogneva.json",
+            "deploy/k3s/cogneva-json-configmap.yaml",
+        ];
+        let mut declared = Vec::new();
+        for carrier in carriers {
+            let path = root.join(carrier);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
+            let document = if carrier.ends_with(".yaml") {
+                embedded_json(&text)
+            } else {
+                text
+            };
+            let parsed: serde_json::Value = serde_json::from_str(&document)
+                .unwrap_or_else(|e| panic!("{carrier} is not readable JSON: {e}"));
+            let rules = parsed
+                .get("boundary")
+                .and_then(|section| section.get("rules"))
+                .and_then(|rules| rules.as_array())
+                .unwrap_or_else(|| panic!("{carrier} declares no /boundary rules"));
+            for rule in rules {
+                if rule.get("name").and_then(|n| n.as_str()) != Some("TokenBudget") {
+                    continue;
+                }
+                if rule.get("enabled").and_then(|e| e.as_bool()) != Some(true) {
+                    continue;
+                }
+                if rule.get("rule_type").and_then(|t| t.as_str()) != Some("hard") {
+                    continue;
+                }
+                let threshold = rule
+                    .get("threshold")
+                    .and_then(|t| t.as_u64())
+                    .unwrap_or_else(|| {
+                        panic!("{carrier} declares a TokenBudget with no threshold")
+                    });
+                declared.push((carrier, threshold));
+            }
+        }
+        assert!(
+            !declared.is_empty(),
+            "the shipped configurations declare no hard TokenBudget rule, so the check \
+             in code has no input and this gate would pass over an empty set"
+        );
+        for (carrier, threshold) in &declared {
+            assert!(
+                *threshold < CollaborationExecutor::TOKEN_ESTIMATE_CAP,
+                "{carrier} declares a TokenBudget of {threshold}, which the estimator cannot \
+                 reach: it saturates at {} and the rule compares with a strict greater-than",
+                CollaborationExecutor::TOKEN_ESTIMATE_CAP
+            );
+        }
+    }
+
+    /// The check runs on the path that produces the tasks it judges.
+    ///
+    /// Everything above this calls `enforce_boundaries` directly, so none of it
+    /// can tell whether the decomposition path still calls it — a deleted call
+    /// site leaves every one of those tests green while the rules go unread
+    /// again. The read is of the call, which is the link no unit test can see.
+    #[test]
+    fn the_decomposition_path_hands_its_tasks_to_the_boundary_gate() {
+        let source = include_str!("collaboration_executor.rs");
+        // Everything above this module is the production surface; the rest of
+        // the file is this test, where the same call appears as a literal.
+        let production = source
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("the file has no production half");
+        let after = production
+            .split("let atomic_tasks = Self::extract_atomic_tasks(&result);")
+            .nth(1)
+            .expect("the decomposition path no longer extracts its atomic tasks");
+        let call = after
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with("//"))
+            .unwrap_or_default();
+        assert_eq!(
+            call, "self.enforce_boundaries(task, &result, &atomic_tasks)?;",
+            "the boundary rules are read somewhere else than where the tasks are produced, \
+             or not at all"
+        );
+        assert_eq!(
+            production.matches("self.enforce_boundaries(").count(),
+            1,
+            "more than one call site means the gate below reads a call and the run uses another"
+        );
+    }
+
+    /// The document embedded in the k3s ConfigMap: the block scalar under
+    /// `cogneva.json:`, dedented by its own indentation.
+    fn embedded_json(manifest: &str) -> String {
+        let (_, body) = manifest
+            .split_once("cogneva.json: |")
+            .expect("the k3s carrier holds no cogneva.json block scalar");
+        let lines: Vec<&str> = body.lines().skip(1).collect();
+        let indent = lines
+            .iter()
+            .find(|line| !line.trim().is_empty())
+            .map(|line| line.len() - line.trim_start().len())
+            .expect("the block scalar is empty");
+        lines
+            .iter()
+            .map(|line| line.get(indent..).unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

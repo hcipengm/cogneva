@@ -31,7 +31,13 @@ pub struct SquadConfig {
     pub context_window_size: Option<usize>,
     /// 可选的任务 profile，用于在没有 MetaLearningEngine 时通过静态规则选择 PGE 模式。
     pub profile: Option<crate::profile::TaskProfile>,
-    /// 可选的 BoundaryConfig，注入到 Evaluator Agent 用于动态边界维度评估。
+    /// Optional BoundaryConfig, carried into the squad run with the task.
+    ///
+    /// The path this is handed to does not read it. A hard boundary rule is
+    /// judged where the tasks it is about first exist — the decomposition path,
+    /// which is the one place that holds both the rules and their subject — so
+    /// this field is a second carrier of the same configuration with no reader
+    /// of its own. Removing it is a change of its own.
     pub boundary_config: Option<crate::BoundaryConfig>,
     /// true = 这是一个 self_evolution 任务；使用更激进的短路径以控制延迟。
     pub is_self_evolution: bool,

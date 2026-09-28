@@ -63,6 +63,44 @@ pub const RALPH_HISTORY_DROPPED: &str = "dropped";
 /// [`RALPH_HISTORY_FED`].
 pub const RALPH_HISTORY_PARTS: [&str; 2] = [RALPH_HISTORY_FED, RALPH_HISTORY_DROPPED];
 
+/// How a decomposition left the boundary gate.
+///
+/// Three cells rather than two, because "the rules were read and the plan
+/// stayed inside them" and "there was no hard rule to read" are different
+/// facts that a pass/fail pair renders as one. The second is the shape a
+/// configuration mistake takes: a rule set that is empty, disabled or soft-only
+/// leaves nothing to violate, and on a counter that only reports violations it
+/// looks exactly like a plan that was checked and cleared.
+///
+/// `violated` is the refusal itself, so the cell that matters when reading
+/// whether a declared budget is doing anything is the one that must be able to
+/// stay at zero without the gate being dead: a zero here next to a rising
+/// `passed` says the rules were read and the plans fitted; the same zero next
+/// to a rising `no_rules` says the rules were never reached.
+pub const BOUNDARY_NO_HARD_RULES: &str = "no_hard_rules";
+pub const BOUNDARY_PASSED: &str = "passed";
+pub const BOUNDARY_VIOLATED: &str = "violated";
+
+/// Every cell of the boundary verdict, published at zero as well. See
+/// [`BOUNDARY_NO_HARD_RULES`].
+pub const BOUNDARY_OUTCOMES: [&str; 3] =
+    [BOUNDARY_NO_HARD_RULES, BOUNDARY_PASSED, BOUNDARY_VIOLATED];
+
+/// The dimensions a hard rule can name.
+///
+/// A closed set on purpose: the evaluator produces a violation only for the
+/// names it has a check for, and a rule declaring anything else is skipped, so
+/// the label's value domain is these five whatever a configuration says. The
+/// cells are published at zero too, which is what keeps "this dimension never
+/// fired" apart from "this dimension was renamed out from under the reader".
+pub const BOUNDARY_DIMENSIONS: [&str; 5] = [
+    "TokenBudget",
+    "SkillBoundary",
+    "TimeBoundary",
+    "StateBoundary",
+    "DataBoundary",
+];
+
 pub fn global_observable() -> Arc<CollaborationObservable> {
     GLOBAL
         .get_or_init(|| Arc::new(CollaborationObservable::new()))
@@ -163,6 +201,21 @@ pub struct CollaborationObservable {
     /// first run looks like. Both cells are published so "no resume ever
     /// happened" and "nothing needed resuming" stay different readings.
     resume_outcomes: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    /// How each decomposition left the boundary gate, over
+    /// [`BOUNDARY_OUTCOMES`].
+    ///
+    /// The configured hard rules are the only place a task-size budget is
+    /// declared, and until this face existed nothing said whether they were
+    /// ever read: a rule set nobody consults and a plan that never broke one
+    /// both left the same trace, which was none. Keyed by a `&'static str` so
+    /// the three cells are the constants above and a typo cannot open a fourth.
+    boundary_evaluations: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
+    /// Boundary violations by dimension, over [`BOUNDARY_DIMENSIONS`].
+    ///
+    /// Separate from the verdict above because the verdict says the gate
+    /// refused and this says what it refused over — the difference between one
+    /// dimension misconfigured and every plan coming in oversized.
+    boundary_violations: Arc<std::sync::Mutex<HashMap<String, u64>>>,
 }
 
 impl CollaborationObservable {
@@ -273,6 +326,28 @@ impl CollaborationObservable {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *map.entry((stage.to_string(), mode.to_string()))
             .or_insert(0) += 1;
+    }
+
+    /// Record how one decomposition left the boundary gate. Takes one of
+    /// [`BOUNDARY_OUTCOMES`] by type, so the reading cannot grow a cell that is
+    /// not one of the three.
+    pub fn record_boundary_evaluation(&self, outcome: &'static str) {
+        let mut map = self
+            .boundary_evaluations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *map.entry(outcome).or_insert(0) += 1;
+    }
+
+    /// Record one boundary violation under the dimension that produced it. The
+    /// name is the rule's own, which is why the published set is the closed
+    /// [`BOUNDARY_DIMENSIONS`] rather than whatever a configuration declared.
+    pub fn record_boundary_violation(&self, dimension: &str) {
+        let mut map = self
+            .boundary_violations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *map.entry(dimension.to_string()).or_insert(0) += 1;
     }
 
     /// Record one resume outcome. A synchronous lock: this counter is the only
@@ -497,6 +572,36 @@ impl Observable for CollaborationObservable {
                 metrics.push(
                     RawMetric::new("collab_goal_class_source_total", count as f64)
                         .with_label("source", source.as_str()),
+                );
+            }
+
+            // The boundary gate's verdict and the dimensions it refused over.
+            // Both faces are published in full, zeros included: reporting only
+            // the violations leaves "the rules were read and the plan fitted"
+            // and "there was no hard rule to read" as the same number, and the
+            // second is what a misconfigured rule set looks like.
+            let verdicts = self
+                .boundary_evaluations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            for outcome in BOUNDARY_OUTCOMES {
+                let count = verdicts.get(outcome).copied().unwrap_or(0);
+                metrics.push(
+                    RawMetric::new("collab_boundary_evaluation_total", count as f64)
+                        .with_label("outcome", outcome),
+                );
+            }
+            let violations = self
+                .boundary_violations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            for dimension in BOUNDARY_DIMENSIONS {
+                let count = violations.get(dimension).copied().unwrap_or(0);
+                metrics.push(
+                    RawMetric::new("collab_boundary_violation_total", count as f64)
+                        .with_label("dimension", dimension),
                 );
             }
 
@@ -921,6 +1026,117 @@ mod tests {
             rest = &quoted[end..];
         }
         values
+    }
+
+    /// The boundary gate's three verdicts and its five dimensions are all on
+    /// the wire before anything has happened, and each cell counts only what
+    /// was recorded into it. The zero cells are the point: `no_rules` has to be
+    /// readable as a cell, because a rule set that was never reached is a
+    /// configuration fault that a violations-only counter reports as silence.
+    #[tokio::test]
+    async fn every_boundary_cell_is_published_and_counted_apart() {
+        let obs = CollaborationObservable::new();
+        let metrics = obs.collect_metrics("D8").await.unwrap();
+        let cell = |metrics: &[RawMetric], name: &str, label: &str, value: &str| {
+            metrics
+                .iter()
+                .find(|m| {
+                    m.name == name
+                        && m.labels.get(label).map(String::as_str) == Some(value)
+                })
+                .map(|m| m.value)
+                .unwrap_or_else(|| {
+                    panic!("{name}{{{label}=\"{value}\"}} must be published, at 0 when nothing was recorded")
+                })
+        };
+
+        for outcome in BOUNDARY_OUTCOMES {
+            assert_eq!(
+                cell(
+                    &metrics,
+                    "collab_boundary_evaluation_total",
+                    "outcome",
+                    outcome
+                ),
+                0.0,
+                "{outcome} must be published even with nothing recorded into it"
+            );
+        }
+        for dimension in BOUNDARY_DIMENSIONS {
+            assert_eq!(
+                cell(
+                    &metrics,
+                    "collab_boundary_violation_total",
+                    "dimension",
+                    dimension
+                ),
+                0.0
+            );
+        }
+
+        obs.record_boundary_evaluation(BOUNDARY_NO_HARD_RULES);
+        obs.record_boundary_evaluation(BOUNDARY_PASSED);
+        obs.record_boundary_evaluation(BOUNDARY_VIOLATED);
+        obs.record_boundary_violation("TokenBudget");
+        obs.record_boundary_violation("TokenBudget");
+        obs.record_boundary_violation("DataBoundary");
+
+        let metrics = obs.collect_metrics("D8").await.unwrap();
+        assert_eq!(
+            cell(
+                &metrics,
+                "collab_boundary_evaluation_total",
+                "outcome",
+                BOUNDARY_NO_HARD_RULES
+            ),
+            1.0
+        );
+        assert_eq!(
+            cell(
+                &metrics,
+                "collab_boundary_evaluation_total",
+                "outcome",
+                BOUNDARY_PASSED
+            ),
+            1.0
+        );
+        assert_eq!(
+            cell(
+                &metrics,
+                "collab_boundary_evaluation_total",
+                "outcome",
+                BOUNDARY_VIOLATED
+            ),
+            1.0
+        );
+        assert_eq!(
+            cell(
+                &metrics,
+                "collab_boundary_violation_total",
+                "dimension",
+                "TokenBudget"
+            ),
+            2.0
+        );
+        assert_eq!(
+            cell(
+                &metrics,
+                "collab_boundary_violation_total",
+                "dimension",
+                "DataBoundary"
+            ),
+            1.0
+        );
+        assert_eq!(
+            cell(
+                &metrics,
+                "collab_boundary_violation_total",
+                "dimension",
+                "TimeBoundary"
+            ),
+            0.0,
+            "counting one dimension twice must not move another"
+        );
     }
 
     /// The extractor reads both spellings the chart uses, so a rule that moves
