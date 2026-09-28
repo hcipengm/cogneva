@@ -859,12 +859,7 @@ impl SquadExecutor {
         // Deterministic environment/protocol failures and stall-detected
         // degenerate loops cannot be fixed by a strategy upgrade — Roundtable
         // would burn the same tokens to the same empty/flat result.
-        let is_terminal = matches!(
-            &verdict,
-            RalphVerdict::Unrecoverable { reason, .. }
-                if reason.starts_with(cog_core::contract::outcome::TERMINAL_ENV_FAILURE_PREFIX)
-                    || reason.starts_with(cog_core::contract::outcome::DEGENERATE_LOOP_PREFIX)
-        );
+        let is_terminal = declared_unfixable(&verdict);
         let can_upgrade = squad.config.max_retries > 0 && !is_terminal;
         let should_upgrade = can_upgrade
             && if let Some(ref r) = reflection {
@@ -1238,6 +1233,23 @@ async fn run_squad_reflection(
     }
 }
 
+/// Whether a verdict carries a cause a strategy upgrade cannot clear.
+///
+/// Both declared classes say retrying is not the answer — one because the
+/// transport or the protocol failed before the work could start, the other
+/// because the work already spent its budget without producing anything — so
+/// escalating Pipeline to Roundtable only buys the same failure from a more
+/// expensive topology. The reasons travel wrapped by the layer that added
+/// context, which is why the decision is asked of the shared predicate rather
+/// than of the reason's first bytes.
+fn declared_unfixable(verdict: &RalphVerdict) -> bool {
+    matches!(
+        verdict,
+        RalphVerdict::Unrecoverable { reason, .. }
+            if cog_core::contract::outcome::is_deterministic_failure(reason)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1265,6 +1277,46 @@ mod tests {
             "generation": {"content": "diff"},
             "evaluation": evaluation_json(verdict, feedback),
         })
+    }
+
+    /// The upgrade guard reads a wrapped declaration, not the reason's first
+    /// bytes. A miss here is not a log line: it hands the failure to a whole
+    /// Roundtable run, the most expensive topology there is, for a cause that
+    /// was already known to be beyond retrying.
+    #[test]
+    fn the_upgrade_guard_reads_a_wrapped_declaration() {
+        use cog_core::contract::outcome::{DEGENERATE_LOOP_PREFIX, TERMINAL_ENV_FAILURE_PREFIX};
+
+        let verdict = |reason: String| RalphVerdict::Unrecoverable {
+            reason,
+            iterations: 1,
+            history: vec![],
+        };
+
+        for declared in [
+            format!("{TERMINAL_ENV_FAILURE_PREFIX}: upstream 503"),
+            // The two shapes the wire produces when a wrapper gets there first.
+            format!("Agent execution error: {TERMINAL_ENV_FAILURE_PREFIX}: upstream 503"),
+            format!("{DEGENERATE_LOOP_PREFIX}: 3 iterations bought no progress"),
+            format!("missing deliverable; original feedback: {DEGENERATE_LOOP_PREFIX}: flat"),
+        ] {
+            assert!(
+                declared_unfixable(&verdict(declared.clone())),
+                "an upgrade must not be bought for a declared cause: {declared:?}"
+            );
+        }
+
+        // A failure that declares nothing is the one an upgrade can still help:
+        // the guard must not become "every failure is terminal".
+        for undeclared in [
+            "evaluator: criteria unmet",
+            "the plan contradicts the deliverable",
+        ] {
+            assert!(
+                !declared_unfixable(&verdict(undeclared.to_string())),
+                "an undeclared failure must keep its upgrade: {undeclared:?}"
+            );
+        }
     }
 
     #[test]

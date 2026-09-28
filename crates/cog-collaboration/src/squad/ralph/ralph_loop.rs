@@ -7,7 +7,7 @@
 //!   不是被消耗掉的额度。
 
 use crate::actors::{EvaluatorActor, GeneratorActor, PlannerActor};
-use crate::squad::classify::classify;
+use crate::squad::classify::{classify, declared_in};
 use crate::squad::pge::pipeline::{PgePipeline, PlanScope};
 use crate::squad::pge::roundtable::{PgeRoundtable, PgeRoundtableResult};
 use crate::squad::pge::stall::{made_progress, ProgressSignals};
@@ -834,8 +834,8 @@ impl RalphLoop {
     /// **Design note**: Determining whether a failure is recoverable is a
     /// semantic judgment. The control-flow rule here defaults to
     /// `Recoverable(Identical)` for all failures, with two exceptions:
-    /// 1. Repeated identical feedback → loop detection (pure control flow).
-    /// 2. Safety-limit exhaustion → terminal unrecoverable.
+    /// 1. A failure whose cause is already declared → terminal.
+    /// 2. Repeated identical feedback → loop detection (pure control flow).
     ///
     /// When an LLM provider is available, `analyze_failure_with_llm` performs
     /// semantic classification (contradiction, skill gap, etc.) and returns
@@ -845,12 +845,18 @@ impl RalphLoop {
         evaluation: &EvaluationResult,
         history: &[RalphIteration],
     ) -> FailureAnalysis {
-        // Stall detection already determined this run is a degenerate loop:
-        // classified, non-retryable, no semantic analysis needed.
-        if evaluation
-            .feedback
-            .starts_with(cog_core::contract::outcome::DEGENERATE_LOOP_PREFIX)
-        {
+        let observable = crate::observable::global_observable();
+
+        // A declared cause needs no reading. Both classes say retrying cannot
+        // clear this, and the text that carries them is produced next to the
+        // code that knows it, so the answer is already in hand before any model
+        // is asked. The class table is the single reader of that text: a bare
+        // prefix match misses the markers when something wraps them — the
+        // defect prepended ahead of the original feedback is one such wrapper —
+        // and a miss here is not a warning, it is a paid classification call
+        // plus an extra iteration for a run that had already been told to stop.
+        if let Some(class) = declared_in(&evaluation.feedback) {
+            observable.record_failure_route(class);
             return FailureAnalysis::Unrecoverable(evaluation.feedback.clone());
         }
 
@@ -861,6 +867,7 @@ impl RalphLoop {
             .take(2)
             .all(|h| h.feedback == evaluation.feedback);
         if recent_same_feedback && history.len() >= 2 {
+            observable.record_failure_route(crate::observable::FAILURE_ROUTE_REPEATED);
             return FailureAnalysis::Unrecoverable(format!(
                 "Same failure repeated {} times: {}",
                 history.len() + 1,
@@ -869,23 +876,31 @@ impl RalphLoop {
         }
 
         // If LLM provider is available, perform semantic failure analysis.
-        if let Some(ref llm) = self.llm_provider {
-            match self
-                .analyze_failure_with_llm(evaluation, history, llm)
-                .await
-            {
-                Ok(analysis) => return analysis,
-                Err(e) => {
-                    tracing::warn!(
-                        "LLM failure analysis failed, falling back to default: {}",
-                        e
-                    );
-                }
+        // The two ways of not paying here are counted apart: nothing wired to
+        // ask is a deployment's own choice, while a classifier that was wired
+        // and errored is an upstream to look at, and one shared cell would add
+        // a configuration to a fault.
+        let Some(llm) = self.llm_provider.as_ref() else {
+            observable.record_failure_route(crate::observable::FAILURE_ROUTE_LLM_ABSENT);
+            return FailureAnalysis::Recoverable(ResetStrategy::Identical);
+        };
+        match self
+            .analyze_failure_with_llm(evaluation, history, llm)
+            .await
+        {
+            Ok(analysis) => {
+                observable.record_failure_route(crate::observable::FAILURE_ROUTE_LLM_CLASSIFIED);
+                analysis
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "LLM failure analysis failed, falling back to default: {}",
+                    e
+                );
+                observable.record_failure_route(crate::observable::FAILURE_ROUTE_LLM_FAILED);
+                FailureAnalysis::Recoverable(ResetStrategy::Identical)
             }
         }
-
-        // Default: all failures are recoverable with Identical retry.
-        FailureAnalysis::Recoverable(ResetStrategy::Identical)
     }
 
     /// Semantic failure analysis powered by LLM.
@@ -2305,6 +2320,125 @@ mod tests {
             ),
             "Unknown strategy should fallback to Identical, got {:?}",
             analysis
+        );
+    }
+
+    /// A failure whose text already declares its class is answered from that
+    /// text, and the classifier is never asked.
+    ///
+    /// The call-count assertion is the point: the classifier is the retry
+    /// path's only paid call, and the reason strings below are shapes the wire
+    /// actually produces — an error type wrapping the marker, and a defect
+    /// prepended ahead of the original feedback. Read as "nothing declared",
+    /// each of them costs a classification call plus the extra iteration the
+    /// answer buys, for a run that had already been told retrying cannot help.
+    #[tokio::test]
+    async fn a_declared_class_is_answered_without_asking_the_classifier() {
+        use cog_core::contract::outcome::DEGENERATE_LOOP_PREFIX;
+        use cog_core::Observable;
+
+        let llm = Arc::new(MockSemanticLlm::new(
+            r#"{"failure_type":"LogicError","root_cause":"bug","recommended_strategy":"Modified","suggested_modifications":"fix"}"#,
+        ));
+        let ralph = RalphLoop::new().with_llm_provider(llm.clone());
+
+        for feedback in [
+            format!(
+                "Agent execution error: {DEGENERATE_LOOP_PREFIX}: 3 iterations bought no progress"
+            ),
+            format!("missing deliverable; original feedback: {DEGENERATE_LOOP_PREFIX}: flat"),
+        ] {
+            let eval = EvaluationResult {
+                verdict: Verdict::Fail,
+                score: Some(0),
+                feedback: feedback.clone(),
+                criteria: vec![],
+                details: None,
+            };
+            let analysis = ralph.analyze_failure(&eval, &[]).await;
+            assert!(
+                matches!(analysis, FailureAnalysis::Unrecoverable(_)),
+                "a declared class is terminal however the text was wrapped: {feedback:?} → {analysis:?}"
+            );
+        }
+        assert!(
+            llm.calls().is_empty(),
+            "a declared class must not cost a classification call, got {} call(s)",
+            llm.calls().len()
+        );
+
+        let metrics = crate::observable::global_observable()
+            .collect_metrics("D8")
+            .await
+            .unwrap();
+        assert!(
+            metrics.iter().any(|m| m.name == "ralph_failure_route_total"
+                && m.labels.get("route").map(String::as_str) == Some("degenerate_loop")
+                && m.value > 0.0),
+            "the route must be readable as ralph_failure_route_total{{route=\"degenerate_loop\"}}"
+        );
+    }
+
+    /// The same door for the other declared class: a terminal environment or
+    /// protocol failure is terminal because the text says so, not because a
+    /// model agreed.
+    #[tokio::test]
+    async fn a_terminal_marker_is_answered_without_asking_the_classifier() {
+        use cog_core::contract::outcome::TERMINAL_ENV_FAILURE_PREFIX;
+
+        let llm = Arc::new(MockSemanticLlm::new(
+            r#"{"failure_type":"ResourceError","root_cause":"rate limit","recommended_strategy":"Identical","suggested_modifications":"retry"}"#,
+        ));
+        let ralph = RalphLoop::new().with_llm_provider(llm.clone());
+
+        let eval = EvaluationResult {
+            verdict: Verdict::Fail,
+            score: Some(0),
+            feedback: format!("Agent execution error: {TERMINAL_ENV_FAILURE_PREFIX}: upstream 503"),
+            criteria: vec![],
+            details: None,
+        };
+        let analysis = ralph.analyze_failure(&eval, &[]).await;
+        assert!(
+            matches!(analysis, FailureAnalysis::Unrecoverable(_)),
+            "terminal env failures are terminal without a classifier: {analysis:?}"
+        );
+        assert!(
+            llm.calls().is_empty(),
+            "a terminal marker must not cost a classification call, got {} call(s)",
+            llm.calls().len()
+        );
+    }
+
+    /// A failure that declares nothing still goes to the classifier and still
+    /// gets its answer, so the guard above cannot quietly become a run that
+    /// never classifies anything.
+    #[tokio::test]
+    async fn an_undeclared_failure_still_reaches_the_classifier() {
+        let llm = Arc::new(MockSemanticLlm::new(
+            r#"{"failure_type":"Contradiction","root_cause":"plan vs output mismatch","recommended_strategy":"Modified","suggested_modifications":"align plan"}"#,
+        ));
+        let ralph = RalphLoop::new().with_llm_provider(llm.clone());
+
+        let eval = EvaluationResult {
+            verdict: Verdict::Fail,
+            score: Some(0),
+            feedback: "the plan contradicts the deliverable".into(),
+            criteria: vec![],
+            details: None,
+        };
+        let analysis = ralph.analyze_failure(&eval, &[]).await;
+        assert!(
+            matches!(
+                analysis,
+                FailureAnalysis::Recoverable(ResetStrategy::Modified)
+            ),
+            "an undeclared failure must still get the classified answer: {analysis:?}"
+        );
+        assert_eq!(
+            llm.calls().len(),
+            1,
+            "the undeclared route must still be paid for exactly once"
         );
     }
 

@@ -229,6 +229,51 @@ pub const BOUNDARY_DIMENSIONS: [&str; 5] = [
     "DataBoundary",
 ];
 
+/// Routes that reach a failure analysis answer without paying for one.
+///
+/// A failure's cause can be declared by the reason itself (the two class names
+/// below, which live in `squad::classify`), or read off the run's own history
+/// when the same failure has already come back. Both are answers the run
+/// already holds, so asking a model to re-derive them buys a second opinion on
+/// a settled question at the price of a call.
+pub const FAILURE_ROUTE_REPEATED: &str = "repeated_failure";
+
+/// Routes that did pay, and the two different reasons a paid route was not
+/// taken. Apart because they have different fixes: nothing is wired to ask is a
+/// configuration the deployment chose, while a wired classifier that failed is
+/// an upstream that needs looking at, and one `llm_fallback` cell would add
+/// them together.
+pub const FAILURE_ROUTE_LLM_CLASSIFIED: &str = "llm_classified";
+pub const FAILURE_ROUTE_LLM_ABSENT: &str = "llm_absent";
+pub const FAILURE_ROUTE_LLM_FAILED: &str = "llm_failed";
+
+/// Every cell of the failure-analysis decision, published at zero as well.
+///
+/// The classifier is the retry path's most expensive step — a system
+/// instruction, the failing evaluation and the run's history tail go out, and
+/// up to 1024 tokens come back — and before this face existed the only way to
+/// tell a run that answered from the reason from one that paid for the answer
+/// was to read the source. A zero in the first three cells therefore says
+/// something on its own: which of the deterministic doors the run is no longer
+/// reaching, rather than that failures of that class stopped happening.
+///
+/// The two class cells are the names from `squad::classify`, not copies of
+/// them, so this face and the termination face count the same event under the
+/// same word. Keyed by a `&'static str` so the cells are exactly these six and
+/// a typo cannot open a seventh.
+///
+/// Deliberately absent: the roundtable path. It decides from the round's own
+/// outcome (a failed verdict, a repeated verdict) and has no classifier call to
+/// avoid, so a cell for it here would count a saving that was never available.
+pub const FAILURE_ROUTES: [&str; 6] = [
+    crate::squad::classify::TERMINAL_ENV_FAILURE_CLASS,
+    crate::squad::classify::DEGENERATE_LOOP_CLASS,
+    FAILURE_ROUTE_REPEATED,
+    FAILURE_ROUTE_LLM_CLASSIFIED,
+    FAILURE_ROUTE_LLM_ABSENT,
+    FAILURE_ROUTE_LLM_FAILED,
+];
+
 pub fn global_observable() -> Arc<CollaborationObservable> {
     GLOBAL
         .get_or_init(|| Arc::new(CollaborationObservable::new()))
@@ -380,6 +425,17 @@ pub struct CollaborationObservable {
     /// the floor is counted, not quietly ignored. Keyed by a `&'static str` so
     /// the cells are the constants above and a typo cannot open a sixth.
     consensus_floors: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
+    /// How each failure analysis reached its answer, over [`FAILURE_ROUTES`].
+    ///
+    /// The classifier is the retry path's only paid call and its answer is
+    /// always one of a few words, but the reason a run stopped paying is what a
+    /// reader needs: a run whose classes are all zero is not a run without
+    /// declared failures, it is a run whose declared failures are no longer
+    /// recognised — which is the exact shape a drifted marker leaves behind. The
+    /// four undecided cells are the ones that separate that from an upstream
+    /// that failed. Keyed by a `&'static str` so the cells are exactly the
+    /// constants above and a typo cannot open a seventh.
+    failure_routes: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
 }
 
 impl CollaborationObservable {
@@ -566,6 +622,20 @@ impl CollaborationObservable {
         *map.entry(dimension.to_string()).or_insert(0) += 1;
     }
 
+    /// Record which route one failure analysis took. Takes one of
+    /// [`FAILURE_ROUTES`] by type, so the reading cannot grow a cell that is not
+    /// one of the six. A synchronous lock, like the boundary face it shares its
+    /// shape with: these counts are the only evidence that a run answered
+    /// without a call, and a dropped count reads as a run that never stopped
+    /// paying.
+    pub fn record_failure_route(&self, route: &'static str) {
+        let mut map = self
+            .failure_routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *map.entry(route).or_insert(0) += 1;
+    }
+
     /// Record one resume outcome. A synchronous lock: this counter is the only
     /// evidence that a resumed task was resumed at all, so a dropped count
     /// would read as a chain that never ran.
@@ -654,6 +724,23 @@ impl Observable for CollaborationObservable {
                 metrics.push(
                     RawMetric::new("ralph_terminations_total", *count as f64)
                         .with_label("reason", reason),
+                );
+            }
+            // Which door each failure analysis left by, zeros included. The two
+            // declared classes are the same words the termination face above
+            // counts, so a run whose classes stop appearing here while still
+            // appearing there is a reader that stopped recognising them, not a
+            // run that stopped having them.
+            let routes = self
+                .failure_routes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            for route in FAILURE_ROUTES {
+                let count = routes.get(route).copied().unwrap_or(0);
+                metrics.push(
+                    RawMetric::new("ralph_failure_route_total", count as f64)
+                        .with_label("route", route),
                 );
             }
             let yields = self.change_yields.lock().await;
@@ -1452,6 +1539,94 @@ mod tests {
             0.0,
             "counting one dimension twice must not move another"
         );
+    }
+
+    /// All six failure-analysis routes are on the wire before any failure has
+    /// been analysed, and each counts only what was recorded into it.
+    ///
+    /// The two class cells are the ones a reader joins against
+    /// `ralph_terminations_total`: a class this face has never counted while
+    /// the termination face has is a reader that stopped recognising the
+    /// marker, which is the failure this face exists to make visible. A test
+    /// that only checked the four paid cells would pass in exactly that
+    /// situation.
+    #[tokio::test]
+    async fn every_failure_route_is_published_and_counted_apart() {
+        let obs = CollaborationObservable::new();
+        let metrics = obs.collect_metrics("D8").await.unwrap();
+        let cell = |metrics: &[RawMetric], name: &str, label: &str, value: &str| {
+            metrics
+                .iter()
+                .find(|m| {
+                    m.name == name
+                        && m.labels.get(label).map(String::as_str) == Some(value)
+                })
+                .map(|m| m.value)
+                .unwrap_or_else(|| {
+                    panic!("{name}{{{label}=\"{value}\"}} must be published, at 0 when nothing was recorded")
+                })
+        };
+
+        for route in FAILURE_ROUTES {
+            assert_eq!(
+                cell(&metrics, "ralph_failure_route_total", "route", route),
+                0.0,
+                "{route} must be published even with nothing recorded into it"
+            );
+        }
+        // The two class cells are read against the termination face by name, so
+        // this test would keep passing if someone re-spelled them here only.
+        assert!(FAILURE_ROUTES.contains(&crate::squad::classify::DEGENERATE_LOOP_CLASS));
+        assert!(FAILURE_ROUTES.contains(&crate::squad::classify::TERMINAL_ENV_FAILURE_CLASS));
+
+        obs.record_failure_route(FAILURE_ROUTE_REPEATED);
+        obs.record_failure_route(FAILURE_ROUTE_REPEATED);
+        obs.record_failure_route(crate::squad::classify::DEGENERATE_LOOP_CLASS);
+        obs.record_failure_route(FAILURE_ROUTE_LLM_FAILED);
+
+        let metrics = obs.collect_metrics("D8").await.unwrap();
+        assert_eq!(
+            cell(
+                &metrics,
+                "ralph_failure_route_total",
+                "route",
+                FAILURE_ROUTE_REPEATED
+            ),
+            2.0,
+            "the same route recorded twice is two, not one"
+        );
+        assert_eq!(
+            cell(
+                &metrics,
+                "ralph_failure_route_total",
+                "route",
+                FAILURE_ROUTE_LLM_FAILED
+            ),
+            1.0
+        );
+        assert_eq!(
+            cell(
+                &metrics,
+                "ralph_failure_route_total",
+                "route",
+                crate::squad::classify::DEGENERATE_LOOP_CLASS
+            ),
+            1.0
+        );
+        // The three cells nothing was recorded into must have stayed at zero:
+        // a face that published a total instead of the cells would move all of
+        // them together and read as every route being taken at once.
+        for untouched in [
+            crate::squad::classify::TERMINAL_ENV_FAILURE_CLASS,
+            FAILURE_ROUTE_LLM_CLASSIFIED,
+            FAILURE_ROUTE_LLM_ABSENT,
+        ] {
+            assert_eq!(
+                cell(&metrics, "ralph_failure_route_total", "route", untouched),
+                0.0,
+                "{untouched} must not move when other routes are recorded"
+            );
+        }
     }
 
     /// All four independent-review cells are on the wire before the gate has
