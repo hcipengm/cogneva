@@ -2270,7 +2270,7 @@ async fn run_evolution_cycle_in(
                         // on the next cycle, and that release build takes the
                         // single build slot the deployer needs to advance. On
                         // 2026-09-27 one change the whitelist had already refused
-                        // was rebuilt and refused twelve times in six hours.
+                        // was rebuilt and refused seven times in under two hours.
                         //
                         // Every other landing failure keeps the behaviour it had
                         // and stays in the queue -- including a size refusal,
