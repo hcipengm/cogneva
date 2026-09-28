@@ -488,7 +488,8 @@ async fn confirm_or_prompt(
         .await;
     };
 
-    if verify_ssh(config, private_key).await {
+    let probe = verify_ssh(config, private_key).await;
+    if probe == SshProbe::Accepted {
         return match promote(kube, config, private_key, &public_line).await {
             Ok(()) => {
                 info!(fingerprint = %fingerprint(&public_line).unwrap_or_default(),
@@ -510,7 +511,10 @@ async fn confirm_or_prompt(
         // 发生了什么，而不是笼统地说"公钥还没登记"。
         NOTE_KEY_PAIR_MISMATCH.to_string()
     } else {
-        "SSH 握手未通过（公钥尚未登记到上游仓库）".to_string()
+        // 自证没通过才轮到"要不要登记"这个问题，所以这里引用的是刚才那次自证的
+        // 结论：它没跑起来时要说的不是"公钥还没登记"——那句话把我们的毛病说成
+        // 了运营者欠一次后台操作。
+        probe_reason(probe)
     };
     warn!(
         fingerprint = %fingerprint(&public_line).unwrap_or_default(),
@@ -548,8 +552,12 @@ async fn register_and_promote(
     // 而且**422 有两种含义**（已存在的密钥、无效的密钥），都被判成功；把它当成
     // "身份已生效"，等于用一个 HTTP 状态码顶替一次真实的认证。握手是同一件事的
     // 直接读数，成了才写 `ready`。
-    if !verify_ssh(config, private_key).await {
-        let reason = "部署密钥已登记，但 SSH 握手仍未通过（密钥未在仓库生效）".to_string();
+    let probe = verify_ssh(config, private_key).await;
+    if probe != SshProbe::Accepted {
+        // 登记那一步只说"平台收下了这个请求"，成没成由这次握手回答。它给出的
+        // 是哪种结论就写哪种：未执行的那档不能写成"密钥未在仓库生效"，那会把
+        // 一次没跑起来的探测记成上游的否定。
+        let reason = format!("部署密钥已登记，但{}", probe_reason(probe));
         warn!(repo = %config.repo, public_key = %public_line, "{reason}");
         return Outcome::AwaitingToken(reason);
     }
@@ -620,22 +628,60 @@ async fn patch_secret(kube: &KubeClient, string_fields: serde_json::Value) -> Re
     .await
 }
 
-/// 用给定的私钥做一次**只读** SSH 握手：`ls-remote` 不改变上游任何状态，
-/// 却把所有要验的东西都走了一遍（DNS、22 端口、密钥被接受、仓库可读）。
-async fn verify_ssh(config: &IdentityConfig, private_key: &str) -> bool {
-    // 没配仓库就没有可自证的对象：这时候去连一个拼不出来的地址只是浪费一次超时。
-    if config.repo.is_empty() || private_key.is_empty() {
-        return false;
+/// 一次 SSH 自证**实际证到了什么**。
+///
+/// 布尔不够用：`false` 把"握手跑完、上游不认这把密钥"与"握手根本没跑起来"装进
+/// 同一个值，而这两件事要不同的人去处置——前者要运营者把公钥登记到仓库，后者是
+/// 本进程或链路的毛病，去仓库上找是白找。分档只按本进程自己的控制流（临时文件、
+/// 起进程、超时都是我们的动作），不解析 ssh 的 stderr：外来文本不参与分类，它只
+/// 作为证据随日志出行。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SshProbe {
+    /// 握手跑完且成功。
+    Accepted,
+    /// 握手跑完，上游拒绝了这次认证。
+    Refused,
+    /// 握手没能执行（原因见载荷），因此**没有**对这把密钥作出任何判定。
+    NotRun(&'static str),
+}
+
+/// 自证的结论如何讲给人听。未执行的那一档必须写明"没有判定"，否则读的人会照着
+/// `Refused` 的处置去仓库里再加一把已经加过的公钥。
+fn probe_reason(probe: SshProbe) -> String {
+    match probe {
+        SshProbe::Accepted => "SSH 握手通过".to_string(),
+        SshProbe::Refused => "SSH 握手未通过（公钥未在目标仓库生效）".to_string(),
+        SshProbe::NotRun(cause) => format!("SSH 自证未能执行（{cause}），未对公钥作出判定"),
     }
-    let Ok(dir) = temp_key_file(private_key) else {
-        return false;
-    };
-    let url = format!("{}{}.git", config.ssh_base, config.repo);
-    let ssh = format!(
+}
+
+/// 把私钥落到临时文件上，并交出**这次握手要用的那串 ssh 参数**。
+///
+/// 递文件而不是目录这件事只有这一个决定点：`-i` 指向目录时 ssh 判它"权限过宽"
+/// （目录按 umask 是 0755）并直接忽略这把密钥——失败发生在读文件那一步，密钥
+/// 本身对不对根本没被问到。所以"交给 ssh 的是什么"与"临时文件在哪里"由同一个
+/// 函数给出，谁改都不会只改一半。
+fn probe_key_and_options(private_key: &str) -> Result<(tempfile::TempDir, String), String> {
+    let (dir, key_path) = temp_key_file(private_key)?;
+    let options = format!(
         "ssh -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
          -o ConnectTimeout=10",
-        dir.path().display()
+        key_path.display()
     );
+    Ok((dir, options))
+}
+
+/// 用给定的私钥做一次**只读** SSH 握手：`ls-remote` 不改变上游任何状态，
+/// 却把所有要验的东西都走了一遍（DNS、22 端口、密钥被接受、仓库可读）。
+async fn verify_ssh(config: &IdentityConfig, private_key: &str) -> SshProbe {
+    // 没配仓库就没有可自证的对象：这时候去连一个拼不出来的地址只是浪费一次超时。
+    if config.repo.is_empty() || private_key.is_empty() {
+        return SshProbe::NotRun("没有可自证的目标（仓库或私钥为空）");
+    }
+    let Ok((_dir, ssh)) = probe_key_and_options(private_key) else {
+        return SshProbe::NotRun("临时私钥写不出");
+    };
+    let url = format!("{}{}.git", config.ssh_base, config.repo);
     // 这条 git 走的是"起进程 + 进程组 + 一次硬超时"那条共用路径：`ssh` 的
     // `ConnectTimeout` 只管到建连为止，建上之后对端不吐字节就是**没有边界的
     // 等待**——而这里是自举链路的自证步骤，卡住就意味着状态位永远停在待确认。
@@ -649,7 +695,7 @@ async fn verify_ssh(config: &IdentityConfig, private_key: &str) -> bool {
         Ok(pair) => pair,
         Err(e) => {
             info!(target: "git_identity", "SSH 自证无法执行: {e}");
-            return false;
+            return SshProbe::NotRun("git 进程起不来");
         }
     };
 
@@ -659,17 +705,17 @@ async fn verify_ssh(config: &IdentityConfig, private_key: &str) -> bool {
             // 进程已经归位、号可以被复用：守卫到此为止。留在后面 disarm，
             // 会变成对一个可能已经属于别人的进程组发 SIGKILL。
             guard.disarm();
-            true
+            SshProbe::Accepted
         }
         Ok(Ok(out)) => {
             guard.disarm();
             let stderr = String::from_utf8_lossy(&out.stderr);
             info!(target: "git_identity", "SSH 自证未通过: {}", stderr.trim());
-            false
+            SshProbe::Refused
         }
         Ok(Err(e)) => {
             info!(target: "git_identity", "SSH 自证无法执行: {e}");
-            false
+            SshProbe::NotRun("git 进程无法等待")
         }
         // 超时：守卫随作用域被丢弃，整条 `git → sh → ssh` 一起走。
         Err(_) => {
@@ -678,7 +724,7 @@ async fn verify_ssh(config: &IdentityConfig, private_key: &str) -> bool {
                 "SSH 自证超时（{}s），已杀进程组",
                 SSH_PROBE_TIMEOUT.as_secs()
             );
-            false
+            SshProbe::NotRun("握手超时，进程组已杀")
         }
     }
 }
@@ -689,15 +735,22 @@ const SSH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20
 
 /// 把私钥写到临时文件（0600）供 git 使用。私钥不进命令行、不进环境变量，
 /// 只以一个权限受限的临时文件存在，用完随 TempDir 一起消失。
-fn temp_key_file(private_key: &str) -> Result<tempfile::TempDir, String> {
+///
+/// 返回的是目录的**守卫**与密钥文件的**路径**两件东西，不能只返回其中一件：
+/// 守卫活得不够久，目录会带着密钥一起被删掉；而交给 ssh 的必须是那个文件，
+/// 递目录过去等于没把密钥给它。
+fn temp_key_file(private_key: &str) -> Result<(tempfile::TempDir, PathBuf), String> {
     let dir = tempfile::Builder::new()
         .prefix("cogneva-git-identity-")
         .tempdir()
         .map_err(|e| format!("创建临时目录失败: {e}"))?;
+    // tempfile 建的目录跟随 umask（常见是 0755）。这里放的是私钥，目录本身也要
+    // 只归属主；跟着 umask 走，等于这条性质随进程环境变。
+    set_owner_only_dir(dir.path())?;
     let path = dir.path().join("id_ed25519");
     std::fs::write(&path, private_key).map_err(|e| format!("写临时私钥失败: {e}"))?;
     set_owner_only(&path)?;
-    Ok(dir)
+    Ok((dir, path))
 }
 
 #[cfg(unix)]
@@ -709,6 +762,18 @@ fn set_owner_only(path: &Path) -> Result<(), String> {
 
 #[cfg(not(unix))]
 fn set_owner_only(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_owner_only_dir(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("设置临时目录权限失败: {e}"))
+}
+
+#[cfg(not(unix))]
+fn set_owner_only_dir(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
@@ -1039,5 +1104,77 @@ mod tests {
         // 空字符串等于没有：写成空值的键不该被当成"有 token"
         assert!(facts.token.is_none());
         assert_eq!(facts.step(), Step::Settled);
+    }
+
+    /// 自证递出去的必须是**密钥文件**。递给 ssh 一个目录时它先判权限、根本不读
+    /// 密钥，于是每一次握手都失败在一个与密钥无关的原因上，而链路上把这次失败
+    /// 记成了"公钥没登记到仓库"。
+    #[test]
+    fn the_probe_hands_ssh_the_key_file_and_not_the_directory_around_it() {
+        let key = "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n";
+        let (dir, options) = probe_key_and_options(key).expect("临时私钥");
+
+        let handed: Vec<&str> = options.split_whitespace().collect();
+        let at = handed
+            .iter()
+            .position(|w| *w == "-i")
+            .expect("选项里没有 -i");
+        let handed_path = Path::new(handed[at + 1]);
+
+        assert!(handed_path.is_file(), "递给 ssh 的不是普通文件");
+        assert_ne!(handed_path, dir.path(), "递给 ssh 的是那个目录");
+        assert!(handed_path.starts_with(dir.path()), "临时密钥跑到目录外了");
+        assert_eq!(
+            std::fs::read(handed_path).expect("读回递过去的文件"),
+            key.as_bytes(),
+            "递过去的文件里不是那把密钥"
+        );
+    }
+
+    /// 临时目录里放的是私钥，权限不能跟着 umask 走。
+    #[cfg(unix)]
+    #[test]
+    fn the_temporary_key_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, key_path) = temp_key_file("PRIVATE").expect("临时私钥");
+        for path in [key_path, dir.path().to_path_buf()] {
+            let mode = std::fs::metadata(&path)
+                .expect("元数据")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode & 0o077, 0, "{} 对同组/其他用户可读", path.display());
+        }
+    }
+
+    /// 没跑起来的自证不许被讲成"上游拒绝了这把密钥"：两者的处置人不同，把前者
+    /// 说成后者会让运营者去后台加一把已经加过的公钥。
+    #[test]
+    fn a_probe_that_never_ran_does_not_blame_the_repository() {
+        let not_run = probe_reason(SshProbe::NotRun("临时私钥写不出"));
+        assert!(not_run.contains("未对公钥作出判定"), "{not_run}");
+        assert!(!not_run.contains("未在目标仓库生效"), "{not_run}");
+
+        let refused = probe_reason(SshProbe::Refused);
+        assert!(refused.contains("未在目标仓库生效"), "{refused}");
+        assert_ne!(not_run, refused);
+    }
+
+    /// 没有可自证的对象时也不必去连一个拼不出来的地址：直接判"没跑"，而不是
+    /// 判"上游拒绝了"。
+    #[tokio::test]
+    async fn a_probe_with_nothing_to_prove_does_not_run() {
+        let config = IdentityConfig {
+            repo: String::new(),
+            key_path: PathBuf::from("/nonexistent"),
+            ssh_base: "git@example.invalid:".to_string(),
+            git_bin: PathBuf::from("/bin/true"),
+            retry_secs: 600,
+        };
+        assert!(matches!(
+            verify_ssh(&config, "PRIVATE").await,
+            SshProbe::NotRun(_)
+        ));
+        assert!(matches!(verify_ssh(&config, "").await, SshProbe::NotRun(_)));
     }
 }
