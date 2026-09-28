@@ -13,6 +13,12 @@ use tracing::{debug, info, warn};
 
 use cog_core::Pattern;
 
+/// The instruction this path sends when no prompt manager is wired. The
+/// declaration of `reflection:skill_extractor` in `prompts/` has to say the
+/// same thing; the guard in `evolution.rs`'s tests renders it and compares.
+pub(crate) const SKILL_EXTRACTOR_SYSTEM: &str =
+    "You are a skill extraction assistant. Respond with valid JSON only.";
+
 /// Extracts skills from mature patterns.
 pub struct SkillExtractor {
     llm: Arc<dyn LlmClient>,
@@ -55,9 +61,7 @@ impl SkillExtractor {
             .prompt_manager
             .as_ref()
             .and_then(|pm| pm.get("reflection:skill_extractor"))
-            .unwrap_or_else(|| {
-                "You are a skill extraction assistant. Respond with valid JSON only.".into()
-            });
+            .unwrap_or_else(|| SKILL_EXTRACTOR_SYSTEM.into());
         let messages = vec![Message::system(system_prompt), Message::user(prompt)];
 
         let options = ChatOptions {

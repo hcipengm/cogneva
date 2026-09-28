@@ -20,6 +20,86 @@ use tracing::{debug, info, warn};
 
 use crate::types::{EvolutionKind, EvolutionResult, EvolutionStatus};
 
+/// What each prompt says when no prompt manager is wired into the engine.
+///
+/// These are not copies kept for their own sake. The same instruction has to
+/// hold on both paths — the declared prompt a running process reads and the
+/// text the code sends when there is nothing to read — and a side that is
+/// edited alone is how a declaration stops describing the run. The guard in
+/// this file's tests renders every declared key and compares it to the text
+/// here byte for byte, so an edit to either side that is not mirrored fails the
+/// suite instead of shipping as a quiet difference.
+mod fallback {
+    /// Skill refinement: asks for an improved `SkillConfig` for one skill.
+    pub fn skill_refinement(skill_json: &str, skill_id: &str) -> String {
+        format!(
+            "You are evolving an existing agent skill based on production feedback.\n\n\
+             Current skill:\n{}\n\n\
+             Generate an improved version as valid JSON with the same schema:\n\
+             - skill_id (keep identical: '{}')\n\
+             - name (improved if needed)\n\
+             - tools (add/remove based on learnings)\n\
+             - max_iterations (tune if needed)\n\
+             - role_type (keep or refine)\n\
+             - system_prompt (the actual prompt text that guides the agent)",
+            skill_json, skill_id
+        )
+    }
+
+    /// Tool variant suggestion: the error patterns observed plus the field list
+    /// the caller parses back out of the reply.
+    pub fn tool_variant(tool_name: &str, error_patterns: &str) -> String {
+        format!(
+            "You are a tool design expert for an AI agent system.\n\n\
+             Existing tool: {}\n\n\
+             Observed error patterns:\n- {}\n\n\
+             Generate an improved tool variant as JSON with these fields:\n\
+             - name: tool name (suggest a new name like {}_v2 or {}_improved)\n\
+             - description: concise description of what the tool does\n\
+             - parameters: valid JSON Schema object describing input parameters\n\
+             - implementation_hint: string describing implementation approach (e.g., \"native\", \"wasm\", \"rhai\")\n\n\
+             Respond with ONLY the JSON object.",
+            tool_name, error_patterns, tool_name, tool_name
+        )
+    }
+
+    /// Code change generation. The reply is read by
+    /// [`super::EvolutionEngine::extract_unified_diff`], which keeps lines from
+    /// the first `diff --git` — so the shape asked for here has to be one that
+    /// line can open. `validation_errors` is empty on the first attempt and
+    /// carries the previous attempt's failures after that.
+    pub fn code_change(
+        learning_context: &str,
+        module_description: &str,
+        validation_errors: &str,
+    ) -> String {
+        let error_section = if validation_errors.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\nPrevious attempt failed validation. Errors:\n{}\n\nPlease fix these errors and regenerate the change.",
+                validation_errors
+            )
+        };
+        format!(
+            "You are an expert Rust engineer improving an AI agent system.\n\n\
+             Context:\n{}\n\n\
+             Requirement:\n{}\
+             {}\n\n\
+             Generate a change that addresses the requirement. Output ONLY a \
+             unified diff (starting with 'diff --git a/... b/...'), with no \
+             markdown fences and no prose. This is a Rust workspace; modify \
+             only source files under crates/**/*.rs.",
+            learning_context, module_description, error_section
+        )
+    }
+
+    pub const SKILL_REFINEMENT_SYSTEM: &str = "Respond with valid JSON SkillConfig only.";
+    pub const TOOL_VARIANT_SYSTEM: &str = "Respond with valid JSON tool definition only.";
+    pub const CODE_CHANGE_SYSTEM: &str =
+        "Respond with a single unified diff change and nothing else.";
+}
+
 /// Engine that drives controlled self-evolution of the system.
 pub struct EvolutionEngine {
     llm: Arc<dyn LlmClient>,
@@ -182,27 +262,14 @@ impl EvolutionEngine {
             self.prompt_manager
                 .as_ref()
                 .and_then(|pm| pm.render("reflection:evolution_refinement", &vars).ok())
-                .unwrap_or_else(|| {
-                    format!(
-                    "You are evolving an existing agent skill based on production feedback.\n\n\
-                     Current skill:\n{}\n\n\
-                     Generate an improved version as valid JSON with the same schema:\n\
-                     - skill_id (keep identical: '{}')\n\
-                     - name (improved if needed)\n\
-                     - tools (add/remove based on learnings)\n\
-                     - max_iterations (tune if needed)\n\
-                     - role_type (keep or refine)\n\
-                     - system_prompt (the actual prompt text that guides the agent)",
-                    skill_json, skill_id
-                )
-                })
+                .unwrap_or_else(|| fallback::skill_refinement(&skill_json, skill_id))
         };
 
         let system_prompt = self
             .prompt_manager
             .as_ref()
             .and_then(|pm| pm.get("reflection:evolution_refinement_system"))
-            .unwrap_or_else(|| "Respond with valid JSON SkillConfig only.".into());
+            .unwrap_or_else(|| fallback::SKILL_REFINEMENT_SYSTEM.into());
 
         let messages = vec![Message::system(system_prompt), Message::user(prompt)];
 
@@ -477,25 +544,14 @@ impl EvolutionEngine {
             self.prompt_manager
                 .as_ref()
                 .and_then(|pm| pm.render("reflection:evolution_tool", &vars).ok())
-                .unwrap_or_else(|| format!(
-                    "You are a tool design expert for an AI agent system.\n\n\
-                     Existing tool: {}\n\n\
-                     Observed error patterns:\n- {}\n\n\
-                     Generate an improved tool variant as JSON with these fields:\n\
-                     - name: tool name (suggest a new name like {}_v2 or {}_improved)\n\
-                     - description: concise description of what the tool does\n\
-                     - parameters: valid JSON Schema object describing input parameters\n\
-                     - implementation_hint: string describing implementation approach (e.g., \"native\", \"wasm\", \"rhai\")\n\n\
-                     Respond with ONLY the JSON object.",
-                    tool_name, errors_text, tool_name, tool_name
-                ))
+                .unwrap_or_else(|| fallback::tool_variant(tool_name, &errors_text))
         };
 
         let system_prompt = self
             .prompt_manager
             .as_ref()
             .and_then(|pm| pm.get("reflection:evolution_tool_system"))
-            .unwrap_or_else(|| "Respond with valid JSON tool definition only.".into());
+            .unwrap_or_else(|| fallback::TOOL_VARIANT_SYSTEM.into());
 
         let messages = vec![Message::system(system_prompt), Message::user(prompt)];
 
@@ -670,24 +726,10 @@ impl EvolutionEngine {
                     .as_ref()
                     .and_then(|pm| pm.render("reflection:evolution_change", &vars).ok())
                     .unwrap_or_else(|| {
-                        let error_section = if validation_errors.is_empty() {
-                            String::new()
-                        } else {
-                            format!(
-                                "\n\nPrevious attempt failed validation. Errors:\n{}\n\nPlease fix these errors and regenerate the change.",
-                                validation_errors
-                            )
-                        };
-                        format!(
-                            "You are an expert Rust engineer improving an AI agent system.\n\n\
-                             Context:\n{}\n\n\
-                             Requirement:\n{}\
-                             {}\n\n\
-                             Generate a change that addresses the requirement. Output ONLY a \
-                             unified diff (starting with 'diff --git a/... b/...'), with no \
-                             markdown fences and no prose. This is a Rust workspace; modify \
-                             only source files under crates/**/*.rs.",
-                            learning_context, module_description, error_section
+                        fallback::code_change(
+                            learning_context,
+                            module_description,
+                            &validation_errors,
                         )
                     })
             };
@@ -696,9 +738,7 @@ impl EvolutionEngine {
                 .prompt_manager
                 .as_ref()
                 .and_then(|pm| pm.get("reflection:evolution_change_system"))
-                .unwrap_or_else(|| {
-                    "Respond with a single unified diff change and nothing else.".into()
-                });
+                .unwrap_or_else(|| fallback::CODE_CHANGE_SYSTEM.into());
 
             let messages = vec![Message::system(system_prompt), Message::user(prompt)];
 
@@ -1245,5 +1285,207 @@ mod tests {
         let text = "diff --git a/x.rs b/x.rs\n@@ -1 +1,2 @@\n a\n+b\n";
         let diff = EvolutionEngine::extract_unified_diff(text).expect("git accepts this shape");
         assert!(diff.starts_with("diff --git a/x.rs b/x.rs"));
+    }
+}
+
+/// The declared prompt and the code's fallback are one instruction carried
+/// twice, and until this guard existed nothing compared them.
+///
+/// The paths diverge in a way no other gate sees: the code path is the one the
+/// tests exercise (every test builds the engine without a prompt manager, so
+/// the fallback is what runs), while the declared path is the one production
+/// runs (the ConfigMap is what a deployed process loads). An edit to either
+/// side alone therefore passes every behavioural test and changes what the
+/// model is told in production only. That is how the change prompt came to ask
+/// for a Markdown code block with the filename as its header while
+/// `extract_unified_diff` keeps lines only from the first `diff --git`: the
+/// generation had no such line, the reply was filed as a conceptual answer, and
+/// the tokens were paid for and discarded.
+#[cfg(test)]
+mod declared_prompt_matches_fallback {
+    use super::{fallback, EvolutionEngine};
+    use cog_prompt::{PromptManager, TemplateVars, WatchMode};
+
+    /// Every key this guard compares. The list is checked against what
+    /// `prompts/` actually declares in both directions, so a declaration added
+    /// or removed without touching this guard fails here rather than dropping
+    /// out of coverage.
+    const COMPARED: [&str; 8] = [
+        "agent:default",
+        "reflection:evolution_change",
+        "reflection:evolution_change_system",
+        "reflection:evolution_refinement",
+        "reflection:evolution_refinement_system",
+        "reflection:evolution_tool",
+        "reflection:evolution_tool_system",
+        "reflection:skill_extractor",
+    ];
+
+    /// Load `prompts/` the way a process does: from the directory as shipped,
+    /// not from a copy written by the test.
+    async fn manager() -> PromptManager {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../prompts");
+        PromptManager::from_dir(dir, WatchMode::None)
+            .await
+            .unwrap_or_else(|e| panic!("prompts/ must load from {dir}: {e}"))
+    }
+
+    /// A `|` block scalar keeps one trailing newline; the code's literal has
+    /// none. That byte is YAML's, not the instruction's, so it is not a
+    /// difference in what the model is told.
+    fn same_instruction(rendered: &str, text: &str) -> bool {
+        rendered.trim_end_matches('\n') == text.trim_end_matches('\n')
+    }
+
+    fn refinement_vars() -> (TemplateVars, &'static str, &'static str) {
+        let json = "{\"skill_id\":\"sk-1\"}";
+        let id = "sk-1";
+        (
+            TemplateVars::new()
+                .with("skill_json", json)
+                .with("skill_id", id),
+            json,
+            id,
+        )
+    }
+
+    fn tool_vars() -> (TemplateVars, &'static str, &'static str) {
+        let name = "read_file";
+        let errors = "timeout\nbad path";
+        (
+            TemplateVars::new()
+                .with("tool_name", name)
+                .with("error_patterns", errors),
+            name,
+            errors,
+        )
+    }
+
+    fn change_vars(errors: Option<&str>) -> TemplateVars {
+        let mut vars = TemplateVars::new()
+            .with("learning_context", "ctx")
+            .with("module_description", "desc");
+        if let Some(e) = errors {
+            vars = vars.with("compile_errors", e);
+        }
+        vars
+    }
+
+    #[tokio::test]
+    async fn every_declared_prompt_is_the_text_the_code_falls_back_to() {
+        let pm = manager().await;
+        let mut keys: Vec<String> = {
+            let reg = pm.registry.read().expect("registry readable");
+            reg.keys().into_iter().cloned().collect()
+        };
+        keys.sort();
+        let compared: Vec<String> = COMPARED.iter().map(|k| k.to_string()).collect();
+        assert_eq!(
+            keys, compared,
+            "prompts/ declares a different set of keys than this guard compares"
+        );
+
+        // Each arm reads its key as a literal at the call rather than passing the
+        // loop's variable down: the workspace-wide sweep that reconciles every
+        // prompt call site against `prompts/` reads the key off the call, and a
+        // call it cannot read is a call it cannot check.
+        for key in COMPARED {
+            // Bootstrap entry owned by cog-prompt; this crate never asks for it
+            // and so has no fallback to compare against.
+            if key == "agent:default" {
+                continue;
+            }
+            let pairs: Vec<(String, String)> = match key {
+                "reflection:skill_extractor" => vec![(
+                    pm.get("reflection:skill_extractor").expect("declared"),
+                    crate::extractor::SKILL_EXTRACTOR_SYSTEM.to_string(),
+                )],
+                "reflection:evolution_refinement" => {
+                    let (vars, json, id) = refinement_vars();
+                    vec![(
+                        pm.render("reflection:evolution_refinement", &vars)
+                            .expect("renders"),
+                        fallback::skill_refinement(json, id),
+                    )]
+                }
+                "reflection:evolution_refinement_system" => vec![(
+                    pm.get("reflection:evolution_refinement_system")
+                        .expect("declared"),
+                    fallback::SKILL_REFINEMENT_SYSTEM.to_string(),
+                )],
+                "reflection:evolution_tool" => {
+                    let (vars, name, errors) = tool_vars();
+                    vec![(
+                        pm.render("reflection:evolution_tool", &vars)
+                            .expect("renders"),
+                        fallback::tool_variant(name, errors),
+                    )]
+                }
+                "reflection:evolution_tool_system" => vec![(
+                    pm.get("reflection:evolution_tool_system")
+                        .expect("declared"),
+                    fallback::TOOL_VARIANT_SYSTEM.to_string(),
+                )],
+                // Both branches: an attempt after a failed validation is the same
+                // instruction plus the errors, and a declaration carrying one
+                // branch and not the other renders a different retry — the one
+                // that costs a second generation.
+                "reflection:evolution_change" => [None, Some("error[E0308]: mismatched types")]
+                    .into_iter()
+                    .map(|errors| {
+                        (
+                            pm.render("reflection:evolution_change", &change_vars(errors))
+                                .expect("renders"),
+                            fallback::code_change("ctx", "desc", errors.unwrap_or("")),
+                        )
+                    })
+                    .collect(),
+                "reflection:evolution_change_system" => vec![(
+                    pm.get("reflection:evolution_change_system")
+                        .expect("declared"),
+                    fallback::CODE_CHANGE_SYSTEM.to_string(),
+                )],
+                other => panic!(
+                    "{other} is declared in prompts/ and this guard has no case for \
+                     it. If cog-reflection falls back for it, compare that text \
+                     here; if another crate reads it, name that crate in this arm."
+                ),
+            };
+            assert!(
+                !pairs.is_empty(),
+                "{key} produced no comparison, so its arm asserts nothing"
+            );
+            for (declared, expected) in pairs {
+                assert!(
+                    same_instruction(&declared, &expected),
+                    "{key}: the declared instruction and the code's fallback differ"
+                );
+            }
+        }
+    }
+
+    /// The change prompt has to ask for a shape its own reader can open, and
+    /// this asserts the premise as well as the conclusion: the reply the old
+    /// declaration asked for yields nothing, and the declaration in force does
+    /// not ask for it.
+    #[tokio::test]
+    async fn the_change_prompt_does_not_ask_for_a_reply_its_reader_discards() {
+        let fenced_code_under_a_filename_header =
+            "```rust\n// crates/foo/src/lib.rs\nfn main() {}\n```";
+        assert!(
+            EvolutionEngine::extract_unified_diff(fenced_code_under_a_filename_header).is_none(),
+            "the reader now accepts this shape, so the assertion below no longer \
+             says anything about it"
+        );
+
+        let pm = manager().await;
+        let rendered = pm
+            .render("reflection:evolution_change", &change_vars(None))
+            .expect("renders");
+        assert!(
+            rendered.contains("diff --git"),
+            "the change prompt does not name the opening line its reader keys on \
+             (`diff --git `): {rendered}"
+        );
     }
 }

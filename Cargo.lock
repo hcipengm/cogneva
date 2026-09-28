@@ -1838,6 +1838,7 @@ dependencies = [
  "blake3",
  "chrono",
  "cog-core",
+ "cog-prompt",
  "cog-storage",
  "schemars",
  "serde",

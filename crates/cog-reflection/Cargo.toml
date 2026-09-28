@@ -29,3 +29,7 @@ tempfile = "3"
 [dev-dependencies]
 tokio-test = "0.4"
 cog-storage = { workspace = true }
+# The guard in `evolution.rs` loads `prompts/` the way a running process does,
+# so the text it compares against is the text that ships rather than a second
+# reading of the YAML.
+cog-prompt = { workspace = true }
