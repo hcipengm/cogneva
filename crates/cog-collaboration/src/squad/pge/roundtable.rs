@@ -351,8 +351,25 @@ impl PgeRoundtable {
 
             // --- Moderator intervention ---
             if let Some(ref moderator) = self.config.moderator {
+                // The board was written from this round a few lines up, and
+                // `history` was appended with the same round, so the moderator
+                // is reading it twice. The debate is the carrier that has to
+                // arrive whole here — it is what the moderator decides on.
+                let moderator_board = Self::board_without_mirrored_round(
+                    &board,
+                    &serde_json::json!({
+                        "plan": &plan_json,
+                        "generation": &generation_json,
+                        "outcome": &outcome_json,
+                    }),
+                );
                 let mod_output = moderator
-                    .moderate(task, &history, &board, self.config.consensus_threshold)
+                    .moderate(
+                        task,
+                        &history,
+                        &moderator_board,
+                        self.config.consensus_threshold,
+                    )
                     .await;
                 tracing::info!(
                     iteration,
@@ -569,6 +586,35 @@ impl PgeRoundtable {
         }
     }
 
+    /// The board a role is shown, with the round it already reads elsewhere in
+    /// the same document taken out.
+    ///
+    /// Every round is written into the board (`latest_plan` / `latest_generation`
+    /// / `latest_outcome`) and is handed to the next roles through a field of
+    /// their own as well: the evaluator's `history` ends on it, the planner's
+    /// `previous_generation` *is* its generation, the moderator's `history` was
+    /// just appended with it. Sending the board whole makes one round arrive
+    /// twice, and the board's copy is the one that grows with every round, so it
+    /// is the copy no prefix cache can absorb.
+    ///
+    /// `round` names the round's own carriers by the board's field names — a
+    /// `plan` / `generation` / `outcome` key, matching `latest_plan` and the
+    /// rest. A field is removed only when the board's copy is byte-equal to the
+    /// one the caller named: a board shared with another writer
+    /// ([`board_store`](PgeRoundtableConfig::board_store)) can hold a *different*
+    /// round, and there the board is that round's only copy, so removing it would
+    /// take content away rather than a duplicate. A field the caller did not name
+    /// is not compared at all — the planner has no second carrier for the
+    /// previous *plan* — and "not compared" must not read as "kept".
+    fn board_without_mirrored_round(
+        board: &serde_json::Value,
+        round: &serde_json::Value,
+    ) -> serde_json::Value {
+        let (trimmed, dropped, kept) = board_mirror_trim(board, round);
+        crate::observable::global_observable().record_board_mirror_bytes(dropped, kept);
+        trimmed
+    }
+
     /// Run a single sequential PGE iteration using the primary actors.
     async fn run_sequential_iteration(
         &self,
@@ -579,6 +625,15 @@ impl PgeRoundtable {
         eval_history: &[serde_json::Value],
         board: &serde_json::Value,
     ) -> (PlannerOutput, GeneratorOutput, RoundOutcome) {
+        // The planner reads the previous generation twice over — as its own
+        // argument and as the board's `latest_generation`. Its previous *plan*
+        // and full previous outcome have no other carrier, so only the
+        // generation is named here and the rest of the board passes through.
+        let planner_round = match prev_gen_ref {
+            Some(generation) => serde_json::json!({ "generation": generation }),
+            None => serde_json::Value::Null,
+        };
+        let planner_board = Self::board_without_mirrored_round(board, &planner_round);
         let plan = self
             .planner
             .plan(
@@ -592,7 +647,7 @@ impl PgeRoundtable {
                     .and_then(|s| s.as_u64())
                     .map(|s| s as u32),
                 prev_gen_ref,
-                Some(board),
+                Some(&planner_board),
             )
             .await;
 
@@ -638,6 +693,12 @@ impl PgeRoundtable {
             .iter()
             .map(|s| s.as_str())
             .collect();
+        // `eval_history` ends on the round the board was last written with, so
+        // the board is carrying that same round a second time.
+        let evaluation_board = Self::board_without_mirrored_round(
+            board,
+            eval_history.last().unwrap_or(&serde_json::Value::Null),
+        );
         let mut evaluation = self
             .evaluator
             .evaluate(
@@ -646,7 +707,7 @@ impl PgeRoundtable {
                 &generation_json,
                 eval_history,
                 &criteria,
-                Some(board),
+                Some(&evaluation_board),
             )
             .await;
         evaluation.enforce_criteria_evidence(!criteria.is_empty());
@@ -695,6 +756,14 @@ impl PgeRoundtable {
             let board = board.clone();
 
             let handle = tokio::spawn(async move {
+                // The same trims as the sequential path, and for the same
+                // reasons. One per branch, because each branch pays for its own
+                // document.
+                let planner_round = match prev_gen.as_ref() {
+                    Some(generation) => serde_json::json!({ "generation": generation }),
+                    None => serde_json::Value::Null,
+                };
+                let planner_board = Self::board_without_mirrored_round(&board, &planner_round);
                 let plan = planner
                     .plan(
                         &task,
@@ -709,7 +778,7 @@ impl PgeRoundtable {
                             .and_then(|s| s.as_u64())
                             .map(|s| s as u32),
                         prev_gen.as_ref(),
-                        Some(&board),
+                        Some(&planner_board),
                     )
                     .await;
 
@@ -760,6 +829,12 @@ impl PgeRoundtable {
                     .iter()
                     .map(|s| s.as_str())
                     .collect();
+                // `eval_history` ends on the round the board was last written
+                // with, so the board is carrying that same round a second time.
+                let evaluation_board = Self::board_without_mirrored_round(
+                    &board,
+                    eval_history.last().unwrap_or(&serde_json::Value::Null),
+                );
                 let mut evaluation = evaluator
                     .evaluate(
                         &task,
@@ -767,7 +842,7 @@ impl PgeRoundtable {
                         &generation_json,
                         &eval_history,
                         &criteria,
-                        Some(&board),
+                        Some(&evaluation_board),
                     )
                     .await;
                 evaluation.enforce_criteria_evidence(!criteria.is_empty());
@@ -1292,6 +1367,49 @@ pub fn parse_evaluation_result(value: &serde_json::Value) -> EvaluationResult {
     }
 
     result
+}
+
+/// What one board field costs the document: the field's own bytes, key
+/// included. The punctuation around it is not counted — what the reading is
+/// for is "how much did the prompt shrink", and every removed field takes the
+/// same two characters with it.
+fn board_mirror_bytes(field: &str, value: &serde_json::Value) -> usize {
+    field.len() + value.to_string().len()
+}
+
+/// The board without its copy of `round`, and what that cost either way: the
+/// bytes of the copies removed, and of the copies that were a different round
+/// and stayed. Pure, so the byte arithmetic is testable on its own; the caller
+/// is what publishes it. See
+/// [`PgeRoundtable::board_without_mirrored_round`] for what the two cases mean.
+fn board_mirror_trim(
+    board: &serde_json::Value,
+    round: &serde_json::Value,
+) -> (serde_json::Value, usize, usize) {
+    const MIRRORS: [(&str, &str); 3] = [
+        ("latest_plan", "plan"),
+        ("latest_generation", "generation"),
+        ("latest_outcome", "outcome"),
+    ];
+    let mut trimmed = board.clone();
+    let mut dropped = 0usize;
+    let mut kept = 0usize;
+    for (field, key) in MIRRORS {
+        let (Some(expected), Some(current)) = (round.get(key), board.get(field)) else {
+            continue;
+        };
+        // What the document gains by keeping it, or loses by removing it.
+        let bytes = board_mirror_bytes(field, current);
+        if current == expected {
+            dropped += bytes;
+            if let Some(object) = trimmed.as_object_mut() {
+                object.remove(field);
+            }
+        } else {
+            kept += bytes;
+        }
+    }
+    (trimmed, dropped, kept)
 }
 
 #[cfg(test)]
@@ -1900,6 +2018,233 @@ mod tests {
         );
     }
 
+    /// The board's copy of a round is removed only when it is the same round the
+    /// role already reads elsewhere. A board holding a *different* round is that
+    /// round's only carrier — removing it would take content away rather than a
+    /// duplicate — and a field the caller never named is not compared at all.
+    #[test]
+    fn the_board_mirror_goes_out_only_when_it_is_the_same_round() {
+        let board = serde_json::json!({
+            "seed": "s",
+            "round": 3,
+            "latest_plan": {"a": 1},
+            "latest_generation": {"content": "x"},
+            "latest_outcome": {"s": 2},
+        });
+
+        // Same round: all three copies go, nothing else moves.
+        let same = serde_json::json!({
+            "plan": {"a": 1},
+            "generation": {"content": "x"},
+            "outcome": {"s": 2},
+        });
+        let trimmed = PgeRoundtable::board_without_mirrored_round(&board, &same);
+        assert_eq!(trimmed.get("latest_plan"), None);
+        assert_eq!(trimmed.get("latest_generation"), None);
+        assert_eq!(trimmed.get("latest_outcome"), None);
+        assert_eq!(trimmed["seed"], serde_json::json!("s"));
+        assert_eq!(trimmed["round"], serde_json::json!(3));
+
+        // A different round in the same field: kept, because the board is then
+        // that round's only copy.
+        let other = serde_json::json!({
+            "plan": {"a": 9},
+            "generation": {"content": "x"},
+            "outcome": {"s": 2},
+        });
+        let trimmed = PgeRoundtable::board_without_mirrored_round(&board, &other);
+        assert_eq!(trimmed["latest_plan"], serde_json::json!({"a": 1}));
+        assert_eq!(trimmed.get("latest_generation"), None);
+
+        // The planner has no second carrier for the previous *plan*, so it names
+        // only the generation and the other two fields pass through untouched.
+        let generation_only = serde_json::json!({"generation": {"content": "x"}});
+        let trimmed = PgeRoundtable::board_without_mirrored_round(&board, &generation_only);
+        assert_eq!(trimmed["latest_plan"], serde_json::json!({"a": 1}));
+        assert_eq!(trimmed["latest_outcome"], serde_json::json!({"s": 2}));
+        assert_eq!(trimmed.get("latest_generation"), None);
+
+        // The reading is in bytes, not in fields: pinning the unit keeps a
+        // later "count the removals" from reading as the same number.
+        assert_eq!(
+            board_mirror_bytes("latest_generation", &serde_json::json!({"content": "x"})),
+            17 + 15
+        );
+        // Every field's own bytes are summed, and the two ends of one trim are
+        // told apart without the process-wide counter (which the tests share).
+        let (_, dropped, kept) = board_mirror_trim(&board, &same);
+        assert_eq!(
+            dropped,
+            board_mirror_bytes("latest_plan", &serde_json::json!({"a": 1}))
+                + board_mirror_bytes("latest_generation", &serde_json::json!({"content": "x"}))
+                + board_mirror_bytes("latest_outcome", &serde_json::json!({"s": 2}))
+        );
+        assert_eq!(kept, 0, "all three copies were the same round");
+
+        let (_, dropped, kept) = board_mirror_trim(&board, &other);
+        assert_eq!(
+            dropped,
+            board_mirror_bytes("latest_generation", &serde_json::json!({"content": "x"}))
+                + board_mirror_bytes("latest_outcome", &serde_json::json!({"s": 2})),
+            "the two fields that were the same round"
+        );
+        assert_eq!(
+            kept,
+            board_mirror_bytes("latest_plan", &serde_json::json!({"a": 1})),
+            "and the one that was not is the guard's own reading"
+        );
+
+        let (_, dropped, kept) = board_mirror_trim(&board, &generation_only);
+        assert_eq!(
+            dropped,
+            board_mirror_bytes("latest_generation", &serde_json::json!({"content": "x"}))
+        );
+        assert_eq!(kept, 0, "a field the caller did not name is not compared");
+    }
+
+    /// The board a role reads carries the round once, through the role's own
+    /// field: the evaluator's history, the planner's previous generation, the
+    /// moderator's debate. Each role is checked in the same run, because the
+    /// trim is per-role — the generator has no second carrier and keeps the
+    /// whole board.
+    #[tokio::test]
+    async fn every_role_reads_the_round_once() {
+        let planner_agent = std::sync::Arc::new(MockAgent::fixed(serde_json::json!({
+            "summary": "s",
+            "plan": {"approach": "keep going"},
+            "sub_tasks": []
+        })));
+        let generator_agent = std::sync::Arc::new(MockAgent::fixed(serde_json::json!({
+            "content": {"code": "fn main() {}"},
+            "artifacts": []
+        })));
+        let evaluator_agent = std::sync::Arc::new(MockAgent::fixed(serde_json::json!({
+            "verdict": "fail", "score": 10, "feedback": "not yet", "criteria": []
+        })));
+        let moderator_agent = std::sync::Arc::new(MockAgent::fixed(serde_json::json!({
+            "decision": "continue"
+        })));
+        let rt = PgeRoundtable::new(
+            PgeRoundtableConfig {
+                max_iterations: 5,
+                consensus_threshold: 1.0,
+                // Flat judgements, so the second round stalls the debate and
+                // the evaluator is called exactly twice.
+                stall_threshold: 2,
+                independent_review: false,
+                context_board: Some(serde_json::json!({"seed": "s"})),
+                moderator: Some(ModeratorActor::new(moderator_agent.clone())),
+                ..Default::default()
+            },
+            PlannerActor::new(planner_agent.clone()),
+            GeneratorActor::new(generator_agent.clone()),
+            EvaluatorActor::new(evaluator_agent.clone()),
+        );
+        let task = cog_core::Task::new(
+            "t-mirror".to_string(),
+            cog_core::TaskType::Custom("test".into()),
+            serde_json::json!({"goal": "g"}),
+        );
+
+        let dropped_before = mirror_bytes(crate::observable::BOARD_MIRROR_DROPPED).await;
+        let result = rt.debate(&task, serde_json::json!({})).await;
+        assert_eq!(
+            result.iterations, 3,
+            "the assertions below describe the run that ended here: three flat rounds, \
+             then the stall"
+        );
+        // The saving is on the record too: a trim nobody counted reads exactly
+        // like a trim that never ran. Only the removed end is asserted — the
+        // tests share this counter, so `kept` cannot be read for one run here;
+        // the guard's own reading is pinned in the pure test instead.
+        assert!(
+            mirror_bytes(crate::observable::BOARD_MIRROR_DROPPED).await > dropped_before,
+            "the board's copies of these rounds were removed without a reading"
+        );
+
+        // The evaluator: every board after the first was written from the round
+        // before, and the history it is handed ends on that same round.
+        let judged = evaluator_agent.inputs();
+        assert_eq!(judged.len(), 3, "every round was judged before the stall");
+        let second = &judged[1]["context"];
+        let board = &second["context_board"];
+        assert_eq!(
+            board.get("latest_generation"),
+            None,
+            "the board is still carrying the round the history already ends on"
+        );
+        assert_eq!(
+            board["round"],
+            serde_json::json!(1),
+            "the board is the previous round's, so the round it mirrors is not in question"
+        );
+        assert_eq!(board["seed"], serde_json::json!("s"));
+        assert_eq!(
+            second["history"][0]["generation"]["content"]["code"],
+            serde_json::json!("fn main() {}"),
+            "and the round itself still arrives, through the history that ends on it"
+        );
+
+        // The planner: its previous generation is a field of its own, so that
+        // one copy goes — while the previous plan, which nothing else carries,
+        // stays on the board.
+        let planned = planner_agent.inputs();
+        assert_eq!(planned.len(), 3);
+        let second_plan = &planned[1]["context"];
+        assert_eq!(
+            second_plan["previous_generation"]["content"]["code"],
+            serde_json::json!("fn main() {}")
+        );
+        assert_eq!(
+            second_plan["context_board"].get("latest_generation"),
+            None,
+            "the plan request was handed the previous generation twice"
+        );
+        assert_eq!(
+            second_plan["context_board"]["latest_plan"]["plan"]["approach"],
+            serde_json::json!("keep going"),
+            "the previous plan has no second carrier and keeps its place"
+        );
+
+        // The generator holds no second copy of anything on the board, so its
+        // board is passed through whole — the trim is per-role, not global.
+        let generated = generator_agent.inputs();
+        assert_eq!(generated.len(), 3);
+        assert_eq!(
+            generated[1]["context"]["context_board"]["latest_generation"]["content"]["code"],
+            serde_json::json!("fn main() {}"),
+            "the generator reads the previous generation only from the board"
+        );
+
+        // The moderator was consulted in the two rounds that reached it; round 3
+        // stalled before it. Each time, the board mirrors the round it was just
+        // handed as the debate.
+        let moderated = moderator_agent.inputs();
+        assert_eq!(
+            moderated.len(),
+            2,
+            "the stalling round reaches no moderator"
+        );
+        for (round, input) in moderated.iter().enumerate() {
+            assert_eq!(
+                input["context_board"].get("latest_generation"),
+                None,
+                "the moderator was handed the round it was just given as the debate"
+            );
+            assert_eq!(
+                input["context_board"]["round"],
+                serde_json::json!(round + 1),
+                "the board is that round's, so the round it mirrors is not in question"
+            );
+            assert_eq!(input["context_board"]["seed"], serde_json::json!("s"));
+            assert_eq!(
+                input["history"][round]["generation"]["content"]["code"],
+                serde_json::json!("fn main() {}"),
+                "and the debate it decides on still carries that round whole"
+            );
+        }
+    }
+
     /// The moderator's mapping names every decision and has no catch-all, so a
     /// decision added later cannot be filed as `continue` and leave the four
     /// cells looking complete.
@@ -1945,6 +2290,25 @@ mod tests {
             "a deployment with no moderator writes no decision cell; without the skip's \
              own cell it reads exactly like a moderator that was never consulted"
         );
+    }
+
+    /// One end of the board-mirror reading, from the process-wide observable.
+    /// Tests share that observable, so a reading is only usable as a delta
+    /// against the value taken before the run.
+    async fn mirror_bytes(part: &str) -> f64 {
+        use cog_core::observability::Observable;
+        let metrics = crate::observable::global_observable()
+            .collect_metrics("D8")
+            .await
+            .unwrap();
+        metrics
+            .iter()
+            .find(|m| {
+                m.name == "pge_board_mirror_bytes_total"
+                    && m.labels.get("part").map(String::as_str) == Some(part)
+            })
+            .map(|m| m.value)
+            .unwrap_or(0.0)
     }
 
     /// One cell of a global series, read from the process-wide observable.

@@ -131,6 +131,22 @@ pub const MODERATOR_OUTCOMES: [&str; 5] = [
     MODERATOR_NOT_ASKED_DISABLED,
 ];
 
+/// The two ends of the board mirror a role is shown, summed in bytes.
+///
+/// `dropped` is what the de-duplication removed: a round the role already reads
+/// through a field of its own — the evaluator's history, the planner's previous
+/// generation, the moderator's debate — which the board was carrying a second
+/// time. `kept` is the other case: the board's copy was *not* that round (a
+/// board shared with another writer holds someone else's), so it is the only
+/// copy and stays. Reading both is what keeps "nothing was ever a duplicate"
+/// apart from "the guard never recognised one".
+pub const BOARD_MIRROR_DROPPED: &str = "dropped";
+pub const BOARD_MIRROR_KEPT: &str = "kept";
+
+/// Both ends of the board mirror, published even at zero. See
+/// [`BOARD_MIRROR_DROPPED`].
+pub const BOARD_MIRROR_PARTS: [&str; 2] = [BOARD_MIRROR_DROPPED, BOARD_MIRROR_KEPT];
+
 /// The two ends of the history a failure analysis is shown, summed in bytes of
 /// the serialized prompt section. `dropped` is what the bound removed: a
 /// zero there means the bound never bound (not that it is broken), while a
@@ -275,6 +291,13 @@ pub struct CollaborationObservable {
     /// keeps it from growing with the run is indistinguishable from the bound
     /// never being reached, and both look like a classifier that works.
     ralph_history_bytes: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
+    /// Bytes of the board mirror removed or kept for the roles that already read
+    /// that round through a field of their own, keyed by [`BOARD_MIRROR_PARTS`].
+    ///
+    /// The saving and its guard are one reading: `dropped` is what one round's
+    /// copy cost, and a `kept` that is not zero is the case the de-duplication
+    /// deliberately left alone, which is why the two cannot share a cell.
+    board_mirror_bytes: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
     /// Resume outcomes, over the closed set in [`crate::resume::RESUME_OUTCOMES`].
     /// The chain whose absence this measures is silent by construction: a task
     /// whose progress was never resumed simply starts again, which is what a
@@ -428,6 +451,18 @@ impl CollaborationObservable {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *map.entry(outcome).or_insert(0) += 1;
+    }
+
+    /// Record one board prepared for a role that also reads the debate history:
+    /// the bytes of the mirrored round removed as a duplicate, and the bytes a
+    /// board that held a *different* round kept.
+    pub fn record_board_mirror_bytes(&self, dropped: usize, kept: usize) {
+        let mut map = self
+            .board_mirror_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *map.entry(BOARD_MIRROR_DROPPED).or_insert(0) += dropped as u64;
+        *map.entry(BOARD_MIRROR_KEPT).or_insert(0) += kept as u64;
     }
 
     /// Record the size of the history a failure analysis was shown: the bytes
@@ -658,6 +693,22 @@ impl Observable for CollaborationObservable {
                 );
             }
 
+            // The board mirror, both ends published. A saving nobody could
+            // distinguish from "this board never had a mirror" is not a saving
+            // anyone can check.
+            let mirror_bytes = self
+                .board_mirror_bytes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            for part in BOARD_MIRROR_PARTS {
+                let count = mirror_bytes.get(part).copied().unwrap_or(0);
+                metrics.push(
+                    RawMetric::new("pge_board_mirror_bytes_total", count as f64)
+                        .with_label("part", part),
+                );
+            }
+
             // The routing face: every cell of the (stage, mode) cross product is
             // published, zeros included. A missing series and "this stage never
             // decided" are the same thing to a scraper, and a missing series is
@@ -881,6 +932,38 @@ mod tests {
         };
         assert_eq!(bytes(RALPH_HISTORY_FED), 120.0);
         assert_eq!(bytes(RALPH_HISTORY_DROPPED), 0.0);
+    }
+
+    /// board 镜像的两端各成一格，零也发布。两头分开正是因为它们不是同一件事：
+    /// `dropped` 是省下来的那份重复，`kept` 是守卫故意没动的那种（board 里那份
+    /// 与历史不同，是唯一一份）。并成一格就再也分不出「没有重复」与「守卫没认出来」。
+    #[tokio::test]
+    async fn both_ends_of_the_board_mirror_are_published() {
+        let obs = CollaborationObservable::new();
+
+        async fn bytes(obs: &CollaborationObservable, part: &str) -> f64 {
+            obs.collect_metrics("D8")
+                .await
+                .unwrap()
+                .iter()
+                .find(|m| {
+                    m.name == "pge_board_mirror_bytes_total"
+                        && m.labels.get("part").map(String::as_str) == Some(part)
+                })
+                .map(|m| m.value)
+                .unwrap_or_else(|| panic!("{part} 这一格在没省过时也要在"))
+        }
+
+        assert_eq!(bytes(&obs, BOARD_MIRROR_DROPPED).await, 0.0);
+        assert_eq!(bytes(&obs, BOARD_MIRROR_KEPT).await, 0.0);
+
+        obs.record_board_mirror_bytes(4301, 0);
+        assert_eq!(bytes(&obs, BOARD_MIRROR_DROPPED).await, 4301.0);
+        assert_eq!(bytes(&obs, BOARD_MIRROR_KEPT).await, 0.0);
+
+        obs.record_board_mirror_bytes(0, 512);
+        assert_eq!(bytes(&obs, BOARD_MIRROR_DROPPED).await, 4301.0);
+        assert_eq!(bytes(&obs, BOARD_MIRROR_KEPT).await, 512.0);
     }
 
     /// 改写这一步的两种结局各自成格：改写买到了新文本、改写什么都没改。
