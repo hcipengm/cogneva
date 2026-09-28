@@ -21,9 +21,9 @@
 //! The rows are written into the real `cog_events` table under a `task_id`
 //! prefix of their own, because the constraint under test is the one
 //! `init_schema` creates: a probe table with a hand-made index would go on
-//! passing after `init_schema` stopped creating it. The prefix is what the
-//! cleanup deletes, so the database is left as it was found and a run that
-//! failed midway does not leave rows a later run would count as history.
+//! passing after `init_schema` stopped creating it. Each test deletes the task
+//! it wrote, so the database is left as it was found and a run that failed
+//! midway does not leave rows a later run would count as history.
 //!
 //! Ignored by default, and needs `COGNEVA_TEST_DATABASE_URL` pointing at a
 //! throwaway database:
@@ -104,9 +104,18 @@ async fn positions(pool: &PgPool, task_id: &str) -> (i64, i64) {
         .unwrap()
 }
 
-async fn cleanup(pool: &PgPool) {
-    sqlx::query("DELETE FROM cog_events WHERE task_id LIKE $1")
-        .bind(format!("{TASK_PREFIX}%"))
+/// The rows one test wrote. The delete names that task rather than the shared
+/// prefix: the three tests in this file run at once in one binary against one
+/// database, so a delete by prefix takes the rows the other two are still
+/// reading. That is what a red run showed -- the overlap test's hundred rows cut
+/// to thirteen by a neighbour finishing first.
+///
+/// Each test clears its own task before it writes as well as after: the task
+/// names are fixed, so rows left behind by a run that died midway are
+/// indistinguishable from this run's history.
+async fn cleanup(pool: &PgPool, task_id: &str) {
+    sqlx::query("DELETE FROM cog_events WHERE task_id = $1")
+        .bind(task_id)
         .execute(pool)
         .await
         .unwrap();
@@ -166,6 +175,7 @@ fn shared_blocks(plan: &Value) -> i64 {
 async fn a_position_is_handed_out_once_and_the_writer_moves_on() {
     let (backend, pool) = setup().await;
     let task = format!("{TASK_PREFIX}positions");
+    cleanup(&pool, &task).await;
 
     let mut given = Vec::new();
     for _ in 0..3 {
@@ -222,7 +232,7 @@ async fn a_position_is_handed_out_once_and_the_writer_moves_on() {
         "the sequence holds a repeated position"
     );
 
-    cleanup(&pool).await;
+    cleanup(&pool, &task).await;
 }
 
 #[tokio::test]
@@ -231,6 +241,7 @@ async fn appends_that_overlap_land_on_distinct_positions() {
     let (backend, pool) = setup().await;
     let backend = Arc::new(backend);
     let task = format!("{TASK_PREFIX}overlap");
+    cleanup(&pool, &task).await;
 
     // The writers start together, each appending on its own connection: with
     // the count and the insert two round trips apart, this is where a count can
@@ -286,7 +297,7 @@ async fn appends_that_overlap_land_on_distinct_positions() {
         "the stored rows do not hold {expected} distinct positions"
     );
 
-    cleanup(&pool).await;
+    cleanup(&pool, &task).await;
 }
 
 #[tokio::test]
@@ -294,6 +305,7 @@ async fn appends_that_overlap_land_on_distinct_positions() {
 async fn a_page_costs_the_same_at_the_oldest_and_the_newest_position() {
     let (backend, pool) = setup().await;
     let task = format!("{TASK_PREFIX}page");
+    cleanup(&pool, &task).await;
 
     sqlx::query(
         "INSERT INTO cog_events (task_id, event_type, payload, offset_num)
@@ -376,5 +388,5 @@ async fn a_page_costs_the_same_at_the_oldest_and_the_newest_position() {
          the oldest one: the cost of a page follows the history rather than the position"
     );
 
-    cleanup(&pool).await;
+    cleanup(&pool, &task).await;
 }
