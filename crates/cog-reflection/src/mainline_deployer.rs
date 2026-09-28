@@ -2660,14 +2660,39 @@ impl MainlineDeployer {
         Ok(())
     }
 
-    /// 集群内 registry 的对象名：Service 与 Deployment 同名（同一份清单里一处
-    /// 声明），而 push 端点的主机部分就是那个 Service。不再单独声明一次——
-    /// 回收要重启的 Deployment 与读数要抓的 Service 必须是同一个东西，第二个
-    /// 名字只会漂移。
-    fn registry_name(&self) -> Option<String> {
-        let endpoint = self.push_endpoint();
-        let (host, _) = endpoint_host_port(&endpoint)?;
-        Some(host.to_string())
+    /// 集群内 registry 的对象名：问集群，不问端点。
+    ///
+    /// 端点的 host 是个 DNS 名（`cogneva-registry.cogneva.svc.cluster.local`），
+    /// 把它当资源名拼成 `deployment/<host>` 送进 kubectl，参数解析器不报错、对象
+    /// 服务报 `NotFound`——于是"跑一次 GC"这个动作**从来没做成过**，而它失败的样子
+    /// 与成功一样：只有一行 warn。名字要从工作负载自己声明的标签读，与交付面的
+    /// 豁免判据同一处声明（[`registry_component_selector`]）。
+    ///
+    /// 名单为空是**错误**，不是没事发生：`kubectl get -l` 零匹配退 0，与"重启成功"
+    /// 在退出码上同形，静默得更彻底。
+    async fn registry_workload_names(&self) -> SFResult<Vec<String>> {
+        let selector = registry_component_selector();
+        let out = self
+            .kubectl(
+                &[
+                    "get",
+                    "deployment",
+                    "-l",
+                    &selector,
+                    "-o",
+                    "jsonpath={.items[*].metadata.name}",
+                ],
+                30,
+            )
+            .await?;
+        let names: Vec<String> = out.split_whitespace().map(str::to_string).collect();
+        if names.is_empty() {
+            return Err(SFError::Config(format!(
+                "no deployment declares itself the image server ({selector}); \
+                 the garbage collection this round exists to trigger cannot run"
+            )));
+        }
+        Ok(names)
     }
 
     /// registry 那张卷的占用读数（走查边车，Service 的 `http` 端点）。
@@ -2716,17 +2741,24 @@ impl MainlineDeployer {
     }
 
     /// 让 registry 重启一次。它的 initContainer 就是 `garbage-collect`，只在
-    /// Pod 启动时跑——所以"跑一次 GC"在这里就是重启那个 Deployment（单副本、
-    /// Recreate，几秒）。放在 initContainer 是既有选择：唯一会写这个 store 的
+    /// Pod 启动时跑——所以"跑一次 GC"在这里就是重启那个运行 registry 的工作负载
+    /// （单副本、Recreate）。放在 initContainer 是既有选择：唯一会写这个 store 的
     /// 进程就是同 Pod 的 registry，init 阶段它还没起来，标记-清扫不可能删到一个
     /// 正在上传、尚未被任何 manifest 引用的 blob。
+    ///
+    /// **代价不是"几秒"**：新 Pod 要把全库扫完才 ready，5.3 GB / 122 tag 的卷上实测
+    /// 20–28 分钟，窗口里每个 `Always` 的引用都解析不到 tag、连节点上已有的字节也
+    /// 起不来。所以这个动作只在真删掉了 tag 的那一轮发生（[`Self::registry_maintenance_round`]），
+    /// 而不是每次推进。哪个对象是 registry 由工作负载自己的标签给出，见
+    /// [`Self::registry_workload_names`]。
     async fn restart_registry(&self) -> SFResult<()> {
-        let name = self
-            .registry_name()
-            .ok_or_else(|| SFError::Config("registry endpoint is not host:port".into()))?;
-        self.kubectl(&["rollout", "restart", &format!("deployment/{name}")], 60)
-            .await
-            .map(|_| ())
+        let names = self.registry_workload_names().await?;
+        for name in &names {
+            self.kubectl(&["rollout", "restart", &format!("deployment/{name}")], 60)
+                .await?;
+            info!(workload = %name, "registry workload restarted to run its garbage collection")
+        }
+        Ok(())
     }
 
     /// 四部署当前声明的镜像对应哪个 rev。不可变 `main-<rev>` 由 tag 直接
@@ -4666,6 +4698,27 @@ fn image_repository(reference: &str) -> &str {
     }
 }
 
+/// What a workload says it is, and the value the image server claims.
+///
+/// One spelling for both sides that have to agree on the identity: the pin
+/// pass, which must leave this workload's own references alone, and the
+/// maintenance round, which must restart *this* workload to make its garbage
+/// collection run. Spelling the label twice would let the two sides drift, and
+/// the drift would be invisible until someone reads a warning.
+const COMPONENT_LABEL: &str = "app.kubernetes.io/component";
+const CLUSTER_REGISTRY_COMPONENT: &str = "cluster-registry";
+
+/// The label selector that names the workload serving the delivered images.
+///
+/// The name is not restated here. The endpoint a rollout pushes to is a
+/// Service, and its host is a DNS name, not a resource name: using it as one
+/// is a string that parses fine and matches nothing, so the restart it was
+/// meant to trigger never happens — and a restart that never happens looks
+/// exactly like a restart that succeeded, because nothing reads the result.
+fn registry_component_selector() -> String {
+    format!("{COMPONENT_LABEL}={CLUSTER_REGISTRY_COMPONENT}")
+}
+
 /// Whether this workload is the one that serves the images a rollout delivers.
 ///
 /// A reference to the build inside it has to stay on the floating tag, and the
@@ -4688,13 +4741,11 @@ fn image_repository(reference: &str) -> &str {
 /// The identity is read off the workload's own label rather than a name list
 /// here, so the exemption travels with the manifest that declares what it is.
 fn serves_the_delivered_images(doc: &serde_yaml::Value) -> bool {
-    const COMPONENT_LABEL: &str = "app.kubernetes.io/component";
-    const CLUSTER_REGISTRY: &str = "cluster-registry";
     doc.get("metadata")
         .and_then(|m| m.get("labels"))
         .and_then(|l| l.get(COMPONENT_LABEL))
         .and_then(|c| c.as_str())
-        == Some(CLUSTER_REGISTRY)
+        == Some(CLUSTER_REGISTRY_COMPONENT)
 }
 
 /// Rewrite every container image in a document that belongs to *this*
@@ -10085,20 +10136,23 @@ exit 0
         format!("cogneva_data_volume_used_bytes{{persistentvolumeclaim=\"{claim}\"}} {bytes}\n")
     }
 
-    /// 回收用例的 kubectl 桩：PVC 的声明量按真读法回一个量，其余调用记账。
-    fn fake_kubectl_pvc(dir: &Path, storage: &str) -> String {
+    /// 回收用例的 kubectl 桩：PVC 的声明量按真读法回一个量，按声明标签问
+    /// "谁是 registry"回 `registry` 那个名单（空串就是零匹配），其余调用记账。
+    fn fake_kubectl_pvc(dir: &Path, storage: &str, registry: &str) -> String {
         let log = dir.join("kubectl.log");
         let script = format!(
             r#"#!/usr/bin/env bash
 echo "$@" >> '{log}'
 case "$*" in
+  *"app.kubernetes.io/component=cluster-registry"*) printf '%s' '{registry}' ;;
   *"rollout restart"*) echo "deployment.apps/x restarted" ;;
   *) printf '%s' '{storage}' ;;
 esac
 exit 0
 "#,
             log = log.display(),
-            storage = storage
+            storage = storage,
+            registry = registry
         );
         write_fake_bin(dir, "fake-kubectl", &script);
         dir.join("fake-kubectl").to_string_lossy().to_string()
@@ -10143,7 +10197,7 @@ exit 0
         let root = tmp.path();
         let bin_dir = root.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
-        let kubectl = fake_kubectl_pvc(&bin_dir, "10Gi");
+        let kubectl = fake_kubectl_pvc(&bin_dir, "10Gi", "cogneva-registry");
         let claim = "cogneva-registry-pvc";
 
         let tags = [
@@ -10225,8 +10279,25 @@ exit 0
         );
         let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
         assert!(
-            calls.contains("rollout restart"),
-            "删完必须让 GC 跑一次，而 GC 是 registry 的 initContainer: {calls}"
+            calls.lines().any(|l| l.contains(
+                "get deployment -l app.kubernetes.io/component=cluster-registry \
+                 -o jsonpath={.items[*].metadata.name}"
+            )),
+            "对象名要问集群、按工作负载自己声明的标签，不能拿端点 host 拼: {calls}"
+        );
+        // 宾语要**逐字相等**，不能是子串：端点 host 拼出来的
+        // `deployment/cogneva-registry.cogneva.svc.cluster.local` 以正确的对象名
+        // 开头，`contains` 会放它过去。
+        let restarted: Vec<&str> = calls
+            .lines()
+            .filter_map(|l| l.split("rollout restart ").nth(1))
+            .map(str::trim)
+            .collect();
+        assert_eq!(
+            restarted,
+            vec!["deployment/cogneva-registry"],
+            "删完必须让 GC 跑一次，而 GC 是 registry 的 initContainer；重启的必须是\
+             查出来的那个对象，动词对了宾语错了等于没做: {calls}"
         );
         assert!(
             calls.contains("get pvc"),
@@ -10246,7 +10317,7 @@ exit 0
         let root = tmp.path();
         let bin_dir = root.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
-        let kubectl = fake_kubectl_pvc(&bin_dir, "10Gi");
+        let kubectl = fake_kubectl_pvc(&bin_dir, "10Gi", "cogneva-registry");
         let (registry, registry_log) = routed_registry(vec![(
             "GET",
             "/v2/cogneva/tags/list".to_string(),
@@ -10295,7 +10366,7 @@ exit 0
         let root = tmp.path();
         let bin_dir = root.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
-        let kubectl = fake_kubectl_pvc(&bin_dir, "10Gi");
+        let kubectl = fake_kubectl_pvc(&bin_dir, "10Gi", "cogneva-registry");
         // 走查边车报 90% 的占用：这一轮到期，真的会开跑。
         let (walker, _) = routed_registry(vec![(
             "GET",
@@ -10537,15 +10608,40 @@ exit 0
     }
 
     #[test]
-    fn the_registry_object_name_comes_from_the_endpoint() {
-        // Service 与 Deployment 同名，而 push 端点的主机部分就是那个 Service：
-        // 回收要重启的对象与它读数的来源必须是同一个名字，不能各声明一次。
+    fn the_seed_image_is_the_only_thing_named_after_the_endpoint() {
+        // 端点给的是**种子镜像**的仓库；它不能同时充当被重启的那个对象名——
+        // 端点的 host 是 DNS 名，当资源名用是个能过解析器、匹配不到任何东西的
+        // 字符串（见 `registry_component_selector`）。
+        assert_eq!(seed_image("reg.local:5000"), "reg.local:5000/cogneva:seed");
+        assert_eq!(
+            registry_component_selector(),
+            "app.kubernetes.io/component=cluster-registry"
+        );
+    }
+
+    /// `kubectl get -l` 零匹配退 0，与"重启成功"在退出码上同形——名单为空必须是
+    /// 错误。上一版就是这个形状：目标名从端点 host 拼出来，`NotFound` 只落进一行
+    /// warn，于是"跑一次 GC"从来没做成过，被删 tag 的层一个都没回收。
+    #[tokio::test]
+    async fn a_restart_that_matches_nothing_is_an_error_not_a_no_op() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let cfg = test_config(root, Path::new("/nonexistent"), "noop", "noop");
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let kubectl = fake_kubectl_pvc(&bin_dir, "10Gi", "");
+        let cfg = test_config(root, Path::new("/nonexistent"), "noop", &kubectl);
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
-        assert_eq!(deployer.registry_name().as_deref(), Some("reg.local"));
-        assert_eq!(seed_image("reg.local:5000"), "reg.local:5000/cogneva:seed");
+
+        let err = deployer.restart_registry().await.unwrap_err().to_string();
+        assert!(
+            err.contains("cluster-registry"),
+            "错误要点名它找的是哪一处声明: {err}"
+        );
+        let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
+        assert!(
+            !calls.contains("rollout restart"),
+            "没找到对象就不该发重启，更不能把空名单读成重启成功: {calls}"
+        );
     }
 
     #[test]
