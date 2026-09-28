@@ -67,7 +67,32 @@ impl MergerActor {
             .map(|b| serde_json::to_value(b).unwrap_or_default())
             .collect();
 
-        let mut input = serde_json::json!({
+        // The stable half: what this role is choosing between, the rule the
+        // choice follows, and the shape the answer has to take. It does not move
+        // from one merge to the next, while the branches and the board it is
+        // being asked about do — so it is assembled apart from the document and
+        // handed over under the contract key, which the runtime renders as the
+        // leading message. See `crate::actors::with_contract`.
+        let mut contract = serde_json::json!({
+            "instructions": "You are the Merger of a roundtable round. Every entry in \
+             `branches` ran the same task and carries its own plan, its own generation, and \
+             the judge's ruling on it. Choose the branch this round carries out and answer \
+             with an object holding `plan`, `generation` and `outcome` copied unchanged from \
+             that branch, `selected_branch_id` set to that branch's `branch_id`, and \
+             `reasoning` saying why it. Rewrite nothing and invent no outcome: a product no \
+             judge ruled on must not be carried out of the round as if one had. A branch \
+             whose judge could not rule carries no score, so it cannot be ranked.",
+            "output_schema": {
+                "plan": "object: the chosen branch's plan, copied unchanged",
+                "generation": "object: the chosen branch's generation, copied unchanged",
+                "outcome": "object: the chosen branch's outcome, copied unchanged",
+                "selected_branch_id": "number: the chosen branch's branch_id",
+                "reasoning": "string: why this branch"
+            },
+            "response_format": "json"
+        });
+
+        let input = serde_json::json!({
             "goal": task.input.get("goal").cloned().unwrap_or(serde_json::json!(task.task_type)),
             "task_type": format!("{:?}", task.task_type),
             "task_id": task.id,
@@ -78,9 +103,10 @@ impl MergerActor {
         // A configured output schema takes precedence over built-in prompt
         // contracts: operators own the contract.
         if let Some(ref schema) = self.output_schema {
-            input["output_schema"] = schema.clone();
-            input["response_format"] = serde_json::json!("json");
+            contract["output_schema"] = schema.clone();
         }
+
+        let input = crate::actors::with_contract(input, contract);
 
         let (mut output, review_basis) = match self.agent.prompt_for_task(&task.id, input).await {
             Ok(result) => {

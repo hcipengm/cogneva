@@ -339,10 +339,17 @@ impl ModeSelectorActor {
         ml_context: Option<&String>,
         knowledge_context: Option<&String>,
     ) -> serde_json::Value {
-        let mut input = serde_json::json!({
-            "goal": goal,
+        // The stable half: the question and the two words the answer may be.
+        // The varying half is everything about this request. Kept apart because
+        // the document serializes in key order and `goal` sorts before
+        // `instruction` — flattened, the first byte of the request already
+        // differs between two requests and the constant sentence behind it never
+        // enters the cacheable prefix. See `crate::actors::with_contract`.
+        let contract = serde_json::json!({
             "instruction": "Choose the best execution mode. Reply with exactly one word: Pipeline or Roundtable.",
         });
+
+        let mut input = serde_json::json!({ "goal": goal });
 
         if let Some(profile) = profile {
             input["profile"] = serde_json::json!({
@@ -363,7 +370,7 @@ impl ModeSelectorActor {
             input["knowledge_context"] = serde_json::json!(ctx);
         }
 
-        input
+        crate::actors::with_contract(input, contract)
     }
 
     fn extract_text(response: &serde_json::Value) -> String {

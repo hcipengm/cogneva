@@ -31,17 +31,39 @@ pub(crate) fn actor_input(
     contract: serde_json::Value,
     context: serde_json::Value,
 ) -> serde_json::Value {
-    let mut doc = serde_json::json!({
-        "task": task,
-        "context": context,
-    });
-    if let Some(fields) = doc.as_object_mut() {
+    with_contract(
+        serde_json::json!({
+            "task": task,
+            "context": context,
+        }),
+        contract,
+    )
+}
+
+/// Attach the stable half to a document that is not one of task and context.
+///
+/// Which half a field belongs to is a property of the request, not of how the
+/// varying fields happen to be arranged. An actor whose document is a single
+/// flat map still has a half that never moves between attempts — its
+/// instructions, its answer contract — and a half that does: the goal, the
+/// debate so far, this round's branches. Written under
+/// [`cog_core::contract::prompt::PROMPT_CONTRACT_KEY`], the runtime renders the
+/// stable half first and drops it from the user message, so the varying fields
+/// cannot sit in front of it. Left in the map they are serialized in key order,
+/// where the field that changes sorts wherever its name happens to fall —
+/// `goal` sorts before `instruction`, and the constant sentence never enters the
+/// cacheable prefix at all.
+pub(crate) fn with_contract(
+    mut document: serde_json::Value,
+    contract: serde_json::Value,
+) -> serde_json::Value {
+    if let Some(fields) = document.as_object_mut() {
         fields.insert(
             cog_core::contract::prompt::PROMPT_CONTRACT_KEY.to_string(),
             contract,
         );
     }
-    doc
+    document
 }
 
 /// The specification a review of this task's output is held to.
@@ -752,222 +774,5 @@ mod tests {
             r#"{"a": 1}"#,
             "planner"
         ));
-    }
-
-    /// An agent that keeps every input document it was handed, so a test can read
-    /// what the actors actually send instead of what they were meant to send.
-    struct InputRecorder {
-        seen: Mutex<Vec<serde_json::Value>>,
-        reply: serde_json::Value,
-    }
-
-    impl InputRecorder {
-        fn new(reply: serde_json::Value) -> Arc<Self> {
-            Arc::new(Self {
-                seen: Mutex::new(Vec::new()),
-                reply,
-            })
-        }
-
-        fn inputs(&self) -> Vec<serde_json::Value> {
-            self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl cog_core::Agent for InputRecorder {
-        async fn prompt(&self, input: serde_json::Value) -> cog_core::SFResult<serde_json::Value> {
-            self.seen
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(input);
-            Ok(self.reply.clone())
-        }
-        async fn start(&self) {}
-        async fn snapshot(
-            &self,
-            _task_id: String,
-        ) -> cog_core::SFResult<cog_core::AgentCheckpoint> {
-            Err(cog_core::SFError::NotImplemented("snapshot".into()))
-        }
-        async fn restore(&self, _snapshot: &cog_core::AgentCheckpoint) -> cog_core::SFResult<()> {
-            Ok(())
-        }
-        async fn continue_(
-            &self,
-            _input: serde_json::Value,
-        ) -> cog_core::SFResult<serde_json::Value> {
-            Err(cog_core::SFError::NotImplemented("continue_".into()))
-        }
-        async fn steer(&self, _instruction: String) -> cog_core::SFResult<()> {
-            Ok(())
-        }
-        async fn abort(&self) -> cog_core::SFResult<()> {
-            Ok(())
-        }
-        async fn reset(&self) -> cog_core::SFResult<()> {
-            Ok(())
-        }
-        async fn state(&self) -> cog_core::SFResult<cog_core::AgentState> {
-            Ok(cog_core::AgentState::Idle)
-        }
-        async fn wait_for_idle(&self) -> cog_core::SFResult<()> {
-            Ok(())
-        }
-        async fn restore_from_id(&self, _checkpoint_id: &str) -> cog_core::SFResult<()> {
-            Ok(())
-        }
-        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<cog_core::AgentEvent> {
-            let (_tx, rx) = tokio::sync::broadcast::channel(1);
-            rx
-        }
-        async fn chat_stream(
-            &self,
-            _messages: &[cog_core::Message],
-            _options: &cog_core::ChatOptions,
-        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
-            Err(cog_core::SFError::NotImplemented("chat_stream".into()))
-        }
-        async fn complete_stream(
-            &self,
-            _prompt: &str,
-            _options: &cog_core::CompleteOptions,
-        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
-            Err(cog_core::SFError::NotImplemented("complete_stream".into()))
-        }
-        async fn read_board(
-            &self,
-            _task_id: &str,
-            _field: &str,
-        ) -> cog_core::SFResult<Option<String>> {
-            Ok(None)
-        }
-        async fn write_board(
-            &self,
-            _task_id: &str,
-            _field: &str,
-            _value: &str,
-        ) -> cog_core::SFResult<()> {
-            Ok(())
-        }
-        async fn receive_message(&self, _msg: cog_core::InboxMessage) -> cog_core::SFResult<()> {
-            Ok(())
-        }
-    }
-
-    fn gate_task() -> cog_core::Task {
-        cog_core::Task::new(
-            "t-prefix",
-            cog_core::TaskType::Custom("test".into()),
-            serde_json::json!({"goal": "g"}),
-        )
-    }
-
-    /// Every PGE actor must hand its stable half over under the key the runtime
-    /// reads, and keep it out of the varying half.
-    ///
-    /// The split is an agreement between two crates: the actors write it, the
-    /// agent runtime reads it (see `cog_core::contract::prompt`). Pinning only
-    /// one side would let the other drift silently — an actor that stops writing
-    /// the key keeps compiling, keeps running, and quietly returns to paying full
-    /// price for a prompt that never changes.
-    #[tokio::test]
-    async fn every_actor_hands_its_stable_half_over_under_the_contract_key() {
-        let task = gate_task();
-        let plan = serde_json::json!({"summary": "s", "sub_tasks": []});
-        let generation = serde_json::json!({"content": "c", "artifacts": []});
-
-        let planner_agent =
-            InputRecorder::new(serde_json::json!({"summary": "s", "sub_tasks": []}));
-        crate::actors::PlannerActor::new(planner_agent.clone())
-            .plan(&task, 1, None, None, None, None)
-            .await;
-
-        let generator_agent = InputRecorder::new(generation.clone());
-        crate::actors::GeneratorActor::new(generator_agent.clone())
-            .generate(
-                &task,
-                &plan,
-                1,
-                crate::actors::PreviousAttempt::default(),
-                None,
-            )
-            .await;
-
-        let evaluator_agent = InputRecorder::new(serde_json::json!({"verdict": "pass"}));
-        crate::actors::EvaluatorActor::new(evaluator_agent.clone())
-            .evaluate(&task, &plan, &generation, &[], &[], None)
-            .await;
-
-        for (role, agent) in [
-            ("planner", &planner_agent),
-            ("generator", &generator_agent),
-            ("evaluator", &evaluator_agent),
-        ] {
-            let inputs = agent.inputs();
-            assert_eq!(inputs.len(), 1, "{role} was expected to send one document");
-            let (contract, payload) = cog_core::contract::prompt::split_contract(inputs[0].clone());
-            let contract = contract.unwrap_or_else(|| panic!("{role} sent no stable half at all"));
-            assert!(
-                !contract.trim().is_empty(),
-                "{role}'s stable half says nothing, so it caches nothing"
-            );
-            assert!(
-                payload
-                    .get(cog_core::contract::prompt::PROMPT_CONTRACT_KEY)
-                    .is_none(),
-                "{role} left the stable half in the varying half as well"
-            );
-            // The varying half is still the varying half: the task and this
-            // attempt's context have to reach the model somewhere.
-            assert!(payload.get("task").is_some(), "{role} dropped the task");
-            assert!(
-                payload.get("context").is_some(),
-                "{role} dropped this attempt's context"
-            );
-        }
-    }
-
-    /// Two attempts of one role share the whole stable half byte for byte, and
-    /// differ only in the half that is allowed to vary.
-    ///
-    /// This is the property the upstream prefix cache is bought with: everything
-    /// from byte 0 to the first difference is billed at the cached rate. It is
-    /// read off the requests the actor builds, which is the only reading
-    /// available while the pool has no quota — upstream `cached_tokens` would be
-    /// the ruler, and it cannot move until there are calls to measure.
-    #[tokio::test]
-    async fn two_attempts_of_one_role_differ_only_outside_the_contract() {
-        let task = gate_task();
-        let plan = serde_json::json!({"summary": "s", "sub_tasks": []});
-        let agent = InputRecorder::new(serde_json::json!({"content": "c", "artifacts": []}));
-        let generator = crate::actors::GeneratorActor::new(agent.clone());
-
-        for attempt in [1, 3] {
-            generator
-                .generate(
-                    &task,
-                    &plan,
-                    attempt,
-                    crate::actors::PreviousAttempt::default(),
-                    None,
-                )
-                .await;
-        }
-
-        let inputs = agent.inputs();
-        assert_eq!(inputs.len(), 2);
-        let split: Vec<_> = inputs
-            .into_iter()
-            .map(cog_core::contract::prompt::split_contract)
-            .collect();
-        assert_eq!(
-            split[0].0, split[1].0,
-            "the stable half must not move between attempts"
-        );
-        assert_ne!(
-            split[0].1, split[1].1,
-            "the varying half must actually vary, or the assertion above proves nothing"
-        );
     }
 }

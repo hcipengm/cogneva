@@ -103,6 +103,39 @@ impl ModeratorActor {
             .map(|h| serde_json::to_value(h).unwrap_or_default())
             .collect();
 
+        // The stable half: what this role is being asked, the words its answer
+        // is spelled with, and the shape the answer takes. None of it moves from
+        // one round to the next, while the debate it is being asked about does —
+        // so it is assembled apart from the document and handed over under the
+        // contract key, which the runtime renders as the leading message. Left in
+        // the map, it would serialize behind `consensus_threshold` and
+        // `context_board`, which both move. See `crate::actors::with_contract`.
+        //
+        // The decision words are spelled the way this actor's parser accepts
+        // them, not the way the enum variants are named: `parse_moderator_output`
+        // lowercases the reply and matches `continue`, `change_strategy`,
+        // `accept_partial`, `escalate`. A contract naming `ChangeStrategy` would
+        // be naming a spelling the parse reads as none of the four, and the round
+        // would continue by default — a decision taken by a word nobody wrote.
+        let mut contract = serde_json::json!({
+            "instructions": "You are the Moderator of a roundtable debate. Each agent \
+             proposed a plan and a generation, and a judge has ruled on the round. Read the \
+             debate so far and decide what happens next: you are not asked whether the round \
+             passed — that verdict is already in the history — you are asked what to do about \
+             a debate that has not confirmed. `decision` is exactly one of: \
+             `continue` — another round with the current strategy; \
+             `change_strategy` — same goal, a different angle, named in `suggestions`; \
+             `accept_partial` — the current best result stands even though consensus was not \
+             reached; `escalate` — this needs an external review or a human.",
+            "output_schema": {
+                "decision": "string: continue | change_strategy | accept_partial | escalate",
+                "reasoning": "string: why this is the right call",
+                "suggestions": ["string: concrete focus for the next round; required for change_strategy"],
+                "good_enough": "bool: whether the current result stands as it is"
+            },
+            "response_format": "json"
+        });
+
         let mut input = serde_json::json!({
             "goal": task.input.get("goal").cloned().unwrap_or(serde_json::json!(task.task_type)),
             "task_type": format!("{:?}", task.task_type),
@@ -116,8 +149,7 @@ impl ModeratorActor {
         // A configured output schema takes precedence over built-in prompt
         // contracts: operators own the contract.
         if let Some(ref schema) = self.output_schema {
-            input["output_schema"] = schema.clone();
-            input["response_format"] = serde_json::json!("json");
+            contract["output_schema"] = schema.clone();
         }
 
         // Inject historical task execution records if knowledge backend is wired.
@@ -132,6 +164,8 @@ impl ModeratorActor {
                 _ => {}
             }
         }
+
+        let input = crate::actors::with_contract(input, contract);
 
         let (mut output, review_basis) = match self.agent.prompt_for_task(&task.id, input).await {
             Ok(result) => {
