@@ -3413,11 +3413,26 @@ impl MainlineDeployer {
         // 只能从一次测量里猜出来，而它答话与否是当场可读的。
         if let Some(restarted_at) = state.registry_restart_unix {
             if self.registry_is_serving().await {
+                let held_secs = now - restarted_at;
                 info!(
                     rev = %rev12(&bare),
-                    held_secs = now - restarted_at,
+                    held_secs,
                     "the tag server answers again; resuming the rollout"
                 );
+                // 这一轮重启的代价在这里落成一条序列。只写日志不够：日志随 Pod
+                // 消失，而"这次重启贵不贵"是要**现读**的——第十节已经吃过一次
+                // 亏，代价被按一个记下来的数报价，而那个数只对当时那个卷成立。
+                // 与回收的计数放在一起读才有意义：扫的时长随"攒了多少废料"走，
+                // 所以"每秒删掉几个 tag"才是判"触发点是不是让卷长得太满"的那条比。
+                if let Some(metrics) = &self.metrics {
+                    let _ = metrics
+                        .record_counter(
+                            cog_core::metric_names::REGISTRY_REBUILD_HOLD_SECS_TOTAL,
+                            held_secs as f64,
+                            std::collections::HashMap::new(),
+                        )
+                        .await;
+                }
                 state.registry_restart_unix = None;
                 self.save_state(&state)?;
             } else {
@@ -10224,7 +10239,7 @@ exit 0
         // is the whole saving.
         let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap_or_default();
         assert!(
-            !calls.contains(&rev12(&rev_a)),
+            !calls.contains(rev12(&rev_a)),
             "the upstream has passed this revision; no rollout job may be dispatched for it: {calls}"
         );
         assert!(
@@ -10432,6 +10447,11 @@ exit 0
 
     /// 反过来：答话即放行，而且**当场**放行（不看按了多久）。释放条件是它给的回答，
     /// 所以这里没有可调的等待时长。
+    ///
+    /// 同时收下这一轮的**代价**：标记放成 10 分钟前，记下的秒数就必须落在那段墙钟
+    /// 里。一个记成 0、记成一个常数、或者压根不记的实现，都过不了下界那一条。
+    /// 上界只是"这是个时钟量"的兜底——这一轮在读它之前还要走几步（读 git、看清单），
+    /// 那几步也算在墙钟里。
     #[tokio::test]
     // 同上：ENV_LOCK 串行化进程级 PATH 修改，需跨 await 持有。
     async fn the_hold_lifts_as_soon_as_the_tag_server_answers() {
@@ -10449,11 +10469,12 @@ exit 0
         let ws = test_workspaces(root, &bare);
         fake_cargo(&bin_dir, ws.target_dir());
         fake_strip(&bin_dir);
-        let deployer = MainlineDeployer::new(cfg, ws);
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let deployer = MainlineDeployer::new(cfg, ws).with_metrics(metrics.clone());
         let old_path = std::env::var("PATH").unwrap_or_default();
         std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
         let mut state = deployer.load_state();
-        state.registry_restart_unix = Some(chrono::Utc::now().timestamp());
+        state.registry_restart_unix = Some(chrono::Utc::now().timestamp() - 600);
         deployer.save_state(&state).unwrap();
 
         // 放行之后这一轮还要读 registry（补 tag 内容、前移浮动签……），那个假
@@ -10463,6 +10484,16 @@ exit 0
         assert!(
             deployer.load_state().registry_restart_unix.is_none(),
             "它答话了就该放行，而不是等够一个猜出来的时长"
+        );
+        let held = metrics
+            .query_counter_totals(cog_core::metric_names::REGISTRY_REBUILD_HOLD_SECS_TOTAL.as_str())
+            .await
+            .unwrap();
+        assert_eq!(held.len(), 1, "这次重启的代价没有被记下来");
+        let secs = held[0].value;
+        assert!(
+            (600.0..=900.0).contains(&secs),
+            "记下的必须是这次真按住的墙钟时长，记到的是 {secs} 秒"
         );
     }
 

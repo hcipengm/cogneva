@@ -165,6 +165,22 @@ metric_names! {
     REGISTRY_PRUNE_FAILURES_TOTAL => "cogneva_registry_prune_failures_total",
     REGISTRY_MAINTENANCE_READING_UNIX => "cogneva_registry_maintenance_reading_unix",
 
+    // cog-reflection — what one reclaim round's restart of the tag server cost.
+    //
+    // A counter of seconds, not a gauge of the last one: the quantity anyone
+    // needs to price this is "how much rollout time has this cost in total",
+    // and a gauge answers with the most recent occurrence instead. It sits next
+    // to the removal counters because the two are read together: the sweep's
+    // cost is proportional to how much waste accumulated since the last one, so
+    // seconds per removed tag is the ratio that says whether the trigger is
+    // letting the store grow too far between rounds.
+    //
+    // It measures the *deployer's* hold -- from issuing the restart to reading
+    // the tag server's own answer -- which is not the fleet's outage: the
+    // outage starts when the old pod is deleted, slightly earlier. The hold is
+    // what this process can read exactly, and it is the cost this process pays.
+    REGISTRY_REBUILD_HOLD_SECS_TOTAL => "cogneva_registry_rebuild_hold_secs_total",
+
     // cog-reflection — the rollout judgement's own resource readings.
     //
     // The judgement runs in a short-lived Job pod, which is born, works for a
