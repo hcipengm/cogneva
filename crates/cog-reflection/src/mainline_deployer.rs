@@ -2272,6 +2272,48 @@ impl MainlineDeployer {
         Ok(images)
     }
 
+    /// 集群此刻**真的被引用着**的 rev：读各工作负载的 pod 模板里每一个容器
+    /// （主容器与 init 容器），只认本仓库的镜像。
+    ///
+    /// 这与"四个目标的命名主容器"不是同一个集合，而回收轮删的是 tag。支撑面的
+    /// init 容器（redis 的 `aof-repair`、进化的 `seed-source`）、备份 CronJob、
+    /// tag 服务自己的边车都可能停在一个既不是 `last_good`、也不是任何目标主容器的
+    /// rev 上——那种 rev 一旦被当"窗外旧 tag"删掉，引用它的工作负载下次重启就再也
+    /// 拉不到镜像。**它不是旧 tag，是有人正在跑的那一版**。
+    ///
+    /// 不读 Job：历史滚动 Job 会把它派发过的每个 rev 永久钉住，等于把回收废掉；
+    /// 正在跑的那个 Job 用的 tag 就是当轮的 bare，本来就在保留集里。
+    async fn live_referenced_revs(&self) -> SFResult<Vec<String>> {
+        // pod 模板在清单里的位置按种类分两处：CronJob 多一层 jobTemplate。
+        const SPECS: [(&str, &str); 4] = [
+            ("deploy", ".spec.template.spec"),
+            ("statefulset", ".spec.template.spec"),
+            ("daemonset", ".spec.template.spec"),
+            ("cronjob", ".spec.jobTemplate.spec.template.spec"),
+        ];
+        let repo = format!("{}/{}", self.pull_endpoint(), IMAGE_REPOSITORY);
+        let mut revs: Vec<String> = Vec::new();
+        for (kind, spec) in SPECS {
+            let jsonpath = format!(
+                "jsonpath={{range .items[*]}}{{range {spec}.containers[*]}}{{.image}}{{\" \"}}{{end}}{{range {spec}.initContainers[*]}}{{.image}}{{\" \"}}{{end}}{{end}}"
+            );
+            let out = self.kubectl(&["get", kind, "-o", &jsonpath], 30).await?;
+            for image in out.split_whitespace() {
+                if image_repository(image) != repo.as_str() {
+                    continue;
+                }
+                let Some(rev) = parse_main_rev(image) else {
+                    continue;
+                };
+                let rev = rev12(rev).to_string();
+                if !revs.contains(&rev) {
+                    revs.push(rev);
+                }
+            }
+        }
+        Ok(revs)
+    }
+
     /// 集群内 HTTP 的一次往返：明文、无凭证，registry 与走查边车共用同一条
     /// 通道（buildah 走的就是这条）。返回状态码、响应头与响应体。
     async fn plain_http(
@@ -2972,6 +3014,26 @@ impl MainlineDeployer {
                 keep.insert(rev.to_string());
             }
         }
+        // 上面那几条只是"这一轮还要用的 rev"。集群里**此刻被引用着**的 rev 是另一组：
+        // 支撑面的 init 容器、备份 CronJob、tag 服务自己的边车都可能停在某个既不是
+        // `last_good`、也不是任何目标主容器的 rev 上（回滚只还原被滚容器，这些引用
+        // 留在失败的那一版）。它们不进名单就会被当旧 tag 删掉，而引用它的工作负载
+        // 下次重启再也拉不到镜像——**那不是旧 tag，是有人正在跑的那一版**。
+        // 读不到就整轮不删：名单不全会静默删错。
+        let live = match self.live_referenced_revs().await {
+            Ok(revs) => revs,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "could not read the revisions live workloads reference; no tag was removed this round"
+                );
+                self.record_maintenance_round(0.0, 0.0, None).await;
+                return;
+            }
+        };
+        for rev in &live {
+            keep.insert(rev.clone());
+        }
         let tags = match self.registry_tags_with_readings().await {
             Ok(tags) => tags,
             Err(e) => {
@@ -2984,6 +3046,14 @@ impl MainlineDeployer {
             }
         };
         let doomed = prunable_tags(&tags, self.cfg.registry_retention, &keep);
+        // 这一轮的读数：白名单有多大、里面哪些 rev 是"集群正在跑"读来的、窗外有几个
+        // 待删。少了它，一次把在跑的 rev 删掉与一次正常的回收在日志上同形。
+        info!(
+            live_referenced = %live.join(","),
+            kept = keep.len(),
+            doomed = doomed.len(),
+            "registry maintenance: what the retention window and the live references protect"
+        );
         let mut removed = 0.0f64;
         let mut failures = 0.0f64;
         for tag in &doomed {
@@ -10295,14 +10365,17 @@ exit 0
     }
 
     /// 回收用例的 kubectl 桩：PVC 的声明量按真读法回一个量，按声明标签问
-    /// "谁是 registry"回 `registry` 那个名单（空串就是零匹配），其余调用记账。
-    fn fake_kubectl_pvc(dir: &Path, storage: &str, registry: &str) -> String {
+    /// "谁是 registry"回 `registry` 那个名单（空串就是零匹配），列工作负载的
+    /// pod 模板（`live`，形如 `localhost:30500/cogneva:main-<rev>`，空串就是
+    /// 读不到任何引用），其余调用记账。
+    fn fake_kubectl_pvc(dir: &Path, storage: &str, registry: &str, live: &str) -> String {
         let log = dir.join("kubectl.log");
         let script = format!(
             r#"#!/usr/bin/env bash
 echo "$@" >> '{log}'
 case "$*" in
   *"app.kubernetes.io/component=cluster-registry"*) printf '%s' '{registry}' ;;
+  *"items"*) printf '%s' '{live}' ;;
   *"rollout restart"*) echo "deployment.apps/x restarted" ;;
   *) printf '%s' '{storage}' ;;
 esac
@@ -10310,7 +10383,8 @@ exit 0
 "#,
             log = log.display(),
             storage = storage,
-            registry = registry
+            registry = registry,
+            live = live
         );
         write_fake_bin(dir, "fake-kubectl", &script);
         dir.join("fake-kubectl").to_string_lossy().to_string()
@@ -10355,7 +10429,7 @@ exit 0
         let root = tmp.path();
         let bin_dir = root.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
-        let kubectl = fake_kubectl_pvc(&bin_dir, "10Gi", "cogneva-registry");
+        let kubectl = fake_kubectl_pvc(&bin_dir, "10Gi", "cogneva-registry", "");
         let claim = "cogneva-registry-pvc";
 
         let tags = [
@@ -10467,6 +10541,210 @@ exit 0
         );
     }
 
+    /// 保留集要读「集群此刻真的引用着的 rev」，不是四个目标的命名主容器：支撑面的
+    /// init 容器、备份 CronJob、tag 服务自己的边车都可能停在某个既不在保留窗、也不是
+    /// 任何目标主容器在跑的 rev 上。删掉那种 tag 就是把**正在跑的那一版**从 registry
+    /// 里拿走，引用它的工作负载下次重启就是 ImagePullBackOff。
+    ///
+    /// 这个夹具两边都判：本仓库的引用（01）要保住窗外的 rev；**别的仓库**的同名 rev（02）
+    /// 不许保住它——按仓库过滤是这条读数的前提，少了它回收会被外部镜像钉住。
+    #[tokio::test]
+    async fn maintenance_keeps_a_rev_a_live_workload_still_references() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let kubectl = fake_kubectl_pvc(
+            &bin_dir,
+            "10Gi",
+            "cogneva-registry",
+            "localhost:30500/cogneva:main-000000000001 foreign.example/cogneva:main-000000000002",
+        );
+        let claim = "cogneva-registry-pvc";
+
+        let tags = [
+            "local",
+            "seed",
+            "main-000000000001",
+            "main-000000000002",
+            "main-000000000003",
+            "main-000000000004",
+        ];
+        let mut routes = vec![(
+            "GET",
+            "/v2/cogneva/tags/list".to_string(),
+            http_200(&tags_json(&tags)),
+        )];
+        for (i, tag) in tags.iter().filter(|t| t.starts_with("main-")).enumerate() {
+            routes.extend(tag_routes(
+                tag,
+                &format!("sha256:m{i}"),
+                &format!("sha256:c{i}"),
+                &[&format!("L{i}")],
+                &format!("rev{i}"),
+                &format!("2026-09-2{}T00:00:00Z", i + 1),
+            ));
+        }
+        routes.extend(tag_routes(
+            "local",
+            "sha256:local",
+            "sha256:cl",
+            &["L9"],
+            "deadbeefcafe",
+            "2026-09-26T00:00:00Z",
+        ));
+        routes.extend(tag_routes(
+            "seed",
+            "sha256:seed",
+            "sha256:cs",
+            &["L0"],
+            "deadbeefcafe",
+            "2026-09-26T00:00:00Z",
+        ));
+        let (registry, registry_log) = routed_registry(routes).await;
+        let (walker, _walker_log) = routed_registry(vec![(
+            "GET",
+            "/metrics".to_string(),
+            http_200(&walker_metrics(claim, 9_000_000_000)),
+        )])
+        .await;
+        let walker_port: u16 = walker.rsplit(':').next().unwrap().parse().unwrap();
+
+        let mut cfg = test_config(root, Path::new("/nonexistent"), "noop", &kubectl);
+        cfg.registry = registry;
+        cfg.registry_claim = claim.into();
+        cfg.registry_walker_port = walker_port;
+        cfg.registry_retention = 2;
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+
+        let mut state = MainlineState::default();
+        // 四个目标的主容器全在最新那个 rev 上：只看 deployed_images 的话 01 与 02 都在
+        // 窗外、两个都会被删——只有"读集群此刻的引用"这条读数能把 01 救下来。
+        let images = vec!["localhost:30500/cogneva:main-000000000004".to_string()];
+        deployer
+            .registry_maintenance_round("000000000004", &images, &mut state)
+            .await;
+
+        let reqs = requests_seen(&registry_log);
+        let deletes: Vec<String> = reqs
+            .iter()
+            .filter_map(|r| r.lines().next())
+            .filter(|l| l.starts_with("DELETE "))
+            .map(|l| l.trim_end_matches(" HTTP/1.1").to_string())
+            .collect();
+        assert_eq!(
+            deletes,
+            vec!["DELETE /v2/cogneva/manifests/sha256:m1"],
+            "窗外是 01 与 02：01 被正在跑的工作负载引用着要保住，02 只被**别的仓库**的\
+             同名 rev 引用、按仓库过滤后不该保住: {deletes:?}"
+        );
+
+        let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
+        for kind in ["deploy", "statefulset", "daemonset", "cronjob"] {
+            assert!(
+                calls.contains(&format!("get {kind} -o jsonpath=")),
+                "引用要按工作负载种类逐个读 pod 模板（主容器＋init 容器）；漏掉任何一种，\
+                 只被那种工作负载引用着的 rev 就会被当成旧 tag 删掉（{kind} 没读）: {calls}"
+            );
+        }
+    }
+
+    /// 引用名单读不到就**整轮不删**：名单不全的后果是静默删错（把有人正在跑的 rev 当
+    /// 旧 tag 删掉），而这个动作不可逆。它只有这一次机会把话说清楚——删掉之后就只剩
+    /// 下一个起不来的工作负载作证了。
+    #[tokio::test]
+    async fn maintenance_deletes_nothing_when_the_live_references_cannot_be_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let kubectl_log = bin_dir.join("kubectl.log");
+        // 这份替身与 `fake_kubectl_pvc` 的唯一差别：读工作负载那一步**失败**
+        // （非零退出 + stderr），而其它查询照常答。
+        let script = format!(
+            r#"#!/usr/bin/env bash
+echo "$@" >> '{log}'
+case "$*" in
+  *"app.kubernetes.io/component=cluster-registry"*) printf '%s' 'cogneva-registry' ;;
+  *"rollout restart"*) echo "deployment.apps/cogneva-registry restarted" ;;
+  *"items"*) echo "Error from server (Forbidden): workloads is forbidden" >&2; exit 1 ;;
+  *) printf '%s' '10Gi' ;;
+esac
+exit 0
+"#,
+            log = kubectl_log.display()
+        );
+        let kubectl = write_fake_bin(&bin_dir, "fake-kubectl", &script)
+            .to_string_lossy()
+            .to_string();
+        let claim = "cogneva-registry-pvc";
+
+        let tags = [
+            "main-000000000001",
+            "main-000000000002",
+            "main-000000000003",
+            "main-000000000004",
+        ];
+        let mut routes = vec![(
+            "GET",
+            "/v2/cogneva/tags/list".to_string(),
+            http_200(&tags_json(&tags)),
+        )];
+        for (i, tag) in tags.iter().enumerate() {
+            routes.extend(tag_routes(
+                tag,
+                &format!("sha256:m{i}"),
+                &format!("sha256:c{i}"),
+                &[&format!("L{i}")],
+                &format!("rev{i}"),
+                &format!("2026-09-2{}T00:00:00Z", i + 1),
+            ));
+        }
+        let (registry, registry_log) = routed_registry(routes).await;
+        let (walker, _walker_log) = routed_registry(vec![(
+            "GET",
+            "/metrics".to_string(),
+            http_200(&walker_metrics(claim, 9_000_000_000)),
+        )])
+        .await;
+        let walker_port: u16 = walker.rsplit(':').next().unwrap().parse().unwrap();
+
+        let mut cfg = test_config(root, Path::new("/nonexistent"), "noop", &kubectl);
+        cfg.registry = registry;
+        cfg.registry_claim = claim.into();
+        cfg.registry_walker_port = walker_port;
+        cfg.registry_retention = 2;
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+
+        let mut state = MainlineState::default();
+        let images = vec!["localhost:30500/cogneva:main-000000000004".to_string()];
+        deployer
+            .registry_maintenance_round("000000000004", &images, &mut state)
+            .await;
+
+        let reqs = requests_seen(&registry_log);
+        let deletes: Vec<String> = reqs
+            .iter()
+            .filter_map(|r| r.lines().next())
+            .filter(|l| l.starts_with("DELETE "))
+            .map(|l| l.trim_end_matches(" HTTP/1.1").to_string())
+            .collect();
+        assert!(
+            deletes.is_empty(),
+            "引用名单读不到时一个 tag 都不许删（窗外那两个此轮只能留着）: {deletes:?}"
+        );
+        let calls = std::fs::read_to_string(&kubectl_log).unwrap();
+        assert!(
+            !calls.contains("rollout restart"),
+            "什么都没删就没有理由重启 tag 服务——重启是这一轮最贵的一步: {calls}"
+        );
+        assert!(
+            state.registry_maintenance_unix > 0,
+            "这一轮**跑过了**（冷却要消耗、状态要落盘），只是没走到删那一步: {}",
+            state.registry_maintenance_unix
+        );
+    }
+
     /// 没有占用读数就不动：体积读数取不到（走查边车没起来）不是"占用是 0"，而
     /// 回收要重启 registry，是个有代价的动作。
     #[tokio::test]
@@ -10475,7 +10753,7 @@ exit 0
         let root = tmp.path();
         let bin_dir = root.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
-        let kubectl = fake_kubectl_pvc(&bin_dir, "10Gi", "cogneva-registry");
+        let kubectl = fake_kubectl_pvc(&bin_dir, "10Gi", "cogneva-registry", "");
         let (registry, registry_log) = routed_registry(vec![(
             "GET",
             "/v2/cogneva/tags/list".to_string(),
@@ -10524,7 +10802,7 @@ exit 0
         let root = tmp.path();
         let bin_dir = root.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
-        let kubectl = fake_kubectl_pvc(&bin_dir, "10Gi", "cogneva-registry");
+        let kubectl = fake_kubectl_pvc(&bin_dir, "10Gi", "cogneva-registry", "");
         // 走查边车报 90% 的占用：这一轮到期，真的会开跑。
         let (walker, _) = routed_registry(vec![(
             "GET",
@@ -10786,7 +11064,7 @@ exit 0
         let root = tmp.path();
         let bin_dir = root.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
-        let kubectl = fake_kubectl_pvc(&bin_dir, "10Gi", "");
+        let kubectl = fake_kubectl_pvc(&bin_dir, "10Gi", "", "");
         let cfg = test_config(root, Path::new("/nonexistent"), "noop", &kubectl);
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
 
