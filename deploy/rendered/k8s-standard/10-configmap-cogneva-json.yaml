@@ -840,12 +840,12 @@ data:
             },
             {
               "name": "change_landing_failures",
-              "promql": "sum by (category) (increase(cogneva_landing_failures_total{category=~\"environment|rejected\"}[6h])) > 0",
+              "promql": "sum by (category) (increase(cogneva_landing_failures_total{category=~\"environment|rejected|path\"}[6h])) > 0",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "Landing failed {value} times in the last six hours with category {category}. An environment failure means the landing machinery itself could not run, and a rejection means the push was refused for a reason re-applying cannot fix, so the change will not land however often it is retried; conflicts and lost races are excluded here because those are expected and retried"
+              "summary": "Landing failed {value} times in the last six hours with category {category}. An environment failure means the landing machinery itself could not run, and a rejection means the push was refused for a reason re-applying cannot fix, so the change will not land however often it is retried. A path refusal is the same kind of terminal answer read off the change instead of the world: the change's paths are not acceptable to the contribution whitelist -- outside it, forbidden, or unreadable as a diff -- so it leaves both channels the moment it is refused and can reach the base branch only through a manual push. It is counted once per refused change where the categories above count once per attempt, so a path value here is how many changes left the channel, not how many rounds were spent; conflicts and lost races are excluded because those are expected and retried"
             },
             {
               "name": "landing_mirror_behind",
