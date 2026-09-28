@@ -106,6 +106,17 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          violations: without it, a contract that holds and a judgement that has \
          never run render the same",
     ),
+    (
+        crate::metric_names::MIRROR_PUSH_FAILURES_TOTAL.as_str(),
+        "Pushes refused by a mirror of the same repository, by mirror. A \
+         landing reports success only when every host took the commit, so a \
+         mirror named here is the whole reason the round that refused it did \
+         not land: the change is on the base branch and not on the mirror, the \
+         mirror is behind by every commit since its first refusal, and the next \
+         attempt fast-forwards them to it — unless its tip is not an ancestor \
+         of the base branch, which is two hosts disagreeing about one branch \
+         and stays here until something outside the loop resolves it",
+    ),
 ];
 
 /// Descriptions for the histogram series. See [`COUNTER_HELP`].

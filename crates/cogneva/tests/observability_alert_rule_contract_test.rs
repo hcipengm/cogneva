@@ -207,6 +207,10 @@ const PRODUCED: &[(&str, &str)] = &[
         "crates/cog-github/src/landing.rs",
     ),
     (
+        "cogneva_mirror_push_failures_total",
+        "crates/cog-github/src/landing.rs",
+    ),
+    (
         "cogneva_metric_held_without_producer",
         "crates/cog-gateway/src/lib.rs",
     ),

@@ -22,7 +22,7 @@ use tracing::warn;
 
 use cog_core::{GeneratedChange, LandedSource, SFError, SFResult};
 
-use crate::config::{BotIdentityConfig, GitHubIntegrationConfig};
+use crate::config::{BotIdentityConfig, GitHubIntegrationConfig, GiteeIntegrationConfig};
 use crate::contribution::ContributionController;
 use crate::error::{CogGitHubError, Result};
 use crate::provider::CodePlatformProvider;
@@ -48,6 +48,26 @@ const CHANGE_ID_TRAILER: &str = "Change-Id";
 /// on the first one, while every other category is retried and shows up here
 /// once per attempt.
 pub use cog_core::metric_names::LANDING_FAILURES_TOTAL as LANDING_FAILURES_METRIC;
+
+/// Pushes to a mirror that were refused, one increment per refusal, labeled
+/// with the mirror.
+///
+/// The base branch takes the commit whether or not a mirror did, so a mirror
+/// that keeps refusing looks exactly like a mirror that is keeping up: the
+/// landing succeeds either way, and the difference lives only here. What it
+/// counts is a state nobody would otherwise see — the same repository on
+/// another host, behind by every commit since the refusal.
+pub use cog_core::metric_names::MIRROR_PUSH_FAILURES_TOTAL as MIRROR_PUSH_FAILURES_METRIC;
+
+/// The path segment the gateway's git routes use for GitHub.
+///
+/// Same word the deployer builds its upstream refs from, and the same one the
+/// gateway's route table matches on: a mirror's URL and its label both come
+/// from here, so the two cannot name different hosts.
+const GITHUB_SLUG: &str = "github";
+
+/// The path segment the gateway's git routes use for Gitee.
+const GITEE_SLUG: &str = "gitee";
 
 /// Why a landing call failed, as a closed set the metric labels.
 ///
@@ -287,11 +307,92 @@ pub async fn load_record(change_id: &str) -> Option<LandingRecord> {
     serde_json::from_str(&text).ok()
 }
 
+/// One upstream the channel lands onto.
+///
+/// The same repository is mirrored on more than one host so that either can
+/// answer for the other, and a commit that reached only one of them is not that
+/// mirror — it is one host holding a history the other never saw. So every
+/// target is pushed, and what each of them said is kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushTarget {
+    /// Remote name inside the working copy. The first target is `origin`: the
+    /// one the worktree tracks and the one the deployer advances the bare main
+    /// from.
+    pub remote: String,
+    /// Platform slug of the gateway route, and the directory the host is
+    /// mirrored under: `github` or `gitee`.
+    pub slug: String,
+    /// Repository on that host, `owner/repo`.
+    pub repo: String,
+    /// Branch the commit lands on there.
+    pub base: String,
+}
+
+impl PushTarget {
+    /// The target the GitHub integration names: what the channel has always
+    /// landed onto.
+    pub fn github(config: &GitHubIntegrationConfig) -> Self {
+        Self {
+            remote: "origin".into(),
+            slug: GITHUB_SLUG.into(),
+            repo: config.repo.clone(),
+            base: config.base_branch.clone(),
+        }
+    }
+
+    /// The same repository on Gitee.
+    pub fn gitee(config: &GiteeIntegrationConfig) -> Self {
+        Self {
+            remote: GITEE_SLUG.into(),
+            slug: GITEE_SLUG.into(),
+            repo: config.repo.clone(),
+            base: config.base_branch.clone(),
+        }
+    }
+
+    /// The metric label. The remote name, because that is the word the working
+    /// copy and the push errors use.
+    fn label(&self) -> &str {
+        &self.remote
+    }
+}
+
+/// The mirrors a landing must also reach, derived from the two integrations.
+///
+/// Empty when the Gitee integration is off, or when it names a different
+/// repository: what is being mirrored is one repository onto two hosts, and a
+/// second repository would take the commit as a copy rather than as the same
+/// history. A configured mirror that cannot be used is said out loud — the
+/// alternative is a deployment that believes it lands onto two hosts while it
+/// lands onto one.
+pub fn mirror_targets(
+    github: &GitHubIntegrationConfig,
+    gitee: &GiteeIntegrationConfig,
+) -> Vec<PushTarget> {
+    if !gitee.enabled {
+        return Vec::new();
+    }
+    if gitee.repo != github.repo {
+        warn!(
+            github_repo = %github.repo,
+            gitee_repo = %gitee.repo,
+            "gitee_integration names another repository; not mirroring landings onto it"
+        );
+        return Vec::new();
+    }
+    vec![PushTarget::gitee(gitee)]
+}
+
 /// The landing channel: commits verified changes to the base branch and
 /// records what it did so a red CI run can be answered later.
 pub struct MainChannel {
     workdir: PathBuf,
     config: GitHubIntegrationConfig,
+    /// Everything a landed commit has to reach, in push order: the primary
+    /// first, the mirrors after it. The order is not cosmetic — a commit that
+    /// loses the race for the base branch must not be on a mirror either, or
+    /// the two hosts hold different histories instead of the same one.
+    mirrors: Vec<PushTarget>,
     provider: Arc<dyn CodePlatformProvider>,
     controller: Arc<ContributionController>,
     /// Serializes landings: each one rebuilds a scratch worktree, so two
@@ -309,6 +410,7 @@ impl std::fmt::Debug for MainChannel {
         f.debug_struct("MainChannel")
             .field("workdir", &self.workdir)
             .field("base", &self.config.base_branch)
+            .field("mirrors", &self.mirrors)
             .finish_non_exhaustive()
     }
 }
@@ -324,11 +426,20 @@ impl MainChannel {
         Self {
             workdir: workdir.into(),
             config,
+            mirrors: Vec::new(),
             provider,
             controller,
             gate: tokio::sync::Mutex::new(()),
             metrics: OnceLock::new(),
         }
+    }
+
+    /// Land onto these mirrors as well: every commit the primary takes is
+    /// pushed there too, and a mirror that refuses is counted rather than
+    /// silently dropped.
+    pub fn with_mirrors(mut self, mirrors: impl IntoIterator<Item = PushTarget>) -> Self {
+        self.mirrors = mirrors.into_iter().collect();
+        self
     }
 
     /// Count landing failures into `metrics`. Called once, from the plugin's
@@ -612,7 +723,22 @@ impl MainChannel {
         source: Option<&LandedSource>,
         base: &str,
     ) -> std::result::Result<LandOutcome, LandingError> {
+        // Mirror repair happens here rather than only where a push was refused:
+        // a change that has landed is never pushed again, so the mirror that
+        // refused it would stay behind for good. What this leaves unrepaired is
+        // what the two verdicts below read, and neither of them may say "in
+        // both hosts" while it is non-empty.
+        let unrepaired = self.catch_up_mirrors(base).await?;
+        self.note_mirror_failures(&unrepaired).await;
+
         if let Some(rev) = self.landed_rev_on(base, &change.change_id).await? {
+            // Finding the change on the primary is not the same as it having
+            // landed: a change half-landed by an earlier round is found here
+            // too, and answering `AlreadyLanded` would report a pair that the
+            // mirror never completed — for good, since nothing lands it again.
+            if !unrepaired.is_empty() {
+                return Err(mirror_error(&unrepaired, &rev));
+            }
             return Ok(LandOutcome::AlreadyLanded(rev));
         }
         let wt = self.fresh_worktree(base).await?;
@@ -673,8 +799,19 @@ impl MainChannel {
             .await?
             .trim()
             .to_string();
-        match self.push(&wt, base).await {
-            Ok(()) => Ok(LandOutcome::Landed(rev)),
+        match self.push(&wt, &rev).await {
+            Ok(refusals) if refusals.is_empty() => Ok(LandOutcome::Landed(rev)),
+            Ok(refusals) => {
+                // The commit is on the base branch, but a mirror did not take
+                // it, so the pair is not level and this is not a landing. It is
+                // reported as a failure rather than swallowed: the caller
+                // deploys on this verdict, and a round that says "landed" while
+                // one host is missing the commit is the reading that made the
+                // missing mirror invisible in the first place. The next attempt
+                // repairs the mirror above and answers `AlreadyLanded`.
+                self.note_mirror_failures(&refusals).await;
+                Err(mirror_error(&refusals, &rev))
+            }
             Err(PushFailure::Raced(msg)) => {
                 Ok(LandOutcome::Superseded(CogGitHubError::Provider(msg)))
             }
@@ -748,13 +885,60 @@ impl MainChannel {
         .map(|_| ())
     }
 
-    /// Push the checked-out commit to the base branch. A lost race against a
-    /// newer base tip is separated from a real rejection: only the former is
+    /// Push the checked-out commit to the base branch and to every mirror.
+    ///
+    /// The base branch is pushed first, so a commit that lost the race there is
+    /// nowhere rather than on a mirror alone: a mirror holding a commit the
+    /// base branch rejected is a fork, and a fork cannot be repaired by the
+    /// fast-forward that repairs every other mirror problem. A mirror that
+    /// refuses afterwards leaves the mirror *behind*, which is repairable, and
+    /// it comes back named for the caller to decide with.
+    async fn push(
+        &self,
+        dir: &Path,
+        rev: &str,
+    ) -> std::result::Result<Vec<MirrorFailure>, PushFailure> {
+        self.push_to(dir, &PushTarget::github(&self.config), rev)
+            .await?;
+        Ok(self.push_to_mirrors(dir, rev).await)
+    }
+
+    /// Push `rev` to each mirror, collecting the refusals.
+    async fn push_to_mirrors(&self, dir: &Path, rev: &str) -> Vec<MirrorFailure> {
+        let mut refusals = Vec::new();
+        for target in &self.mirrors {
+            if let Err(failure) = self.push_to(dir, target, rev).await {
+                warn!(
+                    mirror = target.label(),
+                    rev,
+                    reason = %failure,
+                    "a mirror refused a landed commit; it stays behind until it takes it"
+                );
+                refusals.push(MirrorFailure {
+                    target: target.clone(),
+                    failure,
+                });
+            }
+        }
+        refusals
+    }
+
+    /// Push `rev` to one target's base branch. A lost race against a newer tip
+    /// on that branch is separated from a real rejection: only the former is
     /// worth re-applying onto the fresh tip.
-    async fn push(&self, dir: &Path, base: &str) -> std::result::Result<(), PushFailure> {
+    async fn push_to(
+        &self,
+        dir: &Path,
+        target: &PushTarget,
+        rev: &str,
+    ) -> std::result::Result<(), PushFailure> {
         let (ok, _stdout, stderr) = match run_git_status(
             dir,
-            &["push", "origin", &format!("HEAD:refs/heads/{base}")],
+            &[
+                "push",
+                &target.remote,
+                &format!("{rev}:refs/heads/{}", target.base),
+            ],
         )
         .await
         {
@@ -766,14 +950,162 @@ impl MainChannel {
         }
         if is_push_race(&stderr) {
             return Err(PushFailure::Raced(format!(
-                "push to {base} lost the race: {}",
+                "push to {} on {} lost the race: {}",
+                target.base,
+                target.label(),
                 stderr.trim()
             )));
         }
         Err(PushFailure::Rejected(format!(
-            "push to {base} rejected: {}",
+            "push to {} on {} rejected: {}",
+            target.base,
+            target.label(),
             stderr.trim()
         )))
+    }
+
+    /// Bring each mirror's base branch up to the primary's, when it is behind.
+    ///
+    /// The landing itself already pushes to the mirrors, so this is not the
+    /// main path: it answers a mirror that refused a push earlier. That mirror
+    /// would otherwise stay behind forever, because the change it refused has
+    /// landed and nothing pushes again for a commit in the queue's past.
+    ///
+    /// Fast-forward only. A mirror whose tip is not an ancestor of the
+    /// primary's holds a history the primary does not have — two hosts that
+    /// disagree about a branch — and picking one of them, or force-pushing over
+    /// the other, is not this channel's call to make.
+    async fn catch_up_mirrors(
+        &self,
+        base: &str,
+    ) -> std::result::Result<Vec<MirrorFailure>, LandingError> {
+        if self.mirrors.is_empty() {
+            return Ok(Vec::new());
+        }
+        // One read of the base branch for all of them, and its failure is the
+        // environment's rather than any mirror's: this read goes to the primary
+        // host, so a refusal counted against a mirror here would put the wrong
+        // host's name in the alert. Same commit for every mirror, too, so
+        // reading it per mirror would be the same answer asked N times.
+        let head = self.primary_base(base).await?;
+        let mut refusals = Vec::new();
+        for target in &self.mirrors {
+            match self.catch_up_mirror(target, &head).await {
+                Ok(()) => {}
+                Err(failure) => {
+                    warn!(
+                        mirror = target.label(),
+                        reason = %failure,
+                        "a mirror is not level with the base branch"
+                    );
+                    refusals.push(MirrorFailure {
+                        target: target.clone(),
+                        failure,
+                    });
+                }
+            }
+        }
+        Ok(refusals)
+    }
+
+    /// The base tip as the primary host serves it, read into the worktree.
+    async fn primary_base(&self, base: &str) -> std::result::Result<String, LandingError> {
+        run_git(&self.workdir, &["fetch", "origin", base])
+            .await
+            .map_err(|e| LandingError::of(LandingCategory::Environment, e))?;
+        run_git(&self.workdir, &["rev-parse", &format!("origin/{base}")])
+            .await
+            .map(|out| out.trim().to_string())
+            .map_err(|e| LandingError::of(LandingCategory::Environment, e))
+    }
+
+    async fn catch_up_mirror(
+        &self,
+        target: &PushTarget,
+        head: &str,
+    ) -> std::result::Result<(), PushFailure> {
+        let refused = |reason: String| PushFailure::Rejected(reason);
+        run_git(
+            &self.workdir,
+            &["fetch", "--no-tags", &target.remote, &target.base],
+        )
+        .await
+        .map_err(|e| {
+            refused(format!(
+                "cannot read {} on {}: {e}",
+                target.base,
+                target.label()
+            ))
+        })?;
+        let tip = self
+            .branch_head(&format!("{}/{}", target.remote, target.base))
+            .await?;
+        if tip == head {
+            return Ok(());
+        }
+        if !self.is_ancestor(&tip, head).await? {
+            return Err(refused(format!(
+                "{} is not behind {}: it holds {tip}, which is not an ancestor of {head}",
+                target.label(),
+                GITHUB_SLUG
+            )));
+        }
+        self.push_to(&self.workdir, target, head).await
+    }
+
+    /// The commit a ref points at in the landing working copy.
+    async fn branch_head(&self, refname: &str) -> std::result::Result<String, PushFailure> {
+        run_git(&self.workdir, &["rev-parse", refname])
+            .await
+            .map(|out| out.trim().to_string())
+            .map_err(|e| PushFailure::Rejected(format!("cannot resolve {refname}: {e}")))
+    }
+
+    /// Whether `older` is an ancestor of `newer`.
+    ///
+    /// `merge-base --is-ancestor` answers in its exit code — 1 means no, and
+    /// anything above that is the command failing rather than answering — so
+    /// the reading is the code and not the text next to it.
+    async fn is_ancestor(
+        &self,
+        older: &str,
+        newer: &str,
+    ) -> std::result::Result<bool, PushFailure> {
+        let output = tokio::process::Command::new("git")
+            .args(["merge-base", "--is-ancestor", older, newer])
+            .current_dir(&self.workdir)
+            .output()
+            .await
+            .map_err(|e| PushFailure::Rejected(e.to_string()))?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            code => Err(PushFailure::Rejected(format!(
+                "cannot tell whether {older} is an ancestor of {newer} (git exited {code:?}): {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))),
+        }
+    }
+
+    /// Count the mirrors that refused, so a mirror falling behind is a reading
+    /// and not just a log line.
+    async fn note_mirror_failures(&self, refusals: &[MirrorFailure]) {
+        let Some(metrics) = self.metrics.get().cloned() else {
+            return;
+        };
+        for refusal in refusals {
+            let labels =
+                HashMap::from([("mirror".to_string(), refusal.target.label().to_string())]);
+            if let Err(e) = metrics
+                .record_counter(MIRROR_PUSH_FAILURES_METRIC, 1.0, labels)
+                .await
+            {
+                warn!(
+                    mirror = refusal.target.label(),
+                    "cannot record a refused mirror push: {e}"
+                );
+            }
+        }
     }
 
     /// Revert a landed commit so the base branch returns to green, and return
@@ -793,9 +1125,19 @@ impl MainChannel {
             .await?
             .trim()
             .to_string();
-        self.push(&wt, &record.base)
+        // The revert is a landing like any other: a mirror that keeps the commit
+        // it undoes while the base branch undoes it is exactly the state the
+        // mirror is not supposed to hold. Unlike a landing, though, a refused
+        // mirror does not fail this call. A landing can be re-driven because
+        // `landed_rev_on` finds the commit it already made; a revert has no such
+        // record, so re-driving it reverts the revert — a second undo the caller
+        // never asked for, in place of the one the mirror is missing. The gap is
+        // counted here and closed by `catch_up_mirrors` on the next attempt.
+        let refusals = self
+            .push(&wt, &rev)
             .await
             .map_err(|e| CogGitHubError::Provider(e.to_string()))?;
+        self.note_mirror_failures(&refusals).await;
         Ok(rev)
     }
 }
@@ -811,6 +1153,7 @@ enum LandOutcome {
 }
 
 /// Why a push did not take.
+#[derive(Debug, Clone)]
 enum PushFailure {
     /// A newer commit reached the branch first.
     Raced(String),
@@ -824,6 +1167,36 @@ impl std::fmt::Display for PushFailure {
             PushFailure::Raced(m) | PushFailure::Rejected(m) => f.write_str(m),
         }
     }
+}
+
+/// A mirror that did not take a commit the base branch has.
+///
+/// The mirror is named because "a mirror refused" is not a state anyone can act
+/// on: which host, and why, is what tells a credential apart from a network
+/// path apart from a mirror that has moved somewhere the primary has not.
+#[derive(Debug, Clone)]
+struct MirrorFailure {
+    target: PushTarget,
+    failure: PushFailure,
+}
+
+/// The failure a landing reports when a mirror did not take the commit.
+///
+/// Every refusal is named, not just the first: the hosts can refuse for
+/// different reasons, and a report that stops at one of them sends its reader
+/// looking for a cause that only explains half of what they will find.
+fn mirror_error(refusals: &[MirrorFailure], rev: &str) -> LandingError {
+    let named = refusals
+        .iter()
+        .map(|r| format!("{} ({})", r.target.label(), r.failure))
+        .collect::<Vec<_>>()
+        .join(", ");
+    LandingError::of(
+        LandingCategory::Rejected,
+        CogGitHubError::Provider(format!(
+            "commit {rev} is on the base branch but not on every mirror: {named}"
+        )),
+    )
 }
 
 #[async_trait::async_trait]
@@ -1360,48 +1733,96 @@ pub async fn is_git_workdir(workdir: &Path) -> bool {
 /// In gateway-proxy mode an existing working copy's `origin` is rewritten to
 /// the proxy URL (idempotent), so clones made with SSH/token remotes migrate
 /// without a re-clone. Other modes leave existing remotes untouched.
+///
+/// The mirrors are configured on the way through, for the same reason `origin`
+/// is: a working copy cloned before a mirror was declared has only the primary,
+/// and landing would push to a remote that is not there.
 pub async fn ensure_workdir(
     config: &GitHubIntegrationConfig,
     token: Option<&str>,
+    mirrors: &[PushTarget],
 ) -> Result<PathBuf> {
     let workdir = config.git_workdir_path();
     let url = remote_url(config, token);
-    if is_git_workdir(&workdir).await {
-        if git_proxy_base().is_some() {
-            let output = tokio::process::Command::new("git")
-                .args(["remote", "set-url", "origin", &url])
-                .current_dir(&workdir)
-                .output()
-                .await?;
-            if !output.status.success() {
-                return Err(CogGitHubError::Provider(format!(
-                    "git remote set-url failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                )));
+    let existing = is_git_workdir(&workdir).await;
+    if !existing {
+        if let Some(parent) = workdir.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let output = tokio::process::Command::new("git")
+            .arg("clone")
+            .arg(&url)
+            .arg(&workdir)
+            .output()
+            .await?;
+        if !output.status.success() {
+            // Never leak the token into logs.
+            let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            if let Some(t) = token.filter(|t| !t.is_empty()) {
+                stderr = stderr.replace(t, "***");
             }
+            return Err(CogGitHubError::Provider(format!(
+                "git clone failed: {stderr}"
+            )));
         }
-        return Ok(workdir);
+    } else if git_proxy_base().is_some() {
+        set_remote(&workdir, "origin", &url).await?;
     }
-    if let Some(parent) = workdir.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let output = tokio::process::Command::new("git")
-        .arg("clone")
-        .arg(&url)
-        .arg(&workdir)
-        .output()
-        .await?;
-    if !output.status.success() {
-        // Never leak the token into logs.
-        let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        if let Some(t) = token.filter(|t| !t.is_empty()) {
-            stderr = stderr.replace(t, "***");
-        }
-        return Err(CogGitHubError::Provider(format!(
-            "git clone failed: {stderr}"
-        )));
+    for target in mirrors {
+        // A mirror is a second host for the same repository, so it is set up
+        // whether or not the working copy is new. A mirror with no route and no
+        // credential is reported rather than pushed with nothing: landing onto
+        // one host while believing it is two is the state this replaced.
+        let Some(url) = mirror_url(target, token) else {
+            warn!(
+                mirror = target.label(),
+                "no git route or credential for this mirror; it will not be pushed"
+            );
+            continue;
+        };
+        set_remote(&workdir, &target.remote, &url).await?;
     }
     Ok(workdir)
+}
+
+/// Point `name` at `url`, adding the remote when the working copy does not have
+/// it yet: `remote set-url` alone fails on a remote that is not there, which is
+/// every mirror in a working copy cloned before the mirror was declared.
+async fn set_remote(dir: &Path, name: &str, url: &str) -> Result<()> {
+    let exists = run_git_status(dir, &["remote", "get-url", name]).await?.0;
+    let verb = if exists { "set-url" } else { "add" };
+    run_git(dir, &["remote", verb, name, url]).await?;
+    Ok(())
+}
+
+/// Where one mirror's git remote points.
+///
+/// Through the gateway when one is configured, and by token otherwise: the
+/// mirror is a second host rather than a second route to the first, so its
+/// credentials are the second host's, and its URL is built the same way as
+/// `origin`'s. What it does *not* share with `origin` is the fallback — an
+/// anonymous URL builds a remote that cannot be pushed to, and a fan-out that
+/// counts a host it can never reach is the state this replaced.
+fn mirror_url(target: &PushTarget, token: Option<&str>) -> Option<String> {
+    if target.slug == GITHUB_SLUG {
+        return None;
+    }
+    if let Some(base) = git_proxy_base() {
+        return Some(proxy_route(&base, &target.slug, &target.repo));
+    }
+    token
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("https://oauth2:{t}@gitee.com/{}.git", target.repo))
+}
+
+/// The gateway's route to one host: the proxy base, the platform's own path
+/// segment, then the repository.
+///
+/// Both remotes are built through here, so the route the channel pushes to and
+/// the route it reads a mirror's tip from cannot disagree about their shape —
+/// a disagreement that would read as a mirror that is not level.
+fn proxy_route(base: &str, slug: &str, repo: &str) -> String {
+    format!("{}/{slug}/{repo}.git", base.trim_end_matches('/'))
 }
 
 fn git_proxy_base() -> Option<String> {
@@ -1430,7 +1851,7 @@ fn select_remote_url_for(
     target_repo: &str,
 ) -> String {
     if let Some(base) = proxy_base {
-        return format!("{}/github/{}.git", base.trim_end_matches('/'), target_repo);
+        return proxy_route(base, GITHUB_SLUG, target_repo);
     }
     if use_ssh {
         return format!("ssh://git@github.com:22/{target_repo}.git");
@@ -1869,6 +2290,134 @@ mod tests {
             " ! [rejected]        main -> main (fetch first)\n             hint: Updates were rejected because the remote contains work that you do\n             hint: not have locally."
         ));
         assert!(!is_push_race("remote: Permission to o/r.git denied to bot"));
+    }
+
+    /// 一个仓库两个宿主，两条路由只该差在平台段上。分开拼写迟早会有一天不一致，
+    /// 而不一致读出来正好是「镜像没跟上」——一个查不出病因的读数。
+    #[test]
+    fn a_proxy_route_differs_only_by_the_platform_segment() {
+        assert_eq!(
+            proxy_route("http://gw:8081/git/", "github", "o/r"),
+            "http://gw:8081/git/github/o/r.git"
+        );
+        assert_eq!(
+            proxy_route("http://gw:8081/git", "gitee", "o/r"),
+            "http://gw:8081/git/gitee/o/r.git"
+        );
+    }
+
+    /// 只有 Gitee 集成开着、并且指向**同一个**仓库时才有第二个宿主。指向另一个
+    /// 仓库时没有镜像：那是把变更复制到别处，不是同一份历史存了两份。
+    #[test]
+    fn the_mirror_set_is_the_same_repository_on_a_second_host() {
+        let github = GitHubIntegrationConfig {
+            repo: "o/r".into(),
+            base_branch: "main".into(),
+            ..Default::default()
+        };
+        let gitee = |enabled: bool, repo: &str| GiteeIntegrationConfig {
+            enabled,
+            repo: repo.into(),
+            base_branch: "main".into(),
+            ..Default::default()
+        };
+
+        assert!(mirror_targets(&github, &gitee(false, "o/r")).is_empty());
+
+        let targets = mirror_targets(&github, &gitee(true, "o/r"));
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].remote, "gitee");
+        assert_eq!(targets[0].slug, "gitee");
+        assert_eq!(targets[0].repo, "o/r");
+        assert_eq!(targets[0].base, "main");
+
+        assert!(mirror_targets(&github, &gitee(true, "o/other")).is_empty());
+    }
+
+    /// 主机的远端名是 `origin`：工作树跟踪它，部署器也从它推进裸仓的主分支。
+    #[test]
+    fn the_primary_target_is_the_remote_the_worktree_tracks() {
+        let github = GitHubIntegrationConfig {
+            repo: "o/r".into(),
+            base_branch: "trunk".into(),
+            ..Default::default()
+        };
+        let target = PushTarget::github(&github);
+        assert_eq!(target.remote, "origin");
+        assert_eq!(target.slug, "github");
+        assert_eq!(target.base, "trunk");
+    }
+
+    /// 半成功的报错要把每一端都点名：两端可以各自拒绝，只报第一端的错会让人
+    /// 去找一个只解释一半现场的原因。
+    #[test]
+    fn a_refused_mirror_is_named_with_its_reason_in_the_failure() {
+        let target = |remote: &str| PushTarget {
+            remote: remote.into(),
+            slug: remote.into(),
+            repo: "o/r".into(),
+            base: "main".into(),
+        };
+        let refusals = vec![
+            MirrorFailure {
+                target: target("gitee"),
+                failure: PushFailure::Rejected("permission denied".into()),
+            },
+            MirrorFailure {
+                target: target("gitlab"),
+                failure: PushFailure::Rejected("not behind github".into()),
+            },
+        ];
+
+        let err = mirror_error(&refusals, "abc123");
+
+        assert_eq!(err.category, LandingCategory::Rejected);
+        let text = err.error.to_string();
+        assert!(text.contains("abc123"), "{text}");
+        assert!(
+            text.contains("gitee") && text.contains("permission denied"),
+            "{text}"
+        );
+        assert!(
+            text.contains("gitlab") && text.contains("not behind github"),
+            "{text}"
+        );
+    }
+
+    /// 祖先判据的答案是退出码：0 是、1 否、其余都是「命令没说」。把第三态读成
+    /// 「是祖先」，真分叉就会被当成落后去快进，而那一步是 force push。
+    #[tokio::test]
+    async fn ancestor_readings_come_from_the_exit_code_not_the_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        run_git(repo, &["init", "-q"]).await.unwrap();
+        run_git(repo, &["config", "user.email", "t@example.invalid"])
+            .await
+            .unwrap();
+        run_git(repo, &["config", "user.name", "t"]).await.unwrap();
+        async fn commit(repo: &std::path::Path, content: &str) -> String {
+            std::fs::write(repo.join("f"), content).unwrap();
+            run_git(repo, &["add", "-A"]).await.unwrap();
+            run_git(repo, &["commit", "-qm", content]).await.unwrap();
+            run_git(repo, &["rev-parse", "HEAD"])
+                .await
+                .unwrap()
+                .trim()
+                .to_string()
+        }
+        let one = commit(repo, "one").await;
+        let two = commit(repo, "two").await;
+
+        let chan = MainChannel::new(
+            repo.to_path_buf(),
+            GitHubIntegrationConfig::default(),
+            Arc::new(NullProvider),
+            ContributionController::new_shared(),
+        );
+        assert!(chan.is_ancestor(&one, &two).await.unwrap());
+        assert!(!chan.is_ancestor(&two, &one).await.unwrap());
+        // git exits above 1 when it could not answer at all, which is not "no".
+        assert!(chan.is_ancestor(&"0".repeat(40), &two).await.is_err());
     }
 
     #[tokio::test]

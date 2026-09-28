@@ -284,14 +284,24 @@ impl cog_core::SystemPlugin for GitHubPlugin {
                         .primary_account()
                         .ok()
                         .and_then(|a| a.resolve_token().ok());
-                    match crate::landing::ensure_workdir(&config, token.as_deref()).await {
+                    // 同一个仓库在两端都配了就走双推：变更落一次，两端都要收到。
+                    // 只配了 GitHub 时镜像集为空，通道行为与从前完全一致。
+                    let mirrors = crate::landing::mirror_targets(&config, &gitee_config);
+                    if let Some(mirror) = mirrors.first() {
+                        info!(mirror = %mirror.remote, repo = %mirror.repo, "landings will be pushed to a second host");
+                    }
+                    match crate::landing::ensure_workdir(&config, token.as_deref(), &mirrors).await
+                    {
                         Ok(workdir) => {
-                            let channel = Arc::new(crate::landing::MainChannel::new(
-                                workdir.clone(),
-                                config.clone(),
-                                provider.clone(),
-                                controller.clone(),
-                            ));
+                            let channel = Arc::new(
+                                crate::landing::MainChannel::new(
+                                    workdir.clone(),
+                                    config.clone(),
+                                    provider.clone(),
+                                    controller.clone(),
+                                )
+                                .with_mirrors(mirrors),
+                            );
                             // 属主在 UI 点"提交"时经 ContributionControl::flush_pending
                             // 调用同一通道，跳过策略门禁（点击即批准）。
                             controller.set_sink(channel.clone());

@@ -838,6 +838,15 @@ data:
               "summary": "Landing failed {value} times in the last six hours with category {category}. An environment failure means the landing machinery itself could not run, and a rejection means the push was refused for a reason re-applying cannot fix, so the change will not land however often it is retried; conflicts and lost races are excluded here because those are expected and retried"
             },
             {
+              "name": "landing_mirror_behind",
+              "promql": "sum by (mirror) (increase(cogneva_mirror_push_failures_total[6h])) > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "The base branch is mirrored on {mirror} and that host refused {value} pushes in the last six hours, so commits the base branch has are not there. A landing counts only when every host took the commit, so each refusal is also a round that did not land: the change is on the base branch and not deployed, and the round that would deploy it is the one that repairs the mirror first. Read the mirror's tip against the base branch's before anything else, because the two shapes need different owners -- a mirror that is merely behind is fast-forwarded by the next landing and this clears itself, while a mirror whose tip is not an ancestor of the base branch is two hosts holding different histories, which nothing in this channel will resolve: it never force-pushes over a host and never picks a side"
+            },
+            {
               "name": "redrive_cause_exhausted",
               "promql": "sum(increase(cogneva_redrive_refusals_total{reason=\"cause_exhausted\"}[24h])) > 0",
               "condition": {
