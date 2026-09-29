@@ -232,6 +232,21 @@ metric_names! {
     // the compile and the image push for the superseded rev are already paid by
     // the time the question can be asked.
     MAINLINE_SUPERSEDED_ROLLOUT_TOTAL => "cogneva_mainline_superseded_rollout_total",
+    // Rounds the deployer asked the upstream platforms what CI concluded for the
+    // revision it was about to roll, and what came back: `pass`, `fail` (that
+    // round holds the rollout) or `no_evidence`.
+    //
+    // The reading exists because two of the three answers let the rollout go
+    // ahead. The gate was built to fail open — an unreachable platform must not
+    // stall the whole mainline — so "read a green" and "could not read at all"
+    // both end in a rollout, and afterwards neither the state file (which only
+    // ever records a hold) nor anything else distinguishes them. The one trace
+    // that did was a log line in the deployer's pod, which is replaced on the
+    // next rollout and takes its log with it. `no_evidence` is the label that
+    // has to be readable for the fail-open to be a recorded answer rather than
+    // an absence; a run of it says the gate is passing revisions for a reason
+    // other than the upstream's verdict.
+    MAINLINE_CI_VERDICT_TOTAL => "cogneva_mainline_ci_verdict_total",
 
     // cog-gateway — request accounting.
     HTTP_REQUESTS_TOTAL => "http_requests_total",

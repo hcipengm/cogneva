@@ -2517,7 +2517,8 @@ impl MainlineDeployer {
 
     /// 要滚的这个 rev 在上游各平台的 CI 结论。`Some(false)` = 至少一个平台
     /// 给出了明确的失败结论；`None` = 没有证据（没配基址、平台不可达、仓库
-    /// 不用 CI、检查还没跑完）。
+    /// 不用 CI、检查还没跑完）。三支各自的读数在 [`Self::record_ci_verdict_reading`]
+    /// 里留：`None` 与 `Some(true)` 都放行，事后只有读数能把它们分开。
     async fn ci_verdict_for_rev(&self, rev: &str) -> Option<bool> {
         let mut verdicts = Vec::new();
         for up in &self.cfg.upstreams {
@@ -2534,14 +2535,49 @@ impl MainlineDeployer {
                 verdicts.push(v);
             }
         }
-        if verdicts.iter().any(|v| !*v) {
-            return Some(false);
-        }
-        if verdicts.is_empty() {
+        let verdict = if verdicts.iter().any(|v| !*v) {
+            Some(false)
+        } else if verdicts.is_empty() {
             None
         } else {
             Some(true)
-        }
+        };
+        self.record_ci_verdict_reading(verdict).await;
+        verdict
+    }
+
+    /// The judgement's own reading: which question it asked upstream and which
+    /// answer it got.
+    ///
+    /// Recording only the holds would leave the two forms that let a rollout go
+    /// ahead indistinguishable, and they are the two that need telling apart:
+    /// the gate fails open by design, so "the platforms reported green" and
+    /// "this round could not read them at all" both end in the same dispatch.
+    /// The state file keeps a hold and nothing else, and the log line that used
+    /// to be the only trace dies with the pod that wrote it. One of the three
+    /// labels gains a count each round the question is asked; all three missing
+    /// means the call site is not there.
+    async fn record_ci_verdict_reading(&self, verdict: Option<bool>) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let mut labels = std::collections::HashMap::new();
+        labels.insert(
+            "verdict".to_string(),
+            match verdict {
+                Some(true) => "pass",
+                Some(false) => "fail",
+                None => "no_evidence",
+            }
+            .to_string(),
+        );
+        let _ = metrics
+            .record_counter(
+                cog_core::metric_names::MAINLINE_CI_VERDICT_TOTAL,
+                1.0,
+                labels,
+            )
+            .await;
     }
 
     /// registry 上某 tag 当前内容构建自哪个 rev：manifest → config blob →
@@ -10711,6 +10747,76 @@ exit 0
         cfg.upstreams[0].api_base = Some("http://127.0.0.1:1/github".into());
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
         assert_eq!(deployer.ci_verdict_for_rev("abc123").await, None);
+    }
+
+    /// 三支判定各自留下的是哪一支。
+    ///
+    /// 门禁是 fail-open：读到绿灯与读不到都放行，状态文件只记按住，唯一的
+    /// 日志痕迹随 Pod 一起消失——所以追问一次带着红 CI 的滚动时，能回答
+    /// "这一轮到底读到了什么"的只有这条读数。少了它，"上游说绿"与"根本没
+    /// 读到"在别的读数里是同一格。
+    #[tokio::test]
+    async fn the_ci_verdict_reading_separates_pass_from_no_evidence() {
+        use cog_core::metric_names::MAINLINE_CI_VERDICT_TOTAL;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+
+        // 读到全绿。
+        let (endpoint, handle) = fake_registry(vec![http_200(
+            r#"{"check_runs":[{"conclusion":"success"},{"conclusion":"skipped"}]}"#,
+        )])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_metrics(metrics.clone());
+        assert_eq!(deployer.ci_verdict_for_rev("aaa").await, Some(true));
+        handle.await.unwrap();
+
+        // 读到一条判死的。
+        let (endpoint, handle) = fake_registry(vec![http_200(
+            r#"{"check_runs":[{"conclusion":"failure"}]}"#,
+        )])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_metrics(metrics.clone());
+        assert_eq!(deployer.ci_verdict_for_rev("bbb").await, Some(false));
+        handle.await.unwrap();
+
+        // 平台不可达：没有证据。
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some("http://127.0.0.1:1/github".into());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_metrics(metrics.clone());
+        assert_eq!(deployer.ci_verdict_for_rev("ccc").await, None);
+
+        let rows = metrics
+            .query_counter_totals(MAINLINE_CI_VERDICT_TOTAL.as_str())
+            .await
+            .unwrap();
+        let value = |want: &str| {
+            rows.iter()
+                .find(|r| r.labels.get("verdict").map(String::as_str) == Some(want))
+                .map(|r| r.value)
+        };
+        assert_eq!(value("pass"), Some(1.0), "{rows:?}");
+        assert_eq!(value("fail"), Some(1.0), "{rows:?}");
+        assert_eq!(
+            value("no_evidence"),
+            Some(1.0),
+            "每一次判定都要留下它拿到的是哪一支，否则放行的两支无法区分: {rows:?}"
+        );
+        assert_eq!(
+            rows.len(),
+            3,
+            "三支各一行，多出来的行不属于这个标签: {rows:?}"
+        );
     }
 
     #[tokio::test]
