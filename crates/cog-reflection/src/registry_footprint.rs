@@ -112,7 +112,7 @@ pub const WATCH_LOOP: &str = "registry_footprint_watch";
 /// The registry refuses to serve an OCI manifest to a client that did not say it
 /// understands one (`MANIFEST_UNKNOWN: OCI manifest found, but accept header
 /// does not support OCI manifests`), and these images are OCI.
-const MANIFEST_ACCEPTS: &[&str] = &[
+pub const MANIFEST_ACCEPTS: &[&str] = &[
     "application/vnd.oci.image.manifest.v1+json",
     "application/vnd.oci.image.index.v1+json",
     "application/vnd.docker.distribution.manifest.v2+json",

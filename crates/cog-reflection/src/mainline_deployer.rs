@@ -38,6 +38,11 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use cog_core::contract::version::VersionId;
 use cog_core::{SFError, SFResult, ShutdownSignal};
+// One owner for the media types a manifest request declares: the read side of
+// the same registry API declares them too, and a second copy that lost the OCI
+// entries answers "this tag is not in the store" to every lookup, so the fast
+// path falls through to a rebuild without anything reporting a failure.
+use crate::registry_footprint::MANIFEST_ACCEPTS;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -327,20 +332,6 @@ pub(crate) fn header_value(headers: &[(String, String)], name: &str) -> Option<S
 fn tag_is_immutable_for_rev(tag: &str) -> bool {
     tag.starts_with("main-")
 }
-
-/// 取 manifest 时声明的 media type 集合，四种都要。
-///
-/// registry 按 Accept 决定给不给：store 里存的是 OCI 的那两种（实测 buildah
-/// 推上去的就是 `application/vnd.oci.image.manifest.v1+json`），只声明 docker
-/// 那两种时每一次取都回 404——"这个 tag 在不在"的答案于是恒为"不在"，快路
-/// 静默失效、每次都从头重建一遍。声明集合是这条判据的输入，收窄它就是把
-/// 答案改成"没有"。
-const MANIFEST_ACCEPT: &[&str] = &[
-    "application/vnd.oci.image.manifest.v1+json",
-    "application/vnd.oci.image.index.v1+json",
-    "application/vnd.docker.distribution.manifest.v2+json",
-    "application/vnd.docker.distribution.manifest.list.v2+json",
-];
 
 /// 浮动签是否就是目标 rev：仅当 registry 上该 tag 的镜像当前确实构建自
 /// `bare_rev` 时才成立。只看清单里的 tag 字符串会把"标签还在、内容已被
@@ -2666,7 +2657,7 @@ impl MainlineDeployer {
     async fn tag_shape(&self, tag: &str) -> SFResult<Option<TagShape>> {
         let path = repo_path(&format!("manifests/{tag}"));
         let (status, headers, body) = self
-            .registry_request("GET", &path, MANIFEST_ACCEPT, None)
+            .registry_request("GET", &path, MANIFEST_ACCEPTS, None)
             .await?;
         if status != 200 {
             return Ok(None);
@@ -2678,7 +2669,7 @@ impl MainlineDeployer {
             let Some(child) = first_manifest_digest(&manifest) else {
                 return Ok(None);
             };
-            let child_manifest = self.registry_manifest(&child, MANIFEST_ACCEPT).await?;
+            let child_manifest = self.registry_manifest(&child, MANIFEST_ACCEPTS).await?;
             (child_manifest, digest)
         } else {
             (manifest, digest)
@@ -2708,7 +2699,7 @@ impl MainlineDeployer {
     /// 类型时 registry 一律回 404，于是答案恒为"不在"——快路静默失效，每次都
     /// 从头重建一遍。
     async fn registry_tag_exists(&self, tag: &str) -> bool {
-        self.registry_get(&repo_path(&format!("manifests/{tag}")), MANIFEST_ACCEPT)
+        self.registry_get(&repo_path(&format!("manifests/{tag}")), MANIFEST_ACCEPTS)
             .await
             .is_ok()
     }
@@ -2794,7 +2785,7 @@ impl MainlineDeployer {
     async fn registry_copy_manifest(&self, digest: &str, tag: &str) -> SFResult<()> {
         let path = repo_path(&format!("manifests/{digest}"));
         let (status, headers, body) = self
-            .registry_request("GET", &path, MANIFEST_ACCEPT, None)
+            .registry_request("GET", &path, MANIFEST_ACCEPTS, None)
             .await?;
         if status != 200 {
             return Err(SFError::IO(format!(
@@ -2808,7 +2799,7 @@ impl MainlineDeployer {
             .registry_request(
                 "PUT",
                 &target,
-                MANIFEST_ACCEPT,
+                MANIFEST_ACCEPTS,
                 Some((media_type.as_str(), &body)),
             )
             .await?;
@@ -2826,7 +2817,7 @@ impl MainlineDeployer {
     async fn registry_delete_manifest(&self, digest: &str) -> SFResult<()> {
         let path = repo_path(&format!("manifests/{digest}"));
         let (status, _, body) = self
-            .registry_request("DELETE", &path, MANIFEST_ACCEPT, None)
+            .registry_request("DELETE", &path, MANIFEST_ACCEPTS, None)
             .await?;
         if status != 202 {
             return Err(SFError::IO(format!(
@@ -2925,7 +2916,7 @@ impl MainlineDeployer {
     /// tag 列表）就把我们自己的解析器拉进了判据，解析器一出错会被读成"它没在服务"。
     async fn registry_is_serving(&self) -> bool {
         matches!(
-            self.registry_request("GET", "/v2/", MANIFEST_ACCEPT, None)
+            self.registry_request("GET", "/v2/", MANIFEST_ACCEPTS, None)
                 .await,
             Ok((200, _, _))
         )
