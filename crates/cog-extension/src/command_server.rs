@@ -691,11 +691,21 @@ mod tests {
         // The marker is written from inside the tree, so its presence is proof
         // that a command is running there; the claim is taken before the child
         // is even spawned, so it is in place by then.
+        //
+        // The command outlives the assertions by waiting for a file rather than
+        // by sleeping: a fixed span would measure this host's scheduling, not
+        // the code, and a busy machine would finish the command between the
+        // routes below and the assertion that follows them — the marker would
+        // be gone for the innocent reason, and the failure would read as the
+        // cap reclaiming a tree out from under a running command. The wait is
+        // bounded so that a claim never released still ends the test.
         let running = tokio::spawn(async move {
             reqwest::Client::new()
                 .post(format!("http://{addr}/execute"))
                 .json(&serde_json::json!({
-                    "payload": {"type": "command", "command": "touch started; sleep 3; echo done"},
+                    "payload": {"type": "command", "command": "touch started; i=0; \
+                        while [ $i -lt 120 ]; do [ -f release ] && break; sleep 1; \
+                        i=$((i + 1)); done; echo done"},
                     "task_id": "held",
                 }))
                 .send()
@@ -734,7 +744,10 @@ mod tests {
             "the cap could not be met, and that reading has to reach the scrape surface: {body}"
         );
 
-        // The command is over: the tree is an ordinary tree again.
+        // The command is over: the tree is an ordinary tree again. Releasing it
+        // through the tree is what ends the command, so the span it ran for is
+        // however long the assertions above took, and not a number chosen here.
+        std::fs::write(tree.join("release"), b"").unwrap();
         let streamed = running.await.unwrap();
         assert!(streamed.contains("done"), "{streamed}");
         workdir.route("fourth").await.unwrap();
