@@ -405,6 +405,11 @@ const FOREIGN: &[(&str, &str)] = &[
         "container_memory_working_set_bytes",
         "cadvisor（kubelet 内置）",
     ),
+    ("kube_deployment_spec_replicas", "kube-state-metrics"),
+    (
+        "kube_deployment_status_replicas_available",
+        "kube-state-metrics（Deployment 层面的可用副本数；Pod 是否卡在 Terminating 这里读不出来，只看计数）",
+    ),
     ("kube_node_status_allocatable", "kube-state-metrics"),
     (
         "kube_node_status_capacity",

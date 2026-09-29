@@ -1108,6 +1108,15 @@ data:
             },
             "severity": "warning",
             "summary": "upstream {upstream} has served traffic in the last hour while the gateway still has no measured answer to \"does this upstream report usage in a stream\", so it is deciding whether to keep the caller's stream_options from the vendor profile alone. That decision is what pins token metering at zero: when the profile says the upstream does not report usage, the field is stripped before the request leaves, the upstream is never asked, and every call ends as not_asked -- and neither a zero token count nor an absent usage reading can tell that apart from an upstream that was asked and had nothing to report. A measured verdict is 1 here whichever way it was obtained, from the pool entry or from the gateway asking again while this upstream was healthy, so this series clears by itself once an ask concludes; the backoff between asks is deliberate, because every probe spends real quota. The probe's own log line names this upstream and reports what came back -- a non-2xx is a quota or auth wall that will pass, while a 2xx whose usage did not arrive in a stream frame is an answer to a different question and is the case to look at. The reading that proves the ask mattered is llm_usage_readings_total for this upstream: its not_asked cell should stop growing once a verdict exists, and if it keeps growing with this series at 1, the strip is not what is keeping the counts at zero"
+          },
+          {
+            "name": "workload_no_available_replica",
+            "promql": "((min_over_time((kube_deployment_status_replicas_available < 1)[5m:1m]) and on(namespace, deployment) (kube_deployment_spec_replicas > 0)) and on(namespace, deployment) (count_over_time(kube_deployment_status_replicas_available[10m]) > count_over_time(kube_deployment_status_replicas_available[5m])))",
+            "condition": {
+              "less_than": 1.0
+            },
+            "severity": "critical",
+            "summary": "a deployment that asks for at least one replica has had none available for five minutes ({value} available throughout the window). A rolling update swaps a replica in seconds, so five minutes is not a slow rollout -- the replacement never came up. Read that deployment's pods and the state their containers ended in, not only the revision that was rolling out: a pod the runtime will not let the kubelet finish killing leaves the workload with no replica while no container has crashed, so every restart counter stays at zero and nothing else in this list fires."
           }
           ]
         },
