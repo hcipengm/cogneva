@@ -638,6 +638,9 @@ impl GitOpsPuller {
     /// rather than a no-op — the ConfigMap has already been applied by then, so
     /// reporting success would leave a cluster whose file and processes disagree
     /// while the record says the change landed.
+    ///
+    /// The resource word is part of that reading: the manifest says which kind
+    /// this object is, and the patch addresses that kind.
     async fn roll_config_consumers(&self) -> SFResult<Vec<String>> {
         let dir = self.work_dir();
         let listed = self
@@ -663,19 +666,24 @@ impl GitOpsPuller {
                 warn!(manifest = %path, "config consumers: manifest unreadable, skipping");
                 continue;
             };
-            for name in mounters_of_config(&text)? {
+            for (resource, name) in mounters_of_config(&text)? {
                 if rolled.contains(&name) {
                     continue;
                 }
                 let stamp = cog_core::config_sections::restart_stamp();
                 let body = cog_core::config_sections::restart_patch_body(&stamp);
+                // The noun is the kind the manifest declares. Writing a fixed
+                // one here decides the object by a name the reader never
+                // checked: the manifest that says StatefulSet gets "deployments
+                // <name> not found" at best, and a Deployment that happens to
+                // share the name at worst.
                 self.run(
                     &self.config.kubectl_bin.clone(),
                     &[
                         "-n",
                         &self.config.namespace.clone(),
                         "patch",
-                        "deployment",
+                        resource,
                         &name,
                         "--type",
                         "merge",
@@ -2414,7 +2422,7 @@ fn config_document(manifest: &str) -> serde_json::Value {
 /// mounting the config is rolled without anyone remembering to add it here. Any
 /// workload kind with a pod template counts; what makes a workload a consumer is
 /// the mount, not its kind.
-fn mounters_of_config(manifest: &str) -> SFResult<Vec<String>> {
+fn mounters_of_config(manifest: &str) -> SFResult<Vec<(&'static str, String)>> {
     use serde::Deserialize;
 
     let mut out = Vec::new();
@@ -2433,14 +2441,21 @@ fn mounters_of_config(manifest: &str) -> SFResult<Vec<String>> {
         // lookups read the same here as everywhere else in this file.
         let value = serde_json::to_value(yaml)
             .map_err(|e| SFError::Config(format!("manifest document is not JSON: {e}")))?;
-        if !matches!(
-            value.get("kind").and_then(|k| k.as_str()),
-            Some("Deployment" | "StatefulSet" | "DaemonSet")
-        ) {
+        let Some(kind) = value
+            .get("kind")
+            .and_then(|k| k.as_str())
+            .and_then(crate::workload_kind)
+        else {
+            continue;
+        };
+        // The reading is the one the manifest face can take: a kind whose pods
+        // live per run has nothing to restart.
+        if !kind.long_lived_pods {
             continue;
         }
+        let volumes = format!("/{}/volumes", kind.pod_template.replace('.', "/"));
         let mounts = value
-            .pointer("/spec/template/spec/volumes")
+            .pointer(&volumes)
             .and_then(|v| v.as_array())
             .map(|volumes| {
                 volumes.iter().any(|volume| {
@@ -2453,7 +2468,10 @@ fn mounters_of_config(manifest: &str) -> SFResult<Vec<String>> {
             continue;
         }
         if let Some(name) = value.pointer("/metadata/name").and_then(|n| n.as_str()) {
-            out.push(name.to_string());
+            // The resource word travels with the name: the caller patches what
+            // the manifest says this object is, not what the last manifest it
+            // rolled happened to be.
+            out.push((kind.resource, name.to_string()));
         }
     }
     Ok(out)
@@ -2687,7 +2705,7 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
         assert!(l.is_none());
     }
 
-    async fn git(dir: &Path, args: &[&str]) -> String {
+    pub(super) async fn git(dir: &Path, args: &[&str]) -> String {
         let output = tokio::process::Command::new("git")
             .args(args)
             .current_dir(dir)
@@ -3770,7 +3788,7 @@ spec:
 "#;
         assert_eq!(
             mounters_of_config(manifest).expect("readable"),
-            vec!["cogneva".to_string()]
+            vec![("deployment", "cogneva".to_string())]
         );
     }
 
@@ -3822,9 +3840,129 @@ spec:
         found.sort();
         assert_eq!(
             found,
-            vec!["cogneva".to_string(), "cogneva-evolution".to_string()],
+            vec![
+                ("deployment", "cogneva".to_string()),
+                ("deployment", "cogneva-evolution".to_string()),
+            ],
             "the workloads that mount the config, read from the manifests; a rename here is a \
              rename of what the config roll targets"
+        );
+    }
+
+    /// The noun the patch is sent with is the kind the manifest declares, not a
+    /// word chosen by the reader.
+    ///
+    /// A fixed noun is the same sentence to a reviewer and a different object to
+    /// the cluster: a StatefulSet mounting the config would be patched as a
+    /// `deployment`, which either does not exist under that name (the roll ends
+    /// in an error about a resource nobody mentioned) or does, and then the roll
+    /// moves a workload that never read the document while the one that did
+    /// keeps serving the old values.
+    #[test]
+    fn a_config_consumer_is_addressed_by_the_kind_its_manifest_declares() {
+        let manifest = "\
+---
+kind: StatefulSet
+metadata:
+  name: reader
+spec:
+  template:
+    spec:
+      volumes:
+        - name: cfg
+          configMap:
+            name: cogneva-json
+---
+kind: DaemonSet
+metadata:
+  name: collector
+spec:
+  template:
+    spec:
+      volumes:
+        - name: cfg
+          configMap:
+            name: cogneva-json
+---
+kind: CronJob
+metadata:
+  name: nightly
+spec:
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          volumes:
+            - name: cfg
+              configMap:
+                name: cogneva-json
+";
+        assert_eq!(
+            mounters_of_config(manifest).unwrap(),
+            vec![
+                ("statefulset", "reader".to_string()),
+                ("daemonset", "collector".to_string())
+            ],
+            "each consumer is addressed by its own kind, and a kind whose pods live per run is \
+             not a restart this roll can make"
+        );
+    }
+
+    /// The roll sends the noun its reading reported, read through a real
+    /// checkout and a real commit.
+    ///
+    /// The reading half is not enough on its own: a noun chosen by the caller
+    /// (the shape this used to have) leaves the reading correct and the patch
+    /// aimed at an object the manifest never named.
+    #[tokio::test]
+    async fn the_config_roll_patches_the_kind_the_commit_declares() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join("deploy/k3s")).unwrap();
+        std::fs::write(
+            repo.join("deploy/k3s/reader.yaml"),
+            "---\nkind: StatefulSet\nmetadata:\n  name: reader\nspec:\n  template:\n    spec:\n      \
+             volumes:\n        - name: cfg\n          configMap:\n            name: cogneva-json\n",
+        )
+        .unwrap();
+        super::tests::git(&repo, &["init"]).await;
+        super::tests::git(&repo, &["config", "user.email", "t@t.com"]).await;
+        super::tests::git(&repo, &["config", "user.name", "T"]).await;
+        super::tests::git(&repo, &["add", "."]).await;
+        super::tests::git(&repo, &["commit", "-m", "manifest"]).await;
+
+        let calls = dir.path().join("kubectl.log");
+        let kubectl = crate::test_support::write_executable(
+            dir.path(),
+            "kubectl",
+            &format!(
+                "#!/bin/sh\necho \"$@\" >> '{log}'\necho patched\n",
+                log = calls.display()
+            ),
+        );
+        let puller = GitOpsPuller::new(
+            GitOpsConfig {
+                kubectl_bin: kubectl.to_string_lossy().into_owned(),
+                namespace: "cogneva".into(),
+                work_dir: repo.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(cog_storage::MemoryStateBackend::new()),
+            "c".into(),
+        );
+
+        assert_eq!(
+            puller.roll_config_consumers().await.unwrap(),
+            vec!["reader".to_string()]
+        );
+        let log = std::fs::read_to_string(&calls).unwrap();
+        assert!(
+            log.contains("patch statefulset reader"),
+            "the manifest said StatefulSet and the roll has to address that: {log}"
+        );
+        assert!(
+            !log.contains("patch deployment"),
+            "a noun the reader did not report patches an object the manifest never named: {log}"
         );
     }
 

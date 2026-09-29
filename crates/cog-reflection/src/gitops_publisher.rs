@@ -276,7 +276,7 @@ impl GitOpsPublisher {
                     "-n",
                     &self.config.namespace,
                     "get",
-                    "deploy",
+                    crate::mainline_deployer::workload_resource("Deployment"),
                     "-o",
                     jsonpath,
                 ],

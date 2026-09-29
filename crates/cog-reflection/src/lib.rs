@@ -111,9 +111,10 @@ pub use gitops_puller::{
 };
 pub use image_rollout::ImageRollout;
 pub use mainline_deployer::{
-    api_resource_of, classify_doc, run_mainline_loop, run_rollout_cli, DocFate, FailureClass,
-    MainlineDeployer, RolloutExecutor, RolloutFailure, RolloutPlan, RolloutTarget,
-    DELIVERABLE_MANIFEST_TREES,
+    api_resource_of, classify_doc, run_mainline_loop, run_rollout_cli, workload_kind,
+    workload_kind_of_resource, DocFate, FailureClass, MainlineDeployer, RolloutExecutor,
+    RolloutFailure, RolloutPlan, RolloutTarget, WorkloadKind, DELIVERABLE_MANIFEST_TREES,
+    WORKLOAD_KINDS,
 };
 pub use matcher::{DefaultLearningMatcher, LearningMatcher};
 pub use meta_learning::{DecisionStatsSnapshot, MetaLearningEngine};

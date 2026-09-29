@@ -477,9 +477,29 @@ const FATAL_WAITING_REASONS: &[&str] = &[
 /// IMAGE_SOURCE_UNAVAILABLE_MARKER）。
 const IMAGE_PULL_WAITING_REASONS: &[&str] = &["ErrImagePull", "ImagePullBackOff"];
 
-/// 支撑清单 apply 会动到的工作负载种类。滚动目标本身是 Deployment，但目标由
-/// 逐目标等待单独负责，这里的判据不覆盖它们。
-const SUPPORT_WORKLOAD_KINDS: &[&str] = &["deploy", "statefulset"];
+/// The workload kinds this rollout waits for after the apply, and why the list
+/// is shorter than [`WORKLOAD_KINDS`]: settling is read as replicas
+/// (`spec.replicas` against `status.readyReplicas`) and only these two declare
+/// that pair. A DaemonSet folded in here would read a missing `replicas` as its
+/// absent-field default of one and a missing `readyReplicas` as zero, so the
+/// wait would never come true and the rollout would die at the deadline
+/// instead of reporting readiness. Reading a DaemonSet's progress takes its own
+/// pair (`desiredNumberScheduled`/`numberReady`) and is a change to this face,
+/// not to this list.
+///
+/// The kinds apply can reach and this list does not cover are a known residue:
+/// a DaemonSet or CronJob this apply restarts is not waited for here.
+///
+/// The rollout targets are Deployments of their own and are waited for one by
+/// one; they are not covered here either.
+///
+/// The words come from [`workload_resource`] rather than being spelled here:
+/// this list is read and patched through kubectl, and a face that spelled its
+/// own word would name the same object twice under two spellings.
+const SUPPORT_WORKLOAD_KINDS: &[&str] = &[
+    workload_resource("Deployment"),
+    workload_resource("StatefulSet"),
+];
 
 /// How many read-only pre-flight reads may each spend a whole wait budget
 /// retrying: the support-workload generations before the apply, the same
@@ -511,20 +531,34 @@ const SUPPORT_CAUSE_POD_LIMIT: usize = 3;
 const SUPPORT_CAUSE_CONTAINER_LIMIT: usize = 4;
 const SUPPORT_CAUSE_MESSAGE_CHARS: usize = 200;
 
-/// 每个工作负载读了哪些 ConfigMap 的读法：名字，然后四个消费面各一段，竖线分段。
-/// 卷、projected 里的 ConfigMap 源、envFrom、env.valueFrom（容器与 initContainer
-/// 各两段）。竖线显式占位：一个没有卷的工作负载整段是空的，不能让缺字段把后面的
-/// 段顶掉。
-const CONFIG_CONSUMER_JSONPATH: &str = concat!(
-    "jsonpath={range .items[*]}{.metadata.name}{'|'}",
-    "{range .spec.template.spec.volumes[*]}{.configMap.name}{','}{end}{'|'}",
-    "{range .spec.template.spec.volumes[*]}{.projected.sources[*].configMap.name}{','}{end}{'|'}",
-    "{range .spec.template.spec.containers[*].envFrom[*]}{.configMapRef.name}{','}{end}{'|'}",
-    "{range .spec.template.spec.containers[*].env[*].valueFrom.configMapKeyRef.name}{','}{end}{'|'}",
-    "{range .spec.template.spec.initContainers[*].envFrom[*]}{.configMapRef.name}{','}{end}{'|'}",
-    "{range .spec.template.spec.initContainers[*].env[*].valueFrom.configMapKeyRef.name}{','}{end}",
-    "{'\\n'}{end}"
-);
+/// The read of which ConfigMaps each workload of one kind reads: its name, then
+/// one section per consumption face, separated by pipes.
+///
+/// The faces are volumes, ConfigMap sources inside a projected volume, envFrom,
+/// and env.valueFrom, the last two for containers and initContainers. The pipes
+/// hold their position: a workload with no volumes leaves a section empty, and a
+/// missing field must not pull the later sections forward.
+///
+/// The pod template path is the caller's, taken from the kind being read. It is
+/// not a constant here because it is not the same path for every kind: a CronJob
+/// keeps its template under `jobTemplate`, and a read written for the shorter
+/// path answers "reads nothing" about it -- which is exactly the shape of a
+/// silent miss.
+fn config_consumer_jsonpath(pod_template: &str) -> String {
+    format!(
+        concat!(
+            "jsonpath={{range .items[*]}}{{.metadata.name}}{{'|'}}",
+            "{{range .{path}.volumes[*]}}{{.configMap.name}}{{','}}{{end}}{{'|'}}",
+            "{{range .{path}.volumes[*]}}{{.projected.sources[*].configMap.name}}{{','}}{{end}}{{'|'}}",
+            "{{range .{path}.containers[*].envFrom[*]}}{{.configMapRef.name}}{{','}}{{end}}{{'|'}}",
+            "{{range .{path}.containers[*].env[*].valueFrom.configMapKeyRef.name}}{{','}}{{end}}{{'|'}}",
+            "{{range .{path}.initContainers[*].envFrom[*]}}{{.configMapRef.name}}{{','}}{{end}}{{'|'}}",
+            "{{range .{path}.initContainers[*].env[*].valueFrom.configMapKeyRef.name}}{{','}}{{end}}",
+            "{{'\\n'}}{{end}}"
+        ),
+        path = pod_template
+    )
+}
 
 /// 滚动内部轮询间隔：探测、致命态复查、部署态查询共用同一节拍。
 const ROLLOUT_POLL_SECS: u64 = 5;
@@ -2371,12 +2405,14 @@ impl MainlineDeployer {
     async fn live_referenced_revs(&self) -> SFResult<Vec<String>> {
         let repo = format!("{}/{}", self.pull_endpoint(), IMAGE_REPOSITORY);
         let mut revs: Vec<String> = Vec::new();
-        for (_, kind, path) in WORKLOAD_POD_TEMPLATES {
-            let spec = format!(".{path}");
+        for entry in &WORKLOAD_KINDS {
+            let spec = format!(".{}", entry.pod_template);
             let jsonpath = format!(
                 "jsonpath={{range .items[*]}}{{range {spec}.containers[*]}}{{.image}}{{\" \"}}{{end}}{{range {spec}.initContainers[*]}}{{.image}}{{\" \"}}{{end}}{{end}}"
             );
-            let out = self.kubectl(&["get", kind, "-o", &jsonpath], 30).await?;
+            let out = self
+                .kubectl(&["get", entry.resource, "-o", &jsonpath], 30)
+                .await?;
             for image in out.split_whitespace() {
                 if image_repository(image) != repo.as_str() {
                     continue;
@@ -5084,16 +5120,22 @@ pub fn classify_doc(kind: &str) -> DocFate {
 /// `Secret` is absent on purpose, as are the role, governance, claim and
 /// cluster-scoped kinds: they never travel through the loop, so no grant can
 /// be their answer.
+///
+/// The workload kinds are answered from [`WORKLOAD_KINDS`], where their group
+/// and plural are written down with the rest of what this crate knows about
+/// them. `Job` is the one row only this table holds: it is delivered like any
+/// other workload, but no live reading through [`WORKLOAD_KINDS`] addresses it,
+/// because the rollout's own historical Jobs pin every revision they ever
+/// dispatched and reading them would defeat revision collection.
 pub fn api_resource_of(kind: &str) -> Option<(&'static str, &'static str)> {
+    if let Some(entry) = workload_kind(kind) {
+        return Some((entry.rbac_group, entry.rbac_resource));
+    }
     Some(match kind {
         "ConfigMap" => ("", "configmaps"),
         "Service" => ("", "services"),
         "ServiceAccount" => ("", "serviceaccounts"),
-        "Deployment" => ("apps", "deployments"),
-        "DaemonSet" => ("apps", "daemonsets"),
-        "StatefulSet" => ("apps", "statefulsets"),
         "Job" => ("batch", "jobs"),
-        "CronJob" => ("batch", "cronjobs"),
         "NetworkPolicy" => ("networking.k8s.io", "networkpolicies"),
         "Ingress" => ("networking.k8s.io", "ingresses"),
         "ServiceMonitor" => ("monitoring.coreos.com", "servicemonitors"),
@@ -5275,32 +5317,143 @@ fn pin_app_image_refs(v: &mut serde_yaml::Value, repo: &str, image: &str) -> usi
     }
 }
 
-/// 集群里四种带 pod 模板的工作负载：(清单里的 kind, 寻址用的资源词, pod 模板在
-/// 文档里的路径)。资源词是 `kubectl` 认的那个单数全名（`deployment`、
-/// `statefulset`…），不是 kind 的大写拼写。
+/// One workload kind a delivered manifest can carry, with every spelling of its
+/// name this crate addresses it by and the place its pod template sits.
 ///
-/// CronJob 的 pod 模板比别的种类深两层：它在 `jobTemplate` 里面。少走这一层会让
-/// 备份 CronJob 这类工作负载整个从读数里消失——而它正是会停在失败 rev 上的那种
-/// 引用（容器指着一个每 rev 一个的 tag）。这条深度只在这里写一次：按文档走的
-/// 快照/还原与按种类列一遍的回收轮保留集都从这里取，免得两头各写一份、改一处漏一处。
-const WORKLOAD_POD_TEMPLATES: [(&str, &str, &str); 4] = [
-    ("Deployment", "deployment", "spec.template.spec"),
-    ("StatefulSet", "statefulset", "spec.template.spec"),
-    ("DaemonSet", "daemonset", "spec.template.spec"),
-    ("CronJob", "cronjob", "spec.jobTemplate.spec.template.spec"),
+/// The rows are held once because the faces that read them walk apart quietly.
+/// A live reading spelled `statefulset` and a patch spelled `deployment` are the
+/// same sentence to a reviewer and two different objects to the cluster, and the
+/// narrowest hand-kept list decides what every face built on it can see: a face
+/// listing two kinds answers "nobody reads this configuration" about a
+/// DaemonSet that does.
+///
+/// The pod template path belongs to the kind: a CronJob keeps its template two
+/// levels deeper, under `jobTemplate`, and reading it anywhere else loses the
+/// backup CronJob from every reading taken through this table -- and that is
+/// exactly the workload that stops on a failed revision, because its container
+/// names a tag that exists once per revision.
+///
+/// `long_lived_pods` is the other half: it says whether a configuration change
+/// has to be pushed to the object at all, or whether the next run reads the new
+/// content by itself.
+pub struct WorkloadKind {
+    /// The `kind` a manifest document spells.
+    pub kind: &'static str,
+    /// The resource word kubectl takes for this object, singular.
+    pub resource: &'static str,
+    /// The API group an RBAC rule granting this object spells.
+    pub rbac_group: &'static str,
+    /// The plural resource name the same rule spells.
+    pub rbac_resource: &'static str,
+    /// Where the pod template sits inside a document of this kind.
+    pub pod_template: &'static str,
+    /// A pod of this kind keeps running until something replaces it, so the
+    /// configuration it read at startup is still the one it is serving and a
+    /// changed document leaves it on the old values. A kind whose pods are
+    /// created per run -- a CronJob's -- reads the new content the next time it
+    /// runs, and stamping it would replace nothing.
+    pub long_lived_pods: bool,
+}
+
+pub const WORKLOAD_KINDS: [WorkloadKind; 4] = [
+    WorkloadKind {
+        kind: "Deployment",
+        resource: "deployment",
+        rbac_group: "apps",
+        rbac_resource: "deployments",
+        pod_template: "spec.template.spec",
+        long_lived_pods: true,
+    },
+    WorkloadKind {
+        kind: "StatefulSet",
+        resource: "statefulset",
+        rbac_group: "apps",
+        rbac_resource: "statefulsets",
+        pod_template: "spec.template.spec",
+        long_lived_pods: true,
+    },
+    WorkloadKind {
+        kind: "DaemonSet",
+        resource: "daemonset",
+        rbac_group: "apps",
+        rbac_resource: "daemonsets",
+        pod_template: "spec.template.spec",
+        long_lived_pods: true,
+    },
+    WorkloadKind {
+        kind: "CronJob",
+        resource: "cronjob",
+        rbac_group: "batch",
+        rbac_resource: "cronjobs",
+        pod_template: "spec.jobTemplate.spec.template.spec",
+        long_lived_pods: false,
+    },
 ];
 
-/// 一份清单文档里工作负载的 pod 模板，以及寻址它用的那个资源词。
-fn workload_pod_spec(doc: &serde_yaml::Value) -> Option<(String, &serde_yaml::Value)> {
-    let kind = doc.get("kind").and_then(|k| k.as_str())?;
-    let (_, resource, path) = WORKLOAD_POD_TEMPLATES
+/// The resource word kubectl takes for a manifest kind, read from
+/// [`WORKLOAD_KINDS`].
+///
+/// Const because the faces that name one resource -- a table of what to read, a
+/// kubectl argv -- are consts too. A face that spelled its own word is how one
+/// resource ends up with two spellings: the table's `deployment` and a
+/// hand-written `deploy` are the same object to kubectl, so nothing on the wire
+/// objects, and only a reading that goes through one word while a patch goes
+/// through the other shows it.
+pub(crate) const fn workload_resource(kind: &str) -> &'static str {
+    let mut i = 0;
+    while i < WORKLOAD_KINDS.len() {
+        if same_bytes(WORKLOAD_KINDS[i].kind, kind) {
+            return WORKLOAD_KINDS[i].resource;
+        }
+        i += 1;
+    }
+    panic!("no workload kind declares this name")
+}
+
+/// `str` equality the const evaluator can call (`&str ==` is not const).
+const fn same_bytes(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// The row for a manifest `kind`, or `None` for a document that is not a
+/// workload this crate can address.
+pub fn workload_kind(kind: &str) -> Option<&'static WorkloadKind> {
+    WORKLOAD_KINDS.iter().find(|known| known.kind == kind)
+}
+
+/// The row for a resource word kubectl takes (`deployment`, `statefulset`…).
+///
+/// Live readings come back addressed this way and not by their manifest kind,
+/// so every reader that has a word in hand and needs the rest of the row looks
+/// it up here rather than comparing against a second list of words.
+pub fn workload_kind_of_resource(resource: &str) -> Option<&'static WorkloadKind> {
+    WORKLOAD_KINDS
         .iter()
-        .find(|(known, _, _)| *known == kind)?;
+        .find(|known| known.resource == resource)
+}
+
+/// 一份清单文档里工作负载的 pod 模板，以及它那一行。
+fn workload_pod_spec(
+    doc: &serde_yaml::Value,
+) -> Option<(&'static WorkloadKind, &serde_yaml::Value)> {
+    let kind = doc.get("kind").and_then(|k| k.as_str())?;
+    let entry = workload_kind(kind)?;
     let mut node = doc;
-    for segment in path.split('.') {
+    for segment in entry.pod_template.split('.') {
         node = node.get(segment)?;
     }
-    Some((resource.to_string(), node))
+    Some((entry, node))
 }
 
 /// 清单里一个容器引用，以及清单声明的 image 值。
@@ -5351,7 +5504,7 @@ fn bundle_declared_containers(yaml_text: &str) -> SFResult<Vec<DeclaredRef>> {
         if v.is_null() {
             continue;
         }
-        let Some((resource, spec)) = workload_pod_spec(&v) else {
+        let Some((entry, spec)) = workload_pod_spec(&v) else {
             continue;
         };
         let Some(name) = v
@@ -5373,7 +5526,7 @@ fn bundle_declared_containers(yaml_text: &str) -> SFResult<Vec<DeclaredRef>> {
                     continue;
                 };
                 out.push(DeclaredRef {
-                    resource: resource.clone(),
+                    resource: entry.resource.to_string(),
                     name: name.to_string(),
                     container: container.to_string(),
                     image: image.to_string(),
@@ -6065,9 +6218,15 @@ fn changed_workloads(
     after
         .iter()
         .filter(|w| {
-            !targets
-                .iter()
-                .any(|t| w.kind == "deploy" && t.deployment == w.name)
+            // A rollout target is a Deployment of its own, so the ones it names
+            // are not "some support workload this apply restarted" -- they are
+            // waited for one by one. The word is the table's, not a literal:
+            // the target's own name is compared next to it, and two spellings
+            // of one resource here would silently stop matching.
+            !targets.iter().any(|t| {
+                workload_kind_of_resource(w.kind).map(|k| k.kind) == Some("Deployment")
+                    && t.deployment == w.name
+            })
         })
         .filter(
             |w| match before.iter().find(|b| b.kind == w.kind && b.name == w.name) {
@@ -6603,15 +6762,21 @@ impl RolloutExecutor {
     /// conclusion was reached" classification.
     async fn live_config_consumers(&self) -> SFResult<Vec<ConfigConsumer>> {
         let mut out = Vec::new();
-        for kind in SUPPORT_WORKLOAD_KINDS {
+        // Every kind this crate can address, not the ones a roll happens to
+        // target: this reading answers "who reads this configuration", and a
+        // kind left out of it makes the answer "nobody" -- which the caller
+        // treats as a failed delivery, so a narrow reading here turns a
+        // workload that does read the document into a rollout error.
+        for entry in &WORKLOAD_KINDS {
+            let jsonpath = config_consumer_jsonpath(entry.pod_template);
             let readout = self
                 .probe(
-                    &["get", kind, "-o", CONFIG_CONSUMER_JSONPATH],
+                    &["get", entry.resource, "-o", &jsonpath],
                     30,
                     self.rollout_timeout_secs,
                 )
                 .await?;
-            out.extend(config_consumers(&readout, kind));
+            out.extend(config_consumers(&readout, entry.resource));
         }
         Ok(out)
     }
@@ -6687,6 +6852,24 @@ impl RolloutExecutor {
                 .filter(|c| c.configmaps.iter().any(|m| m == *name))
             {
                 if rolled.contains(&consumer.name) {
+                    continue;
+                }
+                // Which consumers get rolled is narrower than which ones are
+                // read, and it is the kind that decides: a pod that keeps
+                // running is still serving the configuration it read at
+                // startup, while a kind whose pods are created per run reads
+                // the new content on its next run and a stamp would replace
+                // nothing. The reading above still covers both, so the answer
+                // to "does anything read this document" is not decided by
+                // whether a roll is worth doing.
+                let kind = workload_kind_of_resource(&consumer.kind).ok_or_else(|| {
+                    SFError::Config(format!(
+                        "config effect: {} is addressed by a resource word no workload kind \
+                         declares, so this is not a restart this crate can reason about",
+                        consumer.display()
+                    ))
+                })?;
+                if !kind.long_lived_pods {
                     continue;
                 }
                 // 打在 apply 之后的支撑快照之前：这样它是"这次 apply 动过的工作负载"
@@ -7575,17 +7758,14 @@ impl RolloutExecutor {
         for (resource, name) in &workloads {
             // 名字问集群、不问清单：对象可能还没建（首次安装），`--ignore-not-found`
             // 让"不存在"退 0 且无输出，与"读不到"分开——后者必须是错误。
-            let Some((_, _, path)) = WORKLOAD_POD_TEMPLATES
-                .iter()
-                .find(|(_, known, _)| *known == resource)
-            else {
+            let Some(entry) = workload_kind_of_resource(resource) else {
                 // 快照按声明面走，资源词由上面那张表给出，正常到不了这里；真到了
                 // 就当作读不到（一次变更都不许发生），而不是静默少记一个引用。
                 return Err(SFError::Config(format!(
                     "{origin}: {resource}/{name} is not a workload kind this snapshot can read"
                 )));
             };
-            let spec = format!(".{path}");
+            let spec = format!(".{}", entry.pod_template);
             let jsonpath = format!(
                 "jsonpath={{range {spec}.containers[*]}}{{.name}}={{.image}}{{\"\\n\"}}{{end}}{{range {spec}.initContainers[*]}}{{.name}}={{.image}}{{\"\\n\"}}{{end}}"
             );
@@ -9712,8 +9892,8 @@ exit 0
         dir.join("fake-kubectl").to_string_lossy().to_string()
     }
 
-    /// fake kubectl：支撑工作负载的代数查询，前 `failures` 次 `get deploy` 以
-    /// 集群不可达的形状失败（真 kubectl 连不上 apiserver 时的 stderr），之后
+    /// fake kubectl：支撑工作负载的代数查询，前 `failures` 次 `get deployment`
+    /// 以集群不可达的形状失败（真 kubectl 连不上 apiserver 时的 stderr），之后
     /// 正常；statefulset 一直正常。失败次数落盘计数，所以「重试过没有」能从
     /// 日志里读出来，而不用让替身睡够一个尝试超时。
     fn fake_kubectl_failing_times(dir: &Path, failures: u32) -> String {
@@ -9723,7 +9903,7 @@ exit 0
             r#"#!/bin/sh
 echo "$@" >> '{log}'
 case "$*" in
-  *"get deploy"*)
+  *"get deployment"*)
     n=0
     [ -f '{count}' ] && n=$(cat '{count}')
     if [ "$n" -lt {failures} ]; then
@@ -13822,7 +14002,7 @@ case "$*" in
     printf '%s\n' 'volume-walker=localhost:30500/cogneva:main-walkerold' ;;
   *"get deployment cogneva-sandbox-executor --ignore-not-found"*)
     printf '%s\n' 'sandbox-executor=localhost:30500/cogneva:main-old' 'seed-sandbox=localhost:30500/cogneva:main-seedold' ;;
-  *"get deploy -o"*) echo "cogneva-registry 1" ;;
+  *"get deployment -o"*) echo "cogneva-registry 1" ;;
   *"get statefulset -o"*) ;;
   *"get configmap -o"*) echo '{{"items":[]}}' ;;
   *"jsonpath={{.spec}}"*) echo '{{"replicas":1}}' ;;
@@ -14031,7 +14211,7 @@ exit 0
         assert_eq!(workloads.len(), 2, "{workloads:?}");
         let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
         assert_eq!(
-            calls.matches("get deploy").count(),
+            calls.matches("get deployment").count(),
             2,
             "the read has to be tried again, not turned into a rollout failure: {calls}"
         );
@@ -14051,7 +14231,7 @@ exit 0
         executor.live_config_consumers().await.unwrap();
         let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
         assert_eq!(
-            calls.matches("get deploy").count(),
+            calls.matches("get deployment").count(),
             2,
             "the read has to be tried again, not turned into a rollout failure: {calls}"
         );
@@ -14086,19 +14266,19 @@ exit 0
     #[test]
     fn changed_workloads_selects_what_this_apply_restarted() {
         let before = vec![
-            support_workload("deploy", "cogneva-registry", 1),
-            support_workload("deploy", "meilisearch", 3),
+            support_workload("deployment", "cogneva-registry", 1),
+            support_workload("deployment", "meilisearch", 3),
             support_workload("statefulset", "postgres", 1),
         ];
         let after = vec![
             // 代数前进：apply 改了 spec，这个会滚动重启。
-            support_workload("deploy", "cogneva-registry", 2),
+            support_workload("deployment", "cogneva-registry", 2),
             // 没改：原地不动，不该等。
-            support_workload("deploy", "meilisearch", 3),
+            support_workload("deployment", "meilisearch", 3),
             // apply 之前不在：新增的工作负载同样要等到就绪。
             support_workload("statefulset", "nats", 1),
             // 目标部署自己：由逐目标等待负责，不在这里再等一遍。
-            support_workload("deploy", "cogneva-security-gateway", 9),
+            support_workload("deployment", "cogneva-security-gateway", 9),
             support_workload("statefulset", "postgres", 1),
         ];
         let targets = vec![RolloutTarget {
@@ -14111,7 +14291,10 @@ exit 0
             .iter()
             .map(SupportWorkload::display)
             .collect();
-        assert_eq!(changed, vec!["deploy/cogneva-registry", "statefulset/nats"]);
+        assert_eq!(
+            changed,
+            vec!["deployment/cogneva-registry", "statefulset/nats"]
+        );
     }
 
     #[test]
@@ -14328,7 +14511,7 @@ exit 0
         // `\n`（jsonpath 的换行转义）会被 sh 的 echo 展开成真换行，行切分靠不住。
         let first_target = calls.find("set image ").expect("no target rolled");
         let last_settle_poll = calls
-            .rfind("get deploy cogneva-registry")
+            .rfind("get deployment cogneva-registry")
             .expect("the restarted support workload was never waited on");
         assert!(
             last_settle_poll < first_target,
@@ -14336,7 +14519,7 @@ exit 0
         );
         // 没被这次 apply 动过的工作负载不进等待：等它就是把无关的故障算到这次上线头上。
         assert!(
-            !calls.contains("get deploy meilisearch"),
+            !calls.contains("get deployment meilisearch"),
             "an untouched support workload must not gate the rollout: {calls}"
         );
     }
@@ -14474,7 +14657,7 @@ case "$*" in
     touch '{applied}'
     echo "configmap/cogneva-config configured" ;;
   # 支撑工作负载表：apply 之后 registry 的代数前进，其余没动。
-  *"get deploy -o"*)
+  *"get deployment -o"*)
     if [ -f '{applied}' ]; then echo "cogneva-registry 2"; else echo "cogneva-registry 1"; fi
     echo "meilisearch 1"
     ;;
@@ -14482,7 +14665,7 @@ case "$*" in
   # 判死读数：工作负载对象给出它自己的选择器，Pod 列表给出逐容器的病因。模式尾不
   # 带通配：`-o json` 是等就绪那次读的 `-o jsonpath=...` 的前缀，带着通配会把两次
   # 读混成一次。
-  *"get deploy cogneva-registry -o json")
+  *"get deployment cogneva-registry -o json")
     if [ '{cause_readable}' = "yes" ]; then
       printf '%s\n' '{workload_json}'
     else
@@ -14492,7 +14675,7 @@ case "$*" in
     ;;
   *"get pods -l app=cogneva-registry -o json") printf '%s\n' '{pods_json}' ;;
   # 等就绪：第 settle_at 次采样才就绪，之前一直落后一代。
-  *"get deploy cogneva-registry -o"*)
+  *"get deployment cogneva-registry -o"*)
     n=$(cat '{count}' 2>/dev/null || echo 0)
     n=$((n+1)); echo "$n" > '{count}'
     if [ "$n" -ge {settle_at} ]; then touch '{settled}'; echo "2|2|1|1|"; else echo "2|1|1|0|"; fi
@@ -14538,7 +14721,7 @@ exit 0
             "   ",
         ]
         .join("\n");
-        let consumers = config_consumers(&readout, "deploy");
+        let consumers = config_consumers(&readout, "deployment");
         assert_eq!(consumers.len(), 2, "{consumers:?}");
         let cogneva = &consumers[0];
         assert_eq!(cogneva.name, "cogneva");
@@ -14692,16 +14875,16 @@ case "$*" in
     echo 'cogneva|cogneva-json|'
     echo 'cogneva-patcher|cogneva-json|'
     echo 'meilisearch||||||' ;;
-  *"get deploy -o"*)
+  *"get deployment -o"*)
     if [ -f '{patched}' ]; then echo "cogneva-patcher 2"; else echo "cogneva-patcher 1"; fi
     echo "meilisearch 1" ;;
   *"get statefulset -o"*) ;;
   # 被 patch 过之后代数才算前进，等它就绪才是"等这次 apply 动过的工作负载"。
-  *"get deploy cogneva-patcher -o"*)
+  *"get deployment cogneva-patcher -o"*)
     if [ -f '{patched}' ]; then touch '{settled}'; echo "2|2|1|1|"; else echo "1|1|1|1|"; fi
     ;;
-  *"patch deploy cogneva-patcher"*) touch '{patched}'; echo "deployment.apps/cogneva-patcher patched" ;;
-  *"patch deploy cogneva "*) touch '{patched}'; echo "deployment.apps/cogneva patched" ;;
+  *"patch deployment cogneva-patcher"*) touch '{patched}'; echo "deployment.apps/cogneva-patcher patched" ;;
+  *"patch deployment cogneva "*) touch '{patched}'; echo "deployment.apps/cogneva patched" ;;
   *"get deployment "*)
     echo "1|1|1|1|1|" ;;
   *"set image "*)
@@ -14986,7 +15169,7 @@ spec:
         let first_target = calls.find("set image ").expect("no target rolled");
         for workload in ["cogneva-patcher", "cogneva"] {
             let patch = calls
-                .find(&format!("patch deploy {workload} "))
+                .find(&format!("patch deployment {workload} "))
                 .unwrap_or_else(|| panic!("{workload} was never rolled: {calls}"));
             assert!(
                 patch < first_target,
@@ -14999,12 +15182,12 @@ spec:
         );
         // 非目标那个由支撑等待一并等它回就绪。
         assert!(
-            calls.contains("get deploy cogneva-patcher -o"),
+            calls.contains("get deployment cogneva-patcher -o"),
             "an off-target config consumer has to be waited on: {calls}"
         );
         // 没读这份配置的工作负载不进滚动名单。
         assert!(
-            !calls.contains("patch deploy meilisearch"),
+            !calls.contains("patch deployment meilisearch"),
             "a workload that does not read the config must not be rolled: {calls}"
         );
     }
@@ -17592,6 +17775,235 @@ exit 0
             checked.len(),
             DELIVERABLE_MANIFEST_TREES.len(),
             "the walk did not cover the delivered set: {checked:?}"
+        );
+    }
+
+    /// Every path inside a document at which a container list sits.
+    ///
+    /// The walk asks the documents where their containers are instead of asking
+    /// a list of kinds where they should be: a criterion that reads the same
+    /// table as the code it guards can only ever agree with itself.
+    fn container_list_paths(doc: &serde_yaml::Value) -> Vec<String> {
+        fn walk(node: &serde_yaml::Value, path: &mut Vec<String>, out: &mut Vec<String>) {
+            match node {
+                serde_yaml::Value::Mapping(mapping) => {
+                    for (key, value) in mapping {
+                        let Some(key) = key.as_str() else {
+                            continue;
+                        };
+                        if key == "containers" && value.as_sequence().is_some() {
+                            out.push(path.join("."));
+                        }
+                        path.push(key.to_string());
+                        walk(value, path, out);
+                        path.pop();
+                    }
+                }
+                serde_yaml::Value::Sequence(items) => {
+                    for item in items {
+                        walk(item, path, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(doc, &mut Vec::new(), &mut out);
+        out
+    }
+
+    /// Every workload shape the delivered manifests carry has a row in
+    /// [`WORKLOAD_KINDS`], and that row sends a reader to the path the document
+    /// actually keeps its pod template at.
+    ///
+    /// This is the criterion the config reading was missing. The reading was
+    /// built from a hand-kept list of two kinds, so a workload of a third kind
+    /// that reads the same document was not read at all -- and because the
+    /// reading is also what answers "nobody reads this configuration", the
+    /// narrow list did not look like a gap, it looked like a rollout error on
+    /// the other side.
+    #[test]
+    fn the_workload_table_covers_every_shape_the_manifests_deliver() {
+        let root = repo_root();
+        let mut seen: Vec<(String, String)> = Vec::new();
+
+        for rel in DELIVERABLE_MANIFEST_TREES {
+            let dir = root.join(rel);
+            let set = if dir.join(KUSTOMIZATION_FILE).exists() {
+                kustomization_set_from_disk(&dir)
+            } else {
+                flat_set_from_disk(&dir)
+            };
+            for (name, text) in &set.files {
+                for doc in split_docs(text, name).unwrap_or_else(|e| panic!("{rel}/{name}: {e}")) {
+                    let Some(kind) = doc.get("kind").and_then(|k| k.as_str()) else {
+                        continue;
+                    };
+                    for path in container_list_paths(&doc) {
+                        let entry = workload_kind(kind).unwrap_or_else(|| {
+                            panic!(
+                                "{rel}/{name}: {kind} carries a container list at {path} and no \
+                                 row of WORKLOAD_KINDS addresses it; every live reading taken \
+                                 through that table is blind to this object"
+                            )
+                        });
+                        assert_eq!(
+                            entry.pod_template, path,
+                            "{rel}/{name}: {kind} keeps its pod template at {path}, and the row \
+                             for it sends readers to {}",
+                            entry.pod_template
+                        );
+                        seen.push((kind.to_string(), path));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            !seen.is_empty(),
+            "no workload was read from the trees at all"
+        );
+        let mut kinds: Vec<&str> = seen.iter().map(|(k, _)| k.as_str()).collect();
+        kinds.sort();
+        kinds.dedup();
+        let mut paths: Vec<&str> = seen.iter().map(|(_, p)| p.as_str()).collect();
+        paths.sort();
+        paths.dedup();
+        assert!(
+            kinds.len() > 1 && paths.len() > 1,
+            "the walk saw {kinds:?} at {paths:?}: one kind at one path would pass against a \
+             single hardcoded path and prove nothing about the others"
+        );
+    }
+
+    /// The restart patch addresses the pod template of every kind that gets
+    /// rolled, and the address is read out of the body this crate sends rather
+    /// than written next to it.
+    ///
+    /// The body is a fixed document -- `spec.template.metadata.annotations` --
+    /// shared with the other deploy path, so a kind added to the roll face whose
+    /// template sits somewhere else would be patched at a path that does not
+    /// exist on it: a merge patch creates the field, the workload keeps serving
+    /// the configuration it read at startup, and the record says it was rolled.
+    #[test]
+    fn the_restart_patch_addresses_the_template_of_every_kind_it_can_roll() {
+        let body: serde_json::Value =
+            serde_json::from_str(&cog_core::config_sections::restart_patch_body("1700000000"))
+                .expect("the restart body is a JSON document");
+        let mut node = &body;
+        let mut addressed: Vec<&str> = Vec::new();
+        while let Some((key, value)) = node.as_object().and_then(|m| m.iter().next()) {
+            if key == "annotations" {
+                break;
+            }
+            addressed.push(key);
+            node = value;
+        }
+        let addressed = addressed.join(".");
+        assert_eq!(
+            addressed, "spec.template.metadata",
+            "the body these deploy paths send was written for a different shape; this criterion \
+             is reading the wrong address"
+        );
+        let template = addressed
+            .strip_suffix(".metadata")
+            .expect("the address ends at the metadata of a template");
+
+        let mut rolled = 0;
+        for entry in &WORKLOAD_KINDS {
+            if !entry.long_lived_pods {
+                continue;
+            }
+            rolled += 1;
+            assert_eq!(
+                entry.pod_template,
+                format!("{template}.spec"),
+                "{} is rolled for a config change, and the patch it would receive lands at \
+                 {template}, not at its pod template",
+                entry.kind
+            );
+        }
+        assert!(rolled > 0, "no kind is rolled, so this compares nothing");
+    }
+
+    /// The read face covers every kind the table holds, and reads each one at
+    /// its own template. The roll face is narrower -- a kind whose pods are
+    /// created per run has nothing to restart -- and it is narrowed by that
+    /// property, not by leaving the kind out of the reading.
+    ///
+    /// Both halves are read off the commands the deployer issues, because the
+    /// distinction is not visible in the source alone: a kind left out of the
+    /// reading and a kind skipped on the roll look the same in the log line
+    /// that reports what was done.
+    #[tokio::test]
+    async fn the_reading_covers_every_kind_and_the_roll_only_the_long_lived_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let log = dir.join("kubectl.log");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  *"get deployment"*"configMapRef"*) echo "app-deploy|cogneva-json|" ;;
+  *"get statefulset"*"configMapRef"*) echo "app-sts|cogneva-json|" ;;
+  *"get daemonset"*"configMapRef"*) echo "app-ds|cogneva-json|" ;;
+  *"get cronjob"*"configMapRef"*) echo "app-cron|cogneva-json|" ;;
+  *"patch "*)
+    echo "patched $*" ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display()
+        );
+        write_fake_bin(&dir, "fake-kubectl", &script);
+        let executor = RolloutExecutor::new(
+            dir.join("fake-kubectl").to_string_lossy().to_string(),
+            "cogneva",
+            1,
+            1,
+            60,
+            900,
+        );
+
+        // No reading on either side of the apply: every consumer of every
+        // document it reads is a consumer this call has to decide about, which
+        // is the widest this decision ever gets.
+        let mut rolled = executor
+            .roll_config_change_consumers(None, None)
+            .await
+            .expect("the roll decides for itself and does not fail on a cronjob");
+        rolled.sort();
+        assert_eq!(
+            rolled,
+            vec![
+                "app-deploy".to_string(),
+                "app-ds".to_string(),
+                "app-sts".to_string()
+            ],
+            "a consumer whose pods are created per run reads the new document on its next run \
+             and must not be stamped; every other one has to be"
+        );
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        for entry in &WORKLOAD_KINDS {
+            let read = format!("get {} -o jsonpath=", entry.resource);
+            assert!(
+                calls.contains(&read),
+                "{} is in the table yet nothing read it: {calls}",
+                entry.kind
+            );
+            assert!(
+                calls.contains(&format!("{read}{{range .items[*]}}"))
+                    && calls.contains(&format!(".{}", entry.pod_template)),
+                "{} was read, but not at its own pod template: {calls}",
+                entry.kind
+            );
+        }
+        assert!(
+            calls.contains("patch deployment app-deploy")
+                && !calls.contains("patch cronjob app-cron"),
+            "the roll has to address the kind the reading reported: {calls}"
         );
     }
 
