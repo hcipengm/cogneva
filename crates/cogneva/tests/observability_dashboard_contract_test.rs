@@ -14,6 +14,8 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+#[path = "common/closed_set.rs"]
+mod closed_set;
 #[path = "common/producer.rs"]
 mod producer;
 #[path = "common/promql.rs"]
@@ -506,6 +508,22 @@ fn every_series_the_table_claims_is_produced_is_named_by_its_producer() {
         missing.is_empty(),
         "PRODUCED 表登记的产出点已经不存在，面板上的这个序列会永远画不出东西:\n{}",
         missing.join("\n")
+    );
+}
+
+/// The same hole the alert-rule contract has, on the same two tables: this
+/// file's producer check walks PRODUCED only, so a series filed as foreign
+/// stops being looked for in its producer and no other check asks either. See
+/// `common/closed_set.rs` for why the closed set is the reading that decides
+/// it, and why the reverse direction cannot be decided by text.
+#[test]
+fn no_foreign_name_is_one_the_closed_set_publishes() {
+    let filed_here = closed_set::published_by_this_build(FOREIGN);
+
+    assert!(
+        filed_here.is_empty(),
+        "这些名字被登记成外来序列，却是本仓库闭集里的产出名——登记成外来它就不再被查产出点:\n{}",
+        filed_here.join("\n")
     );
 }
 

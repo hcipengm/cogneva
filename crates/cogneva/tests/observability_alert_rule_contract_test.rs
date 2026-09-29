@@ -19,6 +19,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+#[path = "common/closed_set.rs"]
+mod closed_set;
 #[path = "common/producer.rs"]
 mod producer;
 #[path = "common/promql.rs"]
@@ -659,28 +661,18 @@ fn every_series_recorded_as_produced_is_still_published_there() {
 /// something this workspace publishes.
 ///
 /// The producer-existence check above only walks PRODUCED, so filing a produced
-/// series under FOREIGN retires that check for it in silence: the name stops
-/// being looked for in its source file, `every_series_an_alert_rule_reads_is_one_something_produces`
+/// series under FOREIGN retires that check in silence: the name stops being
+/// looked for in its source file, `every_series_an_alert_rule_reads_is_one_something_produces`
 /// keeps accepting any rule that reads it, and if the producer is deleted later
-/// nothing goes red. Two tables that both accept a name, one of which is never
-/// cross-checked against a producer, is the same shape as a hand list beside a
-/// generated set.
+/// nothing goes red.
 ///
-/// The reading taken here is the closed set, because it is the one list of
-/// "series this build publishes" the compiler keeps honest: a closed-set name
-/// under FOREIGN is a contradiction on its face. A tree-wide producer search is
-/// not an alternative — foreign names are short and generic (`up`,
-/// `kube_pod_owner`), so a text match on them counts prose, and the helper the
-/// PRODUCED side uses states that ceiling already. It cannot be lowered by
-/// scanning harder, which is why this direction is checked by identity instead.
+/// The reading lives in `common/closed_set.rs` rather than here: the dashboard
+/// contract sorts its series into the same two tables and has the same hole, so
+/// the criterion is one function with two call sites instead of two copies that
+/// drift apart.
 #[test]
 fn no_foreign_name_is_one_the_closed_set_publishes() {
-    let foreign: BTreeSet<&str> = FOREIGN.iter().map(|(n, _)| *n).collect();
-    let filed_here: Vec<&str> = cog_core::metric_names::ALL
-        .iter()
-        .map(|name| name.as_str())
-        .filter(|name| foreign.contains(name))
-        .collect();
+    let filed_here = closed_set::published_by_this_build(FOREIGN);
 
     assert!(
         filed_here.is_empty(),
