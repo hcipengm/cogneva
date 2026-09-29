@@ -86,11 +86,17 @@ fn signal_death_note(sig: i32, facts: &super::cgroup::MemoryFacts, oom: bool) ->
 /// task worktree); `cargo_target` is injected as `CARGO_TARGET_DIR` so trees
 /// share one externalized build cache. Both are `None` for embedded usage,
 /// preserving process-default behaviour.
+///
+/// `hold` is kept until the child has exited, which is not the same moment the
+/// caller stops reading: a client that disconnects mid-command leaves it
+/// running, and the executor's claim on the worktree has to last that long or
+/// the tree could be reclaimed underneath it.
 pub(crate) fn spawn_command(
     command: &str,
     timeout: std::time::Duration,
     workdir: Option<&Path>,
     cargo_target: Option<&Path>,
+    hold: Option<crate::workdir::WorktreeUse>,
 ) -> SFResult<tokio::sync::mpsc::Receiver<CommandEvent>> {
     let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c")
@@ -115,6 +121,8 @@ pub(crate) fn spawn_command(
     let (tx, rx) = tokio::sync::mpsc::channel::<CommandEvent>(64);
 
     tokio::spawn(async move {
+        // Dropped when this task ends, i.e. after the child was waited for.
+        let _hold = hold;
         use tokio::io::AsyncReadExt;
         let tx_out = tx.clone();
         let tx_err = tx.clone();
@@ -252,7 +260,7 @@ impl SandboxBackend for LocalExecutor {
         match &req.payload {
             SandboxPayload::Command { command } => {
                 tracing::warn!(command = %command, "local command execution (no remote executor configured)");
-                let rx = spawn_command(command, req.timeout, None, None)?;
+                let rx = spawn_command(command, req.timeout, None, None, None)?;
                 Ok(Box::pin(futures::stream::unfold(rx, |mut rx| async move {
                     rx.recv().await.map(|event| (event, rx))
                 })))

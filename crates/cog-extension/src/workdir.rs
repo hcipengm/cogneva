@@ -11,6 +11,16 @@
 //! process restart reconciles state from `git worktree list` plus the sidecar
 //! directory instead of trusting an in-memory index.
 //!
+//! One fact the volume cannot hold, and so the one thing that lives in this
+//! process: a command running in a task's tree claims it ([`WorktreeUse`]) for
+//! as long as the child may live. Ranking by `last_used_unix` alone cannot tell
+//! a tree with a command running in it from an idle one — the sidecar stops
+//! advancing the moment the command starts — so the LRU cap could delete the
+//! tree out from under a build that then fails on files disappearing and gets
+//! the blame for it. The claim is deliberately process-local: the child dies
+//! with this process, so a restart cannot leave a stale claim behind, and
+//! everything a restart must reconcile is still on the volume.
+//!
 //! The bare-repo + worktree + out-of-tree sidecar + external target dir +
 //! stale-lock self-heal pattern is deliberately copied from the evolution
 //! WorkspaceManager: cog-extension must not depend on upper crates, and only
@@ -194,6 +204,11 @@ pub struct WorkdirMetrics {
     registry: Registry,
     workspaces: Gauge,
     gc_reclaimed: Counter,
+    /// Cap passes that could not be met without deleting a tree a command is
+    /// running in. A pass that defers is otherwise invisible: the cap holding
+    /// and the cap being unreachable both read as "nothing happened", and only
+    /// this series says which trees are keeping the count above the cap.
+    cap_deferred: Counter,
     fetch_failures: Counter,
     unscoped_requests: Counter,
     errors: CounterVec,
@@ -216,6 +231,10 @@ impl WorkdirMetrics {
         let gc_reclaimed = Counter::new(
             "sandbox_workspace_gc_reclaimed_total",
             "Task worktrees removed by TTL/LRU garbage collection",
+        )?;
+        let cap_deferred = Counter::new(
+            "sandbox_workspace_cap_deferred_total",
+            "Task worktrees kept above the LRU cap because a command was running in them",
         )?;
         let fetch_failures = Counter::new(
             "sandbox_workspace_fetch_failures_total",
@@ -253,6 +272,7 @@ impl WorkdirMetrics {
         )?;
         registry.register(Box::new(workspaces.clone()))?;
         registry.register(Box::new(gc_reclaimed.clone()))?;
+        registry.register(Box::new(cap_deferred.clone()))?;
         registry.register(Box::new(fetch_failures.clone()))?;
         registry.register(Box::new(unscoped_requests.clone()))?;
         registry.register(Box::new(errors.clone()))?;
@@ -263,6 +283,7 @@ impl WorkdirMetrics {
             registry,
             workspaces,
             gc_reclaimed,
+            cap_deferred,
             fetch_failures,
             unscoped_requests,
             errors,
@@ -293,6 +314,51 @@ impl WorkdirMetrics {
     }
 }
 
+/// A command's claim on a task worktree.
+///
+/// Held for as long as the child process may live, not for as long as the
+/// caller's response stream: a command keeps running after its client
+/// disconnects, so a claim that ended with the stream would reopen exactly the
+/// window it exists to close. The executor hands the claim to the task that
+/// drives the child.
+///
+/// Nothing about it is written down, and that is the point: the child dies with
+/// this process, so a restart cannot leave a claim standing, while everything a
+/// restart must reconcile — the tree, its sidecar — is still on the volume.
+pub struct WorktreeUse {
+    router: Arc<WorkdirRouter>,
+    task_id: String,
+}
+
+impl Drop for WorktreeUse {
+    fn drop(&mut self) {
+        self.router.release(self.task_id.as_str());
+        // The sidecar is what the next cap pass ranks this tree by, and the end
+        // of a claim is the moment the tree was last used. Without this refresh
+        // a build that just ran for ten minutes reads as the oldest tree on the
+        // volume the moment it finishes — exactly when its artifacts are about
+        // to be read — and the next pass deletes it.
+        //
+        // No runtime here means the process is shutting down; the sidecar then
+        // keeps its older stamp, which is what the next process adopts.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let router = Arc::clone(&self.router);
+            let task_id = self.task_id.clone();
+            handle.spawn(async move { router.touch(&task_id).await });
+        }
+    }
+}
+
+/// A panic elsewhere while the claim map was held must not turn every later
+/// reclamation into a panic of its own: the map holds counts of running
+/// commands, not data that can be left half-written, so a poisoned lock is read
+/// through rather than refused.
+fn lock_claims(
+    claims: &std::sync::Mutex<std::collections::HashMap<String, usize>>,
+) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, usize>> {
+    claims.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub struct WorkdirRouter {
     cfg: WorkdirConfig,
     meta_dir: PathBuf,
@@ -300,6 +366,10 @@ pub struct WorkdirRouter {
     /// never run `worktree add` / `worktree remove` against the same state.
     /// The hot path for an existing tree takes no lock.
     create_lock: Mutex<()>,
+    /// Task ids with a command running in their tree right now, and how many.
+    /// Read by the reclamation rules, which must not delete a tree in use; see
+    /// [`WorktreeUse`] for why this is process state rather than a sidecar.
+    in_use: std::sync::Mutex<std::collections::HashMap<String, usize>>,
     metrics: WorkdirMetrics,
     /// One handle per declared claim-backed volume. Built here so the claim and
     /// the directory it is measured against are fixed together for the life of
@@ -336,6 +406,7 @@ impl WorkdirRouter {
             cfg,
             meta_dir,
             create_lock: Mutex::new(()),
+            in_use: std::sync::Mutex::new(std::collections::HashMap::new()),
             metrics,
             footprints,
         }))
@@ -379,11 +450,62 @@ impl WorkdirRouter {
         &self.metrics
     }
 
-    /// Resolve the working directory for a task id, lazily creating the tree
-    /// on first sight. Invalid ids and add failures surface as errors instead
-    /// of silently collapsing onto a shared directory.
-    pub async fn route(&self, task_id: &str) -> SFResult<PathBuf> {
+    /// Claim a tree for a command about to run in it. Counted, because two
+    /// commands of one task may overlap and the tree stays in use until the last
+    /// of them is gone.
+    fn claim(self: &Arc<Self>, task_id: &str) -> WorktreeUse {
+        {
+            let mut claims = lock_claims(&self.in_use);
+            *claims.entry(task_id.to_string()).or_insert(0) += 1;
+        }
+        WorktreeUse {
+            router: Arc::clone(self),
+            task_id: task_id.to_string(),
+        }
+    }
+
+    fn release(&self, task_id: &str) {
+        let mut claims = lock_claims(&self.in_use);
+        if let Some(n) = claims.get_mut(task_id) {
+            *n -= 1;
+            if *n == 0 {
+                claims.remove(task_id);
+            }
+        }
+    }
+
+    /// Commands running in this tree right now. `own_claim` excludes the claim
+    /// the asking caller just took itself, which is not evidence of another
+    /// command and must not make its own rebuild impossible.
+    fn commands_running(&self, task_id: &str, own_claim: bool) -> usize {
+        let claims = lock_claims(&self.in_use);
+        let n = claims.get(task_id).copied().unwrap_or(0);
+        if own_claim {
+            n.saturating_sub(1)
+        } else {
+            n
+        }
+    }
+
+    /// Resolve the working directory for a task id and claim it for the command
+    /// about to run there, lazily creating the tree on first sight.
+    ///
+    /// The claim is taken before the first filesystem call: a reclamation pass
+    /// that has already listed this tree must still see it in use when it
+    /// reaches its own decision, and the only moment a claim can protect a tree
+    /// is before anything starts using it. Invalid ids and add failures surface
+    /// as errors instead of silently collapsing onto a shared directory.
+    pub async fn route(self: &Arc<Self>, task_id: &str) -> SFResult<(PathBuf, WorktreeUse)> {
         validate_task_id(task_id)?;
+        let use_guard = self.claim(task_id);
+        let path = self.route_validated(task_id, true).await?;
+        Ok((path, use_guard))
+    }
+
+    /// The tree on its own, without a claim: a caller that will run something in
+    /// it must go through [`Self::route`], which is the only thing that keeps a
+    /// reclamation pass from deleting it while the command runs.
+    async fn route_validated(&self, task_id: &str, own_claim: bool) -> SFResult<PathBuf> {
         let path = self.cfg.workspaces_root.join(task_id);
         if self.is_healthy(&path).await {
             self.touch(task_id).await;
@@ -395,6 +517,14 @@ impl WorkdirRouter {
             return Ok(path);
         }
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            if self.commands_running(task_id, own_claim) > 0 {
+                // Rebuilding means removing first, and a command is running in
+                // this tree: the caller can come back, the command cannot.
+                return Err(SFError::IO(format!(
+                    "task worktree for {task_id} is in use by a running command and is not a \
+                     healthy worktree; refusing to rebuild it from under that command"
+                )));
+            }
             warn!(task_id = %task_id, path = %path.display(),
                 "task path exists but is not a healthy worktree; rebuilding");
             self.force_remove(&path).await;
@@ -494,6 +624,12 @@ impl WorkdirRouter {
         let trees = self.list_task_trees().await;
         let mut reclaimed = 0u64;
         for (id, path) in trees.iter() {
+            // Asked per tree at the decision rather than from a snapshot taken
+            // when the pass started: a command that started while this pass was
+            // walking must not lose the tree it is running in.
+            if self.commands_running(id, false) > 0 {
+                continue;
+            }
             let reap = match self.read_meta(id) {
                 Some(meta) => now.saturating_sub(meta.last_used_unix) >= ttl,
                 None => {
@@ -526,8 +662,10 @@ impl WorkdirRouter {
     }
 
     /// Remove least-recently-used trees until at most `max - incoming` trees
-    /// remain. Caller must hold [`Self::create_lock`] semantics (route and
-    /// gc_once take it; this fn assumes exclusion).
+    /// remain. Trees with a command running in them are left alone, so the cap
+    /// is a target this pass may not reach; what it could not reach is counted
+    /// rather than silently dropped. Caller must hold [`Self::create_lock`]
+    /// semantics (route and gc_once take it; this fn assumes exclusion).
     async fn enforce_cap(&self, incoming: usize) {
         let max = self.cfg.max_workspaces;
         let mut trees = self.list_task_trees().await;
@@ -540,15 +678,33 @@ impl WorkdirRouter {
                 .unwrap_or(i64::MIN)
         });
         let mut remaining = trees.len() + incoming;
+        let mut deferred = 0u64;
         for (id, path) in trees {
             if remaining <= max {
                 break;
+            }
+            if self.commands_running(&id, false) > 0 {
+                // Deleting this would take the tree out from under a command
+                // that keeps running with its files vanishing beneath it, and
+                // the failure would be read as the command's own. Defer
+                // instead — and say so, because a cap that is quietly not met
+                // reads exactly like a cap that was never reached.
+                deferred += 1;
+                continue;
             }
             warn!(task_id = %id, cap = max, "reclaiming task worktree (LRU cap)");
             self.force_remove(&path).await;
             self.remove_meta(&id);
             self.metrics.gc_reclaimed.inc();
             remaining -= 1;
+        }
+        if deferred > 0 {
+            self.metrics.cap_deferred.inc_by(deferred as f64);
+            warn!(
+                deferred,
+                cap = max,
+                "task worktree cap not met: the trees left to reclaim have commands running in them"
+            );
         }
     }
 
@@ -1040,8 +1196,11 @@ pub fn anchor_path(base: Option<&Path>, path: &str) -> PathBuf {
     }
 }
 
+/// Visible to the crate because the executor server has to drive a real router:
+/// whether a running command claims its tree is decided there, and a claim that
+/// is never taken looks exactly like one that is.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1359,7 +1518,7 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    fn seed_bare(root: &Path) -> PathBuf {
+    pub(crate) fn seed_bare(root: &Path) -> PathBuf {
         let work = root.join("seed");
         std::fs::create_dir_all(&work).unwrap();
         git(&["init", "-q", "-b", "main"], &work);
@@ -1378,7 +1537,12 @@ mod tests {
         bare
     }
 
-    fn router(root: &Path, bare: &Path, max: usize, ttl: Duration) -> Arc<WorkdirRouter> {
+    pub(crate) fn router(
+        root: &Path,
+        bare: &Path,
+        max: usize,
+        ttl: Duration,
+    ) -> Arc<WorkdirRouter> {
         router_with_mirrors(root, bare, max, ttl, Vec::new())
     }
 
@@ -1472,17 +1636,17 @@ mod tests {
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
 
-        let path = r.route("task-1").await.unwrap();
+        let (path, _) = r.route("task-1").await.unwrap();
         assert_eq!(path, tmp.path().join("workspaces").join("task-1"));
         assert!(path.join("README").exists());
         assert!(tmp.path().join("workspaces/.meta/task-1.json").exists());
 
-        let again = r.route("task-1").await.unwrap();
+        let (again, _) = r.route("task-1").await.unwrap();
         assert_eq!(again, path);
         assert_eq!(r.list_task_trees().await.len(), 1);
     }
 
-    const DEFAULT_TTL_SECS_FALLBACK: Duration = Duration::from_secs(21600);
+    pub(crate) const DEFAULT_TTL_SECS_FALLBACK: Duration = Duration::from_secs(21600);
 
     #[tokio::test]
     async fn tasks_are_isolated_and_keep_their_own_files() {
@@ -1490,8 +1654,8 @@ mod tests {
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
 
-        let a = r.route("task-a").await.unwrap();
-        let b = r.route("task-b").await.unwrap();
+        let (a, _) = r.route("task-a").await.unwrap();
+        let (b, _) = r.route("task-b").await.unwrap();
         std::fs::write(a.join("out.txt"), "from-a").unwrap();
         std::fs::write(b.join("out.txt"), "from-b").unwrap();
 
@@ -1521,7 +1685,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 8, Duration::ZERO);
-        let path = r.route("stale-task").await.unwrap();
+        // No command is running, so the claim `route` returns is dropped at
+        // once — an idle tree, which is the only kind this reaps.
+        let (path, _) = r.route("stale-task").await.unwrap();
         let meta = tmp.path().join("workspaces/.meta/stale-task.json");
         assert!(meta.exists());
 
@@ -1550,12 +1716,137 @@ mod tests {
         assert!(!ids.contains(&"old".to_string()));
     }
 
+    /// A tree with a command running in it is in use, and the cap's own policy
+    /// is least-recently-*used*: the oldest tree on the volume is not a
+    /// candidate while its command runs. Deferring is counted, because a cap
+    /// that could not be met and a cap that was never reached read the same.
+    #[tokio::test]
+    async fn lru_cap_defers_instead_of_deleting_a_tree_in_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router(tmp.path(), &bare, 2, DEFAULT_TTL_SECS_FALLBACK);
+        let (running, in_use) = r.route("running").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        r.route("idle").await.unwrap();
+
+        // The oldest tree is the one with the command in it, so the cap takes
+        // the next oldest instead of the tree under the command.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        r.route("newest").await.unwrap();
+
+        let ids: Vec<String> = r
+            .list_task_trees()
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(running.exists(), "the tree a command runs in must survive");
+        assert!(ids.contains(&"running".to_string()), "{ids:?}");
+        assert!(!ids.contains(&"idle".to_string()), "{ids:?}");
+        assert_eq!(
+            r.metrics.cap_deferred.get(),
+            1.0,
+            "a cap that could not be met has to be readable: {ids:?}"
+        );
+
+        // Once the command is over the tree is an ordinary tree again.
+        drop(in_use);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        r.route("later").await.unwrap();
+        assert_eq!(r.list_task_trees().await.len(), 2);
+        assert_eq!(
+            r.metrics.cap_deferred.get(),
+            1.0,
+            "a finished command leaves nothing to defer"
+        );
+    }
+
+    /// The TTL rule asks the same question as the cap: a tree idle past the TTL
+    /// is not idle if a command is running in it.
+    #[tokio::test]
+    async fn ttl_reaps_idle_trees_but_not_one_in_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router(tmp.path(), &bare, 8, Duration::ZERO);
+        let (running, _in_use) = r.route("running").await.unwrap();
+        let (idle, _) = r.route("idle").await.unwrap();
+
+        assert_eq!(
+            r.gc_once().await.unwrap(),
+            1,
+            "the idle tree is the one the TTL rule reaps"
+        );
+        assert!(
+            running.exists(),
+            "a tree with a command in it is not idle, whatever its stamp says"
+        );
+        assert!(!idle.exists(), "an idle tree past the TTL is reaped");
+    }
+
+    /// A command ending is the tree's last use, and the sidecar is what the next
+    /// cap pass ranks it by. Without that stamp a build that just ran for ten
+    /// minutes reads as the oldest tree on the volume the moment it finishes —
+    /// exactly when its artifacts are about to be read.
+    #[tokio::test]
+    async fn a_command_ending_stamps_the_tree_as_last_used() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
+        let (_, in_use) = r.route("built").await.unwrap();
+        let before = r.read_meta("built").unwrap().last_used_unix;
+
+        // The stamp has second granularity, so a command has to outlive the
+        // second it started in for the difference to exist at all.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        drop(in_use);
+
+        // The stamp is written by a task of its own, so it is waited for rather
+        // than assumed: the claim is that it happens, not that it happens by
+        // some particular instant.
+        let mut after = before;
+        for _ in 0..40 {
+            after = r.read_meta("built").unwrap().last_used_unix;
+            if after > before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            after > before,
+            "the end of a command must be stamped on the sidecar: {before} -> {after}"
+        );
+    }
+
+    /// Rebuilding a tree means removing it first. A tree that stopped looking
+    /// healthy *and* has a command running in it is the one case where the
+    /// caller has to come back: the command cannot.
+    #[tokio::test]
+    async fn a_tree_in_use_is_not_rebuilt_under_its_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
+        let (path, _in_use) = r.route("busy").await.unwrap();
+
+        // The tree stops looking like a worktree while a command runs in it.
+        std::fs::remove_file(path.join(".git")).unwrap();
+
+        let err = match r.route("busy").await {
+            Ok(_) => panic!("rebuilding a tree in use must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("in use"), "{err}");
+        assert!(
+            path.exists(),
+            "the tree a command runs in is not removed and rebuilt"
+        );
+    }
+
     #[tokio::test]
     async fn restart_reconciles_trees_and_sidecars() {
         let tmp = tempfile::tempdir().unwrap();
         let bare = seed_bare(tmp.path());
         let r1 = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
-        let path = r1.route("task-survive").await.unwrap();
+        let (path, _) = r1.route("task-survive").await.unwrap();
 
         // Simulate a lost sidecar (tree still registered): recover adopts it.
         std::fs::remove_file(tmp.path().join("workspaces/.meta/task-survive.json")).unwrap();
@@ -1568,7 +1859,7 @@ mod tests {
         // A brand-new router process over the same PVC routes to the same tree.
         let r2 = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
         r2.recover().await.unwrap();
-        assert_eq!(r2.route("task-survive").await.unwrap(), path);
+        assert_eq!(r2.route("task-survive").await.unwrap().0, path);
 
         // Orphan sidecar without a tree is dropped during recovery.
         std::fs::write(tmp.path().join("workspaces/.meta/ghost.json"), "{}").unwrap();
@@ -1581,7 +1872,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bare = seed_bare(tmp.path());
         let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
-        let path = r.route("lock-task").await.unwrap();
+        let (path, _) = r.route("lock-task").await.unwrap();
         let gitdir = PathBuf::from(git_out(&path, &["rev-parse", "--absolute-git-dir"]));
         let lock = gitdir.join("index.lock");
         std::fs::write(&lock, "").unwrap();

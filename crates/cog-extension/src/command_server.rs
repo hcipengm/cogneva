@@ -23,7 +23,7 @@ use serde::Deserialize;
 use tracing::warn;
 
 use crate::hostdocs::{HostDocOp, HostDocPlan, HostDocs};
-use crate::workdir::{self, WorkdirRouter};
+use crate::workdir::{self, WorkdirRouter, WorktreeUse};
 
 #[derive(Clone)]
 struct AppState {
@@ -99,13 +99,21 @@ fn single_shot(result: std::io::Result<String>) -> tokio::sync::mpsc::Receiver<C
 async fn resolve_workdir(
     state: &AppState,
     task_id: Option<&str>,
-) -> Result<(Option<PathBuf>, Option<PathBuf>), Box<Response>> {
+) -> Result<(Option<PathBuf>, Option<PathBuf>, Option<WorktreeUse>), Box<Response>> {
     let Some(router) = state.workdir.as_ref() else {
-        return Ok((None, None));
+        return Ok((None, None, None));
     };
     match task_id.filter(|id| !id.trim().is_empty()) {
+        // The claim travels with the request and is handed to whatever runs the
+        // command: the tree is in use from here until that command is over, and
+        // a reclamation pass that only knows `last_used_unix` cannot tell the
+        // difference on its own.
         Some(id) => match router.route(id).await {
-            Ok(dir) => Ok((Some(dir), Some(router.target_dir().to_path_buf()))),
+            Ok((dir, claim)) => Ok((
+                Some(dir),
+                Some(router.target_dir().to_path_buf()),
+                Some(claim),
+            )),
             Err(e) => {
                 router.metrics().inc_error("route");
                 Err(Box::new(error_response(
@@ -120,7 +128,7 @@ async fn resolve_workdir(
             // any task tree and is counted for observability.
             router.metrics().inc_unscoped();
             tracing::warn!("sandbox request without task id; running outside per-task worktree");
-            Ok((None, Some(router.target_dir().to_path_buf())))
+            Ok((None, Some(router.target_dir().to_path_buf()), None))
         }
     }
 }
@@ -134,10 +142,11 @@ async fn execute_handler(
         .map(std::time::Duration::from_millis)
         .unwrap_or(DEFAULT_TIMEOUT)
         .min(MAX_TIMEOUT);
-    let (workdir, cargo_target) = match resolve_workdir(&state, req.task_id.as_deref()).await {
-        Ok(resolved) => resolved,
-        Err(resp) => return *resp,
-    };
+    let (workdir, cargo_target, worktree_claim) =
+        match resolve_workdir(&state, req.task_id.as_deref()).await {
+            Ok(resolved) => resolved,
+            Err(resp) => return *resp,
+        };
     match req.payload {
         SandboxPayload::Command { ref command } => {
             if command.trim().is_empty() {
@@ -155,6 +164,7 @@ async fn execute_handler(
                 timeout,
                 workdir.as_deref(),
                 cargo_target.as_deref(),
+                worktree_claim,
             ) {
                 Ok(rx) => stream_response(rx),
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -650,6 +660,96 @@ mod tests {
         assert_eq!(stdout.trim(), "OUT");
         assert_eq!(stderr.trim(), "err");
         assert_eq!(exit, Some(7));
+    }
+
+    /// Whether a running command claims its tree is decided at this seam —
+    /// between routing and execution — and a claim that is never taken looks
+    /// exactly like one that is. So the seam is driven end to end: a real
+    /// router, a command that outlives the assertions, and the LRU cap asked to
+    /// reclaim while it runs.
+    #[tokio::test]
+    async fn a_running_command_holds_its_task_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = crate::workdir::tests::seed_bare(tmp.path());
+        let workdir = crate::workdir::tests::router(
+            tmp.path(),
+            &bare,
+            2,
+            std::time::Duration::from_secs(21600),
+        );
+        let tree = tmp.path().join("workspaces").join("held");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serving = workdir.clone();
+        tokio::spawn(async move {
+            axum::serve(listener, app_router_with_workdir(serving))
+                .await
+                .unwrap();
+        });
+
+        // The marker is written from inside the tree, so its presence is proof
+        // that a command is running there; the claim is taken before the child
+        // is even spawned, so it is in place by then.
+        let running = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("http://{addr}/execute"))
+                .json(&serde_json::json!({
+                    "payload": {"type": "command", "command": "touch started; sleep 3; echo done"},
+                    "task_id": "held",
+                }))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+        });
+        for _ in 0..100 {
+            if tree.join("started").exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(tree.join("started").exists(), "the command never started");
+
+        // Two more tasks against a cap of two: the cap has to take a tree, and
+        // the one with a command running in it is not a candidate.
+        workdir.route("second").await.unwrap();
+        workdir.route("third").await.unwrap();
+        assert!(
+            tree.join("started").exists(),
+            "the tree a command runs in was reclaimed underneath it"
+        );
+        let body = reqwest::Client::new()
+            .get(format!("http://{addr}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            body.contains("sandbox_workspace_cap_deferred_total 1"),
+            "the cap could not be met, and that reading has to reach the scrape surface: {body}"
+        );
+
+        // The command is over: the tree is an ordinary tree again.
+        let streamed = running.await.unwrap();
+        assert!(streamed.contains("done"), "{streamed}");
+        workdir.route("fourth").await.unwrap();
+        let body = reqwest::Client::new()
+            .get(format!("http://{addr}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            body.contains("sandbox_workspace_cap_deferred_total 1"),
+            "a finished command leaves nothing to defer: {body}"
+        );
     }
 
     #[tokio::test]
