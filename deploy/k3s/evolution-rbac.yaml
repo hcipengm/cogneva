@@ -42,6 +42,36 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+  # Governance drift reading: the deployer compares the ceilings the repository
+  # declares against the ones the cluster enforces, and the cluster side of that
+  # comparison is `get resourcequota -o json`. Read-only -- the ceiling itself is
+  # not delivered by this path (the install face applies it), so nothing here
+  # lets the loop write one.
+  - apiGroups: [""]
+    resources: ["resourcequotas"]
+    verbs: ["get", "list", "watch"]
+  # Rollback of a change deploy: `kubectl rollout undo` resolves the previous
+  # pod template through the deployment's ReplicaSets before it patches
+  # anything, so the apps rule above (which covers deployments) is not enough.
+  # Live reading without it: "failed to retrieve replica sets from deployment
+  # cogneva: replicasets.apps is forbidden". Read-only, and the same grant the
+  # app pod's gitops-puller Role carries for the same command.
+  #
+  # The deployer's own failure diagnosis reads the same resource (a label
+  # selector over the failing ReplicaSets), and that read is not only a report:
+  # `admission_rejection` decides from its rows whether a rollout was rejected
+  # by the API server. With no grant the sampling answers "empty", so the
+  # verdict reads "no admission rejection" for every rollout — a machine
+  # criterion answering from a permission error.
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list"]
+  # Failure diagnosis: the Warning events of the rollout window. Read-only;
+  # without it the diagnosis silently loses its one description of why a pod
+  # never became ready.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list"]
   # Mainline rollout Jobs: build side applies (create), queries status, and
   # deletes a finished job before redispatch when deployments were reverted by
   # an apply; the in-Job rollout reuses the same ServiceAccount.

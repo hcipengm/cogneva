@@ -6,7 +6,9 @@
 # 比什么：资源集合一个不少不多；每工作负载的 sa/automount/pod securityContext/
 # 整份卷声明；每容器的 args/端口(含协议)/挂载(含只读)/env(含取值来源)/
 # envFrom(含 optional 与 prefix)/命令正文/探针/资源声明/securityContext/workingDir；
-# Service 端口；治理对象与 PVC 的整份 spec；ConfigMap 的键与键值内的配置文档。
+# Service 端口；治理对象与 PVC 的整份 spec；ConfigMap 的键与键值内的配置文档；
+# Role/ClusterRole 的规则集合与 RoleBinding/ClusterRoleBinding 的 subjects+roleRef
+# （少一条授权就是生产里一条路径 Forbidden，多一条是扩权，两侧都可能不同）。
 # 判据面按「凡两侧都可能不同、且不同就改变运行时行为」取，不按「历史上错过什么」取
 # —— 只比错过的那几类，下一类漂移照样无声通过。
 #
@@ -178,6 +180,39 @@ def workload(doc):
     out['containers'] = conts
     return out
 
+def role_rules(doc):
+    """A Role as a comparable set of rules.
+
+    Authorization is a set, not a sequence: the order of rules, and the order of
+    apiGroups/resources/verbs inside one, carry no meaning -- a rule that grants
+    the same three verbs in another order is the same permission. What does
+    change behaviour is which grants exist: one missing verb turns a path
+    Forbidden in production while every other gate stays green (the governance
+    drift reading lost its cluster side exactly that way), and one extra verb is
+    a widened capability. Neither side's spelling is the judge here, so both are
+    normalized before they are compared."""
+    return sorted(
+        json.dumps(
+            {k: (sorted(v) if isinstance(v, list) else v) for k, v in r.items()},
+            sort_keys=True,
+            default=str,
+        )
+        for r in (doc.get('rules') or [])
+    )
+
+def binding_sig(doc):
+    """A binding's whole decision: who, and to what.
+
+    Subjects are a set (one subject listed twice is one subject), and roleRef is
+    the pair that actually selects the permissions. Comparing the subject list
+    alone would let a binding keep its subject while pointing at a different
+    Role."""
+    subjects = sorted(
+        json.dumps(s, sort_keys=True, default=str) for s in (doc.get('subjects') or [])
+    )
+    return json.dumps({'subjects': subjects, 'roleRef': doc.get('roleRef')},
+                      sort_keys=True, default=str)
+
 def svc(doc):
     s = doc['spec']
     return {'ports': sorted(f"{p.get('name','')}:{p['port']}->{p.get('targetPort','')}"
@@ -267,6 +302,18 @@ for name in sorted(set(k) & set(h)):
             errors.append(f"Service/{name[1]} port k3s-only: {x}")
         for x in sorted(set(ha['ports']) - set(ka['ports'])):
             errors.append(f"Service/{name[1]} port helm-only: {x}")
+    elif kind in ('Role', 'ClusterRole'):
+        # 权限面也在这里比：少一条授权就是生产里某条路径 Forbidden（治理面漂移
+        # 读数就这么瞎了），多一条是扩权。规则按集合比，不比字面顺序。
+        ka, ha = role_rules(k[name]), role_rules(h[name])
+        for x in sorted(set(ha) - set(ka)):
+            errors.append(f"{kind}/{name[1]} rule helm-only: {x}")
+        for x in sorted(set(ka) - set(ha)):
+            errors.append(f"{kind}/{name[1]} rule k3s-only: {x}")
+    elif kind in ('RoleBinding', 'ClusterRoleBinding'):
+        ka, ha = binding_sig(k[name]), binding_sig(h[name])
+        if ka != ha:
+            errors.append(f"{kind}/{name[1]}: k3s={ka} helm={ha}")
     elif kind in ('ResourceQuota', 'LimitRange', 'PersistentVolumeClaim'):
         # 治理对象与卷声明的数值是能力面的一部分（上限定小了扩容时新 Pod 会被
         # 直接拒绝，卷声明写小了应用会写爆也无人报错），所以整份 spec 逐字段

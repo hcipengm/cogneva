@@ -103,6 +103,29 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+  # 治理面漂移读数：把「仓库声明的上限」与「集群真正在执行的」比一比，而集群侧
+  # 就是 `get resourcequota -o json`。只读——上限自身不由部署面交付（见资源配额
+  # 清单，由安装面 apply），所以这里不授权写。
+  - apiGroups: [""]
+    resources: ["resourcequotas"]
+    verbs: ["get", "list", "watch"]
+  # 变更部署的回滚：`kubectl rollout undo` 在打补丁之前要先经 ReplicaSet 找到
+  # 上一版 pod 模板，所以上面那条覆盖 deployments 的授权不够。缺它时的现场读数：
+  # 「failed to retrieve replica sets from deployment cogneva: replicasets.apps is
+  # forbidden」。只读，与主应用 Pod 的 gitops-puller 为同一条命令授的权一致。
+  #
+  # 部署器自己的失败诊断读的是同一个资源（按标签选失败的那些 ReplicaSet），而那一读
+  # 不只是报告：`admission_rejection` 拿它的行判定这次滚动有没有被 API server 准入
+  # 拒绝。没授权时采样答「空」，于是每次滚动都读成「没有被拒」——一个机器判据在拿
+  # 权限错误当答案。
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list"]
+  # 失败诊断：滚动窗口里的 Warning 事件。只读；缺它诊断会静默丢掉"Pod 为什么一直
+  # 没就绪"的唯一描述。
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list"]
   # 主线滚动 Job：构建侧 apply(create) 派发、状态查询、Job 已完成但部署被
   # apply 打回时 delete 旧 Job 重新派发；Job 内滚动复用同一 SA。
   # cronjobs 同规则：滚动端 kubectl apply 渲染清单含备份 CronJob，apply 的
