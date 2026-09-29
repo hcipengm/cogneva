@@ -236,3 +236,92 @@ fn the_configured_scrape_set_asks_only_dimensions_that_exist() {
          a round asking for metrics that cannot exist: {unknown:?}"
     );
 }
+
+/// Every declaration the producers make is in the table above.
+///
+/// Each check above reads the table and then looks for what it names. That
+/// direction cannot see a declaration the table never named: a producer that
+/// starts declaring `DimensionSpec::bounded("D10")` has its metrics counted,
+/// exported to no endpoint and asked by nobody, and every check here stays
+/// green — the exact silence this file exists to catch. So this one reads the
+/// producers and looks for the table.
+///
+/// The scan is by path convention, `crates/*/src/observable.rs`, which is where
+/// every observable lives today and is what the table above already assumes.
+/// Two ceilings come with that: a declaration in a file outside that shape is
+/// not seen, and neither is one whose dimension is not a plain string literal
+/// at the call site.
+#[test]
+fn every_declared_dimension_is_recorded_in_the_table() {
+    let crates_dir = repo_root().join("crates");
+    let mut declared_in_source: Vec<(String, String, bool)> = Vec::new();
+    let mut scanned: Vec<String> = Vec::new();
+
+    for entry in std::fs::read_dir(&crates_dir).expect("crates/ is readable") {
+        let name = entry.expect("entry").file_name();
+        let rel = format!("crates/{}/src/observable.rs", name.to_string_lossy());
+        let path = repo_root().join(&rel);
+        if !path.is_file() {
+            continue;
+        }
+        scanned.push(rel.clone());
+
+        for line in read(&rel).lines() {
+            // A commented-out declaration is not one the build makes.
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            for (ctor, bounded) in [("::bounded(\"", true), ("::unbounded(\"", false)] {
+                for (at, _) in line.match_indices(ctor) {
+                    let start = at + ctor.len();
+                    let Some(end) = line[start..].find('"') else {
+                        continue;
+                    };
+                    declared_in_source.push((
+                        rel.clone(),
+                        line[start..start + end].to_string(),
+                        bounded,
+                    ));
+                }
+            }
+        }
+    }
+
+    // A scan that saw nothing would pass for the wrong reason, and would go on
+    // passing silently the day the convention moves.
+    assert!(
+        !declared_in_source.is_empty(),
+        "一个维度都没扫到：路径约定已经不是 observable 声明维度的位置了"
+    );
+    for (file, _) in PRODUCERS {
+        assert!(
+            scanned.iter().any(|seen| seen == file),
+            "表里登记的文件没有被扫到（{file}），这条判据看不到它的声明"
+        );
+    }
+
+    let mut problems: Vec<String> = Vec::new();
+    for (file, dim, bounded) in &declared_in_source {
+        let recorded = PRODUCERS
+            .iter()
+            .find(|(f, _)| f == file)
+            .and_then(|(_, dims)| dims.iter().find(|(d, _)| d == dim));
+        match recorded {
+            None => problems.push(format!(
+                "{file} 声明了 {dim}，表里没有它——它的指标会被计数、导出到没有任何端点"
+            )),
+            Some((_, table_bounded)) if table_bounded != bounded => problems.push(format!(
+                "{file}:{dim} 在源里是 {}, 表里登记的是 {}——两边必须一致，绑定属性决定抓取要不要问它",
+                if *bounded { "bounded" } else { "unbounded" },
+                if *table_bounded { "bounded" } else { "unbounded" }
+            )),
+            Some(_) => {}
+        }
+    }
+
+    assert!(
+        problems.is_empty(),
+        "产出方声明的维度没有全部登记进契约表:\n{}",
+        problems.join("\n")
+    );
+}
