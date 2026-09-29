@@ -1700,6 +1700,14 @@ struct MainlineState {
     /// 只按"我们自己重启过"按住：别的断源原因不归这一格管，也不该由它顺手承担。
     #[serde(default)]
     registry_restart_unix: Option<i64>,
+    /// 上一轮删了 tag、GC 却没发下去（重启失败，或进程在发出去之前就没了）。
+    ///
+    /// 删一个 manifest 只是断了引用：真正把字节从盘上放掉的是 registry 启动时那次
+    /// 扫。所以"删了却没重启"这件事没做完就还欠着，而让欠账成立的那个条件（这一轮
+    /// 删掉了 tag）已经过去了——下一轮删不出东西来，也就不会再有谁重启一次。账要
+    /// 落盘、要能重发：它不属于某一轮，属于这个进程当下的状态。
+    #[serde(default)]
+    registry_gc_owed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -2863,6 +2871,37 @@ impl MainlineDeployer {
         Ok(())
     }
 
+    /// 还一笔欠账：上一轮删了 tag，重启却没发下去。
+    ///
+    /// 与回收轮同一个理由要拿构建闸——重启 registry 就是把别人正在推镜像的那个服务端
+    /// 换掉。拿不到就下一轮再说：欠账不因为晚一轮变得更多，而一轮里重启两次比晚一轮贵。
+    async fn reissue_owed_registry_gc(&self, state: &mut MainlineState, now: i64) {
+        let _slot = match cog_core::build_gate::try_acquire_exclusive("registry gc reissue").await {
+            Ok(slot) => slot,
+            Err(e) => {
+                info!(error = %e, "host is building; deferring the owed registry gc to the next cycle");
+                return;
+            }
+        };
+        match self.restart_registry().await {
+            Ok(()) => {
+                state.registry_gc_owed = false;
+                state.registry_restart_unix = Some(now);
+                if let Err(e) = self.save_state(state) {
+                    warn!(
+                        error = %e,
+                        "could not record the re-issued registry restart; a rollout may start while the tag server rebuilds"
+                    );
+                }
+                info!("re-issued the registry restart an earlier round could not send; its garbage collection now runs");
+            }
+            Err(e) => warn!(
+                error = %e,
+                "could not restart the registry to reclaim the tags an earlier round removed; the debt stays on the books"
+            ),
+        }
+    }
+
     /// 四部署当前声明的镜像对应哪个 rev。不可变 `main-<rev>` 由 tag 直接
     /// 给出（tag 与内容一一对应）；浮动签必须问 registry 当前内容构建自
     /// 哪个 rev——tag 字符串本身不含 rev，而内容随时可能被重新播种。四部署
@@ -3001,6 +3040,19 @@ impl MainlineDeployer {
         if self.cfg.registry_claim.trim().is_empty() {
             return;
         }
+        // 欠账读数每轮都发：这是"删掉的 tag 还没被 GC 放掉"唯一的可见面，而它最需要
+        // 被看见的时刻（重启一直发不出去）恰好没有别的读数——那时只有每轮一句 warn，
+        // 翻日志才知道连着欠了几轮。功能没开时这一格不存在，那是"没人问过"。
+        if let Some(metrics) = &self.metrics {
+            use cog_core::metric_names;
+            let _ = metrics
+                .record_gauge(
+                    metric_names::REGISTRY_GC_OWED,
+                    if state.registry_gc_owed { 1.0 } else { 0.0 },
+                    std::collections::HashMap::new(),
+                )
+                .await;
+        }
         let now = chrono::Utc::now().timestamp();
         let used = self.registry_volume_used_bytes().await;
         let declared = self.registry_declared_bytes().await;
@@ -3012,6 +3064,12 @@ impl MainlineDeployer {
             self.cfg.registry_maintenance_threshold,
             self.cfg.registry_maintenance_cooldown_secs,
         ) {
+            // 不到回收的时候，但**上一轮欠的账还没还**：欠账跟冷却无关——冷却管的是
+            // "多久回收一次"，这一笔说的是"上一次回收没做完"。让欠账成立的那个条件
+            // 已经过去了（下一轮的 `removed` 是 0），所以不在这里还就没人会还。
+            if state.registry_gc_owed {
+                self.reissue_owed_registry_gc(state, now).await;
+            }
             return;
         }
         // 回收要重启 registry，而构建正是往这个 registry 推镜像的动作：不拿宿主
@@ -3105,7 +3163,7 @@ impl MainlineDeployer {
         }
         // 删掉的只是 manifest 上的引用：层还在盘上，直到 GC 跑一次。GC 是 registry
         // Pod 的 initContainer，所以"跑一次 GC"就是让那个 Deployment 重启一次。
-        if removed > 0.0 {
+        if removed > 0.0 || state.registry_gc_owed {
             match self.restart_registry().await {
                 Ok(()) => {
                     // 重启只是"发下去了"：新 Pod 要把全库扫完才 ready，这中间 tag
@@ -3113,6 +3171,7 @@ impl MainlineDeployer {
                     // 进程在这段窗口里重启一次（它正是会做这件事的那个进程）标记就没了，
                     // 下一轮照常推进，正好推进到窗口正中。
                     state.registry_restart_unix = Some(now);
+                    state.registry_gc_owed = false;
                     if let Err(e) = self.save_state(state) {
                         warn!(
                             error = %e,
@@ -3121,6 +3180,16 @@ impl MainlineDeployer {
                     }
                 }
                 Err(e) => {
+                    // 重启没发下去 ⇒ 这一轮删掉的 tag 变成孤儿层，而没有谁会再来重启
+                    // 一次：下一轮 `removed` 是 0。账要落盘，下一轮拿它去重发；只记在
+                    // 这一轮的日志里，等于把一笔跨轮的债务记成一次事件。
+                    state.registry_gc_owed = true;
+                    if let Err(e) = self.save_state(state) {
+                        warn!(
+                            error = %e,
+                            "could not record the owed registry gc; the reclaim waits for some other restart"
+                        );
+                    }
                     warn!(error = %e, "could not restart the registry to reclaim; the removed tags stay on disk until it restarts")
                 }
             }
@@ -8905,6 +8974,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             ci_hold_rev: Some("deadbeef0011".into()),
             registry_maintenance_unix: 0,
             registry_restart_unix: Some(940),
+            registry_gc_owed: false,
         };
         let msg = heartbeat_message(&state, "aabbccddeeff0011", "up-to-date(aabbccddeeff)", 1000);
         assert!(msg.contains("in_flight=aabbccddeeff@Pushed"), "{msg}");
@@ -9256,6 +9326,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             ci_hold_rev: None,
             registry_maintenance_unix: 0,
             registry_restart_unix: None,
+            registry_gc_owed: false,
         };
         let text = serde_json::to_string(&state).unwrap();
         let back: MainlineState = serde_json::from_str(&text).unwrap();
@@ -11104,6 +11175,284 @@ exit 0
                  只被那种工作负载引用着的 rev 就会被当成旧 tag 删掉（{kind} 没读）: {calls}"
             );
         }
+    }
+
+    /// 回收轮的夹具：四个 rev、保留窗 2、01 被正在跑的部署引用着（窗外但保住），
+    /// 于是每轮只该删 02。`restart_failures` 让 `rollout restart` 前几次以集群拒绝的
+    /// 形状失败——"重启没发下去"这条路径只有这样才走得到。
+    async fn registry_round_fixture(
+        root: &Path,
+        restart_failures: u32,
+        retention: usize,
+    ) -> (
+        MainlineDeployer,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        PathBuf,
+    ) {
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let log = bin_dir.join("kubectl.log");
+        let count = bin_dir.join("restarts");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+echo "$@" >> '{log}'
+case "$*" in
+  *"app.kubernetes.io/component=cluster-registry"*) printf '%s' 'cogneva-registry' ;;
+  *"items"*) printf '%s' '' ;;
+  *"rollout restart"*)
+    n=0
+    [ -f '{count}' ] && n=$(cat '{count}')
+    n=$((n + 1))
+    echo "$n" > '{count}'
+    if [ "$n" -le {failures} ]; then
+      echo "Error from server (InternalError): the registry cannot be restarted right now" >&2
+      exit 1
+    fi
+    echo "deployment.apps/cogneva-registry restarted" ;;
+  *) printf '%s' '10Gi' ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            count = count.display(),
+            failures = restart_failures
+        );
+        let kubectl = write_fake_bin(&bin_dir, "fake-kubectl", &script)
+            .to_string_lossy()
+            .to_string();
+        let claim = "cogneva-registry-pvc";
+        let tags = [
+            "local",
+            "seed",
+            "main-000000000001",
+            "main-000000000002",
+            "main-000000000003",
+            "main-000000000004",
+        ];
+        let mut routes = vec![(
+            "GET",
+            "/v2/cogneva/tags/list".to_string(),
+            http_200(&tags_json(&tags)),
+        )];
+        // 四个 rev 各自一层、创建时间递增：保留两个的话，窗是 04 与 03，窗外的是 02 与 01。
+        for (i, tag) in tags.iter().filter(|t| t.starts_with("main-")).enumerate() {
+            routes.extend(tag_routes(
+                tag,
+                &format!("sha256:m{i}"),
+                &format!("sha256:c{i}"),
+                &[&format!("L{i}")],
+                &format!("rev{i}"),
+                &format!("2026-09-2{}T00:00:00Z", i + 1),
+            ));
+        }
+        routes.extend(tag_routes(
+            "local",
+            "sha256:local",
+            "sha256:cl",
+            &["L9"],
+            "deadbeefcafe",
+            "2026-09-26T00:00:00Z",
+        ));
+        routes.extend(tag_routes(
+            "seed",
+            "sha256:seed",
+            "sha256:cs",
+            &["L0"],
+            "deadbeefcafe",
+            "2026-09-26T00:00:00Z",
+        ));
+        let (registry, registry_log) = routed_registry(routes).await;
+        let (walker, _walker_log) = routed_registry(vec![(
+            "GET",
+            "/metrics".to_string(),
+            http_200(&walker_metrics(claim, 9_000_000_000)),
+        )])
+        .await;
+        let walker_port: u16 = walker.rsplit(':').next().unwrap().parse().unwrap();
+
+        let mut cfg = test_config(root, Path::new("/nonexistent"), "noop", &kubectl);
+        cfg.registry = registry;
+        cfg.registry_claim = claim.into();
+        cfg.registry_walker_port = walker_port;
+        cfg.registry_retention = retention;
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+        (deployer, registry_log, log)
+    }
+
+    /// 删一个 manifest 只是断了引用：放掉字节的是 registry 重启时那次 GC。重启**没发
+    /// 下去**时这笔账必须留着——让欠账成立的条件（这一轮删了 tag）已经过去了，下一轮
+    /// `removed` 是 0，谁都不会再重启一次，那些字节就永远占着盘（实测 5.3 GB / 122 tag
+    /// 的卷上，一次重建 20–28 分钟，所以这里不是"晚点再说"的问题，是"永远不再说"）。
+    #[tokio::test]
+    async fn a_failed_registry_restart_leaves_a_debt_the_next_round_pays() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (deployer, registry_log, kubectl_log) = registry_round_fixture(root, 1, 2).await;
+        let images = vec!["localhost:30500/cogneva:main-000000000001".to_string()];
+        // 数**出现次数**而不是行数：这些假 kubectl 的日志没有可靠的行结构。两条
+        // 独立的原因：`echo "$@"` 会把实参开头的 `-n` 当成自己的开关 ⇒ 每次调用既被
+        // 吞掉那个实参、又不带结尾换行；而实参里的 jsonpath 自己可能带换行 ⇒ 行边界
+        // 还会断在调用中间。实测同一份日志：`lines()` 数出 4 个片段、`matches()` 数出
+        // 2 次调用。按行读的断言在"根本没做到"时也会绿。
+        let restarts = || {
+            std::fs::read_to_string(&kubectl_log)
+                .unwrap()
+                .matches("rollout restart")
+                .count()
+        };
+        let deletes = || {
+            requests_seen(&registry_log)
+                .iter()
+                .filter_map(|r| r.lines().next())
+                .filter(|l| l.starts_with("DELETE "))
+                .count()
+        };
+
+        let mut state = MainlineState::default();
+        deployer
+            .registry_maintenance_round("000000000004", &images, &mut state)
+            .await;
+        assert_eq!(restarts(), 1, "删完就要让 GC 跑一次");
+        assert_eq!(deletes(), 1, "窗外只有 02 该删");
+        assert!(
+            state.registry_gc_owed,
+            "重启没发下去就是欠了一笔，而这是状态不是事件：要能跨轮、跨进程活下来"
+        );
+        assert!(
+            state.registry_restart_unix.is_none(),
+            "没重启就没有「它还没答话」那个窗口，按住推进的理由不存在"
+        );
+
+        // 同一份 state 的下一轮：冷却没过，这一轮**不是**回收轮——但欠账跟冷却无关。
+        deployer
+            .registry_maintenance_round("000000000004", &images, &mut state)
+            .await;
+        assert_eq!(
+            restarts(),
+            2,
+            "欠账要能在下一轮重发；不重发就没人会再发一次\n{}",
+            std::fs::read_to_string(&kubectl_log).unwrap_or_default()
+        );
+        assert!(!state.registry_gc_owed, "发下去了账就清了");
+        assert!(
+            state.registry_restart_unix.is_some(),
+            "重启过就要按住推进，到它自己答话为止"
+        );
+        assert_eq!(
+            deletes(),
+            1,
+            "还账那一轮不该顺手再回收一次：这一轮删不出新东西，再删一次是白重启"
+        );
+
+        // 第三轮：账已清、又不到回收的时候 ⇒ 不再重启（否则每轮重启一次 tag 服务）。
+        deployer
+            .registry_maintenance_round("000000000004", &images, &mut state)
+            .await;
+        assert_eq!(restarts(), 2, "债还完就不该再重启一次");
+        assert_eq!(deletes(), 1, "不到回收的时候一个 tag 都不许再删");
+    }
+
+    /// 到期的一轮**删不出东西**时，欠账照样要还。
+    ///
+    /// 欠账的还账口不止"下一轮还没到回收的时候"那一条：进程可能整段冷却期都不在，
+    /// 或者它的构建闸每轮都被占着——等到再有一轮到期时，窗外已经没有可删的 rev 了，
+    /// `removed` 是 0。条件若只看 `removed`，这笔账就永远没人还：它不属于某一轮，
+    /// 属于这个进程当下的状态。
+    #[tokio::test]
+    async fn a_due_round_with_nothing_to_reclaim_still_pays_the_debt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // 保留窗开到 20：六个 tag 全在窗内 ⇒ 这一轮一个都不该删。
+        let (deployer, _registry_log, kubectl_log) = registry_round_fixture(root, 0, 20).await;
+        let images = vec!["localhost:30500/cogneva:main-000000000001".to_string()];
+        let restarts = || {
+            std::fs::read_to_string(&kubectl_log)
+                .unwrap()
+                .matches("rollout restart")
+                .count()
+        };
+
+        let mut state = MainlineState {
+            registry_gc_owed: true,
+            ..Default::default()
+        };
+        deployer
+            .registry_maintenance_round("000000000004", &images, &mut state)
+            .await;
+        assert_eq!(
+            restarts(),
+            1,
+            "删不出东西不代表没有欠账要还；不还就永远是孤儿层\n{}",
+            std::fs::read_to_string(&kubectl_log).unwrap_or_default()
+        );
+        assert!(!state.registry_gc_owed, "发下去了账就清了");
+        assert!(state.registry_restart_unix.is_some());
+    }
+
+    /// 反向对照：到期的一轮**既没删东西、也不欠账**时不许重启。
+    ///
+    /// 少了这一半，把条件写成"每轮到期都重启一次"也全绿——而那是把 tag 服务按在
+    /// 20–28 分钟的重建窗里反复重启，窗口里每个引用都解析不到 tag。
+    #[tokio::test]
+    async fn a_due_round_with_nothing_to_reclaim_and_no_debt_does_not_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (deployer, _registry_log, kubectl_log) = registry_round_fixture(root, 0, 20).await;
+        let images = vec!["localhost:30500/cogneva:main-000000000001".to_string()];
+        let restarts = || {
+            std::fs::read_to_string(&kubectl_log)
+                .unwrap()
+                .matches("rollout restart")
+                .count()
+        };
+
+        let mut state = MainlineState::default();
+        deployer
+            .registry_maintenance_round("000000000004", &images, &mut state)
+            .await;
+        assert_eq!(
+            restarts(),
+            0,
+            "一个 tag 都没删、也没有欠账，就没有重启 tag 服务的理由\n{}",
+            std::fs::read_to_string(&kubectl_log).unwrap_or_default()
+        );
+        assert!(!state.registry_gc_owed);
+        assert!(state.registry_restart_unix.is_none());
+    }
+
+    /// 反向对照：重启**发下去了**就不留账——同一份 state 的下一轮不许再重启一次。
+    /// 少了这一半，"每轮都重启一次"（把 tag 服务按在 20–28 分钟的重建窗里反复重启）
+    /// 也会让上面那条用例全绿。
+    #[tokio::test]
+    async fn a_registry_restart_that_went_out_leaves_no_debt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (deployer, _registry_log, kubectl_log) = registry_round_fixture(root, 0, 2).await;
+        let images = vec!["localhost:30500/cogneva:main-000000000001".to_string()];
+        // 数**出现次数**而不是行数：这些假 kubectl 的日志没有可靠的行结构。两条
+        // 独立的原因：`echo "$@"` 会把实参开头的 `-n` 当成自己的开关 ⇒ 每次调用既被
+        // 吞掉那个实参、又不带结尾换行；而实参里的 jsonpath 自己可能带换行 ⇒ 行边界
+        // 还会断在调用中间。实测同一份日志：`lines()` 数出 4 个片段、`matches()` 数出
+        // 2 次调用。按行读的断言在"根本没做到"时也会绿。
+        let restarts = || {
+            std::fs::read_to_string(&kubectl_log)
+                .unwrap()
+                .matches("rollout restart")
+                .count()
+        };
+
+        let mut state = MainlineState::default();
+        deployer
+            .registry_maintenance_round("000000000004", &images, &mut state)
+            .await;
+        assert_eq!(restarts(), 1);
+        assert!(!state.registry_gc_owed, "发下去了就不欠");
+        assert!(state.registry_restart_unix.is_some());
+
+        deployer
+            .registry_maintenance_round("000000000004", &images, &mut state)
+            .await;
+        assert_eq!(restarts(), 1, "没有欠账就不该有第二轮重启");
     }
 
     /// 引用名单读不到就**整轮不删**：名单不全的后果是静默删错（把有人正在跑的 rev 当
@@ -13318,7 +13667,7 @@ exit 0
         assert_eq!(workloads.len(), 2, "{workloads:?}");
         let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
         assert_eq!(
-            calls.lines().filter(|l| l.contains("get deploy")).count(),
+            calls.matches("get deploy").count(),
             2,
             "the read has to be tried again, not turned into a rollout failure: {calls}"
         );
@@ -13338,7 +13687,7 @@ exit 0
         executor.live_config_consumers().await.unwrap();
         let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
         assert_eq!(
-            calls.lines().filter(|l| l.contains("get deploy")).count(),
+            calls.matches("get deploy").count(),
             2,
             "the read has to be tried again, not turned into a rollout failure: {calls}"
         );
@@ -13919,9 +14268,11 @@ exit 0
         let patched = dir.join("patched.marker");
         let settled = dir.join("settled.marker");
         // 暂存件在 apply 那一刻的读数：把 apply 实参里那个 `-f` 路径**原样**记下来，
-        // 连同它当时在不在盘上。判"删掉了没"只能从这个实参出发——日志是拼接文本，
-        // 按 token 从里面捞路径会捞到被撑开的行边界粘出来的碎片（实测量到过
-        // `...yamlcogneva`），那种字符串当然不存在，`exists()` 于是恒为假。
+        // 连同它当时在不在盘上。判"删掉了没"只能从这个实参出发——日志不是分行的文本：
+        // `echo "$@"` 会把实参开头的 `-n` 当成自己的开关，于是每次调用都被吞掉首个实参
+        // 且不带结尾换行，整份日志是一串首尾相连的调用（实测按 `-f` 取到的"路径"是
+        // `...yamlcogneva` 这种把下一次调用粘进来的碎片）。碎片当然不存在，`exists()`
+        // 于是恒为假——那条断言在种植回归下照样绿。
         let staged_path_file = dir.join("staged.path");
         let staged_state = dir.join("staged.state");
         // 热更新面覆盖到的段（tuning）变了：没有值得滚的理由，配置文档照样变。
@@ -14203,8 +14554,8 @@ spec:
             .expect("rollout should succeed");
 
         // 读数取自 apply 的**实参**（假 kubectl 在那一支里记下来的），不从日志里捞：
-        // 日志是 `echo "$@"` 的拼接文本，jsonpath 实参里带换行会撑开行边界，捞出来的
-        // "路径"可能是碎片——碎片当然不存在，断言就空过了（种植回归照样绿）。
+        // 那份日志不是分行的文本（见夹具里 `staged_path_file` 那段注释），捞出来的
+        // "路径"可能是首尾相连的碎片——碎片当然不存在，断言就空过了（种植回归照样绿）。
         let recorded = std::fs::read_to_string(bin_dir.join("staged.path")).unwrap_or_else(|e| {
             panic!("no target manifest was ever applied through -f: {e}");
         });

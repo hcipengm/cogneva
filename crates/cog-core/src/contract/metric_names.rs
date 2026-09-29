@@ -181,6 +181,19 @@ metric_names! {
     // what this process can read exactly, and it is the cost this process pays.
     REGISTRY_REBUILD_HOLD_SECS_TOTAL => "cogneva_registry_rebuild_hold_secs_total",
 
+    // cog-reflection — a reclaim round whose garbage collection did not go out.
+    //
+    // Deleting a manifest only drops a reference: the layers stay on disk until
+    // the registry restarts and its init container sweeps them. A round whose
+    // restart failed has therefore left a debt, and the condition that would pay
+    // it is now behind it -- the tags are gone, so the next round removes
+    // nothing and never restarts. What is left is a state rather than an event:
+    // it outlives the round that raised it, and the reading has to as well, or a
+    // debt sitting on the books for hours looks exactly like one never taken on.
+    // Published at zero as well as at one: an absent series and a settled debt
+    // are the same empty cell, and the question is worth asking every round.
+    REGISTRY_GC_OWED => "cogneva_registry_gc_owed",
+
     // cog-reflection — the rollout judgement's own resource readings.
     //
     // The judgement runs in a short-lived Job pod, which is born, works for a
