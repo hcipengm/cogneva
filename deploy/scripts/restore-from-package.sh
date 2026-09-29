@@ -115,10 +115,39 @@ kubectl -n "$NS" wait --for=condition=Complete "job/$JOB_NAME" --timeout=1800s |
 kubectl -n "$NS" logs "job/$JOB_NAME" | tail -20
 
 echo "==> 4/4 滚动重启业务部署，让内存态对齐持久层"
-for d in cogneva cogneva-evolution cogneva-sandbox-executor cogneva-security-gateway; do
+# The set is read from the cluster rather than transcribed: what the restore gives
+# back is the persistent layer, and the deployments that have to replay in-memory
+# state are the ones running an image this project publishes -- a set that grows.
+# A transcribed list keeps working when it grows and skips the new deployment in
+# silence: the restore reports success while that deployment still holds the state
+# it had before. The repository name comes from the same $IMAGE read above (digest
+# and tag stripped), so the registry prefix and the rev tag follow the live cluster
+# instead of being maintained here.
+# rollout-set: start
+IMAGE_REPO="$(printf '%s' "$IMAGE" | sed -E 's/@.*$//; s/:[^/]*$//')"
+APP_DEPLOYMENTS=()
+while IFS=$'\t' read -r name images; do
+    [ -n "$name" ] || continue
+    read -ra imgs <<<"$images"
+    for img in "${imgs[@]}"; do
+        repo="$(printf '%s' "$img" | sed -E 's/@.*$//; s/:[^/]*$//')"
+        if [ "$repo" = "$IMAGE_REPO" ]; then
+            APP_DEPLOYMENTS+=("$name")
+            break
+        fi
+    done
+done < <(kubectl -n "$NS" get deploy \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .spec.template.spec.containers[*]}{.image}{" "}{end}{"\n"}{end}')
+if [ "${#APP_DEPLOYMENTS[@]}" -eq 0 ]; then
+    echo "No deployment runs this project's image ($IMAGE_REPO); the restore would leave every" \
+        "in-memory state unreplayed" >&2
+    exit 1
+fi
+# rollout-set: end
+for d in "${APP_DEPLOYMENTS[@]}"; do
     kubectl -n "$NS" rollout restart "deployment/$d"
 done
-for d in cogneva cogneva-evolution cogneva-sandbox-executor cogneva-security-gateway; do
+for d in "${APP_DEPLOYMENTS[@]}"; do
     kubectl -n "$NS" rollout status "deployment/$d" --timeout=300s
 done
 echo "==> 恢复完成"
