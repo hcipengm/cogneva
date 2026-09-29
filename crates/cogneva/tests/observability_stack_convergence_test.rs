@@ -78,17 +78,10 @@ fn declared_kinds(text: &str) -> Vec<String> {
 }
 
 /// kind 落在哪个 API 组、哪个资源名。没有登记 = 清单里出现了授权面还没考虑过的
-/// 对象，两条路必须一起改。
+/// 对象，两条路必须一起改。表本身不在这个文件里：主线循环的授权面判据问的是同一个
+/// 问题，两份手写表一定会分叉，分叉的样子是「一边能授权、另一边连名字都拼不出来」。
 fn api_of(kind: &str) -> Option<(&'static str, &'static str)> {
-    Some(match kind {
-        "ConfigMap" => ("", "configmaps"),
-        "Service" => ("", "services"),
-        "StatefulSet" => ("apps", "statefulsets"),
-        "Ingress" => ("networking.k8s.io", "ingresses"),
-        "ServiceMonitor" => ("monitoring.coreos.com", "servicemonitors"),
-        "PodMonitor" => ("monitoring.coreos.com", "podmonitors"),
-        _ => return None,
-    })
+    cog_reflection::api_resource_of(kind)
 }
 
 fn parse_bracket(line: &str) -> Vec<String> {

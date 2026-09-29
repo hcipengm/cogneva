@@ -46,21 +46,18 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
 /// Every directory whose manifests can be delivered to a cluster.
 ///
 /// The same set the rollout pinning is judged on: the static k3s tree the
 /// in-cluster deployer applies from the repository, and the three pre-rendered
-/// profiles the bootstrap applies without helm.
-const DELIVERED: [&str; 4] = [
-    "deploy/k3s",
-    "deploy/rendered/k3s-single",
-    "deploy/rendered/k3s-multi",
-    "deploy/rendered/k8s-standard",
-];
+/// profiles the bootstrap applies without helm. The list is the rollout's, not
+/// a copy of it -- a tree missing from one reader's copy is a reader that
+/// judges a set which no longer ships, and a walk over a smaller set passes.
+use cog_reflection::DELIVERABLE_MANIFEST_TREES as DELIVERED;
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
 
 /// Workloads whose process measures the volumes it declares, and the evidence.
 ///

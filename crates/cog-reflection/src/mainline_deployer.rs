@@ -4965,6 +4965,23 @@ fn is_cluster_scoped_kind(kind: &str) -> bool {
 /// 平铺的预渲染目录读。
 const KUSTOMIZATION_FILE: &str = "kustomization.yaml";
 
+/// The manifest trees a deployment can be pointed at: the static release set the
+/// in-cluster deployer reads out of the repository, and one pre-rendered
+/// directory per profile.
+///
+/// Written once because three places ask the same question -- the walk that
+/// judges the shipped manifests, the gate that judges the authorization face,
+/// and the volume-footprint claim -- and each of them passes on a smaller set
+/// than it meant to when a tree is missing from its own copy. Which profile
+/// points at which tree is a separate reading, judged against the chart's
+/// profile files.
+pub const DELIVERABLE_MANIFEST_TREES: [&str; 4] = [
+    "deploy/k3s",
+    "deploy/rendered/k3s-single",
+    "deploy/rendered/k3s-multi",
+    "deploy/rendered/k8s-standard",
+];
+
 /// 解析 kustomization.yaml 的 resources 列表——发布集的权威定义。
 fn parse_kustomization_resources(text: &str) -> SFResult<Vec<String>> {
     let v: serde_yaml::Value = serde_yaml::from_str(text)
@@ -5050,6 +5067,39 @@ pub fn classify_doc(kind: &str) -> DocFate {
         return DocFate::StorageClaim;
     }
     DocFate::Deliver
+}
+
+/// The API resource a manifest kind names: its group and its plural resource
+/// name, as an RBAC rule spells them.
+///
+/// This is the half [`classify_doc`] cannot answer: the fate says whether a
+/// document travels, and this says what right would be needed if it does. The
+/// two are read from different files -- the manifests on one side, the Role on
+/// the other -- so a kind that reaches the cluster needs a name both sides
+/// agree on, and an unmapped kind is not "no permission needed": it is a kind
+/// nobody has decided the rights for, which has to fail rather than compare
+/// equal to nothing. A kind this does not know also cannot be granted, so a
+/// `None` here is the end of the check either way.
+///
+/// `Secret` is absent on purpose, as are the role, governance, claim and
+/// cluster-scoped kinds: they never travel through the loop, so no grant can
+/// be their answer.
+pub fn api_resource_of(kind: &str) -> Option<(&'static str, &'static str)> {
+    Some(match kind {
+        "ConfigMap" => ("", "configmaps"),
+        "Service" => ("", "services"),
+        "ServiceAccount" => ("", "serviceaccounts"),
+        "Deployment" => ("apps", "deployments"),
+        "DaemonSet" => ("apps", "daemonsets"),
+        "StatefulSet" => ("apps", "statefulsets"),
+        "Job" => ("batch", "jobs"),
+        "CronJob" => ("batch", "cronjobs"),
+        "NetworkPolicy" => ("networking.k8s.io", "networkpolicies"),
+        "Ingress" => ("networking.k8s.io", "ingresses"),
+        "ServiceMonitor" => ("monitoring.coreos.com", "servicemonitors"),
+        "PodMonitor" => ("monitoring.coreos.com", "podmonitors"),
+        _ => return None,
+    })
 }
 
 /// 拆分多文档 YAML（只拆，不过滤）：空文档（`---` 分隔产生）跳过。
@@ -16004,12 +16054,7 @@ exit 0
         // `deploy/k3s` 是部署器默认读的发布集；预渲染目录也在内，因为发布集目录
         // 是配置面（`manifest_dir`），把它指到任一预渲染目录是受支持的用法，
         // 那些文件同样会被重排后再 apply。
-        for rel in [
-            "deploy/k3s",
-            "deploy/rendered/k3s-single",
-            "deploy/rendered/k3s-multi",
-            "deploy/rendered/k8s-standard",
-        ] {
+        for rel in DELIVERABLE_MANIFEST_TREES {
             let dir = root.join(rel);
             // 发布集目录用 kustomization 反查；预渲染目录是一堆平铺清单，
             // 目录里的每一项都在发布面内。
@@ -17377,6 +17422,177 @@ exit 0
             checked.push((profile, dir));
         }
         assert_eq!(checked.len(), 3, "profile set changed: {checked:?}");
+    }
+
+    /// The authorization face has to cover the delivery face.
+    ///
+    /// Every rev the loop applies the documents its own filter kept, running as
+    /// the ServiceAccount whose only rights are the rules written in this Role.
+    /// A missing rule is a rollout that fails `forbidden` on every rev -- a
+    /// failure that reaches neither the generation side nor any alert -- and an
+    /// extra one is a right granted to a loop with nothing to spend it on. The
+    /// two faces are written in different files, so neither moves when the other
+    /// does; this is the one place they meet.
+    ///
+    /// The trees walked are the ones a deployment can be pointed at: the static
+    /// release set and each pre-rendered profile directory. Reading the mapped
+    /// API resource through [`api_resource_of`] is deliberate -- an unmapped
+    /// kind stops the walk instead of comparing equal to nothing, because a
+    /// manifest that grew an object nobody has decided the rights for is
+    /// exactly the state this asks about.
+    #[test]
+    fn the_evolution_role_covers_every_document_the_loop_will_apply() {
+        const EVOLUTION: &str = "cogneva-evolution";
+        let root = repo_root();
+        let mut checked: Vec<&str> = Vec::new();
+
+        for rel in DELIVERABLE_MANIFEST_TREES {
+            let dir = root.join(rel);
+            let set = if dir.join(KUSTOMIZATION_FILE).exists() {
+                kustomization_set_from_disk(&dir)
+            } else {
+                flat_set_from_disk(&dir)
+            };
+
+            // The delivery face, read through the loop's own filter.
+            let mut needed: std::collections::BTreeSet<(String, String)> =
+                std::collections::BTreeSet::new();
+            let mut docs: Vec<serde_yaml::Value> = Vec::new();
+            for (name, text) in &set.files {
+                let kept =
+                    namespace_docs(text, name).unwrap_or_else(|e| panic!("{rel}/{name}: {e}"));
+                for doc in &kept {
+                    let kind = doc.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                    let (group, resource) = api_resource_of(kind).unwrap_or_else(|| {
+                        panic!(
+                            "{rel}/{name}: kind {kind} has no API resource mapping; the \
+                             authorization face cannot be compared against it"
+                        )
+                    });
+                    needed.insert((group.to_string(), resource.to_string()));
+                }
+                // The unfiltered reading is what the Role is found in: the
+                // filter's whole job is to keep the Role out of the delivery
+                // face, and the grant is written in the very document it drops.
+                docs.extend(split_docs(text, name).unwrap_or_else(|e| panic!("{rel}/{name}: {e}")));
+            }
+            assert!(
+                !needed.is_empty(),
+                "{rel}: the release set delivers nothing, so this gate read nothing"
+            );
+
+            let named = |kind: &str, name: &str| {
+                docs.iter().find(|d| {
+                    d.get("kind").and_then(|k| k.as_str()) == Some(kind)
+                        && d.get("metadata")
+                            .and_then(|m| m.get("name"))
+                            .and_then(|n| n.as_str())
+                            == Some(name)
+                })
+            };
+            let role = named("Role", EVOLUTION)
+                .unwrap_or_else(|| panic!("{rel}: the release set carries no {EVOLUTION} Role"));
+            let list = |rule: &serde_yaml::Value, key: &str| -> Vec<String> {
+                rule.get(key)
+                    .and_then(|v| v.as_sequence())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            };
+            let grants: Vec<(Vec<String>, Vec<String>, Vec<String>)> = role
+                .get("rules")
+                .and_then(|r| r.as_sequence())
+                .into_iter()
+                .flatten()
+                .map(|rule| {
+                    (
+                        list(rule, "apiGroups"),
+                        list(rule, "resources"),
+                        list(rule, "verbs"),
+                    )
+                })
+                .collect();
+            assert!(
+                !grants.is_empty(),
+                "{rel}: the {EVOLUTION} Role carries no rule to compare"
+            );
+
+            let missing: Vec<String> = needed
+                .iter()
+                .filter(|(group, resource)| {
+                    !grants.iter().any(|(groups, resources, verbs)| {
+                        groups.iter().any(|g| g == group)
+                            && resources.iter().any(|r| r == resource)
+                            && ["get", "create", "patch"]
+                                .iter()
+                                .all(|v| verbs.iter().any(|x| x == v))
+                    })
+                })
+                .map(|(g, r)| format!("{g}/{r}"))
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "{rel}: the {EVOLUTION} Role does not cover {missing:?}; every rev of the \
+                 loop would fail with `forbidden` and nothing reads that as a defect"
+            );
+
+            // The escalation side of the same boundary: the rules that would let
+            // a manifest grow its own rights or lift the credentials.
+            for (groups, resources, _) in &grants {
+                assert!(
+                    !groups
+                        .iter()
+                        .any(|g| g.contains("rbac.authorization.k8s.io")),
+                    "{rel}: the {EVOLUTION} Role grants the authorization plane itself"
+                );
+                assert!(
+                    !resources.iter().any(|r| r == "secrets"),
+                    "{rel}: the {EVOLUTION} Role grants secrets"
+                );
+            }
+
+            // A grant reaches a process through the binding, and the binding
+            // names its subject by string: a Role whose SA was renamed reads as
+            // covered while the pod runs with no rights at all.
+            let accounts: Vec<&str> = docs
+                .iter()
+                .filter(|d| d.get("kind").and_then(|k| k.as_str()) == Some("ServiceAccount"))
+                .filter_map(|d| {
+                    d.get("metadata")
+                        .and_then(|m| m.get("name"))
+                        .and_then(|n| n.as_str())
+                })
+                .collect();
+            assert!(
+                accounts.contains(&EVOLUTION),
+                "{rel}: {EVOLUTION} is bound but its ServiceAccount is not in this set: \
+                 {accounts:?}"
+            );
+            let binding = named("RoleBinding", EVOLUTION)
+                .unwrap_or_else(|| panic!("{rel}: no {EVOLUTION} RoleBinding"));
+            assert_eq!(binding["roleRef"]["kind"].as_str(), Some("Role"));
+            assert_eq!(binding["roleRef"]["name"].as_str(), Some(EVOLUTION));
+            let bound = binding["subjects"]
+                .as_sequence()
+                .into_iter()
+                .flatten()
+                .any(|s| {
+                    s.get("kind").and_then(|k| k.as_str()) == Some("ServiceAccount")
+                        && s.get("name").and_then(|n| n.as_str()) == Some(EVOLUTION)
+                });
+            assert!(
+                bound,
+                "{rel}: the {EVOLUTION} RoleBinding does not bind the account the Role is \
+                 written for"
+            );
+            checked.push(rel);
+        }
+        assert_eq!(
+            checked.len(),
+            DELIVERABLE_MANIFEST_TREES.len(),
+            "the walk did not cover the delivered set: {checked:?}"
+        );
     }
 
     // --- The version contract: the judgement runs on real git ---
