@@ -31,6 +31,7 @@ pub mod auto_promoter;
 pub mod baseline_port;
 pub mod build_cache_readings;
 pub mod build_cache_reclaim;
+pub mod change_execution;
 pub mod change_pipeline;
 pub mod config;
 pub mod crew;
@@ -86,8 +87,8 @@ pub use baseline_port::{
 pub use change_pipeline::{ApplyResult, ChangePipeline};
 use cog_core::{DecisionCategory, DecisionOutcome, Learning};
 pub use config::{
-    BaselinePortConfig, GitOpsConfig, MainlineDeployerConfig, ObservabilityStackConfig,
-    PromotionGateConfig,
+    BaselinePortConfig, ChangeJobConfig, GitOpsConfig, MainlineDeployerConfig,
+    ObservabilityStackConfig, PromotionGateConfig,
 };
 pub use detector::{DefaultLearningDetector, LearningDetector};
 pub use discovery::DiscoveryEngine;

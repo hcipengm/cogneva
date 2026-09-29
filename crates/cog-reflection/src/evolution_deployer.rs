@@ -42,6 +42,11 @@ pub struct EvolutionDeployer {
     /// Where the builds this deployer runs report what they cost. Absent for a
     /// deployer nothing observes.
     build_readings: Option<Arc<EvolutionBuildReadings>>,
+    /// 最近一次构建的结局。判定在这里做出——只有跑到 cargo 的那段代码知道它是被
+    /// 预算杀的、自己失败的、还是压根没起来——所以读数也留在这里，由调用方取走。
+    /// 执行搬进一个一过性 Job 之后，调用方就是那条边界上的回程：不把它留出来，
+    /// 搬到别的进程里的构建就没有任何结局可记。
+    last_ending: std::sync::Arc<std::sync::Mutex<Option<BuildEnding>>>,
 }
 
 impl EvolutionDeployer {
@@ -61,6 +66,7 @@ impl EvolutionDeployer {
             target_dir: None,
             budget: None,
             build_readings: None,
+            last_ending: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -84,7 +90,19 @@ impl EvolutionDeployer {
         self
     }
 
+    /// 最近一次构建的结局；这条部署器还没构建过就是 `None`。`None` 与
+    /// 「构建过但结局未知」不是一回事，所以这里不拿某个默认结局顶上。
+    pub fn last_build_ending(&self) -> Option<BuildEnding> {
+        self.last_ending
+            .lock()
+            .map(|slot| *slot)
+            .unwrap_or_default()
+    }
+
     fn record_build(&self, intent: Option<EvolutionIntent>, ending: BuildEnding) {
+        if let Ok(mut slot) = self.last_ending.lock() {
+            *slot = Some(ending);
+        }
         if let Some(readings) = &self.build_readings {
             readings.record(intent, ending);
         }

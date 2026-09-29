@@ -23,6 +23,7 @@ pub enum Command {
     VolumeWalker,
     ValidateConfig,
     MainlineRollout,
+    ExecuteChange,
     Backup,
     Restore,
     RepairAof,
@@ -31,12 +32,13 @@ pub enum Command {
 
 /// Subcommands, in the order they appear in [`USAGE`]. A command added here but
 /// not documented fails the usage test.
-const SUBCOMMANDS: [(&str, Command); 8] = [
+const SUBCOMMANDS: [(&str, Command); 9] = [
     ("security-gateway", Command::SecurityGateway),
     ("sandbox-executor", Command::SandboxExecutor),
     ("volume-walker", Command::VolumeWalker),
     ("validate-config", Command::ValidateConfig),
     ("mainline-rollout", Command::MainlineRollout),
+    ("execute-change", Command::ExecuteChange),
     ("backup", Command::Backup),
     ("restore", Command::Restore),
     ("repair-aof", Command::RepairAof),
@@ -64,6 +66,7 @@ COMMANDS:
     volume-walker          Walk a mounted volume and serve its footprint on /metrics
     validate-config        Validate configuration and dependencies, then exit non-zero on errors
     mainline-rollout       Roll the mainline revision across deployments (in-cluster Job)
+    execute-change         Apply, verify, commit and build one evolution change, then exit
     backup                 Package the data plane into a backup file
     restore <package>      Restore the data plane from a backup file
     repair-aof <aof-dir>   Drop a torn tail from Redis' AOF files, then exit
@@ -82,7 +85,8 @@ impl Command {
     /// `Err` carries the first argument that names no command and no flag; the
     /// caller prints the usage and exits non-zero. Arguments *after* a known
     /// subcommand are left alone — `restore <package>` and `mainline-rollout
-    /// --tag <rev>` both read their own operands from the process environment.
+    /// --tag <rev>` both read their own operands, and `execute-change
+    /// --request <file>` reads the change it must run out of that file.
     pub fn parse<I, S>(args: I) -> Result<Self, String>
     where
         I: IntoIterator<Item = S>,
@@ -151,6 +155,16 @@ mod tests {
                 "cogneva"
             ]),
             Ok(Command::MainlineRollout)
+        );
+        assert_eq!(
+            parse(&[
+                "execute-change",
+                "--request",
+                "/work/request.json",
+                "--outcome",
+                "/work/outcome.json"
+            ]),
+            Ok(Command::ExecuteChange)
         );
     }
 

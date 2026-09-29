@@ -471,6 +471,9 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 // config.rs）：本 crate 自己从 cogneva.json
                 // self_evolution.promotion 段 + env 覆盖加载。
                 let promotion = crate::PromotionGateConfig::load()?;
+                // 按变更一次的 Job 那条路的上界与落点。读不到就是配置写坏了，
+                // 不是"没配"：与上面那份门配置同一种读法，缺文件/缺段取默认。
+                let change_job = crate::ChangeJobConfig::load()?;
                 let evolution_metrics: Option<Arc<dyn cog_core::EvolutionMetrics>> =
                     ctx.consume_service::<dyn cog_core::EvolutionMetrics>();
 
@@ -629,12 +632,34 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 .with_build_readings(build_readings.clone())
                 .with_target_dir(&self_evolution.workspaces.target_dir);
 
+                // 一条请求里不随变更变的那半：路径、预算、策略。**与流水线和部署器
+                // 同源**——这里放进去的正是构造它们用的那几个值，不是把配置再解析
+                // 一遍：再解析一次就可能让执行进程站在另一份世界里，而两份世界的
+                // 差异要到很后面才以"文件不在这儿"的形式现形。
+                let world = crate::change_execution::ChangeExecutionWorld {
+                    project_root: project_root.clone(),
+                    change_dir: self_evolution.change_dir.clone().into(),
+                    workspace_root: self_evolution.workspaces.root.clone().into(),
+                    bare_repo: bare_repo.clone().into(),
+                    target_dir: self_evolution.workspaces.target_dir.clone().into(),
+                    binary_dir: self_evolution.binary_dir.clone().into(),
+                    backup_dir: self_evolution.backup_dir.clone().into(),
+                    test_timeout_secs: self_evolution.test_timeout_secs,
+                    build_timeout_secs: self_evolution.build_timeout_secs,
+                    auto_apply: self_evolution.auto_apply,
+                    manual_approve: self_evolution.manual_approve,
+                    promotion: promotion.clone(),
+                    build_gate: self_evolution.build_gate.clone(),
+                };
+
                 // Published by clone: the flight readings below take the test
                 // budget off this object rather than re-deriving it from the
                 // configuration document, so the wall a flight is judged against
-                // is the one it is actually killed by.
+                // is the one it is actually killed by. Build readings likewise:
+                // the Job route's parent has to record into the same object the
+                // in-process route does.
                 ctx.publish_observable(budget.clone());
-                ctx.publish_observable(build_readings);
+                ctx.publish_observable(build_readings.clone());
 
                 let binary_switcher = ctx.consume_service::<dyn cog_core::BinarySwitcher>();
                 // 变更上游通道（平台集成侧实现）：沙盒验过的提交经它落到主分支。
@@ -974,6 +999,10 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                             let cycle_workspaces = cycle_workspaces.clone();
                             let landing = landing.clone();
                             let flight = flight.clone();
+                            let change_job = change_job.clone();
+                            let world = world.clone();
+                            let cycle_budget = budget.clone();
+                            let cycle_build_readings = build_readings.clone();
                             let cycle_instance = cycle_instance.clone();
                             let cycle_version = cycle_version.clone();
                             async move {
@@ -995,6 +1024,10 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                                         workspaces: &cycle_workspaces,
                                         landing: landing.as_ref(),
                                         flight: &flight,
+                                        change_job: &change_job,
+                                        world: &world,
+                                        budget: &cycle_budget,
+                                        build_readings: &cycle_build_readings,
                                     };
                                     if let Err(e) =
                                         run_evolution_cycle(deps, &cycle_instance, &cycle_version)
@@ -1774,6 +1807,7 @@ async fn ensure_binary_in_place(
 
 /// 一轮演进所需的共享依赖，逐轮不变。打包成一个结构体而不是摊成参数列表，
 /// 免得每加一个消费者都要改所有调用点。
+#[derive(Clone, Copy)]
 struct CycleDeps<'a> {
     pipeline: &'a crate::ChangePipeline,
     deployer: &'a crate::EvolutionDeployer,
@@ -1789,6 +1823,20 @@ struct CycleDeps<'a> {
     /// 本进程的 apply/test 飞行读数：起飞打戳、落地由守卫清除，年龄在抓取期
     /// 现算。变更在这段里不产出任何别的读数，因而"在飞"与"卡住"要靠它分开。
     flight: &'a Arc<crate::evolution_flight_readings::EvolutionFlightReadings>,
+    /// 按变更一次的 Job 这条路的上界与落点。默认 `enabled=false`：执行留在常驻
+    /// 进程里，与从前逐字相同。`enabled` 真的用来决定派不派 Job，`max_parallel`
+    /// 真的用来限并发派发。
+    change_job: &'a crate::config::ChangeJobConfig,
+    /// 一条请求里不随变更变的那半（路径、预算、策略），与流水线、部署器同源。
+    world: &'a crate::change_execution::ChangeExecutionWorld,
+    /// 这一对的超时预算，也是两个超时读数（`cogneva_verification_*`）的落点。
+    /// Job 里那两次运行搬回来的读数要并进**同一个**对象：读数跟着工作搬，不随着
+    /// 进程留下，另开一份就成了同一个量的两个来源。
+    budget: &'a Arc<crate::verification_budget::VerificationBudget>,
+    /// 每次构建的代价按入口与结局分开记的那个读数族。Job 那条路的结局由执行侧
+    /// 做出（只有它知道 cargo 是被预算杀的还是自己失败的），所以它的记账要在这里
+    /// 补上——否则这个族在开关打开之后会安静地少掉那部分构建。
+    build_readings: &'a Arc<crate::evolution_build_readings::EvolutionBuildReadings>,
 }
 
 /// 把两条输入通道汇合成本轮要验证的变更集合。
@@ -2081,21 +2129,405 @@ async fn align_engine_baseline(
     }
 }
 
+/// 一条变更执行完之后交到消费阶段的东西。
+///
+/// 执行（apply/fmt/test/commit/release/暂存）与消费（落地/切二进制/晋升）在这里
+/// 分开：前者可以搬到别的进程里，后者不能——切二进制按定义只能由正在跑的那个进程
+/// 做，落地与晋升要一个跨变更串行的账本。分开之后两条执行路径（本进程内 / 一个
+/// Job）交出同一个形状，消费那一段因此只有一份，不会随执行方式分叉。
+enum ExecutedChange {
+    /// 没能做出判定，且坏在环境上。`stage` 是坏在哪一步，`None` 连结果都没读回来；
+    /// 它只用来挑那句已有的措辞——判据不在文本里。
+    Unjudged {
+        change: crate::types::EvolutionResult,
+        stage: Option<crate::change_execution::UnavailableStage>,
+        error: String,
+    },
+    /// 主机整个等待预算里没给出构建槽位：什么都没被判定、什么也没失败。
+    NoBuildSlot {
+        change: crate::types::EvolutionResult,
+        error: String,
+    },
+    /// 有判定。`held` 为真表示按配置停在人工审批上，此时按定义没有产物——它与
+    /// "该有产物却缺了"是两回事，所以缺产物这件事必须由这个标志解释，不能靠推断。
+    Judged {
+        change: crate::types::EvolutionResult,
+        result: crate::ApplyResult,
+        artifact: Option<crate::BuildArtifact>,
+        held: bool,
+    },
+}
+
+/// 派发方的记账：这条变更派出去了，等着收回来。
+enum DispatchedChange {
+    /// 执行留在本进程里（默认）：没有可等的对象，收回来就是在这里把它跑完。
+    InProcess {
+        change: crate::types::EvolutionResult,
+        intent: Option<cog_core::EvolutionIntent>,
+    },
+    /// 已经在集群里跑：等它结束，读回程。入口跟着走——构建的代价记在哪个入口的
+    /// 账上是派发方知道的事，执行侧只报告结局。
+    Job {
+        change: crate::types::EvolutionResult,
+        intent: Option<cog_core::EvolutionIntent>,
+        plan: Box<crate::change_execution::ChangeJobPlan>,
+    },
+    /// 派发就没走成（基线读不到、清单造不出来、kubectl 起不来）。这条变更**没有被
+    /// 执行过**，按"没能做出判定"收口；它是部署面的问题，不是变更的问题，所以理由
+    /// 要带着走，不能假装没发生。
+    Failed {
+        change: crate::types::EvolutionResult,
+        error: String,
+    },
+}
+
+/// 本批的执行侧：每条变更由谁执行。
+///
+/// `job` 为 `None` 就是"执行留在常驻进程里"（默认）——那里没有别的东西在跑，执行
+/// 就发生在调用它的这个进程里。
+struct ChangeExecutor<'a> {
+    job: Option<Box<crate::change_execution::ChangeJobContext>>,
+    world: &'a crate::change_execution::ChangeExecutionWorld,
+    /// 本轮的工作树：基线读它，进程内执行也在它里面跑。
+    workdir: &'a std::path::Path,
+    workspaces: &'a Arc<crate::workspace::WorkspaceManager>,
+}
+
+impl<'a> ChangeExecutor<'a> {
+    /// 本批走哪条执行路径。
+    ///
+    /// 开关关着时连一次 kubectl 都不发生：否则"关"与"开着但派不出去"在集群侧读起来
+    /// 一模一样。开关开着但现场读不回来（命名空间、Pod 名、镜像摘要、挂载面）时退回
+    /// 进程内执行并留一句 warn——那条路把活干完，只是不并行，比丢掉这一轮强；而
+    /// "这一轮没派 Job"必须说出来，不能退成沉默。
+    async fn for_cycle(
+        config: &crate::config::ChangeJobConfig,
+        world: &'a crate::change_execution::ChangeExecutionWorld,
+        workdir: &'a std::path::Path,
+        workspaces: &'a Arc<crate::workspace::WorkspaceManager>,
+    ) -> Self {
+        let mut job = None;
+        if config.enabled {
+            match crate::change_execution::ChangeJobContext::read(config).await {
+                Ok(ctx) => job = Some(Box::new(ctx)),
+                Err(e) => warn!(
+                    error = %e,
+                    "change-execution jobs are enabled but the dispatch side cannot be read; \
+                     executing inside this process for this cycle"
+                ),
+            }
+        }
+        Self {
+            job,
+            world,
+            workdir,
+            workspaces,
+        }
+    }
+
+    /// 并发窗口。进程内那条路是 1：一次构建只有一份算力，"并行"在那里没有对应的
+    /// 东西；窗口的意义只在于常驻进程这一侧最多同时有几个 Job 在跑。
+    fn window(&self) -> usize {
+        match &self.job {
+            None => 1,
+            Some(ctx) => ctx.config.max_parallel.max(1),
+        }
+    }
+
+    /// 把这条变更派出去，不等它结束。
+    async fn dispatch(
+        &self,
+        change: crate::types::EvolutionResult,
+        intent: Option<cog_core::EvolutionIntent>,
+    ) -> DispatchedChange {
+        let Some(ctx) = &self.job else {
+            return DispatchedChange::InProcess { change, intent };
+        };
+        // 基线是**派发这一刻**常驻进程那棵树上的 HEAD，不是本轮开始时的那个：
+        // 执行侧要站在与它同一个提交上。本轮已经落地的变更都在这个 HEAD 里面，
+        // 拿一个更旧的提交当基线，给出的判词就不是这棵树的判词。
+        let Some(base) = self.workspaces.head_of(self.workdir).await else {
+            let error = format!(
+                "the base revision of the cycle workspace at {} could not be read",
+                self.workdir.display()
+            );
+            warn!(change_id = %change.artifact_id, error = %error, "change not dispatched");
+            return DispatchedChange::Failed { change, error };
+        };
+        let request = self.world.request(change.clone(), base, intent);
+        match ctx.dispatch(&request).await {
+            Ok(plan) => DispatchedChange::Job {
+                change,
+                intent,
+                plan: Box::new(plan),
+            },
+            Err(e) => {
+                warn!(change_id = %change.artifact_id, error = %e, "change not dispatched");
+                DispatchedChange::Failed {
+                    change,
+                    error: e.to_string(),
+                }
+            }
+        }
+    }
+
+    /// 等这条变更的执行结束，收成一个值。
+    async fn collect(
+        &self,
+        dispatched: DispatchedChange,
+        deps: CycleDeps<'_>,
+        evo_engine: &crate::EvolutionEngine,
+    ) -> ExecutedChange {
+        match dispatched {
+            DispatchedChange::Failed { change, error } => ExecutedChange::Unjudged {
+                change,
+                stage: None,
+                error,
+            },
+            DispatchedChange::InProcess { change, intent } => {
+                self.run_in_process(change, intent, deps, evo_engine).await
+            }
+            DispatchedChange::Job {
+                change,
+                intent,
+                plan,
+            } => match &self.job {
+                Some(ctx) => collect_dispatched_job(ctx, *plan, change, intent, deps).await,
+                // `dispatch` 只在 `job` 为真时给出 `Job`，这里不可能走到。
+                None => ExecutedChange::Unjudged {
+                    change,
+                    stage: None,
+                    error: "no change-execution job context for a dispatched change".into(),
+                },
+            },
+        }
+    }
+
+    /// 进程内执行一条变更：与从前逐字相同的那一段，只是把结果收成一个值交出去。
+    async fn run_in_process(
+        &self,
+        change: crate::types::EvolutionResult,
+        intent: Option<cog_core::EvolutionIntent>,
+        deps: CycleDeps<'_>,
+        evo_engine: &crate::EvolutionEngine,
+    ) -> ExecutedChange {
+        let CycleDeps {
+            pipeline,
+            deployer,
+            flight,
+            evolution_metrics,
+            config,
+            ..
+        } = deps;
+        // The flight is the apply/test run and nothing after it: the commit, the
+        // release build and the landing that follow each produce readings of
+        // their own, and an age that covered them would report a state the
+        // change is no longer in. The guard ends the reading on the way out of
+        // every path -- a refusal, an error, a panic -- so the only way it can
+        // read as still in flight is for the process to be inside it.
+        let result = match flight
+            .cover(pipeline.apply_and_test_in(&change, self.workdir))
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // `Err` 意味着管线没能对这个变更做出判定（工作树脏、git 起不来），
+                // 判定类失败都以 `Ok(verdict: Refused(..))` 返回并在消费那一侧处理。
+                return ExecutedChange::Unjudged {
+                    change,
+                    stage: Some(crate::change_execution::UnavailableStage::Verification),
+                    error: e.to_string(),
+                };
+            }
+        };
+
+        evo_engine
+            .update_status(&result.change_id, result.new_status)
+            .await;
+
+        if result.reformatted {
+            // The change was conformed to this workspace's formatting and then
+            // judged on what it does. Not a refusal and not a failure: the
+            // count exists because the gate no longer returns such a change, so
+            // without it a generator whose output never needs conforming and
+            // one whose output always does read the same.
+            info!(
+                change_id = %result.change_id,
+                "Change was conformed to the workspace's formatting before it was judged"
+            );
+            if let Some(m) = evolution_metrics {
+                m.record_change_reformatted().await;
+            }
+        }
+
+        if matches!(
+            result.verdict,
+            crate::change_pipeline::ChangeVerdict::Refused(_)
+        ) {
+            return ExecutedChange::Judged {
+                change,
+                result,
+                artifact: None,
+                held: false,
+            };
+        }
+
+        // 等人工批准：管线按同一个判断把树回滚了，这条路上没有构建，也不该有。
+        // 判词照给，"没有产物"作为一个事实由 `held` 解释。
+        if !config.auto_apply || config.manual_approve {
+            return ExecutedChange::Judged {
+                change,
+                result,
+                artifact: None,
+                held: true,
+            };
+        }
+
+        match deployer
+            .commit_and_build_in(&result.change_id, self.workdir, intent)
+            .await
+        {
+            Ok(artifact) => ExecutedChange::Judged {
+                change,
+                result,
+                artifact: Some(artifact),
+                held: false,
+            },
+            // No slot for the whole wait budget: the build never ran, so nothing
+            // about the change was judged and nothing failed. It is not a change
+            // failure and does not go on that account -- the refusal is already
+            // its own reading, and charging the host's load to the change is how
+            // a busy machine reads as broken code.
+            Err(e) if e.is_build_slot_refused() => ExecutedChange::NoBuildSlot {
+                change,
+                error: e.to_string(),
+            },
+            Err(e) => ExecutedChange::Unjudged {
+                change,
+                stage: Some(crate::change_execution::UnavailableStage::Build),
+                error: e.to_string(),
+            },
+        }
+    }
+}
+
+/// 等一个已经派出去的 Job 结束，把回程收成一次执行结果。
+async fn collect_dispatched_job(
+    ctx: &crate::change_execution::ChangeJobContext,
+    plan: crate::change_execution::ChangeJobPlan,
+    change: crate::types::EvolutionResult,
+    intent: Option<cog_core::EvolutionIntent>,
+    deps: CycleDeps<'_>,
+) -> ExecutedChange {
+    let returned = match ctx.collect(&plan).await {
+        Ok(returned) => returned,
+        Err(e) => {
+            // 等待预算用尽、Pod 不在了、kubectl 起不来：这一类里没有判定，也没有
+            // 哪一步失败的证据。变更留在队列里，下一轮接管它。
+            return ExecutedChange::Unjudged {
+                change,
+                stage: None,
+                error: e.to_string(),
+            };
+        }
+    };
+
+    let Some(outcome) = returned.outcome.as_ref() else {
+        // 类别说不可用、又没有结果文件：连请求都没读进去，或者进程根本没起来，
+        // 或者结果写不出去。这不是"构建失败"，是**没读回来**。
+        return ExecutedChange::Unjudged {
+            change,
+            stage: None,
+            error: format!(
+                "the change job ended as {} without leaving an outcome",
+                returned.category.as_str()
+            ),
+        };
+    };
+
+    // 读数跟着工作搬：Job 里那两次运行的耗时与超时次数并进常驻进程的同一个预算
+    // 对象，于是 `cogneva_verification_*` 在执行搬走之后仍然覆盖这些运行。构建的
+    // 结局只有执行侧知道（cargo 是被预算杀的还是自己失败的），所以它随回程一起
+    // 搬回来，在这里记进同一个读数族。
+    deps.budget.adopt_run(
+        crate::verification_budget::KIND_TEST,
+        outcome.test.last_secs,
+        outcome.test.timeouts,
+    );
+    deps.budget.adopt_run(
+        crate::verification_budget::KIND_BUILD,
+        outcome.build.last_secs,
+        outcome.build.timeouts,
+    );
+    if let Some(ending) = outcome.build_ending {
+        deps.build_readings.record(intent, ending);
+    }
+
+    let result = match outcome.apply_result() {
+        Ok(result) => result,
+        Err(e) => {
+            return ExecutedChange::Unjudged {
+                change,
+                stage: None,
+                error: e.to_string(),
+            }
+        }
+    };
+
+    match returned.category {
+        crate::change_execution::ExecutionCategory::Passed => {
+            let artifact = outcome.build_artifact();
+            let held = outcome.held_for_approval;
+            ExecutedChange::Judged {
+                change,
+                result,
+                artifact,
+                held,
+            }
+        }
+        crate::change_execution::ExecutionCategory::Refused => ExecutedChange::Judged {
+            change,
+            result,
+            artifact: None,
+            held: false,
+        },
+        crate::change_execution::ExecutionCategory::Unavailable => match &outcome.unavailable {
+            // 主机没给槽位：这一轮这条变更没被判定过，也没有任何东西失败。
+            Some(u) if u.cause == crate::change_execution::UnavailableCause::NoBuildSlot => {
+                ExecutedChange::NoBuildSlot {
+                    change,
+                    error: u.reason.clone(),
+                }
+            }
+            Some(u) => ExecutedChange::Unjudged {
+                change,
+                stage: Some(u.stage),
+                error: u.reason.clone(),
+            },
+            None => ExecutedChange::Unjudged {
+                change,
+                stage: None,
+                error: "the change job reports no verdict and no reason".into(),
+            },
+        },
+    }
+}
+
 async fn run_evolution_cycle_in(
     deps: CycleDeps<'_>,
     workdir: &std::path::Path,
 ) -> cog_core::SFResult<()> {
+    // 这一层只用得上通往执行与消费的那几项：部署器、切二进制、策略、晋级触发器
+    // 都在消费那一段里按原样取用，在这里解出来只会多出四个没人读的名字。
     let CycleDeps {
         pipeline,
-        deployer,
-        binary_switcher,
         engine,
-        config,
         evolution_metrics,
-        promoter,
         workspaces,
         landing,
-        flight,
+        change_job,
+        world,
+        ..
     } = deps;
     let Some(evo_engine) = engine.evolution.as_ref() else {
         return Ok(());
@@ -2150,321 +2582,362 @@ async fn run_evolution_cycle_in(
     }
 
     info!(count = changes.len(), "Pending evolution changes found");
+    // 执行侧：默认每条变更在本进程里跑完（与从前逐字相同）；`change_job.enabled`
+    // 打开后每条交给一个一过性 Job。窗口只限**派发**：常驻进程这一侧仍然一次
+    // 消费一条——落地、切二进制、晋升都是跨变更的单点，两处并行会把它们变成竞态，
+    // 而这一项要搬的只是「执行」。
+    let executor = ChangeExecutor::for_cycle(change_job, world, workdir, workspaces).await;
+    let window = executor.window();
+    let mut inflight: Vec<DispatchedChange> = Vec::new();
+    let mut next = 0usize;
+    // 派满窗口、收最老的那条、再补派。窗口为 1（默认，也是进程内那条路）时，
+    // 这就是从前那个逐条循环：派一条、收一条、消费一条，顺序一字不差。
+    while next < changes.len() || !inflight.is_empty() {
+        while inflight.len() < window && next < changes.len() {
+            let change = changes[next].clone();
+            next += 1;
+            let intent = recorded.get(&change.artifact_id).and_then(|c| c.intent);
+            inflight.push(executor.dispatch(change, intent).await);
+        }
+        let dispatched = inflight.remove(0);
+        let executed = executor.collect(dispatched, deps, evo_engine).await;
+        consume_executed_change(executed, deps, &recorded).await?;
+    }
 
-    // Process changes serially. Each change is applied, tested, committed,
-    // built, and (when configured) deployed before moving to the next one.
-    for change in changes {
-        let mut refused: Option<cog_core::RejectionCause> = None;
+    Ok(())
+}
 
-        // The flight is the apply/test run and nothing after it: the commit, the
-        // release build and the landing that follow each produce readings of
-        // their own, and an age that covered them would report a state the
-        // change is no longer in. The guard ends the reading on the way out of
-        // every path -- a refusal, an error, a panic -- so the only way it can
-        // read as still in flight is for the process to be inside it.
-        let result = match flight
-            .cover(pipeline.apply_and_test_in(&change, workdir))
-            .await
-        {
-            Ok(r) => r,
+/// 消费一条执行完的变更：判定、落地、切二进制、记账。
+///
+/// 这一段与执行方式无关：它拿到的永远是同一个形状，无论判定来自本进程还是来自一个
+/// 已经退出的 Job。「执行在哪儿发生」是这一项要改的事，而它不该改变任何一条消费
+/// 规则——所以这里的分支与从前逐字相同，只是判定与产物从外面传进来。
+async fn consume_executed_change(
+    executed: ExecutedChange,
+    deps: CycleDeps<'_>,
+    recorded: &std::collections::HashMap<String, cog_core::GeneratedChange>,
+) -> cog_core::SFResult<()> {
+    let CycleDeps {
+        pipeline,
+        binary_switcher,
+        engine,
+        config,
+        evolution_metrics,
+        promoter,
+        workspaces,
+        landing,
+        ..
+    } = deps;
+
+    let (change, result, artifact, held) = match executed {
+        ExecutedChange::Unjudged {
+            change,
+            stage,
+            error,
+        } => {
+            // 没能做出判定（工作树脏、git 起不来、结果没读回来）是**环境**问题：
+            // 变更本身未必有毛病，重试有意义。所以只记结论、不移出队列——在这里
+            // 退休会因一次环境抖动丢掉一个好变更。
+            warn!(error = %error, "Change apply/test could not reach a verdict");
+            let _ = engine
+                .record_change_outcome(&change.artifact_id, false, &unjudged_message(stage, &error))
+                .await;
+            if let Some(m) = evolution_metrics {
+                m.record_event(true).await;
+                m.record_change_failed().await;
+            }
+            return Ok(());
+        }
+        ExecutedChange::NoBuildSlot { change, error } => {
+            // 主机的负载不是变更的毛病：这一轮什么也没被判定，也什么都没失败。
+            warn!(
+                change_id = %change.artifact_id,
+                error = %error,
+                "Change not built this cycle: host had no build slot"
+            );
+            return Ok(());
+        }
+        ExecutedChange::Judged {
+            change,
+            result,
+            artifact,
+            held,
+        } => (change, result, artifact, held),
+    };
+
+    if let Some(cause) = result.verdict.cause() {
+        // The reason is already in the result; carrying it into the log is
+        // what makes a rejection diagnosable without digging the artifact
+        // out of the sandbox by hand.
+        let reason: String = result.test_output.chars().take(500).collect();
+        warn!(
+            change_id = %result.change_id,
+            status = ?result.new_status,
+            cause = cause.as_str(),
+            reason = %reason,
+            "Change rejected; skipping deploy"
+        );
+        fail_and_retire_change(engine, pipeline, landing.map(|l| l.as_ref()), &result).await;
+        // 被拒的这一笔与从前的尾部分支同源：一次否决同时进聚合与它自己的判据。
+        if let Some(m) = evolution_metrics {
+            m.record_event(true).await;
+            m.record_change_failed().await;
+            // Counted under its criterion as well as in the aggregate: the
+            // aggregate says how much the loop is losing, the criterion
+            // says whether to look at the generator, at what it reads from,
+            // or at the verification run — three different repairs that one
+            // number cannot tell apart.
+            m.record_change_rejected(cause).await;
+        }
+        return Ok(());
+    }
+
+    if held {
+        info!(change_id = %result.change_id, "Change awaiting manual approval");
+        // 与从前逐字相同：判的是 auto_deploy（部署那道门），不是决定要不要构建的
+        // auto_apply。两个开关不同向时这里会少记一笔，那是既有的形状，本项只把
+        // 执行搬了家，不改它。
+        if !config.auto_deploy || config.manual_approve {
+            record_awaiting_approval(engine, evolution_metrics, &result.change_id).await;
+        }
+        return Ok(());
+    }
+
+    // 通过必然带产物：进程内那一侧按定义如此（没有产物就只可能是被拒或在等审批），
+    // 跨进程那一侧由读回那一侧保证。走到这里说明那条保证被破坏了——绝不按通过
+    // 放行：没有产物的「通过」会送一条没构建过的变更去落地。
+    let Some(artifact) = artifact else {
+        warn!(
+            change_id = %result.change_id,
+            "A passed change arrived with no artifact; treating it as an environment failure"
+        );
+        let _ = engine
+            .record_change_outcome(
+                &result.change_id,
+                false,
+                "Passed with no artifact: nothing was built to deploy",
+            )
+            .await;
+        if let Some(m) = evolution_metrics {
+            m.record_event(true).await;
+            m.record_change_failed().await;
+        }
+        return Ok(());
+    };
+
+    info!(
+        change_id = %artifact.change_id,
+        commit = %artifact.commit_hash,
+        "Change committed and built"
+    );
+
+    // 沙盒已经验过这个提交（apply → test → release build）：把它落到
+    // 主分支上，而不是把这个变更留在沙盒里。落地必须先于二进制切换——
+    // 切换会 exec 掉本进程，之后的代码在真实部署里永远不会执行。
+    // 落地失败不放行部署：镜像里跑着主分支没有的代码，是最难排查的
+    // 那种分叉。
+    if let Some(landing) = landing {
+        // 变更本来是记录里的那份就落它那份：从产物重建出来的副本只剩
+        // 描述与正文，记录里比产物多出来的字段（问题号、评审分）会被
+        // 落地的写回覆盖成默认值。
+        let landed = recorded
+            .get(&artifact.change_id)
+            .cloned()
+            .unwrap_or_else(|| cog_core::GeneratedChange {
+                change_id: artifact.change_id.clone(),
+                goal: change.description.clone(),
+                content: change.content.clone(),
+                affected_files: cog_core::parse_diff_affected_files(&change.content)
+                    .unwrap_or_default(),
+                ..Default::default()
+            });
+        let source = cog_core::LandedSource {
+            repo: workspaces.bare_repo().to_path_buf(),
+            rev: artifact.commit_hash.clone(),
+        };
+        match landing.land(&landed, Some(&source)).await {
+            Ok(rev) => {
+                info!(
+                    change_id = %artifact.change_id,
+                    rev = %rev,
+                    "Change landed on the base branch"
+                );
+                retire_landed_change(pipeline, &artifact.change_id).await;
+            }
             Err(e) => {
-                // `Err` 意味着管线没能对这个变更做出判定（工作树脏、git 起不来），
-                // 判定类失败都以 `Ok(verdict: Refused(..))` 返回并在下面处理。环境
-                // 问题可以靠重试自愈，变更本身未必有毛病，所以只记结论、不移出队列
-                // ——在这里退休会因一次环境抖动丢掉一个好变更。
-                warn!(error = %e, "Change apply/test could not reach a verdict");
+                warn!(
+                    change_id = %artifact.change_id,
+                    error = %e,
+                    "Landing on the base branch failed; change left undeployed"
+                );
                 let _ = engine
                     .record_change_outcome(
-                        &change.artifact_id,
+                        &artifact.change_id,
                         false,
-                        &format!("Pipeline error: {}", e),
+                        &format!("Landing failed: {}", e),
                     )
                     .await;
                 if let Some(m) = evolution_metrics {
                     m.record_event(true).await;
                     m.record_change_failed().await;
                 }
-                continue;
-            }
-        };
-
-        evo_engine
-            .update_status(&result.change_id, result.new_status)
-            .await;
-
-        if result.reformatted {
-            // The change was conformed to this workspace's formatting and then
-            // judged on what it does. Not a refusal and not a failure: the
-            // count exists because the gate no longer returns such a change, so
-            // without it a generator whose output never needs conforming and
-            // one whose output always does read the same.
-            info!(
-                change_id = %result.change_id,
-                "Change was conformed to the workspace's formatting before it was judged"
-            );
-            if let Some(m) = evolution_metrics {
-                m.record_change_reformatted().await;
-            }
-        }
-
-        if let Some(cause) = result.verdict.cause() {
-            // The reason is already in the result; carrying it into the log is
-            // what makes a rejection diagnosable without digging the artifact
-            // out of the sandbox by hand.
-            let reason: String = result.test_output.chars().take(500).collect();
-            warn!(
-                change_id = %result.change_id,
-                status = ?result.new_status,
-                cause = cause.as_str(),
-                reason = %reason,
-                "Change rejected; skipping deploy"
-            );
-            fail_and_retire_change(engine, pipeline, landing.map(|l| l.as_ref()), &result).await;
-            refused = Some(cause);
-        } else if !config.auto_apply || config.manual_approve {
-            info!(change_id = %result.change_id, "Change awaiting manual approval");
-        } else {
-            // The change's entry point is carried on the landing record when it
-            // came from one. A change that came in through the local artifact
-            // queue has no such record here, and its build is recorded as
-            // unattributed: naming it after the queue would put a kind on the
-            // reading that nobody determined.
-            let intent = recorded.get(&result.change_id).and_then(|c| c.intent);
-            let artifact = match deployer
-                .commit_and_build_in(&result.change_id, workdir, intent)
-                .await
-            {
-                Ok(a) => a,
-                // No slot for the whole wait budget: the build never ran, so
-                // nothing about the change was judged and nothing failed. It is
-                // not a change failure and does not go on that account -- the
-                // refusal is already its own reading, and charging the host's
-                // load to the change is how a busy machine reads as broken code.
-                Err(e) if e.is_build_slot_refused() => {
-                    warn!(
-                        change_id = %result.change_id,
-                        error = %e,
-                        "Change not built this cycle: host had no build slot"
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    warn!(change_id = %result.change_id, error = %e, "Change commit/build failed");
-                    let _ = engine
-                        .record_change_outcome(
-                            &result.change_id,
-                            false,
-                            &format!("Build failed: {}", e),
-                        )
-                        .await;
-                    if let Some(m) = evolution_metrics {
-                        m.record_event(true).await;
-                        m.record_change_failed().await;
-                    }
-                    continue;
-                }
-            };
-
-            info!(
-                change_id = %artifact.change_id,
-                commit = %artifact.commit_hash,
-                "Change committed and built"
-            );
-
-            // 沙盒已经验过这个提交（apply → test → release build）：把它落到
-            // 主分支上，而不是把这个变更留在沙盒里。落地必须先于二进制切换——
-            // 切换会 exec 掉本进程，之后的代码在真实部署里永远不会执行。
-            // 落地失败不放行部署：镜像里跑着主分支没有的代码，是最难排查的
-            // 那种分叉。
-            if let Some(landing) = landing {
-                // 变更本来是记录里的那份就落它那份：从产物重建出来的副本只剩
-                // 描述与正文，记录里比产物多出来的字段（问题号、评审分）会被
-                // 落地的写回覆盖成默认值。
-                let landed = recorded
-                    .get(&artifact.change_id)
-                    .cloned()
-                    .unwrap_or_else(|| cog_core::GeneratedChange {
-                        change_id: artifact.change_id.clone(),
-                        goal: change.description.clone(),
-                        content: change.content.clone(),
-                        affected_files: cog_core::parse_diff_affected_files(&change.content)
-                            .unwrap_or_default(),
-                        ..Default::default()
-                    });
-                let source = cog_core::LandedSource {
-                    repo: workspaces.bare_repo().to_path_buf(),
-                    rev: artifact.commit_hash.clone(),
-                };
-                match landing.land(&landed, Some(&source)).await {
-                    Ok(rev) => {
-                        info!(
-                            change_id = %artifact.change_id,
-                            rev = %rev,
-                            "Change landed on the base branch"
-                        );
-                        retire_landed_change(pipeline, &artifact.change_id).await;
-                    }
-                    Err(e) => {
-                        warn!(
-                            change_id = %artifact.change_id,
-                            error = %e,
-                            "Landing on the base branch failed; change left undeployed"
-                        );
-                        let _ = engine
-                            .record_change_outcome(
-                                &artifact.change_id,
-                                false,
-                                &format!("Landing failed: {}", e),
-                            )
-                            .await;
-                        if let Some(m) = evolution_metrics {
-                            m.record_event(true).await;
-                            m.record_change_failed().await;
-                        }
-                        // The channel classified this failure as the paths the
-                        // change touches -- a property of the change, not of the
-                        // world around it -- so running the change again repeats
-                        // the same refusal. Retire it rather than leaving it in
-                        // the queue: an entry left there is rebuilt from scratch
-                        // on the next cycle, and that release build takes the
-                        // single build slot the deployer needs to advance. On
-                        // 2026-09-27 one change the whitelist had already refused
-                        // was rebuilt and refused seven times in under two hours.
-                        //
-                        // Every other landing failure keeps the behaviour it had
-                        // and stays in the queue -- including a size refusal,
-                        // which owner approval can still waive. Only a path
-                        // refusal leaves the channel as `Validation`; the other
-                        // categories arrive as `Internal`, and a category this
-                        // side has never heard of keeps that same retryable
-                        // default rather than being retired unread.
-                        if matches!(&e, cog_core::SFError::Validation(_)) {
-                            retire_change_everywhere(
-                                pipeline,
-                                Some(landing.as_ref()),
-                                &artifact.change_id,
-                                &format!("landing refused the change itself: {e}"),
-                            )
-                            .await;
-                        }
-                        continue;
-                    }
-                }
-            }
-
-            if !config.auto_deploy {
-                info!(change_id = %artifact.change_id, "Build artifact awaiting manual deploy");
-            } else {
-                let Some(switcher) = binary_switcher else {
-                    warn!("auto_deploy enabled but no BinarySwitcher service available");
-                    let _ = engine
-                        .record_change_outcome(
-                            &artifact.change_id,
-                            false,
-                            "No BinarySwitcher service available",
-                        )
-                        .await;
-                    if let Some(m) = evolution_metrics {
-                        m.record_event(true).await;
-                        m.record_change_failed().await;
-                    }
-                    continue;
-                };
-
-                if let Err(e) = switcher.stage_new_binary(&artifact.new_binary_path).await {
-                    warn!(change_id = %artifact.change_id, error = %e, "Staging failed");
-                    let _ = engine
-                        .record_change_outcome(
-                            &artifact.change_id,
-                            false,
-                            &format!("Staging failed: {}", e),
-                        )
-                        .await;
-                    if let Some(m) = evolution_metrics {
-                        m.record_event(true).await;
-                        m.record_change_failed().await;
-                    }
-                    continue;
-                }
-                info!(change_id = %artifact.change_id, "Staging new binary for switch");
-
-                // switch_and_restart may exec the current process and never return.
-                if let Err(e) = switcher.switch_and_restart().await {
-                    warn!(error = %e, "Switch failed; attempting rollback");
-                    if let Err(rb_e) = switcher.rollback().await {
-                        warn!(error = %rb_e, "Rollback failed");
-                    }
-                    let _ = engine
-                        .record_change_outcome(
-                            &artifact.change_id,
-                            false,
-                            &format!("Switch failed: {}", e),
-                        )
-                        .await;
-                    if let Some(m) = evolution_metrics {
-                        m.record_event(true).await;
-                        m.record_change_failed().await;
-                    }
-                    return Err(e);
-                }
-
-                let _ = engine
-                    .record_change_outcome(
+                // The channel classified this failure as the paths the
+                // change touches -- a property of the change, not of the
+                // world around it -- so running the change again repeats
+                // the same refusal. Retire it rather than leaving it in
+                // the queue: an entry left there is rebuilt from scratch
+                // on the next cycle, and that release build takes the
+                // single build slot the deployer needs to advance. On
+                // 2026-09-27 one change the whitelist had already refused
+                // was rebuilt and refused seven times in under two hours.
+                //
+                // Every other landing failure keeps the behaviour it had
+                // and stays in the queue -- including a size refusal,
+                // which owner approval can still waive. Only a path
+                // refusal leaves the channel as `Validation`; the other
+                // categories arrive as `Internal`, and a category this
+                // side has never heard of keeps that same retryable
+                // default rather than being retired unread.
+                if matches!(&e, cog_core::SFError::Validation(_)) {
+                    retire_change_everywhere(
+                        pipeline,
+                        Some(landing.as_ref()),
                         &artifact.change_id,
-                        true,
-                        "Change applied, tested, built, and deployed",
+                        &format!("landing refused the change itself: {e}"),
                     )
                     .await;
-                if let Some(m) = evolution_metrics {
-                    m.record_change_applied().await;
-                    m.record_event(false).await;
                 }
-                // 沙盒部署成功 → 交晋级触发器（soak → 分级 → GitOps/审批台）。
-                // 显式带上待发布提交：本轮工作树是临时的，晋级经 soak 后才跑，
-                // 那时它可能已经归还，推送端只按裸仓库里的提交发布。
-                if let Some(p) = promoter {
-                    let p = p.clone();
-                    let source = crate::PromotionSource {
-                        repo: workspaces.bare_repo().to_path_buf(),
-                        rev: artifact.commit_hash.clone(),
-                    };
-                    let promoted_change = change.clone();
-                    tokio::spawn(async move {
-                        p.on_sandbox_deployed(promoted_change, Some(source)).await;
-                    });
-                }
-                continue;
-            }
-        }
-
-        if let Some(cause) = refused {
-            if let Some(m) = evolution_metrics {
-                m.record_event(true).await;
-                m.record_change_failed().await;
-                // Counted under its criterion as well as in the aggregate: the
-                // aggregate says how much the loop is losing, the criterion
-                // says whether to look at the generator, at what it reads from,
-                // or at the verification run — three different repairs that one
-                // number cannot tell apart.
-                m.record_change_rejected(cause).await;
-            }
-        } else if !config.auto_deploy || config.manual_approve {
-            // Change succeeded tests but is waiting for approval; count as
-            // a successful processing step without applying/deploying.
-            let _ = engine
-                .record_change_outcome(
-                    &result.change_id,
-                    true,
-                    "Change passed tests; awaiting manual approval",
-                )
-                .await;
-            if let Some(m) = evolution_metrics {
-                m.record_event(false).await;
+                return Ok(());
             }
         }
     }
 
+    if !config.auto_deploy {
+        info!(change_id = %artifact.change_id, "Build artifact awaiting manual deploy");
+    } else {
+        let Some(switcher) = binary_switcher else {
+            warn!("auto_deploy enabled but no BinarySwitcher service available");
+            let _ = engine
+                .record_change_outcome(
+                    &artifact.change_id,
+                    false,
+                    "No BinarySwitcher service available",
+                )
+                .await;
+            if let Some(m) = evolution_metrics {
+                m.record_event(true).await;
+                m.record_change_failed().await;
+            }
+            return Ok(());
+        };
+
+        if let Err(e) = switcher.stage_new_binary(&artifact.new_binary_path).await {
+            warn!(change_id = %artifact.change_id, error = %e, "Staging failed");
+            let _ = engine
+                .record_change_outcome(
+                    &artifact.change_id,
+                    false,
+                    &format!("Staging failed: {}", e),
+                )
+                .await;
+            if let Some(m) = evolution_metrics {
+                m.record_event(true).await;
+                m.record_change_failed().await;
+            }
+            return Ok(());
+        }
+        info!(change_id = %artifact.change_id, "Staging new binary for switch");
+
+        // switch_and_restart may exec the current process and never return.
+        if let Err(e) = switcher.switch_and_restart().await {
+            warn!(error = %e, "Switch failed; attempting rollback");
+            if let Err(rb_e) = switcher.rollback().await {
+                warn!(error = %rb_e, "Rollback failed");
+            }
+            let _ = engine
+                .record_change_outcome(&artifact.change_id, false, &format!("Switch failed: {}", e))
+                .await;
+            if let Some(m) = evolution_metrics {
+                m.record_event(true).await;
+                m.record_change_failed().await;
+            }
+            return Err(e);
+        }
+
+        let _ = engine
+            .record_change_outcome(
+                &artifact.change_id,
+                true,
+                "Change applied, tested, built, and deployed",
+            )
+            .await;
+        if let Some(m) = evolution_metrics {
+            m.record_change_applied().await;
+            m.record_event(false).await;
+        }
+        // 沙盒部署成功 → 交晋级触发器（soak → 分级 → GitOps/审批台）。
+        // 显式带上待发布提交：本轮工作树是临时的，晋级经 soak 后才跑，
+        // 那时它可能已经归还，推送端只按裸仓库里的提交发布。
+        if let Some(p) = promoter {
+            let p = p.clone();
+            let source = crate::PromotionSource {
+                repo: workspaces.bare_repo().to_path_buf(),
+                rev: artifact.commit_hash.clone(),
+            };
+            let promoted_change = change.clone();
+            tokio::spawn(async move {
+                p.on_sandbox_deployed(promoted_change, Some(source)).await;
+            });
+        }
+        return Ok(());
+    }
+
+    // 落了地但没有部署（auto_deploy 关着）：与从前逐字相同的那一笔。
+    if !config.auto_deploy || config.manual_approve {
+        record_awaiting_approval(engine, evolution_metrics, &result.change_id).await;
+    }
     Ok(())
+}
+
+/// 「测试过了、在等人工批准」这一笔：既用在按配置停在审批上的那条路，也用在构建
+/// 好了但没部署的那条路。措辞与从前一字不差。
+async fn record_awaiting_approval(
+    engine: &crate::ReflectionEngine,
+    metrics: Option<&Arc<dyn cog_core::EvolutionMetrics>>,
+    change_id: &str,
+) {
+    // Change succeeded tests but is waiting for approval; count as
+    // a successful processing step without applying/deploying.
+    let _ = engine
+        .record_change_outcome(
+            change_id,
+            true,
+            "Change passed tests; awaiting manual approval",
+        )
+        .await;
+    if let Some(m) = metrics {
+        m.record_event(false).await;
+    }
+}
+
+/// 执行侧报回来的「没做出判定」该写成哪句话。
+///
+/// 措辞在这一侧定：跨进程搬回来的只有「坏在哪一步」这个事实，文本本身不是判据，
+/// 也不该被拿去做判据。
+fn unjudged_message(
+    stage: Option<crate::change_execution::UnavailableStage>,
+    reason: &str,
+) -> String {
+    use crate::change_execution::UnavailableStage;
+    match stage {
+        // 与进程内那条路上已有的两句话同源：构建失败与「管线没能判定」要落在
+        // 不同的账上，合并成一句就是把归因丢掉。
+        Some(UnavailableStage::Build) => format!("Build failed: {reason}"),
+        Some(UnavailableStage::Verification) => format!("Pipeline error: {reason}"),
+        // 连执行都没读回来（Job 没起来、结果没写出来、等待预算用尽）：它既不是
+        // 「管线没能判定」，也不是「构建失败」，所以不借用那两句话。
+        None => format!("Change execution could not be read back: {reason}"),
+    }
 }
 
 /// Static descriptor for auto-discovery.
@@ -2480,6 +2953,32 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 执行侧的"没做出判定"按**坏在哪一步**分账，不合并成一句话。
+    ///
+    /// 两句话各自对上进程内那条路上原有的写法：构建失败与管线没能判定要落在不同的
+    /// 账上。而"连执行都没读回来"（Job 没起来、结果没写出来、等待预算用尽）是第三
+    /// 种，不许借用前两句话——那会把归因从"没读到"改成"某一步失败了"，判词里就有
+    /// 了一个没发生过的失败。
+    #[test]
+    fn an_unreadable_execution_does_not_borrow_a_step_failure_wording() {
+        use crate::change_execution::UnavailableStage;
+        assert_eq!(
+            unjudged_message(Some(UnavailableStage::Verification), "dirty working tree"),
+            "Pipeline error: dirty working tree"
+        );
+        assert_eq!(
+            unjudged_message(Some(UnavailableStage::Build), "no build slot"),
+            "Build failed: no build slot"
+        );
+        let unread = unjudged_message(None, "the change job never started");
+        assert!(
+            !unread.starts_with("Pipeline error") && !unread.starts_with("Build failed"),
+            "an unreadable execution borrowed a failure wording: {unread}"
+        );
+        // 理由必须带着走：没有理由的"不可用"在读的人那里等于没有读数。
+        assert!(unread.contains("the change job never started"), "{unread}");
+    }
 
     /// 落地通道替身：验证循环从它只读"待验证的记录"。其余方法一律炸掉——输入
     /// 汇合这一步不该落地、不该记录、也不该退休。

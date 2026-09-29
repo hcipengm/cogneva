@@ -225,6 +225,145 @@ impl PromotionGateConfig {
     }
 }
 
+/// 按变更一次的执行 Job：一次最多派几个、Job 自己的资源面与时限。
+///
+/// 默认 `enabled=false`——与从前逐字相同，执行留在常驻进程里。这不是保守取值，
+/// 而是因为打开它是一次**资源预算决定**，不是一次配置翻转：Job 的容器必须声明
+/// `limits.cpu`（不声明时命名空间 LimitRange 的 `defaultCpu` 会按 500m 补齐，而
+/// release 构建在这一档上限下会被限流到跑不完整个构建预算），而声明出来的那一份
+/// 要占命名空间 `limits.cpu` 的配额。那份配额已经按「稳态 15 + 判据 Job 2 +
+/// 替换期 1.5」恰好算满，多一个消费者之前要先决定从谁身上切：进化负载自己的 4 核
+/// 里切一份给 Job，还是抬命名空间上限。这个旋钮不替那个决定做选择，它只保证决定
+/// 之后一个值就能生效。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChangeJobConfig {
+    pub enabled: bool,
+    /// 一次最多同时派几个执行 Job。默认 1：与常驻进程里逐条处理的并发度相同，
+    /// 也是命名空间配额在现状下容得下的数。值真的用来限并发派发——派满就等。
+    pub max_parallel: usize,
+    /// 派发后等这个 Job 结束的上界（秒），同时就是 Job 的
+    /// `activeDeadlineSeconds`：两处必须是同一个数。等待比 Job 自己的上界长，
+    /// 等到的永远是「超时」；短了，会在 Job 还在写结果的时候走掉，把一次可能
+    /// 通过的执行读成「读不到结果」。默认值是算出来的：验证预算 3600 + 构建预算
+    /// 3600 + 构建闸门排队 1800 + 收尾 600。改那两个预算就要一起重算它。
+    pub deadline_secs: u64,
+    /// Job 结束后对象保留的时长（秒），供事后读日志与终止消息。
+    pub ttl_secs_after_finished: u64,
+    /// 轮询 Job 状态的间隔（秒）。
+    pub poll_interval_secs: u64,
+    /// Job 容器的资源面（K8s quantity 字符串）。缺任何一项都会把该容器的 QoS
+    /// 打回 BestEffort，而它偏偏是决定「这条变更过不过」的那个进程。取值来自本
+    /// Pod 在真实 release 构建中的实测（工作集峰值 1.41GiB、CPU 速率 1.16 核）；
+    /// 内存上限给到实测峰值的数倍，因为 rustc 的峰值远高于平均值。
+    pub job_cpu_request: String,
+    pub job_memory_request: String,
+    pub job_cpu_limit: String,
+    pub job_memory_limit: String,
+    /// 执行 Job 的镜像拉取策略。Job 的镜像取自本 Pod 的 `imageID`（带摘要），
+    /// 同一节点上必然已在本地，故默认 `IfNotPresent`。
+    pub image_pull_policy: String,
+    /// 请求文件与结果文件的落点（共享卷内的目录，按变更 id 再分一层）。
+    pub delivery_dir: String,
+    /// 派发方调用的 kubectl。默认按 PATH 找 `kubectl`：K3s 的多调用二进制挂在
+    /// `/usr/local/bin/kubectl`，它按 `argv` 的第一个参数决定自己是谁，所以这个
+    /// 路径同时就是 kubectl；标准 K8s 或镜像自带 kubectl 时同样在 PATH 上。
+    /// 派发方向集群要的只有这一条命令。
+    pub kubectl_bin: String,
+}
+
+impl Default for ChangeJobConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_parallel: 1,
+            deadline_secs: 9600,
+            ttl_secs_after_finished: 86400,
+            poll_interval_secs: 10,
+            job_cpu_request: "500m".into(),
+            job_memory_request: "2Gi".into(),
+            job_cpu_limit: "2000m".into(),
+            job_memory_limit: "6Gi".into(),
+            image_pull_policy: "IfNotPresent".into(),
+            delivery_dir: "/opt/cogneva/sandbox/change-exec".into(),
+            kubectl_bin: "kubectl".into(),
+        }
+    }
+}
+
+impl ChangeJobConfig {
+    /// 从 cogneva.json 的 `self_evolution.change_job` 段加载，再叠加 env 覆盖。
+    /// 文件或段缺失时返回 Default（enabled=false，等于从前）。段存在但解析失败、
+    /// 或 env 值非法时返回 Err——配置写错必须响亮失败，不许静默降级成默认。
+    pub fn load() -> SFResult<Self> {
+        let path = std::env::var("COGNEVA_CONFIG_PATH")
+            .unwrap_or_else(|_| "/etc/cogneva/cogneva.json".into());
+        Self::load_from(Path::new(&path))
+    }
+
+    pub fn load_from(path: &Path) -> SFResult<Self> {
+        let mut cfg = match std::fs::read_to_string(path) {
+            Ok(text) => {
+                let root: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|e| SFError::Config(format!("{}: {e}", path.display())))?;
+                match root.pointer("/self_evolution/change_job") {
+                    Some(section) => serde_json::from_value(section.clone()).map_err(|e| {
+                        SFError::Config(format!(
+                            "{} self_evolution.change_job: {e}",
+                            path.display()
+                        ))
+                    })?,
+                    None => Self::default(),
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) => return Err(SFError::Config(format!("{}: {e}", path.display()))),
+        };
+        cfg.apply_env_with(|k| std::env::var(k).ok())?;
+        Ok(cfg)
+    }
+
+    /// env 覆盖。取值经 `get` 读取（测试可注入假 env）；非法值返回 Err。
+    pub fn apply_env_with(&mut self, get: impl Fn(&str) -> Option<String>) -> SFResult<()> {
+        fn parse<T: std::str::FromStr>(key: &str, raw: &str) -> SFResult<T> {
+            raw.parse::<T>()
+                .map_err(|_| SFError::Config(format!("{key} 值非法: {raw:?}")))
+        }
+        if let Some(v) = get("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_ENABLED") {
+            self.enabled = parse("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_ENABLED", &v)?;
+        }
+        if let Some(v) = get("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_MAX_PARALLEL") {
+            self.max_parallel = parse("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_MAX_PARALLEL", &v)?;
+        }
+        if let Some(v) = get("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_DEADLINE_SECS") {
+            self.deadline_secs = parse("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_DEADLINE_SECS", &v)?;
+        }
+        if let Some(v) = get("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_POLL_INTERVAL_SECS") {
+            self.poll_interval_secs =
+                parse("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_POLL_INTERVAL_SECS", &v)?;
+        }
+        if let Some(v) = get("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_CPU_REQUEST") {
+            self.job_cpu_request = v;
+        }
+        if let Some(v) = get("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_MEMORY_REQUEST") {
+            self.job_memory_request = v;
+        }
+        if let Some(v) = get("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_CPU_LIMIT") {
+            self.job_cpu_limit = v;
+        }
+        if let Some(v) = get("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_MEMORY_LIMIT") {
+            self.job_memory_limit = v;
+        }
+        if let Some(v) = get("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_DELIVERY_DIR") {
+            self.delivery_dir = v;
+        }
+        if let Some(v) = get("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_KUBECTL_BIN") {
+            self.kubectl_bin = v;
+        }
+        Ok(())
+    }
+}
+
 /// 基线移植触发器配置（规则3：公版出新 release tag 后把历代晋级变更
 /// 自治移植到新基线）。porter 本体在沙盒进化 Pod 内运行，轮询上游 tag，
 /// 产出 `evol/<id>` 分支与 `gen-n` 代际 tag。
@@ -1213,6 +1352,64 @@ mod tests {
         // 主/网关/执行器 name 都是 cogneva，单标签选择器会跨部署误判。
         assert_eq!(cfg.targets[0].name, "cogneva");
         assert_eq!(cfg.targets[3].name, "cogneva-evolution");
+    }
+
+    #[test]
+    fn change_job_section_loads_and_env_overrides() {
+        let dir =
+            std::env::temp_dir().join(format!("cog-reflection-cj-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cogneva.json");
+        std::fs::write(
+            &path,
+            r#"{"self_evolution": {"change_job": {"enabled": true, "max_parallel": 3}}}"#,
+        )
+        .unwrap();
+        let cfg = ChangeJobConfig::load_from(&path).unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.max_parallel, 3);
+        // 段里没写的项取默认值，不取零。
+        assert_eq!(cfg.deadline_secs, ChangeJobConfig::default().deadline_secs);
+        assert_eq!(
+            cfg.poll_interval_secs,
+            ChangeJobConfig::default().poll_interval_secs
+        );
+
+        // 段缺席时是默认，且默认是关：等于从前，执行留在常驻进程里。
+        std::fs::write(&path, r#"{"self_evolution": {"enabled": true}}"#).unwrap();
+        let cfg = ChangeJobConfig::load_from(&path).unwrap();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.max_parallel, 1);
+        std::fs::remove_dir_all(&dir).ok();
+
+        let env: HashMap<&str, &str> = [
+            ("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_ENABLED", "true"),
+            ("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_MAX_PARALLEL", "2"),
+            ("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_MEMORY_LIMIT", "3Gi"),
+            (
+                "COGNEVA_SELF_EVOLUTION_CHANGE_JOB_KUBECTL_BIN",
+                "/usr/local/bin/kubectl",
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut cfg = ChangeJobConfig::default();
+        cfg.apply_env_with(|k| env.get(k).map(|s| s.to_string()))
+            .unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.max_parallel, 2);
+        assert_eq!(cfg.job_memory_limit, "3Gi");
+        assert_eq!(cfg.kubectl_bin, "/usr/local/bin/kubectl");
+        // 默认走 PATH 上的 kubectl：本 Pod 把 k3s 多调用二进制挂成
+        // /usr/local/bin/kubectl（argv[0]=kubectl 即 kubectl），正好在 PATH 上。
+        assert_eq!(ChangeJobConfig::default().kubectl_bin, "kubectl");
+
+        let bad: HashMap<&str, &str> = [("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_MAX_PARALLEL", "nope")]
+            .into_iter()
+            .collect();
+        assert!(ChangeJobConfig::default()
+            .apply_env_with(|k| bad.get(k).map(|s| s.to_string()))
+            .is_err());
     }
 
     #[test]

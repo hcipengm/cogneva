@@ -252,6 +252,14 @@ spec:
           env:
             - name: COGNEVA_CONFIG_PATH
               value: "/etc/cogneva/cogneva.json"
+            # 本 Pod 的名字：按变更派出的执行 Job 要跑**同一份代码**，而"同一份"
+            # 只能从本 Pod 的 `status.containerStatuses[].imageID`（带摘要）读出来；
+            # 读自己那份状态得先叫得出自己的名字。读不到名字时不派 Job，不回退成
+            # 用浮动 tag 派——子进程可能因此跑在另一份代码上。
+            - name: COGNEVA_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             # 告警邮件出口的 SMTP 口令：凭证不进清单也不进 values，只认这个
             # Secret 键，缺省即不做鉴权。主应用 Pod 也跑同一条告警桥，两处同源。
             - name: COGNEVA_ALERTMANAGER_EMAIL_SMTP_PASSWORD

@@ -140,6 +140,47 @@ impl Default for VerificationBudget {
     }
 }
 
+impl VerificationBudget {
+    /// What the last run of this kind took, for a caller that has to carry the
+    /// reading somewhere else. Without it the reading exists only as a metric
+    /// emitted by this process, so a run that happened in another process --
+    /// which is where execution goes when it moves off the long-running one --
+    /// would be a run this family of readings never sees.
+    ///
+    /// `None` is not zero: a zero-second run is a real reading, and reporting an
+    /// absent one as zero says "instant" instead of "nothing has happened".
+    pub fn last_run_secs(&self, kind: &str) -> Option<u64> {
+        match self.last_slot(kind).load(Ordering::Relaxed) {
+            NO_RUN => None,
+            secs => Some(secs),
+        }
+    }
+
+    /// How many runs of this kind the budget has killed. A counter rather than a
+    /// flag because the reader on the other side of a process boundary adds what
+    /// it is told to its own, and "how many" is what can be added.
+    pub fn timeouts(&self, kind: &str) -> u64 {
+        self.timeout_counter(kind).load(Ordering::Relaxed)
+    }
+
+    /// Take on readings produced elsewhere. Same quantities, same kinds, so the
+    /// reader that was already asking this process about one of them keeps
+    /// getting the same answer when the work moves.
+    ///
+    /// The elapsed time is written only when the other side had one: an absent
+    /// reading must not overwrite a real one from an earlier run in this
+    /// process, and a killed run deliberately carries no elapsed time (its
+    /// duration is the budget, not a measurement of the work).
+    pub fn adopt_run(&self, kind: &str, elapsed_secs: Option<u64>, timeouts: u64) {
+        if let Some(secs) = elapsed_secs {
+            self.record_run(kind, secs);
+        }
+        for _ in 0..timeouts {
+            self.record_timeout(kind);
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl Observable for VerificationBudget {
     async fn collect_metrics(&self, _dimension: &str) -> SFResult<Vec<RawMetric>> {

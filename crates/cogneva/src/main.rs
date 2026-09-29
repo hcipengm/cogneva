@@ -60,6 +60,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 主线跟踪自动部署的滚动端：独立 Job Pod 内执行，四部署门禁滚动，
         // 任一失败反向回滚 prev tag（进程本身跑在新镜像里，顺带 smoke test）。
         Command::MainlineRollout => cog_reflection::run_rollout_cli().await,
+        // 一条变更的一次执行：独立 Job Pod 内执行，apply → 验证 → 提交 → release
+        // 构建 → 暂存二进制，判定写回共享卷上的结果文件，进程退出即结束。
+        Command::ExecuteChange => cog_reflection::change_execution::run_execute_change_cli().await,
         // 数据面备份与恢复：CronJob 每日打包，换机/重装由一次性恢复 Job 消费。
         Command::Backup => cogneva::backup::run_backup_from_env().await,
         Command::Restore => cogneva::backup::run_restore_from_env().await,

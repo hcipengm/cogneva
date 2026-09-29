@@ -77,7 +77,11 @@ pub const BUILD_OUTCOMES: [&str; 4] = ["built", "failed", "timed_out", OUTCOME_U
 /// keeps the two readings apart: a build the budget killed spent real host time
 /// and is not a measurement of the work, and the caller cannot record it as
 /// one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// 可序列化是为了越过进程边界：构建搬进一个一过性 Job 之后，只有执行侧知道
+/// cargo 是被预算杀的还是自己失败的，而记账要在常驻进程那一侧、记进同一个读数族。
+/// 判定它是什么**只有一处**（部署器），过边界的只是这个结论本身。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BuildEnding {
     /// cargo finished and the binary was staged.
     Built(Duration),
