@@ -533,7 +533,7 @@ The entry script automatically detects whether your network is in mainland China
 ### 🐧 Linux
 
 ```bash
-(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh || curl -fsSL -m 15 https://gitee.com/hcipengm/cogneva/raw/main/bootstrap.sh) | sh
+(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh || curl -fsSL -m 15 "https://gitee.com/api/v5/repos/hcipengm/cogneva/contents/bootstrap.sh?ref=main" | sed -n 's/.*"content":"\([^"]*\)".*/\1/p' | base64 -d) | sh
 ```
 
 Runs directly on the bare metal.
@@ -541,7 +541,7 @@ Runs directly on the bare metal.
 ### 🍎 macOS
 
 ```bash
-(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh || curl -fsSL -m 15 https://gitee.com/hcipengm/cogneva/raw/main/bootstrap.sh) | sh
+(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh || curl -fsSL -m 15 "https://gitee.com/api/v5/repos/hcipengm/cogneva/contents/bootstrap.sh?ref=main" | sed -n 's/.*"content":"\([^"]*\)".*/\1/p' | base64 -d) | sh
 ```
 
 The **same command**. K3s needs a Linux kernel, so the script automatically installs [Lima](https://lima-vm.io) (via Homebrew) and creates an Ubuntu VM, then runs the exact same one-liner inside it. All dependencies live inside the VM; the host only gets `limactl`. When finished, the WebUI is forwarded to <http://localhost:8080>. Manage the VM with `limactl shell cogneva` / `limactl stop cogneva` / `limactl delete cogneva`.
@@ -555,7 +555,7 @@ iwr -useb https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.ps1 
 
 The script installs WSL2 + Ubuntu (prompts for a reboot if required — just re-run it afterwards, it is idempotent), then runs the same one-liner inside WSL. WSL2's default localhostForwarding exposes the WebUI at <http://localhost:8080>. Force China mirrors with `-CnMirror 1`: download the script first and pipe it, e.g. `& ([scriptblock]::Create((iwr -useb <url>).Content)) -CnMirror 1`.
 
-> The first URL is GitHub's official raw endpoint; if it is unreachable (e.g. restricted networks), the command automatically falls back to the Gitee mirror. The bootstrap script itself also falls back to the Gitee repo when fetching source code.
+> The first URL is GitHub's official raw endpoint. If it is unreachable (e.g. restricted networks), the command automatically falls back to the same file on Gitee, read through Gitee's **API contents endpoint** — Gitee's raw endpoint answers HTTP 451 for this particular file, so it cannot serve as the fallback. The bootstrap script itself also falls back to the Gitee repo when fetching source code.
 
 The bootstrapper runs fully unattended — no prompts at all:
 

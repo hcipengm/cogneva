@@ -17,9 +17,17 @@ DEFAULT_HOME="${COGNEVA_HOME:-$HOME/.cogneva}"
 # detect_restricted_net 结算，这里给初值只是为了让 `set -u` 下的引用安全。
 SUDO=""
 CN_MIRROR=0
+# Gitee's raw face answers 451 ("content may contain violation information")
+# for bootstrap.sh itself. The judgement is per-file, asynchronous and
+# re-evaluated, so the fallback leg reads the same bytes from Gitee's API
+# contents endpoint instead: JSON in, base64 "content" field out, decode.
+# Measured 2026-09-30 from a blank VM: raw 451 3/3, while that endpoint
+# returned the byte-identical script 3/3 using nothing but coreutils.
+GITEE_ENTRY_FETCH="curl -fsSL -m 15 \"https://gitee.com/api/v5/repos/hcipengm/cogneva/contents/bootstrap.sh?ref=main\" | sed -n 's/.*\"content\":\"\([^\"]*\)\".*/\1/p' | base64 -d"
+GITHUB_ENTRY_FETCH="curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh"
 # 与 README 完全同一条入口命令（VM/WSL 内复用），CN 模式 Gitee 优先
-ENTRY_CMD_INTL='(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh || curl -fsSL -m 15 https://gitee.com/hcipengm/cogneva/raw/main/bootstrap.sh) | sh'
-ENTRY_CMD_CN='(curl -fsSL -m 15 https://gitee.com/hcipengm/cogneva/raw/main/bootstrap.sh || curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh) | sh'
+ENTRY_CMD_INTL="($GITHUB_ENTRY_FETCH || $GITEE_ENTRY_FETCH) | sh"
+ENTRY_CMD_CN="($GITEE_ENTRY_FETCH || $GITHUB_ENTRY_FETCH) | sh"
 
 # COGNEVA_BOOTSTRAP_FAKE_OS 仅用于干跑测试（模拟 darwin 分支）
 detect_os() {

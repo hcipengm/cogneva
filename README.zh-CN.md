@@ -529,7 +529,7 @@ Cogneva 支持**元启动（Meta-bootstrap）**：从一台空白机器（Linux 
 ### 🐧 Linux
 
 ```bash
-(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh || curl -fsSL -m 15 https://gitee.com/hcipengm/cogneva/raw/main/bootstrap.sh) | sh
+(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh || curl -fsSL -m 15 "https://gitee.com/api/v5/repos/hcipengm/cogneva/contents/bootstrap.sh?ref=main" | sed -n 's/.*"content":"\([^"]*\)".*/\1/p' | base64 -d) | sh
 ```
 
 裸机直接引导。
@@ -537,7 +537,7 @@ Cogneva 支持**元启动（Meta-bootstrap）**：从一台空白机器（Linux 
 ### 🍎 macOS
 
 ```bash
-(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh || curl -fsSL -m 15 https://gitee.com/hcipengm/cogneva/raw/main/bootstrap.sh) | sh
+(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh || curl -fsSL -m 15 "https://gitee.com/api/v5/repos/hcipengm/cogneva/contents/bootstrap.sh?ref=main" | sed -n 's/.*"content":"\([^"]*\)".*/\1/p' | base64 -d) | sh
 ```
 
 **同一条命令**。K3s 需要 Linux 内核，脚本会自动安装 [Lima](https://lima-vm.io)（经 Homebrew，国内走 TUNA 镜像）并创建 Ubuntu 虚拟机，然后在 VM 内执行完全相同的一键命令。所有依赖都装在 VM 内，宿主只多一个 `limactl`。完成后 WebUI 经端口转发到 <http://localhost:8080>。管理 VM：`limactl shell cogneva` / `limactl stop cogneva` / `limactl delete cogneva`。
@@ -551,7 +551,7 @@ iwr -useb https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.ps1 
 
 脚本自动安装 WSL2 + Ubuntu（如需重启会提示，重启后重跑本脚本即可，幂等），然后在 WSL 内执行同一条一键命令。WSL2 默认开启 localhostForwarding，WebUI 直接在浏览器访问 <http://localhost:8080>。强制国内镜像：先下载脚本再传参，如 `& ([scriptblock]::Create((iwr -useb <地址>).Content)) -CnMirror 1`。
 
-> 第一个地址是 GitHub 官方 raw 地址；如果访问不通（比如国内受限网络），命令会自动切换到 Gitee 镜像下载，无需手动选择。脚本内部拉取源码时同样会自动回退到 Gitee 仓库。
+> 第一个地址是 GitHub 官方 raw 地址；如果访问不通（比如国内受限网络），命令会自动从 Gitee 取同一份文件（走 Gitee 的 **API 内容面**——Gitee 的 raw 面对本文件固定返回 451，不能用作兜底），无需手动选择。脚本内部拉取源码时同样会自动回退到 Gitee 仓库。
 
 引导器全程零问答、全自动：
 

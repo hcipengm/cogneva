@@ -15,9 +15,13 @@ $ErrorActionPreference = 'Stop'
 
 function Write-Step([string]$Msg) { Write-Host "[bootstrap] $Msg" }
 
+# Gitee's raw face answers 451 for bootstrap.sh itself, so the fallback leg
+# reads the same bytes from Gitee's API contents endpoint instead. Doubled
+# single quotes are PowerShell's escape inside a single-quoted string; the
+# command is handed to sh verbatim, so the inner quoting must survive.
 # 与 README 完全同一条入口命令；CN 模式 Gitee 优先
-$EntryCmdIntl = '(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh || curl -fsSL -m 15 https://gitee.com/hcipengm/cogneva/raw/main/bootstrap.sh) | sh'
-$EntryCmdCn   = '(curl -fsSL -m 15 https://gitee.com/hcipengm/cogneva/raw/main/bootstrap.sh || curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh) | sh'
+$EntryCmdIntl = '(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh || curl -fsSL -m 15 "https://gitee.com/api/v5/repos/hcipengm/cogneva/contents/bootstrap.sh?ref=main" | sed -n ''s/.*"content":"\([^"]*\)".*/\1/p'' | base64 -d) | sh'
+$EntryCmdCn   = '(curl -fsSL -m 15 "https://gitee.com/api/v5/repos/hcipengm/cogneva/contents/bootstrap.sh?ref=main" | sed -n ''s/.*"content":"\([^"]*\)".*/\1/p'' | base64 -d || curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh) | sh'
 
 function Resolve-CnMirror {
     if ($script:CnMirror -eq '1') { return '1' }
@@ -115,7 +119,12 @@ if ($cn -eq '1') { Set-UbuntuCnApt }
 
 $entry = if ($cn -eq '1') { $EntryCmdCn } else { $EntryCmdIntl }
 Write-Step "在 WSL Ubuntu 内执行与 Linux 完全相同的一键命令，COGNEVA_CN_MIRROR=$cn 已透传..."
-wsl.exe -d Ubuntu -u root -- sh -c "COGNEVA_CN_MIRROR=$cn $entry"
+# Hand the command to sh over stdin rather than argv. wsl.exe rebuilds a
+# Windows command line for the Linux side, and the entry command now carries
+# quote characters that a PowerShell-to-native-exe round trip would have to
+# quote and escape correctly -- untestable from here, and silently wrong when
+# it is. stdin has no such layer: what is written is what sh reads.
+"COGNEVA_CN_MIRROR=$cn $entry" | wsl.exe -d Ubuntu -u root -- sh
 if ($LASTEXITCODE -ne 0) { throw "WSL 内引导失败（exit $LASTEXITCODE）" }
 
 Write-Host ''
