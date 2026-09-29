@@ -59,7 +59,8 @@ pub use contract::wiki::*;
 pub use error::{SFError, SFResult};
 pub use owner_lease::{OwnerLease, OwnerLeaseBroker, Ownership, RoleClaim, RoleHold};
 pub use secrets::{
-    redact_secrets, ChainedSecretProvider, EnvSecretProvider, FileSecretProvider, SecretProvider,
+    redact_json_secrets, redact_secrets, ChainedSecretProvider, EnvSecretProvider,
+    FileSecretProvider, SecretProvider,
 };
 pub use types::*;
 

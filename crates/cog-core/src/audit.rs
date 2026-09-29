@@ -42,7 +42,7 @@ pub struct AuditEvent {
     pub target: String,
     /// 动作描述（如 "change.apply"、"hook.pre_prompt"）。
     pub action: String,
-    /// 结构化详情（禁止包含密钥；写入前应经 `redact_secrets` 处理）。
+    /// 结构化详情（禁止包含密钥；构造时已由 [`crate::secrets::redact_json_secrets`] 脱敏）。
     pub detail: serde_json::Value,
     /// 前一条记录的哈希；创世记录为 `"genesis"`。
     pub prev_hash: String,
@@ -75,8 +75,14 @@ impl AuditEvent {
         actor: impl Into<String>,
         target: impl Into<String>,
         action: impl Into<String>,
-        detail: serde_json::Value,
+        mut detail: serde_json::Value,
     ) -> Self {
+        // Where the guarantee lives: every record is built here, and the hash is
+        // taken from what this leaves behind, so the chain stays consistent with
+        // the stored (redacted) detail. Doing it in a storage backend instead
+        // would leave the next backend free to forget it, and would put the
+        // redaction after the hash.
+        crate::secrets::redact_json_secrets(&mut detail);
         let (seq, prev_hash) = match prev {
             Some(p) => (p.seq + 1, p.hash.clone()),
             None => (1, "genesis".to_string()),

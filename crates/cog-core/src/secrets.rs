@@ -102,16 +102,60 @@ pub fn redact_secrets(input: &str) -> String {
     out
 }
 
-const SECRET_PATTERNS: &[&str] = &[
-    r"sk-ant-[A-Za-z0-9_-]{8,}",
-    r"sk-[A-Za-z0-9_-]{16,}",
-    r"ghp_[A-Za-z0-9]{16,}",
-    r"github_pat_[A-Za-z0-9_]{16,}",
-    r"AKIA[0-9A-Z]{16}",
-    r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
-    r"(?i)(api[_-]?key|token|secret|password)=[^\s&]{4,}",
-    r"(?i)(api[_-]?key|token|secret|password)\s*:\s*[^\s,}]{4,}",
-];
+/// Redact a structured payload: run [`redact_secrets`] over every string, and
+/// replace whole members whose key names a credential.
+///
+/// Serializing the value and redacting the text is not an option: the key-value
+/// patterns match across a JSON member's quotes and colon and leave the document
+/// unparseable. Walking the nodes keeps the structure while the string shapes
+/// (`sk-...`, JWTs, a `token=...` written inside a value) stay visible.
+///
+/// The key half has no text counterpart: in JSON the key sits outside the value,
+/// so `{"token": "..."}` is a shape a string-level redactor can never see. The
+/// criterion is the exact key, not a prefix, and the vocabulary is the same one
+/// the text patterns use -- a second copy would drift against it.
+pub fn redact_json_secrets(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => *text = redact_secrets(text),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(redact_json_secrets),
+        serde_json::Value::Object(members) => {
+            let credential_key =
+                regex::Regex::new(CREDENTIAL_KEY_PATTERN).expect("static key pattern is valid");
+            for (key, member) in members.iter_mut() {
+                if credential_key.is_match(key) {
+                    *member = serde_json::Value::String("[redacted]".to_string());
+                } else {
+                    redact_json_secrets(member);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The credential key names, written once: both the text patterns and the
+/// structured-payload key criterion below are built from this one literal, so a
+/// word added here reaches both readers instead of one.
+macro_rules! define_secret_patterns {
+    ($words:literal) => {
+        /// "This member's value is a credential" for a structured payload: the
+        /// whole key text, anchored, so `token_budget` is not one.
+        const CREDENTIAL_KEY_PATTERN: &str = concat!(r"(?i)^(", $words, r")$");
+
+        const SECRET_PATTERNS: &[&str] = &[
+            r"sk-ant-[A-Za-z0-9_-]{8,}",
+            r"sk-[A-Za-z0-9_-]{16,}",
+            r"ghp_[A-Za-z0-9]{16,}",
+            r"github_pat_[A-Za-z0-9_]{16,}",
+            r"AKIA[0-9A-Z]{16}",
+            r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
+            concat!(r"(?i)(", $words, r")=[^\s&]{4,}"),
+            concat!(r"(?i)(", $words, r")\s*:\s*[^\s,}]{4,}"),
+        ];
+    };
+}
+
+define_secret_patterns!("api[_-]?key|token|secret|password");
 
 #[cfg(test)]
 mod tests {
@@ -167,5 +211,32 @@ mod tests {
         );
         assert_eq!(redact_secrets("api_key=supersecretvalue"), "[redacted]");
         assert_eq!(redact_secrets("nothing secret here"), "nothing secret here");
+    }
+
+    /// The structured form has to cover both halves: a member filed under a
+    /// credential key, and a credential shape sitting inside a value. The last
+    /// two members are what separates an exact key match from a prefix one --
+    /// `token_budget` is a number this system counts, not a credential.
+    #[test]
+    fn redact_json_covers_keys_and_leaves_the_structure_alone() {
+        let mut value = serde_json::json!({
+            "api_key": "supersecretvalue",
+            "token": 12345,
+            "nested": { "password": ["hunter2xyz"] },
+            "note": "key=sk-abcdefghijklmnop1234 done",
+            "list": ["ghp_0123456789abcdefZZ"],
+            "count": 3,
+            "token_budget": 7,
+        });
+        redact_json_secrets(&mut value);
+
+        assert_eq!(value["api_key"], serde_json::json!("[redacted]"));
+        assert_eq!(value["token"], serde_json::json!("[redacted]"));
+        // The member under a credential key goes wholesale, whatever its shape.
+        assert_eq!(value["nested"]["password"], serde_json::json!("[redacted]"));
+        assert_eq!(value["note"], serde_json::json!("key=[redacted] done"));
+        assert_eq!(value["list"][0], serde_json::json!("[redacted]"));
+        assert_eq!(value["count"], serde_json::json!(3));
+        assert_eq!(value["token_budget"], serde_json::json!(7));
     }
 }

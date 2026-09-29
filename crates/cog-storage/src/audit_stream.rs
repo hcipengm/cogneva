@@ -148,6 +148,55 @@ mod tests {
         assert!(reopened.verify().await.unwrap().valid);
     }
 
+    /// The reading the doc contract promises: what lands in the file carries no
+    /// credential, and the record still verifies against its own hash. Both
+    /// halves matter -- a redaction applied after the hash would leave a file
+    /// whose every line fails verification, i.e. a tamper alarm that fires on
+    /// every ordinary write.
+    #[tokio::test]
+    async fn append_redacts_credentials_and_the_chain_still_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+
+        let stream = FileAuditStream::open(&path).await.unwrap();
+        stream
+            .append(
+                AuditKind::HookTrigger,
+                "hook-engine",
+                "task-1",
+                "hook.pre_prompt",
+                serde_json::json!({
+                    "api_key": "sk-ant-abcdefghijklmnopqrst",
+                    "prompt": "call it with token=ghp_0123456789abcdefZZ",
+                    "task_id": "task-1",
+                }),
+            )
+            .await
+            .unwrap();
+        drop(stream);
+
+        let stored = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !stored.contains("sk-ant-") && !stored.contains("ghp_"),
+            "the audit file holds a credential: {stored}"
+        );
+        assert!(
+            stored.contains("[redacted]"),
+            "nothing was redacted, so this reading proves nothing: {stored}"
+        );
+        assert!(
+            stored.contains("task-1"),
+            "the redaction took out a field that is not a credential: {stored}"
+        );
+
+        let reopened = FileAuditStream::open(&path).await.unwrap();
+        let verification = reopened.verify().await.unwrap();
+        assert!(
+            verification.valid,
+            "the stored detail and its hash disagree: {verification:?}"
+        );
+    }
+
     #[tokio::test]
     async fn corrupted_chain_rejected_on_open() {
         let dir = tempfile::tempdir().unwrap();
