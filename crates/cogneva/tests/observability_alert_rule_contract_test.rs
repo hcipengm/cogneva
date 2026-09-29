@@ -451,6 +451,10 @@ const FOREIGN: &[(&str, &str)] = &[
         "kube_pod_container_status_restarts_total",
         "kube-state-metrics",
     ),
+    (
+        "kube_pod_deletion_timestamp",
+        "kube-state-metrics (present only while deletionTimestamp is set: a graceful deletion clears it in seconds, so a timestamp that persists is the wedge itself -- the API took the deletion and the runtime did not release the container, a state no other series reports)",
+    ),
     ("kube_pod_owner", "kube-state-metrics"),
     ("kube_pod_status_phase", "kube-state-metrics"),
     ("node_filesystem_avail_bytes", "node-exporter"),
