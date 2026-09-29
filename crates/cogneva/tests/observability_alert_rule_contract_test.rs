@@ -408,7 +408,7 @@ const FOREIGN: &[(&str, &str)] = &[
     ("kube_deployment_spec_replicas", "kube-state-metrics"),
     (
         "kube_deployment_status_replicas_available",
-        "kube-state-metrics（Deployment 层面的可用副本数；Pod 是否卡在 Terminating 这里读不出来，只看计数）",
+        "kube-state-metrics（Deployment 层面的可用副本数；读数取自各 Pod 的 ready，而 Pod 卡在 Terminating 时 API 仍把它记为 ready，所以这份计数在那种故障下不动）",
     ),
     ("kube_node_status_allocatable", "kube-state-metrics"),
     (
@@ -1172,5 +1172,163 @@ fn set_operators_decide_which_side_supplies_the_value() {
     assert_eq!(
         unreachable_condition_complaints("(a == 0) unless (b > 5)", &C::GreaterThan(3.0)).len(),
         1
+    );
+}
+
+// ── 时长承诺读的是不是窗口里的每一个样本 ─────────────────────────────────────
+
+/// Index of the `)` closing a group that is already open, or `None` when the
+/// expression ends first. `open` points just past the opening parenthesis.
+fn matching_paren_end(expr: &str, open: usize) -> Option<usize> {
+    let bytes = expr.as_bytes();
+    let mut depth = 1i32;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] as char {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The operand of every `min_over_time` / `max_over_time` call in an expression,
+/// with the name of the aggregate it belongs to. The range selector is dropped:
+/// `[30m:1m]` says which samples are read, not what they are read from.
+fn range_aggregate_operands(expr: &str) -> Vec<(&'static str, &str)> {
+    let mut found = Vec::new();
+    for name in ["min_over_time", "max_over_time"] {
+        let mut from = 0usize;
+        while let Some(at) = expr[from..].find(name) {
+            let start = from + at;
+            from = start + name.len();
+            let rest = &expr[from..];
+            // A call, not a longer identifier or a bare mention: nothing but
+            // whitespace between the name and its opening parenthesis.
+            let Some(open) = rest.find('(') else { break };
+            if !rest[..open].trim().is_empty() {
+                continue;
+            }
+            let inner_start = from + open + 1;
+            let Some(inner_end) = matching_paren_end(expr, inner_start) else {
+                continue;
+            };
+            let arg = expr[inner_start..inner_end].trim();
+            let operand = match arg.rfind('[') {
+                Some(bracket) if arg.ends_with(']') => arg[..bracket].trim(),
+                _ => arg,
+            };
+            found.push((name, operand));
+        }
+    }
+    found
+}
+
+/// Complaints about a range aggregate that reads a filtered operand.
+///
+/// A comparison without `bool` is a filter: Prometheus drops the samples that
+/// fail it before the aggregate sees them, and the aggregate reports a value
+/// built only from the survivors. `min_over_time((x < 1)[30m])` therefore
+/// answers "was at least one sample below 1" -- one survivor already puts the
+/// minimum below 1 -- while the rule it sits in promises that *every* sample
+/// over the window was. The reading such a rule wants is the aggregate over the
+/// raw series with the threshold left to the condition, `max_over_time(x[30m])
+/// < 1`, which is false the moment a single sample disagrees, and which is why
+/// the aggregate has to be the direction that reads all of them: the smallest
+/// value for a promise of "none above", the largest for a promise of "none
+/// below".
+///
+/// Only `min_over_time` and `max_over_time` are read here. They are the two
+/// whose value lands on one side of their own filter by construction, so the
+/// answer collapses to an existence check exactly; the sum-style aggregates
+/// carry no such claim.
+///
+/// This is not an evaluator. An operand whose comparison is against something
+/// other than a literal is not classified, and an unclassified operand is not a
+/// complaint -- same direction as the other checks here: a shape this misses
+/// leaves the rule as unread as it already is, while a wrong complaint would
+/// block a rule that works.
+fn filtered_range_aggregate_complaints(expr: &str) -> Vec<String> {
+    let mut complaints = Vec::new();
+    for (name, operand) in range_aggregate_operands(expr) {
+        let Some(range) = leaf_range(operand) else {
+            continue;
+        };
+        complaints.push(format!(
+            "`{name}` 的操作数带着过滤比较（{operand}，取值域 {range:?}）：不带 `bool` 的比较是先过滤，\
+             聚合只看得见通过的样本，于是它答的是「窗口里至少有一个样本在这一侧」，而不是规则承诺的\
+             「窗口里的每一个样本都在这一侧」。把比较挪到聚合外面、阈值交给条件（例：\
+             `max_over_time(x[30m]) < 1`），聚合成败由窗口里有没有样本越界决定"
+        ));
+    }
+    complaints
+}
+
+#[test]
+fn a_range_aggregate_that_reads_a_filter_is_reported() {
+    // The shape this check exists for. The five-minute form shipped once and
+    // fired on healthy workloads: a single scrape at zero was enough, because
+    // the filter had already thrown away every sample that said otherwise.
+    let shipped = "((min_over_time((kube_deployment_status_replicas_available < 1)[5m:1m]) \
+                    and on(namespace, deployment) (kube_deployment_spec_replicas > 0)) \
+                    and on(namespace, deployment) \
+                    (count_over_time(kube_deployment_status_replicas_available[10m]) \
+                     > count_over_time(kube_deployment_status_replicas_available[5m])))";
+    let complaints = filtered_range_aggregate_complaints(shipped);
+    assert_eq!(complaints.len(), 1, "{complaints:?}");
+    assert!(
+        complaints[0].contains("至少有一个样本"),
+        "{}",
+        complaints[0]
+    );
+
+    // The same promise read from the raw series is accepted, in both
+    // directions ...
+    assert!(filtered_range_aggregate_complaints(
+        "((max_over_time(kube_deployment_status_replicas_available[30m:1m]) \
+           and on(namespace, deployment) (kube_deployment_spec_replicas > 0)) \
+           and on(namespace, deployment) \
+           (count_over_time(kube_deployment_status_replicas_available[1h]) \
+            > count_over_time(kube_deployment_status_replicas_available[30m])))"
+    )
+    .is_empty());
+    // ... and so is a comparison that arrives after the aggregate has read the
+    // window, and a filter whose samples are counted rather than aggregated.
+    for fine in [
+        "(min_over_time(cogneva_process_zombies[30m]) > 0) and (count_over_time(cogneva_process_zombies[1h]) > count_over_time(cogneva_process_zombies[30m]))",
+        "(max_over_time(llm_usage_verdict_measured{upstream=~\".+\"}[1h]) == 0) and on (upstream) (max_over_time(llm_upstream_healthy{upstream=~\".+\"}[1h]) == 1)",
+        "count_over_time((cogneva_change_fate_total > 0)[24h]) > 0",
+    ] {
+        assert!(
+            filtered_range_aggregate_complaints(fine).is_empty(),
+            "{fine}"
+        );
+    }
+
+    // Widening beats guessing: an operand this cannot read is not a complaint.
+    assert!(filtered_range_aggregate_complaints("min_over_time((x < y)[30m])").is_empty());
+    assert!(filtered_range_aggregate_complaints("max_over_time((x == bool 0)[30m])").is_empty());
+}
+
+#[test]
+fn no_written_rule_reads_a_filter_through_a_range_aggregate() {
+    let mut complaints: Vec<String> = Vec::new();
+    for (rule, promql) in chart_rules() {
+        for complaint in filtered_range_aggregate_complaints(&promql) {
+            complaints.push(format!("{rule}: {complaint}\n    {promql}"));
+        }
+    }
+
+    assert!(
+        complaints.is_empty(),
+        "这些规则把时长读成了「至少一个样本」:\n{}",
+        complaints.join("\n")
     );
 }

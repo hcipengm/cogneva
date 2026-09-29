@@ -1111,12 +1111,12 @@ data:
           },
           {
             "name": "workload_no_available_replica",
-            "promql": "((min_over_time((kube_deployment_status_replicas_available < 1)[5m:1m]) and on(namespace, deployment) (kube_deployment_spec_replicas > 0)) and on(namespace, deployment) (count_over_time(kube_deployment_status_replicas_available[10m]) > count_over_time(kube_deployment_status_replicas_available[5m])))",
+            "promql": "((max_over_time(kube_deployment_status_replicas_available[30m:1m]) and on(namespace, deployment) (kube_deployment_spec_replicas > 0)) and on(namespace, deployment) (count_over_time(kube_deployment_status_replicas_available[1h]) > count_over_time(kube_deployment_status_replicas_available[30m])))",
             "condition": {
               "less_than": 1.0
             },
             "severity": "critical",
-            "summary": "a deployment that asks for at least one replica has had none available for five minutes ({value} available throughout the window). A rolling update swaps a replica in seconds, so five minutes is not a slow rollout -- the replacement never came up. Read that deployment's pods and the state their containers ended in, not only the revision that was rolling out: a pod the runtime will not let the kubelet finish killing leaves the workload with no replica while no container has crashed, so every restart counter stays at zero and nothing else in this list fires."
+            "summary": "a deployment that asks for at least one replica has had none available for the whole thirty minutes ({value} available at the end of the window). The window has to clear the rollouts themselves: measured over the three days before this rule was written, gaps with no available replica at all ran from a single scrape up to 27 minutes, while the outages worth waking someone for ran 35 minutes and longer -- a five-minute window fires on every rollout instead. Read that deployment's pods and the state their containers ended in, not only the revision that was rolling out. What this rule cannot read, and must not be credited with: the API goes on calling a pod ready while the runtime will not let the kubelet finish killing it, so a container that is never released keeps every replica count here at its healthy value, and that failure reaches this rule only once the containers actually die."
           }
           ]
         },
