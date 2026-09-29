@@ -12,6 +12,13 @@ use cog_core::{
 /// Loop name reported through the background-loop liveness family.
 pub const TIER_MIGRATION_LOOP: &str = "storage_tier_migration";
 
+/// The role this loop takes a lease on, as a reader joins it to the work.
+///
+/// Named for the work rather than the loop: the index keys a pass writes are
+/// spelled the same by every replica, so the thing being serialised is the
+/// migration itself and not this process's way of running it.
+pub const TIER_MIGRATION_ROLE: &str = "tier_migration";
+
 /// Background migrator. Use [`TierMigrator::spawn`] to start a periodic loop
 /// or [`TierMigrator::run_once`] for an explicit pass (used by tests).
 pub struct TierMigrator {
@@ -20,6 +27,9 @@ pub struct TierMigrator {
     pub object_backend: Arc<dyn ObjectBackend>,
     pub index_store: Arc<dyn RawLogIndexStore>,
     pub metrics: Option<Arc<dyn MetricsBackend>>,
+    /// `None` when the deployment published no arbiter — the loop then runs
+    /// exactly as it did before there were leases.
+    role: Option<Arc<dyn cog_core::OwnerLeaseBroker>>,
 }
 
 /// Build a [`TierPolicy`] from the binary-level [`TierMigratorConfig`].
@@ -48,6 +58,7 @@ impl TierMigrator {
             object_backend,
             index_store,
             metrics: None,
+            role: None,
         }
     }
 
@@ -55,6 +66,16 @@ impl TierMigrator {
     /// `tier_migration_total{tier="warm|cold|skipped|error"}`.
     pub fn with_metrics(mut self, metrics: Arc<dyn MetricsBackend>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Contend for the migration role over the shared database.
+    ///
+    /// Without this the loop runs in every replica, which is what it did before
+    /// there were leases and stays the right answer for a deployment whose one
+    /// replica holds the whole index on its own volume.
+    pub fn with_role(mut self, broker: Arc<dyn cog_core::OwnerLeaseBroker>) -> Self {
+        self.role = Some(broker);
         self
     }
 
@@ -78,12 +99,31 @@ impl TierMigrator {
                 let migrator = Arc::clone(&self);
                 let shutdown = shutdown.clone();
                 async move {
+                    // A pass runs hourly by default and can outlast a term by
+                    // itself, so the role is held by its own cadence rather than
+                    // renewed once per pass; the pass still asks where it acts,
+                    // because losing the role has to stop the work in the cycle
+                    // it was lost in.
+                    let role = cog_core::RoleHold::start(
+                        migrator.role.clone(),
+                        TIER_MIGRATION_ROLE,
+                        beat.clone(),
+                        &shutdown,
+                    );
+
                     let mut interval = tokio::time::interval(scan_interval);
                     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     loop {
                         beat.beat();
                         tokio::select! {
                             _ = interval.tick() => {
+                                if !role.may_act().await {
+                                    tracing::debug!(
+                                        "TierMigrator pass skipped: another process holds the \
+                                         migration role"
+                                    );
+                                    continue;
+                                }
                                 match migrator.run_once().await {
                                     Ok(stats) => migrator.emit_metrics(&stats).await,
                                     Err(e) => {

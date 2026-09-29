@@ -57,6 +57,21 @@ use cog_core::{MetricsBackend, SFError, SFResult, ShutdownSignal};
 /// The append-only sample log written by [`crate::PostgresMetricsBackend`].
 pub const SAMPLES_TABLE: &str = "cog_metrics_samples";
 
+/// The role this loop takes a lease on, as a reader joins it to the work.
+pub const ROLE: &str = "metrics_sample_cap";
+
+/// The loop, as the liveness readings name it.
+pub const LOOP: &str = "storage_metrics_sample_cap";
+
+/// The cadence this loop declares for itself: the longest it will wait between
+/// two passes.
+///
+/// The wait it actually takes next is derived from how fast the log is filling
+/// and is never longer than this, so a declared period of this length is the
+/// one that makes "no pass for six of them" mean the loop stopped rather than
+/// that the log went quiet.
+pub const LOOP_PERIOD: Duration = MAX_SWEEP_PERIOD;
+
 /// Longest the sweeper will wait between passes.
 ///
 /// Not a policy: the sweep also republishes the log's size, and Prometheus
@@ -93,6 +108,8 @@ pub struct SampleLogCap {
     budget: i64,
     metrics: Option<Arc<dyn MetricsBackend>>,
     retirement: Option<Arc<crate::metrics_retirement::RetirementPass>>,
+    /// The arbiter over which replica prunes, when the deployment has one.
+    role: Option<Arc<dyn cog_core::OwnerLeaseBroker>>,
 }
 
 /// What the previous pass saw and when it ran. The next period is derived from
@@ -116,7 +133,40 @@ impl SampleLogCap {
             budget: budget as i64,
             metrics: None,
             retirement: None,
+            role: None,
         }
+    }
+
+    /// Lease the pruning half of this loop, so that replicas sharing one
+    /// database do not each hold the log down towards the same capacity.
+    ///
+    /// The budget keeps its meaning — whether this deployment prunes at all —
+    /// and the lease decides which replica does. Without an arbiter the loop
+    /// prunes wherever the budget allows it, which is what every deployment did
+    /// before there was one.
+    pub fn with_role(mut self, broker: Arc<dyn cog_core::OwnerLeaseBroker>) -> Self {
+        self.role = Some(broker);
+        self
+    }
+
+    /// Spawn the sweeper as a supervised loop under this file's own name.
+    ///
+    /// Registered from here rather than by the caller so the name the reading
+    /// reports and the name the loop is declared under cannot become two
+    /// spellings of the same loop — the caller would have to reach across a
+    /// crate boundary for the constant, and a call site is where a literal
+    /// gets written.
+    pub fn spawn(self: Arc<Self>, shutdown: ShutdownSignal) -> tokio::task::JoinHandle<()> {
+        cog_core::loop_health::spawn(
+            LOOP,
+            cog_core::loop_health::Cadence::Periodic(LOOP_PERIOD),
+            shutdown.clone(),
+            move |beat| {
+                let cap = Arc::clone(&self);
+                let shutdown = shutdown.clone();
+                async move { cap.run(beat, shutdown).await }
+            },
+        )
     }
 
     /// Prune a table other than the live one. Exists so a test can point the
@@ -152,17 +202,47 @@ impl SampleLogCap {
 
     /// Sweep once immediately, then at whatever period the fill rate calls
     /// for, until shutdown.
-    pub async fn run(&self, shutdown: ShutdownSignal) {
+    ///
+    /// `beat` is the loop's own handle, handed here because this is where the
+    /// role is contended for: the same stamp that says the loop is cycling
+    /// carries whether this process is the one pruning.
+    pub async fn run(&self, beat: cog_core::loop_health::Beat, shutdown: ShutdownSignal) {
+        // Held on the lease's own cadence rather than on this loop's, because a
+        // pass over a log far over its budget can outlast a term: the loop's
+        // period is inside the ask period (see the test that holds the two
+        // together), but a pass does not have to be, and a term that ran out
+        // mid-pass would hand the log to a second process sweeping it.
+        let role = cog_core::RoleHold::start(self.role.clone(), ROLE, beat.clone(), &shutdown);
         let mut period = MIN_SWEEP_PERIOD;
         let mut previous: Option<PreviousPass> = None;
         loop {
+            beat.beat();
             // Before the sweep, so a retired name's rows are gone when the sweep
             // ranks what is left rather than being counted as ordinary history
             // for one more cycle.
             if let Some(retirement) = self.retirement.clone() {
                 retirement.run_once().await;
             }
-            match self.sweep_once().await {
+            // Two different questions decide the same pass, and they are asked
+            // in this order on purpose: the budget says whether this deployment
+            // prunes at all, and only a deployment that does asks who should be
+            // doing it. A budget of zero is a deployment that means to leave the
+            // log alone, so it has no role to contend for and its replicas must
+            // not start contending for one.
+            //
+            // A process that may not prune still measures and reports. That is
+            // not the same reading as the one the pruner publishes — no budget,
+            // no floor, no removals — and it is deliberately not: this process
+            // cannot say whether the log is being held down, and the reading it
+            // publishes must not claim it can. The role's own series are where
+            // that distinction is legible.
+            let prunes = self.budget_enabled() && role.may_act().await;
+            let pass = if prunes {
+                self.sweep_once().await
+            } else {
+                self.measure_once().await
+            };
+            match pass {
                 Ok(outcome) => {
                     if outcome.removed > 0 {
                         info!(
@@ -197,6 +277,23 @@ impl SampleLogCap {
                 _ = shutdown.wait() => break,
             }
         }
+    }
+
+    /// Measure the log and prune nothing.
+    ///
+    /// What a process owes its readers when it may not prune: the size is a
+    /// property of the table, not of who is allowed to delete from it, and the
+    /// budgets a process that is not pruning reports as `None` are exactly the
+    /// ones it is not enforcing. The alternative — publishing the configured
+    /// capacity and a held count above it — reads as a log being let grow by the
+    /// process that is not the one letting it.
+    pub async fn measure_once(&self) -> SFResult<SweepOutcome> {
+        Ok(SweepOutcome {
+            held: self.row_count().await?,
+            removed: 0,
+            budget: None,
+            floor_held: false,
+        })
     }
 
     /// Delete oldest-first until the log is within capacity, or until the only
@@ -561,6 +658,22 @@ mod tests {
             sql.matches(r#""odd""name""#).count(),
             3,
             "the table is not quoted everywhere it is named: {sql}"
+        );
+    }
+
+    /// The loop asks again as often as the lease contract assumes, which is what
+    /// lets the rule that says a role is unowned treat a handover as bounded by
+    /// the term plus one ask period. A loop whose work cadence was slower than
+    /// that would have to ask on a timer of its own rather than declare a longer
+    /// period here, because a holder that asks after its term has run out is
+    /// contending with whoever took the role in the meantime.
+    #[test]
+    fn the_declared_period_renews_inside_the_lease_contract() {
+        assert!(
+            LOOP_PERIOD <= cog_core::owner_lease::ASK_PERIOD,
+            "the loop declares a period of {LOOP_PERIOD:?}, longer than the ask period {:?} \
+             the lease and its alerting are written against",
+            cog_core::owner_lease::ASK_PERIOD
         );
     }
 }

@@ -24,6 +24,10 @@ use crate::outcome_recorder::OutcomeRecorder;
 use crate::provider::{CiFailureEvent, CodePlatformProvider, PlatformIssue};
 use crate::triage::{IssueTriage, TriageDecision};
 
+/// 发现循环在共用库上争的那行租约。按工作命名而不是按循环命名：两个平台轮询是同一
+/// 段代码的两个实例，它们防的是同一件事——两个副本各自顺着同一批 issue 追问同一句话。
+pub const DISCOVERY_ROLE: &str = "issue_discovery";
+
 /// DAG-side timeout for a single assess task (must exceed the wait budget
 /// below so the poller gives up around the same time the task would be killed).
 const ASSESS_TASK_TIMEOUT_SECS: u64 = 120;

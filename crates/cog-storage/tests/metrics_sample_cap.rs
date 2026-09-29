@@ -17,9 +17,15 @@
 //! database is left as it was found. Each test gets its own table because the
 //! tests share one database and run in parallel.
 
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use sqlx::PgPool;
 
-use cog_storage::SampleLogCap;
+use cog_core::loop_health::{Cadence, LoopHealth, LOOP_LABEL, LOOP_OWNER_HELD};
+use cog_core::{Observable, OwnerLeaseBroker, ShutdownSignal};
+use cog_storage::metrics_sample_cap::{LOOP, LOOP_PERIOD, ROLE};
+use cog_storage::{PgOwnerLeaseBroker, SampleLogCap, LEASE_TABLE};
 
 fn database_url() -> String {
     std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
@@ -119,6 +125,71 @@ async fn count_named(pool: &PgPool, table: &str, name: &str) -> i64 {
 
 fn cap(pool: PgPool, table: &str, budget: u64) -> SampleLogCap {
     SampleLogCap::new(pool, budget).with_table(table)
+}
+
+/// Wait for the loop to publish `want` as its reading of the role, and return
+/// the last one seen.
+///
+/// The waits in the role test below are for a pass to have happened, and a pass
+/// takes as long as its queries take — a fixed sleep would be a number that has
+/// to be re-guessed every time the host or the database changes.
+async fn wait_for_held(health: &LoopHealth, want: f64, limit: Duration) -> Option<f64> {
+    let started = Instant::now();
+    loop {
+        let seen = owner_held(health).await;
+        if seen == Some(want) || started.elapsed() >= limit {
+            return seen;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Wait for the log to come down to `want` rows, and return the last count
+/// taken.
+async fn wait_for_rows(pool: &PgPool, table: &str, want: i64, limit: Duration) -> i64 {
+    let started = Instant::now();
+    loop {
+        let held = count(pool, table).await;
+        if held <= want || started.elapsed() >= limit {
+            return held;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// What the loop published about who holds its role, as its own reading rather
+/// than as an inference from what it did.
+async fn owner_held(health: &LoopHealth) -> Option<f64> {
+    health
+        .collect_metrics("")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| {
+            m.name == LOOP_OWNER_HELD && m.labels.get(LOOP_LABEL).map(String::as_str) == Some(LOOP)
+        })
+        .map(|m| m.value)
+}
+
+/// Clear whatever term is written for the role these tests contend over.
+async fn clear_role(pool: &PgPool) {
+    sqlx::query(&format!("DELETE FROM {LEASE_TABLE} WHERE role = $1"))
+        .bind(ROLE)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// End the term written for the role, which is the state the row is in once its
+/// holder has stopped renewing it.
+async fn expire_role(pool: &PgPool) {
+    sqlx::query(&format!(
+        "UPDATE {LEASE_TABLE} SET expires_at = now() - interval '1 second' WHERE role = $1"
+    ))
+    .bind(ROLE)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -303,5 +374,93 @@ async fn the_floor_does_not_stop_a_sweep_the_budget_can_meet() {
     assert_eq!(outcome.held, 40);
     assert_eq!(outcome.removed, 210);
     assert!(!outcome.floor_held);
+    drop_probe(&pool, table).await;
+}
+
+/// The role gate, read at both ends: one loop over one table, in two runs.
+/// While another process holds the role the loop cycles and reports and keeps
+/// every row; once that holder's term has run out this process takes the role
+/// and the same loop brings the log back under its capacity.
+///
+/// What joins the two runs is the loop's own reading of the role, so a loop
+/// that failed to prune for any other reason — a budget of zero, a query that
+/// errored — cannot pass this.
+#[tokio::test]
+#[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+async fn a_cap_that_does_not_hold_the_role_prunes_nothing() {
+    let table = "metrics_sample_cap_probe_role";
+    let pool = PgPool::connect(&database_url()).await.unwrap();
+    fresh_probe(&pool, table).await;
+    insert_aged(&pool, table, 20, "2 days").await;
+
+    let other = PgOwnerLeaseBroker::with_holder(pool.clone(), "probe-other")
+        .await
+        .unwrap();
+    let own = Arc::new(
+        PgOwnerLeaseBroker::with_holder(pool.clone(), "probe-own")
+            .await
+            .unwrap(),
+    );
+    clear_role(&pool).await;
+    assert!(
+        other
+            .lease(ROLE, Duration::from_secs(60))
+            .try_hold()
+            .await
+            .unwrap(),
+        "the fixture is another process holding the role"
+    );
+
+    let cap = Arc::new(cap(pool.clone(), table, 5).with_role(own));
+
+    // Someone else's role. The loop still cycles and says what it sees; what it
+    // must not do is prune.
+    let health = LoopHealth::new();
+    let beat = health.register(LOOP, Cadence::Periodic(LOOP_PERIOD));
+    let shutdown = ShutdownSignal::default();
+    let running = tokio::spawn({
+        let cap = Arc::clone(&cap);
+        let shutdown = shutdown.clone();
+        async move { cap.run(beat, shutdown).await }
+    });
+    let seen = wait_for_held(&health, 0.0, Duration::from_secs(30)).await;
+    assert_eq!(
+        seen,
+        Some(0.0),
+        "the loop must publish that the role is held elsewhere"
+    );
+    shutdown.trigger();
+    running.await.unwrap();
+    assert_eq!(
+        count(&pool, table).await,
+        20,
+        "a process that does not hold the role must not prune"
+    );
+
+    // The holder stopped renewing. The loop starts again — as it would after a
+    // restart — takes the role, and holds the log down.
+    expire_role(&pool).await;
+    let health = LoopHealth::new();
+    let beat = health.register(LOOP, Cadence::Periodic(LOOP_PERIOD));
+    let shutdown = ShutdownSignal::default();
+    let running = tokio::spawn({
+        let cap = Arc::clone(&cap);
+        let shutdown = shutdown.clone();
+        async move { cap.run(beat, shutdown).await }
+    });
+    let held = wait_for_rows(&pool, table, 5, Duration::from_secs(30)).await;
+    assert_eq!(
+        held, 5,
+        "the loop that holds the role must bring the log under capacity"
+    );
+    assert_eq!(
+        owner_held(&health).await,
+        Some(1.0),
+        "the loop that pruned must be the one that took the role"
+    );
+    shutdown.trigger();
+    running.await.unwrap();
+
+    clear_role(&pool).await;
     drop_probe(&pool, table).await;
 }

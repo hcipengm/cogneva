@@ -4,10 +4,12 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use cog_core::loop_health::{LOOP_LABEL, LOOP_OWNER_HELD};
 use cog_core::{
     MetricsBackend, ObjectBackend, RawFileFormat, RawLogIndexStore, RawLogQuery, ShutdownSignal,
     StorageTier, TierPolicy,
 };
+use cog_storage::tier::migrator::TIER_MIGRATION_LOOP;
 use cog_storage::{
     MemoryMetricsBackend, MemoryObjectBackend, MemoryRawLogIndexStore, TierMigrator,
 };
@@ -315,4 +317,140 @@ async fn the_spawned_loop_passes_without_waiting_a_full_interval() {
         .map(|s| s.value)
         .sum();
     assert_eq!(warm, 1.0, "the pass should have reported its promotion");
+}
+
+/// A broker whose one lease answers whatever the test's flag says.
+///
+/// The arbitration itself is a server's decision and is proven against a live
+/// one; what this stands in for is the answer, so that what the loop does with
+/// an answer can be tested where no database is.
+struct Answering {
+    held: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct AnsweringLease {
+    role: String,
+    held: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl cog_core::OwnerLease for AnsweringLease {
+    fn role(&self) -> &str {
+        &self.role
+    }
+
+    async fn try_hold(&self) -> cog_core::SFResult<bool> {
+        Ok(self.held.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl cog_core::OwnerLeaseBroker for Answering {
+    fn lease(&self, role: &str, _ttl: Duration) -> Arc<dyn cog_core::OwnerLease> {
+        Arc::new(AnsweringLease {
+            role: role.to_string(),
+            held: Arc::clone(&self.held),
+        })
+    }
+}
+
+/// What the loop published about who holds the migration role.
+async fn owner_held() -> Option<f64> {
+    use cog_core::Observable;
+    cog_core::loop_health::registry()
+        .collect_metrics("")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| {
+            m.name == LOOP_OWNER_HELD
+                && m.labels.get(LOOP_LABEL).map(String::as_str) == Some(TIER_MIGRATION_LOOP)
+        })
+        .map(|m| m.value)
+}
+
+/// The role gate at the loop's own level, in both directions: a process that
+/// asked for the migration role and was told another holds it leaves the log
+/// alone, and the same loop with the same file migrates it once the answer is
+/// that it holds the role.
+///
+/// The reading is what joins the two halves, and it is the only thing that
+/// can: "it did not migrate because another process holds the role" and "it did
+/// not migrate because the pass never ran" leave the log in the same state, so
+/// the file alone cannot tell a working gate from a broken loop. The second
+/// half is the control that a gate which never lets anything through fails.
+///
+/// A pass runs at once rather than after an interval, so neither half waits on
+/// a one-hour cadence, and the role is asked on a cadence of its own — the
+/// loop's own cadence is not what keeps its term alive.
+#[tokio::test]
+async fn the_loop_migrates_only_while_it_holds_the_role() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = aged_file(
+        dir.path(),
+        "transport_raw",
+        "2026-09-14.jsonl",
+        Duration::from_secs(172_800),
+    );
+    let (migrator, _objects, index) = migrator(dir.path());
+    let held = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let broker: Arc<dyn cog_core::OwnerLeaseBroker> = Arc::new(Answering {
+        held: Arc::clone(&held),
+    });
+    let migrator = Arc::new(migrator.with_role(broker));
+
+    // Someone else's role: the loop cycles, reports, and does not migrate.
+    let shutdown = ShutdownSignal::new();
+    let handle = Arc::clone(&migrator).spawn(shutdown.clone());
+    let mut seen = None;
+    for _ in 0..400 {
+        seen = owner_held().await;
+        if seen == Some(0.0) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        seen,
+        Some(0.0),
+        "the loop must publish that it does not hold the role"
+    );
+    shutdown.trigger();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    assert!(
+        path.exists(),
+        "a process that does not hold the role must not migrate the log"
+    );
+    assert!(
+        index
+            .query(&RawLogQuery::default())
+            .await
+            .unwrap()
+            .is_empty(),
+        "a process that does not hold the role must not index anything"
+    );
+
+    // The holder stopped renewing, so this process takes the role and the same
+    // pass has to do its work.
+    held.store(true, std::sync::atomic::Ordering::Relaxed);
+    let shutdown = ShutdownSignal::new();
+    let handle = Arc::clone(&migrator).spawn(shutdown.clone());
+    let mut rows = 0;
+    for _ in 0..400 {
+        rows = index.query(&RawLogQuery::default()).await.unwrap().len();
+        if rows == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        rows, 1,
+        "the loop that holds the role must migrate the aged rotation"
+    );
+    assert_eq!(
+        owner_held().await,
+        Some(1.0),
+        "the loop that migrated must be the one that holds the role"
+    );
+    shutdown.trigger();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
 }

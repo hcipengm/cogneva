@@ -303,7 +303,7 @@
   "metrics": {
     "enabled": true,
     "endpoint": "/metrics",
-    "_comment_sample_max_rows": "cog_metrics_samples 是只追加的观测样本日志，这条是它的容量上限（行数），0=不清理。清理的判据是容量不是时间：时间窗两个问题都答不了——流量可以在任何窗内塞进任意多行，而清理仍然会删掉正在读的行、留着没人要的行。清理按最早的先删，直到回到上限为止，但每个 gauge series 的最新一行永不删——gauge 的值就是这张表里它最新那条，删掉等于这个 series 从 /metrics 上消失，读起来是「从来没存在过」而不是「被裁掉了」；计数器与直方图不受这条地板保护，它们的值存在各自的累计表里，日志里的行只是喂给它的历史，整段可删——否则按对象取键的计数器（序列只增不复用）会让地板无限长大，容量旋钮永远咬不住，每轮都自报超容量却一行都删不掉。若光是这些最新行就超过上限，清理停在最新行上并通过 metrics_samples_over_capacity=1 说出来。默认值按开发集群实测的观测速率（约每天 2.2 万行）取约十天，比稳态高一个数量级，正常运转够不着，而失控的探测循环会在几小时内撞上而不是先把卷写满。属主是主应用：两个 Pod 共用同一个库，进化 Pod 的部署环境里置 COGNEVA_METRICS_SAMPLE_MAX_ROWS=0，本进程就不参与清理。已退场的名字（没有任何产者再写它）不看容量，也不靠这条清理放行，而是由独立的释放 pass 挂在这个循环上每轮清一遍四处存储（样本日志加三张累计表），删掉多少行按表分组报在 metrics_retired_rows_removed 上。",
+    "_comment_sample_max_rows": "cog_metrics_samples 是只追加的观测样本日志，这条是它的容量上限（行数），0=不清理。清理的判据是容量不是时间：时间窗两个问题都答不了——流量可以在任何窗内塞进任意多行，而清理仍然会删掉正在读的行、留着没人要的行。清理按最早的先删，直到回到上限为止，但每个 gauge series 的最新一行永不删——gauge 的值就是这张表里它最新那条，删掉等于这个 series 从 /metrics 上消失，读起来是「从来没存在过」而不是「被裁掉了」；计数器与直方图不受这条地板保护，它们的值存在各自的累计表里，日志里的行只是喂给它的历史，整段可删——否则按对象取键的计数器（序列只增不复用）会让地板无限长大，容量旋钮永远咬不住，每轮都自报超容量却一行都删不掉。若光是这些最新行就超过上限，清理停在最新行上并通过 metrics_samples_over_capacity=1 说出来。默认值按开发集群实测的观测速率（约每天 2.2 万行）取约十天，比稳态高一个数量级，正常运转够不着，而失控的探测循环会在几小时内撞上而不是先把卷写满。属主由租约选举，不由部署标志钉死：清理是这张表上的单写者动作，属主写在共用库的一行租约里，两个副本同时开着也只有一个真删——没拿到租约的那个只量大小、照常上报，不参与清理，也不对外产生副作用；属主被杀后，另一个在租约到期后的下一轮接管。这个数于是从「谁是属主」退回成「哪些副本有资格当属主」（租约只在开着清理的进程之间争）：进化 Pod 的部署环境里置 COGNEVA_METRICS_SAMPLE_MAX_ROWS=0，是不让自进化 Pod 去持这张表的角色。已退场的名字（没有任何产者再写它）不看容量，也不靠这条清理放行，而是由独立的释放 pass 挂在这个循环上每轮清一遍四处存储（样本日志加三张累计表），删掉多少行按表分组报在 metrics_retired_rows_removed 上。",
     "sample_max_rows": 200000,
     "_comment_scrape_dimensions": "抓取的可选收窄项，空数组=不收窄。不收窄的含义是：向每个 observable 询取它自己声明的、序列基数有界的全部维度。有界性由产者声明，不由这份清单判定——同一维度名在不同 observable 上可以不同（D1 在 orchestrator 是进程级累计计数器，有界；在 agent 是逐 step 按 task_id 取键的记录，无界），所以写死一份全局清单必然对其中一家是错的：旧清单把 D1 整条排除，orchestrator 那份有界的 D1 就永远读不到；而清单里列了 D4/D5/D6/D8/D9 时，agent 的 collect_metrics 会在五次询问里各回一份它那组不随维度变的累计计数器，同一批样本在同一个抓取体里出现五遍。要收窄时在这里写具体的维度名，它只会比产者声明的更少，不会多——写了没人声明的名字或声明为无界的名字，结果是采不到而不是报错。",
     "scrape_dimensions": []
@@ -355,7 +355,7 @@
   },
   "tier_migrator": {
     "_comment": "hot→warm 就地 zstd 压缩并删除源文件，warm→cold 上传对象存储再删本地，两步都不可逆——热层保留 hot_duration_secs，warm 保留 warm_duration_secs。",
-    "_comment_owner": "迁移必须只有一个属主：raw_log_index 按 (stream, log_date, format) 唯一，冷层对象键又不带进程身份，两个部署同时扫就会互相覆盖索引行与对象（谁后写谁赢，先写的那份不可找回且不报错）。属主是主应用 Pod；进化 Pod 在 app-config 里置 COGNEVA_TIER_MIGRATOR_ENABLED=false。",
+    "_comment_owner": "迁移必须只有一个属主：raw_log_index 按 (stream, log_date, format) 唯一，冷层对象键又不带进程身份，两个部署同时扫就会互相覆盖索引行与对象（谁后写谁赢，先写的那份不可找回且不报错）。属主由租约选举，不由部署标志钉死：参与迁移的副本各自周期性地问共用库上那行租约，只有拿到的那份真扫，属主被杀后另一个在租约到期后的下一次问询接管。所以 COGNEVA_TIER_MIGRATOR_ENABLED 是「这个 Pod 参不参与迁移」的选择，正确性不靠它。",
     "enabled": true,
     "hot_duration_secs": 86400,
     "warm_duration_secs": 604800,
@@ -1019,6 +1019,33 @@
           "summary": "a background loop panicked and was run again {value} time(s) in the last hour, and is running now: a restart means the defect fired and the loop came back from it, not that the defect is gone. It is reported here rather than left to the panic line in the log because a repaired loop publishes all of its own series again, so from every other reading in this deployment it looks like a loop that never stopped -- the repair would be the reason the defect stayed quiet. Read the panic message in that container's log at the moment of the restart (the supervisor logs it with the loop name, the restart count within this run, and the wait it took before trying again). A restart that happens once around a deploy is usually a defect in the new code that the next attempt did not hit; the same loop restarted repeatedly is one the budget will eventually leave dead, which is what background_loop_died then reports. The count is per process: it resets when the process restarts, so a loop that panicked shortly before a restart is visible in the logs and no longer here"
         },
         {
+          "name": "background_loop_role_unowned",
+          "promql": "(max by (loop) (cogneva_loop_role_declared) == 1) unless (max by (loop) (max_over_time(cogneva_loop_owner_held[15m])) == 1)",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "critical",
+          "summary": "every process running this loop declares that it does single-writer work, and none of them has held the role at any point in the last fifteen minutes: the work the role exists to serialise is not being done by anyone. A process that holds the role publishes a 1 for it and a process that asked and was refused publishes a 0, so this fires both when a process asked and was told another has it while that other is gone, and when no process could get an answer at all -- the unanswerable case is where the gauge is deliberately absent rather than zero, since a zero would be a claim that another holder exists, and background_loop_role_probe_failing is where that cause is named. The fifteen minutes are the handover itself, and both numbers it covers are fixed by the lease contract every role is taken under rather than chosen by a loop: a term of six minutes, and an ask at least every two, so a holder that was killed is replaced within about eight, and a window shorter than that would report the ordinary replacement of a pod as an unowned role. What remains once the window has passed is a role nobody is contending for: the ask is failing (a database this deployment cannot reach, which at the same time stops that process pruning anything), or the surviving processes are not cycling at all (background_loop_stalled and background_loop_died on the same series say so), or every replica is skipping the role's work for a reason of its own. This rule is late by construction and that is the intended trade: the readings that say a loop has stopped are the fast ones, and this is the one that says the work is unowned. The declaration side is what makes an empty role visible at all -- a deployment whose every replica stopped asking publishes no holder series, and a rule over the holder alone would be silent through exactly the state it exists to announce"
+        },
+        {
+          "name": "background_loop_role_split",
+          "promql": "sum by (loop) (cogneva_loop_owner_held) > 1",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "critical",
+          "summary": "two processes in this series hold the same single-writer role at once, which is the one state the arbitration exists to make impossible: both of them are acting, so whatever the role guards -- the pruning, the follow-up, the index write -- is being done twice. Read it as a defect in the arbitration rather than as contention, because each ask is answered from the row the two are contending over and that row can name one holder at a time. Two live holders mean one of two things: the term was taken over before its holder stopped renewing it (a clock the two do not share, which is why the row's term and its comparison are both read from the database's own clock), or a process is publishing a held reading it has already lost, which is what a holder wedged inside one pass looks like -- it took the role, never asked again, and the other replica took over on expiry while it was still deleting rows. Those two incidents are the same reading here, so background_loop_stalled on the same series is what tells them apart. An ordinary replacement does not reach this rule: a term outlives the window in which Prometheus keeps serving the last sample of a target that has gone, so a pod that was killed stops reading as a holder (up to five minutes) before its successor is allowed to take the role (six), and the two are never holders at the same time. It fires for as long as both readings are live -- a wedged holder keeps publishing until it is restarted -- so read it as naming the role to go and look at rather than as a count of incidents"
+        },
+        {
+          "name": "background_loop_role_probe_failing",
+          "promql": "increase(cogneva_loop_owner_probe_failures_total[1h])",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "a process asked who holds the role that serialises its work and could not get an answer -- {value} time(s) in the last hour -- and for as long as that lasts it has deliberately stopped acting. An ask whose answer does not arrive is not permission to act: acting wrongly writes the duplicate the role was taken to prevent (a follow-up sent twice, an index row overwritten, an archived file that can no longer be found), and the same doubt makes standing still the cheaper of the two errors. So this is the cause to read behind a loop that is cycling and doing nothing, and the role's own series reads it from the other side: background_loop_role_unowned fires when nothing holds the role, this one says why nothing does. Usual causes, in the order worth checking: the shared database is unreachable from this pod (a pool exhausted or pointed at the wrong place, a network policy, credentials that have stopped working), the table was dropped or renamed under a running deployment, or the ask is timing out against a database that is up but saturated. The count is per process and resets when the process restarts; what separates a process that is asking and failing from one that has stopped asking altogether is the loop's own liveness -- it keeps its declaration and its tick age keeps moving"
+        },
+        {
           "name": "notification_delivery_failing",
           "promql": "sum by (outlet, result, pod) (increase(cogneva_notification_delivery_total{result!=\"ok\"}[1h])) > 0",
           "condition": {
@@ -1181,7 +1208,7 @@
   "github_integration": {
     "_comment": "GitHub integration for self-evolution. Tokens are resolved from environment variables and never enter the sandbox. discovery_mode=both: polling is the periodic fallback, webhook events (via the security gateway, gateway_verified) give second-level response.",
     "enabled": true,
-    "_comment_discovery_enabled": "Whether THIS process runs the discovery loops. One binary serves several deployments (main app, evolution pod, security gateway, sandbox executor) and each of the first two builds its own plugin table, so without this switch both scan the same upstream items and ask the same clarification twice: intent guards are per-pod files, so neither can see the other already acted. The owner is the main app — webhook events structurally reach only it, and polling is its periodic fallback. Deployment sets this false on the evolution pod.",
+    "_comment_discovery_enabled": "Whether THIS process takes part in discovery at all. One binary serves several deployments (main app, evolution pod, security gateway, sandbox executor) and each of the first two builds its own plugin table, so a process that takes part contends for the discovery role over the shared database: each participating replica asks the lease on its own cadence, only the holder scans and follows up, and the role moves to another replica on the next ask after a holder that was killed stops renewing its term. Without that arbitration two processes scan the same upstream items and ask the same clarification twice: intent guards are per-pod files, so neither can see the other already acted. The webhook event entry is deliberately not part of the lease — which process receives issue/comment events is a routing decision made where the events are delivered, and the periodic poll is the fallback for what the events do not reach. Deployment sets this false on the evolution pod, which therefore neither polls nor receives events.",
     "discovery_enabled": true,
     "discovery_mode": "both",
     "repo": "hcipengm/cogneva",

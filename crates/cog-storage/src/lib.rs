@@ -42,6 +42,7 @@ pub mod mem;
 pub mod metrics_retirement;
 pub mod metrics_sample_cap;
 pub mod migrate;
+pub mod owner_lease;
 pub mod partition_maintainer;
 
 // ─── Crate-level re-exports (backward-compatible with old `cog-db` usage) ───
@@ -92,6 +93,7 @@ pub use migrate::{
 pub use dlq::MemoryDeadLetterQueue;
 pub use metrics_retirement::{MetricsRetirement, RetirementOutcome, RetirementPass};
 pub use metrics_sample_cap::{delete_surplus_sql, SampleLogCap, SweepOutcome};
+pub use owner_lease::{lease_holder, PgOwnerLeaseBroker, LEASE_TABLE};
 pub use partition_maintainer::PartitionMaintainer;
 
 pub mod plugin;

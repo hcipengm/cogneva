@@ -49,10 +49,16 @@ pub const STAGED_CHANGE_DRAIN_LOOP: &str = "github_staged_change_drain";
 pub const LANDING_CI_WATCH_LOOP: &str = "github_landing_ci_watch";
 
 /// 平台轮询任务：间隔触发 run_once，shutdown 信号退出。
+///
+/// `role` 是共用库上那行租约的仲裁者（没有共用库时为 None）。发现循环的属主
+/// 由此选举，不由部署标志钉死：参与发现的副本各自周期性问一次租约，只有拿着
+/// 的那份真扫并产生对外副作用，属主被杀后另一个在租约到期后接管。事件入口不在
+/// 租约里——网关把 issue/评论事件送到哪个进程是投递层的路由决定。
 fn spawn_polling_loop(
     platform: &'static str,
     shared: SharedLoop,
     interval_secs: u64,
+    role: Option<Arc<dyn cog_core::OwnerLeaseBroker>>,
     shutdown: cog_core::shutdown::ShutdownSignal,
 ) -> tokio::task::JoinHandle<()> {
     let interval = std::time::Duration::from_secs(interval_secs.max(30));
@@ -72,7 +78,16 @@ fn spawn_polling_loop(
         move |beat| {
             let stop = stop.clone();
             let shared = Arc::clone(&shared);
+            let role = role.clone();
             async move {
+                // 租约按契约自己的节拍续：轮询间隔由配置决定，可以长过一个任期，
+                // 而任期在工作期间到期会把角色交给第二个副本去扫同一批 issue。
+                let role = cog_core::RoleHold::start(
+                    role,
+                    crate::discovery_loop::DISCOVERY_ROLE,
+                    beat.clone(),
+                    &stop,
+                );
                 loop {
                     // 每轮盖一次，抓到没有都盖：这一轮的轮询没发现新东西是常态，
                     // 不能读成循环停了。
@@ -84,6 +99,15 @@ fn spawn_polling_loop(
                             return;
                         }
                         _ = tokio::time::sleep(interval) => {}
+                    }
+                    // 每次动手前现问一次，不读续租任务的上一答：丢了角色的进程要在
+                    // 丢的那一轮就停手，晚了就是重复的追问。
+                    if !role.may_act().await {
+                        tracing::debug!(
+                            platform,
+                            "discovery round skipped: another process holds the role"
+                        );
+                        continue;
                     }
                     if let Err(e) = shared.lock().await.run_once().await {
                         warn!(platform, error = %e, "discovery round failed");
@@ -383,6 +407,9 @@ impl cog_core::SystemPlugin for GitHubPlugin {
     }
 
     async fn start(&self, ctx: &cog_core::PluginContext) -> cog_core::SFResult<()> {
+        // 发现循环的租约：由持有共用库的插件发布，没有共用库时为空——那时每
+        // 个副本都照旧自己扫自己的（单副本部署正是要这样）。
+        let lease_role = ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>();
         let orchestrator = ctx.consume_service::<dyn cog_core::OrchestratorControl>();
         let reflection = ctx.consume_service::<dyn cog_core::ReflectionEngine>();
         // 池全灭时 supervisor 只暂停 LLM 依赖型任务；发现循环每轮入口据此跳过，
@@ -486,6 +513,7 @@ impl cog_core::SystemPlugin for GitHubPlugin {
                     "github",
                     shared,
                     cfg.poll_interval_secs,
+                    lease_role.clone(),
                     self.shutdown.clone(),
                 ));
                 info!("GitHub discovery polling loop started");
@@ -500,6 +528,7 @@ impl cog_core::SystemPlugin for GitHubPlugin {
                     "gitee",
                     shared,
                     interval,
+                    lease_role.clone(),
                     self.shutdown.clone(),
                 ));
                 info!("Gitee discovery polling loop started");

@@ -8,6 +8,7 @@ pub mod error;
 pub mod fs_size;
 pub mod loop_health;
 pub mod observability_text;
+pub mod owner_lease;
 pub mod secrets;
 pub mod types;
 
@@ -56,6 +57,7 @@ pub use contract::task::*;
 pub use contract::tool::*;
 pub use contract::wiki::*;
 pub use error::{SFError, SFResult};
+pub use owner_lease::{OwnerLease, OwnerLeaseBroker, Ownership, RoleClaim, RoleHold};
 pub use secrets::{
     redact_secrets, ChainedSecretProvider, EnvSecretProvider, FileSecretProvider, SecretProvider,
 };

@@ -100,6 +100,16 @@ jobs:
         run: cargo test -p cog-storage --test metrics_sample_cap -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # Which replica may act is decided by one statement, and the acceptance
+      # for it is a question about two processes: two asks landing at once leave
+      # exactly one holder, and a holder that stops renewing loses the role to
+      # whoever asks next. The statement's text is guarded beside its producer
+      # without a server; that guard cannot tell a statement that yields from one
+      # that takes, so this is the half that holds.
+      - name: Live-DB owner-lease arbitration
+        run: cargo test -p cog-storage --test owner_lease -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # What a single pruning statement costs, and which rows it takes. The
       # rank question is a plan question: ranking every row of the log first
       # answers it for the whole table, which is a cost no reading of the

@@ -75,6 +75,14 @@ const NOT_REGISTERED: &[(&str, &str)] = &[
          whose only exit is its channel closing — the logger being shut down, not \
          a defect, and the age of a demand-driven flush means nothing",
     ),
+    (
+        "crates/cog-core/src/owner_lease.rs",
+        "not-a-loop: the ticker asks the arbiter again on behalf of a loop that is \
+         itself registered — it ends when the holder is dropped or the process shuts \
+         down, both intended, and an accidental end is what losing the role means, \
+         so the owner readings the holding loop already publishes are its health and \
+         a series of its own would be a second answer to that one question",
+    ),
 ];
 
 fn workspace_root() -> PathBuf {

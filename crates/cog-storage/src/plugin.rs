@@ -12,6 +12,11 @@ pub struct StoragePlugin {
     /// database. The published pool handle is consumed by whoever needs it
     /// first, so a task started later cannot recover it from the context.
     pg_pool: Option<sqlx::PgPool>,
+    /// The roles this deployment can contend over, built in `init` and kept
+    /// for `start`'s loops. Published rather than only kept, because the loops
+    /// that need a lease are not all in this plugin: whoever owns the shared
+    /// database owns the arbitration, and everyone else reads it from here.
+    lease_broker: Option<Arc<dyn cog_core::OwnerLeaseBroker>>,
 }
 
 impl StoragePlugin {
@@ -20,6 +25,7 @@ impl StoragePlugin {
         Self {
             initialized: false,
             pg_pool: None,
+            lease_broker: None,
         }
     }
 }
@@ -725,11 +731,75 @@ impl cog_core::SystemPlugin for StoragePlugin {
         );
         ctx.publish_service(object_backend);
 
+        // ── Roles contended over the shared database ──
+        // The loops that must happen once per deployment rather than once per
+        // replica take a lease here, on the database they already share. A
+        // deployment that reaches this point has a pool, so its replicas can
+        // arbitrate; one that does not never gets here, and its loops run
+        // unarbitrated exactly as they did before there were leases — which is
+        // the right answer for a deployment whose single replica holds all the
+        // state in question on its own volume.
+        //
+        // Published here rather than in `start`, because the loops that contend for
+        // these roles are not all in this plugin and the phases do not overlap:
+        // every plugin's `init` runs before any plugin's `start`, while the
+        // `start`s run in parallel with each other.
+        let lease_broker: Option<Arc<dyn cog_core::OwnerLeaseBroker>> = match self.pg_pool.clone() {
+            Some(pool) => match crate::PgOwnerLeaseBroker::new(pool).await {
+                Ok(broker) => {
+                    match broker.holders().await {
+                        Ok(held) if !held.is_empty() => info!(
+                            holder = broker.holder(),
+                            roles = ?held,
+                            "owner-lease broker ready; roles held as of this process starting"
+                        ),
+                        Ok(_) => info!(
+                            holder = broker.holder(),
+                            "owner-lease broker ready; no role is held yet"
+                        ),
+                        // Not fatal: the row is readable in the database by
+                        // anyone who wants it, and failing to read it here
+                        // says nothing about being able to take a lease.
+                        Err(e) => warn!(
+                            holder = broker.holder(),
+                            error = %e,
+                            "owner-lease broker ready but the held roles could not be listed"
+                        ),
+                    }
+                    let broker: Arc<dyn cog_core::OwnerLeaseBroker> = Arc::new(broker);
+                    ctx.publish_service(broker.clone());
+                    Some(broker)
+                }
+                Err(e) => {
+                    // The loops go on unarbitrated, which is the right
+                    // answer for one replica and the wrong one for two. That
+                    // is a state the deployment decides, and this line is
+                    // the only place it becomes visible.
+                    warn!(
+                        error = %e,
+                        "owner-lease broker could not be created; single-writer loops in \
+                         this process will run without arbitration"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+
+        self.lease_broker = lease_broker;
+
         self.initialized = true;
         Ok(())
     }
 
     async fn start(&self, ctx: &cog_core::PluginContext) -> cog_core::SFResult<()> {
+        // ── Roles contended over the shared database ──
+        // Built and published in `init`, and read back from there rather than
+        // built again: the loops in this plugin and the ones in other plugins
+        // contend over the same rows, and a second broker here would be a second
+        // answer to one question.
+        let lease_broker = self.lease_broker.clone();
+
         // ── Tier migrator (raw-log cold-tier migration) ──
         if ctx.config().tier_migrator.enabled {
             if let Some(store) = ctx.consume_service::<dyn cog_core::RawLogIndexStore>() {
@@ -747,6 +817,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
                     .unwrap_or_default();
                 match object_backend {
                     Some(object_backend) => {
+                        let role = lease_broker.clone();
                         tokio::spawn(async move {
                             let mut migrator = crate::TierMigrator::new(
                                 base_dir,
@@ -756,6 +827,9 @@ impl cog_core::SystemPlugin for StoragePlugin {
                             );
                             if let Some(mb) = metrics {
                                 migrator = migrator.with_metrics(mb);
+                            }
+                            if let Some(broker) = role {
+                                migrator = migrator.with_role(broker);
                             }
                             let _handle = Arc::new(migrator).spawn(shutdown);
                             info!("TierMigrator started");
@@ -801,12 +875,13 @@ impl cog_core::SystemPlugin for StoragePlugin {
         // backend dies with the process. A budget of 0 disables pruning, which
         // is also how a deployment opts out — the sweep is idempotent across
         // processes, but only the deployment that means to hold the log down
-        // should be the one doing it. The release of retired names is attached
-        // to this loop for its cadence, not for its gate: it runs every cycle
-        // whether or not anything is being pruned, because whether a retired
-        // name is still served is not a capacity decision. Concurrent releases
-        // are harmless — every deployment ships the same list and a second one
-        // finds the rows already gone.
+        // should be the one doing it, and among the replicas of such a
+        // deployment the lease decides which one. The release of retired names
+        // is attached to this loop for its cadence, not for its gate: it runs
+        // every cycle whether or not anything is being pruned, because whether a
+        // retired name is still served is not a capacity decision. Concurrent
+        // releases are harmless — every deployment ships the same list and a
+        // second one finds the rows already gone.
         let sample_max_rows = ctx.config().metrics.sample_max_rows;
         if let Some(pool) = self.pg_pool.clone() {
             let shutdown = ctx
@@ -827,7 +902,10 @@ impl cog_core::SystemPlugin for StoragePlugin {
             if let Some(mb) = metrics {
                 cap = cap.with_metrics(mb);
             }
-            tokio::spawn(async move { cap.run(shutdown).await });
+            if let Some(broker) = lease_broker.clone() {
+                cap = cap.with_role(broker);
+            }
+            let _handle = Arc::new(cap).spawn(shutdown.clone());
             if sample_max_rows == 0 {
                 info!("Metrics sample capacity disabled (sample_max_rows=0)");
             } else {

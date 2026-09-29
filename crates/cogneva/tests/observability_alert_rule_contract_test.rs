@@ -202,6 +202,33 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_loop_restarts_total",
         "crates/cog-core/src/loop_health.rs",
     ),
+    // Who holds the single-writer roles. A loop that exists once per deployment
+    // rather than once per process takes a lease on the role it guards, and
+    // these three series are the whole of that state as a scrape sees it: the
+    // declaration (this process runs the loop and the role is something to
+    // contend for), the holder (1 for the process that holds it, 0 for one that
+    // asked and was refused), and the count of asks that came back with nothing.
+    // The holder series is deliberately absent rather than zero when the ask
+    // could not be answered, which is why the unowned rule needs the
+    // declaration as well: an absent series and a refusal mean different things,
+    // and only the declaration distinguishes "nobody holds it" from "nobody is
+    // asking any more". The acquisitions and losses counters sit on the same
+    // scrape and no rule reads them: which replica holds a role is a question
+    // about a state, and how many times it changed hands is a different
+    // question, answered by the difference of two counter readings rather than
+    // by a threshold written here.
+    (
+        "cogneva_loop_role_declared",
+        "crates/cog-core/src/loop_health.rs",
+    ),
+    (
+        "cogneva_loop_owner_held",
+        "crates/cog-core/src/loop_health.rs",
+    ),
+    (
+        "cogneva_loop_owner_probe_failures_total",
+        "crates/cog-core/src/loop_health.rs",
+    ),
     (
         "cogneva_landing_failures_total",
         "crates/cog-github/src/landing.rs",
@@ -516,6 +543,45 @@ fn a_rule_that_promises_a_duration_reads_a_window_not_two_samples() {
         complaints.is_empty(),
         "告警规则用一个采样点和它 offset 之后的自己判「持续」，周期性的产出方会让它在健康系统上反复触发:\n{}",
         complaints.join("\n")
+    );
+}
+
+/// The rule that says a role is unowned has to wait out the handover the lease
+/// allows, or it reports the ordinary replacement of a pod as an unowned role.
+///
+/// That wait is the term plus the period the holder is allowed to take between
+/// two asks, and both numbers live in the code that publishes the role series
+/// rather than in the rule. Read here instead of argued in a summary, because a
+/// window written into a rule drifts from the constants it was chosen against
+/// the moment either side moves — and the drift is silent: the rule keeps
+/// firing, just on healthy handovers.
+#[test]
+fn the_unowned_role_rule_waits_out_the_handover_the_lease_allows() {
+    let (_, promql) = chart_rules()
+        .into_iter()
+        .find(|(name, _)| name == "background_loop_role_unowned")
+        .expect(
+            "the unowned-role rule is gone, and with it the only reading that says the \
+             single-writer work a role guards is being done by nobody",
+        );
+
+    // The window is the bracketed term of the aggregation that asks whether the
+    // role was held at any point in it.
+    let window = promql
+        .split_once("max_over_time(")
+        .and_then(|(_, rest)| rest.split_once('['))
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .and_then(|(text, _)| promql::duration_seconds(text))
+        .unwrap_or_else(|| panic!("the rule's window is not readable as a duration: {promql}"));
+
+    let term = cog_core::owner_lease::TERM.as_secs();
+    let ask = cog_core::owner_lease::ASK_PERIOD.as_secs();
+    assert!(
+        window >= term + ask,
+        "the unowned-role rule looks back {window}s, less than the {handover}s a handover may \
+         take (a term of {term}s plus one ask period of {ask}s), so a killed holder's ordinary \
+         replacement would be reported as a role nobody holds: {promql}",
+        handover = term + ask
     );
 }
 

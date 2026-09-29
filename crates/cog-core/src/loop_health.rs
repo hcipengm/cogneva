@@ -60,7 +60,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -96,6 +96,103 @@ pub const LOOP_RESTARTS_TOTAL: &str = "cogneva_loop_restarts_total";
 /// unbounded, and a name shared by two instances would let a dead one hide
 /// behind the beats of its live sibling.
 pub const LOOP_LABEL: &str = "loop";
+
+/// The loops that take part in a single-writer role, as `1`.
+///
+/// Published by a process whose loop was given a role to contend for, and by no
+/// one else — a loop that does no single-writer work has no ownership reading to
+/// make and says nothing here. It exists for the rule that has to tell "no
+/// process is holding this role" apart from "no process was ever asked to": the
+/// holder gauge is silent in both, and a rule over the gauge alone would be
+/// quiet through a deployment that lost its owner for good.
+pub const LOOP_ROLE_DECLARED: &str = "cogneva_loop_role_declared";
+
+/// `1` on the process that holds the loop's role, `0` on one that asked and was
+/// told another process holds it.
+///
+/// Absent when the process could not ask at all, which is why the two states are
+/// not a single series with a third value: a zero claims a live holder exists
+/// somewhere else, and a process that could not reach the arbiter has no
+/// business making that claim. The failures it did have are counted next door.
+pub const LOOP_OWNER_HELD: &str = "cogneva_loop_owner_held";
+
+/// Times this process took the role, as a counter: the first term, and every
+/// term it won back after losing one.
+pub const LOOP_OWNER_ACQUISITIONS_TOTAL: &str = "cogneva_loop_owner_acquisitions_total";
+
+/// Times this process held the role and then stopped, as a counter.
+///
+/// A loss is the takeover seen from the losing side, and it is not the same
+/// reading as the winner's acquisition: a process that was the holder and no
+/// longer is has stopped doing work it was doing, and everything it had
+/// published up to that moment is now last-known rather than current. Counted
+/// where it happened, because the process that lost the role may be the only
+/// one that can say the work moved.
+pub const LOOP_OWNER_LOSSES_TOTAL: &str = "cogneva_loop_owner_losses_total";
+
+/// Cycles this loop's role could not be asked about at all, as a counter.
+///
+/// One per attempt, not one per outage: a loop asks once per cycle, so this
+/// divided by the loop's own period is how much of the time the role was
+/// unprovable. It is the reading that separates an unheld role from an
+/// unreachable arbiter — both leave the holder gauge silent, and only one of
+/// them is repaired by looking at the store.
+pub const LOOP_OWNER_PROBE_FAILURES_TOTAL: &str = "cogneva_loop_owner_probe_failures_total";
+
+/// The deployed rule that reads whether any process holds a declared role.
+pub const OWNER_UNOWNED_RULE: &str = "background_loop_role_unowned";
+/// The deployed rule that reads whether two processes hold one role at once.
+pub const OWNER_SPLIT_RULE: &str = "background_loop_role_split";
+/// The deployed rule that reads the cycles a role could not be asked about.
+pub const OWNER_PROBE_RULE: &str = "background_loop_role_probe_failing";
+
+/// What a process's last ask about a loop's role came back as.
+///
+/// The two failure states are kept apart because they are repaired differently:
+/// a role held elsewhere means the work is being done by the other process, and
+/// an unanswerable ask means nobody may be doing it. Collapsing them would make
+/// the same alert serve two incidents whose first step is not the same.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnerState {
+    /// Nothing has been asked yet: either the loop does not contend for a role
+    /// or it has not reached the ask.
+    Unread,
+    /// This process's term.
+    Held,
+    /// Another process's live term.
+    Elsewhere,
+    /// The arbiter could not be consulted.
+    Unprovable,
+}
+
+impl OwnerState {
+    fn code(self) -> u8 {
+        match self {
+            OwnerState::Unread => 0,
+            OwnerState::Held => 1,
+            OwnerState::Elsewhere => 2,
+            OwnerState::Unprovable => 3,
+        }
+    }
+
+    fn from_code(code: u8) -> Self {
+        match code {
+            1 => OwnerState::Held,
+            2 => OwnerState::Elsewhere,
+            3 => OwnerState::Unprovable,
+            _ => OwnerState::Unread,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            OwnerState::Unread => "unread",
+            OwnerState::Held => "held",
+            OwnerState::Elsewhere => "elsewhere",
+            OwnerState::Unprovable => "unprovable",
+        }
+    }
+}
 
 /// The deployed rule that reads the age this module publishes.
 pub const STALL_RULE: &str = "background_loop_stalled";
@@ -244,6 +341,12 @@ struct LoopState {
     last_beat_ms: AtomicU64,
     deaths: AtomicU64,
     restarts: AtomicU64,
+    /// The last answer this process got about the loop's role, as an
+    /// [`OwnerState`] code.
+    owner_state: AtomicU8,
+    owner_acquisitions: AtomicU64,
+    owner_losses: AtomicU64,
+    owner_probe_failures: AtomicU64,
 }
 
 impl LoopState {
@@ -295,6 +398,10 @@ impl LoopHealth {
                 last_beat_ms: AtomicU64::new(now_ms()),
                 deaths: AtomicU64::new(0),
                 restarts: AtomicU64::new(0),
+                owner_state: AtomicU8::new(OwnerState::Unread.code()),
+                owner_acquisitions: AtomicU64::new(0),
+                owner_losses: AtomicU64::new(0),
+                owner_probe_failures: AtomicU64::new(0),
             })
         });
         if state.period_secs != period_secs {
@@ -524,6 +631,73 @@ impl Beat {
         self.state.restarts.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    /// Record what the loop learned about the single-writer role it contends
+    /// for, and report the change.
+    ///
+    /// Called once per cycle by the loop's [`crate::owner_lease::RoleClaim`],
+    /// which is the only thing that knows the answer. A loop that contends and
+    /// one that does not are told apart here and nowhere else: the first call
+    /// makes the loop's role readings exist, and a loop that never makes one
+    /// publishes nothing about ownership.
+    ///
+    /// The two directions are logged and counted separately because they are
+    /// different incidents: taking a term starts work that was not happening,
+    /// and losing one stops work that was. A term that is renewed every cycle
+    /// changes nothing and says nothing.
+    pub fn note_ownership(&self, ownership: crate::owner_lease::Ownership) {
+        use crate::owner_lease::Ownership;
+
+        let now = match ownership {
+            Ownership::Held => OwnerState::Held,
+            Ownership::Elsewhere => OwnerState::Elsewhere,
+            Ownership::Unprovable => OwnerState::Unprovable,
+        };
+        if ownership == Ownership::Unprovable {
+            self.state
+                .owner_probe_failures
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        let previous =
+            OwnerState::from_code(self.state.owner_state.swap(now.code(), Ordering::Relaxed));
+        if previous == now {
+            return;
+        }
+        match (previous, now) {
+            (_, OwnerState::Held) => {
+                let acquisitions = self
+                    .state
+                    .owner_acquisitions
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
+                tracing::info!(
+                    loop_name = self.state.name,
+                    term = if previous == OwnerState::Unread {
+                        "first"
+                    } else {
+                        "regained"
+                    },
+                    acquisitions,
+                    previous = previous.as_str(),
+                    "background loop holds the single-writer role for this term; the work it \
+                     guards happens here until another process takes over"
+                );
+            }
+            (OwnerState::Held, _) => {
+                let losses = self.state.owner_losses.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::warn!(
+                    loop_name = self.state.name,
+                    losses,
+                    now = now.as_str(),
+                    "background loop no longer holds the single-writer role; from here on the \
+                     readings it published are last-known rather than current, and whatever it \
+                     had in flight is another process's to finish"
+                );
+            }
+            _ => {}
+        }
+    }
+
     /// Record this loop's exit as a death unless `shutdown` was triggered.
     ///
     /// Held as a guard so that a loop ending by return and a loop ending by panic
@@ -605,6 +779,47 @@ impl Observable for LoopHealth {
                 RawMetric::new(
                     LOOP_RESTARTS_TOTAL,
                     state.restarts.load(Ordering::Relaxed) as f64,
+                )
+                .with_label(LOOP_LABEL, label),
+            );
+
+            // The role readings, for a loop that was given one to contend for.
+            // Nothing is published for a loop that does no single-writer work:
+            // a zero would be a claim about a role it never had.
+            let owner = OwnerState::from_code(state.owner_state.load(Ordering::Relaxed));
+            if owner == OwnerState::Unread {
+                continue;
+            }
+            out.push(RawMetric::new(LOOP_ROLE_DECLARED, 1.0).with_label(LOOP_LABEL, label));
+            match owner {
+                OwnerState::Held => {
+                    out.push(RawMetric::new(LOOP_OWNER_HELD, 1.0).with_label(LOOP_LABEL, label))
+                }
+                OwnerState::Elsewhere => {
+                    out.push(RawMetric::new(LOOP_OWNER_HELD, 0.0).with_label(LOOP_LABEL, label))
+                }
+                // Nothing: an unanswerable ask is not evidence about who holds
+                // the role, and the count below is what says it happened.
+                OwnerState::Unprovable | OwnerState::Unread => {}
+            }
+            out.push(
+                RawMetric::new(
+                    LOOP_OWNER_ACQUISITIONS_TOTAL,
+                    state.owner_acquisitions.load(Ordering::Relaxed) as f64,
+                )
+                .with_label(LOOP_LABEL, label),
+            );
+            out.push(
+                RawMetric::new(
+                    LOOP_OWNER_LOSSES_TOTAL,
+                    state.owner_losses.load(Ordering::Relaxed) as f64,
+                )
+                .with_label(LOOP_LABEL, label),
+            );
+            out.push(
+                RawMetric::new(
+                    LOOP_OWNER_PROBE_FAILURES_TOTAL,
+                    state.owner_probe_failures.load(Ordering::Relaxed) as f64,
                 )
                 .with_label(LOOP_LABEL, label),
             );
@@ -1101,6 +1316,130 @@ mod tests {
         );
     }
 
+    /// A loop that contends for no role says nothing about ownership.
+    ///
+    /// The distinction the rule depends on: a zero on the holder gauge is a
+    /// claim that a live term belongs to another process, and a loop that does
+    /// no single-writer work cannot make it.
+    #[tokio::test]
+    async fn a_loop_with_no_role_publishes_nothing_about_ownership() {
+        let readings = LoopHealth::new();
+        readings.register("plain_probe", Cadence::Periodic(Duration::from_secs(30)));
+        let metrics = collect(&readings).await;
+        for series in [
+            LOOP_ROLE_DECLARED,
+            LOOP_OWNER_HELD,
+            LOOP_OWNER_ACQUISITIONS_TOTAL,
+            LOOP_OWNER_LOSSES_TOTAL,
+            LOOP_OWNER_PROBE_FAILURES_TOTAL,
+        ] {
+            assert_eq!(
+                metric(&metrics, series, "plain_probe"),
+                None,
+                "{series} must be absent for a loop with no role"
+            );
+        }
+    }
+
+    /// The role readings follow the answers, and count only the changes.
+    ///
+    /// A term renewed every cycle is the ordinary case and must not accumulate:
+    /// a counter that moved on every ask would make a long-held role and a role
+    /// flapping between processes the same reading.
+    #[tokio::test]
+    async fn the_role_readings_follow_the_answers_and_count_only_changes() {
+        use crate::owner_lease::Ownership;
+
+        let readings = LoopHealth::new();
+        let beat = readings.register("role_probe", Cadence::Periodic(Duration::from_secs(30)));
+
+        beat.note_ownership(Ownership::Held);
+        beat.note_ownership(Ownership::Held);
+        let metrics = collect(&readings).await;
+        assert_eq!(
+            metric(&metrics, LOOP_ROLE_DECLARED, "role_probe"),
+            Some(1.0)
+        );
+        assert_eq!(metric(&metrics, LOOP_OWNER_HELD, "role_probe"), Some(1.0));
+        assert_eq!(
+            metric(&metrics, LOOP_OWNER_ACQUISITIONS_TOTAL, "role_probe"),
+            Some(1.0),
+            "renewing a term is not taking a new one"
+        );
+        assert_eq!(
+            metric(&metrics, LOOP_OWNER_LOSSES_TOTAL, "role_probe"),
+            Some(0.0)
+        );
+
+        // Taken over by another process: the holder gauge says so and the loss
+        // is counted where it happened.
+        beat.note_ownership(Ownership::Elsewhere);
+        let metrics = collect(&readings).await;
+        assert_eq!(metric(&metrics, LOOP_OWNER_HELD, "role_probe"), Some(0.0));
+        assert_eq!(
+            metric(&metrics, LOOP_OWNER_LOSSES_TOTAL, "role_probe"),
+            Some(1.0)
+        );
+
+        // And won back, which is a second acquisition rather than the first.
+        beat.note_ownership(Ownership::Held);
+        let metrics = collect(&readings).await;
+        assert_eq!(metric(&metrics, LOOP_OWNER_HELD, "role_probe"), Some(1.0));
+        assert_eq!(
+            metric(&metrics, LOOP_OWNER_ACQUISITIONS_TOTAL, "role_probe"),
+            Some(2.0)
+        );
+    }
+
+    /// An ask that could not be answered leaves the holder gauge absent.
+    ///
+    /// Not a zero: the process has learned nothing about who holds the role, and
+    /// whether the work is being done anywhere is exactly what the missing
+    /// series leaves open. The count is what says the cycle happened.
+    #[tokio::test]
+    async fn an_unanswerable_ask_leaves_the_holder_gauge_absent() {
+        use crate::owner_lease::Ownership;
+
+        let readings = LoopHealth::new();
+        let beat = readings.register("outage_probe", Cadence::Periodic(Duration::from_secs(30)));
+
+        beat.note_ownership(Ownership::Held);
+        beat.note_ownership(Ownership::Unprovable);
+        let metrics = collect(&readings).await;
+        assert_eq!(
+            metric(&metrics, LOOP_OWNER_HELD, "outage_probe"),
+            None,
+            "an unanswerable ask is not evidence about the holder"
+        );
+        assert_eq!(
+            metric(&metrics, LOOP_ROLE_DECLARED, "outage_probe"),
+            Some(1.0),
+            "the loop still declares the role it contends for"
+        );
+        assert_eq!(
+            metric(&metrics, LOOP_OWNER_LOSSES_TOTAL, "outage_probe"),
+            Some(1.0),
+            "the work stopped, and that is a loss wherever it lands"
+        );
+        assert_eq!(
+            metric(&metrics, LOOP_OWNER_PROBE_FAILURES_TOTAL, "outage_probe"),
+            Some(1.0)
+        );
+
+        beat.note_ownership(Ownership::Unprovable);
+        let metrics = collect(&readings).await;
+        assert_eq!(
+            metric(&metrics, LOOP_OWNER_PROBE_FAILURES_TOTAL, "outage_probe"),
+            Some(2.0),
+            "one per cycle asked, so the rate says how much of the time it was unprovable"
+        );
+        assert_eq!(
+            metric(&metrics, LOOP_OWNER_LOSSES_TOTAL, "outage_probe"),
+            Some(1.0),
+            "a second unanswerable cycle is not a second loss"
+        );
+    }
+
     /// The three rules, each asserted against the series this module publishes.
     ///
     /// Renaming either side leaves both ends self-consistent and the signal
@@ -1135,6 +1474,28 @@ mod tests {
         assert!(
             restarted.contains(LOOP_RESTARTS_TOTAL),
             "rule {RESTART_RULE} must query {LOOP_RESTARTS_TOTAL}, got: {restarted}"
+        );
+
+        // The role readings. The unowned rule has to read the declaration as
+        // well as the holder: a deployment whose every replica stopped asking
+        // publishes no holder series at all, and a rule over the holder alone
+        // would be silent through exactly the state it exists to announce.
+        let unowned = find(OWNER_UNOWNED_RULE);
+        assert!(
+            unowned.contains(LOOP_ROLE_DECLARED) && unowned.contains(LOOP_OWNER_HELD),
+            "rule {OWNER_UNOWNED_RULE} must read the declaration and the holder, got: {unowned}"
+        );
+
+        let split = find(OWNER_SPLIT_RULE);
+        assert!(
+            split.contains(LOOP_OWNER_HELD),
+            "rule {OWNER_SPLIT_RULE} must query {LOOP_OWNER_HELD}, got: {split}"
+        );
+
+        let unprovable = find(OWNER_PROBE_RULE);
+        assert!(
+            unprovable.contains(LOOP_OWNER_PROBE_FAILURES_TOTAL),
+            "rule {OWNER_PROBE_RULE} must query {LOOP_OWNER_PROBE_FAILURES_TOTAL}, got: {unprovable}"
         );
     }
 
