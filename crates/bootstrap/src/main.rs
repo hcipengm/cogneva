@@ -1835,6 +1835,49 @@ async fn detect_delivery(cluster_existed: bool) -> Delivery {
     Delivery::Apply
 }
 
+/// 命名空间里 Kubernetes 自己就会建、因此**不算** cogneva 痕迹的对象：任何命名空间
+/// 都有这两样（k8s 1.20 起每个命名空间都带 root CA ConfigMap，default
+/// ServiceAccount 更是从有命名空间起就有），探测读数要把它们剔掉。
+const KUBERNETES_OWN_OBJECTS: [&str; 2] = ["serviceaccount/default", "configmap/kube-root-ca.crt"];
+
+/// 痕迹探测面：命名空间里 cogneva 可能留下的对象种类。
+///
+/// 这份清单是**读**发布树读出来的，不是想出来的——早先的手写名单里
+/// `statefulset/cogneva-postgres` 在集群与仓库里都不存在（真名是 `postgres`），而
+/// 真在发布的 `daemonset/cogneva-buildah` 没人探：手写的名字错了不会报错，只会变成
+/// 一次永远命不中的 kubectl，所以改成按种类整片读（见 `existing_cogneva_objects`），
+/// 与发布树的对齐由 `install_trace_tests` 钉住。`secret` 不在发布树里（内部密钥由
+/// init-secrets.sh 安装时生成），但它恰恰是"装到一半"最常见的痕迹，必须在。
+const TRACE_KINDS: [&str; 15] = [
+    "deployment",
+    "daemonset",
+    "statefulset",
+    "cronjob",
+    "configmap",
+    "secret",
+    "serviceaccount",
+    "persistentvolumeclaim",
+    "service",
+    "ingress",
+    "role",
+    "rolebinding",
+    "networkpolicy",
+    "resourcequota",
+    "limitrange",
+];
+
+/// 从 `kubectl get -o name` 的读数里取第一件**不是** Kubernetes 自建的对象。
+///
+/// 单独成函数是为了让判据能脱离 kubectl 被读：读数里只有 `default`
+/// ServiceAccount 与 `kube-root-ca.crt` 时必须报"没有痕迹"（否则绿地安装会永远
+/// 停在 apply 投递上）。
+fn first_cogneva_trace(listing: &str) -> Option<&str> {
+    listing
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !KUBERNETES_OWN_OBJECTS.contains(line))
+}
+
 /// 命名空间里是否已有 cogneva 管理的对象，返回第一个命中的名字（没有则 None）。
 ///
 /// 判据刻意**不**只查 `deployment/cogneva`：真正要防的是"把别人管理的资源拿 helm
@@ -1842,30 +1885,24 @@ async fn detect_delivery(cluster_existed: bool) -> Delivery {
 /// 还没建），这时只查 Deployment 会得出"绿地"的结论，于是切到 helm install ——
 /// helm 撞上已存在的 Namespace/Secret 直接失败，或者更糟：把 npm 的对象接管成
 /// 自己的。所以对象面要从"工作负载"放宽到"这个命名空间里有没有 cogneva 的痕迹"。
+/// 放宽的方式是把 `TRACE_KINDS` 整片一次读回来，而不是手写一串名字：名字错了没人
+/// 报错，种类的键错了 kubectl 会拒（且测试会红）。
 async fn existing_cogneva_objects() -> Option<String> {
-    for (kind, name) in [
-        ("deployment", "cogneva"),
-        ("daemonset", "cogneva-image-distributor"),
-        ("statefulset", "cogneva-postgres"),
-        ("configmap", "cogneva-json"),
-        ("secret", "cogneva-secrets"),
-        ("serviceaccount", "cogneva"),
-        ("persistentvolumeclaim", "cogneva-data-pvc"),
-    ] {
-        let ok = Command::new("kubectl")
-            .args(["-n", "cogneva", "get", kind, name])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if ok {
-            return Some(format!("{kind}/{name}"));
+    let kinds = TRACE_KINDS.join(",");
+    let out = Command::new("kubectl")
+        .args(["-n", "cogneva", "get", &kinds, "-o", "name"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            first_cogneva_trace(&stdout).map(str::to_string)
         }
+        // 命名空间不存在（绿地安装）时 kubectl 非零退出，这正是"没有痕迹"。
+        _ => None,
     }
-    None
 }
 
 /// helm 归属三件套的键。helm 只接管**带自己标记**的对象：切投递方式时，命名空间
@@ -1887,21 +1924,20 @@ fn helm_ownership_patch() -> String {
     )
 }
 
-/// 从 apply 投递切到 helm 之前，给已存在的 cogneva 对象补归属标记。对象不存在
-/// （绿地安装）是正常路径；其它失败要说出来，否则后续 helm 接管失败时无从知道
-/// 是标记没打上。
+/// 从 apply 投递切到 helm 之前，给已存在的 cogneva 对象补归属标记。
+///
+/// 只可能是**命名空间**：命名空间里的任何对象（工作负载、ConfigMap、Secret、PVC、
+/// Service…）都会让 `existing_cogneva_objects` 命中而停在 apply 投递，走不到 helm
+/// 这条路上来——这条推理成立的前提是那个探测面覆盖了命名空间里全部对象种类
+/// （`TRACE_KINDS`，由 `install_trace_tests` 钉住）。命名空间本身不在那个读数里
+/// （它不是命名空间内的对象），而 chart 自己渲染 Namespace，复用一个上一次 apply
+/// 建的、或使用者手建的命名空间时 helm 会因它"存在但无归属标记"而拒绝 install。
+/// 对象不存在（绿地安装）是正常路径；其它失败要说出来，否则后续 helm 接管失败时
+/// 无从知道是标记没打上。
 async fn ensure_helm_ownership() -> Result<()> {
     let patch = helm_ownership_patch();
     let mut targeted = 0;
-    for kind in [
-        "namespace/cogneva",
-        "serviceaccount/cogneva",
-        "configmap/cogneva-json",
-        "secret/cogneva-secrets",
-        "persistentvolumeclaim/cogneva-data-pvc",
-        "service/cogneva",
-        "deployment/cogneva",
-    ] {
+    for kind in ["namespace/cogneva"] {
         let out = Command::new("kubectl")
             .args(["patch", kind, "-n", "cogneva", "--type=merge", "-p", &patch])
             .stdin(Stdio::null())
@@ -3069,7 +3105,7 @@ mod cn_image_tests {
     };
     use std::path::{Path, PathBuf};
 
-    fn repo_file(rel: &str) -> PathBuf {
+    pub(super) fn repo_file(rel: &str) -> PathBuf {
         Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")).join(rel)
     }
 
@@ -3231,6 +3267,114 @@ mod cn_image_tests {
         assert_eq!(
             meta["annotations"]["meta.helm.sh/release-namespace"],
             "cogneva"
+        );
+    }
+}
+
+#[cfg(test)]
+mod install_trace_tests {
+    use super::cn_image_tests::repo_file;
+    use super::{first_cogneva_trace, TRACE_KINDS};
+    use serde::Deserialize;
+
+    /// 发布树里出现、但 `kubectl -n cogneva get` 读不到的种类：集群级对象与不是
+    /// k8s 对象的清单文件。它们不该进痕迹探测面。
+    const NOT_NAMESPACED: [&str; 3] = ["Namespace", "StorageClass", "Kustomization"];
+
+    /// 安装时才生成、因此不在发布树里的痕迹种类。
+    const GENERATED_AT_INSTALL: [&str; 1] = ["secret"];
+
+    /// 发布树里每个文档的 kind。`deploy/k3s/` 按 kustomization 的 `resources` 列
+    /// （那份清单就是 `kubectl apply -k` 交付的对象集，目录里其余 yaml 是 values
+    /// 之类不交付的文件），外加 bootstrap 自己 apply 的镜像分发器清单。
+    fn delivered_kinds() -> Vec<String> {
+        let kustomization =
+            std::fs::read_to_string(repo_file("deploy/k3s/kustomization.yaml")).unwrap();
+        let manifest: serde_yaml::Value =
+            serde_yaml::from_str(&kustomization).expect("kustomization.yaml 不可解析");
+        let files = manifest["resources"]
+            .as_sequence()
+            .expect("kustomization 没有 resources 列表")
+            .iter()
+            .map(|f| format!("deploy/k3s/{}", f.as_str().expect("resources 里不是文件名")))
+            .chain(["deploy/k8s/image-distributor.yaml".to_string()]);
+
+        let mut kinds = Vec::new();
+        for rel in files {
+            let text = std::fs::read_to_string(repo_file(&rel))
+                .unwrap_or_else(|e| panic!("读不到 {rel}: {e}"));
+            for document in serde_yaml::Deserializer::from_str(&text) {
+                let doc = serde_yaml::Value::deserialize(document)
+                    .unwrap_or_else(|e| panic!("{rel} 的文档不可解析: {e}"));
+                if let Some(kind) = doc.get("kind").and_then(|k| k.as_str()) {
+                    kinds.push(kind.to_string());
+                }
+            }
+        }
+        kinds
+    }
+
+    /// 痕迹探测面必须与发布树对齐。少一种，装到一半只剩那种对象的集群就会被读成
+    /// 绿地，于是 helm install 去撞已存在的资源；多一种不交付的，就是一次永远命不
+    /// 中的 kubectl（手写名单里的 `statefulset/cogneva-postgres` 正是这么烂掉的：
+    /// 集群与仓库里都没有这个对象，真名是 `postgres`）。
+    #[test]
+    fn the_trace_probe_covers_every_namespaced_kind_the_release_delivers() {
+        let mut kinds = delivered_kinds();
+        kinds.sort();
+        kinds.dedup();
+        assert!(
+            kinds.len() > 5,
+            "发布树只读出 {} 种对象，判据本身大概是瞎的",
+            kinds.len()
+        );
+
+        for kind in &kinds {
+            let noun = kind.to_ascii_lowercase();
+            if NOT_NAMESPACED.contains(&kind.as_str()) {
+                assert!(
+                    !TRACE_KINDS.contains(&noun.as_str()),
+                    "{kind} 不是命名空间内对象，痕迹探测面里不该有它"
+                );
+                continue;
+            }
+            assert!(
+                TRACE_KINDS.contains(&noun.as_str()),
+                "发布树交付 {kind}，痕迹探测面里却没有它：装到一半只剩这种对象的集群会被读成绿地"
+            );
+        }
+        for noun in TRACE_KINDS {
+            assert_eq!(
+                noun,
+                noun.to_ascii_lowercase(),
+                "痕迹探测面里的种类名是 kubectl 的键，必须全小写"
+            );
+            let delivered = kinds.iter().any(|k| k.eq_ignore_ascii_case(noun));
+            assert!(
+                delivered || GENERATED_AT_INSTALL.contains(&noun),
+                "痕迹探测面探 {noun}，发布树里却没有任何清单交付它（安装时才生成的种类要显式登记）"
+            );
+        }
+    }
+
+    /// 读数里只有 Kubernetes 自建的那两样时必须报"没有痕迹"：报错了，绿地安装会
+    /// 永远停在 apply 投递上、拿不到 helm 的升级与回滚管理。
+    #[test]
+    fn a_namespace_holding_only_kubernetes_own_objects_has_no_trace() {
+        assert_eq!(first_cogneva_trace(""), None);
+        assert_eq!(first_cogneva_trace("\n"), None);
+        assert_eq!(
+            first_cogneva_trace("serviceaccount/default\nconfigmap/kube-root-ca.crt\n"),
+            None
+        );
+        assert_eq!(
+            first_cogneva_trace("configmap/kube-root-ca.crt\ndeployment.apps/cogneva\n"),
+            Some("deployment.apps/cogneva")
+        );
+        // 装到一半最常见的痕迹是密钥：发布树里没有它，安装时才生成。
+        assert_eq!(
+            first_cogneva_trace("secret/cogneva-secrets\n"),
+            Some("secret/cogneva-secrets")
         );
     }
 }
