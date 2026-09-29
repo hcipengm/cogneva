@@ -1469,15 +1469,33 @@ fn rollout_converged(out: &str) -> bool {
     if parts.len() < 5 {
         return false;
     }
-    let gen: u64 = parts[0].parse().unwrap_or(0);
-    let obs: u64 = parts[1].parse().unwrap_or(0);
     let spec: u32 = parts[2].parse().unwrap_or(0);
     let updated = updated_pod_count(out);
     let ready: u32 = parts[4].parse().unwrap_or(0);
     // unavailable 必须为 0：RollingUpdate 新旧副本并存时，旧副本仍 ready 会让
     // ready==spec 提前成立，但新崩溃副本计入 unavailable，不能判完成。
     let unavailable: u32 = parts.get(5).and_then(|v| v.parse().ok()).unwrap_or(0);
-    obs >= gen && gen > 0 && updated == spec && ready == spec && unavailable == 0 && spec > 0
+    generation_observed(out) && updated == spec && ready == spec && unavailable == 0 && spec > 0
+}
+
+/// 控制器**已经处理过当前这一代模板**（`observedGeneration >= generation`，且
+/// generation 非零）。
+///
+/// 这一条是读 `updatedReplicas` 的前提：在控制器处理新模板之前，`status` 里那一段
+/// 记的仍是**上一代**的账——上一次滚动完成后 `updatedReplicas` 恒等于副本数，于是
+/// apply 之后的第一眼就能读到"新版本建成了 Pod"，而那一刻它数的是旧模板的 Pod。
+/// 判"这一版有没有自己的 Pod"必须落在前提成立的那些读数上。
+fn generation_observed(out: &str) -> bool {
+    let parts: Vec<&str> = out.split('|').collect();
+    let gen: u64 = parts
+        .first()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    let obs: u64 = parts
+        .get(1)
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    gen > 0 && obs >= gen
 }
 
 /// 部署态读数里 `updatedReplicas`（第 3 段）的值：控制器为新版本**建成**了几个
@@ -1486,6 +1504,8 @@ fn rollout_converged(out: &str) -> bool {
 ///
 /// 它和 `rollout_converged` 读同一份读数、同一段，所以两处不能各写一份下标：
 /// 那会让"收敛"与"新版本建成过没有"在同一次读取上给出互相矛盾的答案。
+/// 问"这一版有没有自己的 Pod"时还得先过 [`generation_observed`]——同一段字段在
+/// 控制器处理新模板之前记的是上一代的账。
 fn updated_pod_count(out: &str) -> u32 {
     out.split('|')
         .nth(3)
@@ -6886,7 +6906,12 @@ impl RolloutExecutor {
             {
                 Ok(out) => {
                     observed_ever = true;
-                    new_pod_seen |= updated_pod_count(&out) > 0;
+                    // 只认控制器处理过当前这一代模板的读数：apply 之后的第一眼
+                    // 往往早于控制器，那一段 `updatedReplicas` 仍是上一代的账
+                    // （上一轮滚完时它恒等于副本数），拿它置位会让这条"新版本
+                    // 一个 Pod 都没建成"的出口**整段预算都够不着**——而它正是
+                    // 为这一种现场写的。
+                    new_pod_seen |= generation_observed(&out) && updated_pod_count(&out) > 0;
                     if rollout_converged(&out) {
                         let samples = self.sample_rollout_pods(t).await;
                         match rollout_pods_ready(&samples) {
@@ -13212,6 +13237,76 @@ exit 0
         );
     }
 
+    /// 同一条出口，但第一眼来得比控制器早：`apply` 之后 `status` 里那一段仍是
+    /// **上一代**的账（上一轮滚完时 `updatedReplicas` 等于副本数，所以这一眼读到的
+    /// 是 1），控制器处理完就归零。置过位这条出口就整段预算都够不着了，而它正是
+    /// 为「新版本一个自己的 Pod 都没建成」写的。
+    #[tokio::test]
+    async fn a_sample_from_before_the_new_generation_is_no_pod_of_the_new_revision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let log = bin_dir.join("kubectl.log");
+        let seen = bin_dir.join("generation-read");
+        // 第一眼：`gen=2 obs=1`（控制器还没处理新模板），`updatedReplicas=1` 数的是
+        // 上一代的 Pod。之后：`gen=2 obs=2`，`updatedReplicas` 缺省——现场那条读数。
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    case "$a" in
+      jsonpath=*) ;;
+      *) echo "error: unable to match a printer suitable for the output format \"$a\"" >&2; exit 2 ;;
+    esac
+  fi
+  prev="$a"
+done
+case "$*" in
+  *generation*)
+    if [ -f '{seen}' ]; then
+      echo "2|2|1|||1"
+    else
+      : > '{seen}'
+      echo "2|1|1|1||1"
+    fi
+    ;;
+  *"initContainers"*) ;;
+  *".image"*) echo "localhost:30500/cogneva:main-old" ;;
+  *"get pods"*) echo "0 true " ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            seen = seen.display()
+        );
+        write_fake_bin(&bin_dir, "fake-kubectl", &script);
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            0,
+            1,
+            1,
+            1,
+        );
+        let cfg = MainlineDeployerConfig::default();
+        let plan = RolloutPlan::from_config(&cfg, "localhost:30500/cogneva:main-new".into());
+        let err = executor.run(&plan).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(NEW_REVISION_NEVER_RAN_MARKER),
+            "an updatedReplicas read before the controller processed this generation counts the \
+             previous template's pods and must not become evidence of a pod of this revision: \
+             {msg}"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !calls.contains("main-old"),
+            "no evidence about the new revision means no rollback: {calls}"
+        );
+    }
+
     /// 清单里"会被这次 apply 改写的引用"要按工作负载种类的真实深度取全：Deployment 的
     /// 容器与 init 容器、CronJob 埋在 `jobTemplate` 里的那一份。少走一层，那一类引用
     /// 就既不在快照里、也不在还原里——而守着启动路径的正是这些 init 容器。
@@ -13552,10 +13647,12 @@ exit 0
         )
         .unwrap();
         let log = bin_dir.join("kubectl.log");
-        // 目标永远不收敛（`observedGeneration` 落后），其余照旧；支撑工作负载的代数
-        // 不变，所以没有支撑等待。`updatedReplicas=1`：这一档要的是"新副本建成过、
-        // 但没起来"的版本类失败；写成 0 会落到"新版本一个 Pod 都没建成"（环境类、
-        // 不回滚），那是另一个用例的事。
+        // 目标永远不收敛（新副本没就绪），其余照旧；支撑工作负载的代数不变，所以没有
+        // 支撑等待。`updatedReplicas=1`：这一档要的是"新副本建成过、但没起来"的版本类
+        // 失败；写成 0 会落到"新版本一个 Pod 都没建成"（环境类、不回滚），那是另一个
+        // 用例的事。读数要**自洽**：`observedGeneration` 已经追上这一代——控制器没处理
+        // 过新模板时，`status` 那一段记的是上一代的账（上一轮滚完 `updatedReplicas`
+        // 恰好满值），拿它当"新版本有 Pod"会被这版新判据挡掉，落到环境类上去。
         let script = format!(
             r#"#!/bin/sh
 echo "$@" >> '{log}'
@@ -13568,7 +13665,7 @@ case "$*" in
   *"get statefulset -o"*) ;;
   *"get configmap -o"*) echo '{{"items":[]}}' ;;
   *"jsonpath={{.spec}}"*) echo '{{"replicas":1}}' ;;
-  *generation*) echo "1|0|1|1|0|" ;;
+  *generation*) echo "1|1|1|1|0|" ;;
   *".image"*) echo "localhost:30500/cogneva:main-old" ;;
   *"get pods"*) echo "0 true " ;;
   *) echo ok ;;
