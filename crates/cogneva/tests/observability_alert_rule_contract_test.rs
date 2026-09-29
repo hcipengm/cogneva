@@ -655,6 +655,40 @@ fn every_series_recorded_as_produced_is_still_published_there() {
     );
 }
 
+/// FOREIGN is an allow-list, and the one thing an allow-list must never name is
+/// something this workspace publishes.
+///
+/// The producer-existence check above only walks PRODUCED, so filing a produced
+/// series under FOREIGN retires that check for it in silence: the name stops
+/// being looked for in its source file, `every_series_an_alert_rule_reads_is_one_something_produces`
+/// keeps accepting any rule that reads it, and if the producer is deleted later
+/// nothing goes red. Two tables that both accept a name, one of which is never
+/// cross-checked against a producer, is the same shape as a hand list beside a
+/// generated set.
+///
+/// The reading taken here is the closed set, because it is the one list of
+/// "series this build publishes" the compiler keeps honest: a closed-set name
+/// under FOREIGN is a contradiction on its face. A tree-wide producer search is
+/// not an alternative — foreign names are short and generic (`up`,
+/// `kube_pod_owner`), so a text match on them counts prose, and the helper the
+/// PRODUCED side uses states that ceiling already. It cannot be lowered by
+/// scanning harder, which is why this direction is checked by identity instead.
+#[test]
+fn no_foreign_name_is_one_the_closed_set_publishes() {
+    let foreign: BTreeSet<&str> = FOREIGN.iter().map(|(n, _)| *n).collect();
+    let filed_here: Vec<&str> = cog_core::metric_names::ALL
+        .iter()
+        .map(|name| name.as_str())
+        .filter(|name| foreign.contains(name))
+        .collect();
+
+    assert!(
+        filed_here.is_empty(),
+        "这些名字被登记成外来序列，却是本仓库闭集里的产出名——登记成外来它就不再被查产出点:\n{}",
+        filed_here.join("\n")
+    );
+}
+
 #[test]
 fn every_label_value_a_rule_has_to_select_is_selected_by_one() {
     use cog_github::redrive_budget::{BudgetSide, RedriveRefusal};
