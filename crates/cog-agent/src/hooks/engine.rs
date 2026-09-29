@@ -878,8 +878,17 @@ mod tests {
         // Should return well before the publisher's 100ms sleep finishes.
         assert!(start.elapsed() < Duration::from_millis(50));
 
-        // Wait for the spawned task to run before tearing down the runtime.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Wait for the spawned task to make its call, before tearing down the
+        // runtime. Waiting a fixed span instead would be a reading of the host
+        // rather than of the code: when the machine is busy the task may not be
+        // scheduled at all inside that span, and the caller-returns-early
+        // property above would be reported as a failure to publish. A bounded
+        // deadline still fails when the detached path never publishes, and the
+        // equality below still catches a second call.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while publisher.webhook_calls.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert_eq!(publisher.webhook_calls.load(Ordering::SeqCst), 1);
     }
 
