@@ -23,19 +23,125 @@ gen() {
   fi
 }
 
+# --- While the control plane has not settled yet ---------------------------
+#
+# The API server is allowed to be slow during an install: K3s has just come up,
+# several hundred MB of image were just imported into containerd, and those
+# pages are still being written back. A request can then come back
+#   Error from server (Timeout): request did not complete within requested
+#   timeout - context deadline exceeded
+# which is the API server's own deadline expiring, not a rejected request.
+# Measured 2026-09-30 on a blank machine: the fifth key's patch hit it, `set -e`
+# ended the script with rc=1, and the entire install was reported as failed --
+# while the same machine finished converging minutes later (12/12 workloads
+# Running, /health/ready 200). "Not finished yet" was reported as "failed", and
+# what the user sees is rc=1, so they run it again (idempotent, but a wasted
+# wait) when the right move is to wait.
+#
+# So the two failure classes have to stay apart: timeout / cannot-connect means
+# the control plane is slow, retry; a real refusal (invalid request, forbidden,
+# NotFound) answers the same way every time, so return it on the first try
+# rather than stretching the error out. Everything retried here is a read or a
+# merge patch: a retry creates no second writer and cannot leave a half write.
+KUBECTL_RETRY_ATTEMPTS="${COGNEVA_KUBECTL_RETRY_ATTEMPTS:-8}"
+KUBECTL_RETRY_SLEEP="${COGNEVA_KUBECTL_RETRY_SLEEP:-5}"
+KUBECTL_TMP="$(mktemp -d)"
+trap 'rm -rf "${KUBECTL_TMP}"' EXIT
+
+is_transient_api_error() {
+  case "$1" in
+    *"request did not complete"*) return 0 ;;
+    *"context deadline exceeded"*) return 0 ;;
+    *"Unable to connect to the server"*) return 0 ;;
+    *"connection refused"*) return 0 ;;
+    *"i/o timeout"* | *"TLS handshake timeout"*) return 0 ;;
+    *"etcdserver:"*) return 0 ;;
+    *"unable to return a response"*) return 0 ;;
+    *"ServiceUnavailable"*) return 0 ;;
+    *"error dialing backend"*) return 0 ;;
+  esac
+  return 1
+}
+
+# How long to wait after failure number `attempt`. Linear backoff: 5s, then 5s
+# more each time, about 140s over eight attempts -- wider than the ~40s stall
+# that was measured, and still not long enough to turn a real fault into minutes.
+retry_sleep() {
+  local attempt="$1"
+  echo "  kubectl ${2:-}：控制面还没稳（第 ${attempt}/${KUBECTL_RETRY_ATTEMPTS} 次），$((attempt * KUBECTL_RETRY_SLEEP))s 后重试" >&2
+  sleep $((attempt * KUBECTL_RETRY_SLEEP))
+}
+
+# Read: stdout is the result and goes through to the caller untouched; stderr
+# lands in a file so the retry decision can be made from what was actually said.
+kubectl_read() {
+  local attempt=1 rc err
+  while :; do
+    if kubectl "$@" 2>"${KUBECTL_TMP}/err"; then
+      return 0
+    else
+      rc=$?
+    fi
+    err="$(cat "${KUBECTL_TMP}/err")"
+    printf '%s\n' "${err}" >&2
+    [ "${attempt}" -ge "${KUBECTL_RETRY_ATTEMPTS}" ] && return "${rc}"
+    is_transient_api_error "${err}" || return "${rc}"
+    retry_sleep "${attempt}" "${1:-}"
+    attempt=$((attempt + 1))
+  done
+}
+
+# Write: the caller does not want this command's stdout (it discarded it before
+# too), so keep it quiet and only surface what failed.
+kubectl_write() {
+  local attempt=1 rc err
+  while :; do
+    if kubectl "$@" >"${KUBECTL_TMP}/out" 2>"${KUBECTL_TMP}/err"; then
+      return 0
+    else
+      rc=$?
+    fi
+    err="$(cat "${KUBECTL_TMP}/err")"
+    printf '%s\n' "${err}" >&2
+    [ "${attempt}" -ge "${KUBECTL_RETRY_ATTEMPTS}" ] && return "${rc}"
+    is_transient_api_error "${err}" || return "${rc}"
+    retry_sleep "${attempt}" "${1:-}"
+    attempt=$((attempt + 1))
+  done
+}
+
+# Read one key's base64 value. Three outcomes must stay apart: a value / rc=0
+# with empty output (this key is confirmed absent) / rc!=0 (could not read).
+# Reading the third as the second costs something: the next ensure_random mints
+# a fresh random value for a key that a running workload may be using, and that
+# write does not report itself -- it shows up at the next failed database
+# connection or signature check instead. So an unreadable key stops the script.
+secret_b64() {
+  local out
+  if ! out="$(kubectl_read -n "$NS" get secret "$SECRET" -o "jsonpath={.data.${1}}")"; then
+    echo "错误：读不到 ${NS}/${SECRET} 的 ${1}（控制面没有回应）。" >&2
+    echo "      「读不到」不等于「不存在」——当成不存在会给一个可能正在用的密钥换值。" >&2
+    exit 1
+  fi
+  printf '%s' "${out}"
+}
+
 echo "==> 确保命名空间 ${NS} 存在"
-kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+# The dry run is read into a variable first: inside `$( )` its exit code would
+# be the exit code of `printf`, so a failure there would pass unnoticed.
+ns_manifest="$(kubectl_read create namespace "$NS" --dry-run=client -o yaml)"
+printf '%s' "${ns_manifest}" | kubectl_write apply -f -
 
 echo "==> 确保 Secret ${SECRET} 存在"
-if ! kubectl -n "$NS" get secret "$SECRET" >/dev/null 2>&1; then
-  kubectl -n "$NS" create secret generic "$SECRET"
+if ! kubectl_read -n "$NS" get secret "$SECRET" >/dev/null 2>&1; then
+  kubectl_write -n "$NS" create secret generic "$SECRET"
 fi
 
 # 内部密钥：缺失（或为空）才生成随机值；非空则保留。
 ensure_random() {
   local key="$1"
   local cur
-  cur="$(kubectl -n "$NS" get secret "$SECRET" -o jsonpath="{.data.${key}}" 2>/dev/null || true)"
+  cur="$(secret_b64 "$key")"
   if [ -n "$cur" ]; then
     echo "  ${key}: 已存在，保留不动"
     return
@@ -46,8 +152,8 @@ ensure_random() {
   # 用 merge patch 而非 JSON patch：全新的 Secret 没有 data 字段，
   # RFC 6902 的 add 因父路径 /data 不存在而被 API server 拒绝
   # （The request is invalid）。merge patch 对 map 是"置键"，语义等价。
-  kubectl -n "$NS" patch secret "$SECRET" --type=merge \
-    -p="{\"data\":{\"${key}\":\"${b64}\"}}" >/dev/null
+  kubectl_write -n "$NS" patch secret "$SECRET" --type=merge \
+    -p="{\"data\":{\"${key}\":\"${b64}\"}}"
   echo "  ${key}: 已生成随机强密钥"
 }
 
@@ -93,7 +199,7 @@ keep_host_fingerprint() {
 
 ensure_fingerprint() {
   local key=instance-fingerprint cur val b64
-  cur="$(kubectl -n "$NS" get secret "$SECRET" -o jsonpath="{.data.${key}}" 2>/dev/null || true)"
+  cur="$(secret_b64 "$key")"
   if [ -n "$cur" ]; then
     echo "  ${key}: 已存在，保留不动"
     # Backfill the host copy: this Secret may predate the copy, in which case
@@ -116,8 +222,8 @@ ensure_fingerprint() {
       exit 1
     fi
     b64="$(printf '%s' "$val" | base64 | tr -d '\n')"
-    kubectl -n "$NS" patch secret "$SECRET" --type=merge \
-      -p="{\"data\":{\"${key}\":\"${b64}\"}}" >/dev/null
+    kubectl_write -n "$NS" patch secret "$SECRET" --type=merge \
+      -p="{\"data\":{\"${key}\":\"${b64}\"}}"
     echo "  ${key}: 已从宿主保留副本恢复（与上次安装是同一个实例）"
     return
   fi
@@ -130,18 +236,19 @@ ensure_fingerprint() {
   # 用 merge patch 而非 JSON patch：全新的 Secret 没有 data 字段，
   # RFC 6902 的 add 因父路径 /data 不存在而被 API server 拒绝
   # （The request is invalid）。merge patch 对 map 是"置键"，语义等价。
-  kubectl -n "$NS" patch secret "$SECRET" --type=merge \
-    -p="{\"data\":{\"${key}\":\"${b64}\"}}" >/dev/null
+  kubectl_write -n "$NS" patch secret "$SECRET" --type=merge \
+    -p="{\"data\":{\"${key}\":\"${b64}\"}}"
   keep_host_fingerprint "$val"
   echo "  ${key}: 生成了新实例指纹，并留了一份在 ${HOST_FINGERPRINT_FILE}"
   echo "        本机此前没有这个实例的保留副本：这是第一次安装，或宿主副本被清掉了。"
 }
 
-# 读 Secret 中某个键的明文值（空则输出空）。
+# Read one key's plaintext value (empty output when it is empty). An unreadable
+# Secret stops the script, in secret_b64.
 secret_value() {
-  local key="$1"
-  kubectl -n "$NS" get secret "$SECRET" -o jsonpath="{.data.${key}}" 2>/dev/null \
-    | base64 -d 2>/dev/null || true
+  local b64
+  b64="$(secret_b64 "$1")"
+  printf '%s' "$b64" | base64 -d 2>/dev/null || true
 }
 
 # SeaweedFS S3 网关的身份文件：同时携带 accessKey 与 secretKey，是唯一能被
@@ -149,7 +256,7 @@ secret_value() {
 # 避免与已生效的凭证错位。
 ensure_s3_identity() {
   local key=seaweedfs-s3.json cur access secret json b64
-  cur="$(kubectl -n "$NS" get secret "$SECRET" -o jsonpath="{.data.${key}}" 2>/dev/null || true)"
+  cur="$(secret_b64 "$key")"
   if [ -n "$cur" ]; then
     echo "  ${key}: 已存在，保留不动"
     return
@@ -176,8 +283,8 @@ JSON
   # 用 merge patch 而非 JSON patch：全新的 Secret 没有 data 字段，
   # RFC 6902 的 add 因父路径 /data 不存在而被 API server 拒绝
   # （The request is invalid）。merge patch 对 map 是"置键"，语义等价。
-  kubectl -n "$NS" patch secret "$SECRET" --type=merge \
-    -p="{\"data\":{\"${key}\":\"${b64}\"}}" >/dev/null
+  kubectl_write -n "$NS" patch secret "$SECRET" --type=merge \
+    -p="{\"data\":{\"${key}\":\"${b64}\"}}"
   echo "  ${key}: 已生成（凭证取自 s3-access-key / s3-secret-key）"
 }
 
@@ -185,10 +292,16 @@ JSON
 ensure_blank() {
   local key="$1"
   local cur
-  cur="$(kubectl -n "$NS" get secret "$SECRET" -o jsonpath="{.data.${key}}" 2>/dev/null || true)"
+  cur="$(secret_b64 "$key")"
   if [ -z "$cur" ]; then
-    kubectl -n "$NS" patch secret "$SECRET" --type=merge \
-      -p="{\"data\":{\"${key}\":\"\"}}" >/dev/null 2>&1 || true
+    # A failed placeholder is not fatal (the real value is written by the
+    # wizard; this is the empty string), but it has to be said out loud: a
+    # missing key keeps the Pod that mounts it from starting
+    # (CreateContainerConfigError), and staying quiet leaves that discovery for
+    # then. Delays from a slow control plane are absorbed by kubectl_write.
+    kubectl_write -n "$NS" patch secret "$SECRET" --type=merge \
+      -p="{\"data\":{\"${key}\":\"\"}}" \
+      || echo "  ${key}: 占位未写入（真值仍可由向导写入）" >&2
   fi
 }
 

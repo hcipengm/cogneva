@@ -1392,7 +1392,14 @@ async fn render_distributor_manifest() -> Result<String> {
 /// 失败是硬失败：清单 pin 已在 registry，播种不成功四部署拉不到镜像；
 /// 给足重试，仍失败则让引导器带着明确错误退出（可修复后重跑，幂等）。
 async fn seed_cluster_registry() -> Result<()> {
-    run(
+    // This wait asks "has this machine got round to it yet", not "is the
+    // registry broken": a blank install has only just finished importing the
+    // image and the disk is still writing those pages back, so the registry
+    // Pod may not even have its image pulled. 300s expired on a 6-core /
+    // 12GiB machine whose install did finish, and the same wait passed on a
+    // 12-core one -- the budget was measuring the machine, not the registry.
+    // It now matches the other image-landing wait in this file.
+    if let Err(e) = run(
         "kubectl",
         &[
             "-n",
@@ -1400,11 +1407,17 @@ async fn seed_cluster_registry() -> Result<()> {
             "wait",
             "--for=condition=Available",
             "deployment/cogneva-registry",
-            "--timeout=300s",
+            "--timeout=900s",
         ],
     )
     .await
-    .context("等待集群内 registry 就绪超时")?;
+    {
+        // Print what was on the machine when the budget ran out. Without it the
+        // log says only "wait timed out" -- the same words whether the registry
+        // is crash-looping or still pulling.
+        let _ = run("kubectl", &["-n", "cogneva", "get", "pods", "-o", "wide"]).await;
+        return Err(e).context("等待集群内 registry 就绪超时（上面是超时那一刻的 Pod 现场）");
+    }
     // k3s 是多调用二进制（argv0=ctr），标准 containerd 直接用 ctr。
     let (program, ctr_prefix): (&str, &[&str]) = if command_exists("k3s").await {
         ("k3s", &["ctr"][..])
