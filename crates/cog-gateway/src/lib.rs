@@ -2813,54 +2813,57 @@ mod metrics_exposition_tests {
         cog_core::metric_description(kind, name).is_some()
     }
 
-    /// 描述表的覆盖面：产出侧真实存在、且名字不是自解释的那几个，必须有描述，
-    /// 否则线上会看到一串"未登记"占位符。这条把"忘了写描述"从运行期搬到编译
-    /// 期管不到的测试期。
+    /// 描述表的覆盖面：**闭集里的每一个名字都必须登记描述**，且至少在某一个
+    /// kind 下查得到。
+    ///
+    /// 判据取自 `metric_names::ALL`（编译器保证的闭集），不是一份手抄名单。手抄
+    /// 的名单只在写它的那天等于产出面：此后每加一个指标就少一格，而少掉的那格在
+    /// 运行期只表现为一串 "Undocumented metric" 占位符——读者看得到异常，看不到
+    /// 是谁漏了。2026-09-30 实测：那条手抄名单有 21 个名字，闭集有 60 个，24 个
+    /// 产出中的名字没有描述（其中 13 个正带着占位符出现在两个 Pod 的暴露面上）。
+    ///
+    /// 边界：一个名字登记在**哪个** kind 下，这里判不出来——kind 记在产出点的
+    /// `record_*` 调用上（同一个名字既可能是计数也可能是仪表），闭集里没有它。
+    /// 登错 kind 与漏描述在暴露面上同形（都是占位符），这条测试看不见它。
+    /// `cog-observability` 那条渲染测试也不覆盖它：它写的名字是
+    /// `MetricName::for_tests_only`，一个**故意**不在闭集里的名字，测的是占位符
+    /// 这条路径本身。能判它的读数是暴露面自己——滚上去之后，闭集里的名字不该再
+    /// 出现任何一行占位符。修订前实测（现役 `main-c8e245c9978e`，两个 Pod 的
+    /// `/metrics` 合并）：13 个闭集内的名字正带着占位符，就是下面这条测试现在
+    /// 逼出来的那批。
     #[test]
-    fn produced_names_are_described() {
-        // 名单取自本仓库真正的产出落点；描述表里不该出现产出面没有的名字，
-        // 否则那张表就从"描述"变成了"宣称"——宣称一个永远不来的读数。
-        for name in [
-            "memory_operations_total",
-            "memory_operation_errors_total",
-            cog_core::metric_names::HTTP_REQUESTS_TOTAL.as_str(),
-            "tier_migration_total",
-            "llm_calls_total",
-            "llm_tokens_total",
-            "llm_usage_readings_total",
-            "llm_upstream_client_errors_total",
-            "llm_upstream_failures_total",
-        ] {
+    fn every_closed_set_name_is_described() {
+        for name in cog_core::metric_names::ALL {
+            let name = name.as_str();
             assert!(
-                described(cog_core::MetricType::Counter, name),
-                "counter {name} 缺描述"
+                described(cog_core::MetricType::Counter, name)
+                    || described(cog_core::MetricType::Histogram, name)
+                    || described(cog_core::MetricType::Gauge, name),
+                "闭集里的 {name} 没有任何 kind 登记描述：暴露面上它只会带占位符"
             );
         }
-        for name in [
-            "memory_operation_latency_ms",
-            cog_core::metric_names::HTTP_REQUEST_DURATION_MS.as_str(),
+    }
+
+    /// 反方向：描述表里的每一个名字都必须在闭集里。
+    ///
+    /// 名字取自描述表自己（`documented_metric_names` 枚举三张表），不是抄一份
+    /// 清单；描述一个闭集外的名字等于宣称一个没有产出方的读数，那正是这张表从
+    /// "描述"变成"宣称"的方式。
+    #[test]
+    fn described_names_are_all_in_the_closed_set() {
+        for kind in [
+            cog_core::MetricType::Counter,
+            cog_core::MetricType::Histogram,
+            cog_core::MetricType::Gauge,
         ] {
-            assert!(
-                described(cog_core::MetricType::Histogram, name),
-                "histogram {name} 缺描述"
-            );
-        }
-        for name in [
-            "memory_unextracted_raw",
-            "memory_unextracted_raw_aged_out",
-            "metrics_samples_rows",
-            "metrics_samples_budget_rows",
-            "metrics_samples_over_capacity",
-            "metrics_samples_bytes",
-            "llm_upstream_healthy",
-            "llm_pool_available",
-            "llm_pool_evidenced_recovery_unix",
-            "llm_pool_next_attempt_unix",
-        ] {
-            assert!(
-                described(cog_core::MetricType::Gauge, name),
-                "gauge {name} 缺描述"
-            );
+            for name in cog_core::documented_metric_names(kind) {
+                assert!(
+                    cog_core::metric_names::ALL
+                        .iter()
+                        .any(|registered| registered.as_str() == name),
+                    "{name} 被描述了却不在闭集里：这张表不该宣称一个没有产出方的读数"
+                );
+            }
         }
     }
 
@@ -2871,11 +2874,15 @@ mod metrics_exposition_tests {
     /// 逐条取，写死一个字面量就等于把名单又抄了一份。
     #[test]
     fn names_nothing_produces_are_not_described() {
+        // `llm_call_latency_ms` 2026-09-20 起有产出方了（`record_histogram`，
+        // 逐模型延迟面板读的就是它），而它在这份名单上又挂了十天：名单与描述表
+        // 是手抄的两份，一份漏加了产出方，另一份就被挡着不能描述它。反方向现在
+        // 由 `described_names_are_all_in_the_closed_set` 机械地判，这条只留
+        // 几个闭集外的名字当样例。
         for name in [
             "task_operations_total",
             "agent_steps_total",
             "tool_calls_total",
-            "llm_call_latency_ms",
             "tool_call_latency_ms",
         ] {
             assert!(

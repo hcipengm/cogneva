@@ -125,6 +125,114 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          of the base branch, which is two hosts disagreeing about one branch \
          and stays here until something outside the loop resolves it",
     ),
+    (
+        "cogneva_change_fate_total",
+        "Changes that have ended, by fate and by the entry point that produced \
+         them. Cumulative, and separate from the funnel census for that reason: \
+         a landed change leaves the record directory once its CI verdict comes \
+         back green, so the census's landed cell drops back to zero and a rate \
+         read off it errs toward looking healthy. fate is landed or retired — \
+         the two ways a change finishes here; every other stage is a place to \
+         wait",
+    ),
+    (
+        "cogneva_landing_failures_total",
+        "Landing calls that failed, one per attempt, by category. A landing \
+         failure is otherwise a single log line inside a loop that then moves \
+         on, so 'nothing needs landing' and 'landing is being refused' look the \
+         same from outside. The category is the part that aggregates: a path or \
+         oversized refusal is a property of the change, so it is terminal and \
+         appears once, while conflict, raced, rejected and environment are \
+         retried and appear once per attempt",
+    ),
+    (
+        "cogneva_redrive_refusals_total",
+        "Re-drives that were not submitted, by reason: no_evidence (the failure \
+         arrived without a log, and a fix task built on its absence is a guess \
+         that costs a full round) or cause_exhausted (this cause has already \
+         spent its rounds for the window). Without it, 'nothing is being \
+         generated' and 'generation was switched off for this cause' read the \
+         same from outside",
+    ),
+    (
+        "cogneva_redrive_budget_losses_total",
+        "Round charges the re-drive ledger lost, by side: read (the ledger \
+         could not be read, so its rounds were forgotten) or write (the round \
+         was not charged, so the same cause can buy another one after a \
+         restart). Both directions end in a budget that quietly stopped \
+         applying; they are counted apart because the two repairs differ",
+    ),
+    (
+        "cogneva_registry_maintenance_runs_total",
+        "Registry maintenance rounds that ran, one per round, whether or not \
+         anything was deleted. Read next to the pruned-tag count: a round that \
+         ran and pruned nothing says the trigger fired on a volume that is not \
+         full",
+    ),
+    (
+        "cogneva_registry_pruned_tags_total",
+        "Tags a registry maintenance round deleted, summed over rounds. Written \
+         only when the round deleted something, so its absence means no round \
+         has ever deleted a tag",
+    ),
+    (
+        "cogneva_registry_prune_failures_total",
+        "Tag deletions the registry refused, summed over rounds. Written only \
+         when a round was refused something: a round that deleted most of what \
+         it intended and was refused the rest reads as the two series together \
+         rather than as a clean sweep",
+    ),
+    (
+        "cogneva_registry_rebuild_hold_secs_total",
+        "Seconds the tag server was held away from serving, summed over the \
+         restarts the deployer itself induced. Written when the server answers \
+         again, so it counts completed holds and never the one in progress. \
+         Read with the pruned-tag count: how long a rebuild takes follows how \
+         much waste had accumulated, so seconds per tag deleted is the ratio \
+         that says whether the trigger lets the volume grow too full",
+    ),
+    (
+        "cogneva_mainline_superseded_rollout_total",
+        "Rounds the deployer's guard asked whether the revision it was carrying \
+         had been overtaken upstream: 1 when it had (nothing is rolled out, the \
+         revision is left alone and the new tip is taken next round), 0 when it \
+         had not. The zeros are what keep the question itself visible — a guard \
+         whose call site was deleted would stop producing skips too, and 'no \
+         skip this round' and 'no guard at all' would be the same absent cell",
+    ),
+    (
+        "cogneva_mainline_ci_verdict_total",
+        "CI verdicts the deployer read for the revision it was about to promote, \
+         by verdict: pass, fail or no_evidence. no_evidence is its own value \
+         rather than a kind of failure: a gate whose conclusion could not be \
+         read is not a gate that said no, and counting the two together hides \
+         exactly the case that lets an unverified revision through",
+    ),
+    (
+        "cogneva_dag_stalled_scheduled_reclaimed_total",
+        "Tasks found stalled in Scheduled and put back through the failure path, \
+         summed over repairs. A counter rather than a gauge, because the repair \
+         empties the state it repairs: a gauge would read zero both when nothing \
+         was ever stuck and when everything had just been unstuck. Absent until \
+         the first such repair, which is what the transport losing a dispatch \
+         event looks like",
+    ),
+    (
+        "cogneva_task_checkpoint_total",
+        "Task checkpoint outcomes, by outcome: saved, unpersisted, failed, \
+         superseded, unsuperseded, no_agents. All six are published from the \
+         first scrape, zeros included, so an outcome that never happens does not \
+         read like one that was never wired up. no_agents counts tasks that were \
+         running with none of their agents present in the chain",
+    ),
+    (
+        "llm_request_param_clamped_total",
+        "Request fields the gateway rewrote before sending, by field and \
+         upstream: temperature forced to 1 for upstreams that require it, plus \
+         each field the protocol adapter had to add or replace. A rewrite \
+         changes what was asked for, so 'this upstream answers differently' has \
+         this among its causes",
+    ),
 ];
 
 /// Descriptions for the histogram series. See [`COUNTER_HELP`].
@@ -136,6 +244,16 @@ const HISTOGRAM_HELP: &[(&str, &str)] = &[
     (
         crate::metric_names::HTTP_REQUEST_DURATION_MS.as_str(),
         "HTTP request duration in milliseconds",
+    ),
+    (
+        "llm_call_latency_ms",
+        "Latency of one LLM call attempt in milliseconds, by upstream, model, \
+         result and actor. The same measurement is written to the ClickHouse \
+         detail, which is why the per-model latency panel reads this instead: a \
+         detail row is not something PromQL can query. upstream and model are \
+         both carried because a pool fails over between endpoints serving the \
+         same model, so 'which model is slow' and 'which endpoint is slow' are \
+         different questions",
     ),
 ];
 
@@ -251,6 +369,82 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          died on the way leaves the previous run's values standing: this is how \
          a reader ties them to the run it actually watched, and a timestamp \
          that does not advance across a completed run is that silence",
+    ),
+    (
+        "cogneva_change_funnel",
+        "How many changes the platform is holding at each stage, by entry point: \
+         staged (produced and withheld until the owner approves publication), \
+         unverified (in the landing channel, not yet sandbox-verified), landed, \
+         retired. Computed from the durable records on every scrape rather than \
+         incremented as stages pass, so every stage has a value from the first \
+         scrape — a counter would be absent until its first event, and 'never \
+         happened' would look like 'never wired up'. landed falls back to zero \
+         when a landed change's record is removed after its green verdict, \
+         which is what the fate counter is for",
+    ),
+    (
+        "cogneva_worktree_index_present",
+        "Whether a resident worktree's git index file exists, 1 or 0, by \
+         worktree. Read with the missing-files series: 'the index remembers no \
+         files' and 'the index is not there' both make the next reset look free, \
+         and this is what tells them apart",
+    ),
+    (
+        "cogneva_worktree_index_missing_files",
+        "Tracked files a resident worktree's git index does not remember, by \
+         worktree; 0 is healthy. Every one of them is rewritten by that \
+         worktree's next reset, so a value at the whole-tree size is a tree \
+         about to be rebuilt rather than refreshed",
+    ),
+    (
+        "cogneva_registry_maintenance_reading_unix",
+        "When a registry maintenance round last finished, as a Unix timestamp. \
+         Written only on completion, so a value that stops advancing is the age \
+         of the last round that got through; absent means none ever has",
+    ),
+    (
+        "cogneva_registry_gc_owed",
+        "1 while a maintenance round has deleted tags and not yet got the tag \
+         server to reclaim them, 0 otherwise. Published every round while a \
+         registry claim is configured, because the moment it most needs to be \
+         visible — the restart keeps failing — has no other reading. Absent when \
+         no registry claim is configured, which is 'nobody asked'",
+    ),
+    (
+        "llm_usage_verdict_measured",
+        "1 when this upstream's usage-reporting capability has been settled from \
+         evidence, 0 while it is still assumed, by upstream. Read next to the \
+         token counters: an upstream carrying traffic while we still guess at \
+         stripping stream_options cannot report non-zero tokens, and 'the \
+         upstream does not report usage' and 'we never asked it to' look alike \
+         in every other series",
+    ),
+    (
+        "llm_upstream_quota_window_secs",
+        "The quota window this upstream itself declared, in seconds; 0 when it \
+         declared none, by upstream. Separate from the pool's next-attempt \
+         instant: this is how long the upstream says it will be unusable, that \
+         is when we will probe it again",
+    ),
+    (
+        "llm_upstream_quota_reset_unix",
+        "The instant this upstream itself said its quota returns, as a Unix \
+         timestamp; 0 when it said nothing, by upstream. Kept per upstream \
+         rather than only as a pool value, so a reader can tell which one is \
+         holding the pool back",
+    ),
+    (
+        "llm_upstream_consecutive_failures",
+        "Consecutive failed probes against this upstream, by upstream; the input \
+         the backoff window length is computed from. On the surface because a \
+         reader cannot judge a backoff interval without seeing what produced it. \
+         Absent for an upstream this process has never probed",
+    ),
+    (
+        "llm_pool_quota_window_secs",
+        "The longest quota window any upstream declared, in seconds; 0 when none \
+         did. Answers 'how long', which is a different question from the pool's \
+         two recovery instants and is not capped by our own probe cadence",
     ),
 ];
 
