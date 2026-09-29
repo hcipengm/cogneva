@@ -268,6 +268,30 @@ pub trait ChangeLanding: Send + Sync + std::fmt::Debug {
     /// to the owner forever, and "rejected for this reason" would be
     /// indistinguishable from "never submitted".
     async fn retire_unverified(&self, change_id: &str, reason: &str) -> crate::SFResult<()>;
+
+    /// Whether a diff is inside the surface this instance may contribute at
+    /// all, decided without touching a remote, a branch or a working tree.
+    ///
+    /// `land` reaches the same verdict, but it reaches it at the far end of a
+    /// pipeline that has already applied the change, run the workspace test
+    /// suite and release-built it -- and that build is the single slot every
+    /// other mainline step queues behind, so a change the rules will refuse
+    /// every time spends twelve minutes of it before anyone asks. Asking first
+    /// changes nothing about the answer and everything about what the answer
+    /// costs.
+    ///
+    /// Takes the diff rather than the change because the diff is all it reads,
+    /// and is not `async` for the same reason: an answer that needs no I/O is
+    /// what makes asking it up front reasonable.
+    ///
+    /// A refusal crosses as [`crate::SFError::Validation`] -- the type a path
+    /// refusal from `land` already crosses as -- so a caller that sees one
+    /// settles the change instead of running it again. What is deliberately
+    /// *not* part of this answer: the owner's `forbidden_paths` and the
+    /// changed-line cap. Those are policy, re-read on every landing, and the
+    /// cap is the one gate owner approval waives; settling a change early on
+    /// them would take a decision the owner still holds.
+    fn check_contribution_allowed(&self, diff: &str) -> crate::SFResult<()>;
 }
 
 /// Owner policy for flowing evolved changes back upstream as PRs.

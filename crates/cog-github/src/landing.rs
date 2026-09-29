@@ -1230,6 +1230,15 @@ impl cog_core::ChangeLanding for MainChannel {
             .map_err(refusal_error)
     }
 
+    fn check_contribution_allowed(&self, diff: &str) -> SFResult<()> {
+        // The first thing `check_policy` does, on the same text: one function
+        // holds the rule and this is a second caller of it rather than a second
+        // copy of it, so the answer here and the answer `land` gives cannot
+        // drift apart.
+        ensure_contribution_allowed(diff)
+            .map_err(|e| refusal_error(LandingError::of(LandingCategory::Path, e)))
+    }
+
     async fn record_unverified(&self, change: &GeneratedChange) -> SFResult<()> {
         let now = Utc::now();
         let created = load_record(&change.change_id)
@@ -1895,6 +1904,7 @@ async fn run_git_status(dir: &Path, args: &[&str]) -> Result<(bool, String, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cog_core::ChangeLanding;
     use cog_core::MetricsBackend as _;
 
     fn diff_touching(paths: &[&str]) -> String {
@@ -2013,6 +2023,79 @@ mod tests {
             }
             other => panic!("expected PrivacyRejected, got {other:?}"),
         }
+    }
+
+    /// 提前问到的答案必须与落地给出的那个**同一个**：同一条被点名的路径、同一个
+    /// 出口类型。提前判若落成另一条判据，就等于在沙箱前面拒掉一条本来能落的变更。
+    ///
+    /// 两句都要：被拒的变更在两份读数里都点名同一条路径（同一个判据的两个调用点，
+    /// 不是两次各自判断），而白名单内的变更提前放行——少了后一句，"提前一律拒绝"
+    /// 也会让前一句全绿。
+    #[tokio::test]
+    async fn the_early_verdict_is_the_one_landing_gives() {
+        let chan = channel(crate::config::LandingPolicy::default());
+        let denied = change(
+            "c1",
+            &diff_touching(&[
+                "crates/cog-github/src/lib.rs",
+                "crates/cog-github/tests/it.rs",
+            ]),
+        );
+
+        let early = chan
+            .check_contribution_allowed(&denied.content)
+            .unwrap_err();
+        assert!(
+            matches!(early, SFError::Validation(_)),
+            "提前判的拒绝要走终局那一支，否则调用方会把它当成环境问题再跑一遍：{early:?}"
+        );
+        assert!(
+            early.to_string().contains("crates/cog-github/tests/it.rs"),
+            "点名要落在被拒的路径上：{early}"
+        );
+
+        // 走 trait 那一面，因为调用方读到的就是它：`MainChannel` 自己的 `land`
+        // 返回本 crate 的错误类型（类别在那一层被丢掉），两种类型不比为凭。
+        let late = ChangeLanding::land(&chan, &denied, None).await.unwrap_err();
+        assert!(
+            matches!(late, SFError::Validation(_)),
+            "提前判与落地判要落在同一个出口上，否则调用方对同一个拒绝会用两种做法：{late:?}"
+        );
+        assert!(
+            late.to_string().contains("crates/cog-github/tests/it.rs"),
+            "落地给的读数必须点同一条路径：{late}"
+        );
+
+        let allowed = change("c2", &diff_touching(&["crates/cog-github/src/lib.rs"]));
+        chan.check_contribution_allowed(&allowed.content)
+            .expect("白名单内的变更必须提前放行");
+    }
+
+    /// 提前判**只**判贡献面：业主自己那两档（`forbidden_paths` 与改动行数上限）留在
+    /// 落地那一侧。上限是业主批准就能豁免的那一档，提前把它算成终局，等于替业主做掉
+    /// 那个判决——一条他本可放行的变更会在沙箱之前消失。
+    #[tokio::test]
+    async fn the_early_verdict_leaves_the_owners_limits_to_the_landing() {
+        let chan = channel(crate::config::LandingPolicy {
+            max_changed_lines: 1,
+            ..Default::default()
+        });
+        let big = change(
+            "c1",
+            &diff_touching(&[
+                "crates/cog-github/src/lib.rs",
+                "crates/cog-github/src/webhook.rs",
+            ]),
+        );
+
+        chan.check_contribution_allowed(&big.content)
+            .expect("行数上限不归提前判管");
+
+        let late = ChangeLanding::land(&chan, &big, None).await.unwrap_err();
+        assert!(
+            matches!(late, SFError::Internal(_)),
+            "上限拒的是可豁免的那一档，出口类型要与终局分开，否则调用方会退休一条业主还能放的变更：{late:?}"
+        );
     }
 
     #[test]

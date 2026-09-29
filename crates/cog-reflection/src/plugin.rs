@@ -1801,17 +1801,24 @@ struct CycleDeps<'a> {
 /// 返回的映射里是记录那份变更本身。落地要落它，而不是落一份从产物重建的副本——
 /// 重建只剩描述与正文，记录里比产物多出来的字段（问题号、评审分）会被覆盖掉。
 /// 队列里已有的变更也放进去：它同样有记录，只是这份记录还没被验过。
+///
+/// 汇合顺带判一次贡献面：判不过的变更**不进这一轮**，而是连同理由交回调用方收口
+/// （收口要引擎与指标，这里没有）。判在这里而不是沙箱里，是因为沙箱的代价是那把
+/// 唯一的构建槽——2026-09-27 一条被白名单拒掉的变更 6 小时里被 apply、测、冷编了
+/// 12 次，每次都占着部署器推进也要的那把槽。判据归通道所有，这里只是问一句，不碰
+/// 网络也不碰工作树，所以问到的答案与落地时给出的那个逐字相同。
 async fn merge_verification_inputs(
     queued: Vec<crate::types::EvolutionResult>,
     landing: Option<&dyn cog_core::ChangeLanding>,
 ) -> (
     Vec<crate::types::EvolutionResult>,
     std::collections::HashMap<String, cog_core::GeneratedChange>,
+    Vec<(String, String)>,
 ) {
     let mut recorded: std::collections::HashMap<String, cog_core::GeneratedChange> =
         std::collections::HashMap::new();
     let Some(landing) = landing else {
-        return (queued, recorded);
+        return (queued, recorded, Vec::new());
     };
     let list = match landing.unverified_changes().await {
         Ok(list) => list,
@@ -1822,7 +1829,7 @@ async fn merge_verification_inputs(
                 error = %e,
                 "Unverified landing records could not be read; verifying the local queue only"
             );
-            return (queued, recorded);
+            return (queued, recorded, Vec::new());
         }
     };
 
@@ -1842,7 +1849,28 @@ async fn merge_verification_inputs(
         }
         recorded.insert(change.change_id.clone(), change);
     }
-    (changes, recorded)
+
+    // 每条变更只按"落地时会读的那份正文"判一次：记录在就是记录那份（落地落的也是
+    // 它），否则队列那份。按 id 去重已经做过，所以同一份变更不会一个载体被拒、另一个
+    // 载体照跑。
+    let mut kept = Vec::with_capacity(changes.len());
+    let mut refused = Vec::new();
+    for change in changes {
+        let diff = recorded
+            .get(&change.artifact_id)
+            .map(|c| c.content.as_str())
+            .unwrap_or(change.content.as_str());
+        match landing.check_contribution_allowed(diff) {
+            Ok(()) => kept.push(change),
+            Err(e) => {
+                // 记录不留给这一轮的落地：这条变更不会落地。真正的收口（两份载体
+                // 一起退休）由调用方做，见 `run_evolution_cycle_in`。
+                recorded.remove(&change.artifact_id);
+                refused.push((change.artifact_id.clone(), e.to_string()));
+            }
+        }
+    }
+    (kept, recorded, refused)
 }
 
 /// 记录一次终局失败，并把变更移出待处理队列。
@@ -2084,7 +2112,38 @@ async fn run_evolution_cycle_in(
     align_engine_baseline(workspaces, workdir).await;
 
     let queued = pipeline.pending_changes(Some(evo_engine)).await?;
-    let (changes, recorded) = merge_verification_inputs(queued, landing.map(|l| l.as_ref())).await;
+    let (changes, recorded, refused) =
+        merge_verification_inputs(queued, landing.map(|l| l.as_ref())).await;
+
+    // 贡献面之外的变更在沙箱跑起来之前就收口：两份载体一起退休，并留下一条读数。
+    // 判据是变更自身与这份部署的规则，重跑同一个变更只会得到同一个结论，所以两条
+    // 路都只走一次——而"被拒"与"从没生成过"在记录里必须分得开，否则同一个缺口会
+    // 一遍遍被重新发现。
+    for (change_id, reason) in refused {
+        warn!(
+            change_id = %change_id,
+            reason = %reason,
+            "Change is outside the contributable surface; refused before the sandbox runs"
+        );
+        let _ = engine
+            .record_change_outcome(
+                &change_id,
+                false,
+                &format!("Refused by the contribution rules: {reason}"),
+            )
+            .await;
+        if let Some(m) = evolution_metrics {
+            m.record_event(true).await;
+            m.record_change_failed().await;
+        }
+        retire_change_everywhere(
+            pipeline,
+            landing.map(|l| l.as_ref()),
+            &change_id,
+            &format!("the contribution rules refuse the change itself: {reason}"),
+        )
+        .await;
+    }
 
     if changes.is_empty() {
         return Ok(());
@@ -2428,6 +2487,9 @@ mod tests {
     struct FakeLanding {
         unverified: Vec<cog_core::GeneratedChange>,
         readable: bool,
+        /// 通道对"这条变更能不能被贡献"的回答。汇合这一步会问它，所以这个替身不能
+        /// 像别的方法那样炸掉：判在沙箱之前正是这一轮要钉住的行为。
+        contributable: bool,
     }
 
     #[async_trait::async_trait]
@@ -2452,6 +2514,16 @@ mod tests {
                 return Err(cog_core::SFError::IO("landing dir unreadable".into()));
             }
             Ok(self.unverified.clone())
+        }
+
+        fn check_contribution_allowed(&self, _diff: &str) -> cog_core::SFResult<()> {
+            if self.contributable {
+                Ok(())
+            } else {
+                Err(cog_core::SFError::Validation(
+                    "change touches non-contributable paths: crates/x/tests/y.rs".into(),
+                ))
+            }
         }
 
         async fn retire_unverified(&self, _id: &str, _reason: &str) -> cog_core::SFResult<()> {
@@ -2493,9 +2565,11 @@ mod tests {
         let landing = FakeLanding {
             unverified: vec![generated("github-issue-4-abc", "Fix issue 4")],
             readable: true,
+            contributable: true,
         };
 
-        let (changes, recorded) = merge_verification_inputs(Vec::new(), Some(&landing)).await;
+        let (changes, recorded, refused) =
+            merge_verification_inputs(Vec::new(), Some(&landing)).await;
 
         assert_eq!(changes.len(), 1, "记录必须成为本轮要验证的变更");
         assert_eq!(changes[0].artifact_id, "github-issue-4-abc");
@@ -2511,6 +2585,10 @@ mod tests {
             Some(4),
             "落地要落记录那份：从产物重建的副本会把这个字段抹成默认值"
         );
+        assert!(
+            refused.is_empty(),
+            "贡献面之内的变更一个都不许被提前拒掉：拒是终局，误拒等于把能落的活扔掉"
+        );
     }
 
     /// 两条通道用同一个 id 指同一份变更：生成它的进程写本地队列，提交时又留下
@@ -2520,9 +2598,10 @@ mod tests {
         let landing = FakeLanding {
             unverified: vec![generated("chg-1", "goal from the record")],
             readable: true,
+            contributable: true,
         };
 
-        let (changes, recorded) =
+        let (changes, recorded, refused) =
             merge_verification_inputs(vec![queued("chg-1", "goal from the queue")], Some(&landing))
                 .await;
 
@@ -2535,6 +2614,48 @@ mod tests {
             recorded.contains_key("chg-1"),
             "变更就算来自队列，它的记录也要留给落地用"
         );
+        assert!(
+            refused.is_empty(),
+            "两份载体都指同一份变更时也没有可拒的东西"
+        );
+    }
+
+    /// 贡献面之外的变更**不进这一轮**——判在沙箱之前，因为沙箱的代价是那把唯一的
+    /// 构建槽：2026-09-27 一条被白名单拒掉的变更 6 小时里被冷编了 12 次，每次都占着
+    /// 部署器推进也要的那把槽。判据只有通道手里那一份，这里只是问一句。
+    ///
+    /// 三句都要：这条变更确实在供货（否则"没进这一轮"可能只是探针没伸到）；它没进
+    /// 要验证的集合；它被交回调用方收口——静默丢掉与"从没生成过"在记录里长得一样。
+    #[tokio::test]
+    async fn a_change_outside_the_contributable_surface_never_enters_the_round() {
+        let landing = FakeLanding {
+            unverified: vec![generated("chg-1", "goal from the record")],
+            readable: true,
+            contributable: false,
+        };
+
+        assert_eq!(
+            cog_core::ChangeLanding::unverified_changes(&landing)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "记录必须在供货，否则下面的空集什么都证明不了"
+        );
+
+        let (changes, recorded, refused) =
+            merge_verification_inputs(vec![queued("chg-1", "goal from the queue")], Some(&landing))
+                .await;
+
+        assert_eq!(changes.len(), 0, "贡献不出去的变更不许进这一轮");
+        assert!(recorded.is_empty(), "它的记录也不留给落地");
+        assert_eq!(refused.len(), 1, "被拒的要交回调用方收口，不能静默丢掉");
+        assert_eq!(refused[0].0, "chg-1");
+        assert!(
+            refused[0].1.contains("non-contributable"),
+            "理由要带通道给出的原因：{}",
+            refused[0].1
+        );
     }
 
     /// 读不到记录不是"没有记录"：读失败时本轮只验本地队列，但不能连本地队列也
@@ -2544,25 +2665,34 @@ mod tests {
         let landing = FakeLanding {
             unverified: Vec::new(),
             readable: false,
+            contributable: true,
         };
 
-        let (changes, recorded) =
+        let (changes, recorded, refused) =
             merge_verification_inputs(vec![queued("chg-1", "goal")], Some(&landing)).await;
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].artifact_id, "chg-1");
         assert!(recorded.is_empty());
+        assert!(
+            refused.is_empty(),
+            "记录读不到只是少一份输入，本地队列那份照样进这一轮，不许变成一次终局拒绝"
+        );
     }
 
     /// 未连平台账号时没有落地通道，行为要与从前一致：只验本地队列。
     #[tokio::test]
     async fn without_a_landing_channel_the_local_queue_is_unchanged() {
-        let (changes, recorded) =
+        let (changes, recorded, refused) =
             merge_verification_inputs(vec![queued("chg-1", "goal")], None).await;
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].artifact_id, "chg-1");
         assert!(recorded.is_empty());
+        assert!(
+            refused.is_empty(),
+            "没有落地通道就没有贡献面可判，本地队列不许被这条判据挡下"
+        );
     }
 
     /// A change that lands leaves the pending queue.
@@ -2632,6 +2762,13 @@ mod tests {
 
         async fn unverified_changes(&self) -> cog_core::SFResult<Vec<cog_core::GeneratedChange>> {
             Ok(self.unverified.lock().unwrap().clone())
+        }
+
+        /// 这些测试钉的是"一条变更要从两份载体里一起退休"，不是贡献面的判定本身
+        /// （那一条在 `FakeLanding` 侧有自己的用例），所以这里一律放行——放行也
+        /// 是让下面那些断言仍然只测它要测的那件事。
+        fn check_contribution_allowed(&self, _diff: &str) -> cog_core::SFResult<()> {
+            Ok(())
         }
 
         /// 与真实通道同语义，不只是记一笔：收口就是把记录**移出未验证集**，而
@@ -2712,12 +2849,16 @@ mod tests {
             )],
             "记录那份要一起收口，并带上关掉它的原因"
         );
-        let (again, _) = merge_verification_inputs(
+        let (again, _, refused) = merge_verification_inputs(
             pipeline.pending_changes(None).await.unwrap(),
             Some(&landing),
         )
         .await;
         assert!(again.is_empty(), "下一轮不该在两份载体里再找到它");
+        assert!(
+            refused.is_empty(),
+            "已经退休的变更不属于本轮被拒的那一类：它压根没进供货，再拒一次等于给它记第二笔"
+        );
     }
 
     /// 只收口一边不算退休。这条是"成对"那一半的证伪件：队列清干净了，记录
@@ -2735,12 +2876,16 @@ mod tests {
             "队列那一半已经关了"
         );
 
-        let (again, _) = merge_verification_inputs(
+        let (again, _, refused) = merge_verification_inputs(
             pipeline.pending_changes(None).await.unwrap(),
             Some(&landing),
         )
         .await;
         assert_eq!(again.len(), 1, "记录还在供货，所以这条变更根本没有被退休");
+        assert!(
+            refused.is_empty(),
+            "它回到这一轮的方式不能是提前拒掉：那等于把这条测试要证的缺陷换成另一种形态"
+        );
     }
 
     #[tokio::test]
