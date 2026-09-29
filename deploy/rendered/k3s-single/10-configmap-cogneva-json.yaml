@@ -652,6 +652,24 @@ data:
               "summary": "Volume holds {value}x its declared size: the workload writes past the PVC's requests.storage, and nothing enforces that request, so the declared size is not a ceiling. For a directory-backed volume the excess lands on the node filesystem and the per-volume capacity the kubelet reports is the node's, not this volume's. Either the declaration is wrong for what this deployment writes, or the growth belongs somewhere else"
             },
             {
+              "name": "governance_ceiling_not_enforced",
+              "promql": "(min_over_time(cogneva_governance_drift_fields[30m]) > 0) and (count_over_time(cogneva_governance_drift_fields[1h]) > count_over_time(cogneva_governance_drift_fields[30m]))",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "On {object}, {value} field(s) of a declared resource ceiling has differed from what the cluster enforces at every scrape for 30m: the repository and the cluster disagree about the ceiling, and the cluster is the one admitting pods. A resource ceiling belongs to the operator and only moves when the install face applies it, so a ceiling raised in the repository stays unenforced until then and pods are refused by the old one -- which reads as an admission error rather than as a stale declaration. Either apply the declaration to the cluster, or lower it back to what is enforced"
+            },
+            {
+              "name": "governance_comparison_unreadable",
+              "promql": "increase(cogneva_governance_check_failures_total[6h]) > 6",
+              "condition": {
+                "greater_than": 6.0
+              },
+              "severity": "warning",
+              "summary": "The comparison between the declared resource ceilings and the enforced ones has failed {value} time(s) in the last 6h: the drift reading is stale, so a ceiling the two sides agree on and a ceiling nobody could look at are indistinguishable right now. Six failures is about an hour of consecutive rounds at the deployer's own poll interval, which is past anything a single unreadable moment explains"
+            },
+            {
               "name": "orphans_unreaped",
               "promql": "(min_over_time(cogneva_process_zombies[30m]) > 0) and (count_over_time(cogneva_process_zombies[1h]) > count_over_time(cogneva_process_zombies[30m]))",
               "condition": {

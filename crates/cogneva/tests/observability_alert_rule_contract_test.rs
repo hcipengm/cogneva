@@ -395,6 +395,23 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_registry_prune_failures_total",
         "crates/cog-reflection/src/mainline_deployer.rs",
     ),
+    // The governance face. A resource ceiling belongs to the operator and only
+    // moves when the install face applies it, so a ceiling raised in the
+    // repository stays unenforced until then -- and until it does, "the change
+    // landed" and "the change is in effect" look the same from every reading
+    // that already exists. The drift count is per object, because that is the
+    // unit a ceiling is declared and enforced in. The failure count is the
+    // comparison's own outcome, published from the first scrape: a process that
+    // can never read the cluster publishes the same nothing as one with no
+    // ceiling to compare, and only one of those is worth believing.
+    (
+        "cogneva_governance_drift_fields",
+        "crates/cog-reflection/src/governance_drift.rs",
+    ),
+    (
+        "cogneva_governance_check_failures_total",
+        "crates/cog-reflection/src/governance_drift.rs",
+    ),
 ];
 
 /// Series the rules read that this workspace does not publish, with the owner.

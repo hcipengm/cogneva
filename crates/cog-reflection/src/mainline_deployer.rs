@@ -1746,6 +1746,20 @@ pub struct MainlineDeployer {
     /// runs and only logs: its existence does not depend on anyone subscribing to
     /// its readings.
     metrics: Option<std::sync::Arc<dyn cog_core::MetricsBackend>>,
+    /// The governance declarations read at the last bundle assembly, kept to
+    /// compare against what the cluster is enforcing.
+    ///
+    /// The declared side is cached and the cluster side is re-read every cycle:
+    /// the declarations live in several files of the published set, so reading
+    /// them costs a walk through git at a revision, and they are only in hand at
+    /// the moment a bundle is assembled; what changes is the cluster side --
+    /// when an install-time apply clears a drift the reading has to come back to
+    /// zero with it, because an alert that fires once and can never be cleared
+    /// is worse than no reading at all.
+    declared_governance: std::sync::Mutex<Vec<crate::governance_drift::GovernanceDeclaration>>,
+    /// Where these readings land. Without it the comparison still runs and only
+    /// the log records it.
+    governance_drift: Option<std::sync::Arc<crate::governance_drift::GovernanceDrift>>,
 }
 
 /// git 的 tree-ish 形式：`<rev>:<path>`，路径**不带前导斜杠**。
@@ -1769,12 +1783,23 @@ impl MainlineDeployer {
             workspaces,
             upstream_note: std::sync::Mutex::new("pending".to_string()),
             metrics: None,
+            declared_governance: std::sync::Mutex::new(Vec::new()),
+            governance_drift: None,
         }
     }
 
     /// Report the version contract's own readings.
     pub fn with_metrics(mut self, metrics: std::sync::Arc<dyn cog_core::MetricsBackend>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Report how far the declared ceilings sit from the enforced ones.
+    pub fn with_governance_drift(
+        mut self,
+        drift: std::sync::Arc<crate::governance_drift::GovernanceDrift>,
+    ) -> Self {
+        self.governance_drift = Some(drift);
         self
     }
 
@@ -4296,6 +4321,65 @@ impl MainlineDeployer {
         ))
     }
 
+    /// Compare the resource ceilings the repository declares against the ones the
+    /// cluster is enforcing, and record the drifted field count per object into
+    /// the reading.
+    ///
+    /// It runs every cycle, whether or not there is a new revision: what it is
+    /// there to find is "the install face has not applied this yet", and that
+    /// disappears precisely because the install face applied it. Reading once, at
+    /// the moment a new revision rolls, would leave the reading frozen where the
+    /// cause used to be -- an alert that fires once and can never be cleared is
+    /// worse than no reading at all.
+    ///
+    /// An unreadable cluster records one "comparison could not be made" and fails
+    /// nothing: governance objects are not delivered by this path in the first
+    /// place, and one unreadable moment should not hold up a release. "The two
+    /// sides differ" and "nobody looked" are two cells in the reading precisely
+    /// so that the second is not read as the first here.
+    async fn compare_governance(&self) {
+        let Some(drift) = &self.governance_drift else {
+            return;
+        };
+        let declared = self
+            .declared_governance
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if declared.is_empty() {
+            return;
+        }
+        let live = match self
+            .kubectl(&["get", "resourcequota", "-o", "json"], 60)
+            .await
+        {
+            Ok(text) => match crate::governance_drift::live_quotas(&text) {
+                Ok(live) => live,
+                Err(e) => {
+                    warn!(error = %e, "governance drift: the enforced quotas could not be read");
+                    drift.record_check_failure();
+                    return;
+                }
+            },
+            Err(e) => {
+                warn!(error = %e, "governance drift: the enforced quotas could not be read");
+                drift.record_check_failure();
+                return;
+            }
+        };
+        for (object, fields) in crate::governance_drift::drift_by_object(&declared, &live) {
+            if !fields.is_empty() {
+                warn!(
+                    object = %object,
+                    fields = %fields.join(","),
+                    "the repository declares a ceiling the cluster is not enforcing; it takes \
+                     effect when the install face applies it, not from a rollout"
+                );
+            }
+            drift.record(&object, fields.len());
+        }
+    }
+
     /// 读 rev 处的发布清单并组装清单包。image 必须是节点 pull 端点引用
     /// （kubelet 经 NodePort 拉取），与 set image 路径同一约束。
     ///
@@ -4342,6 +4426,16 @@ impl MainlineDeployer {
             )));
         }
         let bundle = build_rollout_bundle(&set, &self.cfg.targets, image)?;
+        // The declared side changes hands here: the ceilings this revision
+        // declares are the ones every following cycle compares against the
+        // cluster. The empty case is written too -- when a new revision stops
+        // declaring governance ceilings, the old set has to go with it, or the
+        // reading would keep comparing against a declaration that no longer
+        // exists.
+        *self
+            .declared_governance
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = bundle.governance.clone();
         info!(
             rev = %rev12(rev),
             dir = %dir,
@@ -4788,6 +4882,12 @@ pub async fn run_mainline_loop(
                         biased;
                         _ = shutdown.wait() => break,
                         _ = ticker.tick() => {
+                            // Ahead of the rollout: this cycle may spend a quarter
+                            // of an hour building, and the governance reading
+                            // answers how much the cluster enforces right now,
+                            // which has nothing to do with whether this cycle
+                            // carries a new revision.
+                            deployer.compare_governance().await;
                             if let Err(e) = deployer.poll_once().await {
                                 warn!(error = %e, "mainline deployer poll failed");
                             }
@@ -4818,6 +4918,17 @@ pub async fn run_mainline_loop(
 pub struct RolloutBundle {
     pub support_yaml: String,
     pub targets: Vec<TargetManifest>,
+    /// The resource governance ceilings this revision declares in the published
+    /// set. The loop does not deliver them (`GOVERNANCE_KINDS` carries that
+    /// reasoning: a ceiling is tuned by the operator, and replaying a pinned
+    /// default every revision would overwrite it), but they are read out and
+    /// carried along when a bundle is assembled: the rollout side uses them to
+    /// compare against what the cluster actually enforces. Without that, "the
+    /// repository raised the ceiling" and "the cluster already admits against
+    /// the new one" look the same from both readings, until it surfaces as pods
+    /// refused by a stale quota -- and that reads as an admission error, not as
+    /// an expired ceiling.
+    pub governance: Vec<crate::governance_drift::GovernanceDeclaration>,
 }
 
 #[derive(Debug)]
@@ -5499,9 +5610,17 @@ pub fn build_rollout_bundle(
     let repo = image_repository(image);
     let mut patched: BTreeMap<String, String> = BTreeMap::new();
     let mut support_docs: Vec<serde_yaml::Value> = Vec::new();
+    // Governance declarations are collected independently of where a document is
+    // delivered: they do not go into the bundle in the first place
+    // (`namespace_docs` skips them), so this reads the other face of the same
+    // text and has nothing to do with what either branch above does.
+    let mut governance: Vec<crate::governance_drift::GovernanceDeclaration> = Vec::new();
     for res in &set.resources {
         let content = set.content(res)?;
         reject_dialect_dependent_scalars(content, res)?;
+        governance.extend(crate::governance_drift::governance_declarations(
+            content, res,
+        )?);
         match claims.iter().find(|(_, r)| r == res) {
             Some((t, _)) => {
                 let yaml =
@@ -5560,6 +5679,7 @@ pub fn build_rollout_bundle(
     Ok(RolloutBundle {
         support_yaml,
         targets: target_manifests,
+        governance,
     })
 }
 

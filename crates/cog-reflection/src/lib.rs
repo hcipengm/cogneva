@@ -52,6 +52,7 @@ pub mod firecracker;
 pub mod flywheel;
 pub mod gitops_publisher;
 pub mod gitops_puller;
+pub mod governance_drift;
 pub mod image_rollout;
 pub mod mainline_deployer;
 pub mod matcher;

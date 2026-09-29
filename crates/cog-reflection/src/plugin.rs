@@ -1188,7 +1188,16 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 return Ok(());
             };
             let deployer = {
-                let deployer = crate::MainlineDeployer::new(ml_config.clone(), workspaces);
+                // The distance between the declared ceilings and what the cluster
+                // enforces. Attached to this loop rather than started on its own:
+                // the declarations are only in hand at the moment a bundle is
+                // assembled, and assembling one is this loop's own action, so the
+                // process reading them shares its life.
+                let governance_drift =
+                    std::sync::Arc::new(crate::governance_drift::GovernanceDrift::new());
+                ctx.publish_observable(governance_drift.clone());
+                let deployer = crate::MainlineDeployer::new(ml_config.clone(), workspaces)
+                    .with_governance_drift(governance_drift);
                 // The version contract's readings are recorded apart from the
                 // other judgements: they answer "which name is running, and how
                 // far that name sits past a release", which is not the question
