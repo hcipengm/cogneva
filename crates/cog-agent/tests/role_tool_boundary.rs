@@ -20,9 +20,38 @@ use cog_agent::ToolRegistry;
 use cog_core::SkillRegistry;
 use std::sync::Arc;
 
-/// Tools that change the workspace. A role that only plans must hold none of
-/// them; which other tools it holds is its own business.
-const WORKSPACE_CHANGING: [&str; 3] = ["write_file", "run_command", "http_request"];
+/// Whether calling `tool` can change the workspace, answered by what the tool
+/// is rather than by a list of names.
+///
+/// The shell operations are the only tools that reach the executor's
+/// filesystem, and which of them writes is an enum: `Command` runs what the
+/// caller wrote and `WriteFile` writes the file it is given, while `ReadFile`
+/// only reads. That covers the case a name list cannot -- a tool added later
+/// whose mutation nobody declared is not in the list, and a boundary that reads
+/// "not in the list" as "safe" hands it to the planner without a word.
+///
+/// `None` is that uncovered case and not a soft `false`: a native handler runs
+/// in the process that holds the registry, so it cannot reach the checkout at
+/// all, and nothing in the handler says whether it reaches somewhere else
+/// instead. That is a decision, so it is declared by name in
+/// [`NATIVE_EFFECTS`] -- and an undeclared tool is an error the caller has to
+/// resolve rather than a tool the boundary lets through.
+fn changes_the_workspace(tool: &cog_core::Tool) -> Option<bool> {
+    use cog_core::{ShellOp, ToolImplementation};
+    match &tool.implementation {
+        ToolImplementation::Shell(ShellOp::Command | ShellOp::WriteFile) => Some(true),
+        ToolImplementation::Shell(ShellOp::ReadFile) => Some(false),
+        ToolImplementation::Native(_) | ToolImplementation::Wasm { .. } => NATIVE_EFFECTS
+            .iter()
+            .find(|(name, _)| *name == tool.name)
+            .map(|(_, changes)| *changes),
+    }
+}
+
+/// The non-shell tools and what their effects are: `(name, changes the
+/// workspace)`. One entry per tool that reaches outside the checkout -- an HTTP
+/// request mutates whatever it is pointed at, and only the name says so.
+const NATIVE_EFFECTS: [(&str, bool); 1] = [("http_request", true)];
 
 #[derive(Debug)]
 struct UnreachableClient;
@@ -189,13 +218,47 @@ fn a_planning_role_holds_nothing_that_changes_the_workspace() {
             held.contains(&"read_file".to_string()),
             "a planner that cannot read cannot plan; it holds {held:?}"
         );
-        for changing in WORKSPACE_CHANGING {
-            assert!(
-                !held.contains(&changing.to_string()),
-                "the planning role holds '{changing}'; its boundary is to plan, \
-                 not to change the checkout. It holds {held:?}"
-            );
+        for tool in narrowed.list() {
+            match changes_the_workspace(&tool) {
+                Some(false) => {}
+                Some(true) => panic!(
+                    "the planning role holds '{}'; its boundary is to plan, not to \
+                     change the checkout. It holds {held:?}",
+                    tool.name
+                ),
+                None => panic!(
+                    "'{}' is not a shell operation and nobody declared what it does; \
+                     declare it in NATIVE_EFFECTS rather than leaving the planner's \
+                     boundary to read an unknown tool as a harmless one",
+                    tool.name
+                ),
+            }
         }
+    }
+}
+
+/// Every branch of the classification, including the one that has to fail.
+///
+/// Without this the undeclared case is only reachable through a skill file
+/// change, so it would sit unread until the day it mattered.
+#[test]
+fn the_workspace_question_is_answered_by_the_tool_and_not_by_its_name() {
+    let http = builtins::http_request(Arc::new(UnreachableClient));
+    for (tool, expected) in [
+        (builtins::read_file(), Some(false)),
+        (builtins::write_file(), Some(true)),
+        (builtins::run_command(), Some(true)),
+        (http, Some(true)),
+        // Native, and nothing has said whether it changes anything: the one
+        // reading the caller must not fold into "safe".
+        (builtins::search_code(), None),
+    ] {
+        assert_eq!(
+            changes_the_workspace(&tool),
+            expected,
+            "{}: classification",
+            tool.name
+        );
     }
 }
 
