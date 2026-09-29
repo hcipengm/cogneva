@@ -265,12 +265,22 @@ impl GovernanceDrift {
         Self::default()
     }
 
-    /// Record the drifted field count compared for one object (zero included).
-    pub fn record(&self, object: &str, drifted: usize) {
-        self.entries
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(object.to_string(), drifted);
+    /// Record the whole comparison: one entry per declared object, zero counts
+    /// included, and nothing else.
+    ///
+    /// Replacing the table rather than inserting into it is what keeps the
+    /// reading clearable in both directions. A revision can stop declaring an
+    /// object or rename it, and an entry left behind by the previous comparison
+    /// would keep publishing the last count it saw -- a series sitting at a
+    /// non-zero value with nothing left in the repository that could ever clear
+    /// it, which is the same "fires once and can never be cleared" the
+    /// comparison is arranged to avoid on the cluster side.
+    ///
+    /// A comparison that could not be made does not come through here at all: it
+    /// records a failure instead and leaves the last table standing, because
+    /// nobody looked is not a reading that the two sides agree.
+    pub fn record_comparison(&self, drifted: &BTreeMap<String, usize>) {
+        *self.entries.lock().unwrap_or_else(|e| e.into_inner()) = drifted.clone();
     }
 
     /// Record one comparison that could not be made: the cluster was
@@ -437,7 +447,10 @@ mod tests {
         assert_eq!(metrics[0].name, GOVERNANCE_CHECK_FAILURES_METRIC);
         assert!(!metrics.iter().any(|m| m.name == GOVERNANCE_DRIFT_METRIC));
 
-        drift.record("resourcequota/cogneva-quota", 0);
+        drift.record_comparison(&BTreeMap::from([(
+            "resourcequota/cogneva-quota".to_string(),
+            0,
+        )]));
         drift.record_check_failure();
         let metrics = drift.collect_metrics("default").await.unwrap();
         let found = metrics
@@ -460,6 +473,32 @@ mod tests {
         {"kind":"ResourceQuota","metadata":{"name":"cogneva-quota"},
          "spec":{"hard":{"limits.cpu":"17","limits.memory":"34Gi","pods":"40"}}}
     ]}"#;
+
+    /// A revision that stops declaring an object (or renames it) has to take the
+    /// old series with it: an entry left behind reports a drift nothing in the
+    /// repository could ever clear.
+    #[tokio::test]
+    async fn an_object_that_stops_being_declared_stops_being_published() {
+        let drift = GovernanceDrift::new();
+        drift.record_comparison(&BTreeMap::from([
+            ("resourcequota/cogneva-quota".to_string(), 2),
+            ("resourcequota/cogneva-quota-old".to_string(), 1),
+        ]));
+        assert_eq!(drift.objects().len(), 2);
+
+        // The next revision declares only the renamed object, and now matches.
+        drift.record_comparison(&BTreeMap::from([(
+            "resourcequota/cogneva-quota-v2".to_string(),
+            0,
+        )]));
+
+        assert_eq!(
+            drift.objects(),
+            vec!["resourcequota/cogneva-quota-v2"],
+            "an object the revision no longer declares is still being published"
+        );
+        assert_eq!(drift.drift_fields("resourcequota/cogneva-quota-old"), None);
+    }
 
     #[test]
     fn the_enforced_side_is_keyed_the_way_the_declared_side_is() {

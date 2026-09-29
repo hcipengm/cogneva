@@ -1771,17 +1771,25 @@ pub struct MainlineDeployer {
     /// runs and only logs: its existence does not depend on anyone subscribing to
     /// its readings.
     metrics: Option<std::sync::Arc<dyn cog_core::MetricsBackend>>,
-    /// The governance declarations read at the last bundle assembly, kept to
-    /// compare against what the cluster is enforcing.
+    /// The governance declarations read at the tracked revision, kept to compare
+    /// against what the cluster is enforcing.
     ///
-    /// The declared side is cached and the cluster side is re-read every cycle:
-    /// the declarations live in several files of the published set, so reading
-    /// them costs a walk through git at a revision, and they are only in hand at
-    /// the moment a bundle is assembled; what changes is the cluster side --
-    /// when an install-time apply clears a drift the reading has to come back to
-    /// zero with it, because an alert that fires once and can never be cleared
-    /// is worse than no reading at all.
-    declared_governance: std::sync::Mutex<Vec<crate::governance_drift::GovernanceDeclaration>>,
+    /// The declared side is cached and the cluster side is re-read every cycle.
+    /// The declarations live in several files of the published set, so reading
+    /// them costs a walk through git at a revision; what changes cycle to cycle
+    /// is the cluster side -- when an install-time apply clears a drift the
+    /// reading has to come back to zero with it, because an alert that fires
+    /// once and can never be cleared is worse than no reading at all.
+    ///
+    /// The key is the revision, not the process: a declaration left over from an
+    /// earlier revision is the same failure as no reading -- the repository
+    /// lowers a ceiling, the install face applies it, and the reading keeps
+    /// comparing against the old number, so the drift can never come back down.
+    /// `None` is a third cell again: nothing has been read yet, because the
+    /// process started with main already deployed and assembles no bundle until
+    /// main moves.
+    declared_governance:
+        std::sync::Mutex<Option<(String, Vec<crate::governance_drift::GovernanceDeclaration>)>>,
     /// Where these readings land. Without it the comparison still runs and only
     /// the log records it.
     governance_drift: Option<std::sync::Arc<crate::governance_drift::GovernanceDrift>>,
@@ -1808,7 +1816,7 @@ impl MainlineDeployer {
             workspaces,
             upstream_note: std::sync::Mutex::new("pending".to_string()),
             metrics: None,
-            declared_governance: std::sync::Mutex::new(Vec::new()),
+            declared_governance: std::sync::Mutex::new(None),
             governance_drift: None,
         }
     }
@@ -4364,16 +4372,30 @@ impl MainlineDeployer {
     /// place, and one unreadable moment should not hold up a release. "The two
     /// sides differ" and "nobody looked" are two cells in the reading precisely
     /// so that the second is not read as the first here.
+    ///
+    /// The declared side comes from [`Self::declared_governance_now`]: the last
+    /// bundle assembly if there was one, and otherwise the release set at the
+    /// revision being tracked -- an unreadable declaration records a failure to
+    /// compare for the same reason an unreadable cluster does, and is retried on
+    /// the next cycle.
     async fn compare_governance(&self) {
         let Some(drift) = &self.governance_drift else {
             return;
         };
-        let declared = self
-            .declared_governance
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let declared = match self.declared_governance_now().await {
+            Ok(declared) => declared,
+            Err(e) => {
+                warn!(error = %e, "governance drift: the declared ceilings could not be read");
+                drift.record_check_failure();
+                return;
+            }
+        };
         if declared.is_empty() {
+            // Nothing declared means nothing to compare, and the table from an
+            // earlier revision goes with the declaration: without this the last
+            // ceiling the repository used to declare would stay on the scrape
+            // face with nothing able to bring it down.
+            drift.record_comparison(&BTreeMap::new());
             return;
         }
         let live = match self
@@ -4394,6 +4416,9 @@ impl MainlineDeployer {
                 return;
             }
         };
+        // The whole table is written at once, so an object this revision no
+        // longer declares leaves the reading with it.
+        let mut compared = BTreeMap::new();
         for (object, fields) in crate::governance_drift::drift_by_object(&declared, &live) {
             if !fields.is_empty() {
                 warn!(
@@ -4403,19 +4428,123 @@ impl MainlineDeployer {
                      effect when the install face applies it, not from a rollout"
                 );
             }
-            drift.record(&object, fields.len());
+            compared.insert(object, fields.len());
         }
+        drift.record_comparison(&compared);
+    }
+
+    /// The declared ceilings to compare against: the ones cached for the tracked
+    /// revision, and otherwise read from that revision's release set.
+    ///
+    /// A bundle assembly is what normally fills this in, but a process that
+    /// starts with main already deployed assembles none until main moves -- so
+    /// relying on that path alone leaves the per-object reading dark for as long
+    /// as the cluster is the only side changing, and "the install face has not
+    /// applied the new ceiling yet" is exactly a state where nothing moves. The
+    /// read therefore goes through the same two steps as the bundle path
+    /// ([`Self::release_set_at`] plus the dialect check), because a declaration
+    /// read by a second path is a second spelling of the same fact.
+    ///
+    /// The revision is re-read every cycle (one `rev-parse`) so a new revision
+    /// is picked up even when nothing assembles it; the release set itself is
+    /// only walked when the revision actually changed. A failed read is left
+    /// uncached and handed back as an error: the next cycle retries it, and
+    /// "nobody has read the declaration yet" stays a different cell from "this
+    /// revision declares nothing".
+    async fn declared_governance_now(
+        &self,
+    ) -> SFResult<Vec<crate::governance_drift::GovernanceDeclaration>> {
+        let rev = self.bare_main_rev().await?;
+        {
+            let guard = self
+                .declared_governance
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some((cached_rev, declared)) = guard.as_ref() {
+                if *cached_rev == rev {
+                    return Ok(declared.clone());
+                }
+            }
+        }
+        let declared = self.declared_governance_at(&rev).await?;
+        info!(
+            rev = %rev12(&rev),
+            objects = declared.len(),
+            "governance drift: the declared ceilings were read from the release set at the \
+             tracked revision because no bundle was assembled at it"
+        );
+        *self
+            .declared_governance
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some((rev, declared.clone()));
+        Ok(declared)
+    }
+
+    /// The ceilings the release set at `rev` declares.
+    ///
+    /// `manifest_dir` is the same directory the assembly path reads, and it is
+    /// read whether or not this loop delivers manifests: the declaration is a
+    /// property of the repository at that revision, and the install face that
+    /// has to apply it reads the same tree either way.
+    async fn declared_governance_at(
+        &self,
+        rev: &str,
+    ) -> SFResult<Vec<crate::governance_drift::GovernanceDeclaration>> {
+        let set = self.release_set_at(rev).await?;
+        let mut out = Vec::new();
+        for res in &set.resources {
+            let content = set.content(res)?;
+            // The same two steps in the same order as the bundle path: a
+            // declaration whose amount is written in a dialect the assembler
+            // refuses must not become a second opinion here.
+            reject_dialect_dependent_scalars(content, res)?;
+            out.extend(crate::governance_drift::governance_declarations(
+                content, res,
+            )?);
+        }
+        Ok(out)
     }
 
     /// 读 rev 处的发布清单并组装清单包。image 必须是节点 pull 端点引用
     /// （kubelet 经 NodePort 拉取），与 set image 路径同一约束。
+    async fn build_bundle_at(&self, rev: &str, image: &str) -> SFResult<RolloutBundle> {
+        let dir = self.cfg.manifest_dir.trim_end_matches('/');
+        let set = self.release_set_at(rev).await?;
+        let bundle = build_rollout_bundle(&set, &self.cfg.targets, image)?;
+        // The declared side changes hands here: the ceilings this revision
+        // declares are the ones every following cycle compares against the
+        // cluster. The empty case is written too -- when a new revision stops
+        // declaring governance ceilings, the old set has to go with it, or the
+        // reading would keep comparing against a declaration that no longer
+        // exists.
+        *self
+            .declared_governance
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) =
+            Some((rev.to_string(), bundle.governance.clone()));
+        info!(
+            rev = %rev12(rev),
+            dir = %dir,
+            shape = set.shape(),
+            resources = set.len(),
+            support_bytes = bundle.support_yaml.len(),
+            target_manifests = bundle.targets.len(),
+            "manifest bundle assembled"
+        );
+        Ok(bundle)
+    }
+
+    /// rev 处的发布集。
     ///
     /// 目录形态按目录里**有什么**判，不按配置猜：有 `kustomization.yaml` 就是
     /// 发布集目录，否则按平铺的预渲染目录读。两种形态都必须能消费，因为
     /// `manifest_dir` 是配置面，而有的 profile 的权威面就是它自己的预渲染目录
     /// ——`deploy/k3s` 装的是单节点 K3s 的形态，指给标准 K8s 会把 K3s 的宿主
     /// 路径与套接字一并下发。
-    async fn build_bundle_at(&self, rev: &str, image: &str) -> SFResult<RolloutBundle> {
+    ///
+    /// 一处读、两处消费（组包，以及"这个 rev 声明了哪些上限"）：两边读的必须
+    /// 是同一份文本，各读一遍就给了同一份事实两种拼写各自漂移的机会。
+    async fn release_set_at(&self, rev: &str) -> SFResult<ReleaseSet> {
         let dir = self.cfg.manifest_dir.trim_end_matches('/');
         // 列不出来（目录在这个 rev 下不存在、rev 本身不可解）与"目录存在但读不出
         // 发布面"是两件事，读数要说清是哪一件，并把底层那条 git 报错带上。
@@ -4452,27 +4581,7 @@ impl MainlineDeployer {
                 rev12(rev)
             )));
         }
-        let bundle = build_rollout_bundle(&set, &self.cfg.targets, image)?;
-        // The declared side changes hands here: the ceilings this revision
-        // declares are the ones every following cycle compares against the
-        // cluster. The empty case is written too -- when a new revision stops
-        // declaring governance ceilings, the old set has to go with it, or the
-        // reading would keep comparing against a declaration that no longer
-        // exists.
-        *self
-            .declared_governance
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = bundle.governance.clone();
-        info!(
-            rev = %rev12(rev),
-            dir = %dir,
-            shape = set.shape(),
-            resources = set.len(),
-            support_bytes = bundle.support_yaml.len(),
-            target_manifests = bundle.targets.len(),
-            "manifest bundle assembled"
-        );
-        Ok(bundle)
+        Ok(set)
     }
 
     /// 清单包发布成 per-rev ConfigMap（Job 挂载消费）。先按 label 清理
@@ -18600,5 +18709,168 @@ exit 0
                 "{metric} 在没有读数的一轮里被写了个值"
             );
         }
+    }
+
+    /// fake kubectl：resourcequota 查询回给定的 items 数组文本，其余成功。
+    fn fake_kubectl_quota(dir: &Path, items: &str) -> String {
+        let log = dir.join("kubectl.log");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  *"get resourcequota"*) printf '%s' '{items}' ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            items = items
+        );
+        write_fake_bin(dir, "fake-kubectl", &script);
+        dir.join("fake-kubectl").to_string_lossy().to_string()
+    }
+
+    /// 集群侧 `get resourcequota -o json` 的回话，只带一个 `limits.cpu` 字段。
+    fn quota_listing(cpu: &str) -> String {
+        format!(
+            r#"{{"apiVersion":"v1","kind":"List","items":[{{"kind":"ResourceQuota",
+            "metadata":{{"name":"cogneva-quota"}},
+            "spec":{{"hard":{{"limits.cpu":"{cpu}"}}}}}}]}}"#
+        )
+    }
+
+    /// 在 `from` 之上提一个新 rev：`deploy/k3s` 发布集里一只名为 `name` 的
+    /// ResourceQuota 声明 `limits.cpu=cpu`，推到 bare 的 main，返回那个 rev。
+    async fn release_set_declaring_a_quota(
+        work: &Path,
+        from: &str,
+        name: &str,
+        cpu: &str,
+    ) -> String {
+        real_git(work, &["reset", "--hard", from]).await;
+        std::fs::create_dir_all(work.join("deploy/k3s")).unwrap();
+        std::fs::write(
+            work.join("deploy/k3s/kustomization.yaml"),
+            "resources:\n  - resource-quota.yaml\n",
+        )
+        .unwrap();
+        std::fs::write(
+            work.join("deploy/k3s/resource-quota.yaml"),
+            format!(
+                "apiVersion: v1\nkind: ResourceQuota\nmetadata:\n  name: {name}\n  \
+                 namespace: cogneva\nspec:\n  hard:\n    limits.cpu: \"{cpu}\"\n"
+            ),
+        )
+        .unwrap();
+        real_git(work, &["add", "deploy"]).await;
+        real_git(work, &["commit", "-m", "quota"]).await;
+        real_git(work, &["push", "origin", "HEAD:main"]).await;
+        real_git_stdout(work, &["rev-parse", "HEAD"]).await
+    }
+
+    /// 进程起来时 main 已经部署过 ⇒ 它没组过包，声明侧必须自己从被跟踪 rev 的
+    /// 发布集里读出来；集群落后一个字段读成 1，安装面在集群上补齐之后读回 0
+    /// （否则这条读数就是「响了永远清不掉」）。
+    #[tokio::test]
+    async fn the_declared_ceilings_are_read_without_a_bundle_assembly() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, work, _rev_a, rev_b) = setup_repos(root).await;
+        let rev = release_set_declaring_a_quota(&work, &rev_b, "cogneva-quota", "18.5").await;
+
+        let kubectl = fake_kubectl_quota(root, &quota_listing("17"));
+        let drift = std::sync::Arc::new(crate::governance_drift::GovernanceDrift::new());
+        let deployer = MainlineDeployer::new(
+            test_config(root, &bare, "buildah", &kubectl),
+            test_workspaces(root, &bare),
+        )
+        .with_governance_drift(drift.clone());
+        assert_eq!(
+            deployer.bare_main_rev().await.unwrap(),
+            rev,
+            "夹具：bare 的 main 停在带发布集的那个 rev 上"
+        );
+
+        deployer.compare_governance().await;
+        assert_eq!(
+            drift.check_failures(),
+            0,
+            "被跟踪 rev 上的声明读不出来，就不该有比对失败的读数"
+        );
+        assert_eq!(
+            drift.drift_fields("resourcequota/cogneva-quota"),
+            Some(1),
+            "仓库声明 18.5、集群执行 17 是一个字段的差"
+        );
+
+        // 安装面 apply 之后（同一只部署器、下一轮）：读数要回到 0。
+        fake_kubectl_quota(root, &quota_listing("18.5"));
+        deployer.compare_governance().await;
+        assert_eq!(drift.drift_fields("resourcequota/cogneva-quota"), Some(0));
+    }
+
+    /// 声明侧读不出来时只记一次「这次比对没做成」，且**不写下任何逐对象读数**：
+    /// 「没人看过」与「两边一致」必须是两格，否则读成一个 0 的安静读数。
+    #[tokio::test]
+    async fn an_unreadable_declaration_is_a_failed_comparison_not_an_agreement() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // 夹具的 bare/main 上没有 deploy/k3s 树（发布集目录在这个 rev 下不存在）。
+        let (bare, _work, _rev_a, _rev_b) = setup_repos(root).await;
+
+        let kubectl = fake_kubectl_quota(root, &quota_listing("17"));
+        let drift = std::sync::Arc::new(crate::governance_drift::GovernanceDrift::new());
+        let deployer = MainlineDeployer::new(
+            test_config(root, &bare, "buildah", &kubectl),
+            test_workspaces(root, &bare),
+        )
+        .with_governance_drift(drift.clone());
+
+        deployer.compare_governance().await;
+        assert_eq!(drift.check_failures(), 1);
+        assert!(
+            drift.objects().is_empty(),
+            "读不到声明侧却写下了逐对象读数：{:?}",
+            drift.objects()
+        );
+    }
+
+    /// main 前进到下一个 rev 而没有任何组包 ⇒ 声明侧要跟着 rev 走：冻在旧快照上
+    /// 的声明会一直拿一个仓库里已经不存在的对象去比，那条读数再没人清得掉。
+    #[tokio::test]
+    async fn the_declared_side_follows_the_tracked_revision() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, work, _rev_a, rev_b) = setup_repos(root).await;
+        let rev_c = release_set_declaring_a_quota(&work, &rev_b, "cogneva-quota", "18.5").await;
+
+        let kubectl = fake_kubectl_quota(root, &quota_listing("17"));
+        let drift = std::sync::Arc::new(crate::governance_drift::GovernanceDrift::new());
+        let deployer = MainlineDeployer::new(
+            test_config(root, &bare, "buildah", &kubectl),
+            test_workspaces(root, &bare),
+        )
+        .with_governance_drift(drift.clone());
+
+        deployer.compare_governance().await;
+        assert_eq!(drift.drift_fields("resourcequota/cogneva-quota"), Some(1));
+
+        // 有人把这只对象改了名，而这个进程从不组包。
+        let rev_d = release_set_declaring_a_quota(&work, &rev_c, "cogneva-quota-v2", "17").await;
+        deployer.compare_governance().await;
+        assert_eq!(
+            deployer.bare_main_rev().await.unwrap(),
+            rev_d,
+            "夹具：main 已经走到改名后的 rev"
+        );
+        assert_eq!(
+            drift.objects(),
+            vec!["resourcequota/cogneva-quota-v2"],
+            "声明侧冻在上一个 rev 上：改名后的对象没被读出来，旧对象还在报"
+        );
+        assert_eq!(drift.check_failures(), 0);
     }
 }
