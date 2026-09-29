@@ -60,6 +60,12 @@ pub struct ReflectionPlugin {
     /// from start() by the process that pushes to it. A deployment with an
     /// external registry, or one that runs no deployer, holds None here.
     registry_footprint: Option<Arc<crate::registry_footprint::RegistryFootprint>>,
+    /// The distance between the ceilings the repository declares and the ones
+    /// the cluster enforces, published in init and recorded from start() by the
+    /// mainline deployer. Holds None wherever that deployer is not started --
+    /// no handle at all is the one state a reader can tell from "nothing to
+    /// compare".
+    governance_drift: Option<Arc<crate::governance_drift::GovernanceDrift>>,
 }
 
 impl ReflectionPlugin {
@@ -74,6 +80,7 @@ impl ReflectionPlugin {
             artifact_evolution: None,
             build_cache: None,
             registry_footprint: None,
+            governance_drift: None,
         }
     }
 }
@@ -138,6 +145,20 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             "workspace allocator configured"
         );
         self.workspaces = Some(workspaces);
+
+        // The governance drift handle is published **here** and not where the
+        // deployer that records into it is built (`start()`): the metrics
+        // endpoint and the store sampler both take their snapshot of the
+        // published observables while the plugins initialise, so a handle
+        // published from `start()` is held by nobody -- the reading would live
+        // in this process and reach no scrape, and the alert rule that reads it
+        // could never fire. The guard mirrors the block in `start()` that
+        // starts the deployer: published exactly when something will record.
+        if ml_config.enabled && self.workspaces.is_some() {
+            let drift = Arc::new(crate::governance_drift::GovernanceDrift::new());
+            ctx.publish_observable(drift.clone());
+            self.governance_drift = Some(drift);
+        }
 
         // 引擎只把 project_root 用于变更路径校验，给它一棵稳定只读的基线
         // 工作树即可；工作树随沙盒生命周期存在，不再是那棵被大家共用的树。
@@ -1192,12 +1213,24 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 // enforces. Attached to this loop rather than started on its own:
                 // the declarations are only in hand at the moment a bundle is
                 // assembled, and assembling one is this loop's own action, so the
-                // process reading them shares its life.
-                let governance_drift =
-                    std::sync::Arc::new(crate::governance_drift::GovernanceDrift::new());
-                ctx.publish_observable(governance_drift.clone());
-                let deployer = crate::MainlineDeployer::new(ml_config.clone(), workspaces)
-                    .with_governance_drift(governance_drift);
+                // process reading them shares its life. The handle itself was
+                // published in init -- see the field's own note for why it cannot
+                // be published from here.
+                let deployer = crate::MainlineDeployer::new(ml_config.clone(), workspaces);
+                let deployer = match self.governance_drift.clone() {
+                    Some(drift) => deployer.with_governance_drift(drift),
+                    // init publishes it under this same guard, so reaching here
+                    // means the two conditions have drifted apart: the deployer
+                    // runs and its reading nobody can see. Say so rather than
+                    // failing the rollout over a metrics handle.
+                    None => {
+                        warn!(
+                            "mainline deployer running with no governance drift handle; the \
+                             ceiling comparison will reach no scrape"
+                        );
+                        deployer
+                    }
+                };
                 // The version contract's readings are recorded apart from the
                 // other judgements: they answer "which name is running, and how
                 // far that name sits past a release", which is not the question
