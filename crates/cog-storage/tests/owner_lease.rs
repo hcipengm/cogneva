@@ -13,10 +13,17 @@
 //!   cargo test -p cog-storage --test owner_lease -- --ignored
 //! ```
 //!
-//! The tests share one database and run in parallel, so they contend over a
-//! role named for these tests rather than over one a deployment holds, and each
-//! clears it before and after. A live test pointed at a database someone else
-//! is using must not touch a term belonging to a running process.
+//! The tests share one database and run in parallel, so each contends over a
+//! role named for itself rather than over one a deployment holds, and each
+//! clears its own before and after. The role has to be per test, not per file:
+//! a single role shared by tests run at the same time makes every one of them a
+//! writer of the others' rows, and the readings here are exactly the ones a
+//! sibling's write can decide -- a role nobody asked for reads as held, a term
+//! that should have run out is renewed, an acquisition time comes from a row
+//! another test wrote. Naming the role per case is what makes each assertion
+//! about this test's own ask. The prefix is not a role any deployment holds: a
+//! live test pointed at a database someone else is using must not touch a term
+//! belonging to a running process.
 
 use std::time::Duration;
 
@@ -25,8 +32,9 @@ use sqlx::{PgPool, Row};
 use cog_core::OwnerLeaseBroker;
 use cog_storage::{PgOwnerLeaseBroker, LEASE_TABLE};
 
-/// The role these tests contend over.
-const ROLE: &str = "probe_owner_lease";
+/// The prefix every role in this file carries, so a leftover row from an
+/// interrupted run is recognisable as one of these tests'.
+const PROBE: &str = "probe_owner_lease";
 
 fn database_url() -> String {
     std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
@@ -50,9 +58,9 @@ async fn broker(pool: &PgPool, holder: &str) -> PgOwnerLeaseBroker {
 
 /// Clear the role, so a term left by an interrupted earlier run cannot decide
 /// this one.
-async fn clear_role(pool: &PgPool) {
+async fn clear_role(pool: &PgPool, role: &str) {
     sqlx::query(&format!("DELETE FROM {LEASE_TABLE} WHERE role = $1"))
-        .bind(ROLE)
+        .bind(role)
         .execute(pool)
         .await
         .unwrap();
@@ -67,11 +75,11 @@ struct WrittenTerm {
     expires_at: sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>,
 }
 
-async fn written(pool: &PgPool) -> Option<WrittenTerm> {
+async fn written(pool: &PgPool, role: &str) -> Option<WrittenTerm> {
     sqlx::query(&format!(
         "SELECT holder, acquired_at, expires_at FROM {LEASE_TABLE} WHERE role = $1"
     ))
-    .bind(ROLE)
+    .bind(role)
     .fetch_optional(pool)
     .await
     .unwrap()
@@ -84,24 +92,24 @@ async fn written(pool: &PgPool) -> Option<WrittenTerm> {
 
 /// The holder `holders()` reports for the role, which is the reading an
 /// operator takes rather than the one this process believes.
-async fn reported_holder(broker: &PgOwnerLeaseBroker) -> Option<String> {
+async fn reported_holder(broker: &PgOwnerLeaseBroker, role: &str) -> Option<String> {
     broker
         .holders()
         .await
         .unwrap()
         .into_iter()
-        .find(|(role, _)| role == ROLE)
+        .find(|(name, _)| name == role)
         .map(|(_, holder)| holder)
 }
 
 /// End the term written for the role, which is the state the row is in once its
 /// holder has stopped renewing it. Used where a test wants that state without
 /// waiting out a real term.
-async fn expire_role(pool: &PgPool) {
+async fn expire_role(pool: &PgPool, role: &str) {
     sqlx::query(&format!(
         "UPDATE {LEASE_TABLE} SET expires_at = now() - interval '1 second' WHERE role = $1"
     ))
-    .bind(ROLE)
+    .bind(role)
     .execute(pool)
     .await
     .unwrap();
@@ -116,14 +124,15 @@ async fn expire_role(pool: &PgPool) {
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn two_simultaneous_asks_leave_exactly_one_holder() {
+    let role = format!("{PROBE}_simultaneous");
     let pool = connect().await;
     let a = broker(&pool, "probe-a").await;
     let b = broker(&pool, "probe-b").await;
-    clear_role(&pool).await;
+    clear_role(&pool, &role).await;
 
     let ttl = Duration::from_secs(60);
-    let lease_a = a.lease(ROLE, ttl);
-    let lease_b = b.lease(ROLE, ttl);
+    let lease_a = a.lease(&role, ttl);
+    let lease_b = b.lease(&role, ttl);
     let (held_a, held_b) = tokio::join!(lease_a.try_hold(), lease_b.try_hold());
     let (held_a, held_b) = (held_a.unwrap(), held_b.unwrap());
 
@@ -131,13 +140,13 @@ async fn two_simultaneous_asks_leave_exactly_one_holder() {
         held_a ^ held_b,
         "of two simultaneous asks exactly one may hold the role, got a={held_a} b={held_b}"
     );
-    let row = written(&pool)
+    let row = written(&pool, &role)
         .await
         .expect("the winner's term must be written");
     let winner = if held_a { "probe-a" } else { "probe-b" };
     assert_eq!(row.holder, winner, "the row must name the process that won");
 
-    clear_role(&pool).await;
+    clear_role(&pool, &role).await;
 }
 
 /// A term that is live refuses everyone but its own holder, and the holder
@@ -145,23 +154,24 @@ async fn two_simultaneous_asks_leave_exactly_one_holder() {
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn a_live_term_refuses_the_second_holder_and_renews_for_its_own() {
+    let role = format!("{PROBE}_live_term");
     let pool = connect().await;
     let a = broker(&pool, "probe-a").await;
     let b = broker(&pool, "probe-b").await;
-    clear_role(&pool).await;
+    clear_role(&pool, &role).await;
 
     let ttl = Duration::from_secs(60);
-    let holder = a.lease(ROLE, ttl);
+    let holder = a.lease(&role, ttl);
     assert!(holder.try_hold().await.unwrap(), "a free role is taken");
-    let taken = written(&pool).await.unwrap();
+    let taken = written(&pool, &role).await.unwrap();
     assert_eq!(taken.holder, "probe-a");
 
     assert!(
-        !b.lease(ROLE, ttl).try_hold().await.unwrap(),
+        !b.lease(&role, ttl).try_hold().await.unwrap(),
         "a role with a live term must be refused to a second holder"
     );
     assert_eq!(
-        written(&pool).await.unwrap().holder,
+        written(&pool, &role).await.unwrap().holder,
         "probe-a",
         "a refused ask must leave the row as it was"
     );
@@ -175,7 +185,7 @@ async fn a_live_term_refuses_the_second_holder_and_renews_for_its_own() {
         holder.try_hold().await.unwrap(),
         "the holder must be able to renew its own term"
     );
-    let renewed = written(&pool).await.unwrap();
+    let renewed = written(&pool, &role).await.unwrap();
     assert_eq!(renewed.holder, "probe-a");
     assert!(
         renewed.expires_at > taken.expires_at,
@@ -186,7 +196,7 @@ async fn a_live_term_refuses_the_second_holder_and_renews_for_its_own() {
         "a renewal is not a new acquisition"
     );
 
-    clear_role(&pool).await;
+    clear_role(&pool, &role).await;
 }
 
 /// A holder that stops renewing — the pod was killed, the process wedged, the
@@ -195,30 +205,31 @@ async fn a_live_term_refuses_the_second_holder_and_renews_for_its_own() {
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn a_term_that_stops_being_renewed_is_taken_over() {
+    let role = format!("{PROBE}_takeover");
     let pool = connect().await;
     let a = broker(&pool, "probe-a").await;
     let b = broker(&pool, "probe-b").await;
-    clear_role(&pool).await;
+    clear_role(&pool, &role).await;
 
     // Short enough that the wait below outlasts it, long enough that the two
     // asks before the wait cannot.
     let ttl = Duration::from_secs(1);
-    assert!(a.lease(ROLE, ttl).try_hold().await.unwrap());
-    assert!(!b.lease(ROLE, ttl).try_hold().await.unwrap());
+    assert!(a.lease(&role, ttl).try_hold().await.unwrap());
+    assert!(!b.lease(&role, ttl).try_hold().await.unwrap());
 
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
     assert!(
-        b.lease(ROLE, ttl).try_hold().await.unwrap(),
+        b.lease(&role, ttl).try_hold().await.unwrap(),
         "once the term has run out the role is free again"
     );
-    assert_eq!(written(&pool).await.unwrap().holder, "probe-b");
+    assert_eq!(written(&pool, &role).await.unwrap().holder, "probe-b");
     assert!(
-        !a.lease(ROLE, ttl).try_hold().await.unwrap(),
+        !a.lease(&role, ttl).try_hold().await.unwrap(),
         "the displaced holder must stop being told it may act"
     );
 
-    clear_role(&pool).await;
+    clear_role(&pool, &role).await;
 }
 
 /// The reading an operator takes — the table itself — says what the arbitration
@@ -232,34 +243,35 @@ async fn a_term_that_stops_being_renewed_is_taken_over() {
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn the_table_is_the_reading_of_who_holds_what() {
+    let role = format!("{PROBE}_table");
     let pool = connect().await;
     let a = broker(&pool, "probe-a").await;
-    clear_role(&pool).await;
+    clear_role(&pool, &role).await;
 
     assert_eq!(
-        reported_holder(&a).await,
+        reported_holder(&a, &role).await,
         None,
         "a role no one has asked for must not appear as held"
     );
 
     assert!(a
-        .lease(ROLE, Duration::from_secs(60))
+        .lease(&role, Duration::from_secs(60))
         .try_hold()
         .await
         .unwrap());
     assert_eq!(
-        reported_holder(&a).await.as_deref(),
+        reported_holder(&a, &role).await.as_deref(),
         Some("probe-a"),
         "the table is the reading, and it names the holder"
     );
 
-    expire_role(&pool).await;
+    expire_role(&pool, &role).await;
     assert_eq!(
-        reported_holder(&a).await.as_deref(),
+        reported_holder(&a, &role).await.as_deref(),
         Some("probe-a"),
         "an expired term is still a row: who held it last is a fact about the \
          role, and whether the term is live is a separate question"
     );
 
-    clear_role(&pool).await;
+    clear_role(&pool, &role).await;
 }
