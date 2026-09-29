@@ -75,8 +75,12 @@ for d in docs:
 quotas = by_kind.get('ResourceQuota', [])
 limits = by_kind.get('LimitRange', [])
 claims = by_kind.get('PersistentVolumeClaim', [])
-workloads = [d for k in ('Deployment', 'StatefulSet', 'DaemonSet', 'CronJob')
+# Job 也在名单里：下面的注释一直写「并发 Job 按 1 计」，而这里原先只枚举四种，
+# 声明的覆盖面比代码大（今天渲染集里没有 Job，所以数字没动过；但「有 Job 就漏算」
+# 这件事必须由代码而不是由运气来保证）。
+workloads = [d for k in ('Deployment', 'StatefulSet', 'DaemonSet', 'CronJob', 'Job')
              for d in by_kind.get(k, [])]
+
 
 if not quotas and not limits:
     print(f"GOVERNANCE SKIP [{PROFILE}]：未渲染 ResourceQuota/LimitRange（resourceGovernance.enabled=false），无数值可核")
@@ -194,6 +198,32 @@ if lr_container:
                 f"（请求大于上限，容器一旦用默认值就被拒）")
     notes.append(f"容器显式声明 {checked} 项，均在 LimitRange 边界内")
 
+# 部署器在推进时**自己创建**的那个判据 Job：它的资源面声明在进化 ConfigMap 里
+# （渲染产物中读得到），但 Job 对象本身不是这个渲染集里的工作负载——渲染期不存
+# 在，运行期必定存在。上面那条头寸因此看不见它：实机读数是渲染集 16400m + 判据
+# Job 2000m > 配额 17，而头寸那一行照旧打「600m」，准入被拒时读文件读不出所以然。
+# 这里把它一起算出来打一行，让「剩多少」对这一个必然并存的 Pod 也为真。判词照旧
+# 由上面那条（渲染集下限）决定——数值是策略，这一行只把读数摆出来。
+def runtime_rollout_job():
+    for cm in by_kind.get('ConfigMap', []):
+        data = cm.get('data') or {}
+        if str(data.get('COGNEVA_MAINLINE_DEPLOYER_ENABLED', '')).lower() != 'true':
+            continue
+        limit = data.get('COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_CPU_LIMIT')
+        if limit is None:
+            continue
+        return {
+            'config': cm['metadata']['name'],
+            'requests.cpu': data.get('COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_CPU_REQUEST'),
+            'requests.memory': data.get('COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_MEMORY_REQUEST'),
+            'limits.cpu': limit,
+            'limits.memory': data.get('COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_MEMORY_LIMIT'),
+        }
+    return None
+
+
+runtime_job = runtime_rollout_job()
+
 # 工作负载的单副本下限和 vs quota（cpu/memory）。
 for face, quota_key, unit in (('requests', 'requests.cpu', 'cpu'),
                              ('requests', 'requests.memory', 'memory'),
@@ -235,6 +265,21 @@ for face, quota_key, unit in (('requests', 'requests.cpu', 'cpu'),
         notes.append(
             f"{face}.{label} 单副本下限和 {shown(totals)} ≤ 配额 {hard[quota_key]}，"
             f"头寸 {shown(headroom)}（DaemonSet 与并发 Job 按 1 计）")
+
+    if runtime_job is not None and runtime_job.get(quota_key) is not None:
+        extra = qty(runtime_job[quota_key])
+        together = ceiling - totals - extra
+        where = (f"{runtime_job['config']} 声明 COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_"
+                 f"{'CPU' if unit == 'cpu' else 'MEMORY'}_{'LIMIT' if face == 'limits' else 'REQUEST'}"
+                 f" = {runtime_job[quota_key]}")
+        tail = (f"，头寸 {shown(together)}" if together > 0 else
+                "，即推进期在这一面上没有余量：任何 Pod 替换都得等旧 Pod 从额度里真的退出，"
+                "否则准入被拒（FailedCreate），而它落地时是超时判词不是资源判词")
+        notes.append(
+            f"  └ 上面那条头寸没算部署器运行期自己创建的判据 Job（{where}）："
+            f"把它一起算进来 {shown(totals + extra)} vs 配额 {hard[quota_key]}{tail}"
+            f"。本脚本按每 Pod 容器与 init 之和计，而额度记账取两者较大者，"
+            f"所以这里的数只会偏大不会偏小；数值是策略，这一行不动判词")
 
 if errors:
     print(f"GOVERNANCE 校验失败 [{PROFILE}]：")

@@ -21,16 +21,27 @@ storage:
 #
 # 数值按**单节点 K3s（≥4C8G 空白机）**标定：常设镜像分发开销
 # （image-server 100m/64Mi + 每节点 importer 200m/1Gi）已计入，并留出滚动期的
-# 瞬时增量（主线滚动 Job 500m/256Mi；四个业务部署都是单副本且 maxSurge=0，
+# 瞬时增量（主线滚动 Job 2000m/512Mi；四个业务部署都是单副本且 maxSurge=0，
 # 滚动靠先删旧 Pod 再建新 Pod 腾位，不额外占位）。多节点每增一个节点按
 # +200m limits.cpu / +1Gi limits.memory 上调——**渲染期拿不到节点数**，所以这是
 # 由元启动/运维按集群规模经 --set 覆盖的项，不是自动伸缩。
+#
+# 上面那句"留出滚动期的瞬时增量"就是 limitsCpu 的算式，它是算出来的不是拍出来的：
+# 稳态 Pod 的 limits.cpu 合计 15000m，加判据 Job 2000m = 17000m，再留 1500m 给
+# 替换期的重叠，故取 18.5。滚动 Job 的限额此前从 1 core 抬到 2（实测 1 core 时
+# 限流 nr_throttled 261/509、36.3 秒里削掉 4.85 秒，判据更容易撞超时），这一处
+# 跟着 +1500m 而算式没重算，于是稳态加判据恰好等于旧的 hard 17、零余量：额度按
+# **非终态** Pod 记账，一个卡在 Terminating 的旧 Pod 仍占着它的位，替换的新 Pod
+# 就被拒（FailedCreate … requested: limits.cpu=400m, used: 17, limited: 17），
+# 而它落地时读到的判词是超时不是资源，症状与病因隔两层。
+# 动滚动 Job 的资源面就必须重算这个数（渲染期门禁把两者一起打出来）。
+# limitsMemory 34Gi 对同一组分解仍有 5.4Gi 头寸（判据 Job 的 512Mi 已计入），不动。
 resourceGovernance:
   enabled: true
   quota:
     requestsCpu: "6"
     requestsMemory: 12Gi
-    limitsCpu: "17"
+    limitsCpu: "18.5"
     limitsMemory: 34Gi
     pods: "40"
     # 存储声明是**命名空间内全部 PVC 之和的上限**，不是某个卷的容量：目录型卷
