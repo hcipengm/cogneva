@@ -663,7 +663,7 @@ impl GitOpsPuller {
                 warn!(manifest = %path, "config consumers: manifest unreadable, skipping");
                 continue;
             };
-            for name in mounters_of_config(&text) {
+            for name in mounters_of_config(&text)? {
                 if rolled.contains(&name) {
                     continue;
                 }
@@ -2414,20 +2414,25 @@ fn config_document(manifest: &str) -> serde_json::Value {
 /// mounting the config is rolled without anyone remembering to add it here. Any
 /// workload kind with a pod template counts; what makes a workload a consumer is
 /// the mount, not its kind.
-fn mounters_of_config(manifest: &str) -> Vec<String> {
+fn mounters_of_config(manifest: &str) -> SFResult<Vec<String>> {
     use serde::Deserialize;
 
     let mut out = Vec::new();
     for doc in serde_yaml::Deserializer::from_str(manifest) {
-        let Ok(yaml) = serde_yaml::Value::deserialize(doc) else {
-            continue;
-        };
+        // A document that cannot be read ends this call rather than being
+        // skipped. `serde_yaml` hands back the same errored document without
+        // advancing the parser, so "skip it and read the next one" is a loop
+        // that never returns -- a core burnt with no syscall and no log, which
+        // looks exactly like a slow manifest. Stopping the whole roll is the
+        // loud half of the choice: a list that came back short would leave the
+        // workloads it missed on the previous configuration with nothing said.
+        let yaml = serde_yaml::Value::deserialize(doc)
+            .map_err(|e| SFError::Config(format!("manifest is not readable as YAML: {e}")))?;
         // Read the fields through the JSON view: the two value types address a
         // nested field differently, and one of them has to be picked so the
         // lookups read the same here as everywhere else in this file.
-        let Ok(value) = serde_json::to_value(yaml) else {
-            continue;
-        };
+        let value = serde_json::to_value(yaml)
+            .map_err(|e| SFError::Config(format!("manifest document is not JSON: {e}")))?;
         if !matches!(
             value.get("kind").and_then(|k| k.as_str()),
             Some("Deployment" | "StatefulSet" | "DaemonSet")
@@ -2451,7 +2456,7 @@ fn mounters_of_config(manifest: &str) -> Vec<String> {
             out.push(name.to_string());
         }
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -3763,7 +3768,10 @@ spec:
           configMap:
             name: other-config
 "#;
-        assert_eq!(mounters_of_config(manifest), vec!["cogneva".to_string()]);
+        assert_eq!(
+            mounters_of_config(manifest).expect("readable"),
+            vec!["cogneva".to_string()]
+        );
     }
 
     /// The seam the roll depends on: a section the reload path re-applies must
@@ -3805,7 +3813,10 @@ spec:
             }
             files += 1;
             let text = std::fs::read_to_string(&path).expect("manifest readable");
-            found.extend(mounters_of_config(&text));
+            match mounters_of_config(&text) {
+                Ok(names) => found.extend(names),
+                Err(e) => panic!("{}: manifest is not readable: {e}", path.display()),
+            }
         }
         assert!(files > 0, "no manifests were read at all");
         found.sort();
@@ -3815,5 +3826,35 @@ spec:
             "the workloads that mount the config, read from the manifests; a rename here is a \
              rename of what the config roll targets"
         );
+    }
+
+    /// A manifest that cannot be read has to end the call, not be skipped.
+    ///
+    /// The regression does not look like a failure, it looks like a hang:
+    /// `serde_yaml` hands back the same errored document without advancing the
+    /// parser, so "skip it and read the next one" never returns. The assertion
+    /// therefore runs on a thread with a deadline -- not returning is the
+    /// failure, instead of the whole suite being held down. The leaked spinning
+    /// thread is harmless: process exit takes it.
+    #[test]
+    fn an_unreadable_manifest_returns_instead_of_spinning() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let out = mounters_of_config("kind: Deployment\nmetadata:\n  name: cogneva\n  [torn\n");
+            let _ = tx.send(match out {
+                Ok(names) => format!("returned Ok({names:?})"),
+                Err(e) => format!("{e}"),
+            });
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+            Ok(reading) => assert!(
+                reading.contains("not readable as YAML"),
+                "a torn manifest has to come back as an error, got: {reading}"
+            ),
+            Err(_) => panic!(
+                "reading a torn manifest never returned: the document loop is \
+                 spinning on an errored document"
+            ),
+        }
     }
 }

@@ -5523,6 +5523,26 @@ fn stage_rollout_manifest(text: &str, origin: &str, out: &Path) -> SFResult<Opti
     Ok(Some(out.to_path_buf()))
 }
 
+/// Where one target's manifest gets staged before it is applied.
+///
+/// The name has to be different on **every call**: two executors in one process
+/// staging the same deployment (parallel tests are two executors, and a caller
+/// that ever rolls two targets at once is no different) write one path, and
+/// `std::fs::write` truncates before it writes -- so the reader that wins the
+/// race parses a manifest torn in half and treats it as a broken file. The pid
+/// separates processes and the counter separates callers inside one; both are
+/// needed, since either alone still collides.
+fn staged_manifest_path(deployment: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "mainline-target-{}-{}-{seq}.yaml",
+        deployment,
+        std::process::id()
+    ))
+}
+
 /// A plain scalar whose meaning depends on which YAML dialect reads it: the
 /// manifest is parsed here by a 1.2-style reader and written back out, and the
 /// cluster parses that re-emission with a 1.1-style one. The two disagree on
@@ -6219,11 +6239,8 @@ impl RolloutExecutor {
                 let text = tokio::fs::read_to_string(&path)
                     .await
                     .map_err(|e| SFError::IO(format!("read {}: {e}", path.display())))?;
-                let staged = stage_rollout_manifest(
-                    &text,
-                    &key,
-                    &std::env::temp_dir().join(format!("mainline-target-{}.yaml", t.deployment)),
-                )?;
+                let staged =
+                    stage_rollout_manifest(&text, &key, &staged_manifest_path(&t.deployment))?;
                 if let Some(staged_path) = staged {
                     let path_arg = staged_path.to_string_lossy().to_string();
                     info!(
@@ -6232,11 +6249,18 @@ impl RolloutExecutor {
                         manifest = %path_arg,
                         "mainline rollout: apply target manifest"
                     );
-                    self.clear_superseded_env_values(&staged_path).await?;
-                    return self
-                        .run_kubectl(&["apply", "-f", &path_arg], 60)
-                        .await
-                        .map(|_| ());
+                    let outcome = async {
+                        self.clear_superseded_env_values(&staged_path).await?;
+                        self.run_kubectl(&["apply", "-f", &path_arg], 60)
+                            .await
+                            .map(|_| ())
+                    }
+                    .await;
+                    // 这份暂存件只服务这一次 apply，名字又按实例唯一（不再被下一轮覆盖），
+                    // 所以用完就删：留着就是随每一次滚动在临时目录里堆一份，而没有任何
+                    // 回收方认得它们。失败那一路也删——它派生自包里那份清单，包还在。
+                    let _ = tokio::fs::remove_file(&staged_path).await;
+                    return outcome;
                 }
                 warn!(
                     deployment = %t.deployment,
@@ -6542,13 +6566,15 @@ impl RolloutExecutor {
         let text = tokio::fs::read_to_string(manifest)
             .await
             .map_err(|e| SFError::IO(format!("read {}: {e}", manifest.display())))?;
-        for doc in serde_yaml::Deserializer::from_str(&text) {
-            let Ok(doc) = serde_yaml::Value::deserialize(doc) else {
-                continue;
-            };
-            let Ok(desired) = serde_json::to_value(&doc) else {
-                continue;
-            };
+        // 逐文档读，**坏文档不许"跳过它继续下一条"**：`serde_yaml` 解析出错时交回的
+        // 迭代项不推进游标，同一条错误文档会被反复送回来，一次 `continue` 就是永不返回
+        // 的循环——烧满一核、零系统调用、零日志，在观测面上与"很慢"同形。`split_docs`
+        // 把错误 `?` 出去，于是读不出来就不交付这一份：随后的 apply 本就会被准入拒绝，
+        // 而那次拒绝会被读成"这一版坏了"，比在这里停下更贵。
+        let origin = manifest.display().to_string();
+        for doc in split_docs(&text, &origin)? {
+            let desired = serde_json::to_value(&doc)
+                .map_err(|e| SFError::Config(format!("{origin}: document is not JSON: {e}")))?;
             let Some(workload) = cog_core::contract::env_supersede::workload_identity(&desired)
             else {
                 continue;
@@ -13892,6 +13918,12 @@ exit 0
         let applied = dir.join("applied.marker");
         let patched = dir.join("patched.marker");
         let settled = dir.join("settled.marker");
+        // 暂存件在 apply 那一刻的读数：把 apply 实参里那个 `-f` 路径**原样**记下来，
+        // 连同它当时在不在盘上。判"删掉了没"只能从这个实参出发——日志是拼接文本，
+        // 按 token 从里面捞路径会捞到被撑开的行边界粘出来的碎片（实测量到过
+        // `...yamlcogneva`），那种字符串当然不存在，`exists()` 于是恒为假。
+        let staged_path_file = dir.join("staged.path");
+        let staged_state = dir.join("staged.state");
         // 热更新面覆盖到的段（tuning）变了：没有值得滚的理由，配置文档照样变。
         // 内层文档要按 JSON 字符串嵌进 configmap 列表里，引号得转义。
         let (before_body, after_body) = if hot_only {
@@ -13920,6 +13952,17 @@ for a in "$@"; do
 done
 case "$*" in
   *"apply -f "*)
+    prev=""
+    for a in "$@"; do
+      if [ "$prev" = "-f" ]; then
+        case "$a" in
+          *mainline-target-*)
+            printf '%s' "$a" > '{staged_path_file}'
+            if [ -f "$a" ]; then echo present > '{staged_state}'; else echo missing > '{staged_state}'; fi ;;
+        esac
+      fi
+      prev="$a"
+    done
     touch '{applied}'
     echo "configmap/cogneva-json configured" ;;
   # 配置现状：apply 之前是旧文档，之后是新文档。
@@ -13967,6 +14010,8 @@ exit 0
             applied = applied.display(),
             patched = patched.display(),
             settled = settled.display(),
+            staged_path_file = staged_path_file.display(),
+            staged_state = staged_state.display(),
             before_body = before_body,
             after_body = after_body,
             expect_patch = if hot_only { "no" } else { "yes" }
@@ -13982,6 +14027,221 @@ exit 0
         );
         plan.manifests_dir = Some(manifests.to_string_lossy().to_string());
         plan
+    }
+
+    /// 清单里有一条读不出来的文档时，清除残留这一步必须**返回**，而不是"跳过
+    /// 这一条接着读下一条"。
+    ///
+    /// 回归的表现不是变红而是挂死：`serde_yaml` 交回出错的那条文档时不推进游标，
+    /// `continue` 于是成了永不返回的循环。所以断言放在带超时的线程里——不返回就是
+    /// 失败，而不是把整个测试套件一起按住。泄漏一个空转线程没关系，进程退出会收掉。
+    #[test]
+    fn an_unreadable_manifest_returns_instead_of_spinning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("torn.yaml");
+        std::fs::write(
+            &manifest,
+            "kind: Deployment\nmetadata:\n  name: cogneva\n  [torn\n",
+        )
+        .unwrap();
+        let origin = manifest.display().to_string();
+        // 路径故意不存在：这条用例里根本不该走到 kubectl。
+        let kubectl = tmp
+            .path()
+            .join("no-such-kubectl")
+            .to_string_lossy()
+            .to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let out = rt.block_on(async {
+                let executor = RolloutExecutor::new(kubectl, "cogneva", 1, 1, 60, 60);
+                executor.clear_superseded_env_values(&manifest).await
+            });
+            let _ = tx.send(match out {
+                Ok(()) => "returned Ok".to_string(),
+                Err(e) => format!("{e}"),
+            });
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+            Ok(reading) => assert!(
+                reading.contains(&origin) && reading.contains("invalid YAML"),
+                "a torn manifest has to come back as a named error, got: {reading}"
+            ),
+            Err(_) => panic!(
+                "clearing superseded env values on a torn manifest never returned: \
+                 the document loop is spinning on an errored document"
+            ),
+        }
+    }
+
+    /// 反向对照：清单读得出来、live 上确实有一处已被 `valueFrom` 取代的 `value`
+    /// 时，patch 要真的打出去。少了这一半，上面那条用例在"干脆什么都不做"的实现
+    /// 下也是绿的。
+    #[tokio::test]
+    async fn a_superseded_env_value_is_cleared() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let log = bin_dir.join("kubectl.log");
+        let live = r#"{"kind":"Deployment","metadata":{"name":"cogneva"},"spec":{"template":{"spec":{"containers":[{"name":"app","env":[{"name":"TOKEN","value":"a-plaintext-leftover"}]}]}}}}"#;
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  *"get deployment cogneva -o json"*) printf '%s\n' '{live}' ;;
+  *"patch deployment cogneva"*) echo "deployment.apps/cogneva patched" ;;
+  *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
+esac
+"#,
+            log = log.display(),
+            live = live
+        );
+        write_fake_bin(&bin_dir, "fake-kubectl", &script);
+
+        let manifest = tmp.path().join("deployment.yaml");
+        std::fs::write(
+            &manifest,
+            r#"kind: Deployment
+metadata:
+  name: cogneva
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          env:
+            - name: TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: token
+"#,
+        )
+        .unwrap();
+
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            1,
+            1,
+            60,
+            60,
+        );
+        executor
+            .clear_superseded_env_values(&manifest)
+            .await
+            .expect("a readable manifest must come back");
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        let read = calls
+            .find("get deployment cogneva -o json")
+            .unwrap_or_else(|| panic!("the live object was never read: {calls}"));
+        let patch = calls
+            .find("patch deployment cogneva")
+            .unwrap_or_else(|| panic!("the leftover value was never cleared: {calls}"));
+        assert!(read < patch, "the patch has to follow the read: {calls}");
+        assert!(
+            calls.contains("/spec/template/spec/containers/0/env/0/value"),
+            "the patch has to name the leftover value's own path: {calls}"
+        );
+    }
+
+    /// 暂存路径**每次调用都不同**：同名部署的两个执行器写同一个路径时，
+    /// `std::fs::write` 先截断再写，读到的那一方解析到的是被撕成两半的清单，
+    /// 于是把它当成"这一版坏了"。
+    #[test]
+    fn staged_manifest_paths_do_not_collide() {
+        let first = staged_manifest_path("cogneva");
+        let second = staged_manifest_path("cogneva");
+        assert_ne!(
+            first, second,
+            "two calls for one deployment staged to the same path"
+        );
+        assert_ne!(staged_manifest_path("a"), staged_manifest_path("b"));
+
+        let name = first.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("mainline-target-cogneva-"), "{name}");
+        assert!(
+            name.contains(&std::process::id().to_string()),
+            "the name has to separate processes too, not just callers: {name}"
+        );
+        assert_eq!(first.parent().unwrap(), std::env::temp_dir());
+    }
+
+    /// 暂存件**用完就删**。
+    ///
+    /// 路径按实例唯一之后它不再被下一轮覆盖，于是它成了一份没有回收方的产物：每次滚动
+    /// 在临时目录里留一份，谁也不认得那些文件。断言读的是假 kubectl 记下来的**那一个**
+    /// 路径——按前缀扫临时目录会让并行跑的兄弟用例互相看见对方的在飞文件。
+    #[tokio::test]
+    async fn the_staged_manifest_is_removed_after_the_apply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let (manifests, _log) = fake_kubectl_config_effect(&bin_dir, false);
+        // 包里得真有一份目标清单，`apply_target` 才走暂存那条路（没有就回落 `set image`，
+        // 而那样根本没有暂存件可谈）。
+        std::fs::write(
+            manifests.join("deploy-cogneva.yaml"),
+            "kind: Deployment\nmetadata:\n  name: cogneva\n",
+        )
+        .unwrap();
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            1,
+            1,
+            60,
+            60,
+        );
+        executor
+            .run(&config_effect_executor(&manifests))
+            .await
+            .expect("rollout should succeed");
+
+        // 读数取自 apply 的**实参**（假 kubectl 在那一支里记下来的），不从日志里捞：
+        // 日志是 `echo "$@"` 的拼接文本，jsonpath 实参里带换行会撑开行边界，捞出来的
+        // "路径"可能是碎片——碎片当然不存在，断言就空过了（种植回归照样绿）。
+        let recorded = std::fs::read_to_string(bin_dir.join("staged.path")).unwrap_or_else(|e| {
+            panic!("no target manifest was ever applied through -f: {e}");
+        });
+        let path = recorded.trim();
+        assert!(
+            path.contains("mainline-target-"),
+            "the recorded apply argument is not a staged manifest: {path}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(bin_dir.join("staged.state"))
+                .unwrap()
+                .trim(),
+            "present",
+            "the file apply was handed was not on disk: {path}"
+        );
+        assert!(
+            !Path::new(path).exists(),
+            "the staged manifest outlived the apply that used it: {path}"
+        );
+    }
+
+    /// 机制本体：读不出来的那条文档会被**反复交回来**。
+    ///
+    /// 不是在测我们的代码，是把我们依赖的第三方行为钉住——"不许 `continue`"整条
+    /// 理由都建在它上面。`take` 让它必然终止，所以它自己不会挂死。
+    #[test]
+    fn an_errored_document_comes_back_without_end() {
+        let text = "kind: Deployment\nmetadata:\n  name: cogneva\n  [torn\n";
+        let mut rounds = 0;
+        for doc in serde_yaml::Deserializer::from_str(text).take(50) {
+            assert!(
+                serde_yaml::Value::deserialize(doc).is_err(),
+                "round {rounds} parsed: the parser advanced past the torn document"
+            );
+            rounds += 1;
+        }
+        assert_eq!(rounds, 50, "the iterator ended on its own; the fix is moot");
     }
 
     /// 只改配置的 rev：工作负载代数一个都没动（apply 一份 ConfigMap 不动任何 spec），

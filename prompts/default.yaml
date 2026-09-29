@@ -1,7 +1,7 @@
 # 启动兜底的 prompt 集：只放「进程起来时就必须有」的那几条。
 # 与 system_prompts.yaml 一起被 cogneva-prompts 挂进 /etc/cogneva/prompts。
 # 两个文件的 key 不许重名：registry 是覆盖写（`PromptRegistry::register`），
-# 重名等于其中一份声明被静默顶掉——门禁 `prompt-keys-reconcile.test.sh` 判重。
+# 重名等于其中一份声明被静默顶掉——门禁 `deploy/scripts/tests/prompt-declaration-wiring.test.sh` 判重。
 prompts:
   agent:default:
     content: "You are a helpful assistant."

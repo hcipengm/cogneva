@@ -1,7 +1,7 @@
 # Cogneva System Prompts
 # 所有 system prompt 集中管理，支持运行时热加载。
 #
-# 本文件的每一条声明都必须有读者。`deploy/scripts/tests/prompt-keys-reconcile.test.sh`
+# 本文件的每一条声明都必须有读者。`deploy/scripts/tests/prompt-declaration-wiring.test.sh`
 # 双向核对「代码里被请求的 key」与「这里声明的 key」：多一条、少一条都判红。
 # 一条没人读的声明会让读者以为改这里就等于改行为——那比没有这条声明更坏。
 # 启动兜底的那一条（agent:default）在 default.yaml，两个文件不许重名：

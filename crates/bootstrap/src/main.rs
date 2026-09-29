@@ -2123,12 +2123,14 @@ async fn clear_superseded_env_values_in_dir(rendered: &Path) -> Result<usize> {
 async fn clear_superseded_env_values(text: &str) -> Result<usize> {
     let mut cleared = 0usize;
     for doc in serde_yaml::Deserializer::from_str(text) {
-        let Ok(doc) = serde_yaml::Value::deserialize(doc) else {
-            continue;
-        };
-        let Ok(desired) = serde_json::to_value(&doc) else {
-            continue;
-        };
+        // 坏文档不许"跳过它继续下一条"：`serde_yaml` 解析出错时交回的迭代项**不推进
+        // 游标**，同一条错误文档会被反复送回来 ⇒ 一次 `continue` 就是永不返回的循环
+        // （烧满一核、零系统调用、零日志）。读不出来就整体失败：这份文本随后本来也要
+        // 交给 apply，那里同样会拒，只是报得更晚、指向更远。
+        let doc =
+            serde_yaml::Value::deserialize(doc).with_context(|| "清单里有读不出来的 YAML 文档")?;
+        let desired = serde_json::to_value(&doc)
+            .with_context(|| "清单文档无法表达成 JSON（如非字符串键）")?;
         let Some(workload) = cog_core::contract::env_supersede::workload_identity(&desired) else {
             continue;
         };
