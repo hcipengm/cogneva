@@ -55,7 +55,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
             shell_timeout_secs,
             nats_config,
             hook_engine_config,
-            _agent_config,
+            agent_config,
             mbc,
             require_tool_identity,
         ) = {
@@ -245,6 +245,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
             supervisor_state_backend.clone(),
         )
         .with_default_runtime_config(agent_loop_config)
+        .with_heartbeat_interval_secs(agent_config.heartbeat_interval_secs)
         .with_tools(tool_registry);
         // Workers publish onto the cluster-wide bus (stream plugin) so live
         // observers see every turn/tool call in real time. Without the stream

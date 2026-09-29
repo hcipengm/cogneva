@@ -465,12 +465,10 @@
     "max_iterations": 50,
     "stagnation_window": 5
   },
-  "lifecycle": {
-    "heartbeat_interval_secs": 5,
-    "suspect_threshold": 2,
-    "dead_threshold": 5,
-    "registration_ttl_secs": 60,
-    "cleanup_interval_secs": 300
+  "agent": {
+    "_comment": "Agent 注册与心跳。registration_ttl_secs 是注册表里一条 agent 记录的存活秒数（cog-storage 写注册时取它），heartbeat_interval_secs 是 worker 向注册表续约的间隔（cog-agent 建 worker 时取它）。两处都在进程启动时读，改一个值要重启工作负载才生效。",
+    "registration_ttl_secs": 30,
+    "heartbeat_interval_secs": 10
   },
   "tuning": {
     "stream_capacity": 256,

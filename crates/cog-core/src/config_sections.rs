@@ -165,9 +165,10 @@ pub const CONFIG_SECTIONS: &[ConfigSection] = &[
         "Rate limits and dedup window are read at startup."
     ),
     section!(
-        "lifecycle",
+        "agent",
         RestartRequired,
-        "Heartbeat and threshold settings are read at startup."
+        "The registry record's TTL (cog-storage) and the worker heartbeat interval \
+         (cog-agent) are both read at startup."
     ),
     section!(
         "multi_backend_consumer",

@@ -80,6 +80,13 @@ pub struct GlobalAgentManager {
     /// pointer is written, the read comes back empty, and the run starts over
     /// exactly as if nothing had ever been checkpointed.
     checkpoint_store: Option<Arc<dyn cog_core::CheckpointStore>>,
+    /// How often every worker renews its registration.
+    ///
+    /// Read from the `agent` section at startup and handed to each spawned
+    /// agent. Left at the config surface's own default when nothing sets it, so
+    /// the number lives in one place: an interval written here as a second
+    /// constant would be the one that wins, silently.
+    heartbeat_interval_secs: u64,
 }
 
 impl GlobalAgentManager {
@@ -112,7 +119,16 @@ impl GlobalAgentManager {
             event_bus_sink: None,
             observability: None,
             checkpoint_store: None,
+            heartbeat_interval_secs: cog_core::config::AgentConfig::default()
+                .heartbeat_interval_secs,
         }
+    }
+
+    /// Set how often every worker renews its registration, from the `agent`
+    /// section of the delivered configuration.
+    pub fn with_heartbeat_interval_secs(mut self, secs: u64) -> Self {
+        self.heartbeat_interval_secs = secs;
+        self
     }
 
     /// The runtime config a newly spawned agent of `role` starts from: the
@@ -218,7 +234,8 @@ impl GlobalAgentManager {
                 .with_registry(self.registry.clone())
                 .with_registration(registration)
                 .with_message_backend(self.message_backend.clone())
-                .with_state_backend(self.state_backend.clone());
+                .with_state_backend(self.state_backend.clone())
+                .with_heartbeat_interval(self.heartbeat_interval_secs);
             if let Some(ref tools) = self.default_tools {
                 a = a.with_tools(tools.as_ref().clone());
             }
@@ -328,7 +345,8 @@ impl cog_core::AgentManager for GlobalAgentManager {
                 .with_registry(self.registry.clone())
                 .with_registration(registration)
                 .with_message_backend(self.message_backend.clone())
-                .with_state_backend(self.state_backend.clone());
+                .with_state_backend(self.state_backend.clone())
+                .with_heartbeat_interval(self.heartbeat_interval_secs);
             if let Some(ref tools) = self.default_tools {
                 a = a.with_tools(tools.as_ref().clone());
             }
