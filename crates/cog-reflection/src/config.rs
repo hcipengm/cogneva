@@ -36,8 +36,12 @@ pub struct PromotionGateConfig {
     /// L0 配置路径前缀（热更新通道，不碰二进制）。
     pub config_prefixes: Vec<String>,
     /// 直接拒收的文件名（依赖清单/密钥文件），连沙盒都不让进。
+    ///
+    /// 只用于**往下加**：判定取契约 `PROTECTED_FILE_NAMES` 与本表的并集，
+    /// 所以这里少写一个名字不会让任何文件变成可晋级（见
+    /// `cog_reflection::promotion_gate::forbidden_names`）。
     pub forbidden_names: Vec<String>,
-    /// 直接拒收的扩展名。
+    /// 直接拒收的扩展名，同 [`Self::forbidden_names`]：与契约取并集。
     pub forbidden_extensions: Vec<String>,
     /// 晋级周报（eval 长期趋势）开关：周期聚合台账写报告文件 + 趋势向
     /// 下告警。
@@ -82,13 +86,17 @@ impl Default for PromotionGateConfig {
                 "prompts/".into(),
                 "deploy/k3s/cogneva-json-configmap.yaml".into(),
             ],
-            forbidden_names: vec![
-                "Cargo.toml".into(),
-                "Cargo.lock".into(),
-                ".env".into(),
-                ".envrc".into(),
-            ],
-            forbidden_extensions: vec!["pem".into(), "key".into(), "crt".into(), "p12".into()],
+            // Derived, not transcribed: this default used to name four of the
+            // contract's nine, so the promotion gate alone would have let a
+            // change through that every other reader on the pipeline refuses.
+            forbidden_names: cog_core::PROTECTED_FILE_NAMES
+                .iter()
+                .map(|n| n.to_string())
+                .collect(),
+            forbidden_extensions: cog_core::PROTECTED_FILE_EXTENSIONS
+                .iter()
+                .map(|e| e.to_string())
+                .collect(),
             trend_report_enabled: true,
             trend_report_interval_secs: 604_800,
             gitops: GitOpsConfig::default(),

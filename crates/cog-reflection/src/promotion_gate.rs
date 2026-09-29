@@ -76,11 +76,35 @@ fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-fn has_forbidden_extension(path: &str, forbidden: &[String]) -> bool {
+fn has_forbidden_extension<'a>(path: &str, forbidden: impl Iterator<Item = &'a str>) -> bool {
     file_name(path)
         .rsplit_once('.')
-        .map(|(_, ext)| forbidden.iter().any(|f| f.eq_ignore_ascii_case(ext)))
+        .map(|(_, ext)| forbidden.into_iter().any(|f| f.eq_ignore_ascii_case(ext)))
         .unwrap_or(false)
+}
+
+/// The names a change may not touch, whatever this policy says.
+///
+/// The floor is the contract's. `PROTECTED_FILE_NAMES` is the list that carries
+/// the doc and the other readers -- the evaluator and the apply gate both refuse
+/// a change naming one of them -- while a deployment's config is additions to
+/// it. Config may therefore widen the floor and may not narrow it: a policy that
+/// left a name out used to hand this gate a change the rest of the pipeline
+/// refuses, which is the same fact held by two readers of different widths.
+fn forbidden_names<'a>(policy: &'a PromotionGateConfig) -> impl Iterator<Item = &'a str> + 'a {
+    cog_core::PROTECTED_FILE_NAMES
+        .iter()
+        .copied()
+        .chain(policy.forbidden_names.iter().map(String::as_str))
+}
+
+/// The extensions a change may not touch, on the same terms as
+/// [`forbidden_names`].
+fn forbidden_extensions<'a>(policy: &'a PromotionGateConfig) -> impl Iterator<Item = &'a str> + 'a {
+    cog_core::PROTECTED_FILE_EXTENSIONS
+        .iter()
+        .copied()
+        .chain(policy.forbidden_extensions.iter().map(String::as_str))
 }
 
 fn matches_any(path: &str, prefixes: &[String]) -> bool {
@@ -108,13 +132,13 @@ pub fn classify(files: &[String], diff_lines: usize, policy: &PromotionGateConfi
 
     for f in files {
         let name = file_name(f);
-        if policy.forbidden_names.iter().any(|n| n == name) {
+        if forbidden_names(policy).any(|n| n == name) {
             return GateVerdict::Reject {
                 kind: PromotionGateKind::RejectProtected,
                 reason: format!("触及受保护文件 {name}（依赖清单/密钥文件禁止自动进化）"),
             };
         }
-        if has_forbidden_extension(f, &policy.forbidden_extensions) {
+        if has_forbidden_extension(f, forbidden_extensions(policy)) {
             return GateVerdict::Reject {
                 kind: PromotionGateKind::RejectProtected,
                 reason: format!("触及受保护扩展名 {f}（密钥/证书材料禁止自动进化）"),
@@ -201,6 +225,49 @@ mod tests {
             let v = classify(&files(&[f]), 5, &policy());
             assert!(matches!(v, GateVerdict::Reject { .. }), "{f}: {v:?}");
         }
+    }
+
+    /// The contract's protected set is a floor the policy can only add to.
+    ///
+    /// Read with the policy's own lists emptied, because that is the shape that
+    /// tells a floor apart from a transcription: the default config used to name
+    /// four of the contract's nine, so `Dockerfile`, `Containerfile`,
+    /// `docker-compose.yml`, `setup.sh` and `cogneva.json` were promotable here
+    /// while the evaluator and the apply gate both refuse them.
+    #[test]
+    fn the_contract_floor_holds_when_the_policy_names_nothing() {
+        let mut policy = PromotionGateConfig::default();
+        policy.forbidden_names.clear();
+        policy.forbidden_extensions.clear();
+
+        for name in cog_core::PROTECTED_FILE_NAMES {
+            let v = classify(&files(&[name]), 5, &policy);
+            assert!(
+                matches!(v, GateVerdict::Reject { .. }),
+                "受保护文件 {name} 在这个门里没有被拒收: {v:?}"
+            );
+        }
+        for ext in cog_core::PROTECTED_FILE_EXTENSIONS {
+            let path = format!("certs/x.{ext}");
+            let v = classify(&files(&[&path]), 5, &policy);
+            assert!(
+                matches!(v, GateVerdict::Reject { .. }),
+                "受保护扩展名 .{ext} 在这个门里没有被拒收: {v:?}"
+            );
+        }
+    }
+
+    /// The other direction: a policy may still add a name of its own.
+    #[test]
+    fn a_policy_can_add_a_name_of_its_own() {
+        let mut policy = PromotionGateConfig::default();
+        policy.forbidden_names.push("secrets.yaml".into());
+        policy.forbidden_extensions.push("p8".into());
+
+        let v = classify(&files(&["deploy/secrets.yaml"]), 5, &policy);
+        assert!(matches!(v, GateVerdict::Reject { .. }), "{v:?}");
+        let v = classify(&files(&["certs/client.p8"]), 5, &policy);
+        assert!(matches!(v, GateVerdict::Reject { .. }), "{v:?}");
     }
 
     #[test]
