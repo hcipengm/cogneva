@@ -227,11 +227,11 @@ fn crate_dir(root: &Path, krate: &str) -> PathBuf {
 /// this cannot read is a subtree whose ignored tests are missing from the
 /// census, and the census is the only thing that says a test is unread.
 fn collect_rs(dir: &Path, rel: &mut Vec<String>, out: &mut Vec<(PathBuf, Vec<String>)>) {
-    let entries = std::fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("could not list {}: {e}", dir.display()));
+    let entries =
+        std::fs::read_dir(dir).unwrap_or_else(|e| panic!("could not list {}: {e}", dir.display()));
     for entry in entries {
-        let entry = entry
-            .unwrap_or_else(|e| panic!("could not read an entry of {}: {e}", dir.display()));
+        let entry =
+            entry.unwrap_or_else(|e| panic!("could not read an entry of {}: {e}", dir.display()));
         let name = entry.file_name().to_string_lossy().to_string();
         if name == "target" {
             continue;
@@ -264,8 +264,7 @@ fn crate_dirs(root: &Path) -> Vec<String> {
         .unwrap_or_else(|e| panic!("could not read {}: {e}", crates.display()));
     let mut names: Vec<String> = entries
         .map(|entry| {
-            entry
-                .unwrap_or_else(|e| panic!("could not read an entry of {}: {e}", crates.display()))
+            entry.unwrap_or_else(|e| panic!("could not read an entry of {}: {e}", crates.display()))
         })
         .filter(|entry| entry.path().join("Cargo.toml").is_file())
         .map(|entry| entry.file_name().to_string_lossy().to_string())
