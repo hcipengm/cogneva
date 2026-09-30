@@ -19,7 +19,7 @@ use std::time::Duration;
 use crate::GitOpsConfig;
 use async_trait::async_trait;
 use cog_core::{SFError, SFResult};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::auto_promoter::{PromotionChannel, PromotionSource};
 use crate::types::EvolutionResult;
@@ -266,30 +266,40 @@ impl GitOpsPublisher {
     /// 不可变 `main-<rev>` tag。主线前进后浮动 :local 虽已同步前移，
     /// 但构建机可能缓存着旧 :local 层，用不可变 tag 保证基底就是线上版本，
     /// 避免金丝雀基于旧基线自我放大。查询失败/未迁移/混合态退回 :local。
+    ///
+    /// 逐个**按名字**读，而不是列一遍命名空间的 deployment：集合级 list 在
+    /// 按名授权下必被拒（RBAC 的 `resourceNames` 与 list 组合要求请求带对应的
+    /// field selector），而同一个推送端也可能跑在只按名授权的 Pod 里；按名读
+    /// 只要那个名字上的 get。任何一个名字读不出来都算「读不出来」——退回
+    /// :local，并把**哪个名字、为什么**写进日志：权限被拒与「集群里确实还是
+    /// 浮动 tag」是两件事，落成同一行日志就再也没人分得出来。
     async fn resolve_base_image(&self, endpoint: &str) -> String {
         let fallback = format!("{endpoint}/cogneva:local");
-        let jsonpath = "{range .items[*]}{.metadata.name}{\"\\t\"}{range .spec.template.spec.containers[*]}{.name}={.image}{\",\"}{end}{\"\\n\"}{end}";
-        let out = match self
-            .run(
-                &self.config.kubectl_bin,
-                &[
-                    "-n",
-                    &self.config.namespace,
-                    "get",
-                    crate::mainline_deployer::workload_resource("Deployment"),
-                    "-o",
-                    jsonpath,
-                ],
-                30,
-            )
-            .await
-        {
-            Ok(o) => o,
-            Err(e) => {
-                info!(error = %e, "canary base: kubectl query failed; falling back to :local");
-                return fallback;
+        // 单个对象不是 list，所以名字取 `.metadata.name` 而不是
+        // `{range .items[*]}`；`deployed_main_rev` 认的仍是同一份 tab 分隔文本。
+        const JSONPATH: &str = "{.metadata.name}{\"\\t\"}{range .spec.template.spec.containers[*]}{.name}={.image}{\",\"}{end}{\"\\n\"}";
+        let mut out = String::new();
+        for name in CANARY_BASE_DEPLOYMENTS {
+            let target = format!("deployment/{name}");
+            match self
+                .run(
+                    &self.config.kubectl_bin,
+                    &["-n", &self.config.namespace, "get", &target, "-o", JSONPATH],
+                    30,
+                )
+                .await
+            {
+                Ok(o) => out.push_str(&o),
+                Err(e) => {
+                    warn!(
+                        deployment = %name,
+                        error = %e,
+                        "canary base: the running revision could not be read; falling back to :local"
+                    );
+                    return fallback;
+                }
             }
-        };
+        }
         match deployed_main_rev(&out) {
             Some(rev) => {
                 let base = format!("{endpoint}/cogneva:main-{rev}");
@@ -301,16 +311,22 @@ impl GitOpsPublisher {
     }
 }
 
+/// 金丝雀 overlay 基底要读的四个工作负载：只有它们**全部**跑在同一个
+/// `main-<rev>` tag 上，那个 tag 才是可信的基底。
+///
+/// 两个读者共用这一份名字——按名把集群读回来的那条命令，与按名字过滤出这四行
+/// 的解析函数——所以它写在模块作用域，只此一份。
+const CANARY_BASE_DEPLOYMENTS: [&str; 4] = [
+    "cogneva",
+    "cogneva-security-gateway",
+    "cogneva-sandbox-executor",
+    "cogneva-evolution",
+];
+
 /// 解析 `kubectl get deploy` 的 tab 分隔输出：仅当四个 cogneva deployment
 /// 的所有容器都跑在同一个 `main-<rev>` tag 上时返回该 rev；Legacy（:local
 /// 时代）、混合态、空输出都返回 None。
 fn deployed_main_rev(jsonpath_out: &str) -> Option<String> {
-    const DEPLOYMENTS: [&str; 4] = [
-        "cogneva",
-        "cogneva-security-gateway",
-        "cogneva-sandbox-executor",
-        "cogneva-evolution",
-    ];
     let mut revs = std::collections::BTreeSet::new();
     let mut total = 0usize;
     let mut on_main = 0usize;
@@ -318,7 +334,7 @@ fn deployed_main_rev(jsonpath_out: &str) -> Option<String> {
         let Some((name, rest)) = line.split_once('\t') else {
             continue;
         };
-        if !DEPLOYMENTS.contains(&name) {
+        if !CANARY_BASE_DEPLOYMENTS.contains(&name) {
             continue;
         }
         for pair in rest.split(',') {
@@ -592,12 +608,19 @@ mod tests {
         assert_eq!(deployed_main_rev(""), None);
     }
 
+    /// 基底那四读是**逐个按名**发出的，读的是 `动词 目标` 一样一行落到 argv.log
+    /// 供断言：集合级 list 在按名授权下会被拒，所以这条路径不能靠一次列全命名
+    /// 空间。落日志用 printf 而不是 echo —— dash 的 echo 会解释参数里的 `\n`，
+    /// jsonpath 那一段会散成多行，读出来的行数就不再是读的条数（这条曾把一次
+    /// 正确的实现读成 5 条读）。
+    const FAKE_KUBECTL_BASE: &str = "#!/bin/sh\nverb=''\ntarget=''\nfor a in \"$@\"; do case \"$a\" in get|list|patch|apply|delete|rollout) verb=\"$a\";; deployment/*) target=\"$a\";; esac; done\nprintf '%s %s\\n' \"$verb\" \"$target\" >> \"$(dirname \"$0\")/argv.log\"\nname=$(printf '%s' \"$target\" | sed 's|^deployment/||')\nprintf '%s\\t%s=reg.test:5000/cogneva:main-abcdef012345\\n' \"$name\" \"$name\"\n";
+
     #[tokio::test]
     async fn canary_overlay_uses_deployed_main_tag_as_base() {
         let (central, work) = setup_repo().await;
-        // fake kubectl：四部署统一在 main-abcdef012345 上（tab 分隔输出）。
-        let script = "#!/bin/sh\ncat <<'EOF'\ncogneva\tcogneva=reg.test:5000/cogneva:main-abcdef012345,\ncogneva-security-gateway\tsecurity-gateway=reg.test:5000/cogneva:main-abcdef012345,\ncogneva-sandbox-executor\tsandbox-executor=reg.test:5000/cogneva:main-abcdef012345,\ncogneva-evolution\tcogneva=reg.test:5000/cogneva:main-abcdef012345,\nEOF\n";
-        let kubectl = crate::test_support::write_executable(work.path(), "fake-kubectl", script);
+        // fake kubectl：每个名字按名读回一行，都跑在 main-abcdef012345 上。
+        let kubectl =
+            crate::test_support::write_executable(work.path(), "fake-kubectl", FAKE_KUBECTL_BASE);
 
         std::fs::write(work.path().join("cogneva"), b"staged-binary").unwrap();
         let builder = make_fake_builder(work.path());
@@ -622,6 +645,59 @@ mod tests {
                 "FROM cogneva-registry.cogneva.svc.cluster.local:5000/cogneva:main-abcdef012345"
             ),
             "canary base must follow deployed main tag: {cf}"
+        );
+
+        let argv = std::fs::read_to_string(work.path().join("argv.log")).unwrap();
+        let reads: Vec<&str> = argv.lines().collect();
+        assert_eq!(
+            reads.len(),
+            CANARY_BASE_DEPLOYMENTS.len(),
+            "基底要一个名字一条读，不是列一遍命名空间：{argv}"
+        );
+        for name in CANARY_BASE_DEPLOYMENTS {
+            assert!(
+                reads
+                    .iter()
+                    .any(|l| l.contains(&format!("get deployment/{name}"))),
+                "没有按名读 {name}：{argv}"
+            );
+        }
+    }
+
+    /// 一个名字读不出来就是「读不出来」：基底退回浮动 tag，而不是拿读到的
+    /// 那几次回报一个 rev。权限被拒（按名授权之外的名字）与"集群里确实还是
+    /// 浮动 tag"在读数上必须是两件事，这条守的是前者不会被写成后者。
+    #[tokio::test]
+    async fn an_unreadable_canary_base_is_a_fallback_not_a_partial_claim() {
+        let (central, work) = setup_repo().await;
+        let refused = "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in deployment/cogneva-sandbox-executor) echo 'Error from server (Forbidden): deployments.apps is forbidden' >&2; exit 1;; esac; done\nname=$(for a in \"$@\"; do case \"$a\" in deployment/*) echo \"$a\";; esac; done | sed 's|^deployment/||')\nprintf '%s\\t%s=reg.test:5000/cogneva:main-abcdef012345\\n' \"$name\" \"$name\"\n";
+        let kubectl = crate::test_support::write_executable(work.path(), "fake-kubectl", refused);
+
+        std::fs::write(work.path().join("cogneva"), b"staged-binary").unwrap();
+        let builder = make_fake_builder(work.path());
+        let publisher = GitOpsPublisher::new(
+            GitOpsConfig {
+                repo_url: central.path().to_string_lossy().into_owned(),
+                builder_bin: builder.to_string_lossy().into_owned(),
+                kubectl_bin: kubectl.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            work.path(),
+            work.path(),
+        );
+        publisher
+            .publish(&change("p-10"), "l1_rollout", None)
+            .await
+            .unwrap();
+
+        let cf = std::fs::read_to_string(work.path().join("Containerfile.promote")).unwrap();
+        assert!(
+            cf.contains("FROM cogneva-registry.cogneva.svc.cluster.local:5000/cogneva:local"),
+            "一个名字读不出来时必须退回浮动 tag：{cf}"
+        );
+        assert!(
+            !cf.contains("main-abcdef012345"),
+            "读不全就报一个 rev 等于拿部分读当整体：{cf}"
         );
     }
 

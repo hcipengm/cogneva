@@ -2,6 +2,8 @@
 # 主应用 Pod 内的 puller 需要 apply L0 配置 configmap、重建 prompts configmap、
 # 对 cogneva 部署做金丝雀（set image / rollout pause|resume|undo|status）
 # 并读取 pod 健康信号。全部限定 namespace 内、resourceNames 白名单。
+# 推送端读金丝雀基底的那四个 deployment 也走这里：两个 Pod 都会构造推送端，
+# 按名可读是最小面（见下面那条只读规则）。
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -27,6 +29,17 @@ rules:
   - apiGroups: ["apps"]
     resources: ["replicasets"]
     verbs: ["get", "list"]
+  # 金丝雀基底的按名读：推送端要取这四个工作负载当前在跑的不可变 main tag，
+  # 而它也可能跑在本身份所在的 Pod 里（两个 Pod 都会构造推送端），所以这四个
+  # 名字要对本身份可读。只读——写权限仍然只有上面那一个目标（cogneva）。
+  # 为什么不一次 list：resourceNames 与 list 组合要求请求带对应的 field
+  # selector，集合级 list 在本身份下必被拒（现场读数 `cannot list resource
+  # "deployments" in API group "apps"`），而这条路径读不到时只会静默退回浮动
+  # tag —— 拿不到授权与"集群里确实还是浮动 tag"就再也分不出来了。
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["cogneva", "cogneva-security-gateway", "cogneva-sandbox-executor", "cogneva-evolution"]
+    verbs: ["get"]
   # 金丝雀看护：readiness 与 restart count。
   - apiGroups: [""]
     resources: ["pods"]

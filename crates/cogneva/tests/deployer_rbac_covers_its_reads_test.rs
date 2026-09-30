@@ -115,6 +115,8 @@ struct Rule {
     groups: Vec<String>,
     resources: Vec<String>,
     verbs: Vec<String>,
+    /// `resourceNames` 白名单：非空时这条规则**只**覆盖这几个对象。
+    names: Vec<String>,
 }
 
 fn yaml_docs(text: &str) -> Vec<serde_yaml::Value> {
@@ -136,10 +138,16 @@ fn strings(value: Option<&serde_yaml::Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn role() -> Role {
-    let text = read(RBAC);
-    let mut name = String::new();
-    let mut rules = Vec::new();
+/// The Roles a manifest file declares, plus who its RoleBindings bind.
+struct RoleFile {
+    roles: Vec<Role>,
+    bound_subjects: Vec<String>,
+    bound_role: Option<String>,
+}
+
+fn roles_in(relative: &str) -> RoleFile {
+    let text = read(relative);
+    let mut roles: Vec<Role> = Vec::new();
     let mut bound_subjects: Vec<String> = Vec::new();
     let mut bound_role: Option<String> = None;
 
@@ -147,12 +155,13 @@ fn role() -> Role {
         let kind = doc.get("kind").and_then(|k| k.as_str()).unwrap_or("");
         match kind {
             "Role" => {
-                name = doc
+                let name = doc
                     .get("metadata")
                     .and_then(|m| m.get("name"))
                     .and_then(|n| n.as_str())
                     .unwrap_or_default()
                     .to_string();
+                let mut rules = Vec::new();
                 for rule in doc
                     .get("rules")
                     .and_then(|r| r.as_sequence())
@@ -163,8 +172,10 @@ fn role() -> Role {
                         groups: strings(rule.get("apiGroups")),
                         resources: strings(rule.get("resources")),
                         verbs: strings(rule.get("verbs")),
+                        names: strings(rule.get("resourceNames")),
                     });
                 }
+                roles.push(Role { name, rules });
             }
             "RoleBinding" => {
                 for subject in doc
@@ -187,25 +198,42 @@ fn role() -> Role {
         }
     }
 
-    assert!(!rules.is_empty(), "{RBAC} 里没有解析出任何规则");
+    let parsed: usize = roles.iter().map(|r| r.rules.len()).sum();
     assert_eq!(
-        rules.len(),
+        parsed,
         text.lines()
             .filter(|l| l.trim_start().starts_with("- apiGroups:"))
             .count(),
-        "{RBAC} 的规则条数解析后对不上，比对结果不可信"
+        "{relative} 的规则条数解析后对不上，比对结果不可信"
     );
+
+    RoleFile {
+        roles,
+        bound_subjects,
+        bound_role,
+    }
+}
+
+fn role() -> Role {
+    let RoleFile {
+        mut roles,
+        bound_subjects,
+        bound_role,
+    } = roles_in(RBAC);
+
+    assert!(!roles.is_empty(), "{RBAC} 里没有解析出任何规则");
     assert!(
         bound_subjects.iter().any(|s| s == SERVICE_ACCOUNT),
         "{RBAC} 的 RoleBinding 没有把这个 Role 绑给 {SERVICE_ACCOUNT}：授了权却落到别的身份上"
     );
+    let name = roles[0].name.clone();
     assert_eq!(
         bound_role.as_deref(),
         Some(name.as_str()),
         "{RBAC} 的 RoleBinding 指的不是被读的那条 Role"
     );
 
-    Role { name, rules }
+    roles.remove(0)
 }
 
 impl Role {
@@ -225,6 +253,22 @@ impl Role {
             .flat_map(|r| r.verbs.iter().map(String::as_str))
             .collect();
         verbs.iter().all(|v| held.contains(v))
+    }
+}
+
+impl Rule {
+    /// Whether this rule covers the verb **for this object name**. A rule that
+    /// names `resourceNames` covers only those objects; a rule that names none
+    /// covers the whole collection. RBAC also refuses a collection-wide `list`
+    /// for a name-scoped rule unless the request carries a matching
+    /// `fieldSelector`, which is why the base read asks for each name
+    /// separately -- and why checking `get` here is the right question: a
+    /// name-scoped `list` would be a grant that cannot serve the request.
+    fn grants_named(&self, group: &str, resource: &str, verb: &str, name: &str) -> bool {
+        self.groups.iter().any(|g| g == group)
+            && self.resources.iter().any(|x| x == resource)
+            && self.verbs.iter().any(|v| v == verb)
+            && (self.names.is_empty() || self.names.iter().any(|n| n == name))
     }
 }
 
@@ -870,4 +914,116 @@ fn the_role_file_is_the_one_the_parity_gate_holds() {
         Path::new(&repo_root().join(RBAC)).is_file(),
         "{RBAC} 不在仓库里"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The publisher's base read
+// ---------------------------------------------------------------------------
+
+/// `const NAME: [&str; N] = ["a", "b", …];` 里的那些字符串。
+fn const_string_list(src: &str, name: &str) -> Vec<String> {
+    let needle = format!("const {name}: ");
+    let Some(start) = src.find(&needle) else {
+        return Vec::new();
+    };
+    let rest = &src[start + needle.len()..];
+    let Some(open) = rest.find("= [") else {
+        return Vec::new();
+    };
+    let body = &rest[open + 3..];
+    let Some(close) = body.find(']') else {
+        return Vec::new();
+    };
+    body[..close].split(',').filter_map(literal).collect()
+}
+
+/// `- name: KEY` 之后、下一个 env 条目之前那段里的 `value: "…"`。
+fn env_value(src: &str, key: &str) -> Option<String> {
+    let needle = format!("- name: {key}\n");
+    let start = src.find(&needle)? + needle.len();
+    let rest = &src[start..];
+    let end = rest.find("- name: ").unwrap_or(rest.len());
+    quoted(&rest[..end], "value: \"")
+}
+
+/// ConfigMap `data:` 里的一行 `KEY: "…"`。
+fn configmap_value(src: &str, key: &str) -> Option<String> {
+    quoted(src, &format!("  {key}: \""))
+}
+
+fn quoted(src: &str, needle: &str) -> Option<String> {
+    let start = src.find(needle)? + needle.len();
+    let tail = &src[start..];
+    let close = tail.find('"')?;
+    Some(tail[..close].to_string())
+}
+
+/// 推送端要读金丝雀基底那四个工作负载当前在跑的不可变 tag，而这条读数的命令
+/// 必须落在它自己身份的授权面内。这份判据把「谁会构造推送端」也跟着清单里的
+/// 开关读，不跟着注释走：两个 Pod 的基础配置都打开 GitOps，所以两个身份的授权
+/// 都要覆盖那四个名字。漏掉任何一个，读不到只会留一行 warn 后静默退回浮动 tag
+/// ——「拿不到授权」与「集群里确实还是浮动 tag」在判决里同形。
+#[test]
+fn every_identity_that_can_publish_can_read_the_canary_base_names() {
+    let publisher = read("crates/cog-reflection/src/gitops_publisher.rs");
+    let names = const_string_list(&publisher, "CANARY_BASE_DEPLOYMENTS");
+    assert_eq!(
+        names.len(),
+        4,
+        "金丝雀基底名单读出来是 {names:?}：这条判据靠它才算有内容"
+    );
+    assert!(
+        publisher.contains("\"deployment/{name}\""),
+        "基底不再按名读：resourceNames 授权下集合级 list 必被拒，而读不到只静默退回浮动 tag"
+    );
+
+    let app = env_value(
+        &read("deploy/k3s/deployment.yaml"),
+        "COGNEVA_GITOPS_ENABLED",
+    );
+    assert_eq!(
+        app.as_deref(),
+        Some("true"),
+        "app Pod 的 COGNEVA_GITOPS_ENABLED 读不出来：这条判据的前提就不成立了。\
+         若它是有意关掉的，把这个身份从这里去掉，别让它继续假装被覆盖"
+    );
+    let evolution = configmap_value(
+        &read("deploy/k3s/evolution-configmap.yaml"),
+        "COGNEVA_GITOPS_ENABLED",
+    );
+    assert_eq!(
+        evolution.as_deref(),
+        Some("true"),
+        "进化 Pod 的 COGNEVA_GITOPS_ENABLED 读不出来：同上"
+    );
+
+    for (who, files) in [
+        (
+            "app Pod（SA cogneva）",
+            &[
+                "deploy/k3s/gitops-puller-rbac.yaml",
+                "deploy/k3s/llm-admin-rbac.yaml",
+            ][..],
+        ),
+        (
+            "进化 Pod（SA cogneva-evolution）",
+            &["deploy/k3s/evolution-rbac.yaml"][..],
+        ),
+    ] {
+        // 一个 SA 上可以挂多条 Role，API server 按并集判权。
+        let rules: Vec<Rule> = files
+            .iter()
+            .flat_map(|f| roles_in(f).roles)
+            .flat_map(|r| r.rules)
+            .collect();
+        assert!(!rules.is_empty(), "{who} 一条规则都没读到");
+        for name in &names {
+            assert!(
+                rules
+                    .iter()
+                    .any(|r| r.grants_named("apps", "deployments", "get", name)),
+                "{who} 读不到 deployment/{name}：推送端会把它当成浮动 tag 的基底"
+            );
+        }
+    }
 }
