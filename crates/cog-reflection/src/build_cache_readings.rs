@@ -52,8 +52,10 @@
 //!   at all rather than one that is failing.
 //! - `cogneva_build_target_reclaimed_bytes_total{dir}` -- bytes removed so far.
 //! - `cogneva_build_target_last_reclaim_seconds{dir}` -- when a pass last ran,
-//!   and the process start when none has. A pass that never runs has to age
-//!   somewhere, or a cache over its cap reads the same as one being fixed.
+//!   and 0 when none has. A pass that never runs has to age somewhere, or a
+//!   cache over its cap reads the same as one being fixed; the epoch ages it
+//!   from something true, where the process start would age it from something
+//!   that has not happened.
 //! - `cogneva_build_target_scan_interval_seconds{dir}` -- the configured
 //!   interval, so a rule can say "no pass in six intervals" without a constant
 //!   that goes stale when the interval is configured differently.
@@ -194,10 +196,16 @@ pub struct BuildCacheReadings {
     reclaimed_bytes: AtomicU64,
     /// Passes that found the cache over its cap, by outcome.
     over_cap: Mutex<BTreeMap<String, u64>>,
-    /// Unix seconds of the last pass that ran. The process start until one does,
-    /// so a pass that never runs ages against a clock a rule can read: were this
-    /// absent until the first pass, "no pass has ever run" would be the one state
-    /// with no reading at all.
+    /// Unix seconds of the last pass that ran, and 0 until one does.
+    ///
+    /// A pass that never runs still has to age against a clock a rule can read --
+    /// were this absent until the first pass, "no pass has ever run" would be the
+    /// one state with no reading at all -- and the epoch is the one instant a pass
+    /// cannot have run at. Seeding it with the process start instead publishes a
+    /// pass that did not happen: a fresh process reads as "reclaimed 0s ago" while
+    /// `reclaimed_bytes_total` is still 0, and the stalled rule stays quiet for
+    /// the first six intervals of every process, which is exactly the window a
+    /// process that never finds a free slot spends over its cap.
     last_pass_at: AtomicU64,
 }
 
@@ -212,7 +220,7 @@ impl BuildCacheReadings {
             reclaim: Mutex::new(ReclaimState::default()),
             reclaimed_bytes: AtomicU64::new(0),
             over_cap: Mutex::new(BTreeMap::new()),
-            last_pass_at: AtomicU64::new(unix_now()),
+            last_pass_at: AtomicU64::new(0),
         }
     }
 
@@ -999,6 +1007,14 @@ mod tests {
         // No walk has happened, so nothing claims to have measured the cache.
         assert!(!names.contains(&BUILD_TARGET_OVER_LIMIT_METRIC));
         assert!(!names.contains(&BUILD_TARGET_BYTES_METRIC));
+        // No pass has happened either, and this series says when one last did.
+        // The epoch is the answer to "never"; the process start is not an answer
+        // to that question at all, and it is the plausible one -- a reader (or the
+        // stalled rule) takes a start-seeded value for a pass that just paid.
+        assert_eq!(
+            reading(&readings, BUILD_TARGET_LAST_RECLAIM_METRIC, None).await,
+            Some(0.0)
+        );
         let outcomes: Vec<&str> = metrics
             .iter()
             .filter(|m| m.name == BUILD_TARGET_OVER_CAP_METRIC)
