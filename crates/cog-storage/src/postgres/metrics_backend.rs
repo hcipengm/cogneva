@@ -30,11 +30,48 @@ fn series_key(labels: &HashMap<String, String>) -> String {
 /// and the gate that holds the two together has to explain the statement the
 /// backend actually runs rather than a copy of it. One hand-written copy of a
 /// statement is how a gate comes to certify something else.
+///
+/// Two probes per series, both against that index: one that walks the label
+/// sets in the index's own order (`labels >` the one just read, `LIMIT 1`), and
+/// one that reads the newest sample of the label set it landed on (`labels =`
+/// exact, `ORDER BY timestamp DESC LIMIT 1`). The recursion stops on the row
+/// the walk returns past the last label set, whose NULL the outer query drops,
+/// so the walk costs one descent per series and the answer costs one row per
+/// series. `jsonb` defines an ordering but no `min()`/`max()` aggregate, hence
+/// the `ORDER BY labels LIMIT 1` probes rather than an aggregate: an aggregate
+/// over the label sets would also have to read every sample behind them.
+///
+/// A single `DISTINCT ON (labels) ... ORDER BY labels, timestamp DESC` asks for
+/// the same rows and reads the same index, but it reaches its bound only if the
+/// planner hands it the series in group order, and whether the planner does so
+/// depends on how dense that index physically is. After half a million sample
+/// deletions (the retention path trims this log continuously) the live index
+/// carried two pages per entry, which put the estimated cost of the ordered
+/// walk above the estimated cost of reading the same rows out of the heap and
+/// sorting them: 120,457 rows sorted into a 9,344 kB temporary file, 848 ms per
+/// scrape, to return 32 rows -- index present and unused. Cost here is bounded
+/// by the answer whatever the planner believes about the index, because no node
+/// in this plan can see more rows than there are series.
 pub const GAUGE_LATEST_SQL: &str = r#"
-            SELECT DISTINCT ON (labels) value, labels, timestamp
-            FROM cog_metrics_samples
-            WHERE metric_type = 'gauge' AND name = $1
-            ORDER BY labels, timestamp DESC
+            WITH RECURSIVE series(labels) AS (
+                SELECT (SELECT s.labels FROM cog_metrics_samples s
+                        WHERE s.metric_type = 'gauge' AND s.name = $1
+                        ORDER BY s.labels LIMIT 1)
+              UNION ALL
+                SELECT (SELECT s.labels FROM cog_metrics_samples s
+                        WHERE s.metric_type = 'gauge' AND s.name = $1
+                          AND s.labels > series.labels
+                        ORDER BY s.labels LIMIT 1)
+                FROM series WHERE series.labels IS NOT NULL
+            )
+            SELECT latest.value, series.labels, latest.timestamp
+            FROM series
+            CROSS JOIN LATERAL (
+                SELECT s.value, s.timestamp FROM cog_metrics_samples s
+                WHERE s.metric_type = 'gauge' AND s.name = $1 AND s.labels = series.labels
+                ORDER BY s.timestamp DESC LIMIT 1
+            ) AS latest
+            WHERE series.labels IS NOT NULL
             "#;
 
 /// PostgreSQL-backed metrics backend.
@@ -87,12 +124,17 @@ impl PostgresMetricsBackend {
         // their current value out of this log, because a gauge's newest sample
         // *is* its value, so the per-series read is on the same path a scrape
         // endpoint hits continuously. `(name, metric_type)` alone cannot order
-        // that read the way `DISTINCT ON` needs, so the planner sorted every
-        // sample of the series -- measured at 124,631 rows returning 32, external
-        // merge of 8 MB to a temporary file, 1.7 s -- to answer a question whose
-        // answer is one row per series. With labels and the descending timestamp
-        // after the equality columns the walk is in group order and the sort is
-        // gone; `value` rides along so the walk never visits the heap at all.
+        // that read, so the planner sorted every sample of the series --
+        // measured at 124,631 rows returning 32, external merge of 8 MB to a
+        // temporary file, 1.7 s -- to answer a question whose answer is one row
+        // per series. Labels and the descending timestamp after the equality
+        // columns are what turn both parts of that read into one index descent
+        // per series: the label walk uses the labels column, the newest-sample
+        // probe the descending timestamp, and `value` rides along so neither
+        // has to visit the heap. The two are held together by
+        // `GAUGE_LATEST_SQL`, which is written so that no plan can spend more
+        // than one row per series on them, whatever the planner makes of this
+        // index's cost.
         sqlx::query(
             r#"
             CREATE INDEX IF NOT EXISTS idx_cog_metrics_latest_series
@@ -353,10 +395,10 @@ impl MetricsBackend for PostgresMetricsBackend {
     }
 
     async fn query_gauge_latest(&self, name: &str) -> SFResult<Vec<MetricSample>> {
-        // `DISTINCT ON` with a matching leading sort key gives the newest row
-        // per label set in one pass; ordering timestamps descending inside the
-        // group is what makes the first row the current value. The index that
-        // makes that a walk instead of a sort is created in `init_schema`, and
+        // Newest row per label set: the statement walks the label sets through
+        // the index and probes each one for its newest sample, so what it reads
+        // is one row per series rather than the history behind it. The index
+        // that carries both probes is created in `init_schema`, and
         // `GAUGE_LATEST_SQL` is the statement the two are held together by.
         let rows: Vec<(f64, serde_json::Value, DateTime<Utc>)> = sqlx::query_as(GAUGE_LATEST_SQL)
             .bind(name)

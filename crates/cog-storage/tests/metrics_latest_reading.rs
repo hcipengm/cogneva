@@ -5,17 +5,28 @@
 //! precisely so that a counter's current value is *not* read that way. The read
 //! is therefore on a path a scrape endpoint hits continuously, and what it may
 //! cost is bounded by the answer (one row per series) rather than by how much
-//! history the log is holding. `DISTINCT ON` reaches that bound only if the
-//! store can hand it the series in group order: without an index ending in
-//! `labels, timestamp DESC` the planner sorts every sample of the series, which
-//! for the largest gauge in the live log was 124,631 rows sorted to a temporary
-//! file to return 32.
+//! history the log is holding.
+//!
+//! The bound is asserted as rows: no node in the plan may see more rows than
+//! there are series to answer with. Node types alone are not enough to hold
+//! this, and the live log showed why. The same statement and the same index
+//! that walk the series in group order on a table built by this test — 120,000
+//! rows, index chosen, no sort — were answered by the planner with a bitmap
+//! scan plus a sort on the production table: 120,457 rows into a 9,344 kB
+//! temporary file, 848 ms, index present and unused. The difference is physical,
+//! not textual: half a million sample deletions (retention trims this log
+//! continuously) had left the live index carrying about twice the pages per
+//! entry, which put the estimated cost of the ordered walk above the estimated
+//! cost of reading the rows out of the heap and sorting them. A test that
+//! asserts the plan's shape can be green here while production sorts, because
+//! the planner's choice moves with a property of the table that a fresh fixture
+//! cannot have. A bound on the rows the plan sees does not move with it.
 //!
 //! Both halves are checked here because both are the same claim: the answers
-//! are the newest row of each series, and the plan that produced them neither
-//! sorted nor spilled. Neither can be checked without a server, so the test is
-//! ignored by default and needs `COGNEVA_TEST_DATABASE_URL` pointing at a
-//! throwaway database:
+//! are the newest row of each series, and the plan that produced them saw no
+//! more rows than that claim needs. Neither can be checked without a server, so
+//! the test is ignored by default and needs `COGNEVA_TEST_DATABASE_URL` pointing
+//! at a throwaway database:
 //!
 //! ```text
 //! COGNEVA_TEST_DATABASE_URL=postgres://user:pw@127.0.0.1:5432/probe \
@@ -88,6 +99,20 @@ fn collect_nodes(node: &serde_json::Value, found: &mut Vec<String>) {
     }
 }
 
+/// The most rows any one node of the plan saw.
+fn max_rows_seen(plan: &serde_json::Value) -> u64 {
+    let here = plan
+        .get("Actual Rows")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let below = plan
+        .get("Plans")
+        .and_then(|v| v.as_array())
+        .map(|children| children.iter().map(max_rows_seen).max().unwrap_or(0))
+        .unwrap_or(0);
+    here.max(below)
+}
+
 /// The blocks written to a temporary file anywhere in the plan.
 fn temp_written_blocks(plan: &serde_json::Value) -> u64 {
     let here = plan
@@ -136,9 +161,11 @@ async fn the_newest_sample_of_each_series_is_read_without_sorting_the_log() {
         );
     }
 
-    // The plan those answers came from: the series walked in group order rather
-    // than sorted. `EXPLAIN EXECUTE` runs the statement the backend runs, on one
-    // connection, because a prepared statement does not outlive its session.
+    // The plan those answers came from: the label sets walked in the index's
+    // order, one newest-sample probe each, and nothing along the way looking at
+    // the series' history. `EXPLAIN EXECUTE` runs the statement the backend
+    // runs, on one connection, because a prepared statement does not outlive
+    // its session.
     let mut conn = pool.acquire().await.unwrap();
     let prepare = format!("PREPARE probe_latest(text) AS {GAUGE_LATEST_SQL}");
     conn.execute(prepare.as_str()).await.unwrap();
@@ -165,6 +192,16 @@ async fn the_newest_sample_of_each_series_is_read_without_sorting_the_log() {
     assert!(
         kinds.iter().any(|kind| kind.contains("Index")),
         "the latest read did not go through an index at all: {kinds:?}"
+    );
+    // The bound that no plan shape can be read for: one row per series, plus the
+    // row that ends the walk. A plan that reads the history to answer shows up
+    // here however it is arranged, sorted or not.
+    let series_walk_rows = SERIES as u64 + 1;
+    let seen = max_rows_seen(plan);
+    assert!(
+        seen <= series_walk_rows,
+        "the latest read saw {seen} rows for {SERIES} series ({kinds:?}): what it reads is \
+         supposed to be bounded by the answer, not by the history behind it"
     );
 
     sqlx::query("DROP TABLE IF EXISTS cog_metrics_samples")
