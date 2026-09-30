@@ -87,6 +87,15 @@ jobs:
               done
             exit 1
           }
+      # The keypair the contribution admin hands out is written by our own
+      # encoder, so every test we can write about it agrees with itself; the
+      # question that decides whether it works is whether the tool that will
+      # actually use the key reads the PEM. That binary ships on the runner, so
+      # this ran nowhere only because it was ignored and never named -- the same
+      # account the live-DB steps below settle. It is fast, and it panics
+      # rather than passes when the binary is missing, so it cannot go quiet.
+      - name: The generated SSH keypair is readable by ssh-keygen
+        run: cargo test -p cog-gateway --lib -- --ignored
       - name: Live-DB partition tests
         run: cargo test -p cog-storage --test partition_maintainer -- --ignored
         env:
