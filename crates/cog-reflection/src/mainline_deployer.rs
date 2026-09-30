@@ -6071,22 +6071,28 @@ fn stage_rollout_manifest(text: &str, origin: &str, out: &Path) -> SFResult<Opti
     Ok(Some(out.to_path_buf()))
 }
 
-/// Where one target's manifest gets staged before it is applied.
+/// Where one manifest package gets staged before it is applied.
 ///
 /// The name has to be different on **every call**: two executors in one process
-/// staging the same deployment (parallel tests are two executors, and a caller
+/// staging the same package (parallel tests are two executors, and a caller
 /// that ever rolls two targets at once is no different) write one path, and
 /// `std::fs::write` truncates before it writes -- so the reader that wins the
 /// race parses a manifest torn in half and treats it as a broken file. The pid
 /// separates processes and the counter separates callers inside one; both are
 /// needed, since either alone still collides.
-fn staged_manifest_path(deployment: &str) -> PathBuf {
+///
+/// `label` names the package: `target-<deployment>` for one target's manifest,
+/// `support` for the support bundle. Both are staged by the same rule because
+/// both are written by the same process: a fixed name for the support bundle
+/// left two parallel end-to-end tests tearing one file in half, which surfaced
+/// as `invalid YAML document: could not find expected ':'` in whichever of them
+/// parsed second.
+fn staged_manifest_path(label: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "mainline-target-{}-{}-{seq}.yaml",
-        deployment,
+        "mainline-{label}-{}-{seq}.yaml",
         std::process::id()
     ))
 }
@@ -6793,8 +6799,11 @@ impl RolloutExecutor {
                 let text = tokio::fs::read_to_string(&path)
                     .await
                     .map_err(|e| SFError::IO(format!("read {}: {e}", path.display())))?;
-                let staged =
-                    stage_rollout_manifest(&text, &key, &staged_manifest_path(&t.deployment))?;
+                let staged = stage_rollout_manifest(
+                    &text,
+                    &key,
+                    &staged_manifest_path(&format!("target-{}", t.deployment)),
+                )?;
                 if let Some(staged_path) = staged {
                     let path_arg = staged_path.to_string_lossy().to_string();
                     info!(
@@ -7995,12 +8004,9 @@ impl RolloutExecutor {
                     .await
                     .map_err(|e| SFError::IO(format!("read {}: {e}", support.display())))
                     .map_err(|e| classify_before_any_change("support", "", e))?;
-                let staged = stage_rollout_manifest(
-                    &text,
-                    "support.yaml",
-                    &std::env::temp_dir().join("mainline-support.yaml"),
-                )
-                .map_err(|e| classify_before_any_change("support", "", e))?;
+                let staged =
+                    stage_rollout_manifest(&text, "support.yaml", &staged_manifest_path("support"))
+                        .map_err(|e| classify_before_any_change("support", "", e))?;
                 match staged {
                     Some(path) => {
                         let support_arg = path.to_string_lossy().to_string();
@@ -8027,12 +8033,18 @@ impl RolloutExecutor {
                             manifest = %support_arg,
                             "mainline rollout: applying support manifests"
                         );
-                        self.clear_superseded_env_values(&path)
-                            .await
-                            .map_err(|e| classify_before_any_change("support", "", e))?;
-                        self.run_kubectl(&["apply", "-f", &support_arg], 120)
-                            .await
-                            .map_err(|e| classify_before_any_change("support", "", e))?;
+                        let outcome = async {
+                            self.clear_superseded_env_values(&path).await?;
+                            self.run_kubectl(&["apply", "-f", &support_arg], 120)
+                                .await
+                                .map(|_| ())
+                        }
+                        .await;
+                        // 这份暂存件只服务这一次 apply，名字又按实例唯一（不再被下一轮覆盖），
+                        // 所以用完就删：留着就是随每一次滚动在临时目录里堆一份，而没有任何
+                        // 回收方认得它们。失败那一路也删——它派生自包里那份清单，包还在。
+                        let _ = tokio::fs::remove_file(&path).await;
+                        outcome.map_err(|e| classify_before_any_change("support", "", e))?;
                         let configs_after = self.configmap_contents().await;
                         // 支撑清单里除了 ConfigMap/Service，还有后端与集群内
                         // registry 这些工作负载，而目标部署的镜像要从这个 registry
@@ -14931,6 +14943,9 @@ exit 0
         // 于是恒为假——那条断言在种植回归下照样绿。
         let staged_path_file = dir.join("staged.path");
         let staged_state = dir.join("staged.state");
+        // 支撑包那份暂存件的同类读数，理由同下：只在 apply 的实参里看得到。
+        let support_path_file = dir.join("support.path");
+        let support_state = dir.join("support.state");
         // 热更新面覆盖到的段（tuning）变了：没有值得滚的理由，配置文档照样变。
         // 内层文档要按 JSON 字符串嵌进 configmap 列表里，引号得转义。
         let (before_body, after_body) = if hot_only {
@@ -14966,6 +14981,9 @@ case "$*" in
           *mainline-target-*)
             printf '%s' "$a" > '{staged_path_file}'
             if [ -f "$a" ]; then echo present > '{staged_state}'; else echo missing > '{staged_state}'; fi ;;
+          *mainline-support*)
+            printf '%s' "$a" > '{support_path_file}'
+            if [ -f "$a" ]; then echo present > '{support_state}'; else echo missing > '{support_state}'; fi ;;
         esac
       fi
       prev="$a"
@@ -15019,6 +15037,8 @@ exit 0
             settled = settled.display(),
             staged_path_file = staged_path_file.display(),
             staged_state = staged_state.display(),
+            support_path_file = support_path_file.display(),
+            support_state = support_state.display(),
             before_body = before_body,
             after_body = after_body,
             expect_patch = if hot_only { "no" } else { "yes" }
@@ -15162,8 +15182,8 @@ spec:
     /// 于是把它当成"这一版坏了"。
     #[test]
     fn staged_manifest_paths_do_not_collide() {
-        let first = staged_manifest_path("cogneva");
-        let second = staged_manifest_path("cogneva");
+        let first = staged_manifest_path("target-cogneva");
+        let second = staged_manifest_path("target-cogneva");
         assert_ne!(
             first, second,
             "two calls for one deployment staged to the same path"
@@ -15177,6 +15197,20 @@ spec:
             "the name has to separate processes too, not just callers: {name}"
         );
         assert_eq!(first.parent().unwrap(), std::env::temp_dir());
+
+        // 支撑包走的是同一条规矩（两个调用点、一份规则）：它也曾用固定文件名，
+        // 于是同一进程里并行的两次 rollout 互相覆盖，读的一方解析到被撕成两半的清单。
+        let support = staged_manifest_path("support");
+        assert_ne!(support, staged_manifest_path("support"));
+        let support_name = support.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            support_name.starts_with("mainline-support-"),
+            "{support_name}"
+        );
+        assert!(
+            support_name.contains(&std::process::id().to_string()),
+            "the support name has to separate processes too: {support_name}"
+        );
     }
 
     /// 暂存件**用完就删**。
@@ -15230,6 +15264,60 @@ spec:
         assert!(
             !Path::new(path).exists(),
             "the staged manifest outlived the apply that used it: {path}"
+        );
+    }
+
+    /// 支撑包的那半份暂存件：路径**每次动作都不同**、用完就删。
+    ///
+    /// 与目标清单同一条规矩，但它是另一个调用点，而规矩只落在其中一个调用点上就等于
+    /// 没落：支撑包曾用固定文件名 `mainline-support.yaml`，于是同一进程里并行的两次
+    /// rollout 在 `render_docs` 与 `apply` 之间互相覆盖——实测（本机全量门禁）两个用例
+    /// 同时跑，读到的一方报 `invalid YAML document: could not find expected ':'`，把
+    /// 一份被撕成两半的清单当成了"这一版坏了"。两次动作记下来的路径必须不同，才是
+    /// "按动作取路径"而不是"按固定名字取路径"。
+    #[tokio::test]
+    async fn the_support_manifest_is_staged_per_run_and_removed_after_the_apply() {
+        let mut recorded = Vec::new();
+        for _ in 0..2 {
+            let tmp = tempfile::tempdir().unwrap();
+            let bin_dir = tmp.path().to_path_buf();
+            let (manifests, _log) = fake_kubectl_config_effect(&bin_dir, true);
+            let executor = RolloutExecutor::new(
+                bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+                "cogneva",
+                1,
+                1,
+                60,
+                60,
+            );
+            executor
+                .run(&config_effect_executor(&manifests))
+                .await
+                .expect("rollout should succeed");
+
+            let path = std::fs::read_to_string(bin_dir.join("support.path"))
+                .unwrap_or_else(|e| panic!("no support bundle was ever applied through -f: {e}"));
+            let path = path.trim().to_string();
+            assert!(
+                path.contains("mainline-support-"),
+                "the recorded apply argument is not a staged support bundle: {path}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(bin_dir.join("support.state"))
+                    .unwrap()
+                    .trim(),
+                "present",
+                "the file apply was handed was not on disk: {path}"
+            );
+            assert!(
+                !Path::new(&path).exists(),
+                "the staged support bundle outlived the apply that used it: {path}"
+            );
+            recorded.push(path);
+        }
+        assert_ne!(
+            recorded[0], recorded[1],
+            "two rollouts staged the support bundle to one path"
         );
     }
 
