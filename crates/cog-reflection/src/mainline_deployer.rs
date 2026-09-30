@@ -1795,6 +1795,80 @@ pub struct MainlineDeployer {
     governance_drift: Option<std::sync::Arc<crate::governance_drift::GovernanceDrift>>,
 }
 
+/// 平台读失败的四支——只有在这一层还分得开。
+///
+/// 折成一句错误文本会让"连不上"与"回了个 404"在调用方同形，而 CI 判据要在没有
+/// 结论时说出的正是**哪一种没能读到**。状态码与传输错误只在这里还在手上，往上一层
+/// 就只剩一个 `None`。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PlatformReadFailure {
+    /// `api_base` 拼不出 host:port[/prefix]：我们的配置，不是平台不通。
+    BadApiBase,
+    /// 连接、写、读失败或超时。
+    Transport,
+    /// 平台答了，但不是 200。
+    Http(u16),
+    /// 200 回来了，body 却用不成：不是 JSON，或被截断成半截。
+    UnusableBody,
+}
+
+/// 一轮问下来没有结论时，**为什么**没有。
+///
+/// `None` 在判据里是一个值，却有三个来源：被问的一方还没给结论、这条读的路没走通、
+/// 问到了而响应里没有可判的东西。三支各有各的主人（等上游、修网关/凭证、看路径与
+/// 配置），落在同一个标签里就是把三个人的活记成一个人的，而失败的那一支永远有借口。
+/// 所以每一轮 `no_evidence` 都要带上它的原因，取值域是闭集，每个取值对着一个动作。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CiNoVerdictReason {
+    /// 读到了、里面有检查，但至少一条还没有结论。动作只有一个：等下一轮。
+    Pending,
+    /// 读到了、里面一条检查都没有。**这是"问到了、没有东西"，不是"没问到"**——
+    /// 不跑 CI 的仓库与问错了路径在这里同形，所以它单独占一格，不并进读失败。
+    NoRuns,
+    /// 提交状态那条兜底接口也没给出可判的状态。
+    StatusUnreadable,
+    /// `api_base` 拼不出来 ⇒ 配置面。
+    BadApiBase,
+    /// 连接、写、读失败或超时 ⇒ 这条出网的路（网关与它背后那段网络）。
+    ConnectFailed,
+    /// 200 回来了、body 用不成 ⇒ 响应在途中被弄坏了（截断也算），主人在代理这一段。
+    UnusableBody,
+    /// 非 200 的状态码，按主人分格见 [`Self::label`]。
+    Http(u16),
+}
+
+impl CiNoVerdictReason {
+    /// 读数的标签取值域：闭集，每个取值对着一个可做动作的主人。
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::NoRuns => "no_runs",
+            Self::StatusUnreadable => "status_unreadable",
+            Self::BadApiBase => "bad_api_base",
+            Self::ConnectFailed => "connect_failed",
+            Self::UnusableBody => "unusable_body",
+            // 401/403 是同一件事的两张脸：凭证被拒，或凭证所带的额度被限（GitHub 的
+            // 二级限流也回 403）。两脸同一主人，所以同一格。
+            Self::Http(401) | Self::Http(403) => "http_auth_rejected",
+            Self::Http(404) => "http_not_found",
+            Self::Http(429) => "http_rate_limited",
+            Self::Http(code) if (500..=599).contains(&code) => "http_upstream_error",
+            Self::Http(_) => "http_other",
+        }
+    }
+}
+
+impl From<PlatformReadFailure> for CiNoVerdictReason {
+    fn from(failure: PlatformReadFailure) -> Self {
+        match failure {
+            PlatformReadFailure::BadApiBase => Self::BadApiBase,
+            PlatformReadFailure::Transport => Self::ConnectFailed,
+            PlatformReadFailure::UnusableBody => Self::UnusableBody,
+            PlatformReadFailure::Http(code) => Self::Http(code),
+        }
+    }
+}
+
 /// git 的 tree-ish 形式：`<rev>:<path>`，路径**不带前导斜杠**。
 ///
 /// 带斜杠的那一版（`<rev>:/<path>`）不是「路径多了一个字符」这么轻：git 会把整串
@@ -2521,13 +2595,18 @@ impl MainlineDeployer {
     /// 平台 API 的只读 GET：明文 HTTP 打到安全网关的透传端点（凭证由网关在
     /// 出口注入，本进程零 token），与 registry 客户端同形。非 200、不可达、
     /// 响应不是 JSON 一律 Err——调用方按"没有证据"处理，不按失败处理。
-    async fn platform_get_json(&self, api_base: &str, path: &str) -> SFResult<serde_json::Value> {
+    ///
+    /// 失败**分形状**带回来而不是折成一句错误文本：判据要在没有结论时说出是哪一种
+    /// 没能读到，而状态码与传输错误只有在这一层还在手上（见 [`PlatformReadFailure`]，
+    /// 它折成读数标签的那一步在 [`CiNoVerdictReason`]）。
+    async fn platform_get_json(
+        &self,
+        api_base: &str,
+        path: &str,
+    ) -> Result<serde_json::Value, PlatformReadFailure> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let (host, port, prefix) = split_http_base(api_base).ok_or_else(|| {
-            SFError::Config(format!(
-                "platform api base {api_base:?} is not http://host:port[/prefix]"
-            ))
-        })?;
+        let (host, port, prefix) =
+            split_http_base(api_base).ok_or(PlatformReadFailure::BadApiBase)?;
         let req = format!(
             "GET {prefix}{path} HTTP/1.1\r\nHost: {host}\r\nAccept: application/json\r\n\
              User-Agent: cogneva-mainline-deployer\r\nConnection: close\r\n\r\n"
@@ -2537,70 +2616,105 @@ impl MainlineDeployer {
             tokio::net::TcpStream::connect((host.as_str(), port)),
         )
         .await
-        .map_err(|_| SFError::IO(format!("platform api {host}:{port} connect timed out")))?
-        .map_err(|e| SFError::IO(format!("platform api {host}:{port} connect failed: {e}")))?;
+        .map_err(|_| PlatformReadFailure::Transport)?
+        .map_err(|_| PlatformReadFailure::Transport)?;
         stream
             .write_all(req.as_bytes())
             .await
-            .map_err(|e| SFError::IO(format!("platform api request write failed: {e}")))?;
+            .map_err(|_| PlatformReadFailure::Transport)?;
         let mut raw = Vec::new();
         tokio::time::timeout(Duration::from_secs(60), stream.read_to_end(&mut raw))
             .await
-            .map_err(|_| SFError::IO("platform api read timed out".into()))?
-            .map_err(|e| SFError::IO(format!("platform api read failed: {e}")))?;
-        let (status, body) = parse_http_response(&raw)
-            .ok_or_else(|| SFError::IO("platform api returned a malformed HTTP response".into()))?;
+            .map_err(|_| PlatformReadFailure::Transport)?
+            .map_err(|_| PlatformReadFailure::Transport)?;
+        let (status, body) = parse_http_response(&raw).ok_or(PlatformReadFailure::UnusableBody)?;
         if status != 200 {
-            return Err(SFError::IO(format!("platform GET {path} -> {status}")));
+            return Err(PlatformReadFailure::Http(status));
         }
-        serde_json::from_slice(&body)
-            .map_err(|e| SFError::IO(format!("platform GET {path} returned non-JSON: {e}")))
+        serde_json::from_slice(&body).map_err(|_| PlatformReadFailure::UnusableBody)
     }
 
     /// 该 rev 在某平台上的 CI 结论：check runs 优先，提交状态兜底，折判据与
     /// 落地通道共用同一份（取不到就是 `None`，两个消费面都不许猜）。
-    async fn platform_ci_verdict(&self, api_base: &str, repo: &str, rev: &str) -> Option<bool> {
+    ///
+    /// 第二个返回值只在没有结论时给出，说的是**为什么**没有（[`CiNoVerdictReason`]）。
+    /// 它取自 **check-runs 那一次读**：那一次成功、只是内容里没有结论（还没跑完 /
+    /// 一条检查都没有）时，原因就是内容说的那个；那一次失败时，原因就是它的失败形状。
+    /// 兜底那条 status 接口自己的失败**不**改写原因——两处都没有结论时，先问的那个
+    /// 更接近真相（"上游还在跑"与"这条路不通"是两种话，后者才需要动作）。
+    async fn platform_ci_verdict(
+        &self,
+        api_base: &str,
+        repo: &str,
+        rev: &str,
+    ) -> (Option<bool>, Option<CiNoVerdictReason>) {
         let mut conclusions: Vec<String> = Vec::new();
         let mut saw_signal = false;
         let mut pending = false;
-        if let Ok(v) = self
+        // 原因由这一段的形状决定（读到内容 / 读失败），没有"默认值"这种中间态：
+        // 两条分支各给一个，读的人不会看到一个谁都没写的值。
+        let mut reason;
+        match self
             .platform_get_json(api_base, &format!("/repos/{repo}/commits/{rev}/check-runs"))
             .await
         {
-            if let Some(runs) = v.get("check_runs").and_then(|r| r.as_array()) {
-                for run in runs {
-                    saw_signal = true;
-                    match run.get("conclusion").and_then(|c| c.as_str()) {
-                        Some(c) => conclusions.push(c.to_string()),
-                        // 结论为 null = 这条检查还在跑。此刻下结论等于拿半个结果判死刑。
-                        None => pending = true,
+            Ok(v) => {
+                if let Some(runs) = v.get("check_runs").and_then(|r| r.as_array()) {
+                    for run in runs {
+                        saw_signal = true;
+                        match run.get("conclusion").and_then(|c| c.as_str()) {
+                            Some(c) => conclusions.push(c.to_string()),
+                            // 结论为 null = 这条检查还在跑。此刻下结论等于拿半个结果判死刑。
+                            None => pending = true,
+                        }
                     }
                 }
+                reason = if pending {
+                    CiNoVerdictReason::Pending
+                } else {
+                    CiNoVerdictReason::NoRuns
+                };
             }
+            Err(failure) => reason = failure.into(),
         }
         if let Some(verdict) =
             cog_core::contract::ci::fold_ci_signals(saw_signal, pending, &conclusions)
         {
-            return Some(verdict);
+            return (Some(verdict), None);
         }
         // 只用提交状态上报 CI 的仓库（没有 check runs），与落地通道同一条兜底。
-        let status = self
+        if let Ok(status) = self
             .platform_get_json(api_base, &format!("/repos/{repo}/commits/{rev}/status"))
             .await
-            .ok()?;
-        match status.get("state").and_then(|s| s.as_str()) {
-            Some("success") => Some(true),
-            Some("failure") | Some("error") => Some(false),
-            _ => None,
+        {
+            match status.get("state").and_then(|s| s.as_str()) {
+                Some("success") => return (Some(true), None),
+                Some("failure") | Some("error") => return (Some(false), None),
+                // 接口答了、状态字段却不可判。只有 check-runs 那边本来就什么也没说时才
+                // 换成这一格：两边都没给出可判的东西，这一格比 `no_runs` 更贴近实情。
+                // 反过来说，check-runs 说的是"还在跑"时不让它覆盖——那是两种话里更准的那个。
+                _ if reason == CiNoVerdictReason::NoRuns => {
+                    reason = CiNoVerdictReason::StatusUnreadable;
+                }
+                _ => {}
+            }
         }
+        (None, Some(reason))
     }
 
     /// 要滚的这个 rev 在上游各平台的 CI 结论。`Some(false)` = 至少一个平台
     /// 给出了明确的失败结论；`None` = 没有证据（没配基址、平台不可达、仓库
     /// 不用 CI、检查还没跑完）。三支各自的读数在 [`Self::record_ci_verdict_reading`]
     /// 里留：`None` 与 `Some(true)` 都放行，事后只有读数能把它们分开。
+    ///
+    /// 折出 `None` 时**还要问一句为什么**（[`Self::record_ci_verdict_reason_reading`]）：
+    /// `no_evidence` 那一格同时装着「还在跑」「路不通」「响应里没东西」，三支各有各的
+    /// 主人，只有原因读数能把它们分开。原因逐上游记，所以两个读数的关系是
+    /// `sum(reason) = no_evidence × 配置的上游数`；折出结论的那些轮不问原因——它已经
+    /// 在 `verdict` 那一格里说完了。
     async fn ci_verdict_for_rev(&self, rev: &str) -> Option<bool> {
         let mut verdicts = Vec::new();
+        let mut reasons = Vec::new();
         for up in &self.cfg.upstreams {
             let Some(base) = up
                 .api_base
@@ -2608,11 +2722,18 @@ impl MainlineDeployer {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             else {
+                // 配了这个上游却没给基址：它不会去问，也就永远不会有结论，
+                // 属于配置面。记成原因，别让它悄悄消失。
+                reasons.push(CiNoVerdictReason::BadApiBase);
                 continue;
             };
             let repo = up.repo.trim().trim_end_matches(".git");
-            if let Some(v) = self.platform_ci_verdict(base, repo, rev).await {
+            let (verdict, reason) = self.platform_ci_verdict(base, repo, rev).await;
+            if let Some(v) = verdict {
                 verdicts.push(v);
+            }
+            if let Some(r) = reason {
+                reasons.push(r);
             }
         }
         let verdict = if verdicts.iter().any(|v| !*v) {
@@ -2623,6 +2744,9 @@ impl MainlineDeployer {
             Some(true)
         };
         self.record_ci_verdict_reading(verdict).await;
+        if verdict.is_none() {
+            self.record_ci_verdict_reason_reading(&reasons).await;
+        }
         verdict
     }
 
@@ -2658,6 +2782,36 @@ impl MainlineDeployer {
                 labels,
             )
             .await;
+    }
+
+    /// 没有结论时的第二读数：**为什么**没有，按原因分格。
+    ///
+    /// `no_evidence` 那一格同时装着「被问的一方还没给结论」「这条读的路没走通」
+    /// 「问到了而响应里没有可判的东西」，三支各有各的主人（等下一轮、修网关与凭证、
+    /// 看配置与路径拼接），合成一格就是把三个人的活记成一个人的，而失败的那一支
+    /// 永远有借口。所以折出 `None` 的每一轮再按上游各记一格原因；`verdict` 那一格
+    /// 照旧记，两个读数各自成立。原因只在没有结论时记——有结论的轮已经在 `verdict`
+    /// 里说完了，这也是它不与 `pass`/`fail` 重复计数的原因。
+    ///
+    /// 两个读数的关系是可核的：折出 `None` 当且仅当所有配了基址的上游都没给结论，
+    /// 所以每轮 `no_evidence` 恰好贡献「配置的上游数」条原因，即
+    /// `sum(reason) = no_evidence × 上游数`。这个倍数不是噪声：它随配置变，靠它
+    /// 才能看出原因是「哪一条上游在沉默」而不是「整条路一起断了」。
+    async fn record_ci_verdict_reason_reading(&self, reasons: &[CiNoVerdictReason]) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        for reason in reasons {
+            let mut labels = std::collections::HashMap::new();
+            labels.insert("reason".to_string(), reason.label().to_string());
+            let _ = metrics
+                .record_counter(
+                    cog_core::metric_names::MAINLINE_CI_NO_VERDICT_REASON_TOTAL,
+                    1.0,
+                    labels,
+                )
+                .await;
+        }
     }
 
     /// registry 上某 tag 当前内容构建自哪个 rev：manifest → config blob →
@@ -11244,7 +11398,9 @@ exit 0
     /// 读到"在别的读数里是同一格。
     #[tokio::test]
     async fn the_ci_verdict_reading_separates_pass_from_no_evidence() {
-        use cog_core::metric_names::MAINLINE_CI_VERDICT_TOTAL;
+        use cog_core::metric_names::{
+            MAINLINE_CI_NO_VERDICT_REASON_TOTAL, MAINLINE_CI_VERDICT_TOTAL,
+        };
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
@@ -11303,6 +11459,190 @@ exit 0
             rows.len(),
             3,
             "三支各一行，多出来的行不属于这个标签: {rows:?}"
+        );
+
+        // 没有结论的那一轮还要说出是**哪一种**没有：连不上是这条路（网关与它背后
+        // 那段网络）的事，不是"上游还在跑"。两格分开，读的人才知道该做什么。
+        let rows = metrics
+            .query_counter_totals(MAINLINE_CI_NO_VERDICT_REASON_TOTAL.as_str())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "有结论的轮不该产生原因行，没有结论的轮必须产生一行: {rows:?}"
+        );
+        assert_eq!(
+            rows[0].labels.get("reason").map(String::as_str),
+            Some("connect_failed"),
+            "连不上这一支的主人在这条路上，不能被记成「上游还没跑完」: {rows:?}"
+        );
+        assert_eq!(rows[0].value, 1.0, "{rows:?}");
+    }
+
+    /// 沉默的原因标签：闭集、两两不同，每个取值对着一个可做动作的主人。
+    #[test]
+    fn ci_no_verdict_reasons_are_a_closed_set_of_owners() {
+        use CiNoVerdictReason as R;
+        // 读失败的四种形状各有各的落点，不能折成同一句错误文本。
+        assert_eq!(R::from(PlatformReadFailure::BadApiBase), R::BadApiBase);
+        assert_eq!(R::from(PlatformReadFailure::Transport), R::ConnectFailed);
+        assert_eq!(R::from(PlatformReadFailure::UnusableBody), R::UnusableBody);
+        assert_eq!(R::from(PlatformReadFailure::Http(503)), R::Http(503));
+        // 401 与 403 是同一件事的两张脸（凭证被拒 / 凭证所带的额度被限），同格。
+        assert_eq!(R::Http(401).label(), R::Http(403).label());
+
+        let cases = [
+            (R::Pending, "pending"),
+            (R::NoRuns, "no_runs"),
+            (R::StatusUnreadable, "status_unreadable"),
+            (R::BadApiBase, "bad_api_base"),
+            (R::ConnectFailed, "connect_failed"),
+            (R::UnusableBody, "unusable_body"),
+            (R::Http(401), "http_auth_rejected"),
+            (R::Http(404), "http_not_found"),
+            (R::Http(429), "http_rate_limited"),
+            (R::Http(500), "http_upstream_error"),
+            (R::Http(418), "http_other"),
+        ];
+        for (reason, label) in cases {
+            assert_eq!(reason.label(), label);
+        }
+        // 两格同形等于又把两种主人合回一格，所以标签两两不同。
+        let mut labels: Vec<&str> = cases.iter().map(|(r, _)| r.label()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), cases.len());
+    }
+
+    /// 没有结论时要说出**哪一种**没有：三支各有各的主人，也就是三种不同的动作。
+    ///
+    /// `no_evidence` 一格同时装着「上游还在跑」（等下一轮）、「这条路没走通」
+    /// （修网关或凭证）、「问到了而响应里没有可判的东西」（看配置与路径拼接）。
+    /// 合成一格就是把三个人的活记成一个人的，而失败的那一支永远有借口——实测正是
+    /// 这样：36 小时里 20 轮判定有 17 轮落在这一格，读的人只能看到"门禁又没读到"，
+    /// 而其中至少有七轮问的是检查早已全绿跑完的 rev。
+    #[tokio::test]
+    async fn the_missing_verdict_says_which_kind_of_silence_it_was() {
+        use cog_core::metric_names::{
+            MAINLINE_CI_NO_VERDICT_REASON_TOTAL, MAINLINE_CI_VERDICT_TOTAL,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        // 一个上游、给定基址，读数落进同一个后端：每条上游的沉默都进同一本账。
+        let asks = |base: &str, metrics: &std::sync::Arc<cog_storage::MemoryMetricsBackend>| {
+            let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+            cfg.upstreams.truncate(1);
+            cfg.upstreams[0].api_base = Some(base.to_string());
+            MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+                .with_metrics(metrics.clone())
+        };
+
+        // 检查还在跑：动作是等下一轮。兜底那条接口答了却没结论，也不许把原因改写
+        // ——先问的那一次更接近真相。
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(r#"{"check_runs":[{"conclusion":null}]}"#),
+            http_200(r#"{"state":"pending"}"#),
+        ])
+        .await;
+        let deployer = asks(&format!("http://{endpoint}/github"), &metrics);
+        assert_eq!(deployer.ci_verdict_for_rev("aaa").await, None);
+        handle.await.unwrap();
+
+        // 问到了、一条检查都没有：这是"没有东西"，不是"没问到"。
+        let (endpoint, handle) =
+            fake_registry(vec![http_200(r#"{"check_runs":[]}"#), HTTP_404.to_string()]).await;
+        let deployer = asks(&format!("http://{endpoint}/github"), &metrics);
+        assert_eq!(deployer.ci_verdict_for_rev("bbb").await, None);
+        handle.await.unwrap();
+
+        // 兜底那条接口也答不出可判的东西：两处都没结论，这一格比"没有检查"更贴近实情。
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(r#"{"check_runs":[]}"#),
+            http_200(r#"{"state":"unknown"}"#),
+        ])
+        .await;
+        let deployer = asks(&format!("http://{endpoint}/github"), &metrics);
+        assert_eq!(deployer.ci_verdict_for_rev("ccc").await, None);
+        handle.await.unwrap();
+
+        // 凭证被拒（403 也含二级限流）：主人是网关那一侧的凭证。
+        let (endpoint, handle) =
+            fake_registry(vec![http_status(403, "Forbidden"), HTTP_404.to_string()]).await;
+        let deployer = asks(&format!("http://{endpoint}/github"), &metrics);
+        assert_eq!(deployer.ci_verdict_for_rev("ddd").await, None);
+        handle.await.unwrap();
+
+        // 200 回来了、body 不是 JSON：响应在途中被弄坏了，主人在代理这一段。
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(r#"<html>gateway error</html>"#),
+            HTTP_404.to_string(),
+        ])
+        .await;
+        let deployer = asks(&format!("http://{endpoint}/github"), &metrics);
+        assert_eq!(deployer.ci_verdict_for_rev("eee").await, None);
+        handle.await.unwrap();
+
+        // 配了这个上游却没给基址：一个请求都不会发出去，主人是配置面。
+        let deployer = asks("   ", &metrics);
+        assert_eq!(deployer.ci_verdict_for_rev("fff").await, None);
+
+        // 一轮里两条上游都没说话：原因各记一次。这个倍数是可核的——它随配置变，
+        // 靠它才能把"某一条在上游沉默"与"整条路一起断了"分开。
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams[0].api_base = Some("http://127.0.0.1:1/github".into());
+        cfg.upstreams[1].api_base = Some("http://127.0.0.1:1/gitee".into());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_metrics(metrics.clone());
+        assert_eq!(deployer.ci_verdict_for_rev("ggg").await, None);
+
+        let rows = metrics
+            .query_counter_totals(MAINLINE_CI_NO_VERDICT_REASON_TOTAL.as_str())
+            .await
+            .unwrap();
+        let count = |want: &str| {
+            rows.iter()
+                .find(|r| r.labels.get("reason").map(String::as_str) == Some(want))
+                .map(|r| r.value)
+        };
+        assert_eq!(count("pending"), Some(1.0), "{rows:?}");
+        assert_eq!(count("no_runs"), Some(1.0), "{rows:?}");
+        assert_eq!(count("status_unreadable"), Some(1.0), "{rows:?}");
+        assert_eq!(count("http_auth_rejected"), Some(1.0), "{rows:?}");
+        assert_eq!(count("unusable_body"), Some(1.0), "{rows:?}");
+        assert_eq!(count("bad_api_base"), Some(1.0), "{rows:?}");
+        assert_eq!(
+            count("connect_failed"),
+            Some(2.0),
+            "两条上游各沉默一次: {rows:?}"
+        );
+        assert_eq!(
+            count("http_not_found"),
+            None,
+            "兜底那一次读的 404 不许改写原因，否则主人就跟着最后一次失败跑了: {rows:?}"
+        );
+        assert_eq!(
+            rows.len(),
+            7,
+            "标签域是闭集，多出来的行不属于这个读数: {rows:?}"
+        );
+
+        // 两个读数的关系：七轮没有结论 ⇒ 七次 no_evidence；原因比它多出来的那一次
+        // 就是并行沉默的第二条上游。
+        let verdict_rows = metrics
+            .query_counter_totals(MAINLINE_CI_VERDICT_TOTAL.as_str())
+            .await
+            .unwrap();
+        let no_evidence = verdict_rows
+            .iter()
+            .find(|r| r.labels.get("verdict").map(String::as_str) == Some("no_evidence"))
+            .map(|r| r.value);
+        assert_eq!(no_evidence, Some(7.0), "{verdict_rows:?}");
+        let reason_total: f64 = rows.iter().map(|r| r.value).sum();
+        assert_eq!(
+            reason_total, 8.0,
+            "每轮 no_evidence 贡献「沉默的上游数」条原因: {rows:?}"
         );
     }
 

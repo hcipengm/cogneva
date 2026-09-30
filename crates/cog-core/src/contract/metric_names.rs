@@ -247,6 +247,23 @@ metric_names! {
     // an absence; a run of it says the gate is passing revisions for a reason
     // other than the upstream's verdict.
     MAINLINE_CI_VERDICT_TOTAL => "cogneva_mainline_ci_verdict_total",
+    // Why the round above got no verdict, by reason, one count per silent
+    // upstream: `pending` (upstream still working on it), `no_runs` (asked and
+    // there was nothing there), `status_unreadable`, `bad_api_base`,
+    // `connect_failed`, `unusable_body`, and the http_* split by whose fault it
+    // is (auth_rejected, not_found, rate_limited, upstream_error, other).
+    //
+    // The verdict counter above has three cells and one of them is a lie of
+    // omission: `no_evidence` is the same reading whether the checks had not
+    // finished, the token was refused, or the connection to the platform timed
+    // out — three different owners (wait, fix the gateway, fix the path) and
+    // three different actions. The gap was measured: 17 of 20 rounds in the
+    // first 36 hours were `no_evidence` while the upstream had green checks
+    // finished minutes earlier, and the same revision asked twice minutes apart
+    // answered `pass` then `no_evidence` — so the silence was intermittent and
+    // unactionable for lack of exactly this label. Recording it changes no
+    // verdict: the gate still fails open by design.
+    MAINLINE_CI_NO_VERDICT_REASON_TOTAL => "cogneva_mainline_ci_no_verdict_reason_total",
 
     // cog-gateway — request accounting.
     HTTP_REQUESTS_TOTAL => "http_requests_total",

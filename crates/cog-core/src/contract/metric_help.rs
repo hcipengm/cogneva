@@ -201,6 +201,18 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          skip this round' and 'no guard at all' would be the same absent cell",
     ),
     (
+        "cogneva_mainline_ci_no_verdict_reason_total",
+        "Why the deployer's CI question came back without a verdict, one count \
+         per silent upstream, by reason: pending (the upstream had not finished \
+         the checks), no_runs (asked and there was nothing to judge), \
+         status_unreadable, bad_api_base, connect_failed, unusable_body, and \
+         http_auth_rejected / http_not_found / http_rate_limited / \
+         http_upstream_error / http_other. The no_evidence cell of \
+         cogneva_mainline_ci_verdict_total holds all of these at once, and they \
+         do not have the same owner: one means wait, another means the gateway \
+         or its credential, another means the path or the configuration",
+    ),
+    (
         "cogneva_mainline_ci_verdict_total",
         "CI verdicts the deployer read for the revision it was about to promote, \
          by verdict: pass, fail or no_evidence. no_evidence is its own value \
