@@ -652,12 +652,12 @@ data:
             },
             {
               "name": "governance_comparison_unreadable",
-              "promql": "increase(cogneva_governance_check_failures_total[6h]) > 6",
+              "promql": "sum by (namespace) (increase(cogneva_governance_check_failures_total[6h])) > 6",
               "condition": {
                 "greater_than": 6.0
               },
               "severity": "warning",
-              "summary": "The comparison between the declared resource ceilings and the enforced ones has failed {value} time(s) in the last 6h: the drift reading is stale, so a ceiling the two sides agree on and a ceiling nobody could look at are indistinguishable right now. Six failures is about an hour of consecutive rounds at the deployer's own poll interval, which is past anything a single unreadable moment explains"
+              "summary": "The comparison between the declared resource ceilings and the enforced ones has failed {value} time(s) in the last 6h: the drift reading is stale, so a ceiling the two sides agree on and a ceiling nobody could look at are indistinguishable right now. Six failures is about an hour of consecutive rounds at the deployer's own poll interval, which is past anything a single unreadable moment explains. The count is summed over every process in the namespace rather than read per process: the failures belong to the deployment's rounds, and a per-process counter goes back to zero with the process that reports it, so the alert would resolve on a rollout with the comparison just as broken on the far side"
             },
             {
               "name": "orphans_unreaped",
