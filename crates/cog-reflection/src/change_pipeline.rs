@@ -8,7 +8,7 @@
 //!   and roll back on failure.
 //! - Report results by updating the evolution status.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -520,6 +520,33 @@ impl ChangePipeline {
             });
         }
 
+        // Whether this change's diff will be the only difference between the
+        // tree the linter reads and its baseline.
+        //
+        // Read here, while the tree still is the baseline, because after the
+        // change is applied the two writers are indistinguishable: the formatter
+        // conforms the whole tree rather than only the change, so on a baseline
+        // it would rewrite, the worktree diff carries that rewrite as well as
+        // the change, and a lint sitting on a line the formatter rewrote would
+        // be read as this change's — which is the one reading the criterion
+        // exists to avoid. Nothing in the tree says which of the two wrote a
+        // line after the fact, so the question is asked while it can still be
+        // answered.
+        let baseline_is_conformed = match self
+            .run_cargo_fmt_cmd(workdir, &["fmt", "--all", "--", "--check"])
+            .await
+        {
+            Ok((clean, _)) => clean,
+            Err(e) => {
+                warn!(
+                    change_id = %change.artifact_id,
+                    error = %e,
+                    "Could not read whether this tree's baseline is what the formatter produces"
+                );
+                false
+            }
+        };
+
         if let Err(e) = self.git_apply(workdir, &change.content).await {
             return Ok(ApplyResult {
                 change_id: change.artifact_id.clone(),
@@ -570,6 +597,123 @@ impl ChangePipeline {
             }
         };
 
+        // This tree's lints, minus the ones it already carried. Read before the
+        // suite so a change the linter refuses is refused without also paying
+        // for the suite: the linter is a whole-tree compile of its own — cargo
+        // does not hand clippy's artifacts to the test run, they are built with
+        // a wrapper — so the only place the stage can still save that second
+        // compile is here, by refusing before it is spent.
+        //
+        // What is given up is the criterion's reach, not its evidence — a lint
+        // on a line this change did not write is the tree's, and a tree that
+        // does not compile is the suite's to answer for. Both are recorded
+        // where the decision is made rather than left to be inferred from a
+        // green run.
+        let clippy_note = match self.run_cargo_clippy(workdir).await {
+            Ok((true, _)) => "cargo clippy --workspace: no diagnostics on this tree".to_string(),
+            Ok((false, output)) => {
+                // A change is answerable for the lints reported on a line it
+                // wrote, and that reading needs a diff with one writer in it.
+                // Where the baseline is not what the formatter produces, the
+                // tree the linter read differs from its baseline by the
+                // formatter's rewrite of that baseline as well, and no line can
+                // be told from the other: nothing is attributed, and the note
+                // says which of the two readings it is instead of reporting the
+                // tree's lints as this change's.
+                let mut written: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+                if baseline_is_conformed {
+                    written = match self.applied_change_lines(workdir, &change.content).await {
+                        Ok(written) => written,
+                        Err(e) => {
+                            // Without the lines the change wrote there is nothing to
+                            // attribute against, and a verdict read off the raw
+                            // report would convict this change of the tree's lints.
+                            // No verdict keeps it for an attempt that can read them.
+                            warn!(
+                                change_id = %change.artifact_id,
+                                error = %e,
+                                "Could not read the lines this change wrote; reaching no verdict"
+                            );
+                            let _ = self.git_reset_hard(workdir).await;
+                            return Err(e);
+                        }
+                    };
+                }
+                let attribution =
+                    cog_core::contract::reflection::introduced_lints(&written, &output);
+                if !attribution.introduced.is_empty() {
+                    warn!(
+                        change_id = %change.artifact_id,
+                        count = attribution.introduced.len(),
+                        "Change writes lines the linter reports on"
+                    );
+                    let evidence = attribution
+                        .introduced
+                        .iter()
+                        .map(|lint| {
+                            format!(
+                                "{}:{} {} — {}",
+                                lint.file, lint.line, lint.code, lint.message
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n  ");
+                    let _ = self.git_reset_hard(workdir).await;
+                    return Ok(ApplyResult {
+                        change_id: change.artifact_id.clone(),
+                        files_changed,
+                        reformatted,
+                        pre_existing_failures: 0,
+                        verdict: ChangeVerdict::Refused(cog_core::RejectionCause::LintIntroduced),
+                        test_output: format!(
+                            "The change writes lines the linter reports on:\n  {evidence}\n\n{output}"
+                        ),
+                        new_status: EvolutionStatus::ValidationFailed,
+                    });
+                }
+                if !baseline_is_conformed {
+                    info!(
+                        change_id = %change.artifact_id,
+                        diagnostics = attribution.diagnostics,
+                        "The linter reports this tree's lints, and the tree it read differs from its baseline beyond this change"
+                    );
+                    format!(
+                        "cargo clippy --workspace: {} diagnostic(s) on this tree, which differs from its baseline by more than this change (the baseline is not what the formatter produces), so none is read as this change's",
+                        attribution.diagnostics
+                    )
+                } else {
+                    info!(
+                        change_id = %change.artifact_id,
+                        diagnostics = attribution.diagnostics,
+                        "The linter reports this tree's lints; none of them is on a line this change wrote"
+                    );
+                    format!(
+                        "cargo clippy --workspace: {} diagnostic(s) on this tree, none of them on a line this change wrote",
+                        attribution.diagnostics
+                    )
+                }
+            }
+            Err(e) if e.is_build_slot_refused() => {
+                warn!(change_id = %change.artifact_id, error = %e, "cargo clippy got no build slot");
+                let _ = self.git_reset_hard(workdir).await;
+                return Err(e);
+            }
+            Err(e) => {
+                // A linter that reached no verdict is not a change that failed
+                // one: the criterion is one of several, and retiring a sound
+                // change for a judge that never spoke is the same mistake as
+                // reading a busy host as a defect. What it did is recorded in
+                // the change's own evidence rather than only in a log line, so
+                // that "found no lint" and "no linter ran" are not one entry.
+                warn!(
+                    change_id = %change.artifact_id,
+                    error = %e,
+                    "cargo clippy did not run; this change is judged without it"
+                );
+                format!("cargo clippy --workspace: not evaluated ({e})")
+            }
+        };
+
         let (test_passed, test_output) = match self.run_cargo_test(workdir).await {
             Ok(result) => result,
             // No slot for the whole wait budget: the tests never ran, so nothing
@@ -603,7 +747,14 @@ impl ChangePipeline {
         // never pays for it and the cost lands on the runs that need the
         // distinction.
         let mut test_passed = test_passed;
-        let mut test_output = test_output;
+        // What the linter did rides in front of what the suite did: this field
+        // is the record a refused or landed change is read from, and a run that
+        // was not evaluated has to be readable as that rather than as silence.
+        let mut test_output = if clippy_note.is_empty() {
+            test_output
+        } else {
+            format!("{clippy_note}\n\n{test_output}")
+        };
         let mut pre_existing_failures = 0usize;
         if !test_passed {
             match self
@@ -1227,6 +1378,108 @@ impl ChangePipeline {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let combined = format!("{}{}", stdout, stderr);
         Ok((output.status.success(), combined))
+    }
+
+    /// Run CI's lint command over the workspace and return (succeeded, output).
+    ///
+    /// The same command the gate runs, in the one form that lets the verdict be
+    /// attributed at all: `--message-format=json` changes what the run says,
+    /// not what it finds, and leaves the exit status alone.
+    ///
+    /// Bounded by the test budget rather than by a knob of its own. It is a
+    /// whole-workspace compile of the same scale, on the same tree, that budget
+    /// already bounds, so one number covers both jobs, and a second knob would
+    /// have to be set to the same value to be right — one more way for a
+    /// deployment to be configured into a criterion that refuses everything or
+    /// nothing.
+    ///
+    /// Nothing is recorded in the budget sink under its own name: the sink's
+    /// kinds are the two budgets, and writing a third job's duration into the
+    /// `test` kind would make that reading mean "the last workspace compile of
+    /// either job" while still claiming to be one kind.
+    async fn run_cargo_clippy(&self, workdir: &Path) -> SFResult<(bool, String)> {
+        info!("Running cargo clippy --workspace");
+        let _slot = cog_core::build_gate::acquire("change lint verification").await?;
+        let mut cmd = tokio::process::Command::new("cargo");
+        cmd.args([
+            "clippy",
+            "--workspace",
+            "--message-format=json",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .current_dir(workdir)
+        .kill_on_drop(true);
+        self.apply_verification_env(&mut cmd);
+
+        let output =
+            match tokio::time::timeout(Duration::from_secs(self.test_timeout_secs), cmd.output())
+                .await
+            {
+                Ok(result) => {
+                    result.map_err(|e| SFError::IO(format!("Failed to run cargo clippy: {}", e)))?
+                }
+                Err(_) => {
+                    return Err(SFError::IO(format!(
+                        "cargo clippy exceeded the {}s verification budget and was killed",
+                        self.test_timeout_secs
+                    )))
+                }
+            };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Ok((output.status.success(), format!("{}{}", stdout, stderr)))
+    }
+
+    /// The lines the applied change wrote, read from the tree that will land.
+    ///
+    /// The artifact's own line numbers are the numbers of a tree that no longer
+    /// exists by the time the linter speaks: the formatter conforms the tree
+    /// first, and a rewrite that splits one written line into two moves every
+    /// line after it. A reader holding compiled spans against the artifact's
+    /// numbering would then attribute findings to lines the change never wrote
+    /// — and, where the shift went the other way, miss the ones it did.
+    ///
+    /// Read this way the diff has one writer only as long as the baseline is
+    /// what the formatter produces: on a baseline it would rewrite, the formatter
+    /// puts its rewrite of that baseline into the same diff, and a line the
+    /// change never wrote arrives here as one it did. That is the caller's to
+    /// establish before it reads a verdict off this — see the check the stage
+    /// runs while the tree still is the baseline. This function cannot tell the
+    /// two writers apart and does not try to.
+    ///
+    /// A file the change creates is untracked, and a worktree diff does not
+    /// list those. The change itself says which files it creates, and for those
+    /// the whole file is what it wrote.
+    async fn applied_change_lines(
+        &self,
+        workdir: &Path,
+        change_content: &str,
+    ) -> SFResult<BTreeMap<String, BTreeSet<u64>>> {
+        let diff = self
+            .git_try(workdir, &["diff", "HEAD"])
+            .await
+            .ok_or_else(|| {
+                SFError::IO(format!(
+                    "could not read the applied change from {}",
+                    workdir.display()
+                ))
+            })?;
+        let mut written = cog_core::contract::reflection::diff_added_lines(&diff);
+
+        for target in cog_core::parse_diff_targets(change_content) {
+            if target.kind != cog_core::DiffTargetKind::Create {
+                continue;
+            }
+            let Ok(text) = tokio::fs::read_to_string(workdir.join(&target.path)).await else {
+                continue;
+            };
+            let lines: BTreeSet<u64> = (1..=text.lines().count() as u64).collect();
+            written.insert(target.path, lines);
+        }
+        Ok(written)
     }
 
     /// Split a failing run's tests into the ones this revision was already
@@ -2349,6 +2602,273 @@ index 1111111..2222222 100644
         assert!(
             result.test_output.contains("answer_is_42"),
             "the failing test is not in the evidence: {}",
+            result.test_output
+        );
+    }
+
+    /// A change that writes a line the linter reports on is refused for it, and
+    /// the refusal names the line.
+    ///
+    /// The fixture is a real crate and the run is the real command. What has to
+    /// hold here is that a run's machine-readable output joins to the lines this
+    /// change wrote — the diagnostic names its file the way the workspace root
+    /// spells it, and a reader that guessed a different root would attribute
+    /// nothing and pass everything. A fixture that fed the reader a transcript
+    /// would hold the reader and not the join.
+    #[tokio::test]
+    async fn a_change_that_writes_a_lint_is_refused_for_it() {
+        let root = tempfile::tempdir().unwrap();
+        git_ok(root.path(), &["init", "-q"]).await;
+        git_ok(root.path(), &["config", "user.email", "t@t.com"]).await;
+        git_ok(root.path(), &["config", "user.name", "t"]).await;
+        tokio::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(root.path().join("src"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.path().join("src/lib.rs"),
+            "pub fn answer() -> i32 {\n    42\n}\n",
+        )
+        .await
+        .unwrap();
+        git_ok(root.path(), &["add", "."]).await;
+        git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
+
+        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
+        // `&Vec<u8>` is `clippy::ptr_arg` and an uncalled private function is
+        // `dead_code` — two lints from two sources on one written line, so the
+        // refusal has to list what it found rather than the first thing.
+        let change = EvolutionResult {
+            kind: EvolutionKind::CodeChange,
+            artifact_id: "linting-1".into(),
+            description: "给取值模块补一个辅助函数".into(),
+            content: "diff --git a/src/lib.rs b/src/lib.rs\n\
+                      --- a/src/lib.rs\n\
+                      +++ b/src/lib.rs\n\
+                      @@ -1,3 +1,4 @@\n\
+                      \x20pub fn answer() -> i32 {\n\
+                      \x20    42\n\
+                      \x20}\n\
+                      +fn probe(v: &Vec<u8>) -> usize { v.len() }\n"
+                .into(),
+            status: EvolutionStatus::CompileChecked,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+        };
+
+        let result = pipeline
+            .apply_and_test_in(&change, root.path())
+            .await
+            .expect("a judgement about the change is not an environment error");
+
+        assert_eq!(
+            result.verdict,
+            ChangeVerdict::Refused(cog_core::RejectionCause::LintIntroduced)
+        );
+        assert_eq!(result.new_status, EvolutionStatus::ValidationFailed);
+        // The line the change wrote is the fourth of the file it wrote it into.
+        assert!(
+            result.test_output.contains("src/lib.rs:4"),
+            "the refusal does not name the line: {}",
+            result.test_output
+        );
+        assert!(
+            result.test_output.contains("clippy::ptr_arg"),
+            "the refusal does not name the lint: {}",
+            result.test_output
+        );
+        // Refused before the suite ran: the refusal is the change's evidence,
+        // and the test the fixture carries never appears in it.
+        assert!(
+            !result.test_output.contains("answer_is_42"),
+            "the suite ran even though the lint refused the change: {}",
+            result.test_output
+        );
+        // Tracked files only: the linter and the suite leave their own build
+        // output behind (`target/`, `Cargo.lock`), and neither is the change.
+        let status = tokio::process::Command::new("git")
+            .args(["status", "--porcelain", "--untracked-files=no"])
+            .current_dir(root.path())
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "the refused change was left on the tree"
+        );
+    }
+
+    /// A tree that already carries a lint is not a reason to refuse a change
+    /// that writes none.
+    ///
+    /// This is the half that makes the criterion about the change rather than
+    /// about the tree, and it is the incident this gate exists for read the
+    /// other way: judged on the whole-tree report, a change landing on a tree
+    /// with one lint is refused for it — and on such a tree that is every
+    /// change, the one that would clear it included.
+    #[tokio::test]
+    async fn a_tree_that_already_carries_a_lint_does_not_refuse_a_clean_change() {
+        let root = tempfile::tempdir().unwrap();
+        git_ok(root.path(), &["init", "-q"]).await;
+        git_ok(root.path(), &["config", "user.email", "t@t.com"]).await;
+        git_ok(root.path(), &["config", "user.name", "t"]).await;
+        tokio::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(root.path().join("src"))
+            .await
+            .unwrap();
+        // The seed carries `dead_code` and `clippy::ptr_arg` on its fourth line,
+        // and this change never touches that line. It is written the way the
+        // formatter spells it: a seed the formatter would rewrite would put its
+        // own rewrite into the diff the lines are read from, and the reading
+        // would be of two writers at once rather than of the change.
+        tokio::fs::write(
+            root.path().join("src/lib.rs"),
+            "pub fn answer() -> i32 {\n    42\n}\n\
+             fn unused_probe(v: &Vec<u8>) -> usize {\n    v.len()\n}\n\n\
+             #[test]\nfn answer_is_42() {\n    assert_eq!(answer(), 42);\n}\n",
+        )
+        .await
+        .unwrap();
+        git_ok(root.path(), &["add", "."]).await;
+        git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
+
+        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
+        let change = EvolutionResult {
+            kind: EvolutionKind::CodeChange,
+            artifact_id: "clean-1".into(),
+            description: "给取值模块补一个辅助函数".into(),
+            content: "diff --git a/src/lib.rs b/src/lib.rs\n\
+                      --- a/src/lib.rs\n\
+                      +++ b/src/lib.rs\n\
+                      @@ -11,1 +11,2 @@\n\
+                      \x20}\n\
+                      +pub fn doubled() -> i32 { answer() * 2 }\n"
+                .into(),
+            status: EvolutionStatus::CompileChecked,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+        };
+
+        let result = pipeline
+            .apply_and_test_in(&change, root.path())
+            .await
+            .expect("a judgement about the change is not an environment error");
+
+        assert_eq!(result.verdict, ChangeVerdict::Passed);
+        // Control for the control: the linter did speak, and it did report the
+        // tree's own lints — otherwise a green verdict here would be
+        // indistinguishable from a criterion that never ran.
+        assert!(
+            result
+                .test_output
+                .contains("none of them on a line this change wrote"),
+            "the lint criterion left no reading: {}",
+            result.test_output
+        );
+        assert!(
+            !result.test_output.contains("not evaluated"),
+            "the lint criterion did not run at all: {}",
+            result.test_output
+        );
+    }
+
+    /// A baseline the formatter would rewrite is not one this criterion can
+    /// read a diff against, and it declines rather than guessing which of two
+    /// writers a line belongs to.
+    ///
+    /// The formatter conforms the whole tree, not only the change, so on such a
+    /// tree the lines a worktree diff reports include its rewrite of the
+    /// baseline too — and a lint the tree already carried, sitting on a line the
+    /// formatter happened to rewrite, would be read as this change's. Nothing
+    /// in the tree says afterwards which of the two wrote a line, so the stage
+    /// asks while the tree still is the baseline and, when the answer is no,
+    /// attributes nothing. That is a narrower reading than a refusal would look
+    /// like and it is the honest one: the change is judged on the rest, the
+    /// note names which reading this is, and the linter's own report still
+    /// rides in the change's evidence in full.
+    #[tokio::test]
+    async fn a_rewritten_baseline_is_not_read_as_the_changes_lines() {
+        let root = tempfile::tempdir().unwrap();
+        git_ok(root.path(), &["init", "-q"]).await;
+        git_ok(root.path(), &["config", "user.email", "t@t.com"]).await;
+        git_ok(root.path(), &["config", "user.name", "t"]).await;
+        tokio::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(root.path().join("src"))
+            .await
+            .unwrap();
+        // The same lint-bearing line as the control above, spelled the way a
+        // generator would leave it: the formatter rewrites it into three lines,
+        // so the tree the linter reads differs from its baseline by that
+        // rewrite and by nothing else this change did not do.
+        tokio::fs::write(
+            root.path().join("src/lib.rs"),
+            "pub fn answer() -> i32 {\n    42\n}\n\
+             fn unused_probe(v: &Vec<u8>) -> usize { v.len() }\n\n\
+             #[test]\nfn answer_is_42() {\n    assert_eq!(answer(), 42);\n}\n",
+        )
+        .await
+        .unwrap();
+        git_ok(root.path(), &["add", "."]).await;
+        git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
+
+        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
+        let change = EvolutionResult {
+            kind: EvolutionKind::CodeChange,
+            artifact_id: "clean-2".into(),
+            description: "给取值模块补一个辅助函数".into(),
+            content: "diff --git a/src/lib.rs b/src/lib.rs\n\
+                      --- a/src/lib.rs\n\
+                      +++ b/src/lib.rs\n\
+                      @@ -9,1 +9,2 @@\n\
+                      \x20}\n\
+                      +pub fn doubled() -> i32 { answer() * 2 }\n"
+                .into(),
+            status: EvolutionStatus::CompileChecked,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+        };
+
+        let result = pipeline
+            .apply_and_test_in(&change, root.path())
+            .await
+            .expect("a judgement about the change is not an environment error");
+
+        assert_eq!(result.verdict, ChangeVerdict::Passed);
+        // The linter did speak — otherwise this verdict would be the same one a
+        // tree with no lints gets, and the test would pass without the premise
+        // ever being read.
+        assert!(
+            !result.test_output.contains("no diagnostics on this tree"),
+            "the linter never reported anything: {}",
+            result.test_output
+        );
+        assert!(
+            result
+                .test_output
+                .contains("differs from its baseline by more than this change"),
+            "the declined reading is not legible in the evidence: {}",
+            result.test_output
+        );
+        assert!(
+            !result
+                .test_output
+                .contains("none of them on a line this change wrote"),
+            "the criterion claimed a reading it could not make: {}",
             result.test_output
         );
     }

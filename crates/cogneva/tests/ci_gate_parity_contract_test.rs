@@ -55,8 +55,7 @@ const ENFORCED: &[(&str, &str)] = &[
     // the formatter can settle is conformed rather than refused.
     ("fmt", "cargo fmt --all -- --check"),
     // The main suite, with `--no-fail-fast` so the refusal names every failure
-    // rather than the first crate to give up. This is also the compile pass the
-    // change is judged on, which is why adding a lint to it costs nothing.
+    // rather than the first crate to give up.
     ("test", "cargo test --workspace --no-fail-fast"),
 ];
 
@@ -75,13 +74,20 @@ const NOT_ENFORCED: &[(&str, &str)] = &[
     ),
     (
         "clippy",
-        "The observed failure of 2026-09-28. A whole-workspace clippy is a \
-         criterion about the tree, not about the change, so it cannot be added \
-         to the stage as it stands: on a tree that already carries a lint it \
-         would refuse every change, including the one that would clear it — the \
-         same trap the test baseline was added to remove. It belongs here once \
-         the stage can read the tree's own lint set per revision and refuse \
-         only on lints the change introduces.",
+        "The observed failure of 2026-09-28, answered narrowly rather than \
+         fully. The stage runs the same whole-tree `cargo clippy --workspace \
+         -- -D warnings` before the suite, and refuses a change only on \
+         diagnostics whose primary span lands on a line that change writes — \
+         the worktree diff against the tree the linter read, and nothing at all \
+         on a baseline the formatter would rewrite, since that rewrite would be \
+         in the same diff. It is narrower than the job, not equivalent and \
+         cheaper: a lint whose span stays on a line the change never wrote \
+         passes here and dies in the job, as deleting the only caller of an \
+         unmodified function leaves `dead_code` on that function's line. \
+         Reading the tree's own lint set per revision would close that half and \
+         was declined for its cost — a second whole-tree compile per change, \
+         against a build slot that is the ceiling on how many changes the stage \
+         can retire.",
     ),
     (
         "coverage",

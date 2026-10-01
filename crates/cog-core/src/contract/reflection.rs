@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A detected pattern that groups related learnings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +160,15 @@ pub enum RejectionCause {
     TestRunUnavailable,
     /// The suite ran and this change broke it.
     TestsFailed,
+    /// The change writes a line the linter reports on.
+    ///
+    /// A whole-tree lint criterion cannot say this much: the same report holds
+    /// the lints the tree already carried, and a change judged on that set is
+    /// refused for a defect it did not write — which, on a tree that is already
+    /// carrying one, refuses every change including the one that clears it.
+    /// The attribution is by position: the diagnostic's span overlaps a line
+    /// this change writes.
+    LintIntroduced,
 }
 
 impl RejectionCause {
@@ -175,6 +184,7 @@ impl RejectionCause {
         Self::FormattingDiffers,
         Self::TestRunUnavailable,
         Self::TestsFailed,
+        Self::LintIntroduced,
     ];
 
     /// The wire form, for label values and records.
@@ -189,6 +199,7 @@ impl RejectionCause {
             Self::FormattingDiffers => "formatting_differs",
             Self::TestRunUnavailable => "test_run_unavailable",
             Self::TestsFailed => "tests_failed",
+            Self::LintIntroduced => "lint_introduced",
         }
     }
 
@@ -447,6 +458,200 @@ pub fn count_diff_lines(content: &str) -> usize {
                 && !l.starts_with("---")
         })
         .count()
+}
+
+/// The lines a diff writes, per file, numbered on the side the file ends up on.
+///
+/// The line budget answers "how much did this change write"; this answers
+/// "where". A reader holding a position in the resulting file — a diagnostic's
+/// span, say — can then ask whether this change is what put it there, and that
+/// is the difference between a criterion about the change and a criterion about
+/// the tree: judged the second way, a tree that already carries a finding
+/// convicts every change, including the one that clears it.
+///
+/// Only additions are recorded. A removed line is not in the file the change
+/// produces, so nothing can sit on it afterwards, and a context line is by
+/// definition one the change did not write.
+pub fn diff_added_lines(content: &str) -> BTreeMap<String, BTreeSet<u64>> {
+    let mut added: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+
+    for entry in diff_file_entries(content) {
+        if entry.path.is_empty() || entry.path == "/dev/null" {
+            continue;
+        }
+        let mut lines: BTreeSet<u64> = BTreeSet::new();
+        for hunk in &entry.hunks {
+            // The header carries the one thing a body does not: the line in the
+            // new file its first line lands on.
+            let mut body = hunk.lines();
+            let Some(header) = body.next().and_then(parse_hunk_header_parts) else {
+                continue;
+            };
+            let mut new_line = header.new_start;
+            for line in body {
+                match classify_hunk_line(line) {
+                    HunkLine::Added => {
+                        lines.insert(new_line);
+                        new_line += 1;
+                    }
+                    HunkLine::Context => new_line += 1,
+                    HunkLine::Removed | HunkLine::Marker => {}
+                }
+            }
+        }
+        if !lines.is_empty() {
+            added.insert(entry.path, lines);
+        }
+    }
+    added
+}
+
+/// A diagnostic the change itself is answerable for: its span sits on a line
+/// this diff writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntroducedLint {
+    /// The code as the compiler reports it — `clippy::ptr_arg`, `dead_code`.
+    pub code: String,
+    /// Workspace-relative, the way both the compiler and a diff spell it.
+    pub file: String,
+    /// First line of the diagnostic's primary span.
+    pub line: u64,
+    pub message: String,
+}
+
+/// What a linter's machine-readable transcript says about one change.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LintAttribution {
+    /// Diagnostics whose span sits on a line this change writes. Only these are
+    /// the change's to answer for; the rest are the tree's, and convicting a
+    /// change of them retires a sound change for a defect it did not write.
+    pub introduced: Vec<IntroducedLint>,
+    /// Every lint diagnostic the transcript carried, attributed or not.
+    ///
+    /// Beside the list rather than instead of it, because an empty list reports
+    /// "the tree is clean" and "the tree carries lints, none of them here"
+    /// identically, and those are different facts about the change.
+    pub diagnostics: usize,
+}
+
+/// The lint diagnostics a change is answerable for, read from a
+/// `--message-format=json` transcript.
+///
+/// `written` is where the change wrote, as [`diff_added_lines`] reads it. The
+/// distinction this draws is the one a whole-tree lint criterion cannot:
+/// `cargo clippy --workspace` reports the tree's lints, and a change landing on
+/// a tree that already carries one is not what put it there. Only diagnostics
+/// whose primary span overlaps a line the change writes are returned; the paths
+/// join because both sides are relative to the same workspace root.
+///
+/// Three kinds of record are deliberately not read:
+///
+/// - Anything without a lint code. That is a compilation error, and the run
+///   that compiles the tree answers for those; naming a lint here would tell
+///   the producer to fix something that is not what stopped its change.
+/// - Anything without a primary span: a summary line ("aborting due to N
+///   previous errors") is a tally of records already read.
+/// - Anything outside the files the change wrote, and anything whose span
+///   misses every line it wrote — by construction not this change's doing.
+pub fn introduced_lints(
+    written: &BTreeMap<String, BTreeSet<u64>>,
+    transcript: &str,
+) -> LintAttribution {
+    let mut attribution = LintAttribution::default();
+    let mut seen: BTreeSet<(String, String, u64)> = BTreeSet::new();
+
+    for line in transcript.lines() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if record.get("reason").and_then(|r| r.as_str()) != Some("compiler-message") {
+            continue;
+        }
+        let Some(message) = record.get("message") else {
+            continue;
+        };
+        let level = message
+            .get("level")
+            .and_then(|l| l.as_str())
+            .unwrap_or_default();
+        // Both levels: a run that promotes warnings reports a lint as an error,
+        // and one that does not still reports the same lint.
+        if level != "error" && level != "warning" {
+            continue;
+        }
+        let Some(code) = message
+            .get("code")
+            .and_then(|c| c.get("code"))
+            .and_then(|c| c.as_str())
+        else {
+            continue;
+        };
+        if is_compiler_error_code(code) {
+            continue;
+        }
+        attribution.diagnostics += 1;
+
+        // The primary span is where the finding is. A secondary span is context
+        // printed beside it and may sit in a file the change never touched.
+        let Some(span) = message
+            .get("spans")
+            .and_then(|s| s.as_array())
+            .and_then(|spans| {
+                spans
+                    .iter()
+                    .find(|span| span.get("is_primary").and_then(|p| p.as_bool()) == Some(true))
+            })
+        else {
+            continue;
+        };
+        let Some(file) = span.get("file_name").and_then(|f| f.as_str()) else {
+            continue;
+        };
+        let file = file.trim_start_matches("./");
+        let Some(lines) = written.get(file) else {
+            continue;
+        };
+        let start = span.get("line_start").and_then(|l| l.as_u64()).unwrap_or(0);
+        let end = span
+            .get("line_end")
+            .and_then(|l| l.as_u64())
+            .unwrap_or(start);
+        if !(start..=end).any(|line| lines.contains(&line)) {
+            continue;
+        }
+        if !seen.insert((code.to_string(), file.to_string(), start)) {
+            continue;
+        }
+        attribution.introduced.push(IntroducedLint {
+            code: code.to_string(),
+            file: file.to_string(),
+            line: start,
+            message: message
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        });
+    }
+
+    attribution
+        .introduced
+        .sort_by(|a, b| (&a.file, a.line, &a.code).cmp(&(&b.file, b.line, &b.code)));
+    attribution
+}
+
+/// Whether a diagnostic code is one of rustc's numbered errors rather than a
+/// lint name. `E0308` is a type mismatch; `dead_code` and `clippy::ptr_arg` are
+/// lints, and they are what a lint criterion is about.
+fn is_compiler_error_code(code: &str) -> bool {
+    let Some(digits) = code.strip_prefix('E') else {
+        return false;
+    };
+    digits.len() == 4 && digits.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Names a change may not rewrite: the build, deployment and configuration
@@ -1772,6 +1977,7 @@ mod tests {
                 RejectionCause::FormattingDiffers => "formatting_differs",
                 RejectionCause::TestRunUnavailable => "test_run_unavailable",
                 RejectionCause::TestsFailed => "tests_failed",
+                RejectionCause::LintIntroduced => "lint_introduced",
             };
             assert_eq!(cause.as_str(), spelling, "{cause:?} spells two ways");
             assert_eq!(
@@ -1782,7 +1988,7 @@ mod tests {
             assert!(!seen.contains(&spelling), "{spelling} is in the list twice");
             seen.push(spelling);
         }
-        assert_eq!(seen.len(), 9, "ALL is missing a cause: {seen:?}");
+        assert_eq!(seen.len(), 10, "ALL is missing a cause: {seen:?}");
         for (index, cause) in RejectionCause::ALL.iter().enumerate() {
             assert_eq!(cause.slot(), index, "{cause:?} does not sit at {index}");
         }
@@ -2232,6 +2438,199 @@ mod tests {
     #[test]
     fn an_empty_diff_has_no_entries() {
         assert!(diff_file_entries("").is_empty());
+    }
+
+    /// A two-file diff, so a test can ask about a line inside the change, a
+    /// line beside it, and a file the change never opened.
+    ///
+    /// The first hunk's new side runs 10 `keep`, 11 `new`, 12 `added`, 13
+    /// `tail`; the second declares no count, which the grammar reads as one
+    /// line.
+    const CHANGED: &str = "diff --git a/crates/cog-core/src/lib.rs b/crates/cog-core/src/lib.rs\n\
+                           --- a/crates/cog-core/src/lib.rs\n\
+                           +++ b/crates/cog-core/src/lib.rs\n\
+                           @@ -10,3 +10,4 @@\n\
+                           \x20keep\n\
+                           -old\n\
+                           +new\n\
+                           +added\n\
+                           \x20tail\n\
+                           @@ -40 +41 @@\n\
+                           -before\n\
+                           +after\n";
+
+    /// One `--message-format=json` record, built rather than pasted so that
+    /// this reader is held to the shape a run emits instead of to a copy of it.
+    fn compiler_message(
+        level: &str,
+        code: Option<&str>,
+        file: &str,
+        line_start: u64,
+        line_end: u64,
+    ) -> String {
+        serde_json::json!({
+            "reason": "compiler-message",
+            "message": {
+                "level": level,
+                "code": code.map(|code| serde_json::json!({ "code": code })),
+                "message": "a message",
+                "spans": [{
+                    "file_name": file,
+                    "line_start": line_start,
+                    "line_end": line_end,
+                    "is_primary": true,
+                }],
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn the_lines_a_diff_writes_are_its_added_ones() {
+        let added = diff_added_lines(CHANGED);
+        let lines: BTreeSet<u64> = added.get("crates/cog-core/src/lib.rs").unwrap().clone();
+        // 10 is context, 11 and 12 are the two added lines, 13 is context
+        // again; the second hunk's addition lands on 41.
+        assert_eq!(lines, BTreeSet::from([11, 12, 41]));
+        assert_eq!(added.len(), 1);
+    }
+
+    #[test]
+    fn a_deletion_writes_no_lines() {
+        let diff = "diff --git a/gone.txt b/gone.txt\n\
+                    --- a/gone.txt\n\
+                    +++ /dev/null\n\
+                    @@ -1,2 +0,0 @@\n\
+                    -one\n\
+                    -two\n";
+        assert!(diff_added_lines(diff).is_empty());
+    }
+
+    #[test]
+    fn a_lint_on_a_line_the_change_writes_is_the_changes() {
+        // The diagnostic names its file the way a run in this workspace names
+        // it: relative to the workspace root (`crates/<crate>/src/lib.rs`),
+        // which is the same root the diff's paths are relative to.
+        let transcript = [
+            compiler_message(
+                "error",
+                Some("clippy::ptr_arg"),
+                "crates/cog-core/src/lib.rs",
+                12,
+                12,
+            ),
+            compiler_message(
+                "error",
+                Some("dead_code"),
+                "crates/cog-core/src/lib.rs",
+                11,
+                12,
+            ),
+        ]
+        .join("\n");
+        let attribution = introduced_lints(&diff_added_lines(CHANGED), &transcript);
+        assert_eq!(attribution.diagnostics, 2);
+        assert_eq!(
+            attribution.introduced,
+            vec![
+                // A span reaching from a context line into a written one is
+                // still a finding on a line the change wrote.
+                IntroducedLint {
+                    code: "dead_code".into(),
+                    file: "crates/cog-core/src/lib.rs".into(),
+                    line: 11,
+                    message: "a message".into(),
+                },
+                IntroducedLint {
+                    code: "clippy::ptr_arg".into(),
+                    file: "crates/cog-core/src/lib.rs".into(),
+                    line: 12,
+                    message: "a message".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_lint_the_tree_already_carried_is_not_the_changes() {
+        let transcript = [
+            // Line 10 is context and line 13 is context: the tree carried both
+            // before the change and carries them after it.
+            compiler_message(
+                "error",
+                Some("dead_code"),
+                "crates/cog-core/src/lib.rs",
+                10,
+                10,
+            ),
+            compiler_message(
+                "warning",
+                Some("unused_variables"),
+                "crates/cog-core/src/lib.rs",
+                13,
+                13,
+            ),
+        ]
+        .join("\n");
+        let attribution = introduced_lints(&diff_added_lines(CHANGED), &transcript);
+        // Counted, and attributed to no one: an empty list alone would report
+        // this tree and a clean one identically.
+        assert_eq!(attribution.diagnostics, 2);
+        assert!(attribution.introduced.is_empty());
+    }
+
+    #[test]
+    fn a_lint_in_a_file_the_change_never_opened_is_not_the_changes() {
+        let transcript = compiler_message(
+            "error",
+            Some("clippy::needless_return"),
+            "crates/elsewhere/src/lib.rs",
+            11,
+            11,
+        );
+        let attribution = introduced_lints(&diff_added_lines(CHANGED), &transcript);
+        assert_eq!(attribution.diagnostics, 1);
+        assert!(attribution.introduced.is_empty());
+    }
+
+    #[test]
+    fn a_bare_file_name_is_not_joined_to_a_path_that_ends_the_same_way() {
+        // Matching on the tail would attribute one crate's lint to another
+        // crate's change whenever both carry a file of the same name — and it
+        // would read as a pass on the tree where that is wrong. The reader
+        // joins on the whole path, so a short one matches nothing.
+        let transcript = compiler_message("error", Some("clippy::ptr_arg"), "src/lib.rs", 11, 11);
+        assert!(introduced_lints(&diff_added_lines(CHANGED), &transcript)
+            .introduced
+            .is_empty());
+    }
+
+    #[test]
+    fn a_compilation_error_is_not_read_as_a_lint() {
+        let transcript = [
+            // A numbered rustc error, and a diagnostic with no code at all.
+            compiler_message("error", Some("E0308"), "crates/cog-core/src/lib.rs", 11, 11),
+            compiler_message("error", None, "crates/cog-core/src/lib.rs", 12, 12),
+            // The summary a failing run prints after the records it counts.
+            "{\"reason\":\"build-finished\",\"success\":false}".to_string(),
+        ]
+        .join("\n");
+        let attribution = introduced_lints(&diff_added_lines(CHANGED), &transcript);
+        // Nothing considered and nothing attributed: the run that compiles the
+        // tree is what answers for a tree that does not compile, and naming a
+        // lint here would send the producer after the wrong defect.
+        assert_eq!(attribution, LintAttribution::default());
+    }
+
+    #[test]
+    fn a_transcript_that_parses_to_nothing_attributes_nothing() {
+        // A run that printed no records cannot convict anyone, and cannot
+        // silently pass a lint either: the caller still has the exit status it
+        // asked for, and the counts here say the transcript was empty.
+        assert_eq!(
+            introduced_lints(&diff_added_lines(CHANGED), "not json\n\n"),
+            LintAttribution::default()
+        );
     }
 
     /// The four levels must stay distinguishable on the ten-point scale. A
