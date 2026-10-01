@@ -52,8 +52,23 @@ use crate::version_contract::VersionReadings;
 
 /// buildah 存储库放 sandbox PVC：与金丝雀 publisher 共享基镜像层缓存，
 /// Pod 重启不丢。
-const BUILDAH_STORAGE: &str = "/opt/cogneva/sandbox/containers/storage";
-const BUILDAH_RUNROOT: &str = "/opt/cogneva/sandbox/containers/run";
+///
+/// 路径不在这里拼：它由 `sandbox::buildah_store_dir` 单独声明，因为消费它的
+/// 有两个动作——打镜像的那一步和回收它的那一步——两边各拼一次就会漂开。
+fn buildah_storage() -> String {
+    crate::sandbox::buildah_store_dir()
+        .join("storage")
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn buildah_runroot() -> String {
+    crate::sandbox::buildah_store_dir()
+        .join("run")
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// cargo registry 缓存同样落 PVC：镜像里的 /usr/local/cargo 是容器可写层，
 /// Pod 一重建（主线滚动最后一个目标就是 evolution 自己）索引与 crate 缓存
 /// 全丢，每次构建都要在家庭网络上重拉整个 crates.io 索引。
@@ -145,7 +160,7 @@ fn seed_image(registry: &str) -> String {
 
 /// 从镜像引用解析 `main-<rev>` 的 rev 片段；非主线 tag（:local、promote-*、
 /// 节点 localhost/cogneva:local 等）返回 None。
-fn parse_main_rev(image: &str) -> Option<&str> {
+pub(crate) fn parse_main_rev(image: &str) -> Option<&str> {
     let tag = image.rsplit(':').next()?;
     tag.strip_prefix(MAIN_TAG_PREFIX)
 }
@@ -2029,7 +2044,8 @@ impl MainlineDeployer {
 
     /// buildah 子命令统一加 PVC 存储全局参数（全局参数必须在子命令前）。
     async fn buildah(&self, args: &[&str], timeout_secs: u64) -> SFResult<String> {
-        let mut full: Vec<&str> = vec!["--root", BUILDAH_STORAGE, "--runroot", BUILDAH_RUNROOT];
+        let (root, runroot) = (buildah_storage(), buildah_runroot());
+        let mut full: Vec<&str> = vec!["--root", &root, "--runroot", &runroot];
         full.extend_from_slice(args);
         self.run_cmd(&self.cfg.builder_bin, &full, None, timeout_secs)
             .await

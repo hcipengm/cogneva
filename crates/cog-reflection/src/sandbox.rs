@@ -39,6 +39,29 @@ impl std::fmt::Display for SandboxKind {
 /// (`/opt/cogneva/sandbox/src` is the pod working repo).
 pub const DEFAULT_SANDBOX_DIR: &str = "/opt/cogneva/sandbox";
 
+/// The buildah store under the sandbox root.
+///
+/// Written into by the promotion builder and read by the pass that removes
+/// what has fallen out of the retention set, so the two have to name the same
+/// directory. Both call this rather than spelling a path: a second literal
+/// would let the reclaimer walk a store nobody writes, which reads exactly
+/// like a store that is already small.
+///
+/// `COGNEVA_SANDBOX_DIR` moves the whole sandbox, so the store moves with it.
+/// The value is read at each call rather than cached: the two callers run in
+/// one process but the environment is fixed for its life, and a cached copy
+/// would be a second holder of the same fact.
+pub fn buildah_store_dir() -> std::path::PathBuf {
+    sandbox_root().join("containers")
+}
+
+/// The sandbox root the layout is built on, honouring `COGNEVA_SANDBOX_DIR`.
+fn sandbox_root() -> std::path::PathBuf {
+    std::env::var("COGNEVA_SANDBOX_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_SANDBOX_DIR))
+}
+
 /// Raw environment signals, separated from interpretation so detection
 /// stays unit-testable without touching the real host.
 #[derive(Debug, Clone, Default)]
@@ -76,11 +99,7 @@ impl SandboxSignals {
             containerenv: std::path::Path::new("/run/.containerenv").exists(),
             cgroup_v1: std::fs::read_to_string("/proc/1/cgroup").ok(),
             cogneva_sandbox: std::env::var("COGNEVA_SANDBOX").ok(),
-            sandbox_dir: Some(
-                std::env::var("COGNEVA_SANDBOX_DIR")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_SANDBOX_DIR)),
-            ),
+            sandbox_dir: Some(sandbox_root()),
             current_dir: std::env::current_dir().ok(),
         }
     }

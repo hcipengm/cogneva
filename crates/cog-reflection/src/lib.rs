@@ -31,6 +31,7 @@ pub mod auto_promoter;
 pub mod baseline_port;
 pub mod build_cache_readings;
 pub mod build_cache_reclaim;
+pub mod buildah_store;
 pub mod change_execution;
 pub mod change_pipeline;
 pub mod config;
