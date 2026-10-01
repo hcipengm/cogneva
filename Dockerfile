@@ -161,6 +161,12 @@ RUN touch crates/*/src/lib.rs crates/*/src/main.rs 2>/dev/null || true
 # Build the release binary
 RUN cargo build --release --locked --bin cogneva
 
+# Stamp the compiler that just built it. 构建与集群同宿主、镜像随每个 rev 滚动，
+# 而 CI 校验用的是**它自己那一刻**的 stable——两者的版本可以差一版而任何产物都
+# 看不出来（「CI 绿」与「跑着的那份」不同源）。下面运行段还会另装一把工具链给
+# 自进化 worker，那一把**不是**证据，所以这里把编译期这把写进镜像随身带着。
+RUN rustc -V > /etc/cogneva-builder-rustc
+
 # Strip the binary to reduce size
 RUN strip target/release/cogneva
 
@@ -274,6 +280,10 @@ RUN groupadd -r cogneva -g 1001 && \
 
 # Copy the built binary
 COPY --from=builder /build/target/release/cogneva /opt/cogneva/cogneva
+
+# 「这个二进制是谁编的」随镜像走：与上面那把运行期工具链无关，别把后者当证据。
+# 读法：kubectl exec <pod> -c cogneva -- cat /etc/cogneva-builder-rustc
+COPY --from=builder /etc/cogneva-builder-rustc /etc/cogneva-builder-rustc
 
 # Copy SQL migrations so the storage plugin can apply them at runtime
 COPY --from=builder /build/crates/cog-storage/migrations /opt/cogneva/crates/cog-storage/migrations

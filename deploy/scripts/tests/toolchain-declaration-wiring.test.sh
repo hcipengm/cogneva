@@ -99,6 +99,29 @@ while IFS= read -r f; do
   fi
 done < <(git ls-files)
 
+# --- 4) the compiler that built the binary travels with the image --------------
+# `rustc -V` inside a running pod answers with the runtime toolchain -- the one
+# installed for the self-evolution worker, which is a different toolchain on
+# purpose. It is therefore not evidence of what compiled the binary, and until
+# the build stamps itself the two are only separable by reasoning about which
+# mode the image was built in. The write and the copy are checked as a pair, and
+# the write has to sit in the builder stage: the same line in the runtime stage
+# would record the wrong compiler, which is worse than recording none.
+# What this cannot see: if both halves are removed together, the gate reports
+# green -- the stamp's own reading, taken in a running pod, is what covers that.
+writes="$(grep -c 'rustc -V > /etc/cogneva-builder-rustc' Dockerfile || true)"
+[ "${writes}" = "1" ] || fail "Dockerfile 里把编译期 rustc 写进镜像的地方有 ${writes} 处，应当恰好一处"
+copies="$(grep -c '^COPY --from=builder /etc/cogneva-builder-rustc /etc/cogneva-builder-rustc$' Dockerfile || true)"
+[ "${copies}" = "1" ] || fail "Dockerfile 把 /etc/cogneva-builder-rustc 搬进运行段的地方有 ${copies} 处，应当恰好一处"
+write_ln="$(grep -n 'rustc -V > /etc/cogneva-builder-rustc' Dockerfile | head -1 | cut -d: -f1)"
+copy_ln="$(grep -n '^COPY --from=builder /etc/cogneva-builder-rustc' Dockerfile | head -1 | cut -d: -f1)"
+runtime_ln="$(grep -n '^# Stage 2: Runtime' Dockerfile | head -1 | cut -d: -f1)"
+[ -n "${runtime_ln}" ] || fail "找不到运行段的起点；下面那条顺序断言没有依据"
+[ "${write_ln}" -lt "${runtime_ln}" ] \
+  || fail "编译期的 rustc 写在第 ${write_ln} 行，不早于运行段起点第 ${runtime_ln} 行——那记的是运行期那把"
+[ "${copy_ln}" -gt "${write_ln}" ] \
+  || fail "搬运在第 ${copy_ln} 行、早于写入第 ${write_ln} 行；搬的是还不存在的东西"
+
 ci_sites="$(grep -c 'dtolnay/rust-toolchain@' .github/workflows/ci.yml || true)"
 echo "PASS: 工具链声明一份读法（Dockerfile→${reader}），release 工作流走它且不写死版本，" \
      "载体清点为 declared=${declared} cn_overrides=stable×2 runtime=stable（自进化 worker，有意不同）" \
