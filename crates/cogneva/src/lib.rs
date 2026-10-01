@@ -16,6 +16,7 @@ pub mod pidfile;
 pub mod platform;
 pub mod plugin_registry;
 pub mod shutdown_coordinator;
+pub mod startup_guard;
 pub mod validate_config;
 pub mod volume_walker;
 

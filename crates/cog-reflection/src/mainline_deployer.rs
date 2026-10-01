@@ -745,9 +745,9 @@ fn sample_fields(line: &str) -> Vec<&str> {
 }
 
 /// 一条 Pod 现场。每行形如
-/// `name|phase|ready|waitingReason|waitingMessage|startedAt|deletionTimestamp`，
+/// `name|phase|ready|waitingReason|waitingMessage|startedAt|deletionTimestamp|lastTerminatedMessage`，
 /// 竖线显式占位：未起来的容器没有 startedAt、健康的容器没有 waiting，omitempty
-/// 的字段缺失时不会顶掉后面字段的位置。后两列用 `get` 取，所以只有前五列的
+/// 的字段缺失时不会顶掉后面字段的位置。后三列用 `get` 取，所以只有前五列的
 /// 采样行照样能解析。
 ///
 /// 这是诊断与就绪门禁**共用**的一批现场——两者问的本来就是同一件事：这个 Pod
@@ -758,6 +758,12 @@ struct PodSample {
     ready: bool,
     waiting_reason: String,
     waiting_message: String,
+    /// 主容器**上一次**退出时留下的终止消息（容器自己写的死因）。
+    ///
+    /// 必需与 `waiting_message` 分开：进 `CrashLoopBackOff` 的容器，等待态里那句是
+    /// kubelet 的「退避多久后重启」，不是它为什么死。真正的死因只有它自己写下的
+    /// 那一句里才有——没有这一列，一个死循环的容器在读数里只剩「在退避」。
+    last_message: String,
     /// 主容器当前的启动时刻；容器还没起来时为 None。
     started_at: Option<DateTime<Utc>>,
     /// 正在删除中：旧副本 Terminating。它可能仍然 ready，但不属于本次滚动。
@@ -788,6 +794,7 @@ fn pod_samples(out: &str) -> Vec<PodSample> {
             ready: f[2] == "true",
             waiting_reason: f[3].to_string(),
             waiting_message: f[4].to_string(),
+            last_message: f.get(7).unwrap_or(&"").to_string(),
             started_at: f
                 .get(5)
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
@@ -853,7 +860,16 @@ fn rollout_pods_fatal(samples: &[PodSample]) -> Option<String> {
         .iter()
         .filter(|p| !p.terminating)
         .find(|p| FATAL_WAITING_REASONS.contains(&p.waiting_reason.as_str()))
-        .map(|p| format!("{} waiting={}", p.name, p.waiting_reason))
+        .map(|p| {
+            let mut text = format!("{} waiting={}", p.name, p.waiting_reason);
+            // 判死只读到「在退避」。容器自己写下的那一句才是死因，接在分隔符之后
+            // ——那是集群来的自由文本，判据不许读它（见 `primary_message`）。
+            if !p.last_message.is_empty() {
+                text.push_str(SUPPORT_CAUSE_SEPARATOR);
+                text.push_str(&bounded(&p.last_message, SUPPORT_CAUSE_MESSAGE_CHARS));
+            }
+            text
+        })
 }
 
 /// 这批等待原因里有没有「拉取失败」。init 容器与主容器一起看：init 拉不到镜像时
@@ -7134,11 +7150,7 @@ fn container_cause(name: &str, status: &serde_json::Value) -> String {
             ));
         }
     } else if let Some(terminated) = status.pointer("/state/terminated") {
-        seg.push_str(&format!(
-            "terminated {} exit {}",
-            field(terminated, "reason", "<no reason>"),
-            exit_code(terminated)
-        ));
+        seg.push_str(&format!("terminated {}", terminated_cause(terminated)));
     } else if status.pointer("/state/running").is_some() {
         seg.push_str(
             if status
@@ -7164,10 +7176,32 @@ fn container_cause(name: &str, status: &serde_json::Value) -> String {
         seg.push_str(&format!(" restarts={restarts}"));
     }
     if let Some(last) = status.pointer("/lastState/terminated") {
+        seg.push_str(&format!(" last {}", terminated_cause(last)));
+    }
+    seg
+}
+
+/// 终止态的读数：原因、退出码，加上容器自己写下的**终止消息**。
+///
+/// 退出码只说"怎么死的"（`1` = 进程自己非零退出，`137` = 被杀），到底为什么是 `1`
+/// 只有容器自己知道——它把死因写进 `terminationMessagePath`，kubelet 读来放进
+/// `state.terminated.message`（退避后的那一次在 `lastState` 里）。判死时刻主容器
+/// 多半已经进了 `CrashLoopBackOff`，真正的死因于是落在 `lastState` 上：只读当前态
+/// 会把一次「连不上 redis」读成「在退避」，而那两件事要去看的地方相反。
+fn terminated_cause(terminated: &serde_json::Value) -> String {
+    let mut seg = format!(
+        "{} exit {}",
+        field(terminated, "reason", "<no reason>"),
+        exit_code(terminated)
+    );
+    if let Some(message) = terminated
+        .get("message")
+        .and_then(|m| m.as_str())
+        .filter(|m| !m.is_empty())
+    {
         seg.push_str(&format!(
-            " last {} exit {}",
-            field(last, "reason", "<no reason>"),
-            exit_code(last)
+            " ({})",
+            bounded(message, SUPPORT_CAUSE_MESSAGE_CHARS)
         ));
     }
     seg
@@ -8199,7 +8233,8 @@ impl RolloutExecutor {
                      {.status.containerStatuses[0].state.waiting.reason}|\
                      {.status.containerStatuses[0].state.waiting.message}|\
                      {.status.containerStatuses[0].state.running.startedAt}|\
-                     {.metadata.deletionTimestamp}{\"\\n\"}{end}",
+                     {.metadata.deletionTimestamp}|\
+                     {.status.containerStatuses[0].lastState.terminated.message}{\"\\n\"}{end}",
                 ],
                 30,
             )
@@ -8842,7 +8877,13 @@ impl RolloutExecutor {
         refs: &RefSnapshots,
     ) -> Result<(), RolloutFailure> {
         let msg = e.to_string();
-        if is_cluster_unreachable(&msg) {
+        let primary = primary_message(&msg);
+        // 判据只读**我们自己写的那一段**（分隔符之前）。分隔符之后是判死那一刻
+        // 从集群贴上的现场读数，其中包含容器自己留下的终止消息——那是自由文本。
+        // 让它参与下面这几条判据，容器一句「connection refused」或「cannot list
+        // resource」就能把一次真坏的版本判成环境类：不回滚、不记账，坏版本留在
+        // 集群上。分隔符存在的理由就是这个。
+        if is_cluster_unreachable(primary) {
             warn!(
                 error = %e,
                 "cluster unreachable during the rollout; keeping the new revision (no rollback)"
@@ -8855,7 +8896,7 @@ impl RolloutExecutor {
                 e,
             ));
         }
-        if is_admission_denied(&msg) {
+        if is_admission_denied(primary) {
             warn!(
                 error = %e,
                 "the API server rejected the new pods and this revision did not change the \
@@ -8869,7 +8910,7 @@ impl RolloutExecutor {
                 e,
             ));
         }
-        if is_placement_blocked(&msg) {
+        if is_placement_blocked(primary) {
             warn!(
                 error = %e,
                 "the scheduler never placed the new pods and this revision did not change the \
@@ -8883,7 +8924,7 @@ impl RolloutExecutor {
                 e,
             ));
         }
-        if is_image_source_unavailable(&msg) {
+        if is_image_source_unavailable(primary) {
             warn!(
                 error = %e,
                 "the new pods never pulled their image, so the new revision has not run once; \
@@ -8899,7 +8940,7 @@ impl RolloutExecutor {
                 e,
             ));
         }
-        if is_new_revision_never_ran(&msg) {
+        if is_new_revision_never_ran(primary) {
             warn!(
                 error = %e,
                 "no pod of the new revision was ever created, so this timeout says nothing \
@@ -8914,7 +8955,7 @@ impl RolloutExecutor {
                 e,
             ));
         }
-        if is_observation_tool_failure(&msg) {
+        if is_observation_tool_failure(primary) {
             warn!(
                 error = %e,
                 "the observation tool itself could not be run; keeping the new revision (no \
@@ -8932,7 +8973,7 @@ impl RolloutExecutor {
         // 授权被拒这一类在滚动中仍回滚并记版本类：改过的东西要退回去。落点写成
         // auth 而不是 observed，好让"因为读不到集群而回滚"与"版本真的没起来"在
         // 记账和报告里分得开。
-        let locus = if is_authorization_denied(&msg) {
+        let locus = if is_authorization_denied(primary) {
             FailureLocus::AuthDenied
         } else {
             FailureLocus::Observed
@@ -9637,6 +9678,48 @@ COPY ["prompts", "/opt/cogneva/prompts"]
             rollout_pods_fatal(&pod_samples("gw-1|Running|true|||2026-09-17T15:46:29Z|\n")),
             None
         );
+    }
+
+    /// 判死时容器自己写下的那一句必须一路进判词。
+    ///
+    /// 判据只说得出「在退避」：`CrashLoopBackOff` 是 kubelet 在说"重启还在退避"，
+    /// 而退避的原因是「连不上 redis」还是「端口被占」，处置完全相反。少了这一句，
+    /// 一轮滚动停在一句「在退避」上，事后回看就是原因不可知。
+    #[test]
+    fn a_fatal_waiting_pod_brings_its_own_death_reason_into_the_verdict() {
+        let sampled = "cogneva-7d9f8b6c-x2m4p|Running|false|CrashLoopBackOff|\
+                       back-off 5m0s restarting failed container=cogneva|2026-10-01T10:37:00Z||\
+                       cogneva startup failed: storage plugin init failed -> connection refused\n";
+        let fatal = rollout_pods_fatal(&pod_samples(sampled)).unwrap();
+        assert!(fatal.contains("waiting=CrashLoopBackOff"), "{fatal}");
+        assert!(
+            fatal.contains("storage plugin init failed"),
+            "the container's own cause must survive into the verdict: {fatal}"
+        );
+        // 没写终止消息的照样只报等待态：空的与「有一句读不懂的话」不同形。
+        assert_eq!(
+            rollout_pods_fatal(&pod_samples(
+                "gw-1|Running|false|CrashLoopBackOff|back-off|2026-09-17T15:46:29Z||\n"
+            )),
+            Some("gw-1 waiting=CrashLoopBackOff".to_string())
+        );
+    }
+
+    /// 容器自己写的那句话只是证据，不许进判据。
+    ///
+    /// 它可以是任何文本，包括与「集群不可达」逐字相同的那句——而那条判据的结论是
+    /// 「不回滚、不记账」。真让它参与，一个连不上 redis 的坏版本就会被读成观测故障，
+    /// 留在集群上再也没人管。分隔符就是为了把这段自由文本挡在判据之外。
+    #[test]
+    fn a_containers_dying_words_do_not_take_part_in_the_verdict() {
+        let fatal = "pod of deployment/cogneva in fatal waiting state \
+                     cogneva-7d9f8b6c-x2m4p waiting=CrashLoopBackOff\
+                     ; why it has not come up: cogneva startup failed: \
+                     storage plugin init failed -> connection refused";
+        // 整条消息读起来就是「集群不可达」，这正是不能拿它当判据的原因。
+        assert!(is_cluster_unreachable(fatal), "{fatal}");
+        // 判据读的是分隔符之前那一段，里面没有这句话。
+        assert!(!is_cluster_unreachable(primary_message(fatal)), "{fatal}");
     }
 
     #[test]
@@ -15255,6 +15338,40 @@ exit 0
         assert_eq!(support_settled("2|2|1|1|1|1|"), Some(true));
         // 两个版本并存：总数超过新版本副本数，说明还有旧的没撤完。
         assert_eq!(support_settled("2|2|1|1|1|2|"), Some(false));
+    }
+
+    /// 容器自己写下的死因必须原样进读数。
+    ///
+    /// 退出码只说「怎么死的」：`exit 1` 同时是「连不上 redis」与「端口被占」，
+    /// 而这两件事要去看的地方相反。只有终止消息能把它们分开——它是容器退出前
+    /// 自己写的那一句，kubelet 从 `terminationMessagePath` 读来放进 Pod 状态。
+    /// 少了它，一轮滚动停在一句 `Error exit 1` 上，事后回看就是「原因不可知」。
+    #[test]
+    fn a_dead_container_brings_its_own_cause_into_the_reading() {
+        let reason = "cogneva startup failed: storage plugin init failed -> connection refused";
+        let crashlooping = r#"{"items":[{"metadata":{"name":"cogneva-7d9f8b6c-x2m4p"},
+          "status":{"phase":"Running","containerStatuses":[
+            {"name":"cogneva","ready":false,"restartCount":4,
+             "state":{"waiting":{"reason":"CrashLoopBackOff",
+               "message":"back-off 5m0s restarting failed container=cogneva"}},
+             "lastState":{"terminated":{"reason":"Error","exitCode":1,"message":"__MSG__"}}}]}}]}"#;
+        // 判死时刻主容器多半已经退避，真正的死因在 `lastState` 上。
+        let reading = causes_of(&crashlooping.replace("__MSG__", reason));
+        assert!(reading.contains(reason), "{reading}");
+
+        // 还没轮到重启的那一次死在 `state.terminated` 上，同一个判据要成立。
+        let exited = r#"{"items":[{"metadata":{"name":"cogneva-7d9f8b6c-x2m4p"},
+          "status":{"phase":"Running","containerStatuses":[
+            {"name":"cogneva","ready":false,"restartCount":0,
+             "state":{"terminated":{"reason":"Error","exitCode":1,"message":"__MSG__"}}}]}}]}"#;
+        let reading = causes_of(&exited.replace("__MSG__", reason));
+        assert!(reading.contains(reason), "{reading}");
+
+        // 没写消息的容器不能多出一对空括号：空读数与「有一句读不懂的话」不同形。
+        let silent = exited.replace(",\"message\":\"__MSG__\"", "");
+        let reading = causes_of(&silent);
+        assert!(!reading.contains("()"), "{reading}");
+        assert!(reading.contains("terminated Error exit 1"), "{reading}");
     }
 
     fn causes_of(pods_json: &str) -> String {

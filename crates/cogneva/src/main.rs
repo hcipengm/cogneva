@@ -28,7 +28,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match command {
         // 完整应用（无参数时的默认行为）。
-        Command::Run => cogneva::run_app().await,
+        //
+        // 死因在交给 `main` 之前先写进容器终止消息：从这里往上，失败只剩 stdout 可走，
+        // 而 stdout 随 Pod 一起消失（回滚时它被删，Loki 也没在收主应用的日志）。终止
+        // 消息由 kubelet 收进 Pod 状态，滚动端判死那一刻正在读那一面，于是这一轮为什么
+        // 没起来能一路走到滚动记录里。写不进去不影响这次失败本身的交付。
+        Command::Run => match cogneva::run_app().await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                cogneva::startup_guard::record_failure(&*e);
+                Err(e)
+            }
+        },
         Command::Help => {
             println!("{USAGE}");
             Ok(())
