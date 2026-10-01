@@ -54,7 +54,7 @@ impl LlmPoolStatusSource for RedisLlmPoolStatusSource {
             Ok(Some(text)) => match serde_json::from_str(&text) {
                 Ok(status) => Some(status),
                 Err(e) => {
-                    tracing::warn!(error = %e, "LLM pool status snapshot malformed, treated as healthy");
+                    tracing::warn!(error = %e, "LLM pool status snapshot malformed, no verdict this pass");
                     None
                 }
             },
@@ -90,12 +90,23 @@ impl LlmPoolGuard {
         }
     }
 
-    /// Run one pass. The gate is driven to match the observed snapshot every
-    /// time, so a restarted scheduler converges; the returned transition lets
-    /// the caller emit an event only on edges.
+    /// Run one pass. The gate is driven to match the observed snapshot whenever
+    /// there is one, so a restarted scheduler converges; the returned transition
+    /// lets the caller emit an event only on edges.
+    ///
+    /// A pass that reads no snapshot changes nothing: the gate keeps the state
+    /// the last reading put it in and no edge is reported. Both halves of the
+    /// signal roll — the gateway publishes it and redis holds it, and every
+    /// deployment restarts both — so an absent snapshot is an ordinary sight
+    /// during a rollout. Reading it as "the pool is fine" would resume work that
+    /// cannot succeed, and would report a recovery on every restart, which makes
+    /// the alert's own `fired_at` the time of the last rollout instead of the
+    /// time the pool went down. Absence is not a verdict in either direction.
     pub async fn enforce(&self) -> PoolTransition {
-        let snapshot = self.source.status().await;
-        let down = snapshot.as_ref().is_some_and(|s| s.unavailable);
+        let Some(snapshot) = self.source.status().await else {
+            return PoolTransition::Steady;
+        };
+        let down = snapshot.unavailable;
 
         if down {
             self.gate.pause_kind(TaskClass::LlmDependent);
@@ -105,7 +116,7 @@ impl LlmPoolGuard {
 
         let was_down = self.was_down.swap(down, Ordering::SeqCst);
         match (was_down, down) {
-            (false, true) => PoolTransition::Down(snapshot.unwrap_or_default()),
+            (false, true) => PoolTransition::Down(snapshot),
             (true, false) => PoolTransition::Recovered,
             _ => PoolTransition::Steady,
         }
@@ -208,13 +219,19 @@ mod tests {
         }
     }
 
+    /// A snapshot that says the pool can serve again is a verdict, and only a
+    /// verdict resumes the class.
+    fn available_status() -> LlmPoolStatus {
+        LlmPoolStatus::default()
+    }
+
     #[tokio::test]
     async fn pauses_on_down_and_resumes_on_recovery() {
         let gate = Arc::new(SchedulerGate::new());
         let source = Arc::new(ScriptedSource::new(vec![
             Some(down_status()),
             Some(down_status()),
-            None,
+            Some(available_status()),
         ]));
         let guard = LlmPoolGuard::new(source, gate.clone());
 
@@ -229,10 +246,41 @@ mod tests {
         assert!(!gate.is_paused_kind(TaskClass::LlmDependent));
     }
 
+    /// The gateway and redis both restart on every deployment, so a pass with no
+    /// snapshot is routine. It must not undo the pause, and it must not report a
+    /// recovery: a reported recovery resolves the alert and the next firing edge
+    /// re-dates it, which turns the pool-down alert's start time into the time of
+    /// the last rollout.
+    #[tokio::test]
+    async fn an_absent_snapshot_is_neither_a_recovery_nor_a_pause_lift() {
+        let gate = Arc::new(SchedulerGate::new());
+        let source = Arc::new(ScriptedSource::new(vec![
+            Some(down_status()),
+            None,
+            None,
+            Some(available_status()),
+        ]));
+        let guard = LlmPoolGuard::new(source, gate.clone());
+
+        assert_eq!(guard.enforce().await, PoolTransition::Down(down_status()));
+
+        assert_eq!(guard.enforce().await, PoolTransition::Steady);
+        assert!(gate.is_paused_kind(TaskClass::LlmDependent));
+
+        // Still no verdict: the pause holds and no edge is invented.
+        assert_eq!(guard.enforce().await, PoolTransition::Steady);
+        assert!(gate.is_paused_kind(TaskClass::LlmDependent));
+
+        // The absent passes did not move the latch either: the first readable
+        // verdict after them still reads as the recovery edge.
+        assert_eq!(guard.enforce().await, PoolTransition::Recovered);
+        assert!(!gate.is_paused_kind(TaskClass::LlmDependent));
+    }
+
     #[tokio::test]
     async fn healthy_pool_never_pauses() {
         let gate = Arc::new(SchedulerGate::new());
-        let source = Arc::new(ScriptedSource::new(vec![None]));
+        let source = Arc::new(ScriptedSource::new(vec![Some(available_status())]));
         let guard = LlmPoolGuard::new(source, gate.clone());
         assert_eq!(guard.enforce().await, PoolTransition::Steady);
         assert!(!gate.is_paused_kind(TaskClass::LlmDependent));
