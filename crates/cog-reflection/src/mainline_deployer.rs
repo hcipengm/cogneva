@@ -626,9 +626,12 @@ const SUPPORT_WORKLOAD_KINDS: &[&str] = &[
 const PREFLIGHT_RETRYING_READS: u64 = 3;
 
 /// 支撑工作负载"这次滚动可以往下走了"的读法：代数、观测到的代数、期望副本数、
-/// 就绪副本数。竖线显式占位，缺字段（omitempty）不能顶掉后面的位置。
-const SUPPORT_SETTLE_JSONPATH: &str =
-    "jsonpath={.metadata.generation}|{.status.observedGeneration}|{.spec.replicas}|{.status.readyReplicas}";
+/// 就绪副本数、新版本副本数、现有副本总数。竖线显式占位，缺字段（omitempty）不能
+/// 顶掉后面的位置。
+///
+/// 后两个字段是这一条判据的关键，不是陪衬：光看"期望几个、就绪几个"读不出
+/// "旧 Pod 正在被换掉"这件事（见 [`support_settled`]）。
+const SUPPORT_SETTLE_JSONPATH: &str = "jsonpath={.metadata.generation}|{.status.observedGeneration}|{.spec.replicas}|{.status.readyReplicas}|{.status.updatedReplicas}|{.status.replicas}";
 
 /// 支撑工作负载等不到就绪时，贴在判词后面的现场读数与主判词之间的分隔。**判据
 /// 只读它前面那一段**（见 [`primary_message`]）：分隔之后的内容来自集群（Pod 的
@@ -6931,11 +6934,25 @@ fn changed_workloads(
         .collect()
 }
 
-/// 支撑工作负载是否已经回到"这次滚动可以往下走"：控制器已经处理过这一代 spec
-/// （observedGeneration 追平 generation），且就绪副本数达到 spec 要的数目。读法
-/// 解析不出来就返回 None（没读到答案，不是"就绪"）。spec.replicas 缺省时按 1
+/// 支撑工作负载是否已经回到"这次滚动可以往下走"。读法
+/// = `generation|observed|want|ready|updated|running`，三条同时成立才算数：
+///
+/// - `observed >= generation`：控制器已经处理过这一代 spec。
+/// - `updated >= want` 且 `running <= updated`：新版本的副本补齐了、旧版本的副本
+///   撤干净了。**这一条才是这个等待真正的判据**。只看 `ready >= want` 在换 Pod 的
+///   整个窗口里读到的东西与常态一字不差：Deployment 默认先起新副本（`maxSurge`）
+///   再撤旧副本，旧副本一路 Ready，`readyReplicas` 全程等于 `want`；StatefulSet 在
+///   新旧之间总有一个 Pod 顶着，被判删的那个 Pod 也还带着 Ready 条件。于是"旧 Pod
+///   已经下线、新 Pod 还没监听"这一整段——恰恰是这个等待存在的理由——会被判成
+///   "就绪"，等待当场放行，而这次 apply 刚重启过的那个支撑负载正是此刻不可用。
+///   换成"新版本副本数 + 现有副本总数"，判据在故障期间就动了。
+/// - `ready >= want`：新副本还要真的过就绪探针。`updatedReplicas` 数的是新版本的
+///   Pod，不看它是否 Ready，单靠它会把"Pod 已创建、探针还没过"判成就绪。
+///
+/// 读法解析不出来就返回 None（没读到答案，不是"就绪"）。spec.replicas 缺省时按 1
 /// 算：Deployment/StatefulSet 的缺省都是 1，读成 0 会把一个单副本工作负载判成
-/// "不需要就绪"而直接放行。
+/// "不需要就绪"而直接放行。`updatedReplicas` / `replicas` 缺省按 0 算：这两个字段
+/// 都是 optional，缺省即真的为 0，而 0 在 `updated >= want` 一侧是保守方向。
 fn support_settled(readout: &str) -> Option<bool> {
     let mut parts = readout.split('|');
     let generation: i64 = parts.next()?.trim().parse().ok()?;
@@ -6948,7 +6965,15 @@ fn support_settled(readout: &str) -> Option<bool> {
         .next()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(0);
-    Some(observed >= generation && ready >= want)
+    let updated: i32 = parts
+        .next()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    let running: i32 = parts
+        .next()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    Some(observed >= generation && ready >= want && updated >= want && running <= updated)
 }
 
 /// 一个还没就绪的支撑工作负载，它现在那批 Pod 说了什么。
@@ -7656,7 +7681,10 @@ impl RolloutExecutor {
                 if support_settled(&readout) == Some(true) {
                     continue;
                 }
-                last = format!("{} generation|observed|want|ready={readout}", w.display());
+                last = format!(
+                    "{} generation|observed|want|ready|updated|running={readout}",
+                    w.display()
+                );
                 still.push(w);
             }
             pending = still;
@@ -15195,20 +15223,38 @@ exit 0
     }
 
     #[test]
-    fn support_settled_requires_observed_generation_and_ready_replicas() {
-        // generation|observed|want|ready
-        assert_eq!(support_settled("2|2|1|1|"), Some(true));
+    fn support_settled_requires_observed_generation_and_new_replicas() {
+        // generation|observed|want|ready|updated|running
+        assert_eq!(support_settled("2|2|1|1|1|1|"), Some(true));
         // 控制器还没看到这一代 spec：新副本一个都还没起。
-        assert_eq!(support_settled("2|1|1|1|"), Some(false));
+        assert_eq!(support_settled("2|1|1|1|1|1|"), Some(false));
         // 滚动中：就绪副本还没补齐。
-        assert_eq!(support_settled("2|2|3|2|"), Some(false));
+        assert_eq!(support_settled("2|2|3|2|2|3|"), Some(false));
         // 缩到 0 副本：spec 要 0 个，就绪 0 个成立。
-        assert_eq!(support_settled("2|2|0|"), Some(true));
+        assert_eq!(support_settled("2|2|0||||"), Some(true));
         // replicas 缺省（读作 1）而就绪数读不到：不能当成"不需要就绪"。
         assert_eq!(support_settled("2|2||"), Some(false));
         // 读不出来不是"就绪"。
         assert_eq!(support_settled(""), None);
         assert_eq!(support_settled("|2|1|1|"), None);
+    }
+
+    /// 换掉自己最后一个 Pod 的支撑负载不算就绪。
+    ///
+    /// 实测（2026-10-01 `cogneva-mainline-26101b509588`）：`statefulset/redis`
+    /// 被这次 apply 重启，`wait_support_settled` 当场返回，84 秒后 `cogneva` 滚下来
+    /// 时 redis 还没监听，主应用起不来、CrashLoopBackOff、整轮回滚。当时读到的正是
+    /// 第一行——判据只看 `ready >= want`，与常态一字不差。
+    #[test]
+    fn a_support_workload_replacing_its_last_pod_is_not_settled() {
+        // 旧 Pod 还在（ready=1），新版本的副本 0 个：正在换，只是还没换完。
+        assert_eq!(support_settled("2|2|1|1|0|1|"), Some(false));
+        // 新 Pod 起来了（updated=1），但还没过就绪探针。
+        assert_eq!(support_settled("2|2|1|0|1|1|"), Some(false));
+        // 新 Pod 就绪，旧版本的副本撤干净。
+        assert_eq!(support_settled("2|2|1|1|1|1|"), Some(true));
+        // 两个版本并存：总数超过新版本副本数，说明还有旧的没撤完。
+        assert_eq!(support_settled("2|2|1|1|1|2|"), Some(false));
     }
 
     fn causes_of(pods_json: &str) -> String {
@@ -15321,7 +15367,7 @@ exit 0
     #[test]
     fn a_settle_cause_cannot_change_the_locus_of_the_failure() {
         let primary = "support workload this rollout restarted did not become ready within 900s: \
-                       deploy/cogneva-registry generation|observed|want|ready=2|2|1|0";
+                       deploy/cogneva-registry generation|observed|want|ready|updated|running=2|2|1|0|0|1";
         // 正文本该判"观测到的版本缺陷"。
         assert_eq!(locate_before_any_change(primary), FailureLocus::Observed);
         // 附着的那一段里三种环境类措辞都出现，落点仍只看正文。
@@ -15575,7 +15621,7 @@ case "$*" in
   *"get deployment cogneva-registry -o"*)
     n=$(cat '{count}' 2>/dev/null || echo 0)
     n=$((n+1)); echo "$n" > '{count}'
-    if [ "$n" -ge {settle_at} ]; then touch '{settled}'; echo "2|2|1|1|"; else echo "2|1|1|0|"; fi
+    if [ "$n" -ge {settle_at} ]; then touch '{settled}'; echo "2|2|1|1|1|1|"; else echo "2|1|1|0|0|0|"; fi
     ;;
   *"get deployment "*)
     echo "1|1|1|1|1|" ;;
@@ -15784,7 +15830,7 @@ case "$*" in
   *"get statefulset -o"*) ;;
   # 被 patch 过之后代数才算前进，等它就绪才是"等这次 apply 动过的工作负载"。
   *"get deployment cogneva-patcher -o"*)
-    if [ -f '{patched}' ]; then touch '{settled}'; echo "2|2|1|1|"; else echo "1|1|1|1|"; fi
+    if [ -f '{patched}' ]; then touch '{settled}'; echo "2|2|1|1|1|1|"; else echo "1|1|1|1|0|1|"; fi
     ;;
   *"patch deployment cogneva-patcher"*) touch '{patched}'; echo "deployment.apps/cogneva-patcher patched" ;;
   *"patch deployment cogneva "*) touch '{patched}'; echo "deployment.apps/cogneva patched" ;;
