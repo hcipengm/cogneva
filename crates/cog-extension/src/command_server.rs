@@ -23,7 +23,7 @@ use serde::Deserialize;
 use tracing::warn;
 
 use crate::hostdocs::{HostDocOp, HostDocPlan, HostDocs};
-use crate::workdir::{self, WorkdirRouter, WorktreeUse};
+use crate::workdir::{self, CommandHold, WorkdirRouter};
 
 #[derive(Clone)]
 struct AppState {
@@ -99,7 +99,7 @@ fn single_shot(result: std::io::Result<String>) -> tokio::sync::mpsc::Receiver<C
 async fn resolve_workdir(
     state: &AppState,
     task_id: Option<&str>,
-) -> Result<(Option<PathBuf>, Option<PathBuf>, Option<WorktreeUse>), Box<Response>> {
+) -> Result<(Option<PathBuf>, Option<PathBuf>, Option<CommandHold>), Box<Response>> {
     let Some(router) = state.workdir.as_ref() else {
         return Ok((None, None, None));
     };
@@ -112,7 +112,7 @@ async fn resolve_workdir(
             Ok((dir, claim)) => Ok((
                 Some(dir),
                 Some(router.target_dir().to_path_buf()),
-                Some(claim),
+                Some(router.command_hold(Some(claim)).await),
             )),
             Err(e) => {
                 router.metrics().inc_error("route");
@@ -125,10 +125,17 @@ async fn resolve_workdir(
         None => {
             // The business side must stamp identity (require_tool_identity);
             // an unstamped request still runs for compatibility, but outside
-            // any task tree and is counted for observability.
+            // any task tree and is counted for observability. It builds into the
+            // shared cache like any other command, so it takes the command slot
+            // all the same: a command that is not tracked is a build the
+            // reclamation pass cannot see.
             router.metrics().inc_unscoped();
             tracing::warn!("sandbox request without task id; running outside per-task worktree");
-            Ok((None, Some(router.target_dir().to_path_buf()), None))
+            Ok((
+                None,
+                Some(router.target_dir().to_path_buf()),
+                Some(router.command_hold(None).await),
+            ))
         }
     }
 }
@@ -208,6 +215,13 @@ async fn metrics_handler(State(state): State<AppState>) -> Response {
         .as_ref()
         .map(|r| r.metrics().render())
         .unwrap_or_default();
+    // The build cache this executor's commands write into. Rendered from the
+    // readings rather than from the prometheus registry the counters above live
+    // in, because the same family is served by the other process that owns a
+    // cache and both sides go through one renderer -- see `crate::build_cache`.
+    if let Some(router) = state.workdir.as_ref() {
+        body.push_str(&crate::build_cache::render(router.build_cache()).await);
+    }
     body.push_str(&crate::runtime::cgroup::render());
     // Document access is off unless a scope is configured, so its counters are
     // only worth rendering where something can move them.

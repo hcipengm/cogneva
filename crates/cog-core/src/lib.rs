@@ -1,4 +1,7 @@
 pub mod audit;
+pub mod build_cache;
+pub mod build_cache_readings;
+pub mod build_cache_reclaim;
 pub mod build_gate;
 pub mod claim_footprint;
 pub mod config;

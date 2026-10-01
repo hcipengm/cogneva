@@ -89,14 +89,16 @@ fn signal_death_note(sig: i32, facts: &super::cgroup::MemoryFacts, oom: bool) ->
 ///
 /// `hold` is kept until the child has exited, which is not the same moment the
 /// caller stops reading: a client that disconnects mid-command leaves it
-/// running, and the executor's claim on the worktree has to last that long or
-/// the tree could be reclaimed underneath it.
+/// running, and both facts it carries -- the executor's claim on the worktree
+/// and its place in the command slot the cache pass reads -- have to last that
+/// long, or the tree could be reclaimed underneath the command and the cache
+/// emptied while it builds.
 pub(crate) fn spawn_command(
     command: &str,
     timeout: std::time::Duration,
     workdir: Option<&Path>,
     cargo_target: Option<&Path>,
-    hold: Option<crate::workdir::WorktreeUse>,
+    hold: Option<crate::workdir::CommandHold>,
 ) -> SFResult<tokio::sync::mpsc::Receiver<CommandEvent>> {
     let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c")

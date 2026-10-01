@@ -317,6 +317,26 @@ sandboxExecutor:
   workspaceGcIntervalSecs: 600
   repoFetchIntervalSecs: 300
   maxTaskWorkspaces: 8
+  # 本 Pod 自己那块构建缓存（`CARGO_TARGET_DIR`）的上限与复测周期。**它与进化侧
+  # 的 `evolution.workspaces.targetMaxBytes` 是两个对象，不是同一个旋钮的两种写法**：
+  # 那份认的是路径，而同一串路径在进化 Pod 里落在 `evolution-source-pvc` 上、在这里
+  # 落在 `cogneva-sandbox-pvc` 上，界跟着路径走的时候卷不会跟着走。
+  # 0 = 只量不封顶（进化的同类旋钮至今的出厂值）。这里给 3 GiB 而不是 0：
+  # 上限必须落在**这块卷**里，而卷的声明量（5Gi）是部署自己给的预算，所以推得出来——
+  # 5 GiB 减去同住者的实测占用：`CARGO_HOME` 681 MiB（会随依赖增长）、裸仓库 54 MiB、
+  # 8 个任务工作树各约 80 MiB（源码树实测 75 MiB，`.git` 是指向共享裸仓库的文件）
+  # ≈ 0.64 GiB、宿主文档日志按上限 8 MiB 计。余量取整到 3 GiB：给 cargo-home 的增长
+  # 留了余量，且缓存占不到声明量的六成，所以"卷被缓存顶到声明量以上"这件事从结构上
+  # 不会发生（声明量在 local-path 下不被强制，不会被拒绝，只会让那条使用率读数说谎）。
+  # 给低了会被显式报成"到不了上限"（每层至少留一份最新文件，这个地板比上限高时
+  # 回收器不假装收敛），所以这个数不是单调越小小越好的旋钮。
+  # 回收只在**本执行器没有命令在跑**时执行——槽位由命令的整个子进程寿命持有，
+  # 所以删除不会撞上正在编译的文件；代价是任务密集时它会一直报 `busy`。
+  buildCacheMaxBytes: 3221225472
+  # 复测周期（秒）：缓存的占用按层读成 `cogneva_build_target_bytes`。走一遍只取
+  # 元数据，但这棵树有几十万条，且沙箱同时在编译，比分钟更勤没有价值；进程侧有下限
+  # 兜底（取小于它的值等于取下限），而发布出来的间隔是**兜底后的那个数**。
+  buildCacheScanIntervalSecs: 300
   resources:
     requests:
       cpu: 100m

@@ -55,6 +55,16 @@
 //!    running build would fail that build for a reason that has nothing to do
 //!    with it, which is how a host problem gets recorded as a change's fault.
 //!
+//! **Why this lives in `cog-core` rather than next to the process that first
+//! needed it.** Two processes drop bytes from a cargo cache: the one that runs a
+//! deployment's own builds, and the sandbox executor, whose `CARGO_TARGET_DIR`
+//! is a path that lands on a different volume of its own. They cannot depend on
+//! each other -- the sandbox executor sits below every crate that builds -- and
+//! two spellings of "which file goes first" would give the same cache two
+//! answers. So the rules are one artifact, and the crate that both can see is
+//! this one. Each process supplies its own gate, its own cap and its own
+//! volume; nothing here knows about a process, only about a tree.
+//!
 //! What is *not* here is any notion of which workspace a file belongs to. In
 //! this deployment every workspace builds into one `CARGO_TARGET_DIR`, and
 //! cargo's paths carry no workspace identity, so there is no reading that could
@@ -66,7 +76,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use cog_core::fs_size::{FileEntry, FileId};
+use crate::fs_size::{FileEntry, FileId};
 
 /// Layers whose loss costs only time, in the order they are given up.
 ///

@@ -73,21 +73,25 @@ const PRODUCED: &[(&str, &str)] = &[
     // The cap family. Two of them are read by the rules that decide whether the
     // cap is being enforced at all: over-limit is what says there is something
     // to pay down, and the pair of timestamps is what says no pass has.
+    // The names are named in the contract file rather than in either publisher:
+    // two processes measure a cache of this shape on two volumes that are not
+    // each other's, so a second spelling of any of them would leave a rule
+    // reading one process's cache and a panel the other's.
     (
         "cogneva_build_target_unmet_bytes",
-        "crates/cog-reflection/src/build_cache_readings.rs",
+        "crates/cog-core/src/build_cache.rs",
     ),
     (
         "cogneva_build_target_over_limit_bytes",
-        "crates/cog-reflection/src/build_cache_readings.rs",
+        "crates/cog-core/src/build_cache.rs",
     ),
     (
         "cogneva_build_target_last_reclaim_seconds",
-        "crates/cog-reflection/src/build_cache_readings.rs",
+        "crates/cog-core/src/build_cache.rs",
     ),
     (
         "cogneva_build_target_scan_interval_seconds",
-        "crates/cog-reflection/src/build_cache_readings.rs",
+        "crates/cog-core/src/build_cache.rs",
     ),
     // The change queue. The role flag is read on its own, because it is the only
     // one of the four a process publishes without draining the queue: the rule

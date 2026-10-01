@@ -29,8 +29,13 @@ pub const REFLECTION_NAMESPACE: &str = "reflection";
 
 pub mod auto_promoter;
 pub mod baseline_port;
-pub mod build_cache_readings;
-pub mod build_cache_reclaim;
+// The readings and the rules of the shared build cache live in cog-core: two
+// processes measure one and drop bytes from it (this deployment's builder and
+// the sandbox executor), and neither may depend on the other. See the module
+// docs for the one thing they do not share, the fact that says a build is
+// running.
+pub use cog_core::build_cache_readings;
+pub use cog_core::build_cache_reclaim;
 pub mod buildah_store;
 pub mod change_execution;
 pub mod change_pipeline;

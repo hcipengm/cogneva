@@ -158,6 +158,14 @@ spec:
               value: "300"
             - name: SANDBOX_MAX_TASK_WORKSPACES
               value: "8"
+            # 上面那条 `CARGO_TARGET_DIR` 的上限与复测周期。**必须与进化侧那份分开
+            # 声明**：同一串路径在两个 Pod 里落在两块不同的卷上，所以"界在路径上"
+            # 时只有给路径的那一侧被界住。取值理由在 values 里（按这块卷的声明量减去
+            # 同住者推出），这里不重复；单一源是 values.yaml。
+            - name: SANDBOX_BUILD_CACHE_MAX_BYTES
+              value: "3221225472"
+            - name: SANDBOX_BUILD_CACHE_SCAN_INTERVAL_SECS
+              value: "300"
             # 本 Pod 的卷只有这一张，而它既装着工作树又装着构建缓存，是沙箱里
             # 最可能先写满的卷；不声明就没人量它——同一个路径在本 Pod 里是这张
             # claim，在别的 Pod 里不是。子挂载（宿主文档范围）由进程读自己的

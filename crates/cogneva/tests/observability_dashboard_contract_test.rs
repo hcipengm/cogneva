@@ -207,7 +207,7 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
     (
         "cogneva_build_target_bytes",
         &["dir", "layer"],
-        "crates/cog-reflection/src/build_cache_readings.rs",
+        "crates/cog-core/src/build_cache.rs",
     ),
     // The age of the reading above. Published separately because a failed walk
     // keeps the last size, so this is the only series that can tell a cache
@@ -215,7 +215,7 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
     (
         "cogneva_build_target_bytes_scan_age_seconds",
         &["dir"],
-        "crates/cog-reflection/src/build_cache_readings.rs",
+        "crates/cog-core/src/build_cache.rs",
     ),
     // What the cap is, so a panel can draw the cache against it rather than
     // beside it. Published as a flat zero when no cap is set: measured and
@@ -224,13 +224,13 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
     (
         "cogneva_build_target_bytes_cap",
         &["dir"],
-        "crates/cog-reflection/src/build_cache_readings.rs",
+        "crates/cog-core/src/build_cache.rs",
     ),
     // The part of what is held that the cap says should not be there.
     (
         "cogneva_build_target_over_limit_bytes",
         &["dir"],
-        "crates/cog-reflection/src/build_cache_readings.rs",
+        "crates/cog-core/src/build_cache.rs",
     ),
     // The part of that a pass could not reach. A cap that cannot be met reads
     // here and nowhere else -- the plan reaching no further is
@@ -238,7 +238,7 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
     (
         "cogneva_build_target_unmet_bytes",
         &["dir"],
-        "crates/cog-reflection/src/build_cache_readings.rs",
+        "crates/cog-core/src/build_cache.rs",
     ),
     // What passes actually freed, and when one last did. The count is what
     // separates a cap holding because it is enforced from one holding because
@@ -247,12 +247,12 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
     (
         "cogneva_build_target_reclaimed_bytes_total",
         &["dir"],
-        "crates/cog-reflection/src/build_cache_readings.rs",
+        "crates/cog-core/src/build_cache.rs",
     ),
     (
         "cogneva_build_target_last_reclaim_seconds",
         &["dir"],
-        "crates/cog-reflection/src/build_cache_readings.rs",
+        "crates/cog-core/src/build_cache.rs",
     ),
     // Every over-cap pass, split by how it ended. The outcome label is the
     // whole reading: reclaimed, unmet, busy and ungated are four different
@@ -260,7 +260,7 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
     (
         "cogneva_build_target_over_cap_total",
         &["dir", "outcome"],
-        "crates/cog-reflection/src/build_cache_readings.rs",
+        "crates/cog-core/src/build_cache.rs",
     ),
     // The background loop census and its liveness. The loop label is the only
     // label these carry: the same loop runs in every process that enables its

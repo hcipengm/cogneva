@@ -34,8 +34,12 @@ use cog_core::claim_footprint::{ClaimFootprint, ClaimMount};
 use cog_core::{SFError, SFResult};
 use prometheus::{Counter, CounterVec, Encoder, Gauge, GaugeVec, Opts, Registry, TextEncoder};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, warn};
+
+use cog_core::build_cache_readings::{BuildCacheReadings, CacheSlot};
+
+use crate::build_cache::{BuildCacheConfig, CommandSlot, SANDBOX_BUILD_CACHE_LOOP};
 
 /// Loop name reported through the background-loop liveness family.
 pub const WORKTREE_GC_LOOP: &str = "extension_worktree_gc";
@@ -88,6 +92,8 @@ pub struct WorkdirConfig {
     pub data_volume_declaration_error: Option<String>,
     /// How often each declared volume is re-walked.
     pub data_volume_interval: Duration,
+    /// What bounds the build cache the commands of this executor write into.
+    pub build_cache: BuildCacheConfig,
 }
 
 impl WorkdirConfig {
@@ -171,6 +177,7 @@ impl WorkdirConfig {
                 cog_core::claim_footprint::DEFAULT_SCAN_INTERVAL_SECS,
                 cog_core::claim_footprint::MIN_SCAN_INTERVAL_SECS,
             ),
+            build_cache: BuildCacheConfig::from_env(),
         }
     }
 }
@@ -349,6 +356,18 @@ impl Drop for WorktreeUse {
     }
 }
 
+/// What a command holds for as long as its child may live.
+///
+/// Two facts, one lifetime: the claim that keeps its worktree from being
+/// reclaimed, and the place in this process's command slot that keeps the build
+/// cache from being emptied underneath it. Both have to outlast the response
+/// stream rather than end with it -- a client that disconnects mid-command
+/// leaves the child running.
+pub struct CommandHold {
+    _claim: Option<WorktreeUse>,
+    _slot: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
 /// A panic elsewhere while the claim map was held must not turn every later
 /// reclamation into a panic of its own: the map holds counts of running
 /// commands, not data that can be left half-written, so a poisoned lock is read
@@ -375,6 +394,15 @@ pub struct WorkdirRouter {
     /// the directory it is measured against are fixed together for the life of
     /// the process.
     footprints: Vec<Arc<ClaimFootprint>>,
+    /// The build cache every command of this process writes into, measured and
+    /// bounded on a timer. Here rather than in a module of its own because the
+    /// fact that bounds it is this router's own: the commands it is running.
+    build_cache: Arc<BuildCacheReadings>,
+    /// What says whether a command is running: every command holds a read guard
+    /// for as long as its child may live, and a reclaim pass takes the write
+    /// guard. Held across a command's whole life on purpose -- a client that
+    /// disconnects mid-command leaves it running.
+    command_lock: Arc<RwLock<()>>,
 }
 
 impl WorkdirRouter {
@@ -402,6 +430,7 @@ impl WorkdirRouter {
                 ))
             })
             .collect();
+        let build_cache = Arc::new(cfg.build_cache.readings(cfg.target_dir.clone()));
         Ok(Arc::new(Self {
             cfg,
             meta_dir,
@@ -409,6 +438,8 @@ impl WorkdirRouter {
             in_use: std::sync::Mutex::new(std::collections::HashMap::new()),
             metrics,
             footprints,
+            build_cache,
+            command_lock: Arc::new(RwLock::new(())),
         }))
     }
 
@@ -448,6 +479,32 @@ impl WorkdirRouter {
 
     pub fn metrics(&self) -> &WorkdirMetrics {
         &self.metrics
+    }
+
+    /// The build cache this process's commands write into, as measured.
+    pub fn build_cache(&self) -> &Arc<BuildCacheReadings> {
+        &self.build_cache
+    }
+
+    /// The fact a build-cache reclamation pass needs: free only while no command
+    /// of this process is running. See [`crate::build_cache`] for why this
+    /// executor's own commands are what answers that question here.
+    pub fn build_cache_slot(&self) -> Arc<dyn CacheSlot> {
+        Arc::new(CommandSlot::new(Arc::clone(&self.command_lock)))
+    }
+
+    /// Register a command that is about to run, holding its claim on a task
+    /// worktree (when it has one) for as long as its child may live.
+    ///
+    /// Awaited rather than tried: a command that arrives while a reclamation
+    /// pass is deleting from the cache waits for the pass instead of building
+    /// against a half-emptied one. The wait is bounded by the pass, and the pass
+    /// is bounded by the size of the plan it is carrying out.
+    pub async fn command_hold(&self, claim: Option<WorktreeUse>) -> CommandHold {
+        CommandHold {
+            _claim: claim,
+            _slot: self.command_lock.clone().read_owned().await,
+        }
     }
 
     /// Claim a tree for a command about to run in it. Counted, because two
@@ -913,6 +970,35 @@ impl WorkdirRouter {
                 }
             },
         ));
+        // The cache every command here builds into. Spawned whether or not a cap
+        // is configured: measuring it is what makes the cap a decision somebody
+        // can make, and the size is the reading that says when to make it.
+        let cache = Arc::clone(&self.build_cache);
+        let slot = self.build_cache_slot();
+        let cache_interval = Duration::from_secs(cache.scan_interval_secs());
+        // No stop signal and no exit of its own: ending means the cache stops
+        // being measured, and a cache nobody measures reads exactly like one
+        // that is not growing.
+        drop(cog_core::loop_health::spawn_unstoppable(
+            SANDBOX_BUILD_CACHE_LOOP,
+            cog_core::loop_health::Cadence::Periodic(cache_interval),
+            // Rebuilt per attempt, so everything the body consumes is cloned here.
+            move |beat| {
+                let cache = Arc::clone(&cache);
+                let slot = Arc::clone(&slot);
+                async move {
+                    let mut ticker = tokio::time::interval(cache_interval);
+                    loop {
+                        // The first tick of a fresh interval completes at once, so
+                        // the deployment has a size reading from the start rather
+                        // than one interval later.
+                        beat.beat();
+                        ticker.tick().await;
+                        cache.measure_and_enforce(Some(slot.as_ref())).await;
+                    }
+                }
+            },
+        ));
     }
 
     // -- internals -------------------------------------------------------------
@@ -1286,6 +1372,7 @@ pub(crate) mod tests {
             }],
             data_volume_declaration_error: None,
             data_volume_interval: Duration::from_secs(30),
+            build_cache: BuildCacheConfig::default(),
         };
         WorkdirRouter::new(cfg).unwrap()
     }
@@ -1341,6 +1428,70 @@ pub(crate) mod tests {
         ));
     }
 
+    /// The cache this executor's commands build into is bounded here, by the
+    /// one fact this process has: whether it is running a command. With one
+    /// running the pass deletes nothing and is counted as deferred; with none,
+    /// the same pass brings the cache under the cap.
+    ///
+    /// The pairing is the point. A pass that only measured, or one that deleted
+    /// while a command was reading the cache, would both read as "the bound is
+    /// being enforced" from the byte total alone.
+    #[tokio::test]
+    async fn the_build_cache_is_reclaimed_only_while_no_command_is_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let target = tmp.path().join("src").join("target");
+        for name in ["one", "two", "three"] {
+            let path = target.join("release/incremental").join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, vec![b'x'; 1000]).unwrap();
+        }
+        std::fs::create_dir_all(target.join("release/deps")).unwrap();
+        std::fs::write(target.join("release/deps/lib.rlib"), vec![b'x'; 1000]).unwrap();
+
+        let cfg = WorkdirConfig {
+            workspaces_root: tmp.path().join("workspaces"),
+            bare_repo: bare.clone(),
+            target_dir: target.clone(),
+            seed_urls: Vec::new(),
+            ttl: DEFAULT_TTL_SECS_FALLBACK,
+            gc_interval: Duration::from_secs(600),
+            fetch_interval: Duration::from_secs(300),
+            max_workspaces: 8,
+            data_volumes: Vec::new(),
+            data_volume_declaration_error: None,
+            data_volume_interval: Duration::from_secs(30),
+            build_cache: BuildCacheConfig {
+                max_bytes: 3000,
+                scan_interval: Duration::from_secs(300),
+            },
+        };
+        let router = WorkdirRouter::new(cfg).unwrap();
+        let slot = router.build_cache_slot();
+        let on_disk = || cog_core::fs_size::dir_size_bytes(&target, &[]).unwrap();
+
+        let running = router.command_hold(None).await;
+        router
+            .build_cache()
+            .measure_and_enforce(Some(slot.as_ref()))
+            .await;
+        assert_eq!(on_disk(), 4000, "a running command freezes the cache");
+
+        drop(running);
+        router
+            .build_cache()
+            .measure_and_enforce(Some(slot.as_ref()))
+            .await;
+        let after = on_disk();
+        assert!(after <= 3000, "the pass left {after} bytes over a 3000 cap");
+
+        // Both ends are readable on the surface the deployment scrapes, so
+        // "nothing was removed" and "nothing is running" can be told apart.
+        let text = crate::build_cache::render(router.build_cache()).await;
+        assert!(text.contains("outcome=\"busy\"} 1"), "{text}");
+        assert!(text.contains("outcome=\"reclaimed\"} 1"), "{text}");
+    }
+
     /// Two volumes are two readings, each joined against its own declaration:
     /// one number covering both would hide an overrun on the volume that
     /// overran behind the one that did not.
@@ -1376,6 +1527,7 @@ pub(crate) mod tests {
             ],
             data_volume_declaration_error: None,
             data_volume_interval: Duration::from_secs(30),
+            build_cache: BuildCacheConfig::default(),
         };
         let r = WorkdirRouter::new(cfg).unwrap();
         r.measure_volumes_once().await;
@@ -1409,7 +1561,12 @@ pub(crate) mod tests {
         router_watching(tmp.path(), &bare, "cogneva-sandbox-pvc", &volume).spawn_maintenance();
 
         let names = cog_core::loop_health::registry().names();
-        for expected in [WORKTREE_GC_LOOP, WORKTREE_FETCH_LOOP, VOLUME_FOOTPRINT_LOOP] {
+        for expected in [
+            WORKTREE_GC_LOOP,
+            WORKTREE_FETCH_LOOP,
+            VOLUME_FOOTPRINT_LOOP,
+            SANDBOX_BUILD_CACHE_LOOP,
+        ] {
             assert!(
                 names.iter().any(|n| n == expected),
                 "{expected} is not in the census: {names:?}"
@@ -1565,6 +1722,7 @@ pub(crate) mod tests {
             data_volumes: Vec::new(),
             data_volume_declaration_error: None,
             data_volume_interval: Duration::from_secs(30),
+            build_cache: BuildCacheConfig::default(),
         };
         WorkdirRouter::new(cfg).unwrap()
     }

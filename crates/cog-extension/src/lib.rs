@@ -7,6 +7,7 @@
 //! | `wasm`  | Wasmtime | Untrusted third-party code (plugins) |
 //! | `rhai`  | Rhai     | Trusted inline scripting (prompt logic, glue) |
 
+pub mod build_cache;
 pub mod command_server;
 pub mod executor;
 pub mod hostdocs;

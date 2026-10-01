@@ -62,8 +62,21 @@
 //!
 //! Only the process that owns the directory publishes it, which is the process
 //! that runs builds: a deployment with no builder has no cache to report rather
-//! than a cache of zero bytes. Which processes those are is readable from the
-//! build gate's `role` label, so "no series" can be traced to its cause.
+//! than a cache of zero bytes, and the series carry the directory's identity
+//! rather than its path, so nothing here can be read as a sum over two caches
+//! that happen to share a path.
+//!
+//! **Two processes here run builds, and they share no lock.** The one that runs
+//! a deployment's own builds has the host-wide build gate; the sandbox executor
+//! builds into a target directory on a volume of its own, holds no slot in that
+//! gate and cannot take one -- it is the pod with no mounted secrets and no
+//! host path to the slot directory. What the pass needs from a process's own
+//! account of "a build is running" is the same in both cases, and that is what
+//! [`CacheSlot`] abstracts: whether such an account is in force, and something
+//! to hold for the duration of a deletion. The readings and the pass are here
+//! rather than beside either process because the *meaning* of these series has
+//! one author: a second implementation of "what `unmet` means" would be a second
+//! reading of the same name.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -72,102 +85,58 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use cog_core::build_gate::{dir_identity, BuildGate};
-use cog_core::fs_size::{self, FileEntry};
-use cog_core::observability::{DimensionSpec, Observable, RawMetric, TraceFragment};
-use cog_core::{SFResult, ShutdownSignal};
 use tracing::{info, warn};
 
-/// Apparent bytes the cache holds, per layer.
-pub const BUILD_TARGET_BYTES_METRIC: &str = "cogneva_build_target_bytes";
+use crate::build_gate::{dir_identity, BuildGate};
+use crate::fs_size::{self, FileEntry};
+use crate::observability::{DimensionSpec, Observable, RawMetric, TraceFragment};
+use crate::{SFResult, ShutdownSignal};
 
-/// Seconds since the cache was last measured.
-pub const BUILD_TARGET_SCAN_AGE_METRIC: &str = "cogneva_build_target_bytes_scan_age_seconds";
+// The names, labels and depths this family travels under live beside the
+// readings, so both publishers of it read one copy: see `crate::build_cache`.
+pub use crate::build_cache::*;
 
-/// The cap the cache is held to, in bytes. Published only when one is set.
-pub const BUILD_TARGET_CAP_METRIC: &str = "cogneva_build_target_bytes_cap";
-
-/// Bytes the cache is above its cap, as of the last walk.
-pub const BUILD_TARGET_OVER_LIMIT_METRIC: &str = "cogneva_build_target_over_limit_bytes";
-
-/// Bytes still above the cap after the last pass that ran.
-pub const BUILD_TARGET_UNMET_METRIC: &str = "cogneva_build_target_unmet_bytes";
-
-/// Walks that found the cache over its cap, by what happened next.
-pub const BUILD_TARGET_OVER_CAP_METRIC: &str = "cogneva_build_target_over_cap_total";
-
-/// The label naming what a pass did, or why it did not run.
-pub const OUTCOME_LABEL: &str = "outcome";
-
-/// A pass ran and brought the cache under its cap.
-pub const OUTCOME_RECLAIMED: &str = "reclaimed";
-
-/// A pass ran and the cache stayed above its cap.
-pub const OUTCOME_UNMET: &str = "unmet";
-
-/// A build held the only build slot, so no pass ran.
-pub const OUTCOME_BUSY: &str = "busy";
-
-/// No build gate is in force, so nothing may be removed.
-pub const OUTCOME_UNGATED: &str = "ungated";
-
-/// This loop's name in the liveness census.
-pub const BUILD_CACHE_WATCH_LOOP: &str = "build_cache_watch";
-
-/// Every value the outcome label takes, so a reader can see the whole domain
-/// with zeros rather than inferring it from whichever values happened to occur.
-pub const RECLAIM_OUTCOMES: &[&str] = &[
-    OUTCOME_RECLAIMED,
-    OUTCOME_UNMET,
-    OUTCOME_BUSY,
-    OUTCOME_UNGATED,
-];
-
-/// Bytes removed from the cache by this process so far.
-pub const BUILD_TARGET_RECLAIMED_METRIC: &str = "cogneva_build_target_reclaimed_bytes_total";
-
-/// When a reclamation pass last ran, in unix seconds.
-pub const BUILD_TARGET_LAST_RECLAIM_METRIC: &str = "cogneva_build_target_last_reclaim_seconds";
-
-/// The configured scan interval, so a rule can say how long is too long without
-/// carrying a copy of the interval that goes stale when it is configured.
-pub const BUILD_TARGET_SCAN_INTERVAL_METRIC: &str = "cogneva_build_target_scan_interval_seconds";
-
-/// The layer label.
-pub const LAYER_LABEL: &str = "layer";
-
-/// The label naming the directory the reading belongs to.
+/// The fact that says whether anything is currently building into a cache.
 ///
-/// `dev:ino` rather than the path, for the same reason the build gate publishes
-/// it: the same path is mounted from different volumes in different workloads,
-/// and two caches behind one path would otherwise be summed into one number with
-/// nothing to say they are two.
-pub const DIR_LABEL: &str = "dir";
+/// A passing deletion needs more than a measurement of the cache: it needs
+/// something it can *hold* for the whole of the deletion, or the deletion it
+/// authorises can begin a moment before a build that is about to read the same
+/// files. What that fact is differs per process (see the module doc), and what
+/// the pass needs from it does not.
+#[async_trait]
+pub trait CacheSlot: Send + Sync {
+    /// Whether anything bounds the builds into this cache at all.
+    ///
+    /// False means nothing may be removed: a cap with no such fact behind it is
+    /// reported as [`OUTCOME_UNGATED`] rather than enforced against a guess.
+    fn in_force(&self) -> bool;
 
-/// The layer carrying everything past [`MAX_PUBLISHED_LAYERS`].
-pub const OTHER_LAYER: &str = "other";
+    /// Take the slot for one whole pass, or `None` while a build holds it.
+    ///
+    /// The guard is held across the deletion and released by dropping it. An
+    /// implementation that cannot tell whether a build is running returns `None`
+    /// forever rather than handing one out -- refusing to delete is the only
+    /// safe answer to "I do not know", and it is counted as [`OUTCOME_BUSY`].
+    async fn take(&self) -> Option<Box<dyn Send + Sync>>;
+}
 
-/// How deep into the cache a layer is taken from.
-///
-/// Two: one level is a cargo profile (`debug`, `release`), which says nothing
-/// about what can be dropped, and cargo keeps its own division one level below
-/// that (`deps`, `incremental`, `build`, `.fingerprint`, `examples`).
-pub const CACHE_LAYER_DEPTH: usize = 2;
+/// The host-wide build gate *is* the slot for the process that runs a
+/// deployment's own builds: it is what bounds how many of them run at once, and
+/// a pass excludes itself from all of them rather than from one, because the
+/// files it deletes are ones any build could be reading.
+#[async_trait]
+impl CacheSlot for Arc<BuildGate> {
+    fn in_force(&self) -> bool {
+        self.as_ref().in_force()
+    }
 
-/// How many layers get a series of their own.
-///
-/// The layer name comes from a directory in the cache, and a directory name is
-/// data that builds write, so the domain is not closed by construction. The cap
-/// is on the published side and the fold is by size: the layers a reader would
-/// act on keep their names, the rest sum into [`OTHER_LAYER`] so the total stays
-/// exact, and a reader sees the fold as that series growing. Cargo's own layout
-/// is well under this, so in practice nothing is folded.
-pub const MAX_PUBLISHED_LAYERS: usize = 12;
-
-/// Fastest the cache may be re-walked at. The walk is metadata-only, but it
-/// walks a tree with hundreds of thousands of entries on a host that is also
-/// building, so it holds no value being fresher than minutes.
-pub const MIN_SCAN_INTERVAL_SECS: u64 = 60;
+    async fn take(&self) -> Option<Box<dyn Send + Sync>> {
+        match self.try_acquire_exclusive("build-cache-reclaim").await {
+            Ok(permit) => Some(Box::new(permit)),
+            Err(_) => None,
+        }
+    }
+}
 
 /// What the last pass left behind.
 #[derive(Debug, Default, Clone, Copy)]
@@ -278,39 +247,55 @@ impl BuildCacheReadings {
         (scanned_at != 0).then(|| now_unix_secs.saturating_sub(scanned_at))
     }
 
-    /// The layers to publish, largest first, with everything past the cap folded
-    /// into [`OTHER_LAYER`].
+    /// The layers to publish. The fold, the ordering and the always-present
+    /// `other` series are shared with the second publisher of this family —
+    /// see [`crate::build_cache::published_layers`].
     fn published_layers(&self, layers: &BTreeMap<String, u64>) -> Vec<(String, u64)> {
-        let mut ordered: Vec<(&String, u64)> = layers.iter().map(|(k, v)| (k, *v)).collect();
-        // Largest first, then by name, so two layers of equal size do not swap
-        // series between scrapes.
-        ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-
-        let mut out = Vec::with_capacity(ordered.len().min(MAX_PUBLISHED_LAYERS) + 1);
-        let mut folded = 0u64;
-        for (index, (layer, bytes)) in ordered.into_iter().enumerate() {
-            if index < MAX_PUBLISHED_LAYERS {
-                out.push((layer.clone(), bytes));
-            } else {
-                folded = folded.saturating_add(bytes);
-            }
-        }
-        // Always published, zero included: a reader has to be able to tell "no
-        // layer was folded" from "this series is not wired up".
-        out.push((OTHER_LAYER.to_string(), folded));
-        out
+        crate::build_cache::published_layers(layers)
     }
 
-    /// Bring the cache back under its cap, if it is over one and a build slot
-    /// can be taken.
+    /// One pass: walk the cache, publish what the walk found, and bring it under
+    /// the cap.
+    ///
+    /// One walk, not two: the entries are what the cap is enforced against and
+    /// the layers are what is published, and a plan built from a different
+    /// snapshot than the published total would be enforcing a figure nobody can
+    /// see. The walk is off the runtime -- it is metadata-only, but it is a walk
+    /// of a large tree and it must not hold up the cycles that build into it.
+    ///
+    /// A walk that fails keeps the last measurement rather than publishing a
+    /// smaller one, and says so: a total that is too small can only silence a
+    /// cap, and the age of the reading is what tells a stale number from a fresh
+    /// one.
+    pub async fn measure_and_enforce(&self, slot: Option<&dyn CacheSlot>) {
+        let path = self.dir.clone();
+        let walked =
+            tokio::task::spawn_blocking(move || fs_size::dir_files(&path, CACHE_LAYER_DEPTH, &[]))
+                .await;
+        match walked {
+            Ok(Ok(files)) => {
+                self.set_layers(fs_size::layer_totals(&files), unix_now());
+                self.enforce_cap(&files, slot).await;
+            }
+            Ok(Err(e)) => warn!(
+                error = %e,
+                dir = %self.dir.display(),
+                "build cache scan failed; keeping the last measurement"
+            ),
+            Err(e) => warn!(error = %e, "build cache scan task panicked"),
+        }
+    }
+
+    /// Bring the cache back under its cap, if it is over one and a slot can be
+    /// taken.
     ///
     /// `files` are the entries of the walk that produced the measurement being
     /// published, so the total the cap is judged against and the plan that acts
-    /// on it come from one snapshot. Nothing is removed without holding the
-    /// build slot: a file deleted under a running build fails that build for a
-    /// reason that has nothing to do with it, and that failure would be recorded
-    /// against a change rather than against the host.
-    pub async fn enforce_cap(&self, files: &[FileEntry], gate: Option<&Arc<BuildGate>>) {
+    /// on it come from one snapshot. Nothing is removed without holding `slot`:
+    /// a file deleted under a running build fails that build for a reason that
+    /// has nothing to do with it, and that failure would be recorded against a
+    /// change rather than against the host.
+    pub async fn enforce_cap(&self, files: &[FileEntry], slot: Option<&dyn CacheSlot>) {
         let Some(cap) = self.cap_bytes() else {
             return;
         };
@@ -324,37 +309,31 @@ impl BuildCacheReadings {
             return;
         }
 
-        // The gate is what makes "no build is running" a fact rather than a hope.
-        // Where it is not in force, the cap is reported as unenforceable instead
-        // of being enforced against a guess.
-        let Some(gate) = gate.filter(|g| g.in_force()) else {
+        // The slot is what makes "no build is running" a fact rather than a hope.
+        // Where nothing says so, the cap is reported as unenforceable instead of
+        // being enforced against a guess.
+        let Some(slot) = slot.filter(|slot| slot.in_force()) else {
             self.count_outcome(OUTCOME_UNGATED);
             warn!(
                 dir = %self.dir.display(),
                 over_limit_bytes = excess,
-                "build cache is over its cap and no build gate is in force, so nothing was removed"
+                "build cache is over its cap and nothing says whether a build is running, so nothing was removed"
             );
             return;
         };
-        // Every slot, not one: this pass deletes files a build is writing, and
-        // "no build is running" has to hold for *all* the builds the gate admits
-        // rather than for the ones that would have taken a different slot.
-        let permit = match gate.try_acquire_exclusive("build-cache-reclaim").await {
-            Ok(permit) => permit,
-            Err(_) => {
-                // A build holds a slot. Not a failure: the cache is over its
-                // cap while the host is busy building into it, and the next walk
-                // will try again. It is counted separately because a cache that
-                // is *never* reclaimed and one that cannot be reclaimed call for
-                // different things.
-                self.count_outcome(OUTCOME_BUSY);
-                info!(
-                    dir = %self.dir.display(),
-                    over_limit_bytes = excess,
-                    "build cache is over its cap; a build holds a slot, so the pass waits for the next walk"
-                );
-                return;
-            }
+        let Some(permit) = slot.take().await else {
+            // A build holds the slot. Not a failure: the cache is over its cap
+            // while the host is busy building into it, and the next walk will
+            // try again. It is counted separately because a cache that is
+            // *never* reclaimed and one that cannot be reclaimed call for
+            // different things.
+            self.count_outcome(OUTCOME_BUSY);
+            info!(
+                dir = %self.dir.display(),
+                over_limit_bytes = excess,
+                "build cache is over its cap; a build holds the slot, so the pass waits for the next walk"
+            );
+            return;
         };
 
         let plan = crate::build_cache_reclaim::plan_reclaim(files, total, cap);
@@ -530,9 +509,9 @@ pub fn spawn_build_cache_watch(
     // cap it is held to, what a pass reclaimed. If the task died, all of them
     // stop being written, and a cache nobody is measuring reads exactly like a
     // cache that is small. Its liveness therefore cannot come from itself.
-    cog_core::loop_health::spawn(
+    crate::loop_health::spawn(
         BUILD_CACHE_WATCH_LOOP,
-        cog_core::loop_health::Cadence::Periodic(interval),
+        crate::loop_health::Cadence::Periodic(interval),
         shutdown.clone(),
         // Rebuilt per attempt, so everything the body consumes is cloned here.
         move |beat| {
@@ -569,36 +548,15 @@ pub fn spawn_build_cache_watch(
                         biased;
                         _ = shutdown.wait() => break,
                         _ = ticker.tick() => {
-                            let path = dir.clone();
-                            // Off the runtime: the walk is metadata-only but it is a walk of
-                            // a large tree, and it must not hold up the cycles that build
-                            // into this cache.
-                            //
-                            // One walk, not two: the files are what the cap is enforced
-                            // against and the layers are what is published, and a plan built
-                            // from a different snapshot than the published total would be
-                            // enforcing a figure nobody can see.
-                            let walked = tokio::task::spawn_blocking(move || {
-                                fs_size::dir_files(&path, CACHE_LAYER_DEPTH, &[])
-                            })
-                            .await;
-                            match walked {
-                                Ok(Ok(files)) => {
-                                    readings.set_layers(fs_size::layer_totals(&files), unix_now());
-                                    readings
-                                        .enforce_cap(&files, cog_core::build_gate::global().as_ref())
-                                        .await;
-                                }
-                                // A failed walk yields a total that is too small, which can
-                                // only silence a cap. Keep the last measurement rather than
-                                // publish a fictional small one, and say so.
-                                Ok(Err(e)) => warn!(
-                                    error = %e,
-                                    dir = %dir.display(),
-                                    "build cache scan failed; keeping the last measurement"
-                                ),
-                                Err(e) => warn!(error = %e, "build cache scan task panicked"),
-                            }
+                            // Read per pass rather than remembered: the gate is
+                            // installed during startup and the readings object is
+                            // built beside it, so a slot captured once could be
+                            // the empty one and the cap would then be reported as
+                            // unenforceable for the life of the process.
+                            let slot = crate::build_gate::global();
+                            readings
+                                .measure_and_enforce(slot.as_ref().map(|g| g as &dyn CacheSlot))
+                                .await;
                         }
                     }
                 }
@@ -733,7 +691,7 @@ mod tests {
 
     /// A gate in force, over its own slot directory.
     fn gate(lock_dir: &Path, slots: usize, enabled: bool) -> Arc<BuildGate> {
-        Arc::new(BuildGate::new(&cog_core::config::BuildGateConfig {
+        Arc::new(BuildGate::new(&crate::config::BuildGateConfig {
             enabled,
             max_concurrent: slots,
             wait_secs: 0,
@@ -904,11 +862,12 @@ mod tests {
         );
     }
 
-    /// No gate is no permission to delete: without the slot there is no fact
-    /// saying a build is not reading this cache, and a file removed under a
-    /// build fails that build for a reason that is not its own.
+    /// No slot is no permission to delete: with nothing saying whether a build
+    /// is reading this cache -- no slot at all, or one that is not in force --
+    /// a file removed under a build fails that build for a reason that is not
+    /// its own.
     #[tokio::test]
-    async fn nothing_is_removed_without_a_gate_in_force() {
+    async fn nothing_is_removed_without_a_slot_in_force() {
         let lock = tempfile::tempdir().unwrap();
         let (root, files) = cache(&[("release/incremental/one", 1000)]);
         let readings = BuildCacheReadings::new(root.path()).with_cap(1, 300);
