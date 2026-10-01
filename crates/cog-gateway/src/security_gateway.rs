@@ -1073,8 +1073,15 @@ struct AppState {
     git_transport: std::sync::Arc<crate::git_mirror::GitTransport>,
     /// 池健康的落盘出口（指标/时序/告警）。
     pool_obs: Arc<PoolObservability>,
-    /// 跨进程池状态信号连接（调度侧读同一个键决定是否暂停 LLM 依赖型任务）。
-    redis: Option<redis::aio::ConnectionManager>,
+    /// 跨进程池状态通道（调度侧读同一个键决定是否暂停 LLM 依赖型任务）。
+    /// 按需建连、失败可重试：建连只做一次的话，Redis 恰好在这一秒不可达就
+    /// 等于这一侧终生失明，而"失明"与"没有话要说"在观测面上同形。`None`
+    /// 表示没配 Redis（单进程部署），与连不上是两回事。
+    pool_signal: Option<Arc<cog_redis::Reconnecting>>,
+    /// 跨进程初值是否已落地。建连失败过一次时它是 false，由发布循环按拍重试。
+    /// 这一格必须存在：读不到与没有证据在初值上同形，而把前者当后者，池判定
+    /// 会在一次瞬时故障后凭空翻回"可用"。
+    pool_seeded: Arc<AtomicBool>,
     /// 池不可用判定（证据锁存）。任何一次"全上游都承接不了"的观测置位；
     /// 只有某个上游实证成功才清除。健康表为空表示**没有证据**，不等于证据表明
     /// 可用——进程刚起来、或流量停了一阵，表就是空的。若把空表当可用，判定会
@@ -1822,53 +1829,107 @@ fn record_upstream_state(
 
 /// 把池状态写入/清除跨进程 Redis 信号。网关崩了也不会把调度侧永久钉在
 /// 暂停态：键带 TTL，节拍内持续续期，恢复即刻删除。
+///
+/// 通道没接上时这一拍只留一条读数为 0，并按拍重试——池判定只留在网关内存里
+/// 的时候，调度侧读不到它，于是"被判为不可用"这件事在暂停门上是查无此事的，
+/// 而这条 0 是唯一说明它的东西。没配 Redis（单进程部署）不报这条读数：那与
+/// 连不上是两回事。
 async fn publish_pool_signal(state: &AppState, down: bool, bounds: RecoveryBounds) {
-    let Some(conn) = &state.redis else {
+    let Some(channel) = &state.pool_signal else {
+        // 配了地址却没建出通道（连接串非法）：这与"没配 Redis"不是一回事，
+        // 是一条要报出来的故障。
+        if state
+            .config
+            .redis_url
+            .as_deref()
+            .is_some_and(|url| !url.is_empty())
+        {
+            record_gauge(
+                state,
+                cog_core::metric_names::LLM_POOL_SIGNAL_CONNECTED,
+                0.0,
+                &[],
+            )
+            .await;
+        }
         return;
     };
-    let mut conn = conn.clone();
-    if down {
-        let unavailable: Vec<String> = state
-            .config
-            .llm_upstreams
-            .iter()
-            .filter(|u| state.llm_health.is_suspect(u))
-            .map(LlmHealthTable::key)
-            .collect();
-        let status = cog_core::LlmPoolStatus {
-            unavailable: true,
-            evidenced_recovery_unix: bounds.evidenced_unix,
-            next_attempt_unix: bounds.next_probe_unix,
-            unavailable_upstreams: unavailable,
-            // 判定与它的输入同一条载荷、同一次写入：分开写就会有一段时间里
-            // 一边说池不可用、另一边说没有证据，读的人无从判断该信哪边。
-            upstream_evidence: state.llm_health.evidence(&state.config.llm_upstreams),
-        };
-        let payload = match serde_json::to_string(&status) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(error = %e, "池状态序列化失败，跳过 Redis 发布");
-                return;
+    let delivered = match channel.get().await {
+        None => false,
+        Some(ref mut conn) => {
+            if down {
+                publish_down(conn, state, bounds).await
+            } else {
+                publish_up(conn).await
             }
-        };
-        let ttl = pool_status_ttl_secs(state, bounds.next_attempt_unix());
-        let res: redis::RedisResult<()> = redis::cmd("SET")
-            .arg(cog_core::LLM_POOL_STATUS_KEY)
-            .arg(payload)
-            .arg("EX")
-            .arg(ttl)
-            .query_async(&mut conn)
-            .await;
-        if let Err(e) = res {
-            tracing::warn!(error = %e, "池状态写入 Redis 失败");
         }
-    } else {
-        let res: redis::RedisResult<()> = redis::cmd("DEL")
-            .arg(cog_core::LLM_POOL_STATUS_KEY)
-            .query_async(&mut conn)
-            .await;
-        if let Err(e) = res {
+    };
+    record_gauge(
+        state,
+        cog_core::metric_names::LLM_POOL_SIGNAL_CONNECTED,
+        if delivered { 1.0 } else { 0.0 },
+        &[],
+    )
+    .await;
+}
+
+/// 写入"池不可用"载荷，带 TTL。返回是否送达。
+async fn publish_down(
+    conn: &mut redis::aio::ConnectionManager,
+    state: &AppState,
+    bounds: RecoveryBounds,
+) -> bool {
+    let unavailable: Vec<String> = state
+        .config
+        .llm_upstreams
+        .iter()
+        .filter(|u| state.llm_health.is_suspect(u))
+        .map(LlmHealthTable::key)
+        .collect();
+    let status = cog_core::LlmPoolStatus {
+        unavailable: true,
+        evidenced_recovery_unix: bounds.evidenced_unix,
+        next_attempt_unix: bounds.next_probe_unix,
+        unavailable_upstreams: unavailable,
+        // 判定与它的输入同一条载荷、同一次写入：分开写就会有一段时间里
+        // 一边说池不可用、另一边说没有证据，读的人无从判断该信哪边。
+        upstream_evidence: state.llm_health.evidence(&state.config.llm_upstreams),
+    };
+    let payload = match serde_json::to_string(&status) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "池状态序列化失败，跳过 Redis 发布");
+            return false;
+        }
+    };
+    let ttl = pool_status_ttl_secs(state, bounds.next_attempt_unix());
+    let res: redis::RedisResult<()> = redis::cmd("SET")
+        .arg(cog_core::LLM_POOL_STATUS_KEY)
+        .arg(payload)
+        .arg("EX")
+        .arg(ttl)
+        .query_async(conn)
+        .await;
+    match res {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, "池状态写入 Redis 失败");
+            false
+        }
+    }
+}
+
+/// 清除跨进程信号（池已恢复）。返回是否送达。
+async fn publish_up(conn: &mut redis::aio::ConnectionManager) -> bool {
+    let res: redis::RedisResult<()> = redis::cmd("DEL")
+        .arg(cog_core::LLM_POOL_STATUS_KEY)
+        .query_async(conn)
+        .await;
+    match res {
+        Ok(()) => true,
+        Err(e) => {
             tracing::warn!(error = %e, "池状态清除 Redis 失败");
+            false
         }
     }
 }
@@ -1943,6 +2004,11 @@ async fn sync_pool_alert(state: &AppState, down: bool) {
 /// 只在进入/离开"池全灭"时发告警与 ERROR 日志；指标每拍都刷新，
 /// 保证 Prometheus 抓到的永远是当前值。
 async fn refresh_pool_state(state: &AppState) {
+    // 初值还没落地就补读，且必须在任何探测之前：这张表是这一拍判断谁该被探测
+    // 的唯一输入，而"上一拍没读到"不是"没有证据"。
+    if !state.pool_seeded.load(Ordering::SeqCst) && seed_pool_verdict_from_signal(state).await {
+        state.pool_seeded.store(true, Ordering::SeqCst);
+    }
     let upstreams = &state.config.llm_upstreams;
     if upstreams.is_empty() {
         return;
@@ -4448,10 +4514,7 @@ fn init_gateway_logging(
 async fn build_pool_observability(
     config: &SecurityGatewayConfig,
     http_client: &Arc<dyn cog_core::HttpClient>,
-) -> (
-    Arc<PoolObservability>,
-    Option<redis::aio::ConnectionManager>,
-) {
+) -> (Arc<PoolObservability>, Option<Arc<cog_redis::Reconnecting>>) {
     let obs = &config.observability;
     let metrics = Arc::new(PrometheusMetricsBackend::new(""));
 
@@ -4497,18 +4560,12 @@ async fn build_pool_observability(
         None => None,
     };
 
+    // 这里只建"通道"，不建连接：Redis 恰好在这一秒不可达（两者同时滚动、
+    // 解析器还没起来）不能把这一侧判成终生失明。连不上按拍重试，接上了就
+    // 一直用同一条连接。
     let redis = match config.redis_url.as_deref() {
         Some(url) => match redis::Client::open(url) {
-            Ok(client) => match cog_redis::connect(&client).await {
-                Ok(conn) => {
-                    tracing::info!("池状态跨进程信号已接 Redis");
-                    Some(conn)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Redis 连接失败，跨进程池状态降级为关闭");
-                    None
-                }
-            },
+            Ok(client) => Some(Arc::new(cog_redis::Reconnecting::new(client))),
             Err(e) => {
                 tracing::warn!(error = %e, "Redis 连接串非法，跨进程池状态降级为关闭");
                 None
@@ -4562,6 +4619,53 @@ fn seed_pool_down(status: Option<&cog_core::LlmPoolStatus>) -> bool {
     status.is_some_and(|s| s.unavailable)
 }
 
+/// 把上次的池判定与逐上游证据从跨进程信号读回来，落到这一进程的初值上。
+///
+/// 返回 `false` = 这一次没读到，调用方按拍重试。这一格必须有：**读不到**与
+/// **没有证据**在初值上同形，而把前者当后者，池判定就会在一次瞬时故障后凭空
+/// 翻回"可用"。所以只有真正读到了一次应答（哪怕那应答里没有判定）才算落地。
+async fn seed_pool_verdict_from_signal(state: &AppState) -> bool {
+    let Some(channel) = &state.pool_signal else {
+        // 没配 Redis：单进程部署，没有可读的初值，也没有要发布的判定。
+        return true;
+    };
+    let Some(mut conn) = channel.get().await else {
+        return false;
+    };
+    let raw: redis::RedisResult<Option<String>> = redis::cmd("GET")
+        .arg(cog_core::LLM_POOL_STATUS_KEY)
+        .query_async(&mut conn)
+        .await;
+    let text = match raw {
+        Ok(text) => text,
+        Err(e) => {
+            tracing::warn!(error = %e, "跨进程池状态初值读取失败，下一拍再读");
+            return false;
+        }
+    };
+    let status = parse_pool_status(text.as_deref());
+    // 逐上游证据先落地：探测按表里的窗口决定谁该被试，空表会把池内每家都算成
+    // "没有记录"，锁存态下的这一拍就会把它们各试一遍，而我们刚读到它们的窗口
+    // 还没到。
+    if let Some(status) = status.as_ref() {
+        let (restored, dropped) = state
+            .llm_health
+            .seed(&status.upstream_evidence, &state.config.llm_upstreams);
+        if restored > 0 || dropped > 0 {
+            tracing::info!(
+                restored,
+                dropped,
+                "已按上次跨进程信号恢复逐上游证据，退避位置与配额复位时刻不经重启清零"
+            );
+        }
+    }
+    if seed_pool_down(status.as_ref()) {
+        state.pool_down.store(true, Ordering::SeqCst);
+        tracing::warn!("池不可用判定沿用上次跨进程信号（重启不凭空清零），待上游实证成功解除");
+    }
+    true
+}
+
 /// 出站请求的自我标识。
 ///
 /// 上游后台按调用方归属用量，而网关此前连 User-Agent 都不带（reqwest 默认不
@@ -4600,23 +4704,7 @@ pub async fn run(
         Arc::new(cog_net::ReqwestHttpClient::new(reqwest::Client::new()));
     init_gateway_logging(&config.observability, &http_client);
 
-    let (pool_obs, redis) = build_pool_observability(&config, &http_client).await;
-    let status = match redis.as_ref() {
-        Some(conn) => {
-            let mut conn = conn.clone();
-            let raw: Option<String> = redis::cmd("GET")
-                .arg(cog_core::LLM_POOL_STATUS_KEY)
-                .query_async(&mut conn)
-                .await
-                .unwrap_or(None);
-            parse_pool_status(raw.as_deref())
-        }
-        None => None,
-    };
-    let pool_down = seed_pool_down(status.as_ref());
-    if pool_down {
-        tracing::warn!("池不可用判定沿用上次跨进程信号（重启不凭空清零），待上游实证成功解除");
-    }
+    let (pool_obs, pool_signal) = build_pool_observability(&config, &http_client).await;
     let identity: Arc<str> = Arc::from(outbound_identity(build_revision).as_str());
     let identity_headers = identity_default_headers(&identity);
     tracing::info!(identity = %identity, "安全网关出站请求自我标识");
@@ -4646,26 +4734,19 @@ pub async fn run(
         llm_health: std::sync::Arc::new(LlmHealthTable::default()),
         git_transport: std::sync::Arc::new(crate::git_mirror::GitTransport::from_env()),
         pool_obs,
-        redis,
-        pool_down: Arc::new(AtomicBool::new(pool_down)),
+        pool_signal,
+        pool_down: Arc::new(AtomicBool::new(false)),
         pool_recovered: Arc::new(AtomicBool::new(false)),
+        pool_seeded: Arc::new(AtomicBool::new(false)),
         volume_footprint,
         config: config.clone(),
     };
     // 恢复逐上游证据必须发生在任何一拍探测之前：探测按表里的窗口决定谁该被试，
     // 表是空的时候每一条上游都算"没有记录"，锁存态下一轮就会把池内全部上游各试
-    // 一遍，而我们刚从上一条载荷里读到它们各自的窗口还没到。
-    if let Some(status) = status.as_ref() {
-        let (restored, dropped) = state
-            .llm_health
-            .seed(&status.upstream_evidence, &state.config.llm_upstreams);
-        if restored > 0 || dropped > 0 {
-            tracing::info!(
-                restored,
-                dropped,
-                "已按上次跨进程信号恢复逐上游证据，退避位置与配额复位时刻不经重启清零"
-            );
-        }
+    // 一遍，而我们刚从上一条载荷里读到它们各自的窗口还没到。这一次没读到就不算
+    // 落地，由发布循环按拍续读——"读不到"与"没有证据"必须分开。
+    if seed_pool_verdict_from_signal(&state).await {
+        state.pool_seeded.store(true, Ordering::SeqCst);
     }
     if state.github_app.is_some() {
         tracing::info!("安全网关：检测到 GitHub App 凭证，代码平台出口将以 App bot 身份发出");
@@ -5982,6 +6063,244 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         );
     }
 
+    fn scrape(state: &AppState) -> String {
+        String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap()
+    }
+
+    /// 测试用 Redis 的 tcp 地址；不可达时返回 None（调用方打 SKIP 跳过）。这台
+    /// 机器上真的没有 Redis 与"这条判据不成立"是两回事，不能混成同一个绿。
+    async fn test_redis_tcp_addr() -> Option<String> {
+        let url = std::env::var("COGNEVA_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let client = match redis::Client::open(url) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP: unusable Redis url ({e})");
+                return None;
+            }
+        };
+        let addr = match client.get_connection_info().addr {
+            redis::ConnectionAddr::Tcp(ref host, port) => format!("{host}:{port}"),
+            ref other => {
+                eprintln!("SKIP: {other:?} is not a tcp address this test can proxy");
+                return None;
+            }
+        };
+        if tokio::net::TcpStream::connect(&addr).await.is_err() {
+            eprintln!("SKIP: no redis at {addr}");
+            return None;
+        }
+        Some(addr)
+    }
+
+    /// 可控的 TCP 门：关着时把连进来的连接直接丢掉（对端看到的就是"对方还没
+    /// 起来"），开门后按字节转发到真 Redis。用来把"建连的那一刻 Redis 不在"
+    /// 重放成一个测试，而不是靠人记住它发生过。
+    struct GateProxy {
+        addr: std::net::SocketAddr,
+        open: Arc<AtomicBool>,
+    }
+
+    impl GateProxy {
+        async fn start(upstream: String) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind proxy");
+            let addr = listener.local_addr().expect("proxy address");
+            let open = Arc::new(AtomicBool::new(false));
+            let open_task = Arc::clone(&open);
+            tokio::spawn(async move {
+                while let Ok((mut downstream, _)) = listener.accept().await {
+                    if !open_task.load(Ordering::Relaxed) {
+                        drop(downstream);
+                        continue;
+                    }
+                    let upstream = upstream.clone();
+                    tokio::spawn(async move {
+                        let Ok(mut upstream) =
+                            tokio::net::TcpStream::connect(upstream.as_str()).await
+                        else {
+                            return;
+                        };
+                        let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
+                    });
+                }
+            });
+            Self { addr, open }
+        }
+
+        fn open(&self) {
+            self.open.store(true, Ordering::Relaxed);
+        }
+    }
+
+    async fn pool_signal_client(url: &str) -> redis::aio::ConnectionManager {
+        let client = redis::Client::open(url).expect("a well-formed redis url");
+        cog_redis::connect(&client)
+            .await
+            .expect("test redis reachable")
+    }
+
+    async fn write_pool_signal(url: &str, payload: &str) {
+        let mut conn = pool_signal_client(url).await;
+        let _: () = redis::cmd("SET")
+            .arg(cog_core::LLM_POOL_STATUS_KEY)
+            .arg(payload)
+            .arg("EX")
+            .arg(300)
+            .query_async(&mut conn)
+            .await
+            .expect("payload stored");
+    }
+
+    async fn read_pool_signal(url: &str) -> Option<String> {
+        let mut conn = pool_signal_client(url).await;
+        redis::cmd("GET")
+            .arg(cog_core::LLM_POOL_STATUS_KEY)
+            .query_async(&mut conn)
+            .await
+            .expect("payload read")
+    }
+
+    async fn delete_pool_signal(url: &str) {
+        let mut conn = pool_signal_client(url).await;
+        let _: () = redis::cmd("DEL")
+            .arg(cog_core::LLM_POOL_STATUS_KEY)
+            .query_async(&mut conn)
+            .await
+            .expect("payload cleared");
+    }
+
+    /// 没配 Redis 是单进程部署：池判定本来就没有第二个读者，那条"通道断了"的
+    /// 读数不该出现——它不是 0，是这件事不存在。给它一个 0 会把一次正常部署说成
+    /// 故障，而故障多了以后真的那一次就没人看了。
+    #[tokio::test]
+    async fn a_deployment_without_redis_has_no_channel_reading() {
+        let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        state.config.redis_url = None;
+        publish_pool_signal(&state, true, RecoveryBounds::default()).await;
+        let text = scrape(&state);
+        assert!(!text.contains("llm_pool_signal_connected"), "{text}");
+    }
+
+    /// 配了地址却建不出通道（连接串非法）与"没配"是两回事：前者是一条要报出来
+    /// 的配置故障，否则它在这台进程上完全无声。
+    #[tokio::test]
+    async fn a_channel_that_could_not_be_built_reports_zero() {
+        let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        state.config.redis_url = Some("not-a-redis-url".into());
+        assert!(state.pool_signal.is_none());
+        publish_pool_signal(&state, true, RecoveryBounds::default()).await;
+        let text = scrape(&state);
+        assert!(text.contains("llm_pool_signal_connected 0"), "{text}");
+    }
+
+    /// 通道连不上：这一拍照常出 0，池判定一个字都不许编（读不到不等于没有证据），
+    /// 且下一拍还要再试——一次失败就终生放弃，正是这条通道要消灭的那个故障。
+    #[tokio::test]
+    async fn a_blind_channel_reports_zero_and_keeps_trying() {
+        let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        let channel = Arc::new(cog_redis::Reconnecting::with_budget(
+            // 1 号端口不会有人监听：每次取用都被立刻拒绝，测试不必等超时。
+            redis::Client::open("redis://127.0.0.1:1").unwrap(),
+            cog_redis::ConnectBudget {
+                budget_ms: 100,
+                retries: 0,
+            },
+        ));
+        state.pool_signal = Some(Arc::clone(&channel));
+        state.pool_seeded = Arc::new(AtomicBool::new(false));
+
+        refresh_pool_state(&state).await;
+        let text = scrape(&state);
+        assert!(text.contains("llm_pool_signal_connected 0"), "{text}");
+        assert!(
+            !state.pool_seeded.load(Ordering::SeqCst),
+            "读不到就不是读到了，初值不许当成已落地"
+        );
+        assert!(
+            !state.pool_down.load(Ordering::SeqCst),
+            "读不到更不许被当成池不可用：那是替上游声称一件没观测到的事"
+        );
+        let first = channel.failed_attempts();
+        assert!(first >= 1, "建连失败要留下计数");
+
+        refresh_pool_state(&state).await;
+        assert!(
+            channel.failed_attempts() > first,
+            "下一拍要再试；一次失败就终生放弃正是 2026-10-01 那次故障"
+        );
+    }
+
+    /// 那次故障的判据：网关与 Redis 同秒滚动，第一次建连失败，此后终生失明——
+    /// 判定发布不出去，调度侧也读不回来，而池在观测面上照旧显示"可用"。这条把
+    /// "下一次再试"与"读到一次就落地"钉在同一对数上：同一个通道对象，先关后开。
+    #[tokio::test]
+    async fn a_seed_missed_while_the_channel_was_down_lands_once_the_peer_answers() {
+        let Some(upstream) = test_redis_tcp_addr().await else {
+            return;
+        };
+        let upstream_cfg = stub_upstream("https://a.example.com", "m1");
+        let key = LlmHealthTable::key(&upstream_cfg);
+        let now = Utc::now().timestamp();
+        // 上一任网关留下的判定：池不可用，且带着逐上游证据。
+        let payload = serde_json::to_string(&cog_core::LlmPoolStatus {
+            unavailable: true,
+            evidenced_recovery_unix: now + 600,
+            next_attempt_unix: now + 600,
+            unavailable_upstreams: vec![key.clone()],
+            upstream_evidence: vec![cog_core::LlmUpstreamEvidence {
+                identity: key.clone(),
+                consecutive_failures: 4,
+                suspect_until_unix: now + 300,
+                ..Default::default()
+            }],
+        })
+        .unwrap();
+        let redis_url = format!("redis://{upstream}");
+        write_pool_signal(&redis_url, &payload).await;
+
+        let proxy = GateProxy::start(upstream.clone()).await;
+        let proxy_url = format!("redis://{}", proxy.addr);
+        let mut state = test_state(vec![upstream_cfg.clone()]);
+        state.config.redis_url = Some(proxy_url.clone());
+        state.pool_signal = Some(Arc::new(cog_redis::Reconnecting::new(
+            redis::Client::open(proxy_url).unwrap(),
+        )));
+        state.pool_seeded = Arc::new(AtomicBool::new(false));
+
+        // 门关着：这一拍读不到。读不到不许据此把池判翻回"可用"，也不许自称已落地。
+        refresh_pool_state(&state).await;
+        let text = scrape(&state);
+        assert!(text.contains("llm_pool_signal_connected 0"), "{text}");
+        assert!(!state.pool_seeded.load(Ordering::SeqCst));
+        assert!(!state.pool_down.load(Ordering::SeqCst));
+        assert!(!state.llm_health.is_suspect(&upstream_cfg));
+
+        // 门开了：同一个通道对象，下一拍把上次的判定与证据读回来。
+        proxy.open();
+        refresh_pool_state(&state).await;
+        let text = scrape(&state);
+        assert!(text.contains("llm_pool_signal_connected 1"), "{text}");
+        assert!(state.pool_seeded.load(Ordering::SeqCst), "读到一次就算落地");
+        assert!(
+            state.pool_down.load(Ordering::SeqCst),
+            "上次判不可用就该沿用"
+        );
+        assert!(
+            state.llm_health.is_suspect(&upstream_cfg),
+            "逐上游证据要一起回来：空表会把池内每家都算成没有记录，刚读到的窗口会被各试一遍"
+        );
+        // 通道通了以后这一拍自己也发布了一次：Redis 里那条是被续期的。故障当天
+        // 正是 TTL 一路衰减而无人续期，才证明发布早就停了。
+        assert!(
+            read_pool_signal(&redis_url).await.is_some(),
+            "通道转通后这一拍必须把判定发布出去"
+        );
+
+        delete_pool_signal(&redis_url).await;
+    }
+
     #[test]
     fn pool_status_ttl_bounded() {
         let state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
@@ -6635,9 +6954,10 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 alerts: None,
                 usage: None,
             }),
-            redis: None,
+            pool_signal: None,
             pool_down: Arc::new(AtomicBool::new(false)),
             pool_recovered: Arc::new(AtomicBool::new(false)),
+            pool_seeded: Arc::new(AtomicBool::new(true)),
             volume_footprint: Vec::new(),
             config: SecurityGatewayConfig {
                 llm_upstreams: upstreams,

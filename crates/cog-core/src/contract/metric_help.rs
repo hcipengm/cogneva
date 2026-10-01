@@ -320,6 +320,19 @@ const GAUGE_HELP: &[(&str, &str)] = &[
         "Whether any LLM upstream is usable, 1 or 0",
     ),
     (
+        "llm_pool_signal_connected",
+        "Whether the last attempt to publish the pool verdict to Redis \
+         succeeded, 1 or 0. The gateway is the only process holding upstream \
+         credentials, so the scheduler reads its verdict from that key; the \
+         channel is re-established on demand, so a 0 says the attempt failed \
+         and the next one will try again rather than that the channel is gone. \
+         Absent when no Redis is configured, which is a single-process \
+         deployment and not a fault. A 0 beside llm_pool_available 1 is the \
+         reading to look at: the pool verdict is then known to the gateway and \
+         to nobody else, so the scheduler is not pausing LLM-dependent work, \
+         and no other series says so",
+    ),
+    (
         "llm_pool_evidenced_recovery_unix",
         "Recovery instant an upstream itself reported, as a Unix timestamp; \
          0 when no upstream has given one",

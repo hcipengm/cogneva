@@ -52,13 +52,16 @@ impl SupervisorPlugin {
             info!("LLM pool guard disabled: no redis_url configured");
             return;
         }
-        match crate::llm_pool_guard::RedisLlmPoolStatusSource::connect(&redis_url).await {
+        // 只建通道，不建连接：Redis 恰好在这一秒不可达（两者同时滚动、解析器
+        // 还没起来）不能让这一侧终生失明——那样池判定在网关手里，而暂停门读
+        // 不到它，读不到又与"池是好的"同形。连不上按拍重试。
+        match crate::llm_pool_guard::RedisLlmPoolStatusSource::new(&redis_url) {
             Ok(source) => {
                 let source: Arc<dyn cog_core::LlmPoolStatusSource> = Arc::new(source);
                 ctx.publish_service(source.clone());
                 self.pool_source = Some(source);
             }
-            Err(e) => warn!("LLM pool guard disabled: redis connect failed: {e}"),
+            Err(e) => warn!("LLM pool guard disabled: unusable redis url: {e}"),
         }
     }
 

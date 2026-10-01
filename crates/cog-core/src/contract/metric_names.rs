@@ -309,6 +309,7 @@ metric_names! {
     LLM_POOL_EVIDENCED_RECOVERY_UNIX => "llm_pool_evidenced_recovery_unix",
     LLM_POOL_NEXT_ATTEMPT_UNIX => "llm_pool_next_attempt_unix",
     LLM_POOL_QUOTA_WINDOW_SECS => "llm_pool_quota_window_secs",
+    LLM_POOL_SIGNAL_CONNECTED => "llm_pool_signal_connected",
 
     // cog-gateway — the audited LLM channel.
     //

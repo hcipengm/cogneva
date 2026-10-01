@@ -23,22 +23,29 @@ use crate::scheduler_gate::SchedulerGate;
 pub const LLM_POOL_GUARD_LOOP: &str = "supervisor_llm_pool_guard";
 
 /// Reads the snapshot the gateway writes to Redis.
+///
+/// The channel is established on demand and retried after a failure, so a redis
+/// that is briefly away -- the gateway and redis rolling together, a resolver
+/// not up yet -- does not disable the guard for the life of the process. Only a
+/// url that cannot be parsed does that, and that one is a configuration fault
+/// rather than a blip.
 pub struct RedisLlmPoolStatusSource {
-    conn: redis::aio::ConnectionManager,
+    channel: cog_redis::Reconnecting,
 }
 
 impl RedisLlmPoolStatusSource {
-    pub async fn connect(redis_url: &str) -> Result<Self, redis::RedisError> {
+    pub fn new(redis_url: &str) -> Result<Self, redis::RedisError> {
         let client = redis::Client::open(redis_url)?;
-        let conn = cog_redis::connect(&client).await?;
-        Ok(Self { conn })
+        Ok(Self {
+            channel: cog_redis::Reconnecting::new(client),
+        })
     }
 }
 
 #[async_trait::async_trait]
 impl LlmPoolStatusSource for RedisLlmPoolStatusSource {
     async fn status(&self) -> Option<LlmPoolStatus> {
-        let mut conn = self.conn.clone();
+        let mut conn = self.channel.get().await?;
         let raw: redis::RedisResult<Option<String>> = redis::cmd("GET")
             .arg(cog_core::LLM_POOL_STATUS_KEY)
             .query_async(&mut conn)

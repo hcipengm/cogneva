@@ -30,6 +30,7 @@
 //! Scope: this crate owns *how a connection is built*. What is stored on redis —
 //! state, streams, registries, audit — belongs to `cog-storage` and `cog-stream`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use redis::aio::ConnectionManager;
@@ -134,10 +135,95 @@ pub async fn connect_with(
     Ok(connection)
 }
 
+/// A connection kept for the life of a process, established when it is first
+/// asked for and re-attempted after a failure.
+///
+/// `connect` above answers "can I reach redis right now", inside a budget, which
+/// is what a *call site* needs. A channel -- one connection a process holds and
+/// uses for as long as it runs -- needs one thing that a call cannot supply on
+/// its own: permission to come back. Made once at startup, a failure is
+/// permanent and silent. The process that could not reach redis at that instant
+/// stays blind for the rest of its life, and "blind" looks exactly like "nothing
+/// to report" on every surface the channel feeds. Observed on 2026-10-01: the
+/// security gateway started in the same second as the redis pod it reads, failed
+/// to resolve it four seconds later, and from then on published no pool snapshot
+/// and read back no verdict -- with no series anywhere saying the channel was
+/// down, so the pool looked healthy while nothing was listening to it.
+///
+/// Redis being away for a few seconds is not a reason to stop listening -- a pod
+/// restart, a rollout that recreated both ends, a resolver not up yet -- so the
+/// retry lives here, once, instead of in every reader. A caller must read `None`
+/// as "this attempt failed", never as a verdict about what is stored: nothing
+/// was read.
+pub struct Reconnecting {
+    client: redis::Client,
+    budget: ConnectBudget,
+    conn: std::sync::Mutex<Option<ConnectionManager>>,
+    failed_attempts: AtomicU64,
+}
+
+impl Reconnecting {
+    /// A channel bounded by the budget from the environment.
+    pub fn new(client: redis::Client) -> Self {
+        Self::with_budget(client, ConnectBudget::from_env())
+    }
+
+    /// The same, with an explicit budget. For call sites with a reason to
+    /// differ, and for tests that need a fixed bound.
+    pub fn with_budget(client: redis::Client, budget: ConnectBudget) -> Self {
+        Self {
+            client,
+            budget,
+            conn: std::sync::Mutex::new(None),
+            failed_attempts: AtomicU64::new(0),
+        }
+    }
+
+    /// Hand out a live connection, connecting first when there is none.
+    ///
+    /// `None` means this attempt failed; the next call tries again. That is the
+    /// whole point of the type, so a caller that gives up on `None` -- or, worse,
+    /// latches the channel off -- reintroduces the failure it exists to remove.
+    pub async fn get(&self) -> Option<ConnectionManager> {
+        // The lock is not held across the connect: a second caller arriving
+        // while the first is still connecting would otherwise wait behind a
+        // budget it has no share of, and the two would then share one answer.
+        if let Some(conn) = self.held() {
+            return Some(conn);
+        }
+        match connect_with(&self.client, self.budget).await {
+            Ok(conn) => {
+                *self.conn.lock().unwrap() = Some(conn.clone());
+                Some(conn)
+            }
+            Err(e) => {
+                self.failed_attempts.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(error = %e, "redis 未接上，本次尝试失败；下次取用时重试");
+                None
+            }
+        }
+    }
+
+    /// Connect attempts that did not succeed since this channel was created.
+    ///
+    /// A reader needs this to tell the two ways of having no connection apart:
+    /// "not needed yet" and "tried and failed" produce the same `get`, and only
+    /// the second one is a fault.
+    pub fn failed_attempts(&self) -> u64 {
+        self.failed_attempts.load(Ordering::Relaxed)
+    }
+
+    fn held(&self) -> Option<ConnectionManager> {
+        self.conn.lock().unwrap().clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use redis::AsyncCommands;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::Arc;
 
     /// An address that refuses immediately: the shape of "redis is not running".
     const REFUSED: &str = "redis://127.0.0.1:1";
@@ -258,6 +344,132 @@ mod tests {
             .set("cog-redis:test", "1")
             .await
             .expect("and takes commands");
+    }
+
+    /// A failed attempt is not a verdict: the next call tries again. A channel
+    /// that stays shut after one bad minute is the failure observed on
+    /// 2026-10-01, where the gateway spent the rest of its life with the pool
+    /// signal closed because redis was not resolvable at the second it started.
+    #[tokio::test]
+    async fn a_failed_attempt_does_not_close_the_channel() {
+        let client = redis::Client::open(REFUSED).expect("a well-formed url");
+        let channel = Reconnecting::with_budget(client, budget());
+        for attempt in 1..=2 {
+            assert!(
+                channel.get().await.is_none(),
+                "nothing listens on {REFUSED}, so this cannot succeed"
+            );
+            assert_eq!(
+                channel.failed_attempts(),
+                attempt,
+                "attempt {attempt} has to be made rather than skipped"
+            );
+        }
+    }
+
+    /// A TCP proxy in front of redis that closes every connection until it is
+    /// opened: the shape of "redis is coming back" — a pod restarting, a
+    /// resolver that has not answered yet.
+    struct GateProxy {
+        addr: std::net::SocketAddr,
+        open: Arc<AtomicBool>,
+        accepts: Arc<AtomicUsize>,
+    }
+
+    impl GateProxy {
+        async fn start(upstream: String) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind proxy");
+            let addr = listener.local_addr().expect("proxy address");
+            let open = Arc::new(AtomicBool::new(false));
+            let accepts = Arc::new(AtomicUsize::new(0));
+            let (open_task, accepts_task) = (Arc::clone(&open), Arc::clone(&accepts));
+            tokio::spawn(async move {
+                while let Ok((mut downstream, _)) = listener.accept().await {
+                    accepts_task.fetch_add(1, Ordering::Relaxed);
+                    if !open_task.load(Ordering::Relaxed) {
+                        // Dropping it closes it, which is what a client that
+                        // reached the port sees while the peer is still starting.
+                        drop(downstream);
+                        continue;
+                    }
+                    let upstream = upstream.clone();
+                    tokio::spawn(async move {
+                        let Ok(mut upstream) =
+                            tokio::net::TcpStream::connect(upstream.as_str()).await
+                        else {
+                            return;
+                        };
+                        let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
+                    });
+                }
+            });
+            Self {
+                addr,
+                open,
+                accepts,
+            }
+        }
+
+        fn open(&self) {
+            self.open.store(true, Ordering::Relaxed);
+        }
+
+        fn accepts(&self) -> usize {
+            self.accepts.load(Ordering::Relaxed)
+        }
+    }
+
+    /// The half the type exists for: a channel that could not connect reaches
+    /// redis once the peer answers, and a connection it already holds is reused
+    /// rather than reopened.
+    #[tokio::test]
+    async fn a_channel_reaches_redis_once_the_peer_answers() {
+        let url = std::env::var("COGNEVA_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let client = redis::Client::open(url).expect("a well-formed url");
+        let upstream = match client.get_connection_info().addr {
+            redis::ConnectionAddr::Tcp(ref host, port) => format!("{host}:{port}"),
+            ref other => {
+                eprintln!("SKIP: {other:?} is not a tcp address this test can proxy");
+                return;
+            }
+        };
+        if tokio::net::TcpStream::connect(&upstream).await.is_err() {
+            eprintln!("SKIP: no redis at {upstream} to proxy");
+            return;
+        }
+        let proxy = GateProxy::start(upstream).await;
+        let channel = Reconnecting::with_budget(
+            redis::Client::open(format!("redis://{}", proxy.addr)).expect("proxy url"),
+            budget(),
+        );
+
+        assert!(channel.get().await.is_none(), "the gate is shut");
+        assert_eq!(channel.failed_attempts(), 1);
+
+        proxy.open();
+        let mut conn = channel.get().await.expect("the peer answers now");
+        let pong: String = redis::cmd("PING")
+            .query_async(&mut conn)
+            .await
+            .expect("a managed connection answers");
+        assert_eq!(pong, "PONG");
+        assert_eq!(channel.failed_attempts(), 1, "a success is not a failure");
+
+        // Counted from here, not from zero: the shut gate was tried more than
+        // once inside that first call (the connect retries within its budget),
+        // and those attempts are the failure, not the reuse.
+        let after_connect = proxy.accepts();
+        for _ in 0..3 {
+            assert!(channel.get().await.is_some());
+        }
+        assert_eq!(
+            proxy.accepts(),
+            after_connect,
+            "an established channel is handed out again, not reopened"
+        );
     }
 
     /// Evidence for the rationale above, kept runnable instead of quoted from a
