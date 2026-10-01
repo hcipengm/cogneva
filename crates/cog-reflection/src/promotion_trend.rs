@@ -41,6 +41,7 @@ pub fn aggregate(
                 promoted: 0,
                 rolled_back: 0,
                 failed: 0,
+                pending: 0,
                 awaiting_review: 0,
                 awaiting_by_gate: 0,
                 awaiting_over_diff_limit: 0,
@@ -68,7 +69,7 @@ pub fn aggregate(
                     }
                 }
             }
-            PromotionStatus::Pending => {}
+            PromotionStatus::Pending => bucket.pending += 1,
         }
     }
 
@@ -122,12 +123,13 @@ pub fn aggregate(
             && tail.iter().all(|w| w.promoted == 0)
         {
             Some(format!(
-                "连续 {} 周零晋级（{}），这段时间没有任何变更上线",
+                "连续 {} 周零晋级（{}），这段时间没有任何变更上线。{}",
                 DECLINE_RUN,
                 tail.iter()
                     .map(|w| w.week.as_str())
                     .collect::<Vec<_>>()
-                    .join(" → ")
+                    .join(" → "),
+                stall_reason(tail)
             ))
         } else {
             None
@@ -142,10 +144,35 @@ pub fn aggregate(
     }
 }
 
+/// 停摆停下的是哪一侧，从**这几周自己的台账数**里读出来。
+///
+/// 「没有任何变更上线」这句话对两件处置相反的事同时成立：一套从来没生成出
+/// 变更的系统（要去看生成侧为什么没有输入），与一套每周都在生成、每条都卡在
+/// 落地那一段的系统（要去看落地通道）。判词的读者往往只有那一行文字，看不到
+/// 旁边的 labels，所以原因必须长在判词里。
+///
+/// 原因只能从**同一批周**里取。拿一个别的窗口的计数（比如自本进程启动以来的
+/// 信号计数）拼在这里是不行的：两个窗口不一样长，读起来就是一句没有依据的话，
+/// 而且进程一重启那个数就归零，而停摆压根没变。
+fn stall_reason(tail: &[PromotionTrendWeek]) -> String {
+    let pending: u64 = tail.iter().map(|w| w.pending).sum();
+    let awaiting: u64 = tail.iter().map(|w| w.awaiting_review).sum();
+    let failed: u64 = tail.iter().map(|w| w.failed).sum();
+    let rolled_back: u64 = tail.iter().map(|w| w.rolled_back).sum();
+    let generated = pending + awaiting + failed + rolled_back;
+    if generated == 0 {
+        "这几周一条变更都没有生成出来——停的是生成侧，不是落地通道".to_string()
+    } else {
+        format!(
+            "这几周生成了 {generated} 条却一条都没落地（待执行 {pending}、审批中 {awaiting}、失败 {failed}、回滚 {rolled_back}）——停的是落地通道，不是生成侧"
+        )
+    }
+}
+
 /// 把报告写成 markdown（人读）。
 pub fn render_markdown(report: &PromotionTrendReport) -> String {
     let mut out = format!(
-        "# 晋级周报（生成于 {}）\n\n| 周 | 晋级 | 回滚 | 失败 | 审批中 | 门拦 | 超行数 | 成功率 |\n|---|---|---|---|---|---|---|---|\n",
+        "# 晋级周报（生成于 {}）\n\n| 周 | 晋级 | 回滚 | 失败 | 待执行 | 审批中 | 门拦 | 超行数 | 成功率 |\n|---|---|---|---|---|---|---|---|---|\n",
         report.generated_at.format("%Y-%m-%d %H:%M UTC")
     );
     for w in &report.weeks {
@@ -154,11 +181,12 @@ pub fn render_markdown(report: &PromotionTrendReport) -> String {
             .map(|r| format!("{:.0}%", r * 100.0))
             .unwrap_or_else(|| "–".into());
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             w.week,
             w.promoted,
             w.rolled_back,
             w.failed,
+            w.pending,
             w.awaiting_review,
             w.awaiting_by_gate,
             w.awaiting_over_diff_limit,
@@ -302,6 +330,7 @@ impl PromotionTrendReporter {
                     "promoted": w.promoted,
                     "failed": w.failed,
                     "rolled_back": w.rolled_back,
+                    "pending": w.pending,
                     "awaiting_review": w.awaiting_review,
                 })
             })
@@ -473,6 +502,50 @@ mod tests {
             .stall_alert
             .expect("连续零晋级必须被报出来，不能静默");
         assert!(stall.contains("零晋级"), "告警要说明是什么状态：{stall}");
+    }
+
+    /// 停摆的判词要说清停的是哪一侧。同样是「连续几周零晋级」，「一条变更都没
+    /// 生成出来」与「生成了却一条都没落地」要去看的地方相反，而判词的读者往往
+    /// 只有那一行文字。
+    #[test]
+    fn the_stall_verdict_says_which_side_stopped() {
+        let quiet = aggregate(&[], Utc::now())
+            .stall_alert
+            .expect("一条记录都没有也是停摆");
+        assert!(quiet.contains("生成侧"), "没有生成就该指向生成侧：{quiet}");
+
+        // 同样的零晋级，但这几周里变更是存在的，只是每条都停在落地那一段。
+        let records = vec![
+            rec(1, PromotionStatus::Failed),
+            rec(2, PromotionStatus::RolledBack),
+            rec(3, PromotionStatus::AwaitingApproval),
+            rec(3, PromotionStatus::Pending),
+        ];
+        let stalled = aggregate(&records, Utc::now())
+            .stall_alert
+            .expect("零晋级就是停摆");
+        assert!(
+            stalled.contains("落地通道"),
+            "有生成没落地就该指向落地通道：{stalled}"
+        );
+        assert!(
+            !stalled.contains("一条变更都没有生成出来"),
+            "判词不能把「生成了但没落地」说成「没生成」：{stalled}"
+        );
+    }
+
+    /// 待执行那一档必须真的进桶。少了它，「生成了但还在飞」的三周在判词里
+    /// 与「什么都没生成」一模一样——这正是这一档存在的理由。
+    #[test]
+    fn changes_that_are_still_in_flight_are_counted_as_generated() {
+        let records = vec![rec(1, PromotionStatus::Pending)];
+        let week = &aggregate(&records, Utc::now()).weeks[6];
+        assert_eq!(week.pending, 1);
+        assert_eq!(week.promoted, 0);
+        assert_eq!(
+            week.success_rate, None,
+            "还在飞的变更不是胜负样本，不能进成功率分母"
+        );
     }
 
     #[test]
