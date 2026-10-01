@@ -22,12 +22,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # The version is read from the same declaration the container build uses
+      # instead of being restated here: a copy is a second holder of one value,
+      # and the two drift without any gate noticing. The value is also load
+      # bearing — the committed Cargo.lock contains crates requiring rustc >=
+      # 1.91 — so a read that finds nothing fails the job rather than falling
+      # through to the action's own default.
+      - name: Resolve pinned Rust toolchain
+        id: rustver
+        run: |
+          v=$(bash deploy/scripts/declared-toolchain.sh)
+          [ -n "$v" ] || { echo "Could not read the declared Rust toolchain"; exit 1; }
+          echo "Resolved Rust toolchain $v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          # Keep in sync with RUST_TOOLCHAIN in the root Dockerfile — the
-          # committed Cargo.lock contains crates requiring rustc >= 1.91.
-          toolchain: "1.95.0"
+          toolchain: ${{ steps.rustver.outputs.version }}
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2

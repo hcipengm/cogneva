@@ -235,6 +235,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install rustup/stable toolchain for the self-evolution worker.
+# 这是**另一把**工具链，与上面钉住的 RUST_TOOLCHAIN 不是同一个，而且是有意的：
+# 进化 worker 在运行期编译系统写给自己、之后要落地的那些变更，它跟的是 stable
+# 通道（最新），不是编译这个镜像里二进制的那个版本。所以 RUST_TOOLCHAIN 这句
+# 声明**不覆盖**它——别把「Dockerfile 钉了版本」读成「这个镜像里的编译器是钉住的」。
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
