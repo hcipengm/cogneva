@@ -123,17 +123,24 @@ impl PlannerActor {
             contract["output_schema"] = serde_json::json!({
                 "summary": "string: concise plan summary",
                 "plan": "object: structured plan details (may be empty for self-evolution execution)",
-                "sub_tasks": "array: empty for self-evolution execution, otherwise TaskSpec objects"
+                "sub_tasks": "array: empty for self-evolution execution, otherwise TaskSpec objects",
+                "targets": "array of strings: repository-relative paths the change must touch, read from the checkout before you name them"
             });
             contract["example"] = serde_json::json!({
                 "summary": "Print the Cogneva version at startup by reading the version from Cargo.toml in main.rs",
                 "plan": { "approach": "add a version log line in the binary entry point" },
-                "sub_tasks": []
+                "sub_tasks": [],
+                "targets": ["crates/cogneva/src/main.rs"]
             });
             contract["instructions"] = serde_json::json!(
                 "You are the Planner actor. Your job is to produce a plan, NOT the change. \
                  Emit ONLY a single JSON object matching the output_schema. No markdown, no XML, no code fences, no change content. \
-                 Do not output artifact tags or unified diffs; the Generator actor will create the change later."
+                 Do not output artifact tags or unified diffs; the Generator actor will create the change later. \
+                 Also produce targets: the repository-relative paths the change must touch. Read the checkout before you name them \
+                 (you have read_file) — the Generator's diff is judged against this list, and a change that never touches a path you \
+                 named is refused. Name the files the work actually needs, not every file you looked at: an entry you name and the \
+                 change does not touch is a failure, while the change touching files beyond your list is allowed. If the intent names \
+                 an existing file, that file belongs in targets."
             );
         } else if self.output_schema.is_none() && self.prompt_skill.is_none() {
             // Built-in contract for standard goal decomposition. Lowest
@@ -226,6 +233,7 @@ impl PlannerActor {
                     plan: serde_json::Value::String(format!("environment_error: {e}")),
                     sub_tasks: Vec::new(),
                     acceptance_criteria: Vec::new(),
+                    targets: Vec::new(),
                 }
             }
         };

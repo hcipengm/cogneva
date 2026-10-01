@@ -186,6 +186,7 @@ pub fn fallback_best_branch(branches: &[PgeBranchResult]) -> MergeResult {
                 plan: serde_json::json!({}),
                 sub_tasks: Vec::new(),
                 acceptance_criteria: Vec::new(),
+                targets: Vec::new(),
             },
             generation: GeneratorOutput::none(),
             outcome: RoundOutcome::Stopped {

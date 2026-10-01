@@ -470,6 +470,7 @@ impl PgeRoundtable {
                     plan: serde_json::json!({}),
                     sub_tasks: Vec::new(),
                     acceptance_criteria: Vec::new(),
+                    targets: Vec::new(),
                 },
                 generation: GeneratorOutput::none(),
                 outcome: RoundOutcome::Stopped {
@@ -990,6 +991,7 @@ impl PgeRoundtable {
                     plan: serde_json::json!({}),
                     sub_tasks: Vec::new(),
                     acceptance_criteria: Vec::new(),
+                    targets: Vec::new(),
                 },
                 generation: GeneratorOutput::none(),
                 outcome: RoundOutcome::Stopped {
@@ -1095,6 +1097,7 @@ impl PgeRoundtable {
                     plan: serde_json::json!({}),
                     sub_tasks: Vec::new(),
                     acceptance_criteria: Vec::new(),
+                    targets: Vec::new(),
                 },
                 generation: GeneratorOutput::none(),
                 outcome: RoundOutcome::Stopped {
@@ -1204,6 +1207,7 @@ pub fn parse_planner_output(value: &serde_json::Value, goal: &str) -> PlannerOut
             plan: serde_json::Value::String(reason),
             sub_tasks: Vec::new(),
             acceptance_criteria: Vec::new(),
+            targets: Vec::new(),
         };
     }
     serde_json::from_value(value.clone()).unwrap_or_else(|_| PlannerOutput {
@@ -1211,6 +1215,7 @@ pub fn parse_planner_output(value: &serde_json::Value, goal: &str) -> PlannerOut
         plan: value.clone(),
         sub_tasks: Vec::new(),
         acceptance_criteria: Vec::new(),
+        targets: Vec::new(),
     })
 }
 
@@ -1606,6 +1611,7 @@ mod tests {
             plan: serde_json::json!({}),
             sub_tasks: Vec::new(),
             acceptance_criteria: Vec::new(),
+            targets: Vec::new(),
         }
     }
 

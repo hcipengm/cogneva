@@ -107,25 +107,7 @@ impl EvaluatorActor {
         // and skip the semantic LLM evaluation entirely for this mode.
         if is_self_evolution {
             let validation = Self::validate_change_artifacts(generation);
-            let (verdict, score) =
-                if validation.starts_with("change_validation: change artifact(s) are valid") {
-                    (Verdict::Pass, 85)
-                } else if validation.contains("no change artifact found") {
-                    (Verdict::Fail, 0)
-                } else {
-                    (Verdict::Fail, 10)
-                };
-            let output = EvaluationResult {
-                verdict,
-                feedback: validation.clone(),
-                score: Some(score),
-                criteria: vec![Criterion {
-                    name: "change_validation".into(),
-                    score,
-                    comment: validation.clone(),
-                }],
-                details: None,
-            };
+            let output = Self::judge_self_evolution_change(&validation, generation, plan);
             let output_str = serde_json::to_string_pretty(&output).unwrap_or_default();
             // Self-review for self-evolution is skipped: the deterministic change
             // validation already gives a reliable verdict, and reasoning-only
@@ -249,6 +231,94 @@ impl EvaluatorActor {
         output
     }
 
+    /// The deterministic judgement of a self-evolution change: the artifact's
+    /// own validity, and whether it went where the plan said it would.
+    ///
+    /// Pure, and separate from [`Self::evaluate`], because this is the whole
+    /// judgement on that path — no agent is consulted, so a test can assert the
+    /// verdict, the per-target scores and the feedback the repair loop will read
+    /// without standing up a model.
+    ///
+    /// The second half exists because the acceptance criteria are not read here.
+    /// On this path the criteria are free text with no judge, so "the change is
+    /// about what the plan said it was about" can only come from the plan's
+    /// declared target set, compared against the diff's own targets. A plan that
+    /// declares none leaves the vectors empty and changes nothing below.
+    pub(crate) fn judge_self_evolution_change(
+        validation: &str,
+        generation: &serde_json::Value,
+        plan: &serde_json::Value,
+    ) -> EvaluationResult {
+        use crate::squad::pge::types::{change_targets, declared_targets, uncovered_targets};
+
+        let well_formed = validation.starts_with("change_validation: change artifact(s) are valid");
+        let declared = declared_targets(plan);
+        let uncovered = if well_formed {
+            uncovered_targets(generation, &declared)
+        } else {
+            Vec::new()
+        };
+        let (verdict, score) = if !well_formed {
+            if validation.contains("no change artifact found") {
+                (Verdict::Fail, 0)
+            } else {
+                (Verdict::Fail, 10)
+            }
+        } else if uncovered.is_empty() {
+            (Verdict::Pass, 85)
+        } else {
+            // A well-formed change that went somewhere the plan did not name.
+            // Scored above an unappliable diff (10) and below a pass: the artifact
+            // is deliverable in form, it just is not this task. The score is its
+            // own cell because a repair loop that only counted "failed" would not
+            // be able to tell "the patch is broken" from "the patch is fine and
+            // pointed at the wrong file".
+            (Verdict::Fail, 20)
+        };
+
+        let mut criteria = vec![Criterion {
+            name: "change_validation".into(),
+            score,
+            comment: validation.to_string(),
+        }];
+        for target in &declared {
+            let touched = !uncovered.contains(target);
+            criteria.push(Criterion {
+                name: format!("plan_target: {target}"),
+                score: if touched { 100 } else { 0 },
+                comment: if touched {
+                    format!("the change touches {target}")
+                } else {
+                    format!("the change never touches {target}, which the plan named as its target")
+                },
+            });
+        }
+
+        let feedback = if uncovered.is_empty() {
+            validation.to_string()
+        } else {
+            let touched = change_targets(generation);
+            format!(
+                "{}; the change does not touch the target(s) the plan named: {} (the diff's targets are: {})",
+                validation,
+                uncovered.join(", "),
+                if touched.is_empty() {
+                    "none".to_string()
+                } else {
+                    touched.join(", ")
+                }
+            )
+        };
+
+        EvaluationResult {
+            verdict,
+            feedback,
+            score: Some(score),
+            criteria,
+            details: None,
+        }
+    }
+
     /// Validate that self-evolution artifacts contain a valid change.
     /// Returns a criterion string describing the validation result.
     fn validate_change_artifacts(generation: &serde_json::Value) -> String {
@@ -341,6 +411,104 @@ mod tests {
 
     fn verdict_for(diff: &str) -> String {
         EvaluatorActor::validate_change_artifacts(&generation_with_diff(diff))
+    }
+
+    fn plan_naming(paths: &[&str]) -> serde_json::Value {
+        serde_json::json!({ "targets": paths })
+    }
+
+    fn judged(diff: &str, plan: &serde_json::Value) -> EvaluationResult {
+        let generation = generation_with_diff(diff);
+        let validation = EvaluatorActor::validate_change_artifacts(&generation);
+        EvaluatorActor::judge_self_evolution_change(&validation, &generation, plan)
+    }
+
+    fn criterion<'a>(result: &'a EvaluationResult, name: &str) -> &'a Criterion {
+        result
+            .criteria
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("no criterion named {name}: {:?}", result.criteria))
+    }
+
+    /// The case the whole check exists for: the plan said the change is about an
+    /// existing document, the change created an unrelated source file instead.
+    /// The artifact is a perfectly valid diff, so nothing else on this path can
+    /// tell the two apart.
+    #[test]
+    fn a_change_that_never_touches_the_plans_named_file_fails_under_that_criterion() {
+        let plan = plan_naming(&["README.md"]);
+        let result = judged(
+            &create_diff("crates/cogneva/src/windows_quickstart.rs"),
+            &plan,
+        );
+
+        assert_eq!(result.verdict, Verdict::Fail);
+        assert_eq!(criterion(&result, "plan_target: README.md").score, 0);
+        // The repair loop reads the feedback, so the unmet target and the paths
+        // the diff actually took both have to be in it — a verdict alone would
+        // leave the generator guessing which of its files was the wrong one.
+        assert!(result.feedback.contains("README.md"), "{}", result.feedback);
+        assert!(
+            result
+                .feedback
+                .contains("crates/cogneva/src/windows_quickstart.rs"),
+            "{}",
+            result.feedback
+        );
+    }
+
+    #[test]
+    fn a_change_that_touches_the_plans_named_file_passes_even_with_extra_files() {
+        let plan = plan_naming(&["README.md"]);
+        let both = format!(
+            "{}{}",
+            modify_diff("README.md"),
+            create_diff("crates/cogneva/src/quickstart.rs")
+        );
+        let result = judged(&both, &plan);
+
+        assert_eq!(result.verdict, Verdict::Pass);
+        assert_eq!(criterion(&result, "plan_target: README.md").score, 100);
+    }
+
+    /// A plan that declares nothing must leave the judgement byte-for-byte what
+    /// it was before targets existed: every runtime whose planner does not emit
+    /// them has to keep working unchanged.
+    #[test]
+    fn a_plan_declaring_no_targets_judges_the_change_as_before() {
+        let result = judged(
+            &create_diff("crates/cogneva/src/new_module.rs"),
+            &serde_json::json!({}),
+        );
+
+        assert_eq!(result.verdict, Verdict::Pass);
+        assert_eq!(result.score, Some(85));
+        assert_eq!(result.criteria.len(), 1);
+        assert_eq!(result.criteria[0].name, "change_validation");
+    }
+
+    /// A structurally broken diff is judged as broken, not as a scope miss: the
+    /// target check only has meaning once there is a change to place.
+    #[test]
+    fn an_unappliable_diff_keeps_its_own_cause_whatever_the_plan_declared() {
+        let plan = plan_naming(&["README.md"]);
+        let generation = generation_with_diff("not a diff at all\n");
+        let validation = EvaluatorActor::validate_change_artifacts(&generation);
+        let result = EvaluatorActor::judge_self_evolution_change(&validation, &generation, &plan);
+
+        assert_eq!(result.verdict, Verdict::Fail);
+        assert_eq!(result.score, Some(10));
+        assert!(
+            result.feedback.contains("no file paths found"),
+            "{}",
+            result.feedback
+        );
+        assert!(
+            !result.feedback.contains("does not touch"),
+            "{}",
+            result.feedback
+        );
     }
 
     #[test]

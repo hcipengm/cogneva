@@ -81,6 +81,7 @@ mod tests {
             plan: serde_json::json!({}),
             sub_tasks,
             acceptance_criteria: Vec::new(),
+            targets: Vec::new(),
         }
     }
 

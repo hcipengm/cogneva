@@ -262,7 +262,8 @@ fn change_generation_contract() -> serde_json::Value {
         "grounding": "Your diff is validated with `git apply --check` against a checkout of this repository, then applied to it and compiled. It must therefore describe the files as they actually are, not as you remember them. You have file tools in this run — use them before writing: list the directories you intend to touch, then read every file you change in full (read_file, or a shell command such as `sed -n '1,400p' <path>`). Address files by repository-relative path (for example crates/cog-core/src/lib.rs) — the same path that appears in the '+++ b/' line — and those paths resolve against the checkout. Never guess a path: a path that is not in the checkout is rejected unless the diff itself declares it as created.",
         "diff_grammar": "Every hunk header '@@ -<start>,<count> +<start>,<count> @@' must declare exactly the number of lines its body carries, and the diff must end with a newline. Every context line and every removed line has to match the file byte for byte, including indentation and trailing whitespace, and the start line numbers must be the real line numbers in the file you read. Keep hunks narrow and anchor them on context that is unique in the file: one hunk whose context cannot be located fails the entire change.",
         "creating_a_file": "To add a file, declare it as a creation: 'diff --git a/<path> b/<path>', then 'new file mode 100644', '--- /dev/null', '+++ b/<path>', and a hunk header '@@ -0,0 +1,<n> @@' whose body is n '+' lines. Creating a file that already exists fails, and so does rewriting a file that does not exist without declaring it as a creation.",
-        "scope": "Stay inside the checkout, and prefer paths under crates/*/src/. The gate rejects changes to build and deployment manifests (Cargo.toml, Cargo.lock, Dockerfile, Containerfile, docker-compose.yml, setup.sh) and to configuration or credential files (cogneva.json, .env, .envrc, *.pem, *.key, *.crt, *.p12); deletions are judged by the same rules as edits. The applied change is compiled and tested, so it must be complete and self-consistent — no placeholder or unimplemented bodies."
+        "scope": "Stay inside the checkout, and prefer paths under crates/*/src/. The gate rejects changes to build and deployment manifests (Cargo.toml, Cargo.lock, Dockerfile, Containerfile, docker-compose.yml, setup.sh) and to configuration or credential files (cogneva.json, .env, .envrc, *.pem, *.key, *.crt, *.p12); deletions are judged by the same rules as edits. The applied change is compiled and tested, so it must be complete and self-consistent — no placeholder or unimplemented bodies.",
+        "plan_targets": "The plan you are handed may name the repository-relative paths the change must touch. Every path it names has to be a target of your diff: the change may touch more files than the plan lists, but a path the plan names and your diff never touches is refused. If the plan names a file that already exists, change that file — do not create a new one beside it and leave the named file alone."
     })
 }
 
@@ -343,6 +344,14 @@ mod tests {
             (
                 "the directories must be listed before reading",
                 "list the directories you intend to touch",
+            ),
+            (
+                "every path the plan names must be a target of the diff",
+                "has to be a target of your diff",
+            ),
+            (
+                "a named existing file is changed, not bypassed",
+                "do not create a new one beside it",
             ),
         ] {
             assert!(

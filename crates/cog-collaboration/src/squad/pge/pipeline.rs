@@ -156,6 +156,7 @@ pub fn declared_plan(goal: &str, scale: crate::profile::DeclaredScale) -> Planne
         }),
         sub_tasks: Vec::new(),
         acceptance_criteria: Vec::new(),
+        targets: Vec::new(),
     }
 }
 

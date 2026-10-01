@@ -129,6 +129,7 @@ fn a_branch(branch_id: u32) -> PgeBranchResult {
             plan: serde_json::json!({}),
             sub_tasks: Vec::new(),
             acceptance_criteria: Vec::new(),
+            targets: Vec::new(),
         },
         generation: GeneratorOutput::none(),
         outcome: RoundOutcome::Stopped {

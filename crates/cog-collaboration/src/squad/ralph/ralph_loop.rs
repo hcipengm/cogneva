@@ -1933,6 +1933,7 @@ mod tests {
                 plan: serde_json::json!({}),
                 sub_tasks: Vec::new(),
                 acceptance_criteria: Vec::new(),
+                targets: Vec::new(),
             },
             final_generation: GeneratorOutput {
                 content: serde_json::json!({}),
@@ -1964,6 +1965,7 @@ mod tests {
             plan: serde_json::json!({}),
             sub_tasks: Vec::new(),
             acceptance_criteria: Vec::new(),
+            targets: Vec::new(),
         };
         result.final_generation = GeneratorOutput::none();
         result.final_outcome = RoundOutcome::Stopped {

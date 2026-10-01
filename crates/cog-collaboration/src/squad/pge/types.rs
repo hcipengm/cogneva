@@ -29,6 +29,24 @@ pub struct PlannerOutput {
     /// to its generic scoring rubric.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub acceptance_criteria: Vec<String>,
+    /// Repository-relative paths this plan says the change will touch.
+    ///
+    /// Only the self-evolution plan declares these, and only because its
+    /// evaluator judges the change deterministically: for that path the
+    /// acceptance criteria are free text nobody reads, so "the change is about
+    /// what the plan said it was about" needs a machine-readable carrier. The
+    /// check is a set comparison against the diff's own targets — never a
+    /// reading of prose, where a criterion like "must not touch Cargo.toml"
+    /// starts with a path and would invert the question.
+    ///
+    /// The field lives on the type, not in the free-form `plan` object, because
+    /// the plan reaches the evaluator as `serde_json::to_value(&plan)`: a key
+    /// that is not a field here is dropped on the way and never read. Empty
+    /// means the plan declared nothing, and every reader must then be inert —
+    /// which is what keeps this additive for runtimes whose planner does not
+    /// emit targets yet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<String>,
 }
 
 /// Whether an in-band cause names a deterministic failure: the transport never
@@ -283,6 +301,79 @@ impl GeneratorOutput {
         }
         Some(format!("{TERMINAL_ENV_FAILURE_PREFIX}: {}", detail.trim()))
     }
+}
+
+/// Every repository-relative path the generation's unified diffs name, on
+/// either side of the diff.
+///
+/// Read from the serialized generation, the same artifact list the change
+/// validation reads, so the two answers cannot disagree about what the change
+/// touched. Both sides of each diff count because a deletion names its file
+/// where the content disappears: a change that removes the artifact a plan
+/// declared still touched it.
+pub fn change_targets(generation: &serde_json::Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    let Some(artifacts) = generation.get("artifacts").and_then(|v| v.as_array()) else {
+        return paths;
+    };
+    for artifact in artifacts {
+        let artifact_type = artifact
+            .get("artifact_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let name = artifact.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if !is_change_artifact(artifact_type, name) {
+            continue;
+        }
+        let Some(content) = artifact.get("content").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        for target in cog_core::parse_diff_targets(content) {
+            if !paths.contains(&target.path) {
+                paths.push(target.path);
+            }
+        }
+    }
+    paths
+}
+
+/// The plan's declared targets this change never touches, in the order the plan
+/// declared them.
+///
+/// A plain set comparison, deliberately: it does not ask whether the change
+/// satisfies the intent, only whether it went where the plan said it would. The
+/// question it answers is the one the prose criteria could not — a plan naming
+/// `README.md` and a change that only creates `crates/x/src/new.rs` disagree
+/// here, and the generator is told both names. Extra paths are allowed: the plan
+/// is a floor on coverage, not a ceiling on what the work turns out to need.
+pub fn uncovered_targets(generation: &serde_json::Value, declared: &[String]) -> Vec<String> {
+    let touched = change_targets(generation);
+    declared
+        .iter()
+        .filter(|d| !touched.contains(d))
+        .cloned()
+        .collect()
+}
+
+/// The plan's declared targets, read from the serialized plan an evaluator is
+/// handed.
+///
+/// The evaluator sees the plan as JSON rather than as [`PlannerOutput`], so the
+/// read happens here instead of at the call site — but the field is on the type,
+/// which is what makes the value survive `serde_json::to_value` on its way over.
+/// A key that lived only in prose would never reach this function, and the check
+/// built on it would be inert without ever saying so.
+pub fn declared_targets(plan: &serde_json::Value) -> Vec<String> {
+    plan.get("targets")
+        .and_then(|v| v.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// A single evaluation criterion.
@@ -670,6 +761,7 @@ mod tests {
             plan: serde_json::json!({}),
             sub_tasks: Vec::new(),
             acceptance_criteria: vec!["answer states the exact version".into()],
+            targets: Vec::new(),
         };
         let value = serde_json::to_value(&output).unwrap();
         let back: PlannerOutput = serde_json::from_value(value).unwrap();
@@ -685,6 +777,7 @@ mod tests {
             plan: serde_json::json!({}),
             sub_tasks: Vec::new(),
             acceptance_criteria: Vec::new(),
+            targets: Vec::new(),
         };
         assert!(!output.is_terminal_env_failure());
         assert!(output.terminal_env_failure_reason().is_none());
@@ -700,6 +793,7 @@ mod tests {
             ),
             sub_tasks: Vec::new(),
             acceptance_criteria: Vec::new(),
+            targets: Vec::new(),
         };
         assert!(output.is_terminal_env_failure());
         let reason = output.terminal_env_failure_reason().unwrap();
