@@ -98,7 +98,7 @@ const OVERLAY_UNREFRESHABLE: &[(&str, &str)] = &[(
 // ---------------------------------------------------------------------------
 
 /// 完整 rev 取短 id（git 短 sha 惯例 12 字符）。
-fn rev12(rev: &str) -> &str {
+pub(crate) fn rev12(rev: &str) -> &str {
     if rev.len() >= 12 {
         &rev[..12]
     } else {
@@ -382,6 +382,103 @@ struct RegistryTag {
 /// 裸 tag 名 → rev 片段（只有 `main-<rev>` 是）。
 fn tag_rev(tag: &str) -> Option<&str> {
     tag.strip_prefix(MAIN_TAG_PREFIX)
+}
+
+/// The revisions a reclaim pass must not remove, and the live reading behind them.
+///
+/// `live` is carried alongside rather than folded in because a pass has to be
+/// able to say which entries came from "a workload is running this right now"
+/// as opposed to "the window happens to cover it" -- a round that protects
+/// nothing live and one that protects six live revisions look the same in a
+/// count, and only one of them means the reading worked.
+struct Retained {
+    revs: HashSet<String>,
+    live: Vec<String>,
+}
+
+/// 一轮 buildah 库回收的结局，闭集。
+///
+/// 六格而不是"成/不成"两格，因为没删成有三种走法——宿主在构建、保留集读不到、
+/// 库读不到——三者的对策分别是等、修读数、修 buildah。合成一格"失败"会让它们
+/// 永远共用同一个借口。`Failed` 是第六格：跑完了、名单和库都读到了、计划里的
+/// 镜像却一张都没走掉——那是删除这条路本身坏了，与上面三格都不是一件事。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildahOutcome {
+    /// 删掉了至少一张。
+    Pruned,
+    /// 跑完了，库里没有保留集之外的镜像。
+    Nothing,
+    /// 宿主在构建，这一轮没动手。
+    Busy,
+    /// 保留集读不到，一张都没删。
+    KeepUnreadable,
+    /// 库列不出来或列出来读不懂，一张都没删。
+    StoreUnreadable,
+    /// 跑完了，计划里的镜像一张都没走掉。
+    Failed,
+}
+
+impl BuildahOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            BuildahOutcome::Pruned => "pruned",
+            BuildahOutcome::Nothing => "nothing",
+            BuildahOutcome::Busy => "busy",
+            BuildahOutcome::KeepUnreadable => "keep_unreadable",
+            BuildahOutcome::StoreUnreadable => "store_unreadable",
+            BuildahOutcome::Failed => "failed",
+        }
+    }
+}
+
+/// 库的量：`overlay/` 下的一级子目录数与它们占的字节数。
+///
+/// 只量层目录，不量整个库：`overlay-images`、`overlay-layers` 那些是元数据
+/// （量级几 MB），把它们算进来，这个读数就变成"库变了多少"而不是"撤掉了多少
+/// 层"。字节是表观大小（`fs_size` 的口径），不是块数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StoreSize {
+    layers: u64,
+    bytes: u64,
+}
+
+/// 一次删除动作按库自己的话记下来的结果。
+struct BuildahPass {
+    /// 计划里的镜像有几张在重读之后不在了。
+    removed: f64,
+    /// 计划里还剩着的张数。
+    failures: f64,
+    /// 删完之后库的量；量不到就是 `None`。
+    after: Option<StoreSize>,
+}
+
+/// 一轮走完的回收带出来的读数。
+struct BuildahReading<'a> {
+    plan: &'a crate::buildah_store::StorePlan,
+    /// 保留集里有几个 rev 是**此刻有人在跑**的（相对于"窗口恰好盖到"）。
+    live: usize,
+    result: &'a BuildahPass,
+    /// 动手之前库的量。
+    before: Option<StoreSize>,
+    /// 这一轮走完的时刻。
+    completed_at: i64,
+}
+
+impl BuildahReading<'_> {
+    /// 这一轮放掉的层数与字节数；两端量不到就不给这两个数。
+    ///
+    /// 两端都量到才算得出来：只量到一头时，差值里混着这一轮期间别的东西
+    /// 写进去的量（库是共享的），而它比"没量"更坏——它是个看起来有出处的
+    /// 假数。饱和相减，因为库在同一轮里变大时差值会是负的，负的"放掉多少"
+    /// 没有意义，0 才是这一轮实话说出来的下界。
+    fn freed(&self) -> Option<(u64, u64)> {
+        let before = self.before?;
+        let after = self.result.after?;
+        Some((
+            before.layers.saturating_sub(after.layers),
+            before.bytes.saturating_sub(after.bytes),
+        ))
+    }
 }
 
 /// 保留策略：这一轮该删哪些 tag。
@@ -1768,6 +1865,12 @@ struct MainlineState {
     /// 落盘、要能重发：它不属于某一轮，属于这个进程当下的状态。
     #[serde(default)]
     registry_gc_owed: bool,
+    /// 上一次 buildah 库回收是什么时候（unix 秒，0 = 从没做过）。
+    ///
+    /// 与 `registry_maintenance_unix` 分开记：两轮动的是两张卷、两个库，共用一
+    /// 格会让一边的冷却把另一边按住。冷却本身必须落盘，理由同上一格。
+    #[serde(default)]
+    buildah_store_unix: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -3378,29 +3481,8 @@ impl MainlineDeployer {
             warn!(error = %e, "could not record the maintenance run; the next cycle may repeat it");
         }
         info!(used = ?used, declared = ?declared, "registry maintenance: pruning old revs and reclaiming");
-        // 保留集是白名单：认得的、这一轮还要用的 rev 一个都不能删。名单漏一项就是
-        // 静默删错（`prunable_tags` 那一侧是闭集，只管 `main-<rev>`）。
-        let mut keep: HashSet<String> = HashSet::new();
-        keep.insert(bare.to_string());
-        if let Some(rev) = &state.last_good_rev {
-            keep.insert(rev.clone());
-        }
-        if let Some(inflight) = &state.in_flight {
-            keep.insert(inflight.rev.clone());
-        }
-        for image in images {
-            if let Some(rev) = parse_main_rev(image) {
-                keep.insert(rev.to_string());
-            }
-        }
-        // 上面那几条只是"这一轮还要用的 rev"。集群里**此刻被引用着**的 rev 是另一组：
-        // 支撑面的 init 容器、备份 CronJob、tag 服务自己的边车都可能停在某个既不是
-        // `last_good`、也不是任何目标主容器的 rev 上（回滚只还原被滚容器，这些引用
-        // 留在失败的那一版）。它们不进名单就会被当旧 tag 删掉，而引用它的工作负载
-        // 下次重启再也拉不到镜像——**那不是旧 tag，是有人正在跑的那一版**。
-        // 读不到就整轮不删：名单不全会静默删错。
-        let live = match self.live_referenced_revs().await {
-            Ok(revs) => revs,
+        let Retained { revs: keep, live } = match self.retained_revs(bare, images, state).await {
+            Ok(retained) => retained,
             Err(e) => {
                 warn!(
                     error = %e,
@@ -3410,9 +3492,6 @@ impl MainlineDeployer {
                 return;
             }
         };
-        for rev in &live {
-            keep.insert(rev.clone());
-        }
         let tags = match self.registry_tags_with_readings().await {
             Ok(tags) => tags,
             Err(e) => {
@@ -3491,6 +3570,248 @@ impl MainlineDeployer {
             .await;
     }
 
+    /// 一轮 buildah 库回收：把保留集之外的基镜像从本地库里放掉。
+    ///
+    /// 与 registry 那轮**分开触发**。那一轮的判据是 registry 那张卷的占用，
+    /// 这一轮没有对应的占用判据——它该被回收的条件是"库里有保留集之外的
+    /// 镜像"，那不是一条关于盘的压力的话。挂在同一个进程里是因为两者读同一
+    /// 份保留集，不是因为两张卷会一起满；把这一轮绑到那边的阈值上，结果是
+    /// registry 不挤的时候这个库谁也不管。
+    ///
+    /// 两轮合用同一个冷却值（`registry_maintenance_cooldown_secs`）是刻意的：
+    /// 两轮的代价都落在同一个宿主上（各自扫一遍自己的库），一个"隔多久才许
+    /// 再扫一次"的答案对两边是同一个量级。不新增旋钮，是因为它没有第二个
+    /// 该取的值——真需要分开调时再加，那时它自然会有非默认的取值。
+    ///
+    /// 不删的几条各有各的读数：宿主在构建、保留集读不到、库读不到、库读得懂
+    /// 而没什么可删。前三条是"这一轮没能动手"，不是"没人用"——空读数是缺证据，
+    /// 不是证据。
+    async fn buildah_store_round(&self, bare: &str, images: &[String], state: &mut MainlineState) {
+        let now = chrono::Utc::now().timestamp();
+        if now.saturating_sub(state.buildah_store_unix)
+            < self.cfg.registry_maintenance_cooldown_secs as i64
+        {
+            return;
+        }
+        // 删的是别人可能正在用的基镜像，所以与构建互斥。拿不到就下一轮再看：
+        // 宿主在构建时，库恰好也是它正在写的时候。
+        let _slot = match cog_core::build_gate::try_acquire_exclusive("buildah store reclaim").await
+        {
+            Ok(slot) => slot,
+            Err(e) => {
+                info!(error = %e, "host is building; deferring buildah store reclaim");
+                self.record_buildah_round(BuildahOutcome::Busy, None).await;
+                return;
+            }
+        };
+        let Ok(retained) = self.retained_revs(bare, images, state).await else {
+            // 名单不全会静默删错，所以读不到就一张都不删。
+            warn!("could not read the revisions in use; no base image was removed");
+            self.record_buildah_round(BuildahOutcome::KeepUnreadable, None)
+                .await;
+            return;
+        };
+        let store = crate::sandbox::buildah_store_dir();
+        let storage = store.join("storage");
+        let inventory = match self.buildah(&["images", "--json"], 300).await {
+            Ok(body) => body,
+            Err(e) => {
+                warn!(error = %e, "the buildah store could not be listed; nothing was removed");
+                self.record_buildah_round(BuildahOutcome::StoreUnreadable, None)
+                    .await;
+                return;
+            }
+        };
+        let images_in_store = match crate::buildah_store::parse_inventory(&inventory) {
+            Ok(images) => images,
+            Err(e) => {
+                // 命令退出 0 而输出读不懂，与"库里什么都没有"必须分开：后者
+                // 会让下一句去删空集，看起来和"没什么可删"一模一样。
+                warn!(error = %e, "the buildah store inventory could not be read; nothing was removed");
+                self.record_buildah_round(BuildahOutcome::StoreUnreadable, None)
+                    .await;
+                return;
+            }
+        };
+
+        let plan = crate::buildah_store::plan_prune(&images_in_store, &retained.revs);
+        let before = self.store_layers(&storage).await;
+        let result = if plan.doomed.is_empty() {
+            BuildahPass {
+                removed: 0.0,
+                failures: 0.0,
+                after: before,
+            }
+        } else {
+            self.remove_store_images(&storage, &plan.doomed).await
+        };
+        // 记账在这场互斥里做完，然后立刻落盘：这一轮真走完了，"上次回收"
+        // 就该是现在。种子是 `MainlineState` 里那个 0，不是进程启动时刻——
+        // 落成启动时刻的话，一个从没回收过的进程会读成刚刚回收过，而这个
+        // 库正是要在那个窗口里被回收的。
+        state.buildah_store_unix = now;
+        if let Err(e) = self.save_state(state) {
+            warn!(error = %e, "could not record the buildah reclaim; the next cycle may repeat it");
+        }
+        // 读数同轮发：留了几张、删了几张几层、放掉多少字节、保留集里有几个是
+        // "此刻有人在跑"。少了最后一项，一次把在用的删掉和一次正常回收同形。
+        let outcome = if plan.doomed.is_empty() {
+            BuildahOutcome::Nothing
+        } else if result.removed > 0.0 {
+            BuildahOutcome::Pruned
+        } else {
+            BuildahOutcome::Failed
+        };
+        let reading = BuildahReading {
+            plan: &plan,
+            live: retained.live.len(),
+            result: &result,
+            before,
+            completed_at: now,
+        };
+        let freed = reading.freed();
+        self.record_buildah_round(outcome, Some(&reading)).await;
+        info!(
+            store = %store.display(),
+            in_store = images_in_store.len(),
+            kept = plan.kept,
+            doomed = plan.doomed.len(),
+            unnamed = plan.unnamed,
+            foreign = plan.foreign,
+            live_referenced = %retained.live.join(","),
+            removed = result.removed,
+            failures = result.failures,
+            freed = ?freed,
+            "buildah store reclaim round finished"
+        );
+    }
+
+    /// 删掉计划里的镜像，再**重读库存**数实际删掉了几张、几层、多少字节。
+    ///
+    /// 不按命令的退出码记账：一条命令删 160 张，第 40 张失败与全部成功在退出码上
+    /// 同形（非零），而"放掉了多少字节"只有库里少了什么才说得清。所以账取的是
+    /// "计划里那些 id 现在还在不在"。
+    ///
+    /// 重读失败时记的是**一张都没删**，不是全删了：读不回来时既证明不了成功也
+    /// 证明不了失败，而这两种记账在读数上一高一低，往高记会把一次没做成的回收
+    /// 记成做成的。
+    async fn remove_store_images(
+        &self,
+        storage: &std::path::Path,
+        doomed: &[crate::buildah_store::StoreImage],
+    ) -> BuildahPass {
+        // 分批：一次几百个参数的命令一旦超时，整批都算白跑；批小一点，失败只落在
+        // 那一批上。
+        for chunk in doomed.chunks(32) {
+            let mut args: Vec<String> = vec!["rmi".into()];
+            args.extend(chunk.iter().map(|image| image.id.clone()));
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            if let Err(e) = self.buildah(&refs, 900).await {
+                // 账不在这里记：下面那次重读才是账。
+                warn!(error = %e, "a batch of base images could not be removed");
+            }
+        }
+        let survivors: Option<HashSet<String>> = match self
+            .buildah(&["images", "--json"], 300)
+            .await
+        {
+            Ok(body) => match crate::buildah_store::parse_inventory(&body) {
+                Ok(images) => Some(images.into_iter().map(|image| image.id).collect()),
+                Err(e) => {
+                    warn!(error = %e, "the store could not be re-read; counting every removal as a failure");
+                    None
+                }
+            },
+            Err(e) => {
+                warn!(error = %e, "the store could not be re-read; counting every removal as a failure");
+                None
+            }
+        };
+        let removed = survivors
+            .as_ref()
+            .map(|survivors| {
+                doomed
+                    .iter()
+                    .filter(|image| !survivors.contains(&image.id))
+                    .count() as f64
+            })
+            .unwrap_or(0.0);
+        let failures = doomed.len() as f64 - removed;
+        let after = self.store_layers(storage).await;
+        BuildahPass {
+            removed,
+            failures,
+            after,
+        }
+    }
+
+    /// 库里的层数与字节数（`overlay/` 下的一级子目录），取不到就是 `None`。
+    ///
+    /// 只量层目录：`overlay-images` 那些是元数据，几 MB 量级，把它们算进来会让
+    /// 这个读数变成"库变没变"，而不是"撤掉了多少字节的层"。
+    async fn store_layers(&self, storage: &std::path::Path) -> Option<StoreSize> {
+        let overlay = storage.join("overlay");
+        tokio::task::spawn_blocking(move || {
+            cog_core::fs_size::dir_layers(&overlay, 1, &[])
+                .ok()
+                .map(|layers| StoreSize {
+                    layers: layers.len() as u64,
+                    bytes: layers.values().sum(),
+                })
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Read the revisions a reclaim pass must not remove, from the live references.
+    ///
+    /// One reader for both stores. The registry's reclaim deletes revisions and
+    /// the buildah store's reclaim deletes base images of revisions, and the two
+    /// questions are the same question -- which revisions is something still
+    /// using -- so they get the same answer. A second list would be a second
+    /// answer, and the half that deletes is the half that must not disagree: a
+    /// base image removed from under a rollout is a revision nobody can rebuild
+    /// from.
+    ///
+    /// `Err` when a reading it is built from failed. A list that is complete
+    /// except for one entry deletes something in use, so a partial list is not a
+    /// smaller answer, it is a wrong one, and the caller stops rather than acting
+    /// on it.
+    async fn retained_revs(
+        &self,
+        bare: &str,
+        images: &[String],
+        state: &MainlineState,
+    ) -> SFResult<Retained> {
+        // 保留集是白名单：认得的、这一轮还要用的 rev 一个都不能删。名单漏一项就是
+        // 静默删错（`prunable_tags` 那一侧是闭集，只管 `main-<rev>`）。
+        let mut revs: HashSet<String> = HashSet::new();
+        revs.insert(bare.to_string());
+        if let Some(rev) = &state.last_good_rev {
+            revs.insert(rev.clone());
+        }
+        if let Some(inflight) = &state.in_flight {
+            revs.insert(inflight.rev.clone());
+        }
+        for image in images {
+            if let Some(rev) = parse_main_rev(image) {
+                revs.insert(rev.to_string());
+            }
+        }
+        // 上面那几条只是"这一轮还要用的 rev"。集群里**此刻被引用着**的 rev 是另一组：
+        // 支撑面的 init 容器、备份 CronJob、tag 服务自己的边车都可能停在某个既不是
+        // `last_good`、也不是任何目标主容器的 rev 上（回滚只还原被滚容器，这些引用
+        // 留在失败的那一版）。它们不进名单就会被当旧 tag 删掉，而引用它的工作负载
+        // 下次重启再也拉不到镜像——**那不是旧 tag，是有人正在跑的那一版**。
+        // 读不到就整轮不删：名单不全会静默删错。
+        let live = self.live_referenced_revs().await?;
+        for rev in &live {
+            revs.insert(rev.clone());
+        }
+        Ok(Retained { revs, live })
+    }
+
     /// 回收轮自己的读数，两条路径共用一个出处。
     ///
     /// 跑过一轮就记一次计数（失败的轮也要记），删掉几个、被拒几个各记各的，而完成
@@ -3544,6 +3865,83 @@ impl MainlineDeployer {
         }
     }
 
+    /// 一轮 buildah 库回收自己的读数。
+    ///
+    /// 计一轮（按结局分格），没走完的轮只计这一格、不推进"上次回收"：读数里
+    /// 两个数一起看才分得开三种形态——计数涨而时刻不动是"一直在试着回收，
+    /// 一次都没成"，两者都涨是正常回收，两者都不动是这个进程没在做这件事。
+    /// `busy` 那一格同样只计不推进：推进了就等于说"宿主正在构建时这一轮也算
+    /// 回收过了"，而下一轮要等到冷掉六小时，正好错过构建完的那一刻。
+    async fn record_buildah_round(
+        &self,
+        outcome: BuildahOutcome,
+        reading: Option<&BuildahReading<'_>>,
+    ) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        use cog_core::metric_names;
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("outcome".to_string(), outcome.as_str().to_string());
+        let _ = metrics
+            .record_counter(metric_names::BUILDAH_STORE_ROUNDS_TOTAL, 1.0, labels)
+            .await;
+        let Some(reading) = reading else {
+            return;
+        };
+        let no_labels = std::collections::HashMap::new();
+        let _ = metrics
+            .record_gauge(
+                metric_names::BUILDAH_STORE_KEPT_IMAGES,
+                reading.plan.kept as f64,
+                no_labels.clone(),
+            )
+            .await;
+        let _ = metrics
+            .record_gauge(
+                metric_names::BUILDAH_STORE_LIVE_IMAGES,
+                reading.live as f64,
+                no_labels.clone(),
+            )
+            .await;
+        if reading.result.removed > 0.0 {
+            let _ = metrics
+                .record_counter(
+                    metric_names::BUILDAH_STORE_PRUNED_IMAGES_TOTAL,
+                    reading.result.removed,
+                    no_labels.clone(),
+                )
+                .await;
+        }
+        if let Some((layers, bytes)) = reading.freed() {
+            if layers > 0 {
+                let _ = metrics
+                    .record_counter(
+                        metric_names::BUILDAH_STORE_PRUNED_LAYERS_TOTAL,
+                        layers as f64,
+                        no_labels.clone(),
+                    )
+                    .await;
+            }
+            if bytes > 0 {
+                let _ = metrics
+                    .record_counter(
+                        metric_names::BUILDAH_STORE_FREED_BYTES_TOTAL,
+                        bytes as f64,
+                        no_labels.clone(),
+                    )
+                    .await;
+            }
+        }
+        let _ = metrics
+            .record_gauge(
+                metric_names::BUILDAH_STORE_READING_UNIX,
+                reading.completed_at as f64,
+                no_labels,
+            )
+            .await;
+    }
+
     /// 一轮轮询。
     pub async fn poll_once(&self) -> SFResult<()> {
         let mut state = self.load_state();
@@ -3568,6 +3966,12 @@ impl MainlineDeployer {
         // 的表现是卷满了而回收从没跑过，与"不需要回收"读起来一样。
         self.registry_maintenance_round(&bare, &images, &mut state)
             .await;
+
+        // buildah 库回收。与上面那轮共用一份保留集，但**不共用触发条件**：
+        // 上面那轮判的是 registry 那张卷的占用，这个库的占用不是一条关于盘的
+        // 压力的话——该回收它的条件是"库里有保留集之外的镜像"。挂在那边阈值上，
+        // 结果是 registry 不挤的时候这个库谁也不管；而这两张卷的容量并不相关。
+        self.buildah_store_round(&bare, &images, &mut state).await;
 
         // 在飞任务收敛/终态处理。
         if let Some(inflight) = state.in_flight.clone() {
@@ -9668,6 +10072,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             registry_maintenance_unix: 0,
             registry_restart_unix: Some(940),
             registry_gc_owed: false,
+            buildah_store_unix: 0,
         };
         let msg = heartbeat_message(&state, "aabbccddeeff0011", "up-to-date(aabbccddeeff)", 1000);
         assert!(msg.contains("in_flight=aabbccddeeff@Pushed"), "{msg}");
@@ -10020,6 +10425,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             registry_maintenance_unix: 0,
             registry_restart_unix: None,
             registry_gc_owed: false,
+            buildah_store_unix: 0,
         };
         let text = serde_json::to_string(&state).unwrap();
         let back: MainlineState = serde_json::from_str(&text).unwrap();
@@ -10145,6 +10551,22 @@ exit 0
         );
         write_fake_bin(dir, "fake-buildah", &script);
         dir.join("fake-buildah").to_string_lossy().to_string()
+    }
+
+    /// 夹具的 buildah 日志里有没有**打镜像**的动作。
+    ///
+    /// "这个文件存在"曾经等价于"重建了"，因为这个部署器是唯一调 buildah 的一方。
+    /// 库回收打破了这个等价：它每一轮（冷却期外）都会列一次库存，库里该删时还会
+    /// 删几张，而这两种都不是重建。判据因此收在构建自己的动词上——`from` 起容器、
+    /// `commit` 成形、`push` 上传、`tag` 挪浮动签——任一个出现才是重建发生了。
+    /// 收窄之后它抓的还是原来那只虫子，只是不再把回收读成重建。
+    fn buildah_built(bin_dir: &Path) -> bool {
+        let Ok(calls) = std::fs::read_to_string(bin_dir.join("buildah.log")) else {
+            return false;
+        };
+        ["from ", "commit ", "push ", "tag "]
+            .iter()
+            .any(|verb| calls.contains(verb))
     }
 
     /// fake kubectl：deployment 镜像查询输出写死的 deployed_image（四部署同值），
@@ -11182,8 +11604,8 @@ exit 0
         deployer.poll_once().await.unwrap();
 
         assert!(
-            !bin_dir.join("buildah.log").exists(),
-            "no buildah calls expected when already at main rev"
+            !buildah_built(&bin_dir),
+            "no rebuild expected when already at main rev"
         );
         let kubectl_calls =
             std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap_or_default();
@@ -11226,7 +11648,7 @@ exit 0
         let _ = deployer.poll_once().await;
 
         assert!(
-            !bin_dir.join("buildah.log").exists(),
+            !buildah_built(&bin_dir),
             "tag 服务还没答话就不该开始这一版：它注定拉不到镜像"
         );
         assert!(
@@ -13150,7 +13572,7 @@ exit 0
                 .collect::<Vec<_>>()
         );
         assert!(
-            !bin_dir.join("buildah.log").exists(),
+            !buildah_built(&bin_dir),
             "an image already in the registry must be reused, not rebuilt"
         );
         let kubectl_calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
@@ -13275,10 +13697,7 @@ exit 0
 
         deployer.poll_once().await.unwrap();
 
-        assert!(
-            !bin_dir.join("buildah.log").exists(),
-            "判定者没跑完就不该推进浮动签"
-        );
+        assert!(!buildah_built(&bin_dir), "判定者没跑完就不该推进浮动签");
         let state = read_state(&state_path);
         assert_eq!(
             state.in_flight.map(|f| f.rev),
@@ -13323,10 +13742,7 @@ exit 0
 
         deployer.poll_once().await.unwrap();
 
-        assert!(
-            !bin_dir.join("buildah.log").exists(),
-            "判失败的这一版不能推进浮动签"
-        );
+        assert!(!buildah_built(&bin_dir), "判失败的这一版不能推进浮动签");
         let state = read_state(&state_path);
         assert!(state.in_flight.is_none());
         assert_eq!(state.failed_rev.as_deref(), Some(rev_b.as_str()));
@@ -13430,7 +13846,7 @@ exit 0
             "浮动签的 rev 只能从 registry 上的内容读出来，读都没读就谈不上收敛"
         );
         assert!(
-            !bin_dir.join("buildah.log").exists(),
+            !buildah_built(&bin_dir),
             "apply pin to current :local must not trigger rebuild"
         );
         let kubectl_calls =
@@ -13895,7 +14311,7 @@ exit 0
         std::env::set_var("PATH", old_path);
 
         assert!(
-            !bin_dir.join("buildah.log").exists(),
+            !buildah_built(&bin_dir),
             "an environment-class retry must reuse the immutable tag, not rebuild"
         );
         let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
@@ -19316,5 +19732,362 @@ exit 0
             "声明侧冻在上一个 rev 上：改名后的对象没被读出来，旧对象还在报"
         );
         assert_eq!(drift.check_failures(), 0);
+    }
+
+    // ── buildah 库回收 ──
+
+    /// 一份 `buildah images --json` 形状的库存，一条记录一行。
+    ///
+    /// 一行一条不是排版：替身按行删记录（`grep -v`），挤成一行的话删一张就会把
+    /// 整份库存删空，而"删多了"在计数上比"删对了"更大，一眼看不出是夹具的错。
+    fn store_inventory(entries: &[(&str, &str)]) -> String {
+        let rows: Vec<String> = entries
+            .iter()
+            .map(|(id, name)| format!(r#"{{"id":"{id}","names":["{name}"]}}"#))
+            .collect();
+        format!("[\n{}\n]", rows.join(",\n"))
+    }
+
+    /// 一份替身 buildah：`images --json` 读库存文件，`rmi` 把点到的 id 从库存里
+    /// **真的删掉**。
+    ///
+    /// 替身必须改那份库存而不是只回一句成功：账是重读出来的，一个只会说"删好了"
+    /// 的替身会让漏删与成功同形，两个方向都测不出来。
+    fn fake_buildah_store(bin_dir: &Path, inventory: &str) -> String {
+        let inv = bin_dir.join("store-inventory.json");
+        std::fs::write(&inv, inventory).unwrap();
+        let log = bin_dir.join("buildah.log");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+echo "$@" >> '{log}'
+case "$*" in
+  *"--json"*) cat '{inv}' ;;
+  *"rmi"*)
+    for id in "$@"; do
+      grep -q "\"$id\"" '{inv}' || continue
+      grep -v "\"$id\"" '{inv}' > '{inv}.tmp'
+      mv '{inv}.tmp' '{inv}'
+    done
+    ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            inv = inv.display(),
+        );
+        write_fake_bin(bin_dir, "fake-buildah", &script)
+            .to_string_lossy()
+            .to_string()
+    }
+
+    /// 一份替身 kubectl，工作负载那一步答 `live`，其余答空。
+    fn fake_kubectl_live(bin_dir: &Path, live: &str) -> String {
+        let log = bin_dir.join("kubectl.log");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+echo "$@" >> '{log}'
+case "$*" in
+  *"jsonpath"*) printf '%s' '{live}' ;;
+  *) printf '' ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            live = live,
+        );
+        write_fake_bin(bin_dir, "fake-kubectl", &script)
+            .to_string_lossy()
+            .to_string()
+    }
+
+    /// 结局闭集自己是一份完整域：六个取值一个不少、两两不同，且每个都通过
+    /// `as_str` 报得出自己的名字。
+    ///
+    /// 下面那个 `match` 没有通配分支，是这份名单的唯一防线：往枚举里加一格而
+    /// 忘了加到数组里，这里就编不过。名单本身抄在数组里（Rust 没有枚举遍历），
+    /// 所以它与枚举同处一屏，改的人先撞上它再改。
+    #[test]
+    fn the_outcome_domain_covers_every_outcome() {
+        let every = [
+            BuildahOutcome::Pruned,
+            BuildahOutcome::Nothing,
+            BuildahOutcome::Busy,
+            BuildahOutcome::KeepUnreadable,
+            BuildahOutcome::StoreUnreadable,
+            BuildahOutcome::Failed,
+        ];
+        for outcome in every {
+            match outcome {
+                BuildahOutcome::Pruned
+                | BuildahOutcome::Nothing
+                | BuildahOutcome::Busy
+                | BuildahOutcome::KeepUnreadable
+                | BuildahOutcome::StoreUnreadable
+                | BuildahOutcome::Failed => {}
+            }
+            assert!(!outcome.as_str().is_empty());
+        }
+        let mut tokens: Vec<&str> = every.iter().map(|o| o.as_str()).collect();
+        tokens.sort_unstable();
+        let count = tokens.len();
+        tokens.dedup();
+        assert_eq!(tokens.len(), count, "两个结局共用一个名字: {tokens:?}");
+    }
+
+    /// 放掉多少只在两端都量到时才算得出来；一头量不到就没有这个数，而不是拿
+    /// 另一头当答案。库在同一轮里被别的东西写大时饱和成 0——"放掉多少"没有负的。
+    #[test]
+    fn freed_needs_both_ends_and_never_goes_negative() {
+        let plan = crate::buildah_store::StorePlan::default();
+        let big = StoreSize {
+            layers: 200,
+            bytes: 5_000,
+        };
+        let small = StoreSize {
+            layers: 190,
+            bytes: 4_000,
+        };
+        let freed = |before: Option<StoreSize>, after: Option<StoreSize>| {
+            let pass = BuildahPass {
+                removed: 1.0,
+                failures: 0.0,
+                after,
+            };
+            BuildahReading {
+                plan: &plan,
+                live: 0,
+                result: &pass,
+                before,
+                completed_at: 0,
+            }
+            .freed()
+        };
+        assert_eq!(freed(Some(big), Some(small)), Some((10, 1_000)));
+        assert_eq!(freed(None, Some(small)), None, "缺头一端就没这个数");
+        assert_eq!(freed(Some(big), None), None, "缺尾一端也没这个数");
+        assert_eq!(
+            freed(Some(small), Some(big)),
+            Some((0, 0)),
+            "库变大了要饱和成 0，不是负的放掉量"
+        );
+    }
+
+    /// 保留集之外的基镜像走人，里面的留着；账记在重读上。
+    #[tokio::test]
+    async fn the_store_round_removes_only_what_the_retention_set_lets_go() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let gone = "aaaaaaaaaaaa";
+        let stays = "bbbbbbbbbbbb";
+        let buildah = fake_buildah_store(
+            &bin_dir,
+            &store_inventory(&[
+                (gone, "localhost:30500/cogneva:main-333333333333"),
+                (stays, "localhost:30500/cogneva:main-222222222222"),
+            ]),
+        );
+        let kubectl = fake_kubectl_live(&bin_dir, "localhost:30500/cogneva:main-222222222222 ");
+        let mut cfg = test_config(root, Path::new("/nonexistent"), &buildah, &kubectl);
+        cfg.registry_retention = 1;
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_metrics(metrics.clone());
+
+        let mut state = MainlineState::default();
+        deployer
+            .buildah_store_round("111111111111", &[], &mut state)
+            .await;
+
+        let calls = std::fs::read_to_string(bin_dir.join("buildah.log")).unwrap();
+        assert!(
+            calls.contains(&format!("rmi {gone}")),
+            "保留集之外的基镜像要走: {calls}"
+        );
+        assert!(
+            !calls.contains(stays),
+            "有人正在跑的那张一个名字都不许出现在删除命令里: {calls}"
+        );
+        assert!(state.buildah_store_unix > 0, "这一轮走完了就要落盘");
+
+        let removed = metrics
+            .query_counter_totals(
+                cog_core::metric_names::BUILDAH_STORE_PRUNED_IMAGES_TOTAL.as_str(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].value, 1.0, "计划里那一张真的没了");
+        let outcomes = metrics
+            .query_counter_totals(cog_core::metric_names::BUILDAH_STORE_ROUNDS_TOTAL.as_str())
+            .await
+            .unwrap();
+        assert!(
+            outcomes.iter().any(
+                |s| s.labels.get("outcome").map(String::as_str) == Some("pruned") && s.value == 1.0
+            ),
+            "{outcomes:?}"
+        );
+        let kept = metrics
+            .query_gauge_latest(cog_core::metric_names::BUILDAH_STORE_KEPT_IMAGES.as_str())
+            .await
+            .unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].value, 1.0, "留了一张");
+        let live = metrics
+            .query_gauge_latest(cog_core::metric_names::BUILDAH_STORE_LIVE_IMAGES.as_str())
+            .await
+            .unwrap();
+        assert_eq!(live[0].value, 1.0, "保留集里有一个是此刻有人在跑的");
+        let stamp = metrics
+            .query_gauge_latest(cog_core::metric_names::BUILDAH_STORE_READING_UNIX.as_str())
+            .await
+            .unwrap();
+        assert_eq!(stamp.len(), 1, "走完的一轮要留下完成时刻");
+        assert!(stamp[0].value > 0.0);
+    }
+
+    /// 命令退出 0 而输出读不懂，与"库里什么都没有"必须分开：当成空库的下一步
+    /// 是去删一个空集，而它看起来和"没什么可删"一模一样，一步都不会少记。
+    #[tokio::test]
+    async fn an_unreadable_store_inventory_removes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let log = bin_dir.join("buildah.log");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+echo "$@" >> '{log}'
+printf '%s' 'buildah: image store is not initialized'
+exit 0
+"#,
+            log = log.display()
+        );
+        let buildah = write_fake_bin(&bin_dir, "fake-buildah", &script)
+            .to_string_lossy()
+            .to_string();
+        let kubectl = fake_kubectl_live(&bin_dir, "localhost:30500/cogneva:main-222222222222 ");
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let deployer = MainlineDeployer::new(
+            test_config(root, Path::new("/nonexistent"), &buildah, &kubectl),
+            test_workspaces(root, Path::new("/nonexistent")),
+        )
+        .with_metrics(metrics.clone());
+
+        let mut state = MainlineState::default();
+        deployer
+            .buildah_store_round("111111111111", &[], &mut state)
+            .await;
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(!calls.contains("rmi"), "读不懂的库一个都不许删: {calls}");
+        assert_eq!(
+            state.buildah_store_unix, 0,
+            "没走完的轮不许推进上次回收时刻"
+        );
+        let outcomes = metrics
+            .query_counter_totals(cog_core::metric_names::BUILDAH_STORE_ROUNDS_TOTAL.as_str())
+            .await
+            .unwrap();
+        assert!(
+            outcomes.iter().any(|s| {
+                s.labels.get("outcome").map(String::as_str) == Some("store_unreadable")
+                    && s.value == 1.0
+            }),
+            "{outcomes:?}"
+        );
+        let stamp = metrics
+            .query_gauge_latest(cog_core::metric_names::BUILDAH_STORE_READING_UNIX.as_str())
+            .await
+            .unwrap();
+        assert!(stamp.is_empty(), "没走完的一轮不许留下完成时刻: {stamp:?}");
+    }
+
+    /// 保留集读不到就整轮不动，且**不消耗冷却**：名单读不到是"等下一轮"的事，
+    /// 把它记成"刚回收过"会让下一次尝试推迟六小时，而那份名单下一轮可能就读得到。
+    #[tokio::test]
+    async fn an_unreadable_retention_set_removes_nothing_and_does_not_cool_down() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah_store(
+            &bin_dir,
+            &store_inventory(&[("aaaaaaaaaaaa", "localhost:30500/cogneva:main-333333333333")]),
+        );
+        let log = bin_dir.join("kubectl.log");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+echo "$@" >> '{log}'
+case "$*" in
+  *"jsonpath"*) echo "Error from server (Forbidden): deployments is forbidden" >&2; exit 1 ;;
+  *) printf '' ;;
+esac
+exit 0
+"#,
+            log = log.display()
+        );
+        let kubectl = write_fake_bin(&bin_dir, "fake-kubectl", &script)
+            .to_string_lossy()
+            .to_string();
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let deployer = MainlineDeployer::new(
+            test_config(root, Path::new("/nonexistent"), &buildah, &kubectl),
+            test_workspaces(root, Path::new("/nonexistent")),
+        )
+        .with_metrics(metrics.clone());
+
+        let mut state = MainlineState::default();
+        deployer
+            .buildah_store_round("111111111111", &[], &mut state)
+            .await;
+
+        let calls = std::fs::read_to_string(bin_dir.join("buildah.log")).unwrap_or_default();
+        assert!(!calls.contains("rmi"), "名单读不到时一张都不许删: {calls}");
+        assert_eq!(
+            state.buildah_store_unix, 0,
+            "这一轮没走完，冷却不许被消耗掉"
+        );
+        let outcomes = metrics
+            .query_counter_totals(cog_core::metric_names::BUILDAH_STORE_ROUNDS_TOTAL.as_str())
+            .await
+            .unwrap();
+        assert!(
+            outcomes.iter().any(|s| {
+                s.labels.get("outcome").map(String::as_str) == Some("keep_unreadable")
+                    && s.value == 1.0
+            }),
+            "{outcomes:?}"
+        );
+    }
+
+    /// 冷却里连库都不列：库是要人去翻的几万个 inode，判据是时刻而不是占用，
+    /// 每一轮都列一遍就是拿扫描换一个早就知道的答案。
+    #[tokio::test]
+    async fn the_store_round_lists_nothing_inside_its_cooldown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah_store(&bin_dir, &store_inventory(&[]));
+        let kubectl = fake_kubectl_live(&bin_dir, "");
+        let mut cfg = test_config(root, Path::new("/nonexistent"), &buildah, &kubectl);
+        cfg.registry_maintenance_cooldown_secs = 3600;
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+
+        let mut state = MainlineState {
+            buildah_store_unix: chrono::Utc::now().timestamp(),
+            ..Default::default()
+        };
+        deployer
+            .buildah_store_round("111111111111", &[], &mut state)
+            .await;
+
+        assert!(
+            !bin_dir.join("buildah.log").exists(),
+            "冷却里一次 buildah 都不该调"
+        );
     }
 }

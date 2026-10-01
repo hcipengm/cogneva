@@ -165,6 +165,59 @@ metric_names! {
     REGISTRY_PRUNE_FAILURES_TOTAL => "cogneva_registry_prune_failures_total",
     REGISTRY_MAINTENANCE_READING_UNIX => "cogneva_registry_maintenance_reading_unix",
 
+    // cog-reflection — the local build store's reclaim, read as a family.
+    //
+    // Separate from the registry's family above because they are two stores on
+    // two volumes with two triggers, and merging them would make one number
+    // stand for whatever the other store happened to be doing. They share one
+    // retention set, which is why they live in one process, and nothing else.
+    //
+    // The pass counter is labelled by `outcome` rather than split into series
+    // per cause: the causes are a closed set the producing code declares, and a
+    // reader that has to union six series to ask "did any pass run" is reading
+    // the label as if it were six unrelated facts. A round that could not take
+    // the host's build slot counts here too — it is a round that was attempted,
+    // and a store that is never reclaimed because the host is always building
+    // otherwise looks exactly like one nobody ever asked about.
+    //
+    // The pair to read across is this counter and the timestamp below: rounds
+    // rising against a timestamp that does not move is "the reclaim keeps being
+    // attempted and never completes", which is the shape a broken `buildah rmi`
+    // takes. Both rising is a healthy round with or without anything to remove,
+    // and neither moving is a process that is not doing this at all.
+    BUILDAH_STORE_ROUNDS_TOTAL => "cogneva_buildah_store_rounds_total",
+    // Images removed from the store, summed over rounds. Written only when a
+    // round removed something, so its absence means no pass has ever freed an
+    // image.
+    BUILDAH_STORE_PRUNED_IMAGES_TOTAL => "cogneva_buildah_store_pruned_images_total",
+    // Layer directories the store lost, summed over rounds. Read next to the
+    // image count: buildah shares layers between images, so the two diverge, and
+    // a round that removes many images for few layers is freeing less than the
+    // image count suggests.
+    BUILDAH_STORE_PRUNED_LAYERS_TOTAL => "cogneva_buildah_store_pruned_layers_total",
+    // Apparent bytes the store's layers lost, summed over rounds. Apparent
+    // rather than blocks, matching every other size this process reads, and
+    // written only when both ends of the pass could be measured -- a delta with
+    // one end missing would be a number with a provenance that does not exist.
+    BUILDAH_STORE_FREED_BYTES_TOTAL => "cogneva_buildah_store_freed_bytes_total",
+    // Images the retention set protected, as of the last completed round. The
+    // reading that says the keep set is doing something: a pass whose only
+    // number is "removed 0" cannot be told from one that protected nothing and
+    // found nothing to remove.
+    BUILDAH_STORE_KEPT_IMAGES => "cogneva_buildah_store_kept_images",
+    // Revisions the running workloads referenced, as of the last completed
+    // round. Published next to the count above because the two answer different
+    // questions -- how many the window covers against how many something is
+    // running right now -- and a live reading of zero is what a stalled cluster
+    // read would look like, which is the one way this pass could delete a base
+    // that is in use.
+    BUILDAH_STORE_LIVE_IMAGES => "cogneva_buildah_store_live_images",
+    // When a build-store reclaim last ran to completion, in unix seconds; 0
+    // until one does. Seeded with the epoch rather than the process start, so a
+    // process that has never completed a round reads as never having completed
+    // one instead of as having just done it.
+    BUILDAH_STORE_READING_UNIX => "cogneva_buildah_store_reading_unix",
+
     // cog-reflection — what one reclaim round's restart of the tag server cost.
     //
     // A counter of seconds, not a gauge of the last one: the quantity anyone

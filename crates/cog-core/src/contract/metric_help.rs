@@ -245,6 +245,35 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          changes what was asked for, so 'this upstream answers differently' has \
          this among its causes",
     ),
+    (
+        "cogneva_buildah_store_rounds_total",
+        "Attempts to reclaim the local build store, by outcome: pruned, or \
+         nothing to remove, or the host held the build slot, or the retention \
+         set, the store listing, its parse failed. Read with \
+         cogneva_buildah_store_reading_unix: rounds rising against a timestamp \
+         that does not move is a reclaim that is attempted and never completes",
+    ),
+    (
+        "cogneva_buildah_store_pruned_images_total",
+        "Base images removed from the local build store, summed over rounds. \
+         Written only when a round removed something, so its absence means no \
+         round has ever freed one",
+    ),
+    (
+        "cogneva_buildah_store_pruned_layers_total",
+        "Layer directories the local build store lost, summed over rounds. \
+         buildah shares layers between images, so this is not a fixed multiple \
+         of the image count: a round removing many images for few layers frees \
+         less than the image count suggests",
+    ),
+    (
+        "cogneva_buildah_store_freed_bytes_total",
+        "Apparent bytes the local build store's layers lost, summed over the \
+         rounds whose store could be measured before and after. Written only \
+         when both ends were measurable, since one end alone yields a delta with \
+         no provenance; on a host whose store shares hardlinked layers this \
+         counts each inode once",
+    ),
 ];
 
 /// Descriptions for the histogram series. See [`COUNTER_HELP`].
@@ -470,6 +499,29 @@ const GAUGE_HELP: &[(&str, &str)] = &[
         "The longest quota window any upstream declared, in seconds; 0 when none \
          did. Answers 'how long', which is a different question from the pool's \
          two recovery instants and is not capped by our own probe cadence",
+    ),
+    (
+        "cogneva_buildah_store_kept_images",
+        "Images the retention set protected in the local build store, as of the \
+         last completed reclaim round. The reading that says the keep set is \
+         doing something: a round whose only number is 'removed 0' cannot be told \
+         from one that protected nothing and had nothing to remove",
+    ),
+    (
+        "cogneva_buildah_store_live_images",
+        "Revisions the running workloads referenced, as of the last completed \
+         build-store reclaim round. Published next to the protected count because \
+         the two answer different questions -- how many the rollback window \
+         covers against how many something is running now -- and a live reading \
+         of zero is what a broken cluster read looks like, which is the one way \
+         this pass could remove a base image that is in use",
+    ),
+    (
+        "cogneva_buildah_store_reading_unix",
+        "When a local build-store reclaim last ran to completion, as a Unix \
+         timestamp; 0 until one does. Seeded with the epoch rather than the \
+         process start, so a process that has never completed a round reads as \
+         never having completed one instead of as having just done it",
     ),
 ];
 

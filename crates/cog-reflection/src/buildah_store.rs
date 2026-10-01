@@ -109,8 +109,21 @@ pub struct StorePlan {
 /// free a base that is still in the retention set because a second name of the
 /// same record had fallen out of it would be the one mistake here that cannot be
 /// walked back.
+///
+/// The revisions in `kept` arrive at whatever length their source used -- a
+/// state file holds full forty-character revisions, a workload's image holds the
+/// twelve the tag carries -- so both sides are shortened before they are
+/// compared. Comparing them as given is the failure mode this guards: nothing
+/// matches, every image reads as unreferenced, and a pass deletes the base
+/// images of the revisions that are running. `plan_prune` is not the only
+/// consumer of that set, so it does its own shortening rather than relying on
+/// one having been done upstream.
 pub fn plan_prune(images: &[StoreImage], kept: &HashSet<String>) -> StorePlan {
     let mut plan = StorePlan::default();
+    let retained: HashSet<&str> = kept
+        .iter()
+        .map(|rev| crate::mainline_deployer::rev12(rev))
+        .collect();
     for image in images {
         if image.names.is_empty() {
             plan.unnamed += 1;
@@ -127,7 +140,7 @@ pub fn plan_prune(images: &[StoreImage], kept: &HashSet<String>) -> StorePlan {
             plan.foreign += 1;
             continue;
         };
-        if revs.iter().any(|rev| kept.contains(*rev)) {
+        if revs.iter().any(|rev| retained.contains(rev)) {
             plan.kept += 1;
             continue;
         }
@@ -217,6 +230,25 @@ mod tests {
         let plan = plan_prune(&images, &kept(&[]));
         assert!(plan.doomed.is_empty());
         assert_eq!(plan.unnamed, 1);
+    }
+
+    #[test]
+    fn a_full_length_retained_rev_still_protects_its_tag() {
+        // The keep set is assembled from several sources and they do not agree
+        // on a length: a state file holds the full revision, a workload's image
+        // holds the twelve the tag carries. Compared as given, an image whose
+        // revision is only in the set in long form reads as unreferenced, and
+        // the pass removes base images of revisions that are running.
+        let images = vec![named(
+            "live",
+            &[&format!("{REG}/cogneva:main-222222222222")],
+        )];
+        let plan = plan_prune(
+            &images,
+            &kept(&["2222222222222222222222222222222222222222"]),
+        );
+        assert!(plan.doomed.is_empty(), "{:?}", plan.doomed);
+        assert_eq!(plan.kept, 1);
     }
 
     #[test]
