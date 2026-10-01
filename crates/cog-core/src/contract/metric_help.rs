@@ -149,7 +149,10 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          rising unreadable_diff is a change the loop cannot read its way out \
          of: the gate will not push a diff it cannot read, and unlike a path \
          refusal nothing retires it, so it comes back every round until someone \
-         looks at why the diff is malformed",
+         looks at why the diff is malformed. An oversized change reads the same \
+         way for a different reason: the size cap is the one policy limit owner \
+         approval lifts, so nothing in the loop ends it either and it too comes \
+         back every round until the owner decides",
     ),
     (
         "cogneva_redrive_refusals_total",

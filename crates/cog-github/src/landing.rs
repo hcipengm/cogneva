@@ -2277,6 +2277,104 @@ mod tests {
         LandingCategory::Environment,
     ];
 
+    /// The categories the landing alert rule deliberately does not read, each
+    /// with the reason it does not have to. A category in neither this list nor
+    /// the rule's selector fails the test below, so a variant added to the enum
+    /// has to be either wired into the rule or written off here on purpose --
+    /// it cannot fall through into being counted where nobody is listening.
+    ///
+    /// Both entries are the same shape: a failure the deployment's own machinery
+    /// resolves without anyone being told, where the next attempt is expected to
+    /// land. Everything else that is retried waits on something no automatic
+    /// step supplies -- a diff that has to be re-read, an owner who has to waive
+    /// the cap -- and those are read by the rule for exactly that reason.
+    const NOT_ALERTED: [(LandingCategory, &str); 2] = [
+        (
+            LandingCategory::Conflict,
+            "another commit reached the branch first; re-applying is expected to land",
+        ),
+        (
+            LandingCategory::Raced,
+            "another landing won the push race; the next attempt is expected to land",
+        ),
+    ];
+
+    /// The category labels the landing alert rule's selector matches, read from
+    /// the chart file the rule is delivered from.
+    ///
+    /// Scanned as text rather than parsed as JSON: the selector is one literal
+    /// inside a PromQL expression, so a reader would have to walk to it either
+    /// way. Every way this can go wrong -- the rule renamed, the matcher
+    /// changed, the label renamed -- has the same consequence, and returning an
+    /// empty set for any of them would make the assertions below pass for the
+    /// wrong reason, so each one panics with the text it looked for.
+    fn alert_selector_categories() -> Vec<String> {
+        const CHART: &str = include_str!("../../../deploy/helm/cogneva/files/cogneva.json");
+        const MARKER: &str = "cogneva_landing_failures_total{category=~\\\"";
+        const END: &str = "\\\"";
+
+        let start = CHART
+            .find(MARKER)
+            .unwrap_or_else(|| panic!("the chart's alert rules have no {MARKER:?}"))
+            + MARKER.len();
+        let rest = &CHART[start..];
+        let end = rest
+            .find(END)
+            .unwrap_or_else(|| panic!("the selector after {MARKER:?} is never closed"));
+        rest[..end].split('|').map(str::to_owned).collect()
+    }
+
+    /// Every category is either read by the landing alert rule or written off
+    /// with a reason, and no category is both.
+    ///
+    /// The rule's selector is what turns these counters into something that
+    /// wakes someone up, and nothing about adding a variant to the enum makes
+    /// the selector notice: the counters keep being recorded and keep being
+    /// read by nobody, which is indistinguishable from the failure never
+    /// happening. Checked in both directions, because a selector naming a
+    /// category that no longer exists is the same silence from the other side.
+    #[test]
+    fn every_category_is_either_alerted_or_excluded_with_a_reason() {
+        let selected = alert_selector_categories();
+
+        for category in ALL_CATEGORIES {
+            let named = selected.iter().any(|l| l == category.as_str());
+            let written_off = NOT_ALERTED.iter().any(|(c, _)| *c == category);
+            assert!(
+                named != written_off,
+                "{category:?} is {}: the rule {} it and the exemption list {} \
+                 it, so it has to be exactly one of the two (rule reads \
+                 {selected:?})",
+                if named {
+                    "read twice"
+                } else {
+                    "read by nobody"
+                },
+                if named { "names" } else { "does not name" },
+                if written_off {
+                    "lists"
+                } else {
+                    "does not list"
+                },
+            );
+        }
+
+        for label in &selected {
+            assert!(
+                ALL_CATEGORIES.iter().any(|c| c.as_str() == label),
+                "the rule matches {label:?}, which is not a category any more: \
+                 it is a rule for a value nothing produces"
+            );
+        }
+
+        let alerted = selected.len();
+        assert!(
+            alerted < ALL_CATEGORIES.len(),
+            "the rule reads every category, so the exemption list above is \
+             dead and nothing records which failures are meant to be silent"
+        );
+    }
+
     /// A refusal the change's own content caused has to leave the channel as
     /// its own kind. The caller is the only layer that can take the change out
     /// of the queue, and it can only tell "re-driving repeats this" from "the
