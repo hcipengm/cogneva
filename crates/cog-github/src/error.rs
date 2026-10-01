@@ -40,6 +40,19 @@ pub enum CogGitHubError {
     #[error("contribution rejected by privacy gate: {0}")]
     PrivacyRejected(String),
 
+    /// Which paths a change touches could not be read from its diff at all.
+    ///
+    /// A separate variant from [`Self::PrivacyRejected`] on purpose. Both hold
+    /// the change back before anything is pushed, but they say opposite things
+    /// about it: a rejection names paths that are known and unacceptable, while
+    /// this one says the paths are unknown. Only the first is a property of the
+    /// change. Merging them lets a diff that merely failed to parse be read as
+    /// a change that violated the whitelist, and a caller acting on that takes
+    /// the change out of the queue -- the one place a re-serialised diff could
+    /// still have reached the branch from.
+    #[error("diff could not be read: {0}")]
+    DiffUnreadable(String),
+
     /// An HTTP request failed.
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),

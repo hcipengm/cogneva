@@ -76,7 +76,9 @@ const GITEE_SLUG: &str = "gitee";
 /// different answers: a conflict is the base branch having moved under the
 /// change, which re-driving generation can address; a path or size refusal is
 /// a property of the change that re-driving would only repeat; an environment
-/// failure says nothing about the change at all.
+/// failure says nothing about the change at all; and a diff that could not be
+/// read says nothing about the change either, only about the attempt to read
+/// it, which is why it is not filed with the path refusals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LandingCategory {
     /// The verified delta no longer replays onto the base tip. The ordinary
@@ -88,9 +90,18 @@ pub enum LandingCategory {
     /// The push was refused for a reason re-applying cannot fix.
     Rejected,
     /// The path policy refuses the change: it touches paths outside the
-    /// contribution whitelist, a forbidden path, or cannot be read as a diff
-    /// far enough to say which paths it touches.
+    /// contribution whitelist, or a forbidden path. Both name paths that were
+    /// read and are not acceptable, which is what makes this a verdict on the
+    /// change and not on the machinery around it.
     Path,
+    /// Which paths the change touches could not be read from its diff.
+    ///
+    /// The gate is the same one and it still fails closed — nothing is pushed
+    /// on a diff it cannot read — but the answer is not a verdict on the
+    /// change. Keeping this apart from [`Self::Path`] is what lets the caller
+    /// retry a change whose diff came out malformed instead of retiring it as a
+    /// whitelist violation it never committed.
+    UnreadableDiff,
     /// The change exceeds the landing policy's size cap.
     Oversized,
     /// The landing machinery could not run: git, fetch, worktree, commit.
@@ -98,13 +109,18 @@ pub enum LandingCategory {
 }
 
 impl LandingCategory {
-    /// The metric label. Stable: alert rules and dashboards read these.
+    /// The metric label. Stable: alert rules and dashboards read these, so a
+    /// value keeps its spelling once published. `path` kept its name as its
+    /// meaning narrowed to the refusals that name paths, because renaming a
+    /// value that a live rule matches would break the series rather than
+    /// re-describe it.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Conflict => "conflict",
             Self::Raced => "raced",
             Self::Rejected => "rejected",
             Self::Path => "path",
+            Self::UnreadableDiff => "unreadable_diff",
             Self::Oversized => "oversized",
             Self::Environment => "environment",
         }
@@ -166,6 +182,27 @@ impl From<std::io::Error> for LandingError {
 /// much a property of the change: the cap is the one gate owner approval
 /// waives, so a caller acting on it would retire a change the owner could
 /// still land. The path rules are the ones approval does not lift.
+///
+/// An unreadable diff is not on that side either, and for the opposite reason:
+/// nothing was refused about the change, because nothing about it could be
+/// read. Filing it as a path refusal bought a malformed diff the same terminal
+/// treatment as a whitelist violation — the change left the queue as if it had
+/// been rejected, and the queue is where a re-serialised diff would have been
+/// offered again from.
+/// Which of the two answers the contribution gate gave.
+///
+/// The gate is asked one question — may this change reach the public branch? —
+/// and refuses for two different reasons: it read the paths and they are not
+/// acceptable, or it could not read the paths at all. The first is the change's
+/// own property and the second is not, so they leave as different categories
+/// even though one function produced both errors.
+fn contribution_refusal_category(error: &CogGitHubError) -> LandingCategory {
+    match error {
+        CogGitHubError::DiffUnreadable(_) => LandingCategory::UnreadableDiff,
+        _ => LandingCategory::Path,
+    }
+}
+
 fn refusal_error(error: LandingError) -> SFError {
     match error.category {
         LandingCategory::Path => SFError::Validation(error.to_string()),
@@ -681,7 +718,7 @@ impl MainChannel {
     ) -> std::result::Result<(), LandingError> {
         let policy = &self.config.landing_policy;
         ensure_contribution_allowed(&change.content)
-            .map_err(|e| LandingError::of(LandingCategory::Path, e))?;
+            .map_err(|e| LandingError::of(contribution_refusal_category(&e), e))?;
 
         if !owner_approved {
             let changed_lines = count_changed_lines(&change.content);
@@ -697,7 +734,7 @@ impl MainChannel {
         }
 
         let files = affected_files(&change.content)
-            .map_err(|e| LandingError::of(LandingCategory::Path, e))?;
+            .map_err(|e| LandingError::of(contribution_refusal_category(&e), e))?;
         for file in &files {
             if let Some(pattern) = policy
                 .forbidden_paths
@@ -1236,7 +1273,7 @@ impl cog_core::ChangeLanding for MainChannel {
         // copy of it, so the answer here and the answer `land` gives cannot
         // drift apart.
         ensure_contribution_allowed(diff)
-            .map_err(|e| refusal_error(LandingError::of(LandingCategory::Path, e)))
+            .map_err(|e| refusal_error(LandingError::of(contribution_refusal_category(&e), e)))
     }
 
     async fn record_unverified(&self, change: &GeneratedChange) -> SFResult<()> {
@@ -1650,9 +1687,14 @@ pub fn ensure_contribution_allowed(diff: &str) -> Result<()> {
 }
 
 /// Files a unified diff touches, as a landing error when none can be read.
+///
+/// Its own error variant rather than the privacy gate's: both stop the change
+/// before it is pushed, but a caller has to be able to tell "these paths are
+/// refused" from "there were no paths to refuse", and the variant is the only
+/// thing that survives the trip up.
 fn affected_files(diff: &str) -> Result<Vec<String>> {
     cog_core::parse_diff_affected_files(diff)
-        .map_err(|e| CogGitHubError::PrivacyRejected(e.to_string()))
+        .map_err(|e| CogGitHubError::DiffUnreadable(e.to_string()))
 }
 
 /// Whether a single repo-relative path is inside the contribution whitelist.
@@ -2101,7 +2143,48 @@ mod tests {
     #[test]
     fn privacy_gate_fails_closed_on_unparseable_diff() {
         let err = ensure_contribution_allowed("not a diff at all").unwrap_err();
-        assert!(matches!(err, CogGitHubError::PrivacyRejected(_)));
+        assert!(
+            matches!(err, CogGitHubError::DiffUnreadable(_)),
+            "the gate still refuses it, but as an unreadable diff rather than \
+             as a whitelist violation it never committed: {err:?}"
+        );
+    }
+
+    /// A diff the gate could not read must not cross the boundary looking like
+    /// a path refusal. The caller retires on `Validation`, so the two arriving
+    /// as one type is what took a malformed diff out of the queue -- and the
+    /// queue is the only place a re-serialised diff would have been offered
+    /// from again.
+    ///
+    /// Both halves are needed: the unreadable one has to stay retryable, and a
+    /// real whitelist violation has to keep leaving as terminal, or the gate
+    /// would have been loosened instead of re-read.
+    #[tokio::test]
+    async fn an_unreadable_diff_is_not_a_path_refusal() {
+        let chan = channel(crate::config::LandingPolicy::default());
+        let unreadable = change("c1", "not a diff at all");
+        assert_eq!(
+            chan.check_policy(&unreadable, false).unwrap_err().category,
+            LandingCategory::UnreadableDiff
+        );
+        let early = chan
+            .check_contribution_allowed(&unreadable.content)
+            .unwrap_err();
+        assert!(
+            matches!(early, SFError::Internal(_)),
+            "an unreadable diff has to stay retryable: {early:?}"
+        );
+
+        let denied = change("c2", &diff_touching(&["deploy/cogneva/pg.yaml"]));
+        assert_eq!(
+            chan.check_policy(&denied, false).unwrap_err().category,
+            LandingCategory::Path
+        );
+        let refused = ChangeLanding::land(&chan, &denied, None).await.unwrap_err();
+        assert!(
+            matches!(refused, SFError::Validation(_)),
+            "a path the whitelist read and refused is still terminal: {refused:?}"
+        );
     }
 
     #[test]
@@ -2157,13 +2240,18 @@ mod tests {
     /// or the owner's approval could still land.
     fn refused_for_good(category: LandingCategory) -> bool {
         match category {
-            // The rules owner approval does not lift, including a diff that
-            // cannot be read far enough to say which paths it touches.
+            // The rules owner approval does not lift.
             LandingCategory::Path => true,
+            // Not terminal, and this is the whole point of the category
+            // existing: refusing a change because its paths are unacceptable
+            // is a verdict on the change, while failing to read which paths it
+            // touches is a verdict on the reading. Only the first may cost the
+            // change its place in the queue.
+            LandingCategory::UnreadableDiff
             // Size is a property of the change too, but not a terminal one:
             // owner approval waives the cap, so a caller retiring on it would
             // take that decision away from the owner.
-            LandingCategory::Oversized
+            | LandingCategory::Oversized
             // The branch moved under the change; another commit may move it again.
             | LandingCategory::Conflict
             // Another landing won the push race; this change may win the next one.
@@ -2179,11 +2267,12 @@ mod tests {
     /// Every category, so the loop below covers the whole set. Kept in step
     /// with `refused_for_good`, whose match is the half that fails to compile
     /// when the enum grows.
-    const ALL_CATEGORIES: [LandingCategory; 6] = [
+    const ALL_CATEGORIES: [LandingCategory; 7] = [
         LandingCategory::Conflict,
         LandingCategory::Raced,
         LandingCategory::Rejected,
         LandingCategory::Path,
+        LandingCategory::UnreadableDiff,
         LandingCategory::Oversized,
         LandingCategory::Environment,
     ];
@@ -2211,6 +2300,28 @@ mod tests {
             terminal,
             vec![LandingCategory::Path],
             "the paths are the one rule approval does not lift"
+        );
+    }
+
+    /// The label is what the counter aggregates by, so two categories sharing
+    /// one would be counted into a single series and no reader could tell them
+    /// apart afterwards -- the exact shape this split exists to undo. Nothing
+    /// else fails when a variant is added with a label that is already taken,
+    /// because `as_str` is a plain match and the labels are string literals.
+    #[test]
+    fn every_category_counts_under_a_label_of_its_own() {
+        let labels: Vec<&str> = ALL_CATEGORIES.iter().map(|c| c.as_str()).collect();
+        let mut sorted = labels.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            labels.len(),
+            sorted.len(),
+            "two categories share a label: {labels:?}"
+        );
+        assert!(
+            labels.iter().all(|l| !l.is_empty()),
+            "an empty label would be counted under no name at all: {labels:?}"
         );
     }
 
@@ -2337,6 +2448,24 @@ mod tests {
         chan.land(&ch, None).await.unwrap_err();
 
         assert_eq!(failure_count(&metrics, "path").await, 1.0);
+        assert_eq!(series_count(&metrics).await, 1);
+    }
+
+    /// The two answers the gate can give are counted apart, so a run of
+    /// refusals can be read for which of them it was. Under one value the
+    /// count said how often the gate stopped a change and nothing about
+    /// whether the changes were unacceptable or merely unreadable, which is
+    /// the difference between a queue that is working and one that is throwing
+    /// work away.
+    #[tokio::test]
+    async fn an_unreadable_diff_is_counted_under_its_own_category() {
+        let (chan, metrics) = measured_channel(Default::default());
+        let ch = change("c1", "not a diff at all");
+
+        chan.land(&ch, None).await.unwrap_err();
+
+        assert_eq!(failure_count(&metrics, "unreadable_diff").await, 1.0);
+        assert_eq!(failure_count(&metrics, "path").await, 0.0);
         assert_eq!(series_count(&metrics).await, 1);
     }
 

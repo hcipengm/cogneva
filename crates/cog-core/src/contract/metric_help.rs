@@ -140,10 +140,16 @@ const COUNTER_HELP: &[(&str, &str)] = &[
         "Landing calls that failed, one per attempt, by category. A landing \
          failure is otherwise a single log line inside a loop that then moves \
          on, so 'nothing needs landing' and 'landing is being refused' look the \
-         same from outside. The category is the part that aggregates: a path or \
-         oversized refusal is a property of the change, so it is terminal and \
-         appears once, while conflict, raced, rejected and environment are \
-         retried and appear once per attempt",
+         same from outside. The category is the part that aggregates and the \
+         part that says what happens next: only a path refusal is terminal -- \
+         the paths were read and are not acceptable, and no later attempt \
+         changes that -- so it appears once, at the moment the change leaves \
+         the channel, while oversized, unreadable_diff, conflict, raced, \
+         rejected and environment are retried and appear once per attempt. A \
+         rising unreadable_diff is a change the loop cannot read its way out \
+         of: the gate will not push a diff it cannot read, and unlike a path \
+         refusal nothing retires it, so it comes back every round until someone \
+         looks at why the diff is malformed",
     ),
     (
         "cogneva_redrive_refusals_total",

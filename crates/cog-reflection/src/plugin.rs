@@ -2850,11 +2850,16 @@ async fn consume_executed_change(
                 //
                 // Every other landing failure keeps the behaviour it had
                 // and stays in the queue -- including a size refusal,
-                // which owner approval can still waive. Only a path
+                // which owner approval can still waive, and an unreadable
+                // diff, which says nothing about the change and may yet be
+                // re-serialised into one the gate can read. Only a path
                 // refusal leaves the channel as `Validation`; the other
                 // categories arrive as `Internal`, and a category this
                 // side has never heard of keeps that same retryable
-                // default rather than being retired unread.
+                // default rather than being retired unread. That default
+                // is what keeps the unreadable case bounded: nothing else
+                // reclaims it, so the queue re-offering it is the only
+                // thing that brings it back for another look.
                 if matches!(&e, cog_core::SFError::Validation(_)) {
                     retire_change_everywhere(
                         pipeline,
