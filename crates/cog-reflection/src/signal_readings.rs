@@ -20,7 +20,7 @@
 //! throttled by its own cooldown, is blind in exactly the way a stopped watcher
 //! is blind.
 //!
-//! Three series, and the division between them is deliberate:
+//! Five series, and the division between them is deliberate:
 //!
 //! - `cogneva_signal_watcher_running` -- 1 on the process that armed the
 //!   watcher loop, 0 on every other. Published by every process, because the
@@ -33,6 +33,16 @@
 //!   has stopped ticking is not a small number, it is no number at all.
 //! - `cogneva_signal_watcher_signals_total{outcome}` -- one increment per signal
 //!   the watcher found, by what it did with it.
+//! - `cogneva_signal_watcher_guard_entries` -- keys the report-cooldown store
+//!   holds, as of the last completed round. This is the size of the memory the
+//!   watcher carries between rounds, and it is a set rather than an
+//!   accumulation because the store is reclaimed: a reading that could only go
+//!   up would not show that the reclaimer works. It is withheld until the first
+//!   round has read the store, since a zero before that is a claim about a
+//!   store nobody has looked at.
+//! - `cogneva_signal_watcher_guard_reclaimed_total` -- keys dropped from that
+//!   store because their cooldown had run out. Published from the start: zero
+//!   entries reclaimed is a true statement about this process.
 //!
 //! The outcome label takes a closed set, and every value is published on every
 //! scrape even at zero. That is the whole point of the family: a rule asking
@@ -66,6 +76,12 @@ pub const SIGNAL_TICKS_METRIC: &str = "cogneva_signal_watcher_ticks_total";
 
 /// Signals the watcher found, by what it did with each one.
 pub const SIGNAL_OUTCOMES_METRIC: &str = "cogneva_signal_watcher_signals_total";
+
+/// Keys the report-cooldown store holds, as of the last completed round.
+pub const SIGNAL_GUARD_ENTRIES_METRIC: &str = "cogneva_signal_watcher_guard_entries";
+
+/// Keys dropped because their cooldown had run out, since this process started.
+pub const SIGNAL_GUARD_RECLAIMED_METRIC: &str = "cogneva_signal_watcher_guard_reclaimed_total";
 
 /// The label naming what became of a signal.
 pub const OUTCOME_LABEL: &str = "outcome";
@@ -150,6 +166,8 @@ pub struct SignalWatcherReadings {
     running: AtomicBool,
     ticks: AtomicU64,
     signals: [AtomicU64; SIGNAL_OUTCOMES.len()],
+    guard_entries: AtomicU64,
+    guard_reclaimed: AtomicU64,
 }
 
 impl Default for SignalWatcherReadings {
@@ -164,6 +182,8 @@ impl SignalWatcherReadings {
             running: AtomicBool::new(false),
             ticks: AtomicU64::new(0),
             signals: std::array::from_fn(|_| AtomicU64::new(0)),
+            guard_entries: AtomicU64::new(0),
+            guard_reclaimed: AtomicU64::new(0),
         }
     }
 
@@ -185,6 +205,20 @@ impl SignalWatcherReadings {
     /// One signal and what became of it.
     pub fn record(&self, outcome: SignalOutcome) {
         self.signals[outcome.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The report-cooldown store as this round left it: how many keys it holds,
+    /// and how many this round dropped for having outlived their cooldown.
+    ///
+    /// The size is a set, not an accumulation -- the store shrinks as well as
+    /// grows, and a reading that could only go up could not show that the
+    /// reclaimer works. The drop count is an accumulation, and a zero there
+    /// says something true about this process rather than something false about
+    /// the store, which is why the two are separate series.
+    pub fn guard_store(&self, entries: usize, reclaimed: usize) {
+        self.guard_entries.store(entries as u64, Ordering::Relaxed);
+        self.guard_reclaimed
+            .fetch_add(reclaimed as u64, Ordering::Relaxed);
     }
 
     fn count(&self, outcome: &str) -> u64 {
@@ -225,6 +259,21 @@ impl Observable for SignalWatcherReadings {
                     .with_label(OUTCOME_LABEL, *outcome),
             );
         }
+        // The store's size is published only once a round has read it. Before
+        // that, a zero would be a claim about a store nobody has looked at --
+        // the same "have not looked" read as "found nothing" that the tick
+        // count exists to break. The reclaim count has no such problem: zero
+        // entries dropped is a true statement about this process.
+        if self.ticks.load(Ordering::Relaxed) > 0 {
+            out.push(RawMetric::new(
+                SIGNAL_GUARD_ENTRIES_METRIC,
+                self.guard_entries.load(Ordering::Relaxed) as f64,
+            ));
+        }
+        out.push(RawMetric::new(
+            SIGNAL_GUARD_RECLAIMED_METRIC,
+            self.guard_reclaimed.load(Ordering::Relaxed) as f64,
+        ));
         Ok(out)
     }
 
@@ -419,6 +468,79 @@ mod tests {
                 "{label} is published but nothing counts under it"
             );
         }
+    }
+
+    /// The store's size is not published until a round has read the store. A
+    /// zero before that would be a claim about a store nobody looked at, which
+    /// is the same "have not looked" read as "it is empty" that the tick count
+    /// exists to break -- while the reclaim count is a statement about this
+    /// process and is honest from the start.
+    #[tokio::test]
+    async fn the_store_size_waits_for_a_round_and_the_reclaim_count_does_not() {
+        let readings = SignalWatcherReadings::new();
+        readings.mark_running();
+        assert!(values(&readings, SIGNAL_GUARD_ENTRIES_METRIC)
+            .await
+            .is_empty());
+        assert_eq!(
+            values(&readings, SIGNAL_GUARD_RECLAIMED_METRIC).await[0].1,
+            0.0
+        );
+
+        readings.tick();
+        readings.guard_store(261, 0);
+        assert_eq!(
+            values(&readings, SIGNAL_GUARD_ENTRIES_METRIC).await[0].1,
+            261.0
+        );
+    }
+
+    /// The size is a set, not an accumulation. A store that only ever grew is
+    /// exactly what went unnoticed, so the reading has to be able to come back
+    /// down when the reclaimer runs -- and the reclaim count is what says it
+    /// did, rather than the two moving together and neither one explaining.
+    #[tokio::test]
+    async fn the_store_size_falls_when_entries_are_reclaimed() {
+        let readings = SignalWatcherReadings::new();
+        readings.mark_running();
+        readings.tick();
+        readings.guard_store(261, 0);
+        readings.guard_store(39, 222);
+
+        assert_eq!(
+            values(&readings, SIGNAL_GUARD_ENTRIES_METRIC).await[0].1,
+            39.0
+        );
+        assert_eq!(
+            values(&readings, SIGNAL_GUARD_RECLAIMED_METRIC).await[0].1,
+            222.0
+        );
+
+        // A round that reclaimed nothing leaves the count where it was: the
+        // series is cumulative, so a quiet round must not read as a reset.
+        readings.guard_store(38, 0);
+        assert_eq!(
+            values(&readings, SIGNAL_GUARD_RECLAIMED_METRIC).await[0].1,
+            222.0
+        );
+        assert_eq!(
+            values(&readings, SIGNAL_GUARD_ENTRIES_METRIC).await[0].1,
+            38.0
+        );
+    }
+
+    /// A process that holds no watcher publishes none of the store's readings.
+    /// Its store is not empty; it is not this process's store.
+    #[tokio::test]
+    async fn a_process_with_no_watcher_publishes_no_store_reading() {
+        let readings = SignalWatcherReadings::new();
+        readings.guard_store(5, 5);
+        assert!(values(&readings, SIGNAL_GUARD_ENTRIES_METRIC)
+            .await
+            .is_empty());
+        assert!(values(&readings, SIGNAL_GUARD_RECLAIMED_METRIC)
+            .await
+            .is_empty());
     }
 
     /// The tick count is the denominator the outcomes are read against, so a

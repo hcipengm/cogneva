@@ -321,6 +321,22 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["outcome"],
         "crates/cog-reflection/src/signal_readings.rs",
     ),
+    // The report-cooldown store's size, and what the reclaimer took out of it.
+    // No panel draws these yet either. They are here for the same reason as the
+    // three above, and one more that is theirs alone: the store only ever grew
+    // before the reclaimer existed, and its size is the only reading that would
+    // have shown that -- the cooldown count says how many keys are holding a
+    // signal back, not how many keys there are.
+    (
+        "cogneva_signal_watcher_guard_entries",
+        &[],
+        "crates/cog-reflection/src/signal_readings.rs",
+    ),
+    (
+        "cogneva_signal_watcher_guard_reclaimed_total",
+        &[],
+        "crates/cog-reflection/src/signal_readings.rs",
+    ),
     // How much of a volume is in use: the claim label is what the alert rule
     // divides by the declared size. Every producer of it walks the volume, so the
     // panel is one wall per claim rather than one wall per kind of reader. A

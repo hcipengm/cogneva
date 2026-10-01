@@ -173,6 +173,30 @@ async fn save_state(state: &SignalGuardState) {
     }
 }
 
+/// Drop the guard entries whose cooldown has already elapsed, and say how many
+/// went.
+///
+/// An entry means one thing only: this key may not be reported again before
+/// `last + cooldown`. A key that is absent and a key whose cooldown has elapsed
+/// are answered identically by [`cooldown_elapsed`], so reclaiming them changes
+/// no decision this store takes -- which is what makes it safe to do without
+/// touching the check.
+///
+/// What it changes is the store's size, and that is the reason it exists. An
+/// alert key carries the labels that identify its instance, and for most rules
+/// those include the pod it was observed on. A rollout therefore leaves behind
+/// entries naming a pod that will never be seen again, and this store had no
+/// reclaimer: it only ever grew, so its size said nothing about how much was
+/// actually being suppressed, and a key that can no longer match was
+/// indistinguishable from one still holding a signal back.
+fn prune_elapsed(state: &mut SignalGuardState, cooldown_secs: i64, now: DateTime<Utc>) -> usize {
+    let before = state.reported.len();
+    state
+        .reported
+        .retain(|_, last| (now - *last).num_seconds() < cooldown_secs);
+    before - state.reported.len()
+}
+
 /// True when `key` was never reported or its cooldown elapsed. Pure check: the
 /// report is recorded by [`report_outcome`] only once an intent actually
 /// landed, so a submission that never reached the orchestrator is retried on
@@ -431,6 +455,18 @@ async fn tick(
     let mut state = load_state().await;
     let mut dirty = false;
 
+    // Reclaimed before anything is read, so a key whose cooldown has run out is
+    // gone from the round that would have been permitted to report it again --
+    // the removal and the permission are the same event, and doing it later
+    // would leave the store holding an entry whose only meaning had expired.
+    let reclaimed = prune_elapsed(&mut state, config.report_cooldown_secs, now);
+    if reclaimed > 0 {
+        // Written even when the round found nothing, so the file shrinks as
+        // entries expire instead of waiting for the next signal to be carried
+        // along with it.
+        dirty = true;
+    }
+
     // 1. Failure recurrence among self-evolution tasks.
     let window_start = now - chrono::Duration::seconds(config.failure_window_secs);
     let mut by_signature: HashMap<String, Vec<&Task>> = HashMap::new();
@@ -605,9 +641,31 @@ async fn tick(
         }
     }
 
+    // The store's own size is published every round, whatever this round did:
+    // it is the only reading that says whether keys are accumulating, and a
+    // store that only ever grows is how it went unnoticed for weeks. It is a
+    // gauge of the live map rather than a count of insertions, so it comes back
+    // down when the reclaimer runs.
+    publish_guard_store(&state, readings, reclaimed);
+
     if dirty {
         save_state(&state).await;
     }
+}
+
+/// Publish what the guard store holds after this round, and how much this round
+/// reclaimed.
+///
+/// The size is read off the map itself rather than kept as a counter beside it:
+/// a counter of insertions can only grow, and a store whose size was reported
+/// that way would have looked healthy for every week it was accumulating dead
+/// keys. Reading the map is what lets the series come back down.
+fn publish_guard_store(
+    state: &SignalGuardState,
+    readings: &SignalWatcherReadings,
+    reclaimed: usize,
+) {
+    readings.guard_store(state.reported.len(), reclaimed);
 }
 
 /// This loop's name in the liveness census.
@@ -701,6 +759,114 @@ mod tests {
             3600,
             now + chrono::Duration::seconds(3601)
         ));
+    }
+
+    /// The reclaimer drops the expired keys and keeps the live ones, so the
+    /// store's size is the number of keys still holding something back.
+    #[test]
+    fn reclaiming_drops_only_the_entries_whose_cooldown_ran_out() {
+        let now = Utc::now();
+        let mut state = SignalGuardState::default();
+        state
+            .reported
+            .insert("expired".into(), now - chrono::Duration::seconds(86_401));
+        state
+            .reported
+            .insert("live".into(), now - chrono::Duration::seconds(86_399));
+
+        assert_eq!(prune_elapsed(&mut state, 86_400, now), 1);
+        assert_eq!(state.reported.len(), 1);
+        assert!(state.reported.contains_key("live"));
+    }
+
+    /// Reclaiming is invisible to the decision the store is for. Every key
+    /// answers `cooldown_elapsed` the same way before and after, including the
+    /// keys that were dropped -- which is what makes it safe to do at all, and
+    /// what a future change to either side has to keep true.
+    #[test]
+    fn reclaiming_changes_no_cooldown_verdict() {
+        let now = Utc::now();
+        let mut state = SignalGuardState::default();
+        for (key, ago) in [
+            ("long_expired", 200_000),
+            ("just_expired", 86_400),
+            ("live", 10),
+            ("fresh", 0),
+        ] {
+            state
+                .reported
+                .insert(key.into(), now - chrono::Duration::seconds(ago));
+        }
+        // `absent` is the control: it was never in the store, and its verdict
+        // has to match the one an expired key gets after reclaiming.
+        let keys = ["long_expired", "just_expired", "live", "fresh", "absent"];
+        let before: Vec<bool> = keys
+            .iter()
+            .map(|k| cooldown_elapsed(&state, k, 86_400, now))
+            .collect();
+
+        prune_elapsed(&mut state, 86_400, now);
+
+        let after: Vec<bool> = keys
+            .iter()
+            .map(|k| cooldown_elapsed(&state, k, 86_400, now))
+            .collect();
+        assert_eq!(before, after, "reclaiming moved a cooldown verdict");
+    }
+
+    /// The reclaimer runs on the boundary the check uses: an entry exactly at
+    /// its cooldown is permitted again and is reclaimed, not held for one more
+    /// round. The two sides have to meet, or a store pruned on a stricter
+    /// boundary would keep entries that can no longer act.
+    #[test]
+    fn the_reclaimer_and_the_check_agree_on_the_boundary() {
+        let now = Utc::now();
+        let mut state = SignalGuardState::default();
+        state.reported.insert(
+            "at_boundary".into(),
+            now - chrono::Duration::seconds(86_400),
+        );
+        assert!(cooldown_elapsed(&state, "at_boundary", 86_400, now));
+        assert_eq!(prune_elapsed(&mut state, 86_400, now), 1);
+    }
+
+    /// The published size is the map's own length, so a reclaimed key leaves
+    /// the series as well as the file. A count kept beside the store could only
+    /// rise, and the state it would have reported during the weeks this store
+    /// was accumulating dead keys is indistinguishable from a healthy one.
+    #[tokio::test]
+    async fn the_published_size_is_the_store_it_was_read_from() {
+        let now = Utc::now();
+        let readings = SignalWatcherReadings::new();
+        readings.mark_running();
+        readings.tick();
+
+        let mut state = SignalGuardState::default();
+        for (key, ago) in [("live", 10), ("dead", 200_000)] {
+            state
+                .reported
+                .insert(key.into(), now - chrono::Duration::seconds(ago));
+        }
+        let reclaimed = prune_elapsed(&mut state, 86_400, now);
+        publish_guard_store(&state, &readings, reclaimed);
+
+        use cog_core::Observable;
+        let metrics = readings.collect_metrics("").await.unwrap();
+        let value = |name: &str| {
+            metrics
+                .iter()
+                .find(|m| m.name == name)
+                .map(|m| m.value)
+                .unwrap_or(-1.0)
+        };
+        assert_eq!(
+            value(crate::signal_readings::SIGNAL_GUARD_ENTRIES_METRIC),
+            1.0
+        );
+        assert_eq!(
+            value(crate::signal_readings::SIGNAL_GUARD_RECLAIMED_METRIC),
+            1.0
+        );
     }
 
     #[test]
