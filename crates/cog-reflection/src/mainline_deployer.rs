@@ -88,10 +88,16 @@ const OVERLAY_ASSET_LIST_PATH: &str = "deploy/overlay-assets.json";
 /// 这张表的用途是让「不刷新」成为一条要有人辩护的声明，而不是一次遗漏：
 /// 门禁读 Dockerfile 最终阶段的 COPY 行，凡不在资产表里、又不在
 /// [`OVERLAY_BINARY_DEST`] 上的落点，必须在这里留下理由，否则测试红。
-const OVERLAY_UNREFRESHABLE: &[(&str, &str)] = &[(
-    "/opt/cogneva/web",
-    "由镜像的 node 阶段从 web/src 构建，overlay 内没有 node 工具链，新 rev 的前端产物无法在 overlay 内生成",
-)];
+const OVERLAY_UNREFRESHABLE: &[(&str, &str)] = &[
+    (
+        "/opt/cogneva/web",
+        "由镜像的 node 阶段从 web/src 构建，overlay 内没有 node 工具链，新 rev 的前端产物无法在 overlay 内生成",
+    ),
+    (
+        "/etc/cogneva-builder-rustc",
+        "构建段 `rustc -V` 现写、随后 COPY 进镜像的编译期印章；检出里没有这个文件（它记的是「谁编的这个二进制」，不是仓库里的一份内容），overlay 只能从检出刷新，故它没有可刷新的源",
+    ),
+];
 
 // ---------------------------------------------------------------------------
 // 纯函数（无 IO，单测覆盖）
