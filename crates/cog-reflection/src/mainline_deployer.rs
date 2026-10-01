@@ -4960,7 +4960,9 @@ impl MainlineDeployer {
             Ok(declared) => declared,
             Err(e) => {
                 warn!(error = %e, "governance drift: the declared ceilings could not be read");
-                drift.record_check_failure();
+                drift.record_check_failure(
+                    crate::governance_drift::CheckFailure::DeclarationUnreadable,
+                );
                 return;
             }
         };
@@ -4979,14 +4981,16 @@ impl MainlineDeployer {
             Ok(text) => match crate::governance_drift::live_quotas(&text) {
                 Ok(live) => live,
                 Err(e) => {
-                    warn!(error = %e, "governance drift: the enforced quotas could not be read");
-                    drift.record_check_failure();
+                    warn!(error = %e, "governance drift: the enforced quotas could not be parsed");
+                    drift.record_check_failure(
+                        crate::governance_drift::CheckFailure::QuotasUnparseable,
+                    );
                     return;
                 }
             },
             Err(e) => {
                 warn!(error = %e, "governance drift: the enforced quotas could not be read");
-                drift.record_check_failure();
+                drift.record_check_failure(crate::governance_drift::CheckFailure::QuotasUnreadable);
                 return;
             }
         };
@@ -19590,6 +19594,26 @@ exit 0
         dir.join("fake-kubectl").to_string_lossy().to_string()
     }
 
+    /// 把 `get resourcequota` 这一支换成调用方给的脚本体，用来分别造出
+    /// 「命令失败」与「回话解析不出」两种集群侧失败。
+    fn fake_kubectl_quota_broken(dir: &Path, body: &str) -> String {
+        let log = dir.join("kubectl.log");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  *"get resourcequota"*) {body} ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            body = body
+        );
+        write_fake_bin(dir, "fake-kubectl", &script);
+        dir.join("fake-kubectl").to_string_lossy().to_string()
+    }
+
     /// 集群侧 `get resourcequota -o json` 的回话，只带一个 `limits.cpu` 字段。
     fn quota_listing(cpu: &str) -> String {
         format!(
@@ -19690,11 +19714,68 @@ exit 0
 
         deployer.compare_governance().await;
         assert_eq!(drift.check_failures(), 1);
+        assert_eq!(
+            drift.check_failures_for(crate::governance_drift::CheckFailure::DeclarationUnreadable),
+            1,
+            "三格里的哪一格：声明侧读不出来时计数必须指得出是哪一条路"
+        );
+        assert_eq!(
+            drift.check_failures_for(crate::governance_drift::CheckFailure::QuotasUnreadable),
+            0,
+            "集群侧这一格没被碰过——它和声明侧那一格是同形的总数，读成总数就看不出是哪一边"
+        );
         assert!(
             drift.objects().is_empty(),
             "读不到声明侧却写下了逐对象读数：{:?}",
             drift.objects()
         );
+    }
+
+    /// 集群侧失败的两种形态各记自己那一格：`kubectl` 起不来 / 够不到集群读
+    /// `quotas_unreadable`，跑通了但回话解析不出读 `quotas_unparseable`。
+    /// 这两条路原先写同一句 warn、记同一个数，事后只剩一个总数时无法回头分辨，
+    /// 而这两个数指向的是两个完全不同的地方（执行环境 vs 回话的形状）。
+    #[tokio::test]
+    async fn the_two_ways_the_cluster_side_fails_are_two_cells() {
+        for (label, script_body, expected) in [
+            (
+                "kubectl 起不来",
+                "exit 1\n",
+                crate::governance_drift::CheckFailure::QuotasUnreadable,
+            ),
+            (
+                "回话解析不出",
+                "printf '%s' 'not json at all'\nexit 0\n",
+                crate::governance_drift::CheckFailure::QuotasUnparseable,
+            ),
+        ] {
+            let _env = ENV_LOCK.lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            let (bare, work, _rev_a, rev_b) = setup_repos(root).await;
+            release_set_declaring_a_quota(&work, &rev_b, "cogneva-quota", "18.5").await;
+            let kubectl = fake_kubectl_quota_broken(root, script_body);
+
+            let drift = std::sync::Arc::new(crate::governance_drift::GovernanceDrift::new());
+            let deployer = MainlineDeployer::new(
+                test_config(root, &bare, "buildah", &kubectl),
+                test_workspaces(root, &bare),
+            )
+            .with_governance_drift(drift.clone());
+
+            deployer.compare_governance().await;
+            assert_eq!(drift.check_failures(), 1, "{label}");
+            assert_eq!(drift.check_failures_for(expected), 1, "{label}");
+            for other in crate::governance_drift::CheckFailure::ALL {
+                if other != expected {
+                    assert_eq!(
+                        drift.check_failures_for(other),
+                        0,
+                        "{label} 串到了 {other:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// main 前进到下一个 rev 而没有任何组包 ⇒ 声明侧要跟着 rev 走：冻在旧快照上

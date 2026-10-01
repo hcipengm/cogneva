@@ -42,12 +42,68 @@ use cog_core::{SFError, SFResult};
 /// How many fields of one governance object disagree (gauge).
 pub const GOVERNANCE_DRIFT_METRIC: &str = "cogneva_governance_drift_fields";
 
-/// How many comparisons could not be made at all (counter). Deliberately a
-/// series of its own rather than folded into the drift: when the cluster cannot
-/// be read, "the two sides differ" and "nobody looked" are two facts, and one
-/// cell for both leaves no way to tell "the two sides agree" from "nobody
-/// looked".
+/// How many comparisons could not be made at all (counter), by reason.
+///
+/// Deliberately a series of its own rather than folded into the drift: when the
+/// cluster cannot be read, "the two sides differ" and "nobody looked" are two
+/// facts, and one cell for both leaves no way to tell "the two sides agree"
+/// from "nobody looked".
+///
+/// The count carries its reason for the same kind of reason. The comparison
+/// has three ways to fail and they point at three different things to go and
+/// look at, so a bare total hands a reader a number with no direction. The
+/// `warn!` beside each failure used to carry that difference, and the process
+/// that wrote it is gone exactly when the count is still being read -- the
+/// count outlives the log by design, so the reason has to travel in the count.
 pub const GOVERNANCE_CHECK_FAILURES_METRIC: &str = "cogneva_governance_check_failures_total";
+
+/// The ways a comparison can fail to happen.
+///
+/// A closed set: the label value is one of these three words and nothing else,
+/// so a query can be written against the reason without a reader having to
+/// guess at the spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckFailure {
+    /// The declared ceilings could not be read from the tracked revision: the
+    /// repository, the directory in it, or the declaration's own text.
+    DeclarationUnreadable,
+    /// The enforced ceilings could not be read: `kubectl` did not run, or ran
+    /// and could not reach the cluster.
+    QuotasUnreadable,
+    /// The cluster answered, and the answer is not text this side will parse.
+    QuotasUnparseable,
+}
+
+impl CheckFailure {
+    /// Every reason, in the order the label values are listed.
+    ///
+    /// All of them are published whether or not they have happened: an absent
+    /// series and a series at zero are different readings, and "this failure
+    /// mode has not occurred" is the second one.
+    pub const ALL: [CheckFailure; 3] = [
+        CheckFailure::DeclarationUnreadable,
+        CheckFailure::QuotasUnreadable,
+        CheckFailure::QuotasUnparseable,
+    ];
+
+    /// The label value, which is also the word to search the source for.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CheckFailure::DeclarationUnreadable => "declaration_unreadable",
+            CheckFailure::QuotasUnreadable => "quotas_unreadable",
+            CheckFailure::QuotasUnparseable => "quotas_unparseable",
+        }
+    }
+
+    /// Where this reason's cell lives. Derived from [`Self::ALL`] rather than
+    /// from the declaration order, so the two cannot drift apart.
+    fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|r| *r == self)
+            .expect("every reason is in ALL")
+    }
+}
 
 /// The ceilings one governance document declares.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,7 +313,8 @@ pub fn drift_by_object(
 #[derive(Default)]
 pub struct GovernanceDrift {
     entries: Mutex<BTreeMap<String, usize>>,
-    check_failures: AtomicU64,
+    /// One cell per [`CheckFailure`], in that order.
+    check_failures: [AtomicU64; CheckFailure::ALL.len()],
 }
 
 impl GovernanceDrift {
@@ -283,10 +340,13 @@ impl GovernanceDrift {
         *self.entries.lock().unwrap_or_else(|e| e.into_inner()) = drifted.clone();
     }
 
-    /// Record one comparison that could not be made: the cluster was
-    /// unreadable, the object absent, or the output unparseable.
-    pub fn record_check_failure(&self) {
-        self.check_failures.fetch_add(1, Ordering::Relaxed);
+    /// Record one comparison that could not be made, and why.
+    ///
+    /// The reason is not optional: a caller that has a failure in hand knows
+    /// which of the three it is, and a default would put the reason back to
+    /// being unrecorded for whichever caller took it.
+    pub fn record_check_failure(&self, reason: CheckFailure) {
+        self.check_failures[reason.index()].fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn drift_fields(&self, object: &str) -> Option<usize> {
@@ -306,8 +366,20 @@ impl GovernanceDrift {
             .collect()
     }
 
+    /// Every comparison that could not be made, whichever the reason.
+    ///
+    /// Computed from the per-reason cells rather than kept beside them: a
+    /// separately maintained total is a second place for the same fact to
+    /// live, and the two would be free to disagree.
     pub fn check_failures(&self) -> u64 {
-        self.check_failures.load(Ordering::Relaxed)
+        CheckFailure::ALL
+            .iter()
+            .map(|r| self.check_failures_for(*r))
+            .sum()
+    }
+
+    pub fn check_failures_for(&self, reason: CheckFailure) -> u64 {
+        self.check_failures[reason.index()].load(Ordering::Relaxed)
     }
 }
 
@@ -320,10 +392,19 @@ impl Observable for GovernanceDrift {
     /// position to say the latter. Objects already compared publish their zero
     /// for the same reason.
     async fn collect_metrics(&self, _dimension: &str) -> SFResult<Vec<RawMetric>> {
-        let mut out = vec![RawMetric::new(
-            GOVERNANCE_CHECK_FAILURES_METRIC,
-            self.check_failures() as f64,
-        )];
+        let mut out: Vec<RawMetric> = CheckFailure::ALL
+            .iter()
+            .map(|reason| {
+                RawMetric::new(
+                    GOVERNANCE_CHECK_FAILURES_METRIC,
+                    self.check_failures_for(*reason) as f64,
+                )
+                // Spelled as a literal for the same reason the object label
+                // below is: the shipped-summary gate reads label names out of
+                // the source text of this call.
+                .with_label("reason", reason.as_str())
+            })
+            .collect();
         let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         for (object, fields) in entries.iter() {
             out.push(
@@ -441,17 +522,19 @@ mod tests {
     #[tokio::test]
     async fn zero_is_published_and_so_is_a_comparison_that_never_happened() {
         let drift = GovernanceDrift::new();
-        // Nothing compared yet: only the failure count, no object at all.
+        // Nothing compared yet: every failure reason, no object at all.
         let metrics = drift.collect_metrics("default").await.unwrap();
-        assert_eq!(metrics.len(), 1);
-        assert_eq!(metrics[0].name, GOVERNANCE_CHECK_FAILURES_METRIC);
+        assert_eq!(metrics.len(), CheckFailure::ALL.len());
+        assert!(metrics
+            .iter()
+            .all(|m| m.name == GOVERNANCE_CHECK_FAILURES_METRIC));
         assert!(!metrics.iter().any(|m| m.name == GOVERNANCE_DRIFT_METRIC));
 
         drift.record_comparison(&BTreeMap::from([(
             "resourcequota/cogneva-quota".to_string(),
             0,
         )]));
-        drift.record_check_failure();
+        drift.record_check_failure(CheckFailure::QuotasUnreadable);
         let metrics = drift.collect_metrics("default").await.unwrap();
         let found = metrics
             .iter()
@@ -462,11 +545,59 @@ mod tests {
             found.labels.get("object").map(String::as_str),
             Some("resourcequota/cogneva-quota")
         );
-        let failures = metrics
+        let failures = failures_of(&metrics);
+        assert_eq!(
+            failures,
+            vec![
+                ("declaration_unreadable", 0.0),
+                ("quotas_unreadable", 1.0),
+                ("quotas_unparseable", 0.0)
+            ],
+            "每一种失败原因都是自己的一格，且没发生过的那种读成 0 而不是消失"
+        );
+    }
+
+    /// Every published failure count as (reason, value), in the order published.
+    fn failures_of(metrics: &[RawMetric]) -> Vec<(&str, f64)> {
+        metrics
             .iter()
-            .find(|m| m.name == GOVERNANCE_CHECK_FAILURES_METRIC)
-            .unwrap();
-        assert_eq!(failures.value, 1.0);
+            .filter(|m| m.name == GOVERNANCE_CHECK_FAILURES_METRIC)
+            .map(|m| {
+                (
+                    m.labels.get("reason").map(String::as_str).unwrap_or(""),
+                    m.value,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_reason_lands_in_its_own_cell_and_the_total_is_the_sum() {
+        // The three reasons are three different things to go and look at, so
+        // they must not share a cell -- and the total must not be a fourth
+        // place the same fact is kept.
+        let drift = GovernanceDrift::new();
+        drift.record_check_failure(CheckFailure::DeclarationUnreadable);
+        drift.record_check_failure(CheckFailure::QuotasUnreadable);
+        drift.record_check_failure(CheckFailure::QuotasUnreadable);
+        assert_eq!(
+            drift.check_failures_for(CheckFailure::DeclarationUnreadable),
+            1
+        );
+        assert_eq!(drift.check_failures_for(CheckFailure::QuotasUnreadable), 2);
+        assert_eq!(drift.check_failures_for(CheckFailure::QuotasUnparseable), 0);
+        assert_eq!(drift.check_failures(), 3);
+    }
+
+    #[test]
+    fn every_reason_has_a_distinct_label_value() {
+        // The label is a closed set a query is written against, so two reasons
+        // spelling the same word would be one cell wearing two names.
+        let mut seen: Vec<&str> = CheckFailure::ALL.iter().map(|r| r.as_str()).collect();
+        seen.sort_unstable();
+        let before = seen.len();
+        seen.dedup();
+        assert_eq!(seen.len(), before, "{:?}", CheckFailure::ALL);
     }
 
     const LIVE: &str = r#"{"apiVersion":"v1","kind":"List","items":[
