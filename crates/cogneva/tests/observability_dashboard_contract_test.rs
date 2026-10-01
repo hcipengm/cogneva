@@ -295,6 +295,32 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["loop"],
         "crates/cog-core/src/loop_health.rs",
     ),
+    // What the self-discovery watcher does with each round's signals. No panel
+    // draws these yet -- they are published so that "the watcher has gone quiet"
+    // has a reading at all, and they are recorded here so their names and their
+    // producer stay pinned together until something does draw them.
+    //
+    // The outcome label is the reading: a signal refused as a duplicate, one
+    // held back by its own cooldown, and one whose submission never reached the
+    // orchestrator all submit nothing, and folded into one count they would read
+    // exactly like a system with nothing wrong. The tick count is the
+    // denominator they are read against -- without it, a watcher that stopped
+    // ticking and a watcher finding nothing are the same zero.
+    (
+        "cogneva_signal_watcher_running",
+        &[],
+        "crates/cog-reflection/src/signal_readings.rs",
+    ),
+    (
+        "cogneva_signal_watcher_ticks_total",
+        &[],
+        "crates/cog-reflection/src/signal_readings.rs",
+    ),
+    (
+        "cogneva_signal_watcher_signals_total",
+        &["outcome"],
+        "crates/cog-reflection/src/signal_readings.rs",
+    ),
     // How much of a volume is in use: the claim label is what the alert rule
     // divides by the declared size. Every producer of it walks the volume, so the
     // panel is one wall per claim rather than one wall per kind of reader. A

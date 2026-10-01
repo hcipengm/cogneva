@@ -71,6 +71,7 @@ pub mod reviewer;
 pub mod rollout_resources;
 pub mod runtime_assets;
 pub mod sandbox;
+pub mod signal_readings;
 pub mod signal_watcher;
 pub mod squad;
 pub mod types;

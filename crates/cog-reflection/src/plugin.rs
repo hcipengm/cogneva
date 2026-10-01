@@ -66,6 +66,11 @@ pub struct ReflectionPlugin {
     /// no handle at all is the one state a reader can tell from "nothing to
     /// compare".
     governance_drift: Option<Arc<crate::governance_drift::GovernanceDrift>>,
+    /// What the self-discovery watcher finds each round. Published in init and
+    /// counted from start(), by the process that arms the watcher: the handle
+    /// is created unconditionally so a deployment that runs no watcher can
+    /// still say so, and the loop that arms it is what flips the role flag.
+    signal_readings: Arc<crate::signal_readings::SignalWatcherReadings>,
 }
 
 impl ReflectionPlugin {
@@ -81,6 +86,7 @@ impl ReflectionPlugin {
             build_cache: None,
             registry_footprint: None,
             governance_drift: None,
+            signal_readings: Arc::new(crate::signal_readings::SignalWatcherReadings::new()),
         }
     }
 }
@@ -756,6 +762,14 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 });
                 ctx.publish_observable(flight.clone());
 
+                // What the self-discovery watcher does with each round's
+                // signals. Published by every process and counted only by the
+                // one that arms the watcher: without the handle on the control
+                // plane too, a deployment that runs no watcher would publish a
+                // flat count that reads as a watcher finding nothing. The loop
+                // itself is armed in start(), with the other loops.
+                ctx.publish_observable(self.signal_readings.clone());
+
                 // 自动晋级运行时一键暂停开关：admin API 与 AutoPromoter
                 // 共享同一实例，暂停立即对排队晋级生效。
                 let promotion_switch = Arc::new(crate::PromotionSwitch::new());
@@ -1131,6 +1145,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 sw_config,
                 shutdown,
                 alert_source,
+                self.signal_readings.clone(),
             ));
         } else {
             info!("signal watcher: no orchestrator; self-discovery intents disabled");

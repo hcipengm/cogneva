@@ -42,6 +42,8 @@ use tracing::{debug, info, warn};
 
 use cog_core::{OrchestratorControl, Task, TaskStatus, TaskType};
 
+use crate::signal_readings::{SignalOutcome, SignalWatcherReadings};
+
 /// Watcher configuration, loaded from `self_evolution.signal_watcher` in
 /// cogneva.json with env overrides; missing section falls back to defaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,12 +203,27 @@ fn select_alerts<'a>(
     max: usize,
     cooldown_secs: i64,
     now: DateTime<Utc>,
-) -> Vec<&'a cog_core::PersistedAlert> {
-    alerts
-        .iter()
-        .filter(|a| cooldown_elapsed(state, &format!("alert:{}", a.dedup_key), cooldown_secs, now))
-        .take(max)
-        .collect()
+) -> SelectedAlerts<'a> {
+    let (in_cooldown, ready): (Vec<_>, Vec<_>) = alerts.iter().partition(|a| {
+        !cooldown_elapsed(state, &format!("alert:{}", a.dedup_key), cooldown_secs, now)
+    });
+    SelectedAlerts {
+        selected: ready.into_iter().take(max).collect(),
+        in_cooldown: in_cooldown.len(),
+    }
+}
+
+/// The alerts one tick acts on, and how many it left alone because their
+/// cooldown had not elapsed.
+///
+/// The two are returned together rather than counted apart: "an alert was in
+/// cooldown" and "an alert was found and submitted" are answers to the same
+/// question about the same input, and a second pass over the same list to
+/// recover the first would be a second copy of the predicate that has to stay
+/// in step with this one.
+struct SelectedAlerts<'a> {
+    selected: Vec<&'a cog_core::PersistedAlert>,
+    in_cooldown: usize,
 }
 
 /// Turn one firing alert into the intent that will try to fix it.
@@ -364,7 +381,17 @@ fn report_outcome(
     key: &str,
     outcome: IntentOutcome,
     now: DateTime<Utc>,
+    readings: &SignalWatcherReadings,
 ) -> bool {
+    // Counted here rather than at the call sites: every path out of a
+    // submission attempt comes through this function, so this is the one place
+    // where an arm cannot be added without being counted.
+    readings.record(match &outcome {
+        IntentOutcome::Registered => SignalOutcome::Registered,
+        IntentOutcome::Tracked => SignalOutcome::Tracked,
+        IntentOutcome::Redriven => SignalOutcome::Redriven,
+        IntentOutcome::Failed(_) => SignalOutcome::Failed,
+    });
     match outcome {
         IntentOutcome::Registered => {
             state.reported.insert(key.to_string(), now);
@@ -392,7 +419,13 @@ async fn tick(
     orch: &Arc<dyn OrchestratorControl>,
     config: &SignalWatcherConfig,
     alert_source: Option<&Arc<dyn cog_core::ActiveAlertSource>>,
+    readings: &SignalWatcherReadings,
 ) {
+    // Stamped before anything is read, so a round that fails or finds nothing
+    // still counts as a round: the tick count is what the signal counts are
+    // read against, and a denominator that only moves on busy rounds would make
+    // a broken watcher look like a quiet system.
+    readings.tick();
     let now = Utc::now();
     let tasks = orch.get_all_tasks().await;
     let mut state = load_state().await;
@@ -419,6 +452,10 @@ async fn tick(
         }
         let key = format!("failure:{sig}");
         if !cooldown_elapsed(&state, &key, config.report_cooldown_secs, now) {
+            // A recurring failure that is being throttled is still a signal.
+            // Leaving this uncounted would file it under "nothing was wrong",
+            // which is the opposite of what the failure count says.
+            readings.record(SignalOutcome::Cooldown);
             continue;
         }
         dirty = true;
@@ -447,7 +484,7 @@ async fn tick(
             }),
         )
         .await;
-        report_outcome(&mut state, &key, outcome, now);
+        report_outcome(&mut state, &key, outcome, now, readings);
     }
 
     // 2. Queue backlog anomaly.
@@ -457,7 +494,9 @@ async fn tick(
         .count();
     if backlog >= config.backlog_threshold {
         let key = "backlog".to_string();
-        if cooldown_elapsed(&state, &key, config.report_cooldown_secs, now) {
+        if !cooldown_elapsed(&state, &key, config.report_cooldown_secs, now) {
+            readings.record(SignalOutcome::Cooldown);
+        } else {
             dirty = true;
             let dlq = orch.dlq_len().await.unwrap_or(0);
             let goal = format!(
@@ -478,7 +517,7 @@ async fn tick(
                 }),
             )
             .await;
-            report_outcome(&mut state, &key, outcome, now);
+            report_outcome(&mut state, &key, outcome, now, readings);
         }
     }
 
@@ -514,7 +553,7 @@ async fn tick(
             .await;
             // 节拍只在审计任务确实在手时才推进：提交没落地就撤销本轮，
             // 下一轮重试，否则一次编排器抖动会让审计整整晚一个周期。
-            if report_outcome(&mut state, &key, outcome, now) {
+            if report_outcome(&mut state, &key, outcome, now, readings) {
                 state.last_audit = Some(now);
             }
         }
@@ -531,13 +570,22 @@ async fn tick(
             // same slate. It also must not be read as "the alerts cleared":
             // nothing here concludes anything from absence.
             if let Some(alerts) = source.list_active_alerts(100).await {
-                let selected = select_alerts(
+                let SelectedAlerts {
+                    selected,
+                    in_cooldown,
+                } = select_alerts(
                     &alerts,
                     &state,
                     config.alert_channel_max_per_tick,
                     config.report_cooldown_secs,
                     now,
                 );
+                // Firing alerts held back by their cooldown are signals too,
+                // and the count is taken here where the predicate that held
+                // them back is applied, rather than re-derived by a reader.
+                for _ in 0..in_cooldown {
+                    readings.record(SignalOutcome::Cooldown);
+                }
                 for alert in selected {
                     let key = format!("alert:{}", alert.dedup_key);
                     dirty = true;
@@ -551,7 +599,7 @@ async fn tick(
                         detail,
                     )
                     .await;
-                    report_outcome(&mut state, &key, outcome, now);
+                    report_outcome(&mut state, &key, outcome, now, readings);
                 }
             }
         }
@@ -572,6 +620,7 @@ pub fn spawn_signal_watcher_loop(
     config: SignalWatcherConfig,
     shutdown: cog_core::ShutdownSignal,
     alert_source: Option<Arc<dyn cog_core::ActiveAlertSource>>,
+    readings: Arc<SignalWatcherReadings>,
 ) -> tokio::task::JoinHandle<()> {
     let interval = Duration::from_secs(config.poll_interval_secs.max(60));
     info!(
@@ -595,7 +644,13 @@ pub fn spawn_signal_watcher_loop(
             let config = config.clone();
             let shutdown = shutdown.clone();
             let alert_source = alert_source.clone();
+            let readings = readings.clone();
             async move {
+                // Set by the loop that is about to run rather than by the
+                // caller that asked for it: the flag names a watcher that is
+                // running, and a caller cannot know that a spawn it requested
+                // was the one that took.
+                readings.mark_running();
                 let mut ticker = tokio::time::interval(interval);
                 loop {
                     // Every cycle is stamped, including the many that find nothing to
@@ -605,7 +660,7 @@ pub fn spawn_signal_watcher_loop(
                         biased;
                         _ = shutdown.wait() => break,
                         _ = ticker.tick() => {
-                            tick(&orchestrator, &config, alert_source.as_ref()).await;
+                            tick(&orchestrator, &config, alert_source.as_ref(), &readings).await;
                         }
                     }
                 }
@@ -652,11 +707,13 @@ mod tests {
     fn a_submission_that_never_landed_does_not_spend_the_cooldown() {
         let mut state = SignalGuardState::default();
         let now = Utc::now();
+        let readings = SignalWatcherReadings::new();
         assert!(!report_outcome(
             &mut state,
             "alert:x",
             IntentOutcome::Failed("orchestrator unreachable".into()),
-            now
+            now,
+            &readings
         ));
         assert!(
             cooldown_elapsed(&state, "alert:x", 86400, now),
@@ -668,18 +725,21 @@ mod tests {
     fn a_landed_submission_spends_the_cooldown() {
         let mut state = SignalGuardState::default();
         let now = Utc::now();
+        let readings = SignalWatcherReadings::new();
         assert!(report_outcome(
             &mut state,
             "alert:x",
             IntentOutcome::Registered,
-            now
+            now,
+            &readings
         ));
         assert!(!cooldown_elapsed(&state, "alert:x", 86400, now));
         assert!(report_outcome(
             &mut state,
             "alert:y",
             IntentOutcome::Redriven,
-            now
+            now,
+            &readings
         ));
         assert!(!cooldown_elapsed(&state, "alert:y", 86400, now));
     }
@@ -688,16 +748,74 @@ mod tests {
     fn a_tracked_signal_stays_unrecorded_so_a_later_failure_is_seen() {
         let mut state = SignalGuardState::default();
         let now = Utc::now();
+        let readings = SignalWatcherReadings::new();
         assert!(report_outcome(
             &mut state,
             "alert:x",
             IntentOutcome::Tracked,
-            now
+            now,
+            &readings
         ));
         assert!(
             cooldown_elapsed(&state, "alert:x", 86400, now),
             "任务还在手上就不该记账：它一旦失败，下一轮要立刻能发现并重新驱动"
         );
+    }
+
+    /// Every way a submission can end is counted, under the name that says how
+    /// it ended. An arm that returned without recording would put a whole class
+    /// of round back into the one reading this family exists to break apart.
+    #[tokio::test]
+    async fn every_submission_outcome_is_counted_under_its_own_name() {
+        use cog_core::observability::Observable;
+
+        for (outcome, expected) in [
+            (
+                IntentOutcome::Registered,
+                SignalOutcome::Registered.as_str(),
+            ),
+            (IntentOutcome::Tracked, SignalOutcome::Tracked.as_str()),
+            (IntentOutcome::Redriven, SignalOutcome::Redriven.as_str()),
+            (
+                IntentOutcome::Failed("orchestrator unreachable".into()),
+                SignalOutcome::Failed.as_str(),
+            ),
+        ] {
+            let readings = SignalWatcherReadings::new();
+            readings.mark_running();
+            let mut state = SignalGuardState::default();
+            report_outcome(&mut state, "k", outcome, Utc::now(), &readings);
+
+            let counted: Vec<(String, f64)> = readings
+                .collect_metrics("")
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|m| m.name == crate::signal_readings::SIGNAL_OUTCOMES_METRIC)
+                .map(|m| {
+                    (
+                        m.labels
+                            .get(crate::signal_readings::OUTCOME_LABEL)
+                            .cloned()
+                            .unwrap_or_default(),
+                        m.value,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                counted
+                    .iter()
+                    .find(|(label, _)| label == expected)
+                    .map(|(_, value)| *value),
+                Some(1.0),
+                "{expected} was not counted"
+            );
+            assert_eq!(
+                counted.iter().map(|(_, value)| *value).sum::<f64>(),
+                1.0,
+                "one submission has to record exactly one outcome"
+            );
+        }
     }
 
     #[test]
@@ -746,11 +864,15 @@ mod tests {
         state.reported.insert("alert:new2".into(), now);
 
         let picked = select_alerts(&alerts, &state, 1, 86400, now);
-        assert_eq!(picked.len(), 1);
+        assert_eq!(picked.selected.len(), 1);
         assert_eq!(
-            picked[0].dedup_key, "old",
+            picked.selected[0].dedup_key, "old",
             "上限卡的是本轮产出多少意图，先把窗口截断会让冷却中的告警长期挡住排在后面的"
         );
+        // The two held back are the reading that says this tick was not a quiet
+        // one: they are firing alerts the watcher deliberately did not act on,
+        // which is a different state from finding no alert at all.
+        assert_eq!(picked.in_cooldown, 2);
     }
 
     #[test]
@@ -760,11 +882,15 @@ mod tests {
         let picked = select_alerts(&alerts, &SignalGuardState::default(), 2, 86400, now);
         assert_eq!(
             picked
+                .selected
                 .iter()
                 .map(|a| a.dedup_key.as_str())
                 .collect::<Vec<_>>(),
             vec!["a", "b"]
         );
+        // The cap and the cooldown are different reasons an alert is not acted
+        // on, and a truncated alert is not in cooldown: it comes back next tick.
+        assert_eq!(picked.in_cooldown, 0);
     }
 
     #[test]
