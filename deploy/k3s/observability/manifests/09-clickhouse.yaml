@@ -101,13 +101,17 @@ spec:
           # 上限 2Gi 的依据是同一批读数：1Gi 上限下它在一个小时窗口里被 OOMKilled 五次
           # （重启计数器 03:30 起从 0 走到 5），而死前最后一个采样点就在 948MiB——不是突发
           # 超了上限，是稳态离上限只剩一成余量。装到节点更小的机器上按 allocatable 重算。
+          # 抬到 3Gi 是同一个形状又长回来了：工作集对上限的比值 24 小时 p50 0.61 / p90 0.76、
+          # 七天峰值 0.93，也就是稳态又贴回上限的一成以内。上限仍按本卷自己的读数定，
+          # 不按节点余量定——节点现在空闲不代表摄入高峰时不抢，这条旁路被 OOMKilled 一次
+          # 就没人在看日志了。
           resources:
             requests:
               cpu: 100m
-              memory: 1Gi
+              memory: 1536Mi
             limits:
               cpu: 1000m
-              memory: 2Gi
+              memory: 3Gi
   volumeClaimTemplates:
     - metadata:
         name: data

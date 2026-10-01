@@ -72,13 +72,17 @@ grafana:
   enabled: true
   replicas: 1
 
+  # 384Mi 是 chart 的 small 档默认值，而 grafana 的稳态工作集已经爬到 300MiB 上下：
+  # 24 小时内工作集对上限的比值在 0.52–0.80 之间，正是那条告警判据的带内。它自己被杀
+  # 只是丢面板，但同一条规则同时看着 clickhouse——把一半的余量留给「还没发生的突发」
+  # 比省下 384Mi 的额度值。full 档的 512Mi 不动：同一份工作集在那里只占 0.59。
   resources:
     requests:
       cpu: 50m
-      memory: 192Mi
+      memory: 256Mi
     limits:
       cpu: 300m
-      memory: 384Mi
+      memory: 768Mi
 
   persistence:
     enabled: true
