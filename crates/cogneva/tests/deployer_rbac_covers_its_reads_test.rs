@@ -648,6 +648,10 @@ fn slot_words(
     ))
 }
 
+/// One thing a command needs permission for: the API group, the resource, and
+/// the verbs it will use against it.
+type Obligation = (&'static str, &'static str, Vec<&'static str>);
+
 /// What a command needs, beside the resource it names.
 ///
 /// `rollout undo` is the one that is not a straight read or write of its
@@ -658,7 +662,7 @@ fn slot_words(
 fn obligations(
     cmd: &Command,
     target: (&'static str, &'static str),
-) -> Result<Vec<(&'static str, &'static str, Vec<&'static str>)>, String> {
+) -> Result<Vec<Obligation>, String> {
     let (group, resource) = target;
     let here = |verbs: Vec<&'static str>| vec![(group, resource, verbs)];
     match cmd.verb.as_str() {
@@ -694,10 +698,7 @@ fn obligations(
     }
 }
 
-fn needed_for(
-    file: &'static str,
-    used: &mut BTreeSet<&'static str>,
-) -> Vec<(&'static str, &'static str, Vec<&'static str>)> {
+fn needed_for(file: &'static str, used: &mut BTreeSet<&'static str>) -> Vec<Obligation> {
     let src = read(file);
     let body = production_source(&src);
     let mut needed = Vec::new();
