@@ -227,7 +227,10 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          by verdict: pass, fail or no_evidence. no_evidence is its own value \
          rather than a kind of failure: a gate whose conclusion could not be \
          read is not a gate that said no, and counting the two together hides \
-         exactly the case that lets an unverified revision through",
+         exactly the case that lets an unverified revision through. Counted per \
+         question rather than per revision: a round asks before the build and \
+         again before the dispatch, so a revision that reads the same way twice \
+         adds two",
     ),
     (
         "cogneva_dag_stalled_scheduled_reclaimed_total",

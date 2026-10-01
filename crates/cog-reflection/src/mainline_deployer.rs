@@ -2888,6 +2888,36 @@ impl MainlineDeployer {
         verdict
     }
 
+    /// 上游 CI 已经给出明确的失败结论就扣住这个 rev；`Ok(true)` = 扣住了。
+    ///
+    /// 这条判据一轮里问两次，因为它挡的那段窗口在两次提问之间：轮首那次决定
+    /// 要不要花一整段冷构建，派 Job 之前那次决定这份刚编好的镜像要不要进集群。
+    /// 只问轮首那次等于让这扇门在最需要它的地方闭着眼——实测的原因分布正是
+    /// 这样：`no_evidence` 全部落在 `pending`（上游还在跑）与 `no_runs`（还没
+    /// 有东西）两格，一次读失败都没有；而轮首到派发之间隔着的那段构建，足够
+    /// 让那次检查跑出结论。
+    ///
+    /// 读不到结论一律放行（只有 `Some(false)` 才扣）：拿一次平台抖动停掉整条
+    /// 主线跟踪，代价比偶尔滚一个恰好红的 rev 更大。
+    async fn hold_if_ci_reports_failure(
+        &self,
+        state: &mut MainlineState,
+        rev: &str,
+    ) -> SFResult<bool> {
+        if self.ci_verdict_for_rev(rev).await != Some(false) {
+            return Ok(false);
+        }
+        warn!(
+            rev = %rev12(rev),
+            "upstream CI reports a failure for this rev; holding the rollout"
+        );
+        if state.ci_hold_rev.as_deref() != Some(rev) {
+            state.ci_hold_rev = Some(rev.to_string());
+            self.save_state(state)?;
+        }
+        Ok(true)
+    }
+
     /// The judgement's own reading: which question it asked upstream and which
     /// answer it got.
     ///
@@ -2897,8 +2927,10 @@ impl MainlineDeployer {
     /// "this round could not read them at all" both end in the same dispatch.
     /// The state file keeps a hold and nothing else, and the log line that used
     /// to be the only trace dies with the pod that wrote it. One of the three
-    /// labels gains a count each round the question is asked; all three missing
-    /// means the call site is not there.
+    /// labels gains a count each time the question is asked, and a round asks it
+    /// twice -- before the build and again before the dispatch -- so a round
+    /// that reads a verdict for a revision and rolls it adds two. All three
+    /// missing means neither call site is there.
     async fn record_ci_verdict_reading(&self, verdict: Option<bool>) {
         let Some(metrics) = &self.metrics else {
             return;
@@ -4226,17 +4258,9 @@ impl MainlineDeployer {
         // 滚动门禁：上游 CI 已经给出明确的失败结论就不滚这个 rev。bare 的
         // main 在上面就推进过了（它只是一份镜像副本，推进无害），所以这里挡
         // 的是"把红 CI 的代码送进集群"，不是"跟踪上游"——上游修好或下一个 rev
-        // 追上来，这条路径自己恢复。读不到结论一律放行：拿一次平台抖动停掉
-        // 整条主线跟踪，代价比偶尔滚一个恰好红的 rev 更大。
-        if self.ci_verdict_for_rev(&bare).await == Some(false) {
-            warn!(
-                rev = %rev12(&bare),
-                "upstream CI reports a failure for this rev; holding the rollout"
-            );
-            if state.ci_hold_rev.as_deref() != Some(bare.as_str()) {
-                state.ci_hold_rev = Some(bare.clone());
-                self.save_state(&state)?;
-            }
+        // 追上来，这条路径自己恢复。这里问的是第一次；第二次在真要派 Job 之前
+        // （见 `roll_out`），中间隔着的那段构建正是它要补上的窗口。
+        if self.hold_if_ci_reports_failure(&mut state, &bare).await? {
             return Ok(());
         }
         if state.ci_hold_rev.take().is_some() {
@@ -4348,8 +4372,8 @@ impl MainlineDeployer {
         Ok(())
     }
 
-    /// Roll `rev` out, unless the upstream has moved past it while this round
-    /// was working on it.
+    /// Roll `rev` out, unless the upstream has moved past it -- or has since
+    /// reported a failing check on it -- while this round was working on it.
     ///
     /// The advance decision is taken against the tip read at the top of the
     /// round, and the round's own work sits between that decision and the
@@ -4360,6 +4384,16 @@ impl MainlineDeployer {
     /// already left — the next round then pays a second rollout Job and a
     /// second set of workload restarts to reach a tip that was already known.
     /// Asking again here costs one git read.
+    ///
+    /// The CI verdict is the other decision this round takes that early, and it
+    /// is re-asked here for the same reason. The round reads it before paying
+    /// for the build -- the right place to avoid a wasted build, the wrong place
+    /// to learn the answer: the revision has just arrived, so its checks are
+    /// still running. Measured over a day, every `no_evidence` fell into
+    /// `pending` or `no_runs` and none into a read failure. Asked again after
+    /// the build, those checks usually have a verdict by then, and a failing one
+    /// stops the revision before it reaches the cluster instead of one cycle
+    /// after it already has.
     ///
     /// Returns whether the rollout was dispatched. A tip that could not be read
     /// is not an advance: holding a rollout on an unread upstream would trade a
@@ -4395,6 +4429,15 @@ impl MainlineDeployer {
             return Ok(false);
         }
         self.record_supersession_reading(false).await;
+        // 派发前的第二次 CI 提问。第一次在调用者那里、轮首就问了，那时读到的
+        // rev 通常刚落上来、检查还没跑完；从这里到派发之间隔着一整段构建，那段
+        // 时间足够检查跑出结论。扣住时把 `in_flight` 一起清掉——这一轮对这份
+        // rev 已经收手，留着它，下一轮会去读一个从没派过的 Job 的状态。
+        if self.hold_if_ci_reports_failure(state, rev).await? {
+            state.in_flight = None;
+            self.save_state(state)?;
+            return Ok(false);
+        }
         self.dispatch_job(rev, pull_tag).await?;
         Ok(true)
     }
