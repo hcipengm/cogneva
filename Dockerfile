@@ -161,12 +161,6 @@ RUN touch crates/*/src/lib.rs crates/*/src/main.rs 2>/dev/null || true
 # Build the release binary
 RUN cargo build --release --locked --bin cogneva
 
-# Stamp the compiler that just built it. 构建与集群同宿主、镜像随每个 rev 滚动，
-# 而 CI 校验用的是**它自己那一刻**的 stable——两者的版本可以差一版而任何产物都
-# 看不出来（「CI 绿」与「跑着的那份」不同源）。下面运行段还会另装一把工具链给
-# 自进化 worker，那一把**不是**证据，所以这里把编译期这把写进镜像随身带着。
-RUN rustc -V > /etc/cogneva-builder-rustc
-
 # Strip the binary to reduce size
 RUN strip target/release/cogneva
 
@@ -240,11 +234,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     buildah \
     && rm -rf /var/lib/apt/lists/*
 
-# Install rustup/stable toolchain for the self-evolution worker.
-# 这是**另一把**工具链，与上面钉住的 RUST_TOOLCHAIN 不是同一个，而且是有意的：
-# 进化 worker 在运行期编译系统写给自己、之后要落地的那些变更，它跟的是 stable
-# 通道（最新），不是编译这个镜像里二进制的那个版本。所以 RUST_TOOLCHAIN 这句
-# 声明**不覆盖**它——别把「Dockerfile 钉了版本」读成「这个镜像里的编译器是钉住的」。
+# Install rustup/stable toolchain. 这一把与上面钉住的 RUST_TOOLCHAIN 无关、有意不同：
+# 它既给自进化 worker 在运行期编译系统写给自己、之后要落地的变更，也**就是部署器
+# 编译主线二进制的那把**——`mainline_deployer` 在同一个镜像的 Pod 里跑 `cargo build
+# --release`，不传工具链覆盖，所以「跑着的那个二进制是谁编的」读运行 Pod 里的
+# `rustc -V` 就是它，而不是本文件构建段那把（构建段只产底座镜像自己的二进制）。
+# 它跟 stable 通道（最新）⇒ RUST_TOOLCHAIN 这句声明**不覆盖**它：别把「Dockerfile
+# 钉了版本」读成「这个镜像里的编译器是钉住的」。
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
@@ -280,10 +276,6 @@ RUN groupadd -r cogneva -g 1001 && \
 
 # Copy the built binary
 COPY --from=builder /build/target/release/cogneva /opt/cogneva/cogneva
-
-# 「这个二进制是谁编的」随镜像走：与上面那把运行期工具链无关，别把后者当证据。
-# 读法：kubectl exec <pod> -c cogneva -- cat /etc/cogneva-builder-rustc
-COPY --from=builder /etc/cogneva-builder-rustc /etc/cogneva-builder-rustc
 
 # Copy SQL migrations so the storage plugin can apply them at runtime
 COPY --from=builder /build/crates/cog-storage/migrations /opt/cogneva/crates/cog-storage/migrations
