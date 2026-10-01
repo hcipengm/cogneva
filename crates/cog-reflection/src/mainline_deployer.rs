@@ -872,15 +872,43 @@ fn rollout_pods_fatal(samples: &[PodSample]) -> Option<String> {
         })
 }
 
-/// 这批等待原因里有没有「拉取失败」。init 容器与主容器一起看：init 拉不到镜像时
+/// 一个容器的等待态：它停在哪一步（`state.waiting.reason`，闭集里的一个词），以及
+/// **它自己写下的那一句死因**（容器终止消息文件，kubelet 放进
+/// `lastState.terminated.message`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WaitingState {
+    reason: String,
+    cause: String,
+}
+
+/// 解析 `原因|死因` 这样的逐行读数。原因取自闭集、永不含 `|`，所以按**第一个**
+/// `|` 切分即可；死因是自由文本，里面出现 `|` 不影响切分。死因自带换行时多出来的
+/// 那些行没有原因字段，对闭集的匹配自然落空（两个判据都是整词比较）。
+fn pod_waiting_states(out: &str) -> Vec<WaitingState> {
+    out.lines()
+        .filter_map(|line| {
+            let (reason, cause) = line.split_once('|').unwrap_or((line, ""));
+            let reason = reason.trim();
+            if reason.is_empty() {
+                return None;
+            }
+            Some(WaitingState {
+                reason: reason.to_string(),
+                cause: cause.trim().to_string(),
+            })
+        })
+        .collect()
+}
+
+/// 这批等待态里有没有「拉取失败」。init 容器与主容器一起看：init 拉不到镜像时
 /// 主容器只报 PodInitializing，只看主容器会把这一档整个漏掉。
 ///
 /// 返回命中的那个原因本身（而不是布尔）：判词里要写出是哪一个等待态，人才知道
 /// kubelet 停在哪一步。
-fn image_pull_blocked(reasons: &[String]) -> Option<&str> {
-    reasons
+fn image_pull_blocked(states: &[WaitingState]) -> Option<&str> {
+    states
         .iter()
-        .map(String::as_str)
+        .map(|s| s.reason.as_str())
         .find(|r| IMAGE_PULL_WAITING_REASONS.contains(r))
 }
 
@@ -8150,7 +8178,7 @@ impl RolloutExecutor {
                 // 版本，说不出它的好坏。先取下来（临时值不能活到下面的格式化里），
                 // 命不命中都在这里判，判词里带上是哪一个等待态。
                 let pull_blocked =
-                    image_pull_blocked(&self.waiting_reasons(t).await).map(|r| r.to_string());
+                    image_pull_blocked(&self.waiting_states(t).await).map(|r| r.to_string());
                 return Err(if !observed_ever {
                     // 一次都没看到过部署态：这是观测能力故障，不是版本结论。
                     SFError::IO(format!(
@@ -8213,10 +8241,13 @@ impl RolloutExecutor {
         }
     }
 
-    /// 本次滚动的 Pod 上所有等待原因，init 容器与主容器一并取：init 容器拉不到
+    /// 本次滚动的 Pod 上所有等待态，init 容器与主容器一并取：init 容器拉不到
     /// 镜像时主容器只报 PodInitializing，只看主容器会把这一档整个漏掉。查询失败
     /// 返回空表——滚动交替期 containerStatuses 本就可能缺失，由调用方的超时兜底。
-    async fn waiting_reasons(&self, t: &RolloutTarget) -> Vec<String> {
+    ///
+    /// 每一态都把**那个容器自己写下的死因**一并取回：判死那一刻，这条读数往往是
+    /// 崩溃版本留下的唯一一句话（见 [`Self::fatal_pod_state`]）。
+    async fn waiting_states(&self, t: &RolloutTarget) -> Vec<WaitingState> {
         let selector = pod_selector(&t.name, &t.component);
         let out = match self
             .run_kubectl(
@@ -8226,7 +8257,7 @@ impl RolloutExecutor {
                     "-l",
                     &selector,
                     "-o",
-                    "jsonpath={range .items[*]}{range .status.initContainerStatuses[*]}{.state.waiting.reason}{\"\\n\"}{end}{.status.containerStatuses[0].state.waiting.reason}{\"\\n\"}{end}",
+                    "jsonpath={range .items[*]}{range .status.initContainerStatuses[*]}{.state.waiting.reason}|{.lastState.terminated.message}{\"\\n\"}{end}{.status.containerStatuses[0].state.waiting.reason}|{.status.containerStatuses[0].lastState.terminated.message}{\"\\n\"}{end}",
                 ],
                 30,
             )
@@ -8235,23 +8266,31 @@ impl RolloutExecutor {
             Ok(out) => out,
             Err(_) => return Vec::new(),
         };
-        out.lines()
-            .map(|l| l.trim().to_string())
-            .filter(|r| !r.is_empty())
-            .collect()
+        pod_waiting_states(&out)
     }
 
     /// 只查致命等待态（配置错误、CrashLoop、镜像引用非法），查询临时失败返回
     /// Ok——由调用方的超时与后续 pods_healthy 兜底，这里只负责让"必死"的滚动
     /// 快速失败。拉取失败不在这里判（见 IMAGE_PULL_WAITING_REASONS）。
+    ///
+    /// 判词接上容器自己写下的死因（分隔符之后、不进判据，见 [`primary_message`]）：
+    /// 另一个会读死因的判死（`rollout_pods_fatal`）只在一个"已收敛"的分支里跑，
+    /// 而致命等待态的容器一律未就绪，那条判据此刻恒假——崩溃的滚动只能走到这
+    /// 一条，容器留下的那句话就只剩这一个落点。
     async fn fatal_pod_state(&self, t: &RolloutTarget) -> SFResult<()> {
-        for reason in self.waiting_reasons(t).await {
-            if FATAL_WAITING_REASONS.contains(&reason.as_str()) {
-                return Err(SFError::Agent(format!(
-                    "pod of deployment/{} in fatal waiting state {reason}",
-                    t.deployment
-                )));
+        for state in self.waiting_states(t).await {
+            if !FATAL_WAITING_REASONS.contains(&state.reason.as_str()) {
+                continue;
             }
+            let mut text = format!(
+                "pod of deployment/{} in fatal waiting state {}",
+                t.deployment, state.reason
+            );
+            if !state.cause.is_empty() {
+                text.push_str(SUPPORT_CAUSE_SEPARATOR);
+                text.push_str(&bounded(&state.cause, SUPPORT_CAUSE_MESSAGE_CHARS));
+            }
+            return Err(SFError::Agent(text));
         }
         Ok(())
     }
@@ -9919,13 +9958,146 @@ COPY ["prompts", "/opt/cogneva/prompts"]
         assert!(IMAGE_PULL_WAITING_REASONS.contains(&"ImagePullBackOff"));
 
         // 只认拉取那一类，别的等待态不许借走它的处置。
-        let pull = vec![
-            "ImagePullBackOff".to_string(),
-            "PodInitializing".to_string(),
+        let pull = [
+            waiting_state("ImagePullBackOff", ""),
+            waiting_state("PodInitializing", ""),
         ];
         assert_eq!(image_pull_blocked(&pull), Some("ImagePullBackOff"));
-        assert_eq!(image_pull_blocked(&["CrashLoopBackOff".to_string()]), None);
+        assert_eq!(
+            image_pull_blocked(&[waiting_state("CrashLoopBackOff", "")]),
+            None
+        );
         assert_eq!(image_pull_blocked(&[]), None);
+    }
+
+    /// 等待态读数是 `原因|死因` 的逐行文本：原因来自闭集、永不含 `|`，所以按第一个
+    /// `|` 切分；死因是自由文本，自带 `|` 或换行都不许把前面的字段带歪。死因里的换行
+    /// 会多出没有原因字段的行，它们按整行当原因——闭集的两个判据都是整词比较，这类行
+    /// 落在闭集之外，于是不会借走任何一类的处置。
+    #[test]
+    fn waiting_states_split_on_the_first_separator_only() {
+        let out = "CrashLoopBackOff|cogneva startup failed: redis: connection refused\n\
+                   PodInitializing|\n\
+                   a free-text continuation line with no reason field\n";
+        let states = pod_waiting_states(out);
+        assert_eq!(
+            states,
+            vec![
+                waiting_state(
+                    "CrashLoopBackOff",
+                    "cogneva startup failed: redis: connection refused"
+                ),
+                waiting_state("PodInitializing", ""),
+                waiting_state("a free-text continuation line with no reason field", ""),
+            ]
+        );
+        // 关键性质：自由文本多出来的那一行一个闭集都进不去，借不走任何一类的处置。
+        let stray = states.last().unwrap();
+        assert_eq!(
+            stray.reason,
+            "a free-text continuation line with no reason field"
+        );
+        assert!(!FATAL_WAITING_REASONS.contains(&stray.reason.as_str()));
+        assert!(!IMAGE_PULL_WAITING_REASONS.contains(&stray.reason.as_str()));
+
+        // 死因里带 `|` 时切在第一个上，整段都留在死因里。
+        let with_pipe = pod_waiting_states("CrashLoopBackOff|exit code 1 | see logs: boom\n");
+        assert_eq!(
+            with_pipe,
+            vec![waiting_state(
+                "CrashLoopBackOff",
+                "exit code 1 | see logs: boom"
+            )]
+        );
+
+        // 没有分隔符的行按整行当原因：闭集匹配不上，于是不会误判成致命态。
+        assert_eq!(
+            pod_waiting_states("no separator here\n"),
+            vec![waiting_state("no separator here", "")]
+        );
+        assert!(pod_waiting_states("\n\n").is_empty());
+    }
+
+    /// 判死那一条必须把**容器自己写下的那句话**带出来。另一个会读死因的判死
+    /// （`rollout_pods_fatal`）只挂在"已收敛"分支里，而致命等待态的容器一律未就绪、
+    /// 那条分支恒假；崩溃的滚动只能走这一条，容器留下的最后一句话就只剩这一个落点。
+    #[tokio::test]
+    async fn a_fatal_waiting_state_carries_the_containers_own_cause() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let script = r#"#!/bin/sh
+case "$*" in
+  *"get pods"*)
+    printf 'CrashLoopBackOff|cogneva startup failed: redis: connection refused\n' ;;
+  *) echo ok ;;
+esac
+exit 0
+"#;
+        write_fake_bin(&bin_dir, "fake-kubectl", script);
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            1,
+            1,
+            1,
+            1,
+        );
+        let target = RolloutTarget {
+            deployment: "cogneva".into(),
+            container: "cogneva".into(),
+            component: "cogneva".into(),
+            name: "cogneva".into(),
+        };
+
+        let err = executor.fatal_pod_state(&target).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cogneva startup failed: redis: connection refused"),
+            "the container's own last words must reach the failing verdict: {msg}"
+        );
+        // 死因在分隔符之后：它进判词、不进判据，集群里的自由文本不许改分类。
+        assert_eq!(
+            primary_message(&msg),
+            "Agent execution error: pod of deployment/cogneva in fatal waiting state \
+             CrashLoopBackOff"
+        );
+    }
+
+    /// 容器没写下死因时判词保持原样：不许多出一个空的分隔段。
+    #[tokio::test]
+    async fn a_fatal_waiting_state_without_a_cause_keeps_its_plain_verdict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let script = r#"#!/bin/sh
+case "$*" in
+  *"get pods"*) printf 'InvalidImageName|\n' ;;
+  *) echo ok ;;
+esac
+exit 0
+"#;
+        write_fake_bin(&bin_dir, "fake-kubectl", script);
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            1,
+            1,
+            1,
+            1,
+        );
+        let target = RolloutTarget {
+            deployment: "cogneva".into(),
+            container: "cogneva".into(),
+            component: "cogneva".into(),
+            name: "cogneva".into(),
+        };
+
+        let err = executor.fatal_pod_state(&target).await.unwrap_err();
+        let msg = err.to_string();
+        assert_eq!(
+            msg,
+            "Agent execution error: pod of deployment/cogneva in fatal waiting state \
+             InvalidImageName"
+        );
     }
 
     /// 镜像源的标记自成一类：不许被别的标记命中，也不许命中别的标记。
@@ -10761,6 +10933,14 @@ exit 0
         );
         write_fake_bin(dir, "fake-kubectl", &script);
         dir.join("fake-kubectl").to_string_lossy().to_string()
+    }
+
+    /// 一个容器的等待态读数：原因来自闭集，死因是容器自己写下的那句话（可能为空）。
+    fn waiting_state(reason: &str, cause: &str) -> WaitingState {
+        WaitingState {
+            reason: reason.to_string(),
+            cause: cause.to_string(),
+        }
     }
 
     /// fake kubectl：支撑工作负载的代数查询，前 `failures` 次 `get deployment`
