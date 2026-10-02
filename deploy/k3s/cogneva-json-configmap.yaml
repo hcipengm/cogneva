@@ -724,12 +724,12 @@ data:
             },
             {
               "name": "dag_task_stalled_after_ready",
-              "promql": "increase(cogneva_dag_stalled_scheduled_reclaimed_total[1h])",
+              "promql": "sum by (namespace) (increase(cogneva_dag_stalled_scheduled_reclaimed_total[1h]))",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "The scheduler reclaimed {value} task(s) in the last hour that sat in Scheduled past the transport's own reclaim window without ever starting. Scheduled means one thing — a ready message carrying that task was handed to the bus — so a task still in it after the bus has had every chance to re-deliver is one whose message was consumed without a run. The queue reads clean while this happens: the message was acked, so there is no pending entry and no lag to notice, and the task is invisible from every other reading because the publisher scans Pending and the timeout checker reclaims Running. Each reclaim re-runs the work and charges the task's retry budget, so a recurring count is paying for the same tasks twice; a task out of budget fails and cancels its dependents. Read the task ids and the consumer's log around the time of the message, not the queue"
+              "summary": "The scheduler reclaimed {value} task(s) in the last hour that sat in Scheduled past the transport's own reclaim window without ever starting. Scheduled means one thing — a ready message carrying that task was handed to the bus — so a task still in it after the bus has had every chance to re-deliver is one whose message was consumed without a run. The queue reads clean while this happens: the message was acked, so there is no pending entry and no lag to notice, and the task is invisible from every other reading because the publisher scans Pending and the timeout checker reclaims Running. Each reclaim re-runs the work and charges the task's retry budget, so a recurring count is paying for the same tasks twice; a task out of budget fails and cancels its dependents. Read the task ids and the consumer's log around the time of the message, not the queue. The count is summed over every process in the namespace rather than read per process: a reclaim is done by whichever process found the task, so each process counts only its own and the total is the deployment's. Read per process, one condition casts one alert per running process, and each of those rows is keyed by a pod that a rollout deletes — so the fault stays put while the subject it was reported under is replaced, and the alert then sits firing with nothing left to evaluate it"
             },
             {
               "name": "task_checkpoint_not_persisted",
