@@ -261,7 +261,6 @@ impl LLMProvider for RoutingProvider {
 
         for i in 0..attempts {
             let backend = &self.backends[i];
-            let start = std::time::Instant::now();
             let mut stream = match backend.chat_stream(messages, options).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -291,16 +290,6 @@ impl LLMProvider for RoutingProvider {
             while stream.next().await.is_some() {}
 
             let response = stream.result().await;
-            let latency_ms = start.elapsed().as_millis() as u64;
-
-            let obs = crate::observable::global_observable();
-            if response.error_message.is_some() {
-                obs.record_error();
-            } else {
-                let tokens_in = response.usage.input as u64;
-                let tokens_out = response.usage.output as u64;
-                obs.record_call(tokens_in, tokens_out, latency_ms);
-            }
 
             if self.should_failover(response.upstream_failure, response.error_message.as_deref()) {
                 if i + 1 < attempts {
