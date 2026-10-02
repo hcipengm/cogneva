@@ -149,39 +149,27 @@ impl AlertStore {
                 evidenced_recovery_unix,
                 next_attempt_unix,
                 unavailable,
+                pool_size,
+                quota_window_secs,
                 timestamp,
             } => {
-                // The two bounds are worded apart on purpose: a reset time an
-                // upstream reported is a fact about that upstream, while the
-                // backoff expiry is only when we will try again. Calling the
-                // latter an "earliest recovery" tells the reader an upstream
-                // will be back at a time nothing has evidence for.
-                let recovery = match evidenced_recovery_unix {
-                    0 => "no upstream reported a recovery time".to_string(),
-                    at => format!(
-                        "earliest recovery reported by an upstream: {}",
-                        DateTime::<Utc>::from_timestamp(*at, 0)
-                            .map(|t| t.to_rfc3339())
-                            .unwrap_or_else(|| "unknown".into())
-                    ),
-                };
-                let next_attempt = if *next_attempt_unix > 0 {
-                    DateTime::<Utc>::from_timestamp(*next_attempt_unix, 0)
-                        .map(|t| t.to_rfc3339())
-                        .unwrap_or_else(|| "unknown".into())
-                } else {
-                    "unknown".into()
-                };
+                // The sentence is built once and read by every consumer of this
+                // event. Worded here separately it could disagree with the
+                // notification egress, and two plausible sentences that
+                // disagree are worse than either alone: nothing fails, so
+                // nothing points at the one that is wrong.
+                let message = cog_core::pool_down_verdict(
+                    *pool_size,
+                    unavailable,
+                    *evidenced_recovery_unix,
+                    *next_attempt_unix,
+                    *quota_window_secs,
+                );
                 Some(Alert {
                     id: uuid::Uuid::new_v4().to_string(),
                     severity: AlertSeverity::Critical,
                     event_type: "llm_upstream_pool_down".to_string(),
-                    message: format!(
-                        "All {} LLM upstreams unavailable ({recovery}; next attempt: \
-                         {next_attempt}); LLM-dependent tasks paused, supply a reachable \
-                         upstream",
-                        unavailable.len()
-                    ),
+                    message,
                     agent_id: None,
                     task_id: None,
                     crew_id: None,
@@ -258,6 +246,8 @@ mod tests {
             evidenced_recovery_unix: 1_789_315_200,
             next_attempt_unix: 1_789_314_600,
             unavailable: vec!["https://a.example|model-a".into()],
+            pool_size: 4,
+            quota_window_secs: 0,
             timestamp: Utc::now(),
         };
         let alert = AlertStore::event_to_alert(&event).expect("池全灭必须产生告警");
@@ -267,6 +257,13 @@ mod tests {
         assert!(
             alert.message.contains("2026-09-13"),
             "含上游报告的最早恢复时间: {}",
+            alert.message
+        );
+        assert!(
+            alert
+                .message
+                .contains("1 of 4 upstreams are suspect right now"),
+            "嫌疑窗内那几家要报成池里的一部分，不能报成池的大小: {}",
             alert.message
         );
     }
@@ -279,6 +276,8 @@ mod tests {
             evidenced_recovery_unix: 0,
             next_attempt_unix: 1_789_314_600,
             unavailable: vec!["https://a.example|model-a".into()],
+            pool_size: 4,
+            quota_window_secs: 0,
             timestamp: Utc::now(),
         };
         let alert = AlertStore::event_to_alert(&event).expect("没有恢复时刻也要告警");

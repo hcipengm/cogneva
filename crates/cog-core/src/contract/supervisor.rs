@@ -246,6 +246,23 @@ pub struct LlmPoolStatus {
     pub next_attempt_unix: i64,
     /// Identity (`base_url|model`) of the unusable upstreams.
     pub unavailable_upstreams: Vec<String>,
+    /// How many upstreams the pool is configured with; `0` when the writer did
+    /// not carry it (a payload from a build that predates this field).
+    ///
+    /// The list above holds the ones that are suspect *right now*, and that set
+    /// shrinks by itself as probe windows expire while the pool does not. A
+    /// reader given only the list cannot tell a smaller reading from a smaller
+    /// pool, and a verdict built on it says "all N" about a subset. Zero is
+    /// "not reported", never a pool of no upstreams.
+    #[serde(default)]
+    pub pool_size: usize,
+    /// Longest quota window any suspect upstream stated, seconds; `0` when none
+    /// stated one. An upstream that only says its weekly window has to run out
+    /// states no instant, so this is then the only statement of how long the
+    /// outage lasts, and a verdict that omits it reads a spent weekly quota as
+    /// a brief hiccup.
+    #[serde(default)]
+    pub quota_window_secs: u64,
     /// Per-upstream inputs the bounds above were derived from. Empty in a
     /// payload from a build that did not carry them, which reads as "no
     /// evidence to resume with" — the same starting point as a first boot.
@@ -437,8 +454,20 @@ pub enum SupervisorEvent {
         /// Earliest time a suspect upstream will be probed again, unix seconds.
         /// Retry cadence, not an upstream fact, and worded as such downstream.
         next_attempt_unix: i64,
-        /// Identity of the unusable upstreams (`base_url|model`).
+        /// Identity of the unusable upstreams (`base_url|model`). This is the
+        /// suspect set at the moment of the edge, not the pool.
         unavailable: Vec<String>,
+        /// How many upstreams the pool is configured with; `0` when the emitter
+        /// did not carry it. Consumers word their verdict from this rather than
+        /// from the length of the list above, which answers a different
+        /// question and answers it differently every time a window expires.
+        #[serde(default)]
+        pool_size: usize,
+        /// Longest quota window any suspect upstream stated, seconds; `0` when
+        /// none stated one. Carried so a consumer does not have to report "no
+        /// upstream stated a recovery time" when one did state how long it is.
+        #[serde(default)]
+        quota_window_secs: u64,
         timestamp: DateTime<Utc>,
     },
 
@@ -521,6 +550,85 @@ pub enum SupervisorEvent {
     },
 }
 
+/// The one sentence every consumer of [`SupervisorEvent::LlmUpstreamPoolDown`]
+/// shows its reader.
+///
+/// The event has more than one consumer -- the in-app alert history and the
+/// notification egress -- and each used to word the verdict on its own from the
+/// only number the event carried, the length of the suspect list. That number is
+/// a reading, not the pool: it shrinks by itself as probe windows expire while
+/// the pool does not, so "all N upstreams unavailable" described the pool with a
+/// subset that moves without anything about the pool moving. Two consumers
+/// wording it separately can also drift, and the drift is silent here -- both
+/// strings read as plausible, so nothing fails and no reader can tell which one
+/// is wrong.
+///
+/// Written from the fields the event carries, so no consumer can give the
+/// verdict its own scope without changing what every other consumer prints.
+pub fn pool_down_verdict(
+    pool_size: usize,
+    unavailable: &[String],
+    evidenced_recovery_unix: i64,
+    next_attempt_unix: i64,
+    quota_window_secs: u64,
+) -> String {
+    // The size of the pool and the number of upstreams inside their probe window
+    // right now are two different numbers, and only the first one is stable. A
+    // payload that does not carry the pool size says so rather than falling back
+    // to the subset, which is the reading this sentence exists to stop
+    // reporting.
+    let scope = if pool_size == 0 {
+        format!(
+            "the event names {} suspect upstreams and carries no pool size",
+            unavailable.len()
+        )
+    } else {
+        format!(
+            "{} of {} upstreams are suspect right now",
+            unavailable.len(),
+            pool_size
+        )
+    };
+    // A stated reset instant and a stated window are statements of different
+    // strength: only the first one says when the upstream will serve again. With
+    // only the window, reporting "no upstream reported a recovery time" is true
+    // and still misleading -- the window is what the upstream said about how
+    // long this lasts.
+    let recovery = if evidenced_recovery_unix > 0 {
+        format!(
+            "earliest upstream-reported recovery {}",
+            rfc3339(evidenced_recovery_unix)
+        )
+    } else if quota_window_secs > 0 {
+        format!(
+            "no upstream reported a recovery time; the longest upstream-quota window is {} d",
+            quota_window_secs / 86_400
+        )
+    } else {
+        "no upstream reported a recovery time".to_string()
+    };
+    let next_attempt = if next_attempt_unix > 0 {
+        rfc3339(next_attempt_unix)
+    } else {
+        "unknown".to_string()
+    };
+    // The sentence reads by eye, the labels stay machine-readable: a timestamp
+    // that only exists as a unix count in someone's notification is a number
+    // they have to convert before they can act on it.
+    format!(
+        "LLM upstream pool unavailable: {scope} ({recovery}; next attempt {next_attempt}); \
+         LLM-dependent tasks paused, supply a reachable upstream"
+    )
+}
+
+/// Render a unix instant for a human, falling back to the raw count rather than
+/// to a word: "unknown" hides the value a reader needs to reason about.
+fn rfc3339(unix: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(unix, 0)
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_else(|| format!("unix {unix}"))
+}
+
 impl SupervisorEvent {
     /// Return the supervisor event type name for filtering.
     pub fn name(&self) -> &'static str {
@@ -573,6 +681,92 @@ mod tests {
             status.upstream_evidence.is_empty(),
             "absent evidence reads as none held, not as an error"
         );
+    }
+
+    /// A payload written before the pool size travelled with the verdict must
+    /// still parse, and the missing size must read as "not reported" rather than
+    /// as a pool of no upstreams — a consumer that takes 0 for a size prints
+    /// "0 of 0".
+    #[test]
+    fn a_payload_without_the_pool_size_says_it_does_not_have_one() {
+        let old = r#"{"unavailable":true,"evidenced_recovery_unix":1800000000,
+                      "next_attempt_unix":1799999400,
+                      "unavailable_upstreams":["https://a.example.com|m1"]}"#;
+        let status: LlmPoolStatus = serde_json::from_str(old).expect("old payload parses");
+        assert_eq!(status.pool_size, 0);
+        assert_eq!(status.quota_window_secs, 0);
+        let verdict = pool_down_verdict(
+            status.pool_size,
+            &status.unavailable_upstreams,
+            status.evidenced_recovery_unix,
+            status.next_attempt_unix,
+            status.quota_window_secs,
+        );
+        assert!(
+            verdict.contains("carries no pool size"),
+            "0 只能读成「没带」，读成池里一个都没有就是替旧载荷编了一个数: {verdict}"
+        );
+    }
+
+    /// How many upstreams sit inside their probe window moves on its own as the
+    /// windows expire; the pool does not. The verdict has to name both, or a
+    /// reader takes the first for the second.
+    #[test]
+    fn the_verdict_names_the_pool_and_the_suspect_subset_separately() {
+        let suspect = vec!["https://a.example.com|m1".to_string()];
+        let verdict = pool_down_verdict(4, &suspect, 1_789_315_200, 1_789_314_600, 0);
+        assert!(
+            verdict.contains("1 of 4 upstreams are suspect right now"),
+            "两个口径都要有名字: {verdict}"
+        );
+        assert!(
+            !verdict.contains("All ") && !verdict.contains("all "),
+            "不能再用「所有 N 个」拿子集说池: {verdict}"
+        );
+        assert!(
+            verdict.contains("2026-09-13"),
+            "时刻要按人能读的形式给出，退回到 unix 也要带值: {verdict}"
+        );
+    }
+
+    /// An upstream that stated only how long its quota window is has still said
+    /// something about the wait. Reporting "no upstream reported a recovery
+    /// time" while dropping that window is true and still reads as a hiccup.
+    #[test]
+    fn a_stated_window_survives_the_absence_of_a_stated_instant() {
+        let verdict = pool_down_verdict(4, &[], 0, 1_789_314_600, 7 * 86_400);
+        assert!(
+            verdict.contains("no upstream reported a recovery time"),
+            "没有时刻就得直说没有: {verdict}"
+        );
+        assert!(
+            verdict.contains("longest upstream-quota window is 7 d"),
+            "只报了窗口的上游不能被漏掉: {verdict}"
+        );
+    }
+
+    /// The event is consumed by processes that may still be running an older
+    /// build, so a payload that predates the field must parse into "not
+    /// reported" rather than failing — a rejected event loses the edge itself,
+    /// and the edge is what tells the consumers the pool went down at all.
+    #[test]
+    fn an_event_without_the_pool_size_still_parses() {
+        let old = r#"{"type":"llm_upstream_pool_down","evidenced_recovery_unix":0,
+                      "next_attempt_unix":1799999400,
+                      "unavailable":["https://a.example.com|m1"],
+                      "timestamp":"2026-09-13T12:00:00Z"}"#;
+        let event: SupervisorEvent = serde_json::from_str(old).expect("old event parses");
+        match event {
+            SupervisorEvent::LlmUpstreamPoolDown {
+                pool_size,
+                quota_window_secs,
+                ..
+            } => {
+                assert_eq!(pool_size, 0);
+                assert_eq!(quota_window_secs, 0);
+            }
+            other => panic!("解析成了别的变体: {other:?}"),
+        }
     }
 
     #[test]

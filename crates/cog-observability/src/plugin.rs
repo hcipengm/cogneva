@@ -527,35 +527,35 @@ fn supervisor_event_to_alert_events(event: &cog_core::SupervisorEvent) -> Vec<Al
             evidenced_recovery_unix,
             next_attempt_unix,
             unavailable,
+            pool_size,
+            quota_window_secs,
             timestamp,
         } => {
             let mut labels = HashMap::new();
             labels.insert("alert_type".into(), "llm_upstream_pool_down".into());
-            labels.insert("unavailable_count".into(), unavailable.len().to_string());
+            // 两个数各占一个标签，名字自带口径：`suspect_count` 是**当刻还在嫌疑
+            // 窗内**的家数（随窗到期自己变小），`pool_size` 才是池有多大。只报前
+            // 者、还把它叫 `unavailable_count`，读的人会以为池就这么大。
+            labels.insert("suspect_count".into(), unavailable.len().to_string());
+            labels.insert("pool_size".into(), pool_size.to_string());
             labels.insert(
                 "evidenced_recovery_unix".into(),
                 evidenced_recovery_unix.to_string(),
             );
             labels.insert("next_attempt_unix".into(), next_attempt_unix.to_string());
+            labels.insert("quota_window_secs".into(), quota_window_secs.to_string());
             labels.insert("unavailable".into(), unavailable.join(","));
-            // 文案统一由映射层写进 `message` 标签：通知出口与 PG 落盘共用同一份
-            // 文本，避免两侧各写一遍导致措辞漂移。
-            //
-            // 两个时刻分开措辞并各占一个标签：上游报的配额恢复时刻是关于上游的
-            // 证据，退避窗到期只是我们下次再试的时刻。把它们合并报成 "earliest
-            // recovery" 会让值班的人以为上游很快回来，而实际上没有任何上游说过
-            // 什么时候恢复。
-            let recovery = if *evidenced_recovery_unix > 0 {
-                format!("earliest upstream-reported recovery unix {evidenced_recovery_unix}")
-            } else {
-                "no upstream reported a recovery time".to_string()
-            };
+            // 文案在契约层只写一次，所有消费者共用同一句：这里和告警历史各写一
+            // 遍就会漂移，而漂移是静默的——两句都读得通，没有一层会报错，读的人
+            // 也无从判断该信哪句。时刻与窗口长度同样由那一句分开措辞。
             labels.insert(
                 "message".into(),
-                format!(
-                    "All {} LLM upstreams unavailable ({recovery}; next attempt unix {})",
-                    unavailable.len(),
-                    next_attempt_unix
+                cog_core::pool_down_verdict(
+                    *pool_size,
+                    unavailable,
+                    *evidenced_recovery_unix,
+                    *next_attempt_unix,
+                    *quota_window_secs,
                 ),
             );
             let inst = AlertInstance {

@@ -158,6 +158,10 @@ impl LlmPoolGuard {
                                     evidenced_recovery_unix: status.evidenced_recovery_unix,
                                     next_attempt_unix: status.next_attempt_unix,
                                     unavailable: status.unavailable_upstreams,
+                                    // 池的大小与窗口长度一起转发：本模块只是搬运，
+                                    // 图里没有配置面，读 event 的那几处更没有。
+                                    pool_size: status.pool_size,
+                                    quota_window_secs: status.quota_window_secs,
                                     timestamp: chrono::Utc::now(),
                                 });
                             }

@@ -1910,6 +1910,12 @@ async fn publish_down(
         evidenced_recovery_unix: bounds.evidenced_unix,
         next_attempt_unix: bounds.next_probe_unix,
         unavailable_upstreams: unavailable,
+        // 池的大小和窗口长度跟着判定一起走。下游还有两个写者（告警历史、通知
+        // 出口）在说同一件事，而它们没有配置面：让它们现算就是第二份判据，且
+        // 它们手上只有 `unavailable_upstreams`——那是**当刻还在嫌疑窗内**的
+        // 子集，会随窗到期自己缩小，报出去就成了"池只有这么大"。
+        pool_size: state.config.llm_upstreams.len(),
+        quota_window_secs: bounds.window_secs,
         // 判定与它的输入同一条载荷、同一次写入：分开写就会有一段时间里
         // 一边说池不可用、另一边说没有证据，读的人无从判断该信哪边。
         upstream_evidence: state.llm_health.evidence(&state.config.llm_upstreams),
@@ -6403,6 +6409,8 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             evidenced_recovery_unix: now + 600,
             next_attempt_unix: now + 600,
             unavailable_upstreams: vec![key.clone()],
+            pool_size: 4,
+            quota_window_secs: 0,
             upstream_evidence: vec![cog_core::LlmUpstreamEvidence {
                 identity: key.clone(),
                 consecutive_failures: 4,
