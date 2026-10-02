@@ -279,7 +279,7 @@ data:
         "batch_persistence_max_changes": 10,
         "batch_persistence_interval_secs": 5,
         "archive_enabled": true,
-        "archive_after_secs": 3600,
+        "archive_after_secs": 172800,
         "archive_poll_interval_secs": 300,
         "result_claim_idle_secs": 600,
         "result_claim_interval_secs": 60,

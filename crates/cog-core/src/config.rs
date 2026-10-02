@@ -241,6 +241,19 @@ pub struct DagExecutorConfig {
     pub archive_enabled: bool,
     /// How long a task must stay in a terminal state before it is
     /// eligible for archival (seconds).
+    ///
+    /// A `Failed` row is not only history: it is the record the retry premise
+    /// reads. The signal watcher re-drives a self-signal task whose previous
+    /// attempt failed, and that branch is only reachable while the row is still
+    /// in the store — a reaped row reads as "no such task" and the retry is
+    /// silently replaced by a fresh submission. So the retention has to outlive
+    /// the wait between two attempts, which is the longest signal cooldown
+    /// (24 h), with a margin for a door missed to a restart: the 48 h default is
+    /// twice that. A shorter retention does not fail loudly — it makes the
+    /// re-drive structurally unreachable, and the reading looks like a system
+    /// with nothing to retry. Anything that lengthens the cooldown has to be
+    /// weighed against this value; `cog-reflection` holds the pair together
+    /// with a gate.
     #[serde(default = "default_archive_after_secs")]
     pub archive_after_secs: u64,
     /// Interval between archive scans (seconds).
@@ -555,7 +568,7 @@ fn default_archive_enabled() -> bool {
     false
 }
 fn default_archive_after_secs() -> u64 {
-    3600
+    172_800
 }
 fn default_archive_poll_interval_secs() -> u64 {
     300

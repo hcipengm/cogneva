@@ -341,6 +341,18 @@ fn intent_action(existing: Option<&TaskStatus>) -> IntentAction {
     }
 }
 
+/// The id a self-audit intent is filed under, stamped with the day it was due.
+///
+/// The stamp is what keeps the audit out of the re-drive premise the signal keys
+/// live under: those re-drive a failed task on the next door, which is why the
+/// store has to hold a failed row for at least one cooldown. An audit's own wait
+/// is a week, and a stable id would put it behind a premise whose record dies
+/// long before the next audit — so each audit is its own task, and an audit that
+/// failed is scheduled again rather than re-driven.
+fn self_audit_task_id(now: DateTime<Utc>) -> String {
+    format!("self-audit-{}", now.format("%Y%m%d"))
+}
+
 /// Result of one submission attempt. "Nothing needed doing" and "the intent
 /// never reached the orchestrator" must stay distinct: conflating them makes an
 /// idempotent hit look like a broken channel, and a broken channel look like
@@ -565,7 +577,7 @@ async fn tick(
         };
         if due {
             dirty = true;
-            let period = now.format("%Y%m%d").to_string();
+            let key = self_audit_task_id(now);
             let goal = "Audit this repository for security and reliability \
                         defects, going over: hardcoded secrets or weak default \
                         credentials, injection surfaces (command/SQL/XSS), \
@@ -575,7 +587,7 @@ async fn tick(
                         its fix; list the remaining findings in the change \
                         description."
                 .to_string();
-            let key = format!("self-audit-{period}");
+            let period = now.format("%Y%m%d").to_string();
             let outcome = submit_intent(
                 orch,
                 key.clone(),
@@ -1090,5 +1102,98 @@ mod tests {
             forwarded.chars().count()
         );
         assert!(forwarded.ends_with('…'));
+    }
+
+    fn shipped_document(path: &str) -> serde_json::Value {
+        let full = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(path);
+        let text = std::fs::read_to_string(&full)
+            .unwrap_or_else(|e| panic!("{} is unreadable: {e}", full.display()));
+        serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("{} is not JSON: {e}", full.display()))
+    }
+
+    /// The pair as the deployment loads it: the document's own cooldown when the
+    /// section is there, the code default when it is not — the resolution
+    /// `SignalWatcherConfig::load` performs, reproduced rather than trusted.
+    fn retention_and_wait(document: &serde_json::Value) -> (bool, u64, i64) {
+        let enabled = document["dag_executor"]["archive_enabled"]
+            .as_bool()
+            .expect("dag_executor.archive_enabled");
+        let retention = document["dag_executor"]["archive_after_secs"]
+            .as_u64()
+            .expect("dag_executor.archive_after_secs");
+        let wait = document
+            .pointer("/self_evolution/signal_watcher/report_cooldown_secs")
+            .and_then(|v| v.as_i64())
+            .unwrap_or_else(|| SignalWatcherConfig::default().report_cooldown_secs);
+        (enabled, retention, wait)
+    }
+
+    /// A failed row is the record the re-drive reads, and the store reaps it.
+    ///
+    /// `intent_action` re-drives a task whose previous attempt failed, and that
+    /// branch is only reachable while the row is still in the store: a reaped
+    /// row reads as "no such task", the signal goes out as new work, and the
+    /// re-drive happens never — not late, never. The store reaps terminal rows
+    /// after `dag_executor.archive_after_secs` and the wait between two attempts
+    /// on one signal is `report_cooldown_secs`; neither component reads the
+    /// other's number, so the comparison lives here, at the premise. It is read
+    /// out of the documents the deployment ships, because a value that never
+    /// reaches a cluster holds nothing together. Twice the wait, so a door
+    /// missed to a restart still finds its record.
+    #[test]
+    fn the_store_outlives_the_re_drive_window_it_gates() {
+        let shipped = [
+            ("chart", "deploy/helm/cogneva/files/cogneva.json"),
+            ("example", "cogneva.example.json"),
+        ];
+        let mut cases: Vec<(String, bool, u64, i64)> = shipped
+            .iter()
+            .map(|(name, path)| {
+                let (enabled, retention, wait) = retention_and_wait(&shipped_document(path));
+                ((*name).to_string(), enabled, retention, wait)
+            })
+            .collect();
+        let defaults = cog_core::Config::default().dag_executor;
+        // 归档开关默认关，可只要有人在配置里写上 `archive_enabled: true`
+        // 而不写保留期，留下的这个默认值就是那把尺子——所以它也在这里量。
+        cases.push((
+            "code defaults, archival on".into(),
+            true,
+            defaults.archive_after_secs,
+            SignalWatcherConfig::default().report_cooldown_secs,
+        ));
+
+        for (name, enabled, retention, wait) in cases {
+            if !enabled {
+                continue;
+            }
+            assert!(
+                retention as i64 >= 2 * wait,
+                "{name}: 归档窗口 {retention}s 不足重驱动窗口 {wait}s 的两倍——失败行会在门再开之前被回收，\
+                 而 Redrive 只在行还在时可达，「重试」于是静默变成「重新提交」"
+            );
+        }
+    }
+
+    /// The audit's id carries the day it was due for, which is what keeps it out
+    /// of the premise above: with a stable id an audit would be re-driven a week
+    /// later against a record the store reaped days earlier.
+    #[test]
+    fn the_audit_id_carries_its_period() {
+        let monday = DateTime::parse_from_rfc3339("2026-10-05T03:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let same_day = DateTime::parse_from_rfc3339("2026-10-05T23:59:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let next_day = DateTime::parse_from_rfc3339("2026-10-06T03:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert_eq!(self_audit_task_id(monday), self_audit_task_id(same_day));
+        assert_ne!(self_audit_task_id(monday), self_audit_task_id(next_day));
     }
 }
