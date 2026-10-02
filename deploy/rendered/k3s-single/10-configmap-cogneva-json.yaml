@@ -500,12 +500,12 @@ data:
             },
             {
               "name": "pod_restarting_repeatedly",
-              "promql": "max_over_time(kube_pod_container_status_restarts_total[6h]) - min_over_time(kube_pod_container_status_restarts_total[6h])",
+              "promql": "changes(kube_pod_container_status_restarts_total[6h])",
               "condition": {
                 "greater_than": 2.0
               },
               "severity": "warning",
-              "summary": "A container restarted more than twice in 6h ({value}). The fast rule needs five inside 15m, so a container that comes back and dies again every hour or two trips nothing -- clickhouse did exactly that for an hour. A planned spec change restarts a container once, so a third return means something is killing it; kube_pod_container_status_last_terminated_reason names what. Counted as the window's max minus its min rather than with increase(): that one extrapolates a short series across the whole window, so a container that had restarted once was reported as two, and the rule could only cross its threshold in the last seconds before the samples aged out -- it fired six hours after the burst, on a pod that no longer existed"
+              "summary": "A container restarted more than twice in 6h ({value}). The fast rule needs five inside 15m, so a container that comes back and dies again every hour or two trips nothing -- clickhouse did exactly that for an hour. A planned spec change restarts a container once, so a third return means something is killing it; kube_pod_container_status_last_terminated_reason names what. Counted with changes() rather than increase(): that one extrapolates a short series across the whole window, so a container that had restarted once was reported as two, and the rule could only cross its threshold in the last seconds before the samples aged out -- it fired six hours after the burst, on a pod that no longer existed. changes() reads the increments that were actually observed, and understates the count only when two restarts land inside one scrape interval, which is the fast rule's business"
             },
             {
               "name": "pod_oom_killed",
