@@ -578,15 +578,19 @@ struct UpstreamHealth {
 /// 池内两个恢复上界，来源不同、结论强度也不同，因此分开持有而不是先取 min
 /// 再当"最早恢复"播报。
 ///
-/// * `evidenced_unix`：某个嫌疑上游**自己报告**的配额恢复时刻里最早的一个。
-///   这是关于上游状态的证据。
-/// * `next_probe_unix`：我们自己的嫌疑窗到期时刻里最早的一个。这只是"我们下次
-///   会再试一次"，对上游会不会恢复没有任何断言。
-/// * `window_secs`：某个嫌疑上游**自己报告**的配额窗口长度里最长的那个。上游只说
+/// * `evidenced_unix`：某个上游**自己报告**的、**尚未过去**的配额恢复时刻里最早的
+///   一个。这是关于上游状态的证据。
+/// * `next_probe_unix`：我们自己的**未到期**嫌疑窗所对应的探测时刻里最早的一个；
+///   某家上游报过一个**已经过去**的复位时刻时，「现在」也进这一侧。两者都只是
+///   "我们下次会再试一次"，对上游会不会恢复没有任何断言。
+/// * `window_secs`：某个上游**自己报告**的配额窗口长度里最长的那个。上游只说
 ///   "周窗口走完才复位"时没有时刻可报，此时它是唯一关于"还有多久"的说法；0 表示
 ///   没有上游报过窗口。
 ///
-/// 三者都为 0 表示池内没有嫌疑上游。
+/// 两条证据（`evidenced_unix`、`window_secs`）按**证据本身**取舍，不按我们的嫌疑窗
+/// 是否还开着——窗到期只说明"值得再试一次"。`next_probe_unix` 才按窗取舍。
+/// 三者都为 0 表示池内既没有未到期的嫌疑窗，也没有上游报过恢复证据（尚未过去的
+/// 时刻、窗口长度都算），也没有哪家报过已过去的复位时刻。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct RecoveryBounds {
     evidenced_unix: i64,
@@ -784,16 +788,31 @@ impl LlmHealthTable {
             let Some(h) = states.get(&Self::key(u)) else {
                 continue;
             };
-            let Some(until) = h.suspect_until else {
-                continue;
-            };
-            if now_instant >= until {
-                continue;
+            // 探测节拍只由**未到期**的嫌疑窗决定：它答的是"我们下次什么时候再试"，
+            // 窗已到期就是在催着我们试，不是我们已经有节拍了。
+            if let Some(until) = h.suspect_until {
+                if now_instant < until {
+                    let probe = now_unix + until.duration_since(now_instant).as_secs() as i64;
+                    bounds.next_probe_unix = earlier_known(bounds.next_probe_unix, probe);
+                }
             }
-            let probe = now_unix + until.duration_since(now_instant).as_secs() as i64;
-            bounds.next_probe_unix = earlier_known(bounds.next_probe_unix, probe);
+            // 上游自述的恢复证据不挂在我们的嫌疑窗上：窗到期只说明"值得再试一次"
+            // （同 `snapshot` 那条规则），不是上游说过的话被撤销。挂上去的话，一个
+            // 上游的窗一到期，池的 horizon 就静默缩成"此刻仍在窗内的那几家"——池报
+            // 的窗口长度会变成窗内最短的那家，而另一家自述过的复位时刻整个消失，
+            // 于是池明明有 4 家、3 家报过复位时刻，读数却是 1 家、没有恢复时刻。
+            // 已经过去的复位时刻不报：它是一个曾经说过、当刻已不该再当上界用的数。
             if let Some(reset) = h.quota_reset_unix {
-                bounds.evidenced_unix = earlier_known(bounds.evidenced_unix, reset);
+                if reset > now_unix {
+                    bounds.evidenced_unix = earlier_known(bounds.evidenced_unix, reset);
+                } else {
+                    // 已经过去的复位时刻不是"上游将来会恢复"的证据（不能当上界播），
+                    // 但它是"现在就可以再试"的信号。它要落回**节拍**这一侧，不能从
+                    // 两个读数里一起消失：`next_attempt_unix` 取两者的更早值，抹掉它
+                    // 会让 `Retry-After` 从"现在"变成最长 6 小时的退避，把本可立刻成功
+                    // 的调用劝退更久——那是比本缺陷更贵的退化。
+                    bounds.next_probe_unix = earlier_known(bounds.next_probe_unix, now_unix);
+                }
             }
             // 取最长的那个：池里只要有一个上游报的是周窗口，池的恢复 horizon
             // 就不会短于一周，报最短会把它的处境说轻。
@@ -1934,6 +1953,57 @@ async fn publish_up(conn: &mut redis::aio::ConnectionManager) -> bool {
     }
 }
 
+/// 池不可用那一行的判词。抽成纯函数是为了让第二个读者能读它：这段话以前只被人
+/// 读，没有任何断言拦得住"把当刻嫌疑数说成池的大小"。
+///
+/// 两个数各自说清口径：`down` 是**池级**判定，且按设计只由"上游实证成功"解除
+/// （退避窗到期不解除），所以它常常在只剩少数几家窗还开着时仍然为真；而嫌疑窗
+/// 内那几家是一个**当刻**读数。把后者写进"所有 N 个 LLM 上游"这句话里，读告警
+/// 的人会以为池就这么大，而池里另外几家的处境（包括它们自述过的复位时刻）就被
+/// 这句话盖掉了。
+fn pool_down_message(pool_size: usize, unavailable: &[String], bounds: &RecoveryBounds) -> String {
+    // 两种上界分开措辞：上游报了配额恢复时刻就是一条关于上游的事实，只够说明
+    // "我们下次会再试"的退避节拍不能借"恢复"这个词播出去，否则读告警的人会以为
+    // 上游一分钟后就回来。上游自述的窗口长度（只有窗口、没有时刻时才有的那一条）
+    // 一并带上：它是"还要多久"的唯一说法，漏掉它，一次周窗口用尽会被读成短暂抖动。
+    let window_note = if bounds.window_secs > 0 {
+        format!(
+            "，池内上游自述的配额窗口最长 {} 天",
+            bounds.window_secs / 86_400
+        )
+    } else {
+        String::new()
+    };
+    let recovery_note = match bounds.evidenced_unix {
+        0 => format!(
+            "没有任何上游报告恢复时刻{}，{} 起按退避节拍重试",
+            window_note,
+            unix_to_rfc3339(bounds.next_probe_unix)
+        ),
+        evidenced => format!(
+            "上游报告的最早恢复时刻 {}{}，退避重试节拍 {}",
+            unix_to_rfc3339(evidenced),
+            window_note,
+            unix_to_rfc3339(bounds.next_probe_unix)
+        ),
+    };
+    // 池内一家都不在窗内时不说"此刻仍有 0 个"：那是锁存态与窗到期之间的正常
+    // 间隙，说成 0 会让人以为读数坏了。
+    let suspect_note = if unavailable.is_empty() {
+        "，此刻没有上游处在嫌疑窗内".to_string()
+    } else {
+        format!(
+            "，此刻仍有 {} 个处在嫌疑窗内：{}",
+            unavailable.len(),
+            unavailable.join("、")
+        )
+    };
+    format!(
+        "LLM 上游池不可用（池内 {pool_size} 个上游{suspect_note}）（{recovery_note}）；\
+         LLM 依赖型任务已暂停，请补充可联通的上游"
+    )
+}
+
 /// 推进 PG 告警状态机（幂等）。每拍调用，让 PG 里的告警状态始终是池状态的投影；
 /// Fired/Resolved 各打一条日志——告警历史落在 PG，重启后仍可查。
 async fn sync_pool_alert(state: &AppState, down: bool) {
@@ -1950,37 +2020,22 @@ async fn sync_pool_alert(state: &AppState, down: bool) {
         .filter(|u| state.llm_health.is_suspect(u))
         .map(LlmHealthTable::key)
         .collect();
-    // 两种上界分开措辞：上游报了配额恢复时刻就是一条关于上游的事实，只够说明
-    // "我们下次会再试"的退避节拍不能借"恢复"这个词播出去，否则读告警的人会以为
-    // 上游一分钟后就回来。
-    let recovery_note = match bounds.evidenced_unix {
-        0 => format!(
-            "没有任何上游报告恢复时刻，{} 起按退避节拍重试",
-            unix_to_rfc3339(bounds.next_probe_unix)
-        ),
-        evidenced => format!(
-            "上游报告的最早恢复时刻 {}，退避重试节拍 {}",
-            unix_to_rfc3339(evidenced),
-            unix_to_rfc3339(bounds.next_probe_unix)
-        ),
-    };
+    let pool_size = state.config.llm_upstreams.len();
     let alert = NewAlert {
         rule: "llm_upstream_pool_down".into(),
         dedup_key: "llm_upstream_pool_down".into(),
         severity: "critical".into(),
         message: if down {
-            format!(
-                "所有 {} 个 LLM 上游不可用（{}）；LLM 依赖型任务已暂停，请补充可联通的上游",
-                unavailable.len(),
-                recovery_note
-            )
+            pool_down_message(pool_size, &unavailable, &bounds)
         } else {
             "LLM 上游池已恢复，LLM 依赖型任务自动继续".into()
         },
         labels: serde_json::json!({
             "unavailable": unavailable,
+            "pool_size": pool_size,
             "evidenced_recovery_unix": bounds.evidenced_unix,
             "next_attempt_unix": bounds.next_probe_unix,
+            "quota_window_secs": bounds.window_secs,
         }),
     };
     match alerts.set_alert(down, &alert).await {
@@ -1988,7 +2043,7 @@ async fn sync_pool_alert(state: &AppState, down: bool) {
             tracing::error!(
                 evidenced_recovery_unix = bounds.evidenced_unix,
                 next_attempt_unix = bounds.next_probe_unix,
-                note = %recovery_note,
+                note = %alert.message,
                 "池全灭告警已落 PG（firing）"
             );
         }
@@ -5589,6 +5644,105 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         table.note_failure(&v, 300, None, Some(86_400));
         let bounds = table.recovery_bounds(&[u, v]);
         assert_eq!(bounds.window_secs, 7 * 86_400);
+    }
+
+    /// 上游自述的恢复证据不挂在我们的嫌疑窗上。
+    ///
+    /// 现场形状（2026-10-02 实测）：池内 4 家全配额耗尽，3 家报过复位时刻
+    /// （今天 16:00Z、次日、再次日），第 4 家只报"周窗口"；滚动重启后，那 3 家的
+    /// 嫌疑窗已经到期、只剩第 4 家还在窗内。若两条证据都按"窗还开着"取舍，池级
+    /// 读数就会缩成"1 家、没有恢复时刻"，而告警判词又把"1"写成"所有 N 个上游"
+    /// ——池明明还有另外 3 家的处境可读。
+    #[test]
+    fn reported_recovery_survives_our_own_window_expiring() {
+        let table = LlmHealthTable::default();
+        let with_reset = stub_upstream("https://reset.example.com", "m1");
+        let window_only = stub_upstream("https://window.example.com", "m2");
+        let pool = vec![with_reset.clone(), window_only.clone()];
+        let reset = Utc::now().timestamp() + 7_200;
+
+        table.note_failure(&with_reset, 300, Some(reset), Some(86_400));
+        table.note_failure(&window_only, 300, None, Some(7 * 86_400));
+        assert!(table.all_suspect(&pool));
+        assert_eq!(table.recovery_bounds(&pool).evidenced_unix, reset);
+
+        // 把两家的窗都推到过去：模拟"窗到期了、还没被再探一次"。
+        {
+            let mut states = table.states.lock().unwrap();
+            for u in &pool {
+                if let Some(h) = states.get_mut(&LlmHealthTable::key(u)) {
+                    h.suspect_until =
+                        Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+                }
+            }
+        }
+        let bounds = table.recovery_bounds(&pool);
+        assert_eq!(
+            bounds.evidenced_unix, reset,
+            "上游报过的复位时刻是它自己的证据，不该随我们的退避窗一起到期"
+        );
+        assert_eq!(
+            bounds.window_secs,
+            7 * 86_400,
+            "窗口长度是池的 horizon，取最长的那家"
+        );
+        assert_eq!(
+            bounds.next_probe_unix, 0,
+            "探测节拍相反：窗都到期了就没有'下次的钟'，那是在催我们试"
+        );
+        assert!(
+            pool_down_message(pool.len(), &[], &bounds).contains("7 天"),
+            "只有窗口、没有时刻时，窗口长度是'还要多久'的唯一说法，判词必须带上"
+        );
+
+        // 已经过去的复位时刻不再当上界：它是个曾经说过、当刻已不该再播的数。
+        {
+            let mut states = table.states.lock().unwrap();
+            let h = states.get_mut(&LlmHealthTable::key(&with_reset)).unwrap();
+            h.quota_reset_unix = Some(Utc::now().timestamp() - 60);
+        }
+        let bounds = table.recovery_bounds(&pool);
+        assert_eq!(bounds.evidenced_unix, 0);
+        // 两家的窗都已到期，所以这里没有"下次的钟"；非零只能来自那条已经过去的
+        // 复位时刻——它说的是"现在就值得再试"。它不该从两个读数里一起消失：
+        // 抹掉它，`Retry-After` 会从"现在"变成最长 6 小时的退避。
+        assert!(
+            bounds.next_probe_unix > 0,
+            "一个已经过去的复位时刻要说'现在可以再试'，不能两个读数里都没有它"
+        );
+    }
+
+    /// 池级锁存判定与当刻嫌疑集合是两个口径，判词不能把后者说成池的大小。
+    #[test]
+    fn pool_down_message_names_both_scopes() {
+        let bounds = RecoveryBounds {
+            evidenced_unix: 1_790_956_800,
+            next_probe_unix: 1_790_936_536,
+            window_secs: 7 * 86_400,
+        };
+        let msg = pool_down_message(
+            4,
+            &["https://api.example.com/coding/v1|kimi-k3".to_string()],
+            &bounds,
+        );
+        assert!(msg.contains("池内 4 个上游"), "{msg}");
+        assert!(
+            msg.contains("此刻仍有 1 个处在嫌疑窗内"),
+            "当刻嫌疑数必须自报口径，不能被写成池的大小：{msg}"
+        );
+        assert!(
+            !msg.contains("所有 1 个"),
+            "锁存态 + 当刻嫌疑集两个口径混进一句话，读告警的人会以为池就这么大：{msg}"
+        );
+        assert!(
+            msg.contains("2026-10-02T16:00:00+00:00"),
+            "上游报过的复位时刻要在判词里，那才是'什么时候回来'的证据：{msg}"
+        );
+
+        // 一家都不在窗内：锁存仍为真，但判词不能说"0 个上游"。
+        let msg = pool_down_message(4, &[], &RecoveryBounds::default());
+        assert!(msg.contains("此刻没有上游处在嫌疑窗内"), "{msg}");
+        assert!(msg.contains("没有任何上游报告恢复时刻"), "{msg}");
     }
 
     #[test]
