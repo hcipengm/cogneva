@@ -169,6 +169,18 @@ mod tests {
             "the silence has to stay one series per consumer so the alert can name \
              the one that stalled: {promql}"
         );
+        // The left side keeps its labels, so the bound has to reach it as a
+        // scalar: an aggregation without a by/without clause is a vector whose
+        // label set is empty, and vector-to-vector comparison only pairs up
+        // entries whose label sets are equal. Every labelled series on the
+        // left then has no partner, the comparison yields nothing, and the
+        // rule is one that can never fire -- the shape is valid PromQL, so
+        // nothing upstream reports it.
+        assert!(
+            promql.contains("scalar("),
+            "the bound has to be a scalar, or the labelled left side finds no \
+             partner to compare against and the rule is silent for good: {promql}"
+        );
         let summary = rule["summary"].as_str().unwrap_or_default();
         for placeholder in ["{stream}", "{consumer_group}"] {
             assert!(

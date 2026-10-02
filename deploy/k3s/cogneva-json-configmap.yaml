@@ -787,7 +787,7 @@ data:
             },
             {
               "name": "stream_consumer_stalled",
-              "promql": "cogneva_stream_read_silent_seconds > 12 * max(cogneva_stream_read_block_seconds)",
+              "promql": "cogneva_stream_read_silent_seconds > scalar(12 * max(cogneva_stream_read_block_seconds))",
               "condition": {
                 "greater_than": 0.0
               },
