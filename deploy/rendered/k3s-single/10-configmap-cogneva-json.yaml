@@ -536,7 +536,7 @@ data:
             },
             {
               "name": "aof_repair_gave_up_bytes",
-              "promql": "cogneva_aof_repair_dropped_bytes > 0",
+              "promql": "max without (pod, container, instance) (cogneva_aof_repair_dropped_bytes) > 0",
               "condition": {
                 "greater_than": 0.0
               },
@@ -545,7 +545,7 @@ data:
             },
             {
               "name": "aof_repair_untouched_torn_tail",
-              "promql": "cogneva_aof_repair_untouched_torn_tail_bytes > 0",
+              "promql": "max without (pod, container, instance) (cogneva_aof_repair_untouched_torn_tail_bytes) > 0",
               "condition": {
                 "greater_than": 0.0
               },
@@ -554,7 +554,7 @@ data:
             },
             {
               "name": "aof_repair_suspected_interior_holes",
-              "promql": "cogneva_aof_repair_suspected_interior_holes > 0",
+              "promql": "max without (pod, container, instance) (cogneva_aof_repair_suspected_interior_holes) > 0",
               "condition": {
                 "greater_than": 0.0
               },
@@ -563,7 +563,7 @@ data:
             },
             {
               "name": "aof_repair_unhandled_layout",
-              "promql": "cogneva_aof_repair_unhandled_layout > 0",
+              "promql": "max without (pod, container, instance) (cogneva_aof_repair_unhandled_layout) > 0",
               "condition": {
                 "greater_than": 0.0
               },
@@ -572,7 +572,7 @@ data:
             },
             {
               "name": "aof_repair_verdict_absent",
-              "promql": "cogneva_aof_repair_verdict_published < 1",
+              "promql": "max without (pod, container, instance) (cogneva_aof_repair_verdict_published) < 1",
               "condition": {
                 "less_than": 1.0
               },
@@ -599,7 +599,7 @@ data:
             },
             {
               "name": "ralph_loop_terminations_high",
-              "promql": "increase(ralph_terminations_total[30m])",
+              "promql": "sum without (pod, container, instance) (increase(ralph_terminations_total[30m]))",
               "condition": {
                 "greater_than": 20.0
               },
@@ -608,7 +608,7 @@ data:
             },
             {
               "name": "declared_failure_class_unrecorded",
-              "promql": "collab_classification_unreachable",
+              "promql": "max without (pod, container, instance) (collab_classification_unreachable)",
               "condition": {
                 "greater_than": 0.0
               },
@@ -626,7 +626,7 @@ data:
             },
             {
               "name": "self_evolution_yields_no_change",
-              "promql": "increase(self_evolution_change_yield_total{outcome=~\"no_artifacts|submit_failed\"}[6h])",
+              "promql": "sum without (pod, container, instance) (increase(self_evolution_change_yield_total{outcome=~\"no_artifacts|submit_failed\"}[6h]))",
               "condition": {
                 "greater_than": 2.0
               },
@@ -653,7 +653,7 @@ data:
             },
             {
               "name": "governance_ceiling_not_enforced",
-              "promql": "(min_over_time(cogneva_governance_drift_fields[30m]) > 0) and (count_over_time(cogneva_governance_drift_fields[1h]) > count_over_time(cogneva_governance_drift_fields[30m]))",
+              "promql": "(max without (pod, container, instance) (min_over_time(cogneva_governance_drift_fields[30m])) > 0) and (max without (pod, container, instance) (count_over_time(cogneva_governance_drift_fields[1h])) > max without (pod, container, instance) (count_over_time(cogneva_governance_drift_fields[30m])))",
               "condition": {
                 "greater_than": 0.0
               },
@@ -680,7 +680,7 @@ data:
             },
             {
               "name": "trace_tier_demotion_stalled",
-              "promql": "(min_over_time(cogneva_trace_tier_overdue[3h]) > 0) and (count_over_time(cogneva_trace_tier_overdue[6h]) > count_over_time(cogneva_trace_tier_overdue[3h]))",
+              "promql": "(max without (pod, container, instance) (min_over_time(cogneva_trace_tier_overdue[3h])) > 0) and (max without (pod, container, instance) (count_over_time(cogneva_trace_tier_overdue[6h])) > max without (pod, container, instance) (count_over_time(cogneva_trace_tier_overdue[3h])))",
               "condition": {
                 "greater_than": 0.0
               },
@@ -698,7 +698,7 @@ data:
             },
             {
               "name": "trace_tier_migration_failing",
-              "promql": "increase(cogneva_trace_tier_pass_failures_total[1h])",
+              "promql": "sum without (pod, container, instance) (increase(cogneva_trace_tier_pass_failures_total[1h]))",
               "condition": {
                 "greater_than": 0.0
               },
@@ -707,7 +707,7 @@ data:
             },
             {
               "name": "stream_pending_unreclaimed",
-              "promql": "cogneva_stream_pending_unreclaimed_oldest_idle_seconds > 2 * cogneva_stream_pending_claim_idle_seconds",
+              "promql": "max without (pod, container, instance) (cogneva_stream_pending_unreclaimed_oldest_idle_seconds) > 2 * max without (pod, container, instance) (cogneva_stream_pending_claim_idle_seconds)",
               "condition": {
                 "greater_than": 0.0
               },
@@ -716,7 +716,7 @@ data:
             },
             {
               "name": "stream_pending_measure_stale",
-              "promql": "time() - max by (stream, pod) (cogneva_stream_pending_measure_last_seconds) > 6 * max by (stream, pod) (cogneva_stream_pending_measure_interval_seconds)",
+              "promql": "time() - max by (stream) (cogneva_stream_pending_measure_last_seconds) > 6 * max by (stream) (cogneva_stream_pending_measure_interval_seconds)",
               "condition": {
                 "greater_than": 0.0
               },
@@ -725,7 +725,7 @@ data:
             },
             {
               "name": "stream_pending_measure_failing",
-              "promql": "increase(cogneva_stream_pending_measure_failures_total[1h])",
+              "promql": "sum without (pod, container, instance) (increase(cogneva_stream_pending_measure_failures_total[1h]))",
               "condition": {
                 "greater_than": 0.0
               },
@@ -770,7 +770,7 @@ data:
             },
             {
               "name": "runtime_asset_not_refreshed",
-              "promql": "cogneva_runtime_asset_state{state=\"not_refreshed\"} > 0",
+              "promql": "max without (pod, container, instance) (cogneva_runtime_asset_state{state=\"not_refreshed\"}) > 0",
               "condition": {
                 "greater_than": 0.0
               },
@@ -779,7 +779,7 @@ data:
             },
             {
               "name": "runtime_asset_content_drift",
-              "promql": "cogneva_runtime_asset_state{state=\"content_drift\"} > 0",
+              "promql": "max without (pod, container, instance) (cogneva_runtime_asset_state{state=\"content_drift\"}) > 0",
               "condition": {
                 "greater_than": 0.0
               },
@@ -788,7 +788,7 @@ data:
             },
             {
               "name": "runtime_asset_manifest_absent",
-              "promql": "cogneva_runtime_asset_manifest_absent > 0",
+              "promql": "max without (pod, container, instance) (cogneva_runtime_asset_manifest_absent) > 0",
               "condition": {
                 "greater_than": 0.0
               },
@@ -797,7 +797,7 @@ data:
             },
             {
               "name": "stream_consumer_stalled",
-              "promql": "cogneva_stream_read_silent_seconds > 12 * max(cogneva_stream_read_block_seconds)",
+              "promql": "max without (pod, container, instance) (cogneva_stream_read_silent_seconds) > 12 * max(cogneva_stream_read_block_seconds)",
               "condition": {
                 "greater_than": 0.0
               },
@@ -806,7 +806,7 @@ data:
             },
             {
               "name": "runtime_asset_manifest_unusable",
-              "promql": "cogneva_runtime_asset_manifest_unusable > 0",
+              "promql": "max without (pod, container, instance) (cogneva_runtime_asset_manifest_unusable) > 0",
               "condition": {
                 "greater_than": 0.0
               },
@@ -932,7 +932,7 @@ data:
             },
             {
               "name": "series_held_without_producer",
-              "promql": "cogneva_metric_held_without_producer",
+              "promql": "max without (pod, container, instance) (cogneva_metric_held_without_producer)",
               "condition": {
                 "greater_than": 0.0
               },
@@ -941,7 +941,7 @@ data:
             },
             {
               "name": "held_series_check_unreadable",
-              "promql": "cogneva_metric_held_unreadable",
+              "promql": "max without (pod, container, instance) (cogneva_metric_held_unreadable)",
               "condition": {
                 "greater_than": 0.0
               },
@@ -986,7 +986,7 @@ data:
             },
             {
               "name": "build_cache_cap_unmet",
-              "promql": "cogneva_build_target_unmet_bytes > 0",
+              "promql": "max without (pod, container, instance) (cogneva_build_target_unmet_bytes) > 0",
               "condition": {
                 "greater_than": 0.0
               },
@@ -1040,7 +1040,7 @@ data:
             },
             {
               "name": "background_loop_stalled",
-              "promql": "(cogneva_loop_tick_age_seconds > 6 * cogneva_loop_period_seconds) and (cogneva_loop_period_seconds > 0)",
+              "promql": "(max without (pod, container, instance) (cogneva_loop_tick_age_seconds) > 6 * max without (pod, container, instance) (cogneva_loop_period_seconds)) and (max without (pod, container, instance) (cogneva_loop_period_seconds) > 0)",
               "condition": {
                 "greater_than": 0.0
               },
@@ -1049,7 +1049,7 @@ data:
             },
             {
               "name": "background_loop_died",
-              "promql": "cogneva_loop_deaths_total > 0",
+              "promql": "sum without (pod, container, instance) (cogneva_loop_deaths_total) > 0",
               "condition": {
                 "greater_than": 0.0
               },
@@ -1094,7 +1094,7 @@ data:
             },
             {
               "name": "notification_delivery_failing",
-              "promql": "sum by (outlet, result, pod) (increase(cogneva_notification_delivery_total{result!=\"ok\"}[1h])) > 0",
+              "promql": "sum by (outlet, result) (increase(cogneva_notification_delivery_total{result!=\"ok\"}[1h])) > 0",
               "condition": {
                 "greater_than": 0.0
               },
@@ -1112,7 +1112,7 @@ data:
             },
             {
               "name": "registry_maintenance_round_incomplete",
-              "promql": "increase(cogneva_registry_maintenance_runs_total[1h]) > 0 and (time() - cogneva_registry_maintenance_reading_unix) > 3600",
+              "promql": "sum without (pod, container, instance) (increase(cogneva_registry_maintenance_runs_total[1h])) > 0 and (time() - max without (pod, container, instance) (cogneva_registry_maintenance_reading_unix)) > 3600",
               "condition": {
                 "greater_than": 0.0
               },
@@ -1121,7 +1121,7 @@ data:
             },
             {
               "name": "registry_tag_deletion_refused",
-              "promql": "increase(cogneva_registry_prune_failures_total[1h]) > 0",
+              "promql": "sum without (pod, container, instance) (increase(cogneva_registry_prune_failures_total[1h])) > 0",
               "condition": {
                 "greater_than": 0.0
               },
@@ -1130,7 +1130,7 @@ data:
             },
             {
               "name": "llm_usage_verdict_unmeasured",
-              "promql": "(max_over_time(llm_usage_verdict_measured{upstream=~\".+\"}[1h]) == 0) and on (upstream) (max_over_time(llm_upstream_healthy{upstream=~\".+\"}[1h]) == 1)",
+              "promql": "(max without (pod, container, instance) (max_over_time(llm_usage_verdict_measured{upstream=~\".+\"}[1h])) == 0) and on (upstream) (max without (pod, container, instance) (max_over_time(llm_upstream_healthy{upstream=~\".+\"}[1h])) == 1)",
               "condition": {
                 "less_than": 1.0
               },
