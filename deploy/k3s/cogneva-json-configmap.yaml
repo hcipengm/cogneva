@@ -445,39 +445,39 @@ data:
           "rules": [
             {
               "name": "node_disk_usage_high",
-              "promql": "100 - 100 * node_filesystem_avail_bytes{mountpoint=\"/\", fstype=~\"ext4|xfs|overlay\"} / node_filesystem_size_bytes{mountpoint=\"/\", fstype=~\"ext4|xfs|overlay\"}",
+              "promql": "max without (pod, container) (100 - 100 * node_filesystem_avail_bytes{mountpoint=\"/\", fstype=~\"ext4|xfs|overlay\"} / node_filesystem_size_bytes{mountpoint=\"/\", fstype=~\"ext4|xfs|overlay\"})",
               "condition": {
                 "greater_than": 75.0
               },
               "severity": "warning",
-              "summary": "node root filesystem usage above 75% (current {value}%)"
+              "summary": "node root filesystem usage above 75% (current {value}%) The publishing pod is a scrape detail, not the subject: it is deleted and recreated with every monitoring rollout, so it is aggregated out while the label naming the subject is left untouched."
             },
             {
               "name": "node_disk_usage_critical",
-              "promql": "100 - 100 * node_filesystem_avail_bytes{mountpoint=\"/\", fstype=~\"ext4|xfs|overlay\"} / node_filesystem_size_bytes{mountpoint=\"/\", fstype=~\"ext4|xfs|overlay\"}",
+              "promql": "max without (pod, container) (100 - 100 * node_filesystem_avail_bytes{mountpoint=\"/\", fstype=~\"ext4|xfs|overlay\"} / node_filesystem_size_bytes{mountpoint=\"/\", fstype=~\"ext4|xfs|overlay\"})",
               "condition": {
                 "greater_than": 85.0
               },
               "severity": "critical",
-              "summary": "node root filesystem usage above 85% (current {value}%); kubelet eviction starts soon"
+              "summary": "node root filesystem usage above 85% (current {value}%); kubelet eviction starts soon The publishing pod is a scrape detail, not the subject: it is deleted and recreated with every monitoring rollout, so it is aggregated out while the label naming the subject is left untouched."
             },
             {
               "name": "node_disk_pressure",
-              "promql": "kube_node_status_condition{condition=\"DiskPressure\", status=\"true\"}",
+              "promql": "max without (pod, container, instance) (kube_node_status_condition{condition=\"DiskPressure\", status=\"true\"})",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "critical",
-              "summary": "kubelet reports DiskPressure; pods are being evicted"
+              "summary": "kubelet reports DiskPressure; pods are being evicted The publishing pod is a scrape detail, not the subject: it is deleted and recreated with every monitoring rollout, so it is aggregated out while the label naming the subject is left untouched."
             },
             {
               "name": "node_memory_pressure",
-              "promql": "kube_node_status_condition{condition=\"MemoryPressure\", status=\"true\"}",
+              "promql": "max without (pod, container, instance) (kube_node_status_condition{condition=\"MemoryPressure\", status=\"true\"})",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "kubelet reports MemoryPressure"
+              "summary": "kubelet reports MemoryPressure The publishing pod is a scrape detail, not the subject: it is deleted and recreated with every monitoring rollout, so it is aggregated out while the label naming the subject is left untouched."
             },
             {
               "name": "pod_restarting_fast",
@@ -580,12 +580,12 @@ data:
             },
             {
               "name": "sandbox_command_oom_killed",
-              "promql": "increase(sandbox_oom_kills_total[30m])",
+              "promql": "sum by (namespace) (increase(sandbox_oom_kills_total[30m]))",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "The sandbox container's memory limit killed {value} command(s) in the last 30m. A child process dying here leaves the container itself running, so nothing reaches the container-level OOMKilled signal, and the build that died reads downstream as an ordinary failure with empty output; a command that keeps dying at the limit needs a bigger limit, not a different change"
+              "summary": "The sandbox container's memory limit killed {value} command(s) in the last 30m. A child process dying here leaves the container itself running, so nothing reaches the container-level OOMKilled signal, and the build that died reads downstream as an ordinary failure with empty output; a command that keeps dying at the limit needs a bigger limit, not a different change The count is summed across the processes that publish it rather than read per process: each process counts only its own, so the sum is what the deployment did, and the row stays keyed on the subject above instead of on a pod the next rollout deletes."
             },
             {
               "name": "ralph_loop_terminations_high",
@@ -814,12 +814,12 @@ data:
             },
             {
               "name": "node_capacity_changed",
-              "promql": "changes(kube_node_status_allocatable{node=~\".+\", resource=~\"cpu|memory|ephemeral_storage\"}[6h])",
+              "promql": "max without (pod, container, instance) (changes(kube_node_status_allocatable{node=~\".+\", resource=~\"cpu|memory|ephemeral_storage\"}[6h]))",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "The allocatable {resource} of node {node} changed in the last six hours. That is not a fault by itself, but every number derived from the old capacity is now resting on a stale premise: the limits account above, how much build concurrency the host can take, and the probe and cache budgets that were sized against the old machine. Re-derive them; this clears on its own once the change ages out"
+              "summary": "The allocatable {resource} of node {node} changed in the last six hours. That is not a fault by itself, but every number derived from the old capacity is now resting on a stale premise: the limits account above, how much build concurrency the host can take, and the probe and cache budgets that were sized against the old machine. Re-derive them; this clears on its own once the change ages out The publishing pod is a scrape detail, not the subject: it is deleted and recreated with every monitoring rollout, so it is aggregated out while the label naming the subject is left untouched."
             },
             {
               "name": "node_without_memory_reserve",
@@ -949,12 +949,12 @@ data:
             },
             {
               "name": "build_gate_not_in_force",
-              "promql": "min_over_time(cogneva_build_gate_slots{role=\"builder\"}[5m]) and (count_over_time(cogneva_build_gate_slots{role=\"builder\"}[10m]) > count_over_time(cogneva_build_gate_slots{role=\"builder\"}[5m]))",
+              "promql": "max by (dir, role) (min_over_time(cogneva_build_gate_slots{role=\"builder\"}[5m])) and (max by (dir, role) (count_over_time(cogneva_build_gate_slots{role=\"builder\"}[10m])) > max by (dir, role) (count_over_time(cogneva_build_gate_slots{role=\"builder\"}[5m])))",
               "condition": {
                 "less_than": 1.0
               },
               "severity": "warning",
-              "summary": "a process that runs builds has had no build gate in force for 5 minutes: concurrent builds in it are unbounded again, and the refusal counter cannot show this because nothing is being refused -- nothing is being bounded. Usually the slot directory could not be created or written (the gate is installed but not in force, and the reason is in the warning it logged at startup), or the gate is switched off in configuration. Read the dir label on cogneva_build_gate_slots: a builder whose dir differs from the other builders' is bounding only itself"
+              "summary": "a process that runs builds has had no build gate in force for 5 minutes: concurrent builds in it are unbounded again, and the refusal counter cannot show this because nothing is being refused -- nothing is being bounded. Usually the slot directory could not be created or written (the gate is installed but not in force, and the reason is in the warning it logged at startup), or the gate is switched off in configuration. Read the dir label on cogneva_build_gate_slots: a builder whose dir differs from the other builders' is bounding only itself The label set is reduced to the dir and role that identify the builder: the pod running it is recreated on every rollout, and keying on it re-opened this alert for a builder whose gate state had not changed."
             },
             {
               "name": "evolution_build_failed",
@@ -1129,12 +1129,12 @@ data:
           },
           {
             "name": "workload_no_available_replica",
-            "promql": "((max_over_time(kube_deployment_status_replicas_available[30m:1m]) and on(namespace, deployment) (kube_deployment_spec_replicas > 0)) and on(namespace, deployment) (count_over_time(kube_deployment_status_replicas_available[1h]) > count_over_time(kube_deployment_status_replicas_available[30m])))",
+            "promql": "((max without (pod, container, instance) (max_over_time(kube_deployment_status_replicas_available[30m:1m])) and on(namespace, deployment) (max without (pod, container, instance) (kube_deployment_spec_replicas) > 0)) and on(namespace, deployment) (max without (pod, container, instance) (count_over_time(kube_deployment_status_replicas_available[1h])) > max without (pod, container, instance) (count_over_time(kube_deployment_status_replicas_available[30m]))))",
             "condition": {
               "less_than": 1.0
             },
             "severity": "critical",
-            "summary": "a deployment that asks for at least one replica has had none available for the whole thirty minutes ({value} available at the end of the window). The window has to clear the rollouts themselves: measured over the three days before this rule was written, gaps with no available replica at all ran from a single scrape up to 27 minutes, while the outages worth waking someone for ran 35 minutes and longer -- a five-minute window fires on every rollout instead. Read that deployment's pods and the state their containers ended in, not only the revision that was rolling out. What this rule cannot read, and must not be credited with: the API goes on calling a pod ready while the runtime will not let the kubelet finish killing it, so a container that is never released keeps every replica count here at its healthy value, and that failure reaches this rule only once the containers actually die; pod_stuck_terminating reads the deletion side, and states its own limits there."
+            "summary": "a deployment that asks for at least one replica has had none available for the whole thirty minutes ({value} available at the end of the window). The window has to clear the rollouts themselves: measured over the three days before this rule was written, gaps with no available replica at all ran from a single scrape up to 27 minutes, while the outages worth waking someone for ran 35 minutes and longer -- a five-minute window fires on every rollout instead. Read that deployment's pods and the state their containers ended in, not only the revision that was rolling out. What this rule cannot read, and must not be credited with: the API goes on calling a pod ready while the runtime will not let the kubelet finish killing it, so a container that is never released keeps every replica count here at its healthy value, and that failure reaches this rule only once the containers actually die; pod_stuck_terminating reads the deletion side, and states its own limits there. The publishing pod is a scrape detail, not the subject: it is deleted and recreated with every monitoring rollout, so it is aggregated out while the label naming the subject is left untouched."
           },
           {
             "name": "pod_stuck_terminating",
