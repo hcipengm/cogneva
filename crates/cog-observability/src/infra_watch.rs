@@ -579,6 +579,274 @@ async fn notify(
     notifier.notify(&[AlertEvent::Firing(inst)]).await;
 }
 
+/// What a comparison's side carries into the join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    /// One value with no labels: pairs with anything, sample by sample.
+    Scalar,
+    /// A single series with an empty label set: pairs with nothing labelled.
+    LabelLess,
+    /// Series that carry labels, from the scrape or from a grouping clause.
+    Labelled,
+    /// Not decidable from the text.
+    Unknown,
+}
+
+/// Report a comparison whose two sides can never meet.
+///
+/// A PromQL comparison keeps a sample only where both sides carry the *same*
+/// label set. A side that arrives without labels — a bare aggregate with no
+/// grouping clause, or arithmetic built from one — has exactly one, empty label
+/// set, so against a labelled series it pairs on nothing and the comparison
+/// yields no series at all. The rule still loads, is still evaluated on every
+/// tick, and can never fire: the failure is silence, and silence is exactly what
+/// a healthy rule looks like from the outside.
+///
+/// `scalar()` is the fix rather than a reformatting: it turns the side into a
+/// scalar, and a comparison against a scalar compares each sample of the series.
+/// Returns `None` when the shape cannot be judged from the text alone — a
+/// modifier such as `on()` or `ignoring()` rewrites the join, and an expression
+/// this scanner does not recognise is not evidence of a defect. The reading is
+/// therefore a lower bound: no hit means "no defect of this shape", not "all
+/// rules verified".
+pub fn unpaired_comparison(promql: &str) -> Option<String> {
+    let (at, len) = top_level_comparison(promql)?;
+    let lhs = promql[..at].trim();
+    let mut rhs = promql[at + len..].trim();
+    // Modifiers sit between the operator and the right operand. `bool` only
+    // changes the result value; the others rewrite which labels must agree, and
+    // then the text alone no longer says whether the sides can meet.
+    while let Some((word, rest)) = leading_ident(rhs) {
+        match word {
+            "bool" => rhs = rest.trim_start(),
+            "on" | "ignoring" | "group_left" | "group_right" => return None,
+            _ => break,
+        }
+    }
+    let (left, right) = (side_of(lhs), side_of(rhs));
+    let mismatched = matches!(
+        (left, right),
+        (Side::LabelLess, Side::Labelled) | (Side::Labelled, Side::LabelLess)
+    );
+    if !mismatched {
+        return None;
+    }
+    Some(format!(
+        "`{lhs}` {op} `{rhs}`: one side is a single series with no labels and the other carries labels, \
+         so the comparison keeps no sample. Wrap the label-less side in `scalar()` if it is a bound, \
+         or give it a `by` clause if it is a per-label aggregate.",
+        op = &promql[at..at + len],
+    ))
+}
+
+/// Byte offset and length of the first comparison at the top level.
+fn top_level_comparison(text: &str) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' | b'`' => i = skip_string(bytes, i),
+            b'(' | b'{' | b'[' => depth += 1,
+            b')' | b'}' | b']' => depth -= 1,
+            b'>' | b'<' | b'!' | b'=' if depth == 0 => {
+                // `>=`, `<=`, `==`, `!=` are two bytes; a lone `>`, `<` or `=` is one.
+                let len = 1 + usize::from(bytes.get(i + 1) == Some(&b'='));
+                return Some((i, len));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Index of the byte that closes a quoted run, so the caller's own advance
+/// steps over it exactly once. Tolerates an unterminated run by returning the
+/// last byte, which is also where the caller stops.
+fn skip_string(bytes: &[u8], start: usize) -> usize {
+    let quote = bytes[start];
+    let mut i = start + 1;
+    while i < bytes.len() {
+        if bytes[i] == quote {
+            return i;
+        }
+        i += 1;
+    }
+    bytes.len().saturating_sub(1)
+}
+
+/// The identifier a slice starts with, and the remainder.
+fn leading_ident(text: &str) -> Option<(&str, &str)> {
+    let t = text.trim_start();
+    let end = t
+        .char_indices()
+        .find(|(_, c)| !(c.is_alphanumeric() || *c == '_' || *c == ':'))
+        .map(|(i, _)| i)
+        .unwrap_or(t.len());
+    if end == 0 {
+        return None;
+    }
+    Some((&t[..end], &t[end..]))
+}
+
+/// The text inside a pair of parentheses that spans the whole slice.
+fn balanced_inner(text: &str) -> Option<&str> {
+    let t = text.trim();
+    if !t.starts_with('(') || !t.ends_with(')') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let bytes = t.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' | b'`' => i = skip_string(bytes, i),
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 && i != bytes.len() - 1 {
+                    return None; // the closing paren is not the last character
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    t.get(1..t.len() - 1)
+}
+
+/// Split on arithmetic operators at the top level, ignoring a leading sign.
+fn split_arithmetic(text: &str) -> Option<Vec<&str>> {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut cuts = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' | b'`' => i = skip_string(bytes, i),
+            b'(' | b'{' | b'[' => depth += 1,
+            b')' | b'}' | b']' => depth -= 1,
+            b'+' | b'*' | b'/' | b'%' | b'^' if depth == 0 => cuts.push((i, 1)),
+            b'-' if depth == 0 && i > 0 => cuts.push((i, 1)),
+            _ => {}
+        }
+        i += 1;
+    }
+    if cuts.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    for (at, len) in cuts {
+        parts.push(&text[start..at]);
+        start = at + len;
+    }
+    parts.push(&text[start..]);
+    Some(parts)
+}
+
+/// A call whose argument list is the whole expression: `name(args)`.
+fn whole_call(text: &str) -> Option<(&str, &str)> {
+    let (name, rest) = leading_ident(text)?;
+    let rest = rest.trim_start();
+    if !rest.starts_with('(') {
+        return None;
+    }
+    Some((name, balanced_inner(rest)?))
+}
+
+/// An aggregator, which drops the labels of its input unless a grouping clause
+/// names the ones to keep.
+fn is_aggregate(name: &str) -> bool {
+    matches!(
+        name,
+        "sum"
+            | "min"
+            | "max"
+            | "avg"
+            | "group"
+            | "stddev"
+            | "stdvar"
+            | "count"
+            | "quantile"
+            | "topk"
+            | "bottomk"
+            | "count_values"
+    )
+}
+
+/// Whether the tail opens with a `by`/`without` grouping keyword as a whole word.
+fn starts_with_modifier(tail: &str) -> bool {
+    ["by", "without"].iter().any(|word| {
+        tail.strip_prefix(word)
+            .is_some_and(|rest| rest.starts_with(|c: char| c.is_whitespace() || c == '('))
+    })
+}
+
+fn is_number(text: &str) -> bool {
+    let t = text.trim();
+    t.parse::<f64>().is_ok() || matches!(t, "Inf" | "+Inf" | "-Inf" | "NaN")
+}
+
+/// Classify one side of a comparison.
+fn side_of(expr: &str) -> Side {
+    let mut text = expr.trim();
+    while let Some(inner) = balanced_inner(text) {
+        text = inner.trim();
+    }
+    if text.is_empty() {
+        return Side::Unknown;
+    }
+    if is_number(text) {
+        return Side::Scalar;
+    }
+    if let Some((name, _args)) = whole_call(text) {
+        return match name {
+            "scalar" | "time" | "pi" | "rand" => Side::Scalar,
+            "vector" => Side::LabelLess,
+            // An aggregator with no grouping clause collapses everything into
+            // one series carrying no labels. `topk`, `bottomk` and
+            // `count_values` are deliberately not in this list: they hand back
+            // the source series, labels and all.
+            "sum" | "min" | "max" | "avg" | "group" | "stddev" | "stdvar" | "count"
+            | "quantile" => Side::LabelLess,
+            // Every other function — the `*_over_time` family, `rate`, `abs`,
+            // `clamp_*`, `label_replace`, and so on — returns an instant vector
+            // that carries its input's labels. `scalar()` is the only one that
+            // yields a scalar, and it is handled above.
+            _ => Side::Labelled,
+        };
+    }
+    if let Some((name, rest)) = leading_ident(text) {
+        let tail = rest.trim_start();
+        // `<aggregate> by (...) (...)` and `<aggregate> without (...) (...)`
+        // keep whatever labels the clause does not name.
+        if is_aggregate(name) && starts_with_modifier(tail) {
+            return Side::Labelled;
+        }
+        // A selector: a metric name, with or without matchers. Series arrive
+        // from a scrape, so they carry whatever labels the exporter attached.
+        if tail.is_empty() || tail.starts_with('{') {
+            return Side::Labelled;
+        }
+    }
+    if let Some(parts) = split_arithmetic(text) {
+        let sides: Vec<Side> = parts.iter().map(|p| side_of(p)).collect();
+        if sides.iter().all(|s| *s == Side::Scalar) {
+            return Side::Scalar;
+        }
+        if sides.contains(&Side::Unknown) {
+            return Side::Unknown;
+        }
+        if sides.contains(&Side::LabelLess) {
+            return Side::LabelLess;
+        }
+        return Side::Labelled;
+    }
+    Side::Unknown
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -840,6 +1108,88 @@ mod tests {
         }
         assert_eq!(checked, rules.len(), "every shipped rule was inspected");
         assert!(checked > 0, "no rules read; the config path moved");
+    }
+
+    /// 遍历随包发布的每一条规则：这种缺陷的读者必须落在会出事的那条路上——规则是
+    /// 随 chart 发出去的，改坏了在这里红，而不是等它装载、每拍求值、然后静默一整天。
+    #[test]
+    fn no_shipped_rule_compares_a_labelled_side_with_an_unlabelled_one() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let path = root.join("deploy/helm/cogneva/files/cogneva.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("chart JSON parses");
+        let rules = parsed
+            .pointer(cog_core::config_sections::ALERT_RULES_POINTER)
+            .and_then(|v| v.as_array())
+            .expect("rules array");
+        assert!(!rules.is_empty(), "no rules read; the config path moved");
+        let mut flagged: Vec<String> = Vec::new();
+        for rule in rules {
+            let Some(promql) = rule["promql"].as_str() else {
+                continue;
+            };
+            if let Some(why) = unpaired_comparison(promql) {
+                flagged.push(format!(
+                    "{}: {why}",
+                    rule["name"].as_str().unwrap_or("<unnamed>")
+                ));
+            }
+        }
+        assert!(
+            flagged.is_empty(),
+            "规则的比较两侧配不上：它会装载、每拍求值，却一个样本也留不下:\n{}",
+            flagged.join("\n")
+        );
+    }
+
+    /// 反例取自那条规则**修前**的原文。判据抓不住它，就等于没接上——一条只会给
+    /// 已经修好的形状报绿的检查，和被它检查的东西一样静默。
+    #[test]
+    fn a_comparison_against_a_bare_aggregate_is_unpairable() {
+        let before =
+            "cogneva_stream_read_silent_seconds > 12 * max(cogneva_stream_read_block_seconds)";
+        let why = unpaired_comparison(before).expect("修前那条必须被抓住");
+        assert!(why.contains("scalar()"), "判词要指出出路: {why}");
+    }
+
+    #[test]
+    fn a_scalar_wrapped_bound_pairs() {
+        let after = "cogneva_stream_read_silent_seconds > \
+                     scalar(12 * max(cogneva_stream_read_block_seconds))";
+        assert_eq!(unpaired_comparison(after), None);
+    }
+
+    /// 两侧都无标签时它们确实配得上：空标签集等于空标签集。把这些报成缺陷就是
+    /// 假阳性，会把本来正确的规则逼着改坏。
+    #[test]
+    fn two_unlabelled_sides_do_pair() {
+        assert_eq!(unpaired_comparison("time() - max(a) > 6 * max(b)"), None);
+        assert_eq!(unpaired_comparison("max(a) > min(b)"), None);
+    }
+
+    #[test]
+    fn a_number_bound_needs_no_scalar() {
+        assert_eq!(
+            unpaired_comparison("sum by (namespace) (increase(failures_total[6h])) > 6"),
+            None
+        );
+    }
+
+    /// `on()` / `ignoring()` / `group_left` 改写配对规则，两侧能不能遇上不再由
+    /// 文本本身说明——判不了就不判，宁漏不误报。
+    #[test]
+    fn an_explicit_join_modifier_is_left_alone() {
+        assert_eq!(
+            unpaired_comparison("a > on(instance) group_left max(b)"),
+            None
+        );
+    }
+
+    /// 比较号出现在标签匹配器的字符串里时它不是比较运算符。
+    #[test]
+    fn a_comparison_inside_a_matcher_string_is_not_a_comparison() {
+        assert_eq!(unpaired_comparison(r#"a{kind=">"} > 3"#), None);
     }
 
     /// Test-only source walk: reads filenames, never follows symlinks out of
