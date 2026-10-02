@@ -617,12 +617,12 @@ data:
             },
             {
               "name": "goal_class_not_carried",
-              "promql": "increase(collab_goal_class_source_total{source=\"host_type\"}[6h])",
+              "promql": "sum by (source) (increase(collab_goal_class_source_total{source=\"host_type\"}[6h]))",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "The planner read {value} batch(es) of similar decompositions in the last 6h under the type of whatever task happened to hold the goal, not under the class the goal was submitted with. Every production caller re-hosts a goal onto a synthetic planning task, so that host type names the loop rather than the work: all goals of all classes then collapse onto one row and the retrieval keeps answering with something plausible, which is why nothing else shows this. Usual cause: a re-hosting caller stopped carrying `goal_class` along with the goal"
+              "summary": "The planner read {value} batch(es) of similar decompositions in the last 6h under the type of whatever task happened to hold the goal, not under the class the goal was submitted with. Every production caller re-hosts a goal onto a synthetic planning task, so that host type names the loop rather than the work: all goals of all classes then collapse onto one row and the retrieval keeps answering with something plausible, which is why nothing else shows this. Usual cause: a re-hosting caller stopped carrying `goal_class` along with the goal The count is summed across the processes that publish it rather than read per process: each process counts only its own, so the sum is what the deployment did, and the row stays keyed on the subject above instead of on a pod the next rollout deletes."
             },
             {
               "name": "self_evolution_yields_no_change",
@@ -743,30 +743,30 @@ data:
             },
             {
               "name": "task_checkpoint_not_persisted",
-              "promql": "increase(cogneva_task_checkpoint_total{outcome=\"unpersisted\"}[6h])",
+              "promql": "sum by (outcome) (increase(cogneva_task_checkpoint_total{outcome=\"unpersisted\"}[6h]))",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "Agents took {value} snapshot(s) in the last six hours that are not in the checkpoint store, so no resume point was recorded for the tasks they belonged to. An agent without a store still builds a snapshot, emits the event, and returns it; only the save is skipped, and it is skipped silently. The resume pointer is withheld in exactly that case — writing it would name a checkpoint nobody can load — so what is left to read is a task with no resume point, which is the shape of a first run. This is a configuration state rather than a run failure: the agent pool was built without the store, or the store's writes are failing. The tasks themselves lose nothing; they simply cannot be handed over, so a rollout or an eviction re-runs them from the beginning."
+              "summary": "Agents took {value} snapshot(s) in the last six hours that are not in the checkpoint store, so no resume point was recorded for the tasks they belonged to. An agent without a store still builds a snapshot, emits the event, and returns it; only the save is skipped, and it is skipped silently. The resume pointer is withheld in exactly that case — writing it would name a checkpoint nobody can load — so what is left to read is a task with no resume point, which is the shape of a first run. This is a configuration state rather than a run failure: the agent pool was built without the store, or the store's writes are failing. The tasks themselves lose nothing; they simply cannot be handed over, so a rollout or an eviction re-runs them from the beginning. The count is summed across the processes that publish it rather than read per process: each process counts only its own, so the sum is what the deployment did, and the row stays keyed on the subject above instead of on a pod the next rollout deletes."
             },
             {
               "name": "task_checkpoint_not_superseded",
-              "promql": "increase(cogneva_task_checkpoint_total{outcome=\"unsuperseded\"}[6h])",
+              "promql": "sum by (outcome) (increase(cogneva_task_checkpoint_total{outcome=\"unsuperseded\"}[6h]))",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "{value} checkpoint(s) could not be deleted after being replaced. The store is meant to hold one checkpoint per agent — each new one deletes the one it replaces, which is what bounds it by the live set instead of by uptime. A delete that fails leaves the old copy behind with no reader: the resume chain still works, nothing else logs anything, and the only symptom is a table growing with every tick until it fills the volume it shares with the task data. Read the delete failure from the checkpoint loop's log line and check the store's disk and connection."
+              "summary": "{value} checkpoint(s) could not be deleted after being replaced. The store is meant to hold one checkpoint per agent — each new one deletes the one it replaces, which is what bounds it by the live set instead of by uptime. A delete that fails leaves the old copy behind with no reader: the resume chain still works, nothing else logs anything, and the only symptom is a table growing with every tick until it fills the volume it shares with the task data. Read the delete failure from the checkpoint loop's log line and check the store's disk and connection. The count is summed across the processes that publish it rather than read per process: each process counts only its own, so the sum is what the deployment did, and the row stays keyed on the subject above instead of on a pod the next rollout deletes."
             },
             {
               "name": "task_resume_point_unusable",
-              "promql": "increase(collab_task_resume_total{outcome=\"failed\"}[6h])",
+              "promql": "sum by (outcome) (increase(collab_task_resume_total{outcome=\"failed\"}[6h]))",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "A task was handed a resume point it could not restore {value} time(s) in the last six hours, so that run started from the beginning. The pointer on the task board names a checkpoint that is gone or unreadable — the store was cleared, a row was deleted while still referenced, or the store is failing reads. A task with no resume point at all is the ordinary first run and is not counted here; this counter is the one reading on which a chain that exists and is broken differs from a chain that was never needed. Read the task and checkpoint ids from the log and check those rows in the store."
+              "summary": "A task was handed a resume point it could not restore {value} time(s) in the last six hours, so that run started from the beginning. The pointer on the task board names a checkpoint that is gone or unreadable — the store was cleared, a row was deleted while still referenced, or the store is failing reads. A task with no resume point at all is the ordinary first run and is not counted here; this counter is the one reading on which a chain that exists and is broken differs from a chain that was never needed. Read the task and checkpoint ids from the log and check those rows in the store. The count is summed across the processes that publish it rather than read per process: each process counts only its own, so the sum is what the deployment did, and the row stays keyed on the subject above instead of on a pod the next rollout deletes."
             },
             {
               "name": "runtime_asset_not_refreshed",
@@ -914,21 +914,21 @@ data:
             },
             {
               "name": "verification_killed_by_budget",
-              "promql": "increase(cogneva_verification_timeouts_total{kind=\"test\"}[6h])",
+              "promql": "sum by (kind) (increase(cogneva_verification_timeouts_total{kind=\"test\"}[6h]))",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "A change's verification was killed {value} time(s) in the last 6h, having run its whole verification budget for {kind} runs. The change was then retired for the budget and not for its content: it was never judged. The budget it ran against is the cogneva_verification_budget_seconds reading for the test kind, and cogneva_verification_last_run_seconds for the same kind is how long the runs that do finish are taking — a host that got slower shows up there first, and once that line reaches the budget every change is retired on arrival, which reads exactly like a pipeline with nothing to do"
+              "summary": "A change's verification was killed {value} time(s) in the last 6h, having run its whole verification budget for {kind} runs. The change was then retired for the budget and not for its content: it was never judged. The budget it ran against is the cogneva_verification_budget_seconds reading for the test kind, and cogneva_verification_last_run_seconds for the same kind is how long the runs that do finish are taking — a host that got slower shows up there first, and once that line reaches the budget every change is retired on arrival, which reads exactly like a pipeline with nothing to do The count is summed across the processes that publish it rather than read per process: each process counts only its own, so the sum is what the deployment did, and the row stays keyed on the subject above instead of on a pod the next rollout deletes."
             },
             {
               "name": "deployment_killed_by_budget",
-              "promql": "increase(cogneva_verification_timeouts_total{kind=\"build\"}[6h])",
+              "promql": "sum by (kind) (increase(cogneva_verification_timeouts_total{kind=\"build\"}[6h]))",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "A change's release build was killed {value} time(s) in the last 6h, having run its whole deployment budget for {kind} runs, so the commit was rolled back and the change is gone. This is a different loss from a build that failed: nothing about the code was judged either way, and the rollback leaves no other trace that the change ever existed. The budget is the cogneva_verification_budget_seconds reading for the build kind"
+              "summary": "A change's release build was killed {value} time(s) in the last 6h, having run its whole deployment budget for {kind} runs, so the commit was rolled back and the change is gone. This is a different loss from a build that failed: nothing about the code was judged either way, and the rollback leaves no other trace that the change ever existed. The budget is the cogneva_verification_budget_seconds reading for the build kind The count is summed across the processes that publish it rather than read per process: each process counts only its own, so the sum is what the deployment did, and the row stays keyed on the subject above instead of on a pod the next rollout deletes."
             },
             {
               "name": "series_held_without_producer",
@@ -950,12 +950,12 @@ data:
             },
             {
               "name": "build_gate_refused",
-              "promql": "increase(cogneva_build_gate_refused_total[1h])",
+              "promql": "sum by (dir, role) (increase(cogneva_build_gate_refused_total[1h]))",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "a build was refused a slot {value} time(s) in 1h: the host-wide build gate bounds how many builds run at once, because builds share the host with the cluster and the sum of them pages the machine instead of failing. A refusal means a build that had nothing to come back to gave up after its wait budget -- the change or rollout it belonged to did not fail, it did not run, so a refusal that keeps happening is a bound set too low or a builder holding its slot far too long (see cogneva_build_gate_in_flight and cogneva_build_gate_waiting)"
+              "summary": "a build was refused a slot {value} time(s) in 1h: the host-wide build gate bounds how many builds run at once, because builds share the host with the cluster and the sum of them pages the machine instead of failing. A refusal means a build that had nothing to come back to gave up after its wait budget -- the change or rollout it belonged to did not fail, it did not run, so a refusal that keeps happening is a bound set too low or a builder holding its slot far too long (see cogneva_build_gate_in_flight and cogneva_build_gate_waiting) The count is summed across the processes that publish it rather than read per process: each process counts only its own, so the sum is what the deployment did, and the row stays keyed on the subject above instead of on a pod the next rollout deletes."
             },
             {
               "name": "build_gate_not_in_force",
@@ -1058,12 +1058,12 @@ data:
             },
             {
               "name": "background_loop_restarted",
-              "promql": "increase(cogneva_loop_restarts_total[1h])",
+              "promql": "sum by (loop) (increase(cogneva_loop_restarts_total[1h]))",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "a background loop panicked and was run again {value} time(s) in the last hour, and is running now: a restart means the defect fired and the loop came back from it, not that the defect is gone. It is reported here rather than left to the panic line in the log because a repaired loop publishes all of its own series again, so from every other reading in this deployment it looks like a loop that never stopped -- the repair would be the reason the defect stayed quiet. Read the panic message in that container's log at the moment of the restart (the supervisor logs it with the loop name, the restart count within this run, and the wait it took before trying again). A restart that happens once around a deploy is usually a defect in the new code that the next attempt did not hit; the same loop restarted repeatedly is one the budget will eventually leave dead, which is what background_loop_died then reports. The count is per process: it resets when the process restarts, so a loop that panicked shortly before a restart is visible in the logs and no longer here"
+              "summary": "a background loop panicked and was run again {value} time(s) in the last hour, and is running now: a restart means the defect fired and the loop came back from it, not that the defect is gone. It is reported here rather than left to the panic line in the log because a repaired loop publishes all of its own series again, so from every other reading in this deployment it looks like a loop that never stopped -- the repair would be the reason the defect stayed quiet. Read the panic message in that container's log at the moment of the restart (the supervisor logs it with the loop name, the restart count within this run, and the wait it took before trying again). A restart that happens once around a deploy is usually a defect in the new code that the next attempt did not hit; the same loop restarted repeatedly is one the budget will eventually leave dead, which is what background_loop_died then reports. The count is per process: it resets when the process restarts, so a loop that panicked shortly before a restart is visible in the logs and no longer here The count is summed across the processes that publish it rather than read per process: each process counts only its own, so the sum is what the deployment did, and the row stays keyed on the subject above instead of on a pod the next rollout deletes."
             },
             {
               "name": "background_loop_role_unowned",
@@ -1085,12 +1085,12 @@ data:
             },
             {
               "name": "background_loop_role_probe_failing",
-              "promql": "increase(cogneva_loop_owner_probe_failures_total[1h])",
+              "promql": "sum by (loop) (increase(cogneva_loop_owner_probe_failures_total[1h]))",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "a process asked who holds the role that serialises its work and could not get an answer -- {value} time(s) in the last hour -- and for as long as that lasts it has deliberately stopped acting. An ask whose answer does not arrive is not permission to act: acting wrongly writes the duplicate the role was taken to prevent (a follow-up sent twice, an index row overwritten, an archived file that can no longer be found), and the same doubt makes standing still the cheaper of the two errors. So this is the cause to read behind a loop that is cycling and doing nothing, and the role's own series reads it from the other side: background_loop_role_unowned fires when nothing holds the role, this one says why nothing does. Usual causes, in the order worth checking: the shared database is unreachable from this pod (a pool exhausted or pointed at the wrong place, a network policy, credentials that have stopped working), the table was dropped or renamed under a running deployment, or the ask is timing out against a database that is up but saturated. The count is per process and resets when the process restarts; what separates a process that is asking and failing from one that has stopped asking altogether is the loop's own liveness -- it keeps its declaration and its tick age keeps moving"
+              "summary": "a process asked who holds the role that serialises its work and could not get an answer -- {value} time(s) in the last hour -- and for as long as that lasts it has deliberately stopped acting. An ask whose answer does not arrive is not permission to act: acting wrongly writes the duplicate the role was taken to prevent (a follow-up sent twice, an index row overwritten, an archived file that can no longer be found), and the same doubt makes standing still the cheaper of the two errors. So this is the cause to read behind a loop that is cycling and doing nothing, and the role's own series reads it from the other side: background_loop_role_unowned fires when nothing holds the role, this one says why nothing does. Usual causes, in the order worth checking: the shared database is unreachable from this pod (a pool exhausted or pointed at the wrong place, a network policy, credentials that have stopped working), the table was dropped or renamed under a running deployment, or the ask is timing out against a database that is up but saturated. The count is per process and resets when the process restarts; what separates a process that is asking and failing from one that has stopped asking altogether is the loop's own liveness -- it keeps its declaration and its tick age keeps moving The count is summed across the processes that publish it rather than read per process: each process counts only its own, so the sum is what the deployment did, and the row stays keyed on the subject above instead of on a pod the next rollout deletes."
             },
             {
               "name": "notification_delivery_failing",
@@ -1103,12 +1103,12 @@ data:
             },
             {
               "name": "registry_store_walk_failing",
-              "promql": "increase(cogneva_registry_walk_failures_total[1h])",
+              "promql": "sum by (namespace) (increase(cogneva_registry_walk_failures_total[1h]))",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "The walk over the registry store failed {value} time(s) in the last hour. That walk is the only producer of what the store is holding (referenced bytes, tag count, scan age), and the same tag listing feeds the retention round that removes tags when the claim fills -- so while it fails, those readings are last-known rather than current and nothing is being removed, and the pair is invisible without this count: the bytes keep the value of the last successful walk, and a process that never walked once publishes none of the three at all, which is exactly what a process that measures no registry publishes. A walk failing from the first scrape after a restart is the shape to look for first, and the walk's own error in that container's log is where the cause is (a store that answered with something the reader could not frame, an unreachable endpoint, a manifest the registry would not serve). This rule reads the increase, so a walk that starts working stops firing by itself; the count resets with the process, so compare it against the container's uptime before reading it as a rate"
+              "summary": "The walk over the registry store failed {value} time(s) in the last hour. That walk is the only producer of what the store is holding (referenced bytes, tag count, scan age), and the same tag listing feeds the retention round that removes tags when the claim fills -- so while it fails, those readings are last-known rather than current and nothing is being removed, and the pair is invisible without this count: the bytes keep the value of the last successful walk, and a process that never walked once publishes none of the three at all, which is exactly what a process that measures no registry publishes. A walk failing from the first scrape after a restart is the shape to look for first, and the walk's own error in that container's log is where the cause is (a store that answered with something the reader could not frame, an unreachable endpoint, a manifest the registry would not serve). This rule reads the increase, so a walk that starts working stops firing by itself; the count resets with the process, so compare it against the container's uptime before reading it as a rate The count is summed across the processes that publish it rather than read per process: each process counts only its own, so the sum is what the deployment did, and the row stays keyed on the subject above instead of on a pod the next rollout deletes."
             },
             {
               "name": "registry_maintenance_round_incomplete",
