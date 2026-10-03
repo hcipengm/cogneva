@@ -1149,6 +1149,36 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 31,
+          "title": "LLM Tokens by Actor (input / output / cached)",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 120
+          },
+          "targets": [
+            {
+              "expr": "sum by (actor, kind) (increase(llm_tokens_total[1h]))",
+              "legendFormat": "{{actor}} {{kind}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {

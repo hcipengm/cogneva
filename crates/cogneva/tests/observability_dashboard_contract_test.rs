@@ -58,6 +58,23 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["upstream", "model", "result", "actor"],
         "crates/cog-gateway/src/security_gateway.rs",
     ),
+    // The per-call consumption record, split by the actor that spent it and by
+    // the kind of token. The `kind` axis carries `input`, `output` and `cached`;
+    // `cached / input` is the hit rate of the upstream's own prefix cache, which
+    // is the only reading a prefix-stability change can be accepted on -- "the
+    // stable half is byte-identical and first" is a claim about bytes the
+    // upstream served, not about bytes we sent. It had no reader until this
+    // panel: per-actor latency was drawn, per-actor spend was not, so the
+    // reading that says where the money goes existed in the producer alone. The
+    // ratio is read per upstream and protocol (on an OpenAI-compatible upstream
+    // `cached` is a subset of `input`, on Anthropic it is disjoint), which is
+    // why `kind` stays a separate series rather than being folded into a net
+    // number at the producer.
+    (
+        "llm_tokens_total",
+        &["upstream", "kind", "actor"],
+        "crates/cog-gateway/src/security_gateway.rs",
+    ),
     // Agent run counters carry no labels: they are totals for the process, not
     // per-task readings, so nothing distinguishes one sample from the next.
     (
