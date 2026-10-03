@@ -710,7 +710,7 @@
             "greater_than": 0.0
           },
           "severity": "warning",
-          "summary": "Pending state for {stream} failed to be measured {value} time(s) in the last hour. The reclaim loop is running but cannot read the queue, so its last published figures are not evidence about the present"
+          "summary": "Pending state for {stream} failed to be measured {value} time(s) in the last hour. The pending observer for this stream is running but its read of the queue keeps failing, so the figures it last published are last-known rather than current. This is not the reclaim pass: the reclaim pass takes messages back and does not publish this series. It is the companion to stream_pending_measure_stale -- that rule fires when the observer stops asking, this one fires while it keeps asking and keeps failing. The observer's own error in that container's log is where the cause is"
         },
         {
           "name": "dag_task_stalled_after_ready",
