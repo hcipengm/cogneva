@@ -21,6 +21,8 @@ use std::path::PathBuf;
 
 #[path = "common/closed_set.rs"]
 mod closed_set;
+#[path = "common/dashboard.rs"]
+mod dashboard;
 #[path = "common/producer.rs"]
 mod producer;
 #[path = "common/promql.rs"]
@@ -448,6 +450,78 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_governance_check_failures_total",
         "crates/cog-reflection/src/governance_drift.rs",
     ),
+    // Four series whose producers each carry a sentence saying what should read
+    // them and which nothing read: the census below found them by walking the
+    // closed set against both reader faces rather than by looking for rules to
+    // write. Each one closes a failure that is otherwise silent.
+    //
+    // The signing face: the delivery readings count messages that went out, so
+    // an outlet whose every request is refused and an outlet nobody calls are
+    // the same zero there. The refusals split by whose they are -- an outlet no
+    // signing rule covers is ours, a missing key is the operator's -- and only
+    // this counter says which happened.
+    (
+        "cogneva_notification_sign_total",
+        "crates/cog-gateway/src/security_gateway.rs",
+    ),
+    // The registry debt: a round deleted tags and the restart that reclaims the
+    // space kept failing. The round publishes the debt every round precisely
+    // because the moment it matters has no other reading; nothing read it.
+    (
+        "cogneva_registry_gc_owed",
+        "crates/cog-reflection/src/mainline_deployer.rs",
+    ),
+    // The pool signal: whether the gateway got the pool verdict into the key the
+    // scheduler reads. Zero here means a pool that is down is not pausing
+    // LLM-dependent work, and no other series says so.
+    (
+        "llm_pool_signal_connected",
+        "crates/cog-gateway/src/security_gateway.rs",
+    ),
+    // The usage cells: an upstream asked for token usage that answered without
+    // it. Every token total on that upstream is then blind, and the cell was
+    // only mentioned in other series' summaries.
+    (
+        "llm_usage_readings_total",
+        "crates/cog-gateway/src/security_gateway.rs",
+    ),
+    // Five more found the same way. Each one's own help text says what to read
+    // it with or what its non-zero means, and none of them was read.
+    //
+    // The sample log's capacity verdict: 1 when the log is over its row budget
+    // and the oldest-first sweep cannot prune further without deleting a series'
+    // current value. The sweep publishes a verdict; nothing consumed it.
+    (
+        "metrics_samples_over_capacity",
+        "crates/cog-storage/src/metrics_sample_cap.rs",
+    ),
+    // The memory backlog past the re-drive window: raw sources the system will
+    // not pick up again without a budgeted backfill. Its help names the action
+    // it is waiting for, and it had no reader.
+    (
+        "memory_unextracted_raw_aged_out",
+        "crates/cog-memory/src/ingestor.rs",
+    ),
+    // The audited document channel, whose help says "refused_by_audit climbing
+    // is a security event" -- the security cell of a channel with no reader.
+    (
+        "audited_llm_requests_total",
+        "crates/cog-gateway/src/document_egress.rs",
+    ),
+    // The version contract: a standing violation count per clause, reported for
+    // every clause including the zeros precisely so an absent series means the
+    // clause was never judged. Nothing read it.
+    (
+        "cogneva_version_contract_violations",
+        "crates/cog-reflection/src/mainline_deployer.rs",
+    ),
+    // The worktree index: tracked files a resident worktree's git index does not
+    // remember, where the help states 0 is healthy and the size of the number is
+    // the reading.
+    (
+        "cogneva_worktree_index_missing_files",
+        "crates/cog-reflection/src/workspace.rs",
+    ),
 ];
 
 /// Series the rules read that this workspace does not publish, with the owner.
@@ -810,6 +884,284 @@ fn the_tables_hold_no_series_that_no_rule_reads() {
     assert!(
         stale.is_empty(),
         "表里登记的名字没有任何规则在读，说明规则被删或改名后表没跟着收敛: {stale:?}"
+    );
+}
+
+/// Every name the closed set publishes, against every face that reads one.
+///
+/// The test above asks the question in one direction only: a series registered
+/// in `PRODUCED` must be read by a rule. It cannot see a name that was never
+/// registered anywhere, which is exactly the shape of a series that is
+/// published, described in `metric_help`, and read by nobody. This walks the
+/// other way -- from `cog_core::metric_names::ALL`, which the recording macros
+/// generate, so a name in it is published by this build by construction -- and
+/// requires each one to be accounted for by an alert rule, by a dashboard
+/// panel, or by an entry here.
+///
+/// There are two verdicts and no third. `Elsewhere` names the surface that
+/// states the same fact, which makes leaving this name unread a decision
+/// instead of an oversight. `Gap` records a fact that nothing states and
+/// nothing reports: it is a debt, kept as a count by `GAPS_AT_CENSUS` so the
+/// next one cannot arrive unnoticed, and never a statement that the reading is
+/// not worth having.
+enum Unread {
+    /// The same fact is stated elsewhere; the surface is named.
+    Elsewhere(&'static str),
+    /// Nothing states it. A debt, counted by `GAPS_AT_CENSUS`.
+    Gap(&'static str),
+}
+
+/// Names no face reads, with the verdict.
+///
+/// The census that filled this table landed a reader for nine names whose own
+/// help text said what should read them or what their non-zero meant, and whose
+/// failure was otherwise silent: the signing refusals, the registry reclaim
+/// debt, the pool signal, the usage-silence cells, the sample log's capacity
+/// verdict, the memory backlog past the re-drive window, the audited channel's
+/// refusals, the version contract, and the worktree index. The entries below are
+/// what remained, each with the reason it was not closed in that pass.
+///
+/// `Elsewhere` is a decision: the same fact is already stated by a surface that
+/// is read, named here. `Gap` is a debt: nothing states the fact, and the reason
+/// it could not be closed is what the entry carries -- a missing declared bound,
+/// a cadence that no reading publishes, or a repair that is a policy decision
+/// rather than a reader to write. `GAPS_AT_CENSUS` counts them so the next one
+/// must be classified deliberately.
+const UNREAD: &[(&str, Unread)] = &[
+    // The denominator of the rule on the aged-out backlog: the sibling counts
+    // every unextracted raw, this one counts the part the system will retry by
+    // itself, and both are written by the same scan. A reader of the pair is
+    // what the rule above is.
+    (
+        "memory_unextracted_raw",
+        Unread::Elsewhere("the actionable subset is read by memory_raw_backlog_aged_out; this is its denominator"),
+    ),
+    (
+        "memory_operations_total",
+        Unread::Gap("memory backend operation volume; the instrumented facade's own comment says the counter is diluted by the archive housekeeping loop, so a rate threshold would track that loop rather than demand"),
+    ),
+    (
+        "memory_operation_latency_ms",
+        Unread::Gap("memory backend operation latency; no latency bound is declared anywhere in the repository to hang a threshold on"),
+    ),
+    (
+        "memory_operation_errors_total",
+        Unread::Gap("the memory backend's failure counter; a failing backend reaches the user as a failed task and no reading names memory as the cause -- the repair is a threshold policy for what error rate is a fault"),
+    ),
+    (
+        "metrics_retired_rows_removed",
+        Unread::Gap("rows of retired names the last release pass deleted; the help reads a table whose value stays non-zero as one not being drained, but 'stays' is a property of a sequence of passes and the pass cadence is not published by any series"),
+    ),
+    (
+        "metrics_samples_rows",
+        Unread::Elsewhere("one operand of the capacity verdict that metrics_log_at_floor_capacity reads"),
+    ),
+    (
+        "metrics_samples_budget_rows",
+        Unread::Elsewhere("the other operand of that same verdict"),
+    ),
+    (
+        "metrics_samples_bytes",
+        Unread::Elsewhere("the help says it lags the row count and is never the pruning criterion; the capacity verdict is the reading with a criterion"),
+    ),
+    (
+        "tier_migration_total",
+        Unread::Elsewhere("trace_tier_migration_failing, trace_tier_migration_stale and trace_tier_demotion_stalled read the same face's failures, staleness and backlog"),
+    ),
+    (
+        "cogneva_worktree_index_present",
+        Unread::Elsewhere("the sampling loop's liveness is stated by background_loop_stalled over cogneva_loop_tick_age_seconds"),
+    ),
+    (
+        "cogneva_version_contract_checks_total",
+        Unread::Elsewhere("the denominator of version_contract_violated: the help says it is what separates a contract that holds from a judgement that never ran"),
+    ),
+    (
+        "cogneva_version_declared_info",
+        Unread::Elsewhere("the help calls it an identity label rather than a measurement; the declared version is also on the image tag and in the release tag the artifact is built from"),
+    ),
+    (
+        "cogneva_version_commits_since_release",
+        Unread::Gap("how far the running code has moved past the release; no bound is declared, so a rule would have to invent the policy it is meant to enforce"),
+    ),
+    (
+        "evolution_generated_change_files_total",
+        Unread::Gap("generated-change fidelity: measured, logged, and read by nothing; the ratio needs a declared fidelity bound that does not exist"),
+    ),
+    (
+        "evolution_generated_change_files_faithful",
+        Unread::Gap("the faithful half of the same unread ratio"),
+    ),
+    (
+        "evolution_generated_change_hunks_total",
+        Unread::Gap("the same unread fidelity face at hunk granularity; the missing bound is the same one"),
+    ),
+    (
+        "evolution_generated_change_hunks_faithful",
+        Unread::Gap("same face, hunk granularity, faithful half"),
+    ),
+    (
+        "cogneva_registry_pruned_tags_total",
+        Unread::Elsewhere("registry_reclaim_debt_unpaid reads the deletions the tag server did not reclaim; the count of the ones that succeeded adds no other fact"),
+    ),
+    (
+        "cogneva_registry_rebuild_hold_secs_total",
+        Unread::Gap("seconds the tag server was held away per induced restart; the help's criterion is a ratio against the tags deleted, so the reader needs a pair and a bound on how much deferral is acceptable, neither declared"),
+    ),
+    (
+        "cogneva_buildah_store_rounds_total",
+        Unread::Gap("the help says read the rounds against the completion timestamp, but the bound is the attempt cadence and the store round is driven by the build slot rather than a declared period, so no window can be bounded from a reading that exists"),
+    ),
+    (
+        "cogneva_buildah_store_reading_unix",
+        Unread::Gap("the other half of that pair; the same missing cadence is what a staleness bound would need"),
+    ),
+    (
+        "cogneva_buildah_store_pruned_images_total",
+        Unread::Gap("written only when a round freed an image, so absence means no round ever has; same unattested cadence"),
+    ),
+    (
+        "cogneva_buildah_store_pruned_layers_total",
+        Unread::Gap("same face as the pruned image count"),
+    ),
+    (
+        "cogneva_buildah_store_freed_bytes_total",
+        Unread::Gap("same face; bytes freed, written only when both ends of the round were measurable"),
+    ),
+    (
+        "cogneva_buildah_store_kept_images",
+        Unread::Gap("the help calls it the reading that says the keep set is doing something; nothing reads it and no keep-set bound is declared"),
+    ),
+    (
+        "cogneva_buildah_store_live_images",
+        Unread::Gap("the help names the one way this pass could remove a base image that is in use -- a live reading of zero -- and nothing reads it; the highest-value entry in this family, still blocked on the same unattested cadence"),
+    ),
+    (
+        "cogneva_rollout_job_cpu_throttled_ratio",
+        Unread::Gap("share of the newest judgement run's CFS periods throttled by its own limit; no throttling bound is declared"),
+    ),
+    (
+        "cogneva_rollout_job_memory_peak_ratio",
+        Unread::Gap("peak against the declared limit; the help warns a healthy run reads near the top of a narrow band, so the ratio itself is not a usable threshold and the bound that would be is not declared"),
+    ),
+    (
+        "cogneva_rollout_job_reading_unix",
+        Unread::Gap("ties the two readings above to the run that produced them; a reader needs the run cadence, which is per-rollout and published by no series"),
+    ),
+    (
+        "cogneva_mainline_superseded_rollout_total",
+        Unread::Gap("1 or 0 per round on whether the carried revision had been overtaken; the help says the zeros keep the question visible and nothing reads the answer -- a reader needs the round cadence to bound the window"),
+    ),
+    (
+        "cogneva_mainline_ci_verdict_total",
+        Unread::Gap("CI verdicts read for the revision about to be promoted, pass/fail/no_evidence; a red verdict stops the rollout but no rule reads the count, so the reasons below have no surface"),
+    ),
+    (
+        "cogneva_mainline_ci_no_verdict_reason_total",
+        Unread::Gap("why the CI question came back without a verdict; the reasons include pending, which is normal, and the unreadable/config ones, so a rule has to enumerate the non-normal reasons or fire on every wait -- a fail-open list whose policy is not declared"),
+    ),
+    (
+        "llm_upstream_failures_total",
+        Unread::Elsewhere("llm_calls_all_failing reads llm_calls_total{result=error} and the health table states the current consecutive failures; the help says this cumulative total and the backoff window describe one history"),
+    ),
+    (
+        "llm_request_param_clamped_total",
+        Unread::Elsewhere("the producer's own comment states the verdict's readings are the pool entry's key presence and llm_usage_verdict_measured, which llm_usage_verdict_unmeasured reads"),
+    ),
+];
+
+/// How many `Gap` entries the census left. A new series that no face reads and
+/// that nothing else states must be classified, and calling it a gap raises
+/// this number on purpose -- the point of the ratchet is that the increase is a
+/// decision someone made, not a drift nobody saw.
+const GAPS_AT_CENSUS: usize = 23;
+
+#[test]
+fn every_series_the_closed_set_publishes_has_a_decided_reader() {
+    let rule_read: BTreeSet<String> = chart_rules()
+        .iter()
+        .flat_map(|(_, promql)| metric_names_in(promql))
+        .collect();
+    let panel_read = dashboard::series();
+
+    // A histogram is published under its base name and read under one of the
+    // recording suffixes, and the closed set holds the base name -- so a reader
+    // naming the suffix has read the family. The suffixes are the recording
+    // convention and nothing else: `memory_unextracted_raw` has a sibling whose
+    // name merely starts the same way, and a prefix match would read that
+    // sibling as this family's reader.
+    let suffixes = ["_bucket", "_sum", "_count"];
+    let read = |names: &BTreeSet<String>, name: &str| {
+        names.contains(name)
+            || suffixes
+                .iter()
+                .any(|s| names.contains(&format!("{name}{s}")))
+    };
+
+    let listed: BTreeSet<&str> = UNREAD.iter().map(|(n, _)| *n).collect();
+
+    let unclassified: Vec<&str> = cog_core::metric_names::ALL
+        .iter()
+        .map(|n| n.as_str())
+        .filter(|n| !read(&rule_read, n) && !read(&panel_read, n) && !listed.contains(n))
+        .collect();
+    assert!(
+        unclassified.is_empty(),
+        "闭集里的这些序列没有任何告警规则或面板在读，也没在 UNREAD 里给出判词——补读者，或写清那份事实在哪个面上已经可见，或登记成欠账:\n{}",
+        unclassified.join("\n")
+    );
+
+    let published: BTreeSet<&str> = cog_core::metric_names::ALL
+        .iter()
+        .map(|n| n.as_str())
+        .collect();
+
+    let unknown: Vec<&str> = UNREAD
+        .iter()
+        .map(|(n, _)| *n)
+        .filter(|n| !published.contains(n))
+        .collect();
+    assert!(
+        unknown.is_empty(),
+        "UNREAD 里这些名字不在闭集里，登记已过期（改名或删除后没跟着收敛）: {unknown:?}"
+    );
+
+    let read_but_listed: Vec<&str> = UNREAD
+        .iter()
+        .map(|(n, _)| *n)
+        .filter(|n| read(&rule_read, n) || read(&panel_read, n))
+        .collect();
+    assert!(
+        read_but_listed.is_empty(),
+        "UNREAD 里这些名字其实已经有读者了，豁免是假的——读者已落地，登记该删: {read_but_listed:?}"
+    );
+
+    // The reason is the entry's whole value: an exemption without one is the
+    // "not needed" this table exists to refuse, and a debt without one cannot be
+    // acted on. Reading it here is also what keeps the payload from being an
+    // unused field -- a verdict that states nothing is not a verdict.
+    let unreasoned: Vec<&str> = UNREAD
+        .iter()
+        .filter(|(_, v)| {
+            let reason = match v {
+                Unread::Elsewhere(reason) | Unread::Gap(reason) => *reason,
+            };
+            reason.split_whitespace().count() < 5
+        })
+        .map(|(name, _)| *name)
+        .collect();
+    assert!(
+        unreasoned.is_empty(),
+        "UNREAD 里这些条目没写清理由（豁免要说出那份事实在哪个面上、欠账要说出为什么这轮补不了）: {unreasoned:?}"
+    );
+
+    let gaps = UNREAD
+        .iter()
+        .filter(|(_, v)| matches!(v, Unread::Gap(_)))
+        .count();
+    assert!(
+        gaps <= GAPS_AT_CENSUS,
+        "零读者序列的欠账数从 {GAPS_AT_CENSUS} 涨到 {gaps}：新增的零读者序列必须当轮补读者，或把它的成因写进 UNREAD 并同步改 GAPS_AT_CENSUS（改这个数就是承认多欠一笔）"
     );
 }
 

@@ -1119,50 +1119,131 @@ data:
               "summary": "The registry store refused {value} tag deletion(s) in the last hour. Deletion is how the volume is held down, and the round otherwise reports itself as having run, so a refusal is the one shape where reclamation happens on paper and the store keeps growing. The refusal is the store answering something the round cannot act on: a registry that answers the listing but not the delete (a read-only or garbage-collecting one, a token whose scope stopped covering deletes, a 5xx on the delete path), so the cause is in that container's log and in the registry's own -- each refused tag is named there with the store's answer. This rule reads the increase, so a round whose deletions succeed stops firing by itself"
             },
             {
-            "name": "llm_usage_verdict_unmeasured",
-            "promql": "(max without (pod, container, instance) (max_over_time(llm_usage_verdict_measured{upstream=~\".+\"}[1h])) == 0) and on (upstream) (max without (pod, container, instance) (max_over_time(llm_upstream_healthy{upstream=~\".+\"}[1h])) == 1)",
-            "condition": {
-              "less_than": 1.0
+              "name": "llm_usage_verdict_unmeasured",
+              "promql": "(max without (pod, container, instance) (max_over_time(llm_usage_verdict_measured{upstream=~\".+\"}[1h])) == 0) and on (upstream) (max without (pod, container, instance) (max_over_time(llm_upstream_healthy{upstream=~\".+\"}[1h])) == 1)",
+              "condition": {
+                "less_than": 1.0
+              },
+              "severity": "warning",
+              "summary": "upstream {upstream} has served traffic in the last hour while the gateway still has no measured answer to \"does this upstream report usage in a stream\", so it is deciding whether to keep the caller's stream_options from the vendor profile alone. That decision is what pins token metering at zero: when the profile says the upstream does not report usage, the field is stripped before the request leaves, the upstream is never asked, and every call ends as not_asked -- and neither a zero token count nor an absent usage reading can tell that apart from an upstream that was asked and had nothing to report. A measured verdict is 1 here whichever way it was obtained, from the pool entry or from the gateway asking again while this upstream was healthy, so this series clears by itself once an ask concludes; the backoff between asks is deliberate, because every probe spends real quota. The probe's own log line names this upstream and reports what came back -- a non-2xx is a quota or auth wall that will pass, while a 2xx whose usage did not arrive in a stream frame is an answer to a different question and is the case to look at. The reading that proves the ask mattered is llm_usage_readings_total for this upstream: its not_asked cell should stop growing once a verdict exists, and if it keeps growing with this series at 1, the strip is not what is keeping the counts at zero"
             },
-            "severity": "warning",
-            "summary": "upstream {upstream} has served traffic in the last hour while the gateway still has no measured answer to \"does this upstream report usage in a stream\", so it is deciding whether to keep the caller's stream_options from the vendor profile alone. That decision is what pins token metering at zero: when the profile says the upstream does not report usage, the field is stripped before the request leaves, the upstream is never asked, and every call ends as not_asked -- and neither a zero token count nor an absent usage reading can tell that apart from an upstream that was asked and had nothing to report. A measured verdict is 1 here whichever way it was obtained, from the pool entry or from the gateway asking again while this upstream was healthy, so this series clears by itself once an ask concludes; the backoff between asks is deliberate, because every probe spends real quota. The probe's own log line names this upstream and reports what came back -- a non-2xx is a quota or auth wall that will pass, while a 2xx whose usage did not arrive in a stream frame is an answer to a different question and is the case to look at. The reading that proves the ask mattered is llm_usage_readings_total for this upstream: its not_asked cell should stop growing once a verdict exists, and if it keeps growing with this series at 1, the strip is not what is keeping the counts at zero"
-          },
-          {
-            "name": "llm_upstream_rejecting_while_pool_reads_available",
-            "promql": "(changes(llm_upstream_client_errors_total{upstream=~\".+\"}[1h]) > 0) and on () (max(llm_pool_available) == 1)",
-            "condition": {
-              "greater_than": 0.0
+            {
+              "name": "llm_upstream_rejecting_while_pool_reads_available",
+              "promql": "(changes(llm_upstream_client_errors_total{upstream=~\".+\"}[1h]) > 0) and on () (max(llm_pool_available) == 1)",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "upstream {upstream} answered a request before its first byte with a request-shape status (400, 404 or 422) in the last hour -- the counter moved {value} time(s) between scrapes -- and the pool's available reading is still 1. That class of rejection is kept out of the health table on purpose: the request belongs to the caller, and letting it mark the upstream would let one malformed request walk the whole pool down, which happened once. Two consequences follow, and the second is why this counter needs a reader of its own. An upstream that has answered nothing successfully since this gateway started has no health series at all, so there is nothing per-upstream for a reader to look at. And the pool's available reading cannot see this either: it is driven by the suspicion windows, which this class never enters. So while an upstream answers every request with 400 the only trace is this counter, and nothing was reading it. Two conditions produce this same reading and are repaired in opposite directions: a request built wrong on our side, which every upstream rejects, so the counter moves on several upstreams in the same window and the request is what to fix; or an upstream that rejects requests its peers accept, where the counter moves here alone while the pool serves through the others and the repair is on its account or endpoint. This rule cannot tell those apart and must not be read as if it could -- it names the subject, not the cause. Comparing this counter across the pool's upstreams is the reading that separates them."
             },
-            "severity": "warning",
-            "summary": "upstream {upstream} answered a request before its first byte with a request-shape status (400, 404 or 422) in the last hour -- the counter moved {value} time(s) between scrapes -- and the pool's available reading is still 1. That class of rejection is kept out of the health table on purpose: the request belongs to the caller, and letting it mark the upstream would let one malformed request walk the whole pool down, which happened once. Two consequences follow, and the second is why this counter needs a reader of its own. An upstream that has answered nothing successfully since this gateway started has no health series at all, so there is nothing per-upstream for a reader to look at. And the pool's available reading cannot see this either: it is driven by the suspicion windows, which this class never enters. So while an upstream answers every request with 400 the only trace is this counter, and nothing was reading it. Two conditions produce this same reading and are repaired in opposite directions: a request built wrong on our side, which every upstream rejects, so the counter moves on several upstreams in the same window and the request is what to fix; or an upstream that rejects requests its peers accept, where the counter moves here alone while the pool serves through the others and the repair is on its account or endpoint. This rule cannot tell those apart and must not be read as if it could -- it names the subject, not the cause. Comparing this counter across the pool's upstreams is the reading that separates them."
-          },
-          {
-            "name": "llm_calls_all_failing",
-            "promql": "(sum by (upstream) (changes(llm_calls_total{result=\"error\"}[6h])) > 0) unless on () (sum(changes(llm_calls_total{result=\"ok\"}[6h])) > 0)",
-            "condition": {
-              "greater_than": 0.0
+            {
+              "name": "llm_calls_all_failing",
+              "promql": "(sum by (upstream) (changes(llm_calls_total{result=\"error\"}[6h])) > 0) unless on () (sum(changes(llm_calls_total{result=\"ok\"}[6h])) > 0)",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "critical",
+              "summary": "upstream {upstream} recorded failed LLM calls in the last 6 hours while not one call to any upstream succeeded -- the failure counter moved {value} time(s) between scrapes. Nothing else on the observation face says this: the pool's available reading is a probe verdict, so it answers whether we are backing off, not whether any call worked, and an upstream that has not answered successfully since this process started publishes no health series at all. This rule cannot fire on idleness -- it needs the failure side to have moved -- so an empty queue and a dead pool do not look alike here. Each upstream is reported separately for that reason: failures on one upstream while its peers serve is a fault on that account or endpoint, and failures on every upstream in the same window is a request the caller built wrong, and only the comparison across these series tells those apart. Read the status and body the gateway logged for each attempt before choosing a side to repair."
             },
-            "severity": "critical",
-            "summary": "upstream {upstream} recorded failed LLM calls in the last 6 hours while not one call to any upstream succeeded -- the failure counter moved {value} time(s) between scrapes. Nothing else on the observation face says this: the pool's available reading is a probe verdict, so it answers whether we are backing off, not whether any call worked, and an upstream that has not answered successfully since this process started publishes no health series at all. This rule cannot fire on idleness -- it needs the failure side to have moved -- so an empty queue and a dead pool do not look alike here. Each upstream is reported separately for that reason: failures on one upstream while its peers serve is a fault on that account or endpoint, and failures on every upstream in the same window is a request the caller built wrong, and only the comparison across these series tells those apart. Read the status and body the gateway logged for each attempt before choosing a side to repair."
-          },
-          {
-            "name": "workload_no_available_replica",
-            "promql": "((max without (pod, container, instance) (max_over_time(kube_deployment_status_replicas_available[30m:1m])) and on(namespace, deployment) (max without (pod, container, instance) (kube_deployment_spec_replicas) > 0)) and on(namespace, deployment) (max without (pod, container, instance) (count_over_time(kube_deployment_status_replicas_available[1h])) > max without (pod, container, instance) (count_over_time(kube_deployment_status_replicas_available[30m]))))",
-            "condition": {
-              "less_than": 1.0
+            {
+              "name": "workload_no_available_replica",
+              "promql": "((max without (pod, container, instance) (max_over_time(kube_deployment_status_replicas_available[30m:1m])) and on(namespace, deployment) (max without (pod, container, instance) (kube_deployment_spec_replicas) > 0)) and on(namespace, deployment) (max without (pod, container, instance) (count_over_time(kube_deployment_status_replicas_available[1h])) > max without (pod, container, instance) (count_over_time(kube_deployment_status_replicas_available[30m]))))",
+              "condition": {
+                "less_than": 1.0
+              },
+              "severity": "critical",
+              "summary": "a deployment that asks for at least one replica has had none available for the whole thirty minutes ({value} available at the end of the window). The window has to clear the rollouts themselves: measured over the three days before this rule was written, gaps with no available replica at all ran from a single scrape up to 27 minutes, while the outages worth waking someone for ran 35 minutes and longer -- a five-minute window fires on every rollout instead. Read that deployment's pods and the state their containers ended in, not only the revision that was rolling out. What this rule cannot read, and must not be credited with: the API goes on calling a pod ready while the runtime will not let the kubelet finish killing it, so a container that is never released keeps every replica count here at its healthy value, and that failure reaches this rule only once the containers actually die; pod_stuck_terminating reads the deletion side, and states its own limits there. The publishing pod is a scrape detail, not the subject: it is deleted and recreated with every monitoring rollout, so it is aggregated out while the label naming the subject is left untouched."
             },
-            "severity": "critical",
-            "summary": "a deployment that asks for at least one replica has had none available for the whole thirty minutes ({value} available at the end of the window). The window has to clear the rollouts themselves: measured over the three days before this rule was written, gaps with no available replica at all ran from a single scrape up to 27 minutes, while the outages worth waking someone for ran 35 minutes and longer -- a five-minute window fires on every rollout instead. Read that deployment's pods and the state their containers ended in, not only the revision that was rolling out. What this rule cannot read, and must not be credited with: the API goes on calling a pod ready while the runtime will not let the kubelet finish killing it, so a container that is never released keeps every replica count here at its healthy value, and that failure reaches this rule only once the containers actually die; pod_stuck_terminating reads the deletion side, and states its own limits there. The publishing pod is a scrape detail, not the subject: it is deleted and recreated with every monitoring rollout, so it is aggregated out while the label naming the subject is left untouched."
-          },
-          {
-            "name": "pod_stuck_terminating",
-            "promql": "(time() - max by (namespace, pod) (kube_pod_deletion_timestamp)) > 1800",
-            "condition": {
-              "greater_than": 1800.0
+            {
+              "name": "pod_stuck_terminating",
+              "promql": "(time() - max by (namespace, pod) (kube_pod_deletion_timestamp)) > 1800",
+              "condition": {
+                "greater_than": 1800.0
+              },
+              "severity": "critical",
+              "summary": "Pod {pod} in namespace {namespace} has carried a deletion timestamp for {value} seconds: the API took the deletion and the runtime has not released the container, so the pod is neither usable nor gone, and it still occupies whatever ceiling a replacement would have to fit into. Two things about this rule are measured and one is not. Measured: the half hour sits above this cluster's own distribution -- replayed over the three days before the rule was written, every deletion that completed on its own finished within nineteen minutes, while a five-minute threshold would have fired on eighteen pods that were merely rolling; and the series is real, kube-state-metrics exposes the family even when it has no samples (its HELP and TYPE lines are present) and Prometheus lists the name. Not measured: no deletion here has ever reached half an hour, so this rule has never fired on a real stall, and the incident that motivated it would not have tripped it either -- those containers would not die and the outage ran eighty minutes, yet its own deletion episodes lasted nine minutes at most, and its pod kept its place in the API with no deletion stamp for most of that time. Read the kubelet's own log for the pod: deleting it again does not help, and the timestamp is the only thing that moves"
             },
-            "severity": "critical",
-            "summary": "Pod {pod} in namespace {namespace} has carried a deletion timestamp for {value} seconds: the API took the deletion and the runtime has not released the container, so the pod is neither usable nor gone, and it still occupies whatever ceiling a replacement would have to fit into. Two things about this rule are measured and one is not. Measured: the half hour sits above this cluster's own distribution -- replayed over the three days before the rule was written, every deletion that completed on its own finished within nineteen minutes, while a five-minute threshold would have fired on eighteen pods that were merely rolling; and the series is real, kube-state-metrics exposes the family even when it has no samples (its HELP and TYPE lines are present) and Prometheus lists the name. Not measured: no deletion here has ever reached half an hour, so this rule has never fired on a real stall, and the incident that motivated it would not have tripped it either -- those containers would not die and the outage ran eighty minutes, yet its own deletion episodes lasted nine minutes at most, and its pod kept its place in the API with no deletion stamp for most of that time. Read the kubelet's own log for the pod: deleting it again does not help, and the timestamp is the only thing that moves"
-          }
+            {
+              "name": "notification_sign_refused",
+              "promql": "sum by (outlet, outcome) (increase(cogneva_notification_sign_total{outcome!=\"signed\"}[1h])) > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "The notification signing face turned a request away -- {value} refusal(s) on outlet {outlet} in the last hour. The outcome cell says whose it is: unknown_outlet is a name no signing rule covers, which is ours, and not_configured is an outlet this deployment holds no key for, which is the operator's. Nothing else reports this. The delivery readings count messages that went out, so an outlet whose every request is refused and an outlet nobody has called are the same zero there, and only this series says which of the two is happening. The filter names the success cell rather than enumerating the refusals on purpose: a refusal token added later lands on the alerting side by default, where the cost is a look, while the other default would let it go silent. A signature actually handed out increments the signed cell and does not appear here. Read the outlet and the outcome before deciding who repairs it."
+            },
+            {
+              "name": "registry_reclaim_debt_unpaid",
+              "promql": "max without (pod, container, instance) (max_over_time(cogneva_registry_gc_owed[30m])) > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "The registry maintenance round deleted tags and has not got the tag server to reclaim them for at least the last half hour ({value} at the end of the window). The deletion is done and the space is not back: the blobs stay on the volume until the server is restarted and walks its store again, and that restart is what has been failing. This gauge is the only surface that says so, which is why the round publishes it every round rather than at the moment of failure -- by the time the debt is old, the failure is a line in a log nobody reads. The half hour is sixty consecutive beats, well above a scrape gap, so it does not fire on one missed round. It cannot fire when no registry claim is configured: the cell is absent then, which is nobody asked, not a debt. Read the round's own last-round timestamp and the registry pod's restart history; a debt that persists while the round keeps running means the restart itself is being refused, not that the round stopped."
+            },
+            {
+              "name": "llm_pool_signal_undelivered",
+              "promql": "max without (pod, container, instance) (max_over_time(llm_pool_signal_connected[30m])) < 1",
+              "condition": {
+                "less_than": 1.0
+              },
+              "severity": "warning",
+              "summary": "The gateway has not got the pool verdict into the cross-process key for at least the last half hour. The gateway is the only process holding upstream credentials, so the scheduler reads whether the pool is usable from that key; while this reading is 0 the verdict is known to the gateway and to nobody else, and a pool that has gone down is not pausing LLM-dependent work. Read it beside llm_pool_available: a 0 here while that one is 1 is the case worth waking for, because the pool is working and the scheduler is being told nothing, while a 0 beside a 0 is a down pool that is also not being announced. The half hour is sixty consecutive beats: the channel is rebuilt on demand and a single failed attempt is normal, so this fires on a run of them, not one. It cannot fire when no Redis is configured -- the cell is absent then, which is a single-process deployment and not a fault -- and an absent or stale series makes the window empty rather than zero, so a quiet exporter is not read as a delivery failure either. No join is used on purpose: every join right-operand in this family would have to be published unconditionally to survive the failure it is meant to qualify, and the failure here needs no qualification."
+            },
+            {
+              "name": "llm_usage_upstream_silent",
+              "promql": "sum by (upstream) (increase(llm_usage_readings_total{outcome=\"absent\"}[1h])) > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "Upstream {upstream} was asked for token usage and answered without it -- {value} such call(s) in the last hour. This is the cell that says the token totals are blind: a call whose usage never arrived is recorded beside zeros, so every token counter for that upstream reads zero because the upstream said nothing, not because nothing was used, and a token budget or a cost reading built on those counters is wrong in the direction that looks healthy. It is split from the not_asked cell on purpose: absent is the upstream's silence, not_asked is our own request having gone out without stream_options and is the cell to read before blaming the provider. Read the two together before repairing -- a request-side omission shows up as not_asked, and only an upstream that was asked and stayed quiet climbs here."
+            },
+            {
+              "name": "metrics_log_at_floor_capacity",
+              "promql": "max without (pod, container, instance) (max_over_time(metrics_samples_over_capacity[30m])) > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "The metrics sample log is over its row budget and cannot be pruned further without deleting a series' current value ({value} at the end of the window). The sweep deletes oldest-first and stops at each gauge series' newest row, so this is the state where the log has grown past what the deletion order can reach: the reading is already a verdict, not a ratio, and nothing else publishes it. Read the row count and the budget beside it to see how far past, and the on-disk bytes for what the volume is paying -- the bytes lag the row count because PostgreSQL returns deleted space only when it vacuums, so they are a reading and never the criterion. The half hour is sixty consecutive scrapes, so a sweep that momentarily reports the floor does not raise this. The fix is a policy decision and not a code one: either the budget moves or the series that hold it are retired."
+            },
+            {
+              "name": "memory_raw_backlog_aged_out",
+              "promql": "max without (pod, container, instance) (max_over_time(memory_unextracted_raw_aged_out[30m])) > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "Archived raw sources have aged past the re-drive window without a summary ({value} of them at the end of the window). The system will not pick these up again on its own: they need a budgeted backfill, which is a decision someone has to make, and the reading that says the decision is due is this one. It is the actionable half of a pair -- the sibling counts every unextracted raw and this one counts the part that is past the window -- and it is published by the same scan, so a scan that stopped shows up as the pair going absent rather than as a zero. Read the sibling for the size of the backlog still inside the window, and the summarizer's own outcome counters for whether the extraction path is failing or merely behind. A zero here is a real zero: it means every raw still missing a summary is one the system will still try again by itself."
+            },
+            {
+              "name": "audited_request_refused",
+              "promql": "sum by (outcome) (increase(audited_llm_requests_total{outcome!=\"released\"}[1h])) > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "A request offered to the audited document channel was turned away -- {value} of them in the last hour under outcome {outcome} -- so a document somebody wanted to send did not leave. Each cell is a different cause with a different repair and the series is the only surface that says which: refused_by_audit is a security event, the judge having matched a credential shape in the body; blocked_by_switch is the channel configured off, which is a flip of the switch and not a caller mistake; refused_over_bound is the body past the auditable bound, where either the bound or the caller has to change; refused_not_text and refused_unreadable are the caller's encoding and the link. The filter names the one success cell instead of enumerating the refusals so a cell added later lands here rather than going silent. Every cell of this counter is published at zero from deployment on, so a quiet reading is a channel nobody called and not a missing series, and the increase is what separates the two."
+            },
+            {
+              "name": "version_contract_violated",
+              "promql": "max by (clause) (max_over_time(cogneva_version_contract_violations[1h])) > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "Clause {clause} of the version contract does not hold ({value} violations standing at the end of the window). The clauses are the promises the release face makes about tags and declarations -- release_point, tag_fidelity, tag_set_agreement, declaration_monotone -- and a violation means a published artifact or a declared version disagrees with what the repository says. This is a standing count per clause, not a total: a violation nobody fixed does not read as a rising rate of new ones, and every clause is reported including the ones at zero, so an absent series means that clause was never judged rather than that it passed. Read the checks counter beside it for that distinction -- a contract that holds and a judgement that never ran are the same zero without it -- and read the deployer's warning for the values that disagreed. The hour exceeds any single release pass, so the reading is the standing state and not one pass' opinion."
+            },
+            {
+              "name": "worktree_tree_about_to_rebuild",
+              "promql": "max by (worktree) (max_over_time(cogneva_worktree_index_missing_files[30m])) > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "Worktree {worktree} has {value} tracked files its git index does not remember. Every one of them is rewritten by that worktree's next reset, so this is a tree about to be rebuilt rather than refreshed, and the size of the number is itself the reading: a value at the whole-tree size is the index having lost the tree, while a handful is a normal partial state. Nothing else reports it. Read it with the index-present series, because the two failure faces are different -- 'the index remembers no files' and 'the index is not there' both make the next reset look free, and only that pair tells them apart. The half hour is long enough that a reset in progress does not raise this, and the reading is per worktree so the subject is named rather than summed."
+            }
           ]
         },
         "trace_collector": {

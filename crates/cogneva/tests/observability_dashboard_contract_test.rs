@@ -12,7 +12,6 @@
 //! label sets belong to the kubelet, not to this repository.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 
 #[path = "common/closed_set.rs"]
 mod closed_set;
@@ -21,10 +20,12 @@ mod producer;
 #[path = "common/promql.rs"]
 mod promql;
 
+#[path = "common/dashboard.rs"]
+mod dashboard;
+
+use dashboard::{is_log_query, json_field, metric_exprs, repo_root, text as dashboard_text};
 use producer::carries_the_producer;
 use promql::{metric_names_in, shape_complaints};
-
-const DASHBOARD: &str = "deploy/k3s/observability/manifests/06-grafana-dashboard-configmap.yaml";
 
 /// Series this workspace produces: the labels each one carries, and the file
 /// that publishes it.
@@ -429,58 +430,6 @@ const FOREIGN: &[(&str, &str)] = &[
         "kube-state-metrics",
     ),
 ];
-
-fn dashboard_text() -> String {
-    let path = repo_root().join(DASHBOARD);
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("dashboard manifest unreadable at {}: {e}", path.display()))
-}
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-/// Whether an `expr` filters a datasource other than the metric store, i.e. a
-/// log query. Those select by label and name no series, so running the PromQL
-/// extractor over one invents names — a `$variable` reference reads as an
-/// identifier. Only this dashboard holds such panels; the alert rules are all
-/// metric queries.
-fn is_log_query(expr: &str) -> bool {
-    expr.trim_start().starts_with('{')
-}
-
-/// The decoded value of one string field on a line of the manifest.
-///
-/// The dashboard is JSON inside a YAML block scalar, so a label value in it
-/// arrives as `\"firing\"`. Every reader that kept the escapes read that span as
-/// opened and never closed, and the rest of the line disappeared into it --
-/// which is how a check over this file comes to cover less than it looks like
-/// it does. Decoding here means what is analysed is the text Prometheus is
-/// given, and that text has no backslashes in it.
-fn json_field(line: &str, key: &str) -> Option<String> {
-    let object = format!("{{{}}}", line.trim().trim_end_matches(','));
-    let value: serde_json::Value = serde_json::from_str(&object).ok()?;
-    Some(value.get(key)?.as_str()?.to_string())
-}
-
-/// Every metric `expr` in the dashboard, with the line it sits on.
-///
-/// One reader for the name check and the shape check both, so a panel one of
-/// them refuses to see is not a panel the other silently stops covering.
-fn metric_exprs(text: &str) -> Vec<(usize, String)> {
-    text.lines()
-        .enumerate()
-        .filter_map(|(n, line)| {
-            let expr = json_field(line, "expr")?;
-            // A log query selects by label, not by series name; the extractor
-            // would read its `$variable` references as metrics.
-            if expr.is_empty() || is_log_query(&expr) {
-                return None;
-            }
-            Some((n + 1, expr))
-        })
-        .collect()
-}
 
 /// Label names a legend template asks for: every `{{...}}` in the format.
 fn legend_labels_in(legend: &str) -> BTreeSet<String> {

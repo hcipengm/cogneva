@@ -26,9 +26,42 @@ use cog_core::metric_names::IDENTIFIED;
 /// The registry path is checked as the identifier, not the name: a file that
 /// merely passes the name around is not publishing this series, and accepting it
 /// would turn the entry back into the empty licence the check exists to refuse.
+/// The identifier is accepted bare as well as `metric_names::`-qualified,
+/// because a file that imports the constant names a real recording site just as
+/// directly -- the qualification says where the constant came from, not whether
+/// this file records the series -- and refusing the imported form would push a
+/// producer site onto a file that does not publish it. The match is bounded on
+/// both sides so a longer name that merely contains this identifier is not read
+/// as it.
 pub fn carries_the_producer(text: &str, name: &str) -> bool {
     text.contains(&format!("\"{name}\""))
         || IDENTIFIED.iter().any(|(ident, metric)| {
-            metric.as_str() == name && text.contains(&format!("metric_names::{ident}"))
+            metric.as_str() == name
+                && (text.contains(&format!("metric_names::{ident}"))
+                    || mentions_identifier(text, ident))
         })
+}
+
+/// Whether `ident` appears in `text` as a whole identifier.
+///
+/// Bounded on both sides: `VERSION_CONTRACT_VIOLATIONS_TOTAL` and
+/// `MY_VERSION_CONTRACT_VIOLATIONS` both contain the name and neither is it.
+pub fn mentions_identifier(text: &str, ident: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(at) = text[from..].find(ident) {
+        let start = from + at;
+        let end = start + ident.len();
+        let before_ok = start == 0 || !is_word_byte(bytes[start - 1]);
+        let after_ok = end == bytes.len() || !is_word_byte(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
