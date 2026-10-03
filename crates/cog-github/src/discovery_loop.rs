@@ -52,6 +52,26 @@ const CROSS_VALIDATE_TASK_TIMEOUT_SECS: u64 = 3600;
 /// without speeding recovery. Six hours bounds the post-reset recovery
 /// lag while keeping probe cost at one failed call per intent per window.
 const TERMINAL_BACKOFF_CAP_SECS: u64 = 6 * 60 * 60;
+/// How long a finished attempt keeps its intent answered, counted from the
+/// round that saw it finish rather than from the row that carried it.
+///
+/// A completed attempt is a verdict about the intent ("this was fixed"), and
+/// a verdict whose lifetime is whatever the terminal-row retention happens to
+/// be is not a verdict anyone owns: a 1-hour retention re-ran the same intent
+/// three times in seventeen hours, and the fix for that is not "make the
+/// retention longer" but "let the verdict say how long it lasts". The whole
+/// point of keeping the fact here is that the retention can then be set for
+/// its own reason — how long a terminal row stays readable — without moving
+/// this one by accident.
+///
+/// Two days because the platform, not this timer, is what actually ends an
+/// answered intent: a fix that landed closes the issue and the intent stops
+/// being discovered at all. This window only covers the case where we believed
+/// we fixed something and the issue is still open — long enough that a still-
+/// broken issue is re-examined at most once per working day or so, and long
+/// enough to sit out a quota window that kept the attempt from being a real
+/// test of the fix.
+const ANSWERED_GRACE_SECS: u64 = 48 * 60 * 60;
 
 /// Whether a failed processing attempt is deterministic: retrying the same
 /// intent next tick cannot succeed until an external window resets
@@ -101,6 +121,11 @@ enum IntentTaskAction {
     /// The attempt is live: pending, scheduled or running.
     InHand,
     /// The attempt finished successfully. The intent is answered.
+    ///
+    /// The row is what says so while it exists, but the answer outlives it:
+    /// [`ANSWERED_GRACE_SECS`] is counted from the round that observed the
+    /// completion, so the retention that eventually drops the row cannot also
+    /// be what expires the verdict.
     Done,
 }
 
@@ -253,6 +278,12 @@ pub struct GitHubDiscoveryLoop {
     /// Same self-adjusting schedule as [`Self::terminal_backoff`], kept in a
     /// separate ledger because that one is cleared by any successful round.
     redrive_backoff: HashMap<String, TerminalBackoff>,
+    /// Intents whose attempt was seen to finish, and when. Without this the
+    /// "answered" verdict is carried by the task row alone, so it expires when
+    /// the row is archived — a retention that exists to bound how long a
+    /// terminal row stays readable, and that would otherwise be read as "how
+    /// long a fixed issue stays fixed". Keyed like the other guard ledgers.
+    answered: HashMap<String, u64>,
     /// Optional scheduler gate. When the LLM upstream pool is down the
     /// supervisor pauses the [`TaskClass::LlmDependent`] class; every round
     /// that would call an LLM (triage assessment, fix submission) is skipped
@@ -280,6 +311,11 @@ struct DiscoveryGuardState {
     terminal_backoff: HashMap<String, PersistedBackoff>,
     #[serde(default)]
     redrive_backoff: HashMap<String, PersistedBackoff>,
+    /// Intent guard key → unix seconds when its completion was observed. An
+    /// absolute moment rather than a remaining window: it is a fact about the
+    /// past, so a restart can only read it, never move it.
+    #[serde(default)]
+    answered: HashMap<String, u64>,
 }
 
 fn discovery_guard_state_path() -> std::path::PathBuf {
@@ -529,6 +565,7 @@ impl GitHubDiscoveryLoop {
             terminal_backoff: HashMap::new(),
             blocked_reported: HashMap::new(),
             redrive_backoff: HashMap::new(),
+            answered: HashMap::new(),
             gate: None,
         }
     }
@@ -621,6 +658,17 @@ impl GitHubDiscoveryLoop {
                         .entry(key)
                         .or_insert_with(|| TerminalBackoff::restored(&b));
                 }
+                // The later observation wins where both exist: this load runs
+                // once, before any round, so a live entry can only be one this
+                // process wrote after the file was last written — and that one
+                // is younger, which is the direction a grace period must not
+                // be shortened in.
+                for (key, at) in state.answered {
+                    self.answered
+                        .entry(key)
+                        .and_modify(|live| *live = (*live).max(at))
+                        .or_insert(at);
+                }
             }
             Err(e) => {
                 tracing::warn!(error = %e, "discovery guard state corrupt; starting fresh")
@@ -647,6 +695,7 @@ impl GitHubDiscoveryLoop {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.persisted()))
                 .collect(),
+            answered: self.answered.clone(),
         };
         let Ok(json) = serde_json::to_string_pretty(&state) else {
             return;
@@ -746,24 +795,48 @@ impl GitHubDiscoveryLoop {
 
     /// Decide what this round should do about a fix intent and act on the
     /// decision. Returns `true` when the caller should submit a fresh task;
-    /// `false` when the attempt is already in hand, was refilled in place, or
-    /// is blocked. Every `false` return leaves the caller's submitted-guard
-    /// untouched, so the intent is re-examined next round rather than being
-    /// recorded as answered.
+    /// `false` when the attempt is already in hand, was refilled in place, is
+    /// blocked, or was answered recently enough that the answer still stands.
+    /// Every `false` return leaves the caller's submitted-guard untouched, so
+    /// the intent is re-examined next round rather than being recorded as
+    /// answered.
     ///
     /// A re-drive re-runs the stored attempt, so its payload is the one the
     /// intent had when it was first submitted; a reply that arrives while the
     /// attempt is failing is seen by the judgement, not by the refilled task.
     /// Refreshing the payload means replacing the row, which the idempotent
     /// insert cannot do — the attempt is recycled instead of silently dropped.
+    ///
+    /// The verdict this returns is read off the row, but only while the row
+    /// exists. A finished attempt is remembered in [`Self::answered`] for
+    /// [`ANSWERED_GRACE_SECS`], so the archive pass dropping the row cannot
+    /// turn an answered intent back into an unattempted one.
     async fn apply_fix_decision(&mut self, key: &str, kind: IntentKind, number: u64) -> bool {
         match self.intent_decision(kind, number).await {
-            IntentTaskAction::Submit => true,
+            IntentTaskAction::Submit => {
+                // No row carries the id. That is an unattempted intent only if
+                // this loop never watched the attempt finish; an answer it did
+                // watch outlives the row it was read from, by a span declared
+                // for the answer rather than for the row.
+                let still_answered = match self.answered.get(key) {
+                    Some(&at) => now_unix().saturating_sub(at) < ANSWERED_GRACE_SECS,
+                    None => false,
+                };
+                if still_answered {
+                    false
+                } else {
+                    self.answered.remove(key);
+                    true
+                }
+            }
             IntentTaskAction::Done => {
                 // Answered: the streak is about an unresolved intent, so it
                 // ends with the intent. Keeping it would make a later, genuine
                 // failure of this intent wait out the old window.
                 self.redrive_backoff.remove(key);
+                // Keep the moment, not the row: the row is the archive pass's
+                // to drop whenever the retention says so.
+                self.answered.insert(key.to_string(), now_unix());
                 false
             }
             IntentTaskAction::InHand => false,
@@ -872,6 +945,12 @@ impl GitHubDiscoveryLoop {
             return Ok(0);
         }
         self.load_guards_once().await;
+        // The answered ledger is a window with no natural reaper: an intent
+        // whose issue the platform closed stops being discovered, so it never
+        // comes back to be re-decided and its entry would sit there forever.
+        // Drop the expired ones here, where the round already owns the state.
+        self.answered
+            .retain(|_, at| now_unix().saturating_sub(*at) < ANSWERED_GRACE_SECS);
         let mut issues = self
             .discovery
             .scan(self.provider.as_ref(), &self.config)
@@ -2343,6 +2422,150 @@ mod tests {
         std::env::remove_var("COGNEVA_DATA_DIR");
     }
 
+    /// A finished attempt is a verdict about the intent, and the verdict has
+    /// to outlive the row it was read from: the archive pass drops terminal
+    /// rows on a retention that exists to bound how long a row stays readable,
+    /// and reusing it as the lifetime of "this issue is fixed" turns an
+    /// answered intent back into an unattempted one the moment the row goes.
+    #[tokio::test]
+    async fn an_answered_intent_outlives_the_row_that_carried_it() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
+        let orchestrator = Arc::new(MockOrchestrator::new());
+        let build = || {
+            GitHubDiscoveryLoop::new(
+                Arc::new(MockProvider {
+                    issues: vec![],
+                    comments: Mutex::new(vec![]),
+                    ci_logs: vec![],
+                    ci_runs: Mutex::new(vec![]),
+                    prs: vec![],
+                    pr_details: HashMap::new(),
+                }),
+                IssueTriage::rules_only(),
+                config(),
+                Some(orchestrator.clone()),
+                None,
+            )
+        };
+        let mut loop_ = build();
+
+        // No row carries the id: nothing has been attempted, so submitting is
+        // the only way to start.
+        assert!(
+            loop_
+                .apply_fix_decision("issue:7", IntentKind::Issue, 7)
+                .await
+        );
+
+        // The attempt finishes, and a round reads that off the row.
+        // The id is the one the loop derives: `<platform_kind>-<kind>-<number>`,
+        // and the mock provider keeps the trait's default platform kind.
+        orchestrator
+            .intent_rows
+            .lock()
+            .unwrap()
+            .insert("platform-issue-7".into(), TaskStatus::Completed);
+        assert!(
+            !loop_
+                .apply_fix_decision("issue:7", IntentKind::Issue, 7)
+                .await,
+            "a completed attempt answers the intent"
+        );
+
+        // The archive pass drops the row. The answer was not the row's to hold.
+        orchestrator.without_intent_row("platform-issue-7");
+        assert!(
+            !loop_
+                .apply_fix_decision("issue:7", IntentKind::Issue, 7)
+                .await,
+            "the answer must survive the row's retention elapsing"
+        );
+
+        // A restart is not a different system: the grace is carried in the
+        // guard file, like the backoff windows it sits beside.
+        loop_.persist_guards().await;
+        let mut restarted = build();
+        restarted.load_guards_once().await;
+        assert!(
+            !restarted
+                .apply_fix_decision("issue:7", IntentKind::Issue, 7)
+                .await,
+            "an answered intent is still answered after a rollout"
+        );
+
+        // Once the declared span is up, the intent is open again — and the
+        // entry is dropped rather than kept forever.
+        loop_
+            .answered
+            .insert("issue:7".into(), now_unix() - ANSWERED_GRACE_SECS - 1);
+        assert!(
+            loop_
+                .apply_fix_decision("issue:7", IntentKind::Issue, 7)
+                .await
+        );
+        assert!(
+            !loop_.answered.contains_key("issue:7"),
+            "an expired answer is discarded, so the ledger cannot grow forever"
+        );
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
+    /// Both directions of the load, on one file: an answer still inside its
+    /// span survives the restart that reads it, and one whose span has passed
+    /// is not resurrected. A stale file must not keep an intent closed that
+    /// its own span had already released.
+    #[tokio::test]
+    async fn an_expired_answer_is_not_resurrected() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
+        // One entry inside its span and one past it: the load has to keep the
+        // first and drop the second, so a reader cannot pass this by treating
+        // every loaded answer the same way.
+        let on_disk = serde_json::json!({
+            "answered": {
+                "issue:7": (now_unix() - ANSWERED_GRACE_SECS - 1),
+                "issue:8": (now_unix() - 60),
+            },
+        });
+        tokio::fs::write(discovery_guard_state_path(), on_disk.to_string())
+            .await
+            .unwrap();
+
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            Arc::new(MockProvider {
+                issues: vec![],
+                comments: Mutex::new(vec![]),
+                ci_logs: vec![],
+                ci_runs: Mutex::new(vec![]),
+                prs: vec![],
+                pr_details: HashMap::new(),
+            }),
+            IssueTriage::rules_only(),
+            config(),
+            Some(Arc::new(MockOrchestrator::new())),
+            None,
+        );
+        loop_.load_guards_once().await;
+        assert!(
+            loop_
+                .apply_fix_decision("issue:7", IntentKind::Issue, 7)
+                .await,
+            "an answer whose span has passed does not hold the intent closed"
+        );
+        assert!(
+            !loop_
+                .apply_fix_decision("issue:8", IntentKind::Issue, 8)
+                .await,
+            "an answer still inside its span survives the restart that loaded it"
+        );
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
     /// 任务失败的类型从记录原样回到错误对象上，判定因此按类型走。没有类型的
     /// 失败仍然是散文，不允许被读成终止性。
     #[tokio::test]
@@ -2543,6 +2766,10 @@ mod tests {
         /// Result returned for a `pr_cross_validate` task. `None` reports the
         /// task as Failed; the default is a passing verdict JSON.
         cv_verdict: Mutex<Option<serde_json::Value>>,
+        /// Rows the mock graph carries by id, so a test can put an intent's
+        /// attempt into a terminal state and then take it away again — what
+        /// the archive pass does between two rounds.
+        intent_rows: Mutex<HashMap<String, TaskStatus>>,
     }
 
     impl MockOrchestrator {
@@ -2563,7 +2790,14 @@ mod tests {
                     "eval": "not applicable",
                 }))),
                 assess_failure_cause: Mutex::new(None),
+                intent_rows: Mutex::new(HashMap::new()),
             }
+        }
+
+        /// What the archive pass does to a terminal row once its retention
+        /// elapses — the row stops answering for the intent.
+        fn without_intent_row(&self, id: &str) {
+            self.intent_rows.lock().unwrap().remove(id);
         }
 
         fn with_verdict(self, verdict: serde_json::Value) -> Self {
@@ -2687,6 +2921,15 @@ mod tests {
                         task.error = Some("mock cross-validation failure".into());
                     }
                 }
+                return Some(task);
+            }
+            if let Some(status) = self.intent_rows.lock().unwrap().get(id).copied() {
+                let mut task = Task::new(
+                    id,
+                    TaskType::Custom("platform_issue_fix".into()),
+                    serde_json::json!({}),
+                );
+                task.status = status;
                 return Some(task);
             }
             if !id.contains("intent-assess") {
@@ -3128,6 +3371,10 @@ mod tests {
 
     #[tokio::test]
     async fn forbidden_label_is_skipped() {
+        // A round writes the guard file, and the path it writes to is read
+        // from the environment — so this has to serialise with the tests that
+        // set it, or it lands in whatever directory those are using.
+        let _guard = crate::identity::ENV_LOCK.lock().await;
         let mut forbidden = issue(3, "x".repeat(100).as_str());
         forbidden.labels = vec!["wontfix".into()];
         let provider = Arc::new(MockProvider {
@@ -3267,6 +3514,10 @@ mod tests {
 
     #[tokio::test]
     async fn ci_polling_submits_only_new_failures() {
+        // Same reason as `forbidden_label_is_skipped`: a round writes the
+        // guard file at the environment's path, so it must not run while
+        // another test has that path pointed at its own directory.
+        let _guard = crate::identity::ENV_LOCK.lock().await;
         let provider = Arc::new(MockProvider {
             issues: vec![],
             comments: Mutex::new(vec![]),
