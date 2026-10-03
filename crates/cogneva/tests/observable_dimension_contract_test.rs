@@ -60,10 +60,7 @@ const PRODUCERS: &[(&str, &[(&str, bool)])] = &[
         "crates/cog-observability/src/observable.rs",
         &[("D5", true)],
     ),
-    (
-        "crates/cog-orchestrator/src/observable.rs",
-        &[("D1", true), ("D8", true)],
-    ),
+    ("crates/cog-orchestrator/src/observable.rs", &[("D1", true)]),
 ];
 
 /// Dimensions read somewhere other than the scrape endpoint, with the file

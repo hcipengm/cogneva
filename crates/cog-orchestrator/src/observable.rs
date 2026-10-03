@@ -325,15 +325,20 @@ impl Observable for StreamPendingObservable {
     }
 }
 
-use tokio::sync::Mutex;
-
 /// Orchestrator-level observable state.
+///
+/// It publishes the orchestrator's own task outcomes and nothing else. Message
+/// and crew-round counts are deliberately not among them: both facts are
+/// already metered where they happen, in the collaboration layer's D8 series
+/// (`collab_message_count`, `collab_round_count`), whose recorders have live
+/// callers. A second counter here for the same fact would be two numbers that
+/// must agree and can drift. The crew-round one was worse than redundant — it
+/// was keyed per `crew_id` while this producer declares its dimensions bounded,
+/// so wiring it would have made a bounded declaration false.
 #[derive(Default)]
 pub struct OrchestratorObservable {
     task_count: AtomicU64,
     task_success_count: AtomicU64,
-    message_count: AtomicU64,
-    crew_rounds: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl OrchestratorObservable {
@@ -347,48 +352,23 @@ impl OrchestratorObservable {
             self.task_success_count.fetch_add(1, Ordering::Relaxed);
         }
     }
-
-    pub fn record_message(&self) {
-        self.message_count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub async fn record_crew_round(&self, crew_id: impl Into<String>) {
-        let mut map = self.crew_rounds.lock().await;
-        *map.entry(crew_id.into()).or_insert(0) += 1;
-    }
 }
 
 #[async_trait]
 impl Observable for OrchestratorObservable {
     async fn collect_metrics(&self, dimension: &str) -> SFResult<Vec<RawMetric>> {
         let mut metrics = Vec::new();
-        match dimension {
-            "D1" => {
-                let total = self.task_count.load(Ordering::Relaxed);
-                let success = self.task_success_count.load(Ordering::Relaxed);
-                metrics.push(RawMetric::new("orch_task_count", total as f64));
-                metrics.push(RawMetric::new("orch_task_success_count", success as f64));
-                if total > 0 {
-                    metrics.push(RawMetric::new(
-                        "orch_task_success_rate",
-                        success as f64 / total as f64,
-                    ));
-                }
-            }
-            "D8" => {
+        if dimension == "D1" {
+            let total = self.task_count.load(Ordering::Relaxed);
+            let success = self.task_success_count.load(Ordering::Relaxed);
+            metrics.push(RawMetric::new("orch_task_count", total as f64));
+            metrics.push(RawMetric::new("orch_task_success_count", success as f64));
+            if total > 0 {
                 metrics.push(RawMetric::new(
-                    "orch_message_count",
-                    self.message_count.load(Ordering::Relaxed) as f64,
+                    "orch_task_success_rate",
+                    success as f64 / total as f64,
                 ));
-                let rounds = self.crew_rounds.lock().await;
-                for (crew_id, count) in rounds.iter() {
-                    metrics.push(
-                        RawMetric::new("orch_crew_rounds", *count as f64)
-                            .with_label("crew_id", crew_id),
-                    );
-                }
             }
-            _ => {}
         }
         Ok(metrics)
     }
@@ -401,7 +381,7 @@ impl Observable for OrchestratorObservable {
     /// （任务数、成功数、比率），键固定、基数有界；agent 面在 D1 上是逐 step
     /// 按 task_id 记的，同一个维度名在这两处有不同的有界性。
     fn available_dimensions(&self) -> Vec<DimensionSpec> {
-        vec![DimensionSpec::bounded("D1"), DimensionSpec::bounded("D8")]
+        vec![DimensionSpec::bounded("D1")]
     }
 }
 
@@ -672,5 +652,48 @@ mod tests {
                 "rule {rule_name} must query {metric}, got: {promql}"
             );
         }
+    }
+
+    /// The orchestrator's published set is pinned to the outcomes it itself
+    /// produces.
+    ///
+    /// A message count and a per-crew round count used to be published here
+    /// with no writer at all — and the round one was keyed per `crew_id`
+    /// against a dimension this producer declares bounded, so wiring it would
+    /// have made that declaration false. Both facts are metered where they
+    /// happen, in the collaboration layer's D8 series, so this fails if either
+    /// name comes back here without a caller behind it.
+    #[tokio::test]
+    async fn d1_publishes_only_the_orchestrators_own_task_outcomes() {
+        let observable = OrchestratorObservable::new();
+        observable.record_task(true);
+        observable.record_task(false);
+
+        let names: Vec<String> = observable
+            .collect_metrics("D1")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "orch_task_count",
+                "orch_task_success_count",
+                "orch_task_success_rate",
+            ],
+            "two tasks with one success publish the counts and the rate"
+        );
+
+        assert!(
+            observable.collect_metrics("D8").await.unwrap().is_empty(),
+            "nothing is published under D8 any more"
+        );
+        assert_eq!(
+            observable.available_dimensions().len(),
+            1,
+            "the orchestrator declares a single dimension"
+        );
     }
 }
