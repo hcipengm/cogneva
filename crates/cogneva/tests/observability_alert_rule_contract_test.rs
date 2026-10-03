@@ -260,6 +260,14 @@ const PRODUCED: &[(&str, &str)] = &[
         "llm_usage_verdict_measured",
         "crates/cog-gateway/src/security_gateway.rs",
     ),
+    // The only record of a request-shape rejection. The health table never sees
+    // that class of rejection by design, so with no reader here an upstream that
+    // answers every request with 400 keeps its healthy reading and the pool's
+    // available reading at 1, and nothing says otherwise.
+    (
+        "llm_upstream_client_errors_total",
+        "crates/cog-gateway/src/security_gateway.rs",
+    ),
     (
         "cogneva_metric_held_without_producer",
         "crates/cog-gateway/src/lib.rs",
