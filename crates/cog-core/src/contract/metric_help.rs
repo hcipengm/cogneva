@@ -93,7 +93,13 @@ const COUNTER_HELP: &[(&str, &str)] = &[
     ),
     (
         "llm_upstream_failures_total",
-        "Total LLM upstream failures, excluding rate limits",
+        "Total LLM upstream failures this process recorded against an upstream, \
+         counting failures of serving requests and of the health probes that \
+         retest a suspect window alike -- the backoff window beside it is driven \
+         by the same events, so the two readings describe one history. Rejections \
+         as malformed requests are counted separately. Absent until the first \
+         failure: a missing series is neither a zero nor a broken exporter, and \
+         only this counter's own reader can tell which",
     ),
     (
         crate::metric_names::NOTIFICATION_SIGN_TOTAL.as_str(),

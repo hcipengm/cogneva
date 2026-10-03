@@ -2986,18 +2986,9 @@ async fn mark_upstream_failure(
     quota_reset_unix: Option<i64>,
     quota_window_secs: Option<u64>,
 ) {
-    record_counter(
-        state,
-        cog_core::metric_names::LLM_UPSTREAM_FAILURES_TOTAL,
-        &[("upstream", &LlmHealthTable::key(upstream))],
-    )
-    .await;
-    if let Some((consecutive, secs)) = state.llm_health.note_failure(
-        upstream,
-        state.config.llm_health_probe_secs,
-        quota_reset_unix,
-        quota_window_secs,
-    ) {
+    if let Some((consecutive, secs)) =
+        record_upstream_failure(state, upstream, quota_reset_unix, quota_window_secs).await
+    {
         tracing::warn!(
             upstream = %base,
             consecutive_failures = consecutive,
@@ -3006,6 +2997,38 @@ async fn mark_upstream_failure(
             quota_window_secs = quota_window_secs.unwrap_or(0),
             "LLM 上游标记嫌疑，探测窗口到期后复测"
         );
+    }
+}
+
+/// 上游失败记账的共用体：计数、进/加嫌疑窗、落读数。请求路径与主动探测路径都走这里，
+/// 各自只保留自己那条 WARN。
+///
+/// 两条路径非共用这一份不可，因为探测失败与请求失败是同一类事件：都进同一个嫌疑窗、
+/// 都进同一个 `consecutive_failures`。各写一份的代价已经发生过——探测那份漏掉了计数器，
+/// 而池级锁死期间请求根本到不了上游，于是最需要这条计数的那次故障里它一条样本都没有。
+///
+/// 返回 `Some((consecutive, secs))` 表示这次失败**开了新窗**：每一次失败的尝试都进计数，
+/// 但只有开窗那一次值得打日志（窗口内的并发失败刷屏盖掉真正的那条），
+/// 所以调用侧只在拿到 `Some` 时打。
+async fn record_upstream_failure(
+    state: &AppState,
+    upstream: &LlmUpstream,
+    quota_reset_unix: Option<i64>,
+    quota_window_secs: Option<u64>,
+) -> Option<(u32, u64)> {
+    record_counter(
+        state,
+        cog_core::metric_names::LLM_UPSTREAM_FAILURES_TOTAL,
+        &[("upstream", &LlmHealthTable::key(upstream))],
+    )
+    .await;
+    let opened = state.llm_health.note_failure(
+        upstream,
+        state.config.llm_health_probe_secs,
+        quota_reset_unix,
+        quota_window_secs,
+    );
+    if let Some((consecutive, _)) = opened {
         record_upstream_state(
             state,
             upstream,
@@ -3015,6 +3038,7 @@ async fn mark_upstream_failure(
             quota_window_secs,
         );
     }
+    opened
 }
 
 /// 主动健康探测循环：周期扫描嫌疑窗到期的上游，发最小请求复测。
@@ -3068,12 +3092,9 @@ async fn probe_suspect_upstreams(state: &AppState) {
                 }
             }
             Err((msg, quota_reset, quota_window)) => {
-                if let Some((consecutive, secs)) = state.llm_health.note_failure(
-                    &upstream,
-                    state.config.llm_health_probe_secs,
-                    quota_reset,
-                    quota_window,
-                ) {
+                if let Some((consecutive, secs)) =
+                    record_upstream_failure(state, &upstream, quota_reset, quota_window).await
+                {
                     tracing::warn!(
                         upstream = %base,
                         consecutive_failures = consecutive,
@@ -3082,14 +3103,6 @@ async fn probe_suspect_upstreams(state: &AppState) {
                         quota_window_secs = quota_window.unwrap_or(0),
                         error = %msg,
                         "LLM 上游探测仍失败，指数加窗"
-                    );
-                    record_upstream_state(
-                        state,
-                        &upstream,
-                        false,
-                        consecutive,
-                        quota_reset,
-                        quota_window,
                     );
                 }
             }
@@ -6527,6 +6540,69 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         // 两个失败上游都进了嫌疑窗。
         assert!(state.llm_health.is_suspect(&stub_upstream(&dead, "m1")));
         assert!(state.llm_health.is_suspect(&stub_upstream(&dead2, "m2")));
+        // 请求路径的失败也要落进计数：请求与探测共用同一份记账，这一侧钉住，
+        // 免得共用体哪天只剩一侧在用。
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        for (base, model) in [(&dead, "m1"), (&dead2, "m2")] {
+            let key = LlmHealthTable::key(&stub_upstream(base, model));
+            assert_eq!(
+                series_value(
+                    &text,
+                    cog_core::metric_names::LLM_UPSTREAM_FAILURES_TOTAL.as_str(),
+                    &key
+                ),
+                Some(1.0),
+                "上游 {base} 的一次请求失败要进计数:\n{text}"
+            );
+        }
+    }
+
+    /// 探测失败也是上游失败，进同一条计数——因为池锁死期间请求根本到不了上游
+    ///（网关本地就回 503），那时唯一在发生的上游失败就是探测本身。探测这一侧原先
+    /// 自己内联记账、漏了计数器，于是最需要这条计数的那次故障里它一条样本都没有。
+    #[tokio::test]
+    async fn a_failed_health_probe_counts_as_an_upstream_failure() {
+        let dead = spawn_stub_upstream(429, r#"{"error":{"type":"rate_limit_exceeded"}}"#).await;
+        let state = test_state(vec![stub_upstream(&dead, "m1")]);
+        let upstream = state.config.llm_upstreams[0].clone();
+        let key = LlmHealthTable::key(&upstream);
+        // 池锁死：探测覆盖池内全部上游，不看嫌疑窗是否到期——正是现场那次故障的形态。
+        state.pool_down.store(true, Ordering::SeqCst);
+
+        let before = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert_eq!(
+            series_value(
+                &before,
+                cog_core::metric_names::LLM_UPSTREAM_FAILURES_TOTAL.as_str(),
+                &key
+            ),
+            None,
+            "一次失败都没发生时不发布这条序列（缺席不是 0）:\n{before}"
+        );
+
+        probe_suspect_upstreams(&state).await;
+        // 逐上游的 gauge 由池状态刷新那一拍统一发布，不在失败记账里直接写。
+        refresh_pool_state(&state).await;
+
+        let after = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert_eq!(
+            series_value(
+                &after,
+                cog_core::metric_names::LLM_UPSTREAM_FAILURES_TOTAL.as_str(),
+                &key
+            ),
+            Some(1.0),
+            "探测失败要进计数:\n{after}"
+        );
+        assert_eq!(
+            series_value(
+                &after,
+                cog_core::metric_names::LLM_UPSTREAM_CONSECUTIVE_FAILURES.as_str(),
+                &key
+            ),
+            Some(1.0),
+            "同一次失败在嫌疑窗读数上:\n{after}"
+        );
     }
 
     /// 池耗尽时透传最后一个上游的真实响应，上游自己说的重试等待要一起透传。
