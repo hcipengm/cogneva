@@ -1252,6 +1252,15 @@ data:
               },
               "severity": "warning",
               "summary": "A build store reclaim pass computed its keep set from a cluster read that found no live revision at all ({value} was the highest any pass read across the window). The keep set is the whole of what stops this pass deleting a base image something is running, so an empty one is the one way this pass removes a base image that is in use, and the read that produced it exits successfully -- which is why nothing else reports it. The gauge is published only by a completed round, so an absent series means no round completed rather than a zero, and a series carrying a zero is the danger itself rather than a missing reading. The half hour is sixty consecutive beats, so one quiet scrape is not this reading. Read the rounds counter and the last-round timestamp beside it to tell a pass that read nothing from a pass that never ran, and the pruned image count for whether anything was in fact removed from under a running workload."
+            },
+            {
+              "name": "metrics_retired_rows_still_arriving",
+              "promql": "(max without (pod, container, instance) (min_over_time(metrics_retired_rows_removed[1h])) > 0) and (max without (pod, container, instance) (count_over_time(metrics_retired_rows_removed[2h])) > max without (pod, container, instance) (count_over_time(metrics_retired_rows_removed[1h])))",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "Every release pass in the last hour found rows of retired metric names to delete, and the smallest number any of those passes removed is {value}. The release is idempotent, retires a fixed list of names, and clears a table in one pass however large its backlog, so a store that has once been drained reports zero on every pass after the first -- a reading that stays non-zero is one the release is not draining, which is the help's own criterion and the only one this gauge carries. The number is what the last pass removed and not a backlog, so read the row count beside it for how much is there. The hour is far above the sweep's own two-minute ceiling: the pass rides the sweep, and the sweep's period is derived from how fast the log fills rather than configured, which is why the window is a multiple of a bound and not the period itself. The two-hour count is the coverage term and not a second reading: a series younger than the window is judged on the samples it happens to have, so the rule also requires samples older than the hour, which is what makes the 'at every pass' claim true rather than an artifact of a process that just started. An absent series means no pass has run at all, a different fault that the background loop's liveness reading covers."
             }
           ]
         },

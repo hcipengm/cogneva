@@ -532,6 +532,16 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_buildah_store_live_images",
         "crates/cog-reflection/src/mainline_deployer.rs",
     ),
+    // The retired-row release. Its help states the criterion itself -- a table
+    // whose reading stays non-zero is one the release is not draining -- and
+    // the window that makes "stays" readable is bounded rather than guessed:
+    // the pass rides the metric sweep, and the sweep's period is derived from
+    // the fill rate but capped by a declared ceiling, so an hour is a large
+    // multiple of a bound the code states.
+    (
+        "metrics_retired_rows_removed",
+        "crates/cog-storage/src/metrics_retirement.rs",
+    ),
 ];
 
 /// Series the rules read that this workspace does not publish, with the owner.
@@ -959,10 +969,6 @@ const UNREAD: &[(&str, Unread)] = &[
         Unread::Gap("the memory backend's failure counter; a failing backend reaches the user as a failed task and no reading names memory as the cause -- the repair is a threshold policy for what error rate is a fault"),
     ),
     (
-        "metrics_retired_rows_removed",
-        Unread::Gap("rows of retired names the last release pass deleted; the help reads a table whose value stays non-zero as one not being drained, but 'stays' is a property of a sequence of passes and the pass cadence is not published by any series"),
-    ),
-    (
         "metrics_samples_rows",
         Unread::Elsewhere("one operand of the capacity verdict that metrics_log_at_floor_capacity reads"),
     ),
@@ -1080,7 +1086,7 @@ const UNREAD: &[(&str, Unread)] = &[
 /// that nothing else states must be classified, and calling it a gap raises
 /// this number on purpose -- the point of the ratchet is that the increase is a
 /// decision someone made, not a drift nobody saw.
-const GAPS_AT_CENSUS: usize = 22;
+const GAPS_AT_CENSUS: usize = 21;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {
