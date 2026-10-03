@@ -825,7 +825,7 @@ data:
         {
           "id": 23,
           "title": "Build Cache Measurement Age",
-          "description": "How long ago the build cache was measured, and how long ago a pass last removed anything from it, both over 6h. A walk that fails keeps the last reading instead of publishing a smaller one, because a smaller number would read as a cache that shrank -- so the sizes alone cannot tell a cache nothing is writing to from a scan loop that stopped walking it. The first series is what separates them: a flat size with a rising age is an unmeasured cache, and the same flat size with the age staying near the scan interval is a cache that is idle but watched. The second is the same question one step further on, about the pass rather than the walk: a cache that is over its cap and whose last paying pass is hours old is a cap that stopped being enforced -- which looks exactly like a cap that was never needed if you only read the size. It carries no value until a pass has run, so an absent line means no pass has ever paid down this directory. No threshold is drawn, as elsewhere: what counts as stale is the interval the deployment configured, which a panel cannot read.",
+          "description": "How long ago the build cache was measured, how long ago a pass last removed anything from it, and how long it has been over its cap, all over 6h. A walk that fails keeps the last reading instead of publishing a smaller one, because a smaller number would read as a cache that shrank -- so the sizes alone cannot tell a cache nothing is writing to from a scan loop that stopped walking it. The first series is what separates them: a flat size with a rising age is an unmeasured cache, and the same flat size with the age staying near the scan interval is a cache that is idle but watched. The second is the same question one step further on, about the pass rather than the walk, and it is the one pair on this panel whose two lines are read together: a cache that is over its cap and whose last paying pass is hours old is a cap that stopped being enforced -- which looks exactly like a cap that was never needed if you only read the size. It carries no value until a pass has run, so an absent line means no pass has ever paid down this directory. The third is what makes the second's reading honest, because it is the same question asked of the cache rather than of the pass: the age of the last pass grows while the cache sits under its cap, since a cache that needs no pass earns a long age by being fine, where this line stays at zero and only leaves it once a walk has found the cache over and no later walk has found it under. A long second line with a zero third is a cap that is not being exercised; a long second line with the third following it up is a cap that is not holding. No threshold is drawn, as elsewhere: what counts as stale is the interval the deployment configured, which a panel cannot read.",
           "type": "timeseries",
           "gridPos": {
             "h": 8,
@@ -845,6 +845,14 @@ data:
             {
               "expr": "time() - cogneva_build_target_last_reclaim_seconds",
               "legendFormat": "{{dir}} since last pass that paid",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_build_target_over_cap_seconds",
+              "legendFormat": "{{dir}} over its cap for",
               "datasource": {
                 "type": "prometheus",
                 "uid": "${datasource}"

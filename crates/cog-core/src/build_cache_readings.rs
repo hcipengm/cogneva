@@ -50,12 +50,24 @@
 //!   pass ran) or `ungated` (no build gate is in force, so nothing may be
 //!   removed). A growing `busy` or `ungated` is a cap that is not being enforced
 //!   at all rather than one that is failing.
+//! - `cogneva_build_target_over_cap_seconds{dir}` -- how long the cache has been
+//!   over its cap, as a run of walks that each found it over; 0 while it is under.
+//!   The duration a rule needs, and not the same series as the age of the last
+//!   pass: those two are equal only while the cache is over its cap without
+//!   interruption, and reading one for the other turns "no pass in six intervals"
+//!   -- which a cache that was under its cap for most of them earns by being
+//!   fine -- into a claim that the cache has been over its cap for six intervals.
+//!   A run bounded this way is also what a restart can honestly report: the first
+//!   walk of a process that finds the cache over starts a run at that moment.
 //! - `cogneva_build_target_reclaimed_bytes_total{dir}` -- bytes removed so far.
 //! - `cogneva_build_target_last_reclaim_seconds{dir}` -- when a pass last ran,
 //!   and 0 when none has. A pass that never runs has to age somewhere, or a
 //!   cache over its cap reads the same as one being fixed; the epoch ages it
 //!   from something true, where the process start would age it from something
-//!   that has not happened.
+//!   that has not happened. How long ago that was is *not* how long the cache
+//!   has been over its cap -- a cache that spent most of that time under its cap
+//!   earns the same age by being fine -- and the series that answers that
+//!   question is `over_cap_seconds` above.
 //! - `cogneva_build_target_scan_interval_seconds{dir}` -- the configured
 //!   interval, so a rule can say "no pass in six intervals" without a constant
 //!   that goes stale when the interval is configured differently.
@@ -146,6 +158,14 @@ struct ReclaimState {
     over_limit: Option<u64>,
     /// Bytes above the cap after the last pass that ran; `None` before one has.
     unmet: Option<u64>,
+    /// When the run of walks that found the cache over its cap began; `None`
+    /// when the last walk found it under, and before a first walk that did not.
+    ///
+    /// A run of walks rather than of passes: a pass that freed bytes and left the
+    /// cache over does not restart it, because the question this answers is how
+    /// long the cap has been unmet, and a pass that did not meet it did not
+    /// change that answer.
+    over_since: Option<u64>,
 }
 
 /// The cache this process owns, as measured by the last completed walk.
@@ -304,6 +324,15 @@ impl BuildCacheReadings {
         {
             let mut state = self.reclaim.lock().unwrap_or_else(|e| e.into_inner());
             state.over_limit = Some(excess);
+            // What ends the run is a walk that finds the cache under its cap, and
+            // only that: an over-cap walk leaves the beginning where it was
+            // whether or not a pass ran during it, because a pass that freed
+            // bytes and stayed over has not ended anything a reader asked about.
+            if excess == 0 {
+                state.over_since = None;
+            } else if state.over_since.is_none() {
+                state.over_since = Some(unix_now());
+            }
         }
         if excess == 0 {
             return;
@@ -423,6 +452,23 @@ impl BuildCacheReadings {
                     .with_label(DIR_LABEL, dir),
             );
         }
+        // Published whether or not the cache is over, so that a rule reading it
+        // has a number in both states rather than a series that appears when the
+        // cache goes over -- which a rule would read as the same thing as a walk
+        // that never happened. Zero rather than absent is also what makes "under
+        // its cap" sayable: `over_limit_bytes` publishes 0 for that state too,
+        // and a reader comparing the two would otherwise have to treat a missing
+        // series as a satisfied cap.
+        out.push(
+            RawMetric::new(
+                BUILD_TARGET_OVER_CAP_SECS_METRIC,
+                state
+                    .over_since
+                    .map(|since| unix_now().saturating_sub(since))
+                    .unwrap_or(0) as f64,
+            )
+            .with_label(DIR_LABEL, dir),
+        );
         if let Some(unmet) = state.unmet {
             out.push(
                 RawMetric::new(BUILD_TARGET_UNMET_METRIC, unmet as f64).with_label(DIR_LABEL, dir),
@@ -942,6 +988,65 @@ mod tests {
         );
     }
 
+    /// How long the cache has been over its cap is a run of walks, and what
+    /// ends it is a walk that found the cache under. A pass does not: a cache
+    /// that has been over its cap for an hour reads that way whether or not a
+    /// pass paid part of it down during the hour, and the rule that fires on
+    /// this reads the walk's own count of it rather than the age of the last
+    /// pass, which a cache that spent the hour under its cap has too.
+    #[tokio::test]
+    async fn the_over_cap_run_is_ended_by_a_walk_under_the_cap_and_not_by_a_pass() {
+        let lock = tempfile::tempdir().unwrap();
+        let gate = gate(lock.path(), 1, true);
+        let (root, over) = cache(&[("release/incremental/one", 4000)]);
+        let readings = BuildCacheReadings::new(root.path()).with_cap(1000, 300);
+
+        // The reading moves with the clock, so a second can pass between the
+        // walk and the read; what is under test is which moment the run is
+        // measured from, not the wall clock's resolution.
+        let secs_over = |value: Option<f64>| value.expect("published with a cap configured");
+
+        run_a_pass_when_the_slot_is_free(&readings, &over, &gate).await;
+        assert!(
+            secs_over(reading(&readings, BUILD_TARGET_OVER_CAP_SECS_METRIC, None).await) < 5.0,
+            "the run begins at the walk that found the cache over"
+        );
+
+        // What a run that has been going a while reads as, without waiting an
+        // hour for it: the beginning is the only state this carries, so moving
+        // the beginning moves the reading by the same amount.
+        readings.reclaim.lock().unwrap().over_since = Some(unix_now().saturating_sub(3600));
+        assert!(
+            secs_over(reading(&readings, BUILD_TARGET_OVER_CAP_SECS_METRIC, None).await) >= 3600.0
+        );
+
+        // The same over-cap cache, walked again with the slot free. Whatever the
+        // pass freed, the cache is still over, and the run is where it was: a
+        // pass is not a walk that found the cache under its cap.
+        run_a_pass_when_the_slot_is_free(&readings, &over, &gate).await;
+        assert!(
+            secs_over(reading(&readings, BUILD_TARGET_OVER_CAP_SECS_METRIC, None).await) >= 3600.0,
+            "a pass that ran is not a walk that found the cache under"
+        );
+
+        // A walk that finds nothing in the cache ends the run, and says so with a
+        // zero rather than by going absent.
+        readings.enforce_cap(&[], Some(&gate)).await;
+        assert_eq!(
+            reading(&readings, BUILD_TARGET_OVER_CAP_SECS_METRIC, None).await,
+            Some(0.0),
+            "under its cap is a run of length zero"
+        );
+
+        // And the next walk that finds it over starts a new run rather than
+        // resuming the one that ended.
+        run_a_pass_when_the_slot_is_free(&readings, &over, &gate).await;
+        assert!(
+            secs_over(reading(&readings, BUILD_TARGET_OVER_CAP_SECS_METRIC, None).await) < 5.0,
+            "a new run begins at the walk that found it over again"
+        );
+    }
+
     /// The whole family is published with a cap configured, including the
     /// outcomes that have not happened, so a reader sees the domain with zeros
     /// rather than inferring it from what occurred.
@@ -957,6 +1062,7 @@ mod tests {
             BUILD_TARGET_SCAN_INTERVAL_METRIC,
             BUILD_TARGET_RECLAIMED_METRIC,
             BUILD_TARGET_LAST_RECLAIM_METRIC,
+            BUILD_TARGET_OVER_CAP_SECS_METRIC,
         ] {
             assert!(
                 names.contains(&expected),
@@ -972,6 +1078,16 @@ mod tests {
         // stalled rule) takes a start-seeded value for a pass that just paid.
         assert_eq!(
             reading(&readings, BUILD_TARGET_LAST_RECLAIM_METRIC, None).await,
+            Some(0.0)
+        );
+        // Present before a walk and reading zero, so that a rule has a number in
+        // both states rather than a series that appears when the cache goes over
+        // -- which would be the same shape as a cache nothing ever walked. Zero
+        // here means "no walk has found it over", and only a walk can start a
+        // run, because whether the cache is over its cap is not a thing this
+        // process knows between walks.
+        assert_eq!(
+            reading(&readings, BUILD_TARGET_OVER_CAP_SECS_METRIC, None).await,
             Some(0.0)
         );
         let outcomes: Vec<&str> = metrics

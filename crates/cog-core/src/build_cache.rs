@@ -30,6 +30,17 @@ pub const BUILD_TARGET_OVER_LIMIT_METRIC: &str = "cogneva_build_target_over_limi
 /// Bytes still above the cap after the last pass that ran.
 pub const BUILD_TARGET_UNMET_METRIC: &str = "cogneva_build_target_unmet_bytes";
 
+/// How long the cache has been over its cap, in seconds; 0 while it is under.
+///
+/// A separate series from the age of the last pass, because the two are equal
+/// only while a cache is over its cap continuously. A cache that was brought
+/// under its cap and stayed there for an hour before going over again has an
+/// hour-old last pass and a one-interval-old excess, and a rule that reads the
+/// first as the second says "over its cap for six intervals" about a cache that
+/// went over this walk. What ends this span is a walk that finds the cache under
+/// its cap, not a pass that freed bytes.
+pub const BUILD_TARGET_OVER_CAP_SECS_METRIC: &str = "cogneva_build_target_over_cap_seconds";
+
 /// Walks that found the cache over its cap, by what happened next.
 pub const BUILD_TARGET_OVER_CAP_METRIC: &str = "cogneva_build_target_over_cap_total";
 

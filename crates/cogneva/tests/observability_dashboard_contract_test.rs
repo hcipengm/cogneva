@@ -254,6 +254,15 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["dir"],
         "crates/cog-core/src/build_cache.rs",
     ),
+    // How long the cache has been over its cap, as a run of walks. A different
+    // question from the timestamp above, which ages whether or not the cache is
+    // over anything: a cache brought under its cap and left there for an hour
+    // earns a long age by being fine, where this one stays at zero.
+    (
+        "cogneva_build_target_over_cap_seconds",
+        &["dir"],
+        "crates/cog-core/src/build_cache.rs",
+    ),
     // Every over-cap pass, split by how it ended. The outcome label is the
     // whole reading: reclaimed, unmet, busy and ungated are four different
     // reasons no bytes moved, and folded into one count they would read as one.

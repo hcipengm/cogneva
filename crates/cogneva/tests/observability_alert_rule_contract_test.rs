@@ -70,9 +70,16 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_build_gate_slots",
         "crates/cog-core/src/build_gate.rs",
     ),
-    // The cap family. Two of them are read by the rules that decide whether the
-    // cap is being enforced at all: over-limit is what says there is something
-    // to pay down, and the pair of timestamps is what says no pass has.
+    // The cap family, as far as the rules read it. `unmet` is what says a pass
+    // ran and could not reach the cap; the other two are the pair a stalled cap
+    // is judged by -- how long the cache has been over it against how long
+    // between walks, so the threshold moves with a configured interval instead
+    // of a constant that goes stale when the interval changes.
+    // `last_reclaim_seconds` is deliberately not here. It is still published and
+    // still has a panel, but no rule reads it: the age of the last pass is not
+    // how long the cap has gone unmet -- a cache that spent that time under its
+    // cap earns the same age by being fine -- and a rule that read one for the
+    // other woke someone about a cache whose excess was one walk old.
     // The names are named in the contract file rather than in either publisher:
     // two processes measure a cache of this shape on two volumes that are not
     // each other's, so a second spelling of any of them would leave a rule
@@ -82,11 +89,7 @@ const PRODUCED: &[(&str, &str)] = &[
         "crates/cog-core/src/build_cache.rs",
     ),
     (
-        "cogneva_build_target_over_limit_bytes",
-        "crates/cog-core/src/build_cache.rs",
-    ),
-    (
-        "cogneva_build_target_last_reclaim_seconds",
+        "cogneva_build_target_over_cap_seconds",
         "crates/cog-core/src/build_cache.rs",
     ),
     (
