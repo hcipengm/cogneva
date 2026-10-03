@@ -261,11 +261,21 @@ const PRODUCED: &[(&str, &str)] = &[
         "crates/cog-gateway/src/security_gateway.rs",
     ),
     // The only record of a request-shape rejection. The health table never sees
-    // that class of rejection by design, so with no reader here an upstream that
-    // answers every request with 400 keeps its healthy reading and the pool's
-    // available reading at 1, and nothing says otherwise.
+    // that class of rejection by design, and an upstream that has answered
+    // nothing successfully since this process started has no per-upstream health
+    // series at all, so there is no healthy reading to keep: an upstream that
+    // answers every request with 400 leaves the pool's available reading at 1 and
+    // this counter as the only trace, and with no reader here nothing says so.
     (
         "llm_upstream_client_errors_total",
+        "crates/cog-gateway/src/security_gateway.rs",
+    ),
+    // The pool's own verdict -- the companion the rejection rule joins on, and the
+    // only one that survives the case that rule exists for: it is published on
+    // every snapshot regardless of what the per-upstream table holds, so it is
+    // still there when the rejecting upstream has no health series of its own.
+    (
+        "llm_pool_available",
         "crates/cog-gateway/src/security_gateway.rs",
     ),
     (
