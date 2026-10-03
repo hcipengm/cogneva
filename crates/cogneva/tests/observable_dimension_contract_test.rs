@@ -45,10 +45,10 @@ const CHART_CONFIG: &str = "deploy/helm/cogneva/files/cogneva.json";
 /// every pair, so an entry whose declaration moved, vanished, or flipped its
 /// boundedness fails the test.
 const PRODUCERS: &[(&str, &[(&str, bool)])] = &[
-    (
-        "crates/cog-agent/src/observable.rs",
-        &[("D1", false), ("D2", false), ("D3", false)],
-    ),
+    // Declares no dimension: the readings do not vary by one, so the collector
+    // asks it once rather than once per dimension. Its published set is pinned
+    // by this producer's own test.
+    ("crates/cog-agent/src/observable.rs", &[]),
     (
         "crates/cog-collaboration/src/observable.rs",
         &[("D8", true)],
@@ -73,23 +73,7 @@ const CONSUMERS: &[(&str, &[&str])] = &[
 /// Producer/dimension pairs the scrape will not ask for, and why that is
 /// deliberate rather than a gap. Keyed by producer because the same name can be
 /// scraped on one face and unreadable on another.
-const UNREAD: &[(&str, &str, &str)] = &[
-    (
-        "crates/cog-agent/src/observable.rs",
-        "D1",
-        "the agent observable records a series per step keyed by task_id, so its cardinality is unbounded",
-    ),
-    (
-        "crates/cog-agent/src/observable.rs",
-        "D2",
-        "the agent observable records a series per step keyed by task_id, so its cardinality is unbounded",
-    ),
-    (
-        "crates/cog-agent/src/observable.rs",
-        "D3",
-        "the agent observable records a series per step keyed by task_id, so its cardinality is unbounded",
-    ),
-];
+const UNREAD: &[(&str, &str, &str)] = &[];
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")

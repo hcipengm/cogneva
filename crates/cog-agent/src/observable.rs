@@ -1,5 +1,5 @@
 //! Observable implementation for cog-agent.
-//! Exposes D1 (Outcome), D2 (Planning), and D3 (Tool Use) raw metrics.
+//! Exposes the agent's cumulative run counters.
 
 use async_trait::async_trait;
 use cog_core::observability::{DimensionSpec, Observable, RawMetric, TraceFragment};
@@ -7,7 +7,6 @@ use cog_core::SFResult;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use tokio::sync::Mutex as AsyncMutex;
 
 static GLOBAL: OnceLock<Arc<AgentObservable>> = OnceLock::new();
 
@@ -18,11 +17,10 @@ pub fn global_observable() -> Arc<AgentObservable> {
 }
 
 /// Agent-level observable state.
-/// Tracks step-level execution data that can be flushed as raw metrics
-/// for downstream eval consumption.
+/// Tracks how the agent's runs ended, so the iteration ceiling can be derived
+/// from what this role has actually delivered.
 #[derive(Default)]
 pub struct AgentObservable {
-    step_records: Arc<AsyncMutex<Vec<StepRecord>>>,
     run_count: AtomicU64,
     success_count: AtomicU64,
     budget_exhausted_count: AtomicU64,
@@ -77,43 +75,9 @@ pub enum RunOutcome {
     BudgetExhausted,
 }
 
-#[derive(Debug, Clone)]
-struct StepRecord {
-    task_id: String,
-    step_index: usize,
-    action_type: String,
-    success: bool,
-    duration_ms: u64,
-    tool_calls: usize,
-    tool_errors: usize,
-}
-
 impl AgentObservable {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Record a step execution internally (called by the agent runtime).
-    #[allow(clippy::too_many_arguments)]
-    pub async fn record_step(
-        &self,
-        task_id: impl Into<String>,
-        step_index: usize,
-        action_type: impl Into<String>,
-        success: bool,
-        duration_ms: u64,
-        tool_calls: usize,
-        tool_errors: usize,
-    ) {
-        self.step_records.lock().await.push(StepRecord {
-            task_id: task_id.into(),
-            step_index,
-            action_type: action_type.into(),
-            success,
-            duration_ms,
-            tool_calls,
-            tool_errors,
-        });
     }
 
     /// Record a high-level agent run (called by AgentRuntime::run).
@@ -200,18 +164,11 @@ impl AgentObservable {
         let typical = sum.div_ceil(calibration.delivered_iterations.len() as u32);
         seed.max(longest.saturating_add(typical))
     }
-
-    /// Clear records for a given task.
-    pub async fn clear_task(&self, task_id: &str) {
-        let mut recs = self.step_records.lock().await;
-        recs.retain(|r| r.task_id != task_id);
-    }
 }
 
 #[async_trait]
 impl Observable for AgentObservable {
-    async fn collect_metrics(&self, dimension: &str) -> SFResult<Vec<RawMetric>> {
-        let recs = self.step_records.lock().await;
+    async fn collect_metrics(&self, _dimension: &str) -> SFResult<Vec<RawMetric>> {
         let mut metrics = Vec::new();
 
         // High-level counters (available in all dimensions)
@@ -253,76 +210,20 @@ impl Observable for AgentObservable {
             );
         }
 
-        match dimension {
-            "D1" => {
-                for r in recs.iter() {
-                    metrics.push(
-                        RawMetric::new("agent_step_duration_ms", r.duration_ms as f64)
-                            .with_label("task_id", &r.task_id)
-                            .with_label("step_index", r.step_index.to_string()),
-                    );
-                    metrics.push(
-                        RawMetric::new("agent_step_success", if r.success { 1.0 } else { 0.0 })
-                            .with_label("task_id", &r.task_id),
-                    );
-                }
-            }
-            "D2" => {
-                for r in recs.iter() {
-                    metrics.push(
-                        RawMetric::new("agent_plan_step_count", r.step_index as f64 + 1.0)
-                            .with_label("task_id", &r.task_id),
-                    );
-                }
-            }
-            "D3" => {
-                for r in recs.iter() {
-                    metrics.push(
-                        RawMetric::new("agent_tool_calls", r.tool_calls as f64)
-                            .with_label("task_id", &r.task_id),
-                    );
-                    metrics.push(
-                        RawMetric::new("agent_tool_errors", r.tool_errors as f64)
-                            .with_label("task_id", &r.task_id),
-                    );
-                }
-            }
-            _ => {}
-        }
-
         Ok(metrics)
     }
 
-    async fn collect_trace(&self, task_id: &str) -> SFResult<Vec<TraceFragment>> {
-        let recs = self.step_records.lock().await;
-        let fragments: Vec<TraceFragment> = recs
-            .iter()
-            .filter(|r| r.task_id == task_id)
-            .map(|r| TraceFragment {
-                step_index: r.step_index,
-                action_type: r.action_type.clone(),
-                action_params: serde_json::Value::Null,
-                thought: None,
-                screenshot_hash: None,
-                ui_state: None,
-                tool_calls: Vec::new(),
-                duration_ms: r.duration_ms,
-                success: r.success,
-                error: None,
-            })
-            .collect();
-        Ok(fragments)
+    async fn collect_trace(&self, _task_id: &str) -> SFResult<Vec<TraceFragment>> {
+        // No per-step records are kept. The series this used to serve were keyed
+        // by task id, so their cardinality grew with every task, and nothing read
+        // them: the scrape never asks for them and no rule or panel named them.
+        Ok(Vec::new())
     }
 
-    /// D1/D2/D3 都是逐 step 记录、键取自 `task_id`，基数随运行时长增长：它们可以
-    /// 被明确知道自己在查哪个任务的消费者单采，但不能进周期抓取。上面那组不随维度
-    /// 变的累计计数器靠"没有可采维度时采一次"进入抓取。
+    /// 空集：这个 observable 的读数不随维度变。它只报累计计数器，采集侧因此
+    /// "没有可采维度时采一次"，而不是按维度重复问同一份读数回来。
     fn available_dimensions(&self) -> Vec<DimensionSpec> {
-        vec![
-            DimensionSpec::unbounded("D1"),
-            DimensionSpec::unbounded("D2"),
-            DimensionSpec::unbounded("D3"),
-        ]
+        Vec::new()
     }
 }
 
@@ -330,8 +231,10 @@ impl Observable for AgentObservable {
 mod tests {
     use super::*;
 
+    /// The collector asks an observable that declares no dimensions once, with
+    /// an empty name; that is the only call this observable ever answers.
     async fn readings(o: &AgentObservable) -> (f64, f64, f64) {
-        let metrics = o.collect_metrics("D1").await.expect("collect_metrics");
+        let metrics = o.collect_metrics("").await.expect("collect_metrics");
         let read = |name: &str| {
             metrics
                 .iter()
@@ -466,5 +369,42 @@ mod tests {
             0.0,
             "a role that never exhausted must read zero, not be missing"
         );
+    }
+
+    /// 这一组就是这个 observable 的全部产出。多一个名字就多一条没人读的序列，
+    /// 少一个名字就是一条静默消失的读数，两种都要在这里响。
+    #[tokio::test]
+    async fn the_published_set_is_exactly_the_cumulative_counters() {
+        let o = AgentObservable::new();
+        o.record_run("generator", RunOutcome::Delivered, 3, 7, 2);
+        o.record_run("evaluator", RunOutcome::BudgetExhausted, 10, 21, 12);
+
+        let mut names: Vec<String> = o
+            .collect_metrics("")
+            .await
+            .expect("collect_metrics")
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(
+            names,
+            vec![
+                "agent_budget_exhausted_count",
+                "agent_iteration_budget_exhausted",
+                "agent_run_count",
+                "agent_success_count",
+                "agent_total_steps",
+                "agent_total_tool_calls",
+            ]
+        );
+    }
+
+    /// 声明为空集不是遗漏：它让采集侧只问一次。一旦重新声明某个维度，采集侧
+    /// 会按维度把同一份不随维度变的读数问回来，Prometheus 会把重复样本丢掉。
+    #[test]
+    fn no_dimension_is_declared_because_the_readings_do_not_vary_by_one() {
+        assert!(AgentObservable::new().available_dimensions().is_empty());
     }
 }
