@@ -278,6 +278,15 @@ const PRODUCED: &[(&str, &str)] = &[
         "llm_pool_available",
         "crates/cog-gateway/src/security_gateway.rs",
     ),
+    // Request outcomes per upstream. This is where a pool that serves nothing
+    // shows up at all, and its failure half is the only cell that cannot be
+    // produced by idleness: the success half is published lazily, so a rule that
+    // reads absence alone could not tell "nobody called" from "every call
+    // failed", while a rule that requires the failure side to have moved can.
+    (
+        "llm_calls_total",
+        "crates/cog-gateway/src/security_gateway.rs",
+    ),
     (
         "cogneva_metric_held_without_producer",
         "crates/cog-gateway/src/lib.rs",
