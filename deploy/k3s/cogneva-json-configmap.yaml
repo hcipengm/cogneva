@@ -1243,6 +1243,15 @@ data:
               },
               "severity": "warning",
               "summary": "Worktree {worktree} has {value} tracked files its git index does not remember. Every one of them is rewritten by that worktree's next reset, so this is a tree about to be rebuilt rather than refreshed, and the size of the number is itself the reading: a value at the whole-tree size is the index having lost the tree, while a handful is a normal partial state. Nothing else reports it. Read it with the index-present series, because the two failure faces are different -- 'the index remembers no files' and 'the index is not there' both make the next reset look free, and only that pair tells them apart. The half hour is long enough that a reset in progress does not raise this, and the reading is per worktree so the subject is named rather than summed."
+            },
+            {
+              "name": "buildah_store_live_refs_empty",
+              "promql": "min without (pod, container, instance) (max_over_time(cogneva_buildah_store_live_images[30m])) < 1",
+              "condition": {
+                "less_than": 1.0
+              },
+              "severity": "warning",
+              "summary": "A build store reclaim pass computed its keep set from a cluster read that found no live revision at all ({value} was the highest any pass read across the window). The keep set is the whole of what stops this pass deleting a base image something is running, so an empty one is the one way this pass removes a base image that is in use, and the read that produced it exits successfully -- which is why nothing else reports it. The gauge is published only by a completed round, so an absent series means no round completed rather than a zero, and a series carrying a zero is the danger itself rather than a missing reading. The half hour is sixty consecutive beats, so one quiet scrape is not this reading. Read the rounds counter and the last-round timestamp beside it to tell a pass that read nothing from a pass that never ran, and the pruned image count for whether anything was in fact removed from under a running workload."
             }
           ]
         },

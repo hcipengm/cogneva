@@ -522,6 +522,16 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_worktree_index_missing_files",
         "crates/cog-reflection/src/workspace.rs",
     ),
+    // The build store's keep set, and the cluster read it is built from. The
+    // help names a live reading of zero as the one way the reclaim pass removes
+    // a base image something is running, and the producer shows why zero is
+    // reachable: the read returns Ok with an empty list when the workload query
+    // answers with no revision of ours, and the pass goes on to plan a prune
+    // against that empty list. Nothing read the count.
+    (
+        "cogneva_buildah_store_live_images",
+        "crates/cog-reflection/src/mainline_deployer.rs",
+    ),
 ];
 
 /// Series the rules read that this workspace does not publish, with the owner.
@@ -1010,31 +1020,27 @@ const UNREAD: &[(&str, Unread)] = &[
     ),
     (
         "cogneva_buildah_store_rounds_total",
-        Unread::Gap("the help says read the rounds against the completion timestamp, but the bound is the attempt cadence and the store round is driven by the build slot rather than a declared period, so no window can be bounded from a reading that exists"),
+        Unread::Gap("a round is attempted only after a declared cooldown, but the cooldown does not decide when one completes: the pass takes the shared build slot and returns without a reading when the host is building. Measured over three days the completed rounds sat 19h, 36h and 6h apart, so no window can be read off the series and the reader would have to invent one"),
     ),
     (
         "cogneva_buildah_store_reading_unix",
-        Unread::Gap("the other half of that pair; the same missing cadence is what a staleness bound would need"),
+        Unread::Gap("the help promises a reading of zero while a process has never completed a round, and the producer records this gauge only inside the branch a completed round takes, so that promised zero is not on the scrape face -- a never-completed round reads as an absent series. A rule written from the help is structurally unreachable; the repair is on the producer side, and the staleness bound it would still need is the build-slot-gated cadence above"),
     ),
     (
         "cogneva_buildah_store_pruned_images_total",
-        Unread::Gap("written only when a round freed an image, so absence means no round ever has; same unattested cadence"),
+        Unread::Gap("written only when a round freed an image, so its absence is not a zero; the window a reader needs is the build-slot-gated completion cadence, which no series publishes"),
     ),
     (
         "cogneva_buildah_store_pruned_layers_total",
-        Unread::Gap("same face as the pruned image count"),
+        Unread::Gap("the help's own point is that this is not a fixed multiple of the image count, so it is a second number under the same undeclared bound, and it shares the build-slot-gated completion cadence"),
     ),
     (
         "cogneva_buildah_store_freed_bytes_total",
-        Unread::Gap("same face; bytes freed, written only when both ends of the round were measurable"),
+        Unread::Gap("bytes freed, written only when both ends of the round were measurable; the same build-slot-gated completion cadence applies and no free-space bound is declared for the store"),
     ),
     (
         "cogneva_buildah_store_kept_images",
-        Unread::Gap("the help calls it the reading that says the keep set is doing something; nothing reads it and no keep-set bound is declared"),
-    ),
-    (
-        "cogneva_buildah_store_live_images",
-        Unread::Gap("the help names the one way this pass could remove a base image that is in use -- a live reading of zero -- and nothing reads it; the highest-value entry in this family, still blocked on the same unattested cadence"),
+        Unread::Gap("the help calls it the reading that says the keep set is doing something; what would count as the keep set doing something is a policy nobody declared, and the pass publishes the number every completed round, so the missing half is a bound rather than a reader"),
     ),
     (
         "cogneva_rollout_job_cpu_throttled_ratio",
@@ -1074,7 +1080,7 @@ const UNREAD: &[(&str, Unread)] = &[
 /// that nothing else states must be classified, and calling it a gap raises
 /// this number on purpose -- the point of the ratchet is that the increase is a
 /// decision someone made, not a drift nobody saw.
-const GAPS_AT_CENSUS: usize = 23;
+const GAPS_AT_CENSUS: usize = 22;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {
