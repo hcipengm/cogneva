@@ -1271,6 +1271,24 @@ data:
               },
               "severity": "warning",
               "summary": "Every release pass in the last hour found rows of retired metric names to delete, and the smallest number any of those passes removed is {value}. The release is idempotent, retires a fixed list of names, and clears a table in one pass however large its backlog, so a store that has once been drained reports zero on every pass after the first -- a reading that stays non-zero is one the release is not draining, which is the help's own criterion and the only one this gauge carries. The number is what the last pass removed and not a backlog, so read the row count beside it for how much is there. The hour is far above the sweep's own two-minute ceiling: the pass rides the sweep, and the sweep's period is derived from how fast the log fills rather than configured, which is why the window is a multiple of a bound and not the period itself. The two-hour count is the coverage term and not a second reading: a series younger than the window is judged on the samples it happens to have, so the rule also requires samples older than the hour, which is what makes the 'at every pass' claim true rather than an artifact of a process that just started. An absent series means no pass has run at all, a different fault that the background loop's liveness reading covers."
+            },
+            {
+              "name": "mainline_ci_verdict_failed",
+              "promql": "sum by (verdict) (increase(cogneva_mainline_ci_verdict_total{verdict=\"fail\"}[1h])) > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "The CI gate read a red verdict for a revision the deployer was about to promote ({value} such reads in the last hour). This is the gate working -- the rollout is held instead of dispatched -- and the count is read because the hold is otherwise invisible: the state file keeps the hold and nothing else, and the log line that records it dies with the pod that wrote it, so a promotion that has stopped for a week looks the same as one nobody attempted. It is the fail cell of the verdict counter; read the other two beside it, because no_evidence is not this verdict but the gate being unable to judge at all, and the per-reason counter says which platform was silent and how. The hour is the latency this family uses for an event, and one round adds at most two: the question is asked once before the build and again before the dispatch."
+            },
+            {
+              "name": "mainline_ci_verdict_unreadable",
+              "promql": "sum by (reason) (increase(cogneva_mainline_ci_no_verdict_reason_total{reason!=\"pending\",reason!=\"no_runs\"}[1h])) > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "The deployer asked the code platforms for a CI verdict and one of them came back with something other than a verdict, for a reason that is not a wait ({value} such answers in the last hour, under reason {reason}). The gate fails open by design, so this is the state in which a revision can be dispatched unverified, and the label names whose silence it was: status_unreadable and unusable_body are an answer this side could not parse, bad_api_base and connect_failed are the route or the gateway, and the http_ cells are the platform refusing. It filters out the two reasons that are a normal state rather than a fault -- pending is the platform not having finished, and no_runs is a platform with nothing to judge, both of which climb steadily on a healthy deployment -- and names no others on purpose, so a reason added later lands on the alarm side instead of going silent. Read it with the verdict counter's no_evidence cell, which is the same events counted without their cause."
             }
           ]
         },

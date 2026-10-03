@@ -542,6 +542,20 @@ const PRODUCED: &[(&str, &str)] = &[
         "metrics_retired_rows_removed",
         "crates/cog-storage/src/metrics_retirement.rs",
     ),
+    // The CI gate's own reading. A red verdict holds a rollout and leaves no
+    // trace that outlives the pod, and the per-reason counter is the only place
+    // that says which platform went silent instead of answering. Neither had a
+    // reader, so a promotion that stopped because CI said no, and one that went
+    // ahead because the answer could not be read, both arrived as a stall with
+    // no cause on any surface.
+    (
+        "cogneva_mainline_ci_verdict_total",
+        "crates/cog-reflection/src/mainline_deployer.rs",
+    ),
+    (
+        "cogneva_mainline_ci_no_verdict_reason_total",
+        "crates/cog-reflection/src/mainline_deployer.rs",
+    ),
 ];
 
 /// Series the rules read that this workspace does not publish, with the owner.
@@ -1065,14 +1079,6 @@ const UNREAD: &[(&str, Unread)] = &[
         Unread::Gap("1 or 0 per round on whether the carried revision had been overtaken; the help says the zeros keep the question visible and nothing reads the answer -- a reader needs the round cadence to bound the window"),
     ),
     (
-        "cogneva_mainline_ci_verdict_total",
-        Unread::Gap("CI verdicts read for the revision about to be promoted, pass/fail/no_evidence; a red verdict stops the rollout but no rule reads the count, so the reasons below have no surface"),
-    ),
-    (
-        "cogneva_mainline_ci_no_verdict_reason_total",
-        Unread::Gap("why the CI question came back without a verdict; the reasons include pending, which is normal, and the unreadable/config ones, so a rule has to enumerate the non-normal reasons or fire on every wait -- a fail-open list whose policy is not declared"),
-    ),
-    (
         "llm_upstream_failures_total",
         Unread::Elsewhere("llm_calls_all_failing reads llm_calls_total{result=error} and the health table states the current consecutive failures; the help says this cumulative total and the backoff window describe one history"),
     ),
@@ -1086,7 +1092,7 @@ const UNREAD: &[(&str, Unread)] = &[
 /// that nothing else states must be classified, and calling it a gap raises
 /// this number on purpose -- the point of the ratchet is that the increase is a
 /// decision someone made, not a drift nobody saw.
-const GAPS_AT_CENSUS: usize = 21;
+const GAPS_AT_CENSUS: usize = 19;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {
