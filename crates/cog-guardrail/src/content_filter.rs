@@ -14,6 +14,26 @@ use regex::RegexSet;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+/// The rule name this detector stamps on the blocks it raises.
+///
+/// Named here because this is where the block is produced, and recognized
+/// through [`is_harmful_content_rule`] rather than by a second copy of the
+/// string: the layer that counts harmful-content detections has to recognize
+/// the same name the block carries, and two literals that are meant to be one
+/// name is how they stop being one.
+pub const HARMFUL_CONTENT_RULE: &str = "content_filter";
+
+/// Whether a block carrying this rule came from the harmful-content detector.
+///
+/// Matched by equality rather than by prefix. A prefix test would admit any
+/// later rule name that merely begins with this one — a second content rule
+/// added alongside it would start counting as harmful content without anyone
+/// deciding that — and the name being recognized is one detector's whole rule
+/// name, not a family of them.
+pub fn is_harmful_content_rule(rule: &str) -> bool {
+    rule == HARMFUL_CONTENT_RULE
+}
+
 /// 内容过滤器配置。
 #[derive(Debug, Clone)]
 pub struct ContentFilterConfig {
@@ -213,7 +233,7 @@ impl ContentFilter {
         } else {
             GuardResult::Block {
                 reason: all_reasons.join("; "),
-                rule: "content_filter".into(),
+                rule: HARMFUL_CONTENT_RULE.into(),
             }
         }
     }

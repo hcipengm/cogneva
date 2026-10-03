@@ -20,12 +20,18 @@ pub fn global_observable() -> Arc<ObservabilityObservable> {
 }
 
 /// Observability-layer observable state.
-/// Tracks snapshot latency, event counts, rendering metrics, and self-evolution
-/// outcomes.
+///
+/// Tracks snapshot latency, event counts, and self-evolution outcomes. A
+/// rendering-latency series is deliberately not among them: nothing in this
+/// layer renders, no process ever called the recorder, and a series nothing
+/// writes is published as a constant zero that reads as a measured zero. It is
+/// gone rather than wired to the nearest thing that happens to take time —
+/// snapshot latency is already its own series, and counting it twice under a
+/// broader name is a second record of one fact. The published set is pinned
+/// below so a constant cannot come back quietly.
 pub struct ObservabilityObservable {
     snapshot_latency_ms: AtomicU64,
     event_count: AtomicU64,
-    rendering_latency_ms: AtomicU64,
     evolution_event_total: AtomicU64,
     evolution_event_failed_total: AtomicU64,
     evolution_change_applied_total: AtomicU64,
@@ -41,7 +47,6 @@ impl Default for ObservabilityObservable {
         Self {
             snapshot_latency_ms: AtomicU64::new(0),
             event_count: AtomicU64::new(0),
-            rendering_latency_ms: AtomicU64::new(0),
             evolution_event_total: AtomicU64::new(0),
             evolution_event_failed_total: AtomicU64::new(0),
             evolution_change_applied_total: AtomicU64::new(0),
@@ -63,10 +68,6 @@ impl ObservabilityObservable {
 
     pub fn record_event(&self) {
         self.event_count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_rendering_latency(&self, ms: u64) {
-        self.rendering_latency_ms.fetch_add(ms, Ordering::Relaxed);
     }
 
     pub fn record_evolution_event(&self, failed: bool) {
@@ -127,10 +128,6 @@ impl Observable for ObservabilityObservable {
             metrics.push(RawMetric::new(
                 "obs_event_count",
                 self.event_count.load(Ordering::Relaxed) as f64,
-            ));
-            metrics.push(RawMetric::new(
-                "obs_rendering_latency_ms",
-                self.rendering_latency_ms.load(Ordering::Relaxed) as f64,
             ));
             metrics.push(RawMetric::new(
                 "evolution_event_total",
@@ -281,5 +278,52 @@ mod rejection_counter_tests {
         for (label, value) in published(&observable, "evolution_change_rejected_total").await {
             assert_eq!(value, 0.0, "{label} was moved by a rewrite");
         }
+    }
+}
+
+#[cfg(test)]
+mod published_names_tests {
+    use super::*;
+
+    /// The published set is pinned, and pinned to *writers*: every name here is
+    /// fed by a recording call. A series nothing writes still renders, as a
+    /// constant, and a constant published beside real readings reads as a
+    /// measurement. That is what `obs_rendering_latency_ms` was — nothing in
+    /// this layer renders, and no process ever called its recorder — so it is
+    /// gone, and this test fails if a name reappears without the call beside it.
+    ///
+    /// The rejection axis is the one place a zero is deliberate rather than
+    /// missing: every criterion is published whether or not it has fired, so a
+    /// criterion that never fires reads as a zero instead of as an absent
+    /// series, and the interesting reading is exactly that zero.
+    #[tokio::test]
+    async fn d5_publishes_only_series_something_writes() {
+        let observable = ObservabilityObservable::new();
+        let names: Vec<String> = observable
+            .collect_metrics("D5")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+
+        let mut expected: Vec<String> = [
+            "obs_snapshot_latency_ms",
+            "obs_event_count",
+            "evolution_event_total",
+            "evolution_event_failed_total",
+            "evolution_change_applied_total",
+            "evolution_change_failed_total",
+            "evolution_change_reformatted_total",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        expected.extend(std::iter::repeat_n(
+            "evolution_change_rejected_total".to_string(),
+            REJECTION_CAUSES,
+        ));
+
+        assert_eq!(names, expected);
     }
 }

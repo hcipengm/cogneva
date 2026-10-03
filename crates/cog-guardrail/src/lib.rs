@@ -86,16 +86,52 @@ impl CompositeGuardrail {
     }
 
     fn record_observable(result: &GuardResult, obs: &crate::observable::GuardrailObservable) {
-        match result {
-            GuardResult::Block { .. } => {
-                obs.record_block();
-                obs.record_harmful();
-            }
-            GuardResult::Warn { .. } => {
-                obs.record_warn();
-            }
-            GuardResult::Pass => {}
+        let marks = marks_for(result);
+        if marks.block {
+            obs.record_block();
         }
+        if marks.warn {
+            obs.record_warn();
+        }
+        if marks.harmful {
+            obs.record_harmful();
+        }
+    }
+}
+
+/// Which of the layer's counters one verdict feeds.
+///
+/// Kept apart from the counters themselves so the attribution is a pure fact
+/// about the verdict and can be checked without a process-wide observable. The
+/// thing that went wrong before is exactly this decision: every block was
+/// counted as a harmful-content detection, whatever rule produced it, so a
+/// block raised by the PII detector or the tool guard landed under a name that
+/// says harmful content. A block and its cause are two facts; only a block
+/// carries them separately.
+#[derive(Debug, PartialEq, Eq)]
+struct VerdictMarks {
+    block: bool,
+    warn: bool,
+    harmful: bool,
+}
+
+fn marks_for(result: &GuardResult) -> VerdictMarks {
+    match result {
+        GuardResult::Block { rule, .. } => VerdictMarks {
+            block: true,
+            warn: false,
+            harmful: crate::content_filter::is_harmful_content_rule(rule),
+        },
+        GuardResult::Warn { .. } => VerdictMarks {
+            block: false,
+            warn: true,
+            harmful: false,
+        },
+        GuardResult::Pass => VerdictMarks {
+            block: false,
+            warn: false,
+            harmful: false,
+        },
     }
 }
 
@@ -321,5 +357,79 @@ mod tests {
         let logs = recorder.logs().await;
         assert_eq!(logs.len(), 1);
         assert!(matches!(logs[0].check_type, CheckType::ToolCall));
+    }
+
+    // ── 裁决到计数的归因 ──
+
+    fn block(rule: &str) -> GuardResult {
+        GuardResult::Block {
+            reason: "test".into(),
+            rule: rule.into(),
+        }
+    }
+
+    /// A block only counts as a harmful-content detection when the harmful
+    /// content detector is the one that raised it.
+    ///
+    /// The whole point is the negative cases: the PII detector and the tool
+    /// guard block too, and counting them under `guard_harmful_detected` makes
+    /// that series equal to `guard_block_count` by construction while its name
+    /// claims a subset. Losing this test is not a failure to count something —
+    /// it is a reading that says harmful content was found when none was.
+    #[test]
+    fn only_the_content_filter_marks_a_block_as_harmful() {
+        let harmful = marks_for(&block("content_filter"));
+        assert!(harmful.block, "it is still a block");
+        assert!(
+            harmful.harmful,
+            "the harmful-content detector's own rule is the one case that counts"
+        );
+
+        for rule in ["pii_detection", "prompt_injection", "tool_guard:blocked"] {
+            let marks = marks_for(&block(rule));
+            assert!(marks.block, "{rule} blocked");
+            assert!(
+                !marks.harmful,
+                "{rule} is not a harmful-content detection and must not be counted as one"
+            );
+        }
+
+        let warn = marks_for(&GuardResult::Warn {
+            reason: "test".into(),
+            rule: "prompt_guard:role_aware".into(),
+        });
+        assert!(
+            warn.warn && !warn.block && !warn.harmful,
+            "a warn is only a warn"
+        );
+
+        let pass = marks_for(&GuardResult::Pass);
+        assert!(
+            !pass.block && !pass.warn && !pass.harmful,
+            "a pass counts nothing"
+        );
+    }
+
+    /// The rule name this detector puts on the wire is pinned to the literal,
+    /// not compared against the constant it is built from.
+    ///
+    /// The name leaves the process: it is stored in the audit log and it is
+    /// what an operator reads when a check is rejected. A check that only
+    /// compared the constant with itself would stay green through a rename and
+    /// leave every stored rule name pointing at a name nothing stamps any more,
+    /// so the literal is written out here as the thing being promised.
+    #[tokio::test]
+    async fn the_harmful_rule_name_on_the_wire_is_stable() {
+        let filter = ContentFilter::new(ContentFilterConfig::default());
+        match filter.check("How to make a bomb at home").await {
+            GuardResult::Block { rule, .. } => {
+                assert_eq!(rule, "content_filter", "the rule name readers see");
+                assert!(
+                    crate::content_filter::is_harmful_content_rule(&rule),
+                    "and the counter has to recognize the name it publishes"
+                );
+            }
+            other => panic!("a blocked pattern must be blocked, got {other:?}"),
+        }
     }
 }
