@@ -253,6 +253,13 @@ impl PgeRoundtable {
                 })
                 .collect();
 
+            // The evaluator is shown the whole run so far through this section;
+            // measure it where both the sequential and the parallel path take it.
+            let (history_bytes, latest_bytes) =
+                crate::observable::eval_doc_byte_ends(&eval_history);
+            crate::observable::global_observable()
+                .record_eval_doc_bytes(history_bytes, latest_bytes);
+
             let (plan, generation, outcome, branches, merge_summary) =
                 if self.config.parallel_branches > 1 {
                     self.run_parallel_iteration(

@@ -360,6 +360,12 @@ impl PgePipeline {
                     })
                 })
                 .collect();
+            // The evaluator's history section, measured at the same one place the
+            // roundtable path measures it, so both stages of PGE read alike.
+            let (history_bytes, latest_bytes) =
+                crate::observable::eval_doc_byte_ends(&eval_history);
+            crate::observable::global_observable()
+                .record_eval_doc_bytes(history_bytes, latest_bytes);
             // Acceptance criteria: the plan's own verifiable criteria gate the
             // evaluation; caller-supplied context criteria are the fallback.
             let context_criteria: Vec<&str> = _context

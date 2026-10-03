@@ -191,6 +191,40 @@ pub const RALPH_HISTORY_DROPPED: &str = "dropped";
 /// [`RALPH_HISTORY_FED`].
 pub const RALPH_HISTORY_PARTS: [&str; 2] = [RALPH_HISTORY_FED, RALPH_HISTORY_DROPPED];
 
+/// The two ends of the section an evaluator is shown, summed in bytes of the
+/// serialized history it is handed.
+///
+/// Every round rebuilds that section from the whole run so far, resending each
+/// earlier round's full product; `history` sums the section actually sent and
+/// `latest` sums the newest entry alone — one round's own product. The gap
+/// between the two is what resending the earlier rounds costs, which a single
+/// total cannot show: even on the first round, where there is no earlier round,
+/// the sent section is the empty list, so `history` runs a couple of bytes
+/// ahead of `latest` there. Both cells publish at zero, so "no evaluation has
+/// run yet" reads differently from a ruler that was never wired.
+pub const PGE_EVAL_DOC_HISTORY: &str = "history";
+pub const PGE_EVAL_DOC_LATEST: &str = "latest";
+
+/// Both ends of the evaluator document, published even at zero. See
+/// [`PGE_EVAL_DOC_HISTORY`].
+pub const PGE_EVAL_DOC_PARTS: [&str; 2] = [PGE_EVAL_DOC_HISTORY, PGE_EVAL_DOC_LATEST];
+
+/// The byte ends of an evaluator's history section: the serialized size of
+/// every entry, and of the newest entry alone.
+///
+/// A pure function so the sequential and the parallel evaluator paths, and the
+/// tests, all take the same measurement of the same list — the ruler is the
+/// arithmetic, not the call site.
+pub fn eval_doc_byte_ends(history: &[serde_json::Value]) -> (usize, usize) {
+    let total = serde_json::to_string(history).map(|s| s.len()).unwrap_or(0);
+    let latest = history
+        .last()
+        .and_then(|v| serde_json::to_string(v).ok())
+        .map(|s| s.len())
+        .unwrap_or(0);
+    (total, latest)
+}
+
 /// How a decomposition left the boundary gate.
 ///
 /// Three cells rather than two, because "the rules were read and the plan
@@ -375,6 +409,16 @@ pub struct CollaborationObservable {
     /// copy cost, and a `kept` that is not zero is the case the de-duplication
     /// deliberately left alone, which is why the two cannot share a cell.
     board_mirror_bytes: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
+    /// Bytes of the history section handed to an evaluator, keyed by
+    /// [`PGE_EVAL_DOC_PARTS`].
+    ///
+    /// The evaluator is the one stage that is shown the whole run so far; that
+    /// section is the part of its document that grows with the round count, and
+    /// it is bounded only by `max_iterations`. Without this face the growth is
+    /// invisible until someone measures one round by hand, which cannot say
+    /// whether a bound would help — the accumulated size and one round's size
+    /// have to be readable side by side.
+    pge_eval_doc_bytes: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
     /// Resume outcomes, over the closed set in [`crate::resume::RESUME_OUTCOMES`].
     /// The chain whose absence this measures is silent by construction: a task
     /// whose progress was never resumed simply starts again, which is what a
@@ -586,6 +630,18 @@ impl CollaborationObservable {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *map.entry(RALPH_HISTORY_FED).or_insert(0) += fed as u64;
         *map.entry(RALPH_HISTORY_DROPPED).or_insert(0) += dropped as u64;
+    }
+
+    /// Record the size of the history section one evaluator was shown: the
+    /// accumulated bytes across every round so far, and the newest entry's bytes
+    /// on their own.
+    pub fn record_eval_doc_bytes(&self, history: usize, latest: usize) {
+        let mut map = self
+            .pge_eval_doc_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *map.entry(PGE_EVAL_DOC_HISTORY).or_insert(0) += history as u64;
+        *map.entry(PGE_EVAL_DOC_LATEST).or_insert(0) += latest as u64;
     }
 
     /// Record one route decision. A synchronous lock, because the cell is the
@@ -870,6 +926,22 @@ impl Observable for CollaborationObservable {
                 );
             }
 
+            // The evaluator's history section, both ends published. Two zeros
+            // say no evaluation has run since this process started, which has to
+            // read differently from a ruler that was never wired.
+            let eval_doc_bytes = self
+                .pge_eval_doc_bytes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            for part in PGE_EVAL_DOC_PARTS {
+                let count = eval_doc_bytes.get(part).copied().unwrap_or(0);
+                metrics.push(
+                    RawMetric::new("pge_eval_doc_bytes_total", count as f64)
+                        .with_label("part", part),
+                );
+            }
+
             // The routing face: every cell of the (stage, mode) cross product is
             // published, zeros included. A missing series and "this stage never
             // decided" are the same thing to a scraper, and a missing series is
@@ -1093,6 +1165,74 @@ mod tests {
         };
         assert_eq!(bytes(RALPH_HISTORY_FED), 120.0);
         assert_eq!(bytes(RALPH_HISTORY_DROPPED), 0.0);
+    }
+
+    /// 字节算术独立可断言：累计段与单轮段的算法脱离进程级计数器也能验，
+    /// 第一轮的空列表是「历史为空」而不是「没有这格」。
+    #[test]
+    fn eval_doc_byte_ends_separate_the_section_from_one_round() {
+        let empty: Vec<serde_json::Value> = Vec::new();
+        assert_eq!(eval_doc_byte_ends(&empty), (2, 0));
+
+        let one = vec![serde_json::json!({"iteration": 1, "plan": "p"})];
+        assert_eq!(
+            eval_doc_byte_ends(&one).0,
+            serde_json::to_string(&one).unwrap().len()
+        );
+        assert_eq!(
+            eval_doc_byte_ends(&one).1,
+            serde_json::to_string(&one[0]).unwrap().len()
+        );
+
+        let two = vec![
+            serde_json::json!({"iteration": 1, "plan": "p"}),
+            serde_json::json!({"iteration": 2, "plan": "pp"}),
+        ];
+        let (total_two, latest_two) = eval_doc_byte_ends(&two);
+        let (total_one, latest_one) = eval_doc_byte_ends(&one);
+        // The section grows with the round count, and it always exceeds its own
+        // newest entry (the brackets and separators alone).
+        assert!(total_two > total_one);
+        assert!(total_two > latest_two);
+        // The second entry is the longer one, so `latest` follows the newest
+        // entry rather than staying at the first.
+        assert!(latest_two > latest_one);
+    }
+
+    /// 评测器文档的两端按字节发布：累计的那段与单轮那段分开，才分得出
+    /// 「随轮次增长」与「只有一轮可看」。
+    #[tokio::test]
+    async fn both_ends_of_the_evaluator_document_are_published() {
+        let obs = CollaborationObservable::new();
+        obs.record_eval_doc_bytes(14240, 4301);
+
+        let metrics = obs.collect_metrics("D8").await.unwrap();
+        let bytes = |part: &str| {
+            metrics
+                .iter()
+                .find(|m| {
+                    m.name == "pge_eval_doc_bytes_total"
+                        && m.labels.get("part").map(String::as_str) == Some(part)
+                })
+                .map(|m| m.value)
+                .unwrap_or_else(|| panic!("{part} 这一格没跑过时也要在"))
+        };
+        assert_eq!(bytes(PGE_EVAL_DOC_HISTORY), 14240.0);
+        assert_eq!(bytes(PGE_EVAL_DOC_LATEST), 4301.0);
+    }
+
+    /// 没记录过时两格都按零摆出——「还没有评测跑过」不能被读成「尺子没接线」。
+    #[tokio::test]
+    async fn the_evaluator_document_ruler_publishes_zero_before_any_run() {
+        let obs = CollaborationObservable::new();
+        let metrics = obs.collect_metrics("D8").await.unwrap();
+        let cells: Vec<f64> = metrics
+            .iter()
+            .filter(|m| m.name == "pge_eval_doc_bytes_total")
+            .map(|m| m.value)
+            .collect();
+        assert_eq!(cells.len(), PGE_EVAL_DOC_PARTS.len());
+        assert!(cells.iter().all(|v| *v == 0.0));
     }
 
     /// board 镜像的两端各成一格，零也发布。两头分开正是因为它们不是同一件事：
