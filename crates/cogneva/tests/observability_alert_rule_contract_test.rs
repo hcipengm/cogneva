@@ -1072,11 +1072,11 @@ const UNREAD: &[(&str, Unread)] = &[
     ),
     (
         "cogneva_rollout_job_reading_unix",
-        Unread::Gap("ties the two readings above to the run that produced them; a reader needs the run cadence, which is per-rollout and published by no series"),
+        Unread::Gap("ties the two readings above to the run that produced them; a reader needs the run cadence, which is per-rollout and published by no series. The one reading that would not need it is this timestamp's own age, and the store does render a companion that carries it -- cogneva_rollout_job_reading_unix_observed_timestamp_seconds, frozen while the writer is gone -- but that family is outside the closed set the census walks and the contract gate rejects a rule naming it, so the reader has to be opened on both sides at once"),
     ),
     (
         "cogneva_mainline_superseded_rollout_total",
-        Unread::Gap("1 or 0 per round on whether the carried revision had been overtaken; the help says the zeros keep the question visible and nothing reads the answer -- a reader needs the round cadence to bound the window"),
+        Unread::Gap("1 or 0 per round on whether the carried revision had been overtaken. Its value face cannot carry the fault it was built for: the counter is written with 0 on every round, so a broken guard leaves a row the store keeps rendering -- a constant series, not an absent one -- and an absent_over_time reader is structurally unreachable. The only signal is the store's generic per-series companion, cogneva_mainline_superseded_rollout_total_observed_timestamp_seconds, which holds the last write; measured on a cell that stopped being written it freezes while the scrape continues. Reading it means comparing it against a round, and the round cadence is gated by the shared build slot rather than by the declared poll_interval_secs (measured one round per ~2h, far above the poll), so the bound is undeclared and no threshold may be invented. The companion family is named by no closed-set constant and the contract gate would reject a rule that reads it, which is the second half of this gap"),
     ),
     (
         "llm_upstream_failures_total",
