@@ -721,7 +721,7 @@ data:
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "Pending state for {stream} has not been measured for {value}s, more than six of the configured measurement intervals. The reclaim loop that publishes it is not running, so a stranded message on this stream would be invisible again — the state this measurement exists to expose"
+              "summary": "Pending state for {stream} has not been measured for {value}s, more than six of the configured measurement intervals. The loop that publishes it is not running -- the pending observer for this stream, not the reclaim pass. The two were deliberately given separate cadences so that a sweep stuck in its own work cannot freeze this reading, which means the sweep being stuck is exactly the state this rule does not report; background_loop_stalled or background_loop_died on the observer's own loop name is the reading that says the observer stopped. While it is silent a stranded message on this stream would be invisible again -- the state this measurement exists to expose"
             },
             {
               "name": "stream_pending_measure_failing",
