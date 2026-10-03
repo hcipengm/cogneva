@@ -25,6 +25,15 @@ pub struct LlmUsageRecord {
     pub actor: String,
     pub tokens_input: u64,
     pub tokens_output: u64,
+    /// Input tokens the upstream served from its own prefix cache. Its own
+    /// column rather than a fold into `tokens_input`: the ratio of the two is
+    /// the hit rate, and that ratio is the only reading a change to prompt
+    /// prefix stability can be accepted on, so a durable audit of token spend
+    /// that cannot answer it is missing the one number it exists for. How the
+    /// two relate follows the wire protocol (on an OpenAI-compatible upstream
+    /// cached is a subset of input, on Anthropic the two are disjoint), which
+    /// is why they stay apart here instead of being netted out.
+    pub tokens_cached: u64,
     /// Wall time of the call; for streams this is first-byte to last-byte.
     pub latency_ms: u64,
 }
@@ -53,6 +62,7 @@ impl LlmUsageStore {
                 result        TEXT NOT NULL,
                 tokens_input  BIGINT NOT NULL DEFAULT 0,
                 tokens_output BIGINT NOT NULL DEFAULT 0,
+                tokens_cached BIGINT NOT NULL DEFAULT 0,
                 latency_ms    BIGINT NOT NULL DEFAULT 0
             )
             "#,
@@ -63,6 +73,17 @@ impl LlmUsageStore {
         // attributable as "unknown" without a table rewrite.
         sqlx::query(
             "ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS actor TEXT NOT NULL DEFAULT 'unknown'",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Same shape for the cache dimension. Rows written before this column
+        // existed default to 0, and 0 is honest for them as long as the reader
+        // treats "cached" on a row whose input is also 0 as "not metered"
+        // rather than "nothing was cached" -- the two are indistinguishable
+        // after the fact, which is exactly why the column is written going
+        // forward rather than reconstructed backward.
+        sqlx::query(
+            "ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS tokens_cached BIGINT NOT NULL DEFAULT 0",
         )
         .execute(&self.pool)
         .await?;
@@ -79,8 +100,8 @@ impl LlmUsageStore {
             r#"
             INSERT INTO gateway_llm_usage
                 (id, upstream, api_style, model, result, actor,
-                 tokens_input, tokens_output, latency_ms)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 tokens_input, tokens_output, tokens_cached, latency_ms)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             "#,
         )
         .bind(uuid::Uuid::new_v4())
@@ -91,6 +112,7 @@ impl LlmUsageStore {
         .bind(&r.actor)
         .bind(r.tokens_input as i64)
         .bind(r.tokens_output as i64)
+        .bind(r.tokens_cached as i64)
         .bind(r.latency_ms as i64)
         .execute(&self.pool)
         .await?;

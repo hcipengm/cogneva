@@ -1343,6 +1343,7 @@ fn failed_attempt_usage(
         actor: actor.to_string(),
         tokens_input: 0,
         tokens_output: 0,
+        tokens_cached: 0,
         latency_ms,
     })
 }
@@ -1586,6 +1587,7 @@ async fn record_llm_tokens(
             actor: actor.to_string(),
             tokens_input: reading.input,
             tokens_output: reading.output,
+            tokens_cached: reading.cached,
             latency_ms,
         },
     );
