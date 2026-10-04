@@ -216,19 +216,60 @@ impl UpstreamFailure {
     pub fn is_environment_failure(self) -> bool {
         !matches!(self, Self::BadRequest)
     }
-}
 
-impl std::fmt::Display for UpstreamFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
+    /// Every cause, in the order their names render. The list and [`Self::name`]
+    /// are two views of one closed set; a reader that recovers a cause from a
+    /// rendered reason walks the list rather than re-typing the names, and
+    /// `every_cause_reads_back_from_its_own_name` pairs them.
+    pub const ALL: [Self; 6] = [
+        Self::RateLimited,
+        Self::QuotaExhausted,
+        Self::Auth,
+        Self::ServerError,
+        Self::BadRequest,
+        Self::Transport,
+    ];
+
+    /// The name this cause renders under and [`Self::from_name`] reads back.
+    /// Single source: `Display` and the parser both go through it, so a name
+    /// cannot mean one variant on the wire and another to a reader.
+    pub fn name(self) -> &'static str {
+        match self {
             Self::RateLimited => "rate_limited",
             Self::QuotaExhausted => "quota_exhausted",
             Self::Auth => "auth_rejected",
             Self::ServerError => "server_error",
             Self::BadRequest => "bad_request",
             Self::Transport => "transport",
-        };
-        f.write_str(name)
+        }
+    }
+
+    /// The cause rendered under `name`, or `None` when `name` is not one of
+    /// them.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|cause| cause.name() == name)
+    }
+
+    /// The cause a rendered upstream refusal names, when `text` carries one.
+    ///
+    /// The refusal travels as prose once an error type has rendered it —
+    /// `SFError::Upstream` writes `LLM upstream refused (<name>): <reason>` —
+    /// but the name inside the parentheses is this crate's own closed
+    /// vocabulary, not the provider's. A reader one or more crates away from
+    /// the transport can therefore recover the typed cause instead of
+    /// pattern-matching the upstream's own wording, which differs per provider
+    /// and per locale. `every_cause_reads_back_from_its_own_name` pins this
+    /// reader to that rendering.
+    pub fn named_in(text: &str) -> Option<Self> {
+        let (_, rest) = text.split_once("LLM upstream refused (")?;
+        let (name, _) = rest.split_once(')')?;
+        Self::from_name(name)
+    }
+}
+
+impl std::fmt::Display for UpstreamFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
     }
 }
 
@@ -383,6 +424,45 @@ where
 
     let parsed: T = serde_json::from_value(value).map_err(SFError::Serialization)?;
     Ok(parsed)
+}
+
+#[cfg(test)]
+mod upstream_failure_name_tests {
+    use super::*;
+
+    /// The rendered name and the parser are one vocabulary: every cause must
+    /// read back from the exact string the transport writes. A name that
+    /// renders but does not parse would leave a reader one crate away treating
+    /// a typed refusal as prose.
+    #[test]
+    fn every_cause_reads_back_from_its_own_name() {
+        for cause in UpstreamFailure::ALL {
+            assert_eq!(UpstreamFailure::from_name(cause.name()), Some(cause));
+            assert_eq!(cause.to_string(), cause.name());
+        }
+    }
+
+    /// The reader runs against the real error type rather than a hand-built
+    /// string: the rendering `named_in` depends on is `SFError::Upstream`'s, so
+    /// the pairing has to be proven through it — and through the wrappers the
+    /// reason actually travels under.
+    #[test]
+    fn a_rendered_refusal_carries_its_typed_cause() {
+        for cause in UpstreamFailure::ALL {
+            let err = SFError::upstream_refused(cause, "detail");
+            assert_eq!(UpstreamFailure::named_in(&err.to_string()), Some(cause));
+            let nested = SFError::Agent(err.to_string()).to_string();
+            assert_eq!(UpstreamFailure::named_in(&nested), Some(cause));
+        }
+    }
+
+    /// A reason with no rendered refusal is not read as one.
+    #[test]
+    fn prose_that_names_no_refusal_yields_none() {
+        assert_eq!(UpstreamFailure::named_in("upstream is unreachable"), None);
+        assert_eq!(UpstreamFailure::named_in(""), None);
+        assert_eq!(UpstreamFailure::from_name("nonsense"), None);
+    }
 }
 
 #[cfg(test)]

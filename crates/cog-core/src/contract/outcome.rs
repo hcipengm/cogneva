@@ -13,6 +13,8 @@
 //! a producer changes the wording, which is how a declared classification ends
 //! up permanently empty while the corresponding events keep happening.
 
+use crate::contract::llm::UpstreamFailure;
+
 /// Prefix marking a run whose failure cause is deterministic (environment or
 /// upstream protocol), so retry/upgrade loops can stop instead of re-paying for
 /// attempts that must fail again.
@@ -64,10 +66,29 @@ pub const ITERATION_BUDGET_EXHAUSTED_MARKER: &str = "iteration_budget_exhausted"
 /// already the definition of an attempt not worth buying again; the two differ
 /// only in whether the cause was known before the first attempt or discovered
 /// during it.
+///
+/// A terminal declaration is honoured unless the reason it is wrapped around
+/// itself names an upstream refusal the environment can clear on its own. A
+/// producer writes the terminal marker for any prompt failure it cannot tell
+/// apart from a transport that never reached the upstream, so a typed server
+/// error or rate limit gets filed as deterministic and the work is dropped with
+/// no retry — precisely during the outage a later attempt would have survived.
+/// The typed cause is finer-grained than the blanket declaration around it and
+/// wins.
 pub fn is_deterministic_failure(reason: &str) -> bool {
-    [TERMINAL_ENV_FAILURE_PREFIX, DEGENERATE_LOOP_PREFIX]
-        .into_iter()
-        .any(|prefix| declares(reason, prefix))
+    if declares(reason, DEGENERATE_LOOP_PREFIX) {
+        return true;
+    }
+    if !declares(reason, TERMINAL_ENV_FAILURE_PREFIX) {
+        return false;
+    }
+    match UpstreamFailure::named_in(reason) {
+        // A refusal the environment can clear by itself — a rate limit, a
+        // server error, a broken transport — is a failure to come back to, not
+        // one to give up on.
+        Some(cause) if cause.is_environment_failure() && !cause.is_terminal() => false,
+        _ => true,
+    }
 }
 
 /// Whether `reason` carries `prefix` as a declared label.
@@ -171,5 +192,51 @@ mod tests {
         assert!(!is_deterministic_failure(
             "warning: terminal_env_failure is the name of the marker we look for"
         ));
+    }
+
+    /// A terminal declaration that rides on a typed upstream refusal is only as
+    /// terminal as that refusal. A producer cannot tell a transport that never
+    /// reached the upstream apart from one the upstream refused, so it declares
+    /// both terminal — but a server error or a rate limit clears on its own and
+    /// must keep its retries, while quota and credentials do not.
+    #[test]
+    fn a_terminal_declaration_defers_to_the_refusal_it_reports() {
+        let declared = |cause: UpstreamFailure| {
+            format!(
+                "Agent execution error: terminal_env_failure: environment_error: \
+                 LLM upstream refused ({cause}): LLM stream error: API error (HTTP detail)"
+            )
+        };
+
+        for cause in [
+            UpstreamFailure::ServerError,
+            UpstreamFailure::RateLimited,
+            UpstreamFailure::Transport,
+        ] {
+            assert!(
+                !is_deterministic_failure(&declared(cause)),
+                "{cause} clears on its own and must keep its retries"
+            );
+        }
+        for cause in [
+            UpstreamFailure::QuotaExhausted,
+            UpstreamFailure::Auth,
+            UpstreamFailure::BadRequest,
+        ] {
+            assert!(
+                is_deterministic_failure(&declared(cause)),
+                "{cause} cannot be cleared by retrying the same request"
+            );
+        }
+
+        // A declaration carrying no typed refusal is still honoured, and a
+        // degenerate loop stays terminal regardless of any refusal named inside.
+        assert!(is_deterministic_failure(
+            "terminal_env_failure: generator produced no artifacts"
+        ));
+        assert!(is_deterministic_failure(&format!(
+            "degenerate_loop: {}",
+            declared(UpstreamFailure::ServerError)
+        )));
     }
 }
