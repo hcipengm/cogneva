@@ -17,12 +17,31 @@
 //! the user message. Stable first, varying last, is the only shape a prefix cache
 //! can work with.
 //!
+//! Hoisting the contract fixes the head of the request but not the rest of it:
+//! what is left still serializes in key order, and `context` sorts before
+//! `task`. The user message therefore opens on `{"context":{"attempt":`, a byte
+//! that moves every attempt, and the request underneath it — the largest
+//! constant block in the whole request, identical for every attempt of one task
+//! — is bought again at full price each time. [`render_varying_half`] is the
+//! other half of that rule: the request first, what this attempt adds last.
+//!
 //! The key name lives here instead of being spelled out at each site: producer
 //! (the actors) and consumer (the agent runtime) read one constant, whereas two
 //! literals for one agreement drift.
 
 /// The key that carries the stable half of an input document.
 pub const PROMPT_CONTRACT_KEY: &str = "contract";
+
+/// Document keys that state the request rather than this attempt at it.
+///
+/// A prefix cache compares from the first byte, so the order these render in
+/// decides what it can hold: whatever stands before the first attempt-specific
+/// byte is shared by every attempt. `task` is the work being done and does not
+/// move between the attempts of one task — same id, same input — while
+/// everything that does move (the attempt number, the previous feedback, this
+/// round's generation) is assembled under `context` by the caller. In key order
+/// the two arrive the other way round and the varying byte leads.
+const REQUEST_KEYS: [&str; 1] = ["task"];
 
 /// Take the stable half out of the document and return `(stable half, the rest)`.
 ///
@@ -49,6 +68,38 @@ pub fn split_contract(mut input: serde_json::Value) -> (Option<String>, serde_js
         other => other.to_string(),
     };
     (Some(text), input)
+}
+
+/// Render the varying half as one user message, with the request in front.
+///
+/// The content is [`split_contract`]'s payload, byte for byte — this decides
+/// the order, not the contents, and the result parses back to the same value.
+/// Everything under [`REQUEST_KEYS`] is written first, then the remaining keys
+/// in their own order; a payload that is not an object is rendered as it is,
+/// like [`split_contract`] passes non-object documents through.
+///
+/// What this buys is the prefix: on the second attempt at the same task the
+/// request block is byte-identical to the first attempt's, so the upstream
+/// cache holds it instead of being invalidated by the attempt counter that used
+/// to stand in front of it.
+pub fn render_varying_half(payload: &serde_json::Value) -> String {
+    let Some(fields) = payload.as_object() else {
+        return payload.to_string();
+    };
+    let key_text = |key: &str| serde_json::Value::String(key.to_string()).to_string();
+    let mut members: Vec<String> = Vec::with_capacity(fields.len());
+    for key in REQUEST_KEYS {
+        if let Some(value) = fields.get(key) {
+            members.push(format!("{}:{}", key_text(key), value));
+        }
+    }
+    for (key, value) in fields {
+        if REQUEST_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        members.push(format!("{}:{}", key_text(key), value));
+    }
+    format!("{{{}}}", members.join(","))
 }
 
 #[cfg(test)]
@@ -118,5 +169,59 @@ mod tests {
         let (contract, payload) = split_contract(serde_json::json!("just a string"));
         assert!(contract.is_none());
         assert_eq!(payload, serde_json::json!("just a string"));
+    }
+
+    /// The request is written before the attempt, so two attempts at one task
+    /// share everything up to the first attempt-specific byte.
+    ///
+    /// This is the reading, not the arrangement: what matters is the length of
+    /// the common prefix between two attempts, which is what the upstream cache
+    /// gets to keep. Rendering in key order gave it `{"context":{"attempt":`.
+    #[test]
+    fn the_request_stands_before_the_attempt_that_moves() {
+        let doc = |attempt: u32| {
+            serde_json::json!({
+                PROMPT_CONTRACT_KEY: {"instructions": "You are the Planner"},
+                "task": {"id": "t1", "input": {"goal": "fix the parser"}},
+                "context": {"attempt": attempt, "previous_feedback": null},
+            })
+        };
+        let (_, first) = split_contract(doc(1));
+        let (_, second) = split_contract(doc(2));
+        let (first, second) = (render_varying_half(&first), render_varying_half(&second));
+
+        let shared = first
+            .bytes()
+            .zip(second.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        assert!(first.starts_with("{\"task\":"), "{first}");
+        assert!(
+            shared > "{\"context\":{\"attempt\":".len(),
+            "two attempts share only {shared} bytes: {first}"
+        );
+
+        // Same value, ordered: reordering decides where the cache starts, never
+        // what the model reads.
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&first).unwrap(),
+            split_contract(doc(1)).1
+        );
+    }
+
+    /// Reordering must not depend on the payload happening to carry a task: a
+    /// document built by some other path is still rendered as one JSON value.
+    #[test]
+    fn a_payload_without_a_request_renders_in_its_own_order() {
+        let payload = serde_json::json!({"b": 2, "a": 1});
+        let rendered = render_varying_half(&payload);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&rendered).unwrap(),
+            payload
+        );
+        assert_eq!(
+            render_varying_half(&serde_json::json!("prose")),
+            "\"prose\""
+        );
     }
 }

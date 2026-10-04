@@ -861,8 +861,11 @@ impl AgentRuntime {
                 self.context.prepend_message(Message::system(contract));
             }
         }
+        // The varying half is rendered request-first, so the attempt counter
+        // that used to open it does not sit in front of the one block every
+        // attempt of a task shares. See `render_varying_half`.
         self.context.add_message(Message::user(
-            serde_json::to_string(&payload).unwrap_or_default(),
+            cog_core::contract::prompt::render_varying_half(&payload),
         ));
 
         for iteration in 0..self.config.max_iterations {
@@ -2962,6 +2965,50 @@ mod tests {
         assert_eq!(
             systems, 1,
             "the contract must not reappear mid-conversation"
+        );
+    }
+
+    /// The user message opens on the request, so the block two attempts share
+    /// reaches past the attempt counter that used to lead it.
+    ///
+    /// The system message is the same in both attempts either way; what differs
+    /// is how much of *this* message the upstream cache can hold. Read as a
+    /// prefix length rather than as a shape, because the length is the thing the
+    /// cache acts on: the old order shared `{"context":{"attempt":`, and
+    /// everything after it — the task, its input — was bought again at full
+    /// price on every attempt of the same task.
+    #[tokio::test]
+    async fn two_attempts_share_the_body_of_the_user_message() {
+        let llm = RecordingLlm::default();
+        let mut runtime = census_runtime("contract-body");
+        for attempt in [1, 2] {
+            runtime
+                .run(contract_input(attempt, "Emit JSON only"), &llm)
+                .await
+                .expect("the run delivers");
+        }
+
+        let calls = llm.calls();
+        let body_of = |call: &Vec<Message>| {
+            call.iter()
+                .rev()
+                .find(|m| matches!(m, Message::User { .. }))
+                .expect("a user message")
+                .content()
+        };
+        let (first, second) = (body_of(&calls[0]), body_of(&calls[1]));
+        let shared = first
+            .bytes()
+            .zip(second.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        assert!(
+            first.starts_with("{\"task\":"),
+            "the request must open the message: {first}"
+        );
+        assert!(
+            shared > "{\"context\":{\"attempt\":".len(),
+            "the two attempts share only {shared} bytes of the user message"
         );
     }
 }
