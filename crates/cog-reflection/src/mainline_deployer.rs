@@ -1889,6 +1889,12 @@ struct MainlineState {
     /// 与"没有新 rev 可滚"在心跳上完全同形。
     #[serde(default)]
     ci_hold_rev: Option<String>,
+    /// 连续多少轮没从构建闸拿到槽。拿不到就原样回下一轮，不留状态，于是这一支
+    /// 在读数上完全同形——无论撞的是一次别人的构建，还是槽被一个永远不松手的
+    /// 持有者占着。落盘是因为重启正是这个进程自己会做的事：计数在内存里的话，
+    /// 每次滚动都会把"已经等了多久"抹掉，而这恰恰是唯一需要它的那个数。
+    #[serde(default)]
+    advance_deferrals: u32,
     /// 上一次容量回收是什么时候（unix 秒，0 = 从没做过）。冷却窗挂在内存里的话，
     /// 进程重启一次就少一道闸，而重启这个进程正是它自己会做的事。
     #[serde(default)]
@@ -4345,10 +4351,22 @@ impl MainlineDeployer {
         let build_slot = match cog_core::build_gate::try_acquire("mainline advance").await {
             Ok(slot) => slot,
             Err(e) => {
-                info!(error = %e, "host is building; deferring the advance to the next cycle");
+                // 被挡住的每一轮在日志里都和上一轮一模一样：同一个请求者、同一句
+                // "host is building"。次数是这一支唯一随时间变的东西，也是把"恰好
+                // 撞上一台正在构建的宿主"与"永远轮不到"分开的那个读数——`what` 只是
+                // 请求者，拒因里的持有者是门那边加的。清零放在真正拿到槽的那一刻：
+                // 这一计数量的就是"连续多少轮没拿到槽"，拿到一次的下一轮就不再是连续。
+                state.advance_deferrals = state.advance_deferrals.saturating_add(1);
+                self.save_state(&state)?;
+                info!(
+                    deferrals = state.advance_deferrals,
+                    error = %e,
+                    "host is building; deferring the advance to the next cycle"
+                );
                 return Ok(());
             }
         };
+        state.advance_deferrals = 0;
 
         // 叠层基底在这里才定：上面那条快路不需要它（不重建），而它自己要读 registry
         // 并可能改一个 tag，是"真要构建"才付的代价。它要留在槽里：基底 tag 由这

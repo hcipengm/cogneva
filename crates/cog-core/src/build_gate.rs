@@ -516,16 +516,21 @@ impl BuildGate {
         let mut held = Vec::with_capacity(self.slots);
         for slot in 0..self.slots {
             match lock_slot(&self.dir, slot) {
-                Some(file) => held.push(file),
+                Some(file) => {
+                    record_holder(&file, what);
+                    held.push(file);
+                }
                 None => {
                     drop(held);
+                    let held_by = holder_report(&self.dir, self.slots);
                     let reason = format!(
-                        "a build holds one of the {} slots, so builds cannot be excluded",
+                        "a build holds one of the {} slots, so builds cannot be excluded ({held_by})",
                         self.slots
                     );
                     tracing::warn!(
                         what,
                         slots = self.slots,
+                        holder = %held_by,
                         dir = %self.dir.display(),
                         identity = %self.identity(),
                         "{reason}"
@@ -581,6 +586,7 @@ impl BuildGate {
         loop {
             for slot in 0..self.slots {
                 if let Some(file) = lock_slot(&self.dir, slot) {
+                    record_holder(&file, what);
                     self.waiting.fetch_sub(1, Ordering::Relaxed);
                     self.in_flight.fetch_add(1, Ordering::Relaxed);
                     let total = self.acquired.fetch_add(1, Ordering::Relaxed) + 1;
@@ -612,11 +618,19 @@ impl BuildGate {
                 } else {
                     Refusal::Waited
                 };
-                let reason = refusal.reason(self.slots, budget);
+                // Who is holding, read from the holders themselves. A refusal's
+                // own duration is not a reading -- it is fixed by whether the
+                // caller waited -- but the holder's is: it is the length of one
+                // piece of work, and it is what tells a caller that came back
+                // once too often from one that is queueing behind a single
+                // unbroken hold.
+                let held = holder_report(&self.dir, self.slots);
+                let reason = format!("{} ({held})", refusal.reason(self.slots, budget));
                 tracing::warn!(
                     what,
                     refusal = refusal.as_str(),
                     slots = self.slots,
+                    holder = %held,
                     dir = %self.dir.display(),
                     identity = %self.identity(),
                     total,
@@ -692,6 +706,119 @@ impl Drop for BuildPermit {
 }
 
 /// Creates the slot directory, reporting why when it cannot.
+/// Who is holding a slot, as the holder itself wrote it down.
+///
+/// The permission carries no identity: `flock` answers "someone has it" and
+/// nothing else, so a caller refused a slot could only be told that the host was
+/// busy, and learning *which* work held it took a `ps` inside the container —
+/// the reading existed, but only on a machine you had to already be on. The
+/// holder writes one line into the slot file it locked instead, and the refusing
+/// side reads it, so the refusal says what was asked for and what is holding it.
+///
+/// A refusal raises exactly this question, and the refusal counter answers it
+/// wrongly: that counter is per requester, so sixty refusals of one work read
+/// the same whether they were sixty different holders or one work that never let
+/// go. The holder's own `what` is what tells those apart, which is why it is
+/// carried on the refusal rather than published as a series of its own with no
+/// rule to read it.
+struct Holder {
+    what: String,
+    pid: u32,
+}
+
+/// Writes `holder` into a slot file this process has just locked.
+///
+/// Written after the lock, never before: a reader that finds a line here can
+/// rely on the kernel to say whether its writer still lives, because a holder
+/// that dies leaves the line behind and the lock released. Written at all only
+/// because the lock cannot say it.
+#[cfg(unix)]
+fn record_holder(file: &std::fs::File, what: &str) {
+    use std::io::{Seek, SeekFrom, Write};
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!("{}\t{since}\t{what}\n", std::process::id());
+    let mut handle = file;
+    if handle.set_len(0).is_ok() {
+        let _ = handle
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| handle.write_all(line.as_bytes()));
+    }
+}
+
+#[cfg(not(unix))]
+fn record_holder(_file: &std::fs::File, _what: &str) {}
+
+/// Where the record above is read back from, plus the one thing the record
+/// cannot say about itself: whether it is current.
+///
+/// The lock is asked, not the clock. A slot whose lock can be taken over holds
+/// nobody, so whatever is written in it was left by a holder that is gone and
+/// must not be named in a refusal — otherwise the report would outlive its
+/// subject and the next starved caller would blame work that finished long ago.
+#[cfg(unix)]
+fn read_holder(dir: &Path, slot: usize) -> Option<(Holder, std::time::Duration)> {
+    use std::io::Read;
+    use std::os::unix::io::AsRawFd;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(dir.join(format!("slot-{slot}.lock")))
+        .ok()?;
+    // SAFETY: as in `lock_slot` — flock touches only this process's descriptor
+    // table for a descriptor this scope owns, and EWOULDBLOCK is the expected
+    // answer.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        // Nobody holds it, so the line below is a leftover.
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        return None;
+    }
+    let mut text = String::new();
+    (&file).read_to_string(&mut text).ok()?;
+    let line = text.lines().next()?;
+    let mut fields = line.splitn(3, '\t');
+    let pid: u32 = fields.next()?.parse().ok()?;
+    let since_unix: u64 = fields.next()?.parse().ok()?;
+    let what = fields.next()?.to_string();
+    if what.is_empty() {
+        return None;
+    }
+    let held = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().saturating_sub(since_unix))
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_default();
+    Some((Holder { what, pid }, held))
+}
+
+#[cfg(not(unix))]
+fn read_holder(_dir: &Path, _slot: usize) -> Option<(Holder, std::time::Duration)> {
+    None
+}
+
+/// What a refusal can say about what is holding the slots it could not take.
+///
+/// Told apart from "no holder" on purpose: a slot taken by a holder that wrote
+/// nothing — an older build of this gate, or a record the filesystem refused —
+/// is not the same fact as a free slot, and a reader deciding whether the host
+/// is busy or the gate is broken needs to see which one it has.
+fn holder_report(dir: &Path, slots: usize) -> String {
+    let held: Vec<String> = (0..slots)
+        .filter_map(|slot| read_holder(dir, slot))
+        .map(|(h, held)| format!("\"{}\" (pid {}) for {}s", h.what, h.pid, held.as_secs()))
+        .collect();
+    if held.is_empty() {
+        format!("{} of {slots} slots taken, none of them named", slots)
+    } else if held.len() == slots {
+        format!("held by {}", held.join(", "))
+    } else {
+        format!("{} of {slots} slots named: {}", held.len(), held.join(", "))
+    }
+}
+
 fn create_slot_dir(dir: &Path) -> SFResult<()> {
     std::fs::create_dir_all(dir)
         .map_err(|e| SFError::IO(format!("create build gate dir {}: {e}", dir.display())))
@@ -811,6 +938,52 @@ mod tests {
         drop(first);
         let third = gate.try_acquire("third").await.unwrap();
         assert!(third.held(), "dropping a permit frees its slot");
+    }
+
+    /// A refusal used to name only the caller that was turned away, which says
+    /// nothing about why: the permission carries no identity, so answering "who
+    /// has it" meant a `ps` inside the container. The holder writes its own name
+    /// into the slot it locked, and the refusal reads it back.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refusal_names_the_work_holding_the_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 0);
+
+        let held = gate.try_acquire("change verification").await.unwrap();
+        let refused = gate
+            .try_acquire("mainline advance")
+            .await
+            .expect_err("the only slot is taken");
+        let text = refused.to_string();
+        assert!(
+            text.contains("mainline advance") && text.contains("\"change verification\""),
+            "a refusal has to name the requester and the holder, got: {text}"
+        );
+
+        drop(held);
+    }
+
+    /// The record outlives the holder: a process that dies leaves the line it
+    /// wrote while the kernel releases the lock. Reporting that line would make
+    /// every later refusal blame work that finished long ago, so the lock is
+    /// asked whether the record still has a subject.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_left_by_a_departed_holder_is_not_named() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("slot-0.lock"),
+            b"4242\t1700000000\tchange verification\n",
+        )
+        .unwrap();
+
+        let report = holder_report(dir.path(), 1);
+        assert!(
+            !report.contains("change verification"),
+            "a lock nobody holds has no holder to name, got: {report}"
+        );
+        assert!(report.contains("none of them named"), "got: {report}");
     }
 
     /// An exclusion has to exclude *builds*, and one slot does not do that: the
