@@ -244,6 +244,13 @@ impl GeneratorActor {
 /// diff terminated, context matching the file byte for byte. A diff written from
 /// memory is the most expensive failure on this path: the whole generation and
 /// evaluation round is paid for and nothing is produced.
+///
+/// `refusal_causes` is the map that keeps this promise honest as the gate grows:
+/// one entry per [`cog_core::RejectionCause`], naming the field here that
+/// answers it, and a test that holds the two sets equal. A cause the gate gains
+/// without a clause here is a round the generator is invited to spend and lose,
+/// and that has already happened once — the lint criterion added on 2026-10-01
+/// had no clause for seven days.
 fn change_generation_contract() -> serde_json::Value {
     serde_json::json!({
         "output_format": "unified_diff",
@@ -262,8 +269,23 @@ fn change_generation_contract() -> serde_json::Value {
         "grounding": "Your diff is validated with `git apply --check` against a checkout of this repository, then applied to it and compiled. It must therefore describe the files as they actually are, not as you remember them. You have file tools in this run — use them before writing: list the directories you intend to touch, then read every file you change in full (read_file, or a shell command such as `sed -n '1,400p' <path>`). Address files by repository-relative path (for example crates/cog-core/src/lib.rs) — the same path that appears in the '+++ b/' line — and those paths resolve against the checkout. Never guess a path: a path that is not in the checkout is rejected unless the diff itself declares it as created.",
         "diff_grammar": "Every hunk header '@@ -<start>,<count> +<start>,<count> @@' must declare exactly the number of lines its body carries, and the diff must end with a newline. Every context line and every removed line has to match the file byte for byte, including indentation and trailing whitespace, and the start line numbers must be the real line numbers in the file you read. Keep hunks narrow and anchor them on context that is unique in the file: one hunk whose context cannot be located fails the entire change.",
         "creating_a_file": "To add a file, declare it as a creation: 'diff --git a/<path> b/<path>', then 'new file mode 100644', '--- /dev/null', '+++ b/<path>', and a hunk header '@@ -0,0 +1,<n> @@' whose body is n '+' lines. Creating a file that already exists fails, and so does rewriting a file that does not exist without declaring it as a creation.",
-        "scope": "Stay inside the checkout, and prefer paths under crates/*/src/. The gate rejects changes to build and deployment manifests (Cargo.toml, Cargo.lock, Dockerfile, Containerfile, docker-compose.yml, setup.sh) and to configuration or credential files (cogneva.json, .env, .envrc, *.pem, *.key, *.crt, *.p12); deletions are judged by the same rules as edits. The applied change is compiled and tested, so it must be complete and self-consistent — no placeholder or unimplemented bodies.",
-        "plan_targets": "The plan you are handed may name the repository-relative paths the change must touch. Every path it names has to be a target of your diff: the change may touch more files than the plan lists, but a path the plan names and your diff never touches is refused. If the plan names a file that already exists, change that file — do not create a new one beside it and leave the named file alone."
+        "scope": "Stay inside the checkout, and prefer paths under crates/*/src/. The gate rejects changes to build and deployment manifests (Cargo.toml, Cargo.lock, Dockerfile, Containerfile, docker-compose.yml, setup.sh) and to configuration or credential files (cogneva.json, .env, .envrc, *.pem, *.key, *.crt, *.p12); deletions are judged by the same rules as edits. A diff far larger than the change it makes is refused as too large to review, so keep the change to the lines it needs. The applied change is compiled and tested, so it must be complete and self-consistent — no placeholder or unimplemented bodies.",
+        "plan_targets": "The plan you are handed may name the repository-relative paths the change must touch. Every path it names has to be a target of your diff: the change may touch more files than the plan lists, but a path the plan names and your diff never touches is refused. If the plan names a file that already exists, change that file — do not create a new one beside it and leave the named file alone.",
+        "formatting": "Before anything is compiled, the applied tree is checked the way CI checks it: `cargo fmt --all -- --check`. Your change has to be exactly what the workspace's formatter (plain rustfmt) produces — do not hand-format, and do not reflow or realign lines you did not need to touch, because the formatter's version of them is not the one that is in the file. A hunk whose result differs from the formatter's is refused (formatting_differs) no matter how good the code is.",
+        "lint": "The applied tree is then linted the way CI lints it: `cargo clippy --workspace` with warnings denied (`-D warnings`). Only the lines your diff writes are judged — a clippy diagnostic whose span lands on a line you added refuses the change (lint_introduced). Lints the tree already carried are not counted against you, so do not fix unrelated warnings: copy neither them nor the style of the line they report on. Write the new line so clippy has nothing to say about it.",
+        "verification": "The applied change is compiled and the workspace test suite is run. A test that passed on the tree before your change and fails after it refuses the change (tests_failed). A suite that could not be run to a verdict at all (test_run_unavailable) is not your diff's fault and is not held against it, though it does cost the round.",
+        "refusal_causes": {
+            "malformed_diff": "diff_grammar",
+            "promotion_gate_refused": "scope",
+            "forbidden_path": "scope",
+            "intent_mismatch": "plan_targets",
+            "context_does_not_apply": "diff_grammar",
+            "apply_failed": "grounding",
+            "formatting_differs": "formatting",
+            "test_run_unavailable": "no_diff_can_avoid_it: the verification suite needs the host's build slot; when it cannot be had the change is refused without being judged, which no wording of a diff can change",
+            "tests_failed": "verification",
+            "lint_introduced": "lint"
+        }
     })
 }
 
@@ -353,6 +375,30 @@ mod tests {
                 "a named existing file is changed, not bypassed",
                 "do not create a new one beside it",
             ),
+            (
+                "an oversized diff is refused before it is applied",
+                "too large to review",
+            ),
+            (
+                "formatting is judged by the formatter's own output",
+                "cargo fmt --all -- --check",
+            ),
+            (
+                "the formatting rule forbids reflowing untouched lines",
+                "do not reflow or realign lines you did not need to touch",
+            ),
+            (
+                "linting runs with warnings denied",
+                "cargo clippy --workspace",
+            ),
+            (
+                "the lint rule is scoped to the lines the change writes",
+                "Only the lines your diff writes are judged",
+            ),
+            (
+                "tests that passed before the change are the criterion",
+                "passed on the tree before your change and fails after it",
+            ),
         ] {
             assert!(
                 text.contains(needle),
@@ -404,6 +450,59 @@ mod tests {
             assert!(
                 names(ext),
                 "the contract never names protected extension .{ext}"
+            );
+        }
+    }
+
+    /// The marker a cause carries when no wording of a diff can avoid it.
+    ///
+    /// Such a cause still gets an entry and still gets words: an omission and
+    /// an unthought-about cause read the same from here, and the model is owed
+    /// the reason either way.
+    const NOT_WRITABLE: &str = "no_diff_can_avoid_it: ";
+
+    /// The contract answers the gate's whole axis, and the axis it is held to
+    /// is the gate's own — not a list restated here that could drift beside it.
+    ///
+    /// The two tests above pin the wording and the protected-file names; this
+    /// one pins coverage. Without it the expensive direction of the drift is
+    /// silent: a cause added to the gate leaves the generator writing diffs the
+    /// gate refuses, and nothing goes red until a round has already been paid
+    /// for — which is how a lint criterion added on 10-01 cost seven days of
+    /// landings before anyone could see it.
+    #[test]
+    fn the_change_contract_answers_every_refusal_cause() {
+        let contract = change_generation_contract();
+        let answers = contract["refusal_causes"]
+            .as_object()
+            .expect("the contract carries no refusal_causes map");
+
+        for cause in cog_core::RejectionCause::ALL {
+            let key = cause.as_str();
+            let answer = answers
+                .get(key)
+                .and_then(|value| value.as_str())
+                .unwrap_or_else(|| panic!("the contract answers no refusal cause {key}"));
+            match answer.strip_prefix(NOT_WRITABLE) {
+                Some(reason) => assert!(
+                    !reason.trim().is_empty(),
+                    "refusal cause {key} is declared unavoidable with no reason"
+                ),
+                None => assert!(
+                    contract.get(answer).is_some(),
+                    "refusal cause {key} points at contract field {answer}, which the contract does not carry"
+                ),
+            }
+        }
+
+        // The other direction: a key left behind by a renamed variant would
+        // read as coverage for a cause the gate can no longer reach.
+        for key in answers.keys() {
+            assert!(
+                cog_core::RejectionCause::ALL
+                    .iter()
+                    .any(|cause| cause.as_str() == key),
+                "the contract answers {key}, which is not a cause the gate can reach"
             );
         }
     }
