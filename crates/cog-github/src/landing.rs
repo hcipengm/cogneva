@@ -1736,10 +1736,7 @@ pub fn ensure_contribution_allowed(diff: &str) -> Result<()> {
 /// would let the two answers disagree about the same patch.
 pub fn non_contributable_paths(diff: &str) -> Result<Vec<String>> {
     let files = affected_files(diff)?;
-    Ok(files
-        .into_iter()
-        .filter(|p| !is_allowed_path(p))
-        .collect())
+    Ok(files.into_iter().filter(|p| !is_allowed_path(p)).collect())
 }
 
 /// Files a unified diff touches, as a landing error when none can be read.

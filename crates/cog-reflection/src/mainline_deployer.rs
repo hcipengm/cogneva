@@ -11018,7 +11018,12 @@ exit 0
     ///
     /// 读部署这一步落在轮首那次上游读数与构建之间，用它来把"上游在轮首之后、
     /// 构建开始之前走过去了"放进这一轮的中间。推到固定 rev 是幂等的，重复调用无害。
-    fn fake_kubectl_advancing_main(dir: &Path, deployed_image: &str, bare: &Path, rev: &str) -> String {
+    fn fake_kubectl_advancing_main(
+        dir: &Path,
+        deployed_image: &str,
+        bare: &Path,
+        rev: &str,
+    ) -> String {
         let log = dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
@@ -11954,12 +11959,8 @@ exit 0
         std::fs::create_dir_all(&bin_dir).unwrap();
         let buildah = fake_buildah(&bin_dir, rev12(&rev_a));
         // 读部署这一步落在轮首读数与构建之间，上游就在这里落下了下一笔。
-        let kubectl = fake_kubectl_advancing_main(
-            &bin_dir,
-            "reg.local:5000/cogneva:local",
-            &bare,
-            &rev_b,
-        );
+        let kubectl =
+            fake_kubectl_advancing_main(&bin_dir, "reg.local:5000/cogneva:local", &bare, &rev_b);
         let ws = test_workspaces(root, &bare);
         fake_cargo(&bin_dir, ws.target_dir());
         fake_strip(&bin_dir);

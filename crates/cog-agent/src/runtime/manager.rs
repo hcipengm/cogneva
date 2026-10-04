@@ -188,10 +188,7 @@ impl GlobalAgentManager {
     /// The tool registry carries its own handle to the same backend, and that
     /// one is what a worker's tools use. This is the other handle: the one an
     /// agent reads its tree through when something asks what the run changed.
-    pub fn with_sandbox_backend(
-        mut self,
-        backend: Arc<dyn cog_core::SandboxBackend>,
-    ) -> Self {
+    pub fn with_sandbox_backend(mut self, backend: Arc<dyn cog_core::SandboxBackend>) -> Self {
         self.sandbox_backend = Some(backend);
         self
     }

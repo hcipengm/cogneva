@@ -314,10 +314,7 @@ pub trait ChangeLanding: Send + Sync + std::fmt::Debug {
     /// from and what a next attempt is aimed at — and reading them back out of
     /// the message would make a second parser of the one rule, judging the
     /// patch a second time. An implementor answers both from one predicate.
-    fn contribution_refusal_paths(
-        &self,
-        diff: &str,
-    ) -> crate::SFResult<Vec<std::path::PathBuf>>;
+    fn contribution_refusal_paths(&self, diff: &str) -> crate::SFResult<Vec<std::path::PathBuf>>;
 }
 
 /// Owner policy for flowing evolved changes back upstream as PRs.
