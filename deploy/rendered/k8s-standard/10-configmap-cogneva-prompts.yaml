@@ -78,38 +78,6 @@ data:
         tags: ["reflection", "evolution"]
         active: true
     
-      # 答案的形状必须抄读者的解析器：生成的正文由 `EvolutionEngine::extract_unified_diff`
-      # 读，它只认 `diff --git ` / `--- a/` 起始的行，读不到就把整段作答当「概念性回答」丢掉
-      # （`.diff` 不落盘、流水线不消费）。要求 Markdown 代码块会让这条链自己踩自己的读者。
-      reflection:evolution_change:
-        content: |
-          You are an expert Rust engineer improving an AI agent system.
-    
-          Context:
-          {{ learning_context }}
-    
-          Requirement:
-          {{ module_description }}{% if compile_errors is defined %}
-    
-          Previous attempt failed validation. Errors:
-          {{ compile_errors }}
-    
-          Please fix these errors and regenerate the change.{% endif %}
-    
-          Generate a change that addresses the requirement. Output ONLY a unified diff (starting with 'diff --git a/... b/...'), with no markdown fences and no prose. This is a Rust workspace; modify only source files under crates/**/*.rs.
-        version: "1.0.0"
-        description: "EvolutionEngine code change generation prompt"
-        tags: ["reflection", "evolution"]
-        active: true
-    
-      reflection:evolution_change_system:
-        content: |
-          Respond with a single unified diff change and nothing else.
-        version: "1.0.0"
-        description: "EvolutionEngine change system instruction"
-        tags: ["reflection", "evolution"]
-        active: true
-    
       reflection:evolution_tool:
         content: |
           You are a tool design expert for an AI agent system.

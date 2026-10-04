@@ -269,6 +269,9 @@ pub enum EvolutionIntent {
     PrIntent,
     /// A move of the tracked upstream baseline invalidated an earlier attempt.
     BaselineRework,
+    /// A gate refused a change, and the defect it named is being generated for
+    /// again through the main flow.
+    ChangeRework,
     /// The explicit `self_evolution` task form, without a narrower producer.
     SelfEvolution,
     /// A self-evolution task whose kind is not one of the above.
@@ -280,13 +283,14 @@ impl EvolutionIntent {
     /// classes it has none of as well, or an empty class is indistinguishable
     /// from a class that was never wired up. The list is the enum, so adding a
     /// variant cannot leave a reader silently short of a series.
-    pub const ALL: [EvolutionIntent; 8] = [
+    pub const ALL: [EvolutionIntent; 9] = [
         EvolutionIntent::SelfSignal,
         EvolutionIntent::SelfAudit,
         EvolutionIntent::CiFix,
         EvolutionIntent::IssueFix,
         EvolutionIntent::PrIntent,
         EvolutionIntent::BaselineRework,
+        EvolutionIntent::ChangeRework,
         EvolutionIntent::SelfEvolution,
         EvolutionIntent::Unattributed,
     ];
@@ -301,6 +305,7 @@ impl EvolutionIntent {
             EvolutionIntent::IssueFix => "issue_fix",
             EvolutionIntent::PrIntent => "pr_intent",
             EvolutionIntent::BaselineRework => "baseline_rework",
+            EvolutionIntent::ChangeRework => "change_rework",
             EvolutionIntent::SelfEvolution => "self_evolution",
             EvolutionIntent::Unattributed => "unattributed",
         }
@@ -318,6 +323,7 @@ impl EvolutionIntent {
             "platform_issue_fix" => EvolutionIntent::IssueFix,
             "platform_pr_intent" => EvolutionIntent::PrIntent,
             "baseline_port_rework" => EvolutionIntent::BaselineRework,
+            "change_rework" => EvolutionIntent::ChangeRework,
             "self_evolution" => EvolutionIntent::SelfEvolution,
             _ => EvolutionIntent::Unattributed,
         }
@@ -904,6 +910,11 @@ mod tests {
                 "baseline_port_rework",
                 &["crates/cog-reflection/src/baseline_port.rs"],
                 EvolutionIntent::BaselineRework,
+            ),
+            (
+                "change_rework",
+                &["crates/cog-reflection/src/lib.rs"],
+                EvolutionIntent::ChangeRework,
             ),
             (
                 "self_evolution",

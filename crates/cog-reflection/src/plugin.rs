@@ -71,6 +71,9 @@ pub struct ReflectionPlugin {
     /// is created unconditionally so a deployment that runs no watcher can
     /// still say so, and the loop that arms it is what flips the role flag.
     signal_readings: Arc<crate::signal_readings::SignalWatcherReadings>,
+    /// 被门禁拒绝的变更回流主流程那条支路的门与读数。init 建好并发布，
+    /// `start()` 把编排器填进它的槽——跨插件消费只能在 start。
+    rework_gate: Option<Arc<crate::change_rework::ChangeReworkGate>>,
 }
 
 impl ReflectionPlugin {
@@ -87,6 +90,7 @@ impl ReflectionPlugin {
             registry_footprint: None,
             governance_drift: None,
             signal_readings: Arc::new(crate::signal_readings::SignalWatcherReadings::new()),
+            rework_gate: None,
         }
     }
 }
@@ -240,9 +244,9 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         }
 
         // The metrics backend storage published. Consumed here rather than
-        // passed down from wherever the reader sits: the reading belongs to the
-        // engine that runs the generation, and both engines below are built in
-        // this function.
+        // passed down from wherever the reader sits: the readings that need it
+        // are recorded by objects built in this function — the change pipeline
+        // among them.
         // Build an evolution engine up-front for the in-memory fallback below,
         // which has no persistent memory backend to build one from. In
         // production the engine comes from `new_self_evolution`, which builds
@@ -260,9 +264,6 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 .with_change_dir(change_dir.clone());
                 if let Some(ref root) = engine_root {
                     evolution = evolution.with_project_root(root.clone());
-                }
-                if let Some(metrics) = metrics_backend.clone() {
-                    evolution = evolution.with_metrics(metrics);
                 }
                 Some(Arc::new(evolution))
             } else {
@@ -325,7 +326,6 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 Some(tool_tx),
                 engine_root.clone(),
                 change_dir.clone(),
-                metrics_backend,
             )
         } else {
             warn!("ReflectionEngine falling back to in-memory mode (memory_backend or llm_provider unavailable)");
@@ -385,6 +385,16 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
 
         ctx.publish(engine.clone());
         info!("ReflectionPlugin reflection engine published");
+
+        // 被门禁拒绝的变更回流主流程那条支路的属主门与读数。读数在这里发布：
+        // 采集侧的快照是插件初始化期间抓的，从 `start()` 发布的句柄没人读。提交
+        // 权只给承担执行器职责的进程——插件表在两个进程里整表加载，都提交就是同一
+        // 份需求提交两遍。编排器句柄要等 `start()` 才拿得到，这里只定属主。
+        if ctx.config().self_evolution.executor_enabled {
+            engine.rework.arm();
+        }
+        ctx.publish_observable(engine.rework.clone());
+        self.rework_gate = Some(engine.rework.clone());
 
         // Publish ChangeSink when self-evolution is available.
         if let Some(ref evo) = engine.evolution {
@@ -629,7 +639,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                         self_evolution.build_timeout_secs,
                     ));
 
-                let pipeline = crate::ChangePipeline::new(
+                let mut pipeline = crate::ChangePipeline::new(
                     &project_root,
                     &self_evolution.change_dir,
                     // manual_approve holds test-passed changes at AwaitingReview
@@ -640,6 +650,11 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 .with_verification_budget(budget.clone())
                 .with_promotion_policy(promotion.clone())
                 .with_target_dir(&self_evolution.workspaces.target_dir);
+                // 变更忠实度读数的去处：调用点在这里，句柄也从这里给，不再
+                // 绕经生成引擎——那条路已经删了。
+                if let Some(metrics) = metrics_backend.clone() {
+                    pipeline = pipeline.with_metrics(metrics);
+                }
 
                 // What each change's build cost the host, split by which entry
                 // point the change came from and by how it ended: a compile
@@ -1117,6 +1132,19 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         };
         let owns_self_discovery = ctx.config().self_evolution.executor_enabled;
         let orchestrator = ctx.consume_service::<dyn cog_core::OrchestratorControl>();
+        // 被拒变更的回流也要一个编排器句柄，而跨插件消费只能在 start 拿到。
+        // 不承担提交职责的进程留空槽是设计内的一态；承担了却拿不到编排器，说明
+        // 这条支路此刻没有出口，要响亮地说出来而不是静默丢弃。
+        if let Some(gate) = self.rework_gate.as_ref() {
+            match orchestrator.clone() {
+                Some(orch) => gate.set_orchestrator(orch),
+                None if gate.owns_submission() => warn!(
+                    "no orchestrator; a change refused by a gate would have no way \
+                     back into the main flow"
+                ),
+                None => {}
+            }
+        }
         if !sw_config.enabled {
             info!("signal watcher disabled by config");
         } else if !owns_self_discovery {

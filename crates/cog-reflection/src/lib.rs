@@ -39,6 +39,7 @@ pub use cog_core::build_cache_reclaim;
 pub mod buildah_store;
 pub mod change_execution;
 pub mod change_pipeline;
+pub mod change_rework;
 pub mod config;
 pub mod crew;
 pub mod detector;
@@ -205,6 +206,40 @@ fn refusal_subject(cause: cog_core::RejectionCause, files: &[std::path::PathBuf]
     }
 }
 
+/// The task id a hand-off is submitted under.
+///
+/// Named after the refused change when there is one: the point of the id is that
+/// the next attempt is findable from the artifact that was refused, and the
+/// change id is what every other reading of that artifact is keyed by. A defect
+/// the system noticed on its own has no change yet, so it is keyed by its
+/// learning instead.
+///
+/// The id is stable across retries of the same requirement — the orchestrator
+/// treats a re-submission of a held id as an idempotent no-op — so a trigger that
+/// fires twice cannot put two attempts on one defect.
+fn rework_task_id(l: &cog_core::Learning, refused_by_a_gate: bool) -> String {
+    let sanitize = |s: &str| -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect()
+    };
+    let subject = if refused_by_a_gate {
+        l.related_tasks
+            .first()
+            .map(|id| sanitize(id))
+            .unwrap_or_else(|| sanitize(&l.id))
+    } else {
+        sanitize(&l.id)
+    };
+    format!("rework-{subject}")
+}
+
 /// Convenience builder that wires together all Phase-1 components.
 pub struct ReflectionEngine {
     pub detector: Arc<dyn LearningDetector>,
@@ -221,6 +256,14 @@ pub struct ReflectionEngine {
     pub evolution: Option<Arc<EvolutionEngine>>,
     /// Deep self-evolution: autonomous capability discovery.
     pub discovery: Option<Arc<DiscoveryEngine>>,
+    /// Where a refused change is handed back to the main flow, and what became
+    /// of each hand-off.
+    ///
+    /// Built here rather than passed in because the orchestrator it carries
+    /// cannot be consumed until `start()`, while the trigger that reads it is
+    /// live from `init()`. The plugin arms the gate and fills the slot; this
+    /// engine only asks it whether it may submit.
+    pub rework: Arc<crate::change_rework::ChangeReworkGate>,
     /// Per-trigger cooldown tracking to avoid spamming LLM calls.
     evolution_cooldowns:
         Arc<tokio::sync::Mutex<std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>>>,
@@ -252,6 +295,7 @@ impl std::fmt::Debug for ReflectionEngine {
             .field("meta_learning", &self.meta_learning.is_some())
             .field("evolution", &self.evolution.is_some())
             .field("discovery", &self.discovery.is_some())
+            .field("rework_owns_submission", &self.rework.owns_submission())
             .field("evolution_cooldown_secs", &self.evolution_cooldown_secs)
             .field("tool_error_threshold", &self.tool_error_threshold)
             .field("hook_recurrence_threshold", &self.hook_recurrence_threshold)
@@ -286,6 +330,7 @@ impl ReflectionEngine {
             meta_learning: None,
             evolution: None,
             discovery: None,
+            rework: Arc::new(crate::change_rework::ChangeReworkGate::new()),
             evolution_cooldowns: Arc::new(
                 tokio::sync::Mutex::new(std::collections::HashMap::new()),
             ),
@@ -318,9 +363,6 @@ impl ReflectionEngine {
         tool_sink: Option<tokio::sync::mpsc::UnboundedSender<serde_json::Value>>,
         project_root: Option<std::path::PathBuf>,
         change_dir: impl Into<std::path::PathBuf>,
-        // 变更忠实度读数只能挂在真正跑生成的那个引擎上；这个构造函数自己
-        // 建引擎，所以凭据得从这里传进来，不能建完再从外面挂。
-        metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
     ) -> Self {
         let recorder: Arc<dyn LearningRecorder> = Arc::new(MemoryBackendRecorder::new(
             memory_backend.clone(),
@@ -355,9 +397,6 @@ impl ReflectionEngine {
         if let Some(root) = project_root {
             evolution = evolution.with_project_root(root);
         }
-        if let Some(metrics) = metrics {
-            evolution = evolution.with_metrics(metrics);
-        }
         let evolution = Arc::new(evolution);
         let discovery = Arc::new(DiscoveryEngine::new(recorder.clone()));
 
@@ -372,6 +411,7 @@ impl ReflectionEngine {
             meta_learning: None,
             evolution: Some(evolution),
             discovery: Some(discovery),
+            rework: Arc::new(crate::change_rework::ChangeReworkGate::new()),
             evolution_cooldowns: Arc::new(
                 tokio::sync::Mutex::new(std::collections::HashMap::new()),
             ),
@@ -421,6 +461,7 @@ impl ReflectionEngine {
             meta_learning: None,
             evolution: None,
             discovery: None,
+            rework: Arc::new(crate::change_rework::ChangeReworkGate::new()),
             evolution_cooldowns: Arc::new(
                 tokio::sync::Mutex::new(std::collections::HashMap::new()),
             ),
@@ -464,6 +505,7 @@ impl ReflectionEngine {
             meta_learning: None,
             evolution: None,
             discovery: None,
+            rework: Arc::new(crate::change_rework::ChangeReworkGate::new()),
             evolution_cooldowns: Arc::new(
                 tokio::sync::Mutex::new(std::collections::HashMap::new()),
             ),
@@ -530,8 +572,9 @@ impl ReflectionEngine {
         Ok(())
     }
 
-    /// Given a mature learning, trigger synthesize_hook / generate_code_change
-    /// if recurrence thresholds are crossed and cooldown allows.
+    /// Given a mature learning, trigger synthesize_hook and, for a code defect,
+    /// the hand-off to the main flow, if recurrence thresholds are crossed and
+    /// cooldown allows.
     async fn maybe_trigger_evolution_from_learning(&self, l: &cog_core::Learning) {
         if l.recurrence_count >= self.hook_recurrence_threshold {
             let hook_key = format!(
@@ -579,33 +622,94 @@ impl ReflectionEngine {
                 l.area
             );
             if self.check_evolution_cooldown(&change_key).await {
-                if let Some(ref evolution) = self.evolution {
-                    // The refused files are the requirement when they are known:
-                    // they are what the gate said was wrong, and naming them is
-                    // the difference between a next attempt that can find the
-                    // defect and one that searches a whole crate for it.
-                    let module_description = if l.related_files.is_empty() {
-                        format!("{:?} module", l.area)
-                    } else {
-                        format!("Fix the defect in: {}", l.related_files.join(", "))
-                    };
-                    let learning_context = format!(
-                        "Recurring {:?} ({}x): {}. Suggested fix: {}",
-                        l.category, l.recurrence_count, l.details, l.suggested_action
-                    );
-                    tracing::info!(
-                        learning_id = %l.id,
-                        recurrence = l.recurrence_count,
-                        refused_by_a_gate,
-                        "Triggering generate_code_change for a code defect"
-                    );
-                    if let Err(e) = evolution
-                        .generate_code_change(&module_description, &learning_context)
-                        .await
-                    {
-                        tracing::warn!("generate_code_change failed: {}", e);
-                    }
-                }
+                self.hand_off_change_rework(l, refused_by_a_gate).await;
+            }
+        }
+    }
+
+    /// Hand a code defect back to the main evolution flow as a task.
+    ///
+    /// The defect is generated for by the same generator every other entry point
+    /// uses, not by a second one living here. What this side owns is the
+    /// requirement: which files the gate named, what it said, and which criterion
+    /// refused it. Those travel as data in the task payload rather than as prose
+    /// in a prompt, so the next attempt is judged against the same facts by the
+    /// same gate -- a second generator iterating on its own structural check is
+    /// how a change gets generated, refused and generated again from the verdict
+    /// text instead of from the tree.
+    async fn hand_off_change_rework(&self, l: &cog_core::Learning, refused_by_a_gate: bool) {
+        let orchestrator = match self.rework.submission() {
+            // The requirement is not lost here: the process that owns submission
+            // sees the same learning and hands it off.
+            crate::change_rework::Submission::NotOwner => return,
+            crate::change_rework::Submission::NoExecutor => {
+                self.rework
+                    .record(crate::change_rework::ChangeReworkOutcome::NoExecutor);
+                tracing::warn!(
+                    learning_id = %l.id,
+                    "no orchestrator to hand a code defect to; the requirement has no way out"
+                );
+                return;
+            }
+            crate::change_rework::Submission::Ready(orchestrator) => orchestrator,
+        };
+
+        // The refused files are the requirement when they are known: they are
+        // what the gate said was wrong, and naming them is the difference
+        // between a next attempt that can find the defect and one that searches
+        // a whole crate for it.
+        let named_files: Vec<String> = l.related_files.clone();
+        let target = if named_files.is_empty() {
+            format!("{:?} module", l.area)
+        } else {
+            named_files.join(", ")
+        };
+        let goal = format!(
+            "Fix a defect the {} check reported, on {}. Regenerate the change so \
+             that it applies to the current tree and passes the gate that refused \
+             the last attempt. Do not reconstruct the file from the verdict: read \
+             the file as it is.\n\nEvidence:\n{}",
+            l.rejection_cause
+                .map(|c| c.as_str())
+                .unwrap_or("change")
+                .replace('_', " "),
+            target,
+            l.details
+        );
+
+        let task_id = rework_task_id(l, refused_by_a_gate);
+        let task = cog_core::Task::new(
+            task_id.clone(),
+            cog_core::TaskType::Custom("change_rework".into()),
+            serde_json::json!({
+                "goal": goal,
+                "evolution_mode": "generate_change",
+                "task_kind": "change_rework",
+                "learning_id": l.id,
+                "rejection_cause": l.rejection_cause.map(|c| c.as_str()),
+                // The two things the main flow needs, as fields rather than only
+                // inside the goal text: the digest is what the refused run
+                // actually printed, and the file list is where it printed it.
+                "failure_digest": l.details,
+                "named_files": named_files,
+            }),
+        );
+
+        tracing::info!(
+            learning_id = %l.id,
+            task_id = %task_id,
+            recurrence = l.recurrence_count,
+            refused_by_a_gate,
+            "Handing a code defect back to the main flow"
+        );
+        match orchestrator.submit_goal_auto(&goal, vec![task]).await {
+            Ok(_) => self
+                .rework
+                .record(crate::change_rework::ChangeReworkOutcome::Submitted),
+            Err(e) => {
+                self.rework
+                    .record(crate::change_rework::ChangeReworkOutcome::SubmitFailed);
+                tracing::warn!(task_id = %task_id, error = %e, "rework hand-off refused by the orchestrator");
             }
         }
     }
@@ -667,7 +771,8 @@ impl ReflectionEngine {
 
     /// Process a full context window after a run completes.
     /// When learnings reach maturity (recurrence threshold), triggers
-    /// `synthesize_hook` and, for code-related issues, `generate_code_change`.
+    /// `synthesize_hook` and, for code-related issues, a hand-off to the main
+    /// flow's change generation.
     pub async fn process_context(&self, messages: &[cog_core::Message]) -> cog_core::SFResult<()> {
         let learnings = self.detector.detect_from_context(messages);
         for learning in learnings {
@@ -988,21 +1093,6 @@ impl ReflectionEngine {
     ) -> cog_core::SFResult<Option<crate::types::EvolutionResult>> {
         match self.evolution {
             Some(ref evo) => evo.refine_skill(skill_id).await,
-            None => Ok(None),
-        }
-    }
-
-    /// Generate a code change (L2 evolution) and write it to disk.
-    pub async fn generate_code_change(
-        &self,
-        module_description: &str,
-        learning_context: &str,
-    ) -> cog_core::SFResult<Option<crate::types::EvolutionResult>> {
-        match self.evolution {
-            Some(ref evo) => {
-                evo.generate_code_change(module_description, learning_context)
-                    .await
-            }
             None => Ok(None),
         }
     }
@@ -1447,81 +1537,6 @@ mod tests {
         }
     }
 
-    /// A backend that never reached a model: the call itself is reported as
-    /// successful, with no content and the reason in `error_message`.
-    struct UnreachableLlm {
-        reason: String,
-    }
-
-    #[async_trait::async_trait]
-    impl cog_core::LlmClient for UnreachableLlm {
-        async fn chat(
-            &self,
-            _messages: &[cog_core::Message],
-            _options: &cog_core::ChatOptions,
-        ) -> cog_core::SFResult<cog_core::ChatResponse> {
-            Ok(cog_core::ChatResponse {
-                content: Vec::new(),
-                api: "mock".into(),
-                provider: "mock".into(),
-                model: "mock".into(),
-                response_id: None,
-                usage: cog_core::Usage::default(),
-                stop_reason: cog_core::StopReason::Error,
-                error_message: Some(self.reason.clone()),
-                upstream_failure: None,
-                retry_after_secs: None,
-                timestamp: chrono::Utc::now(),
-            })
-        }
-
-        async fn chat_stream(
-            &self,
-            _messages: &[cog_core::Message],
-            _options: &cog_core::ChatOptions,
-        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
-            Err(cog_core::SFError::LLM(self.reason.clone()))
-        }
-
-        async fn complete_stream(
-            &self,
-            _prompt: &str,
-            _options: &cog_core::CompleteOptions,
-        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
-            Err(cog_core::SFError::LLM(self.reason.clone()))
-        }
-
-        async fn health_check(&self) -> bool {
-            false
-        }
-    }
-
-    #[tokio::test]
-    async fn test_code_change_generation_records_nothing_when_the_upstream_never_answered() {
-        let llm: Arc<dyn cog_core::LlmClient> = Arc::new(UnreachableLlm {
-            reason: r#"API error: {"error":"所有 LLM 上游当前不可用"}"#.into(),
-        });
-        let evolution = EvolutionEngine::new(
-            llm,
-            Arc::new(tokio::sync::RwLock::new(SkillRegistry::new())),
-            None,
-        );
-
-        let err = evolution
-            .generate_code_change("a module", "a learning")
-            .await
-            .expect_err("an upstream outage is not a produced change");
-
-        assert!(
-            err.to_string().contains("所有 LLM 上游当前不可用"),
-            "the provider's reason must survive: {err}"
-        );
-        assert!(
-            evolution.list_results().await.is_empty(),
-            "a change that was never generated must not be recorded as one"
-        );
-    }
-
     #[tokio::test]
     async fn test_process_tool_result_sends_to_tool_sink() {
         let registry = Arc::new(tokio::sync::RwLock::new(SkillRegistry::new()));
@@ -1742,8 +1757,8 @@ mod tests {
     /// five — while the same intent was regenerated from scratch by a path that
     /// knew nothing about the refusal.
     #[tokio::test]
-    async fn a_refusal_reaches_generation_on_the_first_one() {
-        let (mut engine, calls, prompts) = engine_that_records_generation();
+    async fn a_refusal_reaches_the_main_flow_on_the_first_one() {
+        let (mut engine, submissions, goals) = engine_that_records_rework();
         engine.set_cooldown_secs(0);
 
         let files = vec![std::path::PathBuf::from("crates/x/src/lib.rs")];
@@ -1752,12 +1767,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            *calls.lock().await,
+            *submissions.lock().await,
             1,
             "the first refusal is the one that carries evidence nothing else has"
         );
 
-        let asked = prompts.lock().await.join("\n");
+        let asked = goals.lock().await.join("\n");
         assert!(
             asked.contains("crates/x/src/lib.rs"),
             "the requirement has to name the file the gate refused on, not just \
@@ -1772,7 +1787,7 @@ mod tests {
     /// every record".
     #[tokio::test]
     async fn a_self_review_pattern_still_waits_for_its_threshold() {
-        let (mut engine, calls, _) = engine_that_records_generation();
+        let (mut engine, submissions, _) = engine_that_records_rework();
         engine.change_recurrence_threshold = 5;
         // The hook trigger shares this path and fires from three occurrences, so
         // it is pushed out of the way: this test is about the change threshold,
@@ -1797,7 +1812,7 @@ mod tests {
                 .maybe_trigger_evolution_from_learning(&learning)
                 .await;
             assert_eq!(
-                *calls.lock().await,
+                *submissions.lock().await,
                 0,
                 "a self-review pattern seen {seen} times is still below its threshold of 5"
             );
@@ -1808,9 +1823,9 @@ mod tests {
             .maybe_trigger_evolution_from_learning(&learning)
             .await;
         assert_eq!(
-            *calls.lock().await,
+            *submissions.lock().await,
             1,
-            "at the threshold it generates, as it always did"
+            "at the threshold it hands the defect to the main flow, as it always did"
         );
     }
 
@@ -1821,7 +1836,7 @@ mod tests {
     /// reads.
     #[tokio::test]
     async fn one_criterion_s_cooldown_does_not_swallow_another() {
-        let (mut engine, calls, _) = engine_that_records_generation();
+        let (mut engine, submissions, _) = engine_that_records_rework();
         engine.set_cooldown_secs(3600);
 
         let files = vec![std::path::PathBuf::from("crates/x/src/lib.rs")];
@@ -1829,16 +1844,16 @@ mod tests {
             .record_change_refusal("c-1", cog_core::RejectionCause::TestsFailed, &files, "boom")
             .await
             .unwrap();
-        assert_eq!(*calls.lock().await, 1, "the first refusal generates");
+        assert_eq!(*submissions.lock().await, 1, "the first refusal hands off");
 
         engine
             .record_change_refusal("c-2", cog_core::RejectionCause::TestsFailed, &files, "boom")
             .await
             .unwrap();
         assert_eq!(
-            *calls.lock().await,
+            *submissions.lock().await,
             1,
-            "the same defect again inside the cooldown is not regenerated"
+            "the same defect again inside the cooldown is not handed off again"
         );
 
         engine
@@ -1851,7 +1866,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            *calls.lock().await,
+            *submissions.lock().await,
             2,
             "a refusal by a different check is a different defect, and the first \
              one's cooldown does not silence it"
@@ -1897,30 +1912,141 @@ mod tests {
         );
     }
 
-    /// An engine whose generation attempts are counted rather than performed,
-    /// and whose prompts are kept.
+    /// 一个只回答「收下了」的编排器替身。
     ///
-    /// A count can say a generation happened; only the prompt can say what it
-    /// was asked to fix, which is the question a refusal is supposed to answer.
+    /// 这条支路对编排器做的唯一一件事是 `submit_goal_auto`；其余方法在此
+    /// `unimplemented!()`——一个会在测试里悄悄做事的替身，会让断言读到别的东西上去。
+    struct RecordingOrchestrator {
+        submissions: Arc<tokio::sync::Mutex<u32>>,
+        goals: Arc<tokio::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::OrchestratorControl for RecordingOrchestrator {
+        async fn submit_goal(
+            &self,
+            _goal: &str,
+            _tasks: Vec<cog_core::Task>,
+        ) -> cog_core::SFResult<()> {
+            unimplemented!("the hand-off submits through submit_goal_auto")
+        }
+        async fn submit_goal_auto(
+            &self,
+            goal: &str,
+            _tasks: Vec<cog_core::Task>,
+        ) -> cog_core::SFResult<Vec<String>> {
+            *self.submissions.lock().await += 1;
+            self.goals.lock().await.push(goal.to_string());
+            Ok(Vec::new())
+        }
+        async fn assign_task(&self, _task_id: &str, _agent_id: &str) -> cog_core::SFResult<()> {
+            unimplemented!()
+        }
+        async fn add_task(&self, _task: cog_core::Task) -> cog_core::SFResult<()> {
+            unimplemented!()
+        }
+        async fn crew_can_retry(&self, _task_ids: &[String]) -> bool {
+            unimplemented!()
+        }
+        async fn crew_retry_all(&self, _task_ids: &[String]) -> usize {
+            unimplemented!()
+        }
+        async fn get_ready_tasks(&self) -> Vec<cog_core::Task> {
+            unimplemented!()
+        }
+        async fn get_all_tasks(&self) -> Vec<cog_core::Task> {
+            unimplemented!()
+        }
+        async fn push_to_dlq(&self, _task_id: &str, _error: String) -> cog_core::SFResult<bool> {
+            unimplemented!()
+        }
+        async fn retry_task(&self, _task_id: &str) -> cog_core::SFResult<()> {
+            unimplemented!()
+        }
+        async fn dlq_len(&self) -> cog_core::SFResult<usize> {
+            unimplemented!()
+        }
+        async fn start_task(&self, _task_id: &str) -> cog_core::SFResult<()> {
+            unimplemented!()
+        }
+        async fn complete_task(
+            &self,
+            _task_id: &str,
+            _result: serde_json::Value,
+        ) -> cog_core::SFResult<Vec<String>> {
+            unimplemented!()
+        }
+        async fn fail_task(
+            &self,
+            _task_id: &str,
+            _error: String,
+            _cause: Option<cog_core::UpstreamFailure>,
+        ) -> cog_core::SFResult<(bool, Vec<String>, bool)> {
+            unimplemented!()
+        }
+        async fn fail_task_after(
+            &self,
+            _task_id: &str,
+            _error: String,
+            _cause: Option<cog_core::UpstreamFailure>,
+            _retry_after_secs: Option<u64>,
+        ) -> cog_core::SFResult<(bool, Vec<String>, bool)> {
+            unimplemented!()
+        }
+        async fn cancel_task(&self, _task_id: &str) -> cog_core::SFResult<Vec<String>> {
+            unimplemented!()
+        }
+        async fn get_task(&self, _task_id: &str) -> Option<cog_core::Task> {
+            unimplemented!()
+        }
+        async fn schedule_task(&self, _task_id: &str) -> cog_core::SFResult<()> {
+            unimplemented!()
+        }
+        async fn check_timeouts(&self) -> Vec<(String, bool, Vec<String>, bool)> {
+            unimplemented!()
+        }
+        async fn get_dependents(&self, _task_id: &str) -> Option<Vec<cog_core::Task>> {
+            unimplemented!()
+        }
+        async fn get_dependencies(&self, _task_id: &str) -> Option<Vec<cog_core::Task>> {
+            unimplemented!()
+        }
+        async fn get_graph(&self) -> (Vec<cog_core::Task>, Vec<(String, String)>) {
+            unimplemented!()
+        }
+        async fn delete_task(&self, _task_id: &str) -> cog_core::SFResult<()> {
+            unimplemented!()
+        }
+        async fn all_completed(&self) -> bool {
+            unimplemented!()
+        }
+        async fn replay_dlq(&self, _task_id: &str) -> cog_core::SFResult<bool> {
+            unimplemented!()
+        }
+    }
+
+    /// 一个把「回流到主流程」记下来的引擎：计数说回流发生过，目标文本说这次
+    /// 被要求修的是什么——后者正是拒绝应当回答的问题。
+    ///
+    /// 属主门先武装、槽先填上：不武装的进程按设计不提交，而这里要读的正是
+    /// 提交了几次。
     #[allow(clippy::type_complexity)]
-    fn engine_that_records_generation() -> (
+    fn engine_that_records_rework() -> (
         ReflectionEngine,
         Arc<tokio::sync::Mutex<u32>>,
         Arc<tokio::sync::Mutex<Vec<String>>>,
     ) {
         let registry = Arc::new(tokio::sync::RwLock::new(SkillRegistry::new()));
-        let mut engine = ReflectionEngine::new_in_memory(registry);
-        let calls = Arc::new(tokio::sync::Mutex::new(0u32));
-        let prompts = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let llm: Arc<dyn cog_core::LlmClient> = Arc::new(CountingLlm {
-            calls: calls.clone(),
-            prompts: Some(prompts.clone()),
-        });
-        engine.evolution = Some(Arc::new(EvolutionEngine::new(
-            llm,
-            Arc::new(tokio::sync::RwLock::new(SkillRegistry::new())),
-            None,
-        )));
-        (engine, calls, prompts)
+        let engine = ReflectionEngine::new_in_memory(registry);
+        let submissions = Arc::new(tokio::sync::Mutex::new(0u32));
+        let goals = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        engine.rework.arm();
+        engine
+            .rework
+            .set_orchestrator(Arc::new(RecordingOrchestrator {
+                submissions: submissions.clone(),
+                goals: goals.clone(),
+            }));
+        (engine, submissions, goals)
     }
 }

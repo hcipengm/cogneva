@@ -63,41 +63,8 @@ mod fallback {
         )
     }
 
-    /// Code change generation. The reply is read by
-    /// [`super::EvolutionEngine::extract_unified_diff`], which keeps lines from
-    /// the first `diff --git` — so the shape asked for here has to be one that
-    /// line can open. `validation_errors` is empty on the first attempt and
-    /// carries the previous attempt's failures after that.
-    pub fn code_change(
-        learning_context: &str,
-        module_description: &str,
-        validation_errors: &str,
-    ) -> String {
-        let error_section = if validation_errors.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "\n\nPrevious attempt failed validation. Errors:\n{}\n\nPlease fix these errors and regenerate the change.",
-                validation_errors
-            )
-        };
-        format!(
-            "You are an expert Rust engineer improving an AI agent system.\n\n\
-             Context:\n{}\n\n\
-             Requirement:\n{}\
-             {}\n\n\
-             Generate a change that addresses the requirement. Output ONLY a \
-             unified diff (starting with 'diff --git a/... b/...'), with no \
-             markdown fences and no prose. This is a Rust workspace; modify \
-             only source files under crates/**/*.rs.",
-            learning_context, module_description, error_section
-        )
-    }
-
     pub const SKILL_REFINEMENT_SYSTEM: &str = "Respond with valid JSON SkillConfig only.";
     pub const TOOL_VARIANT_SYSTEM: &str = "Respond with valid JSON tool definition only.";
-    pub const CODE_CHANGE_SYSTEM: &str =
-        "Respond with a single unified diff change and nothing else.";
 }
 
 /// Engine that drives controlled self-evolution of the system.
@@ -114,15 +81,12 @@ pub struct EvolutionEngine {
     /// variant has been suggested.
     tool_sink: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<serde_json::Value>>>,
     /// Project root for project-context compilation checks.
-    /// When `Some`, `generate_code_change` validates changes against the
-    /// real workspace instead of an isolated temp crate.
+    /// When `Some`, a change's target paths are validated against the real
+    /// workspace instead of an isolated temp crate.
     project_root: Option<std::path::PathBuf>,
     /// In-memory log of all evolution attempts and their current status.
     /// Production systems may additionally persist this to a backend.
     results: Arc<tokio::sync::Mutex<std::collections::HashMap<String, EvolutionResult>>>,
-    /// Where per-artifact fidelity readings go. Absent means the reading is
-    /// kept in the log only; losing the aggregate must not fail generation.
-    metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
 }
 
 impl std::fmt::Debug for EvolutionEngine {
@@ -153,14 +117,7 @@ impl EvolutionEngine {
             tool_sink: std::sync::Mutex::new(None),
             project_root: None,
             results: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-            metrics: None,
         }
-    }
-
-    /// Report per-artifact fidelity readings to the metrics backend.
-    pub fn with_metrics(mut self, metrics: Arc<dyn cog_core::MetricsBackend>) -> Self {
-        self.metrics = Some(metrics);
-        self
     }
 
     /// Set the directory where code changes are written (default:
@@ -693,185 +650,6 @@ impl EvolutionEngine {
     }
 
     // ========================================================================
-    // L2 — Source Code Change Generation (with compile validation)
-    // ========================================================================
-
-    /// Generate a unified-diff change, validate it with `git apply --check`,
-    /// and write it to the evolution-changes directory as `<change_id>.diff`.
-    /// The change goes through up to 3 LLM attempts. If validation fails, the
-    /// error output is fed back into the next prompt. Final statuses:
-    /// - `"compile_checked"` — passed structural + `git apply --check` validation
-    /// - `"compile_error"` — failed validation after 3 attempts
-    /// - `"awaiting_review"` — no unified diff detected (conceptual answer)
-    pub async fn generate_code_change(
-        &self,
-        module_description: &str,
-        learning_context: &str,
-    ) -> SFResult<Option<EvolutionResult>> {
-        let mut validation_errors = String::new();
-        let mut last_text = String::new();
-
-        for attempt in 1..=3 {
-            let prompt = {
-                let mut vars = std::collections::HashMap::new();
-                vars.insert("learning_context".to_string(), learning_context.to_string());
-                vars.insert(
-                    "module_description".to_string(),
-                    module_description.to_string(),
-                );
-                if !validation_errors.is_empty() {
-                    vars.insert("compile_errors".to_string(), validation_errors.clone());
-                }
-                self.prompt_manager
-                    .as_ref()
-                    .and_then(|pm| pm.render("reflection:evolution_change", &vars).ok())
-                    .unwrap_or_else(|| {
-                        fallback::code_change(
-                            learning_context,
-                            module_description,
-                            &validation_errors,
-                        )
-                    })
-            };
-
-            let system_prompt = self
-                .prompt_manager
-                .as_ref()
-                .and_then(|pm| pm.get("reflection:evolution_change_system"))
-                .unwrap_or_else(|| fallback::CODE_CHANGE_SYSTEM.into());
-
-            let messages = vec![Message::system(system_prompt), Message::user(prompt)];
-
-            let options = ChatOptions::default().with_actor("evolution");
-            let response = self.llm.chat(&messages, &options).await?;
-            // A backend that could not serve the request answers with no content
-            // and the reason in `error_message`. Falling through with that empty
-            // text records an empty change as a conceptual answer awaiting
-            // review — an outage counted as a produced artifact, and the yield
-            // record then blames generation instead of the environment.
-            if let Some(reason) = response.error_message.as_deref() {
-                return Err(cog_core::SFError::LLM(format!(
-                    "change generation failed: {reason}"
-                )));
-            }
-            let text: String = response
-                .content
-                .iter()
-                .filter_map(|b| b.as_text())
-                .collect::<Vec<_>>()
-                .join("");
-            last_text = text.clone();
-
-            // Extract the unified diff from the response.
-            let Some(diff) = Self::extract_unified_diff(&text) else {
-                // No diff found — treat as conceptual answer; record it in
-                // memory only (no .diff file, so the pipeline ignores it).
-                let change_id = format!(
-                    "change-{}",
-                    uuid::Uuid::new_v4().to_string()[..8].to_uppercase()
-                );
-                let result = EvolutionResult {
-                    kind: EvolutionKind::CodeChange,
-                    artifact_id: change_id,
-                    description: module_description.into(),
-                    content: text,
-                    status: EvolutionStatus::AwaitingReview,
-                    created_at: Utc::now(),
-                    eval_summary: None,
-                };
-                self.results
-                    .lock()
-                    .await
-                    .insert(result.artifact_id.clone(), result.clone());
-                return Ok(Some(result));
-            };
-
-            // The generator writes the diff as text, so its `@@` counts and its
-            // final terminator are model output rather than facts derived from
-            // a tree. Repair them here, before anything judges the change.
-            let diff = repair_generated_diff(&diff);
-
-            match self.validate_change(&diff).await {
-                (true, _) => {
-                    let change_id = format!(
-                        "change-{}",
-                        uuid::Uuid::new_v4().to_string()[..8].to_uppercase()
-                    );
-                    let filename = self.change_dir.join(format!("{}.diff", change_id));
-                    if let Some(parent) = filename.parent() {
-                        let _ = tokio::fs::create_dir_all(parent).await;
-                    }
-                    tokio::fs::write(&filename, &diff).await.map_err(|e| {
-                        cog_core::SFError::Agent(format!(
-                            "Failed to write change {}: {}",
-                            filename.display(),
-                            e
-                        ))
-                    })?;
-
-                    info!(
-                        change_id = %change_id,
-                        path = %filename.display(),
-                        "Generated code change passed validation"
-                    );
-
-                    let result = EvolutionResult {
-                        kind: EvolutionKind::CodeChange,
-                        artifact_id: change_id,
-                        description: module_description.into(),
-                        content: diff,
-                        status: EvolutionStatus::CompileChecked,
-                        created_at: Utc::now(),
-                        eval_summary: None,
-                    };
-                    self.results
-                        .lock()
-                        .await
-                        .insert(result.artifact_id.clone(), result.clone());
-                    return Ok(Some(result));
-                }
-                (false, output) => {
-                    // The reason is logged as well as fed back to the next
-                    // prompt: a round that only says "retrying" leaves which
-                    // attempt went red and why readable nowhere but the next
-                    // request, which nobody keeps.
-                    warn!(attempt, reason = %output, "Change failed validation, retrying");
-                    validation_errors = output;
-                }
-            }
-        }
-
-        // All retries exhausted — record the failure in memory only; an
-        // invalid change must never reach the change directory.
-        let change_id = format!(
-            "change-{}",
-            uuid::Uuid::new_v4().to_string()[..8].to_uppercase()
-        );
-        warn!(
-            change_id = %change_id,
-            "Change failed validation after 3 attempts"
-        );
-
-        let result = EvolutionResult {
-            kind: EvolutionKind::CodeChange,
-            artifact_id: change_id,
-            description: module_description.into(),
-            content: format!(
-                "{}\n\n<!-- VALIDATION ERRORS AFTER 3 ATTEMPTS -->\n```\n{}\n```\n",
-                last_text, validation_errors
-            ),
-            status: EvolutionStatus::CompileError,
-            created_at: Utc::now(),
-            eval_summary: None,
-        };
-        self.results
-            .lock()
-            .await
-            .insert(result.artifact_id.clone(), result.clone());
-        Ok(Some(result))
-    }
-
-    // ========================================================================
     // Helpers
     // ========================================================================
 
@@ -892,192 +670,6 @@ impl EvolutionEngine {
             trimmed
         }
     }
-
-    /// Extract a unified diff from raw LLM output.
-    ///
-    /// Accepts a bare diff or one wrapped in markdown fences (```diff /
-    /// ```). The diff is taken from the first `diff --git ` line (or, for
-    /// plain unified diffs, the first `--- a/` line) to the end, with
-    /// trailing blank lines and a closing fence stripped. Returns `None`
-    /// when no diff-like content is present or the diff references no files.
-    fn extract_unified_diff(text: &str) -> Option<String> {
-        let lines: Vec<&str> = text.lines().collect();
-        let start = lines
-            .iter()
-            .position(|l| l.starts_with("diff --git "))
-            .or_else(|| lines.iter().position(|l| l.starts_with("--- a/")))?;
-
-        let mut end = lines.len();
-        while end > start && (lines[end - 1].trim().is_empty() || lines[end - 1].trim() == "```") {
-            end -= 1;
-        }
-        if end <= start {
-            return None;
-        }
-
-        let diff = lines[start..end].join("\n");
-        // A deletion names its file only on the side that goes away, so a patch
-        // that only deletes offers no `+++` path. It is still a change, and
-        // discarding it here would drop it as though it were prose.
-        if cog_core::parse_diff_targets(&diff).is_empty() {
-            return None;
-        }
-        Some(diff)
-    }
-
-    /// Validate a unified diff before it enters the change pipeline.
-    ///
-    /// 1. The diff must reference at least one file and must not touch any
-    ///    protected path (see [`Self::validate_change_paths`]).
-    /// 2. The diff must be a body `git apply` can parse (see
-    ///    [`cog_core::diff_structural_defect`]) — a fact about the bytes, so it
-    ///    is settled whether or not there is a tree to apply against.
-    /// 3. When a `project_root` git working tree is configured, the change must
-    ///    apply cleanly (`git apply --check`).
-    ///
-    /// Returns `(success, details)`; `details` feeds the retry loop on
-    /// failure, and names what did *not* run when a step was skipped. Those
-    /// skips are the one place a rejection cannot come from: an environment
-    /// that cannot check must not be reported as the change being bad.
-    async fn validate_change(&self, diff: &str) -> (bool, String) {
-        // Judge every file the diff names, deletions included: deleting a
-        // protected file is the same offence as rewriting it.
-        let files: Vec<std::path::PathBuf> = match cog_core::parse_diff_affected_files(diff) {
-            Ok(f) => f.into_iter().map(std::path::PathBuf::from).collect(),
-            Err(e) => return (false, format!("Change structure invalid: {}", e)),
-        };
-
-        if let Err(e) = self.validate_change_paths(&files, self.project_root.as_deref()) {
-            return (false, e.to_string());
-        }
-
-        // Whether `git apply` can parse the diff at all is a fact about the
-        // bytes, not about any tree. It is therefore settled here, before and
-        // independently of the question whether a tree to apply it to exists.
-        // Leaving it to the branches below is what turned a missing terminator
-        // into a change that "passed validation" and was retired by the
-        // pipeline a second later as a corrupt patch.
-        if let Some(defect) = cog_core::diff_structural_defect(diff) {
-            return (
-                false,
-                format!("Change is not an appliable unified diff: {defect}"),
-            );
-        }
-
-        let Some(root) = self.project_root.as_ref() else {
-            // No tree to check against. The diff is structurally sound, and
-            // this says exactly that instead of claiming a check that never ran.
-            return (
-                true,
-                "diff structure valid; no project root, so no apply check ran".into(),
-            );
-        };
-        if !is_git_worktree(root) {
-            return (
-                true,
-                format!(
-                    "diff structure valid; {} is not a git worktree, so no apply check ran",
-                    root.display()
-                ),
-            );
-        }
-
-        let tmp = match tempfile::NamedTempFile::new() {
-            Ok(t) => t,
-            Err(e) => {
-                warn!(error = %e, "temp file unavailable; apply check skipped");
-                return (
-                    true,
-                    format!("diff structure valid; apply check skipped (temp file: {e})"),
-                );
-            }
-        };
-        if let Err(e) = std::fs::write(tmp.path(), diff) {
-            warn!(error = %e, "temp write failed; apply check skipped");
-            return (
-                true,
-                format!("diff structure valid; apply check skipped (temp write: {e})"),
-            );
-        }
-
-        match tokio::process::Command::new("git")
-            .args(["apply", "--check", "--verbose"])
-            .arg(tmp.path())
-            .current_dir(root)
-            .output()
-            .await
-        {
-            Ok(out) => {
-                let combined = format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&out.stdout),
-                    String::from_utf8_lossy(&out.stderr)
-                );
-                let ok = out.status.success();
-                self.report_fidelity(root, diff, ok).await;
-                (ok, combined)
-            }
-            Err(e) => {
-                warn!(error = %e, "git apply --check unavailable; apply check skipped");
-                (
-                    true,
-                    format!("diff structure valid; apply check skipped (git: {e})"),
-                )
-            }
-        }
-    }
-
-    /// Report how much of a generated artifact actually matched the tree it was
-    /// generated for.
-    ///
-    /// The gate above answers yes or no; this answers how much, which is the
-    /// only form of the answer that can be looked at across rounds. Both
-    /// granularities are reported because they diagnose different things: a
-    /// file that does not apply at all says the artifact is aimed at the wrong
-    /// revision, while a file that applies with half its hunks matching says
-    /// the artifact is aimed right and written wrong.
-    async fn report_fidelity(&self, root: &std::path::Path, diff: &str, whole_patch_ok: bool) {
-        let fidelity = crate::diff_fidelity::measure(root, diff, whole_patch_ok).await;
-        if fidelity.is_empty() {
-            return;
-        }
-        info!(
-            files_total = fidelity.files_total,
-            files_faithful = fidelity.files_faithful,
-            hunks_total = fidelity.hunks_total,
-            hunks_faithful = fidelity.hunks_faithful,
-            "generated change fidelity"
-        );
-        let Some(metrics) = self.metrics.as_ref() else {
-            return;
-        };
-        for (name, value) in [
-            (
-                cog_core::metric_names::EVOLUTION_GENERATED_CHANGE_FILES_TOTAL,
-                fidelity.files_total as f64,
-            ),
-            (
-                cog_core::metric_names::EVOLUTION_GENERATED_CHANGE_FILES_FAITHFUL,
-                fidelity.files_faithful as f64,
-            ),
-            (
-                cog_core::metric_names::EVOLUTION_GENERATED_CHANGE_HUNKS_TOTAL,
-                fidelity.hunks_total as f64,
-            ),
-            (
-                cog_core::metric_names::EVOLUTION_GENERATED_CHANGE_HUNKS_FAITHFUL,
-                fidelity.hunks_faithful as f64,
-            ),
-        ] {
-            if let Err(e) = metrics
-                .record_counter(name, value, std::collections::HashMap::new())
-                .await
-            {
-                warn!(error = %e, metric = %name, "failed to record change fidelity");
-            }
-        }
-    }
-
     // ========================================================================
     // Quality Gate (mirrors SkillExtractor)
     // ========================================================================
@@ -1237,19 +829,6 @@ impl cog_core::ChangeSink for EvolutionEngine {
     }
 }
 
-/// Whether `root` is a git working tree this engine can validate against.
-///
-/// A checkout that owns its repository has a `.git` directory, but every tree
-/// this engine is handed is a linked worktree of the shared bare repository,
-/// and there `.git` is a *file* naming the real git directory. Asking for a
-/// directory therefore answers "not a repository" for every tree the engine
-/// actually has, so the apply check below is skipped on all of them and the
-/// change is accepted unvalidated — to be retired moments later by the
-/// pipeline, whose own pre-check does run.
-fn is_git_worktree(root: &std::path::Path) -> bool {
-    root.join(".git").exists()
-}
-
 /// Repair a generated diff's own structure, leaving what it says untouched.
 ///
 /// The `@@` line counts and the final terminator depend on nothing but the
@@ -1290,116 +869,22 @@ mod tests {
     }
 
     #[test]
-    fn extract_unified_diff_bare() {
-        let text = "diff --git a/crates/foo/src/lib.rs b/crates/foo/src/lib.rs\n\
-                    index 1111111..2222222 100644\n\
-                    --- a/crates/foo/src/lib.rs\n\
-                    +++ b/crates/foo/src/lib.rs\n\
-                    @@ -1,1 +1,1 @@\n\
-                    -old\n\
-                    +new\n";
-        let diff = EvolutionEngine::extract_unified_diff(text).unwrap();
-        assert!(diff.starts_with("diff --git a/crates/foo/src/lib.rs"));
-        assert!(diff.contains("+new"));
-    }
-
-    #[test]
-    fn extract_unified_diff_fenced_with_prose() {
-        let text = "Here is the change you asked for:\n\n\
-                    ```diff\n\
-                    diff --git a/crates/foo/src/lib.rs b/crates/foo/src/lib.rs\n\
-                    --- a/crates/foo/src/lib.rs\n\
-                    +++ b/crates/foo/src/lib.rs\n\
-                    @@ -1,1 +1,1 @@\n\
-                    -old\n\
-                    +new\n\
-                    ```\n";
-        let diff = EvolutionEngine::extract_unified_diff(text).unwrap();
-        assert!(diff.starts_with("diff --git"));
-        assert!(!diff.contains("```"));
-    }
-
-    #[test]
-    fn extract_unified_diff_plain_unified() {
-        let text = "--- a/crates/foo/src/lib.rs\n\
-                    +++ b/crates/foo/src/lib.rs\n\
-                    @@ -1,1 +1,1 @@\n\
-                    -old\n\
-                    +new\n";
-        let diff = EvolutionEngine::extract_unified_diff(text).unwrap();
-        assert!(diff.starts_with("--- a/"));
-    }
-
-    #[test]
-    fn extract_unified_diff_none_for_prose() {
-        assert!(EvolutionEngine::extract_unified_diff("# Just a header\nNo code here.").is_none());
-        assert!(EvolutionEngine::extract_unified_diff("@@ -1 +1 @@\n-a\n+b\n").is_none());
-    }
-
-    #[test]
-    fn extract_unified_diff_keeps_a_deletion() {
-        // A deletion names its file only on the side that goes away. Reading
-        // paths off the `+++` line alone finds nothing there and discards the
-        // change as though the model had written prose; the file it removes is
-        // one the change affects as much as any it rewrites.
-        let text = "diff --git a/x b/x\n\
-                    deleted file mode 100644\n\
-                    --- a/x\n\
-                    +++ /dev/null\n\
-                    @@ -1 +0,0 @@\n\
-                    -a\n";
-        let diff = EvolutionEngine::extract_unified_diff(text).expect("a deletion is a change");
-        assert!(diff.starts_with("diff --git a/x b/x"));
-    }
-
-    #[test]
-    fn extract_unified_diff_accepts_a_hunk_block_naming_its_file_once() {
-        // `git apply` reads the path off the `diff --git` line and does not
-        // need the redundant `---`/`+++` pair at all, so a block carrying only
-        // the former is a diff a gate would have applied. Rejecting it here
-        // discards a usable change as if the model had written prose.
-        let text = "diff --git a/x.rs b/x.rs\n@@ -1 +1,2 @@\n a\n+b\n";
-        let diff = EvolutionEngine::extract_unified_diff(text).expect("git accepts this shape");
-        assert!(diff.starts_with("diff --git a/x.rs b/x.rs"));
-    }
-
-    #[test]
-    fn a_linked_worktree_is_a_git_worktree_even_though_dot_git_is_a_file() {
-        // Every tree this engine validates against is a linked worktree of the
-        // shared bare repository, where `.git` is a file naming the real git
-        // directory. A predicate that asks for a directory answers "not a
-        // repository" for all of them and skips the apply check entirely.
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join(".git"), "gitdir: /elsewhere/repo/.git\n").unwrap();
-        assert!(is_git_worktree(tmp.path()));
-    }
-
-    #[test]
-    fn a_directory_without_a_repository_is_not_a_git_worktree() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(!is_git_worktree(tmp.path()));
-    }
-
-    #[test]
     fn a_diff_the_generator_left_unterminated_is_repaired_before_the_gate() {
         // The shape a live run handed to the apply gate, which rejected it as
         // "corrupt patch at line 9": the body is right, the last line has no
-        // terminator. It comes out of the extractor that way because joining
-        // lines back together cannot restore a byte `lines()` dropped.
+        // terminator.
         let text = "diff --git a/crates/bootstrap/src/main.rs b/crates/bootstrap/src/main.rs\n\
                     --- a/crates/bootstrap/src/main.rs\n\
                     +++ b/crates/bootstrap/src/main.rs\n\
                     @@ -411,1 +411,1 @@\n\
                     -        .map_or(false, |status| status.success());\n\
-                    +        .is_ok_and(|status| status.success());\n";
-        let extracted = EvolutionEngine::extract_unified_diff(text).expect("a diff");
+                    +        .is_ok_and(|status| status.success());";
         assert!(
-            cog_core::diff_structural_defect(&extracted).is_some(),
-            "the extractor now terminates the last line, so this no longer says \
-             anything about the repair"
+            cog_core::diff_structural_defect(text).is_some(),
+            "the sample no longer carries the defect this test is about"
         );
 
-        let repaired = repair_generated_diff(&extracted);
+        let repaired = repair_generated_diff(text);
         assert_eq!(cog_core::diff_structural_defect(&repaired), None);
         assert!(repaired.ends_with('\n'));
         // The repair derives the terminator and changes nothing the diff says.
@@ -1445,24 +930,18 @@ mod tests {
 /// the fallback is what runs), while the declared path is the one production
 /// runs (the ConfigMap is what a deployed process loads). An edit to either
 /// side alone therefore passes every behavioural test and changes what the
-/// model is told in production only. That is how the change prompt came to ask
-/// for a Markdown code block with the filename as its header while
-/// `extract_unified_diff` keeps lines only from the first `diff --git`: the
-/// generation had no such line, the reply was filed as a conceptual answer, and
-/// the tokens were paid for and discarded.
+/// model is told in production only.
 #[cfg(test)]
 mod declared_prompt_matches_fallback {
-    use super::{fallback, EvolutionEngine};
+    use super::fallback;
     use cog_prompt::{PromptManager, TemplateVars, WatchMode};
 
     /// Every key this guard compares. The list is checked against what
     /// `prompts/` actually declares in both directions, so a declaration added
     /// or removed without touching this guard fails here rather than dropping
     /// out of coverage.
-    const COMPARED: [&str; 8] = [
+    const COMPARED: [&str; 6] = [
         "agent:default",
-        "reflection:evolution_change",
-        "reflection:evolution_change_system",
         "reflection:evolution_refinement",
         "reflection:evolution_refinement_system",
         "reflection:evolution_tool",
@@ -1508,16 +987,6 @@ mod declared_prompt_matches_fallback {
             name,
             errors,
         )
-    }
-
-    fn change_vars(errors: Option<&str>) -> TemplateVars {
-        let mut vars = TemplateVars::new()
-            .with("learning_context", "ctx")
-            .with("module_description", "desc");
-        if let Some(e) = errors {
-            vars = vars.with("compile_errors", e);
-        }
-        vars
     }
 
     #[tokio::test]
@@ -1575,25 +1044,6 @@ mod declared_prompt_matches_fallback {
                         .expect("declared"),
                     fallback::TOOL_VARIANT_SYSTEM.to_string(),
                 )],
-                // Both branches: an attempt after a failed validation is the same
-                // instruction plus the errors, and a declaration carrying one
-                // branch and not the other renders a different retry — the one
-                // that costs a second generation.
-                "reflection:evolution_change" => [None, Some("error[E0308]: mismatched types")]
-                    .into_iter()
-                    .map(|errors| {
-                        (
-                            pm.render("reflection:evolution_change", &change_vars(errors))
-                                .expect("renders"),
-                            fallback::code_change("ctx", "desc", errors.unwrap_or("")),
-                        )
-                    })
-                    .collect(),
-                "reflection:evolution_change_system" => vec![(
-                    pm.get("reflection:evolution_change_system")
-                        .expect("declared"),
-                    fallback::CODE_CHANGE_SYSTEM.to_string(),
-                )],
                 other => panic!(
                     "{other} is declared in prompts/ and this guard has no case for \
                      it. If cog-reflection falls back for it, compare that text \
@@ -1611,30 +1061,5 @@ mod declared_prompt_matches_fallback {
                 );
             }
         }
-    }
-
-    /// The change prompt has to ask for a shape its own reader can open, and
-    /// this asserts the premise as well as the conclusion: the reply the old
-    /// declaration asked for yields nothing, and the declaration in force does
-    /// not ask for it.
-    #[tokio::test]
-    async fn the_change_prompt_does_not_ask_for_a_reply_its_reader_discards() {
-        let fenced_code_under_a_filename_header =
-            "```rust\n// crates/foo/src/lib.rs\nfn main() {}\n```";
-        assert!(
-            EvolutionEngine::extract_unified_diff(fenced_code_under_a_filename_header).is_none(),
-            "the reader now accepts this shape, so the assertion below no longer \
-             says anything about it"
-        );
-
-        let pm = manager().await;
-        let rendered = pm
-            .render("reflection:evolution_change", &change_vars(None))
-            .expect("renders");
-        assert!(
-            rendered.contains("diff --git"),
-            "the change prompt does not name the opening line its reader keys on \
-             (`diff --git `): {rendered}"
-        );
     }
 }

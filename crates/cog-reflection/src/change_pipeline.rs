@@ -209,6 +209,23 @@ pub struct ChangePipeline {
     /// one per change. Losing it to a restart costs time and nothing else —
     /// it is recomputed from the same tree.
     baseline_failures: Arc<tokio::sync::Mutex<BaselineFailures>>,
+    /// 变更忠实度读数的去处。判定与读数同源：这个 oracle 就是这里的
+    /// `git apply --check`，所以读数放在这里而不是生成侧——生成侧那份是同一
+    /// 事实的第二份判据。缺席时读数只进日志，丢聚合不该让 apply 失败。
+    metrics: Option<MetricsSink>,
+}
+
+/// 一个 metrics 句柄，连同给它写的 `Debug`。
+///
+/// `ChangePipeline` 派生 `Debug`，而 trait object 没有 `Debug`；这个包装把
+/// 「有没有接读数」印成一个词，而不是把整个 sink 展开进日志行。
+#[derive(Clone)]
+struct MetricsSink(Arc<dyn cog_core::MetricsBackend>);
+
+impl std::fmt::Debug for MetricsSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MetricsSink(..)")
+    }
 }
 
 impl ChangePipeline {
@@ -227,7 +244,14 @@ impl ChangePipeline {
             target_dir: None,
             budget: None,
             baseline_failures: Arc::new(tokio::sync::Mutex::new(None)),
+            metrics: None,
         }
+    }
+
+    /// Where the per-artifact fidelity readings go.
+    pub fn with_metrics(mut self, metrics: Arc<dyn cog_core::MetricsBackend>) -> Self {
+        self.metrics = Some(MetricsSink(metrics));
+        self
     }
 
     /// Attach the observation sink and take the budget from it.
@@ -508,7 +532,13 @@ impl ChangePipeline {
 
         self.ensure_clean_workspace(workdir).await?;
 
-        if let Err(e) = self.git_apply_check(workdir, &change.content).await {
+        let applies = self.git_apply_check(workdir, &change.content).await;
+        // 读数在判词之后、早退之前：这一步的 oracle 与下面这道门是同一个
+        // `git apply --check`，所以读数说的是「这份 diff 与目标树有多契合」，
+        // 而不是另一套判定。
+        self.report_fidelity(workdir, &change.content, applies.is_ok())
+            .await;
+        if let Err(e) = applies {
             return Ok(ApplyResult {
                 change_id: change.artifact_id.clone(),
                 files_changed,
@@ -1018,6 +1048,55 @@ impl ChangePipeline {
     /// Run `git apply --check` on change content without modifying the tree.
     async fn git_apply_check(&self, workdir: &Path, change_content: &str) -> SFResult<()> {
         self.run_git_apply(workdir, change_content, true).await
+    }
+
+    /// 逐文件/逐块读出这份 diff 有多少真的在目标树里找到上下文，并上报。
+    ///
+    /// oracle 是本模块的 `git apply --check`：决定变更能否落地的那个判定，
+    /// 与决定这条读数是什么的那个判定必须是同一个，否则读数可以绿着而门是红的。
+    /// 上报摆在这里而不是生成侧，是因为每条变更真正被判定 apply 的地方在这里；
+    /// 生成侧那份是同一事实的第二份判据。
+    async fn report_fidelity(&self, root: &Path, diff: &str, whole_patch_ok: bool) {
+        let fidelity = crate::diff_fidelity::measure(root, diff, whole_patch_ok).await;
+        // 没解析出任何文件段落＝没东西可测：这条变更根本没走到门，缺席不是零。
+        if fidelity.is_empty() {
+            return;
+        }
+        info!(
+            files_total = fidelity.files_total,
+            files_faithful = fidelity.files_faithful,
+            hunks_total = fidelity.hunks_total,
+            hunks_faithful = fidelity.hunks_faithful,
+            "generated change fidelity"
+        );
+        let Some(metrics) = self.metrics.as_ref().map(|sink| &sink.0) else {
+            return;
+        };
+        for (name, value) in [
+            (
+                cog_core::metric_names::EVOLUTION_GENERATED_CHANGE_FILES_TOTAL,
+                fidelity.files_total as f64,
+            ),
+            (
+                cog_core::metric_names::EVOLUTION_GENERATED_CHANGE_FILES_FAITHFUL,
+                fidelity.files_faithful as f64,
+            ),
+            (
+                cog_core::metric_names::EVOLUTION_GENERATED_CHANGE_HUNKS_TOTAL,
+                fidelity.hunks_total as f64,
+            ),
+            (
+                cog_core::metric_names::EVOLUTION_GENERATED_CHANGE_HUNKS_FAITHFUL,
+                fidelity.hunks_faithful as f64,
+            ),
+        ] {
+            if let Err(e) = metrics
+                .record_counter(name, value, std::collections::HashMap::new())
+                .await
+            {
+                warn!(metric = name.as_str(), error = %e, "could not record change fidelity");
+            }
+        }
     }
 
     /// Apply change content to the working tree with `git apply`.
