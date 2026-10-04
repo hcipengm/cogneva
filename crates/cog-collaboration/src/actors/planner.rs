@@ -241,10 +241,18 @@ impl PlannerActor {
         // 上游已经失败时不能再走自审：那会为同一个不可用的上游再买一次调用，
         // 而且改写的输出会把上面带下来的真因覆盖掉，降级重新变得无声。理由
         // 交给自审漏斗，于是「这次没审」和「这次审了」一样有读数。
+        //
+        // 自进化任务的 plan 也不审，与生成侧同一条理由（`generator.rs` 对
+        // `is_self_evolution` 的跳过）：这条路上要的是能被下游确定性解析的 JSON
+        // 形状，plan 在到这里之前已经解析过，而只会说人话的模型会让改写的自审
+        // 跑到超时才返回——买到的是一段改不动解析结果的散文，代价是一整个超时。
+        // 跳过用同一个具名理由，省下的调用因此是读数而不是缺席。
         let review_basis = if output.is_terminal_env_failure() {
             crate::actors::ReviewBasis::Skipped(
                 crate::observable::SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE,
             )
+        } else if is_self_evolution {
+            crate::actors::ReviewBasis::Skipped(crate::observable::SELF_REVIEW_SKIP_SELF_EVOLUTION)
         } else {
             crate::actors::ReviewBasis::HeldTo(crate::actors::review_spec(task, &[]))
         };

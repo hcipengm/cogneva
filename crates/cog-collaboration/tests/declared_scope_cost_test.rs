@@ -432,3 +432,32 @@ async fn a_text_only_change_costs_far_less_than_a_module_level_one() {
         module.by_role.lock().unwrap()
     );
 }
+
+/// A self-evolution plan is not handed to self-review, for the same reason the
+/// change artifact is not: the plan is a JSON value the pipeline parses before
+/// the review would run, so a revision can only rewrite prose. The plan is the
+/// largest thing either actor hands over, and the review of a document that
+/// size is the slowest cell in the ledger — it runs to its timeout when the
+/// model answers in prose, which is exactly the answer this path rules out.
+#[tokio::test]
+async fn a_self_evolution_plan_is_not_self_reviewed() {
+    let (passed, log) = run_declared(self_evolution_task(
+        "rework the parser across crates/cog-parser/src/lib.rs, \
+         crates/cog-parser/src/lexer.rs, crates/cog-parser/src/ast.rs, \
+         crates/cog-parser/src/error.rs",
+    ))
+    .await;
+
+    assert!(passed, "the change still has to land");
+    assert!(
+        log.role("planner") > 0,
+        "this goal is planned, so what is skipped is the review and not the plan: {:?}",
+        log.by_role.lock().unwrap()
+    );
+    assert_eq!(
+        log.role("planner:review"),
+        0,
+        "a parsed plan is not reviewed: the review rewrites prose only, and the \
+         document it would rewrite is the largest one on the path"
+    );
+}
