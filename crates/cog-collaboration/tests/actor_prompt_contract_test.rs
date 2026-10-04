@@ -120,6 +120,22 @@ fn gate_task() -> cog_core::Task {
     )
 }
 
+/// The task a refused change comes back as: the same shape the hand-off builds,
+/// with the gate's file list in the payload.
+fn rework_task() -> cog_core::Task {
+    cog_core::Task::new(
+        "rework-change-1",
+        cog_core::TaskType::Custom("change_rework".into()),
+        serde_json::json!({
+            "goal": "Fix a defect the LintIntroduced check reported",
+            "evolution_mode": "generate_change",
+            "task_kind": "change_rework",
+            "failure_digest": "clippy::unnecessary_map_or at crates/bootstrap/src/main.rs:411",
+            "named_files": ["crates/bootstrap/src/main.rs"],
+        }),
+    )
+}
+
 /// A branch result, so a merge has something to choose between.
 fn a_branch(branch_id: u32) -> PgeBranchResult {
     PgeBranchResult {
@@ -368,4 +384,56 @@ fn the_words_the_contracts_name_are_the_words_the_parsers_take() {
         "a reply the merger's contract describes was not taken by its parse"
     );
     assert_eq!(merged.selected_branch_id, Some(2));
+}
+
+/// A refused change's hand-back names the files the gate objected to, and the
+/// planner has to hold the new plan to them.
+///
+/// The hand-off writes `named_files` into the task payload; nothing else in the
+/// rework task is specific to the refusal. Before this the planner re-derived the
+/// file list from the checkout, so the one thing the gate knew for certain — the
+/// paths the defect is in — was re-guessed, and a plan that named them again by
+/// accident was indistinguishable from one that read the verdict.
+///
+/// The guard is a pair: the same call on a task without the field must not carry
+/// the requirement. Asserting only the first half would pass on an actor that
+/// wrote `required_targets` for everything, which would tell every ordinary
+/// change to touch files it was never told about.
+#[tokio::test]
+async fn a_handed_back_change_carries_the_files_the_gate_named() {
+    let reply = serde_json::json!({"summary": "s", "sub_tasks": []});
+
+    let agent = Recorder::new(reply.clone());
+    PlannerActor::new(agent.clone())
+        .plan(&rework_task(), 1, None, None, None, None)
+        .await;
+    let contract = stable_half(agent.inputs()[0].clone());
+    let parsed: serde_json::Value =
+        serde_json::from_str(&contract).expect("the stable half of a planner prompt is JSON");
+    assert_eq!(
+        parsed["required_targets"],
+        serde_json::json!(["crates/bootstrap/src/main.rs"]),
+        "the planner was not told which files the gate refused the last attempt on: {contract}"
+    );
+    // The list is data, so the model also has to be told what it means and that
+    // it is not a hint to search for.
+    let instructions = parsed["instructions"].as_str().unwrap_or_default();
+    assert!(
+        instructions.contains("must appear in your targets"),
+        "the file list arrived without the rule that makes it a requirement: {contract}"
+    );
+
+    // And a task that is not a hand-back carries none of it, byte for byte: the
+    // field is the whole difference between "the gate named these" and "go find
+    // the defect". Every ordinary self-evolution task takes this branch.
+    let plain = Recorder::new(reply);
+    PlannerActor::new(plain.clone())
+        .plan(&gate_task(), 1, None, None, None, None)
+        .await;
+    let contract = stable_half(plain.inputs()[0].clone());
+    let parsed: serde_json::Value = serde_json::from_str(&contract).unwrap();
+    assert!(
+        parsed.get("required_targets").is_none(),
+        "an ordinary plan was handed a target list it was never given: {contract}"
+    );
 }

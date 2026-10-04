@@ -4,6 +4,30 @@ use cog_core::{Agent, KnowledgeBackend, Task};
 
 use crate::squad::pge::types::PlannerOutput;
 
+/// The files a refusing gate named, when this task is a hand-back of a refused
+/// change rather than a fresh request.
+///
+/// Read from the task payload, where the hand-off writes it, and read here
+/// because this is the actor that turns a request into the paths the change is
+/// held to. An empty list and an absent field are the same case — a gate that
+/// named nothing has not told the planner anything it did not already know, and
+/// a `required_targets` of zero entries would ask the model to name nothing.
+fn rework_named_files(task: &Task) -> Option<Vec<String>> {
+    let files: Vec<String> = task
+        .input
+        .get("named_files")?
+        .as_array()?
+        .iter()
+        .filter_map(|f| f.as_str())
+        .filter(|f| !f.trim().is_empty())
+        .map(|f| f.to_string())
+        .collect();
+    if files.is_empty() {
+        return None;
+    }
+    Some(files)
+}
+
 /// Planner Actor — semantic wrapper around a `dyn Agent` created via
 /// [`AgentManager`](cog_core::AgentManager).
 ///
@@ -181,6 +205,26 @@ impl PlannerActor {
         // Prompt skill（SKILL.md 模板 + schema 指导）：算子 schema 优先于 skill schema。
         if let Some(ref skill) = self.prompt_skill {
             crate::actors::apply_prompt_skill(&mut contract, skill, self.output_schema.as_ref());
+        }
+
+        // 上一次尝试被门禁拒绝时，判词已经点名了它反对的文件，而这条再生成任务把它
+        // 带在载荷里（`named_files`，由 `hand_off_change_rework` 写入）。此前没有任何
+        // 读者：plan 又从检出里重新找了一遍文件，而答案就在请求里。把它交给 plan，
+        // targets 就是那张表——生成侧的契约已经写着「你点名的路径而 diff 没碰，判退」，
+        // 所以这一条不需要新判据，只是把已有的那一条接上。
+        //
+        // 这份清单整条任务不变，所以它进稳定半边，与其余答案契约一起被缓存；
+        // 没有这个字段的任务（每一个不是回流的自进化任务）字节不变。
+        if let Some(files) = rework_named_files(task) {
+            contract["required_targets"] = serde_json::json!(files);
+            if let Some(instructions) = contract["instructions"].as_str() {
+                contract["instructions"] = serde_json::json!(format!(
+                    "{instructions} required_targets names the repository-relative paths the check \
+                     that refused the previous attempt objected to. Every one of them must appear \
+                     in your targets: the defect is in those files, so the change has to touch \
+                     them. Do not re-derive the list by searching the checkout -- it is given."
+                ));
+            }
         }
 
         // Inject historical decomposition patterns if knowledge backend is wired.
