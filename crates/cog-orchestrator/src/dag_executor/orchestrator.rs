@@ -99,6 +99,28 @@ impl ReclaimCause {
             ),
         }
     }
+
+    /// 这次回收要不要记在任务自己的重试账上。
+    ///
+    /// 判据是「这笔账该不该由任务来付」，不是「这次回收严重不严重」。租约过期读
+    /// 到的事实是**持有者不在了**——进程被换掉、被杀掉，都不是任务做的，B11 那
+    /// 条链的设计里就写死了「转移不计重试」。而这条路上原本唯一的判决是拿回收
+    /// 原因去走通用的失败处理，那个处理只认预算：`retry_count < max_retries`，
+    /// 于是每滚一次版就替任务扣一格，三次部署就能把一条刚跑起来、没出过任何错的
+    /// 回炉判死。类型本来就分好了，这里只是把它读到判定里，不新加读数。
+    ///
+    /// 预算跑满那档相反：它读到的是任务自己烧掉了一整轮预算、进展为零，那笔账
+    /// 由任务买单，仍然按终止处理。
+    ///
+    /// 不记账的回投不是无界的：每回收一次都要有一个真实的持有者先消失，而它要
+    /// 再被回收，得先有新持有者接手、再消失——这一圈里没有任务自己的动作在驱动，
+    /// 也没有时钟在驱动，是环境的节拍在驱动。
+    fn charges_retry_budget(&self) -> bool {
+        match self {
+            Self::LeaseExpired { .. } => false,
+            Self::OverBudget { .. } => true,
+        }
+    }
 }
 
 /// 回收判据。只有 Running 的任务需要被回收，且必须有一条证据：持有者的租约过期
@@ -1160,6 +1182,19 @@ impl DagExecutor {
                 _ => continue,
             }
             self.emit_reclaim(&t, &cause);
+            // 该不该记账由类型说了算（见 `ReclaimCause::charges_retry_budget`）：
+            // 不记账的回收不走通用的失败处理，那条路只剩预算一个判据。
+            if !cause.charges_retry_budget() {
+                match self.requeue_reclaimed_store(&t.id, &cause.error()).await {
+                    Ok(true) => results.push((t.id.clone(), true, Vec::new(), false)),
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(
+                        task_id = %t.id,
+                        "cannot re-arm a task whose owner is gone: {e}"
+                    ),
+                }
+                continue;
+            }
             // 回收是编排层观测到的事实，不是传输层给的信号：没有状态码可依，
             // 类型留空，让下游知道这次失败只有文本。
             if let Ok((retried, cancelled, dlq_pushed)) =
@@ -1180,6 +1215,74 @@ impl DagExecutor {
             }
         }
         results
+    }
+
+    /// The row a reclaimed task becomes when the cause is the environment's and
+    /// not the task's: back in `Pending`, the departed owner's claim cleared,
+    /// and `retry_count` carried over untouched.
+    ///
+    /// Deliberately the same shape as [`Self::stalled_requeued`], because it
+    /// rests on the same rule: a charge has to be justified by what the task
+    /// did, and "the process holding it was replaced" is not the task's doing.
+    ///
+    /// It differs from the stall re-arm in one respect — it keeps a
+    /// `retry_not_before`. A reclaimed task had a turn and was interrupted
+    /// mid-run, so pacing the next dispatch is pacing the work itself; a
+    /// stalled one never started, so any wait would be the matrix's wait for an
+    /// attempt it never made.
+    fn reclaimed_requeued(task: &Task, error: &str, delay: std::time::Duration) -> Task {
+        let now = chrono::Utc::now();
+        let mut next = task.clone();
+        next.status = TaskStatus::Pending;
+        next.error = Some(error.to_string());
+        next.error_cause = None;
+        next.retry_not_before = Some(
+            now + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::zero()),
+        );
+        next.clear_run();
+        next.updated_at = now;
+        next
+    }
+
+    /// 把一条被回收的任务放回队列，**不记重试**。
+    ///
+    /// 写的条件是 `Running`：这条路上有第二个写者（被执行器完成、被别的副本的
+    /// 回收循环接手），条件不成立就是任务已经走了，不是失败——与清扫器同一条
+    /// 理由，所以也只是放弃这一轮，不报错。
+    ///
+    /// 返回 `false` 表示条件没落上；`true` 表示任务已经回到 `Pending`。
+    async fn requeue_reclaimed_store(&self, task_id: &str, error: &str) -> SFResult<bool> {
+        let be = self.fg().expect("store mode");
+        let Some(cur) = be.dag_get_task(&self.workspace_id, task_id).await? else {
+            return Ok(false);
+        };
+        if cur.status != TaskStatus::Running {
+            return Ok(false);
+        }
+        let delay = self.retry_matrix.delay(&cur.task_type, cur.retry_count);
+        let next = Self::reclaimed_requeued(&cur, error, delay);
+        if let Err(e) = be
+            .dag_transition_task(&self.workspace_id, task_id, &[TaskStatus::Running], &next)
+            .await
+        {
+            // 只有「写没落上、行还停在 Running」才是存储拒绝了刚接受的工作；
+            // 否则就是任务已经走到别处去了。
+            if matches!(
+                self.get_task(task_id).await,
+                Some(c) if c.status == TaskStatus::Running
+            ) {
+                return Err(e);
+            }
+            return Ok(false);
+        }
+        // 与清扫器同一处读数：`TaskRetried` 带的是**没变过**的 `retry_count`，
+        // 重复出现的同一个数就是「这一轮没动它的预算」。
+        self.emit_event(cog_core::TaskEvent::TaskRetried {
+            task_id: task_id.into(),
+            retry_count: next.retry_count,
+            timestamp: chrono::Utc::now(),
+        });
+        Ok(true)
     }
 
     async fn archive_terminated_tasks_store(&self) {
@@ -2096,6 +2199,32 @@ impl DagExecutor {
             }
 
             self.emit_reclaim(&task, &cause);
+
+            // 该不该记账由类型说了算（见 `ReclaimCause::charges_retry_budget`）：
+            // 不记账的回收不走通用的失败处理，那条路只剩预算一个判据。
+            if !cause.charges_retry_budget() {
+                let mut inner = self.inner.write().await;
+                let Some(current) = inner.tasks.get_mut(&task_id) else {
+                    continue;
+                };
+                if current.status != TaskStatus::Running {
+                    continue;
+                }
+                let delay = self
+                    .retry_matrix
+                    .delay(&current.task_type, current.retry_count);
+                *current = Self::reclaimed_requeued(current, &cause.error(), delay);
+                let snapshot = current.clone();
+                drop(inner);
+                self.persist_task_fine_grained(&snapshot).await;
+                self.emit_event(cog_core::TaskEvent::TaskRetried {
+                    task_id: task_id.clone(),
+                    retry_count: snapshot.retry_count,
+                    timestamp: chrono::Utc::now(),
+                });
+                results.push((task_id, true, Vec::new(), false));
+                continue;
+            }
 
             if let Ok((retried, cancelled, dlq_pushed)) =
                 self.fail_task(&task_id, cause.error(), None).await
@@ -3400,9 +3529,10 @@ mod tests {
 
     /// 换版把原进程连根拔掉时，它手里的任务停在 Running，而 Running 到不了任何
     /// 终态——没有回收就永久卡住。租约到期是"原进程不在了"的证据，接手它是对的，
-    /// 所以这个原因不能被读成终止性失败，否则一次部署就会把这条链永久封死。
+    /// 所以这个原因不能被读成终止性失败，更不能记在任务自己的重试账上：一次部署
+    /// 就扣一格的话，三次部署就能把一条没出过错的回炉判死。
     #[tokio::test]
-    async fn a_lease_expired_task_is_reclaimed_and_stays_retryable() {
+    async fn a_lease_expired_task_is_reclaimed_without_spending_its_budget() {
         let dag = DagExecutor::new("ws-expired".into()).with_task_lease_secs(60);
         let task = Task::new("t-expired", TaskType::DagNode, serde_json::json!({}));
         dag.add_task(task).await.unwrap();
@@ -3420,7 +3550,7 @@ mod tests {
 
         let results = dag.check_timeouts().await;
         assert_eq!(results.len(), 1);
-        assert!(results[0].1, "租约过期必须回到重试预算里，不是被判死");
+        assert!(results[0].1, "租约过期必须回到队列里，不是被判死");
 
         let view = dag.get_task("t-expired").await.unwrap();
         assert_eq!(view.status, TaskStatus::Pending);
@@ -3431,11 +3561,92 @@ mod tests {
             "部署换人不是确定性失败；标成确定性会让 discovery 把这条意图永久 Blocked 掉"
         );
         assert!(view.lease_owner.is_none(), "回收后租约要清干净");
+        assert_eq!(
+            view.retry_count, 0,
+            "换了持有者不是任务做的：这次回收一格预算都不该扣"
+        );
         assert!(
             view.retry_not_before
                 .is_some_and(|due| due > chrono::Utc::now()),
             "回 Pending 的任务带着退避死线"
         );
+    }
+
+    /// 回归：一次版本滚动就能把一条**预算已经用光**的回炉判死，因为回收这条路
+    /// 唯一的判决是 `retry_count < max_retries`，而它读的是任务自己烧了多少格，
+    /// 不是这次回收该不该由任务付账。这里把预算先摆到用完，回收后任务仍要活着，
+    /// 且账面上那格数**不能**再涨——重复出现的同一个数就是「这一轮没动预算」。
+    #[tokio::test]
+    async fn a_budget_exhausted_task_whose_owner_is_replaced_is_not_judged() {
+        let dag = DagExecutor::new("ws-expired-spent".into()).with_task_lease_secs(60);
+        let task = Task::new("t-spent", TaskType::DagNode, serde_json::json!({}));
+        dag.add_task(task).await.unwrap();
+        dag.schedule_task("t-spent").await.unwrap();
+        dag.start_task("t-spent").await.unwrap();
+        let spent = dag.retry_matrix.max_retries(&TaskType::DagNode).max(1);
+
+        {
+            let mut inner = dag.inner.write().await;
+            let t = inner.tasks.get_mut("t-spent").unwrap();
+            t.retry_count = spent;
+            t.lease_expires_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+            t.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(5));
+            t.timeout_seconds = 3600;
+        }
+
+        let results = dag.check_timeouts().await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1, "预算用完也不许把这次回收判成终态");
+
+        let view = dag.get_task("t-spent").await.unwrap();
+        assert_eq!(view.status, TaskStatus::Pending);
+        assert_eq!(view.retry_count, spent, "回收不动任务的重试账");
+    }
+
+    /// 存储模式走的是另一条实现，判据必须一样：换了持有者不记账，任务回到队列。
+    #[tokio::test]
+    async fn a_store_claim_whose_owner_is_replaced_keeps_its_budget() {
+        let backend: Arc<dyn StateBackend> = Arc::new(cog_storage::MemoryStateBackend::new());
+        let dag = DagExecutor::new("ws-lease-nc-fg".into())
+            .with_state_backend(backend.clone())
+            .with_task_lease_secs(60);
+        dag.add_task(Task::new(
+            "t-nc-fg",
+            TaskType::DagNode,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        dag.schedule_task("t-nc-fg").await.unwrap();
+        dag.start_task("t-nc-fg").await.unwrap();
+
+        let mut row = backend
+            .dag_get_task("ws-lease-nc-fg", "t-nc-fg")
+            .await
+            .unwrap()
+            .expect("the row was persisted");
+        let spent = dag.retry_matrix.max_retries(&TaskType::DagNode).max(1);
+        row.retry_count = spent;
+        row.lease_expires_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+        row.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(5));
+        row.timeout_seconds = 3600;
+        backend
+            .dag_set_task("ws-lease-nc-fg", "t-nc-fg", &row)
+            .await
+            .unwrap();
+
+        assert_eq!(dag.check_timeouts().await.len(), 1);
+        let after = backend
+            .dag_get_task("ws-lease-nc-fg", "t-nc-fg")
+            .await
+            .unwrap()
+            .expect("the row is still there");
+        assert_eq!(
+            after.status,
+            TaskStatus::Pending,
+            "换了持有者不是任务做的，预算用完也不能判死"
+        );
+        assert_eq!(after.retry_count, spent, "回收不动任务的重试账");
     }
 
     /// 持有者还活着却把整段预算跑满，是"花了钱没产出"。同一份输入重跑买不到不同
