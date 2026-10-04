@@ -474,21 +474,39 @@ impl Agent {
     /// `git add -N` first, so a file the run created is part of the diff rather
     /// than an untracked leftover the diff would silently omit.
     ///
-    /// No backend, a failed command or an empty answer is `Ok(None)`, not an
-    /// error: a change that cannot be read from a tree is the caller's typed
-    /// artifact to keep, and failing here would turn "no checkout" into "the
-    /// round produced nothing". What the text means is the caller's to judge —
-    /// this crate runs commands, it does not know what a change artifact is.
-    pub async fn workspace_change(&self, task_id: &str) -> SFResult<Option<String>> {
+    /// `exclude` names files to leave out. A run that writes its own answer into
+    /// the tree — which is what a run told to take its answer from `git diff`
+    /// may well do — leaves a file that is a copy of a change, and a diff that
+    /// carried it would be applied as a change that creates it. Excluding it
+    /// here is the only place the file can be left out: downstream, it is
+    /// indistinguishable from a file the round meant to add.
+    ///
+    /// No backend, a failed command, an empty answer or a name that is not a
+    /// plain file name is `Ok(None)`, not an error: a change that cannot be read
+    /// from a tree is the caller's typed artifact to keep, and failing here
+    /// would turn "no checkout" into "the round produced nothing". What the text
+    /// means is the caller's to judge — this crate runs commands, it does not
+    /// know what a change artifact is.
+    pub async fn workspace_change(
+        &self,
+        task_id: &str,
+        exclude: &[String],
+    ) -> SFResult<Option<String>> {
         let Some(backend) = self.sandbox_backend.as_ref() else {
+            return Ok(None);
+        };
+        let Some(command) = workspace_change_command(exclude) else {
+            tracing::warn!(
+                task_id,
+                "a name to leave out of the checkout's diff is not a plain file name; keeping \
+                 the generated artifact rather than running a command that would carry it"
+            );
             return Ok(None);
         };
         let req = cog_core::SandboxRequest {
             task_id: task_id.to_string(),
             agent_id: self.config.agent_id.clone(),
-            payload: cog_core::SandboxPayload::Command {
-                command: WORKSPACE_CHANGE_COMMAND.to_string(),
-            },
+            payload: cog_core::SandboxPayload::Command { command },
             input: serde_json::Value::Null,
             timeout: std::time::Duration::from_secs(120),
             limits: Default::default(),
@@ -1062,8 +1080,12 @@ impl cog_core::Agent for Agent {
         self.prompt_for_task(task_id, input).await
     }
 
-    async fn workspace_change(&self, task_id: &str) -> cog_core::SFResult<Option<String>> {
-        self.workspace_change(task_id).await
+    async fn workspace_change(
+        &self,
+        task_id: &str,
+        exclude: &[String],
+    ) -> cog_core::SFResult<Option<String>> {
+        self.workspace_change(task_id, exclude).await
     }
 
     async fn start(&self) {
@@ -1403,6 +1425,49 @@ mod forward_event_tests {
 const WORKSPACE_CHANGE_COMMAND: &str =
     "git add -N . >/dev/null 2>&1; git --no-pager diff --no-color";
 
+/// The command that reads a run's change back out of its checkout, with the
+/// files the caller named left out.
+///
+/// Both halves carry the exclusion, so the index is not left with an
+/// intent-to-add entry for a file the diff then refuses to show, and the diff
+/// gets an explicit `.` because a pathspec list of excludes alone is a list
+/// whose meaning depends on the command. `literal` because a name is a name,
+/// not a glob: a run may not widen what it leaves out by naming a file `*`.
+///
+/// `None` when a name is not a plain file name. The command is handed to a
+/// shell and these names come from a model's own output, so anything that could
+/// be read as shell syntax ends the read rather than being quoted and hoped
+/// for; the caller keeps the artifact it already had.
+fn workspace_change_command(exclude: &[String]) -> Option<String> {
+    if exclude.is_empty() {
+        return Some(WORKSPACE_CHANGE_COMMAND.to_string());
+    }
+    let mut pathspecs = String::new();
+    for name in exclude {
+        if !is_plain_file_name(name) {
+            return None;
+        }
+        pathspecs.push_str(&format!(" ':(exclude,literal){name}'"));
+    }
+    Some(format!(
+        "git add -N .{pathspecs} >/dev/null 2>&1; git --no-pager diff --no-color -- .{pathspecs}"
+    ))
+}
+
+/// Whether a name may be put in a command as a literal path.
+///
+/// A plain file name: no directory, no shell or glob metacharacter, no leading
+/// dash that a command could read as an option. Everything here is a character
+/// that cannot change what the shell does with the string.
+fn is_plain_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && !name.starts_with('-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
 /// Read a command's answer as "the change this checkout holds".
 ///
 /// A command that failed and a command that printed nothing are both `None`:
@@ -1446,6 +1511,55 @@ mod workspace_change_tests {
             workspace_change_from(&result(0, stdout)),
             Some("diff --git a/a.rs b/a.rs\n@@ -1 +1 @@\n-old\n+new\n".to_string())
         );
+    }
+
+    /// A run told to take its answer from `git diff` may write that answer into
+    /// the tree. Both halves of the command have to leave that file out: an
+    /// `add -N` that marked it would put an intent-to-add entry in the index for
+    /// a file the diff then refuses to show, and a diff without its explicit `.`
+    /// is a pathspec list whose meaning depends on the git version.
+    #[test]
+    fn the_file_the_run_wrote_its_answer_into_is_left_out_of_both_halves() {
+        let command = workspace_change_command(&["changes.diff".to_string()]).unwrap();
+        let exclude = "':(exclude,literal)changes.diff'";
+        assert_eq!(
+            command,
+            format!("git add -N . {exclude} >/dev/null 2>&1; git --no-pager diff --no-color -- . {exclude}")
+        );
+    }
+
+    /// No name to leave out is the plain read: the command must not grow a
+    /// pathspec that would change what "the tree's diff" means.
+    #[test]
+    fn a_read_with_nothing_to_leave_out_is_the_plain_diff() {
+        assert_eq!(
+            workspace_change_command(&[]),
+            Some(WORKSPACE_CHANGE_COMMAND.to_string())
+        );
+    }
+
+    /// These names come from a model's output and go into a shell command. One
+    /// that could be read as syntax — a quote, a substitution, a glob, a
+    /// directory, an option — ends the read instead of being passed through;
+    /// the caller then keeps the diff it already had.
+    #[test]
+    fn a_name_that_is_not_a_plain_file_name_is_refused_rather_than_passed_on() {
+        for name in [
+            "changes.diff' ; rm -rf / #",
+            "a b.diff",
+            "$(whoami).diff",
+            "*.diff",
+            "/etc/passwd",
+            "sub/changes.diff",
+            "-n",
+            "",
+        ] {
+            assert_eq!(
+                workspace_change_command(&[name.to_string()]),
+                None,
+                "{name:?} must not reach the command"
+            );
+        }
     }
 
     /// A git that failed, or a tree with nothing changed, is not a change: both

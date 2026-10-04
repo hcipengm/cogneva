@@ -266,7 +266,8 @@ async fn prefer_workspace_change(
     if !has_change_artifact(&output) {
         return output;
     }
-    let harvested = match agent.workspace_change(task_id).await {
+    let excluded = artifact_files_to_exclude(&output);
+    let harvested = match agent.workspace_change(task_id, &excluded).await {
         Ok(diff) => diff,
         Err(e) => {
             tracing::warn!(
@@ -286,6 +287,30 @@ async fn prefer_workspace_change(
 
 fn has_change_artifact(output: &GeneratorOutput) -> bool {
     output.artifacts.iter().any(|artifact| artifact.is_change())
+}
+
+/// The files the round's own answer would have left in the checkout.
+///
+/// A change artifact's name is what the round was told to call its answer, and
+/// a run that took that answer from `git --no-pager diff` may have dropped the
+/// output into the tree under exactly that name. The tree then reads back as a
+/// change that creates the file, which is a change nobody wrote. Naming it out
+/// of the read is the only place it can be told apart from a file the round
+/// meant to add.
+///
+/// Only names that read as a diff are collected. A change artifact named like a
+/// source file — the contract asks for `.diff`, but the type alone is enough
+/// for an artifact to count as a change — would otherwise take a real file out
+/// of the diff, and a change missing a file it edited is worse than one whose
+/// diff is the model's own.
+fn artifact_files_to_exclude(output: &GeneratorOutput) -> Vec<String> {
+    output
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.is_change())
+        .map(|artifact| artifact.name.clone())
+        .filter(|name| name.to_lowercase().ends_with(".diff"))
+        .collect()
 }
 
 /// Swap the tree's diff in for the typed one, and say which end was used.
@@ -357,7 +382,7 @@ fn change_generation_contract() -> serde_json::Value {
                 }
             ]
         },
-        "artifact_instructions": "Output exactly one artifact: artifact_type='change', name='changes.diff', content being the raw unified diff whose first line is 'diff --git a/<path> b/<path>'. Produce that content by making the edit in the checkout and then pasting what `git --no-pager diff` prints there, verbatim: the diff is read off the files, not reconstructed from memory. Retyping it by hand is accepted only when the checkout cannot be read at all, and a hand-written diff is the shape the apply gate rejects. No markdown fences, no commentary inside content.",
+        "artifact_instructions": "Output exactly one artifact: artifact_type='change', name='changes.diff', content being the raw unified diff whose first line is 'diff --git a/<path> b/<path>'. Produce that content by making the edit in the checkout and then pasting what `git --no-pager diff` prints there, verbatim: the diff is read off the files, not reconstructed from memory. Retyping it by hand is accepted only when the checkout cannot be read at all, and a hand-written diff is the shape the apply gate rejects. The change is read back from the checkout's own diff, so put nothing in the checkout that is not part of the change. No markdown fences, no commentary inside content.",
         "grounding": "Your diff is validated with `git apply --check` against a checkout of this repository, then applied to it and compiled. It must therefore describe the files as they actually are, not as you remember them. You have file tools in this run — use them before writing: list the directories you intend to touch, then read every file you change in full (read_file, or a shell command such as `sed -n '1,400p' <path>`). Then make the edit in the checkout itself (write_file, or a shell command) and take this artifact's content from `git --no-pager diff`, so the headers, the context lines and the hunk counts are the ones git derives from the files. Address files by repository-relative path (for example crates/cog-core/src/lib.rs) — the same path that appears in the '+++ b/' line — and those paths resolve against the checkout. Never guess a path: a path that is not in the checkout is rejected unless the diff itself declares it as created.",
         "diff_grammar": "Every hunk header '@@ -<start>,<count> +<start>,<count> @@' must declare exactly the number of lines its body carries, and the diff must end with a newline. Every context line and every removed line has to match the file byte for byte, including indentation and trailing whitespace, and the start line numbers must be the real line numbers in the file you read. Keep hunks narrow and anchor them on context that is unique in the file: one hunk whose context cannot be located fails the entire change.",
         "creating_a_file": "To add a file, declare it as a creation: 'diff --git a/<path> b/<path>', then 'new file mode 100644', '--- /dev/null', '+++ b/<path>', and a hunk header '@@ -0,0 +1,<n> @@' whose body is n '+' lines. Creating a file that already exists fails, and so does rewriting a file that does not exist without declaring it as a creation.",
@@ -683,5 +708,39 @@ mod tests {
         let (output, source) = apply_workspace_change(output, Some(TREE_DIFF.into()));
         assert_eq!(source, None);
         assert_eq!(output.artifacts[0].content, "@@ not a diff @@");
+    }
+
+    /// The file the round wrote its answer into is left out of the read. Any
+    /// artifact named like a diff counts as a change artifact — a name ending in
+    /// `.diff` is half of what `is_change` is — so all of them are named out; a
+    /// name that is a source file is not, because dropping a file the round
+    /// really edited is worse than keeping a diff the model typed out.
+    #[test]
+    fn only_the_artifacts_that_read_as_diffs_are_left_out_of_the_read() {
+        let mut output = typed_change_output();
+        output.artifacts.push(crate::squad::pge::types::Artifact {
+            name: "notes.diff".into(),
+            artifact_type: "report".into(),
+            content: "a second answer of the same shape".into(),
+        });
+        output.artifacts.push(crate::squad::pge::types::Artifact {
+            name: "report.md".into(),
+            artifact_type: "report".into(),
+            content: "what the round says it did".into(),
+        });
+        assert_eq!(
+            artifact_files_to_exclude(&output),
+            vec!["changes.diff".to_string(), "notes.diff".to_string()]
+        );
+
+        let source_named = GeneratorOutput {
+            content: serde_json::json!("edited the file"),
+            artifacts: vec![crate::squad::pge::types::Artifact {
+                name: "lib.rs".into(),
+                artifact_type: "change".into(),
+                content: TREE_DIFF.into(),
+            }],
+        };
+        assert!(artifact_files_to_exclude(&source_named).is_empty());
     }
 }

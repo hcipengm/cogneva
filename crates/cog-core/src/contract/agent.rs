@@ -126,11 +126,22 @@ pub trait Agent: Send + Sync {
     /// it is applied to. Implementations that can run a command in the run's
     /// checkout return `Some(diff)` when that tree holds one.
     ///
-    /// `None` means no tree could be read — no checkout, no backend, or a run
-    /// that left its tree untouched. That is not "no change": a caller keeps
-    /// whatever it already had, so this can only replace a diff with one the
-    /// tree itself produced. Default: `None`.
-    async fn workspace_change(&self, _task_id: &str) -> crate::SFResult<Option<String>> {
+    /// `None` means no tree could be read — no checkout, no backend, a run that
+    /// left its tree untouched, or a name in `exclude` that cannot be named to a
+    /// shell. That is not "no change": a caller keeps whatever it already had,
+    /// so this can only replace a diff with one the tree itself produced.
+    ///
+    /// `exclude` names files the caller does not want in the diff. A caller's
+    /// own artifact is written by the run and read back by the caller, so it is
+    /// a report of the change rather than part of it; a diff that carried the
+    /// report would be applied as a change that creates it. A name is passed to
+    /// the command, so an entry that is not a plain file name makes the read
+    /// fail rather than reach the shell. Default: `None`.
+    async fn workspace_change(
+        &self,
+        _task_id: &str,
+        _exclude: &[String],
+    ) -> crate::SFResult<Option<String>> {
         Ok(None)
     }
 
