@@ -390,6 +390,10 @@ const PRODUCED: &[(&str, &str)] = &[
         "crates/cog-collaboration/src/observable.rs",
     ),
     (
+        "self_evolution_change_rework_total",
+        "crates/cog-reflection/src/change_rework.rs",
+    ),
+    (
         "sandbox_oom_kills_total",
         "crates/cog-extension/src/runtime/cgroup.rs",
     ),
