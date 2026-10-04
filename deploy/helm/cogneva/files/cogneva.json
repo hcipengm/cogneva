@@ -714,30 +714,30 @@
         },
         {
           "name": "dag_task_stalled_after_ready",
-          "promql": "sum by (namespace) (increase(cogneva_dag_stalled_scheduled_reclaimed_total[1h]))",
+          "promql": "max by (namespace) (increase(cogneva_dag_stalled_scheduled_reclaimed_total[1h]))",
           "condition": {
             "greater_than": 0.0
           },
           "severity": "warning",
-          "summary": "The scheduler reclaimed {value} task(s) in the last hour that sat in Scheduled past the transport's own reclaim window without ever starting. Scheduled means one thing — a ready message carrying that task was handed to the bus — so a task still in it after the bus has had every chance to re-deliver is one whose message was consumed without a run. The queue reads clean while this happens: the message was acked, so there is no pending entry and no lag to notice, and the task is invisible from every other reading because the publisher scans Pending and the timeout checker reclaims Running. Each reclaim re-runs the work and charges the task's retry budget, so a recurring count is paying for the same tasks twice; a task out of budget fails and cancels its dependents. Read the task ids and the consumer's log around the time of the message, not the queue. The count is summed over every process in the namespace rather than read per process: a reclaim is done by whichever process found the task, so each process counts only its own and the total is the deployment's. Read per process, one condition casts one alert per running process, and each of those rows is keyed by a pod that a rollout deletes — so the fault stays put while the subject it was reported under is replaced, and the alert then sits firing with nothing left to evaluate it"
+          "summary": "The scheduler reclaimed {value} task(s) in the last hour that sat in Scheduled past the transport's own reclaim window without ever starting. Scheduled means one thing — a ready message carrying that task was handed to the bus — so a task still in it after the bus has had every chance to re-deliver is one whose message was consumed without a run. The queue reads clean while this happens: the message was acked, so there is no pending entry and no lag to notice, and the task is invisible from every other reading because the publisher scans Pending and the timeout checker reclaims Running. Each reclaim re-runs the work and charges the task's retry budget, so a recurring count is paying for the same tasks twice; a task out of budget fails and cancels its dependents. Read the task ids and the consumer's log around the time of the message, not the queue. The count is read as the largest value any process reports, not as their sum: a reclaim is done by whichever process found the task, but the count is kept in a row that every process sharing the store reads back, so each of them reports the deployment's total and a sum over them would state it once per reader. Read per process, one condition casts one alert per running process, and each of those rows is keyed by a pod that a rollout deletes — so the fault stays put while the subject it was reported under is replaced, and the alert then sits firing with nothing left to evaluate it"
         },
         {
           "name": "task_checkpoint_not_persisted",
-          "promql": "sum by (outcome) (increase(cogneva_task_checkpoint_total{outcome=\"unpersisted\"}[6h]))",
+          "promql": "max by (outcome) (increase(cogneva_task_checkpoint_total{outcome=\"unpersisted\"}[6h]))",
           "condition": {
             "greater_than": 0.0
           },
           "severity": "warning",
-          "summary": "Agents took {value} snapshot(s) in the last six hours that are not in the checkpoint store, so no resume point was recorded for the tasks they belonged to. An agent without a store still builds a snapshot, emits the event, and returns it; only the save is skipped, and it is skipped silently. The resume pointer is withheld in exactly that case — writing it would name a checkpoint nobody can load — so what is left to read is a task with no resume point, which is the shape of a first run. This is a configuration state rather than a run failure: the agent pool was built without the store, or the store's writes are failing. The tasks themselves lose nothing; they simply cannot be handed over, so a rollout or an eviction re-runs them from the beginning. The count is summed across the processes that publish it rather than read per process: each process counts only its own, so the sum is what the deployment did, and the row stays keyed on the subject above instead of on a pod the next rollout deletes."
+          "summary": "Agents took {value} snapshot(s) in the last six hours that are not in the checkpoint store, so no resume point was recorded for the tasks they belonged to. An agent without a store still builds a snapshot, emits the event, and returns it; only the save is skipped, and it is skipped silently. The resume pointer is withheld in exactly that case — writing it would name a checkpoint nobody can load — so what is left to read is a task with no resume point, which is the shape of a first run. This is a configuration state rather than a run failure: the agent pool was built without the store, or the store's writes are failing. The tasks themselves lose nothing; they simply cannot be handed over, so a rollout or an eviction re-runs them from the beginning. The count is read as the largest value any process reports, not as their sum: the checkpoint is written by whichever process took it, but the count is kept in a row that every process sharing the store reads back, so each of them reports the deployment's total and a sum over them would state it once per reader. The row stays keyed on the subject above instead of on a pod the next rollout deletes."
         },
         {
           "name": "task_checkpoint_not_superseded",
-          "promql": "sum by (outcome) (increase(cogneva_task_checkpoint_total{outcome=\"unsuperseded\"}[6h]))",
+          "promql": "max by (outcome) (increase(cogneva_task_checkpoint_total{outcome=\"unsuperseded\"}[6h]))",
           "condition": {
             "greater_than": 0.0
           },
           "severity": "warning",
-          "summary": "{value} checkpoint(s) could not be deleted after being replaced. The store is meant to hold one checkpoint per agent — each new one deletes the one it replaces, which is what bounds it by the live set instead of by uptime. A delete that fails leaves the old copy behind with no reader: the resume chain still works, nothing else logs anything, and the only symptom is a table growing with every tick until it fills the volume it shares with the task data. Read the delete failure from the checkpoint loop's log line and check the store's disk and connection. The count is summed across the processes that publish it rather than read per process: each process counts only its own, so the sum is what the deployment did, and the row stays keyed on the subject above instead of on a pod the next rollout deletes."
+          "summary": "{value} checkpoint(s) could not be deleted after being replaced. The store is meant to hold one checkpoint per agent — each new one deletes the one it replaces, which is what bounds it by the live set instead of by uptime. A delete that fails leaves the old copy behind with no reader: the resume chain still works, nothing else logs anything, and the only symptom is a table growing with every tick until it fills the volume it shares with the task data. Read the delete failure from the checkpoint loop's log line and check the store's disk and connection. The count is read as the largest value any process reports, not as their sum: the checkpoint is written by whichever process took it, but the count is kept in a row that every process sharing the store reads back, so each of them reports the deployment's total and a sum over them would state it once per reader. The row stays keyed on the subject above instead of on a pod the next rollout deletes."
         },
         {
           "name": "task_resume_point_unusable",
@@ -822,30 +822,30 @@
         },
         {
           "name": "change_funnel_never_lands",
-          "promql": "sum by (intent) (increase(cogneva_change_fate_total{fate=\"retired\"}[24h])) > 0 and on(intent) (sum by (intent) (increase(cogneva_change_fate_total{fate=\"landed\"}[24h])) == 0)",
+          "promql": "max by (intent) (increase(cogneva_change_fate_total{fate=\"retired\"}[24h])) > 0 and on(intent) (max by (intent) (increase(cogneva_change_fate_total{fate=\"landed\"}[24h])) == 0)",
           "condition": {
             "greater_than": 0.0
           },
           "severity": "warning",
-          "summary": "{value} changes from the {intent} entry point were withdrawn by verification in the last day and not one change from that entry point landed in the same window, so generation here is spending its budget without putting anything on the base branch. The window is a full generate-and-verify cycle, so an entry point that is merely slow has not landed within it either; read the retired reasons before generating more from {intent}"
+          "summary": "{value} changes from the {intent} entry point were withdrawn by verification in the last day and not one change from that entry point landed in the same window, so generation here is spending its budget without putting anything on the base branch. The window is a full generate-and-verify cycle, so an entry point that is merely slow has not landed within it either; read the retired reasons before generating more from {intent} Each count here is read as the largest value any process reports rather than as their sum: the rows are kept once and read back by every process that shares the store, so any one of them already states the whole count, and both sides have to be read the same way for the comparison between them to mean anything."
         },
         {
           "name": "change_funnel_unattributed",
-          "promql": "sum(cogneva_change_funnel{intent=\"unattributed\"}) > 0",
+          "promql": "sum(max by (intent, stage) (cogneva_change_funnel{intent=\"unattributed\"})) > 0",
           "condition": {
             "greater_than": 0.0
           },
           "severity": "warning",
-          "summary": "{value} held changes carry an entry point this build cannot name, so they are counted under no entry point and the funnel cannot say which producer is unproductive. Either a producer declares a task kind outside the classified set, or the record predates the intent travelling with the change; new work of either kind will keep landing in this bucket until the kind is classified"
+          "summary": "{value} held changes carry an entry point this build cannot name, so they are counted under no entry point and the funnel cannot say which producer is unproductive. Either a producer declares a task kind outside the classified set, or the record predates the intent travelling with the change; new work of either kind will keep landing in this bucket until the kind is classified The count is read as the largest value any process reports rather than as their sum: the row is kept once and read back by every process that shares the store, so any one of them already states the whole count."
         },
         {
           "name": "change_landing_failures",
-          "promql": "sum by (category) (increase(cogneva_landing_failures_total{category=~\"environment|rejected|path|unreadable_diff|oversized\"}[6h])) > 0",
+          "promql": "max by (category) (increase(cogneva_landing_failures_total{category=~\"environment|rejected|path|unreadable_diff|oversized\"}[6h])) > 0",
           "condition": {
             "greater_than": 0.0
           },
           "severity": "warning",
-          "summary": "Landing failed {value} times in the last six hours with category {category}. An environment failure means the landing machinery itself could not run, and a rejection means the push was refused for a reason re-applying cannot fix, so the change will not land however often it is retried. A path refusal is the same kind of terminal answer read off the change instead of the world: the change's paths are not acceptable to the contribution whitelist -- outside it or forbidden -- so it leaves both channels the moment it is refused and can reach the base branch only through a manual push. It is counted once per refused change where the categories above count once per attempt, so a path value here is how many changes left the channel, not how many rounds were spent. An unreadable diff is the opposite answer and is counted here for the same reason: the gate refuses any diff it cannot read, so the change is held back, but the paths were never read and nothing about the change was judged, so it stays in the queue and comes back every round -- this value is attempts, and a number that keeps rising is a change no automatic step will retire. A size-cap refusal is counted here for the same reason and reads the same way: owner approval is the one thing that waives the cap, so until the owner gives it the change is retried every round and nothing else on this deployment reports that it is waiting. Conflicts and lost races are excluded because those are expected and retried"
+          "summary": "Landing failed {value} times in the last six hours with category {category}. An environment failure means the landing machinery itself could not run, and a rejection means the push was refused for a reason re-applying cannot fix, so the change will not land however often it is retried. A path refusal is the same kind of terminal answer read off the change instead of the world: the change's paths are not acceptable to the contribution whitelist -- outside it or forbidden -- so it leaves both channels the moment it is refused and can reach the base branch only through a manual push. It is counted once per refused change where the categories above count once per attempt, so a path value here is how many changes left the channel, not how many rounds were spent. An unreadable diff is the opposite answer and is counted here for the same reason: the gate refuses any diff it cannot read, so the change is held back, but the paths were never read and nothing about the change was judged, so it stays in the queue and comes back every round -- this value is attempts, and a number that keeps rising is a change no automatic step will retire. A size-cap refusal is counted here for the same reason and reads the same way: owner approval is the one thing that waives the cap, so until the owner gives it the change is retried every round and nothing else on this deployment reports that it is waiting. Conflicts and lost races are excluded because those are expected and retried The count is read as the largest value any process reports rather than as their sum: the row is kept once and read back by every process that shares the store, so any one of them already states the whole count."
         },
         {
           "name": "landing_mirror_behind",
@@ -858,7 +858,7 @@
         },
         {
           "name": "redrive_cause_exhausted",
-          "promql": "sum(increase(cogneva_redrive_refusals_total{reason=\"cause_exhausted\"}[24h])) > 0",
+          "promql": "max by (reason) (increase(cogneva_redrive_refusals_total{reason=\"cause_exhausted\"}[24h])) > 0",
           "condition": {
             "greater_than": 0.0
           },
@@ -867,7 +867,7 @@
         },
         {
           "name": "redrive_refused_without_evidence",
-          "promql": "sum(increase(cogneva_redrive_refusals_total{reason=\"no_evidence\"}[24h])) > 0",
+          "promql": "max by (reason) (increase(cogneva_redrive_refusals_total{reason=\"no_evidence\"}[24h])) > 0",
           "condition": {
             "greater_than": 0.0
           },
@@ -876,7 +876,7 @@
         },
         {
           "name": "redrive_budget_forgotten",
-          "promql": "sum(increase(cogneva_redrive_budget_losses_total{side=\"read\"}[24h])) > 0",
+          "promql": "max by (side) (increase(cogneva_redrive_budget_losses_total{side=\"read\"}[24h])) > 0",
           "condition": {
             "greater_than": 0.0
           },
@@ -885,7 +885,7 @@
         },
         {
           "name": "redrive_charge_not_persisted",
-          "promql": "sum(increase(cogneva_redrive_budget_losses_total{side=\"write\"}[24h])) > 0",
+          "promql": "max by (side) (increase(cogneva_redrive_budget_losses_total{side=\"write\"}[24h])) > 0",
           "condition": {
             "greater_than": 0.0
           },
