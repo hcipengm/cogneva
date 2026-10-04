@@ -1471,6 +1471,57 @@ async fn publish_usage_vocabulary(state: &AppState) {
     }
 }
 
+/// Publish the per-upstream counters at zero, for every configured upstream.
+///
+/// These two are created on demand today, which means each appears with its
+/// first increment already folded into its first sample. `changes()` and
+/// `increase()` are both defined on the difference between adjacent samples, so
+/// the first failure of every process generation reads as zero on them -- and
+/// the gateway rolls every half hour or so, which makes that first failure a
+/// common one, not a corner. The rule that watches for an upstream rejecting
+/// while the pool still reads available is built on exactly that difference, so
+/// on a fresh process it cannot see the very rejection it exists for. It fires
+/// one rejection late, or never if that generation makes only one.
+///
+/// What is placed here is the count before anything has been counted, which is
+/// zero and claims no observation.
+///
+/// Two families are left out on purpose, and for opposite reasons.
+///
+/// `llm_calls_total` carries the caller-supplied `actor` label, so its cells
+/// cannot be enumerated from the configured list; a seed that omitted that
+/// label would publish a series no call can ever add to, and an unmoving cell
+/// reads as traffic that never came, which is the same confusion this publisher
+/// removes, pointed the other way.
+///
+/// The per-upstream gauges have no first increment to lose, so seeding them
+/// would fix nothing and cost something: they are verdicts, and their readers
+/// take a maximum across pods over a window. Seeding `llm_upstream_healthy` at
+/// 1 -- true of an upstream sitting in no suspicion window -- would make
+/// `llm_usage_verdict_unmeasured` fire for every configured upstream, because
+/// that rule pairs "no measured usage verdict" with "healthy somewhere in the
+/// last hour" and a rolling gateway always has a freshly started pod saying 1.
+async fn publish_upstream_vocabulary(state: &AppState) {
+    for upstream in &state.config.llm_upstreams {
+        let key = LlmHealthTable::key(upstream);
+        let labels = [("upstream", key.as_str())];
+        record_counter_add(
+            state,
+            cog_core::metric_names::LLM_UPSTREAM_FAILURES_TOTAL,
+            0.0,
+            &labels,
+        )
+        .await;
+        record_counter_add(
+            state,
+            cog_core::metric_names::LLM_UPSTREAM_CLIENT_ERRORS_TOTAL,
+            0.0,
+            &labels,
+        )
+        .await;
+    }
+}
+
 /// 签名面上一次成功发放的结果名。
 const SIGN_OUTCOME_SIGNED: &str = "signed";
 
@@ -2093,8 +2144,10 @@ async fn refresh_pool_state(state: &AppState) {
 
     for reading in &readings {
         // 本进程一次都没碰过的上游在这里出局：没有判定，也没有窗口长度或失败数
-        // 可报。Prometheus 的序列是懒建的，一条都不发就是这个介质上诚实的"没有
-        // 读数"；发 0 等于替这个上游声称了一个从没发生过的观测。
+        // 可报，而这一族是判决——一条都不发就是这个介质上诚实的"没有读数"；
+        // 发 0 等于替这个上游声称了一个从没发生过的观测。计数器不在此列，它们
+        // 由启动时的 `publish_upstream_vocabulary` 摆在零上，因为那里丢的不是
+        // 判决而是第一次自增（见该函数）。
         let Some(healthy) = reading.healthy else {
             continue;
         };
@@ -4869,6 +4922,9 @@ pub async fn run(
     // upstream that answers without usage reads as a count that climbs rather
     // than as a series nobody can tell from one that was never called.
     publish_usage_vocabulary(&state).await;
+    // 同理：上游池那两条计数器也先摆出来，否则每个进程世代里的第一次失败
+    // 对任何按差值定义的判据都不存在（系列从"不存在"直接跨到"=1"）。
+    publish_upstream_vocabulary(&state).await;
     // 同理：签名面的格子也先摆出来。
     publish_sign_vocabulary(&state).await;
     tracing::info!(
@@ -5991,6 +6047,49 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             .and_then(|v| v.parse().ok())
             .expect("必须带 Retry-After");
         assert!((1_100..=1_200).contains(&retry_after));
+    }
+
+    #[tokio::test]
+    async fn upstream_vocabulary_is_published_before_the_first_increment() {
+        // 这一族是按需创建的：第一次失败会把自增值直接带进首个样本，于是
+        // changes()/increase() 看不见它。种子跑完后格子必须已经在，且是诚实
+        // 的"什么都还没观测到"的值，第一次自增才成为一次可见的变化。
+        let configured = stub_upstream("https://a.example.com", "m1");
+        let state = test_state(vec![configured.clone()]);
+        let key = LlmHealthTable::key(&configured);
+
+        // 没有种子时，这一族一条样本都没有——这正是缺陷本身。
+        let before = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert!(
+            !before.contains(cog_core::metric_names::LLM_UPSTREAM_CLIENT_ERRORS_TOTAL.as_str()),
+            "前提：未跑种子时这一族不存在: {before}"
+        );
+
+        publish_upstream_vocabulary(&state).await;
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        for name in [
+            cog_core::metric_names::LLM_UPSTREAM_FAILURES_TOTAL.as_str(),
+            cog_core::metric_names::LLM_UPSTREAM_CLIENT_ERRORS_TOTAL.as_str(),
+        ] {
+            assert!(
+                text.contains(&format!("{name}{{upstream=\"{key}\"}} 0")),
+                "启动种子必须给出 {name} 的零值格子: {text}"
+            );
+        }
+        // 负例：健康那一格**不能**被种出来。它是判决，而读者取的是跨 pod
+        // 的窗口最大值——种一个 1 会让 `llm_usage_verdict_unmeasured` 对每条
+        // 配置上游长鸣（滚动中的网关上永远有个刚启动的 pod 在说 1）。
+        assert!(
+            !text.contains(cog_core::metric_names::LLM_UPSTREAM_HEALTHY.as_str()),
+            "启动种子不该替任何上游声称一个判决: {text}"
+        );
+
+        // 负例：格子只由配置名单决定，没配置的上游一格都不该有。
+        let unconfigured = stub_upstream("https://b.example.com", "m2");
+        assert!(
+            !text.contains(&LlmHealthTable::key(&unconfigured)),
+            "没配置的上游不该出现在池的读数面上: {text}"
+        );
     }
 
     #[tokio::test]
