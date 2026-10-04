@@ -65,6 +65,7 @@ pub mod mainline_deployer;
 pub mod matcher;
 pub mod meta_learning;
 pub mod observability_stack;
+pub mod pending_promotions;
 pub mod policy_evolution;
 pub mod policy_store;
 pub mod promoter;

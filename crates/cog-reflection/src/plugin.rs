@@ -1060,6 +1060,12 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                                 loop {
                                     beat.beat();
                                     interval.tick().await;
+                                    // 取走 soak 已满的晋级交接。判定必须在这里做，而不是
+                                    // 由部署那一轮自己回调：self_exec 的切换是 execve，
+                                    // 成功即不返回，回调永远不会执行（见 pending_promotions）。
+                                    if let Some(p) = promoter.as_ref() {
+                                        p.drain_handed_off().await;
+                                    }
                                     // 本轮是纯确定性消费：同步工作树、取出待验变更、apply/test/
                                     // build、落地、切二进制，全程不调 LLM。上游全灭时跳过它，只会让
                                     // 一条已经生成好的变更干等（生成侧的池门在 discovery 那边）。
@@ -2938,9 +2944,39 @@ async fn consume_executed_change(
         }
         info!(change_id = %artifact.change_id, "Staging new binary for switch");
 
+        // 晋级判定在切换**之前**交出去（soak → 分级 → GitOps/审批台）。
+        // self_exec 的切换就是本进程的 execve，成功即不返回——挂在它后面的回调
+        // 永不执行，而这是晋级台账唯一可达的写者，所以判定不能长在本轮栈上。
+        // 显式带上待发布提交：本轮工作树是临时的，判定要等 soak 期满才做，
+        // 那时工作树可能已经归还，推送端只按裸仓库里的提交发布。
+        let handed_off = if promoter.is_some() {
+            let source = crate::PromotionSource {
+                repo: workspaces.bare_repo().to_path_buf(),
+                rev: artifact.commit_hash.clone(),
+            };
+            match crate::pending_promotions::hand_off(&change, &source).await {
+                Ok(path) => Some(path),
+                Err(e) => {
+                    warn!(
+                        change_id = %artifact.change_id,
+                        error = %e,
+                        "cannot hand off the promotion decision; this change will not be promoted"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // switch_and_restart may exec the current process and never return.
         if let Err(e) = switcher.switch_and_restart().await {
             warn!(error = %e, "Switch failed; attempting rollback");
+            // 切换没成功就不存在「沙盒部署成功」这一件事：把交接撤掉，别让一条
+            // 从没上过沙盒的变更凭一次没发生的切换去晋级。
+            if let Some(path) = handed_off {
+                crate::pending_promotions::withdraw(&path).await;
+            }
             if let Err(rb_e) = switcher.rollback().await {
                 warn!(error = %rb_e, "Rollback failed");
             }
@@ -2954,6 +2990,12 @@ async fn consume_executed_change(
             return Err(e);
         }
 
+        // 能走到这里，说明本进程的切换是**返回型**的（systemd / sidecar / 镜像
+        // 滚动）——self_exec 在上一句已经把进程映像换掉了。所以下面这笔记账只在
+        // 那几种模式下发生；self_exec 部署里 `cogneva_evolution_change_applied_total`
+        // 恒为 0 就是这个形状，不是「没有变更部署成功」。晋级判定不在这里：
+        // 它已经随上面的交接交出去，由下一轮的 `drain_handed_off` 取走，
+        // 两种模式走同一条路。
         let _ = engine
             .record_change_outcome(
                 &artifact.change_id,
@@ -2964,20 +3006,6 @@ async fn consume_executed_change(
         if let Some(m) = evolution_metrics {
             m.record_change_applied().await;
             m.record_event(false).await;
-        }
-        // 沙盒部署成功 → 交晋级触发器（soak → 分级 → GitOps/审批台）。
-        // 显式带上待发布提交：本轮工作树是临时的，晋级经 soak 后才跑，
-        // 那时它可能已经归还，推送端只按裸仓库里的提交发布。
-        if let Some(p) = promoter {
-            let p = p.clone();
-            let source = crate::PromotionSource {
-                repo: workspaces.bare_repo().to_path_buf(),
-                rev: artifact.commit_hash.clone(),
-            };
-            let promoted_change = change.clone();
-            tokio::spawn(async move {
-                p.on_sandbox_deployed(promoted_change, Some(source)).await;
-            });
         }
         return Ok(());
     }

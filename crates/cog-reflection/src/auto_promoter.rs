@@ -107,24 +107,30 @@ impl AutoPromoter {
         self
     }
 
-    /// 沙盒部署成功回调：等待 soak 后走完整晋级判定。
-    /// 设计为在后台任务里调用（调用方 tokio::spawn）。
-    pub async fn on_sandbox_deployed(
-        &self,
-        change: EvolutionResult,
-        source: Option<PromotionSource>,
-    ) {
-        let change_id = change.artifact_id.clone();
-        if self.policy.soak_secs > 0 {
-            info!(
-                change_id = %change_id,
-                soak_secs = self.policy.soak_secs,
-                "Change deployed in sandbox; soaking before promotion decision"
-            );
-            tokio::time::sleep(std::time::Duration::from_secs(self.policy.soak_secs)).await;
-        }
-        if let Err(e) = self.decide_and_promote_with(&change, source.as_ref()).await {
-            warn!(change_id = %change_id, error = %e, "Promotion decision failed");
+    /// 取走部署进程交出的晋级判定（soak 期满的那些）并逐条判定。
+    ///
+    /// 判定不能由部署进程自己发一个「部署成功后回调」来完成：`self_exec` 切换
+    /// 模式下部署就是本进程的 `execve`，成功即不返回，切换之后注册的回调永不
+    /// 执行——那正是晋级台账在这次修复前从没有过一行的原因。部署进程只负责在
+    /// 切换前把手交出去（`pending_promotions::hand_off`），由 soak 期满时活着的
+    /// 进程在这里取走。判定本身幂等：台账里已有该 change 的记录就直接跳过，
+    /// 所以同一份交接被重复取走不会晋级两次。
+    pub async fn drain_handed_off(&self) {
+        let due =
+            crate::pending_promotions::load_due(self.policy.soak_secs, chrono::Utc::now()).await;
+        for handed in due {
+            let change_id = handed.change.artifact_id.clone();
+            match self
+                .decide_and_promote_with(&handed.change, Some(&handed.source))
+                .await
+            {
+                Ok(()) => crate::pending_promotions::withdraw(&handed.path).await,
+                Err(e) => warn!(
+                    change_id = %change_id,
+                    error = %e,
+                    "handed-off promotion decision failed; keeping it for the next round"
+                ),
+            }
         }
     }
 
@@ -498,6 +504,93 @@ mod tests {
         channel: Option<Arc<dyn PromotionChannel>>,
     ) -> AutoPromoter {
         AutoPromoter::new(policy, ledger, channel, engine())
+    }
+
+    /// 部署进程在 `execve` 之前交出的那一条，必须由活着的进程取走并落进台账。
+    /// 这一格是这次修复的判据：改之前台账里一行都没有，而原因不是「没有变更
+    /// 部署成功」，是判定挂在了永不返回的调用之后。
+    #[tokio::test]
+    async fn a_handed_off_promotion_is_taken_up_and_recorded() {
+        let _guard = crate::pending_promotions::DATA_DIR_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", tmp.path());
+
+        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let policy = crate::PromotionGateConfig {
+            enabled: true,
+            // soak 已满由 `is_due` 的考试负责，这里考的是「取走并落账」。
+            soak_secs: 0,
+            ..Default::default()
+        };
+        let p = promoter(policy, ledger.clone(), None);
+
+        let source = crate::PromotionSource {
+            repo: std::path::PathBuf::from("/host-git"),
+            rev: "abc123".into(),
+        };
+        crate::pending_promotions::hand_off(
+            &change("handed-off", "crates/cog-agent/src/tools.rs"),
+            &source,
+        )
+        .await
+        .unwrap();
+
+        p.drain_handed_off().await;
+
+        let records = ledger.recent(10).await.unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "交出去的判定必须落成台账里的记录，否则解除格仍然没有写者"
+        );
+        assert_eq!(records[0].change_id, "handed-off");
+        assert!(
+            crate::pending_promotions::load_due(0, chrono::Utc::now())
+                .await
+                .is_empty(),
+            "判完要把交接撤回，否则每一轮都会再判一次"
+        );
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
+    /// 判定不到 soak 期不该取走：取早了等于 soak 从未发生。
+    #[tokio::test]
+    async fn a_handed_off_promotion_still_soaking_is_left_alone() {
+        let _guard = crate::pending_promotions::DATA_DIR_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", tmp.path());
+
+        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let policy = crate::PromotionGateConfig {
+            enabled: true,
+            soak_secs: 600,
+            ..Default::default()
+        };
+        let p = promoter(policy, ledger.clone(), None);
+
+        crate::pending_promotions::hand_off(
+            &change("still-soaking", "crates/cog-agent/src/tools.rs"),
+            &crate::PromotionSource {
+                repo: std::path::PathBuf::from("/host-git"),
+                rev: "abc123".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        p.drain_handed_off().await;
+
+        assert!(ledger.recent(10).await.unwrap().is_empty());
+        assert_eq!(
+            crate::pending_promotions::load_due(0, chrono::Utc::now())
+                .await
+                .len(),
+            1,
+            "没到期的交接要留在盘上等下一轮"
+        );
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
     }
 
     #[tokio::test]
