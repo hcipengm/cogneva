@@ -390,4 +390,40 @@ mod tests {
             120
         );
     }
+
+    /// 回归样例：2026-10-04 上游停供那三次尝试的时间戳链——18:24:28.08 →
+    /// 18:24:33.17 → 18:24:37.94，两段间距 5.09s 与 4.77s。那几秒就是退避回落
+    /// 成策略 1s/2s/4s 的指纹：网关当时自报的是 282 秒，而它在角色输出那一跳被
+    /// 拍成了字符串（读回来的那半在 `cog_core::SFError::retry_after_secs` 的
+    /// 回归测试里）。这条把两半钉在一起：同一个上游答案，现在算出来的等待是上游
+    /// 自己说的那个数，不是策略的秒级退避。
+    #[test]
+    fn the_incidents_five_second_gaps_become_the_stated_wait() {
+        let attempts = [
+            "2026-10-04T18:24:28.080Z",
+            "2026-10-04T18:24:33.170Z",
+            "2026-10-04T18:24:37.940Z",
+        ]
+        .map(|t| {
+            t.parse::<chrono::DateTime<chrono::Utc>>()
+                .expect("a real timestamp")
+        });
+
+        for pair in attempts.windows(2) {
+            let gap = pair[1] - pair[0];
+            assert!(
+                gap < chrono::Duration::seconds(60),
+                "样例记的就是退避落到秒级策略时的间距，{gap}"
+            );
+        }
+
+        let matrix = RetryMatrix::defaults();
+        assert_eq!(
+            matrix
+                .delay_with_hint(&TaskType::LlmCall, 1, Some(282))
+                .as_secs(),
+            282,
+            "上游明说的等待接管之后，同一次重试等的是 282 秒，不是策略的 2 秒"
+        );
+    }
 }

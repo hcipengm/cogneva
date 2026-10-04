@@ -136,14 +136,26 @@ impl SFError {
         }
     }
 
-    /// The wait the upstream named on this refusal, if it named one and if this
-    /// error carries a typed refusal at all.
+    /// The wait the upstream named, if it named one.
+    ///
+    /// The typed field first, then the rendering. The fallback is not a
+    /// convenience: this error is flattened into a string by the layers between
+    /// the transport and the retry decision, and every wrapper in between
+    /// (`Agent`, `LLM`, `DagExecutor`) rebuilds it from text alone. Reading only
+    /// the field makes the wait vanish exactly on the path it was measured for,
+    /// and the retry then falls back to a policy backoff measured in seconds
+    /// against an upstream that asked for minutes.
+    ///
+    /// `None` still means the upstream said nothing — the caller's policy
+    /// governs, which is not the same as a zero-length wait.
     pub fn retry_after_secs(&self) -> Option<u64> {
         match self {
             SFError::Upstream {
-                retry_after_secs, ..
-            } => *retry_after_secs,
-            _ => None,
+                retry_after_secs,
+                reason,
+                ..
+            } => retry_after_secs.or_else(|| crate::contract::llm::retry_after_hint_in(reason)),
+            other => crate::contract::llm::retry_after_hint_in(&other.to_string()),
         }
     }
 }
@@ -163,14 +175,31 @@ impl SFError {
     }
 
     /// Build a typed upstream refusal that carries the wait the upstream named.
+    ///
+    /// The wait is rendered into `reason` as well as kept in the field. That is
+    /// deliberate duplication: the field is the reading for anyone who receives
+    /// this error, and the rendering is the reading for the layers in between,
+    /// which flatten the error into a string and carry the reason out with them
+    /// (a role output that reports "the prompt never reached its upstream"
+    /// writes the cause into its own content, and the pipeline wraps that in a
+    /// marker of its own). By the time the retry decision runs, the text is the
+    /// only thing left of this error, so the wait has to be in it.
     pub fn upstream_refused_after(
         cause: UpstreamFailure,
         reason: impl Into<String>,
         retry_after_secs: Option<u64>,
     ) -> Self {
+        let reason = match retry_after_secs {
+            Some(secs) => format!(
+                "{} {}",
+                reason.into(),
+                crate::contract::llm::render_retry_after(secs)
+            ),
+            None => reason.into(),
+        };
         Self::Upstream {
             cause,
-            reason: reason.into(),
+            reason,
             retry_after_secs,
         }
     }
@@ -256,6 +285,63 @@ mod tests {
         );
         // A failure with no typed cause cannot have named a wait either.
         assert_eq!(SFError::Timeout.retry_after_secs(), None);
+    }
+
+    /// 回归：一次上游停供的三次尝试在 10 秒内烧完，退避回到了策略的
+    /// 1s/2s/4s，因为 `retry_after_secs` 在角色输出那一跳被拍成了字符串。
+    ///
+    /// 这条测试复刻的是那一跳：网关 503 带着 `retry-after` 进来到类型上，
+    /// 角色把它写进自己的 content（`environment_error: {e}`），PGE 再套一层
+    /// 终止性标记，最后整条链以 `SFError::Agent` 结束。到达重试判定的错误
+    /// 已经不含任何类型，只有文本 —— 所以等待时长要么在文本里，要么就没了。
+    #[test]
+    fn a_stated_wait_survives_the_flattening_into_a_wrapped_agent_error() {
+        let refused = SFError::upstream_refused_after(
+            UpstreamFailure::ServerError,
+            "LLM stream error: API error (HTTP 503): {\"error\":\"所有 LLM 上游当前不可用\",\
+             \"quota_window_secs\":18000,\"retry_after_seconds\":282}",
+            Some(282),
+        );
+        // 角色输出那一跳：类型没了，文本留下。
+        let as_role_content = format!("environment_error: {refused}");
+        // PGE 那一跳：终止性标记套在外面。
+        let flattened = SFError::Agent(format!("terminal_env_failure: {as_role_content}"));
+
+        assert_eq!(
+            flattened.upstream_failure(),
+            None,
+            "类型确实在这一跳丢了，否则这条测试测的不是它要测的那一跳"
+        );
+        assert_eq!(
+            flattened.retry_after_secs(),
+            Some(282),
+            "上游说的等待时长必须跟着文本过这一跳，否则退避回落成秒级策略"
+        );
+        assert!(
+            !crate::contract::outcome::is_deterministic_failure(&flattened.to_string()),
+            "套上终止性标记之后仍要按它自报的类型判定：server error 是环境自己会清掉的，\
+             保留重试"
+        );
+    }
+
+    /// 拍在文本里的等待时长是量出来的，不是判出来的：取不到就是没说，由调用
+    /// 方自己的策略兜底；读出天文数字也不能真的把任务停在那里。
+    #[test]
+    fn a_wait_read_out_of_text_is_capped_and_absent_means_unstated() {
+        assert_eq!(
+            SFError::Agent("Agent execution error: nothing about a wait".into()).retry_after_secs(),
+            None,
+            "没有这句话时返回 None，而不是 0：0 会读成「立刻重试」"
+        );
+        assert_eq!(
+            SFError::Agent(format!(
+                "refused {}",
+                crate::contract::llm::render_retry_after(9_999_999)
+            ))
+            .retry_after_secs(),
+            Some(crate::contract::llm::MAX_RECOVERED_RETRY_AFTER_SECS),
+            "从散文里读出来的数不能比它可能的来源活得更久"
+        );
     }
 
     /// 状态码到原因的翻译是纯函数，边界的取值要落在预期的档位上。

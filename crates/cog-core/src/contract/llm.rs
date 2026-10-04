@@ -52,6 +52,51 @@ pub fn retry_after_hint(headers: &HashMap<String, String>) -> Option<u64> {
         .and_then(|(_, value)| parse_retry_after_secs(value))
 }
 
+/// The token a rendered refusal carries its stated wait under, and the reader
+/// for it.
+///
+/// The wait starts life as a measurement beside a typed cause, and the cause
+/// has a reader for the prose it is rendered into ([`UpstreamFailure::named_in`])
+/// because the layers between the transport and the retry decision flatten the
+/// error into a string. The wait needs the same reader for the same reason: a
+/// stated wait that reaches the retry decision as `None` lets the policy's own
+/// backoff govern, and a policy backoff of seconds against an upstream that
+/// asked for minutes spends an entire retry budget inside one outage.
+///
+/// A reader that recovers the number from prose cannot trust its magnitude the
+/// way a typed field can, so what it reads is capped: a number that came out of
+/// free text must not be able to park a task indefinitely. The cap is a ceiling
+/// on the wait, not a judgement about the failure — the policy delay still wins
+/// when it is longer.
+pub const RETRY_AFTER_MARKER: &str = "[retry_after_secs=";
+
+/// The longest wait a reader will accept out of rendered text. Matches the
+/// ceiling the gateway's own circuit breaker puts on the interval it advertises,
+/// so a recovered wait cannot outlast the source that produced it.
+pub const MAX_RECOVERED_RETRY_AFTER_SECS: u64 = 6 * 60 * 60;
+
+/// Render `secs` as the token [`retry_after_hint_in`] reads back.
+pub fn render_retry_after(secs: u64) -> String {
+    format!("{RETRY_AFTER_MARKER}{secs}]")
+}
+
+/// The wait a rendered refusal states, when the text carries one.
+///
+/// Read from the last occurrence: the token is appended by whoever rendered the
+/// refusal, so anything that wraps the text again puts more prose after it, and
+/// a reason that itself quotes an earlier rendering must not shadow the outer
+/// one. Absent means the upstream never named a wait, which is not zero — a
+/// caller must fall back to its own policy rather than to "no delay".
+pub fn retry_after_hint_in(text: &str) -> Option<u64> {
+    let rest = &text[text.rfind(RETRY_AFTER_MARKER)? + RETRY_AFTER_MARKER.len()..];
+    let (digits, _) = rest.split_once(']')?;
+    digits
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|secs| secs.min(MAX_RECOVERED_RETRY_AFTER_SECS))
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingLevel {
@@ -503,6 +548,51 @@ mod retry_after_tests {
         assert_eq!(
             retry_after_hint(&HashMap::from([("Retry-After".into(), "n/a".into())])),
             None
+        );
+    }
+
+    /// 渲染与读回是一对：写出去多少，读回来就是多少，且中间被别的散文包过
+    /// 也不影响。
+    #[test]
+    fn a_rendered_wait_reads_back_through_a_wrapper() {
+        let rendered = format!(
+            "environment_error: LLM upstream refused (server_error): HTTP 503 {}",
+            render_retry_after(282)
+        );
+        assert_eq!(retry_after_hint_in(&rendered), Some(282));
+
+        // 外面再套一层（PGE 的终止性标记、SFError 的 Agent 包装），读出来的
+        // 还是同一个数；反过来，什么都没写就是 None，不是 0。
+        assert_eq!(
+            retry_after_hint_in(&format!("terminal_env_failure: {rendered}")),
+            Some(282)
+        );
+        assert_eq!(retry_after_hint_in("refused with no stated wait"), None);
+        assert_eq!(retry_after_hint_in("[retry_after_secs=]"), None);
+        assert_eq!(retry_after_hint_in("[retry_after_secs=soon]"), None);
+    }
+
+    /// 出现过两次时取外层那一次：内层可能是原因自己在引用更早的一次渲染，
+    /// 而外层是刚刚写上去的。取内层等于拿旧的时刻安排新的尝试。
+    #[test]
+    fn the_last_rendered_wait_wins() {
+        let inner = format!("first {}", render_retry_after(60));
+        let outer = format!("{inner} then {}", render_retry_after(282));
+        assert_eq!(retry_after_hint_in(&outer), Some(282));
+    }
+
+    /// 从散文里读出来的数不能比它可能的来源活得更久：真有天文数字也只按上限
+    /// 计，否则一段文本就能把任务停在那里不动。
+    #[test]
+    fn a_wait_read_out_of_text_is_capped() {
+        assert_eq!(
+            retry_after_hint_in(&render_retry_after(MAX_RECOVERED_RETRY_AFTER_SECS + 1)),
+            Some(MAX_RECOVERED_RETRY_AFTER_SECS)
+        );
+        assert_eq!(
+            retry_after_hint_in(&render_retry_after(90)),
+            Some(90),
+            "上限只压超出它的那些，正常值原样返回"
         );
     }
 
