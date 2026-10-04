@@ -30,6 +30,12 @@ const CLAIM_BATCH: usize = 16;
 /// 进程级上限：本进程读的每条 ready 队列共用同一份许可，多读一条队列
 /// 不该把在途执行翻倍。
 const CLAIM_CONCURRENCY: usize = 4;
+/// Bound on one reclaim attempt's store call. The beat is stamped only at the
+/// top of the cycle, so a claim_pending that never returns keeps every later
+/// beat from happening; dropping the stuck attempt returns the loop to the
+/// top, where the next tick starts a fresh call. Half the declared period, so
+/// changing CLAIM_INTERVAL is what should move this ceiling.
+const CLAIM_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Dispatcher that routes ready tasks to the first [`TaskExecutor`] whose
 /// [`TaskExecutor::supports`] returns `true`.
@@ -198,16 +204,24 @@ impl TaskExecutorRouter {
                                 biased;
                                 _ = sweep_shutdown.wait() => break,
                                 _ = ticker.tick() => {
-                                    match sweep_task_backend
-                                        .claim_pending(
+                                    // Bound the single store call this cycle
+                                    // makes: claim_pending has no deadline of
+                                    // its own, and awaiting it unboundedly here
+                                    // held the loop below its top for as long
+                                    // as the peer stayed silent — the reading
+                                    // background_loop_stalled reports.
+                                    let claim = tokio::time::timeout(
+                                        CLAIM_ATTEMPT_TIMEOUT,
+                                        sweep_task_backend.claim_pending(
                                             &sweep_pipe.ready_stream,
                                             &sweep_pipe.group,
                                             PENDING_IDLE_MS,
                                             CLAIM_BATCH,
-                                        )
-                                        .await
-                                    {
-                                        Ok(claimed) if !claimed.is_empty() => {
+                                        ),
+                                    )
+                                    .await;
+                                    match claim {
+                                        Ok(Ok(claimed)) if !claimed.is_empty() => {
                                             tracing::warn!(
                                                 stream = %sweep_pipe.ready_stream,
                                                 count = claimed.len(),
@@ -232,11 +246,18 @@ impl TaskExecutorRouter {
                                                 );
                                             }
                                         }
-                                        Ok(_) => {}
-                                        Err(e) => {
+                                        Ok(Ok(_)) => {}
+                                        Ok(Err(e)) => {
                                             tracing::warn!(
                                                 stream = %sweep_pipe.ready_stream,
                                                 "Pending claim sweep failed: {e}"
+                                            );
+                                        }
+                                        Err(_) => {
+                                            tracing::warn!(
+                                                stream = %sweep_pipe.ready_stream,
+                                                timeout_secs = CLAIM_ATTEMPT_TIMEOUT.as_secs(),
+                                                "Pending claim sweep exceeded its attempt timeout; abandoning this attempt"
                                             );
                                         }
                                     }
