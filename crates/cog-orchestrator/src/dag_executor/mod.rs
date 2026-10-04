@@ -235,25 +235,12 @@ impl DagExecutorRuntime {
                                 biased;
                                 _ = sweep_shutdown.wait() => break,
                                 _ = ticker.tick() => {
-                                    // Bound the one store call this cycle
-                                    // makes: an unresponsive peer once made
-                                    // claim_pending wait without a limit,
-                                    // holding the loop below its top until the
-                                    // stall rule fired. The ceiling is the
-                                    // period this loop publishes, so moving
-                                    // the cadence moves the judgement with it.
-                                    let outcome = tokio::time::timeout(
-                                        std::time::Duration::from_secs(interval_secs),
-                                        sweeper.backend.claim_pending(
-                                            &stream,
-                                            &group,
-                                            claim_idle_ms,
-                                            batch,
-                                        ),
-                                    )
-                                    .await;
-                                    match outcome {
-                                        Ok(Ok(claimed)) => {
+                                    match sweeper
+                                        .backend
+                                        .claim_pending(&stream, &group, claim_idle_ms, batch)
+                                        .await
+                                    {
+                                        Ok(claimed) => {
                                             for (msg_id, bytes) in claimed {
                                                 tracing::warn!(
                                                     stream = %stream, msg_id = %msg_id,
@@ -264,17 +251,10 @@ impl DagExecutorRuntime {
                                                     .await;
                                             }
                                         }
-                                        Ok(Err(e)) => {
+                                        Err(e) => {
                                             tracing::warn!(
                                                 stream = %stream,
                                                 "result pending claim sweep failed: {e}"
-                                            );
-                                        }
-                                        Err(_) => {
-                                            tracing::warn!(
-                                                stream = %stream,
-                                                timeout_secs = interval_secs,
-                                                "result pending claim sweep exceeded its declared period; abandoning this attempt"
                                             );
                                         }
                                     }
