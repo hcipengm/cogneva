@@ -423,6 +423,7 @@ async fn test_agent_loop_with_wal_persists_events() {
         context_window_size: 4000,
         skill_cache_ttl_secs: 30,
         think_stall_timeout_secs: 240,
+        final_draft_timeout_secs: 300,
         skill_config: None,
         crew_id: None,
         squad_id: None,

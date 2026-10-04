@@ -53,7 +53,12 @@ const BUDGET_SAMPLE_WINDOW: usize = 64;
 /// guessing.
 #[derive(Default)]
 struct RoleCalibration {
-    /// Iterations consumed by runs of this role that finished with an answer.
+    /// Iterations consumed by runs of this role that finished with an answer it
+    /// reached on its own. A run cut off at the ceiling is left out even when
+    /// the forced ask salvaged an answer: it stopped where the ceiling said, so
+    /// its length measures the ceiling, not the work. Feeding it back lets every
+    /// rescue raise the next ceiling, which makes the next rescue more likely —
+    /// a ceiling climbing on its own record of having been hit.
     delivered_iterations: VecDeque<u32>,
     /// Runs of this role that were cut off at the ceiling. A run that stops
     /// this way is direct evidence the ceiling was binding, which is what an
@@ -65,12 +70,19 @@ struct RoleCalibration {
 ///
 /// A run that spent its whole iteration budget still reading and testing has
 /// bought nothing: it hands back a sentinel, not an answer. Counting it as a
-/// success hides the ending that costs the most tokens, so the two are
-/// distinguished here and counted apart.
+/// success hides the ending that costs the most tokens, so the endings are
+/// distinguished here and counted apart — including the one that delivers
+/// anyway, because "it delivered" and "it delivered out of a budget it had
+/// already spent" cost the same and mean different things.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunOutcome {
     /// The model stopped calling tools and produced an answer.
     Delivered,
+    /// The iteration budget ran out, and the forced ask still produced an
+    /// answer. The run handed something back, but how long it *needed* is
+    /// unmeasured — it was cut off — so this ending may not feed the
+    /// calibration that decides how long this role's runs may be.
+    DeliveredAfterExhaustion,
     /// The iteration budget ran out before an answer was written.
     BudgetExhausted,
 }
@@ -96,13 +108,11 @@ impl AgentObservable {
         tool_calls: usize,
     ) {
         self.run_count.fetch_add(1, Ordering::Relaxed);
-        match outcome {
-            RunOutcome::Delivered => {
-                self.success_count.fetch_add(1, Ordering::Relaxed);
-            }
-            RunOutcome::BudgetExhausted => {
-                self.budget_exhausted_count.fetch_add(1, Ordering::Relaxed);
-            }
+        if matches!(
+            outcome,
+            RunOutcome::Delivered | RunOutcome::DeliveredAfterExhaustion
+        ) {
+            self.success_count.fetch_add(1, Ordering::Relaxed);
         }
         self.total_steps.fetch_add(steps as u64, Ordering::Relaxed);
         self.total_tool_calls
@@ -113,15 +123,33 @@ impl AgentObservable {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let calibration = calibrations.entry(role.to_string()).or_default();
-        match outcome {
-            RunOutcome::Delivered => {
-                if calibration.delivered_iterations.len() == BUDGET_SAMPLE_WINDOW {
-                    calibration.delivered_iterations.pop_front();
-                }
-                calibration.delivered_iterations.push_back(iterations);
+        if outcome == RunOutcome::Delivered {
+            if calibration.delivered_iterations.len() == BUDGET_SAMPLE_WINDOW {
+                calibration.delivered_iterations.pop_front();
             }
-            RunOutcome::BudgetExhausted => calibration.exhausted_runs += 1,
+            calibration.delivered_iterations.push_back(iterations);
         }
+    }
+
+    /// Note that a run's iteration budget was spent, at the moment the budget is
+    /// judged spent rather than at the end of the run.
+    ///
+    /// What a run cost and what it finally handed back are two facts about two
+    /// moments. Recorded only at the end, a run that spent everything and was
+    /// then salvaged by the forced ask would read exactly like one that never
+    /// came near the ceiling: the ending that costs the most tokens, reported as
+    /// the healthy one. Recorded here, it is counted whatever ending the run
+    /// lands on — and counted even if it never lands on one.
+    pub fn note_budget_exhausted(&self, role: &str) {
+        self.budget_exhausted_count.fetch_add(1, Ordering::Relaxed);
+        let mut calibrations = self
+            .role_calibrations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        calibrations
+            .entry(role.to_string())
+            .or_default()
+            .exhausted_runs += 1;
     }
 
     /// The iteration ceiling to run this role under, given the value a caller
@@ -252,6 +280,7 @@ mod tests {
     #[tokio::test]
     async fn a_run_that_spent_its_budget_is_counted_as_an_exhaustion_not_a_success() {
         let o = AgentObservable::new();
+        o.note_budget_exhausted("generator");
         o.record_run("generator", RunOutcome::BudgetExhausted, 10, 21, 12);
 
         let (runs, successes, exhausted) = readings(&o).await;
@@ -261,6 +290,47 @@ mod tests {
             "a run that wrote no answer must not be counted as a success"
         );
         assert_eq!(exhausted, 1.0);
+    }
+
+    /// 抢救回来的那一轮照样把预算花光了。读数必须两件都说：它是一次交付，
+    /// 也是一次烧空。只在终局记一次的话，这种结尾会读成完全健康的一轮——
+    /// 而它恰恰是最贵的那种。
+    #[tokio::test]
+    async fn a_run_salvaged_after_spending_its_budget_reads_as_both() {
+        let o = AgentObservable::new();
+        o.note_budget_exhausted("generator");
+        o.record_run(
+            "generator",
+            RunOutcome::DeliveredAfterExhaustion,
+            11,
+            21,
+            12,
+        );
+
+        let (runs, successes, exhausted) = readings(&o).await;
+        assert_eq!(runs, 1.0);
+        assert_eq!(successes, 1.0, "它确实把东西交出去了");
+        assert_eq!(exhausted, 1.0, "而它确实把预算花光了才交出去");
+    }
+
+    /// 被截断的运行不能反过来给上限当证据：它停在上限指定的地方，量到的是
+    /// 上限本身，不是工作量。拿它抬墙就是「越抢救、墙越高、越容易再撞」。
+    #[test]
+    fn a_salvaged_run_does_not_raise_the_ceiling_it_stopped_at() {
+        let o = AgentObservable::new();
+        o.note_budget_exhausted("generator");
+        o.record_run(
+            "generator",
+            RunOutcome::DeliveredAfterExhaustion,
+            11,
+            21,
+            12,
+        );
+        assert_eq!(
+            o.iteration_budget_for("generator", 10),
+            10,
+            "在上限处被截断的运行，不能是「上限太低」的证据"
+        );
     }
 
     #[tokio::test]
@@ -348,8 +418,11 @@ mod tests {
     #[tokio::test]
     async fn exhausted_runs_are_readable_per_role() {
         let o = AgentObservable::new();
-        o.record_run("generator", RunOutcome::BudgetExhausted, 10, 21, 12);
-        o.record_run("generator", RunOutcome::BudgetExhausted, 10, 21, 12);
+        // 撞墙记在判定的那一刻，终局记在 run 结束时——按真实顺序两件都走一遍。
+        for _ in 0..2 {
+            o.note_budget_exhausted("generator");
+            o.record_run("generator", RunOutcome::BudgetExhausted, 10, 21, 12);
+        }
         o.record_run("evaluator", RunOutcome::Delivered, 3, 7, 2);
 
         let metrics = o.collect_metrics("D1").await.expect("collect_metrics");

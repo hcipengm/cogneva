@@ -101,16 +101,13 @@ impl GlobalAgentManager {
             state_backend,
             workers: RwLock::new(Vec::new()),
             round_robin: Mutex::new(0),
+            // The rest comes from the one default rather than a second copy of
+            // the numbers: this fallback is replaced from the delivered section
+            // at build time, and a literal here would take over silently the day
+            // that replacement stops being wired.
             default_runtime_config: cog_core::RuntimeConfig {
                 agent_id: String::new(),
-                role: "planner".into(),
-                max_iterations: 10,
-                context_window_size: 32000,
-                skill_cache_ttl_secs: 30,
-                think_stall_timeout_secs: 240,
-                skill_config: None,
-                crew_id: None,
-                squad_id: None,
+                ..cog_core::RuntimeConfig::default()
             },
             default_tools: None,
             external_skill_registry: None,

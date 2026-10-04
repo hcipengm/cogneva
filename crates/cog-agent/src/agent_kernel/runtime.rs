@@ -907,7 +907,13 @@ impl AgentRuntime {
             // If no tool calls, complete normally
             if tool_calls.is_empty() {
                 return self
-                    .deliver(llm, thought_text, assistant_msg, iteration + 1)
+                    .deliver(
+                        llm,
+                        thought_text,
+                        assistant_msg,
+                        iteration + 1,
+                        crate::observable::RunOutcome::Delivered,
+                    )
                     .await;
             }
 
@@ -926,6 +932,9 @@ impl AgentRuntime {
                     "agent loop exhausted its iteration budget with tool calls still pending; \
                      asking for a final draft without tools before writing the run off"
                 );
+                // 撞墙在这里就成立了，与这一轮最后交出什么都没关系。等终局再记，
+                // 抢救回来的那几轮会读成从没撞过墙。
+                crate::observable::global_observable().note_budget_exhausted(&self.config.role);
                 // The ask below is another request on this same transcript, and
                 // an assistant turn whose tool calls have no results is one no
                 // provider will accept. Close it first: the calls are recorded
@@ -944,8 +953,14 @@ impl AgentRuntime {
                 }
                 self.context
                     .add_message(Message::user(FINAL_DRAFT_INSTRUCTION));
-                let forced = match self.think_stream_final(llm).await {
-                    Ok(msg) => {
+                // 这一问是整轮里唯一在预算花完之后发出的请求，所以必须自己有界：
+                // 停顿超时只挡「不吭声」，一个一直吐字的流可以在它里面待到很久。
+                let draft_timeout =
+                    Duration::from_secs(self.config.final_draft_timeout_secs.max(1));
+                let forced = match tokio::time::timeout(draft_timeout, self.think_stream_final(llm))
+                    .await
+                {
+                    Ok(Ok(msg)) => {
                         let text = assistant_text(&msg);
                         if text.trim().is_empty() {
                             // 追问过了，模型还是不交东西：这件事必须跟着哨兵走。
@@ -965,13 +980,23 @@ impl AgentRuntime {
                     // 追问本身失败（上游抖动、流断）不改写这一轮的定性：预算确实
                     // 用完了，照哨兵走终止性失败，比把一次追问的传输错误报成整轮
                     // 失败更接近事实。
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::warn!(
                             agent_id = %self.config.agent_id,
                             error = %e,
                             "the final-draft call failed; the run still ends on its spent budget"
                         );
                         (None, "unavailable")
+                    }
+                    // 到点了还没给完。这一问是「最后再问一次」，不是「想聊多久都行」：
+                    // 没有这条，一个卡住的上游能把一个已经花光预算的轮次再攥住十分钟。
+                    Err(_) => {
+                        tracing::warn!(
+                            agent_id = %self.config.agent_id,
+                            final_draft_timeout_secs = draft_timeout.as_secs(),
+                            "the final-draft call ran past its bound; the run still ends on its spent budget"
+                        );
+                        (None, "timeout")
                     }
                 };
                 if let Some((draft, msg)) = forced.0 {
@@ -980,7 +1005,13 @@ impl AgentRuntime {
                         "the final draft recovered an answer the loop's budget had no room for"
                     );
                     return self
-                        .deliver(llm, draft, msg, self.config.max_iterations + 1)
+                        .deliver(
+                            llm,
+                            draft,
+                            msg,
+                            self.config.max_iterations + 1,
+                            crate::observable::RunOutcome::DeliveredAfterExhaustion,
+                        )
                         .await;
                 }
                 self.state = RuntimeState::Complete;
@@ -1174,6 +1205,8 @@ impl AgentRuntime {
             "agent loop exhausted its iteration budget; \
              the run stops mid-exploration and returns no deliverable"
         );
+        // 同一条：预算在这里用完，就在这里记一次。
+        crate::observable::global_observable().note_budget_exhausted(&self.config.role);
         let result = serde_json::json!({
             "status": cog_core::contract::outcome::MAX_ITERATIONS_STATUS,
             "iterations": self.config.max_iterations
@@ -1214,14 +1247,17 @@ impl AgentRuntime {
     ///
     /// Both the ordinary path (the loop stopped because the model had nothing
     /// left to call) and the forced path (the budget ended and the model was
-    /// asked directly) end here, so the extraction, event emission and run
-    /// accounting cannot drift apart between them.
+    /// asked directly) end here, so the extraction and the event emission cannot
+    /// drift apart between them. The accounting deliberately is not shared:
+    /// `outcome` is how the caller says which of the two this is, because the
+    /// one thing the two paths must not agree on is whether the budget was spent.
     async fn deliver(
         &mut self,
         llm: &dyn cog_core::LlmClient,
         draft: String,
         turn_message: Message,
         iterations: u32,
+        outcome: crate::observable::RunOutcome,
     ) -> SFResult<serde_json::Value> {
         self.state = RuntimeState::Complete;
         let result_timeout = Duration::from_secs(180);
@@ -1274,7 +1310,7 @@ impl AgentRuntime {
         let tool_calls = self.steps.iter().map(|s| s.tool_calls.len()).sum();
         crate::observable::global_observable().record_run(
             &self.config.role,
-            crate::observable::RunOutcome::Delivered,
+            outcome,
             iterations,
             steps,
             tool_calls,
@@ -2321,6 +2357,7 @@ mod tests {
             agent_id: agent_id.into(),
             max_iterations: 1,
             think_stall_timeout_secs: 1,
+            final_draft_timeout_secs: 300,
             ..Default::default()
         };
         AgentRuntime::new(config, tx)
@@ -2687,6 +2724,7 @@ mod tests {
             agent_id: agent_id.into(),
             max_iterations: 1,
             think_stall_timeout_secs: 5,
+            final_draft_timeout_secs: 300,
             ..Default::default()
         };
         AgentRuntime::new(config, tx)
@@ -3009,6 +3047,261 @@ mod tests {
         assert!(
             shared > "{\"context\":{\"attempt\":".len(),
             "the two attempts share only {shared} bytes of the user message"
+        );
+    }
+
+    /// 每次调用都同时回一段可交付的 JSON 和一个工具调用：于是循环在预算内
+    /// 永远停不下来，而钱花完之后那次「不带工具的追问」又确实拿得回东西。
+    /// 这正是「被强制追问救回来的那一轮」的形状。
+    struct ToolCallingLlm;
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmClient for ToolCallingLlm {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _options: &cog_core::ChatOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            let (stream, producer) = cog_core::EventStream::with_capacity(4);
+            tokio::spawn(async move {
+                let mut producer = producer;
+                let text = r#"{"result":"salvaged"}"#.to_string();
+                let _ = producer
+                    .push(AssistantMessageEvent::TextDelta {
+                        content_index: 0,
+                        delta: text.clone(),
+                        timestamp: chrono::Utc::now(),
+                    })
+                    .await;
+                producer.end(cog_core::ChatResponse {
+                    content: vec![
+                        ContentBlock::Text {
+                            text,
+                            text_signature: None,
+                        },
+                        ContentBlock::tool_call("call-salvage", "noop", serde_json::json!({})),
+                    ],
+                    api: "mock".into(),
+                    provider: "mock".into(),
+                    model: "mock".into(),
+                    response_id: None,
+                    usage: cog_core::Usage::default(),
+                    stop_reason: cog_core::StopReason::Stop,
+                    error_message: None,
+                    upstream_failure: None,
+                    retry_after_secs: None,
+                    timestamp: chrono::Utc::now(),
+                });
+            });
+            Ok(stream)
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!()
+        }
+
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _options: &cog_core::ChatOptions,
+        ) -> SFResult<cog_core::ChatResponse> {
+            Ok(cog_core::ChatResponse {
+                content: vec![ContentBlock::Text {
+                    text: r#"{"result":"salvaged"}"#.into(),
+                    text_signature: None,
+                }],
+                api: "mock".into(),
+                provider: "mock".into(),
+                model: "mock".into(),
+                response_id: None,
+                usage: cog_core::Usage::default(),
+                stop_reason: cog_core::StopReason::Stop,
+                error_message: None,
+                upstream_failure: None,
+                retry_after_secs: None,
+                timestamp: chrono::Utc::now(),
+            })
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    /// 撞墙后被强制追问救回来的那一轮：读数必须两件都说——它交付了，也把预算
+    /// 花光了；而它停下的那个位置不能反过来当「这个角色需要多长」的证据。
+    /// 少了前半条，最贵的那种结尾读成健康的；少了后半条，每救一次墙就抬一次。
+    #[tokio::test]
+    async fn a_salvaged_run_counts_as_spent_without_raising_its_own_ceiling() {
+        let role = "salvaged-run-test";
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let config = RuntimeConfig {
+            agent_id: "salvage".into(),
+            role: role.into(),
+            max_iterations: 1,
+            think_stall_timeout_secs: 5,
+            final_draft_timeout_secs: 300,
+            ..Default::default()
+        };
+        let mut runtime = AgentRuntime::new(config, tx);
+        let llm = ToolCallingLlm;
+
+        let result = runtime
+            .run_scoped(serde_json::json!({"task": "salvage"}), &llm, None)
+            .await
+            .expect("the forced final ask salvages an answer");
+
+        assert_eq!(
+            result["result"], "salvaged",
+            "the run must end on what the forced ask produced, not on a sentinel: {result}"
+        );
+
+        let observer = crate::observable::global_observable();
+        use cog_core::Observable as _;
+        let metrics = observer.collect_metrics("").await.expect("collect_metrics");
+        let spent: f64 = metrics
+            .iter()
+            .filter(|m| m.name == "agent_iteration_budget_exhausted")
+            .filter(|m| m.labels.get("role").map(String::as_str) == Some(role))
+            .map(|m| m.value)
+            .sum();
+        assert_eq!(
+            spent, 1.0,
+            "a run salvaged out of a budget it had already spent is still a spent budget"
+        );
+        assert_eq!(
+            observer.iteration_budget_for(role, 7),
+            7,
+            "where it stopped is where the ceiling put it, not evidence the ceiling was low"
+        );
+    }
+
+    /// 预算内照常给工具调用，撞墙后那次「不带工具的追问」既不吐字也不结束。
+    /// 这正是上游卡住时的形状：停顿超时挡不住它，因为流并没有报错，只是不动。
+    struct HangingFinalDraftLlm {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmClient for HangingFinalDraftLlm {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _options: &cog_core::ChatOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            let (stream, producer) = cog_core::EventStream::with_capacity(4);
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::spawn(async move {
+                    let mut producer = producer;
+                    producer.end(cog_core::ChatResponse {
+                        content: vec![ContentBlock::tool_call(
+                            "call-hang",
+                            "noop",
+                            serde_json::json!({}),
+                        )],
+                        api: "mock".into(),
+                        provider: "mock".into(),
+                        model: "mock".into(),
+                        response_id: None,
+                        usage: cog_core::Usage::default(),
+                        stop_reason: cog_core::StopReason::Stop,
+                        error_message: None,
+                        upstream_failure: None,
+                        retry_after_secs: None,
+                        timestamp: chrono::Utc::now(),
+                    });
+                });
+            } else {
+                // 生产者活着，但一直不推进：流既没有事件、也没有结束，
+                // 于是停顿超时永远等不到「没有进展」，只有这道墙能拦住它。
+                tokio::spawn(async move {
+                    let _alive = producer;
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                });
+            }
+            Ok(stream)
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!()
+        }
+
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _options: &cog_core::ChatOptions,
+        ) -> SFResult<cog_core::ChatResponse> {
+            unimplemented!()
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    /// 追问挂住时：整轮必须按时收场，哨兵要写清是「到点没给完」而不是
+    /// 「问过了没答」；而这次撞墙照样要记一次——它只在日志里，读的人
+    /// 就永远看不见救不回来的那两次。
+    #[tokio::test]
+    async fn a_hung_final_draft_ends_the_run_on_its_bound_and_still_counts() {
+        let role = "hung-draft-test";
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let config = RuntimeConfig {
+            agent_id: "hung-draft".into(),
+            role: role.into(),
+            max_iterations: 1,
+            // 停顿窗口远大于这道墙，二者不会互相顶替：1s 后必须由墙收场。
+            think_stall_timeout_secs: 300,
+            final_draft_timeout_secs: 1,
+            ..Default::default()
+        };
+        let mut runtime = AgentRuntime::new(config, tx);
+        let llm = HangingFinalDraftLlm {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let started = std::time::Instant::now();
+        let result = runtime
+            .run(serde_json::json!({"task": "hang"}), &llm)
+            .await
+            .expect("a hung final draft is not an error: the budget, not the ask, ends the run");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the bound must end the run, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            result["status"],
+            cog_core::contract::outcome::MAX_ITERATIONS_STATUS
+        );
+        assert_eq!(
+            result["final_draft"], "timeout",
+            "the sentinel must say the ask ran out of time, not that it answered nothing: {result}"
+        );
+
+        let observer = crate::observable::global_observable();
+        use cog_core::Observable as _;
+        let metrics = observer.collect_metrics("").await.expect("collect_metrics");
+        let spent: f64 = metrics
+            .iter()
+            .filter(|m| m.name == "agent_iteration_budget_exhausted")
+            .filter(|m| m.labels.get("role").map(String::as_str) == Some(role))
+            .map(|m| m.value)
+            .sum();
+        assert_eq!(
+            spent, 1.0,
+            "a run whose recovery ask hung still hit the ceiling exactly once"
         );
     }
 }

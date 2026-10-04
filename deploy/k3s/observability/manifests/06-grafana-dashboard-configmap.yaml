@@ -253,7 +253,7 @@ data:
         {
           "id": 9,
           "title": "Agent Run Outcomes (since process start)",
-          "description": "Every agent run ends either by delivering an answer or by spending its whole iteration budget without writing one. A rising exhausted count means tokens are being paid for runs that produce nothing. Both series reset when the pod restarts.",
+          "description": "Every agent run either delivers an answer or ends with its iteration budget spent. A run that spent the budget and was then salvaged by the forced final ask counts on both series: it delivered, and it cost the most. The exhausted series is the budget table, not a failure count -- a run on it may still have produced something, and one that rose without a matching delivery is the one that bought nothing. Both series reset when the pod restarts.",
           "type": "timeseries",
           "gridPos": {
             "h": 8,
@@ -292,7 +292,7 @@ data:
         {
           "id": 10,
           "title": "Iteration Budget Cut-offs by Role",
-          "description": "Runs of a role that were cut off at its iteration ceiling, split by role. The ceiling is derived from that role's own delivered runs, so a series that keeps rising says the derivation is not keeping up with the work this role is being handed. A cut-off run is total: nothing delivered, everything spent. Reset when the pod restarts.",
+          "description": "Runs of a role that were cut off at its iteration ceiling, split by role. Counted where the ceiling is judged spent, so a run the forced final ask then salvaged is on this series too. The ceiling itself is derived only from runs that finished on their own: a run cut off at the ceiling stopped where the ceiling said, so it measures the ceiling and is left out of that derivation. A rising series therefore says the work handed to this role is growing, not that the ceiling is too low. Reset when the pod restarts.",
           "type": "timeseries",
           "gridPos": {
             "h": 8,

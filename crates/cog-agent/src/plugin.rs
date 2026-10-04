@@ -193,9 +193,9 @@ impl cog_core::SystemPlugin for AgentPlugin {
         info!("AgentPlugin tool registry published");
 
         // ── Eval AgentRuntime ──
-        // agent_loop 是 cog-agent 自有配置段，这里连同 evaluator 的迭代预算一起
-        // 读一次：预算走配置面，改值不用重新打镜像（其余字段仍是评估器自有默认值，
-        // 与生成侧不是一个量级，不能直接继承）。
+        // agent_loop 是 cog-agent 自有配置段，这里连同 evaluator 的迭代预算和兜底
+        // 追问的墙钟界一起读一次：两者都走配置面，改值不用重新打镜像（其余字段仍是
+        // 评估器自有默认值，与生成侧不是一个量级，不能直接继承）。
         let agent_loop_config = crate::AgentLoopConfig::load()?;
         let (eval_event_tx, eval_event_rx) =
             tokio::sync::mpsc::channel::<cog_core::AgentEvent>(128);
@@ -206,6 +206,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
             context_window_size: 32000,
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
+            final_draft_timeout_secs: agent_loop_config.final_draft_timeout_secs,
             skill_config: None,
             crew_id: None,
             squad_id: None,
