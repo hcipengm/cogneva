@@ -303,6 +303,21 @@ pub trait ChangeLanding: Send + Sync + std::fmt::Debug {
     /// cap is the one gate owner approval waives; settling a change early on
     /// them would take a decision the owner still holds.
     fn check_contribution_allowed(&self, diff: &str) -> crate::SFResult<()>;
+
+    /// Which of the paths that diff names the surface refuses, in the order the
+    /// diff names them. Empty for a diff that may flow upstream.
+    ///
+    /// The same rule [`Self::check_contribution_allowed`] decides with, asked
+    /// for its reason in structure rather than only in the sentence the verdict
+    /// crosses as. A refusal has to be recorded under its criterion and the
+    /// files it was refused on — those two are what the recurrence key is built
+    /// from and what a next attempt is aimed at — and reading them back out of
+    /// the message would make a second parser of the one rule, judging the
+    /// patch a second time. An implementor answers both from one predicate.
+    fn contribution_refusal_paths(
+        &self,
+        diff: &str,
+    ) -> crate::SFResult<Vec<std::path::PathBuf>>;
 }
 
 /// Owner policy for flowing evolved changes back upstream as PRs.

@@ -1310,6 +1310,17 @@ impl cog_core::ChangeLanding for MainChannel {
             .map_err(|e| refusal_error(LandingError::of(contribution_refusal_category(&e), e)))
     }
 
+    /// The same rule, asked for the paths rather than the verdict, and mapped
+    /// across the boundary the identical way: a diff that cannot be read has to
+    /// arrive as the same refusal whichever of the two questions was asked, or
+    /// asking the second one would turn a refusal the caller can act on into an
+    /// internal error it can only retry.
+    fn contribution_refusal_paths(&self, diff: &str) -> SFResult<Vec<PathBuf>> {
+        non_contributable_paths(diff)
+            .map(|paths| paths.into_iter().map(PathBuf::from).collect())
+            .map_err(|e| refusal_error(LandingError::of(contribution_refusal_category(&e), e)))
+    }
+
     async fn record_unverified(&self, change: &GeneratedChange) -> SFResult<()> {
         let now = Utc::now();
         let created = load_record(&change.change_id)
@@ -1703,12 +1714,7 @@ fn identity_signoff(identity: &BotIdentityConfig) -> String {
 /// hard-rejected before anything is pushed. A diff from which no paths can be
 /// parsed is rejected as well (fail closed).
 pub fn ensure_contribution_allowed(diff: &str) -> Result<()> {
-    let files = affected_files(diff)?;
-    let denied: Vec<&str> = files
-        .iter()
-        .map(String::as_str)
-        .filter(|p| !is_allowed_path(p))
-        .collect();
+    let denied = non_contributable_paths(diff)?;
     if denied.is_empty() {
         Ok(())
     } else {
@@ -1718,6 +1724,22 @@ pub fn ensure_contribution_allowed(diff: &str) -> Result<()> {
             denied.join(", ")
         )))
     }
+}
+
+/// The paths a diff names that lie outside the surface this instance may
+/// contribute at all.
+///
+/// The verdict and its reason are one rule asked two ways: the caller that
+/// only needs to know whether to carry on reads the emptiness of this, and the
+/// caller that has to file the refusal under its criterion and its files reads
+/// the list. Splitting them any other way — a verdict here and a parser there —
+/// would let the two answers disagree about the same patch.
+pub fn non_contributable_paths(diff: &str) -> Result<Vec<String>> {
+    let files = affected_files(diff)?;
+    Ok(files
+        .into_iter()
+        .filter(|p| !is_allowed_path(p))
+        .collect())
 }
 
 /// Files a unified diff touches, as a landing error when none can be read.
@@ -2099,6 +2121,47 @@ mod tests {
             }
             other => panic!("expected PrivacyRejected, got {other:?}"),
         }
+    }
+
+    /// 判词与它的理由是同一条规则问两次，所以两者必须逐字对上：谁要是各自从
+    /// 一份清单里读，同一份 diff 就会同时得到"过"和"被拒的路径"两个答案，而
+    /// 拒绝被归档到哪个判据、点名哪些文件，全看问的是哪一次。
+    #[test]
+    fn the_refused_paths_and_the_verdict_are_one_rule() {
+        let diff = diff_touching(&[
+            "crates/cog-github/src/lib.rs",
+            "deploy/helm/cogneva/values.yaml",
+            "deploy/k3s/evolution-configmap.yaml",
+        ]);
+
+        let denied = non_contributable_paths(&diff).unwrap();
+        assert_eq!(
+            denied,
+            vec![
+                "deploy/helm/cogneva/values.yaml".to_string(),
+                "deploy/k3s/evolution-configmap.yaml".to_string(),
+            ],
+            "被拒的路径按 diff 里出现的顺序点名，放行的那条不在里面"
+        );
+
+        let msg = match ensure_contribution_allowed(&diff).unwrap_err() {
+            CogGitHubError::PrivacyRejected(msg) => msg,
+            other => panic!("expected PrivacyRejected, got {other:?}"),
+        };
+        for path in &denied {
+            assert!(
+                msg.contains(path.as_str()),
+                "判词里必须出现被判的每一个路径，{path} 却不在：{msg}"
+            );
+        }
+    }
+
+    /// 空集在这一问里是"放行"，不是"没读到"：一份全在白名单里的 diff 不许在
+    /// 这条路上留下任何名字，否则调用方会拿着一份不存在的拒绝去归档。
+    #[test]
+    fn a_whitelisted_diff_refuses_no_paths() {
+        let diff = diff_touching(&["crates/cog-core/src/lib.rs", "README.md"]);
+        assert!(non_contributable_paths(&diff).unwrap().is_empty());
     }
 
     /// 提前问到的答案必须与落地给出的那个**同一个**：同一条被点名的路径、同一个

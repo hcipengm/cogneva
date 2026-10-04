@@ -1952,7 +1952,7 @@ async fn merge_verification_inputs(
 ) -> (
     Vec<crate::types::EvolutionResult>,
     std::collections::HashMap<String, cog_core::GeneratedChange>,
-    Vec<(String, String)>,
+    Vec<(String, String, Vec<std::path::PathBuf>)>,
 ) {
     let mut recorded: std::collections::HashMap<String, cog_core::GeneratedChange> =
         std::collections::HashMap::new();
@@ -2002,10 +2002,15 @@ async fn merge_verification_inputs(
         match landing.check_contribution_allowed(diff) {
             Ok(()) => kept.push(change),
             Err(e) => {
+                // 被拒的文件从**同一条规则**里取，而不是把这句英文再解析一遍：
+                // 拒绝要按判据与文件归档，而重新读一遍同一条规则正是这两者与
+                // 判词开始各说各话的方式。连路径都读不出来的 diff 保留拒绝本身，
+                // 只丢掉名字。
+                let files = landing.contribution_refusal_paths(diff).unwrap_or_default();
                 // 记录不留给这一轮的落地：这条变更不会落地。真正的收口（两份载体
                 // 一起退休）由调用方做，见 `run_evolution_cycle_in`。
                 recorded.remove(&change.artifact_id);
-                refused.push((change.artifact_id.clone(), e.to_string()));
+                refused.push((change.artifact_id.clone(), e.to_string(), files));
             }
         }
     }
@@ -2642,16 +2647,21 @@ async fn run_evolution_cycle_in(
     // 判据是变更自身与这份部署的规则，重跑同一个变更只会得到同一个结论，所以两条
     // 路都只走一次——而"被拒"与"从没生成过"在记录里必须分得开，否则同一个缺口会
     // 一遍遍被重新发现。
-    for (change_id, reason) in refused {
+    for (change_id, reason, files) in refused {
         warn!(
             change_id = %change_id,
             reason = %reason,
             "Change is outside the contributable surface; refused before the sandbox runs"
         );
+        // 这一笔从前记成一条**没有判据**的 outcome，而 outcome 那条路有意不调
+        // 触发器——两者合起来，一次贡献面拒绝既不进判据轴，也从不回到主流程，
+        // 退休就成了一个没有出口的终态。记成 refusal 才带上判据、按判据计数，
+        // 并交给回投那条路。
         let _ = engine
-            .record_change_outcome(
+            .record_change_refusal(
                 &change_id,
-                false,
+                cog_core::RejectionCause::ForbiddenPath,
+                &files,
                 &format!("Refused by the contribution rules: {reason}"),
             )
             .await;
@@ -3167,6 +3177,20 @@ mod tests {
             }
         }
 
+        /// 与 `check_contribution_allowed` 同源：放行时两边都空，拒绝时两边都
+        /// 指名同一个文件。两份答案各写一份清单就会漂开，而这条替身存在的意义
+        /// 正是"判据只有一份"。
+        fn contribution_refusal_paths(
+            &self,
+            _diff: &str,
+        ) -> cog_core::SFResult<Vec<std::path::PathBuf>> {
+            if self.contributable {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![std::path::PathBuf::from("crates/x/tests/y.rs")])
+            }
+        }
+
         async fn retire_unverified(&self, _id: &str, _reason: &str) -> cog_core::SFResult<()> {
             unreachable!("input merging never retires a change")
         }
@@ -3297,6 +3321,13 @@ mod tests {
             "理由要带通道给出的原因：{}",
             refused[0].1
         );
+        // 被拒的路径要和拒绝一起交回，且来自通道自己的那条规则：调用方要按
+        // 「判据 + 文件」归档这笔拒绝，而从句子里再解析一遍就是第二个判定者。
+        assert_eq!(
+            refused[0].2,
+            vec![std::path::PathBuf::from("crates/x/tests/y.rs")],
+            "被拒的路径必须随拒绝一起过来，否则归档时只能去拆那句英文"
+        );
     }
 
     /// 读不到记录不是"没有记录"：读失败时本轮只验本地队列，但不能连本地队列也
@@ -3410,6 +3441,13 @@ mod tests {
         /// 是让下面那些断言仍然只测它要测的那件事。
         fn check_contribution_allowed(&self, _diff: &str) -> cog_core::SFResult<()> {
             Ok(())
+        }
+
+        fn contribution_refusal_paths(
+            &self,
+            _diff: &str,
+        ) -> cog_core::SFResult<Vec<std::path::PathBuf>> {
+            Ok(Vec::new())
         }
 
         /// 与真实通道同语义，不只是记一笔：收口就是把记录**移出未验证集**，而

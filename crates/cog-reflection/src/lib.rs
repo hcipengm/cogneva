@@ -684,14 +684,29 @@ impl ReflectionEngine {
         // what the gate said was wrong, and naming them is the difference
         // between a next attempt that can find the defect and one that searches
         // a whole crate for it.
+        //
+        // A path refusal is the one case where that reading inverts. The files
+        // it names are the ones this instance may not touch, so an attempt aimed
+        // at them is refused by construction, and the requirement would spend
+        // its budget re-deriving a verdict already in hand. There the names
+        // travel as the surface to stay out of and the aim is the area.
         let named_files: Vec<String> = l.related_files.clone();
-        let target = if named_files.is_empty() {
-            format!("{:?} module", l.area)
+        let aim = if named_files.is_empty() {
+            format!("on the {:?} module", l.area)
+        } else if matches!(
+            l.rejection_cause,
+            Some(cog_core::RejectionCause::ForbiddenPath)
+        ) {
+            format!(
+                "with the goal itself, staying out of the paths that check \
+                 refused: {}",
+                named_files.join(", ")
+            )
         } else {
-            named_files.join(", ")
+            format!("on {}", named_files.join(", "))
         };
         let goal = format!(
-            "Fix a defect the {} check reported, on {}. Regenerate the change so \
+            "Fix a defect the {} check reported, {}. Regenerate the change so \
              that it applies to the current tree and passes the gate that refused \
              the last attempt. Do not reconstruct the file from the verdict: read \
              the file as it is.\n\nEvidence:\n{}",
@@ -699,7 +714,7 @@ impl ReflectionEngine {
                 .map(|c| c.as_str())
                 .unwrap_or("change")
                 .replace('_', " "),
-            target,
+            aim,
             l.details
         );
 
@@ -1803,6 +1818,77 @@ mod tests {
             asked.contains("crates/x/src/lib.rs"),
             "the requirement has to name the file the gate refused on, not just \
              the area it lives in; got:\n{asked}"
+        );
+    }
+
+    /// 路径拒绝是唯一一个把上面那条读法倒过来的判据。
+    ///
+    /// 别的判据点名的文件是**下一轮要瞄准的地方**；`ForbiddenPath` 点名的文件是
+    /// **这份实例碰不得的地方**，照着瞄只会由构造被同一条规则再拒一次，把这笔
+    /// 记录从"给出口"变成"烧预算重推同一句判词"。判据分两半读：这笔要回到主流程
+    /// （否则退休仍是终态），且点名的路径在目标里是**要避开的集合**，不是要修的
+    /// 目标。
+    #[tokio::test]
+    async fn a_path_refusal_aims_away_from_the_files_it_named() {
+        let (mut engine, submissions, goals) = engine_that_records_rework();
+        engine.set_cooldown_secs(0);
+
+        let files = vec![
+            std::path::PathBuf::from("deploy/k3s/evolution-configmap.yaml"),
+            std::path::PathBuf::from("deploy/helm/cogneva/values.yaml"),
+        ];
+        engine
+            .record_change_refusal(
+                "c-path",
+                cog_core::RejectionCause::ForbiddenPath,
+                &files,
+                "change touches non-contributable paths",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *submissions.lock().await,
+            1,
+            "贡献面拒绝也是否决：不回主流程就等于没有出口"
+        );
+        let asked = goals.lock().await.join("\n");
+        assert!(
+            asked.contains("staying out of the paths that check refused"),
+            "点名的文件要说成碰不得的集合：\n{asked}"
+        );
+        assert!(
+            asked.contains("deploy/k3s/evolution-configmap.yaml"),
+            "被判的路径本身要留在目标里，否则下一轮会再去撞一遍：\n{asked}"
+        );
+        assert!(
+            !asked.contains("reported, on deploy/k3s/evolution-configmap.yaml"),
+            "不许把它们拼成要修的目标——那正是这条判据的反面：\n{asked}"
+        );
+    }
+
+    /// 上面那条的对照：换向只对路径判据成立。其余判据点名的文件仍然就是下一轮要
+    /// 瞄准的地方，否则这一改会把"说清楚哪坏了"降成"哪儿都别说"。
+    #[tokio::test]
+    async fn a_content_refusal_still_aims_at_the_files_it_named() {
+        let (mut engine, _, goals) = engine_that_records_rework();
+        engine.set_cooldown_secs(0);
+
+        let files = vec![std::path::PathBuf::from("crates/x/src/lib.rs")];
+        engine
+            .record_change_refusal(
+                "c-content",
+                cog_core::RejectionCause::TestsFailed,
+                &files,
+                "two tests failed",
+            )
+            .await
+            .unwrap();
+
+        let asked = goals.lock().await.join("\n");
+        assert!(
+            asked.contains("reported, on crates/x/src/lib.rs"),
+            "内容类判据的目标还是它点名的那个文件：\n{asked}"
         );
     }
 
