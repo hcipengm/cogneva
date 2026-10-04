@@ -1885,9 +1885,14 @@ fn without_metadata_hash(stem: &str) -> String {
 /// with nothing in it. The same defect is then generated again, because nothing
 /// in the second attempt knows anything the first did not.
 ///
-/// So the failing test names lead, the panic sites follow, and the raw output
-/// fills whatever budget is left -- from its tail, which is where cargo prints
-/// the per-test failure detail and the `failures:` summary.
+/// So the failing test names lead, the panic sites follow, and what is left of
+/// the budget goes to the harness's own account of the failure -- the block it
+/// prints under `---- <test> stdout ----`, which holds the assertion message
+/// and the values it printed. That block is *not* at the end of a transcript:
+/// `--no-fail-fast` keeps running the binaries that come after the one that
+/// failed, so the end of the run is their output and cargo's driver lines. The
+/// tail is only where the block lands in a single-binary run, so it is spent
+/// after the blocks rather than instead of them.
 ///
 /// A dump with no failing test named gets its head instead. That case is a
 /// formatter diff or a compile error, and both are identified by their opening
@@ -1928,14 +1933,60 @@ pub fn failure_digest(output: &str, budget: usize) -> String {
     if spent >= budget {
         return take_head(&digest, budget);
     }
-    // The separator is only worth its characters when the tail it introduces
+    // The separator is only worth its characters when the text it introduces
     // survives the budget; an empty tail would leave a dangling heading.
-    let tail = take_tail(output, budget - spent - 1);
-    if !tail.is_empty() {
+    let remaining = budget - spent - 1;
+    // The harness's own block first: it holds what the test said, which is the
+    // half a re-attempt cannot get anywhere else.
+    let mut rest = failure_blocks(output);
+    if !rest.is_empty() {
+        rest = take_head(&rest, remaining);
+    }
+    // The tail is what a run that names its failing test but prints no block
+    // leaves there -- a compile error, or a harness that died. Whatever it
+    // holds is what this function would otherwise have spent the budget on, so
+    // it still gets what the blocks did not take.
+    let left = remaining.saturating_sub(rest.chars().count() + 1);
+    if left > 0 {
+        let tail = take_tail(output, left);
+        if !tail.is_empty() {
+            if !rest.is_empty() {
+                rest.push('\n');
+            }
+            rest.push_str(&tail);
+        }
+    }
+    if !rest.is_empty() {
         digest.push('\n');
-        digest.push_str(&tail);
+        digest.push_str(&rest);
     }
     digest
+}
+
+/// The harness's own account of what each failing test said: the lines from
+/// every `---- <test> stdout ----` marker through the `test result: FAILED.`
+/// line that closes the binary that ran it.
+///
+/// This is where a test's own words are -- the assertion message, the values it
+/// printed -- and it is the one part of a transcript whose position says
+/// nothing about where to look for it: `--no-fail-fast` runs the binaries after
+/// the failing one too, so the block sits wherever that binary happened to run.
+fn failure_blocks(output: &str) -> String {
+    let mut taken: Vec<&str> = Vec::new();
+    let mut inside = false;
+    for line in output.lines() {
+        let line = line.trim_end();
+        if line.starts_with("---- ") {
+            inside = true;
+        }
+        if inside {
+            taken.push(line);
+        }
+        if line.starts_with("test result: FAILED") {
+            inside = false;
+        }
+    }
+    taken.join("\n")
 }
 
 /// How many panic sites a digest names. A run can panic in every test it has;
@@ -2878,6 +2929,77 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored\n";
         assert!(
             !digest.starts_with("test hostdocs::tests::case_"),
             "the passing tests are what the budget was being spent on"
+        );
+    }
+
+    /// The measured shape of a `--workspace --no-fail-fast` refusal: the
+    /// binary that failed ran in the middle of the run, and the binaries after
+    /// it kept printing, so the end of the transcript is their output and
+    /// cargo's driver lines. A window taken from the tail is not the failure --
+    /// it names no test that failed and holds none of what the test said.
+    #[test]
+    fn the_diagnosis_survives_the_binaries_that_ran_after_the_failing_one() {
+        let mut output = String::from(
+            "     Running tests/a_test.rs (target/debug/deps/a_test-0123456789abcdef)\n\
+             \n\
+             running 2 tests\n\
+             test a::one ... ok\n\
+             test a::two ... ok\n\
+             \n\
+             test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n\
+             \n\
+             \x20    Running tests/contract_test.rs (target/debug/deps/contract_test-fedcba9876543210)\n\
+             \n\
+             running 31 tests\n",
+        );
+        for case in 0..30 {
+            output.push_str(&format!("test contract::case_{case} ... ok\n"));
+        }
+        output.push_str(
+            "test contract::every_series_has_a_reader ... FAILED\n\
+             \n\
+             failures:\n\
+             \n\
+             ---- contract::every_series_has_a_reader stdout ----\n\
+             \n\
+             thread 'contract::every_series_has_a_reader' panicked at tests/contract_test.rs:1139:5:\n\
+             闭集里的这些序列没有任何告警规则或面板在读:\n\
+             llm_upstream_registered\n\
+             llm_upstream_request_shape_last_rejection_unix\n\
+             note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\
+             \n\
+             failures:\n\
+             \x20   contract::every_series_has_a_reader\n\
+             \n\
+             test result: FAILED. 30 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n\
+             \n",
+        );
+        // Six more binaries run after the one that failed, none of them failing.
+        for n in 0..6 {
+            output.push_str(&format!(
+                "     Running tests/tail_{n}_test.rs (target/debug/deps/tail_{n}_test-abcdefabcdefabcd)\n\
+                 \n\
+                 running 0 tests\n\
+                 \n\
+                 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n\
+                 \n"
+            ));
+        }
+        output.push_str("error: 1 target failed:\n    `-p cogneva --test contract_test`\n");
+
+        let digest = failure_digest(&output, 2000);
+        assert!(
+            digest.chars().count() <= 2000,
+            "the budget is a budget, not a suggestion; got {}",
+            digest.chars().count()
+        );
+        assert!(
+            digest.contains("llm_upstream_request_shape_last_rejection_unix"),
+            "the assertion message is the half a re-attempt needs; got:\n{digest}"
+        );
+        assert!(
+            digest.contains("tests/contract_test.rs:1139"),
+            "the site the assertion was made at locates the tree to read; got:\n{digest}"
         );
     }
 
