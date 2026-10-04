@@ -1794,9 +1794,9 @@ pub trait MetaLearning: Send + Sync + std::fmt::Debug {
 /// The tests a `cargo test` transcript names as failing, each qualified by the
 /// test binary that ran it.
 ///
-/// Cargo prints `test <name> ... FAILED` under the `Running ...` line of the
-/// binary it is running, and a name alone does not identify a test: two crates
-/// in one workspace can both declare `hostdocs::tests::reachable`. Keying by
+/// Cargo prints `test <name> ... FAILED` while running one of the binaries it
+/// announced, and a name alone does not identify a test: two crates in one
+/// workspace can both declare `hostdocs::tests::reachable`. Keying by
 /// `<binary>/<name>` is what lets two transcripts be compared as sets and have
 /// the comparison mean what it says.
 ///
@@ -1805,14 +1805,41 @@ pub trait MetaLearning: Send + Sync + std::fmt::Debug {
 /// moves whenever the compiler's metadata moves; keeping it would make the same
 /// test look like a different test from one run to the next, and every
 /// comparison would come out empty.
+///
+/// Adjacency is not how the two are found. A caller that runs stdout and stderr
+/// through separate pipes and joins them gets one stream followed by the other,
+/// not the two interleaved: cargo writes `Running ...` to stderr and the harness
+/// writes its own output to stdout, so every `FAILED` line can sit before every
+/// `Running` line. What still holds is the order within each: cargo announces
+/// the binaries in the order it runs them, and the harness announces each run in
+/// that same order. So the k-th run is paired with the k-th announced binary,
+/// and only when both sides counted the same number of runs -- an excerpt that
+/// kept one side and dropped the other would otherwise attribute a failure to
+/// whichever binary happened to land at that index.
 pub fn failing_tests(output: &str) -> BTreeSet<String> {
-    let mut binary = String::from("<unknown>");
+    let binaries: Vec<String> = output
+        .lines()
+        .filter_map(|line| test_binary_of(line.trim_end()))
+        .collect();
+    let runs = output
+        .lines()
+        .filter(|line| harness_run_starts(line.trim_end()))
+        .count();
+    let paired = runs > 0 && runs == binaries.len();
+
+    let mut run_index = 0usize;
+    let mut last_announced = String::from("<unknown>");
     let mut failing = BTreeSet::new();
 
     for line in output.lines() {
         let line = line.trim_end();
+        if paired && harness_run_starts(line) {
+            last_announced = binaries[run_index].clone();
+            run_index += 1;
+            continue;
+        }
         if let Some(name) = test_binary_of(line) {
-            binary = name;
+            last_announced = name;
             continue;
         }
         // Only the run's own line carries the marker. The `failures:` summary
@@ -1825,7 +1852,7 @@ pub fn failing_tests(output: &str) -> BTreeSet<String> {
             if let Some((name, _)) = rest.split_once(" ... ") {
                 let name = name.trim();
                 if !name.is_empty() {
-                    failing.insert(format!("{binary}/{name}"));
+                    failing.insert(format!("{last_announced}/{name}"));
                 }
             }
         }
@@ -1834,25 +1861,54 @@ pub fn failing_tests(output: &str) -> BTreeSet<String> {
     failing
 }
 
+/// The line the harness opens a run with: `running <n> tests`, or `running 1
+/// test` in the singular. Cargo writes it to stdout once per test binary, in the
+/// order the binaries are run, which is the half of the pairing that survives
+/// the two streams being joined instead of interleaved.
+fn harness_run_starts(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("running ") else {
+        return false;
+    };
+    let Some(count) = rest
+        .strip_suffix(" tests")
+        .or_else(|| rest.strip_suffix(" test"))
+    else {
+        return false;
+    };
+    !count.is_empty() && count.chars().all(|c| c.is_ascii_digit())
+}
+
 /// The test binary cargo is about to run, from the line it announces it with.
 ///
-/// Three shapes reach here: `Running unittests src/lib.rs (<path>)`,
-/// `Running tests/foo.rs (<path>)` and `Doc-tests <crate> (<path>)`. All of
-/// them end with the path in parentheses, which is the part that carries the
-/// name; the words before it differ by target kind and are not read.
+/// Four shapes reach here: `Running unittests src/lib.rs (<path>)`,
+/// `Running tests/foo.rs (<path>)`, `Doc-tests <crate> (<path>)` and
+/// `Doc-tests <crate>`. The first three end with the path in parentheses, which
+/// is the part that carries the name. The fourth has no path at all, and its
+/// trailing word is the crate's name -- the same name the parenthesised form
+/// would have yielded, so a run of it is not a run this function failed to name.
 fn test_binary_of(line: &str) -> Option<String> {
     let line = line.trim_start();
-    if !line.starts_with("Running ") && !line.starts_with("Doc-tests ") {
+    let doc_tests = line.starts_with("Doc-tests ");
+    if !line.starts_with("Running ") && !doc_tests {
         return None;
     }
-    let (_, path) = line.rsplit_once('(')?;
-    let stem = path
-        .trim_end()
-        .trim_end_matches(')')
-        .trim()
-        .rsplit('/')
-        .next()?;
-    Some(without_metadata_hash(stem))
+    match line.rsplit_once('(') {
+        Some((_, path)) => {
+            let stem = path
+                .trim_end()
+                .trim_end_matches(')')
+                .trim()
+                .rsplit('/')
+                .next()?;
+            Some(without_metadata_hash(stem))
+        }
+        None if doc_tests => {
+            let name = line.split_whitespace().last()?;
+            Some(without_metadata_hash(name))
+        }
+        // `Running ...` without a path names no file to read a binary from.
+        None => None,
+    }
 }
 
 /// `cog_extension-3f2a1b4c5d6e7f80` -> `cog_extension`.
@@ -2852,6 +2908,59 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored\n";
         );
     }
 
+    /// The shape a caller gets when it runs stdout and stderr through separate
+    /// pipes and joins them: the harness's whole output first, cargo's
+    /// announcements after it. No `FAILED` line has a `Running` line above it
+    /// here, so reading the nearest preceding one names every test `<unknown>`
+    /// -- which is what the cluster's own refusals looked like.
+    #[test]
+    fn a_failure_keeps_its_binary_when_the_two_streams_are_joined() {
+        let output = "\
+running 2 tests\n\
+test hostdocs::tests::every_published_read_outcome_is_reachable ... FAILED\n\
+test hostdocs::tests::another ... ok\n\
+\n\
+failures:\n\
+\n\
+---- hostdocs::tests::every_published_read_outcome_is_reachable stdout ----\n\
+a 0o000 directory should not be listable\n\
+\n\
+test result: FAILED. 1 passed; 1 failed; 0 ignored\n\
+\n\
+running 1 test\n\
+test quota::tests::a_window_that_has_passed_is_not_waited_on ... FAILED\n\
+\n\
+test result: FAILED. 0 passed; 1 failed; 0 ignored\n\
+\n\
+     Running unittests src/lib.rs (target/debug/deps/cog_extension-3f2a1b4c5d6e7f80)\n\
+     Running unittests src/lib.rs (target/debug/deps/cog_auth-0a1b2c3d4e5f6071)\n";
+        assert_eq!(
+            failing_tests(output).into_iter().collect::<Vec<_>>(),
+            vec![
+                "cog_auth/quota::tests::a_window_that_has_passed_is_not_waited_on",
+                "cog_extension/hostdocs::tests::every_published_read_outcome_is_reachable",
+            ]
+        );
+    }
+
+    /// The pairing is by position, so it may only be used when the two sides
+    /// counted the same runs. An excerpt that kept the binaries and dropped the
+    /// harness output would otherwise hand the first failure whichever binary
+    /// came first rather than admitting it does not know.
+    #[test]
+    fn a_failure_is_not_guessed_a_binary_when_the_two_counts_differ() {
+        let output = "\
+test a::b ... FAILED\n\
+\n\
+     Running unittests src/lib.rs (target/debug/deps/cog_core-1111111111111111)\n\
+     Running unittests src/lib.rs (target/debug/deps/cog_core-2222222222222222)\n";
+        assert_eq!(
+            failing_tests(output).into_iter().collect::<Vec<_>>(),
+            vec!["<unknown>/a::b"],
+            "one run, two binaries: nothing says which one it was"
+        );
+    }
+
     /// The metadata hash is part of the binary's file name, so it moves when the
     /// compiler's metadata moves. Two runs of an unchanged test must read as the
     /// same test or a comparison between them is always empty and every failure
@@ -2876,6 +2985,33 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored\n";
                       \n\
                       test src/lib.rs - read (line 12) ... FAILED\n";
         assert!(failing_tests(output).contains("cog_core/src/lib.rs - read (line 12)"));
+    }
+
+    /// Cargo announces a crate whose doc tests it is about to run without a
+    /// path, and that shape counts as a run like any other. Reading it as
+    /// "no binary here" makes the runs outnumber the announced binaries, which
+    /// costs every failure in the transcript its name -- on the cluster's own
+    /// refusal 27 of 157 runs were announced this way.
+    #[test]
+    fn a_doc_test_run_is_announced_without_a_path() {
+        let output = "running 1 test\n\
+                      test src/lib.rs - read (line 12) ... FAILED\n\
+                      \n\
+                      test result: FAILED. 0 passed; 1 failed; 0 ignored\n\
+                      \n\
+                      134 tests, 0 failures\n\
+                      \n\
+                      running 2 tests\n\
+                      test a::b ... FAILED\n\
+                      \n\
+                      test result: FAILED. 1 passed; 1 failed; 0 ignored\n\
+                      \n\
+                      \x20  Doc-tests cog_core\n\
+                      \x20  Doc-tests cog_auth\n";
+        assert_eq!(
+            failing_tests(output).into_iter().collect::<Vec<_>>(),
+            vec!["cog_auth/a::b", "cog_core/src/lib.rs - read (line 12)",]
+        );
     }
 
     /// A run that failed without naming a test did not fail a test: it failed
