@@ -79,8 +79,10 @@ const REVISITED: &[Revisited] = &[
         defined_in: "crates/cog-orchestrator/src/dag_executor/orchestrator.rs",
         called_from: "crates/cog-orchestrator/src/plugin.rs",
         reason: "waits for the ready message that put it here to be consumed; the message can \
-                 be acked without the task ever starting, and the publisher's tick charges that \
-                 attempt and puts the task back, or ends it when the budget is spent",
+                 be acked without the task ever starting, and the publisher's tick puts the \
+                 task back in line without charging an attempt — the age it reads is the same \
+                 whether the message was queued or lost, so only the consumer that sees the \
+                 acknowledgement may charge, and it does that where the ack happens",
     },
     Revisited {
         status: TaskStatus::Running,

@@ -380,6 +380,15 @@ impl TaskExecutorRouter {
                 {
                     tracing::warn!(msg_id = %msg_id, "Failed to ack poison ready message: {e}");
                 }
+                // ack 之后任务还停在 Scheduled：清扫器看不见 ack，只能看见
+                // 年纪，而它现在一律重投、不再扣分。所以「这条消息死了」这句
+                // 话只能由这里说——**这里是唯一看得见 ack 的读者**。说得出
+                // 名字就说：载荷是 publisher 从这一笔任务自己的行序列化出来
+                // 的，整份读不出来就是这一笔的载荷不可编码，按普通失败路径记
+                // 一笔、退避后再序列化一次，并由它自己的预算封顶。整份载荷
+                // 连 JSON 都不是时才说不出名字，那种情形只记日志。
+                self.report_poison_ready_message(task_id_of_poison_payload(bytes), &e, &msg_id)
+                    .await;
                 return;
             }
         };
@@ -499,6 +508,54 @@ impl TaskExecutorRouter {
             tracing::warn!(task_id = %task.id, msg_id = %msg_id, "Failed to ack ready message: {e}");
         }
     }
+
+    /// 把一条已经 ack 掉的毒载荷记到它自己那一笔任务上。
+    ///
+    /// 这里是「这条消息死了」的**第一读者**，也是唯一一个:调度面的清扫器只
+    /// 看得见任务行有多老，看不见 ack，两条路在它眼里同形，所以它已经不再
+    /// 扣分、只把任务放回队列。要有人为「消息死了」说话，只能在看得见 ack
+    /// 的地方说，也就是这里。
+    ///
+    /// 名字取不到就不上报：没名字的追偿是又一次误伤，宁可让那一笔在调度面
+    /// 多转一轮（它会到窗口后被重投，并可能自愈）。
+    async fn report_poison_ready_message(
+        &self,
+        task_id: Option<String>,
+        parse_error: &serde_json::Error,
+        msg_id: &str,
+    ) {
+        let Some(task_id) = task_id else {
+            tracing::warn!(
+                msg_id = %msg_id,
+                "a ready message could not be deserialized and its payload does not name a \
+                 task; dropped with no one to charge"
+            );
+            return;
+        };
+        let Some(ref orch) = self.orchestrator else {
+            tracing::warn!(
+                task_id = %task_id, msg_id = %msg_id,
+                "no orchestrator to record the undecodable ready message against; the task \
+                 will be re-armed when it stalls"
+            );
+            return;
+        };
+        let error = format!(
+            "undecodable ready message: the message carrying this task was acknowledged and \
+             dropped instead of being run, because its payload could not be deserialized \
+             ({parse_error})"
+        );
+        match orch.fail_task(&task_id, error, None).await {
+            Ok((retried, cancelled, _)) => tracing::warn!(
+                task_id = %task_id, msg_id = %msg_id, retried, cancelled = cancelled.len(),
+                "recorded an undecodable ready message against the task whose payload it was"
+            ),
+            Err(e) => tracing::warn!(
+                task_id = %task_id, msg_id = %msg_id,
+                "cannot record the undecodable ready message against its task: {e}"
+            ),
+        }
+    }
 }
 
 /// process_ready_message 的共享上下文，主订阅循环与 pending 清扫器共用，
@@ -516,6 +573,16 @@ struct ReadyPipeline {
 /// PEL 交给清扫器重投，绝不能在 DAG 不知情的情况下继续执行。
 fn start_failure_is_stale(e: &SFError) -> bool {
     matches!(e, cog_core::SFError::TaskFailed { .. })
+}
+
+/// 从一份反序列化失败的就绪载荷里尽量取出任务 id。
+///
+/// 读不成 `Task` 不等于这份载荷不是 JSON：字段增减、两个版本错配都会让它走不
+/// 进类型，而外层的对象和 `id` 键还在。所以退一步按 `Value` 读一次，取不到就
+/// 承认取不到——不猜、不哈希、不拿别的东西顶替名字。
+fn task_id_of_poison_payload(bytes: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    value.get("id")?.as_str().map(str::to_string)
 }
 
 fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
@@ -780,6 +847,30 @@ mod ready_pipeline_tests {
         let acks = backend.acks.lock().await;
         assert_eq!(acks.len(), 1);
         assert_eq!(acks[0].2, vec!["m-poison".to_string()]);
+    }
+
+    /// 整份载荷读不进 `Task` 不等于它没有名字：字段类型随版本变、字段增减，
+    /// 外层对象与 `id` 都还在。名字取得回来，这次投递的死才有主体可追；取不
+    /// 回来就不追——没名字的追偿是又一次误伤。
+    #[test]
+    fn an_undecodable_payload_still_names_its_task() {
+        let task = test_task(60);
+        let mut drifted = serde_json::to_value(&task).unwrap();
+        // 同一个字段换了类型：这一份一定读不进 `Task`，而 `id` 毫发无伤。
+        drifted["timeout_seconds"] = serde_json::json!("sixty");
+        let bytes = serde_json::to_vec(&drifted).unwrap();
+        assert!(
+            serde_json::from_slice::<Task>(&bytes).is_err(),
+            "样例必须读不进 `Task`，否则这条测试什么都没测"
+        );
+        assert_eq!(
+            task_id_of_poison_payload(&bytes).as_deref(),
+            Some(task.id.as_str())
+        );
+
+        // 名字真的取不到时才承认取不到：不猜、不哈希、不拿别的东西顶替。
+        assert_eq!(task_id_of_poison_payload(b"not-json"), None);
+        assert_eq!(task_id_of_poison_payload(b"{\"other\":1}"), None);
     }
 
     #[tokio::test]

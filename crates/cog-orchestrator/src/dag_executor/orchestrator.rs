@@ -182,13 +182,19 @@ impl DagExecutor {
             .clone()
     }
 
-    /// Record that `count` tasks stalled in `Scheduled` were reclaimed.
+    /// Record that `count` tasks stalled in `Scheduled` were re-armed.
     ///
     /// This is the repair's own reading, and it has to be a counter rather than
     /// a live gauge: the repair empties the state it repairs, so a gauge would
     /// read zero both when nothing was ever stuck and when everything was just
-    /// unstuck. What needs to be visible is that the transport lost messages —
-    /// a recurring fault — and that survives in the total.
+    /// unstuck. What survives in the total is how often tasks reach the end of
+    /// the stall window without ever starting — the symptom, not the cause,
+    /// because being put back in line is what the repair does whether the
+    /// message was queued or lost.
+    ///
+    /// So this total cannot say whether the repair worked: being re-armed is
+    /// what the repair does either way. The reading that does say so is the
+    /// charge's absence — a re-armed task keeps the `retry_count` it had.
     async fn record_stalled_scheduled_reclaimed(&self, count: usize) {
         if count == 0 {
             return;
@@ -212,17 +218,27 @@ impl DagExecutor {
         }
     }
 
-    /// Put every task stalled in `Scheduled` back through the failure path.
+    /// Put every task stalled in `Scheduled` back in line, charging nothing.
     ///
-    /// Not a silent reset to `Pending`: this attempt really did produce
-    /// nothing, so it is charged like any other attempt that produced nothing,
-    /// which is what keeps a task whose ready message is lost on every pass
-    /// from being re-run forever. The path it takes is the ordinary one — the
-    /// retry matrix decides the wait and the budget, a spent budget ends in
-    /// `Failed` with its dependents cancelled, and each step is already
-    /// visible.
+    /// A task found here has never been attempted. `Scheduled` says its ready
+    /// message was published, and the two ways it can stay there — the message
+    /// is queued behind a full claim pool, or the message died before anyone
+    /// ran it — are indistinguishable from a task row. Age is the only reading
+    /// this sweep has, and it is the same for a task that was never given a
+    /// turn and for one whose message was dropped. Charging on that age bills
+    /// the task for a shortage of capacity.
     ///
-    /// Returns how many tasks it reclaimed.
+    /// So it re-arms: back to `Pending`, budget untouched, reason recorded, no
+    /// verdict. Undecidable means uncharged, and the task goes back through the
+    /// ordinary publisher — one fresh message per stall window at most, and an
+    /// earlier message still in flight arrives to find the task already moved
+    /// on, which is the stale-message path the consumer already owns.
+    ///
+    /// Who may charge: whoever sees the acknowledgement, and only for a message
+    /// it acked without ever starting the task. That reader lives in
+    /// [`crate::task_executor_router`], where the acks happen.
+    ///
+    /// Returns how many tasks it re-armed.
     pub async fn reclaim_stalled_scheduled(&self, stall_after_secs: u64) -> usize {
         // Floored at the window the transport itself uses before it re-delivers
         // an unacknowledged message. Below it, a message that is merely slow is
@@ -236,7 +252,7 @@ impl DagExecutor {
         let mut reclaimed = 0usize;
         for task in stalled {
             let error = format!(
-                "ready message lost: the task sat in Scheduled for more than {stall_after_secs}s without ever starting, so the message carrying it was consumed without a run"
+                "never started: the task sat in Scheduled for more than {stall_after_secs}s without ever being started, so it was put back in line without charging an attempt"
             );
             match self.reclaim_one_stalled(&task.id, error).await {
                 Ok(true) => reclaimed += 1,
@@ -251,16 +267,16 @@ impl DagExecutor {
         reclaimed
     }
 
-    /// Reclaim one stalled task; `false` if it was no longer stalled.
+    /// Re-arm one stalled task; `false` if it was no longer stalled.
     ///
     /// The sweep runs in every deployment that publishes (the ready queue is
     /// shared, so any of them may publish), which makes the read-then-write a
     /// race the scan itself cannot close: two processes can both find the same
-    /// task stalled and both charge its retry budget, paying twice for one lost
-    /// message. So the charge rides on the state transition — the write carries
-    /// `Scheduled` as its precondition and only the process that still finds it
-    /// there acts. A task that started, or that another sweep already claimed,
-    /// fails the precondition and is left alone.
+    /// task stalled and both act on it. So the action rides on the state
+    /// transition — the write carries `Scheduled` as its precondition and only
+    /// the process that still finds it there acts. A task that started, or that
+    /// another sweep already picked up, fails the precondition and is left
+    /// alone.
     async fn reclaim_one_stalled(&self, task_id: &str, error: String) -> SFResult<bool> {
         let Some(task) = self.get_task(task_id).await else {
             return Ok(false);
@@ -268,20 +284,7 @@ impl DagExecutor {
         if task.status != TaskStatus::Scheduled {
             return Ok(false);
         }
-        // A spent budget is not a retry: the ordinary permanent-failure path
-        // already owns what that means (DLQ, cascade cancel, the event), and
-        // running it twice for one task is harmless where a second charged
-        // retry is not.
-        let budget_left = Self::is_retryable_failure(&error, None)
-            && task.retry_count < self.retry_matrix.max_retries(&task.task_type);
-        if !budget_left {
-            return self.fail_task(task_id, error, None).await.map(|_| true);
-        }
-        let retry_not_before = chrono::Utc::now()
-            + self
-                .retry_matrix
-                .delay_with_hint(&task.task_type, task.retry_count, None);
-        let updated = Self::stalled_to_pending(&task, &error, retry_not_before);
+        let updated = Self::stalled_requeued(&task, &error);
         match self.fg() {
             Some(be) => {
                 if let Err(e) = be
@@ -320,29 +323,33 @@ impl DagExecutor {
                 self.persist_task_fine_grained(&updated).await;
             }
         }
-        self.emit_event(cog_core::TaskEvent::TaskFailed {
+        // `TaskRetried`, not `TaskFailed`: the task failed at nothing. The
+        // `retry_count` it carries is deliberately the unchanged one, so a
+        // reader watching these events sees the same number repeat — that is
+        // the reading that no budget was spent, and it is the only place the
+        // distinction is visible after the fact.
+        self.emit_event(cog_core::TaskEvent::TaskRetried {
             task_id: task_id.into(),
-            error,
-            retried: true,
-            cancelled: Vec::new(),
+            retry_count: updated.retry_count,
             timestamp: chrono::Utc::now(),
         });
         Ok(true)
     }
 
-    /// The row a stalled task becomes: one attempt charged, back in `Pending`
-    /// behind the retry matrix's wait.
-    fn stalled_to_pending(
-        task: &Task,
-        error: &str,
-        retry_not_before: chrono::DateTime<chrono::Utc>,
-    ) -> Task {
+    /// The row a stalled task becomes: back in `Pending`, budget untouched,
+    /// free to be published again on the next pass.
+    ///
+    /// No `retry_not_before`: a wait here would be the retry matrix's wait for
+    /// an attempt this task never made, and the re-arm is the repair, not the
+    /// retry. What bounds the republishing is the stall window itself — the
+    /// task leaves `Scheduled`, so the next sweep can only see it after another
+    /// full window has gone by.
+    fn stalled_requeued(task: &Task, error: &str) -> Task {
         let mut next = task.clone();
         next.status = TaskStatus::Pending;
-        next.retry_count += 1;
         next.error = Some(error.to_string());
         next.error_cause = None;
-        next.retry_not_before = Some(retry_not_before);
+        next.retry_not_before = None;
         next.updated_at = chrono::Utc::now();
         next
     }
@@ -3641,7 +3648,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reclaiming_a_stalled_task_charges_one_attempt_and_requeues_it() {
+    async fn reclaiming_a_stalled_task_puts_it_back_in_line_without_charging() {
         let dag = DagExecutor::new("ws-stalled-reclaim".into());
         for id in ["stalled", "fresh"] {
             dag.add_task(Task::new(id, TaskType::LlmCall, serde_json::json!({})))
@@ -3660,34 +3667,35 @@ mod tests {
         let stalled = dag.get_task("stalled").await.unwrap();
         assert_eq!(stalled.status, TaskStatus::Pending);
         assert_eq!(
-            stalled.retry_count, 1,
-            "an attempt that produced nothing is charged like any other"
+            stalled.retry_count, 0,
+            "the task never ran, so no attempt was spent on it"
         );
         assert!(
-            stalled.retry_not_before.is_some(),
-            "it waits behind the retry matrix rather than being republished immediately"
+            stalled.retry_not_before.is_none(),
+            "the re-arm is the repair, not a retry: it goes back out on the next publish pass"
         );
         assert!(stalled
             .error
             .as_deref()
             .unwrap_or_default()
-            .contains("ready message lost"));
+            .contains("never started"));
 
-        // Charged once per stall, not once per sweep: the task is no longer
-        // `Scheduled`, so the next sweep has nothing to reclaim.
+        // One re-arm per stall, not one per sweep: the task is no longer
+        // `Scheduled`, so the next sweep has nothing to pick up.
         assert_eq!(dag.reclaim_stalled_scheduled(600).await, 0);
-        assert_eq!(dag.get_task("stalled").await.unwrap().retry_count, 1);
+        assert_eq!(dag.get_task("stalled").await.unwrap().retry_count, 0);
 
         let fresh = dag.get_task("fresh").await.unwrap();
         assert_eq!(fresh.status, TaskStatus::Scheduled);
         assert_eq!(fresh.retry_count, 0);
     }
 
-    /// 预算花完之后不是重试：走既有的永久失败路径，级联取消下游，进 DLQ。没有
-    /// 这一条，一条每次都被丢消息的任务会被无限重跑——每一轮都真金白银地调用
-    /// 一次上游。
+    /// 一个在 `Scheduled` 上停多久的任务都不会被这条扫描判终态，哪怕它的预算
+    /// 早就用满：停在那个状态说明它**没被跑过**，清扫器读到的只有年纪，而年纪
+    /// 对「消息排在队伍里」与「消息丢了」同值。判不出的代价不能记在任务头上，
+    /// 所以它只被放回队列，下游也不会被级联取消。
     #[tokio::test]
-    async fn a_stalled_task_out_of_budget_fails_for_good() {
+    async fn a_stalled_task_with_a_spent_budget_is_still_not_judged() {
         let dag = DagExecutor::new("ws-stalled-budget".into());
         dag.add_task(Task::new(
             "stalled",
@@ -3696,8 +3704,7 @@ mod tests {
         ))
         .await
         .unwrap();
-        // After the task it points at: the reverse edge is only recorded for a
-        // dependency that is already in the graph.
+        // 指向已经在图里的那一笔：反向边只为已存在的依赖记。
         let mut downstream = Task::new("downstream", TaskType::LlmCall, serde_json::json!({}));
         downstream.blocked_by = vec!["stalled".into()];
         dag.add_task(downstream).await.unwrap();
@@ -3707,28 +3714,27 @@ mod tests {
             let mut inner = dag.inner.write().await;
             let task = inner.tasks.get_mut("stalled").unwrap();
             task.updated_at = chrono::Utc::now() - chrono::Duration::minutes(30);
-            // 预算用满之后再丢消息就没有下一次了。
             task.retry_count = budget;
         }
 
         assert_eq!(dag.reclaim_stalled_scheduled(600).await, 1);
 
         let stalled = dag.get_task("stalled").await.unwrap();
-        assert_eq!(stalled.status, TaskStatus::Failed);
-        assert!(stalled.retry_not_before.is_none());
+        assert_eq!(stalled.status, TaskStatus::Pending);
+        assert_eq!(stalled.retry_count, budget, "still not one attempt charged");
         assert_eq!(
             dag.get_task("downstream").await.unwrap().status,
-            TaskStatus::Cancelled,
-            "a permanently failed upstream can never unblock its dependents"
+            TaskStatus::Pending,
+            "a task that has not failed cannot cancel what waits on it"
         );
     }
 
     /// 扫描在每一个会发布的部署里都跑（就绪队列是共享的，谁都能发），所以
     /// "读到还在 Scheduled 就动手"这中间有一段扫描自己关不上的缝：两个进程可以
-    /// 同时认定同一个任务卡住，各记一次重试——一条丢掉的消信付两遍钱。这里让两个
-    /// 进程先后扫同一份存储，证明记账挂在状态迁移上，只有一个能落。
+    /// 同时认定同一个任务卡住。这里让两个进程先后扫同一份存储，证明动作挂在状态
+    /// 迁移上，只有一个能落，另一个不会把已经在路上的那一笔第二次挪走。
     #[tokio::test]
-    async fn a_shared_store_charges_a_stalled_task_once_for_the_whole_cluster() {
+    async fn a_shared_store_re_arms_a_stalled_task_once_for_the_whole_cluster() {
         let backend: Arc<dyn StateBackend> = Arc::new(cog_storage::MemoryStateBackend::new());
         let pod_a = DagExecutor::new("ws-stalled-fg".into()).with_state_backend(backend.clone());
         let pod_b = DagExecutor::new("ws-stalled-fg".into()).with_state_backend(backend);
@@ -3752,9 +3758,11 @@ mod tests {
         assert_eq!(
             pod_b.reclaim_stalled_scheduled(600).await,
             0,
-            "the second sweep finds the task already claimed and leaves its budget alone"
+            "the second sweep finds the task already requeued and leaves it alone"
         );
-        assert_eq!(pod_b.get_task("t-fg").await.unwrap().retry_count, 1);
+        let after = pod_b.get_task("t-fg").await.unwrap();
+        assert_eq!(after.status, TaskStatus::Pending);
+        assert_eq!(after.retry_count, 0);
     }
 
     /// 产出侧的词表必须在没有任何任务时也落到指标面上。

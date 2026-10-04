@@ -386,7 +386,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
 
                         // Periodic ready-task publisher.
                         //
-                        // It also reclaims tasks stalled in `Scheduled`, whose
+                        // It also re-arms tasks stalled in `Scheduled`, whose
                         // one exit is the ready message the publisher handed to
                         // the transport: when that message is consumed and the
                         // task does not start, the publisher is the only scan
@@ -396,7 +396,9 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                         // nothing the previous sweep missed — one sweep per
                         // window is the whole resolution this reading has, and
                         // it keeps the extra whole-table scan off the publish
-                        // cadence.
+                        // cadence. It is also what bounds the re-arm: a task put
+                        // back in line leaves `Scheduled`, so the next sweep can
+                        // only see it again after another full window.
                         let scheduled_task_stall_secs =
                             ctx.config().dag_executor.scheduled_task_stall_secs;
                         let reclaim_every_ticks = (scheduled_task_stall_secs
@@ -442,7 +444,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                                                     if reclaimed > 0 {
                                                         tracing::warn!(
                                                             reclaimed,
-                                                            "reclaimed tasks stalled in Scheduled: their ready messages were consumed without starting them"
+                                                            "re-armed tasks that reached the end of the stall window without ever starting; no attempt was charged"
                                                         );
                                                     }
                                                 }

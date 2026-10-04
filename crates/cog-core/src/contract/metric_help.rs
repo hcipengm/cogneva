@@ -262,12 +262,14 @@ const COUNTER_HELP: &[(&str, &str)] = &[
     ),
     (
         "cogneva_dag_stalled_scheduled_reclaimed_total",
-        "Tasks found stalled in Scheduled and put back through the failure path, \
-         summed over repairs. A counter rather than a gauge, because the repair \
-         empties the state it repairs: a gauge would read zero both when nothing \
-         was ever stuck and when everything had just been unstuck. Absent until \
-         the first such repair, which is what the transport losing a dispatch \
-         event looks like",
+        "Tasks found stalled in Scheduled and put back in line without charging \
+         an attempt, summed over repairs. A counter rather than a gauge, because \
+         the repair empties the state it repairs: a gauge would read zero both \
+         when nothing was ever stuck and when everything had just been unstuck. \
+         It reads the symptom, not the cause: a task reaching the end of the \
+         window without starting looks the same whether its message was queued \
+         behind a full claim pool or lost, and the repair re-arms either way. \
+         Absent until the first such repair",
     ),
     (
         "cogneva_task_checkpoint_total",
