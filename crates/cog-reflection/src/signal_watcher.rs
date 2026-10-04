@@ -217,8 +217,83 @@ fn cooldown_elapsed(
     }
 }
 
-/// The firing alerts this tick should act on: drop the ones still inside their
-/// cooldown, then stop once `max` are left.
+/// What this round owes the work standing behind a firing alert.
+///
+/// A firing alert is two facts at once, and the round used to answer both with
+/// one predicate. The alert says a condition is true *now*; the work that
+/// condition stands for is a task row, and that row is the only thing that
+/// knows whether the work is done. Reading the report clock first meant a row
+/// could say "the last attempt failed" or "the last attempt ended having
+/// produced nothing" and the round would still do nothing, because the signal
+/// had been announced too recently. On 2026-10-04 that is what happened: six
+/// self-discovery attempts failed at 06:00Z and were not touched again for the
+/// rest of the day, because the clock they were read against had been armed
+/// when the signal was announced, hours earlier.
+///
+/// The clock is about repeats. Work that did not finish is not a repeat.
+#[derive(Debug, PartialEq, Eq)]
+enum AlertWork {
+    /// A task for this signal is running. Nothing to do, and the clock is not
+    /// consulted: an attempt in flight is work in hand, not a spent report.
+    InHand,
+    /// The condition is true and the work did not finish -- the attempt failed,
+    /// or it ended without producing a change at all. Driven this round
+    /// whatever the clock says.
+    Unfinished,
+    /// Nothing has been filed for this signal. A first announcement, and the
+    /// clock for it starts at the last report.
+    NeverFiled,
+    /// The last attempt ended and did produce work. The signal outliving that
+    /// attempt is a repeat, and the clock for a repeat runs from when the
+    /// attempt ended -- not from when the signal was first announced, which may
+    /// be weeks earlier and would hold every repeat behind a window that has
+    /// nothing to do with it.
+    Ended(DateTime<Utc>),
+}
+
+/// What became of the work filed for one alert, read from the row the
+/// submission itself would read.
+///
+/// Through [`intent_action`], so the round's decision and the submission's
+/// cannot disagree: a status this predicate calls finished is one
+/// `submit_intent` will resubmit, and a status it calls in flight is one
+/// `submit_intent` will refuse as a duplicate.
+fn alert_work(existing: Option<&Task>) -> AlertWork {
+    let Some(task) = existing else {
+        return AlertWork::NeverFiled;
+    };
+    match intent_action(Some(&task.status)) {
+        IntentAction::None => AlertWork::InHand,
+        IntentAction::Redrive => AlertWork::Unfinished,
+        IntentAction::Submit => AlertWork::NeverFiled,
+        IntentAction::Resubmit => {
+            if produced_a_change(task) {
+                AlertWork::Ended(task.updated_at)
+            } else {
+                AlertWork::Unfinished
+            }
+        }
+    }
+}
+
+/// Whether a finished attempt left anything behind.
+///
+/// The change ids are what the pipeline records on the task when it produces
+/// artifacts. Their absence on an attempt that reached a terminal state means
+/// the attempt ran and produced nothing to land: the job is unfinished, not
+/// repeated, and re-driving it is the difference between a condition that is
+/// being worked and one that only looks as if it is.
+fn produced_a_change(task: &Task) -> bool {
+    task.result
+        .as_ref()
+        .and_then(|r| r.get("change_ids"))
+        .and_then(|v| v.as_array())
+        .is_some_and(|ids| !ids.is_empty())
+}
+
+/// The firing alerts this tick should act on: the ones whose work is
+/// unfinished first, then the ones whose report clock has elapsed, stopping
+/// once `max` are left.
 ///
 /// The cap bounds the work a single tick creates, so it has to count the alerts
 /// actually selected rather than the first `max` rows the store returned. The
@@ -227,30 +302,70 @@ fn cooldown_elapsed(
 /// firing — which is exactly when a long-standing fault most needs to be seen.
 fn select_alerts<'a>(
     alerts: &'a [cog_core::PersistedAlert],
+    tasks: &[Task],
     state: &SignalGuardState,
     max: usize,
     cooldown_secs: i64,
     now: DateTime<Utc>,
 ) -> SelectedAlerts<'a> {
-    let (in_cooldown, ready): (Vec<_>, Vec<_>) = alerts.iter().partition(|a| {
-        !cooldown_elapsed(state, &format!("alert:{}", a.dedup_key), cooldown_secs, now)
-    });
+    let mut unfinished = Vec::new();
+    let mut announced = Vec::new();
+    let mut in_hand = 0;
+    let mut in_cooldown = 0;
+    for alert in alerts {
+        let row = tasks
+            .iter()
+            .find(|t| t.id == alert_task_id(&alert.dedup_key));
+        match alert_work(row) {
+            AlertWork::InHand => in_hand += 1,
+            AlertWork::Unfinished => unfinished.push(alert),
+            AlertWork::NeverFiled => {
+                if cooldown_elapsed(
+                    state,
+                    &alert_signal_key(&alert.dedup_key),
+                    cooldown_secs,
+                    now,
+                ) {
+                    announced.push(alert);
+                } else {
+                    in_cooldown += 1;
+                }
+            }
+            AlertWork::Ended(ended_at) => {
+                if (now - ended_at).num_seconds() >= cooldown_secs {
+                    announced.push(alert);
+                } else {
+                    in_cooldown += 1;
+                }
+            }
+        }
+    }
+    // Unfinished work goes first: it is the part a cap must never be the reason
+    // to leave undone.
+    let selected: Vec<&cog_core::PersistedAlert> =
+        unfinished.into_iter().chain(announced).take(max).collect();
     SelectedAlerts {
-        selected: ready.into_iter().take(max).collect(),
-        in_cooldown: in_cooldown.len(),
+        selected,
+        in_hand,
+        in_cooldown,
     }
 }
 
-/// The alerts one tick acts on, and how many it left alone because their
-/// cooldown had not elapsed.
+/// The alerts one tick acts on, and what it left alone.
 ///
-/// The two are returned together rather than counted apart: "an alert was in
-/// cooldown" and "an alert was found and submitted" are answers to the same
-/// question about the same input, and a second pass over the same list to
-/// recover the first would be a second copy of the predicate that has to stay
-/// in step with this one.
+/// These are returned together rather than counted apart: "an alert was in
+/// cooldown", "an alert was already in hand" and "an alert was found and
+/// submitted" are answers to the same question about the same input, and a
+/// second pass over the same list to recover any of them would be a second copy
+/// of the predicate that has to stay in step with this one. They stay separate
+/// counts because "the clock held this signal back" and "this signal is already
+/// being worked on" are not the same state, and a reader shown one number could
+/// not tell which of them a quiet round was.
 struct SelectedAlerts<'a> {
     selected: Vec<&'a cog_core::PersistedAlert>,
+    /// Alerts whose task is running: nothing to drive.
+    in_hand: usize,
+    /// Alerts held back because this would have been a repeat report.
     in_cooldown: usize,
 }
 
@@ -322,6 +437,25 @@ fn error_signature(error: &str) -> String {
 fn short_hash(text: &str) -> String {
     let digest = Sha256::digest(text.as_bytes());
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The report-cooldown key an alert's signal is filed under.
+fn alert_signal_key(dedup_key: &str) -> String {
+    format!("alert:{dedup_key}")
+}
+
+/// The task an alert's work is filed under.
+///
+/// Derived from the alert's identity rather than minted per submission, so the
+/// row survives across rounds and can be read back. That read is what lets a
+/// round ask whether the work behind a firing alert is done, which it cannot do
+/// for a row it cannot name -- and the name is written here alone so the reader
+/// and the writer cannot come to disagree about which row an alert owns.
+fn alert_task_id(dedup_key: &str) -> String {
+    format!(
+        "self-signal-alert-{}",
+        short_hash(&alert_signal_key(dedup_key))
+    )
 }
 
 /// What this tick should do about a signal, given whether a task for it is
@@ -662,9 +796,11 @@ async fn tick(
             if let Some(alerts) = source.list_active_alerts(100).await {
                 let SelectedAlerts {
                     selected,
+                    in_hand,
                     in_cooldown,
                 } = select_alerts(
                     &alerts,
+                    &tasks,
                     &state,
                     config.alert_channel_max_per_tick,
                     config.report_cooldown_secs,
@@ -676,14 +812,20 @@ async fn tick(
                 for _ in 0..in_cooldown {
                     readings.record(SignalOutcome::Cooldown);
                 }
+                // Same for the ones already in hand. Their submission is not
+                // made, so the counting `submit_intent` does cannot happen on
+                // this path -- and an alert the round found and chose not to
+                // touch is not an alert the round did not find.
+                for _ in 0..in_hand {
+                    readings.record(SignalOutcome::Tracked);
+                }
                 for alert in selected {
-                    let key = format!("alert:{}", alert.dedup_key);
+                    let key = alert_signal_key(&alert.dedup_key);
                     dirty = true;
-                    let hash = short_hash(&key);
                     let (goal, detail) = alert_intent(alert, config.alert_label_max_chars);
                     let outcome = submit_intent(
                         orch,
-                        format!("self-signal-alert-{hash}"),
+                        alert_task_id(&alert.dedup_key),
                         "self_signal",
                         goal,
                         detail,
@@ -1113,7 +1255,7 @@ mod tests {
         state.reported.insert("alert:new1".into(), now);
         state.reported.insert("alert:new2".into(), now);
 
-        let picked = select_alerts(&alerts, &state, 1, 86400, now);
+        let picked = select_alerts(&alerts, &[], &state, 1, 86400, now);
         assert_eq!(picked.selected.len(), 1);
         assert_eq!(
             picked.selected[0].dedup_key, "old",
@@ -1123,13 +1265,14 @@ mod tests {
         // one: they are firing alerts the watcher deliberately did not act on,
         // which is a different state from finding no alert at all.
         assert_eq!(picked.in_cooldown, 2);
+        assert_eq!(picked.in_hand, 0);
     }
 
     #[test]
     fn the_cap_still_bounds_how_many_alerts_one_tick_acts_on() {
         let now = Utc::now();
         let alerts = vec![firing("a"), firing("b"), firing("c")];
-        let picked = select_alerts(&alerts, &SignalGuardState::default(), 2, 86400, now);
+        let picked = select_alerts(&alerts, &[], &SignalGuardState::default(), 2, 86400, now);
         assert_eq!(
             picked
                 .selected
@@ -1141,6 +1284,160 @@ mod tests {
         // The cap and the cooldown are different reasons an alert is not acted
         // on, and a truncated alert is not in cooldown: it comes back next tick.
         assert_eq!(picked.in_cooldown, 0);
+    }
+
+    /// A task row for an alert, in the state a test needs to put it in.
+    fn alert_row(dedup_key: &str, status: TaskStatus, result: Option<serde_json::Value>) -> Task {
+        let mut task = Task::new(
+            alert_task_id(dedup_key),
+            TaskType::Custom("self_signal".into()),
+            serde_json::json!({}),
+        );
+        task.status = status;
+        task.result = result;
+        task
+    }
+
+    /// The defect this whole disposition exists for: the attempt failed while
+    /// the alert is still firing, and a clock armed at the announcement is not
+    /// a reason to leave it failed. Six attempts failed at 06:00Z on 2026-10-04
+    /// and the round did not touch them again for the rest of the day.
+    #[test]
+    fn a_failed_attempt_is_driven_even_inside_the_report_cooldown() {
+        let now = Utc::now();
+        let alerts = vec![firing("k")];
+        let tasks = vec![alert_row("k", TaskStatus::Failed, None)];
+        let mut state = SignalGuardState::default();
+        // Announced one second ago: every clock a repeat report is held by is
+        // wide open against this round.
+        state.reported.insert("alert:k".into(), now);
+
+        let picked = select_alerts(&alerts, &tasks, &state, 5, 86400, now);
+        assert_eq!(
+            picked
+                .selected
+                .iter()
+                .map(|a| a.dedup_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["k"],
+            "一次失败的尝试不是一次重复的报告，冷却挡不住它"
+        );
+        assert_eq!(picked.in_cooldown, 0, "它没有在冷却里被拦下");
+        assert_eq!(picked.in_hand, 0, "它也不在手上");
+    }
+
+    /// An attempt that ran to a terminal state and produced nothing to land is
+    /// unfinished work too: the condition is true, and nothing was done about
+    /// it. Read from the change ids the pipeline records on the task, because
+    /// that is the only evidence on the row that anything was produced.
+    #[test]
+    fn an_attempt_that_ended_empty_is_driven_even_inside_the_report_cooldown() {
+        let now = Utc::now();
+        let alerts = vec![firing("k")];
+        let empty = Some(serde_json::json!({"change_ids": []}));
+        let tasks = vec![alert_row("k", TaskStatus::Completed, empty)];
+        let mut state = SignalGuardState::default();
+        state.reported.insert("alert:k".into(), now);
+
+        let picked = select_alerts(&alerts, &tasks, &state, 5, 86400, now);
+        assert_eq!(
+            picked.selected.len(),
+            1,
+            "跑完了但什么都没产出的尝试不算做完"
+        );
+        assert_eq!(picked.in_cooldown, 0);
+    }
+
+    /// An attempt that is still running is work in hand: the round found the
+    /// signal, found it already being worked, and drove nothing. That is a
+    /// third state, and it is neither "in cooldown" nor "found nothing".
+    #[test]
+    fn an_attempt_in_flight_is_work_in_hand_not_a_spent_report() {
+        let now = Utc::now();
+        let alerts = vec![firing("k")];
+        let tasks = vec![alert_row("k", TaskStatus::Running, None)];
+        let mut state = SignalGuardState::default();
+        state.reported.insert("alert:k".into(), now);
+
+        let picked = select_alerts(&alerts, &tasks, &state, 5, 86400, now);
+        assert!(picked.selected.is_empty(), "在跑的尝试不该被再投一次");
+        assert_eq!(picked.in_hand, 1);
+        assert_eq!(
+            picked.in_cooldown, 0,
+            "「已经在手上」和「被冷却挡住」是两种状态，不能合成一个读数"
+        );
+    }
+
+    /// A repeat announcement is still a repeat. An attempt that ended with a
+    /// change behind it leaves nothing for this round to redo, so the signal
+    /// outliving it waits -- and the clock runs from when the attempt ended,
+    /// not from when the signal was first announced.
+    #[test]
+    fn the_repeat_clock_runs_from_when_the_attempt_ended() {
+        let now = Utc::now();
+        let alerts = vec![firing("k")];
+        let produced = Some(serde_json::json!({"change_ids": ["c1"]}));
+        let mut task = alert_row("k", TaskStatus::Completed, produced);
+        // The announcement is two days old, so a clock armed at it has long
+        // elapsed and would resubmit this every tick; the attempt itself ended
+        // a minute ago. The verdict has to follow the attempt.
+        task.updated_at = now - chrono::Duration::seconds(60);
+        let mut state = SignalGuardState::default();
+        state.reported.insert(
+            "alert:k".into(),
+            now - chrono::Duration::seconds(2 * 86_400),
+        );
+
+        let picked = select_alerts(&alerts, &[task], &state, 5, 86400, now);
+        assert!(
+            picked.selected.is_empty(),
+            "刚落地一笔产出的信号不是在重复报告，不该立刻再开一轮"
+        );
+        assert_eq!(picked.in_cooldown, 1);
+    }
+
+    /// And the same alert once the attempt's own clock has elapsed is driven
+    /// again -- the repeat is permitted by when the work ended, which is the
+    /// fact the clock is actually about.
+    #[test]
+    fn the_repeat_is_driven_once_the_attempt_s_own_clock_has_elapsed() {
+        let now = Utc::now();
+        let alerts = vec![firing("k")];
+        let produced = Some(serde_json::json!({"change_ids": ["c1"]}));
+        let mut task = alert_row("k", TaskStatus::Completed, produced);
+        task.updated_at = now - chrono::Duration::seconds(86_401);
+
+        let picked = select_alerts(
+            &alerts,
+            &[task],
+            &SignalGuardState::default(),
+            5,
+            86400,
+            now,
+        );
+        assert_eq!(picked.selected.len(), 1);
+        assert_eq!(picked.in_cooldown, 0);
+    }
+
+    /// Unfinished work is taken before announcements, so the per-tick cap can
+    /// never be the reason a failed attempt stays failed while a fresh
+    /// announcement of something else spends the round's budget.
+    #[test]
+    fn the_cap_spends_the_round_on_unfinished_work_before_announcements() {
+        let now = Utc::now();
+        let alerts = vec![firing("announced"), firing("broken")];
+        let tasks = vec![alert_row("broken", TaskStatus::Failed, None)];
+
+        let picked = select_alerts(&alerts, &tasks, &SignalGuardState::default(), 1, 86400, now);
+        assert_eq!(
+            picked
+                .selected
+                .iter()
+                .map(|a| a.dedup_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["broken"],
+            "上限花在没做完的活上，不是花在先冒出来的那一条上"
+        );
     }
 
     #[test]
