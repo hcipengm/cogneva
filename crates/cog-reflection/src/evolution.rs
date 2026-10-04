@@ -786,6 +786,11 @@ impl EvolutionEngine {
                 return Ok(Some(result));
             };
 
+            // The generator writes the diff as text, so its `@@` counts and its
+            // final terminator are model output rather than facts derived from
+            // a tree. Repair them here, before anything judges the change.
+            let diff = repair_generated_diff(&diff);
+
             match self.validate_change(&diff).await {
                 (true, _) => {
                     let change_id = format!(
@@ -826,8 +831,12 @@ impl EvolutionEngine {
                     return Ok(Some(result));
                 }
                 (false, output) => {
+                    // The reason is logged as well as fed back to the next
+                    // prompt: a round that only says "retrying" leaves which
+                    // attempt went red and why readable nowhere but the next
+                    // request, which nobody keeps.
+                    warn!(attempt, reason = %output, "Change failed validation, retrying");
                     validation_errors = output;
-                    warn!(attempt, "Change failed validation, retrying");
                 }
             }
         }
@@ -920,11 +929,16 @@ impl EvolutionEngine {
     ///
     /// 1. The diff must reference at least one file and must not touch any
     ///    protected path (see [`Self::validate_change_paths`]).
-    /// 2. When a `project_root` git repository is configured, the change must
+    /// 2. The diff must be a body `git apply` can parse (see
+    ///    [`cog_core::diff_structural_defect`]) — a fact about the bytes, so it
+    ///    is settled whether or not there is a tree to apply against.
+    /// 3. When a `project_root` git working tree is configured, the change must
     ///    apply cleanly (`git apply --check`).
     ///
     /// Returns `(success, details)`; `details` feeds the retry loop on
-    /// failure. When `git` is unavailable the structural checks alone decide.
+    /// failure, and names what did *not* run when a step was skipped. Those
+    /// skips are the one place a rejection cannot come from: an environment
+    /// that cannot check must not be reported as the change being bad.
     async fn validate_change(&self, diff: &str) -> (bool, String) {
         // Judge every file the diff names, deletions included: deleting a
         // protected file is the same offence as rewriting it.
@@ -937,31 +951,52 @@ impl EvolutionEngine {
             return (false, e.to_string());
         }
 
+        // Whether `git apply` can parse the diff at all is a fact about the
+        // bytes, not about any tree. It is therefore settled here, before and
+        // independently of the question whether a tree to apply it to exists.
+        // Leaving it to the branches below is what turned a missing terminator
+        // into a change that "passed validation" and was retired by the
+        // pipeline a second later as a corrupt patch.
+        if let Some(defect) = cog_core::diff_structural_defect(diff) {
+            return (
+                false,
+                format!("Change is not an appliable unified diff: {defect}"),
+            );
+        }
+
         let Some(root) = self.project_root.as_ref() else {
+            // No tree to check against. The diff is structurally sound, and
+            // this says exactly that instead of claiming a check that never ran.
             return (
                 true,
-                "structural validation passed (no project root)".into(),
+                "diff structure valid; no project root, so no apply check ran".into(),
             );
         };
-        if !root.join(".git").is_dir() {
-            return (true, "structural validation passed (not a git repo)".into());
+        if !is_git_worktree(root) {
+            return (
+                true,
+                format!(
+                    "diff structure valid; {} is not a git worktree, so no apply check ran",
+                    root.display()
+                ),
+            );
         }
 
         let tmp = match tempfile::NamedTempFile::new() {
             Ok(t) => t,
             Err(e) => {
-                warn!(error = %e, "temp file unavailable; structural validation only");
+                warn!(error = %e, "temp file unavailable; apply check skipped");
                 return (
                     true,
-                    format!("structural validation passed (temp file: {})", e),
+                    format!("diff structure valid; apply check skipped (temp file: {e})"),
                 );
             }
         };
         if let Err(e) = std::fs::write(tmp.path(), diff) {
-            warn!(error = %e, "temp write failed; structural validation only");
+            warn!(error = %e, "temp write failed; apply check skipped");
             return (
                 true,
-                format!("structural validation passed (temp write: {})", e),
+                format!("diff structure valid; apply check skipped (temp write: {e})"),
             );
         }
 
@@ -983,8 +1018,11 @@ impl EvolutionEngine {
                 (ok, combined)
             }
             Err(e) => {
-                warn!(error = %e, "git apply --check unavailable; structural validation only");
-                (true, format!("structural validation passed (git: {})", e))
+                warn!(error = %e, "git apply --check unavailable; apply check skipped");
+                (
+                    true,
+                    format!("diff structure valid; apply check skipped (git: {e})"),
+                )
             }
         }
     }
@@ -1128,9 +1166,14 @@ impl EvolutionEngine {
     ) -> cog_core::SFResult<String> {
         let artifact_id = self.sanitize_artifact_id(&change.change_id);
 
+        // This sink writes the bytes that reach the pipeline verbatim, so it is
+        // the last place a structural defect can be derived back from the body
+        // rather than handed to the apply gate.
+        let content = repair_generated_diff(&change.content);
+
         // Derive affected files from the change content if not supplied.
         let affected_files: Vec<std::path::PathBuf> = if change.affected_files.is_empty() {
-            cog_core::parse_diff_affected_files(&change.content)?
+            cog_core::parse_diff_affected_files(&content)?
                 .into_iter()
                 .map(std::path::PathBuf::from)
                 .collect()
@@ -1155,15 +1198,13 @@ impl EvolutionEngine {
             })?;
         }
 
-        tokio::fs::write(&filename, &change.content)
-            .await
-            .map_err(|e| {
-                cog_core::SFError::IO(format!(
-                    "Failed to write change {}: {}",
-                    filename.display(),
-                    e
-                ))
-            })?;
+        tokio::fs::write(&filename, &content).await.map_err(|e| {
+            cog_core::SFError::IO(format!(
+                "Failed to write change {}: {}",
+                filename.display(),
+                e
+            ))
+        })?;
 
         info!(
             artifact_id = %artifact_id,
@@ -1175,7 +1216,7 @@ impl EvolutionEngine {
             kind: EvolutionKind::CodeChange,
             artifact_id: artifact_id.clone(),
             description: change.goal.clone(),
-            content: change.content.clone(),
+            content: content.clone(),
             status: EvolutionStatus::CompileChecked,
             created_at: Utc::now(),
             eval_summary: None,
@@ -1193,6 +1234,41 @@ impl EvolutionEngine {
 impl cog_core::ChangeSink for EvolutionEngine {
     async fn submit_change(&self, change: cog_core::GeneratedChange) -> cog_core::SFResult<String> {
         self.write_generated_change(&change).await
+    }
+}
+
+/// Whether `root` is a git working tree this engine can validate against.
+///
+/// A checkout that owns its repository has a `.git` directory, but every tree
+/// this engine is handed is a linked worktree of the shared bare repository,
+/// and there `.git` is a *file* naming the real git directory. Asking for a
+/// directory therefore answers "not a repository" for every tree the engine
+/// actually has, so the apply check below is skipped on all of them and the
+/// change is accepted unvalidated — to be retired moments later by the
+/// pipeline, whose own pre-check does run.
+fn is_git_worktree(root: &std::path::Path) -> bool {
+    root.join(".git").exists()
+}
+
+/// Repair a generated diff's own structure, leaving what it says untouched.
+///
+/// The `@@` line counts and the final terminator depend on nothing but the
+/// body beneath them, so a generator that writes a correct body and miscounts
+/// its header — or closes the last line without a terminator, which `git apply`
+/// rejects as "corrupt patch at line N" — can have both derived for no tokens.
+/// Re-prompting instead tends to reproduce them, because the gate can name a
+/// line number but not the mistake. A diff that is already sound comes back
+/// byte for byte, so this can never turn a working patch into a broken one.
+fn repair_generated_diff(diff: &str) -> String {
+    match cog_core::normalize_diff_hunk_headers(diff) {
+        Some(repaired) => {
+            info!(
+                defect = ?cog_core::diff_structural_defect(diff),
+                "repaired diff structure from the body before validation"
+            );
+            repaired
+        }
+        None => diff.to_string(),
     }
 }
 
@@ -1285,6 +1361,79 @@ mod tests {
         let text = "diff --git a/x.rs b/x.rs\n@@ -1 +1,2 @@\n a\n+b\n";
         let diff = EvolutionEngine::extract_unified_diff(text).expect("git accepts this shape");
         assert!(diff.starts_with("diff --git a/x.rs b/x.rs"));
+    }
+
+    #[test]
+    fn a_linked_worktree_is_a_git_worktree_even_though_dot_git_is_a_file() {
+        // Every tree this engine validates against is a linked worktree of the
+        // shared bare repository, where `.git` is a file naming the real git
+        // directory. A predicate that asks for a directory answers "not a
+        // repository" for all of them and skips the apply check entirely.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".git"), "gitdir: /elsewhere/repo/.git\n").unwrap();
+        assert!(is_git_worktree(tmp.path()));
+    }
+
+    #[test]
+    fn a_directory_without_a_repository_is_not_a_git_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!is_git_worktree(tmp.path()));
+    }
+
+    #[test]
+    fn a_diff_the_generator_left_unterminated_is_repaired_before_the_gate() {
+        // The shape a live run handed to the apply gate, which rejected it as
+        // "corrupt patch at line 9": the body is right, the last line has no
+        // terminator. It comes out of the extractor that way because joining
+        // lines back together cannot restore a byte `lines()` dropped.
+        let text = "diff --git a/crates/bootstrap/src/main.rs b/crates/bootstrap/src/main.rs\n\
+                    --- a/crates/bootstrap/src/main.rs\n\
+                    +++ b/crates/bootstrap/src/main.rs\n\
+                    @@ -411,1 +411,1 @@\n\
+                    -        .map_or(false, |status| status.success());\n\
+                    +        .is_ok_and(|status| status.success());\n";
+        let extracted = EvolutionEngine::extract_unified_diff(text).expect("a diff");
+        assert!(
+            cog_core::diff_structural_defect(&extracted).is_some(),
+            "the extractor now terminates the last line, so this no longer says \
+             anything about the repair"
+        );
+
+        let repaired = repair_generated_diff(&extracted);
+        assert_eq!(cog_core::diff_structural_defect(&repaired), None);
+        assert!(repaired.ends_with('\n'));
+        // The repair derives the terminator and changes nothing the diff says.
+        assert!(repaired.contains("+        .is_ok_and(|status| status.success());"));
+        assert!(repaired.contains("-        .map_or(false, |status| status.success());"));
+    }
+
+    #[test]
+    fn a_hunk_header_that_disagrees_with_its_body_is_repaired_from_the_body() {
+        // Two lines in the body, one declared. `git apply` names this as
+        // "corrupt patch" too, and the counts are pure arithmetic over a body
+        // the model already paid for.
+        let diff = "diff --git a/x.rs b/x.rs\n\
+                    --- a/x.rs\n\
+                    +++ b/x.rs\n\
+                    @@ -1,1 +1,1 @@\n\
+                    -a\n\
+                    -b\n\
+                    +c\n\
+                    +d\n";
+        assert!(cog_core::diff_structural_defect(diff).is_some());
+        let repaired = repair_generated_diff(diff);
+        assert_eq!(cog_core::diff_structural_defect(&repaired), None);
+    }
+
+    #[test]
+    fn a_sound_diff_comes_back_byte_for_byte() {
+        let diff = "diff --git a/x.rs b/x.rs\n\
+                    --- a/x.rs\n\
+                    +++ b/x.rs\n\
+                    @@ -1,1 +1,1 @@\n\
+                    -a\n\
+                    +b\n";
+        assert_eq!(repair_generated_diff(diff), diff);
     }
 }
 
