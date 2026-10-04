@@ -1096,6 +1096,37 @@ impl DagExecutor {
             },
         )
         .await?;
+        // 环境付账的失败不进任务的预算账：回队列等上游回来，`retry_count`
+        // 原样不动。与内存路径同一判据、同一个回投动作（界的说明见
+        // [`Self::the_environment_pays`]）。
+        if Self::the_environment_pays(&error, cause, retry_after_secs) {
+            let requeued = self
+                .requeue_without_charge_store(
+                    task_id,
+                    &error,
+                    cause,
+                    retry_after_secs,
+                    // 能落上的是"还欠一轮"的那几种状态：报告通常在 Running
+                    // 到达，也可能晚于一次回收（那时行已经是 Pending），或者
+                    // 晚于重新发布（Scheduled）。终态不在集合里——判死的和跑完
+                    // 的不接受一次回投，那等于把它们复活。
+                    &[
+                        TaskStatus::Pending,
+                        TaskStatus::Scheduled,
+                        TaskStatus::Running,
+                    ],
+                )
+                .await?;
+            if !requeued {
+                tracing::warn!(
+                    task_id = %task_id,
+                    "an upstream refusal arrived for a task that had already moved on; \
+                     leaving it to whoever moved it"
+                );
+            }
+            return Ok((requeued, Vec::new(), false));
+        }
+
         // 与内存路径同一个判据：不能靠重跑清除的失败不给重试预算。
         let max_retries = if Self::is_retryable_failure(&error, cause) {
             self.retry_matrix.max_retries(&task.task_type)
@@ -1185,7 +1216,16 @@ impl DagExecutor {
             // 该不该记账由类型说了算（见 `ReclaimCause::charges_retry_budget`）：
             // 不记账的回收不走通用的失败处理，那条路只剩预算一个判据。
             if !cause.charges_retry_budget() {
-                match self.requeue_reclaimed_store(&t.id, &cause.error()).await {
+                match self
+                    .requeue_without_charge_store(
+                        &t.id,
+                        &cause.error(),
+                        None,
+                        None,
+                        &[TaskStatus::Running],
+                    )
+                    .await
+                {
                     Ok(true) => results.push((t.id.clone(), true, Vec::new(), false)),
                     Ok(false) => {}
                     Err(e) => tracing::warn!(
@@ -1217,25 +1257,32 @@ impl DagExecutor {
         results
     }
 
-    /// The row a reclaimed task becomes when the cause is the environment's and
-    /// not the task's: back in `Pending`, the departed owner's claim cleared,
-    /// and `retry_count` carried over untouched.
+    /// The row a task becomes when the cause of the failure is the
+    /// environment's and not the task's: back in `Pending`, any departed
+    /// owner's claim cleared, and `retry_count` carried over untouched.
     ///
     /// Deliberately the same shape as [`Self::stalled_requeued`], because it
     /// rests on the same rule: a charge has to be justified by what the task
-    /// did, and "the process holding it was replaced" is not the task's doing.
+    /// did, and neither "the process holding it was replaced" nor "the upstream
+    /// said come back in N" is the task's doing.
     ///
     /// It differs from the stall re-arm in one respect — it keeps a
-    /// `retry_not_before`. A reclaimed task had a turn and was interrupted
-    /// mid-run, so pacing the next dispatch is pacing the work itself; a
-    /// stalled one never started, so any wait would be the matrix's wait for an
-    /// attempt it never made.
-    fn reclaimed_requeued(task: &Task, error: &str, delay: std::time::Duration) -> Task {
+    /// `retry_not_before`. A task requeued this way had a turn that was cut
+    /// short (mid-run, or on a refusal the upstream itself timed), so pacing
+    /// the next dispatch is pacing the work itself; a stalled one never
+    /// started, so any wait would be the matrix's wait for an attempt it never
+    /// made.
+    fn requeued_without_charge(
+        task: &Task,
+        error: &str,
+        cause: Option<UpstreamFailure>,
+        delay: std::time::Duration,
+    ) -> Task {
         let now = chrono::Utc::now();
         let mut next = task.clone();
         next.status = TaskStatus::Pending;
         next.error = Some(error.to_string());
-        next.error_cause = None;
+        next.error_cause = cause;
         next.retry_not_before = Some(
             now + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::zero()),
         );
@@ -1244,32 +1291,44 @@ impl DagExecutor {
         next
     }
 
-    /// 把一条被回收的任务放回队列，**不记重试**。
+    /// 把一条任务放回队列，**不记重试**。
     ///
-    /// 写的条件是 `Running`：这条路上有第二个写者（被执行器完成、被别的副本的
+    /// 写的条件是 `expected`：这条路上有第二个写者（被执行器完成、被别的副本的
     /// 回收循环接手），条件不成立就是任务已经走了，不是失败——与清扫器同一条
     /// 理由，所以也只是放弃这一轮，不报错。
     ///
+    /// 等待取上游明说的时长与策略退避的较大者：`retry_after_secs` 为 `None`
+    /// 时就是策略退避（回收路径），为 `Some` 时是上游自己的测量。
+    ///
     /// 返回 `false` 表示条件没落上；`true` 表示任务已经回到 `Pending`。
-    async fn requeue_reclaimed_store(&self, task_id: &str, error: &str) -> SFResult<bool> {
+    async fn requeue_without_charge_store(
+        &self,
+        task_id: &str,
+        error: &str,
+        cause: Option<UpstreamFailure>,
+        retry_after_secs: Option<u64>,
+        expected: &[TaskStatus],
+    ) -> SFResult<bool> {
         let be = self.fg().expect("store mode");
         let Some(cur) = be.dag_get_task(&self.workspace_id, task_id).await? else {
             return Ok(false);
         };
-        if cur.status != TaskStatus::Running {
+        if !expected.contains(&cur.status) {
             return Ok(false);
         }
-        let delay = self.retry_matrix.delay(&cur.task_type, cur.retry_count);
-        let next = Self::reclaimed_requeued(&cur, error, delay);
+        let delay =
+            self.retry_matrix
+                .delay_with_hint(&cur.task_type, cur.retry_count, retry_after_secs);
+        let next = Self::requeued_without_charge(&cur, error, cause, delay);
         if let Err(e) = be
-            .dag_transition_task(&self.workspace_id, task_id, &[TaskStatus::Running], &next)
+            .dag_transition_task(&self.workspace_id, task_id, expected, &next)
             .await
         {
-            // 只有「写没落上、行还停在 Running」才是存储拒绝了刚接受的工作；
+            // 只有「写没落上、行还停在原状态」才是存储拒绝了刚接受的工作；
             // 否则就是任务已经走到别处去了。
             if matches!(
                 self.get_task(task_id).await,
-                Some(c) if c.status == TaskStatus::Running
+                Some(c) if expected.contains(&c.status)
             ) {
                 return Err(e);
             }
@@ -1800,6 +1859,32 @@ impl DagExecutor {
             && !cog_core::contract::outcome::is_deterministic_failure(error)
     }
 
+    /// 这笔账谁付：任务，还是它撞上的环境。
+    ///
+    /// [`Self::is_retryable_failure`] 答的是"预算适不适用"，这条答的是同族的
+    /// 另一半——"这笔账记在谁头上"。两条读同一组输入（类型通道 + 带内标记），
+    /// 所以这不是第二条判定链，是同一个判决点上的第二个问题。
+    ///
+    /// 判据是**上游给出了一次测量**：它说了什么时候值得再来。"282 秒后重试"
+    /// 是上游对自己复位时刻的测量，任务只是恰好在那一刻问了，判它一份预算等于
+    /// 让问的人替答的人付账。没有这句话的失败（一次 5xx、一次传输抖动）不是
+    /// 窗口，是一次抖动，仍然记在任务的预算上；`is_terminal` 的环境因（配额
+    /// 耗尽、凭证被拒）同样判死——环境不是一律不记账。
+    ///
+    /// 界就长在这个判据里，不在别处另定：回投的等待取"上游明说的时长"与策略
+    /// 退避的较大者（[`RetryMatrix::delay_with_hint`]），所以每一次回投之前都
+    /// 必须先有上游的一次新测量。没有测量就不回投，也没有哪个数字是这里发明的。
+    fn the_environment_pays(
+        error: &str,
+        cause: Option<UpstreamFailure>,
+        retry_after_secs: Option<u64>,
+    ) -> bool {
+        let stated_a_wait = retry_after_secs
+            .or_else(|| cog_core::contract::llm::retry_after_hint_in(error))
+            .is_some();
+        stated_a_wait && Self::is_retryable_failure(error, cause)
+    }
+
     /// Fail a task with the given error.
     /// Returns `(retried, cancelled, dlq_pushed)` where:
     /// - `retried` = `true` if the task was sent back to Pending for retry
@@ -1858,6 +1943,44 @@ impl DagExecutor {
                 error: error.clone(),
                 timestamp: chrono::Utc::now(),
             });
+
+        // 环境付账的失败不进任务的预算账：回队列等上游回来，`retry_count`
+        // 原样不动。等待就是上游自己报的那个时长（界的说明见
+        // [`Self::the_environment_pays`]）——没有那条测量就走不到这里。
+        if Self::the_environment_pays(&error, cause, retry_after_secs) {
+            let delay =
+                self.retry_matrix
+                    .delay_with_hint(&task_type, retry_count, retry_after_secs);
+            let now = chrono::Utc::now();
+            let task = inner.tasks.get_mut(task_id).expect("task exists");
+            task.status = TaskStatus::Pending;
+            task.error = Some(error.clone());
+            task.error_cause = cause;
+            task.retry_not_before = Some(
+                now + chrono::Duration::from_std(delay)
+                    .unwrap_or_else(|_| chrono::Duration::zero()),
+            );
+            task.clear_run();
+            task.updated_at = now;
+
+            drop(inner);
+            // 与清扫器同一处读数：`TaskRetried` 带的是**没变过**的 `retry_count`，
+            // 重复出现的同一个数就是"这一轮没动它的预算"。
+            self.emit_event(cog_core::TaskEvent::TaskRetried {
+                task_id: task_id.into(),
+                retry_count,
+                timestamp: chrono::Utc::now(),
+            });
+            let task_snapshot = {
+                let inner = self.inner.read().await;
+                inner.tasks.get(task_id).cloned()
+            };
+            if let Some(ref t) = task_snapshot {
+                self.persist_task_fine_grained(t).await;
+            }
+            self.force_checkpoint().await;
+            return Ok((true, Vec::new(), false));
+        }
 
         // 确定性失败不受重试预算约束：同样的输入在同一环境里再来一次必然同样
         // 失败，多付的只是那一轮烧掉的 token 和上游调用。预算清零比"重试三次
@@ -2213,7 +2336,7 @@ impl DagExecutor {
                 let delay = self
                     .retry_matrix
                     .delay(&current.task_type, current.retry_count);
-                *current = Self::reclaimed_requeued(current, &cause.error(), delay);
+                *current = Self::requeued_without_charge(current, &cause.error(), None, delay);
                 let snapshot = current.clone();
                 drop(inner);
                 self.persist_task_fine_grained(&snapshot).await;
@@ -3432,6 +3555,131 @@ mod tests {
         assert!(
             due > chrono::Utc::now() + chrono::Duration::seconds(240),
             "落库路径把明说的时长丢了: {due}"
+        );
+    }
+
+    /// 上游停供是环境，不是任务做的：网关 503 每次自报"282 秒后重试"，被拒多少次
+    /// 都不该花掉任务自己的预算。跨小时的窗口里，DagNode 的 3 格预算在第 15 分钟
+    /// 就烧完了，而任务从头到尾没做错任何事。
+    ///
+    /// 钉的是"被拒 N 次之后任务仍然可跑"，不是"重试次数变多了"：只钉次数的话，
+    /// 一个把 retry_count 一路加到 max、再回 Pending 的实现照样能过——那正是要修
+    /// 的那一个。
+    ///
+    /// 同一条测试里钉住反面：终态的环境因（这里是没有复位窗口的鉴权拒绝，它甚至
+    /// 也带了一个等待时长）照旧判死。判据一旦放宽成"环境一律不记账"，这条就翻车。
+    #[tokio::test]
+    async fn an_upstream_outage_never_spends_the_tasks_budget() {
+        let dag = DagExecutor::new("ws-outage".into());
+        let task = Task::new("t-outage", TaskType::DagNode, serde_json::json!({}));
+        let task_id = task.id.clone();
+        dag.add_task(task).await.unwrap();
+        dag.schedule_task(&task_id).await.unwrap();
+        dag.start_task(&task_id).await.unwrap();
+
+        // 与线上那一笔同形：网关 503 把自己的原始 body 原样带出去，等待时长在
+        // 角色把错误写进自己 content 那一跳就只剩文本（类型当场丢了）。
+        let refusal = format!(
+            "terminal_env_failure: environment_error: LLM upstream refused (server_error): \
+             LLM stream error: API error (HTTP 503): \
+             {{\"error\":\"所有 LLM 上游当前不可用\",\"quota_window_secs\":18000,\
+             \"retry_after_seconds\":282}}{}",
+            cog_core::contract::llm::render_retry_after(282)
+        );
+
+        // 停供横跨数小时，每次被拒都自报 282 秒；次数取得远多于预算的 3 格。
+        const REFUSALS: u32 = 40;
+        for i in 0..REFUSALS {
+            let (retried, cancelled, _) = dag
+                .fail_task_after(&task_id, refusal.clone(), None, Some(282))
+                .await
+                .unwrap();
+            assert!(retried, "第 {i} 次被拒后任务必须还在队列里");
+            assert!(cancelled.is_empty(), "环境停供不该级联取消下游");
+            let view = dag.get_task(&task_id).await.unwrap();
+            assert_eq!(view.status, TaskStatus::Pending, "第 {i} 次被拒后");
+            assert_eq!(
+                view.retry_count, 0,
+                "被拒 {i} 次，一格预算都不该记在任务头上"
+            );
+            let due = view.retry_not_before.expect("回投要等上游说的那个时长");
+            assert!(
+                due > chrono::Utc::now() + chrono::Duration::seconds(240),
+                "第 {i} 次回投等的是上游报的 282 秒，不是策略的 5 秒"
+            );
+        }
+
+        // 上游回来，任务照常落地。等待是上游定的，测试里直接按"窗口走完"派发。
+        dag.schedule_task(&task_id).await.unwrap();
+        dag.start_task(&task_id).await.unwrap();
+        dag.complete_task(&task_id, serde_json::json!({"ok": true}))
+            .await
+            .unwrap();
+        assert_eq!(
+            dag.get_task(&task_id).await.unwrap().status,
+            TaskStatus::Completed
+        );
+
+        // 反面：终态的环境因照旧判死，哪怕它也说了一个等待时长。
+        let dead = Task::new("t-auth", TaskType::DagNode, serde_json::json!({}));
+        let dead_id = dead.id.clone();
+        dag.add_task(dead).await.unwrap();
+        dag.schedule_task(&dead_id).await.unwrap();
+        dag.start_task(&dead_id).await.unwrap();
+        let (retried, _, _) = dag
+            .fail_task_after(
+                &dead_id,
+                "LLM upstream refused (auth_rejected): invalid api key".into(),
+                Some(UpstreamFailure::Auth),
+                Some(282),
+            )
+            .await
+            .unwrap();
+        assert!(!retried, "鉴权被拒没有复位窗口，一个等待时长救不了它");
+        let view = dag.get_task(&dead_id).await.unwrap();
+        assert_eq!(view.status, TaskStatus::Failed);
+        assert_eq!(view.retry_count, 0, "判死不是花预算花的");
+    }
+
+    /// 存续模式的同一判据：判定在存储里做，回投要随 JSONB 一起落库。双 pod 下
+    /// 判定与重新投递不是同一个进程，只测内存路径会漏掉另一条。
+    #[tokio::test]
+    async fn store_mode_also_lets_the_environment_pay() {
+        let backend: Arc<dyn StateBackend> = Arc::new(cog_storage::MemoryStateBackend::new());
+        let dag = DagExecutor::new("ws-outage-fg".into()).with_state_backend(backend);
+        let task = Task::new("t-outage-fg", TaskType::DagNode, serde_json::json!({}));
+        let task_id = task.id.clone();
+        dag.add_task(task).await.unwrap();
+        dag.schedule_task(&task_id).await.unwrap();
+        dag.start_task(&task_id).await.unwrap();
+
+        let refusal = format!(
+            "terminal_env_failure: LLM upstream refused (server_error): HTTP 503{}",
+            cog_core::contract::llm::render_retry_after(282)
+        );
+
+        const REFUSALS: u32 = 12;
+        for i in 0..REFUSALS {
+            let (retried, _, _) = dag
+                .fail_task_after(&task_id, refusal.clone(), None, Some(282))
+                .await
+                .unwrap();
+            assert!(retried, "第 {i} 次被拒后任务必须还在队列里（存续路径）");
+            let view = dag.get_task(&task_id).await.unwrap();
+            assert_eq!(view.status, TaskStatus::Pending, "第 {i} 次被拒后");
+            assert_eq!(view.retry_count, 0, "存续路径也不该记这笔账");
+            let due = view.retry_not_before.expect("回投要随行落库");
+            assert!(due > chrono::Utc::now() + chrono::Duration::seconds(240));
+        }
+
+        dag.schedule_task(&task_id).await.unwrap();
+        dag.start_task(&task_id).await.unwrap();
+        dag.complete_task(&task_id, serde_json::json!({"ok": true}))
+            .await
+            .unwrap();
+        assert_eq!(
+            dag.get_task(&task_id).await.unwrap().status,
+            TaskStatus::Completed
         );
     }
 
