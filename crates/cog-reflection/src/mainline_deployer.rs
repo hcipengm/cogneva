@@ -4435,6 +4435,7 @@ impl MainlineDeployer {
         rev: &str,
         pull_tag: &str,
     ) -> SFResult<bool> {
+        self.record_rollout_attempt().await;
         let tip = match self.bare_main_rev().await {
             Ok(tip) => match self.refresh_upstream(&tip).await {
                 Some(advanced) => advanced,
@@ -4484,10 +4485,38 @@ impl MainlineDeployer {
             return;
         };
         use cog_core::metric_names;
+        // 问过就算一次，与答案无关。答案那一条在没跳过时写的是 0，而存储把采样累加，
+        // 补一个 0 不会让已渲染的值动——「这一轮问过」在答案那条上读不出来，所以
+        // 「问没问」必须自己有一条计数，否则「一直没跳过」与「守卫没了」是同一格。
+        let _ = metrics
+            .record_counter(
+                metric_names::MAINLINE_SUPERSESSION_CHECKS_TOTAL,
+                1.0,
+                std::collections::HashMap::new(),
+            )
+            .await;
         let _ = metrics
             .record_counter(
                 metric_names::MAINLINE_SUPERSEDED_ROLLOUT_TOTAL,
                 if skipped { 1.0 } else { 0.0 },
+                std::collections::HashMap::new(),
+            )
+            .await;
+    }
+
+    /// 这一轮走到了「要不要把这一版滚出去」的决策点。
+    ///
+    /// 与下面那次提问成对：两条在健康的轮里逐轮同增，它们的差就是「决定要滚、却没问」
+    /// 的轮数——守卫的调用点被删掉在外面读起来正是这个差。放在入口而不是放在提问旁边：
+    /// 挨着提问写就与它同因，差恒为零，什么也判不出来。
+    async fn record_rollout_attempt(&self) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let _ = metrics
+            .record_counter(
+                cog_core::metric_names::MAINLINE_ROLLOUT_ATTEMPTS_TOTAL,
+                1.0,
                 std::collections::HashMap::new(),
             )
             .await;

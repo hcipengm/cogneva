@@ -275,16 +275,44 @@ metric_names! {
     // or, on the re-dispatch path, between the revision's own rollout and the
     // re-dispatch an external apply forced.
     //
-    // Published at zero as well as at a value, and here the zero is the whole
-    // point: every other reading of a skipped rollout is silent, so "the
-    // upstream never passed a rev mid-round" and "the guard that would notice
-    // is not wired" are the same absent cell — and a guard whose call site was
-    // deleted is exactly the second one. A cell of zero says the question was
-    // asked and the round was rolled; an absent series says nothing ever asked.
+    // The zero the producer writes on an unskipped round does not, by itself,
+    // make the question visible: the store accumulates the samples it is given,
+    // so adding zero leaves the rendered value where it was and a round that
+    // asked reads exactly like a round that never ran. What the zero does move
+    // is the store's per-series last-write companion, which is outside this
+    // list and which nothing reads. The count of questions is therefore carried
+    // by a series of its own, on this side of the contract:
+    // `..._supersession_checks_total` below.
+    //
     // The saving it counts is one rollout Job and one set of workload restarts:
     // the compile and the image push for the superseded rev are already paid by
     // the time the question can be asked.
     MAINLINE_SUPERSEDED_ROLLOUT_TOTAL => "cogneva_mainline_superseded_rollout_total",
+    // Rounds the deployer reached the decision point of rolling a revision out.
+    //
+    // It exists to be the second half of a pair. A reading that stops being
+    // written and a round that never ran are the same absent cell, and the
+    // series that would have told them apart is the one under suspicion — so
+    // the question has to be asked of two counts at once. This one moves on
+    // every round that got as far as deciding; `..._supersession_checks_total`
+    // moves in the same call, on the path that also asks the guard. On a
+    // healthy round they are equal, so the difference between them is the
+    // number of rounds that decided to roll without asking the question, which
+    // is what a guard whose call site was deleted looks like from outside. It
+    // is also the cadence every other reading of the round is bounded by: how
+    // often the deployer tries to promote is not the declared poll interval
+    // (that bounds the loop, not the attempt) and no other series publishes it.
+    MAINLINE_ROLLOUT_ATTEMPTS_TOTAL => "cogneva_mainline_rollout_attempts_total",
+    // Times the deployer's guard put the overtaken question, counted whether
+    // the answer was yes or no.
+    //
+    // Recorded as its own count rather than derived from the answers: the
+    // answer counter only moves when the answer is yes, so counting questions
+    // by counting skips would make a healthy quiet stretch read as a guard that
+    // never ran. Read beside `..._rollout_attempts_total`: they climb together
+    // while the guard is wired, and the gap that opens when they stop climbing
+    // together is the guard no longer being asked.
+    MAINLINE_SUPERSESSION_CHECKS_TOTAL => "cogneva_mainline_supersession_checks_total",
     // Rounds the deployer asked the upstream platforms what CI concluded for the
     // revision it was about to roll, and what came back: `pass`, `fail` (that
     // round holds the rollout) or `no_evidence`.

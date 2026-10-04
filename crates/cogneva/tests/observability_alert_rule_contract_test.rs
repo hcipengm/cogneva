@@ -556,6 +556,19 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_mainline_ci_no_verdict_reason_total",
         "crates/cog-reflection/src/mainline_deployer.rs",
     ),
+    // 这一对顶掉的是 `cogneva_mainline_superseded_rollout_total` 那条欠账。原来想让它
+    // 自己当「守卫还在」的证据（它每一轮都写，跳过时写 1、没跳过写 0），但计数器上补
+    // 一个 0 不会让已渲染的值动，所以「这一轮问过」在那条序列上读不出来；能读出来的是
+    // 存储为每条序列渲染的 `_observed_timestamp_seconds` 伴生，而那个族不在闭集里、
+    // 门禁也认不得。于是把「问过」这件事挪到闭集内自成一计数，判据变成一对计数之差。
+    (
+        "cogneva_mainline_rollout_attempts_total",
+        "crates/cog-reflection/src/mainline_deployer.rs",
+    ),
+    (
+        "cogneva_mainline_supersession_checks_total",
+        "crates/cog-reflection/src/mainline_deployer.rs",
+    ),
 ];
 
 /// Series the rules read that this workspace does not publish, with the owner.
@@ -1076,7 +1089,7 @@ const UNREAD: &[(&str, Unread)] = &[
     ),
     (
         "cogneva_mainline_superseded_rollout_total",
-        Unread::Gap("1 or 0 per round on whether the carried revision had been overtaken. Its value face cannot carry the fault it was built for: the counter is written with 0 on every round, so a broken guard leaves a row the store keeps rendering -- a constant series, not an absent one -- and an absent_over_time reader is structurally unreachable. The only signal is the store's generic per-series companion, cogneva_mainline_superseded_rollout_total_observed_timestamp_seconds, which holds the last write; measured on a cell that stopped being written it freezes while the scrape continues. Reading it means comparing it against a round, and the round cadence is gated by the shared build slot rather than by the declared poll_interval_secs (measured one round per ~2h, far above the poll), so the bound is undeclared and no threshold may be invented. The companion family is named by no closed-set constant and the contract gate would reject a rule that reads it, which is the second half of this gap"),
+        Unread::Gap("the share of rounds the guard saved by leaving the carried revision alone. It counts answers, not questions: the producer writes a zero on an unskipped round and a zero sample does not move a counter's value, so this series cannot say whether a quiet stretch was a guard that kept answering no or a guard that stopped being called -- that half is now carried by a pair of its own, cogneva_mainline_rollout_attempts_total against cogneva_mainline_supersession_checks_total, which is what mainline_supersession_question_stopped reads. What is left here is the share itself, and what would make a run of skips a fault is how much upstream movement counts as normal on this repository: a bound nobody declared, so the missing half is a bound rather than a reader"),
     ),
     (
         "llm_upstream_failures_total",

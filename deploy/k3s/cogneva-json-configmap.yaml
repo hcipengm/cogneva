@@ -1279,6 +1279,15 @@ data:
               },
               "severity": "warning",
               "summary": "The deployer asked the code platforms for a CI verdict and one of them came back with something other than a verdict, for a reason that is not a wait ({value} such answers in the last hour under reason {reason}, the largest any workload reported -- this counter is exposed by two workloads that run in step, so a sum over them would state twice the events). The gate fails open by design, so this is the state in which a revision can be dispatched unverified, and the label names whose silence it was: status_unreadable and unusable_body are an answer this side could not parse, bad_api_base and connect_failed are the route or the gateway, and the http_ cells are the platform refusing. It filters out the two reasons that are a normal state rather than a fault -- pending is the platform not having finished, and no_runs is a platform with nothing to judge, both of which climb steadily on a healthy deployment -- and names no others on purpose, so a reason added later lands on the alarm side instead of going silent. Read it with the verdict counter's no_evidence cell, which is the same events counted without their cause."
+            },
+            {
+              "name": "mainline_supersession_question_stopped",
+              "promql": "max(increase(cogneva_mainline_rollout_attempts_total[6h])) - max(increase(cogneva_mainline_supersession_checks_total[6h])) > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "The deployer decided to roll a revision out on {value} round(s) in the last six hours without asking whether the upstream had already overtaken it. This is the guard being gone rather than the guard answering yes: the two counters move in the same call while it is wired -- one when the round reaches the decision, one when it puts the question -- so their difference is exactly the rounds that decided without asking, and a deleted call site is invisible in every other reading, including the answer counter beside them, whose zero on an unasked round does not move. The window only has to hold a round: attempts are the promotion cadence itself, one every couple of hours on this deployment, and no other series publishes it -- the poll interval bounds the loop that looks for work, not the rounds that find any. Nothing is broken while it fires: the rollouts still happen, just without the check that would have skipped the ones the upstream had already replaced."
             }
           ]
         },

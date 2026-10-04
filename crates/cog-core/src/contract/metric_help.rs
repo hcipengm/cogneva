@@ -208,12 +208,34 @@ const COUNTER_HELP: &[(&str, &str)] = &[
     ),
     (
         "cogneva_mainline_superseded_rollout_total",
-        "Rounds the deployer's guard asked whether the revision it was carrying \
+        "Rounds the deployer's guard answered that the revision it was carrying \
          had been overtaken upstream: 1 when it had (nothing is rolled out, the \
          revision is left alone and the new tip is taken next round), 0 when it \
-         had not. The zeros are what keep the question itself visible — a guard \
-         whose call site was deleted would stop producing skips too, and 'no \
-         skip this round' and 'no guard at all' would be the same absent cell",
+         had not. It counts answers, not questions — the producer writes a zero \
+         on an unskipped round, and a zero sample does not move a counter's \
+         value, so 'this round asked and was told no' is not readable here. The \
+         questions are counted by cogneva_mainline_supersession_checks_total, \
+         and the value held here is the share of rounds the guard saved"
+    ),
+    (
+        "cogneva_mainline_rollout_attempts_total",
+        "Rounds the deployer got as far as deciding whether to roll a revision \
+         out. Kept as the partner of cogneva_mainline_supersession_checks_total, \
+         which moves in the same call on the path that asks the guard: while the \
+         guard is wired the two climb together, and rounds that decided to roll \
+         without asking appear as the gap between them. It is also the only \
+         published cadence of a promotion attempt — the declared poll interval \
+         bounds the loop that looks for work, not the rounds that find any",
+    ),
+    (
+        "cogneva_mainline_supersession_checks_total",
+        "Times the deployer's guard put the overtaken question, counted whether \
+         the answer was yes or no. Counted rather than inferred from the skips, \
+         because the answer counter only moves on a yes and a quiet stretch would \
+         then read as a guard that never ran. Read with \
+         cogneva_mainline_rollout_attempts_total: equal while the guard is wired, \
+         and the difference between them is the failure this pair was built to \
+         show",
     ),
     (
         "cogneva_mainline_ci_no_verdict_reason_total",
