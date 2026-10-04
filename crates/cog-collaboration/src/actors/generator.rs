@@ -313,6 +313,54 @@ fn artifact_files_to_exclude(output: &GeneratorOutput) -> Vec<String> {
         .collect()
 }
 
+/// Drop every section that adds a file whose own content is a diff.
+///
+/// The read names the artifact files out by name, which is exact only for the
+/// name the contract asks for. A round that writes its answer somewhere else
+/// leaves a file nothing about the name says is not a source file, and the one
+/// thing that does say so is the file's content: a change that adds a file
+/// holding a diff is a change nothing derived from the repository.
+///
+/// Deliberately narrow. Only a creation counts, and only its first added line,
+/// so a test fixture or a document that merely contains a diff — not as the
+/// whole file, not from its first line — is left alone. A section that is not
+/// dropped is passed through byte for byte.
+fn without_answer_files(diff: &str) -> String {
+    let mut kept = String::new();
+    let mut section = String::new();
+    let mut drop = false;
+    let mut creation = false;
+    let mut seen_first_added = false;
+
+    for line in diff.split_inclusive('\n') {
+        if line.starts_with("diff --git ") {
+            if !drop {
+                kept.push_str(&section);
+            }
+            section.clear();
+            drop = false;
+            creation = false;
+            seen_first_added = false;
+        } else if !drop {
+            if line.starts_with("new file mode ") {
+                creation = true;
+            } else if creation
+                && !seen_first_added
+                && line.starts_with('+')
+                && !line.starts_with("+++")
+            {
+                seen_first_added = true;
+                drop = line.starts_with("+diff --git ");
+            }
+        }
+        section.push_str(line);
+    }
+    if !drop {
+        kept.push_str(&section);
+    }
+    kept
+}
+
 /// Swap the tree's diff in for the typed one, and say which end was used.
 ///
 /// `None` from this is "there was nothing to decide": a round with no change
@@ -330,6 +378,13 @@ fn apply_workspace_change(
     let Some(diff) = harvested.filter(|diff| diff.contains("diff --git")) else {
         return (output, Some("model"));
     };
+    // Second cut at the run's own answer, for the name the read was not told
+    // about. Stripping it can leave nothing, and a tree that held only the
+    // answer held no change: the typed diff is what stays.
+    let diff = without_answer_files(&diff);
+    if !diff.contains("diff --git") {
+        return (output, Some("model"));
+    }
     for artifact in &mut output.artifacts {
         // The contract asks for exactly one change artifact. A second one is a
         // different defect, and filling it with the same diff would hide it
@@ -708,6 +763,36 @@ mod tests {
         let (output, source) = apply_workspace_change(output, Some(TREE_DIFF.into()));
         assert_eq!(source, None);
         assert_eq!(output.artifacts[0].content, "@@ not a diff @@");
+    }
+
+    /// A round that writes its answer out under a name the read was not told
+    /// about is caught by what the file holds instead. Only the section that
+    /// adds a diff goes: the round's real edit is in the same diff and has to
+    /// survive the strip.
+    #[test]
+    fn a_creation_that_holds_a_diff_is_dropped_and_the_rest_kept() {
+        let harvested = format!(
+            "{TREE_DIFF}\
+             diff --git a/patch.txt b/patch.txt\nnew file mode 100644\n\
+             index 0000000..6332604\n--- /dev/null\n+++ b/patch.txt\n@@ -0,0 +1,3 @@\n\
+             +diff --git a/x.rs b/x.rs\n+--- a/x.rs\n++++ b/x.rs\n"
+        );
+        assert_eq!(without_answer_files(&harvested), TREE_DIFF);
+    }
+
+    /// Narrow on purpose: a file the round really added is a file the change
+    /// means to write, and a document that mentions a diff is not a diff. Both
+    /// shapes are common enough that a wider rule would eat real changes.
+    #[test]
+    fn a_new_source_file_and_a_document_that_mentions_a_diff_both_survive() {
+        let harvested = "\
+diff --git a/crates/cogneva/src/new.rs b/crates/cogneva/src/new.rs\n\
+new file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/crates/cogneva/src/new.rs\n\
+@@ -0,0 +1,2 @@\n+// a new module\n+pub fn f() {}\n\
+diff --git a/prompts/notes.md b/prompts/notes.md\nnew file mode 100644\n\
+index 0000000..2222222\n--- /dev/null\n+++ b/prompts/notes.md\n@@ -0,0 +1,2 @@\n\
++Example:\n+diff --git a/x.rs b/x.rs\n";
+        assert_eq!(without_answer_files(harvested), harvested);
     }
 
     /// The file the round wrote its answer into is left out of the read. Any
