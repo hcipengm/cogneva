@@ -1,4 +1,5 @@
 //! Orchestrator plugin — implements [`cog_core::SystemPlugin`].
+//! 它在插件框架里自组装 DAG 执行器及其后台循环。
 
 use std::sync::Arc;
 use tracing::{info, warn};

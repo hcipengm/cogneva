@@ -1,3 +1,4 @@
+//! DAG 执行器编排核心：任务状态、租约、续跑与自修复都在这里汇合。
 use cog_core::{SFError, SFResult, Task, TaskStatus, UpstreamFailure};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
