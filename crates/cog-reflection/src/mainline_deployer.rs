@@ -4342,6 +4342,36 @@ impl MainlineDeployer {
             return Ok(());
         }
 
+        // 开始构建之前再核一次上游。轮首那次核（`poll_once` 开头）与这里之间隔着
+        // 整段回收与收敛判定，而从这里往下要独占唯一的构建槽十分钟；`roll_out`
+        // 里那次复查（派发前）是同一件事，只是要等一次全程构建跑完才发现白跑了。
+        // 判据与它逐字一致：新 tip 是本 rev 的后代才让位——读不到上游照旧推进，
+        // 把主线钉在一个没读到的上游上比白建一轮更糟；不是后代的（上游被改写）
+        // 是分叉，归这一轮自己的推进判断。
+        // 这一步刻意放在拿槽**之前**：它是读 git 与拉上游，不是构建，而那个槽的
+        // 契约是只罩"真要构建"的那一段。
+        let tip = match self.bare_main_rev().await {
+            Ok(tip) => match self.refresh_upstream(&tip).await {
+                Some(advanced) => advanced,
+                None => tip,
+            },
+            Err(e) => {
+                warn!(rev = %rev12(&bare), error = %e, "could not re-read upstream before building; building the revision this round decided on");
+                bare.clone()
+            }
+        };
+        if tip != bare && self.is_ancestor(&bare, &tip).await {
+            info!(
+                rev = %rev12(&bare),
+                tip = %rev12(&tip),
+                "upstream moved past this revision before the build started; skipping the build and taking the new tip next round"
+            );
+            state.in_flight = None;
+            self.save_state(&state)?;
+            self.record_supersession_reading(true).await;
+            return Ok(());
+        }
+
         // 宿主构建闸只界**真要构建**的那一段，所以它在这里才拿，并且在镜像推完
         // 就放（见下面那次 drop）：上面那条"registry 里已有这个 rev"的快路一次
         // 构建都不做，最后那次派 Job 是读 git 与 apply 清单，两者都不是构建。
@@ -10984,6 +11014,34 @@ exit 0
         dir.join("fake-kubectl").to_string_lossy().to_string()
     }
 
+    /// 与 `fake_kubectl` 同形，但每次被问到时把 bare 的 main 推到 `rev`。
+    ///
+    /// 读部署这一步落在轮首那次上游读数与构建之间，用它来把"上游在轮首之后、
+    /// 构建开始之前走过去了"放进这一轮的中间。推到固定 rev 是幂等的，重复调用无害。
+    fn fake_kubectl_advancing_main(dir: &Path, deployed_image: &str, bare: &Path, rev: &str) -> String {
+        let log = dir.join("kubectl.log");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+git --git-dir '{bare}' update-ref refs/heads/main {rev}
+case "$*" in
+  *"get deployment"*) echo "{deployed_image}" ;;
+  *"get job"*) echo "Error: jobs.batch \"x\" not found" >&2; exit 1 ;;
+  *"get pods"*) echo "0 true " ;;
+  *"apply"*) cat >> '{log}'; echo "job.batch/x created" ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            bare = bare.display(),
+            rev = rev,
+            deployed_image = deployed_image
+        );
+        write_fake_bin(dir, "fake-kubectl", &script);
+        dir.join("fake-kubectl").to_string_lossy().to_string()
+    }
+
     /// 一个容器的等待态读数：原因来自闭集，死因是容器自己写下的那句话（可能为空）。
     fn waiting_state(reason: &str, cause: &str) -> WaitingState {
         WaitingState {
@@ -11861,6 +11919,99 @@ exit 0
             skipped.len(),
             1,
             "a skip has to leave a reading; otherwise it is indistinguishable from a round that asked and had nothing to skip: {skipped:?}"
+        );
+        assert_eq!(skipped[0].value, 1.0);
+    }
+
+    /// 同一个让位判据的第二个位置：上游在轮首读数之后、**构建开始之前**走过去了。
+    ///
+    /// 上面那条测试里上游是在"编译"期间动的，所以那一轮照付了全程构建，只是在派发前
+    /// 让位——白烧唯一的构建槽十分钟（实测：21:33 起建，21:43:43 建完，21:44:09 发现
+    /// main 已走到下一笔，整个丢弃）。同一件事在建之前问一次只要一次 git 读。
+    ///
+    /// 让位本身与上面那条是同一个判据、同一个读数，所以这里量的是**代价**：这一轮
+    /// 一个字节都不该编。做不到这一点，这次改动就只是把同一笔浪费挪了个位置。
+    #[tokio::test]
+    // 同上：ENV_LOCK 串行化进程级 PATH 修改，需跨 await 持有。
+    async fn a_rev_the_upstream_passed_before_the_build_is_not_built() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, rev_a, rev_b) = setup_repos(root).await;
+        // 轮首读到 A；A 是 B 的祖先。
+        real_git(
+            root,
+            &[
+                "--git-dir",
+                bare.to_str().unwrap(),
+                "update-ref",
+                "refs/heads/main",
+                &rev_a,
+            ],
+        )
+        .await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, rev12(&rev_a));
+        // 读部署这一步落在轮首读数与构建之间，上游就在这里落下了下一笔。
+        let kubectl = fake_kubectl_advancing_main(
+            &bin_dir,
+            "reg.local:5000/cogneva:local",
+            &bare,
+            &rev_b,
+        );
+        let ws = test_workspaces(root, &bare);
+        fake_cargo(&bin_dir, ws.target_dir());
+        fake_strip(&bin_dir);
+
+        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let deployer = MainlineDeployer::new(cfg, ws).with_metrics(metrics.clone());
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
+        deployer.poll_once().await.unwrap();
+        std::env::set_var("PATH", old_path);
+
+        // 这一轮从没编译过：编译器 double 只在真正答复一次 release build 时写日志，
+        // 所以"日志不存在"就是"没付构建"。
+        let built = std::fs::read_to_string(bin_dir.join("cargo.log")).unwrap_or_default();
+        assert!(
+            built.is_empty(),
+            "the upstream had already left this revision; nothing may be compiled for it: {built}"
+        );
+        let buildah_calls =
+            std::fs::read_to_string(bin_dir.join("buildah.log")).unwrap_or_default();
+        assert!(
+            !buildah_calls.contains("commit"),
+            "no image may be assembled for a revision the upstream has passed: {buildah_calls}"
+        );
+
+        let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap_or_default();
+        assert!(
+            !calls.contains(&job_name(&rev_a)),
+            "no rollout job may be dispatched for it: {calls}"
+        );
+        assert!(
+            !calls.contains("apply -f -"),
+            "a revision the upstream has passed gets no manifest applied: {calls}"
+        );
+        let state = deployer.load_state();
+        assert!(
+            state.in_flight.is_none(),
+            "a skipped round must not leave the revision as its in-flight rollout: {:?}",
+            state.in_flight
+        );
+        let skipped = metrics
+            .query_counter_totals(
+                cog_core::metric_names::MAINLINE_SUPERSEDED_ROLLOUT_TOTAL.as_str(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            skipped.len(),
+            1,
+            "the skip has to leave the same reading the later guard leaves: {skipped:?}"
         );
         assert_eq!(skipped[0].value, 1.0);
     }
