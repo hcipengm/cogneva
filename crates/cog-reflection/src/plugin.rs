@@ -2872,29 +2872,53 @@ async fn consume_executed_change(
                     m.record_event(true).await;
                     m.record_change_failed().await;
                 }
-                // The channel classified this failure as the paths the
-                // change touches -- a property of the change, not of the
-                // world around it -- so running the change again repeats
-                // the same refusal. Retire it rather than leaving it in
-                // the queue: an entry left there is rebuilt from scratch
-                // on the next cycle, and that release build takes the
+                // The channel classified this failure as one the change's
+                // own content caused -- a property of the change, not of
+                // the world around it -- so running the change again
+                // repeats the same refusal. Retire it rather than leaving
+                // it in the queue: an entry left there is rebuilt from
+                // scratch on the next cycle -- apply, the whole-workspace
+                // test, the release build -- and that build takes the
                 // single build slot the deployer needs to advance. On
                 // 2026-09-27 one change the whitelist had already refused
-                // was rebuilt and refused seven times in under two hours.
+                // was rebuilt and refused seven times in under two hours;
+                // on 2026-10-04 a size refusal was re-driven the same way
+                // at 22:17 and 22:30, off two rounds of test plus release
+                // build.
                 //
-                // Every other landing failure keeps the behaviour it had
-                // and stays in the queue -- including a size refusal,
-                // which owner approval can still waive, and an unreadable
-                // diff, which says nothing about the change and may yet be
-                // re-serialised into one the gate can read. Only a path
-                // refusal leaves the channel as `Validation`; the other
-                // categories arrive as `Internal`, and a category this
-                // side has never heard of keeps that same retryable
+                // A category whose verdict says nothing about the change
+                // keeps the behaviour it had and stays in the queue -- an
+                // unreadable diff, which may yet be re-serialised into
+                // one the gate can read, and a base that moved under the
+                // change or a race it lost, which another attempt can
+                // win. Those arrive as `Internal`, and a category this
+                // side has never heard of keeps the same retryable
                 // default rather than being retired unread. That default
                 // is what keeps the unreadable case bounded: nothing else
                 // reclaims it, so the queue re-offering it is the only
                 // thing that brings it back for another look.
                 if matches!(&e, cog_core::SFError::Validation(_)) {
+                    // Retiring the entry must not drop the requirement. A
+                    // refusal the channel carries as `Validation` is one the
+                    // change's own content caused, so the defect is still
+                    // there; recording the refusal is what hands it to the
+                    // rework path, which regenerates it as a change that
+                    // passes the gate. Both owner-side landing gates arrive
+                    // here -- `forbidden_paths` and the size cap -- and that
+                    // pair is what `PromotionGateRefused` names.
+                    let refused_files: Vec<std::path::PathBuf> = landed
+                        .affected_files
+                        .iter()
+                        .map(std::path::PathBuf::from)
+                        .collect();
+                    let _ = engine
+                        .record_change_refusal(
+                            &artifact.change_id,
+                            cog_core::RejectionCause::PromotionGateRefused,
+                            &refused_files,
+                            &format!("Landing refused the change itself: {e}"),
+                        )
+                        .await;
                     retire_change_everywhere(
                         pipeline,
                         Some(landing.as_ref()),

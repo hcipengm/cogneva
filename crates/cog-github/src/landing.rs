@@ -166,29 +166,6 @@ impl From<std::io::Error> for LandingError {
     }
 }
 
-/// Carry a landing failure's category across the trait boundary.
-///
-/// A path refusal leaves as [`SFError::Validation`], the type for an input
-/// that cannot pass; everything else stays the internal error an unclassified
-/// failure has always been. The split is the whole reason the category exists
-/// one layer down: the caller is the only layer that can take the change out
-/// of the queue, and one flattened variant leaves it unable to tell
-/// "re-driving repeats this refusal" from "try again once the host is free".
-/// On 2026-09-27 that flattening cost a change the whitelist had already
-/// refused seven release builds in just under two hours, each holding the
-/// single build slot the deployer needed to advance.
-///
-/// A size refusal is deliberately *not* on that side even though it is just as
-/// much a property of the change: the cap is the one gate owner approval
-/// waives, so a caller acting on it would retire a change the owner could
-/// still land. The path rules are the ones approval does not lift.
-///
-/// An unreadable diff is not on that side either, and for the opposite reason:
-/// nothing was refused about the change, because nothing about it could be
-/// read. Filing it as a path refusal bought a malformed diff the same terminal
-/// treatment as a whitelist violation — the change left the queue as if it had
-/// been rejected, and the queue is where a re-serialised diff would have been
-/// offered again from.
 /// Which of the two answers the contribution gate gave.
 ///
 /// The gate is asked one question — may this change reach the public branch? —
@@ -203,10 +180,67 @@ fn contribution_refusal_category(error: &CogGitHubError) -> LandingCategory {
     }
 }
 
+/// Carry a refusal the caller may act on across the trait boundary.
+///
+/// It leaves as [`SFError::Validation`], the type for an input that cannot
+/// pass, and every other category stays the internal error an unclassified
+/// failure has always been. One flattened variant leaves the caller unable to
+/// tell "re-driving repeats this refusal" from "try again once the host is
+/// free" -- on 2026-09-27 that flattening cost a change the whitelist had
+/// already refused seven release builds in just under two hours.
 fn refusal_error(error: LandingError) -> SFError {
-    match error.category {
-        LandingCategory::Path => SFError::Validation(error.to_string()),
-        _ => SFError::Internal(error.to_string()),
+    if redriving_repeats_the_refusal(error.category) {
+        SFError::Validation(error.to_string())
+    } else {
+        SFError::Internal(error.to_string())
+    }
+}
+
+/// Whether re-driving a change the channel refused would reach the same answer.
+///
+/// The question is not whether the refusal is final but whether re-driving the
+/// change would reach it again, because re-driving is not free. The queue keeps
+/// no verdicts: a `.diff` left in it is read back next cycle as a change nobody
+/// has looked at yet and rebuilt from scratch -- apply, the whole-workspace
+/// test, the release build -- and each of those holds the single build slot the
+/// deployer needs to advance.
+///
+/// An unreadable diff stays retryable: nothing was refused about the change,
+/// because nothing about it could be read. Filing it as a path refusal would
+/// buy a malformed diff the same terminal treatment as a whitelist violation,
+/// and the queue is where a re-serialised diff would be offered again from.
+///
+/// A size refusal is on that side, and for the same reason a path refusal is:
+/// the cap is computed from the change's own content, which does not change
+/// between cycles, so the verdict cannot move. It used to be kept retryable
+/// because owner approval waives the cap, and an entry left in the queue was
+/// meant to be where that approval would find it -- but approval does not read
+/// the queue, nothing carries the entry to it, and all the entry bought was
+/// another rebuild. On 2026-10-04 a change at 211 lines against the 200-line
+/// cap was refused at 22:17 and again at 22:30, off two rounds of test plus
+/// release build, with the deployer and every other pending change behind it.
+///
+/// Terminal and retry-worthy are two questions, not one. The cap is still the
+/// one gate approval lifts, and the record keeps the change after it leaves the
+/// queue, so the owner's door can still be built on the record; what the queue
+/// must not do is re-drive a change it has already answered for.
+///
+/// An exhaustive match, so a category added to [`LandingCategory`] cannot reach
+/// a caller without being answered for here first.
+fn redriving_repeats_the_refusal(category: LandingCategory) -> bool {
+    match category {
+        // The rules owner approval does not lift, and the cap, which approval
+        // lifts but which nothing carries back to the queue.
+        LandingCategory::Path | LandingCategory::Oversized => true,
+        // The verdict says nothing about the change, so a later attempt at the
+        // same content could still be read, applied against a base that has
+        // moved back, or pushed into a race it wins.
+        LandingCategory::UnreadableDiff
+        | LandingCategory::Conflict
+        | LandingCategory::Raced
+        | LandingCategory::Rejected
+        // git, fetch, worktree, commit: the host, not the change.
+        | LandingCategory::Environment => false,
     }
 }
 
@@ -2116,6 +2150,10 @@ mod tests {
     /// 提前判**只**判贡献面：业主自己那两档（`forbidden_paths` 与改动行数上限）留在
     /// 落地那一侧。上限是业主批准就能豁免的那一档，提前把它算成终局，等于替业主做掉
     /// 那个判决——一条他本可放行的变更会在沙箱之前消失。
+    ///
+    /// 但落地那一侧的出口是 `Validation`：上限算的是变更自己的正文，换个周期重跑一遍
+    /// 得到同一句话，所以调用方该做的是把它拿出队列，而不是留着让下一轮再整仓测一遍。
+    /// 业主那一档没有消失——记录里留着这条变更，业主的门要建也是建在记录上。
     #[tokio::test]
     async fn the_early_verdict_leaves_the_owners_limits_to_the_landing() {
         let chan = channel(crate::config::LandingPolicy {
@@ -2135,8 +2173,9 @@ mod tests {
 
         let late = ChangeLanding::land(&chan, &big, None).await.unwrap_err();
         assert!(
-            matches!(late, SFError::Internal(_)),
-            "上限拒的是可豁免的那一档，出口类型要与终局分开，否则调用方会退休一条业主还能放的变更：{late:?}"
+            matches!(late, SFError::Validation(_)),
+            "上限是变更自己正文的属性，重跑一次得到同一句话：出口要让调用方把这条变更拿出队列，\
+             否则它每一轮都被整仓测试与 release 构建重跑一遍，占死唯一的构建槽：{late:?}"
         );
     }
 
@@ -2229,44 +2268,9 @@ mod tests {
         assert!(err.to_string().contains("forbidden path"), "{err}");
     }
 
-    /// Which categories the caller may treat as terminal, written as an
-    /// exhaustive match: a new category cannot be added without answering the
-    /// question here, because this stops compiling.
-    ///
-    /// The answer has to be no for every category but the paths. The boundary
-    /// carries one type, and the caller reads a terminal failure off that type
-    /// alone, so a category that arrives looking terminal gets acted on as if
-    /// it were -- retiring a change a later attempt, a branch that moved back,
-    /// or the owner's approval could still land.
-    fn refused_for_good(category: LandingCategory) -> bool {
-        match category {
-            // The rules owner approval does not lift.
-            LandingCategory::Path => true,
-            // Not terminal, and this is the whole point of the category
-            // existing: refusing a change because its paths are unacceptable
-            // is a verdict on the change, while failing to read which paths it
-            // touches is a verdict on the reading. Only the first may cost the
-            // change its place in the queue.
-            LandingCategory::UnreadableDiff
-            // Size is a property of the change too, but not a terminal one:
-            // owner approval waives the cap, so a caller retiring on it would
-            // take that decision away from the owner.
-            | LandingCategory::Oversized
-            // The branch moved under the change; another commit may move it again.
-            | LandingCategory::Conflict
-            // Another landing won the push race; this change may win the next one.
-            | LandingCategory::Raced
-            // A push refused for something re-applying cannot fix -- but that is
-            // a statement about the attempt, not about the paths the change touches.
-            | LandingCategory::Rejected
-            // git, fetch, worktree, commit: nothing about the change at all.
-            | LandingCategory::Environment => false,
-        }
-    }
-
     /// Every category, so the loop below covers the whole set. Kept in step
-    /// with `refused_for_good`, whose match is the half that fails to compile
-    /// when the enum grows.
+    /// with `redriving_repeats_the_refusal`, whose match is the half that fails
+    /// to compile when the enum grows.
     const ALL_CATEGORIES: [LandingCategory; 7] = [
         LandingCategory::Conflict,
         LandingCategory::Raced,
@@ -2379,25 +2383,30 @@ mod tests {
     /// its own kind. The caller is the only layer that can take the change out
     /// of the queue, and it can only tell "re-driving repeats this" from "the
     /// host was busy" if the kind survives the boundary -- it reads that off
-    /// the type alone, so exactly the terminal categories may arrive as
-    /// `Validation` and everything else has to stay `Internal`.
+    /// the type alone, so exactly the categories re-driving cannot move may
+    /// arrive as `Validation` and everything else has to stay `Internal`.
+    ///
+    /// The set is pinned rather than derived, so widening it is a decision
+    /// somebody makes here and not a side effect of a mapping change.
     #[test]
-    fn only_a_path_refusal_crosses_the_boundary_as_validation() {
-        let mut terminal = Vec::new();
+    fn only_a_refusal_re_driving_cannot_move_crosses_as_validation() {
+        let mut stuck = Vec::new();
         for category in ALL_CATEGORIES {
             let e = LandingError::of(category, CogGitHubError::PrivacyRejected("refused".into()));
             let mapped = refusal_error(e);
-            if refused_for_good(category) {
+            if redriving_repeats_the_refusal(category) {
                 assert!(matches!(mapped, SFError::Validation(_)), "{category:?}");
-                terminal.push(category);
+                stuck.push(category);
             } else {
                 assert!(matches!(mapped, SFError::Internal(_)), "{category:?}");
             }
         }
         assert_eq!(
-            terminal,
-            vec![LandingCategory::Path],
-            "the paths are the one rule approval does not lift"
+            stuck,
+            vec![LandingCategory::Path, LandingCategory::Oversized],
+            "the paths approval does not lift, and the cap approval does -- which \
+             the queue cannot carry back to the owner anyway, so re-driving it buys \
+             a rebuild and nothing else"
         );
     }
 
