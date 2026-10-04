@@ -4107,6 +4107,34 @@ mod tests {
         );
     }
 
+    /// 调用方给的窗口比传输层自己重投未确认消息的窗口更短时，不能因此把还在
+    /// 传输窗口内的消息当成丢掉的活再干一遍：请求的窗口按
+    /// `DEFAULT_READY_CLAIM_IDLE_SECS` 兜底，更短的调用拿不到重复执行。
+    #[tokio::test]
+    async fn a_window_shorter_than_the_transport_floor_is_not_honored() {
+        let dag = DagExecutor::new("ws-stalled-floor".into());
+        dag.add_task(Task::new("young", TaskType::LlmCall, serde_json::json!({})))
+            .await
+            .unwrap();
+        dag.schedule_task("young").await.unwrap();
+        // 比调用方请求的 60s 老，但远在兜底后的 600s 窗口之内。
+        {
+            let mut inner = dag.inner.write().await;
+            inner.tasks.get_mut("young").unwrap().updated_at =
+                chrono::Utc::now() - chrono::Duration::minutes(5);
+        }
+
+        assert_eq!(
+            dag.reclaim_stalled_scheduled(60).await,
+            0,
+            "a caller asking for a window below the transport's own re-delivery window is \
+             asking for the duplicate, and does not get one"
+        );
+        let young = dag.get_task("young").await.unwrap();
+        assert_eq!(young.status, TaskStatus::Scheduled);
+        assert_eq!(young.retry_count, 0);
+    }
+
     #[tokio::test]
     async fn reclaiming_a_stalled_task_puts_it_back_in_line_without_charging() {
         let dag = DagExecutor::new("ws-stalled-reclaim".into());
