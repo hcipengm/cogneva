@@ -544,7 +544,7 @@ impl ChangePipeline {
                 files_changed,
                 reformatted: false,
                 pre_existing_failures: 0,
-                verdict: ChangeVerdict::Refused(cog_core::RejectionCause::ContextDoesNotApply),
+                verdict: ChangeVerdict::Refused(apply_failure_cause(&e.to_string())),
                 test_output: format!("Change pre-check failed: {}", e),
                 new_status: EvolutionStatus::ValidationFailed,
             });
@@ -1662,6 +1662,33 @@ impl ChangePipeline {
     }
 }
 
+/// Which defect a failed `git apply --check` reported.
+///
+/// The check answers with one exit status, but it names two different defects
+/// on stderr: a patch whose hunk headers do not add up never was a unified
+/// diff, while a patch whose context is not in the tree is a diff about the
+/// wrong revision. Both are refusals, and the cause is not decoration — it is
+/// the requirement the next attempt is generated against, and the label the
+/// refusal is counted under. Reading only the exit status files the first
+/// defect under the second's name, and the generator is then told to go check
+/// its context when the artifact it was handed is malformed.
+///
+/// The string git already printed is where the distinction lives, so it is
+/// read rather than re-derived: a second parser here would be a second judge
+/// of whether the patch is well-formed, and the one that decides the refusal
+/// has to be the same one that names it.
+///
+/// Anything unrecognised keeps the context verdict. A message nobody has
+/// classified is not evidence of a defect nobody has seen, and the refusal it
+/// already produced is no worse for keeping the name it had.
+fn apply_failure_cause(stderr: &str) -> cog_core::RejectionCause {
+    if stderr.contains("corrupt patch") {
+        cog_core::RejectionCause::MalformedDiff
+    } else {
+        cog_core::RejectionCause::ContextDoesNotApply
+    }
+}
+
 /// Resolve the path of a file a patch is about to create.
 ///
 /// There is no file for `canonicalize` to speak for — the patch is what brings
@@ -1928,6 +1955,22 @@ mod tests {
              --- a/{path}\n\
              +++ b/{path}\n\
              @@ -1 +1 @@\n\
+             -old\n\
+             +new\n"
+        )
+    }
+
+    /// The same body as [`rewrites`], with a hunk header that promises two
+    /// lines on each side and delivers one. `git apply` refuses it while it is
+    /// still reading the artifact — before it compares a single line to the
+    /// tree — which is what makes it a defect of the diff rather than of its
+    /// context.
+    fn header_undercounts(path: &str) -> String {
+        format!(
+            "diff --git a/{path} b/{path}\n\
+             --- a/{path}\n\
+             +++ b/{path}\n\
+             @@ -1,2 +1,2 @@\n\
              -old\n\
              +new\n"
         )
@@ -2612,6 +2655,54 @@ index 1111111..2222222 100644
             ChangeVerdict::Refused(cog_core::RejectionCause::ContextDoesNotApply)
         );
         assert_eq!(result.new_status, EvolutionStatus::ValidationFailed);
+    }
+
+    /// The other refusal git apply can hand back, and not the same one: a
+    /// header that does not count its own body is refused while the artifact
+    /// is still being read, so the tree was never the problem. The two are
+    /// told apart by what git printed, and the cause travels as the
+    /// requirement the next attempt is generated against — filing this as a
+    /// context mismatch sends the generator to re-read a tree that was never
+    /// wrong while the header it actually wrote goes unnamed.
+    #[tokio::test]
+    async fn a_change_whose_hunk_header_is_wrong_is_refused_for_its_form() {
+        let root = tempfile::tempdir().unwrap();
+        git_ok(root.path(), &["init", "-q"]).await;
+        git_ok(root.path(), &["config", "user.email", "t@t.com"]).await;
+        git_ok(root.path(), &["config", "user.name", "t"]).await;
+        // The tree says exactly what the hunk body says it says, so the only
+        // thing this diff gets wrong is its own header.
+        tokio::fs::write(root.path().join("a.txt"), "old\n")
+            .await
+            .unwrap();
+        git_ok(root.path(), &["add", "."]).await;
+        git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
+
+        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
+        let change = EvolutionResult {
+            kind: EvolutionKind::CodeChange,
+            artifact_id: "corrupt-1".into(),
+            description: "调整这一行的取值".into(),
+            content: header_undercounts("a.txt"),
+            status: EvolutionStatus::CompileChecked,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+        };
+
+        let result = pipeline
+            .apply_and_test_in(&change, root.path())
+            .await
+            .expect("a judgement about the change is not an environment error");
+
+        assert_eq!(
+            result.verdict,
+            ChangeVerdict::Refused(cog_core::RejectionCause::MalformedDiff)
+        );
+        assert!(
+            result.test_output.contains("corrupt patch"),
+            "the refusal was filed under this reading and has to keep it: {}",
+            result.test_output
+        );
     }
 
     /// The suite ran and the change broke it — the one refusal whose evidence
