@@ -606,12 +606,30 @@
         },
         {
           "name": "self_evolution_yields_no_change",
-          "promql": "sum without (pod, container, instance) (increase(self_evolution_change_yield_total{outcome=~\"no_artifacts|submit_failed\"}[6h]))",
+          "promql": "sum without (pod, container, instance) (increase(self_evolution_change_yield_total{outcome=~\"no_artifacts|non_change_artifacts|payload_missing|payload_unreadable|submit_failed\"}[6h]))",
           "condition": {
             "greater_than": 2.0
           },
           "severity": "warning",
-          "summary": "Self-evolution chains reported success {value} time(s) in the last 6h while producing no change to land (no_artifacts: the pipeline yielded no valid diff; submit_failed: every sink rejected it); the landing channel stays empty and the loop silently stops evolving"
+          "summary": "Self-evolution chains reported success {value} time(s) in the last 6h while producing no change to land. The cell names which failure it was, and they have different owners: submit_failed means a diff was produced and every sink refused it; no_artifacts means the run's answer carried no artifact at all; non_change_artifacts means it carried artifacts and not one of them was a diff, so the run answered a different question than the one it was asked; payload_missing means the run handed back no result to read; payload_unreadable means the result arrived in neither envelope this build knows, so the reader and the producer have moved apart. Whichever cell it is, the landing channel stays empty and the loop silently stops evolving"
+        },
+        {
+          "name": "self_evolution_has_no_change_sink",
+          "promql": "sum without (pod, container, instance) (increase(self_evolution_change_yield_total{outcome=\"no_sink\"}[6h]))",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "Self-evolution finished {value} run(s) in the last 6h with no sink to hand a change to, so whatever they produced was dropped and nothing they made could be landed. This is a configuration fault and not a generation fault, which is why it has its own cell: the runs succeeded and their yield had nowhere to go, and from the outside that reads exactly like a loop that produces nothing. Find what is supposed to configure a ChangeSink on this deployment and why it is empty"
+        },
+        {
+          "name": "self_evolution_submitted_nothing",
+          "promql": "(sum without (pod, container, instance) (increase(self_evolution_change_yield_total[24h])) > bool 0) and on() (sum without (pod, container, instance) (increase(self_evolution_change_yield_total{outcome=\"submitted\"}[24h])) == bool 0)",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "Self-evolution runs finished in the last day and not one of them handed a change to a sink. This is the one-failure sensitivity of the same family self_evolution_yields_no_change reads at three in six hours, and the other cells say which way each run failed -- read that rule's summary for what each cell means before generating more. A day with no finished run leaves this silent, so what it reports is runs that produced nothing rather than a loop that was idle"
         },
         {
           "name": "cogneva_workload_metrics_unscraped",

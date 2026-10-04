@@ -423,12 +423,12 @@
         },
         {
           "name": "self_evolution_yields_no_change",
-          "promql": "increase(self_evolution_change_yield_total{outcome=~\"no_artifacts|submit_failed\"}[6h])",
+          "promql": "increase(self_evolution_change_yield_total{outcome=~\"no_artifacts|non_change_artifacts|payload_missing|payload_unreadable|submit_failed\"}[6h])",
           "condition": {
             "greater_than": 2.0
           },
           "severity": "warning",
-          "summary": "Self-evolution chains reported success {value} time(s) in the last 6h while producing no change to land (no_artifacts: the pipeline yielded no valid diff; submit_failed: every sink rejected it); the landing channel stays empty and the loop silently stops evolving"
+          "summary": "Self-evolution chains reported success {value} time(s) in the last 6h while producing no change to land. The cell names which failure it was, and they have different owners: submit_failed means a diff was produced and every sink refused it; no_artifacts means the run's answer carried no artifact at all; non_change_artifacts means it carried artifacts and not one of them was a diff, so the run answered a different question than the one it was asked; payload_missing means the run handed back no result to read; payload_unreadable means the result arrived in neither envelope this build knows, so the reader and the producer have moved apart. Whichever cell it is, the landing channel stays empty and the loop silently stops evolving"
         },
         {
           "name": "cogneva_workload_metrics_unscraped",

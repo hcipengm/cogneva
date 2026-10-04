@@ -5,7 +5,10 @@ use tracing::info;
 
 use crate::{
     actors::ModeSelectorActor,
-    observable::{global_observable, BOUNDARY_NO_HARD_RULES, BOUNDARY_PASSED, BOUNDARY_VIOLATED},
+    observable::{
+        global_observable, ChangeYieldOutcome, BOUNDARY_NO_HARD_RULES, BOUNDARY_PASSED,
+        BOUNDARY_VIOLATED,
+    },
     profile::derive_task_profile,
     squad::{SquadConfig, SquadExecutor, SquadResult},
 };
@@ -748,46 +751,53 @@ impl CollaborationExecutor {
             let outcome = if self.change_sinks.is_empty() {
                 tracing::warn!(
                     task_id=%task.id,
-                    "Self-evolution task succeeded but no ChangeSink is configured"
+                    "Self-evolution task succeeded but no ChangeSink is configured, so any change it produces is dropped"
                 );
-                "no_sink"
+                ChangeYieldOutcome::NoSink
             } else {
-                let changes = Self::extract_changes(
+                match Self::extract_changes(
                     &result,
                     &goal,
                     &Self::pge_mode_str(&result.pge_mode),
                     task.input.get("issue_number").and_then(|v| v.as_u64()),
                     &task.id,
                     task.evolution_intent(),
-                );
-                let extracted = !changes.is_empty();
-                for change in changes {
-                    for sink in &self.change_sinks {
-                        match sink.submit_change(change.clone()).await {
-                            Ok(artifact_id) => {
-                                info!(task_id=%task.id, %artifact_id, "Submitted generated change");
-                                change_ids.push(artifact_id);
-                            }
-                            Err(e) => {
-                                tracing::warn!(task_id=%task.id, error=%e, "Failed to submit generated change");
+                ) {
+                    // The cause is what came back with the emptiness, and it is
+                    // read here rather than discarded: a run that spends a whole
+                    // PGE budget and yields nothing to land is a failed
+                    // evolution step, but a reader that could not read the
+                    // payload and a pipeline that produced nothing are not the
+                    // same failure. Counted so neither hides behind a
+                    // successful-looking task result.
+                    Err(cause) => {
+                        tracing::warn!(
+                            task_id=%task.id,
+                            outcome=cause.as_str(),
+                            "Self-evolution run yielded no change artifact; nothing to land"
+                        );
+                        cause
+                    }
+                    Ok(changes) => {
+                        for change in changes {
+                            for sink in &self.change_sinks {
+                                match sink.submit_change(change.clone()).await {
+                                    Ok(artifact_id) => {
+                                        info!(task_id=%task.id, %artifact_id, "Submitted generated change");
+                                        change_ids.push(artifact_id);
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(task_id=%task.id, error=%e, "Failed to submit generated change");
+                                    }
+                                }
                             }
                         }
+                        if change_ids.is_empty() {
+                            ChangeYieldOutcome::SubmitFailed
+                        } else {
+                            ChangeYieldOutcome::Submitted
+                        }
                     }
-                }
-                if !change_ids.is_empty() {
-                    "submitted"
-                } else if extracted {
-                    "submit_failed"
-                } else {
-                    // The squad reported success but produced no change: a run
-                    // that spends a whole PGE budget and yields nothing to land
-                    // is a failed evolution step. Counted so it cannot hide
-                    // behind a successful-looking task result.
-                    tracing::warn!(
-                        task_id=%task.id,
-                        "Self-evolution run yielded no change artifact; nothing to land"
-                    );
-                    "no_artifacts"
                 }
             };
             crate::observable::global_observable().record_change_yield(outcome);
@@ -1079,6 +1089,14 @@ impl CollaborationExecutor {
         Some(payload.get("roundtable").cloned().unwrap_or(payload))
     }
 
+    /// The changes a run produced, or the cause of its producing none.
+    ///
+    /// The empty returns are not one fact. A run that handed back no payload,
+    /// a payload that arrived in neither envelope this build knows, a pipeline
+    /// that really produced no artifact, and a run that answered the question
+    /// with analysis instead of a diff are four causes with four different
+    /// readers, and a bare `Vec::new()` throws the difference away at the one
+    /// point where it was still known.
     fn extract_changes(
         squad_result: &crate::squad::SquadResult,
         goal: &str,
@@ -1086,10 +1104,12 @@ impl CollaborationExecutor {
         issue_number: Option<u64>,
         task_id: &str,
         intent: Option<cog_core::EvolutionIntent>,
-    ) -> Vec<cog_core::GeneratedChange> {
+    ) -> Result<Vec<cog_core::GeneratedChange>, ChangeYieldOutcome> {
         let mut changes = Vec::new();
+        // `pge_payload` reads the result, so it is only `None` when the run
+        // handed back no result at all.
         let Some(result_val) = Self::pge_payload(squad_result) else {
-            return changes;
+            return Err(ChangeYieldOutcome::PayloadMissing);
         };
 
         let artifacts: Vec<crate::squad::pge::types::Artifact> = if let Ok(pipeline) =
@@ -1101,8 +1121,14 @@ impl CollaborationExecutor {
         {
             roundtable.final_generation.artifacts
         } else {
-            Vec::new()
+            // A payload this build cannot read is not a run that produced
+            // nothing: the envelope it arrived in is what moved.
+            return Err(ChangeYieldOutcome::PayloadUnreadable);
         };
+
+        if artifacts.is_empty() {
+            return Err(ChangeYieldOutcome::NoArtifacts);
+        }
 
         for artifact in artifacts {
             if !artifact.is_change() {
@@ -1135,7 +1161,13 @@ impl CollaborationExecutor {
             });
         }
 
-        changes
+        if changes.is_empty() {
+            // Artifacts came back and not one of them was a diff, so the run
+            // answered a different question than the one it was asked.
+            return Err(ChangeYieldOutcome::NonChangeArtifacts);
+        }
+
+        Ok(changes)
     }
 
     fn extract_score(squad_result: &crate::squad::SquadResult) -> Option<f64> {
@@ -2420,13 +2452,10 @@ mod tests {
             None,
             "task-1",
             None,
-        );
+        )
+        .expect("the diff the debate produced must reach the sink");
 
-        assert_eq!(
-            changes.len(),
-            1,
-            "the diff the debate produced must reach the sink"
-        );
+        assert_eq!(changes.len(), 1);
         assert_eq!(
             changes[0].affected_files,
             vec!["crates/cog-core/src/lib.rs".to_string()]

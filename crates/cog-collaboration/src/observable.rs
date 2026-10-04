@@ -263,6 +263,72 @@ pub const BOUNDARY_DIMENSIONS: [&str; 5] = [
     "DataBoundary",
 ];
 
+/// The name of the yield family.
+///
+/// One name for the producer and for the rules that read it: a reader holding
+/// its own copy is how a rename leaves a rule selecting a series that no longer
+/// exists, which is the silence these rules are written against.
+pub const CHANGE_YIELD_METRIC: &str = "self_evolution_change_yield_total";
+
+/// Where a self-evolution run's yield ended, and why.
+///
+/// Closed set: the metric labels it, and an outcome nobody named would be
+/// counted under a label that lies about what it means. The family exists
+/// because a run that finishes successfully and produces nothing to land is
+/// otherwise indistinguishable from one that produced a change -- the task
+/// reports success either way -- so a loop that silently stopped evolving was
+/// a state nothing could count. What it must not do is count as one cell. A
+/// reader handed a payload it cannot read, a pipeline that genuinely produced
+/// nothing, and a run that answered with something other than a diff are three
+/// different readers with three different repairs, and folding them together
+/// gives all three the same alert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeYieldOutcome {
+    /// The run produced a diff and a sink took it.
+    Submitted,
+    /// A diff was produced and every sink refused it.
+    SubmitFailed,
+    /// The run is self-evolution but this deployment has no sink to hand a
+    /// change to, so nothing it produces can ever be landed.
+    NoSink,
+    /// The squad reported success without a result payload to read at all.
+    PayloadMissing,
+    /// A payload came back in neither shape this build knows: the envelope
+    /// contract moved and this reader did not move with it.
+    PayloadUnreadable,
+    /// The run's own answer carried no artifacts.
+    NoArtifacts,
+    /// Artifacts came back and not one of them was a diff: the run answered
+    /// the question with something else.
+    NonChangeArtifacts,
+}
+
+impl ChangeYieldOutcome {
+    /// Every outcome, so a gate can check that each one reaches a rule.
+    pub const ALL: [Self; 7] = [
+        Self::Submitted,
+        Self::SubmitFailed,
+        Self::NoSink,
+        Self::PayloadMissing,
+        Self::PayloadUnreadable,
+        Self::NoArtifacts,
+        Self::NonChangeArtifacts,
+    ];
+
+    /// The metric label. Stable: alert rules read these.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Submitted => "submitted",
+            Self::SubmitFailed => "submit_failed",
+            Self::NoSink => "no_sink",
+            Self::PayloadMissing => "payload_missing",
+            Self::PayloadUnreadable => "payload_unreadable",
+            Self::NoArtifacts => "no_artifacts",
+            Self::NonChangeArtifacts => "non_change_artifacts",
+        }
+    }
+}
+
 /// Routes that reach a failure analysis answer without paying for one.
 ///
 /// A failure's cause can be declared by the reason itself (the two class names
@@ -333,12 +399,18 @@ pub struct CollaborationObservable {
     /// 同步锁而非 `try_lock`：这是分类可达性自查的记录端，一次丢失会被
     /// 读成「这个分类从没被记录过」而报出并不存在的分叉。
     ralph_terminations: Arc<std::sync::Mutex<HashMap<String, u64>>>,
-    /// 自进化任务的结果计数，按结局分类（submitted / no_artifacts /
-    /// submit_failed / no_sink）。一个跑完却没有产出变更的自进化任务在
-    /// 此之前与成功完全无法区分：squad 报 success、输出 JSON 里只是没有
-    /// change_ids，既没有日志也没有指标，于是"生成侧不出货"能沉默地持续
-    /// 下去。落地通道有没有货必须可数。
-    change_yields: Arc<Mutex<HashMap<String, u64>>>,
+    /// Where self-evolution runs' yields ended, over [`ChangeYieldOutcome`].
+    ///
+    /// A run that finishes successfully and produces nothing to land is
+    /// otherwise indistinguishable from one that produced a change: the squad
+    /// reports success, the output JSON merely has no `change_ids`, and there
+    /// is neither a log nor a metric -- so "generation is producing nothing"
+    /// could go on silently. Whether the landing channel has anything must be
+    /// countable, and countable per cause: the cell that says a reader could
+    /// not read the payload and the cell that says the run produced nothing
+    /// are read by different people. Keyed by a `&'static str` so the cells
+    /// are [`ChangeYieldOutcome::ALL`] and a typo cannot open an eighth.
+    change_yields: Arc<Mutex<HashMap<&'static str, u64>>>,
     /// 分类声明的计数（产生端：写出带前缀 reason/feedback 时记一次）。
     /// 与 [`Self::ralph_terminations`]（记录端）构成分类可达性自查的两端。
     /// 用同步锁而非 `try_lock` 丢弃：这一端是「有没有声明」的证据本身，
@@ -512,9 +584,15 @@ impl CollaborationObservable {
         *map.entry(reason.to_string()).or_insert(0) += 1;
     }
 
-    pub fn record_change_yield(&self, outcome: &str) {
+    /// Record where one self-evolution run's yield ended.
+    ///
+    /// Takes the closed set rather than a `&str`: the metric labels the
+    /// outcome, so a free string would let a new cause be counted under a name
+    /// no reader was ever told about, and no gate could tell that apart from a
+    /// cause that stopped happening.
+    pub fn record_change_yield(&self, outcome: ChangeYieldOutcome) {
         if let Ok(mut map) = self.change_yields.try_lock() {
-            *map.entry(outcome.to_string()).or_insert(0) += 1;
+            *map.entry(outcome.as_str()).or_insert(0) += 1;
         }
     }
 
@@ -799,12 +877,22 @@ impl Observable for CollaborationObservable {
                         .with_label("route", route),
                 );
             }
+            // Every cell of the yield, published at zero once one run has
+            // finished. The cells partition the runs, so after the first one
+            // the zeros are measurements rather than claims; before it the
+            // family is absent, because no run has ended and a zero would
+            // claim one that never did. Reading the cells is what tells "this
+            // cause stopped happening" from "the label was renamed out from
+            // under the reader" -- both are the same absence otherwise.
             let yields = self.change_yields.lock().await;
-            for (outcome, count) in yields.iter() {
-                metrics.push(
-                    RawMetric::new("self_evolution_change_yield_total", *count as f64)
-                        .with_label("outcome", outcome),
-                );
+            if !yields.is_empty() {
+                for outcome in ChangeYieldOutcome::ALL {
+                    let count = yields.get(outcome.as_str()).copied().unwrap_or(0);
+                    metrics.push(
+                        RawMetric::new(CHANGE_YIELD_METRIC, count as f64)
+                            .with_label("outcome", outcome.as_str()),
+                    );
+                }
             }
             let reviews = self
                 .self_review_verdicts
@@ -1297,26 +1385,51 @@ mod tests {
     #[tokio::test]
     async fn change_yield_is_counted_per_outcome() {
         let obs = CollaborationObservable::new();
-        obs.record_change_yield("no_artifacts");
-        obs.record_change_yield("no_artifacts");
-        obs.record_change_yield("submitted");
+        obs.record_change_yield(ChangeYieldOutcome::NoArtifacts);
+        obs.record_change_yield(ChangeYieldOutcome::NoArtifacts);
+        obs.record_change_yield(ChangeYieldOutcome::Submitted);
 
         let metrics = obs.collect_metrics("D8").await.unwrap();
         let yields: Vec<&RawMetric> = metrics
             .iter()
-            .filter(|m| m.name == "self_evolution_change_yield_total")
+            .filter(|m| m.name == CHANGE_YIELD_METRIC)
             .collect();
-        assert_eq!(yields.len(), 2);
-        let no_artifacts = yields
-            .iter()
-            .find(|m| m.labels.get("outcome").map(String::as_str) == Some("no_artifacts"))
-            .expect("no_artifacts outcome is reported");
-        assert_eq!(no_artifacts.value, 2.0);
-        let submitted = yields
-            .iter()
-            .find(|m| m.labels.get("outcome").map(String::as_str) == Some("submitted"))
-            .expect("submitted outcome is reported");
-        assert_eq!(submitted.value, 1.0);
+        // Every declared cell, once one run has finished: the cells partition
+        // the runs, so a missing one reads as a cause that cannot happen rather
+        // than as a cause that did not.
+        assert_eq!(yields.len(), ChangeYieldOutcome::ALL.len());
+        let cell = |outcome: ChangeYieldOutcome| -> f64 {
+            yields
+                .iter()
+                .find(|m| m.labels.get("outcome").map(String::as_str) == Some(outcome.as_str()))
+                .unwrap_or_else(|| panic!("{} outcome is reported", outcome.as_str()))
+                .value
+        };
+        assert_eq!(cell(ChangeYieldOutcome::NoArtifacts), 2.0);
+        assert_eq!(cell(ChangeYieldOutcome::Submitted), 1.0);
+        // The causes that did not happen are published at zero, which is what
+        // keeps them apart from a cause this build cannot name.
+        for outcome in ChangeYieldOutcome::ALL {
+            if matches!(
+                outcome,
+                ChangeYieldOutcome::NoArtifacts | ChangeYieldOutcome::Submitted
+            ) {
+                continue;
+            }
+            assert_eq!(cell(outcome), 0.0, "{}", outcome.as_str());
+        }
+    }
+
+    /// The label is what an alert rule selects on, so two outcomes sharing one
+    /// would make a rule that names either of them read both.
+    #[test]
+    fn every_declared_yield_outcome_has_its_own_label() {
+        let mut seen = std::collections::BTreeSet::new();
+        for outcome in ChangeYieldOutcome::ALL {
+            let label = outcome.as_str();
+            assert!(!label.is_empty(), "{outcome:?} has no label");
+            assert!(seen.insert(label), "two outcomes share the label {label}");
+        }
     }
 
     #[tokio::test]
@@ -1326,7 +1439,7 @@ mod tests {
         // was never taken.
         let obs = CollaborationObservable::new();
         let metrics = obs.collect_metrics("D8").await.unwrap();
-        assert!(metric(&metrics, "self_evolution_change_yield_total").is_none());
+        assert!(metric(&metrics, CHANGE_YIELD_METRIC).is_none());
     }
 
     fn unreachable(metrics: &[RawMetric]) -> Vec<String> {

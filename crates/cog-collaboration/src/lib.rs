@@ -23,7 +23,7 @@ pub use hierarchy::{
     HierarchicalMessage, InterSquadMessage, RoutingStrategy, SquadId, TopicName,
 };
 pub use ipc::{FileSystemIpc, IpcChannel, IpcMessage};
-pub use observable::CollaborationObservable;
+pub use observable::{ChangeYieldOutcome, CollaborationObservable};
 pub use profile::{
     change_tier, complexity_score, declaration_inputs, declared_scale, derive_task_profile,
     scale_label, select_mode, ChangeTier, DeclarationInput, DeclarationInputs, DeclaredScale,

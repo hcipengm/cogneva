@@ -838,10 +838,11 @@ fn no_foreign_name_is_one_the_closed_set_publishes() {
 
 #[test]
 fn every_label_value_a_rule_has_to_select_is_selected_by_one() {
+    use cog_collaboration::ChangeYieldOutcome;
     use cog_github::redrive_budget::{BudgetSide, RedriveRefusal};
 
     let rules = chart_rules();
-    let domains: [(&str, Vec<&str>); 2] = [
+    let domains: [(&str, Vec<&str>); 3] = [
         (
             cog_github::redrive_budget::REDRIVE_REFUSALS_METRIC.as_str(),
             RedriveRefusal::ALL.iter().map(|r| r.as_str()).collect(),
@@ -850,15 +851,18 @@ fn every_label_value_a_rule_has_to_select_is_selected_by_one() {
             cog_github::redrive_budget::REDRIVE_BUDGET_LOSSES_METRIC.as_str(),
             BudgetSide::ALL.iter().map(|s| s.as_str()).collect(),
         ),
+        (
+            cog_collaboration::observable::CHANGE_YIELD_METRIC,
+            ChangeYieldOutcome::ALL.iter().map(|o| o.as_str()).collect(),
+        ),
     ];
 
     let mut unread: Vec<String> = Vec::new();
     for (metric, values) in domains {
         for value in values {
-            let quoted = format!("\"{value}\"");
             let read = rules
                 .iter()
-                .any(|(_, promql)| promql.contains(metric) && promql.contains(&quoted));
+                .any(|(_, promql)| promql.contains(metric) && selects_value(promql, value));
             if !read {
                 unread.push(format!("{metric}{{…=\"{value}\"}}"));
             }
@@ -869,6 +873,49 @@ fn every_label_value_a_rule_has_to_select_is_selected_by_one() {
         unread.is_empty(),
         "这些计数器的取值没有任何规则在读，对应的事件会静默发生（名字被读了不算，取值没被读）: {unread:?}"
     );
+}
+
+/// Whether an expression selects this label value.
+///
+/// A value is selected by its own matcher (`outcome="no_artifacts"`) or as one
+/// alternative of a regex matcher (`outcome=~"no_artifacts|submit_failed"`) --
+/// a family whose cells have one repair each can also be one rule whose summary
+/// says which cell it saw, and both spellings select the value.
+///
+/// Alternatives are compared exactly, and a pattern carrying regex operators is
+/// not a name: `no_.*` would otherwise count as having selected whatever the
+/// producer adds next, which is the drift this check exists to catch. `!~` is
+/// not a selection either -- it is the set the rule excludes.
+fn selects_value(promql: &str, value: &str) -> bool {
+    if promql.contains(&format!("\"{value}\"")) {
+        return true;
+    }
+    let mut rest = promql;
+    while let Some(at) = rest.find("=~\"") {
+        let start = at + 3;
+        let Some(end) = rest[start..].find('"') else {
+            return false;
+        };
+        let pattern = &rest[start..start + end];
+        if pattern.split('|').any(|alt| alt.trim() == value) {
+            return true;
+        }
+        rest = &rest[start + end..];
+    }
+    false
+}
+
+#[test]
+fn a_label_value_is_read_through_either_matcher_spelling() {
+    assert!(selects_value(r#"a{x="v"}"#, "v"));
+    assert!(selects_value(r#"a{x=~"u|v|w"}"#, "v"));
+    assert!(selects_value(r#"a{x=~"u|v|w"}"#, "u"));
+    // A pattern is not a name.
+    assert!(!selects_value(r#"a{x=~"v.*"}"#, "v"));
+    assert!(!selects_value(r#"a{x=~".*"}"#, "v"));
+    // An exclusion selects the other values, not this one.
+    assert!(!selects_value(r#"a{x!~"u|v"}"#, "v"));
+    assert!(!selects_value(r#"a{x=~"u|w"}"#, "v"));
 }
 
 /// Rule names this workspace raises about itself, which must stay outside the
