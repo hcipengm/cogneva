@@ -793,18 +793,15 @@ impl CollaborationExecutor {
             crate::observable::global_observable().record_change_yield(outcome);
         }
 
-        let output = if change_ids.is_empty() {
-            serde_json::json!({
-                "execution_result": execution_output,
-                "squad_result": &result,
-            })
-        } else {
-            serde_json::json!({
-                "execution_result": execution_output,
-                "squad_result": &result,
-                "change_ids": change_ids,
-            })
-        };
+        // The list is published even when it is empty. A successful run whose
+        // generated change never reached a sink is otherwise indistinguishable
+        // from one that had nothing to submit — the key is simply absent — and
+        // that omission is where a produced diff goes missing without a reading.
+        let output = serde_json::json!({
+            "execution_result": execution_output,
+            "squad_result": &result,
+            "change_ids": change_ids,
+        });
 
         let mut metadata = TaskResultMetadata::new("collaboration_atomic");
         if let Some(s) = score {
@@ -1067,6 +1064,21 @@ impl CollaborationExecutor {
         format!("{}-{}", task_id, short)
     }
 
+    /// The PGE payload a squad result carries, with the roundtable's storage
+    /// envelope removed.
+    ///
+    /// A debate records each iteration under a `roundtable` key, and a
+    /// successful debate hands back that same envelope as its result — unlike
+    /// the pipeline, which hands back the pipeline result itself and keeps the
+    /// envelope for the history entry only. Every probe below reads the payload
+    /// through here: one that probes the bare shapes sees a debate that
+    /// produced a diff as a run that produced nothing, and drops the diff while
+    /// the task still reports success.
+    fn pge_payload(squad_result: &crate::squad::SquadResult) -> Option<serde_json::Value> {
+        let payload = squad_result.result.clone()?;
+        Some(payload.get("roundtable").cloned().unwrap_or(payload))
+    }
+
     fn extract_changes(
         squad_result: &crate::squad::SquadResult,
         goal: &str,
@@ -1076,7 +1088,7 @@ impl CollaborationExecutor {
         intent: Option<cog_core::EvolutionIntent>,
     ) -> Vec<cog_core::GeneratedChange> {
         let mut changes = Vec::new();
-        let Some(ref result_val) = squad_result.result else {
+        let Some(result_val) = Self::pge_payload(squad_result) else {
             return changes;
         };
 
@@ -1127,7 +1139,7 @@ impl CollaborationExecutor {
     }
 
     fn extract_score(squad_result: &crate::squad::SquadResult) -> Option<f64> {
-        if let Some(ref result_val) = squad_result.result {
+        if let Some(result_val) = Self::pge_payload(squad_result) {
             // 分解路径的判定是结构性的二值（拿到任务列表 / 没拿到），这里是
             // 把它翻成下游门槛吃的 0..1 分数，不是给产出质量打分。
             if let Ok(plan_run) =
@@ -1154,7 +1166,7 @@ impl CollaborationExecutor {
     }
 
     fn extract_execution_result(squad_result: &crate::squad::SquadResult) -> serde_json::Value {
-        if let Some(ref result_val) = squad_result.result {
+        if let Some(result_val) = Self::pge_payload(squad_result) {
             // 分解路径：计划是交付物，没有生成物可言。
             if let Ok(plan_run) =
                 serde_json::from_value::<crate::squad::PlanRunResult>(result_val.clone())
@@ -1190,7 +1202,7 @@ impl CollaborationExecutor {
 
     fn extract_atomic_tasks(squad_result: &crate::squad::SquadResult) -> Vec<AtomicTask> {
         let mut tasks = Vec::new();
-        if let Some(ref result_val) = squad_result.result {
+        if let Some(result_val) = Self::pge_payload(squad_result) {
             // 分解路径的产物形状：计划本身就是交付物。
             if let Ok(plan_run) =
                 serde_json::from_value::<crate::squad::PlanRunResult>(result_val.clone())
@@ -2332,5 +2344,110 @@ mod tests {
             .map(|line| line.get(indent..).unwrap_or(""))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn roundtable_squad_result(
+        artifacts: Vec<crate::squad::pge::types::Artifact>,
+    ) -> crate::squad::SquadResult {
+        use crate::squad::pge::types::{
+            EvaluationResult, GeneratorOutput, PlannerOutput, RoundOutcome, Verdict,
+        };
+
+        let roundtable = crate::PgeRoundtableResult {
+            iterations: 1,
+            consensus_reached: true,
+            final_plan: PlannerOutput {
+                summary: String::new(),
+                plan: serde_json::json!({}),
+                sub_tasks: Vec::new(),
+                acceptance_criteria: Vec::new(),
+                targets: Vec::new(),
+            },
+            final_generation: GeneratorOutput {
+                content: serde_json::json!({}),
+                artifacts,
+            },
+            final_outcome: RoundOutcome::Judged {
+                evaluation: EvaluationResult {
+                    verdict: Verdict::Pass,
+                    feedback: "looks good".into(),
+                    score: Some(85),
+                    criteria: Vec::new(),
+                    details: None,
+                },
+            },
+            history: Vec::new(),
+            context_board: None,
+            terminal_reason: None,
+        };
+
+        crate::squad::SquadResult {
+            squad_id: "squad-1".into(),
+            success: true,
+            // A debate hands its rounds back under `roundtable`, and a
+            // successful debate hands back that same envelope as its result.
+            result: Some(serde_json::json!({ "roundtable": roundtable })),
+            retry_count: 0,
+            error: None,
+            pge_mode: crate::profile::PgeMode::Roundtable,
+            reflection: None,
+        }
+    }
+
+    /// The diff a debate produced has to reach the sink. The envelope above is
+    /// the debate's own result, so a probe that only tries the bare shapes
+    /// reads the run as having produced nothing: the change is dropped, no
+    /// landing record is written, and the task still reports success.
+    #[test]
+    fn a_roundtable_change_survives_the_envelope_it_arrives_in() {
+        use crate::squad::pge::types::Artifact;
+
+        let diff = "--- a/crates/cog-core/src/lib.rs\n\
+                    +++ b/crates/cog-core/src/lib.rs\n\
+                    @@ -1 +1 @@\n\
+                    -old\n\
+                    +new\n";
+        let squad_result = roundtable_squad_result(vec![Artifact {
+            name: "change.diff".into(),
+            content: diff.into(),
+            artifact_type: "change".into(),
+        }]);
+
+        let changes = CollaborationExecutor::extract_changes(
+            &squad_result,
+            "goal",
+            "roundtable",
+            None,
+            "task-1",
+            None,
+        );
+
+        assert_eq!(
+            changes.len(),
+            1,
+            "the diff the debate produced must reach the sink"
+        );
+        assert_eq!(
+            changes[0].affected_files,
+            vec!["crates/cog-core/src/lib.rs".to_string()]
+        );
+    }
+
+    /// The reading that the dropped diff was missing: the score and the
+    /// execution envelope have to survive the same probe, or a run that
+    /// produced a change is indistinguishable from one that produced nothing
+    /// even after the change itself is recovered.
+    #[test]
+    fn a_roundtable_run_reports_its_score_and_plan() {
+        let squad_result = roundtable_squad_result(Vec::new());
+
+        assert_eq!(
+            CollaborationExecutor::extract_score(&squad_result),
+            Some(0.85)
+        );
+        assert_ne!(
+            CollaborationExecutor::extract_execution_result(&squad_result),
+            serde_json::Value::Null
+        );
     }
 }

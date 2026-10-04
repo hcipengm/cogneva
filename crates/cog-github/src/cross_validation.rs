@@ -402,9 +402,14 @@ pub fn extract_verdict(result: &serde_json::Value) -> Option<CrossValidationVerd
             return Some(v);
         }
     }
-    // PGE pipeline/roundtable final generation artifacts.
+    // PGE pipeline/roundtable final generation artifacts. A debate records its
+    // rounds under a `roundtable` key and hands back that same envelope as its
+    // result, so the bare path covers a pipeline and the nested one a debate;
+    // probing only the bare path reads every debate as having produced no
+    // verdict at all.
     if let Some(artifacts) = result
         .pointer("/squad_result/result/final_generation/artifacts")
+        .or_else(|| result.pointer("/squad_result/result/roundtable/final_generation/artifacts"))
         .and_then(|a| a.as_array())
     {
         for artifact in artifacts {
@@ -634,6 +639,27 @@ mod tests {
         let v = extract_verdict(&result).unwrap();
         assert_eq!(v.verdict, "fail");
         assert_eq!(v.summary, "compile error");
+    }
+
+    #[test]
+    fn verdict_extraction_reads_the_envelope_a_debate_hands_back() {
+        let result = serde_json::json!({
+            "squad_result": {
+                "result": {
+                    "roundtable": {
+                        "final_generation": {
+                            "artifacts": [
+                                {"name": "verdict.json", "artifact_type": "report",
+                                 "content": "```json\n{\"verdict\":\"pass\",\"summary\":\"no defect found\",\"tests\":\"cargo test: 512 passed\",\"eval\":\"n/a\"}\n```"}
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+        let v = extract_verdict(&result).unwrap();
+        assert_eq!(v.verdict, "pass");
+        assert_eq!(v.summary, "no defect found");
     }
 
     #[test]
