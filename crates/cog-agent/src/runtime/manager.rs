@@ -59,6 +59,15 @@ pub struct GlobalAgentManager {
     round_robin: Mutex<usize>,
     default_runtime_config: cog_core::RuntimeConfig,
     default_tools: Option<Arc<crate::ToolRegistry>>,
+    /// The sandbox a worker's own reads of its checkout run in.
+    ///
+    /// A different handle from the one the tool registry carries. A worker's
+    /// tools reach the sandbox through the registry, so a worker created
+    /// without this one still runs commands and still edits its tree; what it
+    /// loses is every read the agent itself makes of that tree, and the loss is
+    /// silent — a backend that is absent and a checkout nobody changed both
+    /// answer "no change here".
+    sandbox_backend: Option<Arc<dyn cog_core::SandboxBackend>>,
     external_skill_registry: Option<Arc<dyn cog_core::ExternalSkillRegistry>>,
     /// The shared agent-skill registry (`skills/*.json`). Handing each new
     /// agent the skill its role declares is what makes the skill's runtime
@@ -110,6 +119,7 @@ impl GlobalAgentManager {
                 ..cog_core::RuntimeConfig::default()
             },
             default_tools: None,
+            sandbox_backend: None,
             external_skill_registry: None,
             skill_registry: None,
             event_bus: None,
@@ -170,6 +180,19 @@ impl GlobalAgentManager {
     /// Set the default [`crate::ToolRegistry`] shared by all spawned workers.
     pub fn with_tools(mut self, tools: Arc<crate::ToolRegistry>) -> Self {
         self.default_tools = Some(tools);
+        self
+    }
+
+    /// Give every spawned worker the sandbox its own checkout reads run in.
+    ///
+    /// The tool registry carries its own handle to the same backend, and that
+    /// one is what a worker's tools use. This is the other handle: the one an
+    /// agent reads its tree through when something asks what the run changed.
+    pub fn with_sandbox_backend(
+        mut self,
+        backend: Arc<dyn cog_core::SandboxBackend>,
+    ) -> Self {
+        self.sandbox_backend = Some(backend);
         self
     }
 
@@ -235,6 +258,9 @@ impl GlobalAgentManager {
                 .with_heartbeat_interval(self.heartbeat_interval_secs);
             if let Some(ref tools) = self.default_tools {
                 a = a.with_tools(tools.as_ref().clone());
+            }
+            if let Some(ref sb) = self.sandbox_backend {
+                a = a.with_sandbox_backend(sb.clone());
             }
             if let Some(ref esr) = self.external_skill_registry {
                 a = a.with_external_skill_registry(esr.clone());
@@ -346,6 +372,9 @@ impl cog_core::AgentManager for GlobalAgentManager {
                 .with_heartbeat_interval(self.heartbeat_interval_secs);
             if let Some(ref tools) = self.default_tools {
                 a = a.with_tools(tools.as_ref().clone());
+            }
+            if let Some(ref sb) = self.sandbox_backend {
+                a = a.with_sandbox_backend(sb.clone());
             }
             if let Some(ref esr) = self.external_skill_registry {
                 a = a.with_external_skill_registry(esr.clone());

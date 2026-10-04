@@ -80,6 +80,9 @@ impl cog_core::SystemPlugin for AgentPlugin {
 
         // Clone before moving into tool_registry so eval runtime can reuse them.
         let sandbox_backend_for_eval = sandbox_backend.clone();
+        // And the pool: the registry's handle is what a worker's tools use, this
+        // one is what the worker itself reads its checkout through.
+        let sandbox_backend_for_pool = sandbox_backend.clone();
         let _guardrail_for_eval = guardrail.clone();
         let plugin_registry_for_eval = plugin_registry.clone();
         let hook_archive = ctx.consume_service::<dyn cog_core::HookArchive>();
@@ -247,7 +250,8 @@ impl cog_core::SystemPlugin for AgentPlugin {
         )
         .with_default_runtime_config(agent_loop_config)
         .with_heartbeat_interval_secs(agent_config.heartbeat_interval_secs)
-        .with_tools(tool_registry);
+        .with_tools(tool_registry)
+        .with_sandbox_backend(sandbox_backend_for_pool);
         // Workers publish onto the cluster-wide bus (stream plugin) so live
         // observers see every turn/tool call in real time. Without the stream
         // plugin agents keep their private buses — tests and embedded use.
