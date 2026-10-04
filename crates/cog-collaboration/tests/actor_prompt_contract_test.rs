@@ -437,3 +437,88 @@ async fn a_handed_back_change_carries_the_files_the_gate_named() {
         "an ordinary plan was handed a target list it was never given: {contract}"
     );
 }
+
+/// Two rounds of one loop are one request, so the upstream cache has to be able
+/// to hold it.
+///
+/// The loop makes a fresh `Task` per outer round — new id, new timestamps — and
+/// the document used to carry the whole record. Serialization is in key order,
+/// `created_at` sorted ahead of everything the request is made of, and the
+/// request was cloned from a context the round's own fields had already been
+/// written into, so two rounds of one request disagreed twice over: once in the
+/// task's bookkeeping and once inside the request itself.
+///
+/// Written as a comparison because that is the property: everything the two
+/// rounds disagree about must sit *after* the request. The control below
+/// reconstructs the assembly that used to be here from the same two rounds, so
+/// the measurement is known to discriminate — a prefix that came out equal for
+/// both shapes would pin nothing.
+#[tokio::test]
+async fn two_rounds_of_one_loop_share_the_request_byte_for_byte() {
+    let base = serde_json::json!({
+        "goal": "add a metric cell for the upstream pool",
+        "evolution_mode": "generate_change",
+        "signals": [{"id": "self-signal-alert-1", "kind": "alert"}],
+    });
+    let goal = "add a metric cell for the upstream pool";
+    let plan = serde_json::json!({"summary": "s", "sub_tasks": []});
+
+    // The loop's own two lines per round, and nothing else: a fresh task, the
+    // round's fields written into `context`.
+    let mut rendered = Vec::new();
+    let mut as_it_used_to_be_built = Vec::new();
+    for iteration in 1..=2u32 {
+        let mut context = base.clone();
+        if iteration > 1 {
+            context["ralph_iteration"] = serde_json::json!(iteration);
+            context["ralph_feedback"] = serde_json::json!("the change did not compile");
+            context["ralph_strategy"] = serde_json::json!("Identical");
+        }
+        let mut input = base.clone();
+        input["goal"] = serde_json::json!(goal);
+        let task = cog_core::Task::new(
+            format!("ralph-pipeline-{}", uuid::Uuid::new_v4()),
+            cog_core::TaskType::Custom("ralph_pipeline_goal".into()),
+            input,
+        );
+
+        let agent = Recorder::new(plan.clone());
+        PlannerActor::new(agent.clone())
+            .plan(&task, 1, None, None, None, None)
+            .await;
+        let (_, payload) = cog_core::contract::prompt::split_contract(agent.inputs()[0].clone());
+        rendered.push(cog_core::contract::prompt::render_varying_half(&payload));
+
+        // The assembly that used to be here: the whole task record, and the
+        // request cloned from the context the round had already been written
+        // into.
+        as_it_used_to_be_built.push(cog_core::contract::prompt::render_varying_half(
+            &serde_json::json!({"task": task, "context": context}),
+        ));
+    }
+
+    let shared_prefix =
+        |a: &str, b: &str| a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
+
+    // The request is everything up to `context`, which the runtime writes after
+    // it. Two rounds must agree on all of it.
+    let request_end = rendered[0]
+        .find(",\"context\":")
+        .expect("the runtime writes the request first");
+    assert!(request_end > 200, "the request is {} bytes", request_end);
+    assert_eq!(
+        &rendered[0][..request_end],
+        &rendered[1][..request_end],
+        "two rounds of one request disagree before the attempt's own fields begin"
+    );
+
+    // The control: same two rounds, the old assembly. Its first differing byte
+    // fell inside the request — that is the defect, and it is also what makes
+    // the comparison above a measurement rather than a coincidence.
+    let old = shared_prefix(&as_it_used_to_be_built[0], &as_it_used_to_be_built[1]);
+    assert!(
+        old < request_end,
+        "the old assembly shared {old} of the request's {request_end} bytes, which \
+         is not the defect this pins"
+    );
+}

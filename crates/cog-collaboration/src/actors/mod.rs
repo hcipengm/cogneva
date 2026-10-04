@@ -33,11 +33,33 @@ pub(crate) fn actor_input(
 ) -> serde_json::Value {
     with_contract(
         serde_json::json!({
-            "task": task,
+            "task": request_half(task),
             "context": context,
         }),
         contract,
     )
+}
+
+/// The part of a task that is the request, as opposed to the record of it.
+///
+/// The whole `Task` used to be written here. It is not a request: it carries the
+/// id, the two timestamps, the status, the retry and lease bookkeeping and the
+/// dependency lists, none of which the requester authored or the model reads.
+/// What it costs is not only the tokens those fields take — it is the cache.
+/// Serialization is in key order, and `created_at` sorts ahead of everything the
+/// request is made of, so the first byte after `{"blocked_by":[],"blocks":[],` is
+/// a timestamp and nothing behind it is ever shared. Measured on two consecutive
+/// rounds of one loop, whose request does not move, the rendered halves shared
+/// 73 bytes of 708 and the first difference was that timestamp.
+///
+/// What a requester authored is `input`, and the branches that read it also want
+/// the type. Both are the same for every round of one request, which is what
+/// makes them cacheable at all.
+fn request_half(task: &cog_core::Task) -> serde_json::Value {
+    serde_json::json!({
+        "input": &task.input,
+        "task_type": &task.task_type,
+    })
 }
 
 /// Attach the stable half to a document that is not one of task and context.

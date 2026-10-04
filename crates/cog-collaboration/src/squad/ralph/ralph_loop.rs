@@ -632,6 +632,14 @@ impl RalphLoop {
     ) -> RalphVerdict {
         self.load_history().await;
 
+        // 请求就是目标加上它被提出时的上下文，整个外层循环只有这一份。本轮
+        // 自己的字段（轮次号、上一轮的反馈、重置策略）写在 `context` 里，随
+        // `context` 走——那才是"本次尝试"该待的地方。它们曾经也被折进任务
+        // 的 input，因为 input 是从**已经写过的** context 克隆出来的：于是同
+        // 一个请求的两轮在请求内部就不一样了，上游缓存连那截从不变的部分也
+        // 存不住。请求与尝试分开，两半才各自成立。
+        let request = context.clone();
+
         // 本轮自己的预算：归档历史提供反馈与停滞证据，不从预算里扣。
         // 起算点跟着历史走曾让预算变成目标的终身配额——攒满之后每次重驱
         // 都瞬间"耗尽"且一轮都不跑，连已经能通过的目标也被永久判死。
@@ -646,7 +654,7 @@ impl RalphLoop {
                 }
             }
 
-            let mut input = context.clone();
+            let mut input = request.clone();
             input["goal"] = serde_json::json!(goal);
             let task = Task::new(
                 format!("ralph-pipeline-{}", uuid::Uuid::new_v4()),
@@ -749,6 +757,9 @@ impl RalphLoop {
     ) -> RalphVerdict {
         self.load_history().await;
 
+        // 与 Pipeline 同构：请求整轮只有一份，轮次自己的字段只落在 context 里。
+        let request = context.clone();
+
         // 与 Pipeline 同构：预算属于本次执行，历史只提供反馈与停滞证据。
         for iteration in 1..=self.config.max_iterations {
             crate::observable::global_observable().record_round();
@@ -759,7 +770,7 @@ impl RalphLoop {
                 }
             }
 
-            let mut input = context.clone();
+            let mut input = request.clone();
             input["goal"] = serde_json::json!(goal);
             let task = Task::new(
                 format!("ralph-roundtable-{}", uuid::Uuid::new_v4()),
