@@ -622,10 +622,35 @@ impl ReflectionEngine {
                 l.pattern_key.as_deref().unwrap_or("unknown"),
                 l.area
             );
-            if self.check_evolution_cooldown(&change_key).await {
+            if self
+                .the_hand_off_takes_its_turn(refused_by_a_gate, &change_key)
+                .await
+            {
                 self.hand_off_change_rework(l, refused_by_a_gate).await;
             }
         }
+    }
+
+    /// Whether this trigger may hand the requirement back to the main flow now,
+    /// or whether the same key fired too recently.
+    ///
+    /// The window is meant for the self-review half, and that half can afford to
+    /// wait: its patterns recur, so a turn lost now is bought later by the same
+    /// defect showing up again. A refusal is not that. It is one verdict on one
+    /// artifact, the artifact is retired on the verdict, and the record this
+    /// trigger holds is never seen again -- a turn it loses here is a
+    /// requirement dropped for good, and the rule that watches for the hand-off
+    /// being dead fires a day later with nothing left to point at.
+    ///
+    /// It is also what lets the loop run. A second attempt that fails the same
+    /// way is refused with the same cause on the same files, which is the same
+    /// key, so a refusal that queued behind its own predecessor would stop the
+    /// regeneration exactly where it has to continue: red, repaired, and round
+    /// again until the gate is green. Nothing is exposed by skipping the queue
+    /// for it -- one refusal retires one artifact, so this can be entered at
+    /// most once per refused change and has nothing to storm with.
+    async fn the_hand_off_takes_its_turn(&self, refused_by_a_gate: bool, key: &str) -> bool {
+        refused_by_a_gate || self.check_evolution_cooldown(key).await
     }
 
     /// Hand a code defect back to the main evolution flow as a task.
@@ -1830,31 +1855,39 @@ mod tests {
         );
     }
 
-    /// Two refusals of different criteria are different defects, and the
-    /// cooldown that keeps one defect from being regenerated every cycle must
-    /// not swallow the other. The key that separates them is the criterion plus
-    /// the files, so this is also the test that the key is what the cooldown
-    /// reads.
+    /// Two refusals of different criteria are different defects; two refusals of
+    /// the same criterion are also two defects. Neither waits its turn.
+    ///
+    /// The second half is the one that had to change. A refusal is one verdict on
+    /// one artifact, the artifact is retired on that verdict, and the record this
+    /// trigger holds is never seen again — so a turn it loses is a requirement
+    /// dropped for good, not a round deferred. It is also the case the loop turns
+    /// on: a regenerated change refused the same way is refused with the same
+    /// cause on the same files, which is the same key, and a refusal that queued
+    /// behind its own predecessor would stop the regeneration exactly where it
+    /// was told to continue.
     #[tokio::test]
-    async fn one_criterion_s_cooldown_does_not_swallow_another() {
+    async fn a_refusal_is_never_the_one_that_waits() {
         let (mut engine, submissions, _) = engine_that_records_rework();
         engine.set_cooldown_secs(3600);
 
         let files = vec![std::path::PathBuf::from("crates/x/src/lib.rs")];
-        engine
-            .record_change_refusal("c-1", cog_core::RejectionCause::TestsFailed, &files, "boom")
-            .await
-            .unwrap();
-        assert_eq!(*submissions.lock().await, 1, "the first refusal hands off");
-
-        engine
-            .record_change_refusal("c-2", cog_core::RejectionCause::TestsFailed, &files, "boom")
-            .await
-            .unwrap();
+        for change in ["c-1", "c-2"] {
+            engine
+                .record_change_refusal(
+                    change,
+                    cog_core::RejectionCause::TestsFailed,
+                    &files,
+                    "boom",
+                )
+                .await
+                .unwrap();
+        }
         assert_eq!(
             *submissions.lock().await,
-            1,
-            "the same defect again inside the cooldown is not handed off again"
+            2,
+            "the second artifact refused the same way is a second requirement, and \
+             holding it back is what made the refusal terminal"
         );
 
         engine
@@ -1868,9 +1901,40 @@ mod tests {
             .unwrap();
         assert_eq!(
             *submissions.lock().await,
-            2,
-            "a refusal by a different check is a different defect, and the first \
-             one's cooldown does not silence it"
+            3,
+            "a refusal by a different check is a different defect, and it goes back \
+             to the main flow like the others"
+        );
+    }
+
+    /// The window still governs the half it was written for, and only that half.
+    ///
+    /// Asked of the decision itself rather than assembled from the trigger's
+    /// conditions, because the asymmetry is the property: a self-review pattern
+    /// recurs, so a round lost inside the window is bought again by the same
+    /// defect showing up; a refusal does not recur.
+    #[tokio::test]
+    async fn the_window_still_holds_back_the_pattern_and_only_the_pattern() {
+        let (engine, ..) = engine_that_records_rework();
+        let key = "change:TestsFailed@crates/x/src/lib.rs:Backend";
+
+        assert!(
+            engine.the_hand_off_takes_its_turn(true, key).await,
+            "the first refusal of a key goes back to the main flow"
+        );
+        assert!(
+            engine.the_hand_off_takes_its_turn(true, key).await,
+            "and so does the one right behind it: the refused artifact is retired, \
+             so there is nothing left to hand off twice"
+        );
+
+        assert!(
+            engine.the_hand_off_takes_its_turn(false, key).await,
+            "a pattern at the threshold buys its generation"
+        );
+        assert!(
+            !engine.the_hand_off_takes_its_turn(false, key).await,
+            "the pattern half is still throttled inside the window"
         );
     }
 
