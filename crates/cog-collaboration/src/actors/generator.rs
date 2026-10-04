@@ -231,8 +231,90 @@ impl GeneratorActor {
                 output = crate::squad::pge::parse_generator_output(&value);
             }
         }
+        // Last, so it also covers a revision the self-review wrote: whatever
+        // artifact the round ends up with is the one the tree is asked about.
+        if is_self_evolution {
+            output = prefer_workspace_change(self.agent.as_ref(), &task.id, output).await;
+        }
         output
     }
+}
+
+/// Take the change from the run's checkout when the checkout holds one.
+///
+/// The artifact the model writes is prose about a file, and the form defects
+/// the apply gate refuses — a path header naming a directory the file is not
+/// in, a context line remembered with a token missing, a hunk header whose
+/// count disagrees with its body — are properties of that prose, not of the
+/// change. A run that edited its checkout has the same change on disk, where
+/// git derived all three from the file itself. This reads that back and swaps
+/// it in.
+///
+/// The typed artifact is kept whenever the tree cannot be read — no checkout,
+/// no backend, or a run that left its tree untouched — so this can only replace
+/// a diff with one the tree produced, never lose a change the round would have
+/// had. Which end was used is counted rather than inferred: a harvest that
+/// silently never fires and a model that never needed one leave the same
+/// absence otherwise.
+async fn prefer_workspace_change(
+    agent: &dyn Agent,
+    task_id: &str,
+    output: GeneratorOutput,
+) -> GeneratorOutput {
+    // A round with no change artifact is never asked about, so a report-only
+    // round does not pay a sandbox command to be told there is nothing to swap.
+    if !has_change_artifact(&output) {
+        return output;
+    }
+    let harvested = match agent.workspace_change(task_id).await {
+        Ok(diff) => diff,
+        Err(e) => {
+            tracing::warn!(
+                task_id,
+                error = %e,
+                "could not read the run's checkout; keeping the generated diff"
+            );
+            None
+        }
+    };
+    let (output, source) = apply_workspace_change(output, harvested);
+    if let Some(source) = source {
+        crate::observable::global_observable().record_change_diff_source(source);
+    }
+    output
+}
+
+fn has_change_artifact(output: &GeneratorOutput) -> bool {
+    output.artifacts.iter().any(|artifact| artifact.is_change())
+}
+
+/// Swap the tree's diff in for the typed one, and say which end was used.
+///
+/// `None` from this is "there was nothing to decide": a round with no change
+/// artifact has no diff whose source could be counted, and counting one anyway
+/// would report a choice that was never made. A harvested string that is not a
+/// diff at all (no `diff --git` in it) is a tree that answered with something
+/// else, and it is refused here rather than handed to the gate as a change.
+fn apply_workspace_change(
+    mut output: GeneratorOutput,
+    harvested: Option<String>,
+) -> (GeneratorOutput, Option<&'static str>) {
+    if !has_change_artifact(&output) {
+        return (output, None);
+    }
+    let Some(diff) = harvested.filter(|diff| diff.contains("diff --git")) else {
+        return (output, Some("model"));
+    };
+    for artifact in &mut output.artifacts {
+        // The contract asks for exactly one change artifact. A second one is a
+        // different defect, and filling it with the same diff would hide it
+        // behind a duplicate.
+        if artifact.is_change() {
+            artifact.content = diff.clone();
+            break;
+        }
+    }
+    (output, Some("tree"))
 }
 
 /// The prompt contract the Generator gets for a self-evolution task.
@@ -275,8 +357,8 @@ fn change_generation_contract() -> serde_json::Value {
                 }
             ]
         },
-        "artifact_instructions": "Output exactly one artifact: artifact_type='change', name='changes.diff', content being the raw unified diff whose first line is 'diff --git a/<path> b/<path>'. No markdown fences, no commentary inside content.",
-        "grounding": "Your diff is validated with `git apply --check` against a checkout of this repository, then applied to it and compiled. It must therefore describe the files as they actually are, not as you remember them. You have file tools in this run — use them before writing: list the directories you intend to touch, then read every file you change in full (read_file, or a shell command such as `sed -n '1,400p' <path>`). Address files by repository-relative path (for example crates/cog-core/src/lib.rs) — the same path that appears in the '+++ b/' line — and those paths resolve against the checkout. Never guess a path: a path that is not in the checkout is rejected unless the diff itself declares it as created.",
+        "artifact_instructions": "Output exactly one artifact: artifact_type='change', name='changes.diff', content being the raw unified diff whose first line is 'diff --git a/<path> b/<path>'. Produce that content by making the edit in the checkout and then pasting what `git --no-pager diff` prints there, verbatim: the diff is read off the files, not reconstructed from memory. Retyping it by hand is accepted only when the checkout cannot be read at all, and a hand-written diff is the shape the apply gate rejects. No markdown fences, no commentary inside content.",
+        "grounding": "Your diff is validated with `git apply --check` against a checkout of this repository, then applied to it and compiled. It must therefore describe the files as they actually are, not as you remember them. You have file tools in this run — use them before writing: list the directories you intend to touch, then read every file you change in full (read_file, or a shell command such as `sed -n '1,400p' <path>`). Then make the edit in the checkout itself (write_file, or a shell command) and take this artifact's content from `git --no-pager diff`, so the headers, the context lines and the hunk counts are the ones git derives from the files. Address files by repository-relative path (for example crates/cog-core/src/lib.rs) — the same path that appears in the '+++ b/' line — and those paths resolve against the checkout. Never guess a path: a path that is not in the checkout is rejected unless the diff itself declares it as created.",
         "diff_grammar": "Every hunk header '@@ -<start>,<count> +<start>,<count> @@' must declare exactly the number of lines its body carries, and the diff must end with a newline. Every context line and every removed line has to match the file byte for byte, including indentation and trailing whitespace, and the start line numbers must be the real line numbers in the file you read. Keep hunks narrow and anchor them on context that is unique in the file: one hunk whose context cannot be located fails the entire change.",
         "creating_a_file": "To add a file, declare it as a creation: 'diff --git a/<path> b/<path>', then 'new file mode 100644', '--- /dev/null', '+++ b/<path>', and a hunk header '@@ -0,0 +1,<n> @@' whose body is n '+' lines. Creating a file that already exists fails, and so does rewriting a file that does not exist without declaring it as a creation.",
         "scope": "Stay inside the checkout, and prefer paths under crates/*/src/. The gate rejects changes to build and deployment manifests (Cargo.toml, Cargo.lock, Dockerfile, Containerfile, docker-compose.yml, setup.sh) and to configuration or credential files (cogneva.json, .env, .envrc, *.pem, *.key, *.crt, *.p12); deletions are judged by the same rules as edits. A diff far larger than the change it makes is refused as too large to review, so keep the change to the lines it needs. The applied change is compiled and tested, so it must be complete and self-consistent — no placeholder or unimplemented bodies.",
@@ -536,5 +618,70 @@ mod tests {
                 "the contract answers {key}, which is not a cause the gate can reach"
             );
         }
+    }
+
+    /// A change artifact carrying the diff the model typed, with a path header
+    /// that names a directory the file is not in — the defect the tree's own
+    /// diff cannot have.
+    fn typed_change_output() -> GeneratorOutput {
+        GeneratorOutput {
+            content: serde_json::json!("added the reader"),
+            artifacts: vec![crate::squad::pge::types::Artifact {
+                name: "changes.diff".into(),
+                artifact_type: "change".into(),
+                content: "diff --git a/crates/cogneta/src/a.rs b/crates/cogneta/src/a.rs\n\
+                          --- a/crates/cogneva/src/a.rs\n+++ b/crates/cogneta/src/a.rs\n\
+                          @@ -1 +1 @@\n-old\n+new\n"
+                    .into(),
+            }],
+        }
+    }
+
+    const TREE_DIFF: &str = "diff --git a/crates/cogneva/src/a.rs b/crates/cogneva/src/a.rs\n\
+                            --- a/crates/cogneva/src/a.rs\n+++ b/crates/cogneva/src/a.rs\n\
+                            @@ -1 +1 @@\n-old\n+new\n";
+
+    #[test]
+    fn the_diff_the_run_left_in_its_checkout_replaces_the_typed_one() {
+        let (output, source) =
+            apply_workspace_change(typed_change_output(), Some(TREE_DIFF.into()));
+        assert_eq!(source, Some("tree"));
+        assert_eq!(output.artifacts[0].content, TREE_DIFF);
+    }
+
+    #[test]
+    fn a_round_the_tree_cannot_answer_for_keeps_the_typed_diff() {
+        let typed = typed_change_output();
+        let (output, source) = apply_workspace_change(typed.clone(), None);
+        assert_eq!(source, Some("model"));
+        assert_eq!(output.artifacts[0].content, typed.artifacts[0].content);
+    }
+
+    #[test]
+    fn a_checkout_that_answers_with_something_other_than_a_diff_is_not_swapped_in() {
+        let typed = typed_change_output();
+        let (output, source) =
+            apply_workspace_change(typed.clone(), Some("nothing changed\n".into()));
+        assert_eq!(source, Some("model"));
+        assert_eq!(output.artifacts[0].content, typed.artifacts[0].content);
+    }
+
+    /// A round with no change artifact has no diff whose source could be
+    /// counted; counting one anyway reports a choice nobody made. The other
+    /// artifact must also survive verbatim — the swap touches change artifacts
+    /// and nothing else.
+    #[test]
+    fn a_round_with_no_change_artifact_decides_nothing() {
+        let output = GeneratorOutput {
+            content: serde_json::json!("a report"),
+            artifacts: vec![crate::squad::pge::types::Artifact {
+                name: "report.md".into(),
+                artifact_type: "report".into(),
+                content: "@@ not a diff @@".into(),
+            }],
+        };
+        let (output, source) = apply_workspace_change(output, Some(TREE_DIFF.into()));
+        assert_eq!(source, None);
+        assert_eq!(output.artifacts[0].content, "@@ not a diff @@");
     }
 }

@@ -270,6 +270,21 @@ pub const BOUNDARY_DIMENSIONS: [&str; 5] = [
 /// exists, which is the silence these rules are written against.
 pub const CHANGE_YIELD_METRIC: &str = "self_evolution_change_yield_total";
 
+/// The name of the change-diff-source family.
+pub const CHANGE_DIFF_SOURCE_METRIC: &str = "collab_change_diff_source_total";
+
+/// Where the diff of a generation round's change artifact came from.
+///
+/// Closed set: the label names a producer, and a third value would mean a
+/// producer nobody wrote down. `tree` is a diff read out of the checkout the
+/// run edited — git derived its headers and context from the files themselves;
+/// `model` is the text the model wrote out, which is what the apply gate
+/// refuses when it disagrees with the file. The second cell is the one that has
+/// to keep being published: it is what "the harvest never fired" looks like,
+/// and on its own that absence is indistinguishable from a tree that was never
+/// read.
+pub const CHANGE_DIFF_SOURCES: [&str; 2] = ["tree", "model"];
+
 /// Where a self-evolution run's yield ended, and why.
 ///
 /// Closed set: the metric labels it, and an outcome nobody named would be
@@ -552,6 +567,19 @@ pub struct CollaborationObservable {
     /// that failed. Keyed by a `&'static str` so the cells are exactly the
     /// constants above and a typo cannot open a seventh.
     failure_routes: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
+    /// Which end the change artifacts of a generation round came from, over
+    /// [`CHANGE_DIFF_SOURCES`].
+    ///
+    /// A round's diff can be the one the model typed out or the one git
+    /// printed from the checkout the run edited. The two are not
+    /// interchangeable: the typed one carries whatever the model remembered
+    /// about the file, and every form defect the apply gate refuses is a
+    /// property of that text, not of the change. Until this face existed the
+    /// question "did the tree get used at all" had no answer, so a harvest that
+    /// silently never fired would read exactly like a model that never needed
+    /// it. Both cells are published, zeros included. Keyed by a `&'static str`
+    /// so the cells are the constants above and a typo cannot open a third.
+    change_diff_sources: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
 }
 
 impl CollaborationObservable {
@@ -811,6 +839,15 @@ impl CollaborationObservable {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *map.entry(source.to_string()).or_insert(0) += 1;
+    }
+
+    /// Record which end one generation round's change artifact came from.
+    pub fn record_change_diff_source(&self, source: &'static str) {
+        let mut map = self
+            .change_diff_sources
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *map.entry(source).or_insert(0) += 1;
     }
 
     /// 记一次分类声明（产生端调用）。临界区只有一次 map 插入，同步加锁
@@ -1102,6 +1139,23 @@ impl Observable for CollaborationObservable {
                 metrics.push(
                     RawMetric::new("collab_goal_class_source_total", count as f64)
                         .with_label("source", source.as_str()),
+                );
+            }
+
+            // Which end a generation round's diff came from. Both cells are
+            // published: a harvest that never fires and a model that never
+            // needed one have to look different, and the `model` cell is what
+            // the second looks like when it is the first.
+            let diff_sources = self
+                .change_diff_sources
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            for source in CHANGE_DIFF_SOURCES {
+                let count = diff_sources.get(source).copied().unwrap_or(0);
+                metrics.push(
+                    RawMetric::new(CHANGE_DIFF_SOURCE_METRIC, count as f64)
+                        .with_label("source", source),
                 );
             }
 
@@ -2052,6 +2106,30 @@ mod tests {
                 "shortcut".to_string(),
                 "unknown".to_string()
             ]
+        );
+    }
+
+    fn diff_source_cells(metrics: &[RawMetric]) -> Vec<(String, f64)> {
+        metrics
+            .iter()
+            .filter(|m| m.name == CHANGE_DIFF_SOURCE_METRIC)
+            .map(|m| (m.labels.get("source").cloned().unwrap_or_default(), m.value))
+            .collect()
+    }
+
+    /// Both ends are published from the first round, zeros included. A series
+    /// that only appears once something happened cannot answer the question it
+    /// exists for: "the harvest never fired" and "the model never needed one"
+    /// leave the same single cell behind.
+    #[tokio::test]
+    async fn both_ends_of_a_change_diff_are_published_including_the_zero() {
+        let obs = CollaborationObservable::new();
+        obs.record_change_diff_source("tree");
+
+        let metrics = obs.collect_metrics("D8").await.unwrap();
+        assert_eq!(
+            diff_source_cells(&metrics),
+            vec![("tree".to_string(), 1.0), ("model".to_string(), 0.0)]
         );
     }
 }

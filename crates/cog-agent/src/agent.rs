@@ -466,6 +466,45 @@ impl Agent {
         self.dispatch_prompt(Some(task_id.to_string()), input).await
     }
 
+    /// The change this task's checkout holds, as git prints it.
+    ///
+    /// The tree a run was given is the one it edited, so a diff taken from it
+    /// is what the run did rather than what it said it did: git derives the
+    /// path headers, the context and the hunk counts from the files themselves.
+    /// `git add -N` first, so a file the run created is part of the diff rather
+    /// than an untracked leftover the diff would silently omit.
+    ///
+    /// No backend, a failed command or an empty answer is `Ok(None)`, not an
+    /// error: a change that cannot be read from a tree is the caller's typed
+    /// artifact to keep, and failing here would turn "no checkout" into "the
+    /// round produced nothing". What the text means is the caller's to judge —
+    /// this crate runs commands, it does not know what a change artifact is.
+    pub async fn workspace_change(&self, task_id: &str) -> SFResult<Option<String>> {
+        let Some(backend) = self.sandbox_backend.as_ref() else {
+            return Ok(None);
+        };
+        let req = cog_core::SandboxRequest {
+            task_id: task_id.to_string(),
+            agent_id: self.config.agent_id.clone(),
+            payload: cog_core::SandboxPayload::Command {
+                command: WORKSPACE_CHANGE_COMMAND.to_string(),
+            },
+            input: serde_json::Value::Null,
+            timeout: std::time::Duration::from_secs(120),
+            limits: Default::default(),
+        };
+        let result = backend.execute(&req).await?;
+        if result.exit_code != 0 {
+            tracing::warn!(
+                task_id,
+                exit_code = result.exit_code,
+                stderr = %result.stderr,
+                "could not read the run's change from its checkout; keeping the generated artifact"
+            );
+        }
+        Ok(workspace_change_from(&result))
+    }
+
     async fn dispatch_prompt(
         &self,
         task_id: Option<String>,
@@ -1023,6 +1062,10 @@ impl cog_core::Agent for Agent {
         self.prompt_for_task(task_id, input).await
     }
 
+    async fn workspace_change(&self, task_id: &str) -> cog_core::SFResult<Option<String>> {
+        self.workspace_change(task_id).await
+    }
+
     async fn start(&self) {
         self.start().await;
     }
@@ -1347,5 +1390,73 @@ mod forward_event_tests {
             matches!(broadcast_rx.try_recv(), Ok(AgentEvent::AgentEnd { .. })),
             "without a sink AgentEnd must stay on broadcast"
         );
+    }
+}
+
+/// The command that reads a run's change back out of its checkout.
+///
+/// `git add -N` before the diff, so a file the run created is part of it rather
+/// than an untracked leftover `git diff` would silently omit; `--no-pager`,
+/// because the executor has no terminal and a pager would hang the read.
+/// `--no-color` for the same reason the pager is named: the answer is bytes
+/// another program compares, not something a human reads.
+const WORKSPACE_CHANGE_COMMAND: &str =
+    "git add -N . >/dev/null 2>&1; git --no-pager diff --no-color";
+
+/// Read a command's answer as "the change this checkout holds".
+///
+/// A command that failed and a command that printed nothing are both `None`:
+/// neither is a change, and the caller keeps the artifact it already has. The
+/// decision is kept out of the request path so the two ways this returns `None`
+/// can be read without a sandbox.
+fn workspace_change_from(result: &cog_core::SandboxResult) -> Option<String> {
+    if result.exit_code != 0 {
+        return None;
+    }
+    let diff = result.stdout.trim_end_matches(['\n', '\r']);
+    if diff.trim().is_empty() {
+        return None;
+    }
+    Some(format!("{diff}\n"))
+}
+
+#[cfg(test)]
+mod workspace_change_tests {
+    use super::*;
+
+    fn result(exit_code: i32, stdout: &str) -> cog_core::SandboxResult {
+        cog_core::SandboxResult {
+            stdout: stdout.into(),
+            stderr: String::new(),
+            exit_code,
+            output: None,
+            duration_ms: 0,
+            resource_usage: Default::default(),
+        }
+    }
+
+    /// The tree's diff comes back with exactly one terminating newline: git
+    /// prints one, and a reader that keeps whatever trailing blank lines the
+    /// capture added would hand the gate a patch with a body the header does
+    /// not count.
+    #[test]
+    fn a_checkout_that_holds_a_diff_answers_with_it_terminated_once() {
+        let stdout = "diff --git a/a.rs b/a.rs\n@@ -1 +1 @@\n-old\n+new\n\n";
+        assert_eq!(
+            workspace_change_from(&result(0, stdout)),
+            Some("diff --git a/a.rs b/a.rs\n@@ -1 +1 @@\n-old\n+new\n".to_string())
+        );
+    }
+
+    /// A git that failed, or a tree with nothing changed, is not a change: both
+    /// have to read as "no answer", or a failed command would be handed on as
+    /// an empty patch and cost the round it was meant to save.
+    #[test]
+    fn a_failed_command_and_an_untouched_tree_both_read_as_no_answer() {
+        assert_eq!(
+            workspace_change_from(&result(128, "diff --git a/a.rs b/a.rs\n")),
+            None
+        );
+        assert_eq!(workspace_change_from(&result(0, "\n  \n")), None);
     }
 }

@@ -114,6 +114,26 @@ pub trait Agent: Send + Sync {
         let _ = task_id;
         self.prompt(input).await
     }
+
+    /// The change a run left in its checkout, read from the tree rather than
+    /// from the text the model wrote out.
+    ///
+    /// A diff the model types by hand is prose about a file: its path headers,
+    /// context lines and hunk counts are whatever the model remembered, and any
+    /// of them can disagree with the file the apply gate reads. A run that was
+    /// given a checkout and edited it leaves the same change as a diff git
+    /// produced from the file's real bytes, which cannot disagree with the tree
+    /// it is applied to. Implementations that can run a command in the run's
+    /// checkout return `Some(diff)` when that tree holds one.
+    ///
+    /// `None` means no tree could be read — no checkout, no backend, or a run
+    /// that left its tree untouched. That is not "no change": a caller keeps
+    /// whatever it already had, so this can only replace a diff with one the
+    /// tree itself produced. Default: `None`.
+    async fn workspace_change(&self, _task_id: &str) -> crate::SFResult<Option<String>> {
+        Ok(None)
+    }
+
     async fn start(&self);
     async fn snapshot(&self, task_id: String) -> crate::SFResult<crate::snapshot::AgentCheckpoint>;
     async fn restore(&self, snapshot: &crate::snapshot::AgentCheckpoint) -> crate::SFResult<()>;
