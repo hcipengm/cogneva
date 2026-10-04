@@ -251,6 +251,16 @@ impl GeneratorActor {
 /// without a clause here is a round the generator is invited to spend and lose,
 /// and that has already happened once — the lint criterion added on 2026-10-01
 /// had no clause for seven days.
+///
+/// Naming the gate's causes is not the same as naming everything the gate
+/// refuses. `tests_failed` answers a suite, and part of that suite is this
+/// repository's own contract tests — conventions stated only in the tests that
+/// judge them, which no enumeration of refusal causes can carry. On 2026-10-04 a
+/// change that added two metric names died on the census test that walks the
+/// closed metric set, after a round had been paid for in full; the diff had
+/// added the publishing half and never the reading half. `repo_contracts` is
+/// where those conventions are written down, because "the test suite runs" tells
+/// the writer that it will be judged and not what it will be judged against.
 fn change_generation_contract() -> serde_json::Value {
     serde_json::json!({
         "output_format": "unified_diff",
@@ -273,7 +283,8 @@ fn change_generation_contract() -> serde_json::Value {
         "plan_targets": "The plan you are handed may name the repository-relative paths the change must touch. Every path it names has to be a target of your diff: the change may touch more files than the plan lists, but a path the plan names and your diff never touches is refused. If the plan names a file that already exists, change that file — do not create a new one beside it and leave the named file alone.",
         "formatting": "Before anything is compiled, the applied tree is checked the way CI checks it: `cargo fmt --all -- --check`. Your change has to be exactly what the workspace's formatter (plain rustfmt) produces — do not hand-format, and do not reflow or realign lines you did not need to touch, because the formatter's version of them is not the one that is in the file. A hunk whose result differs from the formatter's is refused (formatting_differs) no matter how good the code is.",
         "lint": "The applied tree is then linted the way CI lints it: `cargo clippy --workspace` with warnings denied (`-D warnings`). Only the lines your diff writes are judged — a clippy diagnostic whose span lands on a line you added refuses the change (lint_introduced). Lints the tree already carried are not counted against you, so do not fix unrelated warnings: copy neither them nor the style of the line they report on. Write the new line so clippy has nothing to say about it.",
-        "verification": "The applied change is compiled and the workspace test suite is run. A test that passed on the tree before your change and fails after it refuses the change (tests_failed). A suite that could not be run to a verdict at all (test_run_unavailable) is not your diff's fault and is not held against it, though it does cost the round.",
+        "verification": "The applied change is compiled and the workspace test suite is run. A test that passed on the tree before your change and fails after it refuses the change (tests_failed). A suite that could not be run to a verdict at all (test_run_unavailable) is not your diff's fault and is not held against it, though it does cost the round. The suite is wider than the tests that sit beside the code you edit: this repository also carries contract tests that pin conventions a diff cannot state, and they are ordinary tests, so nothing in your diff announces that one of them judges it. Look for them before you write -- grep the test directories for every symbol you add or change (repo_contracts names the ones this path has already lost a round to) -- and satisfy what you find.",
+        "repo_contracts": "Conventions this repository's own tests enforce, and the half a diff that ignores them forgets. The metric name set (cog_core::metric_names::ALL) is closed: a contract test walks it against the alert rules and the dashboard panels and fails for any name that is read by neither and is not registered in that test's census with its own written verdict. A diff that adds a metric name and stops there is therefore incomplete by construction -- it has added the publishing half without the reading half. Add both: the reader (a rule or a panel that consumes the series) or the census entry, and whatever count the test holds against its own census. Treat the same shape as general wherever this repository pins a closed set: the entry you add is judged together with the evidence that reads it.",
         "refusal_causes": {
             "malformed_diff": "diff_grammar",
             "promotion_gate_refused": "scope",
@@ -398,6 +409,26 @@ mod tests {
             (
                 "tests that passed before the change are the criterion",
                 "passed on the tree before your change and fails after it",
+            ),
+            (
+                "the suite is wider than the tests beside the file",
+                "contract tests that pin conventions a diff cannot state",
+            ),
+            (
+                "the writer is told to look for those tests itself",
+                "grep the test directories for every symbol you add or change",
+            ),
+            (
+                "the closed metric name set is named",
+                "The metric name set (cog_core::metric_names::ALL) is closed",
+            ),
+            (
+                "adding a metric is stated to need its reader",
+                "added the publishing half without the reading half",
+            ),
+            (
+                "the census ratchet is stated",
+                "whatever count the test holds against its own census",
             ),
         ] {
             assert!(
