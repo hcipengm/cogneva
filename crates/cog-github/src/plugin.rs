@@ -418,6 +418,15 @@ impl cog_core::SystemPlugin for GitHubPlugin {
         if gate.is_none() {
             info!("GitHubPlugin: no scheduler gate; discovery rounds run unconditionally");
         }
+        // 同一个池读数也供这里判"按上游确定性失败开的退避窗，前提还在不在"：
+        // 闸门说的只是"现在让不让干"，而一条被压住的意图等的是"上游有没有好"，
+        // 那是池的实证纪元答的问题。两个消费方共用同一个来源，不各自读一遍 Redis。
+        let pool = ctx.consume_service::<dyn cog_core::LlmPoolStatusSource>();
+        if pool.is_none() {
+            info!(
+                "GitHubPlugin: no LLM pool status source; backoff windows run to their own expiry"
+            );
+        }
         // 本 crate 是传感器/执行器，绝不直连 LLM。语义可行动性判定以
         // platform_intent_assess 任务经 orchestrator 派给 cog-collaboration 的
         // 单 agent 多模态分支；无 orchestrator 时 triage 退回本地规则启发式。
@@ -482,6 +491,9 @@ impl cog_core::SystemPlugin for GitHubPlugin {
             );
             if let Some(gate) = gate.clone() {
                 loop_ = loop_.with_gate(gate);
+            }
+            if let Some(pool) = pool.clone() {
+                loop_ = loop_.with_pool_status_source(pool);
             }
             Arc::new(tokio::sync::Mutex::new(loop_))
         };

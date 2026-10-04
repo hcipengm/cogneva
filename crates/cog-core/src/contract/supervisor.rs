@@ -268,6 +268,25 @@ pub struct LlmPoolStatus {
     /// evidence to resume with" — the same starting point as a first boot.
     #[serde(default)]
     pub upstream_evidence: Vec<LlmUpstreamEvidence>,
+    /// When the writing process last saw an upstream actually answer, unix
+    /// seconds; `0` when it has not seen one yet. Evidence about the
+    /// upstreams, and the only field here that is.
+    ///
+    /// The other fields answer "when may this be retried"; a consumer that
+    /// itself stopped asking at some moment answers a different question —
+    /// "has anything served since I stopped?" — and could not before, because
+    /// a pooled success is recorded nowhere in the payload. `unavailable` is
+    /// not a substitute: a freshly started writer reports it `false` with an
+    /// empty table, which is "nothing on record", not "something served", and
+    /// releasing a consumer's own backoff on it would flush every parked
+    /// intent on every rollout.
+    ///
+    /// A writer started later reports `0` again even though the pool served
+    /// earlier: this is per-process evidence, so the consumers' premise is
+    /// checked against evidence that exists now, not against a claim nobody
+    /// in this generation can still back.
+    #[serde(default)]
+    pub last_success_unix: i64,
 }
 
 impl LlmPoolStatus {

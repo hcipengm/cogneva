@@ -673,6 +673,14 @@ struct LlmHealthTable {
     /// verdict already answers for that case; adding failures here would only
     /// grow the set and force this lock to be taken on the request path.
     observed: Mutex<std::collections::HashSet<String>>,
+    /// 本进程最近一次看到上游真的应答（成功）的绝对时刻，unix 秒；0 = 还没看到过。
+    ///
+    /// 与 `observed` 记的是同一件事的两个面：那个集合答"有没有哪家被实证过"
+    /// （判定面上的"什么都没见过"与"见过成功"要分开），这个时刻答"**从什么时候
+    /// 起**有证据了"。消费者自己压着的东西（按上游确定性失败开的退避窗）要判的
+    /// 正是后一个问题——它的前提是"上游当下就这个状态"，而这个时刻是那个前提
+    /// 已经被推翻的证据。进程换代就归零：这是**本代**的证据，不是对上一代的转述。
+    last_success_unix: std::sync::atomic::AtomicI64,
     /// 运行时补问到的用量能力判定，按上游身份存（与上面两个表同一个键）。
     runtime_caps: Mutex<std::collections::HashMap<String, RuntimeUsageCapability>>,
 }
@@ -759,11 +767,19 @@ impl LlmHealthTable {
         // the reading has to remember it once the verdict table has no further
         // use for the entry.
         self.observed.lock().unwrap().insert(Self::key(u));
+        // 同一件事的第二个面：不只"有没有证据"，还有"从什么时候起"。
+        self.last_success_unix
+            .store(Utc::now().timestamp(), Ordering::SeqCst);
         let mut states = self.states.lock().unwrap();
         match states.remove(&Self::key(u)) {
             Some(h) => h.suspect_until.is_some(),
             None => false,
         }
+    }
+
+    /// 本进程最近一次上游成功的绝对时刻（unix 秒），0 = 还没有过。
+    fn last_success_unix(&self) -> i64 {
+        self.last_success_unix.load(Ordering::SeqCst)
     }
 
     /// 池全灭：池内每一个上游都处在未到期的嫌疑窗内。
@@ -1899,8 +1915,18 @@ fn record_upstream_state(
     );
 }
 
-/// 把池状态写入/清除跨进程 Redis 信号。网关崩了也不会把调度侧永久钉在
-/// 暂停态：键带 TTL，节拍内持续续期，恢复即刻删除。
+/// 把池判定写入跨进程 Redis 信号。**两个方向都写。**
+///
+/// 以前"可用"这一侧做的是把键删掉，而读者（调度侧的暂停门）只把
+/// `unavailable: false` 这份载荷当恢复凭据——"键不在了"什么都不做。于是池恢复
+/// 那一刻该写的凭据从来没有被写出来过：因池不可用而暂停的 LLM 依赖型任务只在
+/// 调度器自己重启时才偶然解除暂停，而"暂停"与"恢复"是同一套机制的两端，缺一端
+/// 等于整条协作暂停只剩停下的能力。判定得能被读到才算判定，所以两个方向都落
+/// 一条载荷，只有 `unavailable` 一个字段不同。
+///
+/// 幂等、带 TTL、每拍续期：网关崩了也不会把调度侧永久钉在任一方向上——键在
+/// TTL 内到期，读者退回"没有判定"（缺席不是判词），而不是被一条永不失效的
+/// 陈旧判定钉住。
 ///
 /// 通道没接上时这一拍只留一条读数为 0，并按拍重试——池判定只留在网关内存里
 /// 的时候，调度侧读不到它，于是"被判为不可用"这件事在暂停门上是查无此事的，
@@ -1928,13 +1954,7 @@ async fn publish_pool_signal(state: &AppState, down: bool, bounds: RecoveryBound
     };
     let delivered = match channel.get().await {
         None => false,
-        Some(ref mut conn) => {
-            if down {
-                publish_down(conn, state, bounds).await
-            } else {
-                publish_up(conn).await
-            }
-        }
+        Some(ref mut conn) => publish_pool_status(conn, state, down, bounds).await,
     };
     record_gauge(
         state,
@@ -1945,10 +1965,17 @@ async fn publish_pool_signal(state: &AppState, down: bool, bounds: RecoveryBound
     .await;
 }
 
-/// 写入"池不可用"载荷，带 TTL。返回是否送达。
-async fn publish_down(
+/// 写入池判定载荷（带 TTL）。返回是否送达。
+///
+/// 判定之外的部分两个方向**完全一致**：只有 `unavailable` 一个字段不同。所以
+/// 两个方向必须来自同一处赋值——分成两份写，迟早会出现"一边说池不可用、另一边
+/// 说没有证据"的载荷，而读的人无从判断该信哪边。`unavailable: false` 也不是
+/// "池里有几家还在窗内"，而是"这台网关没有任何未平账的池级证据"：逐家的处境由
+/// 下面那两张逐个上游的表如实带着，判定不替它们说话。
+async fn publish_pool_status(
     conn: &mut redis::aio::ConnectionManager,
     state: &AppState,
+    down: bool,
     bounds: RecoveryBounds,
 ) -> bool {
     let unavailable: Vec<String> = state
@@ -1959,7 +1986,7 @@ async fn publish_down(
         .map(LlmHealthTable::key)
         .collect();
     let status = cog_core::LlmPoolStatus {
-        unavailable: true,
+        unavailable: down,
         evidenced_recovery_unix: bounds.evidenced_unix,
         next_attempt_unix: bounds.next_probe_unix,
         unavailable_upstreams: unavailable,
@@ -1972,6 +1999,10 @@ async fn publish_down(
         // 判定与它的输入同一条载荷、同一次写入：分开写就会有一段时间里
         // 一边说池不可用、另一边说没有证据，读的人无从判断该信哪边。
         upstream_evidence: state.llm_health.evidence(&state.config.llm_upstreams),
+        // 两个方向都带这一刻。消费者压着自己的东西时判的是"从我停下到现在，
+        // 上游有没有应答过"，这是唯一答得了它的读数；判定本身答不了——池
+        // "可用"在刚起的进程上与"什么都没见过"同形。
+        last_success_unix: state.llm_health.last_success_unix(),
     };
     let payload = match serde_json::to_string(&status) {
         Ok(p) => p,
@@ -1992,21 +2023,6 @@ async fn publish_down(
         Ok(()) => true,
         Err(e) => {
             tracing::warn!(error = %e, "池状态写入 Redis 失败");
-            false
-        }
-    }
-}
-
-/// 清除跨进程信号（池已恢复）。返回是否送达。
-async fn publish_up(conn: &mut redis::aio::ConnectionManager) -> bool {
-    let res: redis::RedisResult<()> = redis::cmd("DEL")
-        .arg(cog_core::LLM_POOL_STATUS_KEY)
-        .query_async(conn)
-        .await;
-    match res {
-        Ok(()) => true,
-        Err(e) => {
-            tracing::warn!(error = %e, "池状态清除 Redis 失败");
             false
         }
     }
@@ -3122,21 +3138,55 @@ fn spawn_llm_health_prober(state: AppState) -> tokio::task::JoinHandle<()> {
     )
 }
 
+/// 这一拍该探哪些上游。
+///
+/// 三个条件取或：
+/// - 池判定锁存为不可用：这一档下没有真实请求会来实证恢复（LLM 依赖型任务已被
+///   暂停），探测必须自己顶上，且覆盖池内全部上游，不看窗口到没到期。
+/// - **池内没有一台上游被实证可用**：空表（重启清零）与"唯一实证过的那台又失败
+///   了"都落在这里。池的可用读数本来就是"没有未平账的失败"，而这条判据对
+///   "一次都没试过的上游"与"试过而且成功了的上游"同样给真，于是**什么都不知道**
+///   会被读成**可用**，且没有任何一拍会去把那个"不知道"消掉——任务停了、探测
+///   也不发、第一条证据永远不出现。代价上界很紧：任一台上游拿到成功实证，
+///   这个条件立刻不再成立，探测回到只探窗口到期的那些，而一次探针只是一次
+///   `max_tokens=1` 的 ping。
+/// - 嫌疑窗已到期：常规复测。
+///
+/// 抽成函数是为了让"为什么这一拍该探"能被单独断言，而不是只能从"发了几次
+/// 请求"里间接推出来。
+fn upstreams_due_for_probe(state: &AppState) -> Vec<LlmUpstream> {
+    let upstreams = &state.config.llm_upstreams;
+    let latched_down = state.pool_down.load(Ordering::SeqCst);
+    // 与 `snapshot` 同一条判据，不另立一份：`healthy == Some(true)` 就是
+    // "本进程实证过它、且它名下没有未平账的失败"。
+    let unverified = !state
+        .llm_health
+        .snapshot(upstreams)
+        .iter()
+        .any(|reading| reading.healthy == Some(true));
+    upstreams
+        .iter()
+        .filter(|u| latched_down || unverified || state.llm_health.due_for_probe(u))
+        .cloned()
+        .collect()
+}
+
 /// 单轮探测：对所有"嫌疑窗已到期"的上游各发一次最小复测请求。
 ///
 /// 池判定锁存为不可用时，探测覆盖池内全部上游，而不只看窗口到期的那几个：
 /// 那种状态下 LLM 依赖型任务已被暂停，没有真实请求来实证恢复；若探测也因为
 /// "表里没有这条记录"而不发，就没人能发现恢复——这正是要避免的"任务停了→
 /// 没人探活→永不恢复"死锁。
+///
+/// 锁存只覆盖这条死锁的一半：它要求**每一台**上游都躺在未到期的嫌疑窗里，
+/// 而那要求每一台都至少被记过一次失败。另一半是**表建成空表**的时候——
+/// 进程重启即清零，此后只要没有真实请求进来（重启那一刻所有 LLM 依赖型
+/// 任务都还在各自的退避里，正是现场那次的样子），`all_suspect` 对空表恒为假、
+/// `due_for_probe` 对没有记录的上游也恒为假，于是池一边报着"可用"，一边连
+/// 一条健康读数都发不出来，而第一条证据恰恰要靠一次请求才产生。所以
+/// "没有一台上游被实证可用"本身就是该探的理由，见 `upstreams_due_for_probe`。
 async fn probe_suspect_upstreams(state: &AppState) {
-    let latched_down = state.pool_down.load(Ordering::SeqCst);
-    let due: Vec<LlmUpstream> = state
-        .config
-        .llm_upstreams
-        .iter()
-        .filter(|u| latched_down || state.llm_health.due_for_probe(u))
-        .cloned()
-        .collect();
+    let due = upstreams_due_for_probe(state);
     for upstream in due {
         let base = upstream.base_url.trim_end_matches('/');
         match probe_upstream(state, &upstream).await {
@@ -6531,6 +6581,9 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 suspect_until_unix: now + 300,
                 ..Default::default()
             }],
+            // 这一代还有一台上游应答过：载荷带的判定是"不可用"，实证纪元照样
+            // 要如实带上——它答的是另一个问题，两个方向的载荷都得有。
+            last_success_unix: now - 30,
         })
         .unwrap();
         let redis_url = format!("redis://{upstream}");
@@ -6572,6 +6625,64 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert!(
             read_pool_signal(&redis_url).await.is_some(),
             "通道转通后这一拍必须把判定发布出去"
+        );
+
+        delete_pool_signal(&redis_url).await;
+    }
+
+    /// 恢复侧必须留下一条**正向载荷**，而不是"把键删掉"。
+    ///
+    /// 读者（调度侧的暂停门）手里只有两种输入：一条读得到的判定，和"什么都没有"。
+    /// 它把前者当判词、把后者当"这一拍不作声"（网关与 Redis 会同滚，缺席是常态，
+    /// 读成"池好了"会把告警的起始时刻说成上次滚动的时间）。所以恢复这件事只能
+    /// 靠一条 `unavailable: false` 的载荷说出口——键被删掉的话，读者看到的是缺席，
+    /// 池的判定永远停在"不可用"，暂停解不掉。这条断言钉的就是这个区别：
+    /// 池恢复之后，键**仍然存在**，且解析出来的判定是"可用"。
+    #[tokio::test]
+    async fn a_recovered_pool_publishes_a_positive_verdict_instead_of_clearing_the_key() {
+        let Some(upstream) = test_redis_tcp_addr().await else {
+            return;
+        };
+        // 这一条要独占这把键：键名是常量，参数化不了，而同文件里"通道恢复后
+        // 种子落地"那条测试用的是同一把键——同一个库并行跑，各自开头结尾的
+        // DEL 会把对方的载荷删掉，两边的断言都变得看运气。换一个 db 就够了，
+        // 不必让两条测试互相排队。
+        let redis_url = format!("redis://{upstream}/9");
+        delete_pool_signal(&redis_url).await;
+
+        let u = stub_upstream("https://a.example.com", "m1");
+        let mut state = test_state(vec![u.clone()]);
+        state.config.redis_url = Some(redis_url.clone());
+        state.pool_signal = Some(Arc::new(cog_redis::Reconnecting::new(
+            redis::Client::open(redis_url.clone()).unwrap(),
+        )));
+
+        // 这一家不可用：载荷是"池不可用"。
+        state
+            .llm_health
+            .note_failure(&u, 300, Some(Utc::now().timestamp() + 600), None);
+        refresh_pool_state(&state).await;
+        let down_payload: cog_core::LlmPoolStatus = serde_json::from_str(
+            &read_pool_signal(&redis_url)
+                .await
+                .expect("不可用这一侧要落载荷"),
+        )
+        .expect("载荷可解析");
+        assert!(down_payload.unavailable);
+
+        // 它实证恢复：载荷翻转，而不是键消失。
+        state.note_upstream_success(&u);
+        refresh_pool_state(&state).await;
+        let raw = read_pool_signal(&redis_url).await;
+        assert!(
+            raw.is_some(),
+            "池恢复这一拍必须留下一条读得到的判定——键被删掉时读者只看到缺席，暂停解不掉"
+        );
+        let up_payload: cog_core::LlmPoolStatus =
+            serde_json::from_str(&raw.unwrap()).expect("载荷可解析");
+        assert!(
+            !up_payload.unavailable,
+            "恢复的判词就在这一个字段上，两个方向共用同一条载荷"
         );
 
         delete_pool_signal(&redis_url).await;
@@ -6864,6 +6975,50 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert_eq!(&bytes[..], second_body.as_bytes());
         // 嫌疑上游没有被真实请求触碰（note_success 会清窗，窗应仍在）。
         assert!(state.llm_health.is_suspect(&stub_upstream(&first, "m1")));
+    }
+
+    /// 空表不是"池可用"的实证。重启把健康表清零，此后只要没有真实请求进来
+    /// （重启那一刻所有 LLM 依赖型任务都还在各自的退避里），窗口那一路与
+    /// "全上游都进了嫌疑窗"那一路同时为假，于是没有一拍会去产生第一条证据，
+    /// 池一边报着可用、一边连一条健康读数都没有。这一轮探测就是那条缺失的证据。
+    #[tokio::test]
+    async fn an_unverified_pool_is_probed_without_any_request_coming_in() {
+        let alive = spawn_stub_upstream(
+            200,
+            r#"{"choices":[{"message":{"role":"assistant","content":"pong"}}]}"#,
+        )
+        .await;
+        let state = test_state(vec![stub_upstream(&alive, "m1")]);
+        let u = state.config.llm_upstreams[0].clone();
+
+        // 前提：两条老路都不成立——没记录 ⇒ 窗口没到期；空表 ⇒ 池不判不可用。
+        assert!(!state.llm_health.due_for_probe(&u));
+        assert!(!state.llm_health.all_suspect(&state.config.llm_upstreams));
+        assert_eq!(
+            upstreams_due_for_probe(&state).len(),
+            1,
+            "没有一台被实证可用的池必须自己探出第一条证据"
+        );
+
+        probe_suspect_upstreams(&state).await;
+        refresh_pool_state(&state).await;
+
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert_eq!(
+            series_value(
+                &text,
+                cog_core::metric_names::LLM_UPSTREAM_HEALTHY.as_str(),
+                &LlmHealthTable::key(&u)
+            ),
+            Some(1.0),
+            "探到的那次成功要落成健康读数——改前这一格在整段时间里连序列都没有:\n{text}"
+        );
+
+        // 成本上界：拿到实证就不再重复探，回到只探窗口到期的那一家。
+        assert!(
+            upstreams_due_for_probe(&state).is_empty(),
+            "任一台上游被实证可用之后，这一路不该再产生探针"
+        );
     }
 
     #[tokio::test]

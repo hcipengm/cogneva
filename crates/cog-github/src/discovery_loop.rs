@@ -170,6 +170,11 @@ fn terminal_backoff_delay(consecutive: u32, base_secs: u64) -> std::time::Durati
 struct TerminalBackoff {
     consecutive: u32,
     skip_until: std::time::Instant,
+    /// When the window was opened (the failure that armed it), unix seconds.
+    /// Absolute, not a remaining count: the release rule compares it against
+    /// the pool's evidence epoch, which is an instant from another process's
+    /// clock and cannot be compared against a distance.
+    opened_unix: u64,
 }
 
 /// A window in the form a file can hold. `Instant` only means something inside
@@ -181,6 +186,11 @@ struct PersistedBackoff {
     consecutive: u32,
     #[serde(default)]
     skip_until_unix: u64,
+    /// 开窗时刻。与 `skip_until_unix` 一样是一条关于过去的**事实**，所以也写成
+    /// 绝对时刻：它要被拿去跟另一个进程的读数（池的实证纪元）比大小，只剩"还有
+    /// 多久"是比不了的。旧文件没有这一段，读出来是 0，回退到按窗长倒推。
+    #[serde(default)]
+    opened_unix: u64,
 }
 
 fn now_unix() -> u64 {
@@ -199,6 +209,7 @@ impl TerminalBackoff {
                     .skip_until
                     .saturating_duration_since(std::time::Instant::now())
                     .as_secs(),
+            opened_unix: self.opened_unix,
         }
     }
 
@@ -207,14 +218,24 @@ impl TerminalBackoff {
     /// remaining), and the remaining distance is capped like any other window:
     /// a clock that jumped, or a file someone edited, must not park an intent
     /// for longer than the backoff itself is allowed to run.
-    fn restored(p: &PersistedBackoff) -> Self {
+    fn restored(p: &PersistedBackoff, base_secs: u64) -> Self {
         let remaining = p
             .skip_until_unix
             .saturating_sub(now_unix())
             .min(TERMINAL_BACKOFF_CAP_SECS);
+        // 开窗时刻：文件里记着就用它。没有（旧版本写的文件）才按「结束时刻 -
+        // 这个连败数对应的窗长」倒推——窗长由排程函数唯一决定，只是节拍取自
+        // 当刻配置，配置改过就会偏；所以它是回退，不是首选。
+        let opened_unix = if p.opened_unix > 0 {
+            p.opened_unix
+        } else {
+            p.skip_until_unix
+                .saturating_sub(terminal_backoff_delay(p.consecutive, base_secs).as_secs())
+        };
         TerminalBackoff {
             consecutive: p.consecutive,
             skip_until: std::time::Instant::now() + std::time::Duration::from_secs(remaining),
+            opened_unix,
         }
     }
 }
@@ -289,6 +310,18 @@ pub struct GitHubDiscoveryLoop {
     /// that would call an LLM (triage assessment, fix submission) is skipped
     /// until it resumes. Mechanical rounds keep the existing behaviour.
     gate: Option<Arc<dyn cog_core::SchedulerGate>>,
+    /// Cross-process pool snapshot, the same source the scheduler gate reads.
+    /// Used for one purpose: to find out whether an upstream has answered
+    /// since a terminal-failure window was opened, which is what decides
+    /// whether that window still rests on anything. See
+    /// [`Self::refresh_pool_success_epoch`].
+    pool: Option<Arc<dyn cog_core::LlmPoolStatusSource>>,
+    /// The pool's evidence epoch, read once per round: unix seconds of the most
+    /// recent upstream success the *current* gateway process has seen, or `0`
+    /// when it has seen none. Zero is the safe reading — "no evidence yet" is
+    /// not "evidence that the premise is gone", and a fresh gateway reports
+    /// zero while an empty verdict table looks perfectly healthy.
+    pool_success_epoch: u64,
 }
 
 /// Persisted intent guards (`$COGNEVA_DATA_DIR/discovery-guards.json`):
@@ -567,6 +600,8 @@ impl GitHubDiscoveryLoop {
             redrive_backoff: HashMap::new(),
             answered: HashMap::new(),
             gate: None,
+            pool: None,
+            pool_success_epoch: 0,
         }
     }
 
@@ -574,6 +609,14 @@ impl GitHubDiscoveryLoop {
     /// upstream pool is down. Without a gate the loop runs unconditionally.
     pub fn with_gate(mut self, gate: Arc<dyn cog_core::SchedulerGate>) -> Self {
         self.gate = Some(gate);
+        self
+    }
+
+    /// Attach the pool status source so a backoff window whose premise the pool
+    /// has since contradicted can be released early. Without it the loop keeps
+    /// the historical behaviour: every window runs to its own expiry.
+    pub fn with_pool_status_source(mut self, pool: Arc<dyn cog_core::LlmPoolStatusSource>) -> Self {
+        self.pool = Some(pool);
         self
     }
 
@@ -648,15 +691,16 @@ impl GitHubDiscoveryLoop {
                 // once, before any round, so an entry here can only be one
                 // this process set — and re-restoring it from the file would
                 // move its end backwards.
+                let base_secs = self.config.poll_interval_secs;
                 for (key, b) in state.terminal_backoff {
                     self.terminal_backoff
                         .entry(key)
-                        .or_insert_with(|| TerminalBackoff::restored(&b));
+                        .or_insert_with(|| TerminalBackoff::restored(&b, base_secs));
                 }
                 for (key, b) in state.redrive_backoff {
                     self.redrive_backoff
                         .entry(key)
-                        .or_insert_with(|| TerminalBackoff::restored(&b));
+                        .or_insert_with(|| TerminalBackoff::restored(&b, base_secs));
                 }
                 // The later observation wins where both exist: this load runs
                 // once, before any round, so a live entry can only be one this
@@ -765,6 +809,11 @@ impl GitHubDiscoveryLoop {
     /// window. Consecutive re-drives of the same intent lengthen the window,
     /// so an intent that can never succeed is retried on a doubling schedule
     /// instead of once per poll.
+    ///
+    /// 这个账本不参与"池已应答就提前放行"：它的由头是"这次尝试失败却没申报
+    /// 确定性原因"，是一个关于**这条意图**的判断，池随后能不能服务并不反驳它。
+    /// 会提前放行的只有 `terminal_backoff`——那一册记的是上游自述的确定性失败，
+    /// 池的实证正是冲它来的。
     fn note_redrive(&mut self, key: &str) {
         let consecutive = self
             .redrive_backoff
@@ -777,6 +826,7 @@ impl GitHubDiscoveryLoop {
             TerminalBackoff {
                 consecutive,
                 skip_until: std::time::Instant::now() + delay,
+                opened_unix: now_unix(),
             },
         );
         tracing::info!(
@@ -879,6 +929,15 @@ impl GitHubDiscoveryLoop {
     /// produces one WARN per intent per window instead of one per tick.
     fn in_terminal_backoff(&self, key: &str) -> bool {
         match self.terminal_backoff.get(key) {
+            Some(b) if self.released_by_pool(b) => {
+                tracing::info!(
+                    %key,
+                    pool_success_unix = self.pool_success_epoch,
+                    window_opened_unix = b.opened_unix,
+                    "pool has served a request since this backoff was opened; releasing the intent now"
+                );
+                false
+            }
             Some(b) if std::time::Instant::now() < b.skip_until => {
                 tracing::debug!(
                     %key,
@@ -889,6 +948,34 @@ impl GitHubDiscoveryLoop {
             }
             _ => false,
         }
+    }
+
+    /// 这条窗的前提还在不在。
+    ///
+    /// 窗的由头是"上游给了一次确定性失败（配额/凭证/协议），再试一次会原样复现"，
+    /// 那是一个关于**上游当下状态**的判断，不是关于这条意图的判断。池里随后有人
+    /// 真的应答成功，就是那个状态已经变了的证据：窗该让路，此刻重试一次比等到窗
+    /// 口自然到期更值——后者不知道上游好没好，只是把等待当成恢复。
+    ///
+    /// 比较用**池自己报的实证时刻**，不用它的判定："池可用"在刚起的进程上与"什么
+    /// 都没见过"同形，拿它放行等于每次滚动都把全部窗冲掉、把注定失败的尝试重买
+    /// 一遍。窗口不删：连败计数留给下一次失败，它会以更长的窗重新武装。
+    fn released_by_pool(&self, b: &TerminalBackoff) -> bool {
+        self.pool_success_epoch > b.opened_unix
+    }
+
+    /// 每轮读一次池的实证纪元（一次 Redis GET，当轮缓存）。读不到就记 0：
+    /// "读不到"不是"有证据"，与"缺席不是判词"是同一条规矩——它的后果只是这一轮
+    /// 不提前放行，下一轮照常再读。
+    async fn refresh_pool_success_epoch(&mut self) {
+        let Some(source) = self.pool.clone() else {
+            return;
+        };
+        self.pool_success_epoch = source
+            .status()
+            .await
+            .map(|s| s.last_success_unix.max(0) as u64)
+            .unwrap_or(0);
     }
 
     /// Record a failed processing attempt. Terminal (deterministic) failures
@@ -917,10 +1004,14 @@ impl GitHubDiscoveryLoop {
             .or_insert_with(|| TerminalBackoff {
                 consecutive: 0,
                 skip_until: std::time::Instant::now(),
+                opened_unix: now_unix(),
             });
         entry.consecutive += 1;
         let delay = terminal_backoff_delay(entry.consecutive, self.config.poll_interval_secs);
         entry.skip_until = std::time::Instant::now() + delay;
+        // 重新武装即重新开窗：这条窗的前提从**这一次**失败起算，之前那次成功
+        // 不能再给它让路。
+        entry.opened_unix = now_unix();
         tracing::warn!(
             label,
             number,
@@ -945,6 +1036,9 @@ impl GitHubDiscoveryLoop {
             return Ok(0);
         }
         self.load_guards_once().await;
+        // 先取这一轮的池实证纪元，再判任何退避窗：它决定的是"窗的前提还在不在"，
+        // 而窗在下面几处都要判。一轮一次，不按意图各问一遍 Redis。
+        self.refresh_pool_success_epoch().await;
         // The answered ledger is a window with no natural reaper: an intent
         // whose issue the platform closed stops being discovered, so it never
         // comes back to be re-decided and its entry would sit there forever.
@@ -965,20 +1059,25 @@ impl GitHubDiscoveryLoop {
         let scanned_numbers: std::collections::HashSet<u64> =
             issues.iter().map(|i| i.number).collect();
         let now = std::time::Instant::now();
-        let due: Vec<u64> = self
+        // 两条"提前重试"的理由并列：窗口自己到期，或池已经实证有上游应答过。
+        // 后者要走上同一条补取路径——扫描水位已经越过这条 issue，光靠扫描它不会
+        // 再回来。第二个布尔量只用来把日志写成真话：读日志的人要知道这次提前重试
+        // 是等到的还是池自己说好的。
+        let due: Vec<(u64, bool)> = self
             .terminal_backoff
             .iter()
-            .filter(|(key, b)| {
-                key.starts_with("issue:")
-                    && now >= b.skip_until
-                    && key["issue:".len()..]
-                        .parse::<u64>()
-                        .map(|n| !scanned_numbers.contains(&n))
-                        .unwrap_or(false)
+            .filter(|(key, _)| key.starts_with("issue:"))
+            .filter_map(|(key, b)| {
+                let number = key["issue:".len()..].parse::<u64>().ok()?;
+                let expired = now >= b.skip_until;
+                let released = self.released_by_pool(b);
+                if (!expired && !released) || scanned_numbers.contains(&number) {
+                    return None;
+                }
+                Some((number, released))
             })
-            .filter_map(|(key, _)| key["issue:".len()..].parse::<u64>().ok())
             .collect();
-        for number in due {
+        for (number, pool_released) in due {
             match self.provider.get_issue(number).await {
                 Ok(issue)
                     if self
@@ -987,7 +1086,15 @@ impl GitHubDiscoveryLoop {
                         .iter()
                         .any(|s| s.eq_ignore_ascii_case(&issue.state)) =>
                 {
-                    tracing::info!(number, "terminal-backoff window expired; retrying issue");
+                    if pool_released {
+                        tracing::info!(
+                            number,
+                            pool_success_unix = self.pool_success_epoch,
+                            "pool has served since this backoff was opened; retrying issue now"
+                        );
+                    } else {
+                        tracing::info!(number, "terminal-backoff window expired; retrying issue");
+                    }
                     issues.push(issue);
                 }
                 Ok(_) => {
@@ -3133,6 +3240,7 @@ mod tests {
             TerminalBackoff {
                 consecutive: 1,
                 skip_until: std::time::Instant::now() - std::time::Duration::from_secs(1),
+                opened_unix: now_unix().saturating_sub(3_600),
             },
         );
 
@@ -3149,6 +3257,90 @@ mod tests {
             !loop_.terminal_backoff.contains_key("issue:77"),
             "successful retry should clear the backoff entry"
         );
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
+    /// 池的实证纪元比窗口的开窗时刻新 ⇒ 窗的前提已被推翻，这一轮就该重试，
+    /// 不必等窗口自然到期。窗口本身留着：连败计数是下一次失败要用的东西。
+    ///
+    /// 反过来（纪元比开窗时刻旧，或根本没有纪元）窗照旧压着——这正是"两把钟"
+    /// 那类错误的防线：池"可用"在刚起的进程上与"什么都没见过"同形，拿它放行
+    /// 等于每次滚动都把全部窗冲一遍。
+    #[tokio::test]
+    async fn a_pool_success_since_the_window_opened_releases_the_intent_early() {
+        struct FixedPool(Option<cog_core::LlmPoolStatus>);
+        #[async_trait::async_trait]
+        impl cog_core::LlmPoolStatusSource for FixedPool {
+            async fn status(&self) -> Option<cog_core::LlmPoolStatus> {
+                self.0.clone()
+            }
+        }
+
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
+        let opened = now_unix().saturating_sub(600);
+        let mk = |epoch: i64| async move {
+            let provider = Arc::new(MockProvider {
+                issues: vec![issue(
+                    77,
+                    "WebSocket chat bypasses the permission check; repro: open ws without a token and send a task",
+                )],
+                comments: Mutex::new(vec![]),
+                ci_logs: vec![],
+                ci_runs: Mutex::new(vec![]),
+                prs: vec![],
+                pr_details: HashMap::new(),
+            });
+            let orchestrator = Arc::new(MockOrchestrator::new());
+            let mut loop_ = GitHubDiscoveryLoop::new(
+                provider,
+                IssueTriage::rules_only(),
+                config(),
+                Some(orchestrator.clone()),
+                None,
+            )
+            .with_pool_status_source(Arc::new(FixedPool(Some(
+                cog_core::LlmPoolStatus {
+                    unavailable: true,
+                    last_success_unix: epoch,
+                    ..Default::default()
+                },
+            ))));
+            // 扫描水位已越过这条 issue：只有"提前重试"那条补取路径能把它捞回来。
+            loop_.discovery =
+                IssueDiscovery::with_watermark(Utc::now() + chrono::Duration::seconds(1));
+            // 窗口远未到期——提前放行不可能是"等到的"。
+            loop_.terminal_backoff.insert(
+                "issue:77".into(),
+                TerminalBackoff {
+                    consecutive: 7,
+                    skip_until: std::time::Instant::now() + std::time::Duration::from_secs(3_600),
+                    opened_unix: opened,
+                },
+            );
+            loop_.run_once().await.unwrap();
+            let submitted = orchestrator.task_types.lock().unwrap().clone();
+            let still_held = loop_.terminal_backoff.contains_key("issue:77");
+            (submitted, still_held)
+        };
+
+        // 纪元比开窗时刻旧：没有新证据，窗照压。
+        let (submitted, held) = mk(opened as i64 - 60).await;
+        assert!(
+            !submitted.iter().any(|t| t == "platform_intent_assess"),
+            "没有更晚的成功实证时不该提前重试；got {submitted:?}"
+        );
+        assert!(held, "窗未到期又没有被推翻，条目该留着");
+
+        // 纪元比开窗时刻新：上游在窗开之后真的应答过，现在重试。
+        let (submitted, held) = mk(opened as i64 + 60).await;
+        assert!(
+            submitted.iter().any(|t| t == "platform_intent_assess"),
+            "池已实证应答就该立刻重判；got {submitted:?}"
+        );
+        assert!(!held, "重试成功后该清掉条目");
 
         std::env::remove_var("COGNEVA_DATA_DIR");
     }
