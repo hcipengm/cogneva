@@ -11,6 +11,9 @@
 //!   orchestrator raises on a duplicate id rather than skipping it);
 //! - a signal was found and is still inside its report cooldown, so it was not
 //!   even offered for submission;
+//! - a signal was found whose task had already reached a terminal state while
+//!   the signal kept firing -- the finished row was cleared and the work filed
+//!   again;
 //! - a signal was found and the submission never reached the orchestrator.
 //!
 //! Read from the task store alone, all four are the same absence. Reading them
@@ -97,6 +100,13 @@ pub const OUTCOME_TRACKED: &str = "tracked";
 /// A previously failed attempt was reset and will run again.
 pub const OUTCOME_REDRIVEN: &str = "redriven";
 
+/// The signal is still firing and its earlier task had already finished, so the
+/// terminal row was cleared and the work filed as a new task. Distinct from
+/// `redriven`, which resets an attempt that *failed*, and from `tracked`, which
+/// leaves in hand an attempt that has not finished: here the previous attempt
+/// ended successfully, and the signal outlived it.
+pub const OUTCOME_RESUBMITTED: &str = "resubmitted";
+
 /// The submission never reached the orchestrator. Distinct from `tracked`:
 /// both submit nothing, and one of them is a broken channel while the other is
 /// work already in hand.
@@ -113,6 +123,7 @@ pub const SIGNAL_OUTCOMES: &[&str] = &[
     OUTCOME_REGISTERED,
     OUTCOME_TRACKED,
     OUTCOME_REDRIVEN,
+    OUTCOME_RESUBMITTED,
     OUTCOME_FAILED,
     OUTCOME_COOLDOWN,
 ];
@@ -123,6 +134,7 @@ pub enum SignalOutcome {
     Registered,
     Tracked,
     Redriven,
+    Resubmitted,
     Failed,
     Cooldown,
 }
@@ -136,6 +148,7 @@ impl SignalOutcome {
             Self::Registered => OUTCOME_REGISTERED,
             Self::Tracked => OUTCOME_TRACKED,
             Self::Redriven => OUTCOME_REDRIVEN,
+            Self::Resubmitted => OUTCOME_RESUBMITTED,
             Self::Failed => OUTCOME_FAILED,
             Self::Cooldown => OUTCOME_COOLDOWN,
         }
@@ -150,8 +163,9 @@ impl SignalOutcome {
             Self::Registered => 0,
             Self::Tracked => 1,
             Self::Redriven => 2,
-            Self::Failed => 3,
-            Self::Cooldown => 4,
+            Self::Resubmitted => 3,
+            Self::Failed => 4,
+            Self::Cooldown => 5,
         }
     }
 }
@@ -379,6 +393,7 @@ mod tests {
         readings.record(SignalOutcome::Tracked);
         readings.record(SignalOutcome::Tracked);
         readings.record(SignalOutcome::Redriven);
+        readings.record(SignalOutcome::Resubmitted);
         readings.record(SignalOutcome::Failed);
         readings.record(SignalOutcome::Cooldown);
 
@@ -393,11 +408,12 @@ mod tests {
         assert_eq!(by_label(OUTCOME_REGISTERED), 1.0);
         assert_eq!(by_label(OUTCOME_TRACKED), 2.0);
         assert_eq!(by_label(OUTCOME_REDRIVEN), 1.0);
+        assert_eq!(by_label(OUTCOME_RESUBMITTED), 1.0);
         assert_eq!(by_label(OUTCOME_FAILED), 1.0);
         assert_eq!(by_label(OUTCOME_COOLDOWN), 1.0);
         assert_eq!(
             outcomes.iter().map(|(_, v)| *v).sum::<f64>(),
-            6.0,
+            7.0,
             "the outcomes have to account for every signal that was counted"
         );
     }
@@ -417,6 +433,7 @@ mod tests {
             SignalOutcome::Registered,
             SignalOutcome::Tracked,
             SignalOutcome::Redriven,
+            SignalOutcome::Resubmitted,
             SignalOutcome::Failed,
             SignalOutcome::Cooldown,
         ];
@@ -442,6 +459,7 @@ mod tests {
             SignalOutcome::Registered,
             SignalOutcome::Tracked,
             SignalOutcome::Redriven,
+            SignalOutcome::Resubmitted,
             SignalOutcome::Failed,
             SignalOutcome::Cooldown,
         ] {
@@ -457,6 +475,7 @@ mod tests {
             SignalOutcome::Registered,
             SignalOutcome::Tracked,
             SignalOutcome::Redriven,
+            SignalOutcome::Resubmitted,
             SignalOutcome::Failed,
             SignalOutcome::Cooldown,
         ] {

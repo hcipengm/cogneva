@@ -19,11 +19,15 @@
 //! Every intent carries a deterministic id, which lets the watcher ask the
 //! task store whether the signal is already in hand before submitting: the
 //! orchestrator raises on a duplicate id rather than skipping it, so the
-//! idempotence has to live here. A task already in hand is left alone (and
+//! idempotence has to live here. A task still running is left alone (and
 //! spends no cooldown, so a later failure is noticed on the next tick, not a
 //! whole cooldown later); a task that failed while its signal persists is
-//! re-driven; a task that never reached the orchestrator spends no cooldown
-//! either, so the next tick retries instead of the signal going quiet.
+//! re-driven; a task that finished while its signal persists holds the id for
+//! work that is over, so the row is cleared and the signal filed again — the
+//! store keeps finished rows for two cooldowns, and without this the signal
+//! would wait out that whole retention before anything looked at it again; a
+//! task that never reached the orchestrator spends no cooldown either, so the
+//! next tick retries instead of the signal going quiet.
 //!
 //! Only the process that owns the change-execution role runs this loop. The
 //! plugin table is loaded whole by every deployment, and producing intents is
@@ -329,14 +333,25 @@ enum IntentAction {
     /// A previous attempt ended in failure while the signal is still present —
     /// reset it so it runs again.
     Redrive,
-    /// A task exists and has not failed — leave it alone.
+    /// A previous attempt already finished while the signal is still present —
+    /// the terminal row has to be cleared before the work can be filed again.
+    Resubmit,
+    /// A task exists and has not finished — leave it alone.
     None,
 }
 
+/// A finished row and an in-flight row look the same to the orchestrator --
+/// both hold the id, so submitting again is a duplicate -- but they mean
+/// opposite things about the signal. In flight, the signal is being worked on
+/// and nothing should be submitted. Finished, the attempt is over and the
+/// signal is still firing, so the only thing standing between the signal and a
+/// new attempt is the row itself: `retry_task` takes a failed task and nothing
+/// else, so a finished one has to be cleared rather than re-driven.
 fn intent_action(existing: Option<&TaskStatus>) -> IntentAction {
     match existing {
         None => IntentAction::Submit,
         Some(TaskStatus::Failed) => IntentAction::Redrive,
+        Some(TaskStatus::Completed | TaskStatus::Cancelled) => IntentAction::Resubmit,
         Some(_) => IntentAction::None,
     }
 }
@@ -366,6 +381,9 @@ enum IntentOutcome {
     Tracked,
     /// A failed attempt was reset and will run again.
     Redriven,
+    /// The earlier attempt had already finished, so its row was cleared and the
+    /// work filed as a new task.
+    Resubmitted,
     /// Nothing was registered (orchestrator unavailable); retry next tick.
     Failed(String),
 }
@@ -382,13 +400,28 @@ async fn submit_intent(
     detail: serde_json::Value,
 ) -> IntentOutcome {
     let existing = orch.get_task(&task_id).await;
-    match intent_action(existing.as_ref().map(|t| &t.status)) {
+    let action = intent_action(existing.as_ref().map(|t| &t.status));
+    let resubmitting = action == IntentAction::Resubmit;
+    match action {
         IntentAction::None => IntentOutcome::Tracked,
         IntentAction::Redrive => match orch.retry_task(&task_id).await {
             Ok(()) => IntentOutcome::Redriven,
             Err(e) => IntentOutcome::Failed(format!("retry {task_id}: {e}")),
         },
-        IntentAction::Submit => {
+        IntentAction::Submit | IntentAction::Resubmit => {
+            // The finished row goes first, and the delete is checked rather
+            // than assumed: if it fails, submitting under the same id raises on
+            // the duplicate every tick after this one, so the attempt is
+            // reported as failed and retried with the row still there.
+            if resubmitting {
+                if let Err(e) = orch.delete_task(&task_id).await {
+                    return IntentOutcome::Failed(format!("delete {task_id}: {e}"));
+                }
+                info!(
+                    task_id = %task_id,
+                    "cleared a finished task for a signal that is still firing"
+                );
+            }
             let task = Task::new(
                 task_id,
                 TaskType::Custom(task_kind.into()),
@@ -400,6 +433,7 @@ async fn submit_intent(
                 }),
             );
             match orch.submit_goal_auto(&goal, vec![task]).await {
+                Ok(_) if resubmitting => IntentOutcome::Resubmitted,
                 Ok(_) => IntentOutcome::Registered,
                 Err(e) => IntentOutcome::Failed(e.to_string()),
             }
@@ -411,7 +445,9 @@ async fn submit_intent(
 /// actually moved the signal forward spend the cooldown; a submission that
 /// never landed leaves the key unrecorded so the next tick retries, and an
 /// in-flight task stays unrecorded so a failure is noticed promptly rather
-/// than after a full cooldown. Returns true when the signal is in hand.
+/// than after a full cooldown. A re-submission did move the signal forward --
+/// a new attempt is running and the finished row is gone -- so it spends the
+/// cooldown like any other submission. Returns true when the signal is in hand.
 fn report_outcome(
     state: &mut SignalGuardState,
     key: &str,
@@ -426,6 +462,7 @@ fn report_outcome(
         IntentOutcome::Registered => SignalOutcome::Registered,
         IntentOutcome::Tracked => SignalOutcome::Tracked,
         IntentOutcome::Redriven => SignalOutcome::Redriven,
+        IntentOutcome::Resubmitted => SignalOutcome::Resubmitted,
         IntentOutcome::Failed(_) => SignalOutcome::Failed,
     });
     match outcome {
@@ -437,6 +474,11 @@ fn report_outcome(
         IntentOutcome::Redriven => {
             state.reported.insert(key.to_string(), now);
             info!(signal = %key, "self-discovery intent re-driven; the previous attempt had failed");
+            true
+        }
+        IntentOutcome::Resubmitted => {
+            state.reported.insert(key.to_string(), now);
+            info!(signal = %key, "self-discovery intent re-submitted; the previous attempt had finished");
             true
         }
         IntentOutcome::Tracked => {
@@ -920,6 +962,17 @@ mod tests {
             &readings
         ));
         assert!(!cooldown_elapsed(&state, "alert:y", 86400, now));
+        assert!(report_outcome(
+            &mut state,
+            "alert:z",
+            IntentOutcome::Resubmitted,
+            now,
+            &readings
+        ));
+        assert!(
+            !cooldown_elapsed(&state, "alert:z", 86400, now),
+            "重新提交换掉的是一条已经结束的行，代价和一次新提交一样"
+        );
     }
 
     #[test]
@@ -954,6 +1007,10 @@ mod tests {
             ),
             (IntentOutcome::Tracked, SignalOutcome::Tracked.as_str()),
             (IntentOutcome::Redriven, SignalOutcome::Redriven.as_str()),
+            (
+                IntentOutcome::Resubmitted,
+                SignalOutcome::Resubmitted.as_str(),
+            ),
             (
                 IntentOutcome::Failed("orchestrator unreachable".into()),
                 SignalOutcome::Failed.as_str(),
@@ -1007,8 +1064,6 @@ mod tests {
             TaskStatus::Pending,
             TaskStatus::Scheduled,
             TaskStatus::Running,
-            TaskStatus::Completed,
-            TaskStatus::Cancelled,
         ] {
             assert_eq!(
                 intent_action(Some(&live)),
@@ -1016,6 +1071,23 @@ mod tests {
                 "{live:?} 不该再提交或重驱动"
             );
         }
+    }
+
+    /// A row that has reached a terminal state holds the id but is not work in
+    /// hand: the attempt is over and the signal is still firing, so it has to
+    /// be cleared rather than left sitting there until the store ages it out.
+    /// The distinction from `Failed` is which reset is legal -- `retry_task`
+    /// takes a failed task only, so a finished one cannot be re-driven.
+    #[test]
+    fn a_finished_task_is_resubmitted_rather_than_redriven() {
+        assert_eq!(
+            intent_action(Some(&TaskStatus::Completed)),
+            IntentAction::Resubmit
+        );
+        assert_eq!(
+            intent_action(Some(&TaskStatus::Cancelled)),
+            IntentAction::Resubmit
+        );
     }
 
     fn firing(dedup_key: &str) -> cog_core::PersistedAlert {
