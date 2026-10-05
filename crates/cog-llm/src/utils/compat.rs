@@ -220,6 +220,31 @@ pub fn detect_compat(base_url: &str) -> OpenAICompat {
         };
     }
 
+    // Volcengine Ark (`*.volces.com`). The coding surface (`/api/coding/v3`)
+    // answered requests with 400 before the first byte while the pool served
+    // through its peers -- the request-shape counter moved on this upstream
+    // alone, which names this profile, not the shared request builder. It ran
+    // on the fallback below, the one that assumes the latest OpenAI shape, so
+    // the `store` / `reasoning_effort` / tool `strict` fields callers send
+    // went through untouched and the endpoint rejected the body over a field
+    // it does not know. The conservative field set keeps those fields off the
+    // wire; the gateway's admission probes settle the capabilities a host
+    // name cannot tell.
+    if lower.contains("volces.com") || lower.contains("volcengine") {
+        return OpenAICompat {
+            supports_store: false,
+            supports_developer_role: false,
+            supports_reasoning_effort: false,
+            thinking_format: ThinkingFormat::OpenAI,
+            supports_usage_in_streaming: true,
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+            requires_tool_result_name: false,
+            requires_assistant_after_tool_result: false,
+            supports_strict_mode: false,
+            ..Default::default()
+        };
+    }
+
     if lower.contains("localhost:11434") || lower.contains("ollama") {
         return OpenAICompat {
             supports_store: false,
@@ -391,5 +416,36 @@ pub fn apply_vercel_routing(body: &mut serde_json::Value, routing: &VercelGatewa
 
     if !provider.is_empty() {
         body["provider"] = provider.into();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The profile the ark.cn-beijing.volces.com alert named: a request-shape
+    /// rejection that moved on this upstream alone, because the fallback
+    /// profile forwarded `store` / `reasoning_effort` / tool `strict` to an
+    /// endpoint that answers what it does not know with 400 before its first
+    /// byte.
+    #[test]
+    fn volcengine_ark_strips_the_fields_it_rejects() {
+        let compat = detect_compat("https://ark.cn-beijing.volces.com/api/coding/v3");
+        assert!(!compat.supports_store);
+        assert!(!compat.supports_reasoning_effort);
+        assert!(!compat.supports_strict_mode);
+        assert!(!compat.supports_developer_role);
+        // Ark reports usage in streaming and spells the output cap the new
+        // way, as doubao on the same vendor does.
+        assert!(compat.supports_usage_in_streaming);
+        assert_eq!(compat.max_tokens_field, MaxTokensField::MaxCompletionTokens);
+    }
+
+    #[test]
+    fn unknown_hosts_keep_the_latest_openai_shape() {
+        let compat = detect_compat("https://llm.example.com/v1");
+        assert!(compat.supports_store);
+        assert!(compat.supports_reasoning_effort);
+        assert!(compat.supports_strict_mode);
     }
 }

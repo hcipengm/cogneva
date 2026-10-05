@@ -225,7 +225,7 @@ impl SecurityGatewayConfig {
                 .collect::<Vec<_>>()
         };
         let token = |key: &str| std::env::var(key).ok().filter(|s| !s.is_empty());
-        Self {
+        let config = Self {
             egress_port: env_u16("COGNEVA_SG_EGRESS_PORT", 8080),
             llm_port: env_u16("COGNEVA_SG_LLM_PORT", 8081),
             domain_allowlist: list("COGNEVA_SG_DOMAIN_ALLOWLIST"),
@@ -266,7 +266,43 @@ impl SecurityGatewayConfig {
                 tracing::warn!(error = %e, "观测导出配置解析失败，按全部关闭处理");
                 ObservabilityExportersConfig::default()
             }),
+        };
+        // 上游跑在兜底兼容画像（厂商表查无此 host，按最新 OpenAI 形状假设）
+        // 时启动即警告一次。兜底画像会把调用方的 store / reasoning_effort /
+        // 工具 strict 原样放行，而不认这些字段的端点会在首字节前以 400
+        // 拒绝——这类拒绝按设计不进健康表，池读数不变，唯一痕迹是
+        // 请求形态计数，没有这条日志，画像漂移要等告警点名才看得见
+        // （2026-10-05 ark.cn-beijing.volces.com 实证）。
+        for upstream in &config.llm_upstreams {
+            let base = upstream.base_url.to_lowercase();
+            let known = [
+                "openrouter.ai",
+                "gateway.ai.cloudflare.com",
+                "ai-gateway",
+                "api.groq.com",
+                "api.cerebras.ai",
+                "api.x.ai",
+                "api.xai.com",
+                "api.mistral.ai",
+                "minimax",
+                "kimi",
+                "copilot",
+                "ollama",
+                "volces.com",
+                "volcengine",
+            ]
+            .iter()
+            .any(|marker| base.contains(marker));
+            if !known {
+                tracing::warn!(
+                    base_url = %upstream.base_url,
+                    model = %upstream.model,
+                    "LLM 上游无厂商兼容画像，按最新 OpenAI 形状兜底；若上游以 400/404/422 \
+                     拒绝而池读数不变，先在 cog_llm::utils::compat::detect_compat 登记画像"
+                );
+            }
         }
+        config
     }
 }
 

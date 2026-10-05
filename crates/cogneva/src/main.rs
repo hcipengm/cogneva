@@ -60,6 +60,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 镜像 HEALTHCHECK 调用的探针：只探本进程的 HTTP 端口，不启动应用。
         Command::HealthCheck => cogneva::health_check::run(),
         // 独立安全网关模式（deploy/k3s/gateway-deployment.yaml 的启动命令）。
+        // 上游池在 GatewayConfig::from_env 内解析：无厂商兼容画像的上游
+        // （detect_compat 查无此 host）启动即警告，兜底画像放行 newest-OpenAI
+        // 字段会让不认这些字段的端点首字节前 400（ark.cn-beijing.volces.com
+        // 实证），而池读数对此按设计不动，启动日志是早于告警的那条线索。
         Command::SecurityGateway => {
             cog_gateway::security_gateway::run_from_env(Some(env!("COGNEVA_GIT_REVISION"))).await
         }
