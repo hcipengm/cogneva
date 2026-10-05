@@ -183,10 +183,22 @@ impl GeneratorActor {
                         "generator",
                     );
                 }
-                (
-                    crate::squad::pge::parse_generator_output(&result),
-                    crate::actors::ReviewBasis::HeldTo(crate::actors::review_spec(task, &[])),
-                )
+                let output = crate::squad::pge::parse_generator_output(&result);
+                // An output whose own content names a deterministic cause is not
+                // the generator's answer: it is either this actor's fallback or a
+                // spent iteration budget, and the pipeline reads it as terminal
+                // and stops. Grading that placeholder would buy a review of a
+                // sentence nobody wrote in answer to the task, so it is skipped
+                // under the same named reason the planner uses — the calls this
+                // saves stay a reading rather than an absence.
+                let basis = if output.is_terminal_env_failure() {
+                    crate::actors::ReviewBasis::Skipped(
+                        crate::observable::SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE,
+                    )
+                } else {
+                    crate::actors::ReviewBasis::HeldTo(crate::actors::review_spec(task, &[]))
+                };
+                (output, basis)
             }
             Err(e) => {
                 tracing::warn!("Generator prompt failed: {}", e);

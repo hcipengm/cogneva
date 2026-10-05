@@ -9,7 +9,9 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use cog_collaboration::actors::{GeneratorActor, ModeSelectorActor, ModeratorActor, PlannerActor};
+use cog_collaboration::actors::{
+    EvaluatorActor, GeneratorActor, ModeSelectorActor, ModeratorActor, PlannerActor,
+};
 use cog_collaboration::{CollaborationExecutor, PgeMode, RouteStage};
 use cog_core::{
     Agent, AgentManager, AgentState, FailurePattern, ImplementationExample, InboxMessage,
@@ -527,6 +529,128 @@ async fn a_self_evolution_moderator_output_is_not_self_reviewed() {
         1,
         "the skip is about the task being a self-evolution one, not about the \
          moderator: an ordinary round still reviews the decision"
+    );
+}
+
+/// A reply whose own payload names a deterministic cause is not the generator's
+/// answer: it is a spent iteration budget, which the pipeline already reads as
+/// terminal and stops on. Reviewing it would grade a placeholder, so the review
+/// is skipped — while the cause stays on the output, because the skip must not
+/// swallow the reason the pipeline stops for.
+///
+/// The control is the same actor on an ordinary reply, so the count reads as
+/// "this output is not reviewable" rather than "the generator never reviews".
+#[tokio::test]
+async fn a_generator_output_naming_a_deterministic_cause_is_not_self_reviewed() {
+    let spent_budget = serde_json::json!({
+        "status": "max_iterations_reached",
+        "iterations": 10,
+        "pending_tool_calls": 3,
+    });
+
+    let budget_agent = MockAgent::new(spent_budget);
+    let budget_calls = budget_agent.review_calls.clone();
+    let actor = GeneratorActor::new(Arc::new(budget_agent)).with_self_review(self_review_config());
+    let output = actor
+        .generate(
+            &test_task("write a simple main function"),
+            &serde_json::json!({}),
+            0,
+            cog_collaboration::actors::PreviousAttempt::default(),
+            None,
+        )
+        .await;
+
+    assert_eq!(
+        *budget_calls.lock().unwrap(),
+        0,
+        "a spent budget is not a change to review"
+    );
+    assert!(
+        output.is_terminal_env_failure(),
+        "the skip must not take the cause away: this is what stops the pipeline"
+    );
+
+    let plain_agent = MockAgent::new(serde_json::json!({
+        "content": {"code": "fn main() {}"},
+        "artifacts": [],
+    }));
+    let plain_calls = plain_agent.review_calls.clone();
+    let actor = GeneratorActor::new(Arc::new(plain_agent)).with_self_review(self_review_config());
+    actor
+        .generate(
+            &test_task("write a simple main function"),
+            &serde_json::json!({}),
+            0,
+            cog_collaboration::actors::PreviousAttempt::default(),
+            None,
+        )
+        .await;
+
+    assert_eq!(
+        *plain_calls.lock().unwrap(),
+        1,
+        "an answer that names no cause is still reviewed"
+    );
+}
+
+/// The evaluator's twin: a judge that spent its own budget hands back an
+/// envelope with no verdict in it. The roundtable stops on that reason, so a
+/// self-review here would be asking for a critique of a judgement the evaluator
+/// never made.
+#[tokio::test]
+async fn an_evaluator_that_spent_its_budget_is_not_self_reviewed() {
+    let budget_agent = MockAgent::new(serde_json::json!({
+        "status": "max_iterations_reached",
+        "iterations": 10,
+        "pending_tool_calls": 3,
+    }));
+    let budget_calls = budget_agent.review_calls.clone();
+    let actor = EvaluatorActor::new(Arc::new(budget_agent)).with_self_review(self_review_config());
+    let judgement = actor
+        .evaluate(
+            &test_task("judge the widget"),
+            &serde_json::json!({}),
+            &serde_json::json!({"content": {"code": "x"}, "artifacts": []}),
+            &[],
+            &[],
+            None,
+        )
+        .await;
+
+    assert_eq!(
+        *budget_calls.lock().unwrap(),
+        0,
+        "a spent budget is not a judgement to review"
+    );
+    assert!(
+        judgement.is_terminal_env_failure(),
+        "the cause has to survive the skip: the roundtable reads it to stop"
+    );
+
+    let plain_agent = MockAgent::new(serde_json::json!({
+        "verdict": "pass",
+        "score": 92,
+        "feedback": "looks good",
+        "criteria": [],
+    }));
+    let plain_calls = plain_agent.review_calls.clone();
+    let actor = EvaluatorActor::new(Arc::new(plain_agent)).with_self_review(self_review_config());
+    actor
+        .evaluate(
+            &test_task("judge the widget"),
+            &serde_json::json!({}),
+            &serde_json::json!({"content": {"code": "x"}, "artifacts": []}),
+            &[],
+            &[],
+            None,
+        )
+        .await;
+
+    assert_eq!(
+        *plain_calls.lock().unwrap(),
+        1,
+        "a real verdict is still reviewed"
     );
 }
 

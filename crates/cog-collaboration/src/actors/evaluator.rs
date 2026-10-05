@@ -193,10 +193,19 @@ impl EvaluatorActor {
                         "evaluator",
                     );
                 }
-                (
-                    crate::squad::pge::parse_evaluation_result(&result),
-                    crate::actors::ReviewBasis::HeldTo(crate::actors::review_spec(task, criteria)),
-                )
+                let output = crate::squad::pge::parse_evaluation_result(&result);
+                // Same reason as the planner and the generator: an envelope whose
+                // own payload names a deterministic cause is a budget the loop
+                // spent, not a judgement — the roundtable already stops on it —
+                // so a self-review here would be grading the absence of a verdict.
+                let basis = if output.is_terminal_env_failure() {
+                    crate::actors::ReviewBasis::Skipped(
+                        crate::observable::SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE,
+                    )
+                } else {
+                    crate::actors::ReviewBasis::HeldTo(crate::actors::review_spec(task, criteria))
+                };
+                (output, basis)
             }
             Err(e) => {
                 tracing::warn!("Evaluator prompt failed: {}", e);
