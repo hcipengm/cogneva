@@ -350,6 +350,12 @@ async fn run_k3s_install_script(env: &str) -> Result<()> {
 /// exist before the first start of the service.
 const K3S_CONFIG_PATH: &str = "/etc/rancher/k3s/config.yaml";
 
+/// The directory K3s hands the kubelet as its config directory. Kubelet merges
+/// the `.conf` files in it in lexical order, on top of its own defaults and on
+/// top of K3s's generated `00-k3s-defaults.conf`, which is why the name below
+/// has to sort after that one.
+const K3S_KUBELET_DROPIN_DIR: &str = "/var/lib/rancher/k3s/agent/etc/kubelet.conf.d";
+
 /// Write the node's memory QoS settings where K3s will read them.
 ///
 /// Never overwrites: a config file on the node is an operator's decision, and
@@ -372,6 +378,34 @@ fn write_k3s_qos_config(mem_total_mb: u64, cpu_cores: usize) -> Result<()> {
     info!(
         "已预置节点内存 QoS（非 Pod 预留 cpu={}m / memory={}MiB，memory.available<{}MiB 触发驱逐）→ {K3S_CONFIG_PATH}",
         qos.reserved_cpu_milli, qos.reserved_memory_mb, qos.eviction_memory_mb
+    );
+    Ok(())
+}
+
+/// Write the drop-in that bounds the image store by age.
+///
+/// Not a kubelet argument, and it cannot be one: `imageMaximumGCAge` has no
+/// kubelet flag, so a `kubelet-arg` naming it stops the kubelet and the node
+/// never comes up. It has to be written before the first start, like the config
+/// file above, because the K3s agent only creates the directory at its own
+/// start and the kubelet reads the whole directory once. Same policy on an
+/// existing file: it is the operator's if they put one there.
+fn write_k3s_kubelet_image_gc_dropin() -> Result<()> {
+    let dir = Path::new(K3S_KUBELET_DROPIN_DIR);
+    let path = dir.join(cogneva_bootstrap::K3S_IMAGE_GC_DROPIN_FILE);
+    if path.exists() {
+        warn!(
+            "{} 已存在，保留不覆盖：请自行确认其中含 imageMaximumGCAge",
+            path.display()
+        );
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(&path, cogneva_bootstrap::k3s_kubelet_image_gc_dropin_yaml())?;
+    info!(
+        "已预置镜像按年龄回收（{} 未使用的镜像可被回收）→ {}",
+        cogneva_bootstrap::IMAGE_GC_MAX_AGE,
+        path.display()
     );
     Ok(())
 }
@@ -441,6 +475,7 @@ async fn install_k3s(hw: &Hardware) -> Result<()> {
         write_k3s_registries_cn()?;
     }
     write_k3s_qos_config(hw.mem_total_mb, hw.cpu_cores)?;
+    write_k3s_kubelet_image_gc_dropin()?;
     let env = if cn_mirror() {
         "INSTALL_K3S_MIRROR=cn"
     } else {
@@ -676,14 +711,20 @@ async fn install_k3s_agents(agents: &[String]) -> Result<()> {
         let (ssh_target, port) = parse_ssh_target(target);
         // 每个 agent 按**它自己的**读数推导，而不是照抄 server 的：内存与核数
         // 逐节点不同，同一份数字会让小节点留得过多、大节点留得过少。
+        // 镜像库的年龄上限不依赖这台节点的读数，所以两条分支都写它：读不到内存
+        // 的节点照样该有个有界的镜像库。
+        let image_gc = image_gc_remote_write();
         let remote = match remote_qos_config(&ssh_target, port.as_ref()).await {
-            Some(qos) => format!("{prep}{}{download} && {run_remote}", qos_remote_write(&qos)),
+            Some(qos) => format!(
+                "{prep}{}{image_gc}{download} && {run_remote}",
+                qos_remote_write(&qos)
+            ),
             None => {
                 warn!(
                     "读不到 {target} 的内存 / 核数，该节点将不带内存预留与驱逐阈值启动：\
                      装完后按它自己的读数写 {K3S_CONFIG_PATH} 并重启 K3s"
                 );
-                format!("{prep}{download} && {run_remote}")
+                format!("{prep}{image_gc}{download} && {run_remote}")
             }
         };
         let mut args: Vec<String> = vec![
@@ -762,6 +803,23 @@ fn qos_remote_write(yaml: &str) -> String {
     format!(
         "if [ ! -f {K3S_CONFIG_PATH} ]; then mkdir -p /etc/rancher/k3s && \
          cat > {K3S_CONFIG_PATH} <<'COGNEVA_QOS'\n{yaml}COGNEVA_QOS\nfi && "
+    )
+}
+
+/// The same pre-start write as above for the image-store drop-in, and on the
+/// same terms: before the agent's first start, and never over an existing file.
+/// Separate from the QoS write because it does not depend on the node's
+/// readings -- a node whose memory could not be read still gets its store
+/// bounded.
+fn image_gc_remote_write() -> String {
+    let path = format!(
+        "{K3S_KUBELET_DROPIN_DIR}/{}",
+        cogneva_bootstrap::K3S_IMAGE_GC_DROPIN_FILE
+    );
+    let yaml = cogneva_bootstrap::k3s_kubelet_image_gc_dropin_yaml();
+    format!(
+        "if [ ! -f {path} ]; then mkdir -p {K3S_KUBELET_DROPIN_DIR} && \
+         cat > {path} <<'COGNEVA_IMAGE_GC'\n{yaml}COGNEVA_IMAGE_GC\nfi && "
     )
 }
 
@@ -3384,7 +3442,9 @@ mod node_qos_wiring_tests {
     /// K3s reads `/etc/rancher/k3s/config.yaml` once, when the service first
     /// starts, so writing it after the install script is the same as never
     /// writing it: the node would come up with no reservation and no memory
-    /// eviction threshold, and nothing on it would say so.
+    /// eviction threshold, and nothing on it would say so. The kubelet config
+    /// directory is read on the same terms and once, so the drop-in that bounds
+    /// the image store has to be there before that start too.
     #[test]
     fn the_node_qos_config_is_written_before_k3s_starts() {
         let src = include_str!("main.rs");
@@ -3395,8 +3455,18 @@ mod node_qos_wiring_tests {
                 "run_k3s_install_script",
             ),
             (
+                "async fn install_k3s(",
+                "write_k3s_kubelet_image_gc_dropin",
+                "run_k3s_install_script",
+            ),
+            (
                 "async fn install_k3s_agents(",
                 "qos_remote_write",
+                "run(\"ssh\"",
+            ),
+            (
+                "async fn install_k3s_agents(",
+                "image_gc_remote_write",
                 "run(\"ssh\"",
             ),
         ] {

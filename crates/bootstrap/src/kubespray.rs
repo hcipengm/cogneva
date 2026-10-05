@@ -428,9 +428,15 @@ async fn write_node_host_vars(work: &Path, workers: &[String]) -> Result<()> {
             continue;
         };
         let qos = cogneva_bootstrap::node_qos(readings.mem_total_mb, readings.cpu_cores);
+        // 镜像库的年龄上限不依赖读数，但 kubespray 的 kubelet 配置是按节点渲染的，
+        // 所以它跟 QoS 一起写进同一份 host_vars——同一个文件的同一个文档。
         tokio::fs::write(
             dir.join(format!("{name}.yml")),
-            cogneva_bootstrap::kubespray_qos_host_vars(&qos),
+            format!(
+                "{}{}",
+                cogneva_bootstrap::kubespray_qos_host_vars(&qos),
+                cogneva_bootstrap::kubespray_image_gc_vars()
+            ),
         )
         .await
         .with_context(|| format!("写 host_vars/{name}.yml"))?;

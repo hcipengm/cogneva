@@ -357,6 +357,66 @@ pub fn k3s_qos_config_yaml(qos: &NodeQos) -> String {
     )
 }
 
+/// How long an image may sit unused before the kubelet may reclaim it.
+///
+/// A week, for three reasons that agree: it is longer than any rollback this
+/// system performs (the deployer keeps the previous release minutes old), it is
+/// the interval the promotion report runs on, so nothing a report could still be
+/// about is reclaimed while that report is being written, and it bounds the
+/// store at about a week of releases instead of at whatever the disk allows.
+pub const IMAGE_GC_MAX_AGE: &str = "168h";
+
+/// The K3s drop-in that bounds the image store by age.
+///
+/// Kubelet's only bounded-resource trigger for images is a percentage of its
+/// image filesystem: it collects when that filesystem passes
+/// `imageGCHighThresholdPercent`, 85% by default. On a single-disk node the
+/// image store shares the root filesystem, so that percentage is a share of a
+/// filesystem that mostly is not images -- 85% of it is far more free space
+/// than the whole store occupies, which means nothing is ever reclaimed and the
+/// store grows until someone deletes it by hand.
+///
+/// The age bound is the trigger that does not depend on the watermark: an image
+/// unused for longer than this is reclaimed on every collection pass, whatever
+/// the disk says. Two properties of it are worth knowing before setting a value.
+/// Kubelet does not collect by age until it has itself been running longer than
+/// the age, so a node reclaims nothing for the first stretch after it starts --
+/// the same stretch in which it has nothing old to reclaim. And the age is
+/// measured from when the image was last used by a container, so an image that
+/// was pulled and never run ages from the moment kubelet first saw it.
+///
+/// This is a file rather than a `kubelet-arg` because `imageMaximumGCAge` has no
+/// kubelet flag. Every other image GC setting does, which is what makes the flag
+/// the expected home; a `kubelet-arg` naming a flag that does not exist stops
+/// the kubelet, and a kubelet that will not start is a node that never comes up.
+/// The drop-in directory is the one surface that carries the fields the flags
+/// cannot reach: K3s hands it to the kubelet as its config directory, and K3s
+/// writes its own defaults there as `00-k3s-defaults.conf`, which states
+/// `imageMaximumGCAge: 0s`. Files are merged in lexical order, so this one has
+/// to sort after that -- it does.
+pub fn k3s_kubelet_image_gc_dropin_yaml() -> String {
+    format!(
+        "apiVersion: kubelet.config.k8s.io/v1beta1\nkind: KubeletConfiguration\nimageMaximumGCAge: {IMAGE_GC_MAX_AGE}\n"
+    )
+}
+
+/// The name the drop-in has to carry, next to the content for the same reason
+/// the content is here: the ordering is part of the artifact, and the file K3s
+/// writes is named `00-k3s-defaults.conf`.
+pub const K3S_IMAGE_GC_DROPIN_FILE: &str = "50-cogneva-image-gc.conf";
+
+/// The same age bound stated as kubespray host variables.
+///
+/// A fragment rather than a document: it is appended to the node's other
+/// kubelet settings, and a second YAML document in one host_vars file is not a
+/// thing Ansible promises to read. Kubespray renders a real
+/// `KubeletConfiguration` per node, so this needs no drop-in -- the pinned tag's
+/// kubelet-config template merges `kubelet_config_extra_args` into it, which is
+/// how a field with no flag is expressed there.
+pub fn kubespray_image_gc_vars() -> String {
+    format!("kubelet_config_extra_args:\n  imageMaximumGCAge: \"{IMAGE_GC_MAX_AGE}\"\n")
+}
+
 /// The same QoS settings stated as kubespray host variables.
 ///
 /// A K3s node reads one file before its first start; a standard Kubernetes
@@ -626,6 +686,85 @@ mod tests {
             assert!(yaml.contains(signal), "missing {signal} in {yaml}");
         }
         assert!(yaml.starts_with("---\n"));
+    }
+
+    /// The age bound has no kubelet flag, so it cannot ride in the config file's
+    /// `kubelet-arg` list: that list is a flag passthrough, and naming a flag
+    /// that does not exist stops the kubelet, which is a node that never comes
+    /// up. It goes in a drop-in, which has to be a KubeletConfiguration and has
+    /// to carry the age as a duration string.
+    #[test]
+    fn the_image_gc_bound_is_a_dropin_and_not_a_kubelet_arg() {
+        let dropin = k3s_kubelet_image_gc_dropin_yaml();
+        // Parsed rather than grepped: the kubelet's config decoder rejects
+        // unknown fields, so a stray key here is a kubelet that will not start.
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&dropin).expect("drop-in 必须是合法 YAML");
+        assert_eq!(
+            parsed.get("kind").and_then(|v| v.as_str()),
+            Some("KubeletConfiguration")
+        );
+        assert_eq!(
+            parsed.get("apiVersion").and_then(|v| v.as_str()),
+            Some("kubelet.config.k8s.io/v1beta1")
+        );
+        assert_eq!(
+            parsed.get("imageMaximumGCAge").and_then(|v| v.as_str()),
+            Some(IMAGE_GC_MAX_AGE)
+        );
+        assert_eq!(
+            parsed.as_mapping().map(|m| m.len()),
+            Some(3),
+            "只有这三个键：KubeletConfiguration 的字段名拼错或多余都会让 kubelet 起不来"
+        );
+        assert!(
+            !k3s_qos_config_yaml(&node_qos(64199, 24)).contains("gc-age"),
+            "the age must not be written as a kubelet-arg: there is no flag for it"
+        );
+    }
+
+    /// The drop-in directory merges in lexical order and K3s writes
+    /// `imageMaximumGCAge: 0s` into `00-k3s-defaults.conf`, so a file that sorts
+    /// before it would be overridden by the disabled value.
+    #[test]
+    fn the_image_gc_dropin_sorts_after_the_k3s_defaults() {
+        // The name K3s gives its own generated file, read off a running node.
+        const K3S_DEFAULTS_DROPIN_FILE: &str = "00-k3s-defaults.conf";
+        assert!(
+            K3S_IMAGE_GC_DROPIN_FILE > K3S_DEFAULTS_DROPIN_FILE,
+            "lexical order: a name that sorts first is overridden by the disabled default"
+        );
+        assert!(
+            K3S_IMAGE_GC_DROPIN_FILE.ends_with(".conf"),
+            "kubelet 只读 .conf"
+        );
+    }
+
+    #[test]
+    fn the_kubespray_side_states_the_same_age_bound() {
+        let vars = kubespray_image_gc_vars();
+        // A fragment, not a document: it is appended under the node's other
+        // kubelet settings, and one host_vars file has to stay one document --
+        // Ansible reads the first document of a vars file.
+        let combined = format!("{}{}", kubespray_qos_host_vars(&node_qos(64199, 24)), vars);
+        assert_eq!(
+            serde_yaml::Deserializer::from_str(&combined).count(),
+            1,
+            "host_vars 必须是单个文档，否则追加的那一截不会被读到"
+        );
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&combined).expect("host_vars 必须是合法 YAML");
+        assert!(
+            parsed.get("eviction_hard").is_some(),
+            "追加不能把原有的键挤出去"
+        );
+        assert_eq!(
+            parsed
+                .get("kubelet_config_extra_args")
+                .and_then(|v| v.get("imageMaximumGCAge"))
+                .and_then(|v| v.as_str()),
+            Some(IMAGE_GC_MAX_AGE)
+        );
     }
 
     #[test]
