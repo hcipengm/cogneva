@@ -1009,15 +1009,29 @@ fn the_tables_hold_no_series_that_no_rule_reads() {
 /// requires each one to be accounted for by an alert rule, by a dashboard
 /// panel, or by an entry here.
 ///
-/// There are two verdicts and no third. `Elsewhere` names the surface that
-/// states the same fact, which makes leaving this name unread a decision
-/// instead of an oversight. `Gap` records a fact that nothing states and
-/// nothing reports: it is a debt, kept as a count by `GAPS_AT_CENSUS` so the
-/// next one cannot arrive unnoticed, and never a statement that the reading is
-/// not worth having.
+/// There are three verdicts and no fourth. `Elsewhere` names the series the
+/// same fact is read from, which makes leaving this name unread a decision
+/// instead of an oversight. `NotAReading` says no rule can state the fact,
+/// because this series does not carry one. `Gap` records a fact that nothing
+/// states and nothing reports: it is a debt, kept as a count by
+/// `GAPS_AT_CENSUS` so the next one cannot arrive unnoticed, and never a
+/// statement that the reading is not worth having.
+///
+/// The reader is a series name rather than prose on purpose. The census filed
+/// two of these as `Elsewhere` with a reason saying a rule read one of their
+/// operands, and that rule reads neither -- the two names occurred nowhere in
+/// it. A reason is a sentence the gate can only count words in, so a true
+/// exemption and a false one look the same; a series name is looked up, and the
+/// lookup is what separates them.
 enum Unread {
-    /// The same fact is stated elsewhere; the surface is named.
-    Elsewhere(&'static str),
+    /// The same fact is read from these series, each by a shipped rule.
+    Elsewhere {
+        readers: &'static [&'static str],
+        reason: &'static str,
+    },
+    /// No rule can state it: the series carries no measurement -- a label, a
+    /// timestamp, or a copy of something published where it is read.
+    NotAReading(&'static str),
     /// Nothing states it. A debt, counted by `GAPS_AT_CENSUS`.
     Gap(&'static str),
 }
@@ -1045,7 +1059,10 @@ const UNREAD: &[(&str, Unread)] = &[
     // what the rule above is.
     (
         "memory_unextracted_raw",
-        Unread::Elsewhere("the actionable subset is read by memory_raw_backlog_aged_out; this is its denominator"),
+        Unread::Elsewhere {
+            readers: &["memory_unextracted_raw_aged_out"],
+            reason: "the actionable subset is read by memory_raw_backlog_aged_out; this is its denominator",
+        },
     ),
     (
         "memory_operations_total",
@@ -1061,23 +1078,36 @@ const UNREAD: &[(&str, Unread)] = &[
     ),
     (
         "metrics_samples_bytes",
-        Unread::Elsewhere("the help says it lags the row count and is never the pruning criterion; the capacity verdict is the reading with a criterion"),
+        Unread::NotAReading("the help says it lags the row count and is never the pruning criterion; the capacity verdict is the reading with a criterion"),
     ),
     (
         "tier_migration_total",
-        Unread::Elsewhere("trace_tier_migration_failing, trace_tier_migration_stale and trace_tier_demotion_stalled read the same face's failures, staleness and backlog"),
+        Unread::Elsewhere {
+            readers: &[
+                "cogneva_trace_tier_pass_failures_total",
+                "cogneva_trace_tier_last_pass_seconds",
+                "cogneva_trace_tier_overdue",
+            ],
+            reason: "trace_tier_migration_failing, trace_tier_migration_stale and trace_tier_demotion_stalled read the same face's failures, staleness and backlog",
+        },
     ),
     (
         "cogneva_worktree_index_present",
-        Unread::Elsewhere("the sampling loop's liveness is stated by background_loop_stalled over cogneva_loop_tick_age_seconds"),
+        Unread::Elsewhere {
+            readers: &["cogneva_loop_tick_age_seconds"],
+            reason: "the sampling loop's liveness is stated by background_loop_stalled over cogneva_loop_tick_age_seconds",
+        },
     ),
     (
         "cogneva_version_contract_checks_total",
-        Unread::Elsewhere("the denominator of version_contract_violated: the help says it is what separates a contract that holds from a judgement that never ran"),
+        Unread::Elsewhere {
+            readers: &["cogneva_version_contract_violations"],
+            reason: "the denominator of version_contract_violated: the help says it is what separates a contract that holds from a judgement that never ran",
+        },
     ),
     (
         "cogneva_version_declared_info",
-        Unread::Elsewhere("the help calls it an identity label rather than a measurement; the declared version is also on the image tag and in the release tag the artifact is built from"),
+        Unread::NotAReading("the help calls it an identity label rather than a measurement; the declared version is also on the image tag and in the release tag the artifact is built from"),
     ),
     (
         "cogneva_version_commits_since_release",
@@ -1101,7 +1131,10 @@ const UNREAD: &[(&str, Unread)] = &[
     ),
     (
         "cogneva_registry_pruned_tags_total",
-        Unread::Elsewhere("registry_reclaim_debt_unpaid reads the deletions the tag server did not reclaim; the count of the ones that succeeded adds no other fact"),
+        Unread::Elsewhere {
+            readers: &["cogneva_registry_gc_owed"],
+            reason: "registry_reclaim_debt_unpaid reads the deletions the tag server did not reclaim; the count of the ones that succeeded adds no other fact",
+        },
     ),
     (
         "cogneva_registry_rebuild_hold_secs_total",
@@ -1149,13 +1182,34 @@ const UNREAD: &[(&str, Unread)] = &[
     ),
     (
         "llm_upstream_failures_total",
-        Unread::Elsewhere("llm_calls_all_failing reads llm_calls_total{result=error} and the health table states the current consecutive failures; the help says this cumulative total and the backoff window describe one history"),
+        Unread::Elsewhere {
+            readers: &["llm_calls_total"],
+            reason: "llm_calls_all_failing reads llm_calls_total{result=error} and the health table states the current consecutive failures; the help says this cumulative total and the backoff window describe one history",
+        },
     ),
     (
         "llm_request_param_clamped_total",
-        Unread::Elsewhere("the producer's own comment states the verdict's readings are the pool entry's key presence and llm_usage_verdict_measured, which llm_usage_verdict_unmeasured reads"),
+        Unread::Elsewhere {
+            readers: &["llm_usage_verdict_measured"],
+            reason: "the producer's own comment states the verdict's readings are the pool entry's key presence and llm_usage_verdict_measured, which llm_usage_verdict_unmeasured reads",
+        },
     ),
 ];
+
+/// Entries an `Elsewhere` reader claim cannot be resolved against.
+///
+/// A reader has to be a name some face reads -- the same closure the census
+/// walks, rules and panels together. That is the whole claim the entry makes,
+/// and it is the one the census shipped two false entries under: a reason
+/// saying the floor rule read one of the sample log's operands, where the rule
+/// reads neither.
+fn unresolved_readers(read: &BTreeSet<String>, name: &str, readers: &[&str]) -> Vec<String> {
+    readers
+        .iter()
+        .filter(|reader| !read.contains(**reader))
+        .map(|reader| format!("  {name} -> {reader}"))
+        .collect()
+}
 
 /// How many `Gap` entries the census left. A new series that no face reads and
 /// that nothing else states must be classified, and calling it a gap raises
@@ -1231,7 +1285,9 @@ fn every_series_the_closed_set_publishes_has_a_decided_reader() {
         .iter()
         .filter(|(_, v)| {
             let reason = match v {
-                Unread::Elsewhere(reason) | Unread::Gap(reason) => *reason,
+                Unread::Elsewhere { reason, .. }
+                | Unread::NotAReading(reason)
+                | Unread::Gap(reason) => *reason,
             };
             reason.split_whitespace().count() < 5
         })
@@ -1242,6 +1298,25 @@ fn every_series_the_closed_set_publishes_has_a_decided_reader() {
         "UNREAD 里这些条目没写清理由（豁免要说出那份事实在哪个面上、欠账要说出为什么这轮补不了）: {unreasoned:?}"
     );
 
+    // The exemption's reader is looked up, not read. A reason is prose, so the
+    // gate could only ever count its words -- and it did, once, for two entries
+    // whose reason named a rule that reads neither series they exempted. A
+    // series name is either one a face reads or it is not, so the same claim
+    // written this way cannot be made without being true.
+    let any_read: BTreeSet<String> = rule_read.union(&panel_read).cloned().collect();
+    let unresolved: Vec<String> = UNREAD
+        .iter()
+        .flat_map(|(name, verdict)| match verdict {
+            Unread::Elsewhere { readers, .. } => unresolved_readers(&any_read, name, readers),
+            Unread::NotAReading(_) | Unread::Gap(_) => Vec::new(),
+        })
+        .collect();
+    assert!(
+        unresolved.is_empty(),
+        "UNREAD 里这些豁免指向的序列没有任何规则在读，登记本身成了空头许可:\n{}",
+        unresolved.join("\n")
+    );
+
     let gaps = UNREAD
         .iter()
         .filter(|(_, v)| matches!(v, Unread::Gap(_)))
@@ -1250,6 +1325,44 @@ fn every_series_the_closed_set_publishes_has_a_decided_reader() {
         gaps <= GAPS_AT_CENSUS,
         "零读者序列的欠账数从 {GAPS_AT_CENSUS} 涨到 {gaps}：新增的零读者序列必须当轮补读者，或把它的成因写进 UNREAD 并同步改 GAPS_AT_CENSUS（改这个数就是承认多欠一笔）"
     );
+}
+
+/// An exemption has to name a reader that is there.
+///
+/// The census shipped two `Elsewhere` entries for the sample log's row count and
+/// budget whose reason said the floor rule read one of their operands. That rule
+/// reads neither -- the two names occurred nowhere in it -- and the gate passed
+/// both, because a reason is prose and all it can be asked is whether it is
+/// long enough. Written as a series name instead, the same claim is a lookup:
+/// the name is read by a shipped rule or it is not.
+///
+/// This is the unit side of the criterion, against a fabricated claim rather
+/// than the shipped table, so the check that the table is clean cannot be the
+/// only thing standing between a false exemption and a green run.
+#[test]
+fn an_elsewhere_entry_that_names_a_reader_no_rule_has_is_reported() {
+    let any_read: BTreeSet<String> = chart_rules()
+        .iter()
+        .flat_map(|(_, promql)| metric_names_in(promql))
+        .chain(dashboard::series())
+        .collect();
+
+    // A published name nothing reads: the claim the false entries made, in the
+    // form the gate can check.
+    let named = unresolved_readers(&any_read, "metrics_samples_rows", &["metrics_samples_bytes"]);
+    assert!(
+        !named.is_empty(),
+        "豁免指向一条没有读者的序列时必须报出来，否则豁免又退回成一句判据核不了的话"
+    );
+
+    // The reader that really exists stays silent, so the criterion is not
+    // refusing every entry it is given.
+    let resolved = unresolved_readers(
+        &any_read,
+        "metrics_samples_rows",
+        &["metrics_samples_over_capacity"],
+    );
+    assert!(resolved.is_empty(), "{resolved:?}");
 }
 
 /// The gate-blindness verdict must have a successor.
