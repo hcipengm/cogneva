@@ -644,7 +644,7 @@ data:
             },
             {
               "name": "self_evolution_submitted_nothing",
-              "promql": "(sum without (pod, container, instance) (increase(self_evolution_change_yield_total[24h])) > bool 0) and on() (sum without (pod, container, instance) (increase(self_evolution_change_yield_total{outcome=\"submitted\"}[24h])) == bool 0)",
+              "promql": "(sum without (pod, container, instance) (increase(self_evolution_change_yield_total[24h])) > 0) unless on() (sum without (pod, container, instance) (increase(self_evolution_change_yield_total{outcome=\"submitted\"}[24h])) > 0)",
               "condition": {
                 "greater_than": 0.0
               },
@@ -653,7 +653,7 @@ data:
             },
             {
               "name": "self_evolution_rework_never_handed_off",
-              "promql": "(sum without (pod, container, instance) (increase(cogneva_change_fate_total{fate=\"retired\"}[24h])) > bool 0) and on() (sum without (pod, container, instance) (increase(self_evolution_change_rework_total{outcome=\"submitted\"}[24h])) == bool 0)",
+              "promql": "(sum without (pod, container, instance) (increase(cogneva_change_fate_total{fate=\"retired\"}[24h])) > 0) unless on() (sum without (pod, container, instance) (increase(self_evolution_change_rework_total{outcome=\"submitted\"}[24h])) > 0)",
               "condition": {
                 "greater_than": 0.0
               },

@@ -1847,3 +1847,197 @@ fn no_written_rule_reads_a_filter_through_a_range_aggregate() {
         complaints.join("\n")
     );
 }
+
+// ── 集合算子的操作数报的是不是过滤后的取值 ───────────────────────────────────
+
+/// Drop the matching clause (`on(...)` / `ignoring(...)` / `group_left(...)` /
+/// `group_right(...)`) the splitter leaves attached to the right operand, and
+/// one layer of parentheses around what remains.
+fn set_operand_expression(operand: &str) -> &str {
+    let t = operand.trim();
+    let rest = ["on", "ignoring", "group_left", "group_right"]
+        .iter()
+        .find_map(|kw| {
+            let rest = t.strip_prefix(kw)?.trim_start();
+            rest.starts_with('(').then_some(rest)
+        });
+    let expr = match rest {
+        Some(rest) => match matching_paren_end(rest, 1) {
+            Some(end) => rest[end + 1..].trim_start(),
+            None => t,
+        },
+        None => t,
+    };
+    strip_outer_parens(expr)
+}
+
+/// Whether an operand reports a 0/1 indicator as its own value rather than the
+/// value it measured.
+///
+/// `bool` is a value map: every series the selection matches survives carrying 1
+/// or 0 instead of what it measured. That is what it is for when something
+/// above consumes the indicator — `sum(x > bool 0)` counts the series that
+/// satisfy the comparison, and `avg_over_time((y < bool 1)[15m:1m])` is the
+/// fraction of the window it held. A set operator consumes no such thing:
+/// `and` and `unless` pair on labels alone, so an indicator at the operand's own
+/// top level is read by nobody. On their right side the damage is worse than
+/// pointless — that side's value is discarded whatever it holds, so mapping it
+/// leaves the operand selecting every series it matched, and a rule written as
+/// "this happened and that never did" fires for as long as this keeps happening.
+///
+/// Only the top level counts. Deeper in, the 0/1 is inside a call or a range
+/// window, which is a consumer.
+fn reports_an_indicator(operand: &str) -> bool {
+    let expr = set_operand_expression(operand);
+    let bytes = expr.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] as char {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 && bytes[i].is_ascii_alphabetic() {
+            let start = i;
+            while i < bytes.len() && is_word_byte(bytes[i]) {
+                i += 1;
+            }
+            if &expr[start..i] == "bool" {
+                return true;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Complaints about a set operator reading an operand that maps its values
+/// instead of filtering them.
+///
+/// The two sides fail differently and are reported separately. On the right of
+/// `and` / `unless` the mapping destroys a filter and the rule fires on
+/// membership: `A and on() (B == bool 0)` holds whenever B has any sample,
+/// because the set operator never looks at the 1/0 it was handed. On the left
+/// the value does reach the condition, so the mapping there does not open the
+/// gate — it blinds the verdict, which then judges a constant 1 instead of what
+/// the operand measured.
+///
+/// `or` is left alone: it reports the value it takes from either side, so both
+/// operands' values reach the condition.
+///
+/// This is not an evaluator, and it reads text rather than semantics: an
+/// expression it cannot split is not a complaint, and neither is an indicator
+/// buried in a call. A shape this misses leaves the rule as wrong as it already
+/// is, while a wrong complaint would block a rule that works.
+fn indicator_on_a_set_operand_complaints(expr: &str) -> Vec<String> {
+    let mut complaints = Vec::new();
+    collect_indicator_complaints(expr, &mut complaints);
+    complaints
+}
+
+fn collect_indicator_complaints(expr: &str, out: &mut Vec<String>) {
+    let Some((op, left, right)) = split_set_operator(expr) else {
+        return;
+    };
+    if op != "or" {
+        if reports_an_indicator(left) {
+            out.push(format!(
+                "`{op}` 左侧操作数 `{}` 用 `bool` 把取值换成了 0/1：`{op}` 报给条件的正是左侧的取值，\
+                 带上 `bool` 之后判词看见的永远是 1，量出来的值到不了它。该去掉的是 `bool`，不是这个比较",
+                set_operand_expression(left)
+            ));
+        }
+        if reports_an_indicator(right) {
+            out.push(format!(
+                "`{op}` 右侧操作数 `{}` 用 `bool` 把过滤降级成了「这一侧有样本就成立」：`{op}` 只按标签配对、\
+                 右侧报什么值都不看，映射成 0/1 之后它选中的是匹配到的每一组序列，而不是满足那个比较的那些。\
+                 要「另一侧不成立」写成 `unless on() (… > 0)`",
+                set_operand_expression(right)
+            ));
+        }
+    }
+    collect_indicator_complaints(left, out);
+    collect_indicator_complaints(right, out);
+}
+
+#[test]
+fn a_set_operand_that_maps_instead_of_filtering_is_reported() {
+    // The shape this check exists for, and the rule that shipped with it: the
+    // summary promises "finished in the last day and not one of them handed a
+    // change to a sink", the expression fires for as long as any cell of the
+    // counter has moved.
+    let shipped = "(sum without (pod, container, instance) \
+                   (increase(self_evolution_change_yield_total[24h])) > bool 0) \
+                   and on() (sum without (pod, container, instance) \
+                   (increase(self_evolution_change_yield_total{outcome=\"submitted\"}[24h])) == bool 0)";
+    let complaints = indicator_on_a_set_operand_complaints(shipped);
+    assert_eq!(complaints.len(), 2, "{complaints:?}");
+    assert!(
+        complaints.iter().any(|c| c.contains("过滤降级")),
+        "{complaints:?}"
+    );
+
+    // The rewrite is accepted: the filter is back on the right operand, and it
+    // is `unless` that says "and not".
+    assert!(indicator_on_a_set_operand_complaints(
+        "(sum without (pod, container, instance) \
+         (increase(self_evolution_change_yield_total[24h])) > 0) \
+         unless on() (sum without (pod, container, instance) \
+         (increase(self_evolution_change_yield_total{outcome=\"submitted\"}[24h])) > 0)"
+    )
+    .is_empty());
+
+    for fine in [
+        // An indicator something above consumes: the count of the series that
+        // satisfy the comparison.
+        "sum(x > bool 0) and on() (y > 0)",
+        // The same, through a subquery: the fraction of the window the compare
+        // held for.
+        "avg_over_time((sum(cogneva_evolution_change_queue_owner) < bool 1)[15m:1m]) \
+         and on() (count_over_time(cogneva_evolution_change_queue_owner[30m]) \
+         > count_over_time(cogneva_evolution_change_queue_owner[15m]))",
+        // `or` reports the value it takes from either side.
+        "(a == bool 0) or (b > 5)",
+    ] {
+        assert!(
+            indicator_on_a_set_operand_complaints(fine).is_empty(),
+            "{fine}"
+        );
+    }
+
+    // The mapped operand on the left is the other half: the gate stays where it
+    // was, and what breaks is the verdict, which now judges a constant.
+    let left = indicator_on_a_set_operand_complaints("(a > bool 0) unless on() (b > 0)");
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(left[0].contains("到不了它"), "{}", left[0]);
+
+    // Widening beats guessing: an operand this cannot read is not a complaint.
+    for fine in [
+        "x and y",
+        "a and on() (avg_over_time((b < bool 1)[5m:1m]) > 0)",
+        "a unless on() (b > 0) unless on() (c > 0)",
+    ] {
+        assert!(
+            indicator_on_a_set_operand_complaints(fine).is_empty(),
+            "{fine}"
+        );
+    }
+}
+
+#[test]
+fn no_written_rule_maps_a_set_operand_instead_of_filtering_it() {
+    let mut complaints: Vec<String> = Vec::new();
+    for (rule, promql) in chart_rules() {
+        for complaint in indicator_on_a_set_operand_complaints(&promql) {
+            complaints.push(format!("{rule}: {complaint}\n    {promql}"));
+        }
+    }
+
+    assert!(
+        complaints.is_empty(),
+        "这些规则的集合算子操作数没有被当成过滤读:\n{}",
+        complaints.join("\n")
+    );
+}
