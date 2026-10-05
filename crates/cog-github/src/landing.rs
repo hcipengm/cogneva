@@ -1476,11 +1476,28 @@ pub async fn watch_landed(
                 remove_record(&record.change.change_id).await;
             }
             Some(false) => {
-                let log = channel
+                // A fetch that failed is not an empty log. Collapsing the two
+                // made a broken log-fetch path indistinguishable from a
+                // failure with nothing to say, and the re-drive was then
+                // refused for evidence that was never asked for. Keep the
+                // record and let the next pass retry; the watch-window expiry
+                // above is what bounds a fetch that never comes back.
+                let log = match channel
                     .provider
                     .ci_failure_log_for_sha(&record.landed_rev)
                     .await
-                    .unwrap_or_default();
+                {
+                    Ok(log) => log,
+                    Err(e) => {
+                        tracing::warn!(
+                            change_id = %record.change.change_id,
+                            rev = %record.landed_rev,
+                            error = %e,
+                            "CI failure log could not be fetched; retrying next round"
+                        );
+                        continue;
+                    }
+                };
 
                 // Record once: the revert may take several rounds to succeed,
                 // and a failure must not be reported once per round.
@@ -2061,6 +2078,43 @@ mod tests {
         }
         async fn get_pull_request(&self, _n: u64) -> Result<crate::provider::PullRequestDetail> {
             Err(CogGitHubError::Provider("unused".into()))
+        }
+    }
+
+    /// A provider whose CI verdict is red and whose failure log answers with a
+    /// fixed result: the watch loop's answer to a red verdict depends on
+    /// telling a fetch that failed apart from a log that was fetched and came
+    /// back empty.
+    #[derive(Debug)]
+    struct RedCiProvider {
+        log: std::result::Result<String, String>,
+    }
+
+    #[async_trait::async_trait]
+    impl CodePlatformProvider for RedCiProvider {
+        async fn list_open_issues(&self) -> Result<Vec<crate::provider::PlatformIssue>> {
+            Ok(Vec::new())
+        }
+        async fn create_pull_request(
+            &self,
+            _req: crate::provider::CreatePullRequest,
+        ) -> Result<crate::provider::PlatformPullRequest> {
+            Err(CogGitHubError::Provider("unused".into()))
+        }
+        async fn comment_on_issue(&self, _n: u64, _body: String) -> Result<()> {
+            Ok(())
+        }
+        async fn merge_pull_request(&self, _n: u64, _sha: String) -> Result<()> {
+            Ok(())
+        }
+        async fn get_pull_request(&self, _n: u64) -> Result<crate::provider::PullRequestDetail> {
+            Err(CogGitHubError::Provider("unused".into()))
+        }
+        async fn ci_verdict_for_sha(&self, _sha: &str) -> Result<Option<bool>> {
+            Ok(Some(false))
+        }
+        async fn ci_failure_log_for_sha(&self, _sha: &str) -> Result<String> {
+            self.log.clone().map_err(CogGitHubError::Provider)
         }
     }
 
@@ -3192,6 +3246,107 @@ mod tests {
 
         remove_record("chg-old").await;
         remove_record("chg-fresh").await;
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
+    /// A channel whose CI provider answers with a fixed result, so the watch
+    /// loop's red-verdict path runs without a network.
+    fn watch_channel(policy: crate::config::LandingPolicy, provider: RedCiProvider) -> MainChannel {
+        MainChannel::new(
+            "/tmp/nonexistent",
+            GitHubIntegrationConfig {
+                repo: "o/r".into(),
+                landing_policy: policy,
+                ..Default::default()
+            },
+            Arc::new(provider),
+            ContributionController::new_shared(),
+        )
+    }
+
+    /// A fresh landed record whose CI has come back red.
+    async fn save_red_landing(id: &str) {
+        let now = Utc::now();
+        save_record(&LandingRecord {
+            change: change(id, &diff_touching(&["crates/cog-github/src/lib.rs"])),
+            base: "main".into(),
+            landed_rev: "abc1234".into(),
+            state: LandingState::Landed,
+            failure_recorded: false,
+            redriven: false,
+            unlanded_reported: false,
+            retired_reason: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+    }
+
+    /// 取不到的日志不是空日志：抓取失败时记录必须留下等下一轮重试，不能记失败、
+    /// 不能退役，否则一条坏掉的抓取路径会被读成"失败没有证据"，正是
+    /// redrive_refused_without_evidence 这条告警误报的来源。
+    #[tokio::test]
+    async fn a_failed_log_fetch_keeps_the_record_for_the_next_pass() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", dir.path());
+
+        let policy = crate::config::LandingPolicy {
+            revert_on_ci_failure: false,
+            redrive_on_ci_failure: false,
+            ..Default::default()
+        };
+        let chan = watch_channel(
+            policy,
+            RedCiProvider {
+                log: Err("log endpoint returned 500".to_string()),
+            },
+        );
+        save_red_landing("chg-red").await;
+
+        watch_landed(&chan, None, None).await;
+
+        let rec = load_record("chg-red")
+            .await
+            .expect("a fetch error keeps the record so the next pass retries");
+        assert!(
+            !rec.failure_recorded,
+            "no outcome may be recorded against a log that was never read"
+        );
+        assert!(!rec.redriven);
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
+    /// 取回来是空的日志才是"没有证据"：失败照常记录、记录照常退役，这条路不因
+    /// 区分抓取错误而改变。
+    #[tokio::test]
+    async fn an_empty_log_still_settles_the_record() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", dir.path());
+
+        let policy = crate::config::LandingPolicy {
+            revert_on_ci_failure: false,
+            redrive_on_ci_failure: false,
+            ..Default::default()
+        };
+        let chan = watch_channel(
+            policy,
+            RedCiProvider {
+                log: Ok(String::new()),
+            },
+        );
+        save_red_landing("chg-red").await;
+
+        watch_landed(&chan, None, None).await;
+
+        assert!(
+            load_record("chg-red").await.is_none(),
+            "an empty log was fetched, so the landing is settled and the record retires"
+        );
+
         std::env::remove_var("COGNEVA_DATA_DIR");
     }
 
