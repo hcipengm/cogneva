@@ -25,8 +25,15 @@ on:
         options: ['true', 'false']
         default: 'true'
 
+# The push to the base branch is made with a deploy key, not with GITHUB_TOKEN:
+# the branch requires status checks, GITHUB_TOKEN is not an admin, and only
+# admins are exempted here. A write-enabled deploy key is treated as one for
+# direct commits, so it is the credential that can actually act — and, unlike
+# GITHUB_TOKEN, a push made with it starts the workflows that judge the commit
+# it just pushed. The token below is only used to read the tip's check runs.
 permissions:
-  contents: write
+  contents: read
+  checks: read
 
 # One pass at a time: two guards deciding on the same tip would both build a
 # revert commit, and the second push would either race or undo the first.
@@ -49,12 +56,25 @@ jobs:
       - name: Self-test the verdict fold
         run: bash .github/scripts/tests/revert-guard.test.sh
 
+      - name: Install the push key
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p 22 github.com >> ~/.ssh/known_hosts 2>/dev/null
+
       - name: Judge the tip of main
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           BASE: main
           GRACE_SECS: '900'
+          # Where the revert goes when the tip has to be undone. Written as a
+          # full URL rather than a named remote so the credential used here is
+          # the key installed above and not the one the checkout left behind.
+          PUSH_URL: ssh://git@github.com:22/${{ github.repository }}.git
+          GIT_SSH_COMMAND: ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes
           # Scheduled runs follow this default; a manual run may override it.
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'true' }}
         run: bash .github/scripts/revert-guard.sh
