@@ -194,13 +194,16 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 10
             failureThreshold: 6
+          # 取值理由在 chart values 的 `sandboxExecutor.resources`（单一源在那里），
+          # 这里只跟着它走：1Gi 装不下一个 build，实测单个 cargo+rustc 就到上限的 99.6%
+          # 并被 OOM 杀掉。
           resources:
             requests:
               cpu: 100m
-              memory: 256Mi
+              memory: 512Mi
             limits:
               cpu: "1"
-              memory: 1Gi
+              memory: 2Gi
           volumeMounts:
             - name: sandbox-data
               mountPath: /opt/cogneva/sandbox

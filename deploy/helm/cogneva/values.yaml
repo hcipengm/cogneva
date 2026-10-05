@@ -337,13 +337,23 @@ sandboxExecutor:
   # 元数据，但这棵树有几十万条，且沙箱同时在编译，比分钟更勤没有价值；进程侧有下限
   # 兜底（取小于它的值等于取下限），而发布出来的间隔是**兜底后的那个数**。
   buildCacheScanIntervalSecs: 300
+  # 本 Pod 的内存上限是**一次编译就够把它用完**的那种小，所以它不是一个并发旋钮。
+  # 实测：一个 `cargo` 与它自己那唯一的 `rustc` 同时在场时，本容器 `memory.current`
+  # 已经是上限的 **99.6%**（anon 669 MiB + file 400 MiB），而同一个窗口里每十几分钟
+  # 就有一次 `Memory cgroup out of memory`，被杀的是 `rustc`/`cargo` —— 一次变更验证
+  # 整轮白跑。**所以病因不是"并发任务太多"**：这台容器上 rust 的可用并行度本来就是 1
+  # （`cpu.max` 100000/100000），一个 build 只开一个 rustc，而它一个就装不下。
+  # 取 2 GiB 的依据是那个工作负载的形状：单个 build 实测约 0.75 GiB
+  # （rustc 486 MiB + cargo 265 MiB），2 GiB 装得下**两个**这样的 build 再加页缓存，
+  # 而请求提到 512Mi 是与它常驻量同量级。CPU 不动：同一窗口 CFS 周期限流 918/5012
+  # （18%），不是这套 OOM 的病因。
   resources:
     requests:
       cpu: 100m
-      memory: 256Mi
+      memory: 512Mi
     limits:
       cpu: 1000m
-      memory: 1Gi
+      memory: 2Gi
 
 # 宿主机文档整理：把文档所在的目录**窄挂载**进沙箱执行器，让平台代文档属主
 # 整理这些文档。边界是挂载范围而不是白名单代码——只把属主自己的目录挂进来，
