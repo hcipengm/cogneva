@@ -1,3 +1,4 @@
+//! LLM provider implementations, routing, resilience, and streaming backends.
 pub mod config;
 pub mod hot_swap;
 pub mod model;
