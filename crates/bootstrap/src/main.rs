@@ -351,9 +351,11 @@ async fn run_k3s_install_script(env: &str) -> Result<()> {
 const K3S_CONFIG_PATH: &str = "/etc/rancher/k3s/config.yaml";
 
 /// The directory K3s hands the kubelet as its config directory. Kubelet merges
-/// the `.conf` files in it in lexical order, on top of its own defaults and on
-/// top of K3s's generated `00-k3s-defaults.conf`, which is why the name below
-/// has to sort after that one.
+/// the `.conf` files in it in lexical order, later ones winning, on top of its
+/// own defaults and on top of K3s's generated `00-k3s-defaults.conf`. That is
+/// why the name below sorts after that one, and before the `10-cli-config.conf`
+/// K3s copies an operator's `--config` file to: this bound may overrule K3s's
+/// default, never the operator's own setting.
 const K3S_KUBELET_DROPIN_DIR: &str = "/var/lib/rancher/k3s/agent/etc/kubelet.conf.d";
 
 /// Write the node's memory QoS settings where K3s will read them.

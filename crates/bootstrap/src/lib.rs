@@ -392,8 +392,9 @@ pub const IMAGE_GC_MAX_AGE: &str = "168h";
 /// The drop-in directory is the one surface that carries the fields the flags
 /// cannot reach: K3s hands it to the kubelet as its config directory, and K3s
 /// writes its own defaults there as `00-k3s-defaults.conf`, which states
-/// `imageMaximumGCAge: 0s`. Files are merged in lexical order, so this one has
-/// to sort after that -- it does.
+/// `imageMaximumGCAge: 0s`. Files are merged in lexical order, later files
+/// winning, so this one has to sort after that one and before the file K3s
+/// copies an operator's `--config` into -- it does both.
 pub fn k3s_kubelet_image_gc_dropin_yaml() -> String {
     format!(
         "apiVersion: kubelet.config.k8s.io/v1beta1\nkind: KubeletConfiguration\nimageMaximumGCAge: {IMAGE_GC_MAX_AGE}\n"
@@ -401,9 +402,14 @@ pub fn k3s_kubelet_image_gc_dropin_yaml() -> String {
 }
 
 /// The name the drop-in has to carry, next to the content for the same reason
-/// the content is here: the ordering is part of the artifact, and the file K3s
-/// writes is named `00-k3s-defaults.conf`.
-pub const K3S_IMAGE_GC_DROPIN_FILE: &str = "50-cogneva-image-gc.conf";
+/// the content is here: both ends of the ordering are part of the artifact.
+///
+/// It sorts after `00-k3s-defaults.conf`, which is where K3s states the
+/// disabled value, and before `10-cli-config.conf`, which is where K3s copies a
+/// configuration file an operator pointed `--config` at. Landing between the
+/// two keeps both of their decisions intact: the default cannot undo this
+/// bound, and an operator's own value still can.
+pub const K3S_IMAGE_GC_DROPIN_FILE: &str = "05-cogneva-image-gc.conf";
 
 /// The same age bound stated as kubespray host variables.
 ///
@@ -723,16 +729,24 @@ mod tests {
         );
     }
 
-    /// The drop-in directory merges in lexical order and K3s writes
-    /// `imageMaximumGCAge: 0s` into `00-k3s-defaults.conf`, so a file that sorts
-    /// before it would be overridden by the disabled value.
+    /// The drop-in directory merges in lexical order, later files winning. K3s
+    /// writes `imageMaximumGCAge: 0s` into `00-k3s-defaults.conf` and copies a
+    /// file an operator pointed `--config` at into `10-cli-config.conf`, so this
+    /// name has to land between the two: after the first or the disabled value
+    /// wins, before the second or the bound overrules an operator's own value.
     #[test]
-    fn the_image_gc_dropin_sorts_after_the_k3s_defaults() {
-        // The name K3s gives its own generated file, read off a running node.
+    fn the_image_gc_dropin_sorts_between_the_k3s_defaults_and_a_cli_config() {
+        // The name K3s gives its own generated file, and the one it copies an
+        // operator's `--config` to; both read off the K3s source.
         const K3S_DEFAULTS_DROPIN_FILE: &str = "00-k3s-defaults.conf";
+        const K3S_CLI_CONFIG_DROPIN_FILE: &str = "10-cli-config.conf";
         assert!(
             K3S_IMAGE_GC_DROPIN_FILE > K3S_DEFAULTS_DROPIN_FILE,
             "lexical order: a name that sorts first is overridden by the disabled default"
+        );
+        assert!(
+            K3S_IMAGE_GC_DROPIN_FILE < K3S_CLI_CONFIG_DROPIN_FILE,
+            "an operator's own configuration file has to be able to overrule this bound"
         );
         assert!(
             K3S_IMAGE_GC_DROPIN_FILE.ends_with(".conf"),
