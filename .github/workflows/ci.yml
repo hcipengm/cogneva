@@ -296,8 +296,17 @@ jobs:
               done
             exit 1
           }
+      # 上传是给**第三方**的遥测，不是判据：判据在上面那一步（`--fail-under-lines 40`
+      # 连同插桩下的测试红）。所以这一步的失败不该有终局权。
+      # 实测过为什么必须显式写：`fail_ci_if_error: false` 只管 codecov 自己报的上传失败，
+      # **管不住连接层**——`write EPROTO … ssl/tls alert handshake failure (SSL alert 40)`
+      # 是 action 进程自己抛的，照样让这一步非零退出、把整个 job 判红。
+      # 代价不对称：一次 codecov 抖动 = 该 rev 的 CI 红 = 部署器按设计拒绝滚动
+      # **并且**把刚落地的变更自动撤回，而源码树与覆盖率阈值两件事都通过了。
+      # 换成 continue-on-error 后，判据那一侧的强度一字未减。
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
+        continue-on-error: true
         with:
           files: ./cobertura.xml
           fail_ci_if_error: false
