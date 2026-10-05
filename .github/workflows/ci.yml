@@ -241,7 +241,10 @@ jobs:
       - uses: azure/setup-kubectl@v4
       - name: Script tests
         run: |
-          for t in deploy/scripts/tests/*.test.sh; do
+          # Both roots, globbed rather than listed: the guard's own tests live
+          # beside it under .github/ and a hand-kept list is what goes quiet
+          # when one is added.
+          for t in deploy/scripts/tests/*.test.sh .github/scripts/tests/*.test.sh; do
             echo "== ${t}"
             bash "${t}"
           done

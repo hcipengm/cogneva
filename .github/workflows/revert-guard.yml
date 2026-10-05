@@ -1,0 +1,60 @@
+name: Revert Guard
+
+# The fallback that undoes a bad landing on the base branch when nothing inside
+# the cluster can — see .github/scripts/revert-guard.sh for why this lives on a
+# runner instead of in a pod, and for the verdict rule it shares with the
+# in-cluster watcher.
+#
+# It starts in dry-run. A commit that reverts main is a change to the shared
+# branch, so the first rounds only report what it would undo; the switch to
+# acting is a deliberate edit of DRY_RUN below, made after those reports have
+# been read.
+#
+# The schedule is offset from the hour and from the half hour: the fleet's other
+# timers are not the point, but a job that wakes with everyone else queues
+# behind them.
+
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Report the commit that would be reverted instead of reverting it'
+        type: choice
+        options: ['true', 'false']
+        default: 'true'
+
+permissions:
+  contents: write
+
+# One pass at a time: two guards deciding on the same tip would both build a
+# revert commit, and the second push would either race or undo the first.
+concurrency:
+  group: revert-guard
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          # The tip's age is measured from its committer timestamp, and the
+          # subject and author are read from the same commit, so the history
+          # has to be here rather than fetched one commit deep.
+          fetch-depth: 50
+
+      - name: Self-test the verdict fold
+        run: bash .github/scripts/tests/revert-guard.test.sh
+
+      - name: Judge the tip of main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BASE: main
+          GRACE_SECS: '900'
+          # Scheduled runs follow this default; a manual run may override it.
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'true' }}
+        run: bash .github/scripts/revert-guard.sh
