@@ -710,7 +710,7 @@ impl Default for MetricsConfig {
         Self {
             enabled: true,
             endpoint: "/metrics".into(),
-            sample_max_rows: 200_000,
+            sample_max_rows: 500_000,
             scrape_dimensions: Vec::new(),
         }
     }
