@@ -898,7 +898,8 @@ impl cog_core::SystemPlugin for StoragePlugin {
             }
 
             let mut cap = crate::SampleLogCap::new(pool, sample_max_rows)
-                .with_retirement(std::sync::Arc::new(retirement));
+                .with_retirement(std::sync::Arc::new(retirement))
+                .with_deployment(deployment_name());
             if let Some(mb) = metrics {
                 cap = cap.with_metrics(mb);
             }
@@ -922,6 +923,21 @@ impl cog_core::SystemPlugin for StoragePlugin {
         info!("StoragePlugin shutdown");
         Ok(())
     }
+}
+
+/// The deployment this process belongs to, as the platform names it.
+///
+/// Read from the environment rather than from configuration because it is not
+/// configuration: it is the name the deployment already carries, and the two
+/// readings that need it are about *which* deployment is speaking. A value the
+/// process is told by its own manifest is also the only one that cannot grow
+/// per restart — a pod name would be an identity that changes on every rollout,
+/// and the sample log keeps each series' newest row forever.
+///
+/// Absent on a process whose platform never sets one; the readings then go out
+/// unlabelled, which is the same shape as before this existed.
+fn deployment_name() -> String {
+    std::env::var("COGNEVA_DEPLOYMENT_NAME").unwrap_or_default()
 }
 
 /// Build the object backend named by `providers.storage.provider`.

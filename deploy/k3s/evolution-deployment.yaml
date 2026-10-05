@@ -143,6 +143,14 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            # 本部署的名字，与主应用 Pod 同源同形。样本日志的容量声明落在共用表
+            # 里、series 键就是标签集：不署名时「本部署不清理」在读数面上与「隔壁
+            # 那家的 200000」同形。取部署名而不是 Pod 名——地板是按 series 计的，
+            # 随滚动变化的名字会每次滚动多一行永不回收的地板。
+            - name: COGNEVA_DEPLOYMENT_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['app.kubernetes.io/name']
             # 告警邮件出口的 SMTP 口令：凭证不进清单也不进 values，只认这个
             # Secret 键，缺省即不做鉴权。主应用 Pod 也跑同一条告警桥，两处同源。
             - name: COGNEVA_ALERTMANAGER_EMAIL_SMTP_PASSWORD

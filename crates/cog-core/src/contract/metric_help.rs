@@ -383,12 +383,19 @@ const GAUGE_HELP: &[(&str, &str)] = &[
     (
         "metrics_samples_budget_rows",
         "Rows the metrics sample log is allowed to hold; the sweep deletes \
-         oldest-first past this, stopping at each gauge series' newest row",
+         oldest-first past this, stopping at each gauge series' newest row. \
+         Every reading here names the deployment that published it, because \
+         this is one deployment's own declaration and the log they land in is \
+         shared, so without the name a deployment that declares no cap at all \
+         is served the one the deployment beside it declared",
     ),
     (
         "metrics_samples_over_capacity",
         "1 when the sample log is over its row budget and cannot be pruned \
-         further without deleting a gauge series' current value, 0 otherwise",
+         further without deleting a gauge series' current value, 0 otherwise. \
+         Carries the same deployment label as the budget it is read beside, \
+         and is absent rather than 0 for a deployment that ran no pass to \
+         report on",
     ),
     (
         "metrics_samples_bytes",

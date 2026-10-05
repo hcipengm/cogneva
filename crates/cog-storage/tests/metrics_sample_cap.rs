@@ -26,9 +26,9 @@ use cog_core::loop_health::{
     Cadence, LoopHealth, LOOP_LABEL, LOOP_OWNER_ACQUISITIONS_TOTAL, LOOP_OWNER_HELD,
     LOOP_REGISTERED,
 };
-use cog_core::{Observable, OwnerLeaseBroker, ShutdownSignal};
-use cog_storage::metrics_sample_cap::{LOOP, LOOP_PERIOD, ROLE};
-use cog_storage::{PgOwnerLeaseBroker, SampleLogCap, LEASE_TABLE};
+use cog_core::{MetricsBackend, Observable, OwnerLeaseBroker, ShutdownSignal};
+use cog_storage::metrics_sample_cap::{DEPLOYMENT_LABEL, LOOP, LOOP_PERIOD, ROLE};
+use cog_storage::{MemoryMetricsBackend, PgOwnerLeaseBroker, SampleLogCap, LEASE_TABLE};
 
 fn database_url() -> String {
     std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
@@ -526,5 +526,93 @@ async fn the_role_is_taken_only_by_the_deployments_that_prune() {
     running.await.unwrap();
 
     clear_role(&pool).await;
+    drop_probe(&pool, table).await;
+}
+
+/// What the loop publishes says which deployment published it.
+///
+/// The sample log is shared and a series is its label set, so two deployments
+/// that read the log differently write one series and the store answers with
+/// whoever wrote last. The deployment label is what makes "this deployment
+/// declared nothing" a readable statement rather than the deployment next door's
+/// budget — and it has to be the deployment, not the pod, because every series'
+/// newest row is kept forever and a name that changes per rollout leaves a
+/// permanent row behind each time.
+#[tokio::test]
+#[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+async fn the_readings_name_the_deployment_that_published_them() {
+    let table = "metrics_sample_cap_probe_deployment";
+    let pool = PgPool::connect(&database_url()).await.unwrap();
+    fresh_probe(&pool, table).await;
+    insert_aged(&pool, table, 5, "2 days").await;
+
+    let metrics = Arc::new(MemoryMetricsBackend::new());
+    let named = Arc::new(
+        cap(pool.clone(), table, 1000)
+            .with_metrics(Arc::clone(&metrics) as Arc<dyn MetricsBackend>)
+            .with_deployment("probe-deployment"),
+    );
+    let shutdown = ShutdownSignal::default();
+    let handle = named.spawn(shutdown.clone());
+
+    let mut labels = None;
+    for _ in 0..200 {
+        let series = metrics
+            .query_gauge_latest(&cog_core::metric_names::METRICS_SAMPLES_ROWS)
+            .await
+            .unwrap();
+        if let Some(sample) = series.into_iter().next() {
+            labels = Some(sample.labels);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    shutdown.trigger();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+
+    let labels = labels.expect("the loop must publish what the log holds");
+    assert_eq!(
+        labels.get(DEPLOYMENT_LABEL).map(String::as_str),
+        Some("probe-deployment"),
+        "a reading that is one deployment's own claim must name it: {labels:?}"
+    );
+    assert_eq!(
+        labels.len(),
+        1,
+        "the deployment must be the only label these readings carry: {labels:?}"
+    );
+
+    // A process whose platform never named it publishes the same readings
+    // unlabelled rather than under an empty name, which would be a series of
+    // its own that says nothing and splits every reader's set in two.
+    let metrics = Arc::new(MemoryMetricsBackend::new());
+    let unnamed = Arc::new(
+        cap(pool.clone(), table, 1000)
+            .with_metrics(Arc::clone(&metrics) as Arc<dyn MetricsBackend>)
+            .with_deployment("   "),
+    );
+    let shutdown = ShutdownSignal::default();
+    let handle = unnamed.spawn(shutdown.clone());
+    let mut labels = None;
+    for _ in 0..200 {
+        let series = metrics
+            .query_gauge_latest(&cog_core::metric_names::METRICS_SAMPLES_ROWS)
+            .await
+            .unwrap();
+        if let Some(sample) = series.into_iter().next() {
+            labels = Some(sample.labels);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    shutdown.trigger();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+
+    assert_eq!(
+        labels.expect("the loop must publish what the log holds"),
+        std::collections::HashMap::new(),
+        "a blank deployment name is no name, not an empty one"
+    );
+
     drop_probe(&pool, table).await;
 }

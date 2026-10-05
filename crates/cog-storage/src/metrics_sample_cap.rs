@@ -46,6 +46,7 @@
 //! sweep must not do is inherit the retirement's reach or the retirement the
 //! sweep's capacity gate.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -62,6 +63,24 @@ pub const ROLE: &str = "metrics_sample_cap";
 
 /// The loop, as the liveness readings name it.
 pub const LOOP: &str = "storage_metrics_sample_cap";
+
+/// The label that names the deployment a reading below came from.
+///
+/// The sample log is shared and a series is its label set, so a reading
+/// published with an empty one belongs to every process at once: whichever
+/// deployment wrote last is what every scrape serves, and a deployment that
+/// deliberately publishes nothing still serves whoever did. That is the wrong
+/// shape for a reading that is a deployment's own claim — how large it allows
+/// this log to grow, and whether the pass *it* ran could free anything — and it
+/// is invisible for a reading about the log itself, which every writer would
+/// answer the same way.
+///
+/// The value has to be bounded: a deployment name, not a pod name. Every
+/// series' newest row is kept forever, so an identity that changes per rollout
+/// buys a permanent floor row per rollout — around seventy a day at this
+/// repository's landing rate, which is the unbounded floor the log's own design
+/// refuses to grow.
+pub const DEPLOYMENT_LABEL: &str = "deployment";
 
 /// The cadence this loop declares for itself: the longest it will wait between
 /// two passes.
@@ -110,6 +129,10 @@ pub struct SampleLogCap {
     retirement: Option<Arc<crate::metrics_retirement::RetirementPass>>,
     /// The arbiter over which replica prunes, when the deployment has one.
     role: Option<Arc<dyn cog_core::OwnerLeaseBroker>>,
+    /// The deployment this process is, for the readings below. `None` publishes
+    /// them unlabelled, which is what a process whose platform never told it
+    /// which deployment it belongs to can honestly do.
+    deployment: Option<String>,
 }
 
 /// What the previous pass saw and when it ran. The next period is derived from
@@ -134,7 +157,26 @@ impl SampleLogCap {
             metrics: None,
             retirement: None,
             role: None,
+            deployment: None,
         }
+    }
+
+    /// Name this deployment on the readings this loop publishes.
+    ///
+    /// Every one of them is a claim made by one deployment — the capacity it
+    /// allows this log, and whether the pass it ran could free anything — and
+    /// they land in a log every deployment shares. Without a name they are
+    /// served by whichever process a reader scrapes as though the value had
+    /// come from there, which is how a deployment that publishes no budget at
+    /// all comes to answer with the one the deployment beside it declared.
+    ///
+    /// A blank name is treated as none: an empty label value is a series of its
+    /// own that says nothing, and it would split every reader's series set
+    /// without answering the question the label was added for.
+    pub fn with_deployment(mut self, deployment: impl Into<String>) -> Self {
+        let deployment = deployment.into();
+        self.deployment = (!deployment.trim().is_empty()).then_some(deployment);
+        self
     }
 
     /// Lease the pruning half of this loop, so that replicas sharing one
@@ -420,7 +462,9 @@ impl SampleLogCap {
             // is the same claim: a pass with no budget did not sweep, has no
             // floor to report, and a zero written from here would say "nothing
             // is being held down" on behalf of a process that never looked.
-            // Two such writers already make the value whoever wrote last.
+            // The deployment label is what keeps that silence legible: without
+            // it a deployment that published nothing would still be served the
+            // budget the deployment beside it declared.
             self.emit(
                 mb,
                 cog_core::metric_names::METRICS_SAMPLES_OVER_CAPACITY,
@@ -442,11 +486,22 @@ impl SampleLogCap {
         }
     }
 
+    /// The labels every reading this loop publishes carries.
+    ///
+    /// One place, because the readings are read beside each other and a reader
+    /// that has to tell "this deployment declared nothing" from "another
+    /// deployment declared something" needs them to agree on who is speaking.
+    fn labels(&self) -> HashMap<String, String> {
+        match self.deployment {
+            Some(ref deployment) => {
+                HashMap::from([(DEPLOYMENT_LABEL.to_string(), deployment.clone())])
+            }
+            None => HashMap::new(),
+        }
+    }
+
     async fn emit(&self, mb: &Arc<dyn MetricsBackend>, name: cog_core::MetricName, value: f64) {
-        if let Err(e) = mb
-            .record_gauge(name, value, std::collections::HashMap::new())
-            .await
-        {
+        if let Err(e) = mb.record_gauge(name, value, self.labels()).await {
             warn!(error = %e, metric = %name, "metrics sample log gauge emit failed");
         }
     }

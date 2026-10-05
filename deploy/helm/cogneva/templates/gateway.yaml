@@ -70,6 +70,14 @@ spec:
                   key: redis-password
             - name: COGNEVA_DATABASE_URL
               value: "postgres://cog_user:$(PG_PASSWORD)@postgres.{{ include "cogneva.namespace" . }}.svc.cluster.local:5432/cogneva"
+            # 本部署的名字：样本日志的容量与容量判定是**每个部署自己的声明**，
+            # 而它们落在共用表里。不署名时读到的是「最后写的那家」——置 0（不清理）
+            # 的部署照样报出旁边那家声明的数。取部署名而不是 Pod 名：gauge 每个
+            # series 的最新一行永不回收，随滚动变化的名字等于每次滚动多一行永久地板。
+            - name: COGNEVA_DEPLOYMENT_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['app.kubernetes.io/name']
             # 告警邮件出口的 SMTP 口令：凭证不进清单也不进 values，只认这个
             # Secret 键，缺省即不做鉴权。键由集群侧写入（与可观测栈安装脚本写
             # clickhouse-password 同形）。
