@@ -1,4 +1,5 @@
 //! Reflection plugin — implements [`cog_core::SystemPlugin`].
+//! A host that gave no build slot is consumed as `ExecutedChange::NoBuildSlot`, not charged to the change's failure account.
 
 use std::sync::Arc;
 use tracing::{error, info, warn};

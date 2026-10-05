@@ -1,5 +1,6 @@
 //! Change application pipeline for L2 self-evolution.
 //!
+//! A refused build slot stays an error: the tests never ran, the change was never judged, and the caller retries it.
 //! Responsibilities:
 //! - Scan `change_dir` for `.diff` files (unified diff format).
 //! - Validate every affected path: must exist, must live inside the workspace,
