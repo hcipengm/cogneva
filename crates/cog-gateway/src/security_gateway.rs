@@ -709,6 +709,26 @@ struct LlmHealthTable {
     /// verdict already answers for that case; adding failures here would only
     /// grow the set and force this lock to be taken on the request path.
     observed: Mutex<std::collections::HashSet<String>>,
+    /// 对上一条真实请求回了**形态类**拒绝（400/404/422）的上游，等一次探测来定性。
+    ///
+    /// 为什么不能就地判：同一个状态码有两种相反的成因，而响应本身分不出来。一种是
+    /// 调用侧的形态问题（坏消息链、不支持的参数），换到任何兼容上游都会被拒；另一种
+    /// 是上游自己坏了——订阅失效、模型未授权——它对**每一条**请求都这么答。就地判成
+    /// 失败会让一条坏请求依次毒化全池（曾经发生：孤儿 tool_calls 链把两家先后打进
+    /// 嫌疑窗、池全灭 503）；就地判成无害则让一个再也服务不了的上游**永久替池声称
+    /// 可用**，池级熔断因此永不成立，每条请求都先撞它一次。
+    ///
+    /// 分开这两种成因要的不是状态码也不是响应体里的错误码枚举（厂商各写各的，按码表
+    /// 判必然漏），而是**换一条请求再问一次**。池里已经有那件仪器：最小 ping 它对谁都
+    /// 该被受理，能力差异（多模态、tools）在这条请求上不出现。所以这里只把名字挂起来，
+    /// 由探测器发问、由它的成败给出真正的判词——成功即除名（那条请求的错），失败即落进
+    /// 嫌疑窗（这条上游的错）。挂名本身**不进** `states`，所以池的判定面在这一步上不动：
+    /// 一条坏请求在探测出结论之前，池既不会被锁死，也不会被治好的上游撑着说可用。
+    ///
+    /// 只在两种"已定性"的事件上除名：探测或请求本身记了一次失败（`note_failure`），
+    /// 或一次真实成功（`note_success`）。留着它会让 `due_for_probe` 对这个上游恒真，
+    /// 退避窗就形同虚设——探测变成每拍一次，而每次探测都花真实配额。
+    shape_errored: Mutex<std::collections::HashSet<String>>,
     /// 本进程最近一次看到上游真的应答（成功）的绝对时刻，unix 秒；0 = 还没看到过。
     ///
     /// 与 `observed` 记的是同一件事的两个面：那个集合答"有没有哪家被实证过"
@@ -766,6 +786,9 @@ impl LlmHealthTable {
         quota_reset_unix: Option<i64>,
         quota_window_secs: Option<u64>,
     ) -> Option<(u32, u64)> {
+        // 一次**已定性**的失败把"等探测定性"的那个问号消掉：答案已经有了，
+        // 再挂着会让 `due_for_probe` 对这个上游恒真、退避窗失效。
+        self.shape_errored.lock().unwrap().remove(&Self::key(u));
         let now = std::time::Instant::now();
         let mut states = self.states.lock().unwrap();
         let entry = states.entry(Self::key(u)).or_insert(UpstreamHealth {
@@ -799,6 +822,9 @@ impl LlmHealthTable {
 
     /// 记录一次成功：嫌疑态清除。返回此前是否处于嫌疑（调用方打恢复日志）。
     fn note_success(&self, u: &LlmUpstream) -> bool {
+        // 成功同样是一次定性：这条上游刚刚受理了一条真实请求，"等探测定性"
+        // 的问号随之消掉。
+        self.shape_errored.lock().unwrap().remove(&Self::key(u));
         // Recorded before the entry is dropped: this success is evidence, and
         // the reading has to remember it once the verdict table has no further
         // use for the entry.
@@ -811,6 +837,15 @@ impl LlmHealthTable {
             Some(h) => h.suspect_until.is_some(),
             None => false,
         }
+    }
+
+    /// 记一次**形态类**拒绝（400/404/422）并把这条上游挂进待探名单。
+    ///
+    /// 不写 `states`：这条拒绝到底是什么成因还没定性，而 `states` 里的每一条都是
+    /// "未平账的失败"，池的锁与降级都按它走。写进去就等于让一条坏请求拥有锁死全池的
+    /// 权力，那正是这条 400 特例当初要避免的。挂名只给探测器看，见 `shape_errored`。
+    fn note_shape_error(&self, u: &LlmUpstream) {
+        self.shape_errored.lock().unwrap().insert(Self::key(u));
     }
 
     /// 本进程最近一次上游成功的绝对时刻（unix 秒），0 = 还没有过。
@@ -882,6 +917,14 @@ impl LlmHealthTable {
     /// 证据——若按"窗口未到期"报健康，同一个上游会在窗口到时的那一刻报 1，而池
     /// 因为锁存仍报 0，读图的人从两个面上得到相反的结论。
     fn snapshot(&self, upstreams: &[LlmUpstream]) -> Vec<UpstreamReading> {
+        // 取锁顺序与写入侧一致（`shape_errored` → `observed` → `states`），
+        // 免得两条路径反向持有。
+        let mut shape_errored = self.shape_errored.lock().unwrap();
+        // 与 `observed` 同一条理由：配置换掉的上游不该留着一条谁也读不到的记录。
+        // 这里多一层——留着它，这条上游以后**被重新配回池里**时会带着一个早先
+        // 那代的问号，凭空多领一次探测。
+        shape_errored.retain(|key| upstreams.iter().any(|u| Self::key(u) == *key));
+        drop(shape_errored);
         let mut observed = self.observed.lock().unwrap();
         // 配置换掉的上游在这里掉出去。留着它，一条可能很久以前、跨过一次配置
         // 变更的成功会继续替它声称健康；回到"没有读数"是更保守的那个答案。
@@ -990,13 +1033,23 @@ impl LlmHealthTable {
 
     /// 嫌疑上游的复测窗口是否到期：只有这些需要主动探测，
     /// 健康上游不探（每次探测都烧真实配额，由真实请求实证即可）。
+    ///
+    /// 另有一条**没有嫌疑窗**的待探：某条上游对上一条真实请求回了形态类拒绝，
+    /// 到底是请求的错还是它的错，一次响应答不了（见 `shape_errored`）。这条问号
+    /// 必须由探测器去消，而它不是"窗口到期"——所以在这里并进同一个判据，让
+    /// "这一拍该探谁"仍然只有一处答案。
     fn due_for_probe(&self, u: &LlmUpstream) -> bool {
+        let key = Self::key(u);
+        // 先取 `shape_errored` 再取 `states`，与 `note_failure` / `note_success`
+        // 的取锁顺序一致，避免两把锁反向持有。
+        let pending_shape = self.shape_errored.lock().unwrap().contains(&key);
         let now = std::time::Instant::now();
         let states = self.states.lock().unwrap();
-        states
-            .get(&Self::key(u))
-            .and_then(|h| h.suspect_until)
-            .is_some_and(|t| now >= t)
+        pending_shape
+            || states
+                .get(&key)
+                .and_then(|h| h.suspect_until)
+                .is_some_and(|t| now >= t)
     }
 
     /// 逐上游证据：判定所依赖的那几个输入，做成可以跟着判定一起跨进程的值。
@@ -3106,7 +3159,10 @@ async fn stream_forward(
             // 被拒，把它记进嫌疑窗会让一条坏请求依次毒化全池（2026-09-15
             // 实证：planner 孤儿 tool_calls 链把 kimi 与 ark 先后打进嫌疑窗，
             // 池全灭 503）。仍故障转移（上游间能力确有差异，如多模态支持），
-            // 但只记独立计数指标，不动健康表。
+            // 但**不在这里**判它成什么——写进健康表等于给坏请求锁死全池的权力，
+            // 写进"没事"则让一个再也服务不了的上游永久替池声称可用（订阅失效
+            // 这类上游对**每一条**请求都回 400，而它就是被当成调用侧的错）。
+            // 两种成因靠一次响应分不出来，交给探测器换一条请求问：见 `shape_errored`。
             let request_shape_error = matches!(status.as_u16(), 400 | 404 | 422);
             tracing::warn!(
                 upstream = %base,
@@ -3131,6 +3187,7 @@ async fn stream_forward(
                     &[("upstream", &LlmHealthTable::key(upstream))],
                 )
                 .await;
+                state.llm_health.note_shape_error(upstream);
             } else {
                 mark_upstream_failure(&state, upstream, base, quota_reset, quota_window).await;
             }
@@ -3294,6 +3351,11 @@ fn spawn_llm_health_prober(state: AppState) -> tokio::task::JoinHandle<()> {
 ///   这个条件立刻不再成立，探测回到只探窗口到期的那些，而一次探针只是一次
 ///   `max_tokens=1` 的 ping。
 /// - 嫌疑窗已到期：常规复测。
+/// - 有一条**形态类拒绝还没定性**（`shape_errored`）：它没有嫌疑窗可等，所以
+///   不在上面那一条里。真实请求拿到的那个状态码分不出"请求的错"与"这台上游
+///   的错"，而这两者的后果差得远——前者按 2026-09-15 的先例不能动健康表，
+///   后者不动就会让一条永远服务不了的上游一直替池声称可用。探测正是分它们的
+///   仪器：它的请求最小、对谁都该被受理。
 ///
 /// 抽成函数是为了让"为什么这一拍该探"能被单独断言，而不是只能从"发了几次
 /// 请求"里间接推出来。
@@ -7274,6 +7336,106 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             upstreams_due_for_probe(&state).is_empty(),
             "任一台上游被实证可用之后，这一路不该再产生探针"
         );
+    }
+
+    /// 一条请求回了形态类拒绝，不等于这台上游坏了；但也不等于它没坏。改前的
+    /// 两个答案都错在"就地判"：判成失败就让坏请求有权锁死全池，判成没事就让
+    /// 一个对**每一条**请求都回 400 的上游（订阅失效、模型未授权）永远替池
+    /// 声称可用，池级熔断因此永不成立。这一轮把定性交给探针。
+    #[tokio::test]
+    async fn a_shape_error_hands_the_question_to_the_prober() {
+        let bad = spawn_stub_upstream(
+            400,
+            r#"{"error":{"code":"InvalidSubscription","message":"no valid subscription"}}"#,
+        )
+        .await;
+        let state = test_state(vec![stub_upstream(&bad, "m1")]);
+        let u = state.config.llm_upstreams[0].clone();
+
+        // 前提：真实请求拿到 400。它按老规矩不进健康表，所以这一刻池还当它可用
+        // ——这一步本身是对的，坏请求不许锁死全池。
+        state.llm_health.note_shape_error(&u);
+        assert!(
+            !state.llm_health.is_suspect(&u),
+            "形态类拒绝自己不许进嫌疑窗"
+        );
+        assert!(!state.llm_health.all_suspect(&state.config.llm_upstreams));
+
+        // 但它必须被挂进待探名单。改前这一格是假：没有嫌疑窗 ⇒ `due_for_probe`
+        // 恒假，于是没有任何一拍会去问这条上游到底还行不行。
+        assert!(
+            state.llm_health.due_for_probe(&u),
+            "没定性的形态类拒绝必须换来一次探测"
+        );
+
+        probe_suspect_upstreams(&state).await;
+
+        // 探针（最小 ping，对谁都该被受理）同样被拒 ⇒ 是这台的事，不是那条请求的事。
+        // 这一刻起池不再声称它可用。
+        assert!(
+            state.llm_health.is_suspect(&u),
+            "连最小请求都拒了，就是这条上游自己的问题"
+        );
+    }
+
+    /// 反例，也是 2026-09-15 那条先例的守卫：一条坏请求（孤儿 tool_calls 链、
+    /// 不支持的参数）换到别的上游也会被拒，但那**不是**这台上游的错。探针一发
+    /// 就问出来了，池一根汗毛都不该动。
+    #[tokio::test]
+    async fn a_shape_error_on_a_serviceable_upstream_does_not_latch_the_pool() {
+        let ok = spawn_stub_upstream(
+            200,
+            r#"{"choices":[{"message":{"role":"assistant","content":"pong"}}]}"#,
+        )
+        .await;
+        let state = test_state(vec![stub_upstream(&ok, "m1")]);
+        let u = state.config.llm_upstreams[0].clone();
+
+        state.llm_health.note_shape_error(&u);
+        assert!(state.llm_health.due_for_probe(&u));
+
+        probe_suspect_upstreams(&state).await;
+
+        assert!(!state.llm_health.is_suspect(&u), "探到成功就不该有嫌疑");
+        assert!(
+            !state.llm_health.all_suspect(&state.config.llm_upstreams),
+            "一条坏请求不许把池锁死"
+        );
+        // 问号必须被这次定性消费掉：留着它 `due_for_probe` 对这个上游恒真，
+        // 退避窗形同虚设，探测变成每拍一次、每次花真实配额。
+        assert!(
+            !state.llm_health.due_for_probe(&u),
+            "已经定性的问号要消掉，别每拍重探"
+        );
+    }
+
+    /// 失败这条定性路径同样要消费问号——探测给出"这台确实坏了"的判词之后，
+    /// 节拍就归退避窗管，不该继续被那个问号按着每拍复测。
+    #[test]
+    fn a_failure_verdict_consumes_the_pending_shape_question() {
+        let table = LlmHealthTable::default();
+        let u = stub_upstream("http://127.0.0.1:1", "m1");
+        let key = LlmHealthTable::key(&u);
+
+        table.note_shape_error(&u);
+        assert!(table.due_for_probe(&u));
+
+        table.note_failure(&u, 300, None, None);
+        assert!(
+            !table.shape_errored.lock().unwrap().contains(&key),
+            "判词一到手，那个问号就该消掉"
+        );
+
+        // 让退避窗立刻到期：此刻 `due_for_probe` 为真必须是**窗口到期**这一条
+        // 给的，不是残留的问号给的。
+        {
+            let mut states = table.states.lock().unwrap();
+            let entry = states.get_mut(&key).expect("failure entry exists");
+            entry.suspect_until =
+                Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        }
+        assert!(table.due_for_probe(&u));
+        assert!(!table.is_suspect(&u));
     }
 
     #[tokio::test]
