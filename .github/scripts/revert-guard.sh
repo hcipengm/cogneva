@@ -99,6 +99,15 @@ main() {
   email="$(git log -1 --format=%ae "${sha}")"
   cts="$(git log -1 --format=%ct "${sha}")"
 
+  # The verdict is read before this tip is judged, not after: every branch
+  # below refuses tips that are not an aged landing, which is nearly all of
+  # them, so reading it further down would leave this one request unexercised
+  # until the first time the guard is actually needed — and a fallback that
+  # discovers it cannot read at that moment has already failed. Read here, a
+  # read that stops working turns the run red on the next tick instead.
+  local verdict
+  verdict="$(gh api "${repo_url}/commits/${sha}/check-runs?per_page=100" | fold_signals)"
+
   case "${subject}" in
     "${REVERT_PREFIX}"*)
       log "tip ${sha} is itself a revert (\"${subject}\"); nothing to undo"
@@ -123,12 +132,10 @@ main() {
   now="$(date -u +%s)"
   age=$(( now - cts ))
   if [ "${age}" -lt "${grace}" ]; then
-    log "tip ${sha} landed ${age}s ago, inside the ${grace}s grace; the in-cluster watcher still owns it"
+    log "tip ${sha} landed ${age}s ago, inside the ${grace}s grace (verdict=${verdict}); the in-cluster watcher still owns it"
     return 0
   fi
 
-  local verdict
-  verdict="$(gh api "${repo_url}/commits/${sha}/check-runs?per_page=100" | fold_signals)"
   if [ "${verdict}" != "red" ]; then
     log "tip ${sha} verdict=${verdict} ($(verdict_note "${verdict}")); nothing to undo"
     return 0
