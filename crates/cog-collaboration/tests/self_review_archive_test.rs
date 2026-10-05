@@ -9,7 +9,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use cog_collaboration::actors::{GeneratorActor, ModeSelectorActor, PlannerActor};
+use cog_collaboration::actors::{GeneratorActor, ModeSelectorActor, ModeratorActor, PlannerActor};
 use cog_collaboration::{CollaborationExecutor, PgeMode, RouteStage};
 use cog_core::{
     Agent, AgentManager, AgentState, FailurePattern, ImplementationExample, InboxMessage,
@@ -474,6 +474,59 @@ async fn the_mode_selector_does_not_buy_a_review_it_cannot_consume() {
         *review_calls.lock().unwrap(),
         0,
         "the reply is read once and never reviewed"
+    );
+}
+
+/// A self-evolution round's moderator output is a JSON value the roundtable
+/// parses before any review would run, so a revision can only rewrite prose the
+/// parser already accepted — the same reason the plan and the change artifact
+/// are not reviewed on this path. The moderator was the last stage on it still
+/// paying for the review, and it is the slowest cell in the ledger.
+///
+/// The control is in the same test on purpose: the skip is a property of the
+/// task, not of the moderator, so an ordinary task must still buy the review.
+#[tokio::test]
+async fn a_self_evolution_moderator_output_is_not_self_reviewed() {
+    let reply = serde_json::json!({"decision": "continue", "reasoning": "another round"});
+
+    let self_evo_agent = MockAgent::new(reply.clone());
+    let self_evo_calls = self_evo_agent.review_calls.clone();
+    let moderator =
+        ModeratorActor::new(Arc::new(self_evo_agent)).with_self_review(self_review_config());
+    let self_evo_task = Task::new(
+        format!("test-{}", uuid::Uuid::new_v4()),
+        cog_core::TaskType::Custom("self_evolution".into()),
+        serde_json::json!({"goal": "rework the parser"}),
+    );
+    moderator
+        .moderate(&self_evo_task, &[], &serde_json::json!({}), 0.8)
+        .await;
+
+    assert_eq!(
+        *self_evo_calls.lock().unwrap(),
+        0,
+        "a parsed decision is not reviewed: the review rewrites prose only, and \
+         the roundtable has already taken the decision out of this output"
+    );
+
+    let plain_agent = MockAgent::new(reply);
+    let plain_calls = plain_agent.review_calls.clone();
+    let moderator =
+        ModeratorActor::new(Arc::new(plain_agent)).with_self_review(self_review_config());
+    moderator
+        .moderate(
+            &test_task("tidy the widget"),
+            &[],
+            &serde_json::json!({}),
+            0.8,
+        )
+        .await;
+
+    assert_eq!(
+        *plain_calls.lock().unwrap(),
+        1,
+        "the skip is about the task being a self-evolution one, not about the \
+         moderator: an ordinary round still reviews the decision"
     );
 }
 

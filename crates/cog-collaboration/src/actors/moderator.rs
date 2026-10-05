@@ -178,7 +178,17 @@ impl ModeratorActor {
                 }
                 (
                     parse_moderator_output(&result),
-                    crate::actors::ReviewBasis::HeldTo(crate::actors::review_spec(task, &[])),
+                    // 自进化任务上不审，与 plan 和生成侧同一条理由：这份输出在到这里
+                    // 之前已经被解析成结构体，改写只能重写解析器已经接受过的散文，
+                    // 而推理型模型会退回自然语言、把改写步挂满整个超时。跳过用同一个
+                    // 具名理由，省下的调用因此是读数而不是缺席。
+                    if task.is_self_evolution() {
+                        crate::actors::ReviewBasis::Skipped(
+                            crate::observable::SELF_REVIEW_SKIP_SELF_EVOLUTION,
+                        )
+                    } else {
+                        crate::actors::ReviewBasis::HeldTo(crate::actors::review_spec(task, &[]))
+                    },
                 )
             }
             Err(e) => {
