@@ -1031,6 +1031,10 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     };
                     let cycle_instance = instance_id.clone();
                     let cycle_version = version.clone();
+                    // Carried into the cycle below so a service that was not
+                    // published yet when this init read it can still be picked
+                    // up.  Cloning shares the registry, not a snapshot of it.
+                    let cycle_ctx = ctx.clone();
 
                     // No stop signal reaches this loop and it has no exit of its
                     // own, so any end means pending changes stop being verified.
@@ -1042,7 +1046,8 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                         move |beat| {
                             let pipeline = pipeline.clone();
                             let deployer = deployer.clone();
-                            let binary_switcher = binary_switcher.clone();
+                            let mut binary_switcher = binary_switcher.clone();
+                            let cycle_ctx = cycle_ctx.clone();
                             let engine = engine.clone();
                             let self_evolution = self_evolution.clone();
                             let evolution_metrics = evolution_metrics.clone();
@@ -1061,6 +1066,26 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                                 loop {
                                     beat.beat();
                                     interval.tick().await;
+                                    // 这个句柄在 init 里读一次是不够的：发布它的 supervisor
+                                    // 与本插件同层并行 init，先跑完的那个读到的 None 是
+                                    // 「还没发布」，不是「本进程没有」。缺失时每轮重读一次，
+                                    // 读到即停——停是为了让接线台账数的是「边」而不是
+                                    // 「循环轮数」（PinAudit.reads 是计数）。不写
+                                    // `.or(init 那份)`：init 那份为 None 时本就该让位给现读的。
+                                    // 第一轮 tick 是立即返回的，所以这一次重读可能仍落在 init
+                                    // 窗口里、被记成同一 pin 的第二条 init 期 demand——启动报告
+                                    // 里那句话会多打一遍，是报告噪声，不是判据变化。
+                                    if binary_switcher.is_none() {
+                                        binary_switcher = cycle_ctx
+                                            .consume_service::<dyn cog_core::BinarySwitcher>();
+                                        if binary_switcher.is_some() {
+                                            info!(
+                                                "BinarySwitcher resolved after init; \
+                                                 auto-deploy and the promotion hand-off \
+                                                 no longer wait on the init-time read"
+                                            );
+                                        }
+                                    }
                                     // 取走 soak 已满的晋级交接。判定必须在这里做，而不是
                                     // 由部署那一轮自己回调：self_exec 的切换是 execve，
                                     // 成功即不返回，回调永远不会执行（见 pending_promotions）。

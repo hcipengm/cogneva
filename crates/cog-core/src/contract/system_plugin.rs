@@ -1450,6 +1450,40 @@ mod pin_tests {
     }
 
     #[test]
+    fn a_view_kept_from_init_finds_a_publisher_that_arrived_later() {
+        // Same-layer plugins init in parallel, so a read during init can find
+        // nothing while its publisher shows up a moment later.  The view kept
+        // from init shares the registry rather than a snapshot of it, which is
+        // what lets a reader resolve that without holding the publishing plugin
+        // open — and the re-read lands after init, so a reader that retries is
+        // still reported once, for the read that actually raced, rather than once
+        // per attempt.
+        let ctx = ctx();
+        let kept = ctx.as_owner("reader");
+        ctx.set_during_init(true);
+        assert!(kept.consume_service::<dyn Alpha>().is_none());
+        ctx.as_owner("publisher")
+            .publish_service::<dyn Alpha>(Arc::new(AlphaImpl));
+        ctx.set_during_init(false);
+        assert!(kept.consume_service::<dyn Alpha>().is_some());
+
+        let wiring = ctx.pin_wiring();
+        let reads = &wiring
+            .iter()
+            .find(|w| w.pin == Pin::of_service::<dyn Alpha>())
+            .expect("the pin was read")
+            .consumers;
+        assert_eq!(reads.len(), 2, "{wiring:?}");
+        assert!(reads[0].during_init, "the first read is the one that raced");
+        assert!(!reads[1].during_init, "the retry is not an init read");
+
+        let descriptors = [descriptor("publisher", &[]), descriptor("reader", &[])];
+        let audit = PinAudit::evaluate(&wiring, &descriptors);
+        assert_eq!(audit.unordered_init_reads.len(), 1, "{audit:?}");
+        assert_eq!(audit.unordered_init_reads[0].reader, "reader");
+    }
+
+    #[test]
     fn the_runner_audits_the_wiring_the_plugins_actually_produced() {
         let descriptors = [
             descriptor("publisher", &[]),
