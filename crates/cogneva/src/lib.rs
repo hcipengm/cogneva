@@ -20,6 +20,9 @@ pub mod startup_guard;
 pub mod validate_config;
 pub mod volume_walker;
 
+#[cfg(test)]
+mod upstream_request_shape_rejection_contract;
+
 #[cfg(windows)]
 pub mod windows_service;
 
