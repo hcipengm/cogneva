@@ -25,16 +25,16 @@
 //! worth stating, because the outcome counts show it: `busy` here means this
 //! executor was running a command, not that the host was busy.
 //!
-//! **The cap is measured and not bounded until the deployment sets one.** The
-//! default here is 0, which publishes the size and removes nothing. What the
-//! number should be follows from the volume behind the directory, and that
-//! volume is shared with the worktrees, so a default that started deleting
-//! would be answering "how much of this volume may the cache hold" on the
-//! deployment's behalf -- and answering it wrong costs a cold rebuild of
-//! everything. This deployment does set one, so the value a process is running
-//! with is a deployment fact and not something this file states: it arrives
-//! through the environment, and the reasoning for the number stays where the
-//! number is configured.
+//! **The default holds the cache to a cap rather than only measuring it.** The
+//! executor's volume is the deployment's own 5 GiB budget, shared with the
+//! task worktrees, so a safe bound is derivable here instead of remade per
+//! deployment: 5 GiB less the co-tenants leaves 3 GiB for the cache
+//! ([`DEFAULT_MAX_BYTES`]), which keeps the cache below the volume's claim and
+//! answers a full disk before it becomes a build that fails for a reason that
+//! says nothing about the cache. While under the cap the pass only publishes
+//! the size; an explicit `0` keeps the old measure-only behaviour; and the
+//! environment overrides this number, so the reasoning for a different value
+//! stays where that value is configured.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,6 +54,15 @@ pub const SANDBOX_BUILD_CACHE_LOOP: &str = "extension_build_cache_watch";
 /// nothing; the floor itself is applied where the interval is read.
 const DEFAULT_SCAN_INTERVAL_SECS: u64 = 300;
 
+/// Bytes the cache may hold when the deployment names none.
+///
+/// 3 GiB: this executor's own volume is a 5 GiB claim shared with the task
+/// worktrees, and 5 GiB less the measured co-tenants (CARGO_HOME, the bare
+/// repo, the per-task worktrees, the host-docs journal) leaves 3 GiB for the
+/// cache -- enough headroom that it cannot push the volume past its claim. A
+/// deployment that needs another value sets `SANDBOX_BUILD_CACHE_MAX_BYTES`.
+const DEFAULT_MAX_BYTES: u64 = 3_221_225_472;
+
 /// Bytes the cache may hold, and how often it is re-walked.
 #[derive(Debug, Clone)]
 pub struct BuildCacheConfig {
@@ -66,7 +75,7 @@ pub struct BuildCacheConfig {
 impl Default for BuildCacheConfig {
     fn default() -> Self {
         Self {
-            max_bytes: 0,
+            max_bytes: DEFAULT_MAX_BYTES,
             scan_interval: Duration::from_secs(DEFAULT_SCAN_INTERVAL_SECS),
         }
     }
@@ -79,7 +88,7 @@ impl BuildCacheConfig {
         let max_bytes = std::env::var("SANDBOX_BUILD_CACHE_MAX_BYTES")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(0);
+            .unwrap_or(DEFAULT_MAX_BYTES);
         let scan_interval = std::env::var("SANDBOX_BUILD_CACHE_SCAN_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
@@ -164,6 +173,22 @@ mod tests {
     use super::*;
     use cog_core::build_cache::OUTCOME_BUSY;
     use cog_core::fs_size;
+
+    #[test]
+    fn the_default_cap_is_enforced_without_deployment_config() {
+        let config = BuildCacheConfig::default();
+        assert_eq!(
+            config.readings("/nonexistent-cache").cap_bytes(),
+            Some(DEFAULT_MAX_BYTES),
+            "the default bounds the cache, not just measures it"
+        );
+    }
+
+    #[test]
+    fn a_missing_env_var_falls_back_to_the_default_cap() {
+        std::env::remove_var("SANDBOX_BUILD_CACHE_MAX_BYTES");
+        assert_eq!(BuildCacheConfig::from_env().max_bytes, DEFAULT_MAX_BYTES);
+    }
 
     #[test]
     fn a_cache_with_no_configured_cap_is_measured_and_left_alone() {
