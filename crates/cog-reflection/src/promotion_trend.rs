@@ -154,6 +154,11 @@ pub fn aggregate(
 /// 原因只能从**同一批周**里取。拿一个别的窗口的计数（比如自本进程启动以来的
 /// 信号计数）拼在这里是不行的：两个窗口不一样长，读起来就是一句没有依据的话，
 /// 而且进程一重启那个数就归零，而停摆压根没变。
+///
+/// 但「台账里一条都没有」**不是**「一条都没有生成出来」的读数：它还有一个
+/// 第三种来源——台账自己没被写（写者掉了/结构上不可达）。那时前面两件事在台账上
+/// 与本情形同形，而判词如果把「没生成」说成事实，读者会去查一个没坏的地方。
+/// 所以零记录这一支只报它量到的东西（台账空）和两种可能，不替读者选一种。
 fn stall_reason(tail: &[PromotionTrendWeek]) -> String {
     let pending: u64 = tail.iter().map(|w| w.pending).sum();
     let awaiting: u64 = tail.iter().map(|w| w.awaiting_review).sum();
@@ -161,7 +166,7 @@ fn stall_reason(tail: &[PromotionTrendWeek]) -> String {
     let rolled_back: u64 = tail.iter().map(|w| w.rolled_back).sum();
     let generated = pending + awaiting + failed + rolled_back;
     if generated == 0 {
-        "这几周一条变更都没有生成出来——停的是生成侧，不是落地通道".to_string()
+        "这几周台账里没有任何变更记录（待执行/审批中/失败/回滚全为 0）：要么没有变更被生成出来（去看生成侧），要么台账自己没被写（去看台账的写者）——这两种情形在这份读数上同形，判词判不出是哪一种".to_string()
     } else {
         format!(
             "这几周生成了 {generated} 条却一条都没落地（待执行 {pending}、审批中 {awaiting}、失败 {failed}、回滚 {rolled_back}）——停的是落地通道，不是生成侧"
@@ -507,12 +512,27 @@ mod tests {
     /// 停摆的判词要说清停的是哪一侧。同样是「连续几周零晋级」，「一条变更都没
     /// 生成出来」与「生成了却一条都没落地」要去看的地方相反，而判词的读者往往
     /// 只有那一行文字。
+    ///
+    /// 台账零记录这一支还多一层：它只证明台账是空的，不证明没生成过——台账自己
+    /// 没被写的时候，这两件事在台账上同形。所以那一支要点名两种可能，不能替
+    /// 读者挑一种，否则读者会去查一个没坏的地方。
     #[test]
     fn the_stall_verdict_says_which_side_stopped() {
         let quiet = aggregate(&[], Utc::now())
             .stall_alert
             .expect("一条记录都没有也是停摆");
-        assert!(quiet.contains("生成侧"), "没有生成就该指向生成侧：{quiet}");
+        assert!(
+            quiet.contains("生成侧"),
+            "空台账的第一种可能是没生成，判词要点到生成侧：{quiet}"
+        );
+        assert!(
+            quiet.contains("写者"),
+            "台账自己没被写是同形的第二种可能，不点名就只查一头：{quiet}"
+        );
+        assert!(
+            !quiet.contains("一条变更都没有生成出来"),
+            "台账空推不出「没生成」，判词不能把可能说成事实：{quiet}"
+        );
 
         // 同样的零晋级，但这几周里变更是存在的，只是每条都停在落地那一段。
         let records = vec![
