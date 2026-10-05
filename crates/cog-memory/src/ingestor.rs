@@ -15,6 +15,11 @@ pub const MEMORY_RECONCILE_LOOP: &str = "memory_ingest_reconcile";
 /// Loop name reported through the background-loop liveness family.
 pub const MEMORY_BUS_CLAIM_LOOP: &str = "memory_ingest_bus_claim";
 
+/// `memory_operations_total` 上「这次没抽，因为同一份 raw 已有人在办」的
+/// operation 取值。放在这里而不是指标名常量里：它不是一条新的操作，是抽取
+/// 这条路上的一次具名跳过。
+const SKIP_IN_FLIGHT_OPERATION: &str = "extract_skipped_in_flight";
+
 /// 归档 id 里来源 slug 的长度上限。与时间戳/随机段合计仍远低于文件系统
 /// NAME_MAX(255 字节)，同时保留足够前缀让人能从对象键认出来源。
 const RAW_ID_SLUG_MAX: usize = 64;
@@ -232,6 +237,50 @@ impl BusAck {
     }
 }
 
+/// 「这份 raw 正被抽」的在办集合。
+///
+/// 为什么需要：抽取本身就是它的落库判据——`ingest_missing` 按「schema/summary
+/// 有没有落库」判断欠不欠账，而一次抽取要跑一分钟上下。于是「别人正在抽」与
+/// 「没人抽」在这条判据上同形，同一份 raw 的第二条投递会再抽一遍。代价是真金
+/// 白银：第二遍的输入被上游前缀缓存接掉，但输出照付，生成本身也是重复劳动。
+/// 对账重扫与总线投递是两条独立路径，各带各的幂等，唯独没有一道门按「做」
+/// 这个动作自己来锁。
+///
+/// 挡住的那一条**丢弃**而不是等待：等会占死一个抽取并发位，而丢弃是安全的
+/// ——raw 已归档，总线未 ack 会红投、对账按间隔重扫，层存在性判据幂等。
+#[derive(Default)]
+struct InFlight {
+    ids: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl InFlight {
+    /// 认领成功返回凭证，处理结束（含出错与 panic 展开）时由 [`Drop`] 归还。
+    /// 拿不到说明同一份 raw 已有人在办，调用方应跳过而不是排队。
+    fn try_claim(&self, id: &str) -> Option<InFlightGuard<'_>> {
+        let mut ids = self.ids.lock().unwrap_or_else(|e| e.into_inner());
+        if !ids.insert(id.to_string()) {
+            return None;
+        }
+        Some(InFlightGuard {
+            in_flight: self,
+            id: id.to_string(),
+        })
+    }
+}
+
+/// 在办认领的凭证。存 `id` 而不是由调用方传：`Drop` 里不能再借调用方的栈。
+struct InFlightGuard<'a> {
+    in_flight: &'a InFlight,
+    id: String,
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        let mut ids = self.in_flight.ids.lock().unwrap_or_else(|e| e.into_inner());
+        ids.remove(&self.id);
+    }
+}
+
 #[derive(Default)]
 struct PullGateState {
     consecutive_failures: u32,
@@ -415,6 +464,8 @@ pub struct MemoryIngestor {
     config: MemoryIngestorConfig,
     pull_gate: Arc<PullGate>,
     metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
+    /// 按 raw id 的在办集合，挡掉同一份 raw 的并发抽取（见 [`InFlight`]）。
+    in_flight: InFlight,
 }
 
 impl MemoryIngestor {
@@ -427,6 +478,7 @@ impl MemoryIngestor {
             config,
             pull_gate,
             metrics: None,
+            in_flight: InFlight::default(),
         }
     }
 
@@ -811,9 +863,14 @@ impl MemoryIngestor {
             .retry_with_backoff(&label, || self.ingest_missing(&raw))
             .await
         {
-            Ok(()) => {
-                self.pull_gate.note_success();
-                true
+            Ok(done) => {
+                // 跳过（同一份 raw 在办）不算一次成功：这一趟没碰上游，没有
+                // 证据说明上游是活的，不该拿它清掉别人撞出来的失败连击。
+                // 也不算完成——未 ack 才会被红线重投，或由对账扫回来。
+                if done {
+                    self.pull_gate.note_success();
+                }
+                done
             }
             Err(e) if e.is_environment_failure() => {
                 // 上游没接住，不是这条消息的毛病。写死信等于用一次容量故障
@@ -851,7 +908,20 @@ impl MemoryIngestor {
     /// 两层都缺（正常路径，也是绝大多数）时走一次合并调用：抽取器分层调用
     /// 会把同一段 payload 各发一遍，而 payload 是输入 token 的大头。只有一层
     /// 缺时才用单层方法，否则已落库的那层会被白抽一遍。
-    async fn ingest_missing(&self, raw: &RawSource) -> SFResult<()> {
+    ///
+    /// 返回值是「这一趟真的做过活」：认领不到（同一份 raw 已有人在办）时为
+    /// `false`，投递方据此决定要不要 ack——不算完成就不该回执，否则这份 raw
+    /// 只剩对账一条路可走。
+    async fn ingest_missing(&self, raw: &RawSource) -> SFResult<bool> {
+        let Some(_claim) = self.in_flight.try_claim(&raw.id) else {
+            self.record_skipped_in_flight().await;
+            debug!(
+                "Memory extraction skipped for {}: already in flight",
+                raw.id
+            );
+            return Ok(false);
+        };
+
         let schema_done = !self
             .backend
             .schema_for_raw(&raw.namespace, &raw.id)
@@ -888,7 +958,31 @@ impl MemoryIngestor {
             }
         }
 
-        Ok(())
+        Ok(true)
+    }
+
+    /// 记一次「因同一份 raw 在办而没抽」。
+    ///
+    /// 复用 `memory_operations_total` 而不是新开一个指标名：这是抽取这条路
+    /// 上的一次具名结果，与 `memory_operations_total{operation=...}` 已有的
+    /// 语义同类；新名字还要在告警规则普查里登记，为一个跳过理由付这份代价
+    /// 不值。没有这一格，「第二条投递被挡住」与「本来就没有第二次投递」在
+    /// 读数上同形——省下的就只是缺席，不是读数。
+    async fn record_skipped_in_flight(&self) {
+        let Some(metrics) = self.metrics.as_ref() else {
+            return;
+        };
+        let mut labels = HashMap::new();
+        labels.insert(
+            "operation".to_string(),
+            SKIP_IN_FLIGHT_OPERATION.to_string(),
+        );
+        if let Err(e) = metrics
+            .record_counter(cog_core::metric_names::MEMORY_OPERATIONS_TOTAL, 1.0, labels)
+            .await
+        {
+            warn!("Failed to record in-flight extraction skip: {}", e);
+        }
     }
 
     /// 周期对账：启动对账只覆盖"进程崩溃到重启"这一小段。按间隔重扫让窗口内
@@ -1071,15 +1165,15 @@ impl MemoryIngestor {
         })
     }
 
-    async fn retry_with_backoff<F, Fut>(&self, label: &str, mut op: F) -> SFResult<()>
+    async fn retry_with_backoff<F, Fut, T>(&self, label: &str, mut op: F) -> SFResult<T>
     where
         F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = SFResult<()>>,
+        Fut: std::future::Future<Output = SFResult<T>>,
     {
         let mut last_error = None;
         for attempt in 0..=self.config.max_retries {
             match op().await {
-                Ok(()) => return Ok(()),
+                Ok(v) => return Ok(v),
                 Err(e) => {
                     last_error = Some(e);
                     if attempt < self.config.max_retries {
@@ -1831,6 +1925,98 @@ mod tests {
             1,
             "the summary half must still be stored"
         );
+    }
+
+    /// 会卡在抽取里的抽取器：把「第一条还在办」变成一个可观测的状态，而不是
+    /// 靠调度碰运气。`entered()` 等到它真进去，`release()` 放它走。
+    #[derive(Default)]
+    struct GatedExtractor {
+        inner: RuleBasedExtractor,
+        merged: std::sync::atomic::AtomicUsize,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl GatedExtractor {
+        fn merged_calls(&self) -> usize {
+            self.merged.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        async fn entered(&self) {
+            self.entered.notified().await;
+        }
+
+        fn release(&self) {
+            self.release.notify_one();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MemoryExtractor for GatedExtractor {
+        async fn extract_schema(&self, source: &RawSource) -> SFResult<Vec<SchemaEntry>> {
+            self.inner.extract_schema(source).await
+        }
+
+        async fn generate_summary(&self, source: &RawSource) -> SFResult<SummaryEntry> {
+            self.inner.generate_summary(source).await
+        }
+
+        async fn extract_all(
+            &self,
+            source: &RawSource,
+        ) -> SFResult<(Vec<SchemaEntry>, SummaryEntry)> {
+            self.merged
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.entered.notify_one();
+            self.release.notified().await;
+            let schema = self.inner.extract_schema(source).await?;
+            let summary = self.inner.generate_summary(source).await?;
+            Ok((schema, summary))
+        }
+    }
+
+    /// 同一份 raw 的第二条投递不许再抽一遍。
+    ///
+    /// 落库判据（schema/summary 在不在）只看「做完没有」，分不出「另一个执行者
+    /// 正在做」——而对账重扫与总线投递是两条独立路径，同时对同一份 raw 各投
+    /// 一条是常态。实测这条路上重复出现的抽取整段命中上游前缀缓存：输入几乎
+    /// 白送，但输出照付，生成本身也是重复劳动。
+    #[tokio::test]
+    async fn a_second_delivery_of_an_in_flight_raw_is_not_extracted() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        let extractor = Arc::new(GatedExtractor::default());
+        let ingestor = Arc::new(MemoryIngestor::new(backend.clone(), extractor.clone()));
+        let raw = entity_raw("in-flight");
+
+        let first = {
+            let ingestor = ingestor.clone();
+            let raw = raw.clone();
+            tokio::spawn(async move { ingestor.ingest_missing(&raw).await.unwrap() })
+        };
+
+        // 等第一条真进到抽取器里，第二条才是「同时投递」而不是「一前一后」。
+        extractor.entered().await;
+        let second = ingestor
+            .ingest_missing(&raw)
+            .await
+            .expect("a skip is not an error");
+
+        assert!(
+            !second,
+            "the skipped delivery did no work, so it must not read as done"
+        );
+        assert_eq!(
+            extractor.merged_calls(),
+            1,
+            "the same raw must reach the extractor exactly once"
+        );
+
+        extractor.release();
+        assert!(
+            first.await.unwrap(),
+            "the delivery that owns the claim reports done"
+        );
+        assert_eq!(summary_count(&backend).await, 1);
     }
 
     /// 上一次跑到一半（schema 已落库、summary 还没写）是重驱动最常见的样子：
