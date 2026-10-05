@@ -590,6 +590,34 @@ impl ChangePipeline {
             });
         }
 
+        // A change whose only effect is a default no deployment reads is refused
+        // here, before the formatter and the linter, because both of those are
+        // whole-tree compiles: the round this criterion saves is the one that
+        // would have spent them proving a value nothing can reach.
+        //
+        // The worktree diff against `HEAD` is the change and nothing else at
+        // this point — the formatter has not run yet, so it has not rewritten
+        // the baseline into the same diff.
+        if let Some(reason) = self
+            .unreachable_default_reason(workdir, &change.content)
+            .await
+        {
+            warn!(
+                change_id = %change.artifact_id,
+                "Change writes only defaults every shipped document overrides"
+            );
+            let _ = self.git_reset_hard(workdir).await;
+            return Ok(ApplyResult {
+                change_id: change.artifact_id.clone(),
+                files_changed,
+                reformatted: false,
+                pre_existing_failures: 0,
+                verdict: ChangeVerdict::Refused(cog_core::RejectionCause::UnreachableDefault),
+                test_output: reason,
+                new_status: EvolutionStatus::ValidationFailed,
+            });
+        }
+
         // Conformed before it is compiled, and rolled back either way: a change
         // refused here must leave the tree as it found it, or the next run would
         // be verifying this one's leftovers.
@@ -1562,6 +1590,62 @@ impl ChangePipeline {
         Ok(written)
     }
 
+    /// The refusal this change earns for writing only defaults nothing reads,
+    /// `None` when it has an effect somewhere.
+    ///
+    /// Two documents stand for the deployment's configuration here:
+    /// `cogneva.example.json` and the chart's own `cogneva.json`. Those are the
+    /// pair the configuration surface is already judged on, and `deploy/k3s` /
+    /// `deploy/rendered` are held to the chart by the parity gate rather than
+    /// carrying keys of their own. A document that cannot be read or parsed, or
+    /// a written file that cannot be read back, answers `None`: the criterion
+    /// is "every document writes the key", and an unread document has not been
+    /// shown to. Reading no documents is not the same finding as reading them
+    /// and not finding the key, and only the second one refuses a change.
+    async fn unreachable_default_reason(
+        &self,
+        workdir: &Path,
+        change_content: &str,
+    ) -> Option<String> {
+        const DOCUMENTS: &[&str] = &[
+            "cogneva.example.json",
+            "deploy/helm/cogneva/files/cogneva.json",
+        ];
+        let mut documents = Vec::with_capacity(DOCUMENTS.len());
+        for path in DOCUMENTS {
+            let text = tokio::fs::read_to_string(workdir.join(path)).await.ok()?;
+            documents.push(serde_json::from_str(&text).ok()?);
+        }
+
+        let written = self
+            .applied_change_lines(workdir, change_content)
+            .await
+            .ok()?;
+        let mut sources = BTreeMap::new();
+        for file in written.keys() {
+            let text = tokio::fs::read_to_string(workdir.join(file)).await.ok()?;
+            sources.insert(file.clone(), text);
+        }
+
+        let unreachable =
+            cog_core::contract::reflection::unreachable_defaults(&written, &sources, &documents);
+        if unreachable.is_empty() {
+            return None;
+        }
+        let named = unreachable
+            .iter()
+            .map(|d| format!("{}:{} {}", d.file, d.line, d.key))
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        Some(format!(
+            "Every line this change writes is a literal in an `impl Default for *Config`, \
+             and every configuration document this deployment ships writes that key \
+             ({}) — the document's value is the one the process reads, so these defaults \
+             are unreachable and the change has no effect:\n  {named}",
+            DOCUMENTS.join(", ")
+        ))
+    }
+
     /// Split a failing run's tests into the ones this revision was already
     /// failing and the ones it was passing.
     ///
@@ -1901,6 +1985,93 @@ mod tests {
             test_kind_reading(&budget, crate::verification_budget::LAST_RUN_SECONDS_METRIC).await,
             None,
             "a run cut short at the budget has no duration of its own to report"
+        );
+    }
+
+    /// 一笔改动给一个「每份部署文档都写着的键」抬默认值，效果落在没人读的载体
+    /// 上：文档反序列化进类型，缺键才落回 `Default`，所以这个值在任何部署里都
+    /// 读不到。判据要两侧同时成立才出口，这里两侧都造出来。
+    #[tokio::test]
+    async fn a_change_that_only_moves_an_overridden_default_has_no_effect() {
+        let root = tempfile::tempdir().unwrap();
+        let workdir = root.path();
+        let config = workdir.join("crates/cog-core/src/config.rs");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let document = serde_json::json!({
+            "metrics": { "sample_max_rows": 200000, "log_at_floor": false },
+        });
+        let documents = [
+            workdir.join("cogneva.example.json"),
+            workdir.join("deploy/helm/cogneva/files/cogneva.json"),
+        ];
+        for path in &documents {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, serde_json::to_string_pretty(&document).unwrap()).unwrap();
+        }
+        let source = "\
+pub struct MetricsConfig {
+    pub sample_max_rows: usize,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            sample_max_rows: 200_000,
+        }
+    }
+}
+";
+        std::fs::write(&config, source).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "-A"],
+            vec![
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "base",
+            ],
+        ] {
+            let out = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(workdir)
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+        let pipeline = ChangePipeline::new(workdir, workdir, false);
+
+        // 落地闸要拒的那一笔：只把那个被文档钉死的默认值抬上去。
+        std::fs::write(&config, source.replace("200_000", "500_000")).unwrap();
+        let reason = pipeline
+            .unreachable_default_reason(workdir, "")
+            .await
+            .expect("这个默认值没有读者，这笔变更没有任何效果");
+        assert!(
+            reason.contains("sample_max_rows"),
+            "拒因要点名读不到的键：{reason}"
+        );
+        assert!(
+            reason.contains("cogneva.example.json"),
+            "拒因要点名它据以判定的文档：{reason}"
+        );
+
+        // 同一棵树，改的是 impl 之外的一行 ⇒ 有别的效果，不出口。
+        std::fs::write(
+            &config,
+            source.replace("pub sample_max_rows: usize,", "pub sample_max_rows: u32,"),
+        )
+        .unwrap();
+        assert!(
+            pipeline
+                .unreachable_default_reason(workdir, "")
+                .await
+                .is_none(),
+            "字段类型改了就不是「全部改动都是默认值里的字面量」"
         );
     }
 
