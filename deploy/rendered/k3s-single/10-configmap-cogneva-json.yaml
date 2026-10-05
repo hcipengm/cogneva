@@ -919,7 +919,7 @@ data:
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "The channel refused {value} re-drives in the last day because the CI failure arrived with no log to generate against, so there was no cause to build a fix from and a round would have been a guess. The landing was reverted either way, so this is a reading that broke rather than a change: check that the CI run and its job logs can still be fetched before the generator is expected to answer failures again"
+              "summary": "The channel refused {value} re-drives in the last day because the failure it was aimed at had no log to generate against: for that commit no run was still in flight and none had concluded as a failure, so there was nothing to read a cause from and a round would have been a guess. The landing was reverted either way, so this is a reading that broke rather than a change. Before the generator is expected to answer failures again, look at which runs that commit has rather than at whether logs can be fetched: a run that is only still in flight clears itself, while a commit whose runs all concluded without a failure is a verdict that no run backs -- a check cancelled when the next push superseded it goes red without leaving a failure to read"
             },
             {
               "name": "redrive_budget_forgotten",
