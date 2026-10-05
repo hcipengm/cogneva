@@ -1349,7 +1349,11 @@ fn an_elsewhere_entry_that_names_a_reader_no_rule_has_is_reported() {
 
     // A published name nothing reads: the claim the false entries made, in the
     // form the gate can check.
-    let named = unresolved_readers(&any_read, "metrics_samples_rows", &["metrics_samples_bytes"]);
+    let named = unresolved_readers(
+        &any_read,
+        "metrics_samples_rows",
+        &["metrics_samples_bytes"],
+    );
     assert!(
         !named.is_empty(),
         "豁免指向一条没有读者的序列时必须报出来，否则豁免又退回成一句判据核不了的话"
