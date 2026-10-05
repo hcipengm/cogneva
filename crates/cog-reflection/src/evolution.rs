@@ -89,6 +89,40 @@ pub struct EvolutionEngine {
     results: Arc<tokio::sync::Mutex<std::collections::HashMap<String, EvolutionResult>>>,
 }
 
+/// Hard upper bound on the number of [`EvolutionResult`] entries kept in the
+/// engine's in-memory log.
+///
+/// Each result carries the full text of the artifact it produced in
+/// `content`, and the log had no reclaimer: every generation branch inserted
+/// for the pod's whole lifetime, so resident history grew with uptime until
+/// the evolution worker's normal burst amplitude carried its working set into
+/// the OOM band. Durable history is already written to disk (`change_dir`)
+/// and the recorder/state backend, so the resident log only needs recent
+/// entries and the bound makes worst-case resident usage independent of how
+/// many rollout cycles the pod lives through.
+pub(crate) const MAX_RESULTS: usize = 256;
+
+/// Evict the results with the earliest timestamps until `results` holds at
+/// most [`MAX_RESULTS`] entries. Returns how many entries were dropped.
+///
+/// This is the only eviction logic in the engine and it runs under the
+/// caller's results lock, so the bound cannot be bypassed by a new branch.
+fn evict_oldest(results: &mut std::collections::HashMap<String, EvolutionResult>) -> usize {
+    let mut evicted = 0;
+    while results.len() > MAX_RESULTS {
+        let Some(key) = results
+            .iter()
+            .min_by_key(|(_, value)| value.created_at)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        results.remove(&key);
+        evicted += 1;
+    }
+    evicted
+}
+
 impl std::fmt::Debug for EvolutionEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let has_hook_sink = self.hook_sink.lock().map(|g| g.is_some()).unwrap_or(false);
@@ -156,8 +190,19 @@ impl EvolutionEngine {
     /// so it appears in `list_results` / the admin change table.
     /// Same `artifact_id` re-registers (latest proposal wins).
     pub async fn register_result(&self, result: EvolutionResult) {
+        self.insert_result(result).await;
+    }
+
+    /// The single bounded insertion path for [`Self::results`].
+    ///
+    /// Every result this engine produces is stored through here so the
+    /// [`MAX_RESULTS`] cap holds on every branch: after the entry is stored,
+    /// oldest entries are evicted under the same lock. Same `artifact_id`
+    /// re-registers (latest proposal wins).
+    async fn insert_result(&self, result: EvolutionResult) {
         let mut results = self.results.lock().await;
         results.insert(result.artifact_id.clone(), result);
+        evict_oldest(&mut results);
     }
 
     /// Update the status of an evolution result by `artifact_id`.
@@ -265,10 +310,7 @@ impl EvolutionEngine {
                         created_at: Utc::now(),
                         eval_summary: None,
                     };
-                    self.results
-                        .lock()
-                        .await
-                        .insert(result.artifact_id.clone(), result.clone());
+                    self.insert_result(result.clone()).await;
                     Ok(Some(result))
                 } else {
                     warn!(skill_id, "Refined skill failed quality gate");
@@ -281,10 +323,7 @@ impl EvolutionEngine {
                         created_at: Utc::now(),
                         eval_summary: None,
                     };
-                    self.results
-                        .lock()
-                        .await
-                        .insert(result.artifact_id.clone(), result.clone());
+                    self.insert_result(result.clone()).await;
                     Ok(Some(result))
                 }
             }
@@ -299,10 +338,7 @@ impl EvolutionEngine {
                     created_at: Utc::now(),
                     eval_summary: None,
                 };
-                self.results
-                    .lock()
-                    .await
-                    .insert(result.artifact_id.clone(), result.clone());
+                self.insert_result(result.clone()).await;
                 Ok(Some(result))
             }
         }
@@ -389,10 +425,7 @@ impl EvolutionEngine {
                 created_at: Utc::now(),
                 eval_summary: None,
             };
-            self.results
-                .lock()
-                .await
-                .insert(result.artifact_id.clone(), result.clone());
+            self.insert_result(result.clone()).await;
             return Ok(Some(result));
         };
 
@@ -423,10 +456,7 @@ impl EvolutionEngine {
                 created_at: Utc::now(),
                 eval_summary: None,
             };
-            self.results
-                .lock()
-                .await
-                .insert(result.artifact_id.clone(), result.clone());
+            self.insert_result(result.clone()).await;
             return Ok(Some(result));
         }
 
@@ -474,10 +504,7 @@ impl EvolutionEngine {
             created_at: Utc::now(),
             eval_summary: None,
         };
-        self.results
-            .lock()
-            .await
-            .insert(result.artifact_id.clone(), result.clone());
+        self.insert_result(result.clone()).await;
         Ok(Some(result))
     }
 
@@ -548,10 +575,7 @@ impl EvolutionEngine {
                 created_at: Utc::now(),
                 eval_summary: None,
             };
-            self.results
-                .lock()
-                .await
-                .insert(result.artifact_id.clone(), result.clone());
+            self.insert_result(result.clone()).await;
             return Ok(Some(result));
         };
 
@@ -567,10 +591,7 @@ impl EvolutionEngine {
                     created_at: Utc::now(),
                     eval_summary: None,
                 };
-                self.results
-                    .lock()
-                    .await
-                    .insert(result.artifact_id.clone(), result.clone());
+                self.insert_result(result.clone()).await;
                 return Ok(Some(result));
             }
             if !params
@@ -590,10 +611,7 @@ impl EvolutionEngine {
                     created_at: Utc::now(),
                     eval_summary: None,
                 };
-                self.results
-                    .lock()
-                    .await
-                    .insert(result.artifact_id.clone(), result.clone());
+                self.insert_result(result.clone()).await;
                 return Ok(Some(result));
             }
         }
@@ -642,10 +660,7 @@ impl EvolutionEngine {
             created_at: Utc::now(),
             eval_summary: None,
         };
-        self.results
-            .lock()
-            .await
-            .insert(result.artifact_id.clone(), result.clone());
+        self.insert_result(result.clone()).await;
         Ok(Some(result))
     }
 
@@ -813,10 +828,7 @@ impl EvolutionEngine {
             created_at: Utc::now(),
             eval_summary: None,
         };
-        self.results
-            .lock()
-            .await
-            .insert(artifact_id.clone(), result);
+        self.insert_result(result).await;
 
         Ok(artifact_id)
     }
@@ -908,6 +920,62 @@ mod tests {
         assert!(cog_core::diff_structural_defect(diff).is_some());
         let repaired = repair_generated_diff(diff);
         assert_eq!(cog_core::diff_structural_defect(&repaired), None);
+    }
+
+    fn make_result(id: &str, created_at: chrono::DateTime<chrono::Utc>) -> EvolutionResult {
+        EvolutionResult {
+            kind: EvolutionKind::CodeChange,
+            artifact_id: id.to_string(),
+            description: String::new(),
+            content: format!("content-{id}"),
+            status: EvolutionStatus::Generated,
+            created_at,
+            eval_summary: None,
+        }
+    }
+
+    #[test]
+    fn results_at_or_under_the_cap_keep_every_entry() {
+        let mut results = std::collections::HashMap::new();
+        for i in 0..MAX_RESULTS {
+            let id = format!("r-{i}");
+            results.insert(id.clone(), make_result(&id, chrono::Utc::now()));
+        }
+        assert_eq!(
+            evict_oldest(&mut results),
+            0,
+            "nothing at or below the cap may be evicted"
+        );
+        assert_eq!(results.len(), MAX_RESULTS);
+    }
+
+    #[test]
+    fn results_beyond_the_cap_drop_the_oldest_entries() {
+        let mut results = std::collections::HashMap::new();
+        let now = chrono::Utc::now();
+        let total = MAX_RESULTS + 5;
+        for i in 0..total {
+            let id = format!("r-{i}");
+            results.insert(
+                id.clone(),
+                make_result(&id, now + chrono::Duration::milliseconds(i as i64)),
+            );
+        }
+        assert_eq!(
+            evict_oldest(&mut results),
+            5,
+            "the five over-cap entries go"
+        );
+        assert_eq!(results.len(), MAX_RESULTS, "the cap is a hard bound");
+        assert!(
+            !results.contains_key("r-4"),
+            "the earliest results must be evicted"
+        );
+        assert!(
+            results.contains_key("r-5"),
+            "entries newer than the cap floor must survive"
+        );
+        assert!(results.contains_key(&format!("r-{}", total - 1)));
     }
 
     #[test]
