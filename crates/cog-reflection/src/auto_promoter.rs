@@ -76,8 +76,11 @@ pub trait PromotionChannel: Send + Sync {
     /// 已经由落地通道进了主线，而晋级台账那一行还在等人工审批。判据要从仓库
     /// 自己问出来——台账两边的记录互相看不见。
     ///
+    /// 收的是 change id 而不是整条变更：回收一个没有对话者的台账行时手里只有
+    /// 这个 id，而多一个只用得上其中一半的参数就是多一处能对不上的地方。
+    ///
     /// 缺省实现答「看不出」，据此按原样发布，所以不查的推送端与测试零改动。
-    async fn already_published(&self, _change: &EvolutionResult) -> Option<String> {
+    async fn already_published(&self, _change_id: &str) -> Option<String> {
         None
     }
 }
@@ -363,7 +366,7 @@ impl AutoPromoter {
         // 落地通道与晋级通道各自把变更送上主线，两边互不知情：这条变更可能
         // 已经进了主线，而这一行还在等审批。再发一次只会对集群里已经在跑的
         // 那个版本开一场金丝雀——审批要的是把这一格推出去，不是重发。
-        if let Some(reference) = channel.already_published(change).await {
+        if let Some(reference) = channel.already_published(&change_id).await {
             info!(
                 change_id = %change_id,
                 reference = %reference,
@@ -475,6 +478,56 @@ impl AutoPromoter {
                     && matches!(r.status, PromotionStatus::AwaitingApproval)
             })
             .map(|r| r.id))
+    }
+
+    /// 把「等人工审批」里那些已经由落地通道合进主线的行收掉。
+    ///
+    /// 这一格没有别的回收者，而它的对话者会先走：写这一行的是晋级器，晋级器只
+    /// 认手里那条变更；变更一旦落地就被移出待处理队列，于是这一行既等不到人批、
+    /// 也等不到任何一轮判定再碰它，只有停摆告警一直读着它的出口。
+    ///
+    /// 判据只有一条，且是实证：这条变更已经在主线上了。那它等的那件事已经由
+    /// 另一条路做完，把它记成晋级是**如实的记录**，不是替人做决定——没上主线的
+    /// 行一格都不动，人批不动它、这条也绕不过它。
+    pub async fn reclaim_landed_approvals(&self) {
+        let Some(channel) = self.channel.as_ref() else {
+            return;
+        };
+        let recent = match self.ledger.recent(LEDGER_LOOKBACK).await {
+            Ok(recent) => recent,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "promotion ledger unreadable; no awaiting-approval row reclaimed this round"
+                );
+                return;
+            }
+        };
+        for rec in recent.iter().filter(|r| {
+            r.cluster == self.cluster && matches!(r.status, PromotionStatus::AwaitingApproval)
+        }) {
+            let Some(reference) = channel.already_published(&rec.change_id).await else {
+                continue;
+            };
+            let outcome = format!("已在主线：{reference}（落地通道已合入，未重发）");
+            match self
+                .ledger
+                .update_status(&rec.id, PromotionStatus::Promoted, &outcome)
+                .await
+            {
+                Ok(()) => info!(
+                    change_id = %rec.change_id,
+                    record_id = %rec.id,
+                    reference = %reference,
+                    "Change is already on the mainline; closed its awaiting-approval row"
+                ),
+                Err(e) => warn!(
+                    record_id = %rec.id,
+                    error = %e,
+                    "could not close an awaiting-approval row whose change is already live"
+                ),
+            }
+        }
     }
 
     /// 追加台账记录，返回记录 id。
@@ -717,10 +770,12 @@ mod tests {
     }
 
     /// 落地通道已经把这条变更合进主线，推送端要答得出承载它的提交。答不出来
-    /// 就退回缺省，照原样发布——这一格是缺省的反面。
+    /// 就退回缺省，照原样发布——这一格是缺省的反面。按 id 配对：仓库答的是
+    /// 「这一个 id 在主线上」，不认识的 id 要答「没查到」，否则回收者会把每一行
+    /// 都当成已落地。
     struct LandedChannel {
         published: Mutex<Vec<String>>,
-        landed: String,
+        landed: Vec<(String, String)>,
     }
 
     #[async_trait]
@@ -735,8 +790,11 @@ mod tests {
         async fn publish_rollout(&self, change: &EvolutionResult) -> SFResult<String> {
             self.publish_config(change).await
         }
-        async fn already_published(&self, _change: &EvolutionResult) -> Option<String> {
-            Some(self.landed.clone())
+        async fn already_published(&self, change_id: &str) -> Option<String> {
+            self.landed
+                .iter()
+                .find(|(id, _)| id == change_id)
+                .map(|(_, rev)| rev.clone())
         }
     }
 
@@ -790,7 +848,7 @@ mod tests {
         let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
         let channel = Arc::new(LandedChannel {
             published: Mutex::new(Vec::new()),
-            landed: "1fcf76a".into(),
+            landed: vec![("already-landed".into(), "1fcf76a".into())],
         });
         let policy = crate::PromotionGateConfig {
             enabled: true,
@@ -821,6 +879,63 @@ mod tests {
             records[0].outcome.contains("已在主线"),
             "「没重发」这件事要落在证据里，否则事后读不出它为什么没发布：{}",
             records[0].outcome
+        );
+    }
+
+    /// 等人工审批的行，等的可能是一件已经由落地通道做完了的事：变更既然已经
+    /// 进了主线，落地那一刻就被移出待处理队列，于是这一行既等不到人批（审批台
+    /// 手里已经找不到那条变更），也等不到任何一轮判定再碰它。只有这个回收者
+    /// 能把它销账，而它的判据是实证：仓库说这个 id 已经在主线上。
+    #[tokio::test]
+    async fn a_landed_change_closes_its_awaiting_approval_row() {
+        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let channel = Arc::new(LandedChannel {
+            published: Mutex::new(Vec::new()),
+            landed: vec![("landed-x".into(), "1fcf76a".into())],
+        });
+        let policy = crate::PromotionGateConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let p = promoter(policy, ledger.clone(), Some(channel.clone()));
+
+        // 核心路径的变更分级判定为「需人工审批」，落成 awaiting_approval 那格。
+        let core = "crates/cog-storage/src/postgres/state_backend.rs";
+        p.decide_and_promote(&change("landed-x", core))
+            .await
+            .unwrap();
+        p.decide_and_promote(&change("still-waiting", core))
+            .await
+            .unwrap();
+        let before = ledger.recent(10).await.unwrap();
+        assert_eq!(before.len(), 2);
+        assert!(before
+            .iter()
+            .all(|r| r.status == PromotionStatus::AwaitingApproval));
+
+        p.reclaim_landed_approvals().await;
+
+        let records = ledger.recent(10).await.unwrap();
+        assert_eq!(records.len(), 2, "回收是销账，不是再记一笔");
+        let landed = records.iter().find(|r| r.change_id == "landed-x").unwrap();
+        assert_eq!(landed.status, PromotionStatus::Promoted);
+        assert!(
+            landed.outcome.contains("已在主线：1fcf76a"),
+            "「为什么它能被销账」要落在证据里：{}",
+            landed.outcome
+        );
+        let waiting = records
+            .iter()
+            .find(|r| r.change_id == "still-waiting")
+            .unwrap();
+        assert_eq!(
+            waiting.status,
+            PromotionStatus::AwaitingApproval,
+            "没上主线的行一格都不能动——回收绕不过人批，只捡那些人已经不用批的"
+        );
+        assert!(
+            channel.published.lock().unwrap().is_empty(),
+            "回收不发布：做完这件事的是落地通道，不是晋级通道"
         );
     }
 

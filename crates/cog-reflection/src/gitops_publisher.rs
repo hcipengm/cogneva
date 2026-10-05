@@ -322,6 +322,10 @@ impl GitOpsPublisher {
 /// 所以这里问的主线就是它。
 const MAINLINE_REF: &str = "refs/heads/main";
 
+/// 落地通道撤回一条判红变更时用的提交标题前缀。撤回提交的信息里同样逐字带
+/// change id，所以「历史里有这个 id」不等于「这条变更此刻在主线上」。
+const REVERT_SUBJECT_PREFIX: &str = "revert(cogneva): undo change";
+
 /// 金丝雀 overlay 基底要读的四个工作负载：只有它们**全部**跑在同一个
 /// `main-<rev>` tag 上，那个 tag 才是可信的基底。
 ///
@@ -384,33 +388,47 @@ impl PromotionChannel for GitOpsPublisher {
     /// 落地通道把变更**直接合进主线**，提交信息里逐字带 change id；晋级通道推
     /// 的是另一条 release 分支。两条路互不知情，两边的台账也互相看不见，所以
     /// 人工批准一条变更时唯一问得出口的对象是仓库自己：主线里有没有一个带这个
-    /// id 的提交。答不出来（没配仓库地址、git 失败）按「没查到」处理、照原样
-    /// 发布，但要把那句 warn 留下——沉默的降级会让「查过，没有」与「根本没查」
-    /// 在读数上同形。
-    async fn already_published(&self, change: &EvolutionResult) -> Option<String> {
+    /// id 的提交。收的是一个 change id 而不是整条变更——回收一个对话者已经走掉
+    /// 的台账行时手里只有这个 id。答不出来（没配仓库地址、git 失败）按「没查到」
+    /// 处理、照原样发布，但要把那句 warn 留下——沉默的降级会让「查过，没有」与
+    /// 「根本没查」在读数上同形。
+    ///
+    /// 只看**最近**一条带这个 id 的提交，且要看它的标题：落地通道在 CI 判红时
+    /// 会追一条撤回提交，那条提交的信息里同样逐字带着这个 id。只看「历史里有
+    /// 没有这个 id」的话，一条落过地又被撤回去的变更会被读成「已在主线」——而
+    /// 它此刻恰恰不在。撤回在前就答「没查到」。
+    async fn already_published(&self, change_id: &str) -> Option<String> {
         if self.config.repo_url.is_empty() {
             return None;
         }
         match self
             .git(&[
                 "log",
-                "--format=%H",
+                "--format=%H%x1f%s",
                 "-n",
                 "1",
                 "--fixed-strings",
                 "--grep",
-                &change.artifact_id,
+                change_id,
                 MAINLINE_REF,
             ])
             .await
         {
             Ok(out) => {
-                let rev = out.trim();
-                (!rev.is_empty()).then(|| rev.to_string())
+                let line = out.trim();
+                if line.is_empty() {
+                    return None;
+                }
+                // 摘要里带空格，用单元分隔符把哈希与标题分开，免得从标题里劈哈希。
+                let (rev, subject) = line.split_once('\u{1f}').unwrap_or((line, ""));
+                if subject.starts_with(REVERT_SUBJECT_PREFIX) {
+                    return None;
+                }
+                Some(rev.to_string())
             }
             Err(e) => {
                 warn!(
-                    change_id = %change.artifact_id,
+                    change_id = %change_id,
                     error = %e,
                     "could not ask the repository whether the change is already on the mainline"
                 );
@@ -525,10 +543,7 @@ mod tests {
         git(work.path(), &["branch", "-M", "main"]).await;
 
         assert!(
-            publisher
-                .already_published(&change("p-waiting"))
-                .await
-                .is_none(),
+            publisher.already_published("p-waiting").await.is_none(),
             "主线里没有这个 id 时要答「没查到」"
         );
 
@@ -548,12 +563,29 @@ mod tests {
         let head = git(work.path(), &["rev-parse", "HEAD"]).await;
 
         assert_eq!(
-            publisher
-                .already_published(&change("p-landed"))
-                .await
-                .as_deref(),
+            publisher.already_published("p-landed").await.as_deref(),
             Some(head.as_str()),
             "落地提交的 id 出现在信息里，这就是「已经在主线上」的判据"
+        );
+
+        tokio::fs::write(work.path().join("lib.rs"), "fn v3() {}\n")
+            .await
+            .unwrap();
+        git(work.path(), &["add", "."]).await;
+        git(
+            work.path(),
+            &[
+                "commit",
+                "-m",
+                "revert(cogneva): undo change p-landed\n\nThis reverts commit 0.\n\nChange-Id: revert-p-landed\n",
+            ],
+        )
+        .await;
+
+        assert!(
+            publisher.already_published("p-landed").await.is_none(),
+            "落过地又被撤回去的变更，此刻不在主线上；撤回提交里同样带着这个 id，\
+             只看「历史里有没有」会把它读成「已在主线」"
         );
     }
 

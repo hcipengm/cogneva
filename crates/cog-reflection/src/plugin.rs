@@ -1096,6 +1096,12 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                                     // 成功即不返回，回调永远不会执行（见 pending_promotions）。
                                     if let Some(p) = promoter.as_ref() {
                                         p.drain_handed_off().await;
+                                        // 等人工审批的台账行里，有一部分等的是一件
+                                        // 已经发生的事：落地通道先把它合进了主线。
+                                        // 那件事没有对话者来销账（变更落地后已不在
+                                        // 队列里），只有停摆告警一直读着它的出口，
+                                        // 所以每轮顺手回收。
+                                        p.reclaim_landed_approvals().await;
                                     }
                                     // 本轮是纯确定性消费：同步工作树、取出待验变更、apply/test/
                                     // build、落地、切二进制，全程不调 LLM。上游全灭时跳过它，只会让
