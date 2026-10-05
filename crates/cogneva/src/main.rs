@@ -7,6 +7,8 @@ use cogneva::cli::{Command, USAGE};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 依赖树里 ring 与 aws-lc-rs 同时存在，rustls 0.23 无法自动选定
     // CryptoProvider，首次 TLS 调用会 panic——必须在任何 TLS 使用之前安装。
+    // install_default 仅在本进程已装过 provider 时返回 Err；那同样是可用的
+    // provider，因此忽略结果，不阻断启动。
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     // 容器入口即 PID 1，孤儿进程只会被落到这里；这是唯一能收集它们的进程

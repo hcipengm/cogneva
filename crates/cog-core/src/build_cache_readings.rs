@@ -267,13 +267,6 @@ impl BuildCacheReadings {
         (scanned_at != 0).then(|| now_unix_secs.saturating_sub(scanned_at))
     }
 
-    /// The layers to publish. The fold, the ordering and the always-present
-    /// `other` series are shared with the second publisher of this family —
-    /// see [`crate::build_cache::published_layers`].
-    fn published_layers(&self, layers: &BTreeMap<String, u64>) -> Vec<(String, u64)> {
-        crate::build_cache::published_layers(layers)
-    }
-
     /// One pass: walk the cache, publish what the walk found, and bring it under
     /// the cap.
     ///
@@ -514,7 +507,7 @@ impl Observable for BuildCacheReadings {
             return Ok(out);
         };
         out.extend(
-            self.published_layers(&layers)
+            crate::build_cache::published_layers(&layers)
                 .into_iter()
                 .map(|(layer, bytes)| {
                     RawMetric::new(BUILD_TARGET_BYTES_METRIC, bytes as f64)
