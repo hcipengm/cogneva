@@ -317,6 +317,11 @@ impl GitOpsPublisher {
     }
 }
 
+/// 主线分支：落地通道把验证过的变更直接合进来的那条分支，与晋级 release
+/// 分支是两条不同的分支。推送端所在的仓库就是主线部署器 watch 的那个裸仓库，
+/// 所以这里问的主线就是它。
+const MAINLINE_REF: &str = "refs/heads/main";
+
 /// 金丝雀 overlay 基底要读的四个工作负载：只有它们**全部**跑在同一个
 /// `main-<rev>` tag 上，那个 tag 才是可信的基底。
 ///
@@ -372,6 +377,46 @@ fn deployed_main_rev(jsonpath_out: &str) -> Option<String> {
 impl PromotionChannel for GitOpsPublisher {
     async fn publish_config(&self, change: &EvolutionResult) -> SFResult<String> {
         self.publish(change, "l0_config", None).await
+    }
+
+    /// 这条变更是否已经在主线上。
+    ///
+    /// 落地通道把变更**直接合进主线**，提交信息里逐字带 change id；晋级通道推
+    /// 的是另一条 release 分支。两条路互不知情，两边的台账也互相看不见，所以
+    /// 人工批准一条变更时唯一问得出口的对象是仓库自己：主线里有没有一个带这个
+    /// id 的提交。答不出来（没配仓库地址、git 失败）按「没查到」处理、照原样
+    /// 发布，但要把那句 warn 留下——沉默的降级会让「查过，没有」与「根本没查」
+    /// 在读数上同形。
+    async fn already_published(&self, change: &EvolutionResult) -> Option<String> {
+        if self.config.repo_url.is_empty() {
+            return None;
+        }
+        match self
+            .git(&[
+                "log",
+                "--format=%H",
+                "-n",
+                "1",
+                "--fixed-strings",
+                "--grep",
+                &change.artifact_id,
+                MAINLINE_REF,
+            ])
+            .await
+        {
+            Ok(out) => {
+                let rev = out.trim();
+                (!rev.is_empty()).then(|| rev.to_string())
+            }
+            Err(e) => {
+                warn!(
+                    change_id = %change.artifact_id,
+                    error = %e,
+                    "could not ask the repository whether the change is already on the mainline"
+                );
+                None
+            }
+        }
     }
 
     async fn publish_rollout(&self, change: &EvolutionResult) -> SFResult<String> {
@@ -469,6 +514,47 @@ mod tests {
             created_at: chrono::Utc::now(),
             eval_summary: Some("Adopt z=2.0".into()),
         }
+    }
+
+    /// 「这条变更是否已在主线上」要问仓库自己：落地通道把它直接提交进主线，
+    /// 提交信息逐字带 change id；晋级 release 分支上的提交不带这个形状。
+    #[tokio::test]
+    async fn already_published_reads_the_change_id_out_of_the_mainline() {
+        let (central, work) = setup_repo().await;
+        let publisher = l1_publisher(central.path(), work.path());
+        git(work.path(), &["branch", "-M", "main"]).await;
+
+        assert!(
+            publisher
+                .already_published(&change("p-waiting"))
+                .await
+                .is_none(),
+            "主线里没有这个 id 时要答「没查到」"
+        );
+
+        tokio::fs::write(work.path().join("lib.rs"), "fn v2() {}\n")
+            .await
+            .unwrap();
+        git(work.path(), &["add", "."]).await;
+        git(
+            work.path(),
+            &[
+                "commit",
+                "-m",
+                "chore(cogneva): land change p-landed\n\nbody\n",
+            ],
+        )
+        .await;
+        let head = git(work.path(), &["rev-parse", "HEAD"]).await;
+
+        assert_eq!(
+            publisher
+                .already_published(&change("p-landed"))
+                .await
+                .as_deref(),
+            Some(head.as_str()),
+            "落地提交的 id 出现在信息里，这就是「已经在主线上」的判据"
+        );
     }
 
     #[tokio::test]

@@ -797,6 +797,43 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     tokio::sync::broadcast::channel::<cog_core::EvolutionChangeInfo>(64);
                 ctx.publish(Arc::new(stream_tx.clone()));
 
+                // 晋级触发器：沙盒验证全过的 change 由它决定去向
+                // （GitOps 自动晋级 / 审批台待办），配额/熔断/暂停全在
+                // 其中判定。推送端只跟 Git 中央仓库说话，不持集群凭证。
+                let promotion_channel: Option<Arc<dyn crate::PromotionChannel>> =
+                    if promotion.gitops.enabled {
+                        info!(
+                            repo = %promotion.gitops.repo_url,
+                            branch = %promotion.gitops.branch,
+                            "GitOps promotion publisher enabled"
+                        );
+                        // 推送端只要求「能解析待发布提交的 git 目录」：指向裸仓库，
+                        // 变更提交来自用完即弃的临时工作树也不影响推送。
+                        Some(Arc::new(crate::GitOpsPublisher::new(
+                            promotion.gitops.clone(),
+                            &bare_repo,
+                            &self_evolution.binary_dir,
+                        )))
+                    } else {
+                        None
+                    };
+                let promoter: Option<Arc<crate::AutoPromoter>> = ctx
+                    .consume_service::<dyn cog_core::PromotionLedger>()
+                    .map(|ledger| {
+                        Arc::new(
+                            crate::AutoPromoter::new(
+                                promotion.clone(),
+                                ledger,
+                                promotion_channel,
+                                engine.clone(),
+                            )
+                            .with_switch(promotion_switch.clone()),
+                        )
+                    });
+                if promoter.is_none() {
+                    warn!("PromotionLedger not published; auto-promotion disabled");
+                }
+
                 // Publish admin-facing evolution control surface.
                 let mut admin = crate::EvolutionAdminService::new(
                     engine.clone(),
@@ -820,6 +857,11 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                         ledger.clone(),
                         promotion.enabled,
                     );
+                }
+                // 审批台与自动通道共用同一个晋级器：批准一条「等人工审批」的
+                // 变更要落成晋级台账的一次晋级，而不是另开一条路。
+                if let Some(ref promoter) = promoter {
+                    admin = admin.with_promoter(promoter.clone());
                 }
                 // 晋级周报（eval 长期趋势）：周期聚合台账写报告文件，趋势
                 // 向下时写审计告警。latest 句柄同时交给 admin 端点。
@@ -860,43 +902,6 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 let admin_service: Arc<dyn cog_core::EvolutionAdmin> = Arc::new(admin);
                 ctx.publish_service(admin_service);
                 info!("ReflectionPlugin evolution admin service published");
-
-                // 晋级触发器：沙盒验证全过的 change 由它决定去向
-                // （GitOps 自动晋级 / 审批台待办），配额/熔断/暂停全在
-                // 其中判定。推送端只跟 Git 中央仓库说话，不持集群凭证。
-                let promotion_channel: Option<Arc<dyn crate::PromotionChannel>> =
-                    if promotion.gitops.enabled {
-                        info!(
-                            repo = %promotion.gitops.repo_url,
-                            branch = %promotion.gitops.branch,
-                            "GitOps promotion publisher enabled"
-                        );
-                        // 推送端只要求「能解析待发布提交的 git 目录」：指向裸仓库，
-                        // 变更提交来自用完即弃的临时工作树也不影响推送。
-                        Some(Arc::new(crate::GitOpsPublisher::new(
-                            promotion.gitops.clone(),
-                            &bare_repo,
-                            &self_evolution.binary_dir,
-                        )))
-                    } else {
-                        None
-                    };
-                let promoter: Option<Arc<crate::AutoPromoter>> = ctx
-                    .consume_service::<dyn cog_core::PromotionLedger>()
-                    .map(|ledger| {
-                        Arc::new(
-                            crate::AutoPromoter::new(
-                                promotion.clone(),
-                                ledger,
-                                promotion_channel,
-                                engine.clone(),
-                            )
-                            .with_switch(promotion_switch.clone()),
-                        )
-                    });
-                if promoter.is_none() {
-                    warn!("PromotionLedger not published; auto-promotion disabled");
-                }
 
                 // 晋级周报后台循环：立即生成一期，之后按间隔周期生成。
                 if let Some(reporter) = trend_reporter {

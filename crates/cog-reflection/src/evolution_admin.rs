@@ -28,6 +28,9 @@ pub struct EvolutionAdminService {
     stream: Option<tokio::sync::broadcast::Sender<EvolutionChangeInfo>>,
     /// 自动晋级运行时开关（与 AutoPromoter 共享同一实例）。
     switch: Option<Arc<crate::PromotionSwitch>>,
+    /// 晋级器本体（与自动通道共享同一实例）。审批台只有在手里有这个句柄时
+    /// 才认得「这条变更正卡在等人工审批那一格」——那一格唯一的出口就是它。
+    promoter: Option<Arc<crate::AutoPromoter>>,
     /// 晋级台账（晋级历史页数据源）。
     promotion_ledger: Option<Arc<dyn cog_core::PromotionLedger>>,
     /// 配置文件里的自动晋级总开关快照（开关快照的 config_enabled 一列）。
@@ -91,6 +94,7 @@ impl EvolutionAdminService {
             policy_results: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             stream: None,
             switch: None,
+            promoter: None,
             promotion_ledger: None,
             promotion_config_enabled: false,
             trend_latest: None,
@@ -157,6 +161,16 @@ impl EvolutionAdminService {
         self.switch = Some(switch);
         self.promotion_ledger = Some(ledger);
         self.promotion_config_enabled = config_enabled;
+        self
+    }
+
+    /// 接入晋级器本体（与自动通道共享同一实例）。
+    ///
+    /// 接入后，人工批准的落点取决于台账：一条变更若是被晋级器判成「需人工
+    /// 审批」，审批台上的批准就走晋级通道——那一格没有别的出口；否则照旧走
+    /// 本地构建与切换。
+    pub fn with_promoter(mut self, promoter: Arc<crate::AutoPromoter>) -> Self {
+        self.promoter = Some(promoter);
         self
     }
 
@@ -673,6 +687,48 @@ impl EvolutionAdmin for EvolutionAdminService {
         info!(change_id = %change_id, "Operator approved change; proceeding to deploy");
         self.audit(change_id, "change.approve", serde_json::json!({}))
             .await;
+
+        // 一条变更未必是等着本地部署，也可能是卡在晋级台账「等人工审批」那一格：
+        // 晋级器判它要人批才发，而这一格唯一的写者就是晋级器自己、唯一把它推
+        // 出去的动作就是人工批准。批准按钮要是只走本地构建与切换，那一格就没
+        // 有出口，而停摆判据读的正是它的出口（本周 promoted > 0）。
+        if let Some(ref promoter) = self.promoter {
+            match promoter.awaiting_approval(change_id).await {
+                Ok(Some(record_id)) => {
+                    info!(
+                        change_id = %change_id,
+                        record_id = %record_id,
+                        "Operator approval matches a promotion awaiting human approval; promoting"
+                    );
+                    let reference = promoter.promote_approved(&change).await?;
+                    if let Some(ref evo) = self.engine.evolution {
+                        evo.update_status(change_id, crate::types::EvolutionStatus::Active)
+                            .await;
+                    }
+                    self.record_change_applied().await;
+                    self.record_event(false).await;
+                    self.audit(
+                        change_id,
+                        "change.promote",
+                        serde_json::json!({ "reference": reference }),
+                    )
+                    .await;
+                    return Ok(EvolutionDeployResponse {
+                        change_id: change_id.to_string(),
+                        commit_hash: reference,
+                        staged_binary_path: String::new(),
+                        switched: true,
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => warn!(
+                    change_id = %change_id,
+                    error = %e,
+                    "could not read the promotion ledger; falling back to the local deploy path"
+                ),
+            }
+        }
+
         self.deploy_inner(change_id).await
     }
 
@@ -773,6 +829,7 @@ impl EvolutionAdmin for EvolutionAdminService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cog_core::PromotionLedger;
 
     struct PlaceholderLlm;
 
@@ -1071,5 +1128,116 @@ mod tests {
 
         let err = admin.approve_change("p1").await.unwrap_err();
         assert!(err.to_string().contains("not awaiting review"), "got {err}");
+    }
+
+    /// 记下发布过哪些变更的假推送端。
+    #[derive(Default)]
+    struct RecordingChannel {
+        published: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::auto_promoter::PromotionChannel for RecordingChannel {
+        async fn publish_config(&self, change: &crate::types::EvolutionResult) -> SFResult<String> {
+            self.published
+                .lock()
+                .unwrap()
+                .push(change.artifact_id.clone());
+            Ok(format!("commit-{}", change.artifact_id))
+        }
+        async fn publish_rollout(
+            &self,
+            change: &crate::types::EvolutionResult,
+        ) -> SFResult<String> {
+            self.publish_config(change).await
+        }
+    }
+
+    /// 批准一条被判成「需人工审批」的变更，落点必须是晋级台账那一行。
+    ///
+    /// 那一格只有晋级器一个写者，而把它推出去的动作只有人工批准——批准按钮
+    /// 要是照旧走本地构建与切换，这一格就永远停在等审批，停摆判据读的正是它
+    /// 的出口（本周 promoted > 0），于是那支 critical 告警按构造清不掉。
+    #[tokio::test]
+    async fn approving_a_change_that_awaits_approval_promotes_it_instead_of_deploying() {
+        let registry = Arc::new(tokio::sync::RwLock::new(cog_core::SkillRegistry::new()));
+        let llm: Arc<dyn cog_core::LlmClient> = Arc::new(PlaceholderLlm);
+        let evo = Arc::new(crate::EvolutionEngine::new(llm, registry.clone(), None));
+        let mut reflection = crate::ReflectionEngine::new_in_memory(registry.clone());
+        reflection.evolution = Some(evo.clone());
+        let reflection = Arc::new(reflection);
+
+        // 核心路径：分级判它必须人工审批。
+        let diff = "diff --git a/crates/cog-storage/src/postgres/state_backend.rs b/crates/cog-storage/src/postgres/state_backend.rs\n--- a/crates/cog-storage/src/postgres/state_backend.rs\n+++ b/crates/cog-storage/src/postgres/state_backend.rs\n@@ -1 +1 @@\n-a\n+b\n";
+        let change = crate::types::EvolutionResult {
+            kind: crate::types::EvolutionKind::CodeChange,
+            artifact_id: "awaits".into(),
+            description: "test".into(),
+            content: diff.into(),
+            status: crate::types::EvolutionStatus::AwaitingReview,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+        };
+
+        let unique = uuid::Uuid::new_v4();
+        let change_dir = std::env::temp_dir().join(format!("cogneva-test-changes-{unique}"));
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        tokio::fs::write(change_dir.join("awaits.diff"), diff)
+            .await
+            .unwrap();
+        evo.register_result(change.clone()).await;
+
+        // 那一行由真实生产者写出来。手搭一行只能证明形状对，证明不了这条路
+        // 真的会在跑起来时落到那一格。
+        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let channel = Arc::new(RecordingChannel::default());
+        let promoter = Arc::new(crate::AutoPromoter::new(
+            crate::PromotionGateConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ledger.clone(),
+            Some(channel.clone()),
+            reflection.clone(),
+        ));
+        promoter.decide_and_promote(&change).await.unwrap();
+        let seeded = ledger.recent(10).await.unwrap();
+        assert_eq!(seeded.len(), 1);
+        assert_eq!(
+            seeded[0].status,
+            cog_core::PromotionStatus::AwaitingApproval
+        );
+
+        // 工作树指向临时目录：接线若断了，这条测试会走到本地构建那条路上，
+        // 那也必须落在临时目录里而不是真的仓库里。
+        let scratch = tempfile::tempdir().unwrap();
+        let pipeline = crate::ChangePipeline::new(scratch.path(), &change_dir, false);
+        let deployer = crate::EvolutionDeployer::new(
+            scratch.path(),
+            scratch.path().join("bin"),
+            scratch.path().join("backup"),
+        );
+        let admin =
+            crate::EvolutionAdminService::new(reflection.clone(), pipeline, deployer, None, None)
+                .with_promoter(promoter.clone());
+
+        let resp = admin.approve_change("awaits").await.unwrap();
+
+        assert_eq!(resp.commit_hash, "commit-awaits");
+        assert_eq!(
+            resp.staged_binary_path, "",
+            "走的是晋级通道，没有本地构建产物"
+        );
+        assert_eq!(channel.published.lock().unwrap().as_slice(), ["awaits"]);
+
+        let records = ledger.recent(10).await.unwrap();
+        assert_eq!(records.len(), 1, "批准更新那一行，不该再追加一行");
+        assert_eq!(records[0].id, seeded[0].id);
+        assert_eq!(records[0].status, cog_core::PromotionStatus::Promoted);
+        assert_eq!(
+            promoter.awaiting_approval("awaits").await.unwrap(),
+            None,
+            "批准之后那一格必须已经被推出去"
+        );
     }
 }

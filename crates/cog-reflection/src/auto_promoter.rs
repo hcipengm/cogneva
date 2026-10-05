@@ -30,6 +30,11 @@ use crate::promotion_gate::{classify, count_diff_lines, GateVerdict};
 use crate::types::{EvolutionResult, EvolutionStatus};
 use crate::ReflectionEngine;
 
+/// 幂等守卫与「等人工审批」查询看的窗口：两者必须看同一段历史，否则会出现
+/// 「判定说这条已有记录、审批台却说没有那一行」。台账是追加表，一周一行时
+/// 这个窗口按年计。
+const LEDGER_LOOKBACK: usize = 50;
+
 /// 待晋级提交的来源。沙盒变更提交在临时工作树里（detached HEAD，用完即弃），
 /// 推送端不能假设自己的检出就是待发布内容，必须显式拿到提交。
 #[derive(Debug, Clone)]
@@ -64,6 +69,16 @@ pub trait PromotionChannel: Send + Sync {
         change: &EvolutionResult,
     ) -> SFResult<String> {
         self.publish_rollout(change).await
+    }
+    /// 这条变更是否已经在这条通道的目标分支上，返回承载它的提交。
+    ///
+    /// 落地通道与晋级通道各自把变更送上主线，两边互不知情：一条变更完全可以
+    /// 已经由落地通道进了主线，而晋级台账那一行还在等人工审批。判据要从仓库
+    /// 自己问出来——台账两边的记录互相看不见。
+    ///
+    /// 缺省实现答「看不出」，据此按原样发布，所以不查的推送端与测试零改动。
+    async fn already_published(&self, _change: &EvolutionResult) -> Option<String> {
+        None
     }
 }
 
@@ -325,17 +340,46 @@ impl AutoPromoter {
         } else {
             "l1_rollout"
         };
-        let record_id = self
-            .record(
-                &change_id,
-                level,
-                PromotionStatus::Pending,
-                "人工审批通过",
-                // 人批的这条记录不带分级结论：它属于审批，不属于分级。
-                None,
-                change.eval_summary.as_deref(),
-            )
-            .await?;
+        // 人工审批走的是台账里**那一行**：批准的动作就是把「等人工」这一格推
+        // 出去，所以更新它而不是再追加一行。追加会让同一个 change 留下两行，
+        // 旧行永远停在 awaiting_approval，停摆报表于是把一条已经晋级的变更
+        // 永远算作待批。
+        let record_id = match self.awaiting_approval(&change_id).await? {
+            Some(id) => id,
+            None => {
+                self.record(
+                    &change_id,
+                    level,
+                    PromotionStatus::Pending,
+                    "人工审批通过",
+                    // 人批的这条记录不带分级结论：它属于审批，不属于分级。
+                    None,
+                    change.eval_summary.as_deref(),
+                )
+                .await?
+            }
+        };
+
+        // 落地通道与晋级通道各自把变更送上主线，两边互不知情：这条变更可能
+        // 已经进了主线，而这一行还在等审批。再发一次只会对集群里已经在跑的
+        // 那个版本开一场金丝雀——审批要的是把这一格推出去，不是重发。
+        if let Some(reference) = channel.already_published(change).await {
+            info!(
+                change_id = %change_id,
+                reference = %reference,
+                "Change is already on the mainline; recording the approval without republishing"
+            );
+            let outcome = format!("已在主线：{reference}（落地通道已合入，未重发）");
+            self.ledger
+                .update_status(&record_id, PromotionStatus::Promoted, &outcome)
+                .await?;
+            let _ = self
+                .engine
+                .record_change_outcome(&change_id, true, &format!("already on main: {reference}"))
+                .await;
+            return Ok(reference);
+        }
+
         let publish = match (level, source) {
             ("l0_config", Some(src)) => channel.publish_config_from(src, change).await,
             ("l0_config", None) => channel.publish_config(change).await,
@@ -402,7 +446,7 @@ impl AutoPromoter {
     }
 
     async fn always_recorded(&self, change_id: &str) -> SFResult<bool> {
-        let recent = self.ledger.recent(50).await?;
+        let recent = self.ledger.recent(LEDGER_LOOKBACK).await?;
         Ok(recent.iter().any(|r| {
             r.change_id == change_id
                 && r.cluster == self.cluster
@@ -413,6 +457,24 @@ impl AutoPromoter {
                         | PromotionStatus::AwaitingApproval
                 )
         }))
+    }
+
+    /// 这条变更正卡在「等人工审批」那一格时，返回那一行的 id。
+    ///
+    /// 审批台据此选门：有这一行，人工批准走的就是晋级通道——那是这一格唯一
+    /// 的出口；没有，就照旧走本地构建与切换。查询与幂等守卫看同一个窗口，
+    /// 否则会出现「晋级器说这条已有记录、审批台说没有那一行」这种谁都对不上的
+    /// 读数。
+    pub async fn awaiting_approval(&self, change_id: &str) -> SFResult<Option<String>> {
+        let recent = self.ledger.recent(LEDGER_LOOKBACK).await?;
+        Ok(recent
+            .into_iter()
+            .find(|r| {
+                r.change_id == change_id
+                    && r.cluster == self.cluster
+                    && matches!(r.status, PromotionStatus::AwaitingApproval)
+            })
+            .map(|r| r.id))
     }
 
     /// 追加台账记录，返回记录 id。
@@ -652,6 +714,141 @@ mod tests {
         let records = ledger.recent(10).await.unwrap();
         assert_eq!(records[0].status, PromotionStatus::AwaitingApproval);
         assert_eq!(records[0].level, "l2_approval");
+    }
+
+    /// 落地通道已经把这条变更合进主线，推送端要答得出承载它的提交。答不出来
+    /// 就退回缺省，照原样发布——这一格是缺省的反面。
+    struct LandedChannel {
+        published: Mutex<Vec<String>>,
+        landed: String,
+    }
+
+    #[async_trait]
+    impl PromotionChannel for LandedChannel {
+        async fn publish_config(&self, change: &EvolutionResult) -> SFResult<String> {
+            self.published
+                .lock()
+                .unwrap()
+                .push(change.artifact_id.clone());
+            Ok("should-not-have-published".into())
+        }
+        async fn publish_rollout(&self, change: &EvolutionResult) -> SFResult<String> {
+            self.publish_config(change).await
+        }
+        async fn already_published(&self, _change: &EvolutionResult) -> Option<String> {
+            Some(self.landed.clone())
+        }
+    }
+
+    /// 人工批准一条「等人工审批」的变更，要把**那一行**推出去，而不是再追加
+    /// 一行：追加会让旧行永远停在 awaiting_approval，停摆报表于是把一条已经
+    /// 晋级的变更永远算作待批。
+    #[tokio::test]
+    async fn approving_a_change_awaiting_approval_moves_that_row_out_of_awaiting() {
+        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let channel = Arc::new(FakeChannel {
+            published: Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let policy = crate::PromotionGateConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let p = promoter(policy, ledger.clone(), Some(channel.clone()));
+        let c = change(
+            "approve-me",
+            "crates/cog-storage/src/postgres/state_backend.rs",
+        );
+        p.decide_and_promote(&c).await.unwrap();
+
+        let before = ledger.recent(10).await.unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].status, PromotionStatus::AwaitingApproval);
+        assert_eq!(
+            p.awaiting_approval("approve-me").await.unwrap().as_deref(),
+            Some(before[0].id.as_str()),
+            "审批台要先认得出这条变更卡在等人工审批，才谈得上选门"
+        );
+
+        p.promote_approved(&c).await.unwrap();
+
+        let after = ledger.recent(10).await.unwrap();
+        assert_eq!(after.len(), 1, "批准更新那一行，不该再追加一行");
+        assert_eq!(after[0].id, before[0].id);
+        assert_eq!(after[0].status, PromotionStatus::Promoted);
+        assert!(
+            p.awaiting_approval("approve-me").await.unwrap().is_none(),
+            "批准之后那一格必须没有出口之外的东西留下"
+        );
+        assert_eq!(channel.published.lock().unwrap().len(), 1);
+    }
+
+    /// 落地通道已经把变更合进主线，而台账那一行还在等审批：批准要能把它推
+    /// 出去，但不能对集群里已经在跑的那个版本再开一场金丝雀。
+    #[tokio::test]
+    async fn approving_a_change_already_on_the_mainline_does_not_republish() {
+        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let channel = Arc::new(LandedChannel {
+            published: Mutex::new(Vec::new()),
+            landed: "1fcf76a".into(),
+        });
+        let policy = crate::PromotionGateConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let p = promoter(policy, ledger.clone(), Some(channel.clone()));
+        let c = change(
+            "already-landed",
+            "crates/cog-storage/src/postgres/state_backend.rs",
+        );
+        p.decide_and_promote(&c).await.unwrap();
+        assert_eq!(
+            ledger.recent(10).await.unwrap()[0].status,
+            PromotionStatus::AwaitingApproval
+        );
+
+        let reference = p.promote_approved(&c).await.unwrap();
+
+        assert_eq!(reference, "1fcf76a");
+        assert!(
+            channel.published.lock().unwrap().is_empty(),
+            "已经在主线上就不该再发一次"
+        );
+        let records = ledger.recent(10).await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, PromotionStatus::Promoted);
+        assert!(
+            records[0].outcome.contains("已在主线"),
+            "「没重发」这件事要落在证据里，否则事后读不出它为什么没发布：{}",
+            records[0].outcome
+        );
+    }
+
+    /// 台账里没有这一行时，人工审批照旧落一条新记录并发布——接线不能把原有的
+    /// 「批一条还没进过晋级器的变更」堵死。
+    #[tokio::test]
+    async fn approving_a_change_with_no_ledger_row_appends_a_record() {
+        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let channel = Arc::new(FakeChannel {
+            published: Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let policy = crate::PromotionGateConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let p = promoter(policy, ledger.clone(), Some(channel.clone()));
+
+        let reference = p
+            .promote_approved(&change("fresh", "crates/cog-agent/src/tools.rs"))
+            .await
+            .unwrap();
+
+        assert_eq!(reference, "commit-fresh");
+        let records = ledger.recent(10).await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, PromotionStatus::Promoted);
+        assert_eq!(records[0].decision_reason, "人工审批通过");
     }
 
     #[tokio::test]
