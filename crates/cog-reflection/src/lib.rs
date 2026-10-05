@@ -111,6 +111,8 @@ pub use evolution::EvolutionEngine;
 pub use evolution_admin::EvolutionAdminService;
 pub use evolution_deployer::{BuildArtifact, EvolutionDeployer};
 pub use extractor::SkillExtractor;
+/// Deterministic keyword-rule classifier, re-exported so the change executor
+/// can classify environment failures without a second implementation.
 pub use fault_classifier::RuleBasedFaultClassifier;
 pub use firecracker::{FirecrackerSandbox, MicroVm, MicroVmOutcome};
 pub use flywheel::{JsonlFileSink, LearningSink, WarehouseRecorder};

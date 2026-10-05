@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use cog_core::{EvolutionIntent, SFError, SFResult};
+use cog_core::{EvolutionIntent, FaultClassifier, SFError, SFResult};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
@@ -501,6 +501,16 @@ pub async fn execute(request: &ChangeExecutionRequest) -> (i32, ChangeExecutionO
     {
         Ok(ws) => ws,
         Err(e) => {
+            // 建树失败先过故障规则：连工作树都拿不到时，这串原因是这次不可用
+            // 唯一跨进程边界的证据，分类让调用方区分网络、资源与配置类环境问题。
+            let fault = crate::RuleBasedFaultClassifier::new().classify(&e.to_string());
+            warn!(
+                change_id = %change_id,
+                fault_category = ?fault.category,
+                matched_rule = %fault.matched_rule,
+                confidence = fault.confidence,
+                "ephemeral workspace acquisition failed"
+            );
             outcome.unavailable = Some(Unavailable {
                 cause: UnavailableCause::Environment,
                 stage: UnavailableStage::Verification,
