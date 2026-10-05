@@ -106,11 +106,11 @@ const NOT_ENFORCED: &[(&str, &str)] = &[
     ),
     (
         "deploy-parity",
-        "check-deploy-parity.sh, render-deploy.sh --check and the git identity \
-         wiring check all read deploy/ and the chart. Reachable from the stage \
-         for the same cost as any other shell step, and nothing in the Cargo \
-         workspace covers it. A change that touches deploy/ passes verification \
-         and dies here.",
+        "check-deploy-parity.sh, render-deploy.sh --check, the git identity \
+         wiring check and the alert-subject check all read deploy/ and the \
+         chart. Reachable from the stage for the same cost as any other shell \
+         step, and nothing in the Cargo workspace covers it. A change that \
+         touches deploy/ passes verification and dies here.",
     ),
     (
         "bootstrap-cross-platform",

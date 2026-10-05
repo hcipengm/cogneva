@@ -348,6 +348,12 @@ jobs:
       # 这类缺陷在渲染期没有症状（清单合法、parity 也绿），只有这条判据盯得住。
       - name: Check git identity wiring
         run: bash deploy/scripts/check-git-identity-wiring.sh
+      # 告警去重身份＝规则名＋返回序列的标签：表达式没把 pod/container 聚合掉的规则，
+      # 身份会随报信的 Pod 重建而换新，同一个持续中的状况每次滚动都以全新告警再报一次。
+      # 判据读的是表达式结构而不是求值结果（条件此刻不成立时返回零条序列，
+      # 「没有序列」与「没有这个标签」在读数上分不开）。
+      - name: Check alert rules name their subject, not their reporter
+        run: bash deploy/scripts/check-alert-rule-subjects.sh
 
   bootstrap-cross-platform:
     name: Bootstrap Cross-Platform Check
