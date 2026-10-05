@@ -102,6 +102,7 @@ metric_names! {
     CHANGE_FUNNEL => "cogneva_change_funnel",
     CHANGE_FATE_TOTAL => "cogneva_change_fate_total",
     LANDING_FAILURES_TOTAL => "cogneva_landing_failures_total",
+    LANDING_CI_FAILURE_INHERITED_TOTAL => "cogneva_landing_ci_failure_inherited_total",
     MIRROR_PUSH_FAILURES_TOTAL => "cogneva_mirror_push_failures_total",
     REDRIVE_REFUSALS_TOTAL => "cogneva_redrive_refusals_total",
     REDRIVE_BUDGET_LOSSES_TOTAL => "cogneva_redrive_budget_losses_total",

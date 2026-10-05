@@ -170,6 +170,22 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          back every round until the owner decides",
     ),
     (
+        "cogneva_landing_ci_failure_inherited_total",
+        "Landed changes whose red CI was traced to the commit they were replayed \
+         onto rather than to the change itself, so the change was kept instead \
+         of reverted. A commit's CI measures the whole tree it stands on, so a \
+         check that was already failing on the base tip fails again on the \
+         change built over it; reverting that change would restore the very \
+         tree that failed. The change stays in the watch window, and if the same \
+         check goes red once the tree is repaired it is no longer a subset of \
+         what failed underneath and is charged to the change as before. This is \
+         not a fault reading on its own -- each count is a revert that would not \
+         have worked -- but it running while the base branch stays red is how \
+         the branch's own redness is paid for in generation rounds, and only a \
+         bound on how long landings may keep landing onto a red branch would \
+         turn it into one",
+    ),
+    (
         "cogneva_redrive_refusals_total",
         "Re-drives that were not submitted, by reason: no_evidence (the failure \
          arrived without a log, and a fix task built on its absence is a guess \

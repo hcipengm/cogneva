@@ -288,6 +288,7 @@ mod tests {
             failure_recorded: false,
             redriven: false,
             unlanded_reported: false,
+            inherited_ci_reported: false,
             retired_reason: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),

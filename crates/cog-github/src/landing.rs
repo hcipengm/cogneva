@@ -49,6 +49,17 @@ const CHANGE_ID_TRAILER: &str = "Change-Id";
 /// once per attempt.
 pub use cog_core::metric_names::LANDING_FAILURES_TOTAL as LANDING_FAILURES_METRIC;
 
+/// Red CI verdicts on a landed revision that were traced to the commit it was
+/// replayed onto rather than to the change, one increment per landing.
+///
+/// This is the counter for a landing that was **not** answered, and it exists
+/// because that non-action looks exactly like a landing whose CI never came
+/// back: the record stays, no revert appears, and the branch is red either way.
+/// What it separates is the branch being red *because of this change* from the
+/// branch having been red *before* it — the difference between a change that
+/// owes the fix and one that inherited the fault.
+pub use cog_core::metric_names::LANDING_CI_FAILURE_INHERITED_TOTAL as LANDING_CI_FAILURE_INHERITED_METRIC;
+
 /// Pushes to a mirror that were refused, one increment per refusal, labeled
 /// with the mirror.
 ///
@@ -309,6 +320,12 @@ pub struct LandingRecord {
     /// simply old does not re-announce itself every pass.
     #[serde(default)]
     pub unlanded_reported: bool,
+    /// Whether this landing's red CI has already been traced to the commit it
+    /// was replayed onto. A latch for the same reason as `unlanded_reported`:
+    /// the record stays watched for as long as the window lasts, and the
+    /// reading counts landings, not passes over one.
+    #[serde(default)]
+    pub inherited_ci_reported: bool,
     /// Why verification settled this change as one that must not land. Set
     /// together with `Retired`, and the only record of a verdict that leaves
     /// no commit behind.
@@ -662,6 +679,25 @@ impl MainChannel {
         }
     }
 
+    /// Count one red landing whose failing checks were already failing on the
+    /// commit it was replayed onto.
+    ///
+    /// No labels: the interesting part is that it happened at all and how
+    /// often, and the checks that were passed through are named in the warn the
+    /// caller writes next to this. Logged and dropped on failure, like the
+    /// counters around it.
+    async fn note_inherited_ci_failure(&self) {
+        let Some(metrics) = self.metrics_handle() else {
+            return;
+        };
+        if let Err(e) = metrics
+            .record_counter(LANDING_CI_FAILURE_INHERITED_METRIC, 1.0, HashMap::new())
+            .await
+        {
+            warn!("cannot record an inherited CI failure: {e}");
+        }
+    }
+
     /// Count one re-drive that was not submitted, under the reason it was not.
     ///
     /// A refused re-drive is generation being switched off for a cause, and
@@ -726,6 +762,7 @@ impl MainChannel {
             failure_recorded: false,
             redriven: false,
             unlanded_reported: false,
+            inherited_ci_reported: false,
             retired_reason: None,
             created_at: created,
             updated_at: now,
@@ -1181,6 +1218,72 @@ impl MainChannel {
 
     /// Revert a landed commit so the base branch returns to green, and return
     /// the revert commit.
+    /// The commit a landed revision was replayed onto, read from the local
+    /// repository.
+    ///
+    /// The record stores the base *branch*, which moves, so it cannot say which
+    /// tree this revision was built on. The parent of the landing commit is
+    /// exactly that tree — the tip as it stood when the landing was made — and
+    /// it is in the local object store because the landing commit was created
+    /// there. A repository that no longer holds the object answers `None`,
+    /// which the caller reads as "cannot attribute" rather than as an
+    /// exoneration.
+    async fn landed_parent_rev(&self, landed_rev: &str) -> Option<String> {
+        if landed_rev.is_empty() {
+            return None;
+        }
+        let rev = run_git(&self.workdir, &["rev-parse", &format!("{landed_rev}^")])
+            .await
+            .ok()?;
+        let rev = rev.trim().to_string();
+        (!rev.is_empty()).then_some(rev)
+    }
+
+    /// Whether every check that failed on this landing had already failed on
+    /// the commit it was replayed onto.
+    ///
+    /// A revision's CI is about the whole tree, and a landed revision is the
+    /// base tip with one change on top of it — so a check the tip was already
+    /// failing fails on the landing too. Answering a landing for those is what
+    /// lets one broken tip convict every change built on it, in landing order,
+    /// including the change that would have repaired it. It is the rule the
+    /// workspace gate already applies to tests, at the one place a conviction
+    /// still costs a landed commit.
+    ///
+    /// `false` whenever either side cannot be named: an unreadable attribution
+    /// is not an exoneration, so a change with no baseline keeps answering for
+    /// what it inherited. That is what the caller did before this existed, and
+    /// it stays the fallback.
+    ///
+    /// Two reds on the same check name is not a claim that the change broke
+    /// nothing inside it — a change can add a failure to a check that was
+    /// already failing. The record keeps watching for exactly that case: once
+    /// the tip is repaired, the same check failing again is a failure this
+    /// change owns, and the next pass answers for it.
+    async fn ci_failure_is_inherited(&self, record: &LandingRecord) -> bool {
+        let Ok(Some(failed_here)) = self
+            .provider
+            .ci_failed_checks_for_sha(&record.landed_rev)
+            .await
+        else {
+            return false;
+        };
+        if failed_here.is_empty() {
+            // Nothing named failed, so there is nothing to attribute: the red
+            // verdict came from a face that cannot name its checks.
+            return false;
+        }
+        let Some(parent) = self.landed_parent_rev(&record.landed_rev).await else {
+            return false;
+        };
+        let Ok(Some(failed_before)) = self.provider.ci_failed_checks_for_sha(&parent).await else {
+            return false;
+        };
+        failed_here
+            .iter()
+            .all(|check| failed_before.contains(check))
+    }
+
     async fn revert(&self, record: &LandingRecord) -> Result<String> {
         let _guard = self.gate.lock().await;
         let wt = self.fresh_worktree(&record.base).await?;
@@ -1335,6 +1438,7 @@ impl cog_core::ChangeLanding for MainChannel {
             failure_recorded: false,
             redriven: false,
             unlanded_reported: false,
+            inherited_ci_reported: false,
             retired_reason: None,
             created_at: created,
             updated_at: now,
@@ -1476,6 +1580,39 @@ pub async fn watch_landed(
                 remove_record(&record.change.change_id).await;
             }
             Some(false) => {
+                // Whose failure is this, before anything answers for it. The
+                // revert below puts the branch back to the tree this revision
+                // was replayed onto, so on a failure the tip already had it
+                // restores a tree that fails the same checks: the revert costs
+                // the change and returns nothing. Recording the outcome and
+                // re-driving generation from it cost more than nothing — both
+                // point the next round at a change that did not do this.
+                if channel.ci_failure_is_inherited(&record).await {
+                    if !record.inherited_ci_reported {
+                        tracing::warn!(
+                            change_id = %record.change.change_id,
+                            rev = %record.landed_rev,
+                            "landed change is red only on checks that were already failing on the \
+                             commit it was replayed onto; keeping the change and watching, since \
+                             reverting it would restore the tree that fails"
+                        );
+                        record.inherited_ci_reported = true;
+                        // `updated_at` is left alone: it is the clock the watch
+                        // window is measured from, and this is not a change to
+                        // what is being watched.
+                        if let Err(e) = save_record(&record).await {
+                            tracing::warn!(
+                                change_id = %record.change.change_id,
+                                error = %e,
+                                "could not latch the inherited-failure report; it will repeat \
+                                 next pass"
+                            );
+                        }
+                        channel.note_inherited_ci_failure().await;
+                    }
+                    continue;
+                }
+
                 // A fetch that failed is not an empty log. Collapsing the two
                 // made a broken log-fetch path indistinguishable from a
                 // failure with nothing to say, and the re-drive was then
@@ -3098,6 +3235,7 @@ mod tests {
             failure_recorded: false,
             redriven: false,
             unlanded_reported: false,
+            inherited_ci_reported: false,
             retired_reason: None,
             created_at: now,
             updated_at: now,
@@ -3158,6 +3296,7 @@ mod tests {
             failure_recorded: false,
             redriven: false,
             unlanded_reported: false,
+            inherited_ci_reported: false,
             retired_reason: Some("patch does not apply".into()),
             created_at: now - chrono::Duration::seconds(7200),
             updated_at: now - chrono::Duration::seconds(7200),
@@ -3200,6 +3339,7 @@ mod tests {
                 failure_recorded: false,
                 redriven: false,
                 unlanded_reported: false,
+                inherited_ci_reported: false,
                 retired_reason: None,
                 created_at: now - chrono::Duration::seconds(age_secs),
                 updated_at: now - chrono::Duration::seconds(age_secs),
@@ -3275,6 +3415,7 @@ mod tests {
             failure_recorded: false,
             redriven: false,
             unlanded_reported: false,
+            inherited_ci_reported: false,
             retired_reason: None,
             created_at: now,
             updated_at: now,
@@ -3345,6 +3486,268 @@ mod tests {
         assert!(
             load_record("chg-red").await.is_none(),
             "an empty log was fetched, so the landing is settled and the record retires"
+        );
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
+    /// A scratch repository with two empty commits: the second is a landing,
+    /// the first is the tree it was replayed onto. A landing's CI measures its
+    /// whole tree, so the commit underneath it has to exist for there to be
+    /// anything to attribute a failure to.
+    async fn repo_with_parent() -> (tempfile::TempDir, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        run_git(dir.path(), &["init", "-q"]).await.unwrap();
+        for message in ["tip", "landed"] {
+            run_git(
+                dir.path(),
+                &[
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    message,
+                ],
+            )
+            .await
+            .unwrap();
+        }
+        let landed = run_git(dir.path(), &["rev-parse", "HEAD"])
+            .await
+            .unwrap()
+            .trim()
+            .to_string();
+        let base = run_git(dir.path(), &["rev-parse", "HEAD^"])
+            .await
+            .unwrap()
+            .trim()
+            .to_string();
+        (dir, base, landed)
+    }
+
+    /// A provider that names the failing checks on a commit. The map is behind
+    /// a lock so a test can repair the tip between two passes — which is what
+    /// the watch loop's own answer to an inherited failure depends on.
+    struct NamedChecks {
+        failed: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
+    }
+
+    impl NamedChecks {
+        fn new(failed: impl IntoIterator<Item = (String, Vec<String>)>) -> Self {
+            Self {
+                failed: std::sync::Mutex::new(failed.into_iter().collect()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CodePlatformProvider for NamedChecks {
+        async fn list_open_issues(&self) -> Result<Vec<crate::provider::PlatformIssue>> {
+            Ok(Vec::new())
+        }
+        async fn create_pull_request(
+            &self,
+            _req: crate::provider::CreatePullRequest,
+        ) -> Result<crate::provider::PlatformPullRequest> {
+            Err(CogGitHubError::Provider("unused".into()))
+        }
+        async fn comment_on_issue(&self, _n: u64, _body: String) -> Result<()> {
+            Ok(())
+        }
+        async fn merge_pull_request(&self, _n: u64, _sha: String) -> Result<()> {
+            Ok(())
+        }
+        async fn get_pull_request(&self, _n: u64) -> Result<crate::provider::PullRequestDetail> {
+            Err(CogGitHubError::Provider("unused".into()))
+        }
+        async fn ci_verdict_for_sha(&self, _sha: &str) -> Result<Option<bool>> {
+            Ok(Some(false))
+        }
+        async fn ci_failure_log_for_sha(&self, _sha: &str) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn ci_failed_checks_for_sha(&self, sha: &str) -> Result<Option<Vec<String>>> {
+            Ok(self.failed.lock().unwrap().get(sha).cloned())
+        }
+    }
+
+    /// A channel watching `workdir`, with its own metrics backend so a test can
+    /// read back what the pass counted.
+    fn watching_at(
+        workdir: &Path,
+        provider: Arc<dyn CodePlatformProvider>,
+    ) -> (MainChannel, Arc<cog_storage::MemoryMetricsBackend>) {
+        let chan = MainChannel::new(
+            workdir,
+            GitHubIntegrationConfig {
+                repo: "o/r".into(),
+                // Neither the revert nor the re-drive is what is under test
+                // here, and both reach the network. A settled record is the
+                // signal for "this landing was answered for", which is how the
+                // tests around this one read a conviction too.
+                landing_policy: crate::config::LandingPolicy {
+                    revert_on_ci_failure: false,
+                    redrive_on_ci_failure: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            provider,
+            ContributionController::new_shared(),
+        );
+        let metrics = Arc::new(cog_storage::MemoryMetricsBackend::new());
+        chan.attach_metrics(metrics.clone());
+        (chan, metrics)
+    }
+
+    /// A landed record whose CI came back red on `landed_rev`.
+    async fn save_landing_of(id: &str, landed_rev: &str) {
+        let now = Utc::now();
+        save_record(&LandingRecord {
+            change: change(id, &diff_touching(&["crates/cog-github/src/lib.rs"])),
+            base: "main".into(),
+            landed_rev: landed_rev.into(),
+            state: LandingState::Landed,
+            failure_recorded: false,
+            redriven: false,
+            unlanded_reported: false,
+            inherited_ci_reported: false,
+            retired_reason: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn inherited_count(metrics: &cog_storage::MemoryMetricsBackend) -> f64 {
+        metrics
+            .query_counter_totals(LANDING_CI_FAILURE_INHERITED_METRIC.as_str())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.value)
+            .sum()
+    }
+
+    /// 一笔落在已经红的树上的变更，不该替那棵树挨这一笔。
+    ///
+    /// 撤回会把分支退回它落地时那棵树，而那棵树过的就是同一个检查——撤回花掉
+    /// 的是这条变更，换回来的是零。所以这条路既不撤、也不记失败、也不回投，只把
+    /// 这件事记成一次读数并继续看着；记录留着，是因为树被修好之后同一个检查再红，
+    /// 那就是这条变更自己的账了。
+    #[tokio::test]
+    async fn a_failure_the_tree_already_had_is_not_charged_to_the_change() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", dir.path());
+
+        let (repo, base, landed) = repo_with_parent().await;
+        let provider = Arc::new(NamedChecks::new([
+            (landed.clone(), vec!["Format".to_string()]),
+            (base.clone(), vec!["Format".to_string()]),
+        ]));
+        let (chan, metrics) = watching_at(repo.path(), provider);
+        save_landing_of("chg-inherited", &landed).await;
+
+        watch_landed(&chan, None, None).await;
+
+        let rec = load_record("chg-inherited")
+            .await
+            .expect("an inherited failure is not the change's, so it is not settled");
+        assert!(rec.inherited_ci_reported);
+        assert_eq!(inherited_count(&metrics).await, 1.0);
+
+        // The report is a latch: the record stays watched for as long as the
+        // window lasts, and the counter counts landings, not passes over one.
+        watch_landed(&chan, None, None).await;
+        assert!(load_record("chg-inherited").await.is_some());
+        assert_eq!(inherited_count(&metrics).await, 1.0);
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
+    /// 另一半：这条变更自己带来的失败照旧由它承担，撤回那条路一步不改。
+    #[tokio::test]
+    async fn a_failure_the_change_introduced_is_still_answered_for() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", dir.path());
+
+        let (repo, base, landed) = repo_with_parent().await;
+        let provider = Arc::new(NamedChecks::new([
+            (
+                landed.clone(),
+                vec!["Format".to_string(), "Test".to_string()],
+            ),
+            (base.clone(), vec!["Format".to_string()]),
+        ]));
+        let (chan, metrics) = watching_at(repo.path(), provider);
+        save_landing_of("chg-introduced", &landed).await;
+
+        watch_landed(&chan, None, None).await;
+
+        assert!(
+            load_record("chg-introduced").await.is_none(),
+            "a check the tip was passing and this revision fails is the change's to answer for"
+        );
+        assert_eq!(inherited_count(&metrics).await, 0.0);
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
+    /// 说不清是谁的失败，就是这条变更的失败——判不出不许读成洗清。
+    #[tokio::test]
+    async fn an_unnameable_failure_keeps_the_change_answering_for_it() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", dir.path());
+
+        let (repo, _base, landed) = repo_with_parent().await;
+        let (chan, metrics) = watching_at(repo.path(), Arc::new(NamedChecks::new([])));
+        save_landing_of("chg-unnameable", &landed).await;
+
+        watch_landed(&chan, None, None).await;
+
+        assert!(
+            load_record("chg-unnameable").await.is_none(),
+            "a platform that cannot name its checks leaves the change answering for the failure"
+        );
+        assert_eq!(inherited_count(&metrics).await, 0.0);
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
+    /// 留着记录的理由是可证伪的：树修好之后，同一个检查再红就该由这条变更负责。
+    #[tokio::test]
+    async fn a_repaired_tip_hands_the_same_check_back_to_the_change() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", dir.path());
+
+        let (repo, base, landed) = repo_with_parent().await;
+        let provider = Arc::new(NamedChecks::new([
+            (landed.clone(), vec!["Format".to_string()]),
+            (base.clone(), vec!["Format".to_string()]),
+        ]));
+        let (chan, _metrics) = watching_at(repo.path(), provider.clone());
+        save_landing_of("chg-then-fixed", &landed).await;
+
+        watch_landed(&chan, None, None).await;
+        assert!(load_record("chg-then-fixed").await.is_some());
+
+        // The tip is repaired and comes back green; this revision still fails
+        // the same check, so there is nothing left for it to have inherited.
+        provider.failed.lock().unwrap().remove(&base);
+        watch_landed(&chan, None, None).await;
+
+        assert!(
+            load_record("chg-then-fixed").await.is_none(),
+            "once the tip no longer fails the check, that check failing is this change's"
         );
 
         std::env::remove_var("COGNEVA_DATA_DIR");

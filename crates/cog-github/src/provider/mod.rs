@@ -132,6 +132,25 @@ pub trait CodePlatformProvider: Send + Sync {
         Ok(String::new())
     }
 
+    /// Names of the checks that did not pass on one commit — the jobs, not
+    /// their logs. Empty when every completed check passed.
+    ///
+    /// This is the finer reading behind [`Self::ci_verdict_for_sha`]'s
+    /// boolean, and it exists to attribute a red verdict: a commit's CI
+    /// measures the whole tree, so a check that was already failing on the
+    /// commit it was built on fails here too, and nothing in the boolean can
+    /// tell that apart from a check this commit broke.
+    ///
+    /// `None` means "no evidence" — the platform cannot name its checks, or
+    /// none has completed — and is never "nothing failed". A caller that
+    /// cannot name both sides keeps the commit answering for the failure it
+    /// inherited, which is the behaviour every caller had before this existed.
+    ///
+    /// Default: unsupported — providers return `None`.
+    async fn ci_failed_checks_for_sha(&self, _sha: &str) -> Result<Option<Vec<String>>> {
+        Ok(None)
+    }
+
     /// Fetch the current state of a pull request for merge decisions and
     /// outcome recording.
     async fn get_pull_request(&self, pr_number: u64) -> Result<PullRequestDetail>;

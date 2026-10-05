@@ -1194,6 +1194,10 @@ const UNREAD: &[(&str, Unread)] = &[
             reason: "the producer's own comment states the verdict's readings are the pool entry's key presence and llm_usage_verdict_measured, which llm_usage_verdict_unmeasured reads",
         },
     ),
+    (
+        "cogneva_landing_ci_failure_inherited_total",
+        Unread::Gap("landings whose red verdict was traced to the commit they were replayed onto rather than to the change, so the change was kept instead of reverted. The underlying condition -- the base branch's tip is red -- is what mainline_ci_verdict_failed reads, but this series does not carry that fact: it carries the non-action taken because of it, and that warn line names the change and the checks it passed through. A rule would have to declare how many spared landings are a fault, which is a bound on how long the branch may stay red while landings keep landing: a policy nobody stated, so the missing half is a bound rather than a reader"),
+    ),
 ];
 
 /// Entries an `Elsewhere` reader claim cannot be resolved against.
@@ -1215,7 +1219,7 @@ fn unresolved_readers(read: &BTreeSet<String>, name: &str, readers: &[&str]) -> 
 /// that nothing else states must be classified, and calling it a gap raises
 /// this number on purpose -- the point of the ratchet is that the increase is a
 /// decision someone made, not a drift nobody saw.
-const GAPS_AT_CENSUS: usize = 19;
+const GAPS_AT_CENSUS: usize = 20;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {

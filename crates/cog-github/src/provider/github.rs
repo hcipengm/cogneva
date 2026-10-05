@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use octocrab::Octocrab;
 
-use cog_core::contract::ci::fold_ci_signals;
+use cog_core::contract::ci::{ci_conclusion_passes, fold_ci_signals};
 
 use crate::config::GitHubAccount;
 
@@ -23,6 +23,19 @@ const MAX_FAILED_JOBS: usize = 5;
 const MAX_JOB_LOG_BYTES: usize = 16 * 1024;
 /// Max total bytes of logs returned per run.
 const MAX_TOTAL_LOG_BYTES: usize = 80 * 1024;
+
+/// What one commit's check runs say: whether the platform reported any at all,
+/// whether some are still running, and the completed ones **by name**.
+///
+/// The name is kept even though the verdict only needs the conclusion, because
+/// the conclusion alone cannot say which check failed, and "which check" is the
+/// whole of an attribution: two commits can both be red on a check that only
+/// one of them broke.
+struct CheckRunSignals {
+    saw_signal: bool,
+    pending: bool,
+    completed: Vec<(String, String)>,
+}
 
 /// GitHub code platform provider.
 #[derive(Clone, Debug)]
@@ -122,10 +135,15 @@ impl GitHubProvider {
         let mut pending = false;
         let mut saw_signal = false;
         for (owner, repo) in &targets {
-            let (saw, is_pending, mut found) = self.check_run_signals(owner, repo, &sha).await;
-            saw_signal |= saw;
-            pending |= is_pending;
-            conclusions.append(&mut found);
+            let signals = self.check_run_signals(owner, repo, &sha).await;
+            saw_signal |= signals.saw_signal;
+            pending |= signals.pending;
+            conclusions.extend(
+                signals
+                    .completed
+                    .into_iter()
+                    .map(|(_, conclusion)| conclusion),
+            );
         }
         if let Some(verdict) = fold_ci_signals(saw_signal, pending, &conclusions) {
             return Some(verdict);
@@ -139,19 +157,14 @@ impl GitHubProvider {
         None
     }
 
-    /// Conclusions of every check run reported for `sha` on one repository:
-    /// whether any signal exists at all, whether some run is still running,
-    /// and the completed conclusions. An API error yields no signal — never
-    /// evidence either way.
-    async fn check_run_signals(
-        &self,
-        owner: &str,
-        repo: &str,
-        sha: &str,
-    ) -> (bool, bool, Vec<String>) {
+    /// Every check run reported for `sha` on one repository: whether any
+    /// signal exists at all, whether some run is still running, and the
+    /// completed ones as `(name, conclusion)`. An API error yields no signal —
+    /// never evidence either way.
+    async fn check_run_signals(&self, owner: &str, repo: &str, sha: &str) -> CheckRunSignals {
         let mut saw_signal = false;
         let mut pending = false;
-        let mut conclusions = Vec::new();
+        let mut completed = Vec::new();
         let runs = self
             .client
             .checks(owner, repo)
@@ -162,12 +175,16 @@ impl GitHubProvider {
             for run in list.check_runs {
                 saw_signal = true;
                 match run.conclusion {
-                    Some(conclusion) => conclusions.push(conclusion),
+                    Some(conclusion) => completed.push((run.name, conclusion)),
                     None => pending = true,
                 }
             }
         }
-        (saw_signal, pending, conclusions)
+        CheckRunSignals {
+            saw_signal,
+            pending,
+            completed,
+        }
     }
 
     /// Commit-status fallback for repositories that report CI through statuses
@@ -485,14 +502,41 @@ impl CodePlatformProvider for GitHubProvider {
     }
 
     async fn ci_verdict_for_sha(&self, sha: &str) -> Result<Option<bool>> {
-        let (saw_signal, pending, conclusions) =
-            self.check_run_signals(&self.owner, &self.repo, sha).await;
-        if let Some(verdict) = fold_ci_signals(saw_signal, pending, &conclusions) {
+        let signals = self.check_run_signals(&self.owner, &self.repo, sha).await;
+        let conclusions: Vec<String> = signals
+            .completed
+            .iter()
+            .map(|(_, conclusion)| conclusion.clone())
+            .collect();
+        if let Some(verdict) = fold_ci_signals(signals.saw_signal, signals.pending, &conclusions) {
             return Ok(Some(verdict));
         }
         Ok(self
             .combined_status_verdict(&self.owner, &self.repo, sha)
             .await)
+    }
+
+    async fn ci_failed_checks_for_sha(&self, sha: &str) -> Result<Option<Vec<String>>> {
+        let signals = self.check_run_signals(&self.owner, &self.repo, sha).await;
+        if !signals.saw_signal {
+            // No check runs at all: this repository reports CI through commit
+            // statuses, or the query failed. Neither can name a check, and an
+            // unnamed failure is not an attribution.
+            return Ok(None);
+        }
+        // A still-running check does not withhold the failures that are
+        // already concluded, for the same reason the verdict does not: a
+        // conclusion once given is not withdrawn by whatever runs next. It
+        // does mean the set can grow, which is why the caller keeps watching
+        // rather than settling on this reading.
+        Ok(Some(
+            signals
+                .completed
+                .into_iter()
+                .filter(|(_, conclusion)| !ci_conclusion_passes(conclusion))
+                .map(|(name, _)| name)
+                .collect(),
+        ))
     }
 
     async fn ci_failure_log_for_sha(&self, sha: &str) -> Result<String> {
