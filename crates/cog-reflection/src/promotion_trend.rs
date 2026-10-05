@@ -123,13 +123,14 @@ pub fn aggregate(
             && tail.iter().all(|w| w.promoted == 0)
         {
             Some(format!(
-                "连续 {} 周零晋级（{}），这段时间没有任何变更上线。{}",
+                "连续 {} 周零晋级（{}），这段时间没有任何变更上线。{}{}",
                 DECLINE_RUN,
                 tail.iter()
                     .map(|w| w.week.as_str())
                     .collect::<Vec<_>>()
                     .join(" → "),
-                stall_reason(tail)
+                stall_reason(tail),
+                waiting_in_the_open_week(weeks.last())
             ))
         } else {
             None
@@ -171,6 +172,29 @@ fn stall_reason(tail: &[PromotionTrendWeek]) -> String {
         format!(
             "这几周生成了 {generated} 条却一条都没落地（待执行 {pending}、审批中 {awaiting}、失败 {failed}、回滚 {rolled_back}）——停的是落地通道，不是生成侧"
         )
+    }
+}
+
+/// 进行中这一周里排到审批台上的变更，单独起一句说。
+///
+/// 停摆判词只数**已完成**的周（见 `aggregate` 里的理由），代价是它看不见窗口
+/// 末尾那一周正在排队的东西。而在这一格里等着的那条变更，恰好是判词给的两种解释
+/// （没生成 / 台账自己没被写）都盖不住的一种状态：变更生成出来了、台账也写了、
+/// 没有任何东西坏掉，动的只是**读者自己的手**。判词把读者支去生成侧或台账写者，
+/// 他查完两处都是好的，告警却仍在响。
+///
+/// 这一格不属于上面那句话的窗口（它讲的是已完成的那几周），所以不并进去，而是
+/// 单独起一句、自己带星期号。两个窗口的计数拼在同一句话里，读起来就是一句没有
+/// 依据的话——判词里每个数都要能指回自己那个窗口。
+///
+/// 只说审批中这一档：待执行的那些在飞、轮不到读者动手，写进来只会让这句变钝。
+fn waiting_in_the_open_week(week: Option<&PromotionTrendWeek>) -> String {
+    match week {
+        Some(w) if w.awaiting_review > 0 => format!(
+            "另外，本周（{}）已有 {} 条变更停在审批台等待人工批准——停摆的另一头可能就在那里，既不是生成侧也不是台账写者。",
+            w.week, w.awaiting_review
+        ),
+        _ => String::new(),
     }
 }
 
@@ -552,6 +576,32 @@ mod tests {
             !stalled.contains("一条变更都没有生成出来"),
             "判词不能把「生成了但没落地」说成「没生成」：{stalled}"
         );
+    }
+
+    /// 停摆判词只看已完成的那几周，所以它看不见进行中这一周里已经排到审批台上的
+    /// 变更——而那正好是判词的两种解释都盖不住的一种状态，也是唯一一种**读者自己
+    /// 动手就能解掉**的状态。这一格必须单独说出来。
+    #[test]
+    fn a_change_waiting_for_approval_in_the_open_week_is_named_though_the_verdict_ignores_it() {
+        let records = vec![rec(0, PromotionStatus::AwaitingApproval)];
+        let stall = aggregate(&records, Utc::now())
+            .stall_alert
+            .expect("已完成的那几周零晋级，仍是停摆");
+        assert!(
+            stall.contains("审批台"),
+            "本周有变更在等人批准就必须点名，否则读者会去查生成侧与台账写者：{stall}"
+        );
+        assert!(stall.contains("1 条"), "{stall}");
+        assert!(
+            stall.contains("生成侧") && stall.contains("写者"),
+            "原有那两种解释不能因为多了一句就被顶掉：{stall}"
+        );
+
+        // 没有在等审批的变更时，这一句不能凭空长出来。
+        let quiet = aggregate(&[], Utc::now())
+            .stall_alert
+            .expect("一条记录都没有也是停摆");
+        assert!(!quiet.contains("审批台"), "{quiet}");
     }
 
     /// 待执行那一档必须真的进桶。少了它，「生成了但还在飞」的三周在判词里
