@@ -613,10 +613,16 @@ impl MainChannel {
                     return Ok(rev);
                 }
                 LandOutcome::AlreadyLanded(rev) => {
+                    // Deliberately rewritten even on this idempotent path: a
+                    // change half-landed by an earlier pass can reach this arm
+                    // with a record whose landed_rev is still empty, and the
+                    // found rev has to be persisted rather than left stale.
                     self.record_landed(change, &base, &rev).await?;
                     tracing::info!(
                         change_id = %change.change_id,
                         rev = %rev,
+                        base,
+                        attempt,
                         "change already on the base branch; not landing twice"
                     );
                     return Ok(rev);
