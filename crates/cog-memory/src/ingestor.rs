@@ -1175,17 +1175,24 @@ impl MemoryIngestor {
             match op().await {
                 Ok(v) => return Ok(v),
                 Err(e) => {
-                    last_error = Some(e);
                     if attempt < self.config.max_retries {
                         let delay_ms = self.config.retry_base_delay_ms * 2_u64.pow(attempt);
+                        // 退避行必须带上是哪一次失败的原因：重试会把同一条
+                        // 抽取重新发给上游，而重试的原因（本地解析/落库失败
+                        // 与上游环境失败）决定了这次重发是白花钱还是唯一出路
+                        // ——只报「第几次失败」等于把这条判据当场丢掉。
                         warn!(
-                            "{} attempt {}/{} failed, retrying in {}ms",
+                            "{} attempt {}/{} failed ({}), retrying in {}ms",
                             label,
                             attempt + 1,
                             self.config.max_retries + 1,
+                            e,
                             delay_ms
                         );
+                        last_error = Some(e);
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    } else {
+                        last_error = Some(e);
                     }
                 }
             }
@@ -1426,6 +1433,41 @@ mod tests {
         assert_eq!(parsed.timestamp_millis(), now.timestamp_millis());
         assert!(raw_id_timestamp("no-timestamp-here").is_none());
         assert!(raw_id_timestamp("agent-x-1234567890123").is_none());
+    }
+
+    /// 退避重试的语义：试满 `max_retries + 1` 次，返回**最后**一次失败的原因。
+    /// 这条钉住的是「把每次失败的原因写进日志」那处改动没有顺手改掉语义
+    /// （`last_error` 原来在分支外赋值，挪进分支后两个出口都要覆盖到）。
+    #[tokio::test]
+    async fn retry_with_backoff_spends_every_attempt_and_returns_the_last_error() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        let config = MemoryIngestorConfig {
+            retry_base_delay_ms: 0,
+            ..Default::default()
+        };
+        let max_retries = config.max_retries as usize;
+        let ingestor =
+            MemoryIngestor::new(backend, Arc::new(RuleBasedExtractor::new())).with_config(config);
+
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let err = ingestor
+            .retry_with_backoff("probe", || async {
+                let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                Err::<(), _>(cog_core::SFError::Agent(format!("failure #{n}")))
+            })
+            .await
+            .expect_err("every attempt failed, so the call must fail");
+
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            max_retries + 1,
+            "must spend exactly max_retries + 1 attempts"
+        );
+        assert!(
+            err.to_string()
+                .contains(&format!("failure #{}", max_retries + 1)),
+            "the returned error must be the last one, got {err}"
+        );
     }
 
     /// Regression for the ENAMETOOLONG archive failure: with the raw layer on
