@@ -1439,6 +1439,20 @@ enum UsageOutcome {
     /// fault rather than a metering one, and kept apart so a stream that dies
     /// mid-flight cannot be read as an upstream that answers without usage.
     Interrupted,
+    /// Our own caller stopped reading the body before it ended, and no usage
+    /// frame had arrived by then. Neither side can be blamed for the missing
+    /// numbers from this cell alone: the upstream may have been about to speak
+    /// and we stopped listening, so it is not [`Self::Absent`]; and our request
+    /// did ask, so it is not [`Self::NotAsked`] either.
+    ///
+    /// This cell exists because the reading it names used to be dropped
+    /// outright. A caller that stops at the last frame it needs — our own SSE
+    /// client stops at `[DONE]` — leaves the tail of the forwarded stream
+    /// unpolled, and a reading that was only written from that tail was never
+    /// written at all. A usage frame that had already arrived is still
+    /// [`Self::Read`] when this happens: the frame is the whole reading, and
+    /// only the end-of-body marker follows it.
+    Abandoned,
 }
 
 impl UsageOutcome {
@@ -1448,6 +1462,7 @@ impl UsageOutcome {
             UsageOutcome::Absent => "absent",
             UsageOutcome::NotAsked => "not_asked",
             UsageOutcome::Interrupted => "interrupted",
+            UsageOutcome::Abandoned => "abandoned",
         }
     }
 }
@@ -1495,11 +1510,12 @@ impl UsageReading {
 /// The cells `llm_usage_readings_total` can carry. Declared next to the
 /// producer rather than in the registry, so a new outcome cannot be recorded
 /// without appearing here.
-const USAGE_OUTCOMES: [UsageOutcome; 4] = [
+const USAGE_OUTCOMES: [UsageOutcome; 5] = [
     UsageOutcome::Read,
     UsageOutcome::Absent,
     UsageOutcome::NotAsked,
     UsageOutcome::Interrupted,
+    UsageOutcome::Abandoned,
 ];
 
 /// Publish the usage vocabulary at zero, for every configured upstream.
@@ -1823,6 +1839,21 @@ impl UsageScanner {
         }
     }
 
+    /// Which cell a scan belongs in when the stream was dropped before its tail
+    /// ran. The same question as [`Self::outcome`] with the end of the body
+    /// unavailable: the upstream cutting us off is still the upstream doing it,
+    /// and a usage frame that arrived is still the whole reading — but a
+    /// silence we stopped listening through blames neither side.
+    fn outcome_abandoned(&self) -> UsageOutcome {
+        if self.saw_error {
+            UsageOutcome::Interrupted
+        } else if self.saw_usage {
+            UsageOutcome::Read
+        } else {
+            UsageOutcome::Abandoned
+        }
+    }
+
     /// 把一帧里报出的用量并进读数。两件事分开记：**帧到过没有**（决定归哪一格）
     /// 与**计数取多少**（决定记多少 token）。上游报一个 0 表示"没用量"，那和
     /// "没开口"是两回事，所以这两件事不能共用一个判据。
@@ -1867,9 +1898,85 @@ impl UsageScanner {
     }
 }
 
+/// Owns one call's usage write, and makes it happen even when the stream it
+/// belongs to is dropped before the write runs.
+///
+/// The write needs the body to have been scanned, so it naturally lives in the
+/// tail of the forwarded stream. That tail only runs if the caller reads the
+/// body to its end, and a caller is free to stop at the last frame it needs:
+/// our own SSE client stops at `[DONE]`, which arrives *after* the usage frame.
+/// A write that exists only in the tail therefore disappears together with
+/// everything the scan had already collected — and because the outcome cell
+/// incremented from the same place, no existing reading showed the loss. Tying
+/// the write to a value the stream owns makes both paths the same write:
+/// normally from the tail, and on the way out from [`Drop`].
+struct UsageRecorder {
+    scanner: Arc<Mutex<UsageScanner>>,
+    state: AppState,
+    upstream: LlmUpstream,
+    actor: String,
+    start: std::time::Instant,
+    /// Set by whichever of the two paths takes the reading first. A plain flag
+    /// is enough because the two paths cannot run at once — both need to own
+    /// this value, and owning it is exactly what a path has to do before it can
+    /// run. The tail future owns it, and [`Drop`] runs only once that future is
+    /// being torn down.
+    claimed: bool,
+}
+
+impl UsageRecorder {
+    /// Take the scan's counts and the cell they belong in. `abandoned` picks
+    /// the vocabulary: only a dropped stream may score a silence as
+    /// [`UsageOutcome::Abandoned`], since only then is the end of the body
+    /// unknown.
+    ///
+    /// Claiming here rather than after the write is deliberate: a stream
+    /// dropped mid-write has still had its reading taken, and writing it twice
+    /// would be worse than writing it once.
+    fn reading(&mut self, abandoned: bool) -> UsageReading {
+        self.claimed = true;
+        let mut s = self.scanner.lock().unwrap();
+        s.finish();
+        UsageReading {
+            input: s.tokens_input,
+            output: s.tokens_output,
+            cached: s.tokens_cached,
+            outcome: if abandoned {
+                s.outcome_abandoned()
+            } else {
+                s.outcome()
+            },
+        }
+    }
+}
+
+impl Drop for UsageRecorder {
+    fn drop(&mut self) {
+        if self.claimed {
+            return;
+        }
+        let reading = self.reading(true);
+        let state = self.state.clone();
+        let upstream = self.upstream.clone();
+        let actor = std::mem::take(&mut self.actor);
+        let latency_ms = self.start.elapsed().as_millis() as u64;
+        // [`Drop`] cannot await and the caller is already on its way out, so
+        // the write rides a task of its own. Only a runtime that is itself
+        // shutting down makes this impossible, and that costs a reading rather
+        // than a request.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                record_llm_tokens(&state, &upstream, "ok", reading, latency_ms, &actor).await;
+            });
+        }
+    }
+}
+
 /// 把上游响应流包一层旁路扫描：字节原样转发，流结束后把扫到的 usage 记账。
-/// 调用方提前断连时收尾闭包不执行——那种情况下游也多半没收到尾帧，
-/// 没记到的是真实没产生的 output，符合事实。
+///
+/// 记账不绑在流的尾巴上，而是绑在流自己身上（[`UsageRecorder`]）：尾巴只在
+/// 调用方把 body 读到尾时才轮询得到，而调用方读完自己需要的最后一帧就走——
+/// 我们自己的 SSE 客户端在 `[DONE]` 处 break，而 `[DONE]` 排在用量帧**之后**。
 fn wrap_usage_scan(
     state: AppState,
     upstream: LlmUpstream,
@@ -1897,24 +2004,24 @@ fn wrap_usage_scan(
         }
         item
     });
+    let mut recorder = UsageRecorder {
+        scanner,
+        state,
+        upstream,
+        actor,
+        start,
+        claimed: false,
+    };
     let finalize = futures::stream::once(async move {
-        let reading = {
-            let mut s = scanner.lock().unwrap();
-            s.finish();
-            UsageReading {
-                input: s.tokens_input,
-                output: s.tokens_output,
-                cached: s.tokens_cached,
-                outcome: s.outcome(),
-            }
-        };
+        let reading = recorder.reading(false);
+        let latency_ms = recorder.start.elapsed().as_millis() as u64;
         record_llm_tokens(
-            &state,
-            &upstream,
+            &recorder.state,
+            &recorder.upstream,
             "ok",
             reading,
-            start.elapsed().as_millis() as u64,
-            &actor,
+            latency_ms,
+            &recorder.actor,
         )
         .await;
         Ok(axum::body::Bytes::new())
@@ -5354,6 +5461,117 @@ mod tests {
         assert_eq!(s.outcome(), UsageOutcome::Interrupted);
     }
 
+    /// The end of the body is what the tail of the stream knows and a dropped
+    /// stream does not, and only that fact may be scored as [`Abandoned`]: a
+    /// frame that already arrived is still the whole reading, and an upstream
+    /// that cut us off is still the upstream doing it.
+    #[test]
+    fn only_a_silence_we_stopped_listening_through_is_abandoned() {
+        let mut silent = UsageScanner {
+            asked: true,
+            ..UsageScanner::default()
+        };
+        silent.feed(b"data: {\"choices\":[]}\n\n");
+        assert_eq!(silent.outcome(), UsageOutcome::Absent);
+        assert_eq!(
+            silent.outcome_abandoned(),
+            UsageOutcome::Abandoned,
+            "asked and silent, but we stopped reading before the end"
+        );
+
+        let mut spoke = UsageScanner::default();
+        spoke.feed(b"data: {\"usage\":{\"prompt_tokens\":11}}\n\n");
+        assert_eq!(
+            spoke.outcome_abandoned(),
+            UsageOutcome::Read,
+            "用量帧到了就是到了，它后面只剩结束哨兵"
+        );
+
+        let cut = UsageScanner {
+            saw_error: true,
+            ..UsageScanner::default()
+        };
+        assert_eq!(cut.outcome_abandoned(), UsageOutcome::Interrupted);
+
+        let mut never_asked = UsageScanner::default();
+        never_asked.feed(b"data: {\"choices\":[]}\n\n");
+        assert_eq!(
+            never_asked.outcome_abandoned(),
+            UsageOutcome::Abandoned,
+            "没问过也不改判：我们没听到尾，就说不出上游是沉默"
+        );
+    }
+
+    /// A caller that stops reading must still be metered.
+    ///
+    /// The write used to live only in the tail of the forwarded stream, and the
+    /// tail is never polled once the caller has what it needs — our own SSE
+    /// client stops at `[DONE]`, which arrives *after* the usage frame. The
+    /// numbers were therefore in hand and thrown away, along with the outcome
+    /// cell that would have shown it.
+    #[tokio::test]
+    async fn a_stream_the_caller_stops_reading_still_lands_in_the_ledger() {
+        use futures::StreamExt;
+
+        let upstream = test_upstream();
+        let state = test_state(vec![upstream.clone()]);
+        let body = futures::stream::iter(vec![
+            Ok::<_, reqwest::Error>(axum::body::Bytes::from_static(
+                b"data: {\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5}}\n\n",
+            )),
+            Ok(axum::body::Bytes::from_static(b"data: [DONE]\n\n")),
+        ]);
+        let mut stream = Box::pin(wrap_usage_scan(
+            state.clone(),
+            upstream.clone(),
+            body,
+            std::time::Instant::now(),
+            "agent:planner".to_string(),
+            true,
+        ));
+        let first = stream.next().await.expect("a frame").expect("ok bytes");
+        assert!(String::from_utf8_lossy(&first).contains("usage"));
+        drop(stream);
+
+        // Drop 里的写入是 spawn 出去的，让它在断言前跑完。
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+
+        let totals = state
+            .pool_obs
+            .metrics
+            .query_counter_totals(cog_core::metric_names::LLM_USAGE_READINGS_TOTAL.as_str())
+            .await
+            .expect("counter reading");
+        let outcome_sum = |want: &str| -> f64 {
+            totals
+                .iter()
+                .filter(|s| s.labels.get("outcome").map(String::as_str) == Some(want))
+                .map(|s| s.value)
+                .sum()
+        };
+        assert_eq!(
+            outcome_sum("read"),
+            1.0,
+            "丢掉的读数没补上：帧在手上却被扔掉"
+        );
+        assert_eq!(outcome_sum("abandoned"), 0.0);
+
+        let tokens = state
+            .pool_obs
+            .metrics
+            .query_counter_totals(cog_core::metric_names::LLM_TOKENS_TOTAL.as_str())
+            .await
+            .expect("token reading");
+        let input: f64 = tokens
+            .iter()
+            .filter(|s| s.labels.get("kind").map(String::as_str) == Some("input"))
+            .map(|s| s.value)
+            .sum();
+        assert_eq!(input, 11.0, "数字本身也要落账");
+    }
+
     #[test]
     fn a_body_that_named_usage_lands_in_read() {
         let mut s = UsageScanner::default();
@@ -5400,6 +5618,7 @@ mod tests {
             UsageOutcome::Absent,
             UsageOutcome::NotAsked,
             UsageOutcome::Interrupted,
+            UsageOutcome::Abandoned,
         ]
         .iter()
         .map(|o| o.as_str())

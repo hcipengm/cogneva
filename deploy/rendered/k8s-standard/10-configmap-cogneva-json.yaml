@@ -1237,6 +1237,15 @@ data:
               "summary": "Upstream {upstream} was asked for token usage and answered without it -- {value} such call(s) in the last hour. This is the cell that says the token totals are blind: a call whose usage never arrived is recorded beside zeros, so every token counter for that upstream reads zero because the upstream said nothing, not because nothing was used, and a token budget or a cost reading built on those counters is wrong in the direction that looks healthy. It is split from the not_asked cell on purpose: absent is the upstream's silence, not_asked is our own request having gone out without stream_options and is the cell to read before blaming the provider. Read the two together before repairing -- a request-side omission shows up as not_asked, and only an upstream that was asked and stayed quiet climbs here."
             },
             {
+              "name": "llm_usage_ledger_incomplete",
+              "promql": "sum by (upstream) (increase(llm_calls_total{result=\"ok\"}[1h] offset 15m)) - sum by (upstream) (increase(llm_usage_readings_total[1h15m])) > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "The gateway got a successful response from {upstream} but never wrote a token reading for it -- {value} such call(s), counted over the hour that ended fifteen minutes ago. Every accepted response is supposed to produce exactly one reading, because the counts are taken from the response body itself; a call with no reading means the body was never scanned as far as the point where the counts are written. That is the failure that hid 43 percent of the ledger until now: the write lived only in the tail of the forwarded stream, a caller that stops at the last frame it needs never polls that tail, and the outcome cell was incremented from the same place, so nothing on the reading face could show the loss. The two windows are on purpose not the same -- the calls window ends fifteen minutes ago while the readings window reaches to now, so a call still streaming when its own window closed is not scored as a missing reading; a reading written late is impossible by construction, since the counts are already in hand when the write happens. Read the outcome cells beside this rule before repairing: abandoned climbing means callers are dropping response bodies before the usage frame arrives, which is our side, while absent climbing means the upstream itself answered without usage and this gap is a symptom rather than the cause."
+            },
+            {
               "name": "metrics_log_at_floor_capacity",
               "promql": "max without (pod, container, instance) (max_over_time(metrics_samples_over_capacity[30m])) > 0",
               "condition": {

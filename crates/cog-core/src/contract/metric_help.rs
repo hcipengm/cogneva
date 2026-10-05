@@ -83,9 +83,18 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          with no stream_options, so no usage frame was ever due and nothing was \
          ignored; the fix there is on our own request side, and it is the cell \
          to read before blaming an upstream. `read` is an upstream that spoke, \
-         including one that reported zero. `interrupted` is a response that \
+         including one that reported zero, and it counts a call whose caller \
+         stopped reading after the usage frame arrived just the same, because \
+         the frame is the whole reading. `interrupted` is a response that \
          never finished, kept apart so an upstream that dies mid-stream cannot \
-         be read as one that answers quietly",
+         be read as one that answers quietly. `abandoned` is the caller's own \
+         version of that: it stopped reading the body before the end and no \
+         usage frame had arrived by then, so the silence belongs to neither \
+         side -- it is not `absent`, because the upstream may have been about \
+         to speak, and it is not `not_asked`, because the request did ask. \
+         Read it beside `llm_calls_total{result=\"ok\"}`: an accepted call \
+         always lands in exactly one of these cells, so a growing gap between \
+         the two series is a reading that was never written at all",
     ),
     (
         "llm_upstream_client_errors_total",
