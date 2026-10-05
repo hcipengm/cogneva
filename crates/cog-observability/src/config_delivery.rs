@@ -351,4 +351,40 @@ mod tests {
             DocumentDelivery::Matches
         );
     }
+
+    /// The declaration has to declare the rules the deployed document
+    /// carries: the mismatch that fired was a declaration lagging its own
+    /// rule set, and a declaration without these names raises it again on
+    /// every start.
+    #[test]
+    fn the_declaration_declares_the_mainline_ci_verdict_rules() {
+        let declared: serde_json::Value =
+            serde_json::from_str(crate::config::DECLARED_CONFIG_JSON).unwrap();
+        let names: Vec<&str> = declared
+            .pointer(cog_core::config_sections::ALERT_RULES_POINTER)
+            .and_then(|rules| rules.as_array())
+            .expect("the declared document carries a rule list")
+            .iter()
+            .filter_map(|rule| rule.get("name").and_then(|n| n.as_str()))
+            .collect();
+        for rule in [
+            "mainline_ci_verdict_failed",
+            "mainline_ci_verdict_unreadable",
+        ] {
+            assert!(names.contains(&rule), "declared rules lack {rule}");
+        }
+    }
+
+    /// The observability section the declaration ships has to be one the
+    /// running code loads: a section whose shape the schema no longer accepts
+    /// reads as a permanent mismatch against the document every deployment
+    /// renders from the same source.
+    #[test]
+    fn the_declared_observability_section_loads() {
+        let declared: serde_json::Value =
+            serde_json::from_str(crate::config::DECLARED_CONFIG_JSON).unwrap();
+        let section = declared.get("observability").cloned().unwrap_or_default();
+        serde_json::from_value::<crate::config::ObservabilityExportersConfig>(section)
+            .expect("the declared observability section loads");
+    }
 }
