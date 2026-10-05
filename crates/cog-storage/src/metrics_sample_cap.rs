@@ -212,7 +212,22 @@ impl SampleLogCap {
         // period is inside the ask period (see the test that holds the two
         // together), but a pass does not have to be, and a term that ran out
         // mid-pass would hand the log to a second process sweeping it.
-        let role = cog_core::RoleHold::start(self.role.clone(), ROLE, beat.clone(), &shutdown);
+        //
+        // Only a deployment that means to prune contends for it. A claim is not
+        // free to the process that has no use for one: the holder renews on its
+        // own cadence, so a deployment that never prunes keeps the deployment
+        // that does out of the role for as long as it lives. Asking the budget
+        // first is what makes the ordering below true instead of intended.
+        let role = if self.budget_enabled() {
+            Some(cog_core::RoleHold::start(
+                self.role.clone(),
+                ROLE,
+                beat.clone(),
+                &shutdown,
+            ))
+        } else {
+            None
+        };
         let mut period = MIN_SWEEP_PERIOD;
         let mut previous: Option<PreviousPass> = None;
         loop {
@@ -226,9 +241,8 @@ impl SampleLogCap {
             // Two different questions decide the same pass, and they are asked
             // in this order on purpose: the budget says whether this deployment
             // prunes at all, and only a deployment that does asks who should be
-            // doing it. A budget of zero is a deployment that means to leave the
-            // log alone, so it has no role to contend for and its replicas must
-            // not start contending for one.
+            // doing it. A deployment with no role to ask is one whose budget
+            // already answered no.
             //
             // A process that may not prune still measures and reports. That is
             // not the same reading as the one the pruner publishes — no budget,
@@ -236,7 +250,10 @@ impl SampleLogCap {
             // cannot say whether the log is being held down, and the reading it
             // publishes must not claim it can. The role's own series are where
             // that distinction is legible.
-            let prunes = self.budget_enabled() && role.may_act().await;
+            let prunes = match role.as_ref() {
+                Some(hold) => hold.may_act().await,
+                None => false,
+            };
             let pass = if prunes {
                 self.sweep_once().await
             } else {
@@ -398,13 +415,19 @@ impl SampleLogCap {
                 budget as f64,
             )
             .await;
+            // The floor verdict belongs to the pass that could have pruned, and
+            // it is published under the same condition as the budget because it
+            // is the same claim: a pass with no budget did not sweep, has no
+            // floor to report, and a zero written from here would say "nothing
+            // is being held down" on behalf of a process that never looked.
+            // Two such writers already make the value whoever wrote last.
+            self.emit(
+                mb,
+                cog_core::metric_names::METRICS_SAMPLES_OVER_CAPACITY,
+                outcome.floor_held as u8 as f64,
+            )
+            .await;
         }
-        self.emit(
-            mb,
-            cog_core::metric_names::METRICS_SAMPLES_OVER_CAPACITY,
-            outcome.floor_held as u8 as f64,
-        )
-        .await;
 
         match self.table_bytes().await {
             Ok(bytes) => {

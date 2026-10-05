@@ -22,7 +22,10 @@ use std::time::{Duration, Instant};
 
 use sqlx::PgPool;
 
-use cog_core::loop_health::{Cadence, LoopHealth, LOOP_LABEL, LOOP_OWNER_HELD};
+use cog_core::loop_health::{
+    Cadence, LoopHealth, LOOP_LABEL, LOOP_OWNER_ACQUISITIONS_TOTAL, LOOP_OWNER_HELD,
+    LOOP_REGISTERED,
+};
 use cog_core::{Observable, OwnerLeaseBroker, ShutdownSignal};
 use cog_storage::metrics_sample_cap::{LOOP, LOOP_PERIOD, ROLE};
 use cog_storage::{PgOwnerLeaseBroker, SampleLogCap, LEASE_TABLE};
@@ -160,14 +163,20 @@ async fn wait_for_rows(pool: &PgPool, table: &str, want: i64, limit: Duration) -
 /// What the loop published about who holds its role, as its own reading rather
 /// than as an inference from what it did.
 async fn owner_held(health: &LoopHealth) -> Option<f64> {
+    loop_metric(health, LOOP_OWNER_HELD).await
+}
+
+/// One series this loop publishes about itself, or nothing when it publishes no
+/// such series at all. The two are different answers for the role readings: a
+/// loop that never contended for the role has no held and no acquisitions
+/// reading, and only the absence says so.
+async fn loop_metric(health: &LoopHealth, name: &str) -> Option<f64> {
     health
         .collect_metrics("")
         .await
         .unwrap()
         .into_iter()
-        .find(|m| {
-            m.name == LOOP_OWNER_HELD && m.labels.get(LOOP_LABEL).map(String::as_str) == Some(LOOP)
-        })
+        .find(|m| m.name == name && m.labels.get(LOOP_LABEL).map(String::as_str) == Some(LOOP))
         .map(|m| m.value)
 }
 
@@ -377,31 +386,86 @@ async fn the_floor_does_not_stop_a_sweep_the_budget_can_meet() {
     drop_probe(&pool, table).await;
 }
 
-/// The role gate, read at both ends: one loop over one table, in two runs.
-/// While another process holds the role the loop cycles and reports and keeps
-/// every row; once that holder's term has run out this process takes the role
-/// and the same loop brings the log back under its capacity.
+/// The role gate, read at both ends and at the switch that decides whether the
+/// loop contends for it at all.
 ///
-/// What joins the two runs is the loop's own reading of the role, so a loop
-/// that failed to prune for any other reason — a budget of zero, a query that
-/// errored — cannot pass this.
+/// One loop over one table, in three runs — one role is one row, so the whole
+/// story of who may hold it belongs in one test rather than in two that would
+/// have to take turns.
+///
+/// A deployment with a budget of zero must not take it even with a broker
+/// standing ready: the holder renews on the lease's own cadence, so a claim a
+/// process has no use for keeps the process that does prune out of the role for
+/// as long as the claimant lives. What such a loop publishes is nothing — a
+/// held reading or an acquisitions count would both be claims about a role it
+/// never asked for. While another process holds the role the loop cycles and
+/// reports and keeps every row; once that holder's term has run out this
+/// process takes the role and the same loop brings the log back under its
+/// capacity.
+///
+/// What joins the runs is the loop's own reading of the role, so a loop that
+/// failed to prune for any other reason — a query that errored — cannot pass
+/// this.
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
-async fn a_cap_that_does_not_hold_the_role_prunes_nothing() {
+async fn the_role_is_taken_only_by_the_deployments_that_prune() {
     let table = "metrics_sample_cap_probe_role";
     let pool = PgPool::connect(&database_url()).await.unwrap();
     fresh_probe(&pool, table).await;
     insert_aged(&pool, table, 20, "2 days").await;
 
-    let other = PgOwnerLeaseBroker::with_holder(pool.clone(), "probe-other")
-        .await
-        .unwrap();
-    let own = Arc::new(
+    let own: Arc<dyn OwnerLeaseBroker> = Arc::new(
         PgOwnerLeaseBroker::with_holder(pool.clone(), "probe-own")
             .await
             .unwrap(),
     );
     clear_role(&pool).await;
+
+    // A budget of zero. The role is free and this loop has a broker to take it
+    // with, which is what makes declining a decision rather than an inability.
+    // The ask that must not happen happens at start-up, before the first pass:
+    // the first ask is immediate and the next is an ask period away. So this is
+    // a bounded chance to be wrong about a process that has already had its
+    // chance, not a guess at how long a pass takes.
+    let idle = Arc::new(cap(pool.clone(), table, 0).with_role(Arc::clone(&own)));
+    let health = LoopHealth::new();
+    let beat = health.register(LOOP, Cadence::Periodic(LOOP_PERIOD));
+    let shutdown = ShutdownSignal::default();
+    let running = tokio::spawn({
+        let idle = Arc::clone(&idle);
+        let shutdown = shutdown.clone();
+        async move { idle.run(beat, shutdown).await }
+    });
+    let limit = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < limit {
+        assert_eq!(
+            owner_held(&health).await,
+            None,
+            "a deployment with no budget to prune against must not take the role"
+        );
+        assert_eq!(
+            loop_metric(&health, LOOP_OWNER_ACQUISITIONS_TOTAL).await,
+            None,
+            "a deployment that contends for no role must never have asked for one"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        loop_metric(&health, LOOP_REGISTERED).await,
+        Some(1.0),
+        "the absence above must be a decision about the role, not a loop that never ran"
+    );
+    shutdown.trigger();
+    running.await.unwrap();
+    assert_eq!(
+        count(&pool, table).await,
+        20,
+        "a zero budget must leave every row whether or not a role was available"
+    );
+
+    let other = PgOwnerLeaseBroker::with_holder(pool.clone(), "probe-other")
+        .await
+        .unwrap();
     assert!(
         other
             .lease(ROLE, Duration::from_secs(60))
@@ -411,7 +475,7 @@ async fn a_cap_that_does_not_hold_the_role_prunes_nothing() {
         "the fixture is another process holding the role"
     );
 
-    let cap = Arc::new(cap(pool.clone(), table, 5).with_role(own));
+    let pruner = Arc::new(cap(pool.clone(), table, 5).with_role(Arc::clone(&own)));
 
     // Someone else's role. The loop still cycles and says what it sees; what it
     // must not do is prune.
@@ -419,9 +483,9 @@ async fn a_cap_that_does_not_hold_the_role_prunes_nothing() {
     let beat = health.register(LOOP, Cadence::Periodic(LOOP_PERIOD));
     let shutdown = ShutdownSignal::default();
     let running = tokio::spawn({
-        let cap = Arc::clone(&cap);
+        let pruner = Arc::clone(&pruner);
         let shutdown = shutdown.clone();
-        async move { cap.run(beat, shutdown).await }
+        async move { pruner.run(beat, shutdown).await }
     });
     let seen = wait_for_held(&health, 0.0, Duration::from_secs(30)).await;
     assert_eq!(
@@ -444,9 +508,9 @@ async fn a_cap_that_does_not_hold_the_role_prunes_nothing() {
     let beat = health.register(LOOP, Cadence::Periodic(LOOP_PERIOD));
     let shutdown = ShutdownSignal::default();
     let running = tokio::spawn({
-        let cap = Arc::clone(&cap);
+        let pruner = Arc::clone(&pruner);
         let shutdown = shutdown.clone();
-        async move { cap.run(beat, shutdown).await }
+        async move { pruner.run(beat, shutdown).await }
     });
     let held = wait_for_rows(&pool, table, 5, Duration::from_secs(30)).await;
     assert_eq!(
