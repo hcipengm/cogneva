@@ -173,6 +173,12 @@ mod tests {
     use super::*;
     use cog_core::build_cache::OUTCOME_BUSY;
     use cog_core::fs_size;
+    use std::sync::Mutex;
+
+    /// Serializes the tests that mutate `SANDBOX_BUILD_CACHE_MAX_BYTES`: the
+    /// variable is process-global while the harness runs tests on parallel
+    /// threads.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn the_default_cap_is_enforced_without_deployment_config() {
@@ -186,8 +192,29 @@ mod tests {
 
     #[test]
     fn a_missing_env_var_falls_back_to_the_default_cap() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("SANDBOX_BUILD_CACHE_MAX_BYTES");
         assert_eq!(BuildCacheConfig::from_env().max_bytes, DEFAULT_MAX_BYTES);
+    }
+
+    #[test]
+    fn an_explicit_env_var_overrides_the_default_cap() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("SANDBOX_BUILD_CACHE_MAX_BYTES", "0");
+        assert_eq!(
+            BuildCacheConfig::from_env().max_bytes,
+            0,
+            "an explicit 0 still means measure-only"
+        );
+        std::env::set_var("SANDBOX_BUILD_CACHE_MAX_BYTES", "4096");
+        assert_eq!(BuildCacheConfig::from_env().max_bytes, 4096);
+        std::env::set_var("SANDBOX_BUILD_CACHE_MAX_BYTES", "not-a-number");
+        assert_eq!(
+            BuildCacheConfig::from_env().max_bytes,
+            DEFAULT_MAX_BYTES,
+            "an unparsable value is not a configured cap, so the default applies"
+        );
+        std::env::remove_var("SANDBOX_BUILD_CACHE_MAX_BYTES");
     }
 
     #[test]
