@@ -1047,14 +1047,6 @@ const UNREAD: &[(&str, Unread)] = &[
         Unread::Gap("the memory backend's failure counter; a failing backend reaches the user as a failed task and no reading names memory as the cause -- the repair is a threshold policy for what error rate is a fault"),
     ),
     (
-        "metrics_samples_rows",
-        Unread::Elsewhere("one operand of the capacity verdict that metrics_log_at_floor_capacity reads"),
-    ),
-    (
-        "metrics_samples_budget_rows",
-        Unread::Elsewhere("the other operand of that same verdict"),
-    ),
-    (
         "metrics_samples_bytes",
         Unread::Elsewhere("the help says it lags the row count and is never the pruning criterion; the capacity verdict is the reading with a criterion"),
     ),
