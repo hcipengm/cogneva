@@ -2,7 +2,7 @@
 //!
 //! The watcher runs on a timer and, most rounds, submits nothing. Silence is
 //! the ordinary state of a healthy system, and it is the state this family
-//! exists to keep readable -- because the watcher is silent for four different
+//! exists to keep readable -- because the watcher is silent for five different
 //! reasons that nothing else distinguishes:
 //!
 //! - nothing was wrong, so no signal was found at all;
@@ -16,10 +16,10 @@
 //!   again;
 //! - a signal was found and the submission never reached the orchestrator.
 //!
-//! Read from the task store alone, all four are the same absence. Reading them
+//! Read from the task store alone, all five are the same absence. Reading them
 //! as one number is what makes "the watcher has gone quiet" indistinguishable
-//! from "the system is fine", and it is the wrong conclusion in three of the
-//! four cases: a watcher whose every signal is refused as a duplicate, or
+//! from "the system is fine", and it is the wrong conclusion in four of the
+//! five cases: a watcher whose every signal is refused as a duplicate, or
 //! throttled by its own cooldown, is blind in exactly the way a stopped watcher
 //! is blind.
 //!

@@ -2,7 +2,7 @@
 //!
 //! Evolution inputs are not only external intents (issues/PRs); the system
 //! must also discover its own problems. This watcher polls orchestrator task
-//! state and turns three classes of runtime signals into internal evolution
+//! state and turns four classes of runtime signals into internal evolution
 //! intents submitted through the main flow (`evolution_mode=generate_change`):
 //!
 //! 1. **Failure recurrence**: self-evolution tasks failing with the same
