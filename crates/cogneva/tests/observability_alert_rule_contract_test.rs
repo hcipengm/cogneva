@@ -499,6 +499,19 @@ const PRODUCED: &[(&str, &str)] = &[
         "metrics_samples_over_capacity",
         "crates/cog-storage/src/metrics_sample_cap.rs",
     ),
+    // The two series that verdict is computed from: the log's row count and the
+    // budget it is held to. They were published and unread along with the
+    // verdict itself -- nothing compared the log against its own budget, which
+    // is why a sweep that stopped running was silent. The budget series is
+    // absent, not zero, for a deployment that declares no cap.
+    (
+        "metrics_samples_rows",
+        "crates/cog-storage/src/metrics_sample_cap.rs",
+    ),
+    (
+        "metrics_samples_budget_rows",
+        "crates/cog-storage/src/metrics_sample_cap.rs",
+    ),
     // The memory backlog past the re-drive window: raw sources the system will
     // not pick up again without a budgeted backfill. Its help names the action
     // it is waiting for, and it had no reader.
