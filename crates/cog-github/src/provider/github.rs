@@ -508,15 +508,21 @@ impl CodePlatformProvider for GitHubProvider {
             .await
             .map_err(|e| CogGitHubError::Provider(e.to_string()))?;
 
-        let Some(run) = runs
+        let runs: Vec<CiRunSummary> = runs
             .items
             .into_iter()
-            .find(|r| r.head_sha == sha && r.conclusion.as_deref() == Some("failure"))
-        else {
+            .map(|r| CiRunSummary {
+                run_id: r.id.into_inner(),
+                head_sha: r.head_sha,
+                conclusion: r.conclusion.unwrap_or_default(),
+            })
+            .collect();
+
+        let Some(run_id) = run_holding_the_failure(&runs, sha) else {
             return Ok(String::new());
         };
 
-        let logs = self.fetch_ci_failure_logs(run.id.into_inner()).await?;
+        let logs = self.fetch_ci_failure_logs(run_id).await?;
         Ok(logs
             .into_iter()
             .map(|l| format!("## {} (job {})\n{}", l.job_name, l.job_id, l.log_tail))
@@ -584,6 +590,33 @@ pub(crate) fn split_repo(repo: &str) -> Result<(String, String)> {
     Ok((parts[0].to_string(), parts[1].to_string()))
 }
 
+/// Which workflow run of `sha` holds the failed jobs whose logs are wanted.
+///
+/// The verdict that asks for these logs is read from *check runs*, while this
+/// reads *workflow runs*, and the two do not report at the same moment: a run's
+/// own conclusion is written only once its last job finishes, whereas the
+/// verdict answers red as soon as any check has concluded that way. Requiring
+/// the run itself to have concluded `failure` therefore collapsed "the log is
+/// not written yet" into "this failure says nothing", and the caller consumes
+/// the landing record on that same pass — so the re-drive was lost, and the
+/// refusal was counted as no evidence, for a failure whose log was minutes
+/// away. The failed job is already finished (it is what made the verdict red),
+/// so its log is already fetchable: the run is chosen by commit, not by the
+/// run's own verdict.
+///
+/// A concluded failure is still preferred, so a commit carrying more than one
+/// run reads the one that actually failed. `conclusion` is empty when the
+/// platform has not written one yet, which is what keeps a run that is still
+/// going apart from a run that ended some other way than as a failure.
+fn run_holding_the_failure(runs: &[CiRunSummary], sha: &str) -> Option<u64> {
+    let of_this_commit: Vec<&CiRunSummary> = runs.iter().filter(|r| r.head_sha == sha).collect();
+    of_this_commit
+        .iter()
+        .find(|r| r.conclusion == "failure")
+        .or_else(|| of_this_commit.iter().find(|r| r.conclusion.is_empty()))
+        .map(|r| r.run_id)
+}
+
 /// Keep the last `cap` bytes of `text`, starting on a char boundary.
 fn log_tail(text: &str, cap: usize) -> String {
     if text.len() <= cap {
@@ -599,6 +632,53 @@ fn log_tail(text: &str, cap: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_summary(run_id: u64, head_sha: &str, conclusion: &str) -> CiRunSummary {
+        CiRunSummary {
+            run_id,
+            head_sha: head_sha.to_string(),
+            conclusion: conclusion.to_string(),
+        }
+    }
+
+    /// The verdict is red while the run that produced it is still going: the
+    /// failing job is finished (that is what made the verdict red), so its log
+    /// is fetchable, and reading the run as "no log" is what lost the re-drive.
+    #[test]
+    fn a_run_still_going_is_chosen_for_the_commit_it_belongs_to() {
+        let runs = [
+            run_summary(1, "abc", ""),
+            run_summary(2, "abc", "success"),
+            run_summary(3, "other", "failure"),
+        ];
+        assert_eq!(run_holding_the_failure(&runs, "abc"), Some(1));
+    }
+
+    /// A commit can carry several runs; the one that concluded as a failure is
+    /// the one whose logs are wanted, even when another is still going.
+    #[test]
+    fn a_concluded_failure_is_preferred_over_a_run_still_going() {
+        let runs = [run_summary(1, "abc", ""), run_summary(2, "abc", "failure")];
+        assert_eq!(run_holding_the_failure(&runs, "abc"), Some(2));
+    }
+
+    /// Every run for this commit ended, none of them as a failure: the red
+    /// verdict came from something outside these runs (`cancelled` is what a
+    /// superseded run reports), so there is no run here to read a log from.
+    #[test]
+    fn runs_that_ended_otherwise_than_as_a_failure_offer_no_log() {
+        let runs = [
+            run_summary(1, "abc", "cancelled"),
+            run_summary(2, "abc", "success"),
+        ];
+        assert_eq!(run_holding_the_failure(&runs, "abc"), None);
+    }
+
+    #[test]
+    fn no_run_for_the_commit_offers_no_log() {
+        let runs = [run_summary(1, "other", "failure")];
+        assert_eq!(run_holding_the_failure(&runs, "abc"), None);
+    }
 
     #[test]
     fn test_split_repo() {
