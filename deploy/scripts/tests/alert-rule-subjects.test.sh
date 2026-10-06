@@ -34,6 +34,10 @@ doc = json.load(open(src, encoding='utf-8'))
 rules = doc['observability']['infra_watch']['rules']
 by_name = {r['name']: r for r in rules}
 
+# 判词里那句条数由这份配置自己算出来：钉死一个字面量的话，每加一条规则这份
+# 测试就会红一次，而它红的是它自己那份抄本，不是门禁坏了。
+open(f'{out}/rule_count', 'w', encoding='utf-8').write(str(len(rules)))
+
 def dump(name, rules):
     copy = json.loads(json.dumps(doc))
     copy['observability']['infra_watch']['rules'] = list(rules)
@@ -72,7 +76,7 @@ run() { # run <config> -> 打印合并输出，回传退出码
 # 1. 真文件必须绿，并说出它读了多少条
 out="$(run "${config}")" || fail "真规则文件被判红：${out}"
 grep -q 'ALERT SUBJECT OK' <<<"${out}" || fail "绿的时候也要报判词：${out}"
-grep -q '规则 99 条' <<<"${out}" || fail "没有把读到的条数报出来：${out}"
+grep -q "规则 $(cat "${work}/rule_count") 条" <<<"${out}" || fail "没有把读到的条数报出来：${out}"
 
 # 2. 丢掉聚合 -> 红，且点名那条规则
 if out="$(run "${work}/unreduced.json")"; then fail "丢掉聚合的规则被判绿：${out}"; fi
