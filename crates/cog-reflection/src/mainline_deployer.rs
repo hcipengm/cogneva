@@ -4368,6 +4368,10 @@ impl MainlineDeployer {
             );
             state.in_flight = None;
             self.save_state(&state)?;
+            // 这一条让位路径也要记 attempt：它是一轮真正走到「要不要把这一版滚出去」
+            // 并问了守卫的轮。不记的话差会被推向负值，而判据只看 `> 0` —— 一侧的
+            // 判据配上能双向漂移的差，「守卫没被问」的那一侧会被这个偏移垫掉一部分。
+            self.record_rollout_attempt().await;
             self.record_supersession_reading(true).await;
             return Ok(());
         }
@@ -4483,7 +4487,6 @@ impl MainlineDeployer {
         rev: &str,
         pull_tag: &str,
     ) -> SFResult<bool> {
-        self.record_rollout_attempt().await;
         let tip = match self.bare_main_rev().await {
             Ok(tip) => match self.refresh_upstream(&tip).await {
                 Some(advanced) => advanced,
@@ -4494,6 +4497,15 @@ impl MainlineDeployer {
                 rev.to_string()
             }
         };
+        // 这一句贴着下面那次提问写。它与提问是同一件事的两半，而两半之间只允许隔着
+        // 「上游有没有越过这一版」这一次判断；放得更早（本函数入口）会把**死在路上的
+        // 轮**也算成「决定了要滚却没问」——那段路里有逐个平台的 git fetch，进程在其
+        // 中被杀掉（承载部署器的工作负载会被随后的滚动滚掉，在本部署是常态）或者 fetch
+        // 出错返回，都会留下有 attempt 无 question 的一笔，而且一笔就永久留在差里，
+        // 判据于是把「这一轮没走完」报成「守卫的调用点没了」。
+        // 两半仍是**两个独立语句**，不是一次调用写两条：提问那一句真被删掉时，上面这句
+        // 还在、每轮照涨，差就是那个信号——这正是这对计数存在的理由。
+        self.record_rollout_attempt().await;
         if tip != rev && self.is_ancestor(rev, &tip).await {
             info!(
                 rev = %rev12(rev),
@@ -4554,9 +4566,13 @@ impl MainlineDeployer {
 
     /// 这一轮走到了「要不要把这一版滚出去」的决策点。
     ///
-    /// 与下面那次提问成对：两条在健康的轮里逐轮同增，它们的差就是「决定要滚、却没问」
-    /// 的轮数——守卫的调用点被删掉在外面读起来正是这个差。放在入口而不是放在提问旁边：
-    /// 挨着提问写就与它同因，差恒为零，什么也判不出来。
+    /// 与提问成对：两条在健康的轮里逐轮同增，差就是「决定要滚、却没问」的轮数——守卫
+    /// 的调用点被删掉在外面读起来正是这个差。**调用点必须紧邻提问**，而这与「两条分开
+    /// 写」并不矛盾：分开写是为了让提问那一句被删掉时这条照涨（合写成一次调用就丢了这
+    /// 个能力，差恒为零），紧邻写是为了让两半之间只剩「上游有没有越过这一版」这一次判
+    /// 断——摆在更早的入口，两次上游 read（逐个平台的 git fetch）里死掉的轮也进这个差，
+    /// 而那样的轮在本部署是常态（承载部署器的工作负载会被随后的滚动滚掉），判据于是把
+    /// 「这一轮没走完」报成「守卫没了」，并且一笔就永久留在差里。
     async fn record_rollout_attempt(&self) {
         let Some(metrics) = &self.metrics else {
             return;
@@ -11928,6 +11944,31 @@ exit 0
         assert_eq!(skipped[0].value, 1.0);
     }
 
+    /// 一对轮级计数的读数。
+    ///
+    /// 两条序列在健康的轮里必须同增：`attempts` 由提问前紧邻的那一句写，`checks` 由提问
+    /// 那一句写。它们的差是「决定了要滚却没问」的轮数，而那件事的成因只许剩下一个——
+    /// 提问的调用点没了或被绕过。任何别的成因（这一轮死在问答之间）都会把一笔永久留在
+    /// 差里，判据于是把「没走完」报成「守卫失踪」。
+    async fn rollout_counter_pair(
+        metrics: &std::sync::Arc<cog_storage::MemoryMetricsBackend>,
+    ) -> (f64, f64) {
+        let attempts = metrics
+            .query_counter_totals(cog_core::metric_names::MAINLINE_ROLLOUT_ATTEMPTS_TOTAL.as_str())
+            .await
+            .unwrap();
+        let checks = metrics
+            .query_counter_totals(
+                cog_core::metric_names::MAINLINE_SUPERSESSION_CHECKS_TOTAL.as_str(),
+            )
+            .await
+            .unwrap();
+        (
+            attempts.first().map(|r| r.value).unwrap_or(0.0),
+            checks.first().map(|r| r.value).unwrap_or(0.0),
+        )
+    }
+
     /// 同一个让位判据的第二个位置：上游在轮首读数之后、**构建开始之前**走过去了。
     ///
     /// 上面那条测试里上游是在"编译"期间动的，所以那一轮照付了全程构建，只是在派发前
@@ -12015,6 +12056,16 @@ exit 0
             "the skip has to leave the same reading the later guard leaves: {skipped:?}"
         );
         assert_eq!(skipped[0].value, 1.0);
+        // 这一轮走到决策点并问了守卫，所以一对轮级计数必须**各涨一次**。只记提问不记
+        // attempt 的话差会读到 1，而判据的名字是「守卫的调用点没了」——一个只是让位的
+        // 轮会被报成守卫失踪，而且这一笔永久留在差里，六小时窗口过了也还是它。
+        let (attempts, checks) = rollout_counter_pair(&metrics).await;
+        assert_eq!(
+            (attempts, checks),
+            (1.0, 1.0),
+            "a round that reached the decision and asked must move both counters once: \
+             attempts={attempts} checks={checks}"
+        );
     }
 
     /// The guard must not hold a round whose revision is still the tip.
@@ -12074,6 +12125,16 @@ exit 0
             "the guard ran, so it leaves a reading (zero this round) — absent and asked-but-nothing-to-skip must be distinguishable: {asked:?}"
         );
         assert_eq!(asked[0].value, 0.0);
+        // 派发这一条路上，登记 attempt 的那一句与提问那一句必须仍成对：这一条钉的是
+        // attempt 没有被挪丢——挪到提问旁边时若落进了某一个分支里，只有一半的轮会记，
+        // 差会朝另一个方向漂，而判据只看 `> 0`，那一侧没有告警来兜。
+        let (attempts, checks) = rollout_counter_pair(&metrics).await;
+        assert_eq!(
+            (attempts, checks),
+            (1.0, 1.0),
+            "the dispatch path must register the attempt beside the question: \
+             attempts={attempts} checks={checks}"
+        );
     }
 
     /// 回归：四部署镜像被外部写入弄成不一致（清单部分重下发、手工 set image），

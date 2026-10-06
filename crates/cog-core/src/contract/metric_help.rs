@@ -272,11 +272,19 @@ const COUNTER_HELP: &[(&str, &str)] = &[
         "cogneva_mainline_rollout_attempts_total",
         "Rounds the deployer got as far as deciding whether to roll a revision \
          out. Kept as the partner of cogneva_mainline_supersession_checks_total, \
-         which moves in the same call on the path that asks the guard: while the \
-         guard is wired the two climb together, and rounds that decided to roll \
-         without asking appear as the gap between them. It is also the only \
-         published cadence of a promotion attempt — the declared poll interval \
-         bounds the loop that looks for work, not the rounds that find any",
+         written in the statement immediately before the one that asks the \
+         guard: while the guard is wired the two climb together, and a round \
+         that decided to roll without asking appears as the gap between them. \
+         The two are two statements and not one call on purpose — that is what \
+         lets a deleted question call site leave the attempt still climbing. \
+         The placement matters as much as the pairing: counted any earlier, a \
+         round that died on the way to the guard (there is a per-platform git \
+         fetch between the decision and the question, and on this deployment \
+         the workload carrying the deployer is rolled routinely) would land in \
+         the same gap as a guard that is gone, permanently and one round at a \
+         time. It is also the only published cadence of a promotion attempt — \
+         the declared poll interval bounds the loop that looks for work, not \
+         the rounds that find any",
     ),
     (
         "cogneva_mainline_supersession_checks_total",
@@ -286,7 +294,11 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          then read as a guard that never ran. Read with \
          cogneva_mainline_rollout_attempts_total: equal while the guard is wired, \
          and the difference between them is the failure this pair was built to \
-         show",
+         show. Read the difference within one process rather than between two \
+         maxima: both halves are published by every process with the same label \
+         set, so a per-process subtraction cancels the scrape arithmetic \
+         exactly, while subtracting two separately taken maxima leaves a residue \
+         whenever the two maxima come from different pods",
     ),
     (
         "cogneva_mainline_ci_no_verdict_reason_total",
