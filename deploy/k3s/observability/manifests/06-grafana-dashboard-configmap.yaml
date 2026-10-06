@@ -536,7 +536,7 @@ data:
         {
           "id": 32,
           "title": "LLM Upstream Pool Order",
-          "description": "Where each upstream sits in the order a call tries the pool, 0 first. This is the running process's order, not the one in the Secret: an upstream that has failed sinks behind everything that has not, so these lines converge on the declared order only once the last healthy upstream is gone. That convergence is the point -- it is the one state in which the declared order can be read off the process itself, which is how a reorder is confirmed instead of inferred from the Secret plus a pod-start time. Lines that move together between rollouts are a reorder that took effect; a Secret edit with these unchanged is one that did not.",
+          "description": "Where each upstream sits in the order a call tries the pool, 0 first, one line per upstream. This is the running process's order, not the one in the Secret: an upstream that has failed sinks behind everything that has not, so these lines converge on the declared order only once the last healthy upstream is gone. That convergence is the point -- it is the one state in which the declared order can be read off the process itself, which is how a reorder is confirmed instead of inferred from the Secret plus a pod-start time. Lines that move together between rollouts are a reorder that took effect; a Secret edit with these unchanged is one that did not. Every process holding the pool publisher reports this series, so the query takes the maximum by upstream the way the rest of the pool family is read; a bare selector would draw one line per reporter under the same legend.",
           "type": "timeseries",
           "gridPos": {
             "h": 8,
@@ -546,7 +546,7 @@ data:
           },
           "targets": [
             {
-              "expr": "llm_upstream_position",
+              "expr": "max by (upstream) (llm_upstream_position)",
               "legendFormat": "{{upstream}}",
               "datasource": {
                 "type": "prometheus",
