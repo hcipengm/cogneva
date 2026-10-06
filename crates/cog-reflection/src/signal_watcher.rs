@@ -894,6 +894,22 @@ fn stand_down(readings: &SignalWatcherReadings) {
     readings.held_round();
 }
 
+/// The ticker this loop runs its rounds on: the first round one period out, and
+/// every round after it a period apart.
+///
+/// A fresh interval's first tick completes at once, which is what the other
+/// loops here want. This one does not: at process start the pool guard has not
+/// published a verdict yet -- its own read of the pool is still in flight -- so
+/// the gate is open for want of an answer rather than because the pool is well.
+/// A round run then redrives exactly the alerts the gate was added to hold, and
+/// it did so on every restart. Waiting a period costs the first round a period
+/// and leaves the rest of the schedule alone; the guard's first pass is far
+/// shorter than that, so the round is decided by a verdict instead of by its
+/// absence.
+fn round_ticker(interval: Duration) -> tokio::time::Interval {
+    tokio::time::interval_at(tokio::time::Instant::now() + interval, interval)
+}
+
 /// Background loop; follows the same shutdown pattern as the baseline port
 /// trigger loop.
 pub fn spawn_signal_watcher_loop(
@@ -934,7 +950,8 @@ pub fn spawn_signal_watcher_loop(
                 // running, and a caller cannot know that a spawn it requested
                 // was the one that took.
                 readings.mark_running();
-                let mut ticker = tokio::time::interval(interval);
+                // One period before the first round: see `round_ticker`.
+                let mut ticker = round_ticker(interval);
                 // Reported on the edge, not once per round: the round runs at
                 // least once a minute and a down pool lasts days.
                 let mut held = false;
@@ -1655,6 +1672,43 @@ mod tests {
         let llm: Arc<dyn cog_core::SchedulerGate> =
             Arc::new(OneClassGate(cog_core::TaskClass::LlmDependent));
         assert!(llm_held_off(Some(&llm)));
+    }
+
+    /// The first round is one period out, not immediate: an immediate first
+    /// round runs before the pool guard has published its verdict, which is how
+    /// a restart redrove four alerts the gate was holding. The period after it
+    /// is unchanged, so the round a restart costs is the round it waits for.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_round_waits_one_period() {
+        let interval = Duration::from_secs(300);
+        let mut ticker = round_ticker(interval);
+
+        // A second short of the period: the round has not run.
+        tokio::time::advance(interval - Duration::from_secs(1)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), ticker.tick())
+                .await
+                .is_err(),
+            "the first round ran before the period had elapsed"
+        );
+
+        // On the period: it runs, and the next one is a period behind it.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::timeout(Duration::from_millis(1), ticker.tick())
+            .await
+            .expect("the first round never ran");
+
+        tokio::time::advance(interval - Duration::from_secs(1)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), ticker.tick())
+                .await
+                .is_err(),
+            "the rounds after the first are not a period apart"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::timeout(Duration::from_millis(1), ticker.tick())
+            .await
+            .expect("the second round never ran");
     }
 
     /// A held-off round is a round: it moves the denominator and counts one
