@@ -687,7 +687,7 @@
         },
         {
           "name": "trace_tier_demotion_stalled",
-          "promql": "(max without (pod, container, instance) (min_over_time(cogneva_trace_tier_overdue[3h])) > 0) and (max without (pod, container, instance) (count_over_time(cogneva_trace_tier_overdue[6h])) > max without (pod, container, instance) (count_over_time(cogneva_trace_tier_overdue[3h])))",
+          "promql": "(min_over_time(max without (pod, container, instance) (cogneva_trace_tier_overdue)[3h:1m]) > 0) and (max without (pod, container, instance) (count_over_time(cogneva_trace_tier_overdue[6h])) > max without (pod, container, instance) (count_over_time(cogneva_trace_tier_overdue[3h])))",
           "condition": {
             "greater_than": 0.0
           },
