@@ -2881,9 +2881,10 @@ impl MainlineDeployer {
     ///
     /// 折出 `None` 时**还要问一句为什么**（[`Self::record_ci_verdict_reason_reading`]）：
     /// `no_evidence` 那一格同时装着「还在跑」「路不通」「响应里没东西」，三支各有各的
-    /// 主人，只有原因读数能把它们分开。原因逐上游记，所以两个读数的关系是
-    /// `sum(reason) = no_evidence × 配置的上游数`；折出结论的那些轮不问原因——它已经
-    /// 在 `verdict` 那一格里说完了。
+    /// 主人，只有原因读数能把它们分开。原因逐上游记，所以两个累计读数的关系是
+    /// `sum(reason) = no_evidence × 配置的上游数`，且**这条等式只自上游列表最后一次
+    /// 变更起成立**（两个计数都不带纪元，见那个方法的注释）；折出结论的那些轮不问
+    /// 原因——它已经在 `verdict` 那一格里说完了。
     async fn ci_verdict_for_rev(&self, rev: &str) -> Option<bool> {
         let mut verdicts = Vec::new();
         let mut reasons = Vec::new();
@@ -2997,10 +2998,18 @@ impl MainlineDeployer {
     /// 照旧记，两个读数各自成立。原因只在没有结论时记——有结论的轮已经在 `verdict`
     /// 里说完了，这也是它不与 `pass`/`fail` 重复计数的原因。
     ///
-    /// 两个读数的关系是可核的：折出 `None` 当且仅当所有配了基址的上游都没给结论，
-    /// 所以每轮 `no_evidence` 恰好贡献「配置的上游数」条原因，即
-    /// `sum(reason) = no_evidence × 上游数`。这个倍数不是噪声：它随配置变，靠它
-    /// 才能看出原因是「哪一条上游在沉默」而不是「整条路一起断了」。
+    /// 两个读数的关系是可核的，**但要带纪元**：折出 `None` 当且仅当所有配了基址的
+    /// 上游都没给结论，所以每轮 `no_evidence` 恰好贡献「当时配置的上游数」条原因，即
+    /// `sum(reason) = no_evidence × 上游数`。两个计数都是累计值、由共享表服务，
+    /// 谁都不带纪元，所以上游列表一变（加一台 CI、或给某台上游补上基址）这条等式
+    /// 就不再从零成立，只从那次变更起成立；两个累计值直接相减会留下一笔残差，
+    /// 那不是丢写。
+    ///
+    /// 它**不能**说出是哪一条上游在沉默：原因只有 `reason` 一个标签，没有上游维度；
+    /// 而且原因只在 `no_evidence` 时记，`no_evidence` 的定义就是所有上游都没给结论，
+    /// 所以「一条沉默、另一条给了结论」根本不进这个面。它给的是**分格**——一轮里
+    /// 几条在沉默、各落在哪个 `reason` 上（一轮里 `pending` 与 `no_runs` 各加一，
+    /// 就是一台还在跑、另一台问了没东西）。
     async fn record_ci_verdict_reason_reading(&self, reasons: &[CiNoVerdictReason]) {
         let Some(metrics) = &self.metrics else {
             return;
@@ -12626,8 +12635,9 @@ exit 0
         let deployer = asks("   ", &metrics);
         assert_eq!(deployer.ci_verdict_for_rev("fff").await, None);
 
-        // 一轮里两条上游都没说话：原因各记一次。这个倍数是可核的——它随配置变，
-        // 靠它才能把"某一条在上游沉默"与"整条路一起断了"分开。
+        // 一轮里两条上游都没说话：原因各记一次。这个倍数是可核的，但只自上游列表
+        // 最后一次变更起成立；它分开的是"几条在沉默、各落在哪个 reason 上"，不是
+        // "哪一条在沉默"——原因读数没有上游维度。
         let mut cfg = upstream_config(root, Path::new("/nonexistent"));
         cfg.upstreams[0].api_base = Some("http://127.0.0.1:1/github".into());
         cfg.upstreams[1].api_base = Some("http://127.0.0.1:1/gitee".into());
