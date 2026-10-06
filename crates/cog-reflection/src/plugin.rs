@@ -1217,6 +1217,8 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 shutdown,
                 alert_source,
                 self.signal_readings.clone(),
+                // 本循环产出的每个意图都会落到一个 squad，池全灭时跑一轮只买到一次 503。
+                llm_gate.clone(),
             ));
         } else {
             info!("signal watcher: no orchestrator; self-discovery intents disabled");

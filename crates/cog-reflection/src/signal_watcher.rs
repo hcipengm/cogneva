@@ -867,6 +867,18 @@ fn publish_guard_store(
 /// This loop's name in the liveness census.
 pub const SIGNAL_WATCHER_LOOP: &str = "signal_watcher";
 
+/// Whether the upstream pool gate currently holds LLM-dependent work off.
+///
+/// Every intent this watcher submits ends in a squad of planner/generator/
+/// evaluator agents, so a round run while the pool is down cannot produce
+/// anything: it buys one refusing 503 per agent and files the run as a failure.
+/// The gate is the same one the other LLM-dependent loops read; a deployment
+/// with no supervisor publishes no gate, and then the watcher runs as before
+/// rather than standing down for a pause nobody declared.
+fn llm_held_off(gate: Option<&Arc<dyn cog_core::SchedulerGate>>) -> bool {
+    gate.is_some_and(|g| g.is_paused_kind(cog_core::TaskClass::LlmDependent))
+}
+
 /// Background loop; follows the same shutdown pattern as the baseline port
 /// trigger loop.
 pub fn spawn_signal_watcher_loop(
@@ -875,6 +887,7 @@ pub fn spawn_signal_watcher_loop(
     shutdown: cog_core::ShutdownSignal,
     alert_source: Option<Arc<dyn cog_core::ActiveAlertSource>>,
     readings: Arc<SignalWatcherReadings>,
+    llm_gate: Option<Arc<dyn cog_core::SchedulerGate>>,
 ) -> tokio::task::JoinHandle<()> {
     let interval = Duration::from_secs(config.poll_interval_secs.max(60));
     info!(
@@ -899,6 +912,7 @@ pub fn spawn_signal_watcher_loop(
             let shutdown = shutdown.clone();
             let alert_source = alert_source.clone();
             let readings = readings.clone();
+            let llm_gate = llm_gate.clone();
             async move {
                 // Set by the loop that is about to run rather than by the
                 // caller that asked for it: the flag names a watcher that is
@@ -906,6 +920,9 @@ pub fn spawn_signal_watcher_loop(
                 // was the one that took.
                 readings.mark_running();
                 let mut ticker = tokio::time::interval(interval);
+                // Reported on the edge, not once per round: the round runs at
+                // least once a minute and a down pool lasts days.
+                let mut held = false;
                 loop {
                     // Every cycle is stamped, including the many that find nothing to
                     // report: a quiet system is the ordinary case here.
@@ -914,6 +931,21 @@ pub fn spawn_signal_watcher_loop(
                         biased;
                         _ = shutdown.wait() => break,
                         _ = ticker.tick() => {
+                            if llm_held_off(llm_gate.as_ref()) {
+                                if !held {
+                                    held = true;
+                                    info!(
+                                        "LLM upstream pool unavailable; self-discovery signals held until it recovers"
+                                    );
+                                }
+                                // The round is not run and, below, is not stamped
+                                // either: a held-off round looked at nothing, and a
+                                // tick count that never moved is how "the watcher is
+                                // not running" reads. Standing down silently would
+                                // make a pause indistinguishable from a quiet system.
+                                continue;
+                            }
+                            held = false;
                             tick(&orchestrator, &config, alert_source.as_ref(), &readings).await;
                         }
                     }
@@ -1564,5 +1596,51 @@ mod tests {
 
         assert_eq!(self_audit_task_id(monday), self_audit_task_id(same_day));
         assert_ne!(self_audit_task_id(monday), self_audit_task_id(next_day));
+    }
+
+    /// A gate that pauses exactly one class, so the answer says which class the
+    /// caller asked about and not merely that something is paused.
+    struct OneClassGate(cog_core::TaskClass);
+
+    impl cog_core::SchedulerGate for OneClassGate {
+        fn is_paused(&self) -> bool {
+            false
+        }
+
+        fn pause(&self) -> bool {
+            false
+        }
+
+        fn resume(&self) -> bool {
+            false
+        }
+
+        fn is_paused_kind(&self, class: cog_core::TaskClass) -> bool {
+            class == self.0
+        }
+
+        fn pause_kind(&self, _class: cog_core::TaskClass) -> bool {
+            false
+        }
+
+        fn resume_kind(&self, _class: cog_core::TaskClass) -> bool {
+            false
+        }
+    }
+
+    /// The watcher stands down on the pool's verdict about its own class, and
+    /// on nothing else: no gate is a deployment without a supervisor, and a
+    /// paused mechanical class is not the pool's business.
+    #[test]
+    fn held_off_answers_the_llm_class_not_any_pause() {
+        assert!(!llm_held_off(None));
+
+        let mechanical: Arc<dyn cog_core::SchedulerGate> =
+            Arc::new(OneClassGate(cog_core::TaskClass::Mechanical));
+        assert!(!llm_held_off(Some(&mechanical)));
+
+        let llm: Arc<dyn cog_core::SchedulerGate> =
+            Arc::new(OneClassGate(cog_core::TaskClass::LlmDependent));
+        assert!(llm_held_off(Some(&llm)));
     }
 }
