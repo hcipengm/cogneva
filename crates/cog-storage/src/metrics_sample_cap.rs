@@ -380,9 +380,11 @@ impl SampleLogCap {
         // is wrong by construction: the log is written while a pass runs, so a
         // sweep that took every row it was asked to can recount a few rows
         // higher and read as one the floor stopped. Measured on the live log:
-        // a pass removed its whole 855-row overshoot and recounted 200,003
-        // against a budget of 200,000, and published the floor verdict on
-        // those three rows. Only a batch that took nothing says the log is
+        // a pass read 200,855 rows and recounted 200,003 against a budget of
+        // 200,000, and that recount published the floor verdict. The loop
+        // stops early only on a batch that took nothing, and 199,959 rows were
+        // still deletable, so the three rows above the budget were the writes
+        // and not the heads. Only a batch that took nothing says the log is
         // resting on its floor.
         let mut stalled = false;
         while remaining > 0 {
