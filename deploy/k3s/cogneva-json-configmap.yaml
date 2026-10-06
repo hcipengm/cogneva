@@ -616,39 +616,48 @@ data:
             },
             {
               "name": "self_evolution_yields_no_change",
-              "promql": "sum without (pod, container, instance) (increase(self_evolution_change_yield_total{outcome=~\"no_artifacts|non_change_artifacts|payload_missing|payload_unreadable|submit_failed\"}[6h]))",
+              "promql": "max without (pod, container, instance, job) (increase(self_evolution_change_yield_total{outcome=~\"no_artifacts|non_change_artifacts|payload_missing|payload_unreadable|submit_failed\"}[6h]))",
               "condition": {
                 "greater_than": 2.0
               },
               "severity": "warning",
-              "summary": "Self-evolution chains reported success {value} time(s) in the last 6h while producing no change to land. The cell names which failure it was, and they have different owners: submit_failed means a diff was produced and every sink refused it; no_artifacts means the run's answer carried no artifact at all; non_change_artifacts means it carried artifacts and not one of them was a diff, so the run answered a different question than the one it was asked; payload_missing means the run handed back no result to read; payload_unreadable means the result arrived in neither envelope this build knows, so the reader and the producer have moved apart. Whichever cell it is, the landing channel stays empty and the loop silently stops evolving"
+              "summary": "Self-evolution chains reported success {value} time(s) in the last 6h while producing no change to land. The cell names which failure it was, and they have different owners: submit_failed means a diff was produced and every sink refused it; no_artifacts means the run's answer carried no artifact at all; non_change_artifacts means it carried artifacts and not one of them was a diff, so the run answered a different question than the one it was asked; payload_missing means the run handed back no result to read; payload_unreadable means the result arrived in neither envelope this build knows, so the reader and the producer have moved apart. Whichever cell it is, the landing channel stays empty and the loop silently stops evolving. The count is taken once for the fleet rather than summed over the processes that expose it: this counter is held in the shared store, so every pod of every deployment serves the same total, and summing them would report one run once per replica"
             },
             {
               "name": "self_evolution_has_no_change_sink",
-              "promql": "sum without (pod, container, instance) (increase(self_evolution_change_yield_total{outcome=\"no_sink\"}[6h]))",
+              "promql": "max without (pod, container, instance, job) (increase(self_evolution_change_yield_total{outcome=\"no_sink\"}[6h]))",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "Self-evolution finished {value} run(s) in the last 6h with no sink to hand a change to, so whatever they produced was dropped and nothing they made could be landed. This is a configuration fault and not a generation fault, which is why it has its own cell: the runs succeeded and their yield had nowhere to go, and from the outside that reads exactly like a loop that produces nothing. Find what is supposed to configure a ChangeSink on this deployment and why it is empty"
+              "summary": "Self-evolution finished {value} run(s) in the last 6h with no sink to hand a change to, so whatever they produced was dropped and nothing they made could be landed. This is a configuration fault and not a generation fault, which is why it has its own cell: the runs succeeded and their yield had nowhere to go, and from the outside that reads exactly like a loop that produces nothing. Find what is supposed to configure a ChangeSink on this deployment and why it is empty. The count is taken once for the fleet rather than summed over the processes that expose it: this counter is held in the shared store, so every pod of every deployment serves the same total"
             },
             {
               "name": "self_evolution_submitted_nothing",
-              "promql": "(sum without (pod, container, instance) (increase(self_evolution_change_yield_total[24h])) > 0) unless on() (sum without (pod, container, instance) (increase(self_evolution_change_yield_total{outcome=\"submitted\"}[24h])) > 0)",
+              "promql": "(max without (pod, container, instance, job) (increase(self_evolution_change_yield_total[24h])) > 0) unless on() (max without (pod, container, instance, job) (increase(self_evolution_change_yield_total{outcome=\"submitted\"}[24h])) > 0)",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "Self-evolution runs finished in the last day and not one of them handed a change to a sink. This is the one-failure sensitivity of the same family self_evolution_yields_no_change reads at three in six hours, and the other cells say which way each run failed -- read that rule's summary for what each cell means before generating more. A day with no finished run leaves this silent, so what it reports is runs that produced nothing rather than a loop that was idle"
+              "summary": "Self-evolution runs finished in the last day and not one of them handed a change to a sink. This is the one-failure sensitivity of the same family self_evolution_yields_no_change reads at three in six hours, and the other cells say which way each run failed -- read that rule's summary for what each cell means before generating more. A day with no finished run leaves this silent, so what it reports is runs that produced nothing rather than a loop that was idle. Both counts are taken once for the fleet rather than summed over the processes that expose them: this counter is held in the shared store, so every pod of every deployment serves the same total"
+            },
+            {
+              "name": "change_diff_never_harvested",
+              "promql": "(max without (pod, container, instance, job) (increase(collab_change_diff_source_total[24h])) > 0) unless on() (max without (pod, container, instance, job) (increase(collab_change_diff_source_total{source=\"tree\"}[24h])) > 0)",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "Generation rounds handed a change artifact to the pipeline in the last day and not one of their diffs was read out of the run's own checkout: every one of them was the text the model typed. The harvest is what makes a diff checkable — git derives its headers and context from the files themselves, so the gate can compare the change against the tree instead of against the model's account of it — and a day in which the tree end never fires means that comparison stopped happening while the changes kept coming, which is invisible from the landing side because a model-written diff lands exactly like a harvested one. Usual cause: the agent's `workspace_change` returning nothing usable on every round (a deployment with no sandbox backend returns nothing by construction, and the harvest logging the reason with the task id is how the two are told apart) or a checkout whose diff carries no `diff --git` header. Both counts are taken once for the fleet rather than summed over the processes that expose them: this counter is held in the shared store"
             },
             {
               "name": "self_evolution_rework_never_handed_off",
-              "promql": "(sum without (pod, container, instance) (increase(cogneva_change_fate_total{fate=\"retired\"}[24h])) > 0) unless on() (sum without (pod, container, instance) (increase(self_evolution_change_rework_total{outcome=\"submitted\"}[24h])) > 0)",
+              "promql": "(max without (pod, container, instance, job) (increase(cogneva_change_fate_total{fate=\"retired\"}[24h])) > 0) unless on() (sum without (pod, container, instance) (increase(self_evolution_change_rework_total{outcome=\"submitted\"}[24h])) > 0)",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "A change was retired by a gate in the last day and not one refusal came back as a rework task. A refusal is not the end of a change: the criterion that refused it and the files it named are the requirement for the next attempt, and the main flow is supposed to receive that as a change_rework task. When this fires the hand-off is dead, so every refusal is dropped instead of regenerated -- the loop still generates and still refuses, and nothing it learns from a refusal ever reaches the next generation. Read self_evolution_change_rework_total's other cells for which way it failed: no_executor means the process that owns submission never got an orchestrator handle, so the requirement had no way out; submit_failed means the main flow refused the task. Both leave the count at zero on the submitted cell, which is why this rule watches the pair rather than the gate's own counter alone"
+              "summary": "A change was retired by a gate in the last day and not one refusal came back as a rework task. A refusal is not the end of a change: the criterion that refused it and the files it named are the requirement for the next attempt, and the main flow is supposed to receive that as a change_rework task. When this fires the hand-off is dead, so every refusal is dropped instead of regenerated -- the loop still generates and still refuses, and nothing it learns from a refusal ever reaches the next generation. Read self_evolution_change_rework_total's other cells for which way it failed: no_executor means the process that owns submission never got an orchestrator handle, so the requirement had no way out; submit_failed means the main flow refused the task. Both leave the count at zero on the submitted cell, which is why this rule watches the pair rather than the gate's own counter alone. The retired count is taken once for the fleet rather than summed over the processes that expose it: cogneva_change_fate_total is held in the shared store, so every pod of every deployment serves the same total, and summing them would report one retirement once per replica. The rework count beside it is the other kind -- it is published per process, each counting only its own refusals, so there the sum is what the deployment did"
             },
             {
               "name": "cogneva_workload_metrics_unscraped",
@@ -1129,12 +1138,12 @@ data:
             },
             {
               "name": "registry_maintenance_round_incomplete",
-              "promql": "sum without (pod, container, instance) (increase(cogneva_registry_maintenance_runs_total[1h])) > 0 and (time() - max without (pod, container, instance) (cogneva_registry_maintenance_reading_unix)) > 3600",
+              "promql": "max without (pod, container, instance, job) (increase(cogneva_registry_maintenance_runs_total[1h])) > 0 and (time() - max without (pod, container, instance, job) (cogneva_registry_maintenance_reading_unix)) > 3600",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "A reclamation round over the registry store ran {value} time(s) in the last hour and none of them finished. The round counts itself when it starts and stamps the reading only after it has walked the store, so a run count rising against a timestamp that does not move is the reading for a round that started and did not finish; neither half says it alone, because a completed round with nothing left to remove also leaves a run and a zero removal count, and a store that is under the size the round acts on also leaves a stale timestamp with no runs at all. An hour is a bound on the round and not on the reclamation cadence: the round is a tag listing and a few manifest reads, and it stamps within seconds of starting, while the cadence is hours. The cause is in that container's log, where the round returns on the line naming the step it could not do, and the effect is that nothing was removed while the store kept whatever it is holding. A round that cannot finish re-fires this once per cadence rather than continuously, and every firing is the same unresolved round -- so treat a repeat as the same alert, not a new one"
+              "summary": "A reclamation round over the registry store ran {value} time(s) in the last hour and none of them finished. The round counts itself when it starts and stamps the reading only after it has walked the store, so a run count rising against a timestamp that does not move is the reading for a round that started and did not finish; neither half says it alone, because a completed round with nothing left to remove also leaves a run and a zero removal count, and a store that is under the size the round acts on also leaves a stale timestamp with no runs at all. An hour is a bound on the round and not on the reclamation cadence: the round is a tag listing and a few manifest reads, and it stamps within seconds of starting, while the cadence is hours. The cause is in that container's log, where the round returns on the line naming the step it could not do, and the effect is that nothing was removed while the store kept whatever it is holding. A round that cannot finish re-fires this once per cadence rather than continuously, and every firing is the same unresolved round -- so treat a repeat as the same alert, not a new one. Both readings are taken once for the fleet rather than summed over the processes that expose them: these counters are held in the shared store, so every pod of every deployment serves the same total, and summing them would report one round once per replica"
             },
             {
               "name": "registry_tag_deletion_refused",

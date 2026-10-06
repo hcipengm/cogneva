@@ -292,7 +292,9 @@ async fn prefer_workspace_change(
     };
     let (output, source) = apply_workspace_change(output, harvested);
     if let Some(source) = source {
-        crate::observable::global_observable().record_change_diff_source(source);
+        crate::observable::global_observable()
+            .record_change_diff_source(source)
+            .await;
     }
     output
 }
@@ -388,14 +390,14 @@ fn apply_workspace_change(
         return (output, None);
     }
     let Some(diff) = harvested.filter(|diff| diff.contains("diff --git")) else {
-        return (output, Some("model"));
+        return (output, Some(crate::observable::CHANGE_DIFF_SOURCE_MODEL));
     };
     // Second cut at the run's own answer, for the name the read was not told
     // about. Stripping it can leave nothing, and a tree that held only the
     // answer held no change: the typed diff is what stays.
     let diff = without_answer_files(&diff);
     if !diff.contains("diff --git") {
-        return (output, Some("model"));
+        return (output, Some(crate::observable::CHANGE_DIFF_SOURCE_MODEL));
     }
     for artifact in &mut output.artifacts {
         // The contract asks for exactly one change artifact. A second one is a
@@ -406,7 +408,7 @@ fn apply_workspace_change(
             break;
         }
     }
-    (output, Some("tree"))
+    (output, Some(crate::observable::CHANGE_DIFF_SOURCE_TREE))
 }
 
 /// The prompt contract the Generator gets for a self-evolution task.

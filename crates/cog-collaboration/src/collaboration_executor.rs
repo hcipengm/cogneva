@@ -800,7 +800,9 @@ impl CollaborationExecutor {
                     }
                 }
             };
-            crate::observable::global_observable().record_change_yield(outcome);
+            crate::observable::global_observable()
+                .record_change_yield(outcome)
+                .await;
         }
 
         // The list is published even when it is empty. A successful run whose

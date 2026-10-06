@@ -203,6 +203,32 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          applying; they are counted apart because the two repairs differ",
     ),
     (
+        "self_evolution_change_yield_total",
+        "Where self-evolution runs ended, one increment per finished run, by \
+         outcome: submitted (a change was handed to a sink), no_sink (the run \
+         produced one and the deployment has nothing configured to take it), \
+         no_artifacts / non_change_artifacts (the answer carried no diff), \
+         payload_missing / payload_unreadable (there was no result to read), \
+         submit_failed (every sink refused the diff). The cells partition the \
+         runs, so the causes that did not happen are absent rather than zero: \
+         a reader who had to union them would be reading one question as \
+         seven unrelated facts. Held in the metrics store, so it survives a \
+         rollout -- a per-process count restarts at zero every hour and \
+         re-asserts 'nothing has ever yielded'",
+    ),
+    (
+        "collab_change_diff_source_total",
+        "Where a generation round's change diff came from, by source: tree (a \
+         diff read out of the checkout the run edited, so git derived its \
+         headers from the files themselves and the apply gate can compare the \
+         change against the tree) or model (the text the model wrote out, kept \
+         when the harvest returned nothing usable). The tree cell standing \
+         still while the total moves is what 'the harvest stopped firing' \
+         looks like. Held in the metrics store: the ratio of the two is read \
+         across rollouts, which a count that resets on every rollout cannot \
+         show",
+    ),
+    (
         "cogneva_registry_maintenance_runs_total",
         "Registry maintenance rounds that ran, one per round, whether or not \
          anything was deleted. Read next to the pruned-tag count: a round that \

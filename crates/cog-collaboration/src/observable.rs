@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use cog_core::observability::{DimensionSpec, Observable, RawMetric, TraceFragment};
 use cog_core::SFResult;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 /// The chart rule that reads the routing series this module publishes.
@@ -267,23 +267,40 @@ pub const BOUNDARY_DIMENSIONS: [&str; 5] = [
 ///
 /// One name for the producer and for the rules that read it: a reader holding
 /// its own copy is how a rename leaves a rule selecting a series that no longer
-/// exists, which is the silence these rules are written against.
-pub const CHANGE_YIELD_METRIC: &str = "self_evolution_change_yield_total";
+/// exists, which is the silence these rules are written against. It is the
+/// registered name rather than a literal, because this family is written to
+/// the metrics backend -- a name outside the closed set would make the store's
+/// held names and this build's writers disagree about whether anyone still
+/// produces it.
+pub const CHANGE_YIELD_METRIC: &str =
+    cog_core::metric_names::SELF_EVOLUTION_CHANGE_YIELD_TOTAL.as_str();
 
 /// The name of the change-diff-source family.
-pub const CHANGE_DIFF_SOURCE_METRIC: &str = "collab_change_diff_source_total";
+pub const CHANGE_DIFF_SOURCE_METRIC: &str =
+    cog_core::metric_names::COLLAB_CHANGE_DIFF_SOURCE_TOTAL.as_str();
+
+/// A diff read out of the checkout the run edited.
+///
+/// git derived its headers and context from the files themselves, so this end
+/// is what the apply gate can compare against the file rather than against what
+/// the model said the file would be.
+pub const CHANGE_DIFF_SOURCE_TREE: &str = "tree";
+
+/// The text the model wrote out, kept when the checkout had nothing to offer.
+///
+/// This is what the apply gate refuses when it disagrees with the file, and it
+/// is the end that has to keep being countable on its own: "the harvest never
+/// fired" and "the model's diff was taken" are the same single count otherwise.
+pub const CHANGE_DIFF_SOURCE_MODEL: &str = "model";
 
 /// Where the diff of a generation round's change artifact came from.
 ///
 /// Closed set: the label names a producer, and a third value would mean a
-/// producer nobody wrote down. `tree` is a diff read out of the checkout the
-/// run edited — git derived its headers and context from the files themselves;
-/// `model` is the text the model wrote out, which is what the apply gate
-/// refuses when it disagrees with the file. The second cell is the one that has
-/// to keep being published: it is what "the harvest never fired" looks like,
-/// and on its own that absence is indistinguishable from a tree that was never
-/// read.
-pub const CHANGE_DIFF_SOURCES: [&str; 2] = ["tree", "model"];
+/// producer nobody wrote down. The two members are constants rather than
+/// literals because these strings are the metric's label values: a rename at
+/// the writing end and not here would count one fact under two cells, and the
+/// ratio a reader takes across them would be over two different populations.
+pub const CHANGE_DIFF_SOURCES: [&str; 2] = [CHANGE_DIFF_SOURCE_TREE, CHANGE_DIFF_SOURCE_MODEL];
 
 /// Where a self-evolution run's yield ended, and why.
 ///
@@ -414,18 +431,22 @@ pub struct CollaborationObservable {
     /// 同步锁而非 `try_lock`：这是分类可达性自查的记录端，一次丢失会被
     /// 读成「这个分类从没被记录过」而报出并不存在的分叉。
     ralph_terminations: Arc<std::sync::Mutex<HashMap<String, u64>>>,
-    /// Where self-evolution runs' yields ended, over [`ChangeYieldOutcome`].
+    /// The durability sink for the two families below, installed once at
+    /// plugin init.
     ///
-    /// A run that finishes successfully and produces nothing to land is
-    /// otherwise indistinguishable from one that produced a change: the squad
-    /// reports success, the output JSON merely has no `change_ids`, and there
-    /// is neither a log nor a metric -- so "generation is producing nothing"
-    /// could go on silently. Whether the landing channel has anything must be
-    /// countable, and countable per cause: the cell that says a reader could
-    /// not read the payload and the cell that says the run produced nothing
-    /// are read by different people. Keyed by a `&'static str` so the cells
-    /// are [`ChangeYieldOutcome::ALL`] and a typo cannot open an eighth.
-    change_yields: Arc<Mutex<HashMap<&'static str, u64>>>,
+    /// Both families are counters and both are written through it rather than
+    /// kept in a map here, because a count that lives in the process cannot
+    /// answer a question asked after the process is replaced: every rollout
+    /// restarts the count at zero, so "this has never happened" and "this
+    /// happened before the last rollout" are the same reading. The backend is
+    /// the shared store, so the count also stops being per-pod.
+    ///
+    /// `None` is a wiring failure, not a mode: the writing methods say so
+    /// rather than dropping the count silently.
+    metrics: OnceLock<Arc<dyn cog_core::MetricsBackend>>,
+    /// Set once the first write finds no backend, so the warning is a
+    /// transition rather than a line per event.
+    uninstalled_backend_reported: AtomicBool,
     /// 分类声明的计数（产生端：写出带前缀 reason/feedback 时记一次）。
     /// 与 [`Self::ralph_terminations`]（记录端）构成分类可达性自查的两端。
     /// 用同步锁而非 `try_lock` 丢弃：这一端是「有没有声明」的证据本身，
@@ -567,24 +588,47 @@ pub struct CollaborationObservable {
     /// that failed. Keyed by a `&'static str` so the cells are exactly the
     /// constants above and a typo cannot open a seventh.
     failure_routes: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
-    /// Which end the change artifacts of a generation round came from, over
-    /// [`CHANGE_DIFF_SOURCES`].
-    ///
-    /// A round's diff can be the one the model typed out or the one git
-    /// printed from the checkout the run edited. The two are not
-    /// interchangeable: the typed one carries whatever the model remembered
-    /// about the file, and every form defect the apply gate refuses is a
-    /// property of that text, not of the change. Until this face existed the
-    /// question "did the tree get used at all" had no answer, so a harvest that
-    /// silently never fired would read exactly like a model that never needed
-    /// it. Both cells are published, zeros included. Keyed by a `&'static str`
-    /// so the cells are the constants above and a typo cannot open a third.
-    change_diff_sources: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
 }
 
 impl CollaborationObservable {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Take the sink the yield and diff-source counters are written through.
+    ///
+    /// Called once, from the plugin that already publishes this observable.
+    /// The backend is what makes those two families outlive the process; the
+    /// first caller wins, which is what a second plugin init should be.
+    pub fn install_metrics_backend(&self, backend: Arc<dyn cog_core::MetricsBackend>) {
+        let _ = self.metrics.set(backend);
+    }
+
+    /// Write one counter cell, naming the wiring when there is no sink.
+    ///
+    /// A missing backend would otherwise drop the count in silence, and a
+    /// counter that stops being written is indistinguishable from one whose
+    /// cause stopped happening -- the exact confusion these families exist to
+    /// remove. The warning is a transition rather than one line per event.
+    async fn count(&self, name: cog_core::MetricName, label: (&'static str, &str)) {
+        let Some(backend) = self.metrics.get() else {
+            if !self
+                .uninstalled_backend_reported
+                .swap(true, Ordering::Relaxed)
+            {
+                tracing::warn!(
+                    metric = name.as_str(),
+                    "no metrics backend installed; counting this family in-process \
+                     would not survive the next rollout"
+                );
+            }
+            return;
+        };
+        let mut labels = HashMap::new();
+        labels.insert(label.0.to_string(), label.1.to_string());
+        if let Err(e) = backend.record_counter(name, 1.0, labels).await {
+            tracing::warn!(metric = name.as_str(), error = %e, "counter write failed");
+        }
     }
 
     pub fn record_message(&self) {
@@ -618,10 +662,17 @@ impl CollaborationObservable {
     /// outcome, so a free string would let a new cause be counted under a name
     /// no reader was ever told about, and no gate could tell that apart from a
     /// cause that stopped happening.
-    pub fn record_change_yield(&self, outcome: ChangeYieldOutcome) {
-        if let Ok(mut map) = self.change_yields.try_lock() {
-            *map.entry(outcome.as_str()).or_insert(0) += 1;
-        }
+    ///
+    /// The count goes to the store, not to a map here: a run of the loop is
+    /// exactly the thing a rollout interrupts, so a per-process count would
+    /// restart at zero every hour and "nothing has ever yielded" would be
+    /// re-asserted after every rollout.
+    pub async fn record_change_yield(&self, outcome: ChangeYieldOutcome) {
+        self.count(
+            cog_core::metric_names::SELF_EVOLUTION_CHANGE_YIELD_TOTAL,
+            ("outcome", outcome.as_str()),
+        )
+        .await;
     }
 
     /// Record one self-review verdict.
@@ -842,12 +893,16 @@ impl CollaborationObservable {
     }
 
     /// Record which end one generation round's change artifact came from.
-    pub fn record_change_diff_source(&self, source: &'static str) {
-        let mut map = self
-            .change_diff_sources
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *map.entry(source).or_insert(0) += 1;
+    ///
+    /// Written to the store for the reason the yield counter is: the ratio of
+    /// the two cells is read across rollouts, and a count that resets every
+    /// rollout can only ever show the current one.
+    pub async fn record_change_diff_source(&self, source: &'static str) {
+        self.count(
+            cog_core::metric_names::COLLAB_CHANGE_DIFF_SOURCE_TOTAL,
+            ("source", source),
+        )
+        .await;
     }
 
     /// 记一次分类声明（产生端调用）。临界区只有一次 map 插入，同步加锁
@@ -921,16 +976,12 @@ impl Observable for CollaborationObservable {
             // claim one that never did. Reading the cells is what tells "this
             // cause stopped happening" from "the label was renamed out from
             // under the reader" -- both are the same absence otherwise.
-            let yields = self.change_yields.lock().await;
-            if !yields.is_empty() {
-                for outcome in ChangeYieldOutcome::ALL {
-                    let count = yields.get(outcome.as_str()).copied().unwrap_or(0);
-                    metrics.push(
-                        RawMetric::new(CHANGE_YIELD_METRIC, count as f64)
-                            .with_label("outcome", outcome.as_str()),
-                    );
-                }
-            }
+            //
+            // The yield family is not here: it is written to the metrics
+            // backend, which the exposition renders alongside this rollup.
+            // Publishing it from both faces would put the same series in one
+            // scrape twice, and an aggregate over the scrape would then count
+            // every run twice.
             let reviews = self
                 .self_review_verdicts
                 .lock()
@@ -1142,22 +1193,13 @@ impl Observable for CollaborationObservable {
                 );
             }
 
-            // Which end a generation round's diff came from. Both cells are
-            // published: a harvest that never fires and a model that never
-            // needed one have to look different, and the `model` cell is what
-            // the second looks like when it is the first.
-            let diff_sources = self
-                .change_diff_sources
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone();
-            for source in CHANGE_DIFF_SOURCES {
-                let count = diff_sources.get(source).copied().unwrap_or(0);
-                metrics.push(
-                    RawMetric::new(CHANGE_DIFF_SOURCE_METRIC, count as f64)
-                        .with_label("source", source),
-                );
-            }
+            // Which end a generation round's diff came from is written to the
+            // metrics backend, not published here: a harvest that never fires
+            // and a model that never needed one have to look different, and the
+            // `model` cell is what the second looks like when it is the first.
+            // That reading is worth more across rollouts than within one, so it
+            // belongs on the durable face -- and putting it on both would put
+            // the same series in one scrape twice.
 
             // The boundary gate's verdict and the dimensions it refused over.
             // Both faces are published in full, zeros included: reporting only
@@ -1245,6 +1287,120 @@ mod tests {
 
     fn metric(metrics: &[RawMetric], name: &str) -> Option<RawMetric> {
         metrics.iter().find(|m| m.name == name).cloned()
+    }
+
+    /// A store that keeps what it was handed.
+    ///
+    /// The durable families have no map to read after the call — that is what
+    /// moved — so the only place an assertion can sit is the store boundary.
+    #[derive(Default)]
+    struct RecordingBackend {
+        counters: std::sync::Mutex<Vec<(String, f64, HashMap<String, String>)>>,
+    }
+
+    impl RecordingBackend {
+        fn counters(&self) -> Vec<(String, f64, HashMap<String, String>)> {
+            self.counters.lock().unwrap().clone()
+        }
+
+        fn cell(&self, label: &str, value: &str) -> f64 {
+            self.counters()
+                .iter()
+                .filter(|(_, _, labels)| labels.get(label).map(String::as_str) == Some(value))
+                .map(|(_, written, _)| *written)
+                .sum()
+        }
+    }
+
+    #[async_trait]
+    impl cog_core::MetricsBackend for RecordingBackend {
+        async fn record_gauge(
+            &self,
+            _name: cog_core::MetricName,
+            _value: f64,
+            _labels: HashMap<String, String>,
+        ) -> SFResult<()> {
+            Ok(())
+        }
+
+        async fn record_counter(
+            &self,
+            name: cog_core::MetricName,
+            value: f64,
+            labels: HashMap<String, String>,
+        ) -> SFResult<()> {
+            self.counters
+                .lock()
+                .unwrap()
+                .push((name.as_str().to_string(), value, labels));
+            Ok(())
+        }
+
+        async fn record_histogram(
+            &self,
+            _name: cog_core::MetricName,
+            _value: f64,
+            _labels: HashMap<String, String>,
+        ) -> SFResult<()> {
+            Ok(())
+        }
+
+        async fn query_gauge_range(
+            &self,
+            _name: &str,
+            _start: chrono::DateTime<chrono::Utc>,
+            _end: chrono::DateTime<chrono::Utc>,
+        ) -> SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+
+        async fn query_gauge_latest(&self, _name: &str) -> SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+
+        async fn query_counter_range(
+            &self,
+            _name: &str,
+            _start: chrono::DateTime<chrono::Utc>,
+            _end: chrono::DateTime<chrono::Utc>,
+        ) -> SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+
+        async fn query_counter_totals(&self, _name: &str) -> SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+
+        async fn query_histogram_range(
+            &self,
+            _name: &str,
+            _start: chrono::DateTime<chrono::Utc>,
+            _end: chrono::DateTime<chrono::Utc>,
+        ) -> SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+
+        async fn query_histogram_totals(
+            &self,
+            _name: &str,
+        ) -> SFResult<Vec<cog_core::HistogramTotals>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_metric_names(
+            &self,
+            _metric_type: cog_core::MetricType,
+        ) -> SFResult<Vec<String>> {
+            Ok(self
+                .counters()
+                .into_iter()
+                .map(|(name, _, _)| name)
+                .collect())
+        }
+
+        async fn health_check(&self) -> SFResult<()> {
+            Ok(())
+        }
     }
 
     /// 判据面与判定面一起发布。一次「有外部判据」的自审和一次「只有自己上一步
@@ -1437,32 +1593,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn change_yield_is_counted_per_outcome() {
+    async fn a_yield_is_counted_by_the_cell_it_ended_in() {
+        let backend = Arc::new(RecordingBackend::default());
         let obs = CollaborationObservable::new();
-        obs.record_change_yield(ChangeYieldOutcome::NoArtifacts);
-        obs.record_change_yield(ChangeYieldOutcome::NoArtifacts);
-        obs.record_change_yield(ChangeYieldOutcome::Submitted);
+        obs.install_metrics_backend(backend.clone());
+        obs.record_change_yield(ChangeYieldOutcome::NoArtifacts)
+            .await;
+        obs.record_change_yield(ChangeYieldOutcome::NoArtifacts)
+            .await;
+        obs.record_change_yield(ChangeYieldOutcome::Submitted).await;
 
-        let metrics = obs.collect_metrics("D8").await.unwrap();
-        let yields: Vec<&RawMetric> = metrics
-            .iter()
-            .filter(|m| m.name == CHANGE_YIELD_METRIC)
-            .collect();
-        // Every declared cell, once one run has finished: the cells partition
-        // the runs, so a missing one reads as a cause that cannot happen rather
-        // than as a cause that did not.
-        assert_eq!(yields.len(), ChangeYieldOutcome::ALL.len());
-        let cell = |outcome: ChangeYieldOutcome| -> f64 {
-            yields
+        let written = backend.counters();
+        assert!(
+            written
                 .iter()
-                .find(|m| m.labels.get("outcome").map(String::as_str) == Some(outcome.as_str()))
-                .unwrap_or_else(|| panic!("{} outcome is reported", outcome.as_str()))
-                .value
-        };
-        assert_eq!(cell(ChangeYieldOutcome::NoArtifacts), 2.0);
-        assert_eq!(cell(ChangeYieldOutcome::Submitted), 1.0);
-        // The causes that did not happen are published at zero, which is what
-        // keeps them apart from a cause this build cannot name.
+                .all(|(name, _, _)| name == CHANGE_YIELD_METRIC),
+            "the count leaves under the registered name: {written:?}"
+        );
+        assert_eq!(
+            backend.cell("outcome", ChangeYieldOutcome::NoArtifacts.as_str()),
+            2.0
+        );
+        assert_eq!(
+            backend.cell("outcome", ChangeYieldOutcome::Submitted.as_str()),
+            1.0
+        );
+        // A cause that did not happen is absent, not zero. Both read as no
+        // increase over a window, and only one of them is also what a cause
+        // this build cannot name would leave behind.
         for outcome in ChangeYieldOutcome::ALL {
             if matches!(
                 outcome,
@@ -1470,8 +1628,49 @@ mod tests {
             ) {
                 continue;
             }
-            assert_eq!(cell(outcome), 0.0, "{}", outcome.as_str());
+            assert!(
+                !written
+                    .iter()
+                    .any(|(_, _, labels)| labels.get("outcome").map(String::as_str)
+                        == Some(outcome.as_str())),
+                "{} must not be written before it happens",
+                outcome.as_str()
+            );
         }
+    }
+
+    /// The move, not an append: the same series rendered out of two segments of
+    /// `/metrics` would be summed twice by any rule that reads it.
+    #[tokio::test]
+    async fn the_durable_families_no_longer_ride_the_observable_segment() {
+        let backend = Arc::new(RecordingBackend::default());
+        let obs = CollaborationObservable::new();
+        obs.install_metrics_backend(backend.clone());
+        obs.record_change_yield(ChangeYieldOutcome::Submitted).await;
+        obs.record_change_diff_source(CHANGE_DIFF_SOURCE_TREE).await;
+
+        let metrics = obs.collect_metrics("D8").await.unwrap();
+        assert!(metric(&metrics, CHANGE_YIELD_METRIC).is_none());
+        assert!(metric(&metrics, CHANGE_DIFF_SOURCE_METRIC).is_none());
+        // And they did leave: the rollup is silent about them because they went
+        // to the store, not because the call was dropped.
+        assert_eq!(backend.counters().len(), 2);
+    }
+
+    /// The other half of the same wiring: with no sink the count cannot be
+    /// kept anywhere durable, so the failure has to be said out loud — a
+    /// counter that quietly stops being written is exactly the reading these
+    /// families exist to replace.
+    #[tokio::test]
+    async fn a_missing_sink_is_reported_once_rather_than_dropped_in_silence() {
+        let obs = CollaborationObservable::new();
+        obs.record_change_yield(ChangeYieldOutcome::Submitted).await;
+        obs.record_change_diff_source(CHANGE_DIFF_SOURCE_MODEL)
+            .await;
+        assert!(
+            obs.uninstalled_backend_reported.load(Ordering::Relaxed),
+            "the first write with no backend has to report the wiring"
+        );
     }
 
     /// The label is what an alert rule selects on, so two outcomes sharing one
@@ -1484,16 +1683,6 @@ mod tests {
             assert!(!label.is_empty(), "{outcome:?} has no label");
             assert!(seen.insert(label), "two outcomes share the label {label}");
         }
-    }
-
-    #[tokio::test]
-    async fn a_run_that_never_yielded_reports_nothing() {
-        // Absence of the series is the honest state: no self-evolution run has
-        // finished yet. A zero-valued series would claim a measurement that
-        // was never taken.
-        let obs = CollaborationObservable::new();
-        let metrics = obs.collect_metrics("D8").await.unwrap();
-        assert!(metric(&metrics, CHANGE_YIELD_METRIC).is_none());
     }
 
     fn unreachable(metrics: &[RawMetric]) -> Vec<String> {
@@ -2109,27 +2298,36 @@ mod tests {
         );
     }
 
-    fn diff_source_cells(metrics: &[RawMetric]) -> Vec<(String, f64)> {
-        metrics
-            .iter()
-            .filter(|m| m.name == CHANGE_DIFF_SOURCE_METRIC)
-            .map(|m| (m.labels.get("source").cloned().unwrap_or_default(), m.value))
-            .collect()
+    /// Which end a round's diff came from leaves under the label a reader
+    /// selects on, and it is one of the named ends rather than a string that
+    /// happens to look like one.
+    #[tokio::test]
+    async fn a_change_diff_is_counted_by_the_end_it_came_from() {
+        let backend = Arc::new(RecordingBackend::default());
+        let obs = CollaborationObservable::new();
+        obs.install_metrics_backend(backend.clone());
+        obs.record_change_diff_source(CHANGE_DIFF_SOURCE_TREE).await;
+
+        let written = backend.counters();
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].0, CHANGE_DIFF_SOURCE_METRIC);
+        assert_eq!(written[0].1, 1.0);
+        assert_eq!(
+            written[0].2.get("source").map(String::as_str),
+            Some(CHANGE_DIFF_SOURCE_TREE)
+        );
+        assert!(CHANGE_DIFF_SOURCES.contains(&CHANGE_DIFF_SOURCE_TREE));
     }
 
-    /// Both ends are published from the first round, zeros included. A series
-    /// that only appears once something happened cannot answer the question it
-    /// exists for: "the harvest never fired" and "the model never needed one"
-    /// leave the same single cell behind.
-    #[tokio::test]
-    async fn both_ends_of_a_change_diff_are_published_including_the_zero() {
-        let obs = CollaborationObservable::new();
-        obs.record_change_diff_source("tree");
-
-        let metrics = obs.collect_metrics("D8").await.unwrap();
-        assert_eq!(
-            diff_source_cells(&metrics),
-            vec![("tree".to_string(), 1.0), ("model".to_string(), 0.0)]
-        );
+    /// The two ends are one closed set with one definition: the writer names a
+    /// constant, not a literal of its own, or a rename on one side counts a
+    /// fact that happened under a cell no reader was told about.
+    #[test]
+    fn every_change_diff_end_is_named_once() {
+        let mut seen = std::collections::BTreeSet::new();
+        for source in CHANGE_DIFF_SOURCES {
+            assert!(!source.is_empty());
+            assert!(seen.insert(source), "two ends share the name {source}");
+        }
     }
 }

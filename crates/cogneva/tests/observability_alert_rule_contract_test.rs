@@ -389,6 +389,14 @@ const PRODUCED: &[(&str, &str)] = &[
         "self_evolution_change_yield_total",
         "crates/cog-collaboration/src/observable.rs",
     ),
+    // Which end a generation round's diff came from. Its own rule reads the
+    // tree cell against the total, so the family has to be registered for that
+    // rule to be allowed to read it -- and the ratio the pair states is only
+    // visible across rollouts, which is what the shared store is for.
+    (
+        "collab_change_diff_source_total",
+        "crates/cog-collaboration/src/observable.rs",
+    ),
     (
         "self_evolution_change_rework_total",
         "crates/cog-reflection/src/change_rework.rs",
@@ -2094,9 +2102,9 @@ fn a_set_operand_that_maps_instead_of_filtering_is_reported() {
     // summary promises "finished in the last day and not one of them handed a
     // change to a sink", the expression fires for as long as any cell of the
     // counter has moved.
-    let shipped = "(sum without (pod, container, instance) \
+    let shipped = "(max without (pod, container, instance, job) \
                    (increase(self_evolution_change_yield_total[24h])) > bool 0) \
-                   and on() (sum without (pod, container, instance) \
+                   and on() (max without (pod, container, instance, job) \
                    (increase(self_evolution_change_yield_total{outcome=\"submitted\"}[24h])) == bool 0)";
     let complaints = indicator_on_a_set_operand_complaints(shipped);
     assert_eq!(complaints.len(), 2, "{complaints:?}");
@@ -2108,9 +2116,9 @@ fn a_set_operand_that_maps_instead_of_filtering_is_reported() {
     // The rewrite is accepted: the filter is back on the right operand, and it
     // is `unless` that says "and not".
     assert!(indicator_on_a_set_operand_complaints(
-        "(sum without (pod, container, instance) \
+        "(max without (pod, container, instance, job) \
          (increase(self_evolution_change_yield_total[24h])) > 0) \
-         unless on() (sum without (pod, container, instance) \
+         unless on() (max without (pod, container, instance, job) \
          (increase(self_evolution_change_yield_total{outcome=\"submitted\"}[24h])) > 0)"
     )
     .is_empty());

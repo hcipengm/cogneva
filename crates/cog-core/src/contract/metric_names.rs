@@ -107,6 +107,25 @@ metric_names! {
     REDRIVE_REFUSALS_TOTAL => "cogneva_redrive_refusals_total",
     REDRIVE_BUDGET_LOSSES_TOTAL => "cogneva_redrive_budget_losses_total",
 
+    // cog-collaboration — where a self-evolution run's yield ended, and which
+    // end the round's change artifact came from.
+    //
+    // Both are written by the collecting process, so they belong here rather
+    // than only in an `Observable`'s rollup: a run that produced nothing and a
+    // model that typed the diff instead of taking it from the checkout are
+    // facts about the loop's output, and a reading of them that dies with the
+    // pod cannot answer "has this been happening all along".
+    //
+    // The yield counter is labelled by a closed set rather than split per
+    // cause, for the reason the build store's round counter is: a reader who
+    // has to union six series to ask "did any run end" is reading one question
+    // as six unrelated facts. The absence of a cell means that cause has not
+    // happened yet, which the zero it replaces could not say -- a cell that was
+    // never written and a cell written as zero are the same number and
+    // different facts.
+    SELF_EVOLUTION_CHANGE_YIELD_TOTAL => "self_evolution_change_yield_total",
+    COLLAB_CHANGE_DIFF_SOURCE_TOTAL => "collab_change_diff_source_total",
+
     // cog-memory — operation counters, latency, and ingest reconciliation.
     MEMORY_OPERATIONS_TOTAL => "memory_operations_total",
     MEMORY_OPERATION_LATENCY_MS => "memory_operation_latency_ms",

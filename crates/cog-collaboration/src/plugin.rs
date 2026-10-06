@@ -1,7 +1,7 @@
 //! Collaboration plugin — implements [`cog_core::SystemPlugin`].
 
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Collaboration plugin that publishes [`crate::CollaborationExecutor`] as a
 /// [`cog_core::TaskExecutor`] via pin-style.
@@ -30,7 +30,20 @@ impl cog_core::SystemPlugin for CollaborationPlugin {
         info!("CollaborationPlugin initialized");
 
         // Observable publish (pin-style)
-        ctx.publish_observable(crate::observable::global_observable());
+        let observable = crate::observable::global_observable();
+        // The yield and diff-source counters are written through the metrics
+        // backend rather than kept in the observable, so the sink has to be
+        // taken here: this is the only place the plugin context is in hand, and
+        // the writing methods have nowhere else to get it from.
+        if let Some(backend) = ctx.consume_service::<dyn cog_core::MetricsBackend>() {
+            observable.install_metrics_backend(backend);
+        } else {
+            warn!(
+                "no metrics backend published; the self-evolution yield and \
+                 change-diff-source counters will not be recorded"
+            );
+        }
+        ctx.publish_observable(observable);
         info!("CollaborationPlugin observable published");
 
         let llm_provider = ctx.consume_service::<dyn cog_core::LlmClient>();
