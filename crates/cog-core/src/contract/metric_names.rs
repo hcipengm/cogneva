@@ -403,6 +403,21 @@ metric_names! {
     LLM_UPSTREAM_CLIENT_ERRORS_TOTAL => "llm_upstream_client_errors_total",
     LLM_UPSTREAM_FAILURES_TOTAL => "llm_upstream_failures_total",
     LLM_UPSTREAM_HEALTHY => "llm_upstream_healthy",
+    // Upstreams holding a shape-class rejection (400/404/422) whose cause one
+    // response cannot settle, by `upstream`, 1 or 0. Such a status code has two
+    // opposite causes -- a request malformed enough that any compatible
+    // upstream would refuse it too, or an upstream that is broken for
+    // everybody -- and the response itself does not say which. So the request
+    // path only records the question, and a minimal probe answers it.
+    //
+    // This series is that question's own reading: 1 from the moment a
+    // shape-class response arrives until the prober rules on it, 0 otherwise.
+    // Without it the handoff has no reading of its own, because the only other
+    // series that moves is the prober's verdict -- and that one moves for its
+    // own reasons too, since an upstream gets probed whether or not a request
+    // ever named it. A handoff that runs and one that was never wired then look
+    // the same, which is what makes a fix unverifiable after it lands.
+    LLM_UPSTREAM_SHAPE_ERRORED => "llm_upstream_shape_errored",
     LLM_UPSTREAM_QUOTA_WINDOW_SECS => "llm_upstream_quota_window_secs",
     LLM_UPSTREAM_QUOTA_RESET_UNIX => "llm_upstream_quota_reset_unix",
     LLM_UPSTREAM_CONSECUTIVE_FAILURES => "llm_upstream_consecutive_failures",

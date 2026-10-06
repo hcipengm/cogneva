@@ -853,6 +853,11 @@ impl LlmHealthTable {
         self.last_success_unix.load(Ordering::SeqCst)
     }
 
+    /// 这条上游名下有没有一条**还没定性**的形态类拒绝。
+    fn shape_errored(&self, u: &LlmUpstream) -> bool {
+        self.shape_errored.lock().unwrap().contains(&Self::key(u))
+    }
+
     /// 池全灭：池内每一个上游都处在未到期的嫌疑窗内。
     /// 此时没有任何上游能承接请求，是"池不可用"的观测事实。
     fn all_suspect(&self, upstreams: &[LlmUpstream]) -> bool {
@@ -1198,6 +1203,7 @@ pub const DURABLE_POOL_GAUGES: &[cog_core::MetricName] = &[
     cog_core::metric_names::LLM_POOL_QUOTA_WINDOW_SECS,
     cog_core::metric_names::LLM_UPSTREAM_POSITION,
     cog_core::metric_names::LLM_UPSTREAM_HEALTHY,
+    cog_core::metric_names::LLM_UPSTREAM_SHAPE_ERRORED,
     cog_core::metric_names::LLM_UPSTREAM_QUOTA_WINDOW_SECS,
     cog_core::metric_names::LLM_UPSTREAM_QUOTA_RESET_UNIX,
     cog_core::metric_names::LLM_UPSTREAM_CONSECUTIVE_FAILURES,
@@ -2514,6 +2520,29 @@ async fn refresh_pool_state(state: &AppState) {
             state,
             cog_core::metric_names::LLM_UPSTREAM_POSITION,
             position as f64,
+            &[("upstream", &LlmHealthTable::key(upstream))],
+        )
+        .await;
+    }
+
+    // 请求路交出去的那个问号，按上游读。与上面 `healthy` 那一族不同，这里对
+    // **每一条**上游都有定义：没被请求碰过的上游没有未决问题，报 0 是真话，
+    // 而 `healthy` 的 0 会替它声称一次从没发生过的失败。所以走 `upstreams` 而不是
+    // 走 `readings` 那个循环——那个循环对没有判定的上游 `continue`，而挂名恰恰
+    // 不进判定表，两个状态一起出现的正是"有问号、没判定"这一格。
+    //
+    // 两次跃迁本身就是这条读数的内容：0→1 是请求路把一条形态类拒绝交了出去，
+    // 1→0 是探测器给出了结论。少了它，"交出去"与"从没接过线"在别的序列上同形，
+    // 因为探测器本来就会为了它自己的理由改判（它探的不只是被挂名的那些）。
+    for upstream in upstreams.iter() {
+        record_gauge(
+            state,
+            cog_core::metric_names::LLM_UPSTREAM_SHAPE_ERRORED,
+            if state.llm_health.shape_errored(upstream) {
+                1.0
+            } else {
+                0.0
+            },
             &[("upstream", &LlmHealthTable::key(upstream))],
         )
         .await;
@@ -7673,6 +7702,49 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         }
         assert!(table.due_for_probe(&u));
         assert!(!table.is_suspect(&u));
+    }
+
+    /// 那个问号必须有它自己的读数面，否则修法落地之后没法判它在不在跑：
+    /// 探测器给出的判词是唯一会跟着动的另一条序列，而它为了自己的理由也会动
+    /// （一条上游有没有被请求点过名，都会被探），于是"请求路交出去了"与"根本
+    /// 没接过线"在别的格子上一模一样。这条读数的内容就是那两次跃迁：0→1 是
+    /// 交出去，1→0 是探测器定了性。
+    #[tokio::test]
+    async fn the_pending_shape_question_has_a_series_of_its_own() {
+        let configured = stub_upstream("https://a.example.com", "m1");
+        let state = test_state(vec![configured.clone()]);
+        let key = LlmHealthTable::key(&configured);
+        let series = format!(
+            "{}{{upstream=\"{key}\"}}",
+            cog_core::metric_names::LLM_UPSTREAM_SHAPE_ERRORED.as_str()
+        );
+
+        // 没有未决问题时也要在，且是 0——否则"交出去"只能从一条**缺席**的读数
+        // 里读，而缺席与"这个进程还没发过这一族"同形。
+        refresh_pool_state(&state).await;
+        let before = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert!(
+            before.contains(&format!("{series} 0")),
+            "没有未决问题时这条读数要在、且为 0: {before}"
+        );
+
+        // 最后一条真实请求回了形态类拒绝：问号挂上来，读数置 1。
+        state.llm_health.note_shape_error(&configured);
+        refresh_pool_state(&state).await;
+        let open = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert!(
+            open.contains(&format!("{series} 1")),
+            "一条未定性的形态类拒绝挂上来，这条必须置 1: {open}"
+        );
+
+        // 探测给出结论（这里直接记一次失败代表"这台确实坏了"）之后问号消掉。
+        state.llm_health.note_failure(&configured, 300, None, None);
+        refresh_pool_state(&state).await;
+        let settled = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert!(
+            settled.contains(&format!("{series} 0")),
+            "判词一到手就回 0，否则一个已经答过的问题会被永远挂在读数上: {settled}"
+        );
     }
 
     #[tokio::test]

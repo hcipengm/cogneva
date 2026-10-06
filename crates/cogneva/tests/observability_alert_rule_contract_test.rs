@@ -1331,6 +1331,10 @@ const UNREAD: &[(&str, Unread)] = &[
         },
     ),
     (
+        "llm_upstream_shape_errored",
+        Unread::Gap("a rule cannot state it. The value is 1 only while a shape-class rejection is unadjudicated, which is one probe tick at most, so any window over it would extrapolate a transient into a condition -- the reading's content is its two edges, and a window would erase exactly that. It exists because a handoff that runs and one that was never wired used to look the same on every other series, and telling those apart is a question asked once per change, not a standing bound. What is missing is therefore not a reader but a declared condition: how long an open shape question may stand before it is a fault. Until someone states one, a rule here would only report the prober's own cadence back at us"),
+    ),
+    (
         "cogneva_landing_ci_failure_inherited_total",
         Unread::Gap("landings whose red verdict was traced to the commit they were replayed onto rather than to the change, so the change was kept instead of reverted. The underlying condition -- the base branch's tip is red -- is what mainline_ci_verdict_failed reads, but this series does not carry that fact: it carries the non-action taken because of it, and that warn line names the change and the checks it passed through. A rule would have to declare how many spared landings are a fault, which is a bound on how long the branch may stay red while landings keep landing: a policy nobody stated, so the missing half is a bound rather than a reader"),
     ),
@@ -1355,7 +1359,7 @@ fn unresolved_readers(read: &BTreeSet<String>, name: &str, readers: &[&str]) -> 
 /// that nothing else states must be classified, and calling it a gap raises
 /// this number on purpose -- the point of the ratchet is that the increase is a
 /// decision someone made, not a drift nobody saw.
-const GAPS_AT_CENSUS: usize = 20;
+const GAPS_AT_CENSUS: usize = 21;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {

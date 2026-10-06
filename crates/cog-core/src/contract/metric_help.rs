@@ -445,6 +445,18 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          actually succeeded clears it — the same rule the pool verdict uses",
     ),
     (
+        "llm_upstream_shape_errored",
+        "Whether each LLM upstream is holding a shape-class rejection \
+         (400/404/422) that has not been settled yet, 1 or 0. Such a status \
+         code has two opposite causes -- the request's shape, which any \
+         compatible upstream would refuse as well, or the upstream being broken \
+         for everyone -- and one response does not say which, so the request \
+         path only records the question and a minimal probe answers it. This is \
+         that question's own reading: 1 while it is open, 0 once the prober has \
+         ruled either way. It is not a health verdict and does not feed one; \
+         the upstream stays out of the suspect window until the probe fails",
+    ),
+    (
         "llm_pool_available",
         "Whether any LLM upstream is usable, 1 or 0",
     ),
