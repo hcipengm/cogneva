@@ -1292,17 +1292,23 @@ mod tests {
         metrics.iter().find(|m| m.name == name).cloned()
     }
 
+    /// One row as the store boundary sees it: series name, value, label set.
+    ///
+    /// Spelled once and named: the boundary's shape is the whole point of this
+    /// store, and repeating the tuple in three signatures buries it.
+    type RecordedRow = (String, f64, HashMap<String, String>);
+
     /// A store that keeps what it was handed.
     ///
     /// The durable families have no map to read after the call — that is what
     /// moved — so the only place an assertion can sit is the store boundary.
     #[derive(Default)]
     struct RecordingBackend {
-        counters: std::sync::Mutex<Vec<(String, f64, HashMap<String, String>)>>,
+        counters: std::sync::Mutex<Vec<RecordedRow>>,
     }
 
     impl RecordingBackend {
-        fn counters(&self) -> Vec<(String, f64, HashMap<String, String>)> {
+        fn counters(&self) -> Vec<RecordedRow> {
             self.counters.lock().unwrap().clone()
         }
 

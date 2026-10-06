@@ -56,7 +56,7 @@ jobs:
           fetch-depth: 0
       # rustfmt and clippy are requested rather than inherited: the pipeline's
       # format gate runs `cargo fmt --check` and its lint gate runs
-      # `cargo clippy --workspace`, and its tests run both here. Whether the
+      # `cargo clippy --workspace --all-targets`, and its tests run both here. Whether the
       # action's default profile happens to carry either is not something a gate
       # that refuses changes may depend on.
       - uses: dtolnay/rust-toolchain@stable
@@ -203,7 +203,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - run: cargo clippy --workspace -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   entry-scripts:
     name: Entry Scripts Lint
