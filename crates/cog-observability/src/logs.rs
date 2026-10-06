@@ -522,12 +522,30 @@ impl LokiPushClient {
             );
             labels.insert("level".into(), level.clone());
             let timestamp_ns = format!("{}", entry.timestamp.timestamp_nanos_opt().unwrap_or(0));
-            let line = format!(
+            let mut line = format!(
                 "[{}] {} {}",
                 entry.timestamp.to_rfc3339(),
                 level.to_uppercase(),
                 entry.message
             );
+            // This mirror is the durable face, and the layer above fills
+            // `context` with every field the event carried -- including the
+            // module `target`, which nothing else here publishes. Rendering only
+            // the message turned each structured line into an assertion with no
+            // subject: a probe failure reached the store saying only that it had
+            // failed, with the upstream and the error text gone, and the console
+            // (which does print fields) was the only place they ever appeared.
+            // Sorted so the same event reads the same way on every scrape; a
+            // HashMap's order would make two lines from one call differ.
+            let mut fields: Vec<(&String, &serde_json::Value)> = entry.context.iter().collect();
+            fields.sort_by(|a, b| a.0.cmp(b.0));
+            for (name, value) in fields {
+                let text = match value {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                line.push_str(&format!(", {name}: {text}"));
+            }
             streams
                 .entry(labels)
                 .or_default()
@@ -689,6 +707,48 @@ mod tests {
         ]);
         let streams = payload.get("streams").and_then(|v| v.as_array()).unwrap();
         assert_eq!(streams.len(), 2, "info 两条合一，warn 单独一条");
+    }
+
+    /// 耐久行必须带事件的字段。`context` 是这一层专门收集的，只渲染 message
+    /// 会把「上游探测仍失败」这类带载荷的事件降成一句没有主语的话——库能看见
+    /// 它失败了，看不见是谁、为什么。
+    #[test]
+    fn payload_line_carries_the_events_fields() {
+        let client = LokiPushClient::new("http://loki:3100").with_label("service", "probe");
+        let mut with_fields = entry("warn", "LLM 上游探测仍失败，指数加窗");
+        with_fields
+            .context
+            .insert("upstream".into(), serde_json::json!("https://a/v1"));
+        with_fields
+            .context
+            .insert("error".into(), serde_json::json!("HTTP 429: quota exceeded"));
+        with_fields
+            .context
+            .insert("consecutive_failures".into(), serde_json::json!(9));
+
+        let line_of = |e: LogEntry| {
+            let payload = client.build_payload(vec![e]);
+            payload["streams"][0]["values"][0][1]
+                .as_str()
+                .expect("line")
+                .to_string()
+        };
+        let line = line_of(with_fields.clone());
+        assert!(line.contains("LLM 上游探测仍失败"), "message kept: {line}");
+        assert!(
+            line.contains("upstream: https://a/v1"),
+            "upstream carried: {line}"
+        );
+        assert!(
+            line.contains("error: HTTP 429: quota exceeded"),
+            "error carried: {line}"
+        );
+        assert!(
+            line.contains("consecutive_failures: 9"),
+            "non-string field carried: {line}"
+        );
+        // 键序确定：同一事件两次必须逐字节相同（HashMap 的迭代序不是）
+        assert_eq!(line, line_of(with_fields), "field order must be stable");
     }
 
     /// 数事件的假输出层：模拟早期兜底栈与升级后的正式栈。
