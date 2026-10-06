@@ -1170,6 +1170,119 @@ struct PoolObservability {
     alerts: Option<Arc<PostgresAlertStore>>,
     /// 逐调用 token 计量明细（PG）。未配置数据库时 None，计量退化为指标+时序。
     usage: Option<Arc<LlmUsageStore>>,
+    /// 池读数的耐久面（共享 metrics store）。未配置数据库时为 None。
+    durable: Option<Arc<DurableGauges>>,
+}
+
+/// 值没变时的重写周期。它只服务于"上一次写失败"的自愈：值一变就立刻写，
+/// 这条周期只保证一个不再变化的读数不会永远停在一次失败的陈旧值上。
+const DURABLE_GAUGE_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(1800);
+
+/// 一次共享写的上界。这条路径在池状态发布循环里（不是请求路径），但循环一停
+/// 池判定就不再续期，所以等一个不响应的 PG 必须有上限。
+const DURABLE_GAUGE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// 池读数的耐久面：把同一个 gauge 再往共享 metrics store 写一份，让读数活得比
+/// 产出它的进程久。
+///
+/// 进程内那条**永远先发生**，也永远是本进程 `/metrics` 编出来的真值——PG 不可用
+/// 不该让池读数从观测面上消失，网关的核心职责是代理与凭证代持。所以这里只做加法，
+/// 且是**值变了才写**的加法：样本日志按容量轮转，每拍都落一份等于拿别的读数的寿命
+/// 换自己每条 tick 一行，而一条 gauge 的耐久面要的是"最后一个值还在"，不是"每拍
+/// 都留一行"。写失败不更新记录 ⇒ 下一拍自动重试。
+///
+/// 只覆盖池状态发布循环里的 gauge。请求路径上的计数器不走这里：那条路上不经任何
+/// 外部存储，是网关"始终可用"这条边界的原话。
+struct DurableGauges {
+    metrics: Arc<dyn MetricsBackend>,
+    /// 序列 → 上一次写成功的值与时刻。缺席 = 这个序列还没写成功过（含刚启动）。
+    written: std::sync::Mutex<HashMap<String, (f64, std::time::Instant)>>,
+    /// 写失败只报一次：池不可用期间每拍都会失败，每拍一条告警等于把日志刷满，
+    /// 而刷满的日志没人读。写成功时复位，于是每次故障各报一次。
+    reported: AtomicBool,
+    /// 值没变时的重写周期。做成字段而不是直接读常量，好让测试按秒级验证这条规则，
+    /// 不必等半小时。
+    heartbeat: std::time::Duration,
+}
+
+/// 一条序列的键。标签值里可能出现任何字符，所以分隔符选它们不会用的那个控制符，
+/// 而不是逗号或竖线——那些在标签值里是合法内容，撞上就会把两条序列读成一条。
+fn durable_gauge_key(name: &str, labels: &[(&str, &str)]) -> String {
+    let mut pairs: Vec<(&str, &str)> = labels.to_vec();
+    pairs.sort_unstable();
+    let mut key = String::from(name);
+    for (k, v) in pairs {
+        key.push('\u{1f}');
+        key.push_str(k);
+        key.push('=');
+        key.push_str(v);
+    }
+    key
+}
+
+impl DurableGauges {
+    fn new(metrics: Arc<dyn MetricsBackend>) -> Self {
+        Self {
+            metrics,
+            written: std::sync::Mutex::new(HashMap::new()),
+            reported: AtomicBool::new(false),
+            heartbeat: DURABLE_GAUGE_HEARTBEAT,
+        }
+    }
+
+    /// 只给测试用：把心跳周期缩到可观测的尺度。
+    #[cfg(test)]
+    fn with_heartbeat(metrics: Arc<dyn MetricsBackend>, heartbeat: std::time::Duration) -> Self {
+        Self {
+            heartbeat,
+            ..Self::new(metrics)
+        }
+    }
+
+    async fn record(&self, name: cog_core::MetricName, value: f64, labels: &[(&str, &str)]) {
+        let key = durable_gauge_key(name.as_str(), labels);
+        {
+            let written = self
+                .written
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some((last, at)) = written.get(&key) {
+                // 这些读数的取值域是 0/1、小整数计数与 unix 秒，没有 NaN。
+                if *last == value && at.elapsed() < self.heartbeat {
+                    return;
+                }
+            }
+        }
+        let map: HashMap<String, String> = labels
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        match tokio::time::timeout(
+            DURABLE_GAUGE_WRITE_TIMEOUT,
+            self.metrics.record_gauge(name, value, map),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                self.written
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(key, (value, std::time::Instant::now()));
+                self.reported.store(false, Ordering::Relaxed);
+            }
+            Ok(Err(e)) => self.report_once(&e.to_string()),
+            Err(_) => self.report_once("写入超时"),
+        }
+    }
+
+    fn report_once(&self, why: &str) {
+        if !self.reported.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                reason = %why,
+                "池读数写共享 metrics store 失败；耐久面暂时落后，进程内读数不受影响"
+            );
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1298,8 +1411,18 @@ async fn record_gauge(
         .iter()
         .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
         .collect();
-    if let Err(e) = state.pool_obs.metrics.record_gauge(name, value, map).await {
+    if let Err(e) = state
+        .pool_obs
+        .metrics
+        .record_gauge(name, value, map.clone())
+        .await
+    {
         tracing::debug!(error = %e, metric = %name, "指标写入失败");
+    }
+    // 进程内那条已经写完了，这里只是让它活得比进程久。耐久面不可用时这条是空操作，
+    // 而上一条照旧——池读数不该因为共享库写不进去就从观测面上消失。
+    if let Some(durable) = &state.pool_obs.durable {
+        durable.record(name, value, labels).await;
     }
 }
 
@@ -4978,12 +5101,39 @@ async fn build_pool_observability(
         None => None,
     };
 
+    // 池读数的耐久面：与 alerts / usage 同一个 database_url，同一条降级约定
+    // （连不上只 WARN，不阻止网关启动——观测是附加能力，代理与凭证代持才是本职）。
+    // 它是加法而不是替代：进程内注册表照旧每拍都写，那条永远先发生、也始终可用。
+    let durable = match config.database_url.as_deref() {
+        Some(url) => match sqlx::PgPool::connect(url).await {
+            Ok(pool) => {
+                let backend = cog_storage::PostgresMetricsBackend::new(pool);
+                match backend.init_schema().await {
+                    Ok(()) => {
+                        tracing::info!("池读数耐久面已接到共享 metrics store");
+                        Some(Arc::new(DurableGauges::new(Arc::new(backend))))
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "metrics 建表失败，池读数耐久面降级为关闭");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "PostgreSQL 连接失败，池读数耐久面降级为关闭");
+                None
+            }
+        },
+        None => None,
+    };
+
     (
         Arc::new(PoolObservability {
             metrics,
             analytics,
             alerts,
             usage,
+            durable,
         }),
         redis,
     )
@@ -5233,6 +5383,7 @@ pub async fn run_from_env(build_revision: Option<&str>) -> Result<(), Box<dyn st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     fn test_upstream() -> LlmUpstream {
         LlmUpstream {
@@ -7864,6 +8015,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 analytics: None,
                 alerts: None,
                 usage: None,
+                durable: None,
             }),
             pool_signal: None,
             pool_down: Arc::new(AtomicBool::new(false)),
@@ -8445,5 +8597,218 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let revved = outbound_identity(Some("abc1234"));
         assert!(revved.starts_with(&bare), "{revved}");
         assert!(revved.contains("abc1234"), "{revved}");
+    }
+
+    /// 一条被记下来的 gauge：名字、值、标签集。
+    type RecordedGauge = (String, f64, HashMap<String, String>);
+
+    /// 计调用次数、可按需失败的 metrics backend。耐久面的判据是"写了几次"，
+    /// 所以计数本身是被测对象，不能只看最后值对不对。
+    #[derive(Default)]
+    struct CountingMetricsBackend {
+        writes: AtomicUsize,
+        /// 还剩几次调用要失败。用来验证失败之后下一拍会重试，
+        /// 而不是把失败的那次当成已经写进去。
+        fail_first: AtomicUsize,
+        gauges: std::sync::Mutex<Vec<RecordedGauge>>,
+    }
+
+    impl CountingMetricsBackend {
+        fn writes(&self) -> usize {
+            self.writes.load(Ordering::SeqCst)
+        }
+
+        fn recorded(&self) -> Vec<RecordedGauge> {
+            self.gauges.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MetricsBackend for CountingMetricsBackend {
+        async fn record_gauge(
+            &self,
+            name: cog_core::MetricName,
+            value: f64,
+            labels: HashMap<String, String>,
+        ) -> cog_core::SFResult<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            if self.fail_first.load(Ordering::SeqCst) > 0 {
+                self.fail_first.fetch_sub(1, Ordering::SeqCst);
+                return Err(cog_core::SFError::Database("store 不可达".into()));
+            }
+            self.gauges
+                .lock()
+                .unwrap()
+                .push((name.as_str().to_string(), value, labels));
+            Ok(())
+        }
+
+        // 耐久面只碰 record_gauge，其余方法这份测试用不到；写全是为了让
+        // "哪条路径没被测到"在编译期就显形，而不是靠人记得。
+        async fn record_counter(
+            &self,
+            _: cog_core::MetricName,
+            _: f64,
+            _: HashMap<String, String>,
+        ) -> cog_core::SFResult<()> {
+            unimplemented!("耐久面只写 gauge")
+        }
+        async fn record_histogram(
+            &self,
+            _: cog_core::MetricName,
+            _: f64,
+            _: HashMap<String, String>,
+        ) -> cog_core::SFResult<()> {
+            unimplemented!("耐久面只写 gauge")
+        }
+        async fn query_gauge_range(
+            &self,
+            _: &str,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!("耐久面只写 gauge")
+        }
+        async fn query_gauge_latest(
+            &self,
+            _: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!("耐久面只写 gauge")
+        }
+        async fn query_counter_range(
+            &self,
+            _: &str,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!("耐久面只写 gauge")
+        }
+        async fn query_counter_totals(
+            &self,
+            _: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!("耐久面只写 gauge")
+        }
+        async fn query_histogram_totals(
+            &self,
+            _: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::HistogramTotals>> {
+            unimplemented!("耐久面只写 gauge")
+        }
+        async fn query_histogram_range(
+            &self,
+            _: &str,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!("耐久面只写 gauge")
+        }
+        async fn list_metric_names(
+            &self,
+            _: cog_core::MetricType,
+        ) -> cog_core::SFResult<Vec<String>> {
+            unimplemented!("耐久面只写 gauge")
+        }
+        async fn health_check(&self) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_pool_gauge_reaches_the_store_once() {
+        // 池读数是每拍刷的 gauge，而样本日志按容量轮转：每拍落一行等于拿别的读数的
+        // 寿命换自己一条没变过的值。没变就不写。
+        let backend = Arc::new(CountingMetricsBackend::default());
+        let durable = DurableGauges::new(backend.clone());
+        for _ in 0..5 {
+            durable
+                .record(cog_core::metric_names::LLM_POOL_AVAILABLE, 1.0, &[])
+                .await;
+        }
+        assert_eq!(backend.writes(), 1);
+        assert_eq!(backend.recorded()[0].1, 1.0, "写下去的是当前值");
+    }
+
+    #[tokio::test]
+    async fn a_changed_pool_gauge_reaches_the_store_again() {
+        // 值一变就得写：池从"可用"翻成"全灭"是这一族里唯一要被看见的时刻。
+        let backend = Arc::new(CountingMetricsBackend::default());
+        let durable = DurableGauges::new(backend.clone());
+        for value in [1.0, 0.0, 0.0, 1.0] {
+            durable
+                .record(cog_core::metric_names::LLM_POOL_AVAILABLE, value, &[])
+                .await;
+        }
+        assert_eq!(backend.writes(), 3, "四拍里有两拍同值");
+        assert_eq!(backend.recorded().last().unwrap().1, 1.0);
+    }
+
+    #[tokio::test]
+    async fn the_labels_are_part_of_the_series_identity() {
+        // 同一个值落在两个上游上各是一条序列：按名字去重会把"某个上游坏了"
+        // 从读数上抹平。
+        let backend = Arc::new(CountingMetricsBackend::default());
+        let durable = DurableGauges::new(backend.clone());
+        for upstream in ["a", "b"] {
+            durable
+                .record(
+                    cog_core::metric_names::LLM_UPSTREAM_HEALTHY,
+                    1.0,
+                    &[("upstream", upstream)],
+                )
+                .await;
+        }
+        assert_eq!(backend.writes(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_is_retried_on_the_next_tick() {
+        // 失败的那次不算写成功：否则一个瞬时故障会把这个序列的耐久值永远停在旧值上，
+        // 直到它下一次变化——而"不再变化"正是池恢复之后的样子。
+        let backend = Arc::new(CountingMetricsBackend::default());
+        backend.fail_first.store(1, Ordering::SeqCst);
+        let durable = DurableGauges::new(backend.clone());
+        durable
+            .record(cog_core::metric_names::LLM_POOL_AVAILABLE, 1.0, &[])
+            .await;
+        durable
+            .record(cog_core::metric_names::LLM_POOL_AVAILABLE, 1.0, &[])
+            .await;
+        assert_eq!(backend.writes(), 2, "第二拍必须再试一次");
+        assert_eq!(backend.recorded().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_value_that_never_changes_is_rewritten_on_the_heartbeat() {
+        // 心跳只服务于自愈：写失败过、或这一行被别的清理动过，值不变也会重新落地。
+        let backend = Arc::new(CountingMetricsBackend::default());
+        let durable =
+            DurableGauges::with_heartbeat(backend.clone(), std::time::Duration::from_millis(30));
+        for _ in 0..2 {
+            durable
+                .record(cog_core::metric_names::LLM_POOL_AVAILABLE, 1.0, &[])
+                .await;
+        }
+        assert_eq!(backend.writes(), 1, "心跳周期内不重复写");
+        tokio::time::sleep(std::time::Duration::from_millis(45)).await;
+        durable
+            .record(cog_core::metric_names::LLM_POOL_AVAILABLE, 1.0, &[])
+            .await;
+        assert_eq!(backend.writes(), 2);
+    }
+
+    #[test]
+    fn the_series_key_separates_labels_a_naive_join_would_merge() {
+        // 标签值里可以出现任何字符：用逗号或竖线拼键，这两条会拼出同一个键，
+        // 于是其中一条的耐久值永远写不进去。
+        assert_ne!(
+            durable_gauge_key("m", &[("a", "x|b=y")]),
+            durable_gauge_key("m", &[("a", "x"), ("b", "y")])
+        );
+        // 顺序不构成身份：同一个标签集换个书写顺序还是同一条序列。
+        assert_eq!(
+            durable_gauge_key("m", &[("a", "1"), ("b", "2")]),
+            durable_gauge_key("m", &[("b", "2"), ("a", "1")])
+        );
     }
 }
