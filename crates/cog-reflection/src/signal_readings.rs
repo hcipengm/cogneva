@@ -23,7 +23,7 @@
 //! throttled by its own cooldown, is blind in exactly the way a stopped watcher
 //! is blind.
 //!
-//! Five series, and the division between them is deliberate:
+//! Six series, and the division between them is deliberate:
 //!
 //! - `cogneva_signal_watcher_running` -- 1 on the process that armed the
 //!   watcher loop, 0 on every other. Published by every process, because the
@@ -33,7 +33,18 @@
 //! - `cogneva_signal_watcher_ticks_total` -- rounds this process's watcher has
 //!   completed, counted whether or not the round found anything. This is the
 //!   denominator: signals over ticks is a rate, and a rate from a watcher that
-//!   has stopped ticking is not a small number, it is no number at all.
+//!   has stopped ticking is not a small number, it is no number at all. A held
+//!   round ran the gate and stood down, so it counts here too -- if it did not,
+//!   the denominator would freeze exactly when a reader most needs to tell a
+//!   pause from a death.
+//! - `cogneva_signal_watcher_held_total` -- rounds this watcher stood down on the
+//!   LLM pool gate instead of watching. It is a counter at the tick count's own
+//!   cadence, one increment per round that stood down, and that is what makes
+//!   the pause countable rather than inferred: `ticks - held` is the rounds that
+//!   actually looked, and a window where `held` grows is a window this watcher
+//!   spent not watching. A pause left to be read off a denominator that stopped
+//!   moving would not be distinguishable from a loop that died, and the two want
+//!   opposite responses.
 //! - `cogneva_signal_watcher_signals_total{outcome}` -- one increment per signal
 //!   the watcher found, by what it did with it.
 //! - `cogneva_signal_watcher_guard_entries` -- keys the report-cooldown store
@@ -76,6 +87,9 @@ pub const SIGNAL_WATCHER_RUNNING_METRIC: &str = "cogneva_signal_watcher_running"
 
 /// Rounds this process's watcher has completed, signal or no signal.
 pub const SIGNAL_TICKS_METRIC: &str = "cogneva_signal_watcher_ticks_total";
+
+/// Rounds that stood down on the LLM pool gate instead of watching.
+pub const SIGNAL_HELD_METRIC: &str = "cogneva_signal_watcher_held_total";
 
 /// Signals the watcher found, by what it did with each one.
 pub const SIGNAL_OUTCOMES_METRIC: &str = "cogneva_signal_watcher_signals_total";
@@ -178,6 +192,7 @@ impl SignalOutcome {
 /// tests beside it.
 pub struct SignalWatcherReadings {
     running: AtomicBool,
+    held: AtomicU64,
     ticks: AtomicU64,
     signals: [AtomicU64; SIGNAL_OUTCOMES.len()],
     guard_entries: AtomicU64,
@@ -194,6 +209,7 @@ impl SignalWatcherReadings {
     pub fn new() -> Self {
         Self {
             running: AtomicBool::new(false),
+            held: AtomicU64::new(0),
             ticks: AtomicU64::new(0),
             signals: std::array::from_fn(|_| AtomicU64::new(0)),
             guard_entries: AtomicU64::new(0),
@@ -212,8 +228,24 @@ impl SignalWatcherReadings {
 
     /// One completed round, whether or not it found anything. This is what
     /// makes "no signal" countable rather than inferred.
+    ///
+    /// A round the pool gate held off counts too: the loop ran it and decided
+    /// to stand down, which [`Self::held_round`] records. Counting only the
+    /// rounds that watched would freeze this series for as long as the gate is
+    /// closed, which is the reading a dead loop leaves.
     pub fn tick(&self) {
         self.ticks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One round that stood down on the LLM pool gate instead of watching.
+    ///
+    /// At the tick count's own cadence, one increment per stood-down round, so
+    /// the two are read together: `ticks - held` is the rounds that looked, and
+    /// the growth of this series is the pause. A flag instead would say the
+    /// watcher is standing down now but not for how long, and "how long" is the
+    /// question the two want answered together.
+    pub fn held_round(&self) {
+        self.held.fetch_add(1, Ordering::Relaxed);
     }
 
     /// One signal and what became of it.
@@ -266,6 +298,15 @@ impl Observable for SignalWatcherReadings {
         out.push(RawMetric::new(
             SIGNAL_TICKS_METRIC,
             self.ticks.load(Ordering::Relaxed) as f64,
+        ));
+        // Published from the start, like the reclaim count: zero rounds stood
+        // down is a true statement about a watcher that has run and watched.
+        // Withholding it until the first stood-down round would leave "never
+        // stood down" and "never published the question" as the same missing
+        // series.
+        out.push(RawMetric::new(
+            SIGNAL_HELD_METRIC,
+            self.held.load(Ordering::Relaxed) as f64,
         ));
         for outcome in SIGNAL_OUTCOMES {
             out.push(
@@ -342,7 +383,52 @@ mod tests {
             0.0
         );
         assert!(values(&readings, SIGNAL_TICKS_METRIC).await.is_empty());
+        assert!(values(&readings, SIGNAL_HELD_METRIC).await.is_empty());
         assert!(values(&readings, SIGNAL_OUTCOMES_METRIC).await.is_empty());
+    }
+
+    /// A round the pool gate held off is still a round. It moves the tick count
+    /// and counts one stood-down round, and neither of those is a signal: the
+    /// pair is how a reader tells a watcher that is standing down from one that
+    /// died -- both stop producing signals, and only the first keeps ticking.
+    #[tokio::test]
+    async fn a_held_round_ticks_and_counts_the_stood_down_round() {
+        let readings = SignalWatcherReadings::new();
+        readings.mark_running();
+        assert_eq!(values(&readings, SIGNAL_HELD_METRIC).await[0].1, 0.0);
+
+        readings.tick();
+        readings.held_round();
+        readings.tick();
+        readings.held_round();
+        // A round that watched: it ticks and adds nothing to the stood-down
+        // count, which is what makes `ticks - held` the rounds that looked.
+        readings.tick();
+
+        assert_eq!(values(&readings, SIGNAL_TICKS_METRIC).await[0].1, 3.0);
+        assert_eq!(values(&readings, SIGNAL_HELD_METRIC).await[0].1, 2.0);
+
+        for (label, value) in outcome_values(&readings).await {
+            assert_eq!(
+                value, 0.0,
+                "{label} moved on a round that looked at nothing"
+            );
+        }
+    }
+
+    /// The stood-down count is there before the first round can raise it: a zero
+    /// on a running watcher says "nothing stood down", which is a claim it can
+    /// make from the start. Publishing it only once the gate had closed would
+    /// leave that state missing rather than zero, and a watcher that never
+    /// stood down would read the same as one that never published the question.
+    #[tokio::test]
+    async fn the_stood_down_count_is_published_before_the_first_round() {
+        let readings = SignalWatcherReadings::new();
+        readings.mark_running();
+        assert_eq!(
+            values(&readings, SIGNAL_HELD_METRIC).await,
+            vec![(None, 0.0)]
+        );
     }
 
     /// Arming the watcher publishes every outcome value, before any signal has

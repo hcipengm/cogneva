@@ -355,6 +355,17 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &[],
         "crates/cog-reflection/src/signal_readings.rs",
     ),
+    // The other half of that pair: while the pool gate has the watcher standing
+    // down, the tick count keeps moving, because a denominator that froze would
+    // read like a loop that died. This is the series that counts the rounds it
+    // stood down for, at the tick count's own cadence, so `ticks - held` is the
+    // rounds that actually looked and a panel can tell a pause from a quiet
+    // system without inferring it from a counter's silence.
+    (
+        "cogneva_signal_watcher_held_total",
+        &[],
+        "crates/cog-reflection/src/signal_readings.rs",
+    ),
     (
         "cogneva_signal_watcher_signals_total",
         &["outcome"],

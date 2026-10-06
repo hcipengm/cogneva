@@ -879,6 +879,21 @@ fn llm_held_off(gate: Option<&Arc<dyn cog_core::SchedulerGate>>) -> bool {
     gate.is_some_and(|g| g.is_paused_kind(cog_core::TaskClass::LlmDependent))
 }
 
+/// What a round the pool gate held off does to this process's readings.
+///
+/// Two things, and both are deliberate. The round is stamped, because the tick
+/// count is the denominator the signal counts are read against and a denominator
+/// that freezes when the gate closes is how a dead loop reads. And the round is
+/// counted as stood down, so the pause is a series of its own rather than an
+/// inference from a counter that stopped moving. Standing down silently would
+/// leave a pause looking like the quiet system the gate exists to tell it apart
+/// from; freezing the count would leave it looking like a loop that died. The
+/// two series together say which of the three it is.
+fn stand_down(readings: &SignalWatcherReadings) {
+    readings.tick();
+    readings.held_round();
+}
+
 /// Background loop; follows the same shutdown pattern as the baseline port
 /// trigger loop.
 pub fn spawn_signal_watcher_loop(
@@ -938,11 +953,9 @@ pub fn spawn_signal_watcher_loop(
                                         "LLM upstream pool unavailable; self-discovery signals held until it recovers"
                                     );
                                 }
-                                // The round is not run and, below, is not stamped
-                                // either: a held-off round looked at nothing, and a
-                                // tick count that never moved is how "the watcher is
-                                // not running" reads. Standing down silently would
-                                // make a pause indistinguishable from a quiet system.
+                                // Stamped and reported as standing down, not
+                                // skipped: see `stand_down`.
+                                stand_down(&readings);
                                 continue;
                             }
                             held = false;
@@ -1642,5 +1655,37 @@ mod tests {
         let llm: Arc<dyn cog_core::SchedulerGate> =
             Arc::new(OneClassGate(cog_core::TaskClass::LlmDependent));
         assert!(llm_held_off(Some(&llm)));
+    }
+
+    /// A held-off round is a round: it moves the denominator and counts one
+    /// stood-down round, and it counts no signal. A pause has to be readable as
+    /// itself -- the tick alone would leave it looking like the quiet system the
+    /// gate was added to tell it apart from, and freezing the tick would leave
+    /// it looking like a loop that died.
+    #[tokio::test]
+    async fn a_held_off_round_ticks_without_counting_a_signal() {
+        let readings = SignalWatcherReadings::new();
+        readings.mark_running();
+
+        stand_down(&readings);
+        stand_down(&readings);
+
+        use cog_core::Observable;
+        let metrics = readings.collect_metrics("").await.unwrap();
+        let value = |name: &str| {
+            metrics
+                .iter()
+                .find(|m| m.name == name)
+                .map(|m| m.value)
+                .unwrap_or(-1.0)
+        };
+        assert_eq!(value(crate::signal_readings::SIGNAL_TICKS_METRIC), 2.0);
+        assert_eq!(value(crate::signal_readings::SIGNAL_HELD_METRIC), 2.0);
+        let signals: f64 = metrics
+            .iter()
+            .filter(|m| m.name == crate::signal_readings::SIGNAL_OUTCOMES_METRIC)
+            .map(|m| m.value)
+            .sum();
+        assert_eq!(signals, 0.0, "a held-off round counted a signal");
     }
 }
