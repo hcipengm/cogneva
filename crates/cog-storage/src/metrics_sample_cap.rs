@@ -374,17 +374,29 @@ impl SampleLogCap {
         }
 
         let mut remaining = held - budget;
+        // Whether the deletion order ran out of rows it was allowed to take.
+        // That is not the same claim as the count taken after the deletes
+        // still standing above the budget, and reading the second as the first
+        // is wrong by construction: the log is written while a pass runs, so a
+        // sweep that took every row it was asked to can recount a few rows
+        // higher and read as one the floor stopped. Measured on the live log:
+        // a pass removed its whole 855-row overshoot and recounted 200,003
+        // against a budget of 200,000, and published the floor verdict on
+        // those three rows. Only a batch that took nothing says the log is
+        // resting on its floor.
+        let mut stalled = false;
         while remaining > 0 {
             let batch = self.delete_surplus(remaining).await?;
             outcome.removed += batch;
             remaining -= batch as i64;
             if batch == 0 {
+                stalled = true;
                 break;
             }
         }
 
         outcome.held = self.row_count().await?;
-        outcome.floor_held = outcome.held > budget;
+        outcome.floor_held = stalled && outcome.held > budget;
         Ok(outcome)
     }
 

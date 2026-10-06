@@ -386,6 +386,69 @@ async fn the_floor_does_not_stop_a_sweep_the_budget_can_meet() {
     drop_probe(&pool, table).await;
 }
 
+/// A sweep that reaches the budget is not a sweep the floor stopped, even when
+/// the count taken afterwards stands above the budget.
+///
+/// The log is written while a pass runs, so the two claims come apart by
+/// construction: removing the whole overshoot and recounting a few rows higher
+/// is an ordinary pass, and reporting it as the floor produces the one verdict
+/// that tells an operator to move the budget. The writes are made to arrive
+/// during the pass the only way a test can make deterministic — a statement
+/// trigger on the probe table that puts one row back for every batch the sweep
+/// takes, standing in for the traffic that keeps the log moving.
+#[tokio::test]
+#[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+async fn a_sweep_that_reaches_the_budget_is_not_a_sweep_the_floor_stopped() {
+    let table = "metrics_sample_cap_probe_moving";
+    let pool = PgPool::connect(&database_url()).await.unwrap();
+    fresh_probe(&pool, table).await;
+    insert_aged(&pool, table, 300, "2 days").await;
+
+    sqlx::query(&format!(
+        "CREATE OR REPLACE FUNCTION {table}_writer() RETURNS TRIGGER AS $$
+         BEGIN
+             INSERT INTO {table} (metric_type, name, value, timestamp)
+             VALUES ('counter', 'probe_total', 1.0, NOW());
+             RETURN NULL;
+         END; $$ LANGUAGE plpgsql"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "CREATE TRIGGER {table}_writer AFTER DELETE ON {table}
+         EXECUTE FUNCTION {table}_writer()"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Every row here is a counter's, so the deletion order can take all 300
+    // and the budget of 100 is well within reach.
+    let outcome = cap(pool.clone(), table, 100).sweep_once().await.unwrap();
+
+    assert_eq!(
+        outcome.removed, 200,
+        "the pass must take its whole overshoot"
+    );
+    assert_eq!(
+        outcome.held, 101,
+        "the row the trigger put back is what pushes the count over"
+    );
+    assert!(
+        !outcome.floor_held,
+        "a pass that took every row it was asked to did not stop at the floor: \
+         the count above the budget is the writes, not the heads"
+    );
+    drop_probe(&pool, table).await;
+    // The trigger outlives the table it was attached to, so the function is
+    // dropped only once nothing depends on it.
+    sqlx::query(&format!("DROP FUNCTION IF EXISTS {table}_writer()"))
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
 /// The role gate, read at both ends and at the switch that decides whether the
 /// loop contends for it at all.
 ///
