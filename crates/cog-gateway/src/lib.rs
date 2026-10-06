@@ -1116,6 +1116,15 @@ async fn listed_metric_names(
 /// name outside the registry cannot be written by this build at all. That is a
 /// fact about the binary, not a guess about a series.
 ///
+/// The registry is the *serving process's* build, though, and a rollout briefly
+/// puts two builds against one store: a name the newer build has already written
+/// is outside the older process's registry until it rolls too, so this fires for
+/// the length of that overlap and clears itself when the lagging process is
+/// replaced. That firing is honest — the name really is outside that build — and
+/// it is not a series whose producer is gone. Which is why the summary offered
+/// to the operator names this case instead of promising that only retirement or
+/// a dropped registration can produce it.
+///
 /// Retired names never reach here: [`listed_metric_names`] has already dropped
 /// them, which is the state a held-but-unwritten series is supposed to end in.
 ///
