@@ -122,9 +122,9 @@ pub struct PinConsumer {
     /// rather than a designed degradation.
     pub required: bool,
     /// The read happened while `init` was running.  Init runs a topological
-    /// layer at a time and its plugins concurrently, so an init-time read of a
-    /// pin published by a plugin the reader does not depend on can race the
-    /// publish; a read during `start` cannot.
+    /// layer at a time and its plugins concurrently, so an init-time read is in
+    /// time only where the publisher's layer completed before the reader's
+    /// began; a read during `start` has every layer behind it already.
     pub during_init: bool,
 }
 
@@ -206,9 +206,11 @@ impl PluginContext {
         }
     }
 
-    /// Mark the point where the runner leaves `init` and enters `start`.  Reads
-    /// recorded while it is set are the ones a missing dependency edge can make
-    /// race their publisher.
+    /// Mark the point where the runner leaves `init` and enters `start`.  While
+    /// it is set, only the current layer's plugins are running, so a read
+    /// recorded here has no layer boundary behind it unless its publisher's
+    /// layer already completed — which is the case a missing dependency edge
+    /// leaves to chance.
     pub(crate) fn set_during_init(&self, during_init: bool) {
         self.inner.during_init.store(during_init, Ordering::Relaxed);
     }
@@ -508,7 +510,9 @@ pub struct PinAudit {
     /// Pins with more than one publisher.  `consume` returns the first, so
     /// which instance a reader gets depends on init order.
     pub multi_published: Vec<(Pin, Vec<Option<&'static str>>)>,
-    /// Init-time reads that a missing `requires` edge left unordered.
+    /// Init-time reads that a missing `requires` edge left unordered.  The
+    /// verdict is on the declaration, not on the layer plan: a read the plan
+    /// happens to order is still one nothing would have caught being reordered.
     pub unordered_init_reads: Vec<UnorderedInitRead>,
     /// Distinct pins observed, and the totals behind them.
     pub pins: usize,
@@ -556,6 +560,13 @@ impl PinAudit {
                 if !consumer.during_init || reader == publisher {
                     continue;
                 }
+                // Declared order is what this test reads, and it is deliberately
+                // the weaker question: where the layers happen to put the
+                // publisher first the read is in time anyway, and where they do
+                // not, nothing is left to catch it.  Preferring the declaration
+                // keeps the verdict independent of any derived plan, and keeps
+                // it agreeing with the dependency rule the ordered-consumers
+                // test states for the same reads.
                 if !requires_closure(descriptors, reader).contains(publisher) {
                     audit.unordered_init_reads.push(UnorderedInitRead {
                         pin: w.pin,
@@ -582,9 +593,10 @@ impl PinAudit {
         }
         for read in &self.unordered_init_reads {
             tracing::warn!(
-                "plugin '{}' reads pin '{}' during init but does not require '{}'; same-layer plugins init in parallel, so the read can race the publish",
+                "plugin '{}' reads pin '{}' during init and does not require '{}'; nothing declares an order between the two, so the read is in time only when '{}' initialises in an earlier layer",
                 read.reader,
                 read.pin.name(),
+                read.publisher,
                 read.publisher
             );
         }
@@ -1504,5 +1516,36 @@ mod pin_tests {
         assert_eq!(wiring[0].publishers, vec![Some("publisher")]);
         assert_eq!(wiring[0].consumers.len(), 1);
         assert_eq!(wiring[0].consumers[0].owner, Some("reader"));
+    }
+
+    #[test]
+    fn a_later_layer_read_is_still_reported_without_a_declaration() {
+        // The shape the running process has: a plugin initialising in the last
+        // layer reads a pin published by an optional dependency it declares
+        // nowhere.  Every earlier layer has returned by then, so this read is in
+        // time — and it is reported anyway, because the verdict is on what
+        // orders the two and the layer plan is not a declaration.  Making the
+        // dependency hard is not open here (hard also means "fail startup when
+        // absent"), so the report names the read rather than the remedy.
+        let ctx = ctx();
+        ctx.set_during_init(true);
+        ctx.as_owner("memory")
+            .publish_service::<dyn Alpha>(Arc::new(AlphaImpl));
+        assert!(ctx
+            .as_owner("gateway")
+            .consume_service::<dyn Alpha>()
+            .is_some());
+        ctx.set_during_init(false);
+
+        let descriptors = [
+            descriptor("storage", &[]),
+            descriptor("memory", &["storage"]),
+            descriptor("mid", &["storage"]),
+            descriptor("gateway", &["mid"]),
+        ];
+        let audit = PinAudit::evaluate(&ctx.pin_wiring(), &descriptors);
+        assert_eq!(audit.unordered_init_reads.len(), 1, "{audit:?}");
+        assert_eq!(audit.unordered_init_reads[0].reader, "gateway");
+        assert_eq!(audit.unordered_init_reads[0].publisher, "memory");
     }
 }
