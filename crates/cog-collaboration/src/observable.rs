@@ -426,7 +426,10 @@ pub struct CollaborationObservable {
     agent_message_count: AtomicU64,
     agent_turnaround_ms: Arc<Mutex<HashMap<String, Vec<u64>>>>,
     round_count: AtomicU64,
-    /// Ralph Loop 终止计数，按终止原因分类（stagnated / budget_exhausted）。
+    /// Ralph Loop 终止计数，按终止原因分类。
+    /// 这里**不列原因清单**：原因有两个产生处——分类器从文本声明的类别给一个、
+    /// 环自己止损时给一个——列在这里就是第二份定义，改一处漏一处，而读者会拿
+    /// 它当全集去读（实际发生过的那一类反而没人提）。清单要权威就只留一处。
     /// 不收敛链被有界止损是核心健康信号，必须可观测。
     /// 同步锁而非 `try_lock`：这是分类可达性自查的记录端，一次丢失会被
     /// 读成「这个分类从没被记录过」而报出并不存在的分叉。

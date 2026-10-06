@@ -604,7 +604,7 @@ data:
                 "greater_than": 20.0
               },
               "severity": "warning",
-              "summary": "Ralph loops stopped {value} times in the last 30m without passing their goal; the evolution chain is burning budget instead of converging (the reason label distinguishes budget_exhausted from stagnated)"
+              "summary": "Ralph loops stopped {value} times in the last 30m without passing their goal. This rule sums over every reason a loop can stop for -- any stop is worth seeing -- but the reasons are not interchangeable, so this text does not name one: the reason that moved it is {reason}, and the alert's identity carries it, so two different reasons are two different alerts. A loop killed from outside has not answered the budget question at all; only a reason that says the chain gave up on its own has."
             },
             {
               "name": "declared_failure_class_unrecorded",
