@@ -719,9 +719,10 @@ mod tests {
         with_fields
             .context
             .insert("upstream".into(), serde_json::json!("https://a/v1"));
-        with_fields
-            .context
-            .insert("error".into(), serde_json::json!("HTTP 429: quota exceeded"));
+        with_fields.context.insert(
+            "error".into(),
+            serde_json::json!("HTTP 429: quota exceeded"),
+        );
         with_fields
             .context
             .insert("consecutive_failures".into(), serde_json::json!(9));
