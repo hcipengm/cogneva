@@ -534,6 +534,37 @@ data:
           }
         },
         {
+          "id": 32,
+          "title": "LLM Upstream Pool Order",
+          "description": "Where each upstream sits in the order a call tries the pool, 0 first. This is the running process's order, not the one in the Secret: an upstream that has failed sinks behind everything that has not, so these lines converge on the declared order only once the last healthy upstream is gone. That convergence is the point -- it is the one state in which the declared order can be read off the process itself, which is how a reorder is confirmed instead of inferred from the Secret plus a pod-start time. Lines that move together between rollouts are a reorder that took effect; a Secret edit with these unchanged is one that did not.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 56
+          },
+          "targets": [
+            {
+              "expr": "llm_upstream_position",
+              "legendFormat": "{{upstream}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
           "id": 16,
           "title": "Host Build Slots",
           "description": "Builds running on the host against the bound, and builds queued behind them. The bound is per host, but each process publishes its own reading of it, which is why both roles are drawn: a builder line is a process that takes slots, and a control-plane line flat at zero is a process that runs no builds and deliberately bounds nothing. Two builders whose slot directories differ bound only themselves and would both look normal here, so the dir label is on the series for whoever is comparing them by hand; the rule build_gate_not_in_force is what notices.",

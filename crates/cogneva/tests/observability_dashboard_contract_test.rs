@@ -144,6 +144,18 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["upstream"],
         "crates/cog-gateway/src/security_gateway.rs",
     ),
+    // The order a call walks the pool in, which is not the declared one: a
+    // stable sort on suspicion sinks a failed upstream behind everything that
+    // has not failed, so the pool converges on the declared order only once the
+    // last healthy one is gone. The declared order arrives in a Secret at
+    // process start, so without this series a reorder is confirmed by reading
+    // the Secret and a pod-start time and calling it done -- a claim about the
+    // manifest, not about the process the requests are actually walking.
+    (
+        "llm_upstream_position",
+        &["upstream"],
+        "crates/cog-gateway/src/security_gateway.rs",
+    ),
     // The host-wide build bound. Every reading carries the slot directory it is
     // about, because two processes that point at different directories bound
     // only themselves and nothing in the numbers would say so, and the role that

@@ -2477,6 +2477,22 @@ async fn refresh_pool_state(state: &AppState) {
     let bounds = state.llm_health.recovery_bounds(upstreams);
     let readings = state.llm_health.snapshot(upstreams);
 
+    // 池序：`call_llm` 真正会按着走的那个序。走的是同一个函数，不是它的复制品——
+    // 复制一份就等于让读数与行为各自漂移，而这条读数的全部价值就是"进程里现在是
+    // 这个序"。逐上游都发，包括这一代进程一次都没碰过的那些：`healthy` 那一族对
+    // 没碰过的上游缺席是诚实的（没有判定），但序对它们是有定义的——没失败过就还
+    // 站在配置给的位置上，而那往往正是它会被第一个试的原因。
+    let ordered: Vec<&LlmUpstream> = order_by_health(upstreams.iter().collect(), &state.llm_health);
+    for (position, upstream) in ordered.iter().enumerate() {
+        record_gauge(
+            state,
+            cog_core::metric_names::LLM_UPSTREAM_POSITION,
+            position as f64,
+            &[("upstream", &LlmHealthTable::key(upstream))],
+        )
+        .await;
+    }
+
     for reading in &readings {
         // 本进程一次都没碰过的上游在这里出局：没有判定，也没有窗口长度或失败数
         // 可报，而这一族是判决——一条都不发就是这个介质上诚实的"没有读数"；
@@ -7186,6 +7202,50 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert_eq!(ordered[0].base_url, "https://a");
         assert_eq!(ordered[1].base_url, "https://c");
         assert_eq!(ordered[2].base_url, "https://b");
+    }
+
+    /// 池序发出去的必须是**进程里生效的那一序**，不是配置里写的那一序。两者在没有
+    /// 失败时相同，一家失败后就分叉——分叉之后只读配置的人会以为失败的那家还在首位，
+    /// 而每次调用其实已经绕过它了。
+    #[tokio::test]
+    async fn published_pool_order_is_the_one_a_call_walks() {
+        let state = test_state(vec![
+            stub_upstream("https://a.example.com", "m1"),
+            stub_upstream("https://b.example.com", "m2"),
+            stub_upstream("https://c.example.com", "m3"),
+        ]);
+        let keys: Vec<String> = state
+            .config
+            .llm_upstreams
+            .iter()
+            .map(LlmHealthTable::key)
+            .collect();
+        refresh_pool_state(&state).await;
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        // 一家都没失败过：序就是配置序，且没被调用过的上游也有位置——序对它们有
+        // 定义，而"没碰过"正是它们排在首位的原因。
+        for (position, key) in keys.iter().enumerate() {
+            assert!(
+                text.contains(&format!(
+                    "llm_upstream_position{{upstream=\"{key}\"}} {position}"
+                )),
+                "没有失败时序就是配置序: {text}"
+            );
+        }
+
+        // 中间那家失败：它沉到后面，另外两家保持配置序。
+        let b = stub_upstream("https://b.example.com", "m2");
+        state.llm_health.note_failure(&b, 300, None, None);
+        refresh_pool_state(&state).await;
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        let at = |position: usize, key: &str| {
+            text.contains(&format!(
+                "llm_upstream_position{{upstream=\"{key}\"}} {position}"
+            ))
+        };
+        assert!(at(0, &keys[0]), "首位仍在配置序里的第一个: {text}");
+        assert!(at(1, &keys[2]), "没失败过的那家补上来: {text}");
+        assert!(at(2, &keys[1]), "失败的那家沉到最后: {text}");
     }
 
     #[tokio::test]

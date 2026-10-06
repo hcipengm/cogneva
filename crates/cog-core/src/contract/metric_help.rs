@@ -595,6 +595,18 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          Absent for an upstream this process has never probed",
     ),
     (
+        "llm_upstream_position",
+        "Where each upstream sits in the order a call tries the pool, 0 first, \
+         by upstream. Reported for every upstream the process was configured \
+         with, including ones it has never called: a position is defined for all \
+         of them, and it is precisely the untouched ones that head the order. \
+         This is the running process's effective order, not the declared one -- \
+         suspects are demoted behind everything that has not failed, with config \
+         order kept inside each group -- so when the whole pool is suspect these \
+         values are the declared order, read from the process rather than \
+         inferred from the Secret and a pod-start time",
+    ),
+    (
         "llm_pool_quota_window_secs",
         "The longest quota window any upstream declared, in seconds; 0 when none \
          did. Answers 'how long', which is a different question from the pool's \

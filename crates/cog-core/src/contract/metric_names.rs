@@ -406,6 +406,20 @@ metric_names! {
     LLM_UPSTREAM_QUOTA_WINDOW_SECS => "llm_upstream_quota_window_secs",
     LLM_UPSTREAM_QUOTA_RESET_UNIX => "llm_upstream_quota_reset_unix",
     LLM_UPSTREAM_CONSECUTIVE_FAILURES => "llm_upstream_consecutive_failures",
+    // Where each upstream sits in the order a call tries the pool, 0 first, by
+    // `upstream`. The order is not the declared one: candidates are demoted by
+    // a stable sort on suspicion, so a suspect sinks behind everything that has
+    // not failed while config order is kept inside each group, and once the
+    // last healthy one fails this series converges on the declared order.
+    //
+    // The declared order arrives in a Secret at process start, and nothing the
+    // running process says otherwise distinguishes "loaded the order that is in
+    // the Secret now" from "started after the edit and still holds the order it
+    // read before it" -- the two are inferred apart from the Secret's content
+    // plus a pod-start time, which is a claim about the manifest and not a
+    // reading of the process. This series is that reading: values that move
+    // between rollouts say the reorder reached the running pool.
+    LLM_UPSTREAM_POSITION => "llm_upstream_position",
     LLM_POOL_AVAILABLE => "llm_pool_available",
     LLM_POOL_EVIDENCED_RECOVERY_UNIX => "llm_pool_evidenced_recovery_unix",
     LLM_POOL_NEXT_ATTEMPT_UNIX => "llm_pool_next_attempt_unix",
