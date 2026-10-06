@@ -85,6 +85,14 @@ const ANSWERED_GRACE_SECS: u64 = 48 * 60 * 60;
 /// differently per provider and per locale, so prose matching both records one
 /// cause under several names and goes blind the day an upstream rewords.
 ///
+/// The marker answers the environment question, not the terminal one, so the
+/// text is handed to the repository's single terminal verdict instead of being
+/// matched here: a marker that carries its own typed refusal — an upstream
+/// answer of `server_error`, `rate_limited` or `transport` — is a refusal that
+/// is worth another attempt, and reading the bare prefix would block the
+/// intake on exactly the runs the retry layer is willing to refill. Only a
+/// marker with no retryable type behind it is deterministic.
+///
 /// Rate limits are excluded by construction:
 /// [`cog_core::SFError::is_terminal_upstream_failure`] only credits quota and
 /// credentials, and per-minute signals must keep the normal next-tick retry.
@@ -92,8 +100,7 @@ fn is_terminal_failure(err: &CogGitHubError) -> bool {
     if err.is_terminal_upstream_failure() {
         return true;
     }
-    err.to_string()
-        .contains(cog_core::contract::outcome::TERMINAL_ENV_FAILURE_PREFIX)
+    cog_core::contract::outcome::is_deterministic_failure(&err.to_string())
 }
 
 /// What a submission for an intent should do about the task that already
@@ -2433,6 +2440,39 @@ mod tests {
         assert!(!is_terminal_failure(&CogGitHubError::Provider(
             String::new()
         )));
+    }
+
+    /// The wire marker says the environment refused us; it does not say the
+    /// refusal will still hold next tick. Only the type behind the marker
+    /// decides that, so a marker wrapping a retryable refusal must come back
+    /// refillable — the intake would otherwise refuse to re-buy exactly the
+    /// runs the retry loop inside the pipeline is willing to re-buy.
+    #[test]
+    fn a_wire_marker_carrying_a_retryable_refusal_is_not_terminal() {
+        let marker = |cause| {
+            CogGitHubError::Provider(format!(
+                "Agent execution error: {TERMINAL_ENV_FAILURE_PREFIX}: \
+                 environment_error: LLM upstream refused ({cause}): HTTP status"
+            ))
+        };
+
+        // The pool latches: every upstream is refused for now, and the window
+        // resets on its own. Next tick is a different environment.
+        for cause in ["server_error", "rate_limited", "transport"] {
+            assert!(
+                !is_terminal_failure(&marker(cause)),
+                "{cause} is retryable and must stay refillable"
+            );
+        }
+
+        // Refusals the transport typed as terminal keep the backoff: a bad key
+        // and an exhausted window do not heal on their own.
+        for cause in ["auth_rejected", "quota_exhausted", "bad_request"] {
+            assert!(
+                is_terminal_failure(&marker(cause)),
+                "{cause} declares itself deterministic"
+            );
+        }
     }
 
     /// A backoff window is a fact about the intent, not about this process, so
