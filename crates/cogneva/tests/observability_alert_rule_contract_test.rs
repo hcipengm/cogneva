@@ -31,6 +31,7 @@ mod promql;
 use producer::carries_the_producer;
 use promql::{
     lagged_equality_complaints, metric_names_in, shape_complaints, uncovered_window_complaints,
+    windows_over,
 };
 
 const CHART_CONFIG: &str = "deploy/helm/cogneva/files/cogneva.json";
@@ -791,6 +792,133 @@ fn the_unowned_role_rule_waits_out_the_handover_the_lease_allows() {
          replacement would be reported as a role nobody holds: {promql}",
         handover = term + ask
     );
+}
+
+/// Complaints about a rule whose window over a durable-gated series is no
+/// longer than that series' writer heartbeat.
+///
+/// The two failures this separates are not symmetric. A window shorter than the
+/// heartbeat makes the rule fire on a working gateway; a window at exactly the
+/// heartbeat is the same thing, because the gap the gate may leave *is* the
+/// heartbeat. Only strictly longer is safe.
+fn durable_window_complaints(
+    rule: &str,
+    promql: &str,
+    gated: &BTreeSet<String>,
+    heartbeat: u64,
+) -> Vec<String> {
+    windows_over(promql, gated)
+        .into_iter()
+        .filter(|(_, window)| *window <= heartbeat)
+        .map(|(series, window)| {
+            format!(
+                "{rule}: 窗口 {window}s 不长于写者心跳 {heartbeat}s——值不变时写者只在心跳时\
+                 重写，这个窗口里的空档是一个健康网关的正常状态\n    {series}  {promql}"
+            )
+        })
+        .collect()
+}
+
+/// A rule that windows a series the gateway writes through its durable gate has
+/// to look back further than that gate's own heartbeat.
+///
+/// The gate writes a value when it changes and, for one that never changes,
+/// once per `DURABLE_GAUGE_HEARTBEAT`. So a rule reading "no sample in the
+/// window was above zero" over a window no longer than that gap is satisfied by
+/// a healthy gateway sitting between two of its own writes: the window is
+/// empty, the rule calls it a delivery failure, and nothing about the gateway
+/// is wrong. Only a window strictly longer than the heartbeat can tell the two
+/// apart.
+///
+/// Neither number is written here. Both are read from the gate that owns them,
+/// because a window written into a rule drifts from the constant it was chosen
+/// against the moment either side moves — and the drift is silent, in the
+/// direction that makes the rule fire on a working system, which is how the
+/// pool-signal rule shipped with a 30m window against a 1800s heartbeat and
+/// fired on a healthy gateway. The direction is easy to write backwards, so it
+/// is stated once, in the code that compares them.
+#[test]
+fn a_rule_windowing_a_durable_gauge_waits_longer_than_the_writers_heartbeat() {
+    let heartbeat = cog_gateway::security_gateway::DURABLE_GAUGE_HEARTBEAT.as_secs();
+    let gated: BTreeSet<String> = cog_gateway::security_gateway::DURABLE_POOL_GAUGES
+        .iter()
+        .map(|name| name.as_str().to_string())
+        .collect();
+    assert!(
+        gated.len() >= 8,
+        "耐久门控族只剩 {} 条序列，读它的窗口判据已经形同虚设：这条判据的分母是它",
+        gated.len()
+    );
+
+    let mut complaints: Vec<String> = Vec::new();
+    let mut windowed = 0usize;
+    for (rule, promql) in chart_rules() {
+        windowed += windows_over(&promql, &gated).len();
+        complaints.extend(durable_window_complaints(&rule, &promql, &gated, heartbeat));
+    }
+
+    // 分母：一条规则都没窗口这些序列时，上面那句"没有投诉"是空的，不是绿的。
+    // 池信号那条读数正是这样一条规则，它没了或它不再窗口就说明这条判据没有题目。
+    assert!(
+        windowed > 0,
+        "没有任何告警规则对耐久门控族取窗口，这条判据没有分母（池信号送达与否的读数呢？）"
+    );
+    assert!(
+        complaints.is_empty(),
+        "告警规则对耐久门控序列取的窗口必须严格长于写者心跳，否则窗口里的空档是健康的:\n{}",
+        complaints.join("\n")
+    );
+}
+
+/// The gate above separates the two numbers it compares, and does so against a
+/// fabricated rule as well as the shipped ones — a gate that only ever runs
+/// over rules that pass has not been shown to reject anything.
+#[test]
+fn a_window_no_longer_than_the_heartbeat_is_reported_and_a_longer_one_is_not() {
+    let gated: BTreeSet<String> = ["llm_pool_available"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let heartbeat = 1_800u64;
+
+    // 短于心跳：健康的网关在两次写之间就能造出这个空窗口。
+    assert_eq!(
+        durable_window_complaints(
+            "r",
+            "max_over_time(llm_pool_available[30m]) < 1",
+            &gated,
+            heartbeat
+        )
+        .len(),
+        1
+    );
+    // 等于心跳也不行：写者可以一直不写，直到心跳边界。
+    assert_eq!(
+        durable_window_complaints(
+            "r",
+            "max_over_time(llm_pool_available[1800s]) < 1",
+            &gated,
+            heartbeat
+        )
+        .len(),
+        1
+    );
+    // 严格长于心跳：窗口里必有一条写。
+    assert!(durable_window_complaints(
+        "r",
+        "max_over_time(llm_pool_available[1h]) < 1",
+        &gated,
+        heartbeat
+    )
+    .is_empty());
+    // 不在耐久族里的序列不受这条判据管，多长的窗口都放行。
+    assert!(durable_window_complaints(
+        "r",
+        "max_over_time(llm_calls_total[5m]) > 0",
+        &gated,
+        heartbeat
+    )
+    .is_empty());
 }
 
 /// The other half of the same promise: a rule that certifies a window has to

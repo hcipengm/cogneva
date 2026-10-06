@@ -1176,7 +1176,33 @@ struct PoolObservability {
 
 /// 值没变时的重写周期。它只服务于"上一次写失败"的自愈：值一变就立刻写，
 /// 这条周期只保证一个不再变化的读数不会永远停在一次失败的陈旧值上。
-const DURABLE_GAUGE_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(1800);
+///
+/// 它是**读者侧窗口的下限**：值不变就不再写，所以"最近 W 内的采样里必有
+/// 一条记录"当且仅当 `W > 这个周期`——W 小于它时，一个健康的网关在两次心跳
+/// 之间就能让这条判据成真。窗口与这个常数的关系由 `cogneva` 的告警规则契约
+/// 测试读这里核对，不靠人记得。
+pub const DURABLE_GAUGE_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(1800);
+
+/// 走上面那条心跳门控的序列，按名字列出。
+///
+/// 这份清单是跨 crate 的读数而不是内部细节：每一条的判断都是"值不变则只在
+/// 心跳时重写"，所以每一条都要求读它的告警窗口严格长于
+/// [`DURABLE_GAUGE_HEARTBEAT`]。清单由本文件的 `record_gauge` 调用点强制——
+/// 新增一条耐久 gauge 而不登记，`durable_pool_gauges_is_exactly_what_the_funnel_is_called_with`
+/// 会红。
+pub const DURABLE_POOL_GAUGES: &[cog_core::MetricName] = &[
+    cog_core::metric_names::LLM_POOL_SIGNAL_CONNECTED,
+    cog_core::metric_names::LLM_POOL_AVAILABLE,
+    cog_core::metric_names::LLM_POOL_EVIDENCED_RECOVERY_UNIX,
+    cog_core::metric_names::LLM_POOL_NEXT_ATTEMPT_UNIX,
+    cog_core::metric_names::LLM_POOL_QUOTA_WINDOW_SECS,
+    cog_core::metric_names::LLM_UPSTREAM_POSITION,
+    cog_core::metric_names::LLM_UPSTREAM_HEALTHY,
+    cog_core::metric_names::LLM_UPSTREAM_QUOTA_WINDOW_SECS,
+    cog_core::metric_names::LLM_UPSTREAM_QUOTA_RESET_UNIX,
+    cog_core::metric_names::LLM_UPSTREAM_CONSECUTIVE_FAILURES,
+    cog_core::metric_names::LLM_USAGE_VERDICT_MEASURED,
+];
 
 /// 一次共享写的上界。这条路径在池状态发布循环里（不是请求路径），但循环一停
 /// 池判定就不再续期，所以等一个不响应的 PG 必须有上限。
@@ -8870,5 +8896,78 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             durable_gauge_key("m", &[("a", "1"), ("b", "2")]),
             durable_gauge_key("m", &[("b", "2"), ("a", "1")])
         );
+    }
+
+    /// 耐久面的序列清单必须与真正走耐久面的调用点一致。
+    ///
+    /// 告警规则的窗口判据按 [`DURABLE_POOL_GAUGES`] 取心跳，所以这份清单少一条
+    /// 就是一条规则的窗口没人查，多一条就是一条不在耐久面的序列被套上不该有的
+    /// 下限。判据读的是本文件的调用点：只有 `record_gauge` 一个函数把 gauge 送
+    /// 进耐久面（先写进程内、再写共享表），所以这个函数的调用点就是全体。
+    #[test]
+    fn durable_pool_gauges_is_exactly_what_the_funnel_is_called_with() {
+        let source = include_str!("security_gateway.rs");
+        // 生产段才是判据：测试模块里有一份真值 + 一份 `MetricsBackend` 的桩实现，
+        // 两者都会命中 `record_gauge(`，而文件里另有一处 `#[cfg(test)]` 的辅助方法，
+        // 所以按测试模块的开口切，不按第一个 `cfg(test)` 切。
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(before, _)| before)
+            .expect("测试模块的开头变了，这条判据会扫到自己的桩实现");
+
+        let mut found: Vec<cog_core::MetricName> = Vec::new();
+        let mut from = 0;
+        while let Some(rel) = production[from..].find("record_gauge(") {
+            let at = from + rel;
+            from = at + 1;
+            let Some(call) = balanced_span(&production[at..]) else {
+                continue;
+            };
+            for (ident, metric) in cog_core::metric_names::IDENTIFIED {
+                let qualified = format!("metric_names::{ident}");
+                if call.contains(&qualified) && !found.contains(metric) {
+                    found.push(*metric);
+                }
+            }
+        }
+
+        let declared: Vec<&str> = DURABLE_POOL_GAUGES.iter().map(|m| m.as_str()).collect();
+        let seen: Vec<&str> = found.iter().map(|m| m.as_str()).collect();
+        assert!(
+            !declared.is_empty(),
+            "DURABLE_POOL_GAUGES 空了，读它的那条窗口判据会变成恒真"
+        );
+        for name in &declared {
+            assert!(
+                seen.contains(name),
+                "DURABLE_POOL_GAUGES 记着 {name}，但本文件没有把它的调用点交给 \
+                 record_gauge——要么这条本来就不走耐久面，要么它的写入换了路"
+            );
+        }
+        for name in &seen {
+            assert!(
+                declared.contains(name),
+                "{name} 经 record_gauge 落进耐久面，却不在 DURABLE_POOL_GAUGES 里：\
+                 读它的告警窗口不会被要求长于写者心跳"
+            );
+        }
+    }
+
+    /// 从 `(` 起的一段平衡括号文本，含两端的括号。找不到闭合时返回 `None`。
+    fn balanced_span(text: &str) -> Option<&str> {
+        let mut depth = 0usize;
+        for (i, c) in text.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&text[..=i]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 }

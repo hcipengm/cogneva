@@ -432,13 +432,15 @@ fn matching_open(s: &str, close_at: usize, open: u8, close: u8) -> Option<usize>
     }
 }
 
-/// The series a bare `offset` reads, given the position of the keyword.
+/// The series named immediately before `at`, whether what follows is the
+/// `offset` keyword or a range selector.
 ///
-/// `a offset 1h`, `a{x="y"} offset 1h` and `a[5m] offset 1h` all read `a`. An
-/// expression whose selector is parenthesized (`(a + b)[5m] offset 1h`) is not
-/// classified — this feeds a positive finding, so a shape it does not classify
-/// is a weaker gate, not a wrong one.
-fn series_before_offset(s: &str, offset_at: usize) -> Option<&str> {
+/// `a offset 1h`, `a{x="y"} offset 1h` and `a[5m] offset 1h` all read `a`; so do
+/// `a[5m]` and `a{x="y"}[5m]`, which is the same question with the bracket in
+/// the other role. An expression whose selector is parenthesized
+/// (`(a + b)[5m] offset 1h`) is not classified — this feeds a positive finding,
+/// so a shape it does not classify is a weaker gate, not a wrong one.
+fn series_before(s: &str, at: usize) -> Option<&str> {
     let bytes = s.as_bytes();
     let skip_ws = |mut i: usize| {
         while i > 0 && bytes[i - 1].is_ascii_whitespace() {
@@ -446,7 +448,7 @@ fn series_before_offset(s: &str, offset_at: usize) -> Option<&str> {
         }
         i
     };
-    let mut end = skip_ws(offset_at);
+    let mut end = skip_ws(at);
     if end > 0 && bytes[end - 1] == b']' {
         end = skip_ws(matching_open(s, end - 1, b'[', b']')?);
     }
@@ -476,7 +478,7 @@ fn names_read_at_an_offset(s: &str) -> Vec<String> {
             && (i == 0 || !token_char(bytes[i - 1]))
             && (i + "offset".len() == bytes.len() || !token_char(bytes[i + "offset".len()]))
         {
-            if let Some(name) = series_before_offset(s, i) {
+            if let Some(name) = series_before(s, i) {
                 if !NOT_SERIES.contains(&name) {
                     out.push(name.to_string());
                 }
@@ -542,6 +544,41 @@ pub fn duration_seconds(text: &str) -> Option<u64> {
         _ => return None,
     };
     Some(digits.parse::<u64>().ok()? * scale)
+}
+
+/// Every range selector in `expr` that hangs off one of `gated`, as
+/// `(series, window-in-seconds)`.
+///
+/// The question this answers is which series a rule's window actually looks
+/// back over: `max_over_time(x[30m])` and `max(x)` read the same series and
+/// only the first reads a window, while `x[30m]` and `y[30m]` read different
+/// ones. A `[...]` whose selector is an expression rather than a name
+/// (`(a + b)[30m]`) belongs to no series here and is not reported; the caller
+/// of this function feeds a positive finding, so a shape it cannot attribute is
+/// a gap in the gate rather than a wrong complaint.
+pub fn windows_over(expr: &str, gated: &BTreeSet<String>) -> Vec<(String, u64)> {
+    let stripped = strip_braces(&strip_quoted(expr));
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = stripped[from..].find('[') {
+        let at = from + rel;
+        from = at + 1;
+        let Some(close) = stripped[at..].find(']').map(|p| at + p) else {
+            break;
+        };
+        // A subquery carries a step after the window (`[15m:1m]`); the window is
+        // what precedes the colon.
+        let window = stripped[at + 1..close].split(':').next().unwrap_or("");
+        let Some(seconds) = duration_seconds(window) else {
+            continue;
+        };
+        if let Some(name) = series_before(&stripped, at) {
+            if gated.contains(name) {
+                out.push((name.to_string(), seconds));
+            }
+        }
+    }
+    out
 }
 
 /// The window of every call to `func` in `expr`, in seconds.
@@ -849,5 +886,31 @@ mod tests {
         // certificate that the window is covered.
         assert_eq!(duration_seconds("1y"), None);
         assert_eq!(duration_seconds(""), None);
+    }
+
+    /// A window is attributed to the series its selector names, and to no other
+    /// series in the same expression.
+    #[test]
+    fn a_window_is_attributed_to_the_series_it_hangs_off() {
+        let gated: BTreeSet<String> = ["a", "c"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            windows_over(r#"max_over_time(a{upstream=~".+"}[30m]) < 1"#, &gated),
+            vec![("a".to_string(), 1_800)]
+        );
+        // A rule reading two gated series reports both, and `b` — gated by
+        // nothing here — is not reported even though it is read.
+        assert_eq!(
+            windows_over("max(a[1h]) - max(c[30m]) + max(b[5m])", &gated),
+            vec![("a".to_string(), 3_600), ("c".to_string(), 1_800)]
+        );
+        // Reading a gated series without a window is not a window over it.
+        assert_eq!(windows_over("max(a) and max(b[5m])", &gated), Vec::new());
+        // A subquery's step is not part of its window.
+        assert_eq!(
+            windows_over("max_over_time(a[15m:1m])", &gated),
+            vec![("a".to_string(), 900)]
+        );
+        // A parenthesized selector names no series and is not attributed.
+        assert!(windows_over("max_over_time((a + c)[30m])", &gated).is_empty());
     }
 }
