@@ -258,25 +258,167 @@ impl RetirementPass {
 
     /// Publish what the pass removed from each table, every cycle.
     ///
-    /// Every cycle rather than only when it found something: a gauge that is
-    /// written only on a non-zero removal holds its last non-zero value
-    /// forever, and a frozen removal count is exactly as unreadable as the
-    /// frozen total this pass exists to delete.
+    /// Every cycle, cycles that removed nothing included, because one of this
+    /// series' readers counts samples instead of reading the value: the rule
+    /// that says a release is not draining is `min_over_time(...[1h]) > 0`,
+    /// which is "every sample in the last hour was positive". One sample per
+    /// pass is what makes that the same claim as "every pass in the last hour
+    /// found rows". Gating the write would keep the value honest and break the
+    /// claim — the gate that writes only on change, or only on a non-zero
+    /// removal, leaves the hour holding change points rather than passes, and
+    /// the rule fires the moment the first removal lands instead of after an
+    /// hour of them.
+    ///
+    /// The worry a gate is reached for is real and is answered by this same
+    /// write: a pass that removed nothing writes a zero, so a removal that
+    /// stops reads as stopped rather than as its last non-zero value held
+    /// forever. What that needs is the zero, not a row every pass — the row
+    /// every pass is for the counting reader above.
     async fn report(&self, outcome: &RetirementOutcome) {
         let Some(ref mb) = self.metrics else { return };
-        for (table, removed) in outcome.per_table() {
-            let labels = HashMap::from([("table".to_string(), table.to_string())]);
-            if let Err(e) = mb
-                .record_gauge(RETIRED_ROWS_REMOVED_METRIC, removed as f64, labels)
-                .await
-            {
-                warn!(
-                    error = %e,
-                    metric = %RETIRED_ROWS_REMOVED_METRIC,
-                    table,
-                    "retirement removal gauge emit failed"
-                );
-            }
+        publish_removals(mb, outcome).await;
+    }
+}
+
+/// One row per table, whatever the pass removed.
+///
+/// Split out of the pass so the shape the counting reader depends on can be
+/// read and tested without a live store: the pass itself is welded to a pool,
+/// and the claim under test is about rows, not about deletion.
+async fn publish_removals(
+    metrics: &std::sync::Arc<dyn MetricsBackend>,
+    outcome: &RetirementOutcome,
+) {
+    for (table, removed) in outcome.per_table() {
+        let labels = HashMap::from([("table".to_string(), table.to_string())]);
+        if let Err(e) = metrics
+            .record_gauge(RETIRED_ROWS_REMOVED_METRIC, removed as f64, labels)
+            .await
+        {
+            warn!(
+                error = %e,
+                metric = %RETIRED_ROWS_REMOVED_METRIC,
+                table,
+                "retirement removal gauge emit failed"
+            );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MemoryMetricsBackend;
+
+    /// Every row this pass has published, oldest first. The reading under test
+    /// is how many there are and what the last one says, so the rows are the
+    /// reading and not the values.
+    async fn published(metrics: &MemoryMetricsBackend) -> Vec<(String, f64)> {
+        metrics
+            .query_gauge_range(
+                RETIRED_ROWS_REMOVED_METRIC.as_str(),
+                chrono::Utc::now() - chrono::Duration::minutes(5),
+                chrono::Utc::now() + chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|sample| {
+                (
+                    sample.labels.get("table").cloned().unwrap_or_default(),
+                    sample.value,
+                )
+            })
+            .collect()
+    }
+
+    fn backend() -> (
+        std::sync::Arc<MemoryMetricsBackend>,
+        std::sync::Arc<dyn MetricsBackend>,
+    ) {
+        let concrete = std::sync::Arc::new(MemoryMetricsBackend::new());
+        let erased: std::sync::Arc<dyn MetricsBackend> =
+            std::sync::Arc::clone(&concrete) as std::sync::Arc<dyn MetricsBackend>;
+        (concrete, erased)
+    }
+
+    /// Two passes that removed nothing leave two rows per table, and the newer
+    /// of each pair says zero.
+    ///
+    /// The rule reading this series asks whether every sample in the last hour
+    /// was positive, so a pass that writes nothing is a pass the rule cannot
+    /// see: gated on the value, or on "only when it found something", the hour
+    /// would hold change points instead of passes and the rule would fire on
+    /// the first removal rather than on an hour of them. The second assertion
+    /// is what keeps the gate from being reached for the other way round — a
+    /// count that goes quiet has to read as quiet, which is the zero, not the
+    /// absence of a row.
+    #[tokio::test]
+    async fn a_pass_that_removed_nothing_still_reports() {
+        let (concrete, metrics) = backend();
+        let nothing = RetirementOutcome::default();
+
+        publish_removals(&metrics, &nothing).await;
+        let after_first = published(&concrete).await;
+        assert_eq!(
+            after_first.len(),
+            nothing.per_table().len(),
+            "the first pass must report one row per table: {after_first:?}"
+        );
+        assert!(
+            after_first.iter().all(|(_, value)| *value == 0.0),
+            "a pass that removed nothing reports zero: {after_first:?}"
+        );
+
+        publish_removals(&metrics, &nothing).await;
+        let after_second = published(&concrete).await;
+        assert_eq!(
+            after_second.len(),
+            2 * nothing.per_table().len(),
+            "a second pass that removed nothing was not reported: the reader that \
+             counts samples per pass cannot see it: {after_second:?}"
+        );
+    }
+
+    /// And a pass that did remove something moves the value, under the same
+    /// label set as the zeros it replaces.
+    ///
+    /// Counting rows alone would pass an implementation that only ever wrote
+    /// zeros, so the value face is judged beside the row face.
+    #[tokio::test]
+    async fn a_pass_that_removed_rows_reports_them_per_table() {
+        let (concrete, metrics) = backend();
+        publish_removals(&metrics, &RetirementOutcome::default()).await;
+
+        let outcome = RetirementOutcome {
+            samples: 7,
+            counter_totals: 0,
+            histogram_buckets: 3,
+            histogram_sums: 0,
+        };
+        publish_removals(&metrics, &outcome).await;
+
+        let rows = published(&concrete).await;
+        let latest: HashMap<String, f64> = rows
+            .iter()
+            .rev()
+            .take(outcome.per_table().len())
+            .map(|(table, value)| (table.clone(), *value))
+            .collect();
+        assert_eq!(
+            latest.get("samples").copied(),
+            Some(7.0),
+            "the table that lost rows must report how many: {rows:?}"
+        );
+        assert_eq!(
+            latest.get("histogram_buckets").copied(),
+            Some(3.0),
+            "every table reports its own count rather than a shared one: {rows:?}"
+        );
+        assert_eq!(
+            latest.get("counter_totals").copied(),
+            Some(0.0),
+            "a table that lost nothing is reported as zero, not omitted: {rows:?}"
+        );
     }
 }
