@@ -3280,22 +3280,35 @@ async fn stream_forward(
                     // 协议适配点，统一回退为 system，保护所有调用方。这条不
                     // 按兼容表判断：表里没登记的厂商取兜底画像（"支持"），
                     // 而这里判错的代价是整次调用 400，方向只能是无条件回退。
+                    //
+                    // 这次改写对调用方是无声的：回话里不会回显请求发的消息，
+                    // 状态码也还是 200，别处没有任何一条读数能说出它发生过，
+                    // 所以就在动手的这一行把字段名记进本趟的读数。
+                    let mut rewrote_role = false;
                     if let Some(serde_json::Value::Array(msgs)) = obj.get_mut("messages") {
                         for m in msgs.iter_mut() {
                             if m.get("role").and_then(|r| r.as_str()) == Some("developer") {
                                 m["role"] = serde_json::Value::String("system".into());
+                                rewrote_role = true;
                             }
                         }
+                    }
+                    if rewrote_role {
+                        adapted_fields.push("role");
                     }
                     // 其余按字段形状做的兼容调整只对 OpenAI 形状的体有意义：
                     // anthropic 形状的 `max_tokens` 是必填字段，改名会把它弄坏。
                     if style != "anthropic" {
                         let compat = cog_llm::utils::compat::detect_compat(base);
-                        adapted_fields = adapt_request_body(
+                        // 这里是**追加**不是赋值。这一格要留的是"本趟一共改过
+                        // 哪些字段"，适配器返回的只是其中的一半——上面那条角色
+                        // 改写已经先记进来了。写赋值会把它静默丢掉，而丢掉的
+                        // 恰好是唯一没有别处可读的那一条。
+                        adapted_fields.extend(adapt_request_body(
                             obj,
                             &compat,
                             state.llm_health.effective_usage_verdict(upstream),
-                        );
+                        ));
                         // 有的推理模型只接受 temperature=1，别的值直接 400。调
                         // 用方判定不了这件事：它连的是网关，base URL 里没有厂商
                         // 身份，客户端侧按 vendor 域名做的兼容探测在部署形态下
@@ -8083,6 +8096,82 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             ),
             Some(1.0),
             "补问取得结论后这一格该是 1（有出处）:\n{text}"
+        );
+    }
+
+    /// 网关把调用方写的 `developer` 角色改回 `system`：回话里没有痕迹，状态码
+    /// 也还是 200，这条读数是它全局唯一的出处。
+    ///
+    /// 两头都钉：上游收到的那一份（改写在生产端真发生了）和观测面上那一格
+    ///（发生的事被记下来了）。少一头就是"改了没说"或"说了没改"。
+    ///
+    /// 这条改写专门不看画像：画像 11 个分支里 `supports_developer_role` 全是
+    /// false、只有兜底是 true，而网关连的是真实上游，兜底那句"支持"猜错就是
+    /// 整次调用 400，所以它无条件回退——回退的代价就是把调用方挑过的角色名改掉。
+    #[tokio::test]
+    async fn the_developer_role_rewrite_leaves_a_reading_where_it_happens() {
+        let vendor_seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stub = spawn_capturing_upstream(
+            200,
+            r#"{"id":"x","choices":[{"message":{"role":"assistant","content":"hi"}}]}"#,
+            vendor_seen.clone(),
+        )
+        .await;
+        let state = test_state(vec![stub_upstream(&stub, "m1")]);
+        let key = LlmHealthTable::key(&state.config.llm_upstreams[0].clone());
+        let clamped = |text: &str, field: &str| -> Option<f64> {
+            text.lines()
+                .filter(|l| {
+                    l.starts_with(cog_core::metric_names::LLM_REQUEST_PARAM_CLAMPED_TOTAL.as_str())
+                })
+                .find(|l| {
+                    l.contains(&format!("field=\"{field}\""))
+                        && l.contains(&format!("upstream=\"{key}\""))
+                })
+                .and_then(|l| l.split_whitespace().last())
+                .and_then(|v| v.parse::<f64>().ok())
+        };
+
+        // 反例先跑：没有 developer 的请求不该在这条序列上出现，否则"记下来了"
+        // 与"发过请求就记一笔"同形。
+        let resp = chat_completions_passthrough(
+            State(state.clone()),
+            json_request(r#"{"model":"placeholder","messages":[{"role":"user","content":"hi"}]}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert_eq!(
+            clamped(&text, "role"),
+            None,
+            "没改写就不该有这一格:\n{text}"
+        );
+
+        // 正例：调用方按最新 OpenAI 约定把 system 写成 developer。
+        vendor_seen.lock().unwrap().clear();
+        let resp = chat_completions_passthrough(
+            State(state.clone()),
+            json_request(
+                r#"{"model":"placeholder","messages":[{"role":"developer","content":"be terse"},{"role":"user","content":"hi"}]}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200, "上游回 200，调用方看不出角色被改过");
+        let got: serde_json::Value = {
+            let sent = vendor_seen.lock().unwrap();
+            serde_json::from_str(sent.last().expect("上游该收到一次请求")).unwrap()
+        };
+        assert_eq!(
+            got["messages"][0]["role"], "system",
+            "上游收到的那一份里角色已经被改掉"
+        );
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert_eq!(
+            clamped(&text, "role"),
+            Some(1.0),
+            "改过就该在计数里留下 field=role:\n{text}"
         );
     }
 

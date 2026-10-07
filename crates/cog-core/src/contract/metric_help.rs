@@ -346,9 +346,10 @@ const COUNTER_HELP: &[(&str, &str)] = &[
         "llm_request_param_clamped_total",
         "Request fields the gateway rewrote before sending, by field and \
          upstream: temperature forced to 1 for upstreams that require it, plus \
-         each field the protocol adapter had to add or replace. A rewrite \
-         changes what was asked for, so 'this upstream answers differently' has \
-         this among its causes",
+         each field the protocol adapter had to add or replace, plus the role \
+         of a message the caller wrote as developer where the upstream takes \
+         only system. A rewrite changes what was asked for, so 'this upstream \
+         answers differently' has this among its causes",
     ),
     (
         "cogneva_buildah_store_rounds_total",
