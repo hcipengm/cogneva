@@ -37,6 +37,8 @@ use tracing::{info, warn};
 
 use cog_core::{MetricsBackend, SFError, SFResult};
 
+use crate::metrics_sample_cap::DEPLOYMENT_LABEL;
+
 /// The accumulation tables, named for the kind of value each holds.
 pub const COUNTER_TOTALS_TABLE: &str = "cog_metric_counter_totals";
 pub const HISTOGRAM_BUCKETS_TABLE: &str = "cog_metric_histogram_buckets";
@@ -52,9 +54,10 @@ const RELEASE_BATCH: i64 = 5_000;
 
 /// Gauge reporting the rows this pass removed, per table.
 ///
-/// One series per table rather than one total: a table that keeps reporting a
-/// non-zero removal is the reading that says a release is not draining, and a
-/// merged scalar would hide which of the four it is.
+/// One series per table and per deployment rather than one total: a table that
+/// keeps reporting a non-zero removal is the reading that says a release is not
+/// draining, and a merged scalar would hide which of the four it is — while a
+/// series shared by two deployments hides which of *them* it is.
 use cog_core::metric_names::METRICS_RETIRED_ROWS_REMOVED as RETIRED_ROWS_REMOVED_METRIC;
 
 /// What one release pass removed, per table.
@@ -221,6 +224,10 @@ impl MetricsRetirement {
 pub struct RetirementPass {
     retirement: std::sync::Arc<MetricsRetirement>,
     metrics: Option<std::sync::Arc<dyn MetricsBackend>>,
+    /// The deployment this process is, for the reading below. `None` publishes
+    /// unlabelled, which is what a process whose platform never told it which
+    /// deployment it belongs to can honestly do.
+    deployment: Option<String>,
 }
 
 impl RetirementPass {
@@ -228,11 +235,35 @@ impl RetirementPass {
         Self {
             retirement,
             metrics: None,
+            deployment: None,
         }
     }
 
     pub fn with_metrics(mut self, metrics: std::sync::Arc<dyn MetricsBackend>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Name this deployment on the reading this pass publishes.
+    ///
+    /// Every deployment ships the release and runs it on its own cadence, and
+    /// they all write into one shared store where a series *is* its label set.
+    /// Without this name the passes of two deployments land in the same series,
+    /// and the reader's `min_over_time` is then the minimum across both streams
+    /// rather than over one deployment's passes. Those are not the same claim:
+    /// the release clears a table in one pass however large its backlog, so of
+    /// any two passes that straddle a deletion the later one finds the rows
+    /// already gone and writes a zero. The merged minimum is therefore zero in
+    /// every window holding such a pair, and "some deployment's passes keep
+    /// finding rows" — the condition the rule exists for — becomes unreadable on
+    /// a series that carries neither deployment's passes.
+    ///
+    /// The value has to be bounded: a deployment name, not a pod name. Every
+    /// series' newest row is kept forever, so an identity that changes per
+    /// rollout buys a permanent floor row per rollout.
+    pub fn with_deployment(mut self, deployment: impl Into<String>) -> Self {
+        let deployment = deployment.into();
+        self.deployment = (!deployment.trim().is_empty()).then_some(deployment);
         self
     }
 
@@ -274,9 +305,14 @@ impl RetirementPass {
     /// stops reads as stopped rather than as its last non-zero value held
     /// forever. What that needs is the zero, not a row every pass — the row
     /// every pass is for the counting reader above.
+    ///
+    /// Whose passes they are has to be on the row as well, for the same reason
+    /// the count is: this loop runs in every deployment, so a series identified
+    /// only by its table carries the passes of both, and the minimum across two
+    /// streams is not the minimum over either one.
     async fn report(&self, outcome: &RetirementOutcome) {
         let Some(ref mb) = self.metrics else { return };
-        publish_removals(mb, outcome).await;
+        publish_removals(mb, outcome, self.deployment.as_deref()).await;
     }
 }
 
@@ -285,12 +321,21 @@ impl RetirementPass {
 /// Split out of the pass so the shape the counting reader depends on can be
 /// read and tested without a live store: the pass itself is welded to a pool,
 /// and the claim under test is about rows, not about deletion.
+///
+/// The labels are the table and the deployment that ran the pass. The deployment
+/// is not decoration on a reading the reader already scopes itself: it is what
+/// makes the series *this deployment's* pass stream, and the reader asks a
+/// question about one stream.
 async fn publish_removals(
     metrics: &std::sync::Arc<dyn MetricsBackend>,
     outcome: &RetirementOutcome,
+    deployment: Option<&str>,
 ) {
     for (table, removed) in outcome.per_table() {
-        let labels = HashMap::from([("table".to_string(), table.to_string())]);
+        let mut labels = HashMap::from([("table".to_string(), table.to_string())]);
+        if let Some(deployment) = deployment {
+            labels.insert(DEPLOYMENT_LABEL.to_string(), deployment.to_string());
+        }
         if let Err(e) = metrics
             .record_gauge(RETIRED_ROWS_REMOVED_METRIC, removed as f64, labels)
             .await
@@ -342,6 +387,22 @@ mod tests {
         (concrete, erased)
     }
 
+    /// The label set of every row this pass published, oldest first. Read beside
+    /// [`published`], which drops the labels to read the values.
+    async fn published_labels(metrics: &MemoryMetricsBackend) -> Vec<HashMap<String, String>> {
+        metrics
+            .query_gauge_range(
+                RETIRED_ROWS_REMOVED_METRIC.as_str(),
+                chrono::Utc::now() - chrono::Duration::minutes(5),
+                chrono::Utc::now() + chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|sample| sample.labels)
+            .collect()
+    }
+
     /// Two passes that removed nothing leave two rows per table, and the newer
     /// of each pair says zero.
     ///
@@ -358,7 +419,7 @@ mod tests {
         let (concrete, metrics) = backend();
         let nothing = RetirementOutcome::default();
 
-        publish_removals(&metrics, &nothing).await;
+        publish_removals(&metrics, &nothing, None).await;
         let after_first = published(&concrete).await;
         assert_eq!(
             after_first.len(),
@@ -370,7 +431,7 @@ mod tests {
             "a pass that removed nothing reports zero: {after_first:?}"
         );
 
-        publish_removals(&metrics, &nothing).await;
+        publish_removals(&metrics, &nothing, None).await;
         let after_second = published(&concrete).await;
         assert_eq!(
             after_second.len(),
@@ -388,7 +449,7 @@ mod tests {
     #[tokio::test]
     async fn a_pass_that_removed_rows_reports_them_per_table() {
         let (concrete, metrics) = backend();
-        publish_removals(&metrics, &RetirementOutcome::default()).await;
+        publish_removals(&metrics, &RetirementOutcome::default(), None).await;
 
         let outcome = RetirementOutcome {
             samples: 7,
@@ -396,7 +457,7 @@ mod tests {
             histogram_buckets: 3,
             histogram_sums: 0,
         };
-        publish_removals(&metrics, &outcome).await;
+        publish_removals(&metrics, &outcome, None).await;
 
         let rows = published(&concrete).await;
         let latest: HashMap<String, f64> = rows
@@ -420,5 +481,79 @@ mod tests {
             Some(0.0),
             "a table that lost nothing is reported as zero, not omitted: {rows:?}"
         );
+    }
+
+    /// A reading that is one deployment's own pass stream says which deployment
+    /// ran it.
+    ///
+    /// Every deployment ships this loop and they share one store, where a series
+    /// *is* its label set. Two deployments' passes in one series make the
+    /// reader's `min_over_time` a minimum across both streams, and since the
+    /// release clears a table in one pass however large its backlog the second
+    /// pass of any pair finds nothing and writes zero — so the merged minimum is
+    /// zero exactly when a deletion happened, and the rule for "a release that
+    /// is not draining" could never fire. The label is what keeps the question
+    /// about one stream askable.
+    ///
+    /// The two assertions are the two ways to get it wrong: a missing name (the
+    /// series is shared again) and a name that grows per restart (a pod name
+    /// buys a permanent floor row per rollout, since every series' newest row is
+    /// kept forever).
+    #[tokio::test]
+    async fn the_reading_names_the_deployment_that_ran_the_pass() {
+        let (concrete, metrics) = backend();
+        let outcome = RetirementOutcome {
+            samples: 7,
+            ..RetirementOutcome::default()
+        };
+
+        publish_removals(&metrics, &outcome, Some("probe-deployment")).await;
+
+        for labels in published_labels(&concrete).await {
+            assert_eq!(
+                labels.get(DEPLOYMENT_LABEL).map(String::as_str),
+                Some("probe-deployment"),
+                "a reading that is one deployment's passes must name it: {labels:?}"
+            );
+            assert!(
+                labels.contains_key("table"),
+                "the table stays on the reading: a merged scalar would hide which \
+                 of the four stores is not draining: {labels:?}"
+            );
+            assert_eq!(
+                labels.len(),
+                2,
+                "the deployment and the table are the whole identity: {labels:?}"
+            );
+        }
+    }
+
+    /// And a process the platform never told which deployment it is publishes
+    /// unlabelled rather than under an empty name.
+    ///
+    /// A blank label value is a name every such process would answer with, which
+    /// is the same collision the label exists to end — under a value that reads
+    /// like an answer.
+    #[tokio::test]
+    async fn a_pass_with_no_deployment_available_publishes_no_name() {
+        let (concrete, metrics) = backend();
+
+        publish_removals(&metrics, &RetirementOutcome::default(), None).await;
+        let named = RetirementPass::new(std::sync::Arc::new(MetricsRetirement::new(
+            PgPool::connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
+                .expect("a lazy pool"),
+        )))
+        .with_deployment("   ");
+        assert_eq!(
+            named.deployment, None,
+            "a blank deployment name is no name, not an empty one"
+        );
+
+        for labels in published_labels(&concrete).await {
+            assert!(
+                !labels.contains_key(DEPLOYMENT_LABEL),
+                "a deployment nobody named must publish no name at all: {labels:?}"
+            );
+        }
     }
 }

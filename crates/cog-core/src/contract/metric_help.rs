@@ -445,8 +445,13 @@ const GAUGE_HELP: &[(&str, &str)] = &[
     (
         "metrics_retired_rows_removed",
         "Rows of retired metric names the last release pass deleted, labelled \
-         by the table they came from. Reported every pass, so a table whose \
-         reading stays non-zero is one the release is not draining",
+         by the table they came from and by the deployment that ran the pass. \
+         Reported every pass, so a table whose reading stays non-zero is one \
+         the release is not draining. The deployment is part of the identity \
+         because every deployment runs the release: a series keyed by the table \
+         alone would carry two deployments' passes, and the reader's minimum \
+         over that series is zero whenever the pass that ran second found the \
+         rows already gone",
     ),
     (
         "llm_upstream_healthy",

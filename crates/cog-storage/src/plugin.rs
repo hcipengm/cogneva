@@ -890,16 +890,21 @@ impl cog_core::SystemPlugin for StoragePlugin {
                 .unwrap_or_default();
             let metrics = ctx.consume_service::<dyn cog_core::MetricsBackend>();
 
+            // Both readings that name a deployment take the name from one place,
+            // so "this deployment declared nothing" and "this deployment's passes
+            // found nothing" are read against the same subject.
+            let deployment = deployment_name();
             let mut retirement = crate::RetirementPass::new(std::sync::Arc::new(
                 crate::MetricsRetirement::new(pool.clone()),
-            ));
+            ))
+            .with_deployment(deployment.clone());
             if let Some(mb) = metrics.clone() {
                 retirement = retirement.with_metrics(mb);
             }
 
             let mut cap = crate::SampleLogCap::new(pool, sample_max_rows)
                 .with_retirement(std::sync::Arc::new(retirement))
-                .with_deployment(deployment_name());
+                .with_deployment(deployment);
             if let Some(mb) = metrics {
                 cap = cap.with_metrics(mb);
             }
