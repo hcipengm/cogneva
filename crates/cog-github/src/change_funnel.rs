@@ -160,8 +160,8 @@ pub fn census(records: &[LandingRecord], staged: &[GeneratedChange]) -> Vec<Funn
 /// A counter has no series until its first increment, so with nothing landed
 /// and nothing retired yet, "no change has ended this way since this process
 /// started" and "this counter was never wired up" are the same reading: both
-/// are the absence of a series. The publisher walks this list on its tick and
-/// records a zero for each pair, which is what creates the series — a
+/// are the absence of a series. The publisher walks this list once per process
+/// and records a zero for each pair, which is what creates the series — a
 /// counter's `inc_by(0)` adds nothing to the value and everything to the
 /// series. The census already publishes its empty cells for the same reason;
 /// this is the half the census cannot carry, because a landing takes its
@@ -224,7 +224,7 @@ impl crate::landing::MainChannel {
     }
 
     /// Publish the census, one gauge series per (entry point, stage), and seed
-    /// the fate counter's whole domain.
+    /// the fate counter's whole domain — the latter once per process.
     ///
     /// Called on the landing channel's own tick. Failures are logged and the
     /// pass is abandoned: the backend being unreachable is one fact, and
@@ -251,21 +251,36 @@ impl crate::landing::MainChannel {
                 return;
             }
         }
-        // The fate counter is seeded on the same tick, so a class nothing has
-        // reached yet is a zero rather than a missing series. Only the series
-        // is created here; the value each one already carries is untouched.
-        for (intent, fate) in fate_domain() {
-            let labels = HashMap::from([
-                ("intent".to_string(), intent.as_str().to_string()),
-                ("fate".to_string(), fate.as_str().to_string()),
-            ]);
-            if let Err(e) = metrics
-                .record_counter(CHANGE_FATE_METRIC, 0.0, labels)
-                .await
-            {
-                tracing::warn!(error = %e, "cannot seed the change fate counter");
-                return;
+        // The fate counter is seeded so that a class nothing has reached yet
+        // is a zero rather than a missing series. Recording a zero creates the
+        // series without moving its value, but it is not free: the backend
+        // appends a sample row for every record, zero or not, and the domain
+        // is 18 series wide. Doing this on each tick therefore wrote about
+        // 52k rows a day into a store that is capped and shared with every
+        // other reading, and each of those rows evicted somebody else's. Once
+        // per process is what the seed needs — the series has to exist from
+        // this process's first tick, and it does — so the flag is set only
+        // after the whole domain has been accepted, and a pass that failed
+        // halfway retries on the next tick.
+        if !self
+            .fate_domain_seeded
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            for (intent, fate) in fate_domain() {
+                let labels = HashMap::from([
+                    ("intent".to_string(), intent.as_str().to_string()),
+                    ("fate".to_string(), fate.as_str().to_string()),
+                ]);
+                if let Err(e) = metrics
+                    .record_counter(CHANGE_FATE_METRIC, 0.0, labels)
+                    .await
+                {
+                    tracing::warn!(error = %e, "cannot seed the change fate counter");
+                    return;
+                }
             }
+            self.fate_domain_seeded
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }

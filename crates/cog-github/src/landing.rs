@@ -491,6 +491,15 @@ pub struct MainChannel {
     /// this plugin and the channel is built during `init`; none until then, in
     /// which case a failure stays a log line.
     metrics: OnceLock<Arc<dyn cog_core::MetricsBackend>>,
+    /// Whether this process has already published the fate counter's empty
+    /// classes. The seed has to happen once per process and not once per tick:
+    /// recording a zero still appends a sample row, and the fate domain is 18
+    /// series wide, so a per-tick seed costs tens of thousands of rows a day
+    /// in a table that is capped and shared with every other reading.
+    ///
+    /// Read and set by the publisher, which lives in the funnel module because
+    /// the domain it walks is defined there.
+    pub(crate) fate_domain_seeded: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for MainChannel {
@@ -519,6 +528,7 @@ impl MainChannel {
             controller,
             gate: tokio::sync::Mutex::new(()),
             metrics: OnceLock::new(),
+            fate_domain_seeded: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2722,6 +2732,21 @@ mod tests {
             .len()
     }
 
+    /// How many fate rows have been appended, not their value. The seed is
+    /// free to read and not to write, so the cost it has to be judged by is
+    /// the row count.
+    async fn fate_rows(metrics: &cog_storage::MemoryMetricsBackend) -> usize {
+        metrics
+            .query_counter_range(
+                crate::change_funnel::CHANGE_FATE_METRIC.as_str(),
+                chrono::Utc::now() - chrono::Duration::minutes(5),
+                chrono::Utc::now() + chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .len()
+    }
+
     /// The census publishes its empty cells, so the fate counter has to seed
     /// its empty classes too: a counter carries no series until its first
     /// increment, which makes "nothing has ended this way since this process
@@ -2765,6 +2790,43 @@ mod tests {
             })
             .expect("the landed class is seeded and carries its count");
         assert_eq!(landed.value, 1.0);
+    }
+
+    /// Seeding the fate domain creates one series per class by recording a
+    /// zero, and the backend appends a row for every record whether or not it
+    /// carries a value. Done on the tick that is the domain's width in rows
+    /// per tick, into a store that is capped and shared with every other
+    /// reading, and after the first pass it buys nothing: the series is
+    /// already there. What the seed has to guarantee is that the classes exist
+    /// from this process's first tick, and the first pass is that tick.
+    #[tokio::test]
+    async fn the_fate_seed_runs_once_per_process_not_once_per_tick() {
+        let (chan, metrics) = measured_channel(Default::default());
+        let domain =
+            cog_core::EvolutionIntent::ALL.len() * crate::change_funnel::FunnelFate::ALL.len();
+
+        chan.publish_funnel().await;
+        assert_eq!(
+            fate_rows(&metrics).await,
+            domain,
+            "the first tick seeds every class"
+        );
+
+        chan.publish_funnel().await;
+        assert_eq!(
+            fate_rows(&metrics).await,
+            domain,
+            "the second tick re-appended the seed"
+        );
+
+        // Only the zeros are skipped: a fate that really happened is an event
+        // and appends like any other.
+        chan.note_change_fate(
+            &change("c1", &diff_touching(&["crates/cog-github/src/lib.rs"])),
+            crate::change_funnel::FunnelFate::Landed,
+        )
+        .await;
+        assert_eq!(fate_rows(&metrics).await, domain + 1);
     }
 
     #[tokio::test]
