@@ -1067,11 +1067,17 @@ impl LlmHealthTable {
     /// 这台上游此刻还没有答案、值得补问的问题。
     ///
     /// 条目里有答案的不问（那是配置写入时问过的），运行时已有结论的不问（问出来
-    /// 了就不再问）。温度与工具调用**只对 openai 面问**：它们各自的读点本身只对
-    /// openai 发布——钳制那一段在 `style != "anthropic"` 里，工具调用的路由过滤也
-    /// 只在 openai 面按原生 `tool_calls` 判——给 anthropic 条目开这两问，等于去问
-    /// 一件按构造不会用到的答案，而每一次问都是一次真实请求。
+    /// 了就不再问）。三问**都在 openai 面才问**，两条理由在同一个方向上：
+    /// ①它们的读点都只对 openai 发布（钳制与剥 `stream_options` 那一段在
+    /// `style != "anthropic"` 的分支里，工具调用的路由过滤也只在 openai 面按原生
+    /// `tool_calls` 判）——给没有读点的条目开这一问，等于花一次真实请求去问一件
+    /// 没人读的答案；②探测本身是 openai 形状的（`/chat/completions` 加
+    /// `stream_options`），对 anthropic 端点问它，回来的既不是这个问题也不是
+    /// 这个形状的答案，那条判定还会一直停在"问不出来"，每过一个退避窗再花一次。
     fn open_capability_questions(&self, u: &LlmUpstream) -> Vec<CapabilityQuestion> {
+        if u.api_style != "openai" {
+            return Vec::new();
+        }
         let caps = self.runtime_caps.lock().unwrap();
         let probed = caps.get(&Self::key(u));
         let mut open = Vec::new();
@@ -1080,9 +1086,6 @@ impl LlmHealthTable {
             CapabilityQuestion::Temperature,
             CapabilityQuestion::ToolCalls,
         ] {
-            if question != CapabilityQuestion::UsageInStreaming && u.api_style != "openai" {
-                continue;
-            }
             if Self::entry_verdict(u, question).is_some() {
                 continue;
             }
@@ -2698,36 +2701,41 @@ async fn refresh_pool_state(state: &AppState) {
             &[("upstream", &reading.key)],
         )
         .await;
-        // 用量能力判定有没有出处。这一条把"计量恒零"从一个结果变成一个可告警的
-        // 条件：上游正在承接流量而我们还在按厂商画像猜着剥 `stream_options`，
-        // 它的 token 计数就不可能非零。别的序列看不出这一格——上游不报用量与
-        // 我们没问，在计数和读数面上同形。
         if let Some(upstream) = upstreams
             .iter()
             .find(|u| LlmHealthTable::key(u) == reading.key)
         {
-            record_gauge(
-                state,
-                cog_core::metric_names::LLM_USAGE_VERDICT_MEASURED,
-                if state.llm_health.usage_verdict_measured(upstream) {
-                    1.0
-                } else {
-                    0.0
-                },
-                &[("upstream", &reading.key)],
-            )
-            .await;
-            // 工具调用那个判决的出处，与上面用量那条同形、答的是另一个问题。
-            // 路由只把携带 tools 的请求从**实证说不支持**的上游上移开：没问过的
-            // 上游在路由上与"支持"同形，请求照发，回来的是一段写成文本的工具
-            // 调用——一个工具都不会执行，而调用方按正常价买了一次空转。这一格
-            // 落在别处看不出：那次请求是 200，形态类读数与客户端错误计数都不会
-            // 亮，因为它们量的是"被拒"，而这一次是被当成了好消息。
-            //
-            // 只对 openai 协议面发布：anthropic 面的工具调用随协议来，那一面没有
-            // "没问过"这个状态（准入探测本身也只问 openai 条目，见 `llm_admin`），
-            // 给它发 0 会让上面那条规则对一条按构造已关闭的问题常挂。
+            // 三问的出处都只对 openai 协议面发布，判据是**这一问的读点在不在这
+            // 个面上**，不是它重不重要。三问的读点都在 openai 形状的体上：
+            // `adapt_request_body`（剥 `stream_options` 与钳温度都在它里面）只在
+            // `style != "anthropic"` 的分支被调用，工具调用的路由过滤也只在
+            // openai 面按原生 `tool_calls` 判。给按构造没有读点的对面发 0，会让
+            // 对应的规则对一条**已关闭的问题常挂**，而它点名的那条修法（准入时
+            // 写判定、或网关在健康时自己再问一次）在那面上都不存在——准入探测
+            // 本身也只问 openai 条目（见 `llm_admin` 的 `resolve_upstream`），
+            // 补问发出的探测又都是 openai 形状的。
             if upstream.api_style == "openai" {
+                // 用量能力判定有没有出处。这一条把"计量恒零"从一个结果变成一个
+                // 可告警的条件：上游正在承接流量而我们还在按厂商画像猜着剥
+                // `stream_options`，它的 token 计数就不可能非零。别的序列看不出
+                // 这一格——上游不报用量与我们没问，在计数和读数面上同形。
+                record_gauge(
+                    state,
+                    cog_core::metric_names::LLM_USAGE_VERDICT_MEASURED,
+                    if state.llm_health.usage_verdict_measured(upstream) {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                    &[("upstream", &reading.key)],
+                )
+                .await;
+                // 工具调用那个判决的出处，与上面用量那条同形、答的是另一个问题。
+                // 路由只把携带 tools 的请求从**实证说不支持**的上游上移开：没问过的
+                // 上游在路由上与"支持"同形，请求照发，回来的是一段写成文本的工具
+                // 调用——一个工具都不会执行，而调用方按正常价买了一次空转。这一格
+                // 落在别处看不出：那次请求是 200，形态类读数与客户端错误计数都不会
+                // 亮，因为它们量的是"被拒"，而这一次是被当成了好消息。
                 record_gauge(
                     state,
                     cog_core::metric_names::LLM_TOOL_CALLS_VERDICT_MEASURED,
@@ -2748,9 +2756,6 @@ async fn refresh_pool_state(state: &AppState) {
                 // 画像说要钳时，网关把调用方自己挑的那个数**改掉**，回来的还是
                 // 200——按实测钳与按画像钳是同一个状态码、同一段回话、也让
                 // `llm_request_param_clamped_total` 涨同一个数，这一面分不开。
-                //
-                // 与工具调用那面一样只对 openai 发布：钳制那一段本身就在
-                // `style != "anthropic"` 里，anthropic 面按构造没有这个状态。
                 record_gauge(
                     state,
                     cog_core::metric_names::LLM_TEMPERATURE_VERDICT_MEASURED,
@@ -8177,12 +8182,23 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
     #[test]
     fn the_questions_asked_are_the_ones_that_face_reads() {
         let table = LlmHealthTable::default();
-        let mut u = stub_upstream("https://api.anthropic.com/v1", "m1");
-        u.api_style = "anthropic".into();
+        let mut anthropic = stub_upstream("https://api.anthropic.com/v1", "m1");
+        anthropic.api_style = "anthropic".into();
+        // anthropic 面一问都不问：三问的读点都在 openai 形状的体上（钳制与剥
+        // `stream_options` 在 `style != "anthropic"` 的分支里），而探测本身也是
+        // openai 形状的——问了也不会有读点，只会每过一个退避窗花掉一次配额。
+        assert_eq!(table.open_capability_questions(&anthropic), vec![]);
 
+        // 同一个条目换成 openai 面，三问全都该问（池条目里一个判定都没有）。
+        let mut openai = stub_upstream("https://api.openai.example/v1", "m2");
+        openai.api_style = "openai".into();
         assert_eq!(
-            table.open_capability_questions(&u),
-            vec![CapabilityQuestion::UsageInStreaming]
+            table.open_capability_questions(&openai),
+            vec![
+                CapabilityQuestion::UsageInStreaming,
+                CapabilityQuestion::Temperature,
+                CapabilityQuestion::ToolCalls,
+            ]
         );
     }
 
@@ -8485,6 +8501,58 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             clamped(&text, "role"),
             Some(1.0),
             "改过就该在计数里留下 field=role:\n{text}"
+        );
+    }
+
+    /// 用量那个判决的出处：它答的是"要不要留着调用方的 `stream_options`"，而那道
+    /// 决定只在 openai 形状的体上做。
+    ///
+    /// 三处断言与另两条一一对应：没问过的 openai 条目报 0（网关正拿画像决定要不
+    /// 要剥掉那个字段，而剥掉就等于把要观测的那件事自己关掉）、池条目带了判定时
+    /// 报 1、anthropic 面**没有这条序列**——那一面根本不走 `adapt_request_body`，
+    /// 给它发 0 会让规则对一条按构造已关闭的问题常挂，而规则总结里点名的那条修法
+    /// （准入时写判定、或网关在健康时自己再问一次）在那面上都不存在。
+    #[tokio::test]
+    async fn the_usage_verdict_is_read_where_the_body_it_decides_about_is_shaped() {
+        let mut unasked = stub_upstream("https://a.example.com/v1", "m1");
+        unasked.supports_usage_in_streaming = None;
+        let mut asked = stub_upstream("https://b.example.com/v1", "m2");
+        asked.supports_usage_in_streaming = Some(true);
+        let mut anthropic = stub_upstream("https://c.example.com/v1", "m3");
+        anthropic.api_style = "anthropic".into();
+
+        let state = test_state(vec![unasked, asked.clone(), anthropic.clone()]);
+        // 三条都要有健康读数：这一格跟着 `readings` 走，没有判定就没有这一行。
+        for u in [
+            &state.config.llm_upstreams[0],
+            &state.config.llm_upstreams[1],
+            &state.config.llm_upstreams[2],
+        ] {
+            state.llm_health.note_success(u);
+        }
+
+        refresh_pool_state(&state).await;
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        let series = cog_core::metric_names::LLM_USAGE_VERDICT_MEASURED.as_str();
+        assert_eq!(
+            series_value(
+                &text,
+                series,
+                &LlmHealthTable::key(&state.config.llm_upstreams[0])
+            ),
+            Some(0.0),
+            "从没问过的 openai 条目：网关正按画像决定要不要剥 `stream_options`，\
+             这一格必须是 0:\n{text}"
+        );
+        assert_eq!(
+            series_value(&text, series, &LlmHealthTable::key(&asked)),
+            Some(1.0),
+            "池条目带了判定，剥不剥是实证来的，这一格是 1:\n{text}"
+        );
+        assert_eq!(
+            series_value(&text, series, &LlmHealthTable::key(&anthropic)),
+            None,
+            "anthropic 面不走 `adapt_request_body`，这一格不该发布:\n{text}"
         );
     }
 

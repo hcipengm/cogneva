@@ -591,7 +591,7 @@ const GAUGE_HELP: &[(&str, &str)] = &[
     ),
     (
         "llm_usage_verdict_measured",
-        "1 when this upstream's usage-reporting capability has been settled from \
+        "1 when this openai-style upstream's usage-reporting capability has been settled from \
          evidence, 0 while it is still assumed, by upstream. Read next to the \
          token counters: an upstream carrying traffic while we still guess at \
          stripping stream_options cannot report non-zero tokens, and 'the \
