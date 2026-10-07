@@ -324,6 +324,60 @@ check "载体清单：载体总数（4 个来源 × 2 处）" 8 "$n_carriers"
 check "INTL 侧只有一个版本的命令文本" 1 "$(entry_carriers | awk -F'\t' '$1 ~ /:github$/ {print $2}' | sort -u | wc -l | tr -d ' ')"
 check "CN 侧只有一个版本的命令文本" 1 "$(entry_carriers | awk -F'\t' '$1 ~ /:gitee$/ {print $2}' | sort -u | wc -l | tr -d ' ')"
 
+# ---------- ensure_rust：取不到 rustup 脚本不许读成「装好了」 ----------
+# 与入口命令同一形状：`curl … | sh -s` 的退出码是 sh 的，而 sh 读空 stdin 以 0 退出。
+# 跑的是 bootstrap.sh 自己那份函数（文件在上面已经 source 过），PATH 只留假 curl 与
+# 一个 sh —— **没有 cargo**，否则函数会在第一行提前 return，这一整段就成了空跑
+# （判据没有题目时是空的，不是绿的）。
+RF="$FAKE/rust"
+mkdir -p "$RF"
+cat > "$RF/curl" <<'EOF'
+#!/bin/sh
+case "${RUSTUP_FAKE:-ok}" in
+    fail) exit 22 ;;
+    empty) exit 0 ;;
+    *)
+        # 取到的「脚本」：只打一行记号、写掉末尾那次 `.` 要 source 的那个文件
+        echo 'echo RUSTUP-RAN'
+        echo 'printf true > "$HOME/.cargo/env"'
+        exit 0 ;;
+esac
+EOF
+chmod +x "$RF/curl"
+ln -sf /bin/sh "$RF/sh"
+
+rust_home() { mktemp -d; }
+
+run_ensure_rust() { # run_ensure_rust <假法> <HOME>
+    HOME="$2" PATH="$RF" CN_MIRROR=0 RUSTUP_FAKE="$1" COGNEVA_BOOTSTRAP_SOURCE_ONLY=1 \
+        /bin/sh -c '. "$1/bootstrap.sh" >/dev/null 2>&1; ensure_rust' _ "$ROOT" 2>&1
+    echo "rc=$?"
+}
+
+h1="$(rust_home)"; out_fail="$(run_ensure_rust fail "$h1")"
+ok_or "ensure_rust：取不到 → 说出是哪一步取不到" "rustup 安装脚本取不到" "$out_fail"
+not_or "ensure_rust：取不到 → 失败不许落在 cargo/env 这个后果上" "cargo/env" "$out_fail"
+ok_or "ensure_rust：取不到 → 非零退出" "rc=1" "$out_fail"
+
+h2="$(rust_home)"; out_empty="$(run_ensure_rust empty "$h2")"
+ok_or "ensure_rust：回 200 但正文为空 → 同样当场报「取不到」" "rustup 安装脚本取不到" "$out_empty"
+ok_or "ensure_rust：回 200 但正文为空 → 非零退出" "rc=1" "$out_empty"
+
+h3="$(rust_home)"; mkdir -p "$h3/.cargo"; out_ok="$(run_ensure_rust ok "$h3")"
+ok_or "ensure_rust：取到 → 正文真的被执行" "RUSTUP-RAN" "$out_ok"
+ok_or "ensure_rust：取到 → 正常退出" "rc=0" "$out_ok"
+check "ensure_rust：取到 → 末尾那次 source 有东西可读" "yes" "$([ -f "$h3/.cargo/env" ] && echo yes || echo no)"
+
+# 对照（旧写法必须命中这条判据）：`curl … | sh -s` 的管道退出码在空输入下是 0，
+# 而失败只会以 `. "$HOME/.cargo/env"` 这个**后果**的形式出现。
+h4="$(rust_home)"; old_rc="$(HOME="$h4" PATH="$RF" RUSTUP_FAKE=fail /bin/sh -c \
+    'curl --proto "=https" --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal' 2>/dev/null; echo $?)"
+check "对照：旧写法的管道退出码（空输入 ⇒ 0）" 0 "$old_rc"
+h5="$(rust_home)"; old_out="$(HOME="$h5" PATH="$RF" RUSTUP_FAKE=fail /bin/sh -c \
+    'curl --proto "=https" --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal; . "$HOME/.cargo/env"' 2>&1)"
+ok_or "对照：旧写法的失败只说后果（cargo/env 打不开）" "cargo/env" "$old_out"
+not_or "对照：旧写法里没有一句提到取不到" "取不到" "$old_out"
+
 # ---------- macOS 路径：VM 内失败不许被读成「完成」 ----------
 # 假 limactl 把 `shell` 之后的参数原样执行 —— 于是这条判据跑的是**真的**入口命令，
 # 而不是我编造的一个「VM 返回 1」。

@@ -409,7 +409,18 @@ ensure_rust() {
         /tmp/rustup-init -y --profile minimal
         rm -f /tmp/rustup-init
     else
-        curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+        # `curl … | sh -s` 的退出码是 sh 的，而 sh 读到空 stdin 会以 0 退出：取不到与
+        # 装好了同形。原来的兜底是下面那句 `. "$HOME/.cargo/env"`，它点名的是**后果**
+        # （文件不存在），不是「脚本没取到」这一步；同仓 Rust 版安装器
+        # （cog-reflection 的 install_rust）反而把 `~/.cargo/env` 当可缺项跳过。
+        # 判据改落在「取到东西了没有」上，失败当场说清是哪一步。
+        rustup_sh="$(curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs)" || rustup_sh=""
+        if [ -z "$rustup_sh" ]; then
+            echo "[bootstrap] rustup 安装脚本取不到（sh.rustup.rs 不可达，网络受限）；Rust 未安装，未做其他改动" >&2
+            exit 1
+        fi
+        printf '%s\n' "$rustup_sh" | sh -s -- -y --profile minimal
+        unset rustup_sh
     fi
     # shellcheck disable=SC1091
     . "$HOME/.cargo/env"
