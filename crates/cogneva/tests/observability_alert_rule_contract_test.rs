@@ -606,8 +606,10 @@ const PRODUCED: &[(&str, &str)] = &[
     // 这一对顶掉的是 `cogneva_mainline_superseded_rollout_total` 那条欠账。原来想让它
     // 自己当「守卫还在」的证据（它每一轮都写，跳过时写 1、没跳过写 0），但计数器上补
     // 一个 0 不会让已渲染的值动，所以「这一轮问过」在那条序列上读不出来；能读出来的是
-    // 存储为每条序列渲染的 `_observed_timestamp_seconds` 伴生，而那个族不在闭集里、
-    // 门禁也认不得。于是把「问过」这件事挪到闭集内自成一计数，判据变成一对计数之差。
+    // 「最新一次观测在什么时候」，那是存储为每条序列渲染的 `_observed_timestamp_seconds`
+    // 伴生，而这个族当时在门禁视界之外（现在认得，见 `closed_set::a_series_this_build_publishes`）。
+    // 这一对作为所选读数另有其力：它答的是「走到决定这一共有几轮」与「守卫真被问了几次」，
+    // 两者之差就是判据本身；伴生答不出「几次」，只答最后那次在何时。
     (
         "cogneva_mainline_rollout_attempts_total",
         "crates/cog-reflection/src/mainline_deployer.rs",
@@ -703,6 +705,14 @@ fn chart_rules() -> Vec<(String, String)> {
         .collect()
 }
 
+/// A rule may read a name this build records, a name it *derives* from one, or
+/// a foreign series listed with its owner — nothing else, because a rule on any
+/// other name fires never. The derived half is decided by
+/// [`closed_set::a_series_this_build_publishes`], which owns it for both
+/// readers: the store renders `_observed_timestamp_seconds` beside every series
+/// it serves and a histogram's `_bucket`/`_sum`/`_count` come from the name its
+/// producer records, so a rule naming either reads something that exists.
+/// Spelling the judgement here instead is what made the two readers disagree.
 #[test]
 fn every_series_an_alert_rule_reads_is_one_something_produces() {
     let produced: BTreeSet<&str> = PRODUCED.iter().map(|(n, _)| *n).collect();
@@ -711,7 +721,10 @@ fn every_series_an_alert_rule_reads_is_one_something_produces() {
     let mut unknown: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (rule, promql) in chart_rules() {
         for name in metric_names_in(&promql) {
-            if produced.contains(name.as_str()) || foreign.contains(name.as_str()) {
+            if produced.contains(name.as_str())
+                || foreign.contains(name.as_str())
+                || closed_set::a_series_this_build_publishes(&name)
+            {
                 continue;
             }
             unknown.entry(name).or_default().push(rule.clone());
@@ -1329,7 +1342,7 @@ const UNREAD: &[(&str, Unread)] = &[
     ),
     (
         "cogneva_rollout_job_reading_unix",
-        Unread::Gap("ties the two readings above to the run that produced them; a reader needs the run cadence, which is per-rollout and published by no series. The one reading that would not need it is this timestamp's own age, and the store does render a companion that carries it -- cogneva_rollout_job_reading_unix_observed_timestamp_seconds, frozen while the writer is gone -- but that family is outside the closed set the census walks and the contract gate rejects a rule naming it, so the reader has to be opened on both sides at once"),
+        Unread::Gap("ties the two readings above to the run that produced them; a reader needs the run cadence, which is per-rollout and published by no series. The one reading that would not need it is this timestamp's own age, and the store does render a companion that carries it -- cogneva_rollout_job_reading_unix_observed_timestamp_seconds, frozen while the writer is gone. That family is now inside the gate's view, so a rule may name it (see the derived half of every_series_an_alert_rule_reads_is_one_something_produces); what still keeps the reader unopened is the same missing bound, since an age is only a fault against a cadence, and the run happens per change rather than on a declared period"),
     ),
     (
         "cogneva_mainline_superseded_rollout_total",

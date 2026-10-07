@@ -1,6 +1,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
+use cog_core::observability_text::observed_timestamp_name;
 use cog_core::{HistogramTotals, MetricSample};
 
 /// Render a set of counter samples in Prometheus text format.
@@ -215,17 +216,21 @@ fn render_observed_timestamps(name: &str, series: &[(String, i64)]) -> String {
         return String::new();
     }
 
+    // The companion's spelling comes from the shared contract rather than from a
+    // literal here: the rules that may read it and the checks that decide
+    // whether a name has a producer in this build both have to recognise what
+    // this function renders, and a literal in three places is how they stop
+    // agreeing.
+    let companion = observed_timestamp_name(name);
     let mut out = format!(
-        "# HELP {name}_observed_timestamp_seconds Unix seconds the newest observation behind {name} was recorded at\n\
-         # TYPE {name}_observed_timestamp_seconds gauge\n"
+        "# HELP {companion} Unix seconds the newest observation behind {name} was recorded at\n\
+         # TYPE {companion} gauge\n"
     );
     for (key, ts) in series {
         if key.is_empty() {
-            out.push_str(&format!("{name}_observed_timestamp_seconds {ts}\n"));
+            out.push_str(&format!("{companion} {ts}\n"));
         } else {
-            out.push_str(&format!(
-                "{name}_observed_timestamp_seconds{{{key}}} {ts}\n"
-            ));
+            out.push_str(&format!("{companion}{{{key}}} {ts}\n"));
         }
     }
 

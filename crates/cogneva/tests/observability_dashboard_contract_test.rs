@@ -474,18 +474,17 @@ fn every_series_the_dashboard_reads_is_one_something_produces() {
     let mut unknown: BTreeSet<String> = BTreeSet::new();
     for (_, expr) in metric_exprs(&text) {
         for name in metric_names_in(&expr) {
-            if produced.contains(name.as_str()) || foreign.contains(name.as_str()) {
-                continue;
-            }
-            // A classic histogram is exposed as three series derived from the
-            // one name the producer records: `_bucket`, `_sum`, `_count`. Read
-            // the base as the same series rather than asking the dashboard to
-            // pretend otherwise. This over-accepts a `_sum` whose base is a
-            // counter, which no panel in this dashboard does.
-            let base = ["_bucket", "_sum", "_count"]
-                .iter()
-                .find_map(|suffix| name.strip_suffix(suffix));
-            if base.is_some_and(|b| produced.contains(b)) {
+            if produced.contains(name.as_str())
+                || foreign.contains(name.as_str())
+                // A classic histogram is exposed as three series derived from the
+                // one name the producer records: `_bucket`, `_sum`, `_count`, and
+                // the store renders an `_observed_timestamp_seconds` companion
+                // beside every series it serves. Which derivations count is
+                // decided once, in the module both readers share, rather than
+                // here -- spelling it in each reader is what let a `_bucket` be
+                // accepted in a panel and rejected in a rule.
+                || closed_set::a_series_this_build_publishes(&name)
+            {
                 continue;
             }
             unknown.insert(name);

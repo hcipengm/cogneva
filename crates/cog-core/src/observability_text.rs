@@ -17,10 +17,45 @@
 //! fresh map per sample, so an iteration-ordered rendering splits one series into
 //! as many series as there are label permutations, each carrying a fraction of
 //! the total, and every per-series aggregate downstream is then wrong.
+//!
+//! One name in that convention is derived rather than recorded: alongside every
+//! series a store renders it also renders [`OBSERVED_TIMESTAMP_SUFFIX`]'s
+//! companion, carrying when the newest thing behind that series happened. It is
+//! not a name any producer writes, so it is not in the registry of writable
+//! names — but it *is* published by the build, which is why the spelling lives
+//! here beside the other two rather than being re-typed by each renderer and
+//! each reader. A reader that spells it itself keeps matching after the renderer
+//! changes the suffix, and reports a producer for a series nothing renders.
 
 use std::collections::HashMap;
 
 use crate::RawMetric;
+
+/// The suffix a store appends to every series it renders, to carry the time of
+/// the newest observation behind that series.
+///
+/// It is what separates an abandoned series from a quiet one: a value that has
+/// stopped moving is the same shape whether its producer went away or is running
+/// and has nothing to count. Declared in the shared contract layer because the
+/// process that renders the companion, the rules that may read one, and the
+/// checks that judge whether a name has a producer here all have to agree on the
+/// spelling; a re-typed literal is how a reader ends up accepting a name the
+/// store never renders.
+pub const OBSERVED_TIMESTAMP_SUFFIX: &str = "_observed_timestamp_seconds";
+
+/// The companion series name for `base`.
+pub fn observed_timestamp_name(base: &str) -> String {
+    format!("{base}{OBSERVED_TIMESTAMP_SUFFIX}")
+}
+
+/// The series `name` is the companion of, or `None` when `name` is not one.
+///
+/// Only the spelling is decided here. Whether the base names a series this build
+/// publishes is a different question, answered against the registry.
+pub fn observed_timestamp_base(name: &str) -> Option<&str> {
+    name.strip_suffix(OBSERVED_TIMESTAMP_SUFFIX)
+        .filter(|base| !base.is_empty())
+}
 
 /// Render raw observable metrics in Prometheus text format.
 ///
@@ -130,5 +165,30 @@ mod tests {
     #[test]
     fn render_raw_metrics_empty_is_empty() {
         assert!(render_raw_metrics(&[]).is_empty());
+    }
+
+    #[test]
+    fn the_companion_suffix_is_the_one_the_reader_strips() {
+        assert_eq!(
+            observed_timestamp_name("cogneva_rollout_job_reading_unix"),
+            "cogneva_rollout_job_reading_unix_observed_timestamp_seconds"
+        );
+        assert_eq!(
+            observed_timestamp_base("cogneva_rollout_job_reading_unix_observed_timestamp_seconds"),
+            Some("cogneva_rollout_job_reading_unix")
+        );
+    }
+
+    /// The suffix alone is not a base: a bare companion name has no series
+    /// behind it, and reading the empty string as one would let a rule name a
+    /// series nothing renders.
+    #[test]
+    fn a_name_that_is_not_a_companion_has_no_base() {
+        assert_eq!(
+            observed_timestamp_base("cogneva_rollout_job_reading_unix"),
+            None
+        );
+        assert_eq!(observed_timestamp_base(OBSERVED_TIMESTAMP_SUFFIX), None);
+        assert_eq!(observed_timestamp_base(""), None);
     }
 }
