@@ -934,6 +934,15 @@ impl cog_core::SystemPlugin for StoragePlugin {
 /// per restart — a pod name would be an identity that changes on every rollout,
 /// and the sample log keeps each series' newest row forever.
 ///
+/// The manifest is where the name has to come from, and it has to be that
+/// workload's own name. A pod label will not do: the label every pod carries is
+/// the *application* name (`app.kubernetes.io/name`), and one application's
+/// value is shared by every workload built from the same image — the security
+/// gateway, the registry, the sandbox executor and the rollout jobs all answer
+/// with the main deployment's, which is exactly the answer this label exists to
+/// tell apart. A deployment that speaks under another's name writes the other's
+/// series and the store's floor row goes to whichever wrote last.
+///
 /// Absent on a process whose platform never sets one; the readings then go out
 /// unlabelled, which is the same shape as before this existed.
 fn deployment_name() -> String {

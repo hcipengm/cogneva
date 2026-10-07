@@ -354,6 +354,12 @@ jobs:
       # 「没有序列」与「没有这个标签」在读数上分不开）。
       - name: Check alert rules name their subject, not their reporter
         run: bash deploy/scripts/check-alert-rule-subjects.sh
+      # 样本日志那几条 gauge 的写者身份：容量与容量判定是每个部署自己的声明，
+      # 却落在共用表里、series 键就是标签集。值取成 Pod 标签时拿到的是**应用**名，
+      # 同一个镜像的每个工作负载都带着它，那道「别家不许顶这一家的声明」的闸
+      # 就全失效。与上面那条同形：渲染期没有症状，清单合法、parity 也绿。
+      - name: Check deployment-name wiring
+        run: bash deploy/scripts/check-deployment-name-wiring.sh
 
   bootstrap-cross-platform:
     name: Bootstrap Cross-Platform Check
