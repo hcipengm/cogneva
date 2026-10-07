@@ -1185,9 +1185,9 @@ enum Unread {
 /// `Elsewhere` is a decision: the same fact is already stated by a surface that
 /// is read, named here. `Gap` is a debt: nothing states the fact, and the reason
 /// it could not be closed is what the entry carries -- a missing declared bound,
-/// a cadence that no reading publishes, or a repair that is a policy decision
-/// rather than a reader to write. `GAPS_AT_CENSUS` counts them so the next one
-/// must be classified deliberately.
+/// a cadence that no reading publishes, a signal the producer does not publish
+/// yet, or a repair that is a policy decision rather than a reader to write.
+/// `GAPS_AT_CENSUS` counts them so the next one must be classified deliberately.
 const UNREAD: &[(&str, Unread)] = &[
     // The denominator of the rule on the aged-out backlog: the sibling counts
     // every unextracted raw, this one counts the part the system will retry by
@@ -1229,10 +1229,7 @@ const UNREAD: &[(&str, Unread)] = &[
     ),
     (
         "cogneva_worktree_index_present",
-        Unread::Elsewhere {
-            readers: &["cogneva_loop_tick_age_seconds"],
-            reason: "the sampling loop's liveness is stated by background_loop_stalled over cogneva_loop_tick_age_seconds",
-        },
+        Unread::Gap("whether a resident worktree's git index file is there. Reading it beside the missing-files series is what the pair is for -- the help says so and worktree_tree_about_to_rebuild's summary tells the operator to do it -- and yet no rule, panel or other series reads it. That rule cannot stand in: with the index gone, git ls-files lists nothing, so the sibling reads the whole-tree size, which is exactly what it reads when the index is there and remembers no files, so that alert fires on both shapes and tells them apart nowhere. The series this entry used to name, the loop tick, says whether the sampler is running, not which worktree lost its index. No reader was written on purpose: the index is rebuilt by the next reset, so the reading is a transient, and the gateway replays this gauge from the sample store with no window -- a recycled tree keeps exposing its last value, so a rule could never be resolved. A threshold would have to be the round period instead, and rounds are event-driven, so the number would be invented. Closing it means publishing the sampler's own liveness on this face first; until that signal exists the missing half is a producer-side reading rather than a rule to write"),
     ),
     (
         "cogneva_version_contract_checks_total",
@@ -1359,7 +1356,7 @@ fn unresolved_readers(read: &BTreeSet<String>, name: &str, readers: &[&str]) -> 
 /// that nothing else states must be classified, and calling it a gap raises
 /// this number on purpose -- the point of the ratchet is that the increase is a
 /// decision someone made, not a drift nobody saw.
-const GAPS_AT_CENSUS: usize = 21;
+const GAPS_AT_CENSUS: usize = 22;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {
