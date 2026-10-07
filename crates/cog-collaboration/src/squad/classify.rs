@@ -13,10 +13,20 @@
 
 use std::collections::HashMap;
 
-use cog_core::contract::outcome::{DEGENERATE_LOOP_PREFIX, TERMINAL_ENV_FAILURE_PREFIX};
+use cog_core::contract::outcome::{
+    DEGENERATE_LOOP_PREFIX, TERMINAL_ENV_FAILURE_PREFIX, UPSTREAM_UNAVAILABLE_PREFIX,
+};
 
 /// 终止性环境/协议故障的分类标签，与 [`TERMINAL_ENV_FAILURE_PREFIX`] 配对。
 pub const TERMINAL_ENV_FAILURE_CLASS: &str = "terminal_env_failure";
+
+/// 上游拒绝但环境自己会清掉的分类标签，与 [`UPSTREAM_UNAVAILABLE_PREFIX`] 配对。
+///
+/// 这一格存在的理由是**它以前被记错了**：这类原因原先套的是终止性前缀，
+/// 于是同一次终止在两处读出相反的话——`ralph_terminations_total` 说
+/// 「终态」、而重试梯子（读 typed 因）当场排了下一次尝试。分类只能有一个
+/// 答案，答案由原因自己带的那个前缀给出。
+pub const UPSTREAM_UNAVAILABLE_CLASS: &str = "upstream_unavailable";
 
 /// 退化环（花费买不到进展）的分类标签，与 [`DEGENERATE_LOOP_PREFIX`] 配对。
 pub const DEGENERATE_LOOP_CLASS: &str = "degenerate_loop";
@@ -30,6 +40,7 @@ pub const UNCLASSIFIED_CLASS: &str = "unrecoverable";
 pub const DECLARED_CLASSES: &[(&str, &str)] = &[
     (TERMINAL_ENV_FAILURE_PREFIX, TERMINAL_ENV_FAILURE_CLASS),
     (DEGENERATE_LOOP_PREFIX, DEGENERATE_LOOP_CLASS),
+    (UPSTREAM_UNAVAILABLE_PREFIX, UPSTREAM_UNAVAILABLE_CLASS),
 ];
 
 /// 文本声明了哪一个已声明的分类，没有声明则 `None`。
@@ -109,6 +120,14 @@ mod tests {
         assert_eq!(
             classify(&format!("{DEGENERATE_LOOP_PREFIX}: flat across the window")),
             DEGENERATE_LOOP_CLASS
+        );
+        // 上游拒绝、环境自己会清掉的那一类：既不落「终态」也不落兜底格，
+        // 否则这次终止会在两处读出相反的话（见 `UPSTREAM_UNAVAILABLE_CLASS`）。
+        assert_eq!(
+            classify(&format!(
+                "{UPSTREAM_UNAVAILABLE_PREFIX}: environment_error: LLM upstream refused (server_error): HTTP 503"
+            )),
+            UPSTREAM_UNAVAILABLE_CLASS
         );
         // Everything else still has to land somewhere countable.
         assert_eq!(

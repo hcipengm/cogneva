@@ -1,6 +1,7 @@
+use cog_core::contract::llm::UpstreamFailure;
 use cog_core::contract::outcome::{
-    EMPTY_GENERATION_PREFIX, ITERATION_BUDGET_EXHAUSTED_MARKER, MAX_ITERATIONS_STATUS,
-    TERMINAL_ENV_FAILURE_PREFIX,
+    a_refusal_clears_on_its_own, EMPTY_GENERATION_PREFIX, ITERATION_BUDGET_EXHAUSTED_MARKER,
+    MAX_ITERATIONS_STATUS, TERMINAL_ENV_FAILURE_PREFIX, UPSTREAM_UNAVAILABLE_PREFIX,
 };
 use serde::{Deserialize, Serialize};
 
@@ -49,15 +50,49 @@ pub struct PlannerOutput {
     pub targets: Vec<String>,
 }
 
-/// Whether an in-band cause names a deterministic failure: the transport never
-/// reached the upstream, or the loop spent its budget before producing anything.
-/// One predicate for every role output so the planner and the generator cannot
-/// drift apart on what counts as terminal.
+/// Whether an in-band cause says this role produced nothing: the transport never
+/// reached the upstream, tools never ran, or the loop spent its budget. One
+/// predicate for every role output so the planner and the generator cannot
+/// drift apart on which envelopes are placeholders.
+///
+/// This answers *presence*, not fate: a caller that finds a cause here has a
+/// value that is not a deliverable and must not be acted on. Which fate the
+/// cause is published under is [`declaration_for_cause`]'s question — the two
+/// are deliberately apart, because the answer to this one is the same for a
+/// 503 the upstream answered with and for a transport that never arrived.
 fn names_a_deterministic_cause(text: &str) -> bool {
     let t = text.to_ascii_lowercase();
     t.contains("environment_error")
         || t.contains("tool_pipeline_broken")
         || t.contains(ITERATION_BUDGET_EXHAUSTED_MARKER)
+}
+
+/// The wire declaration an in-band cause is published under.
+///
+/// A cause whose text names a typed upstream refusal the environment can clear
+/// on its own is published as [`UPSTREAM_UNAVAILABLE_PREFIX`]: the terminal
+/// marker beside it would claim a fate the cause denies, on a row the retry
+/// ladder is scheduling the next attempt for at that very moment — the retry
+/// decision already reads the typed cause and keeps its retries, so the label
+/// has to agree with it. The refusal's own name travels in the text either way,
+/// so the reader loses nothing.
+///
+/// Every other cause keeps the terminal marker, including the ones carrying no
+/// typed refusal at all: a prompt failure with nothing to name is exactly the
+/// transport that never reached the upstream, which is what the marker was
+/// coined for. A spent iteration budget is a fact about *this* run's own loop
+/// and stays terminal even if a refusal happens to be quoted in the same text.
+fn declaration_for_cause(text: &str) -> &'static str {
+    if text
+        .to_ascii_lowercase()
+        .contains(ITERATION_BUDGET_EXHAUSTED_MARKER)
+    {
+        return TERMINAL_ENV_FAILURE_PREFIX;
+    }
+    match UpstreamFailure::named_in(text) {
+        Some(cause) if a_refusal_clears_on_its_own(cause) => UPSTREAM_UNAVAILABLE_PREFIX,
+        _ => TERMINAL_ENV_FAILURE_PREFIX,
+    }
 }
 
 /// Whether a role output's `content` holds nothing at all: absent, or a string
@@ -127,14 +162,25 @@ impl PlannerOutput {
 
     /// Failure reason in the wire format outer loops match on, carrying the
     /// planner's own error. `None` when the plan was actually produced.
+    ///
+    /// The declaration it opens with names the *cause*, not the fate: a refusal
+    /// the environment can clear on its own comes out declared
+    /// [`UPSTREAM_UNAVAILABLE_PREFIX`], and only a cause nothing ahead can
+    /// change comes out declared terminal (see [`declaration_for_cause`]).
+    /// Readers here decide by the reason's *presence* — the value is not a
+    /// deliverable and must not be acted on — while the retry decision asks
+    /// [`cog_core::contract::outcome::is_deterministic_failure`] about the same
+    /// string.
     pub fn terminal_env_failure_reason(&self) -> Option<String> {
         if !self.is_terminal_env_failure() {
             return None;
         }
         match &self.plan {
-            serde_json::Value::String(s) if !s.trim().is_empty() => {
-                Some(format!("{TERMINAL_ENV_FAILURE_PREFIX}: {}", s.trim()))
-            }
+            serde_json::Value::String(s) if !s.trim().is_empty() => Some(format!(
+                "{}: {}",
+                declaration_for_cause(s),
+                s.trim()
+            )),
             _ => Some(format!(
                 "{TERMINAL_ENV_FAILURE_PREFIX}: planner produced no plan (environment/protocol failure)"
             )),
@@ -289,6 +335,9 @@ impl GeneratorOutput {
     /// nothing without a cause of its own is named by
     /// [`empty_envelope_reason`], which is the repair loop's business and not a
     /// reason to stop.
+    ///
+    /// The declaration matches the cause rather than the blanket terminal
+    /// marker: see [`declaration_for_cause`].
     pub fn terminal_env_failure_reason(&self) -> Option<String> {
         if !self.artifacts.is_empty() {
             return None;
@@ -299,7 +348,11 @@ impl GeneratorOutput {
         if !names_a_deterministic_cause(detail) {
             return None;
         }
-        Some(format!("{TERMINAL_ENV_FAILURE_PREFIX}: {}", detail.trim()))
+        Some(format!(
+            "{}: {}",
+            declaration_for_cause(detail),
+            detail.trim()
+        ))
     }
 }
 
@@ -799,6 +852,72 @@ mod tests {
         let reason = output.terminal_env_failure_reason().unwrap();
         assert!(reason.starts_with(TERMINAL_ENV_FAILURE_PREFIX));
         assert!(reason.contains("HTTP 503 upstream unavailable"));
+    }
+
+    /// 上游**答了话**的那一类不再被写成人不可及的终态。
+    ///
+    /// 同一个字符串在重试判定那里早就按 typed 因保留了重试（契约层自己的
+    /// 用例钉着这条），标签必须跟着走——否则同一行上「终态」与「梯子正在
+    /// 排下一次尝试」同时为真，读的人只能靠知道内情才能不信它。
+    #[test]
+    fn a_refusal_the_environment_can_clear_is_declared_unavailable_not_terminal() {
+        let planner = |cause: &str| PlannerOutput {
+            summary: "planner prompt failed".into(),
+            plan: serde_json::Value::String(format!(
+                "environment_error: LLM upstream refused ({cause}): HTTP 503 upstream unavailable"
+            )),
+            sub_tasks: Vec::new(),
+            acceptance_criteria: Vec::new(),
+            targets: Vec::new(),
+        };
+
+        // 环境自己会清掉的三档：占位关系不变（下游照样不能当交付物），但声明
+        // 换成它自己的那一个，且与重试判定答同一句话。
+        for cause in ["server_error", "rate_limited", "transport"] {
+            let output = planner(cause);
+            assert!(
+                output.is_terminal_env_failure(),
+                "{cause}: 带因的占位仍然是占位"
+            );
+            let reason = output.terminal_env_failure_reason().unwrap();
+            assert!(
+                reason.starts_with(UPSTREAM_UNAVAILABLE_PREFIX),
+                "{cause}: {reason}"
+            );
+            assert!(
+                !cog_core::contract::outcome::is_deterministic_failure(&reason),
+                "{cause}: 标签与重试判定必须同意它，{reason}"
+            );
+        }
+
+        // 拒绝本身就是结论的三档：仍然是终态声明，重试判定也同意。
+        for cause in ["auth_rejected", "quota_exhausted", "bad_request"] {
+            let reason = planner(cause).terminal_env_failure_reason().unwrap();
+            assert!(
+                reason.starts_with(TERMINAL_ENV_FAILURE_PREFIX),
+                "{cause}: {reason}"
+            );
+            assert!(
+                cog_core::contract::outcome::is_deterministic_failure(&reason),
+                "{cause}: {reason}"
+            );
+        }
+
+        // 生成侧同一个判据：这一族的判定不按角色分叉。
+        let generator = |cause: &str| GeneratorOutput {
+            content: serde_json::Value::String(format!(
+                "environment_error: LLM upstream refused ({cause}): HTTP 503 upstream unavailable"
+            )),
+            artifacts: Vec::new(),
+        };
+        assert!(generator("server_error")
+            .terminal_env_failure_reason()
+            .unwrap()
+            .starts_with(UPSTREAM_UNAVAILABLE_PREFIX));
+        assert!(generator("auth_rejected")
+            .terminal_env_failure_reason()
+            .unwrap()
+            .starts_with(TERMINAL_ENV_FAILURE_PREFIX));
     }
 
     fn self_evolution_task() -> cog_core::Task {

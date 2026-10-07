@@ -51,6 +51,20 @@ pub const MAX_ITERATIONS_STATUS: &str = "max_iterations_reached";
 /// compiling after a wording change and silently stop matching.
 pub const ITERATION_BUDGET_EXHAUSTED_MARKER: &str = "iteration_budget_exhausted";
 
+/// Prefix marking a run whose cause is an upstream refusal the environment can
+/// clear on its own — a rate limit, a server error, a broken transport.
+///
+/// Deliberately not [`TERMINAL_ENV_FAILURE_PREFIX`]: the refusal says the
+/// upstream did not serve this call, and nothing about it rules out the next
+/// attempt. Producers reach for the terminal marker because a prompt failure
+/// they cannot tell apart from a transport that never arrived looks the same
+/// from where they stand — but the typed cause travels in the same text and is
+/// finer-grained than the blanket declaration around it. Publishing the
+/// terminal label anyway puts a fate the cause denies onto a row the retry
+/// ladder is scheduling the next attempt for at that very moment, and the
+/// reader has to know to distrust it.
+pub const UPSTREAM_UNAVAILABLE_PREFIX: &str = "upstream_unavailable";
+
 /// Whether a failed run's reason declares a cause that re-running it cannot
 /// clear, so a retry loop reading only the reason must stop rather than pay for
 /// another attempt.
@@ -83,12 +97,24 @@ pub fn is_deterministic_failure(reason: &str) -> bool {
         return false;
     }
     match UpstreamFailure::named_in(reason) {
-        // A refusal the environment can clear by itself — a rate limit, a
-        // server error, a broken transport — is a failure to come back to, not
-        // one to give up on.
-        Some(cause) if cause.is_environment_failure() && !cause.is_terminal() => false,
+        // A refusal the environment can clear by itself is a failure to come
+        // back to, not one to give up on.
+        Some(cause) if a_refusal_clears_on_its_own(cause) => false,
         _ => true,
     }
+}
+
+/// Whether a typed upstream refusal clears on its own: what changes the answer
+/// is the environment (a window resetting, a service coming back, a transport
+/// recovering), so re-running the identical request later is what buys
+/// something. Its complement — quota, credentials, and the request being
+/// malformed — is settled by the refusal itself.
+///
+/// The one place this is decided, so that a producer choosing which marker to
+/// publish a refusal under and a consumer deciding whether to retry it cannot
+/// answer differently about the same typed cause.
+pub fn a_refusal_clears_on_its_own(cause: UpstreamFailure) -> bool {
+    cause.is_environment_failure() && !cause.is_terminal()
 }
 
 /// Whether `reason` carries `prefix` as a declared label.
@@ -238,5 +264,39 @@ mod tests {
             "degenerate_loop: {}",
             declared(UpstreamFailure::ServerError)
         )));
+    }
+
+    /// The other half of that declaration: a refusal the environment can clear
+    /// on its own is published under [`UPSTREAM_UNAVAILABLE_PREFIX`], which is
+    /// not a terminal declaration at all. The producer picking the marker and
+    /// the consumer deciding on a retry both ask
+    /// [`a_refusal_clears_on_its_own`], so the label and the decision cannot
+    /// disagree about the same typed cause.
+    #[test]
+    fn a_refusal_the_environment_can_clear_is_published_as_unavailable() {
+        assert!(!is_deterministic_failure(&format!(
+            "{UPSTREAM_UNAVAILABLE_PREFIX}: environment_error: LLM upstream refused (server_error): HTTP 503"
+        )));
+
+        for cause in [
+            UpstreamFailure::ServerError,
+            UpstreamFailure::RateLimited,
+            UpstreamFailure::Transport,
+        ] {
+            assert!(
+                a_refusal_clears_on_its_own(cause),
+                "{cause} is the environment's to clear"
+            );
+        }
+        for cause in [
+            UpstreamFailure::QuotaExhausted,
+            UpstreamFailure::Auth,
+            UpstreamFailure::BadRequest,
+        ] {
+            assert!(
+                !a_refusal_clears_on_its_own(cause),
+                "{cause} is settled by the refusal itself"
+            );
+        }
     }
 }
