@@ -231,26 +231,16 @@ impl crate::landing::MainChannel {
     /// reporting it once per cell per tick would drown the log line that
     /// matters.
     pub async fn publish_funnel(&self) {
-        let Some(metrics) = self.metrics_handle() else {
-            return;
-        };
         let points = census(
             &load_records().await,
             &crate::pending_changes::load_pending().await,
         );
-        for point in points {
-            let labels = HashMap::from([
-                ("intent".to_string(), point.intent.as_str().to_string()),
-                ("stage".to_string(), point.stage.as_str().to_string()),
-            ]);
-            if let Err(e) = metrics
-                .record_gauge(CHANGE_FUNNEL_METRIC, point.count as f64, labels)
-                .await
-            {
-                tracing::warn!(error = %e, "cannot record the change funnel census");
-                return;
-            }
+        if !self.publish_census(&points).await {
+            return;
         }
+        let Some(metrics) = self.metrics_handle() else {
+            return;
+        };
         // The fate counter is seeded so that a class nothing has reached yet
         // is a zero rather than a missing series. Recording a zero creates the
         // series without moving its value, but it is not free: the backend
@@ -282,6 +272,62 @@ impl crate::landing::MainChannel {
             self.fate_domain_seeded
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    /// Write the census cells that moved, and report whether the pass went
+    /// through.
+    ///
+    /// Split out of the tick so the rule it follows can be read on its own:
+    /// a cell is written when its count moved, not when a tick happened.
+    ///
+    /// Returns `false` when a write failed and the pass was abandoned — the
+    /// backend being unreachable is one fact, and the caller has to stop for
+    /// the same reason rather than because a cell was skipped.
+    pub(crate) async fn publish_census(&self, points: &[FunnelPoint]) -> bool {
+        let Some(metrics) = self.metrics_handle() else {
+            return true;
+        };
+        for point in points {
+            let key = (
+                point.intent.as_str().to_string(),
+                point.stage.as_str().to_string(),
+            );
+            // A cell whose count is already what this process last wrote needs
+            // no new row: a gauge's value is its newest sample, and the store's
+            // sweep keeps exactly that row — it exempts the newest row of every
+            // gauge series, so a cell that stops moving cannot be trimmed away
+            // from under a reader. Writing the same number again would only
+            // cost a row in a capped, shared log, and 36 cells on every tick is
+            // about 100k such rows a day for a census that mostly does not
+            // move.
+            let already = {
+                let written = self
+                    .census_written
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                written.get(&key).copied()
+            };
+            if already == Some(point.count) {
+                continue;
+            }
+            let labels = HashMap::from([
+                ("intent".to_string(), key.0.clone()),
+                ("stage".to_string(), key.1.clone()),
+            ]);
+            if let Err(e) = metrics
+                .record_gauge(CHANGE_FUNNEL_METRIC, point.count as f64, labels)
+                .await
+            {
+                tracing::warn!(error = %e, "cannot record the change funnel census");
+                return false;
+            }
+            let mut written = self
+                .census_written
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            written.insert(key, point.count);
+        }
+        true
     }
 }
 

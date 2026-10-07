@@ -500,6 +500,20 @@ pub struct MainChannel {
     /// Read and set by the publisher, which lives in the funnel module because
     /// the domain it walks is defined there.
     pub(crate) fate_domain_seeded: std::sync::atomic::AtomicBool,
+    /// The census count this process last wrote for each cell, keyed by
+    /// (entry point, stage).
+    ///
+    /// A gauge's value is its newest sample, so writing a count the store
+    /// already holds is a row that says nothing. The census has 36 cells and
+    /// is published on the tick, which made every quiet tick cost 36 rows in a
+    /// store that is capped and shared; the last count per cell is what turns
+    /// that into a write only when a count moves. A failed write is not
+    /// recorded, so the next tick retries it — the cell would otherwise sit at
+    /// a value this process never got through.
+    ///
+    /// Written by the publisher, which lives in the funnel module because the
+    /// cells it walks are defined there.
+    pub(crate) census_written: std::sync::Mutex<std::collections::HashMap<(String, String), u64>>,
 }
 
 impl std::fmt::Debug for MainChannel {
@@ -529,6 +543,7 @@ impl MainChannel {
             gate: tokio::sync::Mutex::new(()),
             metrics: OnceLock::new(),
             fate_domain_seeded: std::sync::atomic::AtomicBool::new(false),
+            census_written: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -2732,6 +2747,20 @@ mod tests {
             .len()
     }
 
+    /// How many census rows have been written, not what they say. The rule
+    /// being judged is about rows, so the count is the reading.
+    async fn census_rows(metrics: &cog_storage::MemoryMetricsBackend) -> usize {
+        metrics
+            .query_gauge_range(
+                crate::change_funnel::CHANGE_FUNNEL_METRIC.as_str(),
+                chrono::Utc::now() - chrono::Duration::minutes(5),
+                chrono::Utc::now() + chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .len()
+    }
+
     /// How many fate rows have been appended, not their value. The seed is
     /// free to read and not to write, so the cost it has to be judged by is
     /// the row count.
@@ -2827,6 +2856,59 @@ mod tests {
         )
         .await;
         assert_eq!(fate_rows(&metrics).await, domain + 1);
+    }
+
+    /// A gauge's value is its newest sample, so a census cell that has not
+    /// moved already has its value in the store — and the sweep cannot take
+    /// that value away, because it exempts every gauge series' newest row.
+    /// Republishing the whole census on every tick therefore bought nothing
+    /// and cost a row per cell per tick in a capped log shared with every
+    /// other reading: 36 cells, a 30 s tick, about 100k rows a day.
+    #[tokio::test]
+    async fn a_census_cell_is_written_when_it_moves_and_not_before() {
+        let (chan, metrics) = measured_channel(Default::default());
+        let domain = crate::change_funnel::census(&[], &[]);
+
+        chan.publish_census(&domain).await;
+        assert_eq!(
+            census_rows(&metrics).await,
+            domain.len(),
+            "the first pass writes every cell, empty ones included"
+        );
+
+        chan.publish_census(&domain).await;
+        assert_eq!(
+            census_rows(&metrics).await,
+            domain.len(),
+            "a census that did not move was written again"
+        );
+
+        let mut moved = domain.clone();
+        moved
+            .iter_mut()
+            .find(|p| {
+                p.intent == cog_core::EvolutionIntent::SelfSignal
+                    && p.stage == crate::change_funnel::FunnelStage::Landed
+            })
+            .expect("the census holds every pair")
+            .count = 7;
+        chan.publish_census(&moved).await;
+        assert_eq!(
+            census_rows(&metrics).await,
+            domain.len() + 1,
+            "a moved cell has to go out, and only it"
+        );
+
+        let latest = metrics
+            .query_gauge_latest(crate::change_funnel::CHANGE_FUNNEL_METRIC.as_str())
+            .await
+            .unwrap();
+        assert_eq!(latest.len(), domain.len());
+        assert_eq!(
+            latest.iter().filter(|s| s.value == 7.0).count(),
+            1,
+            "exactly the cell that moved carries its new count"
+        );
     }
 
     #[tokio::test]
