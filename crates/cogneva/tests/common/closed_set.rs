@@ -44,6 +44,11 @@
 ///
 /// This over-accepts a `_sum` or `_count` whose base is a counter rather than a
 /// histogram, since the registry is not typed here. No rule or panel does that.
+/// The same ceiling applies to the base: the answer is "this build can write
+/// it", not "this deployment's store holds it". A registry name no deployment
+/// ever records has a companion no scrape renders, and this reading cannot tell
+/// that apart from one that is being written — deciding it needs the store,
+/// which is a different question asked elsewhere.
 pub fn a_series_this_build_publishes(name: &str) -> bool {
     let base_published = |base: &str| {
         cog_core::metric_names::ALL
