@@ -540,8 +540,7 @@ mod tests {
 
         publish_removals(&metrics, &RetirementOutcome::default(), None).await;
         let named = RetirementPass::new(std::sync::Arc::new(MetricsRetirement::new(
-            PgPool::connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
-                .expect("a lazy pool"),
+            PgPool::connect_lazy("postgres://nobody@127.0.0.1:1/nothing").expect("a lazy pool"),
         )))
         .with_deployment("   ");
         assert_eq!(
