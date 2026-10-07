@@ -1319,10 +1319,7 @@ const UNREAD: &[(&str, Unread)] = &[
     ),
     (
         "llm_request_param_clamped_total",
-        Unread::Elsewhere {
-            readers: &["llm_usage_verdict_measured"],
-            reason: "the producer's own comment states the verdict's readings are the pool entry's key presence and llm_usage_verdict_measured, which llm_usage_verdict_unmeasured reads",
-        },
+        Unread::Gap("fields the gateway rewrote before sending, by field and upstream. This entry used to be an Elsewhere citing llm_usage_verdict_measured, and that citation is what kills it: the producer's own comment on the usage verdict states that the verdict has two readings and that neither of them is this series, so the sentence offered as the reason is the sentence that excludes it. The two facts are different -- the gauge answers whether one input to one of the adaptations was settled from evidence, the counter answers what happened to a request that was already sent. No rule and no panel on either face names it, and it is not a store series either: the durable face carries only the declared gauge list and this is a counter, so it lives and dies with the gateway process. A rewrite is not a fault by construction -- the temperature clamp fires only where the pool entry or the compat profile says the upstream demands 1, and the max_tokens, store, reasoning_effort, strict and stream_options adaptations follow that same profile -- so a rule would have to declare which rewrites are fault-worthy. What that declaration turns on is evidence: of the three verdicts the admission probe settles (tool calls, temperature, usage) only usage publishes a reading at all, so a clamp decided from a probe result and one decided from a profile guess are the same shape here and on every other series. Until somebody states the condition, a rule would report the gateway's own adaptation habits back at us"),
     ),
     (
         "llm_upstream_shape_errored",
@@ -1353,7 +1350,7 @@ fn unresolved_readers(read: &BTreeSet<String>, name: &str, readers: &[&str]) -> 
 /// that nothing else states must be classified, and calling it a gap raises
 /// this number on purpose -- the point of the ratchet is that the increase is a
 /// decision someone made, not a drift nobody saw.
-const GAPS_AT_CENSUS: usize = 23;
+const GAPS_AT_CENSUS: usize = 24;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {
