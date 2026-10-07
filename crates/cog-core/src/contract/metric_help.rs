@@ -579,7 +579,14 @@ const GAUGE_HELP: &[(&str, &str)] = &[
         "cogneva_registry_maintenance_reading_unix",
         "When a registry maintenance round last finished, as a Unix timestamp. \
          Written only on completion, so a value that stops advancing is the age \
-         of the last round that got through; absent means none ever has",
+         of the last round that got through; 0 until one does, and that 0 is \
+         published rather than left absent, so a store no round has ever \
+         finished reads as never having done one instead of as a series with \
+         nothing to say. Read with the run count beside it, where a count rising \
+         against this timestamp not moving is a round that started and did not \
+         finish -- a reading an absent timestamp cannot carry: the comparison \
+         against it is empty, so the state with nothing ever finished would be \
+         the one the pair could not state",
     ),
     (
         "cogneva_registry_gc_owed",

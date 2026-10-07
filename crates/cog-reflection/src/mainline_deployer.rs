@@ -1970,6 +1970,13 @@ pub struct MainlineDeployer {
     /// 的序列——而它有存在的全部理由，正是分辨"试了很多次、一次也没成"。补这一格
     /// 按进程发一次，不是按拍：值不变，按拍重发只是在样本日志里堆行。
     buildah_reading_seeded: std::sync::atomic::AtomicBool,
+    /// 同上，registry 那一轮的完成时刻。
+    ///
+    /// 两格的补法不同，因为持久副本不在同一个地方：buildah 那边落盘的就是"上一次
+    /// 回收"本身，而 registry 这边落盘的 `registry_maintenance_unix` 记的是**开跑**
+    /// （冷却由此成立，跑不完也记），拿它当"上次走完"会把两件事顶替掉。这一格的耐久
+    /// 副本是这条读数自己——它落在共享表里，判据见 `seed_registry_reading`。
+    registry_reading_seeded: std::sync::atomic::AtomicBool,
 }
 
 /// 平台读失败的四支——只有在这一层还分得开。
@@ -2070,6 +2077,7 @@ impl MainlineDeployer {
             declared_governance: std::sync::Mutex::new(None),
             governance_drift: None,
             buildah_reading_seeded: std::sync::atomic::AtomicBool::new(false),
+            registry_reading_seeded: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -3530,6 +3538,11 @@ impl MainlineDeployer {
         if self.cfg.registry_claim.trim().is_empty() {
             return;
         }
+        // 「一次都没走完过」先要在抓取面上是一个值，不是一条缺席的序列：这条读数
+        // 存在的全部理由就是分辨"试了很多次、一次也没成"（见 `record_maintenance_round`
+        // 与读它的那条规则），而缺席的时刻让这句话在最该成立的部署上无从判起。
+        // 补在冷却、拿不到闸、读不到库之前：这一轮走不走得完与它无关。
+        self.seed_registry_reading().await;
         // 欠账读数每轮都发：这是"删掉的 tag 还没被 GC 放掉"唯一的可见面，而它最需要
         // 被看见的时刻（重启一直发不出去）恰好没有别的读数——那时只有每轮一句 warn，
         // 翻日志才知道连着欠了几轮。功能没开时这一格不存在，那是"没人问过"。
@@ -3916,6 +3929,55 @@ impl MainlineDeployer {
             revs.insert(rev.clone());
         }
         Ok(Retained { revs, live })
+    }
+
+    /// 让「一次都没走完过」在抓取面上有一个值而不是一条缺席的序列。
+    ///
+    /// 这一格的持久副本不是状态文件里的某个数：那里记的是**开跑**（冷却是它，跑不完
+    /// 也要记）。「上次走完是什么时候」的耐久副本就是这条读数自己——它落在共享表里，
+    /// 跨进程、跨滚动，比任何进程内的近似都准。所以补之前先读回来一次：库里有行
+    /// （哪怕那一行就是上一次补的种子 0）⇒ 这一格已经有过值；只有一行都没有，才是
+    /// "一次都没走完过"。
+    ///
+    /// 补它是一个**读数**的问题而不是美观问题：那条规则读的是"跑过的计数在涨、而完成
+    /// 时刻不动"，而缺席的时刻让第二个合取项是空集——于是"一轮都没走完过"这个状态，
+    /// 连同"试了很多次、一次也没成"，在规则上判不了，只在日志里。
+    ///
+    /// 读不回来（后端出错、还没接上）**不算数**：那是"问不出来"，不是"没有过"，所以
+    /// 闸落在取值之后，下一拍还要再试。写进去之前不再复查——0 不是一个完成时刻，把
+    /// 它盖上别人的样本时刻不表示任何事。
+    async fn seed_registry_reading(&self) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        if self
+            .registry_reading_seeded
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let Ok(published) = metrics
+            .query_gauge_latest(cog_core::metric_names::REGISTRY_MAINTENANCE_READING_UNIX.as_str())
+            .await
+        else {
+            return;
+        };
+        if !published.is_empty() {
+            return;
+        }
+        if self
+            .registry_reading_seeded
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let _ = metrics
+            .record_gauge(
+                cog_core::metric_names::REGISTRY_MAINTENANCE_READING_UNIX,
+                0.0,
+                std::collections::HashMap::new(),
+            )
+            .await;
     }
 
     /// 回收轮自己的读数，两条路径共用一个出处。
@@ -13623,7 +13685,9 @@ exit 0
 
     /// 一轮"跑过但没走完"必须留下跑过的痕迹：失败路径记计数而**不动**完成时刻。
     /// 两条合起来才是这一轮的读数——只记计数的话它与"跑完了、一个都没删"同形，只记
-    /// 时刻的话它与"压根没跑"同形。
+    /// 时刻的话它与"压根没跑"同形。完成时刻那一格**在**，只是还是种子那个 0：它不
+    /// 是一个时刻，所以"没走完"没有被说成"刚走完"，而这一格也没有缺席——读这对读数
+    /// 的规则正是靠"计数在涨、时刻不动"判"试了、没成"的。
     #[tokio::test]
     async fn a_round_that_cannot_walk_the_store_still_reads_as_a_run() {
         let tmp = tempfile::tempdir().unwrap();
@@ -13666,9 +13730,12 @@ exit 0
             .query_gauge_latest(cog_core::metric_names::REGISTRY_MAINTENANCE_READING_UNIX.as_str())
             .await
             .unwrap();
-        assert!(
-            completed.is_empty(),
-            "没走完的一轮不许推进完成时刻，否则它与'跑完了一个都没删'同形: {completed:?}"
+        // 没走完的一轮不许留下**完成时刻**。面上那一个 0 是种子——"从没走完过"，
+        // 不是一个完成时刻，它的样本时刻不表示任何事。
+        assert_eq!(
+            completed.iter().map(|s| s.value).collect::<Vec<_>>(),
+            vec![0.0],
+            "没走完的一轮只许留下种子那个 0: {completed:?}"
         );
         assert!(
             !requests_seen(&registry_log)
@@ -13679,6 +13746,66 @@ exit 0
         assert!(
             state.registry_maintenance_unix > 0,
             "冷却照样消耗：这一轮确实开了跑，不落盘下一轮立刻重来"
+        );
+    }
+
+    /// 库里已经有完成时刻时，种子一发都不许发。
+    ///
+    /// 补种子要判的是"这一格从没有过值"，而闸只能问库——库里已经有那一行，就说明
+    /// 有过。若这里照发一个 0，那个 0 会带着**此刻**的样本时刻落在最新一行上，读
+    /// "时刻不动"的人看到的是"刚刚走完了一轮"被改成"从没走完过"；而库里那个真实的
+    /// 完成时刻恰好是判据要读的那一格。这条与 `a_round_that_cannot_walk_the_store_
+    /// still_reads_as_a_run` 是一对：那边钉"从没有过 ⇒ 发 0"，这边钉"已经有 ⇒ 不动"。
+    #[tokio::test]
+    async fn a_completion_already_in_the_store_is_not_reseeded_with_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let kubectl = fake_kubectl_pvc(&bin_dir, "10Gi", "cogneva-registry", "");
+        let (walker, _) = routed_registry(vec![(
+            "GET",
+            "/metrics".to_string(),
+            http_200(&walker_metrics("cogneva-registry-pvc", 9_000_000_000)),
+        )])
+        .await;
+        let walker_port: u16 = walker.rsplit(':').next().unwrap().parse().unwrap();
+        let (registry, _registry_log) = routed_registry(Vec::new()).await;
+
+        let mut cfg = test_config(root, Path::new("/nonexistent"), "noop", &kubectl);
+        cfg.registry = registry;
+        cfg.registry_claim = "cogneva-registry-pvc".into();
+        cfg.registry_walker_port = walker_port;
+        cfg.registry_retention = 1;
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        // 库里已经有一轮走完留下的时刻——上一代进程写的，或本代更早那一轮写的。
+        let done = 1_700_000_000.0;
+        metrics
+            .record_gauge(
+                cog_core::metric_names::REGISTRY_MAINTENANCE_READING_UNIX,
+                done,
+                std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_metrics(metrics.clone());
+
+        // 这一轮本身走不完（tag 列表就断），但走不走得完与种子无关：补之前读回来的
+        // 那一行才是判据。
+        let mut state = MainlineState::default();
+        deployer
+            .registry_maintenance_round("000000000001", &[], &mut state)
+            .await;
+
+        let completed = metrics
+            .query_gauge_latest(cog_core::metric_names::REGISTRY_MAINTENANCE_READING_UNIX.as_str())
+            .await
+            .unwrap();
+        assert_eq!(
+            completed.iter().map(|s| s.value).collect::<Vec<_>>(),
+            vec![done],
+            "库里已有的完成时刻不许被种子那个 0 顶掉: {completed:?}"
         );
     }
 
