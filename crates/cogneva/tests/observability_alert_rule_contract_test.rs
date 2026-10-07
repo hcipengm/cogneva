@@ -595,6 +595,14 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_mainline_supersession_checks_total",
         "crates/cog-reflection/src/mainline_deployer.rs",
     ),
+    // 版本契约的另一半：判定跑过了。它上面那条（`cogneva_version_contract_violations`）是
+    // 按条款读的常驻值，而判定停摆时那条读数停在零——与契约成立同一个零——所以这个计数
+    // 是分开两者的那一面。它每轮、每条款各写一次，且停在共享存储里：判定停了，最后那个
+    // 总量仍然被每个 Pod 渲染出来而不是消失，规则读的就是这个冻结。
+    (
+        "cogneva_version_contract_checks_total",
+        "crates/cog-reflection/src/mainline_deployer.rs",
+    ),
 ];
 
 /// Series the rules read that this workspace does not publish, with the owner.
@@ -1232,10 +1240,6 @@ const UNREAD: &[(&str, Unread)] = &[
         Unread::Gap("whether a resident worktree's git index file is there. Reading it beside the missing-files series is what the pair is for -- the help says so and worktree_tree_about_to_rebuild's summary tells the operator to do it -- and yet no rule, panel or other series reads it. That rule cannot stand in: with the index gone, git ls-files lists nothing, so the sibling reads the whole-tree size, which is exactly what it reads when the index is there and remembers no files, so that alert fires on both shapes and tells them apart nowhere. The series this entry used to name, the loop tick, says whether the sampler is running, not which worktree lost its index. No reader was written on purpose: the index is rebuilt by the next reset, so the reading is a transient, and the gateway replays this gauge from the sample store with no window -- a recycled tree keeps exposing its last value, so a rule could never be resolved. A threshold would have to be the round period instead, and rounds are event-driven, so the number would be invented. Closing it means publishing the sampler's own liveness on this face first; until that signal exists the missing half is a producer-side reading rather than a rule to write"),
     ),
     (
-        "cogneva_version_contract_checks_total",
-        Unread::Gap("the other half of version_contract_violated. The reader this entry used to name, cogneva_version_contract_violations, is genuinely read -- by that rule, which takes it as the numerator's value through max by (clause) (max_over_time(...[1h])) > 0. What this counter carries is the opposite half: that the judgement ran at all. A stopped judgement leaves the window empty, max_over_time over an empty range returns no sample, and the comparison then yields nothing, so a contract that holds and a judgement that never ran are the same shape on every rule in this set -- measured over the live rule set, nothing reads this name. The loop census does not stand in for it either, and that is read off the producer rather than assumed: the deployer stamps its cycle at the top of the loop body, before poll_once, and the early returns inside poll_once that can fire ahead of report_version_contract therefore keep the tick fresh while the judgement never runs. Closing it needs a rule over this counter in the shape mainline_supersession_question_stopped already uses for this same deployer -- a difference of increases over a fixed window -- and the decision it still owes is the window, because the counter is written once per clause per poll and the poll interval is declared per deployment. That is a decision rather than a lookup, so this is a debt"),
-    ),
-    (
         "cogneva_version_declared_info",
         Unread::NotAReading("the help calls it an identity label rather than a measurement; the declared version is also on the image tag and in the release tag the artifact is built from"),
     ),
@@ -1350,7 +1354,7 @@ fn unresolved_readers(read: &BTreeSet<String>, name: &str, readers: &[&str]) -> 
 /// that nothing else states must be classified, and calling it a gap raises
 /// this number on purpose -- the point of the ratchet is that the increase is a
 /// decision someone made, not a drift nobody saw.
-const GAPS_AT_CENSUS: usize = 24;
+const GAPS_AT_CENSUS: usize = 23;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {
