@@ -678,9 +678,12 @@ const GAUGE_HELP: &[(&str, &str)] = &[
     (
         "cogneva_buildah_store_reading_unix",
         "When a local build-store reclaim last ran to completion, as a Unix \
-         timestamp; 0 until one does. Seeded with the epoch rather than the \
-         process start, so a process that has never completed a round reads as \
-         never having completed one instead of as having just done it",
+         timestamp; 0 until one does, and that 0 is published rather than left \
+         absent, so a store no round has ever finished reads as never having \
+         done one instead of as a series with nothing to say. The seed is the \
+         persisted reading, not the process start: a start time would read as a \
+         reclaim that has just completed, which is exactly the window in which \
+         the store should have been reclaimed",
     ),
 ];
 

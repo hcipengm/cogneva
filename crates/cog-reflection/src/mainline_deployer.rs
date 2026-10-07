@@ -1964,6 +1964,12 @@ pub struct MainlineDeployer {
     /// Where these readings land. Without it the comparison still runs and only
     /// the log records it.
     governance_drift: Option<std::sync::Arc<crate::governance_drift::GovernanceDrift>>,
+    /// 「一轮都没走完过」这件事在抓取面上只补一次的那个闸。
+    ///
+    /// 这条读数只在走完一轮的分支里写，于是从没走完过的库在抓取面上是一条**缺席**
+    /// 的序列——而它有存在的全部理由，正是分辨"试了很多次、一次也没成"。补这一格
+    /// 按进程发一次，不是按拍：值不变，按拍重发只是在样本日志里堆行。
+    buildah_reading_seeded: std::sync::atomic::AtomicBool,
 }
 
 /// 平台读失败的四支——只有在这一层还分得开。
@@ -2063,6 +2069,7 @@ impl MainlineDeployer {
             metrics: None,
             declared_governance: std::sync::Mutex::new(None),
             governance_drift: None,
+            buildah_reading_seeded: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -3682,6 +3689,11 @@ impl MainlineDeployer {
     /// 不是证据。
     async fn buildah_store_round(&self, bare: &str, images: &[String], state: &mut MainlineState) {
         let now = chrono::Utc::now().timestamp();
+        // 「一轮都没走完过」先要在抓取面上是一个值，不是一条缺席的序列。这条读数
+        // 存在的全部理由就是分辨"试了很多次、一次也没成"（见 `record_buildah_round`
+        // 与那个计数自己的帮助），而缺席的时刻让这句话在最该成立的部署上无从判起。
+        // 补在冷掉之前：这一轮走不走得完与它无关。
+        self.seed_buildah_reading(state.buildah_store_unix).await;
         if now.saturating_sub(state.buildah_store_unix)
             < self.cfg.registry_maintenance_cooldown_secs as i64
         {
@@ -3957,6 +3969,35 @@ impl MainlineDeployer {
                 )
                 .await;
         }
+    }
+
+    /// 让「一次都没走完过」在抓取面上有一个值而不是一条缺席的序列。
+    ///
+    /// 只在落盘那一格是 0 的时候补：非零时库里已经有那个值（走完的那一轮写下的），
+    /// 重发一次只会把一个旧事实盖上一个新的样本时刻，而那个样本时刻读起来像"刚
+    /// 回收过"。0 没有这个问题——它不是一个完成时刻，它的样本时刻不表示任何事。
+    ///
+    /// 闸在取值之前：`metrics` 还没接上时这一发不算数，接上之后那一拍还要再试。
+    async fn seed_buildah_reading(&self, persisted_unix: i64) {
+        if persisted_unix != 0 {
+            return;
+        }
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        if self
+            .buildah_reading_seeded
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let _ = metrics
+            .record_gauge(
+                cog_core::metric_names::BUILDAH_STORE_READING_UNIX,
+                persisted_unix as f64,
+                std::collections::HashMap::new(),
+            )
+            .await;
     }
 
     /// 一轮 buildah 库回收自己的读数。
@@ -20741,7 +20782,54 @@ exit 0
             .query_gauge_latest(cog_core::metric_names::BUILDAH_STORE_READING_UNIX.as_str())
             .await
             .unwrap();
-        assert!(stamp.is_empty(), "没走完的一轮不许留下完成时刻: {stamp:?}");
+        // 没走完的一轮不许留下**完成时刻**。面上那一个 0 是种子——"从没走完过"，
+        // 不是一个完成时刻，它的样本时刻不表示任何事。
+        assert_eq!(
+            stamp.iter().map(|s| s.value).collect::<Vec<_>>(),
+            vec![0.0],
+            "没走完的一轮只许留下种子那个 0: {stamp:?}"
+        );
+    }
+
+    /// 一轮都没走完过的库在抓取面上要是一个 **0**，不是一条缺席的序列。
+    ///
+    /// `cogneva_buildah_store_rounds_total` 的帮助把读者指到"计数在涨、而时刻不动"
+    /// 这对读法上，而这里只在走完一轮的分支里写：从没走完过的库于是**根本没有**
+    /// 这条序列，那句话在它最该成立的部署（一直在试、一次也没成）上无从判起。
+    /// 所以进程起来后的第一次判断就按落盘那一格补一发：0 = 从没走完过，它**不是
+    /// 一个完成时刻**——种子取进程启动时刻才是错的，那会让一个从没回收过的进程
+    /// 读成刚刚回收过，而这个库正是要在那个窗口里被回收。
+    #[tokio::test]
+    async fn a_store_no_round_has_finished_publishes_the_epoch_not_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        // 库存读不懂 ⇒ 这一轮走不完。走不完正是这条读数要分辨的那一支。
+        let buildah = fake_buildah_store(&bin_dir, "buildah: image store is not initialized");
+        let kubectl = fake_kubectl_live(&bin_dir, "localhost:30500/cogneva:main-222222222222 ");
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let deployer = MainlineDeployer::new(
+            test_config(root, Path::new("/nonexistent"), &buildah, &kubectl),
+            test_workspaces(root, Path::new("/nonexistent")),
+        )
+        .with_metrics(metrics.clone());
+
+        let mut state = MainlineState::default();
+        deployer
+            .buildah_store_round("111111111111", &[], &mut state)
+            .await;
+
+        assert_eq!(state.buildah_store_unix, 0, "这一轮没走完");
+        let stamp = metrics
+            .query_gauge_latest(cog_core::metric_names::BUILDAH_STORE_READING_UNIX.as_str())
+            .await
+            .unwrap();
+        assert_eq!(
+            stamp.iter().map(|s| s.value).collect::<Vec<_>>(),
+            vec![0.0],
+            "从没走完过的库要发一个 0（epoch），不是什么都不发: {stamp:?}"
+        );
     }
 
     /// 保留集读不到就整轮不动，且**不消耗冷却**：名单读不到是"等下一轮"的事，

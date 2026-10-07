@@ -1310,11 +1310,11 @@ const UNREAD: &[(&str, Unread)] = &[
     ),
     (
         "cogneva_buildah_store_rounds_total",
-        Unread::Gap("a round is attempted only after a declared cooldown, but the cooldown does not decide when one completes: the pass takes the shared build slot and returns without a reading when the host is building. Measured over three days the completed rounds sat 19h, 36h and 6h apart, so no window can be read off the series and the reader would have to invent one"),
+        Unread::Gap("a round is attempted only after a declared cooldown, but the cooldown does not decide when one completes: the pass takes the shared build slot and returns without a reading when the host is building. Measured over three days the completed rounds sat 19h, 36h and 6h apart, so no window can be read off the series and the reader would have to invent one. The six samples of cogneva_buildah_store_reading_unix still retained sit 6.03 to 6.11 hours apart, which is that cooldown plus a tick with the slot free -- the two observations are the same statement, that the spacing is cooldown plus whatever the slot cost, so the missing piece is a declared deferral budget rather than a reader"),
     ),
     (
         "cogneva_buildah_store_reading_unix",
-        Unread::Gap("the help promises a reading of zero while a process has never completed a round, and the producer records this gauge only inside the branch a completed round takes, so that promised zero is not on the scrape face -- a never-completed round reads as an absent series. A rule written from the help is structurally unreachable; the repair is on the producer side, and the staleness bound it would still need is the build-slot-gated cadence above"),
+        Unread::Gap("the producer now publishes the persisted reading on the first judgement a process makes, so a store no round has ever finished is a 0 that does not move rather than an absent series, and the pair its sibling's help names -- attempts rising against a timestamp that does not move -- can be read off the face. What still keeps a reader unopened is the bound: the timestamp only advances when a round completes, and the retained samples of this series show completions 6.03 to 6.11 hours apart, which is the declared cooldown plus a tick with the build slot free, so the fault is a round the slot kept deferring and no series declares how much deferral is too much"),
     ),
     (
         "cogneva_buildah_store_pruned_images_total",
