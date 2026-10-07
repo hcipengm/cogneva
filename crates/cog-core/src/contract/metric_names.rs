@@ -413,6 +413,23 @@ metric_names! {
     // runs, and the shape-error reading and the client-error counter stay at
     // zero because nothing was refused.
     LLM_TOOL_CALLS_VERDICT_MEASURED => "llm_tool_calls_verdict_measured",
+    // Whether the decision to rewrite the caller's `temperature` rests on
+    // something measured about this upstream, by `upstream`. 1 = the pool entry
+    // carries a verdict from the admission probe, 0 = the vendor profile
+    // decided instead.
+    //
+    // The third of the three questions the admission probe asks, and the one
+    // whose fallback is easiest to mistake for harmless. A profile that does
+    // not clamp fails in the open: the caller's value goes out unchanged, the
+    // upstream refuses it, and the pool's own failure counter catches the
+    // refusal -- which is why an unmeasured verdict there looks like it needs
+    // no reading. The clamp direction is the opposite: `requires_temperature_one`
+    // is a value the caller chose, the gateway overwrites it, and the request
+    // comes back 200 with the sampling the caller asked for replaced by one
+    // they cannot see or recover. Clamped-on-a-guess and clamped-on-evidence
+    // are the same increment on the clamp counter, the same status code and the
+    // same response body, so nothing else on this face can tell them apart.
+    LLM_TEMPERATURE_VERDICT_MEASURED => "llm_temperature_verdict_measured",
     LLM_REQUEST_PARAM_CLAMPED_TOTAL => "llm_request_param_clamped_total",
     LLM_UPSTREAM_CLIENT_ERRORS_TOTAL => "llm_upstream_client_errors_total",
     LLM_UPSTREAM_FAILURES_TOTAL => "llm_upstream_failures_total",

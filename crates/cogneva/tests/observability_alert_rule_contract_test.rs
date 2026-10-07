@@ -274,6 +274,16 @@ const PRODUCED: &[(&str, &str)] = &[
         "llm_tool_calls_verdict_measured",
         "crates/cog-gateway/src/security_gateway.rs",
     ),
+    // The third admission-probe verdict, and the one whose fallback is easiest to
+    // mistake for safe: a profile that does not clamp fails in the open, so an
+    // unmeasured verdict there looks like it needs nothing. The clamping profile
+    // is the other direction -- it overwrites a temperature the caller chose and
+    // returns 200, and the clamp counter, the status code and the body are all
+    // identical whether that overwrite was evidence or a guess.
+    (
+        "llm_temperature_verdict_measured",
+        "crates/cog-gateway/src/security_gateway.rs",
+    ),
     // The only record of a request-shape rejection. The health table never sees
     // that class of rejection by design, and an upstream that has answered
     // nothing successfully since this process started has no per-upstream health

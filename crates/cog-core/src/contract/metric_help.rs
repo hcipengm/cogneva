@@ -608,6 +608,18 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          request succeeded",
     ),
     (
+        "llm_temperature_verdict_measured",
+        "1 when this openai-style upstream's demand for temperature=1 has been \
+         settled from evidence, 0 while the vendor profile is what decides \
+         whether the caller's temperature is rewritten, by upstream. Read next \
+         to the upstream health gauge: at 0 the fallback may go either way, and \
+         only one of them is visible. A profile that spares the value lets the \
+         upstream refuse it, which the failure counter catches; a profile that \
+         clamps overwrites a number the caller chose and returns 200, so the \
+         request succeeds with sampling nobody asked for and neither the clamp \
+         counter nor the response tells that the verdict behind it was a guess",
+    ),
+    (
         "llm_upstream_quota_window_secs",
         "The quota window this upstream itself declared, in seconds; 0 when it \
          declared none, by upstream. Separate from the pool's next-attempt \

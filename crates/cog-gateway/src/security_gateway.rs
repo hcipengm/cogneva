@@ -1209,6 +1209,7 @@ pub const DURABLE_POOL_GAUGES: &[cog_core::MetricName] = &[
     cog_core::metric_names::LLM_UPSTREAM_CONSECUTIVE_FAILURES,
     cog_core::metric_names::LLM_USAGE_VERDICT_MEASURED,
     cog_core::metric_names::LLM_TOOL_CALLS_VERDICT_MEASURED,
+    cog_core::metric_names::LLM_TEMPERATURE_VERDICT_MEASURED,
 ];
 
 /// 一次共享写的上界。这条路径在池状态发布循环里（不是请求路径），但循环一停
@@ -2626,6 +2627,26 @@ async fn refresh_pool_state(state: &AppState) {
                     state,
                     cog_core::metric_names::LLM_TOOL_CALLS_VERDICT_MEASURED,
                     if upstream.supports_tool_calls.is_some() {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                    &[("upstream", &reading.key)],
+                )
+                .await;
+                // 温度那个判决的出处，三个问题的第三个。与上面两条同形，但它的
+                // 兜底**只在一个方向上是安静的**：画像说不必钳时，调用方的值原样
+                // 发出去、上游不收就回 400，池的失败计数接得住，看起来不需要读数；
+                // 画像说要钳时，网关把调用方自己挑的那个数**改掉**，回来的还是
+                // 200——按实测钳与按画像钳是同一个状态码、同一段回话、也让
+                // `llm_request_param_clamped_total` 涨同一个数，这一面分不开。
+                //
+                // 与工具调用那面一样只对 openai 发布：钳制那一段本身就在
+                // `style != "anthropic"` 里，anthropic 面按构造没有这个状态。
+                record_gauge(
+                    state,
+                    cog_core::metric_names::LLM_TEMPERATURE_VERDICT_MEASURED,
+                    if upstream.requires_temperature_one.is_some() {
                         1.0
                     } else {
                         0.0
@@ -8110,6 +8131,54 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             series_value(&text, series, &LlmHealthTable::key(&anthropic)),
             None,
             "anthropic 面没有\"没问过\"这个状态，这一格不该发布:\n{text}"
+        );
+    }
+
+    /// 温度那个判决的出处：按画像钳与按实测钳在别的面上同形，只有这一格分得开。
+    ///
+    /// 三处断言与工具调用那条一一对应：没问过的 openai 条目报 0（网关正拿画像
+    /// 决定要不要改掉调用方自己挑的那个数）、条目带了判定时报 1、anthropic 面
+    /// **没有这条序列**（钳制那一段本身就在 `style != "anthropic"` 里）。
+    #[tokio::test]
+    async fn the_temperature_verdict_is_read_where_the_clamp_could_have_been_evidence() {
+        let mut unasked = stub_upstream("https://a.example.com/v1", "m1");
+        unasked.requires_temperature_one = None;
+        let mut asked = stub_upstream("https://b.example.com/v1", "m2");
+        asked.requires_temperature_one = Some(true);
+        let mut anthropic = stub_upstream("https://c.example.com/v1", "m3");
+        anthropic.api_style = "anthropic".into();
+
+        let state = test_state(vec![unasked, asked.clone(), anthropic.clone()]);
+        for u in [
+            &state.config.llm_upstreams[0],
+            &state.config.llm_upstreams[1],
+            &state.config.llm_upstreams[2],
+        ] {
+            state.llm_health.note_success(u);
+        }
+
+        refresh_pool_state(&state).await;
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        let series = cog_core::metric_names::LLM_TEMPERATURE_VERDICT_MEASURED.as_str();
+        assert_eq!(
+            series_value(
+                &text,
+                series,
+                &LlmHealthTable::key(&state.config.llm_upstreams[0])
+            ),
+            Some(0.0),
+            "从没问过的 openai 条目：网关正按画像决定要不要改掉调用方的 temperature，\
+             这一格必须是 0:\n{text}"
+        );
+        assert_eq!(
+            series_value(&text, series, &LlmHealthTable::key(&asked)),
+            Some(1.0),
+            "池条目带了判定，钳不钳是实证来的，这一格是 1:\n{text}"
+        );
+        assert_eq!(
+            series_value(&text, series, &LlmHealthTable::key(&anthropic)),
+            None,
+            "anthropic 面按构造不钳 temperature，这一格不该发布:\n{text}"
         );
     }
 
