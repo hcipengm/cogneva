@@ -400,8 +400,10 @@ metric_names! {
     // the upstream's doing.
     LLM_USAGE_VERDICT_MEASURED => "llm_usage_verdict_measured",
     // Whether the decision behind routing a tool-carrying request rests on
-    // something measured about this upstream, by `upstream`. 1 = the pool entry
-    // carries a verdict from the admission probe, 0 = nobody asked it.
+    // something measured about this upstream, by `upstream`. 1 = it does (the
+    // pool entry carries a probed verdict, or the runtime asked again and got
+    // one), 0 = nobody has an answer yet and the request is routed on the
+    // assumption that the upstream supports them.
     //
     // A series of its own rather than a second label on the series above,
     // because the two verdicts are asked separately and one can be settled
@@ -414,9 +416,9 @@ metric_names! {
     // zero because nothing was refused.
     LLM_TOOL_CALLS_VERDICT_MEASURED => "llm_tool_calls_verdict_measured",
     // Whether the decision to rewrite the caller's `temperature` rests on
-    // something measured about this upstream, by `upstream`. 1 = the pool entry
-    // carries a verdict from the admission probe, 0 = the vendor profile
-    // decided instead.
+    // something measured about this upstream, by `upstream`. 1 = it does (the
+    // pool entry carries a probed verdict, or the runtime asked again and got
+    // one), 0 = the vendor profile decided instead.
     //
     // The third of the three questions the admission probe asks, and the one
     // whose fallback is easiest to mistake for harmless. A profile that does

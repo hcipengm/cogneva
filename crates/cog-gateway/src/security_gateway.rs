@@ -737,27 +737,69 @@ struct LlmHealthTable {
     /// 正是后一个问题——它的前提是"上游当下就这个状态"，而这个时刻是那个前提
     /// 已经被推翻的证据。进程换代就归零：这是**本代**的证据，不是对上一代的转述。
     last_success_unix: std::sync::atomic::AtomicI64,
-    /// 运行时补问到的用量能力判定，按上游身份存（与上面两个表同一个键）。
-    runtime_caps: Mutex<std::collections::HashMap<String, RuntimeUsageCapability>>,
+    /// 运行时补问到的能力判定，按上游身份存（与上面两个表同一个键）。
+    runtime_caps: Mutex<std::collections::HashMap<String, RuntimeCapabilityProbe>>,
+}
+
+/// 准入探测问的三个问题。
+///
+/// 三者同源：同一次配置写入、同一条配额墙下发出去的请求，所以它们共用一个
+/// 待问集合与一条节拍（见 [`RuntimeCapabilityProbe`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapabilityQuestion {
+    /// 这台上游会不会在流里报用量（条目字段 `supports_usage_in_streaming`）。
+    UsageInStreaming,
+    /// 这台上游收不收非 1 的 `temperature`（条目字段 `requires_temperature_one`）。
+    Temperature,
+    /// 这台上游认不认原生 `tool_calls`（条目字段 `supports_tool_calls`）。
+    ToolCalls,
+}
+
+impl CapabilityQuestion {
+    /// 这张表里的槽位。
+    fn slot(self) -> usize {
+        match self {
+            CapabilityQuestion::UsageInStreaming => 0,
+            CapabilityQuestion::Temperature => 1,
+            CapabilityQuestion::ToolCalls => 2,
+        }
+    }
 }
 
 /// 一次运行时能力补问的状态。
 ///
-/// 为什么这个表存在：能力判定本来只在一次管理端配置写入时取得
-/// （`llm_admin::resolve_upstream` 的唯一调用点），所以比那次写入更早落下的池
-/// 条目永远没有判定——而 `None` 在透传层读作"按厂商画像猜着剥
-/// `stream_options`"，计量于是恒零，且零与"上游就是不报"同形。`None` 是个
-/// 非终态，没有回收方，这里给它一条回去问的路。
+/// 为什么这个表存在：三个判定本来只在一次管理端配置写入时取得
+/// （`llm_admin::resolve_upstream` 的唯一调用点），而那次探测问不出结论时
+/// （配额墙、鉴权、网络、应答说不清）条目里就不留字段——于是比那次写入更早落下的
+/// 池条目、以及探测无果的条目都没有判定。`None` 在透传层读作"按厂商画像办"，
+/// 而三个问题的兜底**各自都是静默的**：用量回落到"猜着剥 `stream_options`"
+/// （计量恒零，与"上游就是不报"同形）、温度回落到画像的钳制（网关把调用方自己
+/// 挑的采样值改掉，回话仍是 200，与按实测钳同形）、工具调用回落到"放行"（工具
+/// 被写成文本，一个都不执行，而那次请求是 200，形态类读数与客户端错误计数都不亮）。
+/// `None` 是个非终态，没有回收方，这里给它一条回去问的路——三个问题共用这条：
+/// 它们问不出来（或问不出来）的理由从来是同一个，各配一条节拍只会让同一堵墙下的
+/// 探测次数乘三。
 ///
 /// `attempts` 与 `next_attempt` 是这条路的节拍：问不出来（配额墙、不是流式的
 /// 应答）时不能每拍都问——每次探测都花真实配额。退避沿用池自己的形状
 /// （`suspect_backoff_secs`，封顶 6h），所以"问"这件事的代价与"探"同量级。
 #[derive(Debug, Default)]
-struct RuntimeUsageCapability {
-    /// 问出来的判定；`None` = 问过但没结论（仍然回落画像）。
-    verdict: Option<bool>,
+struct RuntimeCapabilityProbe {
+    /// 按 [`CapabilityQuestion::slot`] 排的三个判定；`None` = 这一问还没结论
+    /// （仍然回落画像）。
+    verdicts: [Option<bool>; 3],
     attempts: u32,
     next_attempt: Option<std::time::Instant>,
+}
+
+impl RuntimeCapabilityProbe {
+    fn verdict(&self, question: CapabilityQuestion) -> Option<bool> {
+        self.verdicts[question.slot()]
+    }
+
+    fn set_verdict(&mut self, question: CapabilityQuestion, verdict: bool) {
+        self.verdicts[question.slot()] = Some(verdict);
+    }
 }
 
 impl LlmHealthTable {
@@ -967,41 +1009,104 @@ impl LlmHealthTable {
     /// 在一次配置写入时写下的，两者不同源就不该互相覆盖；条目里有值就说明这条
     /// 上游已经被问过，不必再问，也不必让一次新的探测去翻旧结论。
     fn effective_usage_verdict(&self, u: &LlmUpstream) -> Option<bool> {
-        if let Some(measured) = u.supports_usage_in_streaming {
+        self.effective_capability(u, CapabilityQuestion::UsageInStreaming)
+    }
+
+    /// 透传层实际要用的温度约束判定：`Some(true)` = 把调用方的 temperature 钳成 1。
+    /// 与用量那条同形（池条目优先，补问的顶上，都没有 ⇒ `None` ⇒ 回落画像）。
+    fn effective_temperature_verdict(&self, u: &LlmUpstream) -> Option<bool> {
+        self.effective_capability(u, CapabilityQuestion::Temperature)
+    }
+
+    /// 透传层实际要用的工具调用判定：`Some(false)` = 已实证不支持原生 `tool_calls`，
+    /// 携带 tools 的请求不该再发给它。
+    fn effective_tool_calls_verdict(&self, u: &LlmUpstream) -> Option<bool> {
+        self.effective_capability(u, CapabilityQuestion::ToolCalls)
+    }
+
+    /// 某一问此刻要用的判定：池条目里那个实测值优先，运行时补问到的顶上。
+    fn effective_capability(&self, u: &LlmUpstream, question: CapabilityQuestion) -> Option<bool> {
+        if let Some(measured) = Self::entry_verdict(u, question) {
             return Some(measured);
         }
         self.runtime_caps
             .lock()
             .unwrap()
             .get(&Self::key(u))
-            .and_then(|c| c.verdict)
+            .and_then(|c| c.verdict(question))
     }
 
-    /// 这台上游的用量能力判定是不是实测来的（池条目带了值，或运行时补问到
-    /// 了值）。`false` = 透传层正在按厂商画像猜着剥 `stream_options`，它的 token
-    /// 计量结构性地恒为零。
-    fn usage_verdict_measured(&self, u: &LlmUpstream) -> bool {
-        u.supports_usage_in_streaming.is_some()
+    /// 池条目里带的那个判定。`None` = 写这条条目时探测没给出结论（或那时还没有
+    /// 这一问），条目里就没有字段。
+    fn entry_verdict(u: &LlmUpstream, question: CapabilityQuestion) -> Option<bool> {
+        match question {
+            CapabilityQuestion::UsageInStreaming => u.supports_usage_in_streaming,
+            CapabilityQuestion::Temperature => u.requires_temperature_one,
+            CapabilityQuestion::ToolCalls => u.supports_tool_calls,
+        }
+    }
+
+    /// 某一问的判定是不是实测来的（池条目带了值，或运行时补问到了值）。
+    /// `false` = 透传层正按厂商画像办这一件事。
+    fn capability_measured(&self, u: &LlmUpstream, question: CapabilityQuestion) -> bool {
+        Self::entry_verdict(u, question).is_some()
             || self
                 .runtime_caps
                 .lock()
                 .unwrap()
                 .get(&Self::key(u))
-                .is_some_and(|c| c.verdict.is_some())
+                .is_some_and(|c| c.verdict(question).is_some())
     }
 
-    /// 这台上游该不该现在就补问一次用量能力。
+    /// 这台上游的用量能力判定是不是实测来的。`false` = 透传层正在按厂商画像猜着
+    /// 剥 `stream_options`，它的 token 计量结构性地恒为零。
+    fn usage_verdict_measured(&self, u: &LlmUpstream) -> bool {
+        self.capability_measured(u, CapabilityQuestion::UsageInStreaming)
+    }
+
+    /// 这台上游此刻还没有答案、值得补问的问题。
     ///
-    /// 三个条件缺一不可：条目里没有判定（有判定就没有要问的问题）、补问还没有
-    /// 结论（问出来了就不再问）、退避窗已过（问不出来时按指数让开）。
-    fn due_for_usage_capability_probe(&self, u: &LlmUpstream) -> bool {
-        if u.supports_usage_in_streaming.is_some() {
+    /// 条目里有答案的不问（那是配置写入时问过的），运行时已有结论的不问（问出来
+    /// 了就不再问）。温度与工具调用**只对 openai 面问**：它们各自的读点本身只对
+    /// openai 发布——钳制那一段在 `style != "anthropic"` 里，工具调用的路由过滤也
+    /// 只在 openai 面按原生 `tool_calls` 判——给 anthropic 条目开这两问，等于去问
+    /// 一件按构造不会用到的答案，而每一次问都是一次真实请求。
+    fn open_capability_questions(&self, u: &LlmUpstream) -> Vec<CapabilityQuestion> {
+        let caps = self.runtime_caps.lock().unwrap();
+        let probed = caps.get(&Self::key(u));
+        let mut open = Vec::new();
+        for question in [
+            CapabilityQuestion::UsageInStreaming,
+            CapabilityQuestion::Temperature,
+            CapabilityQuestion::ToolCalls,
+        ] {
+            if question != CapabilityQuestion::UsageInStreaming && u.api_style != "openai" {
+                continue;
+            }
+            if Self::entry_verdict(u, question).is_some() {
+                continue;
+            }
+            if probed.is_some_and(|c| c.verdict(question).is_some()) {
+                continue;
+            }
+            open.push(question);
+        }
+        open
+    }
+
+    /// 这台上游该不该现在就发起一次补问。
+    ///
+    /// 两个条件缺一不可：还有没答案的问题（都有答案就没有要问的）、退避窗已过
+    /// （问不出来时按指数让开）。问出其中一个不等于都问出来了，所以"该不该问"
+    /// 看的是待问集合空不空，不是某一个判定在不在。
+    fn due_for_capability_probe(&self, u: &LlmUpstream) -> bool {
+        if self.open_capability_questions(u).is_empty() {
             return false;
         }
         let now = std::time::Instant::now();
         let caps = self.runtime_caps.lock().unwrap();
         match caps.get(&Self::key(u)) {
-            Some(c) => c.verdict.is_none() && c.next_attempt.is_none_or(|t| now >= t),
+            Some(c) => c.next_attempt.is_none_or(|t| now >= t),
             None => true,
         }
     }
@@ -1010,7 +1115,7 @@ impl LlmHealthTable {
     ///
     /// 只在发起时记账（不在出结论时）：问不出来的那一次也要让开，否则配额墙下
     /// 每一拍都发一次探测。
-    fn note_usage_capability_attempt(&self, key: &str, base_secs: u64) {
+    fn note_capability_attempt(&self, key: &str, base_secs: u64) {
         let mut caps = self.runtime_caps.lock().unwrap();
         let entry = caps.entry(key.to_string()).or_default();
         entry.attempts = entry.attempts.saturating_add(1);
@@ -1019,12 +1124,12 @@ impl LlmHealthTable {
             Some(std::time::Instant::now() + std::time::Duration::from_secs(backoff));
     }
 
-    /// 记一次补问的结论。问出来了就落定，并且不再重问（后续的"该不该问"由
-    /// 条目里的判定回答）。
-    fn note_usage_capability_verdict(&self, key: &str, verdict: bool) {
+    /// 记一问答出来的结论。问出来了就落定，并且不再重问（后续的"该不该问"由
+    /// 条目里或这里的判定回答）。
+    fn note_capability_verdict(&self, key: &str, question: CapabilityQuestion, verdict: bool) {
         let mut caps = self.runtime_caps.lock().unwrap();
         let entry = caps.entry(key.to_string()).or_default();
-        entry.verdict = Some(verdict);
+        entry.set_verdict(question, verdict);
     }
 
     /// 丢掉不在池里的上游的补问记录。
@@ -2626,7 +2731,10 @@ async fn refresh_pool_state(state: &AppState) {
                 record_gauge(
                     state,
                     cog_core::metric_names::LLM_TOOL_CALLS_VERDICT_MEASURED,
-                    if upstream.supports_tool_calls.is_some() {
+                    if state
+                        .llm_health
+                        .capability_measured(upstream, CapabilityQuestion::ToolCalls)
+                    {
                         1.0
                     } else {
                         0.0
@@ -2646,7 +2754,10 @@ async fn refresh_pool_state(state: &AppState) {
                 record_gauge(
                     state,
                     cog_core::metric_names::LLM_TEMPERATURE_VERDICT_MEASURED,
-                    if upstream.requires_temperature_one.is_some() {
+                    if state
+                        .llm_health
+                        .capability_measured(upstream, CapabilityQuestion::Temperature)
+                    {
                         1.0
                     } else {
                         0.0
@@ -2657,7 +2768,7 @@ async fn refresh_pool_state(state: &AppState) {
             }
         }
     }
-    ask_unmeasured_usage_capabilities(state, upstreams, &readings);
+    ask_unmeasured_capabilities(state, upstreams, &readings);
     record_gauge(
         state,
         cog_core::metric_names::LLM_POOL_AVAILABLE,
@@ -2715,17 +2826,21 @@ async fn refresh_pool_state(state: &AppState) {
     sync_pool_alert(state, down).await;
 }
 
-/// 对"健康但用量能力判定未知"的上游补问一次，让那条判定有回去问的路。
+/// 对"健康但某项能力判定未知"的上游补问一次，让那三问有回去问的路。
 ///
 /// 触发点是这一拍观测到的健康态，不是配置写入：能力判定本来只在
 /// `llm_admin::resolve_upstream` 里取得，而它唯一的调用点是一次管理端配置写入，
-/// 所以比那次写入更早落下的池条目永远没有判定——`None` 在透传层读作"按厂商
-/// 画像猜着剥 `stream_options`"，计量于是恒零，而零与"上游就是不报"同形。
+/// 所以比那次写入更早落下的池条目永远没有判定，探测无果的那一次也一样不留字段
+/// ——`None` 在透传层读作"按厂商画像办"，而三问的兜底各自都是静默的（计量恒零、
+/// 采样值被改掉、工具被写成文本）。
+///
+/// 一次补问把这一拍**所有**还没答案的问题问一遍：它们出自同一次准入探测、同一条
+/// 配额墙，一条节拍管三个问题，探测次数才不会被乘三。
 ///
 /// 探测 spawn 出去，不压这一拍的时长：一次探测最长 30 秒超时，而这一拍还要续期
 /// 跨进程信号、落池级告警边沿。记账（次数与退避）在 spawn 之前落，所以重叠的
 /// 两拍不会把同一个上游问两遍。
-fn ask_unmeasured_usage_capabilities(
+fn ask_unmeasured_capabilities(
     state: &AppState,
     upstreams: &[LlmUpstream],
     readings: &[UpstreamReading],
@@ -2733,8 +2848,9 @@ fn ask_unmeasured_usage_capabilities(
     state.llm_health.forget_unconfigured_capabilities(upstreams);
     let base_secs = state.config.llm_health_probe_secs;
     for u in upstreams {
-        // 条目里有判定就没有要问的问题——那个值是同一条探测写下的。
-        if u.supports_usage_in_streaming.is_some() {
+        // 条目里有判定、或补问已经问出结论的，就没有要问的问题。
+        let open = state.llm_health.open_capability_questions(u);
+        if open.is_empty() {
             continue;
         }
         let healthy = readings
@@ -2745,29 +2861,45 @@ fn ask_unmeasured_usage_capabilities(
         if !healthy {
             continue;
         }
-        if !state.llm_health.due_for_usage_capability_probe(u) {
+        if !state.llm_health.due_for_capability_probe(u) {
             continue;
         }
         let key = LlmHealthTable::key(u);
-        state
-            .llm_health
-            .note_usage_capability_attempt(&key, base_secs);
+        state.llm_health.note_capability_attempt(&key, base_secs);
         let health = state.llm_health.clone();
         let (base_url, model, api_key) = (u.base_url.clone(), u.model.clone(), u.api_key.clone());
         tokio::spawn(async move {
-            match crate::llm_admin::detect_usage_in_streaming(&base_url, &model, &api_key).await {
-                Some(verdict) => {
-                    health.note_usage_capability_verdict(&key, verdict);
-                    tracing::info!(
+            for question in open {
+                let probe = match question {
+                    CapabilityQuestion::UsageInStreaming => {
+                        crate::llm_admin::detect_usage_in_streaming(&base_url, &model, &api_key)
+                            .await
+                    }
+                    CapabilityQuestion::Temperature => {
+                        crate::llm_admin::detect_temperature_constraint(&base_url, &model, &api_key)
+                            .await
+                    }
+                    CapabilityQuestion::ToolCalls => {
+                        crate::llm_admin::detect_tool_call_support(&base_url, &model, &api_key)
+                            .await
+                    }
+                };
+                match probe {
+                    Some(verdict) => {
+                        health.note_capability_verdict(&key, question, verdict);
+                        tracing::info!(
+                            upstream = %key,
+                            ?question,
+                            verdict,
+                            "能力补问取得结论；透传层不再按厂商画像猜这一项"
+                        );
+                    }
+                    None => tracing::warn!(
                         upstream = %key,
-                        verdict,
-                        "用量能力补问取得结论；透传层不再按厂商画像猜 stream_options"
-                    );
+                        ?question,
+                        "能力补问没有结论；这一项仍按厂商画像处理"
+                    ),
                 }
-                None => tracing::warn!(
-                    upstream = %key,
-                    "用量能力补问没有结论；这台上游的 stream_options 仍按厂商画像处理"
-                ),
             }
         });
     }
@@ -3175,10 +3307,14 @@ async fn stream_forward(
     let parsed = serde_json::from_slice::<serde_json::Value>(&body).ok();
 
     // 携带 tools 的请求只路由到实证支持原生 tool_calls 的上游：
-    // 准入探测标记 Some(false) 的上游对工具类负载只会空转烧钱
+    // 实证说 Some(false) 的上游对工具类负载只会空转烧钱
     // （工具调用被写成文本、工具零执行），直接跳过；全部不支持时
     // 快速失败 422，调用方立刻拿到明确错误而不是烧完配额才发现。
     // None（老条目/未探测）保持放行，不退化既有行为。
+    // 这里的"实证"包含两条来源：配置写入时的准入探测，和运行期补问到的判定
+    // （`effective_tool_calls_verdict`：池条目优先、补问的顶上）。补问只改变
+    // 一处——一个此前没被问过的上游被问出了"不支持"之后，工具负载从这里开始
+    // 不再发给它；没问出结论就仍旧放行，与未探测同形。
     let wants_tools = parsed
         .as_ref()
         .and_then(|v| v.get("tools"))
@@ -3189,7 +3325,7 @@ async fn stream_forward(
         .llm_upstreams
         .iter()
         .filter(|u| u.api_style == style)
-        .filter(|u| !wants_tools || u.supports_tool_calls != Some(false))
+        .filter(|u| !wants_tools || state.llm_health.effective_tool_calls_verdict(u) != Some(false))
         .collect();
     if candidates.is_empty() {
         if wants_tools
@@ -3313,12 +3449,15 @@ async fn stream_forward(
                         // 用方判定不了这件事：它连的是网关，base URL 里没有厂商
                         // 身份，客户端侧按 vendor 域名做的兼容探测在部署形态下
                         // 永远不命中。网关是唯一知道真实上游的地方。
-                        // 实证优先：准入探测对这台上游直接问过就是证据，只有它
-                        // 没给出结论（老条目/探测无果）时才用厂商画像兜底。
-                        let requires_one = match upstream.requires_temperature_one {
-                            Some(verdict) => verdict,
-                            None => compat.requires_temperature_one,
-                        };
+                        // 实证优先：准入探测对这台上游直接问过就是证据，运行期
+                        // 补问到的也算（`effective_temperature_verdict`：池条目
+                        // 优先、补问的顶上），只有两条路都没有结论时才用厂商画像
+                        // 兜底——而那一格是全系统里唯一会**改掉调用方自己挑的数**
+                        // 的兜底，所以它值得一条回去问的路。
+                        let requires_one = state
+                            .llm_health
+                            .effective_temperature_verdict(upstream)
+                            .unwrap_or(compat.requires_temperature_one);
                         if requires_one {
                             if let Some(t) = obj.get_mut("temperature") {
                                 if t.as_f64() != Some(1.0) {
@@ -7957,44 +8096,94 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert!(body.get("stream_options").is_none());
     }
 
-    /// 运行时补问到的判定只在池条目没有判定时接管，接管之后不再问。
+    /// 运行时补问到的判定只在池条目没有判定时接管，一问答出来就不再问那一问。
     ///
-    /// 三个方向都要钉住：条目里有判定就不该再问（同一条探测已经问过）、补问没
-    /// 结论时要让开（否则配额墙下每一拍都发一次探测）、配置换掉的上游不该留下
-    /// 一条谁也读不到的记录（它与"配了还没问过"同形）。
+    /// 四个方向都要钉住：条目里有判定就不该再问（同一条探测已经问过）、补问没
+    /// 结论时要让开（否则配额墙下每一拍都发一次探测）、问出一问不等于三问都问完
+    /// （节拍看的待问集合，不是某一个判定）、配置换掉的上游不该留下一条谁也读不到
+    /// 的记录（它与"配了还没问过"同形）。
     #[test]
     fn the_runtime_verdict_fills_only_the_entries_the_probe_never_answered() {
         let table = LlmHealthTable::default();
         let mut u = stub_upstream("https://api.kimi.com/v1", "m1");
+        let key = LlmHealthTable::key(&u);
 
-        // 池条目没有判定：透传层此刻只能按画像猜，而这正是要修的形态。
+        // 池条目三问都没有判定：透传层此刻只能按画像办，而这正是要修的形态。
         assert_eq!(table.effective_usage_verdict(&u), None);
+        assert_eq!(table.effective_temperature_verdict(&u), None);
+        assert_eq!(table.effective_tool_calls_verdict(&u), None);
         assert!(!table.usage_verdict_measured(&u));
-        assert!(table.due_for_usage_capability_probe(&u));
+        assert_eq!(
+            table.open_capability_questions(&u),
+            vec![
+                CapabilityQuestion::UsageInStreaming,
+                CapabilityQuestion::Temperature,
+                CapabilityQuestion::ToolCalls
+            ]
+        );
+        assert!(table.due_for_capability_probe(&u));
 
         // 记了账就等退避窗：问不出来时不能每一拍都问，每次探测都花真实配额。
-        table.note_usage_capability_attempt(&LlmHealthTable::key(&u), 300);
-        assert!(!table.due_for_usage_capability_probe(&u));
+        table.note_capability_attempt(&key, 300);
+        assert!(!table.due_for_capability_probe(&u));
 
-        table.note_usage_capability_verdict(&LlmHealthTable::key(&u), true);
+        // 问出其中一问：它接管那一格，另外两问还在等答案——节拍不因为这个结论停下。
+        table.note_capability_verdict(&key, CapabilityQuestion::UsageInStreaming, true);
         assert_eq!(table.effective_usage_verdict(&u), Some(true));
         assert!(table.usage_verdict_measured(&u));
-        assert!(
-            !table.due_for_usage_capability_probe(&u),
-            "问出了结论就不该再问"
+        assert_eq!(
+            table.open_capability_questions(&u),
+            vec![
+                CapabilityQuestion::Temperature,
+                CapabilityQuestion::ToolCalls
+            ],
+            "问出的是一个问题，另两个还在等答案"
         );
+        assert!(
+            !table.due_for_capability_probe(&u),
+            "退避窗还没过，这一刻不该发第二次探测"
+        );
+
+        // 三问都有答案：待问集合空了，节拍到点也不再问。
+        table.note_capability_verdict(&key, CapabilityQuestion::Temperature, false);
+        table.note_capability_verdict(&key, CapabilityQuestion::ToolCalls, true);
+        assert_eq!(table.effective_temperature_verdict(&u), Some(false));
+        assert_eq!(table.effective_tool_calls_verdict(&u), Some(true));
+        assert!(table.open_capability_questions(&u).is_empty());
+        assert!(!table.due_for_capability_probe(&u));
 
         // 池条目里的判定优先：补问不该翻掉一次配置写入时问到的结论，那是同一个
         // 探测写的值，两者不同源就不该互相覆盖。
         u.supports_usage_in_streaming = Some(false);
         assert_eq!(table.effective_usage_verdict(&u), Some(false));
-        assert!(!table.due_for_usage_capability_probe(&u));
 
         // 上游被移出配置：补问记录跟着走，回到"配置里没有"的形态。
         u.supports_usage_in_streaming = None;
         table.forget_unconfigured_capabilities(&[]);
         assert_eq!(table.effective_usage_verdict(&u), None);
-        assert!(table.due_for_usage_capability_probe(&u));
+        assert_eq!(table.effective_temperature_verdict(&u), None);
+        assert_eq!(
+            table.open_capability_questions(&u).len(),
+            3,
+            "记录清掉之后三问又都开着"
+        );
+        assert!(table.due_for_capability_probe(&u));
+    }
+
+    /// anthropic 面按构造只有用量一问：温度那一段钳制在 `style != "anthropic"` 里，
+    /// 工具调用随协议来、路由过滤也只在 openai 面按原生 `tool_calls` 判。
+    ///
+    /// 给它开这两问是去问一件不会用到的答案，而每一次问都是一次真实请求。
+    #[test]
+    fn the_questions_asked_are_the_ones_that_face_reads() {
+        let table = LlmHealthTable::default();
+        let mut u = stub_upstream("https://api.anthropic.com/v1", "m1");
+        u.api_style = "anthropic".into();
+
+        assert_eq!(
+            table.open_capability_questions(&u),
+            vec![CapabilityQuestion::UsageInStreaming]
+        );
     }
 
     /// 从 exposition 里读一条序列的值；读不到 = None，不读成 0。
@@ -8075,9 +8264,19 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert_eq!(resp.status(), 200);
         // 锁的作用域收在这里：下面还要 await 一拍，把 std 锁的守卫跨过 await
         // 点会让这拍持锁运行，被测的那段一旦也去碰这把锁就是死锁。
+        //
+        // 认的是这一次透传，不是"最后一份"：同一个桩也接补问的探测请求（一次补问
+        // 把当时所有没答案的问题都问一遍，所以一次是好几份），它们落在同一个列表里
+        // 而按构造没有调用方的那句话。
         let got: serde_json::Value = {
             let sent = vendor_seen.lock().unwrap();
-            serde_json::from_str(sent.last().expect("上游该收到一次请求")).unwrap()
+            serde_json::from_str(
+                sent.iter()
+                    .rev()
+                    .find(|p| p.contains("\"content\":\"hi\""))
+                    .expect("上游该收到一次透传请求"),
+            )
+            .unwrap()
         };
         assert_eq!(
             got["stream_options"],
@@ -8093,6 +8292,120 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 &text,
                 cog_core::metric_names::LLM_USAGE_VERDICT_MEASURED.as_str(),
                 &LlmHealthTable::key(&upstream)
+            ),
+            Some(1.0),
+            "补问取得结论后这一格该是 1（有出处）:\n{text}"
+        );
+    }
+
+    /// 端到端：健康、条目没判定、画像会钳的上游，补问问到"它收非 1 的温度"之后，
+    /// 透传层不再改调用方挑的那个数，观测面翻成 1。
+    ///
+    /// 靶子是"拿画像当证据"：按实测钳与按画像钳在其余面上同形——同一个状态码、
+    /// 同一段回话、`llm_request_param_clamped_total` 涨同一个数——所以两头的断言
+    /// 都落在**上游收到的那个值**上而不是计数上。只断言判定优先级抓不到"拿到了却
+    /// 没人用"，而那只差一个调用点。
+    #[tokio::test]
+    async fn a_healthy_upstream_with_no_temperature_verdict_is_asked_before_the_profile_clamps() {
+        use cog_llm::utils::compat::detect_compat;
+        let vendor_seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let vendor_stub = spawn_capturing_upstream(
+            200,
+            r#"{"id":"x","choices":[{"message":{"role":"assistant","content":"hi"}}]}"#,
+            vendor_seen.clone(),
+        )
+        .await;
+        // 厂商身份放在路径里：透传层因此按 kimi 画像处理，而那条画像写的是
+        // `requires_temperature_one: true`，即"把调用方的温度钳成 1"。
+        let vendor = stub_upstream(&format!("{vendor_stub}/api.kimi.com"), "m1");
+        let state = test_state(vec![vendor]);
+        let upstream = state.config.llm_upstreams[0].clone();
+        let key = LlmHealthTable::key(&upstream);
+        assert!(
+            detect_compat(&upstream.base_url).requires_temperature_one,
+            "这条画像必须是要钳的，否则这一拍测不到画像的兜底"
+        );
+        assert_eq!(
+            state.llm_health.effective_temperature_verdict(&upstream),
+            None
+        );
+        // 透传的请求体认它自己的那一份：补问的三次探测也会落在同一个桩上。
+        let caller_body = |needle: &str| -> serde_json::Value {
+            let seen = vendor_seen.lock().unwrap();
+            let payload = seen
+                .iter()
+                .rev()
+                .find(|p| p.contains(needle))
+                .unwrap_or_else(|| panic!("上游没收到含 {needle} 的请求"));
+            serde_json::from_str(payload).unwrap()
+        };
+
+        // 一次真实成功：这台上游从此在读数上是健康的（补问的触发条件）。
+        state.llm_health.note_success(&upstream);
+
+        // 这一拍：判定还没有出处，网关只能照画像钳——调用方挑的 0.2 被改掉。
+        let resp = chat_completions_passthrough(
+            State(state.clone()),
+            json_request(
+                r#"{"model":"placeholder","temperature":0.2,
+                    "messages":[{"role":"user","content":"hi"}]}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "钳不钳都不影响状态码，这正是这一格难被看见的原因"
+        );
+        assert_eq!(
+            caller_body("\"content\":\"hi\"")["temperature"],
+            serde_json::json!(1.0),
+            "还没有实测时按画像钳"
+        );
+
+        // 这一拍的补问发出去：桩回 200 = 它收下了 0.2 ⇒ 判定 `false` 落表。
+        refresh_pool_state(&state).await;
+        for _ in 0..100 {
+            if state
+                .llm_health
+                .capability_measured(&upstream, CapabilityQuestion::Temperature)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            state.llm_health.effective_temperature_verdict(&upstream),
+            Some(false),
+            "桩收下了 0.2，补问就该读到「不钳」"
+        );
+
+        // 下一拍：调用方的值原样到上游。
+        let resp = chat_completions_passthrough(
+            State(state.clone()),
+            json_request(
+                r#"{"model":"placeholder","temperature":0.2,
+                    "messages":[{"role":"user","content":"hi"}]}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            caller_body("\"content\":\"hi\"")["temperature"],
+            serde_json::json!(0.2),
+            "实测说它收 0.2，就不该再改掉调用方挑的数"
+        );
+
+        // 观测面：这一格从 0 翻成 1——这条修复自己的读数。
+        refresh_pool_state(&state).await;
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert_eq!(
+            series_value(
+                &text,
+                cog_core::metric_names::LLM_TEMPERATURE_VERDICT_MEASURED.as_str(),
+                &key
             ),
             Some(1.0),
             "补问取得结论后这一格该是 1（有出处）:\n{text}"

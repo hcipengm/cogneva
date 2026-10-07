@@ -364,7 +364,14 @@ fn classify_temperature_probe(status: u16, body: &str) -> Option<bool> {
 }
 
 /// temperature 准入探测：发一个 temperature=0.2 的最小 chat 请求，看上游认不认。
-async fn detect_temperature_constraint(base_url: &str, model: &str, api_key: &str) -> Option<bool> {
+///
+/// 与用量那条一样是 `pub(crate)`：运行期补问会再问一遍，问不出结论的条目
+/// （配额/鉴权/网络）与"比那次配置写入更早落下的条目"都靠这条路补上判定。
+pub(crate) async fn detect_temperature_constraint(
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+) -> Option<bool> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -480,7 +487,11 @@ pub(crate) async fn detect_usage_in_streaming(
 /// 调工具；响应的 `message.tool_calls` 非空才算支持原生协议。返回 None
 /// 表示探测本身失败（网络/非 2xx），能力未知。文本协议变体（工具调用
 /// 写在 content 里）判定为不支持——那正是要挡在工具类负载门外的形态。
-async fn detect_tool_call_support(base_url: &str, model: &str, api_key: &str) -> Option<bool> {
+pub(crate) async fn detect_tool_call_support(
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+) -> Option<bool> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
