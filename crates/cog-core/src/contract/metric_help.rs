@@ -598,6 +598,16 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          in every other series",
     ),
     (
+        "llm_tool_calls_verdict_measured",
+        "1 when this openai-style upstream's support for native tool calls has \
+         been settled from evidence, 0 while a request carrying tools would be \
+         routed to it on the assumption that it does, by upstream. Read next to \
+         the upstream health gauge: an upstream serving traffic with this at 0 \
+         is one where a tool call may come back written as text, and neither a \
+         refused request nor a shape-error reading can show that, because the \
+         request succeeded",
+    ),
+    (
         "llm_upstream_quota_window_secs",
         "The quota window this upstream itself declared, in seconds; 0 when it \
          declared none, by upstream. Separate from the pool's next-attempt \

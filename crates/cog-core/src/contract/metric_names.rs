@@ -399,6 +399,20 @@ metric_names! {
     // nothing look the same on every other series here, and only the second is
     // the upstream's doing.
     LLM_USAGE_VERDICT_MEASURED => "llm_usage_verdict_measured",
+    // Whether the decision behind routing a tool-carrying request rests on
+    // something measured about this upstream, by `upstream`. 1 = the pool entry
+    // carries a verdict from the admission probe, 0 = nobody asked it.
+    //
+    // A series of its own rather than a second label on the series above,
+    // because the two verdicts are asked separately and one can be settled
+    // while the other is not. What it separates is the same shape: the routing
+    // guard moves tool traffic away only from an upstream a probe proved does
+    // not support native tool calls, so an upstream nobody asked is a yes --
+    // and the failure that follows is a success on every other series here.
+    // The upstream answers 200 with the tool calls written as text, no tool
+    // runs, and the shape-error reading and the client-error counter stay at
+    // zero because nothing was refused.
+    LLM_TOOL_CALLS_VERDICT_MEASURED => "llm_tool_calls_verdict_measured",
     LLM_REQUEST_PARAM_CLAMPED_TOTAL => "llm_request_param_clamped_total",
     LLM_UPSTREAM_CLIENT_ERRORS_TOTAL => "llm_upstream_client_errors_total",
     LLM_UPSTREAM_FAILURES_TOTAL => "llm_upstream_failures_total",

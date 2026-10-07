@@ -263,6 +263,17 @@ const PRODUCED: &[(&str, &str)] = &[
         "llm_usage_verdict_measured",
         "crates/cog-gateway/src/security_gateway.rs",
     ),
+    // The second open verdict beside it, and the same kind of series for the
+    // same reason: whether a tool-carrying request is routed to an upstream on
+    // evidence or on the assumption that it supports native tool calls. The
+    // routing guard only moves tool traffic away from an upstream a probe
+    // proved does not support them, so an unasked upstream reads as a yes --
+    // and the failure that follows lands as a 200 whose tool calls were written
+    // into the text, which the refusal-shaped readings beside it cannot see.
+    (
+        "llm_tool_calls_verdict_measured",
+        "crates/cog-gateway/src/security_gateway.rs",
+    ),
     // The only record of a request-shape rejection. The health table never sees
     // that class of rejection by design, and an upstream that has answered
     // nothing successfully since this process started has no per-upstream health

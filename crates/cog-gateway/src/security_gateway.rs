@@ -1208,6 +1208,7 @@ pub const DURABLE_POOL_GAUGES: &[cog_core::MetricName] = &[
     cog_core::metric_names::LLM_UPSTREAM_QUOTA_RESET_UNIX,
     cog_core::metric_names::LLM_UPSTREAM_CONSECUTIVE_FAILURES,
     cog_core::metric_names::LLM_USAGE_VERDICT_MEASURED,
+    cog_core::metric_names::LLM_TOOL_CALLS_VERDICT_MEASURED,
 ];
 
 /// 一次共享写的上界。这条路径在池状态发布循环里（不是请求路径），但循环一停
@@ -2610,6 +2611,29 @@ async fn refresh_pool_state(state: &AppState) {
                 &[("upstream", &reading.key)],
             )
             .await;
+            // 工具调用那个判决的出处，与上面用量那条同形、答的是另一个问题。
+            // 路由只把携带 tools 的请求从**实证说不支持**的上游上移开：没问过的
+            // 上游在路由上与"支持"同形，请求照发，回来的是一段写成文本的工具
+            // 调用——一个工具都不会执行，而调用方按正常价买了一次空转。这一格
+            // 落在别处看不出：那次请求是 200，形态类读数与客户端错误计数都不会
+            // 亮，因为它们量的是"被拒"，而这一次是被当成了好消息。
+            //
+            // 只对 openai 协议面发布：anthropic 面的工具调用随协议来，那一面没有
+            // "没问过"这个状态（准入探测本身也只问 openai 条目，见 `llm_admin`），
+            // 给它发 0 会让上面那条规则对一条按构造已关闭的问题常挂。
+            if upstream.api_style == "openai" {
+                record_gauge(
+                    state,
+                    cog_core::metric_names::LLM_TOOL_CALLS_VERDICT_MEASURED,
+                    if upstream.supports_tool_calls.is_some() {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                    &[("upstream", &reading.key)],
+                )
+                .await;
+            }
         }
     }
     ask_unmeasured_usage_capabilities(state, upstreams, &readings);
@@ -8038,6 +8062,54 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             ),
             Some(1.0),
             "补问取得结论后这一格该是 1（有出处）:\n{text}"
+        );
+    }
+
+    /// 工具调用那个判决的出处：没问过与问过是两格，且只在 openai 协议面发布。
+    ///
+    /// 三处断言缺一不可：从没问过的 openai 条目报 0（这正是路由会照常把带 tools
+    /// 的请求发给它的那一格）、池条目带了判定时报 1、anthropic 面**没有这条序列**
+    /// ——那一面工具调用随协议来，给它发 0 会让规则对一条按构造已关闭的问题常挂。
+    #[tokio::test]
+    async fn the_tool_calls_verdict_is_read_where_the_admission_probe_could_have_asked() {
+        let mut unasked = stub_upstream("https://a.example.com/v1", "m1");
+        unasked.supports_tool_calls = None;
+        let mut asked = stub_upstream("https://b.example.com/v1", "m2");
+        asked.supports_tool_calls = Some(true);
+        let mut anthropic = stub_upstream("https://c.example.com/v1", "m3");
+        anthropic.api_style = "anthropic".into();
+
+        let state = test_state(vec![unasked, asked.clone(), anthropic.clone()]);
+        // 三条都要有健康读数：这一格跟着 `readings` 走，没有判定就没有这一行。
+        for u in [
+            &state.config.llm_upstreams[0],
+            &state.config.llm_upstreams[1],
+            &state.config.llm_upstreams[2],
+        ] {
+            state.llm_health.note_success(u);
+        }
+
+        refresh_pool_state(&state).await;
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        let series = cog_core::metric_names::LLM_TOOL_CALLS_VERDICT_MEASURED.as_str();
+        assert_eq!(
+            series_value(
+                &text,
+                series,
+                &LlmHealthTable::key(&state.config.llm_upstreams[0])
+            ),
+            Some(0.0),
+            "从没问过的 openai 条目：带 tools 的请求会照发给它，这一格必须是 0:\n{text}"
+        );
+        assert_eq!(
+            series_value(&text, series, &LlmHealthTable::key(&asked)),
+            Some(1.0),
+            "池条目带了判定，这一格是 1:\n{text}"
+        );
+        assert_eq!(
+            series_value(&text, series, &LlmHealthTable::key(&anthropic)),
+            None,
+            "anthropic 面没有\"没问过\"这个状态，这一格不该发布:\n{text}"
         );
     }
 
