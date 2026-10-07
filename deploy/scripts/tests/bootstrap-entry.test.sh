@@ -413,6 +413,75 @@ check "macOS 路径：VM 内取不到脚本 → 非零退出" 1 "$rc"
 not_or "macOS 路径：VM 内取不到脚本 → 不许报完成" "完成！" "$mac_bad"
 ok_or "macOS 路径：VM 内取不到脚本 → 说明未完成" "VM 内引导未完成" "$mac_bad"
 
+# ---------- bootstrap.ps1 的投递结构：CI 对 ps1 只做语法检查 ----------
+# 上面那份载体清单钉的是 `$EntryCmd*` 的**文本**。投递方式那一半没有任何判据看着：
+# 入口命令是当 stdin 喂给 WSL 里的 sh、还是当 argv 传（wsl.exe 会重建命令行，引号往返
+# 在 Windows 侧不可测，错了也是静默的）、那次调用的退出码有没有当场结算、强制模式是
+# 跟着 stdin 一起 export 还是写成一个会被丢掉的 `VAR=…` 前缀。这几条都是**行为**，
+# PSParser 只看语法子树，全改动完也不会红。所以下面拿真文件过一遍，再拿三个变异体
+# 各拒一次——判据要能拒，拒不了的只是描述，而这三处恰好都踩在 D36/D37 那条线上。
+ps1_delivery_fails() { # 读 ps1 文本，逐条报「哪一条不过」；全过则无输出
+    awk '
+        { l[NR] = $0 }
+        END {
+            for (i = 1; i <= NR; i++) {
+                # 投递行：以 `-- sh` 结尾（argv 写法会带 -c "…"，不以它结尾）
+                if (l[i] ~ /\| wsl\.exe -d Ubuntu -u root -- sh$/) dl = i
+                if (l[i] ~ /sh -c[ ]*"\$entry/) argv = 1
+            }
+            if (!dl) print "no-stdin-delivery"
+            else {
+                # 喂进去的必须是那个变量，不是别的什么
+                if (l[dl] !~ /\$entry" \| wsl\.exe/) print "entry-not-in-stdin-payload"
+                # 强制模式在 payload 里自己占一行（入口命令以赋值开头，前缀会丢）
+                if (l[dl] !~ /^"export COGNEVA_CN_MIRROR=\$cn`n\$entry"/) print "forced-mode-not-exported"
+                # 这一次调用的退出码当场结算，不能交给后面的步骤去撞
+                if (l[dl + 1] !~ /LASTEXITCODE/) print "exit-code-not-checked"
+            }
+            if (argv) print "entry-passed-as-argv"
+        }
+    '
+}
+
+PS1="$ROOT/bootstrap.ps1"
+check "ps1 投递结构：真文件的五条都过" "" "$(ps1_delivery_fails < "$PS1")"
+
+ps1_mutant() { # ps1_mutant <说明> <期望被拒在哪一条> <变异：awk 字面替换 from> <to>
+    MUT_FROM="$3" MUT_TO="$4" awk '
+        BEGIN { from = ENVIRON["MUT_FROM"]; to = ENVIRON["MUT_TO"] }
+        { i = index($0, from); if (i) $0 = substr($0, 1, i - 1) to substr($0, i + length(from)); print }
+    ' "$PS1" > "$FAKE/mut.ps1"
+    if cmp -s "$PS1" "$FAKE/mut.ps1"; then
+        # 变异没生效 ⇒ 这条「必须被拒」是空跑，当成失败报出去
+        echo "FAIL - 变异体：$1 → 变异没生效（原串在文件里找不到）"
+        fails=$((fails + 1))
+        return
+    fi
+    got="$(ps1_delivery_fails < "$FAKE/mut.ps1")"
+    case "$got" in
+        *"$2"*) echo "ok   - 变异体：$1 → 被拒在 [「$2」]" ;;
+        *) echo "FAIL - 变异体：$1 → 期望拒在 [$2]，实际 [${got:-（没被拒）}]"; fails=$((fails + 1)) ;;
+    esac
+}
+# 变异体按行生成的那种（删掉退出码检查那行）单独来，不能走字面替换
+grep -v 'WSL 内引导失败' "$PS1" > "$FAKE/mut.ps1"
+if cmp -s "$PS1" "$FAKE/mut.ps1"; then
+    echo "FAIL - 变异体：删掉退出码检查 → 变异没生效"
+    fails=$((fails + 1))
+else
+    got="$(ps1_delivery_fails < "$FAKE/mut.ps1")"
+    case "$got" in
+        *exit-code-not-checked*) echo "ok   - 变异体：删掉退出码检查 → 被拒在 [「exit-code-not-checked」]" ;;
+        *) echo "FAIL - 变异体：删掉退出码检查 → 期望拒在 [exit-code-not-checked]，实际 [${got:-（没被拒）}]"; fails=$((fails + 1)) ;;
+    esac
+fi
+ps1_mutant "入口命令改当 argv 传（wsl.exe 会重建命令行）" no-stdin-delivery \
+    '$entry" | wsl.exe -d Ubuntu -u root -- sh' \
+    '$entry" | wsl.exe -d Ubuntu -u root -- sh -c "$entry"'
+ps1_mutant "强制模式改写成会被丢掉的 VAR=… 前缀" forced-mode-not-exported \
+    '"export COGNEVA_CN_MIRROR=$cn`n$entry" | wsl.exe' \
+    '"COGNEVA_CN_MIRROR=$cn $entry" | wsl.exe'
+
 export PATH="$ORIG_PATH"
 if [ "$fails" -ne 0 ]; then
     echo "bootstrap 入口判据测试失败: $fails"
