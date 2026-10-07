@@ -533,7 +533,7 @@ The entry script automatically detects whether your network is in mainland China
 ### 🐧 Linux
 
 ```bash
-(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh || curl -fsSL -m 15 "https://gitee.com/api/v5/repos/hcipengm/cogneva/contents/bootstrap.sh?ref=main" | sed -n 's/.*"content":"\([^"]*\)".*/\1/p' | base64 -d) | sh
+src="$(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh)" || src=""; [ -n "$src" ] || { src="$(curl -fsSL -m 15 'https://gitee.com/api/v5/repos/hcipengm/cogneva/contents/bootstrap.sh?ref=main' | sed -n 's/.*"content":"\([^"]*\)".*/\1/p' | base64 -d)" || src=""; }; export COGNEVA_CN_MIRROR="${COGNEVA_CN_MIRROR-}"; if [ -n "$src" ]; then printf "%s\n" "$src" | sh; else echo "bootstrap: 入口脚本取不到（两个镜像都不可达，网络受限或镜像故障）；未做任何改动 / could not fetch the entry script, nothing was changed" >&2; false; fi
 ```
 
 Runs directly on the bare metal.
@@ -541,7 +541,7 @@ Runs directly on the bare metal.
 ### 🍎 macOS
 
 ```bash
-(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh || curl -fsSL -m 15 "https://gitee.com/api/v5/repos/hcipengm/cogneva/contents/bootstrap.sh?ref=main" | sed -n 's/.*"content":"\([^"]*\)".*/\1/p' | base64 -d) | sh
+src="$(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh)" || src=""; [ -n "$src" ] || { src="$(curl -fsSL -m 15 'https://gitee.com/api/v5/repos/hcipengm/cogneva/contents/bootstrap.sh?ref=main' | sed -n 's/.*"content":"\([^"]*\)".*/\1/p' | base64 -d)" || src=""; }; export COGNEVA_CN_MIRROR="${COGNEVA_CN_MIRROR-}"; if [ -n "$src" ]; then printf "%s\n" "$src" | sh; else echo "bootstrap: 入口脚本取不到（两个镜像都不可达，网络受限或镜像故障）；未做任何改动 / could not fetch the entry script, nothing was changed" >&2; false; fi
 ```
 
 The **same command**. K3s needs a Linux kernel, so the script automatically installs [Lima](https://lima-vm.io) (via Homebrew) and creates an Ubuntu VM, then runs the exact same one-liner inside it. All dependencies live inside the VM; the host only gets `limactl`. When finished, the WebUI is forwarded to <http://localhost:8080>. Manage the VM with `limactl shell cogneva` / `limactl stop cogneva` / `limactl delete cogneva`.

@@ -23,11 +23,21 @@ CN_MIRROR=0
 # contents endpoint instead: JSON in, base64 "content" field out, decode.
 # Measured 2026-09-30 from a blank VM: raw 451 3/3, while that endpoint
 # returned the byte-identical script 3/3 using nothing but coreutils.
-GITEE_ENTRY_FETCH="curl -fsSL -m 15 \"https://gitee.com/api/v5/repos/hcipengm/cogneva/contents/bootstrap.sh?ref=main\" | sed -n 's/.*\"content\":\"\([^\"]*\)\".*/\1/p' | base64 -d"
+GITEE_ENTRY_FETCH="curl -fsSL -m 15 'https://gitee.com/api/v5/repos/hcipengm/cogneva/contents/bootstrap.sh?ref=main' | sed -n 's/.*\"content\":\"\([^\"]*\)\".*/\1/p' | base64 -d"
 GITHUB_ENTRY_FETCH="curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh"
-# 与 README 完全同一条入口命令（VM/WSL 内复用），CN 模式 Gitee 优先
-ENTRY_CMD_INTL="($GITHUB_ENTRY_FETCH || $GITEE_ENTRY_FETCH) | sh"
-ENTRY_CMD_CN="($GITEE_ENTRY_FETCH || $GITHUB_ENTRY_FETCH) | sh"
+# 与 README / bootstrap.ps1 逐字同一条入口命令（VM/WSL 内复用），CN 模式 Gitee 优先。
+# 判据是**先取进变量、验到内容、再喂 sh**，两条腿都必须同时过「退出码」和「取到东西」
+# 两关：
+#  - `(A || B) | sh` 在两条腿都失败时递给 sh 的是**空输入**，而 sh 读空 stdin 以 0
+#    退出——一切照旧，命令报成功、机器上什么都没装（实测：旧写法两腿都失败 rc=0、
+#    零输出），macOS/WSL 路径还会接着打印「完成！」并打开指向空服务的浏览器；
+#  - Gitee 那条腿是 `curl | sed | base64 -d`，管道状态取的是 base64 的：curl 失败时它
+#    照样回 0，于是 `A || B` 根本不会轮到 B。所以每条腿都要自己验一次取到的内容。
+# `sh -c` 里那句 export 是给 `COGNEVA_CN_MIRROR=1 <一键命令>` 这种前缀写法兜底的：
+# 换成变量赋值后前缀不再落在管道上，不显式 export 就传不到真正的引导器。
+ENTRY_FETCH_FAIL="bootstrap: 入口脚本取不到（两个镜像都不可达，网络受限或镜像故障）；未做任何改动 / could not fetch the entry script, nothing was changed"
+ENTRY_CMD_INTL="src=\"\$($GITHUB_ENTRY_FETCH)\" || src=\"\"; [ -n \"\$src\" ] || { src=\"\$($GITEE_ENTRY_FETCH)\" || src=\"\"; }; export COGNEVA_CN_MIRROR=\"\${COGNEVA_CN_MIRROR-}\"; if [ -n \"\$src\" ]; then printf \"%s\\n\" \"\$src\" | sh; else echo \"$ENTRY_FETCH_FAIL\" >&2; false; fi"
+ENTRY_CMD_CN="src=\"\$($GITEE_ENTRY_FETCH)\" || src=\"\"; [ -n \"\$src\" ] || { src=\"\$($GITHUB_ENTRY_FETCH)\" || src=\"\"; }; export COGNEVA_CN_MIRROR=\"\${COGNEVA_CN_MIRROR-}\"; if [ -n \"\$src\" ]; then printf \"%s\\n\" \"\$src\" | sh; else echo \"$ENTRY_FETCH_FAIL\" >&2; false; fi"
 
 # COGNEVA_BOOTSTRAP_FAKE_OS 仅用于干跑测试（模拟 darwin 分支）
 detect_os() {
@@ -636,8 +646,13 @@ macos_bootstrap() {
         entry="$ENTRY_CMD_INTL"
     fi
     echo "[bootstrap] 在 VM 内执行与 Linux 完全相同的一键命令，COGNEVA_CN_MIRROR=$CN_MIRROR 已透传..."
+    # 入口命令自己会在取不到脚本时报错退出；这里再核一次 rc——不核就等于把「VM 内
+    # 什么都没装」读成「完成」，还会接着打开一个指向空服务的浏览器。
     # shellcheck disable=SC2086
-    limactl shell cogneva -- sh -c "COGNEVA_CN_MIRROR=$CN_MIRROR $entry"
+    if ! limactl shell cogneva -- sh -c "COGNEVA_CN_MIRROR=$CN_MIRROR $entry"; then
+        echo "[bootstrap] VM 内引导未完成（原因见上面的输出），宿主侧没有做任何改动。" >&2
+        exit 1
+    fi
     echo ""
     echo "[bootstrap] 完成！Cogneva 已在 VM 内运行，WebUI 经端口转发暴露到本机："
     echo "  http://localhost:8080"

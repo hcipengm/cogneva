@@ -529,7 +529,7 @@ Cogneva 支持**元启动（Meta-bootstrap）**：从一台空白机器（Linux 
 ### 🐧 Linux
 
 ```bash
-(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh || curl -fsSL -m 15 "https://gitee.com/api/v5/repos/hcipengm/cogneva/contents/bootstrap.sh?ref=main" | sed -n 's/.*"content":"\([^"]*\)".*/\1/p' | base64 -d) | sh
+src="$(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh)" || src=""; [ -n "$src" ] || { src="$(curl -fsSL -m 15 'https://gitee.com/api/v5/repos/hcipengm/cogneva/contents/bootstrap.sh?ref=main' | sed -n 's/.*"content":"\([^"]*\)".*/\1/p' | base64 -d)" || src=""; }; export COGNEVA_CN_MIRROR="${COGNEVA_CN_MIRROR-}"; if [ -n "$src" ]; then printf "%s\n" "$src" | sh; else echo "bootstrap: 入口脚本取不到（两个镜像都不可达，网络受限或镜像故障）；未做任何改动 / could not fetch the entry script, nothing was changed" >&2; false; fi
 ```
 
 裸机直接引导。
@@ -537,7 +537,7 @@ Cogneva 支持**元启动（Meta-bootstrap）**：从一台空白机器（Linux 
 ### 🍎 macOS
 
 ```bash
-(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh || curl -fsSL -m 15 "https://gitee.com/api/v5/repos/hcipengm/cogneva/contents/bootstrap.sh?ref=main" | sed -n 's/.*"content":"\([^"]*\)".*/\1/p' | base64 -d) | sh
+src="$(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh)" || src=""; [ -n "$src" ] || { src="$(curl -fsSL -m 15 'https://gitee.com/api/v5/repos/hcipengm/cogneva/contents/bootstrap.sh?ref=main' | sed -n 's/.*"content":"\([^"]*\)".*/\1/p' | base64 -d)" || src=""; }; export COGNEVA_CN_MIRROR="${COGNEVA_CN_MIRROR-}"; if [ -n "$src" ]; then printf "%s\n" "$src" | sh; else echo "bootstrap: 入口脚本取不到（两个镜像都不可达，网络受限或镜像故障）；未做任何改动 / could not fetch the entry script, nothing was changed" >&2; false; fi
 ```
 
 **同一条命令**。K3s 需要 Linux 内核，脚本会自动安装 [Lima](https://lima-vm.io)（经 Homebrew，国内走 TUNA 镜像）并创建 Ubuntu 虚拟机，然后在 VM 内执行完全相同的一键命令。所有依赖都装在 VM 内，宿主只多一个 `limactl`。完成后 WebUI 经端口转发到 <http://localhost:8080>。管理 VM：`limactl shell cogneva` / `limactl stop cogneva` / `limactl delete cogneva`。

@@ -206,6 +206,159 @@ case "$err" in
     *) echo "FAIL - 缺权限报错未指明原因: $err"; fails=$((fails + 1)) ;;
 esac
 
+# ---------- 入口命令：取不到脚本必须报错，不许静默成功 ----------
+# 旧写法 `(A || B) | sh` 在两条腿都失败时把**空输入**递给 sh，而 sh 读空 stdin 以 0
+# 退出：命令报成功、机器上什么都没装（macOS/WSL 路径还会接着打印「完成！」并打开
+# 一个指向空服务的浏览器；实测旧写法两腿都失败时 rc=0、零输出）。
+# 这里把**每一处载体的原文**抽出来逐条跑，而不是重新拼一份命令——重新拼只能证明我
+# 抄得对，证明不了载体本身带着这道判据。
+ENTRY="$(mktemp -d)"
+trap 'rm -rf "$FAKE" "$FAKE2" "$KEYDIR" "$ENTRY"' EXIT
+
+# 假 curl：按 URL 认腿、回放该腿正文；ENTRY_FAKE_FAIL=all|<leg> 时按失败退出
+# （真 curl 带 -f，HTTP 错误同样是非零退出，这里用 22 对齐）。
+cat > "$ENTRY/curl" <<'EOF'
+#!/bin/sh
+url=""
+for a in "$@"; do
+    case "$a" in http*) url="$a" ;; esac
+done
+case "$url" in
+    *gitee.com*) leg=gitee ;;
+    *raw.githubusercontent.com*) leg=github ;;
+    *) echo "假 curl 收到未知 URL: $url" >&2; exit 2 ;;
+esac
+case "${ENTRY_FAKE_FAIL:-}" in
+    all|"$leg") exit 22 ;;
+esac
+cat "$(dirname "$0")/$leg.body"
+EOF
+chmod +x "$ENTRY/curl"
+
+# 两条腿回放**不同的**标记：这样「首选失败真的轮到兜底」是可断言的事实。
+# 正文是可执行的 sh（与真脚本同形），并回显 COGNEVA_CN_MIRROR——强制模式能不能透到
+# 真正的引导器也一并量了。
+cat > "$ENTRY/github.body" <<'EOF'
+#!/bin/sh
+printf 'ENTRY-RAN github\n'
+printf 'ENTRY-CN=%s\n' "${COGNEVA_CN_MIRROR-unset}"
+EOF
+cat > "$ENTRY/gitee.raw" <<'EOF'
+#!/bin/sh
+printf 'ENTRY-RAN gitee\n'
+printf 'ENTRY-CN=%s\n' "${COGNEVA_CN_MIRROR-unset}"
+EOF
+# Gitee 腿走 API contents：JSON 进、base64 "content" 出、decode。假正文必须是同一形状，
+# 否则测的是我编的管道，不是真命令的解码路径。
+printf '{"content":"%s"}\n' "$(base64 < "$ENTRY/gitee.raw" | tr -d '\n')" > "$ENTRY/gitee.body"
+rm -f "$ENTRY/gitee.raw"
+
+# 载体清单。标签格式 `<来源>:<型号>:<首选腿>`。
+# 分母按**来源**给（两个 README 各两处安装片段、ps1 两个字符串、bootstrap.sh 两个
+# 常量）：只断言总数的话，删掉一处、别处加一处，总数照样对得上。
+entry_carriers() {
+    printf 'bootstrap.sh:INTL:github\t%s\n' "$ENTRY_CMD_INTL"
+    printf 'bootstrap.sh:CN:gitee\t%s\n' "$ENTRY_CMD_CN"
+    for f in README.md README.zh-CN.md; do
+        grep -nF 'src="$(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh' "$ROOT/$f" |
+            while IFS=: read -r ln text; do
+                printf '%s:%s:github\t%s\n' "$f" "$ln" "$text"
+            done
+    done
+    # PowerShell 单引号串里的 '' 是一个转义出来的 '；还原成 sh 看到的文本再比。
+    sed -n "s/^\$EntryCmdIntl *= *'\(.*\)'\$/bootstrap.ps1:Intl:github\t\1/p" "$ROOT/bootstrap.ps1" | sed "s/''/'/g"
+    sed -n "s/^\$EntryCmdCn *= *'\(.*\)'\$/bootstrap.ps1:Cn:gitee\t\1/p" "$ROOT/bootstrap.ps1" | sed "s/''/'/g"
+}
+
+ok_or() { # ok_or <描述> <必须出现的串> <输出>
+    case "$3" in
+        *"$2"*) echo "ok   - $1" ;;
+        *) echo "FAIL - $1: 输出里没有 [$2]: $3"; fails=$((fails + 1)) ;;
+    esac
+}
+not_or() { # not_or <描述> <不许出现的串> <输出>
+    case "$3" in
+        *"$2"*) echo "FAIL - $1: 输出里不该有 [$2]: $3"; fails=$((fails + 1)) ;;
+        *) echo "ok   - $1" ;;
+    esac
+}
+
+declare -A seen=()
+n_carriers=0
+while IFS=$'\t' read -r label cmd; do
+    [ -n "${cmd:-}" ] || continue
+    src="${label%%:*}"
+    first="${label##*:}"
+    second=gitee
+    [ "$first" = "gitee" ] && second=github
+    n_carriers=$((n_carriers + 1))
+    seen[$src]=$(( ${seen[$src]:-0} + 1 ))
+
+    up="$(PATH="$ENTRY:$ORIG_PATH" sh -c "$cmd" 2>&1)"; rc=$?
+    check "[$label] 两条腿都在 → 退出码 0" 0 "$rc"
+    ok_or "[$label] 两条腿都在 → 取到的正文真的被执行" "ENTRY-RAN $first" "$up"
+
+    # 首选腿失败必须真的轮到兜底腿（旧写法里这一步靠 `||` 在工作，不能顺手改坏）
+    fb="$(PATH="$ENTRY:$ORIG_PATH" ENTRY_FAKE_FAIL="$first" sh -c "$cmd" 2>&1)"
+    ok_or "[$label] 首选腿失败 → 真的轮到兜底腿" "ENTRY-RAN $second" "$fb"
+
+    # 主体判据：两条腿都失败 ⇒ 非零退出 + 说明原因 + 什么都没执行
+    down="$(PATH="$ENTRY:$ORIG_PATH" ENTRY_FAKE_FAIL=all sh -c "$cmd" 2>&1)"; rc=$?
+    check "[$label] 两条腿都失败 → 非零退出（旧写法这里是 0）" 1 "$rc"
+    not_or "[$label] 两条腿都失败 → 没有执行任何东西" "ENTRY-RAN" "$down"
+    ok_or "[$label] 两条腿都失败 → 报错说明原因" "入口脚本取不到" "$down"
+
+    # 强制模式的前缀写法必须透到真正的引导器：入口命令改成变量赋值开头后，
+    # `COGNEVA_CN_MIRROR=1 <一键命令>` 的前缀不再落在管道上（实测会丢）。
+    forced="$(PATH="$ENTRY:$ORIG_PATH" sh -c "COGNEVA_CN_MIRROR=1 $cmd" 2>&1)"
+    ok_or "[$label] COGNEVA_CN_MIRROR=1 前缀仍透到引导器" "ENTRY-CN=1" "$forced"
+done < <(entry_carriers)
+
+for src in bootstrap.sh bootstrap.ps1 README.md README.zh-CN.md; do
+    check "载体清单：$src 的入口命令处数" 2 "${seen[$src]:-0}"
+done
+check "载体清单：载体总数（4 个来源 × 2 处）" 8 "$n_carriers"
+
+# 同侧载体必须逐字相同。一条命令散在 4 个文件 8 个地方、没有判据盯着，就一定会漂：
+# 单改 README 的 `-m 15`、单改 ps1 的腿序，都不会有任何东西变红。
+check "INTL 侧只有一个版本的命令文本" 1 "$(entry_carriers | awk -F'\t' '$1 ~ /:github$/ {print $2}' | sort -u | wc -l | tr -d ' ')"
+check "CN 侧只有一个版本的命令文本" 1 "$(entry_carriers | awk -F'\t' '$1 ~ /:gitee$/ {print $2}' | sort -u | wc -l | tr -d ' ')"
+
+# ---------- macOS 路径：VM 内失败不许被读成「完成」 ----------
+# 假 limactl 把 `shell` 之后的参数原样执行 —— 于是这条判据跑的是**真的**入口命令，
+# 而不是我编造的一个「VM 返回 1」。
+cat > "$ENTRY/limactl" <<'EOF'
+#!/bin/sh
+case "${1:-}" in
+    --version) echo "limactl version 0.0.0-fake"; exit 0 ;;
+    list)
+        case "${2:-}" in
+            -q) echo cogneva ;;
+            *)  echo "cogneva Running" ;;
+        esac
+        exit 0
+        ;;
+    shell) shift 3; exec "$@" ;;
+esac
+exit 0
+EOF
+chmod +x "$ENTRY/limactl"
+
+macos_run() { # $1 = ENTRY_FAKE_FAIL
+    PATH="$ENTRY:$ORIG_PATH" ENTRY_FAKE_FAIL="$1" COGNEVA_CN_MIRROR=0 \
+        COGNEVA_HOME="$ENTRY/home" COGNEVA_BOOTSTRAP_SOURCE_ONLY=1 \
+        /bin/sh -c ". '$ROOT/bootstrap.sh' >/dev/null 2>&1; macos_bootstrap" 2>&1
+}
+
+mac_ok="$(macos_run "")"; rc=$?
+check "macOS 路径：VM 内成功 → 退出码 0" 0 "$rc"
+ok_or "macOS 路径：VM 内成功 → 报完成" "完成！" "$mac_ok"
+
+mac_bad="$(macos_run all)"; rc=$?
+check "macOS 路径：VM 内取不到脚本 → 非零退出" 1 "$rc"
+not_or "macOS 路径：VM 内取不到脚本 → 不许报完成" "完成！" "$mac_bad"
+ok_or "macOS 路径：VM 内取不到脚本 → 说明未完成" "VM 内引导未完成" "$mac_bad"
+
 export PATH="$ORIG_PATH"
 if [ "$fails" -ne 0 ]; then
     echo "bootstrap 入口判据测试失败: $fails"

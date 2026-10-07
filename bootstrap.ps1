@@ -19,9 +19,11 @@ function Write-Step([string]$Msg) { Write-Host "[bootstrap] $Msg" }
 # reads the same bytes from Gitee's API contents endpoint instead. Doubled
 # single quotes are PowerShell's escape inside a single-quoted string; the
 # command is handed to sh verbatim, so the inner quoting must survive.
-# 与 README 完全同一条入口命令；CN 模式 Gitee 优先
-$EntryCmdIntl = '(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh || curl -fsSL -m 15 "https://gitee.com/api/v5/repos/hcipengm/cogneva/contents/bootstrap.sh?ref=main" | sed -n ''s/.*"content":"\([^"]*\)".*/\1/p'' | base64 -d) | sh'
-$EntryCmdCn   = '(curl -fsSL -m 15 "https://gitee.com/api/v5/repos/hcipengm/cogneva/contents/bootstrap.sh?ref=main" | sed -n ''s/.*"content":"\([^"]*\)".*/\1/p'' | base64 -d || curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh) | sh'
+# 与 README / bootstrap.sh 逐字同一条入口命令；CN 模式 Gitee 优先。
+# 它把脚本取进变量、验非空再喂 sh：`(A || B) | sh` 在两条腿都失败时把空输入递给
+# sh，sh 读空 stdin 以 0 退出，于是下面的 exit code 检查会把它读成「完成」。
+$EntryCmdIntl = 'src="$(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh)" || src=""; [ -n "$src" ] || { src="$(curl -fsSL -m 15 ''https://gitee.com/api/v5/repos/hcipengm/cogneva/contents/bootstrap.sh?ref=main'' | sed -n ''s/.*"content":"\([^"]*\)".*/\1/p'' | base64 -d)" || src=""; }; export COGNEVA_CN_MIRROR="${COGNEVA_CN_MIRROR-}"; if [ -n "$src" ]; then printf "%s\n" "$src" | sh; else echo "bootstrap: 入口脚本取不到（两个镜像都不可达，网络受限或镜像故障）；未做任何改动 / could not fetch the entry script, nothing was changed" >&2; false; fi'
+$EntryCmdCn   = 'src="$(curl -fsSL -m 15 ''https://gitee.com/api/v5/repos/hcipengm/cogneva/contents/bootstrap.sh?ref=main'' | sed -n ''s/.*"content":"\([^"]*\)".*/\1/p'' | base64 -d)" || src=""; [ -n "$src" ] || { src="$(curl -fsSL -m 15 https://raw.githubusercontent.com/hcipengm/cogneva/main/bootstrap.sh)" || src=""; }; export COGNEVA_CN_MIRROR="${COGNEVA_CN_MIRROR-}"; if [ -n "$src" ]; then printf "%s\n" "$src" | sh; else echo "bootstrap: 入口脚本取不到（两个镜像都不可达，网络受限或镜像故障）；未做任何改动 / could not fetch the entry script, nothing was changed" >&2; false; fi'
 
 function Resolve-CnMirror {
     if ($script:CnMirror -eq '1') { return '1' }
@@ -124,7 +126,9 @@ Write-Step "在 WSL Ubuntu 内执行与 Linux 完全相同的一键命令，COGN
 # quote characters that a PowerShell-to-native-exe round trip would have to
 # quote and escape correctly -- untestable from here, and silently wrong when
 # it is. stdin has no such layer: what is written is what sh reads.
-"COGNEVA_CN_MIRROR=$cn $entry" | wsl.exe -d Ubuntu -u root -- sh
+# 强制模式用 export 单独一行：入口命令现在是变量赋值开头，写在它前面的
+# `VAR=…` 前缀不再落在管道上，不会传给真正的引导器（export 才会）。
+"export COGNEVA_CN_MIRROR=$cn`n$entry" | wsl.exe -d Ubuntu -u root -- sh
 if ($LASTEXITCODE -ne 0) { throw "WSL 内引导失败（exit $LASTEXITCODE）" }
 
 Write-Host ''
