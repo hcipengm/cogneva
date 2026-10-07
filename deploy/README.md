@@ -32,7 +32,7 @@ Kubernetes 节）。用户不需要在 K3s / 标准 K8s / Helm 之间做选择�
 | 脚本 | 功能 |
 |---|---|
 | `render-deploy.sh` | 用 `helm template -f profiles/<p>.yaml` 把 chart 渲染进 `rendered/<profile>/`；`--check` 做 CI 新鲜度门禁（重渲染有 diff 即红） |
-| `check-deploy-parity.sh` | chart k3s profile 渲染 vs `k3s/` 静态清单的**字段级 parity** 门禁（47 资源基线，env/卷/挂载/端口/SA 全比对），CI 强制 |
+| `check-deploy-parity.sh` | chart k3s profile 渲染 vs `k3s/` 静态清单的**字段级 parity** 门禁：资源集合、每工作负载的 Pod 模板标签与容器内外全部字段、Service/NetworkPolicy/Ingress/StorageClass/Namespace/ServiceAccount/CronJob 的整份对象、治理对象与 ConfigMap 的整份 spec（安装来源标签除外）。比了多少资源、多少类由脚本自己报（资源随拓扑增减，别在文档里钉死），CI 强制 |
 | `init-secrets.sh` | 安装时**随机生成**内部密钥（pg/redis/内部签名）并创建 Secret；幂等不覆盖已有值；元启动 apply 前自动跑 |
 | `distribute-image.sh` | 多节点镜像增量升级：把镜像 tar 分发到全部节点并滚动重启 |
 | `build-release-image.sh` | release 预构建运行时镜像的**本机单源**构建（产物 tar.gz + sha256） |
@@ -87,7 +87,7 @@ StorageClass，如 Longhorn）。渲染检查：`helm template cogneva deploy/he
 > deploy/scripts/render-deploy.sh` 重新生成，CI 新鲜度门禁防漂移）；
 > `deploy/k3s/` 静态清单是 parity 基线兼集群内 GitOps 拉取端的运行时消费物，
 > 必须与 chart k3s profile 字段级对齐，由 CI 与 `deploy/scripts/check-deploy-parity.sh`
-> 强制（47 资源基线）。改拓扑的顺序见 `deploy/k3s/README.md`。
+> 强制（覆盖多少资源与资源类型以脚本自报为准）。改拓扑的顺序见 `deploy/k3s/README.md`。
 
 ---
 
