@@ -23,7 +23,12 @@ pub struct OpenAICompat {
     pub requires_tool_result_name: bool,
     /// Whether a user message after tool results requires an assistant message in between.
     pub requires_assistant_after_tool_result: bool,
-    /// Whether the provider only accepts temperature=1.0 (e.g. Kimi k2.6).
+    /// Whether the provider only accepts temperature=1.0. A vendor branch sets
+    /// it, and no model name is named beside it: this profile is keyed on the
+    /// base URL, so a model written here is a claim nothing re-checks -- the one
+    /// that used to stand here had already gone stale against the model the pool
+    /// actually ran. The admission probe settles this per upstream anyway, and
+    /// this value is only the fallback for an upstream it has not reached.
     pub requires_temperature_one: bool,
     /// Whether thinking blocks must be converted to text blocks with `<thinking>` delimiters.
     pub requires_thinking_as_text: bool,
@@ -447,5 +452,77 @@ mod tests {
         assert!(compat.supports_store);
         assert!(compat.supports_reasoning_effort);
         assert!(compat.supports_strict_mode);
+    }
+
+    /// 网关据画像决定的六个字段里，只有两个能被实测推翻——`requires_temperature_one`
+    /// 有池条目的准入判定、`supports_usage_in_streaming` 有 `effective_usage_verdict`。
+    /// 另外四个（`supports_store`、`supports_reasoning_effort`、`supports_strict_mode`、
+    /// `max_tokens_field`）**画像写什么就是什么**：池里没有任何读数能把它们判错，
+    /// 记下来的只是「改写发生过」，不是「改写是对的」。所以它们唯一会遇到读者的地方
+    /// 就是这张表——逐分支钉住，改动因此必然是一次有意的改动。
+    ///
+    /// 这张表记的是**画像说的话**，不是上游的能力：`kimi` 那条
+    /// `requires_temperature_one: true` 的出处不在这里（准入探测能把这台问清楚，
+    /// 现役池上还没问过），这里只是不让它被默默改掉。
+    ///
+    /// 分母取自源码本身：本文件里 `if lower` + `.contains(` 的条数就是分支数
+    /// （needle 拆开拼，免得把这条判据自己数进去），漏一行或新加分支没配行都会红。
+    #[test]
+    fn every_vendor_branch_pins_the_decisions_no_measurement_can_overturn() {
+        // (字面量, store, reasoning_effort, strict, max_tokens 拼写, 流里报用量, 只收 temperature=1)
+        #[rustfmt::skip]
+        let branches: &[(&str, bool, bool, bool, MaxTokensField, bool, bool)] = &[
+            ("openrouter.ai",     false, true,  true,  MaxTokensField::MaxTokens,           true,  false),
+            ("gateway.ai.cloudflare.com", false, false, true, MaxTokensField::MaxCompletionTokens, true, false),
+            ("ai-gateway",        false, false, true,  MaxTokensField::MaxCompletionTokens, true,  false),
+            ("api.groq.com",      false, false, false, MaxTokensField::MaxTokens,           false, false),
+            ("api.cerebras.ai",   false, false, false, MaxTokensField::MaxTokens,           false, false),
+            ("api.x.ai",          false, false, false, MaxTokensField::MaxTokens,           true,  false),
+            ("api.xai.com",       false, false, false, MaxTokensField::MaxTokens,           true,  false),
+            ("api.mistral.ai",    false, false, false, MaxTokensField::MaxTokens,           false, false),
+            ("api.minimax.chat",  false, false, false, MaxTokensField::MaxTokens,           false, false),
+            ("minimax",           false, false, false, MaxTokensField::MaxTokens,           false, false),
+            ("api.kimi.com",      false, false, false, MaxTokensField::MaxTokens,           false, true),
+            ("kimi",              false, false, false, MaxTokensField::MaxTokens,           false, true),
+            ("githubcopilot",     false, false, false, MaxTokensField::MaxCompletionTokens, true,  false),
+            ("copilot",           false, false, false, MaxTokensField::MaxCompletionTokens, true,  false),
+            ("volces.com",        false, false, false, MaxTokensField::MaxCompletionTokens, true,  false),
+            ("volcengine",        false, false, false, MaxTokensField::MaxCompletionTokens, true,  false),
+            ("localhost:11434",   false, false, false, MaxTokensField::MaxTokens,           false, false),
+            ("ollama",            false, false, false, MaxTokensField::MaxTokens,           false, false),
+        ];
+        for (literal, store, reasoning, strict, spelling, usage, temperature) in branches {
+            // 厂商身份放进路径：真实上游的 URL 也常常是带路径的，画像正是按子串认厂。
+            let compat = detect_compat(&format!("https://upstream.example.test/v1/{literal}"));
+            let at = format!("字面量 `{literal}`");
+            assert_eq!(compat.supports_store, *store, "{at}: supports_store");
+            assert_eq!(
+                compat.supports_reasoning_effort, *reasoning,
+                "{at}: supports_reasoning_effort"
+            );
+            assert_eq!(
+                compat.supports_strict_mode, *strict,
+                "{at}: supports_strict_mode"
+            );
+            assert_eq!(compat.max_tokens_field, *spelling, "{at}: max_tokens_field");
+            assert_eq!(
+                compat.supports_usage_in_streaming, *usage,
+                "{at}: supports_usage_in_streaming"
+            );
+            assert_eq!(
+                compat.requires_temperature_one, *temperature,
+                "{at}: requires_temperature_one"
+            );
+        }
+
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/utils/compat.rs"))
+                .expect("本文件要能被读到");
+        let branch_count = src.matches(concat!("if lower", ".contains(")).count();
+        assert_eq!(
+            branch_count, 11,
+            "厂商分支数变了（{branch_count} 条）：新分支要在这张表里配齐行，\
+             删分支也要把行删掉——否则这条判据自己会静默缩水"
+        );
     }
 }
