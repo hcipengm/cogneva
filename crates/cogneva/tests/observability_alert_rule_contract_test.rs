@@ -1233,10 +1233,7 @@ const UNREAD: &[(&str, Unread)] = &[
     ),
     (
         "cogneva_version_contract_checks_total",
-        Unread::Elsewhere {
-            readers: &["cogneva_version_contract_violations"],
-            reason: "the denominator of version_contract_violated: the help says it is what separates a contract that holds from a judgement that never ran",
-        },
+        Unread::Gap("the other half of version_contract_violated. The reader this entry used to name, cogneva_version_contract_violations, is genuinely read -- by that rule, which takes it as the numerator's value through max by (clause) (max_over_time(...[1h])) > 0. What this counter carries is the opposite half: that the judgement ran at all. A stopped judgement leaves the window empty, max_over_time over an empty range returns no sample, and the comparison then yields nothing, so a contract that holds and a judgement that never ran are the same shape on every rule in this set -- measured over the live rule set, nothing reads this name. The loop census does not stand in for it either, and that is read off the producer rather than assumed: the deployer stamps its cycle at the top of the loop body, before poll_once, and the early returns inside poll_once that can fire ahead of report_version_contract therefore keep the tick fresh while the judgement never runs. Closing it needs a rule over this counter in the shape mainline_supersession_question_stopped already uses for this same deployer -- a difference of increases over a fixed window -- and the decision it still owes is the window, because the counter is written once per clause per poll and the poll interval is declared per deployment. That is a decision rather than a lookup, so this is a debt"),
     ),
     (
         "cogneva_version_declared_info",
@@ -1356,7 +1353,7 @@ fn unresolved_readers(read: &BTreeSet<String>, name: &str, readers: &[&str]) -> 
 /// that nothing else states must be classified, and calling it a gap raises
 /// this number on purpose -- the point of the ratchet is that the increase is a
 /// decision someone made, not a drift nobody saw.
-const GAPS_AT_CENSUS: usize = 22;
+const GAPS_AT_CENSUS: usize = 23;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {
