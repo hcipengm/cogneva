@@ -308,6 +308,25 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          from an idle buffer that has had nothing to send",
     ),
     (
+        "cogneva_memory_schema_repair_total",
+        "How each round of the memory schema repair loop ended, summed over \
+         rounds and labelled by the outcome. The loop exists to rebuild the \
+         derived layer of archived entries that were written without one -- \
+         without it such an entry is unreachable by search and nothing reports \
+         it, since the test for whether it was written is whether the derived \
+         layer is there. The loop's beat is stamped every repair interval \
+         whether or not it repaired anything, so a round that failed and a \
+         round that found no orphan were the same picture, and the failure \
+         survived only as a log line that dies with the pod. The values are a \
+         closed set the producing module declares: repaired (at least one \
+         orphan was rebuilt), unrepairable (orphans were found but none could \
+         be typed, so the loss is permanent and re-surfaces every round), clean \
+         (nothing was missing), and failed (the pass returned an error). Read \
+         the failed cell against the rest: a failed cell rising over a flat \
+         repaired cell is the repair path failing every round, which is a \
+         different fact from a store with nothing to repair",
+    ),
+    (
         "cogneva_mainline_superseded_rollout_total",
         "Rounds the deployer's guard answered that the revision it was carrying \
          had been overtaken upstream: 1 when it had (nothing is rolled out, the \

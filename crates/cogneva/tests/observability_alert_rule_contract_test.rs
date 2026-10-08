@@ -1747,6 +1747,10 @@ const UNREAD: &[(&str, Unread)] = &[
         "cogneva_analytics_flush_total",
         Unread::Gap("events carried by each flush of the analytics event buffer, one cell per outcome. The whole path had no reading at all before this pass: the flush loop beats every flush interval, so its liveness is read, but delivering a batch to ClickHouse and failing to ship one read the same -- and a failure is a loss rather than a retry, because the insert consumes the batch and nothing sends it again, so the events were gone and only a log line that dies with the pod recorded it. What is still missing is a rule, and a rule here would have to say how many lost events in a window are a fault, which is a threshold on a flush loop: a policy nobody declared. Writing that rule is an alert-rule change, which needs sign-off before it lands, so the reading ships with its debt recorded rather than left absent"),
     ),
+    (
+        "cogneva_memory_schema_repair_total",
+        Unread::Gap("how each round of the memory schema repair loop ended, one cell per outcome. The whole path had no reading at all before this pass: the loop beats every repair interval, so its liveness is read, but a round that returned an error and a round that found no orphan read the same -- and the failed round was a warn line that dies with the pod. This is the loop that exists to make a silent loss visible (an archived entry whose derived layer never landed is unreachable by search and nothing reports it), so its own failure being silent was the same shape one level up. What is still missing is a rule, and a rule here would have to say how many failed rounds in a window are a fault, and whether a run of unrepairable rounds is the same fault as a failed one -- the first is a permanent loss that re-surfaces every round and needs a human, the second is the repair path itself being down. That is a policy and a threshold on a loop that runs every repair interval: nobody declared either. Writing that rule is an alert-rule change, which needs sign-off before it lands, so the reading ships with its debt recorded rather than left absent"),
+    ),
 ];
 
 /// Entries an `Elsewhere` reader claim cannot be resolved against.
@@ -1775,7 +1779,7 @@ fn unresolved_readers(read: &BTreeSet<String>, name: &str, readers: &[&str]) -> 
 /// completion cadence is already read against *is* that budget. The two entries
 /// left the table in the pass that wrote `buildah_store_round_incomplete`, so
 /// 23 became 21.
-const GAPS_AT_CENSUS: usize = 25;
+const GAPS_AT_CENSUS: usize = 26;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {

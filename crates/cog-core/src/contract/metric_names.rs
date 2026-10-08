@@ -252,6 +252,25 @@ metric_names! {
     // buffer that has lost every batch from one that has had nothing to send.
     ANALYTICS_FLUSH_TOTAL => "cogneva_analytics_flush_total",
 
+    // cog-reflection — how each round of the memory schema repair loop ended,
+    // labelled by `outcome`, one round per cell.
+    //
+    // This loop exists to make a silent loss visible again: an archived entry
+    // whose derived layer never landed is unreachable by search, and nothing
+    // reports it, because the test for "was this written" is "is the derived
+    // layer there" and an absence cannot testify to an absence. The loop's only
+    // reading was its own beat, stamped every repair interval whether or not it
+    // repaired anything, so a round that returned an error and a round that found
+    // no orphan read the same -- and both were ordinary-looking. A failed round
+    // was a WARN that dies with the pod.
+    //
+    // A counter, because the round runs on every cycle and the fact is a
+    // cumulative one; the four cells are the closed set of ends, so a reader can
+    // separate a repair path that is failing every round from one that has
+    // nothing to fix, and can see the entries it found but could not type -- a
+    // permanent loss that re-surfaces every round and reads on no other series.
+    MEMORY_SCHEMA_REPAIR_TOTAL => "cogneva_memory_schema_repair_total",
+
     // cog-reflection — the registry store's capacity reclamation, read by the
     // process that reclaims it.
     //

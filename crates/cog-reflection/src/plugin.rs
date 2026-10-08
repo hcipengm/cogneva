@@ -292,7 +292,8 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     info!("memory schema repair disabled by config");
                 } else {
                     let recorder =
-                        crate::MemoryBackendRecorder::new(mb, crate::REFLECTION_NAMESPACE);
+                        crate::MemoryBackendRecorder::new(mb, crate::REFLECTION_NAMESPACE)
+                            .with_metrics(metrics_backend.clone());
                     let shutdown = cog_core::ShutdownSignal::new();
                     if let Some(broadcast_tx) = ctx.consume::<cog_core::ShutdownBroadcastTx>() {
                         let shutdown = shutdown.clone();

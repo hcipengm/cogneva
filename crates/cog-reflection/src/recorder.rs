@@ -3,6 +3,7 @@
 //! learnings can be archived in the same three-layer memory system as
 //! regular agent memories (raw → schema → summary).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -308,6 +309,28 @@ impl SchemaRepair {
     }
 }
 
+/// 一轮「补齐缺失派生层」的结局。落在轮次计数器上的那一格，与 `failed`
+/// 合起来是闭集；名字写死在这里，读者按它枚举。
+enum SchemaRepairRound {
+    /// 补齐跑完了，至少重建了一条派生层。
+    Repaired,
+    /// 补齐跑完了，发现了缺派生层的条目，但一个都认不出类型、补不了。
+    /// 这是要人看一眼的那种：它不会自愈，每轮都会再被扫出来。
+    Unrepairable,
+    /// 补齐跑完了，没有孤儿。这是常态，不是「循环停了」。
+    Clean,
+}
+
+impl SchemaRepairRound {
+    fn as_cell(&self) -> &'static str {
+        match self {
+            SchemaRepairRound::Repaired => "repaired",
+            SchemaRepairRound::Unrepairable => "unrepairable",
+            SchemaRepairRound::Clean => "clean",
+        }
+    }
+}
+
 /// Recorder backed by [`cog_core::MemoryBackend`].
 /// Stores learnings as schema entries so they participate in the
 /// three-layer memory pipeline (raw → schema → summary).
@@ -315,6 +338,8 @@ impl SchemaRepair {
 pub struct MemoryBackendRecorder {
     backend: Arc<dyn cog_core::MemoryBackend>,
     namespace: String,
+    /// 每轮补齐结局的去处。在调用点接线（那时指标服务在手）；缺席时结局只落日志。
+    metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
 }
 
 impl std::fmt::Debug for MemoryBackendRecorder {
@@ -331,6 +356,7 @@ impl Clone for MemoryBackendRecorder {
         Self {
             backend: Arc::clone(&self.backend),
             namespace: self.namespace.clone(),
+            metrics: self.metrics.clone(),
         }
     }
 }
@@ -340,6 +366,38 @@ impl MemoryBackendRecorder {
         Self {
             backend,
             namespace: namespace.into(),
+            metrics: None,
+        }
+    }
+
+    /// 接上每轮补齐结局计数器的去处。调用点在指标服务在手的地方；缺席时结局只落日志。
+    pub fn with_metrics(mut self, metrics: Option<Arc<dyn cog_core::MetricsBackend>>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// 把这一轮补齐落在哪一格记下来。`None` 表示这一轮以错误结束。
+    ///
+    /// 与那句每轮日志同点写、三条分支都写：把「跑到底但没补上」「没孤儿」和
+    /// 「折在半路」分开正是这条读数的全部意义，少写任何一支都会让它们在这条
+    /// 读数面上合流——而「每轮都在失败」与「每轮都没活干」正是这里要分开的
+    /// 两种形状。
+    async fn record_repair_round(&self, outcome: Option<&SchemaRepairRound>) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let cell = outcome.map_or("failed", SchemaRepairRound::as_cell);
+        let mut labels = HashMap::new();
+        labels.insert("outcome".to_string(), cell.to_string());
+        if let Err(e) = metrics
+            .record_counter(
+                cog_core::metric_names::MEMORY_SCHEMA_REPAIR_TOTAL,
+                1.0,
+                labels,
+            )
+            .await
+        {
+            warn!(error = %e, "memory schema repair: could not record round outcome");
         }
     }
 
@@ -422,13 +480,32 @@ pub fn spawn_schema_repair_loop(
                         _ = shutdown.wait() => return,
                     }
                     match recorder.repair_missing_schemas().await {
-                        Ok(repair) if repair.found() > 0 => info!(
-                            repaired = repair.repaired,
-                            unrepairable = repair.unrepairable,
-                            "rebuilt missing memory schemas from archived entries"
-                        ),
-                        Ok(_) => debug!("memory schema repair: no orphaned entries"),
-                        Err(e) => warn!("memory schema repair failed: {}", e),
+                        Ok(repair) if repair.found() > 0 => {
+                            info!(
+                                repaired = repair.repaired,
+                                unrepairable = repair.unrepairable,
+                                "rebuilt missing memory schemas from archived entries"
+                            );
+                            // 一轮里既补上了又认不出的，记成补上了：认出类型的那几条
+                            // 已经重新可查，而认不出的条目下轮还会被扫出来，落到
+                            // unrepairable 那格。
+                            let outcome = if repair.repaired > 0 {
+                                SchemaRepairRound::Repaired
+                            } else {
+                                SchemaRepairRound::Unrepairable
+                            };
+                            recorder.record_repair_round(Some(&outcome)).await;
+                        }
+                        Ok(_) => {
+                            debug!("memory schema repair: no orphaned entries");
+                            recorder
+                                .record_repair_round(Some(&SchemaRepairRound::Clean))
+                                .await;
+                        }
+                        Err(e) => {
+                            warn!("memory schema repair failed: {}", e);
+                            recorder.record_repair_round(None).await;
+                        }
                     }
                 }
             }
@@ -520,6 +597,8 @@ impl LearningRecorder for MemoryBackendRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The counter totals are read through the backend trait, not an inherent method.
+    use cog_core::MetricsBackend;
     use cog_core::contract::memory::{
         MemoryBackend, MemoryMetrics, RelationDirection, SchemaSearchResult, SummaryEntry,
         SummarySearchResult, UnifiedSearchResult,
@@ -1085,5 +1164,60 @@ mod tests {
         assert_eq!(repair.repaired, 0);
         assert_eq!(repair.unrepairable, 1);
         assert!(backend.schemas.lock().unwrap().is_empty());
+    }
+
+    /// 三格互不相同，也不与 `failed` 撞名：这是读者按名字枚举的那份闭集，
+    /// 撞名或漏格都是形状变了。
+    #[test]
+    fn schema_repair_cells_are_a_closed_set_of_distinct_names() {
+        let cells = [
+            SchemaRepairRound::Repaired.as_cell(),
+            SchemaRepairRound::Unrepairable.as_cell(),
+            SchemaRepairRound::Clean.as_cell(),
+        ];
+        let mut sorted = cells.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), cells.len(), "三格必须互不相同");
+        assert!(cells.iter().all(|c| !c.is_empty()));
+        assert!(cells.iter().all(|c| *c != "failed"));
+    }
+
+    /// 每一轮都盖一格，包括折了的那一轮；且闭集恰好四格。少写任何一支，
+    /// 或把 `failed` 并到别的格，这个断言就落。
+    #[tokio::test]
+    async fn every_repair_round_lands_in_exactly_one_cell() {
+        let backend = Arc::new(RawAndSchemaBackend::default());
+        let metrics = Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let recorder =
+            MemoryBackendRecorder::new(backend, "reflection").with_metrics(Some(metrics.clone()));
+
+        recorder
+            .record_repair_round(Some(&SchemaRepairRound::Repaired))
+            .await;
+        recorder
+            .record_repair_round(Some(&SchemaRepairRound::Unrepairable))
+            .await;
+        recorder
+            .record_repair_round(Some(&SchemaRepairRound::Clean))
+            .await;
+        // 折了的那一轮：没有结论，也必须落格。
+        recorder.record_repair_round(None).await;
+
+        let totals = metrics
+            .query_counter_totals("cogneva_memory_schema_repair_total")
+            .await
+            .unwrap();
+        let cell = |name: &str| {
+            totals
+                .iter()
+                .find(|s| s.labels.get("outcome").map(String::as_str) == Some(name))
+                .map(|s| s.value)
+        };
+        assert_eq!(cell("repaired"), Some(1.0));
+        assert_eq!(cell("unrepairable"), Some(1.0));
+        assert_eq!(cell("clean"), Some(1.0));
+        assert_eq!(cell("failed"), Some(1.0));
+        assert_eq!(totals.len(), 4, "闭集恰好四格，多一格少一格都是形状变了");
     }
 }
