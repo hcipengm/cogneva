@@ -3572,7 +3572,8 @@ impl MainlineDeployer {
     ///
     /// 在飞滚动时不做**回收**：重启 registry 会让正在拉镜像的新副本 ErrImagePull，
     /// 而那正是判据把它归成环境类、不回滚的那种失败。晚一轮没有代价。两格读数
-    /// （欠账与"一次都没走完过"）不在此列——它们量的是这一轮之外的事，仍每轮发布。
+    /// （欠账与"一次都没走完过"）不在此列，但它们也不在这里发——它们量的是这一轮
+    /// 之外的事，发射点钉在 `poll_once` 里更早的位置（见 `report_registry_debt`）。
     async fn registry_maintenance_round(
         &self,
         bare: &str,
@@ -3585,30 +3586,11 @@ impl MainlineDeployer {
         if self.cfg.registry_claim.trim().is_empty() {
             return;
         }
-        // 「一次都没走完过」先要在抓取面上是一个值，不是一条缺席的序列：这条读数
-        // 存在的全部理由就是分辨"试了很多次、一次也没成"（见 `record_maintenance_round`
-        // 与读它的那条规则），而缺席的时刻让这句话在最该成立的部署上无从判起。
-        // 补在冷却、拿不到闸、读不到库之前：这一轮走不走得完与它无关。
-        self.seed_registry_reading().await;
-        // 欠账读数每轮都发：这是"删掉的 tag 还没被 GC 放掉"唯一的可见面，而它最需要
-        // 被看见的时刻（重启一直发不出去）恰好没有别的读数——那时只有每轮一句 warn，
-        // 翻日志才知道连着欠了几轮。功能没开时这一格不存在，那是"没人问过"。
-        if let Some(metrics) = &self.metrics {
-            use cog_core::metric_names;
-            let _ = metrics
-                .record_gauge(
-                    metric_names::REGISTRY_GC_OWED,
-                    if state.registry_gc_owed { 1.0 } else { 0.0 },
-                    std::collections::HashMap::new(),
-                )
-                .await;
-        }
-        // 这两格读数落在「在飞滚动」早退之前：滚动在飞只说明这一轮不做回收，不说明
-        // 这卷欠不欠账、这台机器有没有走完过不用被看见。早退挡在它们前面时，写者活着
-        // 而这一格整轮不落——共享表把上一笔值永久送出去，读它的规则会拿一个冻住的
-        // 伴生钟当作「写者停了」，把一条好规则的判据关掉（`registry_reclaim_debt_unpaid`
-        // 就是这条）。回收动作本身仍然要等在飞滚动结束：在别人拉镜像时重启 registry
-        // 会把新副本打成 ErrImagePull，那正是判据归成环境类、不回滚的那种失败。
+        // 两格每轮都发的读数（欠账一格，以及"一次都没走完过"的种子）不在这里发：
+        // 发射点在 `poll_once` 里比本方法更早的一处（`report_registry_debt`），因为
+        // 本方法前面还压着一条更早的早退。回收动作本身仍然要等在飞滚动结束：在别人
+        // 拉镜像时重启 registry 会把新副本打成 ErrImagePull，那正是判据归成环境类、
+        // 不回滚的那种失败。
         if state.in_flight.is_some() {
             return;
         }
@@ -4036,6 +4018,39 @@ impl MainlineDeployer {
             .await;
     }
 
+    /// 欠账读数与"一次都没走完过"的种子：**每一轮都发**，与这一轮推不推进、读不读
+    /// 得到部署镜像都无关。
+    ///
+    /// 欠账这一格是"删掉的 tag 还没被 GC 放掉"唯一的可见面，而它最需要被看见的时刻
+    /// （重启一直发不出去）恰好没有别的读数——那时只有每轮一句 warn，翻日志才知道
+    /// 连着欠了几轮。功能没开时这一格不存在，那是"没人问过"。
+    ///
+    /// 发射点钉在 `poll_once`，不钉在 `registry_maintenance_round` 里：读数排在哪一条
+    /// 早退之前，决定"每轮都发"是真话还是"只有走到底的那些轮才发"。这条缺陷按站点
+    /// 修过一次（回收轮里那道在飞滚动早退），但那条路上还有更早的一站——
+    /// `deployed_images` 的 `?`，折在它上面的轮连回收轮都不会进。而折了的那一轮正是
+    /// 这一格要报告的时刻。
+    async fn report_registry_debt(&self, state: &MainlineState) {
+        if self.cfg.registry_claim.trim().is_empty() {
+            return;
+        }
+        // 「一次都没走完过」先要在抓取面上是一个值，不是一条缺席的序列：这条读数
+        // 存在的全部理由就是分辨"试了很多次、一次也没成"（见 `record_maintenance_round`
+        // 与读它的那条规则），而缺席的时刻让这句话在最该成立的部署上无从判起。补在
+        // 冷却、拿不到闸、读不到库、以及读不到部署镜像之前：这一轮走不走得完与它无关。
+        self.seed_registry_reading().await;
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let _ = metrics
+            .record_gauge(
+                cog_core::metric_names::REGISTRY_GC_OWED,
+                if state.registry_gc_owed { 1.0 } else { 0.0 },
+                std::collections::HashMap::new(),
+            )
+            .await;
+    }
+
     /// 回收轮自己的读数，两条路径共用一个出处。
     ///
     /// 跑过一轮就记一次计数（失败的轮也要记），删掉几个、被拒几个各记各的，而完成
@@ -4218,6 +4233,14 @@ impl MainlineDeployer {
         // 不推进"就等于"这一轮不盖章"，空档照旧。盖哪两棵、为什么只有那两棵，见
         // `WorkspaceManager::heartbeat_index_health`。
         self.workspaces.heartbeat_index_health().await;
+        // 欠账读数与"一次都没走完过"的种子。与上面那条心跳同理，且理由更硬：它们
+        // 量的是这一轮之外的事，任何一条早退都不改变它们该不该被看见——而本方法里
+        // 最早的那条早退就在下一行。放在 `registry_maintenance_round` 里面时，折在
+        // `deployed_images` 上的轮连那个函数都进不去，这一格整轮不落，共享表把上一笔
+        // 值永久送出去，读它的规则拿一个冻住的伴生钟当作"写者停了"，把判据关掉
+        // （`registry_reclaim_debt_unpaid`，界 1800s）。这条缺陷按站点修过一次（回收轮
+        // 里那道在飞滚动早退），这里是同一条路上的上一站。
+        self.report_registry_debt(&state).await;
         let images = self.deployed_images().await?;
         let deployed = classify_deployed(&images);
 
@@ -13824,7 +13847,10 @@ exit 0
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
             .with_metrics(metrics.clone());
 
+        // 种子与欠账那两格的发射点在 `poll_once`（`report_registry_debt`），排在所有
+        // 早退之前；这里按生产里的次序先走那一发，再走回收轮。
         let mut state = MainlineState::default();
+        deployer.report_registry_debt(&state).await;
         deployer
             .registry_maintenance_round("000000000001", &[], &mut state)
             .await;
@@ -13901,8 +13927,10 @@ exit 0
             .with_metrics(metrics.clone());
 
         // 这一轮本身走不完（tag 列表就断），但走不走得完与种子无关：补之前读回来的
-        // 那一行才是判据。
+        // 那一行才是判据。种子那一发在 `poll_once`（`report_registry_debt`），按生产
+        // 里的次序先走它——对着回收轮断言的话这个判据是空的，发射点已经不在那里了。
         let mut state = MainlineState::default();
+        deployer.report_registry_debt(&state).await;
         deployer
             .registry_maintenance_round("000000000001", &[], &mut state)
             .await;
@@ -14087,31 +14115,38 @@ exit 0
         );
     }
 
-    /// 在飞滚动只挡住**回收动作**，挡不住这两格读数：欠账与"一次都没走完过"
-    /// 量的是这一轮之外的事，滚动在飞不改变它们该不该被看见。把它们排在早退之后
-    /// 时，写者整轮不落这一格——共享表把上一笔值永久送出去，读它的规则会拿一个
-    /// 冻住的伴生钟当作"写者停了"，把一条好规则的判据关掉。这里同时钉两件事：
-    /// 欠账那格每轮都落，而回收动作一个都不走（`registry_maintenance_unix` 不动）。
+    /// 欠账读数与"一次都没走完过"的种子排在 `poll_once` 里**每一条早退之前**。
+    ///
+    /// 这两个量说的是这一轮之外的事，任何一条早退都不改变它们该不该被看见。这条
+    /// 缺陷按站点修过一次（回收轮里那道在飞滚动早退，当初的回归测试直接调
+    /// `registry_maintenance_round` 断言的），可那条路上还有更早的一站：
+    /// `deployed_images` 的 `?`。折在它上面的轮连回收轮都不会进，于是那个按站点
+    /// 写的判据再也点不着缺陷。实测（2026-10-08 01:26–03:53Z）这一格连续 8823s
+    /// 没有落过，而同一轮里排在 `?` 之前的 `cogneva_version_contract_violations`
+    /// 每 667s 一落——读前者的规则 `registry_reclaim_debt_unpaid`（界 1800s）
+    /// 整段时间被自己的守卫关着，欠账最该被看见的时刻它恰好看不见。
+    ///
+    /// 所以判据对着**折了一轮**断言，而不是对着回收轮断言：发射点已经不归它管了。
     #[tokio::test]
-    async fn registry_readings_are_published_even_while_a_rollout_is_in_flight() {
+    async fn registry_debt_is_stamped_before_the_poll_can_fold() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let mut cfg = test_config(root, Path::new("/nonexistent"), "noop", "noop");
+        let (bare, _work, _rev_a, _rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        // `get deployment` 失败一次 ⇒ `deployed_images` 返回 Err，这一轮折在回收轮之前。
+        let kubectl = fake_kubectl_failing_times(&bin_dir, 1);
+        let mut cfg = test_config(root, &bare, "noop", &kubectl);
         cfg.registry_claim = "cogneva-registry-pvc".into();
         let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
-        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
-            .with_metrics(metrics.clone());
+        let deployer =
+            MainlineDeployer::new(cfg, test_workspaces(root, &bare)).with_metrics(metrics.clone());
 
-        let mut state = MainlineState {
-            in_flight: Some(InFlight {
-                rev: "000000000004".into(),
-                phase: Phase::Dispatched,
-            }),
-            ..MainlineState::default()
-        };
-        deployer
-            .registry_maintenance_round("000000000004", &[], &mut state)
-            .await;
+        let folded = deployer.poll_once().await;
+        assert!(
+            folded.is_err(),
+            "这一轮必须真的折在 `deployed_images` 上，否则这条判据没测到它要测的那一站"
+        );
 
         let owed = metrics
             .query_gauge_latest(cog_core::metric_names::REGISTRY_GC_OWED.as_str())
@@ -14119,11 +14154,11 @@ exit 0
             .unwrap();
         assert!(
             !owed.is_empty(),
-            "在飞滚动挡的是回收动作，欠账读数仍要每轮落一格：不落就没有伴生钟的时间戳推进，\
-             读它的规则会拿一个冻住的伴生钟当作写者停了，把判据关掉"
+            "折在 `deployed_images` 上的轮也必须把欠账那格发出去：不发就没有伴生钟的时间戳\
+             推进，读它的规则会拿一个冻住的伴生钟当作写者停了，把判据关掉"
         );
         assert_eq!(owed[0].value, 0.0, "默认没欠账");
-        // "一次都没走完过"那格的种子同样在早退之前：它要在最该成立的部署上也在面上。
+        // "一次都没走完过"那格的种子同样要排在早退之前：它要在最该成立的部署上也在面上。
         assert!(
             !metrics
                 .query_gauge_latest(
@@ -14132,14 +14167,8 @@ exit 0
                 .await
                 .unwrap()
                 .is_empty(),
-            "「一次都没走完过」的种子也被在飞早退挡住了"
+            "「一次都没走完过」的种子也被 `deployed_images` 那道早退挡住了"
         );
-        // 回收动作本身仍然要等：这一轮没开（冷却时刻没被消耗），registry 也没被动过。
-        assert_eq!(
-            state.registry_maintenance_unix, 0,
-            "在飞滚动时回收动作不该开跑"
-        );
-        assert!(!state.registry_gc_owed, "这一轮没有制造欠账");
     }
 
     #[tokio::test]
