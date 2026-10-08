@@ -7761,6 +7761,30 @@ impl RolloutExecutor {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
+    /// 落一份清单文件（支撑集、目标部署清单）——走**服务端** apply，与发布那一步
+    /// （`apply_stdin_with`）同一个理由。
+    ///
+    /// 客户端 apply 会把整个对象序列化进
+    /// `kubectl.kubernetes.io/last-applied-configuration` 注解，而注解与对象上别的
+    /// 一切**合计**有 262144 字节的硬顶。支撑集里装的正是随每一轮发布一起长的配置
+    /// 对象：实测那个 `cogneva-json` ConfigMap 一个就是 196164 字节，其中约三分之二
+    /// 是告警规则（104 条、每条约 1.3 KB），也就是离顶只剩五十来条规则。真到了那一
+    /// 天，装不下它的客户端 apply 会让每一轮滚动都在**第一个动作**上中止，而这一步
+    /// 失败按「发布集自己坏了」记成版本缺陷——一份好清单带着"这一版坏了"的判词停下，
+    /// 而修法（改交付方式）恰好在被它自己挡住的那条路上。发布那一步已经因为同一个顶
+    /// 改走服务端，这里是同一段路的下一截。
+    ///
+    /// `--force-conflicts` 的对手只可能是这边自己留下的旧对象（安装期的客户端 apply、
+    /// 以及按 label 的尽力清扫可能没删掉的残件），冲突方不是别的写者——所以接管是对的。
+    /// 缺了它，一条清理失败就会把发布永久卡死，而那正是这条路径要修的那种故障。
+    async fn apply_manifest_file(&self, path: &str, timeout_secs: u64) -> SFResult<String> {
+        self.run_kubectl(
+            &["apply", "-f", path, "--server-side", "--force-conflicts"],
+            timeout_secs,
+        )
+        .await
+    }
+
     async fn set_image(&self, t: &RolloutTarget, image: &str) -> SFResult<()> {
         let image_arg = format!("{}={}", t.container, image);
         self.run_kubectl(
@@ -7807,9 +7831,7 @@ impl RolloutExecutor {
                     );
                     let outcome = async {
                         self.clear_superseded_env_values(&staged_path).await?;
-                        self.run_kubectl(&["apply", "-f", &path_arg], 60)
-                            .await
-                            .map(|_| ())
+                        self.apply_manifest_file(&path_arg, 60).await.map(|_| ())
                     }
                     .await;
                     // 这份暂存件只服务这一次 apply，名字又按实例唯一（不再被下一轮覆盖），
@@ -9043,7 +9065,7 @@ impl RolloutExecutor {
                         );
                         let outcome = async {
                             self.clear_superseded_env_values(&path).await?;
-                            self.run_kubectl(&["apply", "-f", &support_arg], 120)
+                            self.apply_manifest_file(&support_arg, 120)
                                 .await
                                 .map(|_| ())
                         }
@@ -16365,6 +16387,21 @@ exit 0
         executor.run(&plan).await.unwrap();
 
         let calls = std::fs::read_to_string(&log).unwrap();
+        // 支撑集必须走服务端 apply。客户端 apply 会把整个对象塞进
+        // `kubectl.kubernetes.io/last-applied-configuration` 注解，而那条注解与对象上
+        // 别的一切合计 262144 字节硬顶；支撑集里那个配置对象实测已到 196164 字节，其中
+        // 三分之二是随每一轮发布增长的告警规则——装不下时每一轮滚动都在第一个动作上
+        // 中止，而这次中止会被记成"这一版坏了"。
+        let support_at = calls.find("apply -f ").expect("support set not applied");
+        let support_end = calls[support_at..]
+            .find('\n')
+            .map(|i| support_at + i)
+            .unwrap_or(calls.len());
+        let support_argv = &calls[support_at..support_end];
+        assert!(
+            support_argv.contains("--server-side") && support_argv.contains("--force-conflicts"),
+            "the support set must not go through a client-side apply: {support_argv}"
+        );
         // 按字节位置比而不是按行：假 kubectl 用 `echo "$@"` 落日志，实参里的
         // `\n`（jsonpath 的换行转义）会被 sh 的 echo 展开成真换行，行切分靠不住。
         let first_target = calls.find("set image ").expect("no target rolled");
@@ -16959,7 +16996,7 @@ spec:
     async fn the_staged_manifest_is_removed_after_the_apply() {
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().to_path_buf();
-        let (manifests, _log) = fake_kubectl_config_effect(&bin_dir, false);
+        let (manifests, log) = fake_kubectl_config_effect(&bin_dir, false);
         // 包里得真有一份目标清单，`apply_target` 才走暂存那条路（没有就回落 `set image`，
         // 而那样根本没有暂存件可谈）。
         std::fs::write(
@@ -17001,6 +17038,22 @@ spec:
         assert!(
             !Path::new(path).exists(),
             "the staged manifest outlived the apply that used it: {path}"
+        );
+
+        // 两个调用点都必须走服务端 apply，一处漏了就够把滚动挡住：支撑集里那个随规则
+        // 增长的配置对象，与目标清单同属一份发布集，客户端 apply 的 262144 字节注解顶
+        // 对两者一视同仁。计数而不是逐句断言——假 kubectl 的日志把每次调用首尾相连地
+        // 写在一起（见上面 `staged_path_file` 那段的理由），按子串计数是这里唯一稳的形状。
+        let calls = std::fs::read_to_string(&log).unwrap();
+        let applies = calls.matches("apply -f ").count();
+        assert!(
+            applies >= 2,
+            "expected the support set and the target manifest both applied: {calls}"
+        );
+        assert_eq!(
+            applies,
+            calls.matches("--server-side --force-conflicts").count(),
+            "a file apply went back through the client-side path: {calls}"
         );
     }
 
