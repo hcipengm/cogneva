@@ -36,6 +36,11 @@ use crate::config::InfraWatchConfig;
 /// not the thing being watched. Keeping them in the dedup key would fork a
 /// new alert row every time the monitoring stack reschedules its own pods.
 ///
+/// They are excluded from the *stored* labels too, not just the key: for a
+/// series every deployment's endpoint serves, they name whichever pod answered
+/// that tick, so a row carrying them reports a subject that did not produce the
+/// reading — and those labels are what the remediation goal text is built from.
+///
 /// `namespace` and `container` are deliberately absent. They read as scrape
 /// labels only while every rule happens to be scoped to one namespace with one
 /// container per pod; the moment a rule spans namespaces, leaving them out
@@ -415,15 +420,36 @@ fn urlencoding(text: &str) -> String {
     out
 }
 
-/// Stable alert-instance identity: rule name + sorted identity labels.
-fn dedup_key(rule_name: &str, labels: &BTreeMap<String, String>) -> String {
-    let identity = labels
+/// The labels that identify the instance: everything but the scrape's own.
+/// Used both for the dedup key and for what a row stores, so the two can never
+/// disagree about which labels are the subject.
+fn identity_labels(labels: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    labels
         .iter()
         .filter(|(k, _)| !NON_IDENTITY_LABELS.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// Stable alert-instance identity: rule name + sorted identity labels.
+fn dedup_key(rule_name: &str, labels: &BTreeMap<String, String>) -> String {
+    let identity = identity_labels(labels)
+        .iter()
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join(",");
     format!("{rule_name}:{identity}")
+}
+
+/// Labels carried by a stored/notified alert: the instance's identity labels
+/// plus the rendered message and the source. Built from [`identity_labels`] so
+/// the row's subject is the same one the key was computed for — a scrape label
+/// here would name a pod that merely served the metric.
+fn alert_labels(sample: &SeriesSample, message: &str) -> HashMap<String, String> {
+    let mut labels: HashMap<String, String> = identity_labels(&sample.labels).into_iter().collect();
+    labels.insert("message".into(), message.to_string());
+    labels.insert("source".into(), "infra_watch".into());
+    labels
 }
 
 /// Report one sighting to the store and notify on the edge.
@@ -439,13 +465,7 @@ async fn report_sighting(
     outlets: &InfraWatchOutlets,
 ) {
     let message = render_summary(&rule.summary, sample.value, &sample.labels);
-    let mut labels: HashMap<String, String> = sample
-        .labels
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    labels.insert("message".into(), message.clone());
-    labels.insert("source".into(), "infra_watch".into());
+    let labels = alert_labels(sample, &message);
 
     if let Some(store) = &outlets.store {
         let alert = NewAlert {
@@ -905,6 +925,64 @@ mod tests {
         let mut elsewhere = b.clone();
         elsewhere.insert("namespace".to_string(), "cogneva".to_string());
         assert_ne!(dedup_key("crash", &b), dedup_key("crash", &elsewhere));
+    }
+
+    /// The live reading this comes from: a store-held series is rendered by
+    /// every deployment that scrapes the endpoint, so the sample that reports a
+    /// sighting carries the *answering pod's* job/service. Stored as written,
+    /// `memory_raw_backlog_aged_out` was persisted naming `cogneva-evolution`
+    /// while only the `cogneva` deployment produces the reading — and those
+    /// labels are what the remediation goal text is built from. The subject a
+    /// row names must be the one the dedup key was computed for.
+    #[test]
+    fn a_stored_alert_names_the_instance_and_not_the_scrape() {
+        let s = sample(
+            &[
+                ("node", "vm-1"),
+                ("namespace", "cogneva"),
+                ("pod", "cogneva-evolution-6c5cb5669d-grvst"),
+                ("job", "cogneva-evolution"),
+                ("service", "cogneva-evolution"),
+                ("endpoint", "http"),
+                ("prometheus", "monitoring"),
+                ("__name__", "m"),
+            ],
+            1.0,
+        );
+        let labels = alert_labels(&s, "backlog aged out");
+
+        assert_eq!(labels.get("node").map(String::as_str), Some("vm-1"));
+        assert_eq!(
+            labels.get("namespace").map(String::as_str),
+            Some("cogneva"),
+            "namespace distinguishes victims and must survive"
+        );
+        assert_eq!(
+            labels.get("pod").map(String::as_str),
+            Some("cogneva-evolution-6c5cb5669d-grvst"),
+            "which pod is the victim must survive"
+        );
+        assert_eq!(
+            labels.get("message").map(String::as_str),
+            Some("backlog aged out")
+        );
+        assert_eq!(
+            labels.get("source").map(String::as_str),
+            Some("infra_watch")
+        );
+        for gone in ["job", "service", "endpoint", "prometheus", "__name__"] {
+            assert!(
+                !labels.contains_key(gone),
+                "{gone} names the scrape, not the subject: storing it re-attaches \
+                 a pod that merely served the metric"
+            );
+        }
+        // The stored labels and the key must agree on the subject: a caller
+        // cannot see both and believe two different things caused the row.
+        assert_eq!(
+            dedup_key("aged_out", &s.labels),
+            "aged_out:namespace=cogneva,node=vm-1,pod=cogneva-evolution-6c5cb5669d-grvst"
+        );
     }
 
     fn sample(pairs: &[(&str, &str)], value: f64) -> SeriesSample {
