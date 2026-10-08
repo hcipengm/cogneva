@@ -144,6 +144,28 @@ metric_names! {
     METRICS_SAMPLE_SWEEP_FAILED => "metrics_sample_sweep_failed",
     TIER_MIGRATION_TOTAL => "tier_migration_total",
 
+    // cog-storage — the monthly partition maintenance loop's per-round outcome.
+    //
+    // The loop keeps every time-series parent's window open ahead of the clock
+    // and its DEFAULT partition empty; a table with no partition covering a
+    // row's key rejects the insert and takes down whatever carried it. Its
+    // *liveness* already has a reader -- it is on the supervised cadence,
+    // `cogneva_loop_tick_age_seconds{loop="storage_partition_maintenance"}`
+    // stops advancing when the task is gone, and background_loop_stalled says
+    // so. What had no reader was the loop *doing its job* and coming up short:
+    // a step that failed, and a table whose DEFAULT partition was found holding
+    // rows (the window fell behind), both went to a `warn!` that dies with the
+    // pod -- so a round that failed every hour and an instance with nothing to
+    // open are the same picture on every reading. This is that missing face,
+    // one cell per cause, labelled by `reason`.
+    //
+    // A cell is written only when its cause occurs. The closed set is declared
+    // in the producing module, so a reader enumerates it and reads an absent
+    // cell as zero; seeding four zeros into the store every round would spend
+    // durable rows -- in the very sample log whose capacity is itself read and
+    // bounded -- to restate a set the code already states.
+    PARTITION_MAINTENANCE_FAILURES_TOTAL => "cogneva_partition_maintenance_failures_total",
+
     // cog-reflection — workspace index and generated-change fidelity.
     WORKTREE_INDEX_PRESENT => "cogneva_worktree_index_present",
     WORKTREE_INDEX_MISSING_FILES => "cogneva_worktree_index_missing_files",

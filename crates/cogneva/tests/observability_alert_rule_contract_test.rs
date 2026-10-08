@@ -1735,6 +1735,10 @@ const UNREAD: &[(&str, Unread)] = &[
         "baseline_port_tick_failed",
         Unread::Gap("the baseline port trigger's per-round outcome, written every round. The reading landed because the whole outcome path had no reader at all: the trigger is on a supervised cadence, so its liveness is read, but a round that failed and a round with nothing to port were the same picture -- the failure went to a log line that dies with the pod, and an execute failure was even swallowed back into Ok so the round read as a success. What is still missing is a rule, and a rule here would have to say how many failed rounds in a window are a fault, which is a threshold on a loop that polls hourly and retries on a cooldown: a policy nobody declared. Writing that rule is also an alert-rule change, which needs sign-off before it lands, so the reading ships with its debt recorded rather than left absent"),
     ),
+    (
+        "cogneva_partition_maintenance_failures_total",
+        Unread::Gap("the monthly partition maintenance loop's per-round outcome, one cell per cause. The whole path had no reading at all before this pass: the loop is on a supervised cadence, so its liveness is read, but a step that failed and a table whose DEFAULT partition was found holding rows went to log lines that die with the pod -- and a DEFAULT count that could not be read was indistinguishable from one that came back zero. What is still missing is a rule, and a rule here would have to say how many shortfalls in a window are a fault and whether window_behind (the window fell behind, rows are outside every open range) is the same fault as a refused CREATE or a count that could not be read. That is a threshold and a policy on a loop that runs hourly: nobody declared either. Every adjacent gap in this family was closed by writing a rule, and writing one is an alert-rule change, which needs sign-off before it lands, so the reading ships with its debt recorded rather than left absent"),
+    ),
 ];
 
 /// Entries an `Elsewhere` reader claim cannot be resolved against.
@@ -1763,7 +1767,7 @@ fn unresolved_readers(read: &BTreeSet<String>, name: &str, readers: &[&str]) -> 
 /// completion cadence is already read against *is* that budget. The two entries
 /// left the table in the pass that wrote `buildah_store_round_incomplete`, so
 /// 23 became 21.
-const GAPS_AT_CENSUS: usize = 22;
+const GAPS_AT_CENSUS: usize = 23;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {

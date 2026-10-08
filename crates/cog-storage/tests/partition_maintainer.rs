@@ -16,6 +16,7 @@
 
 use chrono::{Datelike, NaiveDate, TimeZone, Utc};
 use sqlx::PgPool;
+use std::sync::Arc;
 
 use cog_core::{RawFileFormat, RawLogIndexEntry, RawLogIndexStore, RawLogQuery, StorageTier};
 use cog_storage::partition_maintainer::{PartitionMaintainer, PartitionedTable};
@@ -154,6 +155,50 @@ async fn rows_parked_in_default_are_moved_when_their_partition_appears() {
     maintainer.maintain().await.unwrap();
     assert_eq!(count_in(&pool, &name).await, 1);
     assert_eq!(count_in(&pool, &default).await, 0);
+
+    drop_probe(&pool, TABLE).await;
+}
+
+/// A row outside every maintained month has only DEFAULT to fall into. Parking
+/// there means the window fell behind, and the round is the only thing that can
+/// see it, so it has to leave that fact on a reading rather than only in a log
+/// line that dies with the pod.
+#[tokio::test]
+#[ignore = "requires COGNEVA_TEST_DATABASE_URL pointing at a live PostgreSQL"]
+async fn a_table_holding_rows_in_default_is_reported_as_behind() {
+    use cog_core::MetricsBackend as _;
+    const TABLE: &str = "partition_maintainer_probe_behind";
+    let pool = PgPool::connect(&database_url()).await.unwrap();
+    fresh_probe(&pool, TABLE).await;
+
+    let metrics = Arc::new(cog_storage::MemoryMetricsBackend::new());
+    let maintainer = PartitionMaintainer::new(pool.clone(), vec![probe_table(TABLE)])
+        .with_metrics(Some(metrics.clone()));
+    maintainer.maintain().await.unwrap();
+
+    // Far enough ahead that no partition this task opens covers it, so it can
+    // only land in DEFAULT.
+    let (default, _) = probe_names(TABLE);
+    let far = Utc::now().date_naive() + chrono::Months::new(24);
+    let start = month_start(far.year(), far.month());
+    insert_at(&pool, TABLE, &format!("{start} 12:00:00+00")).await;
+    assert_eq!(count_in(&pool, &default).await, 1);
+
+    maintainer.maintain().await.unwrap();
+
+    let totals = metrics
+        .query_counter_totals("cogneva_partition_maintenance_failures_total")
+        .await
+        .unwrap();
+    let behind = totals.iter().find(|s| {
+        s.labels.get("reason").map(String::as_str)
+            == Some(cog_storage::partition_maintainer::MaintenanceFailure::WindowBehind.as_str())
+    });
+    assert_eq!(
+        behind.map(|s| s.value),
+        Some(1.0),
+        "a row parked in DEFAULT was not reported as the window being behind"
+    );
 
     drop_probe(&pool, TABLE).await;
 }

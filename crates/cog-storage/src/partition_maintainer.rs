@@ -11,6 +11,7 @@
 //! Rows landing in DEFAULT mean the window fell behind, so they are counted
 //! and reported rather than silently accumulated.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -62,16 +63,97 @@ const MONTHS_BEHIND: i32 = 1;
 /// Loop name reported through the background-loop liveness family.
 pub const PARTITION_MAINTENANCE_LOOP: &str = "storage_partition_maintenance";
 
+/// The ways a maintenance round comes up short.
+///
+/// A closed set: the `reason` label carries one of these words and nothing
+/// else, so a reader writes the query against the cause rather than guessing
+/// at the spelling. Every cause is one the round can actually distinguish --
+/// "a step failed" is not one entry because the failure that matters is which
+/// step, and "the window is behind" is not a step failure at all but the
+/// condition the round exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenanceFailure {
+    /// A table's DEFAULT partition could not be created or confirmed.
+    DefaultPartitionMissing,
+    /// A monthly partition could not be opened or attached.
+    MonthPartitionMissing,
+    /// A table's DEFAULT partition could not be counted, so whether it holds
+    /// rows is unknown -- which is not the same reading as holding none.
+    DefaultBacklogUnreadable,
+    /// A table's DEFAULT partition holds rows: the window fell behind, and
+    /// those rows are outside every open monthly range.
+    WindowBehind,
+}
+
+impl MaintenanceFailure {
+    /// Every cause, in the order the label values are listed, so a reader can
+    /// enumerate the closed set without reading the match below.
+    pub const ALL: [MaintenanceFailure; 4] = [
+        MaintenanceFailure::DefaultPartitionMissing,
+        MaintenanceFailure::MonthPartitionMissing,
+        MaintenanceFailure::DefaultBacklogUnreadable,
+        MaintenanceFailure::WindowBehind,
+    ];
+
+    /// The label value, which is also the word to search the source for.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MaintenanceFailure::DefaultPartitionMissing => "default_partition_missing",
+            MaintenanceFailure::MonthPartitionMissing => "month_partition_missing",
+            MaintenanceFailure::DefaultBacklogUnreadable => "default_backlog_unreadable",
+            MaintenanceFailure::WindowBehind => "window_behind",
+        }
+    }
+}
+
 /// Opens monthly partitions ahead of the clock and installs a DEFAULT
 /// partition per table.
 pub struct PartitionMaintainer {
     pool: PgPool,
     tables: Vec<PartitionedTable>,
+    /// The face the round's outcome is written to. Absent when no metrics
+    /// backend was published: the round runs either way, and the reading is
+    /// simply not produced.
+    metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
 }
 
 impl PartitionMaintainer {
     pub fn new(pool: PgPool, tables: Vec<PartitionedTable>) -> Self {
-        Self { pool, tables }
+        Self {
+            pool,
+            tables,
+            metrics: None,
+        }
+    }
+
+    /// Attach the backend the round's outcome is written to. Absent is a
+    /// supported state the round tolerates; it is not an error.
+    pub fn with_metrics(mut self, metrics: Option<Arc<dyn cog_core::MetricsBackend>>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Stamp one shortfall of this round into its own cell.
+    ///
+    /// A failure to write the reading is logged and dropped: the round's work
+    /// is done either way, and a reading that cannot be written must not turn
+    /// into a failed round.
+    async fn report_failure(&self, reason: MaintenanceFailure) {
+        let Some(ref metrics) = self.metrics else {
+            return;
+        };
+        let mut labels = HashMap::new();
+        labels.insert("reason".to_string(), reason.as_str().to_string());
+        if let Err(e) = metrics
+            .record_counter(
+                cog_core::metric_names::PARTITION_MAINTENANCE_FAILURES_TOTAL,
+                1.0,
+                labels,
+            )
+            .await
+        {
+            warn!(error = %e, "partition maintenance failure emit failed");
+        }
     }
 
     /// Run once immediately, then every `interval_secs` until shutdown.
@@ -123,12 +205,16 @@ impl PartitionMaintainer {
         for table in &self.tables {
             if let Err(e) = self.ensure_default(table).await {
                 warn!(table = table.parent, error = %e, "DEFAULT partition missing");
+                self.report_failure(MaintenanceFailure::DefaultPartitionMissing)
+                    .await;
                 failures += 1;
                 continue;
             }
             for month in from_month..=to_month {
                 if let Err(e) = self.ensure_month(table, month).await {
                     warn!(table = table.parent, month, error = %e, "monthly partition missing");
+                    self.report_failure(MaintenanceFailure::MonthPartitionMissing)
+                        .await;
                     failures += 1;
                 }
             }
@@ -306,11 +392,20 @@ impl PartitionMaintainer {
             "SELECT count(*) FROM ONLY {default}",
             default = quote_ident(&default_name(table)),
         );
-        let backlog: i64 = sqlx::query_scalar(&sql)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| SFError::Database(e.to_string()))?;
+        let backlog: i64 = match sqlx::query_scalar(&sql).fetch_one(&self.pool).await {
+            Ok(n) => n,
+            Err(e) => {
+                // Whether rows are parked here is now unknown, which is not the
+                // same reading as holding none: a failed count gets its own
+                // cell, so a DEFAULT that could not be inspected is never read
+                // as a clean one.
+                self.report_failure(MaintenanceFailure::DefaultBacklogUnreadable)
+                    .await;
+                return Err(SFError::Database(e.to_string()));
+            }
+        };
         if backlog > 0 {
+            self.report_failure(MaintenanceFailure::WindowBehind).await;
             warn!(
                 table = table.parent,
                 rows = backlog,
@@ -408,5 +503,99 @@ mod tests {
             "explainability_y2026m07"
         );
         assert_eq!(default_name(explainability), "explainability_default");
+    }
+
+    #[test]
+    fn each_failure_reason_has_a_distinct_label() {
+        let labels: Vec<&str> = MaintenanceFailure::ALL.iter().map(|r| r.as_str()).collect();
+        let mut distinct = labels.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            labels.len(),
+            "two failure reasons share a label value"
+        );
+        // The word is the handle a reader's query holds, so an empty one names
+        // a cell no query can reach.
+        for value in labels {
+            assert!(!value.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reported_failure_lands_in_its_reason_cell() {
+        use cog_core::MetricsBackend as _;
+        use std::sync::Arc;
+
+        let metrics = Arc::new(crate::MemoryMetricsBackend::new());
+        let pool = sqlx::PgPool::connect_lazy("postgres://127.0.0.1:1/cogneva").unwrap();
+        let maintainer =
+            PartitionMaintainer::new(pool, Vec::new()).with_metrics(Some(metrics.clone()));
+
+        maintainer
+            .report_failure(MaintenanceFailure::WindowBehind)
+            .await;
+        maintainer
+            .report_failure(MaintenanceFailure::WindowBehind)
+            .await;
+        maintainer
+            .report_failure(MaintenanceFailure::MonthPartitionMissing)
+            .await;
+
+        let totals = metrics
+            .query_counter_totals(
+                cog_core::metric_names::PARTITION_MAINTENANCE_FAILURES_TOTAL.as_str(),
+            )
+            .await
+            .unwrap();
+        let cell = |reason: &str| {
+            totals
+                .iter()
+                .find(|s| s.labels.get("reason").map(String::as_str) == Some(reason))
+                .map(|s| s.value)
+        };
+        assert_eq!(cell("window_behind"), Some(2.0));
+        assert_eq!(cell("month_partition_missing"), Some(1.0));
+        // A reason that did not occur has no cell at all: the set is declared
+        // in the code a reader enumerates, not seeded per round, so absence is
+        // the reading for "has not happened".
+        assert_eq!(cell("default_partition_missing"), None);
+    }
+
+    /// A round whose statements all fail is the shape a misconfigured pool
+    /// produces, and it has to leave the reason it failed behind rather than
+    /// only a log line. Nothing connects here: the lazy pool refuses every use,
+    /// so this needs no live database.
+    #[tokio::test]
+    async fn a_round_that_cannot_reach_the_database_reports_why() {
+        use cog_core::MetricsBackend as _;
+        use std::sync::Arc;
+
+        let metrics = Arc::new(crate::MemoryMetricsBackend::new());
+        let pool = sqlx::PgPool::connect_lazy("postgres://127.0.0.1:1/cogneva").unwrap();
+        let maintainer = PartitionMaintainer::new(
+            pool,
+            vec![PartitionedTable::new("probe", "ts", "probe_part")],
+        )
+        .with_metrics(Some(metrics.clone()));
+
+        assert!(maintainer.maintain().await.is_err());
+
+        let totals = metrics
+            .query_counter_totals(
+                cog_core::metric_names::PARTITION_MAINTENANCE_FAILURES_TOTAL.as_str(),
+            )
+            .await
+            .unwrap();
+        let missing = totals.iter().find(|s| {
+            s.labels.get("reason").map(String::as_str)
+                == Some(MaintenanceFailure::DefaultPartitionMissing.as_str())
+        });
+        assert_eq!(
+            missing.map(|s| s.value),
+            Some(1.0),
+            "a round that could not create the DEFAULT partition reported no reason"
+        );
     }
 }

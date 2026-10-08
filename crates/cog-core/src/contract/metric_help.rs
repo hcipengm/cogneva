@@ -258,6 +258,24 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          that says whether the trigger lets the volume grow too full",
     ),
     (
+        "cogneva_partition_maintenance_failures_total",
+        "Ways a monthly partition maintenance round came up short, summed over \
+         rounds and labelled by the cause. The loop's liveness is read already \
+         -- its beat stops when the task is gone -- but its outcome was not: a \
+         step that failed and a table whose DEFAULT partition was found holding \
+         rows were both written to a log line that dies with the pod, so a round \
+         that failed every hour and an instance with nothing to open read the \
+         same. The reason values are a closed set the producing module declares: \
+         default_partition_missing and month_partition_missing when CREATE was \
+         refused, default_backlog_unreadable when the parked-row count could \
+         not be read, and window_behind when the count came back non-zero -- \
+         rows in DEFAULT mean the window fell behind and they are outside every \
+         open range. Written only when its cause occurs, because the closed set \
+         is declared in the code a reader can enumerate; a reader takes an \
+         absent cell as zero, and the rising-against-flat shape is what tells a \
+         failing loop from one with nothing to do",
+    ),
+    (
         "cogneva_mainline_superseded_rollout_total",
         "Rounds the deployer's guard answered that the revision it was carrying \
          had been overtaken upstream: 1 when it had (nothing is rolled out, the \

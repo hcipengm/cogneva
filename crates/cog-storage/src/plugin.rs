@@ -860,10 +860,19 @@ impl cog_core::SystemPlugin for StoragePlugin {
                 .consume::<cog_core::ShutdownSignal>()
                 .map(|s| (*s).clone())
                 .unwrap_or_default();
-            let maintainer = std::sync::Arc::new(crate::PartitionMaintainer::new(
-                pool,
-                crate::partition_maintainer::time_series_tables(),
-            ));
+            let pm_metrics = ctx.consume_service::<dyn cog_core::MetricsBackend>();
+            if pm_metrics.is_none() {
+                warn!(
+                    "MetricsBackend not published; partition maintenance outcomes will not be reported"
+                );
+            }
+            let maintainer = std::sync::Arc::new(
+                crate::PartitionMaintainer::new(
+                    pool,
+                    crate::partition_maintainer::time_series_tables(),
+                )
+                .with_metrics(pm_metrics),
+            );
             drop(maintainer.spawn(interval_secs, shutdown));
             info!("PartitionMaintainer started");
         } else {
