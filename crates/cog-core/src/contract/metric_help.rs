@@ -293,6 +293,21 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          failed cell rising, which is the loop not doing its job",
     ),
     (
+        "cogneva_analytics_flush_total",
+        "Events carried by each flush of the analytics event buffer, labelled \
+         by outcome. The flush loop's only other reading is its own beat, which \
+         is stamped every flush interval whether or not a batch was waiting, so \
+         delivering a batch to ClickHouse and failing to were the same picture \
+         -- and a failure loses the events: the insert consumes the batch, so \
+         nothing retries it and the loss survived only as a log line that dies \
+         with the pod. The values are a closed set the producing module \
+         declares: delivered (the batch reached ClickHouse) and failed (the \
+         insert returned an error and the batch was dropped). Read as the rate \
+         of failed against delivered: a failed cell rising over a flat \
+         delivered cell is the buffer losing events, which is a different fact \
+         from an idle buffer that has had nothing to send",
+    ),
+    (
         "cogneva_mainline_superseded_rollout_total",
         "Rounds the deployer's guard answered that the revision it was carrying \
          had been overtaken upstream: 1 when it had (nothing is rolled out, the \

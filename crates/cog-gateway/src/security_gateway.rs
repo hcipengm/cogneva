@@ -5310,10 +5310,15 @@ async fn build_pool_observability(
             None
         } else {
             tracing::info!(table = %obs.clickhouse.table, "ClickHouse 时序明细已接入");
+            // The flush loop's per-flush outcome reading needs a backend at
+            // construction; this is the one place in the gateway that both has
+            // it and starts the buffer.
+            let flush_metrics: Arc<dyn cog_core::MetricsBackend> = metrics.clone();
             Some(Arc::new(ClickHouseEventBuffer::new(
                 backend,
                 std::time::Duration::from_secs(obs.clickhouse.flush_interval_sec.max(1)),
                 obs.clickhouse.max_batch_size.max(1),
+                Some(flush_metrics),
             )))
         }
     } else {

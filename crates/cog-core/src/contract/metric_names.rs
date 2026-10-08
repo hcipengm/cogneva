@@ -237,6 +237,21 @@ metric_names! {
     // separate a round that never adopted from one that never had evidence to.
     POLICY_EVOLUTION_ROUNDS_TOTAL => "cogneva_policy_evolution_rounds_total",
 
+    // cog-observability — how each flush of the analytics event buffer ended,
+    // labelled by `outcome` and counting the events the batch carried.
+    //
+    // The loop's only reading was its own beat, cogneva_loop_tick_age_seconds,
+    // which is stamped on every flush interval whether or not a batch was
+    // waiting, so it cannot say whether anything reached ClickHouse: delivering
+    // a batch and failing to ship one read the same. The failure is a loss
+    // rather than a retry -- the insert consumes the batch, so a failed flush
+    // drops those events and only a WARN records it.
+    //
+    // A counter, because a flush is a cumulative event over the process's life;
+    // the two cells are the closed set of ends, so a reader can separate a
+    // buffer that has lost every batch from one that has had nothing to send.
+    ANALYTICS_FLUSH_TOTAL => "cogneva_analytics_flush_total",
+
     // cog-reflection — the registry store's capacity reclamation, read by the
     // process that reclaims it.
     //

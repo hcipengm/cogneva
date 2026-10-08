@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cog_core::{HttpClient, HttpRequest};
+use cog_core::{HttpClient, HttpRequest, MetricsBackend};
 
 /// Analytics event record.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -715,10 +715,42 @@ pub struct ClickHouseEventBuffer {
 }
 
 impl ClickHouseEventBuffer {
+    /// Record one flush attempt's fate on the analytics counter.
+    ///
+    /// `delivered` is true when the batch reached ClickHouse; `events` is how
+    /// many the batch carried. A failed attempt is a loss, not a retry — the
+    /// insert consumes the batch, so those events are gone and nothing sends
+    /// them again.
+    async fn record_flush(
+        metrics: &Option<Arc<dyn MetricsBackend>>,
+        delivered: bool,
+        events: usize,
+    ) {
+        let Some(metrics) = metrics else {
+            return;
+        };
+        let mut labels = HashMap::new();
+        labels.insert(
+            "outcome".to_string(),
+            if delivered { "delivered" } else { "failed" }.to_string(),
+        );
+        if let Err(e) = metrics
+            .record_counter(
+                cog_core::metric_names::ANALYTICS_FLUSH_TOTAL,
+                events as f64,
+                labels,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "analytics flush: could not record outcome");
+        }
+    }
+
     pub fn new(
         backend: std::sync::Arc<ClickHouseAnalyticsBackend>,
         flush_interval: std::time::Duration,
         max_batch_size: usize,
+        metrics: Option<Arc<dyn MetricsBackend>>,
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AnalyticsEvent>();
 
@@ -739,6 +771,7 @@ impl ClickHouseEventBuffer {
             move |beat| {
                 let backend = std::sync::Arc::clone(&backend);
                 let rx = std::sync::Arc::clone(&rx);
+                let metrics = metrics.clone();
                 async move {
                     // One batch per attempt: a panic loses the events in hand
                     // that have not been flushed yet, not everything since that
@@ -756,8 +789,18 @@ impl ClickHouseEventBuffer {
                                         &mut buffer,
                                         Vec::with_capacity(max_batch_size),
                                     );
-                                    if let Err(e) = backend.insert_batch(batch).await {
-                                        tracing::warn!("ClickHouse background flush failed: {}", e);
+                                    let events = batch.len();
+                                    match backend.insert_batch(batch).await {
+                                        Ok(()) => {
+                                            Self::record_flush(&metrics, true, events).await
+                                        }
+                                        Err(e) => {
+                                            Self::record_flush(&metrics, false, events).await;
+                                            tracing::warn!(
+                                                "ClickHouse background flush failed: {}",
+                                                e
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -767,8 +810,18 @@ impl ClickHouseEventBuffer {
                                         &mut buffer,
                                         Vec::with_capacity(max_batch_size),
                                     );
-                                    if let Err(e) = backend.insert_batch(batch).await {
-                                        tracing::warn!("ClickHouse background flush failed: {}", e);
+                                    let events = batch.len();
+                                    match backend.insert_batch(batch).await {
+                                        Ok(()) => {
+                                            Self::record_flush(&metrics, true, events).await
+                                        }
+                                        Err(e) => {
+                                            Self::record_flush(&metrics, false, events).await;
+                                            tracing::warn!(
+                                                "ClickHouse background flush failed: {}",
+                                                e
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -828,5 +881,41 @@ mod tests {
             url.contains("INSERT+INTO+llm_events+FORMAT+JSONEachRow"),
             "{url}"
         );
+    }
+
+    /// 每一笔刷写落在唯一一格上，格值＝这一批携带的事件数。两格名字互不相同，
+    /// 所以「送达到 ClickHouse」与「插不进、整批被丢」在读数面可分——前者是
+    /// 交付，后者是丢失，而不是同一个数。
+    #[tokio::test]
+    async fn every_flush_lands_in_exactly_one_cell() {
+        let metrics = Arc::new(crate::metrics::PrometheusMetricsBackend::new(""));
+        let handle: Option<Arc<dyn MetricsBackend>> = Some(metrics.clone());
+
+        ClickHouseEventBuffer::record_flush(&handle, true, 3).await;
+        ClickHouseEventBuffer::record_flush(&handle, false, 5).await;
+
+        let totals = metrics
+            .query_counter_totals("cogneva_analytics_flush_total")
+            .await
+            .expect("counter totals are readable from the registry");
+        assert_eq!(totals.len(), 2, "one series per outcome: {totals:?}");
+
+        let value_of = |outcome: &str| {
+            totals
+                .iter()
+                .find(|s| s.labels.get("outcome").map(String::as_str) == Some(outcome))
+                .map(|s| s.value)
+        };
+        assert_eq!(value_of("delivered"), Some(3.0));
+        assert_eq!(value_of("failed"), Some(5.0));
+    }
+
+    /// 没有 backend 时刷写的结局无处可写，但让循环崩掉不是可选项：record_flush
+    /// 必须安静返回，既不 panic 也不建任何序列。
+    #[tokio::test]
+    async fn a_missing_backend_records_nothing_and_does_not_panic() {
+        let handle: Option<Arc<dyn MetricsBackend>> = None;
+        ClickHouseEventBuffer::record_flush(&handle, false, 7).await;
+        ClickHouseEventBuffer::record_flush(&handle, true, 7).await;
     }
 }

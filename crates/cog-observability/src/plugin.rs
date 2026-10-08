@@ -185,6 +185,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                 backend.clone(),
                 std::time::Duration::from_secs(observability.clickhouse.flush_interval_sec),
                 observability.clickhouse.max_batch_size,
+                ctx.consume_service::<dyn cog_core::MetricsBackend>(),
             ));
             ctx.publish(backend.clone());
             ctx.publish(buffer.clone());
