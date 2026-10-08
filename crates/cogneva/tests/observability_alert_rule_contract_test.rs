@@ -1210,11 +1210,12 @@ fn a_rule_guarding_the_census_waits_longer_than_the_census_heartbeat() {
 /// deployer sitting between two stamps, and the rule goes quiet on the one state
 /// it exists for.
 ///
-/// The family swept here is the two series one emission point publishes -- the
-/// index-present stat and the missing-files count -- rather than the one series
-/// this test was written for. Both are stamped by the same heartbeat, so a sweep
-/// that named one of them passes while its sibling's guard goes quiet on a
-/// working tree; the denominator is counted per series for exactly that reason.
+/// The family swept here is the three series one emission point publishes -- the
+/// index-present stat, the missing-files count, and the outcome of the attempt
+/// itself -- rather than the one series this test was written for. All three are
+/// stamped by the same heartbeat, so a sweep that named one of them passes while
+/// its siblings' guards go quiet on a working tree; the denominator is counted
+/// per series for exactly that reason.
 ///
 /// Neither number is written into this test -- the bound comes out of the
 /// shipped expression and the heartbeat out of the sampler -- because a bound
@@ -1225,11 +1226,12 @@ fn a_rule_guarding_the_index_sample_waits_longer_than_its_heartbeat() {
     let heartbeat = cog_reflection::workspace::INDEX_SAMPLE_HEARTBEAT.as_secs();
     assert!(heartbeat > 0, "索引采样心跳为 0，下面这条判据恒真");
 
-    // 按产出点钉族：两格都由 `WorkspaceManager::sample_index_health_of` 发出、
+    // 按产出点钉族：三格都由 `WorkspaceManager::sample_index_health_of` 发出、
     // 都由同一道心跳盖章。
     let family = [
         cog_core::metric_names::WORKTREE_INDEX_PRESENT.as_str(),
         cog_core::metric_names::WORKTREE_INDEX_MISSING_FILES.as_str(),
+        cog_core::metric_names::WORKTREE_INDEX_SAMPLE_INCOMPLETE.as_str(),
     ];
     for metric in family {
         let mut guarded = 0usize;

@@ -610,6 +610,17 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          about to be rebuilt rather than refreshed",
     ),
     (
+        "cogneva_worktree_index_sample_incomplete",
+        "Whether a resident worktree's index sample could not be completed by \
+         its last attempt, 1 or 0, by worktree. The missing-files count is \
+         written only once both git reads succeed, so an index that is there \
+         and cannot be counted leaves that series at its last value -- the \
+         healthy one -- where its own age guard goes on to close the rule over \
+         it. This is the reading that says the sample itself failed rather \
+         than the tree being fine; it is written on every attempt, so a tree \
+         whose samples complete keeps it at 0",
+    ),
+    (
         "cogneva_registry_maintenance_reading_unix",
         "When a registry maintenance round last finished, as a Unix timestamp. \
          Written only on completion, so a value that stops advancing is the age \

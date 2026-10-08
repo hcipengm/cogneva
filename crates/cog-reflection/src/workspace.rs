@@ -34,6 +34,14 @@ pub use cog_core::metric_names::WORKTREE_INDEX_MISSING_FILES as WORKTREE_INDEX_M
 /// 大小，这一条把两者分开：前者是文件被删或没挂上，后者是写到一半被截断。
 pub use cog_core::metric_names::WORKTREE_INDEX_PRESENT as WORKTREE_INDEX_PRESENT_METRIC;
 
+/// 这一棵工作树的**这次采样尝试**有没有取到数：取到记 0，任一条 git 读数失败记 1。
+///
+/// 上一条读数只在两笔 git 读数都成功时才盖章，所以"索引在、但读不出来"会让它停在
+/// 上一笔（健康的）值上；读它的规则按伴生钟年龄判写者还在不在，而伴生钟冻住之后
+/// 规则是**变静**而不是变红——「采样取不到」与「索引没事」于是在面上同形。这一格
+/// 就是那件事自己的读数。
+pub use cog_core::metric_names::WORKTREE_INDEX_SAMPLE_INCOMPLETE as WORKTREE_INDEX_SAMPLE_INCOMPLETE_METRIC;
+
 /// 一棵常驻工作树的索引读数多久必须重盖一次章。
 ///
 /// 这棵树只在**即将被 `reset --hard`** 的那一刻被采（见
@@ -502,8 +510,11 @@ impl WorkspaceManager {
             return;
         };
         let labels = HashMap::from([("worktree".to_string(), id.to_string())]);
-        // 存在性先报：它只要一次 stat，后面两条 git 读数都失败时这一条仍然前进，
-        // 采样停摆因此不会被读成"一切正常"。
+        // 存在性先报：它只要一次 stat，后面两条 git 读数都失败时这一条仍然前进。
+        // 但"这一条还在前进"只说得清文件在不在，说不清采样取没取到数——索引在、
+        // 却读不出来时它照样报 1，而另一笔读数停在上一笔值上。采样停摆由下面单独
+        // 那一格说（`WORKTREE_INDEX_SAMPLE_INCOMPLETE_METRIC`），这两笔读数谁都
+        // 替不了它。
         let present = tokio::fs::metadata(PathBuf::from(gitdir).join("index"))
             .await
             .is_ok();
@@ -522,6 +533,8 @@ impl WorkspaceManager {
             Ok(n) => n,
             Err(e) => {
                 warn!(worktree = %id, "index sample: cannot list the files at HEAD: {e}");
+                self.report_index_sample_outcome(metrics.as_ref(), id, true)
+                    .await;
                 return;
             }
         };
@@ -529,6 +542,8 @@ impl WorkspaceManager {
             Ok(n) => n,
             Err(e) => {
                 warn!(worktree = %id, "index sample: cannot list the index: {e}");
+                self.report_index_sample_outcome(metrics.as_ref(), id, true)
+                    .await;
                 return;
             }
         };
@@ -540,6 +555,10 @@ impl WorkspaceManager {
             &labels,
         )
         .await;
+        // 两笔读数都落下去了：这一次尝试的结局是"取到了数"。盖在失败的那两站上，
+        // 也盖在这里，所以每一次尝试都只改这一格一次，值就是这一次尝试的结局。
+        self.report_index_sample_outcome(metrics.as_ref(), id, false)
+            .await;
         // 盖章只在两笔读数都落下去之后：上面任何一条早退都意味着这一棵这次没采到，
         // 而没采到就该在下一轮重试，不是把空档记成已经补过。落不下去的那次会每轮
         // 留一行 warn，那是对的——"这棵树的读数取不到"本来就该一直有人看得见。
@@ -548,6 +567,29 @@ impl WorkspaceManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         sampled.insert(id.to_string(), std::time::Instant::now());
+    }
+
+    /// 记下这一次采样尝试的结局：两笔读数都落下去记 0，任一条 git 读数没读成记 1。
+    ///
+    /// 与那两笔读数同一个产出点、按同一道心跳盖章，但**只盖在 git 读数这一头**：
+    /// 解析不出 gitdir 是"这棵树还没建起来、或者已经被回收"，那是
+    /// [`Self::heartbeat_index_health`] 认下的正常状态，在那条早退上记 1 会把一棵
+    /// 还没建起来的树报成故障。而 git 读数失败是另一回事——树在，只是读不出来——它
+    /// 让 missing-files 停在上一笔（健康的）值上，读那条读数的规则于是按"值没动"
+    /// 判活，下面这一格是它唯一的失败面。
+    async fn report_index_sample_outcome(
+        &self,
+        metrics: &dyn cog_core::MetricsBackend,
+        id: &str,
+        incomplete: bool,
+    ) {
+        report(
+            metrics,
+            WORKTREE_INDEX_SAMPLE_INCOMPLETE_METRIC,
+            if incomplete { 1.0 } else { 0.0 },
+            &HashMap::from([("worktree".to_string(), id.to_string())]),
+        )
+        .await;
     }
 
     /// 数一条 git 命令输出的行数。空输出是 0 行，不是一个空行。
@@ -1184,6 +1226,68 @@ mod tests {
             )
             .await,
             tracked
+        );
+    }
+
+    /// 索引文件在、却读不出来（写到一半被截断）时，这一对读数说"一切正常"：
+    /// `present` 是一次 stat，当然报 1；missing-files 只在两笔 git 读数都成功时
+    /// 才盖章，于是它停在上一笔健康值 0 上。实测这一态的后果：`git ls-files` 对
+    /// 零长索引退出 128，`git reset --hard` 同样退出 128——这棵树再也刷新不了，
+    /// 而采样器只留一行 warn。所以"这一次尝试没取到数"要单独成一格。
+    #[tokio::test]
+    async fn index_health_names_an_incomplete_sample_apart_from_a_healthy_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bare, _a, rev_b) = seed_bare(tmp.path());
+        let mb = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let mgr = manager(tmp.path(), &bare).with_metrics(mb.clone());
+
+        let spec = WorkspaceSpec::persistent(
+            "mainline",
+            WorkspaceKind::Deployer,
+            BaseRef::Commit(rev_b.clone()),
+        );
+        let ws = mgr.ensure_persistent(spec).await.unwrap();
+        mgr.sample_index_health(&ws).await;
+        assert_eq!(
+            gauge_of(
+                &mb,
+                WORKTREE_INDEX_SAMPLE_INCOMPLETE_METRIC.as_str(),
+                "mainline"
+            )
+            .await,
+            0.0,
+            "取到数的那一次记 0"
+        );
+
+        // 零长索引：文件还在（stat 说得对），git 读不出来。
+        let gitdir = git_out(&ws.path, &["rev-parse", "--absolute-git-dir"]);
+        std::fs::write(Path::new(&gitdir).join("index"), b"").unwrap();
+        mgr.sample_index_health(&ws).await;
+
+        assert_eq!(
+            gauge_of(&mb, WORKTREE_INDEX_PRESENT_METRIC.as_str(), "mainline").await,
+            1.0,
+            "文件在，存在性读数报的是对的"
+        );
+        assert_eq!(
+            gauge_of(
+                &mb,
+                WORKTREE_INDEX_MISSING_FILES_METRIC.as_str(),
+                "mainline"
+            )
+            .await,
+            0.0,
+            "这一笔没重盖，所以它停在上一笔的健康值上——正是缺陷的形状"
+        );
+        assert_eq!(
+            gauge_of(
+                &mb,
+                WORKTREE_INDEX_SAMPLE_INCOMPLETE_METRIC.as_str(),
+                "mainline"
+            )
+            .await,
+            1.0,
+            "取不到数这件事只有这一格说得出来"
         );
     }
 

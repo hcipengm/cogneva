@@ -144,6 +144,7 @@ metric_names! {
     // cog-reflection — workspace index and generated-change fidelity.
     WORKTREE_INDEX_PRESENT => "cogneva_worktree_index_present",
     WORKTREE_INDEX_MISSING_FILES => "cogneva_worktree_index_missing_files",
+    WORKTREE_INDEX_SAMPLE_INCOMPLETE => "cogneva_worktree_index_sample_incomplete",
     EVOLUTION_GENERATED_CHANGE_FILES_TOTAL => "evolution_generated_change_files_total",
     EVOLUTION_GENERATED_CHANGE_FILES_FAITHFUL => "evolution_generated_change_files_faithful",
     EVOLUTION_GENERATED_CHANGE_HUNKS_TOTAL => "evolution_generated_change_hunks_total",
