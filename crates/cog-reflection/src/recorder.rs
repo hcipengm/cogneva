@@ -597,13 +597,13 @@ impl LearningRecorder for MemoryBackendRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // The counter totals are read through the backend trait, not an inherent method.
-    use cog_core::MetricsBackend;
     use cog_core::contract::memory::{
         MemoryBackend, MemoryMetrics, RelationDirection, SchemaSearchResult, SummaryEntry,
         SummarySearchResult, UnifiedSearchResult,
     };
-    use cog_core::{Area, LearningCategory, LearningSource, Priority};
+    // `MetricsBackend` is here so its `query_counter_totals` is in scope, not as
+    // an inherent method of the in-memory backend.
+    use cog_core::{Area, LearningCategory, LearningSource, MetricsBackend, Priority};
     use std::sync::Mutex;
 
     /// A `MemoryBackend` that only serves the schema layer.
