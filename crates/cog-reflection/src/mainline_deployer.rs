@@ -2387,6 +2387,16 @@ impl MainlineDeployer {
         let Some(metrics) = &self.metrics else {
             return;
         };
+        // 判出来了，就把那一格盖回 0。它必须**每一轮**都盖：成对的那条（判不了时记
+        // 1）读的是"最近一小时内有没有判不了的一轮"，而只有这里每轮把它写回去，
+        // 那句"最近"才成立——见 `report_version_contract_unjudged`。
+        let _ = metrics
+            .record_gauge(
+                cog_core::metric_names::VERSION_CONTRACT_UNJUDGED,
+                0.0,
+                std::collections::HashMap::new(),
+            )
+            .await;
         let mut labels = std::collections::HashMap::new();
         for clause in Clause::ALL {
             let verdict = report.verdict(clause);
@@ -2423,6 +2433,29 @@ impl MainlineDeployer {
                 .record_gauge(VERSION_DECLARED_INFO, 1.0, labels)
                 .await;
         }
+    }
+
+    /// 这一轮判不了版本契约——把这件事本身变成一条读数。
+    ///
+    /// [`Self::report_version_contract`] 需要裸仓库里的 main，所以它排在"读裸仓库"
+    /// 那一站的**后面**：读不到裸仓库的轮在那一站就折了，一条判词也发不出去。而
+    /// `cogneva_version_contract_violations` 是只在值变时才动的读数，store 会把上一笔
+    /// 值连同它**冻住的伴生钟**永久送出去 ⇒ 读它的规则按 `(time() - <伴生钟>) < 3600`
+    /// 把守卫关上 ⇒「判不了」与「契约成立」在值面上同形。剩下那条后备
+    /// （`version_contract_judgement_stopped`）的窗是 6h，对实测 599s 的判定节拍来说
+    /// 要等三十多拍。所以折之前先把"判不了"记下来：读它的规则
+    /// `version_contract_unjudged` 与那条守卫同宽，不留这段空档。
+    async fn report_version_contract_unjudged(&self) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let _ = metrics
+            .record_gauge(
+                cog_core::metric_names::VERSION_CONTRACT_UNJUDGED,
+                1.0,
+                std::collections::HashMap::new(),
+            )
+            .await;
     }
 
     fn set_upstream_note(&self, note: &str) {
@@ -4238,7 +4271,18 @@ impl MainlineDeployer {
         // 上的轮连回收轮那个函数都进不去，而折了的那一轮正是这一格要报告的时刻。
         self.report_registry_debt(&state).await;
 
-        let mut bare = self.bare_main_rev().await?;
+        let mut bare = match self.bare_main_rev().await {
+            Ok(bare) => bare,
+            Err(e) => {
+                // 这一轮判不了版本契约，而"判不了"必须当场可见：判词本身（
+                // `report_version_contract`）要读裸仓库的 main，所以在 `poll_once` 里
+                // 它是唯一一条搬不到最早那一站的读数，折在这一站的轮一条也发不出。
+                // 这里就把它的失败面补上，理由见
+                // [`Self::report_version_contract_unjudged`]。
+                self.report_version_contract_unjudged().await;
+                return Err(e);
+            }
+        };
         // 先把上游拉进来再判推进：bare 的 main 由本循环自己从各平台取，
         // 宿主机不再是这条链上的一环。
         if let Some(advanced) = self.refresh_upstream(&bare).await {
@@ -4249,9 +4293,12 @@ impl MainlineDeployer {
         // stays silent while main stands still, which is exactly when whether the
         // versions have diverged is worth knowing. Judged before every early
         // return below -- but not before the one above, because it needs `bare`
-        // and so cannot be hoisted past the station that reads it. A round that
-        // cannot read the bare repository publishes no contract judgement, which
-        // makes this the one reading of its kind still gated by a station.
+        // and so cannot be hoisted past the station that reads it. It stays the
+        // one reading of its kind gated by a station, and that is why the station
+        // now stamps the failure: a round that cannot read the bare repository
+        // reports the unjudged state before folding, instead of leaving the last
+        // verdict frozen where a guard reads a stopped companion clock as a
+        // contract that holds.
         self.report_version_contract(&bare).await;
         let images = self.deployed_images().await?;
         let deployed = classify_deployed(&images);
@@ -14180,6 +14227,36 @@ exit 0
                 .is_empty(),
             "「一次都没走完过」的种子也被那道早退挡住了"
         );
+    }
+
+    #[tokio::test]
+    async fn a_round_that_cannot_judge_the_contract_stamps_the_unjudged_reading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // 裸仓库指到不存在的地方：`git --git-dir … rev-parse` 非零退出，这一轮就折在
+        // 读裸仓库那一站——正是判版本契约要用的输入取不到的那一站。
+        let cfg = test_config(root, Path::new("/nonexistent"), "noop", "noop");
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_metrics(metrics.clone());
+
+        let folded = deployer.poll_once().await;
+        assert!(
+            folded.is_err(),
+            "这一轮必须真的折在读裸仓库那一站上，否则这条判据没测到它要测的那一站"
+        );
+
+        let unjudged = metrics
+            .query_gauge_latest(cog_core::metric_names::VERSION_CONTRACT_UNJUDGED.as_str())
+            .await
+            .unwrap();
+        assert!(
+            !unjudged.is_empty(),
+            "折了的轮必须把「判不了」这一格发出去：判词在那一站之后，不发的话上一笔判词\
+             连同它冻住的伴生钟被 store 一直送出去，读它的规则拿冻钟当写者停了，把守卫关上——\
+             「判不了」与「契约成立」在值面上同形"
+        );
+        assert_eq!(unjudged[0].value, 1.0, "折了的一轮记的是 1，不是 0");
     }
 
     #[tokio::test]

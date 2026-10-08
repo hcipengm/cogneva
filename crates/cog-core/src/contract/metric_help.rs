@@ -541,6 +541,16 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          at zero, so an absent series means the clause was never judged",
     ),
     (
+        "cogneva_version_contract_unjudged",
+        "1 when the round could not judge the version contract at all, 0 when it \
+         did. The judgement needs the tracked main, read from the bare \
+         repository, so a round that cannot read it publishes no verdict -- and \
+         on a reading that only ever changes its value the store keeps serving \
+         the last verdict with a companion clock that has stopped, which is the \
+         same shape as a contract that holds. This is the reading that says \
+         which of the two it is",
+    ),
+    (
         "cogneva_rollout_job_cpu_throttled_ratio",
         "Share of the CFS periods of the newest rollout judgement run in which \
          the run was throttled by its own CPU limit, read by the run from its \

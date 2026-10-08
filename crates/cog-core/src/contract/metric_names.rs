@@ -155,6 +155,7 @@ metric_names! {
     VERSION_DECLARED_INFO => "cogneva_version_declared_info",
     VERSION_CONTRACT_VIOLATIONS => "cogneva_version_contract_violations",
     VERSION_CONTRACT_CHECKS_TOTAL => "cogneva_version_contract_checks_total",
+    VERSION_CONTRACT_UNJUDGED => "cogneva_version_contract_unjudged",
 
     // cog-reflection — the registry store's capacity reclamation, read by the
     // process that reclaims it.
