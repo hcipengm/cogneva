@@ -1282,12 +1282,12 @@ data:
             },
             {
               "name": "memory_raw_backlog_aged_out",
-              "promql": "max without (pod, container, instance) (max_over_time(memory_unextracted_raw_aged_out[30m])) > 0",
+              "promql": "(max without (pod, container, instance) (max_over_time(memory_unextracted_raw_aged_out[30m])) > 0) and max without (pod, container, instance) (changes(memory_unextracted_raw_aged_out_observed_timestamp_seconds[30m]) > 0)",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "Archived raw sources had aged past the re-drive window without a summary at some scan in the last half hour ({value} being the most any of those scans found). The system will not pick these up again on its own: they need a budgeted backfill, which is a decision someone has to make, and the reading that says the decision is due is this one. It is the actionable half of a pair -- the sibling counts every unextracted raw and this one counts the part that is past the window -- and it is published by the same scan, so a scan that stopped shows up as the pair going absent rather than as a zero. Read the sibling for the size of the backlog still inside the window, and the summarizer's own outcome counters for whether the extraction path is failing or merely behind. A zero here is a real zero: it means every raw still missing a summary is one the system will still try again by itself."
+              "summary": "Archived raw sources had aged past the re-drive window without a summary at some scan in the last half hour ({value} being the most any of those scans found). The system will not pick these up again on its own: they need a budgeted backfill, which is a decision someone has to make, and the reading that says the decision is due is this one. It is the actionable half of a pair -- the sibling counts every unextracted raw and this one counts the part that is past the window. The pair lives in the shared store, which hands out each series' newest row forever, so a scan that stops does not make it go absent: the value it last wrote keeps arriving at every scrape and reads exactly like a fresh one. That is why the value clause is paired with the change count of the same series' _observed_timestamp_seconds companion over the same half hour -- only a scan that is still advancing the pair counts as an observation of this window. Read the sibling for the size of the backlog still inside the window, and the summarizer's own outcome counters for whether the extraction path is failing or merely behind. A zero is a real zero only under that same condition: a frozen pair is a scan that stopped, not a backlog that cleared, and the companion is what tells the two apart."
             },
             {
               "name": "audited_request_refused",
