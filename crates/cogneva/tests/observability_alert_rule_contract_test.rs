@@ -31,7 +31,7 @@ mod promql;
 use producer::carries_the_producer;
 use promql::{
     lagged_equality_complaints, metric_names_in, shape_complaints, uncovered_window_complaints,
-    windows_over,
+    unguarded_store_reading_complaints, windows_over,
 };
 
 const CHART_CONFIG: &str = "deploy/helm/cogneva/files/cogneva.json";
@@ -984,6 +984,80 @@ fn a_rule_that_certifies_a_window_requires_the_window_to_be_covered() {
     assert!(
         complaints.is_empty(),
         "告警规则用一个区间聚合判断整个窗口，却没有要求窗口被铺满——序列比窗口年轻时这句话是假的:\n{}",
+        complaints.join("\n")
+    );
+}
+
+/// A rule that reports on a gauge the metric store serves has to say that the
+/// writer behind it is still running.
+///
+/// The store hands back each series' newest row forever, so a gauge whose
+/// writer stopped goes on being scraped at its last value. A rule reading that
+/// value over a window counts the frozen sample as an observation of the
+/// window, and a writer that stopped on the firing side of its threshold leaves
+/// the rule fired for good: no repair to the thing being measured can clear it,
+/// because the series the rule reads has stopped being connected to it. The
+/// companion `_observed_timestamp_seconds` is the one series that moves when
+/// the writer does, so the reading is `changes()` over it.
+///
+/// The family is taken from the exposition's own description tables rather than
+/// by searching the rule text for metric names. A name search over the rules
+/// answers a different question and answers it wrong: it picks up series
+/// exposed straight from a process's `/metrics`, which fall out of the scrape
+/// with their producer and so never freeze, and it misses the family boundary
+/// entirely -- four rules were hand-fixed one at a time before this test, and
+/// the next rule to read one of these gauges had no way to be told.
+///
+/// The durable pool gauges are excluded, and the exclusion is mechanical rather
+/// than a list of names: their writer rewrites only a value that has not moved
+/// once per `DURABLE_GAUGE_HEARTBEAT`, which is why the criterion they carry is
+/// a window longer than that heartbeat, checked in
+/// `a_rule_windowing_a_durable_gauge_waits_longer_than_the_writers_heartbeat`.
+/// Whether they also want this guard is a separate question, and this test does
+/// not settle it.
+#[test]
+fn a_rule_reading_a_store_gauge_over_a_window_requires_its_writer() {
+    let durable: BTreeSet<&str> = cog_gateway::security_gateway::DURABLE_POOL_GAUGES
+        .iter()
+        .map(|name| name.as_str())
+        .collect();
+    assert!(
+        durable.len() >= 8,
+        "耐久族只剩 {} 条，下面的排除已经等于没有排除",
+        durable.len()
+    );
+
+    let gated: BTreeSet<String> = cog_core::documented_metric_names(cog_core::MetricType::Gauge)
+        .filter(|name| !durable.contains(name))
+        .map(|name| name.to_string())
+        .collect();
+    // 分母：这条判据的分母是「族里有几条非耐久 gauge」。族空了它就恒绿，
+    // 而不是「库里没有共享表 gauge」。
+    assert!(
+        gated.len() >= 8,
+        "闭集里非耐久 gauge 只剩 {} 条，这条判据已经形同虚设",
+        gated.len()
+    );
+
+    let mut complaints: Vec<String> = Vec::new();
+    let mut windowed = 0usize;
+    for (rule, promql) in chart_rules() {
+        windowed += windows_over(&promql, &gated).len();
+        for complaint in unguarded_store_reading_complaints(&promql, &gated) {
+            complaints.push(format!("{rule}: {complaint}\n    {promql}"));
+        }
+    }
+
+    // 另一半分母：一条规则都没窗口这些 gauge 时，上面那句「没有投诉」是空的。
+    // 今天读它们的正是本仓库那条样本日志与积压规则，它们没了就说明题目没了。
+    assert!(
+        windowed > 0,
+        "没有任何告警规则对共享表 gauge 取窗口，这条判据没有分母"
+    );
+    assert!(
+        complaints.is_empty(),
+        "告警规则把共享表 gauge 的值当作窗口里的观测，却没有要求写者还在写——\
+         一个死在点火那侧的写者会让这条规则永久点亮、谁也没法熄灭它:\n{}",
         complaints.join("\n")
     );
 }

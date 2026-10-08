@@ -661,6 +661,54 @@ pub fn uncovered_window_complaints(expr: &str) -> Vec<String> {
     out
 }
 
+/// Store-served gauges a rule reads over a window without saying their writer
+/// is still there.
+///
+/// The store hands back each series' newest row forever, so a gauge whose
+/// writer stopped goes on being scraped at its last value. A window over it
+/// reads that frozen sample as an observation of the window, and a rule firing
+/// on it stays fired with nothing left to move the value back: no repair to
+/// what the number measures can clear it, because the series the rule reads is
+/// no longer connected to what it names. The companion
+/// `_observed_timestamp_seconds` is the one series that moves when the writer
+/// does, at a spelling the exposition and every reader share, so what a rule
+/// needs is `changes()` on the companion in the same expression.
+///
+/// Only a series read through a range selector is checked: that is the shape
+/// that reads a stored value as an observation of a window. A gauge a rule
+/// reads without a window is a parameter of its comparison rather than
+/// something it observes -- the row budget a sample log is measured against is
+/// the case in the shipped rules -- and a name outside `gated` is not a gauge
+/// the store serves at all.
+///
+/// The ceiling, stated the way the rest of this module states ceilings: the
+/// guard is matched by presence, so its window is not compared to the value's
+/// and its position is not decided here. A `changes()` sitting after a
+/// reduction that has already merged the writers passes this check and is still
+/// the shape that let one live stream carry the gate for a stopped one; that
+/// arrangement is asserted rather than assumed in the tests below.
+pub fn unguarded_store_reading_complaints(expr: &str, gated: &BTreeSet<String>) -> Vec<String> {
+    let stripped = strip_braces(&strip_quoted(expr));
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for (name, window) in windows_over(expr, gated) {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let companion = cog_core::observability_text::observed_timestamp_name(&name);
+        if stripped.contains(&format!("changes({companion}[")) {
+            continue;
+        }
+        out.push(format!(
+            "`{name}` 是共享表服务的 gauge：写者停了它不会缺席，只会把最后一笔值永久送出去，\
+             于是规则把这一刻的值读成窗口里的观测。这条规则对 `{name}` 取了 {window}s 的窗口，\
+             却没有在同一表达式里要求写者还在写——`changes({companion}[<窗口>]) > 0`。\
+             少了这一项，一个死在点火那侧的写者会让这条规则永久点亮，谁也没法熄灭它"
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -912,5 +960,68 @@ mod tests {
         );
         // A parenthesized selector names no series and is not attributed.
         assert!(windows_over("max_over_time((a + c)[30m])", &gated).is_empty());
+    }
+
+    /// The store-gauge guard, on the shapes the shipped rules really carry: the
+    /// companion `changes()` is what separates a window over a live writer's
+    /// series from a window over a value the store will hand back forever.
+    #[test]
+    fn a_windowed_store_gauge_without_its_companion_guard_is_reported() {
+        let gated: BTreeSet<String> = ["metrics_samples_rows"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        // The shape the shipped rules write, with the guard inside the
+        // reduction so it pairs with each writer's own series.
+        assert!(unguarded_store_reading_complaints(
+            "(max without (pod, container, instance) \
+             (min_over_time(metrics_samples_rows[30m]) \
+             and (changes(metrics_samples_rows_observed_timestamp_seconds[30m]) > 0))) > 0",
+            &gated
+        )
+        .is_empty());
+
+        // The guard dropped, which is what a new rule looks like.
+        let complaints = unguarded_store_reading_complaints(
+            "max without (pod, container, instance) (min_over_time(metrics_samples_rows[30m])) > 0",
+            &gated,
+        );
+        assert_eq!(complaints.len(), 1, "{complaints:?}");
+        assert!(
+            complaints[0].contains("metrics_samples_rows_observed_timestamp_seconds"),
+            "{}",
+            complaints[0]
+        );
+
+        // Read without a window it is a parameter, not an observation; read
+        // outside the family it is not a stored gauge at all.
+        assert!(unguarded_store_reading_complaints("metrics_samples_rows > 0", &gated).is_empty());
+        assert!(unguarded_store_reading_complaints(
+            "max_over_time(cogneva_process_zombies[30m]) > 0",
+            &gated
+        )
+        .is_empty());
+
+        // Both ceilings, asserted rather than assumed. The guard is matched by
+        // presence, so one sitting after the reduction that merged the writers
+        // is accepted even though a stream that is still running can carry it
+        // for one that has stopped -- the arrangement this gate does not see.
+        assert!(unguarded_store_reading_complaints(
+            "(max by (table) (min_over_time(metrics_samples_rows[1h])) \
+             and max by (table) (changes(metrics_samples_rows_observed_timestamp_seconds[1h]) > 0)) > 0",
+            &gated
+        )
+        .is_empty());
+        // The guard's window is not compared to the value's: a companion read
+        // over any window satisfies the check, because whether that window is
+        // long enough is a question about the writer's cadence, which this
+        // module has no way to see.
+        assert!(unguarded_store_reading_complaints(
+            "max_over_time(metrics_samples_rows[30m]) > 0 \
+             and changes(metrics_samples_rows_observed_timestamp_seconds[30s]) > 0",
+            &gated
+        )
+        .is_empty());
     }
 }
