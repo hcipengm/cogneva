@@ -276,6 +276,23 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          failing loop from one with nothing to do",
     ),
     (
+        "cogneva_policy_evolution_rounds_total",
+        "How each round of the artifact-level evolution search ended, summed \
+         over rounds and labelled by the outcome. The loop's beat is stamped \
+         every cycle whether or not the round produced anything, so it cannot \
+         say which end was reached, and the round's end was only ever a log \
+         line that dies with the pod: adopting a new policy version, finding no \
+         better candidate, having too little evidence to compare, and failing \
+         outright read the same. The values are a closed set the producing \
+         module declares: insufficient_evidence and no_improvement (two ends \
+         that change nothing external, and so leave no other trace), adopted \
+         (a saved-and-hot-swapped version), and failed (the round returned an \
+         error). Read as the rate of adopted against the rest: a flat adopted \
+         cell with a rising insufficient_evidence cell says the search is \
+         awake but has nothing to learn from, which is a different fact from a \
+         failed cell rising, which is the loop not doing its job",
+    ),
+    (
         "cogneva_mainline_superseded_rollout_total",
         "Rounds the deployer's guard answered that the revision it was carrying \
          had been overtaken upstream: 1 when it had (nothing is rolled out, the \

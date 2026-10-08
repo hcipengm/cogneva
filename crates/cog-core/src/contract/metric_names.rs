@@ -217,6 +217,26 @@ metric_names! {
     // deployment runs the trigger for its own instance.
     BASELINE_PORT_TICK_FAILED => "baseline_port_tick_failed",
 
+    // cog-reflection — how each round of the artifact-level evolution search
+    // ended, labelled by `outcome`.
+    //
+    // The loop's liveness is `cogneva_loop_tick_age_seconds{loop="policy_evolution"}`
+    // and it moves every cycle whether or not the round produced anything, so it
+    // cannot say which of the round's ends happened. Two of the three ends change
+    // nothing external -- too little evidence to compare, and a comparison that
+    // found no significantly better candidate -- and the third adopts a new policy
+    // version. All three went to an `INFO` line, and a failed round to a `WARN`,
+    // and those die with the pod: "adopted three versions this week" and "never
+    // adopted one" and "ran out of evidence every round since deploy" and "failing
+    // every round" are four different facts that no reading distinguished. The
+    // module's own note -- not to read its per-round `INFO` as the chain running --
+    // is the guarantee stated in prose with nothing behind it.
+    //
+    // A counter, because the round runs on every cycle and the fact is a
+    // cumulative one; the four cells are the closed set of ends, so a reader can
+    // separate a round that never adopted from one that never had evidence to.
+    POLICY_EVOLUTION_ROUNDS_TOTAL => "cogneva_policy_evolution_rounds_total",
+
     // cog-reflection — the registry store's capacity reclamation, read by the
     // process that reclaims it.
     //

@@ -13,6 +13,7 @@
 //! 执行留下的决策结果。上游断供时循环照常醒、照常报结论，只是每次都在
 //! 报证据不足——"能跑"不等于"有东西可学"，别把这行 INFO 读成链在路上跑。
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -118,11 +119,25 @@ pub enum PolicyEvolutionOutcome {
     },
 }
 
+impl PolicyEvolutionOutcome {
+    /// 这个结论落在轮次计数器上的那一格。四格之一，与 `failed` 合起来是闭集；
+    /// 名字写死在这里，读者按它枚举。
+    fn as_cell(&self) -> &'static str {
+        match self {
+            PolicyEvolutionOutcome::InsufficientEvidence { .. } => "insufficient_evidence",
+            PolicyEvolutionOutcome::NoImprovement { .. } => "no_improvement",
+            PolicyEvolutionOutcome::Adopted { .. } => "adopted",
+        }
+    }
+}
+
 /// 自主参数搜索：读历史结果 → 重放候选 → 显著才升级。
 pub struct PolicyEvolutionDriver {
     config: PolicyEvolutionConfig,
     engine: Arc<MetaLearningEngine>,
     evolution: Arc<ArtifactEvolution>,
+    /// 每轮结局的去处。在调用点接线（那时指标服务在手）；缺席时结局只落日志。
+    metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
 }
 
 impl PolicyEvolutionDriver {
@@ -135,6 +150,36 @@ impl PolicyEvolutionDriver {
             config,
             engine,
             evolution,
+            metrics: None,
+        }
+    }
+
+    /// 接上每轮结局计数器的去处。
+    pub fn with_metrics(mut self, metrics: Option<Arc<dyn cog_core::MetricsBackend>>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// 把这一轮落在哪一格记下来。`None` 表示这一轮以错误结束。
+    ///
+    /// 与那句每轮日志同点写、两条分支都写：把「跑到底但没升级」和「折在半路」
+    /// 分开正是这条读数的全部意义，少写任何一支都会让两者在读数面上合流。
+    async fn record_round(&self, outcome: Option<&PolicyEvolutionOutcome>) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let cell = outcome.map_or("failed", PolicyEvolutionOutcome::as_cell);
+        let mut labels = HashMap::new();
+        labels.insert("outcome".to_string(), cell.to_string());
+        if let Err(e) = metrics
+            .record_counter(
+                cog_core::metric_names::POLICY_EVOLUTION_ROUNDS_TOTAL,
+                1.0,
+                labels,
+            )
+            .await
+        {
+            warn!(error = %e, "policy evolution: could not record round outcome");
         }
     }
 
@@ -287,9 +332,19 @@ pub async fn run_policy_evolution_loop(
                         // 若只在 debug 留痕，"没有更优候选"与"循环根本没跑"在运维面上就是
                         // 同一片空白；而 `baseline_trials` 正是"决策结果是否在积累"的唯一
                         // 带内证据，代价是每小时一行。
+                        //
+                        // 日志之外同一处盖一格计数器：日志随 Pod 消失、也读不成时间序列，
+                        // 而"这次采纳了 / 每轮都报证据不足 / 每轮都失败"是四个不同的事实。
+                        // 写在日志之前、两支都写，回滚也盖——那一格的语义是"这一轮结束了"。
                         _ = ticker.tick() => match driver.run_once().await {
-                            Ok(outcome) => info!(?outcome, "artifact-level evolution round"),
-                            Err(e) => warn!(error = %e, "artifact-level evolution round failed"),
+                            Ok(outcome) => {
+                                driver.record_round(Some(&outcome)).await;
+                                info!(?outcome, "artifact-level evolution round");
+                            }
+                            Err(e) => {
+                                driver.record_round(None).await;
+                                warn!(error = %e, "artifact-level evolution round failed");
+                            }
                         },
                     }
                 }
@@ -302,7 +357,7 @@ pub async fn run_policy_evolution_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cog_core::{DecisionCategory, DecisionOutcome};
+    use cog_core::{DecisionCategory, DecisionOutcome, MetricsBackend};
 
     /// Record outcomes through the same entry point the live system uses, so
     /// the driver is exercised against the grouping the engine really builds.
@@ -512,5 +567,90 @@ mod tests {
         let parsed: Result<PolicyEvolutionConfig, _> =
             serde_json::from_str("{\"min_trials\": \"x\"}");
         assert!(parsed.is_err(), "配置写错必须响亮失败");
+    }
+
+    /// 三种结论各有各的格子，且 `failed` 是第四格——四格互不相同，是读者可
+    /// 枚举的闭集。把任意两格合成一格，这个断言就落。
+    #[test]
+    fn the_round_cells_are_a_closed_distinct_set() {
+        let cells = [
+            PolicyEvolutionOutcome::InsufficientEvidence {
+                replayed_trials: 0,
+                recorded_trials: 0,
+            }
+            .as_cell(),
+            PolicyEvolutionOutcome::NoImprovement {
+                considered: 0,
+                baseline_trials: 0,
+                recorded_trials: 0,
+            }
+            .as_cell(),
+            PolicyEvolutionOutcome::Adopted {
+                version: 0,
+                min_samples: 0,
+                margin: 0.0,
+                z: 0.0,
+                uplift: 0.0,
+            }
+            .as_cell(),
+        ];
+        let mut sorted = cells.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), cells.len(), "三格必须互不相同");
+        assert!(cells.iter().all(|c| !c.is_empty()));
+    }
+
+    /// 每一轮都盖一格，包括折了的那一轮。少盖或把 `failed` 并到别的格，这个
+    /// 断言就落。
+    #[tokio::test]
+    async fn every_round_lands_in_exactly_one_cell() {
+        let tmp = tempfile::tempdir().unwrap();
+        let evolution = Arc::new(ArtifactEvolution::new(crate::PolicyStore::new(tmp.path())));
+        let metrics = Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let d = PolicyEvolutionDriver::new(
+            PolicyEvolutionConfig::default(),
+            engine_with(&[("pipeline", 40, 20)]).await,
+            evolution,
+        )
+        .with_metrics(Some(metrics.clone()));
+
+        d.record_round(Some(&PolicyEvolutionOutcome::InsufficientEvidence {
+            replayed_trials: 1,
+            recorded_trials: 2,
+        }))
+        .await;
+        d.record_round(Some(&PolicyEvolutionOutcome::NoImprovement {
+            considered: 3,
+            baseline_trials: 4,
+            recorded_trials: 5,
+        }))
+        .await;
+        d.record_round(Some(&PolicyEvolutionOutcome::Adopted {
+            version: 7,
+            min_samples: 2,
+            margin: 0.1,
+            z: 3.0,
+            uplift: 0.2,
+        }))
+        .await;
+        // 折了的那一轮：没有结论，也必须落格。
+        d.record_round(None).await;
+
+        let totals = metrics
+            .query_counter_totals("cogneva_policy_evolution_rounds_total")
+            .await
+            .unwrap();
+        let cell = |name: &str| {
+            totals
+                .iter()
+                .find(|s| s.labels.get("outcome").map(String::as_str) == Some(name))
+                .map(|s| s.value)
+        };
+        assert_eq!(cell("insufficient_evidence"), Some(1.0));
+        assert_eq!(cell("no_improvement"), Some(1.0));
+        assert_eq!(cell("adopted"), Some(1.0));
+        assert_eq!(cell("failed"), Some(1.0));
+        assert_eq!(totals.len(), 4, "闭集恰好四格，多一格少一格都是形状变了");
     }
 }

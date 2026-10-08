@@ -1281,10 +1281,20 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     shutdown.trigger();
                 });
             }
+            // 每轮结局读数的产出面。缺失时只在日志里交代一次，否则采纳与失败
+            // 都不会离开那条随 Pod 消失的日志。
+            let pe_metrics = ctx.consume_service::<dyn cog_core::MetricsBackend>();
+            if pe_metrics.is_none() {
+                warn!(
+                    "MetricsBackend not published; policy evolution round outcomes \
+                     will not be reported"
+                );
+            }
             tokio::spawn(crate::run_policy_evolution_loop(
-                Arc::new(crate::PolicyEvolutionDriver::new(
-                    pe_config, engine, evolution,
-                )),
+                Arc::new(
+                    crate::PolicyEvolutionDriver::new(pe_config, engine, evolution)
+                        .with_metrics(pe_metrics),
+                ),
                 shutdown,
             ));
         } else {

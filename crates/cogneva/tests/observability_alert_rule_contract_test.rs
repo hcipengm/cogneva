@@ -1739,6 +1739,10 @@ const UNREAD: &[(&str, Unread)] = &[
         "cogneva_partition_maintenance_failures_total",
         Unread::Gap("the monthly partition maintenance loop's per-round outcome, one cell per cause. The whole path had no reading at all before this pass: the loop is on a supervised cadence, so its liveness is read, but a step that failed and a table whose DEFAULT partition was found holding rows went to log lines that die with the pod -- and a DEFAULT count that could not be read was indistinguishable from one that came back zero. What is still missing is a rule, and a rule here would have to say how many shortfalls in a window are a fault and whether window_behind (the window fell behind, rows are outside every open range) is the same fault as a refused CREATE or a count that could not be read. That is a threshold and a policy on a loop that runs hourly: nobody declared either. Every adjacent gap in this family was closed by writing a rule, and writing one is an alert-rule change, which needs sign-off before it lands, so the reading ships with its debt recorded rather than left absent"),
     ),
+    (
+        "cogneva_policy_evolution_rounds_total",
+        Unread::Gap("how each round of the artifact-level evolution search ended, one cell per outcome. The whole path had no reading at all before this pass: the loop beats every cycle, so its liveness is read, but which of the round's ends was reached went only to a log line that dies with the pod -- adopting a new policy version, finding no better candidate, having too little evidence to compare, and failing outright all read the same. The module's own note not to read the per-round INFO as the chain running is the guarantee stated in prose with nothing behind it. What is still missing is a rule, and a rule here would have to say how many failed rounds in a window are a fault, and whether a flat adopted cell is itself the fault (the search awake but never learning) or the healthy state of a loop that legitimately has nothing better to adopt -- a policy on a loop that runs hourly, which nobody declared. Writing that rule is an alert-rule change, which needs sign-off before it lands, so the reading ships with its debt recorded rather than left absent"),
+    ),
 ];
 
 /// Entries an `Elsewhere` reader claim cannot be resolved against.
@@ -1767,7 +1771,7 @@ fn unresolved_readers(read: &BTreeSet<String>, name: &str, readers: &[&str]) -> 
 /// completion cadence is already read against *is* that budget. The two entries
 /// left the table in the pass that wrote `buildah_store_round_incomplete`, so
 /// 23 became 21.
-const GAPS_AT_CENSUS: usize = 23;
+const GAPS_AT_CENSUS: usize = 24;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {
