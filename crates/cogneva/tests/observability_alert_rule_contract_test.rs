@@ -1210,6 +1210,12 @@ fn a_rule_guarding_the_census_waits_longer_than_the_census_heartbeat() {
 /// deployer sitting between two stamps, and the rule goes quiet on the one state
 /// it exists for.
 ///
+/// The family swept here is the two series one emission point publishes -- the
+/// index-present stat and the missing-files count -- rather than the one series
+/// this test was written for. Both are stamped by the same heartbeat, so a sweep
+/// that named one of them passes while its sibling's guard goes quiet on a
+/// working tree; the denominator is counted per series for exactly that reason.
+///
 /// Neither number is written into this test -- the bound comes out of the
 /// shipped expression and the heartbeat out of the sampler -- because a bound
 /// chosen against a constant drifts from it the moment either side moves, and
@@ -1219,24 +1225,31 @@ fn a_rule_guarding_the_index_sample_waits_longer_than_its_heartbeat() {
     let heartbeat = cog_reflection::workspace::INDEX_SAMPLE_HEARTBEAT.as_secs();
     assert!(heartbeat > 0, "索引采样心跳为 0，下面这条判据恒真");
 
-    let metric = cog_core::metric_names::WORKTREE_INDEX_MISSING_FILES.as_str();
-    let mut guarded = 0usize;
-    for (rule, promql) in chart_rules() {
-        let Some(bound) = companion_age_bound(&promql, metric) else {
-            continue;
-        };
-        guarded += 1;
+    // 按产出点钉族：两格都由 `WorkspaceManager::sample_index_health_of` 发出、
+    // 都由同一道心跳盖章。
+    let family = [
+        cog_core::metric_names::WORKTREE_INDEX_PRESENT.as_str(),
+        cog_core::metric_names::WORKTREE_INDEX_MISSING_FILES.as_str(),
+    ];
+    for metric in family {
+        let mut guarded = 0usize;
+        for (rule, promql) in chart_rules() {
+            let Some(bound) = companion_age_bound(&promql, metric) else {
+                continue;
+            };
+            guarded += 1;
+            assert!(
+                bound > heartbeat,
+                "{rule}: 守卫的年龄界 {bound}s 不严格长于索引采样心跳 {heartbeat}s——\
+                 部署器闲下来坐进两次盖章之间就能造出这个空窗，判据会在完好的树上点亮"
+            );
+        }
+        // 分母按格计，不把两格合并：合并之后一族里少了一格仍然是绿的。
         assert!(
-            bound > heartbeat,
-            "{rule}: 守卫的年龄界 {bound}s 不严格长于索引采样心跳 {heartbeat}s——\
-             部署器闲下来坐进两次盖章之间就能造出这个空窗，判据会在完好的树上点亮"
+            guarded > 0,
+            "{metric} 的伴生钟没有任何规则取年龄界，这条判据对它就等于没有题目"
         );
     }
-    // 分母：没有一条规则读这棵树的伴生钟时，上面这句「没有投诉」是空的。
-    assert!(
-        guarded > 0,
-        "没有任何规则对工作树索引读数的伴生钟取年龄界，这条判据没有分母"
-    );
 }
 
 /// No shipped rule may guard a store-served gauge with a change count over its
@@ -1568,10 +1581,6 @@ const UNREAD: &[(&str, Unread)] = &[
             ],
             reason: "trace_tier_migration_failing, trace_tier_migration_stale and trace_tier_demotion_stalled read the same face's failures, staleness and backlog",
         },
-    ),
-    (
-        "cogneva_worktree_index_present",
-        Unread::Gap("whether a resident worktree's git index file is there. Reading it beside the missing-files series is what the pair is for -- the help says so and worktree_tree_about_to_rebuild's summary tells the operator to do it -- and yet no rule, panel or other series reads it. That rule cannot stand in: with the index gone, git ls-files lists nothing, so the sibling reads the whole-tree size, which is exactly what it reads when the index is there and remembers no files, so that alert fires on both shapes and tells them apart nowhere. The series this entry used to name, the loop tick, says whether the sampler is running, not which worktree lost its index. No reader was written on purpose: the index is rebuilt by the next reset, so the reading is a transient, and the gateway replays this gauge from the sample store with no window -- a recycled tree keeps exposing its last value, so a rule could never be resolved. A threshold would have to be the round period instead, and rounds are event-driven, so the number would be invented. Closing it means publishing the sampler's own liveness on this face first; until that signal exists the missing half is a producer-side reading rather than a rule to write"),
     ),
     (
         "cogneva_version_declared_info",
