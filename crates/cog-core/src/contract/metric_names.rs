@@ -365,6 +365,28 @@ metric_names! {
     // unactionable for lack of exactly this label. Recording it changes no
     // verdict: the gate still fails open by design.
     MAINLINE_CI_NO_VERDICT_REASON_TOTAL => "cogneva_mainline_ci_no_verdict_reason_total",
+    // Rounds the deployer's poll loop finished, by how they finished: `ok` when
+    // the round ran to the end, `failed` when it returned an error.
+    //
+    // The loop already publishes that it is still cycling, and that reading is
+    // blind to what the cycles did. The tick age is stamped at the top of the
+    // tick, before the body runs, and every reading the body publishes is
+    // written ahead of the step that can fail. Measured on 2026-10-08: the
+    // publish step refused the manifest bundle for two and a quarter hours (the
+    // client-side apply annotation ceiling), every round failed there, and the
+    // only trace was a warn the next rollout deletes with the pod that wrote
+    // it. The tick age, the CI verdict counter and the version contract all
+    // read healthy through it, so a deployer that had failed every round for
+    // two hours looked exactly like one with nothing to do.
+    //
+    // A counter rather than the loop's own tick age, because the two answer
+    // different questions: the age says whether the loop is cycling, which
+    // stays true through any run of failures, and this says whether its rounds
+    // arrive. The reader is the pair -- the failure cell moved while the ok
+    // cell did not move over the window -- which separates a loop failing every
+    // round from one that is idle and from one that is dead (a dead loop moves
+    // neither cell, and the tick age is the reading that names it).
+    MAINLINE_POLL_CYCLES_TOTAL => "cogneva_mainline_poll_cycles_total",
 
     // cog-gateway — request accounting.
     HTTP_REQUESTS_TOTAL => "http_requests_total",

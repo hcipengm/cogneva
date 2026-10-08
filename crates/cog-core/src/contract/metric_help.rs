@@ -324,6 +324,22 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          adds two",
     ),
     (
+        "cogneva_mainline_poll_cycles_total",
+        "Rounds the deployer's poll loop finished, by how they finished: ok when \
+         the round ran to the end, failed when it returned an error. Written \
+         once per round, and that is what it adds to the loop's own liveness \
+         reading: cogneva_loop_tick_age_seconds is stamped before the body runs, \
+         so it stays near the period through any run of failures, while this \
+         pair says whether the rounds arrived anywhere. A round that fails \
+         leaves its cause in the process log and nothing else, and the log is \
+         replaced by the next rollout. Read the two cells together: failed \
+         having moved while ok did not, over a window longer than a round, is \
+         mainline_poll_cycles_all_failed. Both cells are written when they \
+         happen and neither is seeded, so an ok cell that is absent means no \
+         round has ever finished in this process -- which the pair's own rule \
+         treats as the same answer as a zero",
+    ),
+    (
         "cogneva_dag_stalled_scheduled_reclaimed_total",
         "Tasks found stalled in Scheduled and put back in line without charging \
          an attempt, summed over repairs. A counter rather than a gauge, because \

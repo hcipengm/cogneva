@@ -3042,6 +3042,55 @@ impl MainlineDeployer {
         }
     }
 
+    /// 这一轮是怎么结束的，按结果记一格。
+    ///
+    /// 循环自己的存活读数（`loop_tick_age_seconds`）在**每拍开头**盖章，量的是
+    /// 「它醒了」，量不到这一轮干了什么；而这一轮里所有别的读数都写在会失败的那一
+    /// 步**之前**。实测（2026-10-08）：发布那一步连着两个多小时拒绝清单包，每一轮
+    /// 都折在那里，唯一的痕迹是一条会随下一个滚动消失的 warn——同一段时间里心跳、
+    /// CI 判词、版本契约全绿，「每轮都失败」与「没事可做」在读数面上同形。
+    ///
+    /// 这里**只记真发生的那一格**，另一半靠规则里的 `unless` 读成「没成功过」：
+    /// 补零要往样本面上多写一行，而这一格的全部内容就是「发生过」——它在样本面上
+    /// 的值本身不承载信息，缺席与零都是同一个答案。所以缺席不构成判据上的洞。
+    async fn record_poll_outcome(&self, ok: bool) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let mut labels = std::collections::HashMap::new();
+        labels.insert(
+            "outcome".to_string(),
+            if ok { "ok" } else { "failed" }.to_string(),
+        );
+        let _ = metrics
+            .record_counter(
+                cog_core::metric_names::MAINLINE_POLL_CYCLES_TOTAL,
+                1.0,
+                labels,
+            )
+            .await;
+    }
+
+    /// 一轮循环体：治理读数 → 轮询 → 记下这一轮是跑到底还是折了。
+    ///
+    /// 三件事同处一个函数是刻意的：结果读数若排在某条早退之后，「每轮都记」就变成
+    /// 「只有走到底的那些轮才记」，而走不到底的那些轮恰恰是它要报告的那批——本文件
+    /// 里已经有过一次这种缺陷（欠账读数的发射点排在在飞滚动的早退之后），那次是读数
+    /// 整格不落、伴生钟冻住，读它的规则把冻住的钟当成「写者停了」。摆在同一个函数
+    /// 里，回归测试才能对着「一轮折了」断言那一格照落，而不是把调用点再抄一遍。
+    async fn run_cycle(&self) {
+        // 排在滚动之前：这一轮可能有大半时间在构建，而治理读数答的是此刻集群的
+        // 执行力，与这一轮推不推进无关。
+        self.compare_governance().await;
+        match self.poll_once().await {
+            Ok(()) => self.record_poll_outcome(true).await,
+            Err(e) => {
+                warn!(error = %e, "mainline deployer poll failed");
+                self.record_poll_outcome(false).await;
+            }
+        }
+    }
+
     /// registry 上某 tag 当前内容构建自哪个 rev：manifest → config blob →
     /// `org.opencontainers.image.revision` 标签。多平台 index 多一跳，先下
     /// 第一个子 manifest 取它的 config digest（各平台同 rev，标签一致）。
@@ -5927,15 +5976,10 @@ pub async fn run_mainline_loop(
                         biased;
                         _ = shutdown.wait() => break,
                         _ = ticker.tick() => {
-                            // Ahead of the rollout: this cycle may spend a quarter
-                            // of an hour building, and the governance reading
-                            // answers how much the cluster enforces right now,
-                            // which has nothing to do with whether this cycle
-                            // carries a new revision.
-                            deployer.compare_governance().await;
-                            if let Err(e) = deployer.poll_once().await {
-                                warn!(error = %e, "mainline deployer poll failed");
-                            }
+                            // 一整轮体在 run_cycle 里，结果读数与这一轮的动作同处
+                            // 一个函数：它若排在某条早退之后，「每轮都记」就变成
+                            // 「只有走到底的那些轮才记」。
+                            deployer.run_cycle().await;
                             let due = last_heartbeat
                                 .map(|t| t.elapsed() >= heartbeat_every)
                                 .unwrap_or(true);
@@ -21157,6 +21201,82 @@ exit 0
         assert!(
             !bin_dir.join("buildah.log").exists(),
             "冷却里一次 buildah 都不该调"
+        );
+    }
+
+    /// 某格结果读数当前的值；这一格没写过就是 0。
+    async fn poll_cycles(
+        metrics: &std::sync::Arc<cog_storage::MemoryMetricsBackend>,
+        outcome: &str,
+    ) -> f64 {
+        metrics
+            .query_counter_totals(cog_core::metric_names::MAINLINE_POLL_CYCLES_TOTAL.as_str())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.labels.get("outcome").map(String::as_str) == Some(outcome))
+            .map(|s| s.value)
+            .unwrap_or(0.0)
+    }
+
+    /// 折了的那一轮同样要留下读数。
+    ///
+    /// 循环自己的存活读数在**每拍开头**盖章，量的是「它醒了」；这一格量的是「它的轮
+    /// 到了没有」。所以承重的断言是**一轮真的失败**时那一格照落——只在跑到底的轮上
+    /// 断言，等于把发射点又抄一遍：实测那次（发布那一步连着两小时拒绝清单包）失败
+    /// 的每一轮都止步在同一个地方，而别的读数全是绿的。
+    ///
+    /// 第二半同样承重：跑到底的那一轮只许动 `ok`，`failed` 那一格必须留在零，否则
+    /// 规则读的「failed 涨了而 ok 没涨」会在一个健康的循环上成立。
+    #[tokio::test]
+    // 同上：ENV_LOCK 串行化进程级 PATH 修改，需跨 await 持有。
+    async fn a_cycle_that_fails_still_leaves_its_outcome_reading() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, _rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, rev12(&rev_b));
+        let kubectl = fake_kubectl(&bin_dir, "reg.local:5000/cogneva:local");
+        let ws = test_workspaces(root, &bare);
+        fake_cargo(&bin_dir, ws.target_dir());
+        fake_strip(&bin_dir);
+
+        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let deployer = MainlineDeployer::new(cfg, ws).with_metrics(metrics.clone());
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
+        deployer.run_cycle().await;
+        assert_eq!(
+            poll_cycles(&metrics, "ok").await,
+            1.0,
+            "跑到底的那一轮要记在 ok 上"
+        );
+        assert_eq!(
+            poll_cycles(&metrics, "failed").await,
+            0.0,
+            "成功的轮不许动 failed 那一格"
+        );
+
+        // 把上游仓库拿走：下一轮的第一步（读 bare 的 main）就折，之后的动作一个也
+        // 做不成——这正是要报告的那种「每轮都失败」。
+        std::fs::remove_dir_all(&bare).unwrap();
+        deployer.run_cycle().await;
+        std::env::set_var("PATH", old_path);
+
+        assert_eq!(
+            poll_cycles(&metrics, "failed").await,
+            1.0,
+            "折了的那一轮必须留下自己的读数，否则「每轮都失败」与「没事可做」在\
+             读数面上同形"
+        );
+        assert_eq!(
+            poll_cycles(&metrics, "ok").await,
+            1.0,
+            "折了的那一轮不该动 ok 那一格"
         );
     }
 }

@@ -618,6 +618,16 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_mainline_supersession_checks_total",
         "crates/cog-reflection/src/mainline_deployer.rs",
     ),
+    // 轮询循环每一轮的结果。循环自己的存活读数（`loop_tick_age_seconds`）在每拍开头
+    // 盖章，量的是「它醒了」，量不到这一轮干了什么；而这一轮里别的读数（版本契约、
+    // CI 判词、那对越权计数）全写在会失败的那一步**之前**。2026-10-08 实测：发布那
+    // 一步连着两个多小时拒绝清单包，每一轮都折在那里，唯一的痕迹是一条会随下一个
+    // 滚动消失的 warn——同一段时间里心跳照打、判词照涨，「每轮都失败」与「没事可做」
+    // 在所有别的读数上同形。这一对是那件事分出来的那一面。
+    (
+        "cogneva_mainline_poll_cycles_total",
+        "crates/cog-reflection/src/mainline_deployer.rs",
+    ),
     // 版本契约的另一半：判定跑过了。它上面那条（`cogneva_version_contract_violations`）是
     // 按条款读的常驻值，而判定停摆时那条读数停在零——与契约成立同一个零——所以这个计数
     // 是分开两者的那一面。它每轮、每条款各写一次，且停在共享存储里：判定停了，最后那个
