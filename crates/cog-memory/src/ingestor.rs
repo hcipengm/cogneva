@@ -1059,6 +1059,7 @@ impl MemoryIngestor {
                 // 自己报出来——判定「做完了没」就是一条 summary 存在性查询，
                 // 缺席查不出缺席。
                 self.report_unextracted(&scan).await;
+                self.report_scan_outcome(false).await;
                 if scan.actionable.is_empty() {
                     return;
                 }
@@ -1082,7 +1083,33 @@ impl MemoryIngestor {
                     );
                 }
             }
-            Err(e) => warn!("Memory ingest reconcile scan failed: {}", e),
+            Err(e) => {
+                // 扫描取不到数时两个积压读数都不盖（它们只在拿到结果时才
+                // 有值），所以「读不出来」必须自己成一条读数：没有它，冻结
+                // 的值会让读它的规则在伴生钟上把「扫不动」当成「写者停了」
+                // 而静默，积压清没清就分不出来。每一次尝试都盖一格。
+                self.report_scan_outcome(true).await;
+                warn!("Memory ingest reconcile scan failed: {}", e);
+            }
+        }
+    }
+
+    /// 发布「这一次对账扫描有没有拿到结果」。
+    ///
+    /// 两个积压 gauge 只在 `Ok(scan)` 分支盖章，所以一次失败的扫描会让它们
+    /// 停在上一笔健康值上，而读 `_aged_out` 的规则按伴生钟年龄判写者死活——
+    /// 冻住的伴生钟把规则静默。这一格就是那件事自己的读数：拿到结果记 0、
+    /// 取不到记 1，每一次尝试都写。
+    async fn report_scan_outcome(&self, failed: bool) {
+        let Some(metrics) = self.metrics.as_ref() else {
+            return;
+        };
+        let name = cog_core::metric_names::MEMORY_UNEXTRACTED_SCAN_FAILED;
+        if let Err(e) = metrics
+            .record_gauge(name, if failed { 1.0 } else { 0.0 }, HashMap::new())
+            .await
+        {
+            warn!("Failed to record {name} gauge: {}", e);
         }
     }
 
@@ -2733,6 +2760,37 @@ mod tests {
         assert!(
             job_rx.try_recv().is_err(),
             "a closed gate must not enqueue work the upstream cannot serve"
+        );
+    }
+
+    /// 每次尝试都盖一格结局：成功的对账把它写回 0，取不到数的那一次写 1。
+    ///
+    /// 两个积压 gauge 只在 `Ok(scan)` 分支盖章，所以扫描失败时它们停在上一笔
+    /// 值上——读 `_aged_out` 的规则按伴生钟年龄在界内还信它。这一格必须在两条
+    /// 路径上都被写：只写失败的实现会让健康期没有读数（伴生钟不存在，规则反而
+    /// 常静），只写成功的实现正是它要修的那个形状。
+    #[tokio::test]
+    async fn the_scan_outcome_is_stamped_on_both_paths() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(RuleBasedExtractor::new()))
+            .with_metrics(metrics.clone());
+
+        let (job_tx, _job_rx) = mpsc::unbounded_channel();
+        let backlog = std::sync::atomic::AtomicUsize::new(0);
+        ingestor.reconcile(&job_tx, &backlog, false).await;
+        assert_eq!(
+            metrics.latest("memory_unextracted_scan_failed"),
+            Some(0.0),
+            "a reconcile that returned a result must stamp the outcome at zero"
+        );
+
+        ingestor.report_scan_outcome(true).await;
+        assert_eq!(
+            metrics.latest("memory_unextracted_scan_failed"),
+            Some(1.0),
+            "a scan that could not be completed is the reading the two backlog \
+             gauges cannot carry"
         );
     }
 

@@ -326,8 +326,13 @@ impl SampleLogCap {
                         held: outcome.held,
                     });
                     self.report(&outcome).await;
+                    self.report_pass_outcome(false).await;
                 }
                 Err(e) => {
+                    // 一次失败的 pass 让四个读数全部不盖，而两条容量规则按伴生
+                    // 钟年龄在界内还信它们——冻住的日志与不再增长的日志于是同形。
+                    // 「这一趟没拿到结果」必须自己成一条读数。
+                    self.report_pass_outcome(true).await;
                     warn!(table = self.table, error = %e, "Metrics sample capacity sweep failed")
                 }
             }
@@ -500,6 +505,17 @@ impl SampleLogCap {
         }
     }
 
+    /// 发布「这一趟 pass 有没有拿到结果」。
+    ///
+    /// 行数、预算、触底判词、字节四个读数只在 `Ok(outcome)` 分支盖章，所以
+    /// 一趟失败的 pass 会让它们全停在上一笔值上，而两条容量规则按伴生钟年龄
+    /// 在界内还信它们——扫不动与不再增长于是在读数上同形。这一格是那件事自己
+    /// 的读数：拿到结果记 0、取不到记 1，每一趟都写。
+    async fn report_pass_outcome(&self, failed: bool) {
+        let Some(ref mb) = self.metrics else { return };
+        publish_pass_outcome(mb, &self.labels(), failed).await;
+    }
+
     /// The labels every reading this loop publishes carries.
     ///
     /// One place, because the readings are read beside each other and a reader
@@ -542,6 +558,30 @@ impl SampleLogCap {
             .fetch_one(&self.pool)
             .await
             .map_err(|e| SFError::Database(e.to_string()))
+    }
+}
+
+/// Publish whether a sweep pass returned a result, under the same labels as the
+/// readings that pass produced.
+///
+/// Free rather than a method for the same reason [`delete_surplus_sql`] is: a
+/// test can drive it against a recording backend and assert both outcomes,
+/// instead of standing up a pool to reach one line through the loop.
+async fn publish_pass_outcome(
+    metrics: &Arc<dyn MetricsBackend>,
+    labels: &HashMap<String, String>,
+    failed: bool,
+) {
+    let value = if failed { 1.0 } else { 0.0 };
+    if let Err(e) = metrics
+        .record_gauge(
+            cog_core::metric_names::METRICS_SAMPLE_SWEEP_FAILED,
+            value,
+            labels.clone(),
+        )
+        .await
+    {
+        warn!(error = %e, "metrics sample sweep outcome emit failed");
     }
 }
 
@@ -633,6 +673,54 @@ mod tests {
             at: Instant::now() - Duration::from_secs(secs),
             held,
         })
+    }
+
+    /// Both outcomes of a pass land, and the labels the pass's other readings
+    /// carry are on them.
+    ///
+    /// The value readings this loop publishes are stamped only on the branch that
+    /// returned an outcome, so a pass that could not reach the database leaves
+    /// them frozen at their last values while the two capacity rules still trust
+    /// them for as long as the companion clock's age allows. This reading is the
+    /// one that separates "the sweep found nothing to do" from "the sweep could
+    /// not run": it is written on both branches, one row per pass, so the rule
+    /// reading it can tell a live quiet log from a silent one. The second
+    /// assertion pins that a failed pass is a 1 and not the absence of a row.
+    #[tokio::test]
+    async fn a_pass_outcome_is_written_on_both_branches() {
+        let concrete = std::sync::Arc::new(crate::MemoryMetricsBackend::new());
+        let metrics: std::sync::Arc<dyn MetricsBackend> =
+            std::sync::Arc::clone(&concrete) as std::sync::Arc<dyn MetricsBackend>;
+        let labels = HashMap::from([(DEPLOYMENT_LABEL.to_string(), "cogneva-app".to_string())]);
+        let now = chrono::Utc::now();
+
+        publish_pass_outcome(&metrics, &labels, false).await;
+        let ok = concrete
+            .query_gauge_range(
+                cog_core::metric_names::METRICS_SAMPLE_SWEEP_FAILED.as_str(),
+                now - chrono::Duration::minutes(5),
+                now + chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.len(), 1, "a returned pass publishes exactly one row");
+        assert_eq!(ok[0].value, 0.0);
+        assert_eq!(
+            ok[0].labels.get(DEPLOYMENT_LABEL),
+            Some(&"cogneva-app".to_string())
+        );
+
+        publish_pass_outcome(&metrics, &labels, true).await;
+        let failed = concrete
+            .query_gauge_range(
+                cog_core::metric_names::METRICS_SAMPLE_SWEEP_FAILED.as_str(),
+                now - chrono::Duration::minutes(5),
+                now + chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.len(), 2, "a failed pass publishes its own row");
+        assert_eq!(failed.last().unwrap().value, 1.0);
     }
 
     /// A log filling at ten rows a second with nine hundred rows of headroom

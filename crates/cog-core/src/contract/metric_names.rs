@@ -132,13 +132,16 @@ metric_names! {
     MEMORY_OPERATION_ERRORS_TOTAL => "memory_operation_errors_total",
     MEMORY_UNEXTRACTED_RAW => "memory_unextracted_raw",
     MEMORY_UNEXTRACTED_RAW_AGED_OUT => "memory_unextracted_raw_aged_out",
+    MEMORY_UNEXTRACTED_SCAN_FAILED => "memory_unextracted_scan_failed",
 
     // cog-storage — the metric store's own readings and tier migration.
     METRICS_RETIRED_ROWS_REMOVED => "metrics_retired_rows_removed",
+    METRICS_RETIREMENT_RELEASE_FAILED => "metrics_retirement_release_failed",
     METRICS_SAMPLES_OVER_CAPACITY => "metrics_samples_over_capacity",
     METRICS_SAMPLES_BYTES => "metrics_samples_bytes",
     METRICS_SAMPLES_BUDGET_ROWS => "metrics_samples_budget_rows",
     METRICS_SAMPLES_ROWS => "metrics_samples_rows",
+    METRICS_SAMPLE_SWEEP_FAILED => "metrics_sample_sweep_failed",
     TIER_MIGRATION_TOTAL => "tier_migration_total",
 
     // cog-reflection — workspace index and generated-change fidelity.

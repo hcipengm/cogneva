@@ -59,6 +59,7 @@ const RELEASE_BATCH: i64 = 5_000;
 /// draining, and a merged scalar would hide which of the four it is — while a
 /// series shared by two deployments hides which of *them* it is.
 use cog_core::metric_names::METRICS_RETIRED_ROWS_REMOVED as RETIRED_ROWS_REMOVED_METRIC;
+use cog_core::metric_names::METRICS_RETIREMENT_RELEASE_FAILED as RETIREMENT_RELEASE_FAILED_METRIC;
 
 /// What one release pass removed, per table.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -282,9 +283,28 @@ impl RetirementPass {
                     );
                 }
                 self.report(&outcome).await;
+                self.report_outcome(false).await;
             }
-            Err(e) => warn!(error = %e, "Retired metric release failed"),
+            Err(e) => {
+                // release 失败时那一格不盖，读它的规则会按伴生钟年龄把「没在
+                // 排空」当成「写者停了」而对一个冻住的值静默。这一格是那件事
+                // 自己的读数：每一趟都盖，成功 0、失败 1。
+                self.report_outcome(true).await;
+                warn!(error = %e, "Retired metric release failed")
+            }
         }
+    }
+
+    /// 发布「这一趟 release 有没有拿到结果」。
+    ///
+    /// `metrics_retired_rows_removed` 只在 `Ok(outcome)` 分支盖章，所以一次
+    /// 失败的 release 会让它停在上一笔值上，而 `metrics_retired_rows_still_arriving`
+    /// 的年龄守卫在界内还信它——release 跑不动与表已经排空于是在读数上同形。
+    /// 带 deployment 标签，理由与那一格相同：每台都在跑这个循环，不带就会
+    /// 把两台合进同一条序列。
+    async fn report_outcome(&self, failed: bool) {
+        let Some(ref mb) = self.metrics else { return };
+        publish_release_outcome(mb, failed, self.deployment.as_deref()).await;
     }
 
     /// Publish what the pass removed from each table, every cycle.
@@ -347,6 +367,44 @@ async fn publish_removals(
                 "retirement removal gauge emit failed"
             );
         }
+    }
+}
+
+/// One row per pass, saying whether the release returned.
+///
+/// The removal rows above are stamped only once the release returns, so a
+/// release that fails leaves the reader of those rows trusting the last value
+/// until its own age bound closes the rule over it — a release that cannot run
+/// and a table that is drained read the same. This is the reading that answers
+/// for the pass itself: 0 when it returned, 1 when it did not, written every
+/// pass. It carries the deployment for the same reason the removal rows do —
+/// one store is shared, and a series without the name would carry two
+/// deployments' passes.
+///
+/// Split out of the pass so the row it writes can be read and tested without a
+/// live store, exactly as [`publish_removals`] is.
+async fn publish_release_outcome(
+    metrics: &std::sync::Arc<dyn MetricsBackend>,
+    failed: bool,
+    deployment: Option<&str>,
+) {
+    let mut labels = HashMap::new();
+    if let Some(deployment) = deployment {
+        labels.insert(DEPLOYMENT_LABEL.to_string(), deployment.to_string());
+    }
+    if let Err(e) = metrics
+        .record_gauge(
+            RETIREMENT_RELEASE_FAILED_METRIC,
+            if failed { 1.0 } else { 0.0 },
+            labels,
+        )
+        .await
+    {
+        warn!(
+            error = %e,
+            metric = %RETIREMENT_RELEASE_FAILED_METRIC,
+            "retirement release outcome gauge emit failed"
+        );
     }
 }
 
@@ -552,6 +610,50 @@ mod tests {
             assert!(
                 !labels.contains_key(DEPLOYMENT_LABEL),
                 "a deployment nobody named must publish no name at all: {labels:?}"
+            );
+        }
+    }
+
+    /// The reading that answers for the pass itself moves off zero when the
+    /// release does not return, which is the shape the removal rows cannot show:
+    /// they are simply not written, and the store goes on serving their last
+    /// value.
+    ///
+    /// The row is judged on both faces — a row exists for a returning pass and
+    /// it says zero, and a failing pass writes a newer row that says one — so an
+    /// implementation that only ever wrote zeros, or only ever wrote on failure,
+    /// is caught rather than passed.
+    #[tokio::test]
+    async fn the_release_outcome_says_whether_the_pass_returned() {
+        let (concrete, metrics) = backend();
+
+        publish_release_outcome(&metrics, false, Some("probe-deployment")).await;
+        publish_release_outcome(&metrics, true, Some("probe-deployment")).await;
+
+        let rows = concrete
+            .query_gauge_range(
+                RETIREMENT_RELEASE_FAILED_METRIC.as_str(),
+                chrono::Utc::now() - chrono::Duration::minutes(5),
+                chrono::Utc::now() + chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "both passes are reported: {rows:?}");
+        assert_eq!(
+            rows[0].value, 0.0,
+            "a pass that returned reports zero, not silence: {rows:?}"
+        );
+        assert_eq!(
+            rows[1].value, 1.0,
+            "a pass that did not return is the reading the removal rows are \
+             missing: {rows:?}"
+        );
+        for row in &rows {
+            assert_eq!(
+                row.labels.get(DEPLOYMENT_LABEL).map(String::as_str),
+                Some("probe-deployment"),
+                "the outcome names who ran the pass, for the same reason the \
+                 removal rows do: {row:?}"
             );
         }
     }

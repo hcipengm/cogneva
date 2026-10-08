@@ -435,8 +435,31 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          will not pick these up again without a budgeted backfill",
     ),
     (
+        "memory_unextracted_scan_failed",
+        "Whether the last reconcile scan could not be completed, 1 or 0. The \
+         two backlog readings above are stamped only once the scan returns a \
+         result, so a scan that fails leaves them at their last, healthy value \
+         while the rule over the aged-out one goes on trusting them until its \
+         age bound closes it -- an unreadable backlog and a cleared one then \
+         look the same. This is the reading that says the scan itself did not \
+         answer; it is written on every attempt, so a scan that completes \
+         keeps it at 0",
+    ),
+    (
         "metrics_samples_rows",
         "Rows currently held in the metrics sample log",
+    ),
+    (
+        "metrics_sample_sweep_failed",
+        "Whether the last sample-log pass could not be completed, 1 or 0 \
+         (a pass is the sweep when the log is over budget, otherwise the \
+         measure). The row count, the budget, the floor verdict and the bytes \
+         are all stamped only once a pass returns, so a pass that fails leaves \
+         every one of them at its last value, and the two capacity rules then \
+         trust a frozen log until their age bound closes them -- a sweep that \
+         cannot run and a log that is not growing look the same. This reading \
+         says the pass itself did not answer; it is written on every pass, so a \
+         pass that completes keeps it at 0",
     ),
     (
         "metrics_samples_budget_rows",
@@ -471,6 +494,17 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          alone would carry two deployments' passes, and the reader's minimum \
          over that series is zero whenever the pass that ran second found the \
          rows already gone",
+    ),
+    (
+        "metrics_retirement_release_failed",
+        "Whether the last retired-rows release pass could not be completed, 1 \
+         or 0. The removal reading above is stamped only once the release \
+         returns, so a release that fails leaves it at its last value, and the \
+         rule that watches it goes on reading a frozen count until its age \
+         bound closes it -- a release that cannot run and a table that is \
+         drained look the same. This reading says the pass itself did not \
+         answer; it is written on every pass, so a pass that completes keeps it \
+         at 0",
     ),
     (
         "llm_upstream_healthy",

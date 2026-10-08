@@ -1254,6 +1254,67 @@ fn a_rule_guarding_the_index_sample_waits_longer_than_its_heartbeat() {
     }
 }
 
+/// A pass-outcome reading must be guarded on the same horizon its sibling is.
+///
+/// Three loops write their value readings only once a pass returns and publish
+/// a separate reading for the pass itself, because a pass that fails leaves the
+/// values frozen where the store keeps serving them. The point of that pairing
+/// is that a reader of the sibling hears about the stall on the outcome series;
+/// if the outcome rule bound a *different* horizon than its sibling, the window
+/// between the two would be a stretch where neither speaks and the frozen value
+/// reads as healthy -- the shape C161 fixed for the version contract by putting
+/// both halves on one bound. Each pair is asserted by name so a rename or a
+/// dropped rule shows up as an empty denominator rather than a green count.
+#[test]
+fn a_pass_outcome_rule_is_guarded_on_the_same_horizon_as_its_sibling() {
+    let pairs = [
+        (
+            cog_core::metric_names::MEMORY_UNEXTRACTED_SCAN_FAILED.as_str(),
+            cog_core::metric_names::MEMORY_UNEXTRACTED_RAW_AGED_OUT.as_str(),
+        ),
+        (
+            cog_core::metric_names::METRICS_SAMPLE_SWEEP_FAILED.as_str(),
+            cog_core::metric_names::METRICS_SAMPLES_ROWS.as_str(),
+        ),
+        (
+            cog_core::metric_names::METRICS_RETIREMENT_RELEASE_FAILED.as_str(),
+            cog_core::metric_names::METRICS_RETIRED_ROWS_REMOVED.as_str(),
+        ),
+    ];
+    for (outcome, sibling) in pairs {
+        let outcome_bound = guarded_bounds(outcome);
+        let sibling_bound = guarded_bounds(sibling);
+        assert!(
+            !outcome_bound.is_empty(),
+            "{outcome} 的伴生钟没有任何规则取年龄界——结局读数没有读者，判据对它等于没有题目"
+        );
+        assert!(
+            !sibling_bound.is_empty(),
+            "{sibling} 的伴生钟没有任何规则取年龄界——兄弟那一半没有读者"
+        );
+        for bound in &outcome_bound {
+            assert!(
+                sibling_bound.contains(bound),
+                "{outcome} 的守卫界 {bound}s 与它的兄弟 {sibling} 的界 {sibling_bound:?} 不在一条线上——\
+                 两界之间那段窗口里两半都不说话，冻住的值就被读成健康的"
+            );
+        }
+    }
+}
+
+/// Every age bound any shipped rule places on this metric's companion clock.
+fn guarded_bounds(metric: &str) -> Vec<u64> {
+    let mut bounds = Vec::new();
+    for (_rule, promql) in chart_rules() {
+        if let Some(bound) = companion_age_bound(&promql, metric) {
+            bounds.push(bound);
+        }
+    }
+    bounds.sort_unstable();
+    bounds.dedup();
+    bounds
+}
+
 /// No shipped rule may guard a store-served gauge with a change count over its
 /// companion.
 ///
