@@ -1516,6 +1516,14 @@ enum Unread {
 /// refusals, the version contract, and the worktree index. The entries below are
 /// what remained, each with the reason it was not closed in that pass.
 ///
+/// An entry's reason is a claim about the repository and it goes stale the way
+/// any other claim does -- the build store's round pair was filed here as
+/// needing "a declared deferral budget" and four days later the sibling reading
+/// on the same completion cadence was already being read against exactly that
+/// budget. The pair's entries are gone because the reader was written; a reason
+/// that says a bound is missing is worth re-reading against the rules before it
+/// is believed.
+///
 /// `Elsewhere` is a decision: the same fact is already stated by a surface that
 /// is read, named here. `Gap` is a debt: nothing states the fact, and the reason
 /// it could not be closed is what the entry carries -- a missing declared bound,
@@ -1601,14 +1609,6 @@ const UNREAD: &[(&str, Unread)] = &[
         Unread::Gap("seconds the tag server was held away per induced restart; the help's criterion is a ratio against the tags deleted, so the reader needs a pair and a bound on how much deferral is acceptable, neither declared"),
     ),
     (
-        "cogneva_buildah_store_rounds_total",
-        Unread::Gap("a round is attempted only after a declared cooldown, but the cooldown does not decide when one completes: the pass takes the shared build slot and returns without a reading when the host is building. Measured over three days the completed rounds sat 19h, 36h and 6h apart, so no window can be read off the series and the reader would have to invent one. The six samples of cogneva_buildah_store_reading_unix still retained sit 6.03 to 6.11 hours apart, which is that cooldown plus a tick with the slot free -- the two observations are the same statement, that the spacing is cooldown plus whatever the slot cost, so the missing piece is a declared deferral budget rather than a reader"),
-    ),
-    (
-        "cogneva_buildah_store_reading_unix",
-        Unread::Gap("the producer now publishes the persisted reading on the first judgement a process makes, so a store no round has ever finished is a 0 that does not move rather than an absent series, and the pair its sibling's help names -- attempts rising against a timestamp that does not move -- can be read off the face. What still keeps a reader unopened is the bound: the timestamp only advances when a round completes, and the retained samples of this series show completions 6.03 to 6.11 hours apart, which is the declared cooldown plus a tick with the build slot free, so the fault is a round the slot kept deferring and no series declares how much deferral is too much"),
-    ),
-    (
         "cogneva_buildah_store_pruned_images_total",
         Unread::Gap("written only when a round freed an image, so its absence is not a zero; the window a reader needs is the build-slot-gated completion cadence, which no series publishes"),
     ),
@@ -1680,7 +1680,14 @@ fn unresolved_readers(read: &BTreeSet<String>, name: &str, readers: &[&str]) -> 
 /// that nothing else states must be classified, and calling it a gap raises
 /// this number on purpose -- the point of the ratchet is that the increase is a
 /// decision someone made, not a drift nobody saw.
-const GAPS_AT_CENSUS: usize = 23;
+///
+/// It comes down when a debt is paid, and that is what happened to the build
+/// store's round pair: both entries said the missing piece was a declared
+/// deferral budget, and the twelve-hour bound the sibling reading on the same
+/// completion cadence is already read against *is* that budget. The two entries
+/// left the table in the pass that wrote `buildah_store_round_incomplete`, so
+/// 23 became 21.
+const GAPS_AT_CENSUS: usize = 21;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {
