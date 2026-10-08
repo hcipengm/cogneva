@@ -30,8 +30,8 @@ mod promql;
 
 use producer::carries_the_producer;
 use promql::{
-    bare_observation_reads, lagged_equality_complaints, metric_names_in, shape_complaints,
-    uncovered_window_complaints, unguarded_store_reading_complaints, window_over_series,
+    bare_observation_reads, companion_age_bound, lagged_equality_complaints, metric_names_in,
+    shape_complaints, uncovered_window_complaints, unguarded_store_reading_complaints,
     windows_over,
 };
 
@@ -1010,25 +1010,33 @@ fn a_rule_that_certifies_a_window_requires_the_window_to_be_covered() {
 /// good: no repair to the thing being measured can clear it, because the series
 /// the rule reads has stopped being connected to it. The companion
 /// `_observed_timestamp_seconds` is the one series that moves when the writer
-/// does, so the reading is `changes()` over it.
+/// does and its value is the instant the row was stored, so the reading is an
+/// age bound on it: `(time() - companion) < <bound>`.
+///
+/// The bound is on the writer's own clock rather than on a change count, and the
+/// difference is what the guard is: the companion is rendered per scrape, so a
+/// `changes()` over it counts only what this serving pod has seen, and a pod
+/// younger than the writer's cadence reads zero for a writer that is running
+/// perfectly well. See [`no_shipped_rule_guards_a_store_gauge_with_a_change_count`].
+///
+/// The family comes from [`gated_store_gauges`], and four rules were hand-fixed
+/// one at a time before this test existed -- the next rule to read one of these
+/// gauges had no way to be told.
+/// The gauges the metric store serves, minus the durable pool family.
 ///
 /// The family is taken from the exposition's own description tables rather than
 /// by searching the rule text for metric names. A name search over the rules
 /// answers a different question and answers it wrong: it picks up series
 /// exposed straight from a process's `/metrics`, which fall out of the scrape
 /// with their producer and so never freeze, and it misses the family boundary
-/// entirely -- four rules were hand-fixed one at a time before this test, and
-/// the next rule to read one of these gauges had no way to be told.
+/// entirely.
 ///
-/// The durable pool gauges are excluded, and the exclusion is mechanical rather
-/// than a list of names: their writer rewrites only a value that has not moved
-/// once per `DURABLE_GAUGE_HEARTBEAT`, which is why the criterion they carry is
-/// a window longer than that heartbeat, checked in
-/// `a_rule_windowing_a_durable_gauge_waits_longer_than_the_writers_heartbeat`.
-/// Whether they also want this guard is a separate question, and this test does
-/// not settle it.
-#[test]
-fn a_rule_reading_a_store_gauge_requires_its_writer() {
+/// The durable pool gauges are excluded mechanically rather than by a list of
+/// names: their writer rewrites a value that has not moved once per
+/// `DURABLE_GAUGE_HEARTBEAT`, which is why the criterion they carry is a window
+/// longer than that heartbeat. Whether they also want this guard is a separate
+/// question.
+fn gated_store_gauges() -> BTreeSet<String> {
     let durable: BTreeSet<&str> = cog_gateway::security_gateway::DURABLE_POOL_GAUGES
         .iter()
         .map(|name| name.as_str())
@@ -1050,6 +1058,12 @@ fn a_rule_reading_a_store_gauge_requires_its_writer() {
         "闭集里非耐久 gauge 只剩 {} 条，这条判据已经形同虚设",
         gated.len()
     );
+    gated
+}
+
+#[test]
+fn a_rule_reading_a_store_gauge_requires_its_writer() {
+    let gated = gated_store_gauges();
 
     let mut complaints: Vec<String> = Vec::new();
     let mut windowed = 0usize;
@@ -1104,15 +1118,28 @@ fn a_windowless_read_is_the_subject_unless_arithmetic_holds_it() {
         "无窗口地把共享表 gauge 当观测读，没有被报出来"
     );
     // The same read with the writer asked about, in the shape the shipped rule
-    // now uses: silent.
+    // uses: silent.
     assert!(
+        unguarded_store_reading_complaints(
+            "sum(max by (intent, stage) (cogneva_change_funnel{intent=\"unattributed\"} \
+             and ((time() - cogneva_change_funnel_observed_timestamp_seconds) < 3600))) > 0",
+            &funnel
+        )
+        .is_empty(),
+        "要求了写者还在写，却被报成没有"
+    );
+    // And the shape that only looks like one, refused here too: the count over a
+    // per-scrape companion reads how long this pod has been serving the series,
+    // not how long ago the writer wrote.
+    assert_eq!(
         unguarded_store_reading_complaints(
             "sum(max by (intent, stage) (cogneva_change_funnel{intent=\"unattributed\"} \
              and (changes(cogneva_change_funnel_observed_timestamp_seconds[1h]) > 0))) > 0",
             &funnel
         )
-        .is_empty(),
-        "要求了写者还在写，却被报成没有"
+        .len(),
+        1,
+        "把「我这个 Pod 起了多久」当成守卫的写法没有被报出来"
     );
     // A bound: an operand of `*`, so not the subject.
     assert!(
@@ -1137,40 +1164,79 @@ fn a_windowless_read_is_the_subject_unless_arithmetic_holds_it() {
 }
 
 /// The guard over the census has to look back further than the publisher's own
-/// heartbeat, the same way the durable pool gauges' windows have to.
+/// heartbeat, the same way the durable pool gauges' bounds have to.
 ///
 /// A cell is stamped when its count moves and, for one that is not moving, once
-/// per `CENSUS_HEARTBEAT`. So a guard no longer than that gap is satisfied by a
-/// live census sitting between two of its own stamps: the change count over its
-/// companion is zero for a writer that is running perfectly well. Neither
-/// number is written into this test -- the window comes out of the shipped
-/// expression and the heartbeat out of the publisher -- because a window chosen
-/// against a constant drifts from it the moment either side moves, and the
-/// drift is silent and in the direction that fires on a working system.
+/// per `CENSUS_HEARTBEAT`. So an age bound no longer than that gap is failed by a
+/// live census sitting between two of its own stamps. Neither number is written
+/// into this test -- the bound comes out of the shipped expression and the
+/// heartbeat out of the publisher -- because a bound chosen against a constant
+/// drifts from it the moment either side moves, and the drift is silent and in
+/// the direction that fires on a working system.
 #[test]
 fn a_rule_guarding_the_census_waits_longer_than_the_census_heartbeat() {
-    let companion = cog_core::observability_text::observed_timestamp_name(
-        cog_core::metric_names::CHANGE_FUNNEL.as_str(),
-    );
     let heartbeat = cog_github::change_funnel::CENSUS_HEARTBEAT.as_secs();
     assert!(heartbeat > 0, "普查心跳为 0，下面这条判据恒真");
 
     let mut guarded = 0usize;
     for (rule, promql) in chart_rules() {
-        let Some(window) = window_over_series(&promql, &companion) else {
+        let Some(bound) =
+            companion_age_bound(&promql, cog_core::metric_names::CHANGE_FUNNEL.as_str())
+        else {
             continue;
         };
         guarded += 1;
         assert!(
-            window > heartbeat,
-            "{rule}: 守卫窗口 {window}s 不严格长于普查心跳 {heartbeat}s——\
+            bound > heartbeat,
+            "{rule}: 守卫的年龄界 {bound}s 不严格长于普查心跳 {heartbeat}s——\
              写者坐在两次盖章之间就能造出这个空窗，判据会在完好的普查上点亮"
         );
     }
     // 分母：没有一条规则读普查的伴生钟时，上面那句「没有投诉」是空的。
     assert!(
         guarded > 0,
-        "没有任何规则对普查的伴生钟取窗口，这条判据没有分母"
+        "没有任何规则对普查的伴生钟取年龄界，这条判据没有分母"
+    );
+}
+
+/// No shipped rule may guard a store-served gauge with a change count over its
+/// companion.
+///
+/// The companion is rendered per scrape, so each serving pod carries its own
+/// series and a range over it can only count changes since that series began. A
+/// pod younger than the writer's cadence therefore reads zero for a writer that
+/// is running normally, and the guard reports the reader's uptime as the
+/// writer's absence -- the direction that hides a real fault. The gate reports
+/// the shape, so what this test adds is the denominator: the sweep has to be
+/// reading the shipped rule set at all, and the family has to be non-empty.
+#[test]
+fn no_shipped_rule_guards_a_store_gauge_with_a_change_count() {
+    let gated = gated_store_gauges();
+    let mut offenders: Vec<String> = Vec::new();
+    let mut with_age_bound = 0usize;
+    for (rule, promql) in chart_rules() {
+        for name in &gated {
+            if !promql.contains(name.as_str()) {
+                continue;
+            }
+            let companion = cog_core::observability_text::observed_timestamp_name(name);
+            if promql.contains(&format!("changes({companion}[")) {
+                offenders.push(format!("{rule} 用 changes({companion}[…]) 守 {name}"));
+            }
+            if companion_age_bound(&promql, name).is_some() {
+                with_age_bound += 1;
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "共享表 gauge 的守卫必须是对绝对时刻取年龄（`(time() - <伴生钟>) < <界>`）：\n{}",
+        offenders.join("\n")
+    );
+    // 分母：一族守卫全被删掉时，空 offenders 什么也不证明。
+    assert!(
+        with_age_bound >= 9,
+        "只有 {with_age_bound} 条规则对共享表 gauge 取了年龄界，守卫一族像是被删掉了"
     );
 }
 

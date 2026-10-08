@@ -581,28 +581,44 @@ pub fn windows_over(expr: &str, gated: &BTreeSet<String>) -> Vec<(String, u64)> 
     out
 }
 
-/// The window a rule looks over one named series, or `None` when it does not
-/// name it at all.
+/// The age bound a rule puts on one series' companion, or `None` when it puts
+/// none.
 ///
 /// The companion a rule guards a store-served gauge with is not itself in
 /// `gated` -- it is the reading that answers the question, not a gauge the store
-/// serves under that name -- so [`windows_over`] cannot find it. It is still a
-/// window with a number in it, and that number is what has to clear the
-/// writer's own heartbeat: a guard whose window is no longer than the gap
-/// between two of the writer's stamps is satisfied by a healthy writer sitting
-/// in that gap.
+/// serves under that name -- so [`windows_over`] cannot find it. What a guard
+/// names is a number, and that number is what has to clear the writer's own
+/// cadence: an age bound no longer than the gap between two of the writer's
+/// stamps is failed by a healthy writer sitting in that gap.
 ///
-/// The alert-rule contract is the only reader: it is where a guard's window is
+/// The alert-rule contract is the only reader: it is where a guard's bound is
 /// compared to a writer's cadence, and the dashboard contract compares nothing
 /// to a heartbeat. Kept here rather than there so both sides of the contract
-/// read windows through one function instead of two that drift.
+/// read bounds through one function instead of two that drift.
+///
+/// The bound is read off the compacted expression, so the rule may spell the
+/// arithmetic with any spacing; a `>` instead of a `<` is not an age bound but
+/// the inverse reading (a rule that fires on the reading being stale), and is
+/// deliberately not returned.
 #[allow(dead_code)]
-pub fn window_over_series(expr: &str, series: &str) -> Option<u64> {
-    let stripped = strip_braces(&strip_quoted(expr));
-    let needle = format!("{series}[");
-    let at = stripped.find(&needle)? + needle.len();
-    let close = stripped[at..].find(']').map(|p| at + p)?;
-    duration_seconds(stripped[at..close].split(':').next().unwrap_or(""))
+pub fn companion_age_bound(expr: &str, series: &str) -> Option<u64> {
+    companion_age_bound_in(&strip_braces(&strip_quoted(expr)), series)
+}
+
+fn companion_age_bound_in(stripped: &str, series: &str) -> Option<u64> {
+    let companion = cog_core::observability_text::observed_timestamp_name(series);
+    let compact: String = stripped.chars().filter(|c| !c.is_whitespace()).collect();
+    let needle = format!("time()-{companion}");
+    let after = compact.find(&needle)? + needle.len();
+    let rest = compact[after..]
+        .strip_prefix(')')
+        .unwrap_or(&compact[after..]);
+    let rest = rest.strip_prefix('<')?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// The window of every call to `func` in `expr`, in seconds.
@@ -695,8 +711,18 @@ pub fn uncovered_window_complaints(expr: &str) -> Vec<String> {
 /// what the number measures can clear it, because the series the rule reads is
 /// no longer connected to what it names. The companion
 /// `_observed_timestamp_seconds` is the one series that moves when the writer
-/// does, at a spelling the exposition and every reader share, so what a rule
-/// needs is `changes()` on the companion in the same expression.
+/// does, at a spelling the exposition and every reader share, and its value is
+/// the instant the row was stored -- so what a rule needs is an age bound on it,
+/// `(time() - companion) < <bound>`, in the same expression.
+///
+/// The obvious-looking alternative is refused. A `changes(companion[W]) > 0`
+/// guard reads the same question and answers a different one: the companion is
+/// rendered per scrape, so each serving pod carries its own series and a range
+/// over it can only count changes since that series began. A pod younger than
+/// the writer's cadence therefore reads zero for a writer that is writing
+/// normally, and the guard reports the reader's uptime as the writer's absence.
+/// An age is the same number in every reader, which is what makes it a statement
+/// about the writer.
 ///
 /// Two shapes read a stored value as an observation, and both are checked. A
 /// range selector hung off the series reads the stored value as an observation
@@ -709,11 +735,12 @@ pub fn uncovered_window_complaints(expr: &str) -> Vec<String> {
 /// whose writers stamp a heartbeat is checked against that heartbeat instead.
 ///
 /// The ceiling, stated the way the rest of this module states ceilings: the
-/// guard is matched by presence, so its window is not compared to the value's
-/// and its position is not decided here. A `changes()` sitting after a
-/// reduction that has already merged the writers passes this check and is still
-/// the shape that let one live stream carry the gate for a stopped one; that
-/// arrangement is asserted rather than assumed in the tests below.
+/// guard is matched by presence, so its bound is not compared to the value's and
+/// its position is not decided here. An age bound sitting after a reduction that
+/// has already merged the writers passes this check and is still the shape that
+/// lets one live stream carry the gate for a stopped one; that arrangement is
+/// asserted rather than assumed in the tests below, and where it was found in
+/// the shipped rules it was moved inside the reduction instead.
 pub fn unguarded_store_reading_complaints(expr: &str, gated: &BTreeSet<String>) -> Vec<String> {
     let stripped = strip_braces(&strip_quoted(expr));
     let mut out = Vec::new();
@@ -726,11 +753,15 @@ pub fn unguarded_store_reading_complaints(expr: &str, gated: &BTreeSet<String>) 
         if guarded_by_its_companion(&stripped, &name) {
             continue;
         }
+        if guard_counts_changes(&stripped, &name) {
+            out.push(change_count_complaint(&name, &companion));
+            continue;
+        }
         out.push(format!(
             "`{name}` 是共享表服务的 gauge：写者停了它不会缺席，只会把最后一笔值永久送出去，\
              于是规则把这一刻的值读成窗口里的观测。这条规则对 `{name}` 取了 {window}s 的窗口，\
-             却没有在同一表达式里要求写者还在写——`changes({companion}[<窗口>]) > 0`。\
-             少了这一项，一个死在点火那侧的写者会让这条规则永久点亮，谁也没法熄灭它"
+             却没有在同一表达式里要求写者还在写——`(time() - {companion}) < <界>`，界要宽过写者\
+             自己的节奏。少了这一项，一个死在点火那侧的写者会让这条规则永久点亮，谁也没法熄灭它"
         ));
     }
     for name in bare_observation_reads(expr, gated) {
@@ -741,25 +772,66 @@ pub fn unguarded_store_reading_complaints(expr: &str, gated: &BTreeSet<String>) 
         if guarded_by_its_companion(&stripped, &name) {
             continue;
         }
+        if guard_counts_changes(&stripped, &name) {
+            out.push(change_count_complaint(&name, &companion));
+            continue;
+        }
         out.push(format!(
             "`{name}` 是共享表服务的 gauge，而这条规则把它读成自己观测的量：没有窗口，也不在\
              任何一个算术量的位置上（不是阈值、不是 `time() - …` 的那一半）。写者停了它不会\
              缺席，只会把最后一笔值永久送出去，于是判词说的一直是最后那一刻的事，而没有任何\
-             东西能把那条判词改回来。要求写者还在写：`{name}` 与 `changes({companion}[<窗口 > 心跳]) > 0` \
-             取交（判据只认有没有，不比对窗口长短）"
+             东西能把那条判词改回来。要求写者还在写：`{name}` 与 `(time() - {companion}) < <界>` \
+             取交（判据只认有没有，不比对界的长短）"
         ));
     }
     out
 }
 
-/// Whether `stripped` asks after the writer of `name` at all.
+/// The complaint for the guard that looks like a writer check and is not one.
 ///
-/// Matched by presence, on purpose: the exposition renders one companion
-/// spelling for every series, and a rule that names it is asking the question
-/// this gate is about. Whether the window it asks over is the right one is a
-/// different criterion, held where the window and the writer's own cadence can
-/// be compared.
+/// Split out because both reading shapes can carry it and the reason is the same
+/// sentence: what the count reads is the reader, not the writer.
+fn change_count_complaint(name: &str, companion: &str) -> String {
+    format!(
+        "`{name}` 是共享表服务的 gauge，这条规则用 `changes({companion}[<窗>]) > 0` 守它，\
+         而这个计数读的不是写者。伴生钟是按抓取渲染的：每个服务 Pod 各有一条自己的序列，\
+         `changes()` 只能数到**这条序列开始之后**的变化，所以一个比写者节奏还年轻的服务 Pod，\
+         对一条正常在写的写者读出来也是 0——守卫把「我这个 Pod 起了多久」当成了「写者停了没有」，\
+         读者在役时长被报成了写者的缺席。改成对绝对时刻取年龄：`(time() - {companion}) < <界>`，\
+         界要宽过写者自己的节奏（实测：一条守六小时一轮、窗取十二小时的规则，在 30 条被服务的\
+         序列里 26 条读出 0，两条在役的也在内，而库里最新一行只有 2.4 小时新）"
+    )
+}
+
+/// Whether `stripped` asks after the writer of `name` in the shape that reads an
+/// absolute instant.
+///
+/// The companion is rendered beside every series the store serves, and its value
+/// is the instant the writer's newest row was stored. So `time() - companion` is
+/// a statement about the writer that no reader's own uptime can move: it is the
+/// same number in a pod that has been up for a second as in one that has been up
+/// for a week. That is the shape this gate looks for, and the companion's name
+/// being present is the whole of the test.
+///
+/// A `changes(companion[W]) > 0` guard is not accepted, and says why in its
+/// complaint: a range over a per-scrape series can only count changes since that
+/// series began, so a serving pod younger than the writer's cadence reads zero
+/// for a writer that is running perfectly well. The guard then answers how long
+/// the reader has been up and reports it as the writer's absence. Measured on
+/// this deployment: a rule guarding a six-hourly round with a twelve-hour window
+/// read zero on 26 of the 30 series the store served, both live ones included,
+/// while the newest stored row was 2.4 hours old.
+///
+/// Matched by presence, on purpose: whether the bound a rule names is longer than
+/// the writer's own cadence is a different criterion, held where the bound and
+/// the cadence can be compared.
 fn guarded_by_its_companion(stripped: &str, name: &str) -> bool {
+    companion_age_bound_in(stripped, name).is_some()
+}
+
+/// Whether `stripped` guards `name` with a change count over its companion at
+/// all, which is the shape [`guarded_by_its_companion`] refuses.
+fn guard_counts_changes(stripped: &str, name: &str) -> bool {
     let companion = cog_core::observability_text::observed_timestamp_name(name);
     stripped.contains(&format!("changes({companion}["))
 }
@@ -1150,9 +1222,9 @@ mod tests {
     }
 
     /// The store-gauge guard, on the shapes the shipped rules really carry: the
-    /// companion `changes()` is what separates reading a live writer's series
-    /// from reading a value the store will hand back forever -- over a window,
-    /// and with no window at all.
+    /// age bound on the companion is what separates reading a live writer's
+    /// series from reading a value the store will hand back forever -- over a
+    /// window, and with no window at all.
     #[test]
     fn a_store_gauge_without_its_companion_guard_is_reported() {
         let gated: BTreeSet<String> = ["metrics_samples_rows"]
@@ -1165,7 +1237,7 @@ mod tests {
         assert!(unguarded_store_reading_complaints(
             "(max without (pod, container, instance) \
              (min_over_time(metrics_samples_rows[30m]) \
-             and (changes(metrics_samples_rows_observed_timestamp_seconds[30m]) > 0))) > 0",
+             and ((time() - metrics_samples_rows_observed_timestamp_seconds) < 1800))) > 0",
             &gated
         )
         .is_empty());
@@ -1181,6 +1253,21 @@ mod tests {
             "{}",
             complaints[0]
         );
+
+        // The guard that looks like one and reads the reader instead: the
+        // change count over a per-scrape companion is zero for a writer that is
+        // running, whenever the serving pod is younger than the writer's own
+        // cadence. Refused with the reason, in both reading shapes.
+        for expr in [
+            "max by (table) (min_over_time(metrics_samples_rows[1h]) \
+             and (changes(metrics_samples_rows_observed_timestamp_seconds[1h]) > 0)) > 0",
+            "max_over_time(metrics_samples_rows[30m]) > 0 \
+             and changes(metrics_samples_rows_observed_timestamp_seconds[30m]) > 0",
+        ] {
+            let counted = unguarded_store_reading_complaints(expr, &gated);
+            assert_eq!(counted.len(), 1, "{expr}: {counted:?}");
+            assert!(counted[0].contains("在役时长"), "{}", counted[0]);
+        }
 
         // A windowless read is not automatically a parameter: compared against
         // a constant, the stored value is what the rule is judging, and that is
@@ -1214,23 +1301,58 @@ mod tests {
 
         // Both ceilings, asserted rather than assumed. The guard is matched by
         // presence, so one sitting after the reduction that merged the writers
-        // is accepted even though a stream that is still running can carry it
+        // is accepted even though a writer that is still running can carry it
         // for one that has stopped -- the arrangement this gate does not see.
         assert!(unguarded_store_reading_complaints(
             "(max by (table) (min_over_time(metrics_samples_rows[1h])) \
-             and max by (table) (changes(metrics_samples_rows_observed_timestamp_seconds[1h]) > 0)) > 0",
+             and max by (table) ((time() - metrics_samples_rows_observed_timestamp_seconds) < 3600)) > 0",
             &gated
         )
         .is_empty());
-        // The guard's window is not compared to the value's: a companion read
-        // over any window satisfies the check, because whether that window is
-        // long enough is a question about the writer's cadence, which this
-        // module has no way to see.
+        // The guard's bound is not compared to the value's: any age bound
+        // satisfies the check, because whether that bound is long enough is a
+        // question about the writer's cadence, which this module has no way to
+        // see.
         assert!(unguarded_store_reading_complaints(
             "max_over_time(metrics_samples_rows[30m]) > 0 \
-             and changes(metrics_samples_rows_observed_timestamp_seconds[30s]) > 0",
+             and ((time() - metrics_samples_rows_observed_timestamp_seconds) < 30)",
             &gated
         )
         .is_empty());
+        // The inverse comparison is not an age bound: a rule that fires on the
+        // reading being *stale* is asking a different question, and the gate
+        // does not silently accept it as the writer-liveness guard.
+        assert_eq!(
+            unguarded_store_reading_complaints(
+                "max_over_time(metrics_samples_rows[30m]) > 0 \
+                 and ((time() - metrics_samples_rows_observed_timestamp_seconds) > 3600)",
+                &gated
+            )
+            .len(),
+            1
+        );
+    }
+
+    /// The bound is read off the arithmetic, however the rule spaces it, and
+    /// only from the freshness side of the comparison.
+    #[test]
+    fn the_age_bound_is_read_from_the_companion_arithmetic() {
+        let shipped = "min without (pod, container, instance) (max_over_time(x[30m]) and \
+             ((time() - x_observed_timestamp_seconds) < 43200)) < 1";
+        assert_eq!(companion_age_bound(shipped, "x"), Some(43_200));
+        assert_eq!(
+            companion_age_bound("(time()-x_observed_timestamp_seconds)<1800", "x"),
+            Some(1_800)
+        );
+        // Not the inverse reading, not an unrelated series, not absent.
+        assert_eq!(
+            companion_age_bound("(time() - x_observed_timestamp_seconds) > 3600", "x"),
+            None
+        );
+        assert_eq!(
+            companion_age_bound("(time() - y_observed_timestamp_seconds) < 60", "x"),
+            None
+        );
+        assert_eq!(companion_age_bound("max_over_time(x[30m]) > 0", "x"), None);
     }
 }
