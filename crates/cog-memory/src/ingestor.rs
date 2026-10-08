@@ -20,6 +20,18 @@ pub const MEMORY_BUS_CLAIM_LOOP: &str = "memory_ingest_bus_claim";
 /// 这条路上的一次具名跳过。
 const SKIP_IN_FLIGHT_OPERATION: &str = "extract_skipped_in_flight";
 
+/// 认领循环每一轮的结局在 `memory_operations_total` 上的三个 operation 取值：
+/// 认领跑成、认领失败、这一轮被拉取闸门折掉。一轮恰好加其中一个。
+///
+/// 循环的 beat 只说它活着，没说这一轮做了什么。没有这三格，「每一轮都失败」
+/// 与「本来就没有待认领的消息」在读数上同形，失败的全部痕迹是一句随 Pod
+/// 消失的 warn。第三态单独给一格也有它的理由：被闸门折掉的一轮既不是认领成功
+/// 也不是认领失败，混进任何一边都会让一次有意的暂停看起来像一次故障——而
+/// 暂停本身由池子自己的读数表达，不该借这一格停住来暗示。
+const CLAIM_RAN_OPERATION: &str = "bus_claim";
+const CLAIM_FAILED_OPERATION: &str = "bus_claim_failed";
+const CLAIM_HELD_OPERATION: &str = "bus_claim_held";
+
 /// 归档 id 里来源 slug 的长度上限。与时间戳/随机段合计仍远低于文件系统
 /// NAME_MAX(255 字节)，同时保留足够前缀让人能从对象键认出来源。
 const RAW_ID_SLUG_MAX: usize = 64;
@@ -636,6 +648,7 @@ impl MemoryIngestor {
                     let backlog = backlog.clone();
                     let inner = inner.clone();
                     async move {
+                        inner.seed_claim_outcomes().await;
                         let mut interval = tokio::time::interval(claim_interval);
                         interval.tick().await; // 跳过立即触发的那一拍
                         loop {
@@ -647,6 +660,7 @@ impl MemoryIngestor {
                             if inner.pull_gate.blocked_for().await.is_some() {
                                 // 认领也是一种投递：闸门关着时认领回来的消息只会再失败
                                 // 一遍并占用投递次数，一样留到恢复后再接。
+                                inner.record_claim_outcome(CLAIM_HELD_OPERATION).await;
                                 debug!("Memory ingest claim paused: LLM upstream unavailable");
                                 continue;
                             }
@@ -655,6 +669,7 @@ impl MemoryIngestor {
                                 .await
                             {
                                 Ok(claimed) => {
+                                    inner.record_claim_outcome(CLAIM_RAN_OPERATION).await;
                                     if !claimed.is_empty() {
                                         info!(
                                             "Memory ingest claimed {} pending bus messages",
@@ -667,7 +682,10 @@ impl MemoryIngestor {
                                         );
                                     }
                                 }
-                                Err(e) => warn!("Memory ingest claim_pending failed: {e}"),
+                                Err(e) => {
+                                    inner.record_claim_outcome(CLAIM_FAILED_OPERATION).await;
+                                    warn!("Memory ingest claim_pending failed: {e}");
+                                }
                             }
                         }
                     }
@@ -1110,6 +1128,48 @@ impl MemoryIngestor {
             .await
         {
             warn!("Failed to record {name} gauge: {}", e);
+        }
+    }
+
+    /// 把认领循环三个结局的序列先按 0 发出去。
+    ///
+    /// 与积压读数「从第一拍就发布（含零）」同一条理由：「还没进过这个状态」
+    /// 与「从来没发布过这个状态」在只看得见已存在序列的查询里同形，而这两句
+    /// 要答的是不同的问题。
+    async fn seed_claim_outcomes(&self) {
+        for operation in [
+            CLAIM_RAN_OPERATION,
+            CLAIM_FAILED_OPERATION,
+            CLAIM_HELD_OPERATION,
+        ] {
+            self.record_claim_counter(operation, 0.0).await;
+        }
+    }
+
+    /// 记一轮认领循环的结局（见 [`CLAIM_RAN_OPERATION`] 一族）。
+    ///
+    /// 记在 `memory_operations_total` 上而不是新开一个指标名：这是认领这条
+    /// 路上的一次具名结果，与 `memory_operations_total{operation=...}` 已有的
+    /// 语义同类，而新名字要为一次「这一轮做了什么」付告警规则普查的代价。
+    async fn record_claim_outcome(&self, operation: &str) {
+        self.record_claim_counter(operation, 1.0).await;
+    }
+
+    async fn record_claim_counter(&self, operation: &str, value: f64) {
+        let Some(metrics) = self.metrics.as_ref() else {
+            return;
+        };
+        let mut labels = HashMap::new();
+        labels.insert("operation".to_string(), operation.to_string());
+        if let Err(e) = metrics
+            .record_counter(
+                cog_core::metric_names::MEMORY_OPERATIONS_TOTAL,
+                value,
+                labels,
+            )
+            .await
+        {
+            warn!("Failed to record the {operation} claim outcome: {}", e);
         }
     }
 
@@ -2131,10 +2191,13 @@ mod tests {
         )
     }
 
-    /// 只留 gauge：对账要断言的就是积压量这一个观测。
+    /// 记 gauge 的 (名字, 值)，以及 counter 的 (名字, operation 标签, 值)。
+    /// counter 侧带标签，因为同一族读数（`memory_operations_total`）用
+    /// `operation` 取值区分「这一轮跑了哪一支」，只按名字看会把三支糊成一条。
     #[derive(Default)]
     struct RecordingMetrics {
         gauges: std::sync::Mutex<Vec<(String, f64)>>,
+        counters: std::sync::Mutex<Vec<(String, String, f64)>>,
     }
 
     impl RecordingMetrics {
@@ -2146,6 +2209,21 @@ mod tests {
                 .rev()
                 .find(|(n, _)| n == name)
                 .map(|(_, v)| *v)
+        }
+
+        /// 某个 `operation` 取值上的累计量。缺席与 0 是两回事：前者说明这一支
+        /// 从没发布过（读者分不出「还没发生」与「写者不存在」）。
+        fn counter_total(&self, name: &str, operation: &str) -> Option<f64> {
+            let counters = self.counters.lock().unwrap();
+            let mut seen = false;
+            let mut sum = 0.0;
+            for (n, op, v) in counters.iter() {
+                if n == name && op == operation {
+                    seen = true;
+                    sum += v;
+                }
+            }
+            seen.then_some(sum)
         }
     }
 
@@ -2166,10 +2244,15 @@ mod tests {
 
         async fn record_counter(
             &self,
-            _name: cog_core::MetricName,
-            _value: f64,
-            _labels: HashMap<String, String>,
+            name: cog_core::MetricName,
+            value: f64,
+            labels: HashMap<String, String>,
         ) -> cog_core::SFResult<()> {
+            let operation = labels.get("operation").cloned().unwrap_or_default();
+            self.counters
+                .lock()
+                .unwrap()
+                .push((name.as_str().to_string(), operation, value));
             Ok(())
         }
 
@@ -2263,6 +2346,192 @@ mod tests {
         async fn health_check(&self) -> cog_core::SFResult<()> {
             Ok(())
         }
+    }
+
+    /// 认领永远失败的总线：其余行为照抄内存实现，只有 `claim_pending` 返回错。
+    /// 认领失败在生产里没有活的样本（Redis Streams 那一支的错误路径从没被读到
+    /// 过），要证明这一支真的会各自落一格，只能把假总线摆出来逼它发生。
+    struct ClaimFailingBus {
+        inner: cog_stream::MemoryMessageBackend,
+    }
+
+    impl ClaimFailingBus {
+        fn new() -> Self {
+            Self {
+                inner: cog_stream::MemoryMessageBackend::new(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::MessageBackend for ClaimFailingBus {
+        async fn publish(&self, subject: &str, payload: &[u8]) -> SFResult<()> {
+            self.inner.publish(subject, payload).await
+        }
+
+        async fn subscribe(&self, subject: &str, group: &str) -> SFResult<cog_core::MessageStream> {
+            self.inner.subscribe(subject, group).await
+        }
+
+        async fn subscribe_from(
+            &self,
+            subject: &str,
+            group: &str,
+            start_id: &str,
+        ) -> SFResult<cog_core::MessageStream> {
+            self.inner.subscribe_from(subject, group, start_id).await
+        }
+
+        async fn create_consumer_group(&self, stream: &str, group: &str) -> SFResult<()> {
+            self.inner.create_consumer_group(stream, group).await
+        }
+
+        async fn ack(&self, stream: &str, group: &str, ids: &[String]) -> SFResult<()> {
+            self.inner.ack(stream, group, ids).await
+        }
+
+        async fn claim_pending(
+            &self,
+            _stream: &str,
+            _group: &str,
+            _min_idle_ms: u64,
+            _count: usize,
+        ) -> SFResult<Vec<(String, Vec<u8>)>> {
+            Err(cog_core::SFError::Internal(
+                "claim backend unreachable".into(),
+            ))
+        }
+
+        async fn pending_stats(
+            &self,
+            stream: &str,
+            group: &str,
+            idle_threshold_ms: u64,
+        ) -> SFResult<Option<cog_core::PendingStats>> {
+            self.inner
+                .pending_stats(stream, group, idle_threshold_ms)
+                .await
+        }
+    }
+
+    /// 认领循环每一轮都落一格结局，且三支互斥。
+    ///
+    /// 这个循环只有一个 beat：它活着，但它每一轮做了什么在读数上一片空白。
+    /// 「每轮都认领失败」与「本来没有待认领的消息」于是同形，失败的全部痕迹
+    /// 是一句随 Pod 消失的 warn——正是这个缺陷。三格必须从第一拍就发布（含
+    /// 零），否则「还没进过这个状态」与「这一支根本没在发」也同形。
+    ///
+    /// 两支分别驱：失败支用 `claim_pending` 恒错的假总线，被折支用恒报告的
+    /// 池快照把闸门关住（此时认领不该发生，它只是被推迟）。
+    #[tokio::test]
+    async fn the_claim_loop_stamps_each_rounds_outcome() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let ingestor = MemoryIngestor::new(
+            Arc::new(MemoryMemoryBackend::new()),
+            Arc::new(RuleBasedExtractor::new()),
+        )
+        .with_metrics(metrics.clone())
+        .with_config(MemoryIngestorConfig {
+            bus_claim_interval_secs: 1,
+            ..MemoryIngestorConfig::default()
+        });
+
+        let _handle = ingestor.spawn_bus(Arc::new(ClaimFailingBus::new()), "cogneva-events");
+
+        let seeded = metrics.clone();
+        assert!(
+            wait_for(move || {
+                let m = seeded.clone();
+                Box::pin(async move {
+                    m.counter_total("memory_operations_total", "bus_claim")
+                        .is_some()
+                        && m.counter_total("memory_operations_total", "bus_claim_failed")
+                            .is_some()
+                        && m.counter_total("memory_operations_total", "bus_claim_held")
+                            .is_some()
+                })
+            })
+            .await,
+            "all three outcomes must be published from the first round, so a branch \
+             that never ran is told apart from one that never published"
+        );
+        assert_eq!(
+            metrics.counter_total("memory_operations_total", "bus_claim"),
+            Some(0.0),
+            "a seeded outcome starts at zero"
+        );
+
+        let failed = metrics.clone();
+        assert!(
+            wait_for(move || {
+                let m = failed.clone();
+                Box::pin(async move {
+                    m.counter_total("memory_operations_total", "bus_claim_failed")
+                        .unwrap_or(0.0)
+                        >= 1.0
+                })
+            })
+            .await,
+            "a round whose claim_pending errored must land on the failed outcome"
+        );
+        assert_eq!(
+            metrics.counter_total("memory_operations_total", "bus_claim"),
+            Some(0.0),
+            "a failed claim must not also count as a completed one"
+        );
+        assert_eq!(
+            metrics.counter_total("memory_operations_total", "bus_claim_held"),
+            Some(0.0),
+            "the gate was open, so no round was folded by it"
+        );
+    }
+
+    /// 闸门关着时认领这一轮被折掉：认领回来的消息只会再失败一遍并占投递
+    /// 次数，所以它被推迟而不是失败——两件事在读数上必须分开。心跳照跳，
+    /// 「循环还活着」与「这一轮真做了事」不是同一个问题。
+    #[tokio::test]
+    async fn a_round_folded_by_the_gate_is_not_a_failed_claim() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let pool = Arc::new(TogglePool::new(true, chrono::Utc::now().timestamp() + 300));
+        let ingestor = MemoryIngestor::new(
+            Arc::new(MemoryMemoryBackend::new()),
+            Arc::new(RuleBasedExtractor::new()),
+        )
+        .with_metrics(metrics.clone())
+        .with_pool_status_source(pool)
+        .with_config(MemoryIngestorConfig {
+            bus_claim_interval_secs: 1,
+            ..MemoryIngestorConfig::default()
+        });
+
+        let _handle = ingestor.spawn_bus(
+            Arc::new(cog_stream::MemoryMessageBackend::new()),
+            "cogneva-events",
+        );
+
+        let held = metrics.clone();
+        assert!(
+            wait_for(move || {
+                let m = held.clone();
+                Box::pin(async move {
+                    m.counter_total("memory_operations_total", "bus_claim_held")
+                        .unwrap_or(0.0)
+                        >= 1.0
+                })
+            })
+            .await,
+            "a round the pause gate folded must be counted as held, not as failure"
+        );
+        assert_eq!(
+            metrics.counter_total("memory_operations_total", "bus_claim_failed"),
+            Some(0.0),
+            "a deliberate pause must not be recorded as a claim error"
+        );
+        assert_eq!(
+            metrics.counter_total("memory_operations_total", "bus_claim"),
+            Some(0.0),
+            "the claim never ran while the gate was closed"
+        );
     }
 
     fn quick_retry_config() -> MemoryIngestorConfig {
