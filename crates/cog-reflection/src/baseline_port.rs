@@ -19,7 +19,7 @@
 //! `OrchestratorControl` 提交的主流程任务，agent 只生成候选，验收权在
 //! 编译器、测试和统计检验。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -177,6 +177,9 @@ pub struct BaselinePorter {
     )>,
     /// 共享编译产物目录（质量门的 cargo 走这里，工作树只放源码）。
     target_dir: Option<PathBuf>,
+    /// 每轮结局读数的产出面。缺失时读数不写（与 GitOps 拉取端同：上报是尽力
+    /// 而为，判据在启动时另行 log 一次）。
+    metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
 }
 
 impl BaselinePorter {
@@ -195,6 +198,7 @@ impl BaselinePorter {
             llm_gate: None,
             workspace: None,
             target_dir: None,
+            metrics: None,
         }
     }
 
@@ -208,6 +212,38 @@ impl BaselinePorter {
     pub fn with_llm_gate(mut self, gate: Arc<dyn cog_core::SchedulerGate>) -> Self {
         self.llm_gate = Some(gate);
         self
+    }
+
+    /// 注入每轮结局读数的产出面（可选；缺失时读数不写）。
+    pub fn with_metrics(mut self, metrics: Option<Arc<dyn cog_core::MetricsBackend>>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// 发布本轮 tick 的结局：成功写 0、失败写 1，每轮都写一行。
+    ///
+    /// 失败原先只写日志，而日志随 Pod 消失，也答不出「这样多久了」。循环的
+    /// beat 在每轮拍首盖章、不管 tick 是否返回，所以循环活着这件事有读数、而
+    /// 「活着但每轮都失败」没有——一个够不着自己仓库、或每次移植都失败的触发器
+    /// 和一个无事可移植的实例，在所有读数上同形，实例就这样静默地停在一个旧
+    /// 基线上。写在这个薄壳里、而不是 [`port_tick`] 内部，是为了让「每轮都写」
+    /// 按构造成立：`port_tick` 有多处提前返回，失败的那条恰好排在最前面，把写点
+    /// 排在它们之后就会被门控掉。壳把整个 tick 收成一个返回点，内部怎么折都折
+    /// 不掉它。
+    async fn report_tick_outcome(&self, failed: bool) {
+        let Some(ref metrics) = self.metrics else {
+            return;
+        };
+        if let Err(e) = metrics
+            .record_gauge(
+                cog_core::metric_names::BASELINE_PORT_TICK_FAILED,
+                if failed { 1.0 } else { 0.0 },
+                HashMap::new(),
+            )
+            .await
+        {
+            warn!(error = %e, "baseline port outcome emit failed");
+        }
     }
 
     /// LLM 上游池当前是否暂停了 LLM 依赖型工作。
@@ -1421,7 +1457,7 @@ async fn port_tick(
         absorbed = plan.absorbed().count(),
         "new upstream baseline detected; starting port"
     );
-    let status = match porter.execute(&plan).await {
+    let outcome = match porter.execute(&plan).await {
         Ok(report) => {
             info!(
                 new_tag = %report.new_tag,
@@ -1430,22 +1466,25 @@ async fn port_tick(
                 rework = report.needs_rework().count(),
                 "baseline port finished"
             );
-            "done"
+            Ok(())
         }
-        Err(e) => {
-            warn!(new_tag = %plan.new_tag, error = %e, "baseline port failed");
-            "failed"
-        }
+        Err(e) => Err(SFError::Internal(format!(
+            "port of {} failed: {e}",
+            plan.new_tag
+        ))),
     };
     attempts.attempts.insert(
         plan.new_tag.clone(),
         PortAttempt {
-            status: status.into(),
+            status: if outcome.is_ok() { "done" } else { "failed" }.into(),
             at: chrono::Utc::now().to_rfc3339(),
         },
     );
     save_attempts(state_path, &attempts).await;
-    Ok(())
+    // 这一轮做了移植却失败了：把失败向外报，让循环的每轮结局读数（与它的
+    // warn）看得到。attempt 已在上方落盘，重试语义不变（下一轮按 cooldown
+    // 重来）；改动只是把一个先前被吞成 Ok 的失败重新变成失败。
+    outcome
 }
 
 /// This loop's name in the liveness census.
@@ -1489,9 +1528,12 @@ pub async fn run_baseline_port_loop(
                         biased;
                         _ = shutdown.wait() => break,
                         _ = ticker.tick() => {
-                            if let Err(e) =
-                                port_tick(&porter, &current_version, &config, &state_path).await
-                            {
+                            let outcome =
+                                port_tick(&porter, &current_version, &config, &state_path).await;
+                            // 每轮都盖一格：本轮结局在读数上留下 0 或 1，无事可移
+                            // 植（返回 Ok）与失败（返回 Err）从此不再同形。
+                            porter.report_tick_outcome(outcome.is_err()).await;
+                            if let Err(e) = outcome {
                                 warn!(error = %e, "baseline port tick failed");
                             }
                         }
@@ -1596,6 +1638,7 @@ fn parse_release_version(tag: &str) -> Option<(u64, u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cog_core::MetricsBackend as _;
     use std::path::Path;
 
     async fn git(dir: &Path, args: &[&str]) -> String {
@@ -2455,5 +2498,107 @@ mod tests {
         let body = tokio::fs::read_to_string(&dump).await.unwrap();
         assert!(body.contains("chg-dump"));
         assert!(body.contains("v0.5.8"));
+    }
+
+    // ── 每轮结局读数 ────────────────────────────────────────────────
+
+    /// 结局读数的值面：失败写 1、成功写 0，且每轮各写一格。
+    #[tokio::test]
+    async fn a_tick_outcome_is_one_when_failed_and_zero_when_not() {
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let porter = BaselinePorter::new(".").with_metrics(Some(metrics.clone()));
+        let name = cog_core::metric_names::BASELINE_PORT_TICK_FAILED.as_str();
+
+        porter.report_tick_outcome(true).await;
+        let failed = metrics.query_gauge_latest(name).await.unwrap();
+        assert_eq!(failed.len(), 1, "一个标签集一条序列");
+        assert_eq!(failed[0].value, 1.0);
+
+        porter.report_tick_outcome(false).await;
+        let ok = metrics.query_gauge_latest(name).await.unwrap();
+        assert_eq!(ok.len(), 1, "同一标签集只留最新一笔");
+        assert_eq!(ok[0].value, 0.0);
+    }
+
+    /// 循环把**每一轮**的结局都盖下来：仓库不可达时 port_tick 返回 Err，读数必须是
+    /// 1，而不是「这轮没发生」。写点若排在 port_tick 内部任何提前返回之后都会被门控
+    /// 掉，所以这条测的是循环壳，不是 port_tick 自己。
+    #[tokio::test]
+    async fn the_loop_stamps_a_failed_round_instead_of_leaving_it_silent() {
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        // 不存在的仓库：每轮 git 调用都失败。
+        let porter = std::sync::Arc::new(
+            BaselinePorter::new("/nonexistent/baseline-port-loop-outcome-test")
+                .with_metrics(Some(metrics.clone())),
+        );
+        let cfg = crate::BaselinePortConfig {
+            poll_interval_secs: 60,
+            ..Default::default()
+        };
+        let shutdown = cog_core::ShutdownSignal::new();
+        let handle = tokio::spawn(run_baseline_port_loop(
+            porter,
+            "0.5.7".into(),
+            cfg,
+            std::path::PathBuf::from("/tmp/baseline-port-loop-outcome-test.json"),
+            shutdown.clone(),
+        ));
+
+        let name = cog_core::metric_names::BASELINE_PORT_TICK_FAILED.as_str();
+        let mut value = None;
+        for _ in 0..200 {
+            if let Some(sample) = metrics
+                .query_gauge_latest(name)
+                .await
+                .unwrap()
+                .into_iter()
+                .next()
+            {
+                value = Some(sample.value);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        shutdown.trigger();
+        let _ = handle.await;
+
+        assert_eq!(
+            value,
+            Some(1.0),
+            "一轮失败必须盖 1；读不到就是把失败出口排在写点之后门控掉了"
+        );
+    }
+
+    /// execute 失败（这里：工作树不干净）原先被吞成 Ok，那一轮在读数上与成功同形。
+    /// 这条断言它现在作为失败向外报，让循环壳的结局读数看得到。
+    #[tokio::test]
+    async fn a_port_that_executes_and_fails_is_a_failed_round() {
+        let dir = setup_repo().await;
+        make_promoted(dir.path(), "chg-1", "feature.rs", "fn feature() {}\n").await;
+        upstream_release(
+            dir.path(),
+            "v0.5.7",
+            "v0.5.8",
+            "upstream.rs",
+            "fn up() {}\n",
+        )
+        .await;
+        // 未跟踪文件让工作树不干净：execute 的 ensure_clean_tree 会拒绝。
+        tokio::fs::write(dir.path().join("dirty.txt"), "dirty\n")
+            .await
+            .unwrap();
+
+        let porter = BaselinePorter::new(dir.path()).without_quality_gate();
+        let outcome = port_tick(
+            &porter,
+            "0.5.7",
+            &crate::BaselinePortConfig::default(),
+            &dir.path().join("attempts.json"),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "execute 失败必须作为失败轮向外报，得到 {outcome:?}"
+        );
     }
 }

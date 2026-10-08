@@ -1441,6 +1441,13 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         if let Some(gate) = llm_gate {
             porter = porter.with_llm_gate(gate);
         }
+        // 每轮结局读数的产出面：与 GitOps 拉取端同源。缺失时只在日志里交代一次，
+        // 移植失败就不会只留在那条随 Pod 消失的日志里。
+        let bp_metrics = ctx.consume_service::<dyn cog_core::MetricsBackend>();
+        if bp_metrics.is_none() {
+            warn!("MetricsBackend not published; baseline port tick outcomes will not be reported");
+        }
+        porter = porter.with_metrics(bp_metrics);
         let porter = Arc::new(porter);
 
         let shutdown = cog_core::ShutdownSignal::new();

@@ -600,6 +600,21 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          keeps it at 0",
     ),
     (
+        "baseline_port_tick_failed",
+        "Whether the last baseline port tick could not be completed, 1 or 0, \
+         written on every round. The trigger carries this instance's promoted \
+         changes onto a new upstream release: it refreshes tags, finds the \
+         newest baseline, plans the port and executes it, and a round that has \
+         nothing to do is the ordinary state. A round that fails -- its \
+         repository unreachable, or the port itself failing -- was written to \
+         the log alone, and the loop's beat is stamped whether or not the tick \
+         returned, so the liveness readings keep saying the loop runs while it \
+         moves nothing. A trigger that fails every round and an instance with \
+         nothing to port are then the same picture. This is the reading that \
+         tells them apart; it is written on every round, so a round that \
+         completes keeps it at 0",
+    ),
+    (
         "cogneva_rollout_job_cpu_throttled_ratio",
         "Share of the CFS periods of the newest rollout judgement run in which \
          the run was throttled by its own CPU limit, read by the run from its \

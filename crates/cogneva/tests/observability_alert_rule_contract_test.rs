@@ -1731,6 +1731,10 @@ const UNREAD: &[(&str, Unread)] = &[
         "cogneva_landing_ci_failure_inherited_total",
         Unread::Gap("landings whose red verdict was traced to the commit they were replayed onto rather than to the change, so the change was kept instead of reverted. The underlying condition -- the base branch's tip is red -- is what mainline_ci_verdict_failed reads, but this series does not carry that fact: it carries the non-action taken because of it, and that warn line names the change and the checks it passed through. A rule would have to declare how many spared landings are a fault, which is a bound on how long the branch may stay red while landings keep landing: a policy nobody stated, so the missing half is a bound rather than a reader"),
     ),
+    (
+        "baseline_port_tick_failed",
+        Unread::Gap("the baseline port trigger's per-round outcome, written every round. The reading landed because the whole outcome path had no reader at all: the trigger is on a supervised cadence, so its liveness is read, but a round that failed and a round with nothing to port were the same picture -- the failure went to a log line that dies with the pod, and an execute failure was even swallowed back into Ok so the round read as a success. What is still missing is a rule, and a rule here would have to say how many failed rounds in a window are a fault, which is a threshold on a loop that polls hourly and retries on a cooldown: a policy nobody declared. Writing that rule is also an alert-rule change, which needs sign-off before it lands, so the reading ships with its debt recorded rather than left absent"),
+    ),
 ];
 
 /// Entries an `Elsewhere` reader claim cannot be resolved against.
@@ -1759,7 +1763,7 @@ fn unresolved_readers(read: &BTreeSet<String>, name: &str, readers: &[&str]) -> 
 /// completion cadence is already read against *is* that budget. The two entries
 /// left the table in the pass that wrote `buildah_store_round_incomplete`, so
 /// 23 became 21.
-const GAPS_AT_CENSUS: usize = 21;
+const GAPS_AT_CENSUS: usize = 22;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {

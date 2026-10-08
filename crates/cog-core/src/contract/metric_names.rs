@@ -178,6 +178,23 @@ metric_names! {
     // two clusters' outcomes as one.
     GITOPS_PULL_FAILED => "gitops_pull_failed",
 
+    // cog-reflection — the baseline port trigger: the same missing face as the
+    // puller above, one step further along the lineage.
+    //
+    // The trigger's job is to carry this instance's promoted changes onto a new
+    // upstream baseline. Its *liveness* already has a reader -- it is on the
+    // same supervised cadence, `cogneva_loop_tick_age_seconds{loop="baseline_port"}`
+    // stops advancing when the task is gone, and background_loop_stalled says so.
+    // What had no reader is the loop *doing its job* and failing: the beat is
+    // stamped at the top of every cycle whether or not `port_tick` returned, the
+    // failure went to the log alone, and the tick left no series behind -- so a
+    // trigger that cannot reach its repository, or whose port fails every round,
+    // and an instance with nothing new to port are the same picture on every
+    // reading. This is that missing face: 0 when the round returned, 1 when it
+    // did not, written on every round. Unlabelled, because one evolution
+    // deployment runs the trigger for its own instance.
+    BASELINE_PORT_TICK_FAILED => "baseline_port_tick_failed",
+
     // cog-reflection — the registry store's capacity reclamation, read by the
     // process that reclaims it.
     //
