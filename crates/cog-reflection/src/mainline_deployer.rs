@@ -3521,17 +3521,15 @@ impl MainlineDeployer {
     /// 报的"活 tag 引用的层"：后者看不见孤儿层，实测同一时刻 3.74 GiB 对
     /// 7.4 GiB。两个读数缺一个就不动——没有证据时重启 registry 是有代价的动作。
     ///
-    /// 在飞滚动时不做：重启 registry 会让正在拉镜像的新副本 ErrImagePull，而那正是
-    /// 判据把它归成环境类、不回滚的那种失败。晚一轮没有代价。
+    /// 在飞滚动时不做**回收**：重启 registry 会让正在拉镜像的新副本 ErrImagePull，
+    /// 而那正是判据把它归成环境类、不回滚的那种失败。晚一轮没有代价。两格读数
+    /// （欠账与"一次都没走完过"）不在此列——它们量的是这一轮之外的事，仍每轮发布。
     async fn registry_maintenance_round(
         &self,
         bare: &str,
         images: &[String],
         state: &mut MainlineState,
     ) {
-        if state.in_flight.is_some() {
-            return;
-        }
         // 没有卷的声明就没有这件事：量的是哪张卷、阈值的分母取谁，都从
         // `COGNEVA_REGISTRY_CLAIM` 来（与走查边车同一个名字）。没声明时读也白读——
         // 量出来的占用无从比较，所以连读都不读，不是读了之后判否。
@@ -3555,6 +3553,15 @@ impl MainlineDeployer {
                     std::collections::HashMap::new(),
                 )
                 .await;
+        }
+        // 这两格读数落在「在飞滚动」早退之前：滚动在飞只说明这一轮不做回收，不说明
+        // 这卷欠不欠账、这台机器有没有走完过不用被看见。早退挡在它们前面时，写者活着
+        // 而这一格整轮不落——共享表把上一笔值永久送出去，读它的规则会拿一个冻住的
+        // 伴生钟当作「写者停了」，把一条好规则的判据关掉（`registry_reclaim_debt_unpaid`
+        // 就是这条）。回收动作本身仍然要等在飞滚动结束：在别人拉镜像时重启 registry
+        // 会把新副本打成 ErrImagePull，那正是判据归成环境类、不回滚的那种失败。
+        if state.in_flight.is_some() {
+            return;
         }
         let now = chrono::Utc::now().timestamp();
         let used = self.registry_volume_used_bytes().await;
@@ -13976,6 +13983,61 @@ exit 0
             !reqs.iter().any(|r| r.contains("tags/list")),
             "连 tag 列表都不必走: {reqs:?}"
         );
+    }
+
+    /// 在飞滚动只挡住**回收动作**，挡不住这两格读数：欠账与"一次都没走完过"
+    /// 量的是这一轮之外的事，滚动在飞不改变它们该不该被看见。把它们排在早退之后
+    /// 时，写者整轮不落这一格——共享表把上一笔值永久送出去，读它的规则会拿一个
+    /// 冻住的伴生钟当作"写者停了"，把一条好规则的判据关掉。这里同时钉两件事：
+    /// 欠账那格每轮都落，而回收动作一个都不走（`registry_maintenance_unix` 不动）。
+    #[tokio::test]
+    async fn registry_readings_are_published_even_while_a_rollout_is_in_flight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut cfg = test_config(root, Path::new("/nonexistent"), "noop", "noop");
+        cfg.registry_claim = "cogneva-registry-pvc".into();
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_metrics(metrics.clone());
+
+        let mut state = MainlineState {
+            in_flight: Some(InFlight {
+                rev: "000000000004".into(),
+                phase: Phase::Dispatched,
+            }),
+            ..MainlineState::default()
+        };
+        deployer
+            .registry_maintenance_round("000000000004", &[], &mut state)
+            .await;
+
+        let owed = metrics
+            .query_gauge_latest(cog_core::metric_names::REGISTRY_GC_OWED.as_str())
+            .await
+            .unwrap();
+        assert!(
+            !owed.is_empty(),
+            "在飞滚动挡的是回收动作，欠账读数仍要每轮落一格：不落就没有伴生钟的时间戳推进，\
+             读它的规则会拿一个冻住的伴生钟当作写者停了，把判据关掉"
+        );
+        assert_eq!(owed[0].value, 0.0, "默认没欠账");
+        // "一次都没走完过"那格的种子同样在早退之前：它要在最该成立的部署上也在面上。
+        assert!(
+            !metrics
+                .query_gauge_latest(
+                    cog_core::metric_names::REGISTRY_MAINTENANCE_READING_UNIX.as_str()
+                )
+                .await
+                .unwrap()
+                .is_empty(),
+            "「一次都没走完过」的种子也被在飞早退挡住了"
+        );
+        // 回收动作本身仍然要等：这一轮没开（冷却时刻没被消耗），registry 也没被动过。
+        assert_eq!(
+            state.registry_maintenance_unix, 0,
+            "在飞滚动时回收动作不该开跑"
+        );
+        assert!(!state.registry_gc_owed, "这一轮没有制造欠账");
     }
 
     #[tokio::test]
