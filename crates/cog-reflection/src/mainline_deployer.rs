@@ -4025,11 +4025,14 @@ impl MainlineDeployer {
     /// （重启一直发不出去）恰好没有别的读数——那时只有每轮一句 warn，翻日志才知道
     /// 连着欠了几轮。功能没开时这一格不存在，那是"没人问过"。
     ///
-    /// 发射点钉在 `poll_once`，不钉在 `registry_maintenance_round` 里：读数排在哪一条
-    /// 早退之前，决定"每轮都发"是真话还是"只有走到底的那些轮才发"。这条缺陷按站点
-    /// 修过一次（回收轮里那道在飞滚动早退），但那条路上还有更早的一站——
-    /// `deployed_images` 的 `?`，折在它上面的轮连回收轮都不会进。而折了的那一轮正是
-    /// 这一格要报告的时刻。
+    /// 发射点钉在 `poll_once` 的**最前面**，不钉在 `registry_maintenance_round`
+    /// 里，也不钉在它上一站：读数排在哪一条早退之前，决定"每轮都发"是真话还是
+    /// "只有走到底的那些轮才发"。这条缺陷按站点修过一次（回收轮里那道在飞滚动
+    /// 早退），但那条路上还有更早的一站——`deployed_images` 的 `?`，折在它上面的轮
+    /// 连回收轮都不会进，而折了的那一轮正是这一格要报告的时刻。这两格谁也用不着
+    /// 这一轮的产物（一个是 `state` 里的欠账布尔，一个是库里的行在不在），所以
+    /// 排在比 `deployed_images` 更早的 `bare_main_rev` 之前：它读不到裸仓库时，
+    /// 折的也是这一轮。
     async fn report_registry_debt(&self, state: &MainlineState) {
         if self.cfg.registry_claim.trim().is_empty() {
             return;
@@ -4214,6 +4217,27 @@ impl MainlineDeployer {
     pub async fn poll_once(&self) -> SFResult<()> {
         let mut state = self.load_state();
 
+        // 这两处钉在**本拍最早的位置**，谁不需要这一轮的产物谁就排在早退前面。
+        // 它们量的是这一轮之外的事（两棵长命树的索引读数还在不在动、registry 这卷
+        // 欠不欠账），这一轮走不走得完与它们无关，任何一条早退都不改变它们该不该
+        // 被看见。本方法里最早的那条早退就在下面一行——`bare_main_rev` 的 `?`——
+        // 排在它下面时，读不到裸仓库的那些轮整格不落：共享表把上一笔值永久送出去，
+        // 读它们的规则拿一个冻住的伴生钟当作"写者停了"，把判据关掉
+        // （`registry_reclaim_debt_unpaid` 界 1800s；`worktree_*` 那一族按伴生钟
+        // 年龄判写者还在不在）。这条缺陷按站点修过两次（回收轮里那道在飞滚动早退、
+        // 以及下面那几个站点），两次都漏了更早的一站，所以这次按**发射点**钉，
+        // 不按"它属于哪一步"钉。
+        //
+        // 索引读数的心跳：两棵长命树只在"即将 reset"的那一刻被采，所以两笔采样之间的
+        // 空档是两次 reset 之间的空档，不是写者自己的节奏；空闲的部署器一停几小时，
+        // 而读这条读数的告警规则按伴生钟的年龄判写者还在不在。心跳必须排在早退之前，
+        // 否则"这一轮不推进"就等于"这一轮不盖章"，空档照旧。盖哪两棵、为什么只有那
+        // 两棵，见 `WorkspaceManager::heartbeat_index_health`。
+        self.workspaces.heartbeat_index_health().await;
+        // 欠账读数与"一次都没走完过"的种子，理由同上且更硬：折在 `deployed_images`
+        // 上的轮连回收轮那个函数都进不去，而折了的那一轮正是这一格要报告的时刻。
+        self.report_registry_debt(&state).await;
+
         let mut bare = self.bare_main_rev().await?;
         // 先把上游拉进来再判推进：bare 的 main 由本循环自己从各平台取，
         // 宿主机不再是这条链上的一环。
@@ -4223,24 +4247,12 @@ impl MainlineDeployer {
         // The version contract is judged every round rather than tied to "did
         // this round advance main": a judgement that only runs on an advance
         // stays silent while main stands still, which is exactly when whether the
-        // versions have diverged is worth knowing. Judged before the early
-        // returns, so none of them skips it.
+        // versions have diverged is worth knowing. Judged before every early
+        // return below -- but not before the one above, because it needs `bare`
+        // and so cannot be hoisted past the station that reads it. A round that
+        // cannot read the bare repository publishes no contract judgement, which
+        // makes this the one reading of its kind still gated by a station.
         self.report_version_contract(&bare).await;
-        // 索引读数的心跳。两棵长命树只在"即将 reset"的那一刻被采，所以两笔采样之间的
-        // 空档是两次 reset 之间的空档，不是写者自己的节奏；空闲的部署器一停几小时，
-        // 而读这条读数的告警规则按伴生钟的年龄判写者还在不在。钉在本方法里，因为它是
-        // 本进程最密的固定节拍，且早退分支全在下面——心跳必须排在它们之前，否则"这一轮
-        // 不推进"就等于"这一轮不盖章"，空档照旧。盖哪两棵、为什么只有那两棵，见
-        // `WorkspaceManager::heartbeat_index_health`。
-        self.workspaces.heartbeat_index_health().await;
-        // 欠账读数与"一次都没走完过"的种子。与上面那条心跳同理，且理由更硬：它们
-        // 量的是这一轮之外的事，任何一条早退都不改变它们该不该被看见——而本方法里
-        // 最早的那条早退就在下一行。放在 `registry_maintenance_round` 里面时，折在
-        // `deployed_images` 上的轮连那个函数都进不去，这一格整轮不落，共享表把上一笔
-        // 值永久送出去，读它的规则拿一个冻住的伴生钟当作"写者停了"，把判据关掉
-        // （`registry_reclaim_debt_unpaid`，界 1800s）。这条缺陷按站点修过一次（回收轮
-        // 里那道在飞滚动早退），这里是同一条路上的上一站。
-        self.report_registry_debt(&state).await;
         let images = self.deployed_images().await?;
         let deployed = classify_deployed(&images);
 
@@ -14127,25 +14139,24 @@ exit 0
     /// 整段时间被自己的守卫关着，欠账最该被看见的时刻它恰好看不见。
     ///
     /// 所以判据对着**折了一轮**断言，而不是对着回收轮断言：发射点已经不归它管了。
+    /// 折的那一站取本方法**最早**的一条早退（`bare_main_rev` 的 `?`，比那次实测的
+    /// `deployed_images` 还早），这样这一发过了它，就过了它后面的每一条。
     #[tokio::test]
     async fn registry_debt_is_stamped_before_the_poll_can_fold() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let (bare, _work, _rev_a, _rev_b) = setup_repos(root).await;
-        let bin_dir = root.join("bin");
-        std::fs::create_dir_all(&bin_dir).unwrap();
-        // `get deployment` 失败一次 ⇒ `deployed_images` 返回 Err，这一轮折在回收轮之前。
-        let kubectl = fake_kubectl_failing_times(&bin_dir, 1);
-        let mut cfg = test_config(root, &bare, "noop", &kubectl);
+        // 裸仓库指到不存在的地方：`git --git-dir … rev-parse` 非零退出，这一轮在
+        // 读部署镜像之前就折了。
+        let mut cfg = test_config(root, Path::new("/nonexistent"), "noop", "noop");
         cfg.registry_claim = "cogneva-registry-pvc".into();
         let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
-        let deployer =
-            MainlineDeployer::new(cfg, test_workspaces(root, &bare)).with_metrics(metrics.clone());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_metrics(metrics.clone());
 
         let folded = deployer.poll_once().await;
         assert!(
             folded.is_err(),
-            "这一轮必须真的折在 `deployed_images` 上，否则这条判据没测到它要测的那一站"
+            "这一轮必须真的折在最早的站点上，否则这条判据没测到它要测的那一站"
         );
 
         let owed = metrics
@@ -14154,8 +14165,8 @@ exit 0
             .unwrap();
         assert!(
             !owed.is_empty(),
-            "折在 `deployed_images` 上的轮也必须把欠账那格发出去：不发就没有伴生钟的时间戳\
-             推进，读它的规则会拿一个冻住的伴生钟当作写者停了，把判据关掉"
+            "折在早退上的轮也必须把欠账那格发出去：不发就没有伴生钟的时间戳推进，\
+             读它的规则会拿一个冻住的伴生钟当作写者停了，把判据关掉"
         );
         assert_eq!(owed[0].value, 0.0, "默认没欠账");
         // "一次都没走完过"那格的种子同样要排在早退之前：它要在最该成立的部署上也在面上。
@@ -14167,7 +14178,7 @@ exit 0
                 .await
                 .unwrap()
                 .is_empty(),
-            "「一次都没走完过」的种子也被 `deployed_images` 那道早退挡住了"
+            "「一次都没走完过」的种子也被那道早退挡住了"
         );
     }
 
