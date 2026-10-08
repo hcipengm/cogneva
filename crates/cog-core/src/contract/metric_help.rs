@@ -335,9 +335,12 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          replaced by the next rollout. Read the two cells together: failed \
          having moved while ok did not, over a window longer than a round, is \
          mainline_poll_cycles_all_failed. Both cells are written when they \
-         happen and neither is seeded, so an ok cell that is absent means no \
-         round has ever finished in this process -- which the pair's own rule \
-         treats as the same answer as a zero",
+         happen and neither is seeded, so an ok cell that is absent means the \
+         store holds no finished round yet -- which the pair's own rule treats \
+         as the same answer as a zero. The totals are shared: the store holds \
+         them and every process serves the same numbers, so a restart resets \
+         neither cell and does not make one process's rounds look like \
+         another's",
     ),
     (
         "cogneva_dag_stalled_scheduled_reclaimed_total",
