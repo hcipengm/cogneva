@@ -765,9 +765,14 @@ impl GitOpsPuller {
         Ok(format!("prompts/ configmap rebuilt ({count} files)"))
     }
 
+    /// 走**服务端** apply。这里落的两个对象都是 ConfigMap，其中
+    /// `deploy/k3s/cogneva-json-configmap.yaml` 装的是整套告警规则与仪表盘，体积
+    /// 随规则增长；客户端 apply 会把整个对象再写进 `kubectl.kubernetes.io/last-applied-configuration`
+    /// 注解，而注解有 262144 字节（256 KiB）硬上限——越过之后这个 ConfigMap 变动的
+    /// 每一次交付都会失败，规则更新静默停在旧版。服务端 apply 不写那条注解。
     async fn kubectl_apply_stdin(&self, yaml: &str) -> SFResult<()> {
         let mut cmd = tokio::process::Command::new(&self.config.kubectl_bin);
-        cmd.args(["apply", "-f", "-"])
+        cmd.args(["apply", "-f", "-", "--server-side", "--force-conflicts"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -3905,6 +3910,47 @@ spec:
             ],
             "each consumer is addressed by its own kind, and a kind whose pods live per run is \
              not a restart this roll can make"
+        );
+    }
+
+    /// 大 ConfigMap 的交付不能走客户端 apply。
+    ///
+    /// `deploy/k3s/cogneva-json-configmap.yaml` 装着整套告警规则与仪表盘，体积随规则
+    /// 增长；客户端 apply 会把整个对象再写一遍进
+    /// `kubectl.kubernetes.io/last-applied-configuration` 注解，而注解总量有 262144
+    /// 字节（256 KiB）硬上限。越过之后这个文件变动的每一次交付都在建 ConfigMap 这一步
+    /// 失败——规则更新静默停在旧版。服务端 apply 不写那条注解。
+    #[tokio::test]
+    async fn the_config_apply_goes_server_side() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("kubectl.log");
+        let kubectl = crate::test_support::write_executable(
+            dir.path(),
+            "kubectl",
+            &format!(
+                "#!/bin/sh\necho \"$@\" >> '{log}'\ncat >> '{log}'\necho ok\n",
+                log = log.display()
+            ),
+        );
+        let puller = GitOpsPuller::new(
+            GitOpsConfig {
+                kubectl_bin: kubectl.to_string_lossy().into_owned(),
+                namespace: "cogneva".into(),
+                work_dir: dir.path().to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(cog_storage::MemoryStateBackend::new()),
+            "c".into(),
+        );
+        puller
+            .kubectl_apply_stdin("kind: ConfigMap\nmetadata:\n  name: cogneva-json\n")
+            .await
+            .unwrap();
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains("--server-side"),
+            "客户端 apply 会把这个对象整个写进 last-applied 注解，越过 256 KiB 上限后 \
+             规则交付静默停摆: {calls}"
         );
     }
 

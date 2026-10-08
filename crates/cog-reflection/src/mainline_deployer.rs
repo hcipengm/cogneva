@@ -5082,8 +5082,28 @@ impl MainlineDeployer {
 
     /// `kubectl apply -f -`，清单经 stdin 传入（Job 与清单包 ConfigMap 共用）。
     async fn apply_stdin(&self, body: &[u8], what: &str) -> SFResult<()> {
+        self.apply_stdin_with(body, what, false).await
+    }
+
+    /// 服务端 apply：对象不再被整个写进 `kubectl.kubernetes.io/last-applied-configuration`
+    /// 注解，因而没有那条 256 KiB 的注解上限。清单包用这一条——它随告警规则与仪表盘
+    /// 增长，已经压着上限跑（见 `publish_manifests_configmap`）。
+    async fn apply_stdin_server_side(&self, body: &[u8], what: &str) -> SFResult<()> {
+        self.apply_stdin_with(body, what, true).await
+    }
+
+    async fn apply_stdin_with(&self, body: &[u8], what: &str, server_side: bool) -> SFResult<()> {
+        let mut args: Vec<&str> = vec!["-n", &self.cfg.namespace, "apply", "-f", "-"];
+        if server_side {
+            // `--force-conflicts`：持有相反字段所有权的只可能是这边自己留下的旧对象
+            // （按 label 的清理是尽力而为，可能没删掉）或安装期的客户端 apply——冲突方
+            // 不是别的写者，所以接管是对的。缺了它，一条清理失败就会把发布永久卡死，
+            // 而那正是这条路径要修的那种故障。
+            args.push("--server-side");
+            args.push("--force-conflicts");
+        }
         let mut child = tokio::process::Command::new(&self.cfg.kubectl_bin)
-            .args(["-n", &self.cfg.namespace, "apply", "-f", "-"])
+            .args(&args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -5467,6 +5487,14 @@ impl MainlineDeployer {
     /// 清单包发布成 per-rev ConfigMap（Job 挂载消费）。先按 label 清理
     /// 旧包——名字含 rev 猜不得，label 是稳定选择器；清理失败只 warn
     /// （新包 apply 不受影响，残留由下次发布再清）。
+    ///
+    /// 走**服务端** apply。客户端 apply 会把整个对象序列化一遍塞进
+    /// `kubectl.kubernetes.io/last-applied-configuration` 注解，而注解有 262144 字节
+    /// （256 KiB）硬上限；这个包把 `support.yaml` 与各 deployment 清单装在同一个
+    /// 对象里，体积随 `deploy/k3s/cogneva-json-configmap.yaml`（告警规则 + 仪表盘）
+    /// 一起长，早就压着那条线跑——越过之后每一轮 poll 都在建 ConfigMap 这一步失败，
+    /// 整条滚动链路停摆，而失败只是一条 WARN。服务端 apply 不写那条注解，体积只受
+    /// etcd 请求上限约束。
     async fn publish_manifests_configmap(&self, rev: &str, bundle: &RolloutBundle) -> SFResult<()> {
         if let Err(e) = self
             .kubectl(
@@ -5505,7 +5533,8 @@ impl MainlineDeployer {
             "data": serde_json::Value::Object(data),
         });
         let body = serde_json::to_vec_pretty(&cm)?;
-        self.apply_stdin(&body, "manifests configmap").await?;
+        self.apply_stdin_server_side(&body, "manifests configmap")
+            .await?;
         info!(rev = %rev12(rev), name = %manifests_configmap_name(rev), "manifest bundle published");
         Ok(())
     }
@@ -18966,6 +18995,30 @@ spec:
         assert!(
             log.contains(&manifests_configmap_name(&rev_c)),
             "manifests configmap missing: {log}"
+        );
+        // 清单包必须走**服务端** apply。客户端 apply 会把整个对象序列化一遍塞进
+        // `kubectl.kubernetes.io/last-applied-configuration` 注解，而注解有 262144
+        // 字节（256 KiB）硬上限；这个包（support.yaml 225 KiB + 四个 deployment 清单）
+        // 早已越过，越过后每一轮都在建 ConfigMap 这一步失败、整条滚动链路停摆，而失败
+        // 只是一条 WARN。
+        //
+        // fake kubectl 用 `echo "$@"`，而 argv 的首项是 `-n`——被 sh 的 echo 当成自己的
+        // flag 吃掉，于是日志里每条 argv 既少了前导 `-n ` 又不换行。所以这里不按行边界
+        // 切段，按 argv 的字面形状找：紧跟这条 argv 的正文就是它经 stdin 传的对象。
+        let argv = "apply -f - --server-side --force-conflicts";
+        let at = log
+            .find(argv)
+            .unwrap_or_else(|| panic!("清单包没有走服务端 apply: {log}"));
+        let body = &log[at + argv.len()..];
+        assert!(
+            body.starts_with('{') && body.contains("\"kind\": \"ConfigMap\""),
+            "服务端 apply 之后紧跟的必须是清单包这个对象: {}",
+            &body[..body.len().min(200)]
+        );
+        assert!(
+            body.contains(&manifests_configmap_name(&rev_c)),
+            "服务端 apply 的必须是 per-rev 清单包，不是别的 ConfigMap: {}",
+            &body[..body.len().min(400)]
         );
         assert!(log.contains("--manifests-dir"), "job args missing: {log}");
         assert!(log.contains("\"mountPath\": \"/manifests\""), "{log}");
