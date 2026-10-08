@@ -946,6 +946,17 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                                  stays report-only"
                             );
                         }
+                        // Each poll's outcome goes to the metric store: the loop's
+                        // liveness is already read, but a puller that cycles and fails
+                        // every round otherwise leaves only a log line, which dies with
+                        // the pod and reads like a cluster with nothing to pull.
+                        let gitops_metrics = ctx.consume_service::<dyn cog_core::MetricsBackend>();
+                        if gitops_metrics.is_none() {
+                            warn!(
+                                "MetricsBackend not published; GitOps poll outcomes \
+                                 stay in the log only"
+                            );
+                        }
                         let puller = Arc::new(
                             crate::GitOpsPuller::new(
                                 promotion.gitops.clone(),
@@ -953,6 +964,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                                 cluster.clone(),
                             )
                             .with_metrics_url(metrics_url)
+                            .with_metrics(gitops_metrics)
                             .with_alert_sink(alert_sink),
                         );
                         let puller_shutdown = cog_core::ShutdownSignal::new();

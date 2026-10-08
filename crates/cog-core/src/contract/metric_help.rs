@@ -585,6 +585,21 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          which of the two it is",
     ),
     (
+        "gitops_pull_failed",
+        "Whether the last GitOps poll could not be completed, 1 or 0, written \
+         on every attempt and labelled by the cluster that pulled. The puller is \
+         what brings this cluster's desired state in: it fetches the release \
+         branch, picks up the promote tag at its head, applies the config change \
+         or runs the canary. A poll that fails is written to the log and nothing \
+         else -- the loop's beat is stamped at the top of the cycle whether or \
+         not the poll returned, so the liveness readings keep saying the loop is \
+         running while it does nothing. A puller that cannot reach the branch \
+         and a cluster with nothing to pull are then the same picture, and the \
+         cluster quietly stops receiving updates. This is the reading that tells \
+         them apart; it is written on every attempt, so a poll that completes \
+         keeps it at 0",
+    ),
+    (
         "cogneva_rollout_job_cpu_throttled_ratio",
         "Share of the CFS periods of the newest rollout judgement run in which \
          the run was throttled by its own CPU limit, read by the run from its \

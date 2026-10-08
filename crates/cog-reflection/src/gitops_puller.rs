@@ -22,7 +22,7 @@
 //! 每个集群的晋级节奏、看护、回滚、熔断都是本地决策——一个集群
 //! 金丝雀失败只影响自己，不影响其他集群。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,6 +51,12 @@ const CANARY_GATES: [&str; 2] = ["latency", "error-rate"];
 /// at all, so there is no per-gate verdict to report. Named so it can carry its
 /// own alert row instead of hiding inside one of the real gates.
 const WHOLE_WATCH_GATE: &str = "watch";
+
+/// Label carrying the cluster a puller's outcome belongs to. Every cluster runs
+/// its own puller against its own checkout of the release branch, and the metric
+/// store is shared, so without the name one cluster's poll outcome would be read
+/// as the other's.
+pub const CLUSTER_LABEL: &str = "cluster";
 
 /// 一次待处理的晋级（从 release 分支 HEAD + promote tag 解析出来）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +100,11 @@ pub struct GitOpsPuller {
     /// and the log, and a verdict that reaches nothing but a log reads exactly
     /// like nobody being told.
     alert_sink: Option<Arc<dyn cog_core::PersistentAlertSink>>,
+    /// Optional metric store: where each poll's outcome is published so a puller
+    /// that fails every round stops looking like a cluster with nothing to pull.
+    /// Without it the failure reaches only the log, which dies with the pod and
+    /// answers no question about how long it has been happening.
+    metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
 }
 
 impl GitOpsPuller {
@@ -104,11 +115,17 @@ impl GitOpsPuller {
             cluster,
             metrics_url: None,
             alert_sink: None,
+            metrics: None,
         }
     }
 
     pub fn with_metrics_url(mut self, url: Option<String>) -> Self {
         self.metrics_url = url;
+        self
+    }
+
+    pub fn with_metrics(mut self, metrics: Option<Arc<dyn cog_core::MetricsBackend>>) -> Self {
+        self.metrics = metrics;
         self
     }
 
@@ -493,8 +510,44 @@ impl GitOpsPuller {
         .await
     }
 
-    /// 一轮拉取。返回是否有新晋级被处理。
+    /// 发布本轮 poll 的结局：成功写 0、失败写 1，每次尝试都写一行。
+    ///
+    /// 轮询失败原先只写日志，而日志随 Pod 消失，也答不出「这样多久了」。循环的
+    /// beat 在每轮拍首盖章、不管 poll 是否返回，所以循环活着这件事有读数、而
+    /// 「活着但每轮都失败」没有——一个够不着 release 分支的拉取端和一个无事可拉
+    /// 的集群，在所有读数上同形，集群就这样静默地不再收到任何期望状态。
+    async fn report_poll_outcome(&self, failed: bool) {
+        let Some(ref metrics) = self.metrics else {
+            return;
+        };
+        let labels = HashMap::from([(CLUSTER_LABEL.to_string(), self.cluster.clone())]);
+        if let Err(e) = metrics
+            .record_gauge(
+                cog_core::metric_names::GITOPS_PULL_FAILED,
+                if failed { 1.0 } else { 0.0 },
+                labels,
+            )
+            .await
+        {
+            warn!(error = %e, cluster = %self.cluster, "gitops poll outcome emit failed");
+        }
+    }
+
+    /// 一轮拉取。返回是否有新晋级被处理，并把这一轮的结局写进读数。
+    ///
+    /// 结局写在这个薄壳里、而不是调用方（循环体）里，是为了让「每次尝试都写」
+    /// 按构造成立：一个进程只要调了它，无论走哪条内部路径都会留下一行。写在
+    /// [`Self::poll_attempt`] 内部则不行——那里有多处提前返回，失败的那条路恰好
+    /// 排在最前面，把写点排在它们之后就会被门控掉，于是「每轮都失败」和「无事
+    /// 可拉」在读数上重新同形。壳把整个尝试收成一个返回点，内部怎么折都折不掉它。
     pub async fn poll_once(&self) -> SFResult<bool> {
+        let result = self.poll_attempt().await;
+        self.report_poll_outcome(result.is_err()).await;
+        result
+    }
+
+    /// 一轮拉取的本体：fetch、找 promote tag、apply 或金丝雀。返回是否有新晋级被处理。
+    async fn poll_attempt(&self) -> SFResult<bool> {
         let head = self.sync_repo().await?;
         if head.is_empty() {
             // release 分支尚未建立（首次晋级前的正常空窗期）。
@@ -1492,9 +1545,13 @@ pub async fn run_puller_loop(puller: Arc<GitOpsPuller>, shutdown: cog_core::Shut
         interval_secs = interval.as_secs(),
         "GitOps puller loop started"
     );
-    // The GitOps puller is what brings the cluster's desired state in, and the
-    // only readings it leaves behind are its own poll outcomes: a puller that
-    // died and a cluster with nothing to pull look the same from them.
+    // The GitOps puller is what brings the cluster's desired state in. A puller
+    // that died is already visible: the loop is on a supervised cadence, its
+    // beat stops advancing, and background_loop_stalled says so. What was not
+    // visible is a puller that is cycling and failing -- the beat is stamped at
+    // the top of every cycle whether or not the poll returned, so liveness stays
+    // green while the cluster takes in nothing. Each poll's outcome is published
+    // inside `poll_once`, on both branches, so the two can be told apart.
     //
     // Awaited in place: the setup above is done once, and what a caller waits on
     // here is the loop itself.
@@ -1516,6 +1573,8 @@ pub async fn run_puller_loop(puller: Arc<GitOpsPuller>, shutdown: cog_core::Shut
                         biased;
                         _ = shutdown.wait() => break,
                         _ = ticker.tick() => {
+                            // The outcome reading is published inside `poll_once`,
+                            // so every attempt leaves a row whether or not it returns.
                             if let Err(e) = puller.poll_once().await {
                                 warn!(error = %e, "GitOps puller poll failed");
                             }
@@ -2867,6 +2926,46 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
             Arc::new(cog_storage::MemoryStateBackend::new()),
             "c".into(),
         )
+    }
+
+    /// 一轮失败的 poll 必须在读数上留下痕迹。
+    ///
+    /// 这就是「拉取端活着但每轮都失败」与「集群无事可拉」的唯一分界：循环的
+    /// beat 照常盖章，所以别的读数看不出差别。仓库路径不存在时 poll 必失败，
+    /// 而结局写在 [`GitOpsPuller::poll_once`] 这层薄壳里，因此驱动一次真的失败
+    /// 就足以断言失败面存在——不用构造金丝雀，也不用真的连一个远端。
+    #[tokio::test]
+    async fn a_failed_poll_leaves_a_failure_reading() {
+        use cog_core::MetricsBackend as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let mb = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let puller = GitOpsPuller::new(
+            GitOpsConfig {
+                repo_url: tmp.path().join("no-such-bare-repo").display().to_string(),
+                work_dir: tmp.path().join("checkout").display().to_string(),
+                ..GitOpsConfig::default()
+            },
+            Arc::new(cog_storage::MemoryStateBackend::new()),
+            "cluster-x".into(),
+        )
+        .with_metrics(Some(
+            std::sync::Arc::clone(&mb) as std::sync::Arc<dyn cog_core::MetricsBackend>
+        ));
+
+        assert!(
+            puller.poll_once().await.is_err(),
+            "仓库够不着时这一轮必须算失败"
+        );
+
+        let samples = mb
+            .query_gauge_latest(cog_core::metric_names::GITOPS_PULL_FAILED.as_str())
+            .await
+            .unwrap();
+        let sample = samples
+            .iter()
+            .find(|s| s.labels.get(CLUSTER_LABEL).map(String::as_str) == Some("cluster-x"))
+            .unwrap_or_else(|| panic!("失败的一轮没有留下读数：{samples:?}"));
+        assert_eq!(sample.value, 1.0, "失败的一轮必须写 1");
     }
 
     /// Records every alert drive as (condition, dedup key, message).

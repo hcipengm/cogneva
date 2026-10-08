@@ -1953,6 +1953,68 @@ fn the_puller_is_handed_the_persistent_alert_sink() {
     );
 }
 
+/// Each GitOps poll's outcome must be published on a face the deployment reads.
+///
+/// The puller brings the cluster's desired state in, and its loop is on a
+/// supervised cadence, so a puller that *stopped* was already visible through
+/// the loop's own readings. What had no reader was the puller *doing its job and
+/// failing*: the beat is stamped at the top of every cycle whether or not the
+/// poll returned, and the puller published no series of its own, so a puller
+/// that cannot reach the release branch poll after poll and a cluster with
+/// nothing to pull were the same picture -- the cluster simply stopped taking in
+/// updates and every reading stayed green. Three things make the fix real, and
+/// each is asserted here: the reading exists, the construction hands the puller
+/// the store it is written to, and the write sits in `poll_once`'s shell rather
+/// than inside the attempt, because the attempt returns early on its failure
+/// paths and a write behind those returns would be gated exactly when it matters.
+#[test]
+fn the_gitops_puller_publishes_each_polls_outcome() {
+    let plugin = read("crates/cog-reflection/src/plugin.rs");
+    let construct = plugin
+        .find("GitOpsPuller::new(")
+        .expect("plugin.rs no longer constructs the GitOps puller here");
+    let start = plugin[..construct]
+        .rfind("promotion.gitops.puller_enabled")
+        .expect("拉取端的构造不在 puller_enabled 守卫里了");
+    let end = plugin[construct..]
+        .find("run_puller_loop")
+        .map(|i| construct + i)
+        .expect("the puller is no longer started right after it is constructed");
+    let block = &plugin[start..end];
+    assert!(
+        block.contains("MetricsBackend"),
+        "拉取端没拿到指标 store：poll 的结局又只剩那句随 Pod 消失的日志了"
+    );
+    assert!(
+        block.contains("with_metrics"),
+        "拉取端拿到了 store 但没有交给自己（构造完之后必须 with_metrics）"
+    );
+
+    let puller = read("crates/cog-reflection/src/gitops_puller.rs");
+    let shell = puller
+        .find("pub async fn poll_once(")
+        .expect("GitOpsPuller::poll_once 没了");
+    let body_end = puller[shell..]
+        .find("\n    }\n")
+        .map(|i| shell + i)
+        .expect("poll_once 的函数体截不出来");
+    let body = &puller[shell..body_end];
+    assert!(
+        body.contains("poll_attempt("),
+        "poll_once 不再是包住一次尝试的薄壳：结局会随它的内部路径被门控"
+    );
+    assert!(
+        body.contains("report_poll_outcome"),
+        "poll_once 这条薄壳没有发布结局：每轮失败就没有读数"
+    );
+    assert_eq!(
+        puller.matches("report_poll_outcome(").count(),
+        2,
+        "结局的写点只能有一处（定义 + poll_once 里那一次调用）——多出来的写点会各写一半，\
+         少了的那一次就等于没写"
+    );
+}
+
 // ── 表达式的值能不能满足它自己的条件 ─────────────────────────────────────────
 
 /// A range of values, open or closed at each end. Infinities stand for "no

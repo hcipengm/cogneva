@@ -1317,6 +1317,15 @@ data:
               "summary": "The memory ingest reconcile scan could not be completed at some attempt in the last half hour, {value} being the highest outcome those attempts recorded. The two backlog readings the sibling rule above reads are stamped only once the scan returns a result, so a scan that fails leaves the aged-out count standing at its last, healthy value -- and the rule over it goes on trusting that value until its own half hour age bound closes it, so an unreadable backlog and a cleared one read the same on those series. This is the reading that says the scan itself did not answer: it is written on every attempt, 0 when the scan returns and 1 when it does not. The half hour is the window its sibling carries, because this is the same loop on the same cadence. The cause is the backend read that refused, in that container's log; read it beside the two backlog counts and never instead of them. The count is taken once for the fleet rather than per process: the store serves each series' newest row to every reader, so one row already states what this deployment did."
             },
             {
+              "name": "gitops_pull_failed",
+              "promql": "(max without (pod, container, instance) (max_over_time(gitops_pull_failed[30m]) and ((time() - gitops_pull_failed_observed_timestamp_seconds) < 1800))) > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "The GitOps puller's poll did not return at some attempt in the last half hour, {value} being the highest outcome those attempts recorded. The puller is what brings this cluster's desired state in: it fetches the release branch, reads the promote tag at its head, then applies a config change or runs a canary. A poll that fails leaves the branch unread, so the cluster stops taking in updates until someone notices -- and until this reading existed nothing was published about it at all. The loop's beat is stamped at the top of every cycle whether or not the poll returned, so the liveness readings keep saying the loop is running while it does nothing, and a puller that cannot reach the branch reads exactly like a cluster with nothing to pull. This is the reading that says the poll itself did not answer; it is written on every attempt, 0 when the poll returns and 1 when it does not. It carries the cluster, because every cluster runs its own puller against its own checkout and the store is shared. The half hour matches the window its sibling outcome readings carry, and is many times this loop's own poll interval. The cause is in that container's log -- a fetch that failed, or a store query that refused -- and the promotion_stall rule cannot stand in for it: that one reads successful promotions in weeks, so a puller failing every couple of minutes is invisible to it for weeks."
+            },
+            {
               "name": "audited_request_refused",
               "promql": "sum by (outcome) (increase(audited_llm_requests_total{outcome!=\"released\"}[1h])) > 0",
               "condition": {

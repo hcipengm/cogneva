@@ -161,6 +161,23 @@ metric_names! {
     VERSION_CONTRACT_CHECKS_TOTAL => "cogneva_version_contract_checks_total",
     VERSION_CONTRACT_UNJUDGED => "cogneva_version_contract_unjudged",
 
+    // cog-reflection — the GitOps puller: the loop that brings the cluster's
+    // desired state in, read by the cluster it pulls for.
+    //
+    // The loop is on a supervised cadence, so its *liveness* already has a
+    // reader: `cogneva_loop_tick_age_seconds` stops moving when the task is gone
+    // and background_loop_stalled says so. What had no reader at all was the
+    // loop *doing its job* and failing: the beat is stamped at the top of every
+    // cycle whether or not the poll returned, the failure was written to the log
+    // alone, and the puller itself left no series behind -- so a puller that
+    // could not reach the release branch poll after poll and a cluster with
+    // nothing to pull were the same picture on every reading. This is that
+    // missing face: 0 when the poll returned, 1 when it did not, written on
+    // every attempt. Labelled by cluster, because every cluster runs its own
+    // puller against its own checkout and a series without the name would read
+    // two clusters' outcomes as one.
+    GITOPS_PULL_FAILED => "gitops_pull_failed",
+
     // cog-reflection — the registry store's capacity reclamation, read by the
     // process that reclaims it.
     //
