@@ -327,6 +327,32 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          different fact from a store with nothing to repair",
     ),
     (
+        "cogneva_skill_hot_reload_total",
+        "How each round of the skill hot-reload loop ended, summed over rounds \
+         and labelled by the outcome. The loop exists to keep the in-memory \
+         skill registry in step with the files on disk; its only other reading \
+         is its own beat, stamped every poll interval whether or not anything \
+         changed, so a round that could not scan the directories at all and a \
+         round that scanned them and found nothing to do were the same picture, \
+         and a skill file that failed to load left the previous definition in \
+         the cache and survived only as a log line that dies with the pod. The \
+         values are a closed set the producing module declares: applied (at \
+         least one skill was loaded, replaced, or evicted, so the cache moved \
+         towards the disk), unchanged (the scan and the cache agreed), \
+         reload_failed (a skill was found on disk but could not be loaded, so \
+         the stale definition kept serving), and failed (the scan itself \
+         returned an error and nothing was inspected). A round that both \
+         applied a change and failed to load another skill is recorded as \
+         applied: the failed skill is re-scanned every round and re-surfaces, \
+         while the applied one is only true of this round. Read the failed and \
+         reload_failed cells against the rest: a failed cell rising is the loop \
+         not looking at the disk at all, which is a different fact from a \
+         broken skill file that re-surfaces every round. The loop runs in every \
+         deployment that enables the skill plugin and all of them write the one \
+         store, so a reader takes a single series rather than summing across \
+         deployments: the sum would report the same total once per writer",
+    ),
+    (
         "cogneva_mainline_superseded_rollout_total",
         "Rounds the deployer's guard answered that the revision it was carrying \
          had been overtaken upstream: 1 when it had (nothing is rolled out, the \

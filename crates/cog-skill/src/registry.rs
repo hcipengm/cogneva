@@ -34,10 +34,39 @@ impl Default for SkillConfig {
     }
 }
 
+/// Where a round of the hot-reload check ended.
+///
+/// The closed set of ends, plus `failed` for a round that could not scan the
+/// directories: without it, a loop that is failing every round and a loop with
+/// nothing to pick up are the same picture on the reading surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HotReloadRound {
+    /// At least one skill was loaded, replaced, or evicted.
+    Applied,
+    /// The scan and the cache agreed — nothing to do.
+    Unchanged,
+    /// A skill found on disk could not be loaded; the stale definition keeps
+    /// serving and the entry is re-scanned on every round.
+    ReloadFailed,
+}
+
+impl HotReloadRound {
+    fn as_cell(&self) -> &'static str {
+        match self {
+            HotReloadRound::Applied => "applied",
+            HotReloadRound::Unchanged => "unchanged",
+            HotReloadRound::ReloadFailed => "reload_failed",
+        }
+    }
+}
+
 /// In-memory skill registry backed by filesystem directories.
 pub struct SkillRegistryImpl {
     config: SkillConfig,
     cache: RwLock<HashMap<String, CachedSkill>>,
+    /// Where each round's outcome goes. Unset when the metrics backend was not
+    /// published: the round then leaves only the log line it always left.
+    metrics: std::sync::OnceLock<Arc<dyn cog_core::MetricsBackend>>,
 }
 
 struct CachedSkill {
@@ -52,7 +81,47 @@ impl SkillRegistryImpl {
         Arc::new(Self {
             config,
             cache: RwLock::new(HashMap::new()),
+            metrics: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Attach the sink for the per-round outcome, once.
+    ///
+    /// Called from the plugin's `start`, not its `init`: the metrics backend is
+    /// published by the storage plugin, which initialises after this one, so
+    /// resolving it inside this plugin's own `init` returns `None`. A `None`
+    /// sink is not an error — the round keeps its log line — so it is simply not
+    /// set.
+    pub fn set_metrics(&self, metrics: Option<Arc<dyn cog_core::MetricsBackend>>) {
+        if let Some(metrics) = metrics {
+            let _ = self.metrics.set(metrics);
+        }
+    }
+
+    /// Where this round's outcome goes. `None` when no backend was published.
+    fn metrics(&self) -> Option<&Arc<dyn cog_core::MetricsBackend>> {
+        self.metrics.get()
+    }
+
+    /// Record which cell of the closed outcome set this round landed in.
+    ///
+    /// `None` means the round ended in an error. It is written at the same point
+    /// as the round itself so a round that could not scan the directories and a
+    /// round that found nothing to do stay apart on the reading surface; without
+    /// it both leave only a line that dies with the pod.
+    async fn record_round(&self, outcome: Option<&HotReloadRound>) {
+        let Some(metrics) = self.metrics() else {
+            return;
+        };
+        let cell = outcome.map_or("failed", HotReloadRound::as_cell);
+        let mut labels = HashMap::new();
+        labels.insert("outcome".to_string(), cell.to_string());
+        if let Err(e) = metrics
+            .record_counter(cog_core::metric_names::SKILL_HOT_RELOAD_TOTAL, 1.0, labels)
+            .await
+        {
+            tracing::warn!(error = %e, "skill hot-reload: could not record round outcome");
+        }
     }
 
     /// Scan all configured directories and load skills into cache.
@@ -117,19 +186,41 @@ impl SkillRegistryImpl {
                     loop {
                         beat.beat();
                         interval.tick().await;
-                        if let Err(e) = registry.check_and_reload().await {
-                            tracing::warn!("Skill hot-reload check failed: {}", e);
-                        }
+                        registry.run_round().await;
                     }
                 }
             },
         )
     }
 
+    /// Run one round and record where it landed.
+    ///
+    /// The recording lives here rather than in the caller so that the failure
+    /// has one place to be dropped from, and that place is a round: a caller
+    /// that unwrapped the result itself would lose the only cell that tells a
+    /// loop failing every round from a loop with nothing to pick up.
+    async fn run_round(&self) {
+        match self.check_and_reload().await {
+            Ok(outcome) => self.record_round(Some(&outcome)).await,
+            Err(e) => {
+                tracing::warn!("Skill hot-reload check failed: {}", e);
+                self.record_round(None).await;
+            }
+        }
+    }
+
     /// Compare disk state with in-memory cache and reload changed skills.
-    async fn check_and_reload(&self) -> SFResult<()> {
+    ///
+    /// Returns which cell of the closed outcome set this round landed in. A
+    /// round that both moved the cache and failed to load another skill is
+    /// `Applied`: the failed skill is re-scanned every round and re-surfaces,
+    /// while what was applied is true only of this round.
+    async fn check_and_reload(&self) -> SFResult<HotReloadRound> {
         let discovered = discover_all(&self.config.directories).await?;
         let mut cache = self.cache.write().await;
+
+        let mut applied = false;
+        let mut reload_failed = false;
 
         // Build a set of discovered skill IDs for eviction detection.
         let discovered_ids: std::collections::HashSet<String> =
@@ -144,6 +235,7 @@ impl SkillRegistryImpl {
         for id in evict_ids {
             tracing::info!(skill_id = %id, "Evicted deleted skill");
             cache.remove(&id);
+            applied = true;
         }
 
         // Load new or modified skills.
@@ -166,15 +258,23 @@ impl SkillRegistryImpl {
                             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
                         tracing::info!(skill_id = %skill_id, path = %path.display(), "Hot-reloaded skill");
                         cache.insert(skill_id, CachedSkill { def, path, mtime });
+                        applied = true;
                     }
                     Err(e) => {
                         tracing::warn!(skill_id = %skill_id, path = %path.display(), error = %e, "Failed to hot-reload skill");
+                        reload_failed = true;
                     }
                 }
             }
         }
 
-        Ok(())
+        Ok(if applied {
+            HotReloadRound::Applied
+        } else if reload_failed {
+            HotReloadRound::ReloadFailed
+        } else {
+            HotReloadRound::Unchanged
+        })
     }
 }
 
@@ -481,7 +581,7 @@ impl SkillRegistryImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cog_core::ExternalSkillRegistry;
+    use cog_core::{ExternalSkillRegistry, MetricsBackend};
 
     /// 内置 PGE prompt skills（prompts/skills/pge_*）必须能被 registry
     /// 完整解析：SKILL.md 正文 + output_schema.json 资源。
@@ -569,5 +669,93 @@ mod tests {
             second, first,
             "a hot reload must not reshuffle what the prompt renders"
         );
+    }
+
+    /// 闭集四格的名字两两不同：一格的名字就是它在读数面上的身份，
+    /// 两格同名等于一格。
+    #[test]
+    fn hot_reload_cells_are_a_closed_set_of_distinct_names() {
+        let cells: Vec<&str> = [
+            HotReloadRound::Applied,
+            HotReloadRound::Unchanged,
+            HotReloadRound::ReloadFailed,
+        ]
+        .iter()
+        .map(|r| r.as_cell())
+        .collect();
+        assert_eq!(cells, vec!["applied", "unchanged", "reload_failed"]);
+        let unique: std::collections::HashSet<&str> = cells.iter().copied().collect();
+        assert_eq!(unique.len(), cells.len(), "闭集里的名字必须两两不同");
+    }
+
+    /// 每一轮恰好落一格，且「同一轮里既搬动缓存又加载失败」记 `applied`。
+    ///
+    /// 最后一组断言是这条优先级的存在理由：让位给 `applied` 的
+    /// `reload_failed` 下一轮必然再现（坏文件还在，缓存里也没有它），
+    /// 所以它不会被这一轮吞掉；反过来则会永久压制自愈的那格。
+    #[tokio::test]
+    async fn every_hot_reload_round_lands_in_exactly_one_cell() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = SkillRegistryImpl::new(SkillConfig {
+            directories: vec![dir.path().to_path_buf()],
+            hot_reload_interval_secs: 60,
+        });
+        let metrics = Arc::new(cog_storage::MemoryMetricsBackend::new());
+        registry.set_metrics(Some(metrics.clone()));
+        // 空目录：扫描与缓存一致。
+        registry.run_round().await;
+
+        // 一个坏技能（frontmatter 少了收尾的 ---）：扫得到、加载不了。
+        let broken = dir.path().join("broken_skill");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join("SKILL.md"), "---\nname: Broken\n").unwrap();
+        registry.run_round().await;
+
+        // 同一个坏技能还在，另加一个好技能：这一轮两格都点着了，记 `applied`。
+        let good = dir.path().join("good_skill");
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::write(
+            good.join("SKILL.md"),
+            "---\nname: Good\ndescription: ok\n---\n\nbody\n",
+        )
+        .unwrap();
+        registry.run_round().await;
+
+        // 好技能已进缓存、mtime 没变；坏技能仍加载不了 ⇒ 它再现了。
+        registry.run_round().await;
+
+        // 折了的那一轮：目录指向一个普通文件，扫描本身就失败，也必须落格。
+        let not_a_dir = dir.path().join("not_a_dir");
+        std::fs::write(&not_a_dir, "not a directory").unwrap();
+        let failing = SkillRegistryImpl::new(SkillConfig {
+            directories: vec![not_a_dir],
+            hot_reload_interval_secs: 60,
+        });
+        failing.set_metrics(Some(metrics.clone()));
+        failing.run_round().await;
+
+        let totals = metrics
+            .query_counter_totals("cogneva_skill_hot_reload_total")
+            .await
+            .unwrap();
+        let cell = |name: &str| {
+            totals
+                .iter()
+                .find(|s| s.labels.get("outcome").map(String::as_str) == Some(name))
+                .map(|s| s.value)
+        };
+        assert_eq!(
+            cell("applied"),
+            Some(1.0),
+            "既搬动缓存又加载失败的那轮记 applied"
+        );
+        assert_eq!(cell("unchanged"), Some(1.0));
+        assert_eq!(
+            cell("reload_failed"),
+            Some(2.0),
+            "让位给 applied 的那格下一轮必须再现"
+        );
+        assert_eq!(cell("failed"), Some(1.0));
+        assert_eq!(totals.len(), 4, "闭集恰好四格，多一格少一格都是形状变了");
     }
 }

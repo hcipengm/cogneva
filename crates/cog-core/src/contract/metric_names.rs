@@ -271,6 +271,24 @@ metric_names! {
     // permanent loss that re-surfaces every round and reads on no other series.
     MEMORY_SCHEMA_REPAIR_TOTAL => "cogneva_memory_schema_repair_total",
 
+    // cog-skill — how each round of the skill hot-reload loop ended, labelled by
+    // `outcome`, one round per cell.
+    //
+    // This loop exists to keep the in-memory registry in step with the skill
+    // files on disk. Its only reading was its own beat, stamped every poll
+    // interval whether or not anything changed, so a round that could not scan
+    // the directories at all and a round that scanned them and found nothing to
+    // do read the same -- and both looked ordinary. A skill file that fails to
+    // load left the previous definition in the cache and went to a WARN that
+    // dies with the pod, so an edited skill that never took effect and a skill
+    // nobody edited were the same picture.
+    //
+    // A counter, because the round runs on every poll interval and the fact is a
+    // cumulative one; the four cells are the closed set of ends, so a reader can
+    // separate a scan that is failing every round from one with nothing to pick
+    // up, and can see the skills it found on disk but could not load.
+    SKILL_HOT_RELOAD_TOTAL => "cogneva_skill_hot_reload_total",
+
     // cog-reflection — the registry store's capacity reclamation, read by the
     // process that reclaims it.
     //

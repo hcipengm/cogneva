@@ -6,6 +6,10 @@ use tracing::{info, warn};
 /// Skill plugin that provides the skill registry and external skill registry.
 pub struct SkillPlugin {
     registry: Option<Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>>,
+    /// The filesystem-backed registry, held across `init` and `start`: the
+    /// hot-reload watcher starts in `start`, where the metrics backend is
+    /// already published, and it needs this handle to attach it.
+    external: Option<Arc<crate::SkillRegistryImpl>>,
     initialized: bool,
 }
 
@@ -14,6 +18,7 @@ impl SkillPlugin {
     pub fn new() -> Self {
         Self {
             registry: None,
+            external: None,
             initialized: false,
         }
     }
@@ -22,6 +27,7 @@ impl SkillPlugin {
     pub fn from_registry(registry: Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>) -> Self {
         Self {
             registry: Some(registry),
+            external: None,
             initialized: false,
         }
     }
@@ -90,7 +96,7 @@ impl cog_core::SystemPlugin for SkillPlugin {
         if let Err(e) = impl_registry.load_all().await {
             warn!(error = %e, "Failed to load some skills");
         }
-        let _watcher = impl_registry.spawn_watcher();
+        self.external = Some(impl_registry.clone());
         let external_registry: Arc<dyn cog_core::ExternalSkillRegistry> = impl_registry;
         ctx.publish_service(external_registry);
         info!("SkillPlugin external skill registry published");
@@ -99,7 +105,24 @@ impl cog_core::SystemPlugin for SkillPlugin {
         Ok(())
     }
 
-    async fn start(&self, _ctx: &cog_core::PluginContext) -> cog_core::SFResult<()> {
+    async fn start(&self, ctx: &cog_core::PluginContext) -> cog_core::SFResult<()> {
+        // The hot-reload watcher is started here rather than in `init` so it can
+        // carry its per-round outcome to the metric store from its first round.
+        // The metrics backend is published by the storage plugin, which
+        // initialises after this one, so resolving it in `init` would find
+        // nothing; every plugin's `init` has completed by the time `start` runs.
+        let Some(registry) = self.external.clone() else {
+            return Ok(());
+        };
+        let metrics = ctx.consume_service::<dyn cog_core::MetricsBackend>();
+        if metrics.is_none() {
+            warn!(
+                "MetricsBackend not published; skill hot-reload round outcomes \
+                 will not be reported"
+            );
+        }
+        registry.set_metrics(metrics);
+        let _watcher = registry.spawn_watcher();
         Ok(())
     }
 

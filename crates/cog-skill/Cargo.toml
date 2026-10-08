@@ -23,3 +23,7 @@ dirs = "5"
 
 [dev-dependencies]
 tokio-test = "0.4"
+# The round-outcome test asserts on a real counter, so it needs a real
+# MetricsBackend: the memory one is the same implementation the family's other
+# outcome tests read.
+cog-storage = { workspace = true }
