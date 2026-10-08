@@ -4211,6 +4211,13 @@ impl MainlineDeployer {
         // versions have diverged is worth knowing. Judged before the early
         // returns, so none of them skips it.
         self.report_version_contract(&bare).await;
+        // 索引读数的心跳。两棵长命树只在"即将 reset"的那一刻被采，所以两笔采样之间的
+        // 空档是两次 reset 之间的空档，不是写者自己的节奏；空闲的部署器一停几小时，
+        // 而读这条读数的告警规则按伴生钟的年龄判写者还在不在。钉在本方法里，因为它是
+        // 本进程最密的固定节拍，且早退分支全在下面——心跳必须排在它们之前，否则"这一轮
+        // 不推进"就等于"这一轮不盖章"，空档照旧。盖哪两棵、为什么只有那两棵，见
+        // `WorkspaceManager::heartbeat_index_health`。
+        self.workspaces.heartbeat_index_health().await;
         let images = self.deployed_images().await?;
         let deployed = classify_deployed(&images);
 

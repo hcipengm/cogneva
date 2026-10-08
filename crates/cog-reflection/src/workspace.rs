@@ -34,6 +34,36 @@ pub use cog_core::metric_names::WORKTREE_INDEX_MISSING_FILES as WORKTREE_INDEX_M
 /// 大小，这一条把两者分开：前者是文件被删或没挂上，后者是写到一半被截断。
 pub use cog_core::metric_names::WORKTREE_INDEX_PRESENT as WORKTREE_INDEX_PRESENT_METRIC;
 
+/// 一棵常驻工作树的索引读数多久必须重盖一次章。
+///
+/// 这棵树只在**即将被 `reset --hard`** 的那一刻被采（见
+/// [`WorkspaceManager::sample_index_health`]），于是两笔采样之间的空档是"两次 reset
+/// 之间的空档"，不是写者自己的节奏：部署器没事可做时它一停几小时，而它报的那个索引
+/// 状态在这几小时里一个字都没变。读这条读数的告警规则按伴生钟的年龄判"写者还在不在"，
+/// 空档有多长规则就瞎多久——实测两棵长命树（部署器树、引擎基线树）在共享表留存的那
+/// 两天里，采样间隔中位数 42 分钟、最长 5.7 小时，而规则给的界是三小时，也就是每棵树
+/// 每天有一两次连着约两个半小时的静默，静默期间当值还在。心跳把这个空档封在写者自己
+/// 的钟上：一轮没动也盖一次章，界于是可以对一条已知的节奏比较，而不是对"没事就不写"猜。
+///
+/// 值与普查、耐久池两处同拍：一个"没变但仍在被观测"的节奏全系统一个值。
+pub const INDEX_SAMPLE_HEARTBEAT: Duration = Duration::from_secs(1800);
+
+/// 这棵常驻工作树的索引现在要不要重采一次。
+///
+/// 与普查那条同形状（`census_needs_write`），少的是"值变了"那一半：值由 git 现读，
+/// 读一次就知道，缓存一份计数反而会拿旧数去比。`last` 是本进程上一笔真写下去的时刻，
+/// `None` 表示本进程还没采过——那一定要采，缺席的一格要先被填上。
+fn index_sample_needs_write(
+    last: Option<std::time::Instant>,
+    now: std::time::Instant,
+    heartbeat: Duration,
+) -> bool {
+    match last {
+        None => true,
+        Some(at) => now.duration_since(at) >= heartbeat,
+    }
+}
+
 /// 工作树默认根目录（沙盒 PVC 内，与 bin/backups/changes/mainline 同级）。
 pub const DEFAULT_WORKSPACES_ROOT: &str = "/opt/cogneva/sandbox/workspaces";
 
@@ -207,6 +237,11 @@ pub struct WorkspaceManager {
     /// 索引健康度采样的去处。缺席则只记日志、不上报——丢一个聚合读数不该让
     /// 刷新本身失败。
     metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
+    /// 每棵常驻树上一笔索引读数写下去的时刻，键是工作树 id。
+    ///
+    /// 只为本进程活着：这一格只用来回答"距上次盖章够久了没有"，进程重启后重采一遍
+    /// 是对的——新进程还没有自己的读数。
+    index_sampled_at: std::sync::Mutex<HashMap<String, std::time::Instant>>,
 }
 
 impl WorkspaceManager {
@@ -225,6 +260,7 @@ impl WorkspaceManager {
             ephemeral_ttl: DEFAULT_EPHEMERAL_TTL,
             stale_lock_age: STALE_GIT_LOCK_AGE,
             metrics: None,
+            index_sampled_at: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -412,22 +448,60 @@ impl WorkspaceManager {
     /// 所以序列基数有界；临时树的 id 带 uuid，采了就是无界基数，而它本来就是一次性
     /// 检出、路径不参与增量，索引丢没丢不影响任何人。
     pub async fn sample_index_health(&self, ws: &Workspace) {
+        self.sample_index_health_of(&ws.id, &ws.path, ws.is_persistent())
+            .await;
+    }
+
+    /// 给两棵长命树补一次索引采样，把"这棵树多久没被重采"封在心跳上。
+    ///
+    /// 覆盖部署器树与引擎基线树：两棵都由本进程持有（同一份分配器，见
+    /// `MainlineDeployer::poll_once` 的调用点），reset 之间可能闲着几小时，而它们的
+    /// 索引读数正是给"下一次 reset 会不会重写整棵树"做证据的。按实例的 `cycle-*`/
+    /// `porter-*` 树不在这里：它们每轮都在原地刷新（实测五分钟一次），不需要补；更
+    /// 要紧的是**不能**补——那些树的寿命跟着实例走，实例没了树就被回收，它们的序列
+    /// 本来就该随写者一起老掉，被心跳续期会把一棵已经不在的树的最后一笔读数永远说成
+    /// 新鲜的，而那正是索引这条读数防的另一头。
+    ///
+    /// 两棵树的 id 取自闭集，所以序列基数有界：心跳只加行，不加维度。
+    pub async fn heartbeat_index_health(&self) {
+        for (id, path) in [
+            ("mainline", self.deployer_workspace()),
+            ("engine-baseline", self.engine_baseline_workspace()),
+        ] {
+            let last = {
+                let sampled = self
+                    .index_sampled_at
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                sampled.get(id).copied()
+            };
+            if !index_sample_needs_write(last, std::time::Instant::now(), INDEX_SAMPLE_HEARTBEAT) {
+                continue;
+            }
+            self.sample_index_health_of(id, &path, true).await;
+        }
+    }
+
+    /// [`Self::sample_index_health`] 的实现体：工作树 id 与路径就是它读的全部，
+    /// 反过来"它属于哪一类树"决定采不采。心跳那条路只有 id 和路径（树可能在盘上还
+    /// 没建起来，也可能已经被回收），所以判据留在这里而不是去凑一棵 [`Workspace`]。
+    async fn sample_index_health_of(&self, id: &str, path: &Path, persistent: bool) {
         let Some(metrics) = self.metrics.clone() else {
             return;
         };
-        if !ws.is_persistent() {
+        if !persistent {
             return;
         }
         let Ok(gitdir) = self
-            .git_in(&ws.path, &["rev-parse", "--absolute-git-dir"])
+            .git_in(path, &["rev-parse", "--absolute-git-dir"])
             .await
         else {
             // 解析不出 gitdir 就采不到，而那本身也是"这棵树的 git 元数据已经不对了"
             // 的一种；留一行日志，不编一个数。
-            warn!(worktree = %ws.id, "index sample: cannot resolve the git dir");
+            warn!(worktree = %id, "index sample: cannot resolve the git dir");
             return;
         };
-        let labels = HashMap::from([("worktree".to_string(), ws.id.clone())]);
+        let labels = HashMap::from([("worktree".to_string(), id.to_string())]);
         // 存在性先报：它只要一次 stat，后面两条 git 读数都失败时这一条仍然前进，
         // 采样停摆因此不会被读成"一切正常"。
         let present = tokio::fs::metadata(PathBuf::from(gitdir).join("index"))
@@ -442,19 +516,19 @@ impl WorkspaceManager {
         .await;
 
         let tracked = match self
-            .count_git_lines(&ws.path, &["ls-tree", "-r", "--name-only", "HEAD"])
+            .count_git_lines(path, &["ls-tree", "-r", "--name-only", "HEAD"])
             .await
         {
             Ok(n) => n,
             Err(e) => {
-                warn!(worktree = %ws.id, "index sample: cannot list the files at HEAD: {e}");
+                warn!(worktree = %id, "index sample: cannot list the files at HEAD: {e}");
                 return;
             }
         };
-        let entries = match self.count_git_lines(&ws.path, &["ls-files"]).await {
+        let entries = match self.count_git_lines(path, &["ls-files"]).await {
             Ok(n) => n,
             Err(e) => {
-                warn!(worktree = %ws.id, "index sample: cannot list the index: {e}");
+                warn!(worktree = %id, "index sample: cannot list the index: {e}");
                 return;
             }
         };
@@ -466,6 +540,14 @@ impl WorkspaceManager {
             &labels,
         )
         .await;
+        // 盖章只在两笔读数都落下去之后：上面任何一条早退都意味着这一棵这次没采到，
+        // 而没采到就该在下一轮重试，不是把空档记成已经补过。落不下去的那次会每轮
+        // 留一行 warn，那是对的——"这棵树的读数取不到"本来就该一直有人看得见。
+        let mut sampled = self
+            .index_sampled_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        sampled.insert(id.to_string(), std::time::Instant::now());
     }
 
     /// 数一条 git 命令输出的行数。空输出是 0 行，不是一个空行。
@@ -1125,6 +1207,120 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "临时树不该被采样"
+        );
+    }
+
+    /// 某棵树在某条读数上已经落了多少行。心跳的全部效果就是"落一行"或"不落"，
+    /// 所以判据要数行，不能只看最新值——值在窗内重复写也是同一个数。
+    async fn sample_rows(
+        mb: &cog_storage::MemoryMetricsBackend,
+        name: &str,
+        worktree: &str,
+    ) -> usize {
+        let now = chrono::Utc::now();
+        mb.query_gauge_range(
+            name,
+            now - chrono::Duration::hours(1),
+            now + chrono::Duration::minutes(1),
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|s| s.labels.get("worktree").map(String::as_str) == Some(worktree))
+        .count()
+    }
+
+    /// 心跳的判据只认本进程上一次真写完的时刻：没采过要采，窗内不采，到点再采。
+    #[test]
+    fn index_sample_heartbeat_writes_when_absent_then_only_at_the_bound() {
+        let now = std::time::Instant::now();
+        assert!(index_sample_needs_write(None, now, INDEX_SAMPLE_HEARTBEAT));
+        assert!(!index_sample_needs_write(
+            Some(now),
+            now,
+            INDEX_SAMPLE_HEARTBEAT
+        ));
+        assert!(!index_sample_needs_write(
+            Some(now - (INDEX_SAMPLE_HEARTBEAT - Duration::from_secs(1))),
+            now,
+            INDEX_SAMPLE_HEARTBEAT
+        ));
+        assert!(index_sample_needs_write(
+            Some(now - INDEX_SAMPLE_HEARTBEAT),
+            now,
+            INDEX_SAMPLE_HEARTBEAT
+        ));
+    }
+
+    /// 两棵长命树只在"即将 reset"时被采，于是空闲的部署器能让读数静默几小时。
+    /// 心跳是它们唯一的第二条写路，必须把它补上；补过之后窗内不许再补。
+    #[tokio::test]
+    async fn heartbeat_stamps_long_lived_worktrees_and_leaves_instance_trees_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bare, _a, rev_b) = seed_bare(tmp.path());
+        let mb = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let mgr = manager(tmp.path(), &bare).with_metrics(mb.clone());
+
+        // 三棵树都建出来，但一条读数都还没采（ensure_persistent 不采）。
+        for (id, kind) in [
+            ("mainline", WorkspaceKind::Deployer),
+            ("engine-baseline", WorkspaceKind::EngineBaseline),
+            ("cycle-7", WorkspaceKind::Cycle),
+        ] {
+            mgr.ensure_persistent(WorkspaceSpec::persistent(
+                id,
+                kind,
+                BaseRef::Commit(rev_b.clone()),
+            ))
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            sample_rows(
+                &mb,
+                WORKTREE_INDEX_MISSING_FILES_METRIC.as_str(),
+                "mainline"
+            )
+            .await,
+            0
+        );
+
+        mgr.heartbeat_index_health().await;
+
+        for id in ["mainline", "engine-baseline"] {
+            assert_eq!(
+                gauge_of(&mb, WORKTREE_INDEX_PRESENT_METRIC.as_str(), id).await,
+                1.0,
+                "{id} 是长命树，心跳必须给它盖章"
+            );
+            assert_eq!(
+                sample_rows(&mb, WORKTREE_INDEX_MISSING_FILES_METRIC.as_str(), id).await,
+                1
+            );
+        }
+        assert_eq!(
+            sample_rows(&mb, WORKTREE_INDEX_MISSING_FILES_METRIC.as_str(), "cycle-7").await,
+            0,
+            "实例树的寿命跟着实例走，被心跳续期会把已回收的树说成新鲜的"
+        );
+
+        // 紧接着的第二拍在窗内：行数不许涨。
+        let before = sample_rows(
+            &mb,
+            WORKTREE_INDEX_MISSING_FILES_METRIC.as_str(),
+            "mainline",
+        )
+        .await;
+        mgr.heartbeat_index_health().await;
+        assert_eq!(
+            sample_rows(
+                &mb,
+                WORKTREE_INDEX_MISSING_FILES_METRIC.as_str(),
+                "mainline"
+            )
+            .await,
+            before,
+            "窗内重复盖章等于把心跳退化成每拍刷一行"
         );
     }
 

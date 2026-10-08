@@ -1199,6 +1199,46 @@ fn a_rule_guarding_the_census_waits_longer_than_the_census_heartbeat() {
     );
 }
 
+/// The guard over the worktree index sample has to look back further than the
+/// heartbeat that re-stamps it.
+///
+/// The sample is taken before a reset, so on a long-lived tree the gap between
+/// two samples is the gap between two resets rather than a cadence the writer
+/// chose -- an idle deployer leaves it unsampled for hours. The heartbeat
+/// (`INDEX_SAMPLE_HEARTBEAT`) is that reading's second writer, so the guard's
+/// bound has to clear it: a bound no longer than that gap is failed by a healthy
+/// deployer sitting between two stamps, and the rule goes quiet on the one state
+/// it exists for.
+///
+/// Neither number is written into this test -- the bound comes out of the
+/// shipped expression and the heartbeat out of the sampler -- because a bound
+/// chosen against a constant drifts from it the moment either side moves, and
+/// the drift is silent and in the direction that fires on a working system.
+#[test]
+fn a_rule_guarding_the_index_sample_waits_longer_than_its_heartbeat() {
+    let heartbeat = cog_reflection::workspace::INDEX_SAMPLE_HEARTBEAT.as_secs();
+    assert!(heartbeat > 0, "索引采样心跳为 0，下面这条判据恒真");
+
+    let metric = cog_core::metric_names::WORKTREE_INDEX_MISSING_FILES.as_str();
+    let mut guarded = 0usize;
+    for (rule, promql) in chart_rules() {
+        let Some(bound) = companion_age_bound(&promql, metric) else {
+            continue;
+        };
+        guarded += 1;
+        assert!(
+            bound > heartbeat,
+            "{rule}: 守卫的年龄界 {bound}s 不严格长于索引采样心跳 {heartbeat}s——\
+             部署器闲下来坐进两次盖章之间就能造出这个空窗，判据会在完好的树上点亮"
+        );
+    }
+    // 分母：没有一条规则读这棵树的伴生钟时，上面这句「没有投诉」是空的。
+    assert!(
+        guarded > 0,
+        "没有任何规则对工作树索引读数的伴生钟取年龄界，这条判据没有分母"
+    );
+}
+
 /// No shipped rule may guard a store-served gauge with a change count over its
 /// companion.
 ///
