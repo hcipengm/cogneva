@@ -877,12 +877,12 @@ data:
             },
             {
               "name": "change_funnel_unattributed",
-              "promql": "sum(max by (intent, stage) (cogneva_change_funnel{intent=\"unattributed\"})) > 0",
+              "promql": "sum(max by (intent, stage) (cogneva_change_funnel{intent=\"unattributed\"} and (changes(cogneva_change_funnel_observed_timestamp_seconds[1h]) > 0))) > 0",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "{value} held changes carry an entry point this build cannot name, so they are counted under no entry point and the funnel cannot say which producer is unproductive. Either a producer declares a task kind outside the classified set, or the record predates the intent travelling with the change; new work of either kind will keep landing in this bucket until the kind is classified The count is read as the largest value any process reports rather than as their sum: the row is kept once and read back by every process that shares the store, so any one of them already states the whole count."
+              "summary": "{value} held changes carry an entry point this build cannot name, so they are counted under no entry point and the funnel cannot say which producer is unproductive. Either a producer declares a task kind outside the classified set, or the record predates the intent travelling with the change; new work of either kind will keep landing in this bucket until the kind is classified The count is read as the largest value any process reports rather than as their sum: the row is kept once and read back by every process that shares the store, so any one of them already states the whole count. A cell counts as a reading only while the census that stamps it is still running: the store serves a gauge's newest row forever, so a census that stopped while a change sat in this bucket would hold the value with nothing left to clear it, and the rule would stay fired for good. The guard is changes() over the companion _observed_timestamp_seconds in the same hour, applied to each cell before the reduction merges the processes. The census rewrites a cell it has not moved once every thirty minutes by its own heartbeat, so the hour outlasts it: two stamps reach the window while the census runs, and none once it stops."
             },
             {
               "name": "change_landing_failures",

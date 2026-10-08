@@ -30,8 +30,9 @@ mod promql;
 
 use producer::carries_the_producer;
 use promql::{
-    lagged_equality_complaints, metric_names_in, shape_complaints, uncovered_window_complaints,
-    unguarded_store_reading_complaints, windows_over,
+    bare_observation_reads, lagged_equality_complaints, metric_names_in, shape_complaints,
+    uncovered_window_complaints, unguarded_store_reading_complaints, window_over_series,
+    windows_over,
 };
 
 const CHART_CONFIG: &str = "deploy/helm/cogneva/files/cogneva.json";
@@ -1003,12 +1004,13 @@ fn a_rule_that_certifies_a_window_requires_the_window_to_be_covered() {
 ///
 /// The store hands back each series' newest row forever, so a gauge whose
 /// writer stopped goes on being scraped at its last value. A rule reading that
-/// value over a window counts the frozen sample as an observation of the
-/// window, and a writer that stopped on the firing side of its threshold leaves
-/// the rule fired for good: no repair to the thing being measured can clear it,
-/// because the series the rule reads has stopped being connected to it. The
-/// companion `_observed_timestamp_seconds` is the one series that moves when
-/// the writer does, so the reading is `changes()` over it.
+/// value as an observation -- over a window, or against a constant with no
+/// window at all -- reads a frozen sample as a fact about now, and a writer
+/// that stopped on the firing side of its threshold leaves the rule fired for
+/// good: no repair to the thing being measured can clear it, because the series
+/// the rule reads has stopped being connected to it. The companion
+/// `_observed_timestamp_seconds` is the one series that moves when the writer
+/// does, so the reading is `changes()` over it.
 ///
 /// The family is taken from the exposition's own description tables rather than
 /// by searching the rule text for metric names. A name search over the rules
@@ -1026,7 +1028,7 @@ fn a_rule_that_certifies_a_window_requires_the_window_to_be_covered() {
 /// Whether they also want this guard is a separate question, and this test does
 /// not settle it.
 #[test]
-fn a_rule_reading_a_store_gauge_over_a_window_requires_its_writer() {
+fn a_rule_reading_a_store_gauge_requires_its_writer() {
     let durable: BTreeSet<&str> = cog_gateway::security_gateway::DURABLE_POOL_GAUGES
         .iter()
         .map(|name| name.as_str())
@@ -1051,24 +1053,124 @@ fn a_rule_reading_a_store_gauge_over_a_window_requires_its_writer() {
 
     let mut complaints: Vec<String> = Vec::new();
     let mut windowed = 0usize;
+    let mut bare = 0usize;
     for (rule, promql) in chart_rules() {
         windowed += windows_over(&promql, &gated).len();
+        bare += bare_observation_reads(&promql, &gated).len();
         for complaint in unguarded_store_reading_complaints(&promql, &gated) {
             complaints.push(format!("{rule}: {complaint}\n    {promql}"));
         }
     }
 
-    // 另一半分母：一条规则都没窗口这些 gauge 时，上面那句「没有投诉」是空的。
-    // 今天读它们的正是本仓库那条样本日志与积压规则，它们没了就说明题目没了。
+    // 另一半分母：一条规则都没把这些 gauge 当观测读时，上面那句「没有投诉」是空的。
+    // 今天读它们的正是本仓库那条样本日志与积压规则（取窗口）与普查那条（无窗口），
+    // 它们没了就说明题目没了。
     assert!(
         windowed > 0,
         "没有任何告警规则对共享表 gauge 取窗口，这条判据没有分母"
     );
     assert!(
+        bare > 0,
+        "没有任何告警规则无窗口地读共享表 gauge 并把它当观测，这条判据的另一半没有分母"
+    );
+    assert!(
         complaints.is_empty(),
-        "告警规则把共享表 gauge 的值当作窗口里的观测，却没有要求写者还在写——\
+        "告警规则把共享表 gauge 的值当作观测（窗口或无窗口），却没有要求写者还在写——\
          一个死在点火那侧的写者会让这条规则永久点亮、谁也没法熄灭它:\n{}",
         complaints.join("\n")
+    );
+}
+
+/// The positions a windowless read of a store-served gauge can be in, with the
+/// two shipped rules that are not this defect as the negative cases: the row
+/// budget a sample log is measured against is a bound and the maintenance
+/// timestamp is a clock, and both are operands of arithmetic. What is left is a
+/// rule comparing the stored value itself, and that one has to ask after its
+/// writer — the shape the window-only version of this check could not see.
+#[test]
+fn a_windowless_read_is_the_subject_unless_arithmetic_holds_it() {
+    let only =
+        |names: &[&str]| -> BTreeSet<String> { names.iter().map(|s| s.to_string()).collect() };
+    let funnel = only(&["cogneva_change_funnel"]);
+
+    // The measurement itself, with its reduction around it: reported.
+    assert_eq!(
+        unguarded_store_reading_complaints(
+            "sum(max by (intent, stage) (cogneva_change_funnel{intent=\"unattributed\"})) > 0",
+            &funnel
+        )
+        .len(),
+        1,
+        "无窗口地把共享表 gauge 当观测读，没有被报出来"
+    );
+    // The same read with the writer asked about, in the shape the shipped rule
+    // now uses: silent.
+    assert!(
+        unguarded_store_reading_complaints(
+            "sum(max by (intent, stage) (cogneva_change_funnel{intent=\"unattributed\"} \
+             and (changes(cogneva_change_funnel_observed_timestamp_seconds[1h]) > 0))) > 0",
+            &funnel
+        )
+        .is_empty(),
+        "要求了写者还在写，却被报成没有"
+    );
+    // A bound: an operand of `*`, so not the subject.
+    assert!(
+        unguarded_store_reading_complaints(
+            "max(metrics_samples_rows) > \
+             1.05 * max without (pod, container, instance) (metrics_samples_budget_rows)",
+            &only(&["metrics_samples_budget_rows"])
+        )
+        .is_empty(),
+        "作为阈值的读被当成了观测"
+    );
+    // A clock: an operand of `-`, so not the subject.
+    assert!(
+        unguarded_store_reading_complaints(
+            "(time() - max without (pod, container, instance, job) \
+             (cogneva_registry_maintenance_reading_unix)) > 3600",
+            &only(&["cogneva_registry_maintenance_reading_unix"])
+        )
+        .is_empty(),
+        "作为时钟的读被当成了观测"
+    );
+}
+
+/// The guard over the census has to look back further than the publisher's own
+/// heartbeat, the same way the durable pool gauges' windows have to.
+///
+/// A cell is stamped when its count moves and, for one that is not moving, once
+/// per `CENSUS_HEARTBEAT`. So a guard no longer than that gap is satisfied by a
+/// live census sitting between two of its own stamps: the change count over its
+/// companion is zero for a writer that is running perfectly well. Neither
+/// number is written into this test -- the window comes out of the shipped
+/// expression and the heartbeat out of the publisher -- because a window chosen
+/// against a constant drifts from it the moment either side moves, and the
+/// drift is silent and in the direction that fires on a working system.
+#[test]
+fn a_rule_guarding_the_census_waits_longer_than_the_census_heartbeat() {
+    let companion = cog_core::observability_text::observed_timestamp_name(
+        cog_core::metric_names::CHANGE_FUNNEL.as_str(),
+    );
+    let heartbeat = cog_github::change_funnel::CENSUS_HEARTBEAT.as_secs();
+    assert!(heartbeat > 0, "普查心跳为 0，下面这条判据恒真");
+
+    let mut guarded = 0usize;
+    for (rule, promql) in chart_rules() {
+        let Some(window) = window_over_series(&promql, &companion) else {
+            continue;
+        };
+        guarded += 1;
+        assert!(
+            window > heartbeat,
+            "{rule}: 守卫窗口 {window}s 不严格长于普查心跳 {heartbeat}s——\
+             写者坐在两次盖章之间就能造出这个空窗，判据会在完好的普查上点亮"
+        );
+    }
+    // 分母：没有一条规则读普查的伴生钟时，上面那句「没有投诉」是空的。
+    assert!(
+        guarded > 0,
+        "没有任何规则对普查的伴生钟取窗口，这条判据没有分母"
     );
 }
 

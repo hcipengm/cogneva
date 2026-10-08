@@ -23,6 +23,43 @@ use crate::landing::{load_records, LandingRecord, LandingState};
 /// How many changes sit at each stage, by the entry point that produced them.
 pub use cog_core::metric_names::CHANGE_FUNNEL as CHANGE_FUNNEL_METRIC;
 
+/// How long a census cell may stand unchanged before it is stamped again.
+///
+/// The store hands back every gauge series' newest row forever, so a cell's
+/// value alone cannot tell a reader whether its writer is quiet or gone —
+/// nothing in the number moves in either case. The
+/// `_observed_timestamp_seconds` companion is the reading that separates them,
+/// and it separates them only while the writer keeps stamping a cell that is
+/// not moving. So a reader that says "the writer behind this cell is still
+/// there" has to look back further than this: a window no longer than the gap
+/// is satisfied by a live writer sitting between two of its own stamps, which
+/// is how a rule fires on a working system.
+///
+/// The number matches the durable pool gauges' own heartbeat for the same
+/// reason it exists there: one cadence for "unchanged but still observed" is
+/// easier to hold than two, and the readers of both are compared to it.
+pub const CENSUS_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(1800);
+
+/// Whether a census cell needs a row now.
+///
+/// The decision is split out of the pass so it can be read and exercised on its
+/// own: the pass also talks to the backend, and a rule that can only be checked
+/// through a store is a rule nobody checks. `last` is what this process last
+/// got through for that cell — count and when — and is `None` for a cell this
+/// process has never written, which is always written so a cell is never absent
+/// from a process's first scrape.
+pub(crate) fn census_needs_write(
+    last: Option<(u64, std::time::Instant)>,
+    count: u64,
+    now: std::time::Instant,
+    heartbeat: std::time::Duration,
+) -> bool {
+    match last {
+        None => true,
+        Some((written, at)) => written != count || now.duration_since(at) >= heartbeat,
+    }
+}
+
 /// How many changes have ended each way, by the entry point that produced them.
 ///
 /// The census cannot answer this one, and the reason is worth stating: a record
@@ -274,11 +311,13 @@ impl crate::landing::MainChannel {
         }
     }
 
-    /// Write the census cells that moved, and report whether the pass went
-    /// through.
+    /// Write the census cells that moved, and the ones that have stood still
+    /// long enough to need a stamp, and report whether the pass went through.
     ///
     /// Split out of the tick so the rule it follows can be read on its own:
-    /// a cell is written when its count moved, not when a tick happened.
+    /// a cell is written when its count moved, or when this process last wrote
+    /// it more than [`CENSUS_HEARTBEAT`] ago — never merely because a tick
+    /// happened.
     ///
     /// Returns `false` when a write failed and the pass was abandoned — the
     /// backend being unreachable is one fact, and the caller has to stop for
@@ -287,27 +326,32 @@ impl crate::landing::MainChannel {
         let Some(metrics) = self.metrics_handle() else {
             return true;
         };
+        let now = std::time::Instant::now();
         for point in points {
             let key = (
                 point.intent.as_str().to_string(),
                 point.stage.as_str().to_string(),
             );
-            // A cell whose count is already what this process last wrote needs
-            // no new row: a gauge's value is its newest sample, and the store's
-            // sweep keeps exactly that row — it exempts the newest row of every
-            // gauge series, so a cell that stops moving cannot be trimmed away
-            // from under a reader. Writing the same number again would only
-            // cost a row in a capped, shared log, and 36 cells on every tick is
-            // about 100k such rows a day for a census that mostly does not
-            // move.
-            let already = {
+            // Two reasons to write, and they carry different readings. A count
+            // that moved is the reading the census exists for. A count that
+            // stood still past the heartbeat is the stamp that says its writer
+            // is still there: the store hands back each series' newest row
+            // forever, so an unstamped cell reads the same whether the producer
+            // is quiet or gone, and `changes(<cell>_observed_timestamp_seconds)`
+            // — the only reading that separates the two — would say "gone" for
+            // a census that is merely not converting anything. What the
+            // heartbeat costs is bounded and small: a cell that never moves is
+            // one row per heartbeat rather than the 36-per-tick flood that made
+            // this a write-on-move in the first place, and the sweep still
+            // exempts every gauge series' newest row, so the value stays put.
+            let last = {
                 let written = self
                     .census_written
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 written.get(&key).copied()
             };
-            if already == Some(point.count) {
+            if !census_needs_write(last, point.count, now, CENSUS_HEARTBEAT) {
                 continue;
             }
             let labels = HashMap::from([
@@ -325,7 +369,7 @@ impl crate::landing::MainChannel {
                 .census_written
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            written.insert(key, point.count);
+            written.insert(key, (point.count, std::time::Instant::now()));
         }
         true
     }
@@ -390,6 +434,41 @@ mod tests {
                 point.intent, point.stage
             );
         }
+    }
+
+    /// The two reasons a cell gets a row, and the one that does not.
+    ///
+    /// The heartbeat half is the one worth pinning: a census that stops
+    /// converting anything stops moving its counts, and a writer that stops
+    /// stamping on that account leaves the companion reading the same for a
+    /// live cell as for an abandoned one — so the rule that would ask whether
+    /// the cell's writer is still there has nothing to ask.
+    #[test]
+    fn a_cell_is_stamped_when_it_moves_or_when_the_heartbeat_is_due() {
+        let heartbeat = std::time::Duration::from_secs(1800);
+        let t0 = std::time::Instant::now();
+
+        // Never written by this process: always, so a process's first scrape
+        // carries every cell and no stage is absent.
+        assert!(census_needs_write(None, 3, t0, heartbeat));
+        // The count moved: the reading the census exists for.
+        assert!(census_needs_write(Some((3, t0)), 4, t0, heartbeat));
+        // Unchanged, inside the heartbeat: no row says anything that another
+        // row did not already say.
+        assert!(!census_needs_write(
+            Some((3, t0)),
+            3,
+            t0 + std::time::Duration::from_secs(1799),
+            heartbeat
+        ));
+        // Unchanged, heartbeat due: not a reading of the count, a reading of
+        // the writer.
+        assert!(census_needs_write(
+            Some((3, t0)),
+            3,
+            t0 + heartbeat,
+            heartbeat
+        ));
     }
 
     /// The seed has to cover the same pairs the counter can take, and each of

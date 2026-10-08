@@ -501,19 +501,23 @@ pub struct MainChannel {
     /// the domain it walks is defined there.
     pub(crate) fate_domain_seeded: std::sync::atomic::AtomicBool,
     /// The census count this process last wrote for each cell, keyed by
-    /// (entry point, stage).
+    /// (entry point, stage), with the time it got through.
     ///
-    /// A gauge's value is its newest sample, so writing a count the store
-    /// already holds is a row that says nothing. The census has 36 cells and
-    /// is published on the tick, which made every quiet tick cost 36 rows in a
-    /// store that is capped and shared; the last count per cell is what turns
-    /// that into a write only when a count moves. A failed write is not
-    /// recorded, so the next tick retries it — the cell would otherwise sit at
-    /// a value this process never got through.
+    /// A gauge's value is its newest sample, so a count the store already holds
+    /// is a row that says nothing about the count. It still says something
+    /// about the writer, though: the companion the store renders is the only
+    /// reading that separates a quiet series from an abandoned one, and it can
+    /// only say "still there" for a cell its writer keeps stamping. So the last
+    /// count and the time it was written are both kept — the count turns the
+    /// 36-rows-per-tick flood into a write when a count moves, and the time
+    /// turns a cell that never moves into one row per heartbeat. A failed write
+    /// is not recorded, so the next tick retries it — the cell would otherwise
+    /// sit at a value this process never got through.
     ///
     /// Written by the publisher, which lives in the funnel module because the
     /// cells it walks are defined there.
-    pub(crate) census_written: std::sync::Mutex<std::collections::HashMap<(String, String), u64>>,
+    pub(crate) census_written:
+        std::sync::Mutex<std::collections::HashMap<(String, String), (u64, std::time::Instant)>>,
 }
 
 impl std::fmt::Debug for MainChannel {
@@ -2858,12 +2862,20 @@ mod tests {
         assert_eq!(fate_rows(&metrics).await, domain + 1);
     }
 
-    /// A gauge's value is its newest sample, so a census cell that has not
-    /// moved already has its value in the store — and the sweep cannot take
-    /// that value away, because it exempts every gauge series' newest row.
-    /// Republishing the whole census on every tick therefore bought nothing
-    /// and cost a row per cell per tick in a capped log shared with every
-    /// other reading: 36 cells, a 30 s tick, about 100k rows a day.
+    /// A gauge's value is its newest sample, so a census cell whose count has
+    /// not moved already holds its value in the store — and the sweep cannot
+    /// take that value away, because it exempts every gauge series' newest row.
+    /// Republishing the whole census on every tick therefore bought no reading
+    /// of the count and cost a row per cell per tick in a capped log shared
+    /// with every other reading: 36 cells, a 30 s tick, about 100k rows a day.
+    ///
+    /// What those rows do buy is the writer's own presence — the companion the
+    /// store renders is the only series that moves when the writer does — so
+    /// the pass is not "only when a count moves" but "when a count moves, or
+    /// when this process has gone a heartbeat without stamping it" (see
+    /// [`crate::change_funnel::CENSUS_HEARTBEAT`]). This test's passes all
+    /// happen inside one heartbeat, so it pins the first half of that rule: a
+    /// tick that changes nothing and is not yet due a stamp writes nothing.
     #[tokio::test]
     async fn a_census_cell_is_written_when_it_moves_and_not_before() {
         let (chan, metrics) = measured_channel(Default::default());

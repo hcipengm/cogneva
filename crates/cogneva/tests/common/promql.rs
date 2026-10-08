@@ -581,6 +581,30 @@ pub fn windows_over(expr: &str, gated: &BTreeSet<String>) -> Vec<(String, u64)> 
     out
 }
 
+/// The window a rule looks over one named series, or `None` when it does not
+/// name it at all.
+///
+/// The companion a rule guards a store-served gauge with is not itself in
+/// `gated` -- it is the reading that answers the question, not a gauge the store
+/// serves under that name -- so [`windows_over`] cannot find it. It is still a
+/// window with a number in it, and that number is what has to clear the
+/// writer's own heartbeat: a guard whose window is no longer than the gap
+/// between two of the writer's stamps is satisfied by a healthy writer sitting
+/// in that gap.
+///
+/// The alert-rule contract is the only reader: it is where a guard's window is
+/// compared to a writer's cadence, and the dashboard contract compares nothing
+/// to a heartbeat. Kept here rather than there so both sides of the contract
+/// read windows through one function instead of two that drift.
+#[allow(dead_code)]
+pub fn window_over_series(expr: &str, series: &str) -> Option<u64> {
+    let stripped = strip_braces(&strip_quoted(expr));
+    let needle = format!("{series}[");
+    let at = stripped.find(&needle)? + needle.len();
+    let close = stripped[at..].find(']').map(|p| at + p)?;
+    duration_seconds(stripped[at..close].split(':').next().unwrap_or(""))
+}
+
 /// The window of every call to `func` in `expr`, in seconds.
 ///
 /// `func` includes its opening paren, and the window taken is the first `[...]`
@@ -674,12 +698,15 @@ pub fn uncovered_window_complaints(expr: &str) -> Vec<String> {
 /// does, at a spelling the exposition and every reader share, so what a rule
 /// needs is `changes()` on the companion in the same expression.
 ///
-/// Only a series read through a range selector is checked: that is the shape
-/// that reads a stored value as an observation of a window. A gauge a rule
-/// reads without a window is a parameter of its comparison rather than
-/// something it observes -- the row budget a sample log is measured against is
-/// the case in the shipped rules -- and a name outside `gated` is not a gauge
-/// the store serves at all.
+/// Two shapes read a stored value as an observation, and both are checked. A
+/// range selector hung off the series reads the stored value as an observation
+/// of a window. A read with no window at all is an observation too, unless it
+/// is somebody's parameter: the row budget a sample log is measured against and
+/// the timestamp a `time() - …` clock is built from are operands of arithmetic,
+/// while a series a rule compares against a constant is the measurement itself.
+/// Which one a windowless read is, mechanically, is [`bare_observation_reads`].
+/// A name outside `gated` is not a gauge the store serves at all, and a family
+/// whose writers stamp a heartbeat is checked against that heartbeat instead.
 ///
 /// The ceiling, stated the way the rest of this module states ceilings: the
 /// guard is matched by presence, so its window is not compared to the value's
@@ -696,7 +723,7 @@ pub fn unguarded_store_reading_complaints(expr: &str, gated: &BTreeSet<String>) 
             continue;
         }
         let companion = cog_core::observability_text::observed_timestamp_name(&name);
-        if stripped.contains(&format!("changes({companion}[")) {
+        if guarded_by_its_companion(&stripped, &name) {
             continue;
         }
         out.push(format!(
@@ -706,7 +733,167 @@ pub fn unguarded_store_reading_complaints(expr: &str, gated: &BTreeSet<String>) 
              少了这一项，一个死在点火那侧的写者会让这条规则永久点亮，谁也没法熄灭它"
         ));
     }
+    for name in bare_observation_reads(expr, gated) {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let companion = cog_core::observability_text::observed_timestamp_name(&name);
+        if guarded_by_its_companion(&stripped, &name) {
+            continue;
+        }
+        out.push(format!(
+            "`{name}` 是共享表服务的 gauge，而这条规则把它读成自己观测的量：没有窗口，也不在\
+             任何一个算术量的位置上（不是阈值、不是 `time() - …` 的那一半）。写者停了它不会\
+             缺席，只会把最后一笔值永久送出去，于是判词说的一直是最后那一刻的事，而没有任何\
+             东西能把那条判词改回来。要求写者还在写：`{name}` 与 `changes({companion}[<窗口 > 心跳]) > 0` \
+             取交（判据只认有没有，不比对窗口长短）"
+        ));
+    }
     out
+}
+
+/// Whether `stripped` asks after the writer of `name` at all.
+///
+/// Matched by presence, on purpose: the exposition renders one companion
+/// spelling for every series, and a rule that names it is asking the question
+/// this gate is about. Whether the window it asks over is the right one is a
+/// different criterion, held where the window and the writer's own cadence can
+/// be compared.
+fn guarded_by_its_companion(stripped: &str, name: &str) -> bool {
+    let companion = cog_core::observability_text::observed_timestamp_name(name);
+    stripped.contains(&format!("changes({companion}["))
+}
+
+/// Store-served gauges a rule reads with no window at all and treats as the
+/// thing it is judging.
+///
+/// A windowless read is not automatically a parameter. `x > <gauge>` and
+/// `time() - <gauge>` use the number as a bound or as a clock -- the rule turns
+/// on the *other* operand crossing it -- while `<gauge> > 0` reads the number
+/// as the measurement, and a frozen writer leaves that judgement standing with
+/// nothing left able to move it. So a read that is nobody's operand but a
+/// comparison's is the same defect as a window over a frozen value, reached
+/// without a window: the shape the window-only check cannot see.
+///
+/// Parameter position is decided by arithmetic, which is where a bound or a
+/// clock is built: expanding outward from the read over the call wrappers and
+/// aggregation clauses that hold it, the operator at the operand's left is one
+/// of `+ - * / %` or it is not. Only the left side is consulted -- `<gauge> * 2`
+/// is a measurement scaled, not a bound -- and a read whose operator the
+/// expansion does not reach is reported, because this feeds a positive finding.
+pub fn bare_observation_reads(expr: &str, gated: &BTreeSet<String>) -> Vec<String> {
+    let stripped = strip_braces(&strip_quoted(expr));
+    let bytes = stripped.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    for name in gated {
+        let mut from = 0usize;
+        while let Some(rel) = stripped[from..].find(name.as_str()) {
+            let at = from + rel;
+            let end = at + name.len();
+            from = end;
+            // Whole tokens only: `<name>_observed_timestamp_seconds` is another
+            // series, and its prefix must not be read as this one.
+            if at > 0 && token_char(bytes[at - 1]) {
+                continue;
+            }
+            if end < bytes.len() && token_char(bytes[end]) {
+                continue;
+            }
+            // A range selector hanging off the read is the windowed shape, and
+            // that one is checked against the window it opens.
+            let mut k = end;
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            if bytes.get(k) == Some(&b'[') {
+                continue;
+            }
+            if parameter_of_arithmetic(&stripped, at) {
+                continue;
+            }
+            if !out.contains(name) {
+                out.push(name.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Whether the read starting at `at` sits in an operand of an arithmetic
+/// operator.
+fn parameter_of_arithmetic(s: &str, at: usize) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = enclosing_operand_start(s, at);
+    while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    i > 0 && matches!(bytes[i - 1], b'+' | b'-' | b'*' | b'/' | b'%')
+}
+
+/// The start of the operand the read at `at` sits in, after expanding outward
+/// over the aggregations, call wrappers and clauses that hold it.
+///
+/// `1.05 * max without (a, b) (x)` reads `x` at the end of a chain of wrappers;
+/// the operand is the whole call, and its left neighbour is the `*`. A shape
+/// the expansion does not recognise stops it and leaves the read where it was,
+/// which reports the read rather than passes it.
+fn enclosing_operand_start(s: &str, at: usize) -> usize {
+    let bytes = s.as_bytes();
+    let skip_ws_left = |mut i: usize| {
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        i
+    };
+    let mut lo = at;
+    loop {
+        let i = skip_ws_left(lo);
+        if i == 0 || bytes[i - 1] != b'(' {
+            return lo;
+        }
+        // The paren before the read belongs to a call or to an aggregation's
+        // clause list; either way the operand starts at the word introducing
+        // it, and that word may itself be wrapped again.
+        let mut k = i - 1;
+        let start = loop {
+            let j = skip_ws_left(k);
+            if j == 0 {
+                break None;
+            }
+            if bytes[j - 1] == b')' {
+                let Some(open) = matching_open(s, j - 1, b'(', b')') else {
+                    break None;
+                };
+                match word_before(s, open) {
+                    Some((start, _)) => k = start,
+                    None => break None,
+                }
+                continue;
+            }
+            break word_before(s, j).map(|(start, _)| start);
+        };
+        match start {
+            Some(start) => lo = start,
+            None => return lo,
+        }
+    }
+}
+
+/// The identifier ending at `end`, with its start.
+fn word_before(s: &str, end: usize) -> Option<(usize, &str)> {
+    let bytes = s.as_bytes();
+    let mut e = end;
+    while e > 0 && bytes[e - 1].is_ascii_whitespace() {
+        e -= 1;
+    }
+    let start = s[..e]
+        .rfind(|c: char| !token_char(c as u8))
+        .map(|p| p + 1)
+        .unwrap_or(0);
+    if start >= e {
+        return None;
+    }
+    Some((start, &s[start..e]))
 }
 
 #[cfg(test)]
@@ -963,10 +1150,11 @@ mod tests {
     }
 
     /// The store-gauge guard, on the shapes the shipped rules really carry: the
-    /// companion `changes()` is what separates a window over a live writer's
-    /// series from a window over a value the store will hand back forever.
+    /// companion `changes()` is what separates reading a live writer's series
+    /// from reading a value the store will hand back forever -- over a window,
+    /// and with no window at all.
     #[test]
-    fn a_windowed_store_gauge_without_its_companion_guard_is_reported() {
+    fn a_store_gauge_without_its_companion_guard_is_reported() {
         let gated: BTreeSet<String> = ["metrics_samples_rows"]
             .iter()
             .map(|s| s.to_string())
@@ -994,9 +1182,30 @@ mod tests {
             complaints[0]
         );
 
-        // Read without a window it is a parameter, not an observation; read
-        // outside the family it is not a stored gauge at all.
-        assert!(unguarded_store_reading_complaints("metrics_samples_rows > 0", &gated).is_empty());
+        // A windowless read is not automatically a parameter: compared against
+        // a constant, the stored value is what the rule is judging, and that is
+        // the same defect with the window left out.
+        let bare = unguarded_store_reading_complaints("metrics_samples_rows > 0", &gated);
+        assert_eq!(bare.len(), 1, "{bare:?}");
+        assert!(
+            bare[0].contains("metrics_samples_rows_observed_timestamp_seconds"),
+            "{}",
+            bare[0]
+        );
+        // What a parameter looks like: the operand of a bound or of a clock.
+        // The rule turns on the other side of the comparison, so a writer that
+        // stopped cannot leave a judgement standing.
+        assert!(unguarded_store_reading_complaints(
+            "max(a_measurement) > 1.05 * max(metrics_samples_rows)",
+            &gated
+        )
+        .is_empty());
+        assert!(unguarded_store_reading_complaints(
+            "(time() - max(metrics_samples_rows)) > 3600",
+            &gated
+        )
+        .is_empty());
+        // Outside the family it is not a stored gauge at all.
         assert!(unguarded_store_reading_complaints(
             "max_over_time(cogneva_process_zombies[30m]) > 0",
             &gated
