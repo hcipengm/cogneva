@@ -217,6 +217,36 @@ fn plan_rule(
     RulePlan { report, close }
 }
 
+/// What one failing tick owes the two audiences of a self-alert.
+struct EvalFailurePlan {
+    /// Tell the store, which advances the row's `last_seen_at`.
+    sight: bool,
+    /// Tell a person.
+    notify: bool,
+}
+
+/// The same decision `plan_rule` makes for infrastructure alerts, for the
+/// watcher's self-alert -- and it has to be made separately here, because this
+/// path is throttled.
+///
+/// The throttle exists so a rule that stays broken does not re-notify every
+/// poll interval, and the latch that implements it (`eval_failure_firing`, also
+/// refilled from the store on restart) is what decides whether a person is told.
+/// Letting that same latch decide whether the store is told is the mistake: the
+/// row then advances `last_seen_at` once, at its first tick, and never again --
+/// for exactly the rules that keep failing, which is when the clock matters. A
+/// row frozen at its firing edge is what a watcher that stopped querying looks
+/// like, so the one field that could tell them apart says the wrong thing.
+fn eval_failure_plan(threshold: u32, streak: u32, latched: bool) -> Option<EvalFailurePlan> {
+    if threshold == 0 || streak < threshold {
+        return None;
+    }
+    Some(EvalFailurePlan {
+        sight: true,
+        notify: !latched,
+    })
+}
+
 /// One evaluation pass over every configured rule.
 async fn tick(
     config: &InfraWatchConfig,
@@ -237,11 +267,17 @@ async fn tick(
                 warn!(rule = %rule.name, error = %e, "infra watch: rule query failed");
                 let streak = failure_streaks.entry(rule.name.clone()).or_insert(0);
                 *streak = streak.saturating_add(1);
-                if config.eval_failure_alert_after > 0 && *streak >= config.eval_failure_alert_after
+                let key = format!("{EVAL_FAILURE_RULE}:{}", rule.name);
+                let latched = eval_failure_firing.contains(&key);
+                if let Some(plan) =
+                    eval_failure_plan(config.eval_failure_alert_after, *streak, latched)
                 {
-                    let key = format!("{EVAL_FAILURE_RULE}:{}", rule.name);
-                    if eval_failure_firing.insert(key.clone()) {
-                        fire_eval_failure(&rule.name, *streak, &e, &key, outlets).await;
+                    if plan.sight {
+                        sight_eval_failure(&rule.name, *streak, &e, &key, outlets).await;
+                    }
+                    if plan.notify {
+                        eval_failure_firing.insert(key.clone());
+                        notify_eval_failure(&rule.name, *streak, &e, outlets).await;
                     }
                 }
                 continue;
@@ -488,53 +524,79 @@ async fn report_sighting(
     }
 }
 
-/// Raise the watcher's self-alert for a rule whose query keeps failing.
-/// Goes through the same persistent state machine as infrastructure alerts
-/// so the observation gap becomes a signal self-discovery can consume.
-async fn fire_eval_failure(
+/// The text both audiences of a self-alert get.
+fn eval_failure_text(rule_name: &str, streak: u32, error: &str) -> String {
+    format!("infra watch rule \"{rule_name}\" query failed {streak} times in a row: {error}")
+}
+
+/// Raise the watcher's self-alert for a rule whose query keeps failing. Goes
+/// through the same persistent state machine as infrastructure alerts so the
+/// observation gap becomes a signal self-discovery can consume.
+///
+/// Told on every failing tick, not once per streak: `set_alert` is what advances
+/// the row's `last_seen_at`, and that field is the only one that separates a
+/// rule still being watched from a watcher that died. The throttle belongs to
+/// the notification, not to the sighting -- see `notify_eval_failure`.
+async fn sight_eval_failure(
     rule_name: &str,
     streak: u32,
     error: &str,
     key: &str,
     outlets: &InfraWatchOutlets,
 ) {
-    let message =
-        format!("infra watch rule \"{rule_name}\" query failed {streak} times in a row: {error}");
+    let Some(store) = &outlets.store else { return };
+    let message = eval_failure_text(rule_name, streak, error);
     let labels = HashMap::from([
         ("watched_rule".to_string(), rule_name.to_string()),
         ("message".to_string(), message.clone()),
         ("source".to_string(), "infra_watch".to_string()),
     ]);
-    if let Some(store) = &outlets.store {
-        let alert = NewAlert {
-            rule: EVAL_FAILURE_RULE.to_string(),
-            dedup_key: key.to_string(),
-            severity: cog_core::AlertSeverity::Warning.as_str().to_string(),
-            message: message.clone(),
-            labels: serde_json::to_value(&labels).unwrap_or_else(|_| serde_json::json!({})),
-        };
-        match store.set_alert(true, &alert).await {
-            Ok(AlertTransition::Fired) => {
-                warn!(rule = %rule_name, streak, "infra watch eval-failure alert firing");
-            }
-            Ok(_) => {}
-            Err(e) => warn!(rule = %rule_name, error = %e, "eval-failure alert persist failed"),
+    let alert = NewAlert {
+        rule: EVAL_FAILURE_RULE.to_string(),
+        dedup_key: key.to_string(),
+        severity: cog_core::AlertSeverity::Warning.as_str().to_string(),
+        message,
+        labels: serde_json::to_value(&labels).unwrap_or_else(|_| serde_json::json!({})),
+    };
+    match store.set_alert(true, &alert).await {
+        Ok(AlertTransition::Fired) => {
+            warn!(rule = %rule_name, streak, "infra watch eval-failure alert firing");
         }
+        Ok(_) => {}
+        Err(e) => warn!(rule = %rule_name, error = %e, "eval-failure alert persist failed"),
     }
-    if let Some(notifier) = &outlets.notifier {
-        let now = Utc::now();
-        let inst = AlertInstance {
-            rule_name: EVAL_FAILURE_RULE.to_string(),
-            labels,
-            state: AlertState::Firing,
-            severity: cog_core::AlertSeverity::Warning,
-            value: streak as f64,
-            starts_at: now,
-            ends_at: None,
-            updated_at: now,
-        };
-        notifier.notify(&[AlertEvent::Firing(inst)]).await;
-    }
+}
+
+/// Tell a person, once per streak: a rule that stays broken for a day is one
+/// incident, and re-notifying it every poll interval is the noise the streak
+/// threshold exists to prevent.
+async fn notify_eval_failure(
+    rule_name: &str,
+    streak: u32,
+    error: &str,
+    outlets: &InfraWatchOutlets,
+) {
+    let Some(notifier) = &outlets.notifier else {
+        return;
+    };
+    let message = eval_failure_text(rule_name, streak, error);
+    let labels = HashMap::from([
+        ("watched_rule".to_string(), rule_name.to_string()),
+        ("message".to_string(), message),
+        ("source".to_string(), "infra_watch".to_string()),
+    ]);
+    let now = Utc::now();
+    let inst = AlertInstance {
+        rule_name: EVAL_FAILURE_RULE.to_string(),
+        labels,
+        state: AlertState::Firing,
+        severity: cog_core::AlertSeverity::Warning,
+        value: streak as f64,
+        starts_at: now,
+        ends_at: None,
+        updated_at: now,
+    };
+    notifier.notify(&[AlertEvent::Firing(inst)]).await;
 }
 
 /// Close one alert row and notify the resolution.
@@ -1438,6 +1500,60 @@ mod tests {
         .await;
         assert!(eval_firing.is_empty());
         assert!(streaks.is_empty());
+    }
+
+    /// The second carrier of what `a_series_already_believed_firing_is_reported_again_every_tick`
+    /// pins: throttling the notification must not throttle the sighting.
+    ///
+    /// The live reading this comes from is a self-alert row whose `last_seen_at`
+    /// sits frozen at the tick its streak reached the threshold while the rule
+    /// went on failing every minute for hours. That row reads exactly like the
+    /// watcher having stopped querying, which is the one thing the sighting
+    /// clock exists to tell apart -- and it can never catch up, because the
+    /// latch is also refilled from the store on restart.
+    ///
+    /// What this pins is the decision, like its sibling above; the call sites
+    /// that act on it are not covered from here, because the store these tests
+    /// have is `None`. Rerouting a sighting behind the notification latch would
+    /// therefore pass this test -- the row's clock is only observable against a
+    /// real store.
+    #[test]
+    fn a_failing_rule_re_sights_its_self_alert_every_tick_but_notifies_once() {
+        // Below the threshold there is nothing to sight or to tell.
+        assert!(eval_failure_plan(3, 2, false).is_none());
+
+        // The tick that reaches the threshold does both.
+        let first = eval_failure_plan(3, 3, false).expect("threshold reached");
+        assert!(first.sight, "the row's clock has to start moving");
+        assert!(first.notify, "a person is told once");
+
+        // Every later tick keeps sighting and stops telling.
+        let later = eval_failure_plan(3, 9, true).expect("still failing");
+        assert!(
+            later.sight,
+            "a row that stops moving reads as a dead watcher"
+        );
+        assert!(
+            !later.notify,
+            "re-notifying every tick is the noise the streak prevents"
+        );
+
+        // Restarted process: the streak map starts empty, so it climbs back to
+        // the threshold, but the latch came back with the row -- so the tick
+        // that reaches the threshold sights and does not tell.
+        assert!(
+            eval_failure_plan(3, 1, true).is_none(),
+            "streak restarts empty"
+        );
+        let adopted = eval_failure_plan(3, 3, true).expect("threshold reached again");
+        assert!(
+            adopted.sight,
+            "the clock resumes even though this process never notified"
+        );
+        assert!(!adopted.notify);
+
+        // Zero disables the self-alert entirely.
+        assert!(eval_failure_plan(0, 9, false).is_none());
     }
 
     #[tokio::test]
