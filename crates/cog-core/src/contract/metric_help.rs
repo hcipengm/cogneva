@@ -353,6 +353,27 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          deployments: the sum would report the same total once per writer",
     ),
     (
+        "cogneva_loki_flush_total",
+        "How each log-flush of the Loki background pusher ended, summed over \
+         flushes and labelled by the outcome; the cell's value is how many log \
+         entries that batch carried. The loop exists to deliver buffered logs to \
+         Loki; its only other reading is its own beat, stamped every flush \
+         interval whether or not there was anything to push, so a push that \
+         failed every round and a buffer that was simply empty were the same \
+         picture. A failed push consumed the batch, so the entries were lost, \
+         not retried, and their only trace was a log line that dies with the \
+         pod. The values are a closed set the producing module declares: \
+         delivered (the batch reached Loki) and failed (it did not, and those \
+         entries are gone). Read the failed cell against the delivered one: a \
+         failed cell rising is the flush path dropping logs, which is a \
+         different fact from a quiet gateway with nothing to ship. Because a \
+         failed round is a loss rather than a retry, the cell value is the entry \
+         count and not the batch count: the number that matters is how many \
+         entries were dropped. Both triggers -- the batch-size one and the \
+         interval one -- go through the same push, so one series covers the \
+         whole path",
+    ),
+    (
         "cogneva_mainline_superseded_rollout_total",
         "Rounds the deployer's guard answered that the revision it was carrying \
          had been overtaken upstream: 1 when it had (nothing is rolled out, the \

@@ -5250,10 +5250,14 @@ fn metrics_router(state: AppState) -> Router {
 /// `COGNEVA_LOG_FORMAT=json|pretty`。Loki 开启时同一批事件镜像一份到 Loki，
 /// 网关的 stdout 与 Loki 内容一致（此前网关从不装订阅者，tracing 全被丢弃，
 /// `kubectl logs` 一片空白）。
+///
+/// 返回 Loki pusher（未开启时为 `None`），由调用方在指标后端建好之后接上它的
+/// 结局读数再起刷写循环 —— 循环在构造点就起的话，后端建起来之前的每一轮都没
+/// 地方记结局。
 fn init_gateway_logging(
     obs: &ObservabilityExportersConfig,
     http_client: &Arc<dyn cog_core::HttpClient>,
-) {
+) -> Option<Arc<LokiBackgroundPusher>> {
     let level = std::env::var("COGNEVA_LOG_LEVEL")
         .or_else(|_| std::env::var("RUST_LOG"))
         .unwrap_or_else(|_| "info".into());
@@ -5273,19 +5277,19 @@ fn init_gateway_logging(
                 .with_label("service", "cogneva-security-gateway")
                 .with_client(http_client.clone()),
         );
-        let pusher = Arc::new(LokiBackgroundPusher::new(
+        // The loop is started by the caller once the flush loop's metric sink
+        // exists — see `run`. Starting it here would leave every round before
+        // the backend was built unable to record its outcome.
+        Some(Arc::new(LokiBackgroundPusher::new(
             client,
             std::time::Duration::from_secs(obs.loki.flush_interval_sec.max(1)),
             obs.loki.max_batch_size.max(1),
-        ));
-        // The handle is no longer held: the loop supervises itself (a panic is
-        // run again in place) and goes away with the process on shutdown.
-        drop(pusher.clone().run_loop());
-        Some(pusher)
+        )))
     } else {
         None
     };
-    init_subscriber_with_pusher(&level, format, pusher, "cogneva-security-gateway");
+    init_subscriber_with_pusher(&level, format, pusher.clone(), "cogneva-security-gateway");
+    pusher
 }
 
 /// 构建池健康的三类落盘出口，外加跨进程 Redis 信号连接。
@@ -5514,9 +5518,17 @@ pub async fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let http_client: Arc<dyn cog_core::HttpClient> =
         Arc::new(cog_net::ReqwestHttpClient::new(reqwest::Client::new()));
-    init_gateway_logging(&config.observability, &http_client);
+    let loki_pusher = init_gateway_logging(&config.observability, &http_client);
 
     let (pool_obs, pool_signal) = build_pool_observability(&config, &http_client).await;
+    // 现在后端已建起来，把刷写循环的结局读数接上再起循环：在构造点取手柄会拿到
+    // `None`（后端晚于此 pusher 才建），循环的每一轮都会无处记结局；取与用排在
+    // 产出者之后，跟上一条读数的处置一致。
+    if let Some(pusher) = loki_pusher {
+        let sink: Arc<dyn cog_core::MetricsBackend> = pool_obs.metrics.clone();
+        pusher.set_metrics(Some(sink));
+        drop(pusher.run_loop());
+    }
     let identity: Arc<str> = Arc::from(outbound_identity(build_revision).as_str());
     let identity_headers = identity_default_headers(&identity);
     tracing::info!(identity = %identity, "安全网关出站请求自我标识");

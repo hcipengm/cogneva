@@ -1755,6 +1755,10 @@ const UNREAD: &[(&str, Unread)] = &[
         "cogneva_skill_hot_reload_total",
         Unread::Gap("how each round of the skill hot-reload loop ended, one cell per outcome. The whole path had no reading at all before this pass: the loop beats every poll interval, so its liveness is read, but a round that could not scan the skill directories at all and a round that scanned them and found nothing to do read the same -- and the failed round was a warn line that dies with the pod. The silent end is the one that matters for this loop: a skill file that fails to load leaves the previously cached definition serving, so an edit that never took effect and a skill nobody edited were the same picture, which is exactly the state the loop exists to end. What is still missing is a rule, and a rule here would have to say how many failed scans in a window are a fault, and whether a persistent reload_failed cell is the same fault as a failed one -- the first is one broken file on disk that re-surfaces every round, the second is the loop not looking at the disk at all, and they want different answers. That is a policy and a threshold on a loop that polls every hot-reload interval: nobody declared either. Writing that rule is an alert-rule change, which needs sign-off before it lands, so the reading ships with its debt recorded rather than left absent"),
     ),
+    (
+        "cogneva_loki_flush_total",
+        Unread::Gap("how each log-flush of the Loki background pusher ended, one cell per outcome, the cell's value being the entry count that batch carried. The whole path had no reading at all before this pass: the loop beats every flush interval, so its liveness is read, but a push that failed every round and a buffer that was simply empty read the same -- and the failed push was a warn line that dies with the pod. The silent end is the one that matters for this loop: a failed push consumed the batch, so those logs are lost and nothing sends them again, which makes the delivery and the loss the same picture one level up. Both triggers -- the batch-size one and the interval one -- go through the same push, so one series covers the whole path. What is still missing is a rule, and a rule here would have to say how many failed flushes in a window are a fault, and whether a gateway that is merely quiet is the same as one whose logs are being dropped. That is a policy and a threshold on a loop that flushes every loki flush interval: nobody declared either. Writing that rule is an alert-rule change, which needs sign-off before it lands, so the reading ships with its debt recorded rather than left absent"),
+    ),
 ];
 
 /// Entries an `Elsewhere` reader claim cannot be resolved against.
@@ -1783,7 +1787,7 @@ fn unresolved_readers(read: &BTreeSet<String>, name: &str, readers: &[&str]) -> 
 /// completion cadence is already read against *is* that budget. The two entries
 /// left the table in the pass that wrote `buildah_store_round_incomplete`, so
 /// 23 became 21.
-const GAPS_AT_CENSUS: usize = 27;
+const GAPS_AT_CENSUS: usize = 28;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {

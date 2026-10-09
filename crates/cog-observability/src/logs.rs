@@ -12,7 +12,7 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
-use cog_core::{HttpClient, HttpRequest};
+use cog_core::{HttpClient, HttpRequest, MetricsBackend};
 use std::sync::Arc;
 
 use std::collections::BTreeMap;
@@ -577,6 +577,14 @@ pub struct LokiBackgroundPusher {
     interval: std::time::Duration,
     max_batch_size: usize,
     buffer: std::sync::Mutex<Vec<LogEntry>>,
+    /// Where a flush's outcome is written.
+    ///
+    /// Resolved after construction, not in `new`: the backend that provides it
+    /// is built later in gateway startup than this pusher, so a handle asked for
+    /// here would be `None` and every round's outcome would be missing for good.
+    /// The loop is started by whoever sets this, so it never runs a round its
+    /// sink cannot record.
+    metrics: OnceLock<Arc<dyn MetricsBackend>>,
 }
 
 impl LokiBackgroundPusher {
@@ -590,21 +598,80 @@ impl LokiBackgroundPusher {
             interval,
             max_batch_size,
             buffer: std::sync::Mutex::new(Vec::with_capacity(max_batch_size)),
+            metrics: OnceLock::new(),
         }
     }
 
-    pub fn enqueue(&self, entry: LogEntry) {
+    /// Attach the sink for this pusher's flush outcomes.
+    ///
+    /// A no-op once set, so a caller that reaches here twice keeps the first
+    /// handle. `None` leaves the pusher silent, which is what a deployment
+    /// without a metrics backend gets — the loop still ships logs, it just has
+    /// nowhere to report a round that dropped them.
+    pub fn set_metrics(&self, metrics: Option<Arc<dyn MetricsBackend>>) {
+        if let Some(metrics) = metrics {
+            let _ = self.metrics.set(metrics);
+        }
+    }
+
+    pub fn enqueue(self: &Arc<Self>, entry: LogEntry) {
         let mut buf = self.buffer.lock().unwrap();
         buf.push(entry);
         if buf.len() >= self.max_batch_size {
             let batch = std::mem::replace(&mut *buf, Vec::with_capacity(self.max_batch_size));
             drop(buf);
-            let client = self.client.clone();
+            let this = Arc::clone(self);
             tokio::spawn(async move {
-                if let Err(e) = client.push(batch).await {
-                    tracing::warn!("Loki background push failed: {}", e);
-                }
+                this.push_batch(batch).await;
             });
+        }
+    }
+
+    /// Push one batch and stamp how it ended.
+    ///
+    /// Both triggers — the batch-size one in `enqueue` and the interval one in
+    /// the loop — come through here, so one reading covers the whole path. The
+    /// value is the entry count, not the batch count: a failed push consumed the
+    /// batch, so those entries are lost and the number that matters is how many.
+    async fn push_batch(&self, batch: Vec<LogEntry>) {
+        let entries = batch.len();
+        let delivered = match self.client.push(batch).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("Loki background push failed: {}", e);
+                false
+            }
+        };
+        Self::record_flush(self.metrics.get(), delivered, entries).await;
+    }
+
+    /// Record one push's fate on the Loki flush counter.
+    ///
+    /// `delivered` is true when the batch reached Loki; `entries` is how many log
+    /// lines the batch carried. A failed push is a loss, not a retry — the push
+    /// consumes the batch, so those entries are gone and nothing sends them again.
+    async fn record_flush(
+        metrics: Option<&Arc<dyn MetricsBackend>>,
+        delivered: bool,
+        entries: usize,
+    ) {
+        let Some(metrics) = metrics else {
+            return;
+        };
+        let mut labels = HashMap::new();
+        labels.insert(
+            "outcome".to_string(),
+            if delivered { "delivered" } else { "failed" }.to_string(),
+        );
+        if let Err(e) = metrics
+            .record_counter(
+                cog_core::metric_names::LOKI_FLUSH_TOTAL,
+                entries as f64,
+                labels,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "loki flush: could not record outcome");
         }
     }
 
@@ -636,9 +703,7 @@ impl LokiBackgroundPusher {
                             }
                             std::mem::replace(&mut *buf, Vec::with_capacity(this.max_batch_size))
                         };
-                        if let Err(e) = this.client.push(batch).await {
-                            tracing::warn!("Loki background push failed: {}", e);
-                        }
+                        this.push_batch(batch).await;
                     }
                 }
             },
@@ -813,5 +878,90 @@ mod tests {
             tracing::warn!(target: "early-subscriber-test", "should pass");
             assert_eq!(late.count(), 2, "reloaded filter must pass warn");
         });
+    }
+
+    /// An HTTP client that answers everything with 200 or fails everything,
+    /// so a flush can be driven through its real push path without a server.
+    #[derive(Debug)]
+    struct FakeHttp {
+        ok: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl HttpClient for FakeHttp {
+        async fn execute(&self, _req: HttpRequest) -> cog_core::SFResult<cog_core::HttpResponse> {
+            if self.ok {
+                Ok(cog_core::HttpResponse {
+                    status: 200,
+                    headers: HashMap::new(),
+                    body: Vec::new(),
+                })
+            } else {
+                Err(cog_core::SFError::Agent("push refused".into()))
+            }
+        }
+    }
+
+    fn pusher(ok: bool) -> Arc<LokiBackgroundPusher> {
+        let client = Arc::new(
+            LokiPushClient::new("http://loki:3100")
+                .with_max_retries(1)
+                .with_client(Arc::new(FakeHttp { ok })),
+        );
+        Arc::new(LokiBackgroundPusher::new(
+            client,
+            std::time::Duration::from_secs(60),
+            10,
+        ))
+    }
+
+    /// A push that failed and a push that succeeded must land in different
+    /// cells, and the cell must carry the entry count — a failed flush is a
+    /// loss, so the number that matters is how many log lines it dropped. The
+    /// test drives `push_batch` (the one path both triggers use), not the
+    /// recording helper, so a mutation in the wiring is seen.
+    #[tokio::test]
+    async fn every_flush_lands_in_exactly_one_cell() {
+        let metrics = Arc::new(crate::metrics::PrometheusMetricsBackend::new(""));
+        let sink: Arc<dyn MetricsBackend> = metrics.clone();
+
+        let delivered = pusher(true);
+        delivered.set_metrics(Some(sink.clone()));
+        delivered
+            .push_batch(vec![entry("info", "a"), entry("info", "b")])
+            .await;
+
+        let failed = pusher(false);
+        failed.set_metrics(Some(sink.clone()));
+        failed
+            .push_batch(vec![
+                entry("info", "x"),
+                entry("info", "y"),
+                entry("info", "z"),
+            ])
+            .await;
+
+        let totals = metrics
+            .query_counter_totals("cogneva_loki_flush_total")
+            .await
+            .expect("counter totals are readable from the registry");
+        assert_eq!(totals.len(), 2, "one series per outcome: {totals:?}");
+
+        let value_of = |outcome: &str| {
+            totals
+                .iter()
+                .find(|s| s.labels.get("outcome").map(String::as_str) == Some(outcome))
+                .map(|s| s.value)
+        };
+        assert_eq!(value_of("delivered"), Some(2.0));
+        assert_eq!(value_of("failed"), Some(3.0));
+    }
+
+    /// A pusher whose sink was never attached still pushes, and records nothing
+    /// — the loop must not panic when the deployment has no metrics backend.
+    #[tokio::test]
+    async fn a_missing_sink_records_nothing_and_does_not_panic() {
+        let p = pusher(false);
+        p.push_batch(vec![entry("info", "x")]).await;
     }
 }

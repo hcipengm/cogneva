@@ -161,6 +161,11 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                 std::time::Duration::from_secs(observability.loki.flush_interval_sec),
                 observability.loki.max_batch_size,
             ));
+            // Same sink the ClickHouse buffer above takes: this plugin's init
+            // runs after the storage plugin has published the backend, so the
+            // handle is here and the pusher can report a batch it could not
+            // deliver.
+            pusher.set_metrics(ctx.consume_service::<dyn cog_core::MetricsBackend>());
             ctx.publish(client.clone());
             ctx.publish(pusher.clone());
             info!("ObservabilityPlugin Loki client + pusher published");

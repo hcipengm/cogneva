@@ -289,6 +289,23 @@ metric_names! {
     // up, and can see the skills it found on disk but could not load.
     SKILL_HOT_RELOAD_TOTAL => "cogneva_skill_hot_reload_total",
 
+    // cog-observability — how each log-flush of the Loki pusher ended, labelled by
+    // `outcome`, the cell's value being how many log entries that batch carried.
+    //
+    // This loop exists to deliver buffered logs to Loki. Its only reading was its
+    // own beat, stamped every flush interval whether or not there was anything to
+    // push, so a push that failed every round and a buffer that was simply empty
+    // read the same -- and both looked ordinary. A failed push consumed the batch,
+    // so the entries were lost, not retried, and their only trace was a WARN that
+    // died with the pod: "delivered" and "the whole batch was dropped" were the
+    // same picture.
+    //
+    // A counter whose cell value is the entry count, not the batch count: the fact
+    // worth alerting on is how many entries a failed flush lost. Both triggers --
+    // the batch-size one and the interval one -- come through the same push, so one
+    // reading covers the whole path.
+    LOKI_FLUSH_TOTAL => "cogneva_loki_flush_total",
+
     // cog-reflection — the registry store's capacity reclamation, read by the
     // process that reclaims it.
     //
