@@ -4,8 +4,9 @@ use async_trait::async_trait;
 
 use cog_core::{
     EmbeddingProvider, FailurePattern, ImplementationExample, KnowledgeBackend, KnowledgeEntry,
-    MemoryBackend, SFResult, SchemaEntry, SchemaKind, SourceRef, SummaryEntry, Task,
-    TaskDecompositionPattern, TaskExecutionRecord, TaskResult, UnifiedSearchResult, WikiBackend,
+    MemoryBackend, MetricsBackend, SFResult, SchemaEntry, SchemaKind, SourceRef, SummaryEntry,
+    Task, TaskDecompositionPattern, TaskExecutionRecord, TaskResult, UnifiedSearchResult,
+    WikiBackend,
 };
 
 /// Unified knowledge backend aggregating [`MemoryBackend`] (three-layer
@@ -21,6 +22,42 @@ pub struct UnifiedKnowledgeBackend {
     memory: MaybeService<dyn MemoryBackend>,
     wiki: Option<Arc<dyn WikiBackend>>,
     embedding: MaybeService<dyn EmbeddingProvider>,
+    metrics: Option<Arc<dyn MetricsBackend>>,
+}
+
+/// How one layer answered one retrieval.
+///
+/// These four are the whole reason the series exists: everything except `Hit`
+/// reaches the caller as an empty list, so "this process holds no such layer",
+/// "the store refused" and "the store answered and matches nothing" are one
+/// answer downstream. See [`Self::record`].
+#[derive(Clone, Copy)]
+enum Outcome {
+    Hit,
+    Empty,
+    Error,
+    Absent,
+}
+
+impl Outcome {
+    /// The cell a layer's answer lands in, from how many rows the layer
+    /// contributed.
+    fn of_rows(rows: usize) -> Self {
+        if rows == 0 {
+            Outcome::Empty
+        } else {
+            Outcome::Hit
+        }
+    }
+
+    fn cell(self) -> &'static str {
+        match self {
+            Outcome::Hit => "hit",
+            Outcome::Empty => "empty",
+            Outcome::Error => "error",
+            Outcome::Absent => "absent",
+        }
+    }
 }
 
 /// A service this backend may hold, and may only come to hold later.
@@ -59,6 +96,46 @@ impl UnifiedKnowledgeBackend {
             memory: MaybeService::None,
             wiki: None,
             embedding: MaybeService::None,
+            metrics: None,
+        }
+    }
+
+    /// Wire where a retrieval's outcome is published.
+    ///
+    /// Without it the retrievals still work; what is lost is the only place
+    /// that says which of the four answers a layer gave. The plugin wires the
+    /// backend the storage plugin publishes, which is there before this
+    /// plugin's init layer runs.
+    pub fn with_metrics(mut self, metrics: Arc<dyn MetricsBackend>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Publish how one layer answered.
+    ///
+    /// Written on every retrieval for every layer consulted, including the
+    /// layer this process does not hold: a cell that is only written when the
+    /// service is there leaves "no such layer" and "the call never happened"
+    /// the same empty cell, which is the confusion this series is for. A
+    /// failure to record is logged and dropped -- the retrieval itself already
+    /// answered, and turning its outcome into an error because the metrics
+    /// store refused would make the reading change what it measures.
+    async fn record(&self, layer: &str, outcome: Outcome) {
+        let Some(ref metrics) = self.metrics else {
+            return;
+        };
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("layer".to_string(), layer.to_string());
+        labels.insert("outcome".to_string(), outcome.cell().to_string());
+        if let Err(e) = metrics
+            .record_counter(
+                cog_core::metric_names::KNOWLEDGE_RETRIEVAL_TOTAL,
+                1.0,
+                labels,
+            )
+            .await
+        {
+            tracing::warn!("could not record the {layer} retrieval outcome: {e}");
         }
     }
 
@@ -266,6 +343,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
                 .await
             {
                 Ok(results) => {
+                    let contributed = results.len();
                     for r in results {
                         match r {
                             UnifiedSearchResult::Schema(s) => {
@@ -297,17 +375,22 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
                             }
                         }
                     }
+                    self.record("memory", Outcome::of_rows(contributed)).await;
                 }
                 Err(e) => {
                     tracing::warn!("memory search failed: {}", e);
+                    self.record("memory", Outcome::Error).await;
                 }
             }
+        } else {
+            self.record("memory", Outcome::Absent).await;
         }
 
         // --- Wiki layer ---
         if let Some(ref wiki) = self.wiki {
             match wiki.search(query, top_k).await {
                 Ok(results) => {
+                    let contributed = results.len();
                     for r in results {
                         entries.push(KnowledgeEntry {
                             id: r.document.id.clone(),
@@ -321,11 +404,15 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
                             })),
                         });
                     }
+                    self.record("wiki", Outcome::of_rows(contributed)).await;
                 }
                 Err(e) => {
                     tracing::warn!("wiki search failed: {}", e);
+                    self.record("wiki", Outcome::Error).await;
                 }
             }
+        } else {
+            self.record("wiki", Outcome::Absent).await;
         }
 
         // Sort by relevance descending.
@@ -342,6 +429,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
         top_k: usize,
     ) -> SFResult<Vec<TaskDecompositionPattern>> {
         let Some(memory) = self.memory.resolve() else {
+            self.record("memory", Outcome::Absent).await;
             return Ok(Vec::new());
         };
 
@@ -349,9 +437,16 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
         // query has to be the dimension the rows are keyed on, and the goal is
         // free text that ranks what came back rather than a string any key
         // contains.
-        let results = memory
+        let results = match memory
             .search_schema(NS_DECOMPOSITION, goal_class, scan_window(top_k))
-            .await?;
+            .await
+        {
+            Ok(results) => results,
+            Err(e) => {
+                self.record("memory", Outcome::Error).await;
+                return Err(e);
+            }
+        };
         let mut patterns: Vec<TaskDecompositionPattern> = results
             .into_iter()
             .filter_map(|r| {
@@ -362,6 +457,8 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
             shared_terms(goal, &b.goal_summary).cmp(&shared_terms(goal, &a.goal_summary))
         });
         patterns.truncate(top_k);
+        self.record("memory", Outcome::of_rows(patterns.len()))
+            .await;
         Ok(patterns)
     }
 
@@ -372,6 +469,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
         top_k: usize,
     ) -> SFResult<Vec<ImplementationExample>> {
         let Some(memory) = self.memory.resolve() else {
+            self.record("memory", Outcome::Absent).await;
             return Ok(Vec::new());
         };
 
@@ -381,9 +479,16 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
         // appended makes the query a string no entry contains, which answers
         // "no prior implementation" for every task and is indistinguishable
         // from a namespace nothing was ever stored in.
-        let results = memory
+        let results = match memory
             .search_schema(NS_IMPLEMENTATION, task_type, scan_window(top_k))
-            .await?;
+            .await
+        {
+            Ok(results) => results,
+            Err(e) => {
+                self.record("memory", Outcome::Error).await;
+                return Err(e);
+            }
+        };
         let mut examples: Vec<ImplementationExample> = results
             .into_iter()
             .filter_map(|r| {
@@ -399,6 +504,8 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
                 .cmp(&shared_terms(input_summary, &a.input_summary))
         });
         examples.truncate(top_k);
+        self.record("memory", Outcome::of_rows(examples.len()))
+            .await;
         Ok(examples)
     }
 
@@ -408,31 +515,48 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
         top_k: usize,
     ) -> SFResult<Vec<FailurePattern>> {
         let Some(memory) = self.memory.resolve() else {
+            self.record("memory", Outcome::Absent).await;
             return Ok(Vec::new());
         };
 
-        let results = memory.search_schema(NS_FAILURE, task_type, top_k).await?;
+        let results = match memory.search_schema(NS_FAILURE, task_type, top_k).await {
+            Ok(results) => results,
+            Err(e) => {
+                self.record("memory", Outcome::Error).await;
+                return Err(e);
+            }
+        };
         let patterns: Vec<FailurePattern> = results
             .into_iter()
             .filter_map(|r| {
                 serde_json::from_value::<FailurePattern>(r.entry.properties.clone()).ok()
             })
             .collect();
+        self.record("memory", Outcome::of_rows(patterns.len()))
+            .await;
         Ok(patterns)
     }
 
     async fn retrieve_task_history(&self, task_id: &str) -> SFResult<Vec<TaskExecutionRecord>> {
         let Some(memory) = self.memory.resolve() else {
+            self.record("memory", Outcome::Absent).await;
             return Ok(Vec::new());
         };
 
-        let results = memory.search_schema(NS_EXECUTION, task_id, 100).await?;
+        let results = match memory.search_schema(NS_EXECUTION, task_id, 100).await {
+            Ok(results) => results,
+            Err(e) => {
+                self.record("memory", Outcome::Error).await;
+                return Err(e);
+            }
+        };
         let records: Vec<TaskExecutionRecord> = results
             .into_iter()
             .filter_map(|r| {
                 serde_json::from_value::<TaskExecutionRecord>(r.entry.properties.clone()).ok()
             })
             .collect();
+        self.record("memory", Outcome::of_rows(records.len())).await;
         Ok(records)
     }
 

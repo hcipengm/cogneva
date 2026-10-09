@@ -1,7 +1,7 @@
 //! Wiki plugin — implements [`cog_core::SystemPlugin`].
 
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Wiki plugin that self-assembles and publishes the wiki backend.
 pub struct WikiPlugin {
@@ -50,10 +50,20 @@ impl cog_core::SystemPlugin for WikiPlugin {
             // here yields a service only when that plugin's init happens to
             // finish first. The handles resolve on first use instead, which is
             // after every init has returned.
-            let unified = crate::UnifiedKnowledgeBackend::new()
+            let mut unified = crate::UnifiedKnowledgeBackend::new()
                 .with_wiki(wiki.clone())
                 .with_memory_late(cog_core::LateService::new(ctx.clone()))
                 .with_embedding_late(cog_core::LateService::new(ctx.clone()));
+            // The retrieval outcome series is the only place that separates a
+            // layer this process does not hold from a layer that answered with
+            // nothing, and the plugin context is in hand only here.
+            match ctx.consume_service::<dyn cog_core::MetricsBackend>() {
+                Some(metrics) => unified = unified.with_metrics(metrics),
+                None => warn!(
+                    "no metrics backend published; knowledge retrieval outcomes \
+                     will not be recorded"
+                ),
+            }
             ctx.publish_service::<dyn cog_core::KnowledgeBackend>(Arc::new(unified));
             info!("WikiPlugin KnowledgeBackend published");
         }

@@ -742,6 +742,23 @@ metric_names! {
     // call is a run-time fault — and a single counter would report them as one
     // "checkpointing is broken".
     TASK_CHECKPOINT => "cogneva_task_checkpoint_total",
+
+    // cog-wiki — what each knowledge layer gave back when it was consulted.
+    //
+    // One cell per layer per call, by `layer` (memory, wiki) and `outcome`
+    // (hit, empty, error, absent). The four are four different facts, and the
+    // retrieval calls answer three of them with the same empty list: a layer
+    // this process does not hold, a layer whose backend refused, and a layer
+    // that answered and had nothing are one `Vec` at every caller, so a caller
+    // choosing between "repair the backend" and "nothing has been stored yet"
+    // has nothing to choose from.
+    //
+    // A counter rather than a gauge because the question belongs to the call,
+    // and the pairs worth reading are per layer: `error` moving says a store
+    // refused, `empty` moving while `hit` stands still says the store answers
+    // and holds nothing that matches, and `absent` on a deployment that means
+    // to have that layer names the wiring rather than the data.
+    KNOWLEDGE_RETRIEVAL_TOTAL => "cogneva_knowledge_retrieval_total",
 }
 
 /// Whether `name` is a series a build can still write.

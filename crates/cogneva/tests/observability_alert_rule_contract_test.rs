@@ -638,6 +638,14 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_version_contract_checks_total",
         "crates/cog-reflection/src/mainline_deployer.rs",
     ),
+    // 知识检索的回声只到一张空表为止，而「没这个层」「后端拒绝」
+    // 「后端答了但没有」在返回值上是同一个空表——修法要在这三者之间选，而选择需要
+    // 的信息调用方拿不到。这个计数把每次检索按 `layer` 与 `outcome`（hit/empty/error/
+    // absent）各记一格，是这条区分唯一存在的地方。
+    (
+        "cogneva_knowledge_retrieval_total",
+        "crates/cog-wiki/src/unified_knowledge_backend.rs",
+    ),
 ];
 
 /// Series the rules read that this workspace does not publish, with the owner.

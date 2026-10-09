@@ -556,6 +556,21 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          no provenance; on a host whose store shares hardlinked layers this \
          counts each inode once",
     ),
+    (
+        crate::metric_names::KNOWLEDGE_RETRIEVAL_TOTAL.as_str(),
+        "What each knowledge layer gave back when it was consulted, labelled by \
+         `layer` (memory, wiki) and `outcome`, one increment per layer per \
+         retrieval call. Outcomes are a closed set: `hit` (the layer answered \
+         with at least one row), `empty` (it answered and had none), `error` \
+         (its backend refused), and `absent` (this process does not hold that \
+         layer at all). The last two are the cells this series exists for: the \
+         retrieval calls return an empty list for all three of empty, error and \
+         absent, so without them a layer that was never wired and one holding \
+         nothing are the same answer at every caller. Read per layer — `error` \
+         moving names a store that refused, `empty` rising against a still \
+         `hit` names a store that answers and matches nothing, and `absent` on \
+         a deployment that means to have the layer names a wiring fault.",
+    ),
 ];
 
 /// Descriptions for the histogram series. See [`COUNTER_HELP`].
