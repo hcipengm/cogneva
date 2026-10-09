@@ -49,6 +49,12 @@ spec:
         # （run_command/read_file/write_file），该 Pod 不持有任何 Secret。
         - protocol: TCP
           port: 9090
+        # 主应用 HTTP 面（8080）：工具的返回点把「装不进上下文窗口」的输出
+        # 归档到这里的内存 Raw 层，标记里带回取引用。这一步走本命名空间内的
+        # 主应用 Service，不经安全网关（该面只代持外网凭证，与本调用无关），
+        # 调用零凭证。少了这一条，归档请求被策略静默丢弃。
+        - protocol: TCP
+          port: 8080
         # 集群内镜像仓库（5000）：publisher push 金丝雀 / 主线 overlay 镜像
         - protocol: TCP
           port: 5000

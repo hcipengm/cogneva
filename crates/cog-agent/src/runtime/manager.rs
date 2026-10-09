@@ -89,6 +89,9 @@ pub struct GlobalAgentManager {
     /// pointer is written, the read comes back empty, and the run starts over
     /// exactly as if nothing had ever been checkpointed.
     checkpoint_store: Option<Arc<dyn cog_core::CheckpointStore>>,
+    /// Where a spawned worker's loop archives a tool output too large for the
+    /// context window. Shared by every worker, like the observability gateway.
+    tool_output_archive: Option<Arc<dyn crate::archive::ToolOutputArchive>>,
     /// How often every worker renews its registration.
     ///
     /// Read from the `agent` section at startup and handed to each spawned
@@ -126,6 +129,7 @@ impl GlobalAgentManager {
             event_bus_sink: None,
             observability: None,
             checkpoint_store: None,
+            tool_output_archive: None,
             heartbeat_interval_secs: cog_core::config::AgentConfig::default()
                 .heartbeat_interval_secs,
         }
@@ -222,6 +226,17 @@ impl GlobalAgentManager {
         self
     }
 
+    /// Give every spawned worker the surface that archives an oversized tool
+    /// output. One handle for the whole pool: the reading it carries is keyed by
+    /// tool, not by worker, so a second copy would only split the count.
+    pub fn with_tool_output_archive(
+        mut self,
+        archive: Arc<dyn crate::archive::ToolOutputArchive>,
+    ) -> Self {
+        self.tool_output_archive = Some(archive);
+        self
+    }
+
     /// Spawn a new worker agent, register it globally, and start its inbox consumer.
     /// # Arguments
     /// * `agent_id` — unique worker identifier
@@ -273,6 +288,9 @@ impl GlobalAgentManager {
             }
             if let Some(ref cp) = self.checkpoint_store {
                 a = a.with_checkpoint_store(cp.clone());
+            }
+            if let Some(ref ar) = self.tool_output_archive {
+                a = a.with_tool_output_archive(ar.clone());
             }
             a
         };
@@ -387,6 +405,9 @@ impl cog_core::AgentManager for GlobalAgentManager {
             }
             if let Some(ref cp) = self.checkpoint_store {
                 a = a.with_checkpoint_store(cp.clone());
+            }
+            if let Some(ref ar) = self.tool_output_archive {
+                a = a.with_tool_output_archive(ar.clone());
             }
             a
         };

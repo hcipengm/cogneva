@@ -112,6 +112,7 @@ data:
         "COGNEVA_AGENT_LOOP_CONTEXT_WINDOW_SIZE": "agent_loop.context_window_size",
         "COGNEVA_AGENT_LOOP_ROLE": "agent_loop.role",
         "COGNEVA_AGENT_LOOP_SKILL_CACHE_TTL_SECS": "agent_loop.skill_cache_ttl_secs",
+        "COGNEVA_MEMORY_API_BASE": "agent_loop.memory_api_base",
         "COGNEVA_SELF_EVOLUTION_ENABLED": "self_evolution.enabled",
         "COGNEVA_SELF_EVOLUTION_AUTO_APPLY": "self_evolution.auto_apply",
         "COGNEVA_SELF_EVOLUTION_AUTO_DEPLOY": "self_evolution.auto_deploy",
@@ -1367,6 +1368,15 @@ data:
               },
               "severity": "warning",
               "summary": "A batch of archived raw sources was permanently abandoned rather than retried ({value} being how many sources every process together discarded in the last half hour). Extraction gave up on their content after retries and wrote each one to the dead-letter namespace, which is also what takes it out of the unextracted backlog: from here on nothing re-drives it and no later reading counts it as owed, so the drop it causes in that backlog is not the debt being paid: no other reading states the loss. That is why the rule is here and not on the backlog: the backlog answers what is still owed, and a source that was abandoned stops being owed. It is a loss by design rather than a fault by design, and the two are told apart by how many arrive: the extraction path is expected to meet content it cannot read, so one is the ordinary case, while a run of them inside one reconcile round is the shape of a change that made readable content unreadable -- a parser, a prompt or a schema, none of which this rule can name. The counters beside it on the same series answer where the run came from: the reconciliation pass re-drives up to aged_out_redrive_batch of the aged-out backlog every round, so a batch discarded in the same round those were handed out is a backlog being processed to a verdict rather than a new defect arriving. This counter is a counter and not a gauge because a discard is an event: the value is how much was lost over the window, and the cells are seeded at zero on startup so that a window with no discards reads as zero rather than as an absent series. Read the backlog pair for what is still owed; whether extraction is failing wholesale has no reading of its own, so a run of these is the only place it shows."
+            },
+            {
+              "name": "tool_output_archive_failing",
+              "promql": "(max by (tool, cause) (increase(cogneva_tool_output_archive_failed_total[30m])) > 0)",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "A tool output did not fit the context window and the bytes that were cut could not be stored, so the model's transcript carries a truncation marker with no reference and the dropped tail exists nowhere else ({value} being the most any one tool/cause pair lost in the last half hour). The rule is here and not on truncation: cutting an output to fit the window is expected -- a task that asks to dump a large file crosses the window share on purpose -- while the archive failing means the part the model did not see is gone for good, since nothing retries it and no other reading counts it. The cause label names the repair, which is why the pair is kept rather than summed away: unconfigured means no memory API base was handed to this deployment, so no request was made and the fix is configuration; unreachable means the API did not answer and the fix is the route to it; refused means the API answered and rejected the write, so the fix is on the API's own readings. A tool label is kept for the same reason the pair is: it says which tool's outputs are being lost, and a total over every tool would report a volume with no owner. One event is enough and no bound is declared, because a failed archive is a permanent loss rather than a rate: the condition does not clear while nothing about it changes, and the half hour only decides how long a single event keeps the alert open. Read this beside cogneva_tool_output_truncated_total, which is the denominator -- it says whether the failures happen against a busy truncation path or a path nothing has flowed through -- and read the pod's log for the tool and the source id the warn line names."
             },
             {
               "name": "gitops_pull_failed",

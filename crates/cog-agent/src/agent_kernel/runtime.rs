@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use crate::context::ContextWindow;
+use crate::context::{truncate_to_chars, ContextWindow};
 use crate::hooks::LifecycleHookEvent;
 use crate::tools::ToolRegistry;
 
@@ -220,6 +220,12 @@ pub struct AgentRuntime {
     /// missing gateway is the difference between a per-task reading and none,
     /// so its absence is reported rather than assumed.
     observability: Option<Arc<dyn cog_core::ObservabilityGateway>>,
+    /// Where an oversized tool output is written back so its tail stays
+    /// reachable by reference. Optional like the other injected handles — the
+    /// run completes without it — but its absence is not the same as a result
+    /// that fit: with no archiver a truncated output is lost, and the handle is
+    /// what carries the reading that says so.
+    tool_output_archive: Option<Arc<dyn crate::archive::ToolOutputArchive>>,
     /// What the run in flight has been billed for so far. Reset by every
     /// [`Self::run_scoped`]; read when the run ends.
     run_usage: RunUsage,
@@ -415,6 +421,7 @@ impl AgentRuntime {
             available_skills_cache: None,
             skills_cache_instant: None,
             observability: None,
+            tool_output_archive: None,
             run_usage: RunUsage::default(),
             run_iterations: 0,
         }
@@ -457,6 +464,20 @@ impl AgentRuntime {
     /// Hand the loop the gateway its per-task token census is written to.
     pub fn with_observability(mut self, gateway: Arc<dyn cog_core::ObservabilityGateway>) -> Self {
         self.observability = Some(gateway);
+        self
+    }
+
+    /// Hand the loop the surface that archives an oversized tool output.
+    ///
+    /// The loop uses it at the tool-return point, where both the full output
+    /// and the window budget are in hand: an output that does not fit is
+    /// written back there and its truncation marker carries the reference, so
+    /// the tail the model never saw can still be fetched.
+    pub fn with_tool_output_archive(
+        mut self,
+        archive: Arc<dyn crate::archive::ToolOutputArchive>,
+    ) -> Self {
+        self.tool_output_archive = Some(archive);
         self
     }
 
@@ -824,6 +845,70 @@ impl AgentRuntime {
         }
     }
 
+    /// The tool-result message for one call, archiving the output when it will
+    /// not fit the window.
+    ///
+    /// This is the only place that holds both the full text and the window
+    /// budget, so it is the only place that can decide a result is oversized and
+    /// still save the part the model will not see. A run with no archive surface
+    /// (embedded use, tests) still cuts the output — it just cannot offer a
+    /// reference to the tail, and the marker says only that bytes were dropped.
+    async fn tool_result_message(
+        &self,
+        task_id: Option<&str>,
+        turn: u32,
+        frame: u32,
+        tool_call_id: &str,
+        tool_name: &str,
+        text: &str,
+    ) -> Message {
+        let budget = self.context.tool_result_budget_chars();
+        if text.chars().count() <= budget {
+            return Message::tool_result_text(tool_call_id, tool_name, text);
+        }
+        // Oversized: the tail is about to be cut, and those bytes exist nowhere
+        // else. Write the full output back where the read side can fetch it and
+        // name it in the marker, so the loss is addressable rather than silent.
+        let reference = match &self.tool_output_archive {
+            Some(archive) => {
+                // The event is counted before the archive is attempted: the
+                // output was cut whether or not the tail could be saved, and a
+                // run whose archives all fail is still a run that truncates.
+                archive.record_truncation(tool_name).await;
+                match task_id {
+                    Some(task_id) => {
+                        let id = cog_core::tool_output_raw_id(task_id, turn, frame);
+                        match archive
+                            .archive(tool_name, &id, "application/json", text)
+                            .await
+                        {
+                            Ok(uri) => Some(uri),
+                            Err(e) => {
+                                tracing::warn!(
+                                    tool = tool_name,
+                                    id = %id,
+                                    error = %e,
+                                    "tool output does not fit the window and could not be archived; \
+                                     the marker carries no reference"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    // No task id to key a source by: nothing to fetch it back
+                    // under, so the marker stays reference-free.
+                    None => None,
+                }
+            }
+            None => None,
+        };
+        Message::tool_result_text(
+            tool_call_id,
+            tool_name,
+            truncate_to_chars(text, budget, reference.as_deref()),
+        )
+    }
+
     /// The run itself, from the first turn to its answer.
     async fn run_turns(
         &mut self,
@@ -1080,7 +1165,7 @@ impl AgentRuntime {
             let mut observations: Vec<serde_json::Value> = Vec::new();
             let mut tool_result_messages: Vec<Message> = Vec::new();
 
-            for tc in &tool_calls {
+            for (frame, tc) in tool_calls.iter().enumerate() {
                 self.emit_event(AgentEvent::ToolExecutionStart {
                     agent_id: self.config.agent_id.clone(),
                     tool_call_id: tc.id.clone(),
@@ -1135,11 +1220,17 @@ impl AgentRuntime {
                 };
 
                 observations.push(observation.clone());
-                tool_result_messages.push(Message::tool_result_text(
-                    &tc.id,
-                    &tc.name,
-                    observation.to_string(),
-                ));
+                tool_result_messages.push(
+                    self.tool_result_message(
+                        run_task_id,
+                        iteration,
+                        frame as u32,
+                        &tc.id,
+                        &tc.name,
+                        &observation.to_string(),
+                    )
+                    .await,
+                );
 
                 self.emit_event(AgentEvent::ToolExecutionEnd {
                     agent_id: self.config.agent_id.clone(),
@@ -3302,6 +3393,177 @@ mod tests {
         assert_eq!(
             spent, 1.0,
             "a run whose recovery ask hung still hit the ceiling exactly once"
+        );
+    }
+
+    /// A tool output too large for the window is archived at the return point and
+    /// the marker carries the reference. Only that point holds both the full text
+    /// and the budget, so a bound that did not fire here would leave the dropped
+    /// tail with no second reader anywhere.
+    #[derive(Debug, Default)]
+    struct RecordingArchive {
+        archived: std::sync::Mutex<Vec<(String, String, String)>>,
+        truncations: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::archive::ToolOutputArchive for RecordingArchive {
+        async fn archive(
+            &self,
+            tool: &str,
+            id: &str,
+            _content_type: &str,
+            text: &str,
+        ) -> SFResult<String> {
+            self.archived
+                .lock()
+                .unwrap()
+                .push((tool.into(), id.into(), text.into()));
+            Ok(cog_core::artifact_uri(
+                cog_core::DEFAULT_MEMORY_NAMESPACE,
+                id,
+            ))
+        }
+
+        async fn record_truncation(&self, tool: &str) {
+            self.truncations.lock().unwrap().push(tool.into());
+        }
+    }
+
+    /// First turn asks for the tool, second turn delivers. The tool's output is
+    /// far past the window share, so the return point must archive it.
+    struct OneToolThenAnswerLlm {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmClient for OneToolThenAnswerLlm {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _options: &cog_core::ChatOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            let first = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            let (stream, producer) = cog_core::EventStream::with_capacity(4);
+            tokio::spawn(async move {
+                let mut producer = producer;
+                let content = if first {
+                    vec![ContentBlock::tool_call(
+                        "call-big",
+                        "bigdump",
+                        serde_json::json!({}),
+                    )]
+                } else {
+                    vec![ContentBlock::Text {
+                        text: r#"{"done":true}"#.into(),
+                        text_signature: None,
+                    }]
+                };
+                let _ = producer
+                    .push(AssistantMessageEvent::TextDelta {
+                        content_index: 0,
+                        delta: String::new(),
+                        timestamp: chrono::Utc::now(),
+                    })
+                    .await;
+                producer.end(cog_core::ChatResponse {
+                    content,
+                    api: "mock".into(),
+                    provider: "mock".into(),
+                    model: "mock".into(),
+                    response_id: None,
+                    usage: cog_core::Usage::default(),
+                    stop_reason: cog_core::StopReason::Stop,
+                    error_message: None,
+                    upstream_failure: None,
+                    retry_after_secs: None,
+                    timestamp: chrono::Utc::now(),
+                });
+            });
+            Ok(stream)
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!()
+        }
+
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _options: &cog_core::ChatOptions,
+        ) -> SFResult<cog_core::ChatResponse> {
+            unimplemented!()
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn an_oversized_tool_output_is_archived_and_referenced_in_the_marker() {
+        let registry = ToolRegistry::new();
+        let payload = serde_json::json!({ "blob": "z".repeat(5000) });
+        let expected = payload.to_string();
+        let blob = payload.clone();
+        cog_core::ToolRegistry::register(
+            &registry,
+            cog_core::Tool {
+                name: "bigdump".into(),
+                description: String::new(),
+                parameters: serde_json::json!({}),
+                implementation: cog_core::ToolImplementation::Native(Arc::new(move |_args| {
+                    let v = blob.clone();
+                    Box::pin(async move { Ok(v) })
+                })),
+            },
+        );
+        let archive = Arc::new(RecordingArchive::default());
+        let config = RuntimeConfig {
+            context_window_size: 400,
+            max_iterations: 4,
+            ..Default::default()
+        };
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let mut runtime = AgentRuntime::new(config, tx)
+            .with_tools(registry)
+            .with_tool_output_archive(archive.clone());
+        let llm = OneToolThenAnswerLlm {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let _ = runtime
+            .run_scoped(serde_json::json!({"goal": "dump"}), &llm, Some("taskseam"))
+            .await;
+
+        let archived = archive.archived.lock().unwrap().clone();
+        assert_eq!(archived.len(), 1, "一次超大输出，正好归档一次");
+        assert_eq!(archived[0].0, "bigdump");
+        assert_eq!(
+            archived[0].1, "taskseam-0000-0000",
+            "id 把任务与 (turn, frame) 编进去，零填充"
+        );
+        assert_eq!(archived[0].2, expected, "归档的是全文，不是截断后的那段");
+        assert_eq!(archive.truncations.lock().unwrap().clone(), vec!["bigdump"]);
+
+        let joined = runtime
+            .get_context()
+            .messages()
+            .iter()
+            .map(|m| m.content())
+            .collect::<Vec<_>>()
+            .join("\n---\n");
+        assert!(
+            joined.contains("artifact://default/taskseam-0000-0000"),
+            "标记里必须带得回引用，否则砍掉的尾巴没人拿得到: {joined}"
+        );
+        assert!(
+            joined.contains("tool output truncated"),
+            "被砍过必须在文本里自己说出来: {joined}"
         );
     }
 }

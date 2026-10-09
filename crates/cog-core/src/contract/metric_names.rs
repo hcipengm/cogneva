@@ -759,6 +759,20 @@ metric_names! {
     // and holds nothing that matches, and `absent` on a deployment that means
     // to have that layer names the wiring rather than the data.
     KNOWLEDGE_RETRIEVAL_TOTAL => "cogneva_knowledge_retrieval_total",
+
+    // cog-agent — what happened to a tool output too large for the context.
+    //
+    // Two cells that must be read together. `truncated` says a tool's output did
+    // not fit and its tail was dropped from the model's view; without it the
+    // drop is visible only inside the text the model receives, so nothing
+    // outside the conversation can count how much was withheld. `archive_failed`
+    // says the tail was meant to stay reachable by reference and does not, so a
+    // reference in a truncation marker points at a source that never landed and
+    // a caller following it finds nothing. Kept as separate series by `tool`
+    // because the first is expected traffic and the second is a defect: folding
+    // them would let a failing archive read as ordinary truncation.
+    TOOL_OUTPUT_TRUNCATED_TOTAL => "cogneva_tool_output_truncated_total",
+    TOOL_OUTPUT_ARCHIVE_FAILED_TOTAL => "cogneva_tool_output_archive_failed_total",
 }
 
 /// Whether `name` is a series a build can still write.

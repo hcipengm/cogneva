@@ -571,6 +571,26 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          `hit` names a store that answers and matches nothing, and `absent` on \
          a deployment that means to have the layer names a wiring fault.",
     ),
+    (
+        crate::metric_names::TOOL_OUTPUT_TRUNCATED_TOTAL.as_str(),
+        "Tool outputs whose tail was dropped from the conversation because the \
+         whole result did not fit the context, labelled by `tool`, one increment \
+         per result cut. The model sees the cut in the text it is handed; this is \
+         the same fact outside the conversation, so a run that spends its budget \
+         on oversized tool results is countable rather than silent. Read per \
+         `tool`: a series climbing for one tool names that tool's output shape, \
+         not the context budget as a whole.",
+    ),
+    (
+        crate::metric_names::TOOL_OUTPUT_ARCHIVE_FAILED_TOTAL.as_str(),
+        "Archives of a truncated tool output's full text that did not land, \
+         labelled by `tool`, one increment per failed archive. A truncation \
+         marker carries an `artifact://` reference only when the full text was \
+         stored, so this counts the times a caller following such a reference \
+         would find nothing; read beside `cogneva_tool_output_truncated_total`, \
+         where a share of the two moving together names the archive endpoint \
+         rather than ordinary truncation.",
+    ),
 ];
 
 /// Descriptions for the histogram series. See [`COUNTER_HELP`].

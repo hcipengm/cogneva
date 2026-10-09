@@ -63,6 +63,12 @@ pub const AGENT_LOOP_ENV: &[(&str, &str)] = &[
         "COGNEVA_AGENT_LOOP_FINAL_DRAFT_TIMEOUT_SECS",
         "final_draft_timeout_secs",
     ),
+    // The platform's own HTTP surface, borrowed the way the business pods
+    // borrow the gateway (see `COGNEVA_GITHUB_API_BASE`): the loop archives an
+    // oversized tool output by POSTing to it, carrying no token. Named without
+    // the `AGENT_LOOP` prefix because it points at a shared endpoint rather
+    // than a knob of this section.
+    (cog_core::MEMORY_API_BASE_ENV, "memory_api_base"),
 ];
 
 const AGENT_POOL_ENV: &[(&str, &str)] = &[
@@ -93,6 +99,10 @@ pub struct AgentLoopConfig {
     /// stall timeout this bounds the whole call, because that ask is the one
     /// that runs after the run's budget is already spent.
     pub final_draft_timeout_secs: u64,
+    /// Base URL of the platform memory API where an oversized tool output is
+    /// archived. Absent when the deployment names none; the loop then still
+    /// truncates, and the failure reading carries the cause.
+    pub memory_api_base: Option<String>,
 }
 
 impl Default for AgentLoopConfig {
@@ -106,6 +116,7 @@ impl Default for AgentLoopConfig {
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
             final_draft_timeout_secs: 420,
+            memory_api_base: None,
         }
     }
 }
@@ -185,6 +196,16 @@ mod tests {
     }
 
     #[test]
+    fn the_memory_api_base_env_is_honored_by_this_section() {
+        // The archive call borrows the platform's own HTTP surface by env, the
+        // way the business pods borrow the gateway. If the name drops out of
+        // this table the deploy-config gate stops being able to tell "honored"
+        // from "honored by nobody", and the loop silently falls back to
+        // unconfigured.
+        assert!(AGENT_LOOP_ENV.contains(&(cog_core::MEMORY_API_BASE_ENV, "memory_api_base")));
+    }
+
+    #[test]
     fn reads_section_and_missing_file_defaults() {
         let p = Path::new("/nonexistent/cogneva.json");
         assert_eq!(AgentLoopConfig::load_from(p).unwrap().role, "planner");
@@ -196,7 +217,7 @@ mod tests {
         std::fs::write(
             &path,
             r#"{"agent_loop": {"role": "evaluator", "max_iterations": 3,
-                    "eval_max_iterations": 7},
+                    "eval_max_iterations": 7, "memory_api_base": "http://cogneva:8080"},
                 "agent_pool": {"worker_count": 8}}"#,
         )
         .unwrap();
@@ -204,6 +225,7 @@ mod tests {
         assert_eq!(l.role, "evaluator");
         assert_eq!(l.max_iterations, 3);
         assert_eq!(l.eval_max_iterations, 7);
+        assert_eq!(l.memory_api_base.as_deref(), Some("http://cogneva:8080"));
         assert_eq!(
             AgentManagerConfig::load_from(&path).unwrap().worker_count,
             8

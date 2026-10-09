@@ -87,6 +87,9 @@ pub struct Agent {
     guardrail: Option<Arc<dyn cog_core::Guardrail>>,
     /// Where each finished run's token census is written, keyed by task.
     observability: Option<Arc<dyn cog_core::ObservabilityGateway>>,
+    /// Where the loop sends a tool output too large to fit the context window,
+    /// so the bytes it drops stay reachable by the reference in the marker.
+    tool_output_archive: Option<Arc<dyn crate::archive::ToolOutputArchive>>,
     /// Broadcast channel capacity for agent events.
     event_channel_capacity: usize,
     /// 持久事件总线投递口。装上之后 AgentEnd 只写总线（broadcast 由
@@ -151,6 +154,7 @@ impl Agent {
             external_skill_registry: None,
             guardrail: None,
             observability: None,
+            tool_output_archive: None,
             event_channel_capacity,
             event_bus_sink: None,
             cmd_channel_capacity,
@@ -266,6 +270,18 @@ impl Agent {
         self
     }
 
+    /// Hand the loop the surface that archives a tool output too large for the
+    /// context window. Without it the output is still cut to fit; what is lost
+    /// is the reference to the dropped bytes, so a reader of the transcript sees
+    /// a truncation with no way back to the whole.
+    pub fn with_tool_output_archive(
+        mut self,
+        archive: Arc<dyn crate::archive::ToolOutputArchive>,
+    ) -> Self {
+        self.tool_output_archive = Some(archive);
+        self
+    }
+
     pub fn with_wal(mut self, wal: Arc<crate::wal::AgentWal>) -> Self {
         self.wal = Some(wal);
         self
@@ -337,6 +353,7 @@ impl Agent {
         let external_skill_registry = self.external_skill_registry.clone();
         let event_bus_sink = self.event_bus_sink.clone();
         let observability = self.observability.clone();
+        let tool_output_archive = self.tool_output_archive.clone();
 
         let loop_event_cap = self.loop_event_channel_capacity;
         let handle = tokio::spawn(async move {
@@ -368,6 +385,9 @@ impl Agent {
             }
             if let Some(ref ob) = observability {
                 agent_loop = agent_loop.with_observability(ob.clone());
+            }
+            if let Some(ref ar) = tool_output_archive {
+                agent_loop = agent_loop.with_tool_output_archive(ar.clone());
             }
 
             // Forward events from AgentRuntime mpsc to Agent broadcast
@@ -792,6 +812,7 @@ impl Agent {
         let plugin_registry = self.plugin_registry.clone();
         let event_bus_sink = self.event_bus_sink.clone();
         let observability = self.observability.clone();
+        let tool_output_archive = self.tool_output_archive.clone();
 
         let loop_event_cap = self.loop_event_channel_capacity;
         let handle = tokio::spawn(async move {
@@ -820,6 +841,9 @@ impl Agent {
             }
             if let Some(ref ob) = observability {
                 agent_loop = agent_loop.with_observability(ob.clone());
+            }
+            if let Some(ref ar) = tool_output_archive {
+                agent_loop = agent_loop.with_tool_output_archive(ar.clone());
             }
 
             // Restore state from snapshot before running

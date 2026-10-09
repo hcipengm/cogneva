@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod agent_kernel;
+pub mod archive;
 pub mod config;
 pub mod consumer;
 pub mod context;
@@ -12,6 +13,7 @@ pub mod tools;
 pub mod wal;
 pub mod worktree;
 
+pub use archive::{HttpToolOutputArchive, ToolOutputArchive};
 pub use config::{AgentLoopConfig, AgentManagerConfig};
 
 pub use agent::Agent;

@@ -221,6 +221,29 @@ impl cog_core::SystemPlugin for AgentPlugin {
         // 追问的墙钟界一起读一次：两者都走配置面，改值不用重新打镜像（其余字段仍是
         // 评估器自有默认值，与生成侧不是一个量级，不能直接继承）。
         let agent_loop_config = crate::AgentLoopConfig::load()?;
+        // The loop archives a tool output that will not fit the window by
+        // POSTing it to the platform memory API — this process holds no memory
+        // dataset (it is switched off where the loops run), so an in-process
+        // handle would be absent exactly here. One archive handle serves the
+        // eval runtime and the whole worker pool: the reading it carries is
+        // keyed by tool, and a second copy would only split the count.
+        let memory_api_base = agent_loop_config.memory_api_base.clone();
+        let tool_output_archive: Option<Arc<dyn crate::ToolOutputArchive>> = ctx
+            .consume_service::<dyn cog_core::HttpClient>()
+            .map(|client| {
+                let metrics = ctx.consume_service::<dyn cog_core::MetricsBackend>();
+                Arc::new(crate::HttpToolOutputArchive::new(
+                    client,
+                    memory_api_base.clone(),
+                    metrics,
+                )) as Arc<dyn crate::ToolOutputArchive>
+            });
+        if tool_output_archive.is_none() {
+            warn!(
+                "HttpClient unavailable; a tool output too large for the context window \
+                 cannot be archived and its dropped tail is unrecoverable"
+            );
+        }
         let (eval_event_tx, eval_event_rx) =
             tokio::sync::mpsc::channel::<cog_core::AgentEvent>(128);
         let eval_config = cog_core::RuntimeConfig {
@@ -239,6 +262,9 @@ impl cog_core::SystemPlugin for AgentPlugin {
             .with_tools(tool_registry.as_ref().clone());
         eval_runtime = eval_runtime.with_sandbox_backend(sandbox_backend_for_eval);
         eval_runtime = eval_runtime.with_plugin_registry(plugin_registry_for_eval);
+        if let Some(ref archive) = tool_output_archive {
+            eval_runtime = eval_runtime.with_tool_output_archive(archive.clone());
+        }
         let eval_runtime_arc: Arc<tokio::sync::Mutex<dyn cog_core::AgentRuntime>> =
             Arc::new(tokio::sync::Mutex::new(eval_runtime));
         ctx.publish_service(eval_runtime_arc);
@@ -273,6 +299,9 @@ impl cog_core::SystemPlugin for AgentPlugin {
         .with_heartbeat_interval_secs(agent_config.heartbeat_interval_secs)
         .with_tools(tool_registry)
         .with_sandbox_backend(sandbox_backend_for_pool);
+        if let Some(ref archive) = tool_output_archive {
+            pool_builder = pool_builder.with_tool_output_archive(archive.clone());
+        }
         // Workers publish onto the cluster-wide bus (stream plugin) so live
         // observers see every turn/tool call in real time. Without the stream
         // plugin agents keep their private buses — tests and embedded use.

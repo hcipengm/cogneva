@@ -94,6 +94,15 @@ impl ContextWindow {
         self.current_tokens
     }
 
+    /// The character budget one tool result may occupy in this window.
+    ///
+    /// The tool-return path uses it to decide whether a result is oversized
+    /// before any message is built; the bound applied on `add_message` uses the
+    /// same number, so a result that fits here will not be cut there.
+    pub fn tool_result_budget_chars(&self) -> usize {
+        tool_result_budget_chars(self.max_tokens)
+    }
+
     fn trim_if_needed(&mut self) {
         while self.current_tokens > self.max_tokens && self.messages.len() > 2 {
             // 保留 system message 与首条 user（任务输入）：丢掉首条 user 后，
@@ -160,6 +169,19 @@ const TOOL_RESULT_WINDOW_SHARE_DIVISOR: usize = 2;
 /// 估算口径里一个 token 折算的字符数，与 `estimate_tokens` 的英文分支同源。
 const CHARS_PER_ESTIMATED_TOKEN: usize = 4;
 
+/// The number of characters one tool result may occupy before it is cut.
+///
+/// The tool-return path reads this to decide whether a result needs archiving,
+/// and the same number bounds it on the way into the context. One function so
+/// the two cannot disagree about where the boundary is: a result the return path
+/// judged to fit and the window then cut would be truncated twice, and the second
+/// cut would take the truncation marker with it.
+pub fn tool_result_budget_chars(max_tokens: usize) -> usize {
+    (max_tokens / TOOL_RESULT_WINDOW_SHARE_DIVISOR)
+        .max(1)
+        .saturating_mul(CHARS_PER_ESTIMATED_TOKEN)
+}
+
 /// 把超出窗口份额的单条工具结果截断到预算内，其余消息原样返回。
 ///
 /// 界按字符数而不是估算 token 数：估算把任何不含空白的整块都算成一个词
@@ -177,9 +199,7 @@ fn bound_tool_result(message: Message, max_tokens: usize) -> Message {
     else {
         return message;
     };
-    let budget_chars = (max_tokens / TOOL_RESULT_WINDOW_SHARE_DIVISOR)
-        .max(1)
-        .saturating_mul(CHARS_PER_ESTIMATED_TOKEN);
+    let budget_chars = tool_result_budget_chars(max_tokens);
     let text: String = content.iter().filter_map(|b| b.as_text()).collect();
     if text.chars().count() <= budget_chars {
         return message;
@@ -190,6 +210,7 @@ fn bound_tool_result(message: Message, max_tokens: usize) -> Message {
         content: vec![cog_core::ContentBlock::text(truncate_to_chars(
             &text,
             budget_chars,
+            None,
         ))],
         is_error: *is_error,
         timestamp: *timestamp,
@@ -201,16 +222,36 @@ fn bound_tool_result(message: Message, max_tokens: usize) -> Message {
 /// 静默的截断读起来像完整输出：读者必须能从文本本身看出"还有没看到的"，
 /// 否则一份被砍过的日志会被当成跑完了的日志。标记里带上原长度，是为了
 /// 让重跑命令时有据可依（收窄输出，而不是原样再来一次）。
-pub fn truncate_to_chars(text: &str, budget_chars: usize) -> String {
+///
+/// `reference` 是这段输出归档后的 `artifact://` 引用，由工具返回点传进来
+/// （只有那里同时知道全文和窗口预算）。带上它，模型看到的标记就是一条可取回
+/// 的把手，而不是一句"有东西被丢了"。
+///
+/// 标记本身也算进预算：它比预算长时结果会溢出，进上下文时被第二次裁剪，
+/// 而那一次会把标记连同里面的引用一起砍掉——归档了却没人拿得到引用，等于
+/// 没归档。所以保留的字符数按「预算减去标记」算，标记里报的也就是这个数。
+pub fn truncate_to_chars(text: &str, budget_chars: usize, reference: Option<&str>) -> String {
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= budget_chars {
         return text.to_string();
     }
-    let kept: String = chars[..budget_chars].iter().collect();
-    format!(
-        "{kept}\n[tool output truncated: showing {budget_chars} of {} characters]",
-        chars.len()
-    )
+    let total = chars.len();
+    let marker_for = |shown: usize| match reference {
+        Some(uri) => format!(
+            "\n[tool output truncated: showing {shown} of {total} characters; \
+             full output archived as {uri}]"
+        ),
+        None => format!("\n[tool output truncated: showing {shown} of {total} characters]"),
+    };
+    // 两趟：先按「报满预算」估标记长度，再按实际的保留数报一次，末尾再收紧一格
+    // 保证「保留字符数 + 标记长度」不超过预算（标记位数只会随保留数变小，不会
+    // 反过来）。这样落在预算内的结果进上下文时不会再被裁剪。
+    let keep = budget_chars
+        .saturating_sub(marker_for(budget_chars).chars().count())
+        .min(total);
+    let keep = keep.min(budget_chars.saturating_sub(marker_for(keep).chars().count()));
+    let kept: String = chars[..keep].iter().collect();
+    format!("{kept}{}", marker_for(keep))
 }
 
 /// 简化的 token 估算。
@@ -443,5 +484,49 @@ mod tests {
         let input = "目标 ".repeat(200);
         ctx.add_message(Message::user(input.clone()));
         assert_eq!(ctx.messages()[0].content(), input);
+    }
+
+    #[test]
+    fn a_truncated_result_reports_its_archived_reference_within_budget() {
+        let text = "x".repeat(5000);
+        let out = truncate_to_chars(&text, 400, Some("artifact://default/t-0001-0002"));
+        assert!(
+            out.contains("tool output truncated"),
+            "被砍过要说出来: {out}"
+        );
+        assert!(
+            out.contains("artifact://default/t-0001-0002"),
+            "归档了就要给得回引用，否则砍掉的字节没人拿得到: {out}"
+        );
+        assert!(
+            out.chars().count() <= 400,
+            "标记本身也算预算，否则进窗口会被二次裁剪: {}",
+            out.chars().count()
+        );
+    }
+
+    #[test]
+    fn an_already_truncated_result_keeps_its_reference_through_the_window() {
+        // 返回点已按预算裁过一次并带上引用；进上下文时同一条界不能再裁一次，
+        // 那一次会把标记连同引用一起砍掉。两处必须用同一个预算。
+        let mut ctx = ContextWindow::new(400);
+        let budget = ctx.tool_result_budget_chars();
+        ctx.add_message(Message::assistant(vec![cog_core::ContentBlock::tool_call(
+            "call_ref",
+            "run_command",
+            serde_json::json!({"command": "dump"}),
+        )]));
+        let full = "y".repeat(5000);
+        let truncated = truncate_to_chars(&full, budget, Some("artifact://default/ref-1"));
+        ctx.add_message(Message::tool_result_text(
+            "call_ref",
+            "run_command",
+            &truncated,
+        ));
+        let kept = ctx.messages().last().unwrap().content();
+        assert!(
+            kept.contains("artifact://default/ref-1"),
+            "二次裁剪不得把引用砍掉: {kept}"
+        );
     }
 }

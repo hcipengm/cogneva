@@ -77,6 +77,7 @@
     "COGNEVA_AGENT_LOOP_CONTEXT_WINDOW_SIZE": "agent_loop.context_window_size",
     "COGNEVA_AGENT_LOOP_ROLE": "agent_loop.role",
     "COGNEVA_AGENT_LOOP_SKILL_CACHE_TTL_SECS": "agent_loop.skill_cache_ttl_secs",
+    "COGNEVA_MEMORY_API_BASE": "agent_loop.memory_api_base",
     "COGNEVA_SELF_EVOLUTION_ENABLED": "self_evolution.enabled",
     "COGNEVA_SELF_EVOLUTION_AUTO_APPLY": "self_evolution.auto_apply",
     "COGNEVA_SELF_EVOLUTION_AUTO_DEPLOY": "self_evolution.auto_deploy",

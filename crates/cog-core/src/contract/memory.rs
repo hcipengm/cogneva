@@ -120,6 +120,56 @@ impl SourceRef {
 /// same store.
 pub const DEFAULT_MEMORY_NAMESPACE: &str = "default";
 
+/// The reference a caller carries to reach an archived raw source: the namespace
+/// it landed in and its id.
+///
+/// One spelling for every producer of the reference, so a reader parsing it back
+/// matches one grammar rather than one per writer.
+pub fn artifact_uri(namespace: &str, id: &str) -> String {
+    format!("artifact://{namespace}/{id}")
+}
+
+/// The raw id of one tool output: the task, the turn it was produced in, and its
+/// position among that turn's tool calls.
+///
+/// Both numbers are zero-padded so lexicographic order is chronological -- a
+/// prefix listing of a task's outputs reads back in the order they happened,
+/// which is what "everything this task saw, in order" asks for. The two numbers
+/// travel inside one segment rather than as two path segments because a
+/// separator in a raw id turns into a directory in the object store and the
+/// source silently vanishes from every listing that would have counted it (see
+/// [`raw_id_key_error`]).
+///
+/// The task id is folded into that one segment too, and the fold has to be a
+/// substitution rather than the id itself: a task id is free text by the time it
+/// reaches here, and one carrying a separator would make the whole id
+/// unaddressable -- the write would be refused at the API and the output would
+/// be lost with only a failure count to show for it. The characters
+/// [`raw_id_key_error`] refuses are replaced instead of the write being skipped,
+/// because a lossy id is still a reachable archive and a refused one is not.
+pub fn tool_output_raw_id(task_id: &str, turn: u32, frame: u32) -> String {
+    let key: String = task_id
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | '\0' => '_',
+            other => other,
+        })
+        .collect();
+    let key = if key.is_empty() { "task" } else { &key };
+    format!("{key}-{turn:04}-{frame:04}")
+}
+
+/// The env name a deployment sets to name the platform memory API base.
+///
+/// Business pods hold no credentials and reach the platform through the gateway;
+/// this is where the gateway is, the memory-API analogue of the code-platform
+/// base the landing channel reads. Named once here so the writer and the
+/// deployment that sets it cannot drift apart.
+pub const MEMORY_API_BASE_ENV: &str = "COGNEVA_MEMORY_API_BASE";
+
+/// The path the memory API archives a raw source at, relative to its base.
+pub const MEMORY_INGEST_PATH: &str = "/api/v1/memory/ingest";
+
 /// Layer 0 — Raw Sources.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RawSource {
