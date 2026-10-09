@@ -133,6 +133,12 @@ metric_names! {
     MEMORY_UNEXTRACTED_RAW => "memory_unextracted_raw",
     MEMORY_UNEXTRACTED_RAW_AGED_OUT => "memory_unextracted_raw_aged_out",
     MEMORY_UNEXTRACTED_SCAN_FAILED => "memory_unextracted_scan_failed",
+    // The stock of sources the ingest path has permanently given up on: each
+    // one left the backlog and will never be re-driven. It is the stock that
+    // pairs with the `dlq_written` operation cell, which counts only arrivals
+    // -- without it nothing states how much has accumulated, and a count that
+    // only ever rises is invisible on the rate.
+    MEMORY_DEAD_LETTER_RAW => "memory_dead_letter_raw",
     // cog-memory — how each pass of the decay maintenance loop ended, labelled
     // by `outcome`, one cell per namespace swept per pass. See the HELP for the
     // closed set and why the cell is a pass rather than an entry count.

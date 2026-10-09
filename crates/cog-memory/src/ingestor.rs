@@ -190,6 +190,11 @@ struct UnextractedScan {
     /// 同一类欠账的**总条数**，含本拍因批量上限没取的那部分。报的是欠了多少，
     /// 不是这一拍还了多少。
     aged_out_total: usize,
+    /// 死信里已经放弃的**存量**。这一拍为了把已判死的 raw 挡在欠账之外，本来
+    /// 就要把死信命名空间全量列一遍，这个 `len()` 是顺手的事实；此前它被算出来
+    /// 又丢掉，于是「丢了多少」（`dlq_written` 那一格）有读数、**「还剩多少」没有**。
+    /// 存量只增不减，写速率上永远看不出来。
+    dead_letter_total: usize,
 }
 
 impl UnextractedScan {
@@ -1344,7 +1349,7 @@ impl MemoryIngestor {
                 }
             }
             Err(e) => {
-                // 扫描取不到数时两个积压读数都不盖（它们只在拿到结果时才
+                // 扫描取不到数时积压与存量读数都不盖（它们只在拿到结果时才
                 // 有值），所以「读不出来」必须自己成一条读数：没有它，冻结
                 // 的值会让读它的规则在伴生钟上把「扫不动」当成「写者停了」
                 // 而静默，积压清没清就分不出来。每一次尝试都盖一格。
@@ -1356,7 +1361,7 @@ impl MemoryIngestor {
 
     /// 发布「这一次对账扫描有没有拿到结果」。
     ///
-    /// 两个积压 gauge 只在 `Ok(scan)` 分支盖章，所以一次失败的扫描会让它们
+    /// 那三个 gauge 只在 `Ok(scan)` 分支盖章，所以一次失败的扫描会让它们
     /// 停在上一笔健康值上，而读 `_aged_out` 的规则按伴生钟年龄判写者死活——
     /// 冻住的伴生钟把规则静默。这一格就是那件事自己的读数：拿到结果记 0、
     /// 取不到记 1，每一次尝试都写。
@@ -1420,18 +1425,25 @@ impl MemoryIngestor {
         }
     }
 
-    /// 发布积压观测。两个 gauge 是两件事、两个决定，不合并成一个标量：
+    /// 发布积压观测。三个 gauge 是三件事、三个决定，不合并成一个标量：
     /// `memory_unextracted_raw` 是全部还欠着抽取的 raw（无时间窗），
     /// `memory_unextracted_raw_aged_out` 是其中已经老过重驱动窗、只能按每拍批量
-    /// 还的那部分。合并会掩盖后者——它永远小于全量，而全量随断供时长一起涨，
-    /// 一个"总量"读数分不出"正在排空"与"排不动"。
-    /// 没有指标面时只记日志：观测缺席不该让对账这一步失败。
+    /// 还的那部分，`memory_dead_letter_raw` 是已经放弃、不再算欠账的那部分存量
+    /// （方向与前面两个相反：它只会涨）。合并会掩盖中间那个——它永远小于全量，
+    /// 而全量随断供时长一起涨，一个"总量"读数分不出"正在排空"与"排不动"。
+    ///
+    /// 前两个值取自扫描结果，第三个取自扫描里本来就要列一遍的死信命名空间——
+    /// 同一份列表顺手得出，不是新开一次扫描。三者盖章都只在扫描成功那一次，
+    /// 失败面是 [`Self::report_scan_outcome`]：它每一次尝试都盖一格，所以「扫不动」
+    /// 与「存量真的是 0」在读数上分得开。没有指标面时只记日志：观测缺席不该让
+    /// 对账这一步失败。
     async fn report_unextracted(&self, scan: &UnextractedScan) {
         let Some(metrics) = self.metrics.as_ref() else {
             debug!(
-                "Memory ingest reconcile: {} unextracted raw sources ({} beyond the re-drive window)",
+                "Memory ingest reconcile: {} unextracted raw sources ({} beyond the re-drive window, {} given up in the dead letter namespace)",
                 scan.total(),
-                scan.aged_out_total
+                scan.aged_out_total,
+                scan.dead_letter_total
             );
             return;
         };
@@ -1440,6 +1452,10 @@ impl MemoryIngestor {
             (
                 cog_core::metric_names::MEMORY_UNEXTRACTED_RAW_AGED_OUT,
                 scan.aged_out_total,
+            ),
+            (
+                cog_core::metric_names::MEMORY_DEAD_LETTER_RAW,
+                scan.dead_letter_total,
             ),
         ] {
             if let Err(e) = metrics
@@ -1476,6 +1492,7 @@ impl MemoryIngestor {
             .filter_map(|e| raw_id_from_uri(&e.source_ref.raw_uri))
             .collect();
         let diagnosed = self.terminally_diagnosed_ids().await?;
+        let dead_letter_total = diagnosed.len();
         let cutoff = chrono::Utc::now()
             - chrono::Duration::hours(self.config.reconcile_lookback_hours as i64);
         let mut actionable = Vec::new();
@@ -1509,6 +1526,7 @@ impl MemoryIngestor {
             actionable,
             aged_out_due,
             aged_out_total,
+            dead_letter_total,
         })
     }
 
@@ -3468,6 +3486,13 @@ mod tests {
             Some(1.0),
             "the backlog gauge must be published even while the upstream is down"
         );
+        assert_eq!(
+            metrics.latest("memory_dead_letter_raw"),
+            Some(0.0),
+            "the dead-letter stock rides the same scan and must be published before the gate is \
+             read: stamping it after the gate would make a shut gate and an empty namespace the \
+             same reading"
+        );
         assert!(
             job_rx.try_recv().is_err(),
             "a closed gate must not enqueue work the upstream cannot serve"
@@ -3476,7 +3501,7 @@ mod tests {
 
     /// 每次尝试都盖一格结局：成功的对账把它写回 0，取不到数的那一次写 1。
     ///
-    /// 两个积压 gauge 只在 `Ok(scan)` 分支盖章，所以扫描失败时它们停在上一笔
+    /// 那三个 gauge 只在 `Ok(scan)` 分支盖章，所以扫描失败时它们停在上一笔
     /// 值上——读 `_aged_out` 的规则按伴生钟年龄在界内还信它。这一格必须在两条
     /// 路径上都被写：只写失败的实现会让健康期没有读数（伴生钟不存在，规则反而
     /// 常静），只写成功的实现正是它要修的那个形状。
@@ -3500,8 +3525,9 @@ mod tests {
         assert_eq!(
             metrics.latest("memory_unextracted_scan_failed"),
             Some(1.0),
-            "a scan that could not be completed is the reading the two backlog \
-             gauges cannot carry"
+            "a scan that could not be completed is the reading the backlog and \
+             stock gauges cannot carry -- their frozen values would speak for a \
+             scan that never answered"
         );
     }
 
@@ -3620,6 +3646,49 @@ mod tests {
              in front of the one that can"
         );
         assert_eq!(metrics.latest("memory_unextracted_raw_aged_out"), Some(0.0));
+        assert_eq!(
+            metrics.latest("memory_dead_letter_raw"),
+            Some(1.0),
+            "what was given up must be readable as a stock: the arrival count alone only rises"
+        );
+    }
+
+    /// 存量量的是死信命名空间本身，不是「这拍挡掉了多少条欠账」。
+    ///
+    /// 两者的差别在一条没有对应 raw 的死信记录上显形——那种记录一条欠账也挡不掉，
+    /// 但它确实已经被放弃了，仍在存量里。取「挡掉了几条」写读数会让这个数随
+    /// 积压的形状起伏，而它要回答的是「一共丢了多少」。
+    #[tokio::test]
+    async fn the_dead_letter_stock_counts_the_namespace_not_what_it_excluded() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        backend
+            .archive_raw(&RawSource::new(
+                "dlq-orphan-with-no-raw".to_string(),
+                "dlq",
+                "ingestion/failed",
+                b"{}".to_vec(),
+            ))
+            .await
+            .unwrap();
+
+        let metrics = Arc::new(RecordingMetrics::default());
+        let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(RuleBasedExtractor::new()))
+            .with_metrics(metrics.clone());
+
+        let (job_tx, _job_rx) = mpsc::unbounded_channel();
+        let backlog = std::sync::atomic::AtomicUsize::new(0);
+        ingestor.reconcile(&job_tx, &backlog, true).await;
+
+        assert_eq!(
+            metrics.latest("memory_dead_letter_raw"),
+            Some(1.0),
+            "a dead letter with no raw behind it still counts: the stock is the namespace"
+        );
+        assert_eq!(
+            metrics.latest("memory_unextracted_raw_aged_out"),
+            Some(0.0),
+            "and it excluded no debt, which is why the two cannot be the same number"
+        );
     }
 
     /// 补驱动按每拍批量走：一次长断供恢复后欠账可能有成千条，一次性塞进队列会把

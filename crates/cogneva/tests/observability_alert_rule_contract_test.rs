@@ -1619,6 +1619,12 @@ fn a_rule_guarding_the_index_sample_waits_longer_than_its_heartbeat() {
 /// dropped rule shows up as an empty denominator rather than a green count.
 #[test]
 fn a_pass_outcome_rule_is_guarded_on_the_same_horizon_as_its_sibling() {
+    // A series can only be named here once a rule reads it -- the assertion below
+    // requires a bound on both halves. So a value reading that freezes on a pass
+    // outcome stays out of this table until its rule lands, and that rule's author
+    // is the one who must add it. `memory_dead_letter_raw` is such a series today:
+    // its obligation is written into its UNREAD entry, which landing the rule
+    // forces them to remove.
     let pairs = [
         (
             cog_core::metric_names::MEMORY_UNEXTRACTED_SCAN_FAILED.as_str(),
@@ -1985,6 +1991,22 @@ const UNREAD: &[(&str, Unread)] = &[
             readers: &["memory_unextracted_raw_aged_out"],
             reason: "the past-the-window subset is read by memory_raw_backlog_aged_out; this is its denominator",
         },
+    ),
+    // The stock the siblings above deliberately exclude: raw sources the ingest
+    // path has permanently given up on. It pairs with the `dlq_written` cell of
+    // `memory_operations_total`, which counts arrivals only -- a count that only
+    // ever rises says nothing on a rate, so without this nobody can state how
+    // much has accumulated. The number was always computed (the scan lists the
+    // dead-letter namespace to keep diagnosed raw out of the backlog) and thrown
+    // away; publishing it is free and needs no second pass. What keeps it a debt
+    // is a bound rather than a reader: nothing prunes this namespace, so a rule
+    // would have to declare how much stock is too much, and that is a reclaim
+    // policy -- and reclaim is not "delete the record", because the backlog
+    // exclusion is derived from these very records, so a deletion moves its raw
+    // back into the debt on the next pass.
+    (
+        "memory_dead_letter_raw",
+        Unread::Gap("the stock of raw the ingest path has given up on. Nothing prunes the dead-letter namespace, so a rule would have to declare how much stock is too much, and that is a reclaim policy nobody has stated -- and reclaim cannot be a deletion, since the backlog exclusion is derived from these records and removing one sends its raw back into the debt on the next pass. Removing this entry means a rule now reads the series, and that rule carries an obligation this table cannot state mechanically while the entry is here: the stock freezes on exactly the outcome the sibling backlog readings freeze on, so its age bound must be the same one memory_unextracted_scan_failed is guarded on -- and the pair must be added to a_pass_outcome_rule_is_guarded_on_the_same_horizon_as_its_sibling, which today asserts a non-empty bound for both halves and so cannot name a series with no rule yet"),
     ),
     (
         "memory_operation_latency_ms",

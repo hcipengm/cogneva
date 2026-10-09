@@ -604,14 +604,37 @@ const GAUGE_HELP: &[(&str, &str)] = &[
     ),
     (
         "memory_unextracted_scan_failed",
-        "Whether the last reconcile scan could not be completed, 1 or 0. The \
-         two backlog readings above are stamped only once the scan returns a \
+        "Whether the last reconcile scan could not be completed, 1 or 0. Every \
+         reading that scan publishes is stamped only once it returns a \
          result, so a scan that fails leaves them at their last, healthy value \
          while the rule over the aged-out one goes on trusting them until its \
          age bound closes it -- an unreadable backlog and a cleared one then \
          look the same. This is the reading that says the scan itself did not \
          answer; it is written on every attempt, so a scan that completes \
          keeps it at 0",
+    ),
+    (
+        "memory_dead_letter_raw",
+        "Archived raw sources the ingest path has permanently given up on: each \
+         one was diagnosed unextractable, moved to the dead-letter namespace, \
+         and will not be picked up again. It is the stock that pairs with the \
+         dlq_written cell on memory_operations_total, which counts only \
+         arrivals -- a count that never falls cannot be seen on a rate, and \
+         this is the other half. A standing stock is not a fault and no \
+         threshold is declared for it: content that cannot be read is an \
+         outcome the extraction path is expected to meet, so a rule on this \
+         value would fire every time the reading is fresh. What a growing stock \
+         does say is how much has accumulated, which is what decides whether \
+         the dead-letter namespace needs reclaiming at all. Reclaiming is not \
+         simply deleting: the backlog excludes these sources because their \
+         dead-letter record exists, so removing a record puts its raw back into \
+         the debt on the next scan -- re-driven, re-diagnosed and re-written. \
+         It is a gauge and not a counter, and like the sibling backlog readings it \
+         is stamped only once a scan returns, so a scan that fails leaves it at \
+         its last value; a zero on that scan is not the same fact as no scan at \
+         all, and the pair that tells them apart is this series' \
+         _observed_timestamp_seconds companion together with \
+         memory_unextracted_scan_failed, which is written on every attempt",
     ),
     (
         "metrics_samples_rows",
