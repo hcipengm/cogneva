@@ -434,18 +434,23 @@ impl MemoryBackend for CompositeMemoryBackend {
                 .collect();
             // No embedder: every candidate is a substring hit, so importance is
             // the only ordering signal — the same prior the dense branch gets
-            // from the weighted summary search.
+            // from the weighted summary search. The id key is what actually makes
+            // the order defined; equal scores alone would leave it to iteration.
             summary_results.sort_by(|a, b| {
-                let score_a = match a {
-                    UnifiedSearchResult::Summary(s) => s.score,
-                    _ => 0.0,
+                let key_a = match a {
+                    UnifiedSearchResult::Summary(s) => {
+                        cog_core::rank_key(1.0, s.entry.importance, &s.entry.id)
+                    }
+                    _ => (0.0, 0.0, ""),
                 };
-                let score_b = match b {
-                    UnifiedSearchResult::Summary(s) => s.score,
-                    _ => 0.0,
+                let key_b = match b {
+                    UnifiedSearchResult::Summary(s) => {
+                        cog_core::rank_key(1.0, s.entry.importance, &s.entry.id)
+                    }
+                    _ => (0.0, 0.0, ""),
                 };
-                score_b
-                    .partial_cmp(&score_a)
+                key_b
+                    .partial_cmp(&key_a)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             results.extend(summary_results);

@@ -339,21 +339,26 @@ impl SummaryBackend for VectorSummaryBackend {
                     .as_ref()
                     .is_none_or(|(start, end)| e.generated_at >= *start && e.generated_at <= *end)
             }) {
-                out.push(SummarySearchResult::new(
-                    entry.clone(),
-                    cog_core::importance_weighted_score(vr.score, entry.importance),
+                out.push((
+                    cog_core::rank_key(vr.score, entry.importance, &entry.id),
+                    SummarySearchResult::new(
+                        entry.clone(),
+                        cog_core::importance_weighted_score(vr.score, entry.importance),
+                    ),
                 ));
             }
         }
         // The vector store ranked this candidate set by raw similarity; the
         // importance weight can re-order it, so the recalled set is ranked again
-        // by the weighted score before it is returned.
-        out.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
+        // before it is returned — by the full key, since the weighted score
+        // flattens every non-positive similarity onto one value and would leave
+        // their order to the order the store handed the candidates over in.
+        out.sort_by(|(key_a, _), (key_b, _)| {
+            key_b
+                .partial_cmp(key_a)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        Ok(out)
+        Ok(out.into_iter().map(|(_, result)| result).collect())
     }
 
     async fn summary_for_raw(&self, namespace: &str, raw_id: &str) -> SFResult<Vec<SummaryEntry>> {
@@ -431,21 +436,26 @@ impl SummaryBackend for VectorSummaryBackend {
                     .as_ref()
                     .is_none_or(|(start, end)| e.generated_at >= *start && e.generated_at <= *end)
             }) {
-                out.push(SummarySearchResult::new(
-                    entry.clone(),
-                    cog_core::importance_weighted_score(vr.score, entry.importance),
+                out.push((
+                    cog_core::rank_key(vr.score, entry.importance, &entry.id),
+                    SummarySearchResult::new(
+                        entry.clone(),
+                        cog_core::importance_weighted_score(vr.score, entry.importance),
+                    ),
                 ));
             }
         }
         // The vector store ranked this candidate set by raw similarity; the
         // importance weight can re-order it, so the recalled set is ranked again
-        // by the weighted score before it is returned.
-        out.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
+        // before it is returned — by the full key, since the weighted score
+        // flattens every non-positive similarity onto one value and would leave
+        // their order to the order the store handed the candidates over in.
+        out.sort_by(|(key_a, _), (key_b, _)| {
+            key_b
+                .partial_cmp(key_a)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        Ok(out)
+        Ok(out.into_iter().map(|(_, result)| result).collect())
     }
 
     async fn update_summary(&self, _namespace: &str, entry: &SummaryEntry) -> SFResult<()> {

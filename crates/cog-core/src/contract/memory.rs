@@ -43,13 +43,46 @@ pub fn importance_from_rating(rating: u8) -> f32 {
 /// related to this query", and importance must not lift such an entry by
 /// scaling a negative number toward zero — the clamp maps the whole
 /// anti-correlated half to `0.0`, so importance can only ever *demote* within
-/// the related half, never promote the unrelated half. Because importance is a
-/// pure multiplier, entries of equal importance keep their similarity order:
-/// the weighted ranking only re-orders entries whose importance differs.
+/// the related half, never promote the unrelated half. Within the related half
+/// importance is a pure multiplier, so entries of equal importance keep their
+/// similarity order; the unrelated half is a flat zero, and its order is
+/// whatever [`rank_key`] decides.
+///
+/// Importance is a weight, so its floor is the one value that makes an entry
+/// unrankable: everything it could score is multiplied by zero and it sinks
+/// below every entry that is both related and rated. That follows from the
+/// declared `0.0..=1.0` range rather than from a filter — an entry is ranked,
+/// not withheld — and the paths that *rate* entries keep a floor of their own
+/// (see [`importance_from_rating`]), so a zero is something a caller states
+/// rather than something a producer drifts into.
 pub fn importance_weighted_score(similarity: f32, importance: f32) -> f32 {
     // `f32::max` returns the non-NaN operand, so a NaN similarity becomes 0.0
     // rather than propagating a NaN score into every downstream comparison.
     similarity.max(0.0) * importance
+}
+
+/// The order a ranked result set sorts by, most significant first: the weighted
+/// score, the raw similarity, then the entry id.
+///
+/// The last two keys are not conveniences. [`importance_weighted_score`] maps the
+/// whole non-positive half onto one score, so the score alone cannot order the
+/// unrelated entries at the end of a result set — they would come back in
+/// whatever order the store handed them over in, and a map's iteration order is
+/// per-process, so a stable sort preserves *that*. The same query then answers
+/// differently between runs, and where a truncated list ends inside the flat
+/// zero the returned *set* differs too, not just its order. Keeping the raw
+/// similarity as the second key makes the ranking monotone in similarity
+/// throughout, which is what "equal importance keeps its similarity order"
+/// means once the clamp is in play.
+///
+/// A candidate set with no similarity of its own (a flat substring match) passes
+/// `1.0` for every member, so the second key ties and the id decides.
+pub fn rank_key(similarity: f32, importance: f32, id: &str) -> (f32, f32, &str) {
+    (
+        importance_weighted_score(similarity, importance),
+        similarity,
+        id,
+    )
 }
 
 /// A pointer back to the raw source that produced a schema or summary entry.
@@ -845,6 +878,32 @@ mod tests {
         assert_eq!(importance_weighted_score(-0.3, 1.0), 0.0);
         assert_eq!(importance_weighted_score(-0.3, 0.1), 0.0);
         assert!(importance_weighted_score(-0.3, 1.0) < importance_weighted_score(0.05, 0.1));
+    }
+
+    /// The score alone is not a total order: everything at or below zero scores
+    /// the same, so a sort on it leaves that half in whatever order it arrived
+    /// in. The key has to keep the similarity underneath it.
+    #[test]
+    fn the_rank_key_orders_the_half_the_score_flattens() {
+        let q = rank_key(-0.1, 0.5, "b");
+        let p = rank_key(-0.9, 0.5, "a");
+        assert_eq!(q.0, p.0, "both are on the flat zero the clamp produces");
+        assert!(q > p, "the less anti-correlated entry still ranks first");
+    }
+
+    /// Two entries the score *and* the similarity leave tied, which is the state
+    /// every flat substring match is in, still come out in a fixed order.
+    #[test]
+    fn the_rank_key_breaks_a_full_tie_on_the_id() {
+        assert!(rank_key(1.0, 0.5, "a") < rank_key(1.0, 0.5, "b"));
+    }
+
+    /// A zero weight is the bottom of the ranking, not a removal: the entry is
+    /// still returned, still carrying its own similarity.
+    #[test]
+    fn a_zero_weight_scores_the_floor_and_still_ranks_below_nothing_else() {
+        assert_eq!(importance_weighted_score(1.0, 0.0), 0.0);
+        assert!(importance_weighted_score(0.05, 0.1) > importance_weighted_score(1.0, 0.0));
     }
 
     #[test]

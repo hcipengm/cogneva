@@ -160,10 +160,12 @@ impl SchemaBackend for MemorySchemaBackend {
             .collect();
         // Substring hits all have similarity 1.0, so the importance weight is
         // what orders them — matching the in-memory backend and the summary
-        // ranking — and it replaces map iteration order with a defined one.
+        // ranking — and the id key replaces map iteration order with a defined
+        // one. The score alone cannot: equal scores would leave the order to the
+        // order the map happened to hand them over in.
         results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
+            cog_core::rank_key(1.0, b.entry.importance, &b.entry.id)
+                .partial_cmp(&cog_core::rank_key(1.0, a.entry.importance, &a.entry.id))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         results.truncate(limit);

@@ -141,10 +141,15 @@ impl RerankerProvider for FastEmbedRerankerProvider {
             })
             .collect();
 
+        // The position the model returned is a total tie-break: scores come back
+        // as floats and ties are common at the bottom of a candidate list, where
+        // an undefined order would make the cut at `top_n` pick a different set
+        // between runs.
         ranked.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.index.cmp(&b.index))
         });
         ranked.truncate(top_n);
         Ok(ranked)

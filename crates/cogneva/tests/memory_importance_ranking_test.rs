@@ -88,6 +88,98 @@ async fn an_anti_correlated_entry_is_never_promoted_by_importance() {
     assert_eq!(results[1].score, 0.0, "an unrelated entry scores zero");
 }
 
+/// The clamp maps every non-positive similarity onto one score, so the score
+/// alone does not order that half. The ranking key keeps the raw similarity as
+/// its second key, which is what makes these three come back in similarity
+/// order rather than in whatever order the store happened to hand them over in.
+#[tokio::test]
+async fn the_unrelated_half_comes_back_in_similarity_order() {
+    let backend = MemoryMemoryBackend::new();
+    // Cosine against the query (1, 0, 0), exactly: -0.9, -0.1, and 0.0.
+    let unrelated = [
+        ("most-opposite", axis(-0.9, 0.435_889_9, 0.0)),
+        ("nearly-orthogonal", axis(-0.1, 0.994_987_5, 0.0)),
+        ("orthogonal", axis(0.0, 1.0, 0.0)),
+    ];
+    for (id, embedding) in &unrelated {
+        backend
+            .store_summary("default", &summary(id, embedding.clone(), 0.5))
+            .await
+            .unwrap();
+    }
+    backend
+        .store_summary(
+            "default",
+            &summary("related", axis(0.2, 0.979_795_9, 0.0), 0.5),
+        )
+        .await
+        .unwrap();
+
+    let query = axis(1.0, 0.0, 0.0);
+    let order = |results: Vec<cog_core::SummarySearchResult>| {
+        results.into_iter().map(|r| r.entry.id).collect::<Vec<_>>()
+    };
+    let first = order(
+        backend
+            .search_summary("default", &query, 10, None)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        first,
+        vec![
+            "related",
+            "orthogonal",
+            "nearly-orthogonal",
+            "most-opposite"
+        ],
+        "the related entry leads, and the flat zero half keeps its similarity order"
+    );
+
+    // Same query over the same corpus: the order must not depend on the order
+    // the map happened to hand the entries over in.
+    let second = order(
+        backend
+            .search_summary("default", &query, 10, None)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(first, second, "a ranking must not vary between calls");
+}
+
+/// `importance` is a plain weight on a declared `0.0..=1.0` scale, so its floor
+/// is the one value that makes an entry unrankable: everything it could score is
+/// multiplied by zero. That is a consequence of the declared range rather than a
+/// hidden filter — the producers that *rate* entries keep a floor of their own
+/// (a rating of 1 out of 10), so reaching zero takes a caller passing it
+/// explicitly, and this test is what says so.
+#[tokio::test]
+async fn an_explicit_zero_importance_ranks_last_rather_than_disappearing() {
+    let backend = MemoryMemoryBackend::new();
+    // The zero-importance entry is the *exact* match for the query; the other is
+    // merely close. Importance still has to put it last.
+    backend
+        .store_summary("default", &summary("zero", axis(1.0, 0.0, 0.0), 0.0))
+        .await
+        .unwrap();
+    backend
+        .store_summary(
+            "default",
+            &summary("close", axis(0.9, 0.435_889_9, 0.0), 0.9),
+        )
+        .await
+        .unwrap();
+
+    let results = backend
+        .search_summary("default", &axis(1.0, 0.0, 0.0), 10, None)
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2, "a zero weight must not remove the entry");
+    assert_eq!(results[0].entry.id, "close");
+    assert_eq!(results[1].entry.id, "zero");
+    assert_eq!(results[1].score, 0.0);
+}
+
 #[tokio::test]
 async fn schema_search_ranks_by_importance() {
     let backend = MemoryMemoryBackend::new();

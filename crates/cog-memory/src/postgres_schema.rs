@@ -340,10 +340,13 @@ impl SchemaBackend for PostgresSchemaBackend {
         // Substring hits all score 1.0 on similarity, so importance is the only
         // ranking signal; ordering in SQL (not after the LIMIT) is what makes the
         // truncation keep the higher-rated facts rather than an arbitrary subset.
+        // The id is the tie-break for the same reason the in-memory rankings use
+        // it: equal importances would otherwise let the database return any of
+        // them, and which ones survive the LIMIT would follow that choice.
         let sql = format!(
             "SELECT {ENTRY_COLUMNS} FROM schema_entries \
              WHERE namespace = $1 AND (name ILIKE $2 OR key ILIKE $2) \
-             ORDER BY importance DESC \
+             ORDER BY importance DESC, id ASC \
              LIMIT $3"
         );
         let rows = sqlx::query(&sql)

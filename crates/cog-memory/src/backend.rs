@@ -178,11 +178,12 @@ impl cog_core::MemoryBackend for MemoryMemoryBackend {
             .collect();
         // Every candidate is a substring hit, so similarity is a full 1.0 and
         // the importance weight is what orders them — the same prior the
-        // summary ranking applies — and it makes the order deterministic where
-        // storing the entries in a map left it to iteration order.
+        // summary ranking applies — and the id key makes the order
+        // deterministic where storing the entries in a map left it to iteration
+        // order.
         results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
+            cog_core::rank_key(1.0, b.entry.importance, &b.entry.id)
+                .partial_cmp(&cog_core::rank_key(1.0, a.entry.importance, &a.entry.id))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         results.truncate(limit);
@@ -351,7 +352,10 @@ impl cog_core::MemoryBackend for MemoryMemoryBackend {
             .metrics
             .write()
             .map_err(|_| SFError::Agent("lock poisoned".into()))?;
-        let mut results: Vec<SummarySearchResult> = store
+        // Ranked by similarity before the entries are turned into results: the
+        // score alone cannot order the non-positive half, and the raw similarity
+        // is not carried in a result.
+        let mut ranked: Vec<(f32, &SummaryEntry)> = store
             .summary
             .values()
             .filter(|e| {
@@ -360,20 +364,23 @@ impl cog_core::MemoryBackend for MemoryMemoryBackend {
                         e.generated_at >= *start && e.generated_at <= *end
                     })
             })
-            .map(|e| {
-                let similarity = Self::cosine_similarity(query_embedding, &e.embedding);
+            .map(|e| (Self::cosine_similarity(query_embedding, &e.embedding), e))
+            .collect();
+        ranked.sort_by(|(sim_a, a), (sim_b, b)| {
+            cog_core::rank_key(*sim_b, b.importance, &b.id)
+                .partial_cmp(&cog_core::rank_key(*sim_a, a.importance, &a.id))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        ranked.truncate(top_k);
+        let results: Vec<SummarySearchResult> = ranked
+            .into_iter()
+            .map(|(similarity, e)| {
                 SummarySearchResult::new(
                     e.clone(),
                     cog_core::importance_weighted_score(similarity, e.importance),
                 )
             })
             .collect();
-        results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        results.truncate(top_k);
         metrics.summary_searched += 1;
         Ok(results)
     }
@@ -461,8 +468,13 @@ impl cog_core::MemoryBackend for MemoryMemoryBackend {
             .map_err(|_| SFError::Agent("lock poisoned".into()))?;
         let query_lower = query.to_lowercase();
 
-        // Schema search (text match)
-        let mut results: Vec<UnifiedSearchResult> = store
+        // Two ranked groups, not one: the schema hits lead and the summary hits
+        // follow, which is the order `CompositeMemoryBackend` produces by
+        // concatenating the two layers' results. Each group is ranked by the key
+        // while its entries are still at hand — a result carries no similarity of
+        // its own — and the cut comes after the two are joined, so a schema hit
+        // can consume the whole budget.
+        let mut ranked: Vec<((f32, f32, &str), UnifiedSearchResult)> = store
             .schema
             .values()
             .filter(|e| {
@@ -471,32 +483,25 @@ impl cog_core::MemoryBackend for MemoryMemoryBackend {
                         || e.key.to_lowercase().contains(&query_lower))
             })
             .map(|e| {
-                UnifiedSearchResult::Schema(SchemaSearchResult {
+                let result = UnifiedSearchResult::Schema(SchemaSearchResult {
                     entry: e.clone(),
                     score: cog_core::importance_weighted_score(1.0, e.importance),
-                })
+                });
+                (cog_core::rank_key(1.0, e.importance, &e.id), result)
             })
             .collect();
-        // Rank the schema hits by their importance-weighted score, so the
-        // truncation below keeps the higher-rated facts rather than whichever
-        // ones map iteration happened to visit first.
-        results.sort_by(|a, b| {
-            let score_a = match a {
-                UnifiedSearchResult::Schema(s) => s.score,
-                _ => 0.0,
-            };
-            let score_b = match b {
-                UnifiedSearchResult::Schema(s) => s.score,
-                _ => 0.0,
-            };
-            score_b
-                .partial_cmp(&score_a)
+        ranked.sort_by(|(key_a, _), (key_b, _)| {
+            key_b
+                .partial_cmp(key_a)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        let mut results: Vec<UnifiedSearchResult> =
+            ranked.into_iter().map(|(_, result)| result).collect();
 
         // Summary search
-        if let Some(emb) = embedding {
-            let mut summaries: Vec<UnifiedSearchResult> = store
+        let mut ranked: Vec<((f32, f32, &str), UnifiedSearchResult)> = if let Some(emb) = embedding
+        {
+            store
                 .summary
                 .values()
                 .filter(|e| {
@@ -507,31 +512,18 @@ impl cog_core::MemoryBackend for MemoryMemoryBackend {
                 })
                 .map(|e| {
                     let similarity = Self::cosine_similarity(emb, &e.embedding);
-                    let score = cog_core::importance_weighted_score(similarity, e.importance);
-                    UnifiedSearchResult::Summary(SummarySearchResult::new(e.clone(), score))
+                    let result = UnifiedSearchResult::Summary(SummarySearchResult::new(
+                        e.clone(),
+                        cog_core::importance_weighted_score(similarity, e.importance),
+                    ));
+                    (cog_core::rank_key(similarity, e.importance, &e.id), result)
                 })
-                .collect();
-            summaries.sort_by(|a, b| {
-                let score_a = match a {
-                    UnifiedSearchResult::Summary(s) => s.score,
-                    _ => 0.0,
-                };
-                let score_b = match b {
-                    UnifiedSearchResult::Summary(s) => s.score,
-                    _ => 0.0,
-                };
-                score_b
-                    .partial_cmp(&score_a)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            results.extend(summaries);
+                .collect()
         } else {
             // No embedder: every candidate is a substring hit, so similarity is a
             // full 1.0 for all of them and the importance weight is what orders
-            // them — the same prior the dense branch applies. Sorting also makes
-            // the order deterministic, where storing summaries in a map left it
-            // to iteration order.
-            let mut summaries: Vec<UnifiedSearchResult> = store
+            // them — the same prior the dense branch applies.
+            store
                 .summary
                 .values()
                 .filter(|e| {
@@ -542,27 +534,21 @@ impl cog_core::MemoryBackend for MemoryMemoryBackend {
                         })
                 })
                 .map(|e| {
-                    UnifiedSearchResult::Summary(SummarySearchResult::new(
+                    let result = UnifiedSearchResult::Summary(SummarySearchResult::new(
                         e.clone(),
                         cog_core::importance_weighted_score(1.0, e.importance),
-                    ))
+                    ));
+                    (cog_core::rank_key(1.0, e.importance, &e.id), result)
                 })
-                .collect();
-            summaries.sort_by(|a, b| {
-                let score_a = match a {
-                    UnifiedSearchResult::Summary(s) => s.score,
-                    _ => 0.0,
-                };
-                let score_b = match b {
-                    UnifiedSearchResult::Summary(s) => s.score,
-                    _ => 0.0,
-                };
-                score_b
-                    .partial_cmp(&score_a)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            results.extend(summaries);
-        }
+                .collect()
+        };
+
+        ranked.sort_by(|(key_a, _), (key_b, _)| {
+            key_b
+                .partial_cmp(key_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        results.extend(ranked.into_iter().map(|(_, result)| result));
 
         results.truncate(top_k);
         Ok(results)
