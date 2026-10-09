@@ -229,6 +229,71 @@ impl std::fmt::Debug for MetricsSink {
     }
 }
 
+/// The metadata record that sits beside a change's `.diff`.
+///
+/// The queue is a directory and keeps no memory of its own: every change's
+/// status lived in a map a restart empties, so after a restart a `.diff` left
+/// over from a change that had already been judged and a brand new one were the
+/// same file, and the listing had to invent a status for both. The record is
+/// what makes them two different files on disk, and unlike the map it survives
+/// the process that wrote it. Shared by the writer (the engine, which knows the
+/// artifact's metadata the moment it is produced) and the readers here, so the
+/// path is spelled once.
+pub(crate) fn change_record_path(dir: &Path, artifact_id: &str) -> PathBuf {
+    dir.join(format!("{artifact_id}.json"))
+}
+
+/// The record of a change that has left the pending queue. Retired beside the
+/// `.diff` it describes, so the pair moves together and neither can be read
+/// alone.
+pub(crate) fn retired_change_record_path(dir: &Path, artifact_id: &str) -> PathBuf {
+    dir.join("retired").join(format!("{artifact_id}.json"))
+}
+
+/// Write a change's metadata record into `dir`.
+///
+/// Free rather than a method because the writer is the engine that produces the
+/// change (it holds the artifact's metadata the moment it has it) and the
+/// readers are here: both name the same path through
+/// [`change_record_path`], and one of them is not a `ChangePipeline`.
+/// Metadata only -- the artifact text stays where it is written.
+pub(crate) async fn write_record_file(dir: &Path, result: &EvolutionResult) -> SFResult<()> {
+    let path = change_record_path(dir, &result.artifact_id);
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            SFError::IO(format!(
+                "Failed to create change dir {}: {}",
+                parent.display(),
+                e
+            ))
+        })?;
+    }
+    let mut record = result.clone();
+    record.content.clear();
+    let text = serde_json::to_string(&record).map_err(SFError::Serialization)?;
+    tokio::fs::write(&path, text).await.map_err(|e| {
+        SFError::IO(format!(
+            "Failed to write change record {}: {}",
+            path.display(),
+            e
+        ))
+    })
+}
+
+/// The timestamp a change carries when no record states one.
+///
+/// A `.diff` written before the record mechanism existed has no creation time
+/// anywhere, and the alternatives are both worse than saying so: a timestamp
+/// taken from the file's own metadata is a claim the filesystem, not the
+/// change, is making (a copy or a restore rewrites it), and the moment of the
+/// read is a claim that changes every pass and orders the listing by when it
+/// was looked at. The minimum representable instant is not a time any change
+/// was made at; it sorts such a change behind every one whose record does
+/// state a time, which is the only ordering claim that follows from "no record
+/// knows".
+pub(crate) const UNKNOWN_CREATED_AT: chrono::DateTime<chrono::Utc> =
+    chrono::DateTime::<chrono::Utc>::MIN_UTC;
+
 impl ChangePipeline {
     pub fn new(
         project_root: impl Into<PathBuf>,
@@ -303,6 +368,16 @@ impl ChangePipeline {
     /// Scans `change_dir` for `.diff` files and treats each one as a unified diff.
     /// This survives process restarts better than the in-memory
     /// `EvolutionEngine` results map.
+    ///
+    /// Each change's state comes from the record beside it, which is the copy a
+    /// restart cannot lose; the resident index is consulted first only because
+    /// it is the same information without a read, and it is written through to
+    /// the record so the two cannot say different things. A `.diff` with no
+    /// record is not read as `CompileChecked`: nothing here knows what happened
+    /// to it, and calling it compiled is what let a change nobody had judged
+    /// look like one that had passed. Its status is the honest unknown, which
+    /// is still verified, and the verification's conclusion is written back so
+    /// the state is answered rather than left standing.
     pub async fn pending_changes(
         &self,
         engine: Option<&EvolutionEngine>,
@@ -337,31 +412,47 @@ impl ChangePipeline {
                 .to_string();
 
             // The engine knows this change's own status and the goal it was
-            // generated for; the directory alone knows neither.
-            let record = match engine {
+            // generated for, and holding it in memory is the same fact as the
+            // record on disk; the record is what answers when the engine does
+            // not know the change at all.
+            let resident = match engine {
                 Some(engine) => engine.get_result(&artifact_id).await,
                 None => None,
             };
-            let status = record
-                .as_ref()
-                .map(|r| r.status)
-                .unwrap_or(EvolutionStatus::CompileChecked);
+            let record = match resident {
+                Some(record) => Some(record),
+                None => self.read_change_record(&artifact_id).await,
+            };
+
+            let (status, description, created_at) = match record {
+                Some(record) => (
+                    record.status,
+                    if record.description.trim().is_empty() {
+                        format!("Code change from {}", path.display())
+                    } else {
+                        record.description
+                    },
+                    record.created_at,
+                ),
+                // A `.diff` written before the record existed. Nothing states
+                // when it was made, so nothing here claims a time for it: the
+                // sentinel says "not known" rather than inventing an instant
+                // from the file's own metadata.
+                None => (
+                    EvolutionStatus::Unrecorded,
+                    format!("Code change from {}", path.display()),
+                    UNKNOWN_CREATED_AT,
+                ),
+            };
 
             if !matches!(
                 status,
-                EvolutionStatus::CompileChecked | EvolutionStatus::AwaitingReview
+                EvolutionStatus::CompileChecked
+                    | EvolutionStatus::AwaitingReview
+                    | EvolutionStatus::Unrecorded
             ) {
                 continue;
             }
-
-            // The description becomes the landed commit's subject line, so it
-            // must carry the change's goal rather than the scratch file it was
-            // read from. After a restart the in-memory record is gone and the
-            // path is all that is left.
-            let description = record
-                .map(|r| r.description)
-                .filter(|d| !d.trim().is_empty())
-                .unwrap_or_else(|| format!("Code change from {}", path.display()));
 
             results.push(EvolutionResult {
                 kind: EvolutionKind::CodeChange,
@@ -369,13 +460,87 @@ impl ChangePipeline {
                 description,
                 content,
                 status,
-                created_at: chrono::Utc::now(),
+                created_at,
                 eval_summary: None,
             });
         }
 
         results.sort_by_key(|a| std::cmp::Reverse(a.created_at));
         Ok(results)
+    }
+
+    /// Write a change's metadata record beside its `.diff`.
+    ///
+    /// The record is the durable half of what the resident index holds: the
+    /// index is per-process and a restart empties it, so a change whose whole
+    /// state lives there stops existing the moment the process does.
+    pub async fn write_change_record(&self, result: &EvolutionResult) -> SFResult<()> {
+        write_record_file(&self.change_dir, result).await
+    }
+
+    /// Read a change's metadata record, from the pending queue or `retired/`.
+    ///
+    /// `retired/` is searched second for the same reason the artifact text is:
+    /// that is where a change goes once it lands or is refused, and its record
+    /// moves with it. A record that cannot be parsed is reported as absent
+    /// rather than as a record with defaulted fields -- a record whose contents
+    /// are unreadable states nothing, and defaulting it would put a fabricated
+    /// status back in the one place built to stop that.
+    pub async fn read_change_record(&self, artifact_id: &str) -> Option<EvolutionResult> {
+        let pending = change_record_path(&self.change_dir, artifact_id);
+        if let Ok(text) = tokio::fs::read_to_string(&pending).await {
+            if let Ok(record) = serde_json::from_str(&text) {
+                return Some(record);
+            }
+        }
+        let retired = retired_change_record_path(&self.change_dir, artifact_id);
+        tokio::fs::read_to_string(retired)
+            .await
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+    }
+
+    /// Every change record this queue can see, pending and retired, newest
+    /// first.
+    ///
+    /// This is the durable face a listing is built from. A change's record
+    /// outlives the process that produced it and stays with the artifact after
+    /// it leaves the queue, so a listing that reads it does not lose a change
+    /// when the resident index that used to carry it drops the entry.
+    pub async fn known_change_records(&self) -> Vec<EvolutionResult> {
+        let mut records: Vec<EvolutionResult> = Vec::new();
+        for dir in [self.change_dir.clone(), self.change_dir.join("retired")] {
+            let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+                continue;
+            };
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                if let Ok(text) = tokio::fs::read_to_string(&path).await {
+                    if let Ok(record) = serde_json::from_str(&text) {
+                        records.push(record);
+                    }
+                }
+            }
+        }
+        records.sort_by_key(|a| std::cmp::Reverse(a.created_at));
+        records
+    }
+
+    /// Whether a change's artifact has already left the pending queue.
+    ///
+    /// The condition a resident record may be dropped under. Dropping a record
+    /// is only safe once the artifact is out of the queue and its own record is
+    /// beside it: until then the index is the last thing holding that change's
+    /// state, and a drop would take the state with it.
+    pub fn artifact_is_retired(&self, artifact_id: &str) -> bool {
+        self.change_dir
+            .join("retired")
+            .join(format!("{artifact_id}.diff"))
+            .exists()
+            && retired_change_record_path(&self.change_dir, artifact_id).exists()
     }
 
     /// Read a change's diff text back from disk by `artifact_id`.
@@ -428,6 +593,24 @@ impl ChangePipeline {
         tokio::fs::rename(&from, &to).await.map_err(|e| {
             SFError::IO(format!("Failed to retire change {}: {}", from.display(), e))
         })?;
+
+        // The record moves with the change it describes. Left behind, it would
+        // keep a retired change in the pending listing, and the pair would
+        // disagree about which queue the change is in. A record that cannot
+        // move is not fatal to the retirement -- the artifact is out of the
+        // queue, which is what retirement is for -- but it is what
+        // `artifact_is_retired` refuses a record drop over, so it is named.
+        let record_from = change_record_path(&self.change_dir, artifact_id);
+        if record_from.exists() {
+            let record_to = retired_change_record_path(&self.change_dir, artifact_id);
+            if let Err(e) = tokio::fs::rename(&record_from, &record_to).await {
+                warn!(
+                    change_id = %artifact_id,
+                    error = %e,
+                    "Change retired but its record could not be moved with it"
+                );
+            }
+        }
 
         info!(
             change_id = %artifact_id,
@@ -3506,6 +3689,230 @@ index 1111111..2222222 100644
                 .join(format!("{id}.diff"))
                 .exists(),
             "变更要留在 retired/ 供事后取证，不是被删掉"
+        );
+    }
+
+    /// 队列是一份字节，记录是这份字节之外唯一还带着状态的东西。
+    fn written_record(
+        id: &str,
+        status: EvolutionStatus,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> EvolutionResult {
+        EvolutionResult {
+            kind: EvolutionKind::CodeChange,
+            artifact_id: id.to_string(),
+            description: format!("goal-{id}"),
+            content: String::new(),
+            status,
+            created_at,
+            eval_summary: None,
+        }
+    }
+
+    /// A `.diff` nobody wrote a record for has no state, and the queue says so
+    /// rather than calling it compiled. Inferring `CompileChecked` is what made a
+    /// leftover file indistinguishable from a change that had passed its gate.
+    #[tokio::test]
+    async fn a_change_with_no_record_is_offered_as_unrecorded() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        let pipeline = ChangePipeline::new(temp.path(), &change_dir, true);
+        tokio::fs::write(change_dir.join("leftover.diff"), "not a real diff\n")
+            .await
+            .unwrap();
+
+        let pending = pipeline.pending_changes(None).await.unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "unknown is still verified: refusing to guess the state must not take it out of the queue"
+        );
+        assert_eq!(pending[0].status, EvolutionStatus::Unrecorded);
+        assert_eq!(
+            pending[0].created_at, UNKNOWN_CREATED_AT,
+            "nothing knows when this was made, so nothing may claim an instant for it"
+        );
+    }
+
+    /// The record is what decides the state, and it decides it on its own -- the
+    /// resident index is only a copy the process happens to hold, and this
+    /// pipeline is given none here.
+    #[tokio::test]
+    async fn the_record_beside_a_change_decides_its_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        let pipeline = ChangePipeline::new(temp.path(), &change_dir, true);
+        tokio::fs::write(change_dir.join("judged.diff"), "not a real diff\n")
+            .await
+            .unwrap();
+
+        let made_at = chrono::Utc::now() - chrono::Duration::hours(3);
+        pipeline
+            .write_change_record(&written_record(
+                "judged",
+                EvolutionStatus::AwaitingReview,
+                made_at,
+            ))
+            .await
+            .unwrap();
+
+        let pending = pipeline.pending_changes(None).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].status, EvolutionStatus::AwaitingReview);
+        assert_eq!(pending[0].created_at, made_at);
+        assert_eq!(pending[0].description, "goal-judged");
+    }
+
+    /// A state that means "not to be worked on" keeps the change out of the
+    /// queue, which is what makes the record worth writing at all.
+    #[tokio::test]
+    async fn a_record_that_settles_a_change_keeps_it_out_of_the_queue() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        let pipeline = ChangePipeline::new(temp.path(), &change_dir, true);
+        tokio::fs::write(change_dir.join("settled.diff"), "not a real diff\n")
+            .await
+            .unwrap();
+        pipeline
+            .write_change_record(&written_record(
+                "settled",
+                EvolutionStatus::ValidationFailed,
+                chrono::Utc::now(),
+            ))
+            .await
+            .unwrap();
+
+        assert!(pipeline.pending_changes(None).await.unwrap().is_empty());
+        // The file is still there: retiring it is a separate decision, and the
+        // queue's silence about it is not the same as it being gone.
+        assert!(change_dir.join("settled.diff").exists());
+    }
+
+    /// Retirement moves the record with the artifact it describes. Left behind,
+    /// the record would keep a retired change in the pending listing, and the
+    /// two halves of the pair would disagree about which queue it is in.
+    #[tokio::test]
+    async fn retiring_a_change_moves_its_record_too() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        let pipeline = ChangePipeline::new(temp.path(), &change_dir, true);
+        let id = "task-2-def456";
+        tokio::fs::write(change_dir.join(format!("{id}.diff")), "not a real diff\n")
+            .await
+            .unwrap();
+        pipeline
+            .write_change_record(&written_record(
+                id,
+                EvolutionStatus::CompileChecked,
+                chrono::Utc::now(),
+            ))
+            .await
+            .unwrap();
+        assert!(!pipeline.artifact_is_retired(id), "not retired yet");
+
+        pipeline.retire_change(id, "corrupt patch").await.unwrap();
+
+        assert!(
+            !change_dir.join(format!("{id}.json")).exists(),
+            "the record may not stay in the pending queue describing a change that left it"
+        );
+        assert!(
+            change_dir
+                .join("retired")
+                .join(format!("{id}.json"))
+                .exists(),
+            "the record has to travel with the artifact"
+        );
+        assert!(pipeline.artifact_is_retired(id));
+        assert_eq!(
+            pipeline.read_change_record(id).await.map(|r| r.status),
+            Some(EvolutionStatus::CompileChecked),
+            "the retired record is still readable where the artifact is"
+        );
+    }
+
+    /// The guard under the drop of a resident record: only a change that is out
+    /// of the queue *and* has its record beside it may be forgotten, or the
+    /// index is the last thing holding the state and dropping it loses the state.
+    #[tokio::test]
+    async fn a_change_is_retired_only_with_both_halves_in_place() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        let retired = change_dir.join("retired");
+        tokio::fs::create_dir_all(&retired).await.unwrap();
+        let pipeline = ChangePipeline::new(temp.path(), &change_dir, true);
+
+        tokio::fs::write(retired.join("half.diff"), "not a real diff\n")
+            .await
+            .unwrap();
+        assert!(
+            !pipeline.artifact_is_retired("half"),
+            "the artifact alone leaves the state it was retired for unrecorded"
+        );
+
+        tokio::fs::write(retired.join("half.json"), "{}")
+            .await
+            .unwrap();
+        assert!(pipeline.artifact_is_retired("half"));
+
+        tokio::fs::write(change_dir.join("pending.json"), "{}")
+            .await
+            .unwrap();
+        assert!(
+            !pipeline.artifact_is_retired("pending"),
+            "a record still in the queue describes a change still in the queue"
+        );
+    }
+
+    /// The listing is built from the records, so it has to see both the ones
+    /// still in the queue and the ones that left it -- a listing that lost the
+    /// retired half would answer "no such change" for work that had just landed.
+    #[tokio::test]
+    async fn the_known_records_cover_the_queue_and_the_retired_half() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        let pipeline = ChangePipeline::new(temp.path(), &change_dir, true);
+
+        let older = chrono::Utc::now() - chrono::Duration::hours(2);
+        pipeline
+            .write_change_record(&written_record(
+                "waiting",
+                EvolutionStatus::Generated,
+                older,
+            ))
+            .await
+            .unwrap();
+        tokio::fs::write(change_dir.join("waiting.diff"), "not a real diff\n")
+            .await
+            .unwrap();
+        pipeline
+            .write_change_record(&written_record(
+                "gone",
+                EvolutionStatus::AwaitingReview,
+                chrono::Utc::now(),
+            ))
+            .await
+            .unwrap();
+        tokio::fs::write(change_dir.join("gone.diff"), "not a real diff\n")
+            .await
+            .unwrap();
+        pipeline.retire_change("gone", "landed").await.unwrap();
+
+        let known: Vec<String> = pipeline
+            .known_change_records()
+            .await
+            .into_iter()
+            .map(|r| r.artifact_id)
+            .collect();
+        assert_eq!(
+            known,
+            vec!["gone".to_string(), "waiting".to_string()],
+            "both halves, newest first"
         );
     }
 

@@ -123,6 +123,20 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_evolution_change_queue_poll_interval_seconds",
         "crates/cog-reflection/src/evolution_queue_readings.rs",
     ),
+    // The engine's in-memory index of code changes, against the number of
+    // change files the directory holds. Neither number is remarkable alone; the
+    // pair is the reading, and it is what states that the retirement path
+    // really drops what it retired. Published by any process whose engine
+    // exists rather than by the owner alone, because the index belongs to
+    // whichever process generates changes.
+    (
+        "cogneva_evolution_resident_results",
+        "crates/cog-reflection/src/evolution_queue_readings.rs",
+    ),
+    (
+        "cogneva_evolution_change_queue_files",
+        "crates/cog-reflection/src/evolution_queue_readings.rs",
+    ),
     // The apply/test flight. Neither of these is published by a task: the age is
     // derived from a stamp the flight leaves behind when the scrape arrives, and
     // the wall is a property of the process. The pair is what tells a

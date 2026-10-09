@@ -323,6 +323,14 @@ pub enum EvolutionStatus {
     /// 评估门否决：z-test 不显著或候选劣于基线（产物级进化 Reject /
     /// Inconclusive 终态）。
     Rejected,
+    /// A change sits in the queue with no record beside it saying what state it
+    /// reached. Every change is written together with a metadata record (see
+    /// `ChangePipeline::write_change_record`), so this status means the record
+    /// is missing -- the file was written before the record existed, or by a
+    /// writer that failed to leave one. It is not `CompileChecked`: nothing
+    /// checked this change, and reading a missing record as "compiled fine" is
+    /// the shape that let a leftover `.diff` be re-verified forever.
+    Unrecorded,
 }
 
 /// Result of an evolution attempt.

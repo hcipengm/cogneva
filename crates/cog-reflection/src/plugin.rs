@@ -2127,7 +2127,14 @@ async fn fail_and_retire_change(
         );
         let _ = engine.record_change_outcome(change_id, false, reason).await;
     }
-    retire_change_everywhere(pipeline, landing, change_id, reason).await;
+    retire_change_everywhere(
+        pipeline,
+        engine.evolution.as_ref(),
+        landing,
+        change_id,
+        reason,
+    )
+    .await;
 }
 
 /// Take a change out of both places it can be offered from again.
@@ -2140,6 +2147,7 @@ async fn fail_and_retire_change(
 /// can never land keeps being rebuilt.
 async fn retire_change_everywhere(
     pipeline: &crate::ChangePipeline,
+    evolution: Option<&Arc<crate::EvolutionEngine>>,
     landing: Option<&dyn cog_core::ChangeLanding>,
     change_id: &str,
     reason: &str,
@@ -2151,6 +2159,7 @@ async fn retire_change_everywhere(
             "Change could not be retired; it stays in the pending queue"
         );
     }
+    drop_resident_record(pipeline, evolution, change_id).await;
     if let Some(landing) = landing {
         if let Err(e) = landing.retire_unverified(change_id, reason).await {
             warn!(
@@ -2182,7 +2191,11 @@ async fn retire_change_everywhere(
 ///
 /// The entry is retired rather than deleted, so what was in the queue stays
 /// readable after the fact.
-async fn retire_landed_change(pipeline: &crate::ChangePipeline, change_id: &str) {
+async fn retire_landed_change(
+    pipeline: &crate::ChangePipeline,
+    evolution: Option<&Arc<crate::EvolutionEngine>>,
+    change_id: &str,
+) {
     if let Err(e) = pipeline
         .retire_change(change_id, "landed on the base branch")
         .await
@@ -2192,6 +2205,26 @@ async fn retire_landed_change(pipeline: &crate::ChangePipeline, change_id: &str)
             error = %e,
             "Change landed but could not be retired from the pending queue; it will be verified again next cycle"
         );
+    }
+    drop_resident_record(pipeline, evolution, change_id).await;
+}
+
+/// 产物退休之后，把常驻索引里那一格也丢掉。
+///
+/// 常驻索引只是队列的缓存，不是状态的事实来源——状态已经落在产物旁边的
+/// 元数据记录里、随产物一起挪进 `retired/`。所以这一格的寿命就是"产物还在
+/// 队列里"的寿命：产物退休了它就该跟着走，否则它只是把一份已经不活的状态
+/// 一直占在内存里（每生成一条代码变更就多一格，直到进程重启）。
+///
+/// 丢之前由 `retire_result` 自己再断言一次产物确实已在 `retired/`——顺序在这里
+/// 不靠调用方记得住：调用方多、每条路都可能失败，而这条断言只有一处。
+async fn drop_resident_record(
+    pipeline: &crate::ChangePipeline,
+    evolution: Option<&Arc<crate::EvolutionEngine>>,
+    change_id: &str,
+) {
+    if let Some(evolution) = evolution {
+        evolution.retire_result(pipeline, change_id).await;
     }
 }
 
@@ -2740,6 +2773,7 @@ async fn run_evolution_cycle_in(
         }
         retire_change_everywhere(
             pipeline,
+            engine.evolution.as_ref(),
             landing.map(|l| l.as_ref()),
             &change_id,
             &format!("the contribution rules refuse the change itself: {reason}"),
@@ -2932,7 +2966,8 @@ async fn consume_executed_change(
                     rev = %rev,
                     "Change landed on the base branch"
                 );
-                retire_landed_change(pipeline, &artifact.change_id).await;
+                retire_landed_change(pipeline, engine.evolution.as_ref(), &artifact.change_id)
+                    .await;
             }
             Err(e) => {
                 warn!(
@@ -3000,6 +3035,7 @@ async fn consume_executed_change(
                         .await;
                     retire_change_everywhere(
                         pipeline,
+                        engine.evolution.as_ref(),
                         Some(landing.as_ref()),
                         &artifact.change_id,
                         &format!("landing refused the change itself: {e}"),
@@ -3466,7 +3502,7 @@ mod tests {
             "the queue has to be offering this change, or the assertion below proves nothing"
         );
 
-        retire_landed_change(&pipeline, "chg-1").await;
+        retire_landed_change(&pipeline, None, "chg-1").await;
 
         assert!(
             pipeline.pending_changes(None).await.unwrap().is_empty(),
@@ -3583,6 +3619,7 @@ mod tests {
 
         retire_change_everywhere(
             &pipeline,
+            None,
             Some(&landing),
             "chg-1",
             "landing refused the change",

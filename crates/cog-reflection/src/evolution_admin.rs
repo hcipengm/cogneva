@@ -273,6 +273,22 @@ impl EvolutionAdminService {
             ),
         }
 
+        // The durable records, which are what a change leaves behind when it is
+        // retired. A retired change is out of the queue, so the scan above does
+        // not return it, and its resident entry is dropped once its artifact is
+        // retired -- this pass is what keeps it in the listing after that. The
+        // two sources above win where they overlap: they carry the richer
+        // record (the scan reads the diff text the listing summarizes, the
+        // engine knows the live status), and this one states metadata only.
+        let records = self.pipeline.known_change_records().await;
+        let known: std::collections::HashSet<String> =
+            results.iter().map(|r| r.artifact_id.clone()).collect();
+        for record in records {
+            if !known.contains(&record.artifact_id) {
+                results.push(record);
+            }
+        }
+
         results
     }
 
@@ -991,6 +1007,73 @@ mod tests {
         assert_eq!(events[0].id, "from-a-previous-process");
     }
 
+    /// 退休把变更挪出队列，也把常驻那一格丢掉；listing 若只读这两处，就会在变更
+    /// 刚落地的下一刻回答"没有这个变更"。它读的第三处是产物旁边那份记录——那是
+    /// 唯一在产物离开队列之后还留着的东西。
+    #[tokio::test]
+    async fn admin_service_lists_a_change_after_its_resident_entry_is_dropped() {
+        let registry = Arc::new(tokio::sync::RwLock::new(cog_core::SkillRegistry::new()));
+        let mut engine = crate::ReflectionEngine::new_in_memory(registry.clone());
+        let llm: Arc<dyn cog_core::LlmClient> = Arc::new(PlaceholderLlm);
+
+        let project_root = std::env::current_dir().unwrap();
+        let unique = uuid::Uuid::new_v4();
+        let change_dir = std::env::temp_dir().join(format!("cogneva-test-changes-{}", unique));
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        let evo = Arc::new(
+            crate::EvolutionEngine::new(llm, registry.clone(), None).with_change_dir(&change_dir),
+        );
+        engine.evolution = Some(evo.clone());
+
+        let id = "landed-change";
+        let record = crate::types::EvolutionResult {
+            kind: crate::types::EvolutionKind::CodeChange,
+            artifact_id: id.to_string(),
+            description: "goal landed".to_string(),
+            content: String::new(),
+            status: crate::types::EvolutionStatus::AwaitingReview,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+        };
+        tokio::fs::write(
+            change_dir.join(format!("{id}.diff")),
+            "--- a/x.txt\n+++ b/x.txt\n@@ -0,0 +1 @@\n+one\n",
+        )
+        .await
+        .unwrap();
+        let pipeline = crate::ChangePipeline::new(&project_root, &change_dir, false);
+        pipeline.write_change_record(&record).await.unwrap();
+        evo.register_result(record).await;
+
+        pipeline.retire_change(id, "landed").await.unwrap();
+        assert!(
+            evo.retire_result(&pipeline, id).await,
+            "the change has to be retired and recorded before the index may drop it"
+        );
+        assert!(evo.get_result(id).await.is_none(), "the index let it go");
+
+        let deployer = crate::EvolutionDeployer::new(
+            &project_root,
+            std::env::temp_dir().join(format!("cogneva-test-bin-{}", unique)),
+            std::env::temp_dir().join(format!("cogneva-test-backup-{}", unique)),
+        );
+        let admin =
+            crate::EvolutionAdminService::new(Arc::new(engine), pipeline, deployer, None, None);
+
+        let ids: Vec<String> = admin
+            .list_changes()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![id.to_string()],
+            "a change that just landed is the one thing a listing must not lose"
+        );
+    }
+
     /// The directory is the queue, and the engine is only an enrichment of it: a
     /// process with no LLM has no engine attached, and it still has a queue to
     /// list. Gating the scan on the engine would make the listing go blind in
@@ -1140,8 +1223,8 @@ mod tests {
         let unique = uuid::Uuid::new_v4();
         let change_dir = std::env::temp_dir().join(format!("cogneva-test-changes-{}", unique));
         tokio::fs::create_dir_all(&change_dir).await.unwrap();
-        // Seed a pending change file; the engine has no status record for it,
-        // so it surfaces as CompileChecked, not AwaitingReview.
+        // Seed a pending change file; neither the engine nor the directory has a
+        // status for it, so it surfaces as Unrecorded, not AwaitingReview.
         tokio::fs::write(
             change_dir.join("p1.diff"),
             "diff --git a/crates/x/src/lib.rs b/crates/x/src/lib.rs\n--- a/crates/x/src/lib.rs\n+++ b/crates/x/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n",

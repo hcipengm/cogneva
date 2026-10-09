@@ -18,6 +18,7 @@ use cog_core::{
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use crate::change_pipeline::write_record_file;
 use crate::types::{EvolutionKind, EvolutionResult, EvolutionStatus};
 
 /// What each prompt says when no prompt manager is wired into the engine.
@@ -192,25 +193,123 @@ impl EvolutionEngine {
 
     /// Update the status of an evolution result by `artifact_id`.
     /// Returns `true` if the result was found and updated.
+    ///
+    /// For a code change the new status is written through to the record beside
+    /// its `.diff`, so the state a restart reads back is this one rather than
+    /// whatever the index held before the change was judged. A change the index
+    /// does not know is still answered when its `.diff` is in the queue: the
+    /// conclusion is what resolves an unrecorded change, and leaving it in the
+    /// index alone would make "no record" the one state that never ends.
     pub async fn update_status(&self, artifact_id: &str, status: EvolutionStatus) -> bool {
-        let mut results = self.results.lock().await;
-        if let Some(r) = results.get_mut(artifact_id) {
-            let old = r.status;
-            r.status = status;
-            info!(
-                artifact_id = %artifact_id,
-                old_status = ?old,
-                new_status = ?status,
-                "Evolution result status updated"
+        let updated = {
+            let mut results = self.results.lock().await;
+            match results.get_mut(artifact_id) {
+                Some(r) => {
+                    let old = r.status;
+                    r.status = status;
+                    info!(
+                        artifact_id = %artifact_id,
+                        old_status = ?old,
+                        new_status = ?status,
+                        "Evolution result status updated"
+                    );
+                    Some(r.clone())
+                }
+                None => None,
+            }
+        };
+
+        match updated {
+            Some(record) if matches!(record.kind, EvolutionKind::CodeChange) => {
+                self.persist_record(&record).await;
+                true
+            }
+            Some(_) => true,
+            None => {
+                // Not in the index. A code change whose `.diff` is still in the
+                // queue has a state worth recording even though this process
+                // never generated it -- that is exactly the change whose record
+                // is missing, and the verification's conclusion is what fills it.
+                let path = self.change_dir.join(format!("{artifact_id}.diff"));
+                if !path.exists() {
+                    warn!(
+                        artifact_id = %artifact_id,
+                        "Evolution result not found for status update"
+                    );
+                    return false;
+                }
+                let record = EvolutionResult {
+                    kind: EvolutionKind::CodeChange,
+                    artifact_id: artifact_id.to_string(),
+                    description: String::new(),
+                    content: String::new(),
+                    status,
+                    created_at: crate::change_pipeline::UNKNOWN_CREATED_AT,
+                    eval_summary: None,
+                };
+                self.persist_record(&record).await;
+                true
+            }
+        }
+    }
+
+    /// Write `record` to the durable copy beside its change.
+    ///
+    /// A failure is logged, not propagated: the caller has already changed the
+    /// in-memory status and cannot undo it, and the record is rewritten on the
+    /// next update. What it costs is that a restart before the next update
+    /// reads the older status, which is the status the record had -- not a
+    /// wrong one.
+    async fn persist_record(&self, record: &EvolutionResult) {
+        if let Err(e) = write_record_file(&self.change_dir, record).await {
+            warn!(
+                artifact_id = %record.artifact_id,
+                error = %e,
+                "could not write the change record; the resident status stands alone until the next update"
             );
-            true
-        } else {
+        }
+    }
+
+    /// How many *code changes* the resident index holds.
+    ///
+    /// Only that kind is counted. The other artifacts are keyed by an id that is
+    /// stable per artifact, so the index holds one entry for each whether
+    /// anything reads it or not; a code change is generated under a fresh id
+    /// every time, so its entries are the ones the retirement path bounds and
+    /// the only ones that can accumulate. The number is published beside the
+    /// queue's file count, which is what turns "the index is remembering more
+    /// changes than exist" into a reading.
+    pub async fn resident_code_change_len(&self) -> usize {
+        self.results
+            .lock()
+            .await
+            .values()
+            .filter(|r| matches!(r.kind, EvolutionKind::CodeChange))
+            .count()
+    }
+
+    /// Drop an artifact's resident record.
+    ///
+    /// Only allowed once the artifact is out of the pending queue and its own
+    /// record sits beside it in `retired/`. The index is otherwise the last
+    /// thing holding that change's state, and this is the drop that would take
+    /// the state with it -- so the check is here rather than at the call site:
+    /// a caller that forgot it would lose the record in silence, and a record
+    /// that never moves is a leak this method exists to end.
+    pub async fn retire_result(&self, pipeline: &crate::ChangePipeline, artifact_id: &str) -> bool {
+        if !pipeline.artifact_is_retired(artifact_id) {
             warn!(
                 artifact_id = %artifact_id,
-                "Evolution result not found for status update"
+                "refusing to drop the resident record: the change is not retired yet"
             );
-            false
+            return false;
         }
+        let mut results = self.results.lock().await;
+        let dropped = results.remove(artifact_id).is_some();
+        if dropped {
+            debug!(artifact_id = %artifact_id, "resident evolution record retired");
+        }
+        dropped
     }
 
     /// Look one result up by `artifact_id`.
@@ -829,6 +928,23 @@ impl EvolutionEngine {
             created_at: Utc::now(),
             eval_summary: None,
         };
+
+        // The record goes down with the change, or the change does not go down
+        // at all. A `.diff` whose record is missing is the state the queue
+        // cannot describe, so a generation that leaves one has produced an
+        // orphan rather than a change -- and the caller is better served by the
+        // error than by a file nothing can say the state of.
+        if let Err(e) = write_record_file(&self.change_dir, &result).await {
+            if let Err(remove) = tokio::fs::remove_file(&filename).await {
+                warn!(
+                    path = %filename.display(),
+                    error = %remove,
+                    "could not remove a change whose record failed to write; it stays as an unrecorded diff"
+                );
+            }
+            return Err(e);
+        }
+
         self.insert_result(result).await;
 
         Ok(artifact_id)
@@ -971,6 +1087,179 @@ mod tests {
                     -a\n\
                     +b\n";
         assert_eq!(repair_generated_diff(diff), diff);
+    }
+
+    /// The engine is the subject, not the model behind it, so the double never
+    /// answers anything.
+    struct SilentLlm;
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmClient for SilentLlm {
+        async fn chat(
+            &self,
+            _messages: &[cog_core::Message],
+            _options: &cog_core::ChatOptions,
+        ) -> cog_core::SFResult<cog_core::ChatResponse> {
+            unimplemented!()
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[cog_core::Message],
+            _options: &cog_core::ChatOptions,
+        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!()
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!()
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    fn engine_on(dir: &std::path::Path) -> EvolutionEngine {
+        let registry = Arc::new(RwLock::new(cog_core::SkillRegistry::new()));
+        let llm: Arc<dyn cog_core::LlmClient> = Arc::new(SilentLlm);
+        EvolutionEngine::new(llm, registry, None).with_change_dir(dir)
+    }
+
+    fn code_change(id: &str, status: EvolutionStatus) -> EvolutionResult {
+        EvolutionResult {
+            kind: EvolutionKind::CodeChange,
+            artifact_id: id.to_string(),
+            description: format!("goal-{id}"),
+            content: String::new(),
+            status,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+        }
+    }
+
+    /// The drop of a resident record is guarded on the artifact being out of the
+    /// queue with its own record beside it, because until then the index is the
+    /// last thing that knows this change's state.
+    #[tokio::test]
+    async fn a_resident_record_is_dropped_only_after_its_change_is_retired() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        let engine = engine_on(&change_dir);
+        let pipeline = crate::ChangePipeline::new(temp.path(), &change_dir, true);
+
+        tokio::fs::write(change_dir.join("chg-1.diff"), "not a real diff\n")
+            .await
+            .unwrap();
+        pipeline
+            .write_change_record(&code_change("chg-1", EvolutionStatus::CompileChecked))
+            .await
+            .unwrap();
+        engine
+            .register_result(code_change("chg-1", EvolutionStatus::CompileChecked))
+            .await;
+
+        assert!(
+            !engine.retire_result(&pipeline, "chg-1").await,
+            "the change is still in the queue: dropping the record now would lose its state"
+        );
+        assert!(
+            engine.get_result("chg-1").await.is_some(),
+            "a refused drop must not have dropped anything"
+        );
+
+        pipeline.retire_change("chg-1", "landed").await.unwrap();
+
+        assert!(engine.retire_result(&pipeline, "chg-1").await);
+        assert!(
+            engine.get_result("chg-1").await.is_none(),
+            "the state lives in the retired record from here on"
+        );
+    }
+
+    /// A change the index never saw still gets its conclusion recorded: it is
+    /// exactly the change whose record is missing, and leaving it in the index
+    /// alone would make "no record" the one state that never ends.
+    #[tokio::test]
+    async fn a_status_update_answers_a_change_the_index_never_saw() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        let engine = engine_on(&change_dir);
+        let pipeline = crate::ChangePipeline::new(temp.path(), &change_dir, true);
+        tokio::fs::write(change_dir.join("legacy.diff"), "not a real diff\n")
+            .await
+            .unwrap();
+
+        assert!(engine.get_result("legacy").await.is_none());
+        assert!(
+            engine
+                .update_status("legacy", EvolutionStatus::AwaitingReview)
+                .await
+        );
+
+        let record = pipeline
+            .read_change_record("legacy")
+            .await
+            .expect("the conclusion has to be on disk, or a restart reads the unknown again");
+        assert_eq!(record.status, EvolutionStatus::AwaitingReview);
+        assert_eq!(
+            record.created_at,
+            crate::change_pipeline::UNKNOWN_CREATED_AT,
+            "recovering a record must not invent a creation time for it"
+        );
+    }
+
+    /// Nothing to answer: no record and no file is not a change this engine can
+    /// say anything about, and pretending otherwise would write a record for a
+    /// change that does not exist.
+    #[tokio::test]
+    async fn a_status_update_for_a_change_that_is_nowhere_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        let engine = engine_on(&change_dir);
+
+        assert!(
+            !engine
+                .update_status("nobody", EvolutionStatus::AwaitingReview)
+                .await
+        );
+        assert!(!change_dir.join("nobody.json").exists());
+    }
+
+    /// The status the index holds is written through to the record, so a restart
+    /// reads the state the change reached rather than the one it was written
+    /// with.
+    #[tokio::test]
+    async fn a_status_update_writes_through_to_the_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        let engine = engine_on(&change_dir);
+        let pipeline = crate::ChangePipeline::new(temp.path(), &change_dir, true);
+        tokio::fs::write(change_dir.join("chg-2.diff"), "not a real diff\n")
+            .await
+            .unwrap();
+        engine
+            .register_result(code_change("chg-2", EvolutionStatus::CompileChecked))
+            .await;
+
+        assert!(
+            engine
+                .update_status("chg-2", EvolutionStatus::AwaitingReview)
+                .await
+        );
+
+        assert_eq!(
+            pipeline.read_change_record("chg-2").await.map(|r| r.status),
+            Some(EvolutionStatus::AwaitingReview)
+        );
     }
 }
 

@@ -33,6 +33,17 @@
 //!   interval this process consumes the queue on, so a rule can say "waiting
 //!   more than six cycles" without carrying a copy of the interval that goes
 //!   stale when it is configured differently.
+//! - `cogneva_evolution_resident_results{dir}` and
+//!   `cogneva_evolution_change_queue_files{dir}` -- the engine's in-memory
+//!   index of code changes, against the number of `.diff` files the directory
+//!   holds whatever their state. The index is a cache of what the queue offers,
+//!   so it cannot hold more changes than exist: an entry whose file is gone and
+//!   that never went through the retirement path is state kept for a change
+//!   that is not there, and that is the leak the pair states. Both numbers come
+//!   from one pass. Unlike the four above they are published by any process
+//!   whose engine exists rather than by the owner alone -- they measure this
+//!   process's own bookkeeping, and a process that generates changes without
+//!   draining the queue keeps the same index.
 //!
 //! The wait is measured from the artifact's own modification time, not from the
 //! `created_at` the listing carries: that one is stamped when the directory is
@@ -70,7 +81,16 @@ pub const QUEUE_OLDEST_METRIC: &str = "cogneva_evolution_change_queue_oldest_sec
 /// The interval this process consumes the queue on, in seconds.
 pub const QUEUE_POLL_INTERVAL_METRIC: &str = "cogneva_evolution_change_queue_poll_interval_seconds";
 
-/// The label naming which queue a reading belongs to.
+/// How many code changes this process's resident index holds.
+pub const RESIDENT_RESULTS_METRIC: &str = "cogneva_evolution_resident_results";
+
+/// How many `.diff` files the queue directory holds, retired ones excluded.
+pub const QUEUE_FILES_METRIC: &str = "cogneva_evolution_change_queue_files";
+
+/// The label naming which queue a reading belongs to: the queue directory's
+/// resolved path. It separates queues that differ by working directory, but a
+/// path string is not an identity -- two processes mounting different volumes
+/// at the same path resolve it to the same value and read as one queue.
 pub const DIR_LABEL: &str = "dir";
 
 /// The queue one process reads, plus whether that process is the one meant to
@@ -180,6 +200,27 @@ fn oldest_age_secs<'a>(dir: &Path, ids: impl Iterator<Item = &'a str>) -> Option
     Some(ages.into_iter().max().unwrap_or(0))
 }
 
+/// How many change files the queue directory holds, whatever their state.
+///
+/// The count is of the files, not of the pending subset: a change the pipeline
+/// is not offering is still a change the engine may legitimately remember, and
+/// the comparison the pair is read by is against the files that exist at all.
+///
+/// `None` when the directory could not be read -- published as nothing, for the
+/// same reason the depth is: a zero from a directory that was never read is the
+/// empty-queue reading this module exists to prevent.
+fn count_change_files(dir: &Path) -> Option<usize> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut count = 0;
+    for entry in entries {
+        let entry = entry.ok()?;
+        if entry.path().extension().and_then(|e| e.to_str()) == Some("diff") {
+            count += 1;
+        }
+    }
+    Some(count)
+}
+
 /// Where the process actually reads the queue, resolved the way it does.
 ///
 /// The shipped configuration carries a relative path, and the pipeline reads it
@@ -212,6 +253,34 @@ impl Observable for EvolutionQueueReadings {
             RawMetric::new(QUEUE_OWNER_METRIC, if self.owner { 1.0 } else { 0.0 })
                 .with_label(DIR_LABEL, dir.clone()),
         ];
+
+        // The index against the files it should be a cache of, taken in one
+        // pass so the two numbers cannot describe different moments. Published
+        // wherever the engine exists rather than on the owner alone: the index
+        // belongs to whichever process generates changes, and that is not
+        // necessarily the one draining the queue.
+        if let Some(engine) = &self.engine {
+            match count_change_files(&self.dir) {
+                Some(files) => {
+                    out.push(
+                        RawMetric::new(
+                            RESIDENT_RESULTS_METRIC,
+                            engine.resident_code_change_len().await as f64,
+                        )
+                        .with_label(DIR_LABEL, dir.clone()),
+                    );
+                    out.push(
+                        RawMetric::new(QUEUE_FILES_METRIC, files as f64)
+                            .with_label(DIR_LABEL, dir.clone()),
+                    );
+                }
+                None => warn!(
+                    dir = %self.dir.display(),
+                    "could not count the change files; publishing no resident reading this pass"
+                ),
+            }
+        }
+
         if !self.owner {
             return Ok(out);
         }
@@ -249,9 +318,75 @@ impl Observable for EvolutionQueueReadings {
 mod tests {
     use super::*;
 
+    /// The engine is not what this module is about, so the double answers with
+    /// nothing and never gets asked: only its index is read here.
+    struct SilentLlm;
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmClient for SilentLlm {
+        async fn chat(
+            &self,
+            _messages: &[cog_core::Message],
+            _options: &cog_core::ChatOptions,
+        ) -> cog_core::SFResult<cog_core::ChatResponse> {
+            unimplemented!()
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[cog_core::Message],
+            _options: &cog_core::ChatOptions,
+        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!()
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!()
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    fn engine(dir: &Path) -> Arc<EvolutionEngine> {
+        let registry = Arc::new(tokio::sync::RwLock::new(cog_core::SkillRegistry::new()));
+        let llm: Arc<dyn cog_core::LlmClient> = Arc::new(SilentLlm);
+        Arc::new(EvolutionEngine::new(llm, registry, None).with_change_dir(dir))
+    }
+
     fn readings(dir: &Path, owner: bool) -> EvolutionQueueReadings {
         let pipeline = ChangePipeline::new(std::env::current_dir().unwrap(), dir, true);
         EvolutionQueueReadings::new(dir, owner, 60, pipeline, None)
+    }
+
+    fn readings_with(
+        dir: &Path,
+        owner: bool,
+        engine: Arc<EvolutionEngine>,
+    ) -> EvolutionQueueReadings {
+        let pipeline = ChangePipeline::new(std::env::current_dir().unwrap(), dir, true);
+        EvolutionQueueReadings::new(dir, owner, 60, pipeline, Some(engine))
+    }
+
+    /// Write a change the way the engine's own sink does, so the file and the
+    /// index entry arrive together as they do in production.
+    async fn generate(engine: &EvolutionEngine, id: &str) {
+        use cog_core::ChangeSink;
+        let change = cog_core::GeneratedChange {
+            change_id: id.to_string(),
+            goal: format!("goal-{id}"),
+            content: "--- a/x.txt\n+++ b/x.txt\n@@ -0,0 +1 @@\n+one\n".to_string(),
+            ..Default::default()
+        };
+        engine
+            .submit_change(change)
+            .await
+            .expect("the engine writes the change and its record together");
     }
 
     async fn value(readings: &EvolutionQueueReadings, name: &str) -> Option<f64> {
@@ -396,6 +531,86 @@ mod tests {
                 .map(|(_, v)| v.clone()),
             Some(view.dir)
         );
+    }
+
+    /// The index is published against the files it is a cache of, and the pair
+    /// states the leak: an entry whose file is gone was not retired through the
+    /// path that drops it.
+    #[tokio::test]
+    async fn the_resident_index_is_read_against_the_files_it_caches() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path());
+        generate(&engine, "chg-1").await;
+        let readings = readings_with(dir.path(), true, engine.clone());
+
+        assert_eq!(value(&readings, RESIDENT_RESULTS_METRIC).await, Some(1.0));
+        assert_eq!(value(&readings, QUEUE_FILES_METRIC).await, Some(1.0));
+
+        // The state the retirement path exists to make impossible: the change's
+        // file is gone and the index still holds it. Read as a pair, that is
+        // the condition; read alone, either number is unremarkable.
+        tokio::fs::remove_file(dir.path().join("chg-1.diff"))
+            .await
+            .unwrap();
+        assert_eq!(value(&readings, RESIDENT_RESULTS_METRIC).await, Some(1.0));
+        assert_eq!(value(&readings, QUEUE_FILES_METRIC).await, Some(0.0));
+    }
+
+    /// Only code changes are counted. The other artifacts are keyed by an id
+    /// that is stable per artifact, so counting them would make the pair claim
+    /// a leak on every deployment that had ever refined a skill.
+    #[tokio::test]
+    async fn the_resident_index_counts_code_changes_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path());
+        let skill = crate::types::EvolutionResult {
+            kind: crate::types::EvolutionKind::SkillRefinement,
+            artifact_id: "skill-1".to_string(),
+            description: "refined".to_string(),
+            content: String::new(),
+            status: crate::types::EvolutionStatus::CompileChecked,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+        };
+        engine.register_result(skill).await;
+        assert!(
+            engine.get_result("skill-1").await.is_some(),
+            "the entry has to be in the index, or this proves nothing about counting it"
+        );
+
+        let readings = readings_with(dir.path(), true, engine);
+        assert_eq!(value(&readings, RESIDENT_RESULTS_METRIC).await, Some(0.0));
+        assert_eq!(value(&readings, QUEUE_FILES_METRIC).await, Some(0.0));
+    }
+
+    /// The index belongs to whichever process generates changes, and that is not
+    /// necessarily the one draining the queue -- so the pair is published by a
+    /// process that is not the owner, unlike the depth and the age.
+    #[tokio::test]
+    async fn a_non_owner_with_an_engine_still_reports_its_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path());
+        generate(&engine, "chg-1").await;
+        let readings = readings_with(dir.path(), false, engine);
+
+        assert_eq!(value(&readings, QUEUE_OWNER_METRIC).await, Some(0.0));
+        assert_eq!(value(&readings, RESIDENT_RESULTS_METRIC).await, Some(1.0));
+        assert_eq!(value(&readings, QUEUE_FILES_METRIC).await, Some(1.0));
+        // The owner-only readings stay absent above it, as before.
+        assert_eq!(value(&readings, QUEUE_PENDING_METRIC).await, None);
+    }
+
+    /// A directory that could not be counted publishes no pair: absence is not a
+    /// leak, and a zero beside a non-zero index would read as one.
+    #[tokio::test]
+    async fn an_unreadable_directory_publishes_no_resident_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path());
+        generate(&engine, "chg-1").await;
+        let readings = readings_with(&dir.path().join("gone"), true, engine);
+
+        assert_eq!(value(&readings, RESIDENT_RESULTS_METRIC).await, None);
+        assert_eq!(value(&readings, QUEUE_FILES_METRIC).await, None);
     }
 
     /// A relative `change_dir` is read against the process's working directory,
