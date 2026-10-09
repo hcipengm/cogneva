@@ -696,13 +696,16 @@ fn read(rel: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()))
 }
 
+/// The deploy config the rules live in, parsed. Read through one function so a
+/// gate that needs a value other than the rules reads the same document the
+/// rules came from.
+fn chart_json() -> serde_json::Value {
+    serde_json::from_str(&read(CHART_CONFIG)).expect("chart config is not valid JSON")
+}
+
 /// Every rule in the chart, name to promql, in file order.
 fn chart_rules() -> Vec<(String, String)> {
-    let path = repo_root().join(CHART_CONFIG);
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("chart config unreadable at {}: {e}", path.display()));
-    let value: serde_json::Value =
-        serde_json::from_str(&text).expect("chart config is not valid JSON");
+    let value = chart_json();
     value["observability"]["infra_watch"]["rules"]
         .as_array()
         .expect("observability.infra_watch.rules is not an array")
@@ -1003,6 +1006,324 @@ fn a_rule_that_certifies_a_window_requires_the_window_to_be_covered() {
         complaints.is_empty(),
         "告警规则用一个区间聚合判断整个窗口，却没有要求窗口被铺满——序列比窗口年轻时这句话是假的:\n{}",
         complaints.join("\n")
+    );
+}
+
+/// One loop's outcome series paired with the cadence that loop actually runs on.
+struct LoopCadence {
+    /// The rule whose window is chosen against this cadence.
+    rule: &'static str,
+    /// The series the loop's outcome lands in.
+    series: &'static str,
+    /// The dotted path the deploy config sets this loop's interval at. Empty when
+    /// the loop's period is not on the deploy surface, which leaves the owning
+    /// crate's default as the effective value.
+    config_path: &'static [&'static str],
+    /// The owning crate's default for that interval.
+    default_secs: u64,
+    /// A floor the loop clamps its configured interval up to. A window or a
+    /// freshness bound chosen against the configured number alone is short of the
+    /// cadence the loop really keeps whenever this floor binds.
+    floor_secs: u64,
+}
+
+impl LoopCadence {
+    fn period(&self, chart: &serde_json::Value) -> u64 {
+        effective_secs(chart, self.config_path, self.default_secs).max(self.floor_secs)
+    }
+}
+
+/// The value a dotted config path resolves to: the deploy config's value when the
+/// deployment sets one, else `default`.
+///
+/// Reading only the default guards a number the deployment is free to differ
+/// from. Reading only the deploy value guards nothing when the deployment stays
+/// silent -- which it does for every loop whose period has never needed tuning.
+fn effective_secs(chart: &serde_json::Value, path: &[&str], default: u64) -> u64 {
+    let mut node = chart;
+    for key in path {
+        match node.get(*key) {
+            Some(next) => node = next,
+            None => return default,
+        }
+    }
+    // A path of no segments lands here: the whole document is not a number, so a
+    // period that is not on the deploy surface resolves to the default.
+    node.as_u64().unwrap_or(default)
+}
+
+/// The loops whose own outcome counter an alert rule reads, with the cadence each
+/// one runs on.
+///
+/// Every period is read from the module that owns it rather than spelled here, so
+/// the table cannot drift from the loop it describes: the deploy config's value
+/// where one is set, else the owning crate's default.
+fn loop_cadences() -> Vec<LoopCadence> {
+    let system = || cog_core::config::SystemConfig::default();
+    let supervisor = || cog_core::config::SupervisorConfig::default();
+    vec![
+        LoopCadence {
+            rule: "baseline_port_tick_failing_every_round",
+            series: "baseline_port_tick_failed",
+            config_path: &["self_evolution", "baseline_port", "poll_interval_secs"],
+            default_secs: cog_reflection::BaselinePortConfig::default().poll_interval_secs,
+            floor_secs: cog_reflection::baseline_port::MIN_POLL_INTERVAL_SECS,
+        },
+        LoopCadence {
+            rule: "memory_schema_repair_passes_all_failed",
+            series: "cogneva_memory_schema_repair_total",
+            config_path: &["self_evolution", "schema_repair_interval_secs"],
+            default_secs: cog_core::config::SelfEvolutionConfig::default()
+                .schema_repair_interval_secs,
+            floor_secs: 1,
+        },
+        LoopCadence {
+            rule: "policy_evolution_rounds_all_failed",
+            series: "cogneva_policy_evolution_rounds_total",
+            config_path: &["self_evolution", "artifact_evolution", "interval_secs"],
+            default_secs: cog_reflection::PolicyEvolutionConfig::default().interval_secs,
+            floor_secs: 1,
+        },
+        LoopCadence {
+            rule: "memory_decay_passes_all_failed",
+            series: "cogneva_memory_decay_total",
+            config_path: &["memory", "maintenance", "decay_interval_secs"],
+            default_secs: cog_memory::config::MaintenanceConfig::default().decay_interval_secs,
+            floor_secs: 1,
+        },
+        LoopCadence {
+            rule: "partition_maintenance_round_came_up_short",
+            series: "cogneva_partition_maintenance_failures_total",
+            config_path: &["system", "partition_maintenance_interval_secs"],
+            default_secs: system().partition_maintenance_interval_secs,
+            floor_secs: 1,
+        },
+        LoopCadence {
+            rule: "memory_bus_claim_rounds_all_failed",
+            series: "memory_operations_total",
+            config_path: &["memory", "ingest", "bus_claim_interval_secs"],
+            default_secs: cog_memory::config::IngestConfig::default().bus_claim_interval_secs,
+            floor_secs: 1,
+        },
+        LoopCadence {
+            rule: "skill_hot_reload_passes_all_failed",
+            series: "cogneva_skill_hot_reload_total",
+            config_path: &["system", "skill_hot_reload_interval_secs"],
+            default_secs: system().skill_hot_reload_interval_secs,
+            floor_secs: 1,
+        },
+        LoopCadence {
+            rule: "skill_reload_failing_every_scan",
+            series: "cogneva_skill_hot_reload_total",
+            config_path: &["system", "skill_hot_reload_interval_secs"],
+            default_secs: system().skill_hot_reload_interval_secs,
+            floor_secs: 1,
+        },
+        LoopCadence {
+            rule: "analytics_flush_batches_all_failed",
+            series: "cogneva_analytics_flush_total",
+            config_path: &["observability", "clickhouse", "flush_interval_sec"],
+            default_secs: cog_observability::config::ClickHouseConfig::default().flush_interval_sec,
+            floor_secs: 1,
+        },
+        LoopCadence {
+            rule: "loki_flush_batches_all_failed",
+            series: "cogneva_loki_flush_total",
+            config_path: &["observability", "loki", "flush_interval_sec"],
+            default_secs: cog_observability::config::LokiConfig::default().flush_interval_sec,
+            floor_secs: 1,
+        },
+        LoopCadence {
+            rule: "supervisor_health_pass_failing",
+            series: "cogneva_supervisor_pass_total",
+            config_path: &["supervisor", "health_interval_secs"],
+            default_secs: supervisor().health_interval_secs,
+            floor_secs: 1,
+        },
+        LoopCadence {
+            rule: "supervisor_quota_pass_failing",
+            series: "cogneva_supervisor_pass_total",
+            config_path: &["supervisor", "quota_interval_secs"],
+            default_secs: supervisor().quota_interval_secs,
+            floor_secs: 1,
+        },
+        LoopCadence {
+            rule: "supervisor_rebalance_pass_failing",
+            series: "cogneva_supervisor_pass_total",
+            config_path: &["supervisor", "rebalance_interval_secs"],
+            default_secs: supervisor().rebalance_interval_secs,
+            floor_secs: 1,
+        },
+        LoopCadence {
+            rule: "supervisor_event_pass_failing",
+            series: "cogneva_supervisor_pass_total",
+            config_path: &["supervisor", "event_window_secs"],
+            default_secs: supervisor().event_window_secs,
+            floor_secs: 1,
+        },
+        LoopCadence {
+            rule: "supervisor_control_plane_pass_failing",
+            series: "cogneva_supervisor_pass_total",
+            config_path: &["supervisor", "control_plane_interval_secs"],
+            default_secs: supervisor().control_plane_interval_secs,
+            floor_secs: 1,
+        },
+    ]
+}
+
+/// Complaints about a rule whose window over a loop's outcome series, or whose
+/// freshness bound on that series' companion, is short of one round of the loop.
+///
+/// The two are one round in opposite directions. A window shorter than a round
+/// can contain no increment at all, because the counter only moves once per
+/// round. A freshness bound at or below a round expires inside every healthy
+/// round, so the guard turns the rule off for the part of the round it is not
+/// covering -- and the rule goes quiet without anything about the loop being
+/// wrong. Both were live in the shipped `baseline_port` rule at once.
+fn loop_cadence_complaints(
+    row: &LoopCadence,
+    promql: &str,
+    chart: &serde_json::Value,
+) -> Vec<String> {
+    let period = row.period(chart);
+    let one: BTreeSet<String> = std::iter::once(row.series.to_string()).collect();
+    let mut out: Vec<String> = windows_over(promql, &one)
+        .into_iter()
+        .filter(|(_, window)| *window < period)
+        .map(|(series, window)| {
+            format!(
+                "{}: 窗口 {window}s 短于 {series} 产出一轮 {period}s——计数器每轮才动一次，\
+                 窗口里可以一条增量都没有，真出故障时这条规则仍是空的",
+                row.rule
+            )
+        })
+        .collect();
+    if let Some(bound) = companion_age_bound(promql, row.series) {
+        if bound <= period {
+            out.push(format!(
+                "{}: 新鲜度界 {bound}s 不长于 {} 产出一轮 {period}s——健康的一轮里，上一笔\
+                 戳记会在下一次求值前就过期，守卫把这条规则关掉",
+                row.rule, row.series
+            ));
+        }
+    }
+    out
+}
+
+/// A rule over a loop's own outcome has to look back at least one round of that
+/// loop, and must not let its freshness guard expire inside a round.
+///
+/// Both numbers are the loop's cadence, and that cadence is owned by the code that
+/// runs the loop: the deployed value where the deploy config sets one, else the
+/// owning crate's default, never below the loop's own floor. Read here instead of
+/// argued in a summary, because a summary's arithmetic drifts from the cadence
+/// silently. The shipped `baseline_port` rule carried a six-minute window and a
+/// ten-minute freshness bound against a loop whose configured interval is an
+/// hour: one round in ten, and a guard that had already expired for five sixths of
+/// every round, so the rule was blind to the failure it was written for while
+/// reading as landed on every other surface.
+#[test]
+fn a_rule_over_a_loops_outcome_waits_at_least_one_round() {
+    let chart = chart_json();
+    let rows = loop_cadences();
+    assert!(
+        rows.len() >= 15,
+        "循环结局规则表只剩 {} 条，这条判据的分母是它",
+        rows.len()
+    );
+
+    let rules: BTreeMap<String, String> = chart_rules().into_iter().collect();
+    let mut complaints: Vec<String> = Vec::new();
+    let mut windowed = 0usize;
+    for row in &rows {
+        let promql = rules.get(row.rule).unwrap_or_else(|| {
+            panic!(
+                "规则 {} 不在配置里：这张表读的是循环的节拍，规则改名或删除时这一行就悄悄\
+                 不再对着任何东西",
+                row.rule
+            )
+        });
+        let one: BTreeSet<String> = std::iter::once(row.series.to_string()).collect();
+        let windows = windows_over(promql, &one);
+        assert!(
+            !windows.is_empty(),
+            "{} 不再对 {} 取窗口，这一行已经不对着任何东西（序列改名了？）",
+            row.rule,
+            row.series
+        );
+        windowed += windows.len();
+        complaints.extend(loop_cadence_complaints(row, promql, &chart));
+    }
+
+    // 分母：一条窗口都没读到，上面那句「没有投诉」是空的，不是绿的。
+    assert!(
+        windowed >= rows.len(),
+        "读到的窗口数 {windowed} 少于表里的行数 {}，说明有行没有对着窗口",
+        rows.len()
+    );
+    assert!(
+        complaints.is_empty(),
+        "告警规则对循环自己的结局读数取的窗口/新鲜度界必须容得下产出它的一轮:\n{}",
+        complaints.join("\n")
+    );
+}
+
+/// The gate above separates the two numbers it compares, and does so against a
+/// fabricated rule as well as the shipped ones -- a gate that only ever runs over
+/// rules that pass has not been shown to reject anything.
+#[test]
+fn a_window_shorter_than_the_loops_round_is_reported_and_a_longer_one_is_not() {
+    let chart = serde_json::json!({});
+    let row = LoopCadence {
+        rule: "r",
+        series: "a_loops_outcome_total",
+        config_path: &[],
+        default_secs: 3600,
+        floor_secs: 1,
+    };
+
+    // 窗口短于一轮：计数器在这个窗口里可以一动不动。
+    assert_eq!(
+        loop_cadence_complaints(&row, "increase(a_loops_outcome_total[6m]) > 0", &chart).len(),
+        1
+    );
+    // 窗口刚好一轮：窗口里必然落着一笔，放行。
+    assert!(
+        loop_cadence_complaints(&row, "increase(a_loops_outcome_total[1h]) > 0", &chart).is_empty()
+    );
+    // 新鲜度界不长于一轮：健康的一轮里戳记会先过期。
+    assert_eq!(
+        loop_cadence_complaints(
+            &row,
+            "(min_over_time(a_loops_outcome_total[2h]) == 1) and \
+             ((time() - a_loops_outcome_total_observed_timestamp_seconds) < 600)",
+            &chart
+        )
+        .len(),
+        1
+    );
+    // 两条都短：各报一次。
+    assert_eq!(
+        loop_cadence_complaints(
+            &row,
+            "(min_over_time(a_loops_outcome_total[5m]) == 1) and \
+             ((time() - a_loops_outcome_total_observed_timestamp_seconds) < 600)",
+            &chart
+        )
+        .len(),
+        2
+    );
+    // 地板抬高了实际节拍：按配置字面量选出来的窗口会被判短。
+    let floored = LoopCadence {
+        rule: "r",
+        series: "a_loops_outcome_total",
+        config_path: &[],
+        default_secs: 30,
+        floor_secs: 300,
+    };
+    assert_eq!(
+        loop_cadence_complaints(&floored, "increase(a_loops_outcome_total[1m]) > 0", &chart).len(),
+        1
     );
 }
 

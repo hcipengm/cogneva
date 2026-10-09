@@ -1490,6 +1490,11 @@ async fn port_tick(
 /// This loop's name in the liveness census.
 pub const BASELINE_PORT_LOOP: &str = "baseline_port";
 
+/// The floor under the configured poll interval: a value below this is clamped
+/// up, so a reader measuring its cadence against `poll_interval_secs` alone
+/// measures a number the loop does not keep whenever this floor binds.
+pub const MIN_POLL_INTERVAL_SECS: u64 = 60;
+
 /// 基线移植触发循环。第一轮立即执行（启动即对齐新基线，不等一个
 /// 轮询周期），之后按 `poll_interval_secs` 周期运行直到 shutdown。
 pub async fn run_baseline_port_loop(
@@ -1499,7 +1504,7 @@ pub async fn run_baseline_port_loop(
     state_path: PathBuf,
     shutdown: cog_core::ShutdownSignal,
 ) {
-    let interval = Duration::from_secs(config.poll_interval_secs.max(60));
+    let interval = Duration::from_secs(config.poll_interval_secs.max(MIN_POLL_INTERVAL_SECS));
     info!(
         interval_secs = interval.as_secs(),
         retry_cooldown_secs = config.retry_cooldown_secs,
