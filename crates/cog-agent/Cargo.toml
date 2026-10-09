@@ -20,6 +20,9 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
+# Raw-source payloads are arbitrary bytes; a non-text one reaches a tool caller
+# base64-encoded so no byte is lost in the JSON result.
+base64 = "0.22"
 uuid = { workspace = true }
 futures = { workspace = true }
 redis = { workspace = true }

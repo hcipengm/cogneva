@@ -402,6 +402,60 @@ impl PluginContext {
 }
 
 // ---------------------------------------------------------------------------
+// LateService — an optional dependency resolved after init
+// ---------------------------------------------------------------------------
+
+/// A service handle that is resolved on first use instead of during `init`.
+///
+/// The framework can express "initialise after X" (`requires`) or "X may be
+/// absent" (`optional_requires`), but not both: adding `X` to `requires` makes
+/// it mandatory — an absent publisher then fails startup — and
+/// `optional_requires` does not enter the layer graph at all, so a reader that
+/// uses it is still reading in whatever order the layers happen to produce. Two
+/// plugins with no edge between them share a layer, and a layer initialises
+/// concurrently, so a read of X during `init` is in time only when the reader's
+/// own init happens to finish second.
+///
+/// Resolving after init removes the question. Every plugin has finished `init`
+/// by the time anything calls into the service, so the first read sees a
+/// registry that has stopped changing, and the answer is cached — one read for
+/// the life of the process rather than one per call. A caller that takes this
+/// handle is also expressing the right thing: absent is a state it can work in,
+/// which is exactly what "optional" was meant to say.
+pub struct LateService<T: ?Sized> {
+    ctx: PluginContext,
+    resolved: std::sync::OnceLock<Option<Arc<T>>>,
+}
+
+impl<T: ?Sized + Send + Sync + 'static> LateService<T> {
+    /// Build a handle that will resolve `T` from `ctx` on first use.
+    pub fn new(ctx: PluginContext) -> Self {
+        Self {
+            ctx,
+            resolved: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The service, or `None` when nothing published one by the time this was
+    /// first asked.
+    pub fn get(&self) -> Option<Arc<T>> {
+        self.resolved
+            .get_or_init(|| self.ctx.consume_service::<T>())
+            .clone()
+    }
+}
+
+impl<T: ?Sized> Clone for LateService<T> {
+    /// Clones share the resolution: two handles from one original are one read.
+    fn clone(&self) -> Self {
+        Self {
+            ctx: self.ctx.clone(),
+            resolved: self.resolved.clone(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SystemPlugin trait
 // ---------------------------------------------------------------------------
 

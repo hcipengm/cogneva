@@ -186,6 +186,27 @@ impl cog_core::SystemPlugin for AgentPlugin {
         } else {
             warn!("HttpClient unavailable; http_request tool not registered");
         }
+        // Memory tools are registered whether or not this process holds a
+        // backend. `http_request` is skipped when its dependency is missing
+        // because that would be a misconfiguration; memory is switched off on
+        // purpose in the evolution worker, and a squad working there must be
+        // able to tell "this layer is absent" from "this namespace is empty".
+        // Registered-but-failing says the first; not registered at all would
+        // look like the second.
+        //
+        // The handle resolves the backend on first call rather than here: the
+        // memory plugin shares this plugin's init layer, and a layer
+        // initialises concurrently, so reading during init returns a backend
+        // only when agent's init happens to finish second.
+        let memory_backend = cog_core::LateService::new(ctx.clone());
+        cog_core::ToolRegistry::register(
+            &*tool_registry,
+            crate::tools::builtins::raw_list(memory_backend.clone()),
+        );
+        cog_core::ToolRegistry::register(
+            &*tool_registry,
+            crate::tools::builtins::raw_fetch(memory_backend),
+        );
         info!(
             tools = ?tool_registry.names(),
             "AgentPlugin built-in tools registered"

@@ -62,9 +62,17 @@ const EXTERNAL_WRITERS: &[ExternalWriter] = &[
               so its writer is the write path rather than a call that spells it; \
               the store's health check reads one row from it to exercise both layers",
         witnesses: &[
+            // The name exists once, in the contract crate; the gateway's own
+            // default is that definition rather than a second spelling of it,
+            // so the exemption cites both -- the single definition, and the
+            // site that substitutes it.
+            (
+                "crates/cog-core/src/contract/memory.rs",
+                "pub const DEFAULT_MEMORY_NAMESPACE: &str = \"default\";",
+            ),
             (
                 "crates/cog-gateway/src/memory.rs",
-                "const DEFAULT_NS: &str = \"default\";",
+                "const DEFAULT_NS: &str = cog_core::DEFAULT_MEMORY_NAMESPACE;",
             ),
             (
                 "crates/cog-gateway/src/memory.rs",

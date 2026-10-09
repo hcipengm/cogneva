@@ -1,9 +1,20 @@
+use base64::Engine as _;
 use cog_core::{CommandEvent, SFResult, SandboxBackend, SandboxPayload, SandboxRequest};
 use cog_core::{Tool, ToolImplementation};
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// The memory backend as the raw-source tools see it: a handle that resolves
+/// the backend on first call instead of during plugin `init`.
+///
+/// The tools cannot consume the backend while the plugin is initialising: the
+/// memory and agent plugins share an init layer, and a layer initialises
+/// concurrently, so that read would return the backend only when agent's init
+/// happens to finish second. Resolving on first call moves the read past every
+/// plugin's `init`, where the registry has stopped changing.
+pub type LateMemoryBackend = cog_core::LateService<dyn cog_core::MemoryBackend>;
 
 /// Real execution identity of one agent run. Carried explicitly from the
 /// actor (which knows the DAG task) through the runtime into sandbox requests,
@@ -413,6 +424,264 @@ mod tests {
             .unwrap();
         assert_eq!(out["status"], 200);
         assert_eq!(out["body"], "POST http://example/x");
+    }
+
+    fn raw_source(
+        id: &str,
+        namespace: &str,
+        content_type: &str,
+        payload: &[u8],
+    ) -> cog_core::RawSource {
+        let now = chrono::Utc::now();
+        cog_core::RawSource {
+            id: id.into(),
+            namespace: namespace.into(),
+            content_type: content_type.into(),
+            payload: payload.to_vec(),
+            tags: Vec::new(),
+            created_at: now,
+            archived_at: now,
+        }
+    }
+
+    /// Minimal raw store: enough of [`cog_core::MemoryBackend`] for the two
+    /// tools. Everything they do not call is `unimplemented!()`.
+    struct StubMemory {
+        raws: Vec<cog_core::RawSource>,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::MemoryBackend for StubMemory {
+        async fn archive_raw(&self, _s: &cog_core::RawSource) -> SFResult<String> {
+            unimplemented!()
+        }
+        async fn get_raw(&self, ns: &str, id: &str) -> SFResult<Option<cog_core::RawSource>> {
+            Ok(self
+                .raws
+                .iter()
+                .find(|r| r.namespace == ns && r.id == id)
+                .cloned())
+        }
+        async fn list_raw(&self, ns: &str, prefix: Option<&str>) -> SFResult<Vec<String>> {
+            Ok(self
+                .raws
+                .iter()
+                .filter(|r| {
+                    r.namespace == ns && prefix.is_none_or(|p| r.content_type.starts_with(p))
+                })
+                .map(|r| r.id.clone())
+                .collect())
+        }
+        async fn delete_raw(&self, _n: &str, _i: &str) -> SFResult<()> {
+            unimplemented!()
+        }
+        async fn store_schema(&self, _n: &str, _e: &cog_core::SchemaEntry) -> SFResult<()> {
+            unimplemented!()
+        }
+        async fn get_schema(&self, _n: &str, _i: &str) -> SFResult<Option<cog_core::SchemaEntry>> {
+            unimplemented!()
+        }
+        async fn search_schema(
+            &self,
+            _n: &str,
+            _q: &str,
+            _l: usize,
+        ) -> SFResult<Vec<cog_core::SchemaSearchResult>> {
+            unimplemented!()
+        }
+        async fn schema_for_raw(&self, _n: &str, _r: &str) -> SFResult<Vec<cog_core::SchemaEntry>> {
+            unimplemented!()
+        }
+        async fn list_schema(&self, _n: &str) -> SFResult<Vec<cog_core::SchemaEntry>> {
+            unimplemented!()
+        }
+        async fn delete_schema(&self, _n: &str, _i: &str) -> SFResult<()> {
+            unimplemented!()
+        }
+        async fn query_relations(
+            &self,
+            _n: &str,
+            _e: &str,
+            _d: cog_core::RelationDirection,
+            _t: Option<&str>,
+        ) -> SFResult<Vec<cog_core::SchemaEntry>> {
+            unimplemented!()
+        }
+        async fn update_schema(&self, _n: &str, _e: &cog_core::SchemaEntry) -> SFResult<()> {
+            unimplemented!()
+        }
+        async fn store_summary(&self, _n: &str, _e: &cog_core::SummaryEntry) -> SFResult<()> {
+            unimplemented!()
+        }
+        async fn get_summary(
+            &self,
+            _n: &str,
+            _i: &str,
+        ) -> SFResult<Option<cog_core::SummaryEntry>> {
+            unimplemented!()
+        }
+        async fn search_summary(
+            &self,
+            _n: &str,
+            _q: &[f32],
+            _k: usize,
+            _t: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+        ) -> SFResult<Vec<cog_core::SummarySearchResult>> {
+            unimplemented!()
+        }
+        async fn summary_for_raw(
+            &self,
+            _n: &str,
+            _r: &str,
+        ) -> SFResult<Vec<cog_core::SummaryEntry>> {
+            unimplemented!()
+        }
+        async fn list_summary(&self, _n: &str) -> SFResult<Vec<cog_core::SummaryEntry>> {
+            unimplemented!()
+        }
+        async fn delete_summary(&self, _n: &str, _i: &str) -> SFResult<()> {
+            unimplemented!()
+        }
+        async fn update_summary(&self, _n: &str, _e: &cog_core::SummaryEntry) -> SFResult<()> {
+            unimplemented!()
+        }
+        fn metrics(&self) -> cog_core::MemoryMetrics {
+            cog_core::MemoryMetrics::default()
+        }
+        async fn health_check(&self) -> SFResult<()> {
+            Ok(())
+        }
+        async fn search_all(
+            &self,
+            _n: &str,
+            _q: &str,
+            _e: Option<&[f32]>,
+            _k: usize,
+            _t: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+        ) -> SFResult<Vec<cog_core::UnifiedSearchResult>> {
+            unimplemented!()
+        }
+        async fn ingest_explicit(
+            &self,
+            _n: &str,
+            _t: &str,
+            _i: f32,
+            _g: Vec<String>,
+        ) -> SFResult<()> {
+            unimplemented!()
+        }
+        async fn forget(&self, _n: &str, _i: &str) -> SFResult<()> {
+            unimplemented!()
+        }
+        async fn decay(&self, _n: &str, _a: u64, _i: f32) -> SFResult<cog_core::DecayReport> {
+            unimplemented!()
+        }
+    }
+
+    fn memory_registry(backend: Option<Arc<dyn cog_core::MemoryBackend>>) -> ToolRegistry {
+        let ctx = cog_core::PluginContext::new(cog_core::Config::default());
+        if let Some(backend) = backend {
+            ctx.publish_service(backend);
+        }
+        let backend: LateMemoryBackend = cog_core::LateService::new(ctx.as_owner("test"));
+        let registry = ToolRegistry::new();
+        cog_core::ToolRegistry::register(&registry, builtins::raw_list(backend.clone()));
+        cog_core::ToolRegistry::register(&registry, builtins::raw_fetch(backend));
+        registry
+    }
+
+    /// The read path the whole raw layer had no caller for: a tool that asks for
+    /// an id gets the archived bytes back.
+    #[tokio::test]
+    async fn raw_fetch_returns_the_archived_bytes() {
+        let stub = Arc::new(StubMemory {
+            raws: vec![
+                raw_source("notes", "default", "text/plain", b"hello raw"),
+                raw_source(
+                    "blob",
+                    "default",
+                    "application/octet-stream",
+                    &[0xff, 0x00, 0xfe],
+                ),
+            ],
+        });
+        let registry = memory_registry(Some(stub));
+
+        let listed = registry
+            .execute("raw_list", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(listed["namespace"], cog_core::DEFAULT_MEMORY_NAMESPACE);
+        assert_eq!(listed["count"], 2);
+
+        let fetched = registry
+            .execute("raw_fetch", serde_json::json!({"id": "notes"}))
+            .await
+            .unwrap();
+        assert_eq!(fetched["encoding"], "utf8");
+        assert_eq!(fetched["payload"], "hello raw");
+        assert_eq!(fetched["content_type"], "text/plain");
+        assert_eq!(fetched["payload_length"], 9);
+
+        // A payload that is not text still comes back whole, with the encoding
+        // named so the caller never has to guess which form it holds.
+        let blob = registry
+            .execute("raw_fetch", serde_json::json!({"id": "blob"}))
+            .await
+            .unwrap();
+        assert_eq!(blob["encoding"], "base64");
+        assert_eq!(blob["payload"], "/wD+");
+        assert_eq!(blob["payload_length"], 3);
+    }
+
+    /// An absent memory layer must fail the call, not return an empty listing.
+    /// "No layer here" and "this namespace holds nothing" are different facts,
+    /// and a caller that cannot tell them apart reads the first as the second.
+    #[tokio::test]
+    async fn raw_tools_report_an_absent_layer_instead_of_an_empty_one() {
+        let registry = memory_registry(None);
+        let list_err = registry
+            .execute("raw_list", serde_json::json!({}))
+            .await
+            .expect_err("an absent backend must not answer with an empty listing");
+        let fetch_err = registry
+            .execute("raw_fetch", serde_json::json!({"id": "x"}))
+            .await
+            .expect_err("an absent backend must not answer with a not-found");
+        for err in [list_err, fetch_err] {
+            let text = err.to_string();
+            assert!(
+                text.contains("memory backend is not available"),
+                "the error must name the absent layer, got: {text}"
+            );
+        }
+    }
+
+    /// The id is checked before the store sees it: an id carrying a separator
+    /// becomes a subtree there and the object quietly stops being listed, so
+    /// the caller is told at the call that caused it.
+    #[tokio::test]
+    async fn raw_fetch_rejects_an_id_that_cannot_be_a_key() {
+        let stub = Arc::new(StubMemory { raws: Vec::new() });
+        let registry = memory_registry(Some(stub));
+        let err = registry
+            .execute("raw_fetch", serde_json::json!({"id": "a/b"}))
+            .await
+            .expect_err("a separator in the id must be rejected");
+        assert!(err.to_string().contains("not addressable"), "got: {err}");
+    }
+
+    #[test]
+    fn payload_encoding_names_which_form_it_returns() {
+        assert_eq!(
+            builtins::encode_raw_payload(b"plain"),
+            ("utf8", "plain".into())
+        );
+        assert_eq!(
+            builtins::encode_raw_payload(&[0xff, 0xfe]),
+            ("base64", "//4=".into())
+        );
+        assert_eq!(builtins::encode_raw_payload(b""), ("utf8", String::new()));
     }
 
     #[tokio::test]
@@ -888,6 +1157,155 @@ pub mod builtins {
                         .ok_or_else(|| cog_core::SFError::Validation("query required".into()))?;
                     // Placeholder - actual implementation would use ripgrep or similar
                     Ok(serde_json::json!({ "results": [], "query": query }))
+                })
+            })),
+        }
+    }
+
+    /// Namespace a memory read lands in when the call carries none.
+    fn ns_arg(args: &serde_json::Value) -> String {
+        args["namespace"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(cog_core::DEFAULT_MEMORY_NAMESPACE)
+            .to_string()
+    }
+
+    /// Render a raw payload for a JSON tool result.
+    ///
+    /// Returns the encoding name alongside the string so the caller never has
+    /// to guess which one it got: text is passed through, anything else is
+    /// base64 so no byte is lost. A single field rather than both forms -- the
+    /// payload can be large, and shipping it twice would double the cost of
+    /// every read for the benefit of a caller that can decode one of them.
+    pub fn encode_raw_payload(payload: &[u8]) -> (&'static str, String) {
+        match std::str::from_utf8(payload) {
+            Ok(text) => ("utf8", text.to_string()),
+            Err(_) => (
+                "base64",
+                base64::engine::general_purpose::STANDARD.encode(payload),
+            ),
+        }
+    }
+
+    /// List the ids of archived raw sources.
+    ///
+    /// This reads the in-process memory backend instead of calling the
+    /// gateway's raw route. That route is behind an operator token and pods
+    /// hold no credentials, so a tool that had to authenticate would be a tool
+    /// no squad could ever call; the backend is the same store the route serves
+    /// from, so this reaches the same entries without crossing a credential
+    /// boundary. When nothing published a backend -- the memory layer is off in
+    /// this process -- the call fails loudly rather than returning an empty
+    /// list: an empty list is what "this namespace holds nothing" looks like,
+    /// and a caller that cannot tell an absent layer from an empty one
+    /// concludes the memory is empty rather than that it was never there.
+    pub fn raw_list(backend: super::LateMemoryBackend) -> Tool {
+        Tool {
+            name: "raw_list".into(),
+            description: "List the ids of archived raw sources in a memory namespace, \
+                          optionally filtered by content-type prefix. Returns ids only; \
+                          call raw_fetch for the bytes. Fails with an error when this \
+                          process has no memory backend."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "namespace": {
+                        "type": "string",
+                        "description": "Memory namespace (default: the shared default namespace)"
+                    },
+                    "content_type_prefix": {
+                        "type": "string",
+                        "description": "Only ids whose content type starts with this"
+                    }
+                }
+            }),
+            implementation: ToolImplementation::Native(Arc::new(move |args| {
+                let backend = backend.clone();
+                Box::pin(async move {
+                    let backend = backend.get().ok_or_else(|| {
+                        cog_core::SFError::Config(
+                            "memory backend is not available in this process: the memory \
+                             layer is disabled here, so raw sources cannot be listed"
+                                .into(),
+                        )
+                    })?;
+                    let ns = ns_arg(&args);
+                    let prefix = args["content_type_prefix"].as_str();
+                    let ids = backend.list_raw(&ns, prefix).await?;
+                    Ok(serde_json::json!({
+                        "namespace": ns,
+                        "count": ids.len(),
+                        "ids": ids,
+                    }))
+                })
+            })),
+        }
+    }
+
+    /// Fetch one archived raw source, bytes included.
+    ///
+    /// The id is checked against the contract's key rules before the store is
+    /// asked: an id carrying a separator does not fail at the store, it becomes
+    /// a subtree and the object disappears from every listing that would have
+    /// counted it. Reporting that here turns a silently missing key into an
+    /// error at the call that caused it.
+    pub fn raw_fetch(backend: super::LateMemoryBackend) -> Tool {
+        Tool {
+            name: "raw_fetch".into(),
+            description: "Fetch one archived raw source by id, returning its bytes. The \
+                          payload is UTF-8 text when the source is text and base64 \
+                          otherwise; `encoding` says which. Fails with an error when this \
+                          process has no memory backend."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Raw source id" },
+                    "namespace": {
+                        "type": "string",
+                        "description": "Memory namespace (default: the shared default namespace)"
+                    }
+                },
+                "required": ["id"]
+            }),
+            implementation: ToolImplementation::Native(Arc::new(move |args| {
+                let backend = backend.clone();
+                Box::pin(async move {
+                    let id = args["id"]
+                        .as_str()
+                        .ok_or_else(|| cog_core::SFError::Validation("id required".into()))?;
+                    if let Some(why) = cog_core::raw_id_key_error(id) {
+                        return Err(cog_core::SFError::Validation(format!(
+                            "raw id {:?} is not addressable: {}",
+                            id, why
+                        )));
+                    }
+                    let backend = backend.get().ok_or_else(|| {
+                        cog_core::SFError::Config(
+                            "memory backend is not available in this process: the memory \
+                             layer is disabled here, so raw sources cannot be read"
+                                .into(),
+                        )
+                    })?;
+                    let ns = ns_arg(&args);
+                    let raw = backend.get_raw(&ns, id).await?.ok_or_else(|| {
+                        cog_core::SFError::Validation(format!(
+                            "raw source {:?} not found in namespace {:?}",
+                            id, ns
+                        ))
+                    })?;
+                    let (encoding, payload) = encode_raw_payload(&raw.payload);
+                    Ok(serde_json::json!({
+                        "id": raw.id,
+                        "namespace": raw.namespace,
+                        "content_type": raw.content_type,
+                        "payload_length": raw.payload.len(),
+                        "encoding": encoding,
+                        "payload": payload,
+                        "created_at": raw.created_at,
+                    }))
                 })
             })),
         }

@@ -4,6 +4,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -11,7 +12,7 @@ use crate::GatewayState;
 use cog_core::MetricSample;
 use cog_core::RawSource;
 
-const DEFAULT_NS: &str = "default";
+const DEFAULT_NS: &str = cog_core::DEFAULT_MEMORY_NAMESPACE;
 
 /// 审计 3.4：从 JWT Claims 派生有效命名空间（多租户记忆隔离）。
 /// 取第一个 workspace 作为命名空间；未认证或无 workspace 时回退 default，
@@ -639,16 +640,28 @@ pub async fn get_raw_handler(
     };
 
     match backend.get_raw(&ns, &id).await {
-        Ok(Some(raw)) => (
-            StatusCode::OK,
-            Json(json!({
-                "id": raw.id,
-                "content_type": raw.content_type,
-                "payload_length": raw.payload.len(),
-                "created_at": raw.created_at,
-            })),
-        )
-            .into_response(),
+        Ok(Some(raw)) => {
+            // The payload is what this route is for. Fetching a raw source
+            // means wanting the bytes it was archived from, and a length
+            // describes them without being them -- a caller that got only the
+            // length had to already know the content to make any use of it.
+            // It travels base64 because the body is a JSON object and the
+            // payload is arbitrary bytes; `payload_length` stays so a caller
+            // can size the transfer without decoding the body, and
+            // `content_type` stays so it can pick a decoder once it has.
+            let encoded = base64::engine::general_purpose::STANDARD.encode(raw.payload.as_slice());
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "id": raw.id,
+                    "content_type": raw.content_type,
+                    "payload_length": raw.payload.len(),
+                    "payload_base64": encoded,
+                    "created_at": raw.created_at,
+                })),
+            )
+                .into_response()
+        }
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "raw source not found"})),

@@ -110,6 +110,16 @@ impl SourceRef {
     }
 }
 
+/// Namespace a memory read or write lands in when the caller carries none.
+///
+/// Every raw/schema/summary key is scoped by namespace, so a caller that has no
+/// workspace of its own still needs one name to read and write under, and the
+/// two sides must agree on it or a write becomes invisible to the read that was
+/// meant to find it. Defined once here rather than spelled out at each entry
+/// point: the gateway, the in-process tools and the ingest paths all address the
+/// same store.
+pub const DEFAULT_MEMORY_NAMESPACE: &str = "default";
+
 /// Layer 0 — Raw Sources.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RawSource {

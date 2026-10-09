@@ -1380,6 +1380,7 @@ name = "cog-agent"
 version = "0.5.8"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "cog-core",
  "cog-redis",
