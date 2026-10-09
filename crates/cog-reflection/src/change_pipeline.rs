@@ -339,11 +339,7 @@ impl ChangePipeline {
             // The engine knows this change's own status and the goal it was
             // generated for; the directory alone knows neither.
             let record = match engine {
-                Some(engine) => engine
-                    .list_results()
-                    .await
-                    .into_iter()
-                    .find(|r| r.artifact_id == artifact_id),
+                Some(engine) => engine.get_result(&artifact_id).await,
                 None => None,
             };
             let status = record
@@ -380,6 +376,26 @@ impl ChangePipeline {
 
         results.sort_by_key(|a| std::cmp::Reverse(a.created_at));
         Ok(results)
+    }
+
+    /// Read a change's diff text back from disk by `artifact_id`.
+    ///
+    /// The engine's resident index deliberately keeps no artifact text (see
+    /// `resident_record`), so a reader that has an id but no content -- the
+    /// admin listing, for a change that has already left the pending queue --
+    /// reads it here instead. `retired/` is searched second because that is
+    /// where the queue puts every change that lands or is refused, and those
+    /// are exactly the ones the pending scan no longer returns.
+    pub async fn read_change_content(&self, artifact_id: &str) -> Option<String> {
+        let pending = self.change_dir.join(format!("{artifact_id}.diff"));
+        if let Ok(text) = tokio::fs::read_to_string(&pending).await {
+            return Some(text);
+        }
+        let retired = self
+            .change_dir
+            .join("retired")
+            .join(format!("{artifact_id}.diff"));
+        tokio::fs::read_to_string(retired).await.ok()
     }
 
     /// Take a change out of the pending queue, keeping it under `retired/` for

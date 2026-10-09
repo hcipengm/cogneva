@@ -216,10 +216,7 @@ impl EvolutionAdminService {
 
     async fn get_policy_result(&self, change_id: &str) -> Option<crate::types::EvolutionResult> {
         if let Some(ref evo) = self.engine.evolution {
-            evo.list_results()
-                .await
-                .into_iter()
-                .find(|r| r.artifact_id == change_id)
+            evo.get_result(change_id).await
         } else {
             self.policy_results.read().await.get(change_id).cloned()
         }
@@ -292,7 +289,25 @@ impl EvolutionAdminService {
                 None => None,
             }
         } else {
-            summarize_diff(&r.content)
+            // The resident index keeps no artifact text, so a change that has
+            // already left the pending queue arrives here with `content` empty
+            // and its diff is read back from where the pipeline retired it. A
+            // pending change still carries its content from `pending_changes`,
+            // and reading that back would be a second read of the same file.
+            //
+            // Only a code change has a diff on disk; the other kinds are read
+            // here too (the index serves them all and clears each one's text)
+            // but nothing wrote them to the change directory, so asking for a
+            // file that cannot exist would be a stat per row per listing, and
+            // it would build a path out of an id that never was a file name.
+            let content = if !r.content.is_empty() {
+                Some(r.content.clone())
+            } else if matches!(r.kind, crate::types::EvolutionKind::CodeChange) {
+                self.pipeline.read_change_content(&r.artifact_id).await
+            } else {
+                None
+            };
+            content.as_deref().and_then(summarize_diff)
         };
         EvolutionChangeInfo {
             id: r.artifact_id,
@@ -874,6 +889,26 @@ mod tests {
         async fn health_check(&self) -> bool {
             true
         }
+    }
+
+    #[test]
+    fn only_a_unified_diff_yields_a_summary() {
+        // Pins the property that dropping `content` from the resident index
+        // leans on. The summary was derived from the artifact text only when
+        // that text was a unified diff; a hook, tool or skill result carries
+        // the generator's JSON, and this returned None for it before the text
+        // stopped being kept. So emptying those entries cannot take a summary
+        // away from them -- and if this ever stops being true for the JSON
+        // shape, the drop would become a display regression and this test says
+        // so rather than the admin table quietly losing a column.
+        assert_eq!(
+            summarize_diff(r#"{"name":"tool","description":"a tool"}"#),
+            None
+        );
+        assert_eq!(
+            summarize_diff("--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n"),
+            Some("1 files, +1 -1".to_string())
+        );
     }
 
     #[tokio::test]

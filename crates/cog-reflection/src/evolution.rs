@@ -84,43 +84,28 @@ pub struct EvolutionEngine {
     /// When `Some`, a change's target paths are validated against the real
     /// workspace instead of an isolated temp crate.
     project_root: Option<std::path::PathBuf>,
-    /// In-memory log of all evolution attempts and their current status.
-    /// Production systems may additionally persist this to a backend.
+    /// Resident index of the evolution attempts this process has produced and
+    /// their current status, keyed by `artifact_id`. It is an index and not a
+    /// copy: [`resident_record`] drops each artifact's text, whose durable copy
+    /// lives in the change directory or the store that owns that artifact kind.
     results: Arc<tokio::sync::Mutex<std::collections::HashMap<String, EvolutionResult>>>,
 }
 
-/// Hard upper bound on the number of [`EvolutionResult`] entries kept in the
-/// engine's in-memory log.
+/// Move a produced result into the shape the resident index stores.
 ///
-/// Each result carries the full text of the artifact it produced in
-/// `content`, and the log had no reclaimer: every generation branch inserted
-/// for the pod's whole lifetime, so resident history grew with uptime until
-/// the evolution worker's normal burst amplitude carried its working set into
-/// the OOM band. Durable history is already written to disk (`change_dir`)
-/// and the recorder/state backend, so the resident log only needs recent
-/// entries and the bound makes worst-case resident usage independent of how
-/// many rollout cycles the pod lives through.
-pub(crate) const MAX_RESULTS: usize = 256;
-
-/// Evict the results with the earliest timestamps until `results` holds at
-/// most [`MAX_RESULTS`] entries. Returns how many entries were dropped.
-///
-/// This is the only eviction logic in the engine and it runs under the
-/// caller's results lock, so the bound cannot be bypassed by a new branch.
-fn evict_oldest(results: &mut std::collections::HashMap<String, EvolutionResult>) -> usize {
-    let mut evicted = 0;
-    while results.len() > MAX_RESULTS {
-        let Some(key) = results
-            .iter()
-            .min_by_key(|(_, value)| value.created_at)
-            .map(|(key, _)| key.clone())
-        else {
-            break;
-        };
-        results.remove(&key);
-        evicted += 1;
-    }
-    evicted
+/// The index keeps the artifact's metadata and drops `content`. The full text
+/// has a durable copy of its own -- the change directory for a code change,
+/// the registries and the artifact store for the rest -- so keeping it here
+/// only duplicated it, and it was the *size* of that text, not the number of
+/// entries, that made resident usage grow with uptime. A cap on the entry
+/// count cannot bound a quantity the entry size sets: "the most recent 256"
+/// is unbounded in bytes whenever an entry may be arbitrarily large. So the
+/// index holds no fixed cap at all -- what remains is one small record per
+/// artifact this process has produced, each mirrored by the store that already
+/// owns it.
+fn resident_record(mut result: EvolutionResult) -> EvolutionResult {
+    result.content.clear();
+    result
 }
 
 impl std::fmt::Debug for EvolutionEngine {
@@ -193,16 +178,16 @@ impl EvolutionEngine {
         self.insert_result(result).await;
     }
 
-    /// The single bounded insertion path for [`Self::results`].
+    /// The single insertion path for [`Self::results`].
     ///
-    /// Every result this engine produces is stored through here so the
-    /// [`MAX_RESULTS`] cap holds on every branch: after the entry is stored,
-    /// oldest entries are evicted under the same lock. Same `artifact_id`
+    /// Every result this engine produces is stored through here, so the shape
+    /// [`resident_record`] enforces -- metadata, no artifact text -- holds on
+    /// every branch and cannot be bypassed by a new one. Same `artifact_id`
     /// re-registers (latest proposal wins).
     async fn insert_result(&self, result: EvolutionResult) {
+        let result = resident_record(result);
         let mut results = self.results.lock().await;
         results.insert(result.artifact_id.clone(), result);
-        evict_oldest(&mut results);
     }
 
     /// Update the status of an evolution result by `artifact_id`.
@@ -228,7 +213,23 @@ impl EvolutionEngine {
         }
     }
 
+    /// Look one result up by `artifact_id`.
+    ///
+    /// Both readers that name a single change -- `ChangePipeline::pending_changes`
+    /// and `EvolutionAdminService::get_policy_result` -- used to call
+    /// `list_results` and then pick one entry out of the clone. `pending_changes`
+    /// does that inside its per-file loop, so every file in the queue cloned the
+    /// whole index and the allocation grew with `files x resident` to answer a
+    /// question about one record. A lookup answers it without touching the rest.
+    pub async fn get_result(&self, artifact_id: &str) -> Option<EvolutionResult> {
+        self.results.lock().await.get(artifact_id).cloned()
+    }
+
     /// List all evolution results ordered from newest to oldest.
+    ///
+    /// The records carry metadata only: `content` is not populated (see
+    /// [`resident_record`]). A caller that needs the artifact text reads it
+    /// back from where that artifact lives.
     pub async fn list_results(&self) -> Vec<EvolutionResult> {
         let results = self.results.lock().await;
         let mut list: Vec<EvolutionResult> = results.values().cloned().collect();
@@ -926,7 +927,7 @@ mod tests {
         EvolutionResult {
             kind: EvolutionKind::CodeChange,
             artifact_id: id.to_string(),
-            description: String::new(),
+            description: format!("desc-{id}"),
             content: format!("content-{id}"),
             status: EvolutionStatus::Generated,
             created_at,
@@ -935,47 +936,30 @@ mod tests {
     }
 
     #[test]
-    fn results_at_or_under_the_cap_keep_every_entry() {
-        let mut results = std::collections::HashMap::new();
-        for i in 0..MAX_RESULTS {
-            let id = format!("r-{i}");
-            results.insert(id.clone(), make_result(&id, chrono::Utc::now()));
-        }
-        assert_eq!(
-            evict_oldest(&mut results),
-            0,
-            "nothing at or below the cap may be evicted"
-        );
-        assert_eq!(results.len(), MAX_RESULTS);
+    fn make_result_carries_text_so_the_drop_test_proves_something() {
+        // Guards the guard: if `make_result` ever stopped carrying text, the
+        // assertion in the test below would pass without proving anything.
+        assert!(!make_result("r-0", chrono::Utc::now()).content.is_empty());
     }
 
     #[test]
-    fn results_beyond_the_cap_drop_the_oldest_entries() {
-        let mut results = std::collections::HashMap::new();
-        let now = chrono::Utc::now();
-        let total = MAX_RESULTS + 5;
-        for i in 0..total {
-            let id = format!("r-{i}");
-            results.insert(
-                id.clone(),
-                make_result(&id, now + chrono::Duration::milliseconds(i as i64)),
-            );
-        }
+    fn the_resident_record_keeps_the_metadata_and_drops_the_artifact_text() {
+        // Resident usage used to grow with the size of the artifact text, which
+        // is a quantity an entry-count cap cannot bound. The record the index
+        // stores keeps the metadata and drops the text; the durable copy stays
+        // where the artifact already lives.
+        let stored = resident_record(make_result("r-0", chrono::Utc::now()));
+        assert!(
+            stored.content.is_empty(),
+            "the artifact text must not stay resident"
+        );
+        assert_eq!(stored.artifact_id, "r-0");
         assert_eq!(
-            evict_oldest(&mut results),
-            5,
-            "the five over-cap entries go"
+            stored.description, "desc-r-0",
+            "the metadata the index exists for must survive the drop"
         );
-        assert_eq!(results.len(), MAX_RESULTS, "the cap is a hard bound");
-        assert!(
-            !results.contains_key("r-4"),
-            "the earliest results must be evicted"
-        );
-        assert!(
-            results.contains_key("r-5"),
-            "entries newer than the cap floor must survive"
-        );
-        assert!(results.contains_key(&format!("r-{}", total - 1)));
+        assert_eq!(stored.kind, EvolutionKind::CodeChange);
+        assert_eq!(stored.status, EvolutionStatus::Generated);
     }
 
     #[test]
