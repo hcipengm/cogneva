@@ -10,7 +10,6 @@ pub mod observable;
 pub mod runtime;
 pub mod tools;
 pub mod wal;
-pub mod working_memory;
 pub mod worktree;
 
 pub use config::{AgentLoopConfig, AgentManagerConfig};

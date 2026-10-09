@@ -73,8 +73,6 @@ pub struct Agent {
     message_backend: Option<Arc<dyn cog_core::MessageBackend>>,
     /// State backend for shared ContextBoard read/write.
     state_backend: Option<Arc<dyn cog_core::StateBackend>>,
-    /// Working memory for anti-loop context management.
-    pub working_memory: Option<crate::working_memory::AgentWorkingMemory>,
     /// Cross-session reflection engine for learning detection and promotion.
     reflection_engine: Option<Arc<dyn cog_core::ReflectionEngine>>,
     /// Checkpoint store for agent state persistence.
@@ -146,7 +144,6 @@ impl Agent {
             registration: None,
             message_backend: None,
             state_backend: None,
-            working_memory: None,
             reflection_engine: None,
             checkpoint_store: None,
             sandbox_backend: None,
@@ -296,15 +293,6 @@ impl Agent {
     /// Configure the state backend for shared ContextBoard access.
     pub fn with_state_backend(mut self, backend: Arc<dyn cog_core::StateBackend>) -> Self {
         self.state_backend = Some(backend);
-        self
-    }
-
-    /// Configure the working memory for anti-loop context management.
-    pub fn with_working_memory(
-        mut self,
-        memory: crate::working_memory::AgentWorkingMemory,
-    ) -> Self {
-        self.working_memory = Some(memory);
         self
     }
 
