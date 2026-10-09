@@ -44,13 +44,16 @@ impl cog_core::SystemPlugin for WikiPlugin {
 
         // Build and publish UnifiedKnowledgeBackend when possible.
         if let Some(ref wiki) = wiki_adapter {
-            let mut unified = crate::UnifiedKnowledgeBackend::new().with_wiki(wiki.clone());
-            if let Some(memory) = ctx.consume_service::<dyn cog_core::MemoryBackend>() {
-                unified = unified.with_memory(memory);
-            }
-            if let Some(embedding) = ctx.consume_service::<dyn cog_core::EmbeddingProvider>() {
-                unified = unified.with_embedding(embedding);
-            }
+            // Both services are wired as handles rather than read here. The
+            // memory plugin publishes them and it initialises in this plugin's
+            // own layer, where plugins initialise concurrently -- so a read
+            // here yields a service only when that plugin's init happens to
+            // finish first. The handles resolve on first use instead, which is
+            // after every init has returned.
+            let unified = crate::UnifiedKnowledgeBackend::new()
+                .with_wiki(wiki.clone())
+                .with_memory_late(cog_core::LateService::new(ctx.clone()))
+                .with_embedding_late(cog_core::LateService::new(ctx.clone()));
             ctx.publish_service::<dyn cog_core::KnowledgeBackend>(Arc::new(unified));
             info!("WikiPlugin KnowledgeBackend published");
         }

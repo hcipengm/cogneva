@@ -355,3 +355,43 @@ async fn a_second_decomposition_of_the_same_class_folds_into_the_row() {
         "宽度按已记录的次数取均值"
     );
 }
+
+/// The memory layer survives being published after this backend is built.
+///
+/// The wiki plugin builds this backend inside its own `init`, and the memory
+/// plugin publishes the service in the same init layer, where plugins
+/// initialise concurrently — so the publish lands after the build about half
+/// the time. A backend that read the service while building would carry no
+/// memory layer for the rest of that process, and every retrieval would come
+/// back empty for a reason nothing on the read side states. The handle
+/// resolves on first use instead, which is after every init has returned.
+#[tokio::test]
+async fn a_memory_layer_published_after_the_backend_is_built_is_still_found() {
+    let ctx = cog_core::PluginContext::new(cog_core::Config::default());
+    let knowledge: Arc<dyn KnowledgeBackend> = Arc::new(
+        UnifiedKnowledgeBackend::new()
+            .with_memory_late(cog_core::LateService::new(ctx.as_owner("test"))),
+    );
+
+    // Built first, published second: the order the wiki plugin meets whenever
+    // the memory plugin's init happens to finish last.
+    let memory: Arc<dyn MemoryBackend> = Arc::new(cog_memory::backend::MemoryMemoryBackend::new());
+    ctx.publish_service(memory);
+
+    let task = Task::new(
+        "task-late",
+        TaskType::Generator,
+        serde_json::json!({ "goal": "late publication" }),
+    );
+    knowledge
+        .archive_execution(&task, &result_of(true, 0.5, None, "archived late"))
+        .await
+        .unwrap();
+
+    let history = knowledge.retrieve_task_history("task-late").await.unwrap();
+    assert_eq!(
+        history.len(),
+        1,
+        "发布晚于构建的 memory 层仍应被解析到，否则这条检索恒空"
+    );
+}

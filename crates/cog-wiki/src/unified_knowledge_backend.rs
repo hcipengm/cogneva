@@ -18,22 +18,62 @@ use cog_core::{
 /// need.  When a backend is `None` the corresponding queries return empty
 /// results.
 pub struct UnifiedKnowledgeBackend {
-    memory: Option<Arc<dyn MemoryBackend>>,
+    memory: MaybeService<dyn MemoryBackend>,
     wiki: Option<Arc<dyn WikiBackend>>,
-    embedding: Option<Arc<dyn EmbeddingProvider>>,
+    embedding: MaybeService<dyn EmbeddingProvider>,
+}
+
+/// A service this backend may hold, and may only come to hold later.
+///
+/// The wiki plugin builds this backend inside its own `init`, and both the
+/// memory backend and the embedding provider are published by a plugin in the
+/// same layer — a layer initialises concurrently, so reading either service
+/// there yields one only when that plugin's `init` happens to finish first.
+/// `Late` defers the lookup to the first use, which runs after every `init`
+/// has returned; `Ready` is for a caller that already holds the service.
+///
+/// `None` and a `Late` that resolves to nothing are the same fact — this
+/// process does not hold the service — and both are kept apart from the empty
+/// answer a query gives when the service is there and has nothing to hand
+/// back: a retrieval that comes up with nothing has to be able to say which of
+/// the two it was.
+enum MaybeService<T: ?Sized> {
+    None,
+    Ready(Arc<T>),
+    Late(cog_core::LateService<T>),
+}
+
+impl<T: ?Sized + Send + Sync + 'static> MaybeService<T> {
+    fn resolve(&self) -> Option<Arc<T>> {
+        match self {
+            MaybeService::None => None,
+            MaybeService::Ready(service) => Some(service.clone()),
+            MaybeService::Late(handle) => handle.get(),
+        }
+    }
 }
 
 impl UnifiedKnowledgeBackend {
     pub fn new() -> Self {
         Self {
-            memory: None,
+            memory: MaybeService::None,
             wiki: None,
-            embedding: None,
+            embedding: MaybeService::None,
         }
     }
 
     pub fn with_memory(mut self, memory: Arc<dyn MemoryBackend>) -> Self {
-        self.memory = Some(memory);
+        self.memory = MaybeService::Ready(memory);
+        self
+    }
+
+    /// Wire a memory layer that is resolved on first use rather than now.
+    ///
+    /// This is the form the plugin uses: it runs while the memory plugin may
+    /// still be initialising, and reading the service there would decide the
+    /// backend by init order.
+    pub fn with_memory_late(mut self, memory: cog_core::LateService<dyn MemoryBackend>) -> Self {
+        self.memory = MaybeService::Late(memory);
         self
     }
 
@@ -43,7 +83,19 @@ impl UnifiedKnowledgeBackend {
     }
 
     pub fn with_embedding(mut self, embedding: Arc<dyn EmbeddingProvider>) -> Self {
-        self.embedding = Some(embedding);
+        self.embedding = MaybeService::Ready(embedding);
+        self
+    }
+
+    /// Wire an embedding provider that is resolved on first use rather than now.
+    ///
+    /// Same reason as [`Self::with_memory_late`]: the provider is published by
+    /// the memory plugin, in this plugin's own init layer.
+    pub fn with_embedding_late(
+        mut self,
+        embedding: cog_core::LateService<dyn EmbeddingProvider>,
+    ) -> Self {
+        self.embedding = MaybeService::Late(embedding);
         self
     }
 }
@@ -195,8 +247,8 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
         let mut entries: Vec<KnowledgeEntry> = Vec::new();
 
         // --- Memory layer ---
-        if let Some(ref memory) = self.memory {
-            let embedding = if let Some(ref provider) = self.embedding {
+        if let Some(memory) = self.memory.resolve() {
+            let embedding = if let Some(provider) = self.embedding.resolve() {
                 match provider.embed(vec![query.into()]).await {
                     Ok(mut vecs) if !vecs.is_empty() => Some(vecs.remove(0)),
                     Ok(_) => None,
@@ -289,7 +341,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
         goal: &str,
         top_k: usize,
     ) -> SFResult<Vec<TaskDecompositionPattern>> {
-        let Some(ref memory) = self.memory else {
+        let Some(memory) = self.memory.resolve() else {
             return Ok(Vec::new());
         };
 
@@ -319,7 +371,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
         input_summary: &str,
         top_k: usize,
     ) -> SFResult<Vec<ImplementationExample>> {
-        let Some(ref memory) = self.memory else {
+        let Some(memory) = self.memory.resolve() else {
             return Ok(Vec::new());
         };
 
@@ -355,7 +407,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
         task_type: &str,
         top_k: usize,
     ) -> SFResult<Vec<FailurePattern>> {
-        let Some(ref memory) = self.memory else {
+        let Some(memory) = self.memory.resolve() else {
             return Ok(Vec::new());
         };
 
@@ -370,7 +422,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
     }
 
     async fn retrieve_task_history(&self, task_id: &str) -> SFResult<Vec<TaskExecutionRecord>> {
-        let Some(ref memory) = self.memory else {
+        let Some(memory) = self.memory.resolve() else {
             return Ok(Vec::new());
         };
 
@@ -385,7 +437,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
     }
 
     async fn archive_execution(&self, task: &Task, result: &TaskResult) -> SFResult<()> {
-        let Some(ref memory) = self.memory else {
+        let Some(memory) = self.memory.resolve() else {
             return Ok(());
         };
 
@@ -424,7 +476,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
             task.id, task.task_type, result.success, result_summary
         );
 
-        let embedding = if let Some(ref provider) = self.embedding {
+        let embedding = if let Some(provider) = self.embedding.resolve() {
             match provider.embed(vec![summary_text.clone()]).await {
                 Ok(mut vecs) if !vecs.is_empty() => vecs.remove(0),
                 Ok(_) => Vec::new(),
@@ -469,7 +521,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
             .unwrap_or_default();
         if result.success {
             self.archive_implementation(
-                memory,
+                &memory,
                 &task_type,
                 &input_summary,
                 &result_summary,
@@ -478,7 +530,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
             .await;
         } else {
             self.archive_failure(
-                memory,
+                &memory,
                 &task_type,
                 &result_summary,
                 result.metadata.feedback.as_deref().unwrap_or_default(),
@@ -490,7 +542,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
     }
 
     async fn archive_decomposition(&self, task: &Task, sub_task_types: &[String]) -> SFResult<()> {
-        let Some(ref memory) = self.memory else {
+        let Some(memory) = self.memory.resolve() else {
             return Ok(());
         };
 
@@ -546,7 +598,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
             }
         };
         self.upsert(
-            memory,
+            &memory,
             NS_DECOMPOSITION,
             SchemaKind::Learning,
             &key,
