@@ -1461,7 +1461,7 @@
         },
         {
             "name": "baseline_port_tick_failing_every_round",
-            "promql": "(max without (pod, container, instance, job) (min_over_time(baseline_port_tick_failed[6m] and ((time() - baseline_port_tick_failed_observed_timestamp_seconds) < 600))) == 1) and (max without (pod, container, instance, job) (count_over_time(baseline_port_tick_failed[12m])) > max without (pod, container, instance, job) (count_over_time(baseline_port_tick_failed[6m])))",
+            "promql": "(max without (pod, container, instance, job) (min_over_time(baseline_port_tick_failed[6m]) and ((time() - baseline_port_tick_failed_observed_timestamp_seconds) < 600)) == 1) and (max without (pod, container, instance, job) (count_over_time(baseline_port_tick_failed[12m])) > max without (pod, container, instance, job) (count_over_time(baseline_port_tick_failed[6m])))",
             "condition": {
               "greater_than": 0.0
             },

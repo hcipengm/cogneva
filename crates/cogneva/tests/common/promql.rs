@@ -290,6 +290,59 @@ fn token_before(s: &str, end: usize) -> Option<&str> {
     }
 }
 
+/// Range selectors with something after them that PromQL does not allow there.
+///
+/// A `[...]` may stand in one place only -- as a function's argument -- so the
+/// tokens that may follow it are the bracket closing that call, a comma, the
+/// `offset` or `@` modifier, and the end of the expression. Everything else is
+/// a parse error, and the shape it is reached by is a guard attached to the
+/// selector instead of to the aggregate: `min_over_time(x[6m] and (...))` reads
+/// as though the guard narrows the samples the minimum is taken over, and what
+/// it is is a range vector handed to a set operator.
+///
+/// The complaint is worth its own function because this is the one unparseable
+/// edit the clause scan cannot see: the operator is present and the brackets
+/// balance, so every other question in this module is answered as though the
+/// text were fine.
+fn range_selector_operand_complaints(stripped: &str) -> Vec<String> {
+    let bytes = stripped.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b']' {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        i = j;
+        if j >= bytes.len() {
+            continue;
+        }
+        let c = bytes[j] as char;
+        if c == ')' || c == ',' || c == '@' {
+            continue;
+        }
+        let is_offset = stripped[j..].starts_with("offset")
+            && (j + "offset".len() == bytes.len() || !token_char(bytes[j + "offset".len()]));
+        if is_offset {
+            continue;
+        }
+        let end = stripped[j..]
+            .find(|ch: char| ch.is_ascii_whitespace() || "(),".contains(ch))
+            .map(|p| j + p)
+            .unwrap_or(bytes.len());
+        out.push(format!(
+            "区间选择子 `[...]` 后面跟着 `{}`：`[...]` 只能当函数的实参，\
+             区间向量不是任何运算符的操作数，这一句 Prometheus 返回 400、规则一次都不会求值",
+            &stripped[j..end]
+        ));
+    }
+    out
+}
+
 /// What a reader can decide about a PromQL expression without a parser, on the
 /// side where the failure is silent.
 ///
@@ -302,15 +355,26 @@ fn token_before(s: &str, end: usize) -> Option<&str> {
 /// what a hand-edited `A{...} on(pod) (B{...} > 0)` looks like when the `/` is
 /// dropped. Unbalanced brackets are caught for the same reason.
 ///
+/// The other shape is the mirror of that one: the operator is present and in
+/// the wrong place. A range selector is only ever a function's argument, so a
+/// binary or set operator sitting right after one leaves the expression
+/// unparseable -- `min_over_time(x[6m] and (y > 0))` is where a guard written
+/// for a store-served gauge lands when the closing bracket is put after the
+/// guard instead of before it, and it fails the same way: a 400 from
+/// Prometheus, a query that never returns, and a rule that is silent through
+/// the fault it names. The clause scan above cannot see it, because nothing is
+/// missing *within* an operand: the operator is there, the brackets balance,
+/// and every series name is real.
+///
 /// This is not a parser, and being explicit about the ceiling is the point: a
 /// well-formed-shape expression naming a series that does not exist, a wrong
 /// label in a matcher, or a mistyped aggregation all pass. What it decides is
-/// the one edit that leaves every series name intact and the expression
-/// unparseable, which is the edit whose result nothing else in this repository
-/// can see.
+/// the edits that leave every series name intact and the expression
+/// unparseable, which are the edits whose result nothing else in this
+/// repository can see.
 pub fn shape_complaints(expr: &str) -> Vec<String> {
-    let mut out = Vec::new();
     let stripped = strip_braces(&strip_quoted(expr));
+    let mut out = range_selector_operand_complaints(&stripped);
 
     let bytes = stripped.as_bytes();
     let mut i = 0;
@@ -1052,6 +1116,45 @@ mod tests {
         assert!(shape_complaints("sum((a)")
             .iter()
             .any(|c| c.contains("少 1")));
+    }
+
+    /// The mirror of the dropped operator: the operator is present and the
+    /// bracket sits on the wrong side of the guard. The clause scan is blind to
+    /// it -- every series name is real, no clause is missing one, the brackets
+    /// balance -- and Prometheus rejects the whole expression, so the rule goes
+    /// quiet through the fault it names.
+    #[test]
+    fn a_range_selector_used_as_an_operand_is_reported() {
+        let broken = "(max without (pod) (min_over_time(x[6m] and \
+             ((time() - x_observed_timestamp_seconds) < 600))) == 1)";
+        let complaints = shape_complaints(broken);
+        assert_eq!(complaints.len(), 1, "{complaints:?}");
+        assert!(complaints[0].contains("`and`"), "{}", complaints[0]);
+
+        // The fix, which is the shape the store-served-gauge guards ship: the
+        // call closes before the guard, and the selector ends the operand.
+        let fixed = "(max without (pod) (min_over_time(x[6m]) and \
+             ((time() - x_observed_timestamp_seconds) < 600)) == 1)";
+        assert!(
+            shape_complaints(fixed).is_empty(),
+            "{:?}",
+            shape_complaints(fixed)
+        );
+
+        // The continuations PromQL does allow after a selector stay silent:
+        // the bracket that closes the call, a comma, and the modifiers.
+        for expr in [
+            "sum(rate(a[5m]))",
+            "quantile_over_time(0.9, a[5m])",
+            "rate(a[5m] offset 1h)",
+            "a[5m] @ end()",
+        ] {
+            assert!(
+                shape_complaints(expr).is_empty(),
+                "{expr}: {:?}",
+                shape_complaints(expr)
+            );
+        }
     }
 
     /// The first thing the gate can see is the first clause in the expression:

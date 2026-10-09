@@ -757,12 +757,15 @@ fn every_series_an_alert_rule_reads_is_one_something_produces() {
 /// passes it for the same reason a blank panel passes: every series it names is
 /// really produced.
 ///
-/// The shape this catches is the one a hand edit makes: an operator dropped
-/// between two operands that a matching clause then sits in front of. Nothing
-/// in this repository reads PromQL grammar, so before this test the only thing
-/// between such an edit and an alert that stays quiet through its own incident
-/// was a person noticing. A rule and a panel fail the same way here, which is
-/// why both sides of this contract ask the same question about their text.
+/// The shapes this catches are the ones a hand edit makes: an operator dropped
+/// between two operands that a matching clause then sits in front of, and the
+/// same edit with the bracket on the wrong side of the guard -- a range
+/// selector handed to a set operator, which Prometheus rejects outright and the
+/// clause scan cannot see. Nothing in this repository reads PromQL grammar, so
+/// before this test the only thing between such an edit and an alert that stays
+/// quiet through its own incident was a person noticing. A rule and a panel
+/// fail the same way here, which is why both sides of this contract ask the
+/// same question about their text.
 #[test]
 fn every_expression_a_rule_writes_is_one_prometheus_can_parse() {
     let mut complaints: Vec<String> = Vec::new();
