@@ -651,6 +651,11 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 )
                 .with_verification_budget(budget.clone())
                 .with_promotion_policy(promotion.clone())
+                // The command that judges a change comes from the deployment,
+                // not from this crate: a project that is not a Rust workspace
+                // declares its own suite here, and the value recorded in a
+                // change's evidence is this one.
+                .with_test_command(self_evolution.test_command.clone())
                 .with_target_dir(&self_evolution.workspaces.target_dir);
                 // 变更忠实度读数的去处：调用点在这里，句柄也从这里给，不再
                 // 绕经生成引擎——那条路已经删了。
@@ -689,6 +694,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     binary_dir: self_evolution.binary_dir.clone().into(),
                     backup_dir: self_evolution.backup_dir.clone().into(),
                     test_timeout_secs: self_evolution.test_timeout_secs,
+                    test_command: self_evolution.test_command.clone(),
                     build_timeout_secs: self_evolution.build_timeout_secs,
                     auto_apply: self_evolution.auto_apply,
                     manual_approve: self_evolution.manual_approve,

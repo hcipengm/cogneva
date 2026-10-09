@@ -126,6 +126,12 @@ pub struct ChangeExecutionWorld {
     pub binary_dir: PathBuf,
     pub backup_dir: PathBuf,
     pub test_timeout_secs: u64,
+    /// The command that judges a change. Travels in the world rather than being
+    /// read from the config again on the executing side: a request is built and
+    /// run by two processes, and a second read of the config is a second value
+    /// that can differ from the one the request was built against.
+    #[serde(default = "cog_core::SelfEvolutionConfig::default_test_command")]
+    pub test_command: Vec<String>,
     pub build_timeout_secs: u64,
     pub auto_apply: bool,
     pub manual_approve: bool,
@@ -550,6 +556,7 @@ async fn run_in(
     )
     .with_verification_budget(budget.clone())
     .with_promotion_policy(world.promotion.clone())
+    .with_test_command(world.test_command.clone())
     .with_target_dir(world.target_dir.as_path());
     let deployer = EvolutionDeployer::new(
         world.project_root.as_path(),
@@ -1498,6 +1505,7 @@ mod tests {
             binary_dir: PathBuf::from("/opt/cogneva/bin"),
             backup_dir: PathBuf::from("/opt/cogneva/bin/backups"),
             test_timeout_secs: 3600,
+            test_command: cog_core::SelfEvolutionConfig::default_test_command(),
             build_timeout_secs: 3600,
             auto_apply: true,
             manual_approve: false,

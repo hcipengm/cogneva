@@ -1219,6 +1219,14 @@ pub struct SelfEvolutionConfig {
     pub health_check_interval_secs: u64,
     pub health_check_max_retries: u32,
     pub test_timeout_secs: u64,
+    /// The command that judges a generated change, as argv — a program and its
+    /// arguments, not a shell line, so a configured value cannot become one.
+    /// The default is this workspace's own suite; a project that is not a Rust
+    /// workspace sets its own, and that is what makes the verification gate a
+    /// property of the project rather than of cogneva. It must name a program:
+    /// an empty list is refused where it is read, because a change accepted
+    /// with no command run is not a change that passed anything.
+    pub test_command: Vec<String>,
     pub build_timeout_secs: u64,
     pub poll_interval_secs: u64,
     /// 反思条目的归档与它的派生层（schema）是两次独立写，第二次失败或中途
@@ -1247,6 +1255,29 @@ pub fn self_evolution_hook_dir(change_dir: impl AsRef<std::path::Path>) -> std::
     change_dir.as_ref().join("hooks")
 }
 
+impl SelfEvolutionConfig {
+    /// The command that judges a change when the deployment names none.
+    ///
+    /// It is a function rather than a literal in `Default` so that the
+    /// serialized change-execution world — built in one process, run in
+    /// another — can default to the same command instead of carrying a second
+    /// copy of it; two copies are two values that can drift, and the drift
+    /// would be invisible until a deployment named one and ran the other.
+    ///
+    /// `--no-fail-fast` because the verdict is read by whoever investigates a
+    /// rejection: stopping at the first failing crate hides the rest of the
+    /// failure surface and makes an environmental problem look like the only
+    /// problem.
+    pub fn default_test_command() -> Vec<String> {
+        vec![
+            "cargo".into(),
+            "test".into(),
+            "--workspace".into(),
+            "--no-fail-fast".into(),
+        ]
+    }
+}
+
 impl Default for SelfEvolutionConfig {
     fn default() -> Self {
         Self {
@@ -1265,6 +1296,7 @@ impl Default for SelfEvolutionConfig {
             health_check_interval_secs: 5,
             health_check_max_retries: 6,
             test_timeout_secs: 3600,
+            test_command: Self::default_test_command(),
             build_timeout_secs: 3600,
             poll_interval_secs: 60,
             schema_repair_interval_secs: 600,
@@ -1507,6 +1539,29 @@ mod tests {
         assert_eq!(
             self_evolution_hook_dir("/opt/cogneva/sandbox/changes/"),
             std::path::Path::new("/opt/cogneva/sandbox/changes/hooks")
+        );
+    }
+
+    /// The command that judges a change is configurable, and its default is the
+    /// one every deployment ran while it was hardcoded. Both halves are the
+    /// point: a project that is not a Rust workspace names its own suite, and a
+    /// deployment that names none keeps behaving exactly as it did.
+    #[test]
+    fn the_test_command_defaults_to_the_workspaces_suite_and_can_be_set() {
+        assert_eq!(
+            SelfEvolutionConfig::default().test_command,
+            ["cargo", "test", "--workspace", "--no-fail-fast"].map(String::from)
+        );
+        let configured: SelfEvolutionConfig =
+            serde_json::from_value(serde_json::json!({ "test_command": ["pytest", "-q"] }))
+                .expect("a configured command parses");
+        assert_eq!(configured.test_command, ["pytest", "-q"].map(String::from));
+        // A document that does not mention it still loads, because the struct
+        // default fills it — the key must not be required.
+        let unset: SelfEvolutionConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(
+            unset.test_command,
+            SelfEvolutionConfig::default_test_command()
         );
     }
 }

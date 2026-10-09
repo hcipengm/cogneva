@@ -502,6 +502,7 @@
     "health_check_interval_secs": 5,
     "health_check_max_retries": 6,
     "test_timeout_secs": 600,
+    "test_command": ["cargo", "test", "--workspace", "--no-fail-fast"],
     "build_timeout_secs": 1800,
     "poll_interval_secs": 60,
     "notify_on_success": true,

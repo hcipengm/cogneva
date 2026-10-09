@@ -5,8 +5,8 @@
 //! - Scan `change_dir` for `.diff` files (unified diff format).
 //! - Validate every affected path: must exist, must live inside the workspace,
 //!   and must not point to build/config/deployment files.
-//! - Apply changes with `git apply`, run `cargo test --workspace`,
-//!   and roll back on failure.
+//! - Apply changes with `git apply`, run the configured test command (the
+//!   default judges this Rust workspace), and roll back on failure.
 //! - Report results by updating the evolution status.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -186,6 +186,11 @@ pub struct ChangePipeline {
     /// runs a single test, so this bounds a build-plus-test, not just a test;
     /// a budget shorter than one real run turns every verdict into a timeout.
     test_timeout_secs: u64,
+    /// The command that judges a change, as argv. Comes from the deployment's
+    /// `self_evolution.test_command`; the default judges a Rust workspace, so a
+    /// project that is not one has to say so here rather than be judged by a
+    /// command that cannot run in its tree.
+    test_command: Vec<String>,
     /// Wall-clock bound on the format check. Short on purpose: the check does
     /// not compile anything, so a run this side of the bound is a hung process
     /// rather than a slow one — and a hung process would hold the executor's
@@ -305,6 +310,7 @@ impl ChangePipeline {
             change_dir: change_dir.into(),
             auto_apply,
             test_timeout_secs: 3600,
+            test_command: cog_core::SelfEvolutionConfig::default().test_command,
             fmt_timeout_secs: DEFAULT_FMT_TIMEOUT_SECS,
             promotion_policy: None,
             target_dir: None,
@@ -349,6 +355,14 @@ impl ChangePipeline {
 
     pub fn with_test_timeout(mut self, secs: u64) -> Self {
         self.test_timeout_secs = secs;
+        self
+    }
+
+    /// The deployment's test command. Taken from the config where the pipeline
+    /// is built, not defaulted here, so the command recorded in a change's
+    /// evidence is the one the deployment configured.
+    pub fn with_test_command(mut self, command: Vec<String>) -> Self {
+        self.test_command = command;
         self
     }
 
@@ -972,7 +986,7 @@ impl ChangePipeline {
             }
         };
 
-        let (test_passed, test_output) = match self.run_cargo_test(workdir).await {
+        let (test_passed, test_output) = match self.run_test_command(workdir).await {
             Ok(result) => result,
             // No slot for the whole wait budget: the tests never ran, so nothing
             // about the change was judged. This stays an `Err` -- the caller
@@ -980,12 +994,12 @@ impl ChangePipeline {
             // `Refused` retires it. Folding a busy host in here would retire a
             // sound change for the load the machine happened to be under.
             Err(e) if e.is_build_slot_refused() => {
-                warn!(change_id = %change.artifact_id, error = %e, "cargo test got no build slot");
+                warn!(change_id = %change.artifact_id, error = %e, command = %self.test_command_line(), "the test command got no build slot");
                 let _ = self.git_reset_hard(workdir).await;
                 return Err(e);
             }
             Err(e) => {
-                warn!(change_id = %change.artifact_id, error = %e, "cargo test execution failed");
+                warn!(change_id = %change.artifact_id, error = %e, command = %self.test_command_line(), "the test command failed to execute");
                 let _ = self.git_reset_hard(workdir).await;
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
@@ -993,7 +1007,7 @@ impl ChangePipeline {
                     reformatted: false,
                     pre_existing_failures: 0,
                     verdict: ChangeVerdict::Refused(cog_core::RejectionCause::TestRunUnavailable),
-                    test_output: format!("Failed to execute cargo test: {}", e),
+                    test_output: format!("Failed to execute {}: {}", self.test_command_line(), e),
                     new_status: EvolutionStatus::ValidationFailed,
                 });
             }
@@ -1636,20 +1650,28 @@ impl ChangePipeline {
         })
     }
 
-    /// Run `cargo test --workspace` and return (success, combined_output).
+    /// Run the configured test command and return (success, combined_output).
     ///
-    /// `--no-fail-fast` because the verdict is read by whoever investigates a
-    /// rejection: stopping at the first failing crate hides the rest of the
-    /// failure surface and makes an environmental problem look like the only
-    /// problem.
-    async fn run_cargo_test(&self, workdir: &Path) -> SFResult<(bool, String)> {
-        info!("Running cargo test --workspace");
+    /// The command is the deployment's, not this crate's: a project that is not
+    /// a Rust workspace is judged by its own suite, and the default is the one
+    /// every deployment ran while this was hardcoded.
+    ///
+    /// An empty command is refused rather than treated as "nothing to run":
+    /// accepting a change because no criterion was reachable is the one reading
+    /// of a missing command that must not be available, and it is the reading a
+    /// typo in a config file would produce.
+    async fn run_test_command(&self, workdir: &Path) -> SFResult<(bool, String)> {
+        let Some(program) = self.test_command.first() else {
+            return Err(SFError::Config(
+                "self_evolution.test_command is empty: no command would judge this change".into(),
+            ));
+        };
         // The heaviest build this host runs, so it is the one the slot exists
         // for. Bound to a named variable, not `_`: an underscore drops the
         // permit on the spot and would bound nothing at all.
         let _slot = cog_core::build_gate::acquire("change verification").await?;
-        let mut cmd = tokio::process::Command::new("cargo");
-        cmd.args(["test", "--workspace", "--no-fail-fast"])
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(&self.test_command[1..])
             .current_dir(workdir)
             .kill_on_drop(true);
         self.apply_verification_env(&mut cmd);
@@ -1660,8 +1682,9 @@ impl ChangePipeline {
                 .await
             {
                 Ok(result) => {
-                    let output = result
-                        .map_err(|e| SFError::IO(format!("Failed to run cargo test: {}", e)))?;
+                    let output = result.map_err(|e| {
+                        SFError::IO(format!("Failed to run {}: {}", self.test_command_line(), e))
+                    })?;
                     if let Some(budget) = &self.budget {
                         budget.record_run(
                             crate::verification_budget::KIND_TEST,
@@ -1675,7 +1698,8 @@ impl ChangePipeline {
                         budget.record_timeout(crate::verification_budget::KIND_TEST);
                     }
                     return Err(SFError::IO(format!(
-                        "cargo test exceeded the {}s verification budget and was killed",
+                        "{} exceeded the {}s verification budget and was killed",
+                        self.test_command_line(),
                         self.test_timeout_secs
                     )));
                 }
@@ -1685,6 +1709,15 @@ impl ChangePipeline {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let combined = format!("{}{}", stdout, stderr);
         Ok((output.status.success(), combined))
+    }
+
+    /// The configured test command as it is written to the change's evidence.
+    ///
+    /// This is what makes the config item readable: the record left behind by a
+    /// rejection names the command that judged it, so a deployment running a
+    /// command other than the default can be told from one that is not.
+    fn test_command_line(&self) -> String {
+        self.test_command.join(" ")
     }
 
     /// Run CI's lint command over the workspace and return (succeeded, output).
@@ -1902,7 +1935,7 @@ impl ChangePipeline {
         }
 
         self.git_reset_hard(workdir).await?;
-        let (_, baseline_output) = self.run_cargo_test(workdir).await?;
+        let (_, baseline_output) = self.run_test_command(workdir).await?;
 
         self.git_apply(workdir, change_content).await.map_err(|e| {
             SFError::IO(format!(
@@ -2166,7 +2199,7 @@ mod tests {
             .with_verification_budget(budget.clone());
 
         let err = pipeline
-            .run_cargo_test(root.path())
+            .run_test_command(root.path())
             .await
             .expect_err("a run that cannot finish in a second must not be waited on");
 
@@ -2286,7 +2319,7 @@ impl Default for MetricsConfig {
             .with_verification_budget(budget.clone());
 
         let (passed, output) = pipeline
-            .run_cargo_test(root.path())
+            .run_test_command(root.path())
             .await
             .expect("a run inside its budget must be waited on");
 
@@ -2303,6 +2336,66 @@ impl Default for MetricsConfig {
                 .await
                 .expect("a finished run has a duration to report");
         assert!(elapsed >= 1.0, "the run slept a second: {elapsed}");
+    }
+
+    /// The command that judges a change is the deployment's, not this crate's:
+    /// a project that is not a Rust workspace is judged by its own suite, and
+    /// the verdict follows the configured command rather than the default.
+    #[tokio::test]
+    async fn the_configured_test_command_decides_the_verdict() {
+        let root = tempfile::tempdir().unwrap();
+
+        let failing = ChangePipeline::new(root.path(), root.path(), false)
+            .with_test_command(vec!["false".into()]);
+        let (passed, _) = failing
+            .run_test_command(root.path())
+            .await
+            .expect("`false` runs");
+        assert!(!passed, "the configured command decides the verdict");
+
+        let passing = ChangePipeline::new(root.path(), root.path(), false)
+            .with_test_command(vec!["true".into()]);
+        let (passed, _) = passing
+            .run_test_command(root.path())
+            .await
+            .expect("`true` runs");
+        assert!(passed);
+        assert_eq!(passing.test_command_line(), "true");
+    }
+
+    /// A command that cannot be started is recorded with the command in it, so
+    /// a deployment running something other than the default can be told from
+    /// one that never left it — the reading this config item exists to produce.
+    #[tokio::test]
+    async fn a_test_command_that_cannot_start_names_itself() {
+        let root = tempfile::tempdir().unwrap();
+        let pipeline = ChangePipeline::new(root.path(), root.path(), false)
+            .with_test_command(vec!["cogneva-no-such-test-command".into()]);
+
+        let err = pipeline
+            .run_test_command(root.path())
+            .await
+            .expect_err("a command that does not exist cannot return a verdict");
+        assert!(
+            err.to_string().contains("cogneva-no-such-test-command"),
+            "the failure has to name the command that was configured: {err}"
+        );
+    }
+
+    /// An empty command is a deployment that has not said how a change is
+    /// judged. Reading it as "nothing failed" would accept every change on a
+    /// config typo, which is the one reading a missing criterion must not have.
+    #[tokio::test]
+    async fn an_empty_test_command_is_refused_rather_than_read_as_a_pass() {
+        let root = tempfile::tempdir().unwrap();
+        let pipeline =
+            ChangePipeline::new(root.path(), root.path(), false).with_test_command(Vec::new());
+
+        let err = pipeline
+            .run_test_command(root.path())
+            .await
+            .expect_err("an empty command judges nothing and must not pass a change");
+        assert!(err.to_string().contains("test_command is empty"), "{err}");
     }
 
     /// A diff that introduces one brand-new file, the shape the generator
