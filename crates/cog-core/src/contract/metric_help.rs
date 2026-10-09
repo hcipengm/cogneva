@@ -374,6 +374,30 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          whole path",
     ),
     (
+        "cogneva_supervisor_pass_total",
+        "How each pass of the supervisor loop ended, summed over rounds and \
+         labelled by `pass` (which arm ran) and `outcome`. The loop drives six \
+         independent passes -- health, quota, rebalance, event aggregation, \
+         autonomous decisions, and control-plane status reporting -- and each one, \
+         when it failed, left only a log line that dies with the pod. Its only \
+         other reading is its own beat, and that beat is driven by the shortest of \
+         the six intervals, so a pass that could not run at all and a pass with \
+         nothing to do were the same picture, and an arm that stopped firing stayed \
+         invisible behind a beat the others kept stamping. `pass` is the closed set \
+         the producing module declares: health, quota, rebalance, event, \
+         autonomous, control_plane. `outcome` is ok or failed: every arm routes its \
+         round through one recording call, so the reading covers all six the same \
+         way. A failed cell rising is a pass failing every time it runs, which is a \
+         different fact from a pass with nothing to do. The autonomous arm reports \
+         no error by construction, so it only ever lands in ok -- a failure inside \
+         it surfaces as the loop's own death, since a panic in the body is counted \
+         by the liveness family. The control-plane arm has no cell while no control \
+         plane is configured, since the arm then has no work. The loop runs in every \
+         deployment that enables the supervisor and all of them write the one store, \
+         so a reader takes a single series rather than summing across deployments: \
+         the sum would report the same total once per writer",
+    ),
+    (
         "cogneva_mainline_superseded_rollout_total",
         "Rounds the deployer's guard answered that the revision it was carrying \
          had been overtaken upstream: 1 when it had (nothing is rolled out, the \

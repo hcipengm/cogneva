@@ -306,6 +306,26 @@ metric_names! {
     // reading covers the whole path.
     LOKI_FLUSH_TOTAL => "cogneva_loki_flush_total",
 
+    // cog-supervisor — how each pass of the supervisor loop ended, labelled by
+    // `pass` (which arm ran) and `outcome`, one pass per cell.
+    //
+    // The loop drives six independent passes -- health, quota, rebalance, event
+    // aggregation, autonomous decisions, and control-plane status reporting --
+    // and each one, when it failed, left only a WARN that died with the pod. Its
+    // only reading was its own beat, and that beat is driven by the shortest of
+    // the six intervals: a pass that could not run at all and a pass with nothing
+    // to do were the same picture, and a starved pass stayed invisible behind a
+    // live beat the other five kept stamping.
+    //
+    // A counter, because every pass runs on each of its own ticks and the fact is
+    // cumulative. `pass` names the arm and `outcome` is the closed set
+    // {ok, failed}; every arm routes its round through one recording call, so the
+    // reading covers all six the same way. The autonomous arm reports no error by
+    // construction, so it only ever lands in `ok` -- a failure inside it surfaces
+    // as the loop's own death, since a panic in the body is counted by the
+    // liveness family.
+    SUPERVISOR_PASS_TOTAL => "cogneva_supervisor_pass_total",
+
     // cog-reflection — the registry store's capacity reclamation, read by the
     // process that reclaims it.
     //

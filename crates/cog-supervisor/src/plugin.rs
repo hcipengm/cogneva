@@ -160,7 +160,11 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
             event_tx.subscribe(),
             meta_learning,
         )
-        .with_config_watch(supervisor_config_rx);
+        .with_config_watch(supervisor_config_rx)
+        // The per-pass outcome reading needs the metrics backend; this plugin
+        // declares `storage` in its descriptor, so that backend is published
+        // before this `init` runs and the handle is available here.
+        .with_metrics(ctx.consume_service::<dyn cog_core::MetricsBackend>());
         if let Some(classifier) = fault_classifier {
             supervisor = supervisor.with_fault_classifier(classifier);
         }

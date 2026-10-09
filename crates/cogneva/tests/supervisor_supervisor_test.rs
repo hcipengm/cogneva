@@ -1,6 +1,7 @@
 use chrono::{Duration as ChronoDuration, Utc};
 use cog_core::{
-    ObservabilityGateway, OrchestratorControl, StateBackend, SupervisorEvent, Task, TaskType,
+    MetricsBackend, ObservabilityGateway, OrchestratorControl, StateBackend, SupervisorEvent, Task,
+    TaskType,
 };
 use cog_storage::{MemoryObservabilityGateway, MemoryStateBackend};
 use cog_supervisor::registry::AgentRegistry;
@@ -266,4 +267,109 @@ async fn config_reload_updates_state() {
     assert_eq!(current.health_interval, Duration::from_secs(1800));
 
     handle.abort();
+}
+
+/// Build a supervisor whose passes report to a local metrics backend, so a test
+/// can drive the real loop and read what each arm recorded.
+#[allow(clippy::too_many_arguments)]
+fn build_measured_supervisor(
+    registry: Arc<AgentRegistry>,
+    state_backend: Arc<dyn StateBackend>,
+    orchestrator: Arc<dyn OrchestratorControl>,
+    quota_source: Arc<dyn cog_core::WorkspaceQuotaSource>,
+    gateway: Arc<dyn ObservabilityGateway>,
+    gate: Arc<SchedulerGate>,
+    metrics: Arc<cog_observability::metrics::PrometheusMetricsBackend>,
+) -> Arc<Supervisor> {
+    let config = SupervisorConfig {
+        health_interval: Duration::from_millis(20),
+        quota_interval: Duration::from_millis(20),
+        rebalance_interval: Duration::from_millis(20),
+        event_window: Duration::from_millis(20),
+        broadcast_capacity: 64,
+        health_checker: HealthCheckerConfig::default(),
+        task_rebalancer: TaskRebalancerConfig::default(),
+        autonomous: AutonomousConfig::default(),
+        quota_threshold: 1_000,
+        control_plane_interval: Duration::from_secs(3600),
+        control_plane_url: None,
+        behavior_history_max: 20,
+        heartbeat_history_max: 1_000,
+        alert_history_max: 10_000,
+    };
+    let (_agent_event_tx, agent_event_rx) = broadcast::channel(64);
+    Arc::new(
+        Supervisor::new(
+            config,
+            registry,
+            state_backend,
+            orchestrator,
+            quota_source,
+            gateway,
+            gate,
+            agent_event_rx,
+            None,
+        )
+        .with_metrics(Some(metrics as Arc<dyn MetricsBackend>)),
+    )
+}
+
+#[tokio::test]
+async fn every_loop_arm_reports_its_rounds() {
+    let registry = Arc::new(AgentRegistry::new());
+    let backend: Arc<dyn StateBackend> = Arc::new(MemoryStateBackend::new());
+    let orchestrator = make_orchestrator();
+    let gateway: Arc<dyn ObservabilityGateway> =
+        Arc::new(MemoryObservabilityGateway::new(backend.clone()));
+    let gate = Arc::new(SchedulerGate::new());
+    let metrics = Arc::new(cog_observability::metrics::PrometheusMetricsBackend::new(
+        "",
+    ));
+
+    let supervisor = build_measured_supervisor(
+        registry,
+        backend,
+        orchestrator,
+        fake_quota_source(2_000),
+        gateway,
+        gate,
+        metrics.clone(),
+    );
+
+    // Drive the real loop rather than the arms directly: the point of this
+    // reading is that every arm reaches the sink from inside `run`, so a test
+    // that called the passes itself would not notice an arm whose recording was
+    // never wired in.
+    let sup = supervisor.clone();
+    let handle = tokio::spawn(async move {
+        sup.run(async { tokio::time::sleep(Duration::from_millis(600)).await })
+            .await;
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    handle.abort();
+
+    let totals = metrics
+        .query_counter_totals("cogneva_supervisor_pass_total")
+        .await
+        .unwrap();
+    let cells: std::collections::BTreeSet<(String, String)> = totals
+        .iter()
+        .map(|s| {
+            (
+                s.labels.get("pass").cloned().unwrap_or_default(),
+                s.labels.get("outcome").cloned().unwrap_or_default(),
+            )
+        })
+        .collect();
+    for pass in ["health", "quota", "rebalance", "event", "autonomous"] {
+        assert!(
+            cells.contains(&(pass.to_string(), "ok".to_string())),
+            "arm {pass} did not report an ok round: {cells:?}"
+        );
+    }
+    // No control plane is configured, so that arm has no work and writes no cell.
+    assert!(
+        !cells.iter().any(|(pass, _)| pass == "control_plane"),
+        "the control-plane arm reported without a control plane: {cells:?}"
+    );
 }

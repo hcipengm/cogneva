@@ -121,6 +121,39 @@ pub struct Supervisor {
     >,
     /// Optional watch receiver for dynamic config reload.
     config_rx: Option<watch::Receiver<SupervisorConfig>>,
+    /// Where each pass of the loop reports how it ended. Unset when the metrics
+    /// backend was not attached: the pass then leaves only the log line it
+    /// always left.
+    metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
+}
+
+/// The arms of the supervisor loop, one per supervised pass.
+///
+/// Each loop iteration fires exactly one of these, so a round is one pass. The
+/// loop's own beat is driven by the shortest of the six intervals, which means a
+/// starved pass stays hidden behind a beat the others keep stamping unless each
+/// pass reports its own rounds.
+#[derive(Debug, Clone, Copy)]
+enum SupervisorPass {
+    Health,
+    Quota,
+    Rebalance,
+    Event,
+    Autonomous,
+    ControlPlane,
+}
+
+impl SupervisorPass {
+    fn as_cell(&self) -> &'static str {
+        match self {
+            SupervisorPass::Health => "health",
+            SupervisorPass::Quota => "quota",
+            SupervisorPass::Rebalance => "rebalance",
+            SupervisorPass::Event => "event",
+            SupervisorPass::Autonomous => "autonomous",
+            SupervisorPass::ControlPlane => "control_plane",
+        }
+    }
 }
 
 impl Supervisor {
@@ -199,6 +232,7 @@ impl Supervisor {
             last_rebalance: tokio::sync::Mutex::new(None),
             behavior_monitors: std::sync::Mutex::new(std::collections::HashMap::new()),
             config_rx: None,
+            metrics: None,
         }
     }
 
@@ -207,6 +241,39 @@ impl Supervisor {
     pub fn with_config_watch(mut self, rx: watch::Receiver<SupervisorConfig>) -> Self {
         self.config_rx = Some(rx);
         self
+    }
+
+    /// Attach the sink for each pass's per-round outcome.
+    ///
+    /// The owner attaches it after the metrics backend has been published; a
+    /// `None` sink is not an error -- the pass keeps its log line -- so it is
+    /// simply left unset.
+    pub fn with_metrics(mut self, metrics: Option<Arc<dyn cog_core::MetricsBackend>>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Record how one arm of the loop ended.
+    ///
+    /// Every arm routes its round through here, so the reading covers all six
+    /// the same way. The `None` sink and a backend error are both swallowed to a
+    /// WARN: a missing reading must not take the supervision loop down with it.
+    async fn record_pass(&self, pass: SupervisorPass, ok: bool) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("pass".to_string(), pass.as_cell().to_string());
+        labels.insert(
+            "outcome".to_string(),
+            if ok { "ok" } else { "failed" }.to_string(),
+        );
+        if let Err(e) = metrics
+            .record_counter(cog_core::metric_names::SUPERVISOR_PASS_TOTAL, 1.0, labels)
+            .await
+        {
+            warn!(error = %e, "supervisor pass: could not record outcome");
+        }
     }
 
     /// Attach a root-cause classifier so exhausted-retry decisions carry a
@@ -529,7 +596,7 @@ impl Supervisor {
                 _ = health.tick() => {
                     cycle = cycle.saturating_add(1);
                     let _ = this.event_tx.send(SupervisorEvent::Tick { timestamp: Utc::now(), cycle });
-                    match this.run_health_pass().await {
+                    let ok = match this.run_health_pass().await {
                         Ok(report) => {
                             if !report.is_clean() {
                                 warn!(
@@ -541,29 +608,54 @@ impl Supervisor {
                             } else {
                                 debug!("Supervisor health pass clean ({} agents)", report.healthy.len());
                             }
+                            true
                         }
-                        Err(e) => warn!("Supervisor health pass failed: {}", e),
-                    }
+                        Err(e) => {
+                            warn!("Supervisor health pass failed: {}", e);
+                            false
+                        }
+                    };
+                    this.record_pass(SupervisorPass::Health, ok).await;
                 }
                 _ = quota.tick() => {
-                    if let Err(e) = this.run_quota_pass().await {
-                        warn!("Supervisor quota pass failed: {}", e);
-                    }
+                    let ok = match this.run_quota_pass().await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            warn!("Supervisor quota pass failed: {}", e);
+                            false
+                        }
+                    };
+                    this.record_pass(SupervisorPass::Quota, ok).await;
                 }
                 _ = rebalance.tick() => {
-                    if let Err(e) = this.run_rebalance_pass().await {
-                        warn!("Supervisor rebalance pass failed: {}", e);
-                    } else {
-                        *this.last_rebalance.lock().await = Some(Utc::now());
-                    }
+                    let ok = match this.run_rebalance_pass().await {
+                        Ok(()) => {
+                            *this.last_rebalance.lock().await = Some(Utc::now());
+                            true
+                        }
+                        Err(e) => {
+                            warn!("Supervisor rebalance pass failed: {}", e);
+                            false
+                        }
+                    };
+                    this.record_pass(SupervisorPass::Rebalance, ok).await;
                 }
                 _ = events.tick() => {
-                    if let Err(e) = this.run_event_pass().await {
-                        warn!("Supervisor event pass failed: {}", e);
-                    }
+                    let ok = match this.run_event_pass().await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            warn!("Supervisor event pass failed: {}", e);
+                            false
+                        }
+                    };
+                    this.record_pass(SupervisorPass::Event, ok).await;
                 }
                 _ = autonomous_tick.tick() => {
                     this.autonomous.run_decision_pass().await;
+                    // The decision pass reports no error by construction: a
+                    // failure inside it is logged there and a panic ends the
+                    // loop attempt, which the liveness family counts.
+                    this.record_pass(SupervisorPass::Autonomous, true).await;
                 }
                 _ = control_plane_tick.tick() => {
                     if let Some(ref client) = this.control_plane {
@@ -584,9 +676,14 @@ impl Supervisor {
                             last_rebalance,
                             timestamp: Utc::now(),
                         };
-                        if let Err(e) = client.report_status(status).await {
-                            warn!("Control plane report failed: {}", e);
-                        }
+                        let ok = match client.report_status(status).await {
+                            Ok(()) => true,
+                            Err(e) => {
+                                warn!("Control plane report failed: {}", e);
+                                false
+                            }
+                        };
+                        this.record_pass(SupervisorPass::ControlPlane, ok).await;
                     }
                 }
                 _ = config_tick => {
