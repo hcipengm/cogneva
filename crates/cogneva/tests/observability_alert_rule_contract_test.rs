@@ -757,17 +757,21 @@ fn every_series_an_alert_rule_reads_is_one_something_produces() {
 /// passes it for the same reason a blank panel passes: every series it names is
 /// really produced.
 ///
-/// The shapes this catches are the ones a hand edit makes: an operator dropped
-/// between two operands that a matching clause then sits in front of, and the
-/// same edit with the bracket on the wrong side of the guard -- a range
-/// selector handed to a set operator, which Prometheus rejects outright and the
-/// clause scan cannot see. Nothing in this repository reads PromQL grammar, so
-/// before this test the only thing between such an edit and an alert that stays
-/// quiet through its own incident was a person noticing. A rule and a panel
-/// fail the same way here, which is why both sides of this contract ask the
-/// same question about their text.
+/// This is not a parser, and the name says so rather than claiming more: it
+/// recognises a finite set of shapes, each of them verified against a live
+/// Prometheus to be rejected outright. What it knows is what a hand edit makes
+/// -- an operator dropped between two operands that a matching clause then sits
+/// in front of, and the same edit with the bracket on the wrong side of the
+/// guard, a range selector handed to a set operator, which the clause scan
+/// cannot see.
+///
+/// A shape outside that set gets past this gate. The backstop for whatever
+/// ships anyway is the watcher's own eval-failure self-alert, which fires on a
+/// query that keeps failing -- slower, and heard only if someone reads the
+/// alerts. A rule and a panel fail the same way here, which is why both sides
+/// of this contract ask the same question about their text.
 #[test]
-fn every_expression_a_rule_writes_is_one_prometheus_can_parse() {
+fn no_rule_expression_has_a_known_unparseable_shape() {
     let mut complaints: Vec<String> = Vec::new();
     for (rule, promql) in chart_rules() {
         for complaint in shape_complaints(&promql) {
@@ -777,7 +781,7 @@ fn every_expression_a_rule_writes_is_one_prometheus_can_parse() {
 
     assert!(
         complaints.is_empty(),
-        "告警规则的表达式 Prometheus 解析不了，这条规则永远不会触发:\n{}",
+        "告警规则的表达式含一种已知的、Prometheus 一定拒绝的形状，这条规则永远不会触发:\n{}",
         complaints.join("\n")
     );
 }

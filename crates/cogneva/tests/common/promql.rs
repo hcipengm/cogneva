@@ -370,8 +370,10 @@ fn range_selector_operand_complaints(stripped: &str) -> Vec<String> {
 /// well-formed-shape expression naming a series that does not exist, a wrong
 /// label in a matcher, or a mistyped aggregation all pass. What it decides is
 /// the edits that leave every series name intact and the expression
-/// unparseable, which are the edits whose result nothing else in this
-/// repository can see.
+/// unparseable. No other check in this repository decides those, and for a rule
+/// the only reading behind this one is the watcher's eval-failure self-alert,
+/// which is what fires once the expression has already shipped and keeps
+/// failing; a panel has nothing behind it at all.
 pub fn shape_complaints(expr: &str) -> Vec<String> {
     let stripped = strip_braces(&strip_quoted(expr));
     let mut out = range_selector_operand_complaints(&stripped);

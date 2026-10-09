@@ -502,12 +502,18 @@ fn every_series_the_dashboard_reads_is_one_something_produces() {
 /// whose series nothing produces — and the check above passes it, because every
 /// series in it is really produced.
 ///
-/// The shape this catches is the one a hand edit makes: an operator dropped
-/// between two operands that a matching clause then sits in front of. Nothing
-/// in this repository reads PromQL grammar, so before this test the only thing
-/// between such an edit and a blank panel was a person noticing.
+/// This is not a parser, and the name says so rather than claiming more: it
+/// recognises a finite set of shapes, each of them verified against a live
+/// Prometheus to be rejected outright -- an operator dropped between two
+/// operands that a matching clause then sits in front of, and the bracket on
+/// the wrong side of the guard, a range selector handed to a set operator.
+///
+/// A shape outside that set gets past this gate, and the panel side has no
+/// backstop behind it: nothing evaluates a panel, so a shape this does not know
+/// stays a blank panel until a person notices. The rule side of the same
+/// question has the watcher's eval-failure self-alert behind it instead.
 #[test]
-fn every_expression_the_dashboard_writes_is_one_prometheus_can_parse() {
+fn no_panel_expression_has_a_known_unparseable_shape() {
     let mut complaints: Vec<String> = Vec::new();
     for (line, expr) in metric_exprs(&dashboard_text()) {
         for complaint in shape_complaints(&expr) {
@@ -517,7 +523,7 @@ fn every_expression_the_dashboard_writes_is_one_prometheus_can_parse() {
 
     assert!(
         complaints.is_empty(),
-        "面板表达式 Prometheus 解析不了，面板会一直是空的:\n{}",
+        "面板表达式含一种已知的、Prometheus 一定拒绝的形状，面板会一直是空的:\n{}",
         complaints.join("\n")
     );
 }
