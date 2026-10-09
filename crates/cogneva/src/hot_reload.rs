@@ -3,7 +3,7 @@
 
 /// Apply hot-reloaded gateway configuration, detecting immutable port changes.
 /// Returns `(applied_items, restart_required_items)`.
-/// Port fields (`http_port`, `ws_port`, `metrics_port`) are compared but
+/// Port fields (`http_port`, `ws_port`, `metrics_port`, `internal_port`) are compared but
 /// intentionally **not** written — the caller must log the change and
 /// either reject the reload or restart the process.
 pub fn apply_gateway_config_update(
@@ -15,23 +15,31 @@ pub fn apply_gateway_config_update(
     let mut applied = Vec::new();
     let mut need_restart = Vec::new();
 
-    let (old_http, old_ws, old_metrics) = {
+    let (old_http, old_ws, old_metrics, old_internal) = {
         let cfg = current.read().unwrap_or_else(|e| e.into_inner());
-        (cfg.http_port, cfg.ws_port, cfg.metrics_port)
+        (
+            cfg.http_port,
+            cfg.ws_port,
+            cfg.metrics_port,
+            cfg.internal_port,
+        )
     };
     let ports_changed = old_http != new_gateway.http_port
         || old_ws != new_gateway.ws_port
-        || old_metrics != new_gateway.metrics_port;
+        || old_metrics != new_gateway.metrics_port
+        || old_internal != new_gateway.internal_port;
 
     if ports_changed {
         need_restart.push(format!(
-            "ports_changed: http {}→{}, ws {}→{}, metrics {}→{}",
+            "ports_changed: http {}→{}, ws {}→{}, metrics {}→{}, internal {}→{}",
             old_http,
             new_gateway.http_port,
             old_ws,
             new_gateway.ws_port,
             old_metrics,
-            new_gateway.metrics_port
+            new_gateway.metrics_port,
+            old_internal,
+            new_gateway.internal_port
         ));
     }
 
@@ -44,7 +52,7 @@ pub fn apply_gateway_config_update(
         cfg.request_timeout_secs = new_gateway.request_timeout_secs;
         cfg.sandbox_task_timeout_secs = new_gateway.sandbox_task_timeout_secs;
         cfg.notification_limit = new_gateway.notification_limit;
-        // NOTE: http_port / ws_port / metrics_port are intentionally
+        // NOTE: http_port / ws_port / metrics_port / internal_port are intentionally
         // preserved so the already-bound sockets remain valid.
     }
     request_timeout_secs.store(

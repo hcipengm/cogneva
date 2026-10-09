@@ -59,6 +59,12 @@ spec:
             - name: webhook
               containerPort: 9091
               protocol: TCP
+            # 零凭证的集群内面（cogneva.json gateway.internal_port）：只挂 memory 的
+            # 归档写与 Raw 读。跑 squad 的 Pod 手里没有凭证，主 API 上那几条按角色判
+            # 它永远进不来，所以这几条另挂一个端口，判据交给网络策略。
+            - name: internal
+              containerPort: 8085
+              protocol: TCP
           envFrom:
             - configMapRef:
                 name: cogneva-config
@@ -109,13 +115,14 @@ spec:
               value: "http://cogneva-security-gateway:8081"
             - name: COGNEVA_GIT_PROXY_BASE
               value: "http://cogneva-security-gateway:8081/git"
-            # 内存 Raw 层的写入面：工具的返回点把装不进上下文窗口的输出归档到
-            # 这里（零凭证，落默认命名空间），标记里带回取引用。指向本命名空间
-            # 内主应用自己的 Service，不经安全网关——那一面只代持外网凭证，与
-            # 本调用无关。缺这个值＝归档未配置，截断的尾巴无处可存，读数里带
+            # 内存 Raw 层的面：工具的返回点把装不进上下文窗口的输出归档到这里，
+            # 取引用也从这里读回（零凭证、落默认命名空间）。本进程自己那一份走
+            # **回环**进内部端口，不是主 API 的 8080——8080 上那几条 memory 路由按
+            # 角色判，零凭证的调用方恒吃 401。不经安全网关：那一面只代持外网凭证，
+            # 与本调用无关。缺这个值＝归档未配置，截断的尾巴无处可存，读数里带
             # unconfigured 的原因。
             - name: COGNEVA_MEMORY_API_BASE
-              value: "http://cogneva:8080"
+              value: "http://127.0.0.1:8085"
             # git 身份自举的基线仓库（owner/name）。自举循环跑在**本进程**：
             # cogneva-secrets 的属主就是这里（WebUI 向导与贡献通道写同一份），
             # 而自举要的正是属主手里的三样东西——Secret 读写、到 GitHub 的

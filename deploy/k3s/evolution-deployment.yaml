@@ -230,11 +230,12 @@ spec:
               value: "http://cogneva-security-gateway:8081"
             - name: COGNEVA_GIT_PROXY_BASE
               value: "http://cogneva-security-gateway:8081/git"
-            # 内存 Raw 层的写入面（归档工具的巨量输出），零凭证。本 Pod 的
-            # egress 是白名单，这条指向主应用 Service 的 8080：少了 network-policy
-            # 里那一条端口放行，归档请求会被静默丢弃。与主应用那份同源。
+            # 内存 Raw 层的面（归档工具的巨量输出 + 取引用读回），零凭证。指向主应用
+            # 的**内部端口** 8085，不是主 API 的 8080：8080 上那几条按角色判，本 Pod
+            # 零凭证恒吃 401。本 Pod 的 egress 是白名单，少了 network-policy 里那一条
+            # 端口放行，归档请求会被静默丢弃。与主应用那份同源。
             - name: COGNEVA_MEMORY_API_BASE
-              value: "http://cogneva:8080"
+              value: "http://cogneva:8085"
             # 实例身份指纹：身份的规范来源，安装期生成、升级复用。身份决定
             # `evol/<id>` 分支名与按实例命名的常驻工作树，必须跨重启与重装稳定。
             - name: COGNEVA_INSTANCE_FINGERPRINT

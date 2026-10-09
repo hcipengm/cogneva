@@ -22,3 +22,9 @@ spec:
       port: 9091
       targetPort: 9091
       protocol: TCP
+    # 零凭证的集群内面：只开给本命名空间里的工作负载（谁可连接见
+    # network-policy.yaml 里挂在主应用 Pod 上的 ingress 规则）。
+    - name: internal
+      port: 8085
+      targetPort: internal
+      protocol: TCP

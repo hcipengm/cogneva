@@ -9,8 +9,11 @@ type ServerHandle = tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error
 /// Gateway plugin that self-assembles [`crate::GatewayState`] and drives the HTTP server lifecycle.
 pub struct GatewayPlugin {
     state: Option<Arc<crate::GatewayState>>,
-    shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
-    server_handle: Mutex<Option<ServerHandle>>,
+    /// 一个监听一个 sender：本进程现在有两个面（主 API 与零凭证内部面），各自
+    /// 起停。合成一个 sender 的话，后开的那个面一存进来就把先开的那个的 sender
+    /// 顶掉——被顶掉的那端立刻收到"发送方没了"，于是主 API 在启动时就自己关了。
+    shutdown_tx: Mutex<Vec<oneshot::Sender<()>>>,
+    server_handle: Mutex<Vec<ServerHandle>>,
     initialized: bool,
 }
 
@@ -19,8 +22,8 @@ impl GatewayPlugin {
     pub fn new() -> Self {
         Self {
             state: None,
-            shutdown_tx: Mutex::new(None),
-            server_handle: Mutex::new(None),
+            shutdown_tx: Mutex::new(Vec::new()),
+            server_handle: Mutex::new(Vec::new()),
             initialized: false,
         }
     }
@@ -270,7 +273,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
                 }
             });
         }
-        let app = crate::create_router(state);
+        let app = crate::create_router(state.clone());
         let http_port = ctx.config().gateway.http_port;
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], http_port));
         info!("HTTP server listening on http://{}", addr);
@@ -290,8 +293,33 @@ impl cog_core::SystemPlugin for GatewayPlugin {
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
         });
 
-        *self.shutdown_tx.lock().await = Some(shutdown_tx);
-        *self.server_handle.lock().await = Some(handle);
+        self.shutdown_tx.lock().await.push(shutdown_tx);
+        self.server_handle.lock().await.push(handle);
+
+        // 零凭证的集群内面：跑 squad 的 Pod 手里没有凭证，主 API 那几条 memory
+        // 路由按角色判，它永远进不来。所以那几条挂到另一个端口上，判据换成网络
+        // 事实（见部署面的 ingress 策略）。端口为 0＝这个部署不开这条面。
+        let internal_port = ctx.config().gateway.internal_port;
+        if internal_port != 0 {
+            let internal_app = crate::create_internal_router(state.clone());
+            let internal_addr = std::net::SocketAddr::from(([0, 0, 0, 0], internal_port));
+            let (internal_shutdown_tx, internal_shutdown_rx) = oneshot::channel::<()>();
+            let internal_listener = tokio::net::TcpListener::bind(internal_addr)
+                .await
+                .map_err(|e| cog_core::SFError::IO(format!("bind {internal_addr} failed: {e}")))?;
+            info!("internal API listening on http://{}", internal_addr);
+            let internal_handle = tokio::spawn(async move {
+                axum::serve(internal_listener, internal_app)
+                    .with_graceful_shutdown(async move {
+                        let _ = internal_shutdown_rx.await;
+                        warn!("Shutdown signal received, stopping internal server...");
+                    })
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            });
+            self.shutdown_tx.lock().await.push(internal_shutdown_tx);
+            self.server_handle.lock().await.push(internal_handle);
+        }
 
         // ── Hook -> WebSocket forwarder ──
         if let Some(hook_engine) = ctx.consume_service::<dyn cog_core::HookEngine>() {
@@ -341,10 +369,10 @@ impl cog_core::SystemPlugin for GatewayPlugin {
     }
 
     async fn shutdown(&self) -> cog_core::SFResult<()> {
-        if let Some(tx) = self.shutdown_tx.lock().await.take() {
+        for tx in self.shutdown_tx.lock().await.drain(..) {
             let _ = tx.send(());
         }
-        if let Some(handle) = self.server_handle.lock().await.take() {
+        for handle in self.server_handle.lock().await.drain(..) {
             if let Err(e) = handle.await {
                 warn!("gateway server shutdown error: {}", e);
             }

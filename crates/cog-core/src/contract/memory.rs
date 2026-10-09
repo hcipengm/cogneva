@@ -170,6 +170,12 @@ pub const MEMORY_API_BASE_ENV: &str = "COGNEVA_MEMORY_API_BASE";
 /// The path the memory API archives a raw source at, relative to its base.
 pub const MEMORY_INGEST_PATH: &str = "/api/v1/memory/ingest";
 
+/// The path that lists the ids of archived raw sources, relative to the base.
+pub const MEMORY_RAW_PATH: &str = "/api/v1/memory/raw";
+
+/// The path one archived raw source's bytes are read from; `{id}` is appended.
+pub const MEMORY_RAW_ITEM_PATH: &str = "/api/v1/memory/raw/{id}";
+
 /// Layer 0 — Raw Sources.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RawSource {

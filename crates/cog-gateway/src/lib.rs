@@ -284,6 +284,61 @@ impl GatewayState {
     }
 }
 
+/// 工具输出归档的写入面（`POST /api/v1/memory/ingest`）。
+///
+/// 单独成函数是因为这条路径挂在**两个** router 上：主 API（组内按 Admin 判）与
+/// 零凭证的集群内面（按网络判）。两处共用一份定义，路径与处理函数只有一处；
+/// 各写一遍的话，改了一边、另一边照旧"看起来在跑"。
+fn memory_ingest_routes() -> Router<Arc<GatewayState>> {
+    Router::new().route(cog_core::MEMORY_INGEST_PATH, post(memory::ingest_handler))
+}
+
+/// Raw 的读取面（list + get），同样挂在两个 router 上（主 API 组内按 Operator 判）。
+fn memory_raw_routes() -> Router<Arc<GatewayState>> {
+    Router::new()
+        .route(cog_core::MEMORY_RAW_PATH, get(memory::list_raw_handler))
+        .route(cog_core::MEMORY_RAW_ITEM_PATH, get(memory::get_raw_handler))
+}
+
+/// 零凭证的集群内面：只挂 Pod 侧要走的 memory 路由，不挂认证/会话/配额。
+///
+/// 换一层判据是这条面存在的全部理由。主 API 上这几条按角色判，而跑 squad 的 Pod
+/// 零凭证（红线），按角色判它永远进不来；把同一组路径匿名挂在主 API 那个端口上，
+/// 又与运营 API 挤成一面，没法只给它们挂网络策略。单开一个端口之后，判据落成
+/// "谁能连这个端口"这条网络事实，与沙盒执行器 9090 面、审计 LLM 通道同一先例。
+/// 命名空间不由调用方指定：无 claims 时处理函数回落到默认命名空间。
+///
+/// 不挂 CORS / 安全响应头 / 压缩：这条面只对集群内的程序开放，没有浏览器来读它，
+/// 响应体直接进 agent 的 HTTP 客户端。
+pub fn create_internal_router(state: Arc<GatewayState>) -> Router {
+    memory_ingest_routes()
+        .merge(memory_raw_routes())
+        .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024))
+        .layer(CatchPanicLayer::new())
+        .layer(TraceLayer::new_for_http())
+        .layer(from_fn({
+            let state = state.clone();
+            move |req: Request, next: Next| {
+                let state = state.clone();
+                async move {
+                    let timeout_secs = state
+                        .request_timeout_secs
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let timeout = std::time::Duration::from_secs(timeout_secs);
+                    match tokio::time::timeout(timeout, next.run(req)).await {
+                        Ok(response) => response,
+                        Err(_) => {
+                            let mut response = Response::new(axum::body::Body::empty());
+                            *response.status_mut() = StatusCode::REQUEST_TIMEOUT;
+                            response
+                        }
+                    }
+                }
+            }
+        }))
+        .with_state(state)
+}
+
 /// 创建 HTTP + WebSocket 路由。
 pub fn create_router(state: Arc<GatewayState>) -> Router {
     let jwt = state.jwt_manager.clone();
@@ -440,7 +495,7 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             "/api/v1/hooks/{id}",
             axum::routing::delete(hooks::delete_hook_handler),
         )
-        .route("/api/v1/memory/ingest", post(memory::ingest_handler))
+        .merge(memory_ingest_routes())
         .route(
             "/api/v1/memory/ingest/batch",
             post(memory::batch_ingest_handler),
@@ -640,8 +695,7 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             "/api/v1/memory/summary/search",
             post(memory::summary_search_handler),
         )
-        .route("/api/v1/memory/raw", get(memory::list_raw_handler))
-        .route("/api/v1/memory/raw/{id}", get(memory::get_raw_handler))
+        .merge(memory_raw_routes())
         .route("/api/v1/memory/stats", get(memory::stats_handler))
         .route("/api/v1/memory/metrics", get(memory::metrics_handler))
         .route("/api/v1/raw_logs", get(raw_logs::list_raw_logs_handler))
@@ -849,124 +903,7 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             .cors_origins,
     );
 
-    public
-        .merge(protected)
-        .layer(from_fn({
-            let state = state.clone();
-            move |mut req: Request, next: Next| {
-                let logger = state.raw_logger.clone();
-                let metrics = state.metrics_backend.clone();
-                let method = req.method().to_string();
-                let uri = req.uri().path().to_string();
-                // 指标标签取路由模板（`/api/v1/tasks/{id}`）而不是原始路径：原始
-                // 路径把每个 task id 都变成一条独立序列，序列数随请求数线性增长，
-                // 而序列没有任何回收路径，抓取正文与标签索引会随运行时间无限膨胀。
-                // 原始路径仍原样进 RawRecord——那是逐请求的流水，不是被聚合的序列。
-                let endpoint = metric_endpoint_label(req.extensions().get::<MatchedPath>());
-                // 探针与抓取器的定时请求既不是业务流量也没有用户意图，进同一个
-                // 计数器只会把错误率分母垫高——它们不可能失败，而业务流量可以降到
-                // 零，于是一个只影响业务端点的回归会藏在里面读不出来。raw 流水同理：
-                // 逐请求的流水是给人看的，探针把它撑大几个数量级。
-                let infra = cog_core::is_infra_endpoint(&endpoint);
-                let request_id = uuid::Uuid::new_v4().to_string();
-
-                // Extract or generate distributed tracing context.
-                let headers: HashMap<String, String> = req
-                    .headers()
-                    .iter()
-                    .filter_map(|(k, v)| {
-                        Some((k.as_str().to_lowercase(), v.to_str().ok()?.to_string()))
-                    })
-                    .collect();
-                let trace_ctx = TraceContext::from_headers(&headers)
-                    .unwrap_or_else(|| TraceContext::generate().with_parent(&request_id));
-                req.extensions_mut().insert(request_id.clone());
-                req.extensions_mut().insert(trace_ctx.clone());
-
-                async move {
-                    let start = std::time::Instant::now();
-                    let mut response = next.run(req).await;
-                    let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
-                    let status = response.status().as_u16();
-
-                    if let Ok(hv) = axum::http::HeaderValue::from_str(&request_id) {
-                        response.headers_mut().insert(
-                            axum::http::header::HeaderName::from_static("x-request-id"),
-                            hv,
-                        );
-                    }
-                    if let Ok(hv) = axum::http::HeaderValue::from_str(&trace_ctx.trace_id) {
-                        response.headers_mut().insert(
-                            axum::http::header::HeaderName::from_static("x-trace-id"),
-                            hv,
-                        );
-                    }
-                    if let Ok(hv) = axum::http::HeaderValue::from_str(&trace_ctx.span_id) {
-                        response
-                            .headers_mut()
-                            .insert(axum::http::header::HeaderName::from_static("x-span-id"), hv);
-                    }
-
-                    if !infra {
-                        let record = cog_core::RawRecord {
-                            meta: cog_core::RawMeta {
-                                version: "1.0".into(),
-                                stream: "transport_raw".into(),
-                                recorded_at: chrono::Utc::now(),
-                                recorded_by: "cog-gateway".into(),
-                                sequence: 0,
-                                trace_id: trace_ctx.trace_id.clone(),
-                                span_id: Some(trace_ctx.span_id.clone()),
-                            },
-                            context: cog_core::RawContext::default(),
-                            payload: cog_core::RawPayload {
-                                direction: "inbound".into(),
-                                transport: "http".into(),
-                                format: Some("json".into()),
-                                raw: serde_json::json!({
-                                    "method": method,
-                                    "uri": uri,
-                                    "status": status,
-                                }),
-                            },
-                        };
-
-                        if let Err(e) = logger.write(record).await {
-                            tracing::warn!("RawLogger write failed (http): {}", e);
-                        }
-
-                        if let Some(ref mb) = metrics {
-                            let mut labels = HashMap::new();
-                            labels.insert("method".into(), method.clone());
-                            labels.insert("endpoint".into(), endpoint.clone());
-                            labels.insert("status".into(), status.to_string());
-                            if let Err(e) = mb
-                                .record_counter(
-                                    cog_core::metric_names::HTTP_REQUESTS_TOTAL,
-                                    1.0,
-                                    labels.clone(),
-                                )
-                                .await
-                            {
-                                tracing::warn!("Failed to record http request counter: {}", e);
-                            }
-                            if let Err(e) = mb
-                                .record_histogram(
-                                    cog_core::metric_names::HTTP_REQUEST_DURATION_MS,
-                                    duration_ms,
-                                    labels,
-                                )
-                                .await
-                            {
-                                tracing::warn!("Failed to record http request histogram: {}", e);
-                            }
-                        }
-                    }
-
-                    response
-                }
-            }
-        }))
+    transport_observability(public.merge(protected), state.clone())
         .layer(from_fn(security_headers_middleware))
         .layer(cors_layer)
         .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024))
@@ -994,6 +931,133 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// 传输面观测层：逐请求的 RawRecord 流水 + transport 计数器/直方图。
+///
+/// 抽成函数是因为它挂在两个 router 上：主 API 与零凭证的集群内面。少了这一层，
+/// 内部面就成了本进程里唯一**没有请求读数**的面——而"这条面在不在跑"恰恰是它
+/// 存在的理由。
+fn transport_observability<S>(router: Router<S>, state: Arc<GatewayState>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router.layer(from_fn({
+        let state = state.clone();
+        move |mut req: Request, next: Next| {
+            let logger = state.raw_logger.clone();
+            let metrics = state.metrics_backend.clone();
+            let method = req.method().to_string();
+            let uri = req.uri().path().to_string();
+            // 指标标签取路由模板（`/api/v1/tasks/{id}`）而不是原始路径：原始
+            // 路径把每个 task id 都变成一条独立序列，序列数随请求数线性增长，
+            // 而序列没有任何回收路径，抓取正文与标签索引会随运行时间无限膨胀。
+            // 原始路径仍原样进 RawRecord——那是逐请求的流水，不是被聚合的序列。
+            let endpoint = metric_endpoint_label(req.extensions().get::<MatchedPath>());
+            // 探针与抓取器的定时请求既不是业务流量也没有用户意图，进同一个
+            // 计数器只会把错误率分母垫高——它们不可能失败，而业务流量可以降到
+            // 零，于是一个只影响业务端点的回归会藏在里面读不出来。raw 流水同理：
+            // 逐请求的流水是给人看的，探针把它撑大几个数量级。
+            let infra = cog_core::is_infra_endpoint(&endpoint);
+            let request_id = uuid::Uuid::new_v4().to_string();
+
+            // Extract or generate distributed tracing context.
+            let headers: HashMap<String, String> = req
+                .headers()
+                .iter()
+                .filter_map(|(k, v)| {
+                    Some((k.as_str().to_lowercase(), v.to_str().ok()?.to_string()))
+                })
+                .collect();
+            let trace_ctx = TraceContext::from_headers(&headers)
+                .unwrap_or_else(|| TraceContext::generate().with_parent(&request_id));
+            req.extensions_mut().insert(request_id.clone());
+            req.extensions_mut().insert(trace_ctx.clone());
+
+            async move {
+                let start = std::time::Instant::now();
+                let mut response = next.run(req).await;
+                let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let status = response.status().as_u16();
+
+                if let Ok(hv) = axum::http::HeaderValue::from_str(&request_id) {
+                    response.headers_mut().insert(
+                        axum::http::header::HeaderName::from_static("x-request-id"),
+                        hv,
+                    );
+                }
+                if let Ok(hv) = axum::http::HeaderValue::from_str(&trace_ctx.trace_id) {
+                    response.headers_mut().insert(
+                        axum::http::header::HeaderName::from_static("x-trace-id"),
+                        hv,
+                    );
+                }
+                if let Ok(hv) = axum::http::HeaderValue::from_str(&trace_ctx.span_id) {
+                    response
+                        .headers_mut()
+                        .insert(axum::http::header::HeaderName::from_static("x-span-id"), hv);
+                }
+
+                if !infra {
+                    let record = cog_core::RawRecord {
+                        meta: cog_core::RawMeta {
+                            version: "1.0".into(),
+                            stream: "transport_raw".into(),
+                            recorded_at: chrono::Utc::now(),
+                            recorded_by: "cog-gateway".into(),
+                            sequence: 0,
+                            trace_id: trace_ctx.trace_id.clone(),
+                            span_id: Some(trace_ctx.span_id.clone()),
+                        },
+                        context: cog_core::RawContext::default(),
+                        payload: cog_core::RawPayload {
+                            direction: "inbound".into(),
+                            transport: "http".into(),
+                            format: Some("json".into()),
+                            raw: serde_json::json!({
+                                "method": method,
+                                "uri": uri,
+                                "status": status,
+                            }),
+                        },
+                    };
+
+                    if let Err(e) = logger.write(record).await {
+                        tracing::warn!("RawLogger write failed (http): {}", e);
+                    }
+
+                    if let Some(ref mb) = metrics {
+                        let mut labels = HashMap::new();
+                        labels.insert("method".into(), method.clone());
+                        labels.insert("endpoint".into(), endpoint.clone());
+                        labels.insert("status".into(), status.to_string());
+                        if let Err(e) = mb
+                            .record_counter(
+                                cog_core::metric_names::HTTP_REQUESTS_TOTAL,
+                                1.0,
+                                labels.clone(),
+                            )
+                            .await
+                        {
+                            tracing::warn!("Failed to record http request counter: {}", e);
+                        }
+                        if let Err(e) = mb
+                            .record_histogram(
+                                cog_core::metric_names::HTTP_REQUEST_DURATION_MS,
+                                duration_ms,
+                                labels,
+                            )
+                            .await
+                        {
+                            tracing::warn!("Failed to record http request histogram: {}", e);
+                        }
+                    }
+                }
+
+                response
+            }
+        }
+    }))
 }
 
 fn build_cors_layer(origins: &[String]) -> CorsLayer {

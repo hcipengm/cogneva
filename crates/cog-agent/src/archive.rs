@@ -10,8 +10,13 @@
 //! process that runs the loops holds no memory dataset on purpose (it is
 //! switched off there), so a handle resolved in-process would be absent exactly
 //! where the loops run. It goes over HTTP to the platform memory API instead,
-//! which is also the only route a credential-free pod has — the call carries no
-//! token, and an anonymous caller lands in the default namespace.
+//! which is also the only route a credential-free pod has. The base URL points
+//! at the API's **internal, zero-credential face** — a port that serves the
+//! memory ingest and raw routes and nothing else — not the operator API, whose
+//! memory routes are gated by role: a caller with no token is refused there
+//! before any handler runs, so the call would never land. On this face there is
+//! no token to carry and no claims to read, so the write lands in the default
+//! namespace by construction.
 //!
 //! Both readings live on this handle rather than beside it because they are the
 //! two fates of one event: a tool output that did not fit. `truncated` counts

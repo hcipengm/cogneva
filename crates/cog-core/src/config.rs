@@ -436,6 +436,16 @@ pub struct GatewayConfig {
     pub http_port: u16,
     pub ws_port: u16,
     pub metrics_port: u16,
+    /// 零凭证的集群内面端口：只挂 Pod 侧要走的那几条 memory 路由（工具输出归档
+    /// 的写、以及 Raw 的读），不挂认证/会话/配额。0＝不开这个监听——没打开过的
+    /// 端口不可能被误用，也不用为一个用不上的面配网络策略。
+    ///
+    /// 与 `http_port` 分开不是为了换路径，是为了换**判据**：主 API 的 memory 路由
+    /// 按角色判，而跑 squad 的 Pod 零凭证（红线），按角色判它永远进不来；放在同一
+    /// 个端口上匿名，又与运营 API 混成一面，没法只给这几条挂网络策略。端口一分，
+    /// 判据就从"按角色"变成"按网络事实"。
+    #[serde(default)]
+    pub internal_port: u16,
     pub cors_origins: Vec<String>,
     /// Access-token TTL in minutes. 0 = built-in default
     /// ([`DEFAULT_ACCESS_TOKEN_TTL_MINUTES`]).

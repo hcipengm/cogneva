@@ -284,6 +284,7 @@
     "http_port": 8080,
     "ws_port": 8081,
     "metrics_port": 9090,
+    "internal_port": 8085,
     "cors_origins": [
       "*"
     ],
