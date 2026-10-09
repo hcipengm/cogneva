@@ -1658,15 +1658,15 @@ const UNREAD: &[(&str, Unread)] = &[
     ),
     (
         "cogneva_buildah_store_pruned_images_total",
-        Unread::Gap("written only when a round freed an image, so its absence is not a zero. It is a volume, and a volume is not a fault without a declared budget for the store, which nothing states. The cadence this entry used to call unpublished is published: cogneva_buildah_store_reading_unix is stamped by every completed round, cogneva_buildah_store_rounds_total counts the attempts beside it, and buildah_store_round_incomplete reads the pair against a bound the store declares elsewhere. The family's fault-worthy states are read on those siblings -- a round attempted and never completed, and a keep set computed from an empty cluster read -- and neither of them needs this count"),
+        Unread::Gap("written only when a round freed an image, so its absence is not a zero. It is a volume, and this store deliberately has no volume bound: the plan says in as many words that there is no cap and none is wanted, because the retention set is already the bound and it answers in the unit that matters -- revisions, not bytes -- which the same round publishes as cogneva_buildah_store_kept_images and cogneva_buildah_store_live_images. The cadence this entry used to call unpublished is published as well: cogneva_buildah_store_reading_unix is stamped by every completed round, cogneva_buildah_store_rounds_total counts the attempts beside it, and buildah_store_round_incomplete reads the pair. The family's fault-worthy states are read on those siblings -- a round attempted and never completed, and a keep set computed from an empty cluster read -- and neither of them needs this count"),
     ),
     (
         "cogneva_buildah_store_pruned_layers_total",
-        Unread::Gap("the help's own point is that this is not a fixed multiple of the image count, so it is a second number under the same undeclared store budget; the completion cadence it shares is published by cogneva_buildah_store_reading_unix and read, so what stands in the way is the budget rather than the cadence"),
+        Unread::Gap("the help's own point is that this is not a fixed multiple of the image count, so it is a second volume under a store that has no volume bound on purpose -- the retention set is the bound and it counts revisions; the completion cadence it shares is published by cogneva_buildah_store_reading_unix and read, so what stands in the way is the unit the bound is stated in rather than the cadence or the reading"),
     ),
     (
         "cogneva_buildah_store_freed_bytes_total",
-        Unread::Gap("bytes freed, written only when both ends of the round were measurable; the help calls the number apparent rather than real, and the cadence is published and read as above, so what a rule would need is a declared budget for the store"),
+        Unread::Gap("bytes freed, written only when both ends of the round were measurable; the help calls the number apparent rather than real, and the cadence is published and read as above, so what a rule would need is a volume bound this store deliberately does not have"),
     ),
     (
         "cogneva_buildah_store_kept_images",
@@ -1798,9 +1798,11 @@ fn unresolved_readers(read: &BTreeSet<String>, name: &str, readers: &[&str]) -> 
 /// is stamped by every completed round, cogneva_buildah_store_rounds_total counts
 /// the attempts beside it, buildah_store_round_incomplete reads the pair, and the
 /// hold's ratio has its partner in cogneva_registry_pruned_tags_total. What stands
-/// in the way of those four is a bound nobody has stated -- a budget for the store,
-/// a limit on how long a hold may last -- and a bound is the owner's decision rather
-/// than a reading this repository is withholding. The fifth was the one that held
+/// in the way of those four is a bound the mechanisms deliberately do not state:
+/// the build store says it has no cap because the retention set is the bound and it
+/// counts revisions rather than bytes, and the tag server's hold lifts when the
+/// server answers rather than after a budget. That is a decision made, not a
+/// reading withheld. The fifth was the one that held
 /// up: the rollout reading really does have no published run cadence, and its reason
 /// now names the counter that looks like one and is not. So 15 stayed 15.
 const GAPS_AT_CENSUS: usize = 15;
