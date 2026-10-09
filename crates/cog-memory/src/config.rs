@@ -121,6 +121,12 @@ pub struct IngestConfig {
     pub startup_reconcile: bool,
     /// 对账只回看最近这么多个小时的 raw。
     pub reconcile_lookback_hours: u64,
+    /// 每拍最多补驱动多少条已老过对账回看窗、且没有被终局诊断的 raw。
+    ///
+    /// 回看窗内的欠账每拍重驱动；窗外的那批转成按固定速率还，速率与事件洪峰
+    /// 解耦：一次长断供（长过回看窗）恢复之后，断供早期归档的 raw 全在窗外，
+    /// 不设上限就会一次性把全部欠账塞进队列，占满抽取并发。0 = 不补。
+    pub aged_out_redrive_batch: usize,
     /// 周期对账间隔（秒）；0 表示只在启动时对账。
     ///
     /// 启动对账只覆盖"进程崩溃到重启"这一小段。一次上游断供比对账回看窗更长
@@ -166,6 +172,7 @@ impl Default for IngestConfig {
             extraction_concurrency: 4,
             startup_reconcile: true,
             reconcile_lookback_hours: 24,
+            aged_out_redrive_batch: 32,
             reconcile_interval_secs: 600,
             pull_pause_after_failures: 3,
             pull_pause_initial_secs: 60,

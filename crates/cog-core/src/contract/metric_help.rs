@@ -584,12 +584,23 @@ const HISTOGRAM_HELP: &[(&str, &str)] = &[
 const GAUGE_HELP: &[(&str, &str)] = &[
     (
         "memory_unextracted_raw",
-        "Archived raw sources still missing a summary, as last scanned",
+        "Archived raw sources whose summary is still owed: missing a summary \
+         and not already diagnosed as unextractable, as last scanned. A source \
+         that failed extraction on its own content is not owed one -- it has a \
+         dead-letter record instead, and re-driving it would reproduce the same \
+         diagnosis -- so it leaves this reading and its discard is counted on \
+         memory_operations_total{operation=\"dlq_written\"}",
     ),
     (
         "memory_unextracted_raw_aged_out",
-        "Subset of the above that aged past the re-drive window; the system \
-         will not pick these up again without a budgeted backfill",
+        "Subset of the above that aged past the re-drive window. These are not \
+         given up on: the reconcile pass picks them up on its own, at most \
+         aged_out_redrive_batch per round, so the reading falls as the debt is \
+         repaid. What it cannot say on its own is whether it is falling: a \
+         value that stays put is a debt larger than the batch, a pass that \
+         stopped, or a batch of zero, and the count of sources each pass \
+         re-drove separates the first from the other two -- it is on \
+         memory_operations_total{operation=\"aged_out_redrive\"}",
     ),
     (
         "memory_unextracted_scan_failed",

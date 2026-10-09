@@ -32,6 +32,24 @@ const CLAIM_RAN_OPERATION: &str = "bus_claim";
 const CLAIM_FAILED_OPERATION: &str = "bus_claim_failed";
 const CLAIM_HELD_OPERATION: &str = "bus_claim_held";
 
+/// 死信条目的 id 前缀。写侧（[`MemoryIngestor::write_dlq`]）与读侧
+/// （[`MemoryIngestor::terminally_diagnosed_ids`]）共用这一个定义：两侧各写一遍
+/// 字面量时，改一处就会让读侧恒空，而恒空的结果是把已经落账的丢弃重新算成欠账。
+const DLQ_ID_PREFIX: &str = "dlq-";
+
+/// 对账把一批已老过重驱动窗、又没有终局诊断的欠账重新入队时，这一格记下**入队
+/// 的条数**（不是这一拍的次数：一条欠账的代价就是它那一次抽取）。
+///
+/// 只报「欠账还在」不够：欠账不回零可能是驱动方没跑（对账循环死了、批次配置成
+/// 0），也可能是它跑着而欠得多、排得慢。前者是故障，后者是正常。两者在这条
+/// gauge 上同形，差别只在「这一拍真的入队了几条」——这一格就是那句话。
+const AGED_OUT_REDRIVE_OPERATION: &str = "aged_out_redrive";
+
+/// 一条 raw 被判定为内容缺陷、写进死信命名空间。这是**丢弃**事件，与「欠账」
+/// 是两个方向：写进死信的 raw 不再进欠账读数（再驱动只会拿到同一份诊断），所以
+/// 丢弃必须有自己的一格，否则「我们放弃了这条记忆」在读数面上只剩总量少了一。
+const DLQ_WRITTEN_OPERATION: &str = "dlq_written";
+
 /// 拉取闸门「此刻由哪一路掌权」在 `memory_operations_total` 上的五个 operation
 /// 取值。闸门每次**换手**记一格，恰好一格，按 0 播种。
 ///
@@ -158,17 +176,25 @@ fn raw_id_from_uri(uri: &str) -> Option<String> {
     uri.strip_prefix("memory://").map(str::to_string)
 }
 
-/// 一次对账扫描的结果。分成两段是因为它们对应两个不同的决定：`actionable`
-/// 会被重新入队（受上游闸门约束），`aged_out` 只能被报出来——对应的 raw 已经
-/// 老过重驱动窗，没有任何一条路径会再碰它们。
+/// 一次对账扫描的结果。三种去向对应三个不同的决定：`actionable` 每拍重驱动，
+/// `aged_out_due` 按每拍批量补驱动，已经在死信里有终局诊断的那些两边都不进
+/// ——它们的诊断已经落账，再驱动一次只会得到同一份诊断。
+///
+/// 「已老过窗」与「已经放弃」是两件事，此前被合成了一个计数：老过窗只说明这条
+/// raw 掉出了每拍都会走的那条路，不说明它抽不出来。一次长过重驱动窗的断供之后，
+/// 断供早期归档的 raw 全部落进这一格，而它们一条终局诊断都没有。
 struct UnextractedScan {
     actionable: Vec<RawSource>,
-    aged_out: usize,
+    /// 已老过重驱动窗、没有终局诊断、本拍取回来准备补驱动的欠账。
+    aged_out_due: Vec<RawSource>,
+    /// 同一类欠账的**总条数**，含本拍因批量上限没取的那部分。报的是欠了多少，
+    /// 不是这一拍还了多少。
+    aged_out_total: usize,
 }
 
 impl UnextractedScan {
     fn total(&self) -> usize {
-        self.actionable.len() + self.aged_out
+        self.actionable.len() + self.aged_out_total
     }
 }
 
@@ -190,11 +216,16 @@ pub struct MemoryIngestorConfig {
     /// 启动时是否对账扫描：把已归档但没有 summary 的 raw 重新入队。覆盖
     /// 崩溃/重启丢掉的在途抽取，以及任何"归档成功但抽取缺席"的残留。
     pub startup_reconcile: bool,
-    /// 重驱动窗：只把最近这么多小时内归档的未抽取 raw 重新入队，更老的放弃。
-    /// 放弃是为了不无限重试内容本身抽不出来的 raw——它们写完死信仍然是"未
-    /// 抽取"，没有这个界就会每拍重驱动一次、死信按对账频率增长。放弃的代价
-    /// 是那部分不可自愈，所以扫描照报（`memory_unextracted_raw_aged_out`）。
+    /// 重驱动窗：最近这么多小时内归档的未抽取 raw 每拍重驱动，更老的转成按
+    /// 批量补驱动。窗口把每拍重驱动的量按住，不按住的话一次长断供恢复后同一批
+    /// 欠账会每拍被重试一遍；把更老的那部分直接放弃则会让断供早期归档的 raw
+    /// 永久掉队，所以它们不是被丢掉，是转成另一条路径。
     pub reconcile_lookback_hours: u64,
+    /// 每拍最多补驱动多少条已老过重驱动窗的欠账。见
+    /// [`UnextractedScan::aged_out_due`]：这批欠账按固定速率还，速率与事件
+    /// 洪峰解耦——不设上限时一次长断供会在恢复后把全部欠账一次塞进队列，占满
+    /// 抽取并发，新事件反而排在它们后面。0 = 不补。
+    pub aged_out_redrive_batch: usize,
     /// 周期对账间隔（秒）；0 = 只在启动时对账。周期重扫让窗口内的欠账在上游
     /// 恢复后的下一拍就被补驱动，不依赖进程重启时机。
     pub reconcile_interval_secs: u64,
@@ -240,6 +271,7 @@ impl Default for MemoryIngestorConfig {
             extraction_concurrency: 4,
             startup_reconcile: true,
             reconcile_lookback_hours: 24,
+            aged_out_redrive_batch: 32,
             reconcile_interval_secs: 600,
             pull_pause_after_failures: 3,
             pull_pause_initial_secs: 60,
@@ -265,6 +297,7 @@ impl From<&IngestConfig> for MemoryIngestorConfig {
             extraction_concurrency: c.extraction_concurrency,
             startup_reconcile: c.startup_reconcile,
             reconcile_lookback_hours: c.reconcile_lookback_hours,
+            aged_out_redrive_batch: c.aged_out_redrive_batch,
             reconcile_interval_secs: c.reconcile_interval_secs,
             pull_pause_after_failures: c.pull_pause_after_failures,
             pull_pause_initial_secs: c.pull_pause_initial_secs,
@@ -835,7 +868,7 @@ impl MemoryIngestor {
                     let backlog = backlog.clone();
                     let inner = inner.clone();
                     async move {
-                        inner.seed_claim_outcomes().await;
+                        inner.seed_operation_cells().await;
                         let mut interval = tokio::time::interval(claim_interval);
                         interval.tick().await; // 跳过立即触发的那一拍
                         loop {
@@ -1100,6 +1133,9 @@ impl MemoryIngestor {
                         // DLQ 都写不进：不 ack 留给总线红投，比静默终结响亮。
                         return false;
                     }
+                    // 丢弃有自己的读数：这条 raw 从此不进欠账（再抽只会得到同一份
+                    // 诊断），所以积压读数会少一，而那一下减少与「还清了」同形。
+                    self.record_operation_cell(DLQ_WRITTEN_OPERATION, 1.0).await;
                 }
                 // 抽取失败但已落 DLQ：事件有了终结记录，ack 掉不再红投——
                 // 否则同一条坏消息会按 max_deliver 反复抽同样的错。
@@ -1266,19 +1302,24 @@ impl MemoryIngestor {
                 // 缺席查不出缺席。
                 self.report_unextracted(&scan).await;
                 self.report_scan_outcome(false).await;
-                if scan.actionable.is_empty() {
+                let actionables = scan.actionable.len();
+                let due = actionables + scan.aged_out_due.len();
+                if due == 0 {
                     return;
                 }
                 if !upstream_available {
                     info!(
-                        "Memory ingest reconcile found {} unextracted raw sources; holding them until the LLM upstream returns",
-                        scan.actionable.len()
+                        "Memory ingest reconcile found {} unextracted raw sources ({} of them beyond the re-drive window); holding them until the LLM upstream returns",
+                        due,
+                        scan.aged_out_due.len()
                     );
                     return;
                 }
                 info!(
-                    "Memory ingest reconcile re-driving {} unextracted raw sources",
-                    scan.actionable.len()
+                    "Memory ingest reconcile re-driving {} unextracted raw sources, {} of them aged-out debt ({} beyond the re-drive window in total)",
+                    due,
+                    scan.aged_out_due.len(),
+                    scan.aged_out_total
                 );
                 for raw in scan.actionable {
                     enqueue(
@@ -1287,6 +1328,19 @@ impl MemoryIngestor {
                         QueuedRaw { raw, ack: None },
                         self.config.backlog_warn_at,
                     );
+                }
+                let debt_enqueued = scan.aged_out_due.len();
+                for raw in scan.aged_out_due {
+                    enqueue(
+                        job_tx,
+                        backlog,
+                        QueuedRaw { raw, ack: None },
+                        self.config.backlog_warn_at,
+                    );
+                }
+                if debt_enqueued > 0 {
+                    self.record_operation_cell(AGED_OUT_REDRIVE_OPERATION, debt_enqueued as f64)
+                        .await;
                 }
             }
             Err(e) => {
@@ -1319,31 +1373,36 @@ impl MemoryIngestor {
         }
     }
 
-    /// 把认领循环三个结局的序列先按 0 发出去。
+    /// 把这个进程会写的 `memory_operations_total` 各格先按 0 发出去。
     ///
     /// 与积压读数「从第一拍就发布（含零）」同一条理由：「还没进过这个状态」
     /// 与「从来没发布过这个状态」在只看得见已存在序列的查询里同形，而这两句
-    /// 要答的是不同的问题。
-    async fn seed_claim_outcomes(&self) {
+    /// 要答的是不同的问题——`increase()` 在没有序列时返回空，读它的规则会静默，
+    /// 与「这一格一直是 0」长得一样。
+    async fn seed_operation_cells(&self) {
         for operation in [
             CLAIM_RAN_OPERATION,
             CLAIM_FAILED_OPERATION,
             CLAIM_HELD_OPERATION,
+            AGED_OUT_REDRIVE_OPERATION,
+            DLQ_WRITTEN_OPERATION,
         ] {
-            self.record_claim_counter(operation, 0.0).await;
+            self.record_operation_cell(operation, 0.0).await;
         }
     }
 
     /// 记一轮认领循环的结局（见 [`CLAIM_RAN_OPERATION`] 一族）。
-    ///
-    /// 记在 `memory_operations_total` 上而不是新开一个指标名：这是认领这条
-    /// 路上的一次具名结果，与 `memory_operations_total{operation=...}` 已有的
-    /// 语义同类，而新名字要为一次「这一轮做了什么」付告警规则普查的代价。
     async fn record_claim_outcome(&self, operation: &str) {
-        self.record_claim_counter(operation, 1.0).await;
+        self.record_operation_cell(operation, 1.0).await;
     }
 
-    async fn record_claim_counter(&self, operation: &str, value: f64) {
+    /// 记一格 `memory_operations_total`（认领的三个结局、闸门换手、对账补驱动的
+    /// 条数、丢弃事件都记在它上面）。
+    ///
+    /// 都记在已有的指标名上而不是各铸新名：这些是各条路上的一次具名结果，与
+    /// `memory_operations_total{operation=...}` 已有的语义同类，而新名字要为一次
+    /// 「这一拍做了什么」付告警规则普查的代价。
+    async fn record_operation_cell(&self, operation: &str, value: f64) {
         let Some(metrics) = self.metrics.as_ref() else {
             return;
         };
@@ -1357,22 +1416,22 @@ impl MemoryIngestor {
             )
             .await
         {
-            warn!("Failed to record the {operation} claim outcome: {}", e);
+            warn!("Failed to record the {operation} operation cell: {}", e);
         }
     }
 
     /// 发布积压观测。两个 gauge 是两件事、两个决定，不合并成一个标量：
-    /// `memory_unextracted_raw` 是全部未抽取 raw（无时间窗，与它的名字和 HELP
-    /// 一致），`memory_unextracted_raw_aged_out` 是其中已经老过重驱动窗、系统
-    /// 自己再也补不回来的那部分。合并会掩盖后者——它永远小于全量，而全量随
-    /// 断供时长一起涨，一个"总量"读数分不出"正在排空"与"永远排不空"。
+    /// `memory_unextracted_raw` 是全部还欠着抽取的 raw（无时间窗），
+    /// `memory_unextracted_raw_aged_out` 是其中已经老过重驱动窗、只能按每拍批量
+    /// 还的那部分。合并会掩盖后者——它永远小于全量，而全量随断供时长一起涨，
+    /// 一个"总量"读数分不出"正在排空"与"排不动"。
     /// 没有指标面时只记日志：观测缺席不该让对账这一步失败。
     async fn report_unextracted(&self, scan: &UnextractedScan) {
         let Some(metrics) = self.metrics.as_ref() else {
             debug!(
                 "Memory ingest reconcile: {} unextracted raw sources ({} beyond the re-drive window)",
                 scan.total(),
-                scan.aged_out
+                scan.aged_out_total
             );
             return;
         };
@@ -1380,7 +1439,7 @@ impl MemoryIngestor {
             (cog_core::metric_names::MEMORY_UNEXTRACTED_RAW, scan.total()),
             (
                 cog_core::metric_names::MEMORY_UNEXTRACTED_RAW_AGED_OUT,
-                scan.aged_out,
+                scan.aged_out_total,
             ),
         ] {
             if let Err(e) = metrics
@@ -1397,14 +1456,13 @@ impl MemoryIngestor {
     /// 的 id，相减即积压——同样结果下逐条 `summary_for_raw` 要多花每个 raw
     /// 一次查询。
     ///
-    /// 时间窗只把结果切成"还能自愈"与"已经放弃"两段，不参与决定要不要看。
+    /// 时间窗只把结果切成"每拍都走"与"按批量还"两段，不参与决定要不要看。
     /// 用窗口筛掉不看的，恰恰是积压里最老、最不可能自己恢复的那一段，等于让
     /// 「记忆静默丢失」随年龄增长自动消失。
     ///
-    /// 重驱动一侧保留窗口是有意的，不是遗漏：内容本身抽不出来的 raw 走死信
-    /// 后仍是"未抽取"，没有窗口就会每拍重驱动一次、死信按对账频率无限增长。
-    /// 代价是这些 raw 超出窗口后不可自愈——所以它必须报出来（`aged_out`），
-    /// 让人知道欠了多少、需要一次带预算的回填。
+    /// 已被判为内容缺陷（死信里有终局记录）的 raw 两边都不进：它没有 summary
+    /// 是真的，但再驱动一次只会拿到同一份诊断，留在欠账里等于让一个不会变的数
+    /// 永远盖住真正在变的那部分。它的丢弃有自己的读数（[`DLQ_WRITTEN_OPERATION`]）。
     async fn collect_unextracted(&self) -> SFResult<UnextractedScan> {
         let ids = self
             .backend
@@ -1417,27 +1475,63 @@ impl MemoryIngestor {
             .into_iter()
             .filter_map(|e| raw_id_from_uri(&e.source_ref.raw_uri))
             .collect();
+        let diagnosed = self.terminally_diagnosed_ids().await?;
         let cutoff = chrono::Utc::now()
             - chrono::Duration::hours(self.config.reconcile_lookback_hours as i64);
         let mut actionable = Vec::new();
-        let mut aged_out = 0usize;
+        let mut debt: Vec<String> = Vec::new();
         for id in ids {
-            if summarized.contains(&id) {
+            if summarized.contains(&id) || diagnosed.contains(&id) {
                 continue;
             }
             // 无时间信息的 id 不算放弃：宁可多查一次 summary。
             if raw_id_timestamp(&id).is_some_and(|ts| ts < cutoff) {
-                aged_out += 1;
+                debt.push(id);
                 continue;
             }
             if let Some(raw) = self.backend.get_raw("default", &id).await? {
                 actionable.push(raw);
             }
         }
+        // 新的欠账先还：同样的 LLM 调用买到的记忆越新越可能还有用，越老的越是
+        // 陈年残留。排序键取 id 里的归档时刻，不取 `list_raw` 的顺序——那是按
+        // agent 名前缀排的，与年龄无关。
+        debt.sort_by_key(|id| std::cmp::Reverse(raw_id_timestamp(id)));
+        let aged_out_total = debt.len();
+        let due_take = self.config.aged_out_redrive_batch.min(debt.len());
+        let mut aged_out_due = Vec::with_capacity(due_take);
+        for id in debt.drain(..due_take) {
+            if let Some(raw) = self.backend.get_raw("default", &id).await? {
+                aged_out_due.push(raw);
+            }
+        }
         Ok(UnextractedScan {
             actionable,
-            aged_out,
+            aged_out_due,
+            aged_out_total,
         })
+    }
+
+    /// 终局诊断集合：死信命名空间里已落账的那批原始 raw id。
+    ///
+    /// 命名空间取配置项 [`MemoryIngestorConfig::dlq_namespace`]，与写侧
+    /// [`Self::write_dlq`] 同一个字段。两侧各取一个来源时（比如这边取调用方的
+    /// 工作区），改一处就会让读侧恒空——而差集只能朝一个方向错：终局集被低估，
+    /// 已经放弃的 raw 就会被重新算成欠账，每拍重试一遍已知抽不出来的东西。
+    ///
+    /// 只列一次、不带 content_type 过滤：带过滤时组合后端会把每条候选的
+    /// envelope 读回来（每条一次对象读），而死信命名空间无界。这么写的前提是
+    /// 「命名空间里的东西」与「内容缺陷记录」按构造等价——`write_dlq` 是这个
+    /// 命名空间唯一的写者。将来若有第二个写者进来，这条等价就断了。
+    async fn terminally_diagnosed_ids(&self) -> SFResult<std::collections::HashSet<String>> {
+        let ids = self
+            .backend
+            .list_raw(&self.config.dlq_namespace, None)
+            .await?;
+        Ok(ids
+            .into_iter()
+            .filter_map(|id| id.strip_prefix(DLQ_ID_PREFIX).map(str::to_string))
+            .collect())
     }
 
     async fn retry_with_backoff<F, Fut, T>(&self, label: &str, mut op: F) -> SFResult<T>
@@ -1490,7 +1584,7 @@ impl MemoryIngestor {
         // 死信目录于是用文件数冒充失败条数（实测 22,139 个文件来自 3,006 条 raw）。
         // 内容缺陷是终止性的，重驱动只会得到同一条诊断，落同一个键即为最新诊断。
         let dlq_raw = RawSource::new(
-            format!("dlq-{}", raw.id),
+            format!("{DLQ_ID_PREFIX}{}", raw.id),
             &self.config.dlq_namespace,
             "ingestion/failed",
             serde_json::to_vec(&dlq_payload).unwrap_or_default(),
@@ -3465,7 +3559,7 @@ mod tests {
         assert_eq!(
             metrics.latest("memory_unextracted_raw"),
             Some(2.0),
-            "the backlog gauge must count every unextracted raw, not only the re-drivable ones"
+            "the backlog gauge must count every raw whose summary is still owed"
         );
         assert_eq!(
             metrics.latest("memory_unextracted_raw_aged_out"),
@@ -3477,8 +3571,127 @@ mod tests {
             "the in-window raw must still be re-driven"
         );
         assert!(
+            job_rx.try_recv().is_ok(),
+            "a raw past the re-drive window is owed one too: the window moves it onto a bounded \
+             path, it does not abandon it"
+        );
+        assert_eq!(
+            metrics.counter_total("memory_operations_total", "aged_out_redrive"),
+            Some(1.0),
+            "how many the pass re-drove must be readable, or a debt that stays put cannot be told \
+             from a pass that stopped repaying"
+        );
+    }
+
+    /// 死信里有终局记录的 raw 不是欠账：内容本身抽不出来，再驱动只会拿到同一份
+    /// 诊断。它两边都不进——不进每拍重驱动，也不进积压读数。
+    #[tokio::test]
+    async fn reconcile_skips_raws_that_already_have_a_terminal_diagnosis() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        let now = Utc::now();
+        let diagnosed = transcript_raw_at("diagnosed", now - chrono::Duration::hours(48));
+        backend.archive_raw(&diagnosed).await.unwrap();
+        backend
+            .archive_raw(&RawSource::new(
+                format!("dlq-{}", diagnosed.id),
+                "dlq",
+                "ingestion/failed",
+                b"{}".to_vec(),
+            ))
+            .await
+            .unwrap();
+
+        let metrics = Arc::new(RecordingMetrics::default());
+        let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(RuleBasedExtractor::new()))
+            .with_metrics(metrics.clone());
+
+        let (job_tx, mut job_rx) = mpsc::unbounded_channel();
+        let backlog = std::sync::atomic::AtomicUsize::new(0);
+        ingestor.reconcile(&job_tx, &backlog, true).await;
+
+        assert!(
             job_rx.try_recv().is_err(),
-            "a raw past the re-drive window is not re-driven"
+            "a raw with a dead-letter record must not be re-driven: the diagnosis is terminal"
+        );
+        assert_eq!(
+            metrics.latest("memory_unextracted_raw"),
+            Some(0.0),
+            "an abandoned raw is not owed a summary; counting it keeps a number that cannot move \
+             in front of the one that can"
+        );
+        assert_eq!(metrics.latest("memory_unextracted_raw_aged_out"), Some(0.0));
+    }
+
+    /// 补驱动按每拍批量走：一次长断供恢复后欠账可能有成千条，一次性塞进队列会把
+    /// 抽取并发占满，新事件反倒排在后面。
+    #[tokio::test]
+    async fn reconcile_repays_aged_out_debt_at_a_bounded_rate() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        let now = Utc::now();
+        for i in 0..5 {
+            backend
+                .archive_raw(&transcript_raw_at(
+                    &format!("debt-{i}"),
+                    now - chrono::Duration::hours(48 + i),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let metrics = Arc::new(RecordingMetrics::default());
+        let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(RuleBasedExtractor::new()))
+            .with_metrics(metrics.clone())
+            .with_config(MemoryIngestorConfig {
+                aged_out_redrive_batch: 2,
+                ..MemoryIngestorConfig::default()
+            });
+
+        let (job_tx, mut job_rx) = mpsc::unbounded_channel();
+        let backlog = std::sync::atomic::AtomicUsize::new(0);
+        ingestor.reconcile(&job_tx, &backlog, true).await;
+
+        assert_eq!(
+            metrics.latest("memory_unextracted_raw_aged_out"),
+            Some(5.0),
+            "the reading states the debt, not how much of it this round paid"
+        );
+        let mut re_driven = 0;
+        while job_rx.try_recv().is_ok() {
+            re_driven += 1;
+        }
+        assert_eq!(
+            re_driven, 2,
+            "one round must re-drive at most aged_out_redrive_batch of the debt"
+        );
+    }
+
+    /// 新的欠账先还：同样的 LLM 调用买到的记忆越新越可能还有用。取的是 id 里的
+    /// 归档时刻，不是 `list_raw` 的顺序（那是按 agent 名前缀排的，与年龄无关）。
+    #[tokio::test]
+    async fn reconcile_repays_the_newest_debt_first() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        let now = Utc::now();
+        let old = transcript_raw_at("old", now - chrono::Duration::hours(240));
+        let recent = transcript_raw_at("recent", now - chrono::Duration::hours(48));
+        backend.archive_raw(&old).await.unwrap();
+        backend.archive_raw(&recent).await.unwrap();
+
+        let metrics = Arc::new(RecordingMetrics::default());
+        let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(RuleBasedExtractor::new()))
+            .with_metrics(metrics.clone())
+            .with_config(MemoryIngestorConfig {
+                aged_out_redrive_batch: 1,
+                ..MemoryIngestorConfig::default()
+            });
+
+        let (job_tx, mut job_rx) = mpsc::unbounded_channel();
+        let backlog = std::sync::atomic::AtomicUsize::new(0);
+        ingestor.reconcile(&job_tx, &backlog, true).await;
+
+        let job = job_rx.try_recv().expect("the batch slot must be spent");
+        assert_eq!(
+            job.raw.id, recent.id,
+            "the batch must buy the newest debt, not whichever id sorted first"
         );
     }
 
