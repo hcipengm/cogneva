@@ -133,6 +133,10 @@ metric_names! {
     MEMORY_UNEXTRACTED_RAW => "memory_unextracted_raw",
     MEMORY_UNEXTRACTED_RAW_AGED_OUT => "memory_unextracted_raw_aged_out",
     MEMORY_UNEXTRACTED_SCAN_FAILED => "memory_unextracted_scan_failed",
+    // cog-memory — how each pass of the decay maintenance loop ended, labelled
+    // by `outcome`, one cell per namespace swept per pass. See the HELP for the
+    // closed set and why the cell is a pass rather than an entry count.
+    MEMORY_DECAY_TOTAL => "cogneva_memory_decay_total",
 
     // cog-storage — the metric store's own readings and tier migration.
     METRICS_RETIRED_ROWS_REMOVED => "metrics_retired_rows_removed",

@@ -1763,6 +1763,10 @@ const UNREAD: &[(&str, Unread)] = &[
         "cogneva_supervisor_pass_total",
         Unread::Gap("how each pass of the supervisor loop ended, one cell per pass per outcome. The six passes had no reading of their own before this one: each failure left only a warn line that dies with the pod, and the loop's only other reading is a beat driven by the shortest of the six intervals, so a pass that could not run at all and a pass with nothing to do read the same, and an arm that stopped firing stayed invisible behind a beat the other five kept stamping. What is still missing is a rule, and a rule here would have to say how many failed passes in a window are a fault for a pass that runs on its own cadence -- health is seconds, rebalance is minutes -- so a single threshold would either miss the fast arm or fire on the slow one's ordinary gaps, and it would have to say whether a flat ok cell is a starved arm or a pass with genuinely nothing to do. That is a per-pass policy and threshold on a loop whose arms run at different rates: nobody declared any of it, and the arms report no cadence of their own beyond the values here. Writing that rule is an alert-rule change, which needs sign-off before it lands, so the reading ships with its debt recorded rather than left absent"),
     ),
+    (
+        "cogneva_memory_decay_total",
+        Unread::Gap("how each pass of the memory decay maintenance loop ended, one cell per namespace swept per pass. Before this pass the documented promise that low-value memories decay automatically had no production caller at all: `MemoryBackend::decay` was implemented and reachable only from a test, so nothing decayed on a running system and no reading could have shown it -- a loop that never runs is invisible to every reading of the loop. This is that loop's own reading, and the cells separate the three states that were the same picture before: a pass that ran and found nothing (`idle`), a pass that demoted entries (`decayed`), a pass that archived them (`archived`), and a pass that could not run (`failed`). What is still missing is a rule, and a rule here would have to say whether a run of `failed` passes is a fault (the maintenance path being down) and, separately, whether the archive rate itself is a fault -- archiving low-value memory is the feature working, not a fault, so a threshold on `archived` would report the feature as a problem, while a threshold on `failed` needs a failure frequency nobody declared for a loop that runs on the decay interval. Whether the configured age and importance thresholds are doing the right thing is a policy on the values, not on this counter. Writing that rule is an alert-rule change, which needs sign-off before it lands, so the reading ships with its debt recorded rather than left absent"),
+    ),
 ];
 
 /// Entries an `Elsewhere` reader claim cannot be resolved against.
@@ -1791,7 +1795,7 @@ fn unresolved_readers(read: &BTreeSet<String>, name: &str, readers: &[&str]) -> 
 /// completion cadence is already read against *is* that budget. The two entries
 /// left the table in the pass that wrote `buildah_store_round_incomplete`, so
 /// 23 became 21.
-const GAPS_AT_CENSUS: usize = 29;
+const GAPS_AT_CENSUS: usize = 30;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {

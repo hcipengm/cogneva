@@ -321,7 +321,7 @@ Not simple conversation-history concatenation, but a **Raw → Schema → Summar
 **Essential differences from file-level memory**:
 - File-level memory (e.g. MEMORY.md) is flat text, capacity-limited, keyword-matched retrieval
 - Cogneva's memory is **structured + vectorized + graph-relational**, supporting semantic retrieval, time-range filtering, and relation-chain queries
-- The LLM automatically assigns importance scores (1–10); low-value memories decay automatically, high-value memories are continuously reinforced
+- The LLM automatically assigns importance scores (1–10); a periodic maintenance pass decays aged low-value memories automatically — down-weighting their importance and archiving those that fall past a floor — while re-observed facts are merged rather than duplicated
 - Multi-tenant Namespace isolation for enterprise-grade data security
 
 ### 🔭 Advantage 5: Full-stack observability

@@ -50,6 +50,23 @@ const COUNTER_HELP: &[(&str, &str)] = &[
         "Total number of failed memory backend operations",
     ),
     (
+        crate::metric_names::MEMORY_DECAY_TOTAL.as_str(),
+        "How each pass of the memory decay maintenance loop ended, labelled by \
+         `outcome`, one increment per namespace swept per pass. Outcomes are a \
+         closed set: `idle` (the pass ran and found nothing to decay), \
+         `decayed` (it lowered the importance of at least one aged low-value \
+         entry), `archived` (it removed at least one such entry from the \
+         searchable summary layer), and `failed` (the pass could not complete). \
+         A pass that both decayed and archived reports `archived`, because the \
+         removal is the half worth seeing and the partial-demotion half is \
+         reported by every other pass that decays without archiving. The cell \
+         counts passes, not entries: an entry count mixes two units under one \
+         name and cannot say whether a quiet stretch was a loop that found \
+         nothing or a loop that stopped being called. This loop lives in every \
+         memory-owning deployment, so a reader takes a single series rather \
+         than summing across deployments.",
+    ),
+    (
         crate::metric_names::HTTP_REQUESTS_TOTAL.as_str(),
         "Total number of HTTP requests",
     ),

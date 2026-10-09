@@ -19,6 +19,18 @@ pub const MEMORY_ENV: &[(&str, &str)] = &[
         "load_embedding_model",
     ),
     ("COGNEVA_MEMORY_LOAD_RERANKER_MODEL", "load_reranker_model"),
+    (
+        "COGNEVA_MEMORY_DECAY_INTERVAL_SECS",
+        "maintenance.decay_interval_secs",
+    ),
+    (
+        "COGNEVA_MEMORY_DECAY_AGE_THRESHOLD_SECS",
+        "maintenance.decay_age_threshold_secs",
+    ),
+    (
+        "COGNEVA_MEMORY_DECAY_IMPORTANCE_THRESHOLD",
+        "maintenance.decay_importance_threshold",
+    ),
 ];
 
 /// Memory 子系统配置。
@@ -50,6 +62,43 @@ pub struct MemoryConfig {
     pub load_reranker_model: bool,
     /// 自动摄取（AgentEnd → 记忆三层）的运行参数。
     pub ingest: IngestConfig,
+    /// 周期维护（低价值记忆自动衰减）的运行参数。
+    pub maintenance: MaintenanceConfig,
+}
+
+/// 记忆维护管线的运行参数。代码侧 [`Default`] 只是兜底，集群上调参改
+/// cogneva.json 的 `memory.maintenance` 段。
+///
+/// 这里是「低价值记忆自动衰减」这句承诺的唯一驱动方：没有这一段，衰减只有
+/// 一个「谁都能调、却没人调」的方法（`MemoryBackend::decay`），
+/// 文档里的自动衰减不成立。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MaintenanceConfig {
+    /// 两次衰减扫描之间的间隔（秒）；0 表示关掉整条维护循环。
+    ///
+    /// 降权是**逐次**的：一次扫描把合格条目的重要性乘 `DECAY_IMPORTANCE_FACTOR`，
+    /// 跌到 `DECAY_ARCHIVE_FLOOR` 才归档。所以归档必须跨多次扫描才发生，任何
+    /// 一次扫描都不会把一条刚入库的低分记忆直接删掉。
+    pub decay_interval_secs: u64,
+    /// 只有生成时间早于「现在减去这么多秒」的条目才够格衰减。
+    pub decay_age_threshold_secs: u64,
+    /// 只有重要性低于这个值的条目才够格衰减。
+    pub decay_importance_threshold: f32,
+    /// 扫描哪些命名空间。默认只有自动摄取写入的那一个——系统衰减**它自己**的记忆；
+    /// 手工摄取写进别的命名空间是调用方的记忆，除非在这里显式列出，否则不动。
+    pub decay_namespaces: Vec<String>,
+}
+
+impl Default for MaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            decay_interval_secs: 3600,
+            decay_age_threshold_secs: 7 * 24 * 3600,
+            decay_importance_threshold: 0.5,
+            decay_namespaces: vec!["default".into()],
+        }
+    }
 }
 
 /// 自动摄取管线的运行参数。代码侧 [`Default`] 只是兜底，集群上调参改

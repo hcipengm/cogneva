@@ -1,4 +1,6 @@
-use cog_core::{MemoryBackend, RawSource, SchemaEntry, SchemaKind, SourceRef, SummaryEntry};
+use cog_core::{
+    MemoryBackend, MetricsBackend, RawSource, SchemaEntry, SchemaKind, SourceRef, SummaryEntry,
+};
 use cog_memory::*;
 use cog_storage::FileObjectBackend;
 use std::sync::Arc;
@@ -664,7 +666,7 @@ async fn test_time_range_filter() {
 }
 
 #[tokio::test]
-async fn test_decay_quantizes_embeddings() {
+async fn test_decay_demotes_aged_low_value_summary() {
     let tmp = tempfile::tempdir().unwrap();
     let object = Arc::new(FileObjectBackend::new(tmp.path()));
     let backend = CompositeMemoryBackend::new(
@@ -689,14 +691,185 @@ async fn test_decay_quantizes_embeddings() {
     backend.store_summary("default", &entry).await.unwrap();
 
     let report = backend.decay("default", 3600, 0.5).await.unwrap();
+    // 0.1 * 0.5 = 0.05, still above the archive floor, so the entry is demoted
+    // in place, not removed.
     assert_eq!(report.entries_decayed, 1);
+    assert_eq!(report.entries_archived, 0);
 
     let retrieved = backend
         .get_summary("default", "decay1")
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(retrieved.embedding, vec![0.12f32, 0.99f32, 0.11f32, 1.0f32]);
+    assert!(
+        (retrieved.importance - 0.05).abs() < 1e-6,
+        "importance should be halved, got {}",
+        retrieved.importance
+    );
+    // The embedding is untouched: decay changes how the entry is valued, not the
+    // vector it is stored with.
+    assert_eq!(
+        retrieved.embedding,
+        vec![0.12345f32, 0.98765f32, 0.11111f32, 0.99999f32]
+    );
+}
+
+#[tokio::test]
+async fn test_decay_archives_summary_that_falls_to_the_floor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let object = Arc::new(FileObjectBackend::new(tmp.path()));
+    let backend = CompositeMemoryBackend::new(
+        object,
+        Arc::new(cog_storage::MemoryVectorBackend::new()),
+        128,
+    );
+
+    let old_time = chrono::Utc::now() - chrono::Duration::hours(48);
+    let mut entry = SummaryEntry::new(
+        "decay-archive",
+        "default",
+        "Already near the floor",
+        vec![0.5f32, 0.5f32],
+        "test",
+        make_source_ref("r1"),
+    )
+    .with_importance(0.03);
+    entry.generated_at = old_time;
+    backend.store_summary("default", &entry).await.unwrap();
+
+    // 0.03 * 0.5 = 0.015, at or below the floor, so this pass archives it.
+    let report = backend.decay("default", 3600, 0.5).await.unwrap();
+    assert_eq!(report.entries_decayed, 0);
+    assert_eq!(report.entries_archived, 1);
+    assert!(
+        backend
+            .get_summary("default", "decay-archive")
+            .await
+            .unwrap()
+            .is_none(),
+        "an archived entry must leave the searchable summary layer"
+    );
+}
+
+#[tokio::test]
+async fn test_decay_leaves_fresh_and_high_value_summaries_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let object = Arc::new(FileObjectBackend::new(tmp.path()));
+    let backend = CompositeMemoryBackend::new(
+        object,
+        Arc::new(cog_storage::MemoryVectorBackend::new()),
+        128,
+    );
+
+    let now = chrono::Utc::now();
+    // Fresh (well within the age threshold) though low value.
+    let mut fresh = SummaryEntry::new(
+        "fresh",
+        "default",
+        "Just stored",
+        vec![1.0f32, 0.0f32],
+        "test",
+        make_source_ref("r1"),
+    )
+    .with_importance(0.01);
+    fresh.generated_at = now;
+    backend.store_summary("default", &fresh).await.unwrap();
+
+    // Old but high value.
+    let mut valuable = SummaryEntry::new(
+        "valuable",
+        "default",
+        "Worth keeping",
+        vec![0.0f32, 1.0f32],
+        "test",
+        make_source_ref("r2"),
+    )
+    .with_importance(0.9);
+    valuable.generated_at = now - chrono::Duration::hours(48);
+    backend.store_summary("default", &valuable).await.unwrap();
+
+    let report = backend.decay("default", 3600, 0.5).await.unwrap();
+    assert_eq!(report.entries_decayed, 0);
+    assert_eq!(report.entries_archived, 0);
+    assert!(backend
+        .get_summary("default", "fresh")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(backend
+        .get_summary("default", "valuable")
+        .await
+        .unwrap()
+        .is_some());
+}
+
+/// Drive the real maintenance loop rather than calling `decay` directly: the
+/// defect this exists for is that the documented automatic decay had no caller,
+/// so a test that called `decay` itself would pass against the broken state.
+#[tokio::test]
+async fn test_decay_maintenance_loop_drives_a_real_pass() {
+    let tmp = tempfile::tempdir().unwrap();
+    let object = Arc::new(FileObjectBackend::new(tmp.path()));
+    let backend = Arc::new(CompositeMemoryBackend::new(
+        object,
+        Arc::new(cog_storage::MemoryVectorBackend::new()),
+        128,
+    ));
+    let mut entry = SummaryEntry::new(
+        "loop-decay",
+        "default",
+        "aged low value",
+        vec![0.2f32, 0.2f32],
+        "test",
+        make_source_ref("r1"),
+    )
+    .with_importance(0.4);
+    entry.generated_at = chrono::Utc::now() - chrono::Duration::hours(48);
+    backend.store_summary("default", &entry).await.unwrap();
+
+    let metrics = Arc::new(cog_observability::metrics::PrometheusMetricsBackend::new(
+        "",
+    ));
+    // The smallest interval the config allows is one second; the loop's first
+    // sweep lands one period after start, so poll rather than race the timer.
+    cog_memory::maintenance::spawn_decay_loop(
+        backend.clone() as Arc<dyn MemoryBackend>,
+        metrics.clone() as Arc<dyn MetricsBackend>,
+        cog_memory::MaintenanceConfig {
+            decay_interval_secs: 1,
+            decay_age_threshold_secs: 3600,
+            decay_importance_threshold: 0.5,
+            decay_namespaces: vec!["default".into()],
+        },
+    );
+
+    let mut saw_decayed = false;
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let totals = metrics
+            .query_counter_totals(cog_core::metric_names::MEMORY_DECAY_TOTAL.as_str())
+            .await
+            .unwrap();
+        if totals
+            .iter()
+            .any(|s| s.labels.get("outcome").map(String::as_str) == Some("decayed"))
+        {
+            saw_decayed = true;
+            break;
+        }
+    }
+    assert!(saw_decayed, "the loop never recorded a decayed pass");
+
+    let after = backend
+        .get_summary("default", "loop-decay")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        (after.importance - 0.2).abs() < 1e-6,
+        "the loop's pass must have demoted the entry, got {}",
+        after.importance
+    );
 }
 
 #[tokio::test]

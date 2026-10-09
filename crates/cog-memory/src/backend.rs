@@ -9,6 +9,8 @@ use cog_core::{
 };
 use cog_core::{SFError, SFResult};
 
+use crate::maintenance::{DECAY_ARCHIVE_FLOOR, DECAY_IMPORTANCE_FACTOR};
+
 // ─── In-memory implementation ──────────────────────────────────────────
 
 #[derive(Debug, Default)]
@@ -615,26 +617,36 @@ impl cog_core::MemoryBackend for MemoryMemoryBackend {
             .map_err(|_| SFError::Agent("lock poisoned".into()))?;
         let now = Utc::now();
         let mut decayed = 0usize;
+        let mut archived_ids: Vec<String> = Vec::new();
 
         for entry in store.summary.values_mut() {
             if entry.namespace != namespace {
                 continue;
             }
-            let age_secs = (now - entry.generated_at).num_seconds() as u64;
-            if age_secs > age_threshold_secs && entry.importance < importance_threshold {
-                entry.embedding = entry
-                    .embedding
-                    .iter()
-                    .map(|v| (v * 100.0).round() / 100.0)
-                    .collect();
+            // `max(0)` guards a stored timestamp in the future: an entry that has
+            // not aged yet must not read as ancient through a negative cast.
+            let age_secs = (now - entry.generated_at).num_seconds().max(0) as u64;
+            if age_secs <= age_threshold_secs || entry.importance >= importance_threshold {
+                continue;
+            }
+            // Demote by one step; archive only once repeated decay has driven the
+            // entry to the floor. The two counts are disjoint.
+            entry.importance = (entry.importance * DECAY_IMPORTANCE_FACTOR).max(0.0);
+            if entry.importance <= DECAY_ARCHIVE_FLOOR {
+                archived_ids.push(entry.id.clone());
+            } else {
                 decayed += 1;
             }
+        }
+
+        for id in &archived_ids {
+            store.summary.remove(id);
         }
 
         Ok(DecayReport {
             namespace: namespace.to_string(),
             entries_decayed: decayed,
-            entries_archived: 0,
+            entries_archived: archived_ids.len(),
         })
     }
 }

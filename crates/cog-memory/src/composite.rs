@@ -3,6 +3,7 @@ use base64::Engine;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::maintenance::{DECAY_ARCHIVE_FLOOR, DECAY_IMPORTANCE_FACTOR};
 use crate::{MemorySchemaBackend, VectorSummaryBackend};
 use chrono::{DateTime, Utc};
 use cog_core::{
@@ -16,7 +17,7 @@ use cog_core::{SchemaBackend, SummaryBackend};
 /// pluggable backend trait.
 /// - Layer 0 (Raw) → [`ObjectBackend`] (e.g. FileObjectBackend, COS)
 /// - Layer 1 (Schema) → [`SchemaBackend`] (e.g. [`MemorySchemaBackend`], PostgreSQL)
-/// - Layer 2 (Summary) → [`SummaryBackend`] (e.g. [`VectorSummaryBackend`], LanceDB)
+/// - Layer 2 (Summary) → [`SummaryBackend`] (e.g. [`VectorSummaryBackend`], Qdrant)
 ///
 /// By default the schema and summary layers are backed by in-memory stores;
 /// callers can swap them for production-grade implementations via
@@ -77,7 +78,7 @@ impl CompositeMemoryBackend {
     }
 
     /// Replace the summary-layer backend with a custom implementation
-    /// (e.g. a LanceDB-backed `SummaryBackend`).
+    /// (e.g. a Qdrant-backed `SummaryBackend`).
     pub fn with_summary_backend(mut self, summary: Arc<dyn SummaryBackend>) -> Self {
         self.summary = summary;
         self.default_summary = None;
@@ -532,15 +533,28 @@ impl MemoryBackend for CompositeMemoryBackend {
         let summaries = self.summary.list_summary(namespace).await?;
         let now = Utc::now();
         let mut decayed = 0usize;
+        let mut archived = 0usize;
 
         for mut entry in summaries {
-            let age_secs = (now - entry.generated_at).num_seconds() as u64;
-            if age_secs > age_threshold_secs && entry.importance < importance_threshold {
-                entry.embedding = entry
-                    .embedding
-                    .iter()
-                    .map(|v| (v * 100.0).round() / 100.0)
-                    .collect();
+            // `max(0)` guards a stored timestamp in the future: an entry that has
+            // not aged yet must not read as ancient through a negative cast.
+            let age_secs = (now - entry.generated_at).num_seconds().max(0) as u64;
+            if age_secs <= age_threshold_secs || entry.importance >= importance_threshold {
+                continue;
+            }
+
+            // Decay demotes, then archives: one pass lowers importance by
+            // `DECAY_IMPORTANCE_FACTOR`, and an entry only leaves the searchable
+            // layer once repeated passes have driven it to `DECAY_ARCHIVE_FLOOR`.
+            // A single pass therefore cannot delete a freshly stored entry no
+            // matter how low its starting importance was. The two counts are
+            // disjoint: an entry is either demoted in place (still searchable)
+            // or removed this pass.
+            entry.importance = (entry.importance * DECAY_IMPORTANCE_FACTOR).max(0.0);
+            if entry.importance <= DECAY_ARCHIVE_FLOOR {
+                self.summary.delete_summary(namespace, &entry.id).await?;
+                archived += 1;
+            } else {
                 self.summary.update_summary(namespace, &entry).await?;
                 decayed += 1;
             }
@@ -549,7 +563,7 @@ impl MemoryBackend for CompositeMemoryBackend {
         Ok(DecayReport {
             namespace: namespace.to_string(),
             entries_decayed: decayed,
-            entries_archived: 0,
+            entries_archived: archived,
         })
     }
 }

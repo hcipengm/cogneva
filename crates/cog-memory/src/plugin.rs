@@ -305,12 +305,27 @@ impl cog_core::SystemPlugin for MemoryPlugin {
     async fn start(&self, ctx: &cog_core::PluginContext) -> cog_core::SFResult<()> {
         // memory 是 cog-memory 自有配置段，自读 cogneva.json。
         let memory = crate::MemoryConfig::load()?;
+        let memory_backend = ctx.consume_service::<dyn cog_core::MemoryBackend>();
+        let metrics_backend = ctx.consume_service::<dyn cog_core::MetricsBackend>();
+
+        // 维护循环只管已经存下的记忆，与「要不要摄取新事件」无关：只要记忆开着就起。
+        // 这是「低价值记忆自动衰减」唯一的生产驱动方——少了它，`decay` 没有调用点。
+        if memory.enabled {
+            if let (Some(backend), Some(metrics)) =
+                (memory_backend.clone(), metrics_backend.clone())
+            {
+                crate::maintenance::spawn_decay_loop(backend, metrics, memory.maintenance.clone());
+            } else {
+                warn!(
+                    "Memory decay maintenance not started: memory backend or metrics backend unavailable"
+                );
+            }
+        }
+
         if !memory.enabled || !memory.auto_ingest {
             return Ok(());
         }
 
-        let memory_backend = ctx.consume_service::<dyn cog_core::MemoryBackend>();
-        let metrics_backend = ctx.consume_service::<dyn cog_core::MetricsBackend>();
         let embed_provider = ctx.consume_service::<dyn cog_core::EmbeddingProvider>();
         let llm_provider = ctx.consume_service::<dyn cog_core::LlmClient>();
         let event_tx = ctx
