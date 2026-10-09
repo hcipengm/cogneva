@@ -293,11 +293,22 @@ fn memory_ingest_routes() -> Router<Arc<GatewayState>> {
     Router::new().route(cog_core::MEMORY_INGEST_PATH, post(memory::ingest_handler))
 }
 
-/// Raw 的读取面（list + get），同样挂在两个 router 上（主 API 组内按 Operator 判）。
+/// Raw 的读取面（list / 元数据 / 内容 / 直链），同样挂在两个 router 上（主 API 组内按 Operator 判）。
+///
+/// 元数据、内容、直链分成三条而不是一条：一条回了字节的路由没法让调用方"先看大小再决定
+/// 拉不拉"，因为等它看到长度时字节已经在路上了。分开之后，预算这根轴才有落脚点。
 fn memory_raw_routes() -> Router<Arc<GatewayState>> {
     Router::new()
         .route(cog_core::MEMORY_RAW_PATH, get(memory::list_raw_handler))
         .route(cog_core::MEMORY_RAW_ITEM_PATH, get(memory::get_raw_handler))
+        .route(
+            cog_core::MEMORY_RAW_CONTENT_PATH,
+            get(memory::get_raw_content_handler),
+        )
+        .route(
+            cog_core::MEMORY_RAW_URL_PATH,
+            get(memory::get_raw_url_handler),
+        )
 }
 
 /// 零凭证的集群内面：只挂 Pod 侧要走的 memory 路由，不挂认证/会话/配额。

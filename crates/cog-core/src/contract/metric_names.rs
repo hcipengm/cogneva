@@ -771,8 +771,17 @@ metric_names! {
     // a caller following it finds nothing. Kept as separate series by `tool`
     // because the first is expected traffic and the second is a defect: folding
     // them would let a failing archive read as ordinary truncation.
+    //
+    // The third is the read side's own fate: a read found the source but its
+    // payload outgrew the byte budget the caller set, so no bytes came back.
+    // Without it, "the source is bigger than you asked for" is indistinguishable
+    // from "the read failed" and, worse, from an empty answer -- a bounded read
+    // and a source that is not there would look the same. Kept by `tool` for the
+    // same reason the pair is: one tool's reads blowing past the budget names
+    // that tool's payload shape rather than reads as a whole.
     TOOL_OUTPUT_TRUNCATED_TOTAL => "cogneva_tool_output_truncated_total",
     TOOL_OUTPUT_ARCHIVE_FAILED_TOTAL => "cogneva_tool_output_archive_failed_total",
+    TOOL_OUTPUT_FETCH_BUDGET_EXHAUSTED_TOTAL => "cogneva_tool_output_fetch_budget_exhausted_total",
 }
 
 /// Whether `name` is a series a build can still write.

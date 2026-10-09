@@ -186,26 +186,33 @@ impl cog_core::SystemPlugin for AgentPlugin {
         } else {
             warn!("HttpClient unavailable; http_request tool not registered");
         }
-        // Memory tools are registered whether or not this process holds a
-        // backend. `http_request` is skipped when its dependency is missing
-        // because that would be a misconfiguration; memory is switched off on
-        // purpose in the evolution worker, and a squad working there must be
-        // able to tell "this layer is absent" from "this namespace is empty".
-        // Registered-but-failing says the first; not registered at all would
-        // look like the second.
+        // Memory tools read through the platform memory API over HTTP rather
+        // than an in-process backend: the process that runs the loops holds no
+        // memory dataset on purpose, so an in-process handle is absent exactly
+        // where a squad runs, while the API's internal face is reachable with
+        // no credentials. They stay registered even when the base or the client
+        // is missing, so a squad can tell "this layer is absent" from "this
+        // namespace is empty": registered-but-failing says the first, while a
+        // skipped registration would look like the second.
         //
-        // The handle resolves the backend on first call rather than here: the
-        // memory plugin shares this plugin's init layer, and a layer
-        // initialises concurrently, so reading during init returns a backend
-        // only when agent's init happens to finish second.
-        let memory_backend = cog_core::LateService::new(ctx.clone());
+        // `agent_loop` is a cog-agent-owned config section, read once here for
+        // both this base and the evaluator's budgets below; changing a value
+        // needs no new image.
+        let agent_loop_config = crate::AgentLoopConfig::load()?;
+        let memory_api_base = agent_loop_config.memory_api_base.clone();
+        let memory_raw_client = ctx.consume_service::<dyn cog_core::HttpClient>();
+        let memory_raw_metrics = ctx.consume_service::<dyn cog_core::MetricsBackend>();
         cog_core::ToolRegistry::register(
             &*tool_registry,
-            crate::tools::builtins::raw_list(memory_backend.clone()),
+            crate::tools::builtins::raw_list(memory_raw_client.clone(), memory_api_base.clone()),
         );
         cog_core::ToolRegistry::register(
             &*tool_registry,
-            crate::tools::builtins::raw_fetch(memory_backend),
+            crate::tools::builtins::raw_fetch(
+                memory_raw_client,
+                memory_api_base.clone(),
+                memory_raw_metrics,
+            ),
         );
         info!(
             tools = ?tool_registry.names(),
@@ -217,17 +224,12 @@ impl cog_core::SystemPlugin for AgentPlugin {
         info!("AgentPlugin tool registry published");
 
         // ── Eval AgentRuntime ──
-        // agent_loop 是 cog-agent 自有配置段，这里连同 evaluator 的迭代预算和兜底
-        // 追问的墙钟界一起读一次：两者都走配置面，改值不用重新打镜像（其余字段仍是
-        // 评估器自有默认值，与生成侧不是一个量级，不能直接继承）。
-        let agent_loop_config = crate::AgentLoopConfig::load()?;
         // The loop archives a tool output that will not fit the window by
         // POSTing it to the platform memory API — this process holds no memory
         // dataset (it is switched off where the loops run), so an in-process
         // handle would be absent exactly here. One archive handle serves the
         // eval runtime and the whole worker pool: the reading it carries is
         // keyed by tool, and a second copy would only split the count.
-        let memory_api_base = agent_loop_config.memory_api_base.clone();
         let tool_output_archive: Option<Arc<dyn crate::ToolOutputArchive>> = ctx
             .consume_service::<dyn cog_core::HttpClient>()
             .map(|client| {

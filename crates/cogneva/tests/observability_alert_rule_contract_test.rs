@@ -2132,6 +2132,10 @@ const UNREAD: &[(&str, Unread)] = &[
         "cogneva_tool_output_truncated_total",
         Unread::Gap("tool outputs cut to fit the context window, by tool. Each one had its tail archived, so this is expected traffic rather than a fault, and what would make a run of them a fault -- how much truncation, or which tools -- is a bound nobody declared, because the right amount follows what the tasks read. The fault-worthy half of the pair is the sibling archive-failure counter, which a rule reads; this is what tells a busy truncation path from an idle one"),
     ),
+    (
+        "cogneva_tool_output_fetch_budget_exhausted_total",
+        Unread::Gap("reads of an archived tool output that stopped short of the bytes because the payload outgrew the caller's byte budget, by tool. The budget is the caller's own, so a bounded read is expected traffic like the truncation counter beside it, not a fault: a caller reading back a large archived output sets the budget it can afford and is told when the source is bigger. What would make a run of them a fault is a bound nobody declared, since the right budget follows what the reads ask for, and the repair for one is local to the caller -- raise the budget or fetch the source directly -- rather than a standing condition a rule could hold open"),
+    ),
 ];
 
 /// Entries an `Elsewhere` reader claim cannot be resolved against.
@@ -2243,7 +2247,7 @@ fn unresolved_readers(read: &BTreeSet<String>, name: &str, readers: &[&str]) -> 
 /// silently, and a row leaving the table went silently green as well; now either
 /// direction is something the author has to say out loud, which is the only
 /// reason to count them here at all.
-const GAPS_AT_CENSUS: usize = 17;
+const GAPS_AT_CENSUS: usize = 18;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {

@@ -448,11 +448,39 @@ pub async fn summary_search_handler(
 #[derive(Debug, Deserialize)]
 pub struct ListRawQuery {
     pub prefix: Option<String>,
+    /// An upper bound on how many ids come back. A listing over a busy namespace
+    /// can outgrow a caller's context window, so the cap is applied here rather
+    /// than left to the caller to trim after paying for the whole list.
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ListRawResponse {
-    pub ids: Vec<String>,
+    /// Each source's id and shape, bytes excluded: a caller choosing what to
+    /// read next needs the size and type, and a listing of bare ids would make
+    /// that choice cost one read per candidate.
+    pub items: Vec<cog_core::RawMetadata>,
+    /// The number of sources the store held before `limit` was applied. Equal to
+    /// `items.len()` when nothing was dropped; larger means the caller saw a
+    /// prefix of a bigger list and must not read it as the whole of one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<usize>,
+}
+
+/// Render a raw payload for a JSON body.
+///
+/// Text passes through as UTF-8, anything else as base64, with the encoding
+/// named alongside so the caller never has to guess which form arrived. One
+/// field, not both: the payload can be large, and shipping it twice would double
+/// the cost of every read for a caller that can decode one of them.
+fn encode_raw_payload_inline(payload: &[u8]) -> (&'static str, String) {
+    match std::str::from_utf8(payload) {
+        Ok(text) => ("utf8", text.to_string()),
+        Err(_) => (
+            "base64",
+            base64::engine::general_purpose::STANDARD.encode(payload),
+        ),
+    }
 }
 
 pub async fn unified_search_handler(
@@ -612,8 +640,25 @@ pub async fn list_raw_handler(
     };
 
     let prefix = params.prefix.as_deref();
-    match backend.list_raw(&ns, prefix).await {
-        Ok(ids) => (StatusCode::OK, Json(ListRawResponse { ids })).into_response(),
+    match backend.list_raw_detailed(&ns, prefix).await {
+        Ok(mut items) => {
+            // Report the store's real size before trimming: a caller capped at
+            // `limit` still needs to know the list was longer, or a bounded read
+            // of a bigger namespace reads exactly like a complete one.
+            let total = items.len();
+            let truncated = params.limit.is_some_and(|n| total > n);
+            if truncated {
+                items.truncate(params.limit.unwrap());
+            }
+            (
+                StatusCode::OK,
+                Json(ListRawResponse {
+                    items,
+                    total: truncated.then_some(total),
+                }),
+            )
+                .into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("list failed: {}", e)})),
@@ -641,22 +686,18 @@ pub async fn get_raw_handler(
 
     match backend.get_raw(&ns, &id).await {
         Ok(Some(raw)) => {
-            // The payload is what this route is for. Fetching a raw source
-            // means wanting the bytes it was archived from, and a length
-            // describes them without being them -- a caller that got only the
-            // length had to already know the content to make any use of it.
-            // It travels base64 because the body is a JSON object and the
-            // payload is arbitrary bytes; `payload_length` stays so a caller
-            // can size the transfer without decoding the body, and
-            // `content_type` stays so it can pick a decoder once it has.
-            let encoded = base64::engine::general_purpose::STANDARD.encode(raw.payload.as_slice());
+            // Metadata only. The bytes travel on the content route instead, so a
+            // caller can read `payload_length` and decide whether the payload
+            // fits its budget before pulling it across -- a route that answered
+            // with the bytes would make that decision impossible, because the
+            // transfer is already spent by the time the size is known. The store
+            // keeps the payload either way; this route just declines to move it.
             (
                 StatusCode::OK,
                 Json(json!({
                     "id": raw.id,
                     "content_type": raw.content_type,
                     "payload_length": raw.payload.len(),
-                    "payload_base64": encoded,
                     "created_at": raw.created_at,
                 })),
             )
@@ -670,6 +711,110 @@ pub async fn get_raw_handler(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("retrieve failed: {}", e)})),
+        )
+            .into_response(),
+    }
+}
+
+/// The raw source's bytes, inline in the response body.
+///
+/// The payload crosses as UTF-8 text when it is text and base64 otherwise, with
+/// `encoding` naming which form arrived -- a single field rather than both, so a
+/// large payload is not sent twice for the benefit of a caller that can decode
+/// one of them. `payload_length` is the length of the decoded bytes, which is
+/// what a caller comparing against a budget wants, not the encoded length.
+pub async fn get_raw_content_handler(
+    State(state): State<Arc<GatewayState>>,
+    claims: Option<axum::Extension<cog_core::Claims>>,
+    Path(id): Path<String>,
+) -> Response {
+    let ns = effective_ns(claims_ref(&claims));
+    let backend = match state.memory_backend.as_ref() {
+        Some(b) => b,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "memory backend disabled"})),
+            )
+                .into_response();
+        }
+    };
+
+    match backend.get_raw(&ns, &id).await {
+        Ok(Some(raw)) => {
+            let (encoding, payload) = encode_raw_payload_inline(&raw.payload);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "id": raw.id,
+                    "namespace": raw.namespace,
+                    "content_type": raw.content_type,
+                    "payload_length": raw.payload.len(),
+                    "encoding": encoding,
+                    "payload": payload,
+                    "created_at": raw.created_at,
+                })),
+            )
+                .into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "raw source not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("retrieve failed: {}", e)})),
+        )
+            .into_response(),
+    }
+}
+
+/// A URL the object store serves the raw source's bytes from, for a caller that
+/// can reach the store directly and would rather not pull the payload through
+/// this process.
+///
+/// `503` when the backend keeps no signable store, `500` when signing failed --
+/// the two are separated because "this deployment has no second read path" and
+/// "the store refused to sign" send the reader to different places.
+pub async fn get_raw_url_handler(
+    State(state): State<Arc<GatewayState>>,
+    claims: Option<axum::Extension<cog_core::Claims>>,
+    Path(id): Path<String>,
+) -> Response {
+    let ns = effective_ns(claims_ref(&claims));
+    let backend = match state.memory_backend.as_ref() {
+        Some(b) => b,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "memory backend disabled"})),
+            )
+                .into_response();
+        }
+    };
+
+    // A short window: the URL carries the object store's signature and is meant
+    // to be used at once. A long one would leave a working link to the stored
+    // bytes circulating past the request that asked for it.
+    const EXPIRY_SECS: u64 = 300;
+    match backend.presign_raw(&ns, &id, EXPIRY_SECS).await {
+        Ok(Some(url)) => (
+            StatusCode::OK,
+            Json(json!({ "id": id, "namespace": ns, "url": url, "expires_in": EXPIRY_SECS })),
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "this memory backend keeps no signable object store; \
+                          read the content route instead"
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("presign failed: {}", e)})),
         )
             .into_response(),
     }

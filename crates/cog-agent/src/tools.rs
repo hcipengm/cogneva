@@ -1,20 +1,26 @@
-use base64::Engine as _;
-use cog_core::{CommandEvent, SFResult, SandboxBackend, SandboxPayload, SandboxRequest};
+use cog_core::metric_names::TOOL_OUTPUT_FETCH_BUDGET_EXHAUSTED_TOTAL;
+use cog_core::{
+    CommandEvent, HttpClient, HttpRequest, MetricsBackend, SFError, SFResult, SandboxBackend,
+    SandboxPayload, SandboxRequest, DEFAULT_MEMORY_NAMESPACE, MEMORY_API_BASE_ENV,
+    MEMORY_RAW_CONTENT_PATH, MEMORY_RAW_ITEM_PATH, MEMORY_RAW_PATH,
+};
 use cog_core::{Tool, ToolImplementation};
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// The memory backend as the raw-source tools see it: a handle that resolves
-/// the backend on first call instead of during plugin `init`.
-///
-/// The tools cannot consume the backend while the plugin is initialising: the
-/// memory and agent plugins share an init layer, and a layer initialises
-/// concurrently, so that read would return the backend only when agent's init
-/// happens to finish second. Resolving on first call moves the read past every
-/// plugin's `init`, where the registry has stopped changing.
-pub type LateMemoryBackend = cog_core::LateService<dyn cog_core::MemoryBackend>;
+/// How long one memory-read call may take before it is abandoned. The call sits
+/// on an agent turn, so its budget is a share of a turn rather than a background
+/// job's: long enough for a healthy API to return a bounded payload, short
+/// enough that an API which stopped answering delays the turn instead of
+/// wedging it.
+const MEMORY_READ_TIMEOUT_SECS: u64 = 30;
+
+/// The payload size a read moves without being told otherwise. A quarter
+/// megabyte is what a tool result that already fit an agent's context roughly
+/// holds; a caller that wants a larger source names its own budget.
+const DEFAULT_RAW_FETCH_BUDGET_BYTES: u64 = 262_144;
 
 /// Real execution identity of one agent run. Carried explicitly from the
 /// actor (which knows the DAG task) through the runtime into sandbox requests,
@@ -396,6 +402,7 @@ impl Default for ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
 
     #[derive(Debug)]
     struct StubHttp;
@@ -444,149 +451,182 @@ mod tests {
         }
     }
 
-    /// Minimal raw store: enough of [`cog_core::MemoryBackend`] for the two
-    /// tools. Everything they do not call is `unimplemented!()`.
-    struct StubMemory {
+    /// Stands in for the platform memory API's raw routes: the listing, the
+    /// metadata read, and the content read, answered off the path the tool
+    /// asked for. The content read encodes the payload the same way the API
+    /// does, so the tool's pass-through is exercised end to end.
+    #[derive(Debug)]
+    struct MemoryApiStub {
         raws: Vec<cog_core::RawSource>,
     }
 
     #[async_trait::async_trait]
-    impl cog_core::MemoryBackend for StubMemory {
-        async fn archive_raw(&self, _s: &cog_core::RawSource) -> SFResult<String> {
-            unimplemented!()
-        }
-        async fn get_raw(&self, ns: &str, id: &str) -> SFResult<Option<cog_core::RawSource>> {
-            Ok(self
-                .raws
-                .iter()
-                .find(|r| r.namespace == ns && r.id == id)
-                .cloned())
-        }
-        async fn list_raw(&self, ns: &str, prefix: Option<&str>) -> SFResult<Vec<String>> {
-            Ok(self
-                .raws
-                .iter()
-                .filter(|r| {
-                    r.namespace == ns && prefix.is_none_or(|p| r.content_type.starts_with(p))
+    impl cog_core::HttpClient for MemoryApiStub {
+        async fn execute(&self, req: cog_core::HttpRequest) -> SFResult<cog_core::HttpResponse> {
+            let not_found = || cog_core::HttpResponse {
+                status: 404,
+                headers: Default::default(),
+                body: b"{\"error\":\"not found\"}".to_vec(),
+            };
+            // Keep only the API-relative path, dropping any scheme/host and query.
+            let path = req
+                .url
+                .split_once("/api/v1/memory")
+                .map(|(_, rest)| format!("/api/v1/memory{rest}"))
+                .unwrap_or_default();
+            let path_only = path.split_once('?').map(|(p, _)| p).unwrap_or(&path);
+            let find = |id: &str| self.raws.iter().find(|r| r.id == id);
+
+            let body = if path_only == "/api/v1/memory/raw" {
+                let items: Vec<serde_json::Value> = self
+                    .raws
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "id": r.id,
+                            "content_type": r.content_type,
+                            "payload_length": r.payload.len(),
+                            "created_at": r.created_at,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({ "items": items })
+            } else if let Some(id) = path_only
+                .strip_prefix("/api/v1/memory/raw/")
+                .and_then(|rest| rest.strip_suffix("/content"))
+            {
+                let Some(r) = find(id) else {
+                    return Ok(not_found());
+                };
+                let (encoding, payload) = match std::str::from_utf8(&r.payload) {
+                    Ok(text) => ("utf8", text.to_string()),
+                    Err(_) => (
+                        "base64",
+                        base64::engine::general_purpose::STANDARD.encode(&r.payload),
+                    ),
+                };
+                serde_json::json!({
+                    "id": r.id,
+                    "namespace": r.namespace,
+                    "content_type": r.content_type,
+                    "payload_length": r.payload.len(),
+                    "encoding": encoding,
+                    "payload": payload,
+                    "created_at": r.created_at,
                 })
-                .map(|r| r.id.clone())
-                .collect())
+            } else if let Some(id) = path_only.strip_prefix("/api/v1/memory/raw/") {
+                let Some(r) = find(id) else {
+                    return Ok(not_found());
+                };
+                serde_json::json!({
+                    "id": r.id,
+                    "content_type": r.content_type,
+                    "payload_length": r.payload.len(),
+                    "created_at": r.created_at,
+                })
+            } else {
+                return Ok(not_found());
+            };
+            Ok(cog_core::HttpResponse {
+                status: 200,
+                headers: Default::default(),
+                body: serde_json::to_vec(&body).unwrap(),
+            })
         }
-        async fn delete_raw(&self, _n: &str, _i: &str) -> SFResult<()> {
-            unimplemented!()
-        }
-        async fn store_schema(&self, _n: &str, _e: &cog_core::SchemaEntry) -> SFResult<()> {
-            unimplemented!()
-        }
-        async fn get_schema(&self, _n: &str, _i: &str) -> SFResult<Option<cog_core::SchemaEntry>> {
-            unimplemented!()
-        }
-        async fn search_schema(
+    }
+
+    #[derive(Debug, Default)]
+    struct Counters(std::sync::Mutex<Vec<(cog_core::MetricName, HashMap<String, String>)>>);
+
+    #[async_trait::async_trait]
+    impl cog_core::MetricsBackend for Counters {
+        async fn record_gauge(
             &self,
-            _n: &str,
-            _q: &str,
-            _l: usize,
-        ) -> SFResult<Vec<cog_core::SchemaSearchResult>> {
-            unimplemented!()
+            _name: cog_core::MetricName,
+            _value: f64,
+            _labels: HashMap<String, String>,
+        ) -> SFResult<()> {
+            Ok(())
         }
-        async fn schema_for_raw(&self, _n: &str, _r: &str) -> SFResult<Vec<cog_core::SchemaEntry>> {
-            unimplemented!()
-        }
-        async fn list_schema(&self, _n: &str) -> SFResult<Vec<cog_core::SchemaEntry>> {
-            unimplemented!()
-        }
-        async fn delete_schema(&self, _n: &str, _i: &str) -> SFResult<()> {
-            unimplemented!()
-        }
-        async fn query_relations(
+        async fn record_counter(
             &self,
-            _n: &str,
-            _e: &str,
-            _d: cog_core::RelationDirection,
-            _t: Option<&str>,
-        ) -> SFResult<Vec<cog_core::SchemaEntry>> {
-            unimplemented!()
+            name: cog_core::MetricName,
+            _value: f64,
+            labels: HashMap<String, String>,
+        ) -> SFResult<()> {
+            self.0.lock().unwrap().push((name, labels));
+            Ok(())
         }
-        async fn update_schema(&self, _n: &str, _e: &cog_core::SchemaEntry) -> SFResult<()> {
-            unimplemented!()
-        }
-        async fn store_summary(&self, _n: &str, _e: &cog_core::SummaryEntry) -> SFResult<()> {
-            unimplemented!()
-        }
-        async fn get_summary(
+        async fn record_histogram(
             &self,
-            _n: &str,
-            _i: &str,
-        ) -> SFResult<Option<cog_core::SummaryEntry>> {
-            unimplemented!()
+            _name: cog_core::MetricName,
+            _value: f64,
+            _labels: HashMap<String, String>,
+        ) -> SFResult<()> {
+            Ok(())
         }
-        async fn search_summary(
+        async fn query_gauge_range(
             &self,
-            _n: &str,
-            _q: &[f32],
-            _k: usize,
-            _t: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
-        ) -> SFResult<Vec<cog_core::SummarySearchResult>> {
-            unimplemented!()
+            _name: &str,
+            _start: chrono::DateTime<chrono::Utc>,
+            _end: chrono::DateTime<chrono::Utc>,
+        ) -> SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
         }
-        async fn summary_for_raw(
+        async fn query_gauge_latest(&self, _name: &str) -> SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+        async fn query_counter_range(
             &self,
-            _n: &str,
-            _r: &str,
-        ) -> SFResult<Vec<cog_core::SummaryEntry>> {
-            unimplemented!()
+            _name: &str,
+            _start: chrono::DateTime<chrono::Utc>,
+            _end: chrono::DateTime<chrono::Utc>,
+        ) -> SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
         }
-        async fn list_summary(&self, _n: &str) -> SFResult<Vec<cog_core::SummaryEntry>> {
-            unimplemented!()
+        async fn query_counter_totals(&self, _name: &str) -> SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
         }
-        async fn delete_summary(&self, _n: &str, _i: &str) -> SFResult<()> {
-            unimplemented!()
+        async fn query_histogram_totals(
+            &self,
+            _name: &str,
+        ) -> SFResult<Vec<cog_core::HistogramTotals>> {
+            Ok(Vec::new())
         }
-        async fn update_summary(&self, _n: &str, _e: &cog_core::SummaryEntry) -> SFResult<()> {
-            unimplemented!()
+        async fn query_histogram_range(
+            &self,
+            _name: &str,
+            _start: chrono::DateTime<chrono::Utc>,
+            _end: chrono::DateTime<chrono::Utc>,
+        ) -> SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
         }
-        fn metrics(&self) -> cog_core::MemoryMetrics {
-            cog_core::MemoryMetrics::default()
+        async fn list_metric_names(
+            &self,
+            _metric_type: cog_core::MetricType,
+        ) -> SFResult<Vec<String>> {
+            Ok(Vec::new())
         }
         async fn health_check(&self) -> SFResult<()> {
             Ok(())
         }
-        async fn search_all(
-            &self,
-            _n: &str,
-            _q: &str,
-            _e: Option<&[f32]>,
-            _k: usize,
-            _t: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
-        ) -> SFResult<Vec<cog_core::UnifiedSearchResult>> {
-            unimplemented!()
-        }
-        async fn ingest_explicit(
-            &self,
-            _n: &str,
-            _t: &str,
-            _i: f32,
-            _g: Vec<String>,
-        ) -> SFResult<()> {
-            unimplemented!()
-        }
-        async fn forget(&self, _n: &str, _i: &str) -> SFResult<()> {
-            unimplemented!()
-        }
-        async fn decay(&self, _n: &str, _a: u64, _i: f32) -> SFResult<cog_core::DecayReport> {
-            unimplemented!()
-        }
     }
 
-    fn memory_registry(backend: Option<Arc<dyn cog_core::MemoryBackend>>) -> ToolRegistry {
-        let ctx = cog_core::PluginContext::new(cog_core::Config::default());
-        if let Some(backend) = backend {
-            ctx.publish_service(backend);
-        }
-        let backend: LateMemoryBackend = cog_core::LateService::new(ctx.as_owner("test"));
+    fn memory_registry(
+        base: Option<&str>,
+        raws: Vec<cog_core::RawSource>,
+        metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
+    ) -> ToolRegistry {
+        let client: Arc<dyn cog_core::HttpClient> = Arc::new(MemoryApiStub { raws });
         let registry = ToolRegistry::new();
-        cog_core::ToolRegistry::register(&registry, builtins::raw_list(backend.clone()));
-        cog_core::ToolRegistry::register(&registry, builtins::raw_fetch(backend));
+        cog_core::ToolRegistry::register(
+            &registry,
+            builtins::raw_list(Some(client.clone()), base.map(str::to_string)),
+        );
+        cog_core::ToolRegistry::register(
+            &registry,
+            builtins::raw_fetch(Some(client), base.map(str::to_string), metrics),
+        );
         registry
     }
 
@@ -594,8 +634,9 @@ mod tests {
     /// an id gets the archived bytes back.
     #[tokio::test]
     async fn raw_fetch_returns_the_archived_bytes() {
-        let stub = Arc::new(StubMemory {
-            raws: vec![
+        let registry = memory_registry(
+            Some("http://mem"),
+            vec![
                 raw_source("notes", "default", "text/plain", b"hello raw"),
                 raw_source(
                     "blob",
@@ -604,8 +645,8 @@ mod tests {
                     &[0xff, 0x00, 0xfe],
                 ),
             ],
-        });
-        let registry = memory_registry(Some(stub));
+            None,
+        );
 
         let listed = registry
             .execute("raw_list", serde_json::json!({}))
@@ -613,6 +654,11 @@ mod tests {
             .unwrap();
         assert_eq!(listed["namespace"], cog_core::DEFAULT_MEMORY_NAMESPACE);
         assert_eq!(listed["count"], 2);
+        // The listing carries each source's shape, so a caller can pick what to
+        // read without first paying for a read per candidate.
+        assert_eq!(listed["items"][0]["id"], "notes");
+        assert_eq!(listed["items"][0]["content_type"], "text/plain");
+        assert_eq!(listed["items"][0]["payload_length"], 9);
 
         let fetched = registry
             .execute("raw_fetch", serde_json::json!({"id": "notes"}))
@@ -634,36 +680,36 @@ mod tests {
         assert_eq!(blob["payload_length"], 3);
     }
 
-    /// An absent memory layer must fail the call, not return an empty listing.
-    /// "No layer here" and "this namespace holds nothing" are different facts,
-    /// and a caller that cannot tell them apart reads the first as the second.
+    /// An unconfigured memory API must fail the call, not return an empty
+    /// listing. "Nowhere to ask" and "this namespace holds nothing" are
+    /// different facts, and a caller that cannot tell them apart reads the first
+    /// as the second.
     #[tokio::test]
-    async fn raw_tools_report_an_absent_layer_instead_of_an_empty_one() {
-        let registry = memory_registry(None);
+    async fn raw_tools_report_an_unconfigured_api_instead_of_an_empty_one() {
+        let registry = memory_registry(None, Vec::new(), None);
         let list_err = registry
             .execute("raw_list", serde_json::json!({}))
             .await
-            .expect_err("an absent backend must not answer with an empty listing");
+            .expect_err("an unconfigured API must not answer with an empty listing");
         let fetch_err = registry
             .execute("raw_fetch", serde_json::json!({"id": "x"}))
             .await
-            .expect_err("an absent backend must not answer with a not-found");
+            .expect_err("an unconfigured API must not answer with a not-found");
         for err in [list_err, fetch_err] {
             let text = err.to_string();
             assert!(
-                text.contains("memory backend is not available"),
-                "the error must name the absent layer, got: {text}"
+                text.contains(MEMORY_API_BASE_ENV),
+                "the error must name the unset base, got: {text}"
             );
         }
     }
 
-    /// The id is checked before the store sees it: an id carrying a separator
-    /// becomes a subtree there and the object quietly stops being listed, so
-    /// the caller is told at the call that caused it.
+    /// The id is checked before it reaches the URL: an id carrying a separator
+    /// becomes a subtree at the store and the object quietly stops being listed,
+    /// so the caller is told at the call that caused it.
     #[tokio::test]
     async fn raw_fetch_rejects_an_id_that_cannot_be_a_key() {
-        let stub = Arc::new(StubMemory { raws: Vec::new() });
-        let registry = memory_registry(Some(stub));
+        let registry = memory_registry(Some("http://mem"), Vec::new(), None);
         let err = registry
             .execute("raw_fetch", serde_json::json!({"id": "a/b"}))
             .await
@@ -671,17 +717,58 @@ mod tests {
         assert!(err.to_string().contains("not addressable"), "got: {err}");
     }
 
-    #[test]
-    fn payload_encoding_names_which_form_it_returns() {
-        assert_eq!(
-            builtins::encode_raw_payload(b"plain"),
-            ("utf8", "plain".into())
+    /// A payload over budget is an explicit outcome, not a silent truncation
+    /// and not an error: the caller set the budget, so it is told the source is
+    /// larger and no bytes are moved -- and the event is counted, so a bounded
+    /// read is visible outside the tool result.
+    #[tokio::test]
+    async fn raw_fetch_reports_budget_exhaustion_rather_than_truncating() {
+        let counters = Arc::new(Counters::default());
+        let registry = memory_registry(
+            Some("http://mem"),
+            vec![raw_source("big", "default", "text/plain", b"0123456789")],
+            Some(counters.clone()),
         );
-        assert_eq!(
-            builtins::encode_raw_payload(&[0xff, 0xfe]),
-            ("base64", "//4=".into())
+
+        let out = registry
+            .execute("raw_fetch", serde_json::json!({"id": "big", "budget": 4}))
+            .await
+            .unwrap();
+        assert_eq!(out["budget_exhausted"], true);
+        assert_eq!(out["payload_length"], 10);
+        assert_eq!(out["budget"], 4);
+        assert!(
+            out.get("payload").is_none(),
+            "a bounded read must not hand back bytes it did not move: {out}"
         );
-        assert_eq!(builtins::encode_raw_payload(b""), ("utf8", String::new()));
+
+        let recorded = counters.0.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, TOOL_OUTPUT_FETCH_BUDGET_EXHAUSTED_TOTAL);
+        assert_eq!(
+            recorded[0].1.get("tool").map(String::as_str),
+            Some("raw_fetch")
+        );
+    }
+
+    /// A budget large enough for the payload moves the bytes: the bound is a
+    /// ceiling, not a filter that drops everything.
+    #[tokio::test]
+    async fn raw_fetch_moves_the_bytes_when_the_budget_allows() {
+        let registry = memory_registry(
+            Some("http://mem"),
+            vec![raw_source("small", "default", "text/plain", b"hello")],
+            None,
+        );
+        let out = registry
+            .execute(
+                "raw_fetch",
+                serde_json::json!({"id": "small", "budget": 16}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["payload"], "hello");
+        assert!(out.get("budget_exhausted").is_none());
     }
 
     #[tokio::test]
@@ -1162,150 +1249,240 @@ pub mod builtins {
         }
     }
 
-    /// Namespace a memory read lands in when the call carries none.
-    fn ns_arg(args: &serde_json::Value) -> String {
-        args["namespace"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(cog_core::DEFAULT_MEMORY_NAMESPACE)
-            .to_string()
-    }
-
-    /// Render a raw payload for a JSON tool result.
-    ///
-    /// Returns the encoding name alongside the string so the caller never has
-    /// to guess which one it got: text is passed through, anything else is
-    /// base64 so no byte is lost. A single field rather than both forms -- the
-    /// payload can be large, and shipping it twice would double the cost of
-    /// every read for the benefit of a caller that can decode one of them.
-    pub fn encode_raw_payload(payload: &[u8]) -> (&'static str, String) {
-        match std::str::from_utf8(payload) {
-            Ok(text) => ("utf8", text.to_string()),
-            Err(_) => (
-                "base64",
-                base64::engine::general_purpose::STANDARD.encode(payload),
-            ),
+    /// Percent-encode one path or query segment so an id or prefix reaches the
+    /// API byte-for-byte as the caller wrote it. The unreserved set passes
+    /// through; anything that could end the segment or start a new query
+    /// parameter is escaped, which is enough for both a path segment and a
+    /// query value.
+    fn encode_url_component(value: &str) -> String {
+        let mut out = String::with_capacity(value.len());
+        for b in value.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    out.push(b as char)
+                }
+                _ => out.push_str(&format!("%{b:02X}")),
+            }
         }
+        out
     }
 
-    /// List the ids of archived raw sources.
+    /// The platform memory API base URL, or an error naming what is missing.
     ///
-    /// This reads the in-process memory backend instead of calling the
-    /// gateway's raw route. That route is behind an operator token and pods
-    /// hold no credentials, so a tool that had to authenticate would be a tool
-    /// no squad could ever call; the backend is the same store the route serves
-    /// from, so this reaches the same entries without crossing a credential
-    /// boundary. When nothing published a backend -- the memory layer is off in
-    /// this process -- the call fails loudly rather than returning an empty
-    /// list: an empty list is what "this namespace holds nothing" looks like,
-    /// and a caller that cannot tell an absent layer from an empty one
-    /// concludes the memory is empty rather than that it was never there.
-    pub fn raw_list(backend: super::LateMemoryBackend) -> Tool {
+    /// The tools read over HTTP rather than resolving the backend in-process:
+    /// the process that runs the loops holds no memory dataset on purpose, so an
+    /// in-process handle is absent exactly where a squad runs, while the API's
+    /// internal face is reachable with no credentials. An unconfigured base is a
+    /// loud error: "nowhere to ask" and "this source does not exist" are
+    /// different facts, and a caller that folds them reads an unwired layer as
+    /// an empty one.
+    fn memory_base(base: Option<&str>) -> SFResult<String> {
+        base.filter(|b| !b.trim().is_empty())
+            .map(|b| b.trim_end_matches('/').to_string())
+            .ok_or_else(|| {
+                SFError::Config(format!(
+                    "{MEMORY_API_BASE_ENV} is not set: there is no memory API to read from"
+                ))
+            })
+    }
+
+    /// The HTTP client the tools read through, or an error naming what is
+    /// missing. The tools are registered whether or not this process holds one:
+    /// a tool that resolves to a configuration error tells a squad "no layer
+    /// here", while a tool that was never registered at all would look like
+    /// "this namespace is empty".
+    fn memory_client(client: Option<Arc<dyn HttpClient>>) -> SFResult<Arc<dyn HttpClient>> {
+        client.ok_or_else(|| {
+            SFError::Config("no HTTP client is available to reach the memory API".into())
+        })
+    }
+
+    /// GET `url` and decode the JSON body. A non-success status is an error
+    /// carrying the status and the API's own body, so a caller sees the refusal
+    /// rather than an empty object.
+    async fn get_json(client: &Arc<dyn HttpClient>, url: &str) -> SFResult<serde_json::Value> {
+        let mut req = HttpRequest::new("GET", url);
+        req.timeout_secs = Some(MEMORY_READ_TIMEOUT_SECS);
+        let resp = client.execute(req).await?;
+        if !resp.is_success() {
+            return Err(SFError::Agent(format!(
+                "memory API answered {} for {url}: {}",
+                resp.status,
+                String::from_utf8_lossy(&resp.body)
+            )));
+        }
+        serde_json::from_slice(&resp.body)
+            .map_err(|e| SFError::Agent(format!("memory API returned unreadable JSON: {e}")))
+    }
+
+    /// List archived raw sources with the metadata a caller needs to choose
+    /// which to read.
+    ///
+    /// Reads over HTTP from the platform memory API. The in-process backend this
+    /// used before is switched off in exactly the process that runs squads, so
+    /// it was absent where the tool was needed; the API's internal face carries
+    /// no token and is reachable by a credential-free pod. An unconfigured base
+    /// fails loudly rather than returning an empty list, so a deployment with no
+    /// memory API to ask is not read as a namespace that holds nothing.
+    pub fn raw_list(client: Option<Arc<dyn HttpClient>>, base: Option<String>) -> Tool {
         Tool {
             name: "raw_list".into(),
-            description: "List the ids of archived raw sources in a memory namespace, \
-                          optionally filtered by content-type prefix. Returns ids only; \
-                          call raw_fetch for the bytes. Fails with an error when this \
-                          process has no memory backend."
+            description: "List archived raw sources in the shared memory namespace, \
+                          optionally filtered by content-type prefix. Each item carries its \
+                          content type, payload length and creation time so a caller can \
+                          choose what to read within its budget; call raw_fetch for the \
+                          bytes. Fails with an error when no memory API base is configured."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "namespace": {
-                        "type": "string",
-                        "description": "Memory namespace (default: the shared default namespace)"
-                    },
                     "content_type_prefix": {
                         "type": "string",
                         "description": "Only ids whose content type starts with this"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Cap on how many ids to return"
                     }
                 }
             }),
             implementation: ToolImplementation::Native(Arc::new(move |args| {
-                let backend = backend.clone();
+                let client = client.clone();
+                let base = base.clone();
                 Box::pin(async move {
-                    let backend = backend.get().ok_or_else(|| {
-                        cog_core::SFError::Config(
-                            "memory backend is not available in this process: the memory \
-                             layer is disabled here, so raw sources cannot be listed"
-                                .into(),
-                        )
-                    })?;
-                    let ns = ns_arg(&args);
-                    let prefix = args["content_type_prefix"].as_str();
-                    let ids = backend.list_raw(&ns, prefix).await?;
-                    Ok(serde_json::json!({
-                        "namespace": ns,
-                        "count": ids.len(),
-                        "ids": ids,
-                    }))
+                    let base = memory_base(base.as_deref())?;
+                    let client = memory_client(client)?;
+                    let mut url = format!("{base}{MEMORY_RAW_PATH}");
+                    let mut query: Vec<String> = Vec::new();
+                    if let Some(prefix) = args["content_type_prefix"].as_str() {
+                        query.push(format!("prefix={}", encode_url_component(prefix)));
+                    }
+                    if let Some(limit) = args["limit"].as_u64() {
+                        query.push(format!("limit={limit}"));
+                    }
+                    if !query.is_empty() {
+                        url.push('?');
+                        url.push_str(&query.join("&"));
+                    }
+                    let body = get_json(&client, &url).await?;
+                    let items = body["items"].as_array().cloned().unwrap_or_default();
+                    let mut out = serde_json::json!({
+                        "namespace": DEFAULT_MEMORY_NAMESPACE,
+                        "count": items.len(),
+                        "items": items,
+                    });
+                    // The store's full size, when the API trimmed the listing to
+                    // `limit`: without it a capped read is indistinguishable
+                    // from a complete one.
+                    if let Some(total) = body["total"].as_u64() {
+                        out["total"] = serde_json::json!(total);
+                    }
+                    Ok(out)
                 })
             })),
         }
     }
 
-    /// Fetch one archived raw source, bytes included.
+    /// Fetch one archived raw source, bytes included, bounded by a byte budget.
     ///
-    /// The id is checked against the contract's key rules before the store is
-    /// asked: an id carrying a separator does not fail at the store, it becomes
-    /// a subtree and the object disappears from every listing that would have
+    /// Two calls: the metadata route first for `payload_length`, then the
+    /// content route only when the payload fits the budget. The order is the
+    /// point -- a route that returned the bytes first would make the budget
+    /// meaningless, because the transfer is spent by the time the size is known.
+    /// A payload over budget is not an unexpected error: it is the budget
+    /// working, so it comes back as an explicit outcome with its own reading,
+    /// not as a silent truncation -- which a caller could not tell from a
+    /// complete read.
+    ///
+    /// The id is checked against the contract's key rules before it reaches the
+    /// URL: an id carrying a separator does not fail at the store, it becomes a
+    /// subtree and the object disappears from every listing that would have
     /// counted it. Reporting that here turns a silently missing key into an
     /// error at the call that caused it.
-    pub fn raw_fetch(backend: super::LateMemoryBackend) -> Tool {
+    pub fn raw_fetch(
+        client: Option<Arc<dyn HttpClient>>,
+        base: Option<String>,
+        metrics: Option<Arc<dyn MetricsBackend>>,
+    ) -> Tool {
         Tool {
             name: "raw_fetch".into(),
-            description: "Fetch one archived raw source by id, returning its bytes. The \
-                          payload is UTF-8 text when the source is text and base64 \
-                          otherwise; `encoding` says which. Fails with an error when this \
-                          process has no memory backend."
+            description: "Fetch one archived raw source by id, returning its bytes when \
+                          they fit the byte budget. The payload is UTF-8 text when the \
+                          source is text and base64 otherwise; `encoding` says which. Over \
+                          budget, the result carries `budget_exhausted` and no bytes. Fails \
+                          with an error when no memory API base is configured."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "id": { "type": "string", "description": "Raw source id" },
-                    "namespace": {
-                        "type": "string",
-                        "description": "Memory namespace (default: the shared default namespace)"
+                    "budget": {
+                        "type": "integer",
+                        "description": "Maximum payload bytes to move (default 262144)"
                     }
                 },
                 "required": ["id"]
             }),
             implementation: ToolImplementation::Native(Arc::new(move |args| {
-                let backend = backend.clone();
+                let client = client.clone();
+                let base = base.clone();
+                let metrics = metrics.clone();
                 Box::pin(async move {
                     let id = args["id"]
                         .as_str()
-                        .ok_or_else(|| cog_core::SFError::Validation("id required".into()))?;
+                        .ok_or_else(|| SFError::Validation("id required".into()))?;
                     if let Some(why) = cog_core::raw_id_key_error(id) {
-                        return Err(cog_core::SFError::Validation(format!(
+                        return Err(SFError::Validation(format!(
                             "raw id {:?} is not addressable: {}",
                             id, why
                         )));
                     }
-                    let backend = backend.get().ok_or_else(|| {
-                        cog_core::SFError::Config(
-                            "memory backend is not available in this process: the memory \
-                             layer is disabled here, so raw sources cannot be read"
-                                .into(),
-                        )
-                    })?;
-                    let ns = ns_arg(&args);
-                    let raw = backend.get_raw(&ns, id).await?.ok_or_else(|| {
-                        cog_core::SFError::Validation(format!(
-                            "raw source {:?} not found in namespace {:?}",
-                            id, ns
-                        ))
-                    })?;
-                    let (encoding, payload) = encode_raw_payload(&raw.payload);
-                    Ok(serde_json::json!({
-                        "id": raw.id,
-                        "namespace": raw.namespace,
-                        "content_type": raw.content_type,
-                        "payload_length": raw.payload.len(),
-                        "encoding": encoding,
-                        "payload": payload,
-                        "created_at": raw.created_at,
-                    }))
+                    let base = memory_base(base.as_deref())?;
+                    let client = memory_client(client)?;
+                    let segment = encode_url_component(id);
+                    let budget = args["budget"]
+                        .as_u64()
+                        .unwrap_or(DEFAULT_RAW_FETCH_BUDGET_BYTES);
+
+                    let item_url =
+                        format!("{base}{}", MEMORY_RAW_ITEM_PATH.replace("{id}", &segment));
+                    let meta = get_json(&client, &item_url).await?;
+                    let payload_length = meta["payload_length"].as_u64().unwrap_or(0);
+                    if payload_length > budget {
+                        // The budget did its job: hand back an outcome a caller
+                        // cannot mistake for the bytes, and count it so the
+                        // bounded read is visible outside the tool result.
+                        if let Some(metrics) = metrics.as_ref() {
+                            let mut labels = HashMap::new();
+                            labels.insert("tool".to_string(), "raw_fetch".to_string());
+                            if let Err(e) = metrics
+                                .record_counter(
+                                    TOOL_OUTPUT_FETCH_BUDGET_EXHAUSTED_TOTAL,
+                                    1.0,
+                                    labels,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    error = %e,
+                                    "raw_fetch: could not record budget-exhausted outcome"
+                                );
+                            }
+                        }
+                        return Ok(serde_json::json!({
+                            "id": id,
+                            "content_type": meta["content_type"],
+                            "payload_length": payload_length,
+                            "budget": budget,
+                            "budget_exhausted": true,
+                        }));
+                    }
+
+                    let content_url = format!(
+                        "{base}{}",
+                        MEMORY_RAW_CONTENT_PATH.replace("{id}", &segment)
+                    );
+                    get_json(&client, &content_url).await
                 })
             })),
         }

@@ -591,6 +591,19 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          where a share of the two moving together names the archive endpoint \
          rather than ordinary truncation.",
     ),
+    (
+        crate::metric_names::TOOL_OUTPUT_FETCH_BUDGET_EXHAUSTED_TOTAL.as_str(),
+        "Reads of an archived tool output that found the source but stopped \
+         short of its bytes because the payload outgrew the byte budget the \
+         caller set, labelled by `tool`, one increment per bounded read. A \
+         bounded read is not a failure -- the budget is the caller's, and \
+         raising it or fetching the source directly both answer it -- so this is \
+         counted rather than alerted. It exists because the alternative is \
+         silence: a read that returned no bytes for being too large and a read \
+         of a source that is not there would otherwise be the same answer at \
+         every caller. Read per `tool`: a series climbing for one tool names \
+         that tool's payload shape, not the budget as a whole.",
+    ),
 ];
 
 /// Descriptions for the histogram series. See [`COUNTER_HELP`].

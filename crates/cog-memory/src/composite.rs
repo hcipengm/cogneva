@@ -240,6 +240,21 @@ impl MemoryBackend for CompositeMemoryBackend {
         self.raw.delete(&key).await
     }
 
+    async fn presign_raw(
+        &self,
+        namespace: &str,
+        id: &str,
+        expiry_secs: u64,
+    ) -> SFResult<Option<String>> {
+        // The URL is signed against the same key `archive_raw` wrote, so it
+        // resolves to the stored envelope the inline reader decodes -- one
+        // stored object, two ways to reach it. The key stays private to this
+        // layer: a caller naming the object by key would be re-deriving a
+        // layout it does not own.
+        let key = Self::raw_key(namespace, id);
+        self.raw.presign_url(&key, expiry_secs).await.map(Some)
+    }
+
     async fn store_schema(&self, namespace: &str, entry: &SchemaEntry) -> SFResult<()> {
         self.schema.store_schema(namespace, entry).await?;
         let mut metrics = self

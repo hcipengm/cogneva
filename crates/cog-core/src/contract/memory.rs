@@ -173,8 +173,20 @@ pub const MEMORY_INGEST_PATH: &str = "/api/v1/memory/ingest";
 /// The path that lists the ids of archived raw sources, relative to the base.
 pub const MEMORY_RAW_PATH: &str = "/api/v1/memory/raw";
 
-/// The path one archived raw source's bytes are read from; `{id}` is appended.
+/// The path one archived raw source's metadata is read from; `{id}` is appended.
 pub const MEMORY_RAW_ITEM_PATH: &str = "/api/v1/memory/raw/{id}";
+
+/// The path one archived raw source's bytes are read from, inline in the
+/// response body; `{id}` is appended. Separate from [`MEMORY_RAW_ITEM_PATH`] so
+/// the metadata read stays cheap: a caller can size a transfer and decide
+/// whether it fits its budget before pulling the payload across.
+pub const MEMORY_RAW_CONTENT_PATH: &str = "/api/v1/memory/raw/{id}/content";
+
+/// The path a directly-servable URL for one archived raw source is obtained
+/// from; `{id}` is appended. The URL points at the object store, so the bytes
+/// do not travel through this process -- the caller fetches them itself, which
+/// is why the route is only useful to a caller that can reach the store.
+pub const MEMORY_RAW_URL_PATH: &str = "/api/v1/memory/raw/{id}/url";
 
 /// Layer 0 — Raw Sources.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -186,6 +198,20 @@ pub struct RawSource {
     pub tags: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub archived_at: DateTime<Utc>,
+}
+
+/// One raw source's identity and shape, without its bytes.
+///
+/// A listing that carried only ids would force a caller to fetch each source to
+/// learn its size, which is exactly the transfer a byte budget exists to avoid:
+/// the decision "is this one small enough to read" cannot be made from an id
+/// alone.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RawMetadata {
+    pub id: String,
+    pub content_type: String,
+    pub payload_length: usize,
+    pub created_at: DateTime<Utc>,
 }
 
 /// Why `id` cannot be used as a raw key, or `None` when it can.
@@ -666,7 +692,53 @@ pub trait MemoryBackend: Send + Sync {
         namespace: &str,
         content_type_prefix: Option<&str>,
     ) -> SFResult<Vec<String>>;
+
+    /// List raw sources with the metadata a caller needs to choose which to
+    /// read, without moving any payload across the boundary.
+    ///
+    /// The default walks the ids [`list_raw`](Self::list_raw) returns and reads
+    /// each stored envelope, which is `N+1` backend calls; a caller that lists
+    /// often and reads rarely should keep using `list_raw` when ids are enough.
+    async fn list_raw_detailed(
+        &self,
+        namespace: &str,
+        content_type_prefix: Option<&str>,
+    ) -> SFResult<Vec<RawMetadata>> {
+        let ids = self.list_raw(namespace, content_type_prefix).await?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(raw) = self.get_raw(namespace, &id).await? {
+                out.push(RawMetadata {
+                    id: raw.id,
+                    content_type: raw.content_type,
+                    payload_length: raw.payload.len(),
+                    created_at: raw.created_at,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     async fn delete_raw(&self, namespace: &str, id: &str) -> SFResult<()>;
+
+    /// A URL the object store can serve this raw source's stored bytes from
+    /// directly, when a backend keeps raw sources in a store that can sign one.
+    ///
+    /// `Ok(None)` is not a failure: a backend with no such store simply has no
+    /// second read path, and the inline reader is the only one. A caller that
+    /// folded the two together would report "no direct link" the same way it
+    /// reports "the store is down", which are different facts for the reader.
+    ///
+    /// `expiry_secs` bounds how long the URL stays valid; it travels to the
+    /// store as the signature's window.
+    async fn presign_raw(
+        &self,
+        _namespace: &str,
+        _id: &str,
+        _expiry_secs: u64,
+    ) -> SFResult<Option<String>> {
+        Ok(None)
+    }
 
     // ── Layer 1: Schema ─────────────────────────────────────────────────
     async fn store_schema(&self, namespace: &str, entry: &SchemaEntry) -> SFResult<()>;
