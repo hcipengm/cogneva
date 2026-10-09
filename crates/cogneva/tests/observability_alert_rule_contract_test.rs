@@ -1654,19 +1654,19 @@ const UNREAD: &[(&str, Unread)] = &[
     ),
     (
         "cogneva_registry_rebuild_hold_secs_total",
-        Unread::Gap("seconds the tag server was held away per induced restart; the help's criterion is a ratio against the tags deleted, so the reader needs a pair and a bound on how much deferral is acceptable, neither declared"),
+        Unread::Gap("seconds the tag server was held away per induced restart. The pair the help's ratio needs exists -- cogneva_registry_pruned_tags_total, itself filed as read elsewhere -- so what is missing is a bound on how long a hold may last, and the mechanism declares none on purpose: the hold lifts when the server answers, which is readable on the spot rather than after a budget, and a hold that never lifts is the unpaid reclaim debt that registry_reclaim_debt_unpaid already reads on cogneva_registry_gc_owed. The ratio would say whether the trigger lets the volume grow too full, and that is a policy nobody has stated"),
     ),
     (
         "cogneva_buildah_store_pruned_images_total",
-        Unread::Gap("written only when a round freed an image, so its absence is not a zero; the window a reader needs is the build-slot-gated completion cadence, which no series publishes"),
+        Unread::Gap("written only when a round freed an image, so its absence is not a zero. It is a volume, and a volume is not a fault without a declared budget for the store, which nothing states. The cadence this entry used to call unpublished is published: cogneva_buildah_store_reading_unix is stamped by every completed round, cogneva_buildah_store_rounds_total counts the attempts beside it, and buildah_store_round_incomplete reads the pair against a bound the store declares elsewhere. The family's fault-worthy states are read on those siblings -- a round attempted and never completed, and a keep set computed from an empty cluster read -- and neither of them needs this count"),
     ),
     (
         "cogneva_buildah_store_pruned_layers_total",
-        Unread::Gap("the help's own point is that this is not a fixed multiple of the image count, so it is a second number under the same undeclared bound, and it shares the build-slot-gated completion cadence"),
+        Unread::Gap("the help's own point is that this is not a fixed multiple of the image count, so it is a second number under the same undeclared store budget; the completion cadence it shares is published by cogneva_buildah_store_reading_unix and read, so what stands in the way is the budget rather than the cadence"),
     ),
     (
         "cogneva_buildah_store_freed_bytes_total",
-        Unread::Gap("bytes freed, written only when both ends of the round were measurable; the same build-slot-gated completion cadence applies and no free-space bound is declared for the store"),
+        Unread::Gap("bytes freed, written only when both ends of the round were measurable; the help calls the number apparent rather than real, and the cadence is published and read as above, so what a rule would need is a declared budget for the store"),
     ),
     (
         "cogneva_buildah_store_kept_images",
@@ -1682,7 +1682,7 @@ const UNREAD: &[(&str, Unread)] = &[
     ),
     (
         "cogneva_rollout_job_reading_unix",
-        Unread::Gap("ties the two readings above to the run that produced them; a reader needs the run cadence, which is per-rollout and published by no series. The one reading that would not need it is this timestamp's own age, and the store does render a companion that carries it -- cogneva_rollout_job_reading_unix_observed_timestamp_seconds, frozen while the writer is gone. That family is now inside the gate's view, so a rule may name it (see the derived half of every_series_an_alert_rule_reads_is_one_something_produces); what still keeps the reader unopened is the same missing bound, since an age is only a fault against a cadence, and the run happens per change rather than on a declared period"),
+        Unread::Gap("ties the two readings above to the run that produced them; a reader needs the run cadence, which is per-rollout and published by no series -- every published name in this family was enumerated, and none counts judgement runs. The nearest is cogneva_mainline_rollout_attempts_total, whose help calls it the only published cadence of a promotion attempt, and it is not the run count: it is written where the round reaches the decision whether to roll, so a revision the upstream has already left reaches that decision and stops there, and reading it as the run cadence would pair a climbing counter with a timestamp that has no run to advance it on every superseded revision. The one reading that would not need the cadence is this timestamp's own age, and the store does render a companion that carries it -- cogneva_rollout_job_reading_unix_observed_timestamp_seconds, frozen while the writer is gone. That family is now inside the gate's view, so a rule may name it (see the derived half of every_series_an_alert_rule_reads_is_one_something_produces); what still keeps the reader unopened is the same missing bound, since an age is only a fault against a cadence, and the run happens per change rather than on a declared period. The bound the judgement itself runs under is declared -- the job's activeDeadlineSeconds is computed from the startup, rollout and soak budgets -- but it is a value in the job spec rather than a published series, so no rule can name it"),
     ),
     (
         "cogneva_mainline_superseded_rollout_total",
@@ -1790,6 +1790,19 @@ fn unresolved_readers(read: &BTreeSet<String>, name: &str, readers: &[&str]) -> 
 /// it no longer has leaves behind. A share of artifacts coming back unfaithful is
 /// the ordinary case -- a refusal is answered by design with a rework round -- and
 /// is deliberately not read here. So 20 became 15.
+///
+/// The count stayed at 15 through the pass that re-read the remaining reasons
+/// one more time. Four of them were filing a false obstacle: three buildah store
+/// counters and the registry rebuild hold each said the cadence a reader needs is
+/// published by no series, and in each case it is -- cogneva_buildah_store_reading_unix
+/// is stamped by every completed round, cogneva_buildah_store_rounds_total counts
+/// the attempts beside it, buildah_store_round_incomplete reads the pair, and the
+/// hold's ratio has its partner in cogneva_registry_pruned_tags_total. What stands
+/// in the way of those four is a bound nobody has stated -- a budget for the store,
+/// a limit on how long a hold may last -- and a bound is the owner's decision rather
+/// than a reading this repository is withholding. The fifth was the one that held
+/// up: the rollout reading really does have no published run cadence, and its reason
+/// now names the counter that looks like one and is not. So 15 stayed 15.
 const GAPS_AT_CENSUS: usize = 15;
 
 #[test]
