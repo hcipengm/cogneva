@@ -772,6 +772,24 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          completes keeps it at 0",
     ),
     (
+        "cogneva_eval_gate_outcomes_total",
+        "How each run of the baseline port's eval A/B gate ended, labelled by \
+         `outcome`, written once per run. The gate refuses a port that \
+         regresses a fixed eval suite; its verdict comes from a sandbox agent \
+         that runs the suite twice and reports the outcomes, and the gate \
+         z-tests what came back. Whether it measured at all is a separate fact \
+         from what it decided, and only the second had a reading: the agent \
+         reporting `applicable=false` and there being no orchestrator both \
+         returned success and left no series, so a port that was never \
+         measured and one that was measured and passed read the same. The \
+         cells are the closed set of ends -- `passed` and `rejected` are the \
+         gate deciding, `not_applicable` and `unreadable` are a run that did \
+         not measure, and `unavailable` is a run that never reached a verdict. \
+         A reader separates a gate that keeps passing from one that keeps \
+         skipping; the skip's own tick-failure reading cannot, because a gate \
+         that skips is not a tick that failed",
+    ),
+    (
         "cogneva_rollout_job_cpu_throttled_ratio",
         "Share of the CFS periods of the newest rollout judgement run in which \
          the run was throttled by its own CPU limit, read by the run from its \

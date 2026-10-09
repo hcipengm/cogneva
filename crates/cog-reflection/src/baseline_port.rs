@@ -246,6 +246,29 @@ impl BaselinePorter {
         }
     }
 
+    /// 发布这一轮 eval A/B 门落在闭集的哪一格。
+    ///
+    /// 与 [`Self::report_tick_outcome`] 同形：门有多处提前返回（无编排器、评估
+    /// 任务没跑成、判词可读或不可读），写点逐一排在每个返回点之前，让「每轮都写」
+    /// 按构造成立——排在它们之后就会被门控掉，而「没测」恰好走的就是那些提前返回。
+    async fn report_eval_gate_outcome(&self, outcome: EvalGateOutcome) {
+        let Some(ref metrics) = self.metrics else {
+            return;
+        };
+        let mut labels = HashMap::new();
+        labels.insert("outcome".to_string(), outcome.as_cell().to_string());
+        if let Err(e) = metrics
+            .record_counter(
+                cog_core::metric_names::EVAL_GATE_OUTCOMES_TOTAL,
+                1.0,
+                labels,
+            )
+            .await
+        {
+            warn!(error = %e, "eval gate outcome emit failed");
+        }
+    }
+
     /// LLM 上游池当前是否暂停了 LLM 依赖型工作。
     fn llm_paused(&self) -> bool {
         self.llm_gate
@@ -1174,6 +1197,8 @@ impl BaselinePorter {
                 "no orchestrator (or LLM pool down); eval A/B gate skipped for {}",
                 change.change_id
             );
+            self.report_eval_gate_outcome(EvalGateOutcome::Unavailable)
+                .await;
             return Ok(Ok(()));
         };
 
@@ -1220,10 +1245,16 @@ impl BaselinePorter {
             .await?
         {
             Ok(t) => t,
-            Err(reason) => return Ok(Err(format!("eval task {task_id} {reason}"))),
+            Err(reason) => {
+                self.report_eval_gate_outcome(EvalGateOutcome::Unavailable)
+                    .await;
+                return Ok(Err(format!("eval task {task_id} {reason}")));
+            }
         };
         let result = completed.result.unwrap_or_else(|| serde_json::json!({}));
-        Ok(eval_regression_feedback(&result))
+        let (outcome, verdict) = eval_regression_feedback(&result);
+        self.report_eval_gate_outcome(outcome).await;
+        Ok(verdict)
     }
 
     async fn run_cargo(&self, args: &[&str], timeout_secs: u64) -> SFResult<(bool, String)> {
@@ -1562,16 +1593,55 @@ fn tail(s: &str, max: usize) -> String {
     format!("[tail {max} of {} bytes]\n{}", s.len(), &s[start..])
 }
 
+/// 这次 eval A/B 门把移植判成了哪一种结局。
+///
+/// 门的判据来自被判方——沙箱 LLM 自己跑两遍评估集、自己报 `success` 布尔，
+/// 控制器只对报回来的两组数跑 z 检验。所以「门测过并放行」与「门没测」是两件
+/// 不同的事实，而原先只有第一件有读数：`applicable=false`（被判方自报没有套件）
+/// 与编排器缺席都直接返回成功，一个从没量过的移植和一个量过且不回归的移植，
+/// 在所有既有读数上一模一样。这几格就是那道区别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvalGateOutcome {
+    /// 跑了 z 检验，未拒绝：移植不回归。
+    Passed,
+    /// 跑了 z 检验，拒绝：移植回归。
+    Rejected,
+    /// 被判方自报没有评估套件可跑。门没有测量。
+    NotApplicable,
+    /// 被判方返回的东西读不成两组结果集。门没有测量。
+    Unreadable,
+    /// 根本没走到判词：无编排器、或评估任务没跑成。两者在
+    /// `baseline_port_tick_failed` 上分得开——任务失败把它置 1，编排器缺席不会。
+    Unavailable,
+}
+
+impl EvalGateOutcome {
+    /// 读数标签的取值。闭集，读的人按这一格把「测过且通过」与三种「没测」分开。
+    fn as_cell(self) -> &'static str {
+        match self {
+            EvalGateOutcome::Passed => "passed",
+            EvalGateOutcome::Rejected => "rejected",
+            EvalGateOutcome::NotApplicable => "not_applicable",
+            EvalGateOutcome::Unreadable => "unreadable",
+            EvalGateOutcome::Unavailable => "unavailable",
+        }
+    }
+}
+
 /// eval A/B 任务结果的纯判定：移植只要求"不回归"——成功率统计显著下降
 /// （z 检验 Reject）才判失败；显著提升或无统计差异都通过。数据缺失/无法
 /// 解析按失败处理（验收权在统计检验，不能静默放行）。
-fn eval_regression_feedback(result: &serde_json::Value) -> Result<(), String> {
+///
+/// 返回两半：落在哪一格（喂读数），以及给调用方的判词。闸门决定不变——
+/// 自报不适用仍然是放行，不是拒绝：全仓一份评估集都没有，把「没套件」判成
+/// 拒绝会让移植线整条停住。变的只是这件事现在有了自己的读数。
+fn eval_regression_feedback(result: &serde_json::Value) -> (EvalGateOutcome, Result<(), String>) {
     let applicable = result
         .get("applicable")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
     if !applicable {
-        return Ok(());
+        return (EvalGateOutcome::NotApplicable, Ok(()));
     }
     let parse = |key: &str| -> Result<Vec<EvalOutcome>, String> {
         let raw = result
@@ -1580,10 +1650,19 @@ fn eval_regression_feedback(result: &serde_json::Value) -> Result<(), String> {
         serde_json::from_value(raw.clone())
             .map_err(|e| format!("eval result `{key}` outcomes unparseable: {e}"))
     };
-    let before = parse("before")?;
-    let after = parse("after")?;
+    let before = match parse("before") {
+        Ok(v) => v,
+        Err(e) => return (EvalGateOutcome::Unreadable, Err(e)),
+    };
+    let after = match parse("after") {
+        Ok(v) => v,
+        Err(e) => return (EvalGateOutcome::Unreadable, Err(e)),
+    };
     if before.is_empty() || after.is_empty() {
-        return Err("eval result returned empty outcome sets".into());
+        return (
+            EvalGateOutcome::Unreadable,
+            Err("eval result returned empty outcome sets".into()),
+        );
     }
     let cmp = eval_compare(&before, &after);
     if cmp.verdict == EvalVerdict::Reject {
@@ -1592,22 +1671,25 @@ fn eval_regression_feedback(result: &serde_json::Value) -> Result<(), String> {
             .filter(|o| !o.success)
             .map(|o| o.task_id.as_str())
             .collect();
-        Err(format!(
-            "eval A/B regression: z={:.2}, success rate {}/{} (baseline) -> {}/{} (ported); \
-             failing tasks: {}",
-            cmp.z_score,
-            cmp.before.succeeded,
-            cmp.before.total,
-            cmp.after.succeeded,
-            cmp.after.total,
-            if failing.is_empty() {
-                "(none reported)".to_string()
-            } else {
-                failing.join(", ")
-            }
-        ))
+        (
+            EvalGateOutcome::Rejected,
+            Err(format!(
+                "eval A/B regression: z={:.2}, success rate {}/{} (baseline) -> {}/{} (ported); \
+                 failing tasks: {}",
+                cmp.z_score,
+                cmp.before.succeeded,
+                cmp.before.total,
+                cmp.after.succeeded,
+                cmp.after.total,
+                if failing.is_empty() {
+                    "(none reported)".to_string()
+                } else {
+                    failing.join(", ")
+                }
+            )),
+        )
     } else {
-        Ok(())
+        (EvalGateOutcome::Passed, Ok(()))
     }
 }
 
@@ -1836,21 +1918,25 @@ mod tests {
     #[test]
     fn eval_gate_skips_when_not_applicable() {
         let result = serde_json::json!({ "applicable": false });
-        assert!(eval_regression_feedback(&result).is_ok());
+        let (outcome, verdict) = eval_regression_feedback(&result);
+        // 放行不变，但这一格必须与被判方无关的「测过且通过」分开。
+        assert!(verdict.is_ok());
+        assert_eq!(outcome, EvalGateOutcome::NotApplicable);
+        assert_eq!(outcome.as_cell(), "not_applicable");
     }
 
     #[test]
     fn eval_gate_fails_closed_on_missing_outcomes() {
-        assert!(eval_regression_feedback(&serde_json::json!({})).is_err());
-        let only_before = serde_json::json!({
-            "before": eval_outcomes(20, 20),
-        });
-        assert!(eval_regression_feedback(&only_before).is_err());
-        let empty = serde_json::json!({
-            "before": [],
-            "after": eval_outcomes(1, 1),
-        });
-        assert!(eval_regression_feedback(&empty).is_err());
+        let cases = [
+            serde_json::json!({}),
+            serde_json::json!({ "before": eval_outcomes(20, 20) }),
+            serde_json::json!({ "before": [], "after": eval_outcomes(1, 1) }),
+        ];
+        for result in cases {
+            let (outcome, verdict) = eval_regression_feedback(&result);
+            assert!(verdict.is_err(), "missing outcomes must fail closed");
+            assert_eq!(outcome, EvalGateOutcome::Unreadable);
+        }
     }
 
     #[test]
@@ -1860,9 +1946,31 @@ mod tests {
             "before": eval_outcomes(20, 20),
             "after": eval_outcomes(14, 20),
         });
-        let err = eval_regression_feedback(&result).expect_err("regression must fail gate");
+        let (outcome, verdict) = eval_regression_feedback(&result);
+        assert_eq!(outcome, EvalGateOutcome::Rejected);
+        let err = verdict.expect_err("regression must fail gate");
         assert!(err.contains("eval A/B regression"));
         assert!(err.contains("t14") || err.contains("failing tasks"));
+    }
+
+    #[test]
+    fn eval_gate_names_the_two_ends_it_can_reach_without_measuring() {
+        // 「测过且通过」与两种「没测」各占一格：这是这条读数的全部意义所在。
+        let passed = serde_json::json!({
+            "before": eval_outcomes(20, 20),
+            "after": eval_outcomes(20, 20),
+        });
+        let (outcome, verdict) = eval_regression_feedback(&passed);
+        assert!(verdict.is_ok());
+        assert_eq!(outcome.as_cell(), "passed");
+        assert_ne!(
+            EvalGateOutcome::Passed.as_cell(),
+            EvalGateOutcome::NotApplicable.as_cell()
+        );
+        assert_ne!(
+            EvalGateOutcome::Passed.as_cell(),
+            EvalGateOutcome::Unavailable.as_cell()
+        );
     }
 
     #[test]
@@ -1872,13 +1980,17 @@ mod tests {
             "before": eval_outcomes(18, 20),
             "after": eval_outcomes(20, 20),
         });
-        assert!(eval_regression_feedback(&result).is_ok());
+        let (outcome, verdict) = eval_regression_feedback(&result);
+        assert_eq!(outcome, EvalGateOutcome::Passed);
+        assert!(verdict.is_ok());
         // 完全相同（无方差）同样放行。
         let same = serde_json::json!({
             "before": eval_outcomes(20, 20),
             "after": eval_outcomes(20, 20),
         });
-        assert!(eval_regression_feedback(&same).is_ok());
+        let (outcome, verdict) = eval_regression_feedback(&same);
+        assert_eq!(outcome, EvalGateOutcome::Passed);
+        assert!(verdict.is_ok());
     }
 
     #[test]

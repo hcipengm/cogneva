@@ -1935,6 +1935,17 @@ enum Unread {
 /// yet, or a repair that is a policy decision rather than a reader to write.
 /// `GAPS_AT_CENSUS` counts them so the next one must be classified deliberately.
 const UNREAD: &[(&str, Unread)] = &[
+    // The port's eval A/B gate ends in "did not measure" more often than not
+    // right now: the repository ships no fixed eval task set, so the sandbox
+    // agent reports `applicable=false` on every run. What would make a run of
+    // those skips a fault is whether a suite is expected to exist, and until one
+    // does no threshold can be declared -- so the reader is a debt, not an
+    // omission. The reading lands now, with the closed outcome set already in
+    // place, so the rule that reads it is one series away when the suite lands.
+    (
+        "cogneva_eval_gate_outcomes_total",
+        Unread::Gap("what would make a run of self-exempted or unavailable gate runs a fault is whether a fixed eval suite is expected to exist, and the repository ships none, so no threshold is declarable yet"),
+    ),
     // The denominator of the rule on the aged-out backlog: the sibling counts
     // every unextracted raw, this one counts the part the system will retry by
     // itself, and both are written by the same scan. A reader of the pair is
@@ -2133,7 +2144,7 @@ fn unresolved_readers(read: &BTreeSet<String>, name: &str, readers: &[&str]) -> 
 /// reading withheld. The fifth was the one that held
 /// up: the rollout reading really does have no published run cadence, and its reason
 /// now names the counter that looks like one and is not. So 15 stayed 15.
-const GAPS_AT_CENSUS: usize = 15;
+const GAPS_AT_CENSUS: usize = 16;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {

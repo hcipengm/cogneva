@@ -221,6 +221,30 @@ metric_names! {
     // deployment runs the trigger for its own instance.
     BASELINE_PORT_TICK_FAILED => "baseline_port_tick_failed",
 
+    // cog-reflection — how each run of the baseline port's eval A/B gate ended,
+    // labelled by `outcome`, one run per cell.
+    //
+    // The gate exists to refuse a port that regresses a fixed eval suite. Its
+    // verdict comes from a sandbox agent that runs the suite twice and reports
+    // the outcomes itself, and the gate only z-tests what came back — so the
+    // verdict and the *having measured* are two different facts, and only the
+    // first had any reading. Two paths passed the gate without measuring, both
+    // returning success: the agent reporting `applicable=false` (about a
+    // component with no suite), and there being no orchestrator at all. Neither
+    // left a series behind, and the failure a tick carries — `baseline_port_tick_failed`
+    // — is 0 for both, because a gate that skips is not a tick that failed. So a
+    // port that was never measured and a port that was measured and did not
+    // regress were the same picture on every reading, which is exactly the shape
+    // this gate must not have.
+    //
+    // A counter, because a gate run is a cumulative event over the process's
+    // life; the five cells are the closed set of ends, so a reader can separate
+    // a gate that keeps passing from one that keeps skipping. `unavailable` is
+    // the cell for "never reached a verdict" -- no orchestrator, or the eval
+    // task did not complete; the two stay apart on `baseline_port_tick_failed`,
+    // which the task failure sets to 1 and the missing orchestrator does not.
+    EVAL_GATE_OUTCOMES_TOTAL => "cogneva_eval_gate_outcomes_total",
+
     // cog-reflection — how each round of the artifact-level evolution search
     // ended, labelled by `outcome`.
     //
