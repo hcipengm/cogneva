@@ -269,6 +269,33 @@ impl BaselinePorter {
         }
     }
 
+    /// 开机把闭集的五格按 0 摆出来。
+    ///
+    /// 这格只在 eval A/B 门被走到时才写，而门走的是「有变更可移植」那条路径：
+    /// 没有变更在途（例如上游断供、提升队列空）时整条路一次都不进，于是**门没
+    /// 跑过**与**读数没接线**在 `/metrics` 上是同一个样子——五格一条序列都不
+    /// 出现。播种之后「本进程起来后门一次都没跑」是五个可读的 0，而不是一片
+    /// 缺席；缺席只留给「这个二进制根本没有这条读数」。
+    async fn seed_eval_gate_outcomes(&self) {
+        let Some(ref metrics) = self.metrics else {
+            return;
+        };
+        for outcome in EvalGateOutcome::ALL {
+            let mut labels = HashMap::new();
+            labels.insert("outcome".to_string(), outcome.as_cell().to_string());
+            if let Err(e) = metrics
+                .record_counter(
+                    cog_core::metric_names::EVAL_GATE_OUTCOMES_TOTAL,
+                    0.0,
+                    labels,
+                )
+                .await
+            {
+                warn!(error = %e, "eval gate outcome seed failed");
+            }
+        }
+    }
+
     /// LLM 上游池当前是否暂停了 LLM 依赖型工作。
     fn llm_paused(&self) -> bool {
         self.llm_gate
@@ -1542,6 +1569,9 @@ pub async fn run_baseline_port_loop(
         version = %current_version,
         "baseline port trigger loop started"
     );
+    // 门只有在「有变更可移植」那几轮才写自己的结局，所以开机先把五格摆成 0，
+    // 让「一轮都还没到门」与「这条读数没接线」不同形。
+    porter.seed_eval_gate_outcomes().await;
     // A port that fails keeps its last state and retries on the next tick, so a
     // loop that died leaves nothing behind but a version that never moves. The
     // supervised shape adds the repair: a panicking tick is run again and counted,
@@ -1626,6 +1656,15 @@ impl EvalGateOutcome {
             EvalGateOutcome::Unavailable => "unavailable",
         }
     }
+
+    /// 闭集全集，供开机播种用。
+    const ALL: [EvalGateOutcome; 5] = [
+        EvalGateOutcome::Passed,
+        EvalGateOutcome::Rejected,
+        EvalGateOutcome::NotApplicable,
+        EvalGateOutcome::Unreadable,
+        EvalGateOutcome::Unavailable,
+    ];
 }
 
 /// eval A/B 任务结果的纯判定：移植只要求"不回归"——成功率统计显著下降
@@ -2635,6 +2674,48 @@ mod tests {
         let ok = metrics.query_gauge_latest(name).await.unwrap();
         assert_eq!(ok.len(), 1, "同一标签集只留最新一笔");
         assert_eq!(ok[0].value, 0.0);
+    }
+
+    /// 开机播种让「门一轮都没跑」是一个可读的 0，而不是一条不存在的序列。
+    ///
+    /// 这格只在门被走到时才写，而门走的是「有变更可移植」那条路径。没有播种时，
+    /// 上游断供（没有变更在途）⇒ 一条序列都不出现，与「这个二进制根本没接这条
+    /// 读数」在 `/metrics` 上同形——本轮实测现网就是这个样子。播种后五格齐全、
+    /// 全 0 即「跑过 0 次门」；真跑过一轮时动的只有那一格。
+    #[tokio::test]
+    async fn the_closed_outcome_set_is_seeded_so_a_gate_that_never_ran_reads_as_zero() {
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let porter = BaselinePorter::new(".").with_metrics(Some(metrics.clone()));
+        let name = cog_core::metric_names::EVAL_GATE_OUTCOMES_TOTAL.as_str();
+
+        // 播种前：一条序列都没有——正是「没接线」与「没跑过」同形的那个样子。
+        assert!(metrics.query_counter_totals(name).await.unwrap().is_empty());
+
+        porter.seed_eval_gate_outcomes().await;
+        let seeded = metrics.query_counter_totals(name).await.unwrap();
+        let cells: std::collections::BTreeMap<String, f64> = seeded
+            .iter()
+            .map(|s| (s.labels["outcome"].clone(), s.value))
+            .collect();
+        assert_eq!(cells.len(), EvalGateOutcome::ALL.len(), "五格全在");
+        assert!(cells.values().all(|v| *v == 0.0), "每一格都按 0 摆出");
+
+        // 真跑一轮：只有那一格动，其余仍是可读的 0。
+        porter
+            .report_eval_gate_outcome(EvalGateOutcome::Passed)
+            .await;
+        let after: std::collections::BTreeMap<String, f64> = metrics
+            .query_counter_totals(name)
+            .await
+            .unwrap()
+            .iter()
+            .map(|s| (s.labels["outcome"].clone(), s.value))
+            .collect();
+        assert_eq!(after["passed"], 1.0);
+        assert_eq!(after["rejected"], 0.0);
+        assert_eq!(after["not_applicable"], 0.0);
+        assert_eq!(after["unreadable"], 0.0);
+        assert_eq!(after["unavailable"], 0.0);
     }
 
     /// 循环把**每一轮**的结局都盖下来：仓库不可达时 port_tick 返回 Err，读数必须是

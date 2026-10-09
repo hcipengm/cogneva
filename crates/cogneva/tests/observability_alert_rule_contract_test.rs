@@ -1940,8 +1940,12 @@ const UNREAD: &[(&str, Unread)] = &[
     // agent reports `applicable=false` on every run. What would make a run of
     // those skips a fault is whether a suite is expected to exist, and until one
     // does no threshold can be declared -- so the reader is a debt, not an
-    // omission. The reading lands now, with the closed outcome set already in
-    // place, so the rule that reads it is one series away when the suite lands.
+    // omission. The closed outcome set is seeded at zero when the loop starts, so
+    // the fact the rule needs is present on every scrape: five zeroed cells say
+    // the gate has not run, and an absent series would only say the binary never
+    // published it. That turns "the gate is idling" and "the reading was never
+    // wired" into different pictures, which is what makes the rule authorable the
+    // moment the suite lands.
     (
         "cogneva_eval_gate_outcomes_total",
         Unread::Gap("what would make a run of self-exempted or unavailable gate runs a fault is whether a fixed eval suite is expected to exist, and the repository ships none, so no threshold is declarable yet"),
