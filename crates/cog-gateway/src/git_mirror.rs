@@ -1662,6 +1662,10 @@ mod tests {
     }
 
     /// 进程是不是还活着（僵尸不算活着：它已经死了，只是没人回收）。
+    ///
+    /// 只在"还没发过杀信号"的地方用（正面的场景检查）。判**杀干净了没有**不能用
+    /// 它：那个判据问的是"这个号还有主吗"，而号会被复用——一个**不属于那一组**的
+    /// 新进程就足以让"还没死"成立。那件事要用 `process_group_alive` 问内核。
     fn process_alive(pid: i32) -> bool {
         let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
             return false;
@@ -1679,9 +1683,9 @@ mod tests {
     /// "机器被压满时调度慢"读成"缺陷"：实测全量并行跑会红、单独跑 6/6 绿。
     const GROUP_SETTLE: std::time::Duration = std::time::Duration::from_secs(30);
 
-    /// 等假 git 写下孙进程的 pid 并读回来。文件是另一个进程写的，所以这里必须
+    /// 等假 git 把某个 pid 写进文件再读回来。文件是另一个进程写的，所以这里必须
     /// 等到它出现，不能假定它已经在了。
-    async fn read_grandchild_pid(pidfile: &std::path::Path) -> i32 {
+    async fn read_pid_file(pidfile: &std::path::Path) -> i32 {
         let deadline = std::time::Instant::now() + GROUP_SETTLE;
         loop {
             if let Ok(text) = std::fs::read_to_string(pidfile) {
@@ -1691,16 +1695,88 @@ mod tests {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "假 git 应在 {GROUP_SETTLE:?} 内写下孙进程 pid"
+                "假 git 应在 {GROUP_SETTLE:?} 内把 pid 写进 {}",
+                pidfile.display()
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }
 
-    /// 等一个进程消失。
-    async fn wait_until_gone(pid: i32) {
+    /// 一个进程组里还有没有活着的成员。
+    ///
+    /// **问的键是"组"，不是"某个号"**——这是这条判据与原来那条（`process_alive(孙进程号)`）
+    /// 的全部差别。原判据把两件事混成一件：号被复用之后，一个**不属于这一组**的新进程
+    /// 就足以让"还没死"成立，而这两个测试要问的从来是"这一组被杀干净了吗"。
+    ///
+    /// 两步：内核先答一次"这一组还有没有号占着"（`kill(-pgid, 0)` 在组空时回 ESRCH，
+    /// 这是常见路径，省掉一次 /proc 扫描）；占着的话再排掉**僵尸**——一组僵尸仍然占着
+    /// 组号，但它们已经死了，按信号那一步会把它们读成"还活着"。
+    fn process_group_alive(pgid: i32) -> bool {
+        // SAFETY: 信号 0 不投递任何信号，只做存在性检查。
+        if unsafe { libc::kill(-pgid, 0) } != 0 {
+            // ESRCH＝这一组一个号都不剩。EPERM 是"还在，只是没权限"，要继续看。
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return false;
+            }
+        }
+        !live_group_members(pgid).is_empty()
+    }
+
+    /// 组里**非僵尸**的成员，连同足以看出它是谁的字段。
+    ///
+    /// 两用：判据用它排僵尸，失败时用它留现场。现场那一半不是顺手加的——
+    /// 这一条在整仓并行下偶发红过（断言是"孙进程必须一起被杀掉"），当时的临时探针
+    /// 复跑全绿、现场没取到；取不到的原因不是探针写得不对，是**下一次重现还得靠
+    /// 运气**。所以现场不能靠"下次再手动抓"，判据自己带一份。
+    fn live_group_members(pgid: i32) -> Vec<String> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Ok(pid) = name.parse::<i32>() else {
+                continue;
+            };
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                continue;
+            };
+            // `comm` 里可以有空格和括号，所以按**最后一个** ')' 切；其后依次是
+            // state、ppid、pgrp。
+            let Some((head, tail)) = stat.rsplit_once(')') else {
+                continue;
+            };
+            let comm = head.split_once('(').map(|(_, c)| c).unwrap_or("");
+            let mut fields = tail.split_whitespace();
+            let state = fields.next().unwrap_or("?");
+            let ppid = fields.next().unwrap_or("?");
+            if fields.next().and_then(|s| s.parse::<i32>().ok()) != Some(pgid) {
+                continue;
+            }
+            if state == "Z" {
+                continue;
+            }
+            let cmd = std::fs::read(format!("/proc/{pid}/cmdline"))
+                .map(|b| {
+                    b.split(|c| *c == 0)
+                        .filter(|s| !s.is_empty())
+                        .map(|s| String::from_utf8_lossy(s).into_owned())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
+            out.push(format!(
+                "pid={pid} state={state} ppid={ppid} comm={comm} cmd={cmd}"
+            ));
+        }
+        out
+    }
+
+    /// 等一个进程组彻底空掉。
+    async fn wait_until_group_empty(pgid: i32) {
         let deadline = std::time::Instant::now() + GROUP_SETTLE;
-        while process_alive(pid) && std::time::Instant::now() < deadline {
+        while process_group_alive(pgid) && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
@@ -1709,16 +1785,23 @@ mod tests {
     async fn silent_transfer_is_killed_along_with_its_whole_process_group() {
         let tmp = tempfile::tempdir().unwrap();
         let pidfile = tmp.path().join("grandchild.pid");
+        let leaderfile = tmp.path().join("leader.pid");
         // 形态与线上一致：先来一行进度，然后永远不再出声；并且它**有子进程**
         // （`git → sh → ssh → 远端`），子进程也会往镜像里写东西。
+        //
+        // 组长号先落盘：它就是这个进程组的组 id（子进程按 `process_group(0)` 自己
+        // 成组），**整组死光之后仍然可用于提问**——而孙进程的号一旦没了 /proc 项，
+        // 就再也读不出它属于哪个组了。
         let fake = write_fake_git(
             tmp.path(),
             &format!(
-                "echo 'remote: Receiving objects: 1%' >&2\n\
+                "echo $$ > {leader}\n\
+                 echo 'remote: Receiving objects: 1%' >&2\n\
                  sleep 300 &\n\
-                 echo $! > {}\n\
+                 echo $! > {child}\n\
                  sleep 300\n",
-                pidfile.display()
+                leader = leaderfile.display(),
+                child = pidfile.display()
             ),
         );
         let t = test_transport(tmp.path(), fake, DEFAULT_SSH_BASE.into(), 1, 30);
@@ -1735,9 +1818,20 @@ mod tests {
         );
 
         // 只杀组长会留下还在写镜像的孙进程——线上那次 index-pack 就活了十几分钟。
-        let pid = read_grandchild_pid(&pidfile).await;
-        wait_until_gone(pid).await;
-        assert!(!process_alive(pid), "孙进程 {pid} 必须一起被杀掉");
+        // 孙进程号只用于证明"这一组真的有两个成员"（否则"组空了"是白说的），
+        // 判据本身问的是**整组空没空**，见 process_group_alive。
+        let grandchild = read_pid_file(&pidfile).await;
+        let leader = read_pid_file(&leaderfile).await;
+        assert_ne!(
+            grandchild, leader,
+            "假 git 必须真的 fork 出一个孙进程，否则这一组只有组长一个成员"
+        );
+        wait_until_group_empty(leader).await;
+        assert!(
+            !process_group_alive(leader),
+            "进程组 {leader} 必须被杀干净（孙进程原为 pid={grandchild}），但还有成员活着：\n{}",
+            live_group_members(leader).join("\n")
+        );
     }
 
     #[tokio::test]
@@ -1801,29 +1895,40 @@ mod tests {
     async fn cancelling_the_executor_still_kills_the_whole_group() {
         let tmp = tempfile::tempdir().unwrap();
         let pidfile = tmp.path().join("grandchild.pid");
+        let leaderfile = tmp.path().join("leader.pid");
         let fake = write_fake_git(
             tmp.path(),
             &format!(
-                "sleep 300 &\n\
-                 echo $! > {}\n\
+                "echo $$ > {leader}\n\
+                 sleep 300 &\n\
+                 echo $! > {child}\n\
                  sleep 300\n",
-                pidfile.display()
+                leader = leaderfile.display(),
+                child = pidfile.display()
             ),
         );
         let t = test_transport(tmp.path(), fake, DEFAULT_SSH_BASE.into(), 30, 60);
         let exec = t.exec.clone();
 
         let task = tokio::spawn(async move { exec.capture(&["ls-remote", "x"], None).await });
-        let pid = read_grandchild_pid(&pidfile).await;
-        assert!(process_alive(pid), "孙进程应当先真的起来");
+        // 取消之前也按"一组人"读：此刻还没发过任何杀信号，所以 pid 还在 /proc 里
+        // 就是真的还在（正面检查用 process_alive 是安全的）。
+        let grandchild = read_pid_file(&pidfile).await;
+        let leader = read_pid_file(&leaderfile).await;
+        assert!(
+            process_alive(grandchild) && process_group_alive(leader),
+            "孙进程应当先真的起来（组长 pid={leader}，孙进程 pid={grandchild}）"
+        );
 
         task.abort();
         let _ = task.await;
 
-        wait_until_gone(pid).await;
+        wait_until_group_empty(leader).await;
         assert!(
-            !process_alive(pid),
-            "调用者的 future 没了，孙进程 {pid} 也必须一起走——只杀组长会把它留下"
+            !process_group_alive(leader),
+            "调用者的 future 没了，进程组 {leader} 也必须跟着走——只杀组长会把它留下。\
+             还有成员活着：\n{}",
+            live_group_members(leader).join("\n")
         );
     }
 
