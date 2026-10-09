@@ -2195,6 +2195,19 @@ fn unresolved_readers(read: &BTreeSet<String>, name: &str, readers: &[&str]) -> 
 /// reading withheld. The fifth was the one that held
 /// up: the rollout reading really does have no published run cadence, and its reason
 /// now names the counter that looks like one and is not. So 15 stayed 15.
+///
+/// It stands at 16 for the pass that published `memory_dead_letter_raw`, the
+/// stock of raw the dead-letter reconcile scan had been computing and throwing
+/// away. That series arrives with no reader and its obligation written into its
+/// own entry, so the count is one higher than the reasons above leave it. The
+/// same arrival showed that this constant had been sitting one above the table
+/// -- 16 against the 15 rows those reasons describe -- so the new entry took the
+/// spare slot without moving the number, which is to say it went in already
+/// classified by nobody. The assertion below therefore compares the two as an
+/// equality. While it was a `<=`, that spare slot absorbed the next arrival
+/// silently, and a row leaving the table went silently green as well; now either
+/// direction is something the author has to say out loud, which is the only
+/// reason to count them here at all.
 const GAPS_AT_CENSUS: usize = 16;
 
 #[test]
@@ -2301,9 +2314,9 @@ fn every_series_the_closed_set_publishes_has_a_decided_reader() {
         .iter()
         .filter(|(_, v)| matches!(v, Unread::Gap(_)))
         .count();
-    assert!(
-        gaps <= GAPS_AT_CENSUS,
-        "零读者序列的欠账数从 {GAPS_AT_CENSUS} 涨到 {gaps}：新增的零读者序列必须当轮补读者，或把它的成因写进 UNREAD 并同步改 GAPS_AT_CENSUS（改这个数就是承认多欠一笔）"
+    assert_eq!(
+        gaps, GAPS_AT_CENSUS,
+        "零读者序列的欠账数与 GAPS_AT_CENSUS 不再相等（表内 {gaps} 笔，常数 {GAPS_AT_CENSUS}）。多一笔：新增的零读者序列必须当轮补读者，或把它的成因写进 UNREAD 并同步改 GAPS_AT_CENSUS（改这个数就是承认多欠一笔）。少一笔：那是补上了读者，同样要把它改回来——这个数就是「还有几笔没读者」的账，不再相等意味着账没人核过"
     );
 }
 
