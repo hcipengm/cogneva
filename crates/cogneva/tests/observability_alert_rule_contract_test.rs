@@ -1623,10 +1623,6 @@ const UNREAD: &[(&str, Unread)] = &[
         Unread::Gap("memory backend operation latency; no latency bound is declared anywhere in the repository to hang a threshold on"),
     ),
     (
-        "memory_operation_errors_total",
-        Unread::Gap("the memory backend's failure counter; a failing backend reaches the user as a failed task and no reading names memory as the cause -- the repair is a threshold policy for what error rate is a fault"),
-    ),
-    (
         "metrics_samples_bytes",
         Unread::NotAReading("the help says it lags the row count and is never the pruning criterion; the capacity verdict is the reading with a criterion"),
     ),
@@ -1648,22 +1644,6 @@ const UNREAD: &[(&str, Unread)] = &[
     (
         "cogneva_version_commits_since_release",
         Unread::Gap("how far the running code has moved past the release; no bound is declared, so a rule would have to invent the policy it is meant to enforce"),
-    ),
-    (
-        "evolution_generated_change_files_total",
-        Unread::Gap("generated-change fidelity: measured, logged, and read by nothing; the ratio needs a declared fidelity bound that does not exist"),
-    ),
-    (
-        "evolution_generated_change_files_faithful",
-        Unread::Gap("the faithful half of the same unread ratio"),
-    ),
-    (
-        "evolution_generated_change_hunks_total",
-        Unread::Gap("the same unread fidelity face at hunk granularity; the missing bound is the same one"),
-    ),
-    (
-        "evolution_generated_change_hunks_faithful",
-        Unread::Gap("same face, hunk granularity, faithful half"),
     ),
     (
         "cogneva_registry_pruned_tags_total",
@@ -1721,7 +1701,7 @@ const UNREAD: &[(&str, Unread)] = &[
     ),
     (
         "llm_upstream_shape_errored",
-        Unread::Gap("a rule cannot state it. The value is 1 only while a shape-class rejection is unadjudicated, which is one probe tick at most, so any window over it would extrapolate a transient into a condition -- the reading's content is its two edges, and a window would erase exactly that. It exists because a handoff that runs and one that was never wired used to look the same on every other series, and telling those apart is a question asked once per change, not a standing bound. What is missing is therefore not a reader but a declared condition: how long an open shape question may stand before it is a fault. Until someone states one, a rule here would only report the prober's own cadence back at us"),
+        Unread::Gap("a rule cannot state it, and the premise is measured rather than assumed: the mark is cleared by the next probe outcome of either sign -- both the failure path and the success path remove it -- and a marked upstream is due for the very next probe tick, so its lifetime is one tick and its content is its two edges. A window over it would certify a transient, and a window long enough to outlast a restart would report the prober's own cadence back at us. It exists because a handoff that runs and one that was never wired used to look the same on every other series, and telling those apart is a question asked once per change, not a standing bound. What could keep it open is the prober not running, and that is a fact about the pool face's writer rather than about this gauge: the durable pool family is rewritten on a heartbeat, no rule reads that family's freshness, and a reader for it would be that family's entry to make. What is missing here is therefore neither a reader nor a bound on this series but a reading of the pool face's own liveness"),
     ),
     (
         "cogneva_landing_ci_failure_inherited_total",
@@ -1792,7 +1772,25 @@ fn unresolved_readers(read: &BTreeSet<String>, name: &str, readers: &[&str]) -> 
 /// `bus_claim_failed` per round -- and that subset is thresholdable without
 /// touching the diluted whole. So the loop gets an all-failed rule and the
 /// name-level entry leaves. So 21 became 20.
-const GAPS_AT_CENSUS: usize = 20;
+///
+/// It came down to 15 in the pass that re-read every remaining reason against
+/// the rules, which is the discipline this constant's own history asks for. Five
+/// entries were filed as needing a bound that turned out to be already stated by
+/// the mechanism they measure. `memory_operation_errors_total` was filed as
+/// needing "a threshold policy for what error rate is a fault"; the counter is
+/// incremented from the same call as the total beside it, so the pair states the
+/// extreme -- one operation failing every call it got -- with no rate in it at
+/// all. The four `evolution_generated_change_*` names were filed as needing "a
+/// declared fidelity bound"; the gate accepts or rejects an artifact as a whole
+/// and keeps the faithful half, so an artifact that fits has every file and hunk
+/// faithful by construction and the pair's zero-remainder is its contract rather
+/// than a level somebody has to pick. What that buys is narrower than the ratio
+/// the entries asked for and is stated as what it is: nothing generated in the
+/// window found its context at all, which is the state a generator reading a tree
+/// it no longer has leaves behind. A share of artifacts coming back unfaithful is
+/// the ordinary case -- a refusal is answered by design with a rework round -- and
+/// is deliberately not read here. So 20 became 15.
+const GAPS_AT_CENSUS: usize = 15;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {
