@@ -32,6 +32,76 @@ const CLAIM_RAN_OPERATION: &str = "bus_claim";
 const CLAIM_FAILED_OPERATION: &str = "bus_claim_failed";
 const CLAIM_HELD_OPERATION: &str = "bus_claim_held";
 
+/// 拉取闸门「此刻由哪一路掌权」在 `memory_operations_total` 上的五个 operation
+/// 取值。闸门每次**换手**记一格，恰好一格，按 0 播种。
+///
+/// 闸门把两路输入——网关发布的池快照（跨进程）与摄取器自己的连续环境失败计数
+/// （本地）——合成**一个**等待时长，而合成把「哪一路在说停」这件事抹掉了。本地
+/// 那一路此前**没有任何自己的读数**：退化到纯本地判据时，唯一的痕迹是一行随
+/// 进程消失的启动 warn，且那行只在**来源缺席**时打，「来源在、但这刻给不出快照」
+/// 这条真实得多的路一次都不打。于是「现在是本地路在掌权」「共享路在掌权」「快照
+/// 那一路整个哑了」三件事在读数面上同形。这五格把它们分开：
+///
+/// - `pull_gate_shared`：闸门关着，只有快照要求暂停；
+/// - `pull_gate_local`：闸门关着，只有本地退避要求暂停；
+/// - `pull_gate_both`：闸门关着，两路都要求；
+/// - `pull_gate_open`：闸门开着，且快照那一路**读到了**（池此刻可用）；
+/// - `pull_gate_blind`：闸门开着，但快照那一路**没读到**（来源缺席或返回 None），
+///   掌版权事实上落到了本地判据上、而它此刻说放行——这正是那一句「闸门开了一条
+///   缝」的窗口，以前它和「上游真的回来了」在读数上同形。
+///
+/// 换手才记，不按拍记：闸门状态稳定时增量为零，`rate(...)` 为 0 就是「这一路
+/// 这阵子没掌过权」，而一次故障里的几次换手各记一格。
+const PULL_GATE_SHARED_OPERATION: &str = "pull_gate_shared";
+const PULL_GATE_LOCAL_OPERATION: &str = "pull_gate_local";
+const PULL_GATE_BOTH_OPERATION: &str = "pull_gate_both";
+const PULL_GATE_OPEN_OPERATION: &str = "pull_gate_open";
+const PULL_GATE_BLIND_OPERATION: &str = "pull_gate_blind";
+
+/// 拉取闸门此刻的掌权者。见 [`PULL_GATE_SHARED_OPERATION`] 一族。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateHolder {
+    Open,
+    Blind,
+    Local,
+    Shared,
+    Both,
+}
+
+impl GateHolder {
+    /// 由两路各自的判读合成一格。`shared_read` 是「快照那一路这一刻读到了东西」，
+    /// 与 `shared_blocking`（读到了、且它要求暂停）不是一回事——两者都为假时才有
+    /// [`GateHolder::Blind`]，那正是来源缺席或返回 None 的那条路。
+    fn from_parts(local_blocking: bool, shared_blocking: bool, shared_read: bool) -> Self {
+        match (local_blocking, shared_blocking) {
+            (true, true) => GateHolder::Both,
+            (true, false) => GateHolder::Local,
+            (false, true) => GateHolder::Shared,
+            (false, false) if shared_read => GateHolder::Open,
+            (false, false) => GateHolder::Blind,
+        }
+    }
+
+    fn as_operation(self) -> &'static str {
+        match self {
+            GateHolder::Open => PULL_GATE_OPEN_OPERATION,
+            GateHolder::Blind => PULL_GATE_BLIND_OPERATION,
+            GateHolder::Local => PULL_GATE_LOCAL_OPERATION,
+            GateHolder::Shared => PULL_GATE_SHARED_OPERATION,
+            GateHolder::Both => PULL_GATE_BOTH_OPERATION,
+        }
+    }
+
+    /// 闭集，供播种与断言使用，顺序即 [`Self::as_operation`] 的枚举顺序。
+    const ALL: [GateHolder; 5] = [
+        GateHolder::Open,
+        GateHolder::Blind,
+        GateHolder::Local,
+        GateHolder::Shared,
+        GateHolder::Both,
+    ];
+}
+
 /// 归档 id 里来源 slug 的长度上限。与时间戳/随机段合计仍远低于文件系统
 /// NAME_MAX(255 字节)，同时保留足够前缀让人能从对象键认出来源。
 const RAW_ID_SLUG_MAX: usize = 64;
@@ -304,6 +374,22 @@ struct PullGateState {
     pool_until: Option<std::time::Instant>,
     /// 当前是否已经播报过"暂停中"。播报只认状态翻转，不认被挡下的条数。
     announced_pause: bool,
+    /// 上一次把掌权者记到读数上时它是谁。`None` 表示还没记过——第一次求值就会
+    /// 记一格，好让「进程起来后闸门一直是开的」也有一条自己的序列。
+    announced_holder: Option<GateHolder>,
+}
+
+/// 快照那一路这一刻的判读。区分「读到了、池可用」「读到了、池不可用」与「根本
+/// 没读到」是全部要点：前两者共享路在掌权，第三者掌版权落回本地判据，而它们在
+/// 只看得见等待时长的旧读数面上同形（都是 `None`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedReading {
+    /// 没有来源（插件被裁剪 / `redis_url` 为空）。
+    NoSource,
+    /// 有来源，但这刻给不出快照（键缺失 / Redis 不可达 / JSON 坏）。
+    Silent,
+    /// 读到了快照：`wait` 为 `Some` 表示池不可用、要求等待，`None` 表示池可用。
+    Read { wait: Option<Duration> },
 }
 
 /// 拉取闸门：把"现在该不该从事件面拉下一条"收敛成一个判据，输入有两路。
@@ -323,6 +409,8 @@ struct PullGate {
     check_secs: u64,
     /// 试跑观察窗（秒）：重试节拍到点后还要等多久才重开闸门。
     resume_observation_secs: u64,
+    /// 掌权者读数写去的指标面。缺席时只记日志，观测缺席不该让闸门这一步失败。
+    metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
     state: std::sync::Mutex<PullGateState>,
 }
 
@@ -330,6 +418,7 @@ impl PullGate {
     fn new(
         pool: Option<Arc<dyn cog_core::LlmPoolStatusSource>>,
         config: &MemoryIngestorConfig,
+        metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
     ) -> Self {
         Self {
             pool,
@@ -338,6 +427,7 @@ impl PullGate {
             max_secs: config.pull_pause_max_secs.max(1),
             check_secs: config.pool_check_secs.max(1),
             resume_observation_secs: config.pull_resume_observation_secs,
+            metrics,
             state: std::sync::Mutex::new(PullGateState::default()),
         }
     }
@@ -374,15 +464,23 @@ impl PullGate {
 
     /// 快照判据：池不可用时给出等待时长。按 [`Self::check_secs`] 缓存快照，
     /// 免得每拉一条都去问一遍同一份答案。
-    async fn shared_wait(&self) -> Option<Duration> {
-        let source = self.pool.as_ref()?;
+    ///
+    /// 返回的 [`SharedReading`] 把「读到了、池可用」「读到了、池不可用」与
+    /// 「没读到」分开——旧签名把三者都压成 `Option<Duration>`，前两者与第三者在
+    /// 掌权者读数上要落进不同的格（见 [`PULL_GATE_BLIND_OPERATION`]）。
+    async fn shared_reading(&self) -> SharedReading {
+        let Some(source) = self.pool.as_ref() else {
+            return SharedReading::NoSource;
+        };
         let now = std::time::Instant::now();
         {
             let s = self.state.lock().unwrap();
             if let Some(at) = s.pool_checked_at {
                 if now.duration_since(at) < Duration::from_secs(self.check_secs) {
                     if let Some(until) = s.pool_until.filter(|t| *t > now) {
-                        return Some(until - now);
+                        return SharedReading::Read {
+                            wait: Some(until - now),
+                        };
                     }
                     // 缓存放算出的暂停时刻已到，不等于"池好了"——它只说明该
                     // 重新判断了。就此返回 None（= 可拉取）会让闸门在上一次
@@ -391,20 +489,22 @@ impl PullGate {
             }
         }
         let snapshot = source.status().await;
-        let wait = snapshot
-            .filter(|st| st.unavailable)
-            .map(|st| self.snapshot_wait(st));
         let now = std::time::Instant::now();
-        let until = wait.map(|d| now + d);
+        let reading = match snapshot {
+            Some(st) if st.unavailable => SharedReading::Read {
+                wait: Some(self.snapshot_wait(st)),
+            },
+            Some(_) => SharedReading::Read { wait: None },
+            None => SharedReading::Silent,
+        };
+        let until = match reading {
+            SharedReading::Read { wait: Some(w) } => Some(now + w),
+            _ => None,
+        };
         let mut s = self.state.lock().unwrap();
         s.pool_checked_at = Some(now);
         s.pool_until = until;
-        if let Some(closes_at) = until {
-            if closes_at > now {
-                return Some(closes_at - now);
-            }
-        }
-        None
+        reading
     }
 
     /// 快照给出的等待时长：到池内下一个可能承接请求的时刻（重试节拍那一支再
@@ -435,34 +535,105 @@ impl PullGate {
             let s = self.state.lock().unwrap();
             s.local_until.filter(|t| *t > now).map(|t| t - now)
         };
-        let shared = self.shared_wait().await;
-        let wait = match (local, shared) {
+        let shared = self.shared_reading().await;
+        let shared_wait = match shared {
+            SharedReading::Read { wait } => wait,
+            SharedReading::NoSource | SharedReading::Silent => None,
+        };
+        let wait = match (local, shared_wait) {
             (None, None) => None,
             (a, b) => Some(a.unwrap_or_default().max(b.unwrap_or_default())),
         };
-        self.announce(wait);
+        let holder =
+            GateHolder::from_parts(local.is_some(), shared_wait.is_some(), shared.read_ok());
+        self.announce(wait, holder).await;
         wait
     }
 
     /// 暂停/恢复各只报一次，认状态翻转而不是认被挡下的条数。
-    fn announce(&self, wait: Option<Duration>) {
-        let mut s = self.state.lock().unwrap();
-        match (wait, s.announced_pause) {
-            (Some(d), false) => {
-                s.announced_pause = true;
-                warn!(
-                    wait_secs = d.as_secs(),
-                    "Memory ingest pull paused: LLM upstream unavailable"
-                );
-            }
-            (None, true) => {
-                s.announced_pause = false;
+    ///
+    /// 两件事各有自己的钟：**暂停的翻转**给日志（一次断供一行 warn、恢复一行
+    /// info），**掌权者的换手**给读数（每一格都被记一次）。它们不同步——闸门
+    /// 开着但快照那一路哑了（[`GateHolder::Blind`]）是一次换手，却不是一次暂停，
+    /// 只该进读数、不该刷出一条"重新暂停"的日志。
+    async fn announce(&self, wait: Option<Duration>, holder: GateHolder) {
+        let paused = wait.is_some();
+        let (pause_flip, holder_changed) = {
+            let mut s = self.state.lock().unwrap();
+            let pause_flip = if paused != s.announced_pause {
+                s.announced_pause = paused;
+                Some(paused)
+            } else {
+                None
+            };
+            let holder_changed = if s.announced_holder != Some(holder) {
+                s.announced_holder = Some(holder);
+                true
+            } else {
+                false
+            };
+            (pause_flip, holder_changed)
+        };
+        match pause_flip {
+            Some(true) => warn!(
+                wait_secs = wait.map(|d| d.as_secs()).unwrap_or(0),
+                "Memory ingest pull paused: LLM upstream unavailable"
+            ),
+            Some(false) => {
                 // 说的是"暂停条件消失了、接下来会再试"，不是"上游确认好了"：
                 // 没有池快照时，闸门开只代表本地窗口到期。
                 info!("Memory ingest pull resumed: pausing condition cleared");
             }
-            _ => {}
+            None => {}
         }
+        if holder_changed {
+            self.record_gate_holder(holder).await;
+        }
+    }
+
+    /// 把「闸门换手到谁」记一格。见 [`PULL_GATE_SHARED_OPERATION`] 一族。
+    ///
+    /// 记在 `memory_operations_total` 上而不是新开一个指标名：这是拉取这条路上
+    /// 的一次具名状态，与 `bus_claim_*` 那三格同类，而新名字要为一次「谁在掌权」
+    /// 付告警规则普查的代价。
+    async fn record_gate_holder(&self, holder: GateHolder) {
+        let Some(metrics) = self.metrics.as_ref() else {
+            return;
+        };
+        let mut labels = HashMap::new();
+        labels.insert("operation".to_string(), holder.as_operation().to_string());
+        if let Err(e) = metrics
+            .record_counter(cog_core::metric_names::MEMORY_OPERATIONS_TOTAL, 1.0, labels)
+            .await
+        {
+            warn!("Failed to record the pull gate holder: {}", e);
+        }
+    }
+
+    /// 把五个掌权者格子按 0 播种。与认领结局同一条理由：「这一路从来没掌过权」
+    /// 与「从来没发布过这一路」在只看得见已存在序列的查询里同形，而这两句要答的
+    /// 是不同的问题。
+    async fn seed_gate_holders(&self) {
+        let Some(metrics) = self.metrics.as_ref() else {
+            return;
+        };
+        for holder in GateHolder::ALL {
+            let mut labels = HashMap::new();
+            labels.insert("operation".to_string(), holder.as_operation().to_string());
+            if let Err(e) = metrics
+                .record_counter(cog_core::metric_names::MEMORY_OPERATIONS_TOTAL, 0.0, labels)
+                .await
+            {
+                warn!("Failed to seed the pull gate holder readings: {}", e);
+            }
+        }
+    }
+}
+
+impl SharedReading {
+    /// 快照那一路读到了东西没有。`NoSource`/`Silent` 之外都为真。
+    fn read_ok(self) -> bool {
+        matches!(self, SharedReading::Read { .. })
     }
 }
 
@@ -483,7 +654,7 @@ pub struct MemoryIngestor {
 impl MemoryIngestor {
     pub fn new(backend: Arc<dyn MemoryBackend>, extractor: Arc<dyn MemoryExtractor>) -> Self {
         let config = MemoryIngestorConfig::default();
-        let pull_gate = Arc::new(PullGate::new(None, &config));
+        let pull_gate = Arc::new(PullGate::new(None, &config, None));
         Self {
             backend,
             extractor,
@@ -494,14 +665,25 @@ impl MemoryIngestor {
         }
     }
 
-    /// 接上指标面，用来发布对账扫到的积压量。
+    /// 接上指标面，用来发布对账扫到的积压量与闸门掌权者。
     pub fn with_metrics(mut self, metrics: Arc<dyn cog_core::MetricsBackend>) -> Self {
+        // 闸门是独立于摄取器的对象，指标面接上后要把它一并重建，否则在后面
+        // 才建闸门的那条 builder 顺序里（没有池来源时）它会一直看不到指标面。
+        self.pull_gate = Arc::new(PullGate::new(
+            self.pull_gate.pool.clone(),
+            &self.config,
+            Some(metrics.clone()),
+        ));
         self.metrics = Some(metrics);
         self
     }
 
     pub fn with_config(mut self, config: MemoryIngestorConfig) -> Self {
-        self.pull_gate = Arc::new(PullGate::new(self.pull_gate.pool.clone(), &config));
+        self.pull_gate = Arc::new(PullGate::new(
+            self.pull_gate.pool.clone(),
+            &config,
+            self.metrics.clone(),
+        ));
         self.config = config;
         self
     }
@@ -512,7 +694,11 @@ impl MemoryIngestor {
         mut self,
         source: Arc<dyn cog_core::LlmPoolStatusSource>,
     ) -> Self {
-        self.pull_gate = Arc::new(PullGate::new(Some(source), &self.config));
+        self.pull_gate = Arc::new(PullGate::new(
+            Some(source),
+            &self.config,
+            self.metrics.clone(),
+        ));
         self
     }
 
@@ -544,6 +730,7 @@ impl MemoryIngestor {
 
         tokio::spawn(async move {
             info!("MemoryIngestor started");
+            inner.pull_gate.seed_gate_holders().await;
             if inner.config.startup_reconcile {
                 // 与周期对账同一条判据：扫描照跑（它是纯 SQL 加对象存储读，
                 // 产出的是积压量这个观测），闸门关着就只报不入队——往一个已知
@@ -695,6 +882,7 @@ impl MemoryIngestor {
 
         tokio::spawn(async move {
             info!("MemoryIngestor bus consumer started (channel={channel}, group={group})");
+            inner.pull_gate.seed_gate_holders().await;
             if inner.config.startup_reconcile {
                 // 同 quiescent 启动路径：扫描照跑，闸门关着只报不入队。
                 let upstream_available = inner.pull_gate.blocked_for().await.is_none();
@@ -1964,6 +2152,22 @@ mod tests {
         }
     }
 
+    /// 健康时**也**给出一份快照（`unavailable: false`）的池来源，与 [`TogglePool`]
+    /// 不同——后者健康时返回 `None`，而真实来源（网关）健康时键仍在、给的是
+    /// `Some`。要分辨「读到了、池可用」与「根本没读到」两格，测试替身必须能
+    /// 演出前者。
+    struct HealthyPool;
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmPoolStatusSource for HealthyPool {
+        async fn status(&self) -> Option<cog_core::LlmPoolStatus> {
+            Some(cog_core::LlmPoolStatus {
+                unavailable: false,
+                ..Default::default()
+            })
+        }
+    }
+
     /// 带可抽取实体的 raw：规则抽取器只认 `@entity:` 这类行，没有它 schema
     /// 层是空的，"已落库/缺失"就分不出来。
     fn entity_raw(id: &str) -> RawSource {
@@ -2698,6 +2902,149 @@ mod tests {
         );
     }
 
+    /// 闸门有两路输入（网关快照、本地退避），合成**一个**等待时长会把「哪一路
+    /// 在说停」抹掉。本地那一路此前没有任何自己的读数——退化到纯本地判据时只剩
+    /// 一行随进程消失的启动 warn，且那行只在**来源缺席**时打。这条回归钉住新读数
+    /// 把三件事分开：共享路掌权、本地路掌权、以及「快照那一路哑了、闸门开着」。
+    #[tokio::test]
+    async fn gate_holder_reading_names_which_path_is_in_power() {
+        let name = cog_core::metric_names::MEMORY_OPERATIONS_TOTAL.as_str();
+
+        // 没有池来源：快照那一路整个哑了，掌版权落在本地判据上、而它此刻说放行。
+        // 这正是旧读数面与「上游真的回来了」同形的那个窗口。
+        let metrics = Arc::new(RecordingMetrics::default());
+        let blind = MemoryIngestor::new(
+            Arc::new(MemoryMemoryBackend::new()),
+            Arc::new(UnreachableExtractor::new()),
+        )
+        .with_metrics(metrics.clone())
+        .with_config(quick_retry_config());
+        assert!(blind.pull_gate.blocked_for().await.is_none());
+        assert_eq!(
+            metrics.counter_total(name, PULL_GATE_BLIND_OPERATION),
+            Some(1.0),
+            "a missing source while the gate is open must read as blind, not as a healthy open"
+        );
+        assert_eq!(
+            metrics.counter_total(name, PULL_GATE_OPEN_OPERATION),
+            None,
+            "the healthy-open cell must stay unwritten while nothing was read"
+        );
+
+        // 池快照报不可用：共享路掌权。
+        let metrics = Arc::new(RecordingMetrics::default());
+        let shared = MemoryIngestor::new(
+            Arc::new(MemoryMemoryBackend::new()),
+            Arc::new(UnreachableExtractor::new()),
+        )
+        .with_metrics(metrics.clone())
+        .with_pool_status_source(Arc::new(TogglePool::new(
+            true,
+            chrono::Utc::now().timestamp() + 300,
+        )))
+        .with_config(MemoryIngestorConfig {
+            pool_check_secs: 1,
+            ..quick_retry_config()
+        });
+        assert!(shared.pull_gate.blocked_for().await.is_some());
+        assert_eq!(
+            metrics.counter_total(name, PULL_GATE_SHARED_OPERATION),
+            Some(1.0),
+            "a down snapshot must read as the shared path holding the gate"
+        );
+
+        // 池健康（给的是 Some 而非 None，与真实来源一致）：闸门开着且读到了快照。
+        let metrics = Arc::new(RecordingMetrics::default());
+        let open = MemoryIngestor::new(
+            Arc::new(MemoryMemoryBackend::new()),
+            Arc::new(UnreachableExtractor::new()),
+        )
+        .with_metrics(metrics.clone())
+        .with_pool_status_source(Arc::new(HealthyPool))
+        .with_config(MemoryIngestorConfig {
+            pool_check_secs: 1,
+            ..quick_retry_config()
+        });
+        assert!(open.pull_gate.blocked_for().await.is_none());
+        assert_eq!(
+            metrics.counter_total(name, PULL_GATE_OPEN_OPERATION),
+            Some(1.0),
+            "a healthy snapshot while the gate is open is the open cell, not the blind one"
+        );
+        assert_eq!(
+            metrics.counter_total(name, PULL_GATE_BLIND_OPERATION),
+            None,
+            "a read snapshot must never be filed as blind"
+        );
+
+        // 快照那一路哑了、本地退避说停：本地路掌权。走一次真实抽取把本地退避
+        // 抬起来——闸门此刻开着（快照缺席），所以抽取真的会撞墙。
+        let metrics = Arc::new(RecordingMetrics::default());
+        let local = MemoryIngestor::new(
+            Arc::new(MemoryMemoryBackend::new()),
+            Arc::new(UnreachableExtractor::new()),
+        )
+        .with_metrics(metrics.clone())
+        .with_config(quick_retry_config());
+        assert!(!local.process(transcript_raw("outage")).await);
+        assert!(local.pull_gate.blocked_for().await.is_some());
+        assert_eq!(
+            metrics.counter_total(name, PULL_GATE_LOCAL_OPERATION),
+            Some(1.0),
+            "the local backoff alone holding the gate is its own cell, not a silent fallback"
+        );
+
+        // 两路都要求：先池健康（闸门开）走一次抽取把本地退避抬起来，再把池掀翻。
+        let metrics = Arc::new(RecordingMetrics::default());
+        let pool = Arc::new(TogglePool::new(false, 0));
+        let both = MemoryIngestor::new(
+            Arc::new(MemoryMemoryBackend::new()),
+            Arc::new(UnreachableExtractor::new()),
+        )
+        .with_metrics(metrics.clone())
+        .with_pool_status_source(pool.clone())
+        .with_config(quick_retry_config());
+        assert!(!both.process(transcript_raw("outage")).await);
+        pool.set(true);
+        assert!(both.pull_gate.blocked_for().await.is_some());
+        assert_eq!(
+            metrics.counter_total(name, PULL_GATE_BOTH_OPERATION),
+            Some(1.0),
+            "both inputs demanding a pause is its own cell, not a duplicate of shared"
+        );
+    }
+
+    /// 掌权者合成的纯函数面：五格互不相同，且最要紧的那一对——「没读到快照、
+    /// 闸门开着」（blind）与「读到了、池可用、闸门开着」（open）——必须分开。
+    /// 旧读数正是把这两件事压成同一个 `None`。
+    #[test]
+    fn gate_holder_separates_a_silent_snapshot_from_a_healthy_one() {
+        assert_eq!(GateHolder::from_parts(true, true, true), GateHolder::Both);
+        assert_eq!(
+            GateHolder::from_parts(true, false, false),
+            GateHolder::Local
+        );
+        assert_eq!(
+            GateHolder::from_parts(true, false, true),
+            GateHolder::Local,
+            "a read-but-available snapshot plus a local pause is still only the local path holding"
+        );
+        assert_eq!(
+            GateHolder::from_parts(false, true, true),
+            GateHolder::Shared
+        );
+        assert_eq!(GateHolder::from_parts(false, false, true), GateHolder::Open);
+        assert_eq!(
+            GateHolder::from_parts(false, false, false),
+            GateHolder::Blind
+        );
+        assert_ne!(
+            GateHolder::from_parts(false, false, true),
+            GateHolder::from_parts(false, false, false),
+            "reading a healthy snapshot and reading nothing must not collapse to one state"
+        );
+    }
+
     /// 恢复时刻可能远在几天之后，也可能因为上游说法不一致而不准：等待时长
     /// 必须封顶，睡死了就错过恢复。时刻已过则是"恢复点未知"而不是"马上就好"，
     /// 按常规复查节拍重判；给 1 秒会让闸门每秒去读一份什么都没变的快照。
@@ -2711,7 +3058,7 @@ mod tests {
             pull_resume_observation_secs: 0,
             ..Default::default()
         };
-        let gate = PullGate::new(None, &config);
+        let gate = PullGate::new(None, &config, None);
         let now = chrono::Utc::now().timestamp();
 
         assert_eq!(
@@ -2786,7 +3133,7 @@ mod tests {
             pull_resume_observation_secs: 300,
             ..Default::default()
         };
-        let gate = PullGate::new(None, &config);
+        let gate = PullGate::new(None, &config, None);
         let now = chrono::Utc::now().timestamp();
 
         assert_eq!(
@@ -2841,6 +3188,7 @@ mod tests {
                 pool_check_secs: 300,
                 ..quick_retry_config()
             },
+            None,
         );
 
         let first = gate.blocked_for().await;
