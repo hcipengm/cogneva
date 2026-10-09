@@ -1619,10 +1619,6 @@ const UNREAD: &[(&str, Unread)] = &[
         },
     ),
     (
-        "memory_operations_total",
-        Unread::Gap("memory backend operation volume; the instrumented facade's own comment says the counter is diluted by the archive housekeeping loop, so a rate threshold would track that loop rather than demand"),
-    ),
-    (
         "memory_operation_latency_ms",
         Unread::Gap("memory backend operation latency; no latency bound is declared anywhere in the repository to hang a threshold on"),
     ),
@@ -1731,38 +1727,6 @@ const UNREAD: &[(&str, Unread)] = &[
         "cogneva_landing_ci_failure_inherited_total",
         Unread::Gap("landings whose red verdict was traced to the commit they were replayed onto rather than to the change, so the change was kept instead of reverted. The underlying condition -- the base branch's tip is red -- is what mainline_ci_verdict_failed reads, but this series does not carry that fact: it carries the non-action taken because of it, and that warn line names the change and the checks it passed through. A rule would have to declare how many spared landings are a fault, which is a bound on how long the branch may stay red while landings keep landing: a policy nobody stated, so the missing half is a bound rather than a reader"),
     ),
-    (
-        "baseline_port_tick_failed",
-        Unread::Gap("the baseline port trigger's per-round outcome, written every round. The reading landed because the whole outcome path had no reader at all: the trigger is on a supervised cadence, so its liveness is read, but a round that failed and a round with nothing to port were the same picture -- the failure went to a log line that dies with the pod, and an execute failure was even swallowed back into Ok so the round read as a success. What is still missing is a rule, and a rule here would have to say how many failed rounds in a window are a fault, which is a threshold on a loop that polls hourly and retries on a cooldown: a policy nobody declared. Writing that rule is also an alert-rule change, which needs sign-off before it lands, so the reading ships with its debt recorded rather than left absent"),
-    ),
-    (
-        "cogneva_partition_maintenance_failures_total",
-        Unread::Gap("the monthly partition maintenance loop's per-round outcome, one cell per cause. The whole path had no reading at all before this pass: the loop is on a supervised cadence, so its liveness is read, but a step that failed and a table whose DEFAULT partition was found holding rows went to log lines that die with the pod -- and a DEFAULT count that could not be read was indistinguishable from one that came back zero. What is still missing is a rule, and a rule here would have to say how many shortfalls in a window are a fault and whether window_behind (the window fell behind, rows are outside every open range) is the same fault as a refused CREATE or a count that could not be read. That is a threshold and a policy on a loop that runs hourly: nobody declared either. Every adjacent gap in this family was closed by writing a rule, and writing one is an alert-rule change, which needs sign-off before it lands, so the reading ships with its debt recorded rather than left absent"),
-    ),
-    (
-        "cogneva_policy_evolution_rounds_total",
-        Unread::Gap("how each round of the artifact-level evolution search ended, one cell per outcome. The whole path had no reading at all before this pass: the loop beats every cycle, so its liveness is read, but which of the round's ends was reached went only to a log line that dies with the pod -- adopting a new policy version, finding no better candidate, having too little evidence to compare, and failing outright all read the same. The module's own note not to read the per-round INFO as the chain running is the guarantee stated in prose with nothing behind it. What is still missing is a rule, and a rule here would have to say how many failed rounds in a window are a fault, and whether a flat adopted cell is itself the fault (the search awake but never learning) or the healthy state of a loop that legitimately has nothing better to adopt -- a policy on a loop that runs hourly, which nobody declared. Writing that rule is an alert-rule change, which needs sign-off before it lands, so the reading ships with its debt recorded rather than left absent"),
-    ),
-    (
-        "cogneva_analytics_flush_total",
-        Unread::Gap("events carried by each flush of the analytics event buffer, one cell per outcome. The whole path had no reading at all before this pass: the flush loop beats every flush interval, so its liveness is read, but delivering a batch to ClickHouse and failing to ship one read the same -- and a failure is a loss rather than a retry, because the insert consumes the batch and nothing sends it again, so the events were gone and only a log line that dies with the pod recorded it. What is still missing is a rule, and a rule here would have to say how many lost events in a window are a fault, which is a threshold on a flush loop: a policy nobody declared. Writing that rule is an alert-rule change, which needs sign-off before it lands, so the reading ships with its debt recorded rather than left absent"),
-    ),
-    (
-        "cogneva_memory_schema_repair_total",
-        Unread::Gap("how each round of the memory schema repair loop ended, one cell per outcome. The whole path had no reading at all before this pass: the loop beats every repair interval, so its liveness is read, but a round that returned an error and a round that found no orphan read the same -- and the failed round was a warn line that dies with the pod. This is the loop that exists to make a silent loss visible (an archived entry whose derived layer never landed is unreachable by search and nothing reports it), so its own failure being silent was the same shape one level up. What is still missing is a rule, and a rule here would have to say how many failed rounds in a window are a fault, and whether a run of unrepairable rounds is the same fault as a failed one -- the first is a permanent loss that re-surfaces every round and needs a human, the second is the repair path itself being down. That is a policy and a threshold on a loop that runs every repair interval: nobody declared either. Writing that rule is an alert-rule change, which needs sign-off before it lands, so the reading ships with its debt recorded rather than left absent"),
-    ),
-    (
-        "cogneva_skill_hot_reload_total",
-        Unread::Gap("how each round of the skill hot-reload loop ended, one cell per outcome. The whole path had no reading at all before this pass: the loop beats every poll interval, so its liveness is read, but a round that could not scan the skill directories at all and a round that scanned them and found nothing to do read the same -- and the failed round was a warn line that dies with the pod. The silent end is the one that matters for this loop: a skill file that fails to load leaves the previously cached definition serving, so an edit that never took effect and a skill nobody edited were the same picture, which is exactly the state the loop exists to end. What is still missing is a rule, and a rule here would have to say how many failed scans in a window are a fault, and whether a persistent reload_failed cell is the same fault as a failed one -- the first is one broken file on disk that re-surfaces every round, the second is the loop not looking at the disk at all, and they want different answers. That is a policy and a threshold on a loop that polls every hot-reload interval: nobody declared either. Writing that rule is an alert-rule change, which needs sign-off before it lands, so the reading ships with its debt recorded rather than left absent"),
-    ),
-    (
-        "cogneva_loki_flush_total",
-        Unread::Gap("how each log-flush of the Loki background pusher ended, one cell per outcome, the cell's value being the entry count that batch carried. The whole path had no reading at all before this pass: the loop beats every flush interval, so its liveness is read, but a push that failed every round and a buffer that was simply empty read the same -- and the failed push was a warn line that dies with the pod. The silent end is the one that matters for this loop: a failed push consumed the batch, so those logs are lost and nothing sends them again, which makes the delivery and the loss the same picture one level up. Both triggers -- the batch-size one and the interval one -- go through the same push, so one series covers the whole path. What is still missing is a rule, and a rule here would have to say how many failed flushes in a window are a fault, and whether a gateway that is merely quiet is the same as one whose logs are being dropped. That is a policy and a threshold on a loop that flushes every loki flush interval: nobody declared either. Writing that rule is an alert-rule change, which needs sign-off before it lands, so the reading ships with its debt recorded rather than left absent"),
-    ),
-    (
-        "cogneva_supervisor_pass_total",
-        Unread::Gap("how each pass of the supervisor loop ended, one cell per pass per outcome. The six passes had no reading of their own before this one: each failure left only a warn line that dies with the pod, and the loop's only other reading is a beat driven by the shortest of the six intervals, so a pass that could not run at all and a pass with nothing to do read the same, and an arm that stopped firing stayed invisible behind a beat the other five kept stamping. What is still missing is a rule, and a rule here would have to say how many failed passes in a window are a fault for a pass that runs on its own cadence -- health is seconds, rebalance is minutes -- so a single threshold would either miss the fast arm or fire on the slow one's ordinary gaps, and it would have to say whether a flat ok cell is a starved arm or a pass with genuinely nothing to do. That is a per-pass policy and threshold on a loop whose arms run at different rates: nobody declared any of it, and the arms report no cadence of their own beyond the values here. Writing that rule is an alert-rule change, which needs sign-off before it lands, so the reading ships with its debt recorded rather than left absent"),
-    ),
 ];
 
 /// Entries an `Elsewhere` reader claim cannot be resolved against.
@@ -1800,7 +1764,35 @@ fn unresolved_readers(read: &BTreeSet<String>, name: &str, readers: &[&str]) -> 
 /// and the window is a multiple of the loop's own declared period. The entry
 /// left the table in the pass that wrote `memory_decay_passes_all_failed`, so
 /// 30 became 29.
-const GAPS_AT_CENSUS: usize = 29;
+///
+/// It came down to 21 when eight more entries of the same family left the table
+/// in one pass. Every one of them said the missing piece was a rule, and every
+/// one of them gave an alert-rule change as the reason it was deferred rather
+/// than done -- which is a cost, not a judgement about the reading. The shape
+/// the family already uses settles the same question each of them asked, and
+/// where a counter carries no healthy cell to pair against (the partition
+/// maintenance shortfall count, the baseline port's 0-or-1 gauge) the shape is
+/// the one that counter can actually support rather than the one its siblings
+/// use. Two of the eight carry a second fault cell beside the loop being down
+/// -- `unrepairable` and `reload_failed` -- and those got their own rules,
+/// because the all-failed right side would have counted a run of them as a
+/// healthy loop. The supervisor's six arms became five rules, one per arm that
+/// can report a failure; the autonomous arm is absent on purpose, since its
+/// producer records every pass as ok by construction and a rule over it could
+/// never fire. So 29 became 21.
+///
+/// It came down to 20 in the same pass, for the memory bus claim loop's
+/// `memory_operations_total` entry. That entry was filed against the metric
+/// name, and its reason was about the whole family: the instrumented facade
+/// folds every backend operation into the same counter, so a threshold on the
+/// name would track the archive housekeeping loop rather than the demand it was
+/// meant to measure. What the claim loop added is not volume but a closed set of
+/// per-round outcomes on three `operation` values the housekeeping loop never
+/// writes -- exactly one of `bus_claim`, `bus_claim_held` and
+/// `bus_claim_failed` per round -- and that subset is thresholdable without
+/// touching the diluted whole. So the loop gets an all-failed rule and the
+/// name-level entry leaves. So 21 became 20.
+const GAPS_AT_CENSUS: usize = 20;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {
