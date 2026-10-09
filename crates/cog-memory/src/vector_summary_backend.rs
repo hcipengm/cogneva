@@ -339,9 +339,20 @@ impl SummaryBackend for VectorSummaryBackend {
                     .as_ref()
                     .is_none_or(|(start, end)| e.generated_at >= *start && e.generated_at <= *end)
             }) {
-                out.push(SummarySearchResult::new(entry.clone(), vr.score));
+                out.push(SummarySearchResult::new(
+                    entry.clone(),
+                    cog_core::importance_weighted_score(vr.score, entry.importance),
+                ));
             }
         }
+        // The vector store ranked this candidate set by raw similarity; the
+        // importance weight can re-order it, so the recalled set is ranked again
+        // by the weighted score before it is returned.
+        out.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         Ok(out)
     }
 
@@ -420,9 +431,20 @@ impl SummaryBackend for VectorSummaryBackend {
                     .as_ref()
                     .is_none_or(|(start, end)| e.generated_at >= *start && e.generated_at <= *end)
             }) {
-                out.push(SummarySearchResult::new(entry.clone(), vr.score));
+                out.push(SummarySearchResult::new(
+                    entry.clone(),
+                    cog_core::importance_weighted_score(vr.score, entry.importance),
+                ));
             }
         }
+        // The vector store ranked this candidate set by raw similarity; the
+        // importance weight can re-order it, so the recalled set is ranked again
+        // by the weighted score before it is returned.
+        out.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         Ok(out)
     }
 

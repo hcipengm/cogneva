@@ -29,6 +29,29 @@ pub fn importance_from_rating(rating: u8) -> f32 {
     rating.clamp(1, IMPORTANCE_RATING_MAX) as f32 / IMPORTANCE_RATING_MAX as f32
 }
 
+/// The score a summary search ranks by: raw similarity scaled by the entry's
+/// importance.
+///
+/// Importance is the one field both producers share (see
+/// [`IMPORTANCE_RATING_MAX`]) and the field decay demotes over time. Folding it
+/// into the ranking is what turns decay into a *fade*: a demoted entry sinks in
+/// search as its importance drops, instead of holding its place until the
+/// archive floor removes it in one step. Without it the only way a low-value
+/// memory leaves the results is by disappearing entirely.
+///
+/// `similarity` is a cosine in `-1.0..=1.0`. A non-positive value says "not
+/// related to this query", and importance must not lift such an entry by
+/// scaling a negative number toward zero — the clamp maps the whole
+/// anti-correlated half to `0.0`, so importance can only ever *demote* within
+/// the related half, never promote the unrelated half. Because importance is a
+/// pure multiplier, entries of equal importance keep their similarity order:
+/// the weighted ranking only re-orders entries whose importance differs.
+pub fn importance_weighted_score(similarity: f32, importance: f32) -> f32 {
+    // `f32::max` returns the non-NaN operand, so a NaN similarity becomes 0.0
+    // rather than propagating a NaN score into every downstream comparison.
+    similarity.max(0.0) * importance
+}
+
 /// A pointer back to the raw source that produced a schema or summary entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SourceRef {
@@ -473,6 +496,10 @@ pub enum MatchType {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SummarySearchResult {
     pub entry: SummaryEntry,
+    /// The ranking score, in `0.0..=1.0`: similarity scaled by the entry's
+    /// importance via [`importance_weighted_score`]. Not the raw cosine — an
+    /// entry's score is what it was *ranked* by, so the returned order and the
+    /// scores always agree.
     pub score: f32,
     pub match_type: MatchType,
     pub highlights: Vec<String>,
@@ -791,6 +818,33 @@ mod tests {
     fn an_out_of_range_rating_is_clamped_into_the_scale() {
         assert_eq!(importance_from_rating(0), 0.1);
         assert_eq!(importance_from_rating(200), 1.0);
+    }
+
+    #[test]
+    fn equal_importance_keeps_the_similarity_order() {
+        // Importance is a pure multiplier, so at a fixed importance it can only
+        // rescale — never reorder — the similarity ranking.
+        assert!(importance_weighted_score(0.9, 0.5) > importance_weighted_score(0.8, 0.5));
+        assert!(importance_weighted_score(0.8, 0.5) > importance_weighted_score(0.7, 0.5));
+    }
+
+    #[test]
+    fn importance_breaks_a_similarity_tie_and_demotes_a_near_match() {
+        // Same similarity, different importance: the higher one wins.
+        assert!(importance_weighted_score(0.9, 0.9) > importance_weighted_score(0.9, 0.5));
+        // The point of the weight: a more-similar but low-value entry sinks
+        // below a less-similar but high-value one.
+        assert!(importance_weighted_score(0.95, 0.1) < importance_weighted_score(0.80, 1.0));
+    }
+
+    #[test]
+    fn importance_cannot_promote_an_anti_correlated_entry() {
+        // A negative cosine says "unrelated"; scaling it by importance must not
+        // lift it toward the related half. The clamp maps it to 0.0 for every
+        // importance, so it can never outrank a genuinely related entry.
+        assert_eq!(importance_weighted_score(-0.3, 1.0), 0.0);
+        assert_eq!(importance_weighted_score(-0.3, 0.1), 0.0);
+        assert!(importance_weighted_score(-0.3, 1.0) < importance_weighted_score(0.05, 0.1));
     }
 
     #[test]

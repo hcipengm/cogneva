@@ -337,9 +337,13 @@ impl SchemaBackend for PostgresSchemaBackend {
         limit: usize,
     ) -> SFResult<Vec<SchemaSearchResult>> {
         let pattern = format!("%{}%", query);
+        // Substring hits all score 1.0 on similarity, so importance is the only
+        // ranking signal; ordering in SQL (not after the LIMIT) is what makes the
+        // truncation keep the higher-rated facts rather than an arbitrary subset.
         let sql = format!(
             "SELECT {ENTRY_COLUMNS} FROM schema_entries \
              WHERE namespace = $1 AND (name ILIKE $2 OR key ILIKE $2) \
+             ORDER BY importance DESC \
              LIMIT $3"
         );
         let rows = sqlx::query(&sql)
@@ -353,7 +357,8 @@ impl SchemaBackend for PostgresSchemaBackend {
         let mut results = Vec::with_capacity(rows.len());
         for row in &rows {
             let entry = Self::row_to_entry(row)?;
-            results.push(SchemaSearchResult { entry, score: 1.0 });
+            let score = cog_core::importance_weighted_score(1.0, entry.importance);
+            results.push(SchemaSearchResult { entry, score });
         }
         Ok(results)
     }

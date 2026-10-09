@@ -416,7 +416,7 @@ impl MemoryBackend for CompositeMemoryBackend {
             results.extend(summaries.into_iter().map(UnifiedSearchResult::Summary));
         } else {
             let query_lower = query.to_lowercase();
-            let summary_results: Vec<UnifiedSearchResult> = self
+            let mut summary_results: Vec<UnifiedSearchResult> = self
                 .summary
                 .list_summary(namespace)
                 .await?
@@ -427,8 +427,27 @@ impl MemoryBackend for CompositeMemoryBackend {
                             e.generated_at >= *start && e.generated_at <= *end
                         })
                 })
-                .map(|e| UnifiedSearchResult::Summary(SummarySearchResult::new(e, 1.0)))
+                .map(|e| {
+                    let score = cog_core::importance_weighted_score(1.0, e.importance);
+                    UnifiedSearchResult::Summary(SummarySearchResult::new(e, score))
+                })
                 .collect();
+            // No embedder: every candidate is a substring hit, so importance is
+            // the only ordering signal — the same prior the dense branch gets
+            // from the weighted summary search.
+            summary_results.sort_by(|a, b| {
+                let score_a = match a {
+                    UnifiedSearchResult::Summary(s) => s.score,
+                    _ => 0.0,
+                };
+                let score_b = match b {
+                    UnifiedSearchResult::Summary(s) => s.score,
+                    _ => 0.0,
+                };
+                score_b
+                    .partial_cmp(&score_a)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             results.extend(summary_results);
         }
 

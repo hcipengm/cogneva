@@ -155,9 +155,17 @@ impl SchemaBackend for MemorySchemaBackend {
             })
             .map(|e| SchemaSearchResult {
                 entry: e.clone(),
-                score: 1.0,
+                score: cog_core::importance_weighted_score(1.0, e.importance),
             })
             .collect();
+        // Substring hits all have similarity 1.0, so the importance weight is
+        // what orders them — matching the in-memory backend and the summary
+        // ranking — and it replaces map iteration order with a defined one.
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(limit);
         Ok(results)
     }
