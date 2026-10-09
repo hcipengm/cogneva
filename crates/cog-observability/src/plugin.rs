@@ -89,6 +89,45 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         } else {
             crate::LogFormat::Pretty
         };
+
+        // Loki mirroring is a tracing layer, and a global subscriber can be
+        // installed only once, so the pusher that layer feeds has to exist
+        // before the subscriber does. Building it after the install (as this
+        // plugin used to) left the pusher published but never fed and its flush
+        // loop never started: the app-side logs never left the process, while
+        // the plugin logged that the pusher was published.
+        let loki_service = observability.jaeger.service_name.clone();
+        let loki_pusher = if !observability.loki.enabled {
+            None
+        } else if observability.jaeger.enabled {
+            warn!(
+                "loki and jaeger are both enabled; the jaeger initializer owns the \
+                 subscriber, so the Loki log mirror is skipped"
+            );
+            None
+        } else {
+            let client = Arc::new(
+                crate::logs::LokiPushClient::new(&observability.loki.endpoint)
+                    .with_max_retries(observability.loki.max_retries.max(1))
+                    .with_timeout(observability.loki.timeout_secs)
+                    .with_label("service", &loki_service)
+                    .with_client(http_client.clone()),
+            );
+            let pusher = Arc::new(crate::logs::LokiBackgroundPusher::new(
+                client.clone(),
+                std::time::Duration::from_secs(observability.loki.flush_interval_sec.max(1)),
+                observability.loki.max_batch_size.max(1),
+            ));
+            // Same sink the ClickHouse buffer below takes: this plugin's init
+            // runs after the storage plugin has published the backend, so the
+            // handle is here and the pusher can report a batch it could not
+            // deliver.
+            pusher.set_metrics(ctx.consume_service::<dyn cog_core::MetricsBackend>());
+            ctx.publish(client.clone());
+            ctx.publish(pusher.clone());
+            Some(pusher)
+        };
+
         let (jaeger_exporter, log_filter_handle) = if observability.jaeger.enabled {
             let exporter = crate::jaeger::init_jaeger_subscriber(
                 &observability.jaeger.endpoint,
@@ -99,9 +138,20 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             );
             (Some(exporter), None)
         } else {
-            let handle = crate::init_subscriber(&log_level, log_format);
+            let handle = crate::logs::init_subscriber_with_pusher(
+                &log_level,
+                log_format,
+                loki_pusher.clone(),
+                &loki_service,
+            );
             (None, Some(handle))
         };
+        // Started only after the sink above was set, so the loop never runs a
+        // round it cannot record.
+        if let Some(pusher) = loki_pusher.clone() {
+            drop(pusher.run_loop());
+            info!("ObservabilityPlugin Loki client + pusher published and flushing");
+        }
         if let Some(handle) = log_filter_handle {
             ctx.publish(Arc::new(LogFilterHandleHolder(handle)));
             info!("ObservabilityPlugin LogFilterHandle published");
@@ -149,27 +199,10 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         }
 
         // ── Loki ──
-        if observability.loki.enabled {
-            let client = crate::logs::LokiPushClient::new(&observability.loki.endpoint)
-                .with_max_retries(observability.loki.max_retries)
-                .with_timeout(observability.loki.timeout_secs)
-                .with_label("service", &observability.jaeger.service_name)
-                .with_client(http_client.clone());
-            let client = Arc::new(client);
-            let pusher = Arc::new(crate::logs::LokiBackgroundPusher::new(
-                client.clone(),
-                std::time::Duration::from_secs(observability.loki.flush_interval_sec),
-                observability.loki.max_batch_size,
-            ));
-            // Same sink the ClickHouse buffer above takes: this plugin's init
-            // runs after the storage plugin has published the backend, so the
-            // handle is here and the pusher can report a batch it could not
-            // deliver.
-            pusher.set_metrics(ctx.consume_service::<dyn cog_core::MetricsBackend>());
-            ctx.publish(client.clone());
-            ctx.publish(pusher.clone());
-            info!("ObservabilityPlugin Loki client + pusher published");
-        } else {
+        // The client + pusher are built next to the subscriber, because the
+        // tracing layer that feeds the pusher has to be in place before the
+        // subscriber is installed. See the subscriber block above.
+        if !observability.loki.enabled {
             info!("Loki push client disabled by config");
         }
 

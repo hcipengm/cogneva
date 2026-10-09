@@ -1034,6 +1034,300 @@ fn word_before(s: &str, end: usize) -> Option<(usize, &str)> {
     Some((start, &s[start..e]))
 }
 
+/// A rule whose guard cannot clear: the half that guards reads a superset of the
+/// windows the half it guards reads, on the same counter.
+///
+/// The shape is `L unless on () R`, where both `L` and `R` are "this counter moved
+/// off zero over the window". `unless` drops every `L` that has a matching `R`, and
+/// an empty `on ()` list matches everything, so the rule reports nothing whenever
+/// `R` has any series at all. If everything `L` selects is also selected by `R`,
+/// then `R` is non-empty whenever the fault is real, and the rule can never report
+/// it. Negated selectors are the usual way in: with a closed outcome set
+/// `{delivered, failed}`, `outcome!="delivered"` selects the same series as
+/// `outcome="failed"`, and the two halves become one expression written twice.
+///
+/// A pair whose guard is narrower than what it guards -- `outcome!="failed"` over
+/// `outcome="failed"`, which is this family's healthy shape -- is left alone,
+/// because then there is a series the fault lives on and the guard does not.
+pub fn self_suppressing_guard_complaints(expr: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (left, right) in fleet_folded_pairs(expr) {
+        for l in zero_compared_counter_reads(&left) {
+            for r in zero_compared_counter_reads(&right) {
+                if l.name != r.name || !widens(&l, &r) {
+                    continue;
+                }
+                out.push(format!(
+                    "守卫那一半 `{}` 读的每一格，被守卫的那一半 `{}` 也读：`unless on ()` 又是全匹配，\
+                     于是守卫只在「被守卫的那格非零」时才沉默——这条规则在它自己写明的故障里是哑的",
+                    r.render(),
+                    l.render()
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// The operand pairs joined by `and`/`unless` with an empty `on ()` list.
+///
+/// Only the fleet-folding form is collected: `on ()` merges every series on both
+/// sides into one, so whatever label the two halves were distinguished by is gone
+/// by the time `unless` compares them.
+fn fleet_folded_pairs(expr: &str) -> Vec<(String, String)> {
+    let bytes = expr.as_bytes();
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if depth == 0 && (i == 0 || !token_char(bytes[i - 1])) {
+            for word in ["unless", "and"] {
+                if !expr[i..].starts_with(word) {
+                    continue;
+                }
+                let after = i + word.len();
+                if after < bytes.len() && token_char(bytes[after]) {
+                    continue;
+                }
+                let Some(operand_start) = empty_on_list_end(expr, after) else {
+                    continue;
+                };
+                out.push((expr[..i].to_string(), expr[operand_start..].to_string()));
+                i = operand_start;
+                break;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Where the right operand starts, if `from` is followed by an empty `on ()` list.
+fn empty_on_list_end(expr: &str, from: usize) -> Option<usize> {
+    let bytes = expr.as_bytes();
+    let mut i = from;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if !expr[i..].starts_with("on") {
+        return None;
+    }
+    let after = i + 2;
+    if after < bytes.len() && token_char(bytes[after]) {
+        return None;
+    }
+    let mut open = after;
+    while open < bytes.len() && bytes[open].is_ascii_whitespace() {
+        open += 1;
+    }
+    if open >= bytes.len() || bytes[open] != b'(' {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut k = open;
+    while k < bytes.len() {
+        match bytes[k] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    if k >= bytes.len() || !expr[open + 1..k].trim().is_empty() {
+        return None;
+    }
+    Some(k + 1)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MatchOp {
+    Eq,
+    Ne,
+}
+
+/// A windowed read of one counter, as `name{matchers}[window]`.
+struct CounterRead {
+    name: String,
+    /// `(key, op, value)` for every `=`/`!=` matcher.
+    equalities: Vec<(String, MatchOp, String)>,
+    /// Set when the selector carried a matcher we cannot read -- a regex, or a
+    /// piece with no operator. Such a read might be selecting less than it looks,
+    /// so it never counts as a guard that widens over the other half.
+    opaque: bool,
+}
+
+impl CounterRead {
+    fn render(&self) -> String {
+        let mut s = self.name.clone();
+        s.push('{');
+        for (n, (k, op, v)) in self.equalities.iter().enumerate() {
+            if n > 0 {
+                s.push(',');
+            }
+            s.push_str(k);
+            s.push_str(match op {
+                MatchOp::Eq => "=",
+                MatchOp::Ne => "!=",
+            });
+            s.push('"');
+            s.push_str(v);
+            s.push('"');
+        }
+        s.push('}');
+        s
+    }
+}
+
+/// The counter reads in `clause` that are windowed and compared against zero.
+///
+/// Both halves of a `> 0` guard have this shape, which is what keeps the check
+/// off ratios and off rules whose two halves read different things on purpose.
+fn zero_compared_counter_reads(clause: &str) -> Vec<CounterRead> {
+    if !compares_against_zero(clause) {
+        return Vec::new();
+    }
+    let bytes = clause.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'{' {
+            i += 1;
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut k = i;
+        while k < bytes.len() {
+            match bytes[k] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+        if k >= bytes.len() {
+            break;
+        }
+        let Some((_, name)) = word_before(clause, i) else {
+            i = k + 1;
+            continue;
+        };
+        let mut after = k + 1;
+        while after < bytes.len() && bytes[after].is_ascii_whitespace() {
+            after += 1;
+        }
+        if after < bytes.len() && bytes[after] == b'[' && !NOT_SERIES.contains(&name) {
+            let (equalities, opaque) = parse_equalities(&clause[i + 1..k]);
+            out.push(CounterRead {
+                name: name.to_string(),
+                equalities,
+                opaque,
+            });
+        }
+        i = k + 1;
+    }
+    out
+}
+
+/// Whether the clause compares something against the literal zero.
+fn compares_against_zero(clause: &str) -> bool {
+    let bytes = clause.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'>' {
+            let mut j = i + 1;
+            if j < bytes.len() && bytes[j] == b'=' {
+                j += 1;
+            }
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len()
+                && bytes[j] == b'0'
+                && (j + 1 >= bytes.len() || !token_char(bytes[j + 1]))
+            {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// The `=`/`!=` matchers in the body of a selector, and whether anything in it
+/// could not be read: regex matchers, which say neither equality nor inequality,
+/// and any piece with no operator at all.
+fn parse_equalities(body: &str) -> (Vec<(String, MatchOp, String)>, bool) {
+    let mut out = Vec::new();
+    let mut opaque = false;
+    for piece in body.split(',') {
+        let piece = piece.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        let found = [
+            ("=~", None),
+            ("!~", None),
+            ("!=", Some(MatchOp::Ne)),
+            ("=", Some(MatchOp::Eq)),
+        ]
+        .iter()
+        .find_map(|(needle, op)| piece.find(needle).map(|at| (at, *op, needle.len())));
+        let (at, op, len) = match found {
+            Some((at, Some(op), len)) => (at, op, len),
+            _ => {
+                opaque = true;
+                continue;
+            }
+        };
+        let key = piece[..at].trim();
+        let value = piece[at + len..].trim().trim_matches('"');
+        if key.is_empty() {
+            opaque = true;
+        } else {
+            out.push((key.to_string(), op, value.to_string()));
+        }
+    }
+    (out, opaque)
+}
+
+/// Whether the guard half reads every series the guarded half reads.
+///
+/// A guard constrains a label key the other half leaves alone, or constrains it
+/// differently, and there is a series the fault lives on that the guard never
+/// looks at -- so the guard can clear. It only widens when each of its matchers
+/// is implied by one of the other half's, key by key.
+fn widens(guarded: &CounterRead, guard: &CounterRead) -> bool {
+    if guard.opaque {
+        return false;
+    }
+    guard.equalities.iter().all(|(gk, gop, gv)| {
+        guarded.equalities.iter().any(|(nk, nop, nv)| {
+            nk == gk
+                && match (nop, gop) {
+                    (MatchOp::Eq, MatchOp::Eq) => nv == gv,
+                    (MatchOp::Eq, MatchOp::Ne) => nv != gv,
+                    (MatchOp::Ne, MatchOp::Ne) => nv == gv,
+                    (MatchOp::Ne, MatchOp::Eq) => false,
+                }
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1459,5 +1753,93 @@ mod tests {
             None
         );
         assert_eq!(companion_age_bound("max_over_time(x[30m]) > 0", "x"), None);
+    }
+
+    /// The shape that shipped twice: `outcome!="delivered"` on a closed set of
+    /// `{delivered, failed}` names the same series as `outcome="failed"`, and the
+    /// empty `on ()` matches everything, so the guard swallows its own fault.
+    #[test]
+    fn a_guard_reading_the_series_it_guards_is_reported() {
+        let shipped = "(max without (pod, container, instance, job) \
+             (increase(cogneva_loki_flush_total{outcome=\"failed\"}[5m])) > 0) \
+             unless on () (max without (pod, container, instance, job) \
+             (increase(cogneva_loki_flush_total{outcome!=\"delivered\"}[5m])) > 0)";
+        assert_eq!(self_suppressing_guard_complaints(shipped).len(), 1);
+        // Spacing and the `and` form are read the same way.
+        let spread = "sum(x_total{outcome=\"failed\"}[1m])>0 and on() sum(x_total{outcome!=\"delivered\"}[1m])>0";
+        assert_eq!(self_suppressing_guard_complaints(spread).len(), 1);
+        // A guard that constrains nothing at all widens over anything the other
+        // half narrows to.
+        assert_eq!(
+            self_suppressing_guard_complaints(
+                "(sum(x_total{outcome=\"failed\"}[5m]) > 0) \
+                 unless on () (sum(x_total{}[5m]) > 0)"
+            )
+            .len(),
+            1
+        );
+    }
+
+    /// Everything a real rule does differently has to keep it quiet.
+    #[test]
+    fn only_the_fleet_folded_same_series_pair_is_reported() {
+        // A label key separates the two halves: the guard can stay silent.
+        assert!(self_suppressing_guard_complaints(
+            "(sum(x_total{outcome=\"failed\"}[5m]) > 0) \
+             unless on () (sum(x_total{outcome=\"retry\"}[5m]) > 0)"
+        )
+        .is_empty());
+        // A key equal-and-not-equal pair is a real separation too.
+        assert!(self_suppressing_guard_complaints(
+            "(sum(x_total{outcome=\"failed\"}[5m]) > 0) \
+             unless on () (sum(x_total{outcome!=\"failed\"}[5m]) > 0)"
+        )
+        .is_empty());
+        // A key the guard constrains and the fault half does not is still a way
+        // out: the fault can live on a series the guard never looks at.
+        assert!(self_suppressing_guard_complaints(
+            "(sum(x_total{outcome=\"failed\"}[5m]) > 0) \
+             unless on () (sum(x_total{shard!=\"a\"}[5m]) > 0)"
+        )
+        .is_empty());
+        // A regex the guard selects on is not readable as equality, so the two
+        // halves are never claimed to be the same series.
+        assert!(self_suppressing_guard_complaints(
+            "(sum(x_total{outcome=\"failed\"}[5m]) > 0) \
+             unless on () (sum(x_total{outcome=~\"failed|retry\"}[5m]) > 0)"
+        )
+        .is_empty());
+        // A non-empty `on ()` list keeps the halves apart by construction.
+        assert!(self_suppressing_guard_complaints(
+            "(sum(x_total{outcome=\"failed\"}[5m]) > 0) \
+             unless on (pod) (sum(x_total{outcome!=\"delivered\"}[5m]) > 0)"
+        )
+        .is_empty());
+        // Different counters.
+        assert!(self_suppressing_guard_complaints(
+            "(sum(x_total{outcome=\"failed\"}[5m]) > 0) \
+             unless on () (sum(y_total{outcome!=\"delivered\"}[5m]) > 0)"
+        )
+        .is_empty());
+        // The guard half is not "moved off zero": a frozen counter is the fault,
+        // so the pair is not this shape.
+        assert!(self_suppressing_guard_complaints(
+            "(sum(x_total{outcome=\"failed\"}[5m]) > 0) \
+             unless on () (sum(x_total{outcome=\"failed\"}[5m]) < 1)"
+        )
+        .is_empty());
+        // The guarded half is not windowed at all.
+        assert!(self_suppressing_guard_complaints(
+            "(sum(x_total{outcome=\"failed\"}[5m]) > 0) \
+             unless on () (sum(x_total{outcome!=\"delivered\"}) > 0)"
+        )
+        .is_empty());
+        // The `and on ()` fleet folding is only collected when both halves read a
+        // counter off zero, which is what keeps the scrape-coverage rule out.
+        assert!(self_suppressing_guard_complaints(
+            "(count(up{namespace=\"cogneva\"}) > 0) \
+             and on () (count_over_time(up[30m]) > count_over_time(up[15m]))"
+        )
+        .is_empty());
     }
 }

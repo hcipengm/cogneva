@@ -543,9 +543,10 @@ const PRODUCED: &[(&str, &str)] = &[
         "metrics_samples_budget_rows",
         "crates/cog-storage/src/metrics_sample_cap.rs",
     ),
-    // The memory backlog past the re-drive window: raw sources the system will
-    // not pick up again without a budgeted backfill. Its help names the action
-    // it is waiting for, and it had no reader.
+    // The memory backlog past the re-drive window: raw sources whose summary is
+    // still owed and that no diagnosis says are impossible. Its help names what
+    // repays them (the reconcile pass, a bounded batch per round) and what a
+    // value that stays put means; it had no reader.
     (
         "memory_unextracted_raw_aged_out",
         "crates/cog-memory/src/ingestor.rs",
@@ -785,6 +786,29 @@ fn no_rule_expression_has_a_known_unparseable_shape() {
     assert!(
         complaints.is_empty(),
         "告警规则的表达式含一种已知的、Prometheus 一定拒绝的形状，这条规则永远不会触发:\n{}",
+        complaints.join("\n")
+    );
+}
+
+/// A guard that reads the very series it guards never lets the rule through.
+///
+/// `L unless on () R` drops every `L` that has a matching `R`, and an empty `on ()`
+/// list matches everything. When both halves are "this counter moved off zero" over
+/// the same series, the guard is the fault, so the rule is silent in exactly the
+/// situation it exists to report. `outcome!="delivered"` on a closed outcome set is
+/// how this happens by accident.
+#[test]
+fn no_guard_suppresses_the_fault_it_watches() {
+    let mut complaints: Vec<String> = Vec::new();
+    for (rule, promql) in chart_rules() {
+        for complaint in promql::self_suppressing_guard_complaints(&promql) {
+            complaints.push(format!("{rule}: {complaint}\n    {promql}"));
+        }
+    }
+
+    assert!(
+        complaints.is_empty(),
+        "告警规则的守卫那一半读的是它自己守的那个计数器的同一格，规则在它写明的故障里永远不会触发:\n{}",
         complaints.join("\n")
     );
 }
@@ -1951,14 +1975,15 @@ const UNREAD: &[(&str, Unread)] = &[
         Unread::Gap("what would make a run of self-exempted or unavailable gate runs a fault is whether a fixed eval suite is expected to exist, and the repository ships none, so no threshold is declarable yet"),
     ),
     // The denominator of the rule on the aged-out backlog: the sibling counts
-    // every unextracted raw, this one counts the part the system will retry by
-    // itself, and both are written by the same scan. A reader of the pair is
-    // what the rule above is.
+    // every raw whose summary is still owed, this one counts the part past the
+    // re-drive window that the reconcile pass repays at a bounded rate, and both
+    // are written by the same scan. A reader of the pair is what the rule above
+    // is.
     (
         "memory_unextracted_raw",
         Unread::Elsewhere {
             readers: &["memory_unextracted_raw_aged_out"],
-            reason: "the actionable subset is read by memory_raw_backlog_aged_out; this is its denominator",
+            reason: "the past-the-window subset is read by memory_raw_backlog_aged_out; this is its denominator",
         },
     ),
     (

@@ -342,6 +342,11 @@
     "skill_cache_ttl_secs": 30
   },
   "observability": {
+    "loki": {
+      "_comment": "结构化日志的耐久面：进程的 tracing 事件只有 stdout 一张脸，随 Pod 消失。网关那一侧另有自己的 pusher，读同一段配置。",
+      "enabled": true,
+      "endpoint": "http://loki.monitoring.svc.cluster.local:3100"
+    },
     "infra_watch": {
       "_comment": "基础设施告警→持久化→自发现。规则即部署策略：阈值改这里不用重建镜像。series 消失或条件不再成立会自动 resolve；规则查询失败不会误 resolve。",
       "enabled": true,
