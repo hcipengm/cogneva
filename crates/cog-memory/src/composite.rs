@@ -1,8 +1,10 @@
 use async_trait::async_trait;
 use base64::Engine;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::isolation::{BenchmarkIsolation, BenchmarkRefusal};
 use crate::maintenance::{DECAY_ARCHIVE_FLOOR, DECAY_IMPORTANCE_FACTOR};
 use crate::{MemorySchemaBackend, VectorSummaryBackend};
 use chrono::{DateTime, Utc};
@@ -39,6 +41,23 @@ pub struct CompositeMemoryBackend {
     default_schema: Option<Arc<MemorySchemaBackend>>,
     /// Concrete handle to the default summary backend; see `default_schema`.
     default_summary: Option<Arc<VectorSummaryBackend>>,
+    /// The exclusion surface for evaluation/benchmark data, judged here as well
+    /// as at the extraction gate.
+    ///
+    /// The two judgments exist for different reasons. The extraction gate
+    /// refuses to *spend*: a payload it can already tell is eval data must not
+    /// become a model call, and the call is the expensive, unrecoverable step.
+    /// This one refuses to *keep*: the raw layer is the only layer whose loss is
+    /// irrecoverable, so a payload written here is one every later reader — the
+    /// extractor, reconciliation, recall — will find again, however it got in.
+    /// A producer that arrives with no gate of its own (a learning recorder, a
+    /// batch ingest that builds its own raw) is covered only by this one, which
+    /// is why the judgment sits at the single point every write into the raw
+    /// layer passes through rather than at each producer.
+    isolation: BenchmarkIsolation,
+    /// Where a refusal is counted. Optional: the backend is also built in tests
+    /// and in-process helpers that publish no metrics backend.
+    operations_metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
 }
 
 impl CompositeMemoryBackend {
@@ -59,7 +78,28 @@ impl CompositeMemoryBackend {
             embedder: None,
             default_schema: Some(schema),
             default_summary: Some(summary),
+            isolation: BenchmarkIsolation::default(),
+            operations_metrics: None,
         }
+    }
+
+    /// Attach the evaluation/benchmark exclusion surface judged at the raw
+    /// layer. Without one the archive face still applies the unconditional tag
+    /// rule; the namespace and canary tables are deployment facts that have to
+    /// be handed in.
+    pub fn with_isolation(mut self, isolation: BenchmarkIsolation) -> Self {
+        self.isolation = isolation;
+        self
+    }
+
+    /// Attach the metrics backend a benchmark refusal is counted on. Without one
+    /// the refusal is still returned and logged; only the counter is missing.
+    pub fn with_operations_metrics(
+        mut self,
+        metrics: Arc<dyn cog_core::MetricsBackend>,
+    ) -> Self {
+        self.operations_metrics = Some(metrics);
+        self
     }
 
     /// Attach an embedder. Explicit ingests then store a real embedding
@@ -83,6 +123,33 @@ impl CompositeMemoryBackend {
         self.summary = summary;
         self.default_summary = None;
         self
+    }
+
+    /// Count one refusal on the rule's own cell of `memory_operations_total`.
+    ///
+    /// The same cell the extraction gate writes, so the reading means "raw
+    /// refused for this rule", not "refused on one particular path". Counting
+    /// only the extraction face would under-report by exactly the producers that
+    /// have no gate — which are the ones this face exists to catch.
+    async fn record_refusal(&self, refusal: BenchmarkRefusal) {
+        let Some(metrics) = self.operations_metrics.as_ref() else {
+            return;
+        };
+        let mut labels = HashMap::new();
+        labels.insert("operation".to_string(), refusal.operation().to_string());
+        if let Err(e) = metrics
+            .record_counter(
+                cog_core::metric_names::MEMORY_OPERATIONS_TOTAL,
+                1.0,
+                labels,
+            )
+            .await
+        {
+            tracing::warn!(
+                "memory: could not record the {} refusal cell: {e}",
+                refusal.operation()
+            );
+        }
     }
 
     /// Fill in the vectors an entry has to carry before the summary layer stores it.
@@ -194,6 +261,26 @@ struct RawEnvelope {
 #[async_trait]
 impl MemoryBackend for CompositeMemoryBackend {
     async fn archive_raw(&self, source: &RawSource) -> SFResult<String> {
+        // The exclusion surface is judged here, at the one point every write
+        // into the raw layer passes through, and not only at the extraction
+        // gate. Refusing to archive is what makes "eval data is in no layer" a
+        // path that does not exist rather than a path that is cleaned up later:
+        // a payload written here outlives this call and is what every later
+        // reader finds, while the extraction gate only decides whether to spend
+        // a model call on it.
+        if let Some(refusal) = self.isolation.refusal(source) {
+            self.record_refusal(refusal).await;
+            tracing::warn!(
+                "Refused to archive {} as benchmark data ({}); nothing was written to the raw layer",
+                source.id,
+                refusal.as_str()
+            );
+            return Err(SFError::Validation(format!(
+                "refused: benchmark data is excluded from memory ({}); nothing was archived",
+                refusal.as_str()
+            )));
+        }
+
         let key = Self::raw_key(&source.namespace, &source.id);
         let uri = self.raw.put(&key, &Self::encode_raw(source)?).await?;
         let mut metrics = self
@@ -525,16 +612,11 @@ impl MemoryBackend for CompositeMemoryBackend {
         let raw = RawSource::new(&id, namespace, "memory/explicit", text.as_bytes().to_vec())
             .with_tags(tags);
 
-        let key = Self::raw_key(namespace, &id);
-        self.raw.put(&key, &Self::encode_raw(&raw)?).await?;
-
-        {
-            let mut metrics = self
-                .metrics
-                .write()
-                .map_err(|_| SFError::Agent("lock poisoned".into()))?;
-            metrics.raw_archived += 1;
-        }
+        // Through the same entry every other raw write uses, so an explicitly
+        // ingested memory is judged by the exclusion surface exactly as an
+        // archived one is. Writing the object here directly would put a payload
+        // in the raw layer without the judgment that is defined over that layer.
+        self.archive_raw(&raw).await?;
 
         // Both vectors are filled in by the same helper the auto-ingest path goes
         // through, so an explicitly ingested memory and an extracted summary are

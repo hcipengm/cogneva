@@ -1432,3 +1432,118 @@ async fn a_bounded_listing_reads_only_the_items_it_returns() {
         "only the returned items may be read back from the store"
     );
 }
+
+/// The exclusion surface is judged at the raw layer's one write entry point, not
+/// only at the extraction gate: a benchmark-tagged raw is refused at archive
+/// time, leaves nothing on disk, and is counted on the extraction gate's own cell.
+#[tokio::test]
+async fn a_benchmark_tagged_raw_is_refused_at_the_archive_face() {
+    let tmp = tempfile::tempdir().unwrap();
+    let object = Arc::new(FileObjectBackend::new(tmp.path()));
+    let metrics = Arc::new(cog_observability::metrics::PrometheusMetricsBackend::new(""));
+    let backend = CompositeMemoryBackend::new(
+        object,
+        Arc::new(cog_storage::MemoryVectorBackend::new()),
+        128,
+    )
+    .with_operations_metrics(metrics.clone() as Arc<dyn MetricsBackend>);
+
+    let source = make_raw("eval-1", "payload")
+        .with_tags(vec![cog_core::RAW_TAG_BENCHMARK.to_string()]);
+
+    let err = backend.archive_raw(&source).await.unwrap_err();
+    assert!(
+        err.to_string().contains("benchmark"),
+        "the refusal must name the exclusion surface, got {err}"
+    );
+    assert!(
+        backend.get_raw("default", "eval-1").await.unwrap().is_none(),
+        "a refused raw must leave nothing in the raw layer"
+    );
+
+    let totals = metrics
+        .query_counter_totals(cog_core::metric_names::MEMORY_OPERATIONS_TOTAL.as_str())
+        .await
+        .unwrap();
+    assert!(
+        totals.iter().any(|s| {
+            s.labels.get("operation").map(String::as_str) == Some("benchmark_tag_refused")
+                && s.value == 1.0
+        }),
+        "the refusal must be counted on the extraction gate's own cell, got {totals:?}"
+    );
+}
+
+/// The payload marker is judged at archive time too: a payload with no tag, in
+/// the default namespace, matches neither declaration rule — the canary that
+/// travels with the data itself is the only rule that recognizes it.
+#[tokio::test]
+async fn a_canary_payload_is_refused_at_the_archive_face() {
+    let tmp = tempfile::tempdir().unwrap();
+    let object = Arc::new(FileObjectBackend::new(tmp.path()));
+    let backend = CompositeMemoryBackend::new(
+        object,
+        Arc::new(cog_storage::MemoryVectorBackend::new()),
+        128,
+    )
+    .with_isolation(BenchmarkIsolation::new(
+        Vec::new(),
+        vec!["CANARY-26b5c67b".into()],
+    ));
+
+    let source = RawSource::new(
+        "eval-2",
+        "tool-output",
+        "text/plain",
+        b"a tool result carrying CANARY-26b5c67b inside".to_vec(),
+    );
+
+    assert!(
+        backend.archive_raw(&source).await.is_err(),
+        "a payload carrying the canary must be refused"
+    );
+    assert!(
+        backend
+            .get_raw("tool-output", "eval-2")
+            .await
+            .unwrap()
+            .is_none(),
+        "a refused raw must leave nothing in the raw layer"
+    );
+}
+
+/// An explicit ingest goes through the same entry, so the same exclusion surface
+/// judges it — writing the object directly would put a payload in the raw layer
+/// without the judgment defined over that layer. The refusal lands before the
+/// embed and the summary write, so the whole call spends no model call at all.
+#[tokio::test]
+async fn an_explicit_ingest_is_judged_by_the_same_exclusion_surface() {
+    let tmp = tempfile::tempdir().unwrap();
+    let object = Arc::new(FileObjectBackend::new(tmp.path()));
+    let backend = CompositeMemoryBackend::new(
+        object,
+        Arc::new(cog_storage::MemoryVectorBackend::new()),
+        128,
+    );
+
+    let refused = backend
+        .ingest_explicit(
+            "default",
+            "an ordinary looking memory",
+            0.5,
+            vec![cog_core::RAW_TAG_BENCHMARK.to_string()],
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "an explicitly ingested benchmark memory must be refused"
+    );
+    assert!(
+        backend.list_raw("default", None).await.unwrap().is_empty(),
+        "nothing may reach the raw layer"
+    );
+    assert!(
+        backend.list_summary("default").await.unwrap().is_empty(),
+        "nothing may reach the summary layer either"
+    );
+}

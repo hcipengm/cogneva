@@ -182,6 +182,15 @@ impl cog_core::SystemPlugin for MemoryPlugin {
                         composite = composite.with_embedder(embedder.clone());
                     }
 
+                    // The exclusion surface rides the raw layer's one write entry
+                    // point, not only the extraction gate: this one refuses to
+                    // keep, the extraction gate refuses to spend. A producer with
+                    // no gate of its own (a learning recorder, a batch ingest that
+                    // builds its own raw) is guarded by this one alone.
+                    composite = composite
+                        .with_isolation(benchmark_isolation.clone())
+                        .with_operations_metrics(metrics_backend.clone());
+
                     // Each layer's own backend loads its own state. The composite's
                     // `set_persist_dir`/`load` helpers only drive the default
                     // in-memory backends, and both are replaced right here, so
