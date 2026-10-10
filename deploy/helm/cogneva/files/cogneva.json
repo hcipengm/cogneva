@@ -75,6 +75,8 @@
     "COGNEVA_MEMORY_BACKEND_TYPE": "memory.backend_type",
     "COGNEVA_MEMORY_EMBEDDING_DIMENSION": "memory.embedding_dimension",
     "COGNEVA_MEMORY_AUTO_INGEST": "memory.auto_ingest",
+    "COGNEVA_MEMORY_LOAD_EMBEDDING_MODEL": "memory.load_embedding_model",
+    "COGNEVA_MEMORY_LOAD_RERANKER_MODEL": "memory.load_reranker_model",
     "COGNEVA_TIER_MIGRATOR_ENABLED": "tier_migrator.enabled",
     "COGNEVA_TIER_HOT_DURATION_SECS": "tier_migrator.hot_duration_secs",
     "COGNEVA_TIER_WARM_DURATION_SECS": "tier_migrator.warm_duration_secs",
@@ -323,7 +325,7 @@
   },
   "memory": {
     "_comment": "Memory backend — composite puts Raw on the shared ObjectBackend, Schema and the Summary entry store on PostgreSQL, and the summary vectors on the shared VectorBackend, so the dataset survives a restart. This applies to the processes that enable it: the evolution worker overrides COGNEVA_MEMORY_ENABLED to false, so it holds no memory dataset at all and any state it must keep across a restart lives in its own app.data_dir instead.",
-    "_comment_models": "load_*_model gates the ONNX weights loaded at startup. Both are false on the shipped profile, but not for the reason this comment used to give: the figure it carried (~1.8GiB free against ~2.2GiB of resident weights per session, dense and sparse each opening their own session over the same BGE-M3 weights) was taken on the earlier 4C/7.5GiB host, and the node is now far larger (24C/62GiB, tens of GiB free), so that figure has to be measured again on the current node rather than quoted if it is ever needed. What is actually missing is the weights themselves. They are deliberately kept out of the image and out of the release archive (4.6GiB total, and gzip cannot shrink fp32 weights), and no authoritative copy has been seeded into the object store or onto a node, so a pod has no directory to read them from at all -- this deploy surface declares neither a weight volume nor a model cache path. Turning either switch on without that copy sends the loader to the model hub at startup, and on an offline or restricted network that fetch neither succeeds nor fails, so plugin init hangs until the liveness probe kills the pod. Until a weight path exists, the vector layer stays absent and search falls back to the schema/text path.",
+    "_comment_models": "load_*_model gates the ONNX weights loaded at startup. Both stay false in this document, and the deployments that have weights on disk turn them on from the outside (env overrides, so profiles that mount nothing are unaffected). What decides it is whether a weight directory exists: the weights are deliberately kept out of the image and out of the release archive (4.6GiB total, and gzip cannot shrink fp32 weights), so a pod can only read them from a directory somebody put on its node first. Turning a switch on without one sends the loader to the model hub at startup, and on an offline or restricted network that fetch neither succeeds nor fails, so plugin init hangs until the liveness probe kills the pod. Embedding opens two sessions over one set of BGE-M3 weights -- dense and sparse, the two halves of hybrid retrieval -- and a process holding both measures 1.67GiB peak RSS, the same as one session alone: both read those same weight files, so the second session costs almost nothing. The reranker is a different model and measures 1.67GiB on its own. The sparse session's failure does not take the dense one down.",
     "enabled": true,
     "backend_type": "composite",
     "embedding_dimension": 1024,

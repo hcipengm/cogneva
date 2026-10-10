@@ -216,6 +216,17 @@ spec:
             # false 后本 Pod 仍发布 admin 服务、仍跑上面这条集群侧 GitOps 拉取端。
             - name: COGNEVA_SELF_EVOLUTION_EXECUTOR_ENABLED
               value: "false"
+            # 本地模型权重：目录就是下面挂进来的那个只读卷，值取自 chart 的同一个
+            # values 键，所以不会出现"挂了卷却还在别处找"或"要找却没有卷"。
+            # 开关与卷同时成立：只挂不打开等于白挂，只打开不挂会让加载器读不到
+            # 权重而静默退回网络。嵌入开启后 dense 与 sparse 两个 session 都建
+            # 起来，也就是混合检索的两半。
+            # 这个 Pod **不能设 HF_HOME**：fastembed 的 hub 客户端优先它，设了就把
+            # 权重目录带偏到别处，而失败读起来像"权重目录坏"，真因在环境里。
+            - name: FASTEMBED_CACHE_DIR
+              value: "/srv/cogneva/models/fastembed"
+            - name: COGNEVA_MEMORY_LOAD_EMBEDDING_MODEL
+              value: "true"
           startupProbe:
             httpGet:
               path: /health/live
@@ -237,13 +248,18 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 10
             failureThreshold: 6
+          # 内存这一档是按**量出来的**本地权重占用定的（实测进程峰值 RSS：嵌入的
+          # dense+sparse 两个 session 一起 1.67GiB，重排单 session 1.67GiB——两个
+          # session 读同一份权重文件，加第二个几乎不涨）。按三个 session 都给足来定：
+          # 嵌入的两半（混合检索）与重排都是本部署的终局能力。这些页是私有匿名页，
+          # 容器里不可回收，所以 limit 要真装得下。
           resources:
             requests:
-              cpu: 250m
-              memory: 512Mi
-            limits:
-              cpu: 1000m
+              cpu: 500m
               memory: 2Gi
+            limits:
+              cpu: 4000m
+              memory: 6Gi
           volumeMounts:
             - name: data
               mountPath: /var/lib/sf-data
@@ -265,6 +281,11 @@ spec:
             # 限速到不可用，2026-08-06 实测 1.4KB/s）。
             - name: kubectl-bin
               mountPath: /usr/local/bin/kubectl
+              readOnly: true
+            # 权重只读：写出缓存目录的活由 deploy/scripts/fetch-model-weights.sh 在
+            # 宿主上做，Pod 里没有任何东西需要写它。
+            - name: model-weights
+              mountPath: /srv/cogneva/models/fastembed
               readOnly: true
       volumes:
         - name: data
@@ -294,6 +315,13 @@ spec:
           hostPath:
             path: /usr/local/bin/k3s
             type: File
+        # type: Directory（不是 DirectoryOrCreate）：权重没落下时这里要**挂不上**，
+        # 而不是给它一个空目录。空目录的后果是加载器静默退回网络、在连不上 hub 的
+        # 集群里把 init 挂死——一个 Pod 起不来的 FailedMount 比那个好读得多。
+        - name: model-weights
+          hostPath:
+            path: /srv/cogneva/models/fastembed
+            type: Directory
       securityContext:
         runAsNonRoot: true
         runAsUser: 1001

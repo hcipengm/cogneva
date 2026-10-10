@@ -49,14 +49,15 @@ kubectl kustomize deploy/k3s > "$TMP/k3s.yaml"
 
 # k3s profile：单节点 K3s 形态（与 deploy/k3s 静态清单语义一一对应）。
 # 渲染 apply 路径不带 Secret（内部密钥由 init-secrets.sh 安装时生成）。
+#
+# 这里读 profile 文件本身，不把 profile 的差异再手抄成一行行 --set：同一份差异
+# 有两处声明时，两边会各自漂。漏抄的那一项下，本门禁把 deploy/k3s 对齐到一份
+# **不是** deploy/rendered/k3s-single 的渲染上，于是「静态清单与 profile 渲染对齐」
+# 这句话对那一项恒真而两边其实不同——两个都叫 k3s 单节点的产物分叉，没有任何
+# 门禁会响。profile 文件是声明差异的唯一处（render-deploy.sh 也从它渲染）。
 helm template cogneva deploy/helm/cogneva \
-  --set image.tag=local \
-  --set evolution.gitRemote.mode=hostPath \
-  --set evolution.gitRemote.hostPath=/var/lib/cogneva-data/git-remote \
-  --set gitops.kubectlBin.enabled=true \
-  --set gitops.kubectlBin.hostPath=/usr/local/bin/k3s \
-  --set buildah.containerdSocket=/run/k3s/containerd \
-  --set secrets.create=false \
+  --namespace cogneva \
+  -f deploy/helm/cogneva/profiles/k3s-single.yaml \
   > "$TMP/helm.yaml"
 
 python3 - "$TMP/k3s.yaml" "$TMP/helm.yaml" <<'PYEOF'

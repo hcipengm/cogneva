@@ -32,6 +32,17 @@ gitops:
     enabled: true
     hostPath: /usr/local/bin/k3s
 
+modelWeights:
+  # 单节点：宿主就是 Pod 所在的节点，权重目录直挂进去，打开本进程的向量能力。
+  # 这个开关同时决定挂载与缓存路径（见 values.yaml），所以不会出现"挂了卷却在别处
+  # 找"或"要找却没有卷"。
+  #
+  # 多节点 profile 保持关闭，理由不是"省内存"而是**没有产出方**：hostPath 只存在于
+  # 单个节点，调度到别的节点上就挂不上；而换成一个空集群卷更坏——空目录让加载器
+  # 静默退回网络、在连不上 hub 的集群里把 init 挂死，且"卷已挂载"看起来一切正常。
+  # 权重由宿主上的 deploy/scripts/fetch-model-weights.sh 落地（每个节点各一份）。
+  enabled: true
+
 buildah:
   # K3s 的 containerd socket 在 /run/k3s/containerd（标准 containerd 是
   # /run/containerd，见 k8s-standard profile）。

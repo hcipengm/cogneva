@@ -35,23 +35,34 @@ storage:
 # 就被拒（FailedCreate … requested: limits.cpu=400m, used: 17, limited: 17），
 # 而它落地时读到的判词是超时不是资源，症状与病因隔两层。
 # 动滚动 Job 的资源面就必须重算这个数（渲染期门禁把两者一起打出来）。
-# limitsMemory 34Gi 对同一组分解仍有 5.4Gi 头寸（判据 Job 的 512Mi 已计入），不动。
+#
+# 2026-10-10 重算：主应用 Pod 抬到 4000m/6Gi（装载本地嵌入权重，见 gateway.resources
+# 的实测读数），两档额度各跟着 +3000m / +4Gi。
+#   limitsCpu 18.5 → 23：稳态合计 15000m 里主应用从 1000m 变 4000m ⇒ 18000m，
+#     加判据 Job 2000m = 20000m，再留 3000m 给替换期重叠（比原来那 1500m 宽，
+#     因为这一档的 Pod 内存与 CPU 都是尖峰型：装载时会跑满 intra-threads）。
+#   limitsMemory 34Gi → 38Gi：原 30.1Gi 里主应用 2Gi 变 6Gi ⇒ 34.1Gi，加判据 Job
+#     的 512Mi = 34.6Gi，头寸 3.4Gi（与上一版同口径）。这一档是**三个 session 都给足**
+#     的结果，不是按当天加载了几个来定的（多出来的两个今天还没打开，理由见
+#     gateway.resources）。
 resourceGovernance:
   enabled: true
   quota:
     requestsCpu: "6"
     requestsMemory: 12Gi
-    limitsCpu: "18.5"
-    limitsMemory: 34Gi
+    limitsCpu: "23"
+    limitsMemory: 38Gi
     pods: "40"
     # 存储声明是**命名空间内全部 PVC 之和的上限**，不是某个卷的容量：目录型卷
     # 不强制 requests.storage，写多少都不影响落盘，它唯一的作用是拒绝一份声明
     # 总量越界的清单。所以它必须 ≥ 本 chart 自己声明的和，否则这套清单装不进
     # 自己的命名空间（实机事故：声明和 188Gi vs 上限 110Gi，PVC 全被拒，落地
-    # 通道断了整天）；而它也不能远高于声明和，否则这个上限就失去意义。当前
-    # 声明和 265Gi（单节点 profile，不含 git-remote），取 300Gi 留 35Gi 头寸。
-    # 每个声明的推导在各自字段旁；渲染期门禁 check-governance-consistency.sh
-    # 会按渲染产物重算这个和并打印头寸，改声明忘记同步这里会直接失败。
+    # 通道断了整天）；而它也不能远高于声明和，否则这个上限就失去意义。
+    # **这里不写声明和与头寸**：会随工作负载增减而漂，写死了必然过期（本字段
+    # 旁就发生过一次，还带着一句"忘记同步会失败"的假兜底——门禁校验的是
+    # "声明和 ≤ 本上限"这条不变式，不读注释里的散文数字）。要看当前和与头寸，
+    # 跑渲染期门禁 `deploy/scripts/check-governance-consistency.sh`，它按渲染
+    # 产物现算现印；每个卷声明的推导在各自字段旁，改声明时改的是那些字段。
     requestsStorage: 300Gi
   limitRange:
     defaultCpu: 500m
@@ -85,6 +96,25 @@ appData:
   storage: 24Gi
   # 空 = 跟随集群默认 SC（与 pg/redis/qdrant 同策略，不绑厂商）。
   storageClass: ""
+
+# 本地模型权重（BGE-M3 嵌入）：加载器只从磁盘读，集群到不了 model hub。
+#
+# 这个开关**一处管两件事**：把宿主上的权重目录只读挂进主应用 Pod，并同时把
+# `memory.load_embedding_model` 打开。两者必须同时成立——只挂不打开等于白挂，
+# 只打开不挂会让加载器读不到权重而**静默退回网络**，在一个连不上 hub 的集群里
+# 那次拉取既不成功也不失败，插件的 init 会挂到 liveness 杀 Pod 为止。所以它们
+# 不由两个开关分别控制，desync 在结构上不可能发生。
+#
+# 为什么只有宿主目录、没有集群卷：多节点上一个 hostPath 只存在于一台节点，
+# 换节点就挂不上，本该走 PVC——但权重进卷今天**没有产出方**（2.2GiB 的 ONNX
+# 权重得先有人放进去）。挂一个空卷比不挂更坏：它同样静默退回网络，症状还是
+# init 挂死，而"卷挂了"看起来又像已经配置好了。所以多节点 profile 保持关闭，
+# 等有一条权重进卷的路径再开。
+modelWeights:
+  enabled: false
+  # 由 deploy/scripts/fetch-model-weights.sh --model bge-m3 落在这里（hf-hub
+  # 自己的缓存布局，进程起来后一个字节也不下载）。
+  hostPath: /srv/cogneva/models/fastembed
 
 # 数据面备份：权威数据（PG 逻辑导出 + Qdrant 一致性快照 + 对象 raw 层 +
 # 实例身份 Secret）打成 tar.zst 落 cogneva-backup-pvc。重启档由 PVC keep
@@ -125,13 +155,26 @@ image:
 gateway:
   # 单副本：单节点集群双副本无可用性收益，只放大内存与凭证副本；多节点后调回 2
   replicas: 1
+  # 内存这一档是按**量出来的**权重占用定的，不是按权重文件推的。2026-10-10 本机
+  # 逐个二进制实测进程峰值 RSS（`/usr/bin/time -v` 的 Maximum resident set size，
+  # 内核 getrusage 高水位）：嵌入把 dense 与 sparse 两个 session 都建起来、各跑一次
+  # 推理＝1.67GiB；重排单 session＝1.67GiB。两处都是 1.67 而不是两倍，因为两个
+  # session 读的是同一份权重文件，加第二个几乎不涨——按"权重文件大小×份数"推会虚高
+  # 一倍多。这一档按**三个 session 都能装下**给：嵌入的 dense+sparse 是混合检索的
+  # 两半，重排是精排那一步，三者都是本部署的终局能力，不按"今天谁在用"砍任何一个。
+  # limits 6Gi ≈ 1.67GiB（嵌入两 session）＋ 1.67GiB（重排）＋ 本进程自己的工作集与
+  # ONNX 推理的批量激活余量。这些页实测是私有匿名页（`smaps_rollup` 的 Anonymous/
+  # Private_Dirty ≈1.67GiB，Shared_Clean 只有几 MB），容器里不可回收，所以 limit 必须
+  # 真装得下而不是靠回收兜底。LimitRange 的单容器上限是 8Gi，再往上会被准入拒掉。
+  # requests 取 2Gi：它声明的是调度器为这个 Pod 预留多少，量真占用的是现网的
+  # `container_memory_working_set_bytes`，届时按读数收紧的是余量，不是能力。
   resources:
     requests:
-      cpu: 250m
-      memory: 512Mi
-    limits:
-      cpu: 1000m
+      cpu: 500m
       memory: 2Gi
+    limits:
+      cpu: 4000m
+      memory: 6Gi
 
 # git 身份基线（owner/name）。两个进程消费同一个值，所以定义在共享层而不是
 # 挂在任一侧名下——拆成两份必然漂移，而漂移的后果是无声的：自举登记的仓库与

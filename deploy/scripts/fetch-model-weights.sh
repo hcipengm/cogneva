@@ -95,9 +95,11 @@ catalog() {
       source="modelscope"
       repo="BAAI/bge-m3"
       revision="master"
-      # dense 与 sparse 吃同一份字节：EmbeddingModel::BGEM3 与 SparseModel::BGEM3 都指向
-      # onnx/model.onnx（外加 onnx/model.onnx_data、onnx/Constant_7_attr__value，最后那个是
-      # 计算图旁边的常量张量）；分词器那侧另外打开仓库根下的四条。
+      # EmbeddingModel::BGEM3 的 model_file 是 onnx/model.onnx，additional_files 是
+      # onnx/model.onnx_data 与 onnx/Constant_7_attr__value（计算图旁边的常量张量）；
+      # 分词器那侧另外打开仓库根下的四条。加载器建 dense 与 sparse 两个 session，而
+      # SparseModel::BGEM3 指的就是同一批文件（sparse 的分类头编译在 crate 里），所以
+      # 这七条是**两个 session 合起来**要打开的全部文件，抓这一份就够。
       files=(config.json special_tokens_map.json tokenizer_config.json tokenizer.json onnx/Constant_7_attr__value onnx/model.onnx onnx/model.onnx_data)
       ;;
     *) die "不认识的 --model：$1（可用的：reranker、bge-m3）" ;;
