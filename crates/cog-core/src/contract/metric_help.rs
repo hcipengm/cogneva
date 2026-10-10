@@ -581,7 +581,12 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          boot case, since a live backend never writes `absent` for wiki, and \
          that is the cell that tells the two apart. Because one cell counts \
          boots where the rest count calls, no rule or panel may sum across \
-         `outcome` and report the total as a number of retrievals.",
+         `outcome` and report the total as a number of retrievals. So a reader \
+         concludes \"no knowledge backend\" from the wiki cell and never from \
+         the memory cell: the memory cell carries ordinary traffic (a live \
+         backend writes `absent` there whenever it answers for wiki and holds \
+         no memory) and the two meanings are only separable while the wiki cell \
+         is read with it.",
     ),
     (
         crate::metric_names::TOOL_OUTPUT_TRUNCATED_TOTAL.as_str(),

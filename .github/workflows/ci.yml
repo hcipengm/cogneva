@@ -137,6 +137,16 @@ jobs:
         run: cargo test -p cog-storage --test metrics_latest_reading -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # A `_total` series is read by differencing two scrapes, so the stored
+      # total has to be accumulated -- and a boot-time seed of a closed set
+      # writes zeros over totals other processes have counted up, which only
+      # works while the write adds. Whether Postgres's upsert adds is a question
+      # only a server answers, and an assigning one would look healthy from
+      # every call site.
+      - name: Live-DB counter totals accumulate
+        run: cargo test -p cog-storage --test metrics_counter_accumulation -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # A task's event offsets are the backend's to assign, and Postgres derives
       # them from a count two writers can read before either has inserted --
       # while a reclaimed lease presumes the previous holder stopped rather than

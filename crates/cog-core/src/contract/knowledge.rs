@@ -254,6 +254,16 @@ pub async fn record_retrieval_cell(
 /// the confusion the series exists to remove; seeding leaves absence to mean
 /// only the second. Written as a zero increment, so a cell another process has
 /// already counted up is not reset.
+///
+/// The seed rests on the counter write adding rather than assigning, which is
+/// what [`crate::MetricsBackend::record_counter`] states and what the live
+/// store test next to the backend pins; a set would make every restart clear
+/// the family.
+///
+/// The label sets are the fixed cross above, whatever the number of pods, so
+/// seeding on every boot writes into the same rows rather than adding a row per
+/// rollout: this is not the shape where a per-boot writer leaves a permanent
+/// floor under a table.
 pub async fn seed_retrieval_cells(metrics: &Arc<dyn crate::MetricsBackend>) {
     for layer in RETRIEVAL_LAYERS {
         for outcome in RETRIEVAL_OUTCOMES {

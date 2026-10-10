@@ -144,6 +144,14 @@ pub trait MetricsBackend: Send + Sync {
     ) -> SFResult<()>;
 
     /// Increment a counter by `value`.
+    ///
+    /// The increment is additive: `value` is added to whatever total the same
+    /// series already holds, so a write of zero creates a series at zero and
+    /// leaves a series someone else has counted up where it was. A boot-time
+    /// seed of a closed set relies on exactly that, and a backend that assigned
+    /// instead of adding would reset the whole family on every restart while
+    /// nothing at the call site changed to say so. The cumulative declaration
+    /// above is the same claim read from the scrape side.
     async fn record_counter(
         &self,
         name: MetricName,
