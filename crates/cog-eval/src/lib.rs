@@ -32,7 +32,7 @@ pub use ablation::{
     Component, GroupReport,
 };
 pub use adapters::{AgentBenchLoader, GaiaRunner, SweBenchRunner};
-pub use comparator::{AbComparator, ComparisonReport, StatisticalTest};
+pub use comparator::{two_proportion_z_test, AbComparator, ComparisonReport, StatisticalTest};
 pub use cross_system::{
     CrossSystemBenchmark, CrossSystemReport, ExternalSystem, MethodologyConfig, SystemScore,
 };

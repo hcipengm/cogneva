@@ -5,6 +5,29 @@ use serde::{Deserialize, Serialize};
 use statrs::distribution::ContinuousCDF;
 use std::collections::HashMap;
 
+/// Two-proportion z-test: H0 = the two pass rates are equal. Returns
+/// `(z, |z| > 1.96)`.
+///
+/// This is the workspace's single home for the test: the eval A/B gate here and
+/// the self-evolution verdict mapping in `cog-reflection` both read it, so the
+/// formula — and the significance cut — live in one place rather than being
+/// re-derived per consumer.
+pub fn two_proportion_z_test(s1: usize, n1: usize, s2: usize, n2: usize) -> (f64, bool) {
+    if n1 == 0 || n2 == 0 {
+        return (0.0, false);
+    }
+    let p1 = s1 as f64 / n1 as f64;
+    let p2 = s2 as f64 / n2 as f64;
+    let pooled = (s1 + s2) as f64 / (n1 + n2) as f64;
+    let se = (pooled * (1.0 - pooled) * (1.0 / n1 as f64 + 1.0 / n2 as f64)).sqrt();
+    if se == 0.0 {
+        // Both rates are 0 or 1: no variance, the two are indistinguishable.
+        return (0.0, false);
+    }
+    let z = (p2 - p1) / se;
+    (z, z.abs() > 1.96)
+}
+
 /// 单指标对比结果。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricComparison {
@@ -82,15 +105,17 @@ impl AbComparator {
             0.0
         };
 
-        // Two-proportion z-test
+        // Two-proportion z-test, through the shared implementation.
         let n1 = baseline.len() as f64;
         let n2 = challenger.len() as f64;
         let p1 = baseline_rate;
         let p2 = challenger_rate;
-        let p_pool = (baseline_pass + challenger_pass) / (n1 + n2);
-        let se = (p_pool * (1.0 - p_pool) * (1.0 / n1 + 1.0 / n2)).sqrt();
-
-        let z = if se > 0.0 { (p2 - p1) / se } else { 0.0 };
+        let (z, _) = two_proportion_z_test(
+            baseline_pass as usize,
+            baseline.len(),
+            challenger_pass as usize,
+            challenger.len(),
+        );
         let p_value = 2.0
             * (1.0
                 - statrs::distribution::Normal::new(0.0, 1.0)
@@ -305,5 +330,39 @@ fn cohens_d_for_proportions(p1: f64, p2: f64, n1: f64, n2: f64) -> f64 {
         (h2 - h1) / pooled_sd
     } else {
         0.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The shared test's cut is |z| > 1.96; a large, clean difference must clear
+    // it and a same-rate pair must not. Pinning both directions keeps the
+    // significance boundary from drifting when the formula is touched.
+    #[test]
+    fn the_z_test_separates_a_clear_gap_from_no_gap() {
+        let (z, significant) = two_proportion_z_test(90, 100, 50, 100);
+        assert!(
+            z.abs() > 1.96,
+            "a 90% vs 50% gap over 100 each is significant: z={z}"
+        );
+        assert!(significant);
+
+        let (z, significant) = two_proportion_z_test(50, 100, 51, 100);
+        assert!(
+            !significant,
+            "a 1-point gap over 100 each is not significant: z={z}"
+        );
+    }
+
+    // Zero samples and the degenerate all-pass / all-fail pair have no variance
+    // to separate; the test must say "cannot tell" rather than divide by zero.
+    #[test]
+    fn a_degenerate_pair_is_not_called_significant() {
+        assert_eq!(two_proportion_z_test(0, 0, 5, 10), (0.0, false));
+        assert_eq!(two_proportion_z_test(0, 0, 0, 0), (0.0, false));
+        assert_eq!(two_proportion_z_test(10, 10, 10, 10), (0.0, false));
+        assert_eq!(two_proportion_z_test(0, 10, 0, 10), (0.0, false));
     }
 }
