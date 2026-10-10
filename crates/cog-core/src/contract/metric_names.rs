@@ -772,6 +772,14 @@ metric_names! {
     // because the first is expected traffic and the second is a defect: folding
     // them would let a failing archive read as ordinary truncation.
     //
+    // The count of cuts says nothing about how much was withheld, and one cut
+    // that dropped ten characters and one that dropped a hundred thousand are
+    // the same event on it. `truncated_chars` is the other half of the same
+    // event, in the unit the loss is actually in, and it is what turns the
+    // count into a share of the conversation spent on oversized results. The
+    // two are written from one place and one computation, so the count is
+    // always the number of increments and the characters the sum of them.
+    //
     // The third is the read side's own fate: a read found the source but its
     // payload outgrew the byte budget the caller set, so no bytes came back.
     // Without it, "the source is bigger than you asked for" is indistinguishable
@@ -779,7 +787,15 @@ metric_names! {
     // and a source that is not there would look the same. Kept by `tool` for the
     // same reason the pair is: one tool's reads blowing past the budget names
     // that tool's payload shape rather than reads as a whole.
+    //
+    // Every cut ends in exactly one of two fates -- the tail was stored, or it
+    // was not and `archive_failed` says why -- so a cut that reaches neither is
+    // one the reading cannot see. The two fates have to add up to the count for
+    // the landed share to be a share rather than a ceiling, which is why the
+    // causes are a closed set and why a run that had no key to archive under
+    // gets a cause of its own instead of being skipped.
     TOOL_OUTPUT_TRUNCATED_TOTAL => "cogneva_tool_output_truncated_total",
+    TOOL_OUTPUT_TRUNCATED_CHARS_TOTAL => "cogneva_tool_output_truncated_chars_total",
     TOOL_OUTPUT_ARCHIVE_FAILED_TOTAL => "cogneva_tool_output_archive_failed_total",
     TOOL_OUTPUT_FETCH_BUDGET_EXHAUSTED_TOTAL => "cogneva_tool_output_fetch_budget_exhausted_total",
 }

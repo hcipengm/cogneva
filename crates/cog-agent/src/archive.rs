@@ -18,17 +18,25 @@
 //! no token to carry and no claims to read, so the write lands in the default
 //! namespace by construction.
 //!
-//! Both readings live on this handle rather than beside it because they are the
-//! two fates of one event: a tool output that did not fit. `truncated` counts
-//! the event; `archive_failure` counts the ones whose tail could not be stored,
-//! under the cause. An unconfigured base URL is one of those causes, not an
-//! exemption — with nowhere to write, a truncated output is lost, and that is
-//! what the reading must say.
+//! The readings live on this handle rather than beside it because they are the
+//! fates of one event: a tool output that did not fit. `truncated` counts the
+//! event and carries its size in characters; `archive_failure` counts the ones
+//! whose tail could not be stored, under the cause. The two have to add up --
+//! every cut either stored its tail or is counted as a failure under some cause
+//! -- or the share of cuts that landed reads as a ceiling rather than a share.
+//! An unconfigured base URL is one of those causes, not an exemption: with
+//! nowhere to write, a truncated output is lost, and that is what the reading
+//! must say. A run with no task id to key a source by is another: no attempt can
+//! be made, the tail is just as gone, and it gets its own cause rather than
+//! being left out of both halves.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cog_core::metric_names::{TOOL_OUTPUT_ARCHIVE_FAILED_TOTAL, TOOL_OUTPUT_TRUNCATED_TOTAL};
+use cog_core::metric_names::{
+    TOOL_OUTPUT_ARCHIVE_FAILED_TOTAL, TOOL_OUTPUT_TRUNCATED_CHARS_TOTAL,
+    TOOL_OUTPUT_TRUNCATED_TOTAL,
+};
 use cog_core::{
     artifact_uri, HttpClient, HttpRequest, MetricsBackend, SFError, SFResult,
     DEFAULT_MEMORY_NAMESPACE, MEMORY_API_BASE_ENV, MEMORY_INGEST_PATH,
@@ -36,8 +44,11 @@ use cog_core::{
 
 /// Why an archive attempt did not produce a reference. A closed set: the label
 /// value names the cause, and a reader choosing between "set the base URL",
-/// "fix the route to the memory API", and "read the API's refusal" is choosing
-/// between these three.
+/// "fix the route to the memory API", "read the API's refusal", and "give this
+/// run a task id" is choosing between these four. It is closed on purpose —
+/// every cut of a tool output lands in exactly one of these or stored its tail,
+/// so the truncation counter minus the failure counter is the number of cuts
+/// whose tail landed.
 pub mod cause {
     /// No base URL is configured, so nothing was attempted.
     pub const UNCONFIGURED: &str = "unconfigured";
@@ -45,6 +56,12 @@ pub mod cause {
     pub const UNREACHABLE: &str = "unreachable";
     /// The memory API answered, and refused the write.
     pub const REFUSED: &str = "refused";
+    /// The run carried no task id, so there was no source name to file the tail
+    /// under and no attempt was made. The repair is not configuration and not on
+    /// the API: it is that the cut happened on a run nothing can key a source
+    /// by, which is what makes the tail unfetchable even though the archive
+    /// endpoint is healthy.
+    pub const UNKEYED: &str = "unkeyed";
 }
 
 /// The surface a run uses to archive an oversized tool output and to record the
@@ -67,8 +84,27 @@ pub trait ToolOutputArchive: Send + Sync + std::fmt::Debug {
         text: &str,
     ) -> SFResult<String>;
 
-    /// Record that `tool`'s output was truncated to fit the context window.
-    async fn record_truncation(&self, tool: &str);
+    /// Record that `tool`'s output was truncated to fit the context window, and
+    /// how many characters of it the model will not see.
+    ///
+    /// The two go in together because they are one event: a caller that counted
+    /// the cut but not its size would publish a reading that cannot tell a
+    /// result cut by ten characters from one cut by a hundred thousand, and the
+    /// character count is only available where the cut is decided.
+    async fn record_truncation(&self, tool: &str, dropped_chars: usize);
+
+    /// Record that `tool`'s output was cut and no archive was attempted because
+    /// the run had no task id to name a source by.
+    ///
+    /// This is a fate of a truncation rather than a precondition of one: the
+    /// output was cut, nothing can fetch the tail back, and the loss is the same
+    /// as one whose write was refused. It is on the handle rather than left to
+    /// the caller because the failure family's causes are a closed set decided
+    /// here, and a caller reporting this as a count of lost cuts would publish
+    /// the cause under a label of its own invention. Leaving it out entirely is
+    /// the reading that hurts: the truncation is in the denominator of the
+    /// landed share and this loss would be in no numerator.
+    async fn record_unkeyed(&self, tool: &str);
 }
 
 /// Archive tool outputs by POSTing them to the platform memory API.
@@ -170,21 +206,38 @@ impl ToolOutputArchive for HttpToolOutputArchive {
         Ok(artifact_uri(DEFAULT_MEMORY_NAMESPACE, id))
     }
 
-    async fn record_truncation(&self, tool: &str) {
-        let mut labels = HashMap::new();
-        labels.insert("tool".to_string(), tool.to_string());
-        self.count(TOOL_OUTPUT_TRUNCATED_TOTAL, 1.0, labels).await;
+    async fn record_truncation(&self, tool: &str, dropped_chars: usize) {
+        let labels = tool_labels(tool);
+        self.count(TOOL_OUTPUT_TRUNCATED_TOTAL, 1.0, labels.clone())
+            .await;
+        self.count(
+            TOOL_OUTPUT_TRUNCATED_CHARS_TOTAL,
+            dropped_chars as f64,
+            labels,
+        )
+        .await;
+    }
+
+    async fn record_unkeyed(&self, tool: &str) {
+        self.record_failure(tool, cause::UNKEYED).await;
     }
 }
 
 impl HttpToolOutputArchive {
     async fn record_failure(&self, tool: &str, cause: &str) {
-        let mut labels = HashMap::new();
-        labels.insert("tool".to_string(), tool.to_string());
+        let mut labels = tool_labels(tool);
         labels.insert("cause".to_string(), cause.to_string());
         self.count(TOOL_OUTPUT_ARCHIVE_FAILED_TOTAL, 1.0, labels)
             .await;
     }
+}
+
+/// The label set every reading in this module carries. One function so the
+/// truncation count, its character total and the failure family cannot end up
+/// keyed by different things -- three series that disagree about their labels
+/// cannot be subtracted from one another, and the landed share is a subtraction.
+fn tool_labels(tool: &str) -> HashMap<String, String> {
+    HashMap::from([("tool".to_string(), tool.to_string())])
 }
 
 /// How long one archive POST may take before it is abandoned.
@@ -223,8 +276,11 @@ mod tests {
         }
     }
 
+    /// 一次计数：名字、增量、标签集。
+    type Reading = (MetricName, f64, HashMap<String, String>);
+
     #[derive(Debug, Default)]
-    struct Counters(Mutex<Vec<(MetricName, HashMap<String, String>)>>);
+    struct Counters(Mutex<Vec<Reading>>);
 
     #[async_trait::async_trait]
     impl MetricsBackend for Counters {
@@ -239,10 +295,10 @@ mod tests {
         async fn record_counter(
             &self,
             name: MetricName,
-            _value: f64,
+            value: f64,
             labels: HashMap<String, String>,
         ) -> SFResult<()> {
-            self.0.lock().unwrap().push((name, labels));
+            self.0.lock().unwrap().push((name, value, labels));
             Ok(())
         }
         async fn record_histogram(
@@ -357,11 +413,11 @@ mod tests {
             assert_eq!(recorded.len(), 1, "one attempt, one failure reading");
             assert_eq!(recorded[0].0, TOOL_OUTPUT_ARCHIVE_FAILED_TOTAL);
             assert_eq!(
-                recorded[0].1.get("tool").map(String::as_str),
+                recorded[0].2.get("tool").map(String::as_str),
                 Some("run_command")
             );
             assert_eq!(
-                recorded[0].1.get("cause").map(String::as_str),
+                recorded[0].2.get("cause").map(String::as_str),
                 Some(expected)
             );
         }
@@ -380,7 +436,7 @@ mod tests {
         assert!(c.calls.lock().unwrap().is_empty());
         let recorded = counters.0.lock().unwrap();
         assert_eq!(
-            recorded[0].1.get("cause").map(String::as_str),
+            recorded[0].2.get("cause").map(String::as_str),
             Some(cause::UNCONFIGURED)
         );
     }
@@ -402,7 +458,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_truncation_reading_names_the_tool() {
+    async fn the_truncation_reading_names_the_tool_and_its_size() {
         let c = client(200, false);
         let counters = Arc::new(Counters::default());
         let archiver = HttpToolOutputArchive::new(
@@ -410,13 +466,40 @@ mod tests {
             Some("http://cogneva:8080".into()),
             Some(counters.clone()),
         );
-        archiver.record_truncation("run_command").await;
+        archiver.record_truncation("run_command", 4096).await;
+        let recorded = counters.0.lock().unwrap();
+        assert_eq!(recorded.len(), 2, "一次裁剪既是「一条」，也带着「多少字」");
+        assert_eq!(recorded[0].0, TOOL_OUTPUT_TRUNCATED_TOTAL);
+        assert_eq!(recorded[0].1, 1.0, "计数那一格每次加一");
+        assert_eq!(recorded[1].0, TOOL_OUTPUT_TRUNCATED_CHARS_TOTAL);
+        assert_eq!(recorded[1].1, 4096.0, "字符量那一格加的是丢掉的字数");
+        for (_, _, labels) in recorded.iter() {
+            assert_eq!(
+                labels.get("tool").map(String::as_str),
+                Some("run_command"),
+                "两格必须按同一个 tool 标签写，否则减不出落 Raw 比例"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unkeyed_cut_is_counted_under_a_cause_of_its_own() {
+        // 没有 task id 时归档根本没被发起。这一份丢失与被拒同样是丢了尾巴，
+        // 得落在同一族里，否则 truncated 减 archive_failed 会把这一份算成落了地。
+        let c = client(200, false);
+        let counters = Arc::new(Counters::default());
+        let archiver = HttpToolOutputArchive::new(
+            c,
+            Some("http://cogneva:8080".into()),
+            Some(counters.clone()),
+        );
+        archiver.record_unkeyed("run_command").await;
         let recorded = counters.0.lock().unwrap();
         assert_eq!(recorded.len(), 1);
-        assert_eq!(recorded[0].0, TOOL_OUTPUT_TRUNCATED_TOTAL);
+        assert_eq!(recorded[0].0, TOOL_OUTPUT_ARCHIVE_FAILED_TOTAL);
         assert_eq!(
-            recorded[0].1.get("tool").map(String::as_str),
-            Some("run_command")
+            recorded[0].2.get("cause").map(String::as_str),
+            Some(cause::UNKEYED)
         );
     }
 }

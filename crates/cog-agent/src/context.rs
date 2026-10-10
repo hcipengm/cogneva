@@ -188,6 +188,13 @@ pub fn tool_result_budget_chars(max_tokens: usize) -> usize {
 /// （4 token），于是一条没有空格的巨块——二进制倾倒、单行大 JSON——
 /// 在窗口账面上永远是 4 token，预算根本不会触发。按字符数卡，这条例外
 /// 就不存在了。
+///
+/// 这里丢掉 [`Truncation::dropped_chars`] 而不发读数，是因为这条路径本就不该
+/// 对工具结果生效：返回点用的是同一个预算，已经按它裁过一次并用带引用的标记
+/// 补齐，这里再裁会连引用一起砍掉。它是一道兜底，服务的是别处构造进上下文、
+/// 没经过返回点的工具结果；那条路径上也没有 metrics handle 可发。真在这里
+/// 裁到工具结果，说明两处预算不再同源——那是 `tool_result_budget_chars` 的
+/// 不变量破了，不是一条读数能报的。
 fn bound_tool_result(message: Message, max_tokens: usize) -> Message {
     let Message::ToolResult {
         tool_call_id,
@@ -207,14 +214,25 @@ fn bound_tool_result(message: Message, max_tokens: usize) -> Message {
     Message::ToolResult {
         tool_call_id: tool_call_id.clone(),
         tool_name: tool_name.clone(),
-        content: vec![cog_core::ContentBlock::text(truncate_to_chars(
-            &text,
-            budget_chars,
-            None,
-        ))],
+        content: vec![cog_core::ContentBlock::text(
+            truncate_to_chars(&text, budget_chars, None).text,
+        )],
         is_error: *is_error,
         timestamp: *timestamp,
     }
+}
+
+/// 一次裁剪的结果：模型将看到的文本，以及原文里没被看到的字符数。
+///
+/// 两者同源。丢弃量就是「原文长度减去保留数」，而保留数是标记算法本身的
+/// 产物（标记也算进预算）；在这里之外重算一遍就是第二份会漂的实现。返回点
+/// 拿这个数去发字符量读数——"截了几条"之外的另一半，只有它说得出一条被砍的
+/// 结果是丢了十个字还是十万个字。
+pub struct Truncation {
+    /// 模型将看到的部分：原文头部，尾部接上说明被丢了多少的标记。
+    pub text: String,
+    /// 原文里没有出现在 [`Self::text`] 中的字符数。没超预算时是 0。
+    pub dropped_chars: usize,
 }
 
 /// 从头部保留到预算为止，并在尾部说明被丢掉了多少。
@@ -230,10 +248,13 @@ fn bound_tool_result(message: Message, max_tokens: usize) -> Message {
 /// 标记本身也算进预算：它比预算长时结果会溢出，进上下文时被第二次裁剪，
 /// 而那一次会把标记连同里面的引用一起砍掉——归档了却没人拿得到引用，等于
 /// 没归档。所以保留的字符数按「预算减去标记」算，标记里报的也就是这个数。
-pub fn truncate_to_chars(text: &str, budget_chars: usize, reference: Option<&str>) -> String {
+pub fn truncate_to_chars(text: &str, budget_chars: usize, reference: Option<&str>) -> Truncation {
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= budget_chars {
-        return text.to_string();
+        return Truncation {
+            text: text.to_string(),
+            dropped_chars: 0,
+        };
     }
     let total = chars.len();
     let marker_for = |shown: usize| match reference {
@@ -251,7 +272,12 @@ pub fn truncate_to_chars(text: &str, budget_chars: usize, reference: Option<&str
         .min(total);
     let keep = keep.min(budget_chars.saturating_sub(marker_for(keep).chars().count()));
     let kept: String = chars[..keep].iter().collect();
-    format!("{kept}{}", marker_for(keep))
+    Truncation {
+        text: format!("{kept}{}", marker_for(keep)),
+        // 标记不在原文里，所以「没被看到的」只算原文被砍掉的那一段：保留数
+        // 是 `keep`，不是 `keep` 加上标记长度。
+        dropped_chars: total - keep,
+    }
 }
 
 /// 简化的 token 估算。
@@ -491,17 +517,32 @@ mod tests {
         let text = "x".repeat(5000);
         let out = truncate_to_chars(&text, 400, Some("artifact://default/t-0001-0002"));
         assert!(
-            out.contains("tool output truncated"),
-            "被砍过要说出来: {out}"
+            out.text.contains("tool output truncated"),
+            "被砍过要说出来: {}",
+            out.text
         );
         assert!(
-            out.contains("artifact://default/t-0001-0002"),
-            "归档了就要给得回引用，否则砍掉的字节没人拿得到: {out}"
+            out.text.contains("artifact://default/t-0001-0002"),
+            "归档了就要给得回引用，否则砍掉的字节没人拿得到: {}",
+            out.text
         );
         assert!(
-            out.chars().count() <= 400,
+            out.text.chars().count() <= 400,
             "标记本身也算预算，否则进窗口会被二次裁剪: {}",
-            out.chars().count()
+            out.text.chars().count()
+        );
+        // 丢掉的字符数要和文本里的标记讲同一件事：标记左边就是保留的头部，
+        // 两者差一个字符就说明读数与模型看到的不是同一个量。
+        let kept = out
+            .text
+            .find("\n[tool output truncated: ")
+            .expect("标记在尾部")
+            .min(out.text.len());
+        let kept = out.text[..kept].chars().count();
+        assert_eq!(
+            out.dropped_chars,
+            text.chars().count() - kept,
+            "丢弃量必须等于原文长度减去标记左边保留的头部"
         );
     }
 
@@ -517,7 +558,7 @@ mod tests {
             serde_json::json!({"command": "dump"}),
         )]));
         let full = "y".repeat(5000);
-        let truncated = truncate_to_chars(&full, budget, Some("artifact://default/ref-1"));
+        let truncated = truncate_to_chars(&full, budget, Some("artifact://default/ref-1")).text;
         ctx.add_message(Message::tool_result_text(
             "call_ref",
             "run_command",

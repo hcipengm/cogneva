@@ -869,44 +869,62 @@ impl AgentRuntime {
         // Oversized: the tail is about to be cut, and those bytes exist nowhere
         // else. Write the full output back where the read side can fetch it and
         // name it in the marker, so the loss is addressable rather than silent.
+        //
+        // The archive is attempted before the cut is made, because the reference
+        // it returns changes the marker's length and the marker is charged to the
+        // same budget: a cut made without it would keep characters the model will
+        // not actually be shown. So the cut has to be made once, with whatever
+        // reference came back, and counted from that one result -- two calls
+        // would report a size the text does not carry.
         let reference = match &self.tool_output_archive {
-            Some(archive) => {
-                // The event is counted before the archive is attempted: the
-                // output was cut whether or not the tail could be saved, and a
-                // run whose archives all fail is still a run that truncates.
-                archive.record_truncation(tool_name).await;
-                match task_id {
-                    Some(task_id) => {
-                        let id = cog_core::tool_output_raw_id(task_id, turn, frame);
-                        match archive
-                            .archive(tool_name, &id, "application/json", text)
-                            .await
-                        {
-                            Ok(uri) => Some(uri),
-                            Err(e) => {
-                                tracing::warn!(
-                                    tool = tool_name,
-                                    id = %id,
-                                    error = %e,
-                                    "tool output does not fit the window and could not be archived; \
-                                     the marker carries no reference"
-                                );
-                                None
-                            }
+            Some(archive) => match task_id {
+                Some(task_id) => {
+                    let id = cog_core::tool_output_raw_id(task_id, turn, frame);
+                    match archive
+                        .archive(tool_name, &id, "application/json", text)
+                        .await
+                    {
+                        Ok(uri) => Some(uri),
+                        Err(e) => {
+                            tracing::warn!(
+                                tool = tool_name,
+                                id = %id,
+                                error = %e,
+                                "tool output does not fit the window and could not be archived; \
+                                 the marker carries no reference"
+                            );
+                            None
                         }
                     }
-                    // No task id to key a source by: nothing to fetch it back
-                    // under, so the marker stays reference-free.
-                    None => None,
                 }
-            }
+                // No task id to key a source by: nothing to fetch it back
+                // under, so the marker stays reference-free. That is a fate of
+                // this cut, not a reason to pass over it -- nothing counts the
+                // tail as lost otherwise, and it is exactly as lost as one whose
+                // write was refused.
+                None => {
+                    tracing::warn!(
+                        tool = tool_name,
+                        "tool output does not fit the window and the run carries no task id \
+                         to archive it under; the marker carries no reference"
+                    );
+                    archive.record_unkeyed(tool_name).await;
+                    None
+                }
+            },
             None => None,
         };
-        Message::tool_result_text(
-            tool_call_id,
-            tool_name,
-            truncate_to_chars(text, budget, reference.as_deref()),
-        )
+        let cut = truncate_to_chars(text, budget, reference.as_deref());
+        // Counted after the archive is attempted, so the size is the size of the
+        // text actually handed over. Every path above reaches here -- a failed
+        // archive and an unkeyed run included -- so a run whose archive never
+        // works is still a run that truncates, and its cuts are still counted.
+        if let Some(archive) = &self.tool_output_archive {
+            archive
+                .record_truncation(tool_name, cut.dropped_chars)
+                .await;
+        }
+        Message::tool_result_text(tool_call_id, tool_name, cut.text)
     }
 
     /// The run itself, from the first turn to its answer.
@@ -3403,7 +3421,8 @@ mod tests {
     #[derive(Debug, Default)]
     struct RecordingArchive {
         archived: std::sync::Mutex<Vec<(String, String, String)>>,
-        truncations: std::sync::Mutex<Vec<String>>,
+        truncations: std::sync::Mutex<Vec<(String, usize)>>,
+        unkeyed: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -3425,8 +3444,15 @@ mod tests {
             ))
         }
 
-        async fn record_truncation(&self, tool: &str) {
-            self.truncations.lock().unwrap().push(tool.into());
+        async fn record_truncation(&self, tool: &str, dropped_chars: usize) {
+            self.truncations
+                .lock()
+                .unwrap()
+                .push((tool.into(), dropped_chars));
+        }
+
+        async fn record_unkeyed(&self, tool: &str) {
+            self.unkeyed.lock().unwrap().push(tool.into());
         }
     }
 
@@ -3548,7 +3574,6 @@ mod tests {
             "id 把任务与 (turn, frame) 编进去，零填充"
         );
         assert_eq!(archived[0].2, expected, "归档的是全文，不是截断后的那段");
-        assert_eq!(archive.truncations.lock().unwrap().clone(), vec!["bigdump"]);
 
         let joined = runtime
             .get_context()
@@ -3564,6 +3589,27 @@ mod tests {
         assert!(
             joined.contains("tool output truncated"),
             "被砍过必须在文本里自己说出来: {joined}"
+        );
+
+        let truncations = archive.truncations.lock().unwrap().clone();
+        assert_eq!(truncations.len(), 1, "一次超大输出，正好记一次截断");
+        assert_eq!(truncations[0].0, "bigdump");
+        // 记下的字符量要和标记里报的是同一件事：标记左边就是保留下来的头部。
+        let shown: usize = joined
+            .split("[tool output truncated: showing ")
+            .nth(1)
+            .and_then(|rest| rest.split(" of ").next())
+            .and_then(|n| n.parse().ok())
+            .expect("标记里写着保留了多少字符");
+        assert_eq!(
+            truncations[0].1,
+            expected.chars().count() - shown,
+            "记录的丢弃量必须是原文长度减去标记里报的保留数；带引用时标记更长，\
+             保留数因此更小，这个数不能按不带引用的标记算"
+        );
+        assert!(
+            archive.unkeyed.lock().unwrap().is_empty(),
+            "有 task id 的运行不该走无键那条结局"
         );
     }
 }

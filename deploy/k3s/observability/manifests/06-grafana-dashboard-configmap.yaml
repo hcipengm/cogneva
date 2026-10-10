@@ -1210,6 +1210,70 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 33,
+          "title": "Tool Output Characters Dropped by Truncation",
+          "description": "How much of a tool's output the conversation never carried, by tool, over 1h: the sum of what each cut left out, deduplicated across the fleet the way every store-backed counter here is (the store serves one row to every reader, so a sum over the scrapes would multiply by the number of pods). This is the half the cut count cannot answer -- one result cut by ten characters and one cut by a hundred thousand are one increment each on the count -- and it is what says whether oversized tool results are eating the context budget or are a rare shape. Read it over the count rather than instead of it: a tool whose count is flat and whose characters climb is one whose outputs got bigger, and one where both climb together is a tool being asked for more than it used to be. A cut is expected traffic, not a fault -- a task that asks for a whole file crosses the window share on purpose -- so no threshold is drawn. What is a fault is a cut whose tail could not be stored, and that is the panel beside this one.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 128
+          },
+          "targets": [
+            {
+              "expr": "max by (tool) (increase(cogneva_tool_output_truncated_chars_total[1h]))",
+              "legendFormat": "{{tool}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 34,
+          "title": "Tool Output Landed in Raw",
+          "description": "The share of a tool's truncated outputs whose tail actually reached the Raw layer, by tool, over 1h -- one reading of the mechanism, not two series a reader has to combine. Every cut ends in exactly one of two ways: the full text was stored and the truncation marker carries an artifact:// reference, or it was not and the failure is counted under a cause. So the share that landed is the truncation count minus the failure count over the truncation count, and a line below 1 is cuts whose tail exists nowhere -- the model saw the marker and the part it did not see is gone for good, since nothing retries it. A flat 1 is every cut recoverable, and a series that is absent is a tool nothing was cut from (increase over an empty window publishes no series at all, so absence here means no cut rather than a lost reading). The failure counter beside it, and the alert on it, carry the cause that names the repair: unconfigured (no memory API base), unreachable (the API did not answer), refused (it answered and rejected the write), unkeyed (the run carried no task id, so no source name existed to file the tail under and no attempt was made). The last one is why the share is read here rather than derived: without it in the count, those cuts would read as landed. The arithmetic is exact only while both series carry the same tool labels, so the panel and the alert read the same pair.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 128
+          },
+          "targets": [
+            {
+              "expr": "1 - (max by (tool) (increase(cogneva_tool_output_archive_failed_total[1h])) / max by (tool) (increase(cogneva_tool_output_truncated_total[1h])))",
+              "legendFormat": "{{tool}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "min": 0,
+              "max": 1,
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {

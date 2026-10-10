@@ -596,17 +596,47 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          the same fact outside the conversation, so a run that spends its budget \
          on oversized tool results is countable rather than silent. Read per \
          `tool`: a series climbing for one tool names that tool's output shape, \
-         not the context budget as a whole.",
+         not the context budget as a whole. It is the denominator of the landed \
+         share: every cut ends either with its tail stored or with an increment \
+         on `cogneva_tool_output_archive_failed_total`, so the share of cuts \
+         whose tail stayed reachable is this counter minus that one over this \
+         one, and the residue is what the reading cannot account for. Read it \
+         with `cogneva_tool_output_truncated_chars_total` for the size of what \
+         was withheld: this counter says how many results were cut and that one \
+         says how much of them the model never saw.",
+    ),
+    (
+        crate::metric_names::TOOL_OUTPUT_TRUNCATED_CHARS_TOTAL.as_str(),
+        "Characters of tool output that the conversation never carried because \
+         the whole result did not fit the context, labelled by `tool`, one \
+         increment per cut carrying the number of characters left out. \
+         `cogneva_tool_output_truncated_total` counts the cuts and says nothing \
+         about their size -- one that dropped ten characters and one that \
+         dropped a hundred thousand are one increment each on it -- so a reader \
+         deciding whether oversized results are eating the conversation needs \
+         these two together, and the ratio or the spend alone cannot be \
+         recovered from either. On the cut that reports it the value is the \
+         original length minus the kept prefix, the same two numbers the marker \
+         in the text carries, so the count is the number of increments and this \
+         is their sum.",
     ),
     (
         crate::metric_names::TOOL_OUTPUT_ARCHIVE_FAILED_TOTAL.as_str(),
         "Archives of a truncated tool output's full text that did not land, \
-         labelled by `tool`, one increment per failed archive. A truncation \
-         marker carries an `artifact://` reference only when the full text was \
-         stored, so this counts the times a caller following such a reference \
-         would find nothing; read beside `cogneva_tool_output_truncated_total`, \
-         where a share of the two moving together names the archive endpoint \
-         rather than ordinary truncation.",
+         labelled by `tool` and by `cause`, one increment per cut whose tail was \
+         not stored. A truncation marker carries an `artifact://` reference only \
+         when the full text was stored, so this counts the times a caller \
+         following such a reference would find nothing. The causes are a closed \
+         set and every cut ends in one of them: `unconfigured` (no base URL was \
+         handed to this deployment, so nothing was attempted), `unreachable` \
+         (the API did not answer), `refused` (it answered and rejected the \
+         write), and `unkeyed` (the run carried no task id, so there was no \
+         source to file the tail under and no attempt was made). That closure is \
+         the point of the series: `cogneva_tool_output_truncated_total` minus \
+         this one is the number of cuts whose tail landed, and the subtraction \
+         only names a share while every unlanded cut is counted here. Read it \
+         beside the truncation counter, where a share of the two moving together \
+         names the archive endpoint rather than ordinary truncation.",
     ),
     (
         crate::metric_names::TOOL_OUTPUT_FETCH_BUDGET_EXHAUSTED_TOTAL.as_str(),

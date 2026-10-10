@@ -422,6 +422,25 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &[],
         "crates/cog-reflection/src/registry_footprint.rs",
     ),
+    // The tool-output fidelity pair. All three are recorded from one site, the
+    // archive handle that decides what became of a cut, which is why the count
+    // and its character total cannot disagree about their labels and why the
+    // failure family is what the landed-share line subtracts.
+    (
+        "cogneva_tool_output_truncated_total",
+        &["tool"],
+        "crates/cog-agent/src/archive.rs",
+    ),
+    (
+        "cogneva_tool_output_truncated_chars_total",
+        &["tool"],
+        "crates/cog-agent/src/archive.rs",
+    ),
+    (
+        "cogneva_tool_output_archive_failed_total",
+        &["tool", "cause"],
+        "crates/cog-agent/src/archive.rs",
+    ),
 ];
 
 /// Series the dashboard may read that this workspace does not produce, with the

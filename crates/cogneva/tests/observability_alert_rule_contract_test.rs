@@ -2121,19 +2121,18 @@ const UNREAD: &[(&str, Unread)] = &[
         "cogneva_landing_ci_failure_inherited_total",
         Unread::Gap("landings whose red verdict was traced to the commit they were replayed onto rather than to the change, so the change was kept instead of reverted. The underlying condition -- the base branch's tip is red -- is what mainline_ci_verdict_failed reads, but this series does not carry that fact: it carries the non-action taken because of it, and that warn line names the change and the checks it passed through. A rule would have to declare how many spared landings are a fault, which is a bound on how long the branch may stay red while landings keep landing: a policy nobody stated, so the missing half is a bound rather than a reader"),
     ),
-    // Tool outputs that did not fit the context window, by tool. One truncation
-    // is an output that was cut and had its tail archived -- expected traffic,
-    // not a fault: a tool that a task asks to dump a large file will cross the
-    // window share on purpose. What would make a run of them a fault is a bound
-    // nobody declared, since the right amount of truncation depends on what the
-    // tasks read. The fault this pair exists to catch is on the sibling,
-    // cogneva_tool_output_archive_failed_total, which a rule reads; this counter
-    // is its denominator, saying whether an archive failed against a busy
-    // truncation path or a path nothing flowed through.
-    (
-        "cogneva_tool_output_truncated_total",
-        Unread::Gap("tool outputs cut to fit the context window, by tool. Each one had its tail archived, so this is expected traffic rather than a fault, and what would make a run of them a fault -- how much truncation, or which tools -- is a bound nobody declared, because the right amount follows what the tasks read. The fault-worthy half of the pair is the sibling archive-failure counter, which a rule reads; this is what tells a busy truncation path from an idle one"),
-    ),
+    // Tool outputs cut to fit the context window, by tool. The count and its
+    // character total were one debt until the fidelity panel landed: a cut is
+    // expected traffic rather than a fault -- a tool a task asks to dump a large
+    // file will cross the window share on purpose -- so what a rule would need
+    // is a bound on how much truncation is normal, and the right amount follows
+    // what the tasks read. The panel reads the three of them together instead,
+    // which is the reading the pair actually supports: this counter is the
+    // denominator of the landed-in-Raw share, and the character total is how
+    // much was withheld. The fault in that family is the archive-failure
+    // counter, which keeps its rule. So the entry is gone rather than moved --
+    // the fact is read by a face, and leaving it here would be an exemption for
+    // a series that has a reader.
     (
         "cogneva_tool_output_fetch_budget_exhausted_total",
         Unread::Gap("reads of an archived tool output that stopped short of the bytes because the payload outgrew the caller's byte budget, by tool. The budget is the caller's own, so a bounded read is expected traffic like the truncation counter beside it, not a fault: a caller reading back a large archived output sets the budget it can afford and is told when the source is bigger. What would make a run of them a fault is a bound nobody declared, since the right budget follows what the reads ask for, and the repair for one is local to the caller -- raise the budget or fetch the source directly -- rather than a standing condition a rule could hold open"),
@@ -2249,7 +2248,18 @@ fn unresolved_readers(read: &BTreeSet<String>, name: &str, readers: &[&str]) -> 
 /// silently, and a row leaving the table went silently green as well; now either
 /// direction is something the author has to say out loud, which is the only
 /// reason to count them here at all.
-const GAPS_AT_CENSUS: usize = 18;
+///
+/// It came down to 17 in the pass that gave the tool-output fidelity pair a
+/// panel. The truncation count had been filed as a debt whose reader was a bound
+/// nobody could declare -- how much truncation is normal follows what the tasks
+/// read -- and that reason was true and still is. What changed is that a reader
+/// arrived which does not need the bound: the panel draws the share of cuts whose
+/// tail landed, and that share is the count minus the failure counter, so the
+/// count is no longer read for its own level but as one operand of an identity.
+/// The character total went in beside it in the same pass and needed no entry of
+/// its own, which is the ordinary case for a new name added with its reader
+/// rather than before one.
+const GAPS_AT_CENSUS: usize = 17;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {
