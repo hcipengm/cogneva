@@ -185,22 +185,10 @@ impl DeclarationInputs {
 /// Extensions whose files are prose rather than something a compiler, a schema
 /// or a test run reads.
 ///
-/// An allow-list on purpose: a path this list does not recognize counts as code,
-/// so an unfamiliar extension can only cost the request the shortcut, never earn
-/// it. The other direction would let a file nobody classified collect the
-/// lightest route by being unreadable here.
-const PROSE_EXTENSIONS: &[&str] = &["md", "markdown", "txt", "rst", "adoc"];
-
-/// Whether a declared path is prose.
-fn is_prose_path(path: &str) -> bool {
-    match path.rsplit_once('.') {
-        Some((_, ext)) => PROSE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()),
-        // A bare name (`LICENSE`, `README`) has no extension to read, and a
-        // dotted directory (`docs/v1.2/notes`) is not a file name at all; both
-        // stay code for the same reason the unknown extensions do.
-        None => false,
-    }
-}
+/// The list lives in the contract layer because the routing rule here and the
+/// change pipeline's tiering both read it, and two copies would let the same
+/// path be prose for one reader and code for the other.
+pub use cog_core::is_prose_path;
 
 /// What a request declares, read once.
 ///

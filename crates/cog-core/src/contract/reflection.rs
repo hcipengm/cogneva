@@ -484,6 +484,251 @@ pub fn count_diff_lines(content: &str) -> usize {
         .count()
 }
 
+/// Extensions whose files are prose rather than something a compiler, a schema
+/// or a test run reads.
+///
+/// An allow-list on purpose: a path this list does not recognize counts as code,
+/// so an unfamiliar extension can only cost a request the lightest route, never
+/// earn it. The other direction would let a file nobody classified collect the
+/// lightest route by being unreadable here.
+pub const PROSE_EXTENSIONS: &[&str] = &["md", "markdown", "txt", "rst", "adoc"];
+
+/// Extensions whose files carry configuration a running process reads by key.
+///
+/// Separate from [`PROSE_EXTENSIONS`] because a configuration change and a
+/// documentation change are routed differently: prose is read by people, and a
+/// key is read by code, so a key that a gate reads decides whether the gates
+/// have to be re-run while a paragraph never can.
+pub const CONFIG_EXTENSIONS: &[&str] = &["json", "yaml", "yml", "toml"];
+
+/// The extension of a path, lowercased, or `None` when it has none.
+fn path_extension(path: &str) -> Option<String> {
+    path.rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+}
+
+/// Whether a path names prose.
+///
+/// A bare name (`LICENSE`, `README`) has no extension to read, and a dotted
+/// directory (`docs/v1.2/notes`) is not a file name at all; both stay code for
+/// the same reason an unknown extension does.
+pub fn is_prose_path(path: &str) -> bool {
+    match path_extension(path) {
+        Some(ext) => PROSE_EXTENSIONS.contains(&ext.as_str()),
+        None => false,
+    }
+}
+
+/// Whether a path names a configuration file.
+pub fn is_config_path(path: &str) -> bool {
+    match path_extension(path) {
+        Some(ext) => CONFIG_EXTENSIONS.contains(&ext.as_str()),
+        None => false,
+    }
+}
+
+/// What a diff does, in the three shapes a reader that only wants to route it
+/// needs — and nothing else.
+///
+/// Distinct from [`parse_diff_targets`] on purpose. A target list answers "which
+/// files, created/modified/deleted"; this answers "which configuration keys moved,
+/// and which lines stopped existing". The routing decision needs the second: two
+/// changes over the same path set are two different changes when one of them
+/// rewrites `memory.ingest.extraction_input_budget_tokens` and the other rewrites
+/// a comment beside it, and only a key set can tell them apart.
+///
+/// Only removals are recorded. An added line cannot take a check away, so a
+/// caller asking "did this change take a gate point out" reads removals and
+/// nothing else; recording additions too would make the answer larger than the
+/// question.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiffShape {
+    /// Configuration files the diff touches, whether or not a key was read out
+    /// of them. Kept apart from the key set because a change to a config file
+    /// that removes no key and adds no key is still a configuration change.
+    pub config_files: BTreeSet<String>,
+    /// The leaf names of the configuration keys the diff writes or removes.
+    ///
+    /// Leaf names, not dotted paths: a diff does not carry the indentation
+    /// context that would let a dotted path be rebuilt without the file it
+    /// applies to, and rebuilding one out of the diff's own text would be a
+    /// reading that changes with how git chose to cut the hunks. A leaf name is
+    /// a token the file and the reader both spell the same way.
+    pub changed_config_keys: BTreeSet<String>,
+    /// Removed lines, per file, with the leading `-` stripped.
+    pub removed_lines: BTreeMap<String, Vec<String>>,
+    /// Added lines, per file, with the leading `+` stripped.
+    ///
+    /// Carried so that a removal can be told from an edit in place. A value
+    /// change removes the old line and adds the new one, and reading only the
+    /// removal would count every configuration update as a deletion.
+    pub added_lines: BTreeMap<String, Vec<String>>,
+}
+
+impl DiffShape {
+    /// Whether the diff removes any line at all.
+    pub fn removes_lines(&self) -> bool {
+        !self.removed_lines.is_empty()
+    }
+
+    /// Whether the diff changes a configuration file.
+    pub fn touches_config(&self) -> bool {
+        !self.config_files.is_empty()
+    }
+
+    /// How many lines the diff removed, over every file.
+    pub fn removed_line_count(&self) -> usize {
+        self.removed_lines.values().map(Vec::len).sum()
+    }
+
+    /// The identifiers a file lost and did not get back, per file.
+    ///
+    /// This is what tells a deletion from an edit. Comparing whole lines would
+    /// fail on the commonest change of all — a value rewritten in place removes
+    /// one line and adds a different one — so the comparison is over the
+    /// identifiers the two sides name: `x = 1` removed and `x = 2` added loses
+    /// nothing, while `let cap = max_diff_lines;` removed with nothing put back
+    /// loses `max_diff_lines`. A name that moved to another line in the same
+    /// file is not a loss, which is the direction that keeps an ordinary
+    /// refactor from reading as a gate point taken out.
+    pub fn net_removed_tokens(&self) -> BTreeMap<String, BTreeSet<String>> {
+        let mut net = BTreeMap::new();
+        for (path, removed) in &self.removed_lines {
+            let added: BTreeSet<String> = self
+                .added_lines
+                .get(path)
+                .map(|lines| identifier_tokens(&lines.join("\n")))
+                .unwrap_or_default();
+            let gone: BTreeSet<String> = identifier_tokens(&removed.join("\n"))
+                .into_iter()
+                .filter(|token| !added.contains(token))
+                .collect();
+            if !gone.is_empty() {
+                net.insert(path.clone(), gone);
+            }
+        }
+        net
+    }
+}
+
+/// The identifiers a text names: runs of letters, digits and underscores that
+/// start with a letter or an underscore.
+///
+/// Deliberately wider than "looks like a configuration key" — this is the
+/// comparison side of [`DiffShape::net_removed_tokens`], where the question is
+/// whether a name survived, not whether it is a name of any particular shape.
+pub fn identifier_tokens(text: &str) -> BTreeSet<String> {
+    let mut tokens = BTreeSet::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        let word = ch.is_ascii_alphanumeric() || ch == '_';
+        if word {
+            if current.is_empty() && ch.is_ascii_digit() {
+                // A run starting with a digit is a number, not a name.
+                continue;
+            }
+            current.push(ch);
+            continue;
+        }
+        if !current.is_empty() {
+            tokens.insert(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.insert(current);
+    }
+    tokens
+}
+
+/// Read a diff into the shapes a routing decision reads it by.
+///
+/// Built on [`diff_file_entries`] rather than on a line scan so that a body line
+/// that merely looks like a header cannot invent a key or a removal: the section
+/// grammar is the one place that decides which lines are body, and a second
+/// reading here would disagree with it exactly where a diff is malformed.
+pub fn diff_shape(content: &str) -> DiffShape {
+    let mut shape = DiffShape::default();
+    for entry in diff_file_entries(content) {
+        let config = is_config_path(&entry.path);
+        if config {
+            shape.config_files.insert(entry.path.clone());
+        }
+        for hunk in &entry.hunks {
+            for line in hunk.lines().skip(1) {
+                // `---` is a section header, never a body line, and the section
+                // grammar has already kept it out of the body — so anything left
+                // starting with `-` here is a removal.
+                let body = if let Some(rest) = line.strip_prefix('-') {
+                    shape
+                        .removed_lines
+                        .entry(entry.path.clone())
+                        .or_default()
+                        .push(rest.to_string());
+                    rest
+                } else if let Some(rest) = line.strip_prefix('+') {
+                    shape
+                        .added_lines
+                        .entry(entry.path.clone())
+                        .or_default()
+                        .push(rest.to_string());
+                    rest
+                } else {
+                    // A context line is one the change did not write.
+                    continue;
+                };
+                if config {
+                    if let Some(key) = config_key_token(body) {
+                        shape.changed_config_keys.insert(key);
+                    }
+                }
+            }
+        }
+    }
+    shape
+}
+
+/// The leaf name of a configuration key written on one changed line, if any.
+///
+/// Reads the two spellings a configuration document uses for a key — a quoted
+/// JSON name and a bare YAML name — and requires the `:` that makes it a key
+/// rather than a value. Anything else (a comment, a scalar, a list entry's
+/// value) yields nothing, which is the safe direction: a key this misses costs a
+/// configuration change the strongest tier, while a key it invents would send a
+/// change to the real gate for a line that moved no key at all.
+fn config_key_token(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("---") {
+        return None;
+    }
+    let name = if let Some(rest) = trimmed.strip_prefix('"') {
+        let end = rest.find('"')?;
+        let name = &rest[..end];
+        if rest[end + 1..].trim_start().starts_with(':') {
+            name
+        } else {
+            return None;
+        }
+    } else {
+        let end = trimmed.find(':')?;
+        let name = trimmed[..end].trim();
+        name
+    };
+    if name.is_empty() {
+        return None;
+    }
+    let leaf = name.rsplit('.').next().unwrap_or(name).trim();
+    // A dotted path names the key; `memory.ingest.x` and `x` are the same key to
+    // a reader that only compares names.
+    let leaf: String = leaf
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    if leaf.is_empty() || leaf.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(leaf)
+}
+
 /// The lines a diff writes, per file, numbered on the side the file ends up on.
 ///
 /// The line budget answers "how much did this change write"; this answers
@@ -3488,5 +3733,87 @@ test a::b ... FAILED\n\
             "foo_bar-zzzzzzzzzzzzzzzz/x",
             "a suffix that is not hex at all is part of the name"
         );
+    }
+
+    #[test]
+    fn prose_and_config_are_an_allow_list_each_way() {
+        assert!(is_prose_path("docs/guide.md"));
+        assert!(is_prose_path("README.MARKDOWN"));
+        assert!(!is_prose_path("crates/cog-core/src/lib.rs"));
+        // A bare name has no extension to read, so it stays code.
+        assert!(!is_prose_path("LICENSE"));
+        // A dotted directory is not a file name at all.
+        assert!(!is_prose_path("docs/v1.2/notes"));
+
+        assert!(is_config_path("config/cogneva.json"));
+        assert!(is_config_path("deploy/x.yaml"));
+        assert!(is_config_path("Cargo.toml"));
+        assert!(!is_config_path("docs/guide.md"));
+        // The reference document is configuration the deployment ships, so it
+        // has to read as configuration. A rule that went by how a file looks —
+        // "an example, so documentation" — would put it in the prose row.
+        assert!(is_config_path("cogneva.example.json"));
+    }
+
+    #[test]
+    fn a_value_rewritten_in_place_losses_no_name() {
+        let diff = "\
+--- a/cogneva.json
++++ b/cogneva.json
+@@ -1,2 +1,2 @@
+-    \"extraction_input_budget_tokens\": 4096,
++    \"extraction_input_budget_tokens\": 8192,
+";
+        let shape = diff_shape(diff);
+        assert!(shape
+            .changed_config_keys
+            .contains("extraction_input_budget_tokens"));
+        assert_eq!(shape.net_removed_tokens(), BTreeMap::new());
+    }
+
+    #[test]
+    fn a_name_taken_out_and_not_put_back_is_net_removed() {
+        let diff = "\
+--- a/src/gate.rs
++++ b/src/gate.rs
+@@ -1,3 +1,2 @@
+-    let cap = policy.max_diff_lines;
+-    let other = 1;
++    let mode = policy.mode;
+";
+        let net = diff_shape(diff).net_removed_tokens();
+        let gone = net.get("src/gate.rs").expect("the file lost names");
+        // `policy` came back on the added line, so it did not move away; the
+        // names that did are the two the added side never repeats.
+        assert!(gone.contains("max_diff_lines"));
+        assert!(gone.contains("other"));
+        assert!(!gone.contains("policy"));
+    }
+
+    #[test]
+    fn identifier_tokens_skip_numbers_and_keep_names() {
+        let tokens = identifier_tokens("for (i, x_1) in v.iter() { let a9 = 12; }");
+        assert!(tokens.contains("x_1"));
+        assert!(tokens.contains("a9"));
+        assert!(!tokens.contains("12"));
+        assert!(!tokens.contains("9"));
+    }
+
+    #[test]
+    fn a_malformed_diff_cannot_invent_a_target_or_a_key() {
+        // The section grammar decides which lines are body; a body line that
+        // merely looks like a header must not start a section, and a key read
+        // off such a line would be a reading of the diff's formatting rather
+        // than of the change.
+        let diff = "\
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,2 +1,2 @@
+-    let fake_key_here = 1;
++    let other = 2;
+";
+        let shape = diff_shape(diff);
+        assert!(shape.changed_config_keys.is_empty());
+        assert!(shape.config_files.is_empty());
     }
 }
