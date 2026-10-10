@@ -125,6 +125,7 @@ print_files=""
 # The catalog above is the committed one. A test substitutes another by pointing
 # BENCHMARK_CATALOG_FILE at a file that defines catalog(); nothing else changes.
 if [ -n "${BENCHMARK_CATALOG_FILE:-}" ]; then
+  # shellcheck source=/dev/null
   . "$BENCHMARK_CATALOG_FILE"
 fi
 
@@ -307,7 +308,7 @@ provision_benchmark() {
       local tmp="$dest/.extract.$$"
       rm -rf "$tmp"; mkdir -p "$tmp"
       tar -xzf "$dest/${a_dest[0]}" -C "$tmp" --strip-components=1
-      rm -rf "$dest/$extract_dir"
+      rm -rf "${dest:?}/${extract_dir:?}"
       mv "$tmp" "$dest/$extract_dir"
       members_ok ||
         die "$extract_dir after extraction does not match the catalog (the tarball hash passed, so extraction itself is what went wrong)"
