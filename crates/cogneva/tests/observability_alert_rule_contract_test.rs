@@ -100,6 +100,14 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_build_target_scan_interval_seconds",
         "crates/cog-core/src/build_cache.rs",
     ),
+    // Which gates a change was routed to, labelled by the tier it landed in.
+    // The pipeline publishes it; the cells are seeded at zero on the first
+    // change it tiers, so the rule below can read `real_gate` against the total
+    // on every scrape rather than only after a change has been routed.
+    (
+        "cogneva_change_tier_total",
+        "crates/cog-reflection/src/change_pipeline.rs",
+    ),
     // The change queue. The role flag is read on its own, because it is the only
     // one of the four a process publishes without draining the queue: the rule
     // that says no executor exists reads the flag rather than the depth, since

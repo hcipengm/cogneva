@@ -31,9 +31,11 @@
 //! The carriers' *paths* are not compiled into the binary. A change that adds
 //! `deploy/scripts/check-something.sh` adds a carrier, and a list built at
 //! compile time would not contain it — so the change that most needs the gate
-//! would be the one routed past it. The walk runs against the checkout the
-//! change is being applied to, which is also the only revision that stays
-//! correct when the running binary and the checkout are not the same commit.
+//! would be the one routed past it. So a path is tested against the patterns
+//! directly, which catches a carrier the change adds before it exists on disk;
+//! and the tokens are read out of the checkout the change is being applied to,
+//! which is also the only revision that stays correct when the running binary
+//! and the checkout are not the same commit.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -72,7 +74,13 @@ pub const TOPOLOGY_PREFIXES: &[&str] = &[
 /// The face a change is measured against.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CriteriaFace {
-    /// Repo-relative paths that are criteria carriers, sorted.
+    /// Repo-relative paths on disk that are criteria carriers, sorted.
+    ///
+    /// Read to tell "a line was removed from inside a carrier" from "a line was
+    /// removed elsewhere": a removal's file is always a file that already
+    /// existed, so it is one the walk saw. Whether a path the *diff* names is a
+    /// carrier is answered by pattern instead, since a carrier the change adds
+    /// is not on disk yet.
     pub carriers: BTreeSet<String>,
     /// Identifiers the carriers' own text names. Used to recognize a
     /// configuration key a gate reads.
@@ -97,6 +105,36 @@ pub enum Tier {
     Structural,
     /// The evaluation gate has to run: this change can move a criterion.
     RealGate,
+}
+
+impl Tier {
+    /// The label this tier is counted under.
+    ///
+    /// A closed set rather than a per-change string: the reading's point is to
+    /// compare cells against each other, and a free-form label would let the
+    /// cells drift into one per change.
+    pub fn as_cell(self) -> &'static str {
+        match self {
+            Tier::Minimal => "minimal",
+            Tier::Compile => "compile",
+            Tier::Tests => "tests",
+            Tier::Structural => "structural",
+            Tier::RealGate => "real_gate",
+        }
+    }
+
+    /// Every tier this build can return, weakest first.
+    ///
+    /// Published as a full cross product so that "this tier never fired" and
+    /// "this reading was never wired up" stay different readings: both leave a
+    /// series that is absent otherwise, and only the second is a defect.
+    pub const ALL: [Tier; 5] = [
+        Tier::Minimal,
+        Tier::Compile,
+        Tier::Tests,
+        Tier::Structural,
+        Tier::RealGate,
+    ];
 }
 
 /// Why a tier was reached. Carried so the real gate does not have to re-derive
@@ -187,7 +225,7 @@ pub fn tier(face: &CriteriaFace, targets: &[DiffTarget], shape: &DiffShape) -> T
 
     for path in &paths {
         let normalized = path.replace('\\', "/");
-        if face.carriers.contains(&normalized) {
+        if is_carrier_path(&normalized) {
             hit(TierReason::CriteriaCarrier, Tier::RealGate, true);
         } else if !cog_core::is_prose_path(&normalized)
             && !cog_core::is_config_path(&normalized)
@@ -229,6 +267,17 @@ pub fn tier(face: &CriteriaFace, targets: &[DiffTarget], shape: &DiffShape) -> T
         reasons,
         touches_criteria_code,
     }
+}
+
+/// Whether a path is a criteria carrier, decided by its kind.
+///
+/// Answered from the pattern list rather than from the walked face, because the
+/// tier is decided before the change is applied: a change that *adds* a carrier
+/// has a path in its diff that is not on disk yet, and a face lookup would miss
+/// exactly the change that most needs the gate. The pattern list is the same one
+/// the walk uses, so the two never disagree about what kind of thing a path is.
+pub fn is_carrier_path(path: &str) -> bool {
+    CARRIER_PATTERNS.iter().any(|p| glob_match(path, p))
 }
 
 /// Whether a path is part of the deployment's own topology.
@@ -412,6 +461,21 @@ mod tests {
             &DiffShape::default(),
         );
         assert_eq!(t.tier, Tier::RealGate);
+        assert!(t.touches_criteria_code);
+    }
+
+    #[test]
+    fn a_carrier_the_change_itself_adds_takes_the_real_gate() {
+        // The tier is decided before the change is applied, so a newly added
+        // carrier is not in the walked face — and a face lookup is exactly the
+        // miss that would route the change which introduces a gate *past* it.
+        let t = tier(
+            &face(&[], &[]),
+            &[target("deploy/scripts/check-brand-new.sh")],
+            &DiffShape::default(),
+        );
+        assert_eq!(t.tier, Tier::RealGate);
+        assert_eq!(t.reasons, vec![TierReason::CriteriaCarrier]);
         assert!(t.touches_criteria_code);
     }
 

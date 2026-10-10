@@ -258,6 +258,22 @@ metric_names! {
     // which the task failure sets to 1 and the missing orchestrator does not.
     EVAL_GATE_OUTCOMES_TOTAL => "cogneva_eval_gate_outcomes_total",
 
+    // cog-reflection — which gates a change was routed to, labelled by `tier`,
+    // written once per change the pipeline reaches.
+    //
+    // The routing reads what the change touches, so the cells answer two
+    // questions at once: how much of the fleet's work is prose, configuration,
+    // source, topology, and -- in `real_gate` -- how often a change moved
+    // something a criterion reads. The last cell is the one with no previous
+    // reading anywhere: before this, "no change has ever touched the criteria
+    // face" and "the routing is inert and sends everything to the cheapest
+    // tier" both looked like a quiet fleet.
+    //
+    // A counter, because a change reaching the pipeline is a cumulative event;
+    // the cells are the closed set of tiers, published as a full cross product
+    // so an absent cell and a cell stuck at zero stay different readings.
+    CHANGE_TIER_TOTAL => "cogneva_change_tier_total",
+
     // cog-reflection — how each round of the artifact-level evolution search
     // ended, labelled by `outcome`.
     //

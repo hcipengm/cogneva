@@ -1035,6 +1035,15 @@ data:
               "summary": "tasks were routed {value} time(s) in the last day and not one of them declared a scope: the tiering that routes a small prose-only change to the lightest topology reads the files a request names and the diff it attaches, and this reading says neither ever arrived. The routing is not failing, it is inert -- and a dead rule looks exactly like a quiet day, because both leave the shortcut cell at zero. Usual causes: goals stopped naming the paths they will touch (the measure reads them out of the goal text), or a caller stopped passing affected_files. Every route is still decided by the keyword and score rules it fell back to"
             },
             {
+              "name": "change_tier_routing_inert",
+              "promql": "sum(increase(cogneva_change_tier_total[24h])) unless sum(increase(cogneva_change_tier_total{tier=\"real_gate\"}[24h])) > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "changes were tiered {value} time(s) in the last day and not one of them reached the real gate: the tier is read from what a change touches -- the paths its diff names, the configuration keys it moves, the names it takes out and does not put back -- and a change that can move a criterion is the one the real gate exists for. A window in which every change lands in a cheaper cell says the criteria face is not being seen, not that nothing touched it: the face is walked from the checkout and its keys are read out of the carriers' own text, so a path set that arrives empty and a carrier walk that finds nothing both land every change in the cheapest tier. Read the cells beside this series before repairing: a total spread across compile and tests with real_gate pinned at zero is the routing gone inert, and that looks exactly like a deployment whose changes only ever edited prose. The cells are seeded at zero on the first change the pipeline tiers, so a series that is absent altogether means the pipeline has tiered nothing yet: either no change has reached it, or execution has been moved into a per-change job, which publishes no reading of its own. Neither of those is the routing gone inert, and an absent reading is not evidence of absence"
+            },
+            {
               "name": "build_cache_cap_unmet",
               "promql": "max without (pod, container, instance) (cogneva_build_target_unmet_bytes) > 0",
               "condition": {

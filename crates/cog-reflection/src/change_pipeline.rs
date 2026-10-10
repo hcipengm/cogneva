@@ -273,6 +273,15 @@ pub struct ChangePipeline {
     /// `git apply --check`，所以读数放在这里而不是生成侧——生成侧那份是同一
     /// 事实的第二份判据。缺席时读数只进日志，丢聚合不该让 apply 失败。
     metrics: Option<MetricsSink>,
+    /// Whether the tier cells have been laid down at zero yet.
+    ///
+    /// A tier that never fired and a tier reading that was never wired are the
+    /// same absent series otherwise, and only the second is a defect. The cells
+    /// are seeded on the first change the pipeline tiers rather than at
+    /// construction, because a process that tiers nothing has no distribution to
+    /// report — an all-zero cross product there would read as a fleet that
+    /// routed everything to the cheapest tier.
+    tier_cells_seeded: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// 一个 metrics 句柄，连同给它写的 `Debug`。
@@ -371,6 +380,7 @@ impl ChangePipeline {
             budget: None,
             baseline_failures: Arc::new(tokio::sync::Mutex::new(None)),
             metrics: None,
+            tier_cells_seeded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -761,6 +771,21 @@ impl ChangePipeline {
                 });
             }
         }
+
+        // Which gates this change is entitled to, decided once, here, from what
+        // it touches. The value is computed at this point and nowhere else: the
+        // criteria face is read off a checkout at a moment, so a second
+        // computation further down would be a second reading of a tree that may
+        // have moved — and the two would disagree with no line of code saying
+        // so. Whatever consumes this later takes the `Tiering` as an argument
+        // rather than recomputing it.
+        //
+        // It is a reading today, not a gate: no gate's behaviour changes on it
+        // yet. That is on purpose — the distribution has to accumulate before
+        // anything is decided from it, and it can only accumulate while nothing
+        // is reacting to it.
+        let tiering = self.change_tier(workdir, &targets, &change.content);
+        self.report_change_tier(&tiering).await;
 
         match Self::validate_change_files(&targets, workdir) {
             Ok(()) => {}
@@ -1392,6 +1417,65 @@ impl ChangePipeline {
             {
                 warn!(metric = name.as_str(), error = %e, "could not record change fidelity");
             }
+        }
+    }
+
+    /// Decide which gates this change is entitled to.
+    ///
+    /// The face is walked from the workdir the change is applied to, which is
+    /// the only revision that stays correct when the running binary and the
+    /// checkout are not the same commit — and the only one that can see a
+    /// criteria carrier the change itself adds.
+    fn change_tier(
+        &self,
+        workdir: &Path,
+        targets: &[cog_core::DiffTarget],
+        content: &str,
+    ) -> crate::criteria_face::Tiering {
+        crate::criteria_face::tier(
+            &crate::criteria_face::criteria_face(workdir),
+            targets,
+            &cog_core::diff_shape(content),
+        )
+    }
+
+    /// Publish which gates this change was routed to, and why.
+    ///
+    /// Takes the decision rather than recomputing it: the tier is computed once
+    /// at the call site and this is one of its readers, so a second walk here
+    /// would be a second reading of a tree that may have moved since.
+    async fn report_change_tier(&self, tiering: &crate::criteria_face::Tiering) {
+        info!(
+            tier = tiering.tier.as_cell(),
+            touches_criteria_code = tiering.touches_criteria_code,
+            reasons = ?tiering.reasons,
+            "change tier"
+        );
+        let Some(metrics) = self.metrics.as_ref().map(|sink| &sink.0) else {
+            return;
+        };
+        if !self
+            .tier_cells_seeded
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            for tier in crate::criteria_face::Tier::ALL {
+                let mut labels = std::collections::HashMap::new();
+                labels.insert("tier".to_string(), tier.as_cell().to_string());
+                if let Err(e) = metrics
+                    .record_counter(cog_core::metric_names::CHANGE_TIER_TOTAL, 0.0, labels)
+                    .await
+                {
+                    warn!(error = %e, "change tier cell seed failed");
+                }
+            }
+        }
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("tier".to_string(), tiering.tier.as_cell().to_string());
+        if let Err(e) = metrics
+            .record_counter(cog_core::metric_names::CHANGE_TIER_TOTAL, 1.0, labels)
+            .await
+        {
+            warn!(error = %e, "change tier emit failed");
         }
     }
 
@@ -4428,5 +4512,75 @@ index 1111111..2222222 100644
             !blamed.contains("answer_is_42"),
             "the test that was already failing must not be in the conviction: {blamed}"
         );
+    }
+
+    // ── 变更档位读数 ────────────────────────────────────────────────
+
+    /// 档位读数真的被生产：五格按 0 摆出，真跑的那两条各自只动一格。
+    ///
+    /// 也钉住播种只发生一次——两次判定之后仍是五格，而不是十格或「第一格被重置」。
+    #[tokio::test]
+    async fn the_change_tier_reading_is_produced_and_seeds_every_cell_once() {
+        use cog_core::MetricsBackend;
+
+        let root = tempfile::tempdir().unwrap();
+        // 一棵带真载体的树：档位要能读出「这条变更动了判据面」。
+        let carrier = root.path().join("deploy/scripts");
+        tokio::fs::create_dir_all(&carrier).await.unwrap();
+        tokio::fs::write(carrier.join("check-x.sh"), "grep -q max_diff_lines\n")
+            .await
+            .unwrap();
+
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let pipeline =
+            ChangePipeline::new(root.path(), root.path(), true).with_metrics(metrics.clone());
+        let name = cog_core::metric_names::CHANGE_TIER_TOTAL.as_str();
+
+        assert!(
+            metrics.query_counter_totals(name).await.unwrap().is_empty(),
+            "播种前一条序列都没有——「没接线」与「没跑过」在这里同形"
+        );
+
+        let code_diff = "diff --git a/crates/cog-core/src/lib.rs b/crates/cog-core/src/lib.rs\n\
+index 1111111..2222222 100644\n\
+--- a/crates/cog-core/src/lib.rs\n\
++++ b/crates/cog-core/src/lib.rs\n\
+@@ -1 +1 @@\n\
+-old\n\
++new\n";
+        let code_targets = ChangePipeline::parse_diff(code_diff).unwrap();
+        let code_tier = pipeline.change_tier(root.path(), &code_targets, code_diff);
+        assert_eq!(code_tier.tier, crate::criteria_face::Tier::Tests);
+        pipeline.report_change_tier(&code_tier).await;
+
+        let carrier_diff = "diff --git a/deploy/scripts/check-x.sh b/deploy/scripts/check-x.sh\n\
+index 1111111..2222222 100644\n\
+--- a/deploy/scripts/check-x.sh\n\
++++ b/deploy/scripts/check-x.sh\n\
+@@ -1 +1 @@\n\
+-grep -q max_diff_lines\n\
++grep -q other_threshold\n";
+        let carrier_targets = ChangePipeline::parse_diff(carrier_diff).unwrap();
+        let carrier_tier = pipeline.change_tier(root.path(), &carrier_targets, carrier_diff);
+        assert_eq!(carrier_tier.tier, crate::criteria_face::Tier::RealGate);
+        pipeline.report_change_tier(&carrier_tier).await;
+
+        let cells: std::collections::BTreeMap<String, f64> = metrics
+            .query_counter_totals(name)
+            .await
+            .unwrap()
+            .iter()
+            .map(|s| (s.labels["tier"].clone(), s.value))
+            .collect();
+        assert_eq!(
+            cells.len(),
+            crate::criteria_face::Tier::ALL.len(),
+            "播种的是全叉积，且只播一次"
+        );
+        assert_eq!(cells["tests"], 1.0, "源码变更落到测试档");
+        assert_eq!(cells["real_gate"], 1.0, "动载体的变更落到真门档");
+        for cell in ["minimal", "compile", "structural"] {
+            assert_eq!(cells[cell], 0.0, "{cell} 没人走过，读到的必须是 0");
+        }
     }
 }

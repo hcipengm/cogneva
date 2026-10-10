@@ -192,6 +192,22 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          wait",
     ),
     (
+        "cogneva_change_tier_total",
+        "Which gates a change was routed to, labelled by `tier`, written once \
+         per change the pipeline reaches. The routing reads what the change \
+         touches -- its paths, the configuration keys it moves, the names it \
+         takes out and does not put back -- and the cells are the closed set it \
+         can land in: `minimal` for prose only, `compile` and `tests` for source \
+         that is not a criterion, `structural` for a configuration value no \
+         criterion reads and for the deployment's own topology, and `real_gate` \
+         for a change that can move a criterion. The cells are published as a \
+         full cross product, so a tier that never fired and a producer that was \
+         never wired both read as zero rather than as a missing series. Read \
+         `real_gate` against the total: a fleet that tiles every change but \
+         never once reaches the real gate is a routing that has gone inert, and \
+         that is the reading no other series states",
+    ),
+    (
         "cogneva_landing_failures_total",
         "Landing calls that failed, one per attempt, by category. A landing \
          failure is otherwise a single log line inside a loop that then moves \
