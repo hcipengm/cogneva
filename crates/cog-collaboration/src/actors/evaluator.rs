@@ -100,18 +100,18 @@ impl EvaluatorActor {
         // unified diffs naming paths the apply gate will also accept.
         let is_self_evolution = task.is_self_evolution();
 
-        // For self-evolution tasks the only question with a measurement surface
-        // is whether the generated artifact is a valid unified diff over safe
-        // paths: the structural criteria, the apply gate and CI all answer it,
-        // deterministically. Asking a model to guess an answer that is already
-        // measurable adds a second, less reliable answer to the same question —
-        // so this mode is judged by the measurement and the semantic evaluation
-        // is skipped.
+        // For self-evolution tasks the questions with a measurement surface are
+        // whether the generated artifact is a valid unified diff over safe
+        // paths, and whether it touches the paths the plan said it would — the
+        // structural criteria, the apply gate, CI and the plan's declared
+        // targets all answer those, deterministically. Asking a model to guess
+        // an answer that is already measurable adds a second, less reliable
+        // answer to the same question, so this mode is judged by the measurement
+        // and the semantic evaluation is skipped.
         //
-        // The other question an evaluator could be asked — whether this change
-        // should be made at all, and whether it passed by loosening a gate — has
-        // no measurement surface today. It is not asked here, and nothing in
-        // this file answers it.
+        // What nothing here asks — and what has no measurement surface today —
+        // is whether this change should be made at all, and whether it passed by
+        // loosening a gate.
         if is_self_evolution {
             let validation = Self::validate_change_artifacts(generation);
             let output = Self::judge_self_evolution_change(&validation, generation, plan);
