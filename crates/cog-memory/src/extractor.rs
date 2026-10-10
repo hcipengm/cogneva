@@ -174,18 +174,45 @@ impl MemoryExtractor for RuleBasedExtractor {
 
 /// High-level convenience wrapper that runs the full ingestion pipeline
 /// for a single raw source.
+///
+/// [`Self::ingest`] 是记忆的另一个入口（网关的写入路由走这一条），而排除面
+/// 必须守在每个入口上，不能只守事件总线那一条：同样的载荷从哪条路进来，
+/// 决定了它落进哪一层，与它是什么数据无关。这里的拒收比事件总线那条更靠前
+/// ——调用方拿到 `Err` 之后**不会**归档，所以 raw 层也不会留下这一份。
 #[derive(Debug, Clone)]
 pub struct IngestionPipeline<E: MemoryExtractor> {
     extractor: E,
+    isolation: crate::isolation::BenchmarkIsolation,
 }
 
 impl<E: MemoryExtractor> IngestionPipeline<E> {
     pub fn new(extractor: E) -> Self {
-        Self { extractor }
+        Self {
+            extractor,
+            isolation: crate::isolation::BenchmarkIsolation::default(),
+        }
+    }
+
+    /// 挂上评测数据的排除面。不挂 = 两张表都空，只有标签那一条规则生效；
+    /// 部署侧的配置在装配处接进来。
+    pub fn with_isolation(mut self, isolation: crate::isolation::BenchmarkIsolation) -> Self {
+        self.isolation = isolation;
+        self
     }
 
     /// Run the extractor against a raw source and return both layers.
+    ///
+    /// 被排除面挡下的 raw 在这里就结束：不调抽取器（真抽取器是一次模型调用，
+    /// 调用出去的内容已经离开了本系统），也不回一份空的层给调用方——空的
+    /// schema 加一条空洞的 summary 落进层里，与「这条记忆抽出来就是空的」
+    /// 同形，而它其实是「我们拒绝了这条记忆」。返回错误是这两种情形的区别。
     pub async fn ingest(&self, source: &RawSource) -> SFResult<(Vec<SchemaEntry>, SummaryEntry)> {
+        if let Some(refusal) = self.isolation.refusal(source) {
+            return Err(cog_core::SFError::Validation(format!(
+                "refused: benchmark data is excluded from memory ({}); nothing was extracted or stored",
+                refusal.as_str()
+            )));
+        }
         self.extractor.extract_all(source).await
     }
 }
@@ -926,5 +953,38 @@ mod tests {
         let ids = |v: &[SchemaEntry]| v.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
         assert_eq!(ids(&once), ids(&twice));
         assert_eq!(once.len(), 3);
+    }
+
+    /// 网关的写入路由消费的是 `IngestionPipeline`，与事件总线那条是两个入口：
+    /// 同一份载荷从哪条路进来，与它是什么数据无关，所以只守一条等于只守一半。
+    /// 拒收要回错误而不是空的层——空的 schema 加一条空洞的 summary 落进层里，
+    /// 与「这条记忆抽出来就是空的」同形。
+    #[tokio::test]
+    async fn the_ingest_pipeline_refuses_benchmark_data_before_the_extractor() {
+        let source = RawSource::new(
+            "hle-1",
+            "benchmark",
+            "text/plain",
+            b"@entity: alpha\n".to_vec(),
+        );
+
+        let configured = IngestionPipeline::new(RuleBasedExtractor::new()).with_isolation(
+            crate::isolation::BenchmarkIsolation::new(vec!["benchmark".into()], Vec::new()),
+        );
+        let err = configured
+            .ingest(&source)
+            .await
+            .expect_err("benchmark data must not be extracted");
+        assert!(
+            err.to_string().contains("benchmark data is excluded"),
+            "the refusal must name what happened, got {err}"
+        );
+
+        // 同一份 raw、没挂排除面：照常抽。少了这一半，把整条管道关掉的缺陷
+        // 会被上面那条断言放过。
+        let unconfigured = IngestionPipeline::new(RuleBasedExtractor::new());
+        let (schema, summary) = unconfigured.ingest(&source).await.expect("ordinary path");
+        assert!(!schema.is_empty());
+        assert_eq!(summary.namespace, "benchmark");
     }
 }

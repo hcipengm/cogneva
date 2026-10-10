@@ -160,6 +160,20 @@ pub struct IngestConfig {
     pub bus_claim_min_idle_ms: u64,
     /// 每轮认领批大小上限。
     pub bus_claim_batch: usize,
+    /// 评测数据专用命名空间/桶：列在这里的命名空间，记忆的任何一层都不接受。
+    ///
+    /// 空表意味着这条规则不生效（不是「不排除任何东西」的另一种写法——两者
+    /// 的差别要从读数里看：被拒的次数记在 `memory_operations_total` 的
+    /// `benchmark_namespace_refused` 一格上）。桶名是部署事实，代码里不写死：
+    /// 写死等于让部署改名只能靠改代码。
+    pub benchmark_namespaces: Vec<String>,
+    /// 评测数据集自带的标记串（canary）：载荷里出现任一条即拒收，不进任何一层。
+    ///
+    /// 这一条与上一条互为补集，不是重复：桶名与标签都要求写侧**带着牌子**来，
+    /// 而一份经普通任务链路、落在默认命名空间的评测内容两条都不命中，只有随
+    /// 数据本身走的标记串还在。空表 = 这条规则不生效；标记串由部署给出（取自
+    /// 数据集自身，代码里不写具体串）。
+    pub benchmark_canary_markers: Vec<String>,
 }
 
 impl Default for IngestConfig {
@@ -184,6 +198,8 @@ impl Default for IngestConfig {
             bus_claim_interval_secs: 30,
             bus_claim_min_idle_ms: 900_000,
             bus_claim_batch: 32,
+            benchmark_namespaces: Vec::new(),
+            benchmark_canary_markers: Vec::new(),
         }
     }
 }

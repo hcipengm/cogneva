@@ -353,7 +353,10 @@
       "bus_group": "memory-ingestor",
       "bus_claim_interval_secs": 30,
       "bus_claim_min_idle_ms": 900000,
-      "bus_claim_batch": 32
+      "bus_claim_batch": 32,
+      "_comment_benchmark": "Evaluation-set isolation: a raw matched by either list is refused before it is archived or extracted, so it reaches no memory layer and is never sent to the extractor. Both lists are deployment and dataset facts and are empty by default, which means that rule is not in effect -- the raw tag rule is the one that is always live (a producer marks a raw with benchmark=true and it is refused regardless of these lists). benchmark_namespaces names the eval-dedicated bucket and covers a writer that puts its data there without a tag; benchmark_canary_markers carries the dataset's own marker strings and is the only rule that still recognises content that arrived through an ordinary task path into the default namespace with its tag lost. Refusals are counted on memory_operations_total, one cell per rule, so a deployment that has configured an empty surface can tell it apart from one that has refused nothing.",
+      "benchmark_namespaces": [],
+      "benchmark_canary_markers": []
     }
   },
   "tier_migrator": {

@@ -50,6 +50,7 @@ impl cog_core::SystemPlugin for MemoryPlugin {
             strict_persistence,
             load_embedding_model,
             load_reranker_model,
+            benchmark_isolation,
         ) = {
             let config = ctx.config();
             // memory 是 cog-memory 自有配置段，自读 cogneva.json。
@@ -61,6 +62,10 @@ impl cog_core::SystemPlugin for MemoryPlugin {
                 config.system.strict_persistence,
                 memory.load_embedding_model,
                 memory.load_reranker_model,
+                crate::BenchmarkIsolation::new(
+                    memory.ingest.benchmark_namespaces.clone(),
+                    memory.ingest.benchmark_canary_markers.clone(),
+                ),
             )
         };
 
@@ -278,11 +283,18 @@ impl cog_core::SystemPlugin for MemoryPlugin {
             ctx.publish_service(b.clone());
             info!("MemoryPlugin memory backend published");
         }
+        // 网关的 memory 写入路由消费的就是这一条，所以排除面必须挂在这里：
+        // 这条管道与事件总线那条是两个入口，而「一份载荷从哪条路进来」与
+        // 「它是什么数据」无关，只守一条等于只守一半。
         let default_ingestor: Arc<dyn cog_core::MemoryIngestor> = Arc::new(
-            crate::IngestionPipeline::new(crate::RuleBasedExtractor::new()),
+            crate::IngestionPipeline::new(crate::RuleBasedExtractor::new())
+                .with_isolation(benchmark_isolation.clone()),
         );
         ctx.publish_service(default_ingestor);
-        info!("MemoryPlugin default ingestor published");
+        info!(
+            "MemoryPlugin default ingestor published; benchmark exclusion surface: {}",
+            benchmark_isolation.describe()
+        );
         ctx.publish_service(metrics_backend);
         info!("MemoryPlugin metrics backend published");
         if let Some(ref p) = embed_provider {
@@ -360,8 +372,20 @@ impl cog_core::SystemPlugin for MemoryPlugin {
                 } else {
                     Arc::new(crate::RuleBasedExtractor::new())
                 };
-            let mut ingestor =
-                crate::MemoryIngestor::new(backend, extractor).with_config((&memory.ingest).into());
+            let isolation = crate::BenchmarkIsolation::new(
+                memory.ingest.benchmark_namespaces.clone(),
+                memory.ingest.benchmark_canary_markers.clone(),
+            );
+            let mut ingestor = crate::MemoryIngestor::new(backend, extractor).with_config(
+                crate::MemoryIngestorConfig {
+                    benchmark_isolation: isolation.clone(),
+                    ..(&memory.ingest).into()
+                },
+            );
+            info!(
+                "Memory ingest exclusion surface (event bus and reconcile path): {}",
+                isolation.describe()
+            );
             if let Some(ref metrics) = metrics_backend {
                 ingestor = ingestor.with_metrics(metrics.clone());
             }

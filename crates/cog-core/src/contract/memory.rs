@@ -257,6 +257,39 @@ pub fn raw_id_key_error(id: &str) -> Option<&'static str> {
     None
 }
 
+/// The canonical tag a producer puts on a raw source to declare it benchmark
+/// data — evaluation-set content that must never reach a memory layer.
+///
+/// Published here rather than spelled at each end: the tag is written by the
+/// task that provisions the evaluation set and read by the ingestor's
+/// exclusion rule, and two independent spellings of one convention fail in the
+/// direction nobody notices — the tag stops matching, the row is admitted, and
+/// the only trace left is in the layer that was supposed to stay clean.
+pub const RAW_TAG_BENCHMARK: &str = "benchmark=true";
+
+/// Whether one tag declares the raw it sits on to be benchmark data.
+///
+/// The key carries the meaning and the value is the producer's spelling
+/// ([`RAW_TAG_BENCHMARK`], `benchmark=1`, or the bare key): a producer that
+/// declares benchmark data by naming the key alone has still declared it, and
+/// reading its spelling as absence is how a red line turns into a silent
+/// admission. The one value that does *not* declare it is an explicit
+/// negative — `benchmark=false` says the opposite, and refusing that raw would
+/// turn a deliberate statement into a lost memory.
+pub fn tag_declares_benchmark(tag: &str) -> bool {
+    let tag = tag.trim();
+    let Some(rest) = tag.strip_prefix("benchmark") else {
+        return false;
+    };
+    // 键与值之间允许留白：`benchmark = true` 是同一个声明的另一种排版，把它
+    // 读成「没有声明」正好是这条规则要防的那种漏。
+    let rest = rest.trim();
+    match rest.strip_prefix('=') {
+        None => rest.is_empty(),
+        Some(value) => !matches!(value.trim(), "false" | "0" | "no"),
+    }
+}
+
 impl RawSource {
     pub fn new(
         id: impl Into<String>,
