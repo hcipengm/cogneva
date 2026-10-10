@@ -78,9 +78,14 @@ spec:
         - protocol: TCP
           port: {{ $allow.port | int }}
     {{- end }}
-    # 监控栈（9090）：infra_watch 按 PromQL 探测节点磁盘 / Pod OOM 等基础设施
+    # 监控栈（9090 / 3100）：infra_watch 按 PromQL 探测节点磁盘 / Pod OOM 等基础设施
     # 信号，查询跨命名空间落到监控命名空间的 Prometheus。podSelector:{} 只
     # 匹配本命名空间，必须显式 namespaceSelector，否则规则求值全部超时失败。
+    #
+    # 3100 是同一命名空间里 Loki 的 push 端点：本 Pod 的日志由进程内的后台推手投
+    # 递到那里。它和上面那条 PromQL 走同一个命名空间却不同端口，所以放行 9090 不
+    # 含它——少了这一条，push 被策略静默丢弃，日志里只剩反复重试的 warn，而"被丢
+    # 弃的日志"与"本来就没有日志产生"从外面看一样。
     - to:
         - namespaceSelector:
             matchLabels:
@@ -88,6 +93,8 @@ spec:
       ports:
         - protocol: TCP
           port: 9090
+        - protocol: TCP
+          port: 3100
     # kube-apiserver：主线部署器构建侧在 Pod 内调 kubectl（查四部署镜像、
     # apply 滚动 Job）。in-cluster 经 kubernetes Service ClusterIP:443
     # （K3s Service CIDR 默认 10.43.0.0/16，标准 kubeadm 常用 10.96.0.0/12，
