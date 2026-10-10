@@ -54,7 +54,7 @@
 //! runner has neither the weights nor a mirror to fetch them from):
 //!
 //! ```text
-//! deploy/scripts/fetch-reranker-weights.sh --dest /srv/cogneva/models/fastembed
+//! deploy/scripts/fetch-model-weights.sh --model reranker --dest /srv/cogneva/models/fastembed
 //! FASTEMBED_CACHE_DIR=/srv/cogneva/models/fastembed \
 //!   cargo test -p cog-memory --test reranker_boundary -- --ignored --nocapture
 //! ```
@@ -283,7 +283,7 @@ fn text_against(
 fn what_a_local_model_can_settle_about_a_file_name() {
     let dir = std::env::var("FASTEMBED_CACHE_DIR").expect(
         "set FASTEMBED_CACHE_DIR to a directory the weights were fetched into \
-         (deploy/scripts/fetch-reranker-weights.sh)",
+         (deploy/scripts/fetch-model-weights.sh --model reranker)",
     );
     let scorer = FastEmbedRerankerProvider::try_new_with_cache_dir(Some(PathBuf::from(&dir)))
         .expect("the weights did not load from FASTEMBED_CACHE_DIR");
