@@ -315,8 +315,11 @@ impl cog_core::SystemPlugin for MemoryPlugin {
                 (memory_backend.clone(), metrics_backend.clone())
             {
                 // 衰减动的是共用条目存储，所以它是一个单写者角色：中介由持有共用库的
-                // 插件在 `init` 里发布（每个插件的 init 都排在任一 start 之前），
-                // 取不到时为空——没有共用库的部署没有第二个写者要挡。
+                // 插件在 `init` 里发布（每个插件的 init 都排在任一 start 之前）。
+                // 取不到时为 None，循环按「没有共用库」自扫——但这条兜底的成因不止
+                // 一种（发布方建中介失败也只 warn），所以拿到中介与否不是资格判据：
+                // 够不够格由「它的条目存储是不是共享那份」决定，不够格的进程靠不启
+                // 这条循环排除在候选集外。
                 let role = ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>();
                 let shutdown = ctx
                     .consume::<cog_core::ShutdownSignal>()
