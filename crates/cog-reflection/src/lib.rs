@@ -366,6 +366,7 @@ impl ReflectionEngine {
         hook_sink: Option<tokio::sync::mpsc::UnboundedSender<serde_json::Value>>,
         tool_sink: Option<tokio::sync::mpsc::UnboundedSender<serde_json::Value>>,
         project_root: Option<std::path::PathBuf>,
+        wiki: Option<cog_core::LateService<dyn cog_core::WikiBackend>>,
         change_dir: impl Into<std::path::PathBuf>,
     ) -> Self {
         let recorder: Arc<dyn LearningRecorder> = Arc::new(MemoryBackendRecorder::new(
@@ -375,8 +376,11 @@ impl ReflectionEngine {
         let detector: Arc<dyn LearningDetector> = Arc::new(DefaultLearningDetector::new());
         let matcher: Arc<dyn LearningMatcher> =
             Arc::new(DefaultLearningMatcher::new(recorder.clone(), None));
-        let promoter: Arc<dyn LearningPromoter> =
-            Arc::new(DefaultLearningPromoter::new(skill_registry.clone()));
+        let mut promoter = DefaultLearningPromoter::new(skill_registry.clone());
+        if let Some(wiki) = wiki {
+            promoter = promoter.with_wiki_late(wiki);
+        }
+        let promoter: Arc<dyn LearningPromoter> = Arc::new(promoter);
         let reviewer = Arc::new(PeriodicReviewer::new(
             recorder.clone(),
             matcher.clone(),

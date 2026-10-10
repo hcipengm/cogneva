@@ -318,6 +318,12 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
 
         let engine = if let (Some(ref mb), Some(ref llm)) = (memory_backend, llm_provider) {
             info!("ReflectionEngine initialized in production mode (persistent learning)");
+            // The wiki backend is published by another plugin in this layer and
+            // the promoter is built here, in the same layer: a backend read now
+            // would be in time only when that plugin's init happens to finish
+            // first. The handle resolves on first use instead, so promoted
+            // learnings reach the wiki regardless of which plugin wins the race.
+            let wiki = cog_core::LateService::<dyn cog_core::WikiBackend>::new(ctx.clone());
             crate::ReflectionEngine::new_self_evolution(
                 skill_registry.clone(),
                 llm.clone(),
@@ -327,6 +333,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 Some(hook_tx),
                 Some(tool_tx),
                 engine_root.clone(),
+                Some(wiki),
                 change_dir.clone(),
             )
         } else {

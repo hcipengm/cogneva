@@ -30,7 +30,7 @@ pub trait LearningPromoter: Send + Sync {
 /// - Related to ≥ `min_tasks` distinct tasks
 /// - First seen within `max_age_days` of last seen
 ///
-/// When a [`cog_core::WikiBackend`] is provided, `Insight` and `KnowledgeGap`
+/// When a [`cog_core::WikiBackend`] is reachable, `Insight` and `KnowledgeGap`
 /// learnings are automatically written to the wiki as Markdown documents.
 type OnPromotedFn = dyn Fn(&PromotionResult) + Send + Sync;
 
@@ -39,7 +39,14 @@ pub struct DefaultLearningPromoter {
     min_tasks: usize,
     max_age_days: i64,
     skill_registry: Arc<RwLock<SkillRegistry>>,
-    wiki_adapter: Option<Arc<dyn cog_core::WikiBackend>>,
+    /// The wiki layer promoted learnings are written into.
+    ///
+    /// Held as a late handle rather than a resolved backend: the plugin that
+    /// publishes the wiki backend and the one that builds this promoter share a
+    /// layer and initialise concurrently, so a backend read here during `init`
+    /// is in time only when the other side happens to finish first. The handle
+    /// resolves on first use, after every `init` has returned.
+    wiki_late: Option<cog_core::LateService<dyn cog_core::WikiBackend>>,
     on_promoted: Option<Arc<OnPromotedFn>>,
 }
 
@@ -50,7 +57,7 @@ impl std::fmt::Debug for DefaultLearningPromoter {
             .field("min_tasks", &self.min_tasks)
             .field("max_age_days", &self.max_age_days)
             .field("skill_registry", &"<SkillRegistry>")
-            .field("wiki_adapter", &self.wiki_adapter.is_some())
+            .field("wiki_late", &self.wiki_late.is_some())
             .finish()
     }
 }
@@ -62,15 +69,20 @@ impl DefaultLearningPromoter {
             min_tasks: 2,
             max_age_days: 30,
             skill_registry,
-            wiki_adapter: None,
+            wiki_late: None,
             on_promoted: None,
         }
     }
 
-    /// Attach a wiki adapter so that `Insight` / `KnowledgeGap` learnings
-    /// are automatically persisted as wiki documents.
-    pub fn with_wiki_adapter(mut self, adapter: Arc<dyn cog_core::WikiBackend>) -> Self {
-        self.wiki_adapter = Some(adapter);
+    /// Attach the wiki layer, resolved on first use, so that `Insight` /
+    /// `KnowledgeGap` learnings are written as wiki documents once the wiki
+    /// plugin has published its backend. Passing the handle rather than the
+    /// backend is what keeps the write from depending on init order.
+    pub fn with_wiki_late(
+        mut self,
+        wiki: cog_core::LateService<dyn cog_core::WikiBackend>,
+    ) -> Self {
+        self.wiki_late = Some(wiki);
         self
     }
 
@@ -161,15 +173,18 @@ impl DefaultLearningPromoter {
         md
     }
 
+    /// The wiki layer, resolved on first use. `None` when nothing published one
+    /// by the time this was first asked.
+    fn wiki(&self) -> Option<Arc<dyn cog_core::WikiBackend>> {
+        self.wiki_late.as_ref().and_then(|w| w.get())
+    }
+
     /// Write a learning to the wiki as a Markdown document.
     async fn write_to_wiki(&self, learning: &Learning) -> SFResult<String> {
-        let adapter = match &self.wiki_adapter {
-            Some(a) => a,
-            None => {
-                return Err(cog_core::SFError::Validation(
-                    "Wiki adapter not configured".into(),
-                ));
-            }
+        let Some(adapter) = self.wiki() else {
+            return Err(cog_core::SFError::Validation(
+                "Wiki adapter not configured".into(),
+            ));
         };
 
         let path = format!("reflections/{}-{:?}.md", learning.id, learning.area);
@@ -291,5 +306,125 @@ impl LearningPromoter for DefaultLearningPromoter {
         }
 
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DefaultLearningPromoter, LearningPromoter};
+    use crate::types::PromotionResult;
+    use async_trait::async_trait;
+    use cog_core::{
+        Area, Config, Learning, LearningCategory, LearningSource, PluginContext, Priority,
+        SFResult, SkillRegistry,
+    };
+    use std::sync::{Arc, Mutex};
+
+    /// A wiki backend that keeps every document written to it, so the test can
+    /// see whether a promoted learning reached the wiki layer at all.
+    struct RecordingWiki {
+        written: Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait]
+    impl cog_core::WikiBackend for RecordingWiki {
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        fn provider_name(&self) -> &str {
+            "recording"
+        }
+
+        async fn ingest_document(&self, relative_path: &str, content: &str) -> SFResult<()> {
+            self.written
+                .lock()
+                .unwrap()
+                .push((relative_path.to_owned(), content.to_owned()));
+            Ok(())
+        }
+    }
+
+    fn promotable_insight() -> Learning {
+        let mut learning = Learning::new(
+            LearningCategory::Insight,
+            Priority::Medium,
+            Area::Backend,
+            "the same read timeout bit us three times",
+            "details",
+            "raise the read timeout",
+            LearningSource::SelfReview,
+        );
+        learning.recurrence_count = 3;
+        learning.related_tasks = vec!["task-a".into(), "task-b".into()];
+        learning
+    }
+
+    fn registry() -> Arc<tokio::sync::RwLock<SkillRegistry>> {
+        Arc::new(tokio::sync::RwLock::new(SkillRegistry::new()))
+    }
+
+    /// A promoted insight has to reach the wiki that another plugin publishes —
+    /// the promoter is built in the same layer as that plugin, so the only way
+    /// it can reach the backend is through a handle that resolves late. Wiring
+    /// the handle but never resolving it (or resolving once, while the
+    /// publisher does not exist yet) leaves every promoted insight on the
+    /// SkillRegistry fallback with no line of code changing.
+    #[tokio::test]
+    async fn a_promoted_insight_reaches_the_wiki_published_after_the_promoter() {
+        let ctx = PluginContext::new(Config::default());
+        let wiki = Arc::new(RecordingWiki {
+            written: Mutex::new(Vec::new()),
+        });
+        let handle = cog_core::LateService::<dyn cog_core::WikiBackend>::new(ctx.clone());
+        let promoter = DefaultLearningPromoter::new(registry()).with_wiki_late(handle);
+        // Published *after* the handle was built, which is the ordering the two
+        // concurrent plugins actually produce.
+        ctx.publish_service::<dyn cog_core::WikiBackend>(wiki.clone());
+
+        let result = promoter
+            .promote_if_ready(&promotable_insight())
+            .await
+            .unwrap();
+
+        match result {
+            PromotionResult::Promoted { target, .. } => assert_eq!(target, "Wiki"),
+            other => panic!("expected a wiki promotion, got {other:?}"),
+        }
+        let written = wiki.written.lock().unwrap();
+        assert_eq!(
+            written.len(),
+            1,
+            "the learning should have been written exactly once"
+        );
+        assert!(
+            written[0].0.starts_with("reflections/"),
+            "the wiki path is {}",
+            written[0].0
+        );
+    }
+
+    /// The other direction: with nothing published the learning still lands, on
+    /// the registry fallback, rather than being dropped. This is the state the
+    /// process was in before the handle was wired, and it is what the wiki path
+    /// above has to be distinguished from — a handle that never resolves must
+    /// fall back, not fail.
+    #[tokio::test]
+    async fn a_promoted_insight_without_a_wiki_falls_back_to_the_registry() {
+        let ctx = PluginContext::new(Config::default());
+        let handle = cog_core::LateService::<dyn cog_core::WikiBackend>::new(ctx);
+        let promoter = DefaultLearningPromoter::new(registry()).with_wiki_late(handle);
+
+        let result = promoter
+            .promote_if_ready(&promotable_insight())
+            .await
+            .unwrap();
+
+        match result {
+            PromotionResult::Promoted { target, .. } => {
+                assert_eq!(target, "SkillRegistry(fallback)")
+            }
+            other => panic!("expected the registry fallback, got {other:?}"),
+        }
     }
 }
