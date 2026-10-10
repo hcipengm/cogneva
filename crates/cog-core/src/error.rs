@@ -84,6 +84,32 @@ pub enum SFError {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// 这次发布的消息比传输层肯接受的字节数还大：**同一份输入重试多少次都是
+    /// 同一个结果**，因为它的大小不随重试改变。
+    ///
+    /// 与其余变体的区别不是严重程度而是性质：那些是「现在不行」，这个是
+    /// 「这份东西不行」。分开类型是为了让重试的那一侧能做出正确决定——
+    /// 把永久错和瞬时错一起重试，一次拒绝就会把队列堵在这里，而重试的次数
+    /// 换不来任何东西；把瞬时错当永久错丢掉，则会在总线抖一下时把事件扔了。
+    ///
+    /// `size` 永远是量出来的那串字节。`limit` 是**这一路能声明的那条界**，所以
+    /// 是 `Option`：本地按服务器声明的上限先判的那一路报得出来；服务器自己回来
+    /// 拒绝的那一路只知道它拒了、不知道它按哪条界拒的——本地那条界正是因为它
+    /// 不够紧才放它过去，拿它充数会是一条假读数。
+    #[error(
+        "Payload exceeds the transport's limit: {size} bytes ({})",
+        render_payload_limit(.limit)
+    )]
+    PayloadTooLarge { size: usize, limit: Option<usize> },
+}
+
+/// 上限那一侧的措辞，比 `Some(1048576)` 这种 Debug 输出更贴近它要回答的问题。
+fn render_payload_limit(limit: &Option<usize>) -> String {
+    match limit {
+        Some(limit) => format!("limit {limit}"),
+        None => "limit not known on this path".to_string(),
+    }
 }
 
 pub type SFResult<T> = Result<T, SFError>;
@@ -125,6 +151,19 @@ impl SFError {
     /// 处理会让系统在一条本来能恢复的路上睡死。
     pub fn is_terminal_upstream_failure(&self) -> bool {
         matches!(self, SFError::Upstream { cause, .. } if cause.is_terminal())
+    }
+
+    /// 这次失败是不是「同一份输入再试多少次都一样」。
+    ///
+    /// 刻意比「不是环境类失败」窄得多。判据放宽到那一档会把库、网络、内部错
+    /// 一起判成永久错——那些换一次调用完全可能成功，丢掉它们等于拿一次抖动
+    /// 换一份耐久记录的消失。这里只承认有类型化依据的那一种：载荷超过传输层
+    /// 的字节上限。判据看类型不看文本，理由同 [`Self::is_environment_failure`]。
+    ///
+    /// 调用方的决定是这个判据存在的理由：重试的那一侧对永久错应**当次消费掉**
+    /// 而不是无限重试，否则一个再也不会变小的载荷会把队头永久占住。
+    pub fn is_permanent_rejection(&self) -> bool {
+        matches!(self, SFError::PayloadTooLarge { .. })
     }
 
     /// 这次失败若带有类型化原因，取出来。调用方拿它做判断，不必回头去解析
@@ -341,6 +380,65 @@ mod tests {
             .retry_after_secs(),
             Some(crate::contract::llm::MAX_RECOVERED_RETRY_AFTER_SECS),
             "从散文里读出来的数不能比它可能的来源活得更久"
+        );
+    }
+
+    /// 永久这一档刻意很窄：库、网络、内部错换一次调用完全可能成功，把「不是环境
+    /// 类」当判据会把它们一起判成永久，丢掉它们等于拿一次抖动换一份耐久记录的消失。
+    #[test]
+    fn permanent_rejection_covers_only_the_payload_that_cannot_shrink() {
+        let too_big = SFError::PayloadTooLarge {
+            size: 2_000_000,
+            limit: Some(1_048_576),
+        };
+        assert!(too_big.is_permanent_rejection());
+        // 它也不属于环境类：大小不随时刻改变，延后重投不是这条失败的解。
+        assert!(!too_big.is_environment_failure());
+
+        for other in [
+            SFError::DagExecutor("bus down".into()),
+            SFError::Agent("upstream timeout".into()),
+            SFError::Timeout,
+            SFError::LLM("provider unavailable".into()),
+            SFError::Validation("payload malformed".into()),
+            SFError::IO("disk full".into()),
+        ] {
+            assert!(
+                !other.is_permanent_rejection(),
+                "{other} 等一等可能就好，按永久错丢掉是拿抖动换记录的消失"
+            );
+        }
+    }
+
+    /// 界那一侧的读数分两种来源，报出来的东西必须跟着来源走。本地前置检查读的是
+    /// 服务器自己声明的上限，报得出来；服务器回来拒绝那一路只知道它拒了、不知道
+    /// 按哪条界拒的——本地那条界正因不够紧才放它过去，填上去就是一条假读数。
+    #[test]
+    fn a_payload_rejection_names_the_limit_only_when_this_path_knew_it() {
+        let judged_locally = SFError::PayloadTooLarge {
+            size: 2_000_000,
+            limit: Some(1_048_576),
+        };
+        assert!(
+            judged_locally.to_string().contains("limit 1048576"),
+            "本地判的那一路，界要跟着一起报出来：{}",
+            judged_locally
+        );
+
+        let refused_by_server = SFError::PayloadTooLarge {
+            size: 2_000_000,
+            limit: None,
+        };
+        assert!(
+            refused_by_server
+                .to_string()
+                .contains("limit not known on this path"),
+            "服务器判的那一路报的是「不知道」，不是本地那个不够紧的数：{}",
+            refused_by_server
+        );
+        assert!(
+            refused_by_server.to_string().contains("2000000 bytes"),
+            "字节数仍然是量出来的那一串：{refused_by_server}"
         );
     }
 
