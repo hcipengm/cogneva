@@ -3181,12 +3181,16 @@ async fn consume_executed_change(
             return Err(e);
         }
 
-        // 能走到这里，说明本进程的切换是**返回型**的（systemd / sidecar / 镜像
-        // 滚动）——self_exec 在上一句已经把进程映像换掉了。所以下面这笔记账只在
-        // 那几种模式下发生；self_exec 部署里 `cogneva_evolution_change_applied_total`
-        // 恒为 0 就是这个形状，不是「没有变更部署成功」。晋级判定不在这里：
-        // 它已经随上面的交接交出去，由下一轮的 `drain_handed_off` 取走，
-        // 两种模式走同一条路。
+        // Reaching this point means the switch is the returning kind (systemd /
+        // sidecar / image rollout) — `self_exec` replaced the process image at
+        // the line above. So this bookkeeping only runs in those modes; that is
+        // why `evolution_change_applied_total` is flat at zero in a `self_exec`
+        // deployment, and it does not mean no change ever deployed. The exposed
+        // name is exactly that, with no `cogneva_` prefix; the prefixed
+        // `cogneva_change_fate_total` is a different series, the upstream
+        // landing funnel. Promotion is not decided here: it was handed off
+        // above and the next round's `drain_handed_off` picks it up, the same
+        // way in both modes.
         let _ = engine
             .record_change_outcome(
                 &artifact.change_id,
