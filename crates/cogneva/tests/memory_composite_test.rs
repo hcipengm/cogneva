@@ -1440,7 +1440,9 @@ async fn a_bounded_listing_reads_only_the_items_it_returns() {
 async fn a_benchmark_tagged_raw_is_refused_at_the_archive_face() {
     let tmp = tempfile::tempdir().unwrap();
     let object = Arc::new(FileObjectBackend::new(tmp.path()));
-    let metrics = Arc::new(cog_observability::metrics::PrometheusMetricsBackend::new(""));
+    let metrics = Arc::new(cog_observability::metrics::PrometheusMetricsBackend::new(
+        "",
+    ));
     let backend = CompositeMemoryBackend::new(
         object,
         Arc::new(cog_storage::MemoryVectorBackend::new()),
@@ -1448,8 +1450,8 @@ async fn a_benchmark_tagged_raw_is_refused_at_the_archive_face() {
     )
     .with_operations_metrics(metrics.clone() as Arc<dyn MetricsBackend>);
 
-    let source = make_raw("eval-1", "payload")
-        .with_tags(vec![cog_core::RAW_TAG_BENCHMARK.to_string()]);
+    let source =
+        make_raw("eval-1", "payload").with_tags(vec![cog_core::RAW_TAG_BENCHMARK.to_string()]);
 
     let err = backend.archive_raw(&source).await.unwrap_err();
     assert!(
@@ -1457,7 +1459,11 @@ async fn a_benchmark_tagged_raw_is_refused_at_the_archive_face() {
         "the refusal must name the exclusion surface, got {err}"
     );
     assert!(
-        backend.get_raw("default", "eval-1").await.unwrap().is_none(),
+        backend
+            .get_raw("default", "eval-1")
+            .await
+            .unwrap()
+            .is_none(),
         "a refused raw must leave nothing in the raw layer"
     );
 

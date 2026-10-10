@@ -94,10 +94,7 @@ impl CompositeMemoryBackend {
 
     /// Attach the metrics backend a benchmark refusal is counted on. Without one
     /// the refusal is still returned and logged; only the counter is missing.
-    pub fn with_operations_metrics(
-        mut self,
-        metrics: Arc<dyn cog_core::MetricsBackend>,
-    ) -> Self {
+    pub fn with_operations_metrics(mut self, metrics: Arc<dyn cog_core::MetricsBackend>) -> Self {
         self.operations_metrics = Some(metrics);
         self
     }
@@ -138,11 +135,7 @@ impl CompositeMemoryBackend {
         let mut labels = HashMap::new();
         labels.insert("operation".to_string(), refusal.operation().to_string());
         if let Err(e) = metrics
-            .record_counter(
-                cog_core::metric_names::MEMORY_OPERATIONS_TOTAL,
-                1.0,
-                labels,
-            )
+            .record_counter(cog_core::metric_names::MEMORY_OPERATIONS_TOTAL, 1.0, labels)
             .await
         {
             tracing::warn!(
