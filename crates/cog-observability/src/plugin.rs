@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::alert_store::{NewAlert, PostgresAlertStore};
+use crate::usage_store::LlmUsageStore;
 
 /// Loop name reported through the background-loop liveness family.
 pub const TRACE_TIER_MIGRATION_LOOP: &str = "observability_trace_tier_migration";
@@ -21,6 +22,9 @@ pub struct ObservabilityPlugin {
     /// service is published before any plugin `start` runs (init_all
     /// completes before start_all; publishing in start would race consumers).
     alert_store: Option<Arc<PostgresAlertStore>>,
+    /// The LLM usage ledger, created in `init` from the same database the alert
+    /// store uses; the rollup loop reads through it in `start`.
+    usage_store: Option<Arc<LlmUsageStore>>,
     /// Per-agent trace buffer budget, read in `init` from config and applied
     /// to the collection task in `start`.
     trace_buffer_max_bytes: usize,
@@ -39,6 +43,7 @@ impl ObservabilityPlugin {
             trace_collector: None,
             trace_tier_migrator: None,
             alert_store: None,
+            usage_store: None,
             trace_buffer_max_bytes: crate::config::TraceCollectorConfig::default().buffer_max_bytes,
             data_volume: Vec::new(),
         }
@@ -360,6 +365,35 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             }
         };
 
+        // ── LLM usage ledger + window rollup ──
+        // The ledger table is created by the gateway, which is the only writer,
+        // but this process creates it too: the rollup reads it from a different
+        // pod, and a fold that only worked once the gateway had run would be a
+        // fold that silently did nothing on a fresh database. `IF NOT EXISTS`
+        // makes the two creators agree rather than race.
+        self.usage_store = match std::env::var("COGNEVA_DATABASE_URL") {
+            Ok(url) if !url.trim().is_empty() => match LlmUsageStore::connect(&url).await {
+                Ok(store) => match store.init_schema().await {
+                    Ok(()) => {
+                        info!("LLM usage ledger reachable; window rollup armed");
+                        Some(Arc::new(store))
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "LLM usage schema init failed; rollup disabled");
+                        None
+                    }
+                },
+                Err(e) => {
+                    warn!(error = %e, "LLM usage store connect failed; rollup disabled");
+                    None
+                }
+            },
+            _ => {
+                info!("COGNEVA_DATABASE_URL unset; LLM usage rollup disabled");
+                None
+            }
+        };
+
         self.initialized = true;
         Ok(())
     }
@@ -415,6 +449,20 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                     }
                 },
             ));
+        }
+
+        // ── LLM usage window rollup ──
+        // The fold runs here, in the main application, and not in the gateway:
+        // the gateway is the process that restarts on every rollout, and a
+        // reading whose producer dies on each rollout is the reading this loop
+        // exists to replace. No handle is held; shutdown closes it through the
+        // signal like the loop above.
+        if let Some(store) = self.usage_store.clone() {
+            let shutdown = ctx
+                .consume::<cog_core::ShutdownSignal>()
+                .map(|s| (*s).clone())
+                .unwrap_or_default();
+            drop(crate::llm_usage_rollup::spawn(store, shutdown));
         }
 
         // ── Data directory footprint ──

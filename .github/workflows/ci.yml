@@ -183,6 +183,16 @@ jobs:
         run: cargo test -p cog-observability --test usage_store_ledger -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The window fold's three claims are all decisions the server makes: that
+      # a window's totals are the ledger's sum over it, that rerunning a window
+      # lands the same rows with the same values (idempotence rests on the
+      # primary key), and that a known combination the window did not use still
+      # lands a zero row. A fold that rewrote a window's keys or dropped the
+      # idle rows would leave every call site and every DB-free test unchanged.
+      - name: Live-DB LLM usage window rollup
+        run: cargo test -p cog-observability --test usage_rollup -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # A taste submission is evidence and a claimable row at once, and both
       # faces are decided by one statement each: whether a second disposition
       # rewrites the first fate, and whether a re-sent id replaces the words
