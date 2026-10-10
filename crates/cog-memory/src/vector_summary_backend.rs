@@ -23,6 +23,7 @@ use cog_core::{SummaryEntry, SummarySearchResult};
 /// Default collection name when none is provided.
 pub const DEFAULT_SUMMARY_COLLECTION: &str = "summaries";
 
+
 /// [`SummaryBackend`] that delegates similarity search to a
 /// [`cog_core::VectorBackend`] and structured-data persistence to a
 /// [`SummaryEntryStore`].
@@ -227,6 +228,7 @@ impl VectorSummaryBackend {
             .map_err(|e| SFError::Agent(format!("write summary.json failed: {}", e)))?;
         Ok(())
     }
+
 }
 
 #[async_trait]
@@ -269,6 +271,7 @@ impl SummaryBackend for VectorSummaryBackend {
         // An entry that lost its embedding must not keep the point it had: the
         // vector index is the store's derived copy, so a stale point would keep
         // answering searches for text the store no longer holds a vector for.
+        let written_id = vec_id.clone();
         let stale_vec_id = {
             let mut vec_ids = self
                 .vec_ids
@@ -280,7 +283,15 @@ impl SummaryBackend for VectorSummaryBackend {
             }
         };
         if let Some(prev) = stale_vec_id {
-            let _ = self.vector.delete(&self.collection, &[prev]).await;
+            // A backend that names the point after the entry hands back that same
+            // name on every insert, so what looks like the entry's previous point is
+            // the one this insert just wrote — deleting it would drop the vector the
+            // row still claims to hold. A backend that mints a fresh name per insert
+            // hands back a different one, and that older point is the stale copy this
+            // exists to remove.
+            if written_id.as_deref() != Some(prev.as_str()) {
+                let _ = self.vector.delete(&self.collection, &[prev]).await;
+            }
         }
         self.persist().await?;
         Ok(())
@@ -488,6 +499,7 @@ impl SummaryBackend for VectorSummaryBackend {
 
         self.store.upsert(entry).await?;
 
+        let written_id = vec_id.clone();
         let stale_vec_id = {
             let mut vec_ids = self
                 .vec_ids
@@ -496,7 +508,11 @@ impl SummaryBackend for VectorSummaryBackend {
             vec_ids.insert(entry.id.clone(), vec_id)
         };
         if let Some(prev) = stale_vec_id {
-            let _ = self.vector.delete(&self.collection, &[prev]).await;
+            // Same rule as `store_summary`: an id the insert just wrote is the entry's
+            // current point, not a stale copy of it.
+            if written_id != prev {
+                let _ = self.vector.delete(&self.collection, &[prev]).await;
+            }
         }
         self.persist().await?;
         Ok(())
@@ -734,4 +750,39 @@ mod tests {
             .unwrap();
         assert!(hits.is_empty());
     }
+
+    /// A backend that names a point after the entry hands back that same name on
+    /// every insert, so a re-store looks like it has a previous point to clean up
+    /// when what it is looking at is the point it just wrote. Deleting that leaves
+    /// the row claiming a vector the collection no longer holds: the entry silently
+    /// stops being found, and nothing in the entry store says so.
+    #[tokio::test]
+    async fn restoring_an_entry_keeps_its_point() {
+        let store = Arc::new(DurableStubStore::new());
+        let backend =
+            VectorSummaryBackend::new(Arc::new(cog_storage::MemoryVectorBackend::new()), 4)
+                .with_store(store);
+        backend.load().await.unwrap();
+
+        backend
+            .store_summary("default", &entry("s1"))
+            .await
+            .unwrap();
+
+        let mut changed = entry("s1");
+        changed.importance = 0.3;
+        backend.update_summary("default", &changed).await.unwrap();
+
+        let hits = backend
+            .search_summary("default", &[1.0, 0.0, 0.0, 0.0], 10, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "the entry must still be found after being written again"
+        );
+        assert_eq!(hits[0].entry.importance, 0.3);
+    }
+
 }

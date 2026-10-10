@@ -1075,8 +1075,23 @@ impl VectorBackend for MemoryVectorBackend {
         let store = cols.entry(collection.into()).or_default();
 
         let mut ids = Vec::with_capacity(vectors.len());
-        for (i, (vec, meta)) in vectors.into_iter().zip(metadata).enumerate() {
-            let id = format!("vec-{}", store.len() + i);
+        for (vec, meta) in vectors.into_iter().zip(metadata) {
+            // The caller's own id when it has one, which is the rule the durable
+            // backend follows: an entry's dense and sparse vectors have to land on one
+            // point, and a point has to be removable by the id the caller knows it by.
+            // Minting a local id here instead gave one entry two points, so a dense
+            // search returned it twice and deleting the entry left its sparse half
+            // behind — a shape no deployment could have.
+            let id = match meta.get("id").and_then(|v| v.as_str()) {
+                Some(caller_id) => caller_id.to_string(),
+                None => {
+                    let mut n = store.len();
+                    while store.contains_key(&format!("vec-{n}")) {
+                        n += 1;
+                    }
+                    format!("vec-{n}")
+                }
+            };
             store.insert(
                 id.clone(),
                 VectorEntry {
