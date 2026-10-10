@@ -67,6 +67,30 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          than summing across deployments.",
     ),
     (
+        crate::metric_names::MEMORY_DROPPED_ENTRIES_TOTAL.as_str(),
+        "Entries that left the searchable layer, labelled by `namespace`. \
+         Entries, not passes: this is the quantity the pass counter beside it \
+         deliberately does not carry, and the two are read together, since a \
+         pass that dropped ten entries and one that dropped one are the same \
+         increment there. What drops an entry is repeated decay -- its \
+         importance falls below the floor and it stops being searchable -- and \
+         that is the loop working rather than failing, so the reading has no \
+         threshold: it says how much memory is being given up, and whether that \
+         amount is right is a matter of the decay policy rather than of this \
+         series. The other way an entry can go is an explicit delete, which has \
+         no caller in this build and no cell of its own here: a delete call \
+         reports success whatever it found, so a count taken at that call would \
+         count requests rather than entries, and a series that says entries left \
+         must not be built from a number that may be zero. The namespace set is \
+         bounded by the loop's own configuration, which lists the namespaces it \
+         sweeps, rather than by traffic. Like the pass counter, every \
+         memory-owning deployment writes this series, so a reader takes a single \
+         series rather than summing across deployments. It is written only when \
+         something was dropped, so absence is a stretch with nothing to drop; a \
+         frozen series is a namespace that has stopped dropping, which the store \
+         reports as the held value rather than as absence.",
+    ),
+    (
         crate::metric_names::HTTP_REQUESTS_TOTAL.as_str(),
         "Total number of HTTP requests",
     ),

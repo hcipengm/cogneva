@@ -67,6 +67,34 @@ impl MetricsInstrumentedMemoryBackend {
 
         crate::observable::global_observable().record_memory_op(latency_ms as u64);
     }
+
+    /// 记一次「条目离开了可搜索层」，单位是条目不是轮次。
+    ///
+    /// 只报后端自报的归档条数，不把这一轮被降权的条目并进来：降权不是丢失，条目
+    /// 还在可搜索层里，只是排位更低——两者并进同一个名字，「少了」和「沉了」就
+    /// 读成同一个数。
+    ///
+    /// 一条都没归档时不写。零增量在值面上不改动任何读数，却会按 namespace 建出
+    /// 一条空序列，而 namespace 的取值面由调用方给定：与其替没发生过的事铺格子，
+    /// 不如让缺席就表示这一段没有东西掉出去。
+    async fn record_dropped(&self, namespace: &str, entries: usize) {
+        if entries == 0 {
+            return;
+        }
+        let mut labels = HashMap::new();
+        labels.insert("namespace".to_string(), namespace.to_string());
+        if let Err(e) = self
+            .metrics
+            .record_counter(
+                cog_core::metric_names::MEMORY_DROPPED_ENTRIES_TOTAL,
+                entries as f64,
+                labels,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "memory: could not record dropped entries");
+        }
+    }
 }
 
 #[async_trait]
@@ -337,6 +365,10 @@ impl MemoryBackend for MetricsInstrumentedMemoryBackend {
             .decay(namespace, age_threshold_secs, importance_threshold)
             .await;
         self.record("decay", start, result.is_err()).await;
+        if let Ok(report) = result.as_ref() {
+            self.record_dropped(namespace, report.entries_archived)
+                .await;
+        }
         result
     }
 }

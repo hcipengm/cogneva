@@ -1274,6 +1274,37 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 35,
+          "title": "Memory Entries Dropped from the Searchable Layer",
+          "description": "How many entries the memory decay loop took out of the searchable layer, by namespace, over 24h. Entries, not passes: the pass counter beside this on the alert face counts rounds, and a round that dropped ten entries and one that dropped one are the same increment there -- this is the only reading that answers how much memory is actually being given up, which is the quantity a decay policy is chosen for. The cause is repeated decay: an entry's importance halves per pass and it leaves once it falls through the floor, so a rising line here is the loop working rather than failing, and no threshold is drawn -- whether the rate is too high is a question about the policy, not about this series. An entry that is merely demoted is not here, since it is still searchable; an explicit delete is not here either, because a delete call reports success whatever it found and no caller in this build runs one, so a count taken there would count requests rather than entries. The series is store-served, so the maximum by namespace is taken rather than a sum: every memory-owning deployment writes the same series and a sum would multiply by the number of readers. Absence means nothing was dropped in the window, and a line that goes flat while the loop's own pass counter keeps moving is a namespace with nothing left to give up.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 136
+          },
+          "targets": [
+            {
+              "expr": "max by (namespace) (increase(cogneva_memory_dropped_entries_total[24h]))",
+              "legendFormat": "{{namespace}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {

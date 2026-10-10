@@ -302,6 +302,91 @@ async fn test_instrumented_backend_records_delete_ops() {
     assert_eq!(delete_raw_count, 1);
 }
 
+/// 丢弃量读的是**条目**，两样东西都不能混进来：轮次（一轮丢十条和一轮丢一条在
+/// 轮次计数器上是同一个增量）与降权（条目还在可搜索层里，只是排位更低）。
+#[tokio::test]
+async fn test_instrumented_backend_counts_dropped_entries_not_passes() {
+    let inner = Arc::new(MemoryMemoryBackend::new());
+    let metrics = Arc::new(MemoryMetricsBackend::new());
+    let backend = MetricsInstrumentedMemoryBackend::new(inner, metrics.clone());
+
+    let aged = chrono::Utc::now() - chrono::Duration::days(30);
+    // 0.03 * 0.5 = 0.015，跌到归档地板 0.02 以下 ⇒ 这一轮离开可搜索层。
+    // 0.9 * 0.5 = 0.45 ⇒ 只降权，仍可搜索。
+    for (id, namespace, importance) in [
+        ("sum-doomed-a", "default", 0.03f32),
+        ("sum-doomed-b", "default", 0.03),
+        ("sum-demoted", "default", 0.9),
+        ("sum-doomed-other", "other", 0.03),
+    ] {
+        let mut entry = SummaryEntry::new(
+            id,
+            namespace,
+            "text",
+            vec![0.1f32; 4],
+            "test",
+            make_source_ref("r1"),
+        );
+        entry.importance = importance;
+        entry.generated_at = aged;
+        backend.store_summary(namespace, &entry).await.unwrap();
+    }
+
+    let report = backend.decay("default", 0, 1.0).await.unwrap();
+    assert_eq!(report.entries_archived, 2);
+    assert_eq!(report.entries_decayed, 1);
+    backend.decay("other", 0, 1.0).await.unwrap();
+
+    let totals = metrics
+        .query_counter_totals(cog_core::metric_names::MEMORY_DROPPED_ENTRIES_TOTAL.as_str())
+        .await
+        .unwrap();
+
+    let by_ns = |ns: &str| {
+        totals
+            .iter()
+            .find(|s| s.labels.get("namespace").map(String::as_str) == Some(ns))
+            .map(|s| s.value)
+    };
+    assert_eq!(totals.len(), 2, "每个命名空间一条序列: {totals:?}");
+    assert_eq!(by_ns("default"), Some(2.0), "值要读条目数而不是轮数");
+    assert_eq!(by_ns("other"), Some(1.0));
+}
+
+/// 一轮里一条都没归档时这一格根本不写。零增量在值面上不改动任何读数，却会按
+/// namespace 建出一条空序列——缺席要留给「这一段没有东西掉出去」。
+#[tokio::test]
+async fn test_a_pass_that_only_demotes_writes_no_drop() {
+    let inner = Arc::new(MemoryMemoryBackend::new());
+    let metrics = Arc::new(MemoryMetricsBackend::new());
+    let backend = MetricsInstrumentedMemoryBackend::new(inner, metrics.clone());
+
+    let mut entry = SummaryEntry::new(
+        "sum-demoted",
+        "default",
+        "text",
+        vec![0.1f32; 4],
+        "test",
+        make_source_ref("r1"),
+    );
+    entry.importance = 0.9;
+    entry.generated_at = chrono::Utc::now() - chrono::Duration::days(30);
+    backend.store_summary("default", &entry).await.unwrap();
+
+    let report = backend.decay("default", 0, 1.0).await.unwrap();
+    assert_eq!(report.entries_archived, 0);
+    assert_eq!(report.entries_decayed, 1);
+
+    let totals = metrics
+        .query_counter_totals(cog_core::metric_names::MEMORY_DROPPED_ENTRIES_TOTAL.as_str())
+        .await
+        .unwrap();
+    assert!(
+        totals.is_empty(),
+        "降权不是丢失，这一格不该有序列: {totals:?}"
+    );
+}
+
 /// A wrapper must forward `presign_raw` to the store it wraps. A default body
 /// returning `None` would let the wrapper answer "this backend keeps no
 /// signable store" on behalf of a store that signs one -- a plausible lie that

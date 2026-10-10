@@ -143,6 +143,13 @@ metric_names! {
     // by `outcome`, one cell per namespace swept per pass. See the HELP for the
     // closed set and why the cell is a pass rather than an entry count.
     MEMORY_DECAY_TOTAL => "cogneva_memory_decay_total",
+    // cog-memory — entries that left the searchable layer, by namespace. The
+    // pass counter beside it answers whether the loop ran; this one answers how
+    // much memory the loop actually gave up, which is the quantity a decay
+    // policy is chosen for and the only one that says whether a quiet stretch
+    // of passes was a loop finding nothing to drop or a drop rate too small to
+    // matter.
+    MEMORY_DROPPED_ENTRIES_TOTAL => "cogneva_memory_dropped_entries_total",
 
     // cog-storage — the metric store's own readings and tier migration.
     METRICS_RETIRED_ROWS_REMOVED => "metrics_retired_rows_removed",
