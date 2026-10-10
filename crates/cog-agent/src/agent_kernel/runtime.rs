@@ -571,6 +571,17 @@ impl AgentRuntime {
         &self.context
     }
 
+    /// 一次 run 结束时随 `AgentEnd` 发布的消息：本窗口见过的全部，而不是
+    /// 这一轮预算允许留下的那部分。
+    ///
+    /// 发布点有三处（正常收尾、迭代预算耗尽、别的提前结束路径），都从这里取。
+    /// 让三处各写一遍 `.messages().to_vec()` 的话，「有的 run 记全、有的 run
+    /// 只记被裁过的」这种分叉要靠人去比对三行才看得出来；这里只有一个定义，
+    /// 加发布点的人也只会看到这一个名字。
+    fn published_messages(&self) -> Vec<Message> {
+        self.context.history().to_vec()
+    }
+
     pub fn get_tools(&self) -> &ToolRegistry {
         &self.tools
     }
@@ -1150,7 +1161,7 @@ impl AgentRuntime {
 
                 self.emit_event(AgentEvent::AgentEnd {
                     agent_id: self.config.agent_id.clone(),
-                    messages: self.context.messages().to_vec(),
+                    messages: self.published_messages(),
                     crew_id: None,
                     squad_id: None,
                     timestamp: chrono::Utc::now(),
@@ -1323,7 +1334,7 @@ impl AgentRuntime {
 
         self.emit_event(AgentEvent::AgentEnd {
             agent_id: self.config.agent_id.clone(),
-            messages: self.context.messages().to_vec(),
+            messages: self.published_messages(),
             crew_id: None,
             squad_id: None,
             timestamp: chrono::Utc::now(),
@@ -1408,7 +1419,7 @@ impl AgentRuntime {
 
         self.emit_event(AgentEvent::AgentEnd {
             agent_id: self.config.agent_id.clone(),
-            messages: self.context.messages().to_vec(),
+            messages: self.published_messages(),
             crew_id: None,
             squad_id: None,
             timestamp: chrono::Utc::now(),

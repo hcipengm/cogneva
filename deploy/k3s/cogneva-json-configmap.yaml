@@ -352,6 +352,8 @@ data:
           "enable_dlq": true,
           "dlq_namespace": "dlq",
           "extraction_concurrency": 4,
+          "_comment_extraction_budget": "The extractor sends one conversation per call, and its length used to be bounded upstream: the raw layer stored the projection the window had already trimmed, so a transcript could not outgrow one window and no bound was needed here. Raw now keeps the whole history of a run, so this is that bound made explicit -- same estimate as the context window (2 per CJK character, otherwise 4 per word), the two ends of the conversation are sent and the middle is elided with a marker naming how many turns and how much of it is missing. 0 sends the whole transcript, which is what a payload below one window costs today.",
+          "extraction_input_budget_tokens": 64000,
           "startup_reconcile": true,
           "reconcile_lookback_hours": 24,
           "aged_out_redrive_batch": 32,

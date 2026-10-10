@@ -102,6 +102,13 @@ impl Default for MaintenanceConfig {
     }
 }
 
+/// 一次抽取能发给模型的 transcript 上限（估算 token）。
+///
+/// 取今天窗口配置的值：raw 层改存完整历史之前，抽取器拿到的最长载荷就是被
+/// 裁到一个窗口的那份，默认值让这条请求的量级不变。它是这条链路上第一个显式
+/// 的界——窗口配置改了要一起看，两者比的是同一段文本。
+pub const DEFAULT_EXTRACTION_INPUT_BUDGET_TOKENS: usize = 64_000;
+
 /// 自动摄取管线的运行参数。代码侧 [`Default`] 只是兜底，集群上调参改
 /// cogneva.json 的 `memory.ingest` 段。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +125,13 @@ pub struct IngestConfig {
     /// 抽取并发上限。抽取是 LLM 时延主导的 I/O 任务，这个值决定事件洪峰
     /// 后积压的排空速率。
     pub extraction_concurrency: usize,
+    /// 一次抽取最多发出去多少估算 token 的 transcript，超出留头留尾、省中间。
+    ///
+    /// 0 = 不设界（整段发出）。界原先由上游隐式给出：raw 层存的是被窗口裁过
+    /// 的那份，长度天然不超过一个窗口。raw 层改存完整历史后这层保护没有了，
+    /// 界必须显式写在这里。口径与窗口同一个估算函数——两者拿同一个数比较，
+    /// 各算一份就会在中文对话上对不上。
+    pub extraction_input_budget_tokens: usize,
     /// 启动时是否对账扫描"已归档未抽取"的 raw 并补驱动（覆盖崩溃窗口）。
     pub startup_reconcile: bool,
     /// 对账只回看最近这么多个小时的 raw。
@@ -185,6 +199,7 @@ impl Default for IngestConfig {
             enable_dlq: true,
             dlq_namespace: "dlq".into(),
             extraction_concurrency: 4,
+            extraction_input_budget_tokens: DEFAULT_EXTRACTION_INPUT_BUDGET_TOKENS,
             startup_reconcile: true,
             reconcile_lookback_hours: 24,
             aged_out_redrive_batch: 32,

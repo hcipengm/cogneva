@@ -319,6 +319,8 @@ pub struct LlmMemoryExtractor {
     provider: Arc<dyn LlmClient>,
     options: ChatOptions,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
+    /// 一次抽取最多把多少估算 token 的 transcript 发出去（0 = 不设界）。
+    input_budget_tokens: usize,
 }
 
 impl std::fmt::Debug for LlmMemoryExtractor {
@@ -336,6 +338,7 @@ impl LlmMemoryExtractor {
             provider,
             options: ChatOptions::default().with_actor("memory"),
             embedder: None,
+            input_budget_tokens: crate::config::DEFAULT_EXTRACTION_INPUT_BUDGET_TOKENS,
         }
     }
 
@@ -346,6 +349,18 @@ impl LlmMemoryExtractor {
 
     pub fn with_embedder(mut self, embedder: Arc<dyn EmbeddingProvider>) -> Self {
         self.embedder = Some(embedder);
+        self
+    }
+
+    /// 一次抽取能发出去多少估算 token 的 transcript。装配处从
+    /// `memory.ingest.extraction_input_budget_tokens` 接进来。
+    ///
+    /// 这个界原先由上游隐式给出：raw 层存的就是被窗口裁到 64k 的那份，于是
+    /// 「发出去的对话不超过一个窗口」是免费成立的。raw 层改存完整历史之后，
+    /// 一份跑了几百轮、中间裁过很多次的会话在 raw 里是全长的，抽取器就成了
+    /// 链路上唯一一处没有界、却把整段文本发给模型的地方。
+    pub fn with_input_budget_tokens(mut self, budget_tokens: usize) -> Self {
+        self.input_budget_tokens = budget_tokens;
         self
     }
 
@@ -370,28 +385,120 @@ impl LlmMemoryExtractor {
 
     /// The source is appended to the instructions exactly here, so every prompt
     /// path pays for the payload the same number of times — once.
-    fn prompt(tasks: &str, source: &RawSource) -> String {
-        format!("{tasks}\n\n{}", String::from_utf8_lossy(&source.payload))
-    }
-
-    fn build_schema_prompt(source: &RawSource) -> String {
-        Self::prompt(
-            &format!("{} {}", Self::SCHEMA_TASK, Self::IMPORTANCE_TASK),
-            source,
+    fn prompt(tasks: &str, source: &RawSource, input_budget_tokens: usize) -> String {
+        format!(
+            "{tasks}\n\n{}",
+            Self::bounded_payload(&source.payload, input_budget_tokens)
         )
     }
 
-    fn build_summary_prompt(source: &RawSource) -> String {
+    /// 一次抽取发出去的正文：装得下就原样，装不下就留头留尾、省掉中间。
+    ///
+    /// 取舍按**整条消息**做，不按字符切：一条消息是一轮对话的最小完整单位，
+    /// 切进去会留下半句工具调用或半条工具结果，读者会把它们当成真的消息。
+    /// 省掉的那段在标记里报出条数与估算量，所以「少了一段」和「本来就短」
+    /// 在文本里长得不一样。
+    fn bounded_payload(payload: &[u8], budget_tokens: usize) -> String {
+        let text = String::from_utf8_lossy(payload);
+        if budget_tokens == 0 {
+            return text.into_owned();
+        }
+        let Ok(messages) = serde_json::from_str::<Vec<cog_core::Message>>(&text) else {
+            // 这条链路写下的 payload 是 `Vec<Message>` 的 JSON；解析不出来说明
+            // 这份 raw 不是它写的（更早的格式、别处放进来的对象）。估算按词
+            // 算，而这一份可能一个词都没有——按估算卡，一个 200KB 的无空白
+            // 大块永远只值 4 token，等于没有界。按字符切是保守的那一侧：一个
+            // 字符最多两个 token（汉字），最多超出一倍。
+            return Self::cut_head_chars(&text, budget_tokens);
+        };
+        let cost = |m: &cog_core::Message| cog_core::estimate_tokens(&m.content());
+        let total: usize = messages.iter().map(cost).sum();
+        if total <= budget_tokens {
+            // 装得下就原样发：重新序列化一遍只是把同一份对话换个写法发出去，
+            // 白花两次转义的差。
+            return text.into_owned();
+        }
+        let half = budget_tokens / 2;
+        let mut head_len = 0usize;
+        let mut head_cost = 0usize;
+        for m in &messages {
+            let c = cost(m);
+            if head_cost + c > half {
+                break;
+            }
+            head_cost += c;
+            head_len += 1;
+        }
+        let mut tail_len = 0usize;
+        let mut tail_cost = 0usize;
+        for m in messages.iter().rev() {
+            let c = cost(m);
+            if tail_cost + c > half {
+                break;
+            }
+            tail_cost += c;
+            tail_len += 1;
+        }
+        // 单条就超过半个预算时两圈都停在 0：头尾各保一条——任务开头与结论
+        // 是最值得留下的两段，宁可略过预算也不把整段对话换成一句「已省略」。
+        // 只剩一条消息时两头收敛到同一条上（尾长按剩余条数夹住）。
+        let head_len = head_len.max(1).min(messages.len());
+        let tail_len = tail_len.max(1).min(messages.len() - head_len);
+        if head_len + tail_len >= messages.len() {
+            // 省不下任何一条整消息（只剩一条，或头尾已经相接）：原样发出。
+            // 宁可这一条略过预算，也不把对话换成一句「已省略」。
+            return text.into_owned();
+        }
+        let (Ok(head), Ok(tail)) = (
+            serde_json::to_string(&messages[..head_len]),
+            serde_json::to_string(&messages[messages.len() - tail_len..]),
+        ) else {
+            // 能反序列化就该能序列化；真出错时退回按字符切，而不是把这一段
+            // 静默换成空串——空串在模型眼里是「这段对话是空的」。
+            return Self::cut_head_chars(&text, budget_tokens);
+        };
+        let elided: usize = messages[head_len..messages.len() - tail_len]
+            .iter()
+            .map(cost)
+            .sum();
+        let elided_len = messages.len() - head_len - tail_len;
+        format!(
+            "{head}\n\n[{elided_len} of {} messages (~{elided} tokens) omitted from the middle \
+             of this conversation; the ends are shown, and the archive holds it in full]\n\n{tail}",
+            messages.len()
+        )
+    }
+
+    /// 解析不出消息数组时的兜底：从头按字符数切，并说明切了多少。
+    fn cut_head_chars(text: &str, budget: usize) -> String {
+        let total = text.chars().count();
+        if total <= budget {
+            return text.to_string();
+        }
+        let head: String = text.chars().take(budget).collect();
+        format!("{head}\n\n[{budget} of {total} characters of an unrecognized payload shown]")
+    }
+
+    fn build_schema_prompt(source: &RawSource, input_budget_tokens: usize) -> String {
+        Self::prompt(
+            &format!("{} {}", Self::SCHEMA_TASK, Self::IMPORTANCE_TASK),
+            source,
+            input_budget_tokens,
+        )
+    }
+
+    fn build_summary_prompt(source: &RawSource, input_budget_tokens: usize) -> String {
         Self::prompt(
             &format!("{} {}", Self::SUMMARY_TASK, Self::IMPORTANCE_TASK),
             source,
+            input_budget_tokens,
         )
     }
 
     /// One prompt carrying both tasks, so one call can answer both. The two
     /// single-layer prompts are what a caller falls back to when only one layer
     /// is still missing; this is what a caller with neither missing uses.
-    fn build_combined_prompt(source: &RawSource) -> String {
+    fn build_combined_prompt(source: &RawSource, input_budget_tokens: usize) -> String {
         Self::prompt(
             &format!(
                 "{} {}\n\n{} {}",
@@ -401,6 +508,7 @@ impl LlmMemoryExtractor {
                 Self::IMPORTANCE_TASK
             ),
             source,
+            input_budget_tokens,
         )
     }
 
@@ -526,7 +634,7 @@ impl LlmMemoryExtractor {
 #[async_trait]
 impl MemoryExtractor for LlmMemoryExtractor {
     async fn extract_schema(&self, source: &RawSource) -> SFResult<Vec<SchemaEntry>> {
-        let prompt = Self::build_schema_prompt(source);
+        let prompt = Self::build_schema_prompt(source, self.input_budget_tokens);
         let extraction: SchemaExtraction = execute_structured(
             &*self.provider,
             &[cog_core::Message::user(prompt)],
@@ -538,7 +646,7 @@ impl MemoryExtractor for LlmMemoryExtractor {
     }
 
     async fn generate_summary(&self, source: &RawSource) -> SFResult<SummaryEntry> {
-        let prompt = Self::build_summary_prompt(source);
+        let prompt = Self::build_summary_prompt(source, self.input_budget_tokens);
         let extraction: SummaryExtraction = execute_structured(
             &*self.provider,
             &[cog_core::Message::user(prompt)],
@@ -554,7 +662,7 @@ impl MemoryExtractor for LlmMemoryExtractor {
     /// it twice and pays for it twice. The two single-layer methods stay for
     /// the case where only one layer is still missing.
     async fn extract_all(&self, source: &RawSource) -> SFResult<(Vec<SchemaEntry>, SummaryEntry)> {
-        let prompt = Self::build_combined_prompt(source);
+        let prompt = Self::build_combined_prompt(source, self.input_budget_tokens);
         let extraction: CombinedExtraction = execute_structured(
             &*self.provider,
             &[cog_core::Message::user(prompt)],
@@ -716,7 +824,10 @@ mod tests {
     #[tokio::test]
     async fn the_merged_prompt_carries_the_payload_once() {
         const SENTINEL: &str = "SENTINEL-4682f1";
-        let prompt = LlmMemoryExtractor::build_combined_prompt(&raw("raw-a", SENTINEL));
+        let prompt = LlmMemoryExtractor::build_combined_prompt(
+            &raw("raw-a", SENTINEL),
+            crate::config::DEFAULT_EXTRACTION_INPUT_BUDGET_TOKENS,
+        );
 
         assert_eq!(
             prompt.matches(SENTINEL).count(),
@@ -725,6 +836,97 @@ mod tests {
         );
         assert!(prompt.contains(LlmMemoryExtractor::SCHEMA_TASK));
         assert!(prompt.contains(LlmMemoryExtractor::SUMMARY_TASK));
+    }
+
+    /// 一份 transcript 的 raw：真链路上 `build_raw` 发出去的就是这个形状。
+    fn transcript(turns: &[&str]) -> RawSource {
+        let messages: Vec<cog_core::Message> =
+            turns.iter().map(|t| cog_core::Message::user(*t)).collect();
+        RawSource::new(
+            "raw-budget",
+            "default",
+            "conversation/transcript",
+            serde_json::to_vec(&messages).unwrap(),
+        )
+    }
+
+    /// 装得下就原样发：换一种序列化写法发出去，等于白花两次转义的差，
+    /// 而抽取器读的是同一份对话。
+    #[test]
+    fn a_transcript_within_budget_is_sent_verbatim() {
+        let source = transcript(&["alpha one", "beta two"]);
+        let prompt = LlmMemoryExtractor::build_combined_prompt(&source, 64_000);
+        let payload = String::from_utf8(source.payload.clone()).unwrap();
+
+        assert!(
+            prompt.contains(&payload),
+            "the payload must reach the model byte for byte: {prompt}"
+        );
+    }
+
+    /// 超预算时留头留尾、省中间：开头是任务、结尾是结论，中间那几轮最可省。
+    /// 省掉的条数写在文本里——"少了一段"与"本来就短"必须长得不一样。
+    #[test]
+    fn an_over_budget_transcript_keeps_both_ends_and_names_what_it_dropped() {
+        let source = transcript(&[
+            "alpha zero",
+            "alpha one",
+            "alpha two",
+            "alpha three",
+            "alpha four",
+        ]);
+        // 每条两个英文词（8 token），预算 24 = 头尾各一条。
+        let prompt = LlmMemoryExtractor::build_combined_prompt(&source, 24);
+
+        assert!(
+            prompt.contains("alpha zero"),
+            "the opening turn is kept: {prompt}"
+        );
+        assert!(
+            prompt.contains("alpha four"),
+            "the closing turn is kept: {prompt}"
+        );
+        assert!(
+            !prompt.contains("alpha two"),
+            "a middle turn must not be sent: {prompt}"
+        );
+        assert!(
+            prompt.contains("3 of 5 messages"),
+            "the elision states how many turns are missing: {prompt}"
+        );
+    }
+
+    /// 单条消息就超过预算时宁可略过预算也不发假的空对话：整段换成一句
+    /// "已省略"之后，抽取器会照着空对话编出一份看起来正常的记忆。
+    #[test]
+    fn a_single_message_over_budget_is_still_sent_whole() {
+        let long = "alpha ".repeat(200);
+        let source = transcript(&[&long]);
+        let prompt = LlmMemoryExtractor::build_combined_prompt(&source, 8);
+
+        assert!(prompt.contains(&long), "the only turn is still there");
+        assert!(
+            !prompt.contains("omitted from the middle"),
+            "nothing was elided, so no elision marker: {prompt}"
+        );
+    }
+
+    /// 解析不出消息数组的载荷按字符切。这一条守的是估算口径的已知盲区：
+    /// 没有空白的大块在估算里永远是一个词，按 token 卡根本不会触发。
+    #[test]
+    fn an_unparsable_payload_is_cut_by_characters_not_by_estimate() {
+        // 用一个不会出现在提示词正文里的字符：任务说明里本来就有几个 `x`
+        // （Extract / extracted / text），按它数会把提示词自己的字算进来。
+        let blob = "~".repeat(2_000);
+        let source = raw("raw-not-a-transcript", &blob);
+        assert!(
+            cog_core::estimate_tokens(&blob) <= 50,
+            "the estimate cannot see a whitespace-free blob"
+        );
+
+        let prompt = LlmMemoryExtractor::build_combined_prompt(&source, 50);
+        assert_eq!(prompt.matches('~').count(), 50);
+        assert!(prompt.contains("unrecognized payload"), "{prompt}");
     }
 
     /// 合并只许省调用，不许改落库的内容：同一份模型输出，分层走与合并走

@@ -13,6 +13,7 @@ pub mod loop_health;
 pub mod observability_text;
 pub mod owner_lease;
 pub mod secrets;
+pub mod token_estimate;
 pub mod types;
 
 pub use audit::{verify_chain, AuditEvent, AuditKind, AuditStream, ChainVerification};
@@ -67,6 +68,7 @@ pub use secrets::{
     redact_json_secrets, redact_secrets, ChainedSecretProvider, EnvSecretProvider,
     FileSecretProvider, SecretProvider,
 };
+pub use token_estimate::estimate_tokens;
 pub use types::*;
 
 // Backward-compatible module aliases for old module paths.

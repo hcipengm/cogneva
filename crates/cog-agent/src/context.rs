@@ -2,9 +2,17 @@ use cog_core::Message;
 
 /// Agent 上下文窗口管理。
 /// 参考 pi-agent-core 的 transcript 设计，但用 Rust Vec 替代 JS 数组。
+///
+/// 窗口有两个面。`messages` 是模型看到的那份，按预算裁剪；`history` 是本窗口
+/// 见过的全部消息，只增不减。裁剪是长对话的正常行为，但被裁掉的轮次原先在
+/// 系统里再没有第二份：快照存的是 `messages`，`AgentEnd` 发的也是 `messages`，
+/// 于是「模型这一轮没看到」等于「这段对话没有发生过」。两面分开之后，模型看
+/// 多少仍由预算决定，系统留多少不由预算决定——记全，投影按预算来。
 #[derive(Clone)]
 pub struct ContextWindow {
     messages: Vec<Message>,
+    /// 与 `messages` 同一套插入位置，但**从不**因为预算被裁。
+    history: Vec<Message>,
     max_tokens: usize,
     current_tokens: usize,
 }
@@ -13,6 +21,7 @@ impl ContextWindow {
     pub fn new(max_tokens: usize) -> Self {
         Self {
             messages: Vec::new(),
+            history: Vec::new(),
             max_tokens,
             current_tokens: 0,
         }
@@ -24,6 +33,11 @@ impl ContextWindow {
         // 于是窗口预算失效，之后每一轮都带着它，同一份字节还会被当作记忆
         // 原文再发给抽取器两次。边界卡在「进入上下文」这一步，且只作用于
         // 工具结果：user 是任务输入、assistant 是模型自己的话，都不该在这里被改写。
+        //
+        // 历史记的是**过界之前**的这条：下面这道界是通道上唯一一处不留引用
+        // 就丢字节的地方（工具返回点那条会先归档再裁，模型手里还留着引用），
+        // 记在前面，被这道界裁掉的字节就还在历史里。
+        self.history.push(message.clone());
         let message = bound_tool_result(message, self.max_tokens);
         let tokens = estimate_tokens(&message.content());
         self.current_tokens += tokens;
@@ -38,6 +52,8 @@ impl ContextWindow {
     /// Appending it instead makes the same text appear again in the middle of the
     /// conversation — paid for twice — and moves it out of the cacheable prefix.
     pub fn prepend_message(&mut self, message: Message) {
+        // 历史跟着投影走位置：读者拿到的那份与模型读过的那份开头相同。
+        self.history.insert(0, message.clone());
         let message = bound_tool_result(message, self.max_tokens);
         self.current_tokens += estimate_tokens(&message.content());
         self.messages.insert(0, message);
@@ -61,8 +77,18 @@ impl ContextWindow {
         &self.messages
     }
 
+    /// 本窗口见过的全部消息，包含被预算裁掉、因而模型这一轮没看到的那部分。
+    ///
+    /// 这一份是耐久面：它落进 raw 归档，抽取器读的也是它。裁剪后的
+    /// [`Self::messages`] 只有两个读者——模型的请求与快照，都是「这一刻
+    /// 的投影」，不是「这段对话是什么」。
+    pub fn history(&self) -> &[Message] {
+        &self.history
+    }
+
     pub fn clear(&mut self) {
         self.messages.clear();
+        self.history.clear();
         self.current_tokens = 0;
     }
 
@@ -70,10 +96,12 @@ impl ContextWindow {
     /// Used by snapshot restore to reconstruct context state.
     pub fn restore_messages(&mut self, messages: Vec<Message>) {
         self.messages.clear();
+        self.history.clear();
         self.current_tokens = 0;
         for msg in messages {
             // 快照可能是旧版本写下的：进入上下文的这一步在恢复路径上也要重做，
             // 否则一份更早的、没有这条界的进程存下的快照会把巨块带回来。
+            self.history.push(msg.clone());
             let msg = bound_tool_result(msg, self.max_tokens);
             let tokens = estimate_tokens(&msg.content());
             self.current_tokens += tokens;
@@ -137,10 +165,23 @@ impl ContextWindow {
                 }
             }
             let mut freed = 0usize;
+            let mut dropped = 0usize;
             for m in self.messages.drain(idx..end) {
                 freed += estimate_tokens(&m.content());
+                dropped += 1;
             }
             self.current_tokens = self.current_tokens.saturating_sub(freed);
+            // 裁剪只作用在投影上，所以这条报的是「模型这一轮少看到多少」，
+            // 而不是「丢了什么」——被裁的轮次仍在 history 里，落进 raw 归档。
+            // 不另铸指标：压力读数由耐久面自己给（transcript 的估算长度对窗口
+            // 配置），铸一个只在这里 +1 的计数器，等于把同一个量记两遍。
+            tracing::debug!(
+                "Context window dropped {} messages (~{} tokens) from the prompt; the window budget is {}, the run history keeps {} messages",
+                dropped,
+                freed,
+                self.max_tokens,
+                self.history.len(),
+            );
         }
         // 裁剪可能把 assistant 删掉却留下它的 tool result；严格校验的供应商
         // （Kimi/OpenAI）会拒绝找不到对应 tool_calls 声明的 tool 消息。孤儿
@@ -280,34 +321,11 @@ pub fn truncate_to_chars(text: &str, budget_chars: usize, reference: Option<&str
     }
 }
 
-/// 简化的 token 估算。
-/// CJK 字符每个算 2 token（保守）；其余按字符数 /4 粗估（英文约 4 字符
-/// 1 token）。CJK 必须按字符计而非字节：UTF-8 一个汉字 3 字节，按字节
-/// 会把中文上下文高估 3 倍，窗口提前触发裁剪。
-pub fn estimate_tokens(text: &str) -> usize {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return 0;
-    }
-
-    let mut tokens = 0;
-    for part in trimmed.split_whitespace() {
-        // CJK 字符检测
-        let is_cjk = |c: &char| {
-            ('\u{4e00}'..='\u{9fff}').contains(c)
-                || ('\u{3000}'..='\u{303f}').contains(c)
-                || ('\u{ff00}'..='\u{ffef}').contains(c)
-        };
-        let cjk_chars = part.chars().filter(is_cjk).count();
-        let other_chars = part.chars().count() - cjk_chars;
-        if cjk_chars > 0 {
-            tokens += cjk_chars * 2 + other_chars.div_ceil(4);
-        } else {
-            tokens += 4; // 英文单词约 4 token
-        }
-    }
-    tokens
-}
+/// 估算口径在整个 workspace 里只有一份（`cog_core::token_estimate`）：窗口
+/// 按它决定裁不裁、抽取器按它决定一段 transcript 发多少，两处既然是拿同一个
+/// 数互相比，就不能各有一份实现。这里保留这个名字，是为了让窗口这一侧的读法
+/// 不变。
+pub use cog_core::estimate_tokens;
 
 #[cfg(test)]
 mod tests {
@@ -544,6 +562,91 @@ mod tests {
             text.chars().count() - kept,
             "丢弃量必须等于原文长度减去标记左边保留的头部"
         );
+    }
+
+    /// 被裁掉的轮次留在历史里：模型这一轮看不到它，系统不必因此失去它。
+    /// 这条界之前，被裁的轮次在本进程之外没有第二份——快照存投影、AgentEnd
+    /// 发投影，于是「模型没看到」等于「这段对话没有发生过」。
+    #[test]
+    fn a_trimmed_turn_stays_in_the_history() {
+        let mut ctx = ContextWindow::new(40);
+        let turns = [
+            "第一轮 filler filler filler filler",
+            "第二轮 filler filler filler filler",
+            "第三轮 filler filler filler filler",
+        ];
+        ctx.add_message(Message::user("目标：把网关的上游换掉"));
+        for t in turns {
+            ctx.add_message(Message::assistant_text(t));
+        }
+
+        let history: Vec<String> = ctx.history().iter().map(|m| m.content()).collect();
+        for kept in ["目标：把网关的上游换掉"].into_iter().chain(turns) {
+            assert!(
+                history.iter().any(|c| c == kept),
+                "历史里少了「{kept}」：{history:?}"
+            );
+        }
+        assert!(
+            ctx.messages().len() < ctx.history().len(),
+            "这张网得真的被裁过，否则这条测试什么都没证明（投影 {} 条 / 历史 {} 条）",
+            ctx.messages().len(),
+            ctx.history().len()
+        );
+    }
+
+    /// 进上下文时被这条界裁掉的那一份，历史里是**过界之前**的全文：这道界是
+    /// 链路上唯一不留引用就丢字节的地方（工具返回点那条先归档再裁，模型手里
+    /// 有引用），历史记在它前面，被裁的字节就还在。
+    #[test]
+    fn a_tool_result_cut_on_the_way_in_keeps_its_bytes_in_the_history() {
+        let mut ctx = ContextWindow::new(400);
+        let full = "z".repeat(5_000);
+        ctx.add_message(Message::assistant(vec![cog_core::ContentBlock::tool_call(
+            "call_raw",
+            "run_command",
+            serde_json::json!({"command": "dump"}),
+        )]));
+        ctx.add_message(Message::tool_result_text("call_raw", "run_command", &full));
+
+        let projected = ctx.messages().last().unwrap().content();
+        assert!(
+            projected.contains("tool output truncated"),
+            "投影这一份是被裁过的"
+        );
+        assert_eq!(
+            ctx.history().last().unwrap().content(),
+            full,
+            "耐久面记的是过界之前的那条"
+        );
+    }
+
+    #[test]
+    fn clearing_the_window_clears_both_faces() {
+        let mut ctx = ContextWindow::new(40);
+        ctx.add_message(Message::user("第一轮 filler filler filler filler"));
+        ctx.add_message(Message::user("第二轮 filler filler filler filler"));
+        ctx.clear();
+
+        assert!(ctx.messages().is_empty());
+        assert!(
+            ctx.history().is_empty(),
+            "新一轮从空开始，否则上一轮的对话会算进这一轮的账"
+        );
+    }
+
+    /// 快照恢复喂的是投影，两个面一起从它长出：恢复之后历史与投影同长，
+    /// 之后的新消息照旧记全。
+    #[test]
+    fn a_restored_snapshot_seeds_both_faces() {
+        let mut ctx = ContextWindow::new(400);
+        ctx.restore_messages(vec![
+            Message::user("任务输入"),
+            Message::assistant_text("上一轮的回答"),
+        ]);
+
+        assert_eq!(ctx.history().len(), ctx.messages().len());
+        assert_eq!(ctx.history().len(), 2);
     }
 
     #[test]

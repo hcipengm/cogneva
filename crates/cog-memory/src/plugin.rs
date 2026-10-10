@@ -433,7 +433,8 @@ impl cog_core::SystemPlugin for MemoryPlugin {
         if let Some(backend) = memory_backend {
             let extractor: Arc<dyn cog_core::MemoryExtractor> =
                 if let Some(ref provider) = llm_provider {
-                    let mut extractor = crate::LlmMemoryExtractor::new(provider.clone());
+                    let mut extractor = crate::LlmMemoryExtractor::new(provider.clone())
+                        .with_input_budget_tokens(memory.ingest.extraction_input_budget_tokens);
                     if let Some(ref embedder) = embed_provider {
                         extractor = extractor.with_embedder(embedder.clone());
                     }
