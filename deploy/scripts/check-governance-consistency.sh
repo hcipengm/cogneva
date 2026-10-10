@@ -19,6 +19,12 @@
 #      注释里运维 --set 的事）。运行期那个 Job 不是外推的下限——它每一次滚动都在，
 #      所以它在判词之内而不是只在头寸那行里（实测就是这么越界的）。
 #
+# 本门读的是**声明值**（渲染产物里的 `spec.hard`），不与 live 集群那只 ResourceQuota
+# 比对。所以本门绿只说「声明的天花板容得下声明的工作负载」——**不等于**「集群此刻装得下」。
+# 后者是运行期准入预检的判词（部署器在替换 Pod 前读 live `resourcequota` + 目标
+# Deployment 再判）。live 偏离声明时（手工 apply 过旧值、或声明已改但尚未落地），
+# **以运行期预检为准，不以本门为准**——本门对 live 一无所知，绿是本分不是保证。
+#
 # 用法：bash deploy/scripts/check-governance-consistency.sh <渲染产物目录>
 #       bash deploy/scripts/check-governance-consistency.sh deploy/rendered/k3s-single
 set -euo pipefail
