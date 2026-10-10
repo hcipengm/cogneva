@@ -83,6 +83,13 @@ data:
   # The evolution worker does not need strict persistence; allow memory fallbacks
   # for PostgreSQL/Redis-dependent plugins so the self-evolution loop can start.
   COGNEVA_STRICT_PERSISTENCE: "false"
+  # 记忆衰减留在主 app：这条循环的单写者租约（角色 memory_decay）只回答「谁可以
+  # 写」，不回答「写的那个人看到的是不是同一份数据」。本 Pod 的 memory 后端将来若
+  # 被打开，它的条目存储在 strict_persistence=false 下允许降级成进程内兜底（建表
+  # 失败只 warn 不 fail），那时它扫到的是空命名空间，每轮都记 idle——租约把它变成
+  # 唯一的衰减者，而共享记忆再也没人衰减，读数却说「没东西可衰减」。置 0 = 本 Pod
+  # 不起这条循环，衰减留在有共享库、且严格模式下会直接失败的那个 Pod。
+  COGNEVA_MEMORY_DECAY_INTERVAL_SECS: "0"
   # 主线跟踪自动部署器：检测 bare 仓库公版 main 前进后，沙盒构建 → buildah 推
   # 集群内 registry（Pod 内走 Service DNS:5000）→ 派独立 Job 经节点 NodePort
   # localhost:30500 门禁滚动四部署，失败自动回滚。依赖 evolution Role 扩权、
