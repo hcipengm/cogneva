@@ -314,7 +314,21 @@ impl cog_core::SystemPlugin for MemoryPlugin {
             if let (Some(backend), Some(metrics)) =
                 (memory_backend.clone(), metrics_backend.clone())
             {
-                crate::maintenance::spawn_decay_loop(backend, metrics, memory.maintenance.clone());
+                // 衰减动的是共用条目存储，所以它是一个单写者角色：中介由持有共用库的
+                // 插件在 `init` 里发布（每个插件的 init 都排在任一 start 之前），
+                // 取不到时为空——没有共用库的部署没有第二个写者要挡。
+                let role = ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>();
+                let shutdown = ctx
+                    .consume::<cog_core::ShutdownSignal>()
+                    .map(|s| (*s).clone())
+                    .unwrap_or_default();
+                crate::maintenance::spawn_decay_loop(
+                    backend,
+                    metrics,
+                    memory.maintenance.clone(),
+                    role,
+                    shutdown,
+                );
             } else {
                 warn!(
                     "Memory decay maintenance not started: memory backend or metrics backend unavailable"

@@ -9,6 +9,12 @@
 //! 命名空间，对每个命名空间调一次 `decay`，并把这一轮落在哪一格记进
 //! `cogneva_memory_decay_total{outcome}`（闭集：`idle`／`decayed`／`archived`／
 //! `failed`）。它自己不判阈值对错——阈值是配置，规则是另一件事。
+//!
+//! 它扫的条目存储在 composite 后端下是**所有进程共用**的（摘要与向量落在共享的
+//! PG／Qdrant 上），所以这条循环是一个单写者角色：两个进程各扫一遍，同一个条目
+//! 的重要性就在同一段时间里乘两次，比策略说的更快跌到归档地板，而
+//! `cogneva_memory_decay_total` 也变成两倍。谁来扫由租约决定，见
+//! [`MEMORY_DECAY_ROLE`]。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,13 +22,20 @@ use std::time::Duration;
 
 use tracing::{info, warn};
 
-use cog_core::{MemoryBackend, MetricsBackend};
+use cog_core::{MemoryBackend, MetricsBackend, OwnerLeaseBroker, ShutdownSignal};
 
 use crate::config::MaintenanceConfig;
 
 /// 这条循环在进程存活注册表里的名字，也是 `cogneva_loop_tick_age_seconds{loop=…}`
 /// 的取值。
 pub const MEMORY_DECAY_LOOP: &str = "memory_decay";
+
+/// 这条循环在租约上的角色名：谁在衰减这份共享的记忆。
+///
+/// 取这个名字而不是复用循环名，是因为两个面读的是两个不同的东西：循环名是存活
+/// 与角色读数的标签（`{loop=…}`），角色名是租约上那一行
+/// （`cogneva_owner_leases.role`）。两者现在同值，但改一个不等于改了另一个。
+pub const MEMORY_DECAY_ROLE: &str = "memory_decay";
 
 /// 一次衰减扫描把合格条目的重要性乘上的系数。
 ///
@@ -65,12 +78,19 @@ impl DecayPass {
 /// 起一条进程级维护循环，按配置节拍衰减记忆。`decay_interval_secs` 为 0 时直接
 /// 不起（整条维护关掉）。
 ///
-/// 用 `spawn_unstoppable`：这条循环没有别人能给它的停止信号，它的退出就等于进程
-/// 退出，所以任何一次提前退出都是一次没人要求的死，交给存活族记账。
+/// `role` 是这棵进程能拿到的租约中介（由持有共用库的插件发布）：有它就先问
+/// 「这个角色是不是我的」，问不到就不动手；没有它就照旧自己扫自己的——那是共用库
+/// 不存在时的样子，那时没有第二个进程在和它争同一份数据。
+///
+/// 循环随进程的 `shutdown` 一起停。它不是「没有停止信号」的那种循环，但也没有
+/// 别人能提前叫停它：任何**没人要求**的提前退出仍然要被存活族记账，这由
+/// `loop_health` 的死亡哨兵负责（见那里的 `watch_death`）。
 pub fn spawn_decay_loop(
     backend: Arc<dyn MemoryBackend>,
     metrics: Arc<dyn MetricsBackend>,
     config: MaintenanceConfig,
+    role: Option<Arc<dyn OwnerLeaseBroker>>,
+    shutdown: ShutdownSignal,
 ) {
     let secs = config.decay_interval_secs;
     if secs == 0 {
@@ -86,25 +106,45 @@ pub fn spawn_decay_loop(
         age_threshold_secs,
         importance_threshold,
         ?namespaces,
+        arbitrated = role.is_some(),
         "Memory decay maintenance enabled"
     );
 
-    drop(cog_core::loop_health::spawn_unstoppable(
+    drop(cog_core::loop_health::spawn(
         MEMORY_DECAY_LOOP,
         cog_core::loop_health::Cadence::Periodic(period),
+        shutdown.clone(),
         // 每次尝试重建闭包，所以体里用到的东西在这里克隆一份。
         move |beat| {
             let backend = backend.clone();
             let metrics = metrics.clone();
             let namespaces = namespaces.clone();
+            let role = role.clone();
+            let shutdown = shutdown.clone();
             async move {
+                // 角色按**租约自己的节拍**续，而不是按这条循环的节拍问一次：扫描周期是
+                // 小时级，租期是分钟级，一轮问一次的话两轮之间这个进程早就不是持有者了，
+                // 而它那时还在扫，另一个进程则已经接手了同一份数据——正是租约要挡的重复。
+                // 循环体里仍然每轮问一次，因为丢了角色要在**丢的那一轮**停下来。
+                let hold =
+                    cog_core::RoleHold::start(role, MEMORY_DECAY_ROLE, beat.clone(), &shutdown);
+
                 let mut ticker = tokio::time::interval(period);
                 // 第一次 tick 立即返回；先吃掉它，让第一轮扫描落在起点之后一个
                 // 周期，而不是插件刚 start 就和启动期抢同一把锁。
                 ticker.tick().await;
                 loop {
                     beat.beat();
-                    ticker.tick().await;
+                    tokio::select! {
+                        _ = ticker.tick() => {}
+                        _ = shutdown.wait() => break,
+                    }
+                    // 这一份数据只该有一个进程在扫。答案由 beat 记（拿到／被别人拿着／
+                    // 问不到），这里只照答案决定动手不动手：问不到也**不**动手——不知道
+                    // 是不是只有自己，和知道只有自己不是一回事。
+                    if !hold.may_act().await {
+                        continue;
+                    }
                     for namespace in &namespaces {
                         let pass = run_pass(
                             &backend,
@@ -369,5 +409,139 @@ mod tests {
         )
         .await;
         assert_eq!(pass, DecayPass::Failed);
+    }
+
+    /// 一个按剧本作答的租约：`held` 说的是「这个角色是不是本进程的」，并记下问了
+    /// 几次——「没扫」要和「还没走到门口」分开，靠的就是这个计数。
+    struct ScriptedLease {
+        held: bool,
+        asks: AtomicUsize,
+    }
+
+    impl ScriptedLease {
+        fn new(held: bool) -> Arc<Self> {
+            Arc::new(Self {
+                held,
+                asks: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl cog_core::OwnerLease for ScriptedLease {
+        fn role(&self) -> &str {
+            MEMORY_DECAY_ROLE
+        }
+
+        async fn try_hold(&self) -> SFResult<bool> {
+            self.asks.fetch_add(1, Ordering::SeqCst);
+            Ok(self.held)
+        }
+    }
+
+    struct ScriptedBroker(Arc<ScriptedLease>);
+
+    impl cog_core::OwnerLeaseBroker for ScriptedBroker {
+        fn lease(&self, _role: &str, _ttl: Duration) -> Arc<dyn cog_core::OwnerLease> {
+            self.0.clone()
+        }
+    }
+
+    /// 扫描周期压到一秒，让测试能在秒级看见一轮。周期本身不是被测的东西。
+    fn fast_config() -> MaintenanceConfig {
+        MaintenanceConfig {
+            decay_interval_secs: 1,
+            ..MaintenanceConfig::default()
+        }
+    }
+
+    fn spawn_with_lease(
+        backend: Arc<ScriptedBackend>,
+        lease: Arc<ScriptedLease>,
+        shutdown: &cog_core::ShutdownSignal,
+    ) {
+        let broker: Arc<dyn cog_core::OwnerLeaseBroker> = Arc::new(ScriptedBroker(lease));
+        spawn_decay_loop(
+            backend as Arc<dyn MemoryBackend>,
+            Arc::new(crate::NoopMetricsBackend::new()),
+            fast_config(),
+            Some(broker),
+            shutdown.clone(),
+        );
+    }
+
+    /// 轮询到条件成立或超时，返回是否成立。等待的是「循环走到了哪里」，不是
+    /// 一个假想的耗时。
+    async fn wait_until(mut done: impl FnMut() -> bool) -> bool {
+        for _ in 0..150 {
+            if done() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        done()
+    }
+
+    /// 角色在别的进程手里时，这一轮一个命名空间都不扫。断言「没扫」的前提是它
+    /// **确实走到了门口**——问过租约——否则这条测试分不清「守住了」和「还没起来」。
+    #[tokio::test]
+    async fn a_round_scans_nothing_while_another_process_holds_the_role() {
+        let backend = ScriptedBackend::new(0, 0, false);
+        let shutdown = cog_core::ShutdownSignal::default();
+        let lease = ScriptedLease::new(false);
+        spawn_with_lease(backend.clone(), Arc::clone(&lease), &shutdown);
+
+        let asked = wait_until(|| lease.asks.load(Ordering::SeqCst) > 0).await;
+        // 再放一段时间，让「问过之后还是没扫」不只是同一瞬间的巧合。
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        shutdown.trigger();
+
+        assert!(
+            asked,
+            "the loop never reached the lease, so this test has not shown what it claims"
+        );
+        assert_eq!(
+            backend.passes.load(Ordering::SeqCst),
+            0,
+            "another process holds the decay role; this one must not decay the shared \
+             entries again"
+        );
+    }
+
+    /// 拿着角色的一轮照扫：守住的判词不能顺手把活也停了。
+    #[tokio::test]
+    async fn the_holder_scans_the_namespaces() {
+        let backend = ScriptedBackend::new(0, 0, false);
+        let shutdown = cog_core::ShutdownSignal::default();
+        let lease = ScriptedLease::new(true);
+        spawn_with_lease(backend.clone(), Arc::clone(&lease), &shutdown);
+
+        let scanned = wait_until(|| backend.passes.load(Ordering::SeqCst) > 0).await;
+        shutdown.trigger();
+
+        assert!(
+            scanned,
+            "the process holds the decay role and its round did not reach the backend"
+        );
+        assert_eq!(
+            *backend.last_ns.lock().unwrap(),
+            Some("default".to_string()),
+            "the round has to scan the configured namespaces, not just any call"
+        );
+    }
+
+    /// 默认扫描周期比租期长，所以「一轮问一次」不足以持有角色：两轮之间角色已经
+    /// 易主，而那一轮还没扫完。这条断言把 `RoleHold`（按租约节拍续）钉在默认配置
+    /// 上——把默认周期调到租期以内、或把续期方式换回一轮一次的人，会在这里撞上。
+    #[test]
+    fn the_default_scan_period_outlasts_a_lease_term() {
+        let period = Duration::from_secs(MaintenanceConfig::default().decay_interval_secs);
+        assert!(
+            period > cog_core::owner_lease::TERM,
+            "the decay loop declares a period of {period:?}, inside the lease term {:?}; a claim \
+             asked once per round would be enough there, and this loop would not have to renew on \
+             the lease's own cadence",
+            cog_core::owner_lease::TERM
+        );
     }
 }

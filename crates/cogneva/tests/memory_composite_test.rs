@@ -832,6 +832,8 @@ async fn test_decay_maintenance_loop_drives_a_real_pass() {
     ));
     // The smallest interval the config allows is one second; the loop's first
     // sweep lands one period after start, so poll rather than race the timer.
+    // Started with no arbiter: this test's point is the decay itself, and with
+    // one process there is no second writer for a lease to hold off.
     cog_memory::maintenance::spawn_decay_loop(
         backend.clone() as Arc<dyn MemoryBackend>,
         metrics.clone() as Arc<dyn MetricsBackend>,
@@ -841,6 +843,8 @@ async fn test_decay_maintenance_loop_drives_a_real_pass() {
             decay_importance_threshold: 0.5,
             decay_namespaces: vec!["default".into()],
         },
+        None,
+        cog_core::ShutdownSignal::default(),
     );
 
     let mut saw_decayed = false;
