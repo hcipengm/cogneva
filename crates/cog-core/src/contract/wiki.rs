@@ -50,6 +50,14 @@ pub trait WikiBackend: Send + Sync {
     fn provider_name(&self) -> &str;
 
     /// Ingest a markdown document at the given relative path.
+    ///
+    /// An index write, not a reading of the document: this spends storage and a
+    /// round trip, never a model call, so its cost does not move with how much
+    /// text the caller has and it is safe to call on content nobody has looked
+    /// at. That property is what callers of this trait rely on, and a backend
+    /// that reached for a model here would spend money on a path whose name
+    /// says "store" -- distilling a source is the maintainer trait's ingest,
+    /// which is the one that costs a model call per source.
     async fn ingest_document(&self, relative_path: &str, content: &str) -> crate::SFResult<()>;
 
     /// Read a single document by its relative path.
