@@ -156,6 +156,9 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             ctx.consume::<tokio::sync::broadcast::Sender<cog_core::EvolutionChangeInfo>>();
         let audit_stream: Option<Arc<dyn cog_core::AuditStream>> =
             ctx.consume_service::<dyn cog_core::AuditStream>();
+        // 外部提交的价值判定落到存储面，由持有共用库的插件发布；本进程只拿写面。
+        let taste_intent_sink: Option<Arc<dyn cog_core::TasteIntentSink>> =
+            ctx.consume_service::<dyn cog_core::TasteIntentSink>();
 
         // ── Build auxiliary components ──
 
@@ -223,6 +226,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             &evolution_admin,
             &evolution_stream,
             &audit_stream,
+            &taste_intent_sink,
         )
         .await
         .map_err(|e| cog_core::SFError::Config(format!("gateway state build failed: {}", e)))?;

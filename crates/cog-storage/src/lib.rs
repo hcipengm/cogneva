@@ -57,7 +57,8 @@ pub use mem::{
 pub use postgres::{
     HookArchiveRow, PostgresAuditRecorder, PostgresHookArchive, PostgresMetricsBackend,
     PostgresObservabilityGateway, PostgresRawLogIndexStore, PostgresSnapshotStore,
-    PostgresStateBackend, PostgresUserStore, EVENTS_PAGE_SQL, GAUGE_LATEST_SQL,
+    PostgresStateBackend, PostgresTasteIntentStore, PostgresUserStore, EVENTS_PAGE_SQL,
+    GAUGE_LATEST_SQL,
 };
 
 #[cfg(feature = "redis")]

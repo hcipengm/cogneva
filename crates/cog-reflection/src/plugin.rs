@@ -1230,11 +1230,18 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             if alert_source.is_none() {
                 info!("signal watcher: no ActiveAlertSource; persisted-alert channel off");
             }
+            // 外部提交的价值判定落盘在共用库，由持有库的插件发布；本进程只拿读面
+            // （加上把读到的那一行的去向写回去，读与写必须落在同一处）。
+            let taste_source = ctx.consume_service::<dyn cog_core::TasteIntentSource>();
+            if taste_source.is_none() {
+                info!("signal watcher: no TasteIntentSource; taste channel off");
+            }
             drop(crate::spawn_signal_watcher_loop(
                 orch,
                 sw_config,
                 shutdown,
                 alert_source,
+                taste_source,
                 self.signal_readings.clone(),
                 // 本循环产出的每个意图都会落到一个 squad，池全灭时跑一轮只买到一次 503。
                 llm_gate.clone(),

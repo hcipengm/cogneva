@@ -42,6 +42,7 @@ pub mod stream;
 pub mod supervisor;
 pub mod system_plugin;
 pub mod task;
+pub mod taste;
 pub mod tool;
 pub mod transport;
 pub mod version;

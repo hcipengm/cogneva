@@ -61,6 +61,7 @@ pub mod supervisor_control;
 pub mod supervisor_status;
 pub mod takeover;
 pub mod tasks;
+pub mod taste;
 pub mod websocket;
 pub mod websocket_protocol;
 pub mod wiki;
@@ -155,6 +156,9 @@ pub struct GatewayState {
         Option<Arc<tokio::sync::broadcast::Sender<cog_core::EvolutionChangeInfo>>>,
     /// 不可篡改审计流（审计 3.5/3.6）：配额执法等安全事件写入哈希链。
     pub audit_stream: Option<Arc<dyn cog_core::AuditStream>>,
+    /// 外部提交的价值判定（taste）落地处。缺席时接收端点显式报错，而不是
+    /// 收下提交再丢掉——提交就是证据，收下一个没落盘的提交等于伪造它。
+    pub taste_intent_sink: Option<Arc<dyn cog_core::TasteIntentSink>>,
     /// Observables — 各业务 crate 暴露的系统级指标（D5/D8/D9）。
     pub observables: Vec<Arc<dyn cog_core::Observable>>,
     /// 抓取维度集合的可选收窄项；空 = 不收窄，采每个 observable 自己声明的有界维度。
@@ -726,6 +730,12 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route(
             "/api/v1/protocol/a2a/agent-card",
             get(a2a_agent_card_handler),
+        )
+        // 外部价值判定：与 A2A 面同级（成员即可提交，见 operator 组），
+        // 审计里记名。判定本身不是变更，它只是把「什么算好」变成一条进化输入。
+        .route(
+            "/api/v1/evolution/taste-intents",
+            post(taste::submit_taste_intent_handler),
         )
         .route(
             "/api/v1/cluster/overview",

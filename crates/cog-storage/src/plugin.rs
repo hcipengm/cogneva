@@ -346,6 +346,43 @@ impl cog_core::SystemPlugin for StoragePlugin {
             }
         }
 
+        // ── Taste intent store (judgements submitted from outside the pipeline) ──
+        // 一个存储、两个面：接收提交的那一端与把提交变成活的那一端拿到的不是同一个
+        // 能力，谁都不该拿到对方的。两个都由持有共用库的这里发布——提交是证据，接
+        // 收方自己再存一份就会有两个「提交了什么」的答案。
+        if let Some(ref pool) = explain_pool {
+            let store = Arc::new(crate::PostgresTasteIntentStore::new(pool.clone()));
+            match store.init_schema().await {
+                Ok(()) => {
+                    let sink: Arc<dyn cog_core::TasteIntentSink> = store.clone();
+                    ctx.publish_service(sink);
+                    let source: Arc<dyn cog_core::TasteIntentSource> = store;
+                    ctx.publish_service(source);
+                    info!("StoragePlugin taste intent store published");
+                }
+                Err(e) => {
+                    if strict_persistence {
+                        return Err(cog_core::SFError::Config(format!(
+                            "PostgresTasteIntentStore init_schema failed (strict_persistence=true): {}",
+                            e
+                        )));
+                    }
+                    warn!(
+                        "PostgresTasteIntentStore init_schema failed: {}. Taste submissions have nowhere to land.",
+                        e
+                    );
+                }
+            }
+        } else {
+            if strict_persistence {
+                return Err(cog_core::SFError::Config(
+                    "PostgreSQL pool not available for the taste intent store (strict_persistence=true)"
+                        .into(),
+                ));
+            }
+            warn!("PostgreSQL pool not available for the taste intent store");
+        }
+
         // ── State backend (for supervisor / orchestrator) ──
         let mut state_backend_pg = false;
         let state_backend: Arc<dyn cog_core::StateBackend> = if let Some(ref pool) = config_pool {

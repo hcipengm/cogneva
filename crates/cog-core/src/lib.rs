@@ -57,6 +57,7 @@ pub use contract::stream::*;
 pub use contract::supervisor::*;
 pub use contract::system_plugin::*;
 pub use contract::task::*;
+pub use contract::taste::*;
 pub use contract::tool::*;
 pub use contract::wiki::*;
 pub use error::{SFError, SFResult};

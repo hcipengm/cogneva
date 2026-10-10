@@ -2,8 +2,9 @@
 //!
 //! Evolution inputs are not only external intents (issues/PRs); the system
 //! must also discover its own problems. This watcher polls orchestrator task
-//! state and turns four classes of runtime signals into internal evolution
-//! intents submitted through the main flow (`evolution_mode=generate_change`):
+//! state and the durable submission store, and turns five classes of signals
+//! into internal evolution intents submitted through the main flow
+//! (`evolution_mode=generate_change`):
 //!
 //! 1. **Failure recurrence**: self-evolution tasks failing with the same
 //!    error signature over and over mean a systematic defect, not bad luck.
@@ -15,6 +16,14 @@
 //! 4. **Persisted alerts**: firing rows in the alert state machine (infra
 //!    watcher, supervisor bridge) are faults something already judged
 //!    alert-worthy; each becomes an intent keyed by its dedup key.
+//! 5. **Taste intents**: judgements submitted from outside the pipeline
+//!    (whether a claimed result holds up, which direction is worth more, what
+//!    the standard of good should be). This is the one channel here whose
+//!    input does not come from the system's own state, and it is the reason
+//!    the other four cannot stand in for it: they all say where it hurts, and
+//!    none of them says where to go. Its input is also the one that can be
+//!    absent for a reason no reading here can see — nobody submitted anything
+//!    — so a quiet channel means nobody spoke, not that nothing is valuable.
 //!
 //! Every intent carries a deterministic id, which lets the watcher ask the
 //! task store whether the signal is already in hand before submitting: the
@@ -83,6 +92,18 @@ pub struct SignalWatcherConfig {
     /// producers, because the control plane that raised the alert can be an
     /// older revision than this watcher.
     pub alert_label_max_chars: usize,
+    /// Channel 5: turn taste intents submitted from outside the pipeline into
+    /// intents. This is the only channel here that carries a judgement of
+    /// value rather than a defect.
+    ///
+    /// It carries only what someone stated, so a deployment where nobody
+    /// submits has no signal on it — and nothing on this channel can tell that
+    /// from having nothing to say. It therefore cannot be a system's only
+    /// taste source: the judgements it cannot reach are the ones nobody has
+    /// put into words yet, which are exactly the ones worth finding.
+    pub taste_channel_enabled: bool,
+    /// Max taste submissions acted on per tick (flood guard).
+    pub taste_channel_max_per_tick: usize,
 }
 
 impl Default for SignalWatcherConfig {
@@ -98,6 +119,8 @@ impl Default for SignalWatcherConfig {
             alert_channel_enabled: true,
             alert_channel_max_per_tick: 5,
             alert_label_max_chars: cog_core::ALERT_LABEL_VALUE_MAX_CHARS,
+            taste_channel_enabled: true,
+            taste_channel_max_per_tick: 5,
         }
     }
 }
@@ -458,6 +481,129 @@ fn alert_task_id(dedup_key: &str) -> String {
     )
 }
 
+/// The report-cooldown key a taste submission's signal is filed under.
+///
+/// The kind and the subject together, both taken from the submission: two
+/// judgements of the same kind about the same subject are one signal, and a
+/// judgement about a subject differs from a preference over it. The subject is
+/// the submitter's own naming, so this suppresses repeats rather than guarding
+/// against a submitter — one thing named two ways is two subjects.
+fn taste_signal_key(intent: &cog_core::TasteIntent) -> String {
+    format!("taste:{}:{}", intent.payload.kind(), intent.subject)
+}
+
+/// The task a submission's work is filed under.
+///
+/// Derived from the submission's own id, which is minted per submission, so
+/// each submission owns exactly one task row for its whole life: the row can be
+/// read back to ask whether the work is still running, and re-submitting the
+/// same judgement after its cooldown produces a new submission with a new id
+/// rather than a second filing under a name that already holds a finished
+/// attempt's history.
+fn taste_task_id(intent: &cog_core::TasteIntent) -> String {
+    format!("self-signal-taste-{}", intent.id)
+}
+
+/// Turn one taste submission into the intent that will act on it.
+///
+/// The judgement is quoted rather than paraphrased: the submitter's reason is
+/// the whole input, and a squad acting on a summary of it would be acting on
+/// the summary. The goal says what kind of thing this is — a stated judgement,
+/// not an instruction — because a channel that turned one person's preference
+/// into an order would be a very different system from one that weighs it.
+fn taste_intent(intent: &cog_core::TasteIntent) -> (String, serde_json::Value) {
+    let goal = format!(
+        "Act on a judgement submitted from outside the pipeline about \"{}\": {}. \
+         Submitted by {} at {}. Decide whether this judgement calls for a change \
+         — to behaviour, to a decision, or to the criterion work is judged by — \
+         and implement the change it calls for; if it calls for none, say why in \
+         the change description. This is a stated judgement rather than an \
+         instruction: what is being asked for is the reason behind it, and the \
+         usual gates still decide whether the result is good.",
+        intent.subject,
+        intent.payload.summary(),
+        intent.submitted_by,
+        intent.submitted_at.to_rfc3339(),
+    );
+    let detail = serde_json::json!({
+        "kind": "taste_intent",
+        "taste_kind": intent.payload.kind(),
+        "subject": intent.subject,
+        "submitted_by": intent.submitted_by,
+        "submitted_at": intent.submitted_at.to_rfc3339(),
+        "intent_id": intent.id,
+        "payload": intent.payload,
+    });
+    (goal, detail)
+}
+
+/// What one round does about the taste submissions it read.
+///
+/// Work and endings are returned together for the same reason the alert
+/// channel returns them together: "held back as a repeat" and "driven this
+/// round" are answers about the same rows, and recovering either one from a
+/// second pass would be a second copy of the predicate.
+struct SelectedTaste<'a> {
+    /// Submissions to hand to the task layer this round, unfinished work first.
+    selected: Vec<&'a cog_core::StoredTasteIntent>,
+    /// Submissions to close as superseded: a judgement of the same kind about
+    /// the same subject was reported so recently that this one is a repeat.
+    superseded: Vec<&'a cog_core::StoredTasteIntent>,
+}
+
+/// Choose this round's taste work.
+///
+/// The two reads answer different questions and are chained rather than merged.
+/// A submission nothing was filed for is a first announcement, and the clock
+/// for it is what holds a repeat back. A submission whose work was filed and
+/// failed is unfinished work, and unfinished work is not a repeat: it is driven
+/// whatever the clock says, which is why it goes first, ahead of the cap.
+///
+/// A submission whose work is still running, or whose work ended and produced
+/// its result, has nothing to do and is not counted as anything — the row is
+/// history from the moment its work finished. Only the repeats are returned to
+/// be closed, because closing them is what keeps them from being re-read as new
+/// announcements every round once the clock runs out.
+fn select_taste<'a>(
+    pending: &'a [cog_core::StoredTasteIntent],
+    filed: &'a [cog_core::StoredTasteIntent],
+    tasks: &HashMap<&str, &Task>,
+    state: &SignalGuardState,
+    cooldown_secs: i64,
+    max: usize,
+    now: DateTime<Utc>,
+) -> SelectedTaste<'a> {
+    let unfinished: Vec<&cog_core::StoredTasteIntent> = filed
+        .iter()
+        .filter(|stored| {
+            stored
+                .task_id
+                .as_deref()
+                .and_then(|id| tasks.get(id))
+                .is_some_and(|task| task.status == TaskStatus::Failed)
+        })
+        .collect();
+
+    let mut announcements = Vec::new();
+    let mut superseded = Vec::new();
+    for stored in pending {
+        if cooldown_elapsed(state, &taste_signal_key(&stored.intent), cooldown_secs, now) {
+            announcements.push(stored);
+        } else {
+            superseded.push(stored);
+        }
+    }
+
+    SelectedTaste {
+        selected: unfinished
+            .into_iter()
+            .chain(announcements)
+            .take(max)
+            .collect(),
+        superseded,
+    }
+}
+
 /// What this tick should do about a signal, given whether a task for it is
 /// already in the store.
 #[derive(Debug, PartialEq, Eq)]
@@ -631,6 +777,7 @@ async fn tick(
     orch: &Arc<dyn OrchestratorControl>,
     config: &SignalWatcherConfig,
     alert_source: Option<&Arc<dyn cog_core::ActiveAlertSource>>,
+    taste_source: Option<&Arc<dyn cog_core::TasteIntentSource>>,
     readings: &SignalWatcherReadings,
 ) {
     // Stamped before anything is read, so a round that fails or finds nothing
@@ -837,6 +984,133 @@ async fn tick(
         }
     }
 
+    // 5. Taste intents submitted from outside the pipeline. This is the one
+    // channel whose input is not the system's own state: a judgement about
+    // whether a result holds up, which direction is worth more, or what the
+    // standard should be. Every other channel here can only report that
+    // something hurts.
+    if config.taste_channel_enabled {
+        if let Some(source) = taste_source {
+            // A failed read on either side leaves this round with no taste work
+            // and touches no row: "the store did not answer" must not arrive as
+            // "nothing was submitted", because the rows it could not read are
+            // still there and the next round is the one that can act on them.
+            let pending = source
+                .pending_intents(config.taste_channel_max_per_tick as i64)
+                .await;
+            // The window is how far back unfinished taste work is looked for,
+            // and it is measured from when the work was handed over: a
+            // submission that sat unclaimed through an outage is filed late,
+            // and its failure has to be findable on the rounds after that
+            // filing rather than on the rounds after the submission.
+            let filed = source
+                .filed_intents(
+                    now - chrono::Duration::seconds(config.report_cooldown_secs),
+                    config.taste_channel_max_per_tick as i64,
+                )
+                .await;
+            match (pending, filed) {
+                (Some(pending), Some(filed)) => {
+                    let by_id: HashMap<&str, &Task> =
+                        tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+                    let SelectedTaste {
+                        selected,
+                        superseded,
+                    } = select_taste(
+                        &pending,
+                        &filed,
+                        &by_id,
+                        &state,
+                        config.report_cooldown_secs,
+                        config.taste_channel_max_per_tick,
+                        now,
+                    );
+                    // Repeats are closed, not postponed. A submission held back
+                    // because a judgement of the same kind about the same
+                    // subject is already in hand is evidence that someone
+                    // agrees with work that is already filed — kept, and never
+                    // a second task. Left pending, the same row would be read
+                    // again once the cooldown ran out and would then file a
+                    // duplicate of work that had already been done.
+                    for stored in superseded {
+                        readings.record(SignalOutcome::Cooldown);
+                        if let Err(e) = source
+                            .dispose(
+                                stored.intent.id,
+                                cog_core::TasteDisposition::Superseded,
+                                None,
+                            )
+                            .await
+                        {
+                            warn!(
+                                id = %stored.intent.id,
+                                error = %e,
+                                "superseded taste submission not closed; it will be read again next round"
+                            );
+                        }
+                    }
+                    for stored in selected {
+                        dirty = true;
+                        let intent = &stored.intent;
+                        let key = taste_signal_key(intent);
+                        let task_id = taste_task_id(intent);
+                        // 这条提交的活已经跑完过一次，缺的只是它那一行的去向
+                        // （进程死在提交与写去向之间）。交给 submit_intent 会走
+                        // 「清掉终态行再提一个新的」那条路，同一份一次性判定就
+                        // 会被做第二遍。
+                        if by_id.get(task_id.as_str()).is_some_and(|t| {
+                            matches!(t.status, TaskStatus::Completed | TaskStatus::Cancelled)
+                        }) {
+                            state.reported.insert(key, now);
+                            if let Err(e) = source
+                                .dispose(
+                                    intent.id,
+                                    cog_core::TasteDisposition::Filed,
+                                    Some(&task_id),
+                                )
+                                .await
+                            {
+                                warn!(
+                                    id = %intent.id,
+                                    error = %e,
+                                    "finished taste submission not closed; it will be read again next round"
+                                );
+                            }
+                            continue;
+                        }
+                        let (goal, detail) = taste_intent(intent);
+                        let outcome =
+                            submit_intent(orch, task_id.clone(), "self_signal", goal, detail).await;
+                        // Only a submission that reached the task layer gets a
+                        // fate written down: one that never got there stays
+                        // pending and is retried, which is also what makes the
+                        // retry idempotent — the second attempt reads the task
+                        // store and finds the work already in hand.
+                        if report_outcome(&mut state, &key, outcome, now, readings) {
+                            if let Err(e) = source
+                                .dispose(
+                                    intent.id,
+                                    cog_core::TasteDisposition::Filed,
+                                    Some(&task_id),
+                                )
+                                .await
+                            {
+                                warn!(
+                                    id = %intent.id,
+                                    error = %e,
+                                    "filed taste submission not marked; its task may be filed again"
+                                );
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    warn!("taste intent store unreadable; no taste work this round");
+                }
+            }
+        }
+    }
+
     // The store's own size is published every round, whatever this round did:
     // it is the only reading that says whether keys are accumulating, and a
     // store that only ever grows is how it went unnoticed for weeks. It is a
@@ -917,6 +1191,7 @@ pub fn spawn_signal_watcher_loop(
     config: SignalWatcherConfig,
     shutdown: cog_core::ShutdownSignal,
     alert_source: Option<Arc<dyn cog_core::ActiveAlertSource>>,
+    taste_source: Option<Arc<dyn cog_core::TasteIntentSource>>,
     readings: Arc<SignalWatcherReadings>,
     llm_gate: Option<Arc<dyn cog_core::SchedulerGate>>,
 ) -> tokio::task::JoinHandle<()> {
@@ -927,6 +1202,7 @@ pub fn spawn_signal_watcher_loop(
         backlog_threshold = config.backlog_threshold,
         self_audit_interval_secs = config.self_audit_interval_secs,
         alert_channel = alert_source.is_some() && config.alert_channel_enabled,
+        taste_channel = taste_source.is_some() && config.taste_channel_enabled,
         "self-discovery signal watcher started"
     );
     // Self-discovery: if this loop stops, the system stops noticing its own
@@ -942,6 +1218,7 @@ pub fn spawn_signal_watcher_loop(
             let config = config.clone();
             let shutdown = shutdown.clone();
             let alert_source = alert_source.clone();
+            let taste_source = taste_source.clone();
             let readings = readings.clone();
             let llm_gate = llm_gate.clone();
             async move {
@@ -976,7 +1253,14 @@ pub fn spawn_signal_watcher_loop(
                                 continue;
                             }
                             held = false;
-                            tick(&orchestrator, &config, alert_source.as_ref(), &readings).await;
+                            tick(
+                                &orchestrator,
+                                &config,
+                                alert_source.as_ref(),
+                                taste_source.as_ref(),
+                                &readings,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -1741,5 +2025,296 @@ mod tests {
             .map(|m| m.value)
             .sum();
         assert_eq!(signals, 0.0, "a held-off round counted a signal");
+    }
+
+    fn judgement(subject: &str, preferred: &str) -> cog_core::TasteIntent {
+        cog_core::TasteIntent {
+            id: uuid::Uuid::new_v4(),
+            subject: subject.into(),
+            submitted_by: "reviewer".into(),
+            submitted_at: Utc::now(),
+            payload: cog_core::TasteIntentPayload::DirectionPreference(
+                cog_core::DirectionPreferenceIntent {
+                    preferred: preferred.into(),
+                    alternative: "the other way".into(),
+                    rationale: "it is the one the queue can absorb".into(),
+                },
+            ),
+        }
+    }
+
+    fn filed_row(intent: cog_core::TasteIntent, task_id: &str) -> cog_core::StoredTasteIntent {
+        cog_core::StoredTasteIntent {
+            intent,
+            task_id: Some(task_id.into()),
+        }
+    }
+
+    fn pending_row(intent: cog_core::TasteIntent) -> cog_core::StoredTasteIntent {
+        cog_core::StoredTasteIntent {
+            intent,
+            task_id: None,
+        }
+    }
+
+    fn taste_row(intent: &cog_core::TasteIntent, status: TaskStatus) -> Task {
+        let mut task = Task::new(
+            taste_task_id(intent),
+            TaskType::Custom("self_signal".into()),
+            serde_json::json!({}),
+        );
+        task.status = status;
+        task
+    }
+
+    /// The key is the pair, so two judgements of one kind about one subject are
+    /// one signal however they are worded — and a judgement *about* a subject is
+    /// not the same signal as a preference *over* it, which is what makes the
+    /// kind part of the key rather than something the reader folds in later.
+    #[test]
+    fn the_taste_key_is_the_kind_and_the_subject_together() {
+        let subject = "the retry policy";
+        let mut verdict = judgement(subject, "the cheap one");
+        verdict.payload =
+            cog_core::TasteIntentPayload::EvaluatorVerdict(cog_core::EvaluatorVerdictIntent {
+                verdict: cog_core::EvaluatorVerdict::Contradicted,
+                rationale: "the failures come from the workload".into(),
+            });
+
+        assert_eq!(
+            taste_signal_key(&judgement(subject, "the cheap one")),
+            taste_signal_key(&judgement(subject, "a different wording")),
+            "同一种判定针对同一个对象就是同一个信号，措辞不同不算两回事"
+        );
+        assert_ne!(
+            taste_signal_key(&judgement(subject, "the cheap one")),
+            taste_signal_key(&verdict),
+            "对同一个对象「判定它对不对」和「偏好哪一个」是两种输入"
+        );
+        assert_ne!(
+            taste_signal_key(&judgement(subject, "the cheap one")),
+            taste_signal_key(&judgement("another subject", "the cheap one"))
+        );
+    }
+
+    /// Every submission owns one task row, derived from its own id. Two
+    /// submissions of the same judgement are two pieces of evidence and get two
+    /// rows: filed under a shared name, the second would land on the first one's
+    /// finished history, which `submit_intent` answers by clearing the row and
+    /// running a one-shot judgement a second time.
+    #[test]
+    fn each_submission_owns_its_own_task_row() {
+        let first = judgement("the retry policy", "the cheap one");
+        let second = judgement("the retry policy", "the cheap one");
+
+        assert_ne!(
+            taste_task_id(&first),
+            taste_task_id(&second),
+            "同一个判定提交两次是两条证据，不能共用一个任务名"
+        );
+        assert_ne!(
+            taste_task_id(&first),
+            alert_task_id("k"),
+            "两条通道的任务名不能撞在一起"
+        );
+    }
+
+    /// The judgement is quoted, not paraphrased: the reason is the whole input,
+    /// and a squad acting on a summary would be acting on the summary. What the
+    /// goal says about it is what kind of thing it is — a stated judgement, not
+    /// an instruction — because the reader of this goal is an agent that will
+    /// otherwise read a preference as an order.
+    #[test]
+    fn the_goal_quotes_the_judgement_and_says_it_is_one() {
+        let intent = judgement("the retry policy", "the cheap one");
+        let rationale = "it is the one the queue can absorb".to_string();
+        let (goal, detail) = taste_intent(&intent);
+
+        assert!(goal.contains(&intent.subject));
+        assert!(
+            goal.contains(&rationale),
+            "提交者给的理由要原样进 goal，转述一次就是丢一次输入"
+        );
+        assert!(goal.contains("reviewer"), "提交者要出现在 goal 里");
+        assert!(
+            goal.contains("stated judgement"),
+            "goal 要说明这是一条陈述出来的判定，而不是一条指令"
+        );
+        assert_eq!(detail["kind"], "taste_intent");
+        assert_eq!(detail["taste_kind"], intent.payload.kind());
+        assert_eq!(detail["intent_id"], intent.id.to_string());
+        assert_eq!(detail["submitted_by"], "reviewer");
+        assert_eq!(
+            detail["payload"].get("preferred").and_then(|v| v.as_str()),
+            Some("the cheap one"),
+            "判定本身要原样随活带下去，产出才能对着当初要求的东西被读"
+        );
+    }
+
+    /// Unfinished work goes first, ahead of the cap, for the same reason it does
+    /// on the alert channel: a failed attempt is not a repeat, and the cap must
+    /// not be the reason it stays failed while a fresh announcement spends the
+    /// round.
+    #[test]
+    fn unfinished_taste_work_comes_before_a_fresh_announcement() {
+        let now = Utc::now();
+        let broken = judgement("the retry policy", "the cheap one");
+        let announced = judgement("the review rubric", "the stricter one");
+        let filed = vec![filed_row(broken.clone(), &taste_task_id(&broken))];
+        let pending = vec![pending_row(announced)];
+        let tasks = [taste_row(&broken, TaskStatus::Failed)];
+        let by_id: HashMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+
+        let picked = select_taste(
+            &pending,
+            &filed,
+            &by_id,
+            &SignalGuardState::default(),
+            86_400,
+            1,
+            now,
+        );
+
+        assert_eq!(
+            picked
+                .selected
+                .iter()
+                .map(|row| row.intent.subject.as_str())
+                .collect::<Vec<_>>(),
+            vec!["the retry policy"],
+            "上限花在没做完的活上，不是花在先冒出来的那一条上"
+        );
+        assert!(picked.superseded.is_empty());
+    }
+
+    /// A submission whose work is still running has nothing to do and nothing to
+    /// close: the row is not a repeat and not unfinished either. Selecting it
+    /// would file a second task for one judgement.
+    #[test]
+    fn a_taste_submission_already_in_flight_is_left_alone() {
+        let now = Utc::now();
+        let intent = judgement("the retry policy", "the cheap one");
+        let filed = vec![filed_row(intent.clone(), &taste_task_id(&intent))];
+        let tasks = [taste_row(&intent, TaskStatus::Running)];
+        let by_id: HashMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+
+        let picked = select_taste(
+            &[],
+            &filed,
+            &by_id,
+            &SignalGuardState::default(),
+            86_400,
+            5,
+            now,
+        );
+
+        assert!(picked.selected.is_empty(), "在跑的活不该被再投一次");
+        assert!(picked.superseded.is_empty(), "它也不是一条重复的判定");
+    }
+
+    /// Work that ran to a terminal state is history. It is not selected here at
+    /// all: handing it to the task layer would go through the path that clears a
+    /// finished row and resubmits, which is a second run of a one-shot
+    /// judgement. Closing the row is the caller's job, and it does it before it
+    /// gets here.
+    #[test]
+    fn finished_taste_work_is_not_selected() {
+        let now = Utc::now();
+        let intent = judgement("the retry policy", "the cheap one");
+        let filed = vec![filed_row(intent.clone(), &taste_task_id(&intent))];
+        let tasks = [taste_row(&intent, TaskStatus::Completed)];
+        let by_id: HashMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+
+        let picked = select_taste(
+            &[],
+            &filed,
+            &by_id,
+            &SignalGuardState::default(),
+            86_400,
+            5,
+            now,
+        );
+
+        assert!(picked.selected.is_empty());
+        assert!(picked.superseded.is_empty());
+    }
+
+    /// A repeat is closed, not postponed. Left pending, the same row would be
+    /// read as a fresh announcement the moment the cooldown ran out and would
+    /// then file a duplicate of work that had already been done — the whole
+    /// reason the closing exists is that the row will otherwise outlive the
+    /// clock that held it back.
+    #[test]
+    fn a_repeat_judgement_is_closed_rather_than_postponed() {
+        let now = Utc::now();
+        let intent = judgement("the retry policy", "the cheap one");
+        let pending = vec![pending_row(intent.clone())];
+        let mut state = SignalGuardState::default();
+        state.reported.insert(
+            taste_signal_key(&intent),
+            now - chrono::Duration::seconds(60),
+        );
+
+        let picked = select_taste(&pending, &[], &HashMap::new(), &state, 86_400, 5, now);
+
+        assert!(picked.selected.is_empty(), "还在冷却里的判定不该被驱动");
+        assert_eq!(picked.superseded.len(), 1);
+        assert_eq!(picked.superseded[0].intent.id, intent.id);
+    }
+
+    /// And the same judgement once its own clock has run out is driven again —
+    /// the cooldown holds a repeat back, it does not forbid one forever.
+    #[test]
+    fn a_repeat_is_driven_once_its_clock_has_run_out() {
+        let now = Utc::now();
+        let intent = judgement("the retry policy", "the cheap one");
+        let pending = vec![pending_row(intent.clone())];
+        let mut state = SignalGuardState::default();
+        state.reported.insert(
+            taste_signal_key(&intent),
+            now - chrono::Duration::seconds(86_401),
+        );
+
+        let picked = select_taste(&pending, &[], &HashMap::new(), &state, 86_400, 5, now);
+
+        assert_eq!(picked.selected.len(), 1);
+        assert!(picked.superseded.is_empty());
+    }
+
+    /// The cap bounds one round, not the queue: submissions behind it are left
+    /// pending rather than closed, because nothing has decided anything about
+    /// them yet. Closing them would turn a busy round into a round that threw
+    /// away the submissions it did not have budget for.
+    #[test]
+    fn the_taste_cap_leaves_the_rest_pending() {
+        let now = Utc::now();
+        let pending = vec![
+            pending_row(judgement("subject a", "x")),
+            pending_row(judgement("subject b", "x")),
+            pending_row(judgement("subject c", "x")),
+        ];
+
+        let picked = select_taste(
+            &pending,
+            &[],
+            &HashMap::new(),
+            &SignalGuardState::default(),
+            86_400,
+            2,
+            now,
+        );
+
+        assert_eq!(
+            picked
+                .selected
+                .iter()
+                .map(|row| row.intent.subject.as_str())
+                .collect::<Vec<_>>(),
+            vec!["subject a", "subject b"]
+        );
+        assert!(
+            picked.superseded.is_empty(),
+            "超上限的那一条不是重复，下一轮还要读它"
+        );
     }
 }
