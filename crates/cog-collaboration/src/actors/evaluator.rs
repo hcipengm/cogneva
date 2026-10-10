@@ -100,20 +100,27 @@ impl EvaluatorActor {
         // unified diffs naming paths the apply gate will also accept.
         let is_self_evolution = task.is_self_evolution();
 
-        // For self-evolution tasks the only thing that matters is whether the
-        // generated change artifact is a valid unified diff over safe paths.
-        // Reasoning-only models often fail to return structured JSON, and the
-        // LLM reformat step can hang for minutes. Use deterministic validation
-        // and skip the semantic LLM evaluation entirely for this mode.
+        // For self-evolution tasks the only question with a measurement surface
+        // is whether the generated artifact is a valid unified diff over safe
+        // paths: the structural criteria, the apply gate and CI all answer it,
+        // deterministically. Asking a model to guess an answer that is already
+        // measurable adds a second, less reliable answer to the same question —
+        // so this mode is judged by the measurement and the semantic evaluation
+        // is skipped.
+        //
+        // The other question an evaluator could be asked — whether this change
+        // should be made at all, and whether it passed by loosening a gate — has
+        // no measurement surface today. It is not asked here, and nothing in
+        // this file answers it.
         if is_self_evolution {
             let validation = Self::validate_change_artifacts(generation);
             let output = Self::judge_self_evolution_change(&validation, generation, plan);
             let output_str = serde_json::to_string_pretty(&output).unwrap_or_default();
-            // Self-review for self-evolution is skipped: the deterministic change
-            // validation already gives a reliable verdict, and reasoning-only
-            // models frequently fail structured JSON extraction, causing the
-            // reformat step to hang for the full timeout. Counted, so the calls
-            // this early return saves are a reading rather than an absence.
+            // Self-review for self-evolution is skipped for the same reason: the
+            // deterministic change validation already answers the measurable
+            // question, and a model asked it again would add a second, less
+            // reliable answer. Counted, so the calls this early return saves are
+            // a reading rather than an absence.
             crate::actors::note_self_review_skip(
                 "evaluator",
                 crate::observable::SELF_REVIEW_SKIP_SELF_EVOLUTION,
