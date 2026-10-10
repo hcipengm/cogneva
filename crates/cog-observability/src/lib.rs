@@ -145,11 +145,32 @@ impl Default for RawStreamConfig {
     }
 }
 
+/// The explainability record face: a store for AI decision rationales.
+///
+/// **Intentionally unwired, and why** — do not read `enabled` and this struct as
+/// "a working store that happens to be quiet". The durable face is real: there
+/// is an `explainability` table, a partitioned table kept by the partition
+/// maintainer, and a `PostgresExplainabilityBackend` that can read and write it.
+/// What is missing is both ends — no producer writes a record through either
+/// backend, and no route queries one back. A table with no writer is not a
+/// wiring gap that another call closes; it is a face whose producer has not been
+/// decided.
+///
+/// A rationale is worth recording because it can be asked for again after a
+/// restart, and the judgment records that survive a restart already exist — a
+/// change's fate, a promotion record. Attaching the rationale to the record that
+/// already carries the judgment is one durable face; standing a second one up
+/// beside it is two faces holding one fact, and the two will disagree. So this
+/// stays unwired until it is decided which judgments must carry a rationale, and
+/// that decision belongs to the record that carries the judgment.
+///
+/// A knob nobody reads reads as the mechanism it names: `persist_interval_sec`
+/// said the in-memory store is written out periodically, and no such writer was
+/// ever built. It was removed rather than left to be misread.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ExplainabilityConfig {
     pub enabled: bool,
     pub max_records_memory: usize,
-    pub persist_interval_sec: u64,
 }
 
 impl Default for ExplainabilityConfig {
@@ -157,7 +178,6 @@ impl Default for ExplainabilityConfig {
         Self {
             enabled: true,
             max_records_memory: 10_000,
-            persist_interval_sec: 60,
         }
     }
 }
@@ -224,6 +244,7 @@ pub struct ObservabilityInitResult {
     pub metrics_backend: Option<Arc<metrics::PrometheusMetricsBackend>>,
     pub jaeger_exporter: Option<Arc<jaeger::JaegerExporter>>,
     pub raw_stream_writer: Option<Arc<raw_stream::RawStreamWriter>>,
+    /// Intentionally unwired; see [`ExplainabilityConfig`].
     pub explainability_store: Option<Arc<explainability::ExplainabilityStore>>,
 }
 
@@ -310,6 +331,10 @@ impl RawStreamName {
 pub struct ObservabilityHandle {
     pub metrics_backend: Option<Arc<dyn cog_core::MetricsBackend>>,
     pub raw_stream_writer: Option<Arc<raw_stream::RawStreamWriter>>,
+    /// Built when `explainability.enabled`, but **intentionally unwired**: no
+    /// producer writes a record and no reader queries one back. See
+    /// [`ExplainabilityConfig`] for why this store is not the face that should
+    /// carry a rationale.
     pub explainability_store: Option<Arc<explainability::ExplainabilityStore>>,
 }
 
