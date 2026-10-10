@@ -283,12 +283,17 @@ impl EvaluatorActor {
         } else if uncovered.is_empty() {
             (Verdict::Pass, 85)
         } else {
-            // A well-formed change that went somewhere the plan did not name.
+            // A well-formed change that never touches a path the plan named.
             // Scored above an unappliable diff (10) and below a pass: the artifact
             // is deliverable in form, it just is not this task. The score is its
             // own cell because a repair loop that only counted "failed" would not
             // be able to tell "the patch is broken" from "the patch is fine and
-            // pointed at the wrong file".
+            // aimed at something else".
+            //
+            // This direction only. Touching paths the plan did not name is
+            // allowed on purpose (the planner is told so): the plan bounds what
+            // the change must cover, not what it may touch, and the apply gate
+            // is what bounds the latter.
             (Verdict::Fail, 20)
         };
 
