@@ -3,9 +3,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
-use uuid::Uuid;
 
 use cog_core::MemoryExtractor;
+use cog_core::{bounded_raw_id, deterministic_raw_id};
 use cog_core::{AgentEvent, SFResult};
 use cog_core::{MemoryBackend, MessageBackend, RawSource};
 
@@ -132,51 +132,9 @@ impl GateHolder {
     ];
 }
 
-/// 归档 id 里来源 slug 的长度上限。与时间戳/随机段合计仍远低于文件系统
-/// NAME_MAX(255 字节)，同时保留足够前缀让人能从对象键认出来源。
-const RAW_ID_SLUG_MAX: usize = 64;
-
-/// 把任意来源收敛成对象键安全的 slug：只保留 ASCII 字母数字与 `.`/`-`，
-/// 其余折成 `_`，截到 [`RAW_ID_SLUG_MAX`]。自进化系统里 agent_id 可以是
-/// 整段 issue 标题（数百字节 CJK，含 `:`、`#`、空格甚至 `/`），直接拼进
-/// 对象键会让 local-fs 后端 ENAMETOOLONG。原始 id 由调用方放进 tags 保留
-/// 可追溯性。
-fn slugify(source: &str) -> String {
-    source
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .take(RAW_ID_SLUG_MAX)
-        .collect()
-}
-
-/// 每次归档唯一的 id：slug + 毫秒时间戳 + 8 位随机段。同一 agent 的多次
-/// 会话不会互相覆盖同一个对象。
-fn bounded_raw_id(prefix: &str, source: &str, now: chrono::DateTime<chrono::Utc>) -> String {
-    let random = &Uuid::new_v4().simple().to_string()[..8];
-    format!(
-        "{prefix}-{}-{}-{random}",
-        slugify(source),
-        now.timestamp_millis()
-    )
-}
-
-/// 确定性 id：同一事件（同一时间戳的同一来源）反复投递产生同一个对象键。
-/// 总线红投/去重的根基——归档按键幂等覆盖，层检查跳过已存在层，重放不会
-/// 派生第二份档案。尾部 `-evt` 占位保持与随机段相同的 `-{millis}-{seg}`
-/// 结构，[`raw_id_timestamp`] 从右数第二段取时间戳的解析对两种 id 同构。
-fn deterministic_raw_id(prefix: &str, source: &str, ts: chrono::DateTime<chrono::Utc>) -> String {
-    format!("{prefix}-{}-{}-evt", slugify(source), ts.timestamp_millis())
-}
-
-/// 从 [`bounded_raw_id`] 生成的 id 尾部取回毫秒时间戳（`-{millis}-{rand8}`
-/// 收尾，slug 里允许出现 `-`，所以从右往左取）。解析失败返回 None，调用方
-/// 按"无时间信息"处理（宁可多扫不漏扫）。
+/// 从 [`cog_core::bounded_raw_id`] / [`cog_core::deterministic_raw_id`] 生成的
+/// id 尾部取回毫秒时间戳（`-{millis}-{seg}` 收尾，slug 里允许出现 `-`，所以从
+/// 右往左取）。解析失败返回 None，调用方按"无时间信息"处理（宁可多扫不漏扫）。
 fn raw_id_timestamp(id: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     let millis: i64 = id.rsplit('-').nth(1)?.parse().ok()?;
     chrono::DateTime::from_timestamp_millis(millis)

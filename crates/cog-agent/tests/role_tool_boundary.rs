@@ -119,7 +119,7 @@ fn production_registry() -> ToolRegistry {
     cog_core::ToolRegistry::register(&registry, builtins::run_command());
     cog_core::ToolRegistry::register(
         &registry,
-        builtins::http_request(Arc::new(UnreachableClient)),
+        builtins::http_request(Arc::new(UnreachableClient), None, 8192),
     );
     registry
 }
@@ -243,7 +243,7 @@ fn a_planning_role_holds_nothing_that_changes_the_workspace() {
 /// change, so it would sit unread until the day it mattered.
 #[test]
 fn the_workspace_question_is_answered_by_the_tool_and_not_by_its_name() {
-    let http = builtins::http_request(Arc::new(UnreachableClient));
+    let http = builtins::http_request(Arc::new(UnreachableClient), None, 8192);
     for (tool, expected) in [
         (builtins::read_file(), Some(false)),
         (builtins::write_file(), Some(true)),

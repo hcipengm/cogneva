@@ -132,6 +132,85 @@ impl std::fmt::Debug for HttpToolOutputArchive {
     }
 }
 
+/// Why one archive POST did not produce a reference. The three are the
+/// deployment-shaped failures [`cause`] names; a caller that reports its own
+/// readings maps them itself, a caller with none only needs to know the write
+/// did not land.
+#[derive(Debug)]
+pub enum WriteFailure {
+    /// No base URL was configured, so no request was made.
+    Unconfigured,
+    /// The request did not complete.
+    Unreachable(SFError),
+    /// The API answered and refused the write.
+    Refused(SFError),
+}
+
+impl WriteFailure {
+    /// The error to hand back to a caller that has no reading of its own.
+    pub fn into_error(self) -> SFError {
+        match self {
+            WriteFailure::Unconfigured => SFError::Config(format!(
+                "{MEMORY_API_BASE_ENV} is not set: nothing can be archived under this deployment"
+            )),
+            WriteFailure::Unreachable(e) => e,
+            WriteFailure::Refused(e) => e,
+        }
+    }
+}
+
+/// POST one raw source to the platform memory API and return the reference a
+/// reader fetches it back by.
+///
+/// One delivery shape for every caller that stores raw bytes from a pod: this
+/// is the same request the tool-output archive makes, so when the API's ingest
+/// contract moves there is one place to change rather than one per producer.
+/// It records nothing. The fates of a tool output are the readings of the
+/// handle below, and they are a closed pair over *cuts* -- a producer whose
+/// payload was never a cut has no cell there to land in, and adding its writes
+/// to those counters would make the share of cuts that landed unreadable.
+pub async fn post_raw(
+    client: &dyn HttpClient,
+    base: Option<&str>,
+    id: &str,
+    content_type: &str,
+    text: &str,
+) -> Result<String, WriteFailure> {
+    let Some(base) = base.filter(|b| !b.trim().is_empty()) else {
+        return Err(WriteFailure::Unconfigured);
+    };
+    let url = format!("{}{MEMORY_INGEST_PATH}", base.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "id": id,
+        "content_type": content_type,
+        "text": text,
+    });
+    // A body that will not serialize is a bug in this function, not a property
+    // of the deployment, and there is no cause for it.
+    let req = match HttpRequest::post(url)
+        .json(&body)
+        .map(|r| r.timeout(ARCHIVE_TIMEOUT_SECS))
+    {
+        Ok(req) => req,
+        Err(e) => return Err(WriteFailure::Unreachable(e)),
+    };
+
+    let resp = client
+        .execute(req)
+        .await
+        .map_err(WriteFailure::Unreachable)?;
+    if !resp.is_success() {
+        return Err(WriteFailure::Refused(SFError::Config(format!(
+            "memory API refused the archive of {id:?}: HTTP {}",
+            resp.status
+        ))));
+    }
+    // The reference is spelling, not a value the API returns: the pod is
+    // anonymous, so the API filed the source under the default namespace, and
+    // the reference says where a reader should ask for it.
+    Ok(artifact_uri(DEFAULT_MEMORY_NAMESPACE, id))
+}
+
 impl HttpToolOutputArchive {
     pub fn new(
         client: Arc<dyn HttpClient>,
@@ -167,43 +246,23 @@ impl ToolOutputArchive for HttpToolOutputArchive {
         content_type: &str,
         text: &str,
     ) -> SFResult<String> {
-        let Some(base) = self.base.as_deref().filter(|b| !b.trim().is_empty()) else {
-            let err = SFError::Config(format!(
-                "{MEMORY_API_BASE_ENV} is not set: a truncated tool output has nowhere to be archived"
-            ));
-            self.record_failure(tool, cause::UNCONFIGURED).await;
-            return Err(err);
+        let base = self.base.as_deref();
+        let resp = match post_raw(self.client.as_ref(), base, id, content_type, text).await {
+            Ok(uri) => return Ok(uri),
+            Err(f) => f,
         };
-        let url = format!("{}{MEMORY_INGEST_PATH}", base.trim_end_matches('/'));
-        let body = serde_json::json!({
-            "id": id,
-            "content_type": content_type,
-            "text": text,
-        });
-        // A body that will not serialize is a bug in this function, not a
-        // property of the deployment, so it is not one of the archive causes.
-        let req = HttpRequest::post(url)
-            .json(&body)?
-            .timeout(ARCHIVE_TIMEOUT_SECS);
-
-        let resp = match self.client.execute(req).await {
-            Ok(resp) => resp,
-            Err(e) => {
-                self.record_failure(tool, cause::UNREACHABLE).await;
-                return Err(e);
-            }
+        let (cause, err) = match resp {
+            WriteFailure::Unconfigured => (
+                cause::UNCONFIGURED,
+                SFError::Config(format!(
+                    "{MEMORY_API_BASE_ENV} is not set: a truncated tool output has nowhere to be archived"
+                )),
+            ),
+            WriteFailure::Unreachable(e) => (cause::UNREACHABLE, e),
+            WriteFailure::Refused(e) => (cause::REFUSED, e),
         };
-        if !resp.is_success() {
-            self.record_failure(tool, cause::REFUSED).await;
-            return Err(SFError::Config(format!(
-                "memory API refused the archive of {id:?}: HTTP {}",
-                resp.status
-            )));
-        }
-        // The reference is spelling, not a value the API returns: the pod is
-        // anonymous, so the API filed the source under the default namespace,
-        // and the reference says where a reader should ask for it.
-        Ok(artifact_uri(DEFAULT_MEMORY_NAMESPACE, id))
+        self.record_failure(tool, cause).await;
+        Err(err)
     }
 
     async fn record_truncation(&self, tool: &str, dropped_chars: usize) {

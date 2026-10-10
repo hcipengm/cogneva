@@ -69,6 +69,10 @@ pub const AGENT_LOOP_ENV: &[(&str, &str)] = &[
     // the `AGENT_LOOP` prefix because it points at a shared endpoint rather
     // than a knob of this section.
     (cog_core::MEMORY_API_BASE_ENV, "memory_api_base"),
+    (
+        "COGNEVA_AGENT_LOOP_EXTERNAL_ARCHIVE_THRESHOLD_CHARS",
+        "external_archive_threshold_chars",
+    ),
 ];
 
 const AGENT_POOL_ENV: &[(&str, &str)] = &[
@@ -103,6 +107,31 @@ pub struct AgentLoopConfig {
     /// archived. Absent when the deployment names none; the loop then still
     /// truncates, and the failure reading carries the cause.
     pub memory_api_base: Option<String>,
+    /// How large an `http_request` response may be before it is stored as an
+    /// external document and the tool hands back a reference instead of the
+    /// body, in characters.
+    ///
+    /// Measured in characters, not bytes, because it is compared against the
+    /// text the tool would otherwise return and the tool-return budget is a
+    /// character count too. A response at or below this stays in the
+    /// conversation as it always has; one above it becomes its own raw source,
+    /// which is what gives externally fetched material a face of its own
+    /// instead of leaving it as one more turn of a transcript.
+    ///
+    /// Keep it under the tool-return budget so the preview the tool returns in
+    /// place of the body still fits one turn -- above that the preview would be
+    /// cut again on the way into the context, and the second cut is the one
+    /// that drops the reference.
+    #[serde(default = "default_external_archive_threshold_chars")]
+    pub external_archive_threshold_chars: usize,
+}
+
+/// The size at which a fetched response stops being a conversational answer and
+/// starts being a document: comfortably above what an API or a page summary
+/// returns, comfortably below the tool-return budget of the smallest window the
+/// loop is configured with.
+fn default_external_archive_threshold_chars() -> usize {
+    8192
 }
 
 impl Default for AgentLoopConfig {
@@ -117,6 +146,7 @@ impl Default for AgentLoopConfig {
             think_stall_timeout_secs: 240,
             final_draft_timeout_secs: 420,
             memory_api_base: None,
+            external_archive_threshold_chars: default_external_archive_threshold_chars(),
         }
     }
 }
@@ -193,6 +223,19 @@ mod tests {
         let p = AgentManagerConfig::default();
         assert!(p.enabled);
         assert_eq!(p.worker_count, 3);
+    }
+
+    #[test]
+    fn the_default_external_archive_threshold_stays_under_the_tool_return_budget() {
+        // A response over the threshold is stored and comes back as a preview
+        // of at most that many characters. That preview is the turn, and the
+        // loop archives any turn that does not fit -- so a threshold at or
+        // above the budget would make the loop store the preview too, a second
+        // copy of a document already stored, and count a cut for it. The two
+        // stores stay disjoint only while the threshold is below the budget of
+        // the smallest window the loop runs with.
+        let threshold = default_external_archive_threshold_chars();
+        assert!(threshold < crate::context::tool_result_budget_chars(32000));
     }
 
     #[test]

@@ -1503,6 +1503,9 @@ mod tests {
             think_stall_timeout_secs: 240,
             final_draft_timeout_secs: 300,
             memory_api_base: None,
+            // Only the fields that map onto RuntimeConfig are asserted below;
+            // this one is carried to complete the literal.
+            external_archive_threshold_chars: 8192,
         };
         let business: cog_core::RuntimeConfig = cfg.into();
         assert_eq!(business.agent_id, "agent-42");

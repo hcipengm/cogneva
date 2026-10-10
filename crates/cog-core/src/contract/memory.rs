@@ -2,6 +2,7 @@ use crate::{storage::SparseEmbedding, SFResult};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -157,6 +158,63 @@ pub fn tool_output_raw_id(task_id: &str, turn: u32, frame: u32) -> String {
         .collect();
     let key = if key.is_empty() { "task" } else { &key };
     format!("{key}-{turn:04}-{frame:04}")
+}
+
+/// The longest the source slug inside a raw id may grow.
+///
+/// With the timestamp and random segments alongside it the whole key stays far
+/// below the file system's `NAME_MAX` (255 bytes), while the prefix is still
+/// long enough for a listing to show where an entry came from.
+pub const RAW_ID_SLUG_MAX: usize = 64;
+
+/// Fold any source name into something safe to put in an object key: ASCII
+/// alphanumerics and `.`/`-` are kept, everything else becomes `_`, and the
+/// result is cut to [`RAW_ID_SLUG_MAX`].
+///
+/// A source name reaching here can be free text -- in the self-evolving system
+/// an agent id is a whole issue title, hundreds of CJK bytes plus `:`, `#`,
+/// spaces and sometimes `/` -- and spliced in raw it makes the local-fs backend
+/// fail with `ENAMETOOLONG`. The original name travels in the entry's tags, so
+/// nothing is lost by folding it here.
+pub fn raw_id_slug(source: &str) -> String {
+    source
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(RAW_ID_SLUG_MAX)
+        .collect()
+}
+
+/// A fresh id for one archived source: prefix, the folded source name, a
+/// millisecond timestamp, and a random segment so two archives of the same
+/// source never collide on one object key.
+pub fn bounded_raw_id(prefix: &str, source: &str, now: DateTime<Utc>) -> String {
+    let random = &Uuid::new_v4().simple().to_string()[..8];
+    format!(
+        "{prefix}-{}-{}-{random}",
+        raw_id_slug(source),
+        now.timestamp_millis()
+    )
+}
+
+/// The id one event always maps to: same source and same instant, same object
+/// key, so redelivering or replaying that event lands on the entry that is
+/// already there and derives no second copy.
+///
+/// The trailing `-evt` occupies the place [`bounded_raw_id`] puts its random
+/// segment in, so both ids end in `-{millis}-{segment}` and a reader taking the
+/// timestamp off the end parses the two the same way.
+pub fn deterministic_raw_id(prefix: &str, source: &str, ts: DateTime<Utc>) -> String {
+    format!(
+        "{prefix}-{}-{}-evt",
+        raw_id_slug(source),
+        ts.timestamp_millis()
+    )
 }
 
 /// The env name a deployment sets to name the platform memory API base.

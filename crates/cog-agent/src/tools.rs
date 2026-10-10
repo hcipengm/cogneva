@@ -421,7 +421,10 @@ mod tests {
     #[tokio::test]
     async fn http_request_tool_executes_via_client() {
         let registry = ToolRegistry::new();
-        cog_core::ToolRegistry::register(&registry, builtins::http_request(Arc::new(StubHttp)));
+        cog_core::ToolRegistry::register(
+            &registry,
+            builtins::http_request(Arc::new(StubHttp), None, 8192),
+        );
         let out = registry
             .execute(
                 "http_request",
@@ -431,6 +434,130 @@ mod tests {
             .unwrap();
         assert_eq!(out["status"], 200);
         assert_eq!(out["body"], "POST http://example/x");
+    }
+
+    /// Answers the fetch with a body of a chosen size, and the memory API's
+    /// ingest endpoint with a chosen status, so both the store-accepted and the
+    /// store-refused branch of `http_request` can be exercised off one double.
+    #[derive(Debug)]
+    struct FetchStub {
+        body_chars: usize,
+        ingest_status: u16,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::HttpClient for FetchStub {
+        async fn execute(&self, req: cog_core::HttpRequest) -> SFResult<cog_core::HttpResponse> {
+            if req.url.contains(cog_core::MEMORY_INGEST_PATH) {
+                return Ok(cog_core::HttpResponse {
+                    status: self.ingest_status,
+                    headers: Default::default(),
+                    body: b"{}".to_vec(),
+                });
+            }
+            Ok(cog_core::HttpResponse {
+                status: 200,
+                headers: Default::default(),
+                body: "x".repeat(self.body_chars).into_bytes(),
+            })
+        }
+    }
+
+    fn fetch_registry(stub: FetchStub, threshold: usize) -> ToolRegistry {
+        let registry = ToolRegistry::new();
+        cog_core::ToolRegistry::register(
+            &registry,
+            builtins::http_request(Arc::new(stub), Some("http://mem:8080".into()), threshold),
+        );
+        registry
+    }
+
+    #[tokio::test]
+    async fn http_request_keeps_a_small_body_inline() {
+        let registry = fetch_registry(
+            FetchStub {
+                body_chars: 64,
+                ingest_status: 200,
+            },
+            8192,
+        );
+        let out = registry
+            .execute("http_request", serde_json::json!({"url": "http://api/x"}))
+            .await
+            .unwrap();
+        assert_eq!(out["status"], 200);
+        assert_eq!(out["body"].as_str().unwrap().chars().count(), 64);
+        assert!(out.get("artifact").is_none());
+    }
+
+    #[tokio::test]
+    async fn http_request_stores_a_large_body_and_references_it() {
+        let registry = fetch_registry(
+            FetchStub {
+                body_chars: 10_000,
+                ingest_status: 200,
+            },
+            100,
+        );
+        let out = registry
+            .execute(
+                "http_request",
+                serde_json::json!({"url": "http://host.example/page"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["status"], 200);
+        assert_eq!(out["body_chars"], 10_000);
+        // The body is gone from the turn; only the head of it survives as a
+        // preview, and the reference is what the rest is fetched back through.
+        assert!(out.get("body").is_none());
+        assert_eq!(out["preview"].as_str().unwrap().chars().count(), 100);
+        let artifact = out["artifact"].as_str().unwrap();
+        assert!(
+            artifact.starts_with("artifact://default/external-host.example-"),
+            "{artifact}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_request_falls_back_to_inline_when_the_store_refuses() {
+        let registry = fetch_registry(
+            FetchStub {
+                body_chars: 10_000,
+                ingest_status: 500,
+            },
+            100,
+        );
+        let out = registry
+            .execute(
+                "http_request",
+                serde_json::json!({"url": "http://host.example/page"}),
+            )
+            .await
+            .unwrap();
+        // Refused store, no cut: the document comes back whole, which is the
+        // behaviour this tool had before there was a threshold at all.
+        assert_eq!(out["status"], 200);
+        assert_eq!(out["body"].as_str().unwrap().chars().count(), 10_000);
+        assert!(out.get("artifact").is_none());
+    }
+
+    #[test]
+    fn url_host_drops_scheme_userinfo_port_and_path() {
+        assert_eq!(
+            super::builtins::url_host("http://example.com/a?b#c"),
+            "example.com"
+        );
+        assert_eq!(
+            super::builtins::url_host("https://user:pw@host.example:8443/x"),
+            "host.example"
+        );
+        assert_eq!(super::builtins::url_host("example.com"), "example.com");
+        assert_eq!(
+            super::builtins::url_host("http://[2001:db8::1]:80/x"),
+            "2001:db8::1"
+        );
+        assert_eq!(super::builtins::url_host(""), "unknown");
     }
 
     fn raw_source(
@@ -1491,10 +1618,31 @@ pub mod builtins {
     /// HTTP request tool. Goes through the system's [`cog_core::HttpClient`]
     /// so proxy/TLS policy is applied uniformly; pods hold no credentials, so
     /// there is nothing in the environment for a request to exfiltrate.
-    pub fn http_request(client: Arc<dyn cog_core::HttpClient>) -> Tool {
+    ///
+    /// A response at or below `archive_threshold_chars` comes back inline, the
+    /// way it always has. A larger one is stored as its own raw source under
+    /// `external/<host>` and the turn carries a reference to it: material
+    /// fetched from outside is not a turn of the conversation, and leaving it
+    /// inside one is what made it unlistable and what let a single page push a
+    /// conversation past its window. The reference is fetchable with
+    /// `raw_fetch`, so nothing is lost by shortening the turn.
+    ///
+    /// When the store refuses the write the body comes back inline instead. The
+    /// document was never cut, so that path loses nothing: it is the behaviour
+    /// this tool had before there was a threshold at all. There is therefore no
+    /// reading of its own for the failed store — the caller sees it in the
+    /// result shape and the pod's log, which is what a fate that loses no bytes
+    /// warrants.
+    pub fn http_request(
+        client: Arc<dyn cog_core::HttpClient>,
+        memory_api_base: Option<String>,
+        archive_threshold_chars: usize,
+    ) -> Tool {
         Tool {
             name: "http_request".into(),
-            description: "Make an HTTP request and return the status and body".into(),
+            description: "Make an HTTP request and return the status and body; a body too \
+                          large to be a turn is stored instead, and the result names it"
+                .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1507,6 +1655,7 @@ pub mod builtins {
             }),
             implementation: ToolImplementation::Native(Arc::new(move |args| {
                 let client = client.clone();
+                let memory_api_base = memory_api_base.clone();
                 Box::pin(async move {
                     let url = args["url"]
                         .as_str()
@@ -1528,12 +1677,78 @@ pub mod builtins {
                         req.body = Some(body.as_bytes().to_vec());
                     }
                     let resp = client.execute(req).await?;
-                    Ok(serde_json::json!({
-                        "status": resp.status,
-                        "body": String::from_utf8_lossy(&resp.body),
-                    }))
+                    let body = String::from_utf8_lossy(&resp.body).to_string();
+                    // The count is what decides, not the byte length: the two
+                    // are the same number for ASCII and diverge by up to four
+                    // for the CJK a fetched page is likely to be full of, and
+                    // the budget this is kept under is a character count.
+                    let body_chars = body.chars().count();
+                    if body_chars <= archive_threshold_chars {
+                        return Ok(serde_json::json!({
+                            "status": resp.status,
+                            "body": body,
+                        }));
+                    }
+                    let host = url_host(url);
+                    let id = cog_core::bounded_raw_id("external", &host, chrono::Utc::now());
+                    let content_type = format!("external/{host}");
+                    match crate::archive::post_raw(
+                        client.as_ref(),
+                        memory_api_base.as_deref(),
+                        &id,
+                        &content_type,
+                        &body,
+                    )
+                    .await
+                    {
+                        Ok(artifact) => Ok(serde_json::json!({
+                            "status": resp.status,
+                            "artifact": artifact,
+                            "body_chars": body_chars,
+                            "preview": body.chars().take(archive_threshold_chars).collect::<String>(),
+                        })),
+                        Err(failure) => {
+                            tracing::warn!(
+                                url,
+                                id = %id,
+                                error = %failure.into_error(),
+                                "fetched document could not be stored; returning it inline"
+                            );
+                            Ok(serde_json::json!({
+                                "status": resp.status,
+                                "body": body,
+                            }))
+                        }
+                    }
                 })
             })),
+        }
+    }
+
+    /// The host of a URL, folded for use in a raw id and a content type.
+    ///
+    /// Everything that can appear between the scheme and the first path
+    /// separator is dropped except the host itself: userinfo would put a
+    /// credential where a listing shows, and the port is a property of this
+    /// deployment's route rather than of the material. IPv6 literals keep their
+    /// brackets, because a host is not the place to re-open the question of
+    /// which colons belong to the address.
+    pub(super) fn url_host(url: &str) -> String {
+        let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+        let authority = after_scheme
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or_default();
+        let host_port = authority.rsplit('@').next().unwrap_or_default();
+        let host = if let Some(rest) = host_port.strip_prefix('[') {
+            rest.split(']').next().unwrap_or_default().to_string()
+        } else {
+            host_port.split(':').next().unwrap_or_default().to_string()
+        };
+        if host.is_empty() {
+            "unknown".to_string()
+        } else {
+            host.to_ascii_lowercase()
         }
     }
 }
