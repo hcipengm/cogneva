@@ -48,6 +48,11 @@ impl cog_core::SystemPlugin for CollaborationPlugin {
 
         let llm_provider = ctx.consume_service::<dyn cog_core::LlmClient>();
 
+        // Read before the LLM gate: whether this process holds a knowledge
+        // backend does not depend on whether it holds an LLM, and the absence
+        // has to be reported even when no executor is published at all.
+        let knowledge_backend = ctx.consume_service::<dyn cog_core::KnowledgeBackend>();
+
         if let Some(ref llm) = llm_provider {
             let hook_engine = ctx.consume_service::<dyn cog_core::HookEngine>();
             let squad_reflection = ctx.consume_service::<dyn cog_core::SquadReflection>();
@@ -55,7 +60,6 @@ impl cog_core::SystemPlugin for CollaborationPlugin {
             let change_sinks = ctx.consume_all_services::<dyn cog_core::ChangeSink>();
             let reflection_engine = ctx.consume_service::<dyn cog_core::ReflectionEngine>();
             let agent_manager = ctx.consume_service::<dyn cog_core::AgentManager>();
-            let knowledge_backend = ctx.consume_service::<dyn cog_core::KnowledgeBackend>();
             let skill_registry = ctx.consume_service::<dyn cog_core::ExternalSkillRegistry>();
             let state_backend = ctx.consume_service::<dyn cog_core::StateBackend>();
 
@@ -109,6 +113,17 @@ impl cog_core::SystemPlugin for CollaborationPlugin {
             info!("CollaborationPlugin CollaborationExecutor published");
         } else {
             info!("CollaborationPlugin: no LLM provider available, skipping publish");
+        }
+
+        // A process that holds no knowledge backend consults nothing, and the
+        // retrieval series shows that as the same empty face a build carrying
+        // no such reading shows. Say it in the series' own cells instead: the
+        // backend is built only when the wiki layer is reachable, so a process
+        // without it holds no layer at all.
+        if knowledge_backend.is_none() {
+            if let Some(metrics) = ctx.consume_service::<dyn cog_core::MetricsBackend>() {
+                cog_core::contract::knowledge::publish_no_knowledge_backend(&metrics).await;
+            }
         }
 
         Ok(())

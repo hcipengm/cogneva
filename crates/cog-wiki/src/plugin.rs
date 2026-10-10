@@ -42,6 +42,21 @@ impl cog_core::SystemPlugin for WikiPlugin {
             info!("WikiPlugin no wiki backend configured");
         }
 
+        // The retrieval series is seeded before the backend is built, and
+        // whether or not a wiki layer was found: a process that reaches no wiki
+        // is exactly the one that will write no retrieval cell, so its zeros
+        // are what has to stay readable.
+        let metrics = ctx.consume_service::<dyn cog_core::MetricsBackend>();
+        match metrics {
+            Some(ref backend) => {
+                cog_core::contract::knowledge::seed_retrieval_cells(backend).await;
+            }
+            None => warn!(
+                "no metrics backend published; the knowledge retrieval cells \
+                 will neither be seeded nor recorded"
+            ),
+        }
+
         // Build and publish UnifiedKnowledgeBackend when possible.
         if let Some(ref wiki) = wiki_adapter {
             // Both services are wired as handles rather than read here. The
@@ -57,12 +72,8 @@ impl cog_core::SystemPlugin for WikiPlugin {
             // The retrieval outcome series is the only place that separates a
             // layer this process does not hold from a layer that answered with
             // nothing, and the plugin context is in hand only here.
-            match ctx.consume_service::<dyn cog_core::MetricsBackend>() {
-                Some(metrics) => unified = unified.with_metrics(metrics),
-                None => warn!(
-                    "no metrics backend published; knowledge retrieval outcomes \
-                     will not be recorded"
-                ),
+            if let Some(backend) = metrics {
+                unified = unified.with_metrics(backend);
             }
             ctx.publish_service::<dyn cog_core::KnowledgeBackend>(Arc::new(unified));
             info!("WikiPlugin KnowledgeBackend published");

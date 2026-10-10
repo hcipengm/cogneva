@@ -569,7 +569,19 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          nothing are the same answer at every caller. Read per layer — `error` \
          moving names a store that refused, `empty` rising against a still \
          `hit` names a store that answers and matches nothing, and `absent` on \
-         a deployment that means to have the layer names a wiring fault.",
+         a deployment that means to have the layer names a wiring fault. The \
+         whole cross of layers and outcomes is seeded at zero when the process \
+         starts, so a boot that runs no retrieval at all is a grid of readable \
+         zeros rather than the same absence a build with no such reading shows. \
+         `absent` is written on two schedules and a reader has to say which it \
+         means: the backend writes it once per retrieval for a layer it does \
+         not hold, while a process that reaches no knowledge backend at all — \
+         the wiki layer is what the composite is built from — writes it once \
+         per boot, on both layers. On the wiki cell an increase can only be the \
+         boot case, since a live backend never writes `absent` for wiki, and \
+         that is the cell that tells the two apart. Because one cell counts \
+         boots where the rest count calls, no rule or panel may sum across \
+         `outcome` and report the total as a number of retrievals.",
     ),
     (
         crate::metric_names::TOOL_OUTPUT_TRUNCATED_TOTAL.as_str(),

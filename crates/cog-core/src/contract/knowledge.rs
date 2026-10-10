@@ -2,6 +2,8 @@ use crate::{SFResult, Task};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// A single knowledge entry returned by unified retrieval.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -177,4 +179,104 @@ pub trait KnowledgeBackend: Send + Sync {
     /// decomposition, and a row is a statement about the decompositions that
     /// happened.
     async fn archive_decomposition(&self, task: &Task, sub_task_types: &[String]) -> SFResult<()>;
+}
+
+// ---------------------------------------------------------------------------
+// The retrieval outcome series
+// ---------------------------------------------------------------------------
+
+/// The layers one knowledge retrieval consults, in the order it consults them.
+///
+/// These are the `layer` values of `cogneva_knowledge_retrieval_total`, and the
+/// composition of the backend is what they name: a retrieval asks memory and
+/// wiki. They are defined here rather than at the backend that names them,
+/// because the caller that has to report a *missing* backend writes the same
+/// cell names, and two places that decide what a layer is called are two places
+/// that can disagree about one series.
+pub const RETRIEVAL_LAYER_MEMORY: &str = "memory";
+pub const RETRIEVAL_LAYER_WIKI: &str = "wiki";
+
+/// Both layers, for a writer that walks the set rather than naming one.
+pub const RETRIEVAL_LAYERS: [&str; 2] = [RETRIEVAL_LAYER_MEMORY, RETRIEVAL_LAYER_WIKI];
+
+/// The cells a consulted layer's answer lands in.
+///
+/// `hit` (the layer answered with rows), `empty` (it answered and had none),
+/// `error` (its backend refused), `absent` (this process holds no such layer).
+/// At every caller the first three are the same empty list, which is the whole
+/// reason the four are separated where they are written rather than where they
+/// are read.
+pub const RETRIEVAL_OUTCOME_HIT: &str = "hit";
+pub const RETRIEVAL_OUTCOME_EMPTY: &str = "empty";
+pub const RETRIEVAL_OUTCOME_ERROR: &str = "error";
+pub const RETRIEVAL_OUTCOME_ABSENT: &str = "absent";
+
+/// All four cells, for a writer that walks the set rather than naming one.
+pub const RETRIEVAL_OUTCOMES: [&str; 4] = [
+    RETRIEVAL_OUTCOME_HIT,
+    RETRIEVAL_OUTCOME_EMPTY,
+    RETRIEVAL_OUTCOME_ERROR,
+    RETRIEVAL_OUTCOME_ABSENT,
+];
+
+/// Publish one cell of `cogneva_knowledge_retrieval_total`.
+///
+/// A write that fails is logged and dropped: the retrieval it describes has
+/// already answered, and turning that answer into an error because the metrics
+/// store refused would let the reading change what it measures.
+pub async fn record_retrieval_cell(
+    metrics: &Arc<dyn crate::MetricsBackend>,
+    layer: &str,
+    outcome: &str,
+    value: f64,
+) {
+    let mut labels = HashMap::new();
+    labels.insert("layer".to_string(), layer.to_string());
+    labels.insert("outcome".to_string(), outcome.to_string());
+    if let Err(e) = metrics
+        .record_counter(
+            crate::metric_names::KNOWLEDGE_RETRIEVAL_TOTAL,
+            value,
+            labels,
+        )
+        .await
+    {
+        tracing::warn!("could not publish the {layer}/{outcome} retrieval cell: {e}");
+    }
+}
+
+/// Publish every cell of the series as zero.
+///
+/// The cells are written only when a retrieval consults a layer, and a
+/// deployment can come up and consult none -- no work to run, or the work that
+/// would run held upstream. With nothing written, "this boot consulted nothing"
+/// and "this build carries no such reading" are the same empty face, which is
+/// the confusion the series exists to remove; seeding leaves absence to mean
+/// only the second. Written as a zero increment, so a cell another process has
+/// already counted up is not reset.
+pub async fn seed_retrieval_cells(metrics: &Arc<dyn crate::MetricsBackend>) {
+    for layer in RETRIEVAL_LAYERS {
+        for outcome in RETRIEVAL_OUTCOMES {
+            record_retrieval_cell(metrics, layer, outcome, 0.0).await;
+        }
+    }
+}
+
+/// Publish that this process obtained no knowledge backend, so no layer could
+/// be consulted at all.
+///
+/// The backend is built only when the wiki layer is reachable, so a process
+/// without it holds no layer and every layer's cell is `absent`. Written once
+/// per process rather than once per retrieval, because there is no retrieval to
+/// count, where the sibling cells are written per retrieval; a reader has to
+/// name the outcome for that reason. On the wiki cell an increase can only be
+/// this: a process holding the backend never writes `absent` for wiki, so it
+/// names a boot with no backend. On the memory cell it cannot be read alone --
+/// a live backend writes `absent` there as ordinary traffic whenever it answers
+/// for wiki and holds no memory -- so the wiki cell is the one that
+/// disambiguates the pair.
+pub async fn publish_no_knowledge_backend(metrics: &Arc<dyn crate::MetricsBackend>) {
+    for layer in RETRIEVAL_LAYERS {
+        record_retrieval_cell(metrics, layer, RETRIEVAL_OUTCOME_ABSENT, 1.0).await;
+    }
 }

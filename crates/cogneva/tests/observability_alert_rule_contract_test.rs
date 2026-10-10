@@ -655,10 +655,12 @@ const PRODUCED: &[(&str, &str)] = &[
     // 知识检索的回声只到一张空表为止，而「没这个层」「后端拒绝」
     // 「后端答了但没有」在返回值上是同一个空表——修法要在这三者之间选，而选择需要
     // 的信息调用方拿不到。这个计数把每次检索按 `layer` 与 `outcome`（hit/empty/error/
-    // absent）各记一格，是这条区分唯一存在的地方。
+    // absent）各记一格，是这条区分唯一存在的地方。写入点集中在 cog-core 的
+    // `record_retrieval_cell`：后端每次检索写一格，取不到后端的进程开机把整张网格
+    // 播种为 0、并按 absent 报一次，两处都走这一个函数。
     (
         "cogneva_knowledge_retrieval_total",
-        "crates/cog-wiki/src/unified_knowledge_backend.rs",
+        "crates/cog-core/src/contract/knowledge.rs",
     ),
 ];
 

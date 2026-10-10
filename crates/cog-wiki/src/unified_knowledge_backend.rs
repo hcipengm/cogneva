@@ -2,6 +2,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use cog_core::contract::knowledge::{
+    record_retrieval_cell, RETRIEVAL_LAYER_MEMORY as LAYER_MEMORY,
+    RETRIEVAL_LAYER_WIKI as LAYER_WIKI, RETRIEVAL_OUTCOME_ABSENT, RETRIEVAL_OUTCOME_EMPTY,
+    RETRIEVAL_OUTCOME_ERROR, RETRIEVAL_OUTCOME_HIT,
+};
 use cog_core::{
     EmbeddingProvider, FailurePattern, ImplementationExample, KnowledgeBackend, KnowledgeEntry,
     MemoryBackend, MetricsBackend, SFResult, SchemaEntry, SchemaKind, SourceRef, SummaryEntry,
@@ -52,12 +57,22 @@ impl Outcome {
 
     fn cell(self) -> &'static str {
         match self {
-            Outcome::Hit => "hit",
-            Outcome::Empty => "empty",
-            Outcome::Error => "error",
-            Outcome::Absent => "absent",
+            Outcome::Hit => RETRIEVAL_OUTCOME_HIT,
+            Outcome::Empty => RETRIEVAL_OUTCOME_EMPTY,
+            Outcome::Error => RETRIEVAL_OUTCOME_ERROR,
+            Outcome::Absent => RETRIEVAL_OUTCOME_ABSENT,
         }
     }
+
+    /// The whole closed set, for the test that pins these cells to the series'
+    /// vocabulary.
+    #[cfg(test)]
+    const ALL: [Outcome; 4] = [
+        Outcome::Hit,
+        Outcome::Empty,
+        Outcome::Error,
+        Outcome::Absent,
+    ];
 }
 
 /// A service this backend may hold, and may only come to hold later.
@@ -124,19 +139,7 @@ impl UnifiedKnowledgeBackend {
         let Some(ref metrics) = self.metrics else {
             return;
         };
-        let mut labels = std::collections::HashMap::new();
-        labels.insert("layer".to_string(), layer.to_string());
-        labels.insert("outcome".to_string(), outcome.cell().to_string());
-        if let Err(e) = metrics
-            .record_counter(
-                cog_core::metric_names::KNOWLEDGE_RETRIEVAL_TOTAL,
-                1.0,
-                labels,
-            )
-            .await
-        {
-            tracing::warn!("could not record the {layer} retrieval outcome: {e}");
-        }
+        record_retrieval_cell(metrics, layer, outcome.cell(), 1.0).await;
     }
 
     pub fn with_memory(mut self, memory: Arc<dyn MemoryBackend>) -> Self {
@@ -375,15 +378,16 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
                             }
                         }
                     }
-                    self.record("memory", Outcome::of_rows(contributed)).await;
+                    self.record(LAYER_MEMORY, Outcome::of_rows(contributed))
+                        .await;
                 }
                 Err(e) => {
                     tracing::warn!("memory search failed: {}", e);
-                    self.record("memory", Outcome::Error).await;
+                    self.record(LAYER_MEMORY, Outcome::Error).await;
                 }
             }
         } else {
-            self.record("memory", Outcome::Absent).await;
+            self.record(LAYER_MEMORY, Outcome::Absent).await;
         }
 
         // --- Wiki layer ---
@@ -404,15 +408,15 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
                             })),
                         });
                     }
-                    self.record("wiki", Outcome::of_rows(contributed)).await;
+                    self.record(LAYER_WIKI, Outcome::of_rows(contributed)).await;
                 }
                 Err(e) => {
                     tracing::warn!("wiki search failed: {}", e);
-                    self.record("wiki", Outcome::Error).await;
+                    self.record(LAYER_WIKI, Outcome::Error).await;
                 }
             }
         } else {
-            self.record("wiki", Outcome::Absent).await;
+            self.record(LAYER_WIKI, Outcome::Absent).await;
         }
 
         // Sort by relevance descending.
@@ -429,7 +433,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
         top_k: usize,
     ) -> SFResult<Vec<TaskDecompositionPattern>> {
         let Some(memory) = self.memory.resolve() else {
-            self.record("memory", Outcome::Absent).await;
+            self.record(LAYER_MEMORY, Outcome::Absent).await;
             return Ok(Vec::new());
         };
 
@@ -443,7 +447,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
         {
             Ok(results) => results,
             Err(e) => {
-                self.record("memory", Outcome::Error).await;
+                self.record(LAYER_MEMORY, Outcome::Error).await;
                 return Err(e);
             }
         };
@@ -457,7 +461,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
             shared_terms(goal, &b.goal_summary).cmp(&shared_terms(goal, &a.goal_summary))
         });
         patterns.truncate(top_k);
-        self.record("memory", Outcome::of_rows(patterns.len()))
+        self.record(LAYER_MEMORY, Outcome::of_rows(patterns.len()))
             .await;
         Ok(patterns)
     }
@@ -469,7 +473,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
         top_k: usize,
     ) -> SFResult<Vec<ImplementationExample>> {
         let Some(memory) = self.memory.resolve() else {
-            self.record("memory", Outcome::Absent).await;
+            self.record(LAYER_MEMORY, Outcome::Absent).await;
             return Ok(Vec::new());
         };
 
@@ -485,7 +489,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
         {
             Ok(results) => results,
             Err(e) => {
-                self.record("memory", Outcome::Error).await;
+                self.record(LAYER_MEMORY, Outcome::Error).await;
                 return Err(e);
             }
         };
@@ -504,7 +508,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
                 .cmp(&shared_terms(input_summary, &a.input_summary))
         });
         examples.truncate(top_k);
-        self.record("memory", Outcome::of_rows(examples.len()))
+        self.record(LAYER_MEMORY, Outcome::of_rows(examples.len()))
             .await;
         Ok(examples)
     }
@@ -515,14 +519,14 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
         top_k: usize,
     ) -> SFResult<Vec<FailurePattern>> {
         let Some(memory) = self.memory.resolve() else {
-            self.record("memory", Outcome::Absent).await;
+            self.record(LAYER_MEMORY, Outcome::Absent).await;
             return Ok(Vec::new());
         };
 
         let results = match memory.search_schema(NS_FAILURE, task_type, top_k).await {
             Ok(results) => results,
             Err(e) => {
-                self.record("memory", Outcome::Error).await;
+                self.record(LAYER_MEMORY, Outcome::Error).await;
                 return Err(e);
             }
         };
@@ -532,21 +536,21 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
                 serde_json::from_value::<FailurePattern>(r.entry.properties.clone()).ok()
             })
             .collect();
-        self.record("memory", Outcome::of_rows(patterns.len()))
+        self.record(LAYER_MEMORY, Outcome::of_rows(patterns.len()))
             .await;
         Ok(patterns)
     }
 
     async fn retrieve_task_history(&self, task_id: &str) -> SFResult<Vec<TaskExecutionRecord>> {
         let Some(memory) = self.memory.resolve() else {
-            self.record("memory", Outcome::Absent).await;
+            self.record(LAYER_MEMORY, Outcome::Absent).await;
             return Ok(Vec::new());
         };
 
         let results = match memory.search_schema(NS_EXECUTION, task_id, 100).await {
             Ok(results) => results,
             Err(e) => {
-                self.record("memory", Outcome::Error).await;
+                self.record(LAYER_MEMORY, Outcome::Error).await;
                 return Err(e);
             }
         };
@@ -556,7 +560,8 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
                 serde_json::from_value::<TaskExecutionRecord>(r.entry.properties.clone()).ok()
             })
             .collect();
-        self.record("memory", Outcome::of_rows(records.len())).await;
+        self.record(LAYER_MEMORY, Outcome::of_rows(records.len()))
+            .await;
         Ok(records)
     }
 
@@ -888,7 +893,18 @@ impl UnifiedKnowledgeBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cog_core::contract::knowledge::RETRIEVAL_OUTCOMES;
     use cog_core::{SFError, WikiDocument, WikiSearchResult};
+
+    /// The cells this producer writes have to be exactly the series'
+    /// vocabulary: the seeding pass walks the vocabulary, so a cell that is
+    /// written but not in it would be zeroed nowhere and read as absent on
+    /// every scrape.
+    #[test]
+    fn the_outcome_cells_are_the_series_vocabulary() {
+        let cells: Vec<&str> = Outcome::ALL.iter().map(|o| o.cell()).collect();
+        assert_eq!(cells, RETRIEVAL_OUTCOMES.to_vec());
+    }
 
     /// Wiki-only mock: returns three documents with distinct scores.
     struct MockWiki;
