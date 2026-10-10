@@ -7481,6 +7481,93 @@ impl RolloutPlan {
     }
 }
 
+/// The `limits` one workload document declares on its pods, summed over every
+/// container and init container, keyed the way a `ResourceQuota` spells the same
+/// resource (`limits.cpu`, `limits.memory`).
+///
+/// `None` means the document carries no pod template at all, or a limits value
+/// that is not a quantity this crate can read. An unreadable limit is not a
+/// limit of zero, and reading one as zero would make a rollout look like it
+/// fits; the caller treats `None` as "cannot judge" and lets the rollout through
+/// rather than guessing.
+///
+/// Summing the containers and the init containers together over-counts against
+/// what admission charges for init containers (which it takes as a maximum over
+/// them, not a sum). That is deliberately the conservative direction, and it
+/// cancels in the difference the caller takes whenever a rollout leaves the init
+/// containers alone -- the only field evidence this crate has.
+fn pod_template_limits(doc: &serde_yaml::Value) -> Option<BTreeMap<String, f64>> {
+    let spec = doc.get("spec")?.get("template")?.get("spec")?;
+    let mut sums: BTreeMap<String, f64> = BTreeMap::new();
+    for list_key in ["containers", "initContainers"] {
+        let Some(list) = spec.get(list_key).and_then(|c| c.as_sequence()) else {
+            continue;
+        };
+        for container in list {
+            let Some(limits) = container.get("resources").and_then(|r| r.get("limits")) else {
+                continue;
+            };
+            let map = limits.as_mapping()?;
+            for (k, v) in map {
+                let Some(key) = k.as_str() else { continue };
+                let text = crate::governance_drift::quantity_text(v)?;
+                let value = cog_core::claim_footprint::quantity_bytes(&text)?;
+                *sums.entry(format!("limits.{key}")).or_insert(0.0) += value;
+            }
+        }
+    }
+    Some(sums)
+}
+
+/// The first resource for which rolling this target's new pod onto the namespace
+/// would pass an enforced ceiling, if any, named with the numbers that decided
+/// it.
+///
+/// The check is one pod's worth of difference: a deployment is rolled a pod at a
+/// time, so the highest the counted usage reaches is the current usage plus the
+/// new pod's limits minus the old pod's (`used - old + new`), and that is what
+/// has to stay at or under `hard`. A resource this rollout does not raise never
+/// trips it.
+///
+/// `None` is returned both for "fits" and for "one of the three numbers could
+/// not be read": an unreadable figure is not a figure that fits, but it is also
+/// not grounds to hold a rollout, and holding a good rollout is the failure this
+/// must not introduce.
+fn admission_shortfall(
+    object: &str,
+    usage: &crate::governance_drift::QuotaUsage,
+    old_limits: &BTreeMap<String, f64>,
+    new_limits: &BTreeMap<String, f64>,
+) -> Option<String> {
+    let mut resources: Vec<&String> = new_limits.keys().collect();
+    resources.sort();
+    for resource in resources {
+        let increase = new_limits[resource] - old_limits.get(resource).copied().unwrap_or(0.0);
+        if increase <= 0.0 {
+            continue;
+        }
+        let Some(hard_text) = usage.hard.get(resource) else {
+            continue;
+        };
+        let Some(used_text) = usage.used.get(resource) else {
+            continue;
+        };
+        let (Some(hard), Some(used)) = (
+            cog_core::claim_footprint::quantity_bytes(hard_text),
+            cog_core::claim_footprint::quantity_bytes(used_text),
+        ) else {
+            continue;
+        };
+        if used + increase > hard {
+            return Some(format!(
+                "{object} {resource}: the new pod raises it by {increase}, and {used_text} used \
+                 + that passes the enforced {hard_text}"
+            ));
+        }
+    }
+    None
+}
+
 /// 支撑清单里可能被 apply 动到的工作负载（后端与集群内 registry）。apply 只改
 /// 自己那份 spec：没改动的工作负载原地不动，改动的会滚动重启几秒到几十秒。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8030,6 +8117,55 @@ impl RolloutExecutor {
     /// 的是当前已部署的 rev，执行这份清单的却是本次目标 rev，两者通常不同——所以
     /// "包里已经清干净了"不能当前提。留下一个安装面对象会让 apply 被准入拒绝，而
     /// 这次拒绝会被读成对目标版本的否定，整条落地通道停在一个没看清集群的中止点上。
+    /// Whether this target's new pod would fail admission against the ceilings
+    /// the cluster enforces right now, judged before anything is applied.
+    ///
+    /// A resource governance object is not delivered by the rollout (see
+    /// [`GOVERNANCE_KINDS`]): a ceiling raised in the repository moves in the
+    /// cluster only when the install face applies it, and in the window between
+    /// the two the workload half can land against a ceiling still at its old
+    /// value. With a rolling strategy that takes the old pod down first, that
+    /// window is an outage. This is the gate the drift reading is not: it holds
+    /// the rollout -- the old pod stays -- while the new pod would not fit, and
+    /// lets it through once the ceiling catches up.
+    ///
+    /// `Some(reason)` is a positive finding, named for the object and resource
+    /// that decided it. `None` means it fits, no quota constrains the raised
+    /// resource, or a side could not be read -- an unreadable figure holds
+    /// nothing back.
+    async fn admission_would_fail(&self, plan: &RolloutPlan, t: &RolloutTarget) -> Option<String> {
+        // The set-image fallback leaves the pod's resources as they are, so
+        // there is nothing to compare; only a manifest that rewrites the
+        // workload can move its limits.
+        let dir = plan.manifests_dir.as_ref()?;
+        let key = target_manifest_key(&t.deployment);
+        let text = tokio::fs::read_to_string(Path::new(dir).join(&key))
+            .await
+            .ok()?;
+        let docs = split_docs(&text, &key).ok()?;
+        let new_limits = docs.iter().find_map(pod_template_limits)?;
+
+        let live_text = self
+            .run_kubectl(&["get", "deployment", &t.deployment, "-o", "json"], 60)
+            .await
+            .ok()?;
+        let live_json: serde_json::Value = serde_json::from_str(&live_text).ok()?;
+        let live_doc = serde_yaml::to_value(&live_json).ok()?;
+        let old_limits = pod_template_limits(&live_doc)?;
+
+        let quota_text = self
+            .run_kubectl(&["get", "resourcequota", "-o", "json"], 60)
+            .await
+            .ok()?;
+        let quotas = crate::governance_drift::live_quota_usage(&quota_text).ok()?;
+        for (object, usage) in &quotas {
+            if let Some(reason) = admission_shortfall(object, usage, &old_limits, &new_limits) {
+                return Some(reason);
+            }
+        }
+        None
+    }
+
     async fn apply_target(&self, plan: &RolloutPlan, t: &RolloutTarget) -> SFResult<()> {
         if let Some(dir) = &plan.manifests_dir {
             let key = target_manifest_key(&t.deployment);
@@ -9402,6 +9538,26 @@ impl RolloutExecutor {
                 .find(|(d, _)| d == &target.deployment)
                 .map(|(_, v)| v.as_str())
                 .unwrap_or_default();
+            // 换旧 Pod 之前先问一次：新 Pod 装不装得下。装不下就当场扣住，
+            // 旧 Pod 留着、应用不断——这是量到了漂移却没有任何门去拦的那一处，
+            // 补成门。装不下是集群此刻的事，不是这一版的结论，所以判环境类、
+            // 不回滚，下一轮天花板跟上了自己会继续。
+            if let Some(reason) = self.admission_would_fail(plan, target).await {
+                warn!(
+                    deployment = %target.deployment,
+                    shortfall = %reason,
+                    "mainline rollout: holding this rollout before it starts; the new pod would \
+                     not admit against the ceiling the cluster enforces right now, so the old pod \
+                     stays and the next round retries"
+                );
+                return Err(RolloutFailure::at(
+                    "precheck",
+                    &target.deployment,
+                    FailureLocus::Admission,
+                    done.is_empty(),
+                    SFError::Config(reason),
+                ));
+            }
             if let Err(e) = self.apply_target(plan, target).await {
                 return self
                     .fail_without_blind_rollback(
@@ -20945,6 +21101,73 @@ exit 0
         real_git(work, &["commit", "-m", "quota"]).await;
         real_git(work, &["push", "origin", "HEAD:main"]).await;
         real_git_stdout(work, &["rev-parse", "HEAD"]).await
+    }
+
+    /// 一份 Deployment 文档里所有容器与 init 容器的 limits 之和，按 ResourceQuota
+    /// 的拼法归并。
+    #[test]
+    fn a_pod_templates_limits_sum_over_every_container() {
+        let doc: serde_yaml::Value = serde_yaml::from_str(
+            "kind: Deployment\nmetadata:\n  name: cogneva\nspec:\n  template:\n    spec:\n      \
+             initContainers:\n        - name: seed\n          resources:\n            limits:\n              cpu: 500m\n      \
+             containers:\n        - name: app\n          resources:\n            limits:\n              cpu: \"4\"\n              memory: 6Gi\n        \
+             - name: sidecar\n          resources:\n            limits:\n              cpu: \"0.5\"\n",
+        )
+        .unwrap();
+        let limits = pod_template_limits(&doc).unwrap();
+        assert_eq!(limits.get("limits.cpu"), Some(&5.0), "4 + 0.5 + 0.5");
+        assert_eq!(limits.get("limits.memory"), Some(&(6.0 * 1024f64.powi(3))));
+    }
+
+    #[test]
+    fn a_document_with_no_pod_template_has_no_limits() {
+        let doc: serde_yaml::Value =
+            serde_yaml::from_str("kind: Service\nmetadata:\n  name: s\n").unwrap();
+        assert!(pod_template_limits(&doc).is_none());
+    }
+
+    /// 装得下就放行；一个字段的增量把用量顶过天花板就扣住。
+    #[test]
+    fn the_shortfall_is_exactly_where_the_increase_crosses_the_ceiling() {
+        let usage = crate::governance_drift::QuotaUsage {
+            hard: BTreeMap::from([("limits.cpu".to_string(), "23".to_string())]),
+            used: BTreeMap::from([("limits.cpu".to_string(), "18500m".to_string())]),
+        };
+        let old = BTreeMap::from([("limits.cpu".to_string(), 4.0)]);
+        // 4 -> 4.5 核：18.5 + 0.5 = 19 <= 23，放行。
+        let fits = BTreeMap::from([("limits.cpu".to_string(), 4.5)]);
+        assert!(admission_shortfall("resourcequota/q", &usage, &old, &fits).is_none());
+        // 4 -> 6 核：18.5 + 2 = 20.5 <= 23，仍放行。
+        let raised = BTreeMap::from([("limits.cpu".to_string(), 6.0)]);
+        assert!(admission_shortfall("resourcequota/q", &usage, &old, &raised).is_none());
+        // 用量已经贴顶时再抬：18.5 -> 22.5，+2 到 24.5 > 23，扣住。
+        let near = crate::governance_drift::QuotaUsage {
+            hard: BTreeMap::from([("limits.cpu".to_string(), "23".to_string())]),
+            used: BTreeMap::from([("limits.cpu".to_string(), "22.5".to_string())]),
+        };
+        let hold = admission_shortfall("resourcequota/q", &near, &old, &raised);
+        assert!(hold.is_some(), "22.5 + 2 应当越过 23");
+        assert!(hold.unwrap().contains("limits.cpu"));
+    }
+
+    /// 没抬的资源、读不到的用量都不该扣住一次滚动。
+    #[test]
+    fn a_shortfall_needs_a_raised_resource_and_readable_numbers() {
+        let old = BTreeMap::from([("limits.cpu".to_string(), 4.0)]);
+        let unchanged = BTreeMap::from([("limits.cpu".to_string(), 4.0)]);
+        // 天花板远低于用量，但这一轮没动 cpu：不算（只看增量）。
+        let low = crate::governance_drift::QuotaUsage {
+            hard: BTreeMap::from([("limits.cpu".to_string(), "1".to_string())]),
+            used: BTreeMap::from([("limits.cpu".to_string(), "5".to_string())]),
+        };
+        assert!(admission_shortfall("resourcequota/q", &low, &old, &unchanged).is_none());
+        // 用量读不出来：不判，放行。
+        let unreadable = crate::governance_drift::QuotaUsage {
+            hard: BTreeMap::from([("limits.cpu".to_string(), "23".to_string())]),
+            used: BTreeMap::new(),
+        };
+        let raised = BTreeMap::from([("limits.cpu".to_string(), 9.0)]);
+        assert!(admission_shortfall("resourcequota/q", &unreadable, &old, &raised).is_none());
     }
 
     /// 进程起来时 main 已经部署过 ⇒ 它没组过包，声明侧必须自己从被跟踪 rev 的

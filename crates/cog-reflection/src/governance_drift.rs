@@ -179,7 +179,7 @@ pub fn governance_declarations(
 /// A YAML scalar as the quantity was written. Numbers count too: `pods: 40`
 /// without quotes parses as a number, and it is the same declaration as
 /// `pods: "40"`.
-fn quantity_text(value: &serde_yaml::Value) -> Option<String> {
+pub(crate) fn quantity_text(value: &serde_yaml::Value) -> Option<String> {
     match value {
         serde_yaml::Value::String(s) => Some(s.clone()),
         serde_yaml::Value::Number(n) => Some(n.to_string()),
@@ -234,18 +234,34 @@ fn same_quantity(a: &str, b: &str) -> bool {
     }
 }
 
-/// The output of `kubectl get resourcequota -o json` -> each object's enforced
-/// `hard` field table.
+/// The enforced ceilings of one `ResourceQuota` and what the namespace is
+/// currently counted as using.
+///
+/// `hard` is what admission reads; `used` is what the quota controller has
+/// counted against it. They are two faces of one object and are read together
+/// because the question the rollout asks is "does the new pod still fit", and
+/// that needs both sides of the subtraction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotaUsage {
+    pub hard: BTreeMap<String, String>,
+    pub used: BTreeMap<String, String>,
+}
+
+/// The output of `kubectl get resourcequota -o json` -> each object's `hard`
+/// and `used` field tables.
 ///
 /// Keys are `<lowercased kind>/<name>`, the same shape as
 /// [`GovernanceDeclaration::object`], which is how the caller pairs the two
-/// sides up. `spec.hard` is what admission reads.
+/// sides up. `spec.hard` is what admission reads; `status.used` is what the
+/// controller has counted so far and may be absent until it has run once, which
+/// is why a missing `status` leaves an empty table rather than failing — "the
+/// count is not there yet" is not "the listing is not a listing".
 ///
 /// Output that is not a listing is an error rather than half a reading: when
 /// this text did not come from `kubectl get` (something else wrote to stdout,
 /// say), comparing "whatever was left" yields a reading nobody can explain, and
 /// it looks exactly like "the two sides agree".
-pub fn live_quotas(text: &str) -> SFResult<BTreeMap<String, BTreeMap<String, String>>> {
+pub fn live_quota_usage(text: &str) -> SFResult<BTreeMap<String, QuotaUsage>> {
     let v: serde_json::Value = serde_json::from_str(text)
         .map_err(|e| SFError::Config(format!("resource quota listing is not JSON: {e}")))?;
     let items = v
@@ -268,21 +284,36 @@ pub fn live_quotas(text: &str) -> SFResult<BTreeMap<String, BTreeMap<String, Str
         else {
             continue;
         };
-        let mut fields = BTreeMap::new();
-        if let Some(hard) = item
-            .get("spec")
-            .and_then(|s| s.get("hard"))
-            .and_then(|h| h.as_object())
-        {
-            for (key, value) in hard {
-                if let Some(text) = value.as_str() {
-                    fields.insert(key.clone(), text.to_string());
+        let table = |v: Option<&serde_json::Value>| {
+            let mut fields = BTreeMap::new();
+            if let Some(map) = v.and_then(|h| h.as_object()) {
+                for (key, value) in map {
+                    if let Some(text) = value.as_str() {
+                        fields.insert(key.clone(), text.to_string());
+                    }
                 }
             }
-        }
-        out.insert(format!("{}/{name}", kind.to_lowercase()), fields);
+            fields
+        };
+        out.insert(
+            format!("{}/{name}", kind.to_lowercase()),
+            QuotaUsage {
+                hard: table(item.get("spec").and_then(|s| s.get("hard"))),
+                used: table(item.get("status").and_then(|s| s.get("used"))),
+            },
+        );
     }
     Ok(out)
+}
+
+/// The output of `kubectl get resourcequota -o json` -> each object's enforced
+/// `hard` field table, the declaration-comparison face of
+/// [`live_quota_usage`].
+pub fn live_quotas(text: &str) -> SFResult<BTreeMap<String, BTreeMap<String, String>>> {
+    Ok(live_quota_usage(text)?
+        .into_iter()
+        .map(|(object, usage)| (object, usage.hard))
+        .collect())
 }
 
 /// Which fields differ, per declared object, against what the cluster enforces.
@@ -638,6 +669,29 @@ mod tests {
             .get("resourcequota/cogneva-quota")
             .expect("the key has to match what a declaration builds for itself");
         assert_eq!(quota.get("limits.cpu").map(String::as_str), Some("17"));
+    }
+
+    #[test]
+    fn the_usage_face_reads_status_used_beside_hard() {
+        let text = r#"{"apiVersion":"v1","kind":"List","items":[
+            {"kind":"ResourceQuota","metadata":{"name":"cogneva-quota"},
+             "spec":{"hard":{"limits.cpu":"23"}},
+             "status":{"used":{"limits.cpu":"18500m"}}}
+        ]}"#;
+        let usage = live_quota_usage(text).unwrap();
+        let q = usage.get("resourcequota/cogneva-quota").unwrap();
+        assert_eq!(q.hard.get("limits.cpu").map(String::as_str), Some("23"));
+        assert_eq!(q.used.get("limits.cpu").map(String::as_str), Some("18500m"));
+    }
+
+    #[test]
+    fn a_quota_without_status_reads_an_empty_used_table_not_a_failure() {
+        // `status.used` is written by the controller and may not be there yet;
+        // that is not the same as the listing being unreadable.
+        let usage = live_quota_usage(LIVE).unwrap();
+        let q = usage.get("resourcequota/cogneva-quota").unwrap();
+        assert_eq!(q.hard.get("limits.cpu").map(String::as_str), Some("17"));
+        assert!(q.used.is_empty());
     }
 
     #[test]
