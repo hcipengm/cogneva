@@ -1339,7 +1339,7 @@ impl CollaborationExecutor {
 #[cfg(test)]
 mod tests {
     use super::CollaborationExecutor;
-    use cog_core::Observable;
+    use cog_core::{Observable, Task, TaskType};
 
     /// Keeps the envelopes the archive is handed, so a test can read back how a
     /// run ended without a store behind it.
@@ -1545,6 +1545,45 @@ mod tests {
         assert_ne!(
             CollaborationExecutor::change_id_for("github-pr-58", "diff A"),
             CollaborationExecutor::change_id_for("github-pr-58", "diff A fixed")
+        );
+    }
+
+    /// The self-evolution fact has to survive the pipeline re-hosting the goal
+    /// on a task of its own making: the actors read `Task::is_self_evolution()`
+    /// off that synthetic task, whose type names the loop rather than the work.
+    ///
+    /// A task can name the fact in its *type* alone — the gateway's create-task
+    /// entry point takes `task_type: "self_evolution"` and leaves the input
+    /// untouched — so once the rehost has replaced the type, the type no longer
+    /// carries it. It has to have been written into the context, where every
+    /// later reader looks. Drop that write and the evaluator's self-evolution
+    /// path turns back into a paid model call with no line of code changing.
+    ///
+    /// The rehost below mirrors the loop's: same type substitution, same context
+    /// carried as the input.
+    #[test]
+    fn a_self_evolution_task_that_names_only_its_type_survives_the_rehost() {
+        let submitted = Task::new(
+            "gw-1",
+            TaskType::Custom("self_evolution".into()),
+            serde_json::json!({ "goal": "raise the read timeout" }),
+        );
+        assert!(submitted.is_self_evolution());
+
+        let context = CollaborationExecutor::build_self_evolution_context(
+            CollaborationExecutor::goal_context(&submitted),
+            "raise the read timeout",
+        );
+        let rehosted = Task::new(
+            "ralph-pipeline-00000000-0000-0000-0000-000000000000",
+            TaskType::Custom("ralph_pipeline_goal".into()),
+            context,
+        );
+
+        assert!(
+            rehosted.is_self_evolution(),
+            "the marker must reach the rehosted task, or the actors' \
+             self-evolution path silently stops firing"
         );
     }
 
