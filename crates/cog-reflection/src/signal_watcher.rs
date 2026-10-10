@@ -2040,6 +2040,7 @@ mod tests {
                     rationale: "it is the one the queue can absorb".into(),
                 },
             ),
+            evidence_refs: Vec::new(),
         }
     }
 

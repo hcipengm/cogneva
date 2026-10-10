@@ -41,6 +41,13 @@ pub struct TasteIntentRequest {
     /// 这条判定针对的是什么。它随后与判定类型配对成为重复抑制的键。
     pub subject: String,
     pub payload: TasteIntentPayload,
+    /// 这条判定据以作出的材料，按引用给出（raw id 或绝对 URI）。
+    ///
+    /// 缺省即「没给材料」，与「判定无关材料」不是一回事：每一种判定都有
+    /// subject，所以这里空着只是提交者没拿出东西来。形状的判据在契约层，
+    /// 不在这个面上——同一条记录日后还会从系统内部的生产者进来。
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
 }
 
 /// 已收下的一条提交。
@@ -51,6 +58,9 @@ pub struct TasteIntentAccepted {
     pub subject: String,
     pub submitted_by: String,
     pub submitted_at: DateTime<Utc>,
+    /// 落盘时记下的材料引用，原样回给提交者：读回面还没被翻到之前，这是
+    /// 「我指的是那份东西」当场唯一的回执。
+    pub evidence_refs: Vec<String>,
 }
 
 /// 收下一条外部提交的价值判定。
@@ -91,6 +101,7 @@ pub async fn submit_taste_intent_handler(
         submitted_by: claims.sub.clone(),
         submitted_at: Utc::now(),
         payload: req.payload,
+        evidence_refs: req.evidence_refs,
     };
     if let Err(error) = intent.validate() {
         return (
@@ -120,6 +131,7 @@ pub async fn submit_taste_intent_handler(
             "kind": intent.payload.kind(),
             "subject": intent.subject,
             "payload": intent.payload,
+            "evidence_refs": intent.evidence_refs,
         });
         if let Err(error) = audit
             .append(
@@ -147,6 +159,7 @@ pub async fn submit_taste_intent_handler(
             subject: intent.subject,
             submitted_by: intent.submitted_by,
             submitted_at: intent.submitted_at,
+            evidence_refs: intent.evidence_refs,
         }),
     )
         .into_response()

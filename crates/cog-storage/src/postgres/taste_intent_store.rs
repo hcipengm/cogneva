@@ -34,7 +34,8 @@ const STATUS_PENDING: &str = "pending";
 
 /// The columns every read returns, in one place so the two readers cannot come
 /// back with differently ordered rows.
-const ROW_COLUMNS: &str = "id, subject, submitted_by, submitted_at, payload, task_id";
+const ROW_COLUMNS: &str =
+    "id, subject, submitted_by, submitted_at, payload, evidence_refs, task_id";
 
 /// PostgreSQL taste intent store.
 #[derive(Clone)]
@@ -52,16 +53,30 @@ impl PostgresTasteIntentStore {
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS cog_taste_intents (
-                id           UUID        PRIMARY KEY,
-                subject      TEXT        NOT NULL,
-                submitted_by TEXT        NOT NULL,
-                submitted_at TIMESTAMPTZ NOT NULL,
-                payload      JSONB       NOT NULL,
-                status       TEXT        NOT NULL,
-                task_id      TEXT,
-                disposed_at  TIMESTAMPTZ
+                id            UUID        PRIMARY KEY,
+                subject       TEXT        NOT NULL,
+                submitted_by  TEXT        NOT NULL,
+                submitted_at  TIMESTAMPTZ NOT NULL,
+                payload       JSONB       NOT NULL,
+                evidence_refs JSONB       NOT NULL DEFAULT '[]'::jsonb,
+                status        TEXT        NOT NULL,
+                task_id       TEXT,
+                disposed_at   TIMESTAMPTZ
             )
             "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+
+        // Additive migration for the material references. A row written before
+        // the column existed gets the empty list, which is exactly what a
+        // submission that named no material means — so an old row stays
+        // readable and stays honest about having offered nothing, and no
+        // rewrite of the table is needed to say so.
+        sqlx::query(
+            "ALTER TABLE cog_taste_intents \
+                 ADD COLUMN IF NOT EXISTS evidence_refs JSONB NOT NULL DEFAULT '[]'::jsonb",
         )
         .execute(&self.pool)
         .await
@@ -97,6 +112,11 @@ impl PostgresTasteIntentStore {
             .map_err(|e| format!("payload column unreadable: {e}"))?;
         let payload: TasteIntentPayload =
             serde_json::from_value(payload).map_err(|e| format!("payload unparsable: {e}"))?;
+        let evidence_refs: serde_json::Value = row
+            .try_get("evidence_refs")
+            .map_err(|e| format!("evidence_refs column unreadable: {e}"))?;
+        let evidence_refs: Vec<String> = serde_json::from_value(evidence_refs)
+            .map_err(|e| format!("evidence_refs unparsable: {e}"))?;
         Ok(StoredTasteIntent {
             intent: TasteIntent {
                 id,
@@ -110,6 +130,7 @@ impl PostgresTasteIntentStore {
                     .try_get("submitted_at")
                     .map_err(|e| format!("submitted_at column unreadable: {e}"))?,
                 payload,
+                evidence_refs,
             },
             task_id: row
                 .try_get("task_id")
@@ -151,10 +172,11 @@ impl PostgresTasteIntentStore {
 impl TasteIntentSink for PostgresTasteIntentStore {
     async fn submit(&self, intent: &TasteIntent) -> SFResult<()> {
         let payload = serde_json::to_value(&intent.payload)?;
+        let evidence_refs = serde_json::to_value(&intent.evidence_refs)?;
         let result = sqlx::query(
             "INSERT INTO cog_taste_intents \
-                 (id, subject, submitted_by, submitted_at, payload, status) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
+                 (id, subject, submitted_by, submitted_at, payload, evidence_refs, status) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
              ON CONFLICT (id) DO NOTHING",
         )
         .bind(intent.id)
@@ -162,6 +184,7 @@ impl TasteIntentSink for PostgresTasteIntentStore {
         .bind(&intent.submitted_by)
         .bind(intent.submitted_at)
         .bind(payload)
+        .bind(evidence_refs)
         .bind(STATUS_PENDING)
         .execute(&self.pool)
         .await

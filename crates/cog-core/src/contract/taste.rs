@@ -48,6 +48,52 @@ pub const TASTE_TEXT_MAX_CHARS: usize = 2_000;
 /// Longest a subject may be, in characters.
 pub const TASTE_SUBJECT_MAX_CHARS: usize = 512;
 
+/// Most materials one submission may name.
+///
+/// A judgement is made against a handful of artifacts, not a corpus: a list
+/// long enough to be a corpus is a listing, and a listing belongs on the
+/// material side where it can be paged and read, not copied into every
+/// submission that mentions it.
+pub const TASTE_EVIDENCE_MAX_REFS: usize = 32;
+
+/// Longest one evidence reference may be, in characters.
+///
+/// Long enough for a URI with a query string, short enough that a submission
+/// cannot carry a document in the field that exists to point at one.
+pub const TASTE_REFERENCE_MAX_CHARS: usize = 2_048;
+
+/// Whether `reference` cannot stand as a material reference, or `None` when it
+/// can.
+///
+/// An entry is either a raw source id or an absolute URI, and the two are told
+/// apart by the scheme separator: a raw id is a store key, and a key may not
+/// contain a path separator, so nothing that parses as an id can also parse as
+/// a URI. Ids are checked by the same rule the store checks them with — an id
+/// that only fails once the store turns it into a key is a reference that is
+/// accepted here and never resolves there, which is the shape of traceability
+/// this field exists to remove.
+pub fn evidence_ref_defect(reference: &str) -> Option<&'static str> {
+    if reference.is_empty() {
+        return Some("must not be empty");
+    }
+    if reference.trim() != reference {
+        return Some("must not be padded with whitespace");
+    }
+    if reference.chars().count() > TASTE_REFERENCE_MAX_CHARS {
+        return Some("is longer than the reference limit");
+    }
+    if let Some((scheme, rest)) = reference.split_once("://") {
+        if scheme.is_empty() {
+            return Some("names no URI scheme");
+        }
+        if rest.is_empty() {
+            return Some("names nothing after its URI scheme");
+        }
+        return None;
+    }
+    crate::contract::memory::raw_id_key_error(reference)
+}
+
 /// What the evidence offered for a claim turned out to be worth.
 ///
 /// Three answers, and they are the whole domain: the evidence does not
@@ -199,6 +245,22 @@ pub struct TasteIntent {
     pub submitted_by: String,
     pub submitted_at: DateTime<Utc>,
     pub payload: TasteIntentPayload,
+    /// The material this judgement was made against, by reference.
+    ///
+    /// The subject is what the judgement is about in the submitter's words,
+    /// and those words are not a key: nothing can be looked up from them. When
+    /// a judgement is later found to be wrong, "which artifact was it about" is
+    /// not answerable from the record, and a criterion changed on a judgement
+    /// nobody can trace back is an opinion carrying the standing of a standard.
+    /// Each entry is either a raw source id — the local artifact, in the form
+    /// the store can be asked for — or an absolute URI for material that lives
+    /// elsewhere.
+    ///
+    /// Empty is the ordinary case and means the submitter offered no material.
+    /// It is not the same claim as "the judgement was about nothing", which
+    /// this vocabulary cannot make at all: every intent has a subject.
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
 }
 
 impl TasteIntent {
@@ -228,6 +290,21 @@ impl TasteIntent {
                 return Err(format!(
                     "{field} is longer than {TASTE_TEXT_MAX_CHARS} characters"
                 ));
+            }
+        }
+        // The references are checked here rather than at the HTTP surface: the
+        // same record arrives from a submitter today and from a producer inside
+        // the system later, and a rule enforced at one entrance is not a rule
+        // about the record. A reference that cannot resolve is worse than none
+        // — it is a traceability claim that reads as satisfied and is not.
+        if self.evidence_refs.len() > TASTE_EVIDENCE_MAX_REFS {
+            return Err(format!(
+                "evidence_refs names more than {TASTE_EVIDENCE_MAX_REFS} materials"
+            ));
+        }
+        for reference in &self.evidence_refs {
+            if let Some(defect) = evidence_ref_defect(reference) {
+                return Err(format!("evidence_refs entry {reference:?} {defect}"));
             }
         }
         Ok(())
@@ -460,6 +537,7 @@ mod tests {
             submitted_by: "op@example".into(),
             submitted_at: Utc::now(),
             payload,
+            evidence_refs: Vec::new(),
         }
     }
 
@@ -506,5 +584,74 @@ mod tests {
             v.rationale = "汉".repeat(TASTE_TEXT_MAX_CHARS + 1);
         }
         assert!(long.validate().is_err());
+    }
+
+    /// A submission may name the material it was judged against, and the
+    /// reference survives the stored form: it is read back by a process other
+    /// than the one that accepted it.
+    #[test]
+    fn a_submission_carries_the_material_it_names() {
+        let mut named = intent(payloads().remove(0));
+        named.evidence_refs = vec![
+            "tool-output-41-0002-0000".into(),
+            "https://example.invalid/report.pdf".into(),
+        ];
+        assert_eq!(named.validate(), Ok(()));
+
+        let text = serde_json::to_string(&named).expect("intent serializes");
+        let back: TasteIntent = serde_json::from_str(&text).expect("intent deserializes");
+        assert_eq!(back.evidence_refs, named.evidence_refs);
+    }
+
+    /// A submission written before the field existed reads back as it was
+    /// written rather than failing to parse. The empty list and the missing key
+    /// mean the same thing here, which is why the old form does not need a
+    /// migration of its own.
+    #[test]
+    fn an_intent_without_the_field_reads_back_with_no_materials() {
+        let stripped = serde_json::json!({
+            "id": Uuid::new_v4(),
+            "subject": "change-42",
+            "submitted_by": "op@example",
+            "submitted_at": Utc::now(),
+            "payload": {"kind": "direction_preference", "preferred": "a",
+                        "alternative": "b", "rationale": "cheaper"},
+        });
+        let back: TasteIntent =
+            serde_json::from_value(stripped).expect("an older intent still parses");
+        assert!(back.evidence_refs.is_empty());
+    }
+
+    /// A reference that could never resolve is refused at submission rather
+    /// than stored: the field exists so a judgement can be traced back, and a
+    /// traceability claim that reads as satisfied but points nowhere is the
+    /// failure it is meant to prevent.
+    #[test]
+    fn an_unresolvable_reference_is_refused() {
+        for bad in [
+            "",
+            " ",
+            " change-42",
+            "change-42 ",
+            "a/b", // a raw id is a store key and may not carry a separator
+            "a\\b",
+            "..",
+            "a\0b",
+            "://no-scheme",
+            "scheme://",
+        ] {
+            let mut attempt = intent(payloads().remove(0));
+            attempt.evidence_refs = vec![bad.into()];
+            assert!(
+                attempt.validate().is_err(),
+                "{bad:?} was accepted as a reference"
+            );
+        }
+
+        let mut too_many = intent(payloads().remove(0));
+        too_many.evidence_refs = (0..=TASTE_EVIDENCE_MAX_REFS)
+            .map(|i| format!("raw-{i}"))
+            .collect();
+        assert!(too_many.validate().is_err());
     }
 }
