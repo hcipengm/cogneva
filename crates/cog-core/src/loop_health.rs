@@ -24,8 +24,24 @@
 //!   age that stays near its period while it lives, so an age of several periods
 //!   means it is not cycling. That is what separates "this loop is stuck" from
 //!   "this cycle had nothing to do", and it is why the beat is unconditional at
-//!   the top of the tick rather than a report of work done. A loop that wakes
-//!   only when there is work declares [`Cadence::EventDriven`] instead, and its
+//!   the top of the tick rather than a report of work done.
+//!
+//!   The period bounds one half of that gap and only one. A cycle that reaches
+//!   the top of its tick and then runs a build, a test or a queue wait is doing
+//!   work its period says nothing about, and while it does, the age climbs past
+//!   any multiple of a period the loop honestly declared — the loop is healthy
+//!   and reads as stalled by construction. A reader cannot tell the two apart
+//!   from the age alone, so the loop has to say the other half too: it declares
+//!   the bound on the work between two beats, and only that sum can be compared
+//!   against an age. [`Cadence::PeriodicWithWork`] is that declaration, and the
+//!   loop is expected to derive the bound from the objects that enforce it (the
+//!   timeout on the subprocess, the wait budget on the gate) rather than from a
+//!   round number chosen to silence the rule. A loop whose cycle drains a queue
+//!   beats between items, so the gap the bound has to cover is one item's work
+//!   rather than the whole queue's.
+//!
+//!   A loop that wakes only when there is work declares [`Cadence::EventDriven`]
+//!   instead, and its
 //!   age is then published but not judged: a consumer waiting quietly on an empty
 //!   queue and a consumer stuck inside a handler look the same from the outside,
 //!   and the reading that separates them is the queue's, not this one's.
@@ -78,6 +94,24 @@ pub const LOOP_REGISTERED: &str = "cogneva_loop_registered";
 pub const LOOP_PERIOD_SECONDS: &str = "cogneva_loop_period_seconds";
 /// Seconds since a loop last beat, computed when the scrape arrives.
 pub const LOOP_TICK_AGE_SECONDS: &str = "cogneva_loop_tick_age_seconds";
+/// The longest a loop's cycle may spend working between two beats, in seconds.
+///
+/// The half of a beat-to-beat gap that [`LOOP_PERIOD_SECONDS`] does not cover.
+/// Zero for a loop whose period bounds its whole cycle, which is every loop that
+/// does not declare otherwise — so a rule sums this onto the period and reads
+/// the same wall it always did for the loops that never needed the distinction.
+///
+/// It is published instead of omitted, and so is the zero: a rule has to do
+/// arithmetic with it, and a series that is absent for some loops and present
+/// for others would make the sum silently drop exactly the loops the whole
+/// declaration exists for.
+///
+/// The bound belongs to the loop because only the loop knows what it does
+/// between beats; it is expected to come from the object that enforces the work
+/// (a subprocess timeout, a wait budget) rather than from a measurement of past
+/// rounds, which would only ever widen and would credit a loop for the slowest
+/// thing it ever did.
+pub const LOOP_WORK_BUDGET_SECONDS: &str = "cogneva_loop_work_budget_seconds";
 /// Times a loop ended while the process was still running, as a counter.
 pub const LOOP_DEATHS_TOTAL: &str = "cogneva_loop_deaths_total";
 /// Times a loop was restarted after panicking, as a counter.
@@ -204,9 +238,34 @@ pub const RESTART_RULE: &str = "background_loop_restarted";
 /// How often a loop is expected to reach the top of its cycle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cadence {
-    /// Every `Duration`, whether or not the cycle found work. This is what makes
-    /// a stalled loop distinguishable from an idle one.
+    /// Every `Duration`, whether or not the cycle found work, and the work one
+    /// cycle does between two beats is short enough that the period covers it.
+    ///
+    /// This is what makes a stalled loop distinguishable from an idle one. It is
+    /// the wrong declaration for a loop whose cycle runs a build, a test or a
+    /// queue wait: its period would then bound only the wait for the next tick,
+    /// and every healthy cycle would age past any multiple of it.
     Periodic(Duration),
+    /// Every `period`, and the work one cycle does between two beats takes up to
+    /// `work`.
+    ///
+    /// For a loop whose cycle contains a step it does not control the duration
+    /// of. Both numbers are parts of the loop's own design, and each has to come
+    /// from what enforces it: `period` from the wait the loop itself sleeps,
+    /// `work` from the timeout or budget on the step that runs inside the cycle.
+    /// A reader adds them, so the wall a rule compares an age against is the
+    /// loop's own numbers rather than a constant that goes stale when one of the
+    /// two is configured differently.
+    ///
+    /// A loop that drains a queue declares the bound on **one item** and beats
+    /// between items, because that is the gap it can actually bound — declaring
+    /// the queue's total would be a claim about a length it does not know.
+    PeriodicWithWork {
+        /// How often the loop reaches the top of its cycle while it is idle.
+        period: Duration,
+        /// The longest the work between two beats may take.
+        work: Duration,
+    },
     /// Only when there is work to do. The age is still published — it is a
     /// reading — but nothing may conclude "stuck" from it.
     EventDriven,
@@ -217,7 +276,17 @@ impl Cadence {
     pub fn period_secs(self) -> u64 {
         match self {
             Cadence::Periodic(d) => d.as_secs(),
+            Cadence::PeriodicWithWork { period, .. } => period.as_secs(),
             Cadence::EventDriven => 0,
+        }
+    }
+
+    /// The bound the loop declares on the work between two beats, in whole
+    /// seconds; 0 when its period already covers its cycle.
+    pub fn work_budget_secs(self) -> u64 {
+        match self {
+            Cadence::PeriodicWithWork { work, .. } => work.as_secs(),
+            Cadence::Periodic(_) | Cadence::EventDriven => 0,
         }
     }
 }
@@ -303,9 +372,13 @@ pub struct RestartPolicy {
 /// How many of a loop's own periods the longest restart wait spans.
 ///
 /// Six is not a value chosen here: it is the multiple the deployed stall rule
-/// already measures a loop against. Waiting longer than that would keep a loop
-/// from beating past the point where it is announced as stalled, so the two
-/// readings would describe the same state in opposite directions.
+/// already measures a loop against, and the rule adds the loop's declared work
+/// budget on top of that multiple. Waiting longer than the multiple would keep a
+/// loop from beating past the point where it is announced as stalled, so the two
+/// readings would describe the same state in opposite directions. The work
+/// budget is deliberately left out of this wait: it is time the loop spends
+/// working rather than time between attempts, and a restart that waited it out
+/// would delay the repair by the length of the thing that is not being repaired.
 const STALL_PERIODS: u32 = 6;
 
 impl RestartPolicy {
@@ -313,6 +386,7 @@ impl RestartPolicy {
     pub fn for_cadence(cadence: Cadence, settings: RestartSettings) -> Self {
         let declared = match cadence {
             Cadence::Periodic(period) => period,
+            Cadence::PeriodicWithWork { period, .. } => period,
             Cadence::EventDriven => Duration::ZERO,
         };
         let base = declared.max(Duration::from_secs(settings.backoff_floor_secs));
@@ -335,6 +409,9 @@ impl RestartPolicy {
 struct LoopState {
     name: String,
     period_secs: u64,
+    /// The bound the loop declared on the work between two beats, in seconds; 0
+    /// for a loop whose period covers its whole cycle.
+    work_budget_secs: u64,
     /// Milliseconds since the process's own epoch, which is the monotone clock
     /// rather than the wall clock: a step of the host clock must not read as a
     /// loop that has not beaten since before it started.
@@ -388,11 +465,13 @@ impl LoopHealth {
     pub fn register(&self, name: impl Into<String>, cadence: Cadence) -> Beat {
         let name = name.into();
         let period_secs = cadence.period_secs();
+        let work_budget_secs = cadence.work_budget_secs();
         let mut loops = self.loops.lock().unwrap_or_else(|e| e.into_inner());
         let state = loops.entry(name.clone()).or_insert_with(|| {
             Arc::new(LoopState {
                 name,
                 period_secs,
+                work_budget_secs,
                 // Registration is a beat: a loop that hangs before its first tick
                 // must age like one, not look newborn forever.
                 last_beat_ms: AtomicU64::new(now_ms()),
@@ -404,11 +483,13 @@ impl LoopHealth {
                 owner_probe_failures: AtomicU64::new(0),
             })
         });
-        if state.period_secs != period_secs {
+        if state.period_secs != period_secs || state.work_budget_secs != work_budget_secs {
             tracing::warn!(
                 loop_name = %state.name,
                 registered_secs = state.period_secs,
                 declared_secs = period_secs,
+                registered_work_budget_secs = state.work_budget_secs,
+                declared_work_budget_secs = work_budget_secs,
                 "loop registered twice with different cadences; the first one is in force"
             );
         }
@@ -765,6 +846,10 @@ impl Observable for LoopHealth {
                     .with_label(LOOP_LABEL, label),
             );
             out.push(
+                RawMetric::new(LOOP_WORK_BUDGET_SECONDS, state.work_budget_secs as f64)
+                    .with_label(LOOP_LABEL, label),
+            );
+            out.push(
                 RawMetric::new(LOOP_TICK_AGE_SECONDS, state.age_secs() as f64)
                     .with_label(LOOP_LABEL, label),
             );
@@ -884,6 +969,56 @@ mod tests {
             metric(&metrics, LOOP_DEATHS_TOTAL, "census_probe"),
             Some(0.0)
         );
+        // A loop that did not declare a work budget publishes a zero rather than
+        // nothing: the rule does arithmetic with this series, and a loop missing
+        // from one side of a sum would drop out of the judgement entirely.
+        assert_eq!(
+            metric(&metrics, LOOP_WORK_BUDGET_SECONDS, "census_probe"),
+            Some(0.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_loop_whose_cycle_does_unbounded_work_publishes_its_own_bound() {
+        let readings = LoopHealth::new();
+        readings.register(
+            "long_cycle_probe",
+            Cadence::PeriodicWithWork {
+                period: Duration::from_secs(300),
+                work: Duration::from_secs(9000),
+            },
+        );
+        let metrics = collect(&readings).await;
+        // The period is still the period: it is what a human reads as "how often
+        // this loop wakes", and widening it to cover the work would have hidden a
+        // loop that stopped waking.
+        assert_eq!(
+            metric(&metrics, LOOP_PERIOD_SECONDS, "long_cycle_probe"),
+            Some(300.0)
+        );
+        assert_eq!(
+            metric(&metrics, LOOP_WORK_BUDGET_SECONDS, "long_cycle_probe"),
+            Some(9000.0)
+        );
+    }
+
+    /// The restart wait spans the period and not the work budget: the budget is
+    /// time the loop spends working, and waiting it out would delay the repair by
+    /// the length of the thing that is not being repaired.
+    #[test]
+    fn the_restart_wait_spans_the_period_and_not_the_work_budget() {
+        let settings = RestartSettings::default();
+        let with_work = RestartPolicy::for_cadence(
+            Cadence::PeriodicWithWork {
+                period: Duration::from_secs(60),
+                work: Duration::from_secs(9000),
+            },
+            settings,
+        );
+        let period_only =
+            RestartPolicy::for_cadence(Cadence::Periodic(Duration::from_secs(60)), settings);
+        assert_eq!(with_work.backoff, period_only.backoff);
+        assert_eq!(with_work.backoff_max, period_only.backoff_max);
     }
 
     #[tokio::test]
@@ -1458,10 +1593,18 @@ mod tests {
                 .unwrap_or_else(|| panic!("rule {name} missing"))
         };
 
+        // The wall is the declared period *and* the declared work budget, and
+        // both have to appear for the same reason the period does: a loop whose
+        // cycle runs a build declares the bound on that work, and a rule that
+        // compared the age against the period alone would fire on every healthy
+        // cycle of exactly the loops that declared the most.
         let stalled = find(STALL_RULE);
         assert!(
-            stalled.contains(LOOP_TICK_AGE_SECONDS) && stalled.contains(LOOP_PERIOD_SECONDS),
-            "rule {STALL_RULE} must compare the age against the declared period, got: {stalled}"
+            stalled.contains(LOOP_TICK_AGE_SECONDS)
+                && stalled.contains(LOOP_PERIOD_SECONDS)
+                && stalled.contains(LOOP_WORK_BUDGET_SECONDS),
+            "rule {STALL_RULE} must compare the age against the declared period and work \
+             budget, got: {stalled}"
         );
 
         let died = find(DEATH_RULE);

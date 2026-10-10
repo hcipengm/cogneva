@@ -69,7 +69,61 @@ const VERIFICATION_ENV_PASSTHROUGH: &[&str] = &[
 /// Default wall-clock bound on the format check. Formatted-or-not is settled by
 /// parsing every file in the workspace, which takes seconds; a run that
 /// outlives this bound is a hung `rustfmt`, not a large workspace.
-const DEFAULT_FMT_TIMEOUT_SECS: u64 = 60;
+pub(crate) const DEFAULT_FMT_TIMEOUT_SECS: u64 = 60;
+
+/// [`ChangePipeline::run_cargo_fmt`] 里最多几趟命令：探针、判、改写、复判。
+/// 判干净就提前返回，所以这是上界不是次数。
+const FMT_CMDS_PER_RUN_FMT: u64 = 4;
+
+/// `run_cargo_fmt` 之外直接跑的那趟基线检查（apply 之前，读这棵树本来就
+/// 是不是格式化过的样子）。
+const FMT_BASELINE_CHECKS_PER_CHANGE: u64 = 1;
+
+/// `run_cargo_fmt` 在一条变更里最多被调用几次：apply 之后那趟，加上测试失败后
+/// 读基线失败集合的那趟。
+const FMT_RUNS_PER_CHANGE: u64 = 2;
+
+/// 一条变更在格式化这一段上最长的墙钟时间。
+///
+/// 这一段既不被宿主构建槽约束、也不被任何单一超时约束，只能按"最多跑几趟命令"
+/// 封顶。验证循环把它加进自己声明的工期界里，所以它必须是数出来的：
+/// `the_one_change_wall_counts_every_call_site_it_names` 数着源码里的调用点守着
+/// 上面那三个数，免得加了新调用点而界还停在旧值上。
+pub(crate) const FMT_SEGMENT_WALL_SECS: u64 = DEFAULT_FMT_TIMEOUT_SECS
+    * (FMT_BASELINE_CHECKS_PER_CHANGE + FMT_RUNS_PER_CHANGE * FMT_CMDS_PER_RUN_FMT);
+
+/// 一条变更要跑几条吃**测试**预算的命令：`run_cargo_clippy` 一条，
+/// `run_test_command` 两条（套件一条，测试失败后读基线失败集合再一条）。
+const TEST_BUDGET_RUNS_PER_CHANGE: u64 = 3;
+
+/// 吃**构建**预算的那一条：发布构建，它的 acquire 在 `evolution_deployer` 里。
+const BUILD_BUDGET_RUNS_PER_CHANGE: u64 = 1;
+
+/// 一条变更上不受节拍约束的那几段活的墙钟上界——一个心跳到下一个心跳之间最长
+/// 的一段。加的是三段：
+///
+/// - 每条 gated 命令各排一次宿主构建槽。闸门每次排队给的界是 `gate_wait_secs`；
+///   闸门关着（或并发上限为 0）时调用方传 0，那时 acquire 不排队。
+/// - 每条命令各吃一份自己的超时预算：`run_cargo_clippy` 与两条
+///   `run_test_command` 吃测试预算，发布构建吃构建预算。
+/// - 格式化那一段，见 [`FMT_SEGMENT_WALL_SECS`]。
+///
+/// 谁在读它：`reflection_change_verification` 把它声明成
+/// [`cog_core::loop_health::Cadence::PeriodicWithWork`] 的工期界。**声明节拍的人
+/// 和拿这个数当存活界的人，量的必须是同一段活**——所以这里加的全是强制那几段活
+/// 的数，不是挑一个整数把规则按住。
+pub(crate) fn one_change_wall_secs(
+    gate_wait_secs: u64,
+    test_budget_secs: u64,
+    build_budget_secs: u64,
+) -> u64 {
+    // 每条 gated 命令恰好 acquire 一次，所以排队次数就是命令条数。
+    let gate_waits = TEST_BUDGET_RUNS_PER_CHANGE + BUILD_BUDGET_RUNS_PER_CHANGE;
+    gate_waits * gate_wait_secs
+        + TEST_BUDGET_RUNS_PER_CHANGE * test_budget_secs
+        + BUILD_BUDGET_RUNS_PER_CHANGE * build_budget_secs
+        + FMT_SEGMENT_WALL_SECS
+}
 
 /// Resolve the environment for the verification test process: the passthrough
 /// set as reported by `get`, plus an explicit target directory.
@@ -2125,6 +2179,72 @@ fn names_same_or_nested(target: &str, anchor: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`one_change_wall_secs`] 加的是哪几段活、`FMT_SEGMENT_WALL_SECS` 那个数
+    /// 乘的是哪几趟命令，都是数着源码里的调用点写下来的。加一条 gated 命令、
+    /// 或让 `run_cargo_fmt` 多跑一趟，界就少算一段——而界少了的症状是停摆告警
+    /// 在健康的轮上响，所以调用点数必须钉住。这里数的都是**生产**调用点：测试
+    /// 模块里那几处调用带着 `root.path()` 这种实参，与下面这些模式不匹配。
+    #[test]
+    fn the_one_change_wall_counts_every_call_site_it_names() {
+        const PIPELINE: &str = include_str!("change_pipeline.rs");
+        const DEPLOYER: &str = include_str!("evolution_deployer.rs");
+        // 只看 `#[cfg(test)]` 之前那一段：这个测试自己的源码里也写着下面这些
+        // 模式串，整份数会把测试自己数进去。本文件的测试模块在文件末尾。
+        let before_tests = |src: &'static str| src.split("#[cfg(test)]").next().unwrap_or(src);
+        let pipeline = before_tests(PIPELINE);
+        let deployer = before_tests(DEPLOYER);
+
+        // 每条 gated 命令**函数**里恰好一次 acquire：测试与 clippy 两条在流水线里，
+        // 发布构建一条在部署器里。
+        let acquire_sites = pipeline.matches("build_gate::acquire(").count()
+            + deployer.matches("build_gate::acquire(").count();
+        assert_eq!(acquire_sites, 3, "gated 命令的函数个数变了");
+
+        // 吃测试预算的：clippy 一条，套件与读基线失败集合各一次。
+        let test_runs = pipeline.matches("self.run_test_command(").count();
+        assert_eq!(
+            pipeline.matches("self.run_cargo_clippy(").count(),
+            1,
+            "run_cargo_clippy 的调用点数变了"
+        );
+        assert_eq!(
+            test_runs as u64 + 1,
+            TEST_BUDGET_RUNS_PER_CHANGE,
+            "吃测试预算的命令 = clippy 一条 + run_test_command 那几条"
+        );
+
+        // 排队次数 = acquire 点 + run_test_command 多走的那一次。
+        assert_eq!(
+            acquire_sites as u64 + (test_runs as u64 - 1),
+            TEST_BUDGET_RUNS_PER_CHANGE + BUILD_BUDGET_RUNS_PER_CHANGE,
+            "构建槽排队次数与它该覆盖的命令条数对不上了"
+        );
+
+        // 格式化那一段：run_cargo_fmt 里几趟命令，加外面那趟基线检查。
+        assert_eq!(
+            FMT_RUNS_PER_CHANGE as usize,
+            pipeline.matches("self.run_cargo_fmt(").count(),
+            "run_cargo_fmt 的调用点数变了"
+        );
+        assert_eq!(
+            pipeline.matches(".run_cargo_fmt_cmd(").count() as u64,
+            FMT_BASELINE_CHECKS_PER_CHANGE + FMT_CMDS_PER_RUN_FMT,
+            "格式化命令的调用点数变了：run_cargo_fmt 里那几处加外面那趟基线检查"
+        );
+
+        // 加数与用法：界是"每条命令一份等待 + 一份预算"，没有别的东西混进来。
+        assert_eq!(
+            one_change_wall_secs(0, 0, 0),
+            FMT_SEGMENT_WALL_SECS,
+            "闸门与预算都是 0 时剩下的只能是格式化那一段"
+        );
+        assert_eq!(
+            one_change_wall_secs(1, 10, 100),
+            4 + 30 + 100 + FMT_SEGMENT_WALL_SECS,
+            "每条 gated 命令一份等待，测试预算三条、构建预算一条"
+        );
+    }
 
     /// The seeded source of the formatting fixtures: line 2 is the line the two
     /// tests change, so they differ in nothing else.

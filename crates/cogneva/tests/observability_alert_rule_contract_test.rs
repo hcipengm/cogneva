@@ -214,6 +214,14 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_loop_period_seconds",
         "crates/cog-core/src/loop_health.rs",
     ),
+    // The work a cycle may run without a beat: the stall rule adds it to the
+    // period, because a cadence bounds only the wait between cycles and a loop
+    // whose cycle runs a build would age past a multiple of its own period by
+    // construction.
+    (
+        "cogneva_loop_work_budget_seconds",
+        "crates/cog-core/src/loop_health.rs",
+    ),
     (
         "cogneva_loop_tick_age_seconds",
         "crates/cog-core/src/loop_health.rs",

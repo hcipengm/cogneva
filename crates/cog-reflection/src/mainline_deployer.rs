@@ -139,6 +139,50 @@ const SEED_TAG: &str = "seed";
 /// 对应写下的名字，`tag_rev` 与 `main_tag` 两端都取它。
 const MAIN_TAG_PREFIX: &str = "main-";
 
+/// 一轮里最多回收几批镜像库里的老镜像（每批 [`BUILDAH_RMI_BATCH_CHUNK`] 张）。
+///
+/// 计划本身不设上限是有意的（见 `buildah_store`：保留集就是那个上限，给"可重建的
+/// 缓存"再钉一个数是没人要的数）。但**一轮做多少**必须有个头：这一轮要向存活判据
+/// 声明自己的工期界，而一条每批 900 秒、批数随库存变的回收循环，会让那个界没法
+/// 存在——库存涨起来时，同一条循环可以从"一轮一分钟"变成"一轮几小时"而没有一次
+/// 心跳。删不完的留给下一轮，回收是幂等的。
+const BUILDAH_RMI_BATCHES_PER_ROUND: u64 = 2;
+
+/// 回收那一轮里每批删几张。与 [`BUILDAH_RMI_BATCHES_PER_ROUND`] 一起构成这一段
+/// 一轮的上界。
+const BUILDAH_RMI_BATCH_CHUNK: usize = 32;
+
+/// 构建那一段里 strip 那一跳的墙钟上界。与 cargo 构建分成两跳（失败不致命），
+/// 所以构建那一段的墙是"cargo 的墙 + 这个数"。
+const STRIP_WALL_SECS: u64 = 60;
+
+/// 打镜像每一步各自的墙钟上界。步名说的是这一步在干什么，不是 buildah 的子命令
+/// 名——同一个子命令在两条路径上的墙不同（`images --json` 要列整个库，`images -q`
+/// 只问一个 tag 在不在），按子命令归并就把其中一条的墙挪到了另一条上。
+///
+/// **这表是这些墙的唯一来源**：每条命令经 [`MainlineDeployer::buildah_step`] 从表里
+/// 取自己的墙（取不到就 panic，绝不回落到字面量），这一轮声明出去的工期界也从这
+/// 张表取最长的那个（[`MainlineDeployer::round_work_secs`]）。两处各写一个数，就
+/// 等于让"声明节拍的人"和"卡住命令的人"量两个不同的数，读到的界也就不再是这条
+/// 循环真正在跑的那个界。
+const BUILDAH_STEP_WALLS: &[(&str, u64)] = &[
+    ("base-from", 1800),
+    ("release-container", 60),
+    ("copy-binary", 300),
+    ("copy-asset", 300),
+    ("copy-manifest", 60),
+    ("check-version", 120),
+    ("label-revision", 60),
+    ("commit-image", 600),
+    ("push-image", 900),
+    ("list-store", 300),
+    ("tag-presence", 30),
+    ("remove-images", 900),
+    ("promote-pull", 900),
+    ("promote-tag", 60),
+    ("promote-push", 900),
+];
+
 /// 稳定叠层基底的 tag：`<registry>/cogneva:seed`。
 ///
 /// overlay 的基底不该是"上一个 rev 的镜像"。基于它时每张新镜像都**包含着
@@ -1977,6 +2021,13 @@ pub struct MainlineDeployer {
     /// （冷却由此成立，跑不完也记），拿它当"上次走完"会把两件事顶替掉。这一格的耐久
     /// 副本是这条读数自己——它落在共享表里，判据见 `seed_registry_reading`。
     registry_reading_seeded: std::sync::atomic::AtomicBool,
+    /// 本循环的心跳句柄，由 [`run_mainline_loop`] 在循环体里装载。
+    ///
+    /// 装在这里而不是层层传参：`buildah` 在调用栈的底（步与步之间隔着好几层
+    /// 函数），而需要打点的恰好就是它。装载只在循环里发生——一次性调用路径不发布
+    /// 存活读数，也就没有该打的点。循环被重启时拿到的是同一登记项的克隆，重装是
+    /// 幂等的（第一次赢）。
+    loop_beat: std::sync::OnceLock<cog_core::loop_health::Beat>,
 }
 
 /// 平台读失败的四支——只有在这一层还分得开。
@@ -2078,7 +2129,13 @@ impl MainlineDeployer {
             governance_drift: None,
             buildah_reading_seeded: std::sync::atomic::AtomicBool::new(false),
             registry_reading_seeded: std::sync::atomic::AtomicBool::new(false),
+            loop_beat: std::sync::OnceLock::new(),
         }
+    }
+
+    /// 装载本循环的心跳句柄；步与步之间打的点落在这一格上。
+    fn set_loop_beat(&self, beat: cog_core::loop_health::Beat) {
+        let _ = self.loop_beat.set(beat);
     }
 
     /// Report the version contract's own readings.
@@ -2214,12 +2271,58 @@ impl MainlineDeployer {
     }
 
     /// buildah 子命令统一加 PVC 存储全局参数（全局参数必须在子命令前）。
+    ///
+    /// 开工前先往本循环的心跳上打一次点：一轮里的步数由资产条数决定（每份资产一步
+    /// `copy`），所以"一轮"这个粒度当不了存活界读——那不是两跳之间的空档，而是一轮
+    /// 里第几份资产。在每一步的边界上打点之后，两跳之间的空档就恒等于最长的那一步，
+    /// 界才只用覆盖它，也才对得上 [`MainlineDeployer::round_work_secs`] 声明的那个数。
+    /// 一次性调用路径（没有循环在跑）不装载句柄，打点自然不发生。
     async fn buildah(&self, args: &[&str], timeout_secs: u64) -> SFResult<String> {
+        if let Some(beat) = self.loop_beat.get() {
+            beat.beat();
+        }
         let (root, runroot) = (buildah_storage(), buildah_runroot());
         let mut full: Vec<&str> = vec!["--root", &root, "--runroot", &runroot];
         full.extend_from_slice(args);
         self.run_cmd(&self.cfg.builder_bin, &full, None, timeout_secs)
             .await
+    }
+
+    /// 按步名跑一条 buildah 子命令，墙钟上界取自 [`BUILDAH_STEP_WALLS`]。
+    ///
+    /// 这个包装存在的理由只有一个：让"这条命令最多跑多久"只有一个来源。直接传
+    /// 字面量的话，这一轮声明出去的工期界与命令实际被卡的时长就是两份数——而它们
+    /// 一旦分家，界少算了不会报错，只会让停摆告警在健康的轮上响。
+    async fn buildah_step(&self, step: &str, args: &[&str]) -> SFResult<String> {
+        let wall = BUILDAH_STEP_WALLS
+            .iter()
+            .find(|(name, _)| *name == step)
+            .map(|(_, wall)| *wall)
+            .unwrap_or_else(|| {
+                panic!("{step} 不是 BUILDAH_STEP_WALLS 里声明的步骤：加上它，或者别从这里走")
+            });
+        self.buildah(args, wall).await
+    }
+
+    /// 最长的一步能卡多久——`buildah` 每次开工前都打点，所以这是"两跳之间"能有多长
+    /// 的那个被卡住的步长。
+    fn buildah_max_step_wall_secs() -> u64 {
+        BUILDAH_STEP_WALLS
+            .iter()
+            .map(|(_, wall)| *wall)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// 这条循环向存活判据声明的一轮工期界：两跳之间**最长**的那段活能干多久。
+    ///
+    /// 取"构建那一段 + 最长的一步"而不是一轮里所有段的和：`buildah` 每开一步之前
+    /// 各打一次点，所以两跳之间不可能夹着整轮的活，只可能是相邻的两段——而相邻两段
+    /// 里最长的那一对就是"cargo 构建（加上后一跳 strip）"和"最长的一步"。求和会把界
+    /// 随资产条数线性放大（每份资产一步 `copy`），而界只会越放越松，放到最后等于把
+    /// 这条规则关掉。
+    fn round_work_secs(&self) -> u64 {
+        self.cfg.build_timeout_secs + STRIP_WALL_SECS + Self::buildah_max_step_wall_secs()
     }
 
     async fn kubectl(&self, args: &[&str], timeout_secs: u64) -> SFResult<String> {
@@ -3803,7 +3906,7 @@ impl MainlineDeployer {
         };
         let store = crate::sandbox::buildah_store_dir();
         let storage = store.join("storage");
-        let inventory = match self.buildah(&["images", "--json"], 300).await {
+        let inventory = match self.buildah_step("list-store", &["images", "--json"]).await {
             Ok(body) => body,
             Err(e) => {
                 warn!(error = %e, "the buildah store could not be listed; nothing was removed");
@@ -3892,17 +3995,26 @@ impl MainlineDeployer {
     ) -> BuildahPass {
         // 分批：一次几百个参数的命令一旦超时，整批都算白跑；批小一点，失败只落在
         // 那一批上。
-        for chunk in doomed.chunks(32) {
+        //
+        // 一轮只做 [`BUILDAH_RMI_BATCHES_PER_ROUND`] 批，删不完的留给下一轮（幂等）：
+        // 批数随库存涨，一轮的时长也就随库存涨，而这一轮要向存活判据声明自己的工期
+        // 界。按 id 排一次序，让"这一轮删哪几批"不取决于库存的排列。
+        let mut doomed = doomed.to_vec();
+        doomed.sort_by(|a, b| a.id.cmp(&b.id));
+        for chunk in doomed
+            .chunks(BUILDAH_RMI_BATCH_CHUNK)
+            .take(BUILDAH_RMI_BATCHES_PER_ROUND as usize)
+        {
             let mut args: Vec<String> = vec!["rmi".into()];
             args.extend(chunk.iter().map(|image| image.id.clone()));
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            if let Err(e) = self.buildah(&refs, 900).await {
+            if let Err(e) = self.buildah_step("remove-images", &refs).await {
                 // 账不在这里记：下面那次重读才是账。
                 warn!(error = %e, "a batch of base images could not be removed");
             }
         }
         let survivors: Option<HashSet<String>> = match self
-            .buildah(&["images", "--json"], 300)
+            .buildah_step("list-store", &["images", "--json"])
             .await
         {
             Ok(body) => match crate::buildah_store::parse_inventory(&body) {
@@ -4914,7 +5026,12 @@ impl MainlineDeployer {
         // strip 失败不致命（二进制可跑，只是体积大）。
         let bin = self.target_dir().join("release/cogneva");
         let _ = self
-            .run_cmd("strip", &[bin.to_str().unwrap_or("")], None, 60)
+            .run_cmd(
+                "strip",
+                &[bin.to_str().unwrap_or("")],
+                None,
+                STRIP_WALL_SECS,
+            )
             .await;
         Ok(())
     }
@@ -4926,11 +5043,11 @@ impl MainlineDeployer {
         // "http: server gave HTTP response to HTTPS client"，与 push 一样
         // 必须显式关 TLS 校验。
         let ctr = self
-            .buildah(&["from", "--tls-verify=false", base], 1800)
+            .buildah_step("base-from", &["from", "--tls-verify=false", base])
             .await?;
         let ctr = ctr.trim().to_string();
         let result = self.buildah_steps(&ctr, rev, new_tag).await;
-        if let Err(e) = self.buildah(&["rm", &ctr], 60).await {
+        if let Err(e) = self.buildah_step("release-container", &["rm", &ctr]).await {
             warn!(error = %e, "buildah rm failed after build");
         }
         result?;
@@ -4983,15 +5100,18 @@ impl MainlineDeployer {
         }
         let assets = self.asset_list().await;
         let bin = self.target_dir().join("release/cogneva");
-        self.buildah(
+        self.buildah_step(
+            "copy-binary",
             &["copy", ctr, bin.to_str().unwrap(), OVERLAY_BINARY_DEST],
-            300,
         )
         .await?;
         for entry in &assets {
             let src = self.workdir().join(&entry.from);
-            self.buildah(&["copy", ctr, src.to_str().unwrap(), &entry.to], 300)
-                .await?;
+            self.buildah_step(
+                "copy-asset",
+                &["copy", ctr, src.to_str().unwrap(), &entry.to],
+            )
+            .await?;
         }
 
         // 把这次拷进去的是什么记进镜像本身，好让**跑最新代码的那一侧**——应用
@@ -5013,22 +5133,22 @@ impl MainlineDeployer {
         let manifest_path = Path::new(&self.cfg.state_dir).join("runtime-assets.json");
         std::fs::write(&manifest_path, manifest)
             .map_err(|e| SFError::IO(format!("write {}: {e}", manifest_path.display())))?;
-        self.buildah(
+        self.buildah_step(
+            "copy-manifest",
             &[
                 "copy",
                 ctr,
                 manifest_path.to_str().unwrap(),
                 crate::runtime_assets::RUNTIME_ASSET_MANIFEST_DEST,
             ],
-            60,
         )
         .await?;
 
         // 换版即验证：新二进制必须能自报版本，且内嵌 rev 是目标 rev。
         let version = self
-            .buildah(
+            .buildah_step(
+                "check-version",
                 &["run", ctr, "--", "/opt/cogneva/cogneva", "--version"],
-                120,
             )
             .await?;
         if !version.contains(rev12(rev)) {
@@ -5038,21 +5158,22 @@ impl MainlineDeployer {
             )));
         }
 
-        self.buildah(
+        self.buildah_step(
+            "label-revision",
             &[
                 "config",
                 "--label",
                 &format!("org.opencontainers.image.revision={rev}"),
                 ctr,
             ],
-            60,
         )
         .await?;
-        self.buildah(&["commit", ctr, new_tag], 600).await?;
+        self.buildah_step("commit-image", &["commit", ctr, new_tag])
+            .await?;
 
         // 只推不可变 tag；浮动签 :local 在滚动收敛后由 promote_local_tag 前移，
         // 防止构建失败/回滚的坏镜像成为静态清单 apply 的回退锚点。
-        self.buildah(&["push", "--tls-verify=false", new_tag], 900)
+        self.buildah_step("push-image", &["push", "--tls-verify=false", new_tag])
             .await?;
         info!(image = %new_tag, "mainline overlay image pushed to registry");
         Ok(())
@@ -5065,16 +5186,17 @@ impl MainlineDeployer {
         let immutable = main_image(&self.push_endpoint(), rev);
         let local = local_image(&self.push_endpoint());
         let present = self
-            .buildah(&["images", "-q", &immutable], 30)
+            .buildah_step("tag-presence", &["images", "-q", &immutable])
             .await?
             .trim()
             .to_string();
         if present.is_empty() {
-            self.buildah(&["pull", "--tls-verify=false", &immutable], 900)
+            self.buildah_step("promote-pull", &["pull", "--tls-verify=false", &immutable])
                 .await?;
         }
-        self.buildah(&["tag", &immutable, &local], 60).await?;
-        self.buildah(&["push", "--tls-verify=false", &local], 900)
+        self.buildah_step("promote-tag", &["tag", &immutable, &local])
+            .await?;
+        self.buildah_step("promote-push", &["push", "--tls-verify=false", &local])
             .await?;
         info!(rev = %rev12(rev), tag = %local, "floating :local advanced to converged revision");
         Ok(())
@@ -6046,14 +6168,25 @@ pub async fn run_mainline_loop(
     // something a rule can read: without a stamp, a deployer that stopped looks
     // exactly like a main that needs no work. The supervised shape adds the other
     // half — a body that panics is run again and the restart is counted.
+    // 这一轮干的活与它的节拍不是一回事：`interval` 卡住的只是两次轮之间的等待，
+    // 而一轮里可能是 cargo 构建加十几条 buildah 子命令。声明出去的工期界必须覆盖
+    // 后者，否则每一个真在干活的轮都会被读成"停摆"——被判据卡住的恰恰是健康的那
+    // 些轮（见 `round_work_secs`）。
+    let work = Duration::from_secs(deployer.round_work_secs());
     let _ = cog_core::loop_health::spawn(
         MAINLINE_DEPLOYER_LOOP,
-        cog_core::loop_health::Cadence::Periodic(interval),
+        cog_core::loop_health::Cadence::PeriodicWithWork {
+            period: interval,
+            work,
+        },
         shutdown.clone(),
         move |beat| {
             let deployer = std::sync::Arc::clone(&deployer);
             let shutdown = shutdown.clone();
             async move {
+                // 心跳句柄装进部署器：一轮里的每一跳由 `buildah` 自己打（步与步之间
+                // 隔着好几层函数，只有它两头都够得着）。
+                deployer.set_loop_beat(beat.clone());
                 let mut ticker = tokio::time::interval(interval);
                 // Last heartbeat is per attempt: a restarted loop re-logs on its
                 // first tick, which is the honest reading of "the loop started".
@@ -21455,5 +21588,66 @@ exit 0
             1.0,
             "折了的那一轮不该动 ok 那一格"
         );
+    }
+
+    /// 声明的工期界与命令实际被卡的时长必须同源：每条 buildah 命令都得从
+    /// [`BUILDAH_STEP_WALLS`] 里取墙，表里也不许留一条没人走的步。
+    ///
+    /// 两处各写一个数不会编译不过、也不会跑出错——它只会让界算少了，而界算少了的
+    /// 表现是停摆告警在**健康**的轮上响。所以这条判据读源码，不读行为：一条新加的
+    /// `self.buildah(...)` 字面量、一条只在表里存在的步名、把某个步名走两次，都要
+    /// 在这里红。
+    #[test]
+    fn every_buildah_call_takes_its_wall_from_the_table() {
+        let production = include_str!("mainline_deployer.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the file has a production half");
+
+        // 唯一的 `self.buildah(` 就是包装自己那一跳。
+        assert_eq!(
+            production.matches(".buildah(").count(),
+            1,
+            "除 buildah_step 之外还有直接调用：那里的墙绕过了表，界就算不到它"
+        );
+
+        // `buildah_step("...")` 的步名；定义体那一处（`fn buildah_step(&self,`）
+        // 因为下一个非空白字符不是引号，自然落选。
+        let called: Vec<&str> = production
+            .match_indices("buildah_step(")
+            .filter_map(|(at, _)| {
+                production[at + "buildah_step(".len()..]
+                    .trim_start()
+                    .strip_prefix('"')
+                    .map(|quoted| quoted.split('"').next().unwrap_or_default())
+            })
+            .collect();
+
+        // 表项 `("步名", 墙)`。
+        let table = production
+            .split("const BUILDAH_STEP_WALLS")
+            .nth(1)
+            .and_then(|rest| rest.split("];").next())
+            .expect("BUILDAH_STEP_WALLS is declared");
+        let declared: Vec<&str> = table
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("(\""))
+            .map(|entry| entry.split('"').next().unwrap_or_default())
+            .collect();
+
+        assert!(!declared.is_empty(), "the table declares no step");
+        for name in &called {
+            assert!(
+                declared.contains(name),
+                "{name} 走了 buildah_step 却不在 BUILDAH_STEP_WALLS 里：这条命令有多长，界不知道"
+            );
+        }
+        for name in &declared {
+            assert!(
+                called.contains(name),
+                "{name} 在表里声明了墙却没人走：界被一条不存在的步撑大了"
+            );
+        }
+        // 一个步名走两次是允许的（库存前后各读一次），界取的是最长的一步，不看条数。
     }
 }

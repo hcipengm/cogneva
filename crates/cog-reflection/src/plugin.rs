@@ -1048,6 +1048,34 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     let poll_interval =
                         std::time::Duration::from_secs(self_evolution.poll_interval_secs);
 
+                    // 一轮里的活不受节拍约束：一轮要把队列里的待验变更全部消费完，而
+                    // 一条变更要过三次宿主构建槽、跑三条各自的超时封顶的命令。心跳在
+                    // 轮首打一次、之后每消费完一条变更再打一次，所以这个界要盖住的是
+                    // **一条**变更——队列有多长这条循环才知道，声明的数不能是队列总和。
+                    //
+                    // 一条变更的活：三次构建槽排队（闸门 wait_secs，闸门关着时不排队）
+                    // 之后各跑一条命令——clippy 与测试各吃一份测试预算、发布构建吃一份
+                    // 构建预算——再加格式化那一段（每趟封在 fmt 预算上，趟数见
+                    // `FMT_SEGMENT_WALL_SECS`）。三段都取自强制它们的那几个数，不是
+                    // 挑一个整数把规则按住。
+                    //
+                    // Job 那条执行路径不用另外算：它的等待预算（deadline + 余量，默认
+                    // 9900 秒）本来就短于这里算出来的进程内上界，盖得住。
+                    let gate_wait_secs = if self_evolution.build_gate.enabled
+                        && self_evolution.build_gate.max_concurrent > 0
+                    {
+                        self_evolution.build_gate.wait_secs
+                    } else {
+                        0
+                    };
+                    let one_change_work = std::time::Duration::from_secs(
+                        crate::change_pipeline::one_change_wall_secs(
+                            gate_wait_secs,
+                            budget.timeout_secs(crate::verification_budget::KIND_TEST),
+                            budget.timeout_secs(crate::verification_budget::KIND_BUILD),
+                        ),
+                    );
+
                     let Some(cycle_workspaces) = self.workspaces.clone() else {
                         warn!("workspace allocator unavailable; self-evolution cycle disabled");
                         self.initialized = true;
@@ -1064,7 +1092,10 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     // own, so any end means pending changes stop being verified.
                     drop(cog_core::loop_health::spawn_unstoppable(
                         CHANGE_VERIFICATION_LOOP,
-                        cog_core::loop_health::Cadence::Periodic(poll_interval),
+                        cog_core::loop_health::Cadence::PeriodicWithWork {
+                            period: poll_interval,
+                            work: one_change_work,
+                        },
                         // Rebuilt per attempt, so everything the body consumes is
                         // cloned here.
                         move |beat| {
@@ -1140,6 +1171,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                                         world: &world,
                                         budget: &cycle_budget,
                                         build_readings: &cycle_build_readings,
+                                        beat: &beat,
                                     };
                                     if let Err(e) =
                                         run_evolution_cycle(deps, &cycle_instance, &cycle_version)
@@ -2010,6 +2042,10 @@ struct CycleDeps<'a> {
     /// 做出（只有它知道 cargo 是被预算杀的还是自己失败的），所以它的记账要在这里
     /// 补上——否则这个族在开关打开之后会安静地少掉那部分构建。
     build_readings: &'a Arc<crate::evolution_build_readings::EvolutionBuildReadings>,
+    /// 本轮循环的心跳句柄。一轮消费多条变更，而每一条的活都可能长过声明的节拍；
+    /// 逐条打点把"上一跳到现在"这一段收窄到**一条**变更，声明的工期界才盖得住。
+    /// 只在轮首打点的话，界就得是整队之和，而那个数这条循环自己也不知道。
+    beat: &'a cog_core::loop_health::Beat,
 }
 
 /// 把两条输入通道汇合成本轮要验证的变更集合。
@@ -2810,6 +2846,9 @@ async fn run_evolution_cycle_in(
     // 派满窗口、收最老的那条、再补派。窗口为 1（默认，也是进程内那条路）时，
     // 这就是从前那个逐条循环：派一条、收一条、消费一条，顺序一字不差。
     while next < changes.len() || !inflight.is_empty() {
+        // 逐条打点：上一跳到这一跳之间只有窗口里那些变更的活，声明的工期界盖的是
+        // 一条。打完点再派，所以这一跳盖的是"接下来这一条"，而不是"刚过去那一条"。
+        deps.beat.beat();
         while inflight.len() < window && next < changes.len() {
             let change = changes[next].clone();
             next += 1;
