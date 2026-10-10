@@ -180,6 +180,7 @@ async fn spawn_app_full(
         observability_gateway: None,
         connection_manager: None,
         wiki_adapter: None,
+        knowledge_backend: None,
         user_store: None,
         platform_identities: None,
         contribution_control: None,
@@ -1065,6 +1066,55 @@ async fn e2e_trace_context_propagation() {
     assert!(
         matched,
         "RawLogger should contain a record with the injected trace_id and span_id"
+    );
+
+    app.shutdown.trigger();
+}
+
+// ─── Test 15: Knowledge layer search route ───────────────────────────
+
+/// The assembled knowledge layer — the composition of the memory and wiki
+/// stores, reranker included — answers on a route of its own. This app wires
+/// the two stores but publishes no such layer, and the difference has to stay
+/// visible: a caller must not read "the layer was never assembled" as "the
+/// layer found nothing".
+#[tokio::test]
+async fn e2e_knowledge_search_reports_an_unassembled_layer() {
+    let Some(app) = spawn_app(false, None).await else {
+        return;
+    };
+    let token = app.bearer_token().await;
+    let body = serde_json::json!({"query": "Charlie", "top_k": 5}).to_string();
+
+    let (status, json) = req_oneshot(
+        app.state.clone(),
+        "POST",
+        "/api/v1/knowledge/search",
+        Body::from(body.clone()),
+        Some(token),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an unassembled layer is a service that cannot answer, not an empty answer"
+    );
+    assert_eq!(json["error"], "knowledge backend disabled");
+
+    // The same route without credentials: it rides the authenticated face, so
+    // an anonymous caller is turned away rather than answered.
+    let (status, _) = req_oneshot(
+        app.state.clone(),
+        "POST",
+        "/api/v1/knowledge/search",
+        Body::from(body),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the route must sit behind auth, not beside it"
     );
 
     app.shutdown.trigger();

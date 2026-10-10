@@ -43,6 +43,7 @@ pub mod github_app;
 pub mod heartbeat_history;
 pub mod hook_forwarder;
 pub mod hooks;
+pub mod knowledge;
 pub mod llm_admin;
 pub mod memory;
 pub mod notifications;
@@ -112,6 +113,14 @@ pub struct GatewayState {
     pub hook_engine: Option<Arc<dyn cog_core::HookEngine>>,
     pub connection_manager: Option<Arc<websocket_protocol::ConnectionManager>>,
     pub wiki_adapter: Option<Arc<dyn cog_core::WikiBackend>>,
+    /// The assembled knowledge layer (memory + wiki, hybrid retrieval and
+    /// reranking included), published by the wiki plugin. Separate from
+    /// [`Self::memory_backend`] and [`Self::wiki_adapter`] beside it: those are
+    /// the individual stores, which answer with what one store holds, while
+    /// this one is the composition a retrieval actually consults. `None` when
+    /// the layer was not published, which is what the search route reports
+    /// instead of answering with an empty result.
+    pub knowledge_backend: Option<Arc<dyn cog_core::KnowledgeBackend>>,
     pub user_store: Option<Arc<dyn cog_core::UserStore>>,
     /// Platform identity store (GitHub/Gitee account ↔ local user linkage).
     /// Present whenever the PG user store is wired.
@@ -836,6 +845,7 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route("/api/v1/wiki/info", get(wiki::info_handler))
         .route("/api/v1/wiki/document", get(wiki::get_document_handler))
         .route("/api/v1/wiki/search", post(wiki::search_handler))
+        .route("/api/v1/knowledge/search", post(knowledge::search_handler))
         .route("/api/v1/sessions", get(sessions::list_sessions_handler))
         .route("/api/v1/sessions", post(sessions::create_session_handler))
         .route("/api/v1/sessions/{id}", get(sessions::get_session_handler))

@@ -193,6 +193,7 @@ async fn build_test_state() -> Option<AutonomousTestState> {
         observability_gateway: None,
         connection_manager: None,
         wiki_adapter: None,
+        knowledge_backend: None,
         user_store: None,
         platform_identities: None,
         contribution_control: None,

@@ -159,6 +159,10 @@ impl cog_core::SystemPlugin for GatewayPlugin {
         // 外部提交的价值判定落到存储面，由持有共用库的插件发布；本进程只拿写面。
         let taste_intent_sink: Option<Arc<dyn cog_core::TasteIntentSink>> =
             ctx.consume_service::<dyn cog_core::TasteIntentSink>();
+        // 组装好的知识层（memory + wiki 的合成体，含混合检索与重排），由 wiki 插件发布。
+        // 它和上面那两个 backend 不是一回事：那两个是各自的店，这个是检索真正去问的那一层。
+        let knowledge_backend: Option<Arc<dyn cog_core::KnowledgeBackend>> =
+            ctx.consume_service::<dyn cog_core::KnowledgeBackend>();
 
         // ── Build auxiliary components ──
 
@@ -196,6 +200,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             &agent_registry,
             &observability_gateway,
             &wiki_adapter,
+            &knowledge_backend,
             &supervisor,
             &alert_store,
             &active_alert_source,
