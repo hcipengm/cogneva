@@ -12,19 +12,24 @@
 # the same figure and disagreed: the ConfigMap said 2000m, the quota comment's
 # calibration (and therefore the note) still counted 500m.
 #
-# The reading is widened, not the verdict: numbers here are policy, so the gate
-# prints the runtime-inclusive headroom and leaves pass/fail on the rendered-set
-# lower bound. What this test pins is that the printed number is *read from the
-# declaration* rather than being a constant that happens to look right today.
+# The reading is now part of the verdict: the judgement Job runs on every
+# rollout, so it is not a "lower bound that might be exceeded on more nodes" but a
+# pod that is always there, and the gate goes red once the rendered set plus the
+# Job passes the ceiling rather than printing a note and passing. What this test
+# pins is that the number is *read from the declaration* (it follows a mutation),
+# that crossing the ceiling is red, and that a disabled deployer removes the line
+# instead of printing a stale one.
 #
-# Three directions:
-#   - the real rendered profiles print the line, and the runtime-inclusive headroom
+# Directions:
+#   - the real rendered profiles print the line, and the runtime-inclusive figure
 #     equals the rendered-set sum plus the Job's declared limit;
+#   - raising the declared limit within the headroom moves the printed number by
+#     exactly that much;
+#   - raising it past the headroom turns the gate red, naming the quota;
 #   - a manifest-declared Job is counted in the lower bound (the note has always
 #     claimed "concurrent Jobs count as 1" while the enumeration listed four kinds
 #     without Job -- a claim wider than the code);
-#   - mutating the declared limit moves the printed number by exactly that much,
-#     and a disabled deployer removes the line instead of printing a stale one.
+#   - a disabled deployer removes the line instead of printing a stale one.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -105,10 +110,39 @@ for profile in k3s-single k3s-multi; do
     || fail "${profile}: runtime-inclusive ${together}m minus rendered-set ${alone}m is not the declared ${job_m}m"
 
   # Mutation control: a limit that cannot coincide with anything else in the tree.
-  # If the number were a constant, or read from the wrong carrier, this would not move.
+  # If the number were a constant, or read from the wrong carrier, this would not
+  # move. It stays within the headroom (3 cores on top of the rendered set is
+  # still under the ceiling) so the gate stays green and the numbers are printed.
   mutated="${work}/mutated-${profile}"
   cp -r "${dir}" "${mutated}"
   python3 - "${mutated}" <<'PYEOF'
+import glob, os, sys, yaml
+
+target = os.path.join(sys.argv[1])
+for path in sorted(glob.glob(os.path.join(target, "*.yaml"))):
+    docs = [d for d in yaml.safe_load_all(open(path)) if d and d.get("kind")]
+    hit = False
+    for d in docs:
+        data = d.get("data") or {}
+        if "COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_CPU_LIMIT" in data:
+            data["COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_CPU_LIMIT"] = "3"
+            hit = True
+    if hit:
+        with open(path, "w") as fh:
+            yaml.safe_dump_all(docs, fh)
+PYEOF
+  bash "${gate}" "${mutated}" > "${work}/mutated-${profile}.out" 2>&1 \
+    || fail "the gate is red on the mutated ${profile}"
+  read -r _ mutated_together < <(read_cpu "${work}/mutated-${profile}.out")
+  [ $(( mutated_together - alone )) -eq 3000 ] \
+    || fail "${profile}: raising the declared limit to 3 cores moved the reading to ${mutated_together}m from ${alone}m, not by 3000m"
+
+  # Verdict control: once the rendered set plus the judgement Job passes the
+  # ceiling the gate must go red -- the Job is inside the verdict now, not a note.
+  # 9 cores pushes the runtime-inclusive figure well past the 23000m ceiling.
+  over="${work}/over-${profile}"
+  cp -r "${dir}" "${over}"
+  python3 - "${over}" <<'PYEOF'
 import glob, os, sys, yaml
 
 target = os.path.join(sys.argv[1])
@@ -124,11 +158,11 @@ for path in sorted(glob.glob(os.path.join(target, "*.yaml"))):
         with open(path, "w") as fh:
             yaml.safe_dump_all(docs, fh)
 PYEOF
-  bash "${gate}" "${mutated}" > "${work}/mutated-${profile}.out" 2>&1 \
-    || fail "the gate is red on the mutated ${profile}"
-  read -r _ mutated_together < <(read_cpu "${work}/mutated-${profile}.out")
-  [ $(( mutated_together - alone )) -eq 9000 ] \
-    || fail "${profile}: raising the declared limit to 9 cores moved the reading to ${mutated_together}m from ${alone}m, not by 9000m"
+  if bash "${gate}" "${over}" > "${work}/over-${profile}.out" 2>&1; then
+    fail "${profile}: the gate stayed green while rendered set + judgement Job passed the ceiling"
+  fi
+  grep -q "已超过配额" "${work}/over-${profile}.out" \
+    || fail "${profile}: the over-ceiling gate did not name the quota"
 
   # Reverse control: with the deployer disabled the Job never exists, so the line
   # must disappear rather than keep printing a number nothing declares.

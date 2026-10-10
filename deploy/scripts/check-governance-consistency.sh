@@ -12,10 +12,12 @@
 #   2. 卷声明之和 ≤ ResourceQuota 的 requests.storage，且头寸 > 0（打印头寸）
 #   3. 每个容器显式声明的 requests/limits 都在 LimitRange 的容器上下限内；
 #      LimitRange 自己的 default/defaultRequest 也要在上下限内
-#   4. 工作负载的单副本下限和（副本数 × 每 Pod 请求，DaemonSet 按 1 计）≤
-#      quota 的 cpu/memory 额度，头寸 > 0。渲染期拿不到节点数，DaemonSet 与
-#      滚动期的并发 Job 都按 1 计，所以这是一个**下限**：下限越界必定越界，
-#      下限不越界不等于多节点下也不越界（那是 values 注释里运维 --set 的事）。
+#   4. 工作负载的单副本下限和（副本数 × 每 Pod 请求，DaemonSet 按 1 计），
+#      **加上部署器运行期必然自己创建的判据 Job**，≤ quota 的 cpu/memory 额度。
+#      渲染期拿不到节点数，DaemonSet 与滚动期的并发 Job 都按 1 计，所以这是一个
+#      **下限**：下限越界必定越界，下限不越界不等于多节点下也不越界（那是 values
+#      注释里运维 --set 的事）。运行期那个 Job 不是外推的下限——它每一次滚动都在，
+#      所以它在判词之内而不是只在头寸那行里（实测就是这么越界的）。
 #
 # 用法：bash deploy/scripts/check-governance-consistency.sh <渲染产物目录>
 #       bash deploy/scripts/check-governance-consistency.sh deploy/rendered/k3s-single
@@ -202,8 +204,7 @@ if lr_container:
 # （渲染产物中读得到），但 Job 对象本身不是这个渲染集里的工作负载——渲染期不存
 # 在，运行期必定存在。上面那条头寸因此看不见它：实机读数是渲染集 16400m + 判据
 # Job 2000m > 配额 17，而头寸那一行照旧打「600m」，准入被拒时读文件读不出所以然。
-# 这里把它一起算出来打一行，让「剩多少」对这一个必然并存的 Pod 也为真。判词照旧
-# 由上面那条（渲染集下限）决定——数值是策略，这一行只把读数摆出来。
+# 这里把它一起算进判词：这个 Job 每一次滚动都在，越界不是多节点外推而是每次都发生。
 def runtime_rollout_job():
     for cm in by_kind.get('ConfigMap', []):
         data = cm.get('data') or {}
@@ -272,14 +273,23 @@ for face, quota_key, unit in (('requests', 'requests.cpu', 'cpu'),
         where = (f"{runtime_job['config']} 声明 COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_"
                  f"{'CPU' if unit == 'cpu' else 'MEMORY'}_{'LIMIT' if face == 'limits' else 'REQUEST'}"
                  f" = {runtime_job[quota_key]}")
-        tail = (f"，头寸 {shown(together)}" if together > 0 else
-                "，即推进期在这一面上没有余量：任何 Pod 替换都得等旧 Pod 从额度里真的退出，"
-                "否则准入被拒（FailedCreate），而它落地时是超时判词不是资源判词")
-        notes.append(
-            f"  └ 上面那条头寸没算部署器运行期自己创建的判据 Job（{where}）："
-            f"把它一起算进来 {shown(totals + extra)} vs 配额 {hard[quota_key]}{tail}"
-            f"。本脚本按每 Pod 容器与 init 之和计，而额度记账取两者较大者，"
-            f"所以这里的数只会偏大不会偏小；数值是策略，这一行不动判词")
+        if together < 0:
+            # 这个 Job 在推进期**必然**与全部工作负载并存：它不是"多节点下才
+            # 会外推出来的下限"，而是每一次滚动都真的在跑。把它挡在判词之外，
+            # 就是让一个必然到达的量躲在"头寸"那一行后面——实机就是这么越界的
+            # （渲染集之和 + 判据 Job > 配额），而准入被拒是以 FailedCreate 落到
+            # 超时判词上的，读文件读不出所以然。判词改到这里来。
+            errors.append(
+                f"工作负载单副本{face}.{unit} 下限和 {shown(totals)} + 部署器运行期"
+                f"自己创建的判据 Job（{where}） = {shown(totals + extra)} 已超过配额 "
+                f"{quota_key} = {hard[quota_key]}：这个 Job 在推进期必然与全部工作负载"
+                f"并存，越界不是多节点外推而是每次都发生（准入被拒 FailedCreate）")
+        else:
+            notes.append(
+                f"  └ 上面那条下限没算部署器运行期自己创建的判据 Job（{where}）："
+                f"把它一起算进来 {shown(totals + extra)} vs 配额 {hard[quota_key]}，"
+                f"头寸 {shown(together)}。本脚本按每 Pod 容器与 init 之和计，而额度"
+                f"记账取两者较大者，所以这里的数只会偏大不会偏小")
 
 if errors:
     print(f"GOVERNANCE 校验失败 [{PROFILE}]：")
