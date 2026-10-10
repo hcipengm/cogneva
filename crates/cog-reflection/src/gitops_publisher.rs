@@ -130,11 +130,21 @@ impl GitOpsPublisher {
             ),
         };
         let tag = format!("promote/{}", sanitize(&change.artifact_id));
+        // 判词写两处：`eval=` 是给人看的散文（旧读端逐字仍认它），
+        // `eval_verdict=` 是跨版本稳定的判词 token（新读端优先读它）。
+        let eval_prose = change
+            .eval_summary
+            .as_ref()
+            .map(|r| r.summary.as_str())
+            .unwrap_or("none");
+        let eval_verdict = change
+            .eval_summary
+            .as_ref()
+            .map(|r| r.verdict.as_token())
+            .unwrap_or("none");
         let msg = format!(
-            "change_id={}\nlevel={}\neval={}",
-            change.artifact_id,
-            level,
-            change.eval_summary.as_deref().unwrap_or("none")
+            "change_id={}\nlevel={}\neval={}\neval_verdict={}",
+            change.artifact_id, level, eval_prose, eval_verdict
         );
 
         // promote tag 是指针性质，重推同 change 允许 -f 覆盖；打上 tag 同时
@@ -530,7 +540,10 @@ mod tests {
             content: String::new(),
             status: crate::types::EvolutionStatus::Active,
             created_at: chrono::Utc::now(),
-            eval_summary: Some("Adopt z=2.0".into()),
+            eval_summary: Some(cog_core::EvalReport {
+                verdict: cog_core::EvalVerdict::Adopt,
+                summary: "Adopt z=2.0".into(),
+            }),
         }
     }
 
@@ -612,6 +625,14 @@ mod tests {
         assert!(tag_msg.contains("change_id=p-1"), "{tag_msg}");
         assert!(tag_msg.contains("level=l1_rollout"), "{tag_msg}");
         assert!(tag_msg.contains("eval=Adopt z=2.0"), "{tag_msg}");
+        assert!(tag_msg.contains("eval_verdict=adopt"), "{tag_msg}");
+
+        // 写出来的 tag 必须能被读端解析回同一个判词 —— 两边的键名对不上时
+        // 没有任何别的东西会红。
+        let (_id, _level, report) = crate::gitops_puller::parse_tag_message(&tag_msg);
+        let report = report.expect("a published tag must carry a parseable verdict");
+        assert_eq!(report.verdict, cog_core::EvalVerdict::Adopt);
+        assert!(!report.verdict.blocks_promotion());
 
         // overlay 基镜像必须是正式 cogneva 镜像（不是 debian 裸基底），
         // 缺省（无外部 registry）推集群内 registry 且走 http。

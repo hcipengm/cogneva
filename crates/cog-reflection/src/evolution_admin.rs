@@ -332,7 +332,7 @@ impl EvolutionAdminService {
             status: format!("{:?}", r.status).to_lowercase(),
             created_at: r.created_at,
             diff_summary,
-            eval_summary: r.eval_summary,
+            eval_summary: r.eval_summary.map(|report| report.summary),
         }
     }
 
@@ -621,7 +621,10 @@ impl EvolutionAdmin for EvolutionAdminService {
             content: serde_json::to_string_pretty(&req.candidate_payload).unwrap_or_default(),
             status,
             created_at,
-            eval_summary: Some(proposal.eval_summary.clone()),
+            eval_summary: Some(cog_core::EvalReport {
+                verdict: proposal.verdict,
+                summary: proposal.eval_summary.clone(),
+            }),
         })
         .await;
 

@@ -11,6 +11,93 @@ use serde::{Deserialize, Serialize};
 
 use crate::SFResult;
 
+/// 评估门判词。判词**类型化**的那一端：门按它判定，不读散文。
+///
+/// 变体的 serde 表示（snake_case）与线上 API 里既有的表示同形，所以把类型
+/// 从反射 crate 上移到契约层不改变任何已发布的 JSON。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvalVerdict {
+    /// 成功率统计显著提升 —— 唯一应被部署的结论。
+    Adopt,
+    /// 成功率统计显著下降。
+    Reject,
+    /// 无统计显著差异（按设计原则同样拒绝部署）。
+    Inconclusive,
+}
+
+impl EvalVerdict {
+    /// 规范 token：tag 的 `eval_verdict=` 行用它，跨版本稳定。
+    pub fn as_token(self) -> &'static str {
+        match self {
+            EvalVerdict::Adopt => "adopt",
+            EvalVerdict::Reject => "reject",
+            EvalVerdict::Inconclusive => "inconclusive",
+        }
+    }
+
+    /// 这个判词是否应当拦下这次晋级。门的判据只在这里定义一处。
+    pub fn blocks_promotion(self) -> bool {
+        matches!(self, EvalVerdict::Reject | EvalVerdict::Inconclusive)
+    }
+
+    /// 从 tag 的值解析判词：认规范 token（大小写不敏感），也认历史散文的前导词
+    /// （`"Reject z=…"` ⇒ `Reject`）。解析不出返回 `None`（= 没有判词，不拦）。
+    ///
+    /// 认散文前导词只是给**升级窗口与历史 tag** 兜底；判定本身只读 `EvalVerdict`。
+    pub fn from_tag_value(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.is_empty() || value.eq_ignore_ascii_case("none") {
+            return None;
+        }
+        let head = value.split_whitespace().next().unwrap_or(value);
+        [
+            EvalVerdict::Adopt,
+            EvalVerdict::Reject,
+            EvalVerdict::Inconclusive,
+        ]
+        .into_iter()
+        .find(|v| head.eq_ignore_ascii_case(v.as_token()))
+    }
+}
+
+/// 评估门结论的载体：**判词（机器读）与散文（给人看）同乘一个载体**。
+///
+/// 判定只读 `verdict`；`summary` 是给台账 / API 展示的散文（含 z 与 uplift），
+/// **不得**拿它当判据 —— 那正是这次要收掉的「类型→散文→前缀」那条链。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvalReport {
+    pub verdict: EvalVerdict,
+    /// 给人看的散文摘要；判定不读它。
+    pub summary: String,
+}
+
+/// 反序列化 `Option<EvalReport>`：**同时接受**新形
+/// `{"verdict":…,"summary":…}` 与**历史散文串**（旧版本这个字段直接存的是
+/// `"Reject z=…"` 这样的串）。散文串按前导词探判词，探不出 ⇒ `None`——
+/// 与旧行为一致（认不出判词就不拦），也保证回放旧盘上的 hand-off 与旧 tag 不炸。
+pub fn deserialize_optional_eval_report<'de, D>(
+    deserializer: D,
+) -> Result<Option<EvalReport>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Prose(String),
+        Structured(EvalReport),
+    }
+    Ok(match Option::<Repr>::deserialize(deserializer)? {
+        None => None,
+        Some(Repr::Structured(report)) => Some(report),
+        Some(Repr::Prose(prose)) => EvalVerdict::from_tag_value(&prose).map(|verdict| EvalReport {
+            verdict,
+            summary: prose,
+        }),
+    })
+}
+
 /// 晋级记录生命周期。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

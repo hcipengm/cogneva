@@ -176,7 +176,10 @@ mod tests {
             content: "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1,2 @@\n x\n+y\n".into(),
             status: crate::types::EvolutionStatus::Active,
             created_at: Utc::now(),
-            eval_summary: Some("Adopt z=2.31 uplift +18%".into()),
+            eval_summary: Some(cog_core::EvalReport {
+                verdict: cog_core::EvalVerdict::Adopt,
+                summary: "Adopt z=2.31 uplift +18%".into(),
+            }),
         }
     }
 

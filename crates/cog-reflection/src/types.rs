@@ -342,7 +342,11 @@ pub struct EvolutionResult {
     pub content: String,
     pub status: EvolutionStatus,
     pub created_at: DateTime<Utc>,
-    /// 评估门结论（两比例 z-test），如 "Adopt z=2.31 uplift +18%"。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub eval_summary: Option<String>,
+    /// 评估门结论：判词（类型）与散文摘要同乘一个载体。门按判词拦，散文只给人看。
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "cog_core::deserialize_optional_eval_report"
+    )]
+    pub eval_summary: Option<cog_core::EvalReport>,
 }

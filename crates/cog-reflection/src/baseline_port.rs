@@ -463,7 +463,7 @@ impl BaselinePorter {
                 tag,
                 commit,
                 level,
-                eval_summary,
+                eval_summary: eval_summary.map(|report| report.summary),
             });
         }
         // for-each-ref 默认字典序，晋级历史线性，字典序即演进顺序。

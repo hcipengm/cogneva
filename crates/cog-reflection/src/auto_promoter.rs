@@ -165,25 +165,22 @@ impl AutoPromoter {
     ) -> SFResult<()> {
         let change_id = change.artifact_id.clone();
 
-        // eval 门：评估明确否决的 change 不晋级。
-        if let Some(summary) = &change.eval_summary {
-            if summary.starts_with("Reject") || summary.starts_with("Inconclusive") {
+        // eval 门：评估明确否决的 change 不晋级。判定读**类型**（判词），不读散文。
+        if let Some(report) = &change.eval_summary {
+            if report.verdict.blocks_promotion() {
+                let reason = format!("eval gate rejected: {}", report.summary);
                 self.record(
                     &change_id,
                     "unknown",
                     PromotionStatus::Failed,
-                    &format!("eval gate rejected: {summary}"),
+                    &reason,
                     None,
-                    change.eval_summary.as_deref(),
+                    Some(report.summary.as_str()),
                 )
                 .await?;
                 let _ = self
                     .engine
-                    .record_change_outcome(
-                        &change_id,
-                        false,
-                        &format!("eval gate rejected: {summary}"),
-                    )
+                    .record_change_outcome(&change_id, false, &reason)
                     .await;
                 return Ok(());
             }
@@ -258,7 +255,7 @@ impl AutoPromoter {
                 PromotionStatus::AwaitingApproval,
                 &reason,
                 Some(verdict.kind()),
-                change.eval_summary.as_deref(),
+                change.eval_summary.as_ref().map(|r| r.summary.as_str()),
             )
             .await?;
             self.set_change_status(&change_id, EvolutionStatus::AwaitingReview)
@@ -274,7 +271,7 @@ impl AutoPromoter {
                 PromotionStatus::Pending,
                 &decision_reason,
                 Some(verdict.kind()),
-                change.eval_summary.as_deref(),
+                change.eval_summary.as_ref().map(|r| r.summary.as_str()),
             )
             .await?;
 
@@ -357,7 +354,7 @@ impl AutoPromoter {
                     "人工审批通过",
                     // 人批的这条记录不带分级结论：它属于审批，不属于分级。
                     None,
-                    change.eval_summary.as_deref(),
+                    change.eval_summary.as_ref().map(|r| r.summary.as_str()),
                 )
                 .await?
             }
@@ -1161,7 +1158,10 @@ mod tests {
         };
         let p = promoter(policy, ledger.clone(), Some(channel.clone()));
         let mut pt = change("p7", "crates/cog-agent/src/tools.rs");
-        pt.eval_summary = Some("Reject z=-1.2 uplift -8%".into());
+        pt.eval_summary = Some(cog_core::EvalReport {
+            verdict: cog_core::EvalVerdict::Reject,
+            summary: "Reject z=-1.2 uplift -8%".into(),
+        });
         p.decide_and_promote(&pt).await.unwrap();
         let records = ledger.recent(10).await.unwrap();
         assert_eq!(records[0].status, PromotionStatus::Failed);

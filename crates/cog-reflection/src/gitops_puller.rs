@@ -64,27 +64,46 @@ pub struct PromotionCandidate {
     pub change_id: String,
     pub level: String,
     pub commit: String,
-    pub eval_summary: Option<String>,
+    pub eval_summary: Option<cog_core::EvalReport>,
 }
 
-/// 解析 promote tag 的 message（`change_id=..\nlevel=..\neval=..`）。
-pub fn parse_tag_message(message: &str) -> (Option<String>, Option<String>, Option<String>) {
+/// 解析 promote tag 的 message。
+///
+/// 逐行 `key=value`：`change_id` / `level` 外，判词取两处 ——
+/// 新版写的 `eval_verdict=<token>` 优先，缺则**回退**解析 `eval=` 的历史散文前导词。
+/// `eval=` 的散文面保留（给人看），判定不读它。两处都没有判词 ⇒ `None`（不拦）。
+pub fn parse_tag_message(
+    message: &str,
+) -> (Option<String>, Option<String>, Option<cog_core::EvalReport>) {
     let mut change_id = None;
     let mut level = None;
-    let mut eval_summary = None;
+    let mut eval_verdict: Option<cog_core::EvalVerdict> = None;
+    let mut eval_prose: Option<String> = None;
     for line in message.lines() {
         if let Some((k, v)) = line.split_once('=') {
             match k.trim() {
                 "change_id" => change_id = Some(v.trim().to_string()),
                 "level" => level = Some(v.trim().to_string()),
+                "eval_verdict" => eval_verdict = cog_core::EvalVerdict::from_tag_value(v),
                 "eval" => {
                     let v = v.trim();
-                    eval_summary = (v != "none").then(|| v.to_string());
+                    if !v.is_empty() && v != "none" {
+                        eval_prose = Some(v.to_string());
+                    }
                 }
                 _ => {}
             }
         }
     }
+    let verdict = eval_verdict.or_else(|| {
+        eval_prose
+            .as_deref()
+            .and_then(cog_core::EvalVerdict::from_tag_value)
+    });
+    let eval_summary = verdict.map(|verdict| cog_core::EvalReport {
+        verdict,
+        summary: eval_prose.unwrap_or_else(|| verdict.as_token().to_string()),
+    });
     (change_id, level, eval_summary)
 }
 
@@ -1493,7 +1512,7 @@ impl GitOpsPuller {
             cluster: self.cluster.clone(),
             status,
             outcome: outcome.to_string(),
-            eval_summary: candidate.eval_summary.clone(),
+            eval_summary: candidate.eval_summary.as_ref().map(|r| r.summary.clone()),
             created_at: now,
             updated_at: now,
         };
@@ -2750,10 +2769,25 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
 
     #[test]
     fn parse_tag_message_full() {
+        // 历史 tag：只有散文 `eval=`，判词要从散文前导词兜出来（升级窗口的兼容路径）。
         let (p, l, e) = parse_tag_message("change_id=p-1\nlevel=l1_rollout\neval=Adopt z=2.0");
         assert_eq!(p.as_deref(), Some("p-1"));
         assert_eq!(l.as_deref(), Some("l1_rollout"));
-        assert_eq!(e.as_deref(), Some("Adopt z=2.0"));
+        let report = e.expect("a legacy prose lead yields a typed verdict");
+        assert_eq!(report.verdict, cog_core::EvalVerdict::Adopt);
+        assert_eq!(report.summary, "Adopt z=2.0");
+    }
+
+    #[test]
+    fn parse_tag_message_prefers_the_typed_token() {
+        // 新版 tag：结构化判词行优先，散文只是给人看的。
+        let (_p, _l, e) = parse_tag_message(
+            "change_id=p-2\nlevel=l1_rollout\neval_verdict=reject\neval=Reject z=-1.2 uplift -8%",
+        );
+        let report = e.expect("the token line yields the verdict");
+        assert_eq!(report.verdict, cog_core::EvalVerdict::Reject);
+        assert!(report.verdict.blocks_promotion());
+        assert_eq!(report.summary, "Reject z=-1.2 uplift -8%");
     }
 
     #[test]

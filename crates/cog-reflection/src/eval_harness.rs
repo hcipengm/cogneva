@@ -62,17 +62,9 @@ impl EvalSummary {
     }
 }
 
-/// change 前后对比结论。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EvalVerdict {
-    /// 成功率统计显著提升 —— 唯一应被部署的结论。
-    Adopt,
-    /// 成功率统计显著下降。
-    Reject,
-    /// 无统计显著差异（按设计原则同样拒绝部署）。
-    Inconclusive,
-}
+/// change 前后对比结论。判词类型的家是契约层（`cog-core`），这里重导出，
+/// 于是 `crate::EvalVerdict` 的全部调用点不必改。
+pub use cog_core::contract::promotion::EvalVerdict;
 
 /// 对比报告。
 #[derive(Debug, Clone, Serialize, Deserialize)]
