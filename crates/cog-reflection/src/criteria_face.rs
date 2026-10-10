@@ -57,6 +57,22 @@ pub const CARRIER_PATTERNS: &[&str] = &[
     "crates/*/tests/**",
     "crates/*/benches/**",
     "crates/*/src/**/*_test.rs",
+    // The fixed evaluation suite. Its contents are what a change is measured
+    // against, so the change that edits a problem is moving the criteria in the
+    // most direct way there is — and it is the one change whose author has an
+    // obvious reason not to want the evaluation to notice. Matching the
+    // directory rather than today's file names, because a second suite added
+    // later is a carrier the moment it lands.
+    //
+    // Being a carrier also means its text is read into `criterion_tokens`, and
+    // this one is 214KB of Python rather than a gate script. Measured before
+    // accepting it (2026-10-10, on a 164-problem suite): 204 identifier-shaped
+    // tokens, 202 of them not already contributed by the other carriers, and 4
+    // that also occur in this workspace's source. That is the direction the
+    // list is allowed to err in — a wider face buys extra evaluation runs, a
+    // narrower one skips the gate — and it is small enough that a second
+    // mechanism to exclude it would cost more than it saves.
+    "eval_datasets/**",
 ];
 
 /// Directories that never hold a carrier, skipped so the walk stays cheap.
@@ -491,6 +507,22 @@ mod tests {
         );
         assert_eq!(t.tier, Tier::RealGate);
         assert!(t.touches_criteria_code);
+    }
+
+    #[test]
+    fn editing_the_evaluation_suite_takes_the_real_gate() {
+        // The suite is what a change is scored against, so rewriting a problem
+        // is a criteria change even though neither the grader's code nor its
+        // configuration moved. Read by directory, so a suite that does not exist
+        // yet is a carrier as soon as it does.
+        for path in [
+            "eval_datasets/humaneval.jsonl",
+            "eval_datasets/some-suite-added-later.jsonl",
+        ] {
+            let t = tier(&face(&[], &[]), &[target(path)], &DiffShape::default());
+            assert_eq!(t.tier, Tier::RealGate, "{path} did not take the real gate");
+            assert_eq!(t.reasons, vec![TierReason::CriteriaCarrier]);
+        }
     }
 
     #[test]
