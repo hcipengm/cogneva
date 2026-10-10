@@ -1048,8 +1048,9 @@ async fn test_composite_memory_query_relations_filtered() {
     assert_eq!(results.len(), 2);
 }
 
-/// Dense-only embedder: every text maps to the same non-zero vector, which is
-/// enough to distinguish "embedded" from the all-zero fallback.
+/// Stub embedder: every text maps to the same non-zero dense vector, which is
+/// enough to distinguish "embedded" from the all-zero fallback, and to a fixed
+/// one-entry sparse vector, so the hybrid path has both halves to hand.
 struct StubEmbedder {
     dim: usize,
 }
@@ -1068,6 +1069,14 @@ impl cog_core::EmbeddingProvider for StubEmbedder {
             .iter()
             .map(|_| cog_core::SparseEmbedding::new(vec![1], vec![1.0]))
             .collect())
+    }
+
+    fn supports_sparse(&self) -> bool {
+        true
+    }
+
+    fn model_id(&self) -> &str {
+        "stub/v1"
     }
 
     fn dimension(&self) -> usize {
@@ -1205,6 +1214,146 @@ async fn test_ingest_explicit_without_embedder_stores_no_vector() {
         cog_core::NO_EMBEDDING_MODEL,
         "an entry with no vector must not name an embedding model"
     );
+}
+
+/// A stored summary carries both halves of the hybrid vector. The summary layer
+/// indexes whatever vectors a row arrives with and never calls a model itself, so
+/// this is the only step that can put them on the row: if the producer leaves the
+/// sparse half empty, the collection has a sparse index nothing ever fills.
+#[tokio::test]
+async fn test_stored_summary_carries_both_halves_of_the_hybrid_vector() {
+    let tmp = tempfile::tempdir().unwrap();
+    let object = Arc::new(FileObjectBackend::new(tmp.path()));
+    let backend = CompositeMemoryBackend::new(
+        object,
+        Arc::new(cog_storage::MemoryVectorBackend::new()),
+        1024,
+    )
+    .with_embedder(Arc::new(StubEmbedder { dim: 1024 }));
+
+    // An extractor hands in a summary with no vector of its own.
+    let entry = SummaryEntry::new(
+        "s1",
+        "default",
+        "the deployment hung because the weight directory was empty",
+        Vec::new(),
+        cog_core::NO_EMBEDDING_MODEL,
+        make_source_ref("r1"),
+    );
+    backend.store_summary("default", &entry).await.unwrap();
+
+    let stored = backend.get_summary("default", "s1").await.unwrap().unwrap();
+    assert_eq!(stored.embedding.len(), 1024);
+    assert_eq!(
+        stored.embedding_model, "stub/v1",
+        "the row names the provider that made its vector, not the call site"
+    );
+    let sparse = stored
+        .sparse_embedding
+        .expect("a provider that can embed sparsely must be asked to");
+    assert!(!sparse.indices.is_empty());
+    assert_eq!(sparse.indices.len(), sparse.values.len());
+}
+
+/// The summary layer as the query side sees it: it keeps the sparse query it
+/// was handed, so the test can assert what reached it rather than only that the
+/// call returned. Everything else answers empty.
+struct RecordingSummary {
+    sparse_query: std::sync::Mutex<Option<cog_core::SparseEmbedding>>,
+}
+
+#[async_trait::async_trait]
+impl cog_core::SummaryBackend for RecordingSummary {
+    async fn store_summary(&self, _ns: &str, _entry: &SummaryEntry) -> cog_core::SFResult<()> {
+        Ok(())
+    }
+
+    async fn get_summary(&self, _ns: &str, _id: &str) -> cog_core::SFResult<Option<SummaryEntry>> {
+        Ok(None)
+    }
+
+    async fn search_summary(
+        &self,
+        _ns: &str,
+        _query_embedding: &[f32],
+        _top_k: usize,
+        _time_range: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+    ) -> cog_core::SFResult<Vec<cog_core::SummarySearchResult>> {
+        Ok(Vec::new())
+    }
+
+    async fn search_summary_hybrid(
+        &self,
+        _ns: &str,
+        _query_dense: &[f32],
+        query_sparse: Option<&cog_core::SparseEmbedding>,
+        _top_k: usize,
+        _time_range: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+    ) -> cog_core::SFResult<Vec<cog_core::SummarySearchResult>> {
+        *self.sparse_query.lock().unwrap() = query_sparse.cloned();
+        Ok(Vec::new())
+    }
+
+    async fn summary_for_raw(
+        &self,
+        _ns: &str,
+        _raw_id: &str,
+    ) -> cog_core::SFResult<Vec<SummaryEntry>> {
+        Ok(Vec::new())
+    }
+
+    async fn list_summary(&self, _ns: &str) -> cog_core::SFResult<Vec<SummaryEntry>> {
+        Ok(Vec::new())
+    }
+
+    async fn delete_summary(&self, _ns: &str, _id: &str) -> cog_core::SFResult<()> {
+        Ok(())
+    }
+
+    async fn update_summary(&self, _ns: &str, _entry: &SummaryEntry) -> cog_core::SFResult<()> {
+        Ok(())
+    }
+}
+
+/// A summary search asks the summary layer for a hybrid match, and derives its
+/// sparse half from the query text: the caller holds a dense vector and no
+/// embedding provider, so the sparse query can only come from the backend's own
+/// embedder. Routing this through the dense-only entry point is what the trait's
+/// silent default would hide -- the call would still succeed.
+#[tokio::test]
+async fn test_search_all_hands_the_summary_layer_a_sparse_query() {
+    let tmp = tempfile::tempdir().unwrap();
+    let object = Arc::new(FileObjectBackend::new(tmp.path()));
+    let summary = Arc::new(RecordingSummary {
+        sparse_query: std::sync::Mutex::new(None),
+    });
+    let backend = CompositeMemoryBackend::new(
+        object,
+        Arc::new(cog_storage::MemoryVectorBackend::new()),
+        1024,
+    )
+    .with_embedder(Arc::new(StubEmbedder { dim: 1024 }))
+    .with_summary_backend(summary.clone());
+
+    backend
+        .search_all(
+            "default",
+            "why did the deployment hang",
+            Some(&vec![0.25f32; 1024]),
+            5,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let sparse = summary
+        .sparse_query
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the query side must hand the summary layer a sparse vector");
+    assert!(!sparse.indices.is_empty());
+    assert_eq!(sparse.indices.len(), sparse.values.len());
 }
 
 /// An object store that counts its reads, so a test can assert how many the

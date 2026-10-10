@@ -218,14 +218,16 @@ spec:
               value: "false"
             # 本地模型权重：目录就是下面挂进来的那个只读卷，值取自 chart 的同一个
             # values 键，所以不会出现"挂了卷却还在别处找"或"要找却没有卷"。
-            # 开关与卷同时成立：只挂不打开等于白挂，只打开不挂会让加载器读不到
-            # 权重而静默退回网络。嵌入开启后 dense 与 sparse 两个 session 都建
-            # 起来，也就是混合检索的两半。
+            # 两个开关一起开：卷里放的正是这两份权重，而它们的加载都要走同一个
+            # 离线目录。嵌入开启后 dense 与 sparse 两个 session 都建起来（混合
+            # 检索的两半）；重排是查询侧精排那一步，它的消费者在 cog-wiki。
             # 这个 Pod **不能设 HF_HOME**：fastembed 的 hub 客户端优先它，设了就把
             # 权重目录带偏到别处，而失败读起来像"权重目录坏"，真因在环境里。
             - name: FASTEMBED_CACHE_DIR
               value: "/srv/cogneva/models/fastembed"
             - name: COGNEVA_MEMORY_LOAD_EMBEDDING_MODEL
+              value: "true"
+            - name: COGNEVA_MEMORY_LOAD_RERANKER_MODEL
               value: "true"
           startupProbe:
             httpGet:

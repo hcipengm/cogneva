@@ -65,6 +65,14 @@ const UNNAMED: &[(&str, &str)] = &[
          stall above: the cost is a download per run, and the question it asks \
          is about a model that is not in the repository.",
     ),
+    (
+        "crates/cog-memory/tests/embedding_boundary.rs",
+        "Same shape as the reranker entry above it, and for the same reason: \
+         what it establishes is that the loader reads the weights from the \
+         directory it was given rather than reaching for a hub, which only has \
+         an answer where a weight directory exists. It is a manual reading \
+         against a materialised model, not a step.",
+    ),
 ];
 
 /// What a step selects, as far as naming tests goes.

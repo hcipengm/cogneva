@@ -17,6 +17,23 @@ pub trait EmbeddingProvider: Send + Sync {
     /// Returns one [`SparseEmbedding`] per input text.
     async fn embed_sparse(&self, texts: Vec<String>) -> SFResult<Vec<SparseEmbedding>>;
 
+    /// Whether [`Self::embed_sparse`] can answer at all right now.
+    ///
+    /// A caller about to write a batch of rows asks this before it starts: the answer
+    /// cannot change while the process runs, and discovering it per row would pay the
+    /// same failure once per row. No default body -- a provider that cannot say is a
+    /// provider whose callers cannot decide, and a default would let a wrapper answer
+    /// for its inner one.
+    fn supports_sparse(&self) -> bool;
+
+    /// The name a stored vector carries as the model that produced it.
+    ///
+    /// A vector is only comparable with another from the same model, so a row records
+    /// who made it; a caller that recomputes or backfills vectors needs this name to say
+    /// which of them the row holds. Asked of the provider rather than written next to a
+    /// call site, because the name belongs to whatever provider is actually injected.
+    fn model_id(&self) -> &str;
+
     /// Return the expected dense vector dimension.
     fn dimension(&self) -> usize;
 }

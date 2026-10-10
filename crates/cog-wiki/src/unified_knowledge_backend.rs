@@ -9,9 +9,9 @@ use cog_core::contract::knowledge::{
 };
 use cog_core::{
     EmbeddingProvider, FailurePattern, ImplementationExample, KnowledgeBackend, KnowledgeEntry,
-    MemoryBackend, MetricsBackend, SFResult, SchemaEntry, SchemaKind, SourceRef, SummaryEntry,
-    Task, TaskDecompositionPattern, TaskExecutionRecord, TaskResult, UnifiedSearchResult,
-    WikiBackend,
+    MemoryBackend, MetricsBackend, RerankerProvider, SFResult, SchemaEntry, SchemaKind, SourceRef,
+    SummaryEntry, Task, TaskDecompositionPattern, TaskExecutionRecord, TaskResult,
+    UnifiedSearchResult, WikiBackend,
 };
 
 /// Unified knowledge backend aggregating [`MemoryBackend`] (three-layer
@@ -27,6 +27,7 @@ pub struct UnifiedKnowledgeBackend {
     memory: MaybeService<dyn MemoryBackend>,
     wiki: Option<Arc<dyn WikiBackend>>,
     embedding: MaybeService<dyn EmbeddingProvider>,
+    reranker: MaybeService<dyn RerankerProvider>,
     metrics: Option<Arc<dyn MetricsBackend>>,
 }
 
@@ -111,6 +112,7 @@ impl UnifiedKnowledgeBackend {
             memory: MaybeService::None,
             wiki: None,
             embedding: MaybeService::None,
+            reranker: MaybeService::None,
             metrics: None,
         }
     }
@@ -176,6 +178,26 @@ impl UnifiedKnowledgeBackend {
         embedding: cog_core::LateService<dyn EmbeddingProvider>,
     ) -> Self {
         self.embedding = MaybeService::Late(embedding);
+        self
+    }
+
+    /// Wire a reranker the caller already holds.
+    pub fn with_reranker(mut self, reranker: Arc<dyn RerankerProvider>) -> Self {
+        self.reranker = MaybeService::Ready(reranker);
+        self
+    }
+
+    /// Wire a reranker that is resolved on first use rather than now.
+    ///
+    /// Same reason as [`Self::with_memory_late`]: the provider is published by
+    /// the memory plugin, in this plugin's own init layer. A process without one
+    /// ranks retrievals by the scores the stores returned, which is what a
+    /// retrieval did before there was a reranker at all.
+    pub fn with_reranker_late(
+        mut self,
+        reranker: cog_core::LateService<dyn RerankerProvider>,
+    ) -> Self {
+        self.reranker = MaybeService::Late(reranker);
         self
     }
 }
@@ -326,6 +348,18 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
     ) -> SFResult<Vec<KnowledgeEntry>> {
         let mut entries: Vec<KnowledgeEntry> = Vec::new();
 
+        // A reranker reorders a candidate set, so it needs one wider than the
+        // answer: asking each store for exactly `top_k` hands the reranker only
+        // the rows the stores already agreed on, and the row it would have
+        // promoted was never in front of it. Without a reranker the stores'
+        // own limit is the answer's limit, and the recall width is unchanged.
+        let reranker = self.reranker.resolve();
+        let recall = if reranker.is_some() {
+            scan_window(top_k)
+        } else {
+            top_k
+        };
+
         // --- Memory layer ---
         if let Some(memory) = self.memory.resolve() {
             let embedding = if let Some(provider) = self.embedding.resolve() {
@@ -342,7 +376,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
             };
 
             match memory
-                .search_all(NS_KNOWLEDGE, query, embedding.as_deref(), top_k, None)
+                .search_all(NS_KNOWLEDGE, query, embedding.as_deref(), recall, None)
                 .await
             {
                 Ok(results) => {
@@ -392,7 +426,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
 
         // --- Wiki layer ---
         if let Some(ref wiki) = self.wiki {
-            match wiki.search(query, top_k).await {
+            match wiki.search(query, recall).await {
                 Ok(results) => {
                     let contributed = results.len();
                     for r in results {
@@ -417,6 +451,50 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
             }
         } else {
             self.record(LAYER_WIKI, Outcome::Absent).await;
+        }
+
+        // Rerank the merged set against the query text when a reranker is wired.
+        // Each layer scored its own rows with its own measure -- cosine for the
+        // memory layer, term overlap for the wiki -- so their numbers are not on
+        // one scale, and sorting them together compares quantities that were
+        // never comparable. The reranker reads the query and every candidate's
+        // text and puts them on one scale, which is also what makes a
+        // cross-layer order mean anything.
+        if let Some(reranker) = reranker {
+            if entries.len() > 1 {
+                let documents: Vec<String> = entries.iter().map(|e| e.content.clone()).collect();
+                match reranker
+                    .rerank(query, documents, top_k.min(entries.len()))
+                    .await
+                {
+                    Ok(ranked) => {
+                        // `index` addresses the batch handed over, so the way back
+                        // is positional. A row the reranker did not rank is not
+                        // appended after the ranked ones: it has no place on the
+                        // scale the rest were put on.
+                        let mut seen = vec![false; entries.len()];
+                        let mut reranked: Vec<KnowledgeEntry> = Vec::with_capacity(ranked.len());
+                        for r in ranked {
+                            let Some(entry) = entries.get(r.index) else {
+                                continue;
+                            };
+                            if std::mem::replace(&mut seen[r.index], true) {
+                                continue;
+                            }
+                            let mut entry = entry.clone();
+                            entry.relevance_score = r.score;
+                            reranked.push(entry);
+                        }
+                        reranked.truncate(top_k);
+                        return Ok(reranked);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "reranking failed; keeping the order the layers returned: {e}"
+                        );
+                    }
+                }
+            }
         }
 
         // Sort by relevance descending.
@@ -906,7 +984,31 @@ mod tests {
         assert_eq!(cells, RETRIEVAL_OUTCOMES.to_vec());
     }
 
-    /// Wiki-only mock: returns three documents with distinct scores.
+    /// Three documents with distinct scores, in an order that is not the
+    /// score order: a caller that ranks what it was handed has to do the work.
+    fn mock_wiki_rows() -> Vec<WikiSearchResult> {
+        let doc = |id: &str, title: &str, content: &str, score: f32| WikiSearchResult {
+            document: WikiDocument {
+                id: id.into(),
+                path: format!("{id}.md"),
+                title: title.into(),
+                content: content.into(),
+                tags: None,
+                created_at: None,
+                updated_at: None,
+            },
+            score,
+            match_type: None,
+            highlights: Vec::new(),
+        };
+        vec![
+            doc("doc-low", "Low relevance", "low content", 0.2),
+            doc("doc-high", "High relevance", "high content", 0.9),
+            doc("doc-mid", "Mid relevance", "mid content", 0.5),
+        ]
+    }
+
+    /// Wiki-only mock: answers every row regardless of the limit it was given.
     struct MockWiki;
 
     #[async_trait]
@@ -924,51 +1026,110 @@ mod tests {
         }
 
         async fn search(&self, _query: &str, _top_k: usize) -> SFResult<Vec<WikiSearchResult>> {
-            Ok(vec![
-                WikiSearchResult {
-                    document: WikiDocument {
-                        id: "doc-low".into(),
-                        path: "low.md".into(),
-                        title: "Low relevance".into(),
-                        content: "low content".into(),
-                        tags: None,
-                        created_at: None,
-                        updated_at: None,
-                    },
-                    score: 0.2,
-                    match_type: None,
-                    highlights: Vec::new(),
-                },
-                WikiSearchResult {
-                    document: WikiDocument {
-                        id: "doc-high".into(),
-                        path: "high.md".into(),
-                        title: "High relevance".into(),
-                        content: "high content".into(),
-                        tags: None,
-                        created_at: None,
-                        updated_at: None,
-                    },
-                    score: 0.9,
-                    match_type: None,
-                    highlights: Vec::new(),
-                },
-                WikiSearchResult {
-                    document: WikiDocument {
-                        id: "doc-mid".into(),
-                        path: "mid.md".into(),
-                        title: "Mid relevance".into(),
-                        content: "mid content".into(),
-                        tags: None,
-                        created_at: None,
-                        updated_at: None,
-                    },
-                    score: 0.5,
-                    match_type: None,
-                    highlights: Vec::new(),
-                },
-            ])
+            Ok(mock_wiki_rows())
         }
+    }
+
+    /// The same rows, but honouring the limit. A mock that answers everything
+    /// looks identical at every recall width, so a test about the window has to
+    /// use one that narrows when the caller does.
+    struct MockWikiWithLimit;
+
+    #[async_trait]
+    impl WikiBackend for MockWikiWithLimit {
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock-limited"
+        }
+
+        async fn ingest_document(&self, _relative_path: &str, _content: &str) -> SFResult<()> {
+            Ok(())
+        }
+
+        async fn search(&self, _query: &str, top_k: usize) -> SFResult<Vec<WikiSearchResult>> {
+            let mut rows = mock_wiki_rows();
+            rows.truncate(top_k);
+            Ok(rows)
+        }
+    }
+
+    /// A reranker whose order is its own: it scores by whether the row's text
+    /// contains the query, which is not the order the rows arrived in.
+    struct KeywordReranker;
+
+    #[async_trait]
+    impl RerankerProvider for KeywordReranker {
+        async fn rerank(
+            &self,
+            query: &str,
+            documents: Vec<String>,
+            top_n: usize,
+        ) -> SFResult<Vec<cog_core::RerankResult>> {
+            let mut ranked: Vec<cog_core::RerankResult> = documents
+                .into_iter()
+                .enumerate()
+                .map(|(index, document)| cog_core::RerankResult {
+                    score: if document.contains(query) { 1.0 } else { 0.0 },
+                    document: Some(document),
+                    index,
+                })
+                .collect();
+            ranked.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.index.cmp(&b.index))
+            });
+            ranked.truncate(top_n);
+            Ok(ranked)
+        }
+    }
+
+    /// With a reranker the retrieval asks the stores for a window wider than the
+    /// answer and takes the reranker's order; without one it ranks by the stores'
+    /// own scores and asks for exactly the answer's width. The two are told apart
+    /// by a row the layers' own window never returned and the reranker promoted.
+    #[tokio::test]
+    async fn a_reranker_reorders_the_candidates_and_its_window_reaches_further() {
+        let task = Task::new(
+            "t1".to_string(),
+            cog_core::TaskType::Custom("test".into()),
+            serde_json::json!({}),
+        );
+
+        let plainly = UnifiedKnowledgeBackend::new()
+            .with_wiki(Arc::new(MockWikiWithLimit))
+            .retrieve_relevant(&task, "mid", 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            plainly[0].id, "doc-high",
+            "without a reranker the store's scores decide"
+        );
+        assert!(
+            !plainly.iter().any(|e| e.id == "doc-mid"),
+            "the width the store was asked for does not reach the third row"
+        );
+
+        let reranked = UnifiedKnowledgeBackend::new()
+            .with_wiki(Arc::new(MockWikiWithLimit))
+            .with_reranker(Arc::new(KeywordReranker))
+            .retrieve_relevant(&task, "mid", 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            reranked[0].id, "doc-mid",
+            "the reranker's order is the retrieval's order, and it reached a row \
+             the store's own width never returned"
+        );
+        assert_eq!(
+            reranked.len(),
+            2,
+            "the answer is still top_k, not the window"
+        );
     }
 
     #[tokio::test]

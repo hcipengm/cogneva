@@ -100,10 +100,14 @@ appData:
 # 本地模型权重（BGE-M3 嵌入）：加载器只从磁盘读，集群到不了 model hub。
 #
 # 这个开关**一处管两件事**：把宿主上的权重目录只读挂进主应用 Pod，并同时把
-# `memory.load_embedding_model` 打开。两者必须同时成立——只挂不打开等于白挂，
-# 只打开不挂会让加载器读不到权重而**静默退回网络**，在一个连不上 hub 的集群里
-# 那次拉取既不成功也不失败，插件的 init 会挂到 liveness 杀 Pod 为止。所以它们
-# 不由两个开关分别控制，desync 在结构上不可能发生。
+# `memory.load_embedding_model` 与 `memory.load_reranker_model` 打开。两者必须
+# 同时成立——只挂不打开等于白挂，只打开不挂会让加载器读不到权重而**静默退回
+# 网络**，在一个连不上 hub 的集群里那次拉取既不成功也不失败，插件的 init 会挂到
+# liveness 杀 Pod 为止。所以它们不由几个开关分别控制，desync 在结构上不可能发生。
+#
+# 卷里要**两份**权重（`--model bge-m3` 与 `--model reranker` 各抓一次）：重排与
+# 嵌入是不同模型，少一份的后果同上，而两个开关是一起翻的，所以缺哪一份都不会
+# 只用能用的那份跑——都在同一个目录里，目录不全就是起不来。
 #
 # 为什么只有宿主目录、没有集群卷：多节点上一个 hostPath 只存在于一台节点，
 # 换节点就挂不上，本该走 PVC——但权重进卷今天**没有产出方**（2.2GiB 的 ONNX
@@ -112,8 +116,10 @@ appData:
 # 等有一条权重进卷的路径再开。
 modelWeights:
   enabled: false
-  # 由 deploy/scripts/fetch-model-weights.sh --model bge-m3 落在这里（hf-hub
-  # 自己的缓存布局，进程起来后一个字节也不下载）。
+  # 由 deploy/scripts/fetch-model-weights.sh 落在这里，`--model bge-m3` 与
+  # `--model reranker` 各跑一次（hf-hub 自己的缓存布局，进程起来后一个字节也不
+  # 下载）。脚本按 hub 声明的哈希逐份校验，所以坏字节进不来；但它只抓点名的那一
+  # 个模型，**两跑都做**才是这个目录的完整定义。
   hostPath: /srv/cogneva/models/fastembed
 
 # 数据面备份：权威数据（PG 逻辑导出 + Qdrant 一致性快照 + 对象 raw 层 +

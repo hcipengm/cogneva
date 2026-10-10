@@ -359,8 +359,11 @@ impl LlmMemoryExtractor {
          focusing on key decisions, lessons learned, user preferences, and actionable \
          insights. Keep the summary concise (1-3 sentences).";
 
-    /// Both layers are rated on the same 1-10 scale, so the scale is stated once
-    /// instead of being repeated per task and drifting apart.
+    /// Both layers are rated on the same 1-10 scale, so its wording is defined
+    /// here once and shared by both tasks instead of being written out twice and
+    /// left to drift. What is single is the definition, not the number of times
+    /// the text reaches the model: a prompt that asks about both layers carries
+    /// it once for each.
     const IMPORTANCE_TASK: &'static str = "Rate the importance of each extracted item on a \
          scale of 1-10, where 10 is critical information that will be valuable in future \
          conversations, and 1 is trivial.";

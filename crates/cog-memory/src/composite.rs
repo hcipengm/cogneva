@@ -62,7 +62,7 @@ impl CompositeMemoryBackend {
         }
     }
 
-    /// Attach a dense embedder. Explicit ingests then store a real embedding
+    /// Attach an embedder. Explicit ingests then store a real embedding
     /// instead of none.
     pub fn with_embedder(mut self, embedder: Arc<dyn cog_core::EmbeddingProvider>) -> Self {
         self.embedder = Some(embedder);
@@ -83,6 +83,65 @@ impl CompositeMemoryBackend {
         self.summary = summary;
         self.default_summary = None;
         self
+    }
+
+    /// Fill in the vectors an entry has to carry before the summary layer stores it.
+    ///
+    /// The summary layer indexes whatever vectors an entry arrives with and never calls a
+    /// model itself, so this is the only place a stored text turns into vectors. Both
+    /// producers reach it: an explicit ingest, and the auto-ingest pipeline, whose extractor
+    /// hands its summaries to `store_summary` like any other caller.
+    ///
+    /// The dense half is computed only when the entry arrives without one — an extractor
+    /// that already embedded its text has done that work, and the model's name goes on the
+    /// row so a later reader can tell which model made the vector.
+    ///
+    /// The sparse half is computed only when the embedder can produce one at all. A
+    /// provider whose sparse session failed to load still embeds densely, and failing the
+    /// whole store over the missing half would take the working half down with it.
+    ///
+    /// With no embedder at all the entry keeps no vector and the text path is the only way
+    /// back to it: a zero vector would be a well-formed but information-free point in the
+    /// collection, tying at score 0.0 with every other such point and answering searches
+    /// with an arbitrary ranking.
+    async fn embed_entry(&self, entry: &SummaryEntry) -> SFResult<SummaryEntry> {
+        let Some(embedder) = self.embedder.as_ref() else {
+            return Ok(entry.clone());
+        };
+        let mut entry = entry.clone();
+
+        if entry.embedding.is_empty() {
+            let vector = embedder
+                .embed(vec![entry.text.clone()])
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| SFError::Agent("embedder returned no vector".into()))?;
+            // An empty vector is what a provider returns for "no vector", so treating it as
+            // one keeps the row's absent-vector state (and its name) rather than writing a
+            // name for a vector that is not there.
+            if !vector.is_empty() {
+                entry.embedding = vector;
+                entry.embedding_model = embedder.model_id().to_string();
+            }
+        }
+
+        if entry.sparse_embedding.is_none() && embedder.supports_sparse() {
+            match embedder.embed_sparse(vec![entry.text.clone()]).await {
+                Ok(mut sparse) => {
+                    if let Some(vector) = sparse.drain(..).next() {
+                        entry = entry.with_sparse_embedding(vector);
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    "sparse embedding failed for summary {}; storing it with its dense \
+                     vector only: {e}",
+                    entry.id
+                ),
+            }
+        }
+
+        Ok(entry)
     }
 
     /// Configure persistence for the default in-memory schema/summary backends.
@@ -313,7 +372,8 @@ impl MemoryBackend for CompositeMemoryBackend {
     }
 
     async fn store_summary(&self, namespace: &str, entry: &SummaryEntry) -> SFResult<()> {
-        self.summary.store_summary(namespace, entry).await?;
+        let entry = self.embed_entry(entry).await?;
+        self.summary.store_summary(namespace, &entry).await?;
         let mut metrics = self
             .metrics
             .write()
@@ -424,9 +484,29 @@ impl MemoryBackend for CompositeMemoryBackend {
             .collect();
 
         if let Some(emb) = embedding {
+            // The sparse half of the query is derived here rather than taken from the
+            // caller: callers hold a dense vector -- one of them takes it straight from
+            // a request body -- and no embedding provider, so a sparse query can only
+            // come from this backend's own embedder. Absent or failing, the search
+            // still runs on the dense half alone: a degraded ranking, not a failed one.
+            let sparse_query = match self.embedder.as_ref() {
+                Some(embedder) if embedder.supports_sparse() => {
+                    match embedder.embed_sparse(vec![query.to_string()]).await {
+                        Ok(mut vectors) => vectors.drain(..).next(),
+                        Err(e) => {
+                            tracing::warn!(
+                                "sparse query embedding failed; ranking the summary layer by \
+                                 its dense vector alone: {e}"
+                            );
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
             let summaries = self
                 .summary
-                .search_summary(namespace, emb, top_k, time_range)
+                .search_summary_hybrid(namespace, emb, sparse_query.as_ref(), top_k, time_range)
                 .await?;
             results.extend(summaries.into_iter().map(UnifiedSearchResult::Summary));
         } else {
@@ -497,35 +577,20 @@ impl MemoryBackend for CompositeMemoryBackend {
             metrics.raw_archived += 1;
         }
 
-        // With no embedder this host has no vector layer, so the entry carries
-        // no vector and the text path is the only way back to it. Writing a
-        // zero vector instead would put a well-formed but information-free
-        // point in the collection, where it ties at score 0.0 with every other
-        // such point and answers searches with an arbitrary ranking.
-        let embedding = match self.embedder.as_ref() {
-            Some(embedder) => embedder
-                .embed(vec![text.to_string()])
-                .await?
-                .into_iter()
-                .next()
-                .ok_or_else(|| SFError::Agent("embedder returned no vector".into()))?,
-            None => Vec::new(),
-        };
-        let embedding_model = if embedding.is_empty() {
-            cog_core::NO_EMBEDDING_MODEL
-        } else {
-            "explicit/v1"
-        };
-
+        // Both vectors are filled in by the same helper the auto-ingest path goes
+        // through, so an explicitly ingested memory and an extracted summary are
+        // embedded one way and carry the model's own name rather than a label the
+        // call site picked.
         let summary = SummaryEntry::new(
             &id,
             namespace,
             text,
-            embedding,
-            embedding_model,
+            Vec::new(),
+            cog_core::NO_EMBEDDING_MODEL,
             cog_core::SourceRef::new(format!("memory://{}", id), "explicit/v1"),
         )
         .with_importance(importance);
+        let summary = self.embed_entry(&summary).await?;
 
         self.summary.store_summary(namespace, &summary).await?;
 

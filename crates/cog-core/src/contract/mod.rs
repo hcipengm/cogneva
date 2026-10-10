@@ -32,6 +32,7 @@ pub mod prompt;
 pub mod protocol;
 pub mod quota;
 pub mod reflection;
+pub mod reranker;
 pub mod resilience;
 pub mod sandbox;
 pub mod shutdown;

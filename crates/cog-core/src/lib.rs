@@ -47,6 +47,7 @@ pub use contract::promotion::*;
 pub use contract::protocol::*;
 pub use contract::quota::*;
 pub use contract::reflection::*;
+pub use contract::reranker::*;
 pub use contract::resilience::*;
 pub use contract::sandbox::*;
 pub use contract::shutdown::*;

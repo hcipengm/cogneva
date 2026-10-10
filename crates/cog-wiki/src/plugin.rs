@@ -59,7 +59,7 @@ impl cog_core::SystemPlugin for WikiPlugin {
 
         // Build and publish UnifiedKnowledgeBackend when possible.
         if let Some(ref wiki) = wiki_adapter {
-            // Both services are wired as handles rather than read here. The
+            // All three services are wired as handles rather than read here. The
             // memory plugin publishes them and it initialises in this plugin's
             // own layer, where plugins initialise concurrently -- so a read
             // here yields a service only when that plugin's init happens to
@@ -68,7 +68,8 @@ impl cog_core::SystemPlugin for WikiPlugin {
             let mut unified = crate::UnifiedKnowledgeBackend::new()
                 .with_wiki(wiki.clone())
                 .with_memory_late(cog_core::LateService::new(ctx.clone()))
-                .with_embedding_late(cog_core::LateService::new(ctx.clone()));
+                .with_embedding_late(cog_core::LateService::new(ctx.clone()))
+                .with_reranker_late(cog_core::LateService::new(ctx.clone()));
             // The retrieval outcome series is the only place that separates a
             // layer this process does not hold from a layer that answered with
             // nothing, and the plugin context is in hand only here.

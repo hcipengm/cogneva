@@ -33,6 +33,11 @@ pub mod schema_backend;
 pub mod types;
 pub mod vector_summary_backend;
 pub use backend::MemoryMemoryBackend;
+/// The reranker contract itself lives in `cog-core`, because its consumer
+/// (`cog-wiki`) must not depend on this crate; only the local implementation is
+/// here. Re-exported so a caller that already depends on `cog-memory` does not
+/// have to reach for both crates to name one concept.
+pub use cog_core::{RerankResult, RerankerProvider};
 pub use composite::CompositeMemoryBackend;
 pub use consolidator::{ConsolidationStrategy, MemoryConsolidator};
 pub use embedding_provider::FastEmbedProvider;
@@ -45,7 +50,7 @@ pub use noop_backends::{NoopMetricsBackend, NoopVectorBackend};
 pub use observable::MemoryObservable;
 pub use postgres_entry_store::{PostgresEntryStore, SUMMARY_ENTRIES_DDL};
 pub use postgres_schema::{PostgresSchemaBackend, SCHEMA_ENTRIES_DDL};
-pub use reranker::{FastEmbedRerankerProvider, RerankResult, RerankerProvider};
+pub use reranker::FastEmbedRerankerProvider;
 pub use schema_backend::MemorySchemaBackend;
 pub use vector_summary_backend::{VectorSummaryBackend, DEFAULT_SUMMARY_COLLECTION};
 pub mod plugin;

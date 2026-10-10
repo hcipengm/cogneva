@@ -49,14 +49,15 @@ pub struct MemoryConfig {
     pub auto_ingest: bool,
     /// 启动期是否加载 ONNX 向量模型（BGE-M3，dense + sparse）。
     ///
-    /// 加载把约 2.1GiB 权重读进常驻内存，且 dense 与 sparse 各开一个 session，
-    /// 同一份权重实际占两遍；模型不在本地缓存时还会先从 HuggingFace 拉取——
-    /// 离线集群里那次连接既不成功也不失败（客户端无超时），插件 init 会一直
-    /// 挂着，直到存活探针把 Pod 杀掉。因此只有权重已就位（由部署侧以只读卷或
-    /// 共享目录提供，权重本身不进镜像）且内存吃得下的部署才打开；其余保持关闭，
-    /// 向量能力缺席但启动不受影响。重排模型（reranker）另有开关。
+    /// 两个 session 读同一份权重文件（实测进程峰值 RSS：dense 与 sparse 两个
+    /// session 一起 1.67GiB，单开 dense 不更小——两个 session 走的是同一批文件页，
+    /// 加第二个几乎不涨）。模型不在本地缓存时会先从 HuggingFace 拉取——离线集群
+    /// 里那次连接既不成功也不失败（客户端无超时），插件 init 会一直挂着，直到存活
+    /// 探针把 Pod 杀掉。因此只有权重已就位（由部署侧以只读卷或共享目录提供，
+    /// 权重本身不进镜像）且内存吃得下的部署才打开；其余保持关闭，向量能力缺席
+    /// 但启动不受影响。重排模型（reranker）另有开关。
     pub load_embedding_model: bool,
-    /// 启动期是否加载 ONNX 重排模型（BGE-Reranker-V2-M3，约 2.1GiB 常驻）。
+    /// 启动期是否加载 ONNX 重排模型（BGE-Reranker-V2-M3，实测进程峰值 RSS 1.67GiB）。
     /// 关闭原因同 [`Self::load_embedding_model`]；其拉取路径写死
     /// `https://huggingface.co`、不吃 `HF_ENDPOINT`，离线集群只能靠本地就位。
     pub load_reranker_model: bool,

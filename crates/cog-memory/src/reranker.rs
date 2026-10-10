@@ -1,30 +1,4 @@
-use cog_core::SFResult;
-
-/// Result of a rerank operation.
-#[derive(Debug, Clone)]
-pub struct RerankResult {
-    pub document: Option<String>,
-    pub score: f32,
-    pub index: usize,
-}
-
-/// Abstraction for cross-encoder reranking models.
-/// Rerankers take a query and a list of candidate documents,
-/// then score each pair for relevance.  They are typically used
-/// as the second stage of a two-stage retrieval pipeline:
-/// 1. Recall (dense + sparse hybrid) → Top-K candidates
-/// 2. Rerank → Top-N most relevant documents.
-#[async_trait::async_trait]
-pub trait RerankerProvider: Send + Sync {
-    /// Rerank candidate documents against a query.
-    /// Returns results sorted by descending relevance score.
-    async fn rerank(
-        &self,
-        query: &str,
-        documents: Vec<String>,
-        top_n: usize,
-    ) -> SFResult<Vec<RerankResult>>;
-}
+use cog_core::{RerankResult, RerankerProvider, SFResult};
 
 /// Local reranker backed by [fastembed](https://crates.io/crates/fastembed).
 /// Uses **BGE-Reranker-V2-M3** (`rozgo/bge-reranker-v2-m3`) by default:

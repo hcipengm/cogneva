@@ -20,13 +20,12 @@
 //! - **The dense control separates**: `如何申请年假？` against an annual-leave policy scores
 //!   cosine **0.717**, the same question against an unrelated canteen menu **0.430**. A
 //!   loader that returned whatever its bytes happened to mean would not keep that order.
-//! - **The sparse session answers too**, and its vector is a map from token id to weight with
-//!   the two sides the same length -- the shape the sparse column and the collection's named
-//!   sparse vector both take.
+//! - **The sparse session loads from the same directory** and produces indices and weights
+//!   of equal length over a nonempty support: the collection has a named sparse vector ready
+//!   to hold one, and hybrid retrieval is the reason this model was picked.
 //!
-//! It needs about 4.3 GiB of weights resident (each session loads its own), so it is ignored
-//! by default and is not in CI (a runner has neither the weights nor a mirror to fetch them
-//! from):
+//! It needs both sessions resident, so it is ignored by default and is not in CI (a runner
+//! has neither the weights nor a mirror to fetch them from):
 //!
 //! ```text
 //! deploy/scripts/fetch-model-weights.sh --model bge-m3 --dest /srv/cogneva/models/fastembed
@@ -37,7 +36,7 @@
 //! Re-run it before treating the numbers as current: they are a statement about specific
 //! weights, not about the idea of a local embedding session. What this file asserts is only
 //! what has to hold for the directory to be usable at all: that a vector of the declared
-//! width comes out, that the sparse side is non-empty, and that the dense vectors keep a
+//! width comes out, that the sparse side produces one, and that the dense vectors keep a
 //! relevant pair apart from an irrelevant one.
 
 use std::path::PathBuf;
@@ -108,27 +107,40 @@ async fn the_embedding_loader_reads_both_sessions_from_a_directory() {
         );
     }
 
-    // The sparse side: token ids with weights, the two sides the same length.
+    // The sparse side: a session over the same directory, producing the token weights the
+    // collection's named sparse vector holds. Indices and values are the two halves of one
+    // vector, so a length mismatch is a vector the store cannot index at all.
+    provider
+        .sparse_status()
+        .expect("the sparse session did not load from the same directory as the dense one");
+    assert!(
+        provider
+            .embed_sparse(Vec::new())
+            .await
+            .expect("an empty batch needs no model to be empty")
+            .is_empty(),
+        "an empty request has nothing to embed and no reason to fail"
+    );
     let sparse = provider
-        .embed_sparse(vec![QUERY.to_string()])
+        .embed_sparse(vec![QUERY.to_string(), RELEVANT.to_string()])
         .await
         .expect("the sparse session did not embed");
-    assert_eq!(sparse.len(), 1, "one sparse vector per input");
-    assert!(
-        !sparse[0].indices.is_empty(),
-        "an empty sparse vector carries no token and would match nothing"
-    );
-    assert_eq!(
-        sparse[0].indices.len(),
-        sparse[0].values.len(),
-        "the sparse vector's indices and weights have to line up"
-    );
-    let ids: std::collections::BTreeSet<u32> = sparse[0].indices.iter().copied().collect();
-    assert_eq!(
-        ids.len(),
-        sparse[0].indices.len(),
-        "a repeated token id would make the sparse vector ambiguous to a dot product"
-    );
+    assert_eq!(sparse.len(), 2, "one sparse vector per input, in order");
+    for vector in &sparse {
+        assert!(
+            !vector.indices.is_empty(),
+            "a sparse vector with no terms would match no query that is not also empty"
+        );
+        assert_eq!(
+            vector.indices.len(),
+            vector.values.len(),
+            "a sparse vector whose two halves disagree on length indexes nothing"
+        );
+        assert!(
+            vector.values.iter().all(|v| v.is_finite()),
+            "a sparse vector with a non-finite weight cannot be scored against anything"
+        );
+    }
 
     // The control, and the only thing asserted about quality here: a relevant pair has to
     // score above an irrelevant one, or the sweep below would be reading numbers from a

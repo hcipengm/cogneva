@@ -113,6 +113,18 @@ impl cog_core::SystemPlugin for MemoryPlugin {
             match crate::FastEmbedProvider::try_new() {
                 Ok(p) => {
                     info!("FastEmbed BGE-M3 loaded: {} dim", p.dimension());
+                    // 两个 session 的成败各自独立：sparse 没起来只是少了混合检索的那一半，
+                    // 说出来让读者知道该修什么，而不是让整条嵌入能力跟着一起消失。
+                    match p.sparse_status() {
+                        Ok(()) => info!(
+                            "FastEmbed BGE-M3 sparse session loaded; hybrid retrieval has both \
+                             halves"
+                        ),
+                        Err(reason) => warn!(
+                            "FastEmbed BGE-M3 sparse session is absent ({reason}); dense \
+                             embedding works, sparse requests will be refused"
+                        ),
+                    }
                     Some(Arc::new(p))
                 }
                 Err(e) => {
@@ -121,10 +133,11 @@ impl cog_core::SystemPlugin for MemoryPlugin {
                 }
             }
         } else {
-            // 关掉是因为这台机器吃不下：权重约 2.1GiB 常驻（dense 与 sparse 各开一个
-            // session，等于同一份权重占两遍），且本地无缓存时会向 HuggingFace 发一次
-            // 没有超时的拉取，离线集群里会把 init 挂死。权重不进镜像，由部署侧以
-            // 只读卷/共享目录提供；确认权重就位且内存足够再打开即恢复向量能力。
+            // 关掉是因为权重不在镜像里：本地无缓存时会向 HuggingFace 发一次没有超时的
+            // 拉取，离线集群里会把 init 挂死。部署侧把权重以只读卷挂上、用一个 env
+            // 覆盖打开这个开关（`FASTEMBED_CACHE_DIR` 指名那份目录），确认权重就位再
+            // 打开即恢复向量能力。dense 与 sparse 两个 session 一起实测峰值 RSS
+            // 1.67GiB：两者读同一份权重文件，加第二个几乎不涨。
             info!(
                 "Embedding model loading disabled (memory.load_embedding_model=false); \
                  published vectors stay unavailable"
@@ -259,7 +272,8 @@ impl cog_core::SystemPlugin for MemoryPlugin {
         };
 
         // ── Reranker provider ──
-        let reranker_provider: Option<Arc<dyn crate::RerankerProvider>> = if load_reranker_model {
+        let reranker_provider: Option<Arc<dyn cog_core::RerankerProvider>> = if load_reranker_model
+        {
             match crate::FastEmbedRerankerProvider::try_new() {
                 Ok(p) => {
                     info!("FastEmbed BGE-Reranker-V2-M3 loaded");
@@ -302,7 +316,9 @@ impl cog_core::SystemPlugin for MemoryPlugin {
             info!("MemoryPlugin embed provider published");
         }
         if let Some(ref p) = reranker_provider {
-            ctx.publish(Arc::new(RerankerProviderHolder(p.clone())));
+            // 按 trait 对象发布（与 embed provider 同一条路）：消费方在 cog-wiki，
+            // 它只依赖 cog-core，认不出本 crate 的具体类型。
+            ctx.publish_service::<dyn cog_core::RerankerProvider>(p.clone());
             info!("MemoryPlugin reranker provider published");
         }
 
@@ -466,9 +482,6 @@ impl cog_core::SystemPlugin for MemoryPlugin {
         Ok(())
     }
 }
-
-/// Wrapper so `dyn RerankerProvider` can be stored in [`cog_core::PluginContext`].
-pub struct RerankerProviderHolder(pub Arc<dyn crate::RerankerProvider>);
 
 /// Static descriptor for auto-discovery.
 pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
