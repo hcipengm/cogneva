@@ -326,12 +326,12 @@ fn fold_decomposition(
     })
 }
 
-/// The leading `SUMMARY_MAX_CHARS` characters of `text`, never splitting one.
-fn clip(text: &str) -> String {
-    if text.chars().count() <= SUMMARY_MAX_CHARS {
+/// The leading `max_chars` characters of `text`, never splitting one.
+fn clip(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
         return text.to_string();
     }
-    text.chars().take(SUMMARY_MAX_CHARS).collect()
+    text.chars().take(max_chars).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -434,7 +434,15 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
                             id: r.document.id.clone(),
                             source: "wiki".into(),
                             title: r.document.title.clone(),
-                            content: r.document.content.clone(),
+                            // A page arrives whole and has no size bound of its
+                            // own, unlike the memory rows above: those were
+                            // already clipped by the layer that wrote them, so
+                            // the two layers would otherwise hand the same
+                            // caller rows whose sizes differ by whatever the
+                            // wiki happens to hold. Clipped here, at the read
+                            // side, because the backend has to go on returning
+                            // the document it holds.
+                            content: clip(&r.document.content, crate::WIKI_PAGE_PROMPT_CHARS),
                             relevance_score: r.score,
                             metadata: Some(serde_json::json!({
                                 "path": r.document.path,
@@ -651,7 +659,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
         let record_id = format!("exec:{}:{}", task.id, chrono::Utc::now().timestamp_millis());
         let task_type = task.task_type.retrieval_class();
         let result_summary = serde_json::to_string(&result.output)
-            .map(|output| clip(&output))
+            .map(|output| clip(&output, SUMMARY_MAX_CHARS))
             .unwrap_or_default();
 
         // --- Layer 1: Schema ---
@@ -724,7 +732,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
         // a caller writing rows here directly would have to guess the query
         // they have to match.
         let input_summary = serde_json::to_string(&task.input)
-            .map(|input| clip(&input))
+            .map(|input| clip(&input, SUMMARY_MAX_CHARS))
             .unwrap_or_default();
         if result.success {
             self.archive_implementation(
@@ -784,7 +792,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
             .input
             .get("goal")
             .and_then(|goal| goal.as_str())
-            .map(clip)
+            .map(|goal| clip(goal, SUMMARY_MAX_CHARS))
             .unwrap_or_default();
         let id = cog_core::schema_entry_id(NS_DECOMPOSITION, SchemaKind::Learning, &key);
 
@@ -887,7 +895,7 @@ impl UnifiedKnowledgeBackend {
             pattern_id: cog_core::schema_entry_id(NS_FAILURE, SchemaKind::ErrorPattern, &key),
             task_type: task_type.to_string(),
             failure_summary: failure_summary.to_string(),
-            root_cause: clip(root_cause),
+            root_cause: clip(root_cause, SUMMARY_MAX_CHARS),
             occurrence_count: occurrences,
             last_occurrence: chrono::Utc::now(),
         };
@@ -971,6 +979,7 @@ impl UnifiedKnowledgeBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::WIKI_PAGE_PROMPT_CHARS;
     use cog_core::contract::knowledge::RETRIEVAL_OUTCOMES;
     use cog_core::{SFError, WikiDocument, WikiSearchResult};
 
@@ -1147,6 +1156,68 @@ mod tests {
         assert_eq!(entries[0].id, "doc-high", "highest score first");
         assert_eq!(entries[1].id, "doc-mid");
         assert!(entries.iter().all(|e| e.source == "wiki"));
+    }
+
+    /// A wiki holding one page far longer than a prompt should carry.
+    struct MockWikiWithLongPage;
+
+    #[async_trait]
+    impl WikiBackend for MockWikiWithLongPage {
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock-long"
+        }
+
+        async fn ingest_document(&self, _relative_path: &str, _content: &str) -> SFResult<()> {
+            Ok(())
+        }
+
+        async fn search(&self, _query: &str, _top_k: usize) -> SFResult<Vec<WikiSearchResult>> {
+            let doc = |id: &str, content: String| WikiSearchResult {
+                document: WikiDocument {
+                    id: id.into(),
+                    path: format!("{id}.md"),
+                    title: id.into(),
+                    content,
+                    tags: None,
+                    created_at: None,
+                    updated_at: None,
+                },
+                score: 1.0,
+                match_type: None,
+                highlights: vec![],
+            };
+            Ok(vec![
+                doc("page-long", "x".repeat(WIKI_PAGE_PROMPT_CHARS * 3)),
+                doc("page-short", "y".repeat(10)),
+            ])
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wiki_page_reaches_the_caller_bounded() {
+        // The wiki layer has no size bound of its own, so without this a
+        // retrieval hands the caller however much the wiki happens to hold. The
+        // backend still returns the document it holds -- the bound is applied
+        // where the text becomes prompt context, which is here.
+        let backend = UnifiedKnowledgeBackend::new().with_wiki(Arc::new(MockWikiWithLongPage));
+        let task = Task::new(
+            "t1".to_string(),
+            cog_core::TaskType::Custom("test".into()),
+            serde_json::json!({}),
+        );
+
+        let entries = backend.retrieve_relevant(&task, "query", 5).await.unwrap();
+        let long = entries.iter().find(|e| e.id == "page-long").unwrap();
+        assert_eq!(long.content.chars().count(), WIKI_PAGE_PROMPT_CHARS);
+
+        // Short enough to fit is left alone: a bound that rewrote every row
+        // would be a rewrite, not a bound.
+        let short = entries.iter().find(|e| e.id == "page-short").unwrap();
+        assert_eq!(short.content, "y".repeat(10));
     }
 
     #[tokio::test]

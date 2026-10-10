@@ -402,7 +402,12 @@ impl WikiMaintainer for LlmWikiMaintainer {
                 continue; // 跳过机器可读副本，只用 markdown 渲染
             }
             sources.push(r.document.path.clone());
-            let snippet: String = r.document.content.chars().take(2_000).collect();
+            let snippet: String = r
+                .document
+                .content
+                .chars()
+                .take(crate::WIKI_PAGE_PROMPT_CHARS)
+                .collect();
             context.push_str(&format!("## 来源 {}\n{}\n\n", r.document.path, snippet));
         }
 
