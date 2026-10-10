@@ -23,10 +23,15 @@
 //!
 //! The table is the store's own ([`PostgresTasteIntentStore::init_schema`]): a
 //! hand-written schema would go on passing after the production one changed
-//! shape. Every row written here carries [`PROBE_SUBMITTER`] and is removed
-//! afterwards, so a throwaway database is left as it was found.
+//! shape. The cases share one server and run in parallel, so each builds that
+//! table in a schema of its own and drops it again — one table between them is
+//! a race on two counts, over the rows in it and over the catalogue entries for
+//! it, and a database is left as it was found either way.
 
-use chrono::{DateTime, Duration, Utc};
+use std::str::FromStr;
+
+use chrono::{DateTime, Duration, SubsecRound, Utc};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -36,7 +41,9 @@ use cog_core::{
 };
 use cog_storage::PostgresTasteIntentStore;
 
-/// Stamped on every row this test writes, so cleanup touches nothing else.
+/// Stamped on every row this test writes, so a row left behind by an
+/// interrupted run is recognisable as one of these tests' rather than a
+/// deployment's.
 const PROBE_SUBMITTER: &str = "probe-taste-intent-store";
 
 fn database_url() -> String {
@@ -54,30 +61,79 @@ fn preference_says_prefer(preferred: &str) -> TasteIntentPayload {
     })
 }
 
+/// The instant as the column holds it: microseconds, not the clock's
+/// nanoseconds.
+///
+/// The store writes `submitted_at` into a `timestamptz`, which keeps
+/// microseconds, so an instant handed over as it was read comes back differing
+/// in its last three digits. Comparing those two is a statement about the clock
+/// rather than about the store; handing over the instant the column can hold is
+/// what makes the equality below about what was stored and read back.
+fn as_the_column_holds_it(at: DateTime<Utc>) -> DateTime<Utc> {
+    at.trunc_subsecs(6)
+}
+
 fn submission(subject: &str, at: DateTime<Utc>) -> TasteIntent {
     TasteIntent {
         id: Uuid::new_v4(),
         subject: subject.to_string(),
         submitted_by: PROBE_SUBMITTER.to_string(),
-        submitted_at: at,
+        submitted_at: as_the_column_holds_it(at),
         payload: preference_says_prefer("the cheap one"),
     }
 }
 
-/// Both faces: one caller may hold only the sink, so the store is used the way
-/// its two consumer kinds use it rather than as one object with two methods.
-async fn store(pool: &PgPool) -> PostgresTasteIntentStore {
-    let store = PostgresTasteIntentStore::new(pool.clone());
-    store.init_schema().await.unwrap();
-    store
+/// Where one case's copy of the table lives. Naming it per case is what makes
+/// each reading here about this case's own rows: pointed at one table the cases
+/// are one another's writers, and a sibling's cleanup mid-assertion deletes
+/// submissions this case has just written.
+fn schema_of(case: &str) -> String {
+    format!("probe_taste_{case}")
 }
 
-async fn remove(pool: &PgPool) {
-    sqlx::query("DELETE FROM cog_taste_intents WHERE submitted_by = $1")
-        .bind(PROBE_SUBMITTER)
-        .execute(pool)
+/// An empty schema holding the store's own table, and the store over it.
+///
+/// `CREATE TABLE IF NOT EXISTS` is a check followed by a create, so two cases
+/// creating the same table at the same instant can both pass the check and one
+/// of them then loses on the catalogue's unique index — that is the failure
+/// this suite reported, and it is not one a case can retry its way out of
+/// without reading rows it did not write. Separate schemas remove the check
+/// both ways: the rows and the catalogue entries are this case's alone.
+async fn probe(case: &str) -> (PgPool, PostgresTasteIntentStore) {
+    let schema = schema_of(case);
+    // The schema has to exist before a connection can name it as its search
+    // path, and the store creates its table in whatever schema the path
+    // selects — a path naming nothing would leave it with nowhere to build.
+    let setup = PgPool::connect(&database_url()).await.unwrap();
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(&setup)
         .await
         .unwrap();
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&setup)
+        .await
+        .unwrap();
+    setup.close().await;
+
+    let options = PgConnectOptions::from_str(&database_url())
+        .expect("COGNEVA_TEST_DATABASE_URL is not a PostgreSQL URL")
+        .options([("search_path", schema.as_str())]);
+    let pool = PgPoolOptions::new().connect_with(options).await.unwrap();
+    let store = PostgresTasteIntentStore::new(pool.clone());
+    store.init_schema().await.unwrap();
+    (pool, store)
+}
+
+/// Hand the schema back with everything in it, so a live database is left as it
+/// was found.
+async fn done(case: &str) {
+    let schema = schema_of(case);
+    let pool = PgPool::connect(&database_url()).await.unwrap();
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
 }
 
 /// A submission is readable while nothing has claimed it, and reading it back
@@ -85,9 +141,8 @@ async fn remove(pool: &PgPool) {
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn a_submission_is_pending_until_something_claims_it() {
-    let pool = PgPool::connect(&database_url()).await.unwrap();
-    let store = store(&pool).await;
-    remove(&pool).await;
+    let case = "pending_until_claimed";
+    let (_pool, store) = probe(case).await;
 
     let submitted = submission("which retry policy", Utc::now());
     store.submit(&submitted).await.unwrap();
@@ -101,7 +156,7 @@ async fn a_submission_is_pending_until_something_claims_it() {
     );
     assert_eq!(pending[0].intent.payload.kind(), submitted.payload.kind());
 
-    remove(&pool).await;
+    done(case).await;
 }
 
 /// Filing is what takes a submission out of the queue, and the task it names
@@ -110,9 +165,8 @@ async fn a_submission_is_pending_until_something_claims_it() {
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn a_filed_submission_leaves_the_queue_and_carries_its_task() {
-    let pool = PgPool::connect(&database_url()).await.unwrap();
-    let store = store(&pool).await;
-    remove(&pool).await;
+    let case = "filed_leaves_queue";
+    let (_pool, store) = probe(case).await;
 
     let submitted = submission("which retry policy", Utc::now());
     store.submit(&submitted).await.unwrap();
@@ -133,7 +187,7 @@ async fn a_filed_submission_leaves_the_queue_and_carries_its_task() {
     assert_eq!(filed[0].intent.id, submitted.id);
     assert_eq!(filed[0].task_id.as_deref(), Some("task-42"));
 
-    remove(&pool).await;
+    done(case).await;
 }
 
 /// The first decision about a submission is the one that stands. A claimer
@@ -142,9 +196,8 @@ async fn a_filed_submission_leaves_the_queue_and_carries_its_task() {
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn a_second_disposition_does_not_overwrite_the_first() {
-    let pool = PgPool::connect(&database_url()).await.unwrap();
-    let store = store(&pool).await;
-    remove(&pool).await;
+    let case = "second_disposition";
+    let (_pool, store) = probe(case).await;
 
     let submitted = submission("which retry policy", Utc::now());
     store.submit(&submitted).await.unwrap();
@@ -168,7 +221,7 @@ async fn a_second_disposition_does_not_overwrite_the_first() {
     );
     assert_eq!(filed[0].task_id.as_deref(), Some("task-42"));
 
-    remove(&pool).await;
+    done(case).await;
 }
 
 /// Disposing an id nobody submitted is not an error and writes nothing: the
@@ -176,9 +229,8 @@ async fn a_second_disposition_does_not_overwrite_the_first() {
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn disposing_an_unknown_id_writes_nothing() {
-    let pool = PgPool::connect(&database_url()).await.unwrap();
-    let store = store(&pool).await;
-    remove(&pool).await;
+    let case = "unknown_id";
+    let (_pool, store) = probe(case).await;
 
     store
         .dispose(Uuid::new_v4(), TasteDisposition::Filed, Some("task-42"))
@@ -191,7 +243,7 @@ async fn disposing_an_unknown_id_writes_nothing() {
         .unwrap()
         .is_empty());
 
-    remove(&pool).await;
+    done(case).await;
 }
 
 /// The filed window is what keeps a reader from re-reading the whole history
@@ -208,9 +260,8 @@ async fn disposing_an_unknown_id_writes_nothing() {
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn the_filed_window_follows_when_the_work_was_handed_over() {
-    let pool = PgPool::connect(&database_url()).await.unwrap();
-    let store = store(&pool).await;
-    remove(&pool).await;
+    let case = "filed_window";
+    let (pool, store) = probe(case).await;
 
     let now = Utc::now();
     // Submitted long before the window opens, filed inside it.
@@ -242,7 +293,7 @@ async fn the_filed_window_follows_when_the_work_was_handed_over() {
         "窗口要跟着「活交出去的时刻」，不是「提交的时刻」"
     );
 
-    remove(&pool).await;
+    done(case).await;
 }
 
 /// The filed read is oldest filing first, so the reader's order is the order the
@@ -250,9 +301,8 @@ async fn the_filed_window_follows_when_the_work_was_handed_over() {
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn filed_submissions_come_back_in_the_order_they_were_handed_over() {
-    let pool = PgPool::connect(&database_url()).await.unwrap();
-    let store = store(&pool).await;
-    remove(&pool).await;
+    let case = "filed_order";
+    let (_pool, store) = probe(case).await;
 
     let now = Utc::now();
     // Submitted newest-first, so an implementation ordering by submission would
@@ -280,7 +330,7 @@ async fn filed_submissions_come_back_in_the_order_they_were_handed_over() {
         .collect();
     assert_eq!(subjects, vec!["filed first", "filed second"]);
 
-    remove(&pool).await;
+    done(case).await;
 }
 
 /// A re-sent submission keeps the first one's words. The submitter is answered
@@ -289,9 +339,8 @@ async fn filed_submissions_come_back_in_the_order_they_were_handed_over() {
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn re_submitting_the_same_id_keeps_the_first_words() {
-    let pool = PgPool::connect(&database_url()).await.unwrap();
-    let store = store(&pool).await;
-    remove(&pool).await;
+    let case = "resend";
+    let (_pool, store) = probe(case).await;
 
     let first = submission("which retry policy", Utc::now());
     let mut second = first.clone();
@@ -303,7 +352,7 @@ async fn re_submitting_the_same_id_keeps_the_first_words() {
     assert_eq!(pending.len(), 1, "one id is one submission");
     assert_eq!(pending[0].intent.payload, first.payload);
 
-    remove(&pool).await;
+    done(case).await;
 }
 
 /// Oldest first, and the cap counts the rows handed over rather than the rows
@@ -311,9 +360,8 @@ async fn re_submitting_the_same_id_keeps_the_first_words() {
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn pending_submissions_come_back_oldest_first_within_the_cap() {
-    let pool = PgPool::connect(&database_url()).await.unwrap();
-    let store = store(&pool).await;
-    remove(&pool).await;
+    let case = "pending_cap";
+    let (_pool, store) = probe(case).await;
 
     let now = Utc::now();
     // Submitted out of order, so an implementation ordering by insertion would
@@ -333,7 +381,7 @@ async fn pending_submissions_come_back_oldest_first_within_the_cap() {
     assert_eq!(capped.len(), 1);
     assert_eq!(capped[0].intent.subject, "oldest");
 
-    remove(&pool).await;
+    done(case).await;
 }
 
 /// A payload that no longer parses is one unreadable row, not a failed batch:
@@ -342,9 +390,8 @@ async fn pending_submissions_come_back_oldest_first_within_the_cap() {
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn an_unreadable_payload_does_not_take_the_rest_of_the_batch_with_it() {
-    let pool = PgPool::connect(&database_url()).await.unwrap();
-    let store = store(&pool).await;
-    remove(&pool).await;
+    let case = "unreadable_payload";
+    let (pool, store) = probe(case).await;
 
     let readable = submission("readable", Utc::now());
     store.submit(&readable).await.unwrap();
@@ -368,7 +415,7 @@ async fn an_unreadable_payload_does_not_take_the_rest_of_the_batch_with_it() {
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].intent.id, readable.id);
 
-    remove(&pool).await;
+    done(case).await;
 }
 
 /// The verdict vocabulary crosses the storage boundary as its own tag, not as
@@ -377,9 +424,8 @@ async fn an_unreadable_payload_does_not_take_the_rest_of_the_batch_with_it() {
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn each_kind_comes_back_as_the_kind_it_was_submitted_as() {
-    let pool = PgPool::connect(&database_url()).await.unwrap();
-    let store = store(&pool).await;
-    remove(&pool).await;
+    let case = "kind_roundtrip";
+    let (_pool, store) = probe(case).await;
 
     let now = Utc::now();
     let verdict = TasteIntent {
@@ -404,5 +450,5 @@ async fn each_kind_comes_back_as_the_kind_it_was_submitted_as() {
     assert_eq!(pending[1].intent.payload, preference.payload);
     assert_eq!(pending[1].intent.payload.kind(), "direction_preference");
 
-    remove(&pool).await;
+    done(case).await;
 }
