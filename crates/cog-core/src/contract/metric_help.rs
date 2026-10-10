@@ -663,6 +663,26 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          names the archive endpoint rather than ordinary truncation.",
     ),
     (
+        crate::metric_names::EVENT_BUS_DROPPED_TOTAL.as_str(),
+        "Run histories the event bus mouth threw away instead of publishing, \
+         labelled by `cause`, one increment per dropped event. It is on this \
+         series and not on a log line because a dropped AgentEnd is the loss of \
+         the run's only durable copy: with a mouth attached the event goes to \
+         the bus and nowhere else, so nothing else holds it and nothing retries \
+         it. The two causes are different defects and are why the series carries \
+         a label rather than a single number. `buffer_full` is backpressure \
+         working as designed -- the publisher is retrying a fault that clears, \
+         the bounded queue at the entrance fills, and the run would have gone out \
+         had it waited -- so a reader treats it as a capacity reading and the \
+         next healthy tick stops incrementing it. `payload_rejected` is a \
+         permanent refusal: the bytes are larger than the transport's own frame \
+         limit and no retry makes them smaller, so the mouth consumes that event \
+         once and the run is unreadable forever, which is the one a reader alerts \
+         on. The two must not be summed, because the total cannot tell a bus that \
+         was busy for a moment from a conversation that is gone; read them per \
+         `cause`.",
+    ),
+    (
         crate::metric_names::TOOL_OUTPUT_FETCH_BUDGET_EXHAUSTED_TOTAL.as_str(),
         "Reads of an archived tool output that found the source but stopped \
          short of its bytes because the payload outgrew the byte budget the \

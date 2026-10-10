@@ -630,6 +630,10 @@ mod ready_pipeline_tests {
 
     #[async_trait]
     impl MessageBackend for ScriptedBackend {
+        async fn payload_limit(&self, _subject: &str) -> SFResult<Option<usize>> {
+            Ok(None)
+        }
+
         async fn publish(&self, subject: &str, payload: &[u8]) -> SFResult<()> {
             self.published
                 .lock()
@@ -936,6 +940,10 @@ mod ready_pipeline_tests {
 
     #[async_trait]
     impl MessageBackend for QueueBackend {
+        async fn payload_limit(&self, _subject: &str) -> SFResult<Option<usize>> {
+            Ok(None)
+        }
+
         async fn publish(&self, subject: &str, payload: &[u8]) -> SFResult<()> {
             self.published
                 .lock()
@@ -1155,6 +1163,10 @@ mod ready_queue_placement_tests {
 
     #[async_trait]
     impl MessageBackend for PerStreamBackend {
+        async fn payload_limit(&self, _subject: &str) -> SFResult<Option<usize>> {
+            Ok(None)
+        }
+
         async fn publish(&self, _subject: &str, _payload: &[u8]) -> SFResult<()> {
             Ok(())
         }

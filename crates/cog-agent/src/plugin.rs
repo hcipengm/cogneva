@@ -323,6 +323,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
                         plane_pub.0.clone(),
                         mbc.publish_buffer_capacity,
                         mbc.publish_retry_base_delay_ms,
+                        ctx.consume_service::<dyn cog_core::MetricsBackend>(),
                     );
                     pool_builder = pool_builder.with_event_bus_sink(sink);
                     info!("AgentPlugin AgentEnd event bus sink attached");

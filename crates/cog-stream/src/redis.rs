@@ -112,6 +112,12 @@ async fn connect(client: &redis::Client) -> SFResult<ConnectionManager> {
 
 #[async_trait]
 impl MessageBackend for RedisMessageBackend {
+    async fn payload_limit(&self, _subject: &str) -> SFResult<Option<usize>> {
+        // Redis Streams 不按「一条消息多少字节」拒绝：它服从 maxmemory 策略，
+        // 那是整实例的容量面而不是单条载荷的界。所以这里没有界可报，而不是报 0。
+        Ok(None)
+    }
+
     async fn publish(&self, subject: &str, payload: &[u8]) -> SFResult<()> {
         let _: String = self
             .connection

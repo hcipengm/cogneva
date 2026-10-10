@@ -476,6 +476,10 @@ mod tests {
 
     #[async_trait]
     impl MessageBackend for TestBackend {
+        async fn payload_limit(&self, _subject: &str) -> SFResult<Option<usize>> {
+            Ok(None)
+        }
+
         async fn publish(&self, subject: &str, payload: &[u8]) -> SFResult<()> {
             let sender = self.sender_for(subject);
             let mut buffers = self.buffers.lock().unwrap();

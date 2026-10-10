@@ -767,6 +767,24 @@ metric_names! {
     // to have that layer names the wiring rather than the data.
     KNOWLEDGE_RETRIEVAL_TOTAL => "cogneva_knowledge_retrieval_total",
 
+    // cog-agent — the event bus mouth a finished run's history goes out through.
+    //
+    // With a delivery mouth attached, a run's AgentEnd goes only here: the agent
+    // keeps no WAL and wires no raw log, and the broadcast copy downstream is
+    // replayed *from* the bus rather than kept beside it, so the bus holds the
+    // only durable copy of a run whose history is long enough to matter. A drop
+    // here is therefore not a buffer refilling; it is a conversation whose whole
+    // record exists nowhere. Labelled by `cause` because the two ways it happens
+    // want opposite repairs and one number would report them as one event:
+    // `buffer_full` is the bounded queue at the entrance backing up while the
+    // publisher retries a fault that clears, so it heals on its own; and
+    // `payload_rejected` is the transport refusing the bytes for exceeding its
+    // own frame limit, which no amount of waiting makes smaller -- the mouth
+    // consumes that event once and the run is gone. A reader must not sum the
+    // label away for that reason: the sum cannot tell "it was busy for a moment"
+    // from "this conversation was lost".
+    EVENT_BUS_DROPPED_TOTAL => "cogneva_event_bus_dropped_total",
+
     // cog-agent — what happened to a tool output too large for the context.
     //
     // Two cells that must be read together. `truncated` says a tool's output did

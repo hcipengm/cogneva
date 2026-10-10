@@ -2764,6 +2764,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl cog_core::MessageBackend for ClaimFailingBus {
+        async fn payload_limit(&self, _subject: &str) -> SFResult<Option<usize>> {
+            Ok(None)
+        }
+
         async fn publish(&self, subject: &str, payload: &[u8]) -> SFResult<()> {
             self.inner.publish(subject, payload).await
         }

@@ -402,6 +402,10 @@ mod tests {
 
     #[async_trait]
     impl MessageBackend for StubBackend {
+        async fn payload_limit(&self, _subject: &str) -> SFResult<Option<usize>> {
+            Ok(None)
+        }
+
         async fn publish(&self, _subject: &str, _payload: &[u8]) -> SFResult<()> {
             Ok(())
         }

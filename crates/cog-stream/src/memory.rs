@@ -54,6 +54,12 @@ impl Default for MemoryMessageBackend {
 
 #[async_trait]
 impl MessageBackend for MemoryMessageBackend {
+    async fn payload_limit(&self, _subject: &str) -> SFResult<Option<usize>> {
+        // 进程内缓冲对单条载荷没有界：内存里放得下就收。所以这里没有界可报，
+        // 而不是报一个 0 或某个「够大」的常数。
+        Ok(None)
+    }
+
     async fn publish(&self, subject: &str, payload: &[u8]) -> SFResult<()> {
         let mut channels = self.channels.lock().unwrap();
         let state = channels

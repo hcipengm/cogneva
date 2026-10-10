@@ -48,6 +48,25 @@ pub trait MessageBackend: Send + Sync {
         Ok(())
     }
 
+    /// The largest single payload this transport will accept on `subject`, when
+    /// it declares one.
+    ///
+    /// `Some(limit)` is the bound the transport itself enforces on one message
+    /// — the server's frame and the stream's own message size, whichever is
+    /// tighter — and it exists so a caller can compare *before* it takes a step
+    /// it cannot undo. A caller that marks its work scheduled and only then
+    /// hands the payload to the publish path has already spent that step when
+    /// the payload turns out to be too large, and what was marked scheduled is
+    /// not offered again. `None` means this backend imposes no bound of this
+    /// kind (an in-memory or test backend), which is not the same statement as
+    /// a declared bound of zero and must not be spelled as one.
+    ///
+    /// Required rather than defaulted: a default answering `None` would let a
+    /// wrapper report "no bound" on behalf of a transport that has one, and the
+    /// caller's pre-check would then wave through exactly the payload the
+    /// publish path goes on to refuse — the ordering this method exists to fix.
+    async fn payload_limit(&self, subject: &str) -> SFResult<Option<usize>>;
+
     /// Subscribe to a subject as part of a consumer group.
     /// Returns a stream of `(message_id, payload)` tuples.  The caller is
     /// responsible for acking individual messages if the implementation

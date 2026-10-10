@@ -158,13 +158,29 @@ impl NatsMessageBackend {
         if e.kind() == async_nats::jetstream::context::PublishErrorKind::Other {
             if let Some(source) = std::error::Error::source(&e) {
                 if let Some(server) = source.downcast_ref::<jetstream::Error>() {
-                    if server.error_code() == jetstream::ErrorCode::STREAM_MESSAGE_EXCEEDS_MAXIMUM {
-                        return SFError::PayloadTooLarge { size, limit: None };
+                    if let Some(cause) = Self::server_refusal_cause(server.error_code(), size) {
+                        return cause;
                     }
                 }
             }
         }
         SFError::DagExecutor(format!("JetStream publish failed: {e}"))
+    }
+
+    /// 服务器拒一条发布时回的错误码 → 该失败的 cause。`None`＝这个码不代表
+    /// 载荷被拒，调用方保留原错、仍按瞬时失败重试。
+    ///
+    /// 只吃码（服务器自己的 `ErrorCode` 类型），不吃任何文本：措辞随上游改写，
+    /// 判定权只在它给的码上。抽成纯函数是为了能直接喂码测——`PublishError` 的
+    /// 构造器是 `pub(crate)`，从我们的 crate 造不出来，而照着错误码本身判的这
+    /// 条支只有服务器真回 10054 才走到；起一台真 NATS 再把流尺寸上限设成正数
+    /// 才能重现，今天那条路不可达，为一个不可达的支引外部依赖不划算。
+    fn server_refusal_cause(code: jetstream::ErrorCode, size: usize) -> Option<SFError> {
+        if code == jetstream::ErrorCode::STREAM_MESSAGE_EXCEEDS_MAXIMUM {
+            Some(SFError::PayloadTooLarge { size, limit: None })
+        } else {
+            None
+        }
     }
 
     /// Ensure a JetStream stream exists for the given subject.
@@ -212,6 +228,14 @@ impl NatsMessageBackend {
 
 #[async_trait]
 impl MessageBackend for NatsMessageBackend {
+    async fn payload_limit(&self, subject: &str) -> SFResult<Option<usize>> {
+        // 与 `publish_batch` 里那道前置检查同一个界：服务器帧与流自己的单条
+        // 上限取小。调用方在**调度之前**问这个数，才可能在动了不可逆的那一步
+        // 之前发现一件发不出去的事。
+        let (_stream, limit) = self.ensure_stream(subject).await?;
+        Ok(Some(limit))
+    }
+
     async fn publish(&self, subject: &str, payload: &[u8]) -> SFResult<()> {
         let (_stream, limit) = self.ensure_stream(subject).await?;
         if payload.len() > limit {
@@ -462,4 +486,48 @@ mod tests {
             4_096
         );
     }
+
+    /// 服务器回的错帧是 JSON，`jetstream::Error` 实现了 `Deserialize` ⇒ 可以拿
+    /// 一条**真实的帧文本**喂进真正的那个类型，再走分类器，不必起 NATS。
+    ///
+    /// `PublishError` 本身构不出来（构造器是 `pub(crate)`），所以这里钉住的是
+    /// 「帧文本 → `jetstream::Error` → 错误码 → cause」这条链上除网络之外的每一步；
+    /// 报文形状取自库解出来的那个 `Response::Err { error }` 里 `error` 一段。
+    #[test]
+    fn a_real_oversize_refusal_frame_maps_to_the_payload_cause() {
+        let server_error: jetstream::Error = serde_json::from_str(
+            r#"{"code":400,"err_code":10054,"description":"maximum message size exceeded"}"#,
+        )
+        .expect("服务器回的错帧就是这个类型反序列化得了的 JSON");
+        assert_eq!(
+            server_error.error_code(),
+            jetstream::ErrorCode::STREAM_MESSAGE_EXCEEDS_MAXIMUM
+        );
+        assert!(matches!(
+            NatsMessageBackend::server_refusal_cause(server_error.error_code(), 2_000_000),
+            Some(SFError::PayloadTooLarge {
+                size: 2_000_000,
+                limit: None
+            })
+        ));
+    }
+
+    /// 只有「超尺寸」那一个码是永久拒绝。别的服务器错误码（这里取一个真实的
+    /// 通用码）仍然是「等一等可能就好」的失败 ⇒ 不翻类型，交回调用方按瞬时重试。
+    #[test]
+    fn other_server_codes_stay_retryable_errors() {
+        let cause =
+            NatsMessageBackend::server_refusal_cause(jetstream::ErrorCode::BAD_REQUEST, 123);
+        assert!(
+            cause.is_none(),
+            "把别的码也当成永久拒绝，等于让一条会被重试救回来的发布就此丢掉"
+        );
+    }
+
+    // TODO(t4a-live-oversize-refusal)：10054 这条支今天在生产里不可达——流的
+    // max_msg_size 是 -1（跟随服务器帧），本地前置检查才是真正生效的那道门，
+    // 服务器拒绝只有在流上限被设成正数、而且本地检查放它过去时才走得到。要实证
+    // 得起一台 NATS，把流的 max_msg_size 设成正数，再发一条超过它的消息。上面
+    // 两个单测钉住的是「码 → cause」与「真帧文本能解出那个码」，没钉住「服务器
+    // 真的会为一条过大消息回 10054」。
 }

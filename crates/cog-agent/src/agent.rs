@@ -1373,7 +1373,7 @@ mod forward_event_tests {
     async fn agent_end_goes_to_sink_not_broadcast_when_sink_set() {
         let (broadcast_tx, mut broadcast_rx) = broadcast::channel::<AgentEvent>(8);
         let spy = Arc::new(SpyPublisher::default());
-        let sink = crate::EventBusSink::spawn(spy.clone(), 8, 1);
+        let sink = crate::EventBusSink::spawn(spy.clone(), 8, 1, None);
 
         forward_event(agent_end("a-bus"), &broadcast_tx, Some(&sink));
 
@@ -1393,7 +1393,7 @@ mod forward_event_tests {
     async fn non_agent_end_stays_on_broadcast_even_with_sink() {
         let (broadcast_tx, mut broadcast_rx) = broadcast::channel::<AgentEvent>(8);
         let spy = Arc::new(SpyPublisher::default());
-        let sink = crate::EventBusSink::spawn(spy.clone(), 8, 1);
+        let sink = crate::EventBusSink::spawn(spy.clone(), 8, 1, None);
 
         forward_event(
             AgentEvent::Heartbeat {

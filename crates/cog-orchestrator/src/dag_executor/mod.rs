@@ -129,6 +129,16 @@ impl DagExecutorRuntime {
     /// published in one batch per queue via [`MessageBackend::publish_batch`]
     /// for lower latency and higher throughput.
     ///
+    /// The size check runs **before** the transition, not after it: scheduling
+    /// is a one-shot, and a task marked scheduled whose payload the transport
+    /// then refuses stays scheduled forever, because the ready scan only ever
+    /// looks at pending tasks. So the payloads are serialised and measured
+    /// first, and a payload over the transport's declared bound refuses the
+    /// whole call with nothing transitioned — the tasks stay pending and are
+    /// offered again on the next scan. The publish path keeps its own check as
+    /// the last line of defence; this one is what keeps the irreversible step
+    /// from being spent on a publication that cannot happen.
+    ///
     /// A task whose artifact is only readable by its producer does not go on
     /// the queue every worker competes for; see [`crate::ready_queue`].
     pub async fn publish_ready_tasks(&self) -> SFResult<()> {
@@ -137,13 +147,10 @@ impl DagExecutorRuntime {
             return Ok(());
         }
 
-        let mut by_stream: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
-
+        // Serialise and group first, changing no state: an oversized payload has
+        // to be found here, while every task is still pending.
+        let mut by_stream: HashMap<String, Vec<(Task, Vec<u8>)>> = HashMap::new();
         for task in ready_tasks {
-            if let Err(e) = self.orchestrator.schedule_task(&task.id).await {
-                tracing::warn!(task_id = %task.id, "schedule_task failed during publish: {e}");
-                continue;
-            }
             let payload = serde_json::to_vec(&task).map_err(SFError::Serialization)?;
             by_stream
                 .entry(crate::ready_queue::ready_stream_for(
@@ -151,10 +158,33 @@ impl DagExecutorRuntime {
                     &self.config.workspace_id,
                 ))
                 .or_default()
-                .push(payload);
+                .push((task, payload));
         }
 
-        for (stream, payloads) in by_stream {
+        for (stream, entries) in &by_stream {
+            let Some(limit) = self.backend.payload_limit(stream).await? else {
+                continue;
+            };
+            if let Some((_, payload)) = entries.iter().find(|(_, payload)| payload.len() > limit) {
+                return Err(SFError::PayloadTooLarge {
+                    size: payload.len(),
+                    limit: Some(limit),
+                });
+            }
+        }
+
+        for (stream, entries) in by_stream {
+            let mut payloads = Vec::with_capacity(entries.len());
+            for (task, payload) in entries {
+                if let Err(e) = self.orchestrator.schedule_task(&task.id).await {
+                    tracing::warn!(task_id = %task.id, "schedule_task failed during publish: {e}");
+                    continue;
+                }
+                payloads.push(payload);
+            }
+            if payloads.is_empty() {
+                continue;
+            }
             self.backend.publish_batch(&stream, &payloads).await?;
         }
         Ok(())
@@ -871,6 +901,11 @@ mod consumer_ack_tests {
         /// "the measurement kept running" apart from "the last reading is still
         /// on screen".
         pending_stats_calls: Arc<std::sync::atomic::AtomicUsize>,
+        /// The single-message bound this transport declares, or `None` for a
+        /// transport that imposes none. A backend that declares one also
+        /// refuses a payload over it, the way a real server does, so a test
+        /// cannot pass by declaring a bound and then accepting everything.
+        payload_limit: Arc<Mutex<Option<usize>>>,
     }
 
     impl ScriptedBackend {
@@ -909,6 +944,10 @@ mod consumer_ack_tests {
                 .load(std::sync::atomic::Ordering::Relaxed)
         }
 
+        fn set_payload_limit(&self, limit: Option<usize>) {
+            *self.payload_limit.lock().unwrap() = limit;
+        }
+
         fn acked_ids(&self) -> Vec<String> {
             self.acks
                 .lock()
@@ -921,7 +960,19 @@ mod consumer_ack_tests {
 
     #[async_trait]
     impl MessageBackend for ScriptedBackend {
-        async fn publish(&self, _subject: &str, _payload: &[u8]) -> SFResult<()> {
+        async fn payload_limit(&self, _subject: &str) -> SFResult<Option<usize>> {
+            Ok(*self.payload_limit.lock().unwrap())
+        }
+
+        async fn publish(&self, _subject: &str, payload: &[u8]) -> SFResult<()> {
+            if let Some(limit) = *self.payload_limit.lock().unwrap() {
+                if payload.len() > limit {
+                    return Err(SFError::PayloadTooLarge {
+                        size: payload.len(),
+                        limit: Some(limit),
+                    });
+                }
+            }
             Ok(())
         }
         async fn subscribe(&self, subject: &str, _group: &str) -> SFResult<MessageStream> {
@@ -1024,6 +1075,96 @@ mod consumer_ack_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         backend.acked_ids()
+    }
+
+    fn ready_task(id: &str, input: serde_json::Value) -> cog_core::Task {
+        let now = chrono::Utc::now();
+        cog_core::Task {
+            id: id.into(),
+            task_type: cog_core::TaskType::DagNode,
+            status: cog_core::TaskStatus::Pending,
+            input,
+            result: None,
+            error: None,
+            error_cause: None,
+            blocked_by: vec![],
+            blocks: vec![],
+            priority: 1,
+            created_at: now,
+            updated_at: now,
+            agent_id: None,
+            workspace_id: Some("ws-limit-test".into()),
+            retry_count: 0,
+            max_retries: 1,
+            retry_not_before: None,
+            started_at: None,
+            timeout_seconds: 30,
+            lease_owner: None,
+            lease_expires_at: None,
+            action_planner_meta: None,
+            goal_id: Some("goal-limit".into()),
+            parent_task_id: None,
+            is_executable: true,
+        }
+    }
+
+    /// The size check has to run before the one-shot transition. Both tasks are
+    /// ready and go to the same queue, so they are one batch; the second
+    /// payload is over the bound the transport declares. Refusing the batch
+    /// must leave both tasks Pending — a task marked Scheduled is never offered
+    /// again by the ready scan (it only reads Pending), so a refusal that
+    /// leaves it scheduled loses that task for good.
+    ///
+    /// Discriminating: moving the check back to after `schedule_task` keeps the
+    /// error (the transport refuses the same payload) but leaves both tasks
+    /// Scheduled, which is exactly what the status assertion catches.
+    #[tokio::test]
+    async fn an_oversized_payload_in_a_batch_schedules_nothing() {
+        let backend = ScriptedBackend::default();
+        let config = DagExecutorConfig {
+            redis_url: "memory".into(),
+            workspace_id: "ws-limit-test".into(),
+            consumer_group: "grp-limit-test".into(),
+            max_retries: 1,
+            ..DagExecutorConfig::default()
+        };
+        let runtime = test_runtime_with(backend.clone(), config);
+
+        let small = ready_task("task-small", serde_json::json!({}));
+        let big = ready_task("task-big", serde_json::json!({ "blob": "x".repeat(4096) }));
+        runtime
+            .orchestrator()
+            .submit_goal("goal-limit", vec![small.clone(), big.clone()])
+            .await
+            .unwrap();
+
+        // The bound sits between the two payloads: the small one fits, the big
+        // one does not. Both are on the same stream, so they are one batch with
+        // one oversized member.
+        let small_len = serde_json::to_vec(&small).unwrap().len();
+        backend.set_payload_limit(Some(small_len + 1));
+
+        let err = runtime
+            .publish_ready_tasks()
+            .await
+            .expect_err("an over-limit payload must refuse the batch");
+        match err {
+            SFError::PayloadTooLarge { limit, .. } => assert_eq!(limit, Some(small_len + 1)),
+            other => panic!("expected a payload-size refusal, got {other:?}"),
+        }
+
+        for id in ["task-small", "task-big"] {
+            let task = runtime
+                .orchestrator()
+                .get_task(id)
+                .await
+                .expect("task present");
+            assert_eq!(
+                task.status,
+                cog_core::TaskStatus::Pending,
+                "{id} must still be Pending: nothing in a refused batch is scheduled"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1398,6 +1539,10 @@ mod orphan_reconciler_tests {
 
     #[async_trait]
     impl MessageBackend for NullBackend {
+        async fn payload_limit(&self, _subject: &str) -> SFResult<Option<usize>> {
+            Ok(None)
+        }
+
         async fn publish(&self, _subject: &str, _payload: &[u8]) -> SFResult<()> {
             Ok(())
         }
