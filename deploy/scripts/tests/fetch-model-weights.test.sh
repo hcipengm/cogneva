@@ -223,7 +223,6 @@ battery() {
   local count_pattern downloads_before downloads_after
   if [ "${source}" = "hf" ]; then count_pattern='/resolve/'; else count_pattern='/repo?'; fi
 
-  local run_fetch
   run_fetch() { "${fetcher}" --model "${model}" --endpoint "${endpoint}" --repo "${model_repo}" --dest "${1}"; }
 
   # --- 1) one real run against the fixture hub ------------------------------
