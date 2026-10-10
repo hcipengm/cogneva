@@ -1202,3 +1202,80 @@ async fn test_ingest_explicit_without_embedder_stores_no_vector() {
         "an entry with no vector must not name an embedding model"
     );
 }
+
+/// An object store that counts its reads, so a test can assert how many the
+/// code under test spent rather than only what it returned.
+struct CountingObjectBackend {
+    inner: FileObjectBackend,
+    gets: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl cog_core::ObjectBackend for CountingObjectBackend {
+    async fn put(&self, key: &str, data: &[u8]) -> cog_core::SFResult<String> {
+        self.inner.put(key, data).await
+    }
+
+    async fn get(&self, key: &str) -> cog_core::SFResult<Option<Vec<u8>>> {
+        self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.get(key).await
+    }
+
+    async fn delete(&self, key: &str) -> cog_core::SFResult<()> {
+        self.inner.delete(key).await
+    }
+
+    async fn presign_url(&self, key: &str, expiry_secs: u64) -> cog_core::SFResult<String> {
+        self.inner.presign_url(key, expiry_secs).await
+    }
+
+    async fn exists(&self, key: &str) -> cog_core::SFResult<bool> {
+        self.inner.exists(key).await
+    }
+
+    async fn list(&self, prefix: Option<&str>) -> cog_core::SFResult<Vec<String>> {
+        self.inner.list(prefix).await
+    }
+}
+
+/// A listing that carries metadata pays one store read per item returned,
+/// because the content type and length live inside each stored envelope. So the
+/// `limit` has to bound the *reads*, not just the page: a listing that read the
+/// whole namespace before trimming would spend a round trip per id to answer a
+/// request for a handful, which on a busy namespace is the difference between a
+/// fast response and one that times out. This pins the trim before the reads.
+#[tokio::test]
+async fn a_bounded_listing_reads_only_the_items_it_returns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let object = Arc::new(CountingObjectBackend {
+        inner: FileObjectBackend::new(tmp.path()),
+        gets: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let backend = CompositeMemoryBackend::new(
+        object.clone(),
+        Arc::new(cog_storage::MemoryVectorBackend::new()),
+        128,
+    );
+
+    for id in ["raw-1", "raw-2", "raw-3", "raw-4", "raw-5"] {
+        backend.archive_raw(&make_raw(id, "payload")).await.unwrap();
+    }
+    let before = object.gets.load(std::sync::atomic::Ordering::SeqCst);
+
+    let listing = backend.list_raw_detailed("default", None, 2).await.unwrap();
+
+    let reads = object.gets.load(std::sync::atomic::Ordering::SeqCst) - before;
+    assert_eq!(
+        listing.items.len(),
+        2,
+        "the page must hold at most `limit` items"
+    );
+    assert_eq!(
+        listing.total, 5,
+        "total must count the whole namespace, not the page"
+    );
+    assert_eq!(
+        reads, 2,
+        "only the returned items may be read back from the store"
+    );
+}

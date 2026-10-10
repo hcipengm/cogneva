@@ -642,6 +642,14 @@ mod tests {
         async fn delete_raw(&self, _ns: &str, _id: &str) -> SFResult<()> {
             unsupported()
         }
+        async fn presign_raw(
+            &self,
+            _ns: &str,
+            _id: &str,
+            _expiry_secs: u64,
+        ) -> SFResult<Option<String>> {
+            Ok(None)
+        }
         async fn store_schema(&self, _ns: &str, _entry: &cog_core::SchemaEntry) -> SFResult<()> {
             unsupported()
         }
@@ -788,6 +796,14 @@ mod tests {
         }
         async fn delete_raw(&self, _ns: &str, _id: &str) -> SFResult<()> {
             unsupported()
+        }
+        async fn presign_raw(
+            &self,
+            _ns: &str,
+            _id: &str,
+            _expiry_secs: u64,
+        ) -> SFResult<Option<String>> {
+            Ok(None)
         }
         async fn store_schema(&self, _ns: &str, entry: &cog_core::SchemaEntry) -> SFResult<()> {
             let mut schemas = self.schemas.lock().unwrap();

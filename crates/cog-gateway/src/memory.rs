@@ -445,6 +445,16 @@ pub async fn summary_search_handler(
     }
 }
 
+/// The listing cap applied when a caller does not set `limit`.
+///
+/// A listing carries each item's metadata, which the object store can only
+/// supply by reading that item's envelope, so the number of store round trips
+/// grows with the number of items returned. An uncapped request would therefore
+/// turn "list the namespace" into one read per id; the cap keeps a listing to a
+/// bounded number of reads and reports the untrimmed `total` so the caller can
+/// see it was a prefix.
+const DEFAULT_RAW_LIST_LIMIT: usize = 100;
+
 #[derive(Debug, Deserialize)]
 pub struct ListRawQuery {
     pub prefix: Option<String>,
@@ -640,21 +650,23 @@ pub async fn list_raw_handler(
     };
 
     let prefix = params.prefix.as_deref();
-    match backend.list_raw_detailed(&ns, prefix).await {
-        Ok(mut items) => {
-            // Report the store's real size before trimming: a caller capped at
-            // `limit` still needs to know the list was longer, or a bounded read
-            // of a bigger namespace reads exactly like a complete one.
-            let total = items.len();
-            let truncated = params.limit.is_some_and(|n| total > n);
-            if truncated {
-                items.truncate(params.limit.unwrap());
-            }
+    // An absent `limit` still has to bound the work: the enrichment reads one
+    // stored envelope per returned item, so "no cap" would mean one store round
+    // trip per id in the namespace. The cap is passed *into* the backend so the
+    // reads it saves never happen.
+    let limit = params.limit.unwrap_or(DEFAULT_RAW_LIST_LIMIT);
+    match backend.list_raw_detailed(&ns, prefix, limit).await {
+        Ok(listing) => {
+            // Report the store's real size whenever the listing was trimmed: a
+            // caller capped at `limit` still needs to know the list was longer,
+            // or a bounded read of a bigger namespace reads exactly like a
+            // complete one.
+            let truncated = listing.total > listing.items.len();
             (
                 StatusCode::OK,
                 Json(ListRawResponse {
-                    items,
-                    total: truncated.then_some(total),
+                    items: listing.items,
+                    total: truncated.then_some(listing.total),
                 }),
             )
                 .into_response()

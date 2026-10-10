@@ -115,6 +115,17 @@ impl cog_core::MemoryBackend for MemoryMemoryBackend {
         Ok(())
     }
 
+    async fn presign_raw(
+        &self,
+        _namespace: &str,
+        _id: &str,
+        _expiry_secs: u64,
+    ) -> SFResult<Option<String>> {
+        // This backend keeps raw sources in process memory, which no external
+        // store can sign a URL for; the inline reader is the only read path.
+        Ok(None)
+    }
+
     async fn store_schema(&self, _namespace: &str, entry: &SchemaEntry) -> SFResult<()> {
         let mut store = self
             .store

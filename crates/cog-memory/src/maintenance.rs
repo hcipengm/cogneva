@@ -219,6 +219,14 @@ mod tests {
         async fn delete_raw(&self, _ns: &str, _id: &str) -> SFResult<()> {
             unimplemented!()
         }
+        async fn presign_raw(
+            &self,
+            _ns: &str,
+            _id: &str,
+            _expiry_secs: u64,
+        ) -> SFResult<Option<String>> {
+            Ok(None)
+        }
         async fn store_schema(&self, _ns: &str, _e: &SchemaEntry) -> SFResult<()> {
             unimplemented!()
         }

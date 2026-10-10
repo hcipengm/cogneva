@@ -99,6 +99,34 @@ impl MemoryBackend for MetricsInstrumentedMemoryBackend {
         result
     }
 
+    async fn list_raw_detailed(
+        &self,
+        namespace: &str,
+        content_type_prefix: Option<&str>,
+        limit: usize,
+    ) -> SFResult<cog_core::RawListing> {
+        let start = Instant::now();
+        let result = self
+            .inner
+            .list_raw_detailed(namespace, content_type_prefix, limit)
+            .await;
+        self.record("list_raw_detailed", start, result.is_err())
+            .await;
+        result
+    }
+
+    async fn presign_raw(
+        &self,
+        namespace: &str,
+        id: &str,
+        expiry_secs: u64,
+    ) -> SFResult<Option<String>> {
+        let start = Instant::now();
+        let result = self.inner.presign_raw(namespace, id, expiry_secs).await;
+        self.record("presign_raw", start, result.is_err()).await;
+        result
+    }
+
     async fn store_schema(&self, namespace: &str, entry: &SchemaEntry) -> SFResult<()> {
         let start = Instant::now();
         let result = self.inner.store_schema(namespace, entry).await;

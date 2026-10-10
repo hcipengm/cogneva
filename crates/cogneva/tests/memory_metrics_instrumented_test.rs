@@ -2,7 +2,7 @@ use cog_core::{
     MemoryBackend, MetricsBackend, RawSource, SchemaEntry, SchemaKind, SourceRef, SummaryEntry,
 };
 use cog_memory::*;
-use cog_storage::MemoryMetricsBackend;
+use cog_storage::{FileObjectBackend, MemoryMetricsBackend};
 use std::sync::Arc;
 
 fn make_raw(id: &str, text: &str) -> RawSource {
@@ -300,4 +300,42 @@ async fn test_instrumented_backend_records_delete_ops() {
         .filter(|c| c.labels.get("operation") == Some(&"delete_raw".into()))
         .count();
     assert_eq!(delete_raw_count, 1);
+}
+
+/// A wrapper must forward `presign_raw` to the store it wraps. A default body
+/// returning `None` would let the wrapper answer "this backend keeps no
+/// signable store" on behalf of a store that signs one -- a plausible lie that
+/// reads exactly like the real no-store case, and one that a caller cannot tell
+/// from it.
+#[tokio::test]
+async fn test_instrumented_backend_forwards_presign_raw() {
+    let tmp = tempfile::tempdir().unwrap();
+    let object = Arc::new(FileObjectBackend::new(tmp.path()));
+    let inner = Arc::new(CompositeMemoryBackend::new(
+        object,
+        Arc::new(cog_storage::MemoryVectorBackend::new()),
+        128,
+    ));
+    let metrics = Arc::new(MemoryMetricsBackend::new());
+    let backend = MetricsInstrumentedMemoryBackend::new(inner, metrics.clone());
+
+    backend.archive_raw(&make_raw("r1", "hello")).await.unwrap();
+
+    let url = backend.presign_raw("default", "r1", 300).await.unwrap();
+    assert!(
+        url.as_deref().is_some_and(|u| u.starts_with("file://")),
+        "the wrapper must forward presign to the store, not answer None: {url:?}"
+    );
+
+    let start = chrono::Utc::now() - chrono::Duration::seconds(5);
+    let end = chrono::Utc::now() + chrono::Duration::seconds(5);
+    let counters = metrics
+        .query_counter_range("memory_operations_total", start, end)
+        .await
+        .unwrap();
+    let presign_count = counters
+        .iter()
+        .filter(|c| c.labels.get("operation") == Some(&"presign_raw".into()))
+        .count();
+    assert_eq!(presign_count, 1);
 }

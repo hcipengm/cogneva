@@ -214,6 +214,19 @@ pub struct RawMetadata {
     pub created_at: DateTime<Utc>,
 }
 
+/// A bounded page of a raw listing, together with the size of the list it was
+/// drawn from.
+///
+/// `total` is the number of ids the store held *before* `limit` was applied, so
+/// a caller that received fewer items than `total` knows it saw a prefix of a
+/// larger namespace rather than the whole of it. Without that number a capped
+/// listing reads exactly like a complete one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RawListing {
+    pub items: Vec<RawMetadata>,
+    pub total: usize,
+}
+
 /// Why `id` cannot be used as a raw key, or `None` when it can.
 ///
 /// A raw id is not free text: every [`MemoryBackend`] turns it into an object
@@ -696,19 +709,28 @@ pub trait MemoryBackend: Send + Sync {
     /// List raw sources with the metadata a caller needs to choose which to
     /// read, without moving any payload across the boundary.
     ///
+    /// `limit` bounds how many envelopes the listing reads, not just how many it
+    /// returns: an object store keeps the content type and length *inside* the
+    /// stored envelope, so each metadata the caller wants costs one read, and a
+    /// listing that read every id before trimming would spend one store round
+    /// trip per id in the namespace to answer a request for a handful. The trim
+    /// therefore happens before the reads.
+    ///
     /// The default walks the ids [`list_raw`](Self::list_raw) returns and reads
-    /// each stored envelope, which is `N+1` backend calls; a caller that lists
-    /// often and reads rarely should keep using `list_raw` when ids are enough.
+    /// the first `limit` stored envelopes, which is `1 + limit` backend calls;
+    /// a caller with only ids to spend should keep using `list_raw`.
     async fn list_raw_detailed(
         &self,
         namespace: &str,
         content_type_prefix: Option<&str>,
-    ) -> SFResult<Vec<RawMetadata>> {
+        limit: usize,
+    ) -> SFResult<RawListing> {
         let ids = self.list_raw(namespace, content_type_prefix).await?;
-        let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
+        let total = ids.len();
+        let mut items = Vec::new();
+        for id in ids.into_iter().take(limit) {
             if let Some(raw) = self.get_raw(namespace, &id).await? {
-                out.push(RawMetadata {
+                items.push(RawMetadata {
                     id: raw.id,
                     content_type: raw.content_type,
                     payload_length: raw.payload.len(),
@@ -716,7 +738,7 @@ pub trait MemoryBackend: Send + Sync {
                 });
             }
         }
-        Ok(out)
+        Ok(RawListing { items, total })
     }
 
     async fn delete_raw(&self, namespace: &str, id: &str) -> SFResult<()>;
@@ -731,14 +753,18 @@ pub trait MemoryBackend: Send + Sync {
     ///
     /// `expiry_secs` bounds how long the URL stays valid; it travels to the
     /// store as the signature's window.
+    ///
+    /// Deliberately has no default body. `Ok(None)` is a plausible answer that a
+    /// wrapper would inherit and pass on as "this backend keeps no signable
+    /// store" -- a lie about a backend that does, told to every caller. A
+    /// forwarding wrapper must state the forward, and a backend without such a
+    /// store must state the `None`; neither gets to leave it unsaid.
     async fn presign_raw(
         &self,
-        _namespace: &str,
-        _id: &str,
-        _expiry_secs: u64,
-    ) -> SFResult<Option<String>> {
-        Ok(None)
-    }
+        namespace: &str,
+        id: &str,
+        expiry_secs: u64,
+    ) -> SFResult<Option<String>>;
 
     // ── Layer 1: Schema ─────────────────────────────────────────────────
     async fn store_schema(&self, namespace: &str, entry: &SchemaEntry) -> SFResult<()>;
