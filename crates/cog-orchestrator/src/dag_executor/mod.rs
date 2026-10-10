@@ -132,12 +132,22 @@ impl DagExecutorRuntime {
     /// The size check runs **before** the transition, not after it: scheduling
     /// is a one-shot, and a task marked scheduled whose payload the transport
     /// then refuses stays scheduled forever, because the ready scan only ever
-    /// looks at pending tasks. So the payloads are serialised and measured
-    /// first, and a payload over the transport's declared bound refuses the
-    /// whole call with nothing transitioned — the tasks stay pending and are
-    /// offered again on the next scan. The publish path keeps its own check as
-    /// the last line of defence; this one is what keeps the irreversible step
-    /// from being spent on a publication that cannot happen.
+    /// looks at pending tasks. So each payload is measured against the bound its
+    /// own transport declares, and measured ahead of *its own* transition.
+    ///
+    /// Measured per payload, not per call: a payload over the bound is held back
+    /// at its pending state and offered again on the next scan, while the rest
+    /// of its queue and every other queue still go out. Refusing the whole call
+    /// would let one task that can never fit stop every queue from dispatching —
+    /// the same "a permanent failure blocks everything behind it" shape this
+    /// check exists to remove. It would also make every caller that reads an
+    /// error here as "do not ack the result" hold its message for redelivery
+    /// forever, so the stalls would spread to the result stream too.
+    ///
+    /// A task that cannot fit is logged with its id; what should eventually
+    /// happen to it — no bound it can satisfy means no publish, ever — is a
+    /// separate decision about a terminal state, not something to invent here.
+    /// The publish path keeps its own check as the last line of defence.
     ///
     /// A task whose artifact is only readable by its producer does not go on
     /// the queue every worker competes for; see [`crate::ready_queue`].
@@ -147,8 +157,7 @@ impl DagExecutorRuntime {
             return Ok(());
         }
 
-        // Serialise and group first, changing no state: an oversized payload has
-        // to be found here, while every task is still pending.
+        // Serialise and group first, changing no state.
         let mut by_stream: HashMap<String, Vec<(Task, Vec<u8>)>> = HashMap::new();
         for task in ready_tasks {
             let payload = serde_json::to_vec(&task).map_err(SFError::Serialization)?;
@@ -161,21 +170,21 @@ impl DagExecutorRuntime {
                 .push((task, payload));
         }
 
-        for (stream, entries) in &by_stream {
-            let Some(limit) = self.backend.payload_limit(stream).await? else {
-                continue;
-            };
-            if let Some((_, payload)) = entries.iter().find(|(_, payload)| payload.len() > limit) {
-                return Err(SFError::PayloadTooLarge {
-                    size: payload.len(),
-                    limit: Some(limit),
-                });
-            }
-        }
-
         for (stream, entries) in by_stream {
+            let limit = self.backend.payload_limit(&stream).await?;
             let mut payloads = Vec::with_capacity(entries.len());
             for (task, payload) in entries {
+                if let Some(limit) = limit {
+                    if payload.len() > limit {
+                        tracing::error!(
+                            task_id = %task.id,
+                            size = payload.len(),
+                            limit,
+                            "task payload is larger than the transport accepts: holding it back rather than spending its one dispatch on a publish that cannot happen"
+                        );
+                        continue;
+                    }
+                }
                 if let Err(e) = self.orchestrator.schedule_task(&task.id).await {
                     tracing::warn!(task_id = %task.id, "schedule_task failed during publish: {e}");
                     continue;
@@ -1108,18 +1117,17 @@ mod consumer_ack_tests {
         }
     }
 
-    /// The size check has to run before the one-shot transition. Both tasks are
-    /// ready and go to the same queue, so they are one batch; the second
-    /// payload is over the bound the transport declares. Refusing the batch
-    /// must leave both tasks Pending — a task marked Scheduled is never offered
-    /// again by the ready scan (it only reads Pending), so a refusal that
-    /// leaves it scheduled loses that task for good.
+    /// An over-limit payload is held back at its own pending state; it must not
+    /// stop anything else. Two things have to survive it: the other task in the
+    /// same queue, and the task on the other queue. A task marked Scheduled is
+    /// never offered again by the ready scan (it reads only Pending), so the one
+    /// that cannot be published is the only thing that may stay Pending.
     ///
-    /// Discriminating: moving the check back to after `schedule_task` keeps the
-    /// error (the transport refuses the same payload) but leaves both tasks
-    /// Scheduled, which is exactly what the status assertion catches.
+    /// Discriminating: refusing the whole call — the first cut — leaves the
+    /// other two Pending and, worse, makes every caller that reads an error here
+    /// as "do not ack the result" redeliver its message forever.
     #[tokio::test]
-    async fn an_oversized_payload_in_a_batch_schedules_nothing() {
+    async fn an_oversized_payload_holds_back_only_its_own_task() {
         let backend = ScriptedBackend::default();
         let config = DagExecutorConfig {
             redis_url: "memory".into(),
@@ -1132,28 +1140,31 @@ mod consumer_ack_tests {
 
         let small = ready_task("task-small", serde_json::json!({}));
         let big = ready_task("task-big", serde_json::json!({ "blob": "x".repeat(4096) }));
+        // Self-evolution routes to the process-local queue, so this one is on a
+        // different stream from the other two.
+        let mut evolution = ready_task("task-evolution", serde_json::json!({}));
+        evolution.task_type = cog_core::TaskType::Custom("self_evolution".into());
         runtime
             .orchestrator()
-            .submit_goal("goal-limit", vec![small.clone(), big.clone()])
+            .submit_goal(
+                "goal-limit",
+                vec![small.clone(), big.clone(), evolution.clone()],
+            )
             .await
             .unwrap();
 
-        // The bound sits between the two payloads: the small one fits, the big
-        // one does not. Both are on the same stream, so they are one batch with
-        // one oversized member.
+        // The bound sits between the payloads: small and evolution fit, big does
+        // not. (The scripted backend applies one bound to every subject.)
         let small_len = serde_json::to_vec(&small).unwrap().len();
-        backend.set_payload_limit(Some(small_len + 1));
+        let evolution_len = serde_json::to_vec(&evolution).unwrap().len();
+        backend.set_payload_limit(Some(small_len.max(evolution_len) + 1));
 
-        let err = runtime
+        runtime
             .publish_ready_tasks()
             .await
-            .expect_err("an over-limit payload must refuse the batch");
-        match err {
-            SFError::PayloadTooLarge { limit, .. } => assert_eq!(limit, Some(small_len + 1)),
-            other => panic!("expected a payload-size refusal, got {other:?}"),
-        }
+            .expect("one over-limit payload must not fail the call");
 
-        for id in ["task-small", "task-big"] {
+        for id in ["task-small", "task-evolution"] {
             let task = runtime
                 .orchestrator()
                 .get_task(id)
@@ -1161,10 +1172,20 @@ mod consumer_ack_tests {
                 .expect("task present");
             assert_eq!(
                 task.status,
-                cog_core::TaskStatus::Pending,
-                "{id} must still be Pending: nothing in a refused batch is scheduled"
+                cog_core::TaskStatus::Scheduled,
+                "{id} is publishable and must not be held back by a task that is not"
             );
         }
+        let held = runtime
+            .orchestrator()
+            .get_task("task-big")
+            .await
+            .expect("task present");
+        assert_eq!(
+            held.status,
+            cog_core::TaskStatus::Pending,
+            "the over-limit task stays pending so the next scan offers it again"
+        );
     }
 
     #[tokio::test]
