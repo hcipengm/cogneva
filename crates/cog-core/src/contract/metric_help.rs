@@ -208,6 +208,24 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          that is the reading no other series states",
     ),
     (
+        "cogneva_eval_gate_outcomes_total",
+        "How each run of the baseline port's eval A/B gate ended, labelled by \
+         `outcome`, written once per run. The gate refuses a port that \
+         regresses a fixed eval suite; its verdict comes from a sandbox agent \
+         that runs the suite twice and reports the outcomes, and the gate \
+         z-tests what came back. Whether it measured at all is a separate fact \
+         from what it decided, and only the second had a reading: the agent \
+         reporting `applicable=false` and there being no orchestrator both \
+         returned success and left no series, so a port that was never \
+         measured and one that was measured and passed read the same. The \
+         cells are the closed set of ends -- `passed` and `rejected` are the \
+         gate deciding, `not_applicable` and `unreadable` are a run that did \
+         not measure, and `unavailable` is a run that never reached a verdict. \
+         A reader separates a gate that keeps passing from one that keeps \
+         skipping; the skip's own tick-failure reading cannot, because a gate \
+         that skips is not a tick that failed",
+    ),
+    (
         "cogneva_landing_failures_total",
         "Landing calls that failed, one per attempt, by category. A landing \
          failure is otherwise a single log line inside a loop that then moves \
@@ -961,24 +979,6 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          completes keeps it at 0",
     ),
     (
-        "cogneva_eval_gate_outcomes_total",
-        "How each run of the baseline port's eval A/B gate ended, labelled by \
-         `outcome`, written once per run. The gate refuses a port that \
-         regresses a fixed eval suite; its verdict comes from a sandbox agent \
-         that runs the suite twice and reports the outcomes, and the gate \
-         z-tests what came back. Whether it measured at all is a separate fact \
-         from what it decided, and only the second had a reading: the agent \
-         reporting `applicable=false` and there being no orchestrator both \
-         returned success and left no series, so a port that was never \
-         measured and one that was measured and passed read the same. The \
-         cells are the closed set of ends -- `passed` and `rejected` are the \
-         gate deciding, `not_applicable` and `unreadable` are a run that did \
-         not measure, and `unavailable` is a run that never reached a verdict. \
-         A reader separates a gate that keeps passing from one that keeps \
-         skipping; the skip's own tick-failure reading cannot, because a gate \
-         that skips is not a tick that failed",
-    ),
-    (
         "cogneva_rollout_job_cpu_throttled_ratio",
         "Share of the CFS periods of the newest rollout judgement run in which \
          the run was throttled by its own CPU limit, read by the run from its \
@@ -1247,5 +1247,29 @@ mod tests {
             metric_help_text(MetricType::Counter, "llm_upstream_healthy")
                 .starts_with("Undocumented metric llm_upstream_healthy")
         );
+    }
+
+    /// A counter's description lives in the counter table.
+    ///
+    /// Pinned by hand for the entries whose kind was wrong, because nothing
+    /// else in the tree judges it: a name's kind is written only at its
+    /// `record_*` call site, so a description filed under the wrong kind and a
+    /// description that was never written are the same thing on the exposition
+    /// -- the placeholder. Both names below are written with `record_counter`.
+    #[test]
+    fn a_counters_description_is_found_under_counter() {
+        for name in [
+            "cogneva_change_tier_total",
+            "cogneva_eval_gate_outcomes_total",
+        ] {
+            assert!(
+                metric_description(MetricType::Counter, name).is_some(),
+                "{name} 由 record_counter 写，描述却不在 counter 表里"
+            );
+            assert!(
+                metric_description(MetricType::Gauge, name).is_none(),
+                "{name} 不该在 gauge 表里——暴露面按实际 kind 查描述，登错 kind 只出占位符"
+            );
+        }
     }
 }
