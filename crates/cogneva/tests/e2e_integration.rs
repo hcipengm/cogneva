@@ -214,6 +214,7 @@ async fn spawn_app_full(
         evolution_admin: None,
         audit_stream: None,
         taste_intent_sink: None,
+        llm_usage_reader: None,
         llm_client: std::sync::Arc::new(std::sync::RwLock::new(None)),
         chat_sessions: std::sync::Arc::new(tokio::sync::Mutex::new(
             std::collections::HashMap::new(),
@@ -1108,6 +1109,60 @@ async fn e2e_knowledge_search_reports_an_unassembled_layer() {
         "POST",
         "/api/v1/knowledge/search",
         Body::from(body),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the route must sit behind auth, not beside it"
+    );
+
+    app.shutdown.trigger();
+}
+
+// ─── Token usage read face (rolled spend) ────────────────────────────
+
+/// The spend face reads the durable rollup through a published reader. In this
+/// harness no database is wired, so the reader is absent — and absence has to
+/// surface as an explicit error, not an empty actor list. An empty list would
+/// read as "the platform spent nothing", which is the one answer a spend face
+/// must never invent. The route also rides the authenticated operator face, so
+/// an anonymous caller is turned away rather than answered.
+#[tokio::test]
+async fn e2e_token_usage_reports_unconfigured_and_sits_behind_auth() {
+    let Some(app) = spawn_app(false, None).await else {
+        return;
+    };
+
+    let token = app.bearer_token().await;
+    let (status, json) = req_oneshot(
+        app.state.clone(),
+        "GET",
+        "/api/v1/observability/token-usage",
+        Body::empty(),
+        Some(token),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "an unconfigured reader is a service that cannot answer, not a zero spend"
+    );
+    assert_eq!(json["error"], "InternalServerError");
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("token usage reader not configured"),
+        "the error names the cause, got: {json}"
+    );
+
+    let (status, _) = req_oneshot(
+        app.state.clone(),
+        "GET",
+        "/api/v1/observability/token-usage",
+        Body::empty(),
         None,
     )
     .await;

@@ -122,6 +122,64 @@ pub async fn agent_state_handler(
     Ok(Json(agent_state))
 }
 
+// ─── Token spend by actor (durable rollup) ───
+
+/// Query parameters for [`token_usage_by_actor_handler`].
+#[derive(Debug, Deserialize)]
+pub struct TokenUsageQuery {
+    /// Size of the trailing window, in hours. Defaults to one day.
+    #[serde(default = "default_usage_hours")]
+    pub hours: i64,
+}
+
+fn default_usage_hours() -> i64 {
+    24
+}
+
+/// Cap on the trailing window one request may ask for.
+///
+/// The fold itself only catches up a week, so a wider request would be answered
+/// from a range the rollup never covers and read as "no spend" — the same face
+/// a genuinely idle platform shows. Bounded here so the widest honest window is
+/// also the widest accepted one.
+const MAX_USAGE_HOURS: i64 = 24 * 7;
+
+/// The rolled spend over a trailing window, with the window echoed back.
+///
+/// The endpoints are returned, not just the rows: a reader has to be able to
+/// tell "we spent nothing" from "we asked for a range the fold never reached",
+/// and only the window itself makes the two distinguishable.
+#[derive(Debug, serde::Serialize)]
+pub struct TokenUsageResponse {
+    pub since: String,
+    pub until: String,
+    pub actors: Vec<cog_core::ActorUsage>,
+}
+
+/// Token spend per actor × upstream × protocol over the trailing window, read
+/// from the durable rollup rather than the per-call ledger.
+pub async fn token_usage_by_actor_handler(
+    State(state): State<Arc<GatewayState>>,
+    Query(q): Query<TokenUsageQuery>,
+) -> Result<Json<TokenUsageResponse>, ApiError> {
+    let reader = state
+        .llm_usage_reader
+        .as_ref()
+        .ok_or_else(|| ApiError::internal("token usage reader not configured"))?;
+    let hours = q.hours.clamp(1, MAX_USAGE_HOURS);
+    let until = chrono::Utc::now();
+    let since = until - chrono::Duration::hours(hours);
+    let actors = reader
+        .usage_by_actor_rolled(since, until)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to read token usage: {e}")))?;
+    Ok(Json(TokenUsageResponse {
+        since: since.to_rfc3339(),
+        until: until.to_rfc3339(),
+        actors,
+    }))
+}
+
 // ─── Task Metrics ───
 
 pub async fn task_metrics_handler(

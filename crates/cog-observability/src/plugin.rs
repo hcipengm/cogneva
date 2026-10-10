@@ -394,6 +394,20 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             }
         };
 
+        // Publish the rolled read face beside the store. The gateway answers
+        // "where did the tokens go" from the fold through this, the same way
+        // it reaches every other cross-crate reading, so it never has to name
+        // this crate's storage internals. Absent when the ledger is absent,
+        // which is what makes the route report "not configured" instead of an
+        // empty spend.
+        if let Some(store) = self.usage_store.as_ref() {
+            let reader: Arc<dyn cog_core::LlmUsageReader> = Arc::new(
+                crate::usage_store::RolledUsageReader::new((**store).clone()),
+            );
+            ctx.publish_service(reader);
+            info!("LLM usage rolled read face published");
+        }
+
         self.initialized = true;
         Ok(())
     }

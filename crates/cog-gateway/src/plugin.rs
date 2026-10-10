@@ -163,6 +163,10 @@ impl cog_core::SystemPlugin for GatewayPlugin {
         // 它和上面那两个 backend 不是一回事：那两个是各自的店，这个是检索真正去问的那一层。
         let knowledge_backend: Option<Arc<dyn cog_core::KnowledgeBackend>> =
             ctx.consume_service::<dyn cog_core::KnowledgeBackend>();
+        // 令牌花费的读出面（读的是 durable rollup，不是逐笔账本），由
+        // observability 插件发布。缺席时那条路由显式报「未配置」，而不是回一笔空账。
+        let llm_usage_reader: Option<Arc<dyn cog_core::LlmUsageReader>> =
+            ctx.consume_service::<dyn cog_core::LlmUsageReader>();
 
         // ── Build auxiliary components ──
 
@@ -232,6 +236,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             &evolution_stream,
             &audit_stream,
             &taste_intent_sink,
+            &llm_usage_reader,
         )
         .await
         .map_err(|e| cog_core::SFError::Config(format!("gateway state build failed: {}", e)))?;

@@ -448,4 +448,99 @@ impl LlmUsageStore {
         .await?;
         Ok(row.and_then(|r| r.get::<Option<DateTime<Utc>>, _>("last")))
     }
+
+    /// Token spend per `(actor, upstream, api_style)` over the closed windows
+    /// inside `[since, until)`, summed across them.
+    ///
+    /// Reads [`ROLLUP_TABLE`], not [`LEDGER_TABLE`]: this is the face a panel
+    /// or an ops query reaches, and it must not put a scan of the ever-growing
+    /// per-call table behind every refresh. Only fully-contained windows are
+    /// summed, so a partially-elapsed hour is left to the next fold rather
+    /// than reported as a short window. `avg_latency_ms` is re-weighted by call
+    /// count so the result is the mean over the calls, not the mean of the
+    /// per-window means.
+    pub async fn usage_by_actor_rolled(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<ActorSpend>> {
+        let rows = sqlx::query(&format!(
+            "SELECT actor, upstream, api_style, \
+                    SUM(calls)::BIGINT AS calls, \
+                    SUM(failed_calls)::BIGINT AS failed_calls, \
+                    SUM(tokens_input)::BIGINT AS tokens_input, \
+                    SUM(tokens_output)::BIGINT AS tokens_output, \
+                    SUM(tokens_cached)::BIGINT AS tokens_cached, \
+                    CASE WHEN SUM(calls) > 0 \
+                         THEN (SUM(avg_latency_ms::BIGINT * calls) / SUM(calls))::BIGINT \
+                         ELSE 0::BIGINT END AS avg_latency_ms \
+             FROM {ROLLUP_TABLE} \
+             WHERE window_start >= $1 AND window_end <= $2 \
+             GROUP BY actor, upstream, api_style \
+             ORDER BY (SUM(tokens_input) + SUM(tokens_output)) DESC, \
+                      actor, upstream, api_style"
+        ))
+        .bind(since)
+        .bind(until)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| ActorSpend {
+                actor: r.get::<String, _>("actor"),
+                upstream: r.get::<String, _>("upstream"),
+                api_style: r.get::<String, _>("api_style"),
+                calls: r.get::<i64, _>("calls"),
+                failed_calls: r.get::<i64, _>("failed_calls"),
+                tokens_input: r.get::<i64, _>("tokens_input"),
+                tokens_output: r.get::<i64, _>("tokens_output"),
+                tokens_cached: r.get::<i64, _>("tokens_cached"),
+                avg_latency_ms: r.get::<i64, _>("avg_latency_ms"),
+            })
+            .collect())
+    }
+}
+
+/// The publishing handle for [`cog_core::LlmUsageReader`]: presents the rolled
+/// read face of [`LlmUsageStore`] under the contract the gateway consumes, so
+/// that the gateway depends on a reading rather than on this crate's storage
+/// internals.
+#[derive(Clone)]
+pub struct RolledUsageReader {
+    store: LlmUsageStore,
+}
+
+impl RolledUsageReader {
+    pub fn new(store: LlmUsageStore) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait::async_trait]
+impl cog_core::LlmUsageReader for RolledUsageReader {
+    async fn usage_by_actor_rolled(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> cog_core::SFResult<Vec<cog_core::ActorUsage>> {
+        let spend = self
+            .store
+            .usage_by_actor_rolled(since, until)
+            .await
+            .map_err(|e| cog_core::SFError::Database(format!("rolled usage read failed: {e}")))?;
+        Ok(spend
+            .into_iter()
+            .map(|s| cog_core::ActorUsage {
+                actor: s.actor,
+                upstream: s.upstream,
+                api_style: s.api_style,
+                calls: s.calls,
+                failed_calls: s.failed_calls,
+                tokens_input: s.tokens_input,
+                tokens_output: s.tokens_output,
+                tokens_cached: s.tokens_cached,
+                avg_latency_ms: s.avg_latency_ms,
+            })
+            .collect())
+    }
 }

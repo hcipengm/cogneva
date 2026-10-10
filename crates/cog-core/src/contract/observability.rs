@@ -438,6 +438,64 @@ pub trait ObservabilityGateway: Send + Sync {
     fn publish_event(&self, event: AgentEvent);
 }
 
+// ─── Token spend, read from the durable rollup ─────────────────────────────
+
+/// One `(actor, upstream, protocol)` line of token spend, summed over the
+/// closed accounting windows a reader asked for.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActorUsage {
+    /// Calling component as the gateway normalized it (`self_review`,
+    /// `agent:<role>`, `unknown`).
+    pub actor: String,
+    /// Pool identity of the upstream that served the calls.
+    pub upstream: String,
+    /// Wire protocol family the tokens were counted under. Carried because
+    /// `tokens_input` means different things per protocol — on an
+    /// OpenAI-compatible upstream it already contains `tokens_cached`, on
+    /// Anthropic the two are disjoint — so a cache-hit ratio is only
+    /// meaningful within one protocol and the two may not be netted together.
+    pub api_style: String,
+    /// Every metered call in the range, failed ones included.
+    pub calls: i64,
+    /// The failed subset of [`Self::calls`]. Kept beside it rather than folded
+    /// in: an error row carries zero tokens by construction, so a range whose
+    /// every call failed and a range with no traffic at all sum to the same
+    /// token count, and the failure count is what tells the two apart.
+    pub failed_calls: i64,
+    pub tokens_input: i64,
+    pub tokens_output: i64,
+    pub tokens_cached: i64,
+    /// Mean wall time across the calls the line covers, weighted by call count
+    /// so that it is the mean of the calls rather than the mean of the windows.
+    pub avg_latency_ms: i64,
+}
+
+/// Reader of the durable token-spend rollup.
+///
+/// Implemented by `cog-observability`, which owns the ledger and its fold, and
+/// consumed by the gateway's operator surface. A spend question is answered
+/// from the fold rather than by scanning the per-call ledger: the per-call
+/// table grows without bound while the same question ("where did yesterday's
+/// tokens go") is asked repeatedly, so re-deriving it on every read would put
+/// a full scan behind every dashboard refresh. A window that has not been
+/// folded yet is absent from the sum, which is why the fold catches up on a
+/// timer rather than only when a reader arrives.
+///
+/// Required, with no default, for the reason the other reading contracts give:
+/// a default would compile into every backend and answer "no tokens were
+/// spent" from a source nothing derives, hiding the very spend the face exists
+/// to expose.
+#[async_trait::async_trait]
+pub trait LlmUsageReader: Send + Sync {
+    /// Token spend per `(actor, upstream, protocol)` over the closed windows
+    /// that fall inside `[since, until)`, summed across them.
+    async fn usage_by_actor_rolled(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> SFResult<Vec<ActorUsage>>;
+}
+
 // ─── Self-Evolution Metrics ────────────────────────────────────────────────
 
 /// Counter-style metrics for the self-evolution pipeline.

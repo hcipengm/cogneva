@@ -73,6 +73,7 @@ pub async fn build_gateway_state(
     evolution_stream: &Option<Arc<tokio::sync::broadcast::Sender<cog_core::EvolutionChangeInfo>>>,
     audit_stream: &Option<Arc<dyn cog_core::AuditStream>>,
     taste_intent_sink: &Option<Arc<dyn cog_core::TasteIntentSink>>,
+    llm_usage_reader: &Option<Arc<dyn cog_core::LlmUsageReader>>,
 ) -> Result<Arc<crate::GatewayState>, Box<dyn std::error::Error>> {
     let gateway_state = Arc::new(crate::GatewayState {
         config: std::sync::RwLock::new(config.gateway.clone()),
@@ -144,6 +145,7 @@ pub async fn build_gateway_state(
         evolution_stream: evolution_stream.clone(),
         audit_stream: audit_stream.clone(),
         taste_intent_sink: taste_intent_sink.clone(),
+        llm_usage_reader: llm_usage_reader.clone(),
         llm_client: Arc::new(std::sync::RwLock::new(None)),
         chat_sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     });

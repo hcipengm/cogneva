@@ -168,6 +168,11 @@ pub struct GatewayState {
     /// 外部提交的价值判定（taste）落地处。缺席时接收端点显式报错，而不是
     /// 收下提交再丢掉——提交就是证据，收下一个没落盘的提交等于伪造它。
     pub taste_intent_sink: Option<Arc<dyn cog_core::TasteIntentSink>>,
+    /// 令牌花费的读出面：按 actor×上游×协议从 durable rollup 汇总，由
+    /// observability 插件发布。**读的是折叠过的窗口不是逐笔账本**——同一个
+    /// 问题（"昨天这些令牌花哪了"）会被反复问，不能让每次读都扫一遍只增不减的
+    /// 明细表。缺席时读路由显式报「未配置」，而不是回一笔空账。
+    pub llm_usage_reader: Option<Arc<dyn cog_core::LlmUsageReader>>,
     /// Observables — 各业务 crate 暴露的系统级指标（D5/D8/D9）。
     pub observables: Vec<Arc<dyn cog_core::Observable>>,
     /// 抓取维度集合的可选收窄项；空 = 不收窄，采每个 observable 自己声明的有界维度。
@@ -761,6 +766,12 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route(
             "/api/v1/tasks/{id}/metrics",
             get(observability::task_metrics_handler),
+        )
+        // 令牌花费按 actor 的读出面：不写 SQL 的人也能看见「过去 N 小时各模块消耗」，
+        // 数值取自 durable rollup 而非逐笔明细表。
+        .route(
+            "/api/v1/observability/token-usage",
+            get(observability::token_usage_by_actor_handler),
         )
         .route(
             "/api/v1/tasks/{id}/logs",
