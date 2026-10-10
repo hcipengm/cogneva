@@ -73,6 +73,29 @@ pub const CARRIER_PATTERNS: &[&str] = &[
     // narrower one skips the gate — and it is small enough that a second
     // mechanism to exclude it would cost more than it saves.
     "eval_datasets/**",
+    // This file, by name. What counts as a criteria carrier is decided by the
+    // two lists below and by `is_carrier_path`, so editing them re-tiers every
+    // change at once: the change that narrows the face is the one change with
+    // the widest effect on what reaches a gate, and it would otherwise be
+    // judged by the list it just narrowed. That is a fixed point rather than an
+    // infinite regress — the list decides which *other* paths are carriers, not
+    // whether the list is one.
+    //
+    // Named rather than covered by a prefix over the crate, which would drag
+    // every unrelated file in `cog-reflection` through the real gate. A file
+    // this is ever split into carrying the same responsibility has to be named
+    // here too; the test below derives its path from `file!()` and fails on a
+    // rename until the pattern moves with it.
+    //
+    // Being a carrier means its text joins `criterion_tokens` as well. Measured
+    // when it was added (2026-10-10): 78 identifier-shaped tokens, 56 not
+    // already contributed by the other carriers, 20 of those also occurring in
+    // other source in this workspace. Wider than a gate script and narrower than
+    // the evaluation suite, and in the direction the list may err in: what it
+    // costs is extra real-gate runs on changes that renamed something this file
+    // mentions, and what it buys is the one file that can narrow the face being
+    // subject to it.
+    "crates/cog-reflection/src/criteria_face.rs",
 ];
 
 /// Directories that never hold a carrier, skipped so the walk stays cheap.
@@ -523,6 +546,32 @@ mod tests {
             assert_eq!(t.tier, Tier::RealGate, "{path} did not take the real gate");
             assert_eq!(t.reasons, vec![TierReason::CriteriaCarrier]);
         }
+    }
+
+    #[test]
+    fn the_file_that_decides_what_a_carrier_is_is_itself_one() {
+        // Whatever narrows the face is judged against a face it just narrowed,
+        // so this file has to be in its own list. Derived from `file!()` rather
+        // than written out: a hardcoded path would go on passing after the
+        // pattern above stopped matching it, which is the one case this test
+        // exists to catch.
+        let me = file!();
+        assert!(
+            is_carrier_path(me),
+            "{me} decides what a criteria carrier is and is not one itself"
+        );
+    }
+
+    #[test]
+    fn editing_the_carrier_list_takes_the_real_gate() {
+        let t = tier(
+            &face(&[], &[]),
+            &[target("crates/cog-reflection/src/criteria_face.rs")],
+            &DiffShape::default(),
+        );
+        assert_eq!(t.tier, Tier::RealGate);
+        assert_eq!(t.reasons, vec![TierReason::CriteriaCarrier]);
+        assert!(t.touches_criteria_code);
     }
 
     #[test]
