@@ -4,6 +4,10 @@ use cog_core::EmbeddingProvider;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+/// The summary layer and the embedder that will be handed to it: what the repair
+/// pass needs, and what is kept from `init` so it can run in `start`.
+type EmbeddingRepair = (Arc<crate::VectorSummaryBackend>, Arc<dyn EmbeddingProvider>);
+
 /// Memory plugin that self-assembles and publishes memory backend,
 /// metrics backend, embedding provider, and reranker provider.
 pub struct MemoryPlugin {
@@ -13,6 +17,13 @@ pub struct MemoryPlugin {
     /// when the event broadcast closes, and `shutdown` uses this handle to
     /// stop it cleanly.
     ingestor_stop: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<()>>>,
+    /// The summary layer together with the embedder it should be given, kept from
+    /// `init` so the repair pass can run once in `start`.
+    ///
+    /// `None` unless the composite backend was assembled with an entry store and a
+    /// model was loaded: the pass exists for rows stored before a model was
+    /// configured, so without one it has no vector to give and nothing to do.
+    embedding_repair: std::sync::Mutex<Option<EmbeddingRepair>>,
 }
 
 impl MemoryPlugin {
@@ -21,6 +32,7 @@ impl MemoryPlugin {
         Self {
             initialized: false,
             ingestor_stop: std::sync::Mutex::new(None),
+            embedding_repair: std::sync::Mutex::new(None),
         }
     }
 }
@@ -145,6 +157,10 @@ impl cog_core::SystemPlugin for MemoryPlugin {
             None
         };
 
+        // 回填通路的两个把手：它的层与它的模型。只有 composite 那一支且模型真的装载了
+        // 才有值——其余各支没有「早于模型的旧行」这个前提，也就没有回填这回事。
+        let mut embedding_repair: Option<EmbeddingRepair> = None;
+
         let memory_backend: Option<Arc<dyn cog_core::MemoryBackend>> = {
             let backend: Arc<dyn cog_core::MemoryBackend> = match memory_backend_type.as_str() {
                 "composite" => {
@@ -215,7 +231,11 @@ impl cog_core::SystemPlugin for MemoryPlugin {
                         }
                         warn!("Summary layer failed to load persisted entries: {}", e);
                     }
-                    composite = composite.with_summary_backend(Arc::new(summary_backend));
+                    let summary_layer = Arc::new(summary_backend);
+                    composite = composite.with_summary_backend(summary_layer.clone());
+                    if let Some(ref embedder) = embed_provider {
+                        embedding_repair = Some((summary_layer, embedder.clone()));
+                    }
 
                     match pg_pool_explain {
                         Some(ref pool) => {
@@ -326,6 +346,11 @@ impl cog_core::SystemPlugin for MemoryPlugin {
         ctx.publish_observable(crate::observable::global_observable());
         info!("MemoryPlugin observable published");
 
+        *self
+            .embedding_repair
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = embedding_repair;
+
         self.initialized = true;
         Ok(())
     }
@@ -364,6 +389,34 @@ impl cog_core::SystemPlugin for MemoryPlugin {
                 warn!(
                     "Memory decay maintenance not started: memory backend or metrics backend unavailable"
                 );
+            }
+
+            // 回填只在 `start` 里跑一次，且只有装载了模型的那一支才拿得到把手：
+            // 「早于模型的旧行」这个前提本身由模型是否装载决定，所以判据不另设开关。
+            // 它不注册成循环——它不是循环，跑完就停了，注册进存活表反而会在正常结束
+            // 之后被读成「这条循环死了」。扫描范围是整张条目表，也就是 `load` 启动时
+            // 已经在做的那次读，代价不是新的一类。
+            if let Some((summary, embedder)) = self
+                .embedding_repair
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                tokio::spawn(async move {
+                    match summary.backfill_embeddings(embedder.as_ref()).await {
+                        Ok(report) => info!(
+                            scanned = report.scanned,
+                            backfilled = report.backfilled,
+                            already_embedded = report.already_embedded,
+                            failed = report.failed,
+                            "Summary embedding repair pass finished"
+                        ),
+                        Err(e) => warn!(
+                            "Summary embedding repair pass could not read the entry store, so \
+                             no row was given a vector: {e}"
+                        ),
+                    }
+                });
             }
         }
 

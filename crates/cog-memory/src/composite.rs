@@ -92,56 +92,15 @@ impl CompositeMemoryBackend {
     /// producers reach it: an explicit ingest, and the auto-ingest pipeline, whose extractor
     /// hands its summaries to `store_summary` like any other caller.
     ///
-    /// The dense half is computed only when the entry arrives without one — an extractor
-    /// that already embedded its text has done that work, and the model's name goes on the
-    /// row so a later reader can tell which model made the vector.
-    ///
-    /// The sparse half is computed only when the embedder can produce one at all. A
-    /// provider whose sparse session failed to load still embeds densely, and failing the
-    /// whole store over the missing half would take the working half down with it.
-    ///
     /// With no embedder at all the entry keeps no vector and the text path is the only way
-    /// back to it: a zero vector would be a well-formed but information-free point in the
-    /// collection, tying at score 0.0 with every other such point and answering searches
-    /// with an arbitrary ranking.
+    /// back to it.
     async fn embed_entry(&self, entry: &SummaryEntry) -> SFResult<SummaryEntry> {
-        let Some(embedder) = self.embedder.as_ref() else {
-            return Ok(entry.clone());
-        };
-        let mut entry = entry.clone();
-
-        if entry.embedding.is_empty() {
-            let vector = embedder
-                .embed(vec![entry.text.clone()])
-                .await?
-                .into_iter()
-                .next()
-                .ok_or_else(|| SFError::Agent("embedder returned no vector".into()))?;
-            // An empty vector is what a provider returns for "no vector", so treating it as
-            // one keeps the row's absent-vector state (and its name) rather than writing a
-            // name for a vector that is not there.
-            if !vector.is_empty() {
-                entry.embedding = vector;
-                entry.embedding_model = embedder.model_id().to_string();
+        match self.embedder.as_ref() {
+            Some(embedder) => {
+                crate::embedding_provider::fill_missing_halves(embedder.as_ref(), entry).await
             }
+            None => Ok(entry.clone()),
         }
-
-        if entry.sparse_embedding.is_none() && embedder.supports_sparse() {
-            match embedder.embed_sparse(vec![entry.text.clone()]).await {
-                Ok(mut sparse) => {
-                    if let Some(vector) = sparse.drain(..).next() {
-                        entry = entry.with_sparse_embedding(vector);
-                    }
-                }
-                Err(e) => tracing::warn!(
-                    "sparse embedding failed for summary {}; storing it with its dense \
-                     vector only: {e}",
-                    entry.id
-                ),
-            }
-        }
-
-        Ok(entry)
     }
 
     /// Configure persistence for the default in-memory schema/summary backends.

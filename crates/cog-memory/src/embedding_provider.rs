@@ -1,10 +1,67 @@
-use cog_core::{EmbeddingProvider, SFError, SFResult, SparseEmbedding};
+use cog_core::{EmbeddingProvider, SFError, SFResult, SparseEmbedding, SummaryEntry};
 
 /// The name stored beside every vector this provider produces. It names the model, not
 /// the caller, because that is what makes two vectors comparable: a row embedded by
 /// another model has to be distinguishable from one embedded by this, and a row with no
 /// vector at all is [`cog_core::NO_EMBEDDING_MODEL`].
 pub const BGE_M3_MODEL_ID: &str = "bge-m3/v1";
+
+/// Fill in the vectors an entry has to carry before a store indexes it.
+///
+/// The dense half is computed only when the entry arrives without one — a caller that
+/// already embedded its text has done that work, and the model's name goes onto the row
+/// so a later reader can tell which model made the vector.
+///
+/// The sparse half is computed only when the provider can produce one at all. A provider
+/// whose sparse session failed to load still embeds densely, and failing over the missing
+/// half would take the working half down with it.
+///
+/// An entry whose text yields no vector keeps none: a zero vector would be a well-formed
+/// but information-free point in the collection, tying at score 0.0 with every other such
+/// point and answering searches with an arbitrary ranking.
+///
+/// The store path and the repair pass both come through here and have to keep doing so.
+/// A second copy would be a second definition of what a stored vector is, and the two
+/// would drift apart exactly where the model changed.
+pub(crate) async fn fill_missing_halves(
+    embedder: &dyn EmbeddingProvider,
+    entry: &SummaryEntry,
+) -> SFResult<SummaryEntry> {
+    let mut entry = entry.clone();
+
+    if entry.embedding.is_empty() {
+        let vector = embedder
+            .embed(vec![entry.text.clone()])
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| SFError::Agent("embedder returned no vector".into()))?;
+        // An empty vector is what a provider returns for "no vector", so treating it as
+        // one keeps the row's absent-vector state (and its name) rather than writing a
+        // name for a vector that is not there.
+        if !vector.is_empty() {
+            entry.embedding = vector;
+            entry.embedding_model = embedder.model_id().to_string();
+        }
+    }
+
+    if entry.sparse_embedding.is_none() && embedder.supports_sparse() {
+        match embedder.embed_sparse(vec![entry.text.clone()]).await {
+            Ok(mut sparse) => {
+                if let Some(vector) = sparse.drain(..).next() {
+                    entry = entry.with_sparse_embedding(vector);
+                }
+            }
+            Err(e) => tracing::warn!(
+                "sparse embedding failed for summary {}; storing it with its dense \
+                 vector only: {e}",
+                entry.id
+            ),
+        }
+    }
+
+    Ok(entry)
+}
 
 /// Local embedding provider backed by [fastembed](https://crates.io/crates/fastembed),
 /// running **BGE-M3** (`BAAI/bge-m3`): 1024-dim dense vectors, an 8192-token context

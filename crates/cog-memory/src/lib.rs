@@ -52,7 +52,9 @@ pub use postgres_entry_store::{PostgresEntryStore, SUMMARY_ENTRIES_DDL};
 pub use postgres_schema::{PostgresSchemaBackend, SCHEMA_ENTRIES_DDL};
 pub use reranker::FastEmbedRerankerProvider;
 pub use schema_backend::MemorySchemaBackend;
-pub use vector_summary_backend::{VectorSummaryBackend, DEFAULT_SUMMARY_COLLECTION};
+pub use vector_summary_backend::{
+    EmbeddingRepairReport, VectorSummaryBackend, DEFAULT_SUMMARY_COLLECTION,
+};
 pub mod plugin;
 
 pub use config::{IngestConfig, MaintenanceConfig, MemoryConfig};

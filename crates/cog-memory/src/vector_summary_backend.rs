@@ -23,6 +23,23 @@ use cog_core::{SummaryEntry, SummarySearchResult};
 /// Default collection name when none is provided.
 pub const DEFAULT_SUMMARY_COLLECTION: &str = "summaries";
 
+/// What one repair pass did.
+///
+/// The counts are reported rather than inferred from the collection afterwards: an
+/// entry store that could not be read and one where every row already carried its
+/// vector leave the collection in the same shape, and only these tell them apart.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct EmbeddingRepairReport {
+    /// Entries the store holds, and the pass therefore looked at.
+    pub scanned: usize,
+    /// Entries that had no vector and now have one.
+    pub backfilled: usize,
+    /// Entries that already carried a dense vector and were left untouched.
+    pub already_embedded: usize,
+    /// Entries still without a vector, because the model could not be reached for
+    /// them or answered with nothing.
+    pub failed: usize,
+}
 
 /// [`SummaryBackend`] that delegates similarity search to a
 /// [`cog_core::VectorBackend`] and structured-data persistence to a
@@ -229,6 +246,74 @@ impl VectorSummaryBackend {
         Ok(())
     }
 
+    /// Give the entries that predate the embedder the vectors they never got.
+    ///
+    /// [`load`](Self::load) rebuilds the collection from the entry store and skips
+    /// every entry with no vector, so a row stored before a model was configured
+    /// stays unreachable by similarity search however long the process runs. Nothing
+    /// in the readings says so: the collection and the store agree with each other,
+    /// and a search simply returns less than the store holds. That is what this pass
+    /// is for — it is the only thing that ever gives those rows a vector.
+    ///
+    /// Only entries with no dense vector are written. One that has a vector is left
+    /// alone: its point in the collection is live, and re-storing it would delete that
+    /// point and insert another in its place for no gain.
+    ///
+    /// A row that fails is counted and skipped, not fatal — one text the model cannot
+    /// handle is not a reason to leave the other hundreds unembedded.
+    pub async fn backfill_embeddings(
+        &self,
+        embedder: &dyn cog_core::EmbeddingProvider,
+    ) -> SFResult<EmbeddingRepairReport> {
+        let entries = self.store.list_all().await?;
+        let mut report = EmbeddingRepairReport {
+            scanned: entries.len(),
+            ..Default::default()
+        };
+
+        for entry in entries {
+            if !entry.embedding.is_empty() {
+                report.already_embedded += 1;
+                continue;
+            }
+
+            let embedded =
+                match crate::embedding_provider::fill_missing_halves(embedder, &entry).await {
+                    Ok(embedded) => embedded,
+                    Err(e) => {
+                        tracing::warn!(
+                            "summary {} could not be embedded; it stays reachable by text \
+                             only: {e}",
+                            entry.id
+                        );
+                        report.failed += 1;
+                        continue;
+                    }
+                };
+
+            // A provider that answers with no vector leaves the row as it found it.
+            // Storing it anyway would rewrite an identical row and count it as repaired.
+            if embedded.embedding.is_empty() {
+                report.failed += 1;
+                continue;
+            }
+
+            // Through the store's own path, not the entry store's: the row and its
+            // point move together, and a repair that wrote only one of them would be
+            // a new instance of the very disagreement this pass exists to remove.
+            if let Err(e) = self.store_summary(&entry.namespace, &embedded).await {
+                tracing::warn!(
+                    "summary {} was embedded but could not be stored back: {e}",
+                    entry.id
+                );
+                report.failed += 1;
+                continue;
+            }
+            report.backfilled += 1;
+        }
+
+        Ok(report)
+    }
 }
 
 #[async_trait]
@@ -785,4 +870,204 @@ mod tests {
         assert_eq!(hits[0].entry.importance, 0.3);
     }
 
+    /// An entry as it looks when it was stored before any model was configured:
+    /// text and metadata, no vector, and the name that says so.
+    fn unembedded(id: &str) -> SummaryEntry {
+        SummaryEntry::new(
+            id,
+            "default",
+            format!("text of {id}"),
+            Vec::new(),
+            cog_core::NO_EMBEDDING_MODEL,
+            SourceRef::new(format!("memory://{id}"), "test/v1"),
+        )
+    }
+
+    /// Stands in for a loaded model: one non-zero dense vector and one sparse entry
+    /// per text, so a repaired row can be told apart from one that never got a
+    /// vector, and both halves of the hybrid vector can be checked. `refuses` names
+    /// the texts it will not embed, so a pass can be handed a row it has to report
+    /// as failed while the rest go through.
+    struct StubEmbedder {
+        dim: usize,
+        refuses: Vec<String>,
+    }
+
+    impl StubEmbedder {
+        fn new(dim: usize) -> Self {
+            Self {
+                dim,
+                refuses: Vec::new(),
+            }
+        }
+
+        fn refusing(dim: usize, text: &str) -> Self {
+            Self {
+                dim,
+                refuses: vec![text.to_string()],
+            }
+        }
+    }
+
+    #[async_trait]
+    impl cog_core::EmbeddingProvider for StubEmbedder {
+        async fn embed(&self, texts: Vec<String>) -> SFResult<Vec<Vec<f32>>> {
+            let mut out = Vec::with_capacity(texts.len());
+            for text in &texts {
+                if self.refuses.iter().any(|r| r == text) {
+                    return Err(SFError::Agent(format!("stub refuses {text}")));
+                }
+                out.push(vec![0.5f32; self.dim]);
+            }
+            Ok(out)
+        }
+
+        async fn embed_sparse(
+            &self,
+            texts: Vec<String>,
+        ) -> SFResult<Vec<cog_core::SparseEmbedding>> {
+            Ok(texts
+                .iter()
+                .map(|_| cog_core::SparseEmbedding::new(vec![1], vec![1.0]))
+                .collect())
+        }
+
+        fn supports_sparse(&self) -> bool {
+            true
+        }
+
+        fn model_id(&self) -> &str {
+            "stub/v1"
+        }
+
+        fn dimension(&self) -> usize {
+            self.dim
+        }
+    }
+
+    /// A row stored before a model was configured carries no vector, so the index
+    /// `load` rebuilds skips it and similarity search can never return it. The pass
+    /// is the only thing that ever gives it one.
+    #[tokio::test]
+    async fn the_pass_gives_a_vector_to_a_row_stored_without_one() {
+        let store = Arc::new(DurableStubStore::new());
+        store.upsert(&unembedded("old")).await.unwrap();
+
+        let backend =
+            VectorSummaryBackend::new(Arc::new(cog_storage::MemoryVectorBackend::new()), 4)
+                .with_store(store);
+        backend.load().await.unwrap();
+
+        let before = backend
+            .search_summary("default", &[0.5, 0.5, 0.5, 0.5], 10, None)
+            .await
+            .unwrap();
+        assert!(
+            before.is_empty(),
+            "a row with no vector must not be reachable by similarity"
+        );
+
+        let report = backend
+            .backfill_embeddings(&StubEmbedder::new(4))
+            .await
+            .unwrap();
+        assert_eq!(
+            report,
+            EmbeddingRepairReport {
+                scanned: 1,
+                backfilled: 1,
+                already_embedded: 0,
+                failed: 0,
+            }
+        );
+
+        let after = backend
+            .search_summary("default", &[0.5, 0.5, 0.5, 0.5], 10, None)
+            .await
+            .unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].entry.id, "old");
+        assert_eq!(
+            after[0].entry.embedding_model, "stub/v1",
+            "the row records which model made the vector"
+        );
+        assert!(
+            after[0].entry.sparse_embedding.is_some(),
+            "the repair fills both halves of the hybrid vector, not just the dense one"
+        );
+    }
+
+    /// Re-storing a row that already has a vector would delete its point from the
+    /// collection and insert another in its place. The pass therefore writes only
+    /// rows that have none, and a second run over the same store finds nothing left.
+    #[tokio::test]
+    async fn the_pass_leaves_an_embedded_row_alone() {
+        let store = Arc::new(DurableStubStore::new());
+        store.upsert(&entry("s1")).await.unwrap();
+
+        let backend =
+            VectorSummaryBackend::new(Arc::new(cog_storage::MemoryVectorBackend::new()), 4)
+                .with_store(store);
+        backend.load().await.unwrap();
+
+        let report = backend
+            .backfill_embeddings(&StubEmbedder::new(4))
+            .await
+            .unwrap();
+        assert_eq!(
+            report,
+            EmbeddingRepairReport {
+                scanned: 1,
+                backfilled: 0,
+                already_embedded: 1,
+                failed: 0,
+            }
+        );
+
+        let hits = backend
+            .search_summary("default", &[1.0, 0.0, 0.0, 0.0], 10, None)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "the entry's own point must survive the pass");
+        assert_eq!(
+            hits[0].entry.embedding_model, "test/v1",
+            "and stay the vector it already had"
+        );
+    }
+
+    /// One text the model cannot handle must not hold back the others: the pass
+    /// counts it and keeps going, so everything it could take ends up indexed and
+    /// the count says what was left behind.
+    #[tokio::test]
+    async fn a_row_the_model_refuses_is_counted_and_does_not_stop_the_pass() {
+        let store = Arc::new(DurableStubStore::new());
+        store.upsert(&unembedded("bad")).await.unwrap();
+        store.upsert(&unembedded("good")).await.unwrap();
+
+        let backend =
+            VectorSummaryBackend::new(Arc::new(cog_storage::MemoryVectorBackend::new()), 4)
+                .with_store(store);
+        backend.load().await.unwrap();
+
+        let report = backend
+            .backfill_embeddings(&StubEmbedder::refusing(4, "text of bad"))
+            .await
+            .unwrap();
+        assert_eq!(
+            report,
+            EmbeddingRepairReport {
+                scanned: 2,
+                backfilled: 1,
+                already_embedded: 0,
+                failed: 1,
+            }
+        );
+
+        let hits = backend
+            .search_summary("default", &[0.5, 0.5, 0.5, 0.5], 10, None)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entry.id, "good");
+    }
 }
