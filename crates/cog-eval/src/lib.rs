@@ -26,6 +26,7 @@ pub mod report;
 pub mod rig;
 pub mod runner;
 pub mod scaffold;
+pub mod scaffolds;
 pub mod service;
 pub mod system_harness;
 pub mod trend;
