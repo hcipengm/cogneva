@@ -317,7 +317,10 @@ spec:
               memory: 2Gi
             limits:
               cpu: 4000m
-              memory: 8Gi
+              # 16Gi：宿主级构建闸门的 cgroup_memory 维要它所在 cgroup 容得下两个
+              # 并发构建（(memory.max − current) / 4481MiB ≥ 2），推导见 chart
+              # values 的 evolution.resources 旁；同时必须 ≤ LimitRange 单容器上限。
+              memory: 16Gi
       volumes:
         - name: sandbox-data
           persistentVolumeClaim:

@@ -458,9 +458,14 @@ struct HostLoad {
 /// limit is a wall, so a build over it is killed, which is a change that failed
 /// for a reason that has nothing to do with the change. A bound set from the
 /// host alone would not see that wall: measured on this deployment's evolution
-/// cgroup — 4 cores, 8 GiB — one build of the workspace peaks at 4.7 GiB of
-/// summed `VmRSS` with 1.7 GiB of anonymous memory already resident, so a second
-/// concurrent build is past the limit while the host has tens of gigabytes free.
+/// cgroup — 4 cores and, when this was measured, 8 GiB — one build of the
+/// workspace peaks at 4.7 GiB of summed `VmRSS` with 1.7 GiB of anonymous
+/// memory already resident, which put a
+/// second concurrent build past that limit while the host had tens of gigabytes
+/// free. The peak is the wall this dimension is sized against, and it does not
+/// move when the limit does: what the limit decides is how many builds fit under
+/// it. The manifest's own number is therefore the whole of the fix here — this
+/// dimension reports the wall, it cannot open it.
 struct BuildBudget {
     /// Bytes the cgroup may use in total, and bytes it is using now.
     mem_max: u64,

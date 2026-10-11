@@ -46,13 +46,22 @@ storage:
 #     的 512Mi = 34.6Gi，头寸 3.4Gi（与上一版同口径）。这一档是**三个 session 都给足**
 #     的结果，不是按当天加载了几个来定的（多出来的两个今天还没打开，理由见
 #     gateway.resources）。
+#
+# 2026-10-11 重算：进化 Pod 抬到 4000m/16Gi（宿主级构建闸门的 cgroup_memory 维要它
+# 所在 cgroup 容得下两个并发构建，推导见 evolution.resources 旁）。
+#   limitsMemory 38Gi → 46Gi：34.1Gi 里进化从 8Gi 变 16Gi ⇒ 42.1Gi，加判据 Job 的
+#     512Mi = 42.6Gi，头寸 3.4Gi（与前两版同口径）。
+#   limitsCpu 不变：这一次只动内存。
+#   单容器上限（limitRange.maxMemory）同批 8Gi → 16Gi。它是**准入面**而不是策略偏
+#   好：不跟着抬，这份 16Gi 的声明在准入就被拒，报出来的是"超过单容器上限"，与
+#   "闸门能不能并发"看起来毫无关系。渲染期门禁第 3 条核的就是这条不变式。
 resourceGovernance:
   enabled: true
   quota:
     requestsCpu: "6"
     requestsMemory: 12Gi
     limitsCpu: "23"
-    limitsMemory: 38Gi
+    limitsMemory: 46Gi
     pods: "40"
     # 存储声明是**命名空间内全部 PVC 之和的上限**，不是某个卷的容量：目录型卷
     # 不强制 requests.storage，写多少都不影响落盘，它唯一的作用是拒绝一份声明
@@ -71,7 +80,11 @@ resourceGovernance:
     defaultRequestCpu: 50m
     defaultRequestMemory: 64Mi
     maxCpu: "4"
-    maxMemory: 8Gi
+    # 单容器上限必须 ≥ 本 chart 自己声明的最大那份容器 limits.memory：它是准入
+    # 面，低了不是"更安全"，是那份声明根本进不来（渲染期门禁第 3 条核这条）。
+    # 当前最大的是进化 Pod（16Gi，构建闸门的 cgroup_memory 维要它的 cgroup 容得
+    # 下两个并发构建），所以这里取 16Gi——恰好贴着最大声明，不额外放宽。
+    maxMemory: 16Gi
     minCpu: 10m
     minMemory: 16Mi
     # 单个 PVC 的上限：必须 ≥ 本 chart 最大的那份卷声明（当前是进化源码卷
@@ -172,7 +185,7 @@ gateway:
   # limits 6Gi ≈ 1.67GiB（嵌入两 session）＋ 1.67GiB（重排）＋ 本进程自己的工作集与
   # ONNX 推理的批量激活余量。这些页实测是私有匿名页（`smaps_rollup` 的 Anonymous/
   # Private_Dirty ≈1.67GiB，Shared_Clean 只有几 MB），容器里不可回收，所以 limit 必须
-  # 真装得下而不是靠回收兜底。LimitRange 的单容器上限是 8Gi，再往上会被准入拒掉。
+  # 真装得下而不是靠回收兜底。LimitRange 的单容器上限是 16Gi，再往上会被准入拒掉。
   # requests 取 2Gi：它声明的是调度器为这个 Pod 预留多少，量真占用的是现网的
   # `container_memory_working_set_bytes`，届时按读数收紧的是余量，不是能力。
   resources:
@@ -349,7 +362,19 @@ evolution:
       memory: 2Gi
     limits:
       cpu: 4000m
-      memory: 8Gi
+      # 宿主级构建闸门的 cgroup_memory 维读的就是这个数：它容得下几个并发构建
+      # = (memory.max − memory.current) / BUILD_PEAK_RSS_BYTES（实测工作区一次
+      # 构建的峰值 4481MiB）。8Gi 时这一维恒为 1：实测 memory.current 已 6.48GiB
+      # （大部分是可回收页缓存，闸门按"上限用了多少"而不是"不可回收多少"计，
+      # 理由见 build_gate.rs 里 BuildBudget 的文档），余下 1.5GiB 只够一个构建，
+      # 于是"宿主还有几十 GB 空闲"也照样串行。
+      #
+      # 16Gi 是让这一维到 2 的**下限不是舒服值**：按今天的 current 算
+      # (16GiB − 6.48GiB) / 4481MiB ≈ 2.2，而第二个构建跑起来后 current 还会涨，
+      # 真值要 rollout 后读 `cogneva_build_gate_ceiling{dimension="cgroup_memory"}`
+      # 再定。抬这个数必须同批抬 LimitRange 的单容器上限（见 resourceGovernance），
+      # 否则 Pod 在准入就被拒。
+      memory: 16Gi
 
 # 沙箱执行器：主应用与进化共用的零凭证工具执行面（run_command/read_file/write_file）。
 # 不挂 Secret、不挂 ServiceAccount token；关掉后主应用/进化的工具调用将无执行面。
