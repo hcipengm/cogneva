@@ -11,6 +11,7 @@
 
 pub mod ablation;
 pub mod adapters;
+pub mod bench;
 pub mod comparator;
 pub mod cross_system;
 pub mod dataset;
@@ -22,7 +23,9 @@ pub mod long_run;
 pub mod metric;
 pub mod plugin;
 pub mod report;
+pub mod rig;
 pub mod runner;
+pub mod scaffold;
 pub mod service;
 pub mod system_harness;
 pub mod trend;
@@ -32,6 +35,7 @@ pub use ablation::{
     Component, GroupReport,
 };
 pub use adapters::{AgentBenchLoader, GaiaRunner, SweBenchRunner};
+pub use bench::{Benchmark, CaseJudge, CaseSource, EnvProvider, Toolkit, Verdict};
 pub use comparator::{two_proportion_z_test, AbComparator, ComparisonReport, StatisticalTest};
 pub use cross_system::{
     CrossSystemBenchmark, CrossSystemReport, ExternalSystem, MethodologyConfig, SystemScore,
@@ -48,7 +52,11 @@ pub use long_run::{
 };
 pub use metric::{EvalMetric, EvalResult, MetricValue, StepRecord};
 pub use report::{DimensionSummary, EvalReport, MetricAggregate, PerCaseResult, ReportFormat};
+pub use rig::{Cell, CellStat, Rig, RunConfig, SeedScore, Table};
 pub use runner::{EvalRunner, RunnerConfig};
+pub use scaffold::{
+    AgentOutput, AgentScaffold, Budget, CaseEnv, FinishReason, NoEnv, SolveContext, ToolSet,
+};
 pub use system_harness::{
     D10Metrics, D13Metrics, DeployObservation, DeploymentTestConfig, FaultObservation, FaultType,
     MachineSpec, ScaleObservation, SecurityObservation, SecurityScenario, SystemEvalHarness,
