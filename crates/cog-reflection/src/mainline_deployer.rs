@@ -6554,8 +6554,18 @@ fn referenced_objects(doc: &serde_yaml::Value) -> Vec<(String, String)> {
         }
     };
     for field in ["containers", "initContainers"] {
-        for c in pod.get(field).and_then(|v| v.as_sequence()).into_iter().flatten() {
-            for e in c.get("env").and_then(|v| v.as_sequence()).into_iter().flatten() {
+        for c in pod
+            .get(field)
+            .and_then(|v| v.as_sequence())
+            .into_iter()
+            .flatten()
+        {
+            for e in c
+                .get("env")
+                .and_then(|v| v.as_sequence())
+                .into_iter()
+                .flatten()
+            {
                 let vf = e.get("valueFrom");
                 push(
                     "Secret",
@@ -8334,7 +8344,10 @@ impl RolloutExecutor {
     async fn missing_reference_holds(&self, docs: &[serde_yaml::Value]) -> Option<String> {
         for (kind, name) in unresolved_references(docs) {
             let resource = kind.to_lowercase();
-            let exists = match self.run_kubectl(&["get", &resource, &name, "-o", "name"], 60).await {
+            let exists = match self
+                .run_kubectl(&["get", &resource, &name, "-o", "name"], 60)
+                .await
+            {
                 Ok(_) => true,
                 Err(e) => {
                     let msg = e.to_string();
