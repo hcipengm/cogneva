@@ -41,7 +41,7 @@ die() { echo "error: $*" >&2; exit 1; }
 
 usage() {
   cat <<'EOF'
-usage: fetch-benchmark-data.sh [--benchmark <swe-bench-pro|toolathlon-gym|all>]
+usage: fetch-benchmark-data.sh [--benchmark <swe-bench-pro|toolathlon-gym|hle|all>]
                                [--dest <dir>] [--endpoint <url>] [--convert]
                                [--verify] [--print-files]
 
@@ -56,6 +56,7 @@ usage: fetch-benchmark-data.sh [--benchmark <swe-bench-pro|toolathlon-gym|all>]
 benchmarks and their pins:
   swe-bench-pro    ModelScope dataset ScaleAI/SWE-bench_Pro, public test split (731 rows)
   toolathlon-gym   GitHub eigent-ai/toolathlon_gym, 503 tasks, fetched as a tarball
+  hle              ModelScope dataset cais/hle, the full split (one parquet)
 EOF
 }
 
@@ -111,7 +112,19 @@ catalog() {
              "59beee37084adb84f84d1462a5d05f451c2dc5a5b4a5f95fa278a847949087e7")
       m_size=("8236215" "1392")
       ;;
-    *) die "unknown --benchmark: $1 (available: swe-bench-pro, toolathlon-gym)" ;;
+    hle)
+      source="modelscope-dataset"
+      repo="cais/hle"
+      revision="1ec1f1f25ed4ad891e3a81d1cbc08f261f5e77c6"
+      # The whole dataset is one parquet under data/. Its sha256 is the object id the mirror
+      # publishes for it, so the download is checked against the mirror's own claim and not
+      # only against a number remembered here.
+      a_dest=("hle/test-00000-of-00001.parquet")
+      a_src=("data/test-00000-of-00001.parquet")
+      a_sha=("6d0ee0602e8aea6b159509577e884f48ecac7b8e3f6822a35f51335a446c726a")
+      a_size=("274276147")
+      ;;
+    *) die "unknown --benchmark: $1 (available: swe-bench-pro, toolathlon-gym, hle)" ;;
   esac
 }
 
@@ -143,9 +156,9 @@ while [ $# -gt 0 ]; do
 done
 
 case "$benchmark" in
-  all) benchmarks=("swe-bench-pro" "toolathlon-gym") ;;
-  swe-bench-pro | toolathlon-gym) benchmarks=("$benchmark") ;;
-  *) die "unknown --benchmark: $benchmark (available: swe-bench-pro, toolathlon-gym, all)" ;;
+  all) benchmarks=("swe-bench-pro" "toolathlon-gym" "hle") ;;
+  swe-bench-pro | toolathlon-gym | hle) benchmarks=("$benchmark") ;;
+  *) die "unknown --benchmark: $benchmark (available: swe-bench-pro, toolathlon-gym, hle, all)" ;;
 esac
 
 if [ -n "$print_files" ]; then

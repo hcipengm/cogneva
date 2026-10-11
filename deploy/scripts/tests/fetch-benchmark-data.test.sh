@@ -51,6 +51,7 @@ expected_committed=(
   "toolathlon-gym.tar.gz"
   "toolathlon-gym/db/init.sql.gz"
   "toolathlon-gym/docker-compose.yml"
+  "hle/test-00000-of-00001.parquet"
 )
 [ "${#committed[@]}" -eq "${#expected_committed[@]}" ] ||
   fail "--print-files listed ${#committed[@]} paths, the catalog is expected to hold ${#expected_committed[@]}"
