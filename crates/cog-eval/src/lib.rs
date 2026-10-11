@@ -41,7 +41,9 @@ pub use adapters::{
     SweProJudge, SweProToolkit, ToolathlonBackend, ToolathlonCaseSource, ToolathlonJudge,
     ToolathlonToolkit, HLE_JSONL, SWE_PRO_JSONL, TOOLATHLON_TASKS_DIR,
 };
-pub use bench::{Benchmark, CaseJudge, CaseSource, EnvProvider, NoEnvProvider, Toolkit, Verdict};
+pub use bench::{
+    Benchmark, CaseJudge, CaseSource, EnvProvider, NoEnvProvider, ToolFactory, Toolkit, Verdict,
+};
 pub use comparator::{two_proportion_z_test, AbComparator, ComparisonReport, StatisticalTest};
 pub use cross_system::{
     CrossSystemBenchmark, CrossSystemReport, ExternalSystem, MethodologyConfig, SystemScore,

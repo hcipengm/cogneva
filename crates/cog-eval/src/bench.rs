@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use cog_core::Tool;
 
 use crate::dataset::EvalCase;
 use crate::scaffold::{AgentOutput, Budget, CaseEnv, ToolSet};
@@ -75,12 +76,24 @@ impl EnvProvider for NoEnvProvider {
     }
 }
 
+/// 按题造工具：拿到这道题的 `case` 与环境**之后**才定工具清单。
+///
+/// 与「构造期收一束现成工具」是两件事：容器里的 bash、某道题 compose 工程暴露出来的
+/// 端口，都要按**这道题的**环境造，而构造期还不知道是哪道题，造不出来。工厂因此收
+/// `case` 与 `env`，由 [`Toolkit::toolset`] 在拿到它们时现调。
+///
+/// 工厂住在基准各自的适配器里，评测台不认识任何基准——所以「工具怎么造」这件事
+/// 不进入台子，也就不会让某一列变得不可比。
+pub type ToolFactory =
+    dyn Fn(&EvalCase, &Arc<dyn CaseEnv>) -> anyhow::Result<Vec<Tool>> + Send + Sync;
+
 /// 工具包：这道题给外壳的工具面，一个基准一个。
 ///
 /// 协议由基准定、**不由方法定**——所以它在基准这一侧，不在外壳那一侧。同一基准
 /// 下四个外壳拿到的是同一束工具，否则表里的差就掺进了「谁的工具多」。
 pub trait Toolkit: Send + Sync {
     /// 工具是绑在 `env` 上的闭包：命令要落在**这道题的**环境里，不是平台沙盒里。
+    /// 这一层每次调用现造（见 [`ToolFactory`]），清单可以随题而变。
     fn toolset(&self, case: &EvalCase, env: &Arc<dyn CaseEnv>) -> anyhow::Result<ToolSet>;
 
     /// 外壳动作空间指名的那几件工具（`wanted` ＝ 外壳声明的名字），由**这道题的环境**供。

@@ -9,7 +9,7 @@
 //! （[`ToolathlonBackend`]），MCP server 的实现也是（[`ToolathlonToolkit`] 只认名字）。
 //! 缺任何一件都必须**报错**，不是给一个空环境或空工具面让分数悄悄掉下去。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use cog_core::Tool;
 use serde::Deserialize;
 
-use crate::bench::{CaseJudge, CaseSource, EnvProvider, Toolkit, Verdict};
+use crate::bench::{CaseJudge, CaseSource, EnvProvider, ToolFactory, Toolkit, Verdict};
 use crate::dataset::EvalCase;
 use crate::scaffold::{AgentOutput, CaseEnv, ToolSet};
 
@@ -187,37 +187,56 @@ impl EnvProvider for ToolathlonEnvProvider {
 /// Toolathlon 的工具包：这道题声明的那些 MCP server。
 ///
 /// 工具集由**基准**定、不由方法定，但这里与 HLE / SWE-bench Pro 不同：要哪几件由**每题**
-/// 的 `task_config.json` 定，不是一个固定清单。所以这一层持的是「名字 → 实现」的登记处，
-/// 判分器按每题的声明挑选；**声明里有、登记处里没有的 server 直接报错**——少给一台
-/// server 会让这一题的工具面比原题小，分数就不可归因了。
+/// 的 `task_config.json` 定，不是一个固定清单。所以这一层持的是「按题造工具」的工厂，
+/// 每次调用现造一批，再从里面挑出这道题声明的那几台；**声明里有、造出来的里面没有的
+/// server 直接报错**——少给一台 server 会让这一题的工具面比原题小，分数就不可归因了。
+///
+/// 工厂而不是固定清单，是因为这些 server 由**这道题自己的** compose 工程暴露：
+/// 端口要到这题的环境起来（`env` 拿到）时才定得下来。
 pub struct ToolathlonToolkit {
-    registry: Option<BTreeMap<String, Tool>>,
+    /// `None` ＝ 关工具的那一次跑。
+    factory: Option<Arc<ToolFactory>>,
 }
 
 impl ToolathlonToolkit {
-    /// 带工具的那一套：登记处按名字建，重复的名字是错误（谁是那台 server 就说不清了）。
-    pub fn with_tools(tools: Vec<Tool>) -> anyhow::Result<Self> {
-        let mut registry = BTreeMap::new();
-        for tool in tools {
-            let name = tool.name.clone();
-            if registry.insert(name.clone(), tool).is_some() {
-                anyhow::bail!("Toolathlon tools are registered by name; `{name}` appears twice");
-            }
+    /// 工具按题现造的那一套。
+    pub fn with_factory(factory: Arc<ToolFactory>) -> Self {
+        Self {
+            factory: Some(factory),
         }
-        Ok(Self {
-            registry: Some(registry),
-        })
+    }
+
+    /// 清单不随题变的那一套：造出来的那一批按名字建登记处。
+    pub fn with_tools(tools: Vec<Tool>) -> anyhow::Result<Self> {
+        check_registry(&tools)?;
+        Ok(Self::with_factory(Arc::new(move |_, _| Ok(tools.clone()))))
     }
 
     /// 关工具的那一套（同一 harness 只关工具的那一次跑）。
     pub fn without_tools() -> Self {
-        Self { registry: None }
+        Self { factory: None }
     }
 }
 
+/// 造出来的那批工具按名字认，重复的名字是错误（谁是那台 server 就说不清了）。
+///
+/// 每次现造的那一批都要过这一关：工厂能按题变，判据因此要落在**真正交出去的**那批上。
+fn check_registry(tools: &[Tool]) -> anyhow::Result<()> {
+    let mut seen = BTreeSet::new();
+    for tool in tools {
+        if !seen.insert(tool.name.as_str()) {
+            anyhow::bail!(
+                "Toolathlon tools are registered by name; `{}` appears twice",
+                tool.name
+            );
+        }
+    }
+    Ok(())
+}
+
 impl Toolkit for ToolathlonToolkit {
-    fn toolset(&self, case: &EvalCase, _env: &Arc<dyn CaseEnv>) -> anyhow::Result<ToolSet> {
-        let Some(registry) = &self.registry else {
+    fn toolset(&self, case: &EvalCase, env: &Arc<dyn CaseEnv>) -> anyhow::Result<ToolSet> {
+        let Some(factory) = &self.factory else {
             return Ok(ToolSet::empty());
         };
         let wanted: Vec<String> = serde_json::from_str(
@@ -226,11 +245,17 @@ impl Toolkit for ToolathlonToolkit {
                 .map(String::as_str)
                 .unwrap_or("[]"),
         )?;
+        let tools = factory(case, env)?;
+        check_registry(&tools)?;
+        let mut registry: BTreeMap<&str, &Tool> = BTreeMap::new();
+        for tool in &tools {
+            registry.insert(tool.name.as_str(), tool);
+        }
         let mut picked = Vec::with_capacity(wanted.len());
         let mut missing = Vec::new();
         for name in &wanted {
-            match registry.get(name) {
-                Some(tool) => picked.push(tool.clone()),
+            match registry.get(name.as_str()) {
+                Some(tool) => picked.push((*tool).clone()),
                 None => missing.push(name.clone()),
             }
         }
@@ -474,6 +499,39 @@ mod tests {
             .toolset(&case("t3", &["excel"]), &env)
             .unwrap()
             .is_empty());
+    }
+
+    /// 工厂按题现造：这道题的 server 由**这道题自己的** compose 工程暴露，端口到环境
+    /// 起来时才知道。现造的那批里少了一台声明的 server，仍要在这题被拦下。
+    #[test]
+    fn a_factory_can_bind_the_servers_to_the_question() {
+        let env: Arc<dyn CaseEnv> = Arc::new(NoEnv);
+        let per_case: Arc<ToolFactory> = Arc::new(|c, _| {
+            let wanted: Vec<String> =
+                serde_json::from_str(c.metadata.get("needed_mcp_servers").unwrap())?;
+            Ok(wanted.iter().map(|n| tool(n)).collect())
+        });
+        assert_eq!(
+            ToolathlonToolkit::with_factory(per_case)
+                .toolset(&case("t1", &["excel", "filesystem"]), &env)
+                .unwrap()
+                .definitions()
+                .len(),
+            2
+        );
+
+        let only_excel: Arc<ToolFactory> = Arc::new(|_, _| Ok(vec![tool("excel")]));
+        let err = ToolathlonToolkit::with_factory(only_excel)
+            .toolset(&case("t2", &["excel", "woocommerce"]), &env)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("woocommerce"), "{err}");
+
+        // 现造的那批里名字重复，同样说不清是哪台 server。
+        let dup: Arc<ToolFactory> = Arc::new(|_, _| Ok(vec![tool("excel"), tool("excel")]));
+        assert!(ToolathlonToolkit::with_factory(dup)
+            .toolset(&case("t3", &["excel"]), &env)
+            .is_err());
     }
 
     fn output() -> AgentOutput {

@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use cog_core::{execute_structured, ChatOptions, LlmClient, Message, Tool};
 use serde::Deserialize;
 
-use crate::bench::{CaseJudge, CaseSource, Toolkit, Verdict};
+use crate::bench::{CaseJudge, CaseSource, ToolFactory, Toolkit, Verdict};
 use crate::dataset::EvalCase;
 use crate::scaffold::{AgentOutput, CaseEnv, ToolSet};
 
@@ -153,34 +153,58 @@ pub const HLE_TOOL_PYTHON: &str = "python";
 /// 恰好这两件、名字钉死。实现没接时构造就失败，而不是给出一束空工具让分数悄悄掉下去：
 /// 「没有工具」与「工具没接上」在分数上同形，必须在这一层就分开。
 pub struct HleToolkit {
-    tools: Option<Vec<Tool>>,
+    /// `None` ＝ 关工具的那一次跑。
+    factory: Option<Arc<ToolFactory>>,
 }
 
 impl HleToolkit {
-    /// 工具开的那一套。必须**恰好**是 web search + Python，名字也按钉死的值来。
-    pub fn with_tools(tools: Vec<Tool>) -> anyhow::Result<Self> {
-        let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        names.sort_unstable();
-        let mut wanted = [HLE_TOOL_WEB_SEARCH, HLE_TOOL_PYTHON];
-        wanted.sort_unstable();
-        if names != wanted {
-            anyhow::bail!(
-                "HLE's tool face is exactly [{HLE_TOOL_WEB_SEARCH}, {HLE_TOOL_PYTHON}]; got {names:?}"
-            );
+    /// 工具开的那一套，清单**按题现造**。
+    ///
+    /// HLE 没有环境，所以今天的工厂忽略 `case`/`env` 交回同一束；留成工厂是与另两列
+    /// 同一形状：将来某题的工具要绑到那道题的环境上时，不必再改这一层的协议。
+    pub fn with_factory(factory: Arc<ToolFactory>) -> Self {
+        Self {
+            factory: Some(factory),
         }
-        Ok(Self { tools: Some(tools) })
+    }
+
+    /// 清单不随题变的那一套（HLE 今天就是这一种）。构造时先核一遍，早失败。
+    pub fn with_tools(tools: Vec<Tool>) -> anyhow::Result<Self> {
+        check_face(&tools)?;
+        Ok(Self::with_factory(Arc::new(move |_, _| Ok(tools.clone()))))
     }
 
     /// 关工具的那一套（同一 harness 只关工具的那一次跑）。
     pub fn without_tools() -> Self {
-        Self { tools: None }
+        Self { factory: None }
     }
 }
 
+/// HLE 的工具面**恰好**是这两件，名字按钉死的值来。
+///
+/// 造出来的清单每次都要过这一关，不只是构造期核一次——工厂是能按题变的，判据因此
+/// 要落在**真正交出去的**那一束上。
+fn check_face(tools: &[Tool]) -> anyhow::Result<()> {
+    let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    names.sort_unstable();
+    let mut wanted = [HLE_TOOL_WEB_SEARCH, HLE_TOOL_PYTHON];
+    wanted.sort_unstable();
+    if names != wanted {
+        anyhow::bail!(
+            "HLE's tool face is exactly [{HLE_TOOL_WEB_SEARCH}, {HLE_TOOL_PYTHON}]; got {names:?}"
+        );
+    }
+    Ok(())
+}
+
 impl Toolkit for HleToolkit {
-    fn toolset(&self, _case: &EvalCase, _env: &Arc<dyn CaseEnv>) -> anyhow::Result<ToolSet> {
-        match &self.tools {
-            Some(tools) => ToolSet::new(tools.clone()),
+    fn toolset(&self, case: &EvalCase, env: &Arc<dyn CaseEnv>) -> anyhow::Result<ToolSet> {
+        match &self.factory {
+            Some(factory) => {
+                let tools = factory(case, env)?;
+                check_face(&tools)?;
+                ToolSet::new(tools)
+            }
             None => Ok(ToolSet::empty()),
         }
     }
@@ -426,6 +450,34 @@ mod tests {
             .toolset(&empty_case, &env)
             .unwrap()
             .is_empty());
+    }
+
+    /// 工具是按题现造的，判据因此落在**真正交出去的**那一束上。
+    ///
+    /// 构造期核不到工厂按题才交出来的错——那一类必须在这一层拦住，否则一束少了一件
+    /// 的工具会静默地把分数拉低。
+    #[test]
+    fn a_factory_built_tool_face_is_checked_at_call_time() {
+        let env: Arc<dyn CaseEnv> = Arc::new(NoEnv);
+        let c = case("hle-y", "exactMatch", "q", "a");
+
+        let good: Arc<ToolFactory> =
+            Arc::new(|_, _| Ok(vec![tool(HLE_TOOL_WEB_SEARCH), tool(HLE_TOOL_PYTHON)]));
+        assert_eq!(
+            HleToolkit::with_factory(good)
+                .toolset(&c, &env)
+                .unwrap()
+                .definitions()
+                .len(),
+            2
+        );
+
+        let short: Arc<ToolFactory> = Arc::new(|_, _| Ok(vec![tool(HLE_TOOL_WEB_SEARCH)]));
+        let err = HleToolkit::with_factory(short)
+            .toolset(&c, &env)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(HLE_TOOL_PYTHON), "{err}");
     }
 
     fn case(id: &str, answer_type: &str, question: &str, answer: &str) -> EvalCase {

@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use cog_core::Tool;
 use serde::Deserialize;
 
-use crate::bench::{CaseJudge, CaseSource, EnvProvider, Toolkit, Verdict};
+use crate::bench::{CaseJudge, CaseSource, EnvProvider, ToolFactory, Toolkit, Verdict};
 use crate::dataset::EvalCase;
 use crate::scaffold::{AgentOutput, CaseEnv, ToolSet};
 
@@ -318,35 +318,58 @@ impl EnvProvider for SweProEnvProvider {
 ///
 /// 协议**恰好** bash + file-edit（与公开的 code agent 配置逐类比照）。实现从外面注入：
 /// 这一层只管名字与件数，缺实现时构造就失败，而不是给出一束空工具让分数悄悄掉下去。
+///
+/// 工具是**按题现造**的：bash 与 file-edit 要落在这道题自己的容器里，容器到
+/// [`Toolkit::toolset`] 拿到 `env` 时才存在，所以清单不能在构造期定死。
 pub struct SweProToolkit {
-    tools: Option<Vec<Tool>>,
+    /// `None` ＝ 关工具的那一次跑。
+    factory: Option<Arc<ToolFactory>>,
 }
 
 impl SweProToolkit {
-    pub fn with_tools(tools: Vec<Tool>) -> anyhow::Result<Self> {
-        let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        names.sort_unstable();
-        let mut wanted = [SWE_PRO_TOOL_BASH, SWE_PRO_TOOL_FILE_EDIT];
-        wanted.sort_unstable();
-        if names != wanted {
-            anyhow::bail!(
-                "SWE-bench Pro's tool face is exactly [{SWE_PRO_TOOL_BASH}, \
-                 {SWE_PRO_TOOL_FILE_EDIT}]; got {names:?}"
-            );
+    /// 工具开的那一套，清单按题现造（绑到这道题的容器上）。
+    pub fn with_factory(factory: Arc<ToolFactory>) -> Self {
+        Self {
+            factory: Some(factory),
         }
-        Ok(Self { tools: Some(tools) })
+    }
+
+    /// 清单不随题变的那一套。构造时先核一遍，早失败。
+    pub fn with_tools(tools: Vec<Tool>) -> anyhow::Result<Self> {
+        check_face(&tools)?;
+        Ok(Self::with_factory(Arc::new(move |_, _| Ok(tools.clone()))))
     }
 
     /// 关工具的那一套（同一 harness 只关工具的那一次跑）。
     pub fn without_tools() -> Self {
-        Self { tools: None }
+        Self { factory: None }
     }
 }
 
+/// SWE-bench Pro 的工具面**恰好**是这两件。每次造出来的清单都要过这一关：工厂能按题变，
+/// 判据因此要落在**真正交出去的**那一束上。
+fn check_face(tools: &[Tool]) -> anyhow::Result<()> {
+    let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    names.sort_unstable();
+    let mut wanted = [SWE_PRO_TOOL_BASH, SWE_PRO_TOOL_FILE_EDIT];
+    wanted.sort_unstable();
+    if names != wanted {
+        anyhow::bail!(
+            "SWE-bench Pro's tool face is exactly [{SWE_PRO_TOOL_BASH}, \
+             {SWE_PRO_TOOL_FILE_EDIT}]; got {names:?}"
+        );
+    }
+    Ok(())
+}
+
 impl Toolkit for SweProToolkit {
-    fn toolset(&self, _case: &EvalCase, _env: &Arc<dyn CaseEnv>) -> anyhow::Result<ToolSet> {
-        match &self.tools {
-            Some(tools) => ToolSet::new(tools.clone()),
+    fn toolset(&self, case: &EvalCase, env: &Arc<dyn CaseEnv>) -> anyhow::Result<ToolSet> {
+        match &self.factory {
+            Some(factory) => {
+                let tools = factory(case, env)?;
+                check_face(&tools)?;
+                ToolSet::new(tools)
+            }
             None => Ok(ToolSet::empty()),
         }
     }
@@ -632,6 +655,30 @@ mod tests {
             .toolset(&any, &env)
             .unwrap()
             .is_empty());
+    }
+
+    /// 工厂拿得到 `case`（与 `env`）：bash 与 file-edit 才能绑到**这道题的**容器上。
+    #[test]
+    fn a_factory_sees_the_case_it_is_building_tools_for() {
+        let env: Arc<dyn CaseEnv> = Arc::new(NoEnv);
+        let factory: Arc<ToolFactory> = Arc::new(|c, _| {
+            if c.id == "swe-pro-per-case" {
+                Ok(vec![tool(SWE_PRO_TOOL_BASH), tool(SWE_PRO_TOOL_FILE_EDIT)])
+            } else {
+                anyhow::bail!("no container for {}", c.id)
+            }
+        });
+        let kit = SweProToolkit::with_factory(factory);
+        assert_eq!(
+            kit.toolset(&case("swe-pro-per-case", "['t']", "[]"), &env)
+                .unwrap()
+                .definitions()
+                .len(),
+            2
+        );
+        assert!(kit
+            .toolset(&case("swe-pro-other", "['t']", "[]"), &env)
+            .is_err());
     }
 
     fn case(id: &str, f2p: &str, p2p: &str) -> EvalCase {
