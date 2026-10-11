@@ -5042,6 +5042,11 @@ impl MainlineDeployer {
             .current_dir(self.workdir())
             .env("CARGO_BUILD_JOBS", &jobs)
             .env("CARGO_HOME", CARGO_HOME_PVC)
+            // 拷贝配置依赖镜像里存在 config.toml：基础镜像一换、受限网络注入被
+            // 摘掉，上面整段就静默跳过，cargo 退回默认 git 索引直连 crates.io，
+            // 家庭网络拉取极慢——正是这段注释要防的慢路径。用环境变量钉死
+            // sparse，不依赖那个文件在不在，兜底从「尽量带到 PVC」变「必然成立」。
+            .env("CARGO_REGISTRIES_CRATES_IO_PROTOCOL", "sparse")
             // 工作树只放源码；产物落在共享 target，工作树重建也不用冷编译。
             .env("CARGO_TARGET_DIR", self.target_dir())
             // build.rs 回退只嵌 7 位短 sha，叠层后的 --version 校验匹配 12
