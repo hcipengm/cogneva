@@ -195,10 +195,26 @@ async fn a_window_folds_the_ledger_and_reruns_in_place_with_zeros_for_the_idle()
     .expect("count after the rerun");
 
     assert_eq!(
-        (first, count_before),
-        (second, count_after),
-        "a rerun writes the same number of rows and leaves the table the same size"
+        count_before, count_after,
+        "a rerun leaves this window's rows for the probe's upstream at the same count"
     );
+    // What the rerun writes is not comparable between the two folds. The count
+    // `rollup_windows` reports is one row for every combination the *whole*
+    // ledger knows — the zero rows for idle combinations are most of it — so it
+    // reads the vocabulary every case in this file contributes to, and the
+    // second case here records its own combination and deletes it again when it
+    // finishes. The number can therefore move in either direction across the
+    // rerun without the fold having done anything different. All that is
+    // assertable from here is the floor: this probe put two combinations in the
+    // ledger before either fold, so each fold reports at least those two.
+    for (written, name) in [(first, "the first fold"), (second, "the rerun")] {
+        assert!(
+            written >= 2,
+            "{name} reports {written} rows written, fewer than the two \
+             combinations this probe recorded, and the fold writes a row for \
+             every combination the ledger knows"
+        );
+    }
     assert_eq!(
         folded(&pool, &upstream, w.start, &busy).await[0],
         (3, 1, 300, 30, 40),
