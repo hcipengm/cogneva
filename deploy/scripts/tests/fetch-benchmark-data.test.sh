@@ -63,6 +63,30 @@ mapfile -t committed_conv < <("${fetcher}" --print-files --convert)
 printf '%s\n' "${committed_conv[@]}" | grep -qx 'swe-bench-pro/test-00000-of-00001.jsonl' ||
   fail "--print-files --convert does not list the derived JSONL"
 
+# The pins a reader needs: what each path is pinned *by*, and whether it is a file or a
+# directory. The hashes are not asserted here (they are read at fetch time; a second copy in
+# this file would be a second carrier to drift), but the shape is: a read-file row must name
+# the derived JSONL the rig actually opens rather than the parquet behind it, and Toolathlon
+# -- whose reader walks a directory -- must appear as a read-dir row rather than silently
+# dropping out for having no hash of its own.
+mapfile -t committed_pins < <("${fetcher}" --print-pins | awk -F'\t' '{ printf "%s\t%s\t%s\n", $1, $2, $4 }')
+expected_pins=(
+  "source	swe-bench-pro	swe-bench-pro/test-00000-of-00001.parquet"
+  "read-file	swe-bench-pro	swe-bench-pro/test-00000-of-00001.jsonl"
+  "source	toolathlon-gym	toolathlon-gym.tar.gz"
+  "read-dir	toolathlon-gym	toolathlon-gym/tasks/finalpool"
+  "source	hle	hle/test-00000-of-00001.parquet"
+  "read-file	hle	hle/test-00000-of-00001.jsonl"
+)
+[ "${#committed_pins[@]}" -eq "${#expected_pins[@]}" ] ||
+  fail "--print-pins printed ${#committed_pins[@]} records, expected ${#expected_pins[@]}"
+for i in "${!expected_pins[@]}"; do
+  [ "${committed_pins[$i]}" = "${expected_pins[$i]}" ] ||
+    fail "--print-pins record $((i + 1)) is '${committed_pins[$i]}', expected '${expected_pins[$i]}'"
+done
+("${fetcher}" --print-pins | awk -F'\t' 'NF != 7 { bad = 1 } END { exit bad }') ||
+  fail "a pin record is not seven tab-separated fields"
+
 # --- the fixture mirror ------------------------------------------------------
 hub="${work}/hub"
 log="${work}/requests.log"
@@ -416,6 +440,37 @@ cmp -s "${restart_dest}/swe-bench-pro/test.parquet" "${parquet_body}" ||
 [ ! -e "${restart_dest}/swe-bench-pro/test.parquet.part" ] ||
   fail "the partial survived a successful restart"
 rm -f "${norange_file}"
+
+# --- 11) --print-pins reads the catalog, it is not a second table ------------
+# The pins must come out of the catalog the same run would fetch from: a fixture catalog with
+# different hashes has to produce different pins, or the pins are a hardcoded copy that can
+# disagree with the bytes on disk while looking authoritative.
+before="$(count_downloads)"
+"${fetcher}" --benchmark swe-bench-pro --print-pins >"${work}/pins.tsv" ||
+  fail "--print-pins failed against the fixture catalog"
+"${fetcher}" --benchmark toolathlon-gym --print-pins >"${work}/pins-tool.tsv" ||
+  fail "--print-pins failed for a single benchmark"
+after="$(count_downloads)"
+[ "${after}" -eq "${before}" ] ||
+  fail "--print-pins fetched from the mirror; it must work with no network"
+pinned() { awk -F'\t' -v k="$1" -v p="$2" '$1 == k && $4 == p { print $5 }' "$3"; }
+[ "$(pinned source swe-bench-pro/test.parquet "${work}/pins.tsv")" = "$(sha_of "${parquet_body}")" ] ||
+  fail "the pin for the parquet is not the fixture catalog's hash"
+[ "$(awk -F'\t' '$1 == "source" && $4 == "swe-bench-pro/test.parquet" { print $3 }' "${work}/pins.tsv")" = "fixture-rev" ] ||
+  fail "the pin does not carry the catalog's revision"
+[ "$(pinned source toolathlon-gym.tar.gz "${work}/pins-tool.tsv")" = "${tar_sha}" ] ||
+  fail "the tarball pin is not the fixture catalog's hash"
+[ "$(pinned read-dir toolathlon-gym/tasks/finalpool "${work}/pins-tool.tsv")" = "-" ] ||
+  fail "the directory pin invents a hash a directory cannot have"
+if [ -n "${have_pyarrow}" ]; then
+  [ "$(pinned read-file swe-bench-pro/test.jsonl "${work}/pins.tsv")" = "$(sha_of "${work}/expected.jsonl")" ] ||
+    fail "the derived JSONL is not pinned by its own hash"
+else
+  # This fixture catalog declares no derived entry (nothing could build one), so the pins for
+  # this one file are absent -- and that is the fixture's shape, not the committed catalog's.
+  # The committed one lists it with --convert left out; that is asserted up top.
+  echo "SKIP: pyarrow not importable, the derived JSONL pin was not exercised"
+fi
 
 "${fetcher}" --help >/dev/null || fail "--help did not exit 0"
 "${fetcher}" --benchmark nope --print-files >/dev/null 2>&1 &&

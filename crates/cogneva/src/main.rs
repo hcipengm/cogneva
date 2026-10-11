@@ -87,6 +87,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // what moves "a host that died uncleanly means truncating the AOF by
         // hand" onto the startup path.
         Command::RepairAof => cogneva::aof_repair::run_from_args(),
+        // 主表对比实验：一条命令跑「数据根 × 基准 × 外壳 × 种子」，输出带 pins 的表。
+        // 缺上游或缺平台时它照样出表，但把缺什么写进表里并以非零退出——「这一格是 0 分」
+        // 与「这一列没跑成」在表里必须分得开。
+        Command::EvalTable => cogneva::eval_table::run_from_args().await,
         Command::WindowsService => {
             #[cfg(windows)]
             {

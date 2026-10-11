@@ -10,6 +10,8 @@ pub mod cli;
 pub mod config_loader;
 pub mod config_watcher;
 pub mod daemon;
+pub mod eval_platform;
+pub mod eval_table;
 pub mod health_check;
 pub mod hot_reload;
 pub mod pidfile;

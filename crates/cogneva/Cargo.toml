@@ -43,6 +43,11 @@ cog-github = { workspace = true }
 
 tokio = { workspace = true }
 tracing = { workspace = true }
+# The eval-table subcommand: its own error type, and the hash it re-measures under the pins
+# it was handed (a pin that is not checked against the bytes on disk is just a label).
+anyhow = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 tracing-subscriber = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }

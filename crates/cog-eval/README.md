@@ -43,8 +43,8 @@ twice, and the difference between them would be prompt wording rather than metho
 
 Three of the four (CodeAct, GEPA, AGENTFLOW) drive the backbone directly through `LlmClient`. The
 fourth, `nql`, is a thin wrapper over the real platform: it reaches the platform through the
-`PlatformRunner` port, which the crate declares and does not implement — a missing platform has to
-look like a missing platform, so that row **errors** rather than scoring low.
+`PlatformRunner` port, which this crate declares and the composition root implements — a missing
+platform has to look like a missing platform, so that row **errors** rather than scoring low.
 
 ## Getting the data
 
@@ -141,10 +141,47 @@ with `errored == 0` in both — over the real data, with only the container/Comp
 COG_EVAL_DATA_ROOT=/srv/cogneva/benchmarks cargo test -p cog-eval
 ```
 
+### Driving the table
+
+One command runs the whole thing — one data root, the benchmarks, the rows, the seeds — and prints
+the table together with the pins it was produced under:
+
+```sh
+cogneva eval-table --pins /srv/cogneva/benchmarks/pins.tsv --tools none \
+                   --backbone '<model>@<version>' --judge '<model>@<version>'
+```
+
+- `--pins` is required, and its file is `deploy/scripts/fetch-benchmark-data.sh --print-pins`'s
+  output: one record per benchmark naming the revision and **the path the rig actually opens** —
+  the derived JSONL rather than the parquet it came from, and for Toolathlon a *directory*
+  (recorded as such, its bytes pinned by the source archive's hash, because a directory has no
+  hash of its own). The driver re-hashes what is on disk and refuses to run when the bytes are not
+  the ones the pin names. A table without pins is a table nobody can compare against anything.
+- `--tools` has no default. `none` and `platform` are two separate experiments, so defaulting
+  would silently decide which one ran. The tools-on arm needs implementations for every tool each
+  benchmark pins (HLE: `web_search` + `python`; SWE-bench Pro: `bash` + `file_edit`; Toolathlon:
+  the MCP servers the task declares), and the composition root has none yet — so it refuses
+  rather than scoring every case on a smaller tool face.
+- Model names come in on the command line as `<model>@<version>` and are checked against the
+  enabled `llm_routing` backends. A pin naming a model no upstream serves is reported as a missing
+  dependency, not printed as though it were in force.
+- Missing dependencies (backbone, judge, container backend, Compose backend, platform) do not stop
+  the table: they are listed under `## wiring`, the cells they touch come out `errored`, and the
+  process exits non-zero. The table is the report; the exit code is the verdict.
+
+Two runs with one data root and one command line print the **same bytes**: no wall clock, no
+container iteration order, no scheduler-dependent ordering (the failure list is sorted by case id,
+not by whichever case finished first). `crates/cogneva/tests/eval_table_determinism.rs` holds that
+to two runs of the pipeline against a scripted backbone — determinism *of the pipeline given the
+same answers*, not end-to-end reproducibility of an upstream that samples at temperature 1.
+
 ### A dead upstream yields data and interfaces, not numbers
 
 This is the honest boundary of the crate today. The rig, the four rows, and all three benchmarks'
-adapter sets are landed; a driver and the platform bridge are not.
+adapter sets are landed; the driver and the platform bridge are landed too. What is not landed is a
+live upstream — with no `llm_routing` backend serving the pinned models and no platform endpoint, a
+run produces the table's *shape* (which cells exist, which pins it ran under, which cells errored)
+and not numbers.
 
 1. **The external dependencies each adapter needs are ports** — the crate declares them and does
    not implement them, because they are where the platform (a container runtime, a Compose project,
@@ -159,15 +196,27 @@ adapter sets are landed; a driver and the platform bridge are not.
    task for the wrong reason. SWE-bench Pro's per-instance container is `SweProBackend` and
    Toolathlon's Compose project is `ToolathlonBackend`: with no backend wired, both env acquisition
    and judging **error** rather than reading as a model that failed the task.
-2. **A driver** — no binary runs the table. The entry point is the library API above.
-3. **The platform bridge** — the `nql` row reaches the real platform through `PlatformRunner`
-   (`src/scaffolds/nql.rs`), and **nothing implements it**. Turning one case into a platform task,
-   running it there, and getting back an `AgentOutput` with a trace is the platform side growing a
-   path, not a call site the rig can add on its own; its implementation lives where the platform
-   types are visible, at the composition root.
+2. **A driver** — `cogneva eval-table` runs the table and prints it with its pins (see *Driving
+   the table* above). It builds no numbers today: every dependency it needs is unwired, and it
+   reports that instead of hiding it.
+3. **The platform bridge** — landed at the composition root, where the platform types are visible.
+   `PlatformApiRunner` (`crates/cogneva/src/eval_platform.rs`) implements `PlatformRunner` over the
+   platform's own HTTP routes: it submits the case as a task, waits for that task to reach a
+   terminal status, then reads back its execution trace and metrics and *projects* them into an
+   `AgentOutput` (the answer text, the step records, the token split, a finish reason). The endpoint,
+   token and deadline come from `COG_EVAL_PLATFORM_BASE` / `COG_EVAL_PLATFORM_TOKEN` /
+   `COG_EVAL_PLATFORM_DEADLINE_SECS`; with no endpoint set the driver keeps the erroring `NoPlatform`
+   port, so the `nql` row errors rather than scoring. It is not a stub — every route it calls is the
+   platform's real one, and a case the platform never finishes is reported as an error, never as a
+   zero. Two things are worth knowing before reading a number off this row: the projection is
+   lossy (the platform's own step `duration_ms` is wall clock, so it is zeroed to keep two runs
+   byte-identical, and the platform reports no stop reason on this route, so every answer finishes
+   `Answered`), and the bridge assumes the platform runs a submitted task *as that task* — a
+   platform that decomposes it into planner-generated children keeps none of the submitted id's
+   work under that id, and the bridge will time out rather than guess.
 
-So what you can reproduce today is the **data plane** (fetch + verify) and the **interfaces**, not
-table numbers.
+So what you can reproduce today is the **data plane** (fetch + verify) and the **interfaces** — and,
+once an upstream is alive, the platform row through a real bridge — not table numbers.
 
 Two further things stand between this rig and numbers even once those land. First, every row except
 NQL drives a backbone (`deepseek-v4-flash`) through `LlmClient` (NQL drives the platform instead),

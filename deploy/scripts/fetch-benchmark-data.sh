@@ -32,6 +32,7 @@
 #   deploy/scripts/fetch-benchmark-data.sh --benchmark swe-bench-pro --convert
 #   deploy/scripts/fetch-benchmark-data.sh --verify [--convert]      # re-check, no network
 #   deploy/scripts/fetch-benchmark-data.sh --print-files
+#   deploy/scripts/fetch-benchmark-data.sh --print-pins              # what pins each read path
 
 set -euo pipefail
 
@@ -43,7 +44,7 @@ usage() {
   cat <<'EOF'
 usage: fetch-benchmark-data.sh [--benchmark <swe-bench-pro|toolathlon-gym|hle|all>]
                                [--dest <dir>] [--endpoint <url>] [--convert]
-                               [--verify] [--print-files]
+                               [--verify] [--print-files] [--print-pins]
 
   --benchmark  which benchmark to provision, default all
   --dest       where the data is written, default /srv/cogneva/benchmarks
@@ -51,6 +52,12 @@ usage: fetch-benchmark-data.sh [--benchmark <swe-bench-pro|toolathlon-gym|hle|al
   --convert    also build (provision) or require (verify) the derived JSONL, needs pyarrow
   --verify     check what is installed against the catalog, no network, non-zero on mismatch
   --print-files  print every path this would install under --dest, one per line, no network
+  --print-pins   print, as tab-separated records, what the pins are for the paths a reader
+                 opens: kind, benchmark, revision, path, sha256, size, note. No network.
+                 Unlike --print-files this lists a derived path whether or not --convert is
+                 given -- a pin names the bytes an experiment was measured against, and that
+                 reading is the derived file. Pins for a file that was never built still have
+                 to be printed, or the missing file would read as "no pin needed".
   -h, --help   this text
 
 benchmarks and their pins:
@@ -142,6 +149,7 @@ endpoint=""
 convert=""
 mode="provision"
 print_files=""
+print_pins=""
 
 # The catalog above is the committed one. A test substitutes another by pointing
 # BENCHMARK_CATALOG_FILE at a file that defines catalog(); nothing else changes.
@@ -158,6 +166,7 @@ while [ $# -gt 0 ]; do
     --convert) convert="1"; shift ;;
     --verify) mode="verify"; shift ;;
     --print-files) print_files="1"; shift ;;
+    --print-pins) print_pins="1"; shift ;;
     -h | --help) usage; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
@@ -177,6 +186,46 @@ if [ -n "$print_files" ]; then
     if [ -n "$convert" ]; then printf '%s\n' "${d_dest[@]}"; fi
   done
   exit 0
+fi
+
+# What pins each path, as tab-separated records: kind, benchmark, revision, path, sha256,
+# size, note. Fixed columns so a reader can take them by position; no field may hold a tab.
+#
+# Three kinds, because two of them cannot be pinned the same way. `source` is an artifact
+# fetched from a mirror. `read-file` is a file a reader opens directly -- for the two
+# benchmarks whose rows come out of a parquet that is the *derived* JSONL, so its own hash
+# is the pin, and the parquet's hash only pins the recipe. `read-dir` is a tree a reader
+# walks (an unpacked tarball): a directory has no content hash at all, so its bytes are
+# pinned by the archive it came from (the `source` record) and the reader has to check the
+# tree some other way -- it counts the cases it reads. Saying that here keeps a directory
+# from looking pinned by a hash that does not exist.
+pin_record() {
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@"
+}
+
+print_pins_and_exit() {
+  for b in "${benchmarks[@]}"; do
+    catalog "$b"
+    for i in "${!a_dest[@]}"; do
+      pin_record source "$b" "$revision" "${a_dest[$i]}" "${a_sha[$i]}" "${a_size[$i]}" \
+        "fetched from the mirror"
+    done
+    for i in "${!d_dest[@]}"; do
+      pin_record read-file "$b" "$revision" "${d_dest[$i]}" "${d_sha[$i]}" "${d_size[$i]}" \
+        "derived by --convert"
+    done
+    if [ -n "$extract_dir" ]; then
+      # The path is the archive's own layout (the top-level directory is stripped on
+      # extraction); no hash names a directory, so the archive's record above is the pin.
+      pin_record read-dir "$b" "$revision" "${extract_dir}/tasks/finalpool" - - \
+        "unpacked from the source archive; a directory has no hash"
+    fi
+  done
+  exit 0
+}
+
+if [ -n "$print_pins" ]; then
+  print_pins_and_exit
 fi
 
 command -v curl >/dev/null || die "missing dependency: curl"
