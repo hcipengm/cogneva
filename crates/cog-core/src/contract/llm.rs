@@ -345,7 +345,13 @@ pub struct ChatResponse {
     pub timestamp: DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+/// Token/cost accounting for one LLM response.
+///
+/// `Deserialize` is here for the callers that carry a measured usage back across a
+/// process boundary — an evaluation rig collecting a scaffold's output compares
+/// cells by what was actually spent, and a re-hydrated [`crate::Usage`] must mean
+/// the same thing as the one the provider produced.
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
 pub struct Usage {
     pub input: u32,
     pub output: u32,
