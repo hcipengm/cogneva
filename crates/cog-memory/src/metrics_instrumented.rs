@@ -16,6 +16,7 @@ use cog_core::{MetricsBackend, SFResult};
 /// - Counter `memory_operations_total`  (label `operation`)
 /// - Histogram `memory_operation_latency_ms` (label `operation`)
 /// - Counter `memory_operation_errors_total` (label `operation`)
+/// - Counter `cogneva_memory_dropped_entries_total` (label `namespace`)
 ///
 /// Example Prometheus output after some activity:
 /// ```text
