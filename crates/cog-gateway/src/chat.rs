@@ -139,6 +139,31 @@ async fn emit_message_end(out: &mpsc::Sender<String>, session_id: &str, message_
     .await;
 }
 
+/// 聊天对一次目标提交的回报：只报承载这道目标的那一**行**的实况。
+///
+/// 不按 `submit_goal_auto` 的返回值判成败：分解判退也是 `Ok`（判词落在目标行的
+/// `Failed` 上），按返回值判会把失败报成成功。目标行是读面认这一道目标的那一行，
+/// 这里报的就是它——用户在这条消息里看到的与流水线里查到的是同一份事实。
+fn goal_report(goal_id: &str, row: Option<&cog_core::Task>) -> String {
+    match row {
+        Some(row) if row.status == cog_core::TaskStatus::Failed => format!(
+            "目标 {goal_id} 分解失败：{}。可以换个更具体的描述再试一次。",
+            row.error.as_deref().unwrap_or("编排器没有记下原因")
+        ),
+        // 分解成功时这一行还没跑完（终态与答案是收口任务跑完后抄回来的），但它上面
+        // 有「答案落在哪一条」的声明——没有这条声明就说明没有任何东西会收口。
+        Some(row) if row.sink_task_id.is_none() => format!(
+            "目标 {goal_id} 已受理，但没有任何一条任务承载它的答案（这次提交没点出收口任务），\
+             它不会自己跑完；请重新提交，或检查编排器的分解器是否就绪。"
+        ),
+        Some(_) => format!(
+            "目标 {goal_id} 已受理：分解出的任务已进入执行图，进度与最终答案见右侧目标流水线\
+             （按 goal_id={goal_id} 可查）。"
+        ),
+        None => format!("目标 {goal_id} 没有被记下：这次提交没有留下可查的那一行。"),
+    }
+}
+
 /// Run one chat turn: echo the user message, stream the LLM reply delta by
 /// delta (typewriter style — the routing layer still fails over transparently
 /// if a backend errors before the first content delta), and record the turn in
@@ -183,11 +208,18 @@ pub async fn run_chat_turn(
     //    LLM planning, so it runs detached and reports back on this
     //    connection when it lands.
     if is_actionable_intent(&llm, &content).await {
+        // 这道目标的身份在受理它的这一层定：承载行的 id 就是它，分解出的子任务都挂在
+        // 这一行下面。当场定下来才报得出「是哪个目标」，用户也才有得可查——空 `tasks`
+        // 那条提交形态同样合法，但那样身份的诞生就落在了分解里面，读的人拿不到。
+        let goal_id = uuid::Uuid::new_v4().to_string();
         emit_delta(
             &out,
             &session_id,
             &assistant_mid,
-            "收到，这是可执行意图。已作为目标提交给编排器：分解为任务后由 squad 接管执行，进度会实时出现在右侧目标流水线；分解完成或失败我都会在这里回报。",
+            &format!(
+                "收到，这是可执行意图。已作为目标 {goal_id} 提交给编排器：分解为任务后由 squad 接管执行，\
+                 进度会实时出现在右侧目标流水线（按 goal_id={goal_id} 可查）；分解完成或失败我都会在这里回报。"
+            ),
         )
         .await;
         emit_message_end(&out, &session_id, &assistant_mid).await;
@@ -200,12 +232,14 @@ pub async fn run_chat_turn(
             // message.start is emitted only when there is content — the
             // decomposition takes minutes, and an empty bubble that whole
             // time reads as broken.
-            let text = match orchestrator.submit_goal_auto(&goal, Vec::new()).await {
-                Ok(ids) => format!(
-                    "目标分解完成，已注入 {} 个任务进入执行图。squad 正在执行，进度见右侧目标流水线。",
-                    ids.len()
-                ),
-                Err(e) => format!("目标分解失败：{e}。可以换个更具体的描述再试一次。"),
+            let row = cog_core::Task::goal_row(goal_id.clone(), &goal);
+            let text = match orchestrator.submit_goal_auto(&goal, vec![row]).await {
+                Ok(_) => {
+                    // 成败读目标行本身，不读返回值：判退也是 Ok。
+                    let row = orchestrator.get_task(&goal_id).await;
+                    goal_report(&goal_id, row.as_ref())
+                }
+                Err(e) => format!("目标 {goal_id} 分解失败：{e}。可以换个更具体的描述再试一次。"),
             };
             let mid = format!("assistant-{}", uuid::Uuid::new_v4());
             emit_message_start(&out2, &sid, &mid, "assistant").await;
@@ -382,6 +416,54 @@ pub async fn run_chat_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 判退落在目标行的 `Failed` 上、`submit_goal_auto` 照样返回 `Ok`——所以回报必须
+    /// 读那一行，否则失败会被报成「已受理，进度见右侧」，用户去右侧只会等一个不会来的
+    /// 结果。
+    #[test]
+    fn a_refused_decomposition_is_reported_as_the_failure_the_row_records() {
+        let mut row = cog_core::Task::goal_row("goal-1", "fix the thing");
+        row.status = cog_core::TaskStatus::Failed;
+        row.error = Some("decomposition produced no executable tasks after 3 attempt(s)".into());
+        let text = goal_report("goal-1", Some(&row));
+        assert!(text.contains("分解失败"), "{text}");
+        assert!(text.contains("no executable tasks"), "{text}");
+        assert!(!text.contains("已受理"), "{text}");
+    }
+
+    /// 分解成功：行还是 Pending（答案要等收口任务跑完才抄回来），但声明已经在了，
+    /// 回报要给出可查的 goal_id 而不是一句「已注入 N 个任务」。
+    #[test]
+    fn an_accepted_goal_is_reported_with_its_id_and_the_pipeline_it_lands_in() {
+        let mut row = cog_core::Task::goal_row("goal-2", "fix the thing");
+        row.sink_task_id = Some("child-7".into());
+        let text = goal_report("goal-2", Some(&row));
+        assert!(text.contains("goal-2"), "{text}");
+        assert!(text.contains("已受理"), "{text}");
+        assert!(!text.contains("分解失败"), "{text}");
+    }
+
+    /// 没有任何东西会收口时必须说出来：受理了却一条承载答案的任务都没有，用户等的是
+    /// 一件不会发生的事。
+    #[test]
+    fn a_goal_no_task_will_close_says_so_instead_of_pointing_at_the_pipeline() {
+        let row = cog_core::Task::goal_row("goal-3", "fix the thing");
+        assert!(row.sink_task_id.is_none());
+        let text = goal_report("goal-3", Some(&row));
+        assert!(text.contains("不会自己跑完"), "{text}");
+        assert!(
+            !text.contains("进度与最终答案"),
+            "it must not point the user at a pipeline for an answer nothing will produce: {text}"
+        );
+    }
+
+    /// 一行都没留下（没有 DagExecutor 之类）：报「没被记下」，不报「已受理」。
+    #[test]
+    fn a_submission_that_left_no_row_is_not_reported_as_accepted() {
+        let text = goal_report("goal-4", None);
+        assert!(text.contains("没有被记下"), "{text}");
+        assert!(!text.contains("已受理"), "{text}");
+    }
 
     #[test]
     fn envelope_matches_frontend_contract() {

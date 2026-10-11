@@ -150,6 +150,12 @@ fn default_true() -> bool {
     true
 }
 
+/// 承载一道目标的那一行的类型拼写。
+///
+/// 写侧按它造行、读侧按它认行（分解时它被排除在规划输入之外，读面靠它区分「目标行」
+/// 与「活」），所以这个字符串只留一处。
+const GOAL_ROW_TASK_TYPE: &str = "goal";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskType {
@@ -536,6 +542,29 @@ impl Task {
             sink_task_id: None,
             is_executable: true,
         }
+    }
+
+    /// 一次目标提交里承载这道目标的那一行：不可执行，只做层级与查询。
+    ///
+    /// 这道目标的答案落在这里。分解出的子任务从这一行取 `goal_id`，用 `parent_task_id`
+    /// 指回它；分解点出的唯一收口任务写在它的 `sink_task_id` 上；它自己不执行，终态与
+    /// 结果是收口任务跑完后抄回来的。判退也一样落在这行上（判成 Failed 并带着原因）——
+    /// 没有这一行，一次提交无论成败在读面上都不存在。
+    ///
+    /// 所以「一次提交至少要有一条这样的行」是提交侧的契约：调用方带了自己的目标行就
+    /// 用它自己的（id 就是客户端拿到的那个），一条行都不给时由分解侧补一条。形状只留
+    /// 这一处构造，两处各写一遍会各自漂——读面按 `Custom("goal")`、`{"goal": …}`、
+    /// `is_executable=false` 认这一行。
+    pub fn goal_row(id: impl Into<String>, goal: &str) -> Self {
+        let id = id.into();
+        let mut task = Task::new(
+            id.clone(),
+            TaskType::Custom(GOAL_ROW_TASK_TYPE.to_string()),
+            serde_json::json!({ "goal": goal }),
+        );
+        task.goal_id = Some(id);
+        task.is_executable = false;
+        task
     }
 
     /// 进入 Running 的唯一入口：开始时刻与租约一起落定。
@@ -961,5 +990,28 @@ mod tests {
         }
 
         assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    /// 目标行的形状由这一个构造定死：读面靠这几个字段认它，任一处漂了都会让
+    /// 「这道目标的答案在哪一行」重新变成猜。
+    #[test]
+    fn the_goal_row_carries_its_identity_and_is_not_work() {
+        let row = Task::goal_row("goal-1", "刷新接口未区分访问令牌");
+        assert_eq!(row.id, "goal-1");
+        assert_eq!(row.goal_id.as_deref(), Some("goal-1"));
+        assert_eq!(row.task_type, TaskType::Custom("goal".to_string()));
+        assert_eq!(
+            row.input["goal"],
+            serde_json::json!("刷新接口未区分访问令牌")
+        );
+        assert!(
+            !row.is_executable,
+            "the goal row is a marker for the goal, never schedulable work"
+        );
+        assert!(
+            !row.is_self_evolution(),
+            "a goal row must not be read as an evolution intent"
+        );
+        assert!(row.sink_task_id.is_none(), "the sink is declared later");
     }
 }

@@ -17,6 +17,11 @@ pub trait OrchestratorControl: Send + Sync {
     /// Submit a goal with optional tasks. If `tasks` is empty, the orchestrator
     /// will automatically decompose the goal into atomic tasks via ActionPlanner.
     ///
+    /// 空 `tasks` 是一条合法的提交形态（接口层的裸 goal、聊天入口的可执行意图都这样
+    /// 提交）：分解侧会为这道目标补出一条承载它的行（`Task::goal_row`），子任务挂在
+    /// 它下面、唯一收口任务的声明与判退都落在它身上。调用方自己带了行时用它自己的
+    /// 那一条，id 就是客户端拿到的 id。
+    ///
     /// Returns the ids this call actually added to the graph. A submission
     /// whose id the graph already holds is an idempotent no-op — the intent is
     /// in hand — so it is not among them. Callers that need to distinguish

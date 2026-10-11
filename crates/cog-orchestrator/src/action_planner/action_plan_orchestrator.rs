@@ -613,6 +613,10 @@ impl ActionPlanOrchestrator {
     /// 3. If `tasks` exist but lack the verified marker, evaluate them and either
     ///    mark+inject or re-decompose.
     ///
+    /// 无论走哪条路，被处理的那一组行里都要有一条**承载这道目标**的行（`Task::goal_row`）：
+    /// 调用方带了就用它自己的，一条都没带时在这里补一条。分解出的子任务靠它拿 `goal_id`
+    /// 与父指针，唯一收口任务的声明写在它身上，判退也落在它身上。
+    ///
     /// Returns the ids this call actually added to the DagExecutor; an id the
     /// graph already held is an idempotent no-op and is not among them.
     pub async fn process_goal_impl(
@@ -689,6 +693,19 @@ impl ActionPlanOrchestrator {
             return Ok(queued);
         }
 
+        // 一条行都不给的提交（接口层与聊天入口都能这么提交）在这里补出承载这道目标的
+        // 那一行：分解出的子任务要靠它拿 `goal_id` 与父指针，唯一收口任务的声明要写在
+        // 它身上，判退也要有行可落。少了这一行，一次提交无论成败在读面上都不存在——
+        // 成功时子任务挂在空父下、没有哪一行声明答案，失败时连判词都没有落点。
+        // 它是不可执行的标记行，组 hints 时按这个键被排除，分解身份也不受影响。
+        let mut tasks = tasks;
+        if tasks.is_empty() {
+            tasks.push(cog_core::Task::goal_row(
+                uuid::Uuid::new_v4().to_string(),
+                goal,
+            ));
+        }
+
         let all_verified = !tasks.is_empty()
             && tasks.iter().all(|t| {
                 t.action_planner_meta
@@ -733,10 +750,18 @@ impl ActionPlanOrchestrator {
         // via Squad → RalphLoop → PGE → SelfReview and returns the final task list.
         // ActionPlanner does not perform its own LLM evaluation — it only checks
         // markers and injects the result returned by Collaboration.
-        if !tasks.is_empty() {
+        //
+        // Only executable rows are hints. A non-executable row is the goal's own
+        // identity/aggregation marker, not a work item to plan around: feeding it
+        // to the planner would echo an idle goal row back into the prompt and —
+        // because the stable decompose id rides `hints.first()` — would also
+        // re-key the intent chain on a fresh per-submission id. A goal that
+        // carries no executable row must decompose exactly as "no hints".
+        let hint_tasks: Vec<Task> = tasks.iter().filter(|t| t.is_executable).cloned().collect();
+        if !hint_tasks.is_empty() {
             tracing::info!(
                 goal = %goal,
-                task_count = %tasks.len(),
+                task_count = %hint_tasks.len(),
                 "Tasks present but not verified; routing to Collaboration for evaluation / decomposition"
             );
         }
@@ -749,13 +774,6 @@ impl ActionPlanOrchestrator {
         // configured bound; hard errors still propagate immediately for
         // stream redelivery.
         let attempts = self.decomposition_max_attempts.max(1);
-        // Only executable rows are hints. A non-executable row is the goal's own
-        // identity/aggregation marker, not a work item to plan around: feeding it
-        // to the planner would echo an idle goal row back into the prompt and —
-        // because the stable decompose id rides `hints.first()` — would also
-        // re-key the intent chain on a fresh per-submission id. A goal that
-        // carries no executable row must decompose exactly as "no hints".
-        let hint_tasks: Vec<Task> = tasks.iter().filter(|t| t.is_executable).cloned().collect();
         let mut plan = None;
         let mut attempts_used = attempts;
         for attempt in 1..=attempts {
@@ -2383,6 +2401,102 @@ mod tests {
         // 声明落在子任务的回指那一行上：读面正是从这一行取答案。
         let child = dag.get_task("child-2").await.unwrap();
         assert_eq!(child.parent_task_id.as_deref(), Some("goal-row"));
+    }
+
+    /// 一条行都不带的提交（只有一句话的裸目标）也必须落下承载这道目标的那一行：
+    /// 子任务靠它拿 `goal_id` 与父指针、声明写在它身上。少了它，成功时子任务挂在
+    /// 空父下、没有任何一行声明答案，读的人找不到这道目标的终答。
+    #[tokio::test]
+    async fn a_bare_goal_gets_the_row_that_carries_its_answer() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-bare-goal".to_string()));
+        let exec = Arc::new(RecordingAtomicExecutor {
+            replies: std::sync::Mutex::new(vec![vec![atomic_task("child-1")]]),
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(exec.clone())
+            .with_dag_executor(dag.clone())
+            .with_decomposition_max_attempts(1);
+
+        let registry = SkillRegistry::new();
+        let ids = planner
+            .process_goal_impl("plan this for me", vec![], &registry)
+            .await
+            .unwrap();
+
+        // 补出来的那一行先入图，子任务挂在它下面。
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        let goal_row_id = ids[0].clone();
+        assert_ne!(
+            goal_row_id, "child-1",
+            "the goal row is minted, not the child"
+        );
+        let row = dag.get_task(&goal_row_id).await.expect("goal row stored");
+        assert!(!row.is_executable, "the goal row is a marker, not work");
+        assert_eq!(row.status, cog_core::TaskStatus::Pending);
+        assert_eq!(row.goal_id.as_deref(), Some(goal_row_id.as_str()));
+        assert_eq!(row.input["goal"], serde_json::json!("plan this for me"));
+        assert_eq!(
+            row.sink_task_id.as_deref(),
+            Some("child-1"),
+            "the answer's landing point must be declared on the row this goal carries"
+        );
+        let child = dag.get_task("child-1").await.unwrap();
+        assert_eq!(child.parent_task_id.as_deref(), Some(goal_row_id.as_str()));
+        assert_eq!(child.goal_id, row.goal_id);
+
+        // 补出来的行不能被当成规划输入：它没有活，喂进去就会让分解回显一行空转的目标行，
+        // 而且分解身份骑 `hints.first()`，会被一个每次提交都新的 id 重新定身份。
+        let seen = exec.seen.lock().unwrap();
+        let (decompose_id, input) = seen.last().expect("the planner ran");
+        assert!(input.get("hints").is_none(), "{input}");
+        assert_eq!(
+            decompose_id,
+            &ActionPlanOrchestrator::decompose_task_id("plan this for me", None),
+            "a bare goal must decompose under the same identity as 'no hints'"
+        );
+    }
+
+    /// 裸目标分解不出来时同样要留下判词：没有这一行，一次失败的提交在读面上什么都不剩，
+    /// 提交方拿到的是一串 id 也好、空表也好，都看不出「这道目标判退了」。
+    #[tokio::test]
+    async fn a_bare_goal_that_cannot_be_decomposed_still_lands_a_failed_row() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-bare-goal-fail".to_string()));
+        let sink: Arc<RecordingAlertSink> = Arc::new(RecordingAlertSink::default());
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(Arc::new(ScriptedAtomicExecutor {
+                replies: std::sync::Mutex::new(vec![vec![]]),
+            }))
+            .with_dag_executor(dag.clone())
+            .with_decomposition_max_attempts(1);
+        planner.attach_alert_sink(sink.clone()).await;
+
+        let registry = SkillRegistry::new();
+        let ids = planner
+            .process_goal_impl("do the impossible", vec![], &registry)
+            .await
+            .expect("exhausted decomposition acks with a failed goal row");
+
+        assert_eq!(ids.len(), 1, "the goal row is the row that landed: {ids:?}");
+        let row = dag.get_task(&ids[0]).await.expect("failed row stored");
+        assert_eq!(row.status, cog_core::TaskStatus::Failed);
+        assert!(!row.is_executable);
+        assert!(row
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("no executable tasks")));
+        assert_eq!(row.goal_id.as_deref(), Some(ids[0].as_str()));
+        // 告警里的目标摘录读的是这一行的 input，所以判词要能说出是哪道目标。
+        let drafts = sink.drafts.lock().unwrap();
+        let labels = &drafts.first().expect("the refusal must alert").labels;
+        assert!(
+            labels["task_goal"]
+                .as_str()
+                .is_some_and(|s| s.contains("do the impossible")),
+            "{labels}"
+        );
     }
 
     /// 没有恰好一条收口任务 ⇒ 整份判退：零条（各片从不收口）与多条（没有哪一条承载

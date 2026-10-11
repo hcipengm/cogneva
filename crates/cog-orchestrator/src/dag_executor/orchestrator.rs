@@ -3190,12 +3190,7 @@ mod tests {
         declared_sink: &str,
         sink_id: &str,
     ) {
-        let mut goal_row = Task::new(
-            goal_id,
-            TaskType::Custom("goal".into()),
-            serde_json::json!({"goal": "a question"}),
-        );
-        goal_row.is_executable = false;
+        let mut goal_row = Task::goal_row(goal_id, "a question");
         goal_row.sink_task_id = Some(declared_sink.to_string());
         let mut sink = Task::new(sink_id, TaskType::Generator, serde_json::json!({}));
         sink.parent_task_id = Some(goal_id.to_string());

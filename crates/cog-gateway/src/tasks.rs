@@ -221,6 +221,9 @@ fn estimate_goal_tokens(req: &CreateTaskRequest) -> u64 {
 /// （分解成功）或 Failed 行（分解没产出），返回值本身因此就是可寻址的那一行。
 /// 它设 `is_executable=false`：它是这次目标的标记，不是活——不接 planner 的回退路径
 /// 也不该把它当任务调度出去（协调器组 hints 时按这个键把它排除在规划输入之外）。
+///
+/// 行本身由 [`Task::goal_row`] 一处构造：接口这条路要带客户端的 id，所以在这里合成；
+/// 一条行都不带的调用方（例如聊天入口）由分解侧补出同样的行。
 fn submitted_tasks(req: &CreateTaskRequest, goal_id: &str) -> Vec<Task> {
     let mut rows: Vec<Task> = req
         .tasks
@@ -244,14 +247,8 @@ fn submitted_tasks(req: &CreateTaskRequest, goal_id: &str) -> Vec<Task> {
         })
         .unwrap_or_default();
     if rows.is_empty() {
-        let mut goal_row = Task::new(
-            goal_id.to_string(),
-            TaskType::Custom("goal".into()),
-            serde_json::json!({ "goal": req.goal }),
-        );
+        let mut goal_row = Task::goal_row(goal_id, &req.goal);
         goal_row.workspace_id = Some(req.workspace_id.clone());
-        goal_row.goal_id = Some(goal_id.to_string());
-        goal_row.is_executable = false;
         rows.push(goal_row);
     }
     rows
