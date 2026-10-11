@@ -13,6 +13,7 @@ pub mod hle;
 pub mod humaneval_loader;
 pub mod swe_pro;
 pub mod swebench_runner;
+pub mod toolathlon;
 
 pub use agentbench_loader::AgentBenchLoader;
 pub use gaia_runner::GaiaRunner;
@@ -27,3 +28,8 @@ pub use swe_pro::{
     SWE_PRO_TOOL_FILE_EDIT,
 };
 pub use swebench_runner::SweBenchRunner;
+pub use toolathlon::{
+    toolathlon_benchmark, ToolathlonBackend, ToolathlonCaseSource, ToolathlonCheck,
+    ToolathlonEnvProvider, ToolathlonJudge, ToolathlonReport, ToolathlonToolkit,
+    TOOLATHLON_TASKS_DIR,
+};

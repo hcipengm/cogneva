@@ -64,7 +64,10 @@ bytes). Every file is hashed before it is installed, never after, and a file alr
 re-hashed rather than re-downloaded. A file whose bytes do not match is refused, not overwritten —
 the name came from the hash, so mismatched bytes mean the mirror is not serving what it claims,
 and that is an operator decision. `--verify` is the reader of those hashes: it re-checks the
-installed set with no network and exits non-zero on any mismatch.
+installed set with no network and exits non-zero on any mismatch. A bare `--verify` covers the
+downloaded artifacts only; the derived text form the rig actually reads is checked only when
+`--convert` is passed too (`--verify --convert`), because building and checking it are one opt-in
+step — so `--verify` alone is not a full check of what the rig reads.
 
 The three benchmarks and their pins:
 
@@ -127,19 +130,22 @@ at all errors out rather than scoring low: a missing platform has to look like a
 
 ### A dead upstream yields data and interfaces, not numbers
 
-This is the honest boundary of the crate today. Three things are **not** landed; the rig and the
-four rows are.
+This is the honest boundary of the crate today. The rig, the four rows, and all three benchmarks'
+adapter sets are landed; a driver and the platform bridge are not.
 
-1. **The per-benchmark adapter sets** — `CaseSource` / `EnvProvider` / `Toolkit` / `CaseJudge` for
-   SWE-bench Pro, Toolathlon and HLE. HLE's four are landed (`src/adapters/hle.rs`,
-   `hle_benchmark(...)`) and SWE-bench Pro's four are landed (`src/adapters/swe_pro.rs`,
-   `swe_pro_benchmark(...)`); Toolathlon is data on disk with no adapter yet. Each `Toolkit` pins
-   the protocol (HLE: exactly `web_search` + `python`; SWE-bench Pro: exactly `bash` + `file_edit`)
-   with the implementations **injected**, not written here — a missing implementation refuses to
-   run rather than handing back an empty toolset that scores low for the wrong reason. SWE-bench
-   Pro's environment is a per-instance container, which is a port (`SweProBackend`) the crate
-   declares and does not implement: with no backend wired, both env acquisition and judging
-   **error** rather than reading as a model that failed the task.
+1. **The external dependencies each adapter needs are ports** — the crate declares them and does
+   not implement them, because they are where the platform (a container runtime, a Compose project,
+   a search API, a judge model) becomes visible, and that is the composition root. All three
+   benchmarks' `CaseSource` / `EnvProvider` / `Toolkit` / `CaseJudge` sets are landed: HLE
+   (`src/adapters/hle.rs`, `hle_benchmark(...)`), SWE-bench Pro (`src/adapters/swe_pro.rs`,
+   `swe_pro_benchmark(...)`) and Toolathlon (`src/adapters/toolathlon.rs`,
+   `toolathlon_benchmark(...)`). Each `Toolkit` pins the protocol with the implementations
+   **injected** — HLE: exactly `web_search` + `python`; SWE-bench Pro: exactly `bash` +
+   `file_edit`; Toolathlon: exactly the MCP servers the task's own `task_config.json` declares —
+   and refuses to run with one missing rather than handing back a smaller toolset that scores the
+   task for the wrong reason. SWE-bench Pro's per-instance container is `SweProBackend` and
+   Toolathlon's Compose project is `ToolathlonBackend`: with no backend wired, both env acquisition
+   and judging **error** rather than reading as a model that failed the task.
 2. **A driver** — no binary runs the table. The entry point is the library API above.
 3. **The platform bridge** — the `nql` row reaches the real platform through `PlatformRunner`
    (`src/scaffolds/nql.rs`), and **nothing implements it**. Turning one case into a platform task,
@@ -158,7 +164,8 @@ rubric). SWE-bench Pro and Toolathlon are graded by deterministic scripts (their
 dead backbone still leaves them empty. Each adapter's external dependency is a parameter, and a
 missing one **errors** rather than scoring zero: HLE's judge takes its upstream as a parameter
 (with no judge model wired, a case that needs it errors, because "never judged" and "judged wrong"
-are the same 0 and different facts), and SWE-bench Pro takes its container backend the same way.
+are the same 0 and different facts), and SWE-bench Pro its container backend, Toolathlon its
+Compose backend, the same way.
 Second, HLE is multimodal; a text-only harness
 has to say whether it skips image rows. Pin the backbone and judge model + version + rubric
 provenance in the experiment metadata: a cell that ran on a substituted model is not a cell in this
