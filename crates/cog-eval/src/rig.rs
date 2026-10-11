@@ -335,11 +335,24 @@ impl Rig {
                         return CaseOutcome::errored(&case, format!("cannot acquire env: {e}"));
                     }
                 };
-                let tools = match toolkit.toolset(&case, &env) {
+                let base = match toolkit.toolset(&case, &env) {
                     Ok(tools) => tools,
                     Err(e) => {
                         env.teardown().await;
                         return CaseOutcome::errored(&case, format!("cannot build toolset: {e}"));
+                    }
+                };
+                // 有效工具面 = (基准工具面 ∩ 臂) ∪ 外壳动作空间。臂由 toolkit 定（无工具臂
+                // 交回空面）；动作空间那半在这里并进来——它不参与消融，两臂都拿得到，所以
+                // 外壳拿到的这个面里读不出自己在哪一臂。
+                let tools = match toolkit.action_tools(&case, &env, scaffold.action_space()) {
+                    Ok(action) => base.union(action),
+                    Err(e) => {
+                        env.teardown().await;
+                        return CaseOutcome::errored(
+                            &case,
+                            format!("cannot build action tools: {e}"),
+                        );
                     }
                 };
                 let ctx = SolveContext {
@@ -695,5 +708,81 @@ mod tests {
         assert_eq!(stat.cell_text(3), "50.0±0.0 (n=1)");
         assert_eq!(CellStat::of(&[0.5, 0.6, 0.7]).cell_text(3), "60.0±10.0");
         assert_eq!(CellStat::of(&[]).cell_text(3), "—");
+    }
+
+    fn python_tool() -> cog_core::Tool {
+        cog_core::Tool {
+            name: "python".into(),
+            description: "an interpreter".into(),
+            parameters: serde_json::json!({"type": "object"}),
+            implementation: cog_core::ToolImplementation::Native(Arc::new(|args| {
+                Box::pin(async move { Ok(args) })
+            })),
+        }
+    }
+
+    /// 工具面为空（无工具臂）但仍供得出外壳的动作空间：记下它被问到要哪几件。
+    struct ActionToolkit(std::sync::Mutex<Vec<String>>);
+    impl Toolkit for ActionToolkit {
+        fn toolset(&self, _c: &EvalCase, _e: &Arc<dyn CaseEnv>) -> anyhow::Result<ToolSet> {
+            // 无工具臂：基准外部工具面是空的。
+            Ok(ToolSet::empty())
+        }
+        fn action_tools(
+            &self,
+            _c: &EvalCase,
+            _e: &Arc<dyn CaseEnv>,
+            wanted: &[&str],
+        ) -> anyhow::Result<ToolSet> {
+            *self.0.lock().unwrap() = wanted.iter().map(|s| (*s).to_string()).collect();
+            ToolSet::new(vec![python_tool()])
+        }
+    }
+
+    /// 记下它这一步看到的工具名，并声明一个动作空间。
+    struct SeesTools(std::sync::Mutex<Vec<String>>);
+    #[async_trait]
+    impl AgentScaffold for SeesTools {
+        fn name(&self) -> &str {
+            "sees-tools"
+        }
+        fn action_space(&self) -> &'static [&'static str] {
+            &["python", "bash"]
+        }
+        async fn solve(&self, _c: &EvalCase, ctx: &SolveContext) -> anyhow::Result<AgentOutput> {
+            *self.0.lock().unwrap() = ctx
+                .tools
+                .definitions()
+                .iter()
+                .map(|d| d.name.clone())
+                .collect();
+            Ok(AgentOutput {
+                final_answer: "ok".into(),
+                trace: vec![],
+                tokens: Default::default(),
+                finish: FinishReason::Answered,
+            })
+        }
+    }
+
+    /// 动作空间由外壳声明、按名向 toolkit 要，且**不随工具面被消融**：基准工具面为空
+    /// （无工具臂）时，外壳仍拿得到自己的动作空间。
+    #[tokio::test]
+    async fn the_action_space_is_unioned_in_and_survives_an_empty_tool_face() {
+        let toolkit = Arc::new(ActionToolkit(std::sync::Mutex::new(Vec::new())));
+        let seen = Arc::new(SeesTools(std::sync::Mutex::new(Vec::new())));
+        let mut b = bench("hle", Arc::new(OkEnv));
+        b.tools = toolkit.clone();
+
+        let table = rig().with_scaffold(seen.clone()).run(&[b]).await;
+
+        // 面空了也要并进动作空间：外壳这一步看得到它的解释器。
+        assert_eq!(*seen.0.lock().unwrap(), vec!["python".to_string()]);
+        // 问的是**外壳声明的名字**，不是判分器或工具自己猜的。
+        assert_eq!(
+            *toolkit.0.lock().unwrap(),
+            vec!["python".to_string(), "bash".to_string()]
+        );
+        assert_eq!(table.cell("sees-tools", "hle").unwrap().stat().mean, 1.0);
     }
 }

@@ -37,16 +37,16 @@ impl Default for CodeAct {
 
 /// 从基准给的这束工具里挑出跑代码的那个。
 ///
+/// CodeAct 的动作空间：一个代码解释器。声明只此一处——`action_space` 与 `code_tool`
+/// 都读它，免得「哪几件算解释器」有两份会互相不一致的说法。
+const ACTION_SPACE: &[&str] = &["python", "bash"];
+
 /// 没有代码工具就没有 CodeAct 的动作空间——这要**报错**，不能降级成「不带工具直接
 /// 问模型」：那样跑出来的是一行别的行，却挂在 CodeAct 名下。
-fn code_tool(tools: &ToolSet) -> Option<&str> {
-    for candidate in ["python", "bash"] {
-        if tools.definitions().iter().any(|d| d.name == candidate) {
-            return tools
-                .definitions()
-                .iter()
-                .find(|d| d.name == candidate)
-                .map(|d| d.name.as_str());
+fn code_tool<'a>(tools: &ToolSet, space: &'a [&'static str]) -> Option<&'a str> {
+    for candidate in space {
+        if tools.definitions().iter().any(|d| d.name == *candidate) {
+            return Some(*candidate);
         }
     }
     None
@@ -58,8 +58,12 @@ impl AgentScaffold for CodeAct {
         "codeact"
     }
 
+    fn action_space(&self) -> &'static [&'static str] {
+        ACTION_SPACE
+    }
+
     async fn solve(&self, case: &EvalCase, ctx: &SolveContext) -> anyhow::Result<AgentOutput> {
-        let tool = code_tool(&ctx.tools).ok_or_else(|| {
+        let tool = code_tool(&ctx.tools, ACTION_SPACE).ok_or_else(|| {
             anyhow::anyhow!(
                 "this benchmark offers no code tool (`python` or `bash`): the action space of this \
                  scaffold is code, and answering without one would be a different row"
@@ -254,6 +258,12 @@ mod tests {
         let ctx = ctx_of(llm, recorder.toolset(&["search"]));
         let err = CodeAct::new().solve(&case(), &ctx).await.unwrap_err();
         assert!(err.to_string().contains("no code tool"), "{err}");
+    }
+
+    #[test]
+    fn the_action_space_is_the_interpreter_not_the_search_tool() {
+        // 消融按角色切：CodeAct 的动作空间是代码解释器，不是别的方法也能用的搜索工具。
+        assert_eq!(CodeAct::new().action_space(), &["python", "bash"][..]);
     }
 
     #[tokio::test]

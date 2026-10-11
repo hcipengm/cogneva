@@ -159,6 +159,34 @@ impl ToolSet {
         self.tools.is_empty()
     }
 
+    /// 并集：把 `other` 里 `self` 没有的工具加进来（同名以 `self` 为准）。
+    ///
+    /// 这是「动作空间并入有效工具面」那一步：基准面（已按臂切过）在外壳动作空间上做并，
+    /// 动作空间不参与消融，所以两臂做完并集都拿得到自己的动作空间。`other` 为空时原样
+    /// 返回、不动定义序列——今天没有工具实现，走的就是这条，并集是恒等的。
+    pub fn union(mut self, other: ToolSet) -> ToolSet {
+        if other.tools.is_empty() {
+            return self;
+        }
+        for (name, tool) in other.tools {
+            self.tools.entry(name).or_insert(tool);
+        }
+        // 定义按名排序重建：并集不该让同一组工具因为谁的 `HashMap` 迭代序不同而给出两份
+        // 不同的定义序列。
+        let mut definitions: Vec<ToolDefinition> = self
+            .tools
+            .values()
+            .map(|t| ToolDefinition {
+                name: t.name.clone(),
+                description: t.description.clone(),
+                parameters: t.parameters.clone(),
+            })
+            .collect();
+        definitions.sort_by(|a, b| a.name.cmp(&b.name));
+        self.definitions = definitions;
+        self
+    }
+
     /// 按名执行。未知工具名是**错误**不是空结果：外壳喊了一个不存在的工具，
     /// 这一格的低分要能归因到外壳自己，而不是被吞成一次「工具返回空」。
     pub async fn call(
@@ -198,6 +226,26 @@ pub struct SolveContext {
 pub trait AgentScaffold: Send + Sync {
     /// 这一行在表里的名字。评测台按它建行，不按 Rust 类型名——换实现类型不该改表。
     fn name(&self) -> &str;
+
+    /// 这个方法赖以行动、缺了它就不再是这个方法的东西（**动作空间**），按名声明。
+    ///
+    /// 消融（无工具臂）切的是**基准外部工具面**，不是这个：一个以代码解释器为动作空间
+    /// 的方法，把解释器关掉就不再看是它自己，那一列量到的是另一个方法，不是「没有工具的
+    /// 它」。所以动作空间**两臂都在**——评测台把 `(基准工具面 ∩ 臂) ∪ 动作空间` 作为这一
+    /// 格的有效工具面交给外壳。切分按**角色**不按工具名：同一个名字在一个方法里是动作
+    /// 空间本身、在另一个方法里只是外部工具，按名字一刀切会误伤。
+    ///
+    /// **声明权在外壳**，且只声明**名字**：谁提供这些工具（哪个沙盒、哪条搜索 API）由
+    /// 组合根定，本 crate 不造实现。没有外部动作空间的方法返回空。
+    ///
+    /// **今天惰性**：组合根还没有任何工具实现，并集加不进东西——加了不改变任何一格的
+    /// 输出。等工具实现到了，行为自动对。
+    ///
+    /// 外壳**拿不到**自己在哪一臂：[`SolveContext`] 上没有、也不许有「这是无工具臂」的
+    /// 旗标——外壳一旦能分辨臂就能特判，中立性就死了。
+    fn action_space(&self) -> &'static [&'static str] {
+        &[]
+    }
 
     async fn solve(&self, case: &EvalCase, ctx: &SolveContext) -> anyhow::Result<AgentOutput>;
 }

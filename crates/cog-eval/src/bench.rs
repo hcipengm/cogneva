@@ -82,6 +82,22 @@ impl EnvProvider for NoEnvProvider {
 pub trait Toolkit: Send + Sync {
     /// 工具是绑在 `env` 上的闭包：命令要落在**这道题的**环境里，不是平台沙盒里。
     fn toolset(&self, case: &EvalCase, env: &Arc<dyn CaseEnv>) -> anyhow::Result<ToolSet>;
+
+    /// 外壳动作空间指名的那几件工具（`wanted` ＝ 外壳声明的名字），由**这道题的环境**供。
+    ///
+    /// 与 [`Self::toolset`] 分开，是因为两者消融不同：`toolset` 是基准外部工具面，无工具臂
+    /// 关掉它；动作空间不参与消融，两臂都拿得到。评测台把两者并起来交给外壳。
+    ///
+    /// 默认交回空集＝这个基准的这道题供不出任何动作空间工具。今天组合根还没接工具实现，
+    /// 所以每个基准都走默认，并集因此是恒等的——不改变任何一格的输出。
+    fn action_tools(
+        &self,
+        _case: &EvalCase,
+        _env: &Arc<dyn CaseEnv>,
+        _wanted: &[&str],
+    ) -> anyhow::Result<ToolSet> {
+        Ok(ToolSet::empty())
+    }
 }
 
 /// 判分适配器：读外壳交回的答案与环境，给一个 0/1。一个基准一个，**方法无关**。
