@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
@@ -127,6 +127,17 @@ pub struct TaskView {
     pub agent_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// 所属 goal。提交时网关生成（未带则用 UUID），响应里以 `message_id` 交回；同一 goal
+    /// 下分解出的子任务带同一个值。以前这个字段只在写侧存在，读侧看不到，于是「按下发的
+    /// goal 找回它派生的那批任务」这条路尽管设计过也从没接通。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal_id: Option<String>,
+    /// 父任务 ID。分解出的原子任务指向被它替代的那条原始任务。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
+    /// 能否被 DagExecutor 调度。原始任务被重新注入成占位时是 false——它只做层级与查询，
+    /// 不能被当成「还没跑的活」。
+    pub is_executable: bool,
 }
 
 impl From<Task> for TaskView {
@@ -145,7 +156,26 @@ impl From<Task> for TaskView {
             agent_id: t.agent_id,
             created_at: t.created_at.to_rfc3339(),
             updated_at: t.updated_at.to_rfc3339(),
+            goal_id: t.goal_id,
+            parent_task_id: t.parent_task_id,
+            is_executable: t.is_executable,
         }
+    }
+}
+
+/// `/api/v1/tasks/list` 与 `/api/v1/tasks/graph` 的过滤参数。不带 query 时与从前逐字相同。
+#[derive(Debug, Deserialize)]
+pub struct TaskQuery {
+    /// 只看这一个 goal 下的任务。值就是提交响应里的 `message_id`；占位任务与它分解出的
+    /// 子任务带同一个值，所以按它过滤能拿到一次提交的全貌。
+    pub goal_id: Option<String>,
+}
+
+/// 一条任务是否属于被查询的 goal。没有 goal 条件时一律留下（既有行为不变）。
+fn in_goal(query: &TaskQuery, task: &Task) -> bool {
+    match &query.goal_id {
+        Some(want) => task.goal_id.as_deref() == Some(want.as_str()),
+        None => true,
     }
 }
 
@@ -311,9 +341,14 @@ pub async fn get_task_handler(
 
 pub async fn list_tasks_handler(
     State(state): State<Arc<GatewayState>>,
+    Query(query): Query<TaskQuery>,
 ) -> Result<Json<Vec<TaskView>>, ApiError> {
     let tasks = state.orchestrator.get_all_tasks().await;
-    let views: Vec<TaskView> = tasks.into_iter().map(|t| t.into()).collect();
+    let views: Vec<TaskView> = tasks
+        .into_iter()
+        .filter(|t| in_goal(&query, t))
+        .map(|t| t.into())
+        .collect();
     Ok(Json(views))
 }
 
@@ -582,9 +617,22 @@ pub async fn get_task_dependencies_handler(
 
 pub async fn get_task_graph_handler(
     State(state): State<Arc<GatewayState>>,
+    Query(query): Query<TaskQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (tasks, edges) = state.orchestrator.get_graph().await;
-    let nodes: Vec<TaskView> = tasks.into_iter().map(|t| t.into()).collect();
+    let kept: Vec<Task> = tasks.into_iter().filter(|t| in_goal(&query, t)).collect();
+    // 过滤时边跟着节点收口：只留两端都还在的边，否则图里会出现指向已被滤掉节点的悬边，
+    // 读的人会以为那条边通向一张没被过滤掉的任务。
+    let edges: Vec<(String, String)> = if query.goal_id.is_some() {
+        let ids: std::collections::HashSet<&str> = kept.iter().map(|t| t.id.as_str()).collect();
+        edges
+            .into_iter()
+            .filter(|(from, to)| ids.contains(from.as_str()) && ids.contains(to.as_str()))
+            .collect()
+    } else {
+        edges
+    };
+    let nodes: Vec<TaskView> = kept.into_iter().map(|t| t.into()).collect();
     Ok(Json(serde_json::json!({
         "nodes": nodes,
         "edges": edges,
@@ -745,5 +793,50 @@ mod tests {
         for s in ["completed", "failed", "cancelled"] {
             assert!(parse_task_status(s).is_err(), "{s} must be rejected");
         }
+    }
+
+    /// 写侧一直在记的 goal 链接，读侧必须看得见——否则「按下发的 goal 找回它派生的那批
+    /// 任务」这条路就还是断的。
+    #[test]
+    fn the_task_view_carries_the_goal_link_the_write_side_records() {
+        let mut t = task("child", cog_core::TaskStatus::Completed, "custom_thing", 0);
+        t.goal_id = Some("goal-1".into());
+        t.parent_task_id = Some("orig".into());
+        t.is_executable = false;
+
+        let view: TaskView = t.into();
+        assert_eq!(view.goal_id.as_deref(), Some("goal-1"));
+        assert_eq!(view.parent_task_id.as_deref(), Some("orig"));
+        assert!(
+            !view.is_executable,
+            "a re-injected placeholder is not schedulable work"
+        );
+    }
+
+    #[test]
+    fn a_goal_filter_keeps_only_that_goals_tasks() {
+        let mut in_g1 = task("a", cog_core::TaskStatus::Pending, "t", 0);
+        in_g1.goal_id = Some("g1".into());
+        let mut in_g2 = task("b", cog_core::TaskStatus::Pending, "t", 0);
+        in_g2.goal_id = Some("g2".into());
+        let goal_less = task("c", cog_core::TaskStatus::Pending, "t", 0);
+
+        let unfiltered = TaskQuery { goal_id: None };
+        assert!(
+            in_goal(&unfiltered, &in_g1)
+                && in_goal(&unfiltered, &in_g2)
+                && in_goal(&unfiltered, &goal_less),
+            "no goal filter keeps every task, exactly as before"
+        );
+
+        let only_g1 = TaskQuery {
+            goal_id: Some("g1".into()),
+        };
+        assert!(in_goal(&only_g1, &in_g1));
+        assert!(!in_goal(&only_g1, &in_g2));
+        assert!(
+            !in_goal(&only_g1, &goal_less),
+            "a task with no goal belongs to no goal"
+        );
     }
 }
