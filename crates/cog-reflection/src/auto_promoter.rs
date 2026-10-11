@@ -1169,6 +1169,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn eval_inconclusive_change_never_promotes() {
+        // `Inconclusive` blocks exactly like `Reject`: a gate that cannot tell
+        // "it got worse" from "it did not get better" must not let the change
+        // through on the strength of the doubt.
+        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let channel = Arc::new(FakeChannel {
+            published: Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let policy = crate::PromotionGateConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let p = promoter(policy, ledger.clone(), Some(channel.clone()));
+        let mut pt = change("p10", "crates/cog-agent/src/tools.rs");
+        pt.eval_summary = Some(cog_core::EvalReport {
+            verdict: cog_core::EvalVerdict::Inconclusive,
+            summary: "Inconclusive z=1.1 uplift +3%".into(),
+        });
+        p.decide_and_promote(&pt).await.unwrap();
+        let records = ledger.recent(10).await.unwrap();
+        assert_eq!(records[0].status, PromotionStatus::Failed);
+        assert!(channel.published.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn eval_adopted_change_promotes() {
+        // The other direction: an `Adopt` verdict is not a refusal, so the
+        // change reaches the channel. This is the half that proves the gate
+        // reads the verdict rather than refusing anything that carries one.
+        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let channel = Arc::new(FakeChannel {
+            published: Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let policy = crate::PromotionGateConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let p = promoter(policy, ledger.clone(), Some(channel.clone()));
+        let mut pt = change("p11", "crates/cog-agent/src/tools.rs");
+        pt.eval_summary = Some(cog_core::EvalReport {
+            verdict: cog_core::EvalVerdict::Adopt,
+            summary: "Adopt z=2.31 uplift +18%".into(),
+        });
+        p.decide_and_promote(&pt).await.unwrap();
+        let records = ledger.recent(10).await.unwrap();
+        assert_eq!(records[0].status, PromotionStatus::Promoted);
+        assert_eq!(channel.published.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_change_with_no_eval_verdict_is_not_gated_on_eval() {
+        // Today no independent producer is wired, so every change arrives with
+        // no verdict and the eval gate does not fire. Pinned so that a later
+        // edit which starts refusing changes merely for lacking a verdict has
+        // to change this test rather than silently halt all promotions.
+        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let channel = Arc::new(FakeChannel {
+            published: Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let policy = crate::PromotionGateConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let p = promoter(policy, ledger.clone(), Some(channel.clone()));
+        p.decide_and_promote(&change("p12", "crates/cog-agent/src/tools.rs"))
+            .await
+            .unwrap();
+        let records = ledger.recent(10).await.unwrap();
+        assert_eq!(records[0].status, PromotionStatus::Promoted);
+        assert_eq!(channel.published.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn duplicate_change_not_promoted_twice() {
         let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
         let channel = Arc::new(FakeChannel {
