@@ -166,6 +166,15 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["dir", "role"],
         "crates/cog-core/src/build_gate.rs",
     ),
+    // What the machine could take, against what is being admitted. Its own row
+    // because the difference between the two is the whole reading: the ceiling
+    // carries the dimension that is setting it, so a bound held below a busy
+    // disk and a bound that is simply the size of the machine do not look alike.
+    (
+        "cogneva_build_gate_ceiling",
+        &["dir", "role", "dimension"],
+        "crates/cog-core/src/build_gate.rs",
+    ),
     (
         "cogneva_build_gate_in_flight",
         &["dir", "role"],

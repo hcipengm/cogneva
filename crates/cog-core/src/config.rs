@@ -1159,15 +1159,26 @@ impl Default for SelfEvolutionWorkspaceConfig {
 /// 宿主的属性不是进程的属性——部署器、变更验证、基线搬运、镜像构建跑在不同
 /// 进程里，各自"有活就起一个"正是和数涨上去的方式。
 ///
-/// `enabled=false` 或 `max_concurrent=0` 时不设界；`lock_dir` 必须**是所有
-/// 构建方看到的同一个目录**，否则每个进程各卡各的，读数里那个
-/// `dev:ino` 就是用来分辨这件事的。
+/// 条数**默认由实测导出**（宿主自己的 cpu / 内存 / 磁盘，加上构建所在容器
+/// 自身的内存上限，取最紧的一项说几就几），随宿主状态在运行期移动，见
+/// `build_gate` 模块。导出要读宿主的这些状态，所以 `lock_dir` 必须**是所有
+/// 构建方看到的同一个目录**，否则每个进程各卡各的，读数里那个 `dev:ino`
+/// 就是用来分辨这件事的。容器那一项不是重复：宿主的余量再大，构建所在容器
+/// 的上限也是硬墙，撞上去的后果是构建被杀。
+///
+/// `enabled=false` 时不设界。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BuildGateConfig {
     pub enabled: bool,
-    /// 同时允许的构建条数。默认 1：构建是宿主的负载尖峰，串行是唯一不靠
-    /// 调参也不会打满的取值。
+    /// 同时允许的构建条数**上限**的覆盖位：**0 表示不要覆盖**（默认），
+    /// 由宿主实测导出；设成正数则钉死这个数，不再看宿主。
+    ///
+    /// 覆盖位是给人用的，不是出厂值：它表示"这台机器我知道得比导出更清楚"
+    /// （同一台宿主机上还跑着别的吃盘的东西、或者这台机器的盘比一般的好），
+    /// 而导出的那几个维度都只看得到本机自己的状态。钉死的数不会随宿主移动，
+    /// 读数里的 `dimension` 标签会写 `override`，而不是 cpu / memory / io /
+    /// cgroup_memory。
     pub max_concurrent: usize,
     /// 一次性构建（变更验证这类没有下一轮可回的）愿意排队多久，超过即拒。
     /// 取 0 表示只试一次、不排队。
@@ -1181,7 +1192,8 @@ impl Default for BuildGateConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_concurrent: 1,
+            // 不覆盖：装机时不认识这台机器，而"1"是一个跟宿主容量无关的常量。
+            max_concurrent: 0,
             wait_secs: 1800,
             lock_dir: "/opt/cogneva/sandbox/build-gate".into(),
         }

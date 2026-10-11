@@ -183,6 +183,21 @@ const BUILDAH_STEP_WALLS: &[(&str, u64)] = &[
     ("promote-push", 900),
 ];
 
+/// 推进连输几轮之后，这一方就去**认领下一个构建名额**（见
+/// `cog_core::build_gate::reserve_build_field`）。
+///
+/// 这一方每次都是"顺路看一眼"（零等待），而变更验证是"死等"：界只有 1 的时候，
+/// 死等的那方可以把槽一直握在手里，顺路看的这方每轮都被挡回去，实测连输 20 轮以上
+/// （`deferrals` 20+，每轮 600 秒）。光把界调大不解决这件事——连续敲门也能把零等待
+/// 方一直挤住——所以要有一个"等够了就插队"的判据。
+///
+/// 取 3 而不是 1：一次撞上正在构建的宿主是正常现象，撞上就插队等于把优先级翻给
+/// 先喊的人；3 轮（30 分钟）比实测的饿死量级低一个数量级，又远高于偶发碰撞。
+///
+/// 插队不是"在循环里等"：认领写进闸门的一个文件，新到的构建自己让步，这一方下一轮
+/// 照旧零等待地来取，取到就清掉认领。周期循环里不出现任何阻塞。
+const ADVANCE_CLAIM_AFTER_DEFERRALS: u32 = 3;
+
 /// 稳定叠层基底的 tag：`<registry>/cogneva:seed`。
 ///
 /// overlay 的基底不该是"上一个 rev 的镜像"。基于它时每张新镜像都**包含着
@@ -4761,6 +4776,12 @@ impl MainlineDeployer {
                 // 这一计数量的就是"连续多少轮没拿到槽"，拿到一次的下一轮就不再是连续。
                 state.advance_deferrals = state.advance_deferrals.saturating_add(1);
                 self.save_state(&state)?;
+                // 连输够多轮：认领下一个名额，让正在排队的构建方都让一步。零等待
+                // 那一半没变——这一轮照旧什么都不做地回下一轮（见
+                // `ADVANCE_CLAIM_AFTER_DEFERRALS`）。
+                if state.advance_deferrals >= ADVANCE_CLAIM_AFTER_DEFERRALS {
+                    cog_core::build_gate::reserve_build_field("mainline advance");
+                }
                 info!(
                     deferrals = state.advance_deferrals,
                     error = %e,

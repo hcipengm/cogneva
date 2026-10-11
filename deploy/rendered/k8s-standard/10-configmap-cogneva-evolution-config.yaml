@@ -45,7 +45,7 @@ data:
   # "有活就起一个"正是和数涨上去的方式。取不到槽位时一次性构建排队（waitSecs
   # 到点即拒，且被拒不算这次变更失败），轮询型步骤直接跳过等下一轮。
   COGNEVA_BUILD_GATE_ENABLED: "true"
-  COGNEVA_BUILD_GATE_MAX_CONCURRENT: "1"
+  COGNEVA_BUILD_GATE_MAX_CONCURRENT: "0"
   COGNEVA_BUILD_GATE_WAIT_SECS: "1800"
   COGNEVA_BUILD_GATE_LOCK_DIR: "/opt/cogneva/sandbox/build-gate"
   # 晋级门（推送端）：沙盒验证全过的变更（change）经分级策略判定后，L0/L1 自动晋级

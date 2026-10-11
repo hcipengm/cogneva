@@ -332,11 +332,15 @@ evolution:
     targetMaxBytes: 17179869184
   # 宿主级构建闸门：同一宿主同时进行的编译 / 打镜像条数上限。构建与集群同宿主，
   # 多路叠加足以让整机进入换页，此后连"该把这件事报出来"的事件循环也一起退化。
+  # maxConcurrent 默认不写死：0 = 按宿主实测导出（宿主的 cpu / 内存 / 磁盘，加上构建
+  # 所在容器的内存上限，取最紧那一项），正数才是钉死它的覆盖位；此时读数
+  # `cogneva_build_gate_ceiling` 的 dimension 标签会写 override，而不是
+  # cpu / memory / io / cgroup_memory。
   # lockDir 必须落在所有构建方共享的 hostPath 上，否则闸门退化成各自为政
   # （读数里 `cogneva_build_gate_slots` 的 dir 标签就是用来分辨这件事的）。
   buildGate:
     enabled: true
-    maxConcurrent: 1
+    maxConcurrent: 0
     waitSecs: 1800
     lockDir: /opt/cogneva/sandbox/build-gate
   resources:

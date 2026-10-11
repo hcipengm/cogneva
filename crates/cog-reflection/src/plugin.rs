@@ -1068,9 +1068,10 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     //
                     // Job 那条执行路径不用另外算：它的等待预算（deadline + 余量，默认
                     // 9900 秒）本来就短于这里算出来的进程内上界，盖得住。
-                    let gate_wait_secs = if self_evolution.build_gate.enabled
-                        && self_evolution.build_gate.max_concurrent > 0
-                    {
+                    // 闸门开不开只看 `enabled`：`max_concurrent=0` 不是"不设界"
+                    // 而是"按宿主实测导出"，导出出来的界一样要排队，把它读成关着
+                    // 会把这一段的等待预算算成 0。
+                    let gate_wait_secs = if self_evolution.build_gate.enabled {
                         self_evolution.build_gate.wait_secs
                     } else {
                         0

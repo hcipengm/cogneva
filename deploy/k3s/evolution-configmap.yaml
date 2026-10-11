@@ -29,8 +29,10 @@ data:
   # 工作树动态分配：部署器独占一棵稳定路径的检出，进化任务各取临时检出，
   # 互不影响；共享 CARGO_TARGET_DIR 在工作树之外，重建工作树不丢增量缓存。
   # 宿主级构建闸门：同一宿主同时进行的编译 / 打镜像条数上限。
+  # MAX_CONCURRENT 默认不写死：0 = 按宿主实测导出（宿主的 cpu / 内存 / 磁盘，
+  # 加上构建所在容器的内存上限，取最紧那一项），正数才是钉死它的覆盖位。
   COGNEVA_BUILD_GATE_ENABLED: "true"
-  COGNEVA_BUILD_GATE_MAX_CONCURRENT: "1"
+  COGNEVA_BUILD_GATE_MAX_CONCURRENT: "0"
   COGNEVA_BUILD_GATE_WAIT_SECS: "1800"
   COGNEVA_BUILD_GATE_LOCK_DIR: "/opt/cogneva/sandbox/build-gate"
   COGNEVA_SELF_EVOLUTION_WORKSPACES_ROOT: "/opt/cogneva/sandbox/workspaces"

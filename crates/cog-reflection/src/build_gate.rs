@@ -3,8 +3,8 @@
 //!
 //! The gate itself — slot files, flocks, counters — lives in
 //! `cog_core::build_gate`. What lives here is the decision about the *numbers*,
-//! because the one mis-set number that keeps hurting is the wait budget: with
-//! `max_concurrent = 1`, a queued one-shot build (a change verification has no
+//! because the one mis-set number that keeps hurting is the wait budget: with a
+//! bound of a single slot, a queued one-shot build (a change verification has no
 //! next cycle to come back to) waits behind a holder whose own work is bounded
 //! by `build_timeout_secs`. A wait budget shorter than that ceiling refuses the
 //! queued build *before the holder is even out of bounds*: the build did not

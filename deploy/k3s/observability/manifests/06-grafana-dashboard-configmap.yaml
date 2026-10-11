@@ -567,7 +567,7 @@ data:
         {
           "id": 16,
           "title": "Host Build Slots",
-          "description": "Builds running on the host against the bound, and builds queued behind them. The bound is per host, but each process publishes its own reading of it, which is why both roles are drawn: a builder line is a process that takes slots, and a control-plane line flat at zero is a process that runs no builds and deliberately bounds nothing. Two builders whose slot directories differ bound only themselves and would both look normal here, so the dir label is on the series for whoever is comparing them by hand; the rule build_gate_not_in_force is what notices.",
+          "description": "Builds running on the host against the bound, and builds queued behind them. The bound is per host, but each process publishes its own reading of it, which is why both roles are drawn: a builder line is a process that takes slots, and a control-plane line flat at zero is a process that runs no builds and deliberately bounds nothing. Two builders whose slot directories differ bound only themselves and would both look normal here, so the dir label is on the series for whoever is comparing them by hand; the rule build_gate_not_in_force is what notices. The ceiling is what the machine could take rather than what is being admitted, and it carries the dimension that is setting it: a bound sitting below its ceiling with the dimension reading io is the control law holding back on a busy disk, and one that is at its ceiling all the way up is the machine's own size - reading cgroup_memory means the container's memory limit, not the host, is what is limiting it.",
           "type": "timeseries",
           "gridPos": {
             "h": 8,
@@ -579,6 +579,14 @@ data:
             {
               "expr": "cogneva_build_gate_slots",
               "legendFormat": "{{role}} bound",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_build_gate_ceiling",
+              "legendFormat": "{{role}} ceiling ({{dimension}})",
               "datasource": {
                 "type": "prometheus",
                 "uid": "${datasource}"

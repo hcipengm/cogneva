@@ -1763,9 +1763,9 @@ data:
         "poll_interval_secs": 60,
         "schema_repair_interval_secs": 600,
         "build_gate": {
-          "_comment": "宿主级构建闸门：同一宿主同时进行的编译/打镜像条数上限。构建与集群同宿主，多路叠加足以把整机拖进换页，此后连应该把这件事报出来的事件循环也一起退化。闸门只装在跑构建的进程里，锁定的是 lock_dir 这一个目录：两个进程指向同一个目录（同一 dev:ino）才互相设界，指向不同目录则各自设界——读数 cogneva_build_gate_slots 的 dir 标签就是用来分辨这件事的，role 标签分辨「跑构建的进程（builder）」与「不跑构建的进程（control-plane，只发零值）」。",
+          "_comment": "宿主级构建闸门：同一宿主同时进行的编译/打镜像条数上限；这个上限默认不是写死的数：0 表示按宿主实测导出（宿主的 cpu / 内存 / 磁盘三项，加上构建所在容器的内存上限，取最紧的一项说几就几），正数才是钉死它的覆盖位，此时读数 cogneva_build_gate_ceiling 的 dimension 标签写 override 而不是 cpu / memory / io / cgroup_memory。构建与集群同宿主，多路叠加足以把整机拖进换页，此后连应该把这件事报出来的事件循环也一起退化。闸门只装在跑构建的进程里，锁定的是 lock_dir 这一个目录：两个进程指向同一个目录（同一 dev:ino）才互相设界，指向不同目录则各自设界——读数 cogneva_build_gate_slots 的 dir 标签就是用来分辨这件事的，role 标签分辨「跑构建的进程（builder）」与「不跑构建的进程（control-plane，只发零值）」。",
           "enabled": true,
-          "max_concurrent": 1,
+          "max_concurrent": 0,
           "wait_secs": 1800,
           "lock_dir": "/opt/cogneva/sandbox/build-gate"
         },
