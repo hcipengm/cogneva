@@ -108,13 +108,16 @@ impl PlatformRunner for NoPlatform {
 //
 // 三处对应关系都写在这个文件里，别处不再有一份。
 //
-// 还有一条前提，它不在这个文件里、也不由这个文件决定：**平台必须把投进去的那道题
-// 当一道题跑**。平台受理的是「意图」，默认会让规划器把意图拆成一堆子任务，投进去的
-// 那个 id 会变成一个不可执行的父占位符，永远停在 Pending——那时答案在子任务上，而
-// 平台没有任何一条路由能把「我投的那个 id」与「它派生的那些 id」连起来。所以这条链
-// 路要求投进去的任务按原样被执行（平台侧已有「已规划、不再拆」的判据，只是还没有从
-// 任务路由上收得到）。对上一个会拆解投递的平台，这里不会猜：轮询到时限，报出平台自己
-// 的状态，而不是把别人的答案算到这一格上。
+// 还有一条前提，它不在这个文件里、也不由这个文件决定：**平台必须把投进去的那道题当一道
+// 题跑，并且说清楚答案落在哪一行上**。平台受理的是「意图」，默认会让规划器把意图拆成一堆
+// 子任务，投进去的那个 id 变成一个不可执行的父占位符。所以平台侧有两条约定，缺一不可：
+//
+//   1. 占位行上带一条声明（`sink_task_id`），指出这道目标的答案落在分解出的哪一条上；
+//   2. 那条走到终态时，占位行的终态跟着它走——否则这里轮询的那一行永远停在 Pending。
+//
+// 分解若没有给出恰好一条收口任务，平台整份判退（占位行落 Failed 并带上原因），这里就把
+// 平台的失败原因报出去：不挑一条顶上，也不把某一片的中间产物算成这一格的答案。对上一个
+// 既不声明也不推导的平台，这里同样不猜——轮询到时限，报出平台自己的状态。
 
 /// 投给平台的一题在平台侧叫什么种类。
 ///
@@ -185,6 +188,10 @@ struct TaskFacts {
     result: Option<serde_json::Value>,
     #[serde(default)]
     error: Option<String>,
+    /// 平台在占位行上写的声明：这道目标的答案落在哪一条上。平台没拆解投递时缺席，
+    /// 那时自报的那一行就是干活的那一行。
+    #[serde(default)]
+    sink_task_id: Option<String>,
 }
 
 /// 平台侧跑完一题之后留下的东西，投影成评测台的 [`AgentOutput`]。
@@ -433,16 +440,25 @@ impl PlatformApiRunner {
         Ok(())
     }
 
+    /// 取一条任务的视图。
+    async fn fetch_facts(&self, task_id: &str) -> anyhow::Result<TaskFacts> {
+        let raw = self
+            .call("GET", &format!("/api/v1/tasks/{task_id}"), None)
+            .await?;
+        serde_json::from_value(raw)
+            .map_err(|e| anyhow::anyhow!("the platform's task view changed shape: {e}"))
+    }
+
     /// 轮询到自己投的那道题走到终态。平台上别的题走得快走得慢都不影响这里。
+    ///
+    /// 轮询的是**投进去的那一行**：平台把这道题拆了的话，它会是一条不可执行的占位行，
+    /// 终态由它点出的那条任务带过来（见本段开头的两条约定）。返回时占位行上带着那条
+    /// 声明，调用方据此去读真正干活的那一行。
     async fn await_terminal(&self, case_id: &str) -> anyhow::Result<TaskFacts> {
         let deadline = Duration::from_secs(self.settings.deadline_secs);
         let started = std::time::Instant::now();
         loop {
-            let raw = self
-                .call("GET", &format!("/api/v1/tasks/{case_id}"), None)
-                .await?;
-            let facts: TaskFacts = serde_json::from_value(raw)
-                .map_err(|e| anyhow::anyhow!("the platform's task view changed shape: {e}"))?;
+            let facts = self.fetch_facts(case_id).await?;
             match facts.status.as_str() {
                 "Completed" | "Failed" | "Cancelled" => return Ok(facts),
                 _ => {}
@@ -509,18 +525,32 @@ impl PlatformRunner for PlatformApiRunner {
         let case_id = format!("eval-{}-{}", request.seed, digest(&request.task));
         self.submit(&case_id, &request).await?;
         let facts = self.await_terminal(&case_id).await?;
-        match facts.status.as_str() {
+        // 答案行 = 那道题被拆解时占位行点出的那条；没被拆解时两者是同一个 id。判成与计
+        // 都读它**自己**那一份事实，不读占位行上抄来的那份：抄写漏掉一个字段时，读抄件
+        // 会把「没存结果」报成平台的错，而真相是那一步没做完。
+        let answer_row = facts
+            .sink_task_id
+            .clone()
+            .unwrap_or_else(|| case_id.clone());
+        let answer = if answer_row == case_id {
+            facts
+        } else {
+            self.fetch_facts(&answer_row).await?
+        };
+        match answer.status.as_str() {
             "Completed" => {}
             other => anyhow::bail!(
-                "the platform ended task {case_id} as {other}: {}",
-                facts.error.as_deref().unwrap_or("it recorded no reason")
+                "the platform ended task {answer_row} as {other}: {}",
+                answer.error.as_deref().unwrap_or("it recorded no reason")
             ),
         }
-        let trace = self.fetch_trace(&case_id).await?;
-        let metrics = self.fetch_metrics(&case_id).await?;
-        let output = project(&case_id, &facts, &trace, &metrics)?;
+        let trace = self.fetch_trace(&answer_row).await?;
+        let metrics = self.fetch_metrics(&answer_row).await?;
+        let output = project(&answer_row, &answer, &trace, &metrics)?;
+        // 报出去的 id 是干活的那一行的：表里某一行对不上时要能回去看那一次跑，而轨迹与
+        // 计数都挂在那一行上。投进去的那一个 id 是题面与种子的纯函数，随时能重算。
         Ok(PlatformReply {
-            task_id: case_id,
+            task_id: answer_row,
             output,
         })
     }
@@ -584,7 +614,13 @@ mod tests {
     #[derive(Clone)]
     struct FakePlatform {
         view: serde_json::Value,
+        /// 投进去那一行之外的那条任务的视图。平台把这道题拆了时，答案落在这一行上：
+        /// 占位行上抄来的那份可能不全（这里就故意让它不全），权威的是这一行。
+        answer_view: Option<serde_json::Value>,
         trace_ids: Vec<String>,
+        /// 轨迹列表里挂的那条 task_id。缺省是提交时的那一个；平台把题拆了时是干活
+        /// 那一行的。
+        trace_task_id: Option<String>,
         trace: cog_core::AgentTrace,
         metrics: cog_core::TaskMetrics,
         submitted: Arc<StdMutex<Vec<serde_json::Value>>>,
@@ -596,7 +632,9 @@ mod tests {
             let task_id = trace.task_id.clone();
             Self {
                 view,
+                answer_view: None,
                 trace_ids: vec![trace.trace_id.clone()],
+                trace_task_id: None,
                 trace,
                 metrics: cog_core::TaskMetrics {
                     task_id,
@@ -636,10 +674,19 @@ mod tests {
 
     async fn handle_task(
         State(f): State<FakePlatform>,
-        AxumPath(_id): AxumPath<String>,
+        AxumPath(id): AxumPath<String>,
     ) -> impl IntoResponse {
         f.tick();
-        Json(f.view.clone())
+        // 投进去的那一行与它点出的那一行各答各的：平台真把题拆了时，两条是不同的行。
+        let submitted_id = f.submitted.lock().unwrap().first().and_then(|b| {
+            b.pointer("/tasks/0/id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
+        match (&f.answer_view, submitted_id) {
+            (Some(answer), Some(submitted)) if id != submitted => Json(answer.clone()),
+            _ => Json(f.view.clone()),
+        }
     }
 
     async fn handle_metrics(
@@ -664,6 +711,7 @@ mod tests {
                     .map(str::to_string)
             })
             .unwrap_or_default();
+        let task_id = f.trace_task_id.clone().unwrap_or(task_id);
         let items: Vec<serde_json::Value> = f
             .trace_ids
             .iter()
@@ -740,21 +788,29 @@ mod tests {
         }
     }
 
+    fn task_of(id: &str, kind: &str) -> cog_core::Task {
+        cog_core::Task::new(
+            id,
+            cog_core::TaskType::Custom(kind.into()),
+            serde_json::json!({}),
+        )
+    }
+
+    fn view_of(task: cog_core::Task) -> serde_json::Value {
+        serde_json::to_value(cog_gateway::tasks::TaskView::from(task)).unwrap()
+    }
+
     fn task_view(
         id: &str,
         status: cog_core::TaskStatus,
         result: Option<serde_json::Value>,
         error: Option<String>,
     ) -> serde_json::Value {
-        let mut task = cog_core::Task::new(
-            id,
-            cog_core::TaskType::Custom(PLATFORM_TASK_KIND.into()),
-            serde_json::json!({}),
-        );
+        let mut task = task_of(id, PLATFORM_TASK_KIND);
         task.status = status;
         task.result = result;
         task.error = error;
-        serde_json::to_value(cog_gateway::tasks::TaskView::from(task)).unwrap()
+        view_of(task)
     }
 
     fn trace_for(id: &str) -> cog_core::AgentTrace {
@@ -875,6 +931,42 @@ mod tests {
         assert_eq!(sent["tasks"][0]["input"]["seed"], 3);
         assert_eq!(sent["tasks"][0]["input"]["max_steps"], 7);
         assert_eq!(sent["tasks"][0]["input"]["max_context_tokens"], 2048);
+    }
+
+    /// 平台把投进去的题拆了：自报终态的那一行是不可执行的占位，答案落在它点出的那条上。
+    /// 这道桥必须跟着那条声明走——判成、轨迹、计数都读干活的那一行。
+    ///
+    /// 占位行上抄来的那份结果在这里**故意是空的**（平台只抄了终态没抄结果），所以这条
+    /// 测试只有在桥读那条被声明出来的行时才会绿：读抄件会得到「complete 了却没存结果」。
+    #[tokio::test]
+    async fn a_decomposed_case_is_read_through_the_declaration_the_platform_wrote() {
+        let case_id = format!("eval-{}-{}", 4, digest("a question the platform splits"));
+        let answer_id = format!("{case_id}-answer");
+
+        let mut goal_row = task_of(&case_id, PLATFORM_TASK_KIND);
+        goal_row.is_executable = false;
+        goal_row.status = cog_core::TaskStatus::Completed;
+        goal_row.sink_task_id = Some(answer_id.clone());
+
+        let mut answer_row = task_of(&answer_id, PLATFORM_TASK_KIND);
+        answer_row.parent_task_id = Some(case_id.clone());
+        answer_row.status = cog_core::TaskStatus::Completed;
+        answer_row.result = Some(serde_json::json!("42"));
+
+        let mut fake = FakePlatform::new(view_of(goal_row), trace_for(&answer_id));
+        fake.answer_view = Some(view_of(answer_row));
+        fake.trace_task_id = Some(answer_id.clone());
+        let served = Served::start(fake.clone()).await;
+        let reply = served
+            .runner(60)
+            .run(request("a question the platform splits", 4))
+            .await
+            .expect("a decomposed case still answers through the row it declares");
+
+        assert_eq!(reply.task_id, answer_id);
+        assert_eq!(reply.output.final_answer, "42");
+        assert_eq!(reply.output.trace.len(), 2);
+        assert_eq!(reply.output.tokens.total_tokens, 30);
     }
 
     #[tokio::test]

@@ -1113,6 +1113,7 @@ mod consumer_ack_tests {
             action_planner_meta: None,
             goal_id: Some("goal-limit".into()),
             parent_task_id: None,
+            sink_task_id: None,
             is_executable: true,
         }
     }
@@ -1279,6 +1280,7 @@ mod consumer_ack_tests {
             action_planner_meta: None,
             goal_id: Some("goal-reclaimed".into()),
             parent_task_id: None,
+            sink_task_id: None,
             is_executable: true,
         };
         runtime

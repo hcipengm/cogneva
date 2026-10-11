@@ -757,6 +757,7 @@ impl ActionPlanOrchestrator {
         // carries no executable row must decompose exactly as "no hints".
         let hint_tasks: Vec<Task> = tasks.iter().filter(|t| t.is_executable).cloned().collect();
         let mut plan = None;
+        let mut attempts_used = attempts;
         for attempt in 1..=attempts {
             let candidate = if hint_tasks.is_empty() {
                 self.decompose_goal(goal, skill_registry, None).await?
@@ -774,6 +775,7 @@ impl ActionPlanOrchestrator {
                 continue;
             }
             plan = Some(candidate);
+            attempts_used = attempt;
             break;
         }
 
@@ -789,46 +791,47 @@ impl ActionPlanOrchestrator {
             // signal watcher turns the firing alert into a fresh fix intent.
             let reason =
                 format!("decomposition produced no executable tasks after {attempts} attempt(s)");
-            tracing::error!(goal = %goal, goal_id = %goal_id, "{reason}");
-            self.fire_decomposition_alert(
-                cog_core::ALERT_RULE_DECOMPOSITION_EMPTY,
-                &goal_id,
-                tasks.first().map(|t| t.id.as_str()),
-                attempts,
-                tasks.first().map(|t| &t.input),
-                &reason,
-            )
-            .await;
-            let mut failed_ids = Vec::new();
-            if let Some(ref dag) = self.dag_executor {
-                let now = Utc::now();
-                let mut failed_rows = Vec::with_capacity(tasks.len());
-                for mut original in tasks {
-                    original.goal_id = Some(goal_id.clone());
-                    original.is_executable = false;
-                    original.status = cog_core::TaskStatus::Failed;
-                    original.error = Some(reason.clone());
-                    original.updated_at = now;
-                    failed_ids.push(original.id.clone());
-                    failed_rows.push(original);
-                }
-                // Batch injection is idempotent: redelivery after a partial
-                // write skips rows that already landed instead of erroring.
-                let queued = dag.add_tasks_batch(failed_rows).await?;
-                for held in failed_ids.iter().filter(|id| !queued.contains(id)) {
-                    let status = dag.get_task(held).await.map(|t| t.status);
-                    tracing::warn!(
-                        task_id = %held,
-                        ?status,
-                        "failed-outcome row held by an existing task; the verdict was not recorded"
-                    );
-                }
-                return Ok(queued);
-            }
-            // No DagExecutor: the verdict was logged and alerted but recorded
-            // nowhere, so there is no id to report as recorded.
-            return Ok(Vec::new());
+            return self
+                .fail_submission(
+                    cog_core::ALERT_RULE_DECOMPOSITION_EMPTY,
+                    &goal_id,
+                    attempts_used,
+                    tasks,
+                    reason,
+                )
+                .await;
         };
+
+        // 「这道目标的答案落在哪一条上」必须由分解自己点出来，且只点一条：零条说明各片
+        // 从不收口，两条以上说明没有哪一条承载答案。两种都不能挑一条顶上——挑错时读的人
+        // 会把某一片的中间产物当成整道目标的答案。
+        //
+        // 这类分解不接重试：重试轮拿不到上一轮的判词（同一组入参再问一遍，问出来的还是
+        // 同一份东西），所以直接走与「一点也没产出」相同的那条判退路，只是告警规则不同。
+        let sinks = Self::sinks_of(&plan.tasks);
+        if sinks.len() != 1 {
+            let named = if sinks.is_empty() {
+                "none".to_string()
+            } else {
+                sinks.join(", ")
+            };
+            let reason = format!(
+                "decomposition named {} task(s) as the one carrying the goal's answer ({named}); \
+                 it must name exactly one — when the work branches, one closing task has to \
+                 combine the pieces into that answer",
+                sinks.len()
+            );
+            return self
+                .fail_submission(
+                    cog_core::ALERT_RULE_DECOMPOSITION_SINK_COUNT,
+                    &goal_id,
+                    attempts_used,
+                    tasks,
+                    reason,
+                )
+                .await;
+        }
+        let sink_id = sinks.into_iter().next().expect("checked exactly one");
 
         // Inject placeholders + children as ONE idempotent batch so a
         // partial write / crash is compensable on redelivery: originals are
@@ -837,10 +840,16 @@ impl ActionPlanOrchestrator {
         let mut all_injected_ids: Vec<String> = Vec::new();
         if let Some(ref dag) = self.dag_executor {
             let now = Utc::now();
+            // 汇点的声明写在承载 `goal_id` 的那一行上——它也是下面每一条子任务的
+            // `parent_task_id` 指向的那一行，读面正是从这一行取答案。
+            let goal_row_id = tasks.first().map(|t| t.id.clone());
             let mut batch = Vec::new();
             for mut original in tasks {
                 original.goal_id = Some(goal_id.clone());
                 original.is_executable = false;
+                if Some(&original.id) == goal_row_id.as_ref() {
+                    original.sink_task_id = Some(sink_id.clone());
+                }
                 original.action_planner_meta = Some(cog_core::ActionPlannerMeta {
                     verified: true,
                     version: Some("1.0.0".into()),
@@ -936,6 +945,63 @@ impl ActionPlanOrchestrator {
         } else {
             tracing::error!(rule, dedup_key = %dedup_key, labels = %labels, "{message} (no persistent alert sink attached)");
         }
+    }
+
+    /// 这份提交判退：把判词写进一条持久告警，原始行做成 Failed 的非可执行占位。
+    ///
+    /// 这是分解失败的**唯一**出口——「一点也没产出」与「产出里没有唯一的收口任务」都要
+    /// 落同样的东西，分成两份写就是两份判据，迟早只改其中一份。判退不是猜一条顶上：
+    /// 原始行判 Failed 会让读者（含轮询的调用方）看到失败本身，而不是一个永远 Pending 的
+    /// 占位。
+    ///
+    /// 没有 DagExecutor 时判词只有日志与告警能落，返回空表而不是谎报已记录的行 id。
+    async fn fail_submission(
+        &self,
+        rule: &str,
+        goal_id: &str,
+        attempts: u32,
+        tasks: Vec<Task>,
+        reason: String,
+    ) -> SFResult<Vec<String>> {
+        tracing::error!(rule = %rule, goal_id = %goal_id, "{reason}");
+        self.fire_decomposition_alert(
+            rule,
+            goal_id,
+            tasks.first().map(|t| t.id.as_str()),
+            attempts,
+            tasks.first().map(|t| &t.input),
+            &reason,
+        )
+        .await;
+        let Some(ref dag) = self.dag_executor else {
+            // No DagExecutor: the verdict was logged and alerted but recorded
+            // nowhere, so there is no id to report as recorded.
+            return Ok(Vec::new());
+        };
+        let now = Utc::now();
+        let mut failed_ids = Vec::new();
+        let mut failed_rows = Vec::with_capacity(tasks.len());
+        for mut original in tasks {
+            original.goal_id = Some(goal_id.to_string());
+            original.is_executable = false;
+            original.status = cog_core::TaskStatus::Failed;
+            original.error = Some(reason.clone());
+            original.updated_at = now;
+            failed_ids.push(original.id.clone());
+            failed_rows.push(original);
+        }
+        // Batch injection is idempotent: redelivery after a partial
+        // write skips rows that already landed instead of erroring.
+        let queued = dag.add_tasks_batch(failed_rows).await?;
+        for held in failed_ids.iter().filter(|id| !queued.contains(id)) {
+            let status = dag.get_task(held).await.map(|t| t.status);
+            tracing::warn!(
+                task_id = %held,
+                ?status,
+                "failed-outcome row held by an existing task; the verdict was not recorded"
+            );
+        }
+        Ok(queued)
     }
 
     /// Retrieve top-k patterns from the pattern DB using semantic similarity.
@@ -1126,6 +1192,28 @@ impl ActionPlanOrchestrator {
             }
         }
         Ok(())
+    }
+
+    /// 这份分解里承载答案的任务 id：没有任何一条别的任务把「等它」写进 `blocked_by`
+    /// 的那些。
+    ///
+    /// 判据取的是执行器真正据以定序的那个字段。`validate_dag` 判的出口是另一张图
+    /// （计划图的 edges）上的结点，那张图运行时没人读——照它写会点到一张没人执行的
+    /// 图上的结点，而且看不出错。
+    ///
+    /// 只看这一次分解给出的任务：全体任务里按「谁没有下游」重算，会把别的目标的行、
+    /// 单独提交的行一起算成汇点。
+    fn sinks_of(tasks: &[AtomicTask]) -> Vec<String> {
+        let waited_on: std::collections::HashSet<&str> = tasks
+            .iter()
+            .flat_map(|t| t.blocked_by.iter().map(String::as_str))
+            .collect();
+        tasks
+            .iter()
+            .map(|t| t.id.as_str())
+            .filter(|id| !waited_on.contains(id))
+            .map(str::to_string)
+            .collect()
     }
 
     /// Append a new pattern to the DB and apply expiration/eviction.
@@ -2237,6 +2325,115 @@ mod tests {
         assert_eq!(child.parent_task_id.as_deref(), Some("sig-alert-2"));
         assert_eq!(child.goal_id, parent.goal_id);
         assert!(sink.calls.lock().unwrap().is_empty());
+    }
+
+    /// `sinks_of` 读的是执行器真正据以定序的那个字段，且只看这一次分解给出的任务。
+    #[test]
+    fn sinks_are_the_tasks_nothing_waits_on() {
+        let mut second = atomic_task("b");
+        second.blocked_by = vec!["a".into()];
+        assert_eq!(
+            ActionPlanOrchestrator::sinks_of(&[atomic_task("a"), second.clone()]),
+            vec!["b".to_string()]
+        );
+        // 单任务：它自己就是收口的那一条。
+        assert_eq!(
+            ActionPlanOrchestrator::sinks_of(&[atomic_task("solo")]),
+            vec!["solo".to_string()]
+        );
+        // 两条互不等待的 → 两个汇点，调用方按「不是恰好一个」判退。
+        assert_eq!(
+            ActionPlanOrchestrator::sinks_of(&[atomic_task("a"), atomic_task("b")]),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        // 每条都在等另一条：一个汇点都没有。执行图上的环由注入那一刻兜住，这里只
+        // 说「承载答案的那一条」在这份分解里不存在。
+        let mut ring_a = atomic_task("a");
+        ring_a.blocked_by = vec!["b".into()];
+        assert!(ActionPlanOrchestrator::sinks_of(&[ring_a, second]).is_empty());
+    }
+
+    /// 分解给出的唯一收口任务要写在目标行上：读面（网关视图、评测桥）据这条声明取答案。
+    #[tokio::test]
+    async fn the_goal_row_declares_the_one_task_carrying_the_answer() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-sink-decl".to_string()));
+        let mut second = atomic_task("child-2");
+        second.blocked_by = vec!["child-1".into()];
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(Arc::new(ScriptedAtomicExecutor {
+                replies: std::sync::Mutex::new(vec![vec![atomic_task("child-1"), second]]),
+            }))
+            .with_dag_executor(dag.clone())
+            .with_decomposition_max_attempts(1);
+
+        let registry = SkillRegistry::new();
+        planner
+            .process_goal_impl("first do a, then b", vec![hint_task("goal-row")], &registry)
+            .await
+            .unwrap();
+
+        let parent = dag.get_task("goal-row").await.unwrap();
+        assert_eq!(parent.status, cog_core::TaskStatus::Pending);
+        assert_eq!(
+            parent.sink_task_id.as_deref(),
+            Some("child-2"),
+            "the declaration must point at the task nothing else waits on"
+        );
+        // 声明落在子任务的回指那一行上：读面正是从这一行取答案。
+        let child = dag.get_task("child-2").await.unwrap();
+        assert_eq!(child.parent_task_id.as_deref(), Some("goal-row"));
+    }
+
+    /// 没有恰好一条收口任务 ⇒ 整份判退：零条（各片从不收口）与多条（没有哪一条承载
+    /// 答案）都不能挑一条顶上——挑错时读的人会把某一片的中间产物当成整道目标的答案。
+    #[tokio::test]
+    async fn a_decomposition_without_a_single_sink_is_refused_loudly() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-no-sink".to_string()));
+        let exec = Arc::new(RecordingAtomicExecutor {
+            replies: std::sync::Mutex::new(vec![vec![
+                atomic_task("child-1"),
+                atomic_task("child-2"),
+            ]]),
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let sink: Arc<RecordingAlertSink> = Arc::new(RecordingAlertSink::default());
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(exec.clone())
+            .with_dag_executor(dag.clone())
+            .with_decomposition_max_attempts(2);
+        planner.attach_alert_sink(sink.clone()).await;
+
+        let registry = SkillRegistry::new();
+        let ids = planner
+            .process_goal_impl(
+                "do two unrelated things",
+                vec![hint_task("goal-row")],
+                &registry,
+            )
+            .await
+            .unwrap();
+
+        // 判退：只有原始那一行落下来，一条子任务都没进图。
+        assert_eq!(ids, vec!["goal-row".to_string()]);
+        assert!(dag.get_task("child-1").await.is_none());
+        assert!(dag.get_task("child-2").await.is_none());
+        let original = dag.get_task("goal-row").await.unwrap();
+        assert_eq!(original.status, cog_core::TaskStatus::Failed);
+        assert!(!original.is_executable);
+        assert!(original
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("exactly one")));
+        assert_eq!(original.sink_task_id, None);
+
+        let calls = sink.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, cog_core::ALERT_RULE_DECOMPOSITION_SINK_COUNT);
+        // 判退不接重试：下一轮拿不到这一轮的判词，同一组入参问出来的是同一份东西，
+        // 所以判退发生在取出计划之后、规划器只被问了一次。
+        assert_eq!(exec.seen.lock().unwrap().len(), 1);
     }
 
     /// 非可执行的 goal 行不是 hint：它只是这次目标的标记，不该进规划输入。

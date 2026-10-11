@@ -1729,13 +1729,82 @@ impl DagExecutor {
         Ok(())
     }
 
+    /// 汇点走到终态时，把它的终态与答案抄到声明了它的那一行上。
+    ///
+    /// 目标行（不可执行的父占位）自己不执行，谁也不会按它跑出一个结果来——它的终态只能是
+    /// 抄来的。抄谁由**声明**说了算：`parent_task_id` 指向的那一行上写着 `sink_task_id`，
+    /// 只有它等于本任务的 id 时才抄。读的是声明，不是「谁没有下游」——按后者全局重算，会把
+    /// 别的目标的行、单独提交的行一起算成汇点，那正是声明要替掉的那种算法。
+    ///
+    /// 判据（终态）留在这里，不在调用点：多叫一次只是多读一行，叫漏一次不会写错——漏掉的
+    /// 那条路只会让目标行停在 Pending，由孤儿对账器兜住。
+    async fn derive_sink_terminal(&self, task_id: &str) {
+        let Some(mut sink) = self.get_task(task_id).await else {
+            return;
+        };
+        if !matches!(
+            sink.status,
+            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+        ) {
+            return;
+        }
+        let Some(parent_id) = sink.parent_task_id.clone() else {
+            return;
+        };
+        let Some(mut row) = self.get_task(&parent_id).await else {
+            return;
+        };
+        if row.sink_task_id.as_deref() != Some(task_id) {
+            return;
+        }
+        let completed = sink.status == TaskStatus::Completed;
+        row.status = sink.status;
+        // 答案只长在跑成的那条路上；判死与取消的行不留半个结果。
+        row.result = if completed { sink.result.take() } else { None };
+        row.error = sink.error.take();
+        row.error_cause = sink.error_cause.take();
+        row.updated_at = chrono::Utc::now();
+        if let Some(be) = self.fg() {
+            if let Err(e) = be.dag_set_task(&self.workspace_id, &parent_id, &row).await {
+                tracing::warn!(
+                    goal_row = %parent_id,
+                    sink = %task_id,
+                    "cannot record the goal row's terminal state: {e}"
+                );
+                return;
+            }
+        } else {
+            let mut inner = self.inner.write().await;
+            match inner.tasks.get_mut(&parent_id) {
+                Some(existing) => *existing = row,
+                None => {
+                    tracing::warn!(
+                        goal_row = %parent_id,
+                        sink = %task_id,
+                        "the goal row this sink is declared on is not in memory; the derived \
+                         terminal state was not recorded"
+                    );
+                    return;
+                }
+            }
+        }
+        tracing::info!(
+            goal_row = %parent_id,
+            sink = %task_id,
+            status = ?sink.status,
+            "goal row terminal derived from its sink"
+        );
+    }
+
     pub async fn complete_task(
         &self,
         task_id: &str,
         result: serde_json::Value,
     ) -> SFResult<Vec<String>> {
         if self.fg().is_some() {
-            return self.complete_task_store(task_id, result).await;
+            let scheduled = self.complete_task_store(task_id, result).await?;
+            self.derive_sink_terminal(task_id).await;
+            return Ok(scheduled);
         }
         self.ensure_task_present(task_id).await?;
         let mut inner = self.inner.write().await;
@@ -1820,6 +1889,7 @@ impl DagExecutor {
         crate::observable::global_observable().record_task(true);
 
         self.force_checkpoint().await;
+        self.derive_sink_terminal(task_id).await;
         Ok(scheduled)
     }
 
@@ -1911,9 +1981,18 @@ impl DagExecutor {
         retry_after_secs: Option<u64>,
     ) -> SFResult<(bool, Vec<String>, bool)> {
         if self.fg().is_some() {
-            return self
+            let (retried, cancelled, dlq_pushed) = self
                 .fail_task_store(task_id, error, cause, retry_after_secs)
-                .await;
+                .await?;
+            // 判死才算终态：回队列的两种（记账重试、环境付账回投）都还没走到头。
+            if !retried {
+                self.derive_sink_terminal(task_id).await;
+            }
+            // 级联取消也是一条终态——被判死的上游拖下水的那种。
+            for dep_id in &cancelled {
+                self.derive_sink_terminal(dep_id).await;
+            }
+            return Ok((retried, cancelled, dlq_pushed));
         }
         self.ensure_task_present(task_id).await?;
         let mut inner = self.inner.write().await;
@@ -2100,6 +2179,10 @@ impl DagExecutor {
 
             crate::observable::global_observable().record_task(false);
             self.force_checkpoint().await;
+            self.derive_sink_terminal(task_id).await;
+            for dep_id in &cancelled {
+                self.derive_sink_terminal(dep_id).await;
+            }
             Ok((false, cancelled, dlq_pushed)) // permanently failed
         }
     }
@@ -2153,7 +2236,12 @@ impl DagExecutor {
 
     pub async fn cancel_task(&self, task_id: &str) -> SFResult<Vec<String>> {
         if self.fg().is_some() {
-            return self.cancel_task_store(task_id).await;
+            let cancelled = self.cancel_task_store(task_id).await?;
+            self.derive_sink_terminal(task_id).await;
+            for dep_id in &cancelled {
+                self.derive_sink_terminal(dep_id).await;
+            }
+            return Ok(cancelled);
         }
         self.ensure_task_present(task_id).await?;
         let mut inner = self.inner.write().await;
@@ -2216,6 +2304,10 @@ impl DagExecutor {
 
         drop(inner);
         self.persist_state().await;
+        self.derive_sink_terminal(task_id).await;
+        for dep_id in &cancelled {
+            self.derive_sink_terminal(dep_id).await;
+        }
         Ok(cancelled)
     }
 
@@ -3089,6 +3181,91 @@ mod tests {
             .await
             .unwrap();
         assert!(pod_a.all_completed().await);
+    }
+
+    /// 目标行（不可执行、声明了汇点）+ 汇点一条，两条一起进图。
+    async fn add_goal_and_sink(
+        dag: &DagExecutor,
+        goal_id: &str,
+        declared_sink: &str,
+        sink_id: &str,
+    ) {
+        let mut goal_row = Task::new(
+            goal_id,
+            TaskType::Custom("goal".into()),
+            serde_json::json!({"goal": "a question"}),
+        );
+        goal_row.is_executable = false;
+        goal_row.sink_task_id = Some(declared_sink.to_string());
+        let mut sink = Task::new(sink_id, TaskType::Generator, serde_json::json!({}));
+        sink.parent_task_id = Some(goal_id.to_string());
+        dag.add_tasks_batch(vec![goal_row, sink]).await.unwrap();
+    }
+
+    /// 汇点走到终态时，目标行跟着它走：目标行自己不执行，它的终态只能是抄来的。
+    #[tokio::test]
+    async fn a_completed_sink_hands_its_terminal_state_to_the_goal_row() {
+        let dag = DagExecutor::new("ws-sink-complete".into());
+        add_goal_and_sink(&dag, "goal-1", "child-1", "child-1").await;
+
+        dag.schedule_task("child-1").await.unwrap();
+        dag.start_task("child-1").await.unwrap();
+        dag.complete_task("child-1", serde_json::json!({"answer": 42}))
+            .await
+            .unwrap();
+
+        let row = dag.get_task("goal-1").await.unwrap();
+        assert_eq!(row.status, TaskStatus::Completed);
+        assert_eq!(row.result, Some(serde_json::json!({"answer": 42})));
+        assert!(!row.is_executable, "抄来的终态不改「它自己不执行」");
+    }
+
+    /// 抄的是**被声明的那一条**：没被声明的任务走完终态不动目标行，被声明的那条判死
+    /// 就让目标行跟着判死，且不留半个结果。
+    #[tokio::test]
+    async fn a_goal_row_derives_only_from_the_sink_it_declares() {
+        let dag = DagExecutor::new("ws-sink-declared".into());
+        add_goal_and_sink(&dag, "goal-1", "child-2", "child-1").await;
+        let mut declared = Task::new("child-2", TaskType::Generator, serde_json::json!({}));
+        declared.parent_task_id = Some("goal-1".into());
+        declared.retry_count = u32::MAX - 1; // 超过任何 max_retries，fail 必终败
+        dag.add_task(declared).await.unwrap();
+
+        dag.schedule_task("child-1").await.unwrap();
+        dag.start_task("child-1").await.unwrap();
+        dag.complete_task("child-1", serde_json::json!({"answer": "not the one"}))
+            .await
+            .unwrap();
+        let row = dag.get_task("goal-1").await.unwrap();
+        assert_eq!(row.status, TaskStatus::Pending);
+        assert_eq!(row.result, None);
+
+        dag.schedule_task("child-2").await.unwrap();
+        dag.start_task("child-2").await.unwrap();
+        let (retried, _, _) = dag.fail_task("child-2", "boom".into(), None).await.unwrap();
+        assert!(!retried);
+        let row = dag.get_task("goal-1").await.unwrap();
+        assert_eq!(row.status, TaskStatus::Failed);
+        assert_eq!(row.error.as_deref(), Some("boom"));
+        assert_eq!(row.result, None, "判死的行不留半个结果");
+    }
+
+    /// 存储权威模式同一条规则：终态落在共享存储里的那一行上，两个 pod 读到的是同一份。
+    #[tokio::test]
+    async fn a_sink_terminal_derives_the_goal_row_across_pods() {
+        let (pod_a, pod_b) = fg_pods();
+        add_goal_and_sink(&pod_a, "goal-1", "child-1", "child-1").await;
+
+        pod_a.schedule_task("child-1").await.unwrap();
+        pod_b.start_task("child-1").await.unwrap();
+        pod_b
+            .complete_task("child-1", serde_json::json!({"answer": "shared"}))
+            .await
+            .unwrap();
+
+        let row = pod_a.get_task("goal-1").await.unwrap();
+        assert_eq!(row.status, TaskStatus::Completed);
+        assert_eq!(row.result, Some(serde_json::json!({"answer": "shared"})));
     }
 
     #[tokio::test]

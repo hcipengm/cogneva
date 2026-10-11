@@ -131,6 +131,15 @@ pub struct Task {
     /// 父任务 ID。原子任务指向其所属的整体任务。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_task_id: Option<String>,
+    /// 这次分解里承载答案的那一条任务的 id，写在**目标行**（不可执行的那个占位）上。
+    ///
+    /// 目标行自己不执行，它的终态是从这条声明指向的那行抄来的：`Some(id)` 读作「这道
+    /// 目标的答案就是 id 那条任务的终态与结果」。所以问「谁在最后」要读这条声明，不能
+    /// 按「谁没有下游」重算——别的目标的行、单独提交的行都会落进那种算法里。
+    /// 没有恰好一条这样的任务（零条＝各片从不收口，两条以上＝没有哪一条承载答案）是
+    /// 一次分解失败，整份提交判退，不会静默挑一条。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sink_task_id: Option<String>,
     /// 是否可被 DagExecutor 调度执行。
     /// 原始整体任务保留注入时设为 false，仅作为层级占位与查询用。
     #[serde(default = "default_true")]
@@ -524,6 +533,7 @@ impl Task {
             action_planner_meta: None,
             goal_id: None,
             parent_task_id: None,
+            sink_task_id: None,
             is_executable: true,
         }
     }

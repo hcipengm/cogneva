@@ -187,6 +187,10 @@ impl PlannerActor {
                  Read context.goal and decompose it into a small set of atomic, independently executable sub_tasks. \
                  Every sub-task must be self-contained: its input.query carries everything the executor needs. \
                  If the goal is trivially simple (e.g. a single question), return exactly ONE sub-task that directly addresses it. \
+                 When the goal needs several sub-tasks, exactly one of them must be the one that carries the goal's answer: \
+                 every other sub-task has to feed into it, nothing may depend on it, and it has to be the only such sub-task. \
+                 If the work naturally branches into several independent results, add one closing sub-task that combines them \
+                 into that single answer instead of leaving the branches as separate ends. \
                  Also produce acceptance_criteria: concrete, verifiable conditions the final output must satisfy \
                  (e.g. 'the answer states the exact version number', 'the summary covers every sub-task'). \
                  Each criterion must be checkable as true or false; do NOT write vague ones like 'implementation is complete'. \

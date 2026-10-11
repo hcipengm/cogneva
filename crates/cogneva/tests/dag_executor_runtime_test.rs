@@ -29,6 +29,7 @@ fn make_test_task(id: &str) -> Task {
         action_planner_meta: None,
         goal_id: None,
         parent_task_id: None,
+        sink_task_id: None,
         is_executable: true,
     }
 }

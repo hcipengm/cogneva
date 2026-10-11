@@ -135,6 +135,10 @@ pub struct TaskView {
     /// 父任务 ID。分解出的原子任务指向被它替代的那条原始任务。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_task_id: Option<String>,
+    /// 这条目标行的答案落在哪条任务上。只有不可执行的占位行会带它；分解没给出恰好一条
+    /// 收口任务时整份提交判退，所以它要么缺席，要么指向唯一的那条。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sink_task_id: Option<String>,
     /// 能否被 DagExecutor 调度。原始任务被重新注入成占位时是 false——它只做层级与查询，
     /// 不能被当成「还没跑的活」。
     pub is_executable: bool,
@@ -158,6 +162,7 @@ impl From<Task> for TaskView {
             updated_at: t.updated_at.to_rfc3339(),
             goal_id: t.goal_id,
             parent_task_id: t.parent_task_id,
+            sink_task_id: t.sink_task_id,
             is_executable: t.is_executable,
         }
     }

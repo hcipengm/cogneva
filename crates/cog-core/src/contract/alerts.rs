@@ -323,6 +323,15 @@ pub const ALERT_RULE_DECOMPOSITION_EMPTY: &str = "decomposition_empty";
 /// Rule name for alerts raised by the stalled-orphan reconciler: a
 /// non-executable parent placeholder with no children stuck pending.
 pub const ALERT_RULE_DECOMPOSITION_ORPHANED: &str = "decomposition_orphaned";
+/// Rule name for alerts raised when a decomposition does not name exactly one
+/// task as the one carrying the answer: zero (the pieces never converge, so
+/// nothing holds the goal's answer) or more than one (no single task does).
+///
+/// Kept separate from [`ALERT_RULE_DECOMPOSITION_EMPTY`], which fires only when
+/// there are no tasks at all: a reader of that rule has to be able to conclude
+/// "the planner produced nothing", and a plan with pieces but no single closing
+/// task is a different condition with a different answer.
+pub const ALERT_RULE_DECOMPOSITION_SINK_COUNT: &str = "decomposition_sink_count";
 /// Rule name for alerts raised when the promotion ledger has gone whole weeks
 /// without a single promotion. Distinct from the trend rule: a flat zero has no
 /// decided samples, so every success-rate comparison skips it and the loudest
