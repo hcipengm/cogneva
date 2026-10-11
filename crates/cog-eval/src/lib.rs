@@ -35,8 +35,11 @@ pub use ablation::{
     AblationConfig, AblationDelta, AblationExecutor, AblationGroup, AblationReport, AblationRunner,
     Component, GroupReport,
 };
-pub use adapters::{AgentBenchLoader, GaiaRunner, SweBenchRunner};
-pub use bench::{Benchmark, CaseJudge, CaseSource, EnvProvider, Toolkit, Verdict};
+pub use adapters::{
+    hle_benchmark, AgentBenchLoader, GaiaRunner, HleCaseSource, HleJudge, HleToolkit,
+    SweBenchRunner, HLE_JSONL,
+};
+pub use bench::{Benchmark, CaseJudge, CaseSource, EnvProvider, NoEnvProvider, Toolkit, Verdict};
 pub use comparator::{two_proportion_z_test, AbComparator, ComparisonReport, StatisticalTest};
 pub use cross_system::{
     CrossSystemBenchmark, CrossSystemReport, ExternalSystem, MethodologyConfig, SystemScore,

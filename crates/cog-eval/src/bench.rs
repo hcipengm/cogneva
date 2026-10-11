@@ -62,6 +62,19 @@ pub trait EnvProvider: Send + Sync {
     async fn acquire(&self, case: &EvalCase) -> anyhow::Result<Arc<dyn CaseEnv>>;
 }
 
+/// 无环境基准的环境适配器。
+///
+/// 纯 API 的基准（HLE，以及将来同形的 GAIA）用它——它报的是「这道题本来就落在 API 上」，
+/// 不是「环境起不来」。要真环境（容器、compose）的基准各写各的，别共用一个假的。
+pub struct NoEnvProvider;
+
+#[async_trait]
+impl EnvProvider for NoEnvProvider {
+    async fn acquire(&self, _case: &EvalCase) -> anyhow::Result<Arc<dyn CaseEnv>> {
+        Ok(Arc::new(crate::scaffold::NoEnv))
+    }
+}
+
 /// 工具包：这道题给外壳的工具面，一个基准一个。
 ///
 /// 协议由基准定、**不由方法定**——所以它在基准这一侧，不在外壳那一侧。同一基准

@@ -187,16 +187,48 @@ import pyarrow.parquet" 2>/dev/null && have_pyarrow=1
 parquet_body="${hub}/ScaleAI/SWE-bench_Pro/resolve/fixture-rev/data/test.parquet"
 mkdir -p "$(dirname "${parquet_body}")"
 if [ -n "${have_pyarrow}" ]; then
+  # One column of this fixture is binary on purpose: the converter's whole job beyond
+  # round-tripping is to keep a blob out of a text row without silently swallowing it.
   python3 -c "${PY_PREAMBLE}
 import sys, pyarrow as pa, pyarrow.parquet as pq
-pq.write_table(pa.table({'id': [1, 2], 'text': ['a', 'b']}), sys.argv[1])" "${parquet_body}"
-  # The JSONL the fetcher must produce, written here by the same rule so the assertion is
-  # about the fetcher's output, not about pyarrow round-tripping itself.
+meta = pa.array([{'bytes': b'\x00\x01\x02img', 'path': 'p.png'}, None],
+                type=pa.struct([('bytes', pa.binary()), ('path', pa.string())]))
+table = pa.table({'id': [1, 2], 'text': ['a', 'b'],
+                  'blob': pa.array([b'\x00\xffraw', None], type=pa.binary()), 'meta': meta})
+pq.write_table(table, sys.argv[1])" "${parquet_body}"
+  # The JSONL the fetcher must produce. This is a second expression of the rule -- a blob
+  # becomes null with its path recorded, a blob-free row is untouched -- so a drift in the
+  # fetcher's converter shows up as a diff here rather than as pyarrow round-tripping itself.
   python3 -c "${PY_PREAMBLE}
 import json, sys, pyarrow.parquet as pq
+
+
+def clean(value, prefix=''):
+    if isinstance(value, (bytes, bytearray)):
+        return None, [prefix or '<root>']
+    if isinstance(value, dict):
+        out, dropped = {}, []
+        for key, item in value.items():
+            cleaned, paths = clean(item, '{}.{}'.format(prefix, key) if prefix else key)
+            out[key] = cleaned
+            dropped += paths
+        return out, dropped
+    if isinstance(value, list):
+        out, dropped = [], []
+        for index, item in enumerate(value):
+            cleaned, paths = clean(item, '{}[{}]'.format(prefix, index))
+            out.append(cleaned)
+            dropped += paths
+        return out, dropped
+    return value, []
+
+
 with open(sys.argv[2], 'w', encoding='utf-8') as fh:
     for row in pq.read_table(sys.argv[1]).to_pylist():
-        fh.write(json.dumps(row, ensure_ascii=False) + '\n')" "${parquet_body}" "${work}/expected.jsonl"
+        cleaned, dropped = clean(row)
+        if dropped:
+            cleaned['_binary_dropped'] = sorted(dropped)
+        fh.write(json.dumps(cleaned, ensure_ascii=False) + '\n')" "${parquet_body}" "${work}/expected.jsonl"
 else
   # Nothing here reads a parquet: only its bytes and hash matter to the fetch.
   head -c 4096 /dev/zero | tr '\0' 'p' >"${parquet_body}"
@@ -346,6 +378,13 @@ if [ -n "${have_pyarrow}" ]; then
   }
   cmp -s "${conv_dest}/swe-bench-pro/test.jsonl" "${work}/expected.jsonl" ||
     fail "the derived JSONL is not what the converter rule produces"
+  # The rule is not "drop blobs quietly": the row has to say a blob was there, and the blob's
+  # own value must be null rather than the raw bytes. Without this the byte-for-byte check
+  # above would pass for a converter that emitted the raw bytes too.
+  grep -q '"_binary_dropped": \["blob", "meta.bytes"\]' "${conv_dest}/swe-bench-pro/test.jsonl" ||
+    fail "a row with a blob does not record what was dropped: $(cat "${conv_dest}/swe-bench-pro/test.jsonl")"
+  grep -q '"blob": null' "${conv_dest}/swe-bench-pro/test.jsonl" ||
+    fail "the dropped blob's value is not null in the text JSONL"
   run swe-bench-pro "${conv_dest}" --verify --convert >/dev/null 2>&1 ||
     fail "--verify --convert went red on a tree with the derived file in place"
   rm -f "${conv_dest}/swe-bench-pro/test.jsonl"

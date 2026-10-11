@@ -9,10 +9,15 @@
 
 pub mod agentbench_loader;
 pub mod gaia_runner;
+pub mod hle;
 pub mod humaneval_loader;
 pub mod swebench_runner;
 
 pub use agentbench_loader::AgentBenchLoader;
 pub use gaia_runner::GaiaRunner;
+pub use hle::{
+    hle_benchmark, HleCaseSource, HleJudge, HleToolkit, HLE_JSONL, HLE_JUDGE_TEMPLATE_VERSION,
+    HLE_TOOL_PYTHON, HLE_TOOL_WEB_SEARCH,
+};
 pub use humaneval_loader::HumanEvalLoader;
 pub use swebench_runner::SweBenchRunner;

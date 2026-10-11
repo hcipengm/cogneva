@@ -123,6 +123,14 @@ catalog() {
       a_src=("data/test-00000-of-00001.parquet")
       a_sha=("6d0ee0602e8aea6b159509577e884f48ecac7b8e3f6822a35f51335a446c726a")
       a_size=("274276147")
+      # For a reader that is not python: the same rows in the same order, text only. The two
+      # blob columns (an image preview, the rationale's image) are not carried -- each row
+      # names what was dropped and the question's own image rides as the data URL the parquet
+      # already stores, so a multimodal harness needs no side files.
+      d_dest=("hle/test-00000-of-00001.jsonl")
+      d_src=("hle/test-00000-of-00001.parquet")
+      d_sha=("8efbca01f176a40d4aa6139c4b99794da2cb7f797a818af2f2ddd84916d9519d")
+      d_size=("122979896")
       ;;
     *) die "unknown --benchmark: $1 (available: swe-bench-pro, toolathlon-gym, hle)" ;;
   esac
@@ -278,17 +286,48 @@ fetch_file() {
 # commit); BENCHMARK_PYLIBS names where to load it from, as a PATH-style list. The row order
 # and the non-ASCII handling match what the catalog hash was taken from, so a different
 # pyarrow that serializes a row differently fails the hash check instead of going unnoticed.
+#
+# A binary column cannot go into a text row, and dropping it silently would make "there was
+# no image" and "the image was thrown away here" read the same. So a blob becomes null and
+# its dotted path is listed in a row-level `_binary_dropped`; a struct that carries a path
+# beside its bytes keeps the path. Rows with no blob are written exactly as before, so the
+# artifacts that already have a pinned hash stay byte-identical.
 convert_jsonl() {
   python3 - "$1" "$2" <<'PY'
 import json, os, sys
 libs = [p for p in os.environ.get("BENCHMARK_PYLIBS", "").split(os.pathsep) if p]
 sys.path[:0] = libs
 import pyarrow.parquet as pq
+
+
+def clean(value, prefix=""):
+    if isinstance(value, (bytes, bytearray)):
+        return None, [prefix or "<root>"]
+    if isinstance(value, dict):
+        out, dropped = {}, []
+        for key, item in value.items():
+            cleaned, paths = clean(item, "{}.{}".format(prefix, key) if prefix else key)
+            out[key] = cleaned
+            dropped += paths
+        return out, dropped
+    if isinstance(value, list):
+        out, dropped = [], []
+        for index, item in enumerate(value):
+            cleaned, paths = clean(item, "{}[{}]".format(prefix, index))
+            out.append(cleaned)
+            dropped += paths
+        return out, dropped
+    return value, []
+
+
 src, dst = sys.argv[1], sys.argv[2]
 rows = pq.read_table(src).to_pylist()
 with open(dst, "w", encoding="utf-8") as fh:
     for row in rows:
-        fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        cleaned, dropped = clean(row)
+        if dropped:
+            cleaned["_binary_dropped"] = sorted(dropped)
+        fh.write(json.dumps(cleaned, ensure_ascii=False) + "\n")
 print("{} rows={} bytes={}".format(dst, len(rows), os.path.getsize(dst)))
 PY
 }

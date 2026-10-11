@@ -72,15 +72,21 @@ The three benchmarks and their pins:
 |---|---|---|---|
 | `swe-bench-pro` | ModelScope `ScaleAI/SWE-bench_Pro` | `0c470e9c…` | `test-00000-of-00001.parquet` (7.5 MiB, 731 rows) |
 | `toolathlon-gym` | GitHub `eigent-ai/toolathlon_gym` | `ed735ba0…` | tarball (104 MiB, 503 tasks), extracted to `toolathlon-gym/` |
-| `hle` | ModelScope `cais/hle` | `1ec1f1f2…` | `test-00000-of-00001.parquet` (262 MiB, ~2,500 questions) |
+| `hle` | ModelScope `cais/hle` | `1ec1f1f2…` | `test-00000-of-00001.parquet` (262 MiB, ~2,500 questions); `test-00000-of-00001.jsonl` under `--convert` |
 
-Two notes on the data itself. SWE-bench Pro's JSONL form is *derived* from its parquet, so that
-step is opt-in (`--convert`) — it needs pyarrow, and the base fetch must not depend on a Python
-package. Point `BENCHMARK_PYLIBS` at a directory holding pyarrow if it is not on the default path;
-the derived file is hash-checked like any other, so a pyarrow that serializes a row differently
-turns into a red run rather than a quietly different benchmark. HLE is MIT-licensed with no gate,
-carries a canary marking it as not-for-training-corpus, and is *multimodal* (its rows carry an
-`image` field), so a text-only harness must either skip image rows and say so or feed them.
+Two notes on the data itself. Both SWE-bench Pro and HLE have a JSONL form *derived* from their
+parquet, so that step is opt-in (`--convert`) — it needs pyarrow, and the base fetch must not depend
+on a Python package. Point `BENCHMARK_PYLIBS` at a directory holding pyarrow if it is not on the
+default path; the derived file is hash-checked like any other, so a pyarrow that serializes a row
+differently turns into a red run rather than a quietly different benchmark. HLE's parquet carries
+binary columns (an image preview, a rationale image) that cannot go into a text row: the converter
+writes each as `null` and lists its path in a row-level `_binary_dropped`, so "there was no image"
+and "the image was dropped here" do not read the same. The question's own image is untouched — it
+travels as the data URL the parquet already stores, so a multimodal harness needs no side files.
+HLE is MIT-licensed with no gate, carries a canary marking it as not-for-training-corpus, and is
+*multimodal* (about 1 row in 7 carries an image), so a text-only harness must either skip image
+rows and say so or feed them; `HleCaseSource` marks the choice on each case
+(`metadata.has_image`) rather than deciding it.
 
 ## Running the rig
 
@@ -118,7 +124,11 @@ This is the honest boundary of the crate today. Three things are **not** landed;
 four rows are.
 
 1. **The per-benchmark adapter sets** — `CaseSource` / `EnvProvider` / `Toolkit` / `CaseJudge` for
-   SWE-bench Pro, Toolathlon and HLE. Only the data is on disk.
+   SWE-bench Pro, Toolathlon and HLE. HLE's four are landed (`src/adapters/hle.rs`,
+   `hle_benchmark(...)`); SWE-bench Pro and Toolathlon are data on disk with no adapter yet. HLE's
+   tool implementations (a search API, a Python sandbox) are **injected**, not written here: the
+   `Toolkit` pins the protocol (exactly `web_search` + `python`) and refuses to run without them
+   rather than handing back an empty toolset that scores low for the wrong reason.
 2. **A driver** — no binary runs the table. The entry point is the library API above.
 3. **The platform bridge** — the `nql` row reaches the real platform through `PlatformRunner`
    (`src/scaffolds/nql.rs`), and **nothing implements it**. Turning one case into a platform task,
@@ -134,6 +144,9 @@ NQL drives a backbone (`deepseek-v4-flash`) through `LlmClient` (NQL drives the 
 and HLE is the one column graded by a generative judge (`Kimi K3`, official `model_graded_fact`
 rubric). SWE-bench Pro and Toolathlon are graded by deterministic scripts (their tests /
 `evaluation/main.py`), so they are the two columns that can score with no LLM judge at all — but a
-dead backbone still leaves them empty. Second, HLE is multimodal; a text-only harness has to say
-whether it skips image rows. Pin the backbone and judge model + version + rubric provenance in the
-experiment metadata: a cell that ran on a substituted model is not a cell in this table.
+dead backbone still leaves them empty. HLE's judge takes its upstream as a parameter: with no judge
+model wired, a case that needs it **errors** rather than scoring zero, because "never judged" and
+"judged wrong" are the same 0 and different facts. Second, HLE is multimodal; a text-only harness
+has to say whether it skips image rows. Pin the backbone and judge model + version + rubric
+provenance in the experiment metadata: a cell that ran on a substituted model is not a cell in this
+table.
