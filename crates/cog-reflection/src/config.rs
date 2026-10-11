@@ -64,8 +64,8 @@ impl Default for PromotionGateConfig {
             // 白名单故意收窄（宁严勿宽）：只有纯工具实现、前端、文档。
             // 未列出的路径一律按 L2 转人工。
             // `docs/` 是仓库内的外部/产品文档目录（可入库）；内部文档
-            // （设计规格/审计/记录）存于仓库外的 internal-docs/，永不
-            // 入库也永不入本白名单——改内部规格的 change 走"模糊从严"
+            // （设计规格/审计/记录）存在仓库之外，永不入库也永不入本
+            // 白名单——改内部规格的 change 走"模糊从严"
             // 自动落 L2，规格变更审批权归人。
             whitelist_prefixes: vec![
                 "crates/cog-agent/src/tools".into(),

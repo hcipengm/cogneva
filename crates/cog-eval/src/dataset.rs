@@ -15,7 +15,8 @@ pub struct EvalCase {
     pub metrics: Vec<crate::metric::EvalMetric>,
     /// 基准自己带的旋钮：来源 rev、镜像名、`fail_to_pass`、可用工具清单等。
     /// 与 `input` 分开是因为 `input` 是**题面**（喂给外壳的那段），这些是**评测台**
-    /// 起环境、判分时要读的东西——外壳不该看见它们（§1.3 第 4 条：外壳看不到判分器）。
+    /// 起环境、判分时要读的东西——外壳不该看见它们：外壳看不见判分器，
+    /// 看得见就等于把判分器泄进题面。
     #[serde(default)]
     pub metadata: HashMap<String, String>,
 }

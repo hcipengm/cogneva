@@ -6,7 +6,7 @@
 //! reproducible from the answer the same person could have got by listing the scope
 //! themselves, or "the plan matches the directory" stops being checkable.
 //!
-//! The order of stations is the design's (09-21 §3.5): classify by name/extension
+//! The order of stations is deliberate: classify by name/extension
 //! first, which never leaves the cluster; a model is consulted only for what the
 //! rules could not decide, and only through the audited channel (`document_egress`
 //! on the gateway), which is off by default. So this module's default behaviour --

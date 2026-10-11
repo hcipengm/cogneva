@@ -39,8 +39,8 @@ pub struct EvolutionQueueView {
     pub owner: bool,
 }
 
-/// Request to evaluate an artifact-level policy candidate against a baseline
-/// (产物级进化 §14.3). The verdict is gated by a two-proportion z-test;
+/// Request to evaluate an artifact-level policy candidate against a baseline.
+/// The verdict is gated by a two-proportion z-test;
 /// an `Adopt` verdict does **not** activate the policy — it stages the
 /// candidate at `AwaitingReview` until a human approves it, mirroring the
 /// source-level `manual_approve` gate.

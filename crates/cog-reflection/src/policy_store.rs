@@ -1,8 +1,8 @@
-//! 产物级进化（open_source_strategy.md §14.3）：策略产物的
+//! 产物级进化：策略产物的
 //! 「读取 → 评估 → 修改 → 保存新版本 → 热替换」循环。
 //!
 //! 与源码级进化（change_pipeline）互补：产物级进化不触碰 `.rs`，只演化
-//! 策略产物——元策略、阈值、评分权重、规则、配置参数（§14.2 分工表）。
+//! 策略产物——元策略、阈值、评分权重、规则、配置参数。
 //!
 //! 设计要点：
 //! - **版本链**：每版记录 parent_hash，hash = sha256(parent_hash ‖ canonical payload)，
@@ -212,7 +212,7 @@ impl PolicyStore {
     }
 }
 
-/// 候选策略的效果样本（§14.3 "Reflection 评估效果"）。
+/// 候选策略在评估任务集上的效果样本。
 #[derive(Debug, Clone)]
 pub struct PolicyCandidate {
     pub payload: serde_json::Value,

@@ -139,7 +139,7 @@ pub struct MetaLearningEngine {
     min_samples: u32,
     /// Success-rate margin required to prefer one decision over another.
     margin: f64,
-    /// 产物级进化策略源（§14.3 热替换）：配置后推荐参数以策略产物 active
+    /// 产物级进化策略源（热替换）：配置后推荐参数以策略产物 active
     /// 版本为准，self.min_samples/self.margin 仅作兜底。
     policy: Option<(crate::PolicyStore, String)>,
     /// 决策聚合的耐久快照：每次记录落盘、构造时读回。None 只出现在测试构造

@@ -236,6 +236,40 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # 仓库自身产物上的散文规则。这一组读的是**源码注释**这类既成的面，不编不跑，
+  # 所以既不属于 fmt/clippy（那两条读编译器），也不属于 deploy-parity（那条读渲染
+  # 清单）。每条判据的形态都一样：扫一个已有面，命中即红，判词指到行。
+  repo-conventions:
+    name: Repo Conventions
+    runs-on: ubuntu-latest
+    steps:
+      # 提交信息是在 history 里的，depth=1 的 checkout 读不到本次推送新增的那几个
+      # 提交——而判的正是它们。
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # 注释不得引用文档：文档在仓库之外，读代码的人跟不过去；修法是把 why 就地
+      # 写清，不是把引用换个说法。
+      - name: Check comments cite no document
+        run: bash deploy/scripts/check-comment-doc-references.sh
+      # 提交信息不得带 AI 署名。署名在 message 里，diff 与评审都看不见，推出去之后
+      # 唯一的修法是重写 history——所以判的是**本次推送新增的提交**，不是整部 history：
+      # 整部扫一次等于「第一次失手之后永久红」，而永久红的门最后会被删掉。
+      # 范围按事件算：PR 读 base/head，push 读 before/sha；before 全零（新建分支）时
+      # 退回「HEAD 可达的全部」。范围算不出来时脚本自己拒绝，不静默放行。
+      - name: Check commit messages carry no AI attribution
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          base="${BASE_SHA}"
+          case "${base}" in
+            "" | 0000000000000000000000000000000000000000) base="" ;;
+          esac
+          if [ -n "${base}" ]; then range="${base}..${HEAD_SHA}"; else range="${HEAD_SHA}"; fi
+          echo "judging ${range}"
+          bash deploy/scripts/check-commit-attribution.sh "${range}"
+
   entry-scripts:
     name: Entry Scripts Lint
     runs-on: ubuntu-latest
@@ -449,6 +483,7 @@ jobs:
       - test
       - fmt
       - clippy
+      - repo-conventions
       - entry-scripts
       - coverage
       - deploy-parity

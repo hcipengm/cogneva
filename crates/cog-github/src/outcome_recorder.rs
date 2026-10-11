@@ -1,6 +1,6 @@
 //! Outcome recorder — feeds PR/CI results back into the reflection engine.
 //!
-//! Implements the feedback leg of the design doc (§8): poll open PRs created
+//! Implements the feedback leg: poll open PRs created
 //! by the bot, and when a PR is merged or closed record the outcome via
 //! `cog_core::ReflectionEngine::record_change_outcome` so future triage and
 //! generation decisions improve.

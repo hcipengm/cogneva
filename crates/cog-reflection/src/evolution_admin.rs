@@ -129,7 +129,7 @@ impl EvolutionAdminService {
         self
     }
 
-    /// 接入产物级进化引擎（§14.3）：启用 `evaluate_policy` 契约方法，
+    /// 接入产物级进化引擎：启用 `evaluate_policy` 契约方法，
     /// 策略升级提议走「z-test → AwaitingReview → 审批热替换」人工门。
     pub fn with_artifact_evolution(mut self, evo: Arc<crate::ArtifactEvolution>) -> Self {
         self.artifact_evolution = Some(evo);

@@ -79,7 +79,7 @@ pub async fn apply_change_handler(
     }
 }
 
-/// Evaluate an artifact-level policy candidate (产物级进化 §14.3).
+/// Evaluate an artifact-level policy candidate.
 /// An Adopt verdict stages the candidate at AwaitingReview; approving the
 /// returned change id hot-swaps the policy version.
 pub async fn evaluate_policy_handler(

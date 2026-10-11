@@ -105,6 +105,21 @@ const NOT_ENFORCED: &[(&str, &str)] = &[
          touches a script passes verification and dies here.",
     ),
     (
+        "repo-conventions",
+        "Two whole-tree readings that compile nothing: \
+         check-comment-doc-references.sh scans the tracked Rust sources for a \
+         comment that cites a document, and check-commit-attribution.sh scans \
+         the commits a push adds for AI attribution. No toolchain beyond git, \
+         bash and coreutils, so the stage could run both for the cost of a shell \
+         step. They are not wired because the stage's pre-land checks are the \
+         three cargo commands, and a fourth surface is a change to the pipeline \
+         rather than a line here. The cost of the gap is a comment rewritten in \
+         place for the first, and an amended message for the second -- neither \
+         is a revert of code, which is why the attribution reading judges only \
+         the commits the push adds: an attribution already in the history can be \
+         refused, not undone.",
+    ),
+    (
         "deploy-parity",
         "check-deploy-parity.sh, render-deploy.sh --check, the git identity \
          wiring check and the alert-subject check all read deploy/ and the \

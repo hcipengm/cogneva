@@ -293,7 +293,7 @@ pub enum EvolutionKind {
     ToolVariant,
     #[serde(alias = "code_patch")]
     CodeChange,
-    /// 产物级进化（§14.3）：策略产物版本升级提议，经 z-test 统计门控 +
+    /// 产物级进化：策略产物版本升级提议，经 z-test 统计门控 +
     /// 人工审批后热替换，不改源码。
     PolicyUpdate,
 }
