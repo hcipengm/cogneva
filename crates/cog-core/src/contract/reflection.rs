@@ -140,8 +140,8 @@ pub struct GeneratedChange {
 pub enum RejectionCause {
     /// The artifact is not a parseable unified diff.
     MalformedDiff,
-    /// The promotion policy refuses the target set — a protected file, or a
-    /// diff too large to review.
+    /// The promotion policy refuses the target set — a protected file or
+    /// directory, or a diff too large to review.
     PromotionGateRefused,
     /// The change touches a path it may not, or rewrites one that is not there.
     ForbiddenPath,
@@ -1171,6 +1171,28 @@ pub const PROTECTED_FILE_NAMES: &[&str] = &[
 /// credential file that no reviewer ever saw.
 pub const PROTECTED_FILE_EXTENSIONS: &[&str] = &["pem", "key", "crt", "p12"];
 
+/// Directory components a change may not reach into, matched against each
+/// component of a repository-relative path.
+///
+/// A floor on the same terms as [`PROTECTED_FILE_NAMES`], and a separate axis
+/// because a name is matched against the last component alone: an evaluation
+/// suite is a directory, so no entry in that list could ever have named one,
+/// and a change could walk straight into it while every other reader here
+/// reported the path as fine.
+///
+/// What makes this the shape worth a hard floor rather than a policy entry: the
+/// suite is what a change is measured against, so the change that edits it and
+/// then reports its own score is moving the criteria and reading the result off
+/// the thing it just moved. Every later check in the pipeline reads the same
+/// suite and would agree with it. Freezing the judge is therefore a property of
+/// the platform rather than a setting a deployment may empty — the same reason
+/// the two lists above are floors.
+///
+/// Matched against a component rather than a prefix: a project's suite sits
+/// beside its own source instead of at the repository root, and its depth is
+/// not something this list can assume.
+pub const PROTECTED_DIR_SEGMENTS: &[&str] = &["eval"];
+
 /// Why a change may not name `path`, or `None` when it may.
 ///
 /// Answers only what is a property of the path itself — its shape and whether
@@ -1201,8 +1223,42 @@ pub fn forbidden_target_reason(path: &str) -> Option<String> {
             return Some(format!("protected file extension: .{ext}"));
         }
     }
+    if let Some(segment) =
+        path_protected_dir_segment(&normalized, PROTECTED_DIR_SEGMENTS.iter().copied())
+    {
+        return Some(format!("protected directory: {segment}/"));
+    }
 
     None
+}
+
+/// The first component of `path` that `forbidden` names, or `None`.
+///
+/// Shared rather than written twice: the promotion gate reaches this verdict
+/// from the contract's floor plus whatever the deployment adds, so a second
+/// match kept there is exactly how the two readers of one rule drift apart.
+/// Takes the forbidden set as an iterator for that reason — the gate hands over
+/// a union it cannot name as a slice.
+///
+/// A component rather than a prefix: the deployment's own policy is written as
+/// prefixes, and a prefix cannot say "at any depth" — `eval/` matches a suite at
+/// the repository root and misses the one beside a project's source, which is
+/// the shape most of them have.
+pub fn path_protected_dir_segment<'a>(
+    path: &str,
+    forbidden: impl Iterator<Item = &'a str>,
+) -> Option<String> {
+    let forbidden: Vec<&str> = forbidden.collect();
+    let normalized = path.replace('\\', "/");
+    std::path::Path::new(&normalized)
+        .components()
+        .find_map(|component| match component {
+            std::path::Component::Normal(segment) => segment
+                .to_str()
+                .filter(|segment| forbidden.iter().any(|f| f == segment))
+                .map(str::to_string),
+            _ => None,
+        })
 }
 
 /// Longest an extension may be before a trailing `.foo` reads as a sentence
@@ -3883,5 +3939,61 @@ test a::b ... FAILED\n\
         let shape = diff_shape(diff);
         assert!(shape.changed_config_keys.is_empty());
         assert!(shape.config_files.is_empty());
+    }
+
+    /// 受保护目录按**分量**判，且判在任意深度。
+    ///
+    /// 这条轴存在的理由是上面两份名单按最后一段比：判据套件是一条目录，
+    /// 在它们里无论如何拼写都表达不出来。所以这里钉住的正是那个差别——
+    /// 同样的字符串出现在更深一层仍然要拒，而只是**前缀**相同的另一条路径
+    /// 不能被它碰到（`eval_datasets` 是既有的 carrier，不是判据套件）。
+    #[test]
+    fn a_protected_directory_is_judged_by_component_at_any_depth() {
+        for path in [
+            "eval/cases.py",
+            "eval/",
+            "poche/eval/cases.py",
+            "a/b/eval/c/d.py",
+            "poche/eval/sub/cases.py",
+        ] {
+            assert!(
+                forbidden_target_reason(path).is_some(),
+                "{path} 应当被拒（受保护目录）"
+            );
+        }
+
+        for path in [
+            "eval_datasets/humaneval.jsonl",
+            "docs/evaluation/notes.md",
+            "evalrun/cases.py",
+            "crates/cog-eval/src/lib.rs",
+        ] {
+            assert_eq!(
+                forbidden_target_reason(path),
+                None,
+                "{path} 不该被目录轴拒（分量要相等，不是前缀/子串）"
+            );
+        }
+    }
+
+    /// 目录分量是**地板**：配置只能往下加，不能把契约这份抹掉。
+    ///
+    /// 与 [`PROTECTED_FILE_NAMES`] 同一条纪律，单独钉一次是因为两侧的消费点
+    /// 不同——这里读的是 `forbidden_target_reason`（评测器与 apply 门都调它），
+    /// 而晋级门另有一份并集。
+    #[test]
+    fn the_protected_directory_floor_is_not_configurable_away() {
+        for segment in PROTECTED_DIR_SEGMENTS {
+            let path = format!("p/{segment}/x.py");
+            let reason = forbidden_target_reason(&path).expect("契约地板必须仍然拒收");
+            assert!(reason.contains(segment), "拒收原因里要能读出事由: {reason}");
+        }
+    }
+
+    /// 目录轴的判据是分量相等，别把 `..` 与绝对路径的既有判决顺序挤掉。
+    #[test]
+    fn a_path_that_escapes_root_is_refused_before_its_components_are_read() {
+        let reason = forbidden_target_reason("../eval/x.py").expect("越出项目根应当被拒");
+        assert!(reason.contains("escapes project root"), "{reason}");
     }
 }

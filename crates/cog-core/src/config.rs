@@ -1643,7 +1643,11 @@ mod tests {
         .expect("configured commands parse");
         assert_eq!(
             configured.fmt_check_command,
-            Some(["ruff", "format", "--check", "."].map(String::from).to_vec())
+            Some(
+                ["ruff", "format", "--check", "."]
+                    .map(String::from)
+                    .to_vec()
+            )
         );
         assert_eq!(
             configured.lint_command,

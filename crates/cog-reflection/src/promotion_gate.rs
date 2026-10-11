@@ -111,11 +111,28 @@ fn matches_any(path: &str, prefixes: &[String]) -> bool {
     prefixes.iter().any(|p| path.starts_with(p.as_str()))
 }
 
+/// The directory components a change may not reach into, on the same terms as
+/// [`forbidden_names`].
+///
+/// A third axis rather than a third list inside the second: a name is matched
+/// against the last component alone, so an evaluation suite — which is a
+/// directory — could not have been named there however the policy spelled it.
+/// Like the other two, the contract's list is the floor and the policy only
+/// adds.
+fn forbidden_dir_segments<'a>(
+    policy: &'a PromotionGateConfig,
+) -> impl Iterator<Item = &'a str> + 'a {
+    cog_core::PROTECTED_DIR_SEGMENTS
+        .iter()
+        .copied()
+        .chain(policy.forbidden_dir_segments.iter().map(String::as_str))
+}
+
 /// 对 change 触及的文件清单做晋级分级。
 ///
 /// 判定顺序（命中即返回）：
 /// 1. 空清单 → Reject（无法确认影响面，fail-closed）；
-/// 2. 任一文件命中黑名单文件名 / 扩展名 → Reject；
+/// 2. 任一文件命中黑名单文件名 / 扩展名 / 目录分量 → Reject；
 /// 3. diff 行数超上限 → RequireApproval；
 /// 4. 全部文件落在 L0 配置路径 → AutoConfig（配置路径是核心路径的
 ///    特例，必须先判；混入任何非配置文件会自然掉到后续判定）；
@@ -142,6 +159,16 @@ pub fn classify(files: &[String], diff_lines: usize, policy: &PromotionGateConfi
             return GateVerdict::Reject {
                 kind: PromotionGateKind::RejectProtected,
                 reason: format!("触及受保护扩展名 {f}（密钥/证书材料禁止自动进化）"),
+            };
+        }
+        if let Some(segment) =
+            cog_core::path_protected_dir_segment(f, forbidden_dir_segments(policy))
+        {
+            return GateVerdict::Reject {
+                kind: PromotionGateKind::RejectProtected,
+                reason: format!(
+                    "触及受保护目录 {segment}/（裁判冻结：判据套件禁止自动进化改动，{f}）"
+                ),
             };
         }
     }
@@ -239,6 +266,7 @@ mod tests {
         let mut policy = PromotionGateConfig::default();
         policy.forbidden_names.clear();
         policy.forbidden_extensions.clear();
+        policy.forbidden_dir_segments.clear();
 
         for name in cog_core::PROTECTED_FILE_NAMES {
             let v = classify(&files(&[name]), 5, &policy);
@@ -255,6 +283,14 @@ mod tests {
                 "受保护扩展名 .{ext} 在这个门里没有被拒收: {v:?}"
             );
         }
+        for segment in cog_core::PROTECTED_DIR_SEGMENTS {
+            let path = format!("{segment}/suite.py");
+            let v = classify(&files(&[&path]), 5, &policy);
+            assert!(
+                matches!(v, GateVerdict::Reject { .. }),
+                "受保护目录 {segment}/ 在这个门里没有被拒收: {v:?}"
+            );
+        }
     }
 
     /// The other direction: a policy may still add a name of its own.
@@ -263,11 +299,35 @@ mod tests {
         let mut policy = PromotionGateConfig::default();
         policy.forbidden_names.push("secrets.yaml".into());
         policy.forbidden_extensions.push("p8".into());
+        policy.forbidden_dir_segments.push("judge".into());
 
         let v = classify(&files(&["deploy/secrets.yaml"]), 5, &policy);
         assert!(matches!(v, GateVerdict::Reject { .. }), "{v:?}");
         let v = classify(&files(&["certs/client.p8"]), 5, &policy);
         assert!(matches!(v, GateVerdict::Reject { .. }), "{v:?}");
+        let v = classify(&files(&["poche/judge/cases.py"]), 5, &policy);
+        assert!(matches!(v, GateVerdict::Reject { .. }), "{v:?}");
+    }
+
+    /// 目录轴按**分量**比，不按前缀：项目自己的判据套件与源码同级，不在仓库根。
+    #[test]
+    fn a_protected_directory_matches_at_any_depth() {
+        let policy = PromotionGateConfig::default();
+
+        let v = classify(&files(&["examples/eval/run.py"]), 5, &policy);
+        assert!(
+            matches!(v, GateVerdict::Reject { .. }),
+            "嵌套的 eval/ 没有被拒收: {v:?}"
+        );
+        // 分量相等是判据，不是子串：`eval_datasets` 与 `evaluation/` 都不该被
+        // 这条轴碰到（前者是既有 carrier，后者是另一件事）。
+        for path in ["eval_datasets/humaneval.jsonl", "docs/evaluation/notes.md"] {
+            let v = classify(&files(&[path]), 5, &policy);
+            assert!(
+                !matches!(v, GateVerdict::Reject { .. }),
+                "{path} 被目录轴误拒: {v:?}"
+            );
+        }
     }
 
     #[test]

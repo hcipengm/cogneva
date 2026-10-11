@@ -43,6 +43,13 @@ pub struct PromotionGateConfig {
     pub forbidden_names: Vec<String>,
     /// 直接拒收的扩展名，同 [`Self::forbidden_names`]：与契约取并集。
     pub forbidden_extensions: Vec<String>,
+    /// 直接拒收的目录分量（按路径的**每一段**比，不是按前缀），同
+    /// [`Self::forbidden_names`]：与契约取并集。
+    ///
+    /// 判据套件（`eval`）是一条目录，而上面两份名单按最后一段比、表达不了
+    /// 它——这就是这条轴单独存在的理由，不是三份并列的名单。项目自己的套件
+    /// 与源码同级而不是在仓库根，所以按分量比而不是按前缀比。
+    pub forbidden_dir_segments: Vec<String>,
     /// 晋级周报（eval 长期趋势）开关：周期聚合台账写报告文件 + 趋势向
     /// 下告警。
     pub trend_report_enabled: bool,
@@ -96,6 +103,10 @@ impl Default for PromotionGateConfig {
             forbidden_extensions: cog_core::PROTECTED_FILE_EXTENSIONS
                 .iter()
                 .map(|e| e.to_string())
+                .collect(),
+            forbidden_dir_segments: cog_core::PROTECTED_DIR_SEGMENTS
+                .iter()
+                .map(|s| s.to_string())
                 .collect(),
             trend_report_enabled: true,
             trend_report_interval_secs: 604_800,
