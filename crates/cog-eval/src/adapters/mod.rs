@@ -11,6 +11,7 @@ pub mod agentbench_loader;
 pub mod gaia_runner;
 pub mod hle;
 pub mod humaneval_loader;
+pub mod swe_pro;
 pub mod swebench_runner;
 
 pub use agentbench_loader::AgentBenchLoader;
@@ -20,4 +21,9 @@ pub use hle::{
     HLE_TOOL_PYTHON, HLE_TOOL_WEB_SEARCH,
 };
 pub use humaneval_loader::HumanEvalLoader;
+pub use swe_pro::{
+    parse_test_list, swe_pro_benchmark, SweProBackend, SweProCaseSource, SweProEnvProvider,
+    SweProJudge, SweProTestReport, SweProToolkit, SWE_PRO_JSONL, SWE_PRO_TOOL_BASH,
+    SWE_PRO_TOOL_FILE_EDIT,
+};
 pub use swebench_runner::SweBenchRunner;

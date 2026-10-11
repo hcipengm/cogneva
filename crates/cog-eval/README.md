@@ -70,7 +70,7 @@ The three benchmarks and their pins:
 
 | benchmark | source | revision | artifact(s) |
 |---|---|---|---|
-| `swe-bench-pro` | ModelScope `ScaleAI/SWE-bench_Pro` | `0c470e9c…` | `test-00000-of-00001.parquet` (7.5 MiB, 731 rows) |
+| `swe-bench-pro` | ModelScope `ScaleAI/SWE-bench_Pro` | `0c470e9c…` | `test-00000-of-00001.parquet` (7.5 MiB, 731 rows); `test-00000-of-00001.jsonl` under `--convert` |
 | `toolathlon-gym` | GitHub `eigent-ai/toolathlon_gym` | `ed735ba0…` | tarball (104 MiB, 503 tasks), extracted to `toolathlon-gym/` |
 | `hle` | ModelScope `cais/hle` | `1ec1f1f2…` | `test-00000-of-00001.parquet` (262 MiB, ~2,500 questions); `test-00000-of-00001.jsonl` under `--convert` |
 
@@ -87,6 +87,13 @@ HLE is MIT-licensed with no gate, carries a canary marking it as not-for-trainin
 *multimodal* (about 1 row in 7 carries an image), so a text-only harness must either skip image
 rows and say so or feed them; `HleCaseSource` marks the choice on each case
 (`metadata.has_image`) rather than deciding it.
+
+SWE-bench Pro's `fail_to_pass` and `pass_to_pass` columns are **Python literal** lists of test
+names (`['a', 'b']`), not JSON arrays — measured over the public split, only 9 of 731 rows happen
+to also be valid JSON, so a JSON parser reads the other 722 as "no tests to run" and passes the
+column for free. `parse_test_list` walks the literal (both quote styles, backslash escapes) and
+refuses any trailing characters; the real-data test asserts each row yields a non-empty
+`fail_to_pass`, which is what pins that silent failure down.
 
 ## Running the rig
 
@@ -125,10 +132,14 @@ four rows are.
 
 1. **The per-benchmark adapter sets** — `CaseSource` / `EnvProvider` / `Toolkit` / `CaseJudge` for
    SWE-bench Pro, Toolathlon and HLE. HLE's four are landed (`src/adapters/hle.rs`,
-   `hle_benchmark(...)`); SWE-bench Pro and Toolathlon are data on disk with no adapter yet. HLE's
-   tool implementations (a search API, a Python sandbox) are **injected**, not written here: the
-   `Toolkit` pins the protocol (exactly `web_search` + `python`) and refuses to run without them
-   rather than handing back an empty toolset that scores low for the wrong reason.
+   `hle_benchmark(...)`) and SWE-bench Pro's four are landed (`src/adapters/swe_pro.rs`,
+   `swe_pro_benchmark(...)`); Toolathlon is data on disk with no adapter yet. Each `Toolkit` pins
+   the protocol (HLE: exactly `web_search` + `python`; SWE-bench Pro: exactly `bash` + `file_edit`)
+   with the implementations **injected**, not written here — a missing implementation refuses to
+   run rather than handing back an empty toolset that scores low for the wrong reason. SWE-bench
+   Pro's environment is a per-instance container, which is a port (`SweProBackend`) the crate
+   declares and does not implement: with no backend wired, both env acquisition and judging
+   **error** rather than reading as a model that failed the task.
 2. **A driver** — no binary runs the table. The entry point is the library API above.
 3. **The platform bridge** — the `nql` row reaches the real platform through `PlatformRunner`
    (`src/scaffolds/nql.rs`), and **nothing implements it**. Turning one case into a platform task,
@@ -144,9 +155,11 @@ NQL drives a backbone (`deepseek-v4-flash`) through `LlmClient` (NQL drives the 
 and HLE is the one column graded by a generative judge (`Kimi K3`, official `model_graded_fact`
 rubric). SWE-bench Pro and Toolathlon are graded by deterministic scripts (their tests /
 `evaluation/main.py`), so they are the two columns that can score with no LLM judge at all — but a
-dead backbone still leaves them empty. HLE's judge takes its upstream as a parameter: with no judge
-model wired, a case that needs it **errors** rather than scoring zero, because "never judged" and
-"judged wrong" are the same 0 and different facts. Second, HLE is multimodal; a text-only harness
+dead backbone still leaves them empty. Each adapter's external dependency is a parameter, and a
+missing one **errors** rather than scoring zero: HLE's judge takes its upstream as a parameter
+(with no judge model wired, a case that needs it errors, because "never judged" and "judged wrong"
+are the same 0 and different facts), and SWE-bench Pro takes its container backend the same way.
+Second, HLE is multimodal; a text-only harness
 has to say whether it skips image rows. Pin the backbone and judge model + version + rubric
 provenance in the experiment metadata: a cell that ran on a substituted model is not a cell in this
 table.

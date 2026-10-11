@@ -36,8 +36,9 @@ pub use ablation::{
     Component, GroupReport,
 };
 pub use adapters::{
-    hle_benchmark, AgentBenchLoader, GaiaRunner, HleCaseSource, HleJudge, HleToolkit,
-    SweBenchRunner, HLE_JSONL,
+    hle_benchmark, swe_pro_benchmark, AgentBenchLoader, GaiaRunner, HleCaseSource, HleJudge,
+    HleToolkit, SweBenchRunner, SweProBackend, SweProCaseSource, SweProJudge, SweProToolkit,
+    HLE_JSONL, SWE_PRO_JSONL,
 };
 pub use bench::{Benchmark, CaseJudge, CaseSource, EnvProvider, NoEnvProvider, Toolkit, Verdict};
 pub use comparator::{two_proportion_z_test, AbComparator, ComparisonReport, StatisticalTest};
