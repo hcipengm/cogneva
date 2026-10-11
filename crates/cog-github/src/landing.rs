@@ -3004,6 +3004,29 @@ mod tests {
         assert!(msg.contains("Signed-off-by:"));
     }
 
+    /// The eval-gate design's third acceptance: the squad's self-reported score
+    /// must reach the commit body as information only. If an edit drops the
+    /// disclaimer — or turns the line back into a "Self-review score" a reader
+    /// would take for a gate — this fails. The point is that no gate reads this
+    /// number, and the body has to say so itself.
+    #[test]
+    fn the_squad_score_is_written_as_a_note_not_as_a_gate() {
+        let msg = commit_message(&BotIdentityConfig::default(), &change("chg-42", "diff"));
+        assert!(
+            msg.contains(
+                "Score the producing squad reported: 0.90 (informational; no gate reads it)"
+            ),
+            "self-review score must be an explicitly non-gating note: {msg}"
+        );
+
+        // A change that reported no score carries no such line at all: the note
+        // is about a number that was actually produced, not a placeholder.
+        let mut unscored = change("chg-43", "diff");
+        unscored.self_review_score = None;
+        let msg = commit_message(&BotIdentityConfig::default(), &unscored);
+        assert!(!msg.contains("Score the producing squad"), "{msg}");
+    }
+
     #[test]
     fn regex_escape_makes_the_id_literal() {
         assert_eq!(escape_regex("chg-1"), "chg\\-1");
