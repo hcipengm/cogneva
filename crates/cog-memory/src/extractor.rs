@@ -7,6 +7,20 @@ use cog_core::{RawSource, SchemaEntry, SchemaKind, SourceRef, SummaryEntry, NO_E
 
 use cog_core::MemoryExtractor;
 
+use crate::observable::{global_observable, PayloadOutcome};
+
+/// Report how one prompt's payload came out, so the input budget's effect is
+/// readable from outside this process.
+///
+/// The call is fire-and-forget on a process-global counter: an extraction that
+/// is about to fail must not fail *because* its reading could not be taken, and
+/// the reading is not part of the extraction's result. Nothing here knows the
+/// tokens an upstream billed -- the gateway settles those -- only whether the
+/// text this process sent was shortened to fit.
+fn note_payload_outcome(outcome: PayloadOutcome) {
+    global_observable().record_extraction_payload(outcome);
+}
+
 /// Fold one more mention of a fact into the pass's entries.
 ///
 /// A pass that finds the same fact twice — two lines naming one event, an LLM
@@ -385,11 +399,13 @@ impl LlmMemoryExtractor {
 
     /// The source is appended to the instructions exactly here, so every prompt
     /// path pays for the payload the same number of times — once.
-    fn prompt(tasks: &str, source: &RawSource, input_budget_tokens: usize) -> String {
-        format!(
-            "{tasks}\n\n{}",
-            Self::bounded_payload(&source.payload, input_budget_tokens)
-        )
+    fn prompt(
+        tasks: &str,
+        source: &RawSource,
+        input_budget_tokens: usize,
+    ) -> (String, PayloadOutcome) {
+        let (payload, outcome) = Self::bounded_payload(&source.payload, input_budget_tokens);
+        (format!("{tasks}\n\n{payload}"), outcome)
     }
 
     /// 一次抽取发出去的正文：装得下就原样，装不下就留头留尾、省掉中间。
@@ -398,10 +414,13 @@ impl LlmMemoryExtractor {
     /// 切进去会留下半句工具调用或半条工具结果，读者会把它们当成真的消息。
     /// 省掉的那段在标记里报出条数与估算量，所以「少了一段」和「本来就短」
     /// 在文本里长得不一样。
-    fn bounded_payload(payload: &[u8], budget_tokens: usize) -> String {
+    ///
+    /// 回来的第二个值是这次是怎么装的。它和正文同一次算出、同一个出口，
+    /// 所以「文本里有没有省略标记」与「读数说没说省了」不会各说各话。
+    fn bounded_payload(payload: &[u8], budget_tokens: usize) -> (String, PayloadOutcome) {
         let text = String::from_utf8_lossy(payload);
         if budget_tokens == 0 {
-            return text.into_owned();
+            return (text.into_owned(), PayloadOutcome::Verbatim);
         }
         let Ok(messages) = serde_json::from_str::<Vec<cog_core::Message>>(&text) else {
             // 这条链路写下的 payload 是 `Vec<Message>` 的 JSON；解析不出来说明
@@ -416,7 +435,7 @@ impl LlmMemoryExtractor {
         if total <= budget_tokens {
             // 装得下就原样发：重新序列化一遍只是把同一份对话换个写法发出去，
             // 白花两次转义的差。
-            return text.into_owned();
+            return (text.into_owned(), PayloadOutcome::Verbatim);
         }
         let half = budget_tokens / 2;
         let mut head_len = 0usize;
@@ -447,7 +466,10 @@ impl LlmMemoryExtractor {
         if head_len + tail_len >= messages.len() {
             // 省不下任何一条整消息（只剩一条，或头尾已经相接）：原样发出。
             // 宁可这一条略过预算，也不把对话换成一句「已省略」。
-            return text.into_owned();
+            //
+            // 这一支也算「超界」：它的正文确实比预算长。把它记成没超界，
+            // 调预算的人会以为界管住了这一段。
+            return (text.into_owned(), PayloadOutcome::Unsplittable);
         }
         let (Ok(head), Ok(tail)) = (
             serde_json::to_string(&messages[..head_len]),
@@ -462,24 +484,38 @@ impl LlmMemoryExtractor {
             .map(cost)
             .sum();
         let elided_len = messages.len() - head_len - tail_len;
-        format!(
-            "{head}\n\n[{elided_len} of {} messages (~{elided} tokens) omitted from the middle \
-             of this conversation; the ends are shown, and the archive holds it in full]\n\n{tail}",
-            messages.len()
+        (
+            format!(
+                "{head}\n\n[{elided_len} of {} messages (~{elided} tokens) omitted from the \
+                 middle of this conversation; the ends are shown, and the archive holds it in \
+                 full]\n\n{tail}",
+                messages.len()
+            ),
+            PayloadOutcome::Elided,
         )
     }
 
     /// 解析不出消息数组时的兜底：从头按字符数切，并说明切了多少。
-    fn cut_head_chars(text: &str, budget: usize) -> String {
+    ///
+    /// 这一支的界数的是**字符**不是估算 token（理由见上面调用处的注释），
+    /// 所以它截与不截只报 [`PayloadOutcome::CharCut`] 或 [`PayloadOutcome::Verbatim`]，
+    /// 不与消息数组那条路的两种「超界」混为一谈。
+    fn cut_head_chars(text: &str, budget: usize) -> (String, PayloadOutcome) {
         let total = text.chars().count();
         if total <= budget {
-            return text.to_string();
+            return (text.to_string(), PayloadOutcome::Verbatim);
         }
         let head: String = text.chars().take(budget).collect();
-        format!("{head}\n\n[{budget} of {total} characters of an unrecognized payload shown]")
+        (
+            format!("{head}\n\n[{budget} of {total} characters of an unrecognized payload shown]"),
+            PayloadOutcome::CharCut,
+        )
     }
 
-    fn build_schema_prompt(source: &RawSource, input_budget_tokens: usize) -> String {
+    fn build_schema_prompt(
+        source: &RawSource,
+        input_budget_tokens: usize,
+    ) -> (String, PayloadOutcome) {
         Self::prompt(
             &format!("{} {}", Self::SCHEMA_TASK, Self::IMPORTANCE_TASK),
             source,
@@ -487,7 +523,10 @@ impl LlmMemoryExtractor {
         )
     }
 
-    fn build_summary_prompt(source: &RawSource, input_budget_tokens: usize) -> String {
+    fn build_summary_prompt(
+        source: &RawSource,
+        input_budget_tokens: usize,
+    ) -> (String, PayloadOutcome) {
         Self::prompt(
             &format!("{} {}", Self::SUMMARY_TASK, Self::IMPORTANCE_TASK),
             source,
@@ -498,7 +537,10 @@ impl LlmMemoryExtractor {
     /// One prompt carrying both tasks, so one call can answer both. The two
     /// single-layer prompts are what a caller falls back to when only one layer
     /// is still missing; this is what a caller with neither missing uses.
-    fn build_combined_prompt(source: &RawSource, input_budget_tokens: usize) -> String {
+    fn build_combined_prompt(
+        source: &RawSource,
+        input_budget_tokens: usize,
+    ) -> (String, PayloadOutcome) {
         Self::prompt(
             &format!(
                 "{} {}\n\n{} {}",
@@ -634,7 +676,8 @@ impl LlmMemoryExtractor {
 #[async_trait]
 impl MemoryExtractor for LlmMemoryExtractor {
     async fn extract_schema(&self, source: &RawSource) -> SFResult<Vec<SchemaEntry>> {
-        let prompt = Self::build_schema_prompt(source, self.input_budget_tokens);
+        let (prompt, outcome) = Self::build_schema_prompt(source, self.input_budget_tokens);
+        note_payload_outcome(outcome);
         let extraction: SchemaExtraction = execute_structured(
             &*self.provider,
             &[cog_core::Message::user(prompt)],
@@ -646,7 +689,8 @@ impl MemoryExtractor for LlmMemoryExtractor {
     }
 
     async fn generate_summary(&self, source: &RawSource) -> SFResult<SummaryEntry> {
-        let prompt = Self::build_summary_prompt(source, self.input_budget_tokens);
+        let (prompt, outcome) = Self::build_summary_prompt(source, self.input_budget_tokens);
+        note_payload_outcome(outcome);
         let extraction: SummaryExtraction = execute_structured(
             &*self.provider,
             &[cog_core::Message::user(prompt)],
@@ -662,7 +706,8 @@ impl MemoryExtractor for LlmMemoryExtractor {
     /// it twice and pays for it twice. The two single-layer methods stay for
     /// the case where only one layer is still missing.
     async fn extract_all(&self, source: &RawSource) -> SFResult<(Vec<SchemaEntry>, SummaryEntry)> {
-        let prompt = Self::build_combined_prompt(source, self.input_budget_tokens);
+        let (prompt, outcome) = Self::build_combined_prompt(source, self.input_budget_tokens);
+        note_payload_outcome(outcome);
         let extraction: CombinedExtraction = execute_structured(
             &*self.provider,
             &[cog_core::Message::user(prompt)],
@@ -824,7 +869,7 @@ mod tests {
     #[tokio::test]
     async fn the_merged_prompt_carries_the_payload_once() {
         const SENTINEL: &str = "SENTINEL-4682f1";
-        let prompt = LlmMemoryExtractor::build_combined_prompt(
+        let (prompt, _) = LlmMemoryExtractor::build_combined_prompt(
             &raw("raw-a", SENTINEL),
             crate::config::DEFAULT_EXTRACTION_INPUT_BUDGET_TOKENS,
         );
@@ -855,9 +900,14 @@ mod tests {
     #[test]
     fn a_transcript_within_budget_is_sent_verbatim() {
         let source = transcript(&["alpha one", "beta two"]);
-        let prompt = LlmMemoryExtractor::build_combined_prompt(&source, 64_000);
+        let (prompt, outcome) = LlmMemoryExtractor::build_combined_prompt(&source, 64_000);
         let payload = String::from_utf8(source.payload.clone()).unwrap();
 
+        assert_eq!(
+            outcome,
+            PayloadOutcome::Verbatim,
+            "a payload under the budget is not something the budget did anything to"
+        );
         assert!(
             prompt.contains(&payload),
             "the payload must reach the model byte for byte: {prompt}"
@@ -876,8 +926,13 @@ mod tests {
             "alpha four",
         ]);
         // 每条两个英文词（8 token），预算 24 = 头尾各一条。
-        let prompt = LlmMemoryExtractor::build_combined_prompt(&source, 24);
+        let (prompt, outcome) = LlmMemoryExtractor::build_combined_prompt(&source, 24);
 
+        assert_eq!(
+            outcome,
+            PayloadOutcome::Elided,
+            "the middle was dropped, so the budget reached this payload"
+        );
         assert!(
             prompt.contains("alpha zero"),
             "the opening turn is kept: {prompt}"
@@ -902,8 +957,11 @@ mod tests {
     fn a_single_message_over_budget_is_still_sent_whole() {
         let long = "alpha ".repeat(200);
         let source = transcript(&[&long]);
-        let prompt = LlmMemoryExtractor::build_combined_prompt(&source, 8);
+        let (prompt, outcome) = LlmMemoryExtractor::build_combined_prompt(&source, 8);
 
+        // 超界但省不下任何一条整消息：报成这一支，而不是报成"没超界"。
+        // 前者是"界在这里管不住"，后者是"界管住了"，调预算时是两件事。
+        assert_eq!(outcome, PayloadOutcome::Unsplittable);
         assert!(prompt.contains(&long), "the only turn is still there");
         assert!(
             !prompt.contains("omitted from the middle"),
@@ -924,9 +982,32 @@ mod tests {
             "the estimate cannot see a whitespace-free blob"
         );
 
-        let prompt = LlmMemoryExtractor::build_combined_prompt(&source, 50);
+        let (prompt, outcome) = LlmMemoryExtractor::build_combined_prompt(&source, 50);
+        assert_eq!(outcome, PayloadOutcome::CharCut);
         assert_eq!(prompt.matches('~').count(), 50);
         assert!(prompt.contains("unrecognized payload"), "{prompt}");
+    }
+
+    /// 一条短得装得下的、但根本解析不成消息数组的载荷：走的是同一条兜底路，
+    /// 却什么都没切掉。它必须报成"原样发出"——把"解析不了"直接当成"截过"
+    /// 会让这个计数再也分不出"界在起作用"与"这份 raw 不是我们写的"。
+    #[test]
+    fn an_unparsable_payload_that_fits_is_not_counted_as_cut() {
+        let source = raw("raw-not-a-transcript", "~short blob~");
+        let (_, outcome) = LlmMemoryExtractor::build_combined_prompt(&source, 50);
+
+        assert_eq!(outcome, PayloadOutcome::Verbatim);
+    }
+
+    /// 界为 0 表示不设界，不是"界等于零"：正文整段发出，报成原样。
+    #[test]
+    fn a_zero_budget_sends_the_whole_payload() {
+        let long = "alpha ".repeat(200);
+        let source = transcript(&[&long]);
+        let (prompt, outcome) = LlmMemoryExtractor::build_combined_prompt(&source, 0);
+
+        assert_eq!(outcome, PayloadOutcome::Verbatim);
+        assert!(prompt.contains(&long));
     }
 
     /// 合并只许省调用，不许改落库的内容：同一份模型输出，分层走与合并走

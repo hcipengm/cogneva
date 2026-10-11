@@ -1352,6 +1352,37 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 37,
+          "title": "Memory Extraction Payloads by Outcome",
+          "description": "Extraction prompts the memory layer built, counted by how the input budget shaped the payload each one carried, over 6h. The four outcomes are kept apart because only one of them responds to the budget: verbatim means the budget did not bind, elided means it bound and the middle of the conversation was dropped, unsplittable means the payload was over budget but no whole message could be dropped so it went out over budget anyway, and char_cut means the payload was not a message array and was cut by characters. The binding rate is elided over the total, and it is the reading a change to memory.ingest.extraction_input_budget_tokens has to be judged against: a bound budget that is nearly all elided is a budget worth lowering, and one that is mostly unsplittable is a budget that is already below what a single conversation costs, where lowering it further removes nothing and only moves calls into the same outcome. The count is per process and resets when the memory layer's pod restarts; increase() over a window handles that.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 144
+          },
+          "targets": [
+            {
+              "expr": "sum by (outcome) (increase(cogneva_memory_extraction_payloads_total[6h]))",
+              "legendFormat": "{{outcome}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {

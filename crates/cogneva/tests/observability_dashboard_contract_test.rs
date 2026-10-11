@@ -481,6 +481,11 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["namespace"],
         "crates/cog-memory/src/metrics_instrumented.rs",
     ),
+    (
+        "cogneva_memory_extraction_payloads_total",
+        &["outcome"],
+        "crates/cog-memory/src/observable.rs",
+    ),
 ];
 
 /// Series the dashboard may read that this workspace does not produce, with the
