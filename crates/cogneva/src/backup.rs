@@ -617,7 +617,11 @@ async fn run_backup_into(
             Err(e) => return Err(e),
         };
         std::fs::write(secrets_dir.join(format!("{object_name}.yaml")), yaml)?;
-        keys.extend(object_keys.into_iter().map(|k| format!("{object_name}/{k}")));
+        keys.extend(
+            object_keys
+                .into_iter()
+                .map(|k| format!("{object_name}/{k}")),
+        );
     }
 
     let pool = PgPool::connect(&cfg.database_url).await?;

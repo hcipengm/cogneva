@@ -1997,7 +1997,9 @@ pub(crate) async fn is_contribution_secret_owner() -> bool {
         }
     };
     match kube
-        .can_get(&crate::secret_layout::internal_secret_api_path(kube.namespace()))
+        .can_get(&crate::secret_layout::internal_secret_api_path(
+            kube.namespace(),
+        ))
         .await
     {
         Ok(allowed) => allowed,

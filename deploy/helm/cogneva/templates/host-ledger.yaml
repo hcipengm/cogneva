@@ -72,23 +72,17 @@ spec:
             httpGet:
               path: /health/live
               port: http
-            periodSeconds: 5
-            timeoutSeconds: 5
-            failureThreshold: 60
+{{ toYaml .Values.healthProbes.startup | indent 12 }}
           livenessProbe:
             httpGet:
               path: /health/live
               port: http
-            periodSeconds: 20
-            timeoutSeconds: 10
-            failureThreshold: 6
+{{ toYaml .Values.healthProbes.liveness | indent 12 }}
           readinessProbe:
             httpGet:
               path: /health/ready
               port: http
-            periodSeconds: 10
-            timeoutSeconds: 10
-            failureThreshold: 6
+{{ toYaml .Values.healthProbes.readiness | indent 12 }}
           resources:
             {{- toYaml .Values.hostLedger.resources | nindent 12 }}
           securityContext:

@@ -446,9 +446,11 @@ pub(crate) async fn ensure_git_identity(config: &IdentityConfig) -> Outcome {
     // 停在等人这一步时把理由落盘：面板要显示、人要知道下一步该做什么。
     if let Outcome::AwaitingToken(reason) = &outcome {
         if facts.note.as_deref() != Some(reason.as_str()) {
-            if let Err(e) =
-                crate::secret_layout::patch_fields_b64(&kube, json!({ SECRET_IDENTITY_NOTE: reason }))
-                    .await
+            if let Err(e) = crate::secret_layout::patch_fields_b64(
+                &kube,
+                json!({ SECRET_IDENTITY_NOTE: reason }),
+            )
+            .await
             {
                 warn!("git 身份自举：写入待办理由失败: {e}");
             }

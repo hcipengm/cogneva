@@ -103,9 +103,7 @@ pub(crate) async fn load_data_view(kube: &KubeClient) -> Result<Value, String> {
 
 /// 把一组待写字段按键所属的对象分组，供 `kube.patch` 分别写。字段名未声明时
 /// 返回错误并报出键名——见模块开头为什么这里不设默认片。
-pub(crate) fn group_fields_by_object(
-    fields: &Value,
-) -> Result<Vec<(&'static str, Value)>, String> {
+pub(crate) fn group_fields_by_object(fields: &Value) -> Result<Vec<(&'static str, Value)>, String> {
     let map = fields
         .as_object()
         .ok_or_else(|| "待写字段不是一个对象".to_string())?;
@@ -201,7 +199,11 @@ mod tests {
         for key in INTERNAL_SECRET_KEYS {
             assert_eq!(secret_object_for_key(key), Some(SECRET_NAME_INTERNAL));
         }
-        assert_eq!(secret_object_for_key("pg-password"), None, "未声明的键不许有默认片");
+        assert_eq!(
+            secret_object_for_key("pg-password"),
+            None,
+            "未声明的键不许有默认片"
+        );
     }
 
     #[test]

@@ -1054,7 +1054,8 @@ impl BuildGate {
             next.min(persisted.unwrap_or(next)).max(1)
         };
         *self.dimension.lock().unwrap_or_else(|e| e.into_inner()) = dimension;
-        self.measured_ceiling.store(ceiling as u64, Ordering::Relaxed);
+        self.measured_ceiling
+            .store(ceiling as u64, Ordering::Relaxed);
         self.derived.store(enforce as u64, Ordering::Relaxed);
         *self.window.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
         let controller = self.is_controller();
@@ -1178,7 +1179,6 @@ impl BuildGate {
         }
     }
 
-
     /// The counters as they stand, for the reading.
     fn counters(&self) -> Counters {
         Counters {
@@ -1275,7 +1275,8 @@ impl BuildGate {
             }
             None => {
                 let held_by = name_holder(&self.dir, CLAIM_FILE);
-                let reason = format!("a build is running, so builds cannot be excluded ({held_by})");
+                let reason =
+                    format!("a build is running, so builds cannot be excluded ({held_by})");
                 // An exclusion is retried by a caller on its own cycle, so a
                 // refusal here is not a failure but the time between two walks —
                 // and with builds arriving back to back, that cycle can be too
@@ -1445,7 +1446,6 @@ impl BuildGate {
         }
     }
 }
-
 
 /// What a permit's holder is doing with the host, which decides what it counts
 /// as.
@@ -1673,7 +1673,10 @@ pub fn dir_identity(_dir: &Path) -> String {
 /// Takes the exclusive lock on one slot file, or reports that someone else has it.
 #[cfg(unix)]
 fn lock_slot(dir: &Path, slot: usize) -> Option<std::fs::File> {
-    file_lock(&dir.join(format!("slot-{slot}.lock")), libc::LOCK_EX | libc::LOCK_NB)
+    file_lock(
+        &dir.join(format!("slot-{slot}.lock")),
+        libc::LOCK_EX | libc::LOCK_NB,
+    )
 }
 
 /// Without `flock` there is no cross-process bound to enforce, so the gate
@@ -2156,7 +2159,7 @@ mod tests {
             "and the count rises with the limit, which is what makes it a reading rather than a setting"
         );
         assert_eq!(
-            load(1 * gib, 1 * gib).ceiling(),
+            load(gib, gib).ceiling(),
             (1, DIM_CGROUP_MEMORY),
             "a cgroup with nothing left is still one build: a bound of zero refuses every build forever"
         );
@@ -2260,7 +2263,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let gate = derived_gate(dir.path(), 0);
 
-        let _permit = gate.try_acquire("a build on a machine that can be read").await;
+        let _permit = gate
+            .try_acquire("a build on a machine that can be read")
+            .await;
         let metrics = gate.collect_metrics("D5").await.unwrap();
         let value = |name: &str| {
             metrics
@@ -2399,7 +2404,9 @@ mod tests {
         let running = gate.try_acquire("a build that is running").await.unwrap();
 
         assert!(
-            gate.try_acquire_exclusive("a build-cache sweep").await.is_err(),
+            gate.try_acquire_exclusive("a build-cache sweep")
+                .await
+                .is_err(),
             "a build is holding the field, so nothing can be excluded from it"
         );
         assert_eq!(
@@ -2414,7 +2421,10 @@ mod tests {
             "the claimed build must not go to an arrival"
         );
         let sweep = gate.try_acquire_exclusive("a build-cache sweep").await;
-        assert!(sweep.is_ok(), "the claim is answered by the work that made it");
+        assert!(
+            sweep.is_ok(),
+            "the claim is answered by the work that made it"
+        );
         assert!(
             gate.reservation().is_none(),
             "and the exclusion taking the field releases it"
@@ -2430,10 +2440,15 @@ mod tests {
     async fn an_exclusion_refused_by_a_peer_exclusion_claims_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let gate = gate(dir.path(), 1, 0);
-        let sweep = gate.try_acquire_exclusive("a build-cache sweep").await.unwrap();
+        let sweep = gate
+            .try_acquire_exclusive("a build-cache sweep")
+            .await
+            .unwrap();
 
         assert!(
-            gate.try_acquire_exclusive("a registry restart").await.is_err(),
+            gate.try_acquire_exclusive("a registry restart")
+                .await
+                .is_err(),
             "one exclusion at a time"
         );
         assert!(

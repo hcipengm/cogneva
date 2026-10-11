@@ -268,10 +268,7 @@ mod tests {
             .into_iter()
             .map(|m| {
                 (
-                    (
-                        m.name,
-                        m.labels.get("slice").cloned().unwrap_or_default(),
-                    ),
+                    (m.name, m.labels.get("slice").cloned().unwrap_or_default()),
                     m.value,
                 )
             })
@@ -330,7 +327,11 @@ mod tests {
             Some(&222.0)
         );
         // Two cells for the slice plus the two host-wide series.
-        assert_eq!(readings.len(), 4, "extra cells came from a neighbouring key");
+        assert_eq!(
+            readings.len(),
+            4,
+            "extra cells came from a neighbouring key"
+        );
     }
 
     /// Every slice is labelled with its own name, and a slice with no readable
@@ -354,9 +355,7 @@ mod tests {
             Some(&30.0)
         );
         assert!(
-            !readings
-                .keys()
-                .any(|(_, slice)| slice == "kubepods.slice"),
+            !readings.keys().any(|(_, slice)| slice == "kubepods.slice"),
             "a slice with no memory.stat was reported as a reading: {readings:?}"
         );
     }
@@ -478,7 +477,10 @@ mod tests {
     fn an_unknown_slice_has_no_path() {
         assert!(slice_dirs("mystery.slice").is_empty());
         assert_eq!(slice_dirs("user.slice"), &["user.slice"]);
-        assert_eq!(slice_dirs("kubepods.slice"), &["kubepods.slice", "kubepods"]);
+        assert_eq!(
+            slice_dirs("kubepods.slice"),
+            &["kubepods.slice", "kubepods"]
+        );
     }
 
     /// The default root is only used when the deployment names no path, so the
@@ -617,7 +619,8 @@ mod tests {
              {HOST_LEDGER_SLICES_READABLE_METRIC}, got: {promql}"
         );
         assert_eq!(
-            rule["condition"]["less_than"], SLICES.len() as f64,
+            rule["condition"]["less_than"],
+            SLICES.len() as f64,
             "rule {HOST_LEDGER_SLICES_INVISIBLE_RULE} must fire below the full slice count"
         );
     }

@@ -77,23 +77,23 @@ spec:
             httpGet:
               path: /health/live
               port: http
+            failureThreshold: 60
             periodSeconds: 5
             timeoutSeconds: 5
-            failureThreshold: 60
           livenessProbe:
             httpGet:
               path: /health/live
               port: http
+            failureThreshold: 6
             periodSeconds: 20
             timeoutSeconds: 10
-            failureThreshold: 6
           readinessProbe:
             httpGet:
               path: /health/ready
               port: http
+            failureThreshold: 6
             periodSeconds: 10
             timeoutSeconds: 10
-            failureThreshold: 6
           resources:
             limits:
               cpu: 100m
