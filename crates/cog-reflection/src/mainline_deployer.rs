@@ -1191,6 +1191,13 @@ enum FailureLocus {
     Unreachable,
     /// 准入面拒绝（配额打满、LimitRange/PodSecurity 越界）：新容器一次都没起来。
     Admission,
+    /// 清单引用了本次 apply 既不带来、集群里也不存在的对象：新 Pod 会照常起来，
+    /// 按名读的键位静默落空（`optional` 与缺键都让那个引用降级），坏的是下游功能
+    /// 而不是 Pod 本身。apply 面建不了这类对象（清单里的 Secret 是硬错误，RBAC、
+    /// 配额、卷声明都被丢掉），所以唯一正确的处置是在动手之前扣住，等安装面把对象
+    /// 建出来。它说的是**集群此刻的状态**，不是这一版的属性——判环境类、不回滚，
+    /// 下一轮安装面补齐后自己继续（见 [`MainlineDeployer::missing_reference_holds`]）。
+    Reference,
     /// 调度器放不下：节点装不下，不是这份变更的事。
     Placement,
     /// 观测工具本身起不来：一次查询都没发出去。
@@ -1241,9 +1248,10 @@ impl KilledReason {
 
 impl FailureLocus {
     /// 全部落点，供读回签名时校验值域用。
-    const ALL: [FailureLocus; 12] = [
+    const ALL: [FailureLocus; 13] = [
         FailureLocus::Unreachable,
         FailureLocus::Admission,
+        FailureLocus::Reference,
         FailureLocus::Placement,
         FailureLocus::Tool,
         FailureLocus::AuthDenied,
@@ -1260,6 +1268,7 @@ impl FailureLocus {
         match self {
             FailureLocus::Unreachable => "unreachable",
             FailureLocus::Admission => "admission",
+            FailureLocus::Reference => "reference",
             FailureLocus::Placement => "placement",
             FailureLocus::Tool => "tool",
             FailureLocus::AuthDenied => "auth",
@@ -1295,6 +1304,7 @@ impl FailureLocus {
                 self,
                 FailureLocus::Unreachable
                     | FailureLocus::Admission
+                    | FailureLocus::Reference
                     | FailureLocus::Placement
                     | FailureLocus::Tool
                     | FailureLocus::ImageSource
@@ -6496,6 +6506,123 @@ fn namespace_docs(yaml_text: &str, origin: &str) -> SFResult<Vec<serde_yaml::Val
     Ok(docs)
 }
 
+/// 沿点分路径取一个子值，缺一层就给 `None`。
+fn at_path<'a>(v: &'a serde_yaml::Value, path: &str) -> Option<&'a serde_yaml::Value> {
+    let mut cur = v;
+    for seg in path.split('.') {
+        cur = cur.get(seg)?;
+    }
+    Some(cur)
+}
+
+/// 沿一串键取一个字符串字段，缺一层或不是字符串都给 `None`。
+fn str_at<'a>(v: &'a serde_yaml::Value, path: &[&str]) -> Option<&'a str> {
+    let mut cur = v;
+    for p in path {
+        cur = cur.get(*p)?;
+    }
+    cur.as_str()
+}
+
+/// 一份清单文档**按名引用**的另一个对象，kind 用清单自己的拼法（`Secret` /
+/// `ConfigMap`）。
+///
+/// 只认工作负载 pod 模板里的引用：`env[].valueFrom.secretKeyRef` /
+/// `configMapKeyRef`、`envFrom[].secretRef` / `configMapRef`、卷上的
+/// `secret.secretName` / `configMap.name` 与 `projected.sources[]` 的同名字段。
+/// 别的 kind 不按名引用这两类对象（Service 按 label 选、NetworkPolicy 按 label
+/// 圈），所以不为它们猜字段——猜出来的名字错了不会报错，只会变成一次判错方向的
+/// 扣留。
+///
+/// 逐个 pod 模板走 [`WORKLOAD_KINDS`] 的表，不另写一份 kind 名单：清单里出现一种
+/// 这张表不认识的工作负载，它的引用就没人看得见，而那正是这张表本身要防的那件事。
+/// 文档不是工作负载（或没有 pod 模板）时返回空集，不是错误。
+fn referenced_objects(doc: &serde_yaml::Value) -> Vec<(String, String)> {
+    let kind = doc.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+    let Some(entry) = workload_kind(kind) else {
+        return Vec::new();
+    };
+    let Some(pod) = at_path(doc, entry.pod_template) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut push = |kind: &str, name: Option<&str>| {
+        if let Some(n) = name {
+            if !n.is_empty() {
+                out.push((kind.to_string(), n.to_string()));
+            }
+        }
+    };
+    for field in ["containers", "initContainers"] {
+        for c in pod.get(field).and_then(|v| v.as_sequence()).into_iter().flatten() {
+            for e in c.get("env").and_then(|v| v.as_sequence()).into_iter().flatten() {
+                let vf = e.get("valueFrom");
+                push(
+                    "Secret",
+                    vf.and_then(|v| str_at(v, &["secretKeyRef", "name"])),
+                );
+                push(
+                    "ConfigMap",
+                    vf.and_then(|v| str_at(v, &["configMapKeyRef", "name"])),
+                );
+            }
+            for ef in c
+                .get("envFrom")
+                .and_then(|v| v.as_sequence())
+                .into_iter()
+                .flatten()
+            {
+                push("Secret", str_at(ef, &["secretRef", "name"]));
+                push("ConfigMap", str_at(ef, &["configMapRef", "name"]));
+            }
+        }
+    }
+    for vol in pod
+        .get("volumes")
+        .and_then(|v| v.as_sequence())
+        .into_iter()
+        .flatten()
+    {
+        push("Secret", str_at(vol, &["secret", "secretName"]));
+        push("ConfigMap", str_at(vol, &["configMap", "name"]));
+        for src in vol
+            .get("projected")
+            .and_then(|v| v.get("sources"))
+            .and_then(|v| v.as_sequence())
+            .into_iter()
+            .flatten()
+        {
+            push("Secret", str_at(src, &["secret", "name"]));
+            push("ConfigMap", str_at(src, &["configMap", "name"]));
+        }
+    }
+    out
+}
+
+/// 这批文档里**自己就带着**的对象（kind/name）：本次 apply 会 upsert 出来的那一批。
+/// 引用集减掉这一批之后，剩下的每一个都必须在集群里已经存在。
+fn defined_objects(docs: &[serde_yaml::Value]) -> std::collections::HashSet<(String, String)> {
+    docs.iter()
+        .filter_map(|d| {
+            let kind = d.get("kind").and_then(|k| k.as_str())?;
+            let name = d.get("metadata").and_then(|m| m.get("name"))?.as_str()?;
+            Some((kind.to_string(), name.to_string()))
+        })
+        .collect()
+}
+
+/// 这批文档引用、而自己既不带来的对象，去重且有序：剩下的每一个都必须在集群里
+/// 已经存在。纯函数，判据脱离集群就能读，集群读那一半在
+/// [`MainlineDeployer::missing_reference_holds`]。
+fn unresolved_references(docs: &[serde_yaml::Value]) -> Vec<(String, String)> {
+    let defined = defined_objects(docs);
+    let mut refs: Vec<(String, String)> = docs.iter().flat_map(referenced_objects).collect();
+    refs.sort();
+    refs.dedup();
+    refs.retain(|r| !defined.contains(r));
+    refs
+}
+
 /// The repository part of an image reference: `localhost:30500/cogneva:local`
 /// becomes `localhost:30500/cogneva`, `redis:7-alpine` becomes `redis`, and
 /// `reg/x@sha256:...` becomes `reg/x`.
@@ -8187,6 +8314,45 @@ impl RolloutExecutor {
         None
     }
 
+    /// 这次 apply 会引用的对象，必须要么随本次 apply 一起来，要么集群里已经在；
+    /// 缺一个就扣住，回到 `Some(说明)`。
+    ///
+    /// 为什么这是一道门而不是一句日志：工作负载按名读的对象缺失时**不报错**。键读取
+    /// 上的 `optional` 与卷的缺失都让那个引用静默降级，Pod 照常 Running、就绪判据
+    /// 全绿，只有下游功能哑掉，而日志里那句话与"功能没配"逐字同形——网关零凭证那
+    /// 次就是这样：上游表、平台 token、身份材料全空，谁也看不出是"配了但没人建"。
+    ///
+    /// 而 apply 面**建不了**这类对象：清单里的 Secret 是硬错误（凭据不经清单链路，
+    /// 见 [`DocFate::ForbiddenSecret`]），所以"引用了但没人建"在滚动侧的处置只能是
+    /// 扣住——安装面（`init-secrets.sh`、chart）才是建它的那一方。扣住发生在任何
+    /// apply 之前，集群一个字节都没变，旧 Pod 留着服务，下一轮安装面补齐后自己继续。
+    ///
+    /// 判据两侧都不来自被判方：引用集来自本次要 apply 的这批文档，存在性来自一次
+    /// 集群读。读不到集群时回答"存在"（扣不住东西）——与 [`Self::admission_would_fail`]
+    /// 同一条纪律：读不到的读数不该扣留发布，真正的集群不可达会在随后的 apply 上报得
+    /// 更准、指向更近。
+    async fn missing_reference_holds(&self, docs: &[serde_yaml::Value]) -> Option<String> {
+        for (kind, name) in unresolved_references(docs) {
+            let resource = kind.to_lowercase();
+            let exists = match self.run_kubectl(&["get", &resource, &name, "-o", "name"], 60).await {
+                Ok(_) => true,
+                Err(e) => {
+                    let msg = e.to_string();
+                    !(msg.contains("NotFound") || msg.contains("not found"))
+                }
+            };
+            if !exists {
+                return Some(format!(
+                    "a workload references {kind}/{name}, which this rollout neither applies (a \
+                     Secret never travels in a manifest) nor finds in the cluster; holding before \
+                     anything is applied so the old pods keep serving, until the install face \
+                     creates it"
+                ));
+            }
+        }
+        None
+    }
+
     async fn apply_target(&self, plan: &RolloutPlan, t: &RolloutTarget) -> SFResult<()> {
         if let Some(dir) = &plan.manifests_dir {
             let key = target_manifest_key(&t.deployment);
@@ -9401,6 +9567,42 @@ impl RolloutExecutor {
     pub async fn run(&self, plan: &RolloutPlan) -> Result<(), RolloutFailure> {
         // 这次 apply 会改写的整组引用，两个面各一份，回滚按同一组还原。
         let mut refs = RefSnapshots::default();
+        // 引用面门：这次 apply 会引用的对象必须要么随本次 apply 一起来、要么集群里
+        // 已经在，缺一个就在这里扣住。位置必须在**第一处 apply 之前**——支撑清单是
+        // 这条通道上的第一个写动作，过了它集群就不再是原样，回滚也回不到"一个字节
+        // 都没动"。判据与理由见 [`Self::missing_reference_holds`]。
+        let mut release_docs: Vec<serde_yaml::Value> = Vec::new();
+        if let Some(dir) = &plan.manifests_dir {
+            let mut sources: Vec<String> = vec!["support.yaml".to_string()];
+            for t in &plan.targets {
+                sources.push(target_manifest_key(&t.deployment));
+            }
+            for key in sources {
+                // 读不到就是这一份没有：目标清单本来就是可选的（缺了走 set image
+                // 兜底），支撑包也可能是空的。真读不出来的那份会在它自己的 apply
+                // 上报得更准。
+                if let Ok(text) = tokio::fs::read_to_string(Path::new(dir).join(&key)).await {
+                    if let Ok(docs) = split_docs(&text, &key) {
+                        release_docs.extend(docs);
+                    }
+                }
+            }
+        }
+        if let Some(reason) = self.missing_reference_holds(&release_docs).await {
+            warn!(
+                shortfall = %reason,
+                "mainline rollout: holding this rollout before it starts; a workload references an \
+                 object that is neither in this release nor in the cluster, so the old pods stay \
+                 and the next round retries once the install face has created it"
+            );
+            return Err(RolloutFailure::at(
+                "precheck",
+                "",
+                FailureLocus::Reference,
+                true,
+                SFError::Config(reason),
+            ));
+        }
         // 支撑资源先于任何镜像变更就位：新二进制启动依赖的 RBAC/ConfigMap/
         // Service 若晚于滚动落地，新 Pod 会因缺依赖 crashloop 触发无谓回滚。
         // 失败直接中止，此时一个镜像都没动（线上原样）：清单确实坏就归版本类，
@@ -18559,6 +18761,61 @@ exit 0
         let secret = "kind: Secret\nmetadata:\n  name: s\n";
         let err = namespace_docs(secret, "secret.yaml").unwrap_err();
         assert!(err.to_string().contains("forbidden"), "{err}");
+    }
+
+    /// 引用面判据的纯半边：每一种按名读的写法都要被认出来（漏一种就是一次静默
+    /// 降级没被扣住），非工作负载 kind 一个字段都不许猜，而本次 apply 自带的那个
+    /// 对象要从引用集里减掉。
+    #[test]
+    fn unresolved_references_names_every_reference_the_apply_does_not_bring() {
+        // 网关零凭证那次的对象形状：env 按键读 + 卷按名挂 + envFrom 整份读。
+        let deps = "kind: Deployment\nmetadata:\n  name: cogneva-security-gateway\nspec:\n  template:\n    spec:\n      initContainers:\n        - name: init\n          envFrom:\n            - secretRef:\n                name: init-secrets\n      containers:\n        - name: gateway\n          env:\n            - name: TOKEN\n              valueFrom:\n                secretKeyRef:\n                  name: cogneva-secrets-oob\n                  key: github-token\n                  optional: true\n            - name: FLAGS\n              valueFrom:\n                configMapKeyRef:\n                  name: cogneva-json\n                  key: flags\n          envFrom:\n            - configMapRef:\n                name: gateway-config\n      volumes:\n        - name: key\n          secret:\n            secretName: git-key\n        - name: rules\n          configMap:\n            name: rules-cm\n        - name: projected\n          projected:\n            sources:\n              - secret:\n                  name: projected-secret\n              - configMap:\n                  name: projected-cm\n";
+        // 这一份自己带来的 ConfigMap 与它引用的那个：都不该进"待建"清单。
+        let brought = "kind: ConfigMap\nmetadata:\n  name: gateway-config\ndata: {}\n";
+        let docs = split_docs(&format!("{deps}---\n{brought}"), "release").unwrap();
+        let missing = unresolved_references(&docs);
+        let named: Vec<String> = missing.iter().map(|(k, n)| format!("{k}/{n}")).collect();
+        assert_eq!(
+            named,
+            vec![
+                "ConfigMap/cogneva-json",
+                "ConfigMap/projected-cm",
+                "ConfigMap/rules-cm",
+                "Secret/cogneva-secrets-oob",
+                "Secret/git-key",
+                "Secret/init-secrets",
+                "Secret/projected-secret",
+            ],
+            "every by-name read is named, and the ConfigMap this apply brings is not"
+        );
+
+        // CronJob 的模板在 jobTemplate 里：读错路径会让备份 Job 的引用整批消失。
+        let cron = "kind: CronJob\nmetadata:\n  name: cogneva-backup\nspec:\n  jobTemplate:\n    spec:\n      template:\n        spec:\n          containers:\n            - name: backup\n              env:\n                - name: TOKEN\n                  valueFrom:\n                    secretKeyRef:\n                      name: cogneva-secrets-oob\n                      key: github-token\n";
+        let cron_docs = split_docs(cron, "cron").unwrap();
+        assert_eq!(
+            unresolved_references(&cron_docs),
+            vec![("Secret".to_string(), "cogneva-secrets-oob".to_string())]
+        );
+
+        // 非工作负载 kind 的文档：就算里面有同名字段也不读，一个引用都不产出。
+        let svc = "kind: Service\nmetadata:\n  name: svc\nspec:\n  template:\n    spec:\n      containers:\n        - env:\n            - valueFrom:\n                secretKeyRef:\n                  name: not-a-reference\n";
+        let svc_docs = split_docs(svc, "svc").unwrap();
+        assert!(unresolved_references(&svc_docs).is_empty());
+    }
+
+    /// `unresolved_references` 的"自带"半边要认 metadata.name，不认 kind 之外的
+    /// 任何字段：同名的两个 kind 是两回事，名字错了就是一次误扣或一次漏扣。
+    #[test]
+    fn a_document_defines_an_object_by_kind_and_name_together() {
+        let docs = split_docs(
+            "kind: ConfigMap\nmetadata:\n  name: shared\n---\nkind: Deployment\nmetadata:\n  name: shared\n",
+            "release",
+        )
+        .unwrap();
+        let defined = defined_objects(&docs);
+        assert!(defined.contains(&("ConfigMap".to_string(), "shared".to_string())));
+        assert!(defined.contains(&("Deployment".to_string(), "shared".to_string())));
+        assert!(!defined.contains(&("Secret".to_string(), "shared".to_string())));
     }
 
     /// 真实事故向量：清单里写着 `defaultMode: 0400`，我们按 1.2 读成字符串、
