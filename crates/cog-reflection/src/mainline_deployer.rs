@@ -4819,7 +4819,17 @@ impl MainlineDeployer {
         self.ensure_source_at(&bare).await?;
 
         // 2. cargo build --release（target/ 在 source PVC 上增量缓存）。
-        self.build_binary(&bare).await?;
+        //
+        // 时长在 `?` 之前落：编译失败的那一轮同样要计进读数，一旦 `?` 早退这一格
+        // 就只剩成功的那些轮，`failed` 那格永远空着——一个只写成功侧的读数把"构建
+        // 一直很快"和"失败的构建从不被记录"读成同一件事。成/败分开（见
+        // `record_build_seconds`）：失败的编译往往几秒就退，混进成功的分位数会把整
+        // 条分布往下拽。
+        let build_started = std::time::Instant::now();
+        let build_outcome = self.build_binary(&bare).await;
+        self.record_build_seconds(build_started.elapsed().as_secs_f64(), build_outcome.is_ok())
+            .await;
+        build_outcome?;
         state.in_flight = Some(InFlight {
             rev: bare.clone(),
             phase: Phase::Built,
@@ -5065,6 +5075,34 @@ impl MainlineDeployer {
             )
             .await;
         Ok(())
+    }
+
+    /// 一轮主线的 `cargo build --release` 花了多久，按 `outcome` 分格。
+    ///
+    /// gauge 而非 histogram：store 的直方图桶界按名字派生，两套上界分别只到
+    /// 65.5s（`_ms`）和 16.4s（其余），而一次编译要几分钟——直方图会把每次观测都
+    /// 塞进溢出桶，发出一条恒等于上界的分位数。gauge 存得住这个值，样本日志就是
+    /// 面板要的历史。
+    ///
+    /// 不按 rev 打标签：一个 rev 只构建一次，一个 rev 一条永久序列，描述的是只属于
+    /// 它自己那一轮的值。写失败只吞掉、不向上抛——这一格是观测面，缺它不该让一次
+    /// 已经编译成功的推进折在这里。
+    async fn record_build_seconds(&self, seconds: f64, ok: bool) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let mut labels = std::collections::HashMap::new();
+        labels.insert(
+            "outcome".to_string(),
+            if ok { "ok" } else { "failed" }.to_string(),
+        );
+        let _ = metrics
+            .record_gauge(
+                cog_core::metric_names::MAINLINE_BUILD_SECONDS,
+                seconds,
+                labels,
+            )
+            .await;
     }
 
     /// buildah 叠层：FROM 当前在跑 tag → 换二进制 + migrations → --version

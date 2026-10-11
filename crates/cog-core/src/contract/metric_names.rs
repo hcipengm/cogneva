@@ -616,6 +616,28 @@ metric_names! {
     // round from one that is idle and from one that is dead (a dead loop moves
     // neither cell, and the tick age is the reading that names it).
     MAINLINE_POLL_CYCLES_TOTAL => "cogneva_mainline_poll_cycles_total",
+    // How long the round's `cargo build --release` took, in seconds, by
+    // `outcome` (`ok` when it returned a binary, `failed` when it gave up). One
+    // gauge per outcome holding the build that finished most recently.
+    //
+    // A gauge and not a histogram: the store derives a histogram's bucket
+    // bounds from the series name, and the two schemes it has top out at 65.5s
+    // (`_ms`) and 16.4s (everything else). A multi-minute compile lands wholly
+    // in the `+Inf` bucket under either, so a histogram here would publish a
+    // distribution with no information in it and a quantile that is always the
+    // top bound -- a reading that looks alive and says nothing. The gauge holds
+    // the value the store can always represent, and the sample log over it is
+    // the history a panel draws; the alert reads the current value against the
+    // declared bound.
+    //
+    // No label per revision: a revision is built once, so a series per revision
+    // would leave one permanent row per build for a value that describes
+    // exactly one of them. `outcome` is bounded and is kept because the two are
+    // different readings -- a build that failed within seconds on a compile
+    // error and one that ran the full compile must not be compared against the
+    // same bound, or a run of early failures reads as the compiler getting
+    // faster.
+    MAINLINE_BUILD_SECONDS => "cogneva_mainline_build_seconds",
 
     // cog-gateway — request accounting.
     HTTP_REQUESTS_TOTAL => "http_requests_total",

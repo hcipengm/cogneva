@@ -1170,6 +1170,22 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          reclaim that has just completed, which is exactly the window in which \
          the store should have been reclaimed",
     ),
+    (
+        crate::metric_names::MAINLINE_BUILD_SECONDS.as_str(),
+        "Duration in seconds of the most recent round's `cargo build --release`, \
+         by `outcome`. The poll-cycles counter beside it answers whether the \
+         loop is cycling; this answers how much of a round the host spent \
+         compiling, which no other series publishes -- the rollout-job ratios \
+         describe the dispatched Job, and the build happens on the host before \
+         any Job exists. It is a gauge and not a histogram because the store's \
+         bucket schemes top out at 65.5s and a compile runs for minutes, so a \
+         histogram would hold every observation in its overflow bucket and \
+         publish a quantile that is always the top bound. Read the `ok` cell: a \
+         build whose duration climbs toward the host's disk ceiling is what a \
+         rollout-stalling round shows before it stalls, and `failed` is a \
+         reading of its own -- a compile that gave up in seconds is not a fast \
+         build",
+    ),
 ];
 
 /// The description registered for one series, if it has one.
