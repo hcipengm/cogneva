@@ -949,11 +949,7 @@ impl BuildGate {
     }
 
     fn persisted_bound(&self) -> Option<usize> {
-        std::fs::read_to_string(self.bound_path())
-            .ok()?
-            .trim()
-            .parse()
-            .ok()
+        read_gate_file(&self.bound_path())?.trim().parse().ok()
     }
 
     /// Writes the derived bound where every process on the host reads it.
@@ -963,7 +959,7 @@ impl BuildGate {
     /// gate pretending the host was measured into a number nobody can read.
     fn persist_bound(&self, bound: usize) {
         let path = self.bound_path();
-        if let Err(e) = std::fs::write(&path, format!("{bound}\n")) {
+        if let Err(e) = write_gate_file(&path, &format!("{bound}\n")) {
             tracing::warn!(
                 path = %path.display(),
                 error = %e,
@@ -986,13 +982,7 @@ impl BuildGate {
     #[cfg(unix)]
     fn take_controller_lock(&self) -> bool {
         use std::os::unix::io::AsRawFd;
-        let Ok(file) = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(self.dir.join(CONTROLLER_FILE))
-        else {
+        let Some(file) = open_gate_file(&self.dir.join(CONTROLLER_FILE), true) else {
             return false;
         };
         // SAFETY: as in `lock_slot` — flock touches only this process's
@@ -1115,7 +1105,7 @@ impl BuildGate {
         let since = unix_now();
         let path = self.dir.join(RESERVE_FILE);
         let previous = self.reservation().map(|(holder, _)| holder);
-        if let Err(e) = std::fs::write(&path, format!("{what}\t{since}\n")) {
+        if let Err(e) = write_gate_file(&path, &format!("{what}\t{since}\n")) {
             tracing::warn!(
                 what,
                 path = %path.display(),
@@ -1135,7 +1125,7 @@ impl BuildGate {
 
     /// The claim on the next build, when there is a fresh one.
     fn reservation(&self) -> Option<(String, u64)> {
-        let text = std::fs::read_to_string(self.dir.join(RESERVE_FILE)).ok()?;
+        let text = read_gate_file(&self.dir.join(RESERVE_FILE))?;
         let mut fields = text.trim().splitn(2, '\t');
         let what = fields.next()?.to_string();
         let since: u64 = fields.next()?.parse().ok()?;
@@ -1591,7 +1581,7 @@ fn read_holder_at(path: &Path) -> Option<(Holder, std::time::Duration)> {
     use std::io::Read;
     use std::os::unix::io::AsRawFd;
 
-    let file = std::fs::OpenOptions::new().read(true).open(path).ok()?;
+    let file = open_gate_file(path, false)?;
     // SAFETY: as in `lock_slot` — flock touches only this process's descriptor
     // table for a descriptor this scope owns, and EWOULDBLOCK is the expected
     // answer.
@@ -1717,6 +1707,83 @@ fn lock_claim_exclusive(_dir: &Path) -> Option<std::fs::File> {
 
 /// Locks a file in the slot directory, creating it if it is not there yet.
 ///
+/// Opens one of the gate's own files in the shared slot directory, refusing to
+/// follow a symbolic link and refusing anything that is not a regular file.
+///
+/// The directory is writable by *every* builder, and the builders are not all the
+/// same user: one of them runs as an unprivileged user while the process that
+/// writes the bound runs as root. A name in here is therefore something that side
+/// can plant. A link at one of these names would send the next writer's bytes
+/// wherever it pointed — and for the bound that writer is the privileged side — while
+/// a fifo at a name that is read would make the reader wait forever. `O_NOFOLLOW`
+/// refuses the link outright and the metadata check refuses everything that is not
+/// a file, so neither shape is reachable rather than merely survived.
+#[cfg(unix)]
+fn open_gate_file(path: &Path, write: bool) -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(!write)
+        .write(write)
+        .create(write)
+        .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .ok()?;
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
+/// The contents of one of the gate's files, or nothing when it is absent, is not
+/// a regular file, or is a link.
+#[cfg(unix)]
+fn read_gate_file(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut file = open_gate_file(path, false)?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).ok()?;
+    Some(text)
+}
+
+/// Replaces one of the gate's files by writing a sibling and renaming it over the
+/// name.
+///
+/// The rename is what closes the last way a planted name could matter: a rename
+/// replaces whatever sits at the destination instead of writing through it, so a
+/// link left at the name is replaced by a regular file rather than followed. The
+/// sibling carries this process's id because two works waiting on the next build
+/// claim it at once and neither may read the other's half-written line; it is
+/// hidden and pid-suffixed rather than shared so that the rename is always the
+/// only thing that decides the contents at the name.
+#[cfg(unix)]
+fn write_gate_file(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = path.with_file_name(format!(".{name}.{}", std::process::id()));
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&tmp)?;
+        file.write_all(text.as_bytes())?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
+#[cfg(not(unix))]
+fn read_gate_file(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path).ok()
+}
+
+#[cfg(not(unix))]
+fn write_gate_file(path: &Path, text: &str) -> std::io::Result<()> {
+    std::fs::write(path, text)
+}
+
 /// Creating is how a bound that rose takes effect: the slots above the bound that
 /// existed when the directory was made are files nobody has written yet, and the
 /// first build to reach one makes it. Lowering the bound never removes a file —
@@ -1724,13 +1791,7 @@ fn lock_claim_exclusive(_dir: &Path) -> Option<std::fs::File> {
 /// would hand the next arrival a second lock on the same slot.
 #[cfg(unix)]
 fn file_lock(path: &Path, how: libc::c_int) -> Option<std::fs::File> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-        .ok()?;
+    let file = open_gate_file(path, true)?;
     use std::os::unix::io::AsRawFd;
     // SAFETY: flock only touches the descriptor table of this process for a
     // descriptor this scope owns; EWOULDBLOCK is the expected "someone else has
@@ -2231,6 +2292,64 @@ mod tests {
         assert_eq!(
             persisted, slots,
             "what is enforced is what is written down for the rest of the host"
+        );
+    }
+
+    /// The directory is writable by every builder, and not all of them are the
+    /// same user, so a name in it is something the other side can plant. A link
+    /// at the name the bound is written to would have the privileged writer put
+    /// the bound wherever the link pointed; the write replaces the name instead
+    /// of following it.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_at_the_bounds_name_is_replaced_not_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"untouched\n").unwrap();
+        let bound_path = dir.path().join(BOUND_FILE);
+        std::os::unix::fs::symlink(&victim, &bound_path).unwrap();
+
+        write_gate_file(&bound_path, "3\n").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "untouched\n",
+            "the file the link pointed at is not where the bound goes"
+        );
+        assert_eq!(
+            read_gate_file(&bound_path).as_deref(),
+            Some("3\n"),
+            "the bound is at its own name after the write"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&bound_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the name holds the bound itself, not a link to it"
+        );
+    }
+
+    /// A link is not followed on the way in either: read as its target, a link
+    /// would let the unprivileged side choose the bound the privileged side
+    /// enforces — a file it can write is a file it can point the bound at.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_where_the_bound_is_read_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"99\n").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join(BOUND_FILE)).unwrap();
+
+        assert!(
+            read_gate_file(&dir.path().join(BOUND_FILE)).is_none(),
+            "a link is not a bound"
+        );
+        let gate = derived_gate(dir.path(), 0);
+        assert_eq!(
+            gate.bound(),
+            1,
+            "a link at the bound's name leaves the host unmeasured, not bounded at the target's number"
         );
     }
 
