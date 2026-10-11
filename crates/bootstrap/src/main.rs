@@ -1986,18 +1986,41 @@ fn helm_ownership_patch() -> String {
 
 /// 从 apply 投递切到 helm 之前，给已存在的 cogneva 对象补归属标记。
 ///
-/// 只可能是**命名空间**：命名空间里的任何对象（工作负载、ConfigMap、Secret、PVC、
-/// Service…）都会让 `existing_cogneva_objects` 命中而停在 apply 投递，走不到 helm
-/// 这条路上来——这条推理成立的前提是那个探测面覆盖了命名空间里全部对象种类
-/// （`TRACE_KINDS`，由 `install_trace_tests` 钉住）。命名空间本身不在那个读数里
-/// （它不是命名空间内的对象），而 chart 自己渲染 Namespace，复用一个上一次 apply
-/// 建的、或使用者手建的命名空间时 helm 会因它"存在但无归属标记"而拒绝 install。
-/// 对象不存在（绿地安装）是正常路径；其它失败要说出来，否则后续 helm 接管失败时
-/// 无从知道是标记没打上。
-async fn ensure_helm_ownership() -> Result<()> {
+/// 补标的面有**两个**，不是一个：
+///
+/// - **命名空间本身**：chart 自己渲染 Namespace，复用一个上一次 apply 建的、或使用者
+///   手建的命名空间时 helm 会因它"存在但无归属标记"而拒绝。命名空间不在
+///   `existing_cogneva_objects` 的读数里（它不是命名空间内的对象），所以这一件必须
+///   单独补。
+/// - **渲染清单里的每个对象**：库里的对象也会缺标记，条件是 **release 先存在、对象
+///   后到**——演化部署器的 `kubectl apply`、上一轮的预渲染 apply、或手敲，都在 release
+///   之外建对象。此时 `detect_delivery` 先看 release、照旧选 helm（release 生命周期
+///   不能被 apply 接管），而 helm 4 拒绝接管任何"存在但没带三件套"的对象，升级当场
+///   被拒、一个对象都没动。2026-10-11 实测就是这么卡住的：6 个对象（两个
+///   NetworkPolicy、两个 host-ledger、一个 audit Service、一个 git-mirror PVC）由部署面
+///   建出来、不带 release 标记，`helm upgrade` 直接失败。
+///
+/// 早先只补命名空间，依据的是一条**顺序假设**——"命名空间里有对象就说明还没建 release，
+/// 探测会停在 apply"。它只在对象全部先于 release 出现时成立；release 先建、对象后到就
+/// 破了，而那恰恰是"装完之后再演化"的常态，Cogneva 自己的部署器正是"后到"的那一类。
+///
+/// 补标的范围取**渲染清单里的对象**而不是命名空间里的全部对象：helm 只校验新清单里
+/// 已有的对象，清单外的对象本就不该被这个 release 接管（例如 init-secrets.sh 建的
+/// Secret 在 `secrets.create=false` 时并不随 chart 走）。渲染拿不到（`None`）时只补
+/// 命名空间——绿地路径本来就一个对象都不存在，其余情况交付自己的报错更准确。
+/// 补标用 merge patch，对象不存在时 kubectl 报 NotFound，按正常路径跳过。
+async fn ensure_helm_ownership(rendered: Option<&str>) -> Result<()> {
     let patch = helm_ownership_patch();
+    let mut targets: Vec<String> = vec!["namespace/cogneva".to_string()];
+    if let Some(text) = rendered {
+        for id in rendered_object_ids(text)? {
+            if !targets.contains(&id) {
+                targets.push(id);
+            }
+        }
+    }
     let mut targeted = 0;
-    for kind in ["namespace/cogneva"] {
+    for kind in &targets {
         let out = Command::new("kubectl")
             .args(["patch", kind, "-n", "cogneva", "--type=merge", "-p", &patch])
             .stdin(Stdio::null())
@@ -2019,6 +2042,33 @@ async fn ensure_helm_ownership() -> Result<()> {
         info!("已为 {targeted} 个既有对象补 helm 归属标记（managed-by=Helm / release=cogneva）");
     }
     Ok(())
+}
+
+/// 渲染文本里每个文档的 `kind/name`（kind 一律小写，kubectl 认），用于补归属标记。
+///
+/// 读不出来的文档不跳过而是整体失败，与 `clear_superseded_env_values` 同一个理由：
+/// `serde_yaml` 出错时交回的迭代项不推进游标，一次 `continue` 就是永不返回的循环。
+/// 这份文本是 helm 刚渲染成功交给我们的，读不出来是我们自己的问题，不该静默少补几个
+/// 对象——少补的后果是 helm 升级在一个没说出口的对象上被拒。
+fn rendered_object_ids(text: &str) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for doc in serde_yaml::Deserializer::from_str(text) {
+        let doc =
+            serde_yaml::Value::deserialize(doc).with_context(|| "清单里有读不出来的 YAML 文档")?;
+        let desired = serde_json::to_value(&doc)
+            .with_context(|| "清单文档无法表达成 JSON（如非字符串键）")?;
+        let (Some(kind), Some(name)) = (
+            desired.get("kind").and_then(|v| v.as_str()),
+            desired
+                .get("metadata")
+                .and_then(|m| m.get("name"))
+                .and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        out.push(format!("{}/{}", kind.to_lowercase(), name));
+    }
+    Ok(out)
 }
 
 /// helm 客户端版本的唯一权威源。安装期按它下载 helm，CI 的部署 parity /
@@ -2393,25 +2443,25 @@ async fn deploy_via_helm(profile: Profile) -> Result<()> {
     args.extend(common.iter().cloned());
     args.push("--create-namespace".into());
 
-    // chart 自己渲染 Namespace，所以复用一个已存在的命名空间（上一次 apply 建的、
-    // 或使用者手建的）时，helm 会因为该对象"存在但无归属标记"而拒绝 install。
-    // 先补标记再交付：这类对象是同一套清单建的，本来就该由本 release 接管。
-    ensure_helm_ownership().await?;
-    // 交付前先渲染一遍：清单与对象现状之间有类**交付本身清不掉**的差异——最典型
-    // 的是 env 从字面量改成 valueFrom 后对象上残留的 value（详见
-    // clear_superseded_env_values）。渲染只是拿来做这件事，不替代交付。
-    // 渲染失败不当门禁：交付自己的报错更准确，这里只少一次清理。
-    match helm_render(&common).await {
-        Ok(text) => {
-            let cleared = clear_superseded_env_values(&text).await?;
-            if cleared > 0 {
-                info!(
-                    count = cleared,
-                    "cleared env values the chart injects from the Secret"
-                );
-            }
+    // 交付前先渲染一遍：既给残留 env 清理提供"将交付什么"的事实——最典型的是 env
+    // 从字面量改成 valueFrom 后对象上残留的 value（详见 clear_superseded_env_values）
+    // ——也给归属补标提供"这个 release 会接管哪些对象"。渲染失败不当门禁：交付自己的
+    // 报错更准确，这里只少一次清理与一次补标。
+    let rendered = helm_render(&common).await;
+    if let Err(e) = &rendered {
+        warn!("helm template 预渲染失败，跳过残留 env 清理: {e}");
+    }
+    // 补归属标记必须在交付**之前**：库里已有、却缺 release 三件套的对象会让 helm
+    // 拒绝升级（详见 ensure_helm_ownership）。
+    ensure_helm_ownership(rendered.as_deref().ok()).await?;
+    if let Ok(text) = &rendered {
+        let cleared = clear_superseded_env_values(text).await?;
+        if cleared > 0 {
+            info!(
+                count = cleared,
+                "cleared env values the chart injects from the Secret"
+            );
         }
-        Err(e) => warn!("helm template 预渲染失败，跳过残留 env 清理: {e}"),
     }
     info!(
         "helm 投递 {} profile（upgrade --install，幂等）",
@@ -3328,6 +3378,22 @@ mod cn_image_tests {
             meta["annotations"]["meta.helm.sh/release-namespace"],
             "cogneva"
         );
+    }
+
+    /// 补标清单必须把渲染文本里**每个带 kind/name 的文档**都读出来，且 kind 与
+    /// kubectl 的拼法一致（小写）：漏一个就少补一个对象，而少补的那一个正是
+    /// helm 升级会拒绝接管的那个——报错只说"归属校验失败"，指不到这里。
+    #[test]
+    fn rendered_object_ids_reads_every_document_kind_and_name() {
+        let manifest = "---\napiVersion: v1\nkind: Namespace\nmetadata:\n  name: cogneva\n---\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: cogneva-sandbox-executor-egress\n  namespace: cogneva\n---\n# 只有注释的文档：跳过，不是失败\n---\napiVersion: v1\nkind: Service\nmetadata:\n  labels:\n    app: x\n";
+        let ids = super::rendered_object_ids(manifest).expect("读得出每个文档");
+        assert!(ids.contains(&"namespace/cogneva".to_string()), "{ids:?}");
+        assert!(
+            ids.contains(&"networkpolicy/cogneva-sandbox-executor-egress".to_string()),
+            "{ids:?}"
+        );
+        // 没有 metadata.name 的文档读不出对象身份，跳过而不是猜一个。
+        assert_eq!(ids.len(), 2, "只有两个文档有名字：{ids:?}");
     }
 }
 
