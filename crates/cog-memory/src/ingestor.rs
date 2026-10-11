@@ -171,9 +171,9 @@ struct UnextractedScan {
     /// 一份也不该有——这里出现非零，说明有一条写入路径**绕过了**闸门（例如
     /// 直写后端的归档调用），那是要有人看一眼的事，不是一条自愈的欠账。
     ///
-    /// 有一处判不到的余量：老过重驱动窗的那些只按 id 入列、取回来才判，所以
-    /// 被排除的老 raw 仍会留在 `aged_out_total` 里（它确实还欠着一次抽取，
-    /// 只是按策略永远不会有），本拍取到的那部分才会从补驱动里去掉。
+    /// 老过重驱动窗的那些按 id 入列、轮到本拍批量取回来才判，所以一条被排除的
+    /// 老 raw 在轮到它之前仍算在 `aged_out_total` 里；轮到的那拍起它连欠账一起
+    /// 退出——既不补驱动，也不再占那条读数（见 `collect_unextracted`）。
     excluded: usize,
 }
 
@@ -759,6 +759,9 @@ impl MemoryIngestor {
         tokio::spawn(async move {
             info!("MemoryIngestor started");
             inner.pull_gate.seed_gate_holders().await;
+            // 与总线路径同一条契约：会写的 `memory_operations_total` 各格先按 0 发出去。
+            // 缺席的格子让 increase() 返回空而不是 0，读数分不清「这拍没补」与「序列不在」。
+            inner.seed_operation_cells().await;
             if inner.config.startup_reconcile {
                 // 与周期对账同一条判据：扫描照跑（它是纯 SQL 加对象存储读，
                 // 产出的是积压量这个观测），闸门关着就只报不入队——往一个已知
@@ -1548,7 +1551,7 @@ impl MemoryIngestor {
         // 陈年残留。排序键取 id 里的归档时刻，不取 `list_raw` 的顺序——那是按
         // agent 名前缀排的，与年龄无关。
         debt.sort_by_key(|id| std::cmp::Reverse(raw_id_timestamp(id)));
-        let aged_out_total = debt.len();
+        let mut aged_out_total = debt.len();
         let due_take = self.config.aged_out_redrive_batch.min(debt.len());
         let mut aged_out_due = Vec::with_capacity(due_take);
         for id in debt.drain(..due_take) {
@@ -1557,6 +1560,13 @@ impl MemoryIngestor {
                 // 的那些每拍最多花掉这个上限次读，且不会进欠账。
                 if self.config.benchmark_isolation.refusal(&raw).is_some() {
                     excluded += 1;
+                    // 「不进欠账」要连读数一起成立：排除面里的 raw 永远不会有
+                    // summary（准入闸门在归档之前，它落进归档只说明有写入路径绕过
+                    // 了闸门），留在 aged_out_total 里就是一条每拍都报、却永远还
+                    // 不了的账——三个读数分不出「停着不还」与「无可还」，而读它的
+                    // 告警只会按前者响。它只在这一拍被取回来时才判得到，所以计到
+                    // 这里为止，本拍起退出欠账。
+                    aged_out_total -= 1;
                     continue;
                 }
                 aged_out_due.push(raw);
@@ -4117,5 +4127,42 @@ mod tests {
             "an excluded raw must not be re-driven: re-driving it every round would make a single \
              smuggled row read as ongoing traffic"
         );
+    }
+
+    /// 回归（memory_raw_backlog_aged_out）：老过重驱动窗的排除面 raw 永远不会
+    /// 有 summary，若它被取回判明之后仍留在 aged_out_total 里，那条读数就每拍
+    /// 都站着、而 aged_out_redrive 恒为 0——读数分不出「停着不还」与「无可还」，
+    /// 告警只会按前者响。判明的那拍起，它必须连欠账一起退出。
+    #[tokio::test]
+    async fn an_aged_out_excluded_raw_leaves_the_debt_once_judged() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        let now = Utc::now();
+        backend
+            .archive_raw(&RawSource::new(
+                bounded_raw_id("agent", "smuggled", now - chrono::Duration::hours(48)),
+                "default",
+                "conversation/transcript",
+                CANARY_MARKER.as_bytes().to_vec(),
+            ))
+            .await
+            .unwrap();
+        let metrics = Arc::new(RecordingMetrics::default());
+        let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(RuleBasedExtractor::new()))
+            .with_metrics(metrics.clone())
+            .with_config(MemoryIngestorConfig {
+                benchmark_isolation: isolation(&[], &[CANARY_MARKER]),
+                ..quick_retry_config()
+            });
+
+        let (job_tx, mut job_rx) = mpsc::unbounded_channel();
+        let backlog = std::sync::atomic::AtomicUsize::new(0);
+        ingestor.reconcile(&job_tx, &backlog, true).await;
+
+        assert_eq!(
+            metrics.latest("memory_unextracted_raw_aged_out"),
+            Some(0.0),
+            "a raw that can never be summarized must stop standing as aged-out debt"
+        );
+        assert!(job_rx.try_recv().is_err(), "and it must not be re-driven");
     }
 }

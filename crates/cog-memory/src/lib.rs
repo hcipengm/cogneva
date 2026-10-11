@@ -10,7 +10,8 @@
 //! - [`MemoryIngestor`]: 后台服务，监听 AgentEvent 自动触发摄取
 //! - **CompositeMemoryBackend** — 组合后端
 //! - **MetricsInstrumentedMemoryBackend** — 指标装饰器
-//! - **记忆维护循环**（[`maintenance`]）— 周期衰减低价值记忆的驱动方
+//! - **记忆维护循环**（[`maintenance`]）— 周期衰减低价值记忆的驱动方；
+//!   「归档必有抽取」的对账补驱动归 [`ingestor`]（启动与周期 reconcile）
 
 pub mod backend;
 pub mod causal;
