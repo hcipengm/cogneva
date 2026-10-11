@@ -204,44 +204,52 @@ fn estimate_goal_tokens(req: &CreateTaskRequest) -> u64 {
 
 /// 把一次提交展开成进 DAG 的初始任务。
 ///
-/// 显式给出的任务带着客户端的 `goal_id` 原样下去。**裸 goal（`tasks` 缺省）也必须有一条
-/// 承载 `goal_id` 的行**：分解在协调器里是从 `tasks.first()` 取 goal_id 的，一个空的
+/// 显式给出的任务带着客户端的 `goal_id` 原样下去。**裸 goal（没有任何可执行行）也必须
+/// 有一条承载 `goal_id` 的行**：分解在协调器里是从 `tasks.first()` 取 goal_id 的，一个空的
 /// `tasks` 会让它当场另生成一个 uuid，客户端拿到的 goal_id 就永远匹配不到任何行——
 /// `?goal_id=` 恒空，那条「按下发的 goal 找回它派生的那批任务」的路等于没建。
+///
+/// 判据是「展开后一条可执行行都没有」，**不是**「`tasks` 字段缺席」：显式 `tasks: []` 与
+/// 缺省一样落到这里——两者都表示「这是一次要平台自己规划的裸 goal」，不能一条行都不给。
 ///
 /// 合成的这条 goal 行（id 与 goal_id 都取客户端那一个）交下去后，由协调器存成占位行
 /// （分解成功）或 Failed 行（分解没产出），返回值本身因此就是可寻址的那一行。
 /// 它设 `is_executable=false`：它是这次目标的标记，不是活——不接 planner 的回退路径
-/// 也不该把它当任务调度出去。
+/// 也不该把它当任务调度出去（协调器组 hints 时按这个键把它排除在规划输入之外）。
 fn submitted_tasks(req: &CreateTaskRequest, goal_id: &str) -> Vec<Task> {
-    match req.tasks.as_ref() {
-        Some(items) => items
-            .iter()
-            .map(|item| {
-                let mut task = Task::new(
-                    item.id.clone(),
-                    parse_task_type(&item.task_type),
-                    item.input.clone(),
-                );
-                task.blocked_by = item.blocked_by.clone();
-                task.priority = item.priority;
-                task.workspace_id = Some(req.workspace_id.clone());
-                task.goal_id = Some(goal_id.to_string());
-                task
-            })
-            .collect(),
-        None => {
-            let mut goal_row = Task::new(
-                goal_id.to_string(),
-                TaskType::Custom("goal".into()),
-                serde_json::json!({ "goal": req.goal }),
-            );
-            goal_row.workspace_id = Some(req.workspace_id.clone());
-            goal_row.goal_id = Some(goal_id.to_string());
-            goal_row.is_executable = false;
-            vec![goal_row]
-        }
+    let mut rows: Vec<Task> = req
+        .tasks
+        .as_ref()
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    let mut task = Task::new(
+                        item.id.clone(),
+                        parse_task_type(&item.task_type),
+                        item.input.clone(),
+                    );
+                    task.blocked_by = item.blocked_by.clone();
+                    task.priority = item.priority;
+                    task.workspace_id = Some(req.workspace_id.clone());
+                    task.goal_id = Some(goal_id.to_string());
+                    task
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if rows.is_empty() {
+        let mut goal_row = Task::new(
+            goal_id.to_string(),
+            TaskType::Custom("goal".into()),
+            serde_json::json!({ "goal": req.goal }),
+        );
+        goal_row.workspace_id = Some(req.workspace_id.clone());
+        goal_row.goal_id = Some(goal_id.to_string());
+        goal_row.is_executable = false;
+        rows.push(goal_row);
     }
+    rows
 }
 
 pub async fn create_task_handler(
@@ -909,5 +917,23 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, "case-1");
         assert_eq!(tasks[0].goal_id.as_deref(), Some("goal-9"));
+    }
+
+    /// 显式空数组 `tasks: []` 与字段缺省是同一件事：没有可执行行 ⇒ 裸 goal，
+    /// 同样要有一条承载 id 的 goal 行。按「字段缺席」判就会漏掉这一条，`?goal_id=` 又变恒空。
+    #[test]
+    fn an_explicit_empty_task_list_is_the_same_bare_goal() {
+        let req = CreateTaskRequest {
+            goal_id: Some("goal-empty".into()),
+            goal: "plan this for me".into(),
+            tasks: Some(vec![]),
+            workspace_id: "ws".into(),
+            priority: None,
+        };
+        let tasks = submitted_tasks(&req, "goal-empty");
+        assert_eq!(tasks.len(), 1, "an empty array is still a bare goal");
+        assert_eq!(tasks[0].id, "goal-empty");
+        assert_eq!(tasks[0].goal_id.as_deref(), Some("goal-empty"));
+        assert!(!tasks[0].is_executable);
     }
 }

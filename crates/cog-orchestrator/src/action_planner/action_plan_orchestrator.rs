@@ -729,13 +729,20 @@ impl ActionPlanOrchestrator {
         // configured bound; hard errors still propagate immediately for
         // stream redelivery.
         let attempts = self.decomposition_max_attempts.max(1);
+        // Only executable rows are hints. A non-executable row is the goal's own
+        // identity/aggregation marker, not a work item to plan around: feeding it
+        // to the planner would echo an idle goal row back into the prompt and —
+        // because the stable decompose id rides `hints.first()` — would also
+        // re-key the intent chain on a fresh per-submission id. A goal that
+        // carries no executable row must decompose exactly as "no hints".
+        let hint_tasks: Vec<Task> = tasks.iter().filter(|t| t.is_executable).cloned().collect();
         let mut plan = None;
         for attempt in 1..=attempts {
-            let candidate = if !tasks.is_empty() {
-                self.decompose_goal(goal, skill_registry, Some(&tasks))
-                    .await?
-            } else {
+            let candidate = if hint_tasks.is_empty() {
                 self.decompose_goal(goal, skill_registry, None).await?
+            } else {
+                self.decompose_goal(goal, skill_registry, Some(&hint_tasks))
+                    .await?
             };
             if candidate.tasks.is_empty() {
                 tracing::warn!(
@@ -1911,6 +1918,39 @@ mod tests {
         }
     }
 
+    /// 同 `ScriptedAtomicExecutor`，但记下每次被交进来的规划任务（id + input），
+    /// 好断言「哪些行被当成了 planner 的 hint、分解 id 用了什么身份」。
+    #[derive(Default)]
+    struct RecordingAtomicExecutor {
+        replies: std::sync::Mutex<Vec<Vec<AtomicTask>>>,
+        seen: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TaskExecutor for RecordingAtomicExecutor {
+        fn supports(&self, _task_type: &TaskType) -> bool {
+            true
+        }
+
+        async fn execute(&self, task: &Task) -> SFResult<TaskResult> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((task.id.clone(), task.input.clone()));
+            let mut guard = self.replies.lock().unwrap();
+            let atomic_tasks = if guard.len() > 1 {
+                guard.remove(0)
+            } else {
+                guard.first().cloned().unwrap_or_default()
+            };
+            Ok(TaskResult {
+                success: true,
+                output: serde_json::json!({ "atomic_tasks": atomic_tasks }),
+                metadata: TaskResultMetadata::new("mock").with_score(0.85),
+            })
+        }
+    }
+
     #[derive(Default)]
     struct RecordingAlertSink {
         calls: std::sync::Mutex<Vec<(bool, String, String)>>,
@@ -2055,6 +2095,85 @@ mod tests {
         assert_eq!(child.parent_task_id.as_deref(), Some("sig-alert-2"));
         assert_eq!(child.goal_id, parent.goal_id);
         assert!(sink.calls.lock().unwrap().is_empty());
+    }
+
+    /// 非可执行的 goal 行不是 hint：它只是这次目标的标记，不该进规划输入。
+    /// 若它当 hint 进去，除了让模型看到一个空转的 goal 行，还会因为分解 id 骑
+    /// `hints.first()` 而被一个每次提交都新的 id 重新定身份——同一意图裂成新链。
+    #[tokio::test]
+    async fn a_non_executable_row_is_not_a_planner_hint() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-goal-row-hint".to_string()));
+        let exec = Arc::new(RecordingAtomicExecutor {
+            replies: std::sync::Mutex::new(vec![vec![atomic_task("child-1")]]),
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(exec.clone())
+            .with_dag_executor(dag.clone())
+            .with_decomposition_max_attempts(1);
+
+        let registry = SkillRegistry::new();
+        let mut goal_row = hint_task("goal-row-1");
+        goal_row.is_executable = false;
+        planner
+            .process_goal_impl("plan this for me", vec![goal_row], &registry)
+            .await
+            .expect("decomposes");
+
+        // 该行仍要被存成占位（既有行为不变），只是不进 hints。
+        let stored = dag.get_task("goal-row-1").await.unwrap();
+        assert!(!stored.is_executable);
+        assert_eq!(stored.status, cog_core::TaskStatus::Pending);
+
+        let seen = exec.seen.lock().unwrap();
+        let (decompose_id, input) = seen.last().expect("the planner ran");
+        assert!(
+            input.get("hints").is_none(),
+            "a non-executable goal row is a marker, not a work item to plan around: {input}"
+        );
+        // 身份必须与「无 hints」逐字一致，否则同一意图每提交一次就换一条链。
+        assert_eq!(
+            decompose_id,
+            &ActionPlanOrchestrator::decompose_task_id("plan this for me", None),
+            "the goal row must not re-key the decompose identity"
+        );
+    }
+
+    /// 反向对照：真正可执行的行仍要作为 hint 进规划输入，且分解 id 取它的稳定 id。
+    /// 少了这一条，上面那个断言对一个「hints 永远为空」的实现也会绿。
+    #[tokio::test]
+    async fn an_executable_row_still_reaches_the_planner_as_a_hint() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-goal-row-hint-pos".to_string()));
+        let exec = Arc::new(RecordingAtomicExecutor {
+            replies: std::sync::Mutex::new(vec![vec![atomic_task("child-1")]]),
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(exec.clone())
+            .with_dag_executor(dag.clone())
+            .with_decomposition_max_attempts(1);
+
+        let registry = SkillRegistry::new();
+        let hint = hint_task("issue-77");
+        planner
+            .process_goal_impl("fix it", vec![hint.clone()], &registry)
+            .await
+            .expect("decomposes");
+
+        let seen = exec.seen.lock().unwrap();
+        let (decompose_id, input) = seen.last().expect("the planner ran");
+        let hints = input
+            .get("hints")
+            .and_then(|h| h.as_array())
+            .expect("an executable row is a hint");
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0]["id"], "issue-77");
+        assert_eq!(
+            decompose_id,
+            &ActionPlanOrchestrator::decompose_task_id("fix it", Some(std::slice::from_ref(&hint))),
+        );
     }
 
     #[tokio::test]
