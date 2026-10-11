@@ -95,6 +95,17 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["role"],
         "crates/cog-agent/src/observable.rs",
     ),
+    // Of those cut-offs, the ones that ended with no answer at all. A sibling
+    // series rather than a label on the one above, because it answers a
+    // different question: the total counts the runs the forced final ask
+    // salvaged too, so on it a role whose ceiling is too low and a role whose
+    // work simply is not answering read the same. This is the one that says
+    // which of a role's cut-offs bought nothing.
+    (
+        "agent_iteration_budget_exhausted_no_deliverable",
+        &["role"],
+        "crates/cog-agent/src/observable.rs",
+    ),
     // Pool recovery readings. Three separate series rather than one "recovers
     // at" number: which upstream said it, when we will probe again, and how long
     // the window an upstream stated is are answers of different strength, and

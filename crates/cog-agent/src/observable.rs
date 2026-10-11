@@ -64,6 +64,15 @@ struct RoleCalibration {
     /// this way is direct evidence the ceiling was binding, which is what an
     /// operator needs to see when the derived value is not moving.
     exhausted_runs: u64,
+    /// Of those, the ones that ended with no answer at all — the run spent its
+    /// whole budget and the forced final ask did not produce one either. Kept
+    /// apart from `exhausted_runs` because that series also carries the runs the
+    /// forced ask salvaged (`RunOutcome::DeliveredAfterExhaustion`), and the two
+    /// endings cost the same and mean different things: one bought nothing, the
+    /// other bought an answer out of a budget it had already spent. A reader
+    /// told only the total cannot tell a role whose ceiling is too low from one
+    /// whose work is simply not answering.
+    exhausted_no_deliverable_runs: u64,
 }
 
 /// How an agent run ended.
@@ -128,6 +137,13 @@ impl AgentObservable {
                 calibration.delivered_iterations.pop_front();
             }
             calibration.delivered_iterations.push_back(iterations);
+        }
+        // Counted here, at the run's end, and not at the moment the ceiling is
+        // judged spent (`note_budget_exhausted`): only the ending says whether
+        // the forced ask produced an answer. The judgement-time counter cannot
+        // tell the two apart, which is exactly the gap this one fills.
+        if outcome == RunOutcome::BudgetExhausted {
+            calibration.exhausted_no_deliverable_runs += 1;
         }
     }
 
@@ -233,6 +249,13 @@ impl Observable for AgentObservable {
                 RawMetric::new(
                     "agent_iteration_budget_exhausted",
                     calibration.exhausted_runs as f64,
+                )
+                .with_label("role", role),
+            );
+            metrics.push(
+                RawMetric::new(
+                    "agent_iteration_budget_exhausted_no_deliverable",
+                    calibration.exhausted_no_deliverable_runs as f64,
                 )
                 .with_label("role", role),
             );
@@ -444,6 +467,43 @@ mod tests {
         );
     }
 
+    /// 「跑到顶且没交卷」与「跑到顶、被强制一问救回来」是两种结局，在
+    /// `exhausted_runs` 那条总线上读不出差别。这条钉住只数前者的那条序列：
+    /// 总额把两者都算上，无交付那条只算真买了空的一个。
+    #[tokio::test]
+    async fn a_no_deliverable_ending_is_counted_apart_from_a_salvaged_one() {
+        let o = AgentObservable::new();
+        for _ in 0..2 {
+            o.note_budget_exhausted("generator");
+            o.record_run("generator", RunOutcome::BudgetExhausted, 10, 21, 12);
+        }
+        o.note_budget_exhausted("generator");
+        o.record_run(
+            "generator",
+            RunOutcome::DeliveredAfterExhaustion,
+            10,
+            21,
+            12,
+        );
+
+        let metrics = o.collect_metrics("D1").await.expect("collect_metrics");
+        let read = |name: &str| {
+            metrics
+                .iter()
+                .find(|m| {
+                    m.name == name && m.labels.get("role").map(String::as_str) == Some("generator")
+                })
+                .map(|m| m.value)
+                .unwrap_or(-1.0)
+        };
+        assert_eq!(read("agent_iteration_budget_exhausted"), 3.0);
+        assert_eq!(
+            read("agent_iteration_budget_exhausted_no_deliverable"),
+            2.0,
+            "the salvaged run belongs on the total but not on the no-deliverable series"
+        );
+    }
+
     /// 这一组就是这个 observable 的全部产出。多一个名字就多一条没人读的序列，
     /// 少一个名字就是一条静默消失的读数，两种都要在这里响。
     #[tokio::test]
@@ -466,6 +526,7 @@ mod tests {
             vec![
                 "agent_budget_exhausted_count",
                 "agent_iteration_budget_exhausted",
+                "agent_iteration_budget_exhausted_no_deliverable",
                 "agent_run_count",
                 "agent_success_count",
                 "agent_total_steps",
