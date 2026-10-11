@@ -54,6 +54,7 @@ pub mod prometheus_render;
 pub mod promotion_gate;
 pub mod quota_middleware;
 pub mod raw_logs;
+pub mod secret_layout;
 pub mod security_gateway;
 pub mod sessions;
 pub mod state;

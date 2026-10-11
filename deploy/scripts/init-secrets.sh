@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cogneva 密钥初始化：幂等初始化 cogneva-secrets。
+# cogneva 密钥初始化：幂等初始化两个 Secret 对象。
 #
 # 元启动（bootstrap）在 apply 预渲染清单前自动调用本脚本，无需手动运行。
 # 内部实例密钥（数据库/缓存/内部签名）首次安装时自动生成强随机值，
@@ -7,12 +7,40 @@
 # 平台 token、LLM 上游等带外凭证不在此生成，留空由 WebUI 向导或
 # kubectl edit secret 写入。
 #
+# 两个对象是权限边界，不是分类：cogneva-secrets 装业务 Pod 要读的键（整对象
+# get），cogneva-secrets-oob 装只该由安全网关读的键。本脚本负责建出后者、把老
+# 安装里混在前者的带外键搬过去，并把留空占位写在对的那一片上——这三件事都得在
+# 清单 apply 之前完成，否则网关 Pod 起不来或向导写进一个没人读的键。
+#
 # 手动部署时用法（在 kubectl apply 之前运行一次；重复运行安全）：
 #   bash deploy/scripts/init-secrets.sh
 set -euo pipefail
 
 NS="${COGNEVA_NS:-cogneva}"
 SECRET=cogneva-secrets
+OOB_SECRET=cogneva-secrets-oob
+
+# 带外半的键表。列出而不按"内部表之外的都搬"来推断：后者会把运维用 kubectl
+# 刚写进内部对象的新键也搬走，而那种搬移不报错、只在读它的那个进程那里变成
+# 空值。多列一个不存在的键是无害的空操作，少列一个才会留下残留副本。
+OOB_KEYS=(
+  llm-upstreams
+  github-token
+  gitee-token
+  github-webhook-secret
+  gitee-webhook-token
+  gitee-oauth-client-secret
+  github-oauth-client-secret
+  notification-dingtalk-secret
+  notification-feishu-secret
+  github-app-id
+  github-app-installation-id
+  github-app-private-key
+  git-ssh-private-key
+  git-ssh-private-key-pending
+  gitee-refresh-token
+  clickhouse-password
+)
 
 # 生成 48 位十六进制强随机串（纯字母数字，可安全进入连接串/URL）。
 gen() {
@@ -116,14 +144,39 @@ kubectl_write() {
 # a fresh random value for a key that a running workload may be using, and that
 # write does not report itself -- it shows up at the next failed database
 # connection or signature check instead. So an unreadable key stops the script.
-secret_b64() {
-  local out
-  if ! out="$(kubectl_read -n "$NS" get secret "$SECRET" -o "jsonpath={.data.${1}}")"; then
-    echo "错误：读不到 ${NS}/${SECRET} 的 ${1}（控制面没有回应）。" >&2
+secret_b64_of() {
+  local object="$1" key="$2" out
+  if ! out="$(kubectl_read -n "$NS" get secret "$object" -o "jsonpath={.data.${key}}")"; then
+    echo "错误：读不到 ${NS}/${object} 的 ${key}（控制面没有回应）。" >&2
     echo "      「读不到」不等于「不存在」——当成不存在会给一个可能正在用的密钥换值。" >&2
     exit 1
   fi
   printf '%s' "${out}"
+}
+
+secret_b64() { secret_b64_of "$SECRET" "$1"; }
+oob_secret_b64() { secret_b64_of "$OOB_SECRET" "$1"; }
+
+# 对象里现有的键名，一行一个。用 go-template 而不是 jsonpath：键里有连字符和
+# 点（`seaweedfs-s3.json`），jsonpath 的 `.data.<key>` 在带点的键上会静默取空，
+# 而"取空"在这里的语义是"这个键不存在"——一次误读会让搬迁把一个真键留在原地。
+secret_keys_of() {
+  kubectl_read -n "$NS" get secret "$1" -o go-template='{{range $k,$v := .data}}{{$k}}{{"\n"}}{{end}}'
+}
+
+ensure_object() {
+  local object="$1"
+  if ! kubectl_read -n "$NS" get secret "$object" >/dev/null 2>&1; then
+    kubectl_write -n "$NS" create secret generic "$object"
+  fi
+}
+
+# 幂等合并写一个键（merge patch：全新对象没有 data 字段，RFC 6902 的 add 会因
+# 父路径不存在被拒）。
+patch_key() {
+  local object="$1" key="$2" b64="$3"
+  kubectl_write -n "$NS" patch secret "$object" --type=merge \
+    -p="{\"data\":{\"${key}\":\"${b64}\"}}"
 }
 
 echo "==> 确保命名空间 ${NS} 存在"
@@ -132,10 +185,33 @@ echo "==> 确保命名空间 ${NS} 存在"
 ns_manifest="$(kubectl_read create namespace "$NS" --dry-run=client -o yaml)"
 printf '%s' "${ns_manifest}" | kubectl_write apply -f -
 
-echo "==> 确保 Secret ${SECRET} 存在"
-if ! kubectl_read -n "$NS" get secret "$SECRET" >/dev/null 2>&1; then
-  kubectl_write -n "$NS" create secret generic "$SECRET"
-fi
+echo "==> 确保 Secret ${SECRET} / ${OOB_SECRET} 存在"
+ensure_object "$SECRET"
+ensure_object "$OOB_SECRET"
+
+# 搬迁：老安装把带外键与内部键混在 cogneva-secrets 里，这里把它们搬到带外对象，
+# 再把副本从内部对象删掉。只搬不删等于没搬——内部对象是整对象 get，业务 Pod
+# 照样读得到那份副本，而"读得到"正是这次分家要消掉的东西。
+#
+# 顺序是先搬后删，且只在带外那份为空时才写：两份都有值时以带外那份为准，它是
+# 分家之后的唯一写点；内部那份此时是残留，删除它不会丢掉任何还在被读的值。
+# 幂等：第二次跑时内部对象已没有这些键，整段是空操作。
+echo "==> 搬迁带外键（${SECRET} → ${OOB_SECRET}，幂等）"
+legacy_keys="$(secret_keys_of "$SECRET")"
+for key in "${OOB_KEYS[@]}"; do
+  printf '%s\n' "${legacy_keys}" | grep -qx -- "${key}" || continue
+  if [ -z "$(oob_secret_b64 "$key")" ]; then
+    patch_key "$OOB_SECRET" "$key" "$(secret_b64 "$key")"
+    echo "  ${key}: 已搬到 ${OOB_SECRET}"
+  else
+    echo "  ${key}: ${OOB_SECRET} 已有值，内部那份按残留处理"
+  fi
+  # 单键删除用 JSON patch：merge patch 只能置键，删键要靠 null，而 null 在这里
+  # 与"把值写成空的 base64"分不开。路径里的键名是本脚本的常量，不来自外部。
+  kubectl_write -n "$NS" patch secret "$SECRET" --type=json \
+    -p="[{\"op\":\"remove\",\"path\":\"/data/${key}\"}]" \
+    || echo "  ${key}: 内部对象副本删除失败（下次运行会再试）" >&2
+done
 
 # 内部密钥：缺失（或为空）才生成随机值；非空则保留。
 ensure_random() {
@@ -149,11 +225,7 @@ ensure_random() {
   local val b64
   val="$(gen)"
   b64="$(printf '%s' "$val" | base64 | tr -d '\n')"
-  # 用 merge patch 而非 JSON patch：全新的 Secret 没有 data 字段，
-  # RFC 6902 的 add 因父路径 /data 不存在而被 API server 拒绝
-  # （The request is invalid）。merge patch 对 map 是"置键"，语义等价。
-  kubectl_write -n "$NS" patch secret "$SECRET" --type=merge \
-    -p="{\"data\":{\"${key}\":\"${b64}\"}}"
+  patch_key "$SECRET" "$key" "$b64"
   echo "  ${key}: 已生成随机强密钥"
 }
 
@@ -222,8 +294,7 @@ ensure_fingerprint() {
       exit 1
     fi
     b64="$(printf '%s' "$val" | base64 | tr -d '\n')"
-    kubectl_write -n "$NS" patch secret "$SECRET" --type=merge \
-      -p="{\"data\":{\"${key}\":\"${b64}\"}}"
+    patch_key "$SECRET" "$key" "$b64"
     echo "  ${key}: 已从宿主保留副本恢复（与上次安装是同一个实例）"
     return
   fi
@@ -233,11 +304,7 @@ ensure_fingerprint() {
     val="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
   fi
   b64="$(printf '%s' "$val" | base64 | tr -d '\n')"
-  # 用 merge patch 而非 JSON patch：全新的 Secret 没有 data 字段，
-  # RFC 6902 的 add 因父路径 /data 不存在而被 API server 拒绝
-  # （The request is invalid）。merge patch 对 map 是"置键"，语义等价。
-  kubectl_write -n "$NS" patch secret "$SECRET" --type=merge \
-    -p="{\"data\":{\"${key}\":\"${b64}\"}}"
+  patch_key "$SECRET" "$key" "$b64"
   keep_host_fingerprint "$val"
   echo "  ${key}: 生成了新实例指纹，并留了一份在 ${HOST_FINGERPRINT_FILE}"
   echo "        本机此前没有这个实例的保留副本：这是第一次安装，或宿主副本被清掉了。"
@@ -280,27 +347,24 @@ ensure_s3_identity() {
 JSON
 )"
   b64="$(printf '%s' "$json" | base64 | tr -d '\n')"
-  # 用 merge patch 而非 JSON patch：全新的 Secret 没有 data 字段，
-  # RFC 6902 的 add 因父路径 /data 不存在而被 API server 拒绝
-  # （The request is invalid）。merge patch 对 map 是"置键"，语义等价。
-  kubectl_write -n "$NS" patch secret "$SECRET" --type=merge \
-    -p="{\"data\":{\"${key}\":\"${b64}\"}}"
+  patch_key "$SECRET" "$key" "$b64"
   echo "  ${key}: 已生成（凭证取自 s3-access-key / s3-secret-key）"
 }
 
-# 带外凭证：仅确保键存在（空占位），真值由向导/运维写入，脚本不生成。
-ensure_blank() {
+# 带外凭证：仅确保键存在（空占位），真值由向导/网关写入，脚本不生成。
+# 占位写在对的那一片上：写进内部对象等于给业务 Pod 留一个没人读、却又被整对象
+# get 覆盖着的键，而真正读它的网关那边仍是缺键。
+ensure_blank_oob() {
   local key="$1"
   local cur
-  cur="$(secret_b64 "$key")"
+  cur="$(oob_secret_b64 "$key")"
   if [ -z "$cur" ]; then
     # A failed placeholder is not fatal (the real value is written by the
     # wizard; this is the empty string), but it has to be said out loud: a
-    # missing key keeps the Pod that mounts it from starting
-    # (CreateContainerConfigError), and staying quiet leaves that discovery for
-    # then. Delays from a slow control plane are absorbed by kubectl_write.
-    kubectl_write -n "$NS" patch secret "$SECRET" --type=merge \
-      -p="{\"data\":{\"${key}\":\"\"}}" \
+    # missing key keeps a workload that reads it by name from starting, and
+    # staying quiet leaves that discovery for then. Delays from a slow control
+    # plane are absorbed by kubectl_write.
+    patch_key "$OOB_SECRET" "$key" "" \
       || echo "  ${key}: 占位未写入（真值仍可由向导写入）" >&2
   fi
 }
@@ -322,22 +386,21 @@ ensure_fingerprint
 echo "==> 对象存储 S3 凭证（缺失才创建）"
 ensure_s3_identity
 
-echo "==> 带外凭证占位（留空，由 WebUI 向导或 kubectl edit secret 写入）"
-ensure_blank llm-upstreams
-ensure_blank llm-api-key
-ensure_blank github-token
-ensure_blank gitee-token
-ensure_blank github-webhook-secret
-ensure_blank gitee-webhook-token
-ensure_blank gitee-oauth-client-secret
-ensure_blank github-oauth-client-secret
-ensure_blank notification-dingtalk-secret
-ensure_blank notification-feishu-secret
+echo "==> 带外凭证占位（留空，由 WebUI 向导或 kubectl edit secret ${OOB_SECRET} 写入）"
+ensure_blank_oob llm-upstreams
+ensure_blank_oob github-token
+ensure_blank_oob gitee-token
+ensure_blank_oob github-webhook-secret
+ensure_blank_oob gitee-webhook-token
+ensure_blank_oob gitee-oauth-client-secret
+ensure_blank_oob github-oauth-client-secret
+ensure_blank_oob notification-dingtalk-secret
+ensure_blank_oob notification-feishu-secret
 
 cat <<'EOF'
 ==> 完成。元启动（bootstrap）会在 apply 清单前自动调用本脚本，无需手动运行。
     手动部署时，密钥就绪后部署对应 profile 的预渲染清单：
     kubectl apply -f deploy/rendered/k3s-single/   # 或 k3s-multi / k8s-standard
     平台 token / LLM 上游：经 WebUI 配置向导写入，或
-    kubectl -n cogneva edit secret cogneva-secrets 后滚动对应 Deployment。
+    kubectl -n cogneva edit secret cogneva-secrets-oob 后滚动对应 Deployment。
 EOF

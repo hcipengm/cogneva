@@ -352,8 +352,12 @@ pub(crate) fn decode_secret_key(secret: &serde_json::Value, key: &str) -> Option
 /// field it did not set itself, and a reader that does so reports a restored
 /// policy it never saw.
 pub(crate) async fn read_contrib_config(kube: &KubeClient) -> Option<serde_json::Value> {
+    // 这份文档只住内部片，读一片就够；合成视图在这里只会多一次可能失败的请求，
+    // 而"读不到"与"读到空的"在这里是两件事（见上面）。
     let secret = kube
-        .get_json(&secret_api_path(kube.namespace()))
+        .get_json(&crate::secret_layout::internal_secret_api_path(
+            kube.namespace(),
+        ))
         .await
         .ok()?;
     match decode_secret_key(&secret, SECRET_CONTRIB_CONFIG) {
@@ -773,16 +777,7 @@ pub(crate) async fn persist_connected(
     string_data[SECRET_CONTRIB_CONFIG] =
         json!(serde_json::to_string(&config_json_val).unwrap_or_else(|_| "{}".to_string()));
 
-    if let Err(e) = kube
-        .patch(
-            &format!(
-                "/api/v1/namespaces/{}/secrets/cogneva-secrets",
-                kube.namespace()
-            ),
-            json!({ "stringData": string_data }),
-        )
-        .await
-    {
+    if let Err(e) = crate::secret_layout::patch_fields(kube, string_data).await {
         return (
             StatusCode::BAD_GATEWAY,
             Json(json!({"error": "secret_patch_failed", "message": e})),
@@ -826,13 +821,9 @@ pub async fn contribution_status_handler(
         None => 0,
     };
     if let Ok(kube) = KubeClient::in_cluster() {
-        if let Ok(secret) = kube
-            .get_json(&format!(
-                "/api/v1/namespaces/{}/secrets/cogneva-secrets",
-                kube.namespace()
-            ))
-            .await
-        {
+        // 这一屏同时报两片的键：token/App 私钥在带外片，配置文档与公钥在内部片。
+        // 分开读会让其中一半恒报未配置，而面板上看不出是"没配"还是"读错了片"。
+        if let Ok(secret) = crate::secret_layout::load_data_view(&kube).await {
             let has = |key: &str| {
                 secret
                     .get("data")
@@ -950,19 +941,15 @@ pub async fn github_app_config_handler(
                 .into_response();
         }
     };
-    if let Err(e) = kube
-        .patch(
-            &format!(
-                "/api/v1/namespaces/{}/secrets/cogneva-secrets",
-                kube.namespace()
-            ),
-            json!({ "stringData": {
-                SECRET_GITHUB_APP_ID: app_id,
-                SECRET_GITHUB_APP_INSTALLATION_ID: installation_id,
-                SECRET_GITHUB_APP_KEY: private_key,
-            }}),
-        )
-        .await
+    if let Err(e) = crate::secret_layout::patch_fields(
+        &kube,
+        json!({
+            SECRET_GITHUB_APP_ID: app_id,
+            SECRET_GITHUB_APP_INSTALLATION_ID: installation_id,
+            SECRET_GITHUB_APP_KEY: private_key,
+        }),
+    )
+    .await
     {
         return (
             StatusCode::BAD_GATEWAY,
@@ -1002,19 +989,15 @@ pub async fn github_app_clear_handler(State(_state): State<Arc<crate::GatewaySta
         }
     };
     // Strategic merge patch: null values delete the keys from `data`.
-    if let Err(e) = kube
-        .patch(
-            &format!(
-                "/api/v1/namespaces/{}/secrets/cogneva-secrets",
-                kube.namespace()
-            ),
-            json!({ "data": {
-                SECRET_GITHUB_APP_ID: null,
-                SECRET_GITHUB_APP_INSTALLATION_ID: null,
-                SECRET_GITHUB_APP_KEY: null,
-            }}),
-        )
-        .await
+    if let Err(e) = crate::secret_layout::patch_fields_b64(
+        &kube,
+        json!({
+            SECRET_GITHUB_APP_ID: null,
+            SECRET_GITHUB_APP_INSTALLATION_ID: null,
+            SECRET_GITHUB_APP_KEY: null,
+        }),
+    )
+    .await
     {
         return (
             StatusCode::BAD_GATEWAY,
@@ -1125,21 +1108,28 @@ pub async fn github_app_manifest_handler(
         }
     };
     // 新 App 与旧 installation 不匹配：清掉旧 installation id，安装后再 discover。
-    if let Err(e) = kube
-        .patch(
-            &format!(
-                "/api/v1/namespaces/{}/secrets/cogneva-secrets",
-                kube.namespace()
-            ),
-            json!({
-                "stringData": {
-                    SECRET_GITHUB_APP_ID: app_id.clone(),
-                    SECRET_GITHUB_APP_KEY: pem,
-                },
-                "data": { SECRET_GITHUB_APP_INSTALLATION_ID: null },
-            }),
+    // 置空那一笔走 base64 那支只是为了让 null 与旁边两类字段同编码（见
+    // patch_fields_b64 的说明）；两笔都落在带外那一片，中间没有别的写者。
+    if let Err(e) = crate::secret_layout::patch_fields(
+        &kube,
+        json!({
+            SECRET_GITHUB_APP_ID: app_id.clone(),
+            SECRET_GITHUB_APP_KEY: pem,
+        }),
+    )
+    .await
+    {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "secret_patch_failed", "message": e})),
         )
-        .await
+            .into_response();
+    }
+    if let Err(e) = crate::secret_layout::patch_fields_b64(
+        &kube,
+        json!({ SECRET_GITHUB_APP_INSTALLATION_ID: null }),
+    )
+    .await
     {
         return (
             StatusCode::BAD_GATEWAY,
@@ -1183,13 +1173,7 @@ pub async fn github_app_discover_handler(
                 .into_response();
         }
     };
-    let secret = match kube
-        .get_json(&format!(
-            "/api/v1/namespaces/{}/secrets/cogneva-secrets",
-            kube.namespace()
-        ))
-        .await
-    {
+    let secret = match crate::secret_layout::load_data_view(&kube).await {
         Ok(s) => s,
         Err(e) => {
             return (
@@ -1288,17 +1272,11 @@ pub async fn github_app_discover_handler(
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
-    if let Err(e) = kube
-        .patch(
-            &format!(
-                "/api/v1/namespaces/{}/secrets/cogneva-secrets",
-                kube.namespace()
-            ),
-            json!({ "stringData": {
-                SECRET_GITHUB_APP_INSTALLATION_ID: installation_id.to_string(),
-            }}),
-        )
-        .await
+    if let Err(e) = crate::secret_layout::patch_fields(
+        &kube,
+        json!({ SECRET_GITHUB_APP_INSTALLATION_ID: installation_id.to_string() }),
+    )
+    .await
     {
         return (
             StatusCode::BAD_GATEWAY,
@@ -1735,12 +1713,11 @@ pub async fn contribution_policy_set_handler(
                 ),
                 Some(config) => {
                     let raw = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
-                    match kube
-                        .patch(
-                            &secret_api_path(kube.namespace()),
-                            json!({ "stringData": { SECRET_CONTRIB_CONFIG: raw } }),
-                        )
-                        .await
+                    match crate::secret_layout::patch_fields(
+                        &kube,
+                        json!({ SECRET_CONTRIB_CONFIG: raw }),
+                    )
+                    .await
                     {
                         Ok(()) => (true, None),
                         Err(e) => (false, Some(e)),
@@ -1856,22 +1833,20 @@ pub async fn contribution_disconnect_handler(
                 .into_response();
         }
     };
-    // Strategic merge patch: null values delete the keys from `data`.
-    if let Err(e) = kube
-        .patch(
-            &format!(
-                "/api/v1/namespaces/{}/secrets/cogneva-secrets",
-                kube.namespace()
-            ),
-            json!({ "data": {
-                SECRET_GITHUB_TOKEN: null,
-                SECRET_GITEE_TOKEN: null,
-                SECRET_GITEE_REFRESH: null,
-                SECRET_SSH_KEY: null,
-                SECRET_CONTRIB_CONFIG: null,
-            }}),
-        )
-        .await
+    // Strategic merge patch: null values delete the keys from `data`. 这五个键横跨
+    // 两片（token/私钥在带外片、配置文档在内部片），按键表分派后是两笔 patch：
+    // 一笔删带外那四个，一笔删内部那一个。
+    if let Err(e) = crate::secret_layout::patch_fields_b64(
+        &kube,
+        json!({
+            SECRET_GITHUB_TOKEN: null,
+            SECRET_GITEE_TOKEN: null,
+            SECRET_GITEE_REFRESH: null,
+            SECRET_SSH_KEY: null,
+            SECRET_CONTRIB_CONFIG: null,
+        }),
+    )
+    .await
     {
         return (
             StatusCode::BAD_GATEWAY,
@@ -1974,13 +1949,7 @@ pub async fn oauth_app_secret_handler(
                 .into_response();
         }
     };
-    if let Err(e) = kube
-        .patch(
-            &secret_api_path(kube.namespace()),
-            json!({ "stringData": { key: secret } }),
-        )
-        .await
-    {
+    if let Err(e) = crate::secret_layout::patch_fields(&kube, json!({ key: secret })).await {
         return (
             StatusCode::BAD_GATEWAY,
             Json(json!({"error": "secret_patch_failed", "message": e})),
@@ -2004,18 +1973,15 @@ pub async fn oauth_app_secret_handler(
         .into_response()
 }
 
-/// cogneva-secrets 的 apiserver 路径。探测与读取必须指向同一个资源，
-/// 所以由同一个函数拼出来。
-pub(crate) fn secret_api_path(namespace: &str) -> String {
-    format!("/api/v1/namespaces/{namespace}/secrets/cogneva-secrets")
-}
-
-/// 本进程是不是刷新任务的属主：只有能读写 cogneva-secrets 的那个才算。
+/// 本进程是不是刷新任务的属主：只有能读写贡献那段 Secret 的那个才算。
 ///
 /// 「集群里配了 Gitee OAuth 应用」是每个进程都能问到的集群级事实，不足以回答
 /// 这个问题——刷新要把新 token 写回 Secret 并滚动安全网关，部署里只有主应用的
 /// ServiceAccount 绑了 `cogneva-llm-admin`（secrets get/patch + 网关 deployment
 /// patch）。判据取 apiserver 自己的权限判决。
+///
+/// 探的是内部那一片：刷新同时写两片，而唯一一个被授权的身份两片都能碰，所以
+/// 探哪片答的都是同一个问题；取内部那片是因为它的名字不随分片而变。
 ///
 /// 判不出来（建不出 in-cluster 客户端、探测本身报错）按**属主**处理：那可能是
 /// 启动瞬间的抖动，属主不该因此被静默停掉；后续每次刷新仍会照常报告。
@@ -2030,7 +1996,10 @@ pub(crate) async fn is_contribution_secret_owner() -> bool {
             return true;
         }
     };
-    match kube.can_get(&secret_api_path(kube.namespace())).await {
+    match kube
+        .can_get(&crate::secret_layout::internal_secret_api_path(kube.namespace()))
+        .await
+    {
         Ok(allowed) => allowed,
         Err(e) => {
             tracing::warn!(
@@ -2132,7 +2101,8 @@ pub fn spawn_gitee_token_refresher(
 
 async fn gitee_refresh_tick(refresh_threshold_secs: u64) -> Result<(), String> {
     let kube = KubeClient::in_cluster()?;
-    let secret = kube.get_json(&secret_api_path(kube.namespace())).await?;
+    // 这一次 tick 要读的键横跨两片：配置文档在内部片，refresh token 在带外片。
+    let secret = crate::secret_layout::load_data_view(&kube).await?;
     let decode = |key: &str| -> Option<String> {
         let b64 = secret.get("data")?.get(key)?.as_str()?;
         let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
@@ -2180,14 +2150,7 @@ async fn gitee_refresh_tick(refresh_threshold_secs: u64) -> Result<(), String> {
     if let Some(new_refresh) = &set.refresh_token {
         string_data[SECRET_GITEE_REFRESH] = json!(new_refresh);
     }
-    kube.patch(
-        &format!(
-            "/api/v1/namespaces/{}/secrets/cogneva-secrets",
-            kube.namespace()
-        ),
-        json!({ "stringData": string_data }),
-    )
-    .await?;
+    crate::secret_layout::patch_fields(&kube, string_data).await?;
     // The gateway reads the token from env at pod start; roll it so egress
     // picks up the fresh pair. The new pod sees a young token and idles.
     kube.restart_gateway().await

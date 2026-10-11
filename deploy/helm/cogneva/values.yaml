@@ -200,7 +200,7 @@ gateway:
 # 挂在任一侧名下——拆成两份必然漂移，而漂移的后果是无声的：自举登记的仓库与
 # 选路探测的仓库一旦不同，SSH 自证就永远握手不过，身份停在 pending。
 #   - 主应用进程：git 身份自举的后台循环跑在这里——它同时握着自举需要的三样
-#     东西（cogneva-secrets 的读写权、到达 GitHub 的 egress、以及网关部署的
+#     东西（两片 Secret 的读写权、到达 GitHub 的 egress、以及网关部署的
 #     滚动权），所以生成的公钥由它登记成这个仓库的部署密钥，并滚网关让私钥
 #     被兜底通道读进去。空 = 不自动登记，只把公钥挂到 WebUI 等人给 token。
 #   - 安全网关：传输选路的实测拿它当探测目标，SSH 兜底也用它拼远端前缀。
@@ -246,7 +246,7 @@ securityGateway:
   # 坏时直冲超时，而黑洞期一来主线 deployer 拉不到基线、landing 推不上去，整条
   # 自进化链路停摆。开这个开关后网关自持一份裸镜像，连续失败即熔断降级到 SSH。
   #
-  # 私钥来自 cogneva-secrets/git-ssh-private-key（真实部署用 SSH 公钥上传到
+  # 私钥来自 cogneva-secrets-oob/git-ssh-private-key（真实部署用 SSH 公钥上传到
   # GitHub 账号，私钥只注入网关）；**缺私钥时兜底自动保持关闭**，网关退回纯
   # HTTPS 透传、行为与从前一致——所以可以先开开关、后补凭证。
   gitMirror:
@@ -643,7 +643,6 @@ secrets:
   # 对象存储（SeaweedFS S3 网关）凭证：同上，留空则安装时随机生成。
   s3AccessKey: ""
   s3SecretKey: ""
-  llmApiKey: ""
   # 带外凭证（网关专用）：真实值带外写入，默认空（未配置时对应功能 fail-closed）。
   llmUpstreams: ""
   githubToken: ""
@@ -675,7 +674,7 @@ secrets:
 # Pages 托管），页面 JS 把 code 经 window.opener.postMessage 自动递回向导；
 # 注册列表里同时保留仓库页作为手动复制兜底。自注册自有 OAuth App 的部署方
 # 把 giteeOauthRedirectUri 改成自己的回调即可。
-# client_secret 与其它带外凭证一样只存在于 cogneva-secrets（见上面 secrets 段），
+# client_secret 与其它带外凭证一样只存在于 cogneva-secrets-oob（见上面 secrets 段），
 # 由运维/向导写入，只进网关。
 contribution:
   githubOauthClientId: "Ov23liz35yGbAC5vO0OP"
@@ -761,9 +760,10 @@ alertmanager:
     # 留空 = 用默认主题「Cogneva Alert — N event(s)」。
     subjectTemplate: ""
     # SMTP 口令**不在这里**：它是凭证，不进 values 也不进清单，只由集群侧写进
-    # Secret 键 cogneva-secrets/smtp-password（与可观测栈安装脚本写 clickhouse-password
-    # 同形；那个键不存在时不做鉴权，Pod 照起）。写入时别用 --from-literal：
-    # 口令会留进 shell 历史与进程参数。
+    # Secret 键 cogneva-secrets/smtp-password（它被主应用与进化两个 Pod 读，所以
+    # 住内部份；可观测栈的口令走的是带外份的 clickhouse-password。那个键不存在时
+    # 不做鉴权，Pod 照起）。写入时别用 --from-literal：口令会留进 shell 历史与
+    # 进程参数。
   # Slack 出口：入站 webhook URL（incoming webhook），频道可留空由 webhook 自己的默认决定。
   slack:
     webhookUrl: ""

@@ -1,7 +1,11 @@
 # LLM 设置界面（WebUI 系统设置）所需的最小权限：
 # 主应用通过 in-cluster ServiceAccount 把用户在设置页填写的 key 写入
-# cogneva-secrets，并把 provider/base_url/model 写进安全网关 Deployment
-# 的 env（模板变更自动滚网关）。真 key 只在安全网关 Pod。
+# Secret，并把 provider/base_url/model 写进安全网关 Deployment 的 env
+# （模板变更自动滚网关）。真 key 只在安全网关 Pod。
+#
+# 两个 Secret 对象都在这条规则里：凭证分成两片之后，向导与贡献通道的写点仍然落
+# 在同一批键上，只是目标对象不同。逐个键看，授权集合与切分前完全一样，没有变宽
+# 也没有变窄——写者搬进网关、这条授权随之收窄到只指带外那一片，是后面一批的事。
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -22,7 +26,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
-    resourceNames: ["cogneva-secrets"]
+    resourceNames: ["cogneva-secrets", "cogneva-secrets-oob"]
     verbs: ["get", "patch"]
   - apiGroups: ["apps"]
     resources: ["deployments"]

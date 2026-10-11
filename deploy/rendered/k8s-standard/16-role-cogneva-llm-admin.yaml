@@ -2,9 +2,13 @@
 # Source: helm chart deploy/helm/cogneva + profiles/k8s-standard.yaml
 # Change chart templates / values / profile, then re-run render-deploy.sh.
 # Source: cogneva/templates/rbac.yaml
-# LLM 设置界面（WebUI 系统设置）最小权限：把用户填写的 key 写入 cogneva-secrets，
+# LLM 设置界面（WebUI 系统设置）最小权限：把用户填写的 key 写入 Secret，
 # 把 provider/base_url/model 写进安全网关 Deployment env（模板变更自动滚网关），
 # 读集群组件健康与晋级门端点。真 key 只在安全网关 Pod。
+#
+# 两个对象都在这条规则里：凭证分成两片之后，向导与贡献通道的写点仍然落在同一批
+# 键上，只是目标对象不同。逐个键看，授权集合与切分前完全一样，没有变宽也没有变窄
+# ——写者搬进网关、这条授权随之收窄到只指带外那一片，是后面一批的事。
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -19,7 +23,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
-    resourceNames: ["cogneva-secrets"]
+    resourceNames: ["cogneva-secrets", "cogneva-secrets-oob"]
     verbs: ["get", "patch"]
   - apiGroups: ["apps"]
     resources: ["deployments"]

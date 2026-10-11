@@ -4,8 +4,9 @@
 # 指标走 Prometheus——四类体裁各落各的后端，不是互为备选。
 #
 # 凭证：clickhouse-credentials 由 install.sh 首次生成强随机密码（仓库零可用密钥），
-# 并镜像写入 cogneva 命名空间的 cogneva-secrets/clickhouse-password，供安全网关连接
-# （跨命名空间不能在 env 里直接引用 Secret，故安装时同步一份）。
+# 并镜像写入 cogneva 命名空间的 cogneva-secrets-oob/clickhouse-password，供安全网关
+# 连接（跨命名空间不能在 env 里直接引用 Secret，故安装时同步一份；写带外那一份是
+# 因为只有网关读它——写进内部份等于铺给每个持内部份的业务 Pod）。
 apiVersion: v1
 kind: Service
 metadata:

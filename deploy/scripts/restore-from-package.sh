@@ -32,7 +32,14 @@ cat "$PKG_DIR/manifest.json"
 
 echo "==> 1/4 创建命名空间并恢复实例身份（Secret 先行，init-secrets.sh 幂等跳过）"
 kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
-kubectl apply -f "$PKG_DIR/secrets/cogneva-secrets.yaml"
+# 按包内文件逐个 apply，不写死对象名：包里有几片密钥对象就恢复几片。写死一份
+# 会让另一份（带外凭证：平台 token、git 身份私钥）静默留在包里没被恢复，而集群
+# 看起来一切正常——直到需要推送代码或访问上游时才发现身份是空的。
+for f in "$PKG_DIR"/secrets/*.yaml; do
+    [ -f "$f" ] || { echo "包内没有密钥清单（$PKG_DIR/secrets/*.yaml）" >&2; exit 1; }
+    echo "    apply $(basename "$f")"
+    kubectl apply -f "$f"
+done
 
 echo "==> 2/4 等待正常安装就绪（postgres / qdrant）"
 if ! kubectl -n "$NS" get deployment cogneva >/dev/null 2>&1; then

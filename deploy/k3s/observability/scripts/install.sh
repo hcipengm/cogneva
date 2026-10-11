@@ -245,18 +245,21 @@ deploy_crd_dependent_manifests() {
 }
 
 # ─── 把 ClickHouse 密码镜像给安全网关命名空间 ─────────────────────
-# 网关从 cogneva-secrets/clickhouse-password 读，值必须与 ClickHouse 服务端一致。
+# 网关从 cogneva-secrets-oob/clickhouse-password 读，值必须与 ClickHouse 服务端一致。
+# 写带外那一份而不是 cogneva-secrets：观测栈的口令今天只被网关读，放进内部份
+# 等于把它铺给持那一份的每个业务 Pod（那份是整对象 get）。写错对象不会报错，
+# 只会让网关永远读到一个空口令、而观测栈这边看起来一切正常。
 mirror_clickhouse_password() {
     kubectl -n cogneva get ns >/dev/null 2>&1 || { log_warn "cogneva 命名空间不存在，跳过密码镜像"; return; }
     local pw_b64
     pw_b64="$(kubectl -n "${NAMESPACE}" get secret clickhouse-credentials -o jsonpath='{.data.password}')"
-    kubectl -n cogneva get secret cogneva-secrets >/dev/null 2>&1 \
-        || kubectl -n cogneva create secret generic cogneva-secrets
-    kubectl -n cogneva patch secret cogneva-secrets --type=json \
+    kubectl -n cogneva get secret cogneva-secrets-oob >/dev/null 2>&1 \
+        || kubectl -n cogneva create secret generic cogneva-secrets-oob
+    kubectl -n cogneva patch secret cogneva-secrets-oob --type=json \
         -p="[{\"op\":\"add\",\"path\":\"/data/clickhouse-password\",\"value\":\"${pw_b64}\"}]" >/dev/null 2>&1 \
-        || kubectl -n cogneva patch secret cogneva-secrets --type=merge \
+        || kubectl -n cogneva patch secret cogneva-secrets-oob --type=merge \
             -p="{\"data\":{\"clickhouse-password\":\"${pw_b64}\"}}" >/dev/null
-    log_info "ClickHouse 密码已镜像到 cogneva-secrets"
+    log_info "ClickHouse 密码已镜像到 cogneva-secrets-oob"
 }
 
 # ─── 部署 kube-prometheus-stack ───────────────────────────────────

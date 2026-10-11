@@ -75,7 +75,7 @@ spec:
             - name: COGNEVA_LLM_UPSTREAMS
               valueFrom:
                 secretKeyRef:
-                  name: cogneva-secrets
+                  name: cogneva-secrets-oob
                   key: llm-upstreams
                   optional: true
             # 代码平台透传凭证：/github/* 出口注入 Bearer token，
@@ -84,7 +84,7 @@ spec:
             - name: COGNEVA_GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: cogneva-secrets
+                  name: cogneva-secrets-oob
                   key: github-token
                   optional: true
             # GitHub App 凭证（可选，运营者配置）：齐备时 /github/* 出口以 App
@@ -93,25 +93,25 @@ spec:
             - name: COGNEVA_GITHUB_APP_ID
               valueFrom:
                 secretKeyRef:
-                  name: cogneva-secrets
+                  name: cogneva-secrets-oob
                   key: github-app-id
                   optional: true
             - name: COGNEVA_GITHUB_APP_INSTALLATION_ID
               valueFrom:
                 secretKeyRef:
-                  name: cogneva-secrets
+                  name: cogneva-secrets-oob
                   key: github-app-installation-id
                   optional: true
             - name: COGNEVA_GITHUB_APP_KEY
               valueFrom:
                 secretKeyRef:
-                  name: cogneva-secrets
+                  name: cogneva-secrets-oob
                   key: github-app-private-key
                   optional: true
             - name: COGNEVA_GITEE_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: cogneva-secrets
+                  name: cogneva-secrets-oob
                   key: gitee-token
                   optional: true
             # git 传输的 SSH 兜底镜像（见 cog-gateway 的 git_mirror 模块）。
@@ -154,13 +154,13 @@ spec:
             # （手动令牌/PAT 通道不受影响）。client_id 是 OAuth App 的公开标识，
             # 随清单原样恢复，重装/换机不受影响；client_secret 相反——它是外面
             # 发的、只能由 Gitee 后台轮换的凭证，写进清单就等于写进仓库（含历史），
-            # 因此只从 cogneva-secrets 注入（init-secrets.sh 建空占位，真值带外写）。
+            # 因此只从 cogneva-secrets-oob 注入（init-secrets.sh 建空占位，真值带外写）。
             - name: COGNEVA_GITEE_OAUTH_CLIENT_ID
               value: "52f5294997d7a9f7046ca0bc7bf7f05da7a293a01800b5df6565be88539e2ea6"
             - name: COGNEVA_GITEE_OAUTH_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: cogneva-secrets
+                  name: cogneva-secrets-oob
                   key: gitee-oauth-client-secret
                   optional: true
             # GitHub 授权码兑换：与 Gitee 同形，兑换在网关进程内完成。设备流
@@ -170,39 +170,39 @@ spec:
             - name: COGNEVA_GITHUB_OAUTH_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: cogneva-secrets
+                  name: cogneva-secrets-oob
                   key: github-oauth-client-secret
                   optional: true
             # webhook 入口（8082）：验平台签名后附内部 HMAC 转发主应用
             # （默认 http://cogneva:9091，可用 COGNEVA_WEBHOOK_FORWARD_URL
             # 覆盖）。任一 secret 未配置时对应端点一律 503（fail-closed），
-            # 真实值带外写入（kubectl edit secret cogneva-secrets）。
+            # 真实值带外写入（kubectl edit secret cogneva-secrets-oob）。
             - name: COGNEVA_GITHUB_WEBHOOK_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: cogneva-secrets
+                  name: cogneva-secrets-oob
                   key: github-webhook-secret
                   optional: true
             - name: COGNEVA_GITEE_WEBHOOK_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: cogneva-secrets
+                  name: cogneva-secrets-oob
                   key: gitee-webhook-token
                   optional: true
             # 通知出口机器人报文签名（钉钉/飞书各一把）：业务 Pod 零持有，
             # 出口要签名时经 /v1/notification/sign 借一次。未配置＝该出口的报文
             # 不签名（机器人用关键词安全是合法形态），端点具名拒绝。真实值带外
-            # 写入（kubectl edit secret cogneva-secrets），不入库。
+            # 写入（kubectl edit secret cogneva-secrets-oob），不入库。
             - name: COGNEVA_NOTIFICATION_DINGTALK_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: cogneva-secrets
+                  name: cogneva-secrets-oob
                   key: notification-dingtalk-secret
                   optional: true
             - name: COGNEVA_NOTIFICATION_FEISHU_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: cogneva-secrets
+                  name: cogneva-secrets-oob
                   key: notification-feishu-secret
                   optional: true
             - name: COGNEVA_WEBHOOK_INTERNAL_SECRET
@@ -245,11 +245,13 @@ spec:
             - name: COGNEVA_CLICKHOUSE_USERNAME
               value: "cogneva"
             # 密码由可观测栈安装时镜像写入（monitoring/clickhouse-credentials →
-            # cogneva-secrets/clickhouse-password）；未部署时 optional 缺省即降级。
+            # cogneva-secrets-oob/clickhouse-password）；未部署时 optional 缺省即降级。
+            # 它之所以不在内部份：今天只有本进程读它，放进内部份反而是把读取面
+            # 铺给持内部份的每一个业务 Pod（那份是整体 get）。
             - name: COGNEVA_CLICKHOUSE_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: cogneva-secrets
+                  name: cogneva-secrets-oob
                   key: clickhouse-password
                   optional: true
             # 观测通道监听端口；与容器端口同源，避免两处漂移。
@@ -315,7 +317,8 @@ spec:
         # ContainerCreating——而网关是全部出站调用的唯一出口。
         - name: git-ssh-key
           secret:
-            secretName: cogneva-secrets
+            # 私钥是账号级写权限的凭证，只在带外份：主应用读不到它。
+            secretName: cogneva-secrets-oob
             optional: true
             # 0400：OpenSSH 只在**属主是自己**时才检查权限位。容器以 1001 运行、
             # 而 Secret 卷文件属主是 root（fsGroup 只加组读），所以这条检查会被

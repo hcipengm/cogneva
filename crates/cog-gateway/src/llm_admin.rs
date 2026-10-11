@@ -20,8 +20,9 @@ use std::sync::Arc;
 
 const SA_DIR: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
 const API_BASE: &str = "https://kubernetes.default.svc";
-const SECRET_NAME: &str = "cogneva-secrets";
 /// 上游池条目：JSON 数组，每元素 {api_style, base_url, model, api_key}。
+/// 它住带外片——这个键只被安全网关读，放内部片等于铺给持那一份的每个业务 Pod
+/// （那份是整对象 get）。键位表与归属见 `secret_layout`。
 const SECRET_UPSTREAMS_KEY: &str = "llm-upstreams";
 const GATEWAY_DEPLOYMENT: &str = "cogneva-security-gateway";
 
@@ -172,15 +173,8 @@ pub async fn llm_config_handler(
         }
     };
 
-    if let Err(e) = kube
-        .patch(
-            &format!(
-                "/api/v1/namespaces/{}/secrets/{}",
-                kube.namespace, SECRET_NAME
-            ),
-            json!({"stringData": {SECRET_UPSTREAMS_KEY: pool_json}}),
-        )
-        .await
+    if let Err(e) =
+        crate::secret_layout::patch_fields(&kube, json!({ SECRET_UPSTREAMS_KEY: pool_json })).await
     {
         return (
             StatusCode::BAD_GATEWAY,
@@ -778,11 +772,13 @@ impl KubeClient {
 
     /// 上游池是否已写入集群 Secret（网关凭证的唯一事实源）。
     async fn secret_has_key(&self) -> Result<bool, String> {
+        // 只探带外那一片：这个键不可能住别处，读两片只会把"带外那份读不到"
+        // 变成一次多余的失败请求。
         let resp = self
             .http
             .get(format!(
-                "{API_BASE}/api/v1/namespaces/{}/secrets/{}",
-                self.namespace, SECRET_NAME
+                "{API_BASE}{}",
+                crate::secret_layout::oob_secret_api_path(&self.namespace)
             ))
             .bearer_auth(&self.token)
             .send()

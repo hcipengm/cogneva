@@ -395,10 +395,11 @@ pub(crate) async fn ensure_git_identity(config: &IdentityConfig) -> Outcome {
         Ok(kube) => kube,
         Err(e) => return Outcome::NotOwner(format!("不在集群内运行（{e}）")),
     };
-    let path = crate::contribution_admin::secret_api_path(kube.namespace());
-    let secret = match kube.get_json(&path).await {
+    // 身份事实横跨两片：生效私钥/候选私钥/token 在带外片，状态位与公钥在内部片。
+    // 合成视图让下面的判据仍然只按 key 取值，不必知道哪半住哪。
+    let secret = match crate::secret_layout::load_data_view(&kube).await {
         Ok(secret) => secret,
-        Err(e) => return Outcome::NotOwner(format!("读取 {path} 失败（{e}）")),
+        Err(e) => return Outcome::NotOwner(e),
     };
     let facts = Facts::from_secret(&secret);
     let step = facts.step();
@@ -423,7 +424,7 @@ pub(crate) async fn ensure_git_identity(config: &IdentityConfig) -> Outcome {
                 fingerprint = %fingerprint(&keypair.public_line).unwrap_or_default(),
                 "git 身份自举：生成密钥对（尚未确认可用）"
             );
-            if let Err(e) = patch_secret(
+            if let Err(e) = crate::secret_layout::patch_fields_b64(
                 &kube,
                 json!({
                     SECRET_SSH_PENDING_KEY: keypair.private_pem,
@@ -445,7 +446,10 @@ pub(crate) async fn ensure_git_identity(config: &IdentityConfig) -> Outcome {
     // 停在等人这一步时把理由落盘：面板要显示、人要知道下一步该做什么。
     if let Outcome::AwaitingToken(reason) = &outcome {
         if facts.note.as_deref() != Some(reason.as_str()) {
-            if let Err(e) = patch_secret(&kube, json!({ SECRET_IDENTITY_NOTE: reason })).await {
+            if let Err(e) =
+                crate::secret_layout::patch_fields_b64(&kube, json!({ SECRET_IDENTITY_NOTE: reason }))
+                    .await
+            {
                 warn!("git 身份自举：写入待办理由失败: {e}");
             }
         }
@@ -581,7 +585,7 @@ async fn promote(
     private_key: &str,
     public_line: &str,
 ) -> Result<(), String> {
-    patch_secret(
+    crate::secret_layout::patch_fields_b64(
         kube,
         json!({
             SECRET_SSH_PRIVATE_KEY: private_key,
@@ -602,30 +606,6 @@ async fn promote(
         "git 身份自举：滚动安全网关以装载新私钥"
     );
     kube.restart_gateway().await
-}
-
-/// 以明文写 Secret。写入用 `data`（base64）而不是 `stringData`：同一份 patch 里
-/// 还要把待确认键位置空，两类字段混用会让"删掉的那个到底生效没有"变得不可读。
-async fn patch_secret(kube: &KubeClient, string_fields: serde_json::Value) -> Result<(), String> {
-    let engine = base64::engine::general_purpose::STANDARD;
-    let mut data = serde_json::Map::new();
-    if let Some(map) = string_fields.as_object() {
-        for (key, value) in map {
-            match value {
-                serde_json::Value::String(text) => {
-                    data.insert(key.clone(), json!(engine.encode(text)));
-                }
-                _ => {
-                    data.insert(key.clone(), serde_json::Value::Null);
-                }
-            }
-        }
-    }
-    kube.patch(
-        &crate::contribution_admin::secret_api_path(kube.namespace()),
-        json!({ "data": serde_json::Value::Object(data) }),
-    )
-    .await
 }
 
 /// 一次 SSH 自证**实际证到了什么**。

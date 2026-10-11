@@ -7,7 +7,8 @@
 //! 包布局：
 //! ```text
 //! <pkg>/manifest.json                 版本/rev/实例指纹/时间/各段内容清单
-//! <pkg>/secrets/cogneva-secrets.yaml  apply-able Secret（data 为 base64）
+//! <pkg>/secrets/cogneva-secrets.yaml      apply-able Secret（data 为 base64）
+//! <pkg>/secrets/cogneva-secrets-oob.yaml  同上，带外凭证那一份（只被网关读）
 //! <pkg>/pg/public.<table>.csv         COPY ... TO STDOUT CSV（分区父表含全分区）
 //! <pkg>/pg/sequences.sql              全部序列的 setval 语句
 //! <pkg>/qdrant/<collection>.snapshot  服务端一致性快照
@@ -27,6 +28,12 @@ use sqlx::PgPool;
 pub const PACKAGE_PREFIX: &str = "cogneva-backup-";
 pub const PACKAGE_SUFFIX: &str = ".tar.zst";
 const TIMESTAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
+
+/// 内部实例密钥对象名：业务 Pod 读的那一份（数据库/缓存/内部签名/S3/邮件）。
+pub const SECRET_NAME_INTERNAL: &str = "cogneva-secrets";
+/// 带外凭证对象名：只被安全网关读的那一份（LLM 上游、平台 token、git 身份私钥…）。
+/// 两片是权限边界，不是分类：内部那份是整对象 get，谁持它就读得到里面每一个键。
+pub const SECRET_NAME_OOB: &str = "cogneva-secrets-oob";
 
 /// 表发现查询：public schema 的普通表（relkind=r）与分区父表（p），
 /// 排除分区子表（pg_inherits 有登记的就是子表——父子都导会双份）与
@@ -88,6 +95,10 @@ pub struct BackupConfig {
     pub qdrant_http_url: String,
     pub backup_dir: PathBuf,
     pub secrets_dir: PathBuf,
+    /// 带外凭证那一份 Secret 的挂载点（只被安全网关读的键）。两片分开导出，
+    /// 恢复时按对象名逐个 apply——合并成一份会让恢复把一个对象写回成两个的
+    /// 内容，而权限面正是按对象划的。
+    pub oob_secrets_dir: PathBuf,
     /// cogneva-data-pvc 挂载根；对象子树取其下 `storage/`。
     pub data_dir: PathBuf,
     pub keep_count: usize,
@@ -108,6 +119,9 @@ impl BackupConfig {
             ),
             secrets_dir: PathBuf::from(
                 std::env::var("COGNEVA_SECRETS_DIR").unwrap_or_else(|_| "/secrets".into()),
+            ),
+            oob_secrets_dir: PathBuf::from(
+                std::env::var("COGNEVA_OOB_SECRETS_DIR").unwrap_or_else(|_| "/secrets-oob".into()),
             ),
             data_dir: PathBuf::from(
                 std::env::var("COGNEVA_DATA_DIR")
@@ -281,9 +295,16 @@ pub async fn restore_postgres(
 
 /// Secret 卷（只读挂载，key 一文件）打成 apply-able manifest。
 /// BTreeMap 让 key 序确定，包内容可 diff。
+///
+/// The object name is a parameter because the instance keeps two of them: the
+/// business-readable one and the out-of-band one only the gateway reads. A
+/// single manifest would have to invent a merge that the cluster does not have,
+/// and the restore side applies whole objects — so the packaging keeps the same
+/// two objects it read.
 pub fn build_secret_manifest(
     secrets_dir: &Path,
     namespace: &str,
+    object_name: &str,
 ) -> Result<(String, Vec<String>), Box<dyn std::error::Error>> {
     let mut data = BTreeMap::new();
     for entry in std::fs::read_dir(secrets_dir)? {
@@ -307,7 +328,7 @@ pub fn build_secret_manifest(
     }
     let keys: Vec<String> = data.keys().cloned().collect();
     let mut yaml = format!(
-        "apiVersion: v1\nkind: Secret\nmetadata:\n  name: cogneva-secrets\n  \
+        "apiVersion: v1\nkind: Secret\nmetadata:\n  name: {object_name}\n  \
          namespace: {namespace}\ntype: Opaque\ndata:\n"
     );
     for (k, v) in &data {
@@ -577,8 +598,27 @@ async fn run_backup_into(
 ) -> Result<BackupManifest, Box<dyn std::error::Error>> {
     let secrets_dir = staging.join("secrets");
     std::fs::create_dir_all(&secrets_dir)?;
-    let (yaml, keys) = build_secret_manifest(&cfg.secrets_dir, &cfg.namespace)?;
-    std::fs::write(secrets_dir.join("cogneva-secrets.yaml"), yaml)?;
+    // 两片各出一份 apply-able manifest。键名带上对象前缀：只列裸键名的话，
+    // 包清单读起来像"这些键都在一个对象里"，而恢复端是按对象 apply 的——
+    // 那句误读会在换机时才暴露。
+    let mut keys = Vec::new();
+    for (dir, object_name) in [
+        (&cfg.secrets_dir, SECRET_NAME_INTERNAL),
+        (&cfg.oob_secrets_dir, SECRET_NAME_OOB),
+    ] {
+        let (yaml, object_keys) = match build_secret_manifest(dir, &cfg.namespace, object_name) {
+            Ok(v) => v,
+            // 带外那份可能还没被创建过（全新安装、向导还没跑）：那不是备份失败，
+            // 包里少一份空对象而已。内部那份缺失是真问题（含实例指纹）。
+            Err(e) if object_name == SECRET_NAME_OOB => {
+                tracing::warn!(dir = %dir.display(), error = %e, "备份：带外凭证对象读不到，跳过该片");
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        std::fs::write(secrets_dir.join(format!("{object_name}.yaml")), yaml)?;
+        keys.extend(object_keys.into_iter().map(|k| format!("{object_name}/{k}")));
+    }
 
     let pool = PgPool::connect(&cfg.database_url).await?;
     let postgres = backup_postgres(&pool, &staging.join("pg")).await?;
@@ -773,7 +813,7 @@ mod tests {
         std::os::unix::fs::symlink("..data/pg-password", root.join("pg-password")).unwrap();
         std::os::unix::fs::symlink("..data/jwt-secret", root.join("jwt-secret")).unwrap();
 
-        let (yaml, keys) = build_secret_manifest(root, "cogneva").unwrap();
+        let (yaml, keys) = build_secret_manifest(root, "cogneva", SECRET_NAME_INTERNAL).unwrap();
 
         assert_eq!(keys, vec!["jwt-secret", "pg-password"], "key 必须排序");
         assert!(yaml.starts_with("apiVersion: v1\nkind: Secret\n"));
@@ -786,7 +826,7 @@ mod tests {
     #[test]
     fn secret_manifest_fails_on_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(build_secret_manifest(dir.path(), "cogneva").is_err());
+        assert!(build_secret_manifest(dir.path(), "cogneva", SECRET_NAME_INTERNAL).is_err());
     }
 
     #[test]

@@ -91,6 +91,12 @@ spec:
                 - name: secrets
                   mountPath: /secrets
                   readOnly: true
+                # 带外那一份同挂：平台 token、git 身份私钥都只在这里，不导就等于
+                # 换机后要回平台后台重新签发一遍。两片分开导出、分开恢复——它们
+                # 是两个对象，权限面也是按对象划的。
+                - name: secrets-oob
+                  mountPath: /secrets-oob
+                  readOnly: true
                 - name: backup
                   mountPath: /backups
           volumes:
@@ -100,6 +106,12 @@ spec:
             - name: secrets
               secret:
                 secretName: cogneva-secrets
+            - name: secrets-oob
+              secret:
+                secretName: cogneva-secrets-oob
+                # 全新安装、向导还没跑过时这个对象可能没有键，但对象本身由
+                # init-secrets.sh 建了出来；optional 让"还没配"不等于"备份跑不起来"。
+                optional: true
             - name: backup
               persistentVolumeClaim:
                 claimName: cogneva-backup-pvc
