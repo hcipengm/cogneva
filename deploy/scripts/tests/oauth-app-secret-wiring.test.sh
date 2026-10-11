@@ -110,12 +110,23 @@ for key in "${oauth_keys[@]}"; do
     || fail "chart 的 ${OBJ_OOB} 模板没有声明 ${key}"
 done
 
-# Every key delivered out of band -- by the wizard, or by an operator editing
-# the Secret -- lives only in the out-of-band Secret. The chart owns that
-# object, so each of them must be read back from the live Secret when values
-# provide nothing. Named here rather than derived: the point of the list is to
-# be the second opinion to each producer's claim, and a list derived from those
-# claims would agree with them by construction.
+# Every key delivered out of band -- by the wizard, by the runtime itself, or by
+# an operator editing the Secret -- lives only in the out-of-band Secret. The
+# chart owns that object, so each of them must be read back from the live Secret
+# when values provide nothing. Named here rather than derived: the point of the
+# list is to be the second opinion to each producer's claim, and a list derived
+# from those claims would agree with them by construction.
+#
+# The whole list, not just the wizard-written head of it. A key whose value the
+# chart does not carry is not a key the chart is excused from migrating: on the
+# upgrade that creates this object the old one still holds the only copy of the
+# git identity key, the Gitee refresh token and the ClickHouse password, and a
+# key left out of the template is dropped without an error -- the gateway reads
+# an empty string and every feature behind it goes quietly unavailable. The tail
+# of the list is written after install (the identity bootstrap, the token
+# refresher, another installer's script), which is a reason to resolve it
+# differently -- never write a fallback empty value for it -- not a reason to
+# leave it out.
 out_of_band=(
   llm-upstreams
   github-token
@@ -126,6 +137,13 @@ out_of_band=(
   github-oauth-client-secret
   notification-dingtalk-secret
   notification-feishu-secret
+  github-app-id
+  github-app-installation-id
+  github-app-private-key
+  git-ssh-private-key
+  git-ssh-private-key-pending
+  gitee-refresh-token
+  clickhouse-password
 )
 [ "${#out_of_band[@]}" -gt 0 ] || fail "带外凭证清单是空的，这一节会静默变成空转"
 
@@ -252,10 +270,20 @@ for manifest in "${app_workloads[@]}"; do
 done
 
 # --- 3) out-of-band credentials survive a chart upgrade -------------------
+# Two sources, because there are two upgrades this template has to survive. The
+# steady state is the object itself: a value written after install (by the
+# wizard, by the runtime, by an operator) must be read back from the live Secret
+# instead of being rewritten to the empty default. The one-off case is the
+# upgrade that creates this object at all -- the split's migration -- where the
+# only copy still sits in the business object. A template missing the second
+# source cannot migrate an existing install, and the loss is silent in exactly
+# the same way: the key renders empty and the gateway reads the empty string.
 chart_secret="${repo}/deploy/helm/cogneva/templates/secret-oob.yaml"
 for k in "${out_of_band[@]}"; do
   grep -qF "index \$oob.data \"${k}\"" "${chart_secret}" \
     || fail "chart 升级会把 ${k} 覆盖成空值：${OBJ_OOB} 模板没有保留既有值"
+  grep -qF "index \$legacy.data \"${k}\"" "${chart_secret}" \
+    || fail "切分当次的升级不会把 ${k} 搬到 ${OBJ_OOB}：模板没有旧对象迁移桥"
 done
 
 # Every key this gate is about must be in that list, or the list drifted away
@@ -323,6 +351,21 @@ done
 for k in "${rust_oob[@]}"; do
   printf '%s\n' "${shell_oob[@]}" | grep -qx "${k}" \
     || fail "Rust 的键表里有 ${k}，init-secrets.sh 的带外表没有：老安装里会留下一份副本在被业务 Pod 读得到的地方"
+done
+
+# The third opinion has to agree too, in both directions. Section 3 walks this
+# list rather than the producers' tables, so a key the producers carry but this
+# list omits would leave the preservation rule unasserted for it while every
+# assertion in the file still passed -- the coverage hole this check closes.
+# Adding a key to the Rust table without adding it here now fails, which is the
+# point: the list is meant to be read, not refreshed from the thing it judges.
+for k in "${out_of_band[@]}"; do
+  printf '%s\n' "${rust_oob[@]}" | grep -qx "${k}" \
+    || fail "${k} 在这份清单里，Rust 的带外键表没有：这一节的断言对象与运行期实际路由的键已经分家"
+done
+for k in "${rust_oob[@]}"; do
+  printf '%s\n' "${out_of_band[@]}" | grep -qx "${k}" \
+    || fail "Rust 的键表里有 ${k}，这份清单没有：升级保留规则在这一节里没有被断言"
 done
 
 echo "PASS: ${oauth_keys[*]} 与 ${sign_envs[*]} 都有消费面（chart/k3s/预渲染），${sign_base} 到得了每个能签名的进程，带外凭证在升级时全部保留，且没有一个留在业务份里；两处键表一致（${#rust_oob[@]} 个带外键）"
