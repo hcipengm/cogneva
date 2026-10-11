@@ -200,9 +200,14 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          can land in: `minimal` for prose only, `compile` and `tests` for source \
          that is not a criterion, `structural` for a configuration value no \
          criterion reads and for the deployment's own topology, and `real_gate` \
-         for a change that can move a criterion. The cells are published as a \
-         full cross product, so a tier that never fired and a producer that was \
-         never wired both read as zero rather than as a missing series. Read \
+         for a change that can move a criterion. The five cells are seeded at \
+         zero by the first change the pipeline tiers: from that change on, a \
+         tier that never fired reads as a zero while an absent series means the \
+         reading was never wired. Before that first change nothing is published \
+         at all, so an absent series there says only that nothing has been \
+         tiered yet -- no change has reached the pipeline, or execution has \
+         moved into a per-change job, which publishes no reading of its own. \
+         Read \
          `real_gate` against the total: a fleet that tiles every change but \
          never once reaches the real gate is a routing that has gone inert, and \
          that is the reading no other series states",

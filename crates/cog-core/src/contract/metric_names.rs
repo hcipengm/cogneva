@@ -270,8 +270,10 @@ metric_names! {
     // tier" both looked like a quiet fleet.
     //
     // A counter, because a change reaching the pipeline is a cumulative event;
-    // the cells are the closed set of tiers, published as a full cross product
-    // so an absent cell and a cell stuck at zero stay different readings.
+    // the cells are the closed set of tiers, seeded at zero by the first change
+    // the pipeline tiers -- from then on an absent cell and a cell stuck at zero
+    // stay different readings. Before that first change nothing is published at
+    // all, and an absent series says only that nothing has been tiered yet.
     CHANGE_TIER_TOTAL => "cogneva_change_tier_total",
 
     // cog-reflection — how each round of the artifact-level evolution search

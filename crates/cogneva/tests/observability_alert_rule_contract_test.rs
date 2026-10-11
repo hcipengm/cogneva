@@ -102,8 +102,11 @@ const PRODUCED: &[(&str, &str)] = &[
     ),
     // Which gates a change was routed to, labelled by the tier it landed in.
     // The pipeline publishes it; the cells are seeded at zero on the first
-    // change it tiers, so the rule below can read `real_gate` against the total
-    // on every scrape rather than only after a change has been routed.
+    // change it tiers, so from that change on the rule below can read
+    // `real_gate` against the total on every scrape. Before that first change
+    // the series is absent, and `increase` over an absent series is empty: the
+    // rule then stays quiet rather than reading a fleet that never reaches the
+    // real gate.
     (
         "cogneva_change_tier_total",
         "crates/cog-reflection/src/change_pipeline.rs",

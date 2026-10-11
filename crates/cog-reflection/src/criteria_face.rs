@@ -164,9 +164,11 @@ impl Tier {
 
     /// Every tier this build can return, weakest first.
     ///
-    /// Published as a full cross product so that "this tier never fired" and
-    /// "this reading was never wired up" stay different readings: both leave a
-    /// series that is absent otherwise, and only the second is a defect.
+    /// The publisher seeds all of these at zero on the first change it tiers,
+    /// so from that change on "this tier never fired" and "this reading was
+    /// never wired up" stay different readings: the first is a zero, the second
+    /// an absent series. Before that first change nothing is published at all,
+    /// and the two cannot yet be told apart.
     pub const ALL: [Tier; 5] = [
         Tier::Minimal,
         Tier::Compile,
