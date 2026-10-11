@@ -128,6 +128,19 @@ the denominator never shrinks — and is reported separately in `errored`, becau
 down" and "the answer was wrong" both score 0 but are different facts. A scaffold that cannot run
 at all errors out rather than scoring low: a missing platform has to look like a missing platform.
 
+### What is checked against the real data
+
+The unit tests use fixtures, so three tests read the fetch script's actual output when
+`COG_EVAL_DATA_ROOT` points at it (and print `SKIP` when it does not, rather than passing
+silently): one per benchmark asserting the row/task counts (2,500 / 731 / 503) and the shapes the
+adapters depend on. A fourth runs both directions of the whole chain — the reference arm (a
+correct solution) must score every case and the degenerate arm (an empty one) must score none,
+with `errored == 0` in both — over the real data, with only the container/Compose backend stubbed:
+
+```sh
+COG_EVAL_DATA_ROOT=/srv/cogneva/benchmarks cargo test -p cog-eval
+```
+
 ### A dead upstream yields data and interfaces, not numbers
 
 This is the honest boundary of the crate today. The rig, the four rows, and all three benchmarks'
