@@ -17,7 +17,14 @@ use crate::bench::Benchmark;
 use crate::dataset::EvalCase;
 use crate::scaffold::{AgentScaffold, SolveContext};
 
+/// 数据根目录从哪个环境变量取。
+///
+/// 名字只写在这一个地方：取数脚本写进哪个目录、跑表的人把哪个目录指过来，靠的是
+/// 同一个变量。各写一份拼写，就会有两份能互相不一致的说法。
+pub const DATA_ROOT_ENV: &str = "COG_EVAL_DATA_ROOT";
+
 /// 一次实验的配置。
+#[derive(Debug, Clone)]
 pub struct RunConfig {
     /// 数据集根目录，取数脚本的 `--dest` 落点。
     ///
@@ -38,6 +45,25 @@ impl RunConfig {
             seeds: vec![0, 1, 2],
             max_concurrency: 4,
         }
+    }
+
+    /// 从 [`DATA_ROOT_ENV`] 取数据根目录。
+    ///
+    /// 变量没设、或设成空串都是错误，不回落：一条默认路径会把「数据根指错了」这条
+    /// 症状藏起来，而它读起来正好像是「基准读不出题」。
+    pub fn from_env() -> anyhow::Result<Self> {
+        let raw = std::env::var(DATA_ROOT_ENV).map_err(|_| {
+            anyhow::anyhow!(
+                "{DATA_ROOT_ENV} is not set: the rig does not guess where the benchmark data \
+                 lives -- point it at the directory the fetch script wrote to"
+            )
+        })?;
+        if raw.trim().is_empty() {
+            anyhow::bail!(
+                "{DATA_ROOT_ENV} is empty: an empty data root reads as a benchmark with no cases"
+            );
+        }
+        Ok(Self::new(raw))
     }
 }
 

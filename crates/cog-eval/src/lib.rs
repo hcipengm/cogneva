@@ -53,7 +53,7 @@ pub use long_run::{
 };
 pub use metric::{EvalMetric, EvalResult, MetricValue, StepRecord};
 pub use report::{DimensionSummary, EvalReport, MetricAggregate, PerCaseResult, ReportFormat};
-pub use rig::{Cell, CellStat, Rig, RunConfig, SeedScore, Table};
+pub use rig::{Cell, CellStat, Rig, RunConfig, SeedScore, Table, DATA_ROOT_ENV};
 pub use runner::{EvalRunner, RunnerConfig};
 pub use scaffold::{
     AgentOutput, AgentScaffold, Budget, CaseEnv, FinishReason, NoEnv, SolveContext, ToolSet,
