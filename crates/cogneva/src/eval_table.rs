@@ -59,7 +59,8 @@ usage: cogneva eval-table --pins <file> --backbone <model>@<version> --judge <mo
                           [--benchmarks hle,swe-bench-pro,toolathlon]
                           [--scaffolds codeact,gepa,agentflow,nql] [--seeds 0,1,2]
                           [--subset <file>] [--out <file>]
-                          [--admission <dir>] [--admission-floor-unmeasured <n>]
+                          [--concurrency-slot <n>] [--admission <dir>]
+                          [--admission-floor-unmeasured <n>]
                           [--admission-ceiling-unmeasured <n>]
 
   --pins       the pins file: what the data is pinned by, as printed by
@@ -83,22 +84,33 @@ usage: cogneva eval-table --pins <file> --backbone <model>@<version> --judge <mo
                or dropping a case. The archive's path and content hash go into the table header,
                because which cases ran is part of what the table says.
   --out        write the output here instead of standard output
+  --concurrency-slot
+               how many cases this run may have in flight at once. It is one of three factors and
+               the effective concurrency is the smallest of them: this slot, the admission gate's
+               bound at that moment, and each column's own isolation ceiling (toolathlon's cases
+               share one postgres, so its ceiling is one). A slot and a gate are not alternatives:
+               give both and both apply. At least one of the two has to be given -- a run with
+               neither is refused before it starts, because nothing would bound how much of a host
+               that also runs the cluster this run takes.
   --admission  an existing directory that turns the admission gate on. Point it at the same
                directory the build gate uses (self_evolution.build_gate.lock_dir): the point of
                it is that builds and benchmark cases contend for one machine, and two gates on
                two directories cap each other's absence. The directory has to exist -- a new
                empty one would gate nothing while looking like it does. Without this flag the
-               gate is not in force and the run says so; it is not run at a lower bound. The
-               gate's bound is not a constant: a controller moves it between the two bounds
-               below as the host's pressure moves, and only judged cases are ever held back.
+               gate is not in force and the run says so, and then the static slot and each column's
+               own ceiling are the only bounds left. The gate's bound is not a constant: a
+               controller moves it between the
+               two bounds below as the host's pressure moves, and only judged cases are ever held
+               back.
   --admission-floor-unmeasured
   --admission-ceiling-unmeasured
-               the gate's lower and upper bounds. NEITHER HAS BEEN MEASURED on this host: the
-               numbers here are a form floor (never zero) and a placeholder equal to the fixed
-               concurrency this driver used before, not a reading. The real ceiling has to be
-               derived per case from its peak memory and cpu seconds, which waits for the
-               benchmarks' execution side. They only mean anything with --admission: passing one
-               without it is an error rather than a silently ignored number.
+               the gate's lower and upper bounds. NEITHER HAS BEEN MEASURED on this host: both are
+               the driver's own form defaults (a floor that is never zero, a placeholder ceiling),
+               not readings. The real ceiling has to be derived per case from its peak memory and
+               cpu seconds, which waits for the benchmarks' execution side. The numbers in force
+               are printed in the report's gate section, where they can be read back. They only
+               mean anything with --admission: passing one without it is an error rather than a
+               silently ignored number.
 
   the nql row reaches the platform from the environment: COG_EVAL_PLATFORM_BASE is the platform
   endpoint (COG_EVAL_PLATFORM_TOKEN, COG_EVAL_PLATFORM_DEADLINE_SECS optional). With no base the
@@ -176,7 +188,13 @@ pub struct EvalTableArgs {
     pub seeds: Vec<u64>,
     /// 只跑这份存档点名的题；`None` ＝全量。
     pub subset: Option<PathBuf>,
-    /// 准入闸门的目录；`None` ＝不开闸门，用固定名额。
+    /// 这一格同时在跑的 case 数上限。**没有默认值**：给了默认值，这次跑的界就从命令行上
+    /// 消失了，而它决定了这台与集群同机的宿主被压到什么程度。
+    ///
+    /// 它与闸门**不是二选一**：有效并发 ＝ min(这一列的隔离上界, 闸门此刻的界, 这个名额)。
+    /// 两个都不给是解析期的错误，不是「那就用一个隐含的数」。
+    pub concurrency_slot: Option<usize>,
+    /// 准入闸门的目录；`None` ＝不开闸门，这时只有静态名额与每一列自己的隔离上界在管。
     ///
     /// 目录**由参数直接给出**，不给默认值：默认值会把「指到构建方那个目录」变成一句话里
     /// 的一个约定，而指错目录的闸门与没开闸门在报表上是两件不同的事，前者更糟——它看起来
@@ -260,6 +278,7 @@ impl EvalTableArgs {
         let mut scaffolds: Option<Vec<String>> = None;
         let mut seeds: Option<Vec<u64>> = None;
         let mut subset: Option<PathBuf> = None;
+        let mut concurrency_slot: Option<usize> = None;
         let mut admission_dir: Option<PathBuf> = None;
         let mut admission_floor: Option<usize> = None;
         let mut admission_ceiling: Option<usize> = None;
@@ -304,6 +323,10 @@ impl EvalTableArgs {
                     subset = Some(PathBuf::from(next_arg(args, i, flag)?));
                     i += 2;
                 }
+                "--concurrency-slot" => {
+                    concurrency_slot = Some(count_arg(args, i, flag)?);
+                    i += 2;
+                }
                 "--seeds" => {
                     let mut parsed = Vec::new();
                     for item in parse_list(next_arg(args, i, flag)?)? {
@@ -341,7 +364,7 @@ impl EvalTableArgs {
         };
 
         // 两个界限只在闸门开着时才有意义。给了数却不开闸门，是「以为自己在设一个界」而
-        // 实际上没有—— silently 吞掉它，这次跑就会以固定名额跑完，而命令行上写着上界 3。
+        // 实际上没有—— silently 吞掉它，这次跑就会以静态名额跑完，而命令行上写着上界 3。
         for (flag, set) in [
             ("--admission-floor-unmeasured", admission_floor),
             ("--admission-ceiling-unmeasured", admission_ceiling),
@@ -362,6 +385,18 @@ impl EvalTableArgs {
             }
         }
 
+        // 两个界至少要给一个，而且不是在这里补一个默认值：这次跑放行几个，是命令行上必须
+        // 显式说出来的东西，缺了就停在解析这一步——跑起来才发现没有界，读的人只会以为
+        // 「界是宿主给的」。
+        if concurrency_slot.is_none() && admission_dir.is_none() {
+            return Err(
+                "--concurrency-slot or --admission is required: effective concurrency is the \
+                 smallest of each column's own isolation ceiling, the gate's bound, and this \
+                 slot, and a run that gives neither of the last two has no bound at all"
+                    .into(),
+            );
+        }
+
         Ok(Self {
             data_root,
             benchmarks: selected,
@@ -369,6 +404,7 @@ impl EvalTableArgs {
             // 种子表的默认值取自评测台的主表规格，不在这里再抄一份数字。
             seeds: seeds.unwrap_or_else(|| RunConfig::new(".").seeds),
             subset,
+            concurrency_slot,
             pins: pins.ok_or("--pins is required: a table without pins is not comparable")?,
             // 工具臂默认 `platform`：那是主表要跑的那一臂。`none` 要显式写出，好让
             // 「这次跑的是一臂诊断」在命令行上就被点明，而不是默认落进去。
@@ -766,7 +802,7 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
         RunConfig {
             data_root: data_root.clone(),
             seeds: args.seeds.clone(),
-            max_concurrency: 4,
+            max_concurrency: args.concurrency_slot,
             subset: subset.clone(),
             checkpoint: Some(checkpoint.clone()),
             admission: admission.clone(),
@@ -980,6 +1016,32 @@ fn render(args: &EvalTableArgs, wiring: WiringReport<'_>, readings: Readings<'_>
     }
 
     out.push_str("\n## gate\n");
+    // 一次跑放行几个，由三个数一起定：命令行给的静态名额、闸门当下的界、以及每一列自己的
+    // 隔离上界。三个里至少有一个是命令行给的（解析时就卡住了），但生效值只有一个——只报
+    // 生效值的话，读的人没法判断这次跑是被谁挡住的，也没法判断换一个就能不能多放。
+    out.push_str(&format!(
+        "concurrency-slot\t{}\n",
+        match args.concurrency_slot {
+            Some(n) => n.to_string(),
+            None => "none: this run is bounded by the gate and each column's own ceiling only"
+                .to_string(),
+        }
+    ));
+    out.push_str(
+        "concurrency-rule\teffective = min(column ceiling, gate bound, static slot): the three \
+         are not alternatives and the smallest one wins\n",
+    );
+    for (name, ceiling) in &table.column_ceilings {
+        out.push_str(&format!(
+            "concurrency-column\t{name}\t{}\n",
+            match ceiling {
+                Some(n) => format!("ceiling={n}"),
+                None => "ceiling=none: the cases in this column do not share state, so the \
+                         column itself adds no ceiling"
+                    .to_string(),
+            }
+        ));
+    }
     match &table.gate {
         Some(gate) => {
             // 目录身份跟着界一起出：两台宿主、两个目录，报出来的是两个界，而它们各自都
@@ -1036,8 +1098,8 @@ fn render(args: &EvalTableArgs, wiring: WiringReport<'_>, readings: Readings<'_>
             }
         }
         None => out.push_str(
-            "gate\tnot in force: no --admission directory was given, so this run used the fixed \
-             per-column concurrency and never looked at the host\n",
+            "gate\tnot in force: no --admission directory was given, so the bound on this run is \
+             the static slot and each column's own ceiling, and nothing looked at the host\n",
         ),
     }
 
@@ -1284,6 +1346,9 @@ mod tests {
             "m@1",
             "--judge",
             "j@1",
+            // 两个界至少要给一个：这几条用例不带闸门，所以给静态名额。
+            "--concurrency-slot",
+            "2",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -1390,9 +1455,17 @@ mod tests {
             ToolArm::Platform,
             "不给就是主表那一臂"
         );
-        assert!(args(&["--backbone", "m@1", "--judge", "j@1"])
-            .unwrap_err()
-            .contains("--pins"));
+        assert!(args(&[
+            "--backbone",
+            "m@1",
+            "--judge",
+            "j@1",
+            // 放行几个也必给，这里一并给上，好让报出来的错就是缺 pins 那一条。
+            "--concurrency-slot",
+            "2",
+        ])
+        .unwrap_err()
+        .contains("--pins"));
     }
 
     fn one_cell_table() -> Table {
@@ -1403,6 +1476,8 @@ mod tests {
             wanted_seeds: 3,
             unreadable: vec![],
             gate: None,
+            // 这一列自己的隔离上界：hle 各例不共享状态，所以它不加界。
+            column_ceilings: vec![("hle".into(), None)],
         }
     }
 
@@ -1527,6 +1602,68 @@ mod tests {
         assert!(text.contains("## gate\n"), "{text}");
         assert!(text.contains("gate\tnot in force"), "{text}");
         assert!(!text.contains("gate-dir"), "{text}");
+    }
+
+    /// 一次跑放行几个，是用三个数取小来的；报告只印生效值的话，读的人看不出是被谁挡住的
+    /// 那一次，也就没法判断换一个参数能不能多放。
+    #[test]
+    fn the_gate_section_names_the_slot_the_min_rule_and_every_columns_ceiling() {
+        let args = EvalTableArgs::parse(&minimal()).unwrap();
+        let verified = BTreeMap::new();
+        let mut table = one_cell_table();
+        // 一列自带隔离上界（各例共享一个 postgres），一列没有。
+        table.column_ceilings = vec![("hle".into(), None), ("toolathlon".into(), Some(1))];
+        let text = render(
+            &args,
+            WiringReport {
+                missing: &[],
+                platform_base: None,
+            },
+            Readings {
+                data_root: Path::new("/data"),
+                pins: &Pins::default(),
+                verified: &verified,
+                subset: None,
+                checkpoint: &checkpoint_at("/tmp/table.md"),
+                table: &table,
+                errored: 0,
+            },
+        );
+        assert!(text.contains("concurrency-slot\t2\n"), "{text}");
+        assert!(
+            text.contains(
+                "concurrency-rule\teffective = min(column ceiling, gate bound, static slot)"
+            ),
+            "取小这条规则要写在读数旁边，否则三个数只能读出「界是多少」：{text}"
+        );
+        assert!(
+            text.contains("concurrency-column\thle\tceiling=none"),
+            "{text}"
+        );
+        assert!(
+            text.contains("concurrency-column\ttoolathlon\tceiling=1\n"),
+            "列自己的上界要跟着列出，它不是命令行给的：{text}"
+        );
+    }
+
+    /// 两个界一个都不给等于没有界。跑起来才发现的话，环境已经在起了——所以卡在解析这一步。
+    #[test]
+    fn a_run_that_gives_neither_a_slot_nor_a_gate_has_no_bound_and_is_refused() {
+        let mut raw = minimal();
+        let at = raw
+            .windows(2)
+            .position(|w| w[0] == "--concurrency-slot")
+            .expect("minimal() supplies the slot");
+        raw.drain(at..at + 2);
+        let err = EvalTableArgs::parse(&raw).unwrap_err();
+        assert!(err.contains("--concurrency-slot or --admission"), "{err}");
+        assert!(err.contains("no bound at all"), "{err}");
+
+        // 只给闸门就够了：要的是「至少一个」，不是「两个都要」。
+        raw.extend(["--admission", "/tmp/gate"].iter().map(|s| s.to_string()));
+        let args = EvalTableArgs::parse(&raw).expect("a gate alone is a bound");
+        assert_eq!(args.concurrency_slot, None);
+        assert!(args.admission_dir.is_some());
     }
 
     #[test]

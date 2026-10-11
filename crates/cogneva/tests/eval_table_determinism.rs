@@ -195,6 +195,9 @@ fn args_on(root: &Path, pins: &Path, scaffolds: &str, subset: Option<&Path>) -> 
         scaffolds.to_string(),
         "--seeds".to_string(),
         "0,1,2".to_string(),
+        // 静态名额没有默认值，两个界至少要给一个；这条链不带闸门，所以在这里给。
+        "--concurrency-slot".to_string(),
+        "2".to_string(),
     ]
     .to_vec();
     if let Some(subset) = subset {
@@ -434,6 +437,9 @@ async fn an_archive_that_does_not_cover_a_benchmark_is_refused_before_the_run() 
         "gepa",
         "--seeds",
         "0",
+        // 两个界至少要给一个，这条链不带闸门。
+        "--concurrency-slot",
+        "2",
         "--subset",
         &archive.display().to_string(),
     ]

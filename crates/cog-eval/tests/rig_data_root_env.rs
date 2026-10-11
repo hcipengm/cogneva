@@ -150,8 +150,10 @@ async fn the_data_root_env_var_is_what_the_rig_reads_cases_from() {
     std::fs::write(dir.path().join("cases.txt"), "c1\nc2\nc3\n").unwrap();
     std::env::set_var(DATA_ROOT_ENV, dir.path());
 
-    let config = RunConfig::from_env().unwrap();
+    let mut config = RunConfig::from_env().unwrap();
     assert_eq!(config.data_root.as_path(), dir.path());
+    // 静态名额没有默认值：调用方要么给一个，要么给闸门，两个都不给这次跑失败。
+    config.max_concurrency = Some(2);
     let table = Rig::new(Arc::new(NeverCalled), config)
         .with_scaffold(Arc::new(Echo))
         .run(&[benchmark()])
@@ -168,7 +170,9 @@ async fn the_data_root_env_var_is_what_the_rig_reads_cases_from() {
     let other = tempfile::tempdir().unwrap();
     std::fs::write(other.path().join("cases.txt"), "c1\n").unwrap();
     std::env::set_var(DATA_ROOT_ENV, other.path());
-    let table = Rig::new(Arc::new(NeverCalled), RunConfig::from_env().unwrap())
+    let mut config = RunConfig::from_env().unwrap();
+    config.max_concurrency = Some(2);
+    let table = Rig::new(Arc::new(NeverCalled), config)
         .with_scaffold(Arc::new(Echo))
         .run(&[benchmark()])
         .await

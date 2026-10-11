@@ -34,8 +34,14 @@ pub struct RunConfig {
     pub data_root: PathBuf,
     /// 同一格的独立运行数。主表规格是 3。
     pub seeds: Vec<u64>,
-    /// 同时在跑的 case 数。基准的环境是有重量的（容器、compose），不是纯 IO。
-    pub max_concurrency: usize,
+    /// 同时放行几个 case 的**静态名额**。基准的环境是有重量的（容器、compose），不是纯 IO，
+    /// 所以这个数由调用方给，没有默认值——一个默认名额会在给了闸门时把闸门的界悄悄压住
+    /// （有效并发取小），看起来却像没人设过上限。
+    ///
+    /// 它与闸门**不是二选一**：有效并发 ＝ min(这一列的隔离上界, 闸门此刻的界, 这个名额)。
+    /// 三个都给了就取小；静态名额与闸门**至少要给一个**，一个都不给这次跑失败——没有界就
+    /// 没有并发，等于把一台与集群同机的宿主当成无主的。
+    pub max_concurrency: Option<usize>,
     /// 只跑存档点名的那几道题；`None` ＝全量。
     ///
     /// 子集是**读进来的**，不是跑的时候现抽的：现抽的话，题面数据换一版、抽取实现改一行，
@@ -47,10 +53,12 @@ pub struct RunConfig {
     /// 丢掉，那就不叫暂停。续的**粒度是例**，不是例内——一道题跑到一半的现场在它自己的
     /// 容器里，没有落盘面，被打断的例按没跑过重跑。
     pub checkpoint: Option<Checkpoint>,
-    /// 准入闸门。`None` ＝用 `max_concurrency` 那个固定名额，不看宿主压力。
+    /// 准入闸门。`None` ＝这次跑不看宿主压力，只受静态名额与每一列自己的隔离上界限制。
     ///
-    /// 两者**不是叠加的**：给了闸门，`max_concurrency` 就让位——两个界同时管着，读数上
-    /// 分不出这一次少放进来是因为闸门还是因为这个数。闸门自己的下界上界在它自己的配置里。
+    /// 它与 `max_concurrency` **都算数**，取小：闸门管的是宿主这一刻还能不能再放，静态名额
+    /// 管的是这一次跑自己允许多少个并行。缺了闸门，读的人从表上看到的分不出「宿主当时有余量」
+    /// 与「没人看过宿主」——所以报表在闸门缺席时会明说这一次没有闸门。闸门自己的下界上界在
+    /// 它自己的配置里。
     pub admission: Option<Arc<cog_core::admission::Admission>>,
 }
 
@@ -292,7 +300,9 @@ impl RunConfig {
         Self {
             data_root: data_root.into(),
             seeds: vec![0, 1, 2],
-            max_concurrency: 4,
+            // 静态名额不给默认值：调用方要么自己给一个，要么给闸门，两个都不给就是这次
+            // 跑失败。默认一个数会让「界是谁定的」这件事从配置里消失。
+            max_concurrency: None,
             subset: None,
             checkpoint: None,
             admission: None,
@@ -446,6 +456,13 @@ pub struct Table {
     /// 分得开。
     #[serde(default)]
     pub gate: Option<cog_core::admission::GateReading>,
+    /// 每一列的隔离上界（基准名，上界）。`None` ＝这一列的例环境彼此隔离，这一列自己不设上界。
+    ///
+    /// 有效并发是三个因子取小，其中闸门的界与静态名额都在报表里单列着，只有这一项长在
+    /// **列**上（它是一份环境实现自己的事实：例共不共享一个 postgres／容器）。不随表出，
+    /// 读的人就只能看到两个因子，「这一次放进来几个」还差一个数。
+    #[serde(default)]
+    pub column_ceilings: Vec<(String, Option<usize>)>,
 }
 
 impl Table {
@@ -512,18 +529,17 @@ impl Table {
     }
 }
 
-/// 一格拿到的那张票。
+/// 一格拿到的那张票：静态名额的那一半与闸门的那一半，各可能缺席，但至少有一半。
 ///
-/// 有闸门时是闸门发的（界会动），没闸门时是那个固定名额的信号量。两种票对例来说只做
-/// 一件事——持有期间占着名额，落下就归还——所以例里不必知道自己是被谁放行的，也就不会
-/// 出现「有闸门的那条路上少还了名额」这种只在一种模式下存在的漏。
+/// 有效并发是三个因子取小，所以两个界都给了的时候两半都要拿到才算放行——只拿一半就等于
+/// 静默地把另一个界放在一边，而报表上是看不出来的。
 ///
 /// 两个字段都**只为了 `Drop` 而存在**，谁也不会去读它——所以这里明说一句，免得下一个人
 /// 把「没读」当成「可以换成 ()」。
 #[allow(dead_code)]
-enum Ticket {
-    Gate(cog_core::admission::Permit),
-    Slot(tokio::sync::OwnedSemaphorePermit),
+struct Ticket {
+    slot: Option<tokio::sync::OwnedSemaphorePermit>,
+    gate: Option<cog_core::admission::Permit>,
 }
 
 /// 运行器。
@@ -562,6 +578,20 @@ impl Rig {
     /// 落错检查点是**拒绝**而不是继续：`Err` 只在配置了检查点、而它接不上时出现
     /// （身份不同、或另一个驱动正占着它）。不配检查点这条路不会因为文件而失败。
     pub async fn run(&self, benchmarks: &[Benchmark]) -> anyhow::Result<Table> {
+        // 两个界至少要给一个，且给了的不能是零：没有界就没有并发，等于把一台与集群同机的
+        // 宿主当成无主的；而 0 个名额／一条也不放行的闸门是「停下来的跑次顶着界的名字」。
+        // 放在最前面：一次跑要在花掉任何一次环境启动之前就知道自己没有界。
+        match (self.config.max_concurrency, self.config.admission.is_some()) {
+            (None, false) => anyhow::bail!(
+                "this run has no concurrency bound: give either a static slot \
+                 (RunConfig::max_concurrency) or an admission gate -- a run with neither would use \
+                 as much of this host as it can, and this host also runs the cluster"
+            ),
+            (Some(0), _) => anyhow::bail!(
+                "a static slot of 0 admits nothing: that is a stopped run wearing the slot's name"
+            ),
+            _ => {}
+        }
         let log = match &self.config.checkpoint {
             Some(cp) => Some(Arc::new(CheckpointLog::open(cp)?)),
             None => None,
@@ -623,6 +653,10 @@ impl Rig {
             wanted_seeds: self.config.seeds.len(),
             unreadable,
             gate: self.config.admission.as_ref().map(|g| g.reading()),
+            column_ceilings: benchmarks
+                .iter()
+                .map(|b| (b.name.clone(), b.column_ceiling))
+                .collect(),
         })
     }
 
@@ -636,9 +670,13 @@ impl Rig {
         log: Option<Arc<CheckpointLog>>,
     ) -> anyhow::Result<SeedScore> {
         let started = Instant::now();
-        // 有闸门就只由闸门放行：两个界同时管着，这一次少放进来一个就分不出是谁拦的。
+        // 有效并发 ＝ min(列的隔离上界, 闸门此刻的界, 静态名额)：两个界都给就都要拿到票。
+        // 名单个半区各自可能缺席，`run` 已经保证不会两个都缺席。
         let admission = self.config.admission.clone();
-        let semaphore = Arc::new(Semaphore::new(self.config.max_concurrency.max(1)));
+        let slots = self
+            .config
+            .max_concurrency
+            .map(|n| Arc::new(Semaphore::new(n)));
         let mut handles = Vec::new();
         // 上一次跑过的例：不建环境、不调上游、不判分——它那一格已经定了，重跑只会把
         // 一个非确定的读数换成另一个。
@@ -651,10 +689,23 @@ impl Rig {
                     continue;
                 }
             }
-            let permit = match &admission {
-                Some(gate) => Ticket::Gate(gate.acquire(&bench.name, bench.column_ceiling).await),
-                None => Ticket::Slot(semaphore.clone().acquire_owned().await.unwrap()),
+            // 先占静态名额，再要闸门的票：票上的持有时间于是就是这一例真正在跑的时间
+            // （先要票再等名额会把排队时间记进闸门的延迟读数），而「被闸门挡住多少例」也
+            // 数得准——每一道走到闸门前的题都已经握着一个名额，它等就是这台宿主在挡。
+            let slot = match &slots {
+                Some(sem) => Some(
+                    sem.clone()
+                        .acquire_owned()
+                        .await
+                        .expect("the slot semaphore outlives the run"),
+                ),
+                None => None,
             };
+            let gate = match &admission {
+                Some(gate) => Some(gate.acquire(&bench.name, bench.column_ceiling).await),
+                None => None,
+            };
+            let permit = Ticket { slot, gate };
             let case = case.clone();
             let llm = self.llm.clone();
             let env_provider = bench.env.clone();
@@ -1025,7 +1076,7 @@ mod tests {
             RunConfig {
                 data_root: "/nonexistent".into(),
                 seeds: vec![7, 8, 9],
-                max_concurrency: 4,
+                max_concurrency: Some(4),
                 subset: None,
                 checkpoint: None,
                 admission: None,
@@ -1047,7 +1098,7 @@ mod tests {
             RunConfig {
                 data_root: "/nonexistent".into(),
                 seeds: vec![7],
-                max_concurrency: 4,
+                max_concurrency: Some(4),
                 subset: Some(subset),
                 checkpoint: None,
                 admission: None,
@@ -1291,7 +1342,7 @@ mod tests {
             RunConfig {
                 data_root: "/nonexistent".into(),
                 seeds: vec![7],
-                max_concurrency: 4,
+                max_concurrency: Some(4),
                 subset: None,
                 checkpoint: Some(cp),
                 admission: None,
@@ -1363,13 +1414,16 @@ mod tests {
         }
     }
 
-    fn gated_rig(admission: Option<Arc<cog_core::admission::Admission>>) -> Rig {
+    fn gated_rig(
+        slot: Option<usize>,
+        admission: Option<Arc<cog_core::admission::Admission>>,
+    ) -> Rig {
         Rig::new(
             Arc::new(NeverCalled),
             RunConfig {
                 data_root: "/nonexistent".into(),
                 seeds: vec![0],
-                max_concurrency: 4,
+                max_concurrency: slot,
                 subset: None,
                 checkpoint: None,
                 admission,
@@ -1402,7 +1456,7 @@ mod tests {
             window: std::time::Duration::from_secs(3600),
         })
         .unwrap();
-        let table = gated_rig(Some(gate.clone()))
+        let table = gated_rig(Some(4), Some(gate.clone()))
             .run(&[column_of(Some(1), env.clone())])
             .await
             .unwrap();
@@ -1419,11 +1473,64 @@ mod tests {
         assert!(reading.blocked >= 1, "被挡住的例必须记下来：{reading:?}");
 
         let env = Arc::new(CountingEnv::new());
-        gated_rig(None)
+        gated_rig(Some(4), None)
             .run(&[column_of(None, env.clone())])
             .await
             .unwrap();
         assert_eq!(env.peak(), 2, "没有这一列的上界时，两题是同时在跑的");
+    }
+
+    /// 静态名额是取小的另一项：闸门这一刻许 4 个，但这一次跑自己只给一个名额，那就只能
+    /// 跑一个。少了这条，闸门在场就等于把静态名额静默作废。
+    #[tokio::test]
+    async fn a_static_slot_smaller_than_the_gate_bounds_the_run() {
+        let env = Arc::new(CountingEnv::new());
+        let dir = tempfile::tempdir().unwrap();
+        let gate = cog_core::admission::open(&cog_core::admission::AdmissionConfig {
+            dir: dir.path().to_path_buf(),
+            floor_unmeasured: 4,
+            ceiling_unmeasured: 4,
+            window: std::time::Duration::from_secs(3600),
+        })
+        .unwrap();
+        let table = gated_rig(Some(1), Some(gate))
+            .run(&[column_of(None, env.clone())])
+            .await
+            .unwrap();
+        assert_eq!(env.peak(), 1, "静态名额是 1，两题就不可能同时在跑");
+        // 三个因子都随表出：这一列没有自己的上界，闸门与名额各是几都要看得见。
+        assert_eq!(
+            table.column_ceilings,
+            vec![("toolathlon".to_string(), None)]
+        );
+        let reading = table.gate.expect("报表要带上闸门那一刻的读数");
+        assert_eq!(
+            reading.bound, 4,
+            "闸门这一刻放行 4 个，被名额压住的是这一次跑自己"
+        );
+    }
+
+    /// 两个界一个都不给＝这次跑失败，而且要在动任何环境之前就说。
+    #[tokio::test]
+    async fn a_run_with_neither_a_slot_nor_a_gate_is_refused() {
+        let err = gated_rig(None, None)
+            .run(&[column_of(None, Arc::new(CountingEnv::new()))])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no concurrency bound"), "{err}");
+        assert!(err.contains("static slot"), "{err}");
+    }
+
+    /// 名额 0 与「没有名额」是两件事：前者是停下来的跑次顶着界的名字，照样要拒。
+    #[tokio::test]
+    async fn a_zero_static_slot_is_refused_rather_than_read_as_no_slot() {
+        let err = gated_rig(Some(0), None)
+            .run(&[column_of(None, Arc::new(CountingEnv::new()))])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("admits nothing"), "{err}");
     }
 
     /// 接回来的那半不重跑：同一份检查点跑第二遍，交给外壳的题数必须是零。

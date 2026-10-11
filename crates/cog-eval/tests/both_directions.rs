@@ -151,7 +151,10 @@ async fn the_rig_scores_the_reference_arm_high_and_the_degenerate_arm_zero() {
 
     // 一臂一个 Rig：同名的两臂不能同表（同一列名会让读数无从归因）。
     async fn run_arm(root: std::path::PathBuf, bench: Benchmark) -> Table {
-        Rig::new(Arc::new(SilentLlm), RunConfig::new(root))
+        let mut config = RunConfig::new(root);
+        // 静态名额没有默认值：两个界至少要给一个。
+        config.max_concurrency = Some(2);
+        Rig::new(Arc::new(SilentLlm), config)
             .with_scaffold(Arc::new(EmptyScaffold))
             .run(&[bench])
             .await
