@@ -1094,11 +1094,13 @@ impl BuildGate {
     ///
     /// Called by a work that has just been refused and comes back on its own: a
     /// one-shot build waits in [`BuildGate::acquire`] instead and does not need
-    /// this. It is a request rather than a queue — two works waiting overwrite
-    /// each other's claim and the later one wins — because what it has to
-    /// accomplish is only that the field stops being taken by arrivals, and
-    /// after that the waiters are again taken in the order they ask, each having
-    /// a claim of its own.
+    /// this. The waiters are taken in the order they ask, each holding a claim of
+    /// its own until its ask is answered or the claim lapses. A claim has one
+    /// thing to accomplish — that the field stops being taken by arrivals — and a
+    /// second claim does not add to it: it only takes the turn from the work that
+    /// asked first, whose next ask then comes round on a field someone else is
+    /// holding, so its claim never survives to the ask it was made for. A holder
+    /// refreshing its own claim is what keeps a work that keeps losing its place.
     pub fn reserve_build_field(&self, what: &str) {
         if !self.installed {
             return;
@@ -1106,6 +1108,21 @@ impl BuildGate {
         let since = unix_now();
         let path = self.dir.join(RESERVE_FILE);
         let previous = self.reservation().map(|(holder, _)| holder);
+        // A claim that is already here and fresh belongs to the work that asked
+        // first, and it is left to it. Arrivals stand down on the claim itself
+        // rather than on who left it, so this ask has nothing to gain by writing
+        // over one, and the other work has its turn to lose.
+        if let Some(holder) = previous.as_deref() {
+            if holder != what {
+                tracing::info!(
+                    what,
+                    held_by = holder,
+                    dir = %self.dir.display(),
+                    "the next build is already claimed; leaving that turn to the work that asked first"
+                );
+                return;
+            }
+        }
         if let Err(e) = write_gate_file(&path, &format!("{what}\t{since}\n")) {
             tracing::warn!(
                 what,
@@ -1143,29 +1160,22 @@ impl BuildGate {
     }
 
     /// Releases a claim held by `what`, which is done once its ask is answered.
-    fn release_reservation(&self, what: &str) {
-        // Someone else's claim is left alone: they are waiting too, and this ask
-        // being answered is not their turn.
-        if let Some((holder, _)) = self.reservation() {
-            if holder == what {
-                self.clear_reservation();
-            }
-        }
-    }
-
-    /// Releases the claim on the next build, whoever holds it.
     ///
-    /// For the exclusion that has just taken the field: the claim was a way
-    /// through to the field, and it has been answered. Left behind, it would keep
-    /// builds out of a field that is free again the moment the exclusion ends.
-    /// A claim that is not refreshed comes back by itself at the next walk of
-    /// whoever wanted it.
-    fn clear_reservation(&self) {
+    /// Someone else's claim is left alone, whether this is a build that took a
+    /// slot or an exclusion that took the field: they are waiting too, and this
+    /// ask being answered is not their turn. Taking it would be losing a turn
+    /// rather than spending one — the other work asks again on its own cycle and
+    /// finds the field free of its claim and busy with whoever came next, so a
+    /// work on a longer cycle than the field's traffic never gets a turn at all.
+    /// Its own holder releases it when its ask is answered, and a claim nobody
+    /// refreshes lapses at [`RESERVE_FRESH`].
+    fn release_reservation(&self, what: &str) {
         if !self.installed {
             return;
         }
-        if self.reservation().is_none() {
-            return;
+        match self.reservation() {
+            Some((holder, _)) if holder == what => {}
+            _ => return,
         }
         let path = self.dir.join(RESERVE_FILE);
         if let Err(e) = std::fs::remove_file(&path) {
@@ -1266,10 +1276,12 @@ impl BuildGate {
         match lock_claim_exclusive(&self.dir) {
             Some(file) => {
                 record_holder(&file, what);
-                // The field is this caller's now, so the claim on the next build
-                // has been answered: leaving it would hold the builds that come
-                // after this pass out of a field that is free again.
-                self.clear_reservation();
+                // The field is this caller's now, so its own claim on the next
+                // build has been answered and is released. Another work's is not:
+                // this pass took the field without answering that work's ask, and
+                // a claim released here would be gone before its holder's next
+                // ask comes round.
+                self.release_reservation(what);
                 self.excluded.fetch_add(1, Ordering::Relaxed);
                 Ok(self.permit(what, vec![file], HoldKind::Excluding))
             }
@@ -2429,6 +2441,70 @@ mod tests {
             gate.reservation().is_none(),
             "and the exclusion taking the field releases it"
         );
+    }
+
+    /// An exclusion takes the field whenever it is free, and taking it is not the
+    /// same as answering the work that claimed the next build: that work's ask is
+    /// still outstanding, so its claim has to outlive the pass. Released here it
+    /// is gone before its holder asks again, which for a work on a longer cycle
+    /// than the field's traffic is every turn.
+    #[tokio::test]
+    async fn an_exclusion_leaves_another_works_claim_standing() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 0);
+        let running = gate.try_acquire("a build that is running").await.unwrap();
+        assert!(gate.try_acquire("mainline advance").await.is_err());
+        gate.reserve_build_field("mainline advance");
+
+        drop(running);
+        let sweep = gate
+            .try_acquire_exclusive("a build-cache sweep")
+            .await
+            .unwrap();
+        assert_eq!(
+            gate.reservation().map(|(what, _)| what).as_deref(),
+            Some("mainline advance"),
+            "the sweep's pass does not answer the advance's ask"
+        );
+        drop(sweep);
+        assert!(
+            gate.try_acquire("a change verification").await.is_err(),
+            "and arrivals are still held out until that ask is answered"
+        );
+        let waiting = gate.try_acquire("mainline advance").await.unwrap();
+        drop(waiting);
+        assert!(
+            gate.reservation().is_none(),
+            "answered by its own work, and released then"
+        );
+    }
+
+    /// A refusal is not a licence to take the turn another work is holding —
+    /// arrivals stand down on the claim itself, whichever work left it. A second
+    /// claim adds nothing to that and costs the work that asked first its place,
+    /// so the first claim stands until its holder is answered or it lapses.
+    #[tokio::test]
+    async fn a_claim_already_held_is_left_to_its_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 0);
+        let running = gate.try_acquire("a build that is running").await.unwrap();
+        gate.reserve_build_field("a build-cache sweep");
+        gate.reserve_build_field("mainline advance");
+        assert_eq!(
+            gate.reservation().map(|(what, _)| what).as_deref(),
+            Some("a build-cache sweep"),
+            "the work that asked first keeps the turn it claimed"
+        );
+
+        drop(running);
+        assert!(
+            gate.try_acquire("a change verification").await.is_err(),
+            "arrivals stand down on that claim just the same"
+        );
+        let sweep = gate.try_acquire_exclusive("a build-cache sweep").await;
+        assert!(sweep.is_ok(), "and it is answered by its own work");
+        drop(sweep);
+        assert!(gate.reservation().is_none());
     }
 
     /// The other half of that wiring: while a peer exclusion holds the field,
