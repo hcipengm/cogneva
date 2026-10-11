@@ -824,10 +824,49 @@ impl WorkspaceManager {
         {
             return false;
         }
-        self.list()
+        let Ok(entries) = self.list().await else {
+            return false;
+        };
+        let Some(entry) = entries.iter().find(|e| e.path == path) else {
+            return false;
+        };
+        // 被杀进程可能在 add/remove 中途留下管理锁：不清掉，`git worktree remove`
+        // 永远拒绝动这棵树，分配器于是每次都在一棵拆不掉也修不了的树上失败。
+        // 解锁受同一道年龄门约束；解锁失败按不健康处理，让调用方重建。
+        if entry.locked && !self.unlock_stale_admin_lock(path).await {
+            return false;
+        }
+        // 索引丢失或被截断时（被杀进程写了一半），git 登记与 `rev-parse` 依然
+        // 正常，但 `reset --hard` 要么直接退出 128、要么按 HEAD 重写整棵树——
+        // 共享 target 的增量缓存随之整轮作废，单构建槽被这一棵树的冷重建占满
+        // 整个窗口，循环永远走不到队列的退休步。这正是 `sample_index_health`
+        // 读的那个状态；在这里判不健康，让这棵树被重建而不是被"复用"。
+        self.git_in(path, &["ls-files"]).await.is_ok()
+    }
+
+    /// 清除一棵已登记工作树上的管理锁，受与索引锁同一道年龄门约束：锁文件
+    /// 必须老过 `stale_lock_age` 才动手（新锁可能是并发 add/remove 的活锁）。
+    /// 返回这棵树之后是否处于未上锁状态。
+    async fn unlock_stale_admin_lock(&self, path: &Path) -> bool {
+        let Ok(gitdir) = self
+            .git_in(path, &["rev-parse", "--absolute-git-dir"])
             .await
-            .map(|entries| entries.iter().any(|e| e.path == path))
-            .unwrap_or(false)
+        else {
+            return false;
+        };
+        let lock = PathBuf::from(gitdir).join("locked");
+        if !clear_stale_git_lock(&lock, self.stale_lock_age).await {
+            return false;
+        }
+        warn!(
+            path = %path.display(),
+            "removed stale worktree admin lock left by a killed process; unlocking"
+        );
+        // 锁文件已删，`unlock` 只是清掉 git 的登记位；它失败不再构成阻塞。
+        let _ = self
+            .git_bare(&["worktree", "unlock", path.to_str().unwrap_or("")])
+            .await;
+        true
     }
 
     /// 工作树里幂等补 `local` 远程（指向裸仓库本身）。各消费者沿用既有的
@@ -1913,5 +1952,53 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("index.lock"));
         assert!(lock.exists(), "可能是活锁的新锁不能删");
+    }
+
+    /// 索引被截断（被杀进程写了一半）的树：git 登记与 `rev-parse` 都正常，
+    /// 但它再也刷新不了——`reset --hard` 对这棵树退出 128。健康检查必须把它
+    /// 判成不健康，让 ensure_persistent 重建，而不是"复用"进每轮一次的全树
+    /// 重写（或一次永久的失败）。
+    #[tokio::test]
+    async fn a_persistent_tree_with_a_wedged_index_is_rebuilt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bare, _a, rev_b) = seed_bare(tmp.path());
+        let mgr = manager(tmp.path(), &bare);
+        let spec = WorkspaceSpec::persistent(
+            "mainline",
+            WorkspaceKind::Deployer,
+            BaseRef::Commit(rev_b.clone()),
+        );
+        let ws = mgr.ensure_persistent(spec.clone()).await.unwrap();
+
+        // 零长索引：文件还在，git 读不出来。
+        let gitdir = git_out(&ws.path, &["rev-parse", "--absolute-git-dir"]);
+        std::fs::write(Path::new(&gitdir).join("index"), b"").unwrap();
+
+        let rebuilt = mgr.ensure_persistent(spec).await.unwrap();
+        assert!(rebuilt.path.join("a.txt").exists());
+        assert_eq!(git_out(&rebuilt.path, &["rev-parse", "HEAD"]), rev_b);
+    }
+
+    /// 被杀进程留下的管理锁（`git worktree lock` / 中途的 add-remove）：
+    /// 锁龄超过判定值即按尸体处理——解锁后这棵树被复用，而不是每轮在一棵
+    /// 拆不掉也修不了的树上失败。
+    #[tokio::test]
+    async fn a_stale_admin_lock_is_unlocked_and_the_tree_reused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bare, _a, rev_b) = seed_bare(tmp.path());
+        let mgr = manager(tmp.path(), &bare).with_stale_lock_age(Duration::ZERO);
+        let spec = WorkspaceSpec::persistent(
+            "mainline",
+            WorkspaceKind::Deployer,
+            BaseRef::Commit(rev_b.clone()),
+        );
+        let ws = mgr.ensure_persistent(spec.clone()).await.unwrap();
+        git(&bare, &["worktree", "lock", ws.path.to_str().unwrap()]);
+        assert!(mgr.list().await.unwrap()[0].locked);
+
+        // 判定龄为零：锁按尸体处理，解锁后树被复用而不是重建。
+        let again = mgr.ensure_persistent(spec).await.unwrap();
+        assert_eq!(again.path, ws.path);
+        assert!(!mgr.list().await.unwrap()[0].locked);
     }
 }
