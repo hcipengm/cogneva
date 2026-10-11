@@ -18,8 +18,10 @@ use crate::scaffold::{AgentOutput, AgentScaffold, Budget, SolveContext};
 
 /// 平台端口：投一题、等它跑完、把结果取回来。
 ///
-/// **今天没有实现**。有了它才有这一行的数；没有它，这一行跑不起来，而这必须表现为
-/// 「跑不起来」而不是「跑出来一个低分」——后者的形状是平台被别的东西替掉了。
+/// **实现在组合根**——评测台只声明这个端口，具体那条走平台 HTTP 路由、把答复投影成
+/// `AgentOutput` 的链路落在能看见平台类型的地方，不在这里。这里也不提供任何「缺席时
+/// 照样能跑」的默认实现：没有平台时这一行必须表现为「跑不起来」而不是「跑出来一个
+/// 低分」，后者的形状是平台被别的东西替掉了。
 #[async_trait]
 pub trait PlatformRunner: Send + Sync {
     async fn run(&self, request: PlatformRequest) -> anyhow::Result<PlatformReply>;
