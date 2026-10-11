@@ -75,6 +75,7 @@ impl SweBenchRunner {
             tags.push("rust".into());
         }
         EvalCase {
+            metadata: Default::default(),
             id: format!("swebench-{}", inst.instance_id),
             name: format!("{} @ {}", inst.repo, inst.instance_id),
             input: serde_json::json!({

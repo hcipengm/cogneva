@@ -205,6 +205,7 @@ mod tests {
         let mut d = EvalDataset::new("toy");
         for i in 0..n {
             d.add_case(EvalCase {
+                metadata: Default::default(),
                 id: format!("c{i}"),
                 name: format!("c{i}"),
                 input: serde_json::Value::Null,

@@ -52,6 +52,7 @@ impl GaiaRunner {
                 })
                 .unwrap_or_else(|| "unknown".into());
             dataset.add_case(EvalCase {
+                metadata: Default::default(),
                 id: format!("gaia-{}", q.task_id),
                 name: format!("GAIA level {level} {}", q.task_id),
                 input: serde_json::json!({

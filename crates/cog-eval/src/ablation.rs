@@ -241,6 +241,7 @@ mod tests {
         let mut d = EvalDataset::new("toy");
         for id in ["c1", "c2"] {
             d.add_case(crate::dataset::EvalCase {
+                metadata: Default::default(),
                 id: id.into(),
                 name: id.into(),
                 input: serde_json::Value::Null,

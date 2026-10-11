@@ -50,6 +50,7 @@ impl AgentBenchLoader {
                 other => other.to_string(),
             };
             dataset.add_case(EvalCase {
+                metadata: Default::default(),
                 id: format!("agentbench-{env}-{id}"),
                 name: format!("{env} task {id}"),
                 input: serde_json::json!({ "instruction": task.instruction, "env": env }),

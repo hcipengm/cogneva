@@ -87,6 +87,7 @@ impl HumanEvalLoader {
 
     pub fn problem_to_case(problem: &HumanEvalProblem) -> EvalCase {
         EvalCase {
+            metadata: Default::default(),
             // The release's own id, with the one character that cannot survive
             // being used as a name replaced. `task_id` travels back from a run
             // as `EvalOutcome::task_id`, so it has to be a string a run can

@@ -140,6 +140,7 @@ mod tests {
 
     fn mk_case() -> EvalCase {
         EvalCase {
+            metadata: Default::default(),
             id: "t1".into(),
             name: "test".into(),
             input: serde_json::Value::Null,
