@@ -70,6 +70,7 @@ async fn a_refused_slot_keeps_the_change_alive_and_the_tree_clean() {
         status: EvolutionStatus::CompileChecked,
         created_at: chrono::Utc::now(),
         eval_summary: None,
+        tiering: None,
     };
 
     let lock_dir = tempfile::tempdir().unwrap();

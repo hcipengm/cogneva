@@ -252,6 +252,13 @@ pub struct ChangeExecutionOutcome {
     pub reformatted: bool,
     #[serde(default)]
     pub pre_existing_failures: usize,
+    /// 这条变更被路由到哪些门，随回程一起搬回常驻进程。
+    ///
+    /// 档位是从一棵 checkout 上读出来的、只读一次：执行侧算过之后，消费侧再算
+    /// 一次就是在另一棵（可能已被下游改写过的）树上读第二次，两个读数会不一致，
+    /// 而没有任何一行代码变化。所以它作为数据搬，不重算。
+    #[serde(default)]
+    pub tiering: Option<crate::criteria_face::Tiering>,
     #[serde(default)]
     pub artifact: Option<ExecutedArtifact>,
     #[serde(default)]
@@ -284,6 +291,7 @@ impl ChangeExecutionOutcome {
             test_output: String::new(),
             reformatted: false,
             pre_existing_failures: 0,
+            tiering: None,
             artifact: None,
             unavailable: None,
             build_ending: None,
@@ -317,6 +325,7 @@ impl ChangeExecutionOutcome {
             new_status: self.new_status.unwrap_or(EvolutionStatus::Generated),
             reformatted: self.reformatted,
             pre_existing_failures: self.pre_existing_failures,
+            tiering: self.tiering.clone(),
         })
     }
 
@@ -588,6 +597,7 @@ async fn run_in(
     outcome.test_output = result.test_output.clone();
     outcome.reformatted = result.reformatted;
     outcome.pre_existing_failures = result.pre_existing_failures;
+    outcome.tiering = result.tiering.clone();
 
     if let ChangeVerdict::Refused(cause) = result.verdict {
         outcome.verdict = Some(OutcomeVerdict::Refused(cause));
@@ -1492,6 +1502,7 @@ mod tests {
             status: EvolutionStatus::Generated,
             created_at: Utc::now(),
             eval_summary: None,
+            tiering: None,
         }
     }
 
@@ -1594,6 +1605,33 @@ mod tests {
         write_json_atomic(&path, &never_built).unwrap();
         let read: ChangeExecutionOutcome = read_json(&path).unwrap();
         assert_eq!(read.build_ending, None);
+    }
+
+    /// 档位也要随回程跨进程：执行侧算过一次，常驻进程的晋级判定只能读回它，
+    /// 不能拿另一棵已经改过的树重算。老的执行结果文件没有这个键，读回来是
+    /// `None`，不是反序列化失败——升级窗口里在途的那一份不能炸。
+    #[test]
+    fn the_routing_tier_crosses_the_boundary_and_an_old_record_reads_as_none() {
+        use crate::criteria_face::{Tier, TierReason, Tiering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(OUTCOME_FILE);
+        let mut outcome = passed("change-1");
+        outcome.tiering = Some(Tiering {
+            tier: Tier::RealGate,
+            reasons: vec![TierReason::CriteriaCarrier],
+            touches_criteria_code: false,
+        });
+        write_json_atomic(&path, &outcome).unwrap();
+        let read: ChangeExecutionOutcome = read_json(&path).unwrap();
+        assert_eq!(read.tiering, outcome.tiering);
+        assert_eq!(read.apply_result().unwrap().tiering, outcome.tiering);
+
+        let mut old = passed("change-2");
+        old.tiering = None;
+        write_json_atomic(&path, &old).unwrap();
+        let read: ChangeExecutionOutcome = read_json(&path).unwrap();
+        assert_eq!(read.tiering, None);
     }
 
     #[test]

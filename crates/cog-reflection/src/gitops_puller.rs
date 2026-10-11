@@ -2861,6 +2861,7 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
             status: crate::types::EvolutionStatus::Active,
             created_at: chrono::Utc::now(),
             eval_summary: None,
+            tiering: None,
         };
         crate::PromotionChannel::publish_rollout(&publisher, &change)
             .await

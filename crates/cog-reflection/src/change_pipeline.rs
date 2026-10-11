@@ -203,6 +203,12 @@ pub struct ApplyResult {
     /// with this above zero is the reading that a mainline is red, which is
     /// otherwise invisible: each change looks fine on its own.
     pub pre_existing_failures: usize,
+    /// 这条变更被路由到哪些门。
+    ///
+    /// 档位在这里算一次，之后由消费方取用、不重算：判据面是从一棵 checkout
+    /// 上读出来的，而 apply 之后这棵树还会被下游继续改写。早期早退（在算档位
+    /// 之前就返回的几次拒绝）没有档位可言，故为 `None`。
+    pub tiering: Option<crate::criteria_face::Tiering>,
 }
 
 /// What a failing whole-suite run says about the change that was applied.
@@ -540,6 +546,7 @@ impl ChangePipeline {
                 status,
                 created_at,
                 eval_summary: None,
+                tiering: None,
             });
         }
 
@@ -739,6 +746,7 @@ impl ChangePipeline {
                     verdict: ChangeVerdict::Refused(cog_core::RejectionCause::MalformedDiff),
                     test_output: format!("Change is not a usable diff: {e}"),
                     new_status: EvolutionStatus::ValidationFailed,
+                    tiering: None,
                 });
             }
             Err(e) => return Err(e),
@@ -768,6 +776,7 @@ impl ChangePipeline {
                     verdict: ChangeVerdict::Refused(cog_core::RejectionCause::PromotionGateRefused),
                     test_output: format!("Promotion gate rejected: {reason}"),
                     new_status: EvolutionStatus::Rejected,
+                    tiering: None,
                 });
             }
         }
@@ -799,6 +808,7 @@ impl ChangePipeline {
                     verdict: ChangeVerdict::Refused(cog_core::RejectionCause::ForbiddenPath),
                     test_output: format!("Change touches a forbidden or missing path: {e}"),
                     new_status: EvolutionStatus::ValidationFailed,
+                    tiering: Some(tiering.clone()),
                 });
             }
             Err(e) => return Err(e),
@@ -820,6 +830,7 @@ impl ChangePipeline {
                 verdict: ChangeVerdict::Refused(cog_core::RejectionCause::IntentMismatch),
                 test_output: format!("Change does not answer its goal: {reason}"),
                 new_status: EvolutionStatus::ValidationFailed,
+                tiering: Some(tiering.clone()),
             });
         }
 
@@ -840,6 +851,7 @@ impl ChangePipeline {
                 verdict: ChangeVerdict::Refused(apply_failure_cause(&e.to_string())),
                 test_output: format!("Change pre-check failed: {}", e),
                 new_status: EvolutionStatus::ValidationFailed,
+                tiering: Some(tiering.clone()),
             });
         }
 
@@ -879,6 +891,7 @@ impl ChangePipeline {
                 verdict: ChangeVerdict::Refused(cog_core::RejectionCause::ApplyFailed),
                 test_output: format!("Change application failed: {}", e),
                 new_status: EvolutionStatus::ValidationFailed,
+                tiering: Some(tiering.clone()),
             });
         }
 
@@ -907,6 +920,7 @@ impl ChangePipeline {
                 verdict: ChangeVerdict::Refused(cog_core::RejectionCause::UnreachableDefault),
                 test_output: reason,
                 new_status: EvolutionStatus::ValidationFailed,
+                tiering: Some(tiering.clone()),
             });
         }
 
@@ -931,6 +945,7 @@ impl ChangePipeline {
                         "The formatter could not make this tree what it produces:\n{output}"
                     ),
                     new_status: EvolutionStatus::ValidationFailed,
+                    tiering: Some(tiering.clone()),
                 });
             }
             Err(e) => {
@@ -944,6 +959,7 @@ impl ChangePipeline {
                     verdict: ChangeVerdict::Refused(cog_core::RejectionCause::TestRunUnavailable),
                     test_output: format!("Failed to execute cargo fmt: {}", e),
                     new_status: EvolutionStatus::ValidationFailed,
+                    tiering: Some(tiering.clone()),
                 });
             }
         };
@@ -1020,6 +1036,7 @@ impl ChangePipeline {
                             "The change writes lines the linter reports on:\n  {evidence}\n\n{output}"
                         ),
                         new_status: EvolutionStatus::ValidationFailed,
+                    tiering: Some(tiering.clone()),
                     });
                 }
                 if !baseline_is_conformed {
@@ -1088,6 +1105,7 @@ impl ChangePipeline {
                     verdict: ChangeVerdict::Refused(cog_core::RejectionCause::TestRunUnavailable),
                     test_output: format!("Failed to execute {}: {}", self.test_command_line(), e),
                     new_status: EvolutionStatus::ValidationFailed,
+                    tiering: Some(tiering.clone()),
                 });
             }
         };
@@ -1185,6 +1203,7 @@ impl ChangePipeline {
             new_status,
             reformatted,
             pre_existing_failures,
+            tiering: Some(tiering.clone()),
         })
     }
 
@@ -2797,6 +2816,7 @@ impl Default for MetricsConfig {
             status: EvolutionStatus::CompileChecked,
             created_at: chrono::Utc::now(),
             eval_summary: None,
+            tiering: None,
         };
 
         let result = pipeline
@@ -3153,6 +3173,7 @@ index 1111111..2222222 100644
             status: crate::types::EvolutionStatus::CompileChecked,
             created_at: chrono::Utc::now(),
             eval_summary: None,
+            tiering: None,
         };
 
         let result = pipeline.apply_and_test(&change).await.unwrap();
@@ -3239,6 +3260,7 @@ index 1111111..2222222 100644
             status: crate::types::EvolutionStatus::CompileChecked,
             created_at: chrono::Utc::now(),
             eval_summary: None,
+            tiering: None,
         };
 
         let result = pipeline
@@ -3272,6 +3294,7 @@ index 1111111..2222222 100644
             status: crate::types::EvolutionStatus::CompileChecked,
             created_at: chrono::Utc::now(),
             eval_summary: None,
+            tiering: None,
         };
 
         let result = pipeline
@@ -3311,6 +3334,7 @@ index 1111111..2222222 100644
             status: EvolutionStatus::CompileChecked,
             created_at: chrono::Utc::now(),
             eval_summary: None,
+            tiering: None,
         };
 
         let result = pipeline
@@ -3355,6 +3379,7 @@ index 1111111..2222222 100644
             status: EvolutionStatus::CompileChecked,
             created_at: chrono::Utc::now(),
             eval_summary: None,
+            tiering: None,
         };
 
         let result = pipeline
@@ -3422,6 +3447,7 @@ index 1111111..2222222 100644
             status: EvolutionStatus::CompileChecked,
             created_at: chrono::Utc::now(),
             eval_summary: None,
+            tiering: None,
         };
 
         let result = pipeline
@@ -3497,6 +3523,7 @@ index 1111111..2222222 100644
             status: EvolutionStatus::CompileChecked,
             created_at: chrono::Utc::now(),
             eval_summary: None,
+            tiering: None,
         };
 
         let result = pipeline
@@ -3595,6 +3622,7 @@ index 1111111..2222222 100644
             status: EvolutionStatus::CompileChecked,
             created_at: chrono::Utc::now(),
             eval_summary: None,
+            tiering: None,
         };
 
         let result = pipeline
@@ -3679,6 +3707,7 @@ index 1111111..2222222 100644
             status: EvolutionStatus::CompileChecked,
             created_at: chrono::Utc::now(),
             eval_summary: None,
+            tiering: None,
         };
 
         let result = pipeline
@@ -3746,6 +3775,7 @@ index 1111111..2222222 100644
             status: EvolutionStatus::CompileChecked,
             created_at: chrono::Utc::now(),
             eval_summary: None,
+            tiering: None,
         };
 
         let result = pipeline
@@ -3795,6 +3825,7 @@ index 1111111..2222222 100644
             status: EvolutionStatus::CompileChecked,
             created_at: chrono::Utc::now(),
             eval_summary: None,
+            tiering: None,
         };
 
         let result = pipeline
@@ -3843,6 +3874,7 @@ index 1111111..2222222 100644
             status: EvolutionStatus::CompileChecked,
             created_at: chrono::Utc::now(),
             eval_summary: None,
+            tiering: None,
         };
 
         let result = pipeline
@@ -3944,6 +3976,7 @@ index 1111111..2222222 100644
             status: crate::types::EvolutionStatus::CompileChecked,
             created_at: chrono::Utc::now(),
             eval_summary: None,
+            tiering: None,
         };
 
         // 弄脏工作树。
@@ -4003,6 +4036,7 @@ index 1111111..2222222 100644
             status,
             created_at,
             eval_summary: None,
+            tiering: None,
         }
     }
 
@@ -4357,6 +4391,7 @@ index 1111111..2222222 100644
             status: EvolutionStatus::CompileChecked,
             created_at: chrono::Utc::now(),
             eval_summary: None,
+            tiering: None,
         }
     }
 

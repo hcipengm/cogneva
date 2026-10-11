@@ -349,4 +349,12 @@ pub struct EvolutionResult {
         deserialize_with = "cog_core::deserialize_optional_eval_report"
     )]
     pub eval_summary: Option<cog_core::EvalReport>,
+    /// 这条变更被路由到哪些门，随变更记录一起持久化。
+    ///
+    /// 晋级判定跑在 soak 之后、且常常跑在另一个进程里：那时工作树可能已经
+    /// 移动过，重算档位就是在读一棵会动的树，得到的第二次读数会与第一次
+    /// 不一致而没有任何一行代码变化。所以档位在 apply 时算一次、带上走，
+    /// 消费方取它作为参数，不重算。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tiering: Option<crate::criteria_face::Tiering>,
 }

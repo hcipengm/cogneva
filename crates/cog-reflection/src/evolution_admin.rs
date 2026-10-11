@@ -625,6 +625,7 @@ impl EvolutionAdmin for EvolutionAdminService {
                 verdict: proposal.verdict,
                 summary: proposal.eval_summary.clone(),
             }),
+            tiering: None,
         })
         .await;
 
@@ -1037,6 +1038,7 @@ mod tests {
             status: crate::types::EvolutionStatus::AwaitingReview,
             created_at: chrono::Utc::now(),
             eval_summary: None,
+            tiering: None,
         };
         tokio::fs::write(
             change_dir.join(format!("{id}.diff")),
@@ -1298,6 +1300,7 @@ mod tests {
             status: crate::types::EvolutionStatus::AwaitingReview,
             created_at: chrono::Utc::now(),
             eval_summary: None,
+            tiering: None,
         };
 
         let unique = uuid::Uuid::new_v4();

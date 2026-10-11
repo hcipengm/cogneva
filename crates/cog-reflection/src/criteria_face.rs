@@ -132,7 +132,12 @@ pub struct CriteriaFace {
 /// rows gets the strongest one, never the cheapest. A reader that takes the
 /// minimum "to avoid slowing the build down" is the failure this ordering
 /// exists to make impossible to express by accident.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+// The wire spelling is the same token as `as_cell`, so a change record that
+// carried a tier and the metric cell it was counted in name it identically.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum Tier {
     /// Nothing runs: the change touches only prose.
     Minimal,
@@ -180,7 +185,8 @@ impl Tier {
 
 /// Why a tier was reached. Carried so the real gate does not have to re-derive
 /// the trigger, and so a reading can say which rows fire in production.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TierReason {
     /// Every path the change touches is prose.
     ProseOnly,
@@ -199,7 +205,7 @@ pub enum TierReason {
 }
 
 /// The decision, with the rows that produced it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Tiering {
     pub tier: Tier,
     pub reasons: Vec<TierReason>,

@@ -544,6 +544,7 @@ mod tests {
                 verdict: cog_core::EvalVerdict::Adopt,
                 summary: "Adopt z=2.0".into(),
             }),
+            tiering: None,
         }
     }
 

@@ -138,6 +138,7 @@ pub async fn load_due(soak_secs: u64, now: DateTime<Utc>) -> Vec<HandedOff> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::criteria_face::{Tier, TierReason, Tiering};
 
     fn at(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
@@ -180,6 +181,11 @@ mod tests {
                 verdict: cog_core::EvalVerdict::Adopt,
                 summary: "Adopt z=2.31 uplift +18%".into(),
             }),
+            tiering: Some(Tiering {
+                tier: Tier::RealGate,
+                reasons: vec![TierReason::CriteriaCarrier],
+                touches_criteria_code: false,
+            }),
         }
     }
 
@@ -190,6 +196,7 @@ mod tests {
         std::env::set_var("COGNEVA_DATA_DIR", dir.path());
 
         let change = handed_off_change("chg-round-trip");
+        assert!(change.tiering.is_some());
         let source = PromotionSource {
             repo: PathBuf::from("/host-git"),
             rev: "abc123".into(),
@@ -208,6 +215,11 @@ mod tests {
         assert_eq!(due[0].change.artifact_id, "chg-round-trip");
         assert_eq!(due[0].change.content, change.content);
         assert_eq!(due[0].change.eval_summary, change.eval_summary);
+        assert_eq!(
+            due[0].change.tiering, change.tiering,
+            "档位要随变更记录过盘：判定在 soak 之后、常常在另一个进程里做，\
+             那时工作树已经移动，重算就是第二次读数"
+        );
         assert_eq!(due[0].source.repo, PathBuf::from("/host-git"));
         assert_eq!(due[0].source.rev, "abc123");
 

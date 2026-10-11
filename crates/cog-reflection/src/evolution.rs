@@ -246,6 +246,7 @@ impl EvolutionEngine {
                     status,
                     created_at: crate::change_pipeline::UNKNOWN_CREATED_AT,
                     eval_summary: None,
+                    tiering: None,
                 };
                 self.persist_record(&record).await;
                 true
@@ -409,6 +410,7 @@ impl EvolutionEngine {
                         status: EvolutionStatus::Generated,
                         created_at: Utc::now(),
                         eval_summary: None,
+                        tiering: None,
                     };
                     self.insert_result(result.clone()).await;
                     Ok(Some(result))
@@ -422,6 +424,7 @@ impl EvolutionEngine {
                         status: EvolutionStatus::ValidationFailed,
                         created_at: Utc::now(),
                         eval_summary: None,
+                        tiering: None,
                     };
                     self.insert_result(result.clone()).await;
                     Ok(Some(result))
@@ -437,6 +440,7 @@ impl EvolutionEngine {
                     status: EvolutionStatus::ValidationFailed,
                     created_at: Utc::now(),
                     eval_summary: None,
+                    tiering: None,
                 };
                 self.insert_result(result.clone()).await;
                 Ok(Some(result))
@@ -524,6 +528,7 @@ impl EvolutionEngine {
                 status: EvolutionStatus::ValidationFailed,
                 created_at: Utc::now(),
                 eval_summary: None,
+                tiering: None,
             };
             self.insert_result(result.clone()).await;
             return Ok(Some(result));
@@ -555,6 +560,7 @@ impl EvolutionEngine {
                 status: EvolutionStatus::ValidationFailed,
                 created_at: Utc::now(),
                 eval_summary: None,
+                tiering: None,
             };
             self.insert_result(result.clone()).await;
             return Ok(Some(result));
@@ -603,6 +609,7 @@ impl EvolutionEngine {
             status: EvolutionStatus::Generated,
             created_at: Utc::now(),
             eval_summary: None,
+            tiering: None,
         };
         self.insert_result(result.clone()).await;
         Ok(Some(result))
@@ -674,6 +681,7 @@ impl EvolutionEngine {
                 status: EvolutionStatus::ValidationFailed,
                 created_at: Utc::now(),
                 eval_summary: None,
+                tiering: None,
             };
             self.insert_result(result.clone()).await;
             return Ok(Some(result));
@@ -690,6 +698,7 @@ impl EvolutionEngine {
                     status: EvolutionStatus::ValidationFailed,
                     created_at: Utc::now(),
                     eval_summary: None,
+                    tiering: None,
                 };
                 self.insert_result(result.clone()).await;
                 return Ok(Some(result));
@@ -710,6 +719,7 @@ impl EvolutionEngine {
                     status: EvolutionStatus::ValidationFailed,
                     created_at: Utc::now(),
                     eval_summary: None,
+                    tiering: None,
                 };
                 self.insert_result(result.clone()).await;
                 return Ok(Some(result));
@@ -759,6 +769,7 @@ impl EvolutionEngine {
             status: EvolutionStatus::Generated,
             created_at: Utc::now(),
             eval_summary: None,
+            tiering: None,
         };
         self.insert_result(result.clone()).await;
         Ok(Some(result))
@@ -927,6 +938,7 @@ impl EvolutionEngine {
             status: EvolutionStatus::CompileChecked,
             created_at: Utc::now(),
             eval_summary: None,
+            tiering: None,
         };
 
         // The record goes down with the change, or the change does not go down
@@ -1048,6 +1060,7 @@ mod tests {
             status: EvolutionStatus::Generated,
             created_at,
             eval_summary: None,
+            tiering: None,
         }
     }
 
@@ -1139,6 +1152,7 @@ mod tests {
             status,
             created_at: chrono::Utc::now(),
             eval_summary: None,
+            tiering: None,
         }
     }
 

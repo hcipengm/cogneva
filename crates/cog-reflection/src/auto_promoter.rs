@@ -601,6 +601,7 @@ mod tests {
             status: EvolutionStatus::Active,
             created_at: Utc::now(),
             eval_summary: None,
+        tiering: None,
         }
     }
 

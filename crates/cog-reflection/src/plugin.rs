@@ -2109,6 +2109,7 @@ async fn merge_verification_inputs(
                 status: crate::types::EvolutionStatus::CompileChecked,
                 created_at: chrono::Utc::now(),
                 eval_summary: None,
+                tiering: None,
             });
         }
         recorded.insert(change.change_id.clone(), change);
@@ -2928,6 +2929,12 @@ async fn consume_executed_change(
         } => (change, result, artifact, held),
     };
 
+    // 档位在这里只是转手：执行侧从一棵 checkout 上算过一次，而从那以后工作树
+    // 还会被判定、构建、落地继续改写，在这里重算就是在另一棵树上读第二次。
+    // 带上它，好让 soak 之后才做的晋级判定不用回头去猜这条变更当初被路由到哪。
+    let mut change = change;
+    change.tiering = result.tiering.clone();
+
     if let Some(cause) = result.verdict.cause() {
         // The reason is already in the result; carrying it into the log is
         // what makes a rejection diagnosable without digging the artifact
@@ -3387,6 +3394,7 @@ mod tests {
             status: crate::types::EvolutionStatus::CompileChecked,
             created_at: chrono::Utc::now(),
             eval_summary: None,
+            tiering: None,
         }
     }
 

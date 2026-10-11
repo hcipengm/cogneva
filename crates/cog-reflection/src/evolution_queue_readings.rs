@@ -571,6 +571,7 @@ mod tests {
             status: crate::types::EvolutionStatus::CompileChecked,
             created_at: chrono::Utc::now(),
             eval_summary: None,
+            tiering: None,
         };
         engine.register_result(skill).await;
         assert!(
