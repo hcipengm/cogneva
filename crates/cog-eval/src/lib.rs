@@ -42,7 +42,8 @@ pub use adapters::{
     ToolathlonToolkit, HLE_JSONL, SWE_PRO_JSONL, TOOLATHLON_TASKS_DIR,
 };
 pub use bench::{
-    Benchmark, CaseJudge, CaseSource, EnvProvider, NoEnvProvider, ToolFactory, Toolkit, Verdict,
+    tools_bound_to, Benchmark, CaseJudge, CaseSource, EnvProvider, NoEnvProvider, ToolFactory,
+    Toolkit, Verdict,
 };
 pub use comparator::{two_proportion_z_test, AbComparator, ComparisonReport, StatisticalTest};
 pub use cross_system::{

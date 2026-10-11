@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use cog_core::Tool;
+use cog_core::{Tool, ToolDefinition, ToolImplementation};
 
 use crate::dataset::EvalCase;
 use crate::scaffold::{AgentOutput, Budget, CaseEnv, ToolSet};
@@ -87,6 +87,44 @@ impl EnvProvider for NoEnvProvider {
 pub type ToolFactory =
     dyn Fn(&EvalCase, &Arc<dyn CaseEnv>) -> anyhow::Result<Vec<Tool>> + Send + Sync;
 
+/// 把基准定义的工具面**接到这道题环境的执行面**上。
+///
+/// 定义（名字＋参数 schema）由基准出，执行落在**这道题自己的**环境里——这正是
+/// [`ToolFactory`] 要的形状：承载工具的容器 / compose 工程，要到 `env` 拿到时才存在。
+/// 名字**逐字**递给执行面，这里不改写、不翻译；执行面收到不认识的名字要自己报错，
+/// 不许静默落到别的后端（落到平台沙盒里跑出来的不是这道题的答案）。
+///
+/// 环境没有执行面时**报错**，不回落成一束空工具：「这道题本来就没有环境」与「环境的
+/// 执行面没接上」在分数上同形，必须在这一层就分开。
+pub fn tools_bound_to(
+    env: &Arc<dyn CaseEnv>,
+    definitions: &[ToolDefinition],
+) -> anyhow::Result<Vec<Tool>> {
+    let executor = env.executor().ok_or_else(|| {
+        anyhow::anyhow!(
+            "environment `{}` offers no execution face, so a benchmark tool cannot run in it",
+            env.id()
+        )
+    })?;
+    Ok(definitions
+        .iter()
+        .map(|definition| {
+            let executor = executor.clone();
+            let name = definition.name.clone();
+            Tool {
+                name: definition.name.clone(),
+                description: definition.description.clone(),
+                parameters: definition.parameters.clone(),
+                implementation: ToolImplementation::Native(Arc::new(move |arguments| {
+                    let executor = executor.clone();
+                    let name = name.clone();
+                    Box::pin(async move { executor.execute(&name, arguments).await })
+                })),
+            }
+        })
+        .collect())
+}
+
 /// 工具包：这道题给外壳的工具面，一个基准一个。
 ///
 /// 协议由基准定、**不由方法定**——所以它在基准这一侧，不在外壳那一侧。同一基准
@@ -145,8 +183,91 @@ pub struct Benchmark {
 mod tests {
     use super::*;
     use crate::scaffold::{AgentScaffold, FinishReason, SolveContext};
-    use cog_core::{ChatOptions, ChatResponse, Message};
+    use cog_core::{ChatOptions, ChatResponse, Message, SFError, SFResult};
     use std::path::PathBuf;
+
+    /// 替身环境：把一句话的执行面（或不给）按需接上。
+    struct StubEnv {
+        executor: Option<Arc<dyn cog_core::ToolExecutor>>,
+    }
+
+    #[async_trait]
+    impl CaseEnv for StubEnv {
+        fn id(&self) -> &str {
+            "stub"
+        }
+        fn executor(&self) -> Option<Arc<dyn cog_core::ToolExecutor>> {
+            self.executor.clone()
+        }
+        async fn teardown(&self) {}
+    }
+
+    /// 只认自己那一套工具名的执行面，并把收到的名字记下来。
+    struct OnlyBash(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl cog_core::ToolExecutor for OnlyBash {
+        async fn execute(
+            &self,
+            name: &str,
+            arguments: serde_json::Value,
+        ) -> SFResult<serde_json::Value> {
+            if name != "bash" {
+                return Err(SFError::Validation(format!(
+                    "this environment runs no `{name}`"
+                )));
+            }
+            self.0.lock().unwrap().push(name.to_string());
+            Ok(arguments)
+        }
+    }
+
+    fn definition(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.into(),
+            description: name.into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    /// 定义由基准出、执行落在**这道题的环境**里；名字逐字到达执行面，回来的错也原样传上去。
+    #[tokio::test]
+    async fn a_benchmark_tool_runs_in_the_case_environment() {
+        let executor = Arc::new(OnlyBash(Default::default()));
+        let env: Arc<dyn CaseEnv> = Arc::new(StubEnv {
+            executor: Some(executor.clone()),
+        });
+        let set = ToolSet::new(
+            tools_bound_to(&env, &[definition("bash"), definition("python")]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(set.definitions().len(), 2);
+
+        let out = set
+            .call("bash", serde_json::json!({"command": "ls"}))
+            .await
+            .unwrap();
+        assert_eq!(out, serde_json::json!({"command": "ls"}));
+        assert_eq!(executor.0.lock().unwrap().as_slice(), ["bash"]);
+
+        // 执行面不认识的名字由**它**报错，不为这一格编一个空结果。
+        let err = set
+            .call("python", serde_json::json!({}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("python"), "{err}");
+    }
+
+    /// 环境没有执行面是**报错**，不是给一束空工具：两者在分数上同形。
+    #[tokio::test]
+    async fn an_environment_without_an_execution_face_is_an_error() {
+        let env: Arc<dyn CaseEnv> = Arc::new(StubEnv { executor: None });
+        let err = tools_bound_to(&env, &[definition("bash")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no execution face"), "{err}");
+    }
 
     struct MemorySource {
         cases: Vec<EvalCase>,
