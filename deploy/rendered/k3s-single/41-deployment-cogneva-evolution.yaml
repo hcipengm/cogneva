@@ -278,6 +278,10 @@ spec:
             - name: git-remote
               mountPath: /host-git
               readOnly: false
+            # 挂载点与宿主上的路径**同名**：闸门的「同一块目录」只能靠读数里的
+            # dev:ino 认，两侧不同名时人第一眼看到的是两个目录。
+            - name: build-gate
+              mountPath: "/var/lib/cogneva-build-gate"
             - name: cogneva-json
               # 必须挂目录：挂成 /etc/cogneva/cogneva.json 且无 subPath 会把
               # ConfigMap 挂成同名目录，进程读文件失败静默回退默认配置
@@ -312,6 +316,13 @@ spec:
         - name: app-data
           persistentVolumeClaim:
             claimName: cogneva-evolution-data-pvc
+        - name: build-gate
+          hostPath:
+            path: "/var/lib/cogneva-build-gate"
+            # DirectoryOrCreate：宿主上没有任何东西会先建这个目录，用 Directory
+            # 会让新机器上 Pod 直接起不来；这里要的是它自己出现（root:root 0755，
+            # 与 git-remote 那份宿主目录同形）。
+            type: DirectoryOrCreate
         - name: git-remote
           hostPath:
             path: /var/lib/cogneva-data/git-remote

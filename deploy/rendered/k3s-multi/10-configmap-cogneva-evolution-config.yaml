@@ -47,7 +47,7 @@ data:
   COGNEVA_BUILD_GATE_ENABLED: "true"
   COGNEVA_BUILD_GATE_MAX_CONCURRENT: "0"
   COGNEVA_BUILD_GATE_WAIT_SECS: "1800"
-  COGNEVA_BUILD_GATE_LOCK_DIR: "/opt/cogneva/sandbox/build-gate"
+  COGNEVA_BUILD_GATE_LOCK_DIR: "/var/lib/cogneva-build-gate"
   # 晋级门（推送端）：沙盒验证全过的变更（change）经分级策略判定后，L0/L1 自动晋级
   # 走 GitOps 发布（annotated tag + evolution-release 分支推中央 bare 仓库），
   # L2 留审批台。推送只写挂载的 bare 仓库 /host-git，不持任何集群凭证。

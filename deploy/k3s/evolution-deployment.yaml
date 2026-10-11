@@ -289,6 +289,10 @@ spec:
             - name: git-remote
               mountPath: /host-git
               readOnly: false
+            # 挂载点与宿主上的路径同名：闸门的「同一块目录」只能靠读数里的
+            # dev:ino 认，两侧不同名时人第一眼看到的是两个目录。
+            - name: build-gate
+              mountPath: /var/lib/cogneva-build-gate
             - name: cogneva-json
               # 必须挂目录：挂成 /etc/cogneva/cogneva.json 且无 subPath 会把
               # ConfigMap 挂成同名目录，进程读文件失败静默回退默认配置，
@@ -331,6 +335,12 @@ spec:
         - name: app-data
           persistentVolumeClaim:
             claimName: cogneva-evolution-data-pvc
+        # 宿主级构建闸门的锁目录。挂载点与宿主上的路径同名，两侧才看着像一块
+        # 目录；Path 上的目录不存在时由 kubelet 建（root:root 0755）。
+        - name: build-gate
+          hostPath:
+            path: /var/lib/cogneva-build-gate
+            type: DirectoryOrCreate
         # __GIT_REMOTE_HOSTPATH_BEGIN__
         - name: git-remote
           # 单节点（默认，本文件可直接 kubectl apply）：引导器部署前在宿主

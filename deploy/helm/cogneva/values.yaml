@@ -349,13 +349,21 @@ evolution:
   # 所在容器的内存上限，取最紧那一项），正数才是钉死它的覆盖位；此时读数
   # `cogneva_build_gate_ceiling` 的 dimension 标签会写 override，而不是
   # cpu / memory / io / cgroup_memory。
-  # lockDir 必须落在所有构建方共享的 hostPath 上，否则闸门退化成各自为政
-  # （读数里 `cogneva_build_gate_slots` 的 dir 标签就是用来分辨这件事的）。
+  # lockDir 与 hostPath 是**同一个字符串**，这是刻意的：闸门只在一块目录里成立，
+  # 而「同一块目录」的判据是它报出来的 `dir` 标签（值是目录的 dev:ino，不是路径）——
+  # 路径在两侧不同名，读数就会看起来像两个目录，人也就无从分辨其实现场是一个还是两个。
+  # 所以不要把它放到别的卷的挂载点**里面**（比如 /var/lib/cogneva-data 下的某个子目录），
+  # 那要靠"更具体的挂载赢"才成立，同路径的主张随即变脆；与 /var/lib/cogneva-buildah
+  # 同形，另起一个宿主目录。
+  # 目前只有进化 Pod 与宿主侧 `cogneva eval-table --admission` 指到这里；多节点上每个
+  # 节点各有一份，那是对的——界按台算。别再往这个目录里加**非 root** 的入场方：
+  # 那会同时带回两个问题（fsGroup 互改属主、不受信方占住槽位），见 build_gate 的注解。
   buildGate:
     enabled: true
     maxConcurrent: 0
     waitSecs: 1800
-    lockDir: /opt/cogneva/sandbox/build-gate
+    hostPath: /var/lib/cogneva-build-gate
+    lockDir: /var/lib/cogneva-build-gate
   resources:
     requests:
       cpu: 500m
