@@ -297,6 +297,8 @@ mod tests {
             env: Arc::new(NoEnv),
             budget: Budget::default(),
             seed: 5,
+            benchmark: "hle".into(),
+            scaffold: "gepa".into(),
         }
     }
 

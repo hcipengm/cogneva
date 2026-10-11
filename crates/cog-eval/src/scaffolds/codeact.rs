@@ -181,6 +181,8 @@ mod tests {
             env: Arc::new(NoEnv),
             budget: Budget::default(),
             seed: 3,
+            benchmark: "hle".into(),
+            scaffold: "codeact".into(),
         }
     }
 

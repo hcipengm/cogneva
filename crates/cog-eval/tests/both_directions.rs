@@ -155,6 +155,7 @@ async fn the_rig_scores_the_reference_arm_high_and_the_degenerate_arm_zero() {
             .with_scaffold(Arc::new(EmptyScaffold))
             .run(&[bench])
             .await
+            .unwrap()
     }
 
     if has_swe {

@@ -519,10 +519,15 @@ impl PlatformApiRunner {
 #[async_trait]
 impl PlatformRunner for PlatformApiRunner {
     async fn run(&self, request: PlatformRequest) -> anyhow::Result<PlatformReply> {
-        // 同一道题＋同一颗种子＝平台侧同一个任务。三次种子是不同的任务，因此不会
-        // 命中同一份缓存；同一次跑重来会命中平台自己的「同 id 幂等跳过」，那是平台
-        // 对「同一个任务」的定义，不是缓存穿透。
-        let case_id = format!("eval-{}-{}", request.seed, digest(&request.task));
+        // 同一格里的同一道题＝平台侧同一个任务。同一次跑重来会命中平台自己的「同 id
+        // 幂等跳过」，那是平台对「同一个任务」的定义，不是缓存穿透；判成与计都读那一条
+        // 已经落定的行。
+        //
+        // id 里必须**一个坐标都不少**：只有种子与题面的话，两个基准上题面相同的两道题、
+        // 或者四行外壳跑同一道题，都会命中同一条行——而更贵的一种是「同一个外壳改了代码
+        // 重跑」：id 不变，平台把上一次那条终态行交回来，读数看着完全正常，实际是新代码
+        // 一次都没跑。所以这里带上代码自己的版本号。
+        let case_id = case_task_id(&request);
         self.submit(&case_id, &request).await?;
         let facts = self.await_terminal(&case_id).await?;
         // 答案行 = 那道题被拆解时占位行点出的那条；没被拆解时两者是同一个 id。判成与计
@@ -556,6 +561,22 @@ impl PlatformRunner for PlatformApiRunner {
     }
 }
 
+/// 平台侧的任务 id：一格里的一个例，加上**这份代码**是哪一份。
+///
+/// 四个坐标（基准、外壳、种子、题面指纹）缺一个就会让两件不同的活共用一个 id；代码版本
+/// 那一段管的是另一件事——同一个外壳改了代码重跑时，id 必须跟着变，否则平台把上一次
+/// 那条终态行交回来，读数看着完全正常，实际是新代码一次都没跑。
+fn case_task_id(request: &PlatformRequest) -> String {
+    format!(
+        "eval-{}-{}-{}-{}-{}",
+        request.benchmark,
+        request.scaffold,
+        request.seed,
+        digest(&request.task),
+        env!("COGNEVA_VERSION_ID")
+    )
+}
+
 /// 题面的短指纹，用来拼任务 id。它只是让同一道题认得出是同一道题，不是安全边界。
 fn digest(text: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -584,6 +605,8 @@ mod tests {
         let err = platform
             .run(PlatformRequest {
                 task: "a question".into(),
+                benchmark: "hle".into(),
+                scaffold: "nql".into(),
                 seed: 0,
                 budget: Budget::default(),
             })
@@ -855,6 +878,8 @@ mod tests {
     fn request(task: &str, seed: u64) -> PlatformRequest {
         PlatformRequest {
             task: task.into(),
+            benchmark: "hle".into(),
+            scaffold: "nql".into(),
             seed,
             budget: Budget {
                 max_steps: 7,
@@ -862,6 +887,35 @@ mod tests {
                 temperature: 0.5,
             },
         }
+    }
+
+    /// 任务 id 的幂等单元必须吃全「这一格是哪一格」：换了外壳或换了基准，就是另一格，
+    /// 不能被认成同一道题已经跑过而把上一格的终态当成本格的成绩交回来。
+    #[test]
+    fn the_task_id_carries_every_coordinate_of_the_case() {
+        let base = case_task_id(&request("a question", 7));
+        assert!(base.contains(env!("COGNEVA_VERSION_ID")), "{base}");
+
+        let mut other = request("a question", 7);
+        other.scaffold = "gepa".into();
+        assert_ne!(base, case_task_id(&other), "换了外壳还是同一个 id：{base}");
+
+        let mut other = request("a question", 7);
+        other.benchmark = "toolathlon".into();
+        assert_ne!(base, case_task_id(&other), "换了基准还是同一个 id：{base}");
+
+        assert_ne!(
+            base,
+            case_task_id(&request("a question", 8)),
+            "换了 seed 还是同一个 id：{base}"
+        );
+        assert_ne!(
+            base,
+            case_task_id(&request("another question", 7)),
+            "换了题还是同一个 id：{base}"
+        );
+        // 同一格、同一构建，重复提交仍是同一件事——幂等性没被这几刀切掉。
+        assert_eq!(base, case_task_id(&request("a question", 7)));
     }
 
     /// 平台的接入点解析是纯函数：没有基址就是没有平台，其余各有默认。
@@ -887,7 +941,7 @@ mod tests {
     #[tokio::test]
     async fn a_case_goes_in_as_a_task_and_comes_back_as_an_agent_output() {
         // 先按 id 探一次，才能把响应体造成「这一次提交」的样子。
-        let id_for_view = format!("eval-{}-{}", 3, digest("2 + 2?"));
+        let id_for_view = case_task_id(&request("2 + 2?", 3));
         let fake = FakePlatform::new(
             task_view(
                 &id_for_view,
@@ -940,7 +994,7 @@ mod tests {
     /// 测试只有在桥读那条被声明出来的行时才会绿：读抄件会得到「complete 了却没存结果」。
     #[tokio::test]
     async fn a_decomposed_case_is_read_through_the_declaration_the_platform_wrote() {
-        let case_id = format!("eval-{}-{}", 4, digest("a question the platform splits"));
+        let case_id = case_task_id(&request("a question the platform splits", 4));
         let answer_id = format!("{case_id}-answer");
 
         let mut goal_row = task_of(&case_id, PLATFORM_TASK_KIND);
@@ -971,7 +1025,7 @@ mod tests {
 
     #[tokio::test]
     async fn two_runs_of_one_case_come_back_identical() {
-        let id = format!("eval-{}-{}", 1, digest("same question"));
+        let id = case_task_id(&request("same question", 1));
         let fake = FakePlatform::new(
             task_view(
                 &id,
@@ -994,7 +1048,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_case_that_never_finishes_is_an_error_not_a_zero() {
-        let id = format!("eval-{}-{}", 0, digest("slow question"));
+        let id = case_task_id(&request("slow question", 0));
         let fake = FakePlatform::new(
             task_view(&id, cog_core::TaskStatus::Pending, None, None),
             trace_for(&id),
@@ -1012,7 +1066,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_case_carries_the_platforms_own_reason() {
-        let id = format!("eval-{}-{}", 0, digest("doomed question"));
+        let id = case_task_id(&request("doomed question", 0));
         let fake = FakePlatform::new(
             task_view(
                 &id,
@@ -1036,7 +1090,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_score_without_a_process_is_an_error() {
-        let id = format!("eval-{}-{}", 0, digest("untraceable question"));
+        let id = case_task_id(&request("untraceable question", 0));
         let mut fake = FakePlatform::new(
             task_view(
                 &id,

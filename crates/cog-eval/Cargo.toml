@@ -22,6 +22,10 @@ anyhow = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 
+# 检查点的独占权：flock 由内核在进程退出时放开，正是续跑要接上的场合，而
+# `std` 里那个同义 API 的 MSRV 比本工作区声明的高。
+libc = "0.2"
+
 # Statistical testing
 statrs = "0.17"
 

@@ -33,6 +33,11 @@ pub struct PlatformRequest {
     /// 题面。逐题投、一题一个任务：把整个数据集合成一个大任务，这一格的分数就
     /// 归因不到任何一道题上。
     pub task: String,
+    /// 这一格在哪一列（基准）上。任务是按 id 幂等的，id 里少了这一项，
+    /// 两个基准上题面相同的两道题就是同一件活。
+    pub benchmark: String,
+    /// 这一格在哪一行（外壳）上。少了它，「四行共用同一份题面」会让四行交回同一份结果。
+    pub scaffold: String,
     /// 同一格的三个运行里的哪一个。平台侧要按它分流，三次不能命中同一份缓存——
     /// 那样「三个独立种子」就只是同一个数的三份拷贝。
     pub seed: u64,
@@ -69,6 +74,8 @@ impl AgentScaffold for Nql {
             .platform
             .run(PlatformRequest {
                 task: task_text(case),
+                benchmark: ctx.benchmark.clone(),
+                scaffold: ctx.scaffold.clone(),
                 seed: ctx.seed,
                 budget: ctx.budget,
             })
@@ -146,6 +153,8 @@ mod tests {
             env: Arc::new(NoEnv),
             budget: Budget::default(),
             seed: 2,
+            benchmark: "hle".into(),
+            scaffold: "nql".into(),
         };
 
         let out = Nql::new(platform.clone())
@@ -180,6 +189,8 @@ mod tests {
             env: Arc::new(NoEnv),
             budget: Budget::default(),
             seed: 0,
+            benchmark: "hle".into(),
+            scaffold: "nql".into(),
         };
         let err = Nql::new(Arc::new(Missing))
             .solve(&case(), &ctx)

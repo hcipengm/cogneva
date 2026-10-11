@@ -1490,6 +1490,7 @@ dependencies = [
  "cog-core",
  "comfy-table",
  "hex",
+ "libc",
  "schemars",
  "serde",
  "serde_json",

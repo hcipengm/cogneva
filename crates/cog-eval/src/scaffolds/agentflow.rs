@@ -317,6 +317,8 @@ mod tests {
             env: Arc::new(NoEnv),
             budget: Budget::default(),
             seed: 1,
+            benchmark: "hle".into(),
+            scaffold: "agentflow".into(),
         }
     }
 

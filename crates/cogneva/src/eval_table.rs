@@ -24,7 +24,8 @@ use cog_eval::adapters::{
     SweProToolkit, ToolathlonBackend, ToolathlonToolkit,
 };
 use cog_eval::scaffolds::{table_scaffolds, PlatformRunner};
-use cog_eval::{Benchmark, CaseSubset, Rig, RunConfig, Table};
+use cog_eval::{Benchmark, CaseSubset, Checkpoint, Rig, RunConfig, Table};
+use sha2::Digest;
 
 use crate::eval_platform::{BridgeSettings, NoBackbone, NoPlatform, PlatformApiRunner};
 
@@ -537,6 +538,55 @@ pub struct Outcome {
 }
 
 /// 跑一次表并渲染。依赖由调用方注入：命令行注入真上游与真平台，测试注入替身。
+/// 这次跑的检查点：落在哪、以及它是谁。
+///
+/// 身份把**这次跑要用的每一件东西**都收进来：数据的 pin、骨干与裁判的模型、工具臂、
+/// 基准与外壳清单、种子表、子集存档，以及**这份代码本身**。少了最后一项就够了不着的
+/// 那一种错——「同一个外壳改了代码重跑」会接上一次那条老记录，把旧代码的结果当成新代码
+/// 的读数交回来，而表上完全看不出来。
+///
+/// 它与随表出去的 pins 是同一批东西（表里的 pins 让**别人**能复跑这张表，这里的身份让
+/// **这次**跑接得上自己上一次的半成品），所以两处都从这一份材料出，不各写一份。
+fn run_checkpoint(
+    args: &EvalTableArgs,
+    verified: &BTreeMap<String, String>,
+    subset: Option<&CaseSubset>,
+) -> Checkpoint {
+    let mut material = String::new();
+    for (benchmark, how) in verified {
+        material.push_str(&format!("pin\t{benchmark}\t{how}\n"));
+    }
+    material.push_str(&format!(
+        "backbone\t{}@{}\n",
+        args.backbone.model, args.backbone.version
+    ));
+    material.push_str(&format!(
+        "judge\t{}@{}\n",
+        args.judge.model, args.judge.version
+    ));
+    material.push_str(&format!("tools\t{}\n", args.tools.render()));
+    material.push_str(&format!("benchmarks\t{}\n", args.benchmarks.join(",")));
+    material.push_str(&format!("scaffolds\t{}\n", args.scaffolds.join(",")));
+    material.push_str(&format!("seeds\t{:?}\n", args.seeds));
+    material.push_str(&format!("software\t{}\n", env!("COGNEVA_VERSION_ID")));
+    if let Some(subset) = subset {
+        material.push_str(&format!("subset\t{}\n", subset.source().sha256));
+    }
+    let run_id = hex::encode(sha2::Sha256::digest(material.as_bytes()));
+    let path = match &args.out {
+        // 检查点跟着报表走：一次跑的两份产物放在一起，谁也不会拿另一份去接。
+        Some(out) => {
+            let mut name = out.file_name().unwrap_or_default().to_os_string();
+            name.push(".cases.jsonl");
+            out.with_file_name(name)
+        }
+        // 没有 `--out` 时落在当前目录，名字带上身份的前一截：两套参数在同一目录里
+        // 跑不会互相顶掉，而身份仍然是文件里逐行核过的那一个。
+        None => PathBuf::from(format!("eval-table-{}.cases.jsonl", &run_id[..12])),
+    };
+    Checkpoint { path, run_id }
+}
+
 pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Result<Outcome> {
     let data_root = match &args.data_root {
         Some(root) => root.clone(),
@@ -618,6 +668,7 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
             seeds: args.seeds.clone(),
             max_concurrency: 4,
             subset: subset.clone(),
+            checkpoint: Some(run_checkpoint(args, &verified, subset.as_deref())),
         },
     );
     for scaffold in table_scaffolds(platform) {
@@ -636,7 +687,7 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
         )?);
     }
 
-    let table = rig.run(&benchmarks).await;
+    let table = rig.run(&benchmarks).await?;
     let errored: usize = table.cells.iter().map(|c| c.errored()).sum();
 
     // 读不出题的基准会留下一整列「题数为 0」的格子。那不是一个读数为零的格子，是这一列
@@ -829,9 +880,18 @@ fn render(args: &EvalTableArgs, wiring: WiringReport<'_>, readings: Readings<'_>
                 continue;
             };
             for seed in &cell.per_seed {
+                // `resumed` 单列出来：接回来的那些题用的是**当时**那份外壳与那次上游，
+                // 与这一轮跑出来的不是同一个条件。归零（没有检查点或全新一次跑）就是
+                // 这一格全是这一轮的读数。
                 out.push_str(&format!(
-                    "cell\t{col}\t{row}\tseed={}\tresolved={}\ttotal={}\terrored={}\ttokens={}\tsteps={}\n",
-                    seed.seed, seed.resolved, seed.total, seed.errored, seed.tokens, seed.steps
+                    "cell\t{col}\t{row}\tseed={}\tresolved={}\ttotal={}\terrored={}\tresumed={}\ttokens={}\tsteps={}\n",
+                    seed.seed,
+                    seed.resolved,
+                    seed.total,
+                    seed.errored,
+                    seed.resumed,
+                    seed.tokens,
+                    seed.steps
                 ));
             }
         }
@@ -1067,6 +1127,50 @@ mod tests {
         let other = EvalTableArgs::parse(&other).unwrap();
         assert_eq!(parsed.benchmarks, other.benchmarks);
         assert_eq!(parsed.scaffolds, other.scaffolds);
+    }
+
+    /// 检查点的身份就是这张表的身份：换了外壳集合、换了骨干版本，就是另一次实验，
+    /// 不能在同一份 `--out` 上接着上一次的半成品跑——那样交回来的读数一半是旧条件的。
+    #[test]
+    fn the_checkpoint_identity_rides_the_pins_of_the_run() {
+        let verified: BTreeMap<String, String> = BTreeMap::new();
+        let base = EvalTableArgs::parse(&minimal()).unwrap();
+        let one = run_checkpoint(&base, &verified, None);
+
+        let mut other = EvalTableArgs::parse(&minimal()).unwrap();
+        other.backbone.version = "2".into();
+        assert_ne!(
+            one.run_id,
+            run_checkpoint(&other, &verified, None).run_id,
+            "换了骨干版本还是同一个身份"
+        );
+
+        let mut other = EvalTableArgs::parse(&minimal()).unwrap();
+        other.scaffolds = vec!["nql"];
+        assert_ne!(
+            one.run_id,
+            run_checkpoint(&other, &verified, None).run_id,
+            "换了外壳集合还是同一个身份"
+        );
+
+        // 同一套参数重复算，身份相同：它要认得出自己上一次留下的半成品。
+        assert_eq!(one.run_id, run_checkpoint(&base, &verified, None).run_id);
+
+        // 没有 `--out` 时文件名带身份前截，两套参数在同一目录里跑不会互相顶掉。
+        assert!(
+            one.path.to_string_lossy().contains(&one.run_id[..12]),
+            "{}",
+            one.path.display()
+        );
+        assert_ne!(one.path, run_checkpoint(&other, &verified, None).path);
+
+        // 给了 `--out`：检查点跟着报表走，一次跑的两份产物放在一起。
+        let mut with_out = EvalTableArgs::parse(&minimal()).unwrap();
+        with_out.out = Some(PathBuf::from("/tmp/table.md"));
+        assert_eq!(
+            run_checkpoint(&with_out, &verified, None).path,
+            PathBuf::from("/tmp/table.md.cases.jsonl")
+        );
     }
 
     #[test]

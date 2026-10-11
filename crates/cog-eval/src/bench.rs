@@ -415,6 +415,8 @@ mod tests {
             env: env.clone(),
             budget: bench.budget,
             seed: 0,
+            benchmark: "hle".into(),
+            scaffold: "test".into(),
         };
         let out = EchoScaffold.solve(&cases[0], &ctx).await.unwrap();
         let verdict = bench.judge.judge(&cases[0], &env, &out).await.unwrap();

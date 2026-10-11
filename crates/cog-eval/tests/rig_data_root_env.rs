@@ -154,7 +154,8 @@ async fn the_data_root_env_var_is_what_the_rig_reads_cases_from() {
     let table = Rig::new(Arc::new(NeverCalled), config)
         .with_scaffold(Arc::new(Echo))
         .run(&[benchmark()])
-        .await;
+        .await
+        .unwrap();
 
     let cell = table.cell("echo", "hle").unwrap();
     assert_eq!(cell.per_seed[0].total, 3, "题是从环境变量指的那个目录读的");
@@ -169,7 +170,8 @@ async fn the_data_root_env_var_is_what_the_rig_reads_cases_from() {
     let table = Rig::new(Arc::new(NeverCalled), RunConfig::from_env().unwrap())
         .with_scaffold(Arc::new(Echo))
         .run(&[benchmark()])
-        .await;
+        .await
+        .unwrap();
     assert_eq!(table.cell("echo", "hle").unwrap().per_seed[0].total, 1);
 
     std::env::remove_var(DATA_ROOT_ENV);
