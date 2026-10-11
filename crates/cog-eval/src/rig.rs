@@ -16,6 +16,7 @@ use tokio::sync::Semaphore;
 use crate::bench::Benchmark;
 use crate::dataset::EvalCase;
 use crate::scaffold::{AgentScaffold, SolveContext};
+use crate::subset::CaseSubset;
 
 /// 数据根目录从哪个环境变量取。
 ///
@@ -35,6 +36,11 @@ pub struct RunConfig {
     pub seeds: Vec<u64>,
     /// 同时在跑的 case 数。基准的环境是有重量的（容器、compose），不是纯 IO。
     pub max_concurrency: usize,
+    /// 只跑存档点名的那几道题；`None` ＝全量。
+    ///
+    /// 子集是**读进来的**，不是跑的时候现抽的：现抽的话，题面数据换一版、抽取实现改一行，
+    /// 同一个开关在不同时候跑的就不是同一批题，两次迭代的分差随之失去意义。
+    pub subset: Option<Arc<CaseSubset>>,
 }
 
 impl RunConfig {
@@ -44,6 +50,7 @@ impl RunConfig {
             data_root: data_root.into(),
             seeds: vec![0, 1, 2],
             max_concurrency: 4,
+            subset: None,
         }
     }
 
@@ -169,6 +176,12 @@ pub struct Table {
     pub cells: Vec<Cell>,
     /// 这次要求的种子数。写进表里，免得读的人以为每格都是三个数。
     pub wanted_seeds: usize,
+    /// 哪个基准的题没能拿到，以及为什么（基准名，原因）。
+    ///
+    /// 它不参与计分，但报表里那句「缺了什么」要能说出**因**：读不出数据与子集点名的题
+    /// 不在这一版数据里，都表现为一整列题数为 0，而追查的方向完全不同。
+    #[serde(default)]
+    pub unreadable: Vec<(String, String)>,
 }
 
 impl Table {
@@ -269,13 +282,30 @@ impl Rig {
     /// 跑整张表。
     pub async fn run(&self, benchmarks: &[Benchmark]) -> Table {
         let mut cells = Vec::new();
+        let mut unreadable: Vec<(String, String)> = Vec::new();
         for bench in benchmarks {
             let cases = match bench.cases.cases(&self.config.data_root) {
-                Ok(cases) => cases,
+                Ok(cases) => match &self.config.subset {
+                    Some(subset) => match subset.select(&bench.name, cases) {
+                        Ok(cases) => cases,
+                        // 子集选不出题与数据读不出来，在表里都表现为一整列题数为 0，
+                        // 所以这里把原因也带出去给报表用。
+                        Err(e) => {
+                            tracing::error!(benchmark = %bench.name, error = %e, "cannot apply the case subset");
+                            unreadable.push((bench.name.clone(), e.to_string()));
+                            Vec::new()
+                        }
+                    },
+                    None => cases,
+                },
                 Err(e) => {
                     // 读不出数据不是「分数低」：是这一次实验没跑成。留一格带判词的
                     // 空读数，比静默少一列好——静默少一列会被读成「这个基准没过」。
                     tracing::error!(benchmark = %bench.name, error = %e, "cannot read the benchmark's cases");
+                    unreadable.push((
+                        bench.name.clone(),
+                        format!("the case source could not read its cases: {e}"),
+                    ));
                     Vec::new()
                 }
             };
@@ -303,6 +333,7 @@ impl Rig {
             cols: benchmarks.iter().map(|b| b.name.clone()).collect(),
             cells,
             wanted_seeds: self.config.seeds.len(),
+            unreadable,
         }
     }
 
@@ -616,8 +647,75 @@ mod tests {
                 data_root: "/nonexistent".into(),
                 seeds: vec![7, 8, 9],
                 max_concurrency: 4,
+                subset: None,
             },
         )
+    }
+
+    /// 把一份存档写到临时文件里再读回来——跑表走的就是这条路。
+    fn archived(text: &str) -> Arc<CaseSubset> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subset.tsv");
+        std::fs::write(&path, text).unwrap();
+        Arc::new(CaseSubset::load(&path).unwrap())
+    }
+
+    fn rig_on(subset: Arc<CaseSubset>) -> Rig {
+        Rig::new(
+            Arc::new(NeverCalled),
+            RunConfig {
+                data_root: "/nonexistent".into(),
+                seeds: vec![7],
+                max_concurrency: 4,
+                subset: Some(subset),
+            },
+        )
+    }
+
+    /// 子集跑的是子集：分母跟着子集走，不是基准的题数。
+    #[tokio::test]
+    async fn a_subset_run_scores_the_archived_cases_and_not_the_whole_benchmark() {
+        let rig = rig_on(archived("hle\ta\n")).with_scaffold(Arc::new(HalfRight));
+        let table = rig.run(&[bench("hle", Arc::new(OkEnv))]).await;
+        let cell = table.cell("half-right", "hle").unwrap();
+        assert_eq!(cell.per_seed[0].total, 1, "分母＝存档里的题数");
+        assert_eq!(cell.per_seed[0].resolved, 1, "只跑存档点名的 a");
+        assert!(table.unreadable.is_empty(), "{:?}", table.unreadable);
+    }
+
+    /// 存档点名的题这一版数据里没有：那一列题数为 0，而**原因**要写在表里，
+    /// 不能让读的人去追数据根与追存档之间猜。
+    #[tokio::test]
+    async fn a_subset_that_names_a_missing_case_says_so_instead_of_scoring_zero() {
+        let rig = rig_on(archived("hle\tghost\n")).with_scaffold(Arc::new(AlwaysRight));
+        let table = rig.run(&[bench("hle", Arc::new(OkEnv))]).await;
+        assert_eq!(
+            table.cell("always-right", "hle").unwrap().per_seed[0].total,
+            0
+        );
+        let (benchmark, why) = table.unreadable.first().expect("缺席要说出来");
+        assert_eq!(benchmark, "hle");
+        assert!(why.contains("ghost"), "{why}");
+    }
+
+    /// 存档没覆盖这个基准，是报错，不是「那就跑全量」。
+    #[tokio::test]
+    async fn a_benchmark_the_archive_does_not_cover_is_reported_not_run_in_full() {
+        let rig = rig_on(archived("hle\ta\n")).with_scaffold(Arc::new(AlwaysRight));
+        let table = rig
+            .run(&[
+                bench("hle", Arc::new(OkEnv)),
+                bench("toolathlon", Arc::new(OkEnv)),
+            ])
+            .await;
+        let (benchmark, why) = table.unreadable.first().expect("缺席要说出来");
+        assert_eq!(benchmark, "toolathlon");
+        assert!(why.contains("hle"), "要点出存档里有什么：{why}");
+        // 覆盖到的那个基准照常跑，不受影响。
+        assert_eq!(
+            table.cell("always-right", "hle").unwrap().per_seed[0].total,
+            1
+        );
     }
 
     #[tokio::test]

@@ -91,6 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 缺上游或缺平台时它照样出表，但把缺什么写进表里并以非零退出——「这一格是 0 分」
         // 与「这一列没跑成」在表里必须分得开。
         Command::EvalTable => cogneva::eval_table::run_from_args().await,
+        Command::EvalCaseSubset => cogneva::eval_subset::run_from_args(),
         Command::WindowsService => {
             #[cfg(windows)]
             {

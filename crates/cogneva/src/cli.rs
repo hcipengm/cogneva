@@ -28,12 +28,13 @@ pub enum Command {
     Restore,
     RepairAof,
     EvalTable,
+    EvalCaseSubset,
     WindowsService,
 }
 
 /// Subcommands, in the order they appear in [`USAGE`]. A command added here but
 /// not documented fails the usage test.
-const SUBCOMMANDS: [(&str, Command); 10] = [
+const SUBCOMMANDS: [(&str, Command); 11] = [
     ("security-gateway", Command::SecurityGateway),
     ("sandbox-executor", Command::SandboxExecutor),
     ("volume-walker", Command::VolumeWalker),
@@ -44,6 +45,7 @@ const SUBCOMMANDS: [(&str, Command); 10] = [
     ("restore", Command::Restore),
     ("repair-aof", Command::RepairAof),
     ("eval-table", Command::EvalTable),
+    ("eval-case-subset", Command::EvalCaseSubset),
 ];
 
 /// Flags that take effect wherever they appear in the argument list.
@@ -74,6 +76,8 @@ COMMANDS:
     repair-aof <aof-dir>   Drop a torn tail from Redis' AOF files, then exit
     eval-table [OPTIONS]   Run the main comparison table (benchmarks x scaffolds x seeds)
                            against a pinned data root, then exit; --pins names the pins file
+    eval-case-subset       Draw a fixed-seed subset of cases and archive it; runs read that
+                           archive through `eval-table --subset` instead of redrawing
 
     With no COMMAND the full application starts.
 

@@ -24,7 +24,7 @@ use cog_eval::adapters::{
     SweProToolkit, ToolathlonBackend, ToolathlonToolkit,
 };
 use cog_eval::scaffolds::{table_scaffolds, PlatformRunner};
-use cog_eval::{Benchmark, Rig, RunConfig, Table};
+use cog_eval::{Benchmark, CaseSubset, Rig, RunConfig, Table};
 
 use crate::eval_platform::{BridgeSettings, NoBackbone, NoPlatform, PlatformApiRunner};
 
@@ -56,7 +56,8 @@ pub const USAGE: &str = "\
 usage: cogneva eval-table --pins <file> --backbone <model>@<version> --judge <model>@<version>
                           [--tools <none|platform>] [--data-root <dir>]
                           [--benchmarks hle,swe-bench-pro,toolathlon]
-                          [--scaffolds codeact,gepa,agentflow,nql] [--seeds 0,1,2] [--out <file>]
+                          [--scaffolds codeact,gepa,agentflow,nql] [--seeds 0,1,2]
+                          [--subset <file>] [--out <file>]
 
   --pins       the pins file: what the data is pinned by, as printed by
                deploy/scripts/fetch-benchmark-data.sh --print-pins
@@ -72,6 +73,12 @@ usage: cogneva eval-table --pins <file> --backbone <model>@<version> --judge <mo
   --benchmarks comma-separated; default all three, in the canonical order
   --scaffolds  comma-separated; default all four, in the table's row order
   --seeds      comma-separated independent runs per cell; default 0,1,2 (the main-table spec)
+  --subset     run the cases an archived subset names, instead of every case. The archive is a
+               file of `benchmark<TAB>case id` lines drawn once by `cogneva eval-case-subset`;
+               it is read, never redrawn here. A benchmark the archive does not cover, or an id
+               this data root does not have, stops the run instead of silently running in full
+               or dropping a case. The archive's path and content hash go into the table header,
+               because which cases ran is part of what the table says.
   --out        write the output here instead of standard output
 
   the nql row reaches the platform from the environment: COG_EVAL_PLATFORM_BASE is the platform
@@ -148,6 +155,8 @@ pub struct EvalTableArgs {
     pub benchmarks: Vec<&'static str>,
     pub scaffolds: Vec<&'static str>,
     pub seeds: Vec<u64>,
+    /// 只跑这份存档点名的题；`None` ＝全量。
+    pub subset: Option<PathBuf>,
     pub pins: PathBuf,
     pub tools: ToolArm,
     pub backbone: ModelPin,
@@ -207,6 +216,7 @@ impl EvalTableArgs {
         let mut benchmarks: Option<Vec<String>> = None;
         let mut scaffolds: Option<Vec<String>> = None;
         let mut seeds: Option<Vec<u64>> = None;
+        let mut subset: Option<PathBuf> = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -244,6 +254,10 @@ impl EvalTableArgs {
                     scaffolds = Some(parse_list(next_arg(args, i, flag)?)?);
                     i += 2;
                 }
+                "--subset" => {
+                    subset = Some(PathBuf::from(next_arg(args, i, flag)?));
+                    i += 2;
+                }
                 "--seeds" => {
                     let mut parsed = Vec::new();
                     for item in parse_list(next_arg(args, i, flag)?)? {
@@ -274,6 +288,7 @@ impl EvalTableArgs {
             scaffolds: scaffold_names,
             // 种子表的默认值取自评测台的主表规格，不在这里再抄一份数字。
             seeds: seeds.unwrap_or_else(|| RunConfig::new(".").seeds),
+            subset,
             pins: pins.ok_or("--pins is required: a table without pins is not comparable")?,
             // 工具臂默认 `platform`：那是主表要跑的那一臂。`none` 要显式写出，好让
             // 「这次跑的是一臂诊断」在命令行上就被点明，而不是默认落进去。
@@ -531,6 +546,34 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
         bail!("the data root {} is not a directory", data_root.display());
     }
 
+    // 子集先读、先查覆盖面，在核 pins 之前：存档是本机一个小文件，核 pins 要按哈希逐份
+    // 读数据。先在便宜的那一步把「这次跑的是哪一批题」定下来，指错了当场就知道，不必
+    // 先扫一遍几百 MB 的题面；覆盖不到某个基准也要在开跑之前说，而不是跑到那一列才发现。
+    let subset = match &args.subset {
+        Some(path) => {
+            let subset = Arc::new(CaseSubset::load(path)?);
+            let uncovered: Vec<&str> = args
+                .benchmarks
+                .iter()
+                .copied()
+                .filter(|name| subset.count(name).is_none())
+                .collect();
+            if !uncovered.is_empty() {
+                bail!(
+                    "the subset archive {} names no cases for {}; it covers: {}. A benchmark the \
+                     archive does not cover cannot run beside the others: it would run in full \
+                     while its neighbours run a subset, and the two columns' numbers would not \
+                     be the same experiment",
+                    path.display(),
+                    uncovered.join(", "),
+                    subset.benchmarks().collect::<Vec<_>>().join(", ")
+                );
+            }
+            Some(subset)
+        }
+        None => None,
+    };
+
     let verified = pins.verify(&data_root, &args.benchmarks)?;
 
     // 每一处缺席都记名字：报表里缺什么、怎么补，比一个非零退出码有用。
@@ -574,6 +617,7 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
             data_root: data_root.clone(),
             seeds: args.seeds.clone(),
             max_concurrency: 4,
+            subset: subset.clone(),
         },
     );
     for scaffold in table_scaffolds(platform) {
@@ -596,9 +640,18 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
     let errored: usize = table.cells.iter().map(|c| c.errored()).sum();
 
     // 读不出题的基准会留下一整列「题数为 0」的格子。那不是一个读数为零的格子，是这一列
-    // 没有读数——两者在表里都写 0，必须在这里分开。
+    // 没有读数——两者在表里都写 0，必须在这里分开。运行器把原因带了出来（数据读不出来／
+    // 子集点名的题不在这一版数据里），照它的原话记：这两条追查方向完全不同，合成一句
+    // 「题数为 0」就等于把因说成了命。
+    for (benchmark, why) in &table.unreadable {
+        missing.push(format!("{benchmark}: {why}"));
+    }
     for cell in &table.cells {
-        if cell.per_seed.iter().all(|s| s.total == 0) {
+        let named = table
+            .unreadable
+            .iter()
+            .any(|(benchmark, _)| benchmark == &cell.benchmark);
+        if !named && cell.per_seed.iter().all(|s| s.total == 0) {
             let why = format!(
                 "{}: the case source read no cases (the column would read as a score of zero)",
                 cell.benchmark
@@ -611,15 +664,18 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
 
     let text = render(
         args,
-        &data_root,
-        pins,
-        &verified,
         WiringReport {
             missing: &missing,
             platform_base: wiring.platform_base.as_deref(),
         },
-        &table,
-        errored,
+        Readings {
+            data_root: &data_root,
+            pins,
+            verified: &verified,
+            subset: subset.as_deref(),
+            table: &table,
+            errored,
+        },
     );
     Ok(Outcome {
         text,
@@ -628,7 +684,9 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
     })
 }
 
-fn build_benchmark(
+/// 按名字造一个基准。名字与取数适配器只有这一份权威：画子集那条命令也走这里，
+/// 不再抄一份「哪个基准叫什么、题从哪儿读」。
+pub(crate) fn build_benchmark(
     name: &str,
     judge: Option<Arc<dyn LlmClient>>,
     wiring: &Wiring,
@@ -666,15 +724,29 @@ struct WiringReport<'a> {
     platform_base: Option<&'a str>,
 }
 
-fn render(
-    args: &EvalTableArgs,
-    data_root: &Path,
-    pins: &Pins,
-    verified: &BTreeMap<String, String>,
-    wiring: WiringReport<'_>,
-    table: &Table,
+/// 要渲染的那次跑读了什么、跑出了什么。
+///
+/// 数据是哪一份（`data_root`、`pins`、`verified`、`subset`）与结果是哪一份（`table`、
+/// `errored`）是同一件事的两半——「这张表说的是哪次跑」缺了任何一半都答不出来，所以
+/// 一起递，而不是在参数表上排成一串。
+struct Readings<'a> {
+    data_root: &'a Path,
+    pins: &'a Pins,
+    verified: &'a BTreeMap<String, String>,
+    subset: Option<&'a CaseSubset>,
+    table: &'a Table,
     errored: usize,
-) -> String {
+}
+
+fn render(args: &EvalTableArgs, wiring: WiringReport<'_>, readings: Readings<'_>) -> String {
+    let Readings {
+        data_root,
+        pins,
+        verified,
+        subset,
+        table,
+        errored,
+    } = readings;
     let mut out = String::new();
     out.push_str("# eval-table\n\n## pins\n");
     out.push_str(&format!("backbone\t{}\n", args.backbone.render()));
@@ -696,6 +768,20 @@ fn render(
             .join(",")
     ));
     out.push_str(&format!("data-root\t{}\n", data_root.display()));
+    // 跑的是哪一批题，跟基准数据是哪个版本一样，是这张表说的话的一部分：两次跑用了不同的
+    // 子集（或一次全量一次子集），表头看不出区别的话，两个分就不该并排读。
+    if let Some(subset) = subset {
+        out.push_str(&format!(
+            "subset\t{}\tsha256:{}\n",
+            subset.source().path.display(),
+            subset.source().sha256
+        ));
+        for name in &args.benchmarks {
+            if let Some(count) = subset.count(name) {
+                out.push_str(&format!("subset-cases\t{name}\t{count}\n"));
+            }
+        }
+    }
     for name in &args.benchmarks {
         if let Some(pin) = pins.by_benchmark.get(pins_key(name)) {
             let (kind, read) = match &pin.read {
@@ -790,7 +876,13 @@ pub fn operands(argv: &[String]) -> Vec<String> {
     if rest.first().map(String::is_empty) == Some(false) {
         rest.remove(0);
     }
-    if rest.first().map(String::as_str) == Some("eval-table") {
+    // 子命令名是这里第一个不以 `-` 开头的词；每个子命令的开关都是 `--x`，所以这个判据
+    // 不会把某个参数当成命令名吃掉。照名字写死一个，加一条子命令就要回来改这里一次。
+    if rest
+        .first()
+        .map(|word| !word.starts_with('-'))
+        .unwrap_or(false)
+    {
         rest.remove(0);
     }
     rest
@@ -1017,6 +1109,7 @@ mod tests {
             cols: vec!["hle".into()],
             cells: vec![],
             wanted_seeds: 3,
+            unreadable: vec![],
         }
     }
 
@@ -1027,15 +1120,18 @@ mod tests {
         let verified = BTreeMap::new();
         let text = render(
             &args,
-            Path::new("/data"),
-            &Pins::default(),
-            &verified,
             WiringReport {
                 missing: &[],
                 platform_base: None,
             },
-            &one_cell_table(),
-            0,
+            Readings {
+                data_root: Path::new("/data"),
+                pins: &Pins::default(),
+                verified: &verified,
+                subset: None,
+                table: &one_cell_table(),
+                errored: 0,
+            },
         );
         assert!(text.contains("tools\tnone\n"), "{text}");
         assert!(text.contains("diagnostic\t"), "{text}");
@@ -1055,15 +1151,18 @@ mod tests {
         let verified = BTreeMap::new();
         let text = render(
             &args,
-            Path::new("/data"),
-            &Pins::default(),
-            &verified,
             WiringReport {
                 missing: &[],
                 platform_base: None,
             },
-            &one_cell_table(),
-            0,
+            Readings {
+                data_root: Path::new("/data"),
+                pins: &Pins::default(),
+                verified: &verified,
+                subset: None,
+                table: &one_cell_table(),
+                errored: 0,
+            },
         );
         assert!(!text.contains("diagnostic\t"), "{text}");
         assert!(text.contains("| Scaffold |"), "表体要在：{text}");

@@ -28,6 +28,7 @@ pub mod runner;
 pub mod scaffold;
 pub mod scaffolds;
 pub mod service;
+pub mod subset;
 pub mod system_harness;
 pub mod trend;
 
@@ -65,6 +66,9 @@ pub use rig::{Cell, CellStat, Rig, RunConfig, SeedScore, Table, DATA_ROOT_ENV};
 pub use runner::{EvalRunner, RunnerConfig};
 pub use scaffold::{
     AgentOutput, AgentScaffold, Budget, CaseEnv, FinishReason, NoEnv, SolveContext, ToolSet,
+};
+pub use subset::{
+    draw as draw_case_subset, render as render_case_subset, CaseSubset, SubsetSource,
 };
 pub use system_harness::{
     D10Metrics, D13Metrics, DeployObservation, DeploymentTestConfig, FaultObservation, FaultType,

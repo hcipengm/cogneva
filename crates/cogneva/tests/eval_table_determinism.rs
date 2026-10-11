@@ -173,7 +173,12 @@ fn fixture(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
 }
 
 fn args(root: &Path, pins: &Path, scaffolds: &str) -> EvalTableArgs {
-    let raw: Vec<String> = [
+    args_on(root, pins, scaffolds, None)
+}
+
+/// 同一条命令行，外加可选的 `--subset`。
+fn args_on(root: &Path, pins: &Path, scaffolds: &str, subset: Option<&Path>) -> EvalTableArgs {
+    let mut raw: Vec<String> = [
         "--pins".to_string(),
         pins.display().to_string(),
         "--tools".to_string(),
@@ -192,6 +197,9 @@ fn args(root: &Path, pins: &Path, scaffolds: &str) -> EvalTableArgs {
         "0,1,2".to_string(),
     ]
     .to_vec();
+    if let Some(subset) = subset {
+        raw.extend(["--subset".to_string(), subset.display().to_string()]);
+    }
     EvalTableArgs::parse(&raw).expect("the fixture's arguments are well formed")
 }
 
@@ -320,4 +328,105 @@ async fn a_missing_platform_is_an_error_not_a_zero_score() {
     );
     // 有判词的那张表也要逐字节可 diff：失败明细按题 id 排，不按并发完成的先后。
     assert_eq!(out.text, again.text, "失败明细的顺序不能由调度决定");
+}
+
+/// 跑一份存档点名的子集：分母是存档里的题数，表头要说清跑的是哪一批题。
+#[tokio::test]
+async fn a_subset_run_scores_the_archived_cases_and_names_the_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, pins_path) = fixture(dir.path());
+    let pins = Pins::load(&pins_path).unwrap();
+    let archive = dir.path().join("seed7_n1.tsv");
+    std::fs::write(&archive, "# drawn for this test\n# seed\t7\nhle\thle-q1\n").unwrap();
+
+    let args = args_on(dir.path(), &pins_path, "gepa,agentflow", Some(&archive));
+    let out = run_table(&args, &wired(false), &pins).await.unwrap();
+
+    // 两题的夹具里只跑一道：分母跟着存档走，不是基准的题数。
+    assert!(
+        out.text
+            .contains("cell\thle\tgepa\tseed=0\tresolved=1\ttotal=1\terrored=0\t"),
+        "{}",
+        out.text
+    );
+    // 跑的是哪一批题随表出去，而且钉到文件：路径会变，内容哈希不会。
+    assert!(
+        out.text
+            .contains(&format!("subset\t{}\tsha256:", archive.display())),
+        "{}",
+        out.text
+    );
+    assert!(out.text.contains("subset-cases\thle\t1"), "{}", out.text);
+    assert_eq!(out.missing.len(), 1, "{:?}", out.missing);
+}
+
+/// 存档点名的题这一版数据里没有：报出来的是**因**（哪道题没了），不是一行 0 分。
+#[tokio::test]
+async fn an_archive_naming_a_case_this_data_lacks_says_which_case() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, pins_path) = fixture(dir.path());
+    let pins = Pins::load(&pins_path).unwrap();
+    let archive = dir.path().join("stale.tsv");
+    std::fs::write(&archive, "hle\thle-q1\nhle\thle-q9-gone\n").unwrap();
+
+    let args = args_on(dir.path(), &pins_path, "gepa", Some(&archive));
+    let out = run_table(&args, &wired(false), &pins).await.unwrap();
+
+    let named = out
+        .missing
+        .iter()
+        .find(|m| m.starts_with("hle:"))
+        .unwrap_or_else(|| panic!("{:?}", out.missing));
+    assert!(named.contains("hle-q9-gone"), "{named}");
+    assert!(!named.contains("hle-q1"), "存在的题不许一起报：{named}");
+    assert_eq!(out.errored, 0, "这一列是没读数，不是跑不动");
+    assert!(
+        out.text
+            .contains("cell\thle\tgepa\tseed=0\tresolved=0\ttotal=0\t"),
+        "{}",
+        out.text
+    );
+}
+
+/// 存档没覆盖这个基准：开跑之前就报错，不许拿「全量」顶上。
+#[tokio::test]
+async fn an_archive_that_does_not_cover_a_benchmark_is_refused_before_the_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, pins_path) = fixture(dir.path());
+    let pins = Pins::load(&pins_path).unwrap();
+    let archive = dir.path().join("hle-only.tsv");
+    std::fs::write(&archive, "hle\thle-q1\n").unwrap();
+
+    // 夹具的数据根里只有 hle 的题，所以这里只验「覆盖不到」这一条：把 toolathlon 也选上。
+    let raw: Vec<String> = [
+        "--pins",
+        &pins_path.display().to_string(),
+        "--tools",
+        "none",
+        "--backbone",
+        "double@1",
+        "--judge",
+        "double@1",
+        "--data-root",
+        &dir.path().display().to_string(),
+        "--benchmarks",
+        "hle,toolathlon",
+        "--scaffolds",
+        "gepa",
+        "--seeds",
+        "0",
+        "--subset",
+        &archive.display().to_string(),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let args = EvalTableArgs::parse(&raw).unwrap();
+
+    let err = match run_table(&args, &wired(false), &pins).await {
+        Ok(_) => panic!("覆盖不到就不该开跑"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("toolathlon"), "{err}");
+    assert!(err.contains("hle"), "要点出存档里有什么：{err}");
 }
