@@ -571,12 +571,20 @@ impl ActionPlanOrchestrator {
 
     /// Convert an [`AtomicTask`] into a [`Task`] suitable for injection into
     /// [`DagExecutor`].
+    ///
+    /// The role skill ids the registry seeds are lower-case (`planner`,
+    /// `generator`, …), while the built-in [`TaskType`] variants are spelled
+    /// capitalized. Match case-insensitively so a role id binds to its built-in
+    /// type instead of degrading to `Custom("planner")` — the two only look
+    /// alike where the type is rendered back to a string, and the binding is
+    /// lost everywhere a real `TaskType` is read. An id that names no role
+    /// stays `Custom(<id>)`, which is what a generic executor type wants.
     fn atomic_task_to_task(at: &AtomicTask) -> Task {
         let task_type = match at.skill_id.as_deref() {
-            Some("Planner") => TaskType::Planner,
-            Some("Generator") => TaskType::Generator,
-            Some("Evaluator") => TaskType::Evaluator,
-            Some("Reviewer") => TaskType::Reviewer,
+            Some(id) if id.eq_ignore_ascii_case("planner") => TaskType::Planner,
+            Some(id) if id.eq_ignore_ascii_case("generator") => TaskType::Generator,
+            Some(id) if id.eq_ignore_ascii_case("evaluator") => TaskType::Evaluator,
+            Some(id) if id.eq_ignore_ascii_case("reviewer") => TaskType::Reviewer,
             Some(other) => TaskType::Custom(other.to_string()),
             None => TaskType::Custom("unknown".to_string()),
         };
@@ -1889,6 +1897,44 @@ mod tests {
             output_entities: vec![],
             estimated_seconds: 600,
         }
+    }
+
+    fn atomic_task_with_skill(id: &str, skill_id: &str) -> AtomicTask {
+        AtomicTask {
+            skill_id: Some(skill_id.into()),
+            ..atomic_task(id)
+        }
+    }
+
+    /// The role skill ids the registry seeds are lower-case, so a plan that
+    /// names them must land on the built-in `TaskType`. Before the mapping
+    /// matched only capitalized names this fell through to `Custom("planner")`
+    /// — indistinguishable in a rendered string, but not where the type is read
+    /// as a type.
+    #[test]
+    fn a_lower_case_seeded_role_id_maps_onto_its_builtin_task_type() {
+        let cases = [
+            ("planner", TaskType::Planner),
+            ("generator", TaskType::Generator),
+            ("evaluator", TaskType::Evaluator),
+            ("reviewer", TaskType::Reviewer),
+            ("Planner", TaskType::Planner),
+        ];
+        for (skill_id, expected) in cases {
+            let task =
+                ActionPlanOrchestrator::atomic_task_to_task(&atomic_task_with_skill("t", skill_id));
+            assert_eq!(task.task_type, expected, "skill_id {skill_id}");
+        }
+    }
+
+    /// An id that names no role must keep its `Custom` binding: the planner is
+    /// free to emit a generic executor type (a tool or capability name), and
+    /// that is exactly the case the built-in enum cannot cover.
+    #[test]
+    fn a_non_role_skill_id_stays_a_custom_type() {
+        let task =
+            ActionPlanOrchestrator::atomic_task_to_task(&atomic_task_with_skill("t", "web_search"));
+        assert_eq!(task.task_type, TaskType::Custom("web_search".into()));
     }
 
     /// TaskExecutor that replies a scripted sequence of atomic-task lists,

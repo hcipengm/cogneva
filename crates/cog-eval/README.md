@@ -147,7 +147,7 @@ One command runs the whole thing — one data root, the benchmarks, the rows, th
 the table together with the pins it was produced under:
 
 ```sh
-cogneva eval-table --pins /srv/cogneva/benchmarks/pins.tsv --tools none \
+cogneva eval-table --pins /srv/cogneva/benchmarks/pins.tsv \
                    --backbone '<model>@<version>' --judge '<model>@<version>'
 ```
 
@@ -157,11 +157,13 @@ cogneva eval-table --pins /srv/cogneva/benchmarks/pins.tsv --tools none \
   (recorded as such, its bytes pinned by the source archive's hash, because a directory has no
   hash of its own). The driver re-hashes what is on disk and refuses to run when the bytes are not
   the ones the pin names. A table without pins is a table nobody can compare against anything.
-- `--tools` has no default. `none` and `platform` are two separate experiments, so defaulting
-  would silently decide which one ran. The tools-on arm needs implementations for every tool each
-  benchmark pins (HLE: `web_search` + `python`; SWE-bench Pro: `bash` + `file_edit`; Toolathlon:
-  the MCP servers the task declares), and the composition root has none yet — so it refuses
-  rather than scoring every case on a smaller tool face.
+- `--tools` defaults to `platform`, the arm the main table is run on. The tools-on arm needs
+  implementations for every tool each benchmark pins (HLE: `web_search` + `python`; SWE-bench Pro:
+  `bash` + `file_edit`; Toolathlon: the MCP servers the task declares), and the composition root
+  has none yet — so `platform` refuses rather than scoring every case on a smaller tool face.
+  `--tools none` is a **diagnostic** arm only: it prints its readings but is not a table row (its
+  table is withheld, and the run exits non-zero as an incomplete experiment), because a run on a
+  different tool face is not the same experiment as the rows it would sit beside.
 - Model names come in on the command line as `<model>@<version>` and are checked against the
   enabled `llm_routing` backends. A pin naming a model no upstream serves is reported as a missing
   dependency, not printed as though it were in force.

@@ -232,12 +232,20 @@ async fn two_runs_over_one_data_root_produce_the_same_bytes() {
         first.text, second.text,
         "同一个数据根两次跑必须逐字节相同，差异在各段之间比对"
     );
-    assert!(first.missing.is_empty(), "{:?}", first.missing);
+    // 这条测试走的是诊断臂（工具面与主表不同的那一臂）：它必须被记成「不是主表那一行」，
+    // 而且除此之外没有别的缺席——逐格读数仍是真跑出来的。
+    assert_eq!(first.missing.len(), 1, "{:?}", first.missing);
+    assert!(
+        first.missing[0].contains("diagnostic arm"),
+        "{:?}",
+        first.missing
+    );
+    assert!(first.text.contains("diagnostic\t"), "{}", first.text);
     assert_eq!(first.errored, 0, "{}", first.text);
 
-    // 表里有数：两题都判过、都过。
+    // 表体被拒收为表行，但逐格读数在：两题都判过、都过。
     assert!(
-        first.text.contains("| **gepa** | 100.0±0.0 |"),
+        first.text.contains("## table\n(withheld:"),
         "{}",
         first.text
     );
@@ -272,7 +280,13 @@ async fn the_platform_port_is_what_the_nql_row_runs() {
 
     let out = run_table(&args, &wired(true), &pins).await.unwrap();
     assert_eq!(out.errored, 0, "{}", out.text);
-    assert!(out.text.contains("| **nql** | 100.0±0.0 |"), "{}", out.text);
+    // 诊断臂不发表体，但逐格读数在：两题都经平台端口跑通、都判过。
+    assert!(
+        out.text
+            .contains("cell\thle\tnql\tseed=0\tresolved=2\ttotal=2\terrored=0\t"),
+        "{}",
+        out.text
+    );
     // 平台的读数出于哪个端点，随表出去：接上了却不说接在哪，这张表就没法被别人复跑。
     assert!(
         out.text.contains("platform\thttp://platform.test"),

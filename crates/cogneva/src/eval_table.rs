@@ -53,15 +53,17 @@ const SCAFFOLDS: [&str; 4] = ["codeact", "gepa", "agentflow", "nql"];
 const FAILURE_SAMPLE: usize = 3;
 
 pub const USAGE: &str = "\
-usage: cogneva eval-table --pins <file> --tools <none|platform> --backbone <model>@<version>
-                          --judge <model>@<version> [--data-root <dir>]
+usage: cogneva eval-table --pins <file> --backbone <model>@<version> --judge <model>@<version>
+                          [--tools <none|platform>] [--data-root <dir>]
                           [--benchmarks hle,swe-bench-pro,toolathlon]
                           [--scaffolds codeact,gepa,agentflow,nql] [--seeds 0,1,2] [--out <file>]
 
   --pins       the pins file: what the data is pinned by, as printed by
                deploy/scripts/fetch-benchmark-data.sh --print-pins
-  --tools      which arm of the tool axis this run is. There is no default: both arms are
-               separate experiments, so guessing one would silently decide which ran.
+  --tools      which arm of the tool axis this run is. Defaults to `platform`, the arm the
+               main table is run on. `none` is a diagnostic arm only: its numbers print but
+               are not table rows, because a run on a different tool face is not the same
+               experiment as the rows it would sit beside.
   --backbone   the model every scaffold drives, as name@version. The name has to be one the
                configured routing serves -- a pin that names a model nobody configured is a
                label, not a pin.
@@ -107,9 +109,10 @@ impl ModelPin {
 /// 工具轴上的哪一臂。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolArm {
-    /// 无工具臂：关掉工具，别的都一样。
+    /// 无工具臂：关掉工具，别的都一样。今天它**只作诊断**——工具面不同的跑次与其它行
+    /// 比的不是同一件事，所以它的数字不进表。
     None,
-    /// 有工具臂：工具由平台提供，今天组合根还没有一份。
+    /// 有工具臂：工具由平台提供。这是主表要跑的那一臂，所以它是默认。
     Platform,
 }
 
@@ -127,6 +130,12 @@ impl ToolArm {
             Self::None => "none",
             Self::Platform => "platform",
         }
+    }
+
+    /// 这一臂的数字能不能进主表。只有工具面与主表一致的跑次才作数；关掉工具的跑次是
+    /// 诊断，读数照样打印，但不作表行。
+    fn is_table_arm(self) -> bool {
+        matches!(self, Self::Platform)
     }
 }
 
@@ -266,7 +275,9 @@ impl EvalTableArgs {
             // 种子表的默认值取自评测台的主表规格，不在这里再抄一份数字。
             seeds: seeds.unwrap_or_else(|| RunConfig::new(".").seeds),
             pins: pins.ok_or("--pins is required: a table without pins is not comparable")?,
-            tools: tool_arm.ok_or("--tools is required: both arms are separate experiments")?,
+            // 工具臂默认 `platform`：那是主表要跑的那一臂。`none` 要显式写出，好让
+            // 「这次跑的是一臂诊断」在命令行上就被点明，而不是默认落进去。
+            tools: tool_arm.unwrap_or(ToolArm::Platform),
             backbone: backbone.ok_or("--backbone <model>@<version> is required")?,
             judge: judge.ok_or("--judge <model>@<version> is required")?,
             out,
@@ -524,6 +535,14 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
 
     // 每一处缺席都记名字：报表里缺什么、怎么补，比一个非零退出码有用。
     let mut missing = Vec::new();
+    // 诊断臂不是缺席的依赖，但它同样意味着这次跑不是一次完整的实验：没有主表那一臂的
+    // 工具面，格子就不能作表行。记进来，退出码于是不会把一次诊断跑当成一次成表跑。
+    if !args.tools.is_table_arm() {
+        missing.push(
+            "tools: this run used the tools-off diagnostic arm, so it is not a main-table row"
+                .to_string(),
+        );
+    }
     if wiring.backbone.is_none() {
         missing.push("backbone: no LLM upstream is configured".to_string());
     }
@@ -615,15 +634,16 @@ fn build_benchmark(
     wiring: &Wiring,
     tools: ToolArm,
 ) -> Result<Benchmark> {
-    // 工具臂在这一处收口：`None` 是设计里的无工具臂；有工具臂要一整套工具实现，而今天
-    // 组合根没有。少给几个工具会让这一格因为「工具面不同」得分——那是在量别的东西，
-    // 所以宁可不跑。
+    // 工具臂在这一处收口：`None` 是诊断臂；有工具臂（主表那一臂）要一整套工具实现，而
+    // 今天组合根没有。少给几个工具会让这一格因为「工具面不同」得分——那是在量别的东西，
+    // 所以宁可不跑。要现在就跑，只能显式选诊断臂。
     if tools == ToolArm::Platform {
         bail!(
-            "--tools platform: the with-tools arm needs implementations for the tools each \
-             benchmark pins (web_search/python, bash/file_edit, the MCP servers), and the \
-             composition root has none. Running the tools-off arm instead would score every \
-             case on a different tool face."
+            "--tools platform (the default): the with-tools arm needs implementations for the \
+             tools each benchmark pins (web_search/python, bash/file_edit, the MCP servers), and \
+             the composition root has none. Running the tools-off arm instead would score every \
+             case on a different tool face; pass `--tools none` explicitly if all you want is a \
+             diagnostic run."
         );
     }
     Ok(match name {
@@ -660,6 +680,13 @@ fn render(
     out.push_str(&format!("backbone\t{}\n", args.backbone.render()));
     out.push_str(&format!("judge\t{}\n", args.judge.render()));
     out.push_str(&format!("tools\t{}\n", args.tools.render()));
+    // 诊断臂要把自己的身份写在 pins 段里，紧挨着它标注的那一行：读的人从这一行就能
+    // 看出下面的数字为什么不是表行，不用去猜 `tools none` 意味着什么。
+    if !args.tools.is_table_arm() {
+        out.push_str(
+            "diagnostic\tthis run is the tools-off diagnostic arm; its numbers are not a table row\n",
+        );
+    }
     out.push_str(&format!(
         "seeds\t{}\n",
         args.seeds
@@ -698,7 +725,16 @@ fn render(
     }
 
     out.push_str("\n## table\n");
-    out.push_str(&table.to_markdown());
+    if args.tools.is_table_arm() {
+        out.push_str(&table.to_markdown());
+    } else {
+        // 拒收为表行：工具面与主表不同的跑次，格子与它并排放的就不是同一件事。逐格读数
+        // 仍在下面的 `## per seed` 里，够诊断用，但它不构成一行表。
+        out.push_str(
+            "(withheld: this run is the tools-off diagnostic arm; its cells are not a table row. \
+             The per-seed readings below are kept for diagnosis.)\n",
+        );
+    }
 
     out.push_str("\n## per seed\n");
     for col in &table.cols {
@@ -950,22 +986,87 @@ mod tests {
     }
 
     #[test]
-    fn the_tool_arm_and_the_pins_have_no_default() {
-        // 工具臂猜一个就是替人决定这次是哪个实验；pins 缺了则这张表不比任何东西。
+    fn the_pins_have_no_default_and_the_tool_arm_defaults_to_platform() {
+        // pins 缺了这张表不比任何东西；工具臂则有个正确的默认——主表跑的那一臂。诊断臂
+        // 要显式选，好让「这次不是表行」在命令行上就被写下来。
+        assert_eq!(
+            EvalTableArgs::parse(&minimal()).unwrap().tools,
+            ToolArm::None,
+            "显式 --tools none 就照它办"
+        );
+
         let without_arm: Vec<String> = minimal()
             .iter()
             .enumerate()
             .filter(|(i, _)| *i != 2 && *i != 3)
             .map(|(_, s)| s.clone())
             .collect();
-        assert!(EvalTableArgs::parse(&without_arm)
-            .unwrap_err()
-            .contains("--tools"));
-        assert!(
-            args(&["--tools", "none", "--backbone", "m@1", "--judge", "j@1"])
-                .unwrap_err()
-                .contains("--pins")
+        assert_eq!(
+            EvalTableArgs::parse(&without_arm).unwrap().tools,
+            ToolArm::Platform,
+            "不给就是主表那一臂"
         );
+        assert!(args(&["--backbone", "m@1", "--judge", "j@1"])
+            .unwrap_err()
+            .contains("--pins"));
+    }
+
+    fn one_cell_table() -> Table {
+        Table {
+            rows: vec!["nql".into()],
+            cols: vec!["hle".into()],
+            cells: vec![],
+            wanted_seeds: 3,
+        }
+    }
+
+    #[test]
+    fn the_tools_off_arm_marks_itself_diagnostic_and_withholds_the_table() {
+        let args = EvalTableArgs::parse(&minimal()).unwrap();
+        assert!(!args.tools.is_table_arm(), "none 不是表行那一臂");
+        let verified = BTreeMap::new();
+        let text = render(
+            &args,
+            Path::new("/data"),
+            &Pins::default(),
+            &verified,
+            WiringReport {
+                missing: &[],
+                platform_base: None,
+            },
+            &one_cell_table(),
+            0,
+        );
+        assert!(text.contains("tools\tnone\n"), "{text}");
+        assert!(text.contains("diagnostic\t"), "{text}");
+        assert!(
+            text.contains("## table\n(withheld:"),
+            "表体必须被拒收：{text}"
+        );
+        assert!(!text.contains("| Scaffold |"), "{text}");
+    }
+
+    #[test]
+    fn the_platform_arm_is_the_one_that_carries_the_table() {
+        let mut raw = minimal();
+        raw.extend(["--tools", "platform"].iter().map(|s| s.to_string()));
+        let args = EvalTableArgs::parse(&raw).unwrap();
+        assert!(args.tools.is_table_arm());
+        let verified = BTreeMap::new();
+        let text = render(
+            &args,
+            Path::new("/data"),
+            &Pins::default(),
+            &verified,
+            WiringReport {
+                missing: &[],
+                platform_base: None,
+            },
+            &one_cell_table(),
+            0,
+        );
+        assert!(!text.contains("diagnostic\t"), "{text}");
+        assert!(text.contains("| Scaffold |"), "表体要在：{text}");
     }
 
     #[test]
