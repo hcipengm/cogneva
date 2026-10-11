@@ -661,6 +661,7 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
         .clone()
         .unwrap_or_else(|| Arc::new(NoPlatform::new("the composition root wires no platform")));
 
+    let checkpoint = run_checkpoint(args, &verified, subset.as_deref());
     let mut rig = Rig::new(
         backbone,
         RunConfig {
@@ -668,7 +669,7 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
             seeds: args.seeds.clone(),
             max_concurrency: 4,
             subset: subset.clone(),
-            checkpoint: Some(run_checkpoint(args, &verified, subset.as_deref())),
+            checkpoint: Some(checkpoint.clone()),
         },
     );
     for scaffold in table_scaffolds(platform) {
@@ -724,6 +725,7 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
             pins,
             verified: &verified,
             subset: subset.as_deref(),
+            checkpoint: &checkpoint,
             table: &table,
             errored,
         },
@@ -785,6 +787,7 @@ struct Readings<'a> {
     pins: &'a Pins,
     verified: &'a BTreeMap<String, String>,
     subset: Option<&'a CaseSubset>,
+    checkpoint: &'a Checkpoint,
     table: &'a Table,
     errored: usize,
 }
@@ -795,6 +798,7 @@ fn render(args: &EvalTableArgs, wiring: WiringReport<'_>, readings: Readings<'_>
         pins,
         verified,
         subset,
+        checkpoint,
         table,
         errored,
     } = readings;
@@ -819,6 +823,20 @@ fn render(args: &EvalTableArgs, wiring: WiringReport<'_>, readings: Readings<'_>
             .join(",")
     ));
     out.push_str(&format!("data-root\t{}\n", data_root.display()));
+    // 续跑的口径跟着表走：读的人看到 `## per seed` 里那一列 `resumed` 时，得同时知道
+    // **记下来的是哪些例**。判据只有一条——判分器给出过判词。跑不动 / 上游拒了不进记录，
+    // 续跑时**重跑**它们，而不是把它们当成「跑过且没过」记住；反过来说，记录里没有的例
+    // 在格子里按没过计，它只是不该被记成「已经有结论」。
+    out.push_str(&format!(
+        "checkpoint\t{}\trun-id={}\n",
+        checkpoint.path.display(),
+        &checkpoint.run_id[..12]
+    ));
+    out.push_str(
+        "checkpoint-rule\tonly judged cases are recorded; a case that got no verdict (env or \
+         upstream failure) is run again on resume rather than remembered as failed, and a case \
+         with no record counts as not resolved in its cell\n",
+    );
     // 跑的是哪一批题，跟基准数据是哪个版本一样，是这张表说的话的一部分：两次跑用了不同的
     // 子集（或一次全量一次子集），表头看不出区别的话，两个分就不该并排读。
     if let Some(subset) = subset {
@@ -1086,6 +1104,14 @@ mod tests {
         EvalTableArgs::parse(&raw.iter().map(|s| s.to_string()).collect::<Vec<_>>())
     }
 
+    /// 检查点只是报表里的一行身份，这几条渲染的用例不关心它在哪。
+    fn checkpoint_at(out: &str) -> Checkpoint {
+        Checkpoint {
+            path: PathBuf::from(format!("{out}.cases.jsonl")),
+            run_id: "0123456789abcdef".into(),
+        }
+    }
+
     fn minimal() -> Vec<String> {
         [
             "--pins",
@@ -1233,6 +1259,7 @@ mod tests {
                 pins: &Pins::default(),
                 verified: &verified,
                 subset: None,
+                checkpoint: &checkpoint_at("/tmp/table.md"),
                 table: &one_cell_table(),
                 errored: 0,
             },
@@ -1244,6 +1271,39 @@ mod tests {
             "表体必须被拒收：{text}"
         );
         assert!(!text.contains("| Scaffold |"), "{text}");
+    }
+
+    /// 检查点记的是**结论**不是「跑过」：这条判据要印在表里。少了它，「没跑过的例」
+    /// 会被下一个人读成「跑过且没过」——而续跑正是照这条判据决定要不要重跑。
+    #[test]
+    fn the_report_states_what_the_checkpoint_remembers() {
+        let args = EvalTableArgs::parse(&minimal()).unwrap();
+        let verified = BTreeMap::new();
+        let text = render(
+            &args,
+            WiringReport {
+                missing: &[],
+                platform_base: None,
+            },
+            Readings {
+                data_root: Path::new("/data"),
+                pins: &Pins::default(),
+                verified: &verified,
+                subset: None,
+                checkpoint: &checkpoint_at("/tmp/table.md"),
+                table: &one_cell_table(),
+                errored: 0,
+            },
+        );
+        assert!(
+            text.contains("checkpoint\t/tmp/table.md.cases.jsonl\trun-id=0123456789ab"),
+            "{text}"
+        );
+        assert!(text.contains("checkpoint-rule\t"), "{text}");
+        assert!(
+            text.contains("run again on resume rather than remembered as failed"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1264,6 +1324,7 @@ mod tests {
                 pins: &Pins::default(),
                 verified: &verified,
                 subset: None,
+                checkpoint: &checkpoint_at("/tmp/table.md"),
                 table: &one_cell_table(),
                 errored: 0,
             },
