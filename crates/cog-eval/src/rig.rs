@@ -393,7 +393,9 @@ impl Rig {
                     budget,
                     seed,
                 };
-                let solved = scaffold.solve(&case, &ctx).await;
+                // 交到外壳手上的只有题面：答案键与评测台的旋钮在 `shell_view` 里就没了，
+                // 判分读的仍是**原来那一份**。
+                let solved = scaffold.solve(&case.shell_view(), &ctx).await;
                 let outcome = match solved {
                     Err(e) => CaseOutcome::errored(&case, format!("scaffold failed: {e}")),
                     Ok(output) => match judge.judge(&case, &env, &output).await {
@@ -640,6 +642,41 @@ mod tests {
         }
     }
 
+    /// 记下它收到的那份 case，供「外壳看不到答案」这条判据读。
+    type Seen = Arc<std::sync::Mutex<Option<EvalCase>>>;
+
+    struct RecordingScaffold(Seen);
+    #[async_trait]
+    impl AgentScaffold for RecordingScaffold {
+        fn name(&self) -> &str {
+            "recording"
+        }
+        async fn solve(&self, case: &EvalCase, _ctx: &SolveContext) -> anyhow::Result<AgentOutput> {
+            *self.0.lock().unwrap() = Some(case.clone());
+            Ok(AgentOutput {
+                final_answer: "ok".into(),
+                trace: vec![],
+                tokens: Default::default(),
+                finish: FinishReason::Answered,
+            })
+        }
+    }
+
+    /// 判分器看到的那一份，用它证明收窄只发生在外壳那一侧。
+    struct RecordingJudge(Seen);
+    #[async_trait]
+    impl CaseJudge for RecordingJudge {
+        async fn judge(
+            &self,
+            case: &EvalCase,
+            _env: &Arc<dyn CaseEnv>,
+            _output: &AgentOutput,
+        ) -> anyhow::Result<Verdict> {
+            *self.0.lock().unwrap() = Some(case.clone());
+            Ok(Verdict::pass("recorded"))
+        }
+    }
+
     fn rig() -> Rig {
         Rig::new(
             Arc::new(NeverCalled),
@@ -882,5 +919,47 @@ mod tests {
             vec!["python".to_string(), "bash".to_string()]
         );
         assert_eq!(table.cell("sees-tools", "hle").unwrap().stat().mean, 1.0);
+    }
+
+    /// 交到外壳手上的那份 case 里没有答案键：`expected_output` 与评测台起环境/判分用的
+    /// 旋钮都不在，题面还在。判分器读的仍是**原来那一份**——收窄的是外壳的输入，
+    /// 不是判分的依据。
+    #[tokio::test]
+    async fn the_shell_is_handed_the_case_without_the_answer_key() {
+        let shell_saw: Seen = Arc::new(std::sync::Mutex::new(None));
+        let judge_saw: Seen = Arc::new(std::sync::Mutex::new(None));
+
+        let mut case = cases().remove(0);
+        case.metadata
+            .insert("fail_to_pass".into(), "tests::the_answer".into());
+
+        let b = Benchmark {
+            name: "hle".into(),
+            metric: "pass@1".into(),
+            cases: Arc::new(MemorySource(vec![case])),
+            env: Arc::new(OkEnv),
+            tools: Arc::new(NoTools),
+            judge: Arc::new(RecordingJudge(judge_saw.clone())),
+            budget: Budget::default(),
+        };
+
+        rig()
+            .with_scaffold(Arc::new(RecordingScaffold(shell_saw.clone())))
+            .run(&[b])
+            .await;
+
+        let handed = shell_saw.lock().unwrap().clone().expect("外壳被叫过");
+        assert!(handed.expected_output.is_none(), "答案键不许到外壳手上");
+        assert!(handed.expected_tools.is_none(), "期望工具也不许");
+        assert!(handed.metadata.is_empty(), "评测台的旋钮不许到外壳手上");
+        assert_eq!(handed.input, serde_json::json!("a"), "题面还是题面");
+        assert_eq!(handed.id, "a", "身份还在：外壳要按它记 trace");
+
+        let judged = judge_saw.lock().unwrap().clone().expect("判分被叫过");
+        assert!(judged.expected_output.is_some(), "判分仍读得到答案键");
+        assert!(
+            judged.metadata.contains_key("fail_to_pass"),
+            "判分仍读得到评测台的旋钮"
+        );
     }
 }

@@ -20,6 +20,28 @@ pub struct EvalCase {
     pub metadata: HashMap<String, String>,
 }
 
+impl EvalCase {
+    /// 交给外壳的那一份：题面与它的身份，别的都留在外面。
+    ///
+    /// 答案键（`expected_output`）、期望工具（`expected_tools`）、评测台起环境与判分用的
+    /// 旋钮（`metadata`：镜像名、来源 rev、`fail_to_pass`、可用工具清单）以及计分表
+    /// （`tags` / `metrics`）都只给评测台读。外壳拿到的那个值里就没有这些字段的内容，
+    /// 所以「看不到答案」不靠外壳自觉，也不靠谁记得别读——判分器那一侧仍读**原来那一份**，
+    /// 收窄的是外壳的输入，不是判分的依据。
+    pub fn shell_view(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            input: self.input.clone(),
+            expected_output: None,
+            expected_tools: None,
+            tags: Vec::new(),
+            metrics: Vec::new(),
+            metadata: HashMap::new(),
+        }
+    }
+}
+
 /// 评估数据集。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EvalDataset {
