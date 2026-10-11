@@ -202,6 +202,48 @@ fn estimate_goal_tokens(req: &CreateTaskRequest) -> u64 {
     ((chars / 4) as u64).max(1)
 }
 
+/// 把一次提交展开成进 DAG 的初始任务。
+///
+/// 显式给出的任务带着客户端的 `goal_id` 原样下去。**裸 goal（`tasks` 缺省）也必须有一条
+/// 承载 `goal_id` 的行**：分解在协调器里是从 `tasks.first()` 取 goal_id 的，一个空的
+/// `tasks` 会让它当场另生成一个 uuid，客户端拿到的 goal_id 就永远匹配不到任何行——
+/// `?goal_id=` 恒空，那条「按下发的 goal 找回它派生的那批任务」的路等于没建。
+///
+/// 合成的这条 goal 行（id 与 goal_id 都取客户端那一个）交下去后，由协调器存成占位行
+/// （分解成功）或 Failed 行（分解没产出），返回值本身因此就是可寻址的那一行。
+/// 它设 `is_executable=false`：它是这次目标的标记，不是活——不接 planner 的回退路径
+/// 也不该把它当任务调度出去。
+fn submitted_tasks(req: &CreateTaskRequest, goal_id: &str) -> Vec<Task> {
+    match req.tasks.as_ref() {
+        Some(items) => items
+            .iter()
+            .map(|item| {
+                let mut task = Task::new(
+                    item.id.clone(),
+                    parse_task_type(&item.task_type),
+                    item.input.clone(),
+                );
+                task.blocked_by = item.blocked_by.clone();
+                task.priority = item.priority;
+                task.workspace_id = Some(req.workspace_id.clone());
+                task.goal_id = Some(goal_id.to_string());
+                task
+            })
+            .collect(),
+        None => {
+            let mut goal_row = Task::new(
+                goal_id.to_string(),
+                TaskType::Custom("goal".into()),
+                serde_json::json!({ "goal": req.goal }),
+            );
+            goal_row.workspace_id = Some(req.workspace_id.clone());
+            goal_row.goal_id = Some(goal_id.to_string());
+            goal_row.is_executable = false;
+            vec![goal_row]
+        }
+    }
+}
+
 pub async fn create_task_handler(
     State(state): State<Arc<GatewayState>>,
     claims: Option<axum::Extension<cog_core::Claims>>,
@@ -272,25 +314,7 @@ pub async fn create_task_handler(
         }
     }
 
-    let tasks: Vec<Task> = if let Some(ref items) = req.tasks {
-        items
-            .iter()
-            .map(|item| {
-                let mut task = Task::new(
-                    item.id.clone(),
-                    parse_task_type(&item.task_type),
-                    item.input.clone(),
-                );
-                task.blocked_by = item.blocked_by.clone();
-                task.priority = item.priority;
-                task.workspace_id = Some(req.workspace_id.clone());
-                task.goal_id = Some(goal_id.clone());
-                task
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let tasks: Vec<Task> = submitted_tasks(&req, &goal_id);
 
     // 异步受理：goal 分解需要多轮 LLM 调用（实测 50-90s），远超网关超时层。
     // 同步等待会在超时后丢弃 future，分解结果永远注入不了 DAG（2026-08-06
@@ -838,5 +862,52 @@ mod tests {
             !in_goal(&only_g1, &goal_less),
             "a task with no goal belongs to no goal"
         );
+    }
+
+    /// 裸 goal：客户端拿到的 goal_id 必须落在一条行上，否则 `?goal_id=` 恒空，
+    /// 「按下发的 goal 找回它派生的那批任务」这条路就还是断的。
+    #[test]
+    fn a_bare_goal_carries_its_id_onto_a_row_so_the_client_can_poll_it() {
+        let req = CreateTaskRequest {
+            goal_id: Some("goal-1".into()),
+            goal: "do the thing".into(),
+            tasks: None,
+            workspace_id: "ws".into(),
+            priority: None,
+        };
+        let tasks = submitted_tasks(&req, "goal-1");
+        assert_eq!(tasks.len(), 1, "a bare goal must still be addressable");
+        assert_eq!(
+            tasks[0].id, "goal-1",
+            "the row id is the id the client was handed, so its own response id polls back"
+        );
+        assert_eq!(tasks[0].goal_id.as_deref(), Some("goal-1"));
+        assert!(
+            !tasks[0].is_executable,
+            "the goal row is a marker for the goal, not schedulable work"
+        );
+    }
+
+    /// 显式任务：各自保留自己的 id，同时都带同一个 goal_id（这是分解用的载体，
+    /// 也是 `?goal_id=` 的连接键）。
+    #[test]
+    fn explicit_tasks_keep_their_ids_and_carry_the_goal_id() {
+        let req = CreateTaskRequest {
+            goal_id: None,
+            goal: "g".into(),
+            tasks: Some(vec![crate::tasks::TaskItem {
+                id: "case-1".into(),
+                task_type: "benchmark_case".into(),
+                input: serde_json::json!({ "x": 1 }),
+                blocked_by: vec![],
+                priority: 0,
+            }]),
+            workspace_id: "ws".into(),
+            priority: None,
+        };
+        let tasks = submitted_tasks(&req, "goal-9");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "case-1");
+        assert_eq!(tasks[0].goal_id.as_deref(), Some("goal-9"));
     }
 }
