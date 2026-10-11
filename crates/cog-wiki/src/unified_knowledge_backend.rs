@@ -149,6 +149,41 @@ impl UnifiedKnowledgeBackend {
         self
     }
 
+    /// Stamp the memory rows that survived into the answer the caller is handed.
+    ///
+    /// The layers' own stores can only report what a search *returned*; whether
+    /// a row ever reached a model is known here and nowhere else, because this
+    /// is where the answer is assembled. So the count is taken on the final
+    /// list, after reranking and truncation, and split by the layer the row's
+    /// `source` names: the two layers are two tables, and each row has to be
+    /// written back to its own.
+    ///
+    /// A failed write is logged and dropped. The retrieval already has its
+    /// answer, and failing it because the counter could not be written would
+    /// let a bookkeeping reading change what it measures.
+    async fn record_retrieved_memory(&self, entries: &[KnowledgeEntry]) {
+        let Some(memory) = self.memory.resolve() else {
+            return;
+        };
+        let schema_source = memory_source(MEMORY_LAYER_SCHEMA);
+        let summary_source = memory_source(MEMORY_LAYER_SUMMARY);
+        let mut schema_ids: Vec<String> = Vec::new();
+        let mut summary_ids: Vec<String> = Vec::new();
+        for entry in entries {
+            if entry.source == schema_source {
+                schema_ids.push(entry.id.clone());
+            } else if entry.source == summary_source {
+                summary_ids.push(entry.id.clone());
+            }
+        }
+        if schema_ids.is_empty() && summary_ids.is_empty() {
+            return;
+        }
+        if let Err(e) = memory.record_retrievals(&schema_ids, &summary_ids).await {
+            tracing::warn!("recording memory retrievals failed; the answer is unaffected: {e}");
+        }
+    }
+
     /// Wire a memory layer that is resolved on first use rather than now.
     ///
     /// This is the form the plugin uses: it runs while the memory plugin may
@@ -217,6 +252,23 @@ const NS_IMPLEMENTATION: &str = "implementation";
 const NS_FAILURE: &str = "failure_pattern";
 const NS_EXECUTION: &str = "task_execution";
 const NS_KNOWLEDGE: &str = "knowledge";
+
+/// Which memory layer a retrieved row came from, as it appears in the row's
+/// `source`. The two layers are two tables, so the retrieval reading has to be
+/// written back to the one the row belongs to; the assembly point is the only
+/// place that still knows which that was.
+const MEMORY_LAYER_SCHEMA: &str = "schema";
+const MEMORY_LAYER_SUMMARY: &str = "summary";
+
+/// The `source` string a memory row carries.
+///
+/// One definition, used both when the row is built and when the assembled list
+/// is read back: a writer and a reader that each spell the format out would
+/// drift apart silently, and the reader would then match nothing and report
+/// "nothing was retrieved" for every query.
+fn memory_source(layer: &str) -> String {
+    format!("memory:{layer}:{NS_KNOWLEDGE}")
+}
 
 /// How much of a record's free text is kept, in characters.
 ///
@@ -386,7 +438,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
                             UnifiedSearchResult::Schema(s) => {
                                 entries.push(KnowledgeEntry {
                                     id: s.entry.id.clone(),
-                                    source: format!("memory:schema:{}", NS_KNOWLEDGE),
+                                    source: memory_source(MEMORY_LAYER_SCHEMA),
                                     title: s.entry.name.clone(),
                                     content: serde_json::to_string(&s.entry.properties)
                                         .unwrap_or_default(),
@@ -400,7 +452,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
                             UnifiedSearchResult::Summary(s) => {
                                 entries.push(KnowledgeEntry {
                                     id: s.entry.id.clone(),
-                                    source: format!("memory:summary:{}", NS_KNOWLEDGE),
+                                    source: memory_source(MEMORY_LAYER_SUMMARY),
                                     title: s.entry.namespace.clone(),
                                     content: s.entry.text.clone(),
                                     relevance_score: s.score,
@@ -468,7 +520,7 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
         // never comparable. The reranker reads the query and every candidate's
         // text and puts them on one scale, which is also what makes a
         // cross-layer order mean anything.
-        if let Some(reranker) = reranker {
+        let reranked = if let Some(reranker) = reranker {
             if entries.len() > 1 {
                 let documents: Vec<String> = entries.iter().map(|e| e.content.clone()).collect();
                 match reranker
@@ -494,22 +546,39 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
                             reranked.push(entry);
                         }
                         reranked.truncate(top_k);
-                        return Ok(reranked);
+                        Some(reranked)
                     }
                     Err(e) => {
                         tracing::warn!(
                             "reranking failed; keeping the order the layers returned: {e}"
                         );
+                        None
                     }
                 }
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
 
-        // Sort by relevance descending.
-        entries.sort_by(|a, b| b.relevance_score.partial_cmp(&a.relevance_score).unwrap());
-        entries.truncate(top_k);
+        let answer = match reranked {
+            Some(reranked) => reranked,
+            None => {
+                // Sort by relevance descending.
+                entries.sort_by(|a, b| b.relevance_score.partial_cmp(&a.relevance_score).unwrap());
+                entries.truncate(top_k);
+                entries
+            }
+        };
 
-        Ok(entries)
+        // The reading is taken here, on the assembled answer, because that is
+        // what reached the model: a candidate the reranker dropped, or one
+        // pushed out past `top_k`, was never handed over and must not be
+        // counted as if it had been.
+        self.record_retrieved_memory(&answer).await;
+
+        Ok(answer)
     }
 
     async fn retrieve_similar_decompositions(
@@ -1388,5 +1457,124 @@ mod tests {
 
         assert_eq!(pattern.goal_summary, "the goal it was recorded with");
         assert_eq!(pattern.used_count, 2);
+    }
+
+    // ── The retrieval reading is taken on the assembled answer ────────────
+
+    fn knowledge_schema(id: &str, name: &str) -> cog_core::SchemaEntry {
+        cog_core::SchemaEntry::new(
+            id,
+            NS_KNOWLEDGE,
+            cog_core::SchemaKind::Entity,
+            name,
+            id,
+            cog_core::SourceRef::new(format!("memory://{id}"), "test/v1"),
+        )
+    }
+
+    fn test_task() -> Task {
+        Task::new(
+            "t1".to_string(),
+            cog_core::TaskType::Custom("test".into()),
+            serde_json::json!({}),
+        )
+    }
+
+    /// The reading counts what reached the model, not what a search returned:
+    /// a row the answer's own width pushed out was never handed over, and
+    /// counting it would reward the recall window rather than the value.
+    #[tokio::test]
+    async fn only_the_rows_in_the_answer_are_stamped() {
+        let memory = Arc::new(cog_memory::MemoryMemoryBackend::new());
+        for id in ["s1", "s2", "s3"] {
+            memory
+                .store_schema(NS_KNOWLEDGE, &knowledge_schema(id, "alpha term"))
+                .await
+                .unwrap();
+        }
+
+        let backend =
+            UnifiedKnowledgeBackend::new().with_memory(memory.clone() as Arc<dyn MemoryBackend>);
+        let answer = backend
+            .retrieve_relevant(&test_task(), "alpha", 2)
+            .await
+            .unwrap();
+        assert_eq!(answer.len(), 2, "top_k truncation still applies");
+        assert!(answer
+            .iter()
+            .all(|e| e.source == memory_source(MEMORY_LAYER_SCHEMA)));
+
+        let mut counted = Vec::new();
+        for id in ["s1", "s2", "s3"] {
+            let entry = memory.get_schema(NS_KNOWLEDGE, id).await.unwrap().unwrap();
+            if entry.retrieval_count > 0 {
+                counted.push(id.to_string());
+                assert!(
+                    answer.iter().any(|e| e.id == id),
+                    "{id} was counted but is not in the answer"
+                );
+            }
+        }
+        assert_eq!(
+            counted.len(),
+            2,
+            "exactly the rows in the answer carry the count, and each carries it once"
+        );
+        for entry in &answer {
+            let stored = memory
+                .get_schema(NS_KNOWLEDGE, &entry.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.retrieval_count, 1);
+            assert!(stored.last_retrieved_at.is_some());
+        }
+    }
+
+    /// The two memory layers are two tables, so a row's count has to land on the
+    /// layer it came from; a batch that sent every id to one side would leave the
+    /// other layer's rows looking never-retrieved.
+    #[tokio::test]
+    async fn each_layer_is_stamped_on_its_own_table() {
+        let memory = Arc::new(cog_memory::MemoryMemoryBackend::new());
+        memory
+            .store_schema(NS_KNOWLEDGE, &knowledge_schema("schema-row", "alpha"))
+            .await
+            .unwrap();
+        memory
+            .store_summary(
+                NS_KNOWLEDGE,
+                &cog_core::SummaryEntry::new(
+                    "summary-row",
+                    NS_KNOWLEDGE,
+                    "alpha",
+                    Vec::new(),
+                    cog_core::NO_EMBEDDING_MODEL,
+                    cog_core::SourceRef::new("memory://summary-row", "test/v1"),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let backend =
+            UnifiedKnowledgeBackend::new().with_memory(memory.clone() as Arc<dyn MemoryBackend>);
+        let answer = backend
+            .retrieve_relevant(&test_task(), "alpha", 2)
+            .await
+            .unwrap();
+        assert_eq!(answer.len(), 2, "both layers contribute a row");
+
+        let schema = memory
+            .get_schema(NS_KNOWLEDGE, "schema-row")
+            .await
+            .unwrap()
+            .unwrap();
+        let summary = memory
+            .get_summary(NS_KNOWLEDGE, "summary-row")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(schema.retrieval_count, 1);
+        assert_eq!(summary.retrieval_count, 1);
     }
 }

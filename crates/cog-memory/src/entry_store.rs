@@ -4,6 +4,7 @@
 //! and PostgreSQL (production) without changing the vector-backend layer.
 
 use async_trait::async_trait;
+use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::RwLock;
 
@@ -35,6 +36,14 @@ pub trait SummaryEntryStore: Send + Sync {
 
     /// List all entries across all namespaces (used for backup/export).
     async fn list_all(&self) -> SFResult<Vec<SummaryEntry>>;
+
+    /// Bump `retrieval_count` and stamp `last_retrieved_at` for every id given.
+    ///
+    /// Deliberately has no default body: a store that keeps no such reading must
+    /// say so, rather than accept the call and let the counters stay at zero —
+    /// zero looks exactly like "never retrieved", which is the one answer the
+    /// reading exists to distinguish.
+    async fn record_retrieval(&self, ids: &[String]) -> SFResult<()>;
 
     /// Whether this store persists data durably (e.g. PostgreSQL).
     /// When `true`, `VectorSummaryBackend` skips JSON file persistence
@@ -135,5 +144,28 @@ impl SummaryEntryStore for MemoryEntryStore {
             .read()
             .map_err(|_| SFError::Agent("lock poisoned".into()))?;
         Ok(entries.values().cloned().collect())
+    }
+
+    async fn record_retrieval(&self, ids: &[String]) -> SFResult<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now();
+        let mut entries = self
+            .entries
+            .write()
+            .map_err(|_| SFError::Agent("lock poisoned".into()))?;
+        for id in ids {
+            // Entries are keyed by (namespace, id); the counter is a property of
+            // the entry, so every namespace holding this id is bumped. A stale id
+            // with no row here is skipped, matching the durable store.
+            for ((_, entry_id), entry) in entries.iter_mut() {
+                if entry_id == id {
+                    entry.retrieval_count = entry.retrieval_count.saturating_add(1);
+                    entry.last_retrieved_at = Some(now);
+                }
+            }
+        }
+        Ok(())
     }
 }

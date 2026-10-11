@@ -704,6 +704,23 @@ impl MemoryBackend for CompositeMemoryBackend {
             entries_archived: archived,
         })
     }
+
+    async fn record_retrievals(
+        &self,
+        schema_ids: &[String],
+        summary_ids: &[String],
+    ) -> SFResult<()> {
+        // One assembly, two tables: each layer records its own ids, and a
+        // request that reached only one layer must not send the other an empty
+        // call the store would have to special-case.
+        if !schema_ids.is_empty() {
+            self.schema.record_schema_retrieval(schema_ids).await?;
+        }
+        if !summary_ids.is_empty() {
+            self.summary.record_summary_retrieval(summary_ids).await?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -718,6 +735,13 @@ mod tests {
     struct ReadTally {
         one_row: AtomicUsize,
         whole_namespace: AtomicUsize,
+        /// Batches handed to each layer's retrieval stamp, and how many ids the
+        /// batch carried: one `record_retrievals` call splits its ids by layer,
+        /// so a layer must see at most one batch and only its own ids.
+        schema_stamps: AtomicUsize,
+        schema_stamp_ids: AtomicUsize,
+        summary_stamps: AtomicUsize,
+        summary_stamp_ids: AtomicUsize,
     }
 
     impl ReadTally {
@@ -784,6 +808,14 @@ mod tests {
         async fn update_schema(&self, _namespace: &str, _entry: &SchemaEntry) -> SFResult<()> {
             Ok(())
         }
+
+        async fn record_schema_retrieval(&self, ids: &[String]) -> SFResult<()> {
+            self.tally.schema_stamps.fetch_add(1, Ordering::SeqCst);
+            self.tally
+                .schema_stamp_ids
+                .fetch_add(ids.len(), Ordering::SeqCst);
+            Ok(())
+        }
     }
 
     struct CountingSummary {
@@ -831,6 +863,14 @@ mod tests {
         async fn update_summary(&self, _namespace: &str, _entry: &SummaryEntry) -> SFResult<()> {
             Ok(())
         }
+
+        async fn record_summary_retrieval(&self, ids: &[String]) -> SFResult<()> {
+            self.tally.summary_stamps.fetch_add(1, Ordering::SeqCst);
+            self.tally
+                .summary_stamp_ids
+                .fetch_add(ids.len(), Ordering::SeqCst);
+            Ok(())
+        }
     }
 
     fn counting_composite(tally: Arc<ReadTally>) -> (CompositeMemoryBackend, tempfile::TempDir) {
@@ -869,5 +909,34 @@ mod tests {
             0,
             "health check must not load a whole namespace through either layer"
         );
+    }
+
+    /// One assembly yields one batch per layer, carrying that layer's ids. A
+    /// dispatch that sent every id to both layers would count rows on the wrong
+    /// table, and one that skipped a layer whose ids were empty would still be
+    /// right — but a layer handed the other layer's ids would not be.
+    #[tokio::test]
+    async fn a_retrieval_reading_goes_to_the_layer_that_named_the_ids() {
+        let tally = Arc::new(ReadTally::default());
+        let (backend, _tmp) = counting_composite(tally.clone());
+
+        backend
+            .record_retrievals(&["s1".to_string(), "s2".to_string()], &["m1".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(tally.schema_stamps.load(Ordering::SeqCst), 1);
+        assert_eq!(tally.schema_stamp_ids.load(Ordering::SeqCst), 2);
+        assert_eq!(tally.summary_stamps.load(Ordering::SeqCst), 1);
+        assert_eq!(tally.summary_stamp_ids.load(Ordering::SeqCst), 1);
+
+        // A layer with no ids in this assembly is not called at all, so a
+        // store that treats an empty batch as a no-op is not relied on.
+        backend
+            .record_retrievals(&["s3".to_string()], &[])
+            .await
+            .unwrap();
+        assert_eq!(tally.summary_stamps.load(Ordering::SeqCst), 1);
+        assert_eq!(tally.schema_stamp_ids.load(Ordering::SeqCst), 3);
     }
 }

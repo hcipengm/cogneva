@@ -5,6 +5,7 @@
 //! provided here keeps everything in a `HashMap` with optional JSON persistence.
 
 use async_trait::async_trait;
+use chrono::Utc;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::RwLock;
@@ -300,6 +301,27 @@ impl SchemaBackend for MemorySchemaBackend {
                 store.insert(existing.id.clone(), existing);
             } else {
                 store.insert(entry.id.clone(), entry.clone());
+            }
+        }
+        self.persist().await?;
+        Ok(())
+    }
+
+    async fn record_schema_retrieval(&self, ids: &[String]) -> SFResult<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now();
+        {
+            let mut store = self
+                .store
+                .write()
+                .map_err(|_| SFError::Agent("lock poisoned".into()))?;
+            for id in ids {
+                if let Some(entry) = store.get_mut(id) {
+                    entry.retrieval_count = entry.retrieval_count.saturating_add(1);
+                    entry.last_retrieved_at = Some(now);
+                }
             }
         }
         self.persist().await?;

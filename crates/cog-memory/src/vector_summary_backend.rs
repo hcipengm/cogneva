@@ -602,6 +602,13 @@ impl SummaryBackend for VectorSummaryBackend {
         self.persist().await?;
         Ok(())
     }
+
+    /// The counters live on the rows, so the write goes to the entry store. The
+    /// vector index is a derived copy of those rows and carries no count of its
+    /// own — writing it there would put the reading somewhere a rebuild drops.
+    async fn record_summary_retrieval(&self, ids: &[String]) -> SFResult<()> {
+        self.store.record_retrieval(ids).await
+    }
 }
 
 #[cfg(test)]
@@ -650,6 +657,9 @@ mod tests {
         }
         async fn list_all(&self) -> SFResult<Vec<SummaryEntry>> {
             self.inner.list_all().await
+        }
+        async fn record_retrieval(&self, ids: &[String]) -> SFResult<()> {
+            self.inner.record_retrieval(ids).await
         }
         fn is_durable(&self) -> bool {
             true

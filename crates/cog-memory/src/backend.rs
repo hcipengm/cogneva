@@ -696,4 +696,32 @@ impl cog_core::MemoryBackend for MemoryMemoryBackend {
             entries_archived: archived_ids.len(),
         })
     }
+
+    async fn record_retrievals(
+        &self,
+        schema_ids: &[String],
+        summary_ids: &[String],
+    ) -> SFResult<()> {
+        if schema_ids.is_empty() && summary_ids.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now();
+        let mut store = self
+            .store
+            .write()
+            .map_err(|_| SFError::Agent("lock poisoned".into()))?;
+        for id in schema_ids {
+            if let Some(entry) = store.schema.get_mut(id) {
+                entry.retrieval_count = entry.retrieval_count.saturating_add(1);
+                entry.last_retrieved_at = Some(now);
+            }
+        }
+        for id in summary_ids {
+            if let Some(entry) = store.summary.get_mut(id) {
+                entry.retrieval_count = entry.retrieval_count.saturating_add(1);
+                entry.last_retrieved_at = Some(now);
+            }
+        }
+        Ok(())
+    }
 }

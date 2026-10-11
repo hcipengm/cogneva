@@ -1313,6 +1313,10 @@ impl cog_core::SummaryBackend for RecordingSummary {
     async fn update_summary(&self, _ns: &str, _entry: &SummaryEntry) -> cog_core::SFResult<()> {
         Ok(())
     }
+
+    async fn record_summary_retrieval(&self, _ids: &[String]) -> cog_core::SFResult<()> {
+        Ok(())
+    }
 }
 
 /// A summary search asks the summary layer for a hybrid match, and derives its

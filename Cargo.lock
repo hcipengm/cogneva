@@ -1959,6 +1959,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "cog-core",
+ "cog-memory",
  "meilisearch-sdk",
  "pathdiff",
  "regex",

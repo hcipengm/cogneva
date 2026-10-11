@@ -456,6 +456,19 @@ pub struct SchemaEntry {
     pub confidence: f32,
     pub importance: f32,
     pub extracted_at: DateTime<Utc>,
+    /// 条目级取用读数：这条事实被**真正交给模型**过几次。
+    ///
+    /// 落成表上的一列，不落成指标标签——per-entry 标签会让 series 数随条目线性
+    /// 膨胀。计的是「进了最终结果的那份」，不是「命中」：命中只是候选池大小，
+    /// 受 `top_k` 与召回噪声支配，拿它当价值信号等于把噪声奖励成价值。
+    #[serde(default)]
+    pub retrieval_count: u64,
+    /// 最近一次被交给模型的时刻；从未取用过就是 `None`。
+    ///
+    /// 与 `retrieval_count` 同时写：一个是量、一个是时间，分开写会在两次写之间
+    /// 出现「取用过但没有时刻」的中间态，而读的人只能看到一个。
+    #[serde(default)]
+    pub last_retrieved_at: Option<DateTime<Utc>>,
 }
 
 fn one() -> u64 {
@@ -487,6 +500,9 @@ impl SchemaEntry {
             confidence: 1.0,
             importance: 0.5,
             extracted_at: now,
+            // 取用读数从零开始：新条目还没进过任何一次结果。
+            retrieval_count: 0,
+            last_retrieved_at: None,
         }
     }
 
@@ -629,6 +645,10 @@ pub fn merge_schema_observation(stored: &SchemaEntry, observed: &SchemaEntry) ->
     };
     merged.first_seen = stored.first_seen.min(observed.first_seen);
     merged.last_seen = stored.last_seen.max(observed.last_seen);
+    // 取用读数是这一行攒下来的历史，不是这一次观测带的事实。从观测侧抄一遍
+    // 会把累积的计数抹回 0——一次重新抽取就等于把「这条被取用过多少次」删掉。
+    merged.retrieval_count = stored.retrieval_count;
+    merged.last_retrieved_at = stored.last_retrieved_at;
     merged
 }
 
@@ -657,6 +677,12 @@ pub struct SummaryEntry {
     pub confidence: f32,
     pub importance: f32,
     pub generated_at: DateTime<Utc>,
+    /// 条目级取用读数，与 `SchemaEntry` 同一套口径：见那边的说明。
+    #[serde(default)]
+    pub retrieval_count: u64,
+    /// 最近一次被交给模型的时刻；从未取用过就是 `None`。
+    #[serde(default)]
+    pub last_retrieved_at: Option<DateTime<Utc>>,
 }
 
 impl SummaryEntry {
@@ -680,6 +706,8 @@ impl SummaryEntry {
             confidence: 1.0,
             importance: 0.5,
             generated_at: Utc::now(),
+            retrieval_count: 0,
+            last_retrieved_at: None,
         }
     }
 
@@ -928,6 +956,24 @@ pub trait MemoryBackend: Send + Sync {
         age_threshold_secs: u64,
         importance_threshold: f32,
     ) -> SFResult<DecayReport>;
+
+    /// Record that this run handed these entries to the model, so the rows
+    /// themselves can answer which content is worth spending an extraction on.
+    ///
+    /// The caller is the assembly point — the place that decides the final
+    /// list — and it names each entry by the layer it came from, because the
+    /// two layers are two tables. The call is made for what reached the model,
+    /// not for what a search returned: a candidate pool is sized by `top_k` and
+    /// recall noise, so counting hits would reward the noise.
+    ///
+    /// Like the per-layer methods it dispatches to, this has no default body:
+    /// a backend that cannot write the reading has to say so instead of
+    /// accepting the call and dropping it.
+    async fn record_retrievals(
+        &self,
+        schema_ids: &[String],
+        summary_ids: &[String],
+    ) -> SFResult<()>;
 }
 
 /// Trait for ingesting raw sources into structured schema and summary layers.
@@ -1035,6 +1081,18 @@ pub trait SchemaBackend: Send + Sync {
 
     /// Update a schema entry, merging properties if the key already exists.
     async fn update_schema(&self, namespace: &str, entry: &SchemaEntry) -> SFResult<()>;
+
+    /// Record that these entries were handed to the model.
+    ///
+    /// Deliberately has no default body. A no-op default would let a backend
+    /// that keeps no such readings — and, worse, a wrapper delegating to one —
+    /// answer "recorded" while nothing was written, and the whole point of the
+    /// reading is to answer "which entries are worth spending an extraction
+    /// on" out of the rows themselves.
+    ///
+    /// The caller passes ids, not entries: the write is one statement per
+    /// batch, and an id is all the store needs to find its row.
+    async fn record_schema_retrieval(&self, ids: &[String]) -> SFResult<()>;
 }
 
 /// Pluggable backend for the Summary layer (Layer 2) of permanent memory.
@@ -1083,6 +1141,11 @@ pub trait SummaryBackend: Send + Sync {
 
     /// Update a summary entry, overwriting if the id already exists.
     async fn update_summary(&self, namespace: &str, entry: &SummaryEntry) -> SFResult<()>;
+
+    /// Record that these entries were handed to the model. See
+    /// [`SchemaBackend::record_schema_retrieval`] for why this has no default
+    /// body.
+    async fn record_summary_retrieval(&self, ids: &[String]) -> SFResult<()>;
 }
 
 #[cfg(test)]
@@ -1325,6 +1388,29 @@ mod tests {
             merge_schema_observation(&stored, &from_elsewhere).occurrences,
             4
         );
+    }
+
+    /// The retrieval reading belongs to the stored row, not to the observation
+    /// being folded into it. A re-extraction starts from a freshly built entry,
+    /// so its counters are zero; a merge that took the observed side's values
+    /// would reset the accumulated count on every pass, and a row that has been
+    /// retrieved a hundred times would read as never retrieved.
+    #[test]
+    fn a_re_extraction_does_not_reset_the_retrieval_reading() {
+        let mut stored = entry("ns", "raw-a", "gateway");
+        stored.retrieval_count = 7;
+        stored.last_retrieved_at = Some(Utc::now());
+
+        let re_extracted = entry("ns", "raw-a", "gateway");
+        let merged = merge_schema_observation(&stored, &re_extracted);
+        assert_eq!(merged.retrieval_count, 7);
+        assert_eq!(merged.last_retrieved_at, stored.last_retrieved_at);
+
+        // A different source reporting the fact folds into the same row, so it
+        // must not touch the reading either.
+        let from_elsewhere = entry("ns", "raw-b", "gateway");
+        let merged = merge_schema_observation(&stored, &from_elsewhere);
+        assert_eq!(merged.retrieval_count, 7);
     }
 
     /// Two sources describing one entity usually describe different facets of

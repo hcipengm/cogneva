@@ -366,6 +366,13 @@ mod tests {
         async fn forget(&self, _ns: &str, _id: &str) -> SFResult<()> {
             unimplemented!()
         }
+        async fn record_retrievals(
+            &self,
+            _schema_ids: &[String],
+            _summary_ids: &[String],
+        ) -> SFResult<()> {
+            unimplemented!()
+        }
     }
 
     #[tokio::test]

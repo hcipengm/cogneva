@@ -371,4 +371,16 @@ impl MemoryBackend for MetricsInstrumentedMemoryBackend {
         }
         result
     }
+
+    async fn record_retrievals(
+        &self,
+        schema_ids: &[String],
+        summary_ids: &[String],
+    ) -> SFResult<()> {
+        let start = Instant::now();
+        let result = self.inner.record_retrievals(schema_ids, summary_ids).await;
+        self.record("record_retrievals", start, result.is_err())
+            .await;
+        result
+    }
 }

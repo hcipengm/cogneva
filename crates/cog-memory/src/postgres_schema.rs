@@ -35,12 +35,16 @@ CREATE TABLE IF NOT EXISTS schema_entries (
     observed_by       TEXT[]      NOT NULL DEFAULT '{}',
     occurrences       BIGINT      NOT NULL DEFAULT 1,
     first_seen        TIMESTAMPTZ,
-    last_seen         TIMESTAMPTZ
+    last_seen         TIMESTAMPTZ,
+    retrieval_count   BIGINT      NOT NULL DEFAULT 0,
+    last_retrieved_at TIMESTAMPTZ
 );
 ALTER TABLE schema_entries ADD COLUMN IF NOT EXISTS observed_by TEXT[] NOT NULL DEFAULT '{}';
 ALTER TABLE schema_entries ADD COLUMN IF NOT EXISTS occurrences BIGINT NOT NULL DEFAULT 1;
 ALTER TABLE schema_entries ADD COLUMN IF NOT EXISTS first_seen  TIMESTAMPTZ;
 ALTER TABLE schema_entries ADD COLUMN IF NOT EXISTS last_seen   TIMESTAMPTZ;
+ALTER TABLE schema_entries ADD COLUMN IF NOT EXISTS retrieval_count BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE schema_entries ADD COLUMN IF NOT EXISTS last_retrieved_at TIMESTAMPTZ;
 
 -- Rows written before the observer list existed name their one origin in
 -- `raw_uri`. Seeding the list from that column is what keeps them answerable
@@ -66,7 +70,8 @@ CREATE INDEX IF NOT EXISTS idx_schema_entries_observed_by ON schema_entries USIN
 /// [`PostgresSchemaBackend::row_to_entry`] reads them.
 const ENTRY_COLUMNS: &str = "namespace, id, kind, name, key, properties, raw_uri, range_spec, \
                              extractor_version, extracted_at, confidence, importance, \
-                             observed_by, occurrences, first_seen, last_seen";
+                             observed_by, occurrences, first_seen, last_seen, \
+                             retrieval_count, last_retrieved_at";
 
 /// PostgreSQL-backed Schema layer.
 /// Wraps a shared [`PgPool`] so callers can reuse an existing connection pool
@@ -173,6 +178,12 @@ impl PostgresSchemaBackend {
         let last_seen: DateTime<Utc> = row
             .try_get("last_seen")
             .map_err(|e| SFError::Agent(format!("decode last_seen: {}", e)))?;
+        let retrieval_count: i64 = row
+            .try_get("retrieval_count")
+            .map_err(|e| SFError::Agent(format!("decode retrieval_count: {}", e)))?;
+        let last_retrieved_at: Option<DateTime<Utc>> = row
+            .try_get("last_retrieved_at")
+            .map_err(|e| SFError::Agent(format!("decode last_retrieved_at: {}", e)))?;
 
         Ok(SchemaEntry {
             id,
@@ -194,6 +205,8 @@ impl PostgresSchemaBackend {
             confidence,
             importance,
             extracted_at,
+            retrieval_count: retrieval_count.max(0) as u64,
+            last_retrieved_at,
         })
     }
 }
@@ -572,5 +585,48 @@ impl SchemaBackend for PostgresSchemaBackend {
         .await
         .map_err(|e| SFError::Agent(format!("update_schema failed: {}", e)))?;
         Ok(())
+    }
+
+    /// Bump the retrieval counters for every id in one statement.
+    ///
+    /// One statement for the batch, not one per id: the entries reach the model
+    /// as a list from a single assembly, so they are recorded the same way. Ids
+    /// with no row are silently skipped — a search can name an entry the store
+    /// has since dropped, and failing the whole batch over a stale id would lose
+    /// the readings for every live entry in it.
+    async fn record_schema_retrieval(&self, ids: &[String]) -> SFResult<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            "UPDATE schema_entries \
+             SET retrieval_count = retrieval_count + 1, last_retrieved_at = NOW() \
+             WHERE id = ANY($1)",
+        )
+        .bind(ids)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SFError::Agent(format!("record_schema_retrieval failed: {}", e)))?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The DDL is the one place the table's shape lives, and `ENTRY_COLUMNS` is
+    /// what every read selects. A column named in one and missing from the other
+    /// fails only against a live database — the kind of drift that reaches
+    /// production because nothing here reads it. Checked without a database so
+    /// the two lists cannot disagree silently.
+    #[test]
+    fn every_selected_column_exists_in_the_ddl() {
+        for column in ENTRY_COLUMNS.split(',').map(|c| c.trim()) {
+            assert!(
+                column.is_empty() || SCHEMA_ENTRIES_DDL.contains(column),
+                "ENTRY_COLUMNS names {column}, which the DDL never creates"
+            );
+        }
     }
 }

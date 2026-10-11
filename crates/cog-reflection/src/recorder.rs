@@ -756,6 +756,13 @@ mod tests {
         ) -> SFResult<cog_core::DecayReport> {
             unsupported()
         }
+        async fn record_retrievals(
+            &self,
+            _schema_ids: &[String],
+            _summary_ids: &[String],
+        ) -> SFResult<()> {
+            unsupported()
+        }
     }
 
     /// A `MemoryBackend` that serves the raw and schema layers in memory.
@@ -921,6 +928,13 @@ mod tests {
             _age: u64,
             _importance: f32,
         ) -> SFResult<cog_core::DecayReport> {
+            unsupported()
+        }
+        async fn record_retrievals(
+            &self,
+            _schema_ids: &[String],
+            _summary_ids: &[String],
+        ) -> SFResult<()> {
             unsupported()
         }
     }

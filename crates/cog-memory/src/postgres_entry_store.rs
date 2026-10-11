@@ -37,14 +37,30 @@ CREATE TABLE IF NOT EXISTS summary_entries (
     extracted_at      TIMESTAMPTZ NOT NULL,
     confidence        REAL        NOT NULL DEFAULT 1.0,
     importance        REAL        NOT NULL DEFAULT 0.5,
-    related_schema_ids JSONB
+    related_schema_ids JSONB,
+    retrieval_count   BIGINT      NOT NULL DEFAULT 0,
+    last_retrieved_at TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS idx_summary_entries_ns_raw_uri ON summary_entries(namespace, raw_uri);
+ALTER TABLE summary_entries ADD COLUMN IF NOT EXISTS retrieval_count BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE summary_entries ADD COLUMN IF NOT EXISTS last_retrieved_at TIMESTAMPTZ;
 UPDATE summary_entries
    SET embedding = '{}', embedding_model = ''
  WHERE cardinality(embedding) > 0
    AND embedding = array_fill(0.0::real, ARRAY[cardinality(embedding)]);
 "#;
+
+/// Columns every `SELECT` in this module returns, in the order
+/// [`PostgresEntryStore::row_to_entry`] reads them.
+///
+/// One const rather than the same list repeated in each of the six reads: a
+/// column added to five of them and not the sixth would decode a row the sixth
+/// query never selected, and `try_get` would report it as a decode failure for
+/// one caller only.
+const SUMMARY_ENTRY_COLUMNS: &str = "id, namespace, text, embedding, sparse_embedding, \
+                                     embedding_model, raw_uri, range_spec, extractor_version, \
+                                     extracted_at, confidence, importance, related_schema_ids, \
+                                     retrieval_count, last_retrieved_at";
 
 /// PostgreSQL-backed entry store for the Summary layer.
 /// Wraps a shared [`PgPool`].  Call [`Self::init_table`] once at startup.
@@ -117,6 +133,12 @@ impl PostgresEntryStore {
             .flatten()
             .and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or_default();
+        let retrieval_count: i64 = row
+            .try_get("retrieval_count")
+            .map_err(|e| SFError::Agent(format!("decode retrieval_count: {}", e)))?;
+        let last_retrieved_at: Option<DateTime<Utc>> = row
+            .try_get("last_retrieved_at")
+            .map_err(|e| SFError::Agent(format!("decode last_retrieved_at: {}", e)))?;
 
         Ok(SummaryEntry {
             id,
@@ -135,6 +157,8 @@ impl PostgresEntryStore {
             confidence,
             importance,
             generated_at: extracted_at,
+            retrieval_count: retrieval_count.max(0) as u64,
+            last_retrieved_at,
         })
     }
 }
@@ -146,13 +170,10 @@ impl SummaryEntryStore for PostgresEntryStore {
     }
 
     async fn get(&self, namespace: &str, id: &str) -> SFResult<Option<SummaryEntry>> {
-        let row = sqlx::query(
-            "SELECT id, namespace, text, embedding, sparse_embedding, embedding_model, \
-                    raw_uri, range_spec, extractor_version, extracted_at, \
-                    confidence, importance, related_schema_ids \
-             FROM summary_entries \
-             WHERE id = $1 AND namespace = $2",
-        )
+        let row = sqlx::query(&format!(
+            "SELECT {SUMMARY_ENTRY_COLUMNS} FROM summary_entries \
+             WHERE id = $1 AND namespace = $2"
+        ))
         .bind(id)
         .bind(namespace)
         .fetch_optional(&self.pool)
@@ -170,13 +191,10 @@ impl SummaryEntryStore for PostgresEntryStore {
             return Ok(Vec::new());
         }
         // sqlx 不支持 Vec<String> 直接 bind，用 unnest
-        let rows = sqlx::query(
-            "SELECT id, namespace, text, embedding, sparse_embedding, embedding_model, \
-                    raw_uri, range_spec, extractor_version, extracted_at, \
-                    confidence, importance, related_schema_ids \
-             FROM summary_entries \
-             WHERE namespace = $1 AND id = ANY($2)",
-        )
+        let rows = sqlx::query(&format!(
+            "SELECT {SUMMARY_ENTRY_COLUMNS} FROM summary_entries \
+             WHERE namespace = $1 AND id = ANY($2)"
+        ))
         .bind(namespace)
         .bind(ids)
         .fetch_all(&self.pool)
@@ -191,13 +209,10 @@ impl SummaryEntryStore for PostgresEntryStore {
     }
 
     async fn list(&self, namespace: &str) -> SFResult<Vec<SummaryEntry>> {
-        let rows = sqlx::query(
-            "SELECT id, namespace, text, embedding, sparse_embedding, embedding_model, \
-                    raw_uri, range_spec, extractor_version, extracted_at, \
-                    confidence, importance, related_schema_ids \
-             FROM summary_entries \
-             WHERE namespace = $1",
-        )
+        let rows = sqlx::query(&format!(
+            "SELECT {SUMMARY_ENTRY_COLUMNS} FROM summary_entries \
+             WHERE namespace = $1"
+        ))
         .bind(namespace)
         .fetch_all(&self.pool)
         .await
@@ -211,13 +226,10 @@ impl SummaryEntryStore for PostgresEntryStore {
     }
 
     async fn list_by_raw_uri(&self, namespace: &str, raw_uri: &str) -> SFResult<Vec<SummaryEntry>> {
-        let rows = sqlx::query(
-            "SELECT id, namespace, text, embedding, sparse_embedding, embedding_model, \
-                    raw_uri, range_spec, extractor_version, extracted_at, \
-                    confidence, importance, related_schema_ids \
-             FROM summary_entries \
-             WHERE namespace = $1 AND raw_uri = $2",
-        )
+        let rows = sqlx::query(&format!(
+            "SELECT {SUMMARY_ENTRY_COLUMNS} FROM summary_entries \
+             WHERE namespace = $1 AND raw_uri = $2"
+        ))
         .bind(namespace)
         .bind(raw_uri)
         .fetch_all(&self.pool)
@@ -291,12 +303,9 @@ impl SummaryEntryStore for PostgresEntryStore {
     }
 
     async fn list_all(&self) -> SFResult<Vec<SummaryEntry>> {
-        let rows = sqlx::query(
-            "SELECT id, namespace, text, embedding, sparse_embedding, embedding_model, \
-                    raw_uri, range_spec, extractor_version, extracted_at, \
-                    confidence, importance, related_schema_ids \
-             FROM summary_entries",
-        )
+        let rows = sqlx::query(&format!(
+            "SELECT {SUMMARY_ENTRY_COLUMNS} FROM summary_entries"
+        ))
         .fetch_all(&self.pool)
         .await
         .map_err(|e| SFError::Agent(format!("entry_store list_all failed: {}", e)))?;
@@ -306,5 +315,39 @@ impl SummaryEntryStore for PostgresEntryStore {
             out.push(Self::row_to_entry(row)?);
         }
         Ok(out)
+    }
+
+    async fn record_retrieval(&self, ids: &[String]) -> SFResult<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            "UPDATE summary_entries \
+             SET retrieval_count = retrieval_count + 1, last_retrieved_at = NOW() \
+             WHERE id = ANY($1)",
+        )
+        .bind(ids)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SFError::Agent(format!("entry_store record_retrieval failed: {}", e)))?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Same check as the schema table's: the six reads select
+    /// `SUMMARY_ENTRY_COLUMNS`, so a column there that the DDL never creates
+    /// would decode as a failure against a live database only.
+    #[test]
+    fn every_selected_column_exists_in_the_ddl() {
+        for column in SUMMARY_ENTRY_COLUMNS.split(',').map(|c| c.trim()) {
+            assert!(
+                column.is_empty() || SUMMARY_ENTRIES_DDL.contains(column),
+                "SUMMARY_ENTRY_COLUMNS names {column}, which the DDL never creates"
+            );
+        }
     }
 }
