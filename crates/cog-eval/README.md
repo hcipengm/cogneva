@@ -41,6 +41,11 @@ The four rows in `src/scaffolds/` share only the protocol edge (`take_turn`, `ob
 **not** share a control loop: two rows running the same loop would be the same implementation
 twice, and the difference between them would be prompt wording rather than method.
 
+Three of the four (CodeAct, GEPA, AGENTFLOW) drive the backbone directly through `LlmClient`. The
+fourth, `nql`, is a thin wrapper over the real platform: it reaches the platform through the
+`PlatformRunner` port, which the crate declares and does not implement — a missing platform has to
+look like a missing platform, so that row **errors** rather than scoring low.
+
 ## Getting the data
 
 Benchmark data is a few hundred MB of parquet and tarballs; it is not committed. Fetch it into a
@@ -109,16 +114,26 @@ at all errors out rather than scoring low: a missing platform has to look like a
 
 ### A dead upstream yields data and interfaces, not numbers
 
-This is the honest boundary of the crate today. The rig and the four rows are here; the per-benchmark
-adapter sets (`CaseSource` / `EnvProvider` / `Toolkit` / `CaseJudge` for SWE-bench Pro, Toolathlon and
-HLE) are not landed yet, and there is no driver binary — the entry point is the library API above.
+This is the honest boundary of the crate today. Three things are **not** landed; the rig and the
+four rows are.
+
+1. **The per-benchmark adapter sets** — `CaseSource` / `EnvProvider` / `Toolkit` / `CaseJudge` for
+   SWE-bench Pro, Toolathlon and HLE. Only the data is on disk.
+2. **A driver** — no binary runs the table. The entry point is the library API above.
+3. **The platform bridge** — the `nql` row reaches the real platform through `PlatformRunner`
+   (`src/scaffolds/nql.rs`), and **nothing implements it**. Turning one case into a platform task,
+   running it there, and getting back an `AgentOutput` with a trace is the platform side growing a
+   path, not a call site the rig can add on its own; its implementation lives where the platform
+   types are visible, at the composition root.
+
 So what you can reproduce today is the **data plane** (fetch + verify) and the **interfaces**, not
 table numbers.
 
-And even once the adapters land, two of the three benchmarks still produce no numbers without
-upstreams: every scaffold drives a backbone (`deepseek-v4-flash`) through `LlmClient`, and HLE is
-the one column graded by a generative judge (`Kimi K3`, official `model_graded_fact` rubric).
-SWE-bench Pro and Toolathlon are graded by deterministic scripts (their tests / `evaluation/main.py`),
-so they are the two columns that can score with no LLM judge at all — but a dead backbone still
-leaves them empty. Pin the backbone and judge model + version + rubric provenance in the experiment
-metadata; a cell that ran on a substituted model is not a cell in this table.
+Two further things stand between this rig and numbers even once those land. First, every row except
+NQL drives a backbone (`deepseek-v4-flash`) through `LlmClient` (NQL drives the platform instead),
+and HLE is the one column graded by a generative judge (`Kimi K3`, official `model_graded_fact`
+rubric). SWE-bench Pro and Toolathlon are graded by deterministic scripts (their tests /
+`evaluation/main.py`), so they are the two columns that can score with no LLM judge at all — but a
+dead backbone still leaves them empty. Second, HLE is multimodal; a text-only harness has to say
+whether it skips image rows. Pin the backbone and judge model + version + rubric provenance in the
+experiment metadata: a cell that ran on a substituted model is not a cell in this table.
