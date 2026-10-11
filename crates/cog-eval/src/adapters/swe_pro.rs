@@ -515,6 +515,10 @@ pub fn swe_pro_benchmark(
         tools: Arc::new(tools),
         judge: Arc::new(SweProJudge::new(backend)),
         budget: crate::scaffold::Budget::default(),
+        // 每题一个自己的容器、自己的仓库副本：例与例之间没有共享物。这一列的上界因此
+        // **不是**常数，它取决于后端在一台宿主上能起几个容器——那要等执行面落地才量得
+        // 出来，所以这里留 `None`，由宿主压力那个界先管着。
+        column_ceiling: None,
     }
 }
 

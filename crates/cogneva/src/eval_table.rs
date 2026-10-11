@@ -59,6 +59,8 @@ usage: cogneva eval-table --pins <file> --backbone <model>@<version> --judge <mo
                           [--benchmarks hle,swe-bench-pro,toolathlon]
                           [--scaffolds codeact,gepa,agentflow,nql] [--seeds 0,1,2]
                           [--subset <file>] [--out <file>]
+                          [--admission <dir>] [--admission-floor-unmeasured <n>]
+                          [--admission-ceiling-unmeasured <n>]
 
   --pins       the pins file: what the data is pinned by, as printed by
                deploy/scripts/fetch-benchmark-data.sh --print-pins
@@ -81,6 +83,22 @@ usage: cogneva eval-table --pins <file> --backbone <model>@<version> --judge <mo
                or dropping a case. The archive's path and content hash go into the table header,
                because which cases ran is part of what the table says.
   --out        write the output here instead of standard output
+  --admission  an existing directory that turns the admission gate on. Point it at the same
+               directory the build gate uses (self_evolution.build_gate.lock_dir): the point of
+               it is that builds and benchmark cases contend for one machine, and two gates on
+               two directories cap each other's absence. The directory has to exist -- a new
+               empty one would gate nothing while looking like it does. Without this flag the
+               gate is not in force and the run says so; it is not run at a lower bound. The
+               gate's bound is not a constant: a controller moves it between the two bounds
+               below as the host's pressure moves, and only judged cases are ever held back.
+  --admission-floor-unmeasured
+  --admission-ceiling-unmeasured
+               the gate's lower and upper bounds. NEITHER HAS BEEN MEASURED on this host: the
+               numbers here are a form floor (never zero) and a placeholder equal to the fixed
+               concurrency this driver used before, not a reading. The real ceiling has to be
+               derived per case from its peak memory and cpu seconds, which waits for the
+               benchmarks' execution side. They only mean anything with --admission: passing one
+               without it is an error rather than a silently ignored number.
 
   the nql row reaches the platform from the environment: COG_EVAL_PLATFORM_BASE is the platform
   endpoint (COG_EVAL_PLATFORM_TOKEN, COG_EVAL_PLATFORM_DEADLINE_SECS optional). With no base the
@@ -158,6 +176,16 @@ pub struct EvalTableArgs {
     pub seeds: Vec<u64>,
     /// 只跑这份存档点名的题；`None` ＝全量。
     pub subset: Option<PathBuf>,
+    /// 准入闸门的目录；`None` ＝不开闸门，用固定名额。
+    ///
+    /// 目录**由参数直接给出**，不给默认值：默认值会把「指到构建方那个目录」变成一句话里
+    /// 的一个约定，而指错目录的闸门与没开闸门在报表上是两件不同的事，前者更糟——它看起来
+    /// 在保护宿主。
+    pub admission_dir: Option<PathBuf>,
+    /// 闸门的下界。**未实测**。
+    pub admission_floor_unmeasured: Option<usize>,
+    /// 闸门的上界。**未实测**。
+    pub admission_ceiling_unmeasured: Option<usize>,
     pub pins: PathBuf,
     pub tools: ToolArm,
     pub backbone: ModelPin,
@@ -169,6 +197,20 @@ fn next_arg<'a>(args: &'a [String], at: usize, name: &str) -> Result<&'a str, St
     args.get(at + 1)
         .map(String::as_str)
         .ok_or_else(|| format!("{name} needs a value"))
+}
+
+fn count_arg(args: &[String], at: usize, name: &str) -> Result<usize, String> {
+    let raw = next_arg(args, at, name)?;
+    let n: usize = raw
+        .parse()
+        .map_err(|e| format!("{name}: `{raw}` is not a count: {e}"))?;
+    if n == 0 {
+        return Err(format!(
+            "{name}: 0 is not a bound -- a gate that admits nothing is a stopped run wearing the \
+             gate's name"
+        ));
+    }
+    Ok(n)
 }
 
 fn parse_list(raw: &str) -> Result<Vec<String>, String> {
@@ -218,6 +260,9 @@ impl EvalTableArgs {
         let mut scaffolds: Option<Vec<String>> = None;
         let mut seeds: Option<Vec<u64>> = None;
         let mut subset: Option<PathBuf> = None;
+        let mut admission_dir: Option<PathBuf> = None;
+        let mut admission_floor: Option<usize> = None;
+        let mut admission_ceiling: Option<usize> = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -270,6 +315,18 @@ impl EvalTableArgs {
                     seeds = Some(parsed);
                     i += 2;
                 }
+                "--admission" => {
+                    admission_dir = Some(PathBuf::from(next_arg(args, i, flag)?));
+                    i += 2;
+                }
+                "--admission-floor-unmeasured" => {
+                    admission_floor = Some(count_arg(args, i, flag)?);
+                    i += 2;
+                }
+                "--admission-ceiling-unmeasured" => {
+                    admission_ceiling = Some(count_arg(args, i, flag)?);
+                    i += 2;
+                }
                 other => return Err(format!("unknown argument: {other}")),
             }
         }
@@ -282,6 +339,28 @@ impl EvalTableArgs {
             Some(raw) => canonicalize(&raw, &SCAFFOLDS, "scaffold")?,
             None => SCAFFOLDS.to_vec(),
         };
+
+        // 两个界限只在闸门开着时才有意义。给了数却不开闸门，是「以为自己在设一个界」而
+        // 实际上没有—— silently 吞掉它，这次跑就会以固定名额跑完，而命令行上写着上界 3。
+        for (flag, set) in [
+            ("--admission-floor-unmeasured", admission_floor),
+            ("--admission-ceiling-unmeasured", admission_ceiling),
+        ] {
+            if set.is_some() && admission_dir.is_none() {
+                return Err(format!(
+                    "{flag} needs --admission <dir>: a bound on a gate that is not in force is \
+                     not a bound"
+                ));
+            }
+        }
+        if let (Some(floor), Some(ceiling)) = (admission_floor, admission_ceiling) {
+            if floor > ceiling {
+                return Err(format!(
+                    "--admission-floor-unmeasured {floor} is above --admission-ceiling-unmeasured \
+                     {ceiling}: the bound lives between them, and an empty interval has none"
+                ));
+            }
+        }
 
         Ok(Self {
             data_root,
@@ -296,6 +375,9 @@ impl EvalTableArgs {
             tools: tool_arm.unwrap_or(ToolArm::Platform),
             backbone: backbone.ok_or("--backbone <model>@<version> is required")?,
             judge: judge.ok_or("--judge <model>@<version> is required")?,
+            admission_dir,
+            admission_floor_unmeasured: admission_floor,
+            admission_ceiling_unmeasured: admission_ceiling,
             out,
         })
     }
@@ -596,6 +678,23 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
         bail!("the data root {} is not a directory", data_root.display());
     }
 
+    // 闸门开在跑之前，而且开不起来就是**失败**，不是「照旧跑」：这个闸门守的是这台宿主，
+    // 它和集群同一台机器。命令行的意思是「按一个会动的界放行」，不是「随便跑，回头在报表
+    // 里记一句没开成」——后者会在宿主已经被压住的时候才发现。
+    let admission = match &args.admission_dir {
+        Some(dir) => {
+            let mut cfg = cog_core::admission::AdmissionConfig::new(dir);
+            if let Some(floor) = args.admission_floor_unmeasured {
+                cfg.floor_unmeasured = floor;
+            }
+            if let Some(ceiling) = args.admission_ceiling_unmeasured {
+                cfg.ceiling_unmeasured = ceiling;
+            }
+            Some(cog_core::admission::open(&cfg).map_err(|e| anyhow::anyhow!("{e}"))?)
+        }
+        None => None,
+    };
+
     // 子集先读、先查覆盖面，在核 pins 之前：存档是本机一个小文件，核 pins 要按哈希逐份
     // 读数据。先在便宜的那一步把「这次跑的是哪一批题」定下来，指错了当场就知道，不必
     // 先扫一遍几百 MB 的题面；覆盖不到某个基准也要在开跑之前说，而不是跑到那一列才发现。
@@ -670,6 +769,7 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
             max_concurrency: 4,
             subset: subset.clone(),
             checkpoint: Some(checkpoint.clone()),
+            admission: admission.clone(),
         },
     );
     for scaffold in table_scaffolds(platform) {
@@ -877,6 +977,68 @@ fn render(args: &EvalTableArgs, wiring: WiringReport<'_>, readings: Readings<'_>
         for line in wiring.missing {
             out.push_str(&format!("missing\t{line}\n"));
         }
+    }
+
+    out.push_str("\n## gate\n");
+    match &table.gate {
+        Some(gate) => {
+            // 目录身份跟着界一起出：两台宿主、两个目录，报出来的是两个界，而它们各自都
+            // 看起来「生效了」。`dev:ino` 是这两份读数能不能并排读的判据。
+            out.push_str(&format!("gate-dir\t{}\t{}\n", gate.dir, gate.identity));
+            out.push_str(&format!(
+                "gate\tbound={}\tfloor={}\tceiling={}\taction={}\tcontroller={}\tin-flight={}\tblocked={}\n",
+                gate.bound,
+                gate.floor,
+                gate.ceiling,
+                gate.action,
+                if gate.controller { "yes" } else { "no" },
+                gate.in_flight,
+                gate.blocked
+            ));
+            // 界的来历：两个界限是拍的，压力是量的。分开写，免得读的人以为上界也是量出来的。
+            out.push_str(&format!(
+                "gate-bounds\tfloor={}\tceiling={}\tunmeasured: both come from \
+                 --admission-floor-unmeasured/--admission-ceiling-unmeasured and are a form floor \
+                 and a placeholder, not a reading on this host\n",
+                gate.floor, gate.ceiling
+            ));
+            match gate.pressure {
+                Some(p) => out.push_str(&format!(
+                    "gate-pressure\tcpu={:.2}/{:.2}\tio={:.2}/{:.2}\tmemory={:.2}/{:.2}\t\
+                     avg10/avg60\tMemAvailable={:.1}GiB\tbuild-slots-held={}\n",
+                    p.cpu_avg10,
+                    p.cpu_avg60,
+                    p.io_avg10,
+                    p.io_avg60,
+                    p.mem_avg10,
+                    p.mem_avg60,
+                    p.mem_available_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                    p.builds_in_flight
+                )),
+                // 「读不出压力」与「压力是零」是两件事：前者让界不动，后者让界往上走。
+                None => out.push_str(
+                    "gate-pressure\tunreadable: no /proc pressure or memory reading on this host, \
+                     so the bound does not move at all\n",
+                ),
+            }
+            match &gate.red {
+                Some(why) => out.push_str(&format!("gate-red\t{why}\n")),
+                None => out.push_str("gate-red\tnone of the four lights is on\n"),
+            }
+            // 界贴着下界不是结论，是一个状态。它停下来多久是「这件事持续了多久」，而原因在
+            // 上面那两行里——写成「界一直很低」就等于把因说成了命。
+            if gate.windows_at_floor > 0 {
+                out.push_str(&format!(
+                    "gate-at-floor\t{} window(s) in a row at the floor; the pressure and the red \
+                     line above are what held it there\n",
+                    gate.windows_at_floor
+                ));
+            }
+        }
+        None => out.push_str(
+            "gate\tnot in force: no --admission directory was given, so this run used the fixed \
+             per-column concurrency and never looked at the host\n",
+        ),
     }
 
     out.push_str("\n## table\n");
@@ -1240,6 +1402,7 @@ mod tests {
             cells: vec![],
             wanted_seeds: 3,
             unreadable: vec![],
+            gate: None,
         }
     }
 
@@ -1304,6 +1467,191 @@ mod tests {
             text.contains("run again on resume rather than remembered as failed"),
             "{text}"
         );
+    }
+
+    fn one_cell_table_with_gate(gate: cog_core::admission::GateReading) -> Table {
+        let mut table = one_cell_table();
+        table.gate = Some(gate);
+        table
+    }
+
+    fn gate_reading() -> cog_core::admission::GateReading {
+        cog_core::admission::GateReading {
+            bound: 2,
+            floor: 1,
+            ceiling: 4,
+            action: "decreased".into(),
+            pressure: Some(cog_core::admission::Pressure {
+                cpu_avg10: 0.61,
+                cpu_avg60: 2.10,
+                io_avg10: 24.12,
+                io_avg60: 29.60,
+                mem_avg10: 0.99,
+                mem_avg60: 1.30,
+                mem_available_bytes: 41 * 1024 * 1024 * 1024,
+                builds_in_flight: 1,
+            }),
+            red: Some("1 build slot(s) are held on this host".into()),
+            blocked: 17,
+            windows_at_floor: 3,
+            in_flight: 1,
+            controller: true,
+            dir: "/opt/cogneva/sandbox/build-gate".into(),
+            identity: "64770:1234".into(),
+        }
+    }
+
+    #[test]
+    fn without_a_directory_the_gate_is_off_and_the_report_says_so() {
+        // 「没开闸门」与「开着闸门但一直没减」在表里必须分得开：读的人要能知道这些格子的
+        // 并行度是固定名额给的，还是当时那台机器给的。
+        let args = EvalTableArgs::parse(&minimal()).unwrap();
+        assert!(args.admission_dir.is_none());
+        let verified = BTreeMap::new();
+        let text = render(
+            &args,
+            WiringReport {
+                missing: &[],
+                platform_base: None,
+            },
+            Readings {
+                data_root: Path::new("/data"),
+                pins: &Pins::default(),
+                verified: &verified,
+                subset: None,
+                checkpoint: &checkpoint_at("/tmp/table.md"),
+                table: &one_cell_table(),
+                errored: 0,
+            },
+        );
+        assert!(text.contains("## gate\n"), "{text}");
+        assert!(text.contains("gate\tnot in force"), "{text}");
+        assert!(!text.contains("gate-dir"), "{text}");
+    }
+
+    #[test]
+    fn a_bound_on_a_gate_that_is_not_in_force_is_an_error() {
+        // 命令行上写着上界 3 而实际上以固定名额跑完——这一次跑的读数就与它自己声明的条件
+        // 对不上，而表上看不出来。
+        let mut raw = minimal();
+        raw.extend(
+            ["--admission-ceiling-unmeasured", "3"]
+                .iter()
+                .map(|s| s.to_string()),
+        );
+        let err = EvalTableArgs::parse(&raw).unwrap_err();
+        assert!(err.contains("--admission <dir>"), "{err}");
+    }
+
+    #[test]
+    fn the_two_bounds_have_to_be_ordered_and_neither_may_be_zero() {
+        let dir = ["--admission", "/tmp/gate"];
+        let mut raw = minimal();
+        raw.extend(dir.iter().map(|s| s.to_string()));
+        raw.extend(
+            [
+                "--admission-floor-unmeasured",
+                "4",
+                "--admission-ceiling-unmeasured",
+                "2",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        );
+        assert!(EvalTableArgs::parse(&raw).unwrap_err().contains("above"));
+
+        let mut raw = minimal();
+        raw.extend(dir.iter().map(|s| s.to_string()));
+        raw.extend(
+            ["--admission-ceiling-unmeasured", "0"]
+                .iter()
+                .map(|s| s.to_string()),
+        );
+        let err = EvalTableArgs::parse(&raw).unwrap_err();
+        assert!(err.contains("not a bound"), "{err}");
+    }
+
+    /// 闸门那一段要能单独回答四件事：界是多少、上一刻的压力读数、界为什么动、以及挡住了
+    /// 多少例。少任何一件，读的人就得去别处猜——这正是「界低」被读成「宿主闲」的原因。
+    #[test]
+    fn the_gate_section_prints_the_bound_its_pressure_its_cause_and_what_it_held_back() {
+        let mut raw = minimal();
+        raw.extend(
+            ["--admission", "/opt/cogneva/sandbox/build-gate"]
+                .iter()
+                .map(|s| s.to_string()),
+        );
+        let args = EvalTableArgs::parse(&raw).unwrap();
+        assert_eq!(
+            args.admission_dir.as_deref(),
+            Some(Path::new("/opt/cogneva/sandbox/build-gate"))
+        );
+        let verified = BTreeMap::new();
+        let text = render(
+            &args,
+            WiringReport {
+                missing: &[],
+                platform_base: None,
+            },
+            Readings {
+                data_root: Path::new("/data"),
+                pins: &Pins::default(),
+                verified: &verified,
+                subset: None,
+                checkpoint: &checkpoint_at("/tmp/table.md"),
+                table: &one_cell_table_with_gate(gate_reading()),
+                errored: 0,
+            },
+        );
+        assert!(
+            text.contains("gate-dir\t/opt/cogneva/sandbox/build-gate\t64770:1234"),
+            "目录身份是两份读数能不能并排读的判据：{text}"
+        );
+        assert!(
+            text.contains("bound=2\tfloor=1\tceiling=4\taction=decreased\tcontroller=yes\tin-flight=1\tblocked=17"),
+            "{text}"
+        );
+        assert!(text.contains("io=24.12/29.60"), "{text}");
+        assert!(text.contains("build-slots-held=1"), "{text}");
+        assert!(
+            text.contains("gate-red\t1 build slot(s) are held"),
+            "{text}"
+        );
+        assert!(text.contains("gate-at-floor\t3 window(s)"), "{text}");
+        assert!(
+            text.contains("unmeasured: both come from"),
+            "拍的界限必须与量出来的压力分开写：{text}"
+        );
+    }
+
+    #[test]
+    fn a_gate_that_could_not_read_the_host_says_so_instead_of_showing_calm() {
+        let mut reading = gate_reading();
+        reading.pressure = None;
+        reading.action = "none".into();
+        reading.red = None;
+        reading.windows_at_floor = 0;
+        let args = EvalTableArgs::parse(&minimal()).unwrap();
+        let verified = BTreeMap::new();
+        let text = render(
+            &args,
+            WiringReport {
+                missing: &[],
+                platform_base: None,
+            },
+            Readings {
+                data_root: Path::new("/data"),
+                pins: &Pins::default(),
+                verified: &verified,
+                subset: None,
+                checkpoint: &checkpoint_at("/tmp/table.md"),
+                table: &one_cell_table_with_gate(reading),
+                errored: 0,
+            },
+        );
+        assert!(text.contains("gate-pressure\tunreadable"), "{text}");
+        assert!(text.contains("gate-red\tnone of the four lights"), "{text}");
+        assert!(!text.contains("gate-at-floor"), "{text}");
     }
 
     #[test]

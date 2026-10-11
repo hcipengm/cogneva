@@ -7,7 +7,7 @@
 //!
 //! 第二条测试量的是另一件事：平台缺席必须表现成「跑不起来」，不能表现成一个低分。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -200,6 +200,13 @@ fn args_on(root: &Path, pins: &Path, scaffolds: &str, subset: Option<&Path>) -> 
     if let Some(subset) = subset {
         raw.extend(["--subset".to_string(), subset.display().to_string()]);
     }
+    // 报表写到这一格自己的临时目录里，检查点跟着它走。不给 `--out` 的话检查点落在进程的
+    // 当前目录：同一份参数的两条测试会指向**同一份记录**（身份里没有数据根的路径），并行
+    // 跑时一个把另一个锁在门外，而跑完还会在仓库里留下文件。
+    raw.extend([
+        "--out".to_string(),
+        root.join("table.md").display().to_string(),
+    ]);
     EvalTableArgs::parse(&raw).expect("the fixture's arguments are well formed")
 }
 
@@ -234,6 +241,18 @@ async fn two_runs_over_one_data_root_produce_the_same_bytes() {
     let args = args(dir.path(), &pins_path, "gepa,agentflow");
 
     let first = run_table(&args, &wired(false), &pins).await.unwrap();
+    // 第二次跑之前把检查点移开：这两次要读的是**两次独立的跑**。留着它的话，第二次会把
+    // 第一次跑完的例接回来（那正是检查点该干的事），两次的报表于是差在 `resumed` 上——
+    // 这条测试量的就不再是「同一个输入两次跑出同样的字节」了。
+    let record = PathBuf::from(
+        first
+            .text
+            .lines()
+            .find_map(|line| line.strip_prefix("checkpoint\t"))
+            .and_then(|line| line.split('\t').next())
+            .expect("报表要说出检查点落在哪，这里照它的话去移"),
+    );
+    std::fs::remove_file(&record).expect("第一次跑必须留下过一份记录");
     let second = run_table(&args, &wired(false), &pins).await.unwrap();
 
     assert_eq!(
@@ -429,4 +448,56 @@ async fn an_archive_that_does_not_cover_a_benchmark_is_refused_before_the_run() 
     };
     assert!(err.contains("toolathlon"), "{err}");
     assert!(err.contains("hle"), "要点出存档里有什么：{err}");
+}
+
+/// 闸门从命令行一路接到运行器上——报表里那一段读数就是这一路接通的证据。
+///
+/// 少了这条，`--admission` 可以解析得很好、渲染得很好，而中间那一跳（命令行 → 运行器的
+/// 配置 → 每一格要票的那一处）断着：报表照样打出一段 `## gate`，因为那一段是拿配置里
+/// 那个对象渲染的，而每格拿到的仍然是固定名额的信号量。
+#[tokio::test]
+async fn the_gate_reaches_the_rig_and_the_report_says_which_directory_it_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, pins_path) = fixture(dir.path());
+    let pins = Pins::load(&pins_path).unwrap();
+    let gate_dir = dir.path().join("gate");
+    std::fs::create_dir(&gate_dir).unwrap();
+
+    let mut args = args(dir.path(), &pins_path, "gepa,agentflow");
+    args.admission_dir = Some(gate_dir.clone());
+    // 两界都钉在 1：每一格里两题，所以闸门**必须**挡下一题。界若只是一个被渲染出来的
+    // 配置，这一轮会两题并排跑完，`blocked` 就还是 0。
+    args.admission_floor_unmeasured = Some(1);
+    args.admission_ceiling_unmeasured = Some(1);
+
+    let out = run_table(&args, &wired(false), &pins).await.unwrap();
+    assert_eq!(out.errored, 0, "{}", out.text);
+    assert!(out.text.contains("## gate\n"), "{}", out.text);
+    assert!(!out.text.contains("gate\tnot in force"), "{}", out.text);
+    assert!(
+        out.text
+            .contains(&format!("gate-dir\t{}\t", gate_dir.display())),
+        "读数要说出界的是哪个目录：{}",
+        out.text
+    );
+    assert!(out.text.contains("floor=1\tceiling=1"), "{}", out.text);
+    assert!(out.text.contains("controller=yes"), "{}", out.text);
+    // 界是 1 而每格两题：挡下来的例数必须是真的被挡过的那些。
+    let gate = out
+        .text
+        .lines()
+        .find_map(|line| line.strip_prefix("gate\t"))
+        .expect("gate 那一段要有一行读数");
+    let blocked: usize = gate
+        .split('\t')
+        .find_map(|f| f.strip_prefix("blocked="))
+        .and_then(|n| n.parse().ok())
+        .expect("这一行要说挡下了几例");
+    assert!(blocked >= 1, "界是 1 而每格两题，至少挡下一题：{gate}");
+    // 界是拍的，这一点必须与量出来的压力分开写，且写在表里。
+    assert!(
+        out.text.contains("unmeasured: both come from"),
+        "{}",
+        out.text
+    );
 }

@@ -360,6 +360,9 @@ pub fn hle_benchmark(
         tools: Arc::new(tools),
         judge: Arc::new(HleJudge::new(judge)),
         budget: crate::scaffold::Budget::default(),
+        // 没有环境：题面进、判分器读答案，例与例之间没有共享物，所以这一列只受宿主压力
+        // 那一个界管。
+        column_ceiling: None,
     }
 }
 

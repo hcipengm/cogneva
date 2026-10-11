@@ -47,6 +47,11 @@ pub struct RunConfig {
     /// 丢掉，那就不叫暂停。续的**粒度是例**，不是例内——一道题跑到一半的现场在它自己的
     /// 容器里，没有落盘面，被打断的例按没跑过重跑。
     pub checkpoint: Option<Checkpoint>,
+    /// 准入闸门。`None` ＝用 `max_concurrency` 那个固定名额，不看宿主压力。
+    ///
+    /// 两者**不是叠加的**：给了闸门，`max_concurrency` 就让位——两个界同时管着，读数上
+    /// 分不出这一次少放进来是因为闸门还是因为这个数。闸门自己的下界上界在它自己的配置里。
+    pub admission: Option<Arc<cog_core::admission::Admission>>,
 }
 
 /// 检查点的落点与它的身份。
@@ -290,6 +295,7 @@ impl RunConfig {
             max_concurrency: 4,
             subset: None,
             checkpoint: None,
+            admission: None,
         }
     }
 
@@ -433,6 +439,13 @@ pub struct Table {
     /// 不在这一版数据里，都表现为一整列题数为 0，而追查的方向完全不同。
     #[serde(default)]
     pub unreadable: Vec<(String, String)>,
+    /// 这次跑的时候闸门是什么样：界、上下界、上一刻的压力、为什么动、挡了多少例。
+    ///
+    /// 它是**随表一起出**的：分数与「当时放进来几个」出自同一次运行，分开存就会出现
+    /// 一张分数配一份别的时刻的闸门读数。没有闸门时是 `None`，与「闸门开着但一动不动」
+    /// 分得开。
+    #[serde(default)]
+    pub gate: Option<cog_core::admission::GateReading>,
 }
 
 impl Table {
@@ -497,6 +510,20 @@ impl Table {
         ));
         md
     }
+}
+
+/// 一格拿到的那张票。
+///
+/// 有闸门时是闸门发的（界会动），没闸门时是那个固定名额的信号量。两种票对例来说只做
+/// 一件事——持有期间占着名额，落下就归还——所以例里不必知道自己是被谁放行的，也就不会
+/// 出现「有闸门的那条路上少还了名额」这种只在一种模式下存在的漏。
+///
+/// 两个字段都**只为了 `Drop` 而存在**，谁也不会去读它——所以这里明说一句，免得下一个人
+/// 把「没读」当成「可以换成 ()」。
+#[allow(dead_code)]
+enum Ticket {
+    Gate(cog_core::admission::Permit),
+    Slot(tokio::sync::OwnedSemaphorePermit),
 }
 
 /// 运行器。
@@ -595,6 +622,7 @@ impl Rig {
             cells,
             wanted_seeds: self.config.seeds.len(),
             unreadable,
+            gate: self.config.admission.as_ref().map(|g| g.reading()),
         })
     }
 
@@ -608,6 +636,8 @@ impl Rig {
         log: Option<Arc<CheckpointLog>>,
     ) -> anyhow::Result<SeedScore> {
         let started = Instant::now();
+        // 有闸门就只由闸门放行：两个界同时管着，这一次少放进来一个就分不出是谁拦的。
+        let admission = self.config.admission.clone();
         let semaphore = Arc::new(Semaphore::new(self.config.max_concurrency.max(1)));
         let mut handles = Vec::new();
         // 上一次跑过的例：不建环境、不调上游、不判分——它那一格已经定了，重跑只会把
@@ -621,7 +651,10 @@ impl Rig {
                     continue;
                 }
             }
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let permit = match &admission {
+                Some(gate) => Ticket::Gate(gate.acquire(&bench.name, bench.column_ceiling).await),
+                None => Ticket::Slot(semaphore.clone().acquire_owned().await.unwrap()),
+            };
             let case = case.clone();
             let llm = self.llm.clone();
             let env_provider = bench.env.clone();
@@ -901,6 +934,7 @@ mod tests {
             tools: Arc::new(NoTools),
             judge: Arc::new(OkJudge),
             budget: Budget::default(),
+            column_ceiling: None,
         }
     }
 
@@ -994,6 +1028,7 @@ mod tests {
                 max_concurrency: 4,
                 subset: None,
                 checkpoint: None,
+                admission: None,
             },
         )
     }
@@ -1015,6 +1050,7 @@ mod tests {
                 max_concurrency: 4,
                 subset: Some(subset),
                 checkpoint: None,
+                admission: None,
             },
         )
     }
@@ -1258,6 +1294,7 @@ mod tests {
                 max_concurrency: 4,
                 subset: None,
                 checkpoint: Some(cp),
+                admission: None,
             },
         )
     }
@@ -1267,6 +1304,126 @@ mod tests {
             path: path.to_path_buf(),
             run_id: run_id.into(),
         }
+    }
+
+    /// 一个环境要起一会儿，起的时候记下这一刻有几个例占着机器。
+    ///
+    /// 量的是「同时开着几个」：这是这一列的上界唯一看得见的形状。环境在 `acquire` 里
+    /// 记账、在 `teardown` 里销账，而票比这两头都活得久——所以数出来的峰值绝不会超过真正
+    /// 放行的票数。
+    struct CountingEnv {
+        live: Arc<std::sync::Mutex<usize>>,
+        peak: Arc<std::sync::Mutex<usize>>,
+    }
+
+    impl CountingEnv {
+        fn new() -> Self {
+            Self {
+                live: Arc::new(std::sync::Mutex::new(0)),
+                peak: Arc::new(std::sync::Mutex::new(0)),
+            }
+        }
+
+        fn peak(&self) -> usize {
+            *self.peak.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl EnvProvider for CountingEnv {
+        async fn acquire(&self, _case: &EvalCase) -> anyhow::Result<Arc<dyn CaseEnv>> {
+            {
+                let mut live = self.live.lock().unwrap();
+                *live += 1;
+                let mut peak = self.peak.lock().unwrap();
+                *peak = (*peak).max(*live);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            Ok(Arc::new(HeldEnv {
+                live: self.live.clone(),
+            }))
+        }
+    }
+
+    struct HeldEnv {
+        live: Arc<std::sync::Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl CaseEnv for HeldEnv {
+        fn id(&self) -> &str {
+            "held"
+        }
+        fn executor(&self) -> Option<Arc<dyn cog_core::ToolExecutor>> {
+            None
+        }
+        async fn teardown(&self) {
+            let mut live = self.live.lock().unwrap();
+            *live = live.saturating_sub(1);
+        }
+    }
+
+    fn gated_rig(admission: Option<Arc<cog_core::admission::Admission>>) -> Rig {
+        Rig::new(
+            Arc::new(NeverCalled),
+            RunConfig {
+                data_root: "/nonexistent".into(),
+                seeds: vec![0],
+                max_concurrency: 4,
+                subset: None,
+                checkpoint: None,
+                admission,
+            },
+        )
+        .with_scaffold(Arc::new(AlwaysRight))
+    }
+
+    fn column_of(ceiling: Option<usize>, env: Arc<CountingEnv>) -> Benchmark {
+        let mut b = bench("toolathlon", env);
+        b.column_ceiling = ceiling;
+        b
+    }
+
+    /// 一列的隔离上界是**取小的那一半**：闸门开着、界是 4，但这一列自己只许同时跑一个，
+    /// 那就只能跑一个。
+    ///
+    /// 反证是同一条判据的另一半：同一份环境、同一个题数，**不给闸门**时两个例是同时在跑
+    /// 的。没有这条对照，上面那条「峰值是 1」也可能只是这两个例本来就没重叠——量具自己
+    /// 不动，量出来的数没有意义。
+    #[tokio::test]
+    async fn a_column_ceiling_holds_even_when_the_gate_would_admit_more() {
+        let env = Arc::new(CountingEnv::new());
+        let dir = tempfile::tempdir().unwrap();
+        let gate = cog_core::admission::open(&cog_core::admission::AdmissionConfig {
+            dir: dir.path().to_path_buf(),
+            // 两界都是 4：闸门这一刻就是 4 个名额，拦人的只可能是这一列自己的上界。
+            floor_unmeasured: 4,
+            ceiling_unmeasured: 4,
+            window: std::time::Duration::from_secs(3600),
+        })
+        .unwrap();
+        let table = gated_rig(Some(gate.clone()))
+            .run(&[column_of(Some(1), env.clone())])
+            .await
+            .unwrap();
+        assert_eq!(env.peak(), 1, "这一列自己共享一个 postgres，只许一个在跑");
+        assert_eq!(
+            table
+                .cell("always-right", "toolathlon")
+                .unwrap()
+                .stat()
+                .mean,
+            1.0
+        );
+        let reading = table.gate.expect("报表要带上闸门那一刻的读数");
+        assert!(reading.blocked >= 1, "被挡住的例必须记下来：{reading:?}");
+
+        let env = Arc::new(CountingEnv::new());
+        gated_rig(None)
+            .run(&[column_of(None, env.clone())])
+            .await
+            .unwrap();
+        assert_eq!(env.peak(), 2, "没有这一列的上界时，两题是同时在跑的");
     }
 
     /// 接回来的那半不重跑：同一份检查点跑第二遍，交给外壳的题数必须是零。
@@ -1416,6 +1573,7 @@ mod tests {
             tools: Arc::new(NoTools),
             judge: Arc::new(RecordingJudge(judge_saw.clone())),
             budget: Budget::default(),
+            column_ceiling: None,
         };
 
         rig()

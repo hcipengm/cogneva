@@ -1,3 +1,4 @@
+pub mod admission;
 pub mod audit;
 pub mod build_cache;
 pub mod build_cache_readings;

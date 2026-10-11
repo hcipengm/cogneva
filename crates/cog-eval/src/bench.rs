@@ -177,6 +177,13 @@ pub struct Benchmark {
     pub tools: Arc<dyn Toolkit>,
     pub judge: Arc<dyn CaseJudge>,
     pub budget: Budget,
+    /// 这个基准自己不许越过的并行上界；`None` ＝它的环境彼此隔离，只受宿主压力限制。
+    ///
+    /// 它是**列的属性，不是宿主的属性**：准入闸门看的是这台机器还能放几个进来，这一项
+    /// 说的是这一列就算机器闲着也不许同时跑两个——两者取小。所以它不能当配置项下发，
+    /// 只能跟产生它的那份环境实现写在一起：环境什么时候共享、共享在哪里，是那份实现
+    /// 自己的事实。
+    pub column_ceiling: Option<usize>,
 }
 
 #[cfg(test)]
@@ -343,6 +350,7 @@ mod tests {
             tools: Arc::new(EchoToolkit),
             judge: Arc::new(ExactJudge),
             budget: Budget::default(),
+            column_ceiling: None,
         }
     }
 

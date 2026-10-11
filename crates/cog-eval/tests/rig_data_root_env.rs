@@ -130,6 +130,7 @@ fn benchmark() -> Benchmark {
         tools: Arc::new(NoTools),
         judge: Arc::new(IdJudge),
         budget: Budget::default(),
+        column_ceiling: None,
     }
 }
 

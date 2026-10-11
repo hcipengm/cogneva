@@ -373,6 +373,10 @@ pub fn toolathlon_benchmark(
         tools: Arc::new(tools),
         judge: Arc::new(ToolathlonJudge::new(backend)),
         budget: crate::scaffold::Budget::default(),
+        // 这一列的所有任务共用同一个 postgres：两例同时在跑，就不是「谁的库」读不出来，
+        // 而是一例的清库把另一例的中间状态删掉——分数会掉，而且掉在哪一例上看不出来。
+        // 所以这一列的并行上界是 1，与宿主此刻闲不闲无关。
+        column_ceiling: Some(1),
     }
 }
 
