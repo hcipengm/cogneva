@@ -119,11 +119,21 @@ struct Rule {
     names: Vec<String>,
 }
 
-fn yaml_docs(text: &str) -> Vec<serde_yaml::Value> {
-    serde_yaml::Deserializer::from_str(text)
-        .filter_map(|doc| serde_yaml::Value::deserialize(doc).ok())
-        .filter(|v| !v.is_null())
-        .collect()
+/// `text` 里的每一篇文档，或者一次带文件名的 panic。解析不出来的文档是**失败**，
+/// 不是跳过：丢掉它就把它带的规则一起丢掉了，闸门会在一片它从没读过的输入上报绿。
+/// （`serde_yaml` 在文档反序列化失败时不推进游标，所以这里把错误丢掉不只是有损。）
+fn yaml_docs(text: &str, file: &str) -> Vec<serde_yaml::Value> {
+    let mut out: Vec<serde_yaml::Value> = Vec::new();
+    for doc in serde_yaml::Deserializer::from_str(text) {
+        match serde_yaml::Value::deserialize(doc) {
+            Ok(v) if v.is_null() => {}
+            Ok(v) => out.push(v),
+            Err(e) => panic!(
+                "{file}: 有一篇文档解析不出来（{e}）：解析不了是判据的形态问题，不能当它不存在"
+            ),
+        }
+    }
+    out
 }
 
 fn strings(value: Option<&serde_yaml::Value>) -> Vec<String> {
@@ -151,7 +161,7 @@ fn roles_in(relative: &str) -> RoleFile {
     let mut bound_subjects: Vec<String> = Vec::new();
     let mut bound_role: Option<String> = None;
 
-    for doc in yaml_docs(&text) {
+    for doc in yaml_docs(&text, relative) {
         let kind = doc.get("kind").and_then(|k| k.as_str()).unwrap_or("");
         match kind {
             "Role" => {
@@ -1027,4 +1037,17 @@ fn every_identity_that_can_publish_can_read_the_canary_base_names() {
             );
         }
     }
+}
+
+/// 判据读不懂的形态要**响**：一篇解析不出来的文档被丢掉，它带的规则就一起消失，
+/// 于是「读不到授权」被读成「没有这条规则」。走这个文件自己的 `yaml_docs`，而不是
+/// 只断言那串文本是坏的。
+#[test]
+#[should_panic(expected = "解析不出来")]
+fn a_document_that_does_not_parse_is_a_failure_not_a_skip() {
+    // 未闭合的 flow sequence：一处真实的畸形形态（比如没渲染完的模板落到这里）。
+    let _ = yaml_docs(
+        "apiVersion: rbac.authorization.k8s.io/v1\nkind: Role\nrules: [\n",
+        "torn.yaml",
+    );
 }
