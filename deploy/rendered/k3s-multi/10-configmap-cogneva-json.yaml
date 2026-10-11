@@ -1691,6 +1691,33 @@ data:
               },
               "severity": "warning",
               "summary": "One knowledge-retrieval layer failed on every call it answered in the last six hours: {value} errors under {layer} and not one retrieval in the same window that came back with rows or with an empty list. Every layer a retrieval consults records one cell among hit (rows came back), empty (the store answered and matched nothing), error (the store refused) and absent (this process holds no such layer). The whole cross of layers and cells is seeded at zero when a process starts, so a boot that consults nothing reads as zeros rather than as absence, and the cells are not all written on one schedule: the backend writes one per retrieval call, while a process that reached no knowledge backend writes absent once per boot on both layers -- an increase on the wiki cell is that case alone, since a live backend never writes absent for wiki, which is what tells it apart from the ordinary traffic the memory cell also carries. No reader may sum across cells and report the total as a number of retrievals. The four are only readable together because the caller sees the resulting list and nothing else -- a layer that refused, a layer this host never held, and a store that merely had nothing to hand back all reach that caller as the same empty vector, so a repair choice between \"fix the backend\" and \"there is simply nothing stored\" cannot be made from what the caller returns. On the error cell alone this reading would say how much retrieval failed and nothing about whether any of it worked, which is why the guard is read against the layer's own non-error answers instead of against the fleet: a layer that is down stays down and the other layer answering normally does not clear it, and the per-layer grouping is what keeps the healthy layer from averaging the unhealthy one away. The right side accepts a hit or an empty answer and deliberately not an absent one, because a replica that never held the layer is no evidence that the layer still serves, so a process without memory must not silence an error being recorded by the replicas that do hold it, and absent is its own cell for exactly this reason. The shape is all-failed rather than a failure rate: the counter is incremented once per call, so both sides of the guard count the same calls and the rule states \"this layer is not being served\" without a bound on how much error rate is a fault, and no such bound is declared anywhere. Six hours is the window the other all-failed rules on this face use and it is long enough that a layer consulted rarely has had a fair chance to answer. Both cells are taken once for the fleet rather than summed over the pods that expose them, because this counter is held in the shared store and each pod reads back the same total. What this rule does not say: it does not distinguish a layer that answered nothing because the backend is down from one that answered nothing because the store is genuinely empty -- that difference lives in the hit, empty and absent cells read side by side, not in the error count alone"
+            },
+            {
+              "name": "host_slice_anon_floor_unmeasured",
+              "promql": "(max by (node) (min_over_time(cogneva_host_slice_anon_bytes{slice=\"user.slice\"}[15m])) > 8589934592) and (sum by (node) (count_over_time(cogneva_host_slice_anon_bytes{slice=\"user.slice\"}[30m])) > sum by (node) (count_over_time(cogneva_host_slice_anon_bytes{slice=\"user.slice\"}[15m])))",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "宿主侧（非集群）匿名页：某个节点上 user.slice 的 anon 在最近 15 分钟里每一次采样都高于声明的地板 8 GiB（{value} 字节，{node} 是节点名）。这条线上的数是宿主机上**不属于本集群**的进程持有的匿名内存——本平台的 Pod 都记在 kubepods.slice 下，system.slice 是系统服务（含容器运行时）——所以它涨起来说明宿主侧别的东西在吃内存（典型是宿主上直接跑的构建进程树与交互式会话）。有读数的必要是因为构建闸门的上限是从宿主全局读数导出的：分不出「这台机器自己忙」与「本平台填满了它」，闸门就会为一台被别的东西占满的机器关掉构建，而两种情形在闸门自己的读数上一模一样。判词按节点分组（`by (node)`），不求和：一个把全集群加起来的和跟单台地板比，在多节点上是「所有节点加起来越过一个单节点地板」，机器越多越容易误报，而这条读数本来就是按台成立的。**8 GiB 这个地板是拍的，不是量出来的**：落地当天实测 user.slice anon 1.34G，约 6 倍余量；可触发性来自「宿主侧一到两个构建进程树同时跑」（构建进程树 RSS 峰值约 4481MiB）。序列真正跑起来之后一周内按实测分布重新定这个数——在那之前别把它当成有依据的界。持续 15 分钟由 min_over_time 给出，覆盖条件（30m 的采样数 > 15m 的采样数）要求这 15 分钟真的被观测到：没有它，一个刚起的账本 Pod 会凭第一条采样就说「已经持续了 15 分钟」。它只报 user.slice：kubepods.slice 是本平台自己，不该触发这条。"
+            },
+            {
+              "name": "host_ledger_node_unreported",
+              "promql": "count by (node) (kube_node_info) unless on (node) count by (node) (cogneva_host_ledger_node_info)",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "节点 {node} 在集群的节点清单里，却没有自己的宿主账本序列：这个节点上没人量宿主侧的内存，它的读数不是 0，是不存在。这两种状态在所有别的地方同形——图上一个节点缺一条线和不缺一条线看起来只是线的多少，而账本缺席时「这台机器闲着」与「这台机器没人看」在判据上一模一样，这正是成对失明：产出方和读它的规则一起消失，检查器报的还是绿。所以判词写成「缺席即异常」：以 kube-state-metrics 的 kube_node_info 为节点清单（它就是集群当前认为自己有哪些节点），拿它去减账本的在场序列（cogneva_host_ledger_node_info），剩下的节点就是有节点、没账本。写成这个方向是因为它同时答了两个问题：节点被移除时它从 kube_node_info 里消失，于是不再被报（不是永久挂在告警上）；节点还在而账本停了，它就一直报。账本 Pod 是一个 DaemonSet，每个节点一个，所以这条规则报出来通常意味着三件事之一：这个节点上新起的账本 Pod 因为某个原因没能跑起来（最典型的是命名空间的 ResourceQuota 里 pods 配额已满——DaemonSet 的 Pod 也是由控制器经 apiserver 建在该命名空间里、照样占配额，配额满时新节点的账本 Pod 会 Pending，而 tolerations 挡不住这件事）；或者是节点刚加入还没有等到下一个 rollout；或者是这个节点的 cgroup 树连 slice 都看不到（那种情况另有 host_ledger_slices_invisible 报，本规则不重复报）。"
+            },
+            {
+              "name": "host_ledger_slices_invisible",
+              "promql": "(min by (node) (min_over_time(cogneva_host_ledger_slices_readable[15m])) < 3) and (sum by (node) (count_over_time(cogneva_host_ledger_slices_readable[30m])) > sum by (node) (count_over_time(cogneva_host_ledger_slices_readable[15m])))",
+              "condition": {
+                "less_than": 3.0
+              },
+              "severity": "warning",
+              "summary": "节点 {node} 的宿主账本跑起来了，但它能读到的 cgroup slice 少于 3 个（{value} 个，3 个是 user.slice / system.slice / kubepods.slice）。这不是「这个 slice 是空的」，是「这个节点的挂载点下面没有这些目录」——cgroup v1 的宿主上 /sys/fs/cgroup 存在，但里面不是这三个 slice 目录，于是账本进程一个 memory.stat 都读不到。产出方对 kubepods 这一格认两种拼法——systemd 的 kubepods.slice 与 cgroupfs 驱动的 kubepods（后者是没有 .slice 后缀的目录，kubelet 的默认驱动之一），两种都读不到才算缺席——所以这里数的是「读不到整棵树」，不是「这台节点的驱动名字和我们不一样」：一个用 cgroupfs 驱动的节点是健康的，把它报成故障只会让这条界常年红着、最后没人看。把这种情况报成 0 是错读数：0 是量出来的，看不见是没量到，而两者在图上同形。所以产出方把「读到几个」单独发成 cogneva_host_ledger_slices_readable，本规则读它；账本 Pod 自己也会在日志里按 slice 各打一条 warn。读数在读到 0 个时最危险也最容易混过去：那个节点上宿主侧的内存账整个是空的，而节点在场序列照发，所以另一条 host_ledger_node_unreported 不会报——两条规则各管一半，缺一不可。"
             }
           ]
         },
@@ -1767,7 +1794,7 @@ data:
           "enabled": true,
           "max_concurrent": 0,
           "wait_secs": 1800,
-          "lock_dir": "/opt/cogneva/sandbox/build-gate"
+          "lock_dir": "/var/lib/cogneva-build-gate"
         },
         "notify_on_success": true,
         "notify_on_failure": true,

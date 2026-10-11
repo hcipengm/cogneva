@@ -72,6 +72,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 卷占用走查：挂在只由第三方进程写入的卷上的边车，把该卷的盘上字节发布成
         // 卷族序列（deploy/k3s/cluster-registry.yaml 的 volume-walker 容器）。
         Command::VolumeWalker => cogneva::volume_walker::run_from_env().await,
+        // 宿主账本的拆解面：每节点一个只读进程，把宿主 cgroup v2 的三个 slice 各按
+        // anon / file 拆开（deploy/k3s/host-ledger-daemonset.yaml 的启动命令）。
+        Command::HostLedger => cogneva::host_ledger::run_from_env().await,
         // 启动前配置与依赖校验（审计 Phase 2 任务 2.5）。
         Command::ValidateConfig => cogneva::validate_config::run().await,
         // 主线跟踪自动部署的滚动端：独立 Job Pod 内执行，四部署门禁滚动，

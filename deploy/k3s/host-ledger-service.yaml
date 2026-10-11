@@ -1,0 +1,23 @@
+# 宿主账本的抓取面：无头 Service（clusterIP: None），每个节点的 Pod 各自成为
+# 一个抓取目标。
+# 端点名 `http` 是观测面的契约：ServiceMonitor 按端口名（http）挑端点，换个名字
+# 等于这条抓取配置不存在——账本一直在产出而 Prometheus 里没有它。
+apiVersion: v1
+kind: Service
+metadata:
+  name: cogneva-host-ledger
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: host-ledger
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: host-ledger
+  ports:
+    - name: http
+      port: 9100
+      targetPort: http
+      protocol: TCP

@@ -1200,7 +1200,10 @@ impl Default for BuildGateConfig {
             // 不覆盖：装机时不认识这台机器，而"1"是一个跟宿主容量无关的常量。
             max_concurrent: 0,
             wait_secs: 1800,
-            lock_dir: "/opt/cogneva/sandbox/build-gate".into(),
+            // 与部署清单挂的那条 hostPath 同名：哪一层（配置文件、环境变量、
+            // 默认值）最后说话，落点都是同一个字符串。默认值本身不保证共享——
+            // 目录只有在部署真的把它挂出来时才是同一块。
+            lock_dir: "/var/lib/cogneva-build-gate".into(),
         }
     }
 }

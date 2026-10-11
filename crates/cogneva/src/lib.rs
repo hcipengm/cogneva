@@ -14,6 +14,7 @@ pub mod eval_platform;
 pub mod eval_subset;
 pub mod eval_table;
 pub mod health_check;
+pub mod host_ledger;
 pub mod hot_reload;
 pub mod pidfile;
 pub mod platform;

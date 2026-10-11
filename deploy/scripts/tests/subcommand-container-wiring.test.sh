@@ -92,11 +92,13 @@ PYEOF
 check_file "${repo}/deploy/k3s/cluster-registry.yaml"
 check_file "${repo}/deploy/k3s/gateway-deployment.yaml"
 check_file "${repo}/deploy/k3s/sandbox-executor-deployment.yaml"
+check_file "${repo}/deploy/k3s/host-ledger-daemonset.yaml"
 check_file "${work}/chart.yaml"
 for profile in k3s-single k3s-multi k8s-standard; do
   check_file "${repo}/deploy/rendered/${profile}/41-deployment-cogneva-registry.yaml"
   check_file "${repo}/deploy/rendered/${profile}/41-deployment-cogneva-security-gateway.yaml"
   check_file "${repo}/deploy/rendered/${profile}/41-deployment-cogneva-sandbox-executor.yaml"
+  check_file "${repo}/deploy/rendered/${profile}/40-daemonset-cogneva-host-ledger.yaml"
 done
 
 # Reverse control: the same reading has to fail on a manifest where the argv was

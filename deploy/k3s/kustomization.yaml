@@ -28,6 +28,8 @@ resources:
   - evolution-pvc.yaml
   - evolution-rbac.yaml
   - buildah-daemonset.yaml
+  - host-ledger-daemonset.yaml
+  - host-ledger-service.yaml
   - postgres-deployment.yaml
   - postgres-service.yaml
   - redis-deployment.yaml

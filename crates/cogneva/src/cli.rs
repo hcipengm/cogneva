@@ -21,6 +21,7 @@ pub enum Command {
     SecurityGateway,
     SandboxExecutor,
     VolumeWalker,
+    HostLedger,
     ValidateConfig,
     MainlineRollout,
     ExecuteChange,
@@ -34,10 +35,11 @@ pub enum Command {
 
 /// Subcommands, in the order they appear in [`USAGE`]. A command added here but
 /// not documented fails the usage test.
-const SUBCOMMANDS: [(&str, Command); 11] = [
+const SUBCOMMANDS: [(&str, Command); 12] = [
     ("security-gateway", Command::SecurityGateway),
     ("sandbox-executor", Command::SandboxExecutor),
     ("volume-walker", Command::VolumeWalker),
+    ("host-ledger", Command::HostLedger),
     ("validate-config", Command::ValidateConfig),
     ("mainline-rollout", Command::MainlineRollout),
     ("execute-change", Command::ExecuteChange),
@@ -68,6 +70,7 @@ COMMANDS:
     security-gateway       Run the security gateway only
     sandbox-executor       Run the sandbox executor only
     volume-walker          Walk a mounted volume and serve its footprint on /metrics
+    host-ledger            Read the host's cgroup slices and serve their memory on /metrics
     validate-config        Validate configuration and dependencies, then exit non-zero on errors
     mainline-rollout       Roll the mainline revision across deployments (in-cluster Job)
     execute-change         Apply, verify, commit and build one evolution change, then exit

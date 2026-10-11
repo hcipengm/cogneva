@@ -514,7 +514,7 @@
       "enabled": true,
       "max_concurrent": 0,
       "wait_secs": 1800,
-      "lock_dir": "/opt/cogneva/sandbox/build-gate"
+      "lock_dir": "/var/lib/cogneva-build-gate"
     }
   },
   "multi_backend_consumer": {

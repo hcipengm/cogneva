@@ -6,6 +6,7 @@ pub mod config_delivery;
 pub mod data_volume;
 pub mod explainability;
 pub mod explainability_pg;
+pub mod host_ledger;
 pub mod infra_watch;
 pub mod jaeger;
 pub mod llm_usage_rollup;

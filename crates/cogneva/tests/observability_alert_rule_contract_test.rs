@@ -353,6 +353,31 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_metric_held_unreadable",
         "crates/cog-gateway/src/lib.rs",
     ),
+    // The host's memory, split by the slices the kernel already keeps it in. One
+    // series per slice, so the two names published together are one reading; the
+    // rule reads only the slice that says "something outside this cluster is
+    // holding memory", and the file slice is the denominator a reader compares it
+    // against rather than a value any rule thresholds.
+    (
+        "cogneva_host_slice_anon_bytes",
+        "crates/cog-observability/src/host_ledger.rs",
+    ),
+    // The two series that make the reading above usable on more than one
+    // machine, and the reason each is a series rather than an assumption. A
+    // ledger pod that fails to start on one node produces no sample at all, and
+    // a node reporting nothing is the same picture as a node reporting zero --
+    // so one series states the node is running its ledger, and the other states
+    // how much of the host tree that ledger could read. The second is not a
+    // convenience: a cgroup v1 host has the mount point and none of the slices,
+    // which reads as three zeroes unless the coverage is published separately.
+    (
+        "cogneva_host_ledger_node_info",
+        "crates/cog-observability/src/host_ledger.rs",
+    ),
+    (
+        "cogneva_host_ledger_slices_readable",
+        "crates/cog-observability/src/host_ledger.rs",
+    ),
     (
         "cogneva_process_zombies",
         "crates/cog-observability/src/process_zombies.rs",
@@ -695,6 +720,10 @@ const FOREIGN: &[(&str, &str)] = &[
     (
         "kube_deployment_status_replicas_available",
         "kube-state-metrics（Deployment 层面的可用副本数；读数取自各 Pod 的 ready，而 Pod 卡在 Terminating 时 API 仍把它记为 ready，所以这份计数在那种故障下不动）",
+    ),
+    (
+        "kube_node_info",
+        "kube-state-metrics（每个节点一条常量序列；它是「集群当前认为自己有哪些节点」的那份清单，所以节点被移除时它也消失——按它来判断账本缺席，才不会把「节点没了」和「节点在但不报」混成一件事）",
     ),
     ("kube_node_status_allocatable", "kube-state-metrics"),
     (

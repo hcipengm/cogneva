@@ -355,8 +355,11 @@ evolution:
   # 所以不要把它放到别的卷的挂载点**里面**（比如 /var/lib/cogneva-data 下的某个子目录），
   # 那要靠"更具体的挂载赢"才成立，同路径的主张随即变脆；与 /var/lib/cogneva-buildah
   # 同形，另起一个宿主目录。
-  # 目前只有进化 Pod 与宿主侧 `cogneva eval-table --admission` 指到这里；多节点上每个
-  # 节点各有一份，那是对的——界按台算。别再往这个目录里加**非 root** 的入场方：
+  # 目前有两个入场方：进化 Pod，与集群内评测台 `cogneva eval-table --admission`。
+  # 用 hostPath 而不是共享卷，理由是**界按台算**：这里给出的上限是从本机读数导出的
+  # （宿主 cpu / 内存 / 磁盘，加构建容器的 cgroup 内存上限），所以它只对"同一个节点上
+  # 的构建方"成立，目录也就该按节点各一份；换成跨节点共享的卷，等于把 N 台的在飞条数
+  # 收在一条按单台导出的界下面。别再往这个目录里加**非 root** 的入场方：
   # 那会同时带回两个问题（fsGroup 互改属主、不受信方占住槽位），见 build_gate 的注解。
   buildGate:
     enabled: true
@@ -528,6 +531,43 @@ buildah:
     limits:
       cpu: 2000m
       memory: 4Gi
+
+# 宿主账本的拆解面（host-ledger DaemonSet）：每节点一个只读进程，把宿主 cgroup v2
+# 的三个 slice 各按 anon / file 报出来。它存在的理由是「宿主上多少内存是本平台的」
+# 这个问题今天没有数据源：node_exporter 的 cgroups collector 是按 cgroup v1 写的
+# （在 v2 宿主上只出子系统级别的 cgroup/enabled 两格，没有按 slice 的字节），
+# cadvisor 只走自己被 root 住的那棵子树，两者都不给宿主的 slice 分解。而构建闸门的
+# 上限是从宿主全局读数导出的，没有分解就分不出「这台机器自己忙」与「本平台填满了它」。
+# hostPath 挂宿主的 cgroup 根（只读）。这不是特权面：memory.stat 本身是 0444，
+# 进程不需要任何 capability、不需要 hostPID、不碰设备——挂成只读也让"量一下"这件事
+# 不可能改到宿主。挂载点只在容器内取名，进程按 COGNEVA_HOST_CGROUP_ROOT 找它。
+hostLedger:
+  enabled: true
+  # 宿主 cgroup v2 根。cgroup v1 宿主也照挂（目录存在），只是下面找不到 slice，
+  # 于是什么都不报——不造假根：这里用 Directory 而不是 DirectoryOrCreate。
+  # 这一段是整个宿主账本里唯一一处**按节点**的东西，而且它只在这台节点上成立：
+  # hostPath 的声明面在集群里（DaemonSet 是一个集群对象），存储面不在——字节落在节点
+  # 根文件系统上，不归任何 StorageClass/PVC 管，`helm uninstall` 也带不走它。跟它成
+  # 镜像关系的是沙盒那张 PVC（/opt/cogneva/sandbox）：那张的声明面和存储面都在集群
+  # 生命周期里。两者都别按"反正宿主上也看得见"去理解。
+  hostPath: /sys/fs/cgroup
+  mountPath: /host/cgroup
+  port: 9100
+  resources:
+    # 每次抓取读三个小文件，常驻与尖峰都在噪声级；request 按实耗定，上限留一个
+    # 足以容纳一次抓取的余量即可。
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+  # 这个 DaemonSet 的 Pod 也占命名空间 ResourceQuota 的 pods 配额：它的 Pod 是
+  # 控制器经 apiserver 在该命名空间里建的，配额满时新节点上的账本 Pod 会 Pending，
+  # 那个节点于是静默地没有账本（tolerations 挡不住这件事）。当前选择：接受，并让
+  # host_ledger_node_unreported 报「有节点、没账本」。不给它 priorityClassName——
+  # 为了报一条读数去抢占工作负载，代价比它大。配额本身是另一件事：它现在是从这台
+  # 机器的读数导出的，换一台机器要重推（见 resourceGovernance.quota）。
 
 # 集群内镜像仓库：GitOps L1 金丝雀镜像秒级分发通道。
 # publisher（进化 Pod）把 overlay 镜像（cogneva 基镜像 + 新二进制）push 到
