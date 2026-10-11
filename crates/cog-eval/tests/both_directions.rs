@@ -12,15 +12,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use cog_core::LlmClient;
 use cog_eval::adapters::swe_pro::parse_test_list;
 use cog_eval::adapters::{SweProBackend, SweProTestReport, ToolathlonBackend, ToolathlonReport};
 use cog_eval::{
-    swe_pro_benchmark, toolathlon_benchmark, AgentOutput, AgentScaffold, CaseEnv, EvalCase,
-    Benchmark, FinishReason, NoEnv, Rig, RunConfig, SolveContext, SweProToolkit, Table,
-    ToolathlonToolkit,
-    DATA_ROOT_ENV, SWE_PRO_JSONL, TOOLATHLON_TASKS_DIR,
+    swe_pro_benchmark, toolathlon_benchmark, AgentOutput, AgentScaffold, Benchmark, CaseEnv,
+    EvalCase, FinishReason, NoEnv, Rig, RunConfig, SolveContext, SweProToolkit, Table,
+    ToolathlonToolkit, DATA_ROOT_ENV, SWE_PRO_JSONL, TOOLATHLON_TASKS_DIR,
 };
-use cog_core::LlmClient;
 
 /// 占位上游：这一条链上没有任何一步该碰模型。
 struct SilentLlm;
