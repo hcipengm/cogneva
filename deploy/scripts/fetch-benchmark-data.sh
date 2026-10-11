@@ -224,6 +224,32 @@ why_mismatch() {
   printf 'hash %s, catalog says %s' "$(sha256sum "$f" | cut -d' ' -f1)" "$want_sha"
 }
 
+# Download a URL into $part. Three things ride together here, and each covers a way the
+# transfer can wedge without ever failing loudly:
+#
+#   `-C -`  lets a later run continue from the partial. On an empty (or absent) partial curl
+#           sends no Range at all, so a first download is unaffected.
+#   `--speed-limit/--speed-time`  a connection that is up but not moving does not time out on
+#           its own, so `--retry` never gets a chance to act on it. 30 seconds below 1 KiB/s
+#           counts as dead (curl exits 28, which `--retry` does cover).
+#   exit 33 means the source does not serve byte ranges (gh-proxy does not). 33 is NOT in
+#           `--retry`'s set, so the partial would wedge every re-run at the same spot forever.
+#           Drop it and fetch from scratch once -- bounded, exactly once, and without `-C -`
+#           so no Range is sent again.
+curl_download() {
+  local url="$1" part="$2" label="$3" rc=0
+  local opts=(--retry 5 --retry-delay 3 --speed-limit 1024 --speed-time 30)
+
+  curl -fSL "${opts[@]}" -C - --no-progress-meter "$url" -o "$part" || rc=$?
+  if [ "$rc" -eq 33 ]; then
+    echo "  restart  $label: the source serves no byte ranges, dropping the partial"
+    rm -f "$part"
+    rc=0 # the first curl's code must not survive a successful restart
+    curl -fSL "${opts[@]}" --no-progress-meter "$url" -o "$part" || rc=$?
+  fi
+  return "$rc"
+}
+
 fetch_file() {
   local rel="$1" url="$2" want_sha="$3" want_size="$4"
   local out="$dest/$rel" part="$dest/$rel.part"
@@ -238,8 +264,8 @@ fetch_file() {
   fi
 
   [ -f "$part" ] && echo "  resume   $rel" || echo "  fetch    $rel  ($(numfmt --to=iec "$want_size"))"
-  curl -fSL --retry 5 --retry-delay 3 -C - --no-progress-meter "$url" -o "$part" ||
-    die "$rel failed to download (what arrived is in $part, re-running resumes it)"
+  curl_download "$url" "$part" "$rel" ||
+    die "$rel failed to download (what is left in $part only helps a later run if this source serves byte ranges)"
 
   if ! check_file "$part" "$want_sha" "$want_size"; then
     die "$rel does not match the catalog after download ($(why_mismatch "$part" "$want_sha" "$want_size"))"

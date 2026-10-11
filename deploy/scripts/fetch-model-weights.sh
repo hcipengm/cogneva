@@ -286,6 +286,26 @@ rel_target() {
   printf '%s/blobs' "$ups"
 }
 
+# 把 URL 取进 $part。三件事一起做，各治一种「不声不响卡死」：
+#   `-C -` 断了的下一次从分片续传（分片为空/不存在时 curl 不发 Range，首次下载不受影响）；
+#   `--speed-limit/--speed-time` 「连上但不动」的连接 curl 不会自己超时，也就轮不到 `--retry`
+#            —— 30 秒都跑不到 1 KiB/s 就当死（退 28，在 `--retry` 的集里）；
+#   退 33 = 这个源不支持 byte range。33 **不在** `--retry` 的重试集里，分片于是会把每次重跑
+#            都卡在同一处。撞上就丢掉分片、去掉 `-C -` 从零重来一次（有界，只一次）。
+curl_download() {
+  local url="$1" part="$2" label="$3" rc=0
+  local opts=(--retry 5 --retry-delay 3 --speed-limit 1024 --speed-time 30)
+
+  curl -fSL "${opts[@]}" -C - --no-progress-meter "$url" -o "$part" || rc=$?
+  if [ "$rc" -eq 33 ]; then
+    echo "  重下    $label：这个源不支持断点续传，丢掉分片从零重来"
+    rm -f "$part"
+    rc=0 # 第一次的退出码不能活过一次成功的重下
+    curl -fSL "${opts[@]}" --no-progress-meter "$url" -o "$part" || rc=$?
+  fi
+  return "$rc"
+}
+
 mkdir -p "$root/blobs" "$root/refs"
 
 echo "模型 $model（$source）仓库 $repo @ $commit → $root"
@@ -316,8 +336,8 @@ for file in "${files[@]}"; do
     else
       echo "  下载    $file  $(numfmt --to=iec "$expected_size")"
     fi
-    curl -fSL --retry 5 --retry-delay 3 -C - --no-progress-meter "$(download_url "$file")" -o "$part" ||
-      die "$file 下载失败（已下的字节留在 $part，重跑会续传）"
+    curl_download "$(download_url "$file")" "$part" "$file" ||
+      die "$file 下载失败（留在 $part 的分片只对支持断点续传的源有用）"
 
     got_size="$(stat -c%s "$part")"
     [ "$got_size" = "$expected_size" ] ||

@@ -68,6 +68,7 @@ hub="${work}/hub"
 log="${work}/requests.log"
 port_file="${work}/port"
 bogus_file="${work}/bogus"
+norange_file="${work}/norange"
 tarball="${work}/fixture-tree.tar.gz"
 : >"${log}"
 
@@ -81,7 +82,13 @@ tar -czf "${tarball}" -C "${work}/tree" toolathlon_gym-fixture
 cat >"${work}/serve.py" <<'PY'
 import http.server, os, sys, urllib.parse
 
-root, port_file, log, tarball, bogus_file = sys.argv[1:6]
+root, port_file, log, tarball, bogus_file, norange_file = sys.argv[1:7]
+
+def marker(path):
+    if os.path.isfile(path):
+        with open(path) as fh:
+            return {line.strip() for line in fh if line.strip()}
+    return set()
 
 def bogus_target():
     if os.path.isfile(bogus_file):
@@ -125,8 +132,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         # Range support, because the fetcher resumes with `curl -C -`: a server that answers
         # 200 to a ranged request would make the resume assertion test curl, not the script.
+        # A file named in the norange marker is served the way a proxy that cannot resume
+        # serves it -- 200 and the whole body even when a Range was asked for -- which is what
+        # makes curl exit 33 and is the case the fetcher has to dig itself out of.
         start = 0
         range_hdr = self.headers.get("Range")
+        if served in marker(norange_file):
+            range_hdr = None
         if range_hdr and range_hdr.startswith("bytes="):
             start = int(range_hdr[len("bytes="):].split("-")[0])
             if start >= len(data):
@@ -155,7 +167,7 @@ with open(port_file, "w") as fh:
 server.serve_forever()
 PY
 
-python3 "${work}/serve.py" "${hub}" "${port_file}" "${log}" "${tarball}" "${bogus_file}" &
+python3 "${work}/serve.py" "${hub}" "${port_file}" "${log}" "${tarball}" "${bogus_file}" "${norange_file}" &
 server_pid=$!
 for _ in $(seq 1 50); do [ -s "${port_file}" ] && break; sleep 0.1; done
 [ -s "${port_file}" ] || fail "fixture mirror did not start"
@@ -345,6 +357,26 @@ if [ -n "${have_pyarrow}" ]; then
 else
   echo "SKIP: pyarrow not importable, the parquet -> JSONL path was not exercised"
 fi
+
+# --- 10) a source that cannot resume is restarted, not wedged -----------------
+# `-C -` against a source that answers 200 to a ranged request makes curl exit 33, and 33 is
+# not in `--retry`'s set -- so a leftover `.part` would wedge every re-run at the same spot.
+# With a partial in place the fetcher must drop it and fetch from scratch, once.
+printf '%s\n' 'test.parquet' >"${norange_file}"
+restart_dest="${work}/restart-dest"
+mkdir -p "${restart_dest}/swe-bench-pro"
+head -c 1000 "${parquet_body}" >"${restart_dest}/swe-bench-pro/test.parquet.part"
+run swe-bench-pro "${restart_dest}" >"${work}/r10.log" 2>&1 || {
+  cat "${work}/r10.log" >&2
+  fail "a partial against a source with no byte ranges wedged the fetcher"
+}
+grep -q "restart" "${work}/r10.log" ||
+  fail "the fetcher did not report dropping the partial the source could not resume"
+cmp -s "${restart_dest}/swe-bench-pro/test.parquet" "${parquet_body}" ||
+  fail "the restarted download did not end up as the full body"
+[ ! -e "${restart_dest}/swe-bench-pro/test.parquet.part" ] ||
+  fail "the partial survived a successful restart"
+rm -f "${norange_file}"
 
 "${fetcher}" --help >/dev/null || fail "--help did not exit 0"
 "${fetcher}" --benchmark nope --print-files >/dev/null 2>&1 &&
