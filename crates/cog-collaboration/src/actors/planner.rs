@@ -176,7 +176,7 @@ impl PlannerActor {
                 "sub_tasks": [{
                     "id": "string: unique task id like t1, t2",
                     "name": "string: short task name",
-                    "task_type": "string: a skill id from task.input.skills, or a generic executor type",
+                    "task_type": "string: the id of the executor this sub-task should be handed to, from task.input.executors, or a generic executor type if none of them fits",
                     "input": {"query": "string: everything the executor needs to accomplish this task"},
                     "blocked_by": ["string: ids of tasks that must finish first, empty if none"]
                 }],

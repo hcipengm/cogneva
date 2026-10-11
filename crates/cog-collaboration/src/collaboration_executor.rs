@@ -242,6 +242,12 @@ impl cog_core::TaskExecutor for CollaborationExecutor {
         // be intercepted before the squad paths (the task carries no
         // evolution_mode marker, but routing it through a squad would waste a full
         // planner/generator/evaluator run on a one-shot JSON verdict).
+        //
+        // This kind, and the ones like it (`self_evolution`,
+        // `baseline_port_rework`), are platform-internal entry points: they are
+        // dispatched by name here, before anything consults the executor table,
+        // and they are not rows of it. A row says which kind of hand runs a
+        // sub-task; these say which of the platform's own flows produced a task.
         if let TaskType::Custom(kind) = &task.task_type {
             if kind == "platform_intent_assess" {
                 return self.execute_intent_assess(task).await;

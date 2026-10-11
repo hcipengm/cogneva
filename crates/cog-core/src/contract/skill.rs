@@ -3,6 +3,17 @@
 //!discovery, loading, hot-reload, and content serving.
 //!Skills are LLM-readable instruction documents (SKILL.md + scripts/)
 //!that extend agent capabilities without recompiling the main binary.
+//!
+//!Two different things share the word "skill" here, and reading one as the
+//!other is what made the registry look like a capability catalogue:
+//!
+//!- the **Markdown skill** above — an instruction document an agent reads;
+//!- [`SkillConfig`] — one row of the **executor table**: which kind of hand a
+//!  sub-task can be handed to, which tools that hand may call, and how many
+//!  iterations it gets. `SkillRegistry` holds these rows, and goal
+//!  decomposition reads exactly this table to learn the kinds of hand it may
+//!  name. It is not a list of what the system can do, and an empty table is a
+//!  legal state rather than a half-configured one.
 
 use crate::{
     storage::VectorBackend, AtomicTask, BoundaryReport, BoundaryRule, BoundaryViolation, RuleType,
@@ -200,11 +211,14 @@ impl SkillRegistry {
             })
     }
 
-    /// Insert an agent skill configuration.
+    /// Insert one row of the executor table.
     ///
-    /// Also mirrors the config into the planner-facing `skills` map so that
-    /// goal decomposition (`get_all`) sees every loaded agent skill — the two
-    /// maps must never drift apart ("Everything is a skill").
+    /// Also mirrors the row into the planner-facing `skills` map, because goal
+    /// decomposition reads the table through `get_all` — the two maps must never
+    /// drift apart. The mirror carries the row's kind in `description`, which is
+    /// the field the decomposition payload renders it through; it is the answer
+    /// to "which kind of hand", so it must not read as a claim about what that
+    /// hand can do.
     pub fn insert_skill_config(&mut self, skill: SkillConfig) {
         let mirrored = Skill {
             id: skill.skill_id.clone(),
@@ -555,6 +569,50 @@ mod tests {
             blocked_by: blocked_by.into_iter().map(String::from).collect(),
             blocks: blocks.into_iter().map(String::from).collect(),
         }
+    }
+
+    fn config(id: &str, role_type: &str, tools: Vec<&str>) -> SkillConfig {
+        SkillConfig {
+            skill_id: id.to_string(),
+            name: id.to_string(),
+            system_prompt: String::new(),
+            tools: tools.into_iter().map(String::from).collect(),
+            max_iterations: 10,
+            role_type: role_type.to_string(),
+        }
+    }
+
+    /// 分解载荷读的是镜像那条，所以镜像的 `description` 必须是种类本身：
+    /// 它一旦变成一句话，planner 读到的就不是「交给哪类手」。
+    #[test]
+    fn the_mirror_carries_the_executor_kind() {
+        let mut registry = SkillRegistry::new();
+        registry.insert_skill_config(config("gen-v2", "generator", vec!["write_file"]));
+
+        let mirrored = registry.get("gen-v2").expect("the row must be mirrored");
+        assert_eq!(mirrored.description, "generator");
+        assert_eq!(mirrored.tools, vec!["write_file".to_string()]);
+        assert_eq!(registry.get_skill("gen-v2").unwrap().role_type, "generator");
+        assert_eq!(
+            registry
+                .skill_for_role("generator")
+                .map(|s| s.skill_id.as_str()),
+            Some("gen-v2"),
+            "同一条也要按角色找得到：镜像与角色查找读的是同一行的两半"
+        );
+
+        // 两个面一起消失，不留一半：只删一个面会让「表是空的」与「镜像还在」同时为真。
+        registry.remove_skill_config("gen-v2");
+        assert!(registry.get("gen-v2").is_none());
+        assert!(registry.get_skill("gen-v2").is_none());
+    }
+
+    /// 空表是合法状态，不是半配置：没有登记哪类手时两张面都空，且查不到角色。
+    #[test]
+    fn an_empty_table_is_a_legal_state() {
+        let registry = SkillRegistry::new();
+        assert!(registry.get_all().is_empty());
+        assert!(registry.skill_for_role("generator").is_none());
     }
 
     fn default_rules() -> Vec<BoundaryRule> {

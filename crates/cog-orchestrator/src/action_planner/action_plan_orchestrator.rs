@@ -432,11 +432,13 @@ impl ActionPlanOrchestrator {
     ) -> SFResult<ActionPlan> {
         let skills = skill_registry.get_all();
         if skills.is_empty() {
-            // A fresh system has no distilled skills yet — that must not
-            // block its first goal. Decomposition proceeds with an empty
-            // capability list; skill-gap filling distills new skills from
-            // the execution results afterwards.
-            tracing::info!("Skill registry is empty; decomposing without skill context");
+            // The table this feeds is the executor registry: one entry per kind
+            // of hand a sub-task can be handed to. An empty table is a normal
+            // state (no kinds registered), not a half-configured system, so it
+            // must not block a goal — the planner then names a generic executor
+            // type instead of a registered one, which `atomic_task_to_task`
+            // reads the same way.
+            tracing::info!("the executor registry is empty; decomposing without a registered kind");
         }
 
         // Step 1.1: pattern retrieval (top-3 similar cases).
@@ -460,7 +462,10 @@ impl ActionPlanOrchestrator {
             // 拒绝的模式，于是模型拒答而链路把拒答当成生成器没产出。
             let mut task_input = serde_json::json!({
                 "goal": goal,
-                "skills": skills.iter().map(|s| serde_json::json!({
+                // 这份清单回答的是「这道子任务交给哪类手」，不是「平台有什么能力」：
+                // 每条就是执行器表里的一行，`description` 装的是它的种类（role_type）。
+                // 键名与 planner 提示词里那句同名，两处一起改。
+                "executors": skills.iter().map(|s| serde_json::json!({
                     "id": s.id,
                     "name": s.name,
                     "description": s.description,
@@ -572,13 +577,20 @@ impl ActionPlanOrchestrator {
     /// Convert an [`AtomicTask`] into a [`Task`] suitable for injection into
     /// [`DagExecutor`].
     ///
-    /// The role skill ids the registry seeds are lower-case (`planner`,
+    /// The role ids the registry seeds are lower-case (`planner`,
     /// `generator`, …), while the built-in [`TaskType`] variants are spelled
     /// capitalized. Match case-insensitively so a role id binds to its built-in
     /// type instead of degrading to `Custom("planner")` — the two only look
     /// alike where the type is rendered back to a string, and the binding is
     /// lost everywhere a real `TaskType` is read. An id that names no role
     /// stays `Custom(<id>)`, which is what a generic executor type wants.
+    ///
+    /// The id is the planner's answer to "which kind of hand", picked out of
+    /// the executor table it was handed in `task_input.executors`; this is where
+    /// that answer becomes the `TaskType` the pipeline routes on. The four names
+    /// below are the built-in kinds, and an id that matches none of them is not
+    /// a lookup failure — `Custom(<id>)` is a hand the registry does not have to
+    /// know about.
     fn atomic_task_to_task(at: &AtomicTask) -> Task {
         let task_type = match at.skill_id.as_deref() {
             Some(id) if id.eq_ignore_ascii_case("planner") => TaskType::Planner,
@@ -1873,14 +1885,98 @@ mod tests {
         assert!(!tokens.contains("a"));
     }
 
+    /// 没接执行器就没有东西能分解目标——这跟表里有没有行是两件事。
     #[tokio::test]
-    async fn test_empty_skill_registry_errors() {
+    async fn decomposition_without_a_task_executor_errors() {
         let registry = SkillRegistry::new();
         let orchestrator = ActionPlanOrchestrator::new();
         let result = orchestrator
             .decompose_goal("do something", &registry, None)
             .await;
         assert!(result.is_err());
+    }
+
+    /// 空表是合法状态：没有登记哪类手，planner 就点一个通用执行器种类。
+    #[tokio::test]
+    async fn an_empty_executor_table_still_decomposes() {
+        let registry = SkillRegistry::new();
+        assert!(registry.get_all().is_empty());
+        let orchestrator = ActionPlanOrchestrator::new().with_task_executor(make_mock_executor());
+        let plan = orchestrator
+            .decompose_goal("do something", &registry, None)
+            .await
+            .expect("an empty table must not block a goal");
+        assert_eq!(plan.tasks.len(), 1);
+        assert!(plan.skills.is_empty());
+    }
+
+    /// Mock [`TaskExecutor`] 会留住它收到的那个 [`Task`]，供断言载荷形状用。
+    struct CapturingTaskExecutor {
+        seen: std::sync::Mutex<Option<Task>>,
+        atomic_tasks: Vec<AtomicTask>,
+    }
+
+    #[async_trait::async_trait]
+    impl TaskExecutor for CapturingTaskExecutor {
+        fn supports(&self, _task_type: &TaskType) -> bool {
+            true
+        }
+
+        async fn execute(&self, task: &Task) -> SFResult<TaskResult> {
+            *self.seen.lock().unwrap() = Some(task.clone());
+            Ok(TaskResult {
+                success: true,
+                output: serde_json::json!({ "atomic_tasks": self.atomic_tasks }),
+                metadata: TaskResultMetadata::new("capturing").with_score(0.85),
+            })
+        }
+    }
+
+    /// 分解载荷交给 planner 的是执行器清单：键名说清「交给哪类手」，每条给的是种类。
+    #[tokio::test]
+    async fn the_decomposition_payload_hands_the_planner_the_executor_table() {
+        let executor = Arc::new(CapturingTaskExecutor {
+            seen: std::sync::Mutex::new(None),
+            atomic_tasks: vec![atomic_task("t1")],
+        });
+        let orchestrator = ActionPlanOrchestrator::new().with_task_executor(executor.clone());
+        let mut registry = SkillRegistry::new();
+        registry.insert_skill_config(cog_core::SkillConfig {
+            skill_id: "planner".into(),
+            name: "Planner".into(),
+            system_prompt: String::new(),
+            tools: vec!["read_file".into()],
+            max_iterations: 10,
+            role_type: "planner".into(),
+        });
+
+        orchestrator
+            .decompose_goal("build a website", &registry, None)
+            .await
+            .unwrap();
+
+        let seen = executor
+            .seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the executor must have been handed a task");
+        let rows = seen
+            .input
+            .get("executors")
+            .expect("the payload must name the executor table")
+            .as_array()
+            .expect("the executor table must render as a list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], "planner");
+        assert_eq!(
+            rows[0]["description"], "planner",
+            "交给 planner 的是这一行的种类，不是一段能力描述"
+        );
+        assert!(
+            seen.input.get("skills").is_none(),
+            "旧键名没有读者之后不该还留在载荷里"
+        );
     }
 
     fn atomic_task(id: &str) -> AtomicTask {

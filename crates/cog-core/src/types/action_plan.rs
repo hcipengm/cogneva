@@ -1,11 +1,19 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// A skill definition in the skill registry.
+/// One row of the executor table, as goal decomposition reads it.
+///
+/// This is the planner-facing mirror of [`SkillConfig`]: the same row, with the
+/// id, the name and the kind it registers — enough for the planner to name the
+/// kind of hand for a sub-task. It is not a statement of what the system can do.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 pub struct Skill {
     pub id: String,
     pub name: String,
+    /// The kind of hand this row registers. For a row mirrored from a
+    /// [`SkillConfig`] this is its `role_type`, and it is what the decomposition
+    /// payload hands the planner; a bare kind such as `planner`, never a
+    /// sentence about capabilities.
     pub description: String,
     pub tools: Vec<String>,
     #[serde(default)]
@@ -16,9 +24,17 @@ pub struct Skill {
     pub blocks: Vec<String>,
 }
 
-/// Agent skill configuration loaded dynamically from JSON.
-/// Defines the persona, tools, and runtime parameters for an agent role.
-/// Aligns with "Everything is a skill" architecture principle.
+/// One row of the executor table, loaded dynamically from JSON.
+///
+/// A row answers three questions: which kind of hand this is (`role_type`), what
+/// that hand may call (`tools`), and how many iterations it gets
+/// (`max_iterations`). Agents are configured from a row by role
+/// (`skill_for_role`), and goal decomposition is handed the rows so it can name
+/// the kind of hand for each sub-task.
+///
+/// The table is not a capability catalogue: it lists the hands that exist, and an
+/// empty table is legal — a run then declares no per-role tool boundary and the
+/// planner names a generic executor kind instead of a registered one.
 /// **Note:** `system_prompt` is deprecated. LLM calls must use structured
 /// JSON input via `cog_llm::execute_structured` instead of natural-language
 /// prompts. The field is retained only for backward-compatible deserialisation.
@@ -40,6 +56,13 @@ pub struct SkillConfig {
     pub tools: Vec<String>,
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,
+    /// The kind of hand this row registers — the dispatch key.
+    ///
+    /// Read in two places: [`crate::SkillRegistry::skill_for_role`] binds an
+    /// agent's role to its row, and goal decomposition hands it to the planner as
+    /// the row's `description`, which is how a sub-task ends up naming a kind of
+    /// hand. It is a kind name (`planner`, `generator`, …), not a capability
+    /// claim: the row's boundary is `tools`, next to it.
     pub role_type: String,
 }
 

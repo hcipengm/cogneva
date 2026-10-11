@@ -283,8 +283,9 @@ COPY --from=builder /build/crates/cog-storage/migrations /opt/cogneva/crates/cog
 # WebUI 静态资源（网关同源直接服务，浏览器打开即用）
 COPY --from=webbuilder /web/dist /opt/cogneva/web
 
-# 内置技能（planner/generator/evaluator）——自主执行流按技能分解目标，
-# 缺失时 Skill registry 为空，任务在调 LLM 前就失败
+# 执行器表的三行样例（planner/generator/evaluator）。表可以为空——空表时目标照常分解，
+# 只是 planner 点不到已登记的种类，且这几类手不再声明自己的工具边界（不声明＝拿整个注册表），
+# 所以镜像是带着样例发的，不是带着必需品。运维可以删、可以改、可以加自己的行。
 COPY skills /opt/cogneva/skills
 
 # Set ownership
