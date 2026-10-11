@@ -259,6 +259,21 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["dir", "layer"],
         "crates/cog-core/src/build_cache.rs",
     ),
+    // The size says how much a layer holds; this says how much of it a build
+    // rewrote inside the window. A build reusing its cache moves the count
+    // without moving the size, so the two together are what tells a warm build
+    // from one that had to rebuild -- and the window is read beside the count,
+    // because a bare number says how many files moved and not over how long.
+    (
+        "cogneva_build_target_rewritten_files",
+        &["dir", "layer"],
+        "crates/cog-core/src/build_cache.rs",
+    ),
+    (
+        "cogneva_build_target_rewrite_window_seconds",
+        &["dir"],
+        "crates/cog-core/src/build_cache.rs",
+    ),
     // The age of the reading above. Published separately because a failed walk
     // keeps the last size, so this is the only series that can tell a cache
     // nobody writes to from a scan loop that stopped.

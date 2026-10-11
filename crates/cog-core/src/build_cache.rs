@@ -21,6 +21,29 @@ pub const BUILD_TARGET_BYTES_METRIC: &str = "cogneva_build_target_bytes";
 /// Seconds since the cache was last measured.
 pub const BUILD_TARGET_SCAN_AGE_METRIC: &str = "cogneva_build_target_bytes_scan_age_seconds";
 
+/// Files the cache had rewritten within the recent window, per layer.
+///
+/// The companion to [`BUILD_TARGET_BYTES_METRIC`]: a layer's bytes say how much
+/// is held there, and this says how much of it is being rebuilt. A build that is
+/// recompiling what it compiled last time rewrites files without moving the size
+/// much, so the size alone reads the same for a build that reused the cache and
+/// one that had to rebuild it, and the count is what tells those apart. Read
+/// against the window that qualifies it.
+pub const BUILD_TARGET_REWRITTEN_METRIC: &str = "cogneva_build_target_rewritten_files";
+
+/// The window [`BUILD_TARGET_REWRITTEN_METRIC`] counts over, in seconds.
+pub const BUILD_TARGET_REWRITE_WINDOW_METRIC: &str = "cogneva_build_target_rewrite_window_seconds";
+
+/// How far back a file's last write may be and still count as rewritten.
+///
+/// An hour: a build that takes long enough to be worth attributing runs for tens
+/// of minutes, so a shorter window would show one build as a run of smaller
+/// ones, and a longer one would keep a finished build's churn in the reading
+/// after the next build had started. This is also the span the readings taken by
+/// hand off the host used, so a number read here is comparable with the ones
+/// already on record.
+pub const REWRITE_WINDOW_SECS: u64 = 3600;
+
 /// The cap the cache is held to, in bytes. Published only when one is set.
 pub const BUILD_TARGET_CAP_METRIC: &str = "cogneva_build_target_bytes_cap";
 
@@ -139,4 +162,43 @@ pub fn published_layers(layers: &std::collections::BTreeMap<String, u64>) -> Vec
     }
     out.push((OTHER_LAYER.to_string(), folded));
     out
+}
+
+/// `counts` folded onto the layer names [`published_layers`] gave `layers`.
+///
+/// The size series and the rewrite series are read side by side -- a layer whose
+/// bytes are named and whose count is folded cannot be put against the other --
+/// so they have to carry the same names. Which layers get their own name is the
+/// size series' call, because dropping a cache is a question about size, and a
+/// count is read about a layer the reader already decided to look at.
+///
+/// A layer `counts` does not mention reads as zero rather than as absent: both
+/// maps come from one walk, so a layer with bytes in it was written at some
+/// point, and no rewrite inside the window is a measurement, not a gap.
+pub fn published_layer_counts(
+    layers: &std::collections::BTreeMap<String, u64>,
+    counts: &std::collections::BTreeMap<String, u64>,
+) -> Vec<(String, u64)> {
+    let published = published_layers(layers);
+    // The fold is always the last entry, whether or not anything went into it.
+    let fold_at = published.len().saturating_sub(1);
+    let named: std::collections::BTreeSet<&str> = published[..fold_at]
+        .iter()
+        .map(|(layer, _)| layer.as_str())
+        .collect();
+    let folded: u64 = counts
+        .iter()
+        .filter(|(name, _)| !named.contains(name.as_str()))
+        .fold(0u64, |acc, (_, count)| acc.saturating_add(*count));
+    published
+        .into_iter()
+        .enumerate()
+        .map(|(index, (layer, _))| {
+            if index == fold_at {
+                (layer, folded)
+            } else {
+                (layer.clone(), counts.get(&layer).copied().unwrap_or(0))
+            }
+        })
+        .collect()
 }

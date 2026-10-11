@@ -71,6 +71,12 @@
 //! - `cogneva_build_target_scan_interval_seconds{dir}` -- the configured
 //!   interval, so a rule can say "no pass in six intervals" without a constant
 //!   that goes stale when the interval is configured differently.
+//! - `cogneva_build_target_rewritten_files{dir,layer}` -- files each layer had
+//!   rewritten within `cogneva_build_target_rewrite_window_seconds{dir}` of the
+//!   last walk. The size series says how much a layer holds and this says how
+//!   much of it is being rebuilt; a build recompiling what it compiled last time
+//!   moves the count without moving the size, which is what a reader watching a
+//!   build reuse its cache needs and the size alone cannot say.
 //!
 //! Only the process that owns the directory publishes it, which is the process
 //! that runs builds: a deployment with no builder has no cache to report rather
@@ -176,6 +182,13 @@ struct ReclaimState {
 pub struct BuildCacheReadings {
     dir: PathBuf,
     layers: Mutex<BTreeMap<String, u64>>,
+    /// Files each layer had rewritten within [`REWRITE_WINDOW_SECS`] of the last
+    /// completed walk, from the same walk as `layers`.
+    ///
+    /// Kept beside the sizes rather than derived from them: the two answer
+    /// different questions about one tree, and a size that did not move still
+    /// says nothing about whether the layer was rebuilt.
+    rewritten: Mutex<BTreeMap<String, u64>>,
     /// Unix seconds of the last completed walk; 0 before one has happened.
     scanned_at: AtomicU64,
     /// Bytes the cache may hold, or 0 when it is measured but not bounded.
@@ -203,6 +216,7 @@ impl BuildCacheReadings {
         Self {
             dir: dir.into(),
             layers: Mutex::new(BTreeMap::new()),
+            rewritten: Mutex::new(BTreeMap::new()),
             scanned_at: AtomicU64::new(0),
             cap_bytes: 0,
             scan_interval_secs: 0,
@@ -247,6 +261,17 @@ impl BuildCacheReadings {
             .store(scanned_at_unix_secs, Ordering::Release);
     }
 
+    /// Record the rewrite counts of one completed walk.
+    ///
+    /// Separate from [`Self::set_layers`] rather than carried in one call: the
+    /// size and the count are separate readings, and a caller that has one but
+    /// not the other -- a test seeding a size to read the cap family -- should be
+    /// able to set it without also claiming anything about rewrites.
+    pub fn set_rewritten(&self, rewritten: BTreeMap<String, u64>) {
+        let mut held = self.rewritten.lock().unwrap_or_else(|e| e.into_inner());
+        *held = rewritten;
+    }
+
     /// The last measurement, or `None` before one has happened.
     ///
     /// Not an empty map: a cache that reads as zero bytes before anything was
@@ -287,7 +312,13 @@ impl BuildCacheReadings {
                 .await;
         match walked {
             Ok(Ok(files)) => {
-                self.set_layers(fs_size::layer_totals(&files), unix_now());
+                let now = unix_now();
+                self.set_layers(fs_size::layer_totals(&files), now);
+                self.set_rewritten(fs_size::recently_written_totals(
+                    &files,
+                    now,
+                    REWRITE_WINDOW_SECS,
+                ));
                 self.enforce_cap(&files, slot).await;
             }
             Ok(Err(e)) => warn!(
@@ -515,6 +546,31 @@ impl Observable for BuildCacheReadings {
                         .with_label(LAYER_LABEL, layer)
                 }),
         );
+        // The same layers, and only the same layers: the fold here follows the
+        // one the sizes took, so a layer a reader can see the size of is a layer
+        // it can see the rewrite count of, and neither series names a layer the
+        // other folded away.
+        let rewritten = self
+            .rewritten
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        out.extend(
+            crate::build_cache::published_layer_counts(&layers, &rewritten)
+                .into_iter()
+                .map(|(layer, count)| {
+                    RawMetric::new(BUILD_TARGET_REWRITTEN_METRIC, count as f64)
+                        .with_label(DIR_LABEL, dir.clone())
+                        .with_label(LAYER_LABEL, layer)
+                }),
+        );
+        out.push(
+            RawMetric::new(
+                BUILD_TARGET_REWRITE_WINDOW_METRIC,
+                REWRITE_WINDOW_SECS as f64,
+            )
+            .with_label(DIR_LABEL, dir.clone()),
+        );
         if let Some(age) = self.scan_age_secs(unix_now()) {
             out.push(
                 RawMetric::new(BUILD_TARGET_SCAN_AGE_METRIC, age as f64)
@@ -662,6 +718,101 @@ mod tests {
                 ("other".to_string(), 0),
                 ("tmp".to_string(), 1),
             ]
+        );
+    }
+
+    /// The rewrite counts come out against exactly the layers the sizes named,
+    /// so a reader can put one series against the other. A layer the size series
+    /// folded must not be named here, and one it named must not be folded here.
+    #[tokio::test]
+    async fn the_rewrite_counts_are_published_against_the_layers_the_sizes_named() {
+        let readings = readings_with(&[("debug/deps", 900), ("release/deps", 100)]);
+        readings.set_rewritten(
+            [("debug/deps", 40u64), ("release/deps", 2u64)]
+                .into_iter()
+                .map(|(name, count)| (name.to_string(), count))
+                .collect(),
+        );
+
+        let metrics = readings.collect_metrics("").await.unwrap();
+        let layer_of = |name: &str| -> Vec<String> {
+            metrics
+                .iter()
+                .filter(|m| m.name == name)
+                .map(|m| m.labels.get(LAYER_LABEL).cloned().unwrap_or_default())
+                .collect()
+        };
+        assert_eq!(
+            layer_of(BUILD_TARGET_REWRITTEN_METRIC),
+            layer_of(BUILD_TARGET_BYTES_METRIC)
+        );
+        let counts: Vec<(String, u64)> = metrics
+            .iter()
+            .filter(|m| m.name == BUILD_TARGET_REWRITTEN_METRIC)
+            .map(|m| {
+                (
+                    m.labels.get(LAYER_LABEL).cloned().unwrap_or_default(),
+                    m.value as u64,
+                )
+            })
+            .collect();
+        assert_eq!(
+            counts,
+            vec![
+                ("debug/deps".to_string(), 40),
+                ("release/deps".to_string(), 2),
+                (OTHER_LAYER.to_string(), 0),
+            ]
+        );
+        // The window travels with the count: a bare number says how many files
+        // moved but not over how long, which is the whole of what it means.
+        assert_eq!(
+            reading(&readings, BUILD_TARGET_REWRITE_WINDOW_METRIC, None).await,
+            Some(REWRITE_WINDOW_SECS as f64)
+        );
+    }
+
+    /// A layer the size series folded keeps its count in the folded series, so
+    /// folding the names does not quietly drop the rewrites that happened in the
+    /// layers that lost their name.
+    #[tokio::test]
+    async fn rewrites_in_a_folded_layer_are_counted_in_the_fold() {
+        let many: Vec<(String, u64)> = (0..MAX_PUBLISHED_LAYERS + 3)
+            .map(|i| (format!("layer-{i:02}"), (i as u64 + 1) * 10))
+            .collect();
+        let readings = BuildCacheReadings::new("/nonexistent-cache");
+        readings.set_layers(many.iter().cloned().collect(), unix_now());
+        // The three smallest layers are the ones the size series folds; the
+        // largest keeps its own name.
+        readings.set_rewritten(
+            [
+                ("layer-00", 7u64),
+                ("layer-01", 5u64),
+                ("layer-02", 3u64),
+                ("layer-14", 11u64),
+            ]
+            .into_iter()
+            .map(|(name, count)| (name.to_string(), count))
+            .collect(),
+        );
+
+        let metrics = readings.collect_metrics("").await.unwrap();
+        let count_of = |layer: &str| -> Option<u64> {
+            metrics
+                .iter()
+                .filter(|m| m.name == BUILD_TARGET_REWRITTEN_METRIC)
+                .find(|m| m.labels.get(LAYER_LABEL).map(String::as_str) == Some(layer))
+                .map(|m| m.value as u64)
+        };
+        assert_eq!(
+            count_of("layer-14"),
+            Some(11),
+            "a named layer keeps its count"
+        );
+        assert_eq!(
+            count_of(OTHER_LAYER),
+            Some(7 + 5 + 3),
+            "the rewrites of the folded layers are counted in the fold"
         );
     }
 
@@ -1065,6 +1216,12 @@ mod tests {
         // No walk has happened, so nothing claims to have measured the cache.
         assert!(!names.contains(&BUILD_TARGET_OVER_LIMIT_METRIC));
         assert!(!names.contains(&BUILD_TARGET_BYTES_METRIC));
+        // The rewrite count is a walk's finding too, so it is absent with the
+        // size rather than published as zero: "nothing was rewritten" and
+        // "nothing has been walked" are different states, and a zero here would
+        // read as a cache every build had reused.
+        assert!(!names.contains(&BUILD_TARGET_REWRITTEN_METRIC));
+        assert!(!names.contains(&BUILD_TARGET_REWRITE_WINDOW_METRIC));
         // No pass has happened either, and this series says when one last did.
         // The epoch is the answer to "never"; the process start is not an answer
         // to that question at all, and it is the plausible one -- a reader (or the

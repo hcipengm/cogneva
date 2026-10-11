@@ -185,6 +185,46 @@ pub fn counted_bytes(files: &[FileEntry]) -> u64 {
         .fold(0u64, |acc, entry| acc.saturating_add(entry.len))
 }
 
+/// How many of one walk's entries were written within `window_secs` of
+/// `now_unix_secs`, totalled by the same layer rule as [`layer_totals`].
+///
+/// Files, not bytes: a build that recompiled a crate rewrites the same artifacts
+/// it wrote last time, so the bytes barely move while the count says how much of
+/// the cache was rebuilt. That is the reading that separates a hot build from a
+/// cold one, and it comes off the walk the size already needs rather than a
+/// second pass over the tree.
+///
+/// An entry with no modification time is not counted: it is not evidence that
+/// nothing was written there, only that nothing can be said about it. Aliases
+/// are skipped for the reason [`counted_bytes`] skips them -- one file written
+/// once is one write, however many names it has.
+pub fn recently_written_totals(
+    files: &[FileEntry],
+    now_unix_secs: u64,
+    window_secs: u64,
+) -> BTreeMap<String, u64> {
+    let cutoff = now_unix_secs.saturating_sub(window_secs);
+    let mut totals: BTreeMap<String, u64> = BTreeMap::new();
+    for entry in files {
+        if entry.alias {
+            continue;
+        }
+        let Some(modified) = entry.modified else {
+            continue;
+        };
+        let written_at = modified
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|since| since.as_secs())
+            .unwrap_or(0);
+        if written_at < cutoff {
+            continue;
+        }
+        let total = totals.entry(entry.layer.clone()).or_default();
+        *total = total.saturating_add(1);
+    }
+    totals
+}
+
 /// The one traversal both readings are built from.
 fn walk(
     dir: &Path,
@@ -481,5 +521,62 @@ mod tests {
                 assert!(result.is_err(), "{result:?}");
             }
         }
+    }
+
+    fn set_modified(path: &Path, at: SystemTime) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    }
+
+    /// The count is of writes inside the window, by layer, and a file written
+    /// before the window is not counted -- otherwise a build that reused the
+    /// cache would read the same as one that rebuilt it.
+    #[test]
+    fn only_writes_inside_the_window_are_counted() {
+        let root = scratch("recent");
+        let now = SystemTime::now();
+        let now_secs = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        write(&root.join("debug/deps/a.rlib"), 10);
+        write(&root.join("debug/deps/b.rlib"), 10);
+        write(&root.join("release/deps/c.rlib"), 10);
+        let old = root.join("release/deps/old.rlib");
+        write(&old, 10);
+        set_modified(&old, now - std::time::Duration::from_secs(2 * 3600));
+
+        let files = dir_files(&root, 2, &[]).unwrap();
+        let counts = recently_written_totals(&files, now_secs, 3600);
+        assert_eq!(counts.get("debug/deps"), Some(&2));
+        assert_eq!(
+            counts.get("release/deps"),
+            Some(&1),
+            "the file written before the window is left out"
+        );
+    }
+
+    /// A file with no modification time is not evidence of a write, so it is
+    /// left out rather than counted as recent.
+    #[test]
+    fn a_file_without_a_timestamp_is_not_counted() {
+        let now_secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let entry = FileEntry {
+            path: PathBuf::from("debug/deps/x"),
+            layer: "debug/deps".to_string(),
+            len: 1,
+            modified: None,
+            id: None,
+            links: None,
+            alias: false,
+        };
+        assert!(recently_written_totals(&[entry], now_secs, 3600).is_empty());
     }
 }

@@ -1321,6 +1321,37 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 36,
+          "title": "Build Cache Rewrites by Layer",
+          "description": "Files each layer of the shared build cache had rewritten within the last hour, by directory and layer, over 6h. The companion to the bytes panel: the size says how much a layer holds and this says how much of it is being rebuilt, and the two are read together because a build that recompiles what it compiled last time rewrites files without moving the size -- so the size alone reads the same for a build that reused its cache and one that had to rebuild it, and this count is what tells those apart. A spike across a whole deps layer is a cold build, which is the reading a build that took tens of minutes has to be attributed to; a flat line near zero is a build reusing the cache. The window travels beside the count as cogneva_build_target_rewrite_window_seconds, because a bare number says how many files moved and not over how long. Kept per directory for the reason the bytes panel is: the same path is mounted from different volumes and a sum would put two caches into one number.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 136
+          },
+          "targets": [
+            {
+              "expr": "sum by (dir, layer) (cogneva_build_target_rewritten_files)",
+              "legendFormat": "{{dir}} {{layer}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {
