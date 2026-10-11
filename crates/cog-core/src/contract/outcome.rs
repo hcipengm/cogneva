@@ -96,6 +96,13 @@ pub fn is_deterministic_failure(reason: &str) -> bool {
     if !declares(reason, TERMINAL_ENV_FAILURE_PREFIX) {
         return false;
     }
+    // The iteration-budget marker rides inside the terminal envelope when a
+    // role translates its spent ReAct budget into an environment error. It is
+    // not a deterministic cause: the per-role adaptive budget is raised from
+    // exactly this observation, so the next attempt runs with more room.
+    if declares(reason, ITERATION_BUDGET_EXHAUSTED_MARKER) {
+        return false;
+    }
     match UpstreamFailure::named_in(reason) {
         // A refusal the environment can clear by itself is a failure to come
         // back to, not one to give up on.
