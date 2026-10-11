@@ -132,6 +132,16 @@ pub struct ChangeExecutionWorld {
     /// that can differ from the one the request was built against.
     #[serde(default = "cog_core::SelfEvolutionConfig::default_test_command")]
     pub test_command: Vec<String>,
+    /// The command that checks a change's tree against this deployment's
+    /// formatter, or `None` for this workspace's own formatter. Travels with the
+    /// world for the same reason the test command does: the request is built and
+    /// run by two processes, and a second read of the config is a second value.
+    #[serde(default)]
+    pub fmt_check_command: Option<Vec<String>>,
+    /// The command that lints a change's tree, or `None` for this workspace's
+    /// own linter. Travels with the world for the same reason.
+    #[serde(default)]
+    pub lint_command: Option<Vec<String>>,
     pub build_timeout_secs: u64,
     pub auto_apply: bool,
     pub manual_approve: bool,
@@ -566,6 +576,8 @@ async fn run_in(
     .with_verification_budget(budget.clone())
     .with_promotion_policy(world.promotion.clone())
     .with_test_command(world.test_command.clone())
+    .with_fmt_check_command(world.fmt_check_command.clone())
+    .with_lint_command(world.lint_command.clone())
     .with_target_dir(world.target_dir.as_path());
     let deployer = EvolutionDeployer::new(
         world.project_root.as_path(),
@@ -1517,6 +1529,8 @@ mod tests {
             backup_dir: PathBuf::from("/opt/cogneva/bin/backups"),
             test_timeout_secs: 3600,
             test_command: cog_core::SelfEvolutionConfig::default_test_command(),
+            fmt_check_command: None,
+            lint_command: None,
             build_timeout_secs: 3600,
             auto_apply: true,
             manual_approve: false,

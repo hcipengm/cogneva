@@ -1257,6 +1257,33 @@ pub struct SelfEvolutionConfig {
     /// an empty list is refused where it is read, because a change accepted
     /// with no command run is not a change that passed anything.
     pub test_command: Vec<String>,
+    /// The command that answers whether a change's tree is what this project's
+    /// formatter produces, as argv — program and arguments, not a shell line,
+    /// so a configured value cannot become one.
+    ///
+    /// Omitted: this workspace's own formatter, the invocation every deployment
+    /// ran while this was hardcoded. That one is a pair of commands, because
+    /// cargo fmt can rewrite the tree it is asked about; a change that arrives
+    /// unformatted is conformed here rather than sent back a round for it.
+    /// Declared: this project's formatter, run as given, and as a check only —
+    /// a declared command is never assumed to be able to rewrite anything, so
+    /// the tree it is asked about has to already be what it produces.
+    /// Empty: this project has no formatter. The stage does not run, and the
+    /// change's own evidence says the stage did not run, because a judge that
+    /// never spoke and one that spoke and found nothing are different readings.
+    pub fmt_check_command: Option<Vec<String>>,
+    /// The command that lints a change's tree, as argv.
+    ///
+    /// Omitted: this workspace's own linter. It is the only one whose findings
+    /// can be compared against the lines the change wrote, because that
+    /// comparison reads the compiler's diagnostic interchange.
+    /// Declared: this project's linter, whose exit status is the verdict on
+    /// this tree. Its findings can be excused as the tree's own only when it
+    /// speaks that same interchange; a linter that refuses a tree in any other
+    /// form refuses the change, since nothing here can show the findings are
+    /// not the change's.
+    /// Empty: this project has no linter, recorded as the stage not running.
+    pub lint_command: Option<Vec<String>>,
     pub build_timeout_secs: u64,
     pub poll_interval_secs: u64,
     /// 反思条目的归档与它的派生层（schema）是两次独立写，第二次失败或中途
@@ -1327,6 +1354,8 @@ impl Default for SelfEvolutionConfig {
             health_check_max_retries: 6,
             test_timeout_secs: 3600,
             test_command: Self::default_test_command(),
+            fmt_check_command: None,
+            lint_command: None,
             build_timeout_secs: 3600,
             poll_interval_secs: 60,
             schema_repair_interval_secs: 600,
@@ -1593,5 +1622,45 @@ mod tests {
             unset.test_command,
             SelfEvolutionConfig::default_test_command()
         );
+    }
+
+    /// The formatter and linter are configurable the same way, with the same
+    /// default: omitted means this workspace's own, which is what every
+    /// deployment ran while the stage was hardcoded. An explicit empty list is
+    /// not the same as omitting the key — the type has to keep those two
+    /// readings apart so the stage can tell "no formatter" from "the built-in
+    /// one".
+    #[test]
+    fn the_formatter_and_linter_default_to_the_workspaces_own_and_can_be_set() {
+        let default = SelfEvolutionConfig::default();
+        assert_eq!(default.fmt_check_command, None);
+        assert_eq!(default.lint_command, None);
+
+        let configured: SelfEvolutionConfig = serde_json::from_value(serde_json::json!({
+            "fmt_check_command": ["ruff", "format", "--check", "."],
+            "lint_command": ["ruff", "check", "."],
+        }))
+        .expect("configured commands parse");
+        assert_eq!(
+            configured.fmt_check_command,
+            Some(["ruff", "format", "--check", "."].map(String::from).to_vec())
+        );
+        assert_eq!(
+            configured.lint_command,
+            Some(["ruff", "check", "."].map(String::from).to_vec())
+        );
+
+        let declared_absent: SelfEvolutionConfig = serde_json::from_value(serde_json::json!({
+            "fmt_check_command": [],
+            "lint_command": [],
+        }))
+        .expect("an explicit empty declaration parses");
+        assert_eq!(declared_absent.fmt_check_command, Some(Vec::new()));
+        assert_eq!(declared_absent.lint_command, Some(Vec::new()));
+
+        // Omitted still loads: the key must not be required.
+        let unset: SelfEvolutionConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(unset.fmt_check_command, None);
+        assert_eq!(unset.lint_command, None);
     }
 }

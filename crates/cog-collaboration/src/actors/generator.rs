@@ -473,6 +473,7 @@ fn change_generation_contract() -> serde_json::Value {
             "test_run_unavailable": "no_diff_can_avoid_it: the verification suite needs the host's build slot; when it cannot be had the change is refused without being judged, which no wording of a diff can change",
             "tests_failed": "verification",
             "lint_introduced": "lint",
+            "lint_refused": "no_diff_can_avoid_it: the linter this deployment declares reports in a form the gate cannot compare against the lines a diff writes, so no diff can be shown not to have caused its findings; the deployment's declaration is what decides this, not the wording of a change",
             "unreachable_default": "effect"
         }
     })

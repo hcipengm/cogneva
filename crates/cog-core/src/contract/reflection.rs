@@ -169,6 +169,18 @@ pub enum RejectionCause {
     /// The attribution is by position: the diagnostic's span overlaps a line
     /// this change writes.
     LintIntroduced,
+    /// The tree's linter refused it, and its findings are in no form this
+    /// pipeline can compare against the lines the change wrote.
+    ///
+    /// Only the compiler's diagnostic interchange lets a finding be attributed
+    /// to a line, and that attribution is what separates a lint the change
+    /// wrote from one the tree already carried. A declared linter that refuses
+    /// a tree without speaking that interchange leaves nothing to excuse its
+    /// findings as the tree's own, and reading it as a change no linter
+    /// reported on would be the reading a linter that never ran produces —
+    /// so the change is refused instead. A deployment whose linter cannot be
+    /// attributed either declares one that can, or declares none.
+    LintRefused,
     /// The change writes a value nothing can read: every line it writes is a
     /// literal inside an `impl Default for *Config`, and every configuration
     /// document a deployment ships writes that key in that config's section.
@@ -195,6 +207,7 @@ impl RejectionCause {
         Self::TestRunUnavailable,
         Self::TestsFailed,
         Self::LintIntroduced,
+        Self::LintRefused,
         Self::UnreachableDefault,
     ];
 
@@ -211,6 +224,7 @@ impl RejectionCause {
             Self::TestRunUnavailable => "test_run_unavailable",
             Self::TestsFailed => "tests_failed",
             Self::LintIntroduced => "lint_introduced",
+            Self::LintRefused => "lint_refused",
             Self::UnreachableDefault => "unreachable_default",
         }
     }
@@ -1016,16 +1030,9 @@ pub fn introduced_lints(
     let mut seen: BTreeSet<(String, String, u64)> = BTreeSet::new();
 
     for line in transcript.lines() {
-        let line = line.trim();
-        if !line.starts_with('{') {
-            continue;
-        }
-        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+        let Some(record) = compiler_message_record(line) else {
             continue;
         };
-        if record.get("reason").and_then(|r| r.as_str()) != Some("compiler-message") {
-            continue;
-        }
         let Some(message) = record.get("message") else {
             continue;
         };
@@ -1097,6 +1104,39 @@ pub fn introduced_lints(
         .introduced
         .sort_by(|a, b| (&a.file, a.line, &a.code).cmp(&(&b.file, b.line, &b.code)));
     attribution
+}
+
+/// One record of a linter's machine-readable transcript, if the line is one.
+///
+/// A `--message-format=json` transcript is one JSON object per line, and the
+/// compiler marks each diagnostic with `reason == "compiler-message"`. Reading
+/// that marker in one place keeps "this transcript speaks the interchange" and
+/// "here are its findings" from disagreeing about what counts as a record.
+fn compiler_message_record(line: &str) -> Option<serde_json::Value> {
+    let line = line.trim();
+    if !line.starts_with('{') {
+        return None;
+    }
+    let record: serde_json::Value = serde_json::from_str(line).ok()?;
+    if record.get("reason").and_then(|r| r.as_str()) != Some("compiler-message") {
+        return None;
+    }
+    Some(record)
+}
+
+/// Whether a transcript is in the compiler's diagnostic interchange at all.
+///
+/// A finding can be attributed to the line that wrote it only through that
+/// interchange: it is where a diagnostic's span is written down. A linter that
+/// refuses a tree without speaking it has left nothing that can separate the
+/// findings it reports from the ones the tree already carried, so a reader that
+/// would otherwise fall back to "no findings" asks this first — a linter that
+/// never spoke and one that spoke and found nothing are different readings, and
+/// only one of them is true.
+pub fn has_compiler_messages(transcript: &str) -> bool {
+    transcript
+        .lines()
+        .any(|line| compiler_message_record(line).is_some())
 }
 
 /// Whether a diagnostic code is one of rustc's numbered errors rather than a
@@ -2540,6 +2580,7 @@ mod tests {
                 RejectionCause::TestRunUnavailable => "test_run_unavailable",
                 RejectionCause::TestsFailed => "tests_failed",
                 RejectionCause::LintIntroduced => "lint_introduced",
+                RejectionCause::LintRefused => "lint_refused",
                 RejectionCause::UnreachableDefault => "unreachable_default",
             };
             assert_eq!(cause.as_str(), spelling, "{cause:?} spells two ways");
@@ -2551,7 +2592,7 @@ mod tests {
             assert!(!seen.contains(&spelling), "{spelling} is in the list twice");
             seen.push(spelling);
         }
-        assert_eq!(seen.len(), 11, "ALL is missing a cause: {seen:?}");
+        assert_eq!(seen.len(), 12, "ALL is missing a cause: {seen:?}");
         for (index, cause) in RejectionCause::ALL.iter().enumerate() {
             assert_eq!(cause.slot(), index, "{cause:?} does not sit at {index}");
         }
@@ -3287,6 +3328,33 @@ impl Default for MetricsConfig {
             introduced_lints(&diff_added_lines(CHANGED), "not json\n\n"),
             LintAttribution::default()
         );
+    }
+
+    /// Whether a transcript speaks the interchange is a separate question from
+    /// what it attributes: a reader that would otherwise fall back to "no
+    /// findings" asks this first, so silence and an absence of findings stay
+    /// apart. A transcript of records that name no lint code still speaks it —
+    /// that is a compiler error, not a linter that never spoke.
+    #[test]
+    fn only_the_compilers_own_records_speak_the_interchange() {
+        assert!(!has_compiler_messages(""));
+        assert!(!has_compiler_messages("not json\n"));
+        assert!(!has_compiler_messages(
+            "{\"reason\":\"build-finished\",\"success\":true}"
+        ));
+        assert!(has_compiler_messages(
+            "{\"reason\":\"compiler-artifact\",\"target\":{}}\n\
+             {\"reason\":\"compiler-message\",\"message\":{\"level\":\"error\",\"code\":null}}"
+        ));
+        // A record with a code but no span still speaks the interchange: it is
+        // the marker that decides, not whether a finding can be placed.
+        assert!(has_compiler_messages(&compiler_message(
+            "warning",
+            Some("dead_code"),
+            "crates/cog-core/src/lib.rs",
+            12,
+            12
+        )));
     }
 
     /// The four levels must stay distinguishable on the ten-point scale. A

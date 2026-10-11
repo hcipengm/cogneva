@@ -71,6 +71,48 @@ const VERIFICATION_ENV_PASSTHROUGH: &[&str] = &[
 /// outlives this bound is a hung `rustfmt`, not a large workspace.
 pub(crate) const DEFAULT_FMT_TIMEOUT_SECS: u64 = 60;
 
+/// The formatter this workspace's deployments ran while the stage was
+/// hardcoded, in the three forms the stage needs: a probe that settles whether
+/// there is a formatter to ask at all, a check that answers whether the tree is
+/// what it produces, and the rewrite that makes it so.
+///
+/// A deployment that is not a Rust workspace declares its own in
+/// `self_evolution.fmt_check_command` — one command, the check, because a
+/// declared formatter is not assumed to be able to rewrite anything. The probe
+/// has no declared counterpart: a command that cannot be started is already the
+/// answer it exists to give.
+const BUILTIN_FMT_PROBE: &[&str] = &["cargo", "fmt", "--version"];
+const BUILTIN_FMT_CHECK: &[&str] = &["cargo", "fmt", "--all", "--", "--check"];
+const BUILTIN_FMT_CONFORM: &[&str] = &["cargo", "fmt", "--all"];
+
+/// The linter this workspace's deployments ran while the stage was hardcoded.
+/// `--message-format=json` is what makes its findings comparable against the
+/// lines a change wrote, and it changes what the run says, not what it finds.
+const BUILTIN_LINT: &[&str] = &[
+    "cargo",
+    "clippy",
+    "--workspace",
+    "--message-format=json",
+    "--",
+    "-D",
+    "warnings",
+];
+
+/// The sentence a change's own record carries when its deployment declares no
+/// linter.
+///
+/// A linter that never ran and a linter that ran and found nothing are
+/// different readings, and only one of them is true here: declaring none is
+/// that fact, written where the verdict is read, rather than left to be
+/// inferred from a run that was never refused.
+const NO_LINTER_NOTE: &str =
+    "This deployment declares no linter: the change was not checked against one.";
+
+/// The built-in linter as it is named in a change's evidence: the command a
+/// reader recognises, not the full argv that carries `--message-format=json`
+/// and the warning promotion.
+const BUILTIN_LINT_LINE: &str = "cargo clippy --workspace";
+
 /// [`ChangePipeline::run_cargo_fmt`] 里最多几趟命令：探针、判、改写、复判。
 /// 判干净就提前返回，所以这是上界不是次数。
 const FMT_CMDS_PER_RUN_FMT: u64 = 4;
@@ -235,6 +277,39 @@ enum FailureAttribution {
 /// methods, and spelling it out each time hides which part is the reading.
 type BaselineFailures = Option<(String, BTreeSet<String>)>;
 
+/// What this deployment's formatting stage read for a tree.
+#[derive(Debug)]
+enum FormatVerdict {
+    /// The tree is what the formatter produces. `rewritten` says whether the
+    /// stage had to conform it — only the built-in formatter can. `note` is
+    /// what the change's own record carries about the stage: empty for the
+    /// built-in formatter, whose evidence is reported when it refuses, and a
+    /// sentence for a deployment that declares its own or none, because a
+    /// change verified without a formatter has to be readable as that.
+    Conformed { rewritten: bool, note: String },
+    /// The tree is not what the formatter produces. The change is refused, and
+    /// this is the evidence the refusal carries.
+    Differs(String),
+}
+
+/// What this deployment's lint stage read for a tree.
+#[derive(Debug)]
+enum LintVerdict {
+    /// The linter found nothing on this tree. The string is the sentence the
+    /// change's record carries.
+    Clean(String),
+    /// The linter reports on this tree in the compiler's diagnostic
+    /// interchange, which is the one form whose findings can be compared
+    /// against the lines the change wrote. `line` is the command, so the note
+    /// this produces names the judge that spoke rather than this crate's.
+    Attributable { line: String, output: String },
+    /// The linter reports on this tree in a form nothing here can compare, so
+    /// no finding can be shown to be the tree's own.
+    Unattributable(String),
+    /// This deployment declares no linter.
+    NotDeclared,
+}
+
 /// Pipeline that turns validated code changes into tested source changes.
 #[derive(Debug, Clone)]
 pub struct ChangePipeline {
@@ -251,6 +326,15 @@ pub struct ChangePipeline {
     /// project that is not one has to say so here rather than be judged by a
     /// command that cannot run in its tree.
     test_command: Vec<String>,
+    /// The command that judges the tree's formatting, when the deployment
+    /// declares one. `None` means this workspace's own formatter, which is the
+    /// built-in pair below: it answers both whether the tree is what it
+    /// produces and the rewrite that makes it so.
+    fmt_check_command: Option<Vec<String>>,
+    /// The command that lints the tree, when the deployment declares one.
+    /// `None` means this workspace's own linter, the only one whose findings
+    /// this pipeline can compare against the lines the change wrote.
+    lint_command: Option<Vec<String>>,
     /// Wall-clock bound on the format check. Short on purpose: the check does
     /// not compile anything, so a run this side of the bound is a hung process
     /// rather than a slow one — and a hung process would hold the executor's
@@ -380,6 +464,8 @@ impl ChangePipeline {
             auto_apply,
             test_timeout_secs: 3600,
             test_command: cog_core::SelfEvolutionConfig::default().test_command,
+            fmt_check_command: None,
+            lint_command: None,
             fmt_timeout_secs: DEFAULT_FMT_TIMEOUT_SECS,
             promotion_policy: None,
             target_dir: None,
@@ -433,6 +519,20 @@ impl ChangePipeline {
     /// evidence is the one the deployment configured.
     pub fn with_test_command(mut self, command: Vec<String>) -> Self {
         self.test_command = command;
+        self
+    }
+
+    /// The deployment's formatter, when it declares one. `None` keeps this
+    /// workspace's own; an empty list is a deployment declaring it has none.
+    pub fn with_fmt_check_command(mut self, command: Option<Vec<String>>) -> Self {
+        self.fmt_check_command = command;
+        self
+    }
+
+    /// The deployment's linter, when it declares one. `None` keeps this
+    /// workspace's own; an empty list is a deployment declaring it has none.
+    pub fn with_lint_command(mut self, command: Option<Vec<String>>) -> Self {
+        self.lint_command = command;
         self
     }
 
@@ -867,19 +967,23 @@ impl ChangePipeline {
         // exists to avoid. Nothing in the tree says which of the two wrote a
         // line after the fact, so the question is asked while it can still be
         // answered.
-        let baseline_is_conformed = match self
-            .run_cargo_fmt_cmd(workdir, &["fmt", "--all", "--", "--check"])
-            .await
-        {
-            Ok((clean, _)) => clean,
-            Err(e) => {
-                warn!(
-                    change_id = %change.artifact_id,
-                    error = %e,
-                    "Could not read whether this tree's baseline is what the formatter produces"
-                );
-                false
-            }
+        //
+        // Only the built-in formatter rewrites anything: a deployment that
+        // declares a check, or no formatter at all, leaves this tree with one
+        // writer by construction, and there is nothing to ask.
+        let baseline_is_conformed = match self.fmt_check_command {
+            Some(_) => true,
+            None => match self.run_cargo_fmt_cmd(workdir, BUILTIN_FMT_CHECK).await {
+                Ok((clean, _)) => clean,
+                Err(e) => {
+                    warn!(
+                        change_id = %change.artifact_id,
+                        error = %e,
+                        "Could not read whether this tree's baseline is what the formatter produces"
+                    );
+                    false
+                }
+            },
         };
 
         if let Err(e) = self.git_apply(workdir, &change.content).await {
@@ -927,12 +1031,12 @@ impl ChangePipeline {
         // Conformed before it is compiled, and rolled back either way: a change
         // refused here must leave the tree as it found it, or the next run would
         // be verifying this one's leftovers.
-        let reformatted = match self.run_cargo_fmt(workdir).await {
-            Ok((true, reformatted, _)) => reformatted,
-            Ok((false, _, output)) => {
+        let (reformatted, fmt_note) = match self.judge_format(workdir).await {
+            Ok(FormatVerdict::Conformed { rewritten, note }) => (rewritten, note),
+            Ok(FormatVerdict::Differs(evidence)) => {
                 warn!(
                     change_id = %change.artifact_id,
-                    "Change is not what this workspace's formatter produces, and conforming it did not settle that; rolling back"
+                    "Change is not what this deployment's formatter produces; rolling back"
                 );
                 let _ = self.git_reset_hard(workdir).await;
                 return Ok(ApplyResult {
@@ -941,15 +1045,13 @@ impl ChangePipeline {
                     reformatted: false,
                     pre_existing_failures: 0,
                     verdict: ChangeVerdict::Refused(cog_core::RejectionCause::FormattingDiffers),
-                    test_output: format!(
-                        "The formatter could not make this tree what it produces:\n{output}"
-                    ),
+                    test_output: evidence,
                     new_status: EvolutionStatus::ValidationFailed,
                     tiering: Some(tiering.clone()),
                 });
             }
             Err(e) => {
-                warn!(change_id = %change.artifact_id, error = %e, "cargo fmt execution failed");
+                warn!(change_id = %change.artifact_id, error = %e, "the format check did not run");
                 let _ = self.git_reset_hard(workdir).await;
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
@@ -957,7 +1059,7 @@ impl ChangePipeline {
                     reformatted: false,
                     pre_existing_failures: 0,
                     verdict: ChangeVerdict::Refused(cog_core::RejectionCause::TestRunUnavailable),
-                    test_output: format!("Failed to execute cargo fmt: {}", e),
+                    test_output: format!("Failed to execute the format check: {}", e),
                     new_status: EvolutionStatus::ValidationFailed,
                     tiering: Some(tiering.clone()),
                 });
@@ -976,9 +1078,23 @@ impl ChangePipeline {
         // does not compile is the suite's to answer for. Both are recorded
         // where the decision is made rather than left to be inferred from a
         // green run.
-        let clippy_note = match self.run_cargo_clippy(workdir).await {
-            Ok((true, _)) => "cargo clippy --workspace: no diagnostics on this tree".to_string(),
-            Ok((false, output)) => {
+        let clippy_note = match self.judge_lint(workdir, &change.artifact_id).await {
+            Ok(LintVerdict::Clean(note)) => note,
+            Ok(LintVerdict::NotDeclared) => NO_LINTER_NOTE.to_string(),
+            Ok(LintVerdict::Unattributable(evidence)) => {
+                let _ = self.git_reset_hard(workdir).await;
+                return Ok(ApplyResult {
+                    change_id: change.artifact_id.clone(),
+                    files_changed,
+                    reformatted,
+                    pre_existing_failures: 0,
+                    verdict: ChangeVerdict::Refused(cog_core::RejectionCause::LintRefused),
+                    test_output: evidence,
+                    new_status: EvolutionStatus::ValidationFailed,
+                    tiering: Some(tiering.clone()),
+                });
+            }
+            Ok(LintVerdict::Attributable { line, output }) => {
                 // A change is answerable for the lints reported on a line it
                 // wrote, and that reading needs a diff with one writer in it.
                 // Where the baseline is not what the formatter produces, the
@@ -1046,7 +1162,7 @@ impl ChangePipeline {
                         "The linter reports this tree's lints, and the tree it read differs from its baseline beyond this change"
                     );
                     format!(
-                        "cargo clippy --workspace: {} diagnostic(s) on this tree, which differs from its baseline by more than this change (the baseline is not what the formatter produces), so none is read as this change's",
+                        "{line}: {} diagnostic(s) on this tree, which differs from its baseline by more than this change (the baseline is not what the formatter produces), so none is read as this change's",
                         attribution.diagnostics
                     )
                 } else {
@@ -1056,13 +1172,13 @@ impl ChangePipeline {
                         "The linter reports this tree's lints; none of them is on a line this change wrote"
                     );
                     format!(
-                        "cargo clippy --workspace: {} diagnostic(s) on this tree, none of them on a line this change wrote",
+                        "{line}: {} diagnostic(s) on this tree, none of them on a line this change wrote",
                         attribution.diagnostics
                     )
                 }
             }
             Err(e) if e.is_build_slot_refused() => {
-                warn!(change_id = %change.artifact_id, error = %e, "cargo clippy got no build slot");
+                warn!(change_id = %change.artifact_id, error = %e, "the linter got no build slot");
                 let _ = self.git_reset_hard(workdir).await;
                 return Err(e);
             }
@@ -1076,9 +1192,10 @@ impl ChangePipeline {
                 warn!(
                     change_id = %change.artifact_id,
                     error = %e,
-                    "cargo clippy did not run; this change is judged without it"
+                    command = %self.lint_command_line(),
+                    "The linter did not run; this change is judged without it"
                 );
-                format!("cargo clippy --workspace: not evaluated ({e})")
+                format!("{}: not evaluated ({e})", self.lint_command_line())
             }
         };
 
@@ -1116,13 +1233,21 @@ impl ChangePipeline {
         // never pays for it and the cost lands on the runs that need the
         // distinction.
         let mut test_passed = test_passed;
-        // What the linter did rides in front of what the suite did: this field
-        // is the record a refused or landed change is read from, and a run that
-        // was not evaluated has to be readable as that rather than as silence.
-        let mut test_output = if clippy_note.is_empty() {
-            test_output
-        } else {
-            format!("{clippy_note}\n\n{test_output}")
+        // What the earlier criteria did rides in front of what the suite did, in
+        // the order they ran: this field is the record a refused or landed
+        // change is read from, and a stage that was not evaluated — or ran and
+        // was declared absent — has to be readable as that rather than as
+        // silence.
+        let mut test_output = {
+            let notes: Vec<&str> = [fmt_note.as_str(), clippy_note.as_str()]
+                .into_iter()
+                .filter(|note| !note.is_empty())
+                .collect();
+            if notes.is_empty() {
+                test_output
+            } else {
+                format!("{}\n\n{test_output}", notes.join("\n"))
+            }
         };
         let mut pre_existing_failures = 0usize;
         if !test_passed {
@@ -1714,36 +1839,52 @@ impl ChangePipeline {
         }
     }
 
-    /// Spawn one `cargo fmt` invocation under the verification environment and
-    /// the format bound, returning (succeeded, combined_output).
+    /// Spawn one judge command under the verification environment and the
+    /// caller's bound, returning (succeeded, combined_output).
     ///
-    /// The probe and the check both come through here so that "what may the
-    /// formatter see" and "how long may it take" keep one answer each rather
-    /// than one per call site.
-    async fn run_cargo_fmt_cmd(&self, workdir: &Path, args: &[&str]) -> SFResult<(bool, String)> {
-        let mut cmd = tokio::process::Command::new("cargo");
-        cmd.args(args).current_dir(workdir).kill_on_drop(true);
+    /// Every command that judges a change comes through here — the formatter's
+    /// probe and check, the linter, the suite — so that "what may it see" and
+    /// "what may it run under" keep one answer each rather than one per call
+    /// site: a second site that rebuilt these lines by hand would be free to
+    /// drop the environment the verdict is only valid in.
+    async fn run_verification_command(
+        &self,
+        workdir: &Path,
+        argv: &[String],
+        timeout_secs: u64,
+    ) -> SFResult<(bool, String)> {
+        let Some(program) = argv.first() else {
+            return Err(SFError::Config(
+                "a verification command with no program judges nothing".into(),
+            ));
+        };
+        let line = argv.join(" ");
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(&argv[1..]).current_dir(workdir).kill_on_drop(true);
         self.apply_verification_env(&mut cmd);
 
-        let output =
-            match tokio::time::timeout(Duration::from_secs(self.fmt_timeout_secs), cmd.output())
-                .await
-            {
-                Ok(result) => result.map_err(|e| {
-                    SFError::IO(format!("Failed to run cargo {}: {}", args.join(" "), e))
-                })?,
-                Err(_) => {
-                    return Err(SFError::IO(format!(
-                        "cargo {} exceeded the {}s format budget and was killed",
-                        args.join(" "),
-                        self.fmt_timeout_secs
-                    )))
-                }
-            };
+        let output = match tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output())
+            .await
+        {
+            Ok(result) => result.map_err(|e| SFError::IO(format!("Failed to run {line}: {e}")))?,
+            Err(_) => {
+                return Err(SFError::IO(format!(
+                    "{line} exceeded the {timeout_secs}s verification budget and was killed"
+                )))
+            }
+        };
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         Ok((output.status.success(), format!("{}{}", stdout, stderr)))
+    }
+
+    /// Spawn one invocation of the built-in formatter, under the format bound.
+    /// The argv is the whole command line, program included.
+    async fn run_cargo_fmt_cmd(&self, workdir: &Path, argv: &[&str]) -> SFResult<(bool, String)> {
+        let argv: Vec<String> = argv.iter().map(|arg| (*arg).to_string()).collect();
+        self.run_verification_command(workdir, &argv, self.fmt_timeout_secs)
+            .await
     }
 
     /// Judge this tree's formatting, conforming it when the formatter would
@@ -1775,36 +1916,87 @@ impl ChangePipeline {
     /// to ask at all; only after that does a nonzero exit mean the tree is what
     /// the formatter rewrites.
     async fn run_cargo_fmt(&self, workdir: &Path) -> SFResult<(bool, bool, String)> {
-        let (available, why) = self
-            .run_cargo_fmt_cmd(workdir, &["fmt", "--version"])
-            .await?;
+        let (available, why) = self.run_cargo_fmt_cmd(workdir, BUILTIN_FMT_PROBE).await?;
         if !available {
             return Err(SFError::IO(format!(
                 "the format check has no formatter to ask: {why}"
             )));
         }
         info!("Running cargo fmt --all -- --check");
-        let (clean, checked) = self
-            .run_cargo_fmt_cmd(workdir, &["fmt", "--all", "--", "--check"])
-            .await?;
+        let (clean, checked) = self.run_cargo_fmt_cmd(workdir, BUILTIN_FMT_CHECK).await?;
         if clean {
             return Ok((true, false, checked));
         }
         info!("Conforming the change to what this workspace's formatter produces");
-        let (ran, rewrite_output) = self.run_cargo_fmt_cmd(workdir, &["fmt", "--all"]).await?;
+        let (ran, rewrite_output) = self.run_cargo_fmt_cmd(workdir, BUILTIN_FMT_CONFORM).await?;
         let evidence = format!("{checked}\n{rewrite_output}");
         if !ran {
             return Ok((false, false, evidence));
         }
-        let (conformed, rechecked) = self
-            .run_cargo_fmt_cmd(workdir, &["fmt", "--all", "--", "--check"])
-            .await?;
+        let (conformed, rechecked) = self.run_cargo_fmt_cmd(workdir, BUILTIN_FMT_CHECK).await?;
         let evidence = format!("{evidence}\n{rechecked}");
         Ok(if conformed {
             (true, true, evidence)
         } else {
             (false, false, evidence)
         })
+    }
+
+    /// What this deployment's formatting stage reads for this tree.
+    ///
+    /// Three declarations, three readings. The built-in formatter is the one
+    /// path that can rewrite the tree, and the one whose probe separates "no
+    /// formatter to ask" from "not what the formatter produces". A declared
+    /// command is asked the same question and nothing more: it is a check, and
+    /// a tree it does not produce is refused rather than conformed, because a
+    /// declared command is never assumed to be able to rewrite anything. A
+    /// deployment that declares none gets no reading, and its change's own
+    /// record carries that fact — a stage that never ran and a stage that ran
+    /// and found nothing are different readings, and only one of them is true.
+    async fn judge_format(&self, workdir: &Path) -> SFResult<FormatVerdict> {
+        match self.fmt_check_command.as_deref() {
+            None => match self.run_cargo_fmt(workdir).await? {
+                (true, rewritten, _) => Ok(FormatVerdict::Conformed {
+                    rewritten,
+                    note: String::new(),
+                }),
+                (false, _, evidence) => Ok(FormatVerdict::Differs(format!(
+                    "The formatter could not make this tree what it produces:\n{evidence}"
+                ))),
+            },
+            Some([]) => Ok(FormatVerdict::Conformed {
+                rewritten: false,
+                note:
+                    "This deployment declares no formatter: the change was not checked against one."
+                        .to_string(),
+            }),
+            Some(argv) => {
+                let line = argv.join(" ");
+                info!(command = %line, "Running the formatter this deployment declares");
+                match self
+                    .run_verification_command(workdir, argv, self.fmt_timeout_secs)
+                    .await
+                {
+                    Ok((true, _)) => Ok(FormatVerdict::Conformed {
+                        rewritten: false,
+                        note: format!(
+                            "{line}: the tree is what this deployment's formatter produces"
+                        ),
+                    }),
+                    Ok((false, evidence)) => Ok(FormatVerdict::Differs(format!(
+                        "The formatter this deployment declares does not produce this tree \
+                         (the change must arrive already conformed; a declared formatter is \
+                         not asked to rewrite it):\n{evidence}"
+                    ))),
+                    // A command that cannot be started is the same fact the
+                    // built-in probe exists to name: there is no formatter to
+                    // ask, so nothing was judged.
+                    Err(e) => Err(SFError::IO(format!(
+                        "the format check has no formatter to ask: {e}"
+                    ))),
+                }
+            }
+        }
     }
 
     /// Run the configured test command and return (success, combined_output).
@@ -1877,7 +2069,23 @@ impl ChangePipeline {
         self.test_command.join(" ")
     }
 
-    /// Run CI's lint command over the workspace and return (succeeded, output).
+    /// The command this deployment's lint stage would run, as it is written to
+    /// the change's evidence.
+    ///
+    /// Declaring no linter is not the same as declaring the built-in one, but
+    /// the line a deployment reads here is the line that ran: with nothing
+    /// declared that is the built-in linter, and with one declared it is that
+    /// command, so a record that says the linter did not run names the linter
+    /// the deployment actually asked for.
+    fn lint_command_line(&self) -> String {
+        match self.lint_command.as_deref() {
+            Some(argv) if !argv.is_empty() => argv.join(" "),
+            _ => BUILTIN_LINT_LINE.to_string(),
+        }
+    }
+
+    /// Run the built-in linter's command over the workspace and return
+    /// (succeeded, output).
     ///
     /// The same command the gate runs, in the one form that lets the verdict be
     /// attributed at all: `--message-format=json` changes what the run says,
@@ -1894,40 +2102,83 @@ impl ChangePipeline {
     /// kinds are the two budgets, and writing a third job's duration into the
     /// `test` kind would make that reading mean "the last workspace compile of
     /// either job" while still claiming to be one kind.
+    ///
+    /// No slot is taken here: the stage takes one for whichever linter it runs,
+    /// so that this command and a deployment's own are one gated command each
+    /// to the wall bound rather than two.
     async fn run_cargo_clippy(&self, workdir: &Path) -> SFResult<(bool, String)> {
         info!("Running cargo clippy --workspace");
+        let argv: Vec<String> = BUILTIN_LINT.iter().map(|arg| (*arg).to_string()).collect();
+        self.run_verification_command(workdir, &argv, self.test_timeout_secs)
+            .await
+    }
+
+    /// What this deployment's linter reads for this tree, as the sentence the
+    /// change's own record carries, or a refusal.
+    ///
+    /// The build slot is taken once, here, for whichever linter runs: a declared
+    /// linter is the same kind of work as the built-in one — a whole-tree read
+    /// that compiles — so a deployment that declares one is not thereby allowed
+    /// to run it beside the host's other builds, and the two are one gated
+    /// command to the wall bound rather than two. A deployment that declares no
+    /// linter returns before the slot is taken, because there is no work for a
+    /// slot to bound.
+    ///
+    /// A declared linter is judged by its exit status on this tree, and that is
+    /// all it can be judged by: the comparison that separates a finding the
+    /// change wrote from one the tree already carried reads the compiler's
+    /// diagnostic interchange, and no other linter speaks it. So a declared
+    /// linter that refuses the tree refuses the change — reading its findings
+    /// as the tree's own would need the comparison that is not available, and
+    /// reading the absence of parseable findings as "nothing was reported"
+    /// would be the reading a linter that never ran produces. A deployment
+    /// whose linter cannot be attributed either declares one that can, or
+    /// declares none.
+    ///
+    /// The un-attributable answer is the declared linter's alone. The built-in
+    /// one always speaks the interchange, and where it exits non-zero on a tree
+    /// it cannot parse there is a compilation error for the suite to answer
+    /// for, not a linter refusing the change; reading that as `LintRefused`
+    /// would retire a change for a verdict the lint criterion never made.
+    async fn judge_lint(&self, workdir: &Path, change_id: &str) -> SFResult<LintVerdict> {
+        let declared = match self.lint_command.as_deref() {
+            Some([]) => return Ok(LintVerdict::NotDeclared),
+            Some(argv) => Some(argv),
+            None => None,
+        };
         let _slot = cog_core::build_gate::acquire("change lint verification").await?;
-        let mut cmd = tokio::process::Command::new("cargo");
-        cmd.args([
-            "clippy",
-            "--workspace",
-            "--message-format=json",
-            "--",
-            "-D",
-            "warnings",
-        ])
-        .current_dir(workdir)
-        .kill_on_drop(true);
-        self.apply_verification_env(&mut cmd);
-
-        let output =
-            match tokio::time::timeout(Duration::from_secs(self.test_timeout_secs), cmd.output())
-                .await
-            {
-                Ok(result) => {
-                    result.map_err(|e| SFError::IO(format!("Failed to run cargo clippy: {}", e)))?
-                }
-                Err(_) => {
-                    return Err(SFError::IO(format!(
-                        "cargo clippy exceeded the {}s verification budget and was killed",
-                        self.test_timeout_secs
-                    )))
-                }
-            };
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Ok((output.status.success(), format!("{}{}", stdout, stderr)))
+        let (line, passed, output) = match declared {
+            Some(argv) => {
+                let line = argv.join(" ");
+                info!(command = %line, "Running the linter this deployment declares");
+                let (passed, output) = self
+                    .run_verification_command(workdir, argv, self.test_timeout_secs)
+                    .await?;
+                (line, passed, output)
+            }
+            None => {
+                let (passed, output) = self.run_cargo_clippy(workdir).await?;
+                (BUILTIN_LINT_LINE.to_string(), passed, output)
+            }
+        };
+        if passed {
+            return Ok(LintVerdict::Clean(format!(
+                "{line}: no diagnostics on this tree"
+            )));
+        }
+        if declared.is_none() || cog_core::contract::reflection::has_compiler_messages(&output) {
+            return Ok(LintVerdict::Attributable { line, output });
+        }
+        warn!(
+            change_id = %change_id,
+            command = %line,
+            "The declared linter refuses this tree and its findings cannot be attributed to lines"
+        );
+        Ok(LintVerdict::Unattributable(format!(
+            "The linter this deployment declares refuses this tree, and its findings are not in \
+             the compiler's diagnostic interchange, so none of them can be shown to be the \
+             tree's own rather than this change's:\n{output}"
+        )))
     }
 
     /// The lines the applied change wrote, read from the tree that will land.
@@ -2078,7 +2329,10 @@ impl ChangePipeline {
     /// The change is put back exactly as this run found it, formatter and all:
     /// the tree being judged is the conformed one, and re-applying the raw
     /// content would silently undo the formatting this same run just applied
-    /// and commit a tree the format check rejects.
+    /// and commit a tree the format check rejects. A deployment that declares
+    /// its own formatter, or none, has no rewrite in it to undo — a declared
+    /// formatter only ever checks, and the change went on the tree as it
+    /// arrived — so the raw content is what the run found.
     async fn baseline_failing_tests(
         &self,
         workdir: &Path,
@@ -2099,17 +2353,22 @@ impl ChangePipeline {
                 "could not put the change back after reading the tree's own test failures: {e}"
             ))
         })?;
-        match self.run_cargo_fmt(workdir).await {
-            Ok((true, _, _)) => {}
-            Ok((false, _, output)) => {
-                return Err(SFError::IO(format!(
-                    "could not conform the change to the formatter after reading the tree's own test failures:\n{output}"
-                )));
-            }
-            Err(e) => {
-                return Err(SFError::IO(format!(
-                    "could not run the formatter after reading the tree's own test failures: {e}"
-                )));
+        // Only the built-in formatter rewrites the tree, so only it has a
+        // rewrite to re-apply here. A declared one checks and does not rewrite,
+        // and a deployment that declares none has nothing to run.
+        if self.fmt_check_command.is_none() {
+            match self.run_cargo_fmt(workdir).await {
+                Ok((true, _, _)) => {}
+                Ok((false, _, output)) => {
+                    return Err(SFError::IO(format!(
+                        "could not conform the change to the formatter after reading the tree's own test failures:\n{output}"
+                    )));
+                }
+                Err(e) => {
+                    return Err(SFError::IO(format!(
+                        "could not run the formatter after reading the tree's own test failures: {e}"
+                    )));
+                }
             }
         }
 
@@ -2619,6 +2878,102 @@ impl Default for MetricsConfig {
             .await
             .expect_err("an empty command judges nothing and must not pass a change");
         assert!(err.to_string().contains("test_command is empty"), "{err}");
+    }
+
+    /// A declared formatter is asked the one question a check answers and no
+    /// more: is this tree what the formatter produces. It is never asked to
+    /// rewrite — a declared command is not assumed to be able to — so a tree it
+    /// does not produce is refused rather than conformed, and the change's
+    /// record says which reading it got.
+    #[tokio::test]
+    async fn a_declared_formatter_is_asked_and_never_rewrites() {
+        let root = tempfile::tempdir().unwrap();
+        let declaring = |argv: Vec<String>| {
+            ChangePipeline::new(root.path(), root.path(), false).with_fmt_check_command(Some(argv))
+        };
+
+        match declaring(vec!["true".into()])
+            .judge_format(root.path())
+            .await
+            .unwrap()
+        {
+            FormatVerdict::Conformed { rewritten, note } => {
+                assert!(!rewritten, "a declared formatter is a check, not a rewrite");
+                assert!(note.contains("true"), "the note names the judge: {note}");
+            }
+            other => panic!("expected a conformed verdict, got {other:?}"),
+        }
+
+        match declaring(vec!["false".into()])
+            .judge_format(root.path())
+            .await
+            .unwrap()
+        {
+            FormatVerdict::Differs(evidence) => assert!(
+                evidence.contains("not asked to rewrite"),
+                "the refusal has to say the declared formatter was not asked to rewrite: {evidence}"
+            ),
+            other => panic!("expected a differing verdict, got {other:?}"),
+        }
+
+        // Declaring none is not the same as declaring the built-in one: the
+        // stage does not run, and the change's own record carries that fact.
+        match declaring(Vec::new())
+            .judge_format(root.path())
+            .await
+            .unwrap()
+        {
+            FormatVerdict::Conformed { rewritten, note } => {
+                assert!(!rewritten);
+                assert!(note.contains("no formatter"), "{note}");
+            }
+            other => panic!("expected a conformed verdict, got {other:?}"),
+        }
+    }
+
+    /// A declared linter is judged by its exit status, and a refusal it cannot
+    /// attribute is not read as a clean tree. The built-in linter is left out of
+    /// that reading: its non-zero exit on a tree it cannot parse is a
+    /// compilation error for the suite, not a lint refusal.
+    #[tokio::test]
+    async fn a_declared_linter_decides_and_an_unreadable_refusal_is_not_clean() {
+        let root = tempfile::tempdir().unwrap();
+        let declaring = |argv: Vec<String>| {
+            ChangePipeline::new(root.path(), root.path(), false).with_lint_command(Some(argv))
+        };
+
+        match declaring(vec!["true".into()])
+            .judge_lint(root.path(), "c")
+            .await
+            .unwrap()
+        {
+            LintVerdict::Clean(note) => {
+                assert!(note.contains("true"), "the note names the judge: {note}")
+            }
+            other => panic!("expected a clean verdict, got {other:?}"),
+        }
+
+        // `false` speaks nothing, so nothing here can show its refusal is not
+        // the change's doing.
+        match declaring(vec!["false".into()])
+            .judge_lint(root.path(), "c")
+            .await
+            .unwrap()
+        {
+            LintVerdict::Unattributable(evidence) => assert!(
+                evidence.contains("diagnostic interchange"),
+                "the refusal has to name why it cannot be attributed: {evidence}"
+            ),
+            other => panic!("expected an unattributable verdict, got {other:?}"),
+        }
+
+        assert!(matches!(
+            declaring(Vec::new())
+                .judge_lint(root.path(), "c")
+                .await
+                .unwrap(),
+            LintVerdict::NotDeclared
+        ));
     }
 
     /// A diff that introduces one brand-new file, the shape the generator
@@ -3565,6 +3920,79 @@ index 1111111..2222222 100644
         assert!(
             String::from_utf8_lossy(&status.stdout).trim().is_empty(),
             "the refused change was left on the tree"
+        );
+    }
+
+    /// A declared linter that refuses the tree without speaking the compiler's
+    /// diagnostic interchange refuses the change, and the refusal says why.
+    ///
+    /// A finding can only be excused as the tree's own through that interchange:
+    /// it is where a diagnostic's span is written down. A linter that refuses a
+    /// tree without it has left nothing that separates the findings it reports
+    /// from the ones the tree already carried, and reading its silence as "no
+    /// findings" would be the reading a linter that never ran produces.
+    #[tokio::test]
+    async fn a_declared_linter_that_speaks_no_interchange_refuses_the_change() {
+        let root = tempfile::tempdir().unwrap();
+        git_ok(root.path(), &["init", "-q"]).await;
+        git_ok(root.path(), &["config", "user.email", "t@t.com"]).await;
+        git_ok(root.path(), &["config", "user.name", "t"]).await;
+        tokio::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(root.path().join("src"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.path().join("src/lib.rs"),
+            "pub fn answer() -> i32 {\n    42\n}\n",
+        )
+        .await
+        .unwrap();
+        git_ok(root.path(), &["add", "."]).await;
+        git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
+
+        // `false` refuses every tree, and its refusal is plain text rather than
+        // the interchange, so nothing here can show its findings are the tree's
+        // rather than this change's.
+        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false)
+            .with_lint_command(Some(vec!["false".into()]));
+        let change = EvolutionResult {
+            kind: EvolutionKind::CodeChange,
+            artifact_id: "opaque-lint-1".into(),
+            description: "给取值模块补一个辅助函数".into(),
+            content: "diff --git a/src/lib.rs b/src/lib.rs\n\
+                      --- a/src/lib.rs\n\
+                      +++ b/src/lib.rs\n\
+                      @@ -1,3 +1,4 @@\n\
+                      \x20pub fn answer() -> i32 {\n\
+                      \x20    42\n\
+                      \x20}\n\
+                      +fn generated() {}\n"
+                .into(),
+            status: EvolutionStatus::CompileChecked,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+            tiering: None,
+        };
+
+        let result = pipeline
+            .apply_and_test_in(&change, root.path())
+            .await
+            .expect("a judgement about the change is not an environment error");
+
+        assert_eq!(
+            result.verdict,
+            ChangeVerdict::Refused(cog_core::RejectionCause::LintRefused)
+        );
+        assert_eq!(result.new_status, EvolutionStatus::ValidationFailed);
+        assert!(
+            result.test_output.contains("diagnostic interchange"),
+            "the refusal has to say why the linter's word could not be taken: {}",
+            result.test_output
         );
     }
 
