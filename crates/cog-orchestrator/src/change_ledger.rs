@@ -531,6 +531,74 @@ mod tests {
         );
     }
 
+    /// The same row under a different scope, so a set of rows can be told apart
+    /// by the identity the pass keys its memory on.
+    fn row_at(scope: &str) -> ChangeLedgerRow {
+        ChangeLedgerRow {
+            identity: ChangeIdentity::new("grep", scope, "fn thing"),
+            ..row(ChangeState::Pending, None)
+        }
+    }
+
+    /// Every reason in the closed set is named on the line, zeroes included. A
+    /// reason that emptied has to read as zero rather than vanish: a missing key
+    /// and a reason nobody thought to count look the same to the reader.
+    #[test]
+    fn the_reason_line_names_every_reason_including_the_empty_ones() {
+        let mut by_reason = HashMap::new();
+        by_reason.insert(UnsettledReason::ScopeOutsideTree, 12);
+        by_reason.insert(UnsettledReason::GitFailed, 1);
+        assert_eq!(
+            reason_summary(&by_reason),
+            "revision_unreadable 0, kind_without_predicate 0, scope_outside_tree 12, git_failed 1"
+        );
+    }
+
+    /// With nothing unanswerable the line still says so, all four at zero: the
+    /// absence of the field would otherwise be the only thing saying it, and an
+    /// absent field is not a reading.
+    #[test]
+    fn a_pass_that_could_settle_everything_still_names_the_reasons() {
+        assert_eq!(
+            reason_summary(&HashMap::new()),
+            "revision_unreadable 0, kind_without_predicate 0, scope_outside_tree 0, git_failed 0"
+        );
+    }
+
+    /// What a dead tree left unjudged, counted the way the loop would have read
+    /// it: a row inside its unanswered window is not one this pass was going to
+    /// judge, and once that window is up it is.
+    #[test]
+    fn a_dead_tree_counts_what_this_pass_would_have_judged() {
+        let now = Instant::now();
+        let rows: Vec<ChangeLedgerRow> = (0..5).map(|n| row_at(&format!("crates/{n}"))).collect();
+        let mut unsettled = HashMap::new();
+        unsettled.insert(
+            ChangeIdentity::new("grep", "crates/0", "fn thing"),
+            UnsettledCheck {
+                why: "the scope is not in this revision".into(),
+                since: now,
+            },
+        );
+        assert_eq!(would_judge(&rows, &unsettled, now), 4);
+        assert_eq!(would_judge(&rows, &HashMap::new(), now), 5);
+        assert_eq!(would_judge(&rows, &unsettled, now + UNMEASURABLE_RETRY), 5);
+    }
+
+    /// The count is of what a pass judges, not of what it read: past the batch
+    /// bound the rows beyond it were not going to be judged either, and counting
+    /// them would overstate what the failure cost.
+    #[test]
+    fn the_batch_bound_is_what_a_pass_judges_not_what_it_read() {
+        let rows: Vec<ChangeLedgerRow> = (0..MEASUREMENTS_PER_PASS + 1)
+            .map(|n| row_at(&format!("crates/{n}")))
+            .collect();
+        assert_eq!(
+            would_judge(&rows, &HashMap::new(), Instant::now()),
+            MEASUREMENTS_PER_PASS
+        );
+    }
+
     /// A row left alone for not being settleable is asked again once its window
     /// is up. Without the second half, "cannot tell" would harden into "never
     /// looked at again" and a tree that gained the path would go unnoticed.
