@@ -830,7 +830,10 @@ mod tests {
     fn a_grep_line_keeps_the_colons_in_the_text() {
         let rev = "0".repeat(40);
         assert_eq!(
-            parse_grep_line(&format!("{rev}:crates/x/src/a.rs:7:let t = cog_core::Task;"), &rev),
+            parse_grep_line(
+                &format!("{rev}:crates/x/src/a.rs:7:let t = cog_core::Task;"),
+                &rev
+            ),
             Some((
                 "crates/x/src/a.rs".to_string(),
                 "let t = cog_core::Task;".to_string()
