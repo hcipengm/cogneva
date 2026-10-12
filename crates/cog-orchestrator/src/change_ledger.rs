@@ -11,7 +11,7 @@
 //! a process whose storage holds no shared database never reaches this point, so
 //! it never becomes a candidate.
 //!
-//! Three things happen here, and the third is the only one that moves a row. The
+//! Four things happen here, and the third is the only one that moves a row. The
 //! loop folds the intake into the account -- declarations queued by other parties
 //! become readings, through the same reading path a direct write would use -- it
 //! reads the outstanding set back out, saying plainly when a read failed, and it
@@ -19,14 +19,19 @@
 //! state. The fold is mechanical: it carries what a document asked for and adds
 //! nothing of its own, so this loop cannot make a change look done by folding.
 //!
-//! The half that would hand the outstanding set to the goal/DAG path is still
-//! missing; what sets a state today is a look at the tree and nothing else. A row
-//! whose check could not be run keeps the state a document gave it and is named
-//! in the pass's own line, so "nothing has looked at this" and "something looked
-//! and could not tell" stay apart -- and the count of the second is a reading
-//! rather than a silence. Not being able to tell is not final either: such a row
-//! is asked again after [`UNMEASURABLE_RETRY`], because why it could not be
-//! settled is a property of a tree that moves.
+//! The fourth thing is what makes the ledger a driver rather than a record: the
+//! rows a measurement found `pending` are handed to the goal path, one task
+//! each, so "the ledger says this is still owed" is where a change gets worked
+//! on from. Handing over is not finishing. A dispatched change keeps its state
+//! and only a later measurement -- of the tree, after someone has changed it --
+//! can move the row, so a task that reported success changes nothing by itself.
+//!
+//! A row whose check could not be run keeps the state a document gave it and is
+//! named in the pass's own line, so "nothing has looked at this" and "something
+//! looked and could not tell" stay apart -- and the count of the second is a
+//! reading rather than a silence. Not being able to tell is not final either:
+//! such a row is asked again after [`UNMEASURABLE_RETRY`], because why it could
+//! not be settled is a property of a tree that moves.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -36,7 +41,7 @@ use tracing::{debug, info, warn};
 
 use cog_core::{
     ChangeIdentity, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement, ChangeState,
-    OwnerLeaseBroker, ShutdownSignal,
+    OrchestratorControl, OwnerLeaseBroker, ShutdownSignal, Task, TaskType,
 };
 
 use crate::change_measure::{CheckTree, UnsettledReason};
@@ -116,19 +121,87 @@ struct UnsettledCheck {
     since: Instant,
 }
 
+/// The prefix a dispatched task's id carries, so a task sitting in the graph
+/// says which loop put it there.
+const DISPATCH_TASK_PREFIX: &str = "change-ledger-";
+
+/// The task kind a dispatched change is submitted under.
+///
+/// A name of the platform's own flows rather than a kind of hand: the change is
+/// not handed to a generic worker, it is handed to the change-generation path,
+/// and the kind is what that path is looked up by.
+const DISPATCH_TASK_KIND: &str = "change_ledger";
+
+/// The task id a change is dispatched under.
+///
+/// Derived from the identity, because that is the whole mechanism: this loop
+/// re-reads the same outstanding set every few minutes, and an id that moved
+/// between passes would file the same work again on every one of them.
+///
+/// Hashed rather than rendered from the parts. A literal is source code and
+/// routinely contains the separator a flattened identity is made of, so two
+/// different changes can render the same string -- and a shared id is not a
+/// duplicate cost, it is a change that is never dispatched at all, because the
+/// second one finds the first one's row in the graph and takes it for its own.
+/// Each part is terminated as it is fed in, so no split of the same characters
+/// hashes the same either.
+fn dispatch_task_id(identity: &ChangeIdentity) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for part in [&identity.kind, &identity.scope, &identity.literal] {
+        hasher.update(part.as_bytes());
+        hasher.update(&[0]);
+    }
+    let hex = hasher.finalize().to_hex();
+    format!("{DISPATCH_TASK_PREFIX}{}", &hex[..16])
+}
+
+/// What a dispatched change is worked on as.
+///
+/// The change's own words, in one line: the title a reading restated it with,
+/// or failing that what the change asserts. An identity is the last resort
+/// rather than the first, because a goal that is only `grep:path:literal` tells
+/// the generator where to look and not what is wanted there.
+fn dispatch_goal(row: &ChangeLedgerRow) -> String {
+    let text = row
+        .title
+        .as_deref()
+        .or(row.assertion.as_deref())
+        .unwrap_or("");
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        row.identity.as_key()
+    } else {
+        text
+    }
+}
+
 /// Start the loop. Not started when there is no ledger store (see the module
 /// header).
+///
+/// `orchestrator` is the goal path the pending set is handed to. It is optional
+/// for the same reason the lease role is: a process that cannot submit a goal
+/// still keeps an account, and refusing to run the loop at all would trade a
+/// missing driver for a missing ledger. Where it is absent the pass says so
+/// once, by name, rather than skipping the handover silently.
 pub fn spawn_change_ledger_loop(
     store: Arc<dyn ChangeLedgerStore>,
     role: Option<Arc<dyn OwnerLeaseBroker>>,
+    orchestrator: Option<Arc<dyn OrchestratorControl>>,
     shutdown: ShutdownSignal,
     tree: CheckTree,
 ) {
     info!(
         interval_secs = CHANGE_LEDGER_PASS_INTERVAL.as_secs(),
         arbitrated = role.is_some(),
+        dispatching = orchestrator.is_some(),
         "Change ledger loop enabled"
     );
+    if orchestrator.is_none() {
+        warn!(
+            "change ledger: no goal path is available, so a change found still owed will be \
+             recorded and not handed to anyone"
+        );
+    }
 
     drop(cog_core::loop_health::spawn(
         CHANGE_LEDGER_LOOP,
@@ -138,6 +211,7 @@ pub fn spawn_change_ledger_loop(
         move |beat| {
             let store = store.clone();
             let role = role.clone();
+            let orchestrator = orchestrator.clone();
             let shutdown = shutdown.clone();
             let tree = tree.clone();
             async move {
@@ -174,6 +248,14 @@ pub fn spawn_change_ledger_loop(
                     }
                     read_pass(&*store).await;
                     measure_pass(&*store, &tree, &mut unsettled).await;
+                    // Handing over comes last, and that order is the point: the
+                    // set dispatched is then the set as of this pass, so a change
+                    // this pass just found in the tree is never handed to anyone,
+                    // and a change this pass just found missing is handed over on
+                    // the same pass that found it, rather than one period later.
+                    if let Some(ref orchestrator) = orchestrator {
+                        dispatch_pass(&*store, orchestrator).await;
+                    }
                 }
             }
         },
@@ -384,6 +466,146 @@ async fn measure_pass(
         revision = snapshot.rev(),
         "change ledger: measured the outstanding set against the tree"
     );
+}
+
+/// Hand the changes still owed to the goal path, one task each.
+///
+/// Only `pending` is handed over, and the rest of the outstanding set is named
+/// in the line rather than left to be inferred from an absence. The three
+/// excluded states are excluded for three different reasons: `undecided` is
+/// "nothing can tell yet", which is a check to rewrite rather than work to
+/// start; `conflict` is two documents disagreeing about what the artifact should
+/// be, which no amount of code generation resolves; and `partial` is a change
+/// already under way, whose remaining half this loop cannot name. A state that is
+/// not handed over is still a row this pass read.
+///
+/// The task's id is derived from the change's identity, so a change handed over
+/// once is never handed over twice: this loop re-reads the same outstanding set
+/// every period, and the graph's own row is what remembers the handover. That is
+/// also why nothing here re-submits a change whose task has failed. Retrying is a
+/// policy with a budget, and the task already carries one; a second retry
+/// authority inside the ledger would be a second answer to "has this been tried
+/// enough", in the same table whose point is one answer per question.
+///
+/// A dispatched change's state is not touched. Handing work over is not doing it,
+/// and a row moved because a task was filed would have the ledger reporting a
+/// tree that nothing had looked at.
+async fn dispatch_pass(store: &dyn ChangeLedgerStore, orchestrator: &Arc<dyn OrchestratorControl>) {
+    // The read is bounded by the ledger's own census rather than by a number
+    // chosen here, and it has to be that wide because of where pending rows sit
+    // in it. A state of `pending` *is* a measurement's result, so those rows are
+    // the freshest in a staleness-ordered read, behind every row nothing has
+    // looked at; measured on the live ledger, the first fifty outstanding rows
+    // were all of them `undecided`. A bound the size of the one this pass
+    // measures with would therefore hand over nothing for as long as unmeasured
+    // rows remain ahead of them. Taking the whole non-landed set is what makes
+    // "the pending set" the thing this reads, and it needs no constant to stay
+    // true as the ledger grows.
+    let outstanding_total = match store.census().await {
+        Ok(census) => census
+            .iter()
+            .filter(|(state, _)| *state != ChangeState::Landed)
+            .map(|(_, count)| *count)
+            .sum::<u64>(),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: the census could not be read, so this pass handed nothing over"
+            );
+            return;
+        }
+    };
+    let rows = match store.outstanding(outstanding_total as usize).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: the outstanding set could not be read, so this pass handed \
+                 nothing over"
+            );
+            return;
+        }
+    };
+
+    let pending: Vec<ChangeLedgerRow> = rows
+        .iter()
+        .filter(|row| row.state == ChangeState::Pending)
+        .cloned()
+        .collect();
+
+    let mut submitted = 0usize;
+    let mut already = 0usize;
+    let mut failed = 0usize;
+    for row in &pending {
+        let task_id = dispatch_task_id(&row.identity);
+        // The graph is read before the submission rather than the submission's
+        // answer being read after it: the goal path treats a repeated id as a
+        // fault, so a pass that submitted blind would leave a line saying the
+        // handover failed while the change was in fact handed over.
+        if orchestrator.get_task(&task_id).await.is_some() {
+            already += 1;
+            continue;
+        }
+        let goal = dispatch_goal(row);
+        let task = Task::new(
+            task_id,
+            TaskType::Custom(DISPATCH_TASK_KIND.into()),
+            serde_json::json!({
+                "goal": goal,
+                "evolution_mode": "generate_change",
+                "task_kind": DISPATCH_TASK_KIND,
+                "change_identity": {
+                    "kind": row.identity.kind,
+                    "scope": row.identity.scope,
+                    "literal": row.identity.literal,
+                },
+                "change_sources": row
+                    .sources
+                    .iter()
+                    .map(|source| source.doc.as_str())
+                    .collect::<Vec<_>>(),
+            }),
+        );
+        match orchestrator.submit_goal_auto(&goal, vec![task]).await {
+            Ok(_) => submitted += 1,
+            Err(e) => {
+                failed += 1;
+                warn!(
+                    change = %row.identity,
+                    error = %e,
+                    "change ledger: a change still owed could not be handed over"
+                );
+            }
+        }
+    }
+
+    info!(
+        pending = pending.len(),
+        submitted,
+        already_handed_over = already,
+        failed,
+        not_handed_over = %held_back_summary(&rows),
+        "change ledger: handed the pending set to the goal path"
+    );
+}
+
+/// The outstanding rows this pass did not hand over, by state.
+///
+/// Named as a field rather than left to be inferred from the counts above: the
+/// states left out of the handover are left out for reasons, and a line that
+/// reported only what was submitted would leave a reader unable to tell a ledger
+/// with nothing owed from one whose whole outstanding set sits in a state nothing
+/// can act on.
+fn held_back_summary(rows: &[ChangeLedgerRow]) -> String {
+    ChangeState::ALL
+        .into_iter()
+        .filter(|state| *state != ChangeState::Pending)
+        .filter_map(|state| {
+            let n = rows.iter().filter(|row| row.state == state).count();
+            (n > 0).then(|| format!("{} {}", state.as_str(), n))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// How many of these rows a pass would have judged.
@@ -626,5 +848,69 @@ mod tests {
             outstanding_summary(&rows),
             "1 outstanding: landed 1; never measured 0; oldest measurement 2025-10-09T08:53:20+00:00"
         );
+    }
+
+    /// The id has to be a function of the identity and of nothing else: this loop
+    /// re-reads the same outstanding set every period, and an id that moved
+    /// between passes would file the same change again on every one of them.
+    #[test]
+    fn the_task_id_is_the_same_string_for_the_same_identity() {
+        let one = ChangeIdentity::new("grep", "crates/x", "fn thing");
+        let two = ChangeIdentity::new("grep", "crates/x", "fn thing");
+        assert_eq!(dispatch_task_id(&one), dispatch_task_id(&two));
+        assert!(dispatch_task_id(&one).starts_with(DISPATCH_TASK_PREFIX));
+    }
+
+    /// Two identities that render the same string must not share an id. The
+    /// flattened form separates its parts with the same character a literal is
+    /// full of, so a split of `a:b:c` is two changes by what they name and one
+    /// string by how they read -- and an id read off that string would hand over
+    /// whichever of them came second and leave the other owed forever.
+    #[test]
+    fn identities_that_render_alike_get_different_task_ids() {
+        let split_early = ChangeIdentity::new("grep", "a", "b:c");
+        let split_late = ChangeIdentity::new("grep", "a:b", "c");
+        assert_eq!(split_early.as_key(), split_late.as_key());
+        assert_ne!(
+            dispatch_task_id(&split_early),
+            dispatch_task_id(&split_late)
+        );
+    }
+
+    /// The goal is the change's own words. A title is a reading's restatement of
+    /// what is wanted; the identity is only where to look, so it is the fallback
+    /// and not the first choice.
+    #[test]
+    fn the_goal_prefers_the_title_and_falls_back_to_the_identity() {
+        let titled = ChangeLedgerRow {
+            title: Some("  make the gate read the  reading  ".into()),
+            ..row(ChangeState::Pending, None)
+        };
+        assert_eq!(dispatch_goal(&titled), "make the gate read the reading");
+
+        let asserted = ChangeLedgerRow {
+            title: None,
+            assertion: Some("the gate reads the reading".into()),
+            ..row(ChangeState::Pending, None)
+        };
+        assert_eq!(dispatch_goal(&asserted), "the gate reads the reading");
+
+        let bare = row(ChangeState::Pending, None);
+        assert_eq!(dispatch_goal(&bare), bare.identity.as_key());
+    }
+
+    /// What was left out is on the line, by state. Otherwise a ledger whose whole
+    /// outstanding set sits in a state nothing can act on reads exactly like one
+    /// with nothing owed.
+    #[test]
+    fn the_held_back_line_names_every_state_that_was_not_handed_over() {
+        let rows = vec![
+            row(ChangeState::Conflict, None),
+            row(ChangeState::Pending, None),
+            row(ChangeState::Undecided, None),
+            row(ChangeState::Undecided, None),
+        ];
+        assert_eq!(held_back_summary(&rows), "conflict 1, undecided 2");
+        assert_eq!(held_back_summary(&[row(ChangeState::Pending, None)]), "");
     }
 }

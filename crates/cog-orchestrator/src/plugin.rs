@@ -653,6 +653,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                 crate::change_ledger::spawn_change_ledger_loop(
                     store,
                     ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>(),
+                    ctx.consume_service::<dyn cog_core::OrchestratorControl>(),
                     ledger_shutdown,
                     crate::change_measure::tree_from_environment(),
                 );
