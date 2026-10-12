@@ -517,6 +517,53 @@ pub fn sysctl_node_io_conf(disk: &NodeDiskIo, reading: &ThroughputReading) -> St
     )
 }
 
+/// The `key = value` settings a sysctl drop-in states, comments and blank lines
+/// dropped.
+///
+/// The drop-in this system writes carries a comment block naming the reading its
+/// numbers came from, so its text moves whenever the device is re-measured even
+/// when the watermarks do not. Two files are therefore compared by the settings
+/// they state rather than by their bytes: a re-measurement that changed nothing
+/// reads as no change, and it is the file that disagrees that reads as one.
+pub fn sysctl_settings(conf: &str) -> Vec<(String, String)> {
+    conf.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            Some((key.trim().to_string(), value.trim().to_string()))
+        })
+        .collect()
+}
+
+/// How the settings already on the node disagree with the ones just derived,
+/// one sentence per key, empty when they agree.
+///
+/// This is the read-back face of a write that never overwrites: once the file
+/// exists this path stops writing, so nothing else can say whether the file on
+/// the node still holds what the derivation would put there -- or whether it was
+/// written by hand, to a value this code would not produce.
+pub fn sysctl_conf_disagreements(on_node: &str, derived: &str) -> Vec<String> {
+    let have: std::collections::BTreeMap<String, String> =
+        sysctl_settings(on_node).into_iter().collect();
+    let want: std::collections::BTreeMap<String, String> =
+        sysctl_settings(derived).into_iter().collect();
+    let mut out = Vec::new();
+    for (key, value) in &want {
+        match have.get(key) {
+            Some(held) if held == value => {}
+            Some(held) => out.push(format!("{key}: on the node {held}, derived {value}")),
+            None => out.push(format!("{key}: missing on the node, derived {value}")),
+        }
+    }
+    for key in have.keys() {
+        if !want.contains_key(key) {
+            out.push(format!("{key}: on the node but not in the derivation"));
+        }
+    }
+    out
+}
+
 /// How long an image may sit unused before the kubelet may reclaim it.
 ///
 /// A week, for three reasons that agree: it is longer than any rollback this
@@ -955,13 +1002,69 @@ mod tests {
             },
         );
         assert_ne!(first, second, "the reading is what moved");
-        let settings = |conf: &str| -> Vec<String> {
-            conf.lines()
-                .filter(|line| !line.starts_with('#'))
-                .map(str::to_string)
-                .collect()
-        };
-        assert_eq!(settings(&first), settings(&second));
+        assert_eq!(sysctl_settings(&first), sysctl_settings(&second));
+        assert!(
+            sysctl_conf_disagreements(&first, &second).is_empty(),
+            "a re-measurement that moved no watermark is not a disagreement"
+        );
+    }
+
+    #[test]
+    fn the_setting_lines_read_back_as_keys_and_values() {
+        let parsed = sysctl_settings(
+            "# a comment\n\
+             vm.dirty_bytes = 195500000\n\
+             \n\
+             vm.dirty_ratio=0\n",
+        );
+        assert_eq!(
+            parsed,
+            vec![
+                ("vm.dirty_bytes".to_string(), "195500000".to_string()),
+                ("vm.dirty_ratio".to_string(), "0".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_node_whose_file_disagrees_is_named_key_by_key() {
+        let disk = node_disk_io(39_100_000, 64199);
+        let derived = sysctl_node_io_conf(&disk, &a_reading());
+        // A file that matches the derivation except on the force watermark and
+        // the ratio -- what an operator's hand-written file would differ by.
+        let on_node = format!(
+            "vm.dirty_background_bytes = {}\n\
+             vm.dirty_bytes = 1\n\
+             vm.dirty_background_ratio = 0\n\
+             vm.dirty_ratio = 20\n",
+            disk.dirty_background_bytes
+        );
+        let diffs = sysctl_conf_disagreements(&on_node, &derived);
+        assert!(
+            diffs.iter().any(|d| d
+                == &format!(
+                    "vm.dirty_bytes: on the node 1, derived {}",
+                    disk.dirty_bytes
+                )),
+            "a watermark that disagrees must be named with both numbers: {diffs:?}"
+        );
+        assert!(
+            diffs
+                .iter()
+                .any(|d| d == "vm.dirty_ratio: on the node 20, derived 0"),
+            "the ratio the derivation would clear must be named: {diffs:?}"
+        );
+        assert_eq!(
+            diffs.len(),
+            2,
+            "only the keys that disagree are reported, not the whole file: {diffs:?}"
+        );
+    }
+
+    #[test]
+    fn a_file_the_derivation_would_write_reports_no_disagreement() {
+        let conf = sysctl_node_io_conf(&node_disk_io(52_000_000, 64199), &a_reading());
+        assert!(sysctl_conf_disagreements(&conf, &conf).is_empty());
     }
 
     #[test]

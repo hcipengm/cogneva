@@ -412,6 +412,111 @@ fn write_k3s_kubelet_image_gc_dropin() -> Result<()> {
     Ok(())
 }
 
+/// An environment variable that carries nothing is not carrying a value.
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+}
+
+/// The device's sustained write throughput and the reading it came from, as an
+/// operator who measured them hands them over, or `None` when they handed over
+/// none.
+///
+/// Read here rather than measured here on purpose. The install host is idle, so
+/// a measurement taken on it reads the device's cache burst, not the rate it
+/// settles at under load -- and it is the settled rate the watermarks are sized
+/// from, so a burst reading would size them several times too large. The
+/// measurement is taken while the device is working, which is a moment the
+/// installer is not at, so it arrives as an input.
+///
+/// `None` is not a failure: a node installed without a measurement keeps the
+/// kernel's own watermarks, which is the honest state for a number nobody took.
+/// The whole reading is required, not just the rate: the drop-in records where
+/// the number came from, and a header missing a field reads as if the reading
+/// never had it.
+fn node_io_reading_input() -> Option<(u64, cogneva_bootstrap::ThroughputReading)> {
+    let raw = nonempty_env("COGNEVA_NODE_IO_WRITE_BYTES_PER_SEC")?;
+    let sustained = raw.trim().parse::<u64>().ok();
+    let device = nonempty_env("COGNEVA_NODE_IO_DEVICE");
+    let window = nonempty_env("COGNEVA_NODE_IO_WINDOW");
+    let busy =
+        nonempty_env("COGNEVA_NODE_IO_BUSY_PERCENT").and_then(|b| b.trim().parse::<u8>().ok());
+    let measured_at = nonempty_env("COGNEVA_NODE_IO_MEASURED_AT");
+    if let (Some(sustained), Some(device), Some(window), Some(busy), Some(measured_at)) =
+        (sustained, device, window, busy, measured_at)
+    {
+        return Some((
+            sustained,
+            cogneva_bootstrap::ThroughputReading {
+                device,
+                window,
+                busy_percent: busy,
+                measured_at,
+            },
+        ));
+    }
+    warn!(
+        "宿主脏页水位本次不写：COGNEVA_NODE_IO_WRITE_BYTES_PER_SEC 已设，但读数来源不齐\
+         （需连同 COGNEVA_NODE_IO_DEVICE / _WINDOW / _BUSY_PERCENT / _MEASURED_AT 一起给）。\
+         水位要记下它读自哪张盘、哪个窗口、同窗多忙、何时量的，缺一项就等于让头注释谎称读数没有那一项"
+    );
+    None
+}
+
+/// Write the drop-in that carries this node's writeback watermarks, or report
+/// how the one already on the node disagrees with what this reading derives.
+///
+/// Same policy as the config files above on a file that exists -- it is the
+/// operator's decision -- but with a read-back, because a file that is never
+/// overwritten otherwise has nothing that can say the node is running watermarks
+/// this derivation would not produce, or that a hand-written file has drifted
+/// from it. The comparison is over the settings rather than the bytes: the
+/// header records the reading and moves on every re-measurement even when the
+/// watermarks do not.
+///
+/// Applying is a separate step, and the hop between the rule that watches these
+/// watermarks and this write is a person: the reading comes from a rule firing
+/// on a working device and an operator carrying it here, not from any loop.
+async fn write_node_io_sysctl_dropin(
+    disk: &cogneva_bootstrap::NodeDiskIo,
+    reading: &cogneva_bootstrap::ThroughputReading,
+) -> Result<()> {
+    let path = Path::new(cogneva_bootstrap::NODE_IO_SYSCTL_FILE);
+    let derived = cogneva_bootstrap::sysctl_node_io_conf(disk, reading);
+    if path.exists() {
+        let on_node = std::fs::read_to_string(path)?;
+        let disagreements = cogneva_bootstrap::sysctl_conf_disagreements(&on_node, &derived);
+        if disagreements.is_empty() {
+            info!("{} 与本次推导一致，保留不覆盖", path.display());
+        } else {
+            warn!(
+                "{} 已存在且与本次推导不一致（保留不覆盖）：{}。\
+                 请自行确认盘上这份是操作者的决定，还是按旧设备／旧口径留下的过期值",
+                path.display(),
+                disagreements.join("；")
+            );
+        }
+        return Ok(());
+    }
+    std::fs::create_dir_all("/etc/sysctl.d")?;
+    std::fs::write(path, &derived)?;
+    let status = Command::new("sysctl").arg("--system").status().await?;
+    if !status.success() {
+        warn!(
+            "sysctl --system 退出码 {:?}：{} 已写入，但水未必即刻生效",
+            status.code(),
+            path.display()
+        );
+    }
+    info!(
+        "已按设备稳态写 {}/s 预置脏页水位（dirty_background_bytes={} / dirty_bytes={}）→ {}",
+        disk.sustained_write_bytes_per_sec,
+        disk.dirty_background_bytes,
+        disk.dirty_bytes,
+        path.display()
+    );
+    Ok(())
+}
+
 /// Report the nodes whose allocatable memory equals their capacity.
 ///
 /// Kubelet derives allocatable from capacity minus kubeReserved, systemReserved
@@ -478,6 +583,10 @@ async fn install_k3s(hw: &Hardware) -> Result<()> {
     }
     write_k3s_qos_config(hw.mem_total_mb, hw.cpu_cores)?;
     write_k3s_kubelet_image_gc_dropin()?;
+    if let Some((rate, reading)) = node_io_reading_input() {
+        let disk = cogneva_bootstrap::node_disk_io(rate, hw.mem_total_mb);
+        write_node_io_sysctl_dropin(&disk, &reading).await?;
+    }
     let env = if cn_mirror() {
         "INSTALL_K3S_MIRROR=cn"
     } else {

@@ -46,6 +46,11 @@ Cogneva 元启动引导器
     COGNEVA_REPO_ROOT                部署资产所在目录（缺省用二进制内嵌资产解包）
     COGNEVA_INTENT_CONFIG            intent_config.yaml 输出路径
     COGNEVA_MANAGEMENT_PLAN          management_plan.yaml 输出路径
+    COGNEVA_NODE_IO_WRITE_BYTES_PER_SEC  实测的设备稳态写（字节/秒）；设了才写宿主脏页水位
+    COGNEVA_NODE_IO_DEVICE           该读数读自哪张整盘（如 nvme0n1）
+    COGNEVA_NODE_IO_WINDOW           读数取的窗口（如 5m）
+    COGNEVA_NODE_IO_BUSY_PERCENT     同窗设备忙率（整数百分比）
+    COGNEVA_NODE_IO_MEASURED_AT      测量时刻（UTC）
 
 选项：
     -h, --help       打印本帮助并退出
@@ -126,6 +131,11 @@ mod tests {
             "COGNEVA_IMAGE_REGISTRY",
             "COGNEVA_IMAGE_URL",
             "COGNEVA_REPO_ROOT",
+            "COGNEVA_NODE_IO_WRITE_BYTES_PER_SEC",
+            "COGNEVA_NODE_IO_DEVICE",
+            "COGNEVA_NODE_IO_WINDOW",
+            "COGNEVA_NODE_IO_BUSY_PERCENT",
+            "COGNEVA_NODE_IO_MEASURED_AT",
         ] {
             assert!(USAGE.contains(name), "usage text omits {name}");
         }
