@@ -386,7 +386,7 @@ impl Supervisor {
         }
 
         if !report.dead.is_empty() {
-            let dead_ids: Vec<String> = report.dead.iter().map(|(id, _)| id.clone()).collect();
+            let dead_ids = report.dead_ids();
             let respawn = self.respawner.handle_dead_agents(&dead_ids).await?;
             for action in &respawn.retried_crews {
                 let _ = self.event_tx.send(SupervisorEvent::CrewRetried {

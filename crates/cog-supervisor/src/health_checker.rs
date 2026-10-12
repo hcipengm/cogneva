@@ -25,6 +25,12 @@ impl HealthReport {
     pub fn unhealthy_total(&self) -> usize {
         self.suspect.len() + self.dead.len() + self.stuck.len()
     }
+
+    /// Return the ids of the agents this pass classified as dead,
+    /// in the order they were recorded.
+    pub fn dead_ids(&self) -> Vec<String> {
+        self.dead.iter().map(|(id, _)| id.clone()).collect()
+    }
 }
 
 /// Configuration for the [`HealthChecker`] component.

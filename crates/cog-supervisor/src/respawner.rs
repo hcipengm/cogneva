@@ -246,9 +246,6 @@ impl Respawner {
         // We update the state-change timestamp so that subsequent
         // checks see this is a recent transition.
         self.registry.mark_state_change(agent_id);
-        // Touch the heartbeat backwards to past-dead horizon: simpler is
-        // to record the wall-clock now; the caller drives the action.
-        let _ = Utc::now();
         Ok(())
     }
 }
