@@ -1126,6 +1126,21 @@ impl BuildGate {
         lay_out_slots(&self.dir, bound);
     }
 
+    /// Lays the slot directory out on a round where the bound did not move.
+    ///
+    /// The round that moves the bound lays the directory out beside the number
+    /// it writes above; a round that does not still has a name to take back. A
+    /// slot above the bound that was held when the bound last fell is skipped at
+    /// that moment -- removing a held name is what puts two builds in one slot
+    /// -- and nothing else comes back for it once its holder leaves, so the name
+    /// outlives the bound that disowned it and reads to anyone counting the
+    /// directory as room the host does not have. Only the controller runs this:
+    /// the bound is one process's decision for the host, and so are the names
+    /// under it.
+    fn reconcile_slots(&self, bound: usize) {
+        lay_out_slots(&self.dir, bound);
+    }
+
     /// Whether this process is the one that moves the bound.
     ///
     /// The lock is taken once and kept for the life of the process, so the
@@ -1224,6 +1239,8 @@ impl BuildGate {
         // deriving it again from a host it has not watched.
         if controller && persisted != Some(enforce) {
             self.persist_bound(enforce);
+        } else if controller {
+            self.reconcile_slots(enforce);
         }
         if enforce != current {
             tracing::info!(
@@ -2905,6 +2922,41 @@ unevictable 28532736
         );
         drop(second);
         drop(first);
+    }
+
+    /// The slot a bound could not take while a build was in it is taken back on
+    /// a later round, once that build is gone.
+    ///
+    /// What a bound falls past is not always free when it falls: the name it
+    /// leaves is the one a build is in, and the pass that moves the bound skips
+    /// it. Nothing at that moment records an obligation to come back, so if only
+    /// a moving bound laid the directory out the name would stay for as long as
+    /// the directory does, read by anyone counting files as room the host does
+    /// not have. This drives the same reconcile a round with no bound movement
+    /// runs, so the name comes back on the round after the build leaves.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_round_that_moves_no_bound_takes_back_the_room_above_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 2, 0);
+        let first = gate.try_acquire("a build in the first slot").await.unwrap();
+        let second = gate
+            .try_acquire("a build in the second slot")
+            .await
+            .unwrap();
+        gate.persist_bound(1);
+        let stale = dir.path().join("slot-1.lock");
+        assert!(stale.exists(), "the held slot survives the bound that fell");
+
+        drop(second);
+        drop(first);
+        gate.reconcile_slots(1);
+
+        assert!(
+            !stale.exists(),
+            "a bound that stood still still takes back the room above it once it is free"
+        );
+        assert!(dir.path().join("slot-0.lock").exists());
     }
 
     /// A work that keeps being turned away claims the next build, and a build
