@@ -100,6 +100,19 @@ pub fn effective_config(cfg: &BuildGateConfig, build_timeout_secs: u64) -> Build
 mod tests {
     use super::*;
 
+    /// A whole self-evolution block around one gate config, so the pair the
+    /// derivation reads comes from one place here too.
+    fn self_evolution(
+        build_gate: BuildGateConfig,
+        build_timeout_secs: u64,
+    ) -> cog_core::SelfEvolutionConfig {
+        cog_core::SelfEvolutionConfig {
+            build_timeout_secs,
+            build_gate,
+            ..Default::default()
+        }
+    }
+
     fn cfg(wait_secs: u64) -> BuildGateConfig {
         BuildGateConfig {
             enabled: true,
@@ -158,17 +171,21 @@ mod tests {
     /// one of them and arm the other.
     #[test]
     fn the_gate_is_derived_from_the_block_that_holds_both_numbers() {
-        let mut self_evolution = cog_core::SelfEvolutionConfig::default();
-        self_evolution.build_timeout_secs = 3600;
-        self_evolution.build_gate.wait_secs = 1800;
+        let configured = self_evolution(cfg(1800), 3600);
         assert_eq!(
-            effective_gate_for(&self_evolution).wait_secs,
+            effective_gate_for(&configured).wait_secs,
             3600 + WAIT_RELEASE_MARGIN_SECS
         );
         // Everything that is not the budget is the operator's own setting and is
         // passed through: the floor is about one number, not about the gate.
-        self_evolution.build_gate.max_concurrent = 3;
-        assert_eq!(effective_gate_for(&self_evolution).max_concurrent, 3);
+        let widened = self_evolution(
+            BuildGateConfig {
+                max_concurrent: 3,
+                ..cfg(1800)
+            },
+            3600,
+        );
+        assert_eq!(effective_gate_for(&widened).max_concurrent, 3);
     }
 
     /// The executor arms the derivation, and no production reader in this crate
