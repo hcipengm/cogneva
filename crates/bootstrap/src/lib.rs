@@ -357,6 +357,166 @@ pub fn k3s_qos_config_yaml(qos: &NodeQos) -> String {
     )
 }
 
+/// Where the drop-in that carries this node's disk writeback watermarks lands.
+///
+/// `/etc/sysctl.d` rather than a line in `/etc/sysctl.conf`, because the number
+/// is a reading of the device and changes when the device does: a file this
+/// system owns can be rewritten by whoever takes the reading, and the operator's
+/// own `/etc/sysctl.conf` -- applied after this directory by `sysctl --system`,
+/// so a value put there still overrules this one -- is left untouched.
+pub const NODE_IO_SYSCTL_FILE: &str = "/etc/sysctl.d/99-cogneva-node-io.conf";
+
+/// Seconds of the device's own sustained write the node lets pile up before the
+/// kernel starts writing back in the background.
+const DIRTY_BACKGROUND_SECONDS: u64 = 2;
+
+/// The same, for the watermark at which a writer is made to write back before it
+/// can dirty more.
+const DIRTY_FORCE_SECONDS: u64 = 5;
+
+/// Floor for the background watermark. Below the speed the flusher threads can
+/// drain, the kernel starts writing back while the writers are still faster than
+/// it, so the queue this bound exists to shape never forms and the two points
+/// collapse into a permanent trickle. These floors are the smallest pair that
+/// still lets a burst finish.
+const DIRTY_BACKGROUND_FLOOR_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Floor for the force watermark, above the background floor by construction.
+const DIRTY_FLOOR_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The unflushed data never grows past this share of RAM: one twentieth, a
+/// twentieth of the ceiling below.
+///
+/// A cap and not the derivation -- the derivation is the device's throughput --
+/// but the cap is memory's only honest part here. RAM does not decide how much
+/// unflushed data is affordable; it decides only that a device so fast the
+/// throughput-derived number would be enormous must not be allowed to hold the
+/// whole node's memory dirty, which would turn a disk bound into an OOM.
+const DIRTY_MAX_RAM_DIVISOR: u64 = 20;
+
+/// Hard ceiling on either watermark, for a node whose RAM would put the share
+/// above it.
+const DIRTY_CEILING_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// The dirty-page watermarks this node should run with, in bytes.
+///
+/// The two numbers are read from the device's own sustained write throughput,
+/// not from a share of RAM. `vm.dirty_ratio` is a percentage of memory, and the
+/// unflushed data a node can afford has nothing to do with how much memory it
+/// has: what it costs is how long the device takes to write that data back,
+/// which is throughput times seconds. Read against this deployment, the default
+/// 20% of 64 GiB is 12.5 GiB, which at the 33-52 MB/s this node's device writes
+/// while it is working is four to seven minutes of unflushed data -- and every
+/// second a reader waits behind that flush is the stall the ratio produces. The
+/// bytes form says the same thing in the unit that is actually bounded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeDiskIo {
+    /// The device's sustained (post-cache) write throughput, bytes per second.
+    pub sustained_write_bytes_per_sec: u64,
+    /// `vm.dirty_background_bytes`: where the kernel begins writing back in the
+    /// background, without blocking a writer.
+    pub dirty_background_bytes: u64,
+    /// `vm.dirty_bytes`: where a writer is made to write back before it can
+    /// dirty more, which is what a build pays as a stall.
+    pub dirty_bytes: u64,
+}
+
+/// The watermarks for a node whose disk writes back at
+/// `sustained_write_bytes_per_sec`.
+///
+/// `mem_total_mb` is read only for the cap: the amount consumed here is the
+/// device's throughput, and RAM's part is to keep the pile from growing into a
+/// large share of it.
+pub fn node_disk_io(sustained_write_bytes_per_sec: u64, mem_total_mb: u64) -> NodeDiskIo {
+    let ram_bytes = mem_total_mb.saturating_mul(1024 * 1024);
+    // Floored as well as capped, so the pair below it still has the floors to
+    // fall back to on a node whose RAM is smaller than its own floors.
+    let ceiling = DIRTY_CEILING_BYTES
+        .min(ram_bytes / DIRTY_MAX_RAM_DIVISOR)
+        .max(DIRTY_FLOOR_BYTES);
+    let force = (sustained_write_bytes_per_sec * DIRTY_FORCE_SECONDS)
+        .max(DIRTY_FLOOR_BYTES)
+        .min(ceiling);
+    // Capped at half the force point as well as the ceiling, so the two stay
+    // distinct at every input: a background point at or above the force point is
+    // a writeback that only starts once it is already too late, which is the
+    // same as having no background point at all.
+    let background = (sustained_write_bytes_per_sec * DIRTY_BACKGROUND_SECONDS)
+        .max(DIRTY_BACKGROUND_FLOOR_BYTES)
+        .min(force / 2);
+    NodeDiskIo {
+        sustained_write_bytes_per_sec,
+        dirty_background_bytes: background,
+        dirty_bytes: force,
+    }
+}
+
+/// Where the throughput a node's watermarks were read from came from.
+///
+/// Carried alongside the pair, because the pair is a function of the window it
+/// was read over and of how much of that window the device spent working. A
+/// rate averaged over a window the device spent mostly idle measures the idle
+/// time rather than the device, and the two readings yield watermarks that
+/// differ by as much as the device was underworked. The install-time reading is
+/// the worst case of this: it is taken while the page cache absorbs the writes,
+/// so it sees the device's burst and not its sustained rate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThroughputReading {
+    /// The whole disk the rate was read on. The watermark is global to the node,
+    /// so this names whichever device the reading was taken on rather than the
+    /// one the filesystem is mounted from.
+    pub device: String,
+    /// The window the rate was averaged over.
+    pub window: String,
+    /// How much of that window the device was busy, in whole percent.
+    pub busy_percent: u8,
+    /// When the reading was taken, UTC.
+    pub measured_at: String,
+}
+
+/// The sysctl drop-in that carries the watermarks, and the reading they came
+/// from.
+///
+/// The reading goes in as a comment block above the values, because a file that
+/// carries only the numbers cannot be checked against a later reading: two files
+/// that disagree are then indistinguishable from two files read over different
+/// windows, which is the routine case for a number that moves with the device.
+/// A reader comparing a delivered file against a freshly derived one therefore
+/// parses the values and leaves the comment block out of the comparison; a
+/// comparison of whole files reports a difference every time the device is
+/// re-measured, including when nothing about the watermarks changed.
+///
+/// The two ratio keys are written as zero beside the byte keys rather than left
+/// out. The kernel keeps one of each pair and reads the other back as zero once
+/// either is written, so `vm.dirty_bytes` alone already clears `vm.dirty_ratio`
+/// -- but the file is also what a person reads to see the node's writeback
+/// policy, and half a pair that looks unset reads as if the ratios were still in
+/// play. Both halves stated is what makes the answer whole.
+pub fn sysctl_node_io_conf(disk: &NodeDiskIo, reading: &ThroughputReading) -> String {
+    format!(
+        "# Writeback watermarks read from the device's sustained write throughput,\n\
+         # not from a share of RAM. Where that reading came from:\n\
+         # device {device}\n\
+         # window {window}\n\
+         # busy {busy}% of that window\n\
+         # measured at {at}\n\
+         # sustained write {throughput} bytes/s, read as the rate of\n\
+         # node_disk_written_bytes_total over a window whose occupancy is the rate of\n\
+         # node_disk_io_time_seconds_total.\n\
+         vm.dirty_background_bytes = {background}\n\
+         vm.dirty_bytes = {force}\n\
+         vm.dirty_background_ratio = 0\n\
+         vm.dirty_ratio = 0\n",
+        device = reading.device,
+        window = reading.window,
+        busy = reading.busy_percent,
+        at = reading.measured_at,
+        throughput = disk.sustained_write_bytes_per_sec,
+        background = disk.dirty_background_bytes,
+        force = disk.dirty_bytes,
+    )
+}
+
 /// How long an image may sit unused before the kubelet may reclaim it.
 ///
 /// A week, for three reasons that agree: it is longer than any rollback this
@@ -669,6 +829,139 @@ mod tests {
         // the first start, so a stray key here is a node that never comes up.
         assert_eq!(yaml.lines().filter(|l| !l.starts_with("  - ")).count(), 1);
         assert!(yaml.starts_with("kubelet-arg:\n"));
+    }
+
+    #[test]
+    fn the_watermarks_are_read_from_the_devices_own_throughput() {
+        // A device writing 39.1 MB/s sustained on a 64199 MiB node: two seconds
+        // of the device starts the background writeback, five seconds is where a
+        // writer is made to wait.
+        let disk = node_disk_io(39_100_000, 64199);
+        assert_eq!(disk.dirty_background_bytes, 78_200_000);
+        assert_eq!(disk.dirty_bytes, 195_500_000);
+        // The RAM share is nowhere near binding here, which is the point: the
+        // device, not the memory, sets both numbers.
+        assert!(disk.dirty_bytes < 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_slow_device_keeps_the_floors_and_a_fast_one_keeps_the_cap() {
+        // A device so slow the throughput product falls under the floors: the
+        // floors hold, because below them the flusher never catches up.
+        let slow = node_disk_io(1_000_000, 8192);
+        assert_eq!(slow.dirty_background_bytes, 32 * 1024 * 1024);
+        assert_eq!(slow.dirty_bytes, 64 * 1024 * 1024);
+        // A device fast enough to ask for more than a small node's RAM share in
+        // five seconds is capped at that share instead.
+        let fast = node_disk_io(200_000_000, 8192);
+        let share = 8192 * 1024 * 1024 / DIRTY_MAX_RAM_DIVISOR;
+        assert_eq!(fast.dirty_bytes, share);
+        assert!(
+            fast.dirty_bytes < 200_000_000 * DIRTY_FORCE_SECONDS,
+            "the cap, not the device, set this one"
+        );
+    }
+
+    #[test]
+    fn the_force_watermark_is_always_above_the_background_one() {
+        for throughput in [0u64, 1, 1_000_000, 39_100_000, 200_000_000, 5_000_000_000] {
+            for ram_mb in [512u64, 4096, 8192, 64199, 1_048_576] {
+                let disk = node_disk_io(throughput, ram_mb);
+                assert!(
+                    disk.dirty_bytes > disk.dirty_background_bytes,
+                    "throughput {throughput}, ram {ram_mb}: force {} is not above background {}",
+                    disk.dirty_bytes,
+                    disk.dirty_background_bytes
+                );
+                assert!(
+                    disk.dirty_background_bytes <= disk.dirty_bytes / 2,
+                    "throughput {throughput}, ram {ram_mb}: the background point is not \
+                     meaningfully below the force point"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_dropin_states_both_halves_of_each_pair() {
+        let conf = sysctl_node_io_conf(&node_disk_io(39_100_000, 64199), &a_reading());
+        assert!(
+            conf.contains("vm.dirty_background_bytes = 78200000\n"),
+            "{conf}"
+        );
+        assert!(conf.contains("vm.dirty_bytes = 195500000\n"), "{conf}");
+        // The ratios are stated zero rather than left out, so the file reads as
+        // the whole policy and not half of one.
+        assert!(conf.contains("vm.dirty_background_ratio = 0\n"), "{conf}");
+        assert!(conf.contains("vm.dirty_ratio = 0\n"), "{conf}");
+    }
+
+    /// A device reading, in the shape the measuring side hands one over: the
+    /// busiest window of a real device rather than the install-time burst.
+    fn a_reading() -> ThroughputReading {
+        ThroughputReading {
+            device: "nvme0n1".to_string(),
+            window: "5m".to_string(),
+            busy_percent: 86,
+            measured_at: "2026-10-13T00:47:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn the_dropin_says_which_window_its_number_came_from() {
+        let conf = sysctl_node_io_conf(&node_disk_io(52_000_000, 64199), &a_reading());
+        for fact in [
+            "# device nvme0n1\n",
+            "# window 5m\n",
+            "# busy 86% of that window\n",
+            "# measured at 2026-10-13T00:47:00Z\n",
+            "# sustained write 52000000 bytes/s",
+        ] {
+            assert!(conf.contains(fact), "{fact:?} missing from:\n{conf}");
+        }
+        // Everything before the first setting is a comment, and the settings are
+        // exactly the four keys -- which is what lets a reader compare two files
+        // by what they set and not by what they say about where it came from.
+        let settings: Vec<&str> = conf.lines().filter(|line| !line.starts_with('#')).collect();
+        assert_eq!(
+            settings,
+            vec![
+                "vm.dirty_background_bytes = 104000000",
+                "vm.dirty_bytes = 260000000",
+                "vm.dirty_background_ratio = 0",
+                "vm.dirty_ratio = 0",
+            ],
+            "{conf}"
+        );
+        assert!(
+            conf.starts_with("# Writeback watermarks"),
+            "the reading goes above the values:\n{conf}"
+        );
+    }
+
+    #[test]
+    fn a_remeasurement_that_moves_no_value_changes_no_setting() {
+        // The same device read twice: the header differs, the policy does not.
+        // A comparison that reads whole files calls this a drift and asks an
+        // operator to reconcile a node whose watermarks never moved.
+        let disk = node_disk_io(52_000_000, 64199);
+        let first = sysctl_node_io_conf(&disk, &a_reading());
+        let second = sysctl_node_io_conf(
+            &disk,
+            &ThroughputReading {
+                busy_percent: 82,
+                measured_at: "2026-10-13T06:00:00Z".to_string(),
+                ..a_reading()
+            },
+        );
+        assert_ne!(first, second, "the reading is what moved");
+        let settings = |conf: &str| -> Vec<String> {
+            conf.lines()
+                .filter(|line| !line.starts_with('#'))
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(settings(&first), settings(&second));
     }
 
     #[test]
