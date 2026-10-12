@@ -1067,6 +1067,20 @@ impl MemoryIngestor {
         });
     }
 
+    /// 类型在 Agent/DagExecutor 的文本跳里被拍平之后，环境类失败还能不能被认
+    /// 出来，全看 reason 里那两个线标（见 cog_core::contract::outcome）：外层
+    /// 把上游 5xx/限流包进 terminal_env_failure 时，is_deterministic_failure 会
+    /// 按里面那个自报的、环境自己能清掉的拒绝回答 false。它不是这条 raw 的内
+    /// 容判决；在这里写死信，就是把一次上游事故在一个对账轮里批量记成永久丢失。
+    fn flattened_environment_failure(reason: &str) -> bool {
+        use cog_core::contract::outcome::{
+            declares, is_deterministic_failure, TERMINAL_ENV_FAILURE_PREFIX,
+            UPSTREAM_UNAVAILABLE_PREFIX,
+        };
+        declares(reason, UPSTREAM_UNAVAILABLE_PREFIX)
+            || (declares(reason, TERMINAL_ENV_FAILURE_PREFIX) && !is_deterministic_failure(reason))
+    }
+
     /// 单条 raw 的完整处理：先确保归档（幂等），再补齐缺失的层。层检查让
     /// 崩溃重放不会重复写已存在的 schema/summary。返回是否处理完成——总线
     /// 模式下只有完成才 ack，未完成留给红投。
@@ -1122,7 +1136,10 @@ impl MemoryIngestor {
                 }
                 done
             }
-            Err(e) if e.is_environment_failure() => {
+            Err(e)
+                if e.is_environment_failure()
+                    || Self::flattened_environment_failure(&e.to_string()) =>
+            {
                 // 上游没接住，不是这条消息的毛病。写死信等于用一次容量故障
                 // 决定哪些事件永远进不了记忆，ack 掉更会把唯一的恢复路径压到
                 // 对账窗口上——留在事件面等重投，并让闸门暂停后续拉取。
