@@ -1,0 +1,929 @@
+//! The resident maintenance loop for the principle ledger.
+//!
+//! The account's authoritative copy is the platform's own `principle_ledger`
+//! table: one row per principle, identity the memory's own file name, and a state
+//! only a look at the two registries may move. What maintains it is this resident
+//! interval loop, registered in the main process's plugin and elected through the
+//! owner lease, so the table has exactly one writer at any moment. It is the
+//! change ledger's loop with a different subject and the same shape -- same
+//! lease, same liveness family, same rule that the account is written in exactly
+//! one place and read everywhere.
+//!
+//! Four things happen here, and the third is the only one that moves a row. The
+//! loop folds the intake into the account, reporting by name any principle whose
+//! carrier's bytes moved since it was last measured and holding those back from
+//! measurement for the pass. It reads what is outstanding back out, with the
+//! census of the whole account beside it, because "how much of the corpus has a
+//! gate" is the reading this account exists to produce. It looks at the
+//! outstanding set against both registries, through the one call that may move a
+//! state. And it reports the reverse direction -- declarations in the platform's
+//! own tree that name no row of the account -- by name, because a mistyped slug
+//! and a principle the account never heard of are one count and two fixes.
+//!
+//! What it does not do is hand work over. The set of principles with no gate is
+//! what a driver would act on, and the change ledger's own loop does hand its
+//! owed set over -- so the question here is answered rather than skipped: a
+//! corpus of five hundred-odd ungated principles would go onto the goal path in
+//! one pass, a dispatched task has no withdrawal, and what a gate for a given
+//! principle should even look like is a design nobody has started. Handing that
+//! over is its own change with its own budget and its own way back; the reading
+//! such a change would act on is what this pass produces every period.
+//!
+//! A row the look could not settle keeps its state and is named in the pass's own
+//! line, with every reason of the closed set counted on every pass, zeroes
+//! included. That is what keeps "nothing has looked at this" and "something
+//! looked and could not tell" apart -- and a third answer that vanishes when it
+//! is zero is a third answer nobody can see going away.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use tracing::{debug, info, warn};
+
+use cog_core::{
+    OwnerLeaseBroker, PrincipleCensus, PrincipleLedgerStore, PrincipleMeasurement, PrincipleOrphan,
+    PrincipleRow, PrincipleState, ShutdownSignal,
+};
+
+use crate::change_measure::CheckTree;
+use crate::principle_measure::{
+    drift_annotation, judge, measurable, Declarations, UnsettledReason, Verdict,
+    PLATFORM_DECLARATION_PATTERN, PLATFORM_REGISTRY_FILES,
+};
+
+/// This loop's name in the process liveness registry, and the value of
+/// `cogneva_loop_tick_age_seconds{loop=...}`.
+pub const PRINCIPLE_LEDGER_LOOP: &str = "principle_ledger";
+
+/// This loop's role name on the owner lease: who maintains the account.
+///
+/// The same value as the loop name, but the two read different surfaces: the
+/// loop name labels the liveness and ownership readings (`{loop=...}`), the role
+/// name is the row in `cogneva_owner_leases.role`.
+pub const PRINCIPLE_LEDGER_ROLE: &str = "principle_ledger";
+
+/// How long one round waits for the next.
+///
+/// The account moves on two events only: the host pushing a reading of the
+/// corpus, or a contract test being added to the platform's tree. Both are
+/// human-driven and measured in hours, so this period is not "how fast do
+/// principles arrive" but "how long before someone notices the account stopped
+/// being maintained". Minutes rather than seconds keeps the steady state out of
+/// the log. The deployed liveness alert derives its threshold from this period
+/// (`6 * period`), so changing it changes that threshold.
+pub const PRINCIPLE_LEDGER_PASS_INTERVAL: Duration = Duration::from_secs(300);
+
+/// How many outstanding rows one round reads for its own census line.
+///
+/// The round exists for one thing: to make "the account is readable, and this is
+/// how much is outstanding" a line in the log with a reading behind it.
+const OUTSTANDING_PEEK: usize = 50;
+
+/// How many queued readings one pass folds into the account.
+///
+/// Generous on purpose, and deliberately larger than the corpus. The intake is
+/// one list of the whole corpus pushed in one go, so a bound below the corpus
+/// size would leave the account chasing the list across passes and every count
+/// read in between would be of a half-folded corpus -- which is exactly the kind
+/// of reading this account must not publish. A pass is still bounded: a queue
+/// that grew past this is not a corpus being read, it is a writer looping.
+const DECLARATIONS_PER_PASS: usize = 1000;
+
+/// How many queued refusal events one pass counts.
+const REFUSALS_PER_PASS: usize = 500;
+
+/// How many rows one pass looks at against the registries.
+///
+/// The account holds rows in the hundreds and a pass that walked all of them
+/// would spend the whole interval asking git questions while holding the owner
+/// lease. Rows are taken stalest-first, so this bound costs latency rather than
+/// coverage: everything outstanding is still reached, in as many passes as it
+/// takes.
+const MEASUREMENTS_PER_PASS: usize = 200;
+
+/// How long a look that could not be settled is left before it is asked again.
+///
+/// Held alone it would be permanent, and a permanent answer to a question about
+/// two moving registries is the wrong shape: the look could not be settled
+/// because of what the tree holds right now, and a tree that gains a contract
+/// test makes it answerable. An hour is long enough that re-asking costs nothing
+/// (the pass runs every few minutes and the unanswered set is a few hundred rows)
+/// and short enough that a tree that changed is noticed within the same working
+/// session.
+const UNMEASURABLE_RETRY: Duration = Duration::from_secs(3600);
+
+/// A principle this process could not settle, and when it last tried.
+///
+/// The reason is kept so a repeat is not said twice, and the time so that the
+/// silence is a window rather than a decision. Both are this process's memory of
+/// what it already said, not facts about the account, so a restarting process
+/// re-learns them by asking again -- the honest way to recover, since what makes
+/// a look unsettleable is a property of the registries and can change.
+#[derive(Debug)]
+struct UnsettledPrinciple {
+    why: String,
+    since: Instant,
+}
+
+/// Start the loop. Not started when there is no ledger store (see the module
+/// header).
+pub fn spawn_principle_ledger_loop(
+    store: Arc<dyn PrincipleLedgerStore>,
+    role: Option<Arc<dyn OwnerLeaseBroker>>,
+    shutdown: ShutdownSignal,
+    tree: CheckTree,
+) {
+    info!(
+        interval_secs = PRINCIPLE_LEDGER_PASS_INTERVAL.as_secs(),
+        arbitrated = role.is_some(),
+        "Principle ledger loop enabled"
+    );
+
+    drop(cog_core::loop_health::spawn(
+        PRINCIPLE_LEDGER_LOOP,
+        cog_core::loop_health::Cadence::Periodic(PRINCIPLE_LEDGER_PASS_INTERVAL),
+        shutdown.clone(),
+        // Rebuilt per attempt, so everything the body consumes is cloned here.
+        move |beat| {
+            let store = store.clone();
+            let role = role.clone();
+            let shutdown = shutdown.clone();
+            let tree = tree.clone();
+            async move {
+                // The role is renewed on the lease contract's own cadence rather
+                // than once per pass: a pass can be long, and a term that ran out
+                // mid-pass would hand the seat to a second process working the
+                // same table. The loop still asks once per pass, because a role
+                // lost has to stop the work in the pass it was lost.
+                let hold =
+                    cog_core::RoleHold::start(role, PRINCIPLE_LEDGER_ROLE, beat.clone(), &shutdown);
+
+                // Looks this process could not settle, by slug, with the reason
+                // it could not and when it was last tried.
+                let mut unsettled: HashMap<String, UnsettledPrinciple> = HashMap::new();
+
+                let mut ticker = tokio::time::interval(PRINCIPLE_LEDGER_PASS_INTERVAL);
+                // The first tick is immediately ready; eating it puts the first
+                // read one period after the start rather than contending with
+                // startup for the same table.
+                ticker.tick().await;
+                loop {
+                    beat.beat();
+                    tokio::select! {
+                        _ = ticker.tick() => {}
+                        _ = shutdown.wait() => break,
+                    }
+                    // One process at a time works this table. The answer is
+                    // recorded on the beat (held / held elsewhere / unprovable);
+                    // this only obeys it, and obeys it strictly: unprovable also
+                    // means do not act, because not knowing that nobody holds the
+                    // role is not the same as knowing it.
+                    if !hold.may_act().await {
+                        continue;
+                    }
+                    // The fold runs first and hands back what drifted, so a row
+                    // whose carrier's bytes just moved is held back from this
+                    // pass's measurement rather than being measured against the
+                    // text the account was carrying until a moment ago.
+                    let drift = fold_pass(&*store).await;
+                    read_pass(&*store).await;
+                    measure_pass(&*store, &tree, &drift, &mut unsettled).await;
+                }
+            }
+        },
+    ));
+}
+
+/// One round: read the account's outstanding set and its census, and say so
+/// plainly when either could not be read.
+///
+/// A failed read is neither raised nor retried here: in a periodic loop the next
+/// round is the retry, and repeated failure is never silent -- every round leaves
+/// a warning.
+async fn read_pass(store: &dyn PrincipleLedgerStore) {
+    match store.outstanding(OUTSTANDING_PEEK).await {
+        Ok(rows) if rows.is_empty() => {
+            debug!("principle ledger read: nothing outstanding");
+        }
+        Ok(rows) => {
+            info!(summary = %outstanding_summary(&rows), "principle ledger read");
+        }
+        Err(e) => {
+            warn!(error = %e, "principle ledger read failed; this cycle read nothing");
+        }
+    }
+
+    // The census is the reading the account exists for: how much of the corpus
+    // has a gate, how much is a debt, and how much nothing has looked at. Read
+    // every pass and printed every pass, because a coverage that is only computed
+    // when someone asks is one nobody watches.
+    match store.census().await {
+        Ok(census) => info!(account = %account_summary(&census), "principle ledger census"),
+        Err(e) => warn!(error = %e, "principle ledger: the census could not be read"),
+    }
+}
+
+/// Fold what has been queued into the account, count what has been refused, and
+/// hand back the principles whose carrier moved.
+///
+/// Folding first is what makes a principle appear in the same pass's outstanding
+/// reading; the backlog is read either way, because a backlog that stays non-zero
+/// across passes is the one reading that says the account has not caught up with
+/// what it was told. Neither the fold's failure nor the count's is raised or
+/// retried -- the next pass is the retry, and every pass leaves a line.
+async fn fold_pass(store: &dyn PrincipleLedgerStore) -> HashSet<String> {
+    let mut drifted = HashSet::new();
+    match store.fold_declarations(DECLARATIONS_PER_PASS).await {
+        Ok(fold) if fold.folded == 0 && fold.drifted.is_empty() => {}
+        Ok(fold) => {
+            // By name, with both hashes: the question a drift raises is "did the
+            // gate follow the text", and a count of drifted principles cannot be
+            // answered without going to look up what moved. Said here and not
+            // carried into the measurement, because what the account does about
+            // it is nothing -- no state is written for a drifted row.
+            for drift in &fold.drifted {
+                warn!(
+                    slug = %drift.slug,
+                    "principle ledger: this principle's carrier bytes moved, so this pass does \
+                     not judge it -- {}",
+                    drift_annotation(drift)
+                );
+                drifted.insert(drift.slug.clone());
+            }
+            info!(
+                folded = fold.folded,
+                drifted = fold.drifted.len(),
+                "principle ledger: readings folded into the account"
+            );
+        }
+        Err(e) => warn!(
+            error = %e,
+            "principle ledger: folding the intake failed; nothing entered the account this pass"
+        ),
+    }
+    match store.pending_declarations().await {
+        Ok(0) => {}
+        Ok(pending) => info!(
+            pending,
+            "principle ledger: readings queued and not yet folded"
+        ),
+        Err(e) => warn!(error = %e, "principle ledger: could not read the intake backlog"),
+    }
+
+    // The refusal counts. The side that refused work cannot add to the account
+    // itself -- a count written by the party it counts is the number this table
+    // exists to replace -- so it reports events and this is where they are added
+    // up. Nothing here decides whether a refusal was justified; it counts what
+    // was reported and keeps the last instant.
+    match store.fold_refusals(REFUSALS_PER_PASS).await {
+        Ok(0) => {}
+        Ok(folded) => info!(
+            folded,
+            "principle ledger: gate refusals counted against their principles"
+        ),
+        Err(e) => warn!(error = %e, "principle ledger: counting refusals failed"),
+    }
+    match store.pending_refusals().await {
+        Ok(0) => {}
+        Ok(pending) => info!(
+            pending,
+            "principle ledger: refusals reported and not yet counted"
+        ),
+        Err(e) => warn!(error = %e, "principle ledger: could not read the refusal backlog"),
+    }
+
+    drifted
+}
+
+/// Read the platform's own registry out of one revision of the tree.
+///
+/// The registry is this platform's source: a contract test whose header states
+/// which principle it enforces. It is read the same way a change's check is
+/// measured -- out of the repository, at one resolved revision, through the same
+/// tree -- because a running deployment has no checkout of its own source and
+/// because a ref resolved once per pass is what makes every row in the pass
+/// answer for one tree.
+///
+/// A failure comes back as the reason it failed rather than as an empty registry:
+/// the two are the difference between "no gate found" and "no registry read", and
+/// that difference is the whole point of the third answer.
+async fn read_registry(
+    tree: &CheckTree,
+) -> Result<(Declarations, String), (UnsettledReason, String)> {
+    let snapshot = tree.snapshot().await.map_err(|why| {
+        (
+            UnsettledReason::RevisionUnreadable,
+            format!("the platform's own tree could not be resolved, so no declaration could be read: {why}"),
+        )
+    })?;
+    let lines = tree
+        .matching_lines(
+            snapshot.rev(),
+            PLATFORM_REGISTRY_FILES,
+            PLATFORM_DECLARATION_PATTERN,
+        )
+        .await
+        .map_err(|why| {
+            (
+                UnsettledReason::RegistryUnreadable,
+                format!(
+                    "the declaration lines could not be read at {}: {why}",
+                    snapshot.rev()
+                ),
+            )
+        })?;
+    Ok((Declarations::parse(&lines), snapshot.rev().to_string()))
+}
+
+/// The measurement a row's verdict turns into, or `None` for one that moves
+/// nothing.
+///
+/// The verdict is taken as an argument rather than looked up again here: the same
+/// look decides both whether to write and what to write, and a second call would
+/// be a second answer to the same question.
+///
+/// The platform-side gate column is written with the verdict, from the same
+/// declaration the verdict was drawn from, so the column and the state agree by
+/// construction: a row whose state says a gate exists and whose gate column names
+/// nothing is a row no reader can argue with.
+fn measurement_of(
+    row: &PrincipleRow,
+    verdict: &Verdict,
+    declarations: &Declarations,
+    revision: &str,
+) -> Option<PrincipleMeasurement> {
+    let state = verdict.state()?;
+    let mut measurement = PrincipleMeasurement::new(row.slug.clone(), state).at_revision(revision);
+    measurement.platform_gate = declarations.gate_for(&row.slug).map(str::to_string);
+    Some(measurement)
+}
+
+/// Look at the outstanding set against both registries, and record what each row
+/// came back as.
+///
+/// The batch is read before the tree is opened, so that a registry which cannot
+/// be read still reports how many rows it left unmeasured. Opening the registry
+/// first and returning on failure would leave that pass with a warning and no
+/// count, which is the one shape a reader cannot tell from a pass with nothing to
+/// do.
+///
+/// A row whose look could not be settled is left exactly as it is: its state is
+/// what an earlier look found, and this pass has nothing to put in its place.
+/// What it does have is the reason, said once per slug and then counted, so the
+/// steady state is a number rather than a wall of repeats. Leaving it alone is a
+/// deferral rather than a verdict -- the registries move, and the row is asked
+/// again after [`UNMEASURABLE_RETRY`].
+async fn measure_pass(
+    store: &dyn PrincipleLedgerStore,
+    tree: &CheckTree,
+    drifted: &HashSet<String>,
+    unsettled: &mut HashMap<String, UnsettledPrinciple>,
+) {
+    // A row that cannot be settled keeps its `measured_at`, so it holds the head
+    // of a staleness-ordered read on every pass. Asking for the known ones on top
+    // of the batch is what stops them crowding out the rows a look can answer
+    // for: without it, a large enough unanswerable set would mean nothing below
+    // it is ever reached.
+    let take = MEASUREMENTS_PER_PASS.saturating_add(unsettled.len());
+    let rows = match store.outstanding(take).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "principle ledger: the outstanding set could not be read, so nothing was \
+                 judged this pass"
+            );
+            return;
+        }
+    };
+
+    let (declarations, revision) = match read_registry(tree).await {
+        Ok(read) => read,
+        Err((reason, why)) => {
+            // One fault, one reason, every row that this pass would have judged:
+            // a registry nobody could read must not read as a pass with nothing
+            // outstanding. Not remembered in `unsettled` either, because this is
+            // not a fact about any one principle -- it is the registry being
+            // unreadable, and it is re-asked in full on every pass until it is
+            // not.
+            warn!(
+                why = %why,
+                reason = reason.as_str(),
+                rows = would_judge(&rows, unsettled, Instant::now(), drifted),
+                "principle ledger: the platform's registry could not be read, so nothing was \
+                 judged this pass"
+            );
+            return;
+        }
+    };
+
+    // The reverse direction, before any verdict: a declaration naming a slug the
+    // account has no row for is reported by name and with the file that says it.
+    // A mistyped slug and a principle the account never heard of are one count
+    // and two different fixes, and a silence here would judge the first of them
+    // as the second.
+    //
+    // Carried as an `Option` rather than reported only when it is non-zero: the
+    // reconciliation runs on every pass, so its result belongs on the pass line
+    // whether or not it found anything, and an absent count would leave "read and
+    // found none" indistinguishable from "the account's side of the comparison
+    // could not be read". `None` is the second of those, and it is not a zero.
+    let orphan_declarations = match store.slugs().await {
+        Ok(known) => {
+            let known: HashSet<String> = known.into_iter().collect();
+            let orphans = declarations.orphans(&known);
+            if !orphans.is_empty() {
+                warn!(
+                    orphan_declarations = orphans.len(),
+                    orphans = %orphan_summary(&orphans),
+                    "principle ledger: the platform's registry names principles the account has \
+                     no row for"
+                );
+            }
+            Some(orphans.len())
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "principle ledger: the account's slugs could not be read, so the reverse \
+                 reconciliation was skipped this pass"
+            );
+            None
+        }
+    };
+
+    // A declaration the registry could not read is named too: it is a file's
+    // specific line, and the account is about to report every principle it might
+    // have been the gate for as ungated, so the reader needs to know which line
+    // to look at.
+    if declarations.has_unreadable() {
+        warn!(
+            unreadable_declarations = declarations.unreadable_count(),
+            declarations = %unreadable_summary(&declarations),
+            "principle ledger: the platform's registry holds declarations whose slug cannot be \
+             read, so no principle can be found ungated on this pass"
+        );
+    }
+
+    let now = Instant::now();
+    let mut enforced = 0usize;
+    let mut unenforced = 0usize;
+    let mut by_reason: HashMap<UnsettledReason, usize> = HashMap::new();
+    let mut known_unsettled = 0usize;
+    let mut considered = 0usize;
+    let mut held_back_for_drift = 0usize;
+    for row in &rows {
+        if drifted.contains(&row.slug) {
+            held_back_for_drift += 1;
+            continue;
+        }
+        if let Some(known) = unsettled.get(&row.slug) {
+            if still_unanswered(known, now) {
+                known_unsettled += 1;
+                continue;
+            }
+            // Past its window: asked again rather than assumed unchanged.
+        }
+        if considered == MEASUREMENTS_PER_PASS {
+            break;
+        }
+        considered += 1;
+        let verdict = judge(row, &declarations);
+        let Some(measurement) = measurement_of(row, &verdict, &declarations, &revision) else {
+            let reason = verdict
+                .reason()
+                .unwrap_or(UnsettledReason::RegistryUnreadable);
+            let why = verdict
+                .why()
+                .unwrap_or("the look settled nothing and gave no reason")
+                .to_string();
+            // Said when the wording is new, not every time it is re-confirmed:
+            // what the re-confirmation is for is the answer changing, and a line
+            // per hour per row says nothing the count does not.
+            if unsettled.get(&row.slug).map(|k| k.why.as_str()) != Some(why.as_str()) {
+                warn!(
+                    slug = %row.slug,
+                    reason = reason.as_str(),
+                    why = %why,
+                    "principle ledger: this principle cannot be settled against the two \
+                     registries; its state is left as it was"
+                );
+            }
+            unsettled.insert(row.slug.clone(), UnsettledPrinciple { why, since: now });
+            *by_reason.entry(reason).or_default() += 1;
+            continue;
+        };
+        // Settled this time, so whatever this slug was unanswered for is over and
+        // its reason is dropped: a stale reason left in the map would report a
+        // fault the registries no longer have.
+        unsettled.remove(&row.slug);
+        match measurement.state {
+            PrincipleState::Enforced => enforced += 1,
+            PrincipleState::Unenforced => unenforced += 1,
+        }
+        if let Err(e) = store.apply_principle_measurement(&measurement).await {
+            // Counted as judged because it was, not because it was stored: the
+            // line below is what says the write failed, and a state that did not
+            // land must not also be subtracted from the reading.
+            warn!(
+                slug = %row.slug,
+                error = %e,
+                "principle ledger: a measurement could not be written back"
+            );
+        }
+    }
+
+    info!(
+        judged = considered,
+        enforced,
+        unenforced,
+        held_back_for_drift,
+        unsettled = %reason_summary(&by_reason),
+        already_unsettled = known_unsettled,
+        orphan_declarations = ?orphan_declarations,
+        revision = %revision,
+        "principle ledger: judged the outstanding set against the two registries"
+    );
+}
+
+/// How many of these rows a pass would have judged.
+///
+/// The same rules the loop applies -- a row held back for drift is not judged, a
+/// slug inside its unanswered window is not asked again, and the batch is bounded
+/// -- so a count taken when the registry could not be read reports what went
+/// unjudged rather than what was read.
+fn would_judge(
+    rows: &[PrincipleRow],
+    unsettled: &HashMap<String, UnsettledPrinciple>,
+    now: Instant,
+    drifted: &HashSet<String>,
+) -> usize {
+    measurable(rows, drifted)
+        .into_iter()
+        .filter(|row| match unsettled.get(&row.slug) {
+            Some(known) => !still_unanswered(known, now),
+            None => true,
+        })
+        .take(MEASUREMENTS_PER_PASS)
+        .count()
+}
+
+/// One pass's unanswered rows by reason, as a single field.
+///
+/// Every reason in the closed set is named, zero included. A field per reason
+/// would be a second copy of the set, and it would go stale the moment the set
+/// grew; a line naming only what happened leaves the reader counting absences.
+/// The set is the code's, so the line is rendered from it.
+fn reason_summary(by_reason: &HashMap<UnsettledReason, usize>) -> String {
+    UnsettledReason::ALL
+        .iter()
+        .map(|reason| {
+            format!(
+                "{} {}",
+                reason.as_str(),
+                by_reason.get(reason).copied().unwrap_or(0)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Whether a look already known not to be settleable is left alone this pass.
+///
+/// The window is what makes leaving a row alone a deferral rather than a verdict:
+/// past it the look is run again, so a tree that gained a contract test is
+/// noticed without anything having to be restarted.
+fn still_unanswered(known: &UnsettledPrinciple, now: Instant) -> bool {
+    now.duration_since(known.since) < UNMEASURABLE_RETRY
+}
+
+/// The whole account in one line: the three counts, the total, and the coverage
+/// they make.
+///
+/// The coverage is computed here rather than left to the reader because it is the
+/// number this account exists to produce, and a ratio someone has to work out
+/// from two counts is one that gets quoted wrong. The unmeasured count is named
+/// beside it and never folded into the debt: a principle no look has settled is
+/// not a principle without a gate.
+fn account_summary(census: &PrincipleCensus) -> String {
+    let coverage = match census.coverage() {
+        Some(ratio) => format!("{:.1}%", ratio * 100.0),
+        None => "no rows".to_string(),
+    };
+    format!(
+        "enforced {} unenforced {} unmeasured {} total {} coverage {}",
+        census.enforced,
+        census.unenforced,
+        census.unmeasured,
+        census.total(),
+        coverage
+    )
+}
+
+/// Compress one round's outstanding rows into one line.
+///
+/// The two kinds of "oldest" are named separately: never measured (`measured_at`
+/// is empty) and measured while still outstanding. The first says something
+/// entered the account that nothing has looked at; the second says it was looked
+/// at and is still owed. One number covering both would state them as one fact.
+fn outstanding_summary(rows: &[PrincipleRow]) -> String {
+    let by_state = PrincipleState::ALL
+        .into_iter()
+        .filter_map(|state| {
+            let n = rows.iter().filter(|row| row.state == Some(state)).count();
+            (n > 0).then(|| format!("{} {}", state.as_str(), n))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let unmeasured = rows.iter().filter(|row| row.state.is_none()).count();
+    let by_state = if by_state.is_empty() {
+        format!("unmeasured {unmeasured}")
+    } else {
+        format!("{by_state}, unmeasured {unmeasured}")
+    };
+    match rows.iter().filter_map(|row| row.measured_at).min() {
+        Some(oldest) => format!(
+            "{} outstanding: {by_state}; oldest look {}",
+            rows.len(),
+            oldest.to_rfc3339()
+        ),
+        None => format!("{} outstanding: {by_state}", rows.len()),
+    }
+}
+
+/// The declarations the account has no row for, one per line.
+///
+/// By name and with the file, never as a bare total: the work a mistyped slug
+/// calls for is in the declaration and the work a never-read principle calls for
+/// is in the reading, and a reader given only the count cannot tell which of the
+/// two they are looking at.
+fn orphan_summary(orphans: &[PrincipleOrphan]) -> String {
+    orphans
+        .iter()
+        .map(|orphan| format!("{}<-{}", orphan.slug, orphan.source))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The declarations the registry held but could not read, one per line.
+fn unreadable_summary(declarations: &Declarations) -> String {
+    declarations
+        .unreadable()
+        .iter()
+        .map(|(path, text)| format!("{path}: {text}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    fn row(slug: &str, host: Option<&str>, state: Option<PrincipleState>) -> PrincipleRow {
+        PrincipleRow {
+            slug: slug.to_string(),
+            lead: None,
+            carrier_path: None,
+            carrier_sha256: None,
+            host_gate: host.map(str::to_string),
+            platform_gate: None,
+            state,
+            refusals: 0,
+            last_refused_at: None,
+            first_seen_at: Utc.timestamp_opt(1_760_000_000, 0).unwrap(),
+            measured_at: None,
+            measured_rev: None,
+        }
+    }
+
+    fn declarations(lines: &[(&str, &str)]) -> Declarations {
+        Declarations::parse(
+            &lines
+                .iter()
+                .map(|(path, text)| (path.to_string(), text.to_string()))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Every reason in the closed set is named on the line, zeroes included. A
+    /// reason that emptied has to read as zero rather than vanish: a missing key
+    /// and a reason nobody thought to count look the same to the reader.
+    #[test]
+    fn the_reason_line_names_every_reason_including_the_empty_ones() {
+        let mut by_reason = HashMap::new();
+        by_reason.insert(UnsettledReason::HostColumnAbsent, 12);
+        by_reason.insert(UnsettledReason::CarrierNotInTree, 1);
+        assert_eq!(
+            reason_summary(&by_reason),
+            "registry_unreadable 0, revision_unreadable 0, host_column_absent 12, \
+             carrier_not_in_tree 1, declaration_unparsable 0"
+        );
+        assert_eq!(
+            reason_summary(&HashMap::new()),
+            "registry_unreadable 0, revision_unreadable 0, host_column_absent 0, \
+             carrier_not_in_tree 0, declaration_unparsable 0"
+        );
+    }
+
+    /// The account's own line: the three counts, the total, and the ratio. The
+    /// unmeasured rows are in the total -- they are rows the account holds, and
+    /// leaving them out would make the coverage read as if it were computed over
+    /// only the principles someone had got to.
+    #[test]
+    fn the_account_line_counts_the_unmeasured_rows_against_the_total() {
+        let census = PrincipleCensus {
+            enforced: 5,
+            unenforced: 556,
+            unmeasured: 0,
+        };
+        assert_eq!(
+            account_summary(&census),
+            "enforced 5 unenforced 556 unmeasured 0 total 561 coverage 0.9%"
+        );
+
+        let partly = PrincipleCensus {
+            enforced: 1,
+            unenforced: 0,
+            unmeasured: 2,
+        };
+        assert_eq!(
+            account_summary(&partly),
+            "enforced 1 unenforced 0 unmeasured 2 total 3 coverage 33.3%"
+        );
+    }
+
+    /// An account holding nothing has no coverage, and a zero would read as an
+    /// account whose every principle is ungated.
+    #[test]
+    fn an_empty_account_has_no_coverage_rather_than_none() {
+        assert_eq!(
+            account_summary(&PrincipleCensus::default()),
+            "enforced 0 unenforced 0 unmeasured 0 total 0 coverage no rows"
+        );
+    }
+
+    /// Never measured and measured-but-still-outstanding are two facts, and the
+    /// line says both: one is something entered that nothing has looked at, the
+    /// other is something looked at and still owed.
+    #[test]
+    fn the_outstanding_line_separates_unmeasured_rows_from_stale_ones() {
+        let rows = vec![
+            row("a", Some("A_RE"), None),
+            row("b", Some("-"), Some(PrincipleState::Unenforced)),
+            row("c", Some("-"), Some(PrincipleState::Unenforced)),
+        ];
+        assert_eq!(
+            outstanding_summary(&rows),
+            "3 outstanding: unenforced 2, unmeasured 1"
+        );
+    }
+
+    /// The state order does not follow the row order: the same rows in a
+    /// different order read out as the same line, or every diff of two readings
+    /// would be noise.
+    #[test]
+    fn the_state_order_does_not_follow_the_row_order() {
+        let one = vec![
+            row("b", Some("-"), Some(PrincipleState::Unenforced)),
+            row("a", Some("-"), Some(PrincipleState::Enforced)),
+        ];
+        let two = vec![
+            row("a", Some("-"), Some(PrincipleState::Enforced)),
+            row("b", Some("-"), Some(PrincipleState::Unenforced)),
+        ];
+        assert_eq!(outstanding_summary(&one), outstanding_summary(&two));
+    }
+
+    /// The reverse direction is by name and with the file. A total cannot tell a
+    /// mistyped slug from a principle the account never heard of, and the two
+    /// call for different work.
+    #[test]
+    fn the_orphan_line_names_each_declaration_and_its_file() {
+        let orphans = vec![
+            PrincipleOrphan {
+                slug: "feedback_typo".into(),
+                source: "crates/cogneva/tests/a.rs".into(),
+            },
+            PrincipleOrphan {
+                slug: "feedback_ghost".into(),
+                source: "crates/cogneva/tests/b.rs".into(),
+            },
+        ];
+        assert_eq!(
+            orphan_summary(&orphans),
+            "feedback_typo<-crates/cogneva/tests/a.rs, \
+             feedback_ghost<-crates/cogneva/tests/b.rs"
+        );
+    }
+
+    /// A declaration nothing can read is named with its file and its text: the
+    /// account is about to report every principle it might have been the gate for
+    /// as ungated, so the reader needs the line, not a total.
+    #[test]
+    fn the_unreadable_line_names_the_file_and_the_line() {
+        let registry = declarations(&[("crates/cogneva/tests/a.rs", "//! principle: Bad-Slug")]);
+        assert_eq!(
+            unreadable_summary(&registry),
+            "crates/cogneva/tests/a.rs: //! principle: Bad-Slug"
+        );
+    }
+
+    /// The state written with a verdict comes from the same declaration the
+    /// verdict was drawn from, so the two cannot disagree.
+    #[test]
+    fn the_measurement_carries_the_gate_it_was_judged_by() {
+        let registry = declarations(&[("crates/cogneva/tests/a.rs", "//! principle: feedback_x")]);
+        let judged = row("feedback_x", Some("-"), None);
+        let verdict = judge(&judged, &registry);
+        let platformed = measurement_of(&judged, &verdict, &registry, "rev1")
+            .expect("a gate in the platform's registry settles the row");
+        assert_eq!(platformed.state, PrincipleState::Enforced);
+        assert_eq!(
+            platformed.platform_gate.as_deref(),
+            Some("crates/cogneva/tests/a.rs")
+        );
+        assert_eq!(platformed.measured_rev.as_deref(), Some("rev1"));
+    }
+
+    /// A look that settled nothing produces no measurement at all: there is no
+    /// state to write, and a measurement carrying the state the row already had
+    /// would stamp a fresh `measured_at` on a look nobody made.
+    #[test]
+    fn a_look_that_settled_nothing_writes_nothing() {
+        let judged = row("feedback_x", None, None);
+        let verdict = judge(&judged, &Declarations::default());
+        assert!(measurement_of(&judged, &verdict, &Declarations::default(), "rev1").is_none());
+    }
+
+    /// A drift that is not judged this pass does not count against the pass's
+    /// batch, and the same rows with the drift over are judged.
+    #[test]
+    fn a_drifted_row_is_not_counted_as_one_the_pass_would_judge() {
+        let rows = vec![row("a", Some("A_RE"), None), row("b", Some("B_RE"), None)];
+        let now = Instant::now();
+        let drifted: HashSet<String> = ["a".to_string()].into_iter().collect();
+        assert_eq!(would_judge(&rows, &HashMap::new(), now, &drifted), 1);
+        assert_eq!(would_judge(&rows, &HashMap::new(), now, &HashSet::new()), 2);
+    }
+
+    /// What a dead registry left unjudged, counted the way the loop would have
+    /// read it: a slug inside its unanswered window is not one this pass was
+    /// going to judge, and once that window is up it is.
+    #[test]
+    fn a_dead_registry_counts_what_this_pass_would_have_judged() {
+        let now = Instant::now();
+        let rows = vec![
+            row("a", Some("A_RE"), None),
+            row("b", Some("B_RE"), None),
+            row("c", Some("C_RE"), None),
+        ];
+        let mut unsettled = HashMap::new();
+        unsettled.insert(
+            "a".to_string(),
+            UnsettledPrinciple {
+                why: "the host's column never arrived".into(),
+                since: now,
+            },
+        );
+        assert_eq!(would_judge(&rows, &unsettled, now, &HashSet::new()), 2);
+        assert_eq!(
+            would_judge(&rows, &unsettled, now + UNMEASURABLE_RETRY, &HashSet::new()),
+            3
+        );
+    }
+
+    /// The count is of what a pass judges, not of what it read: past the batch
+    /// bound the rows beyond it were not going to be judged either, and counting
+    /// them would overstate what the failure cost.
+    #[test]
+    fn the_batch_bound_is_what_a_pass_judges_not_what_it_read() {
+        let rows: Vec<PrincipleRow> = (0..MEASUREMENTS_PER_PASS + 1)
+            .map(|n| row(&format!("feedback_{n}"), Some("A_RE"), None))
+            .collect();
+        assert_eq!(
+            would_judge(&rows, &HashMap::new(), Instant::now(), &HashSet::new()),
+            MEASUREMENTS_PER_PASS
+        );
+    }
+
+    /// A row left alone for not being settleable is asked again once its window
+    /// is up. Without the second half, "cannot tell" would harden into "never
+    /// looked at again" and a registry that gained a declaration would go
+    /// unnoticed.
+    #[test]
+    fn a_row_is_left_alone_only_until_its_window_is_up() {
+        let now = Instant::now();
+        let fresh = UnsettledPrinciple {
+            why: "the host's column never arrived".into(),
+            since: now,
+        };
+        assert!(still_unanswered(&fresh, now));
+        assert!(still_unanswered(
+            &fresh,
+            now + UNMEASURABLE_RETRY - Duration::from_secs(1)
+        ));
+        assert!(!still_unanswered(&fresh, now + UNMEASURABLE_RETRY));
+    }
+}

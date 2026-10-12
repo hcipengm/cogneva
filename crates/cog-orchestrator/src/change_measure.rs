@@ -409,6 +409,42 @@ impl CheckTree {
         }
     }
 
+    /// Every line under `pathspec` at `rev` matching an extended `pattern`, as
+    /// the file it is in and its text.
+    ///
+    /// A general read of the tree rather than a check about one change: what the
+    /// platform's own source declares about itself is read the same way, out of
+    /// the same commit, with the same timeout -- a second git wrapper would be a
+    /// second place for the revision discipline and the timeout to drift from
+    /// this one.
+    ///
+    /// The expression is extended because the shape a declaration is written in
+    /// is what is being looked for; a caller wanting its argument treated as
+    /// text has [`Self::holds`], which anchors it with `-F`.
+    ///
+    /// A repository with no match is an empty list, not a failure: `git grep`
+    /// reports the two differently and only one of them is news.
+    pub async fn matching_lines(
+        &self,
+        rev: &str,
+        pathspec: &str,
+        pattern: &str,
+    ) -> Result<Vec<(String, String)>, String> {
+        let mut args = vec!["grep", "-n", "-E", "-e", pattern, rev];
+        if !pathspec.is_empty() {
+            args.push("--");
+            args.push(pathspec);
+        }
+        match self.git(&args).await {
+            Ok(out) => Ok(out
+                .lines()
+                .filter_map(|line| parse_grep_line(line, rev))
+                .collect()),
+            Err(e) if e.starts_with(NO_MATCH) => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// One git invocation against this repository. `Ok` is its stdout; `Err` is
     /// what went wrong, as a line fit to put in a log.
     async fn git(&self, args: &[&str]) -> Result<String, String> {
@@ -452,6 +488,39 @@ impl CheckTree {
 /// Leading marker for a refusal that carries no message, so that "no match" and
 /// "could not run" stay apart without reading exit codes at the call site.
 const NO_MATCH: &str = "no match";
+
+/// One line of `git grep -n` output, as the file it is in and its text.
+///
+/// Two formats reach here and the difference is not cosmetic. Asked to read a
+/// tree, `git grep` writes the revision in front of every line --
+/// `<rev>:<path>:<line>:<text>` -- and asked about the working directory it does
+/// not; a parser that took the first colon-separated field for the path would
+/// name the revision as the file, keep the path as a line number, and hand its
+/// caller text with a line number glued to the front. That misreading is silent:
+/// every line still parses, the count is even right, and only the answers are
+/// wrong.
+///
+/// The revision is dropped by its own value rather than by field position. It is
+/// the string this call asked for, so a path that happens to hold a colon cannot
+/// be mistaken for it, and a revision that git spells differently from the way it
+/// was asked for -- a shortened one, say -- shows up as a path that will not
+/// resolve rather than as a silently wrong one. The rest is split from the left
+/// so that the text stays whole: it is the last field and holds anything, colons
+/// included.
+fn parse_grep_line(line: &str, rev: &str) -> Option<(String, String)> {
+    let line = match line.strip_prefix(rev) {
+        Some(rest) => rest.strip_prefix(':').unwrap_or(line),
+        None => line,
+    };
+    let mut fields = line.splitn(3, ':');
+    let path = fields.next()?;
+    let lineno = fields.next()?;
+    let text = fields.next()?;
+    // A refusal line rather than a match: `git grep -n` prints a trailing
+    // summary for a match with no line number on it, which is not a line of the
+    // tree.
+    (!lineno.is_empty()).then(|| (path.to_string(), text.to_string()))
+}
 
 /// The scope as a path inside the tree.
 ///
@@ -726,5 +795,59 @@ mod tests {
         assert!(!predicate_is_a_rendering("cog_core::Task"));
         assert!(!predicate_is_a_rendering("crates/x::y"));
         assert!(predicate_is_a_rendering("crates/x :: fn thing"));
+    }
+
+    /// Reading a tree, `git grep` puts the revision in front of every line. Both
+    /// shapes are parsed, because both reach this function and the wrong one
+    /// parses cleanly into a path nobody has.
+    #[test]
+    fn a_grep_line_is_read_with_the_revision_off_and_the_text_whole() {
+        let rev = "0".repeat(40);
+        assert_eq!(
+            parse_grep_line(
+                &format!("{rev}:crates/x/tests/a.rs:41://! principle: feedback_x"),
+                &rev
+            ),
+            Some((
+                "crates/x/tests/a.rs".to_string(),
+                "//! principle: feedback_x".to_string()
+            ))
+        );
+        // The working directory's format, with no revision in front.
+        assert_eq!(
+            parse_grep_line("crates/x/tests/a.rs:41://! principle: feedback_x", &rev),
+            Some((
+                "crates/x/tests/a.rs".to_string(),
+                "//! principle: feedback_x".to_string()
+            ))
+        );
+    }
+
+    /// The text is whatever follows the second colon, colons included: a line of
+    /// source is the thing being read, and one holding `::` must not come back
+    /// cut in half.
+    #[test]
+    fn a_grep_line_keeps_the_colons_in_the_text() {
+        let rev = "0".repeat(40);
+        assert_eq!(
+            parse_grep_line(&format!("{rev}:crates/x/src/a.rs:7:let t = cog_core::Task;"), &rev),
+            Some((
+                "crates/x/src/a.rs".to_string(),
+                "let t = cog_core::Task;".to_string()
+            ))
+        );
+    }
+
+    /// A prefix that looks like the revision but is not one -- a path that merely
+    /// starts with the same characters -- is left alone, and a line carrying no
+    /// line number is not a line of the tree.
+    #[test]
+    fn a_path_that_merely_starts_like_the_revision_is_not_one() {
+        let rev = "abc";
+        assert_eq!(
+            parse_grep_line("abcdef.rs:3:text", rev),
+            Some(("abcdef.rs".to_string(), "text".to_string()))
+        );
+        assert_eq!(parse_grep_line("abcdef.rs::text", rev), None);
     }
 }

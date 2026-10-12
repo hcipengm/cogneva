@@ -779,6 +779,24 @@ impl cog_core::SystemPlugin for StoragePlugin {
             warn!("No PostgreSQL pool; the change ledger is unavailable in this deployment");
         }
 
+        // ── PrincipleLedgerStore ──
+        // The same shape and the same reason as the change ledger above: the
+        // account is the table, a process-local one would report its own state
+        // as the platform's, and without a pool nothing is published and the
+        // loop that maintains it leaves the account alone.
+        if let Some(pool) = self.pg_pool.clone() {
+            let store: Arc<dyn cog_core::PrincipleLedgerStore> =
+                Arc::new(crate::PostgresPrincipleLedgerStore::new(pool));
+            ctx.publish_service(store);
+            info!("StoragePlugin principle ledger store published");
+        } else if strict_persistence {
+            return Err(cog_core::SFError::Config(
+                "No PostgreSQL pool for PrincipleLedgerStore (strict_persistence=true)".into(),
+            ));
+        } else {
+            warn!("No PostgreSQL pool; the principle ledger is unavailable in this deployment");
+        }
+
         // ── ObjectBackend (singleton for all modules) ──
         let http_client = ctx.consume_service::<dyn cog_core::HttpClient>();
         let object_backend =

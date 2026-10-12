@@ -661,6 +661,34 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
             None => info!("change ledger loop not started: no ChangeLedgerStore published"),
         }
 
+        // Principle ledger loop.
+        //
+        // Same shape as the change ledger's and for the same reasons: the
+        // account's authoritative copy is the platform's own table, this is the
+        // one loop that maintains it, and it is elected through the owner lease
+        // so the table has one writer. It is started only where a ledger store
+        // was published, and not being started is not a fault -- a deployment
+        // without a shared database has no account to keep.
+        match ctx.consume_service::<dyn cog_core::PrincipleLedgerStore>() {
+            Some(store) => {
+                let principle_shutdown = ctx
+                    .consume::<cog_core::ShutdownSignal>()
+                    .map(|s| (*s).clone())
+                    .unwrap_or_default();
+                crate::principle_ledger::spawn_principle_ledger_loop(
+                    store,
+                    ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>(),
+                    principle_shutdown,
+                    // The same tree the change ledger measures against: what the
+                    // platform's own source declares about itself is read out of
+                    // the commit this deployment builds from, one repository and
+                    // one mount.
+                    crate::change_measure::tree_from_environment(),
+                );
+            }
+            None => info!("principle ledger loop not started: no PrincipleLedgerStore published"),
+        }
+
         Ok(())
     }
 
