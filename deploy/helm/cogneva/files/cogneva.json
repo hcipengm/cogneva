@@ -990,12 +990,12 @@
         },
         {
           "name": "build_gate_refused",
-          "promql": "sum by (dir, role) (increase(cogneva_build_gate_refused_total[1h]))",
+          "promql": "sum by (dir, role, reason) (increase(cogneva_build_gate_refused_total[1h]))",
           "condition": {
             "greater_than": 0.0
           },
           "severity": "warning",
-          "summary": "a build was refused a slot {value} time(s) in 1h: the host-wide build gate bounds how many builds run at once, because builds share the host with the cluster and the sum of them pages the machine instead of failing. A refusal means a build that had nothing to come back to gave up after its wait budget -- the change or rollout it belonged to did not fail, it did not run, so a refusal that keeps happening is a bound set too low or a builder holding its slot far too long (see cogneva_build_gate_in_flight and cogneva_build_gate_waiting) The count is summed across the processes that publish it rather than read per process: each process counts only its own, so the sum is what the deployment did, and the row stays keyed on the subject above instead of on a pod the next rollout deletes."
+          "summary": "a build was refused a slot {value} time(s) in 1h, on the wall {reason}: the host-wide build gate bounds how many builds run at once, because builds share the host with the cluster and the sum of them pages the machine instead of failing. A refusal is a build that never ran rather than one that failed -- the change or rollout it belonged to did not fail, it did not run. The wall is on the row and the four do not share a remedy: busy is a build that would not wait finding every slot taken and waited_out is one that waited the whole budget for a slot that never freed, and those two are the bound set too low or a builder holding its slot far too long (see cogneva_build_gate_in_flight and cogneva_build_gate_waiting); maintenance_hold is a build-cache sweep or a registry restart holding the field, which is work standing the builds down on purpose and is ours to schedule rather than a bound to raise; queue_ahead is another work that was turned away and claimed the next build, which is the gate queueing and wants nobody. Sum the wall away when the only question is whether the gate is refusing work. The count is summed across the processes that publish it rather than read per process: each process counts only its own, so the sum is what the deployment did, and the row stays keyed on the subject above instead of on a pod the next rollout deletes."
         },
         {
           "name": "build_gate_not_in_force",
