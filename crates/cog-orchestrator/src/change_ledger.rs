@@ -11,12 +11,19 @@
 //! a process whose storage holds no shared database never reaches this point, so
 //! it never becomes a candidate.
 //!
-//! This loop writes no row today. Both halves that write -- reading documents
-//! into the account (in), handing the outstanding set to the goal/DAG path (out)
-//! -- have no production path yet: nothing on this platform reads documents or
-//! evaluates a change's own check, so a write here would be a verdict this loop
-//! made up. What it does is the half it can do honestly: take the seat, read the
-//! outstanding set, and say when the read failed.
+//! Two things happen here, and neither is a judgement. The loop folds the intake
+//! into the account -- declarations queued by other parties become readings,
+//! through the same reading path a direct write would use -- and reads the
+//! outstanding set back out, saying plainly when a read failed. The fold is
+//! mechanical: it carries what a document asked for and adds nothing of its own,
+//! so this loop cannot make a change look done.
+//!
+//! The half that would hand the outstanding set to the goal/DAG path is still
+//! missing. Nothing on this platform evaluates a change's own check yet, so a
+//! state written here would be a verdict this loop made up. Until that path
+//! exists the ledger is fed but not measured, and its rows stay `undecided` --
+//! which is the honest reading of "read about, never looked at", and is why the
+//! two halves are reported separately rather than as one progress number.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,6 +63,16 @@ pub const CHANGE_LEDGER_PASS_INTERVAL: Duration = Duration::from_secs(300);
 /// work over will pick its own batch size from its own throttle rather than
 /// reusing this one.
 const OUTSTANDING_PEEK: usize = 50;
+
+/// How many queued declarations one pass folds into the account.
+///
+/// A pass is a maintenance tick, not a queue drain, so it takes a bounded slice
+/// and the next tick takes the rest: an intake that grew large must not make a
+/// single tick unbounded, and a tick that ran long would hold the owner lease
+/// past the cadence it is renewed on. The queue is written by a person or a
+/// script, in batches of tens, so this bound is generous for how it is used --
+/// reaching it means the fold is behind, which the backlog reading says anyway.
+const DECLARATIONS_PER_PASS: usize = 200;
 
 /// Start the loop. Not started when there is no ledger store (see the module
 /// header).
@@ -121,6 +138,8 @@ pub fn spawn_change_ledger_loop(
 /// round is the retry, and repeated failure is never silent -- every round
 /// leaves a warning.
 async fn read_pass(store: &dyn ChangeLedgerStore) {
+    fold_pass(store).await;
+
     match store.outstanding(OUTSTANDING_PEEK).await {
         Ok(rows) if rows.is_empty() => {
             debug!("change ledger read: nothing outstanding");
@@ -131,6 +150,36 @@ async fn read_pass(store: &dyn ChangeLedgerStore) {
         Err(e) => {
             warn!(error = %e, "change ledger read failed; this cycle read nothing");
         }
+    }
+}
+
+/// Fold what has been queued into the account, then say how much is still
+/// queued.
+///
+/// Folding first is what makes a change appear in the same pass's outstanding
+/// reading; the backlog is read either way, because a backlog that stays non-zero
+/// across passes is the one reading that says the account has not caught up with
+/// what it was told. Neither the fold's failure nor the count's is raised or
+/// retried -- the next pass is the retry, and every pass leaves a line.
+async fn fold_pass(store: &dyn ChangeLedgerStore) {
+    match store.fold_declarations(DECLARATIONS_PER_PASS).await {
+        Ok(0) => {}
+        Ok(folded) => info!(
+            folded,
+            "change ledger: declarations folded into the account"
+        ),
+        Err(e) => warn!(
+            error = %e,
+            "change ledger: folding the intake failed; nothing entered the account this pass"
+        ),
+    }
+    match store.pending_declarations().await {
+        Ok(0) => {}
+        Ok(pending) => info!(
+            pending,
+            "change ledger: declarations queued and not yet folded"
+        ),
+        Err(e) => warn!(error = %e, "change ledger: could not read the intake backlog"),
     }
 }
 

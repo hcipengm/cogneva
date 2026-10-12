@@ -190,6 +190,14 @@ impl ChangeMeasurement {
 /// separate surface: a reading records what a document asks for, a measurement
 /// records what the tree shows, and only the second one decides whether a change
 /// is done.
+///
+/// The reading pipeline has two steps, and the storage keeps them apart. A
+/// reading can be queued with [`Self::declare`] by anyone who has news for the
+/// ledger; it enters the account only when the ledger's own writer folds it with
+/// [`Self::fold_declarations`]. The queue is durable rather than in-process
+/// because the two steps happen at different times and often in different
+/// processes, and a handover that only ever existed in memory is one the ledger
+/// cannot be shown to have received.
 #[async_trait]
 pub trait ChangeLedgerStore: Send + Sync {
     /// Add or refresh the rows a document reading contributes: the identity, the
@@ -202,6 +210,55 @@ pub trait ChangeLedgerStore: Send + Sync {
     /// because its document was dropped from the corpus is not a statement that
     /// the change is gone.
     async fn record_readings(&self, readings: &[ChangeReading]) -> SFResult<usize>;
+
+    /// Queue a reading to be folded into the account: what a document asks for,
+    /// waiting for the ledger's own writer to pick it up.
+    ///
+    /// This is the intake, and it is a separate door from [`Self::record_readings`]
+    /// on purpose. Writing the account directly is the resident writer's job; a
+    /// session, a script or an extraction batch that has news for the ledger
+    /// queues it here instead. Queuing *is* telling: a change nobody queued is a
+    /// change the ledger was never told about, so there is no second channel
+    /// through which the handover could happen and not be recorded.
+    ///
+    /// Takes the same shape a reading does, because that is what it becomes --
+    /// one document's naming of one change, with no state. A declaration cannot
+    /// move a row's state any more than a reading can: the fold writes through
+    /// [`Self::record_readings`], which by contract never touches `state`,
+    /// `measured_at` or `landed_at`. The side that declares a change therefore
+    /// has no way to declare it done.
+    ///
+    /// Idempotent per document and identity: queuing the same change from the
+    /// same document twice leaves one declaration, so a declaring script that is
+    /// re-run after a failure does not queue the same work twice. A declaration
+    /// already queued is left exactly as it is -- correcting one means
+    /// withdrawing it and declaring again, for the same reason a reading is
+    /// withdrawn rather than edited. Answers how many declarations were newly
+    /// queued; the ones already there are not counted.
+    async fn declare(&self, readings: &[ChangeReading]) -> SFResult<usize>;
+
+    /// Fold up to `limit` unfolded declarations into the account, and answer how
+    /// many were folded.
+    ///
+    /// The fold is the ledger's only way in, and it adds nothing of its own:
+    /// every declaration becomes exactly one [`Self::record_readings`] call, so
+    /// a state still comes only from a measurement.
+    ///
+    /// Declarations are marked folded *after* their reading is written. A fold
+    /// interrupted in between leaves them unfolded and the next pass repeats the
+    /// work, which costs nothing because the reading path is an idempotent
+    /// upsert. Marking first would instead drop the reading, and a change that
+    /// was declared but never entered the account is the failure the intake
+    /// exists to make impossible.
+    async fn fold_declarations(&self, limit: usize) -> SFResult<usize>;
+
+    /// How many declarations are queued and not yet folded: the intake's backlog.
+    ///
+    /// This is the one reading that says whether "the ledger was told" actually
+    /// happened. A change handed over and not yet folded appears here and
+    /// nowhere else, so zero is the only state in which the account is known to
+    /// have caught up with what has been declared.
+    async fn pending_declarations(&self) -> SFResult<u64>;
 
     /// Apply one measurement: move the row's state, stamp `measured_at`, and
     /// stamp or clear `landed_at` to match.

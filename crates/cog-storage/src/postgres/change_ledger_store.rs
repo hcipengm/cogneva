@@ -24,6 +24,17 @@ use cog_core::{
 const ROW_COLUMNS: &str = "kind, scope, literal, state, title, assertion, sources, \
                            first_seen_at, measured_at, landed_at";
 
+/// How wide each keyed identity part may be, taken from the columns that key
+/// them rather than from what a caller would like to write.
+///
+/// The bounds are the narrower dialect's (MySQL cannot key an unbounded TEXT
+/// column), so one set governs both. Widths are counted in characters, which is
+/// what both dialects' VARCHAR lengths mean.
+const KIND_MAX: usize = 32;
+const SCOPE_MAX: usize = 191;
+const LITERAL_MAX: usize = 512;
+const DOC_MAX: usize = 512;
+
 /// PostgreSQL change ledger store.
 #[derive(Clone)]
 pub struct PostgresChangeLedgerStore {
@@ -86,6 +97,39 @@ impl PostgresChangeLedgerStore {
             .map(|row| Self::row_to_entry(row).map_err(SFError::Database))
             .collect()
     }
+
+    /// A queued declaration as the reading it will be folded as.
+    ///
+    /// A row that cannot be read into a reading fails the fold rather than being
+    /// skipped: a dropped declaration is indistinguishable from one that was
+    /// never made, and the ledger would look caught up while a change it was
+    /// told about sits queued forever.
+    fn row_to_reading(row: &sqlx::postgres::PgRow) -> Result<ChangeReading, String> {
+        Ok(ChangeReading {
+            identity: ChangeIdentity::new(
+                row.try_get::<String, _>("kind")
+                    .map_err(|e| format!("kind: {e}"))?,
+                row.try_get::<String, _>("scope")
+                    .map_err(|e| format!("scope: {e}"))?,
+                row.try_get::<String, _>("literal")
+                    .map_err(|e| format!("literal: {e}"))?,
+            ),
+            title: row
+                .try_get::<Option<String>, _>("title")
+                .map_err(|e| format!("title: {e}"))?,
+            assertion: row
+                .try_get::<Option<String>, _>("assertion")
+                .map_err(|e| format!("assertion: {e}"))?,
+            source: ChangeSource {
+                doc: row
+                    .try_get::<String, _>("doc")
+                    .map_err(|e| format!("doc: {e}"))?,
+                verdict: row
+                    .try_get::<Option<String>, _>("verdict")
+                    .map_err(|e| format!("verdict: {e}"))?,
+            },
+        })
+    }
 }
 
 /// Add a reading's source to a row that may already cite other documents.
@@ -127,11 +171,77 @@ ON CONFLICT (kind, scope, literal) DO UPDATE SET
         ELSE NULL
     END";
 
+/// Refuse a reading whose identity or document does not fit its column.
+///
+/// Checked here rather than left to the database because the dialects disagree
+/// about an over-long value: Postgres raises, and MySQL shortens it. A key that
+/// was silently shortened would land on a different change's row, and the
+/// collision is invisible in the stored row -- the two would simply be one row,
+/// and one of them would never be measured.
+fn check_fits(what: &str, value: &str, max: usize) -> Result<(), String> {
+    let width = value.chars().count();
+    if width > max {
+        return Err(format!(
+            "{what} is {width} characters, over the {max} the column holds"
+        ));
+    }
+    Ok(())
+}
+
+/// Every reading is checked before it is written, wherever it came from, so a
+/// queued declaration and a direct write are held to the same width.
+fn check_reading(reading: &ChangeReading) -> Result<(), String> {
+    check_fits("kind", &reading.identity.kind, KIND_MAX)?;
+    check_fits("scope", &reading.identity.scope, SCOPE_MAX)?;
+    check_fits("literal", &reading.identity.literal, LITERAL_MAX)?;
+    check_fits("source document", &reading.source.doc, DOC_MAX)
+}
+
+/// Queue a declaration, or leave the one already queued for this change and
+/// document exactly as it is.
+///
+/// `DO NOTHING` rather than an update: a declaration is one reading of one
+/// document, so a document that wants to say something different about a change
+/// withdraws its declaration and makes a new one. Updating in place would make
+/// "what this document asked for" a value that changes without the document
+/// changing, which is the same merge the reading path refuses.
+const DECLARE_SQL: &str = "\
+INSERT INTO change_ledger_declared (kind, scope, literal, doc, title, assertion, verdict)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+ON CONFLICT (kind, scope, literal, doc) DO NOTHING";
+
+/// The declarations one fold takes, oldest first.
+///
+/// The identity parts break ties on `declared_at` because a batch queued in one
+/// statement shares a timestamp, and without the tiebreak which of them a
+/// half-full fold takes would follow whatever order the scan returned -- a
+/// different set on the next run, and a different one again on the other
+/// dialect.
+const FOLD_SELECT_SQL: &str = "\
+SELECT kind, scope, literal, doc, title, assertion, verdict
+FROM change_ledger_declared
+WHERE folded_at IS NULL
+ORDER BY declared_at ASC, kind ASC, scope ASC, literal ASC, doc ASC
+LIMIT $1";
+
+/// Mark one declaration folded, and only if it is still unfolded.
+///
+/// The `folded_at IS NULL` guard is what keeps the stamp a statement about this
+/// fold rather than an overwrite: it can be run again without moving a time that
+/// an earlier fold set.
+const FOLD_MARK_SQL: &str = "\
+UPDATE change_ledger_declared SET folded_at = now()
+WHERE folded_at IS NULL AND kind = $1 AND scope = $2 AND literal = $3 AND doc = $4";
+
+const PENDING_SQL: &str =
+    "SELECT count(*) AS n FROM change_ledger_declared WHERE folded_at IS NULL";
+
 #[async_trait]
 impl ChangeLedgerStore for PostgresChangeLedgerStore {
     async fn record_readings(&self, readings: &[ChangeReading]) -> SFResult<usize> {
         let mut stored = 0usize;
         for reading in readings {
+            check_reading(reading).map_err(SFError::Validation)?;
             sqlx::query(RECORD_READING_SQL)
                 .bind(&reading.identity.kind)
                 .bind(&reading.identity.scope)
@@ -151,6 +261,82 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
             stored += 1;
         }
         Ok(stored)
+    }
+
+    async fn declare(&self, readings: &[ChangeReading]) -> SFResult<usize> {
+        let mut queued = 0usize;
+        for reading in readings {
+            check_reading(reading).map_err(SFError::Validation)?;
+            let outcome = sqlx::query(DECLARE_SQL)
+                .bind(&reading.identity.kind)
+                .bind(&reading.identity.scope)
+                .bind(&reading.identity.literal)
+                .bind(&reading.source.doc)
+                .bind(&reading.title)
+                .bind(&reading.assertion)
+                .bind(&reading.source.verdict)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| {
+                    SFError::Database(format!("declare {}: {e}", reading.identity.as_key()))
+                })?;
+            // The conflict clause writes nothing, so a declaration already queued
+            // contributes no row here. Counting the statement rather than the
+            // batch is what makes "how many were newly queued" answerable.
+            queued += outcome.rows_affected() as usize;
+        }
+        Ok(queued)
+    }
+
+    async fn fold_declarations(&self, limit: usize) -> SFResult<usize> {
+        let rows = sqlx::query(FOLD_SELECT_SQL)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("read declarations to fold: {e}")))?;
+        let readings: Vec<ChangeReading> = rows
+            .iter()
+            .map(|row| Self::row_to_reading(row).map_err(SFError::Database))
+            .collect::<SFResult<_>>()?;
+        if readings.is_empty() {
+            return Ok(0);
+        }
+
+        // The account first, the marks second. A fold that stops in between
+        // leaves the declarations unfolded and repeats this work on the next
+        // pass, which the reading path absorbs as an idempotent upsert; the
+        // other order would drop the change instead, and nothing would say so.
+        self.record_readings(&readings).await?;
+
+        let mut folded = 0usize;
+        for reading in &readings {
+            sqlx::query(FOLD_MARK_SQL)
+                .bind(&reading.identity.kind)
+                .bind(&reading.identity.scope)
+                .bind(&reading.identity.literal)
+                .bind(&reading.source.doc)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| {
+                    SFError::Database(format!(
+                        "mark declaration folded for {}: {e}",
+                        reading.identity.as_key()
+                    ))
+                })?;
+            folded += 1;
+        }
+        Ok(folded)
+    }
+
+    async fn pending_declarations(&self) -> SFResult<u64> {
+        let row = sqlx::query(PENDING_SQL)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("count pending declarations: {e}")))?;
+        let n: i64 = row
+            .try_get("n")
+            .map_err(|e| SFError::Database(format!("pending count: {e}")))?;
+        Ok(n.max(0) as u64)
     }
 
     async fn apply_measurement(&self, measurement: &ChangeMeasurement) -> SFResult<()> {
