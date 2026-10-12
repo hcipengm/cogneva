@@ -514,13 +514,13 @@ async fn report_sighting(
         match store.set_alert(true, &alert).await {
             Ok(AlertTransition::Fired) => {
                 warn!(rule = %rule.name, key = %key, %message, "infra alert firing");
-                notify(rule, sample, &labels, true, outlets).await;
+                notify(rule, sample, &labels, outlets).await;
             }
             Ok(_) => {}
             Err(e) => warn!(rule = %rule.name, error = %e, "infra alert persist failed"),
         }
     } else {
-        notify(rule, sample, &labels, true, outlets).await;
+        notify(rule, sample, &labels, outlets).await;
     }
 }
 
@@ -637,7 +637,6 @@ async fn notify(
     rule: &crate::config::InfraRule,
     sample: &SeriesSample,
     labels: &HashMap<String, String>,
-    firing: bool,
     outlets: &InfraWatchOutlets,
 ) {
     let Some(notifier) = &outlets.notifier else {
@@ -647,11 +646,7 @@ async fn notify(
     let inst = AlertInstance {
         rule_name: rule.name.clone(),
         labels: labels.clone(),
-        state: if firing {
-            AlertState::Firing
-        } else {
-            AlertState::Resolved
-        },
+        state: AlertState::Firing,
         severity: rule.severity,
         value: sample.value,
         starts_at: now,
