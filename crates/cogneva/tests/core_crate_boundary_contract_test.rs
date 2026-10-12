@@ -110,7 +110,30 @@ const MODULE_REASONS: &[&str] = &[
     "pending-relocation",
 ];
 
-/// Where each mechanism is going: `(module, destination crate)`.
+/// The shape of the move a registered mechanism is owed.
+///
+/// A registered destination is not by itself a plan. Where a mechanism can go
+/// depends on who reads it: a module whose consumers already reach the
+/// destination can move as it stands, and one whose consumers reach a crate that
+/// reaches *them* cannot move at all without inverting an edge. The two shapes
+/// take the two different answers, so the row has to say which one it is rather
+/// than leave a reader to work it out from the destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owed {
+    /// The module moves whole, and every crate that reads it already depends on
+    /// the destination. Nothing else has to change for the move to be legal, so
+    /// the work is the move and nothing here can be satisfied by relabelling.
+    Direct,
+    /// The module is a contract and a mechanism in one file, and no existing
+    /// crate both reads it and is reachable from the destination. It leaves in
+    /// two halves: the contract half stays in the core as a module under
+    /// `contract/`, where the assertions drawn around the core's source root
+    /// cannot see it, and the half that keeps state leaves for the destination.
+    /// The consumers are untouched, because they already reach `cog-core`.
+    Split,
+}
+
+/// Where each mechanism is going: `(module, destination crate, owed)`.
 ///
 /// The two directions are both asserted, so this is a debt list and not a
 /// permission: a module registered as awaiting relocation has to name its
@@ -123,14 +146,53 @@ const MODULE_REASONS: &[&str] = &[
 /// already depend on is the one whose relocation does not invent an edge. The
 /// modules that reach `/proc` or take a `flock` are the same family and have to
 /// land together, because they call each other.
-const RELOCATION_TARGET: &[(&str, &str)] = &[
-    ("admission", "cog-reflection"),
-    ("build_cache_readings", "cog-reflection"),
-    ("build_cache_reclaim", "cog-reflection"),
-    ("build_gate", "cog-reflection"),
-    ("loop_health", "cog-observability"),
-    ("owner_lease", "cog-storage"),
+///
+/// What each destination means depends on [`Owed`]: for a `Direct` row it is
+/// where the module ends up, and for a `Split` row it is where the half that
+/// keeps state ends up. A `Split` row's destination is therefore *not* a crate
+/// its readers depend on -- it is chosen by which crate already runs the
+/// mechanism, and the readers never touch it.
+const RELOCATION_TARGET: &[(&str, &str, Owed)] = &[
+    // Runs the control law in `cog-eval`, the crate that drives the gate through
+    // a whole cycle. `cog-reflection` was named here before the readers were
+    // counted, and it cannot be the destination: `cog-eval` is a reader, so the
+    // move would add `cog-eval -> cog-reflection`, and `cog-reflection` already
+    // depends on `cog-eval` -- the edge would close a cycle rather than lengthen
+    // a path.
+    ("admission", "cog-eval", Owed::Split),
+    // Read for the sizes of the layers it caches, by the crate whose workdir
+    // owns that cache.
+    ("build_cache_readings", "cog-extension", Owed::Split),
+    // One reader, and it is the destination.
+    ("build_cache_reclaim", "cog-reflection", Owed::Direct),
+    // Twenty-eight call sites in the destination and five in the assembly root.
+    ("build_gate", "cog-reflection", Owed::Direct),
+    // The crate that publishes the health readings the loops are watched by.
+    ("loop_health", "cog-observability", Owed::Split),
+    // The lease is stored next to the tiers it guards.
+    ("owner_lease", "cog-storage", Owed::Direct),
 ];
+
+/// Where a split module's contract half lands: the core's `contract` module,
+/// under the module's own name.
+///
+/// The name is derived rather than written down a second time. A row that named
+/// its contract half could name a different module than the one it is registered
+/// under, and the two spellings would agree with nothing; deriving it means the
+/// half is either at the path the registry implies or it is not there.
+const CONTRACT_DIR: &str = "../cog-core/src/contract";
+
+/// The calls a contract half may not contain, because a contract that reaches
+/// the kernel is a mechanism that was renamed rather than moved.
+///
+/// Read as code rather than as text. Each entry is a spelling that only occurs
+/// where something is being called or opened: `/proc` needs the quote of a path
+/// literal, a process spawn needs the module path, and `libc` needs the `::`.
+/// A bare word would not do -- `cog-core/src/contract/supervisor.rs` has a doc
+/// comment reading "restart the service/process", and matching `/proc` inside
+/// that word would report a contract that reaches the kernel where there is a
+/// sentence about restarting one.
+const CONTRACT_FORBIDDEN: &[&str] = &["\"/proc", "std::process", "libc::", "flock("];
 
 /// The crates the core may depend on: closed, and with no workspace crate in it.
 ///
@@ -219,6 +281,14 @@ struct Workspace {
     /// feature is still a dependency, and a text scan of the manifest answers a
     /// question about the file format instead of about the crate.
     core_deps: BTreeMap<Kind, BTreeSet<String>>,
+    /// Every member's normal dependencies, by member name.
+    ///
+    /// The relocation check asks whether a crate a module is consumed from
+    /// already reaches the crate the module is going to, and that is a question
+    /// about the resolved graph for the same reason the core's own set is: an
+    /// edge can be spelled under a target table or behind a feature, and a scan
+    /// of the manifest would answer about the spelling instead of the edge.
+    member_deps: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Workspace {
@@ -246,13 +316,28 @@ impl Workspace {
             .expect("cargo metadata carries packages");
 
         let mut members = BTreeSet::new();
+        let mut member_deps: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for p in packages {
-            members.insert(
-                p["name"]
-                    .as_str()
-                    .expect("a package has a name")
-                    .to_string(),
-            );
+            let name = p["name"]
+                .as_str()
+                .expect("a package has a name")
+                .to_string();
+            let mut normal = BTreeSet::new();
+            for d in p["dependencies"]
+                .as_array()
+                .expect("a package carries its dependencies")
+            {
+                if Kind::of(d) == Kind::Normal {
+                    normal.insert(
+                        d["name"]
+                            .as_str()
+                            .expect("a dependency has a name")
+                            .to_string(),
+                    );
+                }
+            }
+            member_deps.insert(name.clone(), normal);
+            members.insert(name);
         }
 
         let core = packages
@@ -270,7 +355,11 @@ impl Workspace {
                 .or_default()
                 .insert(name.to_string());
         }
-        Self { members, core_deps }
+        Self {
+            members,
+            core_deps,
+            member_deps,
+        }
     }
 }
 
@@ -378,10 +467,15 @@ fn every_mechanism_owed_a_move_names_where_it_is_going() {
     let owed = pending_relocation();
 
     let mut destinations: BTreeMap<String, String> = BTreeMap::new();
-    for (module, destination) in RELOCATION_TARGET {
+    for (module, destination, _owed) in RELOCATION_TARGET {
         assert!(
             ws.members.contains(*destination),
             "RELOCATION_TARGET sends `{module}` to `{destination}`, which is not a workspace member"
+        );
+        assert_ne!(
+            *destination, CORE,
+            "RELOCATION_TARGET sends `{module}` to the core, which is where it already is — a \
+             relocation whose destination is its source is not a plan"
         );
         assert!(
             owed.contains(*module),
@@ -475,4 +569,183 @@ fn every_dependency_marked_for_removal_is_still_a_dependency() {
              from DEPS_TO_DROP and CORE_DEPS, and the closed set will refuse to let it back in"
         );
     }
+}
+
+/// Whether `needle` occurs in `hay` as a whole word.
+///
+/// The consumer reading is deliberately generous — a crate that names a module
+/// anywhere counts as a reader. Being generous costs a gate that fails against a
+/// real dependency to add; being stingy costs a relocation that invents the very
+/// edge this check exists to catch, and the second mistake is the one nothing
+/// downstream would report.
+fn names_module(hay: &str, needle: &str) -> bool {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    hay.match_indices(needle).any(|(at, _)| {
+        let before = hay[..at].chars().next_back();
+        let after = hay[at + needle.len()..].chars().next();
+        before.is_none_or(|c| !ident(c)) && after.is_none_or(|c| !ident(c))
+    })
+}
+
+/// Whether any `.rs` file under `dir` names `module`.
+fn any_source_names(dir: &Path, module: &str) -> bool {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        if file_type.is_dir() {
+            if any_source_names(&path, module) {
+                return true;
+            }
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if names_module(&text, module) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The crates that read `module`, the core excluded, read from the sources
+/// rather than from the registry.
+///
+/// The question here is not who is *allowed* to reach a module but who does, and
+/// no manifest records that: an edge can be resolved and unused. The scan is of
+/// `crates/*/src`, so a use that only exists in a crate's tests does not count —
+/// a test can reach a dev-dependency the crate itself does not link, and counting
+/// that would report a consumer that does not need the destination in the graph
+/// the move is about.
+///
+/// Only members are read. A directory under `crates/` that no manifest names is
+/// not in the dependency graph at all — nothing compiles it, so it has no edges
+/// to check and a use inside it reaches nothing. It is a real defect of its own
+/// kind, but it is not a reader, and reporting it here would say a relocation is
+/// blocked when what has happened is that a file was written where nothing
+/// builds.
+fn consumers_of(root: &Path, members: &BTreeSet<String>, module: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let crates = match std::fs::read_dir(root.join("crates")) {
+        Ok(crates) => crates,
+        Err(e) => panic!("the workspace's `crates` directory must be readable: {e}"),
+    };
+    for entry in crates.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == CORE || !members.contains(&name) {
+            continue;
+        }
+        if any_source_names(&entry.path().join("src"), module) {
+            out.insert(name);
+        }
+    }
+    out
+}
+
+/// The workspace root, from this crate's manifest directory.
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// A row that says the readers already reach the destination is making a claim
+/// about the dependency graph, and this reads the graph.
+///
+/// This is the half of the relocation plan that a registry cannot state: naming
+/// a destination says where a module should end up, not whether it can go there.
+/// A module read by a crate that the destination reaches — or read by a crate
+/// that reaches nothing the destination has — cannot move without an edge, and
+/// the worst of those is a cycle, which no amount of moving a file closes. The
+/// rows that make this claim are exactly the ones checked; a `Split` row makes
+/// the opposite claim, which is why the two shapes are told apart rather than
+/// both being sent down this path.
+#[test]
+fn a_relocation_the_readers_already_reach_names_an_edge_that_is_there() {
+    let ws = Workspace::read();
+    let root = workspace_root();
+    let mut unreachable = Vec::new();
+    let mut checked = 0usize;
+    for (module, destination, owed) in RELOCATION_TARGET {
+        if *owed != Owed::Direct {
+            continue;
+        }
+        for consumer in consumers_of(&root, &ws.members, module) {
+            // A crate does not depend on itself, so the destination reading its
+            // own module says nothing about whether the move invents an edge --
+            // that half of the module leaves by not leaving.
+            if consumer == *destination {
+                continue;
+            }
+            checked += 1;
+            let reaches = ws
+                .member_deps
+                .get(&consumer)
+                .is_some_and(|deps| deps.contains(*destination));
+            if !reaches {
+                unreachable.push(format!(
+                    "`{consumer}` reads `{module}`, which this row sends to `{destination}`, and \
+                     `{consumer}` does not depend on `{destination}`"
+                ));
+            }
+        }
+    }
+    assert!(
+        unreachable.is_empty(),
+        "these relocations are registered as needing no new edge and would invent one: \
+         {unreachable:#?} — either the destination is wrong for the module, or the module is not \
+         `direct` and leaves in halves"
+    );
+    assert!(
+        checked > 0,
+        "no `direct` row had a consumer outside the core, so this check read nothing: a row whose \
+         reading is empty is a row that is not describing the tree"
+    );
+}
+
+/// A mechanism leaving the core in halves keeps a contract half under
+/// `contract/`, where the assertions drawn around the core's source root cannot
+/// see it — the root's module set is registered, and a file inside a registered
+/// directory is not part of it.
+///
+/// So the kernel calls are read directly. A contract half that reaches `/proc`,
+/// spawns a process, calls into `libc` or takes a `flock` is not a contract: it
+/// is the same mechanism under a second name, and nothing else in this file
+/// would report it. The scan covers the whole contract directory rather than
+/// only the halves the current rows imply, so a half lands checked instead of
+/// checked once someone remembers to register it.
+#[test]
+fn the_cores_contract_layer_holds_no_mechanism() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(CONTRACT_DIR);
+    let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| {
+        panic!(
+            "the contract directory {} must be readable: {e}",
+            dir.display()
+        )
+    });
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for token in CONTRACT_FORBIDDEN {
+            if text.contains(token) {
+                found.push(format!("{} holds `{token}`", path.display()));
+            }
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "the core's contract layer reaches the kernel: {found:#?} — a contract is an interface or \
+         a shape, and a file here that reads `/proc`, spawns a process or takes a lock is a \
+         mechanism that was renamed rather than moved"
+    );
 }

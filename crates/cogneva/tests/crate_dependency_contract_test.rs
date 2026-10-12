@@ -239,6 +239,50 @@ const TARGETS_TO_INTRODUCE: &[&str] = &[
 /// be a decision.
 const ASSEMBLY_ROOTS: &[&str] = &["cogneva", "cogneva-bootstrap"];
 
+/// Every workspace member, by name, frozen.
+///
+/// Two reasons, and the second is why a naming rule is not enough. The first is
+/// a decision: the members are not added to, so a capability goes into a crate
+/// that already exists, and a list that has to be edited is how that decision is
+/// read rather than remembered. The second is that every assertion in this file
+/// draws its boundary around "a `cog-*` business crate" or an assembly root, so
+/// a member added outside both shapes would be exempt from all of them without
+/// anyone deciding that — which is exactly what the naming rule was written to
+/// catch, one name too late.
+///
+/// Asserted in both directions, so this describes the tree rather than permitting
+/// it: a member that is added fails until its row is written, and a row whose
+/// member is gone fails until the row is deleted.
+const MEMBERS: &[&str] = &[
+    "cog-agent",
+    "cog-auth",
+    "cog-collaboration",
+    "cog-core",
+    "cog-eval",
+    "cog-extension",
+    "cog-gateway",
+    "cog-github",
+    "cog-guardrail",
+    "cog-llm",
+    "cog-memory",
+    "cog-net",
+    "cog-notification",
+    "cog-observability",
+    "cog-orchestrator",
+    "cog-prompt",
+    "cog-protocol",
+    "cog-quota",
+    "cog-redis",
+    "cog-reflection",
+    "cog-skill",
+    "cog-storage",
+    "cog-stream",
+    "cog-supervisor",
+    "cog-wiki",
+    "cogneva",
+    "cogneva-bootstrap",
+];
+
 /// `cog-core` is the bottom of the graph: every crate may depend on it, and it
 /// depends on no crate.
 const CORE: &str = "cog-core";
@@ -465,6 +509,46 @@ fn every_member_is_a_business_crate_or_a_declared_assembly_root() {
             "assembly root {root} is declared but is not a workspace member"
         );
     }
+}
+
+/// The workspace members are exactly the registered ones.
+///
+/// The naming rule above says which *shapes* of member this gate recognises;
+/// this says which members exist. Without it, a crate arrives by being created:
+/// a `cog-*` package is born recognised, and every table here silently gains a
+/// participant nobody chose. With it, adding a crate is a line in a diff, next
+/// to the reason for it.
+#[test]
+fn the_workspace_members_are_exactly_the_registered_ones() {
+    let ws = Workspace::read();
+    let registered: BTreeSet<&str> = MEMBERS.iter().copied().collect();
+    assert_eq!(
+        registered.len(),
+        MEMBERS.len(),
+        "MEMBERS lists the same member twice: {MEMBERS:?}"
+    );
+
+    let unregistered: Vec<&String> = ws
+        .members
+        .keys()
+        .filter(|name| !registered.contains(name.as_str()))
+        .collect();
+    assert!(
+        unregistered.is_empty(),
+        "workspace members that are not registered: {unregistered:?} — the workspace is not added \
+         to, so a new crate is either a mistake or a decision that has to be written down here \
+         with what it is for"
+    );
+
+    let missing: Vec<&&str> = MEMBERS
+        .iter()
+        .filter(|name| !ws.members.contains_key(**name))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "MEMBERS registers crates the workspace no longer has: {missing:?} — the list describes \
+         the tree, so a member that is removed takes its row with it"
+    );
 }
 
 /// The assembly roots are exempt from the registry because assembling is what
