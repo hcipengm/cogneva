@@ -3407,6 +3407,17 @@ mod install_trace_tests {
     /// k8s 对象的清单文件。它们不该进痕迹探测面。
     const NOT_NAMESPACED: [&str; 3] = ["Namespace", "StorageClass", "Kustomization"];
 
+    /// 交付了、`kubectl get` 也读得到、但**仍然不进痕迹探测面**的种类：CRD 支持的
+    /// 第三方对象。
+    ///
+    /// 探针把 `TRACE_KINDS` 拼成**一条** `kubectl get` 一次读回来，判据是整条命令的
+    /// 退出码。只要其中一个种类的 CRD 在目标集群不存在（装 nginx 的集群上没有 traefik
+    /// 的 `Middleware`，装 traefik 的集群上没有 nginx 的 `Ingress` 之外的 CRD，方向对称），
+    /// 这条命令就非零退出，于是**一个已经有 cogneva 对象的命名空间被读成绿地**——
+    /// 正是这个探针要防的那件事。这类对象由 apply 自己交付，缺 CRD 时 apply 当场报错，
+    /// 不需要探针替它兜底。
+    const CRD_BACKED_NOT_PROBED: [&str; 1] = ["Middleware"];
+
     /// 安装时才生成、因此不在发布树里的痕迹种类。
     const GENERATED_AT_INSTALL: [&str; 1] = ["secret"];
 
@@ -3443,7 +3454,8 @@ mod install_trace_tests {
     /// 痕迹探测面必须与发布树对齐。少一种，装到一半只剩那种对象的集群就会被读成
     /// 绿地，于是 helm install 去撞已存在的资源；多一种不交付的，就是一次永远命不
     /// 中的 kubectl（手写名单里的 `statefulset/cogneva-postgres` 正是这么烂掉的：
-    /// 集群与仓库里都没有这个对象，真名是 `postgres`）。
+    /// 集群与仓库里都没有这个对象，真名是 `postgres`）。不交付的两类（集群级对象、
+    /// CRD 支持的第三方对象）显式登记，理由写在各自常量上。
     #[test]
     fn the_trace_probe_covers_every_namespaced_kind_the_release_delivers() {
         let mut kinds = delivered_kinds();
@@ -3457,10 +3469,12 @@ mod install_trace_tests {
 
         for kind in &kinds {
             let noun = kind.to_ascii_lowercase();
-            if NOT_NAMESPACED.contains(&kind.as_str()) {
+            if NOT_NAMESPACED.contains(&kind.as_str())
+                || CRD_BACKED_NOT_PROBED.contains(&kind.as_str())
+            {
                 assert!(
                     !TRACE_KINDS.contains(&noun.as_str()),
-                    "{kind} 不是命名空间内对象，痕迹探测面里不该有它"
+                    "{kind} 不进痕迹探测面，就不该出现在 TRACE_KINDS 里"
                 );
                 continue;
             }
