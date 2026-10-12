@@ -654,6 +654,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                     store,
                     ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>(),
                     ledger_shutdown,
+                    crate::change_measure::tree_from_environment(),
                 );
             }
             None => info!("change ledger loop not started: no ChangeLedgerStore published"),

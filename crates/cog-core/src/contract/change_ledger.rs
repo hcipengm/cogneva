@@ -150,6 +150,10 @@ pub struct ChangeLedgerRow {
     /// that nothing has looked at is not the same as one measured a while ago,
     /// and a reader that cannot tell them apart reports the second as current.
     pub measured_at: Option<DateTime<Utc>>,
+    /// The revision that measurement read, when it named one. `None` wherever
+    /// `measured_at` is `None`, and also for a measurement taken by a process
+    /// with no revision to name.
+    pub measured_rev: Option<String>,
     /// When a measurement last found the change satisfied. Set and cleared by
     /// measurement, so `state == Landed` and this being present agree by
     /// construction.
@@ -163,6 +167,10 @@ pub struct ChangeLedgerRow {
 /// measurement was applied rather than a time the caller chose. A caller-set
 /// time can be backdated or reused, and a ledger whose completion times are
 /// chosen by the side being judged has no independent reading in it.
+///
+/// The revision is the caller's, by contrast, and has to be: it is not a time but
+/// the thing that was looked at, and only the look knows which tree it opened.
+/// Nothing invents one when the look had none.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangeMeasurement {
     pub identity: ChangeIdentity,
@@ -171,6 +179,15 @@ pub struct ChangeMeasurement {
     /// with the tree can be argued with rather than merely disbelieved.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observation: Option<String>,
+    /// The revision the tree was read at, or `None` when the look had no
+    /// revision to name.
+    ///
+    /// Kept beside the state because a state is a claim about a tree and the tree
+    /// moves: without this, "landed" says the artifact is in the project and
+    /// cannot say whether that was true of this mainline or of one that has since
+    /// dropped it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measured_rev: Option<String>,
 }
 
 impl ChangeMeasurement {
@@ -179,7 +196,14 @@ impl ChangeMeasurement {
             identity,
             state,
             observation: None,
+            measured_rev: None,
         }
+    }
+
+    /// The same measurement, naming the revision it was taken against.
+    pub fn at_revision(mut self, revision: impl Into<String>) -> Self {
+        self.measured_rev = Some(revision.into());
+        self
     }
 }
 

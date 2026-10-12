@@ -22,7 +22,7 @@ use cog_core::{
 /// Every read returns these, in one place so no two readers can come back with
 /// differently ordered columns.
 const ROW_COLUMNS: &str = "kind, scope, literal, state, title, assertion, sources, \
-                           first_seen_at, measured_at, landed_at";
+                           first_seen_at, measured_at, measured_rev, landed_at";
 
 /// How wide each keyed identity part may be, taken from the columns that key
 /// them rather than from what a caller would like to write.
@@ -83,6 +83,9 @@ impl PostgresChangeLedgerStore {
             measured_at: row
                 .try_get("measured_at")
                 .map_err(|e| format!("measured_at: {e}"))?,
+            measured_rev: row
+                .try_get("measured_rev")
+                .map_err(|e| format!("measured_rev: {e}"))?,
             landed_at: row
                 .try_get("landed_at")
                 .map_err(|e| format!("landed_at: {e}"))?,
@@ -160,11 +163,17 @@ ON CONFLICT (kind, scope, literal) DO UPDATE SET
 /// reads as outstanding rather than as done-and-forgotten. The times come from
 /// `now()` in the same statement that writes the state: taken from the caller
 /// instead, a completion time would be a value the measured side supplies.
+///
+/// The revision is the caller's, and it takes the caller's `NULL` with it: a
+/// measurement that named no revision must clear whatever revision was there
+/// rather than leave a stale one beside a fresh state, which would read as a
+/// state measured against a tree it was never measured against.
 const APPLY_MEASUREMENT_SQL: &str = "\
-INSERT INTO change_ledger (kind, scope, literal, state, measured_at, landed_at)
-VALUES ($1, $2, $3, $4, now(), CASE WHEN $4 = 'landed' THEN now() ELSE NULL END)
+INSERT INTO change_ledger (kind, scope, literal, state, measured_rev, measured_at, landed_at)
+VALUES ($1, $2, $3, $4, $5, now(), CASE WHEN $4 = 'landed' THEN now() ELSE NULL END)
 ON CONFLICT (kind, scope, literal) DO UPDATE SET
     state = EXCLUDED.state,
+    measured_rev = EXCLUDED.measured_rev,
     measured_at = now(),
     landed_at = CASE
         WHEN EXCLUDED.state = 'landed' THEN COALESCE(change_ledger.landed_at, now())
@@ -345,6 +354,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
             .bind(&measurement.identity.scope)
             .bind(&measurement.identity.literal)
             .bind(measurement.state.as_str())
+            .bind(&measurement.measured_rev)
             .execute(&self.pool)
             .await
             .map_err(|e| {
