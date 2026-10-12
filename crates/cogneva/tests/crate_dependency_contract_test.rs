@@ -60,6 +60,9 @@
 //! dependency — the scan answers "does this text appear", and the question is
 //! "does this crate link that one". `cargo metadata` answers the question, in
 //! the vocabulary of the resolver rather than of the file format.
+//!
+//! principle: feedback_dependency_direction
+//! principle: feedback_no_new_crates
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

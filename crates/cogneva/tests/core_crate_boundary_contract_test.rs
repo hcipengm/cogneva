@@ -55,6 +55,8 @@
 //! nothing read at all. A module registered as `shared-definition` that is
 //! really a mechanism passes this gate and fails its reviewer, and that is the
 //! division of labour the gate is built on rather than a hole in it.
+//!
+//! principle: feedback_prefer_not_to_touch_core
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
