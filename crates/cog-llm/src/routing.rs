@@ -53,6 +53,9 @@ fn text_failover_flags(msg: &str) -> (bool, bool) {
 ///   delta 之前的 Error 事件也可切换后端"（见 `wrap_with_failover`），内容
 ///   一旦开始下发即锁定后端，避免用户看到两个模型拼出的半份答案。
 /// - `health_check` 只要任一 backend 健康即返回 `true`。
+///
+/// 实例由网关 `upstream_pool` 模块按 `llm_routing` 配置统一构造；本类型
+/// 只管逐请求故障转移，不持有池级健康判定。
 pub struct RoutingProvider {
     backends: Vec<Arc<dyn LLMProvider>>,
     max_attempts: usize,

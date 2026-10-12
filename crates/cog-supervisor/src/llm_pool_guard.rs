@@ -9,6 +9,9 @@
 //! deployment and metric collection keep running without an LLM, so a pool
 //! outage must not stop them. Probing stays in the gateway process, which is
 //! never gated, so a paused scheduler cannot deadlock recovery.
+//!
+//! The publishing half is the gateway's `upstream_pool` module; this side
+//! only reads the snapshot it writes.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

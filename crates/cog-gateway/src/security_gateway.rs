@@ -2465,28 +2465,8 @@ async fn publish_pool_status(
         // "可用"在刚起的进程上与"什么都没见过"同形。
         last_success_unix: state.llm_health.last_success_unix(),
     };
-    let payload = match serde_json::to_string(&status) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(error = %e, "池状态序列化失败，跳过 Redis 发布");
-            return false;
-        }
-    };
     let ttl = pool_status_ttl_secs(state, bounds.next_attempt_unix());
-    let res: redis::RedisResult<()> = redis::cmd("SET")
-        .arg(cog_core::LLM_POOL_STATUS_KEY)
-        .arg(payload)
-        .arg("EX")
-        .arg(ttl)
-        .query_async(conn)
-        .await;
-    match res {
-        Ok(()) => true,
-        Err(e) => {
-            tracing::warn!(error = %e, "池状态写入 Redis 失败");
-            false
-        }
-    }
+    crate::upstream_pool::write_pool_status(conn, &status, ttl).await
 }
 
 /// 池不可用那一行的判词。抽成纯函数是为了让第二个读者能读它：这段话以前只被人

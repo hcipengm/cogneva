@@ -64,6 +64,7 @@ pub mod supervisor_status;
 pub mod takeover;
 pub mod tasks;
 pub mod taste;
+pub mod upstream_pool;
 pub mod websocket;
 pub mod websocket_protocol;
 pub mod wiki;
