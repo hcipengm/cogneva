@@ -28,6 +28,7 @@ pub mod orchestrator;
 pub mod outcome;
 pub mod platform_sign;
 pub mod plugin;
+pub mod project_kind;
 pub mod promotion;
 pub mod prompt;
 pub mod protocol;

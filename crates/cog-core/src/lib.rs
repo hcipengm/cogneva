@@ -46,6 +46,7 @@ pub use contract::notification::*;
 pub use contract::observability::*;
 pub use contract::orchestrator::*;
 pub use contract::plugin::*;
+pub use contract::project_kind::*;
 pub use contract::promotion::*;
 pub use contract::protocol::*;
 pub use contract::quota::*;

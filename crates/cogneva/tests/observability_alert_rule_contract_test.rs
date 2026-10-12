@@ -2185,6 +2185,10 @@ const UNREAD: &[(&str, Unread)] = &[
         "cogneva_tool_output_fetch_budget_exhausted_total",
         Unread::Gap("reads of an archived tool output that stopped short of the bytes because the payload outgrew the caller's byte budget, by tool. The budget is the caller's own, so a bounded read is expected traffic like the truncation counter beside it, not a fault: a caller reading back a large archived output sets the budget it can afford and is told when the source is bigger. What would make a run of them a fault is a bound nobody declared, since the right budget follows what the reads ask for, and the repair for one is local to the caller -- raise the budget or fetch the source directly -- rather than a standing condition a rule could hold open"),
     ),
+    (
+        "cogneva_project_kind_total",
+        Unread::Gap("changes the pipeline dispatched, by the landing recipe it used and by whether the project declared that recipe or the built-in supplied it. A rule would have to say how much of a fleet running on the built-in is a fault, and that is a policy nobody has declared: at the moment this name is minted not one project carries a declaration, so every dispatch lands in the `builtin` cell and any bound set now would fire on the ordinary case. What makes the reading worth publishing before that bound exists is that it is the only place the fallback is visible at all -- a project landing as a built-in Rust workspace and a project that chose to land that way dispatch identically on every other series, and neither is a fault until somebody says which projects are expected to declare. The composition a rule would want is the one already published on the rejection side: a project whose declaration cannot be read is refused, and that refusal is counted under `cogneva_change_rejected_total{cause=project_kind_unusable}`, so the population that needs a threshold here is the one that silently took the built-in rather than the one that failed loudly"),
+    ),
 ];
 
 /// Entries an `Elsewhere` reader claim cannot be resolved against.
@@ -2307,7 +2311,14 @@ fn unresolved_readers(read: &BTreeSet<String>, name: &str, readers: &[&str]) -> 
 /// The character total went in beside it in the same pass and needed no entry of
 /// its own, which is the ordinary case for a new name added with its reader
 /// rather than before one.
-const GAPS_AT_CENSUS: usize = 17;
+/// It went to 18 in the pass that published `cogneva_project_kind_total`, the
+/// dispatch reading that says whether a change landed under the recipe its
+/// project declared or under the built-in. Its reader is a bound rather than a
+/// rule for the reason its own entry gives: nobody has declared how much of a
+/// fleet running on the built-in is a fault, and every dispatch lands there
+/// today. The count is what makes that a deliberate exemption instead of an
+/// omission.
+const GAPS_AT_CENSUS: usize = 18;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {

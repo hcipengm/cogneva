@@ -69,6 +69,7 @@ pub mod observability_stack;
 pub mod pending_promotions;
 pub mod policy_evolution;
 pub mod policy_store;
+pub(crate) mod project_kind;
 pub mod promoter;
 pub mod promotion_gate;
 pub mod promotion_switch;

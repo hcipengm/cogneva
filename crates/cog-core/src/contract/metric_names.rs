@@ -276,6 +276,29 @@ metric_names! {
     // all, and an absent series says only that nothing has been tiered yet.
     CHANGE_TIER_TOTAL => "cogneva_change_tier_total",
 
+    // cog-reflection — which landing recipe each change was dispatched under,
+    // and whether the project named it or the built-in supplied it.
+    //
+    // Without this the fallback is silent, and silence here is the shape the
+    // whole declaration surface exists to remove: "this project never declared
+    // a kind" and "this project declared the built-in" dispatch identically, so
+    // a project landing as a Rust workspace on the strength of never having
+    // said otherwise reads exactly like one that chose it. `kind` is a label
+    // rather than a second series because the second recipe, when it exists,
+    // is a value of the same question.
+    //
+    // A counter, because reaching a dispatch is a cumulative event per change;
+    // the cells are the closed set of recipes crossed with the two sources, and
+    // they are seeded at zero by the first change the pipeline dispatches, so
+    // from then on a cell stuck at zero and an absent series stay different
+    // readings.
+    //
+    // Not filed with the build-outcome cells: those are compile semantics
+    // (`built`/`failed`/`timed_out`/`unstarted`) and a recipe that does not
+    // compile anything has no way to land in one of them without lying about
+    // what happened.
+    PROJECT_KIND_TOTAL => "cogneva_project_kind_total",
+
     // cog-reflection — how each round of the artifact-level evolution search
     // ended, labelled by `outcome`.
     //

@@ -191,6 +191,24 @@ pub enum RejectionCause {
     /// has no effect anywhere, and no later reading can tell it apart from one
     /// that was never applied.
     UnreachableDefault,
+    /// The project's own declaration does not say how it lands: its `kind` is
+    /// declared in a form this platform cannot read, or names a recipe it does
+    /// not implement.
+    ///
+    /// Refused rather than defaulted, even though the built-in would have
+    /// carried every change today. A project that carries a declaration and
+    /// cannot say what it is would otherwise land as the built-in while its own
+    /// document said something else, and no later reading could tell that apart
+    /// from a project that declared nothing — which is the one distinction this
+    /// surface exists to keep.
+    ///
+    /// The change is not what is at fault, and this refusal is not a judgement
+    /// of it: nothing about the diff decides this, so no wording of one can
+    /// avoid it. It is a deployment fault — the project's configuration
+    /// document is broken — and it is refused terminally rather than retried,
+    /// because retrying an error that no pass can clear would hold the change
+    /// forever instead of reporting it once.
+    ProjectKindUnusable,
 }
 
 impl RejectionCause {
@@ -209,6 +227,7 @@ impl RejectionCause {
         Self::LintIntroduced,
         Self::LintRefused,
         Self::UnreachableDefault,
+        Self::ProjectKindUnusable,
     ];
 
     /// The wire form, for label values and records.
@@ -226,6 +245,7 @@ impl RejectionCause {
             Self::LintIntroduced => "lint_introduced",
             Self::LintRefused => "lint_refused",
             Self::UnreachableDefault => "unreachable_default",
+            Self::ProjectKindUnusable => "project_kind_unusable",
         }
     }
 
@@ -2638,6 +2658,7 @@ mod tests {
                 RejectionCause::LintIntroduced => "lint_introduced",
                 RejectionCause::LintRefused => "lint_refused",
                 RejectionCause::UnreachableDefault => "unreachable_default",
+                RejectionCause::ProjectKindUnusable => "project_kind_unusable",
             };
             assert_eq!(cause.as_str(), spelling, "{cause:?} spells two ways");
             assert_eq!(
@@ -2648,7 +2669,7 @@ mod tests {
             assert!(!seen.contains(&spelling), "{spelling} is in the list twice");
             seen.push(spelling);
         }
-        assert_eq!(seen.len(), 12, "ALL is missing a cause: {seen:?}");
+        assert_eq!(seen.len(), 13, "ALL is missing a cause: {seen:?}");
         for (index, cause) in RejectionCause::ALL.iter().enumerate() {
             assert_eq!(cause.slot(), index, "{cause:?} does not sit at {index}");
         }

@@ -192,6 +192,22 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          wait",
     ),
     (
+        "cogneva_project_kind_total",
+        "Changes the pipeline dispatched, labelled by the landing recipe it \
+         used (`kind`) and by where that recipe came from (`source`, either \
+         `declared` or `builtin`). The declaration lives in the project's own \
+         configuration document, so a project that says nothing lands by the \
+         built-in without this reading being able to say so — which is what the \
+         `source` label is for: a project that never declared a kind and a \
+         project that declared the built-in dispatch identically and are two \
+         different facts. A project whose declaration cannot be read is refused \
+         instead, and appears under `cogneva_change_rejected_total` with cause \
+         `project_kind_unusable`. The cells are seeded at zero by the first \
+         change the pipeline dispatches: from then on, a recipe that never ran \
+         reads as a zero while an absent series means no change has been \
+         dispatched yet",
+    ),
+    (
         "cogneva_change_tier_total",
         "Which gates a change was routed to, labelled by `tier`, written once \
          per change the pipeline reaches. The routing reads what the change \

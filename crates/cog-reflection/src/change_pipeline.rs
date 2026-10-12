@@ -372,6 +372,11 @@ pub struct ChangePipeline {
     /// report — an all-zero cross product there would read as a fleet that
     /// routed everything to the cheapest tier.
     tier_cells_seeded: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the kind cells have been written at zero yet. Seeded on the
+    /// first dispatch for the same reason the tier cells are: before any change
+    /// has been dispatched there is no distribution to report, and an all-zero
+    /// product would read as a fleet whose projects all declared the built-in.
+    project_kind_cells_seeded: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// 一个 metrics 句柄，连同给它写的 `Debug`。
@@ -473,6 +478,7 @@ impl ChangePipeline {
             baseline_failures: Arc::new(tokio::sync::Mutex::new(None)),
             metrics: None,
             tier_cells_seeded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            project_kind_cells_seeded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -935,6 +941,41 @@ impl ChangePipeline {
         }
 
         self.ensure_clean_workspace(workdir).await?;
+
+        // Which landing recipe this change is dispatched under, read from the
+        // project's own declaration and at this exact point: from here until
+        // the diff is applied the tree is the revision the change is being
+        // applied to, so this is the project saying what it is rather than the
+        // change saying what it wants to be judged by. The order matters twice
+        // over — the document is a path no change may write, so nothing is in
+        // flight to read past, and reading the revision under test rather than
+        // the deployment's checkout keeps the answer from describing a tree
+        // that is not the one being judged whenever the running binary and the
+        // checkout have moved apart.
+        let declaration = crate::project_kind::declaration_in(workdir);
+        let (project_kind, kind_source) = match declaration.resolved() {
+            Ok(resolved) => resolved,
+            Err(reason) => {
+                warn!(
+                    change_id = %change.artifact_id,
+                    reason = %reason,
+                    "The project's kind declaration cannot be dispatched on"
+                );
+                return Ok(ApplyResult {
+                    change_id: change.artifact_id.clone(),
+                    files_changed,
+                    reformatted: false,
+                    pre_existing_failures: 0,
+                    verdict: ChangeVerdict::Refused(cog_core::RejectionCause::ProjectKindUnusable),
+                    test_output: format!(
+                        "The project's kind declaration cannot be dispatched on: {reason}"
+                    ),
+                    new_status: EvolutionStatus::Rejected,
+                    tiering: Some(tiering.clone()),
+                });
+            }
+        };
+        self.report_project_kind(project_kind, kind_source).await;
 
         let applies = self.git_apply_check(workdir, &change.content).await;
         // 读数在判词之后、早退之前：这一步的 oracle 与下面这道门是同一个
@@ -1620,6 +1661,61 @@ impl ChangePipeline {
             .await
         {
             warn!(error = %e, "change tier emit failed");
+        }
+    }
+
+    /// Publish which recipe this change was dispatched under, and whether the
+    /// project named it or the built-in supplied it.
+    ///
+    /// Takes the decision rather than re-reading the declaration, so the
+    /// recipe reported is the one the dispatch used: a second read here could
+    /// land on a different document state than the one the change was dispatched
+    /// on, and the reading would then explain a decision that was never made.
+    ///
+    /// The two sources are published as one axis rather than the second being
+    /// left to silence. "This project never declared a kind" and "this project
+    /// declared the built-in" dispatch identically, and only a dispatch that
+    /// used the built-in because the project said nothing is the silent
+    /// fallback this surface exists to make visible.
+    async fn report_project_kind(
+        &self,
+        project_kind: cog_core::ProjectKind,
+        source: cog_core::ProjectKindSource,
+    ) {
+        info!(
+            kind = project_kind.as_str(),
+            source = source.as_str(),
+            "project kind"
+        );
+        let Some(metrics) = self.metrics.as_ref().map(|sink| &sink.0) else {
+            return;
+        };
+        if !self
+            .project_kind_cells_seeded
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            for kind in cog_core::ProjectKind::ALL {
+                for source in cog_core::ProjectKindSource::ALL {
+                    let mut labels = std::collections::HashMap::new();
+                    labels.insert("kind".to_string(), kind.as_str().to_string());
+                    labels.insert("source".to_string(), source.as_str().to_string());
+                    if let Err(e) = metrics
+                        .record_counter(cog_core::metric_names::PROJECT_KIND_TOTAL, 0.0, labels)
+                        .await
+                    {
+                        warn!(error = %e, "project kind cell seed failed");
+                    }
+                }
+            }
+        }
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("kind".to_string(), project_kind.as_str().to_string());
+        labels.insert("source".to_string(), source.as_str().to_string());
+        if let Err(e) = metrics
+            .record_counter(cog_core::metric_names::PROJECT_KIND_TOTAL, 1.0, labels)
+            .await
+        {
+            warn!(error = %e, "project kind emit failed");
         }
     }
 
@@ -5045,5 +5141,163 @@ index 1111111..2222222 100644\n\
         for cell in ["minimal", "compile", "structural"] {
             assert_eq!(cells[cell], 0.0, "{cell} 没人走过，读到的必须是 0");
         }
+    }
+
+    /// The dispatch reading has to publish the whole cross product of recipes
+    /// and sources on the first dispatch, because the one fact it exists for is
+    /// the fallback: a cell that was never seeded is absent, and absent reads
+    /// the same as "the built-in has never been used" — the reading a project
+    /// that declares nothing would then be invisible behind.
+    #[tokio::test]
+    async fn the_project_kind_reading_is_produced_and_seeds_every_cell_once() {
+        use cog_core::MetricsBackend;
+
+        let root = tempfile::tempdir().unwrap();
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let pipeline =
+            ChangePipeline::new(root.path(), root.path(), true).with_metrics(metrics.clone());
+        let name = cog_core::metric_names::PROJECT_KIND_TOTAL.as_str();
+
+        assert!(
+            metrics.query_counter_totals(name).await.unwrap().is_empty(),
+            "播种前一条序列都没有——「没接线」与「没跑过」在这里同形"
+        );
+
+        pipeline
+            .report_project_kind(
+                cog_core::ProjectKind::Rust,
+                cog_core::ProjectKindSource::Declared,
+            )
+            .await;
+
+        let cells: std::collections::BTreeMap<String, f64> = metrics
+            .query_counter_totals(name)
+            .await
+            .unwrap()
+            .iter()
+            .map(|s| {
+                (
+                    format!("{}/{}", s.labels["kind"], s.labels["source"]),
+                    s.value,
+                )
+            })
+            .collect();
+        assert_eq!(
+            cells.len(),
+            cog_core::ProjectKind::ALL.len() * cog_core::ProjectKindSource::ALL.len(),
+            "播种的是全叉积，且只播一次"
+        );
+        assert_eq!(cells["rust/declared"], 1.0, "项目自己声明的那一跳");
+        assert_eq!(
+            cells["rust/builtin"], 0.0,
+            "没人走内置时读到的必须是 0，不能是缺席"
+        );
+    }
+
+    /// A project that carries a declaration and cannot say what it is does not
+    /// land. The refusal is a judgement about the deployment rather than about
+    /// the change, so it comes back as a verdict and not as an environment
+    /// error: a `Err` here would be retried on every pass and would hold the
+    /// change forever instead of reporting the project's document once.
+    #[tokio::test]
+    async fn a_project_whose_kind_declaration_cannot_be_read_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        git_ok(root.path(), &["init", "-q"]).await;
+        git_ok(root.path(), &["config", "user.email", "t@t.com"]).await;
+        git_ok(root.path(), &["config", "user.name", "t"]).await;
+        tokio::fs::write(root.path().join("a.txt"), "old\n")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.path().join(cog_core::PROJECT_KIND_DOCUMENT),
+            r#"{"kind": "cobol"}"#,
+        )
+        .await
+        .unwrap();
+        git_ok(root.path(), &["add", "."]).await;
+        git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
+
+        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
+        let change = EvolutionResult {
+            kind: EvolutionKind::CodeChange,
+            artifact_id: "misdeclared-1".into(),
+            description: "调整这一行的取值".into(),
+            content: rewrites("a.txt"),
+            status: EvolutionStatus::CompileChecked,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+            tiering: None,
+        };
+
+        let result = pipeline
+            .apply_and_test_in(&change, root.path())
+            .await
+            .expect("a judgement about the project is not an environment error");
+
+        assert_eq!(
+            result.verdict,
+            ChangeVerdict::Refused(cog_core::RejectionCause::ProjectKindUnusable)
+        );
+        assert_eq!(result.new_status, EvolutionStatus::Rejected);
+        // The refusal names what the project wrote and what would have worked,
+        // because the one reading an operator has is this string.
+        assert!(
+            result.test_output.contains("cobol") && result.test_output.contains("rust"),
+            "拒绝的理由没把写下的和能用的都说出来：{}",
+            result.test_output
+        );
+    }
+
+    /// The document the kind is declared in is one a change may not rewrite.
+    /// That floor is what makes reading it before the apply enough: the
+    /// dispatch reads the pre-change revision, and the path it reads is one no
+    /// diff can move in the same run. A name here that the floor does not carry
+    /// would leave the dispatch reading a file the change could rewrite first.
+    #[tokio::test]
+    async fn the_document_the_kind_is_declared_in_is_one_a_change_may_not_rewrite() {
+        let root = tempfile::tempdir().unwrap();
+        git_ok(root.path(), &["init", "-q"]).await;
+        git_ok(root.path(), &["config", "user.email", "t@t.com"]).await;
+        git_ok(root.path(), &["config", "user.name", "t"]).await;
+        tokio::fs::write(
+            root.path().join(cog_core::PROJECT_KIND_DOCUMENT),
+            "{\"kind\": \"cobol\"}\n",
+        )
+        .await
+        .unwrap();
+        git_ok(root.path(), &["add", "."]).await;
+        git_ok(root.path(), &["commit", "-q", "-m", "seed"]).await;
+
+        let pipeline = ChangePipeline::new(root.path(), root.path().join("changes"), false);
+        let change = EvolutionResult {
+            kind: EvolutionKind::CodeChange,
+            artifact_id: "self-serving-1".into(),
+            description: "把项目的 kind 改成 rust".into(),
+            content: format!(
+                "diff --git a/{doc} b/{doc}\n\
+                 --- a/{doc}\n\
+                 +++ b/{doc}\n\
+                 @@ -1 +1 @@\n\
+                 -{{\"kind\": \"cobol\"}}\n\
+                 +{{\"kind\": \"rust\"}}\n",
+                doc = cog_core::PROJECT_KIND_DOCUMENT
+            ),
+            status: EvolutionStatus::CompileChecked,
+            created_at: chrono::Utc::now(),
+            eval_summary: None,
+            tiering: None,
+        };
+
+        let result = pipeline
+            .apply_and_test_in(&change, root.path())
+            .await
+            .expect("a judgement about the project is not an environment error");
+
+        assert_eq!(
+            result.verdict,
+            ChangeVerdict::Refused(cog_core::RejectionCause::ForbiddenPath),
+            "声明文档必须落在受保护清单里，否则一条变更可以先改写它、再让分派按改写后的判它：{:?}",
+            result.test_output
+        );
     }
 }
