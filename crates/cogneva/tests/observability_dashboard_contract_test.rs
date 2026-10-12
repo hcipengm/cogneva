@@ -203,7 +203,7 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
     ),
     (
         "cogneva_build_gate_refused_total",
-        &["dir", "role"],
+        &["dir", "role", "reason"],
         "crates/cog-core/src/build_gate.rs",
     ),
     (

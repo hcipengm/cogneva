@@ -162,7 +162,16 @@ pub const BUILD_GATE_SLOTS: &str = "cogneva_build_gate_slots";
 pub const BUILD_GATE_CEILING: &str = "cogneva_build_gate_ceiling";
 /// Builds that have taken a slot, as a counter.
 pub const BUILD_GATE_ACQUIRED_TOTAL: &str = "cogneva_build_gate_acquired_total";
-/// Builds that were refused a slot, as a counter.
+/// Builds that were refused a slot, as a counter, by `reason`: the wall that
+/// turned the build away.
+///
+/// The walls do not all share an owner — a build that found every slot taken
+/// (`busy`, `waited_out`) is a capacity reading, a sweep or registry restart
+/// holding the field (`maintenance_hold`) is maintenance standing the builds
+/// down on purpose, and another work's reservation (`queue_ahead`) is the queue
+/// doing its job — and one number over all four cannot say which of them is
+/// happening. Summed over `reason` this is the number the counter carried
+/// before the label existed, so a reader that wants the old total keeps it.
 pub const BUILD_GATE_REFUSED_TOTAL: &str = "cogneva_build_gate_refused_total";
 /// Time builds have spent waiting for a slot, in milliseconds, summed over the
 /// builds that went on to take one.
@@ -446,7 +455,10 @@ struct Counters {
     excluded: u64,
     waiting: u64,
     acquired: u64,
-    refused: u64,
+    /// One count per wall, indexed by [`RefusedBy::index`], so the refusal
+    /// counter publishes a fixed series set rather than a set that grows with
+    /// the walls a process happens to have hit.
+    refused: [u64; RefusedBy::ALL.len()],
     wait_ms_total: u64,
     wait_ms_max: u64,
     held_ms_total: u64,
@@ -789,7 +801,7 @@ fn readings(
         m.with_label("dir", origin.dir.to_string())
             .with_label("role", origin.role.to_string())
     };
-    vec![
+    let mut out = vec![
         label(RawMetric::new(BUILD_GATE_SLOTS, slots as f64)),
         label(RawMetric::new(BUILD_GATE_CEILING, ceiling as f64))
             .with_label("dimension", dimension.to_string()),
@@ -798,7 +810,20 @@ fn readings(
         label(RawMetric::new(BUILD_GATE_EXCLUDED, c.excluded as f64)),
         label(RawMetric::new(BUILD_GATE_WAITING, c.waiting as f64)),
         label(RawMetric::new(BUILD_GATE_ACQUIRED_TOTAL, c.acquired as f64)),
-        label(RawMetric::new(BUILD_GATE_REFUSED_TOTAL, c.refused as f64)),
+    ];
+    // One row per wall, all of them always, so a reader summing the counter over
+    // its labels gets the same total the one-number version published and the
+    // series set does not depend on which walls this process has hit.
+    for wall in RefusedBy::ALL {
+        out.push(
+            label(RawMetric::new(
+                BUILD_GATE_REFUSED_TOTAL,
+                c.refused[wall.index()] as f64,
+            ))
+            .with_label("reason", wall.as_str().to_string()),
+        );
+    }
+    out.extend([
         label(RawMetric::new(
             BUILD_GATE_WAIT_MS_TOTAL,
             c.wait_ms_total as f64,
@@ -813,7 +838,8 @@ fn readings(
             BUILD_GATE_WAIT_BUDGET_MS,
             wait_budget_ms as f64,
         )),
-    ]
+    ]);
+    out
 }
 
 /// Takes a slot for a build that has nowhere to come back to, waiting within the
@@ -855,31 +881,74 @@ pub async fn try_acquire_exclusive(what: &str) -> SFResult<Option<BuildPermit>> 
     }
 }
 
-/// How a slot request ended.
+/// Which wall turned a build away, as the values the refusal counter carries.
+///
+/// The counter used to be one number, and the walls behind it do not have the
+/// same owner: a host whose slots are all busy is a capacity reading, a sweep or
+/// a registry restart holding the field is maintenance standing the builds down
+/// on purpose, and another work's reservation is the queue working as it should.
+/// One number over all four says "a build was refused" and cannot say which —
+/// the same shape the CI reader's no-verdict counter carries its reasons to
+/// avoid. The set is closed at four so the series set stays fixed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Refusal {
+enum RefusedBy {
     /// The caller asked not to wait, and no slot was free.
     Busy,
     /// The wait budget ran out with every slot still taken.
-    Waited,
+    WaitedOut,
+    /// A build-cache sweep or a registry restart was holding the field.
+    Excluded,
+    /// Another work had been turned away and claimed the next build.
+    Reserved,
 }
 
-impl Refusal {
+impl RefusedBy {
+    /// Every wall, in the order the counter publishes them.
+    const ALL: [RefusedBy; 4] = [Self::Busy, Self::WaitedOut, Self::Excluded, Self::Reserved];
+
+    /// This wall's own words, said the same way every time it causes a refusal.
+    ///
+    /// `slots` and `wait` are the two walls that are a matter of counts; the
+    /// other two are walls in name only and say their sentence regardless.
     fn reason(self, slots: usize, wait: Duration) -> String {
         match self {
-            Refusal::Busy => format!("all {slots} build slots are taken"),
-            Refusal::Waited => format!(
+            RefusedBy::Busy => format!("all {slots} build slots are taken"),
+            RefusedBy::WaitedOut => format!(
                 "all {slots} build slots were taken for the whole {}s wait budget",
                 wait.as_secs()
             ),
+            RefusedBy::Excluded => {
+                "a build-cache sweep or a registry restart is holding the field".to_string()
+            }
+            RefusedBy::Reserved => "another work claimed the next build".to_string(),
         }
     }
 
+    /// The value a reader sees, which is the whole of what an alert says about
+    /// the cause: a bare token with no sentence around it.
+    ///
+    /// Named for what happened rather than for the variant, because the two
+    /// walls that are not slot counts say nothing on their own.
+    /// `maintenance_hold` rather than `excluded` because the
+    /// `cogneva_build_gate_excluded` gauge is a different subject: it counts
+    /// builds held out of the gate at this instant, where this label says why
+    /// one build was turned away. A refused build found the field held, it was
+    /// not itself held out of the gate, and one word for the two would say they
+    /// are the same thing.
     fn as_str(self) -> &'static str {
         match self {
-            Refusal::Busy => "busy",
-            Refusal::Waited => "waited_out",
+            RefusedBy::Busy => "busy",
+            RefusedBy::WaitedOut => "waited_out",
+            RefusedBy::Excluded => "maintenance_hold",
+            RefusedBy::Reserved => "queue_ahead",
         }
+    }
+
+    fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|wall| *wall == self)
+            .expect("every wall is in ALL")
     }
 }
 
@@ -923,7 +992,8 @@ pub struct BuildGate {
     excluded: AtomicU64,
     waiting: AtomicU64,
     acquired: AtomicU64,
-    refused: AtomicU64,
+    /// One counter per wall, indexed by [`RefusedBy::index`].
+    refused: [AtomicU64; RefusedBy::ALL.len()],
     wait_ms_total: AtomicU64,
     wait_ms_max: AtomicU64,
     held_ms_total: AtomicU64,
@@ -971,7 +1041,7 @@ impl BuildGate {
             excluded: AtomicU64::new(0),
             waiting: AtomicU64::new(0),
             acquired: AtomicU64::new(0),
-            refused: AtomicU64::new(0),
+            refused: std::array::from_fn(|_| AtomicU64::new(0)),
             wait_ms_total: AtomicU64::new(0),
             wait_ms_max: AtomicU64::new(0),
             held_ms_total: AtomicU64::new(0),
@@ -1283,7 +1353,7 @@ impl BuildGate {
             excluded: self.excluded.load(Ordering::Relaxed),
             waiting: self.waiting.load(Ordering::Relaxed),
             acquired: self.acquired.load(Ordering::Relaxed),
-            refused: self.refused.load(Ordering::Relaxed),
+            refused: std::array::from_fn(|i| self.refused[i].load(Ordering::Relaxed)),
             wait_ms_total: self.wait_ms_total.load(Ordering::Relaxed),
             wait_ms_max: self.wait_ms_max.load(Ordering::Relaxed),
             held_ms_total: self.held_ms_total.load(Ordering::Relaxed),
@@ -1448,7 +1518,9 @@ impl BuildGate {
         // once" rather than "never look".
         loop {
             let bound = self.bound();
-            let mut blocked_by: Option<String> = None;
+            // Why this pass got nowhere, when it was not the slot count that
+            // stopped it: which wall, and who was holding what put it there.
+            let mut blocked_by: Option<(RefusedBy, String)> = None;
             for slot in 0..bound {
                 let Some(file) = lock_slot(&self.dir, slot) else {
                     continue;
@@ -1459,10 +1531,7 @@ impl BuildGate {
                 // that a build never sits on a slot while a sweep finishes.
                 let Some(claim) = lock_claim_shared(&self.dir) else {
                     drop(file);
-                    blocked_by = Some(format!(
-                        "a build-cache sweep or a registry restart is holding the field ({})",
-                        name_holder(&self.dir, CLAIM_FILE)
-                    ));
+                    blocked_by = Some((RefusedBy::Excluded, name_holder(&self.dir, CLAIM_FILE)));
                     break;
                 };
                 // A work that was turned away and said it is still waiting gets
@@ -1471,9 +1540,7 @@ impl BuildGate {
                     if claimant != what {
                         drop(claim);
                         drop(file);
-                        blocked_by = Some(format!(
-                            "\"{claimant}\" was turned away and has claimed the next build"
-                        ));
+                        blocked_by = Some((RefusedBy::Reserved, format!("\"{claimant}\"")));
                         break;
                     }
                 }
@@ -1505,12 +1572,12 @@ impl BuildGate {
             }
             if Instant::now() >= deadline {
                 self.waiting.fetch_sub(1, Ordering::Relaxed);
-                let total = self.refused.fetch_add(1, Ordering::Relaxed) + 1;
-                let refusal = if budget.is_zero() {
-                    Refusal::Busy
-                } else {
-                    Refusal::Waited
+                let by = match blocked_by.as_ref() {
+                    Some((wall, _)) => *wall,
+                    None if budget.is_zero() => RefusedBy::Busy,
+                    None => RefusedBy::WaitedOut,
                 };
+                let total = self.refused[by.index()].fetch_add(1, Ordering::Relaxed) + 1;
                 // Who is holding, read from the holders themselves. A refusal's
                 // own duration is not a reading -- it is fixed by whether the
                 // caller waited -- but the holder's is: it is the length of one
@@ -1519,17 +1586,23 @@ impl BuildGate {
                 // unbroken hold. When the slots are not what stopped the ask, the
                 // slots' holders are not who stopped it either, so the reason
                 // carries what did instead.
-                let held = match blocked_by.as_deref() {
-                    Some(why) => why.to_string(),
+                let held = match blocked_by.as_ref() {
+                    Some((_, holder)) => holder.clone(),
                     None => holder_report(&self.dir, bound),
                 };
-                let reason = match blocked_by.as_deref() {
-                    Some(why) => format!("the gate is not open to this build: {why}"),
-                    None => format!("{} ({held})", refusal.reason(bound, budget)),
+                // The wall's own sentence, whenever the wall is what stopped the
+                // ask: four walls, four sentences, so the same wall reads the
+                // same way in every refusal it causes. A build kept out by
+                // something other than the slot count says so as well, because
+                // the slots' holders are then not who stopped it.
+                let opening = match blocked_by.as_ref() {
+                    Some(_) => "the gate is not open to this build: ",
+                    None => "",
                 };
+                let reason = format!("{opening}{} ({held})", by.reason(bound, budget));
                 tracing::warn!(
                     what,
-                    refusal = refusal.as_str(),
+                    refusal = by.as_str(),
                     slots = bound,
                     holder = %held,
                     dir = %self.dir.display(),
@@ -2373,7 +2446,7 @@ mod tests {
             "an exclusion that was refused is not an exclusion that is in force"
         );
         assert_eq!(
-            reading(&gate, BUILD_GATE_REFUSED_TOTAL).await,
+            refused_reading(&gate).await,
             0.0,
             "no build was refused a slot here: an exclusion that could not be taken is not a build turned away"
         );
@@ -3196,11 +3269,54 @@ unevictable 28532736
             SFError::ResourceExhausted(_)
         ));
         assert!(refused_is_environmental());
-        assert_eq!(gate.refused.load(Ordering::Relaxed), 1);
+        assert_eq!(refused_total(&gate), 1);
+        assert_eq!(
+            refused_on(&gate, RefusedBy::WaitedOut),
+            1,
+            "the wall it hit was the wait budget, not a sweep or a reservation"
+        );
     }
 
     fn refused_is_environmental() -> bool {
         SFError::ResourceExhausted("busy".into()).is_environment_failure()
+    }
+
+    /// Refusals this gate counted on one wall.
+    fn refused_on(gate: &BuildGate, wall: RefusedBy) -> u64 {
+        gate.refused[wall.index()].load(Ordering::Relaxed)
+    }
+
+    /// Refusals this gate counted over every wall.
+    fn refused_total(gate: &BuildGate) -> u64 {
+        gate.refused.iter().map(|c| c.load(Ordering::Relaxed)).sum()
+    }
+
+    /// A build turned away because the field is being swept is not a host that is
+    /// simply busy, and the counter has to say which: one is maintenance standing
+    /// the builds down on purpose, the other is capacity. Counted together they
+    /// read as the same alert and send an operator to the wrong place.
+    #[tokio::test]
+    async fn a_build_refused_by_a_sweep_lands_on_its_own_wall() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 2, 0);
+        let sweep = gate
+            .try_acquire_exclusive("sweeping the build cache")
+            .await
+            .unwrap();
+        assert!(sweep.held(), "the exclusion holds the field");
+        let refused = gate.acquire("a one-shot build").await;
+        assert!(refused.is_err(), "an exclusion admits no build at all");
+        assert_eq!(
+            refused_on(&gate, RefusedBy::Excluded),
+            1,
+            "the sweep is the wall this build hit"
+        );
+        assert_eq!(
+            refused_on(&gate, RefusedBy::Busy),
+            0,
+            "and it is not the capacity reading, which would send the reader to the bound"
+        );
+        drop(sweep);
     }
 
     /// How long the bound costs is the reason to look at it at all: a gate at
@@ -3338,7 +3454,7 @@ unevictable 28532736
         assert!(!permit.held());
         drop(permit);
         assert_eq!(disabled.in_flight.load(Ordering::Relaxed), 0);
-        assert_eq!(disabled.refused.load(Ordering::Relaxed), 0);
+        assert_eq!(refused_total(&disabled), 0);
         assert_eq!(
             reading(&disabled, BUILD_GATE_HELD_MS_TOTAL).await,
             0.0,
@@ -3401,6 +3517,18 @@ unevictable 28532736
             .value
     }
 
+    /// The refusal counter summed over every wall, from the published rows: the
+    /// one number the counter carried before it was split.
+    async fn refused_reading(gate: &Arc<BuildGate>) -> f64 {
+        gate.collect_metrics("D5")
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.name == BUILD_GATE_REFUSED_TOTAL)
+            .map(|m| m.value)
+            .sum()
+    }
+
     fn inactive(dir: &Path) -> Arc<dyn Observable> {
         install_for(
             &BuildGateConfig {
@@ -3433,6 +3561,9 @@ unevictable 28532736
                 BUILD_GATE_WAITING,
                 BUILD_GATE_ACQUIRED_TOTAL,
                 BUILD_GATE_REFUSED_TOTAL,
+                BUILD_GATE_REFUSED_TOTAL,
+                BUILD_GATE_REFUSED_TOTAL,
+                BUILD_GATE_REFUSED_TOTAL,
                 BUILD_GATE_WAIT_MS_TOTAL,
                 BUILD_GATE_WAIT_MS_MAX,
                 BUILD_GATE_HELD_MS_TOTAL,
@@ -3448,6 +3579,22 @@ unevictable 28532736
                 metric.name
             );
         }
+        // One row per wall, all of them, even where none has been hit: a reader
+        // summing the counter over `reason` has to get the whole number, not the
+        // walls this process happens to have reached.
+        let reasons: Vec<&str> = published
+            .iter()
+            .filter(|m| m.name == BUILD_GATE_REFUSED_TOTAL)
+            .filter_map(|m| m.labels.get("reason").map(String::as_str))
+            .collect();
+        assert_eq!(
+            reasons,
+            RefusedBy::ALL
+                .iter()
+                .map(|wall| wall.as_str())
+                .collect::<Vec<_>>(),
+            "every wall is published, so the refusals can be attributed"
+        );
     }
 
     /// The count a rule reads is per-host, and a host has one builder process
