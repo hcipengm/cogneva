@@ -862,6 +862,75 @@ fn no_rule_expression_has_a_known_unparseable_shape() {
     );
 }
 
+/// Whether a device counter is named in seconds without measuring seconds.
+///
+/// On a block-multiqueue device the kernel writes the `*_ticks` fields as the
+/// sum of each request's in-flight time, so they climb by however many requests
+/// were overlapping rather than by the time the device spent busy. Measured on
+/// this deployment's NVMe over one 20 second window, `write_ticks` reached
+/// 11,322% of the wall clock and `time_in_queue` -- which is what the usual
+/// `%util` query is built from -- 11,477%. A rate over one of these is not a
+/// duration, and `sectors * 512 / write_ticks` is throughput divided by average
+/// concurrency while reading exactly like a throughput.
+///
+/// `io_ticks` is the exception: it counts time at least one request was in
+/// flight, which the clock does bound (84% of wall clock in the same window).
+/// It is the only spelling of device time a rule may read.
+fn sums_in_flight_time(metric: &str) -> bool {
+    metric.starts_with("node_disk_")
+        && metric.ends_with("_seconds_total")
+        && metric != "node_disk_io_time_seconds_total"
+}
+
+/// No rule reads a device counter as elapsed time.
+///
+/// A device reading that reads like a duration and is not one is worse than a
+/// missing reading: the alert fires on a number nobody can interpret, and the
+/// threshold picked for it was picked by reading the same wrong quantity.
+#[test]
+fn no_rule_reads_a_device_counter_as_elapsed_time() {
+    let mut complaints: Vec<String> = Vec::new();
+    for (rule, promql) in chart_rules() {
+        for metric in metric_names_in(&promql) {
+            if sums_in_flight_time(&metric) {
+                complaints.push(format!("{rule} reads {metric}\n    {promql}"));
+            }
+        }
+    }
+
+    assert!(
+        complaints.is_empty(),
+        "these device counters sum per-request in-flight time rather than time on \
+         the clock, so a rate or ratio over one is not a duration:\n{}",
+        complaints.join("\n")
+    );
+}
+
+/// The gate above is aimed at the counters it means to catch.
+///
+/// Without this, a predicate that had drifted off the name it was written for
+/// would report nothing and look like a clean fleet.
+#[test]
+fn the_device_counter_gate_reports_the_counter_it_is_aimed_at() {
+    for caught in [
+        "node_disk_read_time_seconds_total",
+        "node_disk_write_time_seconds_total",
+        "node_disk_discard_time_seconds_total",
+        "node_disk_io_time_weighted_seconds_total",
+    ] {
+        assert!(sums_in_flight_time(caught), "{caught} should be reported");
+    }
+    for allowed in [
+        "node_disk_io_time_seconds_total",
+        "node_disk_written_bytes_total",
+        "node_disk_read_bytes_total",
+        "node_disk_writes_completed_total",
+        "node_disk_info",
+    ] {
+        assert!(!sums_in_flight_time(allowed), "{allowed} should be allowed");
+    }
+}
+
 /// A guard that reads the very series it guards never lets the rule through.
 ///
 /// `L unless on () R` drops every `L` that has a matching `R`, and an empty `on ()`
