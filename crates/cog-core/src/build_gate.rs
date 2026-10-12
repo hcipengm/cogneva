@@ -489,9 +489,30 @@ struct HostLoad {
 /// it. The manifest's own number is therefore the whole of the fix here — this
 /// dimension reports the wall, it cannot open it.
 struct BuildBudget {
-    /// Bytes the cgroup may use in total, and bytes it is using now.
+    /// Bytes the cgroup may use in total, and bytes charged to it now.
     mem_max: u64,
     mem_current: u64,
+    /// How much of `mem_current` the kernel can take back on demand: the page
+    /// cache the cgroup holds as a result of having read files, which is what a
+    /// cgroup that has built before is mostly holding.
+    mem_reclaimable: u64,
+}
+
+/// Bytes of a cgroup's charge the kernel can give back without writing them out,
+/// read out of the cgroup's own `memory.stat`.
+///
+/// `inactive_file` rather than `file`: `file` counts pages read recently enough
+/// that the kernel would rather keep them, and what a bound may spend is the
+/// part the kernel has already decided it is not holding on to.
+///
+/// Zero when the file does not name it, which counts the whole charge as
+/// unreclaimable — the reading this dimension used before it knew the
+/// difference, so nothing loses a bound it had.
+fn reclaimable_file_bytes(stat: &str) -> u64 {
+    stat.lines()
+        .find_map(|line| line.strip_prefix("inactive_file "))
+        .and_then(|bytes| bytes.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 impl BuildBudget {
@@ -517,21 +538,38 @@ impl BuildBudget {
         let base = Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/'));
         let mem_max = read_u64_file(&base.join("memory.max"))?;
         let mem_current = read_u64_file(&base.join("memory.current"))?;
+        // A cgroup whose accounting cannot be read is charged in full, which is
+        // the reading this dimension had before it could tell cache apart.
+        let mem_reclaimable = std::fs::read_to_string(base.join("memory.stat"))
+            .map(|stat| reclaimable_file_bytes(&stat))
+            .unwrap_or(0);
         Some(Self {
             mem_max,
             mem_current,
+            mem_reclaimable,
         })
     }
 
     /// How many more builds the cgroup's limit can hold.
     ///
-    /// What is left of the limit rather than what is left of its *unreclaimable*
-    /// part: the page cache charged to the cgroup is reclaimable, but reclaiming
-    /// it is IO, and a bound that spends that room is admitting builds into a
-    /// budget that will be paid for by the disk the io dimension is already
-    /// watching.
+    /// What is left of the limit less what the kernel cannot take back, rather
+    /// than what is left of the limit less everything charged to it: on a cgroup
+    /// that has built before, most of `memory.current` is the page cache of the
+    /// files the build itself read back — read against a 16 GiB limit, 14 GiB of
+    /// it charged and 12 GiB of that inactive file, so the charge the kernel
+    /// cannot hand back is 2 GiB and what is left is room for three builds. The
+    /// same reading taken against everything charged leaves 0.45 of a build,
+    /// which is room for none of one.
+    ///
+    /// A dimension pinned at one is not a reading: it would name itself the wall
+    /// on every settled cgroup and hide the dimensions that do move, and
+    /// reclaiming that cache is IO, which the io dimension is the one charged
+    /// for — spending only one budget for it is what keeps that charge from
+    /// being paid twice.
     fn ceiling(&self) -> f64 {
-        self.mem_max.saturating_sub(self.mem_current) as f64 / BUILD_PEAK_RSS_BYTES as f64
+        self.mem_max
+            .saturating_sub(self.mem_current.saturating_sub(self.mem_reclaimable)) as f64
+            / BUILD_PEAK_RSS_BYTES as f64
     }
 }
 
@@ -2427,7 +2465,7 @@ mod tests {
     #[test]
     fn the_containers_memory_limit_caps_the_ceiling() {
         let gib = 1024 * 1024 * 1024;
-        let load = |mem_max: u64, mem_current: u64| HostLoad {
+        let load = |mem_max: u64, mem_current: u64, mem_reclaimable: u64| HostLoad {
             pressure: Pressure {
                 cpu_avg10: 0.0,
                 cpu_avg60: 0.0,
@@ -2443,6 +2481,7 @@ mod tests {
             budget: Some(BuildBudget {
                 mem_max,
                 mem_current,
+                mem_reclaimable,
             }),
         };
         // One build per core the host could run, and then some: a limit this
@@ -2452,24 +2491,75 @@ mod tests {
         let roomy = (cpu_bound as u64 + 1) * BUILD_PEAK_RSS_BYTES;
 
         assert_eq!(
-            load(roomy, 0).ceiling(),
+            load(roomy, 0, 0).ceiling(),
             (cpu_bound, DIM_CPU),
             "a limit with room for one build per core and then some leaves the host deciding"
         );
         assert_eq!(
-            load(8 * gib, 4 * gib).ceiling(),
+            load(8 * gib, 4 * gib, 0).ceiling(),
             (1, DIM_CGROUP_MEMORY),
-            "8 GiB with half of it already charged leaves room for one build of {BUILD_PEAK_RSS_BYTES} bytes, not two"
+            "8 GiB with half of it charged and none of it cache leaves room for one build of {BUILD_PEAK_RSS_BYTES} bytes, not two"
         );
         assert_eq!(
-            load(20 * gib, 8 * gib).ceiling(),
+            load(20 * gib, 8 * gib, 0).ceiling(),
             (2, DIM_CGROUP_MEMORY),
             "and the count rises with the limit, which is what makes it a reading rather than a setting"
         );
         assert_eq!(
-            load(gib, gib).ceiling(),
+            load(gib, gib, 0).ceiling(),
             (1, DIM_CGROUP_MEMORY),
             "a cgroup with nothing left is still one build: a bound of zero refuses every build forever"
+        );
+        // The shape a cgroup that has built before is in: charged close to its
+        // limit, and most of the charge the pages of the build's own reads. The
+        // two answers below are the same cgroup, told apart only by whether the
+        // cache in it is counted as spent.
+        assert_eq!(
+            load(16 * gib, 14 * gib, 0).ceiling(),
+            (1, DIM_CGROUP_MEMORY),
+            "counting the page cache as spent pins this dimension at one, which is what it did"
+        );
+        assert_eq!(
+            load(16 * gib, 14 * gib, 12 * gib).ceiling(),
+            (3, DIM_CGROUP_MEMORY),
+            "12 of those 14 GiB are cache the kernel gives back, so the limit has room for three builds"
+        );
+    }
+
+    /// What the cgroup is charged is not what a build can spend, and the part
+    /// that is taken back has to be read out of the cgroup's own accounting: a
+    /// number read off the wrong line would give back memory that is not there.
+    #[test]
+    fn the_reclaimable_part_is_the_caches_own_line_and_no_other() {
+        // A charge of 6 GiB, 4.6 GiB of it anonymous and 1 GiB of it inactive
+        // file: the shape read off a cgroup on this host.
+        let stat = "\
+anon 4907634688
+file 1432453120
+kernel 52428800
+slab 25165824
+inactive_file 1083584512
+active_file 348868608
+unevictable 0
+";
+        assert_eq!(
+            reclaimable_file_bytes(stat),
+            1083584512,
+            "the inactive file pages are what the kernel gives back"
+        );
+        assert!(
+            reclaimable_file_bytes(stat) < 1432453120,
+            "and they are part of the file pages rather than all of them: the active ones are being kept"
+        );
+        assert_eq!(
+            reclaimable_file_bytes("anon 4096\nfile 8192\n"),
+            0,
+            "a cgroup that names no inactive file gets nothing given back, not everything"
+        );
+        assert_eq!(
+            reclaimable_file_bytes(""),
+            0,
+            "and neither does one that cannot be parsed at all"
         );
     }
 
