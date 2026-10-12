@@ -1057,6 +1057,106 @@ async fn ensure_default_storage_class() -> Result<()> {
     );
 }
 
+/// 交付前校验前门：要下发的 ingress 声明的 IngressClass，集群里必须真有一条。
+///
+/// 声明的那个名字从**渲染产物**里读，不在这里另抄一份常量——同一份事实两处声明会
+/// 各自漂，而这条门只在「清单说的」与「集群有的」对不上时才有话说。两个投递路径
+/// 交付的是同一份声明（apply 读渲染目录、helm 读同一 profile 的 values），渲染产物
+/// 与 profile 的一致性由 CI 的 render 新鲜度门禁与 deploy parity 两者守着。
+///
+/// 为什么必须报错而不是警告：声明了集群没有的 class，ingress 就没有任何控制器认领
+/// ——对象照样 apply 成功、Pod 照样 Running、`kubectl get ingress` 也照样打得出来，
+/// 只有集群外的请求全变成 404。这条路上没有任何一个环节会响（实测过一次：前门 404
+/// 了很久，直到有人从集群外 curl 才发现）。缺失要在这里响，不是在使用现场响。
+async fn ensure_ingress_class_serves(profile: Profile) -> Result<()> {
+    let Some(declared) = declared_ingress_class(&rendered_manifest_dir(profile))? else {
+        // 这份清单里没有 Ingress（ingress.enabled=false）：没有前门可校验。
+        return Ok(());
+    };
+    let present = cluster_ingress_classes().await?;
+    if present.iter().any(|c| c == &declared) {
+        info!(ingress_class = %declared, "前门校验：集群认领这条 IngressClass");
+        return Ok(());
+    }
+    bail!(
+        "清单里的 ingress 声明 IngressClass `{declared}`，但集群里没有这一条（现有：{}）。\
+         这条 ingress 不会有控制器认领，集群外的请求全是 404，而集群内一切读数正常。\
+         两条路：装承担这个 class 的 ingress 控制器；或改用集群已有的那条——K3s 自带 \
+         traefik 并把它标成默认（`kubectl get ingressclass` 看名字），此时把 chart 的 \
+         `ingress.className` 改成它再跑 deploy/scripts/render-deploy.sh。",
+        if present.is_empty() {
+            "一条都没有".to_string()
+        } else {
+            present.join(", ")
+        }
+    );
+}
+
+/// 渲染产物里第一个 Ingress 对象声明的 IngressClass；清单里没有 Ingress 时为 `None`。
+///
+/// 按内容找而不是按文件名找：渲染产物与 deploy/k3s 静态清单用两套命名，文件名不是
+/// 判据面。路径（`spec.ingressClassName`）不存在也返回 `None`——省略这个字段时
+/// 集群用默认 class，那条路不归本门管。
+fn declared_ingress_class(dir: &Path) -> Result<Option<String>> {
+    if !dir.is_dir() {
+        return Ok(None);
+    }
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
+    paths.sort();
+    for path in paths {
+        if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)?;
+        for doc in serde_yaml::Deserializer::from_str(&text) {
+            let Ok(value) = serde_yaml::Value::deserialize(doc) else {
+                continue;
+            };
+            if value.get("kind").and_then(|k| k.as_str()) != Some("Ingress") {
+                continue;
+            }
+            if let Some(class) = value
+                .get("spec")
+                .and_then(|s| s.get("ingressClassName"))
+                .and_then(|c| c.as_str())
+            {
+                return Ok(Some(class.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// 集群里现有的 IngressClass 名字。读不到即报错：「探针没跑成」与「集群里一条都没有」
+/// 在判据里必须是两个答案，否则 API 不可达会被读成「集群没有这条 class」。
+async fn cluster_ingress_classes() -> Result<Vec<String>> {
+    let out = Command::new("kubectl")
+        .args([
+            "get",
+            "ingressclass",
+            "-o",
+            "jsonpath={.items[*].metadata.name}",
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .context("探测集群 IngressClass：kubectl 不可用")?;
+    if !out.status.success() {
+        bail!(
+            "读集群 IngressClass 失败：{}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect())
+}
+
 /// 探测部署 profile：发行版（K3s / 标准 K8s）× 节点数（单 / 多）。
 async fn detect_profile() -> Result<Profile> {
     let nodes = probe_nodes().await;
@@ -2156,6 +2256,7 @@ async fn helm_release_exists() -> bool {
 
 async fn deploy_manifests(cluster_existed: bool) -> Result<()> {
     let profile = detect_profile().await?;
+    ensure_ingress_class_serves(profile).await?;
     match detect_delivery(cluster_existed).await {
         Delivery::Apply => deploy_via_apply(profile).await,
         Delivery::Helm => deploy_via_helm(profile).await,
@@ -3610,5 +3711,67 @@ mod node_qos_wiring_tests {
             ready_at < read_at,
             "内存账的读回必须排在 wait_ready 之后（否则节点还没注册）"
         );
+    }
+}
+
+#[cfg(test)]
+mod ingress_preflight_tests {
+    use super::*;
+
+    /// 声明的 IngressClass 按**对象内容**读，不按文件名读：渲染产物叫
+    /// `60-ingress-cogneva.yaml`、deploy/k3s 静态清单叫 `ingress.yaml`，两套命名
+    /// 都可能变，文件名不是判据面。
+    #[test]
+    fn the_declared_ingress_class_is_read_from_the_object_not_the_filename() {
+        let dir =
+            std::env::temp_dir().join(format!("cogneva-ingress-class-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 名字像 ingress 但没有 Ingress 对象。
+        std::fs::write(
+            dir.join("00-ingress-cogneva.yaml"),
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: decoy\n",
+        )
+        .unwrap();
+        // 名字完全不像 ingress，却真的带着 Ingress（前面还有一份非对象文档）。
+        std::fs::write(
+            dir.join("zz-whatever.yaml"),
+            "apiVersion: v1\nitems: []\n---\napiVersion: networking.k8s.io/v1\n\
+             kind: Ingress\nmetadata:\n  name: cogneva\nspec:\n  ingressClassName: traefik\n",
+        )
+        .unwrap();
+        assert_eq!(
+            declared_ingress_class(&dir).unwrap().as_deref(),
+            Some("traefik")
+        );
+
+        // 清单里没有 Ingress（`ingress.enabled=false`）⇒ 没有前门可校验。
+        std::fs::remove_file(dir.join("zz-whatever.yaml")).unwrap();
+        assert_eq!(declared_ingress_class(&dir).unwrap(), None);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 前门校验必须排在**两个投递路径之前**：下发完了再校验等于没校验，那时
+    /// ingress 已经躺在集群里没人认领了。
+    #[test]
+    fn the_ingress_class_check_runs_before_delivery() {
+        let src = include_str!("main.rs");
+        let body = src
+            .split("async fn deploy_manifests(")
+            .nth(1)
+            .expect("deploy_manifests 不在 main.rs 里");
+        let check_at = body
+            .find("ensure_ingress_class_serves(profile).await")
+            .expect("deploy_manifests 没有做前门校验");
+        for delivery in ["deploy_via_apply(profile)", "deploy_via_helm(profile)"] {
+            let at = body
+                .find(delivery)
+                .unwrap_or_else(|| panic!("deploy_manifests 没有调用 {delivery}"));
+            assert!(
+                check_at < at,
+                "前门校验必须排在 {delivery} 之前（下发之后再校验，ingress 已经没人认领）"
+            );
+        }
     }
 }
