@@ -420,8 +420,10 @@ impl Observable for InactiveBuildGate {
             0,
             DIM_NONE,
             Counters::default(),
-            &dir_identity(Path::new(&self.dir)),
-            BUILD_GATE_ROLE_CONTROL_PLANE,
+            Origin {
+                dir: &dir_identity(Path::new(&self.dir)),
+                role: BUILD_GATE_ROLE_CONTROL_PLANE,
+            },
             0,
         ))
     }
@@ -714,6 +716,17 @@ fn cpu_times() -> Option<(usize, u64, u64)> {
     Some((cores, busy, total))
 }
 
+/// Where a set of readings came from: the directory the gate bounds and the side
+/// of the gate this process is on.
+///
+/// One value rather than two, because the two label every metric in the set and
+/// neither means anything without the other: a `role` with no `dir` names a side
+/// of no particular gate, and two gates on one host would merge into one series.
+struct Origin<'a> {
+    dir: &'a str,
+    role: &'a str,
+}
+
 /// The whole series set, in one place: a reader that has to tell "no bound here"
 /// from "this deployment never reported" cannot do it if the two sources of the
 /// set can drift.
@@ -723,13 +736,12 @@ fn readings(
     ceiling: usize,
     dimension: &str,
     c: Counters,
-    dir: &str,
-    role: &str,
+    origin: Origin<'_>,
     wait_budget_ms: u64,
 ) -> Vec<RawMetric> {
     let label = |m: RawMetric| {
-        m.with_label("dir", dir.to_string())
-            .with_label("role", role.to_string())
+        m.with_label("dir", origin.dir.to_string())
+            .with_label("role", origin.role.to_string())
     };
     vec![
         label(RawMetric::new(BUILD_GATE_SLOTS, slots as f64)),
@@ -988,7 +1000,14 @@ impl BuildGate {
                 bound,
                 "could not persist the build bound; other processes on this host keep the bound they read"
             );
+            return;
         }
+        // The bound is what the gate admits; the files below it are what it hands
+        // out. A bound that fell leaves the room above it on disk, where a reader
+        // that counts the directory -- a person looking at the gate, or the
+        // occupied reading -- takes it for room the gate does not have, and the
+        // host is read as being allowed to build beside itself.
+        lay_out_slots(&self.dir, bound);
     }
 
     /// Whether this process is the one that moves the bound.
@@ -1684,6 +1703,68 @@ fn create_slot_dir(dir: &Path) -> SFResult<()> {
     Ok(())
 }
 
+/// Makes the slot files in the directory match the bound it publishes.
+///
+/// Which slots exist and which slots the gate admits are two facts that have to
+/// agree wherever both can be read, because the directory outlives the bound
+/// that made it: a bound that fell leaves the files it used to admit behind, and
+/// the next reader of the directory -- a person, or a reading that counts held
+/// slots -- sees a gate that hands out more room than it does.
+///
+/// The files below the bound are made here rather than left to the first build
+/// that needs one, because not every builder may create a file: the host's own
+/// client takes a slot by opening a file that is already there and will not
+/// invent one, so a bound that rose over a directory without its files would be
+/// room the host can never take. Writing the bound and making the room go
+/// together, on the one side that publishes either.
+///
+/// The rule that a file someone holds is never unlinked is kept exactly: a slot
+/// file's meaning is its lock, so a name removed from under a holder would let
+/// the next arrival create a second file under it and two builds would sit in
+/// one slot. The lock is taken first and the name is removed only while it is
+/// held, so the file that goes is one no build is in. Best-effort throughout: a
+/// name this process may not create or unlink is left as it is.
+#[cfg(unix)]
+fn lay_out_slots(dir: &Path, bound: usize) {
+    for slot in 0..bound {
+        // Opening for writing creates the file under the same mode a builder
+        // would find it in, so nothing here is a slot only this user can use.
+        let _ = open_gate_file(&dir.join(format!("slot-{slot}.lock")), true);
+    }
+    use std::os::unix::io::AsRawFd;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(slot) = name
+            .to_string_lossy()
+            .strip_prefix("slot-")
+            .and_then(|rest| rest.strip_suffix(".lock"))
+            .and_then(|index| index.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        if slot < bound {
+            continue;
+        }
+        let path = entry.path();
+        let Some(file) = open_gate_file(&path, false) else {
+            continue;
+        };
+        // SAFETY: as in `lock_slot` -- flock touches only this process's
+        // descriptor table for a descriptor this scope owns, and EWOULDBLOCK is
+        // the expected "a build is in this slot" answer.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            continue;
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(not(unix))]
+fn lay_out_slots(_dir: &Path, _bound: usize) {}
+
 /// Modes that make the gate directory usable by every builder on the host.
 ///
 /// World-writable and sticky for the directory, world-writable for the files in
@@ -1898,9 +1979,12 @@ fn write_gate_file(path: &Path, text: &str) -> std::io::Result<()> {
 
 /// Creating is how a bound that rose takes effect: the slots above the bound that
 /// existed when the directory was made are files nobody has written yet, and the
-/// first build to reach one makes it. Lowering the bound never removes a file —
-/// a slot file's meaning is its lock, so unlinking one another process holds
-/// would hand the next arrival a second lock on the same slot.
+/// first build to reach one makes it. Lowering the bound never removes a file
+/// that is held -- a slot file's meaning is its lock, so unlinking one another
+/// process holds would hand the next arrival a second lock on the same slot. The
+/// files the bound no longer admits are removed by [`lay_out_slots`], which
+/// takes that lock before it removes anything, so the names go while each one is
+/// provably empty.
 #[cfg(unix)]
 fn file_lock(path: &Path, how: libc::c_int) -> Option<std::fs::File> {
     let file = open_gate_file(path, true)?;
@@ -1936,8 +2020,10 @@ impl Observable for BuildGate {
             ceiling,
             dimension,
             self.counters(),
-            &self.identity(),
-            BUILD_GATE_ROLE_BUILDER,
+            Origin {
+                dir: &self.identity(),
+                role: BUILD_GATE_ROLE_BUILDER,
+            },
             self.wait_budget_ms(),
         ))
     }
@@ -2578,6 +2664,55 @@ mod tests {
             1,
             "a link at the bound's name leaves the host unmeasured, not bounded at the target's number"
         );
+    }
+
+    /// The bound says what the gate admits and the directory says what exists.
+    /// A bound that fell leaves the difference on disk, where anyone counting
+    /// files reads a gate that hands out more room than it does.
+    #[cfg(unix)]
+    #[test]
+    fn a_bound_that_fell_takes_its_slot_files_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 2, 0);
+        let stale = dir.path().join("slot-1.lock");
+        std::fs::write(&stale, b"").unwrap();
+
+        gate.persist_bound(1);
+
+        assert!(
+            !stale.exists(),
+            "the slot the bound no longer admits is not left on the host"
+        );
+        assert!(
+            dir.path().join("slot-0.lock").exists(),
+            "the slot the bound does admit is there for a builder that cannot make it"
+        );
+    }
+
+    /// A slot file's meaning is its lock, so the one file a bound must not take
+    /// with it is the one a build is in: removing the name would let the next
+    /// arrival create a second file under it and two builds would sit in one slot.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_slot_a_build_is_in_survives_a_bound_that_fell() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 2, 0);
+        let first = gate.try_acquire("a build in the first slot").await.unwrap();
+        let second = gate
+            .try_acquire("a build in the second slot")
+            .await
+            .unwrap();
+        let in_use = dir.path().join("slot-1.lock");
+        assert!(in_use.exists(), "the second build is in the second slot");
+
+        gate.persist_bound(1);
+
+        assert!(
+            in_use.exists(),
+            "a slot a build is in is not removed from under it"
+        );
+        drop(second);
+        drop(first);
     }
 
     /// A work that keeps being turned away claims the next build, and a build
