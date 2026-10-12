@@ -758,6 +758,27 @@ impl cog_core::SystemPlugin for StoragePlugin {
         ctx.publish_service(raw_log_index_store);
         info!("StoragePlugin raw log index store published");
 
+        // ── ChangeLedgerStore ──
+        // The ledger *is* the account, not a cache of one: its rows are the only
+        // place the outstanding set exists, and the repository copy is rendered
+        // from them. There is no in-memory fallback for the same reason there is
+        // no fallback for the account itself -- a process-local ledger would
+        // report its own state as the platform's, which is the failure this
+        // table was built to remove. Without a pool nothing is published, and
+        // the loop that maintains it finds no store and leaves the ledger alone.
+        if let Some(pool) = self.pg_pool.clone() {
+            let store: Arc<dyn cog_core::ChangeLedgerStore> =
+                Arc::new(crate::PostgresChangeLedgerStore::new(pool));
+            ctx.publish_service(store);
+            info!("StoragePlugin change ledger store published");
+        } else if strict_persistence {
+            return Err(cog_core::SFError::Config(
+                "No PostgreSQL pool for ChangeLedgerStore (strict_persistence=true)".into(),
+            ));
+        } else {
+            warn!("No PostgreSQL pool; the change ledger is unavailable in this deployment");
+        }
+
         // ── ObjectBackend (singleton for all modules) ──
         let http_client = ctx.consume_service::<dyn cog_core::HttpClient>();
         let object_backend =

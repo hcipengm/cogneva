@@ -1,4 +1,5 @@
 pub mod audit_recorder;
+pub mod change_ledger_store;
 pub mod hook_archive;
 pub mod metrics_backend;
 pub mod observability_gateway;
@@ -9,6 +10,7 @@ pub mod taste_intent_store;
 pub mod user_store;
 
 pub use audit_recorder::PostgresAuditRecorder;
+pub use change_ledger_store::PostgresChangeLedgerStore;
 pub use hook_archive::{HookArchiveRow, PostgresHookArchive};
 pub use metrics_backend::{PostgresMetricsBackend, GAUGE_LATEST_SQL};
 pub use observability_gateway::PostgresObservabilityGateway;
