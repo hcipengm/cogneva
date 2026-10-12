@@ -470,6 +470,25 @@ pub struct ActorUsage {
     pub avg_latency_ms: i64,
 }
 
+/// One rolled read: the spend lines, and the range of windows they were summed
+/// over.
+///
+/// The range travels with the rows because an unfolded range and an idle one
+/// are otherwise the same answer — an empty list. The fold lands one window per
+/// closed hour, so the trailing hour every caller reaches for first is exactly
+/// the one that is not folded yet; without the endpoints a reader cannot tell
+/// that from a platform that spent nothing. `covered_since` and
+/// `covered_until` are both `None` when no closed window fell inside the range
+/// that was asked for, and never one without the other.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RolledUsage {
+    /// Start of the oldest window summed.
+    pub covered_since: Option<DateTime<Utc>>,
+    /// End of the newest window summed.
+    pub covered_until: Option<DateTime<Utc>>,
+    pub actors: Vec<ActorUsage>,
+}
+
 /// Reader of the durable token-spend rollup.
 ///
 /// Implemented by `cog-observability`, which owns the ledger and its fold, and
@@ -479,7 +498,8 @@ pub struct ActorUsage {
 /// tokens go") is asked repeatedly, so re-deriving it on every read would put
 /// a full scan behind every dashboard refresh. A window that has not been
 /// folded yet is absent from the sum, which is why the fold catches up on a
-/// timer rather than only when a reader arrives.
+/// timer rather than only when a reader arrives — and why the read reports the
+/// range it covered rather than the range it was asked for.
 ///
 /// Required, with no default, for the reason the other reading contracts give:
 /// a default would compile into every backend and answer "no tokens were
@@ -488,12 +508,18 @@ pub struct ActorUsage {
 #[async_trait::async_trait]
 pub trait LlmUsageReader: Send + Sync {
     /// Token spend per `(actor, upstream, protocol)` over the closed windows
-    /// that fall inside `[since, until)`, summed across them.
+    /// that fall inside `[since, until)`, summed across them, with the endpoints
+    /// of the range those windows cover.
+    ///
+    /// The returned range is the implementation's own answer, not a restatement
+    /// of `since` and `until`: it names the windows that were actually summed,
+    /// so a partial answer is visible as a range narrower than the request
+    /// rather than as a short sum.
     async fn usage_by_actor_rolled(
         &self,
         since: DateTime<Utc>,
         until: DateTime<Utc>,
-    ) -> SFResult<Vec<ActorUsage>>;
+    ) -> SFResult<RolledUsage>;
 }
 
 // ─── Self-Evolution Metrics ────────────────────────────────────────────────

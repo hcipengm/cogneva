@@ -138,21 +138,25 @@ fn default_usage_hours() -> i64 {
 
 /// Cap on the trailing window one request may ask for.
 ///
-/// The fold itself only catches up a week, so a wider request would be answered
-/// from a range the rollup never covers and read as "no spend" — the same face
-/// a genuinely idle platform shows. Bounded here so the widest honest window is
-/// also the widest accepted one.
+/// Bounded so a single refresh cannot ask the fold for a range wider than the
+/// ledger's own history; a request past the fold's reach is answered as an
+/// uncovered range either way, so the cap bounds the scan and not the honesty
+/// of the answer.
 const MAX_USAGE_HOURS: i64 = 24 * 7;
 
-/// The rolled spend over a trailing window, with the window echoed back.
+/// The rolled spend, with the range of windows it was summed over.
 ///
-/// The endpoints are returned, not just the rows: a reader has to be able to
-/// tell "we spent nothing" from "we asked for a range the fold never reached",
-/// and only the window itself makes the two distinguishable.
+/// The endpoints are the ones the rollup answered for, not the ones the request
+/// named, and they are `null` together when no folded window fell inside the
+/// requested range. Both halves matter: the fold lands one window per closed
+/// hour, so the trailing window a caller reaches for first is exactly the one
+/// that is not folded yet, and echoing the request back would certify "we
+/// covered that" over an empty list — the same response a genuinely idle
+/// platform returns. The two are told apart by the range the read covered.
 #[derive(Debug, serde::Serialize)]
 pub struct TokenUsageResponse {
-    pub since: String,
-    pub until: String,
+    pub covered_since: Option<String>,
+    pub covered_until: Option<String>,
     pub actors: Vec<cog_core::ActorUsage>,
 }
 
@@ -169,15 +173,24 @@ pub async fn token_usage_by_actor_handler(
     let hours = q.hours.clamp(1, MAX_USAGE_HOURS);
     let until = chrono::Utc::now();
     let since = until - chrono::Duration::hours(hours);
-    let actors = reader
+    let rolled = reader
         .usage_by_actor_rolled(since, until)
         .await
         .map_err(|e| ApiError::internal(format!("failed to read token usage: {e}")))?;
-    Ok(Json(TokenUsageResponse {
-        since: since.to_rfc3339(),
-        until: until.to_rfc3339(),
-        actors,
-    }))
+    Ok(Json(token_usage_response(rolled)))
+}
+
+/// Project a rolled read onto the response face.
+///
+/// Takes the read alone, so the request's own window is not in scope here and
+/// cannot be echoed as if it were coverage; every endpoint the response carries
+/// is one the rollup named.
+fn token_usage_response(rolled: cog_core::RolledUsage) -> TokenUsageResponse {
+    TokenUsageResponse {
+        covered_since: rolled.covered_since.map(|t| t.to_rfc3339()),
+        covered_until: rolled.covered_until.map(|t| t.to_rfc3339()),
+        actors: rolled.actors,
+    }
 }
 
 // ─── Task Metrics ───
@@ -587,5 +600,89 @@ mod tests {
         let mut o = overview("unknown");
         apply_alert_verdict(&mut o, Some(&source)).await;
         assert_eq!(o.cluster_health, "unknown");
+    }
+
+    /// The endpoints on the wire are the range the rollup answered for.
+    ///
+    /// Not restating the request: the read is the only input this projection
+    /// has, and the test hands it endpoints that no request could have produced
+    /// (a range that stops an hour short of now) so that an echoed request
+    /// window cannot pass.
+    #[test]
+    fn the_endpoints_on_the_wire_are_the_range_the_read_covered() {
+        let covered_since = chrono::Utc::now() - chrono::Duration::hours(3);
+        let covered_until = chrono::Utc::now() - chrono::Duration::hours(1);
+        let response = token_usage_response(cog_core::RolledUsage {
+            covered_since: Some(covered_since),
+            covered_until: Some(covered_until),
+            actors: vec![],
+        });
+        assert_eq!(
+            response.covered_since.as_deref(),
+            Some(covered_since.to_rfc3339().as_str())
+        );
+        assert_eq!(
+            response.covered_until.as_deref(),
+            Some(covered_until.to_rfc3339().as_str())
+        );
+    }
+
+    /// A request no folded window falls inside answers with no endpoints at
+    /// all, rather than with the window that was asked for.
+    ///
+    /// This is the shape the trailing-hour request hits: the fold lands closed
+    /// hours, so the newest hour is by construction not covered yet. Reporting
+    /// it as covered would make an unfolded hour and an idle one the same
+    /// answer.
+    #[test]
+    fn an_uncovered_range_answers_without_endpoints() {
+        let response = token_usage_response(cog_core::RolledUsage {
+            covered_since: None,
+            covered_until: None,
+            actors: vec![],
+        });
+        assert!(
+            response.covered_since.is_none() && response.covered_until.is_none(),
+            "a range the fold never reached must not be reported as a covered one"
+        );
+        let wire = serde_json::to_value(&response).expect("the response serializes");
+        assert!(
+            wire["covered_since"].is_null() && wire["covered_until"].is_null(),
+            "both endpoints read as null on the wire, got: {wire}"
+        );
+    }
+
+    /// The handler has no way to put the request's window into the answer: the
+    /// response is built in one place, and that place is handed the read only.
+    ///
+    /// Read off the sources rather than asserted about the projection alone,
+    /// because the defect this replaces was not a wrong endpoint: the handler
+    /// computed the window from its own arguments and echoed it, and a test of
+    /// the projection's arithmetic passes just as well while the handler builds
+    /// the response itself.
+    #[test]
+    fn the_handler_answers_from_the_read_not_from_its_own_window() {
+        let src = include_str!("observability.rs");
+        let production = match src.rfind("\n#[cfg(test)]") {
+            Some(at) => &src[..at],
+            None => src,
+        };
+        let handler_start = production
+            .find("pub async fn token_usage_by_actor_handler")
+            .expect("the token usage handler is in this file");
+        let handler = &production[handler_start..];
+        let handler = match handler.find("\n}\n") {
+            Some(end) => &handler[..end],
+            None => handler,
+        };
+        assert!(
+            handler.contains("token_usage_response(rolled)"),
+            "the handler must project the read through the one place that builds the response"
+        );
+        assert!(
+            !handler.contains("to_rfc3339") && !handler.contains("TokenUsageResponse {"),
+            "the handler builds the response itself; the range it echoes would be its own request \
+             window, which is not the range the rollup answered for"
+        );
     }
 }

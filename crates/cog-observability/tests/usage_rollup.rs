@@ -332,6 +332,7 @@ async fn the_rolled_reader_sums_the_fold_over_the_windows_in_range() {
         .await
         .expect("read the rolled spend");
     let line = rolled
+        .rows
         .iter()
         .find(|s| s.actor == actor)
         .expect("the actor is present in the range");
@@ -349,6 +350,29 @@ async fn the_rolled_reader_sums_the_fold_over_the_windows_in_range() {
         "the mean is over the calls, (100+100+400)/3, not the mean of the \
          per-window means, (100+400)/2"
     );
+    // The range reported is the one the rows were taken from — the window
+    // edges, not the requested instants, which fall inside the first and last
+    // windows and would name a range no window boundary matches.
+    assert_eq!(rolled.covered_since, Some(w1.start));
+    assert_eq!(rolled.covered_until, Some(w2.end));
+    // And a window really was summed at each reported end: the oldest window
+    // start and the newest window end under the reported range are the reported
+    // ends themselves. A range that merely brackets the rows would pass the two
+    // assertions above only by coincidence.
+    let (lo, hi) = sqlx::query_as::<_, (Option<DateTime<Utc>>, Option<DateTime<Utc>>)>(
+        "SELECT MIN(window_start), MAX(window_end) FROM cog_llm_usage_rollup \
+         WHERE window_start >= $1 AND window_end <= $2",
+    )
+    .bind(rolled.covered_since.expect("a covered start"))
+    .bind(rolled.covered_until.expect("a covered end"))
+    .fetch_one(&pool)
+    .await
+    .expect("read the window edges under the reported range");
+    assert_eq!(
+        (lo, hi),
+        (Some(w1.start), Some(w2.end)),
+        "the reported endpoints are window boundaries the fold landed"
+    );
 
     // A range that stops before the second window leaves it out.
     let first_only = store
@@ -356,11 +380,34 @@ async fn the_rolled_reader_sums_the_fold_over_the_windows_in_range() {
         .await
         .expect("read the first window only");
     let line1 = first_only
+        .rows
         .iter()
         .find(|s| s.actor == actor)
         .expect("the actor is present");
     assert_eq!(line1.calls, 2, "only the first window is in range");
     assert_eq!(line1.tokens_input, 300, "100 + 200");
+    assert_eq!(first_only.covered_since, Some(w1.start));
+    assert_eq!(first_only.covered_until, Some(w1.end));
+
+    // The trailing hour is the one a caller reaches for first and the one the
+    // fold cannot have landed: it is the window that starts where the newest
+    // folded window ends. Nothing is reported covered, which is what tells this
+    // answer apart from an hour with no spend in it -- without the endpoints the
+    // two are the same empty list.
+    let unwrapped = store
+        .usage_by_actor_rolled(w2.end, w2.end + Duration::hours(1))
+        .await
+        .expect("read a window the fold has not reached");
+    assert!(
+        unwrapped.covered_since.is_none() && unwrapped.covered_until.is_none(),
+        "an unfolded window is not a covered one, got {:?}..{:?}",
+        unwrapped.covered_since,
+        unwrapped.covered_until
+    );
+    assert!(
+        unwrapped.rows.is_empty(),
+        "nothing was folded in that window, so no row may be summed from it"
+    );
 
     sqlx::query("DELETE FROM gateway_llm_usage WHERE actor = $1")
         .bind(&actor)

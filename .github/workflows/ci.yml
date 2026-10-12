@@ -189,6 +189,12 @@ jobs:
       # primary key), and that a known combination the window did not use still
       # lands a zero row. A fold that rewrote a window's keys or dropped the
       # idle rows would leave every call site and every DB-free test unchanged.
+      # The read's own claim is decided by the server too: the range reported
+      # back has to be the range of windows that were summed, because the fold
+      # lands closed hours and the trailing hour a caller asks for first is the
+      # one window it cannot have reached. A read that answered with the window
+      # it was asked for makes an unfolded hour and an idle one the same empty
+      # list, and only a server can say which windows exist to be summed.
       - name: Live-DB LLM usage window rollup
         run: cargo test -p cog-observability --test usage_rollup -- --ignored
         env:

@@ -110,6 +110,25 @@ pub struct ActorSpend {
     pub avg_latency_ms: i64,
 }
 
+/// One rolled read: the spend, and the range of windows it was summed over.
+#[derive(Debug, Clone)]
+pub struct RolledSpend {
+    /// Start of the oldest window summed, and end of the newest. Both are
+    /// `None` — never one without the other — when no closed window fell inside
+    /// the range that was asked for.
+    ///
+    /// Read out of the rollup rather than echoed from the arguments: only
+    /// fully-contained windows are summed, so the range the rows cover is in
+    /// general narrower than the range asked for, and a caller given only the
+    /// second cannot tell "nothing was spent here" from "the fold has not
+    /// reached here yet". Those two are the same shape of answer — an empty
+    /// list — which is why the range that was actually read has to travel with
+    /// it.
+    pub covered_since: Option<DateTime<Utc>>,
+    pub covered_until: Option<DateTime<Utc>>,
+    pub rows: Vec<ActorSpend>,
+}
+
 /// One closed accounting window, `[start, end)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RollupWindow {
@@ -450,7 +469,8 @@ impl LlmUsageStore {
     }
 
     /// Token spend per `(actor, upstream, api_style)` over the closed windows
-    /// inside `[since, until)`, summed across them.
+    /// inside `[since, until)`, summed across them, together with the endpoints
+    /// of the range those windows cover.
     ///
     /// Reads [`ROLLUP_TABLE`], not [`LEDGER_TABLE`]: this is the face a panel
     /// or an ops query reaches, and it must not put a scan of the ever-growing
@@ -459,11 +479,42 @@ impl LlmUsageStore {
     /// than reported as a short window. `avg_latency_ms` is re-weighted by call
     /// count so the result is the mean over the calls, not the mean of the
     /// per-window means.
+    ///
+    /// The covered range is scanned first and the sums are then taken over
+    /// exactly that range, not over the requested one. Both orders read the
+    /// same closed windows in a quiet table; under a fold that is still
+    /// landing, the ordering is what keeps the two halves of the answer
+    /// agreeing. The fold only appends windows newer than the newest it has
+    /// already landed, so a window landing between the two statements falls
+    /// outside the scanned range and drops out of the sums. The other order
+    /// would let the sums cover a window the endpoints do not name — the
+    /// half-covered answer this range exists to make visible.
     pub async fn usage_by_actor_rolled(
         &self,
         since: DateTime<Utc>,
         until: DateTime<Utc>,
-    ) -> anyhow::Result<Vec<ActorSpend>> {
+    ) -> anyhow::Result<RolledSpend> {
+        let scanned = sqlx::query(&format!(
+            "SELECT MIN(window_start) AS covered_since, MAX(window_end) AS covered_until \
+             FROM {ROLLUP_TABLE} \
+             WHERE window_start >= $1 AND window_end <= $2"
+        ))
+        .bind(since)
+        .bind(until)
+        .fetch_one(&self.pool)
+        .await?;
+        let covered_since = scanned.get::<Option<DateTime<Utc>>, _>("covered_since");
+        let covered_until = scanned.get::<Option<DateTime<Utc>>, _>("covered_until");
+        // A minimum and a maximum over the same non-empty set are present or
+        // absent together; the pair is destructured rather than the two values
+        // checked one by one so that half a range cannot be reported.
+        let (Some(covered_since), Some(covered_until)) = (covered_since, covered_until) else {
+            return Ok(RolledSpend {
+                covered_since: None,
+                covered_until: None,
+                rows: Vec::new(),
+            });
+        };
         let rows = sqlx::query(&format!(
             "SELECT actor, upstream, api_style, \
                     SUM(calls)::BIGINT AS calls, \
@@ -480,11 +531,11 @@ impl LlmUsageStore {
              ORDER BY (SUM(tokens_input) + SUM(tokens_output)) DESC, \
                       actor, upstream, api_style"
         ))
-        .bind(since)
-        .bind(until)
+        .bind(covered_since)
+        .bind(covered_until)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
+        let rows = rows
             .iter()
             .map(|r| ActorSpend {
                 actor: r.get::<String, _>("actor"),
@@ -497,7 +548,12 @@ impl LlmUsageStore {
                 tokens_cached: r.get::<i64, _>("tokens_cached"),
                 avg_latency_ms: r.get::<i64, _>("avg_latency_ms"),
             })
-            .collect())
+            .collect();
+        Ok(RolledSpend {
+            covered_since: Some(covered_since),
+            covered_until: Some(covered_until),
+            rows,
+        })
     }
 }
 
@@ -522,25 +578,30 @@ impl cog_core::LlmUsageReader for RolledUsageReader {
         &self,
         since: DateTime<Utc>,
         until: DateTime<Utc>,
-    ) -> cog_core::SFResult<Vec<cog_core::ActorUsage>> {
+    ) -> cog_core::SFResult<cog_core::RolledUsage> {
         let spend = self
             .store
             .usage_by_actor_rolled(since, until)
             .await
             .map_err(|e| cog_core::SFError::Database(format!("rolled usage read failed: {e}")))?;
-        Ok(spend
-            .into_iter()
-            .map(|s| cog_core::ActorUsage {
-                actor: s.actor,
-                upstream: s.upstream,
-                api_style: s.api_style,
-                calls: s.calls,
-                failed_calls: s.failed_calls,
-                tokens_input: s.tokens_input,
-                tokens_output: s.tokens_output,
-                tokens_cached: s.tokens_cached,
-                avg_latency_ms: s.avg_latency_ms,
-            })
-            .collect())
+        Ok(cog_core::RolledUsage {
+            covered_since: spend.covered_since,
+            covered_until: spend.covered_until,
+            actors: spend
+                .rows
+                .into_iter()
+                .map(|s| cog_core::ActorUsage {
+                    actor: s.actor,
+                    upstream: s.upstream,
+                    api_style: s.api_style,
+                    calls: s.calls,
+                    failed_calls: s.failed_calls,
+                    tokens_input: s.tokens_input,
+                    tokens_output: s.tokens_output,
+                    tokens_cached: s.tokens_cached,
+                    avg_latency_ms: s.avg_latency_ms,
+                })
+                .collect(),
+        })
     }
 }
