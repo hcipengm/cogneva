@@ -99,6 +99,13 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies", "ingresses"]
     verbs: ["get", "list", "watch", "create", "patch", "update"]
+  # Ingress 侧的 traefik Middleware（WebSocket/帧头改写），由上面的 ingress 按名
+  # 引用，所以两者必须一起到达集群——只交付 ingress 会留下一个指向不存在资源的
+  # 引用。CRD 组，因此 grants 里看不出它属于哪一类；目标集群没有 traefik CRD 时
+  # 这次 apply 会报错，与安装面 apply 同一份清单时的行为一致。
+  - apiGroups: ["traefik.io"]
+    resources: ["middlewares"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
   # Pod 健康检查（name+component 双标签选择器，集合 list）。
   - apiGroups: [""]
     resources: ["pods"]

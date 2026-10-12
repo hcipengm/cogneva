@@ -6504,6 +6504,7 @@ pub fn api_resource_of(kind: &str) -> Option<(&'static str, &'static str)> {
         "Ingress" => ("networking.k8s.io", "ingresses"),
         "ServiceMonitor" => ("monitoring.coreos.com", "servicemonitors"),
         "PodMonitor" => ("monitoring.coreos.com", "podmonitors"),
+        "Middleware" => ("traefik.io", "middlewares"),
         _ => return None,
     })
 }
