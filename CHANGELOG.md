@@ -37,3 +37,7 @@ based on [Keep a Changelog](https://keepachangelog.com/).
   a fallback. An explicit `SANDBOX_BUILD_CACHE_MAX_BYTES` value still overrides
   it, including `0`, which keeps the measure-only behaviour; an unparsable value
   is treated as "not configured" and falls back with it.
+  The 3 GiB number is defined once, as
+  `cog_core::build_cache::DEFAULT_CACHE_MAX_BYTES`, and the executor reads it
+  from there instead of carrying its own copy, so the fallback cannot drift
+  from the bound the shared readings describe.

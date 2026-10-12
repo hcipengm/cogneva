@@ -56,12 +56,13 @@ const DEFAULT_SCAN_INTERVAL_SECS: u64 = 300;
 
 /// Bytes the cache may hold when the deployment names none.
 ///
-/// 3 GiB: this executor's own volume is a 5 GiB claim shared with the task
-/// worktrees, and 5 GiB less the measured co-tenants (CARGO_HOME, the bare
-/// repo, the per-task worktrees, the host-docs journal) leaves 3 GiB for the
-/// cache -- enough headroom that it cannot push the volume past its claim. A
+/// The shared [`cog_core::build_cache_readings::DEFAULT_CACHE_MAX_BYTES`]:
+/// one deployment-derived 3 GiB number (a 5 GiB claim less the measured
+/// co-tenants -- `CARGO_HOME`, the bare repo, the per-task worktrees, the
+/// host-docs journal), read from the same module that names the readings
+/// rather than copied here, so two publishers cannot drift apart on it. A
 /// deployment that needs another value sets `SANDBOX_BUILD_CACHE_MAX_BYTES`.
-const DEFAULT_MAX_BYTES: u64 = 3_221_225_472;
+const DEFAULT_MAX_BYTES: u64 = cog_core::build_cache_readings::DEFAULT_CACHE_MAX_BYTES;
 
 /// Bytes the cache may hold, and how often it is re-walked.
 #[derive(Debug, Clone)]

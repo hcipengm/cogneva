@@ -140,6 +140,17 @@ pub const MAX_PUBLISHED_LAYERS: usize = 12;
 /// building, so it holds no value being fresher than minutes.
 pub const MIN_SCAN_INTERVAL_SECS: u64 = 60;
 
+/// Bytes a build cache may hold when the deployment names no cap of its own.
+///
+/// 3 GiB: the build volumes are 5 GiB claims shared with the task worktrees,
+/// and 5 GiB less the measured co-tenants (`CARGO_HOME`, the bare repo, the
+/// per-task worktrees, the host-docs journal) leaves 3 GiB for the cache --
+/// enough headroom that it cannot push the volume past its claim. Every
+/// publisher that keeps a cache in this shape reads the number from here
+/// instead of carrying a copy that can drift; an explicitly configured value
+/// still overrides it, including `0`, which keeps the measure-only behaviour.
+pub const DEFAULT_CACHE_MAX_BYTES: u64 = 3_221_225_472;
+
 /// The layers to publish, largest first, with everything past
 /// [`MAX_PUBLISHED_LAYERS`] folded into [`OTHER_LAYER`].
 ///
