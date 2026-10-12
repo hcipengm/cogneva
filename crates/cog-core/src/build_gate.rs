@@ -498,19 +498,27 @@ struct BuildBudget {
     mem_reclaimable: u64,
 }
 
-/// Bytes of a cgroup's charge the kernel can give back without writing them out,
-/// read out of the cgroup's own `memory.stat`.
+/// Bytes of a cgroup's charge the kernel can give back on demand, read out of
+/// the cgroup's own `memory.stat`.
 ///
-/// `inactive_file` rather than `file`: `file` counts pages read recently enough
-/// that the kernel would rather keep them, and what a bound may spend is the
-/// part the kernel has already decided it is not holding on to.
+/// The whole `file` line, not the `inactive_file` part of it. Which pages sit on
+/// the kernel's active list says what reclaim would cost — a page read recently
+/// enough to be kept is one that has to be read again — and not whether the
+/// memory is available: under pressure the kernel demotes the active list and
+/// gives those pages back the same way. Reading the narrow line as the free part
+/// is what pinned this dimension at one on this deployment: measured
+/// 2026-10-13 on the evolution cgroup, a 16 GiB limit held 15.5 GiB charged, of
+/// which 14.0 GiB was file pages — 3.5 inactive and 10.5 active — so the
+/// arithmetic left 0.93 of a build. One build of the workspace peaks at 4481
+/// MiB, the cgroup had never reached its limit once (`memory.events max 0`), and
+/// the bound was one against a wall no reading showed.
 ///
 /// Zero when the file does not name it, which counts the whole charge as
 /// unreclaimable — the reading this dimension used before it knew the
 /// difference, so nothing loses a bound it had.
 fn reclaimable_file_bytes(stat: &str) -> u64 {
     stat.lines()
-        .find_map(|line| line.strip_prefix("inactive_file "))
+        .find_map(|line| line.strip_prefix("file "))
         .and_then(|bytes| bytes.trim().parse().ok())
         .unwrap_or(0)
 }
@@ -556,10 +564,10 @@ impl BuildBudget {
     /// than what is left of the limit less everything charged to it: on a cgroup
     /// that has built before, most of `memory.current` is the page cache of the
     /// files the build itself read back — read against a 16 GiB limit, 14 GiB of
-    /// it charged and 12 GiB of that inactive file, so the charge the kernel
-    /// cannot hand back is 2 GiB and what is left is room for three builds. The
-    /// same reading taken against everything charged leaves 0.45 of a build,
-    /// which is room for none of one.
+    /// it charged and 12 GiB of that page cache, so the charge the kernel cannot
+    /// hand back is 2 GiB and what is left is room for three builds. The same
+    /// reading taken against everything charged leaves 0.45 of a build, which is
+    /// room for none of one.
     ///
     /// A dimension pinned at one is not a reading: it would name itself the wall
     /// on every settled cgroup and hide the dimensions that do move, and
@@ -2524,42 +2532,63 @@ mod tests {
             (3, DIM_CGROUP_MEMORY),
             "12 of those 14 GiB are cache the kernel gives back, so the limit has room for three builds"
         );
+        // The same pair read off this deployment on 2026-10-13, where the
+        // cgroup held 14.0 GiB of file pages and only 3.5 GiB of them inactive:
+        // the inactive line is the reading that said one, and the file page
+        // line -- the memory the kernel demotes and reclaims either way -- says
+        // three.
+        assert_eq!(
+            load(16 * gib, 16_595_374_080, 3_779_870_720).ceiling(),
+            (1, DIM_CGROUP_MEMORY),
+            "the inactive part alone leaves under one build and floors this dimension at one"
+        );
+        assert_eq!(
+            load(16 * gib, 16_595_374_080, 15_053_443_072).ceiling(),
+            (3, DIM_CGROUP_MEMORY),
+            "the file pages are room for three, on a cgroup that never reached its limit"
+        );
     }
 
     /// What the cgroup is charged is not what a build can spend, and the part
     /// that is taken back has to be read out of the cgroup's own accounting: a
     /// number read off the wrong line would give back memory that is not there.
     #[test]
-    fn the_reclaimable_part_is_the_caches_own_line_and_no_other() {
-        // A charge of 6 GiB, 4.6 GiB of it anonymous and 1 GiB of it inactive
-        // file: the shape read off a cgroup on this host.
+    fn the_reclaimable_part_is_the_file_pages_and_all_of_them() {
+        // The shape read off this deployment's evolution cgroup on 2026-10-13:
+        // 14.0 GiB of file pages against a 16 GiB limit, 3.5 GiB of them
+        // inactive and 10.5 GiB active.
         let stat = "\
-anon 4907634688
-file 1432453120
-kernel 52428800
-slab 25165824
-inactive_file 1083584512
-active_file 348868608
-unevictable 0
+anon 854978560
+file 15053443072
+kernel 686620672
+inactive_file 3779870720
+active_file 11273572352
+unevictable 28532736
 ";
         assert_eq!(
             reclaimable_file_bytes(stat),
-            1083584512,
-            "the inactive file pages are what the kernel gives back"
+            15053443072,
+            "the file pages are what the kernel gives back, active list or not"
         );
         assert!(
-            reclaimable_file_bytes(stat) < 1432453120,
-            "and they are part of the file pages rather than all of them: the active ones are being kept"
+            reclaimable_file_bytes(stat) > 3779870720,
+            "reading only the inactive ones is what pinned this dimension at one: \
+             the other 10.5 GiB is cache the kernel demotes and reclaims like any other"
         );
         assert_eq!(
-            reclaimable_file_bytes("anon 4096\nfile 8192\n"),
+            reclaimable_file_bytes("anon 4096\n"),
             0,
-            "a cgroup that names no inactive file gets nothing given back, not everything"
+            "a cgroup that names no file pages gets nothing given back, not everything"
+        );
+        assert_eq!(
+            reclaimable_file_bytes("file_mapped 4096\nfile_dirty 2048\n"),
+            0,
+            "`file` followed by a letter is a different line and not this one"
         );
         assert_eq!(
             reclaimable_file_bytes(""),
             0,
-            "and neither does one that cannot be parsed at all"
+            "and neither does a cgroup whose accounting cannot be parsed at all"
         );
     }
 
