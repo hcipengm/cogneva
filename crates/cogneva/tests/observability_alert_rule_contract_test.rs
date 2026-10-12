@@ -882,13 +882,19 @@ fn sums_in_flight_time(metric: &str) -> bool {
         && metric != "node_disk_io_time_seconds_total"
 }
 
-/// No rule reads a device counter as elapsed time.
+/// No rule this repo ships reads a device counter as elapsed time.
 ///
 /// A device reading that reads like a duration and is not one is worse than a
 /// missing reading: the alert fires on a number nobody can interpret, and the
 /// threshold picked for it was picked by reading the same wrong quantity.
+///
+/// "This repo ships" is the whole of the reach. The check reads the rules the
+/// chart renders, and a rule carried by a third party in its own
+/// `PrometheusRule` object is not in its view. Nothing ships such a rule today,
+/// so there is no gap to close; but the reach is the chart's rules, not every
+/// rule the cluster runs, and the name says so.
 #[test]
-fn no_rule_reads_a_device_counter_as_elapsed_time() {
+fn no_rule_this_repo_ships_reads_a_device_counter_as_elapsed_time() {
     let mut complaints: Vec<String> = Vec::new();
     for (rule, promql) in chart_rules() {
         for metric in metric_names_in(&promql) {
