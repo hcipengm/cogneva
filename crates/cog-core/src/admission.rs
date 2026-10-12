@@ -139,7 +139,7 @@ fn read_mem_available() -> Option<u64> {
 /// 目录里有哪些 `slot-*.lock`，就是构建方允许有几种槽。目录里没有槽位文件时答案是 0，
 /// 而这与「构建方在另一个目录里」在读数上同形——所以目录身份（`dev:ino`）跟着报出去，
 /// 让读的人自己判断两边是不是同一个目录。
-fn build_slots_held(dir: &Path) -> usize {
+pub(crate) fn build_slots_held(dir: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };

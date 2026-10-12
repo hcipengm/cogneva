@@ -112,6 +112,22 @@ use crate::{SFError, SFResult};
 
 /// Builds holding a slot in this process, as a gauge.
 pub const BUILD_GATE_IN_FLIGHT: &str = "cogneva_build_gate_in_flight";
+/// Slot files locked right now in the shared directory, as a gauge: every
+/// builder on the host counted, this process and any other alike.
+///
+/// Published beside [`BUILD_GATE_IN_FLIGHT`] because the two answer different
+/// questions, and only the difference between them is the one this series
+/// exists for. The in-flight gauge counts what *this* process is running, so a
+/// builder that is not this process is invisible in it; this one is read from
+/// the locks themselves, which is the only reading that does not depend on the
+/// other builder being cooperative. What it is for: the bound in
+/// [`BUILD_GATE_SLOTS`] is a number of slot files, and the claim a bound is
+/// actually holding is that at most that many builds run on this host at once.
+/// Two series of build activity that never meet leave that claim unreadable --
+/// one process admitting up to its bound while another builds beside it looks
+/// exactly like one process admitting up to its bound, and the difference is
+/// whether the host is carrying one build or two.
+pub const BUILD_GATE_OCCUPIED: &str = "cogneva_build_gate_occupied";
 /// Holders that are not builds and hold every slot to keep them out, as a gauge:
 /// 1 while such a caller is excluding builds, 0 otherwise.
 ///
@@ -395,7 +411,11 @@ struct InactiveBuildGate {
 #[async_trait]
 impl Observable for InactiveBuildGate {
     async fn collect_metrics(&self, _dimension: &str) -> SFResult<Vec<RawMetric>> {
+        // No slots held either: a process that runs no builds takes no lock, so
+        // the count of locks is not its to report -- and it counts locks in a
+        // directory it does not mount.
         Ok(readings(
+            0,
             0,
             0,
             DIM_NONE,
@@ -699,6 +719,7 @@ fn cpu_times() -> Option<(usize, u64, u64)> {
 /// set can drift.
 fn readings(
     slots: usize,
+    occupied: usize,
     ceiling: usize,
     dimension: &str,
     c: Counters,
@@ -714,6 +735,7 @@ fn readings(
         label(RawMetric::new(BUILD_GATE_SLOTS, slots as f64)),
         label(RawMetric::new(BUILD_GATE_CEILING, ceiling as f64))
             .with_label("dimension", dimension.to_string()),
+        label(RawMetric::new(BUILD_GATE_OCCUPIED, occupied as f64)),
         label(RawMetric::new(BUILD_GATE_IN_FLIGHT, c.in_flight as f64)),
         label(RawMetric::new(BUILD_GATE_EXCLUDED, c.excluded as f64)),
         label(RawMetric::new(BUILD_GATE_WAITING, c.waiting as f64)),
@@ -1657,7 +1679,56 @@ fn holder_report(dir: &Path, slots: usize) -> String {
 
 fn create_slot_dir(dir: &Path) -> SFResult<()> {
     std::fs::create_dir_all(dir)
-        .map_err(|e| SFError::IO(format!("create build gate dir {}: {e}", dir.display())))
+        .map_err(|e| SFError::IO(format!("create build gate dir {}: {e}", dir.display())))?;
+    open_gate_dir(dir);
+    Ok(())
+}
+
+/// Modes that make the gate directory usable by every builder on the host.
+///
+/// World-writable and sticky for the directory, world-writable for the files in
+/// it. Nothing here is a secret -- a holder's name, a claim, a count -- so the
+/// mode is not about who may read it; it is about who may *write* it, and the
+/// answer has to be everyone who builds.
+const GATE_DIR_MODE: u32 = 0o1777;
+const GATE_FILE_MODE: u32 = 0o666;
+
+/// Opens the gate directory to every builder on this host, whichever user it
+/// runs as.
+///
+/// The gate is a rendezvous between builders that are neither the same program
+/// nor the same user: a shell on the host and the container both take slots
+/// here. Each of them has to be able to create a lock file and to write its own
+/// name into one, so the directory has to permit both -- a builder that cannot
+/// create the file cannot ask for a slot at all, and the gate then bounds only
+/// the builder that happened to create the directory. Sticky so that one
+/// builder cannot unlink a file another is holding, which for a lock file is the
+/// same as releasing it.
+///
+/// Set on the way in rather than left to creation, because the directory
+/// outlives the process that made it: one created before this ran is owned by
+/// whoever ran first with whatever mode the umask gave, and leaving it that way
+/// keeps every other builder out while the gate goes on reading as installed.
+/// The same argument applies to the files, and is made where they are opened.
+///
+/// Failing is not fatal and must not be silent: this may be a directory this
+/// process does not own, in which case it can still gate itself, and the warning
+/// says which builder was left out rather than the gate quietly bounding one of
+/// several.
+fn open_gate_dir(dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) =
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(GATE_DIR_MODE))
+        {
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %e,
+                "could not open the build gate directory to every builder; a builder that runs as another user cannot take a slot here and nothing in the readings says so"
+            );
+        }
+    }
 }
 
 /// `dev:ino` of a directory, read from the filesystem rather than remembered, so
@@ -1744,6 +1815,20 @@ fn open_gate_file(path: &Path, write: bool) -> Option<std::fs::File> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
         .ok()?;
+    if write {
+        // The files carry what a *holder* wrote: its name, its claim on the next
+        // build. The holder is not always the process that created the file --
+        // a slot the container made is written by the host's shell the next
+        // time round -- so the mode has to be set rather than inherited from
+        // whichever umask created it. Set here rather than at creation for the
+        // same reason as the directory: an install that predates this keeps
+        // files only one builder can write, and reopening one is the moment that
+        // can be corrected without asking an operator to chmod a host path.
+        // Best-effort: a file this process does not own refuses, and the holder
+        // note it then cannot write is a reading it loses, not a lock it loses.
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(GATE_FILE_MODE));
+    }
     file.metadata().ok()?.is_file().then_some(file)
 }
 
@@ -1784,6 +1869,18 @@ fn write_gate_file(path: &Path, text: &str) -> std::io::Result<()> {
             .truncate(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&tmp)?;
+        // The temporary file is made under this process's umask and then
+        // renamed onto the gate's name, so without this the file the rename
+        // lands carries a mode only this process can write -- and the rename is
+        // what makes it the gate's, not who performed it. That is the same
+        // state `open_gate_file` corrects on open, and it has to be corrected
+        // here too: the two writers of these files are different programs, so
+        // setting it on one path leaves the other path's files unshareable, and
+        // the reading that says so is a builder refused the right to claim its
+        // own turn. Set before the write so the name never exists in the wrong
+        // mode even for an instant.
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(GATE_FILE_MODE));
         file.write_all(text.as_bytes())?;
     }
     std::fs::rename(&tmp, path)
@@ -1829,8 +1926,13 @@ impl Observable for BuildGate {
         self.step().await;
         let slots = if self.in_force() { self.bound() } else { 0 };
         let (ceiling, dimension) = self.ceiling();
+        // Read from the directory rather than counted here, because the question
+        // is what the host is carrying and not what this process is doing with
+        // it: a builder that is not this process does not report to this
+        // process, and its hold is visible exactly where it put it.
         Ok(readings(
             slots,
+            crate::admission::build_slots_held(&self.dir),
             ceiling,
             dimension,
             self.counters(),
@@ -1872,6 +1974,114 @@ mod tests {
         fn assert_send<T: Send>() {}
         assert_send::<BuildPermit>();
         assert_send::<Arc<BuildGate>>();
+    }
+
+    /// The gate bounds every builder on the host, not only the one that made the
+    /// directory: a second builder that cannot create a lock file cannot ask for
+    /// a slot at all.
+    #[test]
+    fn the_gate_directory_is_opened_to_every_builder() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gate");
+
+        // The case that matters is the one on a host that has already run a
+        // build: the directory exists, owned by whoever ran first, and the mode
+        // is whatever the umask gave. Installing the gate has to leave it usable
+        // by the next builder, whatever user that is.
+        fs::create_dir_all(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _ = gate(&path, 1, 0);
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, GATE_DIR_MODE,
+            "a directory that predates the gate keeps its old mode, and only the builder that created it can take a slot"
+        );
+    }
+
+    /// The holder's name and the claim on the next build are written by whoever
+    /// holds the file, which is not always whoever created it.
+    #[test]
+    fn a_gate_file_is_writable_by_the_builder_that_opens_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CLAIM_FILE);
+
+        let held = open_gate_file(&path, true).unwrap();
+
+        let mode = held.metadata().unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, GATE_FILE_MODE,
+            "the file a build holds is one only its creator can write, so the next builder on the host cannot record that it is holding it"
+        );
+    }
+
+    /// The other writer of these files is the one that writes by *path* -- the
+    /// bound, and the claim on the next build -- and it goes through a temporary
+    /// file and a rename. That path has to land the same mode, and it did not:
+    /// the file was made under the process's umask, so the cluster's copy was
+    /// readable by the host and not writable by it, and a host build could read
+    /// the gate and never claim a turn on it.
+    #[test]
+    fn a_gate_file_written_by_path_lands_the_shared_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(RESERVE_FILE);
+
+        write_gate_file(&path, "host build\t1791783276\n").unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, GATE_FILE_MODE,
+            "the claim on the next build is rewritten by every later asker, so a mode from the umask leaves all but the first unable to ask"
+        );
+        // The temporary file must not survive the rename: one left beside the
+        // gate's files is neither a slot nor a claim, and the reader that walks
+        // the directory would find a name it has no meaning for.
+        let leftovers: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with('.'))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temporary files left behind: {leftovers:?}"
+        );
+    }
+
+    /// The reading the bound's claim is checked against counts every builder,
+    /// and it is read from the locks rather than from what the builders report.
+    #[tokio::test]
+    async fn the_occupied_count_sees_a_lock_this_process_did_not_take() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 0);
+
+        assert_eq!(occupied(&gate).await, 0, "nothing is running yet");
+
+        // A slot held by anyone at all, taken the way another builder on the
+        // host would take it: by locking the file, without this process knowing.
+        let slot = file_lock(&dir.path().join("slot-0.lock"), libc::LOCK_EX).unwrap();
+        assert_eq!(
+            occupied(&gate).await,
+            1,
+            "a build this process never admitted is a build the host is carrying"
+        );
+
+        drop(slot);
+        assert_eq!(occupied(&gate).await, 0);
+    }
+
+    async fn occupied(gate: &Arc<BuildGate>) -> usize {
+        gate.collect_metrics("D5")
+            .await
+            .unwrap()
+            .iter()
+            .find(|m| m.name == BUILD_GATE_OCCUPIED)
+            .map(|m| m.value as usize)
+            .expect("the gate publishes the occupied count on every scrape")
     }
 
     #[tokio::test]
@@ -2963,6 +3173,7 @@ mod tests {
             vec![
                 BUILD_GATE_SLOTS,
                 BUILD_GATE_CEILING,
+                BUILD_GATE_OCCUPIED,
                 BUILD_GATE_IN_FLIGHT,
                 BUILD_GATE_EXCLUDED,
                 BUILD_GATE_WAITING,
