@@ -34,8 +34,9 @@ rules:
     verbs: ["get", "list", "watch", "create", "patch", "update"]
   # Ingress 侧的 traefik Middleware（WebSocket/帧头改写），由上面的 ingress 按名
   # 引用，所以两者必须一起到达集群——只交付 ingress 会留下一个指向不存在资源的
-  # 引用。CRD 组，因此 grants 里看不出它属于哪一类；目标集群没有 traefik CRD 时
-  # 这次 apply 会报错，与安装面 apply 同一份清单时的行为一致。
+  # 引用。谓词与 ingress 模板同一个：该 profile 不交付 Middleware 时这里也不授权，
+  # 免得留下一条永远用不到的授权。CRD 组，因此 grants 里看不出它属于哪一类；目标
+  # 集群没有 traefik CRD 时这次 apply 会报错，与安装面 apply 同一份清单时的行为一致。
   - apiGroups: ["traefik.io"]
     resources: ["middlewares"]
     verbs: ["get", "list", "watch", "create", "patch", "update"]
