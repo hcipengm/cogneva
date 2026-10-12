@@ -40,6 +40,28 @@ struct AppState {
 const MAX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Port the executor listens on when `SANDBOX_EXECUTOR_PORT` names none.
+///
+/// The executor's Service targets this same port, so it is fixed in code
+/// rather than remade per deployment: a missing or unusable variable binds
+/// the port the Service already routes to, while the environment stays
+/// authoritative when it names a usable port.
+const DEFAULT_EXECUTOR_PORT: u16 = 9090;
+
+/// Resolve the listen port from `SANDBOX_EXECUTOR_PORT`.
+///
+/// A set but unusable value -- not a number, out of `u16` range, or 0, which
+/// binds no port -- is not a configured port: the default applies instead of
+/// failing to start, the same shape `BuildCacheConfig::from_env` uses for a
+/// value it cannot parse.
+fn executor_port_from_env() -> u16 {
+    std::env::var("SANDBOX_EXECUTOR_PORT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .unwrap_or(DEFAULT_EXECUTOR_PORT)
+}
+
 #[derive(Deserialize)]
 struct ExecuteRequest {
     payload: SandboxPayload,
@@ -553,7 +575,10 @@ async fn documents_rollback_handler(
 }
 
 /// Entry point for the `sandbox-executor` subcommand.
-/// Port from `SANDBOX_EXECUTOR_PORT`, default 9090.
+///
+/// The listen port comes from `SANDBOX_EXECUTOR_PORT` through
+/// [`executor_port_from_env`]: a missing or unusable value falls back to
+/// [`DEFAULT_EXECUTOR_PORT`], the port the executor's Service targets.
 pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
     // 独立子命令不经 run_app，需自行初始化日志，否则请求审计行不落地。
     tracing_subscriber::fmt()
@@ -562,10 +587,7 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-    let port: u16 = std::env::var("SANDBOX_EXECUTOR_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(9090);
+    let port = executor_port_from_env();
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
 
     // Host document scopes exist only where the deployment mounted one. An
@@ -618,6 +640,26 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes the tests that mutate `SANDBOX_EXECUTOR_PORT`: the variable
+    /// is process-global while the harness runs tests on parallel threads.
+    static PORT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn executor_port_defaults_when_unset_and_overrides_when_set() {
+        let _guard = PORT_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SANDBOX_EXECUTOR_PORT");
+        assert_eq!(executor_port_from_env(), DEFAULT_EXECUTOR_PORT);
+        std::env::set_var("SANDBOX_EXECUTOR_PORT", " 9191 ");
+        assert_eq!(executor_port_from_env(), 9191);
+        std::env::set_var("SANDBOX_EXECUTOR_PORT", "not-a-port");
+        assert_eq!(executor_port_from_env(), DEFAULT_EXECUTOR_PORT);
+        std::env::set_var("SANDBOX_EXECUTOR_PORT", "0");
+        assert_eq!(executor_port_from_env(), DEFAULT_EXECUTOR_PORT);
+        std::env::set_var("SANDBOX_EXECUTOR_PORT", "70000");
+        assert_eq!(executor_port_from_env(), DEFAULT_EXECUTOR_PORT);
+        std::env::remove_var("SANDBOX_EXECUTOR_PORT");
+    }
 
     async fn post(addr: std::net::SocketAddr, body: serde_json::Value) -> reqwest::Response {
         reqwest::Client::new()

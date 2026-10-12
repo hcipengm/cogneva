@@ -85,24 +85,31 @@ impl BuildCacheConfig {
     pub fn from_env() -> Self {
         // Bytes, not a float: a cap read as a float would be rounded to the
         // nearest representable integer, which is a number nobody configured.
-        let max_bytes = std::env::var("SANDBOX_BUILD_CACHE_MAX_BYTES")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(DEFAULT_MAX_BYTES);
-        let scan_interval = std::env::var("SANDBOX_BUILD_CACHE_SCAN_INTERVAL_SECS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(DEFAULT_SCAN_INTERVAL_SECS)
-            // The floor is the shared one: a deployment that asks to re-walk
-            // faster than a walk of this size is worth gets the floor, and the
-            // interval that is published is the floor rather than the ask, so
-            // the rule comparing a pass against its own interval does not
-            // measure a cadence nothing runs at.
-            .max(cog_core::build_cache::MIN_SCAN_INTERVAL_SECS);
+        let max_bytes = Self::env_u64_or("SANDBOX_BUILD_CACHE_MAX_BYTES", DEFAULT_MAX_BYTES);
+        let scan_interval = Self::env_u64_or(
+            "SANDBOX_BUILD_CACHE_SCAN_INTERVAL_SECS",
+            DEFAULT_SCAN_INTERVAL_SECS,
+        )
+        // The floor is the shared one: a deployment that asks to re-walk
+        // faster than a walk of this size is worth gets the floor, and the
+        // interval that is published is the floor rather than the ask, so
+        // the rule comparing a pass against its own interval does not
+        // measure a cadence nothing runs at.
+        .max(cog_core::build_cache::MIN_SCAN_INTERVAL_SECS);
         Self {
             max_bytes,
             scan_interval: Duration::from_secs(scan_interval),
         }
+    }
+
+    /// Read an integer configuration variable, falling back to `default` when
+    /// it is unset or cannot be parsed: such a value is not a configured
+    /// number -- the same rule for the cap and the interval.
+    fn env_u64_or(key: &str, default: u64) -> u64 {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(default)
     }
 
     /// The readings this configuration asks for.
@@ -215,6 +222,35 @@ mod tests {
             "an unparsable value is not a configured cap, so the default applies"
         );
         std::env::remove_var("SANDBOX_BUILD_CACHE_MAX_BYTES");
+    }
+
+    #[test]
+    fn the_scan_interval_defaults_floors_and_overrides_from_the_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SANDBOX_BUILD_CACHE_SCAN_INTERVAL_SECS");
+        assert_eq!(
+            BuildCacheConfig::from_env().scan_interval,
+            Duration::from_secs(DEFAULT_SCAN_INTERVAL_SECS)
+        );
+        std::env::set_var("SANDBOX_BUILD_CACHE_SCAN_INTERVAL_SECS", "1");
+        assert_eq!(
+            BuildCacheConfig::from_env().scan_interval,
+            Duration::from_secs(cog_core::build_cache::MIN_SCAN_INTERVAL_SECS),
+            "a request faster than the shared floor is served at the floor"
+        );
+        std::env::set_var("SANDBOX_BUILD_CACHE_SCAN_INTERVAL_SECS", "1234");
+        assert_eq!(
+            BuildCacheConfig::from_env().scan_interval,
+            Duration::from_secs(1234),
+            "an explicit interval above the floor is the interval that runs"
+        );
+        std::env::set_var("SANDBOX_BUILD_CACHE_SCAN_INTERVAL_SECS", "soon");
+        assert_eq!(
+            BuildCacheConfig::from_env().scan_interval,
+            Duration::from_secs(DEFAULT_SCAN_INTERVAL_SECS),
+            "an unparsable interval is not configured, so the default applies"
+        );
+        std::env::remove_var("SANDBOX_BUILD_CACHE_SCAN_INTERVAL_SECS");
     }
 
     #[test]
