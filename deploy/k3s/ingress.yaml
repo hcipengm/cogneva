@@ -1,13 +1,16 @@
 # Ingress — 主应用对外入口
 #
-# 历史：最初按 traefik 编写（k3s 自带），但本机 k3s 以 --disable=traefik 安装，
-# traefik Middleware CRD 不存在，该清单从未生效（2026-07-28 嵌套测试中因无 CRD
-# 被探测剔除）。现集群入口统一由 ingress-nginx 承担（见
-# deploy/k3s/ingress-nginx-values.yaml），本清单随之改为 nginx 形态。
+# 入口控制器取 traefik：K3s 自带 traefik 并把它标成默认 IngressClass（`kubectl get
+# ingressclass` 只有这一条）。此前本清单是 nginx 形态，但那台集群里没有 ingress-nginx
+# ——`--disable=traefik` 从未被执行过（bootstrap 与脚本里零命中），`deploy/k8s/
+# ingress-nginx.yaml` 也只被 README 提到、没有任何脚本调用。结果是这条 ingress 没有
+# 控制器认领：集群外请求打到 traefik 直接 404，前门是死的。
+#
+# WebSocket 与安全响应头由同目录 middleware-websocket-headers.yaml 承担——traefik 的
+# ingress 注解不覆盖这些，middleware 才覆盖。
 #
 # 不设 host 作为兜底路由：任意 Host 头（含隧道直连）都进主应用；
 # 监控组件按各自域名路由（见 observability/manifests/07-ingress-monitoring.yaml）。
-# WebSocket：nginx 原生支持 Upgrade，加长读写超时避免长连接被掐断。
 
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -18,11 +21,10 @@ metadata:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/component: gateway
   annotations:
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-body-size: 64m
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    traefik.ingress.kubernetes.io/router.middlewares: "cogneva-websocket-headers@kubernetescrd"
 spec:
-  ingressClassName: nginx
+  ingressClassName: traefik
   rules:
     - http:
         paths:

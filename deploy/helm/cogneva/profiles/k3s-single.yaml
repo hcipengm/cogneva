@@ -18,6 +18,13 @@ image:
 secrets:
   create: false
 
+ingress:
+  # K3s 自带 traefik 并把它标成默认 IngressClass（`kubectl get ingressclass`
+  # 只有一条，CONTROLLER 是 traefik.io/ingress-controller）。chart 默认的 nginx
+  # 在这类集群上产出的 ingress 没有控制器认领，前门直接 404；取 traefik 则走
+  # chart 的 traefik 分支——除注解外还输出 WebSocket/安全头 Middleware。
+  className: traefik
+
 evolution:
   gitRemote:
     # 单节点：git-remote 直挂宿主 bare 仓库目录（宿主 <-> Pod 双向同步通道，

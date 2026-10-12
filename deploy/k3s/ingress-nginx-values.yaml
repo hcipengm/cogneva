@@ -1,6 +1,12 @@
 # ingress-nginx controller 参数 — 单节点 k3s 形态
 #
-# 背景：k3s 安装时 --disable=traefik，集群入口统一走 ingress-nginx。
+# 现状（2026-10-12 实测）：**本机 k3s 并非以 --disable=traefik 安装**。集群唯一的
+# IngressClass 是 `traefik (default)`，ingress-nginx 从未装过，`bootstrap.sh` 与
+# `crates/bootstrap` 里也零命中 `--disable=traefik|ingress-nginx` ⇒ 本文件当前没有
+# 任何调用方，是给"确实用 ingress-nginx 的集群"留的参数集；入口清单见
+# deploy/k3s/ingress.yaml（traefik 形态）。此前本文件的头注与 values.yaml 的注释
+# 都声称入口统一走 ingress-nginx，那是错的现实，曾把入口清单也带成 nginx 形态。
+#
 # 采用 hostNetwork：controller 直接在节点上绑定 80/443，源地址路径最短；
 # 也是为家用主机无公网 IP 的场景预留——隧道（frp/rathole 等）出口直接
 # 打节点 80/443，无需 NodePort 映射。

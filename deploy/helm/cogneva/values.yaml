@@ -819,8 +819,10 @@ alertmanager:
 
 ingress:
   enabled: true
-  # nginx 为默认（k3s 现网入口统一 ingress-nginx）；traefik 时自动附带
-  # WebSocket Middleware 与注解（需集群存在 traefik CRD）。
+  # 这里的默认值是**中立值**，不是任何一台集群的现状：标准 K8s 形态由运维自己装
+  # ingress-nginx（见 deploy/k8s/README.md），K3s 形态则由 profile 覆盖——K3s
+  # 自带 traefik 并把它标成默认 IngressClass。取 traefik 时自动附带 WebSocket
+  # Middleware 与注解（需集群存在 traefik CRD）。
   className: nginx
   # 空 = 兜底路由（任意 Host 头进主应用）；设值后按 host 匹配。
   host: ""

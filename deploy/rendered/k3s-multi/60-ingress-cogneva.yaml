@@ -14,12 +14,10 @@ metadata:
     app.kubernetes.io/version: "0.5.8"
     app.kubernetes.io/component: gateway
   annotations:
-    # nginx 原生支持 WebSocket Upgrade，加长读写超时避免长连接被掐断
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-body-size: 64m
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    traefik.ingress.kubernetes.io/router.middlewares: "cogneva-websocket-headers@kubernetescrd"
 spec:
-  ingressClassName: nginx
+  ingressClassName: traefik
   rules:
     -
       http:

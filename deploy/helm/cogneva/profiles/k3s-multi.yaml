@@ -16,6 +16,11 @@ image:
 secrets:
   create: false
 
+ingress:
+  # 与 k3s-single 同因：K3s 自带 traefik 并把它标成默认 IngressClass，取 traefik
+  # 才走 chart 的 traefik 分支（注解 + WebSocket/安全头 Middleware）。
+  className: traefik
+
 resourceGovernance:
   # 沿用 chart 默认的单节点标定值。多节点每增一个节点要按
   # +200m limits.cpu / +1Gi limits.memory 上调（分发器 DaemonSet 逐节点常驻），

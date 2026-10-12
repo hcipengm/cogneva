@@ -357,6 +357,7 @@ COVERED_KINDS = {
     'Role', 'ClusterRole', 'RoleBinding', 'ClusterRoleBinding',
     'ResourceQuota', 'LimitRange', 'PersistentVolumeClaim', 'ConfigMap',
     'NetworkPolicy', 'Ingress', 'StorageClass', 'Namespace', 'ServiceAccount',
+    'Middleware',
 }
 
 k = load(sys.argv[1], 'deploy/k3s 渲染结果')
@@ -445,11 +446,14 @@ for name in sorted(both):
         if ka != ha:
             errors.append(f"{kind}/{name[1]}: k3s={ka} helm={ha}")
     elif kind in ('NetworkPolicy', 'Ingress', 'StorageClass', 'Namespace',
-                  'ServiceAccount'):
-        # 这五类原先只比名字。其中四条 NetworkPolicy 正是零凭证红线落地的地方
+                  'ServiceAccount', 'Middleware'):
+        # 这几类原先只比名字。其中四条 NetworkPolicy 正是零凭证红线落地的地方
         # （进化 Pod 的 egress 白名单、沙盒执行器的放行端口），StorageClass 的
         # reclaimPolicy 决定卷删了数据还在不在，Ingress 的注解决定一个请求能不能
-        # 过得去。名字对上从来不代表它们做同一件事。
+        # 过得去，Middleware 的 headers 决定响应头。名字对上从来不代表它们做同一件事。
+        # Middleware 是 traefik 的 CRD：它只被 Ingress 的注解按名字引用，所以两侧
+        # 的 name/namespace 任何一边漂了，引用就指向一个不存在的东西——正文比整份
+        # spec 正是为了这个。
         for d in json_diff(obj_sig(k[name]), obj_sig(h[name]), 'object'):
             errors.append(f"{kind}/{name[1]}/{d}")
     elif kind in ('ResourceQuota', 'LimitRange', 'PersistentVolumeClaim'):

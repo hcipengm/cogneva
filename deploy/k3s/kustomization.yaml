@@ -46,3 +46,4 @@ resources:
   - backup-cronjob.yaml
   - network-policy.yaml
   - ingress.yaml
+  - middleware-websocket-headers.yaml

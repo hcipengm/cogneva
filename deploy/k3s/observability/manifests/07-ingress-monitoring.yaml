@@ -1,7 +1,7 @@
 # Ingress — 监控组件入口（grafana / prometheus），按域名路由
 #
 # 访问方式：在客户端 /etc/hosts 或内网 DNS 把两个域名指到承载
-# ingress-nginx 的节点（或隧道出口），例如：
+# traefik 的节点（或隧道出口），例如：
 #   <节点IP>  grafana.cogneva.local prometheus.cogneva.local
 # 家用主机无公网 IP 场景下，节点地址即隧道本机出口。
 #
@@ -13,7 +13,7 @@ metadata:
   name: grafana
   namespace: monitoring
 spec:
-  ingressClassName: nginx
+  ingressClassName: traefik
   rules:
     - host: grafana.cogneva.local
       http:
@@ -32,7 +32,7 @@ metadata:
   name: prometheus
   namespace: monitoring
 spec:
-  ingressClassName: nginx
+  ingressClassName: traefik
   rules:
     - host: prometheus.cogneva.local
       http:
