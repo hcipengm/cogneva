@@ -91,7 +91,7 @@ impl BuildCacheConfig {
             DEFAULT_SCAN_INTERVAL_SECS,
         )
         // The floor is the shared one: a deployment that asks to re-walk
-        // faster than a walk of this size is worth gets the floor, and the
+        // faster than a walk of this size warrants gets the floor, and the
         // interval that is published is the floor rather than the ask, so
         // the rule comparing a pass against its own interval does not
         // measure a cadence nothing runs at.

@@ -14,7 +14,7 @@ based on [Keep a Changelog](https://keepachangelog.com/).
   `SANDBOX_BUILD_CACHE_MAX_BYTES`. Those manifests are outside the contribution
   allow-list, and the cache shares a small 5 GiB claim with the task worktrees,
   so a pod whose environment lost the variable could fill that volume and turn
-  it into builds failing for reasons that said nothing about the cache. The
+  that into build failures for reasons that said nothing about the cache. The
   env-driven constructor and `Default` now carry the same deployment-derived 3
   GiB cap (`DEFAULT_MAX_BYTES` = 5 GiB minus the measured co-tenants:
   `CARGO_HOME`, the bare repo, the per-task worktrees, the host-docs journal) as
