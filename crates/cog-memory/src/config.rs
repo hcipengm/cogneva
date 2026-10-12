@@ -60,6 +60,7 @@ pub struct MemoryConfig {
     /// 启动期是否加载 ONNX 重排模型（BGE-Reranker-V2-M3，实测进程峰值 RSS 1.67GiB）。
     /// 关闭原因同 [`Self::load_embedding_model`]；其拉取路径写死
     /// `https://huggingface.co`、不吃 `HF_ENDPOINT`，离线集群只能靠本地就位。
+    /// 与嵌入模型一样，插件装载时显式读取 `FASTEMBED_CACHE_DIR` 指名权重目录。
     pub load_reranker_model: bool,
     /// 自动摄取（AgentEnd → 记忆三层）的运行参数。
     pub ingest: IngestConfig,

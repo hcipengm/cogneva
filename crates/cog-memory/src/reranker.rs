@@ -18,6 +18,20 @@ impl FastEmbedRerankerProvider {
         Self::try_new_with_cache_dir(None)
     }
 
+    /// The same, but with the cache directory taken from `FASTEMBED_CACHE_DIR`
+    /// in this process's environment, if the variable is set.
+    ///
+    /// The reranker's fetch path fixes its endpoint and ignores `HF_ENDPOINT`,
+    /// so on a network that cannot reach huggingface.co the variable is the only
+    /// handle a deployment has for pointing the load at weights it mounted
+    /// itself. Reading it here, at the construction site, keeps the policy "the
+    /// cache dir is an environment decision" out of every caller.
+    pub fn try_new_from_env() -> Result<Self, String> {
+        Self::try_new_with_cache_dir(
+            std::env::var_os("FASTEMBED_CACHE_DIR").map(std::path::PathBuf::from),
+        )
+    }
+
     /// The same, with the cache directory named here instead of read from the
     /// environment.
     ///

@@ -303,7 +303,11 @@ impl cog_core::SystemPlugin for MemoryPlugin {
         // ── Reranker provider ──
         let reranker_provider: Option<Arc<dyn cog_core::RerankerProvider>> = if load_reranker_model
         {
-            match crate::FastEmbedRerankerProvider::try_new() {
+            // Honor FASTEMBED_CACHE_DIR explicitly: the reranker's fetch path
+            // fixes its endpoint and ignores HF_ENDPOINT, so the cache dir is
+            // the only handle an offline deployment has for naming where it
+            // mounted the weights.
+            match crate::FastEmbedRerankerProvider::try_new_from_env() {
                 Ok(p) => {
                     info!("FastEmbed BGE-Reranker-V2-M3 loaded");
                     Some(Arc::new(p))
