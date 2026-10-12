@@ -78,16 +78,20 @@ pub fn tree_from_environment() -> CheckTree {
 /// Why a check could not be settled, as a closed set.
 ///
 /// Closed because these are read as counts, and a count keyed by free text makes
-/// every distinct wording its own series. The four are four different owners and
-/// four different actions -- the tree could not be opened, the check has no
-/// predicate, the check is about something this tree cannot hold, git itself
-/// failed -- and a number covering all four would name none of them.
+/// every distinct wording its own series. The five are five different owners and
+/// five different actions -- the tree could not be opened, the check has no
+/// predicate, the predicate is a finding written out rather than a fragment, the
+/// check is about something this tree cannot hold, git itself failed -- and a
+/// number covering all five would name none of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnsettledReason {
     /// No revision to judge against could be resolved.
     RevisionUnreadable,
     /// There is no predicate for this kind of check.
     KindWithoutPredicate,
+    /// The predicate is a whole finding written out, so it names no fragment of
+    /// this tree and no search for it can match.
+    PredicateIsARendering,
     /// The check names something this tree cannot hold, so it never ran.
     ScopeOutsideTree,
     /// git was asked and did not answer.
@@ -96,9 +100,10 @@ pub enum UnsettledReason {
 
 impl UnsettledReason {
     /// Every reason, for a reader that has to enumerate them.
-    pub const ALL: [UnsettledReason; 4] = [
+    pub const ALL: [UnsettledReason; 5] = [
         UnsettledReason::RevisionUnreadable,
         UnsettledReason::KindWithoutPredicate,
+        UnsettledReason::PredicateIsARendering,
         UnsettledReason::ScopeOutsideTree,
         UnsettledReason::GitFailed,
     ];
@@ -107,6 +112,7 @@ impl UnsettledReason {
         match self {
             UnsettledReason::RevisionUnreadable => "revision_unreadable",
             UnsettledReason::KindWithoutPredicate => "kind_without_predicate",
+            UnsettledReason::PredicateIsARendering => "predicate_is_a_rendering",
             UnsettledReason::ScopeOutsideTree => "scope_outside_tree",
             UnsettledReason::GitFailed => "git_failed",
         }
@@ -333,6 +339,15 @@ impl CheckTree {
                 "a `grep` check with no literal names nothing to look for",
             );
         }
+        if predicate_is_a_rendering(literal) {
+            return CheckOutcome::unsettled(
+                UnsettledReason::PredicateIsARendering,
+                format!(
+                    "`{literal}` is a finding written out rather than a fragment of this \
+                     tree: it carries the separator a finding is split on"
+                ),
+            );
+        }
         let scoped = !scope.is_empty() && scope != ".";
         if scoped && !snapshot.could_hold(scope) {
             return CheckOutcome::unsettled(
@@ -444,6 +459,33 @@ const NO_MATCH: &str = "no match";
 /// backticks and padding belong to the document, not to the path.
 fn scope_of(identity: &ChangeIdentity) -> &str {
     identity.scope.trim().trim_matches('`').trim()
+}
+
+/// The separator a finding is written with, between its scope and its predicate.
+///
+/// A check is recorded as `grep <scope> :: <literal>`, and the intake splits the
+/// line on this. So the separator belongs to the record, and finding it inside a
+/// predicate means the split went somewhere the record did not intend -- two
+/// findings joined into one line, say, in which case everything after the first
+/// separator lands in the predicate field, second rendering included.
+const SCOPE_PREDICATE_SEPARATOR: &str = " :: ";
+
+/// Whether the predicate field holds a finding written out rather than a
+/// fragment of the tree.
+///
+/// Deliberately the separator alone, and not the other things a mis-assembled
+/// line carries. `||`, `&&` and backticks are ordinary contents of a literal --
+/// `a || b` is what a line of this tree's own source looks like -- and a rule
+/// that read those as evidence of a rendering would take real checks out of the
+/// measurable set, which is the opposite of the point. A padded ` :: ` is not
+/// something a fragment of source holds.
+///
+/// Without this the check is not unanswerable, it is *wrong*: `git grep -F` for
+/// a whole finding cannot match a line of source, so the check answers "absent"
+/// on every pass forever, the row keeps reading as work still owed, and a change
+/// that has landed is indistinguishable from one that has not.
+fn predicate_is_a_rendering(literal: &str) -> bool {
+    literal.contains(SCOPE_PREDICATE_SEPARATOR)
 }
 
 #[cfg(test)]
@@ -639,5 +681,50 @@ mod tests {
             .await
             .expect_err("a repository that is not there has no snapshot");
         assert!(why.contains("/nonexistent/tree"), "{why}");
+    }
+
+    /// A predicate that is a finding written out whole answers `absent` on every
+    /// pass, because no line of the tree can contain it. Read as a miss, the row
+    /// stays in the outstanding set for good and a change that landed reads
+    /// exactly like one that did not; it has to read as unattemptable instead.
+    ///
+    /// The row below is the shape the intake produces when one line carried two
+    /// findings: the line is split at the first separator, and everything after
+    /// it -- the second finding's own rendering included -- lands in the
+    /// predicate field.
+    #[tokio::test]
+    async fn a_predicate_that_is_a_written_out_finding_never_settles_a_row() {
+        let tree = CheckTree::new("/nonexistent", "main");
+        let outcome = tree
+            .judge(
+                &snapshot(),
+                &identity(
+                    "grep",
+                    "crates/cog-agent/src/agent_kernel/runtime.rs",
+                    "await_an_unscoped_read || grep \
+                     crates/cog-agent/src/agent_kernel/runtime.rs \
+                     :: an_unscoped_run_writes_no_census_row",
+                ),
+            )
+            .await;
+        assert_eq!(outcome.state(), None, "{outcome:?}");
+        assert_eq!(
+            outcome.reason(),
+            Some(UnsettledReason::PredicateIsARendering)
+        );
+    }
+
+    /// The separator and nothing else. `||`, `&&` and backticks are all ordinary
+    /// contents of a literal -- `a || b` is a line of Rust -- so a rule that read
+    /// them as evidence of a rendering would take real checks out of the
+    /// measurable set, which is the opposite of what this is for.
+    #[test]
+    fn a_literal_is_a_rendering_only_when_it_carries_the_separator() {
+        assert!(!predicate_is_a_rendering("a || b"));
+        assert!(!predicate_is_a_rendering("a && b"));
+        assert!(!predicate_is_a_rendering("`fn main`"));
+        assert!(!predicate_is_a_rendering("cog_core::Task"));
+        assert!(!predicate_is_a_rendering("crates/x::y"));
+        assert!(predicate_is_a_rendering("crates/x :: fn thing"));
     }
 }

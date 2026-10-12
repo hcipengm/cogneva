@@ -254,7 +254,7 @@ pub fn spawn_change_ledger_loop(
                     // and a change this pass just found missing is handed over on
                     // the same pass that found it, rather than one period later.
                     if let Some(ref orchestrator) = orchestrator {
-                        dispatch_pass(&*store, orchestrator).await;
+                        dispatch_pass(&*store, orchestrator, &unsettled).await;
                     }
                 }
             }
@@ -468,6 +468,25 @@ async fn measure_pass(
     );
 }
 
+/// The rows a pass hands over: the ones still owed that this pass has not just
+/// found it cannot measure.
+///
+/// A row the pass left unanswered is dropped here rather than at submission, so
+/// that "what is outstanding" and "what is owed to somebody" stay two readable
+/// sets. A row may be both -- a bad check keeps its `pending` state -- and
+/// splitting them here is what keeps the handover from becoming a claim about
+/// the tree.
+fn dispatchable(
+    rows: &[ChangeLedgerRow],
+    unsettled: &HashMap<ChangeIdentity, UnsettledCheck>,
+) -> Vec<ChangeLedgerRow> {
+    rows.iter()
+        .filter(|row| row.state == ChangeState::Pending)
+        .filter(|row| !unsettled.contains_key(&row.identity))
+        .cloned()
+        .collect()
+}
+
 /// Hand the changes still owed to the goal path, one task each.
 ///
 /// Only `pending` is handed over, and the rest of the outstanding set is named
@@ -478,6 +497,13 @@ async fn measure_pass(
 /// be, which no amount of code generation resolves; and `partial` is a change
 /// already under way, whose remaining half this loop cannot name. A state that is
 /// not handed over is still a row this pass read.
+///
+/// A `pending` row this same pass could not settle is left out too, and that one
+/// is not a state: it is what the pass learned. Being unsettled moves no state --
+/// the row keeps what a document gave it, which for a bad check is `pending` --
+/// so the state alone would hand over exactly the rows nothing can measure. The
+/// task would then be work no artifact can close, sitting on the goal path for
+/// good, and the tree would never show why.
 ///
 /// The task's id is derived from the change's identity, so a change handed over
 /// once is never handed over twice: this loop re-reads the same outstanding set
@@ -490,7 +516,11 @@ async fn measure_pass(
 /// A dispatched change's state is not touched. Handing work over is not doing it,
 /// and a row moved because a task was filed would have the ledger reporting a
 /// tree that nothing had looked at.
-async fn dispatch_pass(store: &dyn ChangeLedgerStore, orchestrator: &Arc<dyn OrchestratorControl>) {
+async fn dispatch_pass(
+    store: &dyn ChangeLedgerStore,
+    orchestrator: &Arc<dyn OrchestratorControl>,
+    unsettled: &HashMap<ChangeIdentity, UnsettledCheck>,
+) {
     // The read is bounded by the ledger's own census rather than by a number
     // chosen here, and it has to be that wide because of where pending rows sit
     // in it. A state of `pending` *is* a measurement's result, so those rows are
@@ -527,11 +557,7 @@ async fn dispatch_pass(store: &dyn ChangeLedgerStore, orchestrator: &Arc<dyn Orc
         }
     };
 
-    let pending: Vec<ChangeLedgerRow> = rows
-        .iter()
-        .filter(|row| row.state == ChangeState::Pending)
-        .cloned()
-        .collect();
+    let pending = dispatchable(&rows, unsettled);
 
     let mut submitted = 0usize;
     let mut already = 0usize;
@@ -579,11 +605,21 @@ async fn dispatch_pass(store: &dyn ChangeLedgerStore, orchestrator: &Arc<dyn Orc
         }
     }
 
+    // Counted apart from the states because these rows are `pending`: the state
+    // line cannot show them, and a pass that quietly stopped handing rows over
+    // would otherwise read as a pass with fewer changes owed in it.
+    let unmeasurable = rows
+        .iter()
+        .filter(|row| row.state == ChangeState::Pending)
+        .filter(|row| unsettled.contains_key(&row.identity))
+        .count();
+
     info!(
         pending = pending.len(),
         submitted,
         already_handed_over = already,
         failed,
+        unmeasurable,
         not_handed_over = %held_back_summary(&rows),
         "change ledger: handed the pending set to the goal path"
     );
@@ -772,7 +808,7 @@ mod tests {
         by_reason.insert(UnsettledReason::GitFailed, 1);
         assert_eq!(
             reason_summary(&by_reason),
-            "revision_unreadable 0, kind_without_predicate 0, scope_outside_tree 12, git_failed 1"
+            "revision_unreadable 0, kind_without_predicate 0, predicate_is_a_rendering 0, scope_outside_tree 12, git_failed 1"
         );
     }
 
@@ -783,7 +819,7 @@ mod tests {
     fn a_pass_that_could_settle_everything_still_names_the_reasons() {
         assert_eq!(
             reason_summary(&HashMap::new()),
-            "revision_unreadable 0, kind_without_predicate 0, scope_outside_tree 0, git_failed 0"
+            "revision_unreadable 0, kind_without_predicate 0, predicate_is_a_rendering 0, scope_outside_tree 0, git_failed 0"
         );
     }
 
@@ -912,5 +948,37 @@ mod tests {
         ];
         assert_eq!(held_back_summary(&rows), "conflict 1, undecided 2");
         assert_eq!(held_back_summary(&[row(ChangeState::Pending, None)]), "");
+    }
+
+    /// A `pending` row the pass could not settle is not handed over. It carries
+    /// the state work is handed over in -- an unsettled look moves no state, so
+    /// the row keeps whatever a document gave it -- and handing it over anyway
+    /// would put a task on the goal path that no artifact can ever close, for a
+    /// change the tree may already hold.
+    #[test]
+    fn a_row_the_pass_could_not_settle_is_not_handed_over() {
+        let rows = vec![
+            row_at("crates/a"),
+            row_at("crates/b"),
+            ChangeLedgerRow {
+                state: ChangeState::Landed,
+                ..row_at("crates/c")
+            },
+        ];
+        let mut unsettled = HashMap::new();
+        unsettled.insert(
+            ChangeIdentity::new("grep", "crates/b", "fn thing"),
+            UnsettledCheck {
+                why: "the predicate is a finding written out".into(),
+                since: Instant::now(),
+            },
+        );
+        let handed = dispatchable(&rows, &unsettled);
+        assert_eq!(handed.len(), 1, "{handed:?}");
+        assert_eq!(handed[0].identity.scope, "crates/a");
+
+        // And with nothing unanswered, the pending row comes back: the exclusion
+        // is the pass's own finding and not a property of the state.
+        assert_eq!(dispatchable(&rows, &HashMap::new()).len(), 2);
     }
 }
