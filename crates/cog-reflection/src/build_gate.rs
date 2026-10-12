@@ -19,13 +19,67 @@
 //! floor, so the misconfiguration cannot silently come back. An explicit
 //! `wait_secs = 0` keeps its documented meaning — try once, no queue — and is
 //! left alone.
+//!
+//! [`effective_gate_for`] is where a process applies it, and it is applied
+//! once per process: every reader of the budget — the gate that refuses, the
+//! wall a flight in progress is judged against, the wall a cycle's queue is
+//! planned against — reads the same derivation. Two numbers here would mean a
+//! build refused at a wall the readings do not show, which is the shape of the
+//! defect the floor exists to remove.
 
 use cog_core::config::BuildGateConfig;
+use cog_core::SelfEvolutionConfig;
 
 /// Extra seconds past the build timeout that a waiter is given, so a holder
 /// that runs right up to its bound still has time to release before the waiter
 /// is refused.
+///
+/// The margin is the part of the handover the build timeout cannot cover: a
+/// holder killed at its own bound still has to drop the slot, and a waiter that
+/// arrived before the holder took it has to survive that. It cannot be derived
+/// from the timeout -- how long a killed holder takes to let go is a different
+/// quantity -- but it is not measured here either. Nothing on this deployment
+/// publishes the interval between a holder reaching its own deadline and its
+/// slot becoming free, so this number is a name for the delay rather than a
+/// reading of it, and it is the last frozen number on this path. What is known
+/// about the delay on this deployment, measured 2026-10-12: the longest single
+/// hold is 1424s (`cogneva_build_gate_held_ms_max`) against a 3600s build
+/// timeout, and 3 builds had been refused at the then-armed 1800s.
+///
+/// What the floor this margin produces does and does not cover, because the
+/// difference is a whole class of refusals: `build_timeout_secs + margin`
+/// covers a waiter queued behind *one* holder running to the full of its right.
+/// It does not cover a queue of several such holders -- with a bound of one, N
+/// holders that each stay inside their right can still refuse the waiter behind
+/// them, and every one of those holders was legal. That is not hypothetical:
+/// `cogneva_build_gate_wait_ms_max` reached 1693s against a longest hold of
+/// 1424s, so waits on this host already outlive any single hold. A refusal of
+/// that kind is a capacity reading, not a misconfiguration, and telling the two
+/// apart requires the refusal to say which wall it hit -- which the counter
+/// does not carry yet.
+///
+/// The floor also tracks one field and the slot is held under two: a build is
+/// killed at `build_timeout_secs` and a change's verification run is killed at
+/// `test_timeout_secs`, and both take a slot in this same gate (the
+/// verification's own hold is named `change verification`). The two are equal on
+/// this deployment -- 3600s each -- so the floor covers both today, and an
+/// operator who raised the test timeout alone would move the longest legal hold
+/// past the floor without touching the number that answers for it.
 pub const WAIT_RELEASE_MARGIN_SECS: u64 = 600;
+
+/// The gate configuration to arm for a self-evolution block, and the one number
+/// every reader of the budget must take.
+///
+/// Takes the whole block rather than the two fields because the two fields are
+/// what must not drift apart: a caller that fetched `wait_secs` and
+/// `build_timeout_secs` separately could floor against one and arm the other,
+/// and the pair is only meaningful together.
+pub fn effective_gate_for(self_evolution: &SelfEvolutionConfig) -> BuildGateConfig {
+    effective_config(
+        &self_evolution.build_gate,
+        self_evolution.build_timeout_secs,
+    )
+}
 
 /// The gate configuration this process should actually arm, given the build
 /// timeout its builds are killed at.
@@ -98,5 +152,130 @@ mod tests {
             effective_config(&cfg(100), 60).wait_secs,
             60 + WAIT_RELEASE_MARGIN_SECS
         );
+    }
+
+    /// The two numbers come out of one block, so a caller cannot floor against
+    /// one of them and arm the other.
+    #[test]
+    fn the_gate_is_derived_from_the_block_that_holds_both_numbers() {
+        let mut self_evolution = cog_core::SelfEvolutionConfig::default();
+        self_evolution.build_timeout_secs = 3600;
+        self_evolution.build_gate.wait_secs = 1800;
+        assert_eq!(
+            effective_gate_for(&self_evolution).wait_secs,
+            3600 + WAIT_RELEASE_MARGIN_SECS
+        );
+        // Everything that is not the budget is the operator's own setting and is
+        // passed through: the floor is about one number, not about the gate.
+        self_evolution.build_gate.max_concurrent = 3;
+        assert_eq!(effective_gate_for(&self_evolution).max_concurrent, 3);
+    }
+
+    /// The executor arms the derivation, and no production reader in this crate
+    /// takes the document's own budget.
+    ///
+    /// Read off the sources rather than asserted about the arithmetic, because
+    /// the defect this replaces was not a wrong number: the derivation was
+    /// correct and nothing called it, so the gate waited the document's 1800s
+    /// while a legal hold was 3600s and builds were refused for it. A test of
+    /// the function's own arithmetic passes while the wiring is dead, and that
+    /// is exactly what had been happening.
+    ///
+    /// The crate, and not the one file an earlier version of this test looked
+    /// at: the readers of the budget are the executor's wiring, the wall a
+    /// flight in progress is judged against, and the wall a cycle's queue is
+    /// planned against -- a check that names one file stops covering the
+    /// readers added to the others, and saying nothing about them is not the
+    /// same as saying they are fine.
+    #[test]
+    fn no_reader_in_this_crate_takes_the_documents_own_wait_budget() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_sources(&src, &mut files);
+        // A walk that read nothing must fail rather than pass: "no reader found"
+        // and "no file read" are the same words for two different facts, and
+        // only one of them is an answer.
+        assert!(
+            files.len() > 40,
+            "the scan read {} source files under {}; that is not this crate",
+            files.len(),
+            src.display()
+        );
+        let mut arms = 0;
+        for path in &files {
+            let text = std::fs::read_to_string(path).expect("a source file to be readable");
+            let production = production_part(&text);
+            for at in occurrences(production, ".wait_secs") {
+                // The receiver, read as an identifier: the field of the
+                // configuration block is the defect, and `build_gate_cfg` --
+                // the name the derived value is bound to -- is the answer.
+                let before = &production[..at];
+                let start = before
+                    .char_indices()
+                    .rev()
+                    .take_while(|(_, ch)| ch.is_alphanumeric() || *ch == '_')
+                    .last()
+                    .map(|(index, _)| index)
+                    .unwrap_or(before.len());
+                assert_ne!(
+                    &before[start..],
+                    "build_gate",
+                    "{} takes the configuration block's own wait budget; every reader has to \
+                     take the derived one, or a build is refused at a wall the readings do \
+                     not show",
+                    path.display()
+                );
+            }
+            if production.contains("effective_gate_for(") {
+                arms += 1;
+            }
+        }
+        assert!(
+            arms > 0,
+            "nothing in this crate derives the gate config it arms -- the floor is dead code \
+             again"
+        );
+    }
+
+    /// Every `.rs` file under `dir`, subdirectories included.
+    fn collect_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// A file's text with its test module removed.
+    ///
+    /// Test code is not what this test is about, and it is where the document's
+    /// own number is written down in a fixture -- left in, the check would
+    /// refuse the very regression test that proves it works. Cut at the last
+    /// top-level `#[cfg(test)]` rather than the first: the attribute is also
+    /// used on single items (a `cfg(test)`-only import, a setter), and cutting
+    /// at one of those would quietly drop production code from the scan.
+    fn production_part(text: &str) -> &str {
+        match text.rfind("\n#[cfg(test)]") {
+            Some(at) => &text[..at],
+            None => text,
+        }
+    }
+
+    /// Where `needle` occurs in `text`.
+    fn occurrences(text: &str, needle: &str) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(at) = text[from..].find(needle) {
+            let at = from + at;
+            out.push(at);
+            from = at + needle.len();
+        }
+        out
     }
 }

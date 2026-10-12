@@ -36,6 +36,7 @@ pub mod baseline_port;
 // running.
 pub use cog_core::build_cache_readings;
 pub use cog_core::build_cache_reclaim;
+pub mod build_gate;
 pub mod buildah_store;
 pub mod change_execution;
 pub mod change_pipeline;

@@ -548,6 +548,13 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     }
                 }
 
+                // 闸门实际武装的那个预算，也是判超时那两个墙要读的那一个数。配置段里
+                // 的 wait_secs 不是它：短于一次合法构建的预算会被抬到「构建超时 +
+                // 释放余量」，抬起来之后武装的是这个数、拒绝也是按这个数拒——如果
+                // 那两处墙仍读配置段里的原值，就会出现「按 4200 秒拒绝、读数里写着
+                // 1800」，而被拒的构建在读数上找不到自己被按在哪个墙上。
+                let build_gate_cfg = crate::build_gate::effective_gate_for(&self_evolution);
+
                 // Firecracker 微虚拟机编排（审计 2.5.4）：microvm.enabled 时
                 // host 不本地执行 change pipeline，而是每个 cycle 冷启动一个
                 // MicroVM（挂载 PV → 执行进化 → 阅后即焚）。preflight 失败
@@ -710,7 +717,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     auto_apply: self_evolution.auto_apply,
                     manual_approve: self_evolution.manual_approve,
                     promotion: promotion.clone(),
-                    build_gate: self_evolution.build_gate.clone(),
+                    build_gate: build_gate_cfg.clone(),
                 };
 
                 // Published by clone: the flight readings below take the test
@@ -772,18 +779,18 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 //
                 // The wall it is judged against is the sum of the bounds of its
                 // two slowest steps, taken from the objects that enforce them:
-                // the verification budget the pipeline holds, and the build
-                // gate's configured wait -- the same value `install_for` below
-                // hands the gate this process runs under. A gate that turns out
-                // not to be in force (disabled, or a slot directory it could not
-                // create) makes this wall larger than the flight's true bound,
-                // which delays a rule rather than firing one on a healthy
-                // flight. Only the process that runs flights publishes any of
-                // it: the role is the same `executor_enabled` the queue readings
-                // publish, and a second flag here could drift out of step with
-                // that one.
+                // the verification budget the pipeline holds, and the wait the
+                // gate actually refuses at -- the same derived value
+                // `install_for` below hands the gate this process runs under.
+                // A gate that turns out not to be in force (disabled, or a slot
+                // directory it could not create) makes this wall larger than the
+                // flight's true bound, which delays a rule rather than firing
+                // one on a healthy flight. Only the process that runs flights
+                // publishes any of it: the role is the same `executor_enabled`
+                // the queue readings publish, and a second flag here could drift
+                // out of step with that one.
                 let flight_wall_secs = budget.timeout_secs(crate::verification_budget::KIND_TEST)
-                    + self_evolution.build_gate.wait_secs;
+                    + build_gate_cfg.wait_secs;
                 let flight = Arc::new(if executor_enabled {
                     crate::evolution_flight_readings::EvolutionFlightReadings::new(
                         self_evolution.change_dir.clone(),
@@ -1014,7 +1021,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 // because nothing above builds and the spawns below move the
                 // config into their closures.
                 let build_gate =
-                    cog_core::build_gate::install_for(&self_evolution.build_gate, executor_enabled);
+                    cog_core::build_gate::install_for(&build_gate_cfg, executor_enabled);
                 ctx.publish_observable(build_gate);
 
                 // What the shared build cache holds, layer by layer. Published
@@ -1075,8 +1082,8 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     // 闸门开不开只看 `enabled`：`max_concurrent=0` 不是"不设界"
                     // 而是"按宿主实测导出"，导出出来的界一样要排队，把它读成关着
                     // 会把这一段的等待预算算成 0。
-                    let gate_wait_secs = if self_evolution.build_gate.enabled {
-                        self_evolution.build_gate.wait_secs
+                    let gate_wait_secs = if build_gate_cfg.enabled {
+                        build_gate_cfg.wait_secs
                     } else {
                         0
                     };
