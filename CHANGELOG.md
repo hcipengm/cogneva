@@ -7,6 +7,22 @@ based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- The meta-bootstrap now carries the deployment-derived resource-governance
+  budget as a Rust-side fallback. The LimitRange and ResourceQuota values
+  live only in the deployment manifests, which are outside the contribution
+  allow-list: the per-container max (the evolution pod included) was raised
+  from 8 GiB to 16 GiB, the main gateway keeps a 6 GiB limit, and the
+  namespace quota is 46 GiB of `limits.memory` (42.1 GiB steady-state plus
+  the 512 Mi judge job plus 3.4 GiB headroom), 40 pods and 300 GiB of
+  storage. A rendered manifest or pod environment that lost those governed
+  values used to lose the measured safe cap with them. `ResourceBudget` in
+  `crates/bootstrap/src/main.rs` now starts `Default`/`from_env` from those
+  same deployment-derived numbers; `COGNEVA_CONTAINER_MEMORY_LIMIT_MB`,
+  `COGNEVA_GATEWAY_MEMORY_LIMIT_MB`, `COGNEVA_NAMESPACE_MEMORY_LIMIT_MB`,
+  `COGNEVA_NAMESPACE_PODS_MAX` and `COGNEVA_NAMESPACE_STORAGE_LIMIT_MB`
+  override them, and an unset or unparsable value is treated as "not
+  configured" and falls back with the default.
+
 - The standalone sandbox executor now bounds its own build cache by default.
   `BuildCacheConfig` (`crates/cog-extension/src/build_cache.rs`) used to start
   from a zero cap — publish the cache size and remove nothing — so the cache was

@@ -184,6 +184,91 @@ struct Hardware {
     kvm: bool,
 }
 
+/// 部署侧资源治理预算在引导侧的安全回落。
+///
+/// 数值与部署清单（deploy/k3s、helm values 与各 profile 的渲染产物——这些路径
+/// 在贡献白名单之外，引导器不能直接改）里的 LimitRange/ResourceQuota 同源：
+/// LimitRange 把单容器（含演化 Pod）内存上限定在 16Gi（由 8Gi 上调），主网关
+/// 容器内存 limit 6Gi；命名空间 ResourceQuota 把 `limits.memory` 定在 46Gi
+/// （稳态 42.1Gi + 评审任务 512Mi + 3.4Gi 余量）、Pod 数 40、存储总量 300Gi。
+/// 清单正常投递时这些值由集群侧强制执行；若某份清单丢失了被治理的值，引导侧
+/// 仍持有这份部署派生预算，不会静默退回无上限。需要其它值时用对应的
+/// `COGNEVA_*` 环境变量覆盖；无法解析的值按“未配置”处理，回落默认值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResourceBudget {
+    /// 单容器（含演化 Pod）内存上限，MiB：16Gi。
+    container_memory_limit_mb: u64,
+    /// 主网关容器内存上限，MiB：6Gi。
+    gateway_memory_limit_mb: u64,
+    /// 命名空间内存总量上限，MiB：46Gi。
+    namespace_memory_limit_mb: u64,
+    /// 命名空间 Pod 数上限：40。
+    namespace_pods_max: u64,
+    /// 命名空间存储总量上限，MiB：300Gi。
+    namespace_storage_limit_mb: u64,
+}
+
+/// 单容器 LimitRange 内存上限：16Gi。
+const DEFAULT_CONTAINER_MEMORY_LIMIT_MB: u64 = 16 * 1024;
+/// 主网关容器内存上限：6Gi。
+const DEFAULT_GATEWAY_MEMORY_LIMIT_MB: u64 = 6 * 1024;
+/// 命名空间 ResourceQuota 内存总量上限：46Gi
+/// （稳态 42.1Gi + 评审任务 512Mi + 3.4Gi 余量）。
+const DEFAULT_NAMESPACE_MEMORY_LIMIT_MB: u64 = 46 * 1024;
+/// 命名空间 Pod 数上限：40。
+const DEFAULT_NAMESPACE_PODS_MAX: u64 = 40;
+/// 命名空间存储总量上限：300Gi。
+const DEFAULT_NAMESPACE_STORAGE_LIMIT_MB: u64 = 300 * 1024;
+
+impl Default for ResourceBudget {
+    fn default() -> Self {
+        Self {
+            container_memory_limit_mb: DEFAULT_CONTAINER_MEMORY_LIMIT_MB,
+            gateway_memory_limit_mb: DEFAULT_GATEWAY_MEMORY_LIMIT_MB,
+            namespace_memory_limit_mb: DEFAULT_NAMESPACE_MEMORY_LIMIT_MB,
+            namespace_pods_max: DEFAULT_NAMESPACE_PODS_MAX,
+            namespace_storage_limit_mb: DEFAULT_NAMESPACE_STORAGE_LIMIT_MB,
+        }
+    }
+}
+
+impl ResourceBudget {
+    /// 从 `COGNEVA_*` 环境变量读覆盖值；变量缺失或无法解析时回落部署派生默认。
+    fn from_env() -> Self {
+        Self {
+            container_memory_limit_mb: budget_env_u64_or(
+                "COGNEVA_CONTAINER_MEMORY_LIMIT_MB",
+                DEFAULT_CONTAINER_MEMORY_LIMIT_MB,
+            ),
+            gateway_memory_limit_mb: budget_env_u64_or(
+                "COGNEVA_GATEWAY_MEMORY_LIMIT_MB",
+                DEFAULT_GATEWAY_MEMORY_LIMIT_MB,
+            ),
+            namespace_memory_limit_mb: budget_env_u64_or(
+                "COGNEVA_NAMESPACE_MEMORY_LIMIT_MB",
+                DEFAULT_NAMESPACE_MEMORY_LIMIT_MB,
+            ),
+            namespace_pods_max: budget_env_u64_or(
+                "COGNEVA_NAMESPACE_PODS_MAX",
+                DEFAULT_NAMESPACE_PODS_MAX,
+            ),
+            namespace_storage_limit_mb: budget_env_u64_or(
+                "COGNEVA_NAMESPACE_STORAGE_LIMIT_MB",
+                DEFAULT_NAMESPACE_STORAGE_LIMIT_MB,
+            ),
+        }
+    }
+}
+
+/// 读整数环境变量：未设置或无法解析时回落 `default`。无法解析的值不是一个被
+/// 配置的数字（与 sandbox build cache 的同名规则一致）。
+fn budget_env_u64_or(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
 #[derive(Debug, Serialize)]
 struct IntentConfig {
     /// 实际供给的发行版（k3s / kubespray）；资源门禁回落时记的是回落结果。
@@ -2968,6 +3053,11 @@ async fn main() -> Result<()> {
         "硬件探测: {} 核 / {} MiB / {} / {} 节点",
         hw.cpu_cores, hw.mem_total_mb, hw.arch, hw.nodes
     );
+    let resource_budget = ResourceBudget::from_env();
+    info!(
+        "资源治理预算（部署侧 LimitRange/ResourceQuota 的引导侧回落）: {:?}",
+        resource_budget
+    );
     let decision = decide_provision(&hw).await;
     info!(
         "供给决策: distro={:?} 多节点={} 回落={:?}",
@@ -3595,6 +3685,40 @@ mod node_qos_wiring_tests {
         assert!(
             ready_at < read_at,
             "内存账的读回必须排在 wait_ready 之后（否则节点还没注册）"
+        );
+    }
+}
+
+#[cfg(test)]
+mod resource_budget_tests {
+    use super::ResourceBudget;
+
+    #[test]
+    fn from_env_overrides_parseable_values_and_falls_back_otherwise() {
+        // 这些键只被资源预算读取；一个测试内串行设置/清除，避免并行互相覆盖。
+        // 显式配置的值逐字生效。
+        std::env::set_var("COGNEVA_CONTAINER_MEMORY_LIMIT_MB", "1024");
+        std::env::set_var("COGNEVA_NAMESPACE_PODS_MAX", "7");
+        let configured = ResourceBudget::from_env();
+        assert_eq!(configured.container_memory_limit_mb, 1024);
+        assert_eq!(configured.namespace_pods_max, 7);
+        // 无法解析的值按“未配置”回落默认，不是 0。
+        std::env::set_var("COGNEVA_NAMESPACE_PODS_MAX", "lots");
+        assert_eq!(
+            ResourceBudget::from_env().namespace_pods_max,
+            super::DEFAULT_NAMESPACE_PODS_MAX
+        );
+        std::env::remove_var("COGNEVA_CONTAINER_MEMORY_LIMIT_MB");
+        std::env::remove_var("COGNEVA_NAMESPACE_PODS_MAX");
+        // 全部未配置时得到部署派生默认。
+        assert_eq!(ResourceBudget::from_env(), ResourceBudget::default());
+        assert_eq!(
+            ResourceBudget::default().namespace_memory_limit_mb,
+            46 * 1024
+        );
+        assert_eq!(
+            ResourceBudget::default().namespace_storage_limit_mb,
+            300 * 1024
         );
     }
 }
