@@ -122,6 +122,17 @@ spec:
               value: "http://cogneva-security-gateway:8081"
             - name: COGNEVA_GIT_PROXY_BASE
               value: "http://cogneva-security-gateway:8081/git"
+            # 要按文档持续排产的那些面：值是一个 face 列表（id/repo/sop_path/
+            # cadence_secs），它逐个说清去哪里读哪份文档。只认这个 Secret 键，值
+            # 带外写入清单——面名与仓名是部署自己的事，公开树里一个都不出现。
+            # 缺省即没有面要排产：loop 不启动、零出网，这段能力休眠。值解析不出来
+            # 也按缺省处理，并被记为「配了但读不懂」而不是静默当作没配。
+            - name: COGNEVA_TASK_FACE_SOURCES
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: task-face-sources
+                  optional: true
             # 内存 Raw 层的面：工具的返回点把装不进上下文窗口的输出归档到这里，
             # 取引用也从这里读回（零凭证、落默认命名空间）。本进程自己那一份走
             # **回环**进内部端口，不是主 API 的 8080——8080 上那几条 memory 路由按

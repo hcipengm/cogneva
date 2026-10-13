@@ -859,6 +859,27 @@ metric_names! {
     // "checkpointing is broken".
     TASK_CHECKPOINT => "cogneva_task_checkpoint_total",
 
+    // cog-orchestrator — what the SOP dispatch loop did with each configured face
+    // on each tick, and what it found while compiling.
+    //
+    // The loop turns a face's declared plan into DAG tasks. Its failure modes do
+    // not look alike: a document that cannot be fetched, one that does not
+    // compile, and a tick that simply found nothing changed are three different
+    // facts, and a loop that stops reaching a face entirely is a fourth that only
+    // the per-face cadence shows. `result` is a closed set (compiled,
+    // skipped_unchanged, fetch_error, compile_error) so a reader counts outcomes
+    // rather than parsing messages.
+    SOP_DISPATCH_TOTAL => "sop_dispatch_total",
+    // How many tasks one face's plan put into the DAG, summed over ticks. It is
+    // separate from the tick counter because a compile that succeeds and injects
+    // nothing and one that injects ten are the same `compiled` cell.
+    SOP_TASKS_INJECTED_TOTAL => "sop_tasks_injected_total",
+    // Tasks whose declared `role` named no row in the executor table. The role is
+    // carried through verbatim and nothing maps it yet, so such a task is
+    // injected and then may never be picked up; this cell is what makes that
+    // silence visible before a mapping exists to close it.
+    SOP_UNMAPPED_ROLE_TOTAL => "sop_unmapped_role_total",
+
     // cog-wiki — what each knowledge layer gave back when it was consulted.
     //
     // One cell per layer per call, by `layer` (memory, wiki) and `outcome`

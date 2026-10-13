@@ -1741,6 +1741,7 @@ name = "cog-orchestrator"
 version = "0.5.8"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "blake3",
  "chrono",
  "cog-core",
@@ -1749,6 +1750,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

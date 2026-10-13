@@ -747,6 +747,47 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
             None => info!("principle ledger loop not started: no PrincipleLedgerStore published"),
         }
 
+        // SOP dispatch loop.
+        //
+        // Which faces to keep planned is configuration, not code: the loop runs
+        // only where the environment names them, and a deployment that names
+        // none carries the capability dormant and makes no outbound call. Every
+        // missing piece is a reason not to start rather than a reason to run
+        // half-wired -- a dispatch loop that cannot fetch, cannot inject, or
+        // cannot say which hands exist would report a face's plan as kept while
+        // nothing about it was.
+        match crate::sop::SopDispatchConfig::from_env() {
+            None => info!("SOP dispatch not started: no task face sources configured"),
+            Some(config) => {
+                let http = ctx.consume_service::<dyn cog_core::HttpClient>();
+                let skills = ctx.consume::<tokio::sync::RwLock<cog_core::SkillRegistry>>();
+                match (self.action_planner.clone(), http, skills) {
+                    (Some(planner), Some(http), Some(skills)) => {
+                        let shutdown = ctx
+                            .consume::<cog_core::ShutdownSignal>()
+                            .map(|s| (*s).clone())
+                            .unwrap_or_default();
+                        crate::sop::spawn_sop_dispatch_loop(
+                            planner as Arc<dyn cog_core::ActionPlanner>,
+                            skills,
+                            http,
+                            ctx.consume_service::<dyn cog_core::MetricsBackend>(),
+                            ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>(),
+                            shutdown,
+                            config,
+                        );
+                    }
+                    (planner, http, skills) => warn!(
+                        planner = planner.is_some(),
+                        http = http.is_some(),
+                        skills = skills.is_some(),
+                        "SOP dispatch not started: a face list is configured but the \
+                         planner, the fetch client, or the skill registry is not published"
+                    ),
+                }
+            }
+        }
+
         Ok(())
     }
 

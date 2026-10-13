@@ -2372,6 +2372,23 @@ const UNREAD: &[(&str, Unread)] = &[
         "cogneva_project_kind_total",
         Unread::Gap("changes the pipeline dispatched, by the landing recipe it used and by whether the project declared that recipe or the built-in supplied it. A rule would have to say how much of a fleet running on the built-in is a fault, and that is a policy nobody has declared: at the moment this name is minted not one project carries a declaration, so every dispatch lands in the `builtin` cell and any bound set now would fire on the ordinary case. What makes the reading worth publishing before that bound exists is that it is the only place the fallback is visible at all -- a project landing as a built-in Rust workspace and a project that chose to land that way dispatch identically on every other series, and neither is a fault until somebody says which projects are expected to declare. The composition a rule would want is the one already published on the rejection side: a project whose declaration cannot be read is refused, and that refusal is counted under `cogneva_change_rejected_total{cause=project_kind_unusable}`, so the population that needs a threshold here is the one that silently took the built-in rather than the one that failed loudly"),
     ),
+    // The three readings minted with the SOP dispatch loop. The loop's own
+    // liveness is not a gap: it reports through the background-loop family like
+    // every other resident loop, so a stopped dispatcher is already a reading.
+    // What none of the three carries is a bound, and each is here for that
+    // reason rather than for a missing reader.
+    (
+        "sop_dispatch_total",
+        Unread::Gap("what the SOP dispatch loop did with each configured face on each tick, by `face` and a closed `result` set (compiled, skipped_unchanged, fetch_error, compile_error). The loop starts only where the environment names at least one face, so on a deployment that names none the series is absent rather than zero -- which is why no rule can treat absence as a fault, and why a rule would have to fire on the outcome cells instead. The cell that looks rule-worthy is the failure pair, and what is missing is how many failed ticks a face may have before it is a fault: a document being edited, a platform briefly refusing, and a face whose path is wrong all read as a run of `fetch_error`, and nothing declares how long a stretch of those is expected to be repaired by the next tick. The per-face cadence a reader would otherwise use to bound that stretch is the one number that never appears on the wire -- the intervals live in the configuration the loop reads and are published nowhere -- so a rule would have to derive them from this counter's own rate, which is circular"),
+    ),
+    (
+        "sop_tasks_injected_total",
+        Unread::Gap("how many tasks each face's plan put into the DAG, summed over ticks. It exists because a compile that injects nothing and one that injects ten are the same `compiled` cell on the tick counter beside it. What a rule would need is how much a face is expected to keep planned, and that is a property of the face's document rather than of this repository: a face whose plan is five tasks and one whose plan is fifty are both healthy, and the workload a deployment is willing to carry is a policy nobody has declared. It is a volume under no declared bound, which is the same shape as the change and build-store volumes filed above and not a reader anyone could write today"),
+    ),
+    (
+        "sop_unmapped_role_total",
+        Unread::Gap("tasks whose declared `role` named no row in the executor table, by `face`. The role is carried through verbatim and the dispatch path maps it to nothing, so a task can be injected with `is_executable` set and a role no hand answers to -- and that is a fact no other series states, since the injected count beside it is the same whether or not anything can pick the work up. The lookup itself is not missing: the executor table already answers it through its own role-to-skill mapping, and the count is taken against that answer rather than against a table spelled here. What a rule would have to say is which of these are faults, and that turns on a mapping nobody has declared: the roles a face's document uses and the role kinds the executor table registers are two vocabularies with no published correspondence between them, so at the moment this name is minted every role a face declares is unmapped until an operator adds a row for it, and a rule firing on any nonzero would flag the wiring of a new face rather than a fault. The bound is what the actor loop's own entry says is missing -- the population that needs a threshold is the one that took a fallback -- and here the fallback is simply that nobody picks the task up"),
+    ),
 ];
 
 /// Entries an `Elsewhere` reader claim cannot be resolved against.
@@ -2501,7 +2518,17 @@ fn unresolved_readers(read: &BTreeSet<String>, name: &str, readers: &[&str]) -> 
 /// fleet running on the built-in is a fault, and every dispatch lands there
 /// today. The count is what makes that a deliberate exemption instead of an
 /// omission.
-const GAPS_AT_CENSUS: usize = 18;
+///
+/// It went to 21 in the pass that published the SOP dispatch loop's three
+/// readings. They arrived together and are filed together, because the loop
+/// mints all three or none: a deployment that configures no face makes no
+/// outbound call and writes no cell, so there is no state in which one of them
+/// exists and its siblings do not. Each is a gap for the reason its own entry
+/// gives -- a bound nobody declared, twice, and a role vocabulary with no
+/// published correspondence to the executor table, once -- and the tick
+/// counter's entry is the one worth reading, since it is the series a reader
+/// would assume a rule already covers.
+const GAPS_AT_CENSUS: usize = 21;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {

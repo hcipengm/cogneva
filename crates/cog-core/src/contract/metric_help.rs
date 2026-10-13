@@ -783,6 +783,41 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          every caller. Read per `tool`: a series climbing for one tool names \
          that tool's payload shape, not the budget as a whole.",
     ),
+    (
+        crate::metric_names::SOP_DISPATCH_TOTAL.as_str(),
+        "What the SOP dispatch loop did with one configured face on one tick, \
+         labelled by `face` and `result`, one increment per face per tick that \
+         came due. The results are a closed set and are four different facts: \
+         `compiled` (the document was read, compiled and handed to the planner), \
+         `skipped_unchanged` (read but byte-identical to the last compiled \
+         revision, so nothing was re-injected), `fetch_error` (the platform could \
+         not be read or refused the request) and `compile_error` (the document \
+         was read but is not a usable plan). Read per `face`: a face whose \
+         `compiled` stops while the loop's tick age stays fresh is a face the \
+         document or the endpoint stopped answering for, which a single total \
+         across faces would hide.",
+    ),
+    (
+        crate::metric_names::SOP_TASKS_INJECTED_TOTAL.as_str(),
+        "Tasks a face's plan put into the DAG, labelled by `face`, summed over \
+         ticks. It is the numerator the dispatch counter cannot give: a compile \
+         that succeeded and injected nothing and one that injected ten are the \
+         same `compiled` cell, so a reader wanting to know the plan is doing work \
+         reads this beside it. It counts what the injection answered with, not \
+         what it was asked for, so a re-submission the graph already held adds \
+         nothing -- the same document does not read as new work.",
+    ),
+    (
+        crate::metric_names::SOP_UNMAPPED_ROLE_TOTAL.as_str(),
+        "Tasks whose declared `role` named no row in the executor table, labelled \
+         by `face`, one increment per such task at compile time. The role is \
+         carried through verbatim and nothing maps it to a kind of hand yet, so \
+         such a task is injected and may then never be picked up; this series is \
+         what turns that into a reading instead of a hang that looks like work in \
+         progress. Read per `face`: a face whose tasks all land here is a face \
+         whose plan names roles this deployment does not staff, which is a \
+         configuration gap rather than a defect in the document.",
+    ),
 ];
 
 /// Descriptions for the histogram series. See [`COUNTER_HELP`].
