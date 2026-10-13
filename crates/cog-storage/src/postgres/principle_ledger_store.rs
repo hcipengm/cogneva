@@ -534,9 +534,19 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
 /// `first_seen_at` is set by the column default on insert and not written on
 /// conflict, so it stays the moment the row entered the account.
 ///
-/// `host_gate`, `check_kind` and the carrier fields keep what is already there
-/// when the reading carries nothing for them: a reading from a source that does
-/// not know about a field is not a reading that found the field empty.
+/// `host_gate` and the carrier fields keep what is already there when the reading
+/// carries nothing for them: a reading from a source that does not know about a
+/// field is not a reading that found the field empty.
+///
+/// `check_kind` is the exception, and it is not a looser rule but a stricter one:
+/// its `NULL` is not silence, it is the account's own word for "no tier has been
+/// declared for this principle". A merge that kept the stored tier would make
+/// that word unwritable -- a tier could be declared and then never withdrawn,
+/// while the column that records whether the tier was declared can only ever move
+/// in one direction. A principle whose tier was declared by mistake would carry
+/// it for good, and the fold that carries it here would keep it too: the queue
+/// row is written from the declared row wholesale, so a `NULL` that reaches this
+/// statement came from a source that pushed the column and left it empty.
 const RECORD_READING_SQL: &str = "\
 INSERT INTO principle_ledger (slug, lead, carrier_path, carrier_sha256, host_gate, check_kind)
 VALUES ($1, $2, $3, $4, $5, $6)
@@ -545,7 +555,7 @@ ON CONFLICT (slug) DO UPDATE SET
     carrier_path = COALESCE(EXCLUDED.carrier_path, principle_ledger.carrier_path),
     carrier_sha256 = COALESCE(EXCLUDED.carrier_sha256, principle_ledger.carrier_sha256),
     host_gate = COALESCE(EXCLUDED.host_gate, principle_ledger.host_gate),
-    check_kind = COALESCE(EXCLUDED.check_kind, principle_ledger.check_kind)";
+    check_kind = EXCLUDED.check_kind";
 
 /// Queue a reading, or re-queue the one already there when the reading would
 /// actually change it.
@@ -573,7 +583,11 @@ ON CONFLICT (slug) DO UPDATE SET
 ///
 /// The `COALESCE` half is not new and is what the account's own reading path
 /// already does: a source that knows nothing about a field is not a source that
-/// found the field empty, so it may not clear it.
+/// found the field empty, so it may not clear it. `check_kind` is the one column
+/// that keeps no `COALESCE`, for the reason spelled out on
+/// [`RECORD_READING_SQL`]: its empty value is a value the account has a meaning
+/// for, so a merge that preserved the stored tier would leave "no tier declared"
+/// unsayable in both copies of this rule.
 const DECLARE_SQL: &str = "\
 INSERT INTO principle_ledger_declared (slug, source, lead, carrier_path, carrier_sha256, host_gate, \
 check_kind)
@@ -583,14 +597,14 @@ ON CONFLICT (slug, source) DO UPDATE SET
     carrier_path = COALESCE(EXCLUDED.carrier_path, principle_ledger_declared.carrier_path),
     carrier_sha256 = COALESCE(EXCLUDED.carrier_sha256, principle_ledger_declared.carrier_sha256),
     host_gate = COALESCE(EXCLUDED.host_gate, principle_ledger_declared.host_gate),
-    check_kind = COALESCE(EXCLUDED.check_kind, principle_ledger_declared.check_kind),
+    check_kind = EXCLUDED.check_kind,
     declared_at = now(),
     folded_at = NULL
 WHERE (COALESCE(EXCLUDED.lead, principle_ledger_declared.lead),
        COALESCE(EXCLUDED.carrier_path, principle_ledger_declared.carrier_path),
        COALESCE(EXCLUDED.carrier_sha256, principle_ledger_declared.carrier_sha256),
        COALESCE(EXCLUDED.host_gate, principle_ledger_declared.host_gate),
-       COALESCE(EXCLUDED.check_kind, principle_ledger_declared.check_kind))
+       EXCLUDED.check_kind)
   IS DISTINCT FROM
       (principle_ledger_declared.lead, principle_ledger_declared.carrier_path,
        principle_ledger_declared.carrier_sha256, principle_ledger_declared.host_gate,

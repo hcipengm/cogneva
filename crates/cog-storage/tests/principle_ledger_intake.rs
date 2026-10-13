@@ -17,6 +17,12 @@
 //!   full-corpus re-push (which is what a push that failed part way is retried
 //!   with) from re-queueing the whole backlog and resetting the fold's own marks
 //!   on rows whose values did not move.
+//! - A reading that declares no tier has to clear the tier stored, which is the
+//!   opposite sign of the bullet above and a deliberate exception to it: the
+//!   tier's `NULL` is the account's word for "nothing is declared here", so a
+//!   merge that kept the stored tier would make that word unsayable and leave a
+//!   tier that could be declared and never taken back. One statement has to get
+//!   both directions right, which is why both are checked.
 //!
 //! Neither can be settled without a server: which branch of an `ON CONFLICT`
 //! runs, and whether `rows_affected` counts a row, are facts about the server.
@@ -242,6 +248,81 @@ async fn a_reading_that_says_nothing_new_writes_no_row_and_leaves_the_mark_alone
     assert!(
         !queued(&pool, &slug).await,
         "the fold's mark has to survive a repeat of the reading it folded"
+    );
+
+    cleanup(&pool, &marker).await;
+}
+
+/// A reading that declares no tier takes back a tier that was declared earlier,
+/// in the queue and in the account.
+///
+/// `check_kind` is the one column where `NULL` is not "this reading says nothing"
+/// but the account's own word for "no tier has been declared here", and a merge
+/// that keeps the stored tier makes that word unwritable: a tier declared by
+/// mistake -- or by a reading whose generator has since been fixed -- could never
+/// be taken back, and every later fold would carry it forward. The direction
+/// matters as much as the value: this is the opposite sign of the case below,
+/// and one statement has to get both of them right.
+///
+/// The three steps are the whole story. The withdrawal is a change (it re-queues),
+/// the fold carries it through, and a re-push of the same withdrawal is not a
+/// change again -- without that last one, a corpus where a tier was withdrawn
+/// would re-queue that row on every pass forever.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_reading_that_declares_no_tier_takes_back_the_one_the_account_holds() {
+    let _serialized = QUEUE.lock().await;
+    let (store, pool, marker) = store().await;
+    let slug = format!("{marker}/withdrawn");
+    let source = "probe-intake";
+    let mut declared = reading(&slug, source);
+    declared.check_kind = Some(PrincipleCheckKind::Shape);
+    assert_eq!(
+        store.declare(&[declared]).await.unwrap(),
+        1,
+        "the tier queues"
+    );
+    store.fold_declarations(100).await.expect("fold it");
+    assert_eq!(
+        store
+            .get(&slug)
+            .await
+            .unwrap()
+            .expect("it is there")
+            .check_kind,
+        Some(PrincipleCheckKind::Shape),
+        "the account holds the declared tier"
+    );
+
+    // The same reading with no tier in it: nobody declares this one any more.
+    let withdrawn = reading(&slug, source);
+    assert_eq!(
+        store.declare(std::slice::from_ref(&withdrawn)).await.unwrap(),
+        1,
+        "a withdrawn tier is a change to the row, so it has to re-queue"
+    );
+    store
+        .fold_declarations(100)
+        .await
+        .expect("fold the withdrawal");
+    assert_eq!(
+        store
+            .get(&slug)
+            .await
+            .unwrap()
+            .expect("it is there")
+            .check_kind,
+        None,
+        "the account has to end with no tier declared, not with the tier it had"
+    );
+    assert_eq!(
+        store.declare(&[withdrawn]).await.unwrap(),
+        0,
+        "a withdrawal that is already the row's value is not a change again"
+    );
+    assert!(
+        !queued(&pool, &slug).await,
+        "and it may not leave the row re-queued for the next fold"
     );
 
     cleanup(&pool, &marker).await;
