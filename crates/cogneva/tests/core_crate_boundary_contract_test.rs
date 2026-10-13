@@ -278,12 +278,12 @@ enum Owed {
     Split,
 }
 
-/// Where each mechanism is going is not written here: it is the registry's own
-/// `destination` column, read by [`relocation_target`]. What each destination
-/// means depends on [`Owed`]: for a `Direct` row it is where the module ends up,
-/// and for a `Split` row it is where the half that keeps state ends up, which is
-/// *not* a crate the module's readers depend on -- it is chosen by which crate
-/// already runs the mechanism, and the readers never touch it.
+// Where each mechanism is going is not written here: it is the registry's own
+// `destination` column, read by `relocation_target`. What each destination means
+// depends on `Owed`: for a `Direct` row it is where the module ends up, and for a
+// `Split` row it is where the half that keeps state ends up, which is *not* a
+// crate the module's readers depend on -- it is chosen by which crate already
+// runs the mechanism, and the readers never touch it.
 
 /// Where a split module's contract half lands: the core's `contract` module,
 /// under the module's own name.
