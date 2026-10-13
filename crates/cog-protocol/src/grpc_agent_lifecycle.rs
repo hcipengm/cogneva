@@ -275,10 +275,32 @@ impl AgentLifecycle for AgentLifecycleGrpcHandler {
         let checkpoint_id = uuid::Uuid::new_v4().to_string();
         let _ = self.event_tx.send(SupervisorEvent::CheckpointRequested {
             agent_id: req.agent_id.clone(),
-            task_id: req.task_id,
+            task_id: req.task_id.clone(),
             checkpoint_id: checkpoint_id.clone(),
             timestamp: chrono::Utc::now(),
         });
+        // Push it like kill and restart do. The event alone never reaches the
+        // agent: it goes to whoever subscribes to supervisor events, so a
+        // remote caller used to get `success: true` and a checkpoint id while
+        // the agent was never told to take one.
+        let cmd = Command {
+            payload: Some(crate::agent_lifecycle::command::Payload::Checkpoint(
+                CheckpointCmd {
+                    task_id: req.task_id,
+                },
+            )),
+        };
+        if let Err(e) = self.router.push(&req.agent_id, cmd) {
+            warn!(
+                "gRPC Checkpoint: failed to push command to agent {}: {}",
+                req.agent_id, e
+            );
+            return Ok(Response::new(CheckpointResp {
+                agent_id: req.agent_id,
+                checkpoint_id: String::new(),
+                success: false,
+            }));
+        }
         Ok(Response::new(CheckpointResp {
             agent_id: req.agent_id,
             checkpoint_id,
@@ -360,11 +382,56 @@ impl AgentLifecycle for AgentLifecycleGrpcHandler {
 
 pub struct GrpcAgentLifecycleServer {
     router: AgentCommandRouter,
+    /// The process's `SupervisorEvent` broadcast, attached once there is one.
+    ///
+    /// Empty until then, because this server is constructed and published
+    /// during the protocol plugin's `init` while the sender is published by the
+    /// supervisor plugin, whose descriptor requires this one -- so the two ends
+    /// of the same process meet after construction, not at it.
+    events: std::sync::RwLock<Option<broadcast::Sender<SupervisorEvent>>>,
 }
 
 impl GrpcAgentLifecycleServer {
     pub fn new(router: AgentCommandRouter) -> Self {
-        Self { router }
+        Self {
+            router,
+            events: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// Attach the process's `SupervisorEvent` broadcast.
+    pub fn attach_events(&self, tx: broadcast::Sender<SupervisorEvent>) {
+        *self.events.write().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    }
+
+    /// The router this server dispatches through, so the process that built
+    /// both does not have to keep a second copy of it.
+    pub fn router(&self) -> AgentCommandRouter {
+        self.router.clone()
+    }
+
+    /// Put reported events on the broadcast, or say why they cannot go.
+    ///
+    /// A trait that answers `Ok` with nothing behind it reads to the caller as
+    /// accepted events, and this one answered `Ok(0)` -- a count of events
+    /// accepted that had been dropped on the floor. Failing instead is the only
+    /// answer that cannot be mistaken for delivery.
+    fn report(&self, agent_id: &str, events: Vec<AgentEvent>) -> SFResult<u32> {
+        let guard = self.events.read().unwrap_or_else(|e| e.into_inner());
+        let Some(tx) = guard.as_ref() else {
+            return Err(SFError::Agent(format!(
+                "no SupervisorEvent channel in this process, so events from {agent_id} would reach nobody"
+            )));
+        };
+        let accepted = events.len() as u32;
+        for event in events {
+            let _ = tx.send(SupervisorEvent::AgentEventReported {
+                agent_id: agent_id.to_string(),
+                event,
+                timestamp: chrono::Utc::now(),
+            });
+        }
+        Ok(accepted)
     }
 }
 
@@ -400,16 +467,15 @@ impl AgentLifecycleServer for GrpcAgentLifecycleServer {
         Ok(self.router.connected_agents())
     }
 
-    async fn report_event(&self, _agent_id: &str, _event: &AgentEvent) -> SFResult<()> {
-        // Server-side `report_event` is consumed by Supervisor via the gRPC handler
-        // above; this trait method is a no-op because the actual event processing
-        // happens in the tonic server which has access to the broadcast channel.
-        Ok(())
+    async fn report_event(&self, agent_id: &str, event: &AgentEvent) -> SFResult<()> {
+        // The tonic handler has a caller per RPC; this face has whatever holds
+        // the trait object, and it goes onto the same broadcast, so both faces
+        // of one process report the same way.
+        self.report(agent_id, vec![event.clone()]).map(|_| ())
     }
 
-    async fn upload_events(&self, _agent_id: &str, _events: Vec<AgentEvent>) -> SFResult<u32> {
-        // Same as report_event — the tonic handler processes the stream directly.
-        Ok(0)
+    async fn upload_events(&self, agent_id: &str, events: Vec<AgentEvent>) -> SFResult<u32> {
+        self.report(agent_id, events)
     }
 }
 
@@ -524,5 +590,204 @@ fn map_proto_command(cmd: Command) -> AgentCommand {
         None => AgentCommand::Kill {
             reason: "unknown command".into(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cog_core::{AgentRegistration, ResourceInfo};
+
+    /// Holds what it was given. The handlers answer "is this agent known"
+    /// before they push anything, so a test of the push path needs a registry
+    /// that can say yes.
+    #[derive(Default)]
+    struct StubRegistry {
+        agents: Mutex<HashMap<String, AgentRegistration>>,
+    }
+
+    #[async_trait]
+    impl AgentRegistry for StubRegistry {
+        async fn register(&self, registration: &AgentRegistration) -> SFResult<()> {
+            self.agents
+                .lock()
+                .unwrap()
+                .insert(registration.agent_id.clone(), registration.clone());
+            Ok(())
+        }
+
+        async fn heartbeat(&self, _agent_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+
+        async fn deregister(&self, agent_id: &str) -> SFResult<()> {
+            self.agents.lock().unwrap().remove(agent_id);
+            Ok(())
+        }
+
+        async fn get(&self, agent_id: &str) -> SFResult<Option<AgentRegistration>> {
+            Ok(self.agents.lock().unwrap().get(agent_id).cloned())
+        }
+
+        async fn list(&self) -> SFResult<Vec<AgentRegistration>> {
+            Ok(self.agents.lock().unwrap().values().cloned().collect())
+        }
+
+        async fn list_by_role(&self, _role: &str) -> SFResult<Vec<AgentRegistration>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_by_capability(&self, _capability: &str) -> SFResult<Vec<AgentRegistration>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn registration(agent_id: &str) -> AgentRegistration {
+        AgentRegistration::new(
+            agent_id,
+            "host-1",
+            "10.0.0.1",
+            "worker",
+            "ws-1",
+            Vec::new(),
+            ResourceInfo::default(),
+        )
+    }
+
+    fn event() -> AgentEvent {
+        AgentEvent::AgentStart {
+            agent_id: "a-1".into(),
+            crew_id: None,
+            squad_id: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    async fn registered_handler() -> AgentLifecycleGrpcHandler {
+        let registry = Arc::new(StubRegistry::default());
+        registry.register(&registration("a-1")).await.unwrap();
+        let (tx, _rx) = broadcast::channel(16);
+        AgentLifecycleGrpcHandler::new(
+            registry as Arc<dyn AgentRegistry>,
+            tx,
+            AgentCommandRouter::new(),
+        )
+    }
+
+    /// The checkpoint used to answer `success: true` and an id while the only
+    /// thing it sent was a supervisor event — the agent was never told to take
+    /// one, and kill and restart next door both push.
+    #[tokio::test]
+    async fn a_checkpoint_reaches_the_agent_it_names() {
+        let handler = registered_handler().await;
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<Command>(8);
+        handler.router.register("a-1".into(), cmd_tx);
+
+        let resp = handler
+            .checkpoint(Request::new(CheckpointReq {
+                agent_id: "a-1".into(),
+                task_id: "t-9".into(),
+            }))
+            .await
+            .expect("the call answers")
+            .into_inner();
+
+        assert!(resp.success);
+        assert!(
+            !resp.checkpoint_id.is_empty(),
+            "the id it answers with is the one the caller tracks the checkpoint by"
+        );
+        match cmd_rx.try_recv().expect("the agent was told to checkpoint") {
+            Command {
+                payload: Some(crate::agent_lifecycle::command::Payload::Checkpoint(c)),
+            } => assert_eq!(c.task_id, "t-9"),
+            other => panic!("expected a checkpoint command, got {other:?}"),
+        }
+    }
+
+    /// No subscription means no stream to push to. The caller has to be able to
+    /// tell that apart from a checkpoint the agent actually took.
+    #[tokio::test]
+    async fn a_checkpoint_for_an_agent_with_no_command_stream_is_not_a_success() {
+        let handler = registered_handler().await;
+
+        let resp = handler
+            .checkpoint(Request::new(CheckpointReq {
+                agent_id: "a-1".into(),
+                task_id: "t-9".into(),
+            }))
+            .await
+            .expect("the call answers")
+            .into_inner();
+
+        assert!(!resp.success, "nobody was listening, so nothing was taken");
+        assert!(resp.checkpoint_id.is_empty());
+    }
+
+    /// An agent the registry has never seen is not a checkpoint either.
+    #[tokio::test]
+    async fn a_checkpoint_for_an_unknown_agent_is_not_a_success() {
+        let handler = registered_handler().await;
+
+        let resp = handler
+            .checkpoint(Request::new(CheckpointReq {
+                agent_id: "nobody".into(),
+                task_id: "t-9".into(),
+            }))
+            .await
+            .expect("the call answers")
+            .into_inner();
+
+        assert!(!resp.success);
+    }
+
+    /// The trait face answered `Ok(())` and `Ok(0)` for both of these: events
+    /// the caller believed were reported, and a count of events accepted, with
+    /// nothing behind either. Refusing is the only answer that cannot be read
+    /// as delivery.
+    #[tokio::test]
+    async fn events_reported_without_a_channel_are_refused_rather_than_accepted() {
+        let server = GrpcAgentLifecycleServer::new(AgentCommandRouter::new());
+
+        let single = server.report_event("a-1", &event()).await;
+        assert!(single.is_err(), "no channel, so nothing was reported");
+
+        let batch = server.upload_events("a-1", vec![event(), event()]).await;
+        assert!(
+            batch.is_err(),
+            "no channel, so accepted_count is not a number"
+        );
+    }
+
+    /// With the channel attached the same two calls deliver, on the same
+    /// broadcast the RPC face uses, so a process that holds this trait object
+    /// reports events the supervisor can see.
+    #[tokio::test]
+    async fn attached_events_reach_the_broadcast() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let server = GrpcAgentLifecycleServer::new(AgentCommandRouter::new());
+        server.attach_events(tx);
+
+        server
+            .report_event("a-1", &event())
+            .await
+            .expect("the channel is attached");
+        let accepted = server
+            .upload_events("a-1", vec![event(), event()])
+            .await
+            .expect("the channel is attached");
+        assert_eq!(accepted, 2, "the count is what went onto the channel");
+
+        let mut seen = 0;
+        while let Ok(reported) = rx.try_recv() {
+            match reported {
+                SupervisorEvent::AgentEventReported { agent_id, .. } => {
+                    assert_eq!(agent_id, "a-1");
+                    seen += 1;
+                }
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        assert_eq!(seen, 3, "one reported singly and two in a batch");
     }
 }

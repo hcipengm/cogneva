@@ -7,7 +7,10 @@ use tracing::{info, warn};
 pub struct ProtocolPlugin {
     mcp_client: Option<Arc<dyn cog_core::McpClient>>,
     a2a_client: Option<Arc<crate::A2aClient>>,
-    grpc_router: Option<crate::grpc_agent_lifecycle::AgentCommandRouter>,
+    /// The lifecycle server published at init. `start` keeps the handle so it
+    /// can hand the server the process's event channel, which is published by
+    /// the supervisor plugin after this one's init has already run.
+    grpc_server: Option<Arc<crate::grpc_agent_lifecycle::GrpcAgentLifecycleServer>>,
 }
 
 impl ProtocolPlugin {
@@ -16,7 +19,7 @@ impl ProtocolPlugin {
         Self {
             mcp_client: None,
             a2a_client: None,
-            grpc_router: None,
+            grpc_server: None,
         }
     }
 
@@ -28,7 +31,7 @@ impl ProtocolPlugin {
         Self {
             mcp_client,
             a2a_client: Some(a2a_client),
-            grpc_router: None,
+            grpc_server: None,
         }
     }
 }
@@ -71,9 +74,10 @@ impl cog_core::SystemPlugin for ProtocolPlugin {
         // ── gRPC lifecycle server handle (command router) ──
         let router = crate::grpc_agent_lifecycle::AgentCommandRouter::new();
         let server = Arc::new(crate::grpc_agent_lifecycle::GrpcAgentLifecycleServer::new(
-            router.clone(),
+            router,
         ));
-        ctx.publish_service(server as Arc<dyn cog_core::AgentLifecycleServer>);
+        ctx.publish_service(server.clone() as Arc<dyn cog_core::AgentLifecycleServer>);
+        self.grpc_server = Some(server);
         info!("ProtocolPlugin AgentLifecycleServer published");
 
         // ── gRPC lifecycle client ──
@@ -94,18 +98,23 @@ impl cog_core::SystemPlugin for ProtocolPlugin {
             }
         }
 
-        self.grpc_router = Some(router);
         Ok(())
     }
 
     async fn start(&self, ctx: &cog_core::PluginContext) -> cog_core::SFResult<()> {
         // Start gRPC server only when running in a supervisor context
         // (AgentRegistry + SupervisorEvent sender are available).
-        if let Some(router) = self.grpc_router.clone() {
+        if let Some(server) = self.grpc_server.clone() {
+            let router = server.router();
             if let Some(agent_registry) = ctx.consume_service::<dyn cog_core::AgentRegistry>() {
                 if let Some(event_tx) =
                     ctx.consume::<tokio::sync::broadcast::Sender<cog_core::SupervisorEvent>>()
                 {
+                    // The trait face reports events onto the same channel the
+                    // RPC face does. Attached here and not at construction
+                    // because the sender is published by the supervisor plugin,
+                    // which this one cannot wait for during init.
+                    server.attach_events((*event_tx).clone());
                     let bind_addr = std::env::var("COGNEVA_GRPC_BIND_ADDR")
                         .unwrap_or_else(|_| "0.0.0.0:50051".into());
                     let socket_addr: std::net::SocketAddr = bind_addr.parse().map_err(|e| {
