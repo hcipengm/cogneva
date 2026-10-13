@@ -4,8 +4,6 @@
 //! - Task: 任务生命周期管理
 //! - Client: 向外部 Agent 发送任务
 
-use serde::{Deserialize, Serialize};
-
 // ==========================================================================
 // Agent Card
 // ==========================================================================
@@ -26,53 +24,13 @@ pub use cog_core::{AgentAuthentication, AgentCapabilities, AgentCard, AgentSkill
 // A2A Task
 // ==========================================================================
 
-/// A2A Task 生命周期。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct A2aTask {
-    pub id: String,
-    pub status: TaskStatus,
-    pub messages: Vec<TaskMessage>,
-    pub artifacts: Vec<TaskArtifact>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskStatus {
-    Submitted,
-    Working,
-    InputRequired,
-    Completed,
-    Canceled,
-    Failed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskMessage {
-    pub role: String,
-    pub parts: Vec<MessagePart>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum MessagePart {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "file")]
-    File {
-        name: String,
-        mime_type: String,
-        bytes: String,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskArtifact {
-    pub name: String,
-    pub parts: Vec<MessagePart>,
-    pub index: u32,
-}
+// 同名片那一族：类型住在 `cog-core`——A2A 的 HTTP 面由 gateway 服务，而 gateway 不许
+// 依赖本 crate 的具体类型。这里只做别名。
+//
+// `TaskStatus` 在 core 里叫 `A2aTaskStatus`：core 根上已经有一个给自家任务存储用的
+// `TaskStatus`，两者是两套状态（调度器的 vs A2A 线上的），同名会让人读错。
+pub use cog_core::A2aTaskStatus as TaskStatus;
+pub use cog_core::{A2aTask, MessagePart, TaskArtifact, TaskMessage};
 
 // ==========================================================================
 // A2A Client

@@ -19,6 +19,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
+pub mod a2a;
 pub mod action_plan;
 pub mod agents;
 pub mod alert_store;
@@ -751,6 +752,10 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             "/api/v1/protocol/a2a/agent-card",
             get(a2a_agent_card_handler),
         )
+        // 名片上 `streaming` / `state_transition_history` 两杆旗指名的就是这个方法。
+        // 旗子与端点必须在同一处能被读出来——旗在这里挂，端点也在这里挂，改名的人
+        // 会同时看到两张。
+        .route(a2a::MESSAGE_STREAM, post(a2a::message_stream_handler))
         // 外部价值判定：与 A2A 面同级（成员即可提交，见 operator 组），
         // 审计里记名。判定本身不是变更，它只是把「什么算好」变成一条进化输入。
         .route(
@@ -2869,11 +2874,8 @@ async fn a2a_agent_card_handler(State(state): State<Arc<GatewayState>>) -> Respo
                 .http_port
         ),
         version: env!("CARGO_PKG_VERSION").into(),
-        capabilities: cog_core::AgentCapabilities {
-            streaming: true,
-            push_notifications: false,
-            state_transition_history: true,
-        },
+        // 旗子不在这里写死：它由本模块真正服务的那张端点推出（见 `a2a::capabilities`）。
+        capabilities: a2a::capabilities(),
         skills: vec![
             cog_core::AgentSkill {
                 id: "task_orchestration".into(),
