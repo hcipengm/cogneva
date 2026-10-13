@@ -73,7 +73,12 @@ const CORE_ROOT_MODULES: &[(&str, &str)] = &[
     ("admission", "pending-relocation"),
     ("audit", "shared-definition"),
     ("build_cache", "shared-definition"),
-    ("build_cache_readings", "pending-relocation"),
+    // Both `cog-extension` and `cog-reflection` build a readings object and
+    // spawn the watch loop, and neither reaches the other, so no single
+    // destination crate is reachable from every reader. The contract half has to
+    // sit where both reach — the core — and the driver stays with it, so the
+    // reason names the driver rather than reading as a pure definition.
+    ("build_cache_readings", "shared-definition-with-driver"),
     ("build_cache_reclaim", "pending-relocation"),
     ("build_gate", "pending-relocation"),
     ("claim_footprint", "shared-definition"),
@@ -99,6 +104,19 @@ const MODULE_REASONS: &[&str] = &[
     // size, a rendering — where a second copy would drift and the two readings
     // would differ with nothing in either one to explain the difference.
     "shared-definition",
+    // A shared definition that also owns a driver the core still runs: the
+    // types and the periodic work that keeps them current sit in one module, so
+    // the module is a definition *and* something that acts on a loop. A reader
+    // selecting `shared-definition` rows for "nothing here does anything" has to
+    // tell this apart, which is why it is not folded into that word.
+    //
+    // Not checked: nothing in this gate decides whether a module has a driver. A
+    // driver is a loop, and no predicate over a module's source says "this one
+    // has one" — the nearest is a scan for a spelling (`loop_health::spawn`,
+    // `todo::time::interval`) that a driver could have without, and that would
+    // also read a `#[cfg(test)]` spawn as a production one. The word is a claim
+    // a reviewer reads, not a property this gate verifies.
+    "shared-definition-with-driver",
     // Configuration types: every crate that reads the configuration reads the
     // same fields, and a second definition would be a second configuration.
     "shared-config",
@@ -168,9 +186,10 @@ const RELOCATION_TARGET: &[(&str, &str, Owed)] = &[
     // depends on `cog-eval` -- the edge would close a cycle rather than lengthen
     // a path.
     ("admission", "cog-eval", Owed::Split),
-    // Read for the sizes of the layers it caches, by the crate whose workdir
-    // owns that cache.
-    ("build_cache_readings", "cog-extension", Owed::Split),
+    // `build_cache_readings` was registered here and is not any more: its two
+    // readers both reach the core and neither reaches the other, so no shared
+    // destination exists, and the module stays whole under a definition reason
+    // that names its driver.
     // The crate whose scan loop runs the reclaim: its `measure_and_enforce` is
     // the only producer call, and it drives the slot. `cog-reflection` only
     // re-exports the module, and the core reads `plan_reclaim` itself, so both
