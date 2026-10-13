@@ -142,7 +142,7 @@ async fn reply(shared: &Shared, tx: &mpsc::UnboundedSender<Bytes>, body: &serde_
             "tools": [{
                 "name": "echo",
                 "description": "echoes its argument back",
-                "input_schema": {"type": "object"},
+                "inputSchema": {"type": "object"},
             }],
         }),
         "tools/call" => {
@@ -163,7 +163,7 @@ async fn reply(shared: &Shared, tx: &mpsc::UnboundedSender<Bytes>, body: &serde_
                             &id,
                             serde_json::json!({
                                 "content": [{"type": "text", "text": "echo:first"}],
-                                "is_error": false,
+                                "isError": false,
                             }),
                         )
                         .to_string(),
@@ -173,7 +173,7 @@ async fn reply(shared: &Shared, tx: &mpsc::UnboundedSender<Bytes>, body: &serde_
             }
             serde_json::json!({
                 "content": [{"type": "text", "text": format!("echo:{q}")}],
-                "is_error": false,
+                "isError": false,
             })
         }
         other => serde_json::json!({"probe says": other}),

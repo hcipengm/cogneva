@@ -163,7 +163,16 @@ pub trait McpTransport: Send + Sync {
 // MCP Types
 // ==========================================================================
 
+/// One entry of a `tools/list` reply.
+///
+/// The field names below are the protocol's, not this crate's: the wire spells
+/// them camelCase, so the serde attribute is what makes this type readable by
+/// and writable to anything else that speaks MCP. Without it the struct
+/// round-trips with itself and with nothing else -- every real server's
+/// `tools/list` fails to parse as a missing `input_schema`, and everything this
+/// side emits is unreadable to a client that follows the schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct McpTool {
     pub name: String,
     pub description: String,
@@ -176,7 +185,10 @@ pub struct McpToolCall {
     pub arguments: HashMap<String, serde_json::Value>,
 }
 
+/// A `tools/call` reply. `isError` is the protocol's spelling; it is absent from
+/// a successful call, hence the default.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct McpToolResult {
     pub content: Vec<McpContent>,
     #[serde(default)]
@@ -189,7 +201,11 @@ pub enum McpContent {
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "image")]
-    Image { data: String, mime_type: String },
+    Image {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
 }
 
 impl McpContent {
@@ -249,7 +265,7 @@ mod tests {
             .call_tool("echo", serde_json::json!({"q": "hi"}))
             .await
             .unwrap();
-        assert_eq!(result["is_error"], serde_json::json!(false));
+        assert_eq!(result["isError"], serde_json::json!(false));
         assert_eq!(result["content"][0]["type"], serde_json::json!("text"));
         assert_eq!(result["content"][0]["text"], serde_json::json!("echo:hi"));
     }
@@ -269,5 +285,39 @@ mod tests {
             .call_tool("echo", serde_json::json!({}))
             .await
             .is_err());
+    }
+
+    /// The writing direction, which the transport tests cannot cover: they read
+    /// spec-shaped replies, so they catch this side failing to *parse* the
+    /// protocol, while nothing there notices this side failing to *emit* it. A
+    /// tool list goes out to callers from here (the gateway hands one straight
+    /// to whoever asked), and a client that follows the schema reads
+    /// `inputSchema` there -- a crate that spells it otherwise is talking to
+    /// nobody.
+    #[test]
+    fn what_this_side_writes_is_spelled_the_way_the_protocol_spells_it() {
+        let tool = McpTool {
+            name: "echo".into(),
+            description: "echoes its argument back".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        let wire = serde_json::to_value(&tool).unwrap();
+        assert!(wire.get("inputSchema").is_some(), "{wire}");
+        assert!(wire.get("input_schema").is_none(), "{wire}");
+
+        let result = McpToolResult {
+            content: vec![McpContent::Image {
+                data: "AA==".into(),
+                mime_type: "image/png".into(),
+            }],
+            is_error: true,
+        };
+        let wire = serde_json::to_value(&result).unwrap();
+        assert_eq!(wire["isError"], serde_json::json!(true), "{wire}");
+        assert_eq!(
+            wire["content"][0]["mimeType"],
+            serde_json::json!("image/png"),
+            "{wire}"
+        );
     }
 }

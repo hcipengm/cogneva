@@ -42,6 +42,13 @@ use cog_protocol::{McpTransport, StdioTransport};
 /// reply, which makes it ordered by construction.
 ///
 /// `COGNEVA_PROBE_BEHAVIOUR` picks the one thing a case is about.
+///
+/// The replies below are spelled the way the protocol spells them (the wire is
+/// camelCase: `inputSchema`, `isError`), not the way this crate's own structs
+/// happen to name their fields. A stub written in the implementation's spelling
+/// would agree with the implementation by construction and pass no matter which
+/// of the two the far side actually speaks -- which is exactly what happened
+/// here once, with the field names this file no longer uses.
 const STUB: &str = r#"
 set -u
 receipt=${COGNEVA_PROBE_RECEIPT:?the receipt file has to be named}
@@ -79,7 +86,7 @@ while IFS= read -r line; do
           i=$((i+1))
         done
       fi
-      reply "$id" '{"tools":[{"name":"echo","description":"echoes its argument back","input_schema":{"type":"object"}}]}'
+      reply "$id" '{"tools":[{"name":"echo","description":"echoes its argument back","inputSchema":{"type":"object"}}]}'
       ;;
     *'"method":"tools/call"'*)
       q=$(printf '%s\n' "$line" | sed -n 's/.*"q":"\([^"]*\)".*/\1/p')
@@ -88,10 +95,10 @@ while IFS= read -r line; do
         continue
       fi
       if [ "$behaviour" = out_of_order ] && [ "$q" = second ] && [ -n "${held:-}" ]; then
-        reply "$held" '{"content":[{"type":"text","text":"echo:first"}],"is_error":false}'
+        reply "$held" '{"content":[{"type":"text","text":"echo:first"}],"isError":false}'
         held=
       fi
-      reply "$id" "{\"content\":[{\"type\":\"text\",\"text\":\"echo:$q\"}],\"is_error\":false}"
+      reply "$id" "{\"content\":[{\"type\":\"text\",\"text\":\"echo:$q\"}],\"isError\":false}"
       ;;
   esac
 done
