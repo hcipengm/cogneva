@@ -111,6 +111,19 @@ jobs:
         run: cargo test -p cog-storage --test change_ledger_store -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The principle ledger's intake is keyed on `(slug, source)`, so every
+      # later reading of a principle lands on the row already queued for it, and
+      # whether that row is rewritten is decided by the conflict clause alone --
+      # which branch of an `ON CONFLICT` runs is a fact about the server, and so
+      # is whether `rows_affected` counted a row. A clause that leaves the
+      # existing row alone drops corrected readings while reporting the pass as
+      # done, and no reading of the account can show it: the queue is the only
+      # path to the account, so a reading it refused is one the account never
+      # gets. Without this step that shape passes everything.
+      - name: Live-DB principle-ledger intake
+        run: cargo test -p cog-storage --test principle_ledger_intake -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The sample-log sweep is expressed almost entirely as one DELETE, so its
       # correctness cannot be checked without a server; the DB-free tests beside
       # it only cover the sweep period. Leaving these out of the gate is how a

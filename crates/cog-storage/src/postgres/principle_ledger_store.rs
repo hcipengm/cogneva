@@ -177,9 +177,12 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
                 .execute(&self.pool)
                 .await
                 .map_err(|e| SFError::Database(format!("declare {}: {e}", reading.slug)))?;
-            // The conflict clause writes nothing, so a reading already queued
-            // contributes no row here. Counting the statement rather than the
-            // batch is what makes "how many were newly queued" answerable.
+            // A reading that says what the queued one already says matches the
+            // conflict clause's `WHERE` and writes no row; one that says
+            // something different writes its row and counts here. Counting the
+            // statement rather than the batch is what makes "how many were
+            // queued or re-queued" answerable, and the `WHERE` is what keeps
+            // that number meaning something rather than counting every re-push.
             queued += outcome.rows_affected() as usize;
         }
         Ok(queued)
@@ -544,19 +547,54 @@ ON CONFLICT (slug) DO UPDATE SET
     host_gate = COALESCE(EXCLUDED.host_gate, principle_ledger.host_gate),
     check_kind = COALESCE(EXCLUDED.check_kind, principle_ledger.check_kind)";
 
-/// Queue a reading, or leave the one already queued for this principle and
-/// source exactly as it is.
+/// Queue a reading, or re-queue the one already there when the reading would
+/// actually change it.
 ///
-/// `DO NOTHING` rather than an update: a reading is one pass over one corpus, so
-/// a source that wants to say something different pushes again with a new
-/// source, or withdraws and re-declares. Updating in place would make "what the
-/// host said about this principle" a value that changes without the host
-/// changing, which is the same merge the account's own reading path refuses.
+/// Not `DO NOTHING`, which this used to be. The rule it was standing on -- "a
+/// source that wants to say something different pushes again with a new source,
+/// or withdraws and re-declares" -- described two moves this table has no way to
+/// make. The source is a constant in the pusher, so a re-push cannot be a new
+/// one; there is no withdrawal statement anywhere. What `DO NOTHING` did instead
+/// was freeze each `(slug, source)` at whatever the **first** reading said, and a
+/// reading taken before a column existed, or by a reader that could not yet see a
+/// field, says `NULL` for it. A NULL is a value here, so the corrected reading
+/// that arrived later matched the key, hit `DO NOTHING`, and was dropped while
+/// the pass still reported success. Nothing in the account could ever say
+/// otherwise: a row that cannot be re-read is a row that is frozen.
+///
+/// `WHERE ... IS DISTINCT FROM` is what keeps the re-queue from becoming a
+/// livelock: without it every pass over the corpus would re-queue all of it,
+/// resetting `folded_at` on rows whose values did not move, and the fold -- which
+/// reads a bounded batch per tick -- would never catch up. It compares the values
+/// the `SET` would produce, not the raw incoming ones, because a field the
+/// reading carries nothing for keeps what is stored: comparing the incoming
+/// `NULL` against a stored value would call that a change, re-queue it, write the
+/// same row, and do the same thing again on the next pass.
+///
+/// The `COALESCE` half is not new and is what the account's own reading path
+/// already does: a source that knows nothing about a field is not a source that
+/// found the field empty, so it may not clear it.
 const DECLARE_SQL: &str = "\
 INSERT INTO principle_ledger_declared (slug, source, lead, carrier_path, carrier_sha256, host_gate, \
 check_kind)
 VALUES ($1, $2, $3, $4, $5, $6, $7)
-ON CONFLICT (slug, source) DO NOTHING";
+ON CONFLICT (slug, source) DO UPDATE SET
+    lead = COALESCE(EXCLUDED.lead, principle_ledger_declared.lead),
+    carrier_path = COALESCE(EXCLUDED.carrier_path, principle_ledger_declared.carrier_path),
+    carrier_sha256 = COALESCE(EXCLUDED.carrier_sha256, principle_ledger_declared.carrier_sha256),
+    host_gate = COALESCE(EXCLUDED.host_gate, principle_ledger_declared.host_gate),
+    check_kind = COALESCE(EXCLUDED.check_kind, principle_ledger_declared.check_kind),
+    declared_at = now(),
+    folded_at = NULL
+WHERE (COALESCE(EXCLUDED.lead, principle_ledger_declared.lead),
+       COALESCE(EXCLUDED.carrier_path, principle_ledger_declared.carrier_path),
+       COALESCE(EXCLUDED.carrier_sha256, principle_ledger_declared.carrier_sha256),
+       COALESCE(EXCLUDED.host_gate, principle_ledger_declared.host_gate),
+       COALESCE(EXCLUDED.check_kind, principle_ledger_declared.check_kind))
+  IS DISTINCT FROM
+      (principle_ledger_declared.lead, principle_ledger_declared.carrier_path,
+       principle_ledger_declared.carrier_sha256, principle_ledger_declared.host_gate,
+       principle_ledger_declared.check_kind)";
 
 /// The readings one fold takes, oldest first.
 ///
