@@ -573,6 +573,22 @@ impl cog_core::SystemPlugin for StoragePlugin {
         ctx.publish_service(dead_letter_queue);
         info!("StoragePlugin dead-letter queue published");
 
+        // ── Agent WAL (Redis) ──
+        //
+        // The agent's durable event log, read back by `replay_events` after a
+        // checkpoint restore. With no production caller of `Agent::with_wal`
+        // every agent ran `wal: None`, so the checkpoint's `event_offset` was
+        // always 0 and the replay silently restored nothing -- the snapshot and
+        // the events after it came apart, which is the one thing the WAL is
+        // there to prevent. Published from here for the same reason as the
+        // dead-letter queue: the concrete backend lives in this crate and the
+        // consumer speaks the `WalBackend` trait from `cog-core`. It shares the
+        // connection opened above, like the queue and the registry below.
+        let wal_backend: Arc<dyn cog_core::WalBackend> =
+            Arc::new(crate::wal::RedisWalBackend::from_connection(redis_conn.clone()));
+        ctx.publish_service(wal_backend);
+        info!("StoragePlugin WAL backend published");
+
         // ── AgentRegistry (Redis) ──
         let agent_registry = crate::RedisAgentRegistry::new(redis_conn)
             .with_ttl_seconds(ctx.config().agent.registration_ttl_secs);

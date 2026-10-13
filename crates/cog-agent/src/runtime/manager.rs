@@ -89,6 +89,14 @@ pub struct GlobalAgentManager {
     /// pointer is written, the read comes back empty, and the run starts over
     /// exactly as if nothing had ever been checkpointed.
     checkpoint_store: Option<Arc<dyn cog_core::CheckpointStore>>,
+    /// The durable event log each agent writes its events to.
+    ///
+    /// The store above persists the checkpoint; this is what makes the events
+    /// after it replayable. Without a backend every agent runs `wal: None`, its
+    /// checkpoint records `event_offset: 0`, and a restore replays nothing --
+    /// the snapshot loads and everything that happened after it is gone, while
+    /// every surface reports the checkpoint was written.
+    wal_backend: Option<Arc<dyn cog_core::WalBackend>>,
     /// Where a spawned worker's loop archives a tool output too large for the
     /// context window. Shared by every worker, like the observability gateway.
     tool_output_archive: Option<Arc<dyn crate::archive::ToolOutputArchive>>,
@@ -129,6 +137,7 @@ impl GlobalAgentManager {
             event_bus_sink: None,
             observability: None,
             checkpoint_store: None,
+            wal_backend: None,
             tool_output_archive: None,
             heartbeat_interval_secs: cog_core::config::AgentConfig::default()
                 .heartbeat_interval_secs,
@@ -226,6 +235,37 @@ impl GlobalAgentManager {
         self
     }
 
+    /// Attach the durable event log each agent writes to.
+    ///
+    /// One backend serves every worker; each agent gets its own log keyed by
+    /// its id, so a restart replays that agent's events and not another's.
+    pub fn with_wal_backend(mut self, backend: Arc<dyn cog_core::WalBackend>) -> Self {
+        self.wal_backend = Some(backend);
+        self
+    }
+
+    /// Open `agent_id`'s event log, or `None` when no backend is attached.
+    ///
+    /// A log that will not open is reported and the agent starts without one:
+    /// the append path already treats a WAL failure as non-fatal, and refusing
+    /// to spawn would turn a missing history into an outage. The log line names
+    /// the consequence, because "no WAL" and "an empty WAL" look the same to
+    /// every reader downstream.
+    async fn wal_for(&self, agent_id: impl AsRef<str>) -> Option<Arc<crate::wal::AgentWal>> {
+        let agent_id = agent_id.as_ref();
+        let backend = self.wal_backend.as_ref()?;
+        match crate::wal::AgentWal::new(backend.clone(), agent_id).await {
+            Ok(wal) => Some(Arc::new(wal)),
+            Err(e) => {
+                tracing::warn!(
+                    agent_id,
+                    "WAL unavailable; this agent's checkpoints will replay no events: {e}"
+                );
+                None
+            }
+        }
+    }
+
     /// Give every spawned worker the surface that archives an oversized tool
     /// output. One handle for the whole pool: the reading it carries is keyed by
     /// tool, not by worker, so a second copy would only split the count.
@@ -268,6 +308,9 @@ impl GlobalAgentManager {
                 .with_message_backend(self.message_backend.clone())
                 .with_state_backend(self.state_backend.clone())
                 .with_heartbeat_interval(self.heartbeat_interval_secs);
+            if let Some(wal) = self.wal_for(&agent_id).await {
+                a = a.with_wal(wal);
+            }
             if let Some(ref tools) = self.default_tools {
                 a = a.with_tools(tools.as_ref().clone());
             }
@@ -385,6 +428,9 @@ impl cog_core::AgentManager for GlobalAgentManager {
                 .with_message_backend(self.message_backend.clone())
                 .with_state_backend(self.state_backend.clone())
                 .with_heartbeat_interval(self.heartbeat_interval_secs);
+            if let Some(wal) = self.wal_for(&agent_id).await {
+                a = a.with_wal(wal);
+            }
             if let Some(ref tools) = self.default_tools {
                 a = a.with_tools(tools.as_ref().clone());
             }

@@ -325,6 +325,19 @@ impl std::fmt::Debug for RedisWalBackend {
 }
 
 impl RedisWalBackend {
+    /// Build over an already-open connection.
+    ///
+    /// A process keeps one shared Redis manager, so a caller that has already
+    /// opened one hands it here rather than opening a second. Same shape as the
+    /// dead-letter queue and the agent registry, which share the connection the
+    /// plugin opened once.
+    pub fn from_connection(client: redis::aio::ConnectionManager) -> Self {
+        Self {
+            client,
+            max_entries: None,
+        }
+    }
+
     pub async fn new(redis_url: &str) -> Result<Self, WalError> {
         let client =
             redis::Client::open(redis_url).map_err(|e| WalError::Backend(e.to_string()))?;

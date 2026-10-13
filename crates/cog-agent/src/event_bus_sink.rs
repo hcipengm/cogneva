@@ -109,9 +109,11 @@ impl EventBusSink {
     /// 非阻塞投递。缓冲满时丢弃并打 ERROR，并按 `buffer_full` 记一笔读数。
     ///
     /// 丢掉的这一份就是**没有**的那一份：装上投递口之后 `AgentEnd` 不再走
-    /// broadcast，而 agent 侧的 `wal` 与 `raw_logger` 都是 `Option`，生产装配里
-    /// 两者都没接（`Agent::with_wal` 没有生产调用方）⇒ 总线这一份是 `AgentEnd`
-    /// **唯一**的耐久副本，丢了没有第二条路能补回来。
+    /// broadcast，而这一份曾经是它的**唯一**耐久副本——`Agent::with_wal` 当时
+    /// 没有生产调用方。现在 `wal` 接上了：存储插件发布后端，每个 worker 按
+    /// agent_id 各拿一份日志。所以总线这一份**不再是**唯一的那一份；丢掉的仍
+    /// 要补，补的路是回读那条 wal，不是让总线重发。`raw_logger` 那条不保证接
+    /// 上（`Agent` 自己那一个仍可能是 `None`），不能算进「还有一份」里。
     pub fn send(&self, event: cog_core::AgentEvent) {
         if let Err(e) = self.tx.try_send(event) {
             let n = self.drops.buffer_full.fetch_add(1, Ordering::Relaxed) + 1;

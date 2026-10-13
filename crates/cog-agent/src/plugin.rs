@@ -87,6 +87,11 @@ impl cog_core::SystemPlugin for AgentPlugin {
         let plugin_registry_for_eval = plugin_registry.clone();
         let hook_archive = ctx.consume_service::<dyn cog_core::HookArchive>();
         let agent_registry = ctx.require_service::<dyn cog_core::AgentRegistry>()?;
+        // The agent's durable event log. Required, like the checkpoint store
+        // below: a checkpoint taken without a log records `event_offset: 0`, so
+        // a restore replays nothing and the events after the snapshot are gone
+        // -- and that reads exactly like a clean resume.
+        let wal_backend = ctx.require_service::<dyn cog_core::WalBackend>()?;
 
         // ── HookEngine ──
         let redis_backend: Arc<dyn cog_core::MessageBackend> = match shared_message_backend.clone()
@@ -349,6 +354,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
             pool_builder = pool_builder.with_external_skill_registry(esr.clone());
         }
         pool_builder = pool_builder.with_observability(observability);
+        pool_builder = pool_builder.with_wal_backend(wal_backend);
         // 检查点存储：把快照交给 agent 的落盘那一半。缺了它，快照照样返回、
         // 事件照样发、日志照样绿，只有 save 那一步不存在——于是「可续跑的
         // 进度」这个说法在生产里没有任何一份实物，而所有面看起来都装好了。
