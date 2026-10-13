@@ -252,9 +252,9 @@ enum Handover {
     /// The task finished. The tree is about to show it and the next measurement
     /// is what moves the row, so this loop files nothing.
     Completed,
-    /// The task died for a reason that is the work's. The change stayed put, the
-    /// one retry authority has spent its budget, and a second handover here
-    /// would be a second answer to "was this tried enough".
+    /// The task died for a reason that is the work's. This is an answer about
+    /// the change, and handing it over again would be a second attempt at a
+    /// question the graph has already answered.
     DeadWork,
     /// The task died to the environment -- a refusal that says "not this time",
     /// not "not this change". The change is still owed.
@@ -298,10 +298,17 @@ fn classify_handover(task: &Task) -> Handover {
 /// How many generations a change may be handed over under before this loop
 /// leaves it to the graph.
 ///
-/// Not a number chosen here: it is the retry budget the change's own task type
-/// carries ([`crate::dag_executor::RetryMatrix::defaults`]), so an environment
-/// failure costs the change the same number of attempts a work failure would
-/// have. The cap only binds the pathological case -- an upstream reporting
+/// A choice this module makes, sourced rather than invented: the executor
+/// declares a retry budget per task kind, and a handover is re-made up to that
+/// many times ([`crate::dag_executor::RetryMatrix::defaults`]). The executor's
+/// own answer for the failures this re-arms is *none* -- it judges them
+/// terminal, so the budget it applies is zero -- and that difference is the
+/// point: what the graph will not retry, the ledger hands over again.
+///
+/// The number is read from the same defaults the executor builds its own matrix
+/// from, so it is written in one place; a matrix override would move the
+/// executor's budget without moving this bound, and nothing overrides one
+/// today. The cap only binds the pathological case -- an upstream reporting
 /// itself available and then refusing every handover -- and reaching it leaves
 /// the change owed and named in the pass line rather than re-filed forever.
 fn dispatch_rearm_limit() -> u32 {
@@ -968,15 +975,16 @@ fn dispatchable(
 /// The task's id is derived from the change's identity, so a change handed over
 /// once is not handed over again by accident: this loop re-reads the same
 /// outstanding set every period, and the graph's own row is what remembers the
-/// handover. Retrying is a policy with a budget, and the task carries one; the
-/// ledger runs no second retry authority. What the ledger does is read the row
-/// the graph holds rather than only whether it holds one, and act on the one
-/// answer that is not a retry question at all: an attempt that did not happen at
-/// all -- a handover the environment returned -- is not a change that has been
-/// tried, so it is handed over again under the next generation. Which reason is
-/// the environment's is [`classify_handover`]'s answer, and the generation is
-/// bounded by the task type's own retry budget, so this is one authority reading
-/// its own verdict and not a second one.
+/// handover. The ledger runs no retry authority of its own -- it never re-runs a
+/// failed attempt. What it does is read the row the graph holds rather than only
+/// whether it holds one, and act on the one answer that is not a retry question
+/// at all: an attempt that did not happen -- a handover the environment returned
+/// -- is not a change that has been tried, so it is handed over again under the
+/// next generation. Which reason is the environment's is [`classify_handover`]'s
+/// answer, and each re-made handover spends a generation of the budget the task
+/// kind declares ([`dispatch_rearm_limit`]). The executor's own verdict on these
+/// failures is terminal, with no budget applied at all, so this is the ledger
+/// acting where the graph declined to rather than the graph retrying after all.
 ///
 /// A dispatched change's state is not touched. Handing work over is not doing it,
 /// and a row moved because a task was filed would have the ledger reporting a
@@ -1711,9 +1719,10 @@ mod tests {
         assert!(matches!(classify_handover(&in_flight), Handover::InFlight));
     }
 
-    /// The re-arm budget is the task type's own retry budget, not a number this
-    /// module chose: an environment failure must cost the change the same number
-    /// of attempts a work failure would have.
+    /// The re-arm budget is read from the executor's own matrix rather than
+    /// written here: a literal would keep the two in step only until somebody
+    /// changed the declared budget. The executor's *effective* budget for these
+    /// failures is zero, and acting on that difference is what this module is.
     #[test]
     fn the_rearm_budget_is_the_task_types_rearm_budget() {
         assert_eq!(
