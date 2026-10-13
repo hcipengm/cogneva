@@ -23,7 +23,8 @@ pub use circuit_registry::CircuitBreakerRegistry;
 pub use orchestrator::DagExecutor;
 pub use retry_matrix::{BackoffStrategy, CircuitBreakerConfig, RetryConfig, RetryMatrix};
 pub use task_checkpoint::{
-    checkpoint_task, CheckpointAgents, CheckpointRound, LiveCheckpointAgents,
+    checkpoint_task, checkpoint_task_with_timeout, CheckpointAgents, CheckpointRound,
+    LiveCheckpointAgents, CHECKPOINT_STEP_TIMEOUT,
 };
 pub use task_phase::{ExitCriteria, PhaseTransitionRules, PhasedTask, TaskPhase};
 

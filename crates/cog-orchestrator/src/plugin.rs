@@ -531,9 +531,25 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                                     .expect("shared orchestrator");
                                 let cadence =
                                     std::time::Duration::from_secs(checkpoint_interval_secs);
+                                // 单步超时的兜底：整轮（枚举本进程全部在跑任务并
+                                // 逐个落点）的总耗时也必须有界。预算随循环自己注册
+                                // 的节拍推导（留 5s 余量、至少 10s），不是写死的
+                                // 常量；节拍调大，这条判断跟着走。名册再大、下游再
+                                // 慢，控制权也会在节拍内回到循环顶部，beat 不会停。
+                                let round_budget = std::cmp::max(
+                                    cadence.saturating_sub(std::time::Duration::from_secs(5)),
+                                    std::time::Duration::from_secs(10),
+                                );
+                                // 申报 = 推导自施加方：工期界取施加它的对象
+                                // （整轮预算），节拍取循环真正睡眠的等待，所以
+                                // 告警的墙随二者一起动，而不是一个会过时的整数。
+                                let declared = cog_core::loop_health::Cadence::PeriodicWithWork {
+                                    period: cadence,
+                                    work: round_budget,
+                                };
                                 drop(cog_core::loop_health::spawn(
                                     TASK_CHECKPOINT_LOOP,
-                                    cog_core::loop_health::Cadence::Periodic(cadence),
+                                    declared,
                                     checkpoint_shutdown.clone(),
                                     // Rebuilt per attempt, so everything the body consumes is cloned here.
                                     move |beat| {
@@ -558,14 +574,31 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                                                 beat.beat();
                                                 tokio::select! {
                                                     _ = interval.tick() => {
-                                                        let saved = checkpoint_orchestrator
-                                                            .checkpoint_owned_tasks(agents.as_ref())
-                                                            .await;
-                                                        if saved > 0 {
-                                                            tracing::debug!(
-                                                                saved,
-                                                                "task checkpoint producer wrote resume points"
-                                                            );
+                                                        match tokio::time::timeout(
+                                                            round_budget,
+                                                            checkpoint_orchestrator
+                                                                .checkpoint_owned_tasks(
+                                                                    agents.as_ref(),
+                                                                ),
+                                                        )
+                                                        .await
+                                                        {
+                                                            Ok(saved) => {
+                                                                if saved > 0 {
+                                                                    tracing::debug!(
+                                                                        saved,
+                                                                        "task checkpoint producer wrote resume points"
+                                                                    );
+                                                                }
+                                                            }
+                                                            Err(_) => {
+                                                                tracing::warn!(
+                                                                    budget_secs =
+                                                                        round_budget
+                                                                            .as_secs(),
+                                                                    "task checkpoint round exceeded its budget and was cut short; some tasks were not checkpointed this cycle"
+                                                                );
+                                                            }
                                                         }
                                                     }
                                                     _ = checkpoint_shutdown.wait() => break,

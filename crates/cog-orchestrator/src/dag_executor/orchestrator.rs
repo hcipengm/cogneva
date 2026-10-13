@@ -8,7 +8,9 @@ use uuid::Uuid;
 
 use super::circuit_registry::CircuitBreakerRegistry;
 use super::retry_matrix::RetryMatrix;
-use super::task_checkpoint::{self, checkpoint_task, CheckpointAgents, CheckpointRound};
+use super::task_checkpoint::{
+    self, checkpoint_task_with_timeout, CheckpointAgents, CheckpointRound, CHECKPOINT_STEP_TIMEOUT,
+};
 use super::task_phase::PhasedTask;
 use cog_core::{DeadLetterEntry, DeadLetterQueue, RetryAttempt, SuggestedAction};
 
@@ -2518,7 +2520,12 @@ impl DagExecutor {
         };
         let mut saved = 0usize;
         for task_id in self.owned_running_tasks().await {
-            let round = checkpoint_task(&task_id, agents, &state).await;
+            // 每个动作都带上单步等待上限：一个卡死的 agent 快照或存储调用只
+            // 计一次 `failed`，其余 agent/任务照常落检查点，毒不倒整轮。
+            // spawn 处另有随节拍推导、并向存活体系申报的整轮预算兜底。
+            let round =
+                checkpoint_task_with_timeout(&task_id, agents, &state, CHECKPOINT_STEP_TIMEOUT)
+                    .await;
             saved += round.saved;
             self.record_task_checkpoint(&round).await;
         }

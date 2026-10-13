@@ -11,6 +11,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // provider，因此忽略结果，不阻断启动。
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    // 构建标签加 git 修订，唯一标识本进程跑的代码状态：一条只告实例的
+    // 告警（如 background_loop_stalled 按 loop 名、按 pod 各自判定）要能
+    // 对回确切版本。走 stderr 而非 tracing：各命令路径的 subscriber 尚未
+    // 装上，这里打 tracing 多半会被丢，而容器运行时收 stderr；stdout 上
+    // 的 --help/--version/探针输出不变。
+    eprintln!(
+        "cogneva starting: version {} (rev {})",
+        env!("COGNEVA_VERSION_ID"),
+        env!("COGNEVA_GIT_REVISION")
+    );
+
     // 容器入口即 PID 1，孤儿进程只会被落到这里；这是唯一能收集它们的进程
     // （git 为本地远端起的 sh -c git-upload-pack 就是这类孤儿）。子命令无关：
     // 三个常驻模式都以 PID 1 身份跑，非 PID 1 时该函数直接返回。

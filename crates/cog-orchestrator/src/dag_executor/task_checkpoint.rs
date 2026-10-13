@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use cog_core::{AgentManager, CheckpointStore, SFResult, StateBackend};
 
@@ -140,14 +141,51 @@ impl CheckpointAgents for LiveCheckpointAgents {
     }
 }
 
+/// 单个检查点动作（枚举 agent、拍快照、读写板、回收旧点）的等待上限。
+///
+/// 它必须是个**有界**值，不能无限等：产出侧每一步 await 的都是别的进程
+/// （agent）或存储；任一个挂死（挂死的 RPC、锁竞争、存储 I/O）时，无限等
+/// 会让整个迭代回不到循环顶部、心跳戳停更——表现就是
+/// `background_loop_stalled`。超时走既有结局计数（快照类记 `failed`，回收
+/// 旧点记 `unsuperseded`），下一轮重试，单个 agent 再卡也毒不倒整条链。
+///
+/// 它同时是循环向存活体系申报工期界的原料（见
+/// [`cog_core::loop_health::Cadence::PeriodicWithWork`]）：申报的工期界由真正
+/// 施加该界的对象推导，而不是挑一个能让规则闭嘴的整数，所以调整这里的超时
+/// 会带着告警的墙一起动。
+pub const CHECKPOINT_STEP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// 给一次检查点动作套上等待上限：超时落成 `cog_core::SFError::Timeout`，
+/// 走调用点既有的错误分支（计 `failed` 并继续），而不是把 await 挂到永远。
+async fn bounded<T>(
+    step_timeout: Duration,
+    fut: impl std::future::Future<Output = SFResult<T>>,
+) -> SFResult<T> {
+    match tokio::time::timeout(step_timeout, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(cog_core::SFError::Timeout),
+    }
+}
+
 /// 为一个任务名下的每个 agent 落检查点，并把可恢复的那些指针挂到任务的板上。
 pub async fn checkpoint_task(
     task_id: &str,
     agents: &dyn CheckpointAgents,
     state: &Arc<dyn StateBackend>,
 ) -> CheckpointRound {
+    checkpoint_task_with_timeout(task_id, agents, state, CHECKPOINT_STEP_TIMEOUT).await
+}
+
+/// 同 [`checkpoint_task`]，但每个动作的等待上限由调用方给定（生产走
+/// [`CHECKPOINT_STEP_TIMEOUT`]，测试用短超时证明挂死会被切断）。
+pub async fn checkpoint_task_with_timeout(
+    task_id: &str,
+    agents: &dyn CheckpointAgents,
+    state: &Arc<dyn StateBackend>,
+    step_timeout: Duration,
+) -> CheckpointRound {
     let mut round = CheckpointRound::default();
-    let roster = match agents.agents_of(task_id).await {
+    let roster = match bounded(step_timeout, agents.agents_of(task_id)).await {
         Ok(roster) => roster,
         Err(e) => {
             tracing::warn!(task = task_id, error = %e, "cannot enumerate the agents of a running task");
@@ -158,7 +196,7 @@ pub async fn checkpoint_task(
     // 板读一次给整轮用：上一份指针在写新的之前读，才知道该替掉哪一份。读不到
     // 只影响「旧的那份能不能回收」，不影响本轮该写的指针照写——续跑是主功能，
     // 容量是附带条件，不能因为后者读不到就把前者停掉。
-    let previous = match state.get_board(task_id).await {
+    let previous = match bounded(step_timeout, state.get_board(task_id)).await {
         Ok(Some(board)) => board.fields,
         Ok(None) => Default::default(),
         Err(e) => {
@@ -169,7 +207,7 @@ pub async fn checkpoint_task(
 
     for (agent_id, role) in roster {
         round.agents += 1;
-        let checkpoint_id = match agents.snapshot(task_id, &agent_id).await {
+        let checkpoint_id = match bounded(step_timeout, agents.snapshot(task_id, &agent_id)).await {
             Ok(id) => id,
             Err(e) => {
                 round.failed += 1;
@@ -182,13 +220,15 @@ pub async fn checkpoint_task(
                 continue;
             }
         };
-        match agents.persisted(&checkpoint_id).await {
+        match bounded(step_timeout, agents.persisted(&checkpoint_id)).await {
             // 指针只在续跑点真的存在时写：写下一条指不到东西的路标，恢复端
             // 只会把它读成「没有续跑点」，而产出侧的读数会说是「写了」。
             Ok(true) => {
-                match state
-                    .set_board_field(task_id, &checkpoint_field(&role), &checkpoint_id)
-                    .await
+                match bounded(
+                    step_timeout,
+                    state.set_board_field(task_id, &checkpoint_field(&role), &checkpoint_id),
+                )
+                .await
                 {
                     Ok(()) => {
                         round.saved += 1;
@@ -199,7 +239,7 @@ pub async fn checkpoint_task(
                             // 顺序不能反：先写指针再删旧的。反过来，删成功而写
                             // 失败就成了「续跑点没了」；这个顺序最坏也只是多留
                             // 一份没人指的实物。
-                            match agents.forget(old).await {
+                            match bounded(step_timeout, agents.forget(old)).await {
                                 Ok(()) => round.superseded += 1,
                                 Err(e) => {
                                     round.unsuperseded += 1;
@@ -701,6 +741,57 @@ mod tests {
         let fields = board.fields.lock().unwrap();
         assert!(!fields.contains_key(&("t-1".into(), "checkpoint:planner".into())));
         assert!(fields.contains_key(&("t-1".into(), "checkpoint:evaluator".into())));
+    }
+
+    /// 一个永远不返回的 agent 调用也不能把检查点迭代挂死：每步有超时，
+    /// 超时计入 `failed`，迭代照常返回——这正是 `background_loop_stalled`
+    /// 当初的形状（一个卡住的调用让循环回不到顶部）。
+    #[tokio::test]
+    async fn a_hung_agent_call_is_bounded_and_counted_as_failed() {
+        struct HungAgents {
+            roster: Vec<(String, String)>,
+        }
+
+        #[async_trait::async_trait]
+        impl CheckpointAgents for HungAgents {
+            async fn agents_of(&self, _task_id: &str) -> SFResult<Vec<(String, String)>> {
+                Ok(self.roster.clone())
+            }
+            async fn snapshot(&self, _task_id: &str, _agent_id: &str) -> SFResult<String> {
+                std::future::pending().await
+            }
+            async fn persisted(&self, _checkpoint_id: &str) -> SFResult<bool> {
+                std::future::pending().await
+            }
+            async fn forget(&self, _checkpoint_id: &str) -> SFResult<()> {
+                std::future::pending().await
+            }
+        }
+
+        let (_, state) = board();
+        let agents = HungAgents {
+            roster: vec![
+                ("squad:t-1-planner".to_string(), "planner".to_string()),
+                ("squad:t-1-evaluator".to_string(), "evaluator".to_string()),
+            ],
+        };
+        let started = std::time::Instant::now();
+
+        let round = checkpoint_task_with_timeout(
+            "t-1",
+            &agents,
+            &state,
+            std::time::Duration::from_millis(20),
+        )
+        .await;
+
+        assert_eq!(round.agents, 2, "both agents were attempted");
+        assert_eq!(round.failed, 2, "each hung call is bounded and counted");
+        assert_eq!(round.saved, 0);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "a hung agent used to block the whole iteration indefinitely"
+        );
     }
 
     /// 写得进、读不出的板：只用来把「板读失败」这条路走通。

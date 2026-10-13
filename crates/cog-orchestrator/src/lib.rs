@@ -13,9 +13,9 @@ pub mod task_executor_router;
 pub use action_planner::ActionPlanOrchestrator;
 pub use dag_executor::task_phase::{ExitCriteria, PhaseTransitionRules, PhasedTask, TaskPhase};
 pub use dag_executor::{
-    BackoffStrategy, CheckpointAgents, CheckpointRound, CircuitBreakerConfig,
-    CircuitBreakerRegistry, DagExecutor, DagExecutorConfig, DagExecutorRuntime,
-    LiveCheckpointAgents, RetryConfig, RetryMatrix,
+    checkpoint_task_with_timeout, BackoffStrategy, CheckpointAgents, CheckpointRound,
+    CircuitBreakerConfig, CircuitBreakerRegistry, DagExecutor, DagExecutorConfig,
+    DagExecutorRuntime, LiveCheckpointAgents, RetryConfig, RetryMatrix, CHECKPOINT_STEP_TIMEOUT,
 };
 pub use observable::OrchestratorObservable;
 pub use orchestrator_control_impl::OrchestratorControlImpl;
