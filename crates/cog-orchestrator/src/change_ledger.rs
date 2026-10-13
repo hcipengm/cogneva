@@ -11,13 +11,15 @@
 //! a process whose storage holds no shared database never reaches this point, so
 //! it never becomes a candidate.
 //!
-//! Four things happen here, and the third is the only one that moves a row. The
-//! loop folds the intake into the account -- declarations queued by other parties
-//! become readings, through the same reading path a direct write would use -- it
-//! reads the outstanding set back out, saying plainly when a read failed, and it
-//! measures that set against the tree, through the one call that may move a
-//! state. The fold is mechanical: it carries what a document asked for and adds
-//! nothing of its own, so this loop cannot make a change look done by folding.
+//! Five things happen here, and the measuring is the only one that moves a row.
+//! The loop folds the intake into the account -- declarations queued by other
+//! parties become readings, through the same reading path a direct write would
+//! use -- it reads the tree's own debt registries into the account the same way,
+//! it reads the outstanding set back out, saying plainly when a read failed, and
+//! it measures that set against the tree, through the one call that may move a
+//! state. Both intakes are mechanical: they carry what a document or a registry
+//! asked for and add nothing of their own, so this loop cannot make a change look
+//! done by reading anything into it.
 //!
 //! The fourth thing is what makes the ledger a driver rather than a record: the
 //! rows a measurement found `pending` are handed to the goal path, one task
@@ -32,6 +34,18 @@
 //! reading rather than a silence. Not being able to tell is not final either:
 //! such a row is asked again after [`UNMEASURABLE_RETRY`], because why it could
 //! not be settled is a property of a tree that moves.
+//!
+//! The second reading source is the project's own debt registries: two files in
+//! the tree listing dependencies that are owed removal and core modules that are
+//! owed a move. They are readings and not a second account -- every row they name
+//! enters through the same call a declaration does, and only a measurement of the
+//! tree can move it. What makes them a source rather than a table is where the
+//! news comes from and how a row is retired: nothing queues these, the loop reads
+//! them out of the tree it is already measuring against, and a row stops being
+//! owed when the tree stops carrying what it asked for -- not when the registry
+//! stops listing it. A registry nobody edited would otherwise be able to close an
+//! account by deleting its own line, which is the self-reported completion this
+//! whole loop is built to refuse.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -40,11 +54,15 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use cog_core::{
-    ChangeIdentity, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement, ChangeState,
-    OrchestratorControl, OwnerLeaseBroker, ShutdownSignal, Task, TaskType,
+    ChangeIdentity, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement, ChangeReading,
+    ChangeSource, ChangeState, OrchestratorControl, OwnerLeaseBroker, ShutdownSignal, Task,
+    TaskType,
 };
 
-use crate::change_measure::{CheckTree, UnsettledReason};
+use crate::change_measure::{
+    CheckTree, UnsettledReason, DEPENDENCY_EDGE_KIND, DEV_DEPENDENCY_EDGE_KIND,
+    MODULE_RELOCATION_KIND,
+};
 
 /// This loop's name in the process liveness registry, and the value of
 /// `cogneva_loop_tick_age_seconds{loop=...}`.
@@ -131,6 +149,36 @@ const DISPATCH_TASK_PREFIX: &str = "change-ledger-";
 /// not handed to a generic worker, it is handed to the change-generation path,
 /// and the kind is what that path is looked up by.
 const DISPATCH_TASK_KIND: &str = "change_ledger";
+
+/// The dependency registry, relative to the repository root.
+///
+/// One of the two reading sources this loop reads out of the tree. The file is
+/// the same one the dependency contract test reads its own table from, so a row
+/// registered there is a row that reaches the account, and the two readers cannot
+/// drift apart: a running binary cannot read a test's constant, so the registry
+/// lives in the tree and both take it from there.
+const DEBT_EDGE_FILE: &str = "crates/cogneva/debt/dependency-edges.tsv";
+
+/// The module registry, relative to the repository root.
+///
+/// The other reading source, the same file the core boundary contract test reads:
+/// one row per module of the core's source root, with the reason it is a contract
+/// and -- when a move is owed -- where it is going.
+const DEBT_MODULE_FILE: &str = "crates/cogneva/debt/core-modules.tsv";
+
+/// The `reason` a module row carries when it is owed a move.
+///
+/// Read here so that a registry which grew a destination under any other reason
+/// names nothing to work on, rather than putting a move in the account that
+/// nobody registered.
+const RELOCATION_REASON: &str = "pending-relocation";
+
+/// The core's own module list, relative to the repository root.
+///
+/// Where a module's move is measured: a module owed a move out of the core is
+/// gone when this file stops declaring it, which is a fact about the tree and not
+/// about the registry row.
+const CORE_MODULE_LIST: &str = "crates/cog-core/src/lib.rs";
 
 /// The task id a change is dispatched under.
 ///
@@ -247,6 +295,11 @@ pub fn spawn_change_ledger_loop(
                         continue;
                     }
                     read_pass(&*store).await;
+                    // The tree's own registries are the second intake, and they
+                    // go in after the fold and before the measurement for the
+                    // reason [`registry_pass`] gives: a row read this pass is
+                    // judged by this pass.
+                    registry_pass(&tree, &*store).await;
                     measure_pass(&*store, &tree, &mut unsettled).await;
                     // Handing over comes last, and that order is the point: the
                     // set dispatched is then the set as of this pass, so a change
@@ -312,6 +365,211 @@ async fn fold_pass(store: &dyn ChangeLedgerStore) {
         ),
         Err(e) => warn!(error = %e, "change ledger: could not read the intake backlog"),
     }
+}
+
+/// Read the tree's own debt registries into the account.
+///
+/// The second intake, beside the queued declarations, and run after the fold so
+/// that a row named by both a document and a registry is one row either way: both
+/// doors lead to the same reading path, which is an idempotent upsert keyed by
+/// the identity.
+///
+/// Run before the measurement rather than after it, so a row read for the first
+/// time in a pass is judged in that same pass: the registry is read at the
+/// revision the pass measures, and a row read after the measurement would wait a
+/// whole period for its first look. The hand-over that follows the measurement
+/// reads the account, so it would not see such a row either.
+///
+/// Nothing here is raised: a pass is a maintenance tick and the next tick is the
+/// retry, which is the rule the fold and the read follow too. A registry that
+/// could not be read is not recorded as an empty one -- the account keeps the
+/// rows it already holds and the warning says this pass contributed none, so "no
+/// debt" and "no registry read" stay apart.
+async fn registry_pass(tree: &CheckTree, store: &dyn ChangeLedgerStore) {
+    let readings = match registry_readings(tree).await {
+        Ok(readings) => readings,
+        Err(why) => {
+            warn!(
+                why = %why,
+                "change ledger: the tree's own debt registries could not be read, so this pass \
+                 contributed no readings from them"
+            );
+            return;
+        }
+    };
+    match store.record_readings(&readings).await {
+        Ok(_) => info!(
+            readings = readings.len(),
+            "change ledger: read the tree's own debt registries into the account"
+        ),
+        // The account keeps what it has: this pass added nothing, and the next is
+        // the retry. Said with the count it was carrying so a reader can tell a
+        // rejection from a registry that was empty.
+        Err(e) => warn!(
+            error = %e,
+            readings = readings.len(),
+            "change ledger: the tree's own debt registries could not be written into the account"
+        ),
+    }
+}
+
+/// What the tree's own debt registries ask for, as readings.
+///
+/// The registries are read at their own snapshot rather than one carried in from
+/// the measuring pass. A reading carries no state and moves nothing: it says what
+/// a row is about and is measured a moment later by the same pass, so a revision
+/// that moved in between would only put a row in the account a few seconds early
+/// for a tree that has since changed -- where sharing the measurement's snapshot
+/// would mean threading one pass's revision through an intake that a caller other
+/// than the loop could not supply.
+async fn registry_readings(tree: &CheckTree) -> Result<Vec<ChangeReading>, String> {
+    let snapshot = tree
+        .snapshot()
+        .await
+        .map_err(|why| format!("the platform's own tree could not be resolved: {why}"))?;
+    let rev = snapshot.rev();
+    let edges = tree
+        .matching_lines(rev, DEBT_EDGE_FILE, ".")
+        .await
+        .map_err(|why| {
+            format!("the dependency registry {DEBT_EDGE_FILE} could not be read at {rev}: {why}")
+        })?;
+    let modules = tree
+        .matching_lines(rev, DEBT_MODULE_FILE, ".")
+        .await
+        .map_err(|why| {
+            format!("the module registry {DEBT_MODULE_FILE} could not be read at {rev}: {why}")
+        })?;
+    let mut readings = edge_readings(&edges);
+    readings.extend(module_readings(&modules));
+    Ok(readings)
+}
+
+/// Where a crate's manifest is, relative to the repository root.
+///
+/// A dependency is declared in its consumer's manifest, so that file is the scope
+/// the debt is measured under -- and the literal searched for in it is the
+/// dependency's own assignment.
+fn manifest_of(consumer: &str) -> String {
+    format!("crates/{consumer}/Cargo.toml")
+}
+
+/// What an edge row asks for, in the words the goal path is handed.
+///
+/// The row's own two ends and the contract it should go through instead. The
+/// point of handing a registered debt over, rather than an ungated principle, is
+/// that it can say what to build and not only where to look.
+fn edge_goal(consumer: &str, dep: &str, contract: &str, dev: bool) -> String {
+    if contract.is_empty() {
+        return format!("Remove the {consumer} -> {dep} dependency by routing it through the core's contract layer.");
+    }
+    let when = if dev { "in its tests " } else { "" };
+    format!("Make {consumer} reach {dep} through the core contract {contract} {when}instead of depending on it directly.")
+}
+
+/// What a module row asks for, in the words the goal path is handed.
+///
+/// The module and the crate it is going to, and -- for a module that keeps state
+/// as well as defining a contract -- the shape of the move, so the generator is
+/// told the module leaves in halves rather than whole.
+fn module_goal(module: &str, destination: &str, split: bool) -> String {
+    let shape = if split {
+        " The module is a contract and a mechanism in one file: the half that keeps state moves, and the contract half stays in the core's contract layer."
+    } else {
+        ""
+    };
+    format!("Move the core module `{module}` out of cog-core's source root into the `{destination}` crate.{shape}")
+}
+
+/// The edge rows the dependency registry carries, as readings.
+///
+/// One row per line, tab-separated `kind consumer dep contract`, exactly as the
+/// contract test reads it: a `#`-led line and the `kind consumer dep contract`
+/// header carry no work, and a kind outside the two edge kinds is not a row this
+/// intake knows how to aim.
+///
+/// The literal is the dependency's own assignment and not its bare name. A
+/// manifest documents itself where the dependency is declared -- a comment naming
+/// the crate a few lines above it is ordinary writing -- and a bare name matches
+/// that comment too, which would keep a dependency that is already gone reading
+/// as owed for good. The trailing `=` also keeps a shorter name from matching a
+/// longer one that merely begins with it.
+fn edge_readings(lines: &[(String, String)]) -> Vec<ChangeReading> {
+    let mut readings = Vec::new();
+    for (_path, text) in lines {
+        let text = text.trim();
+        if text.is_empty() || text.starts_with('#') {
+            continue;
+        }
+        let mut field = text.split('\t');
+        let (kind, dev) = match field.next() {
+            Some("allowed") => (DEPENDENCY_EDGE_KIND, false),
+            Some("allowed_dev") => (DEV_DEPENDENCY_EDGE_KIND, true),
+            _ => continue,
+        };
+        let (Some(consumer), Some(dep)) = (field.next(), field.next()) else {
+            continue;
+        };
+        let contract = field.next().unwrap_or("").trim();
+        readings.push(ChangeReading {
+            identity: ChangeIdentity::new(kind, manifest_of(consumer), format!("{dep} =")),
+            title: Some(edge_goal(consumer, dep, contract, dev)),
+            assertion: None,
+            source: ChangeSource {
+                doc: DEBT_EDGE_FILE.to_string(),
+                verdict: None,
+            },
+        });
+    }
+    readings
+}
+
+/// The module rows the module registry carries, as readings.
+///
+/// One row per line, tab-separated `module reason destination`, exactly as the
+/// core boundary contract test reads it. Only a module the registry marks as
+/// awaiting relocation *and* gives a destination is a row this intake can aim: a
+/// module owed a move with no destination has no endpoint to name, so it stays
+/// out of the account rather than entering it as work nobody registered.
+///
+/// The destination is `crate shape`, and the shape -- `direct` or `split` --
+/// rides into the goal so a split module is described as leaving in halves.
+fn module_readings(lines: &[(String, String)]) -> Vec<ChangeReading> {
+    let mut readings = Vec::new();
+    for (_path, text) in lines {
+        let text = text.trim();
+        if text.is_empty() || text.starts_with('#') {
+            continue;
+        }
+        let mut field = text.split('\t');
+        let (Some(module), Some(reason)) = (field.next(), field.next()) else {
+            continue;
+        };
+        if module == "module" || reason != RELOCATION_REASON {
+            continue;
+        }
+        let Some(destination) = field.next().map(str::trim) else {
+            continue;
+        };
+        let mut parts = destination.split_whitespace();
+        let (Some(crate_name), Some(shape)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        readings.push(ChangeReading {
+            identity: ChangeIdentity::new(
+                MODULE_RELOCATION_KIND,
+                CORE_MODULE_LIST,
+                format!("mod {module};"),
+            ),
+            title: Some(module_goal(module, crate_name, shape == "split")),
+            assertion: None,
+            source: ChangeSource {
+                doc: DEBT_MODULE_FILE.to_string(),
+                verdict: None,
+            },
+        });
+    }
+    readings
 }
 
 /// Measure the outstanding set against the tree, and record what each row came
@@ -980,5 +1238,131 @@ mod tests {
         // And with nothing unanswered, the pending row comes back: the exclusion
         // is the pass's own finding and not a property of the state.
         assert_eq!(dispatchable(&rows, &HashMap::new()).len(), 2);
+    }
+
+    /// The identity a registered dependency becomes: the consumer's manifest as
+    /// the scope, and the dependency's own assignment as the literal.
+    ///
+    /// Both halves are the mapping and not a preference. The scope has to be the
+    /// file the dependency is declared in, or the check would search the crate
+    /// rather than its manifest; and the literal has to be the assignment, or a
+    /// comment that merely names the crate would keep a removed dependency owed
+    /// for good.
+    #[test]
+    fn a_registered_dependency_becomes_a_check_against_its_consumers_manifest() {
+        let rows = edge_readings(&[(
+            "crates/cogneva/debt/dependency-edges.tsv".to_string(),
+            "allowed\tcog-gateway\tcog-llm\tcontract::llm::LlmClient".to_string(),
+        )]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].identity.kind, DEPENDENCY_EDGE_KIND);
+        assert_eq!(rows[0].identity.scope, "crates/cog-gateway/Cargo.toml");
+        assert_eq!(rows[0].identity.literal, "cog-llm =");
+        assert_eq!(rows[0].source.doc, DEBT_EDGE_FILE);
+        assert_eq!(rows[0].source.verdict, None);
+    }
+
+    /// A test-time edge is a kind of its own, so the census can tell the two
+    /// apart, and the goal says the reach is from the tests rather than from the
+    /// crate.
+    #[test]
+    fn a_test_time_edge_is_a_kind_of_its_own() {
+        let rows = edge_readings(&[(
+            "registry".to_string(),
+            "allowed_dev\tcog-gateway\tcog-llm\tcontract::llm::LlmClient".to_string(),
+        )]);
+        assert_eq!(rows[0].identity.kind, DEV_DEPENDENCY_EDGE_KIND);
+        assert_eq!(rows[0].identity.scope, "crates/cog-gateway/Cargo.toml");
+        assert_eq!(
+            rows[0].title.as_deref(),
+            Some(
+                "Make cog-gateway reach cog-llm through the core contract \
+                 contract::llm::LlmClient in its tests instead of depending on it directly."
+            )
+        );
+    }
+
+    /// Lines that carry no work -- the header and a `#` comment -- and a kind
+    /// this intake cannot aim are skipped, rather than entering the account as a
+    /// row nothing measures. A row naming no contract still enters: the edge is
+    /// owed either way, and what carries it instead is what the goal then cannot
+    /// say.
+    #[test]
+    fn only_registered_edge_rows_become_readings() {
+        let rows = edge_readings(&[
+            (
+                "registry".to_string(),
+                "kind\tconsumer\tdep\tcontract".to_string(),
+            ),
+            (
+                "registry".to_string(),
+                "# allowed\tcog-y\tcog-z\tcontract::z".to_string(),
+            ),
+            (
+                "registry".to_string(),
+                "something\tcog-y\tcog-z\t".to_string(),
+            ),
+            (
+                "registry".to_string(),
+                "allowed\tcog-short\tcog-y".to_string(),
+            ),
+            (
+                "registry".to_string(),
+                "allowed\tcog-x\tcog-y\t".to_string(),
+            ),
+        ]);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].identity.scope, "crates/cog-short/Cargo.toml");
+        // A row whose contract column is empty -- whether the field is absent or
+        // blank -- still names an edge that is owed.
+        assert_eq!(rows[1].identity.scope, "crates/cog-x/Cargo.toml");
+        assert_eq!(
+            rows[1].title.as_deref(),
+            Some(
+                "Remove the cog-x -> cog-y dependency by routing it through the core's \
+                 contract layer."
+            )
+        );
+    }
+
+    /// A module is measured against the core's own module list and named the way
+    /// that file declares it, so the row still owed is the one whose declaration
+    /// is still there.
+    #[test]
+    fn a_registered_relocation_becomes_a_check_against_the_cores_module_list() {
+        let rows = module_readings(&[
+            (
+                "registry".to_string(),
+                "module\treason\tdestination".to_string(),
+            ),
+            (
+                "registry".to_string(),
+                "admission\tpending-relocation\tcog-eval split".to_string(),
+            ),
+            (
+                "registry".to_string(),
+                "audit\tshared-definition\t".to_string(),
+            ),
+            (
+                "registry".to_string(),
+                "build_gate\tpending-relocation\tcog-orchestrator".to_string(),
+            ),
+        ]);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].identity.kind, MODULE_RELOCATION_KIND);
+        assert_eq!(rows[0].identity.scope, CORE_MODULE_LIST);
+        assert_eq!(rows[0].identity.literal, "mod admission;");
+        assert_eq!(rows[0].source.doc, DEBT_MODULE_FILE);
+        // The shape rides into the goal, so a module that leaves in halves is
+        // described that way rather than as a file that moves whole.
+        assert_eq!(
+            rows[0].title.as_deref(),
+            Some(
+                "Move the core module `admission` out of cog-core's source root into the \
+                 `cog-eval` crate. The module is a contract and a mechanism in one file: \
+                 the half that keeps state moves, and the contract half stays in the \
+                 core's contract layer."
+            )
+        );
     }
 }

@@ -58,6 +58,38 @@ pub const TREE_REPO_ENV: &str = "COGNEVA_CHANGE_LEDGER_TREE_REPO";
 /// Environment key naming the revision checks are measured against.
 pub const TREE_REF_ENV: &str = "COGNEVA_CHANGE_LEDGER_TREE_REF";
 
+/// The kinds whose check is a demand that something be gone.
+///
+/// Three names and one predicate: what each of them asks for is the absence of
+/// an artifact, so all three are judged by the same mirror of `grep` (see
+/// [`CheckTree::judge_absence`]). They are kept as three kinds rather than merged
+/// into one because the work behind them is different -- a production
+/// dependency, a test-time one, and a core module owed a move -- and a census
+/// that merged them could not say which of the three stopped moving.
+///
+/// The names are the reading's. The project's own debt registries carry them as
+/// a column, so a kind renamed there is a kind renamed here, and rows already in
+/// the account under the old name would be a second population nothing measures.
+pub const DEPENDENCY_EDGE_KIND: &str = "dependency_edge";
+
+/// The test-time edge of the pair above: a dependency reachable from a crate's
+/// tests rather than from the crate itself.
+pub const DEV_DEPENDENCY_EDGE_KIND: &str = "dev_dependency_edge";
+
+/// A module of the core's source root owed a move out of it.
+pub const MODULE_RELOCATION_KIND: &str = "module_relocation";
+
+/// The three absence kinds, for a reader that has to enumerate them.
+///
+/// Built from the three above rather than written out again: a list that
+/// repeated the names would be a second place to change one and a way for the
+/// judge to stop covering a kind the registries still carry.
+pub const ABSENCE_KINDS: [&str; 3] = [
+    DEPENDENCY_EDGE_KIND,
+    DEV_DEPENDENCY_EDGE_KIND,
+    MODULE_RELOCATION_KIND,
+];
+
 /// The tree this deployment measures against.
 ///
 /// Read from the environment rather than from the configuration document because
@@ -120,11 +152,18 @@ impl UnsettledReason {
 }
 
 /// What one look at the tree found.
+///
+/// Named for the *change* rather than for the artifact, because both are read
+/// here and they answer in opposite directions: an ordinary check asks that
+/// something be there, and a debt check asks that something be gone. `Landed` is
+/// the state the caller moves a row to; the two variants below are the two
+/// answers that move one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckOutcome {
-    /// The tree holds the artifact the check names.
+    /// The tree satisfies what the check asks for: it holds the artifact, or --
+    /// for a check written as a demand that something be gone -- it is gone.
     Landed,
-    /// The check ran, and the tree does not hold it.
+    /// The check ran, and the tree does not satisfy it. The mirror of `Landed`.
     Absent,
     /// The check could not be run, or running it cannot settle the question.
     Unsettled {
@@ -289,6 +328,13 @@ impl CheckTree {
         match identity.kind.as_str() {
             "grep" => self.judge_grep(snapshot, scope, &identity.literal).await,
             "exists" => self.judge_exists(snapshot, scope).await,
+            // The mirror of the two above. These are named by the reading and
+            // not written by hand, so -- unlike `absent`/`missing` below -- the
+            // direction is not in doubt: each of them asks that the artifact be
+            // gone, which is what the registry row itself stops saying once it is.
+            kind if ABSENCE_KINDS.contains(&kind) => {
+                self.judge_absence(snapshot, scope, &identity.literal).await
+            }
             // Both of these name a literal's absence, and both are written by
             // hand to mean two opposite things: the demand that it be gone, and
             // the evidence that a search came back empty. The identity holds the
@@ -374,6 +420,93 @@ impl CheckTree {
         match self.holds(snapshot.rev(), scope, literal).await {
             Ok(true) => CheckOutcome::Landed,
             Ok(false) => CheckOutcome::Absent,
+            Err(why) => CheckOutcome::unsettled(UnsettledReason::GitFailed, why),
+        }
+    }
+
+    /// The predicate for a check written as a demand that something be gone.
+    ///
+    /// The same two questions [`Self::judge_exists`] and [`Self::judge_grep`] ask
+    /// -- is this path here, does this path hold this literal -- with the answer
+    /// read the other way round. That inversion is the whole of the predicate, and
+    /// it is the reason these kinds need an arm of their own: an absence check
+    /// measured by the ordinary one would read as landed the moment the artifact
+    /// appeared and as outstanding forever once it was removed -- the exact
+    /// backwards of what it asks.
+    ///
+    /// The two unsettled cases are kept, and neither is written as an `Absent` on
+    /// the way to being flipped. A scope this tree cannot hold is not an artifact
+    /// that is gone: read as one, a single mistyped path would close an account
+    /// nobody paid, silently, which is what [`Snapshot::could_hold`] is for. And a
+    /// literal carrying the separator a finding is split on names no fragment of
+    /// this tree, so searching for it would answer "gone" for text that was never
+    /// a spelling of anything.
+    ///
+    /// An empty literal degrades to the path itself: the check then reads "this
+    /// file must not be here", the inverse of `exists`. That is the whole reason
+    /// the two cases are branches rather than one: with nothing to search for,
+    /// the scope is the artifact.
+    async fn judge_absence(&self, snapshot: &Snapshot, scope: &str, literal: &str) -> CheckOutcome {
+        if literal.is_empty() {
+            // The whole tree cannot be gone, so a check naming no path and no
+            // literal asks for nothing this tree could ever satisfy.
+            if scope.is_empty() || scope == "." {
+                return CheckOutcome::unsettled(
+                    UnsettledReason::KindWithoutPredicate,
+                    "a check asking for something to be gone names neither a path nor a literal",
+                );
+            }
+            if !snapshot.could_hold(scope) {
+                return CheckOutcome::unsettled(
+                    UnsettledReason::ScopeOutsideTree,
+                    format!("`{scope}` is not a path this tree can hold"),
+                );
+            }
+            // `Ok(true)` is the path being there, which for this check is the
+            // change *not* done. The inversion is stated here rather than left to
+            // a reader of the outcome's name, because the name is the other way
+            // round.
+            return match self.has(snapshot.rev(), scope).await {
+                Ok(true) => CheckOutcome::Absent,
+                Ok(false) => CheckOutcome::Landed,
+                Err(why) => CheckOutcome::unsettled(UnsettledReason::GitFailed, why),
+            };
+        }
+        if predicate_is_a_rendering(literal) {
+            return CheckOutcome::unsettled(
+                UnsettledReason::PredicateIsARendering,
+                format!(
+                    "`{literal}` is a finding written out rather than a fragment of this \
+                     tree: it carries the separator a finding is split on"
+                ),
+            );
+        }
+        let scoped = !scope.is_empty() && scope != ".";
+        if scoped && !snapshot.could_hold(scope) {
+            return CheckOutcome::unsettled(
+                UnsettledReason::ScopeOutsideTree,
+                format!("`{scope}` is not a path this tree can hold"),
+            );
+        }
+        // A scope that is not in the tree leaves the question unasked: the search
+        // never happened, and an empty search cannot be told from the artifact
+        // having been found and removed. Reading it as gone would let a drifted
+        // path pay a debt off.
+        if scoped {
+            match self.has(snapshot.rev(), scope).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return CheckOutcome::unsettled(
+                        UnsettledReason::ScopeOutsideTree,
+                        format!("this revision has no `{scope}`, so the check cannot be run"),
+                    )
+                }
+                Err(why) => return CheckOutcome::unsettled(UnsettledReason::GitFailed, why),
+            }
+        }
+        match self.holds(snapshot.rev(), scope, literal).await {
+            Ok(true) => CheckOutcome::Absent,
+            Ok(false) => CheckOutcome::Landed,
             Err(why) => CheckOutcome::unsettled(UnsettledReason::GitFailed, why),
         }
     }
@@ -910,5 +1043,219 @@ mod tests {
             Some(("abcdef.rs".to_string(), "text".to_string()))
         );
         assert_eq!(parse_grep_line("abcdef.rs::text", rev), None);
+    }
+
+    /// A repository holding exactly these files, at one commit on `main`.
+    ///
+    /// The repository it returns is a *bare* one, under `<dir>/bare`, because
+    /// that is what a deployment mounts: the tree a running process measures is a
+    /// git directory with no worktree beside it. The files are written into a
+    /// scratch worktree and committed through that, which is how the same content
+    /// would reach the real one.
+    ///
+    /// A real repository and not a stub, because what these tests ask -- whether
+    /// a fixed string occurs in a file, and whether the line it occurs on is the
+    /// dependency or a comment about it -- is answered by git. A stub would
+    /// answer whatever the test had already assumed, which is nothing.
+    ///
+    /// The caller keeps the returned directory alive; [`CheckTree`] is built from
+    /// `dir.path().join("bare")`.
+    fn repo(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let bare = dir.path().join("bare");
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).expect("the scratch worktree");
+        let bare = bare.to_str().expect("a path this host can spell");
+        let work = work.to_str().expect("a path this host can spell");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .output()
+                .expect("git on the test host");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "--bare", "-b", "main", bare]);
+        for (relative, text) in files {
+            let path = std::path::Path::new(work).join(relative);
+            std::fs::create_dir_all(path.parent().expect("a file has a parent"))
+                .expect("the directories the file goes in");
+            std::fs::write(&path, text).expect("the fixture file");
+        }
+        git(&[
+            "--git-dir",
+            bare,
+            "config",
+            "user.email",
+            "tree@cogneva.invalid",
+        ]);
+        git(&["--git-dir", bare, "config", "user.name", "tree"]);
+        git(&["--git-dir", bare, "--work-tree", work, "add", "--all"]);
+        git(&[
+            "--git-dir",
+            bare,
+            "--work-tree",
+            work,
+            "commit",
+            "-q",
+            "-m",
+            "fixture",
+        ]);
+        dir
+    }
+
+    /// The one revision every check in a fixture test is judged against.
+    async fn fixture_snapshot(tree: &CheckTree) -> Snapshot {
+        tree.snapshot()
+            .await
+            .expect("the fixture repository is readable")
+    }
+
+    /// The literal of a debt check is the dependency's own assignment, not its
+    /// name.
+    ///
+    /// A manifest that mentions a crate in a comment -- which the project's own
+    /// gateway does, a few lines above the dependency it is about -- would
+    /// otherwise keep a paid dependency reading as owed forever. What a
+    /// dependency declaration is, is the assignment; a comment is not one.
+    #[tokio::test]
+    async fn a_dependency_left_only_in_a_comment_is_a_dependency_that_is_gone() {
+        let dir = repo(&[(
+            "crates/cog-gateway/Cargo.toml",
+            "# the gateway serves cog-llm's table from its own copy\n[dependencies]\n",
+        )]);
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let snapshot = fixture_snapshot(&tree).await;
+        assert_eq!(
+            tree.judge(
+                &snapshot,
+                &identity(
+                    DEPENDENCY_EDGE_KIND,
+                    "crates/cog-gateway/Cargo.toml",
+                    "cog-llm ="
+                )
+            )
+            .await,
+            CheckOutcome::Landed
+        );
+    }
+
+    /// And the same check against a manifest that still declares it reads as a
+    /// debt still owed -- including when what it declares is a *different* crate
+    /// whose name merely begins the same way.
+    #[tokio::test]
+    async fn a_declared_dependency_is_still_owed_and_a_longer_name_is_not_it() {
+        let dir = repo(&[(
+            "crates/cog-gateway/Cargo.toml",
+            "[dependencies]\ncog-llm-extra = { workspace = true }\n",
+        )]);
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let snapshot = fixture_snapshot(&tree).await;
+        let scope = "crates/cog-gateway/Cargo.toml";
+        assert_eq!(
+            tree.judge(
+                &snapshot,
+                &identity(DEPENDENCY_EDGE_KIND, scope, "cog-llm =")
+            )
+            .await,
+            CheckOutcome::Landed,
+            "a longer crate's name is not the dependency this check names"
+        );
+        assert_eq!(
+            tree.judge(
+                &snapshot,
+                &identity(DEPENDENCY_EDGE_KIND, scope, "cog-llm-extra =")
+            )
+            .await,
+            CheckOutcome::Absent
+        );
+    }
+
+    /// A module is named the way its own file declares it, so the declaration
+    /// still in the core's module list is the move still owed -- and that a
+    /// declaration is a substring search is what lets `pub mod X;` answer for
+    /// `mod X;`.
+    #[tokio::test]
+    async fn a_module_still_declared_by_the_core_is_still_owed() {
+        let dir = repo(&[(
+            "crates/cog-core/src/lib.rs",
+            "pub mod admission;\npub mod build_gate;\n",
+        )]);
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let snapshot = fixture_snapshot(&tree).await;
+        let list = "crates/cog-core/src/lib.rs";
+        assert_eq!(
+            tree.judge(
+                &snapshot,
+                &identity(MODULE_RELOCATION_KIND, list, "mod admission;")
+            )
+            .await,
+            CheckOutcome::Absent
+        );
+        assert_eq!(
+            tree.judge(
+                &snapshot,
+                &identity(MODULE_RELOCATION_KIND, list, "mod audit;")
+            )
+            .await,
+            CheckOutcome::Landed
+        );
+    }
+
+    /// A debt check with no literal names the path itself, which is the arm
+    /// covering `exists`'s inverse as well as `grep`'s.
+    #[tokio::test]
+    async fn a_debt_check_with_no_literal_asks_for_the_path_to_be_gone() {
+        let dir = repo(&[("crates/gone/old.rs", "fn x() {}\n")]);
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let snapshot = fixture_snapshot(&tree).await;
+        assert_eq!(
+            tree.judge(
+                &snapshot,
+                &identity(DEPENDENCY_EDGE_KIND, "crates/gone/old.rs", "")
+            )
+            .await,
+            CheckOutcome::Absent
+        );
+        assert_eq!(
+            tree.judge(
+                &snapshot,
+                &identity(DEPENDENCY_EDGE_KIND, "crates/gone/new.rs", "")
+            )
+            .await,
+            CheckOutcome::Landed
+        );
+    }
+
+    /// A debt check about a path this tree does not hold is left unsettled, and
+    /// never read as paid: a mistyped scope would otherwise close an account
+    /// nobody paid, silently and for good.
+    ///
+    /// Both ways a scope can fail to answer are exercised -- a top-level entry
+    /// the project does not have at all, and a directory that is there but does
+    /// not hold the file -- because they arrive by different routes and only the
+    /// first is caught by the root check.
+    #[tokio::test]
+    async fn a_debt_check_about_a_path_outside_the_tree_is_left_unsettled() {
+        let dir = repo(&[("crates/other/src/lib.rs", "pub fn x() {}\n")]);
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let snapshot = fixture_snapshot(&tree).await;
+        for scope in ["elsewhere/Cargo.toml", "crates/gone/Cargo.toml"] {
+            let outcome = tree
+                .judge(
+                    &snapshot,
+                    &identity(DEPENDENCY_EDGE_KIND, scope, "cog-llm ="),
+                )
+                .await;
+            assert_eq!(
+                outcome.reason(),
+                Some(UnsettledReason::ScopeOutsideTree),
+                "`{scope}` answered {outcome:?}"
+            );
+            assert_eq!(outcome.state(), None, "`{scope}` moved a row");
+        }
     }
 }

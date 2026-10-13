@@ -711,13 +711,6 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                 crate::principle_ledger::spawn_principle_ledger_loop(
                     store,
                     ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>(),
-                    ctx.consume_service::<dyn cog_core::OrchestratorControl>(),
-                    // The build gate's lock directory, from the same config the
-                    // gate itself reads. The loop reads the bound the gate
-                    // publishes there rather than choosing a handover bound of
-                    // its own: how many code changes this host can build at once
-                    // is a fact about the machine, worked out in one place.
-                    ctx.config().self_evolution.build_gate.lock_dir.clone(),
                     principle_shutdown,
                     // The same tree the change ledger measures against: what the
                     // platform's own source declares about itself is read out of
