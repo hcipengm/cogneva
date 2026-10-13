@@ -500,7 +500,7 @@ All communication layers are abstracted through `cog-core` Backend Traits — **
 | Event bus | `MessageBackend` | NATS JetStream | Redis Streams / Kafka / in-memory channel |
 | External API | — | HTTP / WebSocket | — |
 
-`MessageBackend` Trait definition (`cog-core/src/stream/message_bus.rs`):
+`MessageBackend` Trait definition (`crates/cog-core/src/contract/stream.rs`):
 - `publish` / `subscribe` / `create_consumer_group` / `ack` / `dlq`
 - Implementations can optimize batching and delayed delivery for Redis pipelines, NATS concurrent publishing, in-memory single-lock, etc.
 
@@ -518,7 +518,7 @@ All storage layers are likewise abstracted through `cog-core` Backend Traits —
 | Full-text search | `SearchBackend` | Meilisearch | Elasticsearch |
 | Metrics | `MetricsBackend` | Prometheus | — |
 
-`VectorBackend` Trait example (`cog-core/src/storage/vector.rs`):
+`VectorBackend` Trait example (`crates/cog-core/src/contract/storage.rs`):
 - `create_collection` / `insert` / `insert_sparse` / `search` / `search_sparse` / `search_hybrid`
 - `search_hybrid` default implementation: only calls `search` (dense vector retrieval), does not depend on `search_sparse`; vector databases supporting sparse + dense hybrid can override with a native implementation
 

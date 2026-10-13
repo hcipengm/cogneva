@@ -268,6 +268,11 @@ jobs:
       # 写清，不是把引用换个说法。
       - name: Check comments cite no document
         run: bash deploy/scripts/check-comment-doc-references.sh
+      # README 里点名的源码路径必须存在。死在正文里的路径不会让任何东西失败——
+      # 文件搬了家，正文照常渲染成一句看着完整的说明，只有读者照着去开文件才发现
+      # 是个死指针。判的是反引号括起来、带扩展名的串（口径见脚本头部）。
+      - name: Check README paths exist
+        run: bash deploy/scripts/check-readme-paths.sh
       # 提交信息不得带 AI 署名。署名在 message 里，diff 与评审都看不见，推出去之后
       # 唯一的修法是重写 history——所以判的是**本次推送新增的提交**，不是整部 history：
       # 整部扫一次等于「第一次失手之后永久红」，而永久红的门最后会被删掉。

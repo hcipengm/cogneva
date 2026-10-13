@@ -496,7 +496,7 @@ Cogneva 有 20+ 业务 crate，如果让它们直接互相依赖，很快会变�
 | 事件总线 | `MessageBackend` | NATS JetStream | Redis Streams / Kafka / 内存通道 |
 | 外部 API | — | HTTP / WebSocket | — |
 
-`MessageBackend` Trait 定义（`cog-core/src/stream/message_bus.rs`）：
+`MessageBackend` Trait 定义（`crates/cog-core/src/contract/stream.rs`）：
 - `publish` / `subscribe` / `create_consumer_group` / `ack` / `dlq`
 - 实现方可针对 Redis pipeline、NATS 并发发布、内存单锁等优化 batch 和延迟发布
 
@@ -514,7 +514,7 @@ Cogneva 有 20+ 业务 crate，如果让它们直接互相依赖，很快会变�
 | 全文搜索 | `SearchBackend` | Meilisearch | Elasticsearch |
 | 指标 | `MetricsBackend` | Prometheus | — |
 
-`VectorBackend` Trait 示例（`cog-core/src/storage/vector.rs`）：
+`VectorBackend` Trait 示例（`crates/cog-core/src/contract/storage.rs`）：
 - `create_collection` / `insert` / `insert_sparse` / `search` / `search_sparse` / `search_hybrid`
 - `search_hybrid` 默认实现：仅调用 `search`（稠密向量检索），不依赖 `search_sparse`；支持 sparse + dense hybrid 的向量数据库可覆盖为原生实现
 
