@@ -124,6 +124,13 @@ enum Owed {
     /// The module moves whole, and every crate that reads it already depends on
     /// the destination. Nothing else has to change for the move to be legal, so
     /// the work is the move and nothing here can be satisfied by relabelling.
+    ///
+    /// No row claims this shape today: every module the registry sends has a
+    /// reader the destination cannot reach. The variant stays because the shape
+    /// stays -- the day a module's readers all reach its destination is the day
+    /// this gate is looking for, and dropping the variant would drop the ability
+    /// to register that module.
+    #[allow(dead_code)]
     Direct,
     /// The module is a contract and a mechanism in one file, and no existing
     /// crate both reads it and is reachable from the destination. It leaves in
@@ -663,15 +670,8 @@ fn readers_of(
     out
 }
 
-/// Where under `dir` a `.rs` file names `module`, as `path:line` strings, read
-/// the way [`readers_of`] reads a reader: a whole word anywhere in the line.
-fn reader_sites(dir: &Path, module: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    collect_reader_sites(dir, module, &mut out);
-    out
-}
-
-fn collect_reader_sites(dir: &Path, module: &str, out: &mut Vec<String>) {
+/// Where under `dir` a `.rs` file has a line `matches`, as `path:line` strings.
+fn collect_sites(dir: &Path, out: &mut Vec<String>, matches: &dyn Fn(&str) -> bool) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -681,11 +681,11 @@ fn collect_reader_sites(dir: &Path, module: &str, out: &mut Vec<String>) {
             continue;
         };
         if kind.is_dir() {
-            collect_reader_sites(&path, module, out);
+            collect_sites(&path, out, matches);
         } else if path.extension().is_some_and(|e| e == "rs") {
             if let Ok(text) = std::fs::read_to_string(&path) {
                 for (i, line) in text.lines().enumerate() {
-                    if names_module(line, module) {
+                    if matches(line) {
                         out.push(format!("{}:{}", path.display(), i + 1));
                     }
                 }
@@ -694,60 +694,117 @@ fn collect_reader_sites(dir: &Path, module: &str, out: &mut Vec<String>) {
     }
 }
 
+/// Whether `line` reaches a module through a `crate::` path, the way one module
+/// reads a sibling.
+///
+/// Deliberately narrower than the whole-word reading [`names_module`] uses for
+/// the other crates, and only for the core. The core's `lib.rs` declares every
+/// root module with a `pub mod`, and that line is the registration a relocation
+/// removes rather than a reader the move has to satisfy: counting it would mark
+/// every row blocked, and a `Split` row asserting "something blocks the move"
+/// would be satisfied by a module that could have moved whole.
+fn references_crate_module(line: &str, module: &str) -> bool {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    let needle = format!("crate::{module}");
+    line.match_indices(needle.as_str()).any(|(at, _)| {
+        let before = line[..at].chars().next_back();
+        let after = line[at + needle.len()..].chars().next();
+        before.is_none_or(|c| !ident(c)) && after.is_none_or(|c| !ident(c))
+    })
+}
+
+/// Where the core itself reads `module`, as `path:line` sites.
+///
+/// The core reads a root module the way any module reads a sibling, through
+/// `crate::`; everything the core's own `lib.rs` writes about the module is its
+/// registration. The sites are returned rather than a flag so a failure can name
+/// them, and the module's own file never appears — a module does not reach
+/// itself.
+fn core_reads(root: &Path, module: &str) -> Vec<String> {
+    let dir = root.join("crates").join(CORE).join("src");
+    let mut out = Vec::new();
+    collect_sites(&dir, &mut out, &|line| {
+        references_crate_module(line, module)
+    });
+    out
+}
+
 /// The workspace root, from this crate's manifest directory.
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// A row that says the readers already reach the destination is making a claim
-/// about the dependency graph, and this reads the graph.
+/// The readers that make moving `module` to `destination` whole impossible.
 ///
-/// This is the half of the relocation plan that a registry cannot state: naming
-/// a destination says where a module should end up, not whether it can go there.
-/// A module read by a crate that the destination reaches — or read by a crate
-/// that reaches nothing the destination has — cannot move without an edge, and
-/// the worst of those is a cycle, which no amount of moving a file closes. The
-/// rows that make this claim are exactly the ones checked; a `Split` row makes
-/// the opposite claim, which is why the two shapes are told apart rather than
-/// both being sent down this path.
+/// Empty exactly when nothing stands in the way of a `Direct` move: every crate
+/// that reads the module either is the destination or already depends on it, and
+/// the core reads it nowhere. One predicate answers both shapes of a row — a
+/// `Direct` row asserts this is empty and a `Split` row asserts it is not — so a
+/// module that could have moved whole cannot hide under the harder label, and a
+/// row claiming no edge is needed cannot pass while one is.
+///
+/// The core is read through [`core_reads`] rather than as one more consumer:
+/// counting the `pub mod` that registers the module would mark every row
+/// blocked, and a `Split` row would be satisfied by a module that could move.
+fn blocking_readers(root: &Path, ws: &Workspace, module: &str, destination: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let core_sites = core_reads(root, module);
+    if !core_sites.is_empty() {
+        out.push(format!(
+            "the core itself reads `{module}` ({core_sites:?}), which this row would move to \
+             `{destination}` whole — the core depends on no crate, so it can never reach the \
+             destination and the module leaves in halves"
+        ));
+    }
+    for consumer in readers_of(root, &ws.members, module, false) {
+        // A crate does not depend on itself, so the destination reading its own
+        // module says nothing about whether the move invents an edge -- that half
+        // of the module leaves by not leaving.
+        if consumer == destination {
+            continue;
+        }
+        let reaches = ws
+            .member_deps
+            .get(&consumer)
+            .is_some_and(|deps| deps.contains(destination));
+        if !reaches {
+            out.push(format!(
+                "`{consumer}` reads `{module}`, which this row sends to `{destination}`, and \
+                 `{consumer}` does not depend on `{destination}`"
+            ));
+        }
+    }
+    out
+}
+
+/// The two shapes a row can claim, each read against the dependency graph, which
+/// is the half of the plan a registry cannot state: naming a destination says
+/// where a module should end up, not whether it can go there.
+///
+/// A `Direct` row claims the move invents no edge -- every crate that reads the
+/// module already reaches the destination -- and a `Split` row claims the
+/// opposite: that no whole move is possible, because some reader cannot be
+/// brought along. Both are read from the same set of blocking readers, so a row
+/// that understates the work and one that overstates it both fail. A module read
+/// by the core, or by a crate the destination does not reach, cannot move whole;
+/// a module with no such reader is not a split, whatever the row says.
 #[test]
 fn a_relocation_the_readers_already_reach_names_an_edge_that_is_there() {
     let ws = Workspace::read();
     let root = workspace_root();
     let mut unreachable = Vec::new();
+    let mut understated = Vec::new();
     for (module, destination, owed) in RELOCATION_TARGET {
-        if *owed != Owed::Direct {
-            continue;
-        }
-        // The core is included: a `Direct` row claims the module can move whole,
-        // and the core reading it makes that claim impossible — the core depends
-        // on no crate, so it could never reach the destination.
-        for consumer in readers_of(&root, &ws.members, module, true) {
-            // A crate does not depend on itself, so the destination reading its
-            // own module says nothing about whether the move invents an edge --
-            // that half of the module leaves by not leaving.
-            if consumer == *destination {
-                continue;
-            }
-            if consumer == CORE {
-                let sites = reader_sites(&root.join("crates").join(CORE).join("src"), module);
-                unreachable.push(format!(
-                    "the core itself reads `{module}`, which this row would move to `{destination}` \
-                     whole ({sites:?}) — the core depends on no crate, so this module leaves in \
-                     halves and the row is `split`, not `direct`"
-                ));
-                continue;
-            }
-            let reaches = ws
-                .member_deps
-                .get(&consumer)
-                .is_some_and(|deps| deps.contains(*destination));
-            if !reaches {
-                unreachable.push(format!(
-                    "`{consumer}` reads `{module}`, which this row sends to `{destination}`, and \
-                     `{consumer}` does not depend on `{destination}`"
-                ));
-            }
+        let blocking = blocking_readers(&root, &ws, module, destination);
+        match owed {
+            // A `Direct` row claims the move needs no new edge, read against the
+            // graph: nothing may block it.
+            Owed::Direct => unreachable.extend(blocking),
+            // A `Split` row claims the opposite, that no whole move is possible.
+            // An empty set is a module that could have moved whole, under a label
+            // that says it could not.
+            Owed::Split if blocking.is_empty() => understated.push(*module),
+            Owed::Split => {}
         }
     }
     assert!(
@@ -755,6 +812,12 @@ fn a_relocation_the_readers_already_reach_names_an_edge_that_is_there() {
         "these relocations are registered as needing no new edge and would invent one: \
          {unreachable:#?} — either the destination is wrong for the module, or the module is not \
          `direct` and leaves in halves"
+    );
+    assert!(
+        understated.is_empty(),
+        "these modules are registered as leaving in halves, but nothing blocks moving them whole: \
+         {understated:?} — every reader is the destination or already depends on it, and the core \
+         reads it nowhere, so the row overstates the work and the module could move `direct`"
     );
 
     // A row is a claim about a module, and a module nothing reads is a claim about
