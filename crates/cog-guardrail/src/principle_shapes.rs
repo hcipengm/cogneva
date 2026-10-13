@@ -124,8 +124,60 @@ pub fn deferral_exempt(line: &str) -> bool {
     matches(DEFERRAL_EXEMPT, line) || matches(DEFERRAL_STRIKING, line)
 }
 
+/// Whether one pattern matches, in the dialect the two readers agree on.
+///
+/// The patterns are written for the host's reader, which is `grep -E`: grep
+/// matches a line at a time, so `^` and `$` are the ends of a line. The regex
+/// crate here matches a whole string at a time, so the same anchors mean the ends
+/// of the *string* -- and two shapes (`AI_TRAILER_RE`, `FROZEN_DOC_RE`) are
+/// anchored. Compiled without the mode below, those two could only fire on a
+/// whole subject that began or ended with the forbidden text, which is almost
+/// never, so the in-process judge would pass what the host refused while both
+/// read the same table. The `(?m)` mode restores per-line anchors and is what
+/// makes "the same definition" true across the two readers rather than nominal.
 fn matches(pattern: &str, text: &str) -> bool {
-    regex::Regex::new(pattern).is_ok_and(|re| re.is_match(text))
+    compile(pattern).is_ok_and(|re| re.is_match(text))
+}
+
+/// One pattern, compiled the way every reader here reads it. Kept apart from
+/// `matches` so a test can assert a pattern *compiles* rather than only that it
+/// failed to block.
+fn compile(pattern: &str) -> Result<regex::Regex, regex::Error> {
+    regex::Regex::new(&format!("(?m){pattern}"))
+}
+
+/// The strings a tool call is made of, one per field the call carries them in.
+///
+/// Every shape is judged against each of these and any match is a match. Why not
+/// the call's JSON as one string, which is the obvious subject: serialising it
+/// escapes newlines to the two characters `\n` and puts the whole call on one
+/// line, so a shape anchored to a line -- the AI trailer's `^`, a path's `$` --
+/// could never fire, and the in-process judge would pass exactly the calls the
+/// host's hook refuses. The fields are taken as the strings they are instead: the
+/// shell's `command`, an edit's `file_path` and its `content` or `new_string`, a
+/// message's `message`. Objects and arrays are walked so a field the caller names
+/// differently is still read, and the tool's own name is included because a
+/// forbidden tool spelled in the name is a shape too. Only when a call carries no
+/// string at all does the serialised form stand in, so a payload shaped unlike
+/// any of these is still judged rather than skipped.
+fn subjects(tool: &cog_core::ToolCall) -> Vec<String> {
+    let mut out = vec![tool.name.clone()];
+    collect_strings(&tool.arguments, &mut out);
+    if out.len() == 1 {
+        out.push(tool.arguments.to_string());
+    }
+    out
+}
+
+fn collect_strings(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(text) => out.push(text.clone()),
+        serde_json::Value::Array(items) => items.iter().for_each(|i| collect_strings(i, out)),
+        serde_json::Value::Object(fields) => {
+            fields.values().for_each(|f| collect_strings(f, out));
+        }
+        _ => {}
+    }
 }
 
 /// A guardrail that refuses a tool call whose name or arguments carry a shape a
@@ -154,10 +206,10 @@ impl cog_core::Guardrail for PrincipleShapeGuard {
     }
 
     async fn check_tool_call(&self, tool: &cog_core::ToolCall) -> cog_core::GuardResult {
-        let mut subject = String::from(tool.name.as_str());
-        subject.push(' ');
-        subject.push_str(&tool.arguments.to_string());
-        match first_match(&subject) {
+        match subjects(tool)
+            .iter()
+            .find_map(|subject| first_match(subject))
+        {
             Some(shape) => cog_core::GuardResult::Block {
                 reason: format!("工具调用带着形状表禁止的一项（{shape}）"),
                 rule: format!("principle_shapes:{shape}"),
@@ -179,15 +231,15 @@ mod tests {
     #[test]
     fn every_shape_compiles_under_the_regex_crate() {
         for pattern in DEFERRAL_SHAPES {
-            regex::Regex::new(pattern)
+            compile(pattern)
                 .unwrap_or_else(|e| panic!("deferral shape {pattern:?} does not compile: {e}"));
         }
         for (name, pattern) in ALL_SHAPES {
-            regex::Regex::new(pattern)
+            compile(pattern)
                 .unwrap_or_else(|e| panic!("shape {name} ({pattern:?}) does not compile: {e}"));
         }
         for pattern in [DEFERRAL_EXEMPT, DEFERRAL_STRIKING] {
-            regex::Regex::new(pattern)
+            compile(pattern)
                 .unwrap_or_else(|e| panic!("pattern {pattern:?} does not compile: {e}"));
         }
     }
@@ -310,5 +362,110 @@ mod tests {
             guard.check_tool_call(&clean).await,
             cog_core::GuardResult::Pass
         );
+    }
+
+    /// Every shape has to fire on a real tool call, not only on a string handed
+    /// straight to `first_match`.
+    ///
+    /// Those are two different paths, and the difference hid a real leak: a
+    /// call's arguments serialised into one string escape their newlines, so a
+    /// shape anchored to a line -- the AI trailer's `^`, a path's `$` -- could
+    /// never fire through the guard, while a test that fed the pattern its own
+    /// sample stayed green. So every case below starts from the call an agent
+    /// would actually make and names the shape it must refuse on, and the last
+    /// group is the negative half: the same call shapes with clean text pass.
+    #[tokio::test]
+    async fn every_shape_fires_on_the_call_it_was_written_for() {
+        use cog_core::Guardrail;
+        let guard = PrincipleShapeGuard;
+        let call = |name: &str, arguments: serde_json::Value| cog_core::ToolCall {
+            id: "x".into(),
+            name: name.into(),
+            arguments,
+        };
+        let rule_of = |result: cog_core::GuardResult| match result {
+            cog_core::GuardResult::Block { rule, .. } => rule,
+            other => panic!("expected a block, got {other:?}"),
+        };
+
+        // A frozen document edited in place: the shape is anchored to the path,
+        // and the path is a field of the call.
+        assert_eq!(
+            rule_of(
+                guard
+                    .check_tool_call(&call(
+                        "Edit",
+                        serde_json::json!({
+                            "file_path": "internal-docs/2026-01-01_x.md",
+                            "old_string": "a",
+                            "new_string": "b"
+                        })
+                    ))
+                    .await
+            ),
+            "principle_shapes:FROZEN_DOC_RE"
+        );
+
+        // An AI trailer on a line of a commit command: the shape is anchored to
+        // the start of a line, and the line is the message's second.
+        assert_eq!(
+            rule_of(
+                guard
+                    .check_tool_call(&call(
+                        "Bash",
+                        serde_json::json!({
+                            "command": "git commit -F - <<'MSG'\nwhy it changed\n\nCo-authored-by: someone\nMSG"
+                        })
+                    ))
+                    .await
+            ),
+            "principle_shapes:AI_TRAILER_RE"
+        );
+
+        // A deferral written into a file's content.
+        assert_eq!(
+            rule_of(
+                guard
+                    .check_tool_call(&call(
+                        "Write",
+                        serde_json::json!({"file_path": "/tmp/x.md", "content": "归属主定。"})
+                    ))
+                    .await
+            ),
+            "principle_shapes:DEFERRAL_SHAPES"
+        );
+
+        // A circled numeral in the text being written.
+        assert_eq!(
+            rule_of(
+                guard
+                    .check_tool_call(&call(
+                        "Write",
+                        serde_json::json!({"file_path": "/tmp/x.md", "content": "one is ① and two is ②"})
+                    ))
+                    .await
+            ),
+            "principle_shapes:CIRCLED_CHARS"
+        );
+
+        for clean in [
+            call(
+                "Edit",
+                serde_json::json!({"file_path": "crates/x/src/y.rs", "new_string": "let a = 1;"}),
+            ),
+            call(
+                "Bash",
+                serde_json::json!({"command": "git commit -m 'fix the thing'"}),
+            ),
+            call(
+                "Write",
+                serde_json::json!({"file_path": "/tmp/x.md", "content": "trigger: the queue is non-empty"}),
+            ),
+        ] {
+            assert_eq!(
+                guard.check_tool_call(&clean).await,
+                cog_core::GuardResult::Pass
+            );
+        }
     }
 }
