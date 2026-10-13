@@ -682,6 +682,24 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_mainline_supersession_checks_total",
         "crates/cog-reflection/src/mainline_deployer.rs",
     ),
+    // 「在试、什么都没落地」的那一面。attempts 在「走到决定要不要滚」时写，交付被
+    // 集群拒也照涨，所以一个每轮空转 20 小时的部署器在所有别的计数上与健康的同形；
+    // completed 只在真的滚上去（四部署到目标 rev 且判定跑完）时写。2026-10-12→13
+    // 实测：evolution 的 Role 少了一条交付要的授权，每次派发都被拒，20 小时零部署，
+    // 没有任何一条序列说出来——这一对是那件事分出来的那一面。
+    (
+        "cogneva_mainline_rollout_completed_total",
+        "crates/cog-reflection/src/mainline_deployer.rs",
+    ),
+    // 被拒派发按哪个动词、哪个资源记一条。上面那一对答的是「在试、什么都没落地」，
+    // 答不出**为什么**——被拒的 apply 死在那次滚动 Job 的 Pod 里，Job 一结束痕迹
+    // 就没了。这条是部署器自己派发前拿集群问的 SelfSubjectAccessReview，标签里
+    // 带着被扣住的动词和资源，2026-10-12→13 那 20 小时缺的就是它（Role 少
+    // patch middlewares.traefik.io）。
+    (
+        "cogneva_mainline_preflight_refused_total",
+        "crates/cog-reflection/src/mainline_deployer.rs",
+    ),
     // 轮询循环每一轮的结果。循环自己的存活读数（`loop_tick_age_seconds`）在每拍开头
     // 盖章，量的是「它醒了」，量不到这一轮干了什么；而这一轮里别的读数（版本契约、
     // CI 判词、那对越权计数）全写在会失败的那一步**之前**。2026-10-08 实测：发布那

@@ -523,6 +523,39 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          the rounds that find any",
     ),
     (
+        "cogneva_mainline_rollout_completed_total",
+        "Rollouts the deployer saw land: the deployments on the revision it \
+         dispatched, with the judgement that ran against them finished and \
+         passed. The partner of cogneva_mainline_rollout_attempts_total, and the \
+         reading whose absence hid a stall: the attempts counter moves when a \
+         round reaches the decision to promote, whether or not anything is ever \
+         deployed, so a deployer refused every cycle climbed it exactly as a \
+         healthy one did and no series said otherwise. Read them as a pair -- \
+         attempts rising while completed stays flat is a deployer trying and \
+         nothing landing, which is what a delivery the cluster refuses looks \
+         like from here. The time of the last completed rollout is the \
+         __observed_timestamp_seconds companion the store renders beside this",
+    ),
+    (
+        "cogneva_mainline_preflight_refused_total",
+        "Rollouts the deployer refused to dispatch because the cluster says its \
+         ServiceAccount may not apply one of the kinds the revision delivers, by \
+         verb and resource. What it names is the gap between the delivery face and \
+         the authorization face -- two declarations that are equal in the tree \
+         (a gate proves that) but separately delivered to a cluster, where the \
+         installed Role can be behind: an upgrade nobody ran, a grant added to the \
+         tree that never reached the release. The deployer's own tree-side gate \
+         reads the tree; only the cluster can say what the cluster will accept, \
+         so this is asked live, before the dispatch, and a refusal is one the \
+         rollout Job never got to make. It exists because the refused dispatch \
+         used to live and die inside that Job: the poll counter showed a failed \
+         round and the attempts counter climbed, but which verb on which resource \
+         was withheld was written nowhere that outlived the pod, and twenty hours \
+         of that passed with the cause unreadable. Written before the dispatch, so \
+         a refused round never reached the Job -- this is the deployer's judgement \
+         of the cluster, not the cluster's rejection replayed after the fact",
+    ),
+    (
         "cogneva_mainline_supersession_checks_total",
         "Times the deployer's guard put the overtaken question, counted whether \
          the answer was yes or no. Counted rather than inferred from the skips, \

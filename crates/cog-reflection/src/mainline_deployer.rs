@@ -2363,6 +2363,46 @@ impl MainlineDeployer {
             .await
     }
 
+    /// 问集群「本进程这个身份有没有这个动词」，把 `kubectl auth can-i` 的
+    /// yes / no 读成一个 bool。
+    ///
+    /// 不走 [`Self::kubectl`]：那条路在退出码非零时报错，而 `auth can-i` 恰恰用
+    /// 退出码 1 表示「不行」——经它一问，一次「被拒」就被读成「探针坏了」，正是
+    /// 这道预检要看见的那件事。这里像 [`Self::apply_capture`] 一样自己收 stdout，
+    /// 只认 `yes` / `no` 两个答案；其余（kubectl 起了但答不出，比如连不上 API）
+    /// 认作错误而不是拒绝——探针本身坏了不该被当成集群拒绝，那会把一次探针故障
+    /// 变成本循环永远不派发。
+    async fn can_i(&self, verb: &str, group: &str, resource: &str) -> SFResult<bool> {
+        let target = rbac_target(group, resource);
+        let mut child = tokio::process::Command::new(&self.cfg.kubectl_bin)
+            .args([
+                "-n",
+                self.cfg.namespace.as_str(),
+                "auth",
+                "can-i",
+                verb,
+                target.as_str(),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| SFError::IO(format!("spawn kubectl auth can-i: {e}")))?;
+        let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+            .await
+            .map_err(|_| SFError::IO("kubectl auth can-i timed out after 30s".into()))?
+            .map_err(|e| SFError::IO(format!("kubectl auth can-i: {e}")))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        match stdout.trim() {
+            "yes" => Ok(true),
+            "no" => Ok(false),
+            other => Err(SFError::IO(format!(
+                "kubectl auth can-i {verb} {target} answered neither yes nor no ({other:?}): {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))),
+        }
+    }
+
     async fn git_src(&self, args: &[&str]) -> SFResult<String> {
         let workdir = self.workdir();
         self.run_cmd("git", args, Some(&workdir), 120).await
@@ -4487,6 +4527,9 @@ impl MainlineDeployer {
                 // 任何失败证据。
                 self.report_rollout_resources(&job).await;
                 info!(rev = %rev12(&inflight.rev), "mainline rollout converged");
+                // 真的滚上去了：与每轮的"走到决定点"分开记，缺了这一条，交付被
+                // 集群拒、每一轮空转的 20 小时在计数面上与健康同形。
+                self.record_rollout_completed().await;
                 // 浮动签只在收敛后前移，失败回滚的坏镜像绝不进 :local。
                 self.promote_local_tag(&inflight.rev).await?;
                 state.last_good_rev = Some(inflight.rev.clone());
@@ -5002,6 +5045,122 @@ impl MainlineDeployer {
             .await;
     }
 
+    /// 这一版的四部署真的滚到了目标 rev，判定者也判过了。
+    ///
+    /// 与 `record_rollout_attempt` 成对：那条在"走到决定要不要滚"时写，这条只在
+    /// 真的滚上去时写。缺了这一条，"每一轮都到了决定点、却一个镜像都没上去"与
+    /// "健康"在计数器面同形——attempts 照涨，其余读数照涨，只有交付被集群拒了
+    /// 这件事没有任何一条序列说出来。读这一对：attempts 涨而 completed 平，就是
+    /// 「在试、什么都没落地」。
+    async fn record_rollout_completed(&self) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let _ = metrics
+            .record_counter(
+                cog_core::metric_names::MAINLINE_ROLLOUT_COMPLETED_TOTAL,
+                1.0,
+                std::collections::HashMap::new(),
+            )
+            .await;
+    }
+
+    /// 派发前拿集群实测一遍：这一 rev 真正会 apply 的每一种 kind，本进程的身份
+    /// 到底有没有 get / create / patch。
+    ///
+    /// 树里那道静态门证明的是「树里的发布面」与「树里的 Role」相等——两份都写在
+    /// 仓库里。可**装到集群上的** Role 是另一份投递，它可以落后于树：没人跑的
+    /// helm upgrade，或只进了树、没进 release 的授权。落后时每一轮都走到同一次
+    /// apply、被同一句 `forbidden` 拒掉，而拒绝死在那次滚动 Job 的 Pod 里：poll
+    /// 计数器只显示这一轮失败、attempts 照涨，可**到底是哪个动词、哪个资源**被扣着，
+    /// 写不进任何活过这个 Pod 的地方。2026-10-12 到 10-13 实测约二十小时如此，直到
+    /// Role 被手工补上。所以这一问必须在派发**之前**、由部署器自己问集群，答案落进
+    /// `cogneva_mainline_preflight_refused_total{verb,resource}`，并且**当场拒发**——
+    /// 与其把同一个被拒的 apply 再跑二十小时，不如这一轮就不派 Job，让 in_flight 停在
+    /// Pushed、下轮重试，等授权补上。
+    ///
+    /// 发布面按**包自己的字节**读，不重读仓库：包就是 Job 会 apply 的那份东西，
+    /// 重读一遍就给了同一份事实两种拼写各自漂移的机会。恒等映射（见
+    /// [`api_resource_of`]）认不出的 kind 只记 WARN 跳过：CI 侧那道门对这种 kind 是
+    /// 直接 panic 的，它到不了生产；这里 panic 只会把一个能自查的部署器变成躺平。
+    async fn preflight_delivery_authorization(&self, bundle: &RolloutBundle) -> SFResult<()> {
+        let mut needed: std::collections::BTreeSet<(&'static str, &'static str)> =
+            std::collections::BTreeSet::new();
+        let note =
+            |origin: &str,
+             yaml: &str,
+             needed: &mut std::collections::BTreeSet<(&'static str, &'static str)>| {
+                for d in split_docs(yaml, origin).unwrap_or_default() {
+                    let kind = d.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                    match api_resource_of(kind) {
+                        Some(pair) => {
+                            needed.insert(pair);
+                        }
+                        None => warn!(
+                            origin = %origin,
+                            kind = %kind,
+                            "delivery preflight: kind has no API resource mapping; the cluster cannot be asked about it"
+                        ),
+                    }
+                }
+            };
+        note("support.yaml", &bundle.support_yaml, &mut needed);
+        for t in &bundle.targets {
+            note(&t.key, &t.yaml, &mut needed);
+        }
+        // apply 落在一个还不存在的对象上要 create，落在已有的对象上要 patch，两边都
+        // 得先 get 到它——三个动词缺一个，`kubectl apply` 就在那一步停下。
+        for (group, resource) in &needed {
+            let target = rbac_target(group, resource);
+            for verb in ["get", "create", "patch"] {
+                match self.can_i(verb, group, resource).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.record_preflight_refused(verb, group, resource).await;
+                        return Err(SFError::Config(format!(
+                            "delivery preflight refused: the {EVOLUTION_SERVICE_ACCOUNT} ServiceAccount may \
+                             not {verb} {target} in namespace {}; the cluster's Role is behind the tree's \
+                             declaration -- an upgrade that was never run, or a grant that reached the \
+                             repository and not the release. Every revision would be rejected at the same \
+                             apply until the installed Role is brought up to the tree",
+                            self.cfg.namespace
+                        )));
+                    }
+                    // A probe that could not answer is not the cluster refusing:
+                    // 只记 warn 放行，不把一次探针故障变成本循环永远不派发。
+                    Err(e) => warn!(
+                        error = %e,
+                        verb = %verb,
+                        resource = %target,
+                        "delivery preflight probe failed; the dispatch proceeds without this check"
+                    ),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 一次被预检拒掉的派发，按被扣住的运行记录一条。
+    ///
+    /// 落点由 [`Self::preflight_delivery_authorization`] 的注释负责，这里只保证
+    /// 名字里带的是**被拒的那个动词和那个资源**——不带标签的拒收计数点不出是哪一次
+    /// 授权被卡，读数就退回成「有东西被拒了」这句没有下文的话。
+    async fn record_preflight_refused(&self, verb: &str, group: &str, resource: &str) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("verb".to_string(), verb.to_string());
+        labels.insert("resource".to_string(), rbac_target(group, resource));
+        let _ = metrics
+            .record_counter(
+                cog_core::metric_names::MAINLINE_PREFLIGHT_REFUSED_TOTAL,
+                1.0,
+                labels,
+            )
+            .await;
+    }
+
     /// 把部署器独占的工作树对齐到目标 rev。这里没有守卫也没有"忙则跳过"：
     /// 树是自己的，不存在需要保护的在途工作，损坏就重建。
     async fn ensure_source_at(&self, rev: &str) -> SFResult<()> {
@@ -5317,6 +5476,9 @@ impl MainlineDeployer {
             // 重试——发布集坏（清单缺失/Secret 混入）时宁可不上线也不能
             // 静默回落纯 set image，那会让拓扑滞后悄悄回来。
             let bundle = self.build_bundle_at(rev, new_tag).await?;
+            // 拿集群实测授权，在发布包之前：被拒时 in_flight 停在 Pushed、下轮
+            // 重试，而不是把同一个会被拒的 apply 再派进 Job 里跑一遍。
+            self.preflight_delivery_authorization(&bundle).await?;
             self.publish_manifests_configmap(rev, &bundle).await?;
             args.push("--manifests-dir".into());
             args.push("/manifests".into());
@@ -5382,7 +5544,7 @@ impl MainlineDeployer {
                         },
                     },
                     "spec": {
-                        "serviceAccountName": "cogneva-evolution",
+                        "serviceAccountName": EVOLUTION_SERVICE_ACCOUNT,
                         "restartPolicy": "Never",
                         "containers": [{
                             "name": "mainline-rollout",
@@ -6508,6 +6670,23 @@ pub fn api_resource_of(kind: &str) -> Option<(&'static str, &'static str)> {
         _ => return None,
     })
 }
+
+/// `kubectl` 与 RBAC 认的资源名：空 apiGroup 就是裸资源名，非空要写成
+/// `<资源>.<组>` 才指得唯一。组和资源名分开存，拼法只有这一处——`auth can-i`
+/// 的入参、`cogneva_mainline_preflight_refused_total` 的 `resource` 标签、报错
+/// 里那句「是哪个资源被扣着」，要让它们说的是同一个名字。
+fn rbac_target(group: &str, resource: &str) -> String {
+    if group.is_empty() {
+        resource.to_string()
+    } else {
+        format!("{resource}.{group}")
+    }
+}
+
+/// 部署器进程与它派出的滚动 Job 共用的身份。Job 以它去 apply，部署器自己的
+/// `auth can-i` 问的也是它——两处必须是同一个字符串，否则预检问的是另一个身份，
+/// 绿灯证明的不是这次投递会不会被拒。
+const EVOLUTION_SERVICE_ACCOUNT: &str = "cogneva-evolution";
 
 /// 拆分多文档 YAML（只拆，不过滤）：空文档（`---` 分隔产生）跳过。
 pub(crate) fn split_docs(yaml_text: &str, origin: &str) -> SFResult<Vec<serde_yaml::Value>> {

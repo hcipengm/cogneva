@@ -575,6 +575,52 @@ metric_names! {
     // often the deployer tries to promote is not the declared poll interval
     // (that bounds the loop, not the attempt) and no other series publishes it.
     MAINLINE_ROLLOUT_ATTEMPTS_TOTAL => "cogneva_mainline_rollout_attempts_total",
+    // Rollouts the deployer watched land: the deployments actually on the
+    // revision it dispatched, with the judgement that ran against them finished
+    // and passed.
+    //
+    // The partner of the attempts counter above, and the reading whose absence
+    // let a twenty-hour stall run silent. `..._rollout_attempts_total` answers
+    // "how often did a round reach the decision to promote", and it moves
+    // whether or not anything is ever deployed -- a round that decides to roll
+    // writes it before it can fail, so through a deployer that decided every
+    // cycle and never once got an image onto the cluster it climbed exactly as
+    // it does on a healthy one, and nothing on the face told the two apart. That
+    // is the shape a delivery refused by the cluster has: the round does its
+    // work, the apply or the Job is rejected for a reason only the refusing side
+    // knows, and the loop returns to the top with every counter still moving.
+    // This one moves only where a rollout is observed whole, so attempts
+    // climbing while completed stays flat is the deployer trying and nothing
+    // landing -- a fault no single count can show, only the pair.
+    //
+    // A counter, not a "last deployed" timestamp: the store renders each
+    // series' `_observed_timestamp_seconds` companion anyway, so the time of the
+    // last completed rollout is readable beside this, while the count is the
+    // half that answers "did any land in the window" without a cadence to bound
+    // an age against -- which no series publishes for a per-change event.
+    MAINLINE_ROLLOUT_COMPLETED_TOTAL => "cogneva_mainline_rollout_completed_total",
+    // Rollouts the deployer refused to dispatch because the cluster says its
+    // ServiceAccount may not apply one of the kinds the revision delivers, by
+    // `verb` and `resource`.
+    //
+    // The delivery face and the authorization face are two declarations, and the
+    // tree's own gate only proves them equal *in the tree*. What is installed on
+    // a cluster is a separate delivery of the Role, and it can be behind the tree
+    // -- a `helm upgrade` nobody ran, or a grant added to the tree that never
+    // reached the release. While it is behind, every round reaches the same apply
+    // and is refused the same way, and the refusal lives inside the rollout Job:
+    // the poll counter shows a failed round, the attempts counter climbs, and
+    // *which* verb on *which* resource the cluster withheld is written nowhere
+    // that survives the pod. Measured over 2026-10-12 and 2026-10-13: about
+    // twenty hours of that, one refused dispatch after another, until the Role
+    // was patched by hand. This counter is the durable name of the cause the
+    // outcome counter (`..._rollout_completed_total`) can only say was missing:
+    // a rule fires on it, and the label says what to grant.
+    //
+    // Written before the dispatch, so a refused round is one that never reached
+    // the Job at all -- the reading is the deployer's own judgement of the
+    // cluster, not the cluster's rejection replayed.
+    MAINLINE_PREFLIGHT_REFUSED_TOTAL => "cogneva_mainline_preflight_refused_total",
     // Times the deployer's guard put the overtaken question, counted whether
     // the answer was yes or no.
     //
