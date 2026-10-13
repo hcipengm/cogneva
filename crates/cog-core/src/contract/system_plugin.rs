@@ -554,6 +554,34 @@ pub struct UnorderedInitRead {
     pub publisher: &'static str,
 }
 
+/// A pin read under one identity that was published under another.
+///
+/// Both sides derive their pin from the type they name, so `Arc<Concrete>` and
+/// `Arc<dyn Trait>` are two different pins and never meet — a publisher that
+/// only does the first, and a reader that only asks for the second, is a
+/// wiring break with no error anywhere. It is visible only across the two
+/// anomaly lists: the concrete value sits in `unconsumed` (published, nobody
+/// read it) and the trait object sits in `unsatisfied` (read, nobody published
+/// it), and the two answer to the same trailing type name. Read apart they
+/// look like two unrelated dead ends; together they are one break, and this is
+/// the pair that names it.
+#[derive(Clone, Debug)]
+pub struct PinIdentityMismatch {
+    /// The pin a reader asked for and nothing published.
+    pub read: Pin,
+    /// The pin something published and nobody read, under the same type name.
+    pub published: Pin,
+}
+
+/// The trailing path segment of a `type_name`, which is what the two sides of
+/// an identity mismatch agree on: `cog_reflection::ReflectionEngine` and
+/// `dyn cog_core::contract::reflection::ReflectionEngine` both end in
+/// `ReflectionEngine`. Matching on the whole name would find none of these,
+/// because the paths differ by construction.
+fn short_type_name(name: &str) -> &str {
+    name.rsplit("::").next().unwrap_or(name)
+}
+
 /// Verdict on the pin wiring the runtime observed.
 #[derive(Debug, Default)]
 pub struct PinAudit {
@@ -568,6 +596,9 @@ pub struct PinAudit {
     /// verdict is on the declaration, not on the layer plan: a read the plan
     /// happens to order is still one nothing would have caught being reordered.
     pub unordered_init_reads: Vec<UnorderedInitRead>,
+    /// Pairs of the same type attached to an `unsatisfied` read and an
+    /// `unconsumed` publish — one break, reported the two ways it shows up.
+    pub identity_mismatches: Vec<PinIdentityMismatch>,
     /// Distinct pins observed, and the totals behind them.
     pub pins: usize,
     pub publishes: usize,
@@ -630,6 +661,22 @@ impl PinAudit {
                 }
             }
         }
+        // Pair the two anomaly lists by trailing type name. Collected into a
+        // local first: the lists are borrowed to read them and the audit is
+        // borrowed to push the result, and both cannot be held at once.
+        let mut mismatches = Vec::new();
+        for (published, _) in &audit.unconsumed {
+            let published_short = short_type_name(published.name());
+            for (read, _) in &audit.unsatisfied {
+                if short_type_name(read.name()) == published_short {
+                    mismatches.push(PinIdentityMismatch {
+                        read: *read,
+                        published: *published,
+                    });
+                }
+            }
+        }
+        audit.identity_mismatches = mismatches;
         audit
     }
 
@@ -672,12 +719,28 @@ impl PinAudit {
                 publishers
             );
         }
+        for m in &self.identity_mismatches {
+            tracing::warn!(
+                "pin '{}' was read but never published, and pin '{}' was published but never read: the same type under two identities, so the publish and the read cannot meet",
+                m.read.name(),
+                m.published.name()
+            );
+        }
+        // Every family is named in its own slot rather than folded into one
+        // total. A total is what let the largest family go unread: `unconsumed`
+        // was left out of the sum, so the thirty-one pins it holds were absent
+        // from the only aggregate line and from every verdict, and a count that
+        // is not there cannot be noticed missing.
         tracing::debug!(
-            "pin wiring: {} pins, {} publishes, {} reads, {} anomalies",
+            "pin wiring: {} pins, {} publishes, {} reads; anomalies: {} multi-published, {} unordered init reads, {} unsatisfied, {} unconsumed, {} identity mismatches",
             self.pins,
             self.publishes,
             self.reads,
-            self.multi_published.len() + self.unordered_init_reads.len() + self.unsatisfied.len()
+            self.multi_published.len(),
+            self.unordered_init_reads.len(),
+            self.unsatisfied.len(),
+            self.unconsumed.len(),
+            self.identity_mismatches.len()
         );
     }
 
