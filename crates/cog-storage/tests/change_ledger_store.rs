@@ -391,21 +391,19 @@ async fn a_later_measurement_clears_a_retirement() {
     cleanup(&pool, &marker).await;
 }
 
-/// A document that corrects what it says about a change reaches the account, and
-/// a re-declaration that says nothing new does not.
+/// A corrected declaration reaches the account's citation of the document.
 ///
-/// This is the whole chain in one case, because each link can drop the
-/// correction on its own: the intake can refuse to re-queue a corrected
-/// declaration, and the reading path can keep the cited entry it already has.
-/// Either one alone leaves the account citing a verdict the document no longer
-/// makes -- and the disagreement between a document's claim and a measurement,
-/// which is the reading the account exists to produce, would be reported against
-/// the stale claim. Neither link is visible without a server: which branch of an
-/// `ON CONFLICT` runs, whether `rows_affected` counted a row, and what `jsonb`
-/// ends up holding are all facts about the server.
+/// The correction is made the way the producer's own verb makes it -- the
+/// declaration is withdrawn from the intake and declared again -- and what this
+/// checks is the half that used to be missing: the corrected reading is recorded,
+/// and the row went on citing the verdict the document made first, so the
+/// disagreement between a document's claim and a measurement was reported against
+/// a claim the document no longer made. It is not visible without a server: what
+/// `jsonb` ends up holding after an `ON CONFLICT` update is a fact about the
+/// server, and so is whether the second declaration reached the fold at all.
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
-async fn a_corrected_declaration_re_queues_and_the_account_cites_the_current_verdict() {
+async fn a_corrected_declaration_reaches_the_accounts_citation_of_its_document() {
     let (store, pool, marker) = store().await;
     let id = identity(&marker, "corrected");
     let doc = format!("docs/{marker}.md");
@@ -442,10 +440,13 @@ async fn a_corrected_declaration_re_queues_and_the_account_cites_the_current_ver
     assert_eq!(cited.len(), 1, "one document, one citation: {cited:?}");
     assert_eq!(cited[0].verdict.as_deref(), Some("undecided"));
 
+    // The producer's correction verb: take the declaration back off the intake
+    // by the same four columns it was declared with, then declare it again.
+    withdraw_declaration(&pool, &id, &doc).await;
     assert_eq!(
         store.declare(&[declaration("landed")]).await.unwrap(),
         1,
-        "the document's verdict moved, so the declaration has to re-queue"
+        "the corrected declaration is a fresh row, so it queues"
     );
     store
         .fold_declarations(100, Some("probe-rev"))
@@ -469,6 +470,26 @@ async fn a_corrected_declaration_re_queues_and_the_account_cites_the_current_ver
     );
 
     cleanup(&pool, &marker).await;
+}
+
+/// Take one declaration back off the intake, the way the producer's withdrawal
+/// verb does: a plain delete on the four columns the intake is keyed on, not
+/// through the store -- the store has no withdrawal, and the whole point of the
+/// verb is that it is the declarer's to run.
+async fn withdraw_declaration(pool: &PgPool, id: &ChangeIdentity, doc: &str) {
+    let removed = sqlx::query(
+        "DELETE FROM change_ledger_declared \
+         WHERE (kind, scope, literal, doc) = ($1, $2, $3, $4)",
+    )
+    .bind(&id.kind)
+    .bind(&id.scope)
+    .bind(&id.literal)
+    .bind(doc)
+    .execute(pool)
+    .await
+    .expect("withdraw the declaration")
+    .rows_affected();
+    assert_eq!(removed, 1, "the declaration was there to withdraw");
 }
 
 /// Queue one retirement the way the classifier does: a plain write to the intake

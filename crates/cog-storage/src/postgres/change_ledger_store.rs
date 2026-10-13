@@ -165,17 +165,18 @@ impl PostgresChangeLedgerStore {
 
 /// Add a reading's source to a row that may already cite other documents.
 ///
-/// A document cited once keeps its entry, and its *entry* is what moves when the
-/// document's verdict does. The rule used to be that an existing entry was left
-/// exactly as it was, on the grounds that "a document whose verdict changed is
-/// applied by withdrawing that document's reading and reading it again" -- a
-/// withdrawal nothing in this contract provides. What that rule did instead was
-/// freeze each document's claim at its first reading, so a document that
-/// corrected its verdict was cited forever with the one it had before, and the
-/// disagreement between a document's claim and a measurement -- the reading the
-/// account exists to produce -- was reported against a claim the document no
-/// longer made. Where the entry is keyed by the document, "what this document
-/// said" has to be what it says now.
+/// A document cited once keeps its entry -- one entry per document, rebuilt when
+/// what the document says about the change has moved. The rule used to be that an
+/// existing entry was left exactly as it was, on the grounds that a document
+/// whose verdict changed is applied by withdrawing its declaration and reading it
+/// again. The withdrawal is real and works on the intake; what it does not reach
+/// is this row. Withdrawing and re-declaring writes the corrected declaration,
+/// the fold records it, and this clause then found the document already cited and
+/// kept the entry it had, so the row went on citing the verdict the document made
+/// first -- and the disagreement between a document's claim and a measurement,
+/// which is the reading the account exists to produce, was reported against a
+/// claim the document no longer made. Where the entry is keyed by the document,
+/// "what this document said" has to be what it says now.
 ///
 /// The rewrite is guarded twice: an entry is added for a document not yet cited,
 /// and an entry already there is rebuilt only when its verdict actually differs.
@@ -358,48 +359,26 @@ fn check_measurement(m: &ChangeMeasurement) -> Result<(), String> {
     }
 }
 
-/// Queue a declaration, or re-queue the one already there when it would
-/// actually change it.
+/// Queue a declaration, or leave the one already queued for this change and
+/// document exactly as it is.
 ///
-/// Not `DO NOTHING`, which this used to be. The rule it stood on -- "a document
-/// that wants to say something different about a change withdraws its
-/// declaration and makes a new one" -- named a move this table has no way to
-/// make: there is no withdrawal statement anywhere, and the key already carries
-/// the document, so a re-declaration is the same key. What `DO NOTHING` did was
-/// freeze each `(kind, scope, literal, doc)` at whatever the **first**
-/// declaration said, and the corrected one -- an extraction that learned the
-/// document's verdict, a re-rendered title -- matched the key, was dropped, and
-/// the pass still reported success. The migration's own note that "re-declaring
-/// is how a corrected declaration is made" was describing the opposite of what
-/// the clause did.
+/// `DO NOTHING` rather than an update: a declaration is one reading of one
+/// document, so a document that wants to say something different about a change
+/// withdraws its declaration and makes a new one. Updating in place would make
+/// "what this document asked for" a value that changes without the document
+/// changing, which is the same merge the reading path refuses.
 ///
-/// `WHERE ... IS DISTINCT FROM` is what keeps the re-queue from becoming a
-/// livelock: without it a declaring script that re-pushes the whole corpus every
-/// pass would re-queue all of it, resetting `folded_at` on declarations whose
-/// values did not move, and the fold -- which takes a bounded batch per tick --
-/// would never catch up. It compares the values the `SET` would produce, not the
-/// raw incoming ones, because a field the declaration carries nothing for keeps
-/// what is stored: comparing the incoming `NULL` against a stored value would
-/// call that a change, re-queue it, write the same row, and do it again next
-/// pass.
-///
-/// The `COALESCE` half is not new: a declarer that knows nothing about a field
-/// is not a declarer that found the field empty, and it may not clear it.
+/// The withdrawal that rule depends on is real and lives on the producer side --
+/// it deletes exactly the keys it is handed, so re-declaring is a fresh insert
+/// rather than a conflict this clause has to resolve. What the account kept doing
+/// was narrower and is fixed where it happened: the corrected declaration reached
+/// the ledger and the ledger went on citing the verdict the document made first,
+/// because the reading path kept a cited document's entry as it was. See
+/// [`RECORD_READING_SQL`].
 const DECLARE_SQL: &str = "\
 INSERT INTO change_ledger_declared (kind, scope, literal, doc, title, assertion, verdict)
 VALUES ($1, $2, $3, $4, $5, $6, $7)
-ON CONFLICT (kind, scope, literal, doc) DO UPDATE SET
-    title = COALESCE(EXCLUDED.title, change_ledger_declared.title),
-    assertion = COALESCE(EXCLUDED.assertion, change_ledger_declared.assertion),
-    verdict = COALESCE(EXCLUDED.verdict, change_ledger_declared.verdict),
-    declared_at = now(),
-    folded_at = NULL
-WHERE (COALESCE(EXCLUDED.title, change_ledger_declared.title),
-       COALESCE(EXCLUDED.assertion, change_ledger_declared.assertion),
-       COALESCE(EXCLUDED.verdict, change_ledger_declared.verdict))
-  IS DISTINCT FROM
-      (change_ledger_declared.title, change_ledger_declared.assertion,
-       change_ledger_declared.verdict)";
+ON CONFLICT (kind, scope, literal, doc) DO NOTHING";
 
 /// The declarations one fold takes, oldest first.
 ///
@@ -500,12 +479,9 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
                 .map_err(|e| {
                     SFError::Database(format!("declare {}: {e}", reading.identity.as_key()))
                 })?;
-            // A declaration that says what the queued one already says matches
-            // the conflict clause's `WHERE` and writes no row; one that says
-            // something different writes its row and counts here. Counting the
-            // statement rather than the batch is what makes "how many were
-            // queued or re-queued" answerable, and the `WHERE` is what keeps
-            // that number meaning something rather than counting every re-push.
+            // The conflict clause writes nothing, so a declaration already queued
+            // contributes no row here. Counting the statement rather than the
+            // batch is what makes "how many were newly queued" answerable.
             queued += outcome.rows_affected() as usize;
         }
         Ok(queued)
