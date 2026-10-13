@@ -307,6 +307,105 @@ pub trait ChangeLedgerStore: Send + Sync {
     /// comparing two censuses needs to see a state that emptied, which is
     /// exactly the reading an absent key would hide.
     async fn census(&self) -> SFResult<Vec<(ChangeState, u64)>>;
+
+    /// Record what one dispatch pass decided, and why it decided that much.
+    ///
+    /// The pass is the account's executor-facing half, and it is the half whose
+    /// stalling used to be invisible: a pass that handed nothing over and a pass
+    /// with nothing to hand over leave the same rows in `change_ledger`, so the
+    /// account alone cannot tell them apart. This is where the difference is
+    /// written down -- not because the pass's health is a change, but because the
+    /// reason dispatch stood still is a reading, and a reading that lives only in
+    /// a process's log dies when the process rolls.
+    ///
+    /// Appended, never updated: one row per pass, so a reader can ask how long
+    /// dispatch stood still and how often, which an upserted row could not answer.
+    async fn record_dispatch_state(&self, state: &DispatchState) -> SFResult<()>;
+}
+
+/// What one dispatch pass did, and the closed reason it did only that much.
+///
+/// The pass is not a verdict on any change, and this carries none: it says what
+/// the handover did this tick, what was owed at the time, and -- when nothing was
+/// handed over -- which of the agreed reasons stopped it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchState {
+    pub decision: DispatchDecision,
+    pub pool: PoolReading,
+    /// Rows that were owed this pass. The reading that separates "nothing to do"
+    /// from "work was owed and was not handed over".
+    pub pending: u64,
+    pub submitted: u64,
+    /// Rows whose task the goal path already had: handed over on an earlier pass.
+    pub already: u64,
+    pub failed: u64,
+    /// Rows this pass's own measurement could not settle, so they were not handed
+    /// over. Counted apart from `pending` because the state alone cannot show
+    /// them.
+    pub unmeasurable: u64,
+    /// When dispatch may resume, unix seconds; `0` when no bound is known.
+    pub resume_at_unix: i64,
+    /// The recovery instant the pool's own evidence stated, unix seconds; `0`
+    /// when nothing stated one. Kept beside `resume_at_unix` so a reader can tell
+    /// a bound derived from an upstream's statement from one this process chose.
+    pub evidenced_recovery_unix: i64,
+    /// Longest quota window any suspect upstream stated, seconds; `0` when none
+    /// did. The only statement of how long a quota outage lasts when no instant
+    /// was given.
+    pub quota_window_secs: u64,
+}
+
+/// The decision a dispatch pass reached, as a closed set.
+///
+/// One value per reason dispatch can stand still for, so a reader enumerating the
+/// set does not have to learn about a new one from an unexpected row. The pool
+/// member is the one that exists today; a second reason is a value here, a CHECK
+/// in the table, and a migration -- which is what keeps the set closed rather
+/// than merely documented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchDecision {
+    /// The pass handed over what was owed.
+    Proceed,
+    /// The pass handed nothing over: no configured upstream could serve a
+    /// request, so every task it submitted would have failed for that reason.
+    PausedLlmPoolUnavailable,
+}
+
+impl DispatchDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Proceed => "proceed",
+            Self::PausedLlmPoolUnavailable => "paused_llm_pool_unavailable",
+        }
+    }
+}
+
+/// What the pool snapshot said, including that there was none.
+///
+/// Three values rather than two because "no evidence of a healthy pool" and "no
+/// evidence of a sick one" arrive as the same absence, and a reader that saw
+/// them as one value could not tell a pass that dispatched behind a healthy pool
+/// from one that dispatched blind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PoolReading {
+    /// A snapshot said the pool can serve.
+    Available,
+    /// A snapshot said no configured upstream can serve.
+    Unavailable,
+    /// No usable snapshot: nothing said either way.
+    Absent,
+}
+
+impl PoolReading {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Unavailable => "unavailable",
+            Self::Absent => "absent",
+        }
+    }
 }
 
 /// What one document reading contributes to the account.

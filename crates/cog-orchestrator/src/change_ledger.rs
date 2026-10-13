@@ -55,8 +55,8 @@ use tracing::{debug, info, warn};
 
 use cog_core::{
     ChangeIdentity, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement, ChangeReading,
-    ChangeSource, ChangeState, OrchestratorControl, OwnerLeaseBroker, ShutdownSignal, Task,
-    TaskType,
+    ChangeSource, ChangeState, DispatchDecision, DispatchState, LlmPoolStatus, OrchestratorControl,
+    OwnerLeaseBroker, PoolReading, ShutdownSignal, Task, TaskType,
 };
 
 use crate::change_measure::{
@@ -235,6 +235,7 @@ pub fn spawn_change_ledger_loop(
     store: Arc<dyn ChangeLedgerStore>,
     role: Option<Arc<dyn OwnerLeaseBroker>>,
     orchestrator: Option<Arc<dyn OrchestratorControl>>,
+    pool: Option<Arc<dyn cog_core::LlmPoolStatusSource>>,
     shutdown: ShutdownSignal,
     tree: CheckTree,
 ) {
@@ -242,12 +243,19 @@ pub fn spawn_change_ledger_loop(
         interval_secs = CHANGE_LEDGER_PASS_INTERVAL.as_secs(),
         arbitrated = role.is_some(),
         dispatching = orchestrator.is_some(),
+        pool_gated = pool.is_some(),
         "Change ledger loop enabled"
     );
     if orchestrator.is_none() {
         warn!(
             "change ledger: no goal path is available, so a change found still owed will be \
              recorded and not handed to anyone"
+        );
+    }
+    if pool.is_none() {
+        warn!(
+            "change ledger: no pool snapshot source is published, so this loop hands work over \
+             without knowing whether any upstream can serve it -- seen, and recorded as absent"
         );
     }
 
@@ -260,6 +268,7 @@ pub fn spawn_change_ledger_loop(
             let store = store.clone();
             let role = role.clone();
             let orchestrator = orchestrator.clone();
+            let pool = pool.clone();
             let shutdown = shutdown.clone();
             let tree = tree.clone();
             async move {
@@ -307,7 +316,8 @@ pub fn spawn_change_ledger_loop(
                     // and a change this pass just found missing is handed over on
                     // the same pass that found it, rather than one period later.
                     if let Some(ref orchestrator) = orchestrator {
-                        dispatch_pass(&*store, orchestrator, &unsettled).await;
+                        let pool = pool.as_deref();
+                        dispatch_pass(&*store, orchestrator, &unsettled, pool).await;
                     }
                 }
             }
@@ -778,6 +788,7 @@ async fn dispatch_pass(
     store: &dyn ChangeLedgerStore,
     orchestrator: &Arc<dyn OrchestratorControl>,
     unsettled: &HashMap<ChangeIdentity, UnsettledCheck>,
+    pool: Option<&dyn cog_core::LlmPoolStatusSource>,
 ) {
     // The read is bounded by the ledger's own census rather than by a number
     // chosen here, and it has to be that wide because of where pending rows sit
@@ -816,6 +827,49 @@ async fn dispatch_pass(
     };
 
     let pending = dispatchable(&rows, unsettled);
+
+    // Counted apart from the states because these rows are `pending`: the state
+    // line cannot show them, and a pass that quietly stopped handing rows over
+    // would otherwise read as a pass with fewer changes owed in it.
+    let unmeasurable = rows
+        .iter()
+        .filter(|row| row.state == ChangeState::Pending)
+        .filter(|row| unsettled.contains_key(&row.identity))
+        .count();
+
+    let snapshot = match pool {
+        Some(source) => source.status().await,
+        None => None,
+    };
+    let verdict = pool_verdict(
+        snapshot.as_ref(),
+        now_unix(),
+        CHANGE_LEDGER_PASS_INTERVAL.as_secs(),
+    );
+
+    // A pass whose tasks could only fail is not a pass: no configured upstream
+    // can serve a request, so every task handed over now is work that will come
+    // back with the pool's own error and leave the change exactly as owed as it
+    // was. The handover stops, and the stop is written down where it survives
+    // the process -- a pending set that nothing is acting on reads the same as a
+    // pending set nobody has reached yet, which is how a whole day of dispatch
+    // could land on a dead pool without the account saying so.
+    if verdict.decision == DispatchDecision::PausedLlmPoolUnavailable {
+        warn!(
+            pending = pending.len(),
+            unmeasurable,
+            resume_at_unix = verdict.resume_at_unix,
+            evidenced_recovery_unix = verdict.evidenced_recovery_unix,
+            quota_window_secs = verdict.quota_window_secs,
+            upstreams = snapshot
+                .as_ref()
+                .map(|status| status.unavailable_upstreams.join(","))
+                .unwrap_or_default(),
+            "change ledger: no configured upstream can serve, so this pass handed nothing over"
+        );
+        record_dispatch_state(store, &verdict, pending.len(), 0, 0, 0, unmeasurable).await;
+        return;
+    }
 
     let mut submitted = 0usize;
     let mut already = 0usize;
@@ -863,24 +917,147 @@ async fn dispatch_pass(
         }
     }
 
-    // Counted apart from the states because these rows are `pending`: the state
-    // line cannot show them, and a pass that quietly stopped handing rows over
-    // would otherwise read as a pass with fewer changes owed in it.
-    let unmeasurable = rows
-        .iter()
-        .filter(|row| row.state == ChangeState::Pending)
-        .filter(|row| unsettled.contains_key(&row.identity))
-        .count();
-
     info!(
         pending = pending.len(),
         submitted,
         already_handed_over = already,
         failed,
         unmeasurable,
+        pool = verdict.reading.as_str(),
         not_handed_over = %held_back_summary(&rows),
         "change ledger: handed the pending set to the goal path"
     );
+    record_dispatch_state(
+        store,
+        &verdict,
+        pending.len(),
+        submitted,
+        already,
+        failed,
+        unmeasurable,
+    )
+    .await;
+}
+
+/// Write one pass's own reading, and never let a failure to write it stop the
+/// pass.
+///
+/// A pass that could not record what it did still did it, and a loop that gave
+/// up on the handover because the reading's table was missing would trade the
+/// working half for the recorded half. The failure is raised where it is a
+/// problem for a reader: it says the pause is not on record, which reads as a
+/// silent stop, and that is the one thing this table exists to prevent.
+async fn record_dispatch_state(
+    store: &dyn ChangeLedgerStore,
+    verdict: &PoolVerdict,
+    pending: usize,
+    submitted: usize,
+    already: usize,
+    failed: usize,
+    unmeasurable: usize,
+) {
+    let state = DispatchState {
+        decision: verdict.decision,
+        pool: verdict.reading,
+        pending: pending as u64,
+        submitted: submitted as u64,
+        already: already as u64,
+        failed: failed as u64,
+        unmeasurable: unmeasurable as u64,
+        resume_at_unix: verdict.resume_at_unix,
+        evidenced_recovery_unix: verdict.evidenced_recovery_unix,
+        quota_window_secs: verdict.quota_window_secs,
+    };
+    if let Err(e) = store.record_dispatch_state(&state).await {
+        warn!(
+            error = %e,
+            decision = state.decision.as_str(),
+            "change ledger: what this pass decided could not be recorded, so the decision is \
+             only in this line"
+        );
+    }
+}
+
+/// What the pool's snapshot says this pass should do.
+///
+/// Pure, and that is on purpose: this is the judgement that has to be right
+/// exactly when the pool is down, which is when it cannot be exercised on the
+/// live system. The three answers are the three states a snapshot can be in, and
+/// the third one is a state rather than an error -- no snapshot is not a healthy
+/// pool. Treating it as one would leave a process with no source at all handing
+/// work over for ever, which is the behaviour this gate exists to end; treating
+/// it as a sick pool would stop dispatch for a missing observer, which is a
+/// driver traded for a reading.
+///
+/// The resume bound is whatever the snapshot's own evidence supports, read
+/// through the contract's [`LlmPoolStatus::resume_wait_secs`] rather than chosen
+/// here: an upstream that stated when it serves again is waited for to that
+/// instant, and our own probe cadence gets one observation window added, because
+/// resuming at a probe is resuming before the probe's outcome exists. When both
+/// are stated the *earlier* one is the answer -- it is the first moment worth
+/// looking again -- so the bound recorded is the soonest supportable one, while
+/// the upstream's own stated instant travels beside it in
+/// `evidenced_recovery_unix` and a reader can always tell the upstream's promise
+/// from this process's cadence. The window is this loop's own period, the next
+/// time it would look anyway, so no new number enters the account.
+fn pool_verdict(
+    status: Option<&LlmPoolStatus>,
+    now_unix: i64,
+    observation_secs: u64,
+) -> PoolVerdict {
+    let Some(status) = status else {
+        return PoolVerdict {
+            decision: DispatchDecision::Proceed,
+            reading: PoolReading::Absent,
+            resume_at_unix: 0,
+            evidenced_recovery_unix: 0,
+            quota_window_secs: 0,
+        };
+    };
+    let resume_at_unix = if status.unavailable {
+        status
+            .resume_wait_secs(now_unix, observation_secs)
+            .map(|wait| now_unix.saturating_add(wait as i64))
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    PoolVerdict {
+        decision: if status.unavailable {
+            DispatchDecision::PausedLlmPoolUnavailable
+        } else {
+            DispatchDecision::Proceed
+        },
+        reading: if status.unavailable {
+            PoolReading::Unavailable
+        } else {
+            PoolReading::Available
+        },
+        resume_at_unix,
+        evidenced_recovery_unix: status.evidenced_recovery_unix,
+        quota_window_secs: status.quota_window_secs,
+    }
+}
+
+/// One pass's decision and the bounds it was read against.
+struct PoolVerdict {
+    decision: DispatchDecision,
+    reading: PoolReading,
+    resume_at_unix: i64,
+    evidenced_recovery_unix: i64,
+    quota_window_secs: u64,
+}
+
+/// Wall-clock seconds, for comparing against instants an upstream stated.
+///
+/// The database clock is used for everything this loop writes; this is the other
+/// direction -- the snapshot's bounds are unix seconds from the gateway's own
+/// clock, and a bound can only be compared with a clock of the same kind.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// The outstanding rows this pass did not hand over, by state.
@@ -1364,5 +1541,101 @@ mod tests {
                  core's contract layer."
             )
         );
+    }
+
+    /// A snapshot saying no upstream can serve stops the pass, and the bound it
+    /// stops until is the earliest one the evidence supports -- here the instant
+    /// the upstream itself stated, which is sooner than our next probe would be.
+    #[test]
+    fn an_unavailable_pool_pauses_the_pass_at_the_earliest_stated_bound() {
+        let now = 1_760_000_000i64;
+        let status = LlmPoolStatus {
+            unavailable: true,
+            evidenced_recovery_unix: now + 100,
+            next_attempt_unix: now + 1_000,
+            unavailable_upstreams: vec!["https://a.example|m".to_string()],
+            quota_window_secs: 2_592_000,
+            ..Default::default()
+        };
+        let verdict = pool_verdict(Some(&status), now, 300);
+        assert_eq!(verdict.decision, DispatchDecision::PausedLlmPoolUnavailable);
+        assert_eq!(verdict.reading, PoolReading::Unavailable);
+        // The upstream's instant is sooner than the probe's outcome would be, so
+        // it is the bound -- and it is carried as itself, not as the derived
+        // number, so a reader can still see it was the upstream that said so.
+        assert_eq!(verdict.resume_at_unix, now + 100);
+        assert_eq!(verdict.evidenced_recovery_unix, now + 100);
+        assert_eq!(verdict.quota_window_secs, 2_592_000);
+    }
+
+    /// With no instant stated, the only bound is our own probe cadence, and one
+    /// observation window is added to it: the pass may not resume at a probe it
+    /// has not yet seen the result of.
+    #[test]
+    fn a_probe_cadence_bound_gets_one_observation_window_added() {
+        let now = 1_760_000_000i64;
+        let status = LlmPoolStatus {
+            unavailable: true,
+            evidenced_recovery_unix: 0,
+            next_attempt_unix: now + 100,
+            ..Default::default()
+        };
+        let verdict = pool_verdict(Some(&status), now, 300);
+        assert_eq!(verdict.decision, DispatchDecision::PausedLlmPoolUnavailable);
+        assert_eq!(verdict.resume_at_unix, now + 400);
+        // No instant was stated, so nothing is claimed to have been.
+        assert_eq!(verdict.evidenced_recovery_unix, 0);
+    }
+
+    /// An unavailable pool with no bound in the future is a pause with no known
+    /// end, which is a state of its own -- not "resume now". Reading it as an
+    /// imminent recovery is exactly the reading a spent weekly quota produces.
+    ///
+    /// The stated instant is already past and no probe cadence is on record, so
+    /// nothing lies ahead: the contract's own function answers `None` and the
+    /// pass records no instant rather than inventing one.
+    #[test]
+    fn a_pause_with_no_future_bound_states_no_resume_instant() {
+        let now = 1_760_000_000i64;
+        let status = LlmPoolStatus {
+            unavailable: true,
+            evidenced_recovery_unix: now - 1,
+            next_attempt_unix: 0,
+            ..Default::default()
+        };
+        let verdict = pool_verdict(Some(&status), now, 300);
+        assert_eq!(verdict.decision, DispatchDecision::PausedLlmPoolUnavailable);
+        assert_eq!(verdict.resume_at_unix, 0);
+        // The spent instant is still reported as what the upstream said, even
+        // though it cannot be the bound: it is what a reader needs to tell a
+        // stale statement from no statement at all.
+        assert_eq!(verdict.evidenced_recovery_unix, now - 1);
+    }
+
+    /// A healthy pool dispatches, and the reading says the pass knew it could.
+    #[test]
+    fn an_available_pool_dispatches_and_says_it_knew() {
+        let now = 1_760_000_000i64;
+        let status = LlmPoolStatus {
+            unavailable: false,
+            ..Default::default()
+        };
+        let verdict = pool_verdict(Some(&status), now, 300);
+        assert_eq!(verdict.decision, DispatchDecision::Proceed);
+        assert_eq!(verdict.reading, PoolReading::Available);
+        assert_eq!(verdict.resume_at_unix, 0);
+    }
+
+    /// No snapshot is not a healthy pool: the pass proceeds -- a missing observer
+    /// must not become a driver -- but the reading keeps "dispatched blind" apart
+    /// from "dispatched behind a healthy pool".
+    #[test]
+    fn an_absent_snapshot_dispatches_but_is_not_reported_as_healthy() {
+        let now = 1_760_000_000i64;
+        let verdict = pool_verdict(None, now, 300);
+        assert_eq!(verdict.decision, DispatchDecision::Proceed);
+        assert_eq!(verdict.reading, PoolReading::Absent);
+        assert_eq!(verdict.resume_at_unix, 0);
+        assert_ne!(verdict.reading, PoolReading::Available);
     }
 }

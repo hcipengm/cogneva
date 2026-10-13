@@ -16,7 +16,7 @@ use sqlx::{PgPool, Row};
 
 use cog_core::{
     ChangeIdentity, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement, ChangeReading,
-    ChangeSource, ChangeState, SFError, SFResult,
+    ChangeSource, ChangeState, DispatchState, SFError, SFResult,
 };
 
 /// Every read returns these, in one place so no two readers can come back with
@@ -179,6 +179,18 @@ ON CONFLICT (kind, scope, literal) DO UPDATE SET
         WHEN EXCLUDED.state = 'landed' THEN COALESCE(change_ledger.landed_at, now())
         ELSE NULL
     END";
+
+/// Append one dispatch pass's own reading.
+///
+/// Plain insert, no conflict clause: the row is an observation of a moment, and
+/// a second pass is a second row. `observed_at` comes from the database clock in
+/// the same statement, for the same reason a measurement's times do -- a pass
+/// that stamped its own clock would be reporting a time it supplied.
+const RECORD_DISPATCH_STATE_SQL: &str = "\
+INSERT INTO change_dispatch_state (
+    decision, pool_reading, pending, submitted, already, failed, unmeasurable,
+    resume_at_unix, evidenced_recovery_unix, quota_window_secs
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)";
 
 /// Refuse a reading whose identity or document does not fit its column.
 ///
@@ -434,5 +446,23 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
                 (state, n)
             })
             .collect())
+    }
+
+    async fn record_dispatch_state(&self, state: &DispatchState) -> SFResult<()> {
+        sqlx::query(RECORD_DISPATCH_STATE_SQL)
+            .bind(state.decision.as_str())
+            .bind(state.pool.as_str())
+            .bind(state.pending as i64)
+            .bind(state.submitted as i64)
+            .bind(state.already as i64)
+            .bind(state.failed as i64)
+            .bind(state.unmeasurable as i64)
+            .bind(state.resume_at_unix)
+            .bind(state.evidenced_recovery_unix)
+            .bind(state.quota_window_secs as i64)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("record dispatch state: {e}")))?;
+        Ok(())
     }
 }
