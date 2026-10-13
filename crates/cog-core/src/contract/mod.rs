@@ -26,6 +26,7 @@ pub mod notification;
 pub mod observability;
 pub mod orchestrator;
 pub mod outcome;
+pub mod owner_lease;
 pub mod platform_sign;
 pub mod plugin;
 pub mod principle_ledger;

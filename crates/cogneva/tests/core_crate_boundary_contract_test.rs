@@ -84,7 +84,6 @@ const CORE_ROOT_MODULES: &[(&str, &str)] = &[
     ("lib", "crate-root"),
     ("loop_health", "pending-relocation"),
     ("observability_text", "shared-definition"),
-    ("owner_lease", "pending-relocation"),
     ("secrets", "shared-definition"),
     ("token_estimate", "shared-definition"),
 ];
@@ -171,8 +170,6 @@ const RELOCATION_TARGET: &[(&str, &str, Owed)] = &[
     ("build_gate", "cog-reflection", Owed::Direct),
     // The crate that publishes the health readings the loops are watched by.
     ("loop_health", "cog-observability", Owed::Split),
-    // The lease is stored next to the tiers it guards.
-    ("owner_lease", "cog-storage", Owed::Direct),
 ];
 
 /// Where a split module's contract half lands: the core's `contract` module,

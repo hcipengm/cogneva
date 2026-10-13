@@ -12,7 +12,6 @@ pub mod error;
 pub mod fs_size;
 pub mod loop_health;
 pub mod observability_text;
-pub mod owner_lease;
 pub mod secrets;
 pub mod token_estimate;
 pub mod types;
@@ -45,6 +44,7 @@ pub use contract::net::*;
 pub use contract::notification::*;
 pub use contract::observability::*;
 pub use contract::orchestrator::*;
+pub use contract::owner_lease;
 pub use contract::plugin::*;
 pub use contract::principle_ledger::*;
 pub use contract::project_kind::*;
@@ -67,7 +67,7 @@ pub use contract::taste::*;
 pub use contract::tool::*;
 pub use contract::wiki::*;
 pub use error::{SFError, SFResult};
-pub use owner_lease::{OwnerLease, OwnerLeaseBroker, Ownership, RoleClaim, RoleHold};
+pub use contract::owner_lease::{OwnerLease, OwnerLeaseBroker, Ownership, RoleClaim, RoleHold};
 pub use secrets::{
     redact_json_secrets, redact_secrets, ChainedSecretProvider, EnvSecretProvider,
     FileSecretProvider, SecretProvider,
