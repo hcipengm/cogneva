@@ -74,6 +74,85 @@ impl std::fmt::Display for PrincipleState {
     }
 }
 
+/// How a principle is meant to be checked, when that has been said.
+///
+/// The ledger's other questions are all about whether a gate *exists*. This one
+/// is about whether one *should*, and the two have to be kept apart: a principle
+/// nobody machine-checks and a principle no machine can check both read as
+/// `unenforced`, and only the first is work. Folding them together makes "how much
+/// is ungated" a number that can never fall -- every rule that is a person's to
+/// hold counts as a debt forever -- so the tier is stored and the debt reading can
+/// subtract it.
+///
+/// Four values, and the three "tiers" a reader groups them into (`shape` |
+/// `tree` + `live` | `judgement`) are the grouping, not the closed set: the tier a
+/// value belongs to is a presentation, and a presentation stored as the identity
+/// would have to be migrated whenever it was redrawn.
+///
+/// The enum is optional wherever it appears. A principle whose tier nobody has
+/// declared has none, and every value here is a claim about how the principle is
+/// checked that a reading has to make on purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrincipleCheckKind {
+    /// The sentence or command is recognisable as written, so a check can run
+    /// before the act -- a session-side hook, shipped in the image.
+    Shape,
+    /// The answer needs one walk of the tree, so it is read after the fact, at a
+    /// revision.
+    Tree,
+    /// The answer needs a reading off the running system, read after the fact
+    /// against the same revision.
+    Live,
+    /// No machine decides it. A person does, and the row is the record that it is
+    /// a person's to decide -- never a debt, and never a gate.
+    Judgement,
+}
+
+impl PrincipleCheckKind {
+    /// Every value the column may take, so a census can report the zeroes.
+    pub const ALL: [PrincipleCheckKind; 4] = [
+        PrincipleCheckKind::Shape,
+        PrincipleCheckKind::Tree,
+        PrincipleCheckKind::Live,
+        PrincipleCheckKind::Judgement,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PrincipleCheckKind::Shape => "shape",
+            PrincipleCheckKind::Tree => "tree",
+            PrincipleCheckKind::Live => "live",
+            PrincipleCheckKind::Judgement => "judgement",
+        }
+    }
+
+    /// The value a stored string names, or `None` for anything else.
+    ///
+    /// No fallback, for the same reason the state column has none: a string this
+    /// does not know is a row written by something that disagrees with this
+    /// contract, and reading it as any of the four would invent a tier.
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.as_str() == value)
+    }
+
+    /// Whether a resident loop is the thing that measures this tier.
+    ///
+    /// The tree and live tiers are read after the fact against a revision, which
+    /// is what the loop does; `shape` is decided before the act by the session,
+    /// and `judgement` is nobody's but a person's. Kept as a method rather than at
+    /// each call site so the routing cannot disagree with itself.
+    pub fn measured_by_resident_loop(self) -> bool {
+        matches!(self, PrincipleCheckKind::Tree | PrincipleCheckKind::Live)
+    }
+}
+
+impl std::fmt::Display for PrincipleCheckKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// One principle as a host-side reading names it.
 ///
 /// The fields are exactly the columns of `list-principles.sh --tsv`, which is
@@ -106,6 +185,14 @@ pub struct PrincipleReading {
     /// The shape of the check the host's own registry runs for it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_gate: Option<String>,
+    /// How this principle is meant to be checked, when the reading knows.
+    ///
+    /// Declared rather than measured: it says where the check *belongs*, which is
+    /// a decision about the rule, not a finding about the tree. `None` is a
+    /// reading that says nothing about the tier, and it does not move a tier
+    /// already on the row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check_kind: Option<PrincipleCheckKind>,
 }
 
 /// The result of looking at both registries for one principle.
@@ -171,6 +258,13 @@ pub struct PrincipleRow {
     pub host_gate: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub platform_gate: Option<String>,
+    /// How the principle is meant to be checked, when a reading has declared it.
+    ///
+    /// `None` until one does, and it stays `None` for a principle nobody has
+    /// classified: an undeclared tier and a declared `judgement` are different
+    /// findings, and only the latter is the record that the rule is a person's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check_kind: Option<PrincipleCheckKind>,
     /// `None` until a look settles it, and it stays `None` for a look that could
     /// not settle -- a row nothing has looked at and one no look could reach are
     /// the same reading here, and both are different from `unenforced`.
@@ -260,6 +354,37 @@ impl PrincipleCensus {
             0 => None,
             total => Some(self.enforced as f64 / total as f64),
         }
+    }
+}
+
+/// How many rows the account holds by the tier that checks them, the undeclared
+/// ones counted apart.
+///
+/// The tier a row is on is the only thing that says why a row is ungated: a
+/// `judgement` row has no gate because none is meant to exist, the three machine
+/// tiers are ungated because nobody has gated them yet, and a row with no tier is
+/// one nobody has said anything about. Folding the first into the debt makes the
+/// ungated count a number that can never fall; folding the last into it charges
+/// the account for a tier it was never told. So the count is taken here, keyed the
+/// way the column is -- four values, not the three tiers a reader groups them
+/// into, because the grouping is a presentation and this is a reading.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrincipleCheckKindCensus {
+    pub shape: u64,
+    pub tree: u64,
+    pub live: u64,
+    pub judgement: u64,
+    pub undeclared: u64,
+}
+
+impl PrincipleCheckKindCensus {
+    /// How many rows carry a tier at all.
+    pub fn declared(&self) -> u64 {
+        self.total() - self.undeclared
+    }
+
+    pub fn total(&self) -> u64 {
+        self.shape + self.tree + self.live + self.judgement + self.undeclared
     }
 }
 
@@ -364,6 +489,15 @@ pub trait PrincipleLedgerStore: Send + Sync {
     /// censuses needs to see a state that emptied, and an absent field is not a
     /// reading.
     async fn census(&self) -> SFResult<PrincipleCensus>;
+
+    /// How many rows the ledger holds by the tier that checks them, with the
+    /// rows whose tier nobody has declared counted apart from all four.
+    ///
+    /// The reading that says why a row is ungated: a `judgement` row is ungated
+    /// because none is meant to exist, and subtracting it is what makes "how much
+    /// is ungated" a number work can move. Every count is present, the zeroes
+    /// included, for the same reason the state census names them.
+    async fn check_kind_census(&self) -> SFResult<PrincipleCheckKindCensus>;
 
     /// Queue gate refusals for the writer to count.
     ///

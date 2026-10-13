@@ -42,8 +42,9 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use cog_core::{
-    OwnerLeaseBroker, PrincipleCensus, PrincipleLedgerStore, PrincipleMeasurement, PrincipleOrphan,
-    PrincipleRow, PrincipleState, ShutdownSignal,
+    OwnerLeaseBroker, PrincipleCensus, PrincipleCheckKind, PrincipleCheckKindCensus,
+    PrincipleLedgerStore, PrincipleMeasurement, PrincipleOrphan, PrincipleRow, PrincipleState,
+    ShutdownSignal,
 };
 
 use crate::change_measure::CheckTree;
@@ -221,6 +222,21 @@ async fn read_pass(store: &dyn PrincipleLedgerStore) {
     match store.census().await {
         Ok(census) => info!(account = %account_summary(&census), "principle ledger census"),
         Err(e) => warn!(error = %e, "principle ledger: the census could not be read"),
+    }
+
+    // The tier census beside it, because the state census alone cannot say why a
+    // row is ungated. A debt and a principle a person holds both read as
+    // `unenforced` there; only this reading tells them apart, and the number work
+    // can move is the debt with the `judgement` rows subtracted.
+    match store.check_kind_census().await {
+        Ok(census) => info!(
+            check_kind = %check_kind_summary(&census),
+            "principle ledger check-kind census"
+        ),
+        Err(e) => warn!(
+            error = %e,
+            "principle ledger: the check-kind census could not be read"
+        ),
     }
 }
 
@@ -469,6 +485,7 @@ async fn measure_pass(
     let now = Instant::now();
     let mut enforced = 0usize;
     let mut unenforced = 0usize;
+    let mut human_only = 0usize;
     let mut by_reason: HashMap<UnsettledReason, usize> = HashMap::new();
     let mut known_unsettled = 0usize;
     let mut considered = 0usize;
@@ -490,6 +507,18 @@ async fn measure_pass(
         }
         considered += 1;
         let verdict = judge(row, &declarations);
+        // A principle a person holds is not a row this pass can move, and it is
+        // not a row that failed to be moved either. Handled before the unsettled
+        // path rather than through it: that path is keyed by a reason from the
+        // closed set, and none of them is "no gate is meant to exist", so a
+        // judgement row reaching it would be filed under whichever reason a
+        // fallback happened to name. Counted on its own so the pass line says how
+        // many rows the account is holding on a person's behalf.
+        if verdict == Verdict::HumanOnly {
+            human_only += 1;
+            unsettled.remove(&row.slug);
+            continue;
+        }
         let Some(measurement) = measurement_of(row, &verdict, &declarations, &revision) else {
             let reason = verdict
                 .reason()
@@ -538,6 +567,7 @@ async fn measure_pass(
         judged = considered,
         enforced,
         unenforced,
+        human_only,
         held_back_for_drift,
         unsettled = %reason_summary(&by_reason),
         already_unsettled = known_unsettled,
@@ -621,6 +651,39 @@ fn account_summary(census: &PrincipleCensus) -> String {
     )
 }
 
+/// The whole account by tier in one line: every value of the closed set, the
+/// undeclared count, the total, and the two groupings a reader needs.
+///
+/// The values are rendered from [`PrincipleCheckKind::ALL`] rather than written
+/// out, so a fifth tier would appear here without this line being edited -- and a
+/// field per tier that nobody remembered to add would be a count that silently
+/// stopped covering the account. The two groupings are computed here because they
+/// are the whole reason the line exists: the three *tiers* a reader thinks in are
+/// `shape | tree + live | judgement`, and the debt that work can move is the three
+/// machine values with the `judgement` rows -- and the undeclared ones -- held out.
+fn check_kind_summary(census: &PrincipleCheckKindCensus) -> String {
+    let by_value = PrincipleCheckKind::ALL
+        .iter()
+        .map(|kind| {
+            let n = match kind {
+                PrincipleCheckKind::Shape => census.shape,
+                PrincipleCheckKind::Tree => census.tree,
+                PrincipleCheckKind::Live => census.live,
+                PrincipleCheckKind::Judgement => census.judgement,
+            };
+            format!("{} {}", kind.as_str(), n)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{by_value}, undeclared {}, machine_tiers {}, held_by_a_person {}, total {}",
+        census.undeclared,
+        census.total() - census.judgement - census.undeclared,
+        census.judgement,
+        census.total()
+    )
+}
+
 /// Compress one round's outstanding rows into one line.
 ///
 /// The two kinds of "oldest" are named separately: never measured (`measured_at`
@@ -689,6 +752,7 @@ mod tests {
             carrier_sha256: None,
             host_gate: host.map(str::to_string),
             platform_gate: None,
+            check_kind: None,
             state,
             refusals: 0,
             last_refused_at: None,
@@ -761,6 +825,27 @@ mod tests {
         assert_eq!(
             account_summary(&PrincipleCensus::default()),
             "enforced 0 unenforced 0 unmeasured 0 total 0 coverage no rows"
+        );
+    }
+
+    /// The check-kind line names every tier of the closed set, the undeclared
+    /// rows apart, and the two groupings. The number that matters is the one the
+    /// state census cannot produce: the machine-checkable rows are the three
+    /// machine values with the judgement rows -- and the undeclared ones -- held
+    /// out, which is the debt work can actually move.
+    #[test]
+    fn the_check_kind_line_names_every_tier_and_the_two_groupings() {
+        let census = PrincipleCheckKindCensus {
+            shape: 6,
+            tree: 3,
+            live: 1,
+            judgement: 4,
+            undeclared: 608,
+        };
+        assert_eq!(
+            check_kind_summary(&census),
+            "shape 6, tree 3, live 1, judgement 4, undeclared 608, machine_tiers 10, \
+             held_by_a_person 4, total 622"
         );
     }
 

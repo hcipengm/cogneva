@@ -16,15 +16,16 @@ use async_trait::async_trait;
 use sqlx::{PgPool, Row};
 
 use cog_core::{
-    PrincipleCensus, PrincipleDrift, PrincipleFold, PrincipleLedgerStore, PrincipleMeasurement,
-    PrincipleReading, PrincipleRefusal, PrincipleRow, PrincipleState, SFError, SFResult,
+    PrincipleCensus, PrincipleCheckKind, PrincipleCheckKindCensus, PrincipleDrift, PrincipleFold,
+    PrincipleLedgerStore, PrincipleMeasurement, PrincipleReading, PrincipleRefusal, PrincipleRow,
+    PrincipleState, SFError, SFResult,
 };
 
 /// Every read returns these, in one place so no two readers can come back with
 /// differently ordered columns.
 const ROW_COLUMNS: &str = "slug, lead, carrier_path, carrier_sha256, host_gate, platform_gate, \
-                           state, refusals, last_refused_at, first_seen_at, measured_at, \
-                           measured_rev";
+                           check_kind, state, refusals, last_refused_at, first_seen_at, \
+                           measured_at, measured_rev";
 
 /// How wide each keyed column may be, taken from the columns that key them
 /// rather than from what a caller would like to write.
@@ -78,6 +79,7 @@ impl PostgresPrincipleLedgerStore {
             platform_gate: row
                 .try_get("platform_gate")
                 .map_err(|e| format!("platform_gate: {e}"))?,
+            check_kind: parse_check_kind(row)?,
             state,
             refusals: row
                 .try_get("refusals")
@@ -112,6 +114,7 @@ impl PostgresPrincipleLedgerStore {
             host_gate: row
                 .try_get("host_gate")
                 .map_err(|e| format!("host_gate: {e}"))?,
+            check_kind: parse_check_kind(row)?,
         })
     }
 
@@ -140,6 +143,7 @@ where
         .bind(&reading.carrier_path)
         .bind(&reading.carrier_sha256)
         .bind(&reading.host_gate)
+        .bind(reading.check_kind.map(PrincipleCheckKind::as_str))
         .execute(exec)
         .await
         .map_err(|e| SFError::Database(format!("record reading for {}: {e}", reading.slug)))?;
@@ -169,6 +173,7 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
                 .bind(&reading.carrier_path)
                 .bind(&reading.carrier_sha256)
                 .bind(&reading.host_gate)
+                .bind(reading.check_kind.map(PrincipleCheckKind::as_str))
                 .execute(&self.pool)
                 .await
                 .map_err(|e| SFError::Database(format!("declare {}: {e}", reading.slug)))?;
@@ -377,6 +382,42 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
         Ok(census)
     }
 
+    async fn check_kind_census(&self) -> SFResult<PrincipleCheckKindCensus> {
+        let rows = sqlx::query(CHECK_KIND_CENSUS_SQL)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
+        let mut census = PrincipleCheckKindCensus::default();
+        for row in &rows {
+            // The query groups the undeclared rows under their own key, so a row
+            // reaching this loop with no tier is the fifth count rather than an
+            // error: `NULL` is a value this column is allowed to hold, and it is
+            // the one that says nobody has said how the row is checked.
+            let kind: Option<String> = row
+                .try_get("check_kind")
+                .map_err(|e| SFError::Database(e.to_string()))?;
+            let n: i64 = row
+                .try_get("n")
+                .map_err(|e| SFError::Database(e.to_string()))?;
+            let n = n.max(0) as u64;
+            match kind.as_deref() {
+                Some(text) => match PrincipleCheckKind::parse(text) {
+                    Some(PrincipleCheckKind::Shape) => census.shape += n,
+                    Some(PrincipleCheckKind::Tree) => census.tree += n,
+                    Some(PrincipleCheckKind::Live) => census.live += n,
+                    Some(PrincipleCheckKind::Judgement) => census.judgement += n,
+                    None => {
+                        return Err(SFError::Database(format!(
+                            "check_kind column holds `{text}`, which is not a check kind"
+                        )))
+                    }
+                },
+                None => census.undeclared += n,
+            }
+        }
+        Ok(census)
+    }
+
     async fn report_refusals(&self, events: &[PrincipleRefusal]) -> SFResult<usize> {
         let mut queued = 0usize;
         for event in events {
@@ -490,17 +531,18 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
 /// `first_seen_at` is set by the column default on insert and not written on
 /// conflict, so it stays the moment the row entered the account.
 ///
-/// `host_gate` and the carrier fields keep what is already there when the
-/// reading carries nothing for them: a reading from a source that does not know
-/// about a field is not a reading that found the field empty.
+/// `host_gate`, `check_kind` and the carrier fields keep what is already there
+/// when the reading carries nothing for them: a reading from a source that does
+/// not know about a field is not a reading that found the field empty.
 const RECORD_READING_SQL: &str = "\
-INSERT INTO principle_ledger (slug, lead, carrier_path, carrier_sha256, host_gate)
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO principle_ledger (slug, lead, carrier_path, carrier_sha256, host_gate, check_kind)
+VALUES ($1, $2, $3, $4, $5, $6)
 ON CONFLICT (slug) DO UPDATE SET
     lead = COALESCE(EXCLUDED.lead, principle_ledger.lead),
     carrier_path = COALESCE(EXCLUDED.carrier_path, principle_ledger.carrier_path),
     carrier_sha256 = COALESCE(EXCLUDED.carrier_sha256, principle_ledger.carrier_sha256),
-    host_gate = COALESCE(EXCLUDED.host_gate, principle_ledger.host_gate)";
+    host_gate = COALESCE(EXCLUDED.host_gate, principle_ledger.host_gate),
+    check_kind = COALESCE(EXCLUDED.check_kind, principle_ledger.check_kind)";
 
 /// Queue a reading, or leave the one already queued for this principle and
 /// source exactly as it is.
@@ -511,8 +553,9 @@ ON CONFLICT (slug) DO UPDATE SET
 /// host said about this principle" a value that changes without the host
 /// changing, which is the same merge the account's own reading path refuses.
 const DECLARE_SQL: &str = "\
-INSERT INTO principle_ledger_declared (slug, source, lead, carrier_path, carrier_sha256, host_gate)
-VALUES ($1, $2, $3, $4, $5, $6)
+INSERT INTO principle_ledger_declared (slug, source, lead, carrier_path, carrier_sha256, host_gate, \
+check_kind)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
 ON CONFLICT (slug, source) DO NOTHING";
 
 /// The readings one fold takes, oldest first.
@@ -522,7 +565,7 @@ ON CONFLICT (slug, source) DO NOTHING";
 /// takes would follow whatever order the scan returned -- a different set on the
 /// next run, and a different one again on the other dialect.
 const FOLD_SELECT_SQL: &str = "\
-SELECT slug, source, lead, carrier_path, carrier_sha256, host_gate
+SELECT slug, source, lead, carrier_path, carrier_sha256, host_gate, check_kind
 FROM principle_ledger_declared
 WHERE folded_at IS NULL
 ORDER BY declared_at ASC, slug ASC, source ASC
@@ -580,6 +623,16 @@ ON CONFLICT (slug) DO UPDATE SET
 const CENSUS_SQL: &str = "\
 SELECT state, count(*) AS n FROM principle_ledger
 GROUP BY state";
+
+/// The same census by the tier that checks each row, the undeclared rows grouped
+/// under `NULL`.
+///
+/// A separate statement from the state census rather than a `state, check_kind`
+/// cross product: the two questions are asked by different readers at different
+/// times, and a joint grouping would make each one pay for the other's cardinality.
+const CHECK_KIND_CENSUS_SQL: &str = "\
+SELECT check_kind, count(*) AS n FROM principle_ledger
+GROUP BY check_kind";
 
 /// Queue one refusal, or leave the one already queued for this principle,
 /// instant and source exactly as it is.
@@ -648,6 +701,26 @@ fn check_fits(what: &str, value: &str, max: usize) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The tier a row carries, or why it cannot be read.
+///
+/// A stored string this contract does not know fails the read instead of being
+/// dropped or defaulted. Dropping it would report a classified principle as
+/// unclassified -- the one thing the column exists to tell apart -- and defaulting
+/// it would invent a tier nobody declared. Both are the same error the state
+/// column refuses, applied to the column that says who is meant to check the
+/// principle.
+fn parse_check_kind(row: &sqlx::postgres::PgRow) -> Result<Option<PrincipleCheckKind>, String> {
+    let raw: Option<String> = row
+        .try_get("check_kind")
+        .map_err(|e| format!("check_kind: {e}"))?;
+    match raw {
+        Some(text) => Ok(Some(PrincipleCheckKind::parse(&text).ok_or_else(|| {
+            format!("check_kind column holds `{text}`, which is not a check kind")
+        })?)),
+        None => Ok(None),
+    }
 }
 
 /// Every reading is checked before it is written, wherever it came from, so a

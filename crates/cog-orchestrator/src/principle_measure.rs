@@ -126,6 +126,12 @@ pub enum Verdict {
     Enforced(GateSide),
     /// Both registries were read and neither names a gate. A debt.
     Unenforced,
+    /// The principle is one a person holds: no machine gate is meant to exist, so
+    /// neither registry's silence about it is a finding. Distinct from a debt --
+    /// a debt is work that a gate would clear, and this row's "no gate" cannot be
+    /// cleared by any amount of work, so counting it as one makes the ungated
+    /// number a count that never falls.
+    HumanOnly,
     /// The look could not settle it, and says why.
     Unsettled {
         reason: UnsettledReason,
@@ -150,6 +156,7 @@ impl Verdict {
         match self {
             Verdict::Enforced(_) => Some(cog_core::PrincipleState::Enforced),
             Verdict::Unenforced => Some(cog_core::PrincipleState::Unenforced),
+            Verdict::HumanOnly => None,
             Verdict::Unsettled { .. } => None,
         }
     }
@@ -290,6 +297,16 @@ fn is_slug(slug: &str) -> bool {
 /// is no fallback: a host column that is empty or absent is *not* a gate, and it
 /// is not the absence of one either.
 pub fn judge(row: &PrincipleRow, declarations: &Declarations) -> Verdict {
+    // A principle whose tier a person holds settles here, before either registry
+    // is asked. Asking them would report it as a debt the moment neither named a
+    // gate -- and no gate is meant to, so the debt would be permanent, and every
+    // count of ungated principles would carry it forever. The tier is the record
+    // that this is a person's to decide; nothing the registries say can change
+    // that, so the look stops here rather than reading their silence as an
+    // answer.
+    if row.check_kind == Some(cog_core::PrincipleCheckKind::Judgement) {
+        return Verdict::HumanOnly;
+    }
     let platform = declarations.gate_for(&row.slug);
     match row.host_gate.as_deref().map(str::trim) {
         // No value and an empty value are the same reading: the host's column
@@ -368,6 +385,7 @@ mod tests {
             carrier_sha256: None,
             host_gate: host.map(str::to_string),
             platform_gate: None,
+            check_kind: None,
             state: None,
             refusals: 0,
             last_refused_at: None,
@@ -394,6 +412,43 @@ mod tests {
         let verdict = judge(&row("feedback_x", Some("-")), &Declarations::default());
         assert_eq!(verdict, Verdict::Unenforced);
         assert_eq!(verdict.state(), Some(cog_core::PrincipleState::Unenforced));
+    }
+
+    /// A `judgement` row settles on its tier, and the registries are never asked.
+    /// The row here carries exactly the reading that would otherwise be a debt --
+    /// a `-` in the host column with nothing in the platform's -- and the tier is
+    /// what keeps it from being written down as one. A person holds this
+    /// principle; no gate is meant to, so neither registry's silence is a finding
+    /// and the ungated count must not carry it forever.
+    #[test]
+    fn a_judgement_row_settles_on_its_tier_before_the_registries_are_asked() {
+        let mut held = row("feedback_x", Some("-"));
+        held.check_kind = Some(cog_core::PrincipleCheckKind::Judgement);
+        let verdict = judge(&held, &Declarations::default());
+        assert_eq!(verdict, Verdict::HumanOnly);
+        assert_eq!(verdict.state(), None);
+        assert_eq!(verdict.reason(), None);
+    }
+
+    /// The tier is the whole reason the answer is HumanOnly: the same reading on
+    /// a row of any other tier is still a debt. The short-circuit keys on the
+    /// tier and not on the registries, so a row that names a machine-checkable
+    /// tier is judged exactly as before.
+    #[test]
+    fn a_machine_checkable_row_is_still_a_debt() {
+        for kind in [
+            cog_core::PrincipleCheckKind::Shape,
+            cog_core::PrincipleCheckKind::Tree,
+            cog_core::PrincipleCheckKind::Live,
+        ] {
+            let mut row = row("feedback_x", Some("-"));
+            row.check_kind = Some(kind);
+            assert_eq!(
+                judge(&row, &Declarations::default()),
+                Verdict::Unenforced,
+                "{kind:?}"
+            );
+        }
     }
 
     /// A gate in either registry is a gate. Neither side is a tiebreak for the
