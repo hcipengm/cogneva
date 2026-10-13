@@ -1341,7 +1341,7 @@ pub fn terminated_exit_code(pod: &serde_json::Value, container: &str) -> Option<
 
 /// 从 Job 的那个 Pod 上读退出码。
 ///
-/// 两个标签都试：`job-name` 是老的（弃用但仍在写），`batch.kubernetes.io/job-name`
+/// 两个标签都试：`job-name` 是老的（已废弃但仍在写），`batch.kubernetes.io/job-name`
 /// 是新的。两个都问不到就是那个 Pod 已经不在了——这时报错，不拿 Job 的成败凑一个
 /// 类别出来。
 async fn job_exit_code(kubectl: &str, namespace: &str, job_name: &str) -> SFResult<i32> {
