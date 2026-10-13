@@ -114,10 +114,16 @@ pub const GONE_KIND: &str = "gone";
 
 /// Every kind the judge can answer, for a reader that has to enumerate them.
 ///
-/// The one place the kind vocabulary is written down. A kind the intake accepts
-/// but this does not name is a row nothing will ever measure -- it reads as
-/// outstanding for good -- so the intake's set and this one are meant to be the
-/// same set, and the intake is meant to read this one rather than carry its own.
+/// The vocabulary's written-down form is `crates/cogneva/contracts/change-kinds.tsv`
+/// -- one row per kind, carrying which way its check points and whether a
+/// declaration may take it. These constants are this crate's binding to that
+/// file and not a second copy of it: a gate compares the two as sets, both ways,
+/// so a kind added on either side without the other is red.
+///
+/// The intake is the third side and is not tied to the file mechanically -- it
+/// lives in the private repository that feeds this account and cannot read it. A
+/// kind the intake accepts but this does not name is a row nothing will ever
+/// measure: it reads as outstanding for good.
 pub const JUDGEABLE_KINDS: [&str; 6] = [
     GREP_KIND,
     EXISTS_KIND,
@@ -126,6 +132,16 @@ pub const JUDGEABLE_KINDS: [&str; 6] = [
     ABSENCE_KINDS[1],
     ABSENCE_KINDS[2],
 ];
+
+/// The kinds no predicate answers, kept as names so a gate can compare them.
+///
+/// Retired, not deleted: a row already in the account under one of these names
+/// still has to be nameable in order to be retired, so the name is still part of
+/// the vocabulary even though no declaration may carry it. Written once here
+/// because the judge's dispatch arm and the vocabulary gate both have to agree
+/// on which names those are, and a literal spelled out at each would be two
+/// places to change one thing.
+pub const RETIRED_KINDS: [&str; 2] = ["absent", "missing"];
 
 /// The tree this deployment measures against.
 ///
@@ -443,7 +459,7 @@ impl CheckTree {
             // two stay unsettled so that the rows already written under them keep
             // reading as a criterion to rewrite rather than settling as a verdict
             // no look reached.
-            "absent" | "missing" => CheckOutcome::unsettled(
+            kind if RETIRED_KINDS.contains(&kind) => CheckOutcome::unsettled(
                 UnsettledReason::KindWithoutPredicate,
                 "a check written as an absence is written both for `this must be gone` \
                  and for `a search of this path found nothing`, and the check itself \
@@ -981,7 +997,7 @@ mod tests {
     #[tokio::test]
     async fn an_absence_check_retracts_its_row_rather_than_landing_it() {
         let tree = CheckTree::new("/nonexistent", "main");
-        for kind in ["absent", "missing"] {
+        for kind in RETIRED_KINDS {
             let outcome = tree
                 .judge(&snapshot(), &identity(kind, "crates/x", "y"))
                 .await;
@@ -1026,7 +1042,7 @@ mod tests {
     /// search from landing the row it was evidence against.
     #[test]
     fn the_ambiguous_kinds_are_not_published_as_judgeable() {
-        for kind in ["absent", "missing"] {
+        for kind in RETIRED_KINDS {
             assert!(
                 !JUDGEABLE_KINDS.contains(&kind),
                 "`{kind}` means two opposite things and has no predicate"
