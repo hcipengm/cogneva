@@ -295,13 +295,12 @@ impl GatewayState {
         &self,
         notification: cog_core::Notification,
     ) -> cog_core::SFResult<()> {
-        if let Some(ref store) = self.notification_store {
-            store.create(notification.clone()).await?;
-        }
-        if let Some(ref dispatcher) = self.notification_dispatcher {
-            dispatcher.dispatch(&notification).await?;
-        }
-        Ok(())
+        cog_core::persist_then_dispatch(
+            self.notification_store.as_ref(),
+            self.notification_dispatcher.as_ref(),
+            notification,
+        )
+        .await
     }
 }
 

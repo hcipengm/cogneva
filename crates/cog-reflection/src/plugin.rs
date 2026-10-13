@@ -1614,18 +1614,17 @@ async fn notify_sandbox_downgrade(ctx: &cog_core::PluginContext, reason: &str) {
         read_at: None,
     };
 
+    // The order and the failure rule come from the contract, not from here: a
+    // store that failed means the dispatch does not happen, so an operator is
+    // never sent to a notification list that does not contain what they were
+    // just told. This site warns instead of propagating because a downgrade
+    // must still be reported by the log even when no channel took it.
     let store = ctx.consume_service::<dyn cog_core::NotificationStore>();
-    if let Some(store) = store {
-        if let Err(e) = store.create(notification.clone()).await {
-            warn!(error = %e, "Failed to persist sandbox-downgrade notification");
-        }
-    }
-
     let dispatcher = ctx.consume_service::<dyn cog_core::NotificationDispatcher>();
-    if let Some(dispatcher) = dispatcher {
-        if let Err(e) = dispatcher.dispatch(&notification).await {
-            warn!(error = %e, "Failed to dispatch sandbox-downgrade notification");
-        }
+    if let Err(e) =
+        cog_core::persist_then_dispatch(store.as_ref(), dispatcher.as_ref(), notification).await
+    {
+        warn!(error = %e, "Failed to persist and dispatch sandbox-downgrade notification");
     }
 }
 
