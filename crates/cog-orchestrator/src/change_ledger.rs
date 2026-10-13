@@ -729,8 +729,24 @@ async fn measure_pass(
         // No observation travels with the write. What this look saw is the check
         // and the revision, and the revision rides in its own column rather than
         // in a rendered note the storage does not keep.
-        let measurement =
-            ChangeMeasurement::new(row.identity.clone(), state).at_revision(snapshot.rev());
+        //
+        // An undecided row is retracted for a reason that is a property of the
+        // row itself, and that reason is the whole answer to "why will this never
+        // settle by retrying". It is written with the state so a reader can ask
+        // *which* rows are stuck for *which* reason instead of only how many are
+        // stuck: the reason travels as its name, because the vocabulary is this
+        // judge's and the storage contract does not depend on this module.
+        let measurement = match state {
+            ChangeState::Undecided => ChangeMeasurement::undecided(
+                row.identity.clone(),
+                outcome
+                    .reason()
+                    .expect("an undecided state is reached only through a reason")
+                    .as_str(),
+            )
+            .at_revision(snapshot.rev()),
+            _ => ChangeMeasurement::new(row.identity.clone(), state).at_revision(snapshot.rev()),
+        };
         if let Err(e) = store.apply_measurement(&measurement).await {
             // Counted as measured because it was, not because it was stored: the
             // line below is what says the write failed, and a state that did not
@@ -1157,12 +1173,48 @@ fn still_unanswered(known: &UnsettledCheck, now: Instant) -> bool {
 /// at and is still owed. One number covering both would state them as one fact.
 /// A `landed` row is not outstanding -- the query excludes it -- so one showing
 /// up here means the storage filter broke, not that the ledger grew a row.
+///
+/// The undecided rows are broken down by the reason they are stuck, because that
+/// reason is the whole answer to why they will never settle and it is a property
+/// of the row, not of any one pass. The pass's own `unsettled` field cannot give
+/// it: it counts only the rows *that* pass asked, so a row the pass did not reach
+/// -- which, over passes, is most of them -- never appears there. The reason is
+/// rendered in the closed set's order so two readings diff cleanly, and a row
+/// measured before the reason was persisted reads as `unstated` rather than being
+/// dropped, so the breakdown always sums to the undecided count.
 fn outstanding_summary(rows: &[ChangeLedgerRow]) -> String {
     let by_state = ChangeState::ALL
         .into_iter()
         .filter_map(|state| {
             let n = rows.iter().filter(|row| row.state == state).count();
-            (n > 0).then(|| format!("{} {}", state.as_str(), n))
+            if n == 0 {
+                return None;
+            }
+            if state != ChangeState::Undecided {
+                return Some(format!("{} {}", state.as_str(), n));
+            }
+            let stuck: Vec<&ChangeLedgerRow> = rows
+                .iter()
+                .filter(|row| row.state == ChangeState::Undecided)
+                .collect();
+            let mut parts: Vec<String> = UnsettledReason::ALL
+                .iter()
+                .filter_map(|reason| {
+                    let m = stuck
+                        .iter()
+                        .filter(|row| row.unsettled_reason.as_deref() == Some(reason.as_str()))
+                        .count();
+                    (m > 0).then(|| format!("{} {}", reason.as_str(), m))
+                })
+                .collect();
+            let unstated = stuck
+                .iter()
+                .filter(|row| row.unsettled_reason.is_none())
+                .count();
+            if unstated > 0 {
+                parts.push(format!("unstated {unstated}"));
+            }
+            Some(format!("undecided {n} ({})", parts.join(", ")))
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -1197,6 +1249,7 @@ mod tests {
             measured_at: measured_at.map(|s| Utc.timestamp_opt(s, 0).unwrap()),
             measured_rev: None,
             landed_at: None,
+            unsettled_reason: None,
             retire_reason: None,
             retired_at: None,
         }
@@ -1213,8 +1266,38 @@ mod tests {
         ];
         assert_eq!(
             outstanding_summary(&rows),
-            "3 outstanding: pending 2, undecided 1; never measured 1; \
+            "3 outstanding: pending 2, undecided 1 (unstated 1); never measured 1; \
              oldest measurement 2025-10-09T08:53:20+00:00"
+        );
+    }
+
+    /// The undecided rows are split by the reason they are stuck, in the closed
+    /// set's order, and a row with no reason persisted yet reads as unstated
+    /// rather than vanishing -- so the parts always sum to the undecided count.
+    ///
+    /// This is the reading the pass's own `unsettled` field cannot give: that
+    /// field counts only the rows the pass asked, so a row the pass did not reach
+    /// is missing from it entirely, and "why is this stuck" is unanswerable from
+    /// the ledger once the log rolls.
+    #[test]
+    fn the_summary_splits_the_undecided_rows_by_reason() {
+        let stuck = |reason: Option<&str>| ChangeLedgerRow {
+            state: ChangeState::Undecided,
+            unsettled_reason: reason.map(str::to_string),
+            ..row(ChangeState::Undecided, Some(1_760_000_000))
+        };
+        let rows = vec![
+            stuck(Some("scope_outside_tree")),
+            stuck(Some("kind_without_predicate")),
+            stuck(Some("scope_outside_tree")),
+            stuck(None),
+            row(ChangeState::Pending, Some(1_760_000_000)),
+        ];
+        assert_eq!(
+            outstanding_summary(&rows),
+            "5 outstanding: pending 1, undecided 4 \
+             (kind_without_predicate 1, scope_outside_tree 2, unstated 1); \
+             never measured 0; oldest measurement 2025-10-09T08:53:20+00:00"
         );
     }
 
@@ -1243,7 +1326,7 @@ mod tests {
         ];
         assert_eq!(
             outstanding_summary(&rows),
-            "2 outstanding: conflict 1, undecided 1; never measured 2"
+            "2 outstanding: conflict 1, undecided 1 (unstated 1); never measured 2"
         );
     }
 

@@ -101,6 +101,16 @@ jobs:
         run: cargo test -p cog-storage --test partition_maintainer -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The change ledger's reason column is written through one statement and
+      # read through a fixed column list, and both are the kind of coupling a
+      # DB-free test cannot see: a column added to the write and not the read
+      # fails only against a server, and "a reason outside the closed set is
+      # refused" is a fact about the column's own constraint. Without this the
+      # round trip that the reason column exists to make possible is never run.
+      - name: Live-DB change-ledger store
+        run: cargo test -p cog-storage --test change_ledger_store -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The sample-log sweep is expressed almost entirely as one DELETE, so its
       # correctness cannot be checked without a server; the DB-free tests beside
       # it only cover the sweep period. Leaving these out of the gate is how a

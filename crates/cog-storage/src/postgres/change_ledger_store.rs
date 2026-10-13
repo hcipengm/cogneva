@@ -23,7 +23,7 @@ use cog_core::{
 /// differently ordered columns.
 const ROW_COLUMNS: &str = "kind, scope, literal, state, title, assertion, sources, \
                            first_seen_at, measured_at, measured_rev, landed_at, \
-                           retire_reason, retired_at";
+                           unsettled_reason, retire_reason, retired_at";
 
 /// How wide each keyed identity part may be, taken from the columns that key
 /// them rather than from what a caller would like to write.
@@ -77,6 +77,14 @@ impl PostgresChangeLedgerStore {
                     .map_err(|e| format!("retire_reason column holds {e}"))
             })
             .transpose()?;
+        // The unsettled reason is read as it stands rather than parsed into a
+        // closed set: the vocabulary is the judge's, which this crate does not
+        // depend on, and the column's own constraint already refuses a value
+        // outside the set, so there is nothing here for a parse to catch that the
+        // write did not.
+        let unsettled_reason: Option<String> = row
+            .try_get("unsettled_reason")
+            .map_err(|e| format!("unsettled_reason: {e}"))?;
         Ok(ChangeLedgerRow {
             identity: ChangeIdentity::new(
                 row.try_get::<String, _>("kind")
@@ -104,6 +112,7 @@ impl PostgresChangeLedgerStore {
             landed_at: row
                 .try_get("landed_at")
                 .map_err(|e| format!("landed_at: {e}"))?,
+            unsettled_reason,
             retire_reason,
             retired_at: row
                 .try_get("retired_at")
@@ -187,9 +196,13 @@ ON CONFLICT (kind, scope, literal) DO UPDATE SET
 /// statement that writes the state: taken from the caller instead, a completion
 /// time would be a value the measured side supplies.
 ///
-/// The reason is written exactly as the measurement carries it -- `NULL` for
-/// every state but `retired` -- so the row and the state agree by construction,
-/// the same way `landed` agrees with `landed_at`.
+/// Both reasons are written exactly as the measurement carries them -- `NULL` for
+/// every state but the one each belongs to -- so the row and the state agree by
+/// construction, the same way `landed` agrees with `landed_at`. Every state
+/// except `retired` clears `retire_reason`, and every state except `undecided`
+/// clears `unsettled_reason`: a reason left beside a state it does not describe
+/// would read as one, so a row re-measured out of `undecided` does not keep the
+/// reason beside a state that is no longer undecided.
 ///
 /// The revision is the caller's, and it takes the caller's `NULL` with it: a
 /// measurement that named no revision must clear whatever revision was there
@@ -197,10 +210,11 @@ ON CONFLICT (kind, scope, literal) DO UPDATE SET
 /// state measured against a tree it was never measured against.
 const APPLY_MEASUREMENT_SQL: &str = "\
 INSERT INTO change_ledger (
-    kind, scope, literal, state, measured_rev, retire_reason, measured_at, landed_at, retired_at
+    kind, scope, literal, state, measured_rev, retire_reason, unsettled_reason,
+    measured_at, landed_at, retired_at
 )
 VALUES (
-    $1, $2, $3, $4, $5, $6, now(),
+    $1, $2, $3, $4, $5, $6, $7, now(),
     CASE WHEN $4 = 'landed' THEN now() ELSE NULL END,
     CASE WHEN $4 = 'retired' THEN now() ELSE NULL END
 )
@@ -208,6 +222,7 @@ ON CONFLICT (kind, scope, literal) DO UPDATE SET
     state = EXCLUDED.state,
     measured_rev = EXCLUDED.measured_rev,
     retire_reason = EXCLUDED.retire_reason,
+    unsettled_reason = EXCLUDED.unsettled_reason,
     measured_at = now(),
     landed_at = CASE
         WHEN EXCLUDED.state = 'landed' THEN COALESCE(change_ledger.landed_at, now())
@@ -258,29 +273,45 @@ fn check_reading(reading: &ChangeReading) -> Result<(), String> {
 
 /// Refuse a measurement whose state and reason do not agree.
 ///
-/// The invariant is that a row is retired if and only if it carries a reason.
-/// [`ChangeMeasurement::retired`] makes a reason-less retirement unbuildable, so
-/// the half this catches is the other direction -- a reason left on a measurement
-/// of some other state, which would write a row that is not retired while holding
-/// a reason it is not. Checked here as well as constrained in the schema because
-/// the dialects disagree: Postgres can hold the coupling in a CHECK, MySQL 5.7
-/// cannot, and a rule that only one dialect enforces is a rule the store cannot
-/// rely on.
+/// Two invariants: a row is retired if and only if it carries a `retire_reason`,
+/// and a row is undecided if and only if it carries an `unsettled_reason`.
+/// [`ChangeMeasurement::retired`] and [`ChangeMeasurement::undecided`] make a
+/// reason-less retirement and a reason-less undecided row unbuildable, so the half
+/// this catches is the other direction -- a reason left on a measurement of some
+/// other state, which would write a row that is not in that state while holding a
+/// reason it is not. Checked here as well as constrained in the schema because the
+/// dialects disagree: Postgres can hold the coupling in a CHECK, MySQL 5.7 cannot,
+/// and a rule that only one dialect enforces is a rule the store cannot rely on.
 fn check_measurement(m: &ChangeMeasurement) -> Result<(), String> {
     match (m.state, m.retire_reason) {
-        (ChangeState::Retired, None) => Err(
-            "a retired measurement carries no reason, which would be a deletion \
-             wearing a state's clothes"
+        (ChangeState::Retired, None) => {
+            return Err(
+                "a retired measurement carries no reason, which would be a deletion \
+                 wearing a state's clothes"
+                    .to_string(),
+            );
+        }
+        (state, Some(reason)) if state != ChangeState::Retired => {
+            return Err(format!(
+                "a {} measurement carries the retire reason {}, which belongs only to a \
+                 retired row",
+                state.as_str(),
+                reason.as_str()
+            ));
+        }
+        _ => {}
+    }
+    match (m.state, m.unsettled_reason.as_deref()) {
+        (ChangeState::Undecided, None) => Err(
+            "an undecided measurement carries no reason, which would read as answered"
                 .to_string(),
         ),
-        (ChangeState::Retired, Some(_)) => Ok(()),
-        (state, Some(reason)) => Err(format!(
-            "a {} measurement carries the retire reason {}, which belongs only to a \
-             retired row",
-            state.as_str(),
-            reason.as_str()
+        (state, Some(reason)) if state != ChangeState::Undecided => Err(format!(
+            "a {} measurement carries the unsettled reason {reason}, which belongs only to \
+             an undecided row",
+            state.as_str()
         )),
-        (_, None) => Ok(()),
+        _ => Ok(()),
     }
 }
 
@@ -435,6 +466,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
             .bind(measurement.state.as_str())
             .bind(&measurement.measured_rev)
             .bind(measurement.retire_reason.map(RetireReason::as_str))
+            .bind(&measurement.unsettled_reason)
             .execute(&self.pool)
             .await
             .map_err(|e| {

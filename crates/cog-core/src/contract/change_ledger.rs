@@ -241,6 +241,15 @@ pub struct ChangeLedgerRow {
     /// measurement, so `state == Landed` and this being present agree by
     /// construction.
     pub landed_at: Option<DateTime<Utc>>,
+    /// Why the row is `undecided`, when it is. `None` in every other state.
+    ///
+    /// A row is `undecided` only for a reason that is a property of the row
+    /// itself rather than of the look, so this is the reason the row will never
+    /// settle by retrying. Kept as a name from the judge's closed set, as text:
+    /// the vocabulary belongs to the judge, and threading the judge's type
+    /// through here would make the storage contract depend on the judge's module.
+    /// A value outside the set is refused by the column's own constraint.
+    pub unsettled_reason: Option<String>,
     /// Why the change was retired, when it was. `None` in every other state:
     /// the reason is part of the retirement rather than a field every row
     /// carries, and a reason left beside a row that is not retired would read as
@@ -272,6 +281,13 @@ pub struct ChangeMeasurement {
     /// be a deletion wearing a state's clothes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retire_reason: Option<RetireReason>,
+    /// Why, when the state is [`ChangeState::Undecided`]. `None` for every other
+    /// state, and required for that one: a row retracted from the outstanding set
+    /// without a reason to argue with would read as answered. A name from the
+    /// judge's closed set, as text for the same reason [`ChangeLedgerRow`] keeps
+    /// it as text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unsettled_reason: Option<String>,
     /// What the measurement saw, kept with the row so a state that disagrees
     /// with the tree can be argued with rather than merely disbelieved.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -302,10 +318,35 @@ impl ChangeMeasurement {
             ChangeState::Retired,
             "a retirement must be built with ChangeMeasurement::retired so it carries a reason"
         );
+        assert_ne!(
+            state,
+            ChangeState::Undecided,
+            "an undecided measurement must be built with ChangeMeasurement::undecided so it carries a reason"
+        );
         Self {
             identity,
             state,
             retire_reason: None,
+            unsettled_reason: None,
+            observation: None,
+            measured_rev: None,
+        }
+    }
+
+    /// A measurement that could not settle the row because of a property of the
+    /// row itself, with the reason it could not.
+    ///
+    /// The reason is an argument rather than a field a caller may leave empty, so
+    /// an undecided measurement with no reason is not a value that can be built --
+    /// the same shape [`ChangeMeasurement::retired`] has, and for the same
+    /// reason: a row moved out of the outstanding set with nothing to say why
+    /// would read as answered.
+    pub fn undecided(identity: ChangeIdentity, reason: impl Into<String>) -> Self {
+        Self {
+            identity,
+            state: ChangeState::Undecided,
+            retire_reason: None,
+            unsettled_reason: Some(reason.into()),
             observation: None,
             measured_rev: None,
         }
@@ -323,6 +364,7 @@ impl ChangeMeasurement {
             identity,
             state: ChangeState::Retired,
             retire_reason: Some(reason),
+            unsettled_reason: None,
             observation: None,
             measured_rev: None,
         }
@@ -642,5 +684,38 @@ mod tests {
             ChangeState::Pending,
         );
         assert_eq!(pending.retire_reason, None);
+    }
+
+    /// An undecided row cannot be written without the reason it is undecided,
+    /// the same way a retirement cannot be written without its reason: a row
+    /// retracted from the outstanding set with nothing to say why would read as
+    /// answered.
+    #[test]
+    #[should_panic(expected = "must be built with ChangeMeasurement::undecided")]
+    fn an_undecided_measurement_without_a_reason_cannot_be_built() {
+        let _ = ChangeMeasurement::new(
+            ChangeIdentity::new("grep", "crates/", "x"),
+            ChangeState::Undecided,
+        );
+    }
+
+    #[test]
+    fn an_undecided_measurement_carries_its_reason_and_a_plain_one_carries_none() {
+        let undecided = ChangeMeasurement::undecided(
+            ChangeIdentity::new("grep", "crates/", "x"),
+            "kind_without_predicate",
+        );
+        assert_eq!(undecided.state, ChangeState::Undecided);
+        assert_eq!(
+            undecided.unsettled_reason.as_deref(),
+            Some("kind_without_predicate")
+        );
+        assert_eq!(undecided.retire_reason, None);
+
+        let pending = ChangeMeasurement::new(
+            ChangeIdentity::new("grep", "crates/", "x"),
+            ChangeState::Pending,
+        );
+        assert_eq!(pending.unsettled_reason, None);
     }
 }
