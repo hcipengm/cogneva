@@ -17,7 +17,8 @@ use cog_core::{MessageBackend, MessageStream, NatsConfig, SFError, SFResult};
 /// from [`NatsConfig::stream_retention`] (default `WorkQueue`).
 /// Consumer groups are mapped to durable JetStream pull consumers.
 /// Received messages are held in an internal map so that [`Self::ack`] can
-/// reference them by sequence number.
+/// reference them; the map is keyed by stream, consumer group and sequence
+/// together, since a sequence number is unique only within one stream.
 pub struct NatsMessageBackend {
     jetstream: jetstream::Context,
     /// 连接本身，只用来读服务器声明的消息大小上限。JetStream 的发布路径
@@ -28,6 +29,24 @@ pub struct NatsMessageBackend {
     pending_acks: Arc<RwLock<HashMap<String, async_nats::jetstream::Message>>>,
     consumer_tuning: ConsumerTuning,
     stream_retention: RetentionPolicy,
+}
+
+/// Key for the in-flight map, and for the lookup `ack` does in it.
+///
+/// A JetStream sequence number is unique only *within* a stream, and the
+/// sequence is the whole of what the caller hands back on `ack`. Keying the map
+/// on the sequence alone therefore lets two subscribers reading different
+/// streams collide whenever their deliveries happen to share a sequence, and
+/// the loser's `ack` confirms the other stream's message -- a message the
+/// broker then never redelivers, while the one actually processed stays
+/// unconfirmed. The stream and the consumer group are part of the message's
+/// identity, so they are part of the key.
+///
+/// The separator is a control character, which no subject or group name may
+/// contain, so no pair of distinct (stream, group, id) triples can join into
+/// the same key.
+fn pending_key(stream: &str, group: &str, id: &str) -> String {
+    format!("{stream}\u{1}{group}\u{1}{id}")
 }
 
 /// Parse [`NatsConfig::stream_retention`] into a JetStream retention policy.
@@ -297,24 +316,31 @@ impl MessageBackend for NatsMessageBackend {
             .await
             .map_err(|e| SFError::DagExecutor(format!("JetStream messages failed: {e}")))?;
 
+        // The stream and group have to outlive this function to be part of the
+        // in-flight key, so they travel into the stream as owned copies rather
+        // than as the borrowed arguments they arrived as.
+        let key_scope = Arc::new((subject.to_string(), group.to_string()));
         let pending = Arc::clone(&self.pending_acks);
         let stream =
-            futures::stream::try_unfold((messages, pending), |(mut msgs, pending)| async move {
-                match msgs.next().await {
-                    Some(Ok(msg)) => {
-                        let seq = msg.info().map(|i| i.stream_sequence).unwrap_or(0);
-                        let id = seq.to_string();
-                        let payload = msg.payload.to_vec();
-                        pending
-                            .write()
-                            .map_err(|_| SFError::Agent("ack lock poisoned".into()))?
-                            .insert(id.clone(), msg);
-                        Ok(Some(((id, payload), (msgs, pending))))
+            futures::stream::try_unfold((messages, pending), move |(mut msgs, pending)| {
+                let key_scope = Arc::clone(&key_scope);
+                async move {
+                    match msgs.next().await {
+                        Some(Ok(msg)) => {
+                            let seq = msg.info().map(|i| i.stream_sequence).unwrap_or(0);
+                            let id = seq.to_string();
+                            let payload = msg.payload.to_vec();
+                            pending
+                                .write()
+                                .map_err(|_| SFError::Agent("ack lock poisoned".into()))?
+                                .insert(pending_key(&key_scope.0, &key_scope.1, &id), msg);
+                            Ok(Some(((id, payload), (msgs, pending))))
+                        }
+                        Some(Err(e)) => Err(SFError::DagExecutor(format!(
+                            "JetStream message error: {e}"
+                        ))),
+                        None => Ok(None),
                     }
-                    Some(Err(e)) => Err(SFError::DagExecutor(format!(
-                        "JetStream message error: {e}"
-                    ))),
-                    None => Ok(None),
                 }
             });
 
@@ -350,24 +376,31 @@ impl MessageBackend for NatsMessageBackend {
             .await
             .map_err(|e| SFError::DagExecutor(format!("JetStream messages failed: {e}")))?;
 
+        // The stream and group have to outlive this function to be part of the
+        // in-flight key, so they travel into the stream as owned copies rather
+        // than as the borrowed arguments they arrived as.
+        let key_scope = Arc::new((subject.to_string(), group.to_string()));
         let pending = Arc::clone(&self.pending_acks);
         let stream =
-            futures::stream::try_unfold((messages, pending), |(mut msgs, pending)| async move {
-                match msgs.next().await {
-                    Some(Ok(msg)) => {
-                        let seq = msg.info().map(|i| i.stream_sequence).unwrap_or(0);
-                        let id = seq.to_string();
-                        let payload = msg.payload.to_vec();
-                        pending
-                            .write()
-                            .map_err(|_| SFError::Agent("ack lock poisoned".into()))?
-                            .insert(id.clone(), msg);
-                        Ok(Some(((id, payload), (msgs, pending))))
+            futures::stream::try_unfold((messages, pending), move |(mut msgs, pending)| {
+                let key_scope = Arc::clone(&key_scope);
+                async move {
+                    match msgs.next().await {
+                        Some(Ok(msg)) => {
+                            let seq = msg.info().map(|i| i.stream_sequence).unwrap_or(0);
+                            let id = seq.to_string();
+                            let payload = msg.payload.to_vec();
+                            pending
+                                .write()
+                                .map_err(|_| SFError::Agent("ack lock poisoned".into()))?
+                                .insert(pending_key(&key_scope.0, &key_scope.1, &id), msg);
+                            Ok(Some(((id, payload), (msgs, pending))))
+                        }
+                        Some(Err(e)) => Err(SFError::DagExecutor(format!(
+                            "JetStream message error: {e}"
+                        ))),
+                        None => Ok(None),
                     }
-                    Some(Err(e)) => Err(SFError::DagExecutor(format!(
-                        "JetStream message error: {e}"
-                    ))),
-                    None => Ok(None),
                 }
             });
 
@@ -383,14 +416,14 @@ impl MessageBackend for NatsMessageBackend {
         Ok(())
     }
 
-    async fn ack(&self, _stream: &str, _group: &str, ids: &[String]) -> SFResult<()> {
+    async fn ack(&self, stream: &str, group: &str, ids: &[String]) -> SFResult<()> {
         for id in ids {
             let msg = {
                 let mut pending = self
                     .pending_acks
                     .write()
                     .map_err(|_| SFError::Agent("ack lock poisoned".into()))?;
-                pending.remove(id)
+                pending.remove(&pending_key(stream, group, id))
             };
             if let Some(msg) = msg {
                 msg.ack()
@@ -450,6 +483,34 @@ fn subject_to_stream_name(subject: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 序号的唯一性只在一条流之内，而调用方 `ack` 时交回的只有序号。两条流
+    /// 各有一条序号相同的投递，键若只取序号，后一条会盖掉前一条，前一条的
+    /// `ack` 就会确认到另一条流的消息上——被确认的那条 broker 不再重投，真正
+    /// 处理过的那条永远重新投递。这一格钉的是「同名序号不撞键」。
+    #[test]
+    fn the_same_sequence_on_two_streams_is_two_keys() {
+        assert_ne!(
+            pending_key("orchestrator:results", "workers", "42"),
+            pending_key("agent:inbox", "workers", "42")
+        );
+        // 组也是消息身份的一部分：同一条流上两个消费者组各自收着一份。
+        assert_ne!(
+            pending_key("agent:inbox", "workers", "42"),
+            pending_key("agent:inbox", "reviewers", "42")
+        );
+        // 反向：同一条消息在两条路上算出同一个键，否则取不回它也确认不了。
+        assert_eq!(
+            pending_key("agent:inbox", "workers", "42"),
+            pending_key("agent:inbox", "workers", "42")
+        );
+        // 分隔符本身不能拼进一个更长的名字里再造出一次撞键。
+        assert_ne!(
+            pending_key("a", "b", "c"),
+            pending_key("a\u{1}b", "", "c"),
+            "拼出来的键必须由三个不可混淆的字段构成"
+        );
+    }
 
     /// 两个上限取小，取到的是「这条消息真的能进去」的那个数：服务器帧是硬
     /// 天花板，流自己的 max_msg_size 只会在它之下再收紧。
