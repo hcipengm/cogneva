@@ -394,8 +394,24 @@ impl CheckTree {
     /// `-F` because the literal is the artifact's spelling and not a pattern: a
     /// literal containing a `.` or a `[` is not a wildcard, and matching it as
     /// one would land changes the tree never had.
+    ///
+    /// A literal bounded by word characters at both ends is matched with word
+    /// boundaries, and that is what keeps a prefix from reading as the artifact.
+    /// A bare substring search lets `principle` match `principle_ledger`, so a
+    /// declaration for a table that was never created reads as landed because a
+    /// *different* table's name begins with it -- and the whole difference the
+    /// account is meant to state, between "there" and "not there", is erased for
+    /// exactly the family of names that share a stem. A literal that starts or
+    /// ends on a non-word character is a fragment that stops mid-token on purpose
+    /// (a call's `foo(` is followed by its argument), and anchoring it would make
+    /// a fragment the tree does hold read as missing, so it keeps the plain
+    /// fixed-string search.
     async fn holds(&self, rev: &str, scope: &str, literal: &str) -> Result<bool, String> {
-        let mut args = vec!["grep", "-q", "-F", "-e", literal, rev];
+        let mut args = vec!["grep", "-q", "-F"];
+        if needs_word_boundaries(literal) {
+            args.push("-w");
+        }
+        args.extend(["-e", literal, rev]);
         if !scope.is_empty() && scope != "." {
             args.push("--");
             args.push(scope);
@@ -530,6 +546,25 @@ fn scope_of(identity: &ChangeIdentity) -> &str {
     identity.scope.trim().trim_matches('`').trim()
 }
 
+/// Whether a literal should be matched with word boundaries at its ends.
+///
+/// True when the first and last characters are both word characters -- the
+/// alphabet an identifier is written in. The edges are what decide, not the whole
+/// literal: a declaration is often a fragment of source (`CREATE TABLE IF NOT
+/// EXISTS principle`), and it is the trailing `principle` running into
+/// `principle_ledger` that turns a check about a table nobody created into a
+/// landed one. Requiring the *entire* literal to be one identifier would exempt
+/// exactly that fragment. A literal whose edge is punctuation (`foo(`) is not
+/// anchored, because in source it is followed by the call's argument and a
+/// boundary there would refuse a fragment the tree holds.
+fn needs_word_boundaries(literal: &str) -> bool {
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    matches!(
+        (literal.chars().next(), literal.chars().last()),
+        (Some(first), Some(last)) if is_word(first) && is_word(last)
+    )
+}
+
 /// The separator a finding is written with, between its scope and its predicate.
 ///
 /// A check is recorded as `grep <scope> :: <literal>`, and the intake splits the
@@ -631,6 +666,29 @@ mod tests {
             "crates/cog-core/src"
         );
         assert_eq!(scope_of(&identity("grep", "crates/x", "y")), "crates/x");
+    }
+
+    /// A literal is anchored when its ends are word characters, whatever is in
+    /// between -- `principle` must not match `principle_ledger`, and neither must
+    /// the multi-word fragment `CREATE TABLE IF NOT EXISTS principle`, whose
+    /// trailing word runs into the same stem. A literal that stops on punctuation
+    /// is left unanchored so a fragment the tree holds still reads as held.
+    #[test]
+    fn a_literal_bounded_by_word_characters_is_matched_by_word() {
+        assert!(needs_word_boundaries("principle"));
+        assert!(needs_word_boundaries("principle_shapes"));
+        assert!(needs_word_boundaries("check_kind"));
+        assert!(needs_word_boundaries(
+            "CREATE TABLE IF NOT EXISTS principle"
+        ));
+        assert!(needs_word_boundaries(
+            "crates/cog-storage/migrations/postgres"
+        ));
+
+        assert!(!needs_word_boundaries("foo("));
+        assert!(!needs_word_boundaries("(principle"));
+        assert!(!needs_word_boundaries("-> principle"));
+        assert!(!needs_word_boundaries(""));
     }
 
     /// A check about some other tree is not a check that missed. The project has
