@@ -149,3 +149,10 @@ cog-notification = { path = "crates/cog-notification" }
 cog-gateway = { path = "crates/cog-gateway" }
 cog-supervisor = { path = "crates/cog-supervisor" }
 cog-github = { path = "crates/cog-github" }
+
+# Keep line tables so backtraces still print file:line, drop the two sections
+# nothing here reads (DWARF .debug_info / .debug_str). The dev profile's full
+# debug info dominates build-cache writes; line tables alone are what
+# panics, `#[track_caller]`, and llvm-cov's line coverage actually consume.
+[profile.dev]
+debug = "line-tables-only"
