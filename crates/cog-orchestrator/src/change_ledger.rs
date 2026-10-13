@@ -797,13 +797,15 @@ async fn dispatch_pass(
     // looked at; measured on the live ledger, the first fifty outstanding rows
     // were all of them `undecided`. A bound the size of the one this pass
     // measures with would therefore hand over nothing for as long as unmeasured
-    // rows remain ahead of them. Taking the whole non-landed set is what makes
-    // "the pending set" the thing this reads, and it needs no constant to stay
-    // true as the ledger grows.
+    // rows remain ahead of them. Taking the whole outstanding set -- both
+    // terminal states excluded, the same exclusion the read itself applies, so the
+    // bound and the set it bounds stay one definition -- is what makes "the
+    // pending set" the thing this reads, and it needs no constant to stay true as
+    // the ledger grows.
     let outstanding_total = match store.census().await {
         Ok(census) => census
             .iter()
-            .filter(|(state, _)| *state != ChangeState::Landed)
+            .filter(|(state, _)| state.is_outstanding())
             .map(|(_, count)| *count)
             .sum::<u64>(),
         Err(e) => {
@@ -1176,6 +1178,8 @@ mod tests {
             measured_at: measured_at.map(|s| Utc.timestamp_opt(s, 0).unwrap()),
             measured_rev: None,
             landed_at: None,
+            retire_reason: None,
+            retired_at: None,
         }
     }
 

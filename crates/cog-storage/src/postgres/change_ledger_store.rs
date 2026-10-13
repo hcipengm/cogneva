@@ -16,13 +16,14 @@ use sqlx::{PgPool, Row};
 
 use cog_core::{
     ChangeIdentity, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement, ChangeReading,
-    ChangeSource, ChangeState, DispatchState, SFError, SFResult,
+    ChangeSource, ChangeState, DispatchState, RetireReason, SFError, SFResult,
 };
 
 /// Every read returns these, in one place so no two readers can come back with
 /// differently ordered columns.
 const ROW_COLUMNS: &str = "kind, scope, literal, state, title, assertion, sources, \
-                           first_seen_at, measured_at, measured_rev, landed_at";
+                           first_seen_at, measured_at, measured_rev, landed_at, \
+                           retire_reason, retired_at";
 
 /// How wide each keyed identity part may be, taken from the columns that key
 /// them rather than from what a caller would like to write.
@@ -62,6 +63,20 @@ impl PostgresChangeLedgerStore {
             .map_err(|e| format!("sources: {e}"))?;
         let sources: Vec<ChangeSource> = serde_json::from_value(sources)
             .map_err(|e| format!("sources column unparsable: {e}"))?;
+        // The reason is parsed from its name the same way the state is: a value
+        // the closed set does not hold fails the read rather than being skipped,
+        // because a retirement whose reason could not be read would be a deletion
+        // again -- the row would be out of the outstanding set with nothing to
+        // say why.
+        let retire_reason: Option<String> = row
+            .try_get("retire_reason")
+            .map_err(|e| format!("retire_reason: {e}"))?;
+        let retire_reason = retire_reason
+            .map(|name| {
+                name.parse::<RetireReason>()
+                    .map_err(|e| format!("retire_reason column holds {e}"))
+            })
+            .transpose()?;
         Ok(ChangeLedgerRow {
             identity: ChangeIdentity::new(
                 row.try_get::<String, _>("kind")
@@ -89,6 +104,10 @@ impl PostgresChangeLedgerStore {
             landed_at: row
                 .try_get("landed_at")
                 .map_err(|e| format!("landed_at: {e}"))?,
+            retire_reason,
+            retired_at: row
+                .try_get("retired_at")
+                .map_err(|e| format!("retired_at: {e}"))?,
         })
     }
 
@@ -156,27 +175,46 @@ ON CONFLICT (kind, scope, literal) DO UPDATE SET
         ELSE change_ledger.sources || EXCLUDED.sources
     END";
 
-/// Write one measurement, with both times taken from the database clock.
+/// Write one measurement, with every time taken from the database clock.
 ///
 /// `landed_at` is kept from the first measurement that found it landed and
 /// cleared when a later one does not, so a row that stopped being satisfied
-/// reads as outstanding rather than as done-and-forgotten. The times come from
-/// `now()` in the same statement that writes the state: taken from the caller
-/// instead, a completion time would be a value the measured side supplies.
+/// reads as outstanding rather than as done-and-forgotten. `retired_at` and
+/// `retire_reason` follow the same rule: a retirement is what the current
+/// measurement found, so a later measurement of any other state clears both, and
+/// a row that is re-examined back out of `retired` does not keep a reason beside
+/// a state it no longer describes. The times come from `now()` in the same
+/// statement that writes the state: taken from the caller instead, a completion
+/// time would be a value the measured side supplies.
+///
+/// The reason is written exactly as the measurement carries it -- `NULL` for
+/// every state but `retired` -- so the row and the state agree by construction,
+/// the same way `landed` agrees with `landed_at`.
 ///
 /// The revision is the caller's, and it takes the caller's `NULL` with it: a
 /// measurement that named no revision must clear whatever revision was there
 /// rather than leave a stale one beside a fresh state, which would read as a
 /// state measured against a tree it was never measured against.
 const APPLY_MEASUREMENT_SQL: &str = "\
-INSERT INTO change_ledger (kind, scope, literal, state, measured_rev, measured_at, landed_at)
-VALUES ($1, $2, $3, $4, $5, now(), CASE WHEN $4 = 'landed' THEN now() ELSE NULL END)
+INSERT INTO change_ledger (
+    kind, scope, literal, state, measured_rev, retire_reason, measured_at, landed_at, retired_at
+)
+VALUES (
+    $1, $2, $3, $4, $5, $6, now(),
+    CASE WHEN $4 = 'landed' THEN now() ELSE NULL END,
+    CASE WHEN $4 = 'retired' THEN now() ELSE NULL END
+)
 ON CONFLICT (kind, scope, literal) DO UPDATE SET
     state = EXCLUDED.state,
     measured_rev = EXCLUDED.measured_rev,
+    retire_reason = EXCLUDED.retire_reason,
     measured_at = now(),
     landed_at = CASE
         WHEN EXCLUDED.state = 'landed' THEN COALESCE(change_ledger.landed_at, now())
+        ELSE NULL
+    END,
+    retired_at = CASE
+        WHEN EXCLUDED.state = 'retired' THEN COALESCE(change_ledger.retired_at, now())
         ELSE NULL
     END";
 
@@ -216,6 +254,34 @@ fn check_reading(reading: &ChangeReading) -> Result<(), String> {
     check_fits("scope", &reading.identity.scope, SCOPE_MAX)?;
     check_fits("literal", &reading.identity.literal, LITERAL_MAX)?;
     check_fits("source document", &reading.source.doc, DOC_MAX)
+}
+
+/// Refuse a measurement whose state and reason do not agree.
+///
+/// The invariant is that a row is retired if and only if it carries a reason.
+/// [`ChangeMeasurement::retired`] makes a reason-less retirement unbuildable, so
+/// the half this catches is the other direction -- a reason left on a measurement
+/// of some other state, which would write a row that is not retired while holding
+/// a reason it is not. Checked here as well as constrained in the schema because
+/// the dialects disagree: Postgres can hold the coupling in a CHECK, MySQL 5.7
+/// cannot, and a rule that only one dialect enforces is a rule the store cannot
+/// rely on.
+fn check_measurement(m: &ChangeMeasurement) -> Result<(), String> {
+    match (m.state, m.retire_reason) {
+        (ChangeState::Retired, None) => Err(
+            "a retired measurement carries no reason, which would be a deletion \
+             wearing a state's clothes"
+                .to_string(),
+        ),
+        (ChangeState::Retired, Some(_)) => Ok(()),
+        (state, Some(reason)) => Err(format!(
+            "a {} measurement carries the retire reason {}, which belongs only to a \
+             retired row",
+            state.as_str(),
+            reason.as_str()
+        )),
+        (_, None) => Ok(()),
+    }
 }
 
 /// Queue a declaration, or leave the one already queued for this change and
@@ -361,12 +427,14 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
     }
 
     async fn apply_measurement(&self, measurement: &ChangeMeasurement) -> SFResult<()> {
+        check_measurement(measurement).map_err(SFError::Validation)?;
         sqlx::query(APPLY_MEASUREMENT_SQL)
             .bind(&measurement.identity.kind)
             .bind(&measurement.identity.scope)
             .bind(&measurement.identity.literal)
             .bind(measurement.state.as_str())
             .bind(&measurement.measured_rev)
+            .bind(measurement.retire_reason.map(RetireReason::as_str))
             .execute(&self.pool)
             .await
             .map_err(|e| {
@@ -382,10 +450,16 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // Rows nothing has measured sort first: an unmeasured row is the least
         // known, not the freshest, and ordering it by insertion would put every
         // newly read change ahead of one that has waited for a measurement.
+        //
+        // Both terminal states are excluded together, so the set this answers is
+        // the same one `landed` was excluded to make: the work. A retired row is
+        // not work -- its question is answered -- and leaving it in would hand a
+        // fixture identity back to the tree, whose check would only overwrite the
+        // retirement with the unsettled answer it was retired to stop repeating.
         Self::entries(
             sqlx::query(&format!(
                 "SELECT {ROW_COLUMNS} FROM change_ledger \
-                 WHERE state <> 'landed' \
+                 WHERE state NOT IN ('landed', 'retired') \
                  ORDER BY measured_at ASC NULLS FIRST, first_seen_at ASC \
                  LIMIT $1"
             ))

@@ -84,16 +84,28 @@ pub enum ChangeState {
     Undecided,
     /// A measurement found the artifact as the change asks for it.
     Landed,
+    /// A look found the identity itself is one the account should not be
+    /// holding, so there is nothing left to ask of the code tree. A second
+    /// terminal state beside [`ChangeState::Landed`], and like it a property of
+    /// the `(identity, criterion revision)` pair rather than of the artifact: a
+    /// later look at a different corpus can move the row back out, which is why
+    /// this is a state and not a deletion.
+    Retired,
 }
 
 impl ChangeState {
     /// Every state, in the order the repository views group them.
-    pub const ALL: [ChangeState; 5] = [
+    ///
+    /// The two terminal states come last, side by side, because that is how a
+    /// reader asks about them: `landed` and `retired` are the two ways a row
+    /// stops being outstanding, and the four before them are the ways it is not.
+    pub const ALL: [ChangeState; 6] = [
         ChangeState::Conflict,
         ChangeState::Pending,
         ChangeState::Partial,
         ChangeState::Undecided,
         ChangeState::Landed,
+        ChangeState::Retired,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -103,7 +115,19 @@ impl ChangeState {
             ChangeState::Partial => "partial",
             ChangeState::Undecided => "undecided",
             ChangeState::Landed => "landed",
+            ChangeState::Retired => "retired",
         }
+    }
+
+    /// Whether a row in this state is still outstanding work.
+    ///
+    /// Both terminal states read false, and both for the same reason: a row
+    /// whose question has been answered -- by the artifact being there, or by the
+    /// identity turning out not to belong -- is not work anybody still owes. A
+    /// reader that asked "is it landed" to answer this would count every retired
+    /// row as outstanding.
+    pub fn is_outstanding(self) -> bool {
+        !matches!(self, ChangeState::Landed | ChangeState::Retired)
     }
 }
 
@@ -115,6 +139,65 @@ impl std::str::FromStr for ChangeState {
             .into_iter()
             .find(|state| state.as_str() == s)
             .ok_or_else(|| format!("unknown change state: {s}"))
+    }
+}
+
+/// Why a change was retired: the closed set of answers to "why does the account
+/// not hold this identity".
+///
+/// A state that could not say why would be indistinguishable from a deletion --
+/// the row would be gone from the outstanding set with nothing to argue with, and
+/// the same three rows coming back would look like three new changes. Keeping the
+/// reason closed is what lets a reader ask "how much of the account was retired
+/// because it named a fixture" and get an answer that a free-text note could not
+/// give.
+///
+/// The set is closed for the same reason [`ChangeState`]'s is: a value outside it
+/// is a caller error rather than a new category, and the storage refuses to store
+/// one. Adding a reason is a variant here, a value in the column's closed set, and
+/// a migration -- which is what keeps the set closed rather than merely written
+/// down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetireReason {
+    /// A later declaration names the same change under a different identity --
+    /// a rename, or a check re-pointed at the artifact it was always about. The
+    /// change still exists; this row's identity is the one left behind, and
+    /// retiring it is the merge that the two identities would otherwise never
+    /// get, since the ledger keys them apart on purpose.
+    Superseded,
+    /// The identity names a test fixture rather than a change to the artifact.
+    Fixture,
+    /// The scope is outside the tree a criterion can read, so the row's check
+    /// could only ever come back unsettled and no measurement will ever move it.
+    OutOfScope,
+}
+
+impl RetireReason {
+    /// Every reason, in the order the readings group them.
+    pub const ALL: [RetireReason; 3] = [
+        RetireReason::Superseded,
+        RetireReason::Fixture,
+        RetireReason::OutOfScope,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RetireReason::Superseded => "superseded",
+            RetireReason::Fixture => "fixture",
+            RetireReason::OutOfScope => "out_of_scope",
+        }
+    }
+}
+
+impl std::str::FromStr for RetireReason {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|reason| reason.as_str() == s)
+            .ok_or_else(|| format!("unknown retire reason: {s}"))
     }
 }
 
@@ -158,6 +241,15 @@ pub struct ChangeLedgerRow {
     /// measurement, so `state == Landed` and this being present agree by
     /// construction.
     pub landed_at: Option<DateTime<Utc>>,
+    /// Why the change was retired, when it was. `None` in every other state:
+    /// the reason is part of the retirement rather than a field every row
+    /// carries, and a reason left beside a row that is not retired would read as
+    /// one. Set and cleared with [`ChangeLedgerRow::retired_at`].
+    pub retire_reason: Option<RetireReason>,
+    /// When a measurement last found the change retired. Set and cleared by
+    /// measurement, so `state == Retired` and this being present agree by
+    /// construction, the same way `landed_at` agrees with `Landed`.
+    pub retired_at: Option<DateTime<Utc>>,
 }
 
 /// The result of looking at the tree for one change.
@@ -175,6 +267,11 @@ pub struct ChangeLedgerRow {
 pub struct ChangeMeasurement {
     pub identity: ChangeIdentity,
     pub state: ChangeState,
+    /// Why, when the state is [`ChangeState::Retired`]. `None` for every other
+    /// state, and required for that one: a retirement that did not say why would
+    /// be a deletion wearing a state's clothes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retire_reason: Option<RetireReason>,
     /// What the measurement saw, kept with the row so a state that disagrees
     /// with the tree can be argued with rather than merely disbelieved.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -191,10 +288,41 @@ pub struct ChangeMeasurement {
 }
 
 impl ChangeMeasurement {
+    /// A measurement of a non-retired state.
+    ///
+    /// Panics on [`ChangeState::Retired`] rather than building a retirement with
+    /// no reason: retire through [`ChangeMeasurement::retired`], which cannot be
+    /// called without one. The alternative -- letting this build a reason-less
+    /// retirement and rejecting it later in the store -- would make the invariant
+    /// a property of one storage backend instead of of the value, and the two
+    /// would drift the moment a second backend appeared.
     pub fn new(identity: ChangeIdentity, state: ChangeState) -> Self {
+        assert_ne!(
+            state,
+            ChangeState::Retired,
+            "a retirement must be built with ChangeMeasurement::retired so it carries a reason"
+        );
         Self {
             identity,
             state,
+            retire_reason: None,
+            observation: None,
+            measured_rev: None,
+        }
+    }
+
+    /// A measurement that found the identity is one the account should not hold,
+    /// with the reason it should not.
+    ///
+    /// The reason is an argument to this constructor rather than a field a caller
+    /// may leave empty, so a retirement without one is not a value that can be
+    /// built -- the closed set of reasons is a required part of the state, not a
+    /// label hung on it afterwards.
+    pub fn retired(identity: ChangeIdentity, reason: RetireReason) -> Self {
+        Self {
+            identity,
+            state: ChangeState::Retired,
+            retire_reason: Some(reason),
             observation: None,
             measured_rev: None,
         }
@@ -292,7 +420,14 @@ pub trait ChangeLedgerStore: Send + Sync {
     /// by what has been read about.
     async fn apply_measurement(&self, measurement: &ChangeMeasurement) -> SFResult<()>;
 
-    /// The rows that are not `landed`, stalest measurement first.
+    /// The rows that are still outstanding, stalest measurement first.
+    ///
+    /// Both terminal states are left out, [`ChangeState::Landed`] and
+    /// [`ChangeState::Retired`]: a row whose question is answered is not work,
+    /// and a reader that took "not landed" for "outstanding" would hand a retired
+    /// row back to the tree and overwrite the retirement with whatever the tree
+    /// says -- which for an identity that is not an artifact is the unsettled
+    /// answer this state exists to stop repeating.
     ///
     /// `None` in `measured_at` sorts first: nothing has looked at those, which
     /// is less known than a stale measurement, not more current.
@@ -421,4 +556,91 @@ pub struct ChangeReading {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assertion: Option<String>,
     pub source: ChangeSource,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every state and reason round-trips through its name, and the lists hold no
+    /// duplicates.
+    ///
+    /// This is the gate on the closed sets: the storage writes a state by its
+    /// name and reads it back by parsing, and a variant left out of `ALL` is one
+    /// no reader enumerates -- the census would count it as absent and the row
+    /// would vanish from every view without an error. Adding a variant without
+    /// adding it to `ALL`, or giving two variants the same name, fails here.
+    #[test]
+    fn every_state_and_reason_round_trips_through_its_name() {
+        for state in ChangeState::ALL {
+            let name = state.as_str();
+            assert_eq!(
+                name.parse::<ChangeState>(),
+                Ok(state),
+                "state {name} does not parse back to itself"
+            );
+        }
+        let mut states: Vec<&str> = ChangeState::ALL.iter().map(|s| s.as_str()).collect();
+        states.sort_unstable();
+        let unique = states.len();
+        states.dedup();
+        assert_eq!(unique, states.len(), "two states share a name");
+
+        for reason in RetireReason::ALL {
+            let name = reason.as_str();
+            assert_eq!(
+                name.parse::<RetireReason>(),
+                Ok(reason),
+                "reason {name} does not parse back to itself"
+            );
+        }
+        let mut reasons: Vec<&str> = RetireReason::ALL.iter().map(|r| r.as_str()).collect();
+        reasons.sort_unstable();
+        let unique = reasons.len();
+        reasons.dedup();
+        assert_eq!(unique, reasons.len(), "two reasons share a name");
+    }
+
+    /// The two terminal states are the two that are not outstanding.
+    ///
+    /// A reader that asked "is it landed" to answer "is there work here" would
+    /// count every retired row as outstanding, and hand a fixture identity back
+    /// to the tree. This pins the predicate to the set so the two cannot drift.
+    #[test]
+    fn only_the_terminal_states_are_not_outstanding() {
+        for state in ChangeState::ALL {
+            let terminal = matches!(state, ChangeState::Landed | ChangeState::Retired);
+            assert_eq!(state.is_outstanding(), !terminal, "{}", state.as_str());
+        }
+    }
+
+    /// A retirement cannot be built without a reason, and a reason cannot be hung
+    /// on a non-retired measurement.
+    ///
+    /// The first half is a panic because the value is unbuildable; the second is
+    /// checked in the store, and this only pins the constructor's side of it.
+    #[test]
+    #[should_panic(expected = "must be built with ChangeMeasurement::retired")]
+    fn a_retirement_without_a_reason_cannot_be_built() {
+        let _ = ChangeMeasurement::new(
+            ChangeIdentity::new("grep", "crates/", "x"),
+            ChangeState::Retired,
+        );
+    }
+
+    #[test]
+    fn a_retirement_carries_its_reason_and_a_plain_measurement_carries_none() {
+        let retired = ChangeMeasurement::retired(
+            ChangeIdentity::new("grep", "crates/", "x"),
+            RetireReason::Fixture,
+        );
+        assert_eq!(retired.state, ChangeState::Retired);
+        assert_eq!(retired.retire_reason, Some(RetireReason::Fixture));
+
+        let pending = ChangeMeasurement::new(
+            ChangeIdentity::new("grep", "crates/", "x"),
+            ChangeState::Pending,
+        );
+        assert_eq!(pending.retire_reason, None);
+    }
 }
