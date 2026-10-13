@@ -209,7 +209,7 @@ impl cog_core::SystemPlugin for ProtocolPlugin {
 /// The two are returned together because a listener nobody can stop is not a
 /// service the process owns -- and the signal has to exist before the first
 /// call arrives, not when someone remembers to add a shutdown path.
-fn spawn_grpc_server(
+pub(crate) fn spawn_grpc_server(
     server: crate::agent_lifecycle::agent_lifecycle_server::AgentLifecycleServer<
         crate::grpc_agent_lifecycle::AgentLifecycleGrpcHandler,
     >,

@@ -110,6 +110,18 @@ pub struct AgentLifecycleGrpcHandler {
     agent_registry: Arc<dyn AgentRegistry>,
     event_tx: broadcast::Sender<SupervisorEvent>,
     router: AgentCommandRouter,
+    /// The state each agent last reported in its heartbeat, by agent id.
+    ///
+    /// It lives here rather than in the registry because the registry's
+    /// contract has no state column: an agent sends its state on every
+    /// heartbeat and the field had nowhere to land, so the server took the
+    /// agent id and dropped the rest. This is the one place on that path that
+    /// can hold it without a cross-crate contract change.
+    ///
+    /// The trade is that the answer is "what this process was told" rather than
+    /// a durable fact: after a restart it reads unknown until the next
+    /// heartbeat, which is exactly what it knows.
+    states: std::sync::Mutex<HashMap<String, String>>,
 }
 
 impl AgentLifecycleGrpcHandler {
@@ -122,6 +134,7 @@ impl AgentLifecycleGrpcHandler {
             agent_registry,
             event_tx,
             router,
+            states: std::sync::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -136,6 +149,16 @@ impl AgentLifecycle for AgentLifecycleGrpcHandler {
     ) -> Result<Response<HeartbeatResp>, Status> {
         let req = request.into_inner();
         let _ = self.agent_registry.heartbeat(&req.agent_id).await;
+        // The state is the only part of a heartbeat the registry cannot take,
+        // and the only part that answers "what is it doing": record it here,
+        // where the RPC that asks is answered. An empty state is not a state,
+        // so it leaves the previous one standing rather than erasing it.
+        if !req.state.is_empty() {
+            self.states
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(req.agent_id.clone(), req.state.clone());
+        }
         Ok(Response::new(HeartbeatResp {
             agent_id: req.agent_id,
             accepted: true,
@@ -314,9 +337,22 @@ impl AgentLifecycle for AgentLifecycleGrpcHandler {
     ) -> Result<Response<QueryStateResp>, Status> {
         let req = request.into_inner();
         let info = self.agent_registry.get(&req.agent_id).await.ok().flatten();
-        let state = match info {
-            Some(agent) => format!("registered (last_heartbeat: {:?})", agent.last_heartbeat),
-            None => "unknown".into(),
+        // What the agent last said about itself answers the question better
+        // than the fact that it is registered, so it is preferred. When there
+        // is no reported state the registration stands in -- it is a weaker
+        // answer than a state word, but it is not a wrong one.
+        let reported = self
+            .states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&req.agent_id)
+            .cloned();
+        let state = match (info, reported) {
+            (_, Some(reported)) => reported,
+            (Some(agent), None) => {
+                format!("registered (last_heartbeat: {:?})", agent.last_heartbeat)
+            }
+            (None, None) => "unknown".into(),
         };
         Ok(Response::new(QueryStateResp {
             agent_id: req.agent_id,
@@ -789,5 +825,88 @@ mod tests {
             }
         }
         assert_eq!(seen, 3, "one reported singly and two in a batch");
+    }
+
+    /// A free port nothing is listening on: bind it, read what the OS chose,
+    /// let it go.
+    fn free_port() -> std::net::SocketAddr {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("the OS hands out a port");
+        let addr = probe.local_addr().expect("a bound listener has an address");
+        drop(probe);
+        addr
+    }
+
+    /// The state an agent reports has to come back out of the query. It used to
+    /// be read off the wire and dropped, so the field answered with a
+    /// registration timestamp and the agent's own word -- the only part of a
+    /// heartbeat that says what it is doing -- went nowhere.
+    ///
+    /// Driven over a real socket rather than by calling the two handlers: the
+    /// claim is about what a client of this service gets, and the two calls
+    /// travel in opposite directions (one in, one out) through the generated
+    /// code either way.
+    #[tokio::test]
+    async fn the_state_an_agent_reports_is_the_state_the_query_answers() {
+        let addr = free_port();
+        let handler = {
+            let registry = Arc::new(StubRegistry::default());
+            registry.register(&registration("a-1")).await.unwrap();
+            let (tx, _rx) = broadcast::channel(16);
+            AgentLifecycleGrpcHandler::new(
+                registry as Arc<dyn AgentRegistry>,
+                tx,
+                AgentCommandRouter::new(),
+            )
+        };
+        let server =
+            crate::agent_lifecycle::agent_lifecycle_server::AgentLifecycleServer::new(handler);
+        let (_handle, _stop) = crate::plugin::spawn_grpc_server(server, addr);
+
+        // The bind is inside the spawned task, so connecting once here would
+        // race it: wait until something answers on the port before talking.
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let mut client =
+            crate::agent_lifecycle::agent_lifecycle_client::AgentLifecycleClient::connect(format!(
+                "http://{addr}"
+            ))
+            .await
+            .expect("the server is listening on the port it was given");
+
+        client
+            .heartbeat(HeartbeatReq {
+                agent_id: "a-1".into(),
+                timestamp: chrono::Utc::now().timestamp(),
+                state: "active".into(),
+            })
+            .await
+            .expect("the heartbeat is accepted");
+
+        let answered = client
+            .query_state(QueryStateReq {
+                agent_id: "a-1".into(),
+            })
+            .await
+            .expect("the query answers")
+            .into_inner();
+        assert_eq!(
+            answered.state, "active",
+            "the query answers with what the agent said, not with a timestamp"
+        );
+
+        // An agent that never sent one is not given a state it never had.
+        let stranger = client
+            .query_state(QueryStateReq {
+                agent_id: "nobody".into(),
+            })
+            .await
+            .expect("the query answers")
+            .into_inner();
+        assert_eq!(stranger.state, "unknown");
     }
 }
