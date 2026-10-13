@@ -438,7 +438,12 @@ pub trait PrincipleLedgerStore: Send + Sync {
     /// Queue readings for the ledger's own writer to fold in.
     ///
     /// Idempotent per (slug, source): re-running the same list queues nothing
-    /// twice, so a push that failed part way can simply be repeated.
+    /// twice, so a push that failed part way can simply be repeated. A reading
+    /// that says something the queued one did not **re-queues it** -- a reading
+    /// taken before a column existed files a value the later corrected one has
+    /// to be able to replace -- and a field a reading carries nothing for keeps
+    /// what is stored rather than clearing it. Answers how many readings were
+    /// queued or re-queued; the ones already saying exactly this are not counted.
     async fn declare(&self, readings: &[PrincipleReading]) -> SFResult<usize>;
 
     /// Fold up to `limit` unfolded readings into the account, and answer how

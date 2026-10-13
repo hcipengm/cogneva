@@ -165,11 +165,25 @@ impl PostgresChangeLedgerStore {
 
 /// Add a reading's source to a row that may already cite other documents.
 ///
-/// Existing entries are left exactly as they are when the document is already
-/// cited. A document whose verdict changed is applied by withdrawing that
-/// document's reading and reading it again, which is what keeps "which document
-/// said what" a statement about one reading of one document rather than a
-/// merge of two.
+/// A document cited once keeps its entry, and its *entry* is what moves when the
+/// document's verdict does. The rule used to be that an existing entry was left
+/// exactly as it was, on the grounds that "a document whose verdict changed is
+/// applied by withdrawing that document's reading and reading it again" -- a
+/// withdrawal nothing in this contract provides. What that rule did instead was
+/// freeze each document's claim at its first reading, so a document that
+/// corrected its verdict was cited forever with the one it had before, and the
+/// disagreement between a document's claim and a measurement -- the reading the
+/// account exists to produce -- was reported against a claim the document no
+/// longer made. Where the entry is keyed by the document, "what this document
+/// said" has to be what it says now.
+///
+/// The rewrite is guarded twice: an entry is added for a document not yet cited,
+/// and an entry already there is rebuilt only when its verdict actually differs.
+/// Without the second guard every re-reading of an unchanged document would
+/// rewrite the row, which is a write per citation per pass for no reading.
+/// Rebuilding rather than appending keeps one entry per document: two entries
+/// for one document would be the same merge the guard exists to avoid, in the
+/// other direction.
 ///
 /// `first_seen_rev` is written only on the row's first entry and never refreshed:
 /// the conflict clause leaves it alone, so a second document citing an existing
@@ -182,11 +196,25 @@ ON CONFLICT (kind, scope, literal) DO UPDATE SET
     title = COALESCE(EXCLUDED.title, change_ledger.title),
     assertion = COALESCE(EXCLUDED.assertion, change_ledger.assertion),
     sources = CASE
+        WHEN NOT EXISTS (
+            SELECT 1 FROM jsonb_array_elements(change_ledger.sources) AS cited(entry)
+            WHERE cited.entry->>'doc' = $6
+        ) THEN change_ledger.sources || EXCLUDED.sources
         WHEN EXISTS (
             SELECT 1 FROM jsonb_array_elements(change_ledger.sources) AS cited(entry)
             WHERE cited.entry->>'doc' = $6
-        ) THEN change_ledger.sources
-        ELSE change_ledger.sources || EXCLUDED.sources
+              AND cited.entry->>'verdict' IS DISTINCT FROM $7
+        ) THEN (
+            SELECT jsonb_agg(
+                CASE
+                    WHEN cited.entry->>'doc' = $6
+                    THEN jsonb_build_object('doc', $6, 'verdict', $7)
+                    ELSE cited.entry
+                END
+            )
+            FROM jsonb_array_elements(change_ledger.sources) AS cited(entry)
+        )
+        ELSE change_ledger.sources
     END";
 
 /// Write one measurement, with every time taken from the database clock.
@@ -330,18 +358,48 @@ fn check_measurement(m: &ChangeMeasurement) -> Result<(), String> {
     }
 }
 
-/// Queue a declaration, or leave the one already queued for this change and
-/// document exactly as it is.
+/// Queue a declaration, or re-queue the one already there when it would
+/// actually change it.
 ///
-/// `DO NOTHING` rather than an update: a declaration is one reading of one
-/// document, so a document that wants to say something different about a change
-/// withdraws its declaration and makes a new one. Updating in place would make
-/// "what this document asked for" a value that changes without the document
-/// changing, which is the same merge the reading path refuses.
+/// Not `DO NOTHING`, which this used to be. The rule it stood on -- "a document
+/// that wants to say something different about a change withdraws its
+/// declaration and makes a new one" -- named a move this table has no way to
+/// make: there is no withdrawal statement anywhere, and the key already carries
+/// the document, so a re-declaration is the same key. What `DO NOTHING` did was
+/// freeze each `(kind, scope, literal, doc)` at whatever the **first**
+/// declaration said, and the corrected one -- an extraction that learned the
+/// document's verdict, a re-rendered title -- matched the key, was dropped, and
+/// the pass still reported success. The migration's own note that "re-declaring
+/// is how a corrected declaration is made" was describing the opposite of what
+/// the clause did.
+///
+/// `WHERE ... IS DISTINCT FROM` is what keeps the re-queue from becoming a
+/// livelock: without it a declaring script that re-pushes the whole corpus every
+/// pass would re-queue all of it, resetting `folded_at` on declarations whose
+/// values did not move, and the fold -- which takes a bounded batch per tick --
+/// would never catch up. It compares the values the `SET` would produce, not the
+/// raw incoming ones, because a field the declaration carries nothing for keeps
+/// what is stored: comparing the incoming `NULL` against a stored value would
+/// call that a change, re-queue it, write the same row, and do it again next
+/// pass.
+///
+/// The `COALESCE` half is not new: a declarer that knows nothing about a field
+/// is not a declarer that found the field empty, and it may not clear it.
 const DECLARE_SQL: &str = "\
 INSERT INTO change_ledger_declared (kind, scope, literal, doc, title, assertion, verdict)
 VALUES ($1, $2, $3, $4, $5, $6, $7)
-ON CONFLICT (kind, scope, literal, doc) DO NOTHING";
+ON CONFLICT (kind, scope, literal, doc) DO UPDATE SET
+    title = COALESCE(EXCLUDED.title, change_ledger_declared.title),
+    assertion = COALESCE(EXCLUDED.assertion, change_ledger_declared.assertion),
+    verdict = COALESCE(EXCLUDED.verdict, change_ledger_declared.verdict),
+    declared_at = now(),
+    folded_at = NULL
+WHERE (COALESCE(EXCLUDED.title, change_ledger_declared.title),
+       COALESCE(EXCLUDED.assertion, change_ledger_declared.assertion),
+       COALESCE(EXCLUDED.verdict, change_ledger_declared.verdict))
+  IS DISTINCT FROM
+      (change_ledger_declared.title, change_ledger_declared.assertion,
+       change_ledger_declared.verdict)";
 
 /// The declarations one fold takes, oldest first.
 ///
@@ -442,9 +500,12 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
                 .map_err(|e| {
                     SFError::Database(format!("declare {}: {e}", reading.identity.as_key()))
                 })?;
-            // The conflict clause writes nothing, so a declaration already queued
-            // contributes no row here. Counting the statement rather than the
-            // batch is what makes "how many were newly queued" answerable.
+            // A declaration that says what the queued one already says matches
+            // the conflict clause's `WHERE` and writes no row; one that says
+            // something different writes its row and counts here. Counting the
+            // statement rather than the batch is what makes "how many were
+            // queued or re-queued" answerable, and the `WHERE` is what keeps
+            // that number meaning something rather than counting every re-push.
             queued += outcome.rows_affected() as usize;
         }
         Ok(queued)

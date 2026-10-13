@@ -437,10 +437,11 @@ pub trait ChangeLedgerStore: Send + Sync {
     /// Idempotent per document and identity: queuing the same change from the
     /// same document twice leaves one declaration, so a declaring script that is
     /// re-run after a failure does not queue the same work twice. A declaration
-    /// already queued is left exactly as it is -- correcting one means
-    /// withdrawing it and declaring again, for the same reason a reading is
-    /// withdrawn rather than edited. Answers how many declarations were newly
-    /// queued; the ones already there are not counted.
+    /// that says something the queued one did not **re-queues it**, and one that
+    /// says nothing new writes no row: a document's current claim is the one the
+    /// account is to hold, and re-sending what is already queued must not read as
+    /// a correction. Answers how many declarations were queued or re-queued; the
+    /// ones already saying exactly this are not counted.
     async fn declare(&self, readings: &[ChangeReading]) -> SFResult<usize>;
 
     /// Fold up to `limit` unfolded declarations into the account, and answer how

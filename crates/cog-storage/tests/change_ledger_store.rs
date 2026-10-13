@@ -6,7 +6,9 @@
 //! outside the closed set is refused rather than stored, that the revision a row
 //! entered at is written once and never moved, and that a retirement queued on
 //! its own intake is folded into the account by the ledger's writer and is
-//! idempotent to re-fold. None of it can be checked without a server -- the
+//! idempotent to re-fold, and that a document that corrects what it declares
+//! reaches both the queue and the account's citation of it. None of it can be
+//! checked without a server -- the
 //! coupling between the reason and the state lives in the statement and in a CHECK
 //! the server enforces, "a reason outside the set is refused" is a fact about an
 //! ENUM or a CHECK, and the set-once rule of the entry revision is a fact about
@@ -384,6 +386,86 @@ async fn a_later_measurement_clears_a_retirement() {
     assert_eq!(
         row.retire_reason, None,
         "a reason left beside a state that is no longer retired would read as one"
+    );
+
+    cleanup(&pool, &marker).await;
+}
+
+/// A document that corrects what it says about a change reaches the account, and
+/// a re-declaration that says nothing new does not.
+///
+/// This is the whole chain in one case, because each link can drop the
+/// correction on its own: the intake can refuse to re-queue a corrected
+/// declaration, and the reading path can keep the cited entry it already has.
+/// Either one alone leaves the account citing a verdict the document no longer
+/// makes -- and the disagreement between a document's claim and a measurement,
+/// which is the reading the account exists to produce, would be reported against
+/// the stale claim. Neither link is visible without a server: which branch of an
+/// `ON CONFLICT` runs, whether `rows_affected` counted a row, and what `jsonb`
+/// ends up holding are all facts about the server.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_corrected_declaration_re_queues_and_the_account_cites_the_current_verdict() {
+    let (store, pool, marker) = store().await;
+    let id = identity(&marker, "corrected");
+    let doc = format!("docs/{marker}.md");
+    let declaration = |verdict: &str| ChangeReading {
+        identity: id.clone(),
+        title: Some("a change the probe declares".into()),
+        assertion: Some("the probe's assertion".into()),
+        source: ChangeSource {
+            doc: doc.clone(),
+            verdict: Some(verdict.to_string()),
+        },
+    };
+
+    assert_eq!(
+        store.declare(&[declaration("undecided")]).await.unwrap(),
+        1,
+        "the first declaration queues"
+    );
+    assert_eq!(
+        store.declare(&[declaration("undecided")]).await.unwrap(),
+        0,
+        "re-sending what is already queued is not a correction"
+    );
+    store
+        .fold_declarations(100, Some("probe-rev"))
+        .await
+        .expect("fold the declaration");
+    let cited = store
+        .get(&id)
+        .await
+        .expect("read the row")
+        .expect("the row exists")
+        .sources;
+    assert_eq!(cited.len(), 1, "one document, one citation: {cited:?}");
+    assert_eq!(cited[0].verdict.as_deref(), Some("undecided"));
+
+    assert_eq!(
+        store.declare(&[declaration("landed")]).await.unwrap(),
+        1,
+        "the document's verdict moved, so the declaration has to re-queue"
+    );
+    store
+        .fold_declarations(100, Some("probe-rev"))
+        .await
+        .expect("fold the correction");
+    let cited = store
+        .get(&id)
+        .await
+        .expect("read the row")
+        .expect("the row exists")
+        .sources;
+    assert_eq!(
+        cited.len(),
+        1,
+        "the correction replaces the citation rather than adding one: {cited:?}"
+    );
+    assert_eq!(
+        cited[0].verdict.as_deref(),
+        Some("landed"),
+        "the account cites what the document says now, not what it said first"
     );
 
     cleanup(&pool, &marker).await;
