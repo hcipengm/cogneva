@@ -2374,7 +2374,7 @@ impl MainlineDeployer {
     /// 变成本循环永远不派发。
     async fn can_i(&self, verb: &str, group: &str, resource: &str) -> SFResult<bool> {
         let target = rbac_target(group, resource);
-        let mut child = tokio::process::Command::new(&self.cfg.kubectl_bin)
+        let child = tokio::process::Command::new(&self.cfg.kubectl_bin)
             .args([
                 "-n",
                 self.cfg.namespace.as_str(),
@@ -20660,6 +20660,19 @@ exit 0
                  loop would fail with `forbidden` and nothing reads that as a defect"
             );
 
+            // The other direction of the same comparison: a mutating right on a
+            // resource the delivery face never carries. It reads as covered
+            // because nothing consumes it -- until someone widens the loop and
+            // the right is there to be spent, with no delivery-face change to
+            // review.
+            let extras = mutating_grants_without_a_delivery(&grants, &needed);
+            assert!(
+                extras.is_empty(),
+                "{rel}: the {EVOLUTION} Role grants a mutating right on {extras:?} that no \
+                 document in this set delivers; a right with nothing to spend it on is a \
+                 decision the delivery face cannot see"
+            );
+
             // The escalation side of the same boundary: the rules that would let
             // a manifest grow its own rights or lift the credentials.
             for (groups, resources, _) in &grants {
@@ -20715,6 +20728,93 @@ exit 0
             checked.len(),
             DELIVERABLE_MANIFEST_TREES.len(),
             "the walk did not cover the delivered set: {checked:?}"
+        );
+    }
+
+    /// 授权面比交付面多出来的那些**会改东西**的授权：一个没有对象可花的权。
+    ///
+    /// 交付面是从清单树读出来的（每个 kind 映射到它的 `(apiGroup, resource)`），
+    /// 授权面是从 Role 读出来的，两面写在不同的文件里，谁动了另一面都不会跟着动。
+    /// 只读授权豁免——读一个循环永远不交付的资源是它在观测，不是它在动手（部署器
+    /// 要读 pods / resourcequotas / replicasets / events，却从不写它们）。下面两条
+    /// 例外是**文档带不动**的授权，理由写在这里而不是清单里：循环自己派出的滚动
+    /// Job（由部署器创建与删除，从不作为文档交付），以及安装期就建好、绑定后只允许
+    /// 改 `resources.requests` 的卷声明。
+    ///
+    /// `(apiGroup, resource)` 是 RBAC 的拼法：空组就是核心 API，与 Role 里写的完全
+    /// 一致。空组写成 `""` 而非省略，是为了让这里与清单里 `apiGroups: [""]` 的读法
+    /// 对齐。
+    fn mutating_grants_without_a_delivery(
+        grants: &[(Vec<String>, Vec<String>, Vec<String>)],
+        needed: &std::collections::BTreeSet<(String, String)>,
+    ) -> Vec<String> {
+        const READ_ONLY: &[&str] = &["get", "list", "watch"];
+        const REASONED: &[(&str, &str)] = &[("", "persistentvolumeclaims"), ("batch", "jobs")];
+        let mut extras = Vec::new();
+        for (groups, resources, verbs) in grants {
+            if verbs.iter().all(|v| READ_ONLY.contains(&v.as_str())) {
+                continue;
+            }
+            for group in groups {
+                for resource in resources {
+                    if needed.contains(&(group.clone(), resource.clone()))
+                        || REASONED.iter().any(|(g, r)| g == group && r == resource)
+                    {
+                        continue;
+                    }
+                    extras.push(format!("{group}/{resource}"));
+                }
+            }
+        }
+        extras.sort();
+        extras.dedup();
+        extras
+    }
+
+    /// The reverse-direction predicate can go red, and it names the one grant
+    /// that should qualify while leaving the three exempt kinds alone. Written
+    /// against a synthetic Role so the sample is the predicate's input rather
+    /// than the shipped tree it would otherwise agree with by construction.
+    #[test]
+    fn a_mutating_grant_with_no_delivered_document_is_named() {
+        use std::collections::BTreeSet;
+        let needed: BTreeSet<(String, String)> = [("apps".to_string(), "deployments".to_string())]
+            .into_iter()
+            .collect();
+        let grants: Vec<(Vec<String>, Vec<String>, Vec<String>)> = vec![
+            // Delivered: covered.
+            (
+                vec!["apps".into()],
+                vec!["deployments".into()],
+                vec!["get".into(), "create".into()],
+            ),
+            // Read-only extra: the loop observes it, never writes it.
+            (
+                vec!["".into()],
+                vec!["pods".into()],
+                vec!["get".into(), "list".into()],
+            ),
+            // Mutating extra with nothing delivered: the one to name.
+            (
+                vec!["apps".into()],
+                vec!["daemonsets".into()],
+                vec!["create".into()],
+            ),
+            // The reasoned exceptions: the rollout Job and the install-time claim.
+            (
+                vec!["batch".into()],
+                vec!["jobs".into()],
+                vec!["create".into()],
+            ),
+            (
+                vec!["".into()],
+                vec!["persistentvolumeclaims".into()],
+                vec!["patch".into()],
+            ),
+        ];
+        assert_eq!(
+            mutating_grants_without_a_delivery(&grants, &needed),
+            vec!["apps/daemonsets".to_string()]
         );
     }
 

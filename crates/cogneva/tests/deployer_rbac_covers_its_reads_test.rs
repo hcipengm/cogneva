@@ -899,9 +899,22 @@ fn every_file_that_talks_to_the_cluster_is_named() {
 #[test]
 fn the_job_specs_and_the_role_name_the_same_principal() {
     let deployer = read(SCANNED[0]);
+    // The identity lives in one constant so the preflight's error message and the
+    // Job's `serviceAccountName` cannot drift apart. Read that constant out and
+    // compare it to the ServiceAccount the Role binds, then check the Job takes
+    // its value from the constant rather than spelling the name a second time --
+    // two literals would agree today and be free to disagree tomorrow, which is
+    // the drift this test exists to forbid.
+    let sa = const_str_value(&deployer, "EVOLUTION_SERVICE_ACCOUNT").unwrap_or_else(|| {
+        panic!("部署器源码里没有 EVOLUTION_SERVICE_ACCOUNT：滚动 Job 的身份没有单一来源")
+    });
+    assert_eq!(
+        sa, SERVICE_ACCOUNT,
+        "滚动 Job 用的 SA 与授权面绑的那个不是同一个身份"
+    );
     assert!(
-        deployer.contains(&format!("\"serviceAccountName\": \"{SERVICE_ACCOUNT}\"")),
-        "滚动 Job 的 serviceAccountName 不再写 {SERVICE_ACCOUNT}：授权面绑的就不是它了"
+        deployer.contains("\"serviceAccountName\": EVOLUTION_SERVICE_ACCOUNT"),
+        "滚动 Job 的 serviceAccountName 不再取自那个常量：授权面绑的就不是它了"
     );
     let change = read(SCANNED[1]);
     assert!(
@@ -930,6 +943,14 @@ fn the_role_file_is_the_one_the_parity_gate_holds() {
 // ---------------------------------------------------------------------------
 // The publisher's base read
 // ---------------------------------------------------------------------------
+
+/// `const NAME: &str = "value";` 里的那个字符串。
+fn const_str_value(src: &str, name: &str) -> Option<String> {
+    let needle = format!("const {name}: &str = \"");
+    let start = src.find(&needle)? + needle.len();
+    let end = src[start..].find('"')? + start;
+    Some(src[start..end].to_string())
+}
 
 /// `const NAME: [&str; N] = ["a", "b", …];` 里的那些字符串。
 fn const_string_list(src: &str, name: &str) -> Vec<String> {
