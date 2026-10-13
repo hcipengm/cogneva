@@ -41,7 +41,10 @@
 //!   named it), because the number alone cannot tell a cap that is tracking the
 //!   cache from one that has stopped. The line exists only while a cap is in
 //!   force, so a cache with no cap is this line being absent rather than a value
-//!   of it.
+//!   of it -- and that absence is readable, because the sizes are not absent: a
+//!   cache that has been walked publishes them whether or not a cap is in force,
+//!   so a cache showing sizes with no cap line is a cache with no cap rather than
+//!   one nothing measured.
 //! - `cogneva_build_target_over_limit_bytes{dir}` -- how far above it the cache
 //!   is, as of the last walk. The earlier of the two numbers that say the cap is
 //!   not holding.
@@ -1174,7 +1177,23 @@ mod tests {
             .await;
 
         assert_eq!(on_disk(root.path()), 1000);
+        readings.set_layers(
+            [("release/incremental".to_string(), 1000)]
+                .into_iter()
+                .collect(),
+            unix_now(),
+        );
         let metrics = readings.collect_metrics("").await.unwrap();
+        // The sizes are published so that the absence of the cap family reads as
+        // "no cap" rather than as "nothing was measured": both families come out
+        // of one publication, and a reader that only sees missing lines cannot
+        // tell a cache held to no bound from a cache the process stopped
+        // reporting on.
+        assert!(
+            metrics.iter().any(|m| m.name == BUILD_TARGET_BYTES_METRIC),
+            "{:?}",
+            metrics.iter().map(|m| &m.name).collect::<Vec<_>>()
+        );
         assert!(
             !metrics
                 .iter()
