@@ -49,4 +49,21 @@ pub struct AgentAuthentication {
 pub trait McpClient: Send + Sync {
     /// List tools exposed by the MCP server.
     async fn list_tools(&self) -> crate::SFResult<Vec<serde_json::Value>>;
+
+    /// Call a tool exposed by the MCP server and return its result.
+    ///
+    /// Both ends of this call are untyped JSON, for the same reason
+    /// [`Self::list_tools`] is: the concrete request/result types belong to the
+    /// protocol crate, and a caller holding this trait object must be able to
+    /// make the call without depending on that crate. A trait that stops at
+    /// listing tools makes the call unreachable for exactly those callers —
+    /// they can see which tools exist and cannot run one.
+    ///
+    /// `arguments` is the tool's argument object; an implementation is expected
+    /// to reject a non-object rather than guess.
+    async fn call_tool(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> crate::SFResult<serde_json::Value>;
 }

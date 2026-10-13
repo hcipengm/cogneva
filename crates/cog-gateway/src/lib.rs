@@ -744,6 +744,10 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         )
         .route("/api/v1/protocol/mcp/tools", get(mcp_tools_list_handler))
         .route(
+            "/api/v1/protocol/mcp/tools/call",
+            post(mcp_tool_call_handler),
+        )
+        .route(
             "/api/v1/protocol/a2a/agent-card",
             get(a2a_agent_card_handler),
         )
@@ -2805,6 +2809,41 @@ async fn mcp_tools_list_handler(State(state): State<Arc<GatewayState>>) -> Respo
             Err(e) => (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({"error": "mcp_list_failed", "message": e.to_string()})),
+            )
+                .into_response(),
+        },
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "mcp_client_not_configured"})),
+        )
+            .into_response(),
+    }
+}
+
+/// Body of a tool call: the tool's name and its argument object.
+#[derive(serde::Deserialize)]
+struct McpToolCallRequest {
+    name: String,
+    /// The tool's arguments. Left as raw JSON because the tool's schema is the
+    /// server's, not this gateway's; a missing field is `null` and the client
+    /// contract refuses anything that is not an object.
+    #[serde(default)]
+    arguments: serde_json::Value,
+}
+
+/// POST /api/v1/protocol/mcp/tools/call — run one tool on the configured MCP
+/// server. The counterpart of the list handler above: without it a caller can
+/// see which tools exist and never run one.
+async fn mcp_tool_call_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<McpToolCallRequest>,
+) -> Response {
+    match state.mcp_client {
+        Some(ref client) => match client.call_tool(&req.name, req.arguments).await {
+            Ok(result) => (StatusCode::OK, Json(json!({ "result": result }))).into_response(),
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": "mcp_call_failed", "message": e.to_string()})),
             )
                 .into_response(),
         },
