@@ -182,3 +182,51 @@ impl MessageBackend for MemoryMessageBackend {
         Ok(None)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine as _;
+
+    /// 死信记录里必须放着那条消息自己的字节。
+    ///
+    /// 这条断言的名字就是契约的一行：调用方走的是「这条消息再也读不出来」的那条分支，
+    /// 死信队列是它之后唯一还留着这份内容的地方。只带 id 和 reason 的记录读起来像
+    /// 「已经处理了」，而真正丢掉的东西还是一样的没了。
+    #[tokio::test]
+    async fn a_dead_letter_record_carries_the_bytes_it_is_about() {
+        let backend = MemoryMessageBackend::new();
+        // 这具载荷是**非法 JSON**，正是走到这一格的那些消息的样子：它们读不出来，
+        // 所以不能假设里面是什么编码，二进制的也要原样带过去。
+        let body: &[u8] = b"not json at all \x00\xff\xfe";
+
+        backend
+            .dlq("tasks:ready", "17-0", body, "unparsable DagMessage")
+            .await
+            .expect("dead-letter write");
+
+        // 默认实现写的是 `{stream}:dlq`，所以这里从那个 subject 上读回来——断言的是
+        // 「写到哪里」和「写了什么」两件事，改掉任一件这条就要红。
+        let mut stream = backend
+            .subscribe_from("tasks:ready:dlq", "g", "0")
+            .await
+            .expect("subscribe to the dead-letter subject");
+        let (_id, record) = stream
+            .next()
+            .await
+            .expect("a dead-letter record was published")
+            .expect("readable record");
+
+        let record: serde_json::Value =
+            serde_json::from_slice(&record).expect("the record is JSON");
+        assert_eq!(record["original_id"], "17-0");
+        assert_eq!(record["reason"], "unparsable DagMessage");
+        let payload = base64::engine::general_purpose::STANDARD
+            .decode(record["payload_b64"].as_str().expect("payload field"))
+            .expect("payload decodes");
+        assert_eq!(
+            payload, body,
+            "字节原样带过去；丢了这一格，死信队列就只剩一条『有个消息死了』的读数"
+        );
+    }
+}

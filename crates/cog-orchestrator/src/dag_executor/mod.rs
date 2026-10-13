@@ -397,8 +397,29 @@ impl DagExecutorRuntime {
             Ok(m) => m,
             Err(e) => {
                 // Poison message: no future bytes can parse better, so ack it
-                // out instead of letting the sweeper redeliver it forever.
+                // out instead of letting the sweeper redeliver it forever. The
+                // bytes go to the dead-letter queue first, because the ack is
+                // the step that makes them unrecoverable and a log line is not
+                // a place anybody reads a message back from. A failed DLQ write
+                // does not hold the message pending: the parse can never
+                // succeed, so redelivery buys nothing, and the loss is reported
+                // by name instead.
                 tracing::warn!(msg_id = %msg_id, "Failed to deserialize DagMessage: {e}");
+                if let Err(dlq_err) = self
+                    .backend
+                    .dlq(
+                        result_stream,
+                        msg_id,
+                        bytes,
+                        &format!("unparsable DagMessage: {e}"),
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        msg_id = %msg_id,
+                        "dead-letter write failed; this message's bytes are now lost: {dlq_err}"
+                    );
+                }
                 self.ack_result(result_stream, group_name, msg_id).await;
                 return;
             }
@@ -916,6 +937,11 @@ mod consumer_ack_tests {
         /// refuses a payload over it, the way a real server does, so a test
         /// cannot pass by declaring a bound and then accepting everything.
         payload_limit: Arc<Mutex<Option<usize>>>,
+        /// 死信写的记录：`(stream, msg_id, payload, reason)`。
+        ///
+        /// 记的是**参数**而不是发出去的那条 JSON——测试要钉的是「哪条消息、带着什么字节、
+        /// 为什么」被交给了死信队列，记录本身长什么样由契约自己的往返测试钉。
+        dlq_writes: Arc<Mutex<Vec<(String, String, Vec<u8>, String)>>>,
     }
 
     impl ScriptedBackend {
@@ -966,6 +992,10 @@ mod consumer_ack_tests {
                 .flat_map(|(_, _, ids)| ids.clone())
                 .collect()
         }
+
+        fn dlq_writes(&self) -> Vec<(String, String, Vec<u8>, String)> {
+            self.dlq_writes.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
@@ -1012,6 +1042,24 @@ mod consumer_ack_tests {
                 .lock()
                 .unwrap()
                 .push((stream.to_string(), group.to_string(), ids.to_vec()));
+            Ok(())
+        }
+        /// 记下参数而不是走默认实现：这一层测的是**接线**（谁在什么时候把哪条消息的字节
+        /// 交出去），记录本身的形状由契约的往返测试钉。写死不覆盖就会走默认实现去
+        /// `publish`，而这个 double 的 `publish` 什么都不记，接线错了也看不出来。
+        async fn dlq(
+            &self,
+            stream: &str,
+            msg_id: &str,
+            payload: &[u8],
+            reason: &str,
+        ) -> SFResult<()> {
+            self.dlq_writes.lock().unwrap().push((
+                stream.to_string(),
+                msg_id.to_string(),
+                payload.to_vec(),
+                reason.to_string(),
+            ));
             Ok(())
         }
         async fn claim_pending(
@@ -1235,6 +1283,47 @@ mod consumer_ack_tests {
         let _ = handle.await.unwrap();
 
         assert_eq!(acks, vec!["rid-poison".to_string()]);
+    }
+
+    /// 毒消息在 ack 之前先落到死信队列，带着它自己的字节。
+    ///
+    /// ack 是不可逆的那一步：它一落地，这份字节在这个进程里就没有第二处了。修之前这条
+    /// 路径只留一行日志，而日志不是能读回消息的地方——「有个消息死了」和「死的那条里
+    /// 写了什么」是两个问题，只答得出前一个的死信队列不值得存在。
+    #[tokio::test]
+    async fn a_poison_result_reaches_the_dead_letter_queue_carrying_its_bytes() {
+        let backend = ScriptedBackend::default();
+        let poison = b"not-json \x00\xff".to_vec();
+        backend.enqueue(
+            "orchestrator:results:ws-ack-test",
+            "rid-poison",
+            poison.clone(),
+        );
+
+        let runtime = test_runtime(backend.clone());
+        let shutdown = ShutdownSignal::new();
+        let shutdown_clone = shutdown.clone();
+        let handle = tokio::spawn(async move { runtime.run_consumer(shutdown_clone).await });
+        wait_for_acks(&backend, 1).await;
+        shutdown.trigger();
+        let _ = handle.await.unwrap();
+
+        let writes = backend.dlq_writes();
+        assert_eq!(writes.len(), 1, "一条毒消息对应一笔死信写");
+        let (stream, msg_id, payload, reason) = &writes[0];
+        assert_eq!(
+            stream, "orchestrator:results:ws-ack-test",
+            "写回它来的那条流"
+        );
+        assert_eq!(msg_id, "rid-poison");
+        assert_eq!(
+            payload, &poison,
+            "原样带过去——这一格丢了，死信记录就只剩「有个消息死了」"
+        );
+        assert!(
+            reason.contains("unparsable"),
+            "理由要说明它为什么会在这儿，实际是 {reason:?}"
+        );
     }
 
     #[tokio::test]

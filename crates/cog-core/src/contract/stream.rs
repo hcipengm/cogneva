@@ -27,6 +27,26 @@ pub struct PendingStats {
     pub unreclaimed_oldest_idle_ms: u64,
 }
 
+/// The serialized record a dead-letter entry is made of.
+///
+/// One builder rather than one per backend, because the record's shape is what
+/// a reader of the DLQ subject parses: three implementations each building their
+/// own copy of the same JSON is three places to change when a field is added and
+/// three chances to drop the payload, which is the field this exists to carry.
+/// The payload is base64 so no byte of a binary message is lost on the way in —
+/// the messages that reach here are the ones that could not be parsed, so
+/// assuming anything about their encoding is exactly the assumption that failed.
+pub fn dead_letter_record(msg_id: &str, payload: &[u8], reason: &str) -> SFResult<Vec<u8>> {
+    use base64::Engine as _;
+    let record = serde_json::json!({
+        "original_id": msg_id,
+        "reason": reason,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "payload_b64": base64::engine::general_purpose::STANDARD.encode(payload),
+    });
+    serde_json::to_vec(&record).map_err(SFError::Serialization)
+}
+
 /// Abstract message-queue backend for the DagExecutor layer.
 /// Implementations may target Redis Streams, NATS, Kafka, or in-memory
 /// channels for testing.  The trait is intentionally low-level (raw bytes)
@@ -134,16 +154,20 @@ pub trait MessageBackend: Send + Sync {
     ) -> SFResult<Option<PendingStats>>;
 
     /// Publish a message to the dead-letter queue for the given stream.
-    /// The default implementation appends to a `{stream}:dlq` subject.
-    /// Backends may override this to use a native DLQ mechanism.
-    async fn dlq(&self, stream: &str, msg_id: &str, reason: &str) -> SFResult<()> {
-        let payload = serde_json::json!({
-            "original_id": msg_id,
-            "reason": reason,
-            "timestamp": chrono::Utc::now().to_rfc3339(),
-        });
-        let bytes = serde_json::to_vec(&payload).map_err(SFError::Serialization)?;
-        self.publish(&format!("{}:dlq", stream), &bytes).await
+    ///
+    /// `payload` is the message's own bytes, and it is a parameter because a
+    /// record holding only an id and a reason cannot answer the one question a
+    /// dead-letter queue exists for — what was in the message. Every caller
+    /// reaches this from a branch that is about to drop those bytes for good, so
+    /// a queue that keeps the id and loses the message makes the loss look
+    /// handled while the thing lost is still gone.
+    ///
+    /// The default implementation appends [`dead_letter_record`] to a
+    /// `{stream}:dlq` subject; backends may override this to use a native DLQ
+    /// mechanism, but the record has to carry the same four fields.
+    async fn dlq(&self, stream: &str, msg_id: &str, payload: &[u8], reason: &str) -> SFResult<()> {
+        let record = dead_letter_record(msg_id, payload, reason)?;
+        self.publish(&format!("{}:dlq", stream), &record).await
     }
 
     /// Publish a message after a delay.

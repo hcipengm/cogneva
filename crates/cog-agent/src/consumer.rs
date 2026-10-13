@@ -251,7 +251,27 @@ impl AgentConsumer {
                 Err(e) => {
                     // Poison message: ack it out, otherwise every redelivery
                     // fails the same parse and the consumer can never advance.
+                    // The bytes are handed to the dead-letter queue before the
+                    // ack, because the ack is what makes them unrecoverable and
+                    // a log line is not somewhere a message is read back from.
+                    // A failed DLQ write does not keep it pending: the parse can
+                    // never succeed, so redelivery buys nothing.
                     tracing::warn!(msg_id = %msg_id, "Failed to deserialize InboxMessage: {e}");
+                    if let Err(dlq_err) = self
+                        .backend
+                        .dlq(
+                            &self.inbox_stream,
+                            &msg_id,
+                            &bytes,
+                            &format!("unparsable InboxMessage: {e}"),
+                        )
+                        .await
+                    {
+                        tracing::error!(
+                            msg_id = %msg_id,
+                            "dead-letter write failed; this message's bytes are now lost: {dlq_err}"
+                        );
+                    }
                     if let Err(e) = self
                         .backend
                         .ack(

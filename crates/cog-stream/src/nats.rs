@@ -418,17 +418,6 @@ impl MessageBackend for NatsMessageBackend {
         Ok(None)
     }
 
-    async fn dlq(&self, stream: &str, msg_id: &str, reason: &str) -> SFResult<()> {
-        let payload = serde_json::json!({
-            "original_id": msg_id,
-            "reason": reason,
-            "timestamp": chrono::Utc::now().to_rfc3339(),
-        });
-        let bytes = serde_json::to_vec(&payload).map_err(SFError::Serialization)?;
-        let dlq_subject = format!("{}:dlq", stream);
-        self.publish(&dlq_subject, &bytes).await
-    }
-
     async fn delay_publish(&self, subject: &str, payload: &[u8], delay_ms: u64) -> SFResult<()> {
         let subject = subject.to_string();
         let payload = payload.to_vec();

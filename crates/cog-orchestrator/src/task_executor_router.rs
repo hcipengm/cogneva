@@ -387,8 +387,30 @@ impl TaskExecutorRouter {
                 // 的，整份读不出来就是这一笔的载荷不可编码，按普通失败路径记
                 // 一笔、退避后再序列化一次，并由它自己的预算封顶。整份载荷
                 // 连 JSON 都不是时才说不出名字，那种情形只记日志。
-                self.report_poison_ready_message(task_id_of_poison_payload(bytes), &e, &msg_id)
+                let charged = self
+                    .report_poison_ready_message(task_id_of_poison_payload(bytes), &e, &msg_id)
                     .await;
+                // 上面那条路要能记账，前提是载荷里读得出一个 task_id，并且有 orchestrator
+                // 接得住。两条都不成立时这条消息就谁都不欠——那正是死信队列的位置：它是
+                // 唯一一个不需要领域对象就能收下这份字节的地方。能记账时不写，是因为那时
+                // 损失已经落在任务行上，再写一份就是把同一件事记在两处。
+                if !charged {
+                    if let Err(dlq_err) = pipe
+                        .task_backend
+                        .dlq(
+                            &pipe.ready_stream,
+                            &msg_id,
+                            bytes,
+                            &format!("unparsable ready message: {e}"),
+                        )
+                        .await
+                    {
+                        tracing::error!(
+                            msg_id = %msg_id,
+                            "dead-letter write failed; this message's bytes are now lost: {dlq_err}"
+                        );
+                    }
+                }
                 return;
             }
         };
@@ -523,14 +545,14 @@ impl TaskExecutorRouter {
         task_id: Option<String>,
         parse_error: &serde_json::Error,
         msg_id: &str,
-    ) {
+    ) -> bool {
         let Some(task_id) = task_id else {
             tracing::warn!(
                 msg_id = %msg_id,
                 "a ready message could not be deserialized and its payload does not name a \
                  task; dropped with no one to charge"
             );
-            return;
+            return false;
         };
         let Some(ref orch) = self.orchestrator else {
             tracing::warn!(
@@ -538,7 +560,7 @@ impl TaskExecutorRouter {
                 "no orchestrator to record the undecodable ready message against; the task \
                  will be re-armed when it stalls"
             );
-            return;
+            return false;
         };
         let error = format!(
             "undecodable ready message: the message carrying this task was acknowledged and \
@@ -546,14 +568,20 @@ impl TaskExecutorRouter {
              ({parse_error})"
         );
         match orch.fail_task(&task_id, error, None).await {
-            Ok((retried, cancelled, _)) => tracing::warn!(
-                task_id = %task_id, msg_id = %msg_id, retried, cancelled = cancelled.len(),
-                "recorded an undecodable ready message against the task whose payload it was"
-            ),
-            Err(e) => tracing::warn!(
-                task_id = %task_id, msg_id = %msg_id,
-                "cannot record the undecodable ready message against its task: {e}"
-            ),
+            Ok((retried, cancelled, _)) => {
+                tracing::warn!(
+                    task_id = %task_id, msg_id = %msg_id, retried, cancelled = cancelled.len(),
+                    "recorded an undecodable ready message against the task whose payload it was"
+                );
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    task_id = %task_id, msg_id = %msg_id,
+                    "cannot record the undecodable ready message against its task: {e}"
+                );
+                false
+            }
         }
     }
 }
@@ -679,7 +707,13 @@ mod ready_pipeline_tests {
         ) -> SFResult<Option<cog_core::PendingStats>> {
             Ok(None)
         }
-        async fn dlq(&self, _stream: &str, _msg_id: &str, _reason: &str) -> SFResult<()> {
+        async fn dlq(
+            &self,
+            _stream: &str,
+            _msg_id: &str,
+            _payload: &[u8],
+            _reason: &str,
+        ) -> SFResult<()> {
             Ok(())
         }
     }
@@ -993,7 +1027,13 @@ mod ready_pipeline_tests {
         ) -> SFResult<Option<cog_core::PendingStats>> {
             Ok(None)
         }
-        async fn dlq(&self, _stream: &str, _msg_id: &str, _reason: &str) -> SFResult<()> {
+        async fn dlq(
+            &self,
+            _stream: &str,
+            _msg_id: &str,
+            _payload: &[u8],
+            _reason: &str,
+        ) -> SFResult<()> {
             Ok(())
         }
     }
@@ -1216,7 +1256,13 @@ mod ready_queue_placement_tests {
         ) -> SFResult<Option<cog_core::PendingStats>> {
             Ok(None)
         }
-        async fn dlq(&self, _stream: &str, _msg_id: &str, _reason: &str) -> SFResult<()> {
+        async fn dlq(
+            &self,
+            _stream: &str,
+            _msg_id: &str,
+            _payload: &[u8],
+            _reason: &str,
+        ) -> SFResult<()> {
             Ok(())
         }
     }

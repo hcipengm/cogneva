@@ -69,7 +69,13 @@ git -C "${fixture}" add -A
 run_gate 0 '只有 hcipengm/cogneva' "${fixture}"
 
 # 另一个仓：红，且判词指到行（文件:行号）。
-printf '%s\n' 'see https://github.com/hcipengm/secret-thing' >"${fixture}/src/leak.txt"
+#
+# 仓名**拼出来**再写进夹具，不写成整串：本文件自己就落在被这个门扫的那棵树上，整串
+# 写下的那一刻，门会红在**自己的夹具**上——而那条判词（「这里引用了一个不该引的仓」）
+# 与「树里真有泄露」是同一条，从输出上分不出是哪一种。拼开之后字面量不落在任何被扫的
+# 文件里，夹具仍然是它要的那串，真泄露照旧红。
+leak_repo="secret""-thing"
+printf '%s\n' "see https://github.com/hcipengm/${leak_repo}" >"${fixture}/src/leak.txt"
 git -C "${fixture}" add -A
 run_gate 1 'secret-thing' "${fixture}"
 out="$(bash "${gate}" "${fixture}" 2>&1 || true)"

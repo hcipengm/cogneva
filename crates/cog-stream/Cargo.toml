@@ -22,6 +22,11 @@ futures = { workspace = true }
 redis = { workspace = true, optional = true }
 async-nats = { workspace = true, optional = true }
 
+[dev-dependencies]
+# 死信记录的载荷是 base64 编码的；测试要把它解回原字节，而不是拿一个
+# 自己算出来的字符串去比（那样测的是算字符串的方式，不是记录里放了什么）。
+base64 = "0.22"
+
 [features]
 default = ["redis", "nats", "mem"]
 redis = ["dep:redis"]

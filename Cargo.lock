@@ -1923,6 +1923,7 @@ version = "0.5.8"
 dependencies = [
  "async-nats 0.40.0",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "cog-core",
  "cog-redis",

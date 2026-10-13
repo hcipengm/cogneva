@@ -85,10 +85,7 @@ fn rows() -> Vec<Row> {
             );
             let (kind, direction, state) = (fields[0].trim(), fields[1].trim(), fields[2].trim());
             for (column, value) in [("kind", kind), ("direction", direction), ("state", state)] {
-                assert!(
-                    !value.is_empty(),
-                    "{column} is empty on this row: {line:?}"
-                );
+                assert!(!value.is_empty(), "{column} is empty on this row: {line:?}");
             }
             assert!(
                 DIRECTIONS.contains(&direction),

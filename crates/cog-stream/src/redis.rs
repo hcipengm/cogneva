@@ -434,18 +434,18 @@ impl MessageBackend for RedisMessageBackend {
         Ok(Some(stats))
     }
 
-    async fn dlq(&self, stream: &str, msg_id: &str, reason: &str) -> SFResult<()> {
-        let payload = serde_json::json!({
-            "original_id": msg_id,
-            "reason": reason,
-            "timestamp": chrono::Utc::now().to_rfc3339(),
-        });
-        let bytes = serde_json::to_vec(&payload)?;
+    async fn dlq(&self, stream: &str, msg_id: &str, payload: &[u8], reason: &str) -> SFResult<()> {
+        // Redis Streams gets the record appended with XADD rather than
+        // published, which is why this is an override and not the default: the
+        // entry has to land in a stream the reclaim and read paths already
+        // understand. The record itself comes from the shared builder so the
+        // two surfaces cannot drift on its fields.
+        let record = cog_core::dead_letter_record(msg_id, payload, reason)?;
         let dlq_stream = format!("{}:dlq", stream);
         let _: String = self
             .connection
             .clone()
-            .xadd(&dlq_stream, "*", &[("payload", &bytes as &[u8])])
+            .xadd(&dlq_stream, "*", &[("payload", &record as &[u8])])
             .await
             .map_err(|e: RedisError| SFError::Redis(e.to_string()))?;
         Ok(())

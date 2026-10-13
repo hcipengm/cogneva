@@ -1026,11 +1026,30 @@ impl Agent {
                                 }
                             }
                             Err(e) => {
+                                // Same poison path as in `consumer`: the bytes
+                                // reach the dead-letter queue before the ack that
+                                // makes them unrecoverable. A failed write is
+                                // reported and still does not hold the message
+                                // pending — this parse can never succeed.
                                 tracing::warn!(
                                     msg_id = %msg_id,
                                     "Failed to deserialize InboxMessage: {}",
                                     e
                                 );
+                                if let Err(dlq_err) = backend
+                                    .dlq(
+                                        &inbox_stream,
+                                        &msg_id,
+                                        &bytes,
+                                        &format!("unparsable InboxMessage: {e}"),
+                                    )
+                                    .await
+                                {
+                                    tracing::error!(
+                                        msg_id = %msg_id,
+                                        "dead-letter write failed; this message's bytes are now lost: {dlq_err}"
+                                    );
+                                }
                             }
                         }
                         if let Err(e) = backend

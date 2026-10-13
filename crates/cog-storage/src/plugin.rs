@@ -564,12 +564,11 @@ impl cog_core::SystemPlugin for StoragePlugin {
         // same shape as the state backend, raw logger and object backend above.
         // It reuses the connection opened just above -- one process keeps one
         // shared Redis manager, not one per backend.
-        let dead_letter_queue: Arc<dyn cog_core::DeadLetterQueue> = Arc::new(
-            crate::RedisDeadLetterQueue::from_connection(
+        let dead_letter_queue: Arc<dyn cog_core::DeadLetterQueue> =
+            Arc::new(crate::RedisDeadLetterQueue::from_connection(
                 redis_conn.clone(),
                 format!("orchestrator:dlq:{dag_workspace_id}"),
-            ),
-        );
+            ));
         ctx.publish_service(dead_letter_queue);
         info!("StoragePlugin dead-letter queue published");
 
@@ -584,8 +583,9 @@ impl cog_core::SystemPlugin for StoragePlugin {
         // dead-letter queue: the concrete backend lives in this crate and the
         // consumer speaks the `WalBackend` trait from `cog-core`. It shares the
         // connection opened above, like the queue and the registry below.
-        let wal_backend: Arc<dyn cog_core::WalBackend> =
-            Arc::new(crate::wal::RedisWalBackend::from_connection(redis_conn.clone()));
+        let wal_backend: Arc<dyn cog_core::WalBackend> = Arc::new(
+            crate::wal::RedisWalBackend::from_connection(redis_conn.clone()),
+        );
         ctx.publish_service(wal_backend);
         info!("StoragePlugin WAL backend published");
 
