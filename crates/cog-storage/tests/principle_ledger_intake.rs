@@ -297,7 +297,10 @@ async fn a_reading_that_declares_no_tier_takes_back_the_one_the_account_holds() 
     // The same reading with no tier in it: nobody declares this one any more.
     let withdrawn = reading(&slug, source);
     assert_eq!(
-        store.declare(std::slice::from_ref(&withdrawn)).await.unwrap(),
+        store
+            .declare(std::slice::from_ref(&withdrawn))
+            .await
+            .unwrap(),
         1,
         "a withdrawn tier is a change to the row, so it has to re-queue"
     );
