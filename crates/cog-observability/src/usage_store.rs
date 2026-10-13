@@ -64,7 +64,11 @@ pub const ROLLUP_TABLE: &str = "cog_llm_usage_rollup";
 /// read off the caller's identity because the same component runs in more than
 /// one environment: a table mapping names to environments would go stale the
 /// moment a deployment moved, while the caller always knows where it is.
-pub const LLM_ORIGIN_HEADER: &str = "x-cogneva-origin";
+///
+/// Defined in the contract layer rather than here, because the crates that set
+/// it do not depend on the crate that reads it — spelled out in full at the
+/// definition site.
+pub use cog_core::LLM_ORIGIN_HEADER;
 
 /// The environment a metered call was made in, as a closed set.
 ///

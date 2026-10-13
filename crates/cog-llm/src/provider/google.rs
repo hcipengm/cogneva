@@ -181,7 +181,7 @@ impl LLMProvider for GoogleProvider {
             .client
             .clone()
             .ok_or_else(|| SFError::Agent("GoogleProvider: no HttpClient configured".into()))?;
-        let headers = options.headers.clone();
+        let headers = crate::origin::outbound_headers(options);
         let body = self.build_request_body(messages, options);
         let abort_signal = options.abort_signal.clone();
 

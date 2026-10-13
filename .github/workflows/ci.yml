@@ -446,6 +446,13 @@ jobs:
       # 就全失效。与上面那条同形：渲染期没有症状，清单合法、parity 也绿。
       - name: Check deployment-name wiring
         run: bash deploy/scripts/check-deployment-name-wiring.sh
+      # token 账的环境轴（哪个环境烧的）。值与上面那两条同形：写者身份由部署声明，
+      # 写错或漏写在渲染期没有症状——读数照发，只是那一格落进 unknown，
+      # 而 unknown 不是环境、不计进任何一家的总数。判据还从代码读闭集，
+      # 并盯着「闭集里每个值都要有生产者」这一半（resident_worker 豁免：它的
+      # 生产者在会话侧，不在本仓，去树里找反而是错的）。
+      - name: Check LLM origin wiring
+        run: bash deploy/scripts/check-llm-origin-wiring.sh
 
   bootstrap-cross-platform:
     name: Bootstrap Cross-Platform Check

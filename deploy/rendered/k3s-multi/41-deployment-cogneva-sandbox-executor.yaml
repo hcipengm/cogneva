@@ -131,6 +131,12 @@ spec:
             - configMapRef:
                 name: cogneva-config
           env:
+            # 本进程的花费属于哪个环境：沙盒执行器是**实验性**代码跑的地方，
+            # 它的花费必须能与控制面分开读——混进 gateway_pool 就没有任何读数
+            # 能把「沙盒烧掉的」从「平台自己烧掉的」里分出来。值的闭集在代码里，
+            # 判据 deploy/scripts/check-llm-origin-wiring.sh。
+            - name: COGNEVA_LLM_ORIGIN
+              value: sandbox
             - name: SANDBOX_EXECUTOR_PORT
               value: "9090"
             # 每任务工作树路由：真实 task id 锚定命令 cwd 与相对文件路径。

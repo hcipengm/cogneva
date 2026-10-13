@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 
 use crate::websocket_protocol::ServerMessage;
 use crate::GatewayState;
+use cog_observability::usage_store::LlmOrigin;
 
 /// Per-session history cap (user + assistant messages combined).
 const SESSION_HISTORY_CAP: usize = 40;
@@ -59,7 +60,12 @@ async fn is_actionable_intent(llm: &Arc<dyn cog_core::LlmClient>, content: &str)
         cog_core::Message::system(INTENT_CLASSIFY_PROMPT),
         cog_core::Message::user(content),
     ];
-    let options = cog_core::ChatOptions::default().with_actor("intent_gateway");
+    let options = cog_core::ChatOptions::default()
+        .with_actor("intent_gateway")
+        // A person is waiting on this classification, so its spend belongs to
+        // the interactive environment even though the process it runs in is
+        // the one driving the platform's own pool.
+        .with_origin(LlmOrigin::Interactive.as_str());
     let res = tokio::time::timeout(
         std::time::Duration::from_secs(CLASSIFY_TIMEOUT_SECS),
         llm.chat(&messages, &options),
@@ -264,7 +270,10 @@ pub async fn run_chat_turn(
         response_format: cog_core::ResponseFormat::Text,
         ..Default::default()
     }
-    .with_actor("web_chat");
+    .with_actor("web_chat")
+    // Both chat faces answer a person who is waiting, so both are interactive
+    // spend — unlike the pool the same process drives on its own.
+    .with_origin(LlmOrigin::Interactive.as_str());
 
     // 4. Stream the reply: deltas are forwarded as they arrive.
     let mut stream = match tokio::time::timeout(

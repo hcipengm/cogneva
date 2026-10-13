@@ -17,6 +17,21 @@ pub type AssistantMessageEventProducer = EventStreamProducer<AssistantMessageEve
 /// metrics so per-actor consumption (e.g. self-review) is observable.
 pub const LLM_ACTOR_HEADER: &str = "x-cogneva-actor";
 
+/// Inbound header carrying the environment a call was made from, alongside
+/// [`LLM_ACTOR_HEADER`] on the same proxied request.
+///
+/// The two headers answer different questions and are read side by side:
+/// `actor` says which component burned the tokens, this one says where it ran,
+/// and the same component runs in more than one environment, so neither can be
+/// derived from the other.
+///
+/// The closed set of values lives with the reader that normalises them; the
+/// constant lives here because every crate that *makes* a call declares this
+/// header, and those crates depend on the contract layer, not on the reader.
+/// A writer that could not name the header would have to spell the string
+/// itself, and a second spelling is a second value.
+pub const LLM_ORIGIN_HEADER: &str = "x-cogneva-origin";
+
 /// The standard header an upstream uses to say when it can serve us again.
 pub const RETRY_AFTER_HEADER: &str = "retry-after";
 
@@ -212,6 +227,20 @@ impl ChatOptions {
     pub fn with_actor(mut self, actor: &str) -> Self {
         self.headers
             .insert(LLM_ACTOR_HEADER.to_string(), actor.to_string());
+        self
+    }
+
+    /// Declare the environment this call is made from, overriding whatever the
+    /// process declared for its calls in general.
+    ///
+    /// Most callers never need this: the environment a process runs in is a
+    /// property of where it is deployed, so the transport layer states it once
+    /// for every call the process makes. It is here for the process that hosts
+    /// more than one environment — a control plane answering a human and
+    /// driving its own pool is one process with two answers.
+    pub fn with_origin(mut self, origin: &str) -> Self {
+        self.headers
+            .insert(LLM_ORIGIN_HEADER.to_string(), origin.to_string());
         self
     }
 }

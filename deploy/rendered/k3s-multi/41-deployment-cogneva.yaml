@@ -94,6 +94,13 @@ spec:
             # （判据 deploy/scripts/check-deployment-name-wiring.sh）。
             - name: COGNEVA_DEPLOYMENT_NAME
               value: cogneva
+            # 本进程的花费属于哪个环境。token 账按这条轴回答「哪个环境烧的」，
+            # 与 actor 轴（哪个组件烧的）正交——同一个组件在多个环境里跑，两个
+            # 问题互不蕴含。控制面自己驱动平台的任务池，所以是 gateway_pool；
+            # WebUI 聊天那两条路径上有人在等，由代码就地改判成 interactive。
+            # 值的闭集在代码里，判据 deploy/scripts/check-llm-origin-wiring.sh。
+            - name: COGNEVA_LLM_ORIGIN
+              value: gateway_pool
             # 告警邮件出口的 SMTP 口令：凭证不进清单也不进 values，只认这个
             # Secret 键，缺省即不做鉴权。键由集群侧写入（与可观测栈安装脚本写
             # clickhouse-password 同形）。
