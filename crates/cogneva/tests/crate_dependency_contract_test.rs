@@ -33,7 +33,7 @@
 //! the other direction:
 //!
 //! - A new edge fails. Every normal internal dependency of a business crate
-//!   must appear in [`ALLOWED`], and every dev one in [`ALLOWED_DEV`]; the
+//!   must appear in [`allowed()`], and every dev one in [`allowed_dev()`]; the
 //!   failure names the edge.
 //! - A stale row fails. Every row must still correspond to a real edge, so
 //!   removing an edge and leaving its row behind is refused rather than quietly
@@ -67,84 +67,31 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
-/// The internal dependencies the tree has today, frozen: `(consumer,
-/// dependency, replace_with)`.
+/// The internal dependencies the tree has today, frozen as
+/// `(consumer, dependency, replace_with)`.
 ///
+/// The rows live in `crates/cogneva/debt/dependency-edges.tsv` — a tree file the
+/// running loop reads through the same bytes this test does, so there is one
+/// carrier and no second copy free to drift from what the loop acts on.
 /// `replace_with` is the edge's primary target — the contract that covers the
 /// bulk of what the consumer reaches for — and not a claim that the edge has
-/// exactly one use. An edge whose other uses need contracts of their own is
-/// really several edges that share one dependency, and the row cannot say so:
-/// the row is keyed on the pair, and the dependency stays until the last use of
-/// it is gone. The known remainders are named where the row is, so a reader does
-/// not have to rediscover them; `cog-gateway -> cog-storage` is the worst of
-/// them, with one use of a pooled-connection handle beside the metrics backends
-/// the row names.
+/// exactly one use; the known remainders are named on the row itself.
 ///
 /// A business crate is any workspace member named `cog-*`. The crates that
 /// assemble them are listed in [`ASSEMBLY_ROOTS`] and are the only members
 /// allowed to name a business crate directly, because wiring the crates
 /// together is the whole of what they do.
-const ALLOWED: &[(&str, &str, &str)] = &[
-    ("cog-agent", "cog-redis", "contract::stream::MessageBackend"),
-    ("cog-auth", "cog-redis", "contract::kv::KeyValueStore"),
-    ("cog-auth", "cog-storage", "contract::kv::KeyValueStore"),
-    (
-        "cog-collaboration",
-        "cog-redis",
-        "contract::kv::KeyValueStore",
-    ),
-    ("cog-gateway", "cog-llm", "contract::llm::LlmClient"),
-    ("cog-gateway", "cog-net", "contract::net::HttpClient"),
-    (
-        "cog-gateway",
-        "cog-observability",
-        "contract::alerts::AlertStore",
-    ),
-    ("cog-gateway", "cog-redis", "contract::kv::KeyValueStore"),
-    // Metrics backends cover all but two of this edge's uses. The remainders
-    // are one direct client handle, which is [`contract::kv::KeyValueStore`],
-    // and one pooled-connection handle for which no contract exists yet — that
-    // one needs a target of its own when the edge is worked, and it is why the
-    // row cannot come out on the metrics work alone.
-    (
-        "cog-gateway",
-        "cog-storage",
-        "contract::storage::MetricsBackend",
-    ),
-    (
-        "cog-memory",
-        "cog-storage",
-        "contract::storage::VectorBackend",
-    ),
-    ("cog-quota", "cog-redis", "contract::kv::KeyValueStore"),
-    ("cog-quota", "cog-storage", "contract::kv::KeyValueStore"),
-    ("cog-reflection", "cog-eval", "contract::eval::EvalService"),
-    (
-        "cog-storage",
-        "cog-protocol",
-        "contract::codec::RawRecordCodec",
-    ),
-    // What the storage crate owns and what the redis crate is: the argument
-    // that the driver belongs to storage is an argument about which crate the
-    // implementation lands in, not about a capability every crate should be
-    // able to reach. Either way the reach is a key-value contract; there is no
-    // version of this edge that ends in a direct link.
-    ("cog-storage", "cog-redis", "contract::kv::KeyValueStore"),
-    (
-        "cog-stream",
-        "cog-redis",
-        "contract::stream::MessageBackend",
-    ),
-    (
-        "cog-supervisor",
-        "cog-redis",
-        "contract::supervisor::LlmPoolStatusSource",
-    ),
-];
+const DEPENDENCY_EDGES_FILE: &str = "debt/dependency-edges.tsv";
 
-/// The dev-only internal dependencies, frozen the same way and asserted with
-/// the same severity.
+/// The normal-kind rows: `(consumer, dependency, replace_with)`.
+fn allowed() -> &'static [(&'static str, &'static str, &'static str)] {
+    static ROWS: OnceLock<Vec<(&'static str, &'static str, &'static str)>> = OnceLock::new();
+    ROWS.get_or_init(|| debt_rows("allowed"))
+}
+
+/// The dev-only rows, frozen the same way and asserted with the same severity.
 ///
 /// A dev edge does not ship, but it does rebuild: linking a neighbour from
 /// `#[cfg(test)]` puts that neighbour in the rebuild set of this crate's tests
@@ -152,39 +99,56 @@ const ALLOWED: &[(&str, &str, &str)] = &[
 /// run without the neighbour's in-memory backend existing and behaving. The
 /// stand-in is the symptom; a contract with one implementation is what leaves a
 /// test with nowhere else to get a stand-in from.
-const ALLOWED_DEV: &[(&str, &str, &str)] = &[
-    (
-        "cog-github",
-        "cog-storage",
-        "contract::storage::MetricsBackend",
-    ),
-    (
-        "cog-memory",
-        "cog-stream",
-        "contract::stream::MessageBackend",
-    ),
-    (
-        "cog-orchestrator",
-        "cog-storage",
-        "contract::storage::StateBackend",
-    ),
-    (
-        "cog-reflection",
-        "cog-prompt",
-        "contract::prompt::PromptManager",
-    ),
-    (
-        "cog-reflection",
-        "cog-storage",
-        "contract::storage::StateBackend",
-    ),
-    (
-        "cog-skill",
-        "cog-storage",
-        "contract::storage::MetricsBackend",
-    ),
-    ("cog-wiki", "cog-memory", "contract::memory::MemoryBackend"),
-];
+fn allowed_dev() -> &'static [(&'static str, &'static str, &'static str)] {
+    static ROWS: OnceLock<Vec<(&'static str, &'static str, &'static str)>> = OnceLock::new();
+    ROWS.get_or_init(|| debt_rows("allowed_dev"))
+}
+
+/// The rows of [`DEPENDENCY_EDGES_FILE`] whose first column is `kind`, skipping
+/// the `kind` header and `#` line comments.
+///
+/// The strings are leaked so the parsed rows keep the `&'static str` shape the
+/// rest of this file is written against; a registry of a few dozen rows leaks a
+/// few dozen short strings once, which a test process does not notice.
+fn debt_rows(kind: &str) -> Vec<(&'static str, &'static str, &'static str)> {
+    read_debt(DEPENDENCY_EDGES_FILE)
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| {
+            let mut field = line.split('\t');
+            if field.next()? != kind {
+                return None;
+            }
+            let consumer = leak(field.next()?);
+            let dep = leak(field.next()?);
+            let contract = leak(field.next().unwrap_or(""));
+            Some((consumer, dep, contract))
+        })
+        .collect()
+}
+
+/// A string that lives as long as the process.
+fn leak(value: &str) -> &'static str {
+    Box::leak(value.to_string().into_boxed_str())
+}
+
+/// Read a repo file named relative to this crate's manifest, failing loudly: a
+/// registry that reads nothing would pass every assertion by having no rows.
+fn read_debt(relative: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("cannot read the debt file {}: {error}", path.display()))
+}
+
+/// This test's own source, read back to prove the rows are not written here.
+/// The path is built from the manifest rather than from `file!()`, which the
+/// compiler spells relative to the workspace root.
+fn read_own_source() -> String {
+    let name = Path::new(file!())
+        .file_name()
+        .expect("this test file has a name");
+    read_debt(&format!("tests/{}", name.to_string_lossy()))
+}
 
 /// The closed set of core-side targets a row may name.
 ///
@@ -559,7 +523,7 @@ fn the_workspace_members_are_exactly_the_registered_ones() {
 #[test]
 fn a_normal_dependency_between_business_crates_is_registered_or_rejected() {
     let ws = Workspace::read();
-    let registered = registry(ALLOWED, "ALLOWED");
+    let registered = registry(allowed(), "ALLOWED");
     let unregistered: Vec<String> = ws
         .kind(Kind::Normal)
         .iter()
@@ -581,7 +545,7 @@ fn a_normal_dependency_between_business_crates_is_registered_or_rejected() {
 #[test]
 fn a_dev_dependency_between_business_crates_is_registered_or_rejected() {
     let ws = Workspace::read();
-    let registered = registry(ALLOWED_DEV, "ALLOWED_DEV");
+    let registered = registry(allowed_dev(), "ALLOWED_DEV");
     let unregistered: Vec<String> = ws
         .kind(Kind::Dev)
         .iter()
@@ -616,8 +580,45 @@ fn a_registered_edge_that_no_longer_exists_is_a_stale_row() {
              removing an edge means removing its row"
         );
     };
-    live(Kind::Normal, ALLOWED, "ALLOWED");
-    live(Kind::Dev, ALLOWED_DEV, "ALLOWED_DEV");
+    live(Kind::Normal, allowed(), "ALLOWED");
+    live(Kind::Dev, allowed_dev(), "ALLOWED_DEV");
+}
+
+/// The edge registry has one carrier. The rows are the file's; a literal tuple
+/// in this test would be a second copy the loop cannot see and free to drift
+/// from the bytes it reads, which is the drift the move to the file forbids.
+///
+/// The scan looks for the two shapes a re-added row takes: a one-line tuple
+/// naming two crates, or a wrapped one whose last line is a target and whose two
+/// lines above each name one crate. [`MEMBERS`] lists crate names one per line,
+/// so a run of single-crate lines alone is not a row.
+#[test]
+fn the_edge_rows_live_in_the_file_and_not_in_this_test() {
+    assert!(
+        !allowed().is_empty() && !allowed_dev().is_empty(),
+        "{DEPENDENCY_EDGES_FILE} parsed to no rows — the registry reads nothing and would pass \
+         every assertion by having nothing to check"
+    );
+    let this_file = file!();
+    let source = read_own_source();
+    let lines: Vec<&str> = source.lines().collect();
+    let inlined: Vec<String> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let crates = line.matches("\"cog-").count();
+            let wrapped = line.trim_start().starts_with("\"contract::")
+                && index >= 2
+                && lines[index - 1].matches("\"cog-").count() == 1
+                && lines[index - 2].matches("\"cog-").count() == 1;
+            (crates >= 2 || wrapped).then(|| format!("{}: {line}", index + 1))
+        })
+        .collect();
+    assert!(
+        inlined.is_empty(),
+        "edge rows are written into {this_file} instead of {DEPENDENCY_EDGES_FILE}: {inlined:?} — the \
+         loop reads the file, so a literal here is a copy it cannot see"
+    );
 }
 
 /// Every row names a contract that is really there, or one that is on the list
@@ -626,7 +627,7 @@ fn a_registered_edge_that_no_longer_exists_is_a_stale_row() {
 /// exactly like a row that is fine.
 #[test]
 fn every_registered_target_is_a_core_contract_that_exists_or_is_owed() {
-    for (table, rows) in [("ALLOWED", ALLOWED), ("ALLOWED_DEV", ALLOWED_DEV)] {
+    for (table, rows) in [("ALLOWED", allowed()), ("ALLOWED_DEV", allowed_dev())] {
         for (consumer, dep, target) in rows {
             let (module_exists, trait_declared) = core_contract_says(target);
             let owed = TARGETS_TO_INTRODUCE.contains(target);

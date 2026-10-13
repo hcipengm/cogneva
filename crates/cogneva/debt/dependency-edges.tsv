@@ -1,0 +1,54 @@
+# 内部依赖边欠账的单一来源。契约测试与本树的运行环读同一份字节。
+#
+# 一条边一行，制表符分隔：kind  consumer  dep  contract
+#   kind      allowed（发布期）或 allowed_dev（仅测试期）
+#   consumer  发起依赖的业务 crate
+#   dep       被直接依赖的邻居
+#   contract  这条边应该经由的 core 契约；允许为空表示契约还没写出来
+#              （名字由 targets-to-introduce 承接），落到 goal 时以契约名作终点。
+#
+# `#` 开头的行是行注，解析器跳过；空行同理。行注随它下面那一条走，说明那条边
+# 为什么是这个契约、为什么还不能撤。
+#
+# 为什么是一份文件而不是常量：运行中的二进制读不到测试文件里的 const——它只能
+# 读树。把表放在这里，测试（编译期读者）与环（运行期读者，经 CheckTree）读的是
+# 同一份字节，改一个字节两边同时变，不会有第二份会悄悄漂走的名册。
+
+kind	consumer	dep	contract
+allowed	cog-agent	cog-redis	contract::stream::MessageBackend
+allowed	cog-auth	cog-redis	contract::kv::KeyValueStore
+allowed	cog-auth	cog-storage	contract::kv::KeyValueStore
+allowed	cog-collaboration	cog-redis	contract::kv::KeyValueStore
+allowed	cog-gateway	cog-llm	contract::llm::LlmClient
+allowed	cog-gateway	cog-net	contract::net::HttpClient
+allowed	cog-gateway	cog-observability	contract::alerts::AlertStore
+allowed	cog-gateway	cog-redis	contract::kv::KeyValueStore
+# 这条边多数的用途由 metrics 后端覆盖，余下两处：一处是直接的 client 句柄
+# （即 contract::kv::KeyValueStore），另一处是一个池化连接句柄，它今天还没有
+# 契约——那条要在做这条边时给它一个自己的终点，也是这条边不能只靠 metrics
+# 那一笔就撤掉的原因。
+allowed	cog-gateway	cog-storage	contract::storage::MetricsBackend
+allowed	cog-memory	cog-storage	contract::storage::VectorBackend
+allowed	cog-quota	cog-redis	contract::kv::KeyValueStore
+allowed	cog-quota	cog-storage	contract::kv::KeyValueStore
+allowed	cog-reflection	cog-eval	contract::eval::EvalService
+allowed	cog-storage	cog-protocol	contract::codec::RawRecordCodec
+# storage 拥有什么、redis 是什么：driver 属于 storage 是一个关于实现落在哪个
+# crate 的论证，不是一个关于每个 crate 都该够得着的能力的论证。无论哪种，这个
+# 到达都是一个键值契约；这条边没有以直接链接收尾的版本。
+allowed	cog-storage	cog-redis	contract::kv::KeyValueStore
+allowed	cog-stream	cog-redis	contract::stream::MessageBackend
+allowed	cog-supervisor	cog-redis	contract::supervisor::LlmPoolStatusSource
+# 仅测试期的内部依赖，同样冻结、同样严厉断言。
+#
+# 测试边不下发，但会重编：从 `#[cfg(test)]` 链接一个邻居，同样把那个邻居放进本
+# crate 测试的重编集里，并耦合两个 crate 的夹具——没有邻居的内存后端存在并行为
+# 正确，这个测试就跑不起来。替身是症状；一个只有一个实现的契约才是让测试无处
+# 取得替身的原因。
+allowed_dev	cog-github	cog-storage	contract::storage::MetricsBackend
+allowed_dev	cog-memory	cog-stream	contract::stream::MessageBackend
+allowed_dev	cog-orchestrator	cog-storage	contract::storage::StateBackend
+allowed_dev	cog-reflection	cog-prompt	contract::prompt::PromptManager
+allowed_dev	cog-reflection	cog-storage	contract::storage::StateBackend
+allowed_dev	cog-skill	cog-storage	contract::storage::MetricsBackend
+allowed_dev	cog-wiki	cog-memory	contract::memory::MemoryBackend

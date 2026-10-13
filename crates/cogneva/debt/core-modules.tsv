@@ -1,0 +1,38 @@
+# core 源根里的模块欠账的单一来源。契约测试与本树的运行环读同一份字节。
+#
+# 一个模块一行，制表符分隔：module  reason
+#   module  core 源根里的模块名（目录与 .rs 都登记，只是 kind 不同）
+#   reason  它为什么是契约而不是能力，取值见下面的闭集。
+#
+# reason 出自闭集（见契约测试里的 MODULE_REASONS），不是散文：一条写句子的登记
+# 不管句子真假都作同样的声明，而登记一个模块的意义正在于这句话能被拿去对着闭集
+# 核对。
+#
+# 与 dependency-edges.tsv 同一个理由放在树里：运行中的二进制读不到 const，只能
+# 读树；一份文件两个读者（编译期测试 + 运行期环）读同字节，改一个字节两边同时变。
+
+module	reason
+admission	pending-relocation
+audit	shared-definition
+build_cache	shared-definition
+# cog-extension 与 cog-reflection 各自构造一个 readings 对象并 spawn watch 环，
+# 两者互不依赖，所以没有任何单一目标 crate 对每个读者都可达。契约那半必须坐在
+# 两者都够得着的地方——core——而 driver 随之留下，所以 reason 点的是 driver 而
+# 不是纯定义。
+build_cache_readings	shared-definition-with-driver
+# 留下：core 自己的 enforce_cap 是唯一调用者，两个量缓存的进程都经
+# measure_and_enforce 到达它——cog-extension 的 workdir 直接到达，core 的 watch
+# （由 cog-reflection spawn）到达。cog-extension 与 cog-reflection 互不依赖，
+# 所以没有目标 crate 够得着每个消费者，机制随运行它的 core driver 留下。
+build_cache_reclaim	shared-mechanism-with-core-driver
+build_gate	pending-relocation
+claim_footprint	shared-definition
+config	shared-config
+config_sections	shared-config
+error	shared-error
+fs_size	shared-definition
+lib	crate-root
+loop_health	pending-relocation
+observability_text	shared-definition
+secrets	shared-definition
+token_estimate	shared-definition

@@ -29,7 +29,7 @@
 //! module's documentation, and text cannot tell those from a real call site. So
 //! the assertions read structure instead:
 //!
-//! - [`CORE_ROOT_MODULES`] is the exact set of modules in the core's source
+//! - [`core_root_modules()`] is the exact set of modules in the core source
 //!   root, and the exact set of directories there too. A file that is not on the
 //!   list fails, and so does a directory, so a mechanism cannot arrive by being
 //!   added — only by being registered, which is a decision someone has to write
@@ -61,43 +61,60 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 /// The modules in the core's source root, each with the reason it is a contract
 /// rather than a capability: `(module, reason)`.
 ///
-/// The reason is a member of [`MODULE_REASONS`] rather than prose. A row whose
-/// reason is a sentence makes the same claim whether the claim is true, and the
-/// whole point of registering a module is that the claim can be checked against
-/// the list.
-const CORE_ROOT_MODULES: &[(&str, &str)] = &[
-    ("admission", "pending-relocation"),
-    ("audit", "shared-definition"),
-    ("build_cache", "shared-definition"),
-    // Both `cog-extension` and `cog-reflection` build a readings object and
-    // spawn the watch loop, and neither reaches the other, so no single
-    // destination crate is reachable from every reader. The contract half has to
-    // sit where both reach — the core — and the driver stays with it, so the
-    // reason names the driver rather than reading as a pure definition.
-    ("build_cache_readings", "shared-definition-with-driver"),
-    // Stays: the core's own `enforce_cap` is the only caller, and both processes
-    // that measure a cache reach it through `measure_and_enforce` -- the
-    // `cog-extension` workdir directly, and the core's watch, which
-    // `cog-reflection` spawns. Neither `cog-extension` nor `cog-reflection`
-    // depends on the other, so no destination crate reaches every consumer, and
-    // the mechanism stays with the core driver that runs it.
-    ("build_cache_reclaim", "shared-mechanism-with-core-driver"),
-    ("build_gate", "pending-relocation"),
-    ("claim_footprint", "shared-definition"),
-    ("config", "shared-config"),
-    ("config_sections", "shared-config"),
-    ("error", "shared-error"),
-    ("fs_size", "shared-definition"),
-    ("lib", "crate-root"),
-    ("loop_health", "pending-relocation"),
-    ("observability_text", "shared-definition"),
-    ("secrets", "shared-definition"),
-    ("token_estimate", "shared-definition"),
-];
+/// The rows live in `crates/cogneva/debt/core-modules.tsv`, a tree file the
+/// running loop reads through the same bytes this test does — the registry has
+/// one carrier, so there is no second copy free to drift from what the loop
+/// reads. The reason is a member of [`MODULE_REASONS`] rather than prose: a row
+/// whose reason is a sentence makes the same claim whether the claim is true,
+/// and the whole point of registering a module is that the claim can be checked
+/// against the list.
+const CORE_MODULES_FILE: &str = "debt/core-modules.tsv";
+
+fn core_root_modules() -> &'static [(&'static str, &'static str)] {
+    static ROWS: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
+    ROWS.get_or_init(|| {
+        read_debt(CORE_MODULES_FILE)
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .filter_map(|line| {
+                let mut field = line.split('\t');
+                let module = field.next()?;
+                if module == "module" {
+                    return None;
+                }
+                Some((leak(module), leak(field.next().unwrap_or(""))))
+            })
+            .collect()
+    })
+}
+
+/// A string that lives as long as the process.
+fn leak(value: &str) -> &'static str {
+    Box::leak(value.to_string().into_boxed_str())
+}
+
+/// Read a repo file named relative to this crate's manifest, failing loudly: a
+/// registry that reads nothing would pass every assertion by having no rows.
+fn read_debt(relative: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("cannot read the debt file {}: {error}", path.display()))
+}
+
+/// This test's own source, read back to prove the rows are not written here.
+/// The path is built from the manifest rather than from `file!()`, which the
+/// compiler spells relative to the workspace root.
+fn read_own_source() -> String {
+    let name = Path::new(file!())
+        .file_name()
+        .expect("this test file has a name");
+    read_debt(&format!("tests/{}", name.to_string_lossy()))
+}
 
 /// The directories in the core's source root, registered the same way and for
 /// the same reason: a module that arrives as a directory would otherwise pass an
@@ -441,7 +458,7 @@ fn core_root_entries() -> (BTreeSet<String>, BTreeSet<String>) {
 /// module registered twice is two rows for one file.
 fn registered_modules() -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    for (module, reason) in CORE_ROOT_MODULES {
+    for (module, reason) in core_root_modules() {
         assert!(
             MODULE_REASONS.contains(reason),
             "CORE_ROOT_MODULES registers `{module}` with `{reason}`, which is not one of \
@@ -458,11 +475,44 @@ fn registered_modules() -> BTreeSet<String> {
 /// The modules the relocation owes, from the registry itself rather than from a
 /// second list that could disagree with it.
 fn pending_relocation() -> BTreeSet<String> {
-    CORE_ROOT_MODULES
+    core_root_modules()
         .iter()
         .filter(|(_, reason)| *reason == "pending-relocation")
         .map(|(module, _)| module.to_string())
         .collect()
+}
+
+/// The module registry has one carrier. The rows are the file's; a literal
+/// module name in this test would be a second copy the loop cannot see and free
+/// to drift from the bytes it reads, which is the drift the move to the file
+/// forbids.
+///
+/// The modules owed a move are named again by [`RELOCATION_TARGET`], a second
+/// list by design, so their names are skipped: every other module has no home in
+/// this file, and a hit means the table has grown back.
+#[test]
+fn the_module_rows_live_in_the_file_and_not_in_this_test() {
+    assert!(
+        !core_root_modules().is_empty(),
+        "{CORE_MODULES_FILE} parsed to no rows — the registry reads nothing and would pass every \
+         assertion by having nothing to check"
+    );
+    let this_file = file!();
+    let source = read_own_source();
+    let named_by_destination: BTreeSet<&str> = RELOCATION_TARGET
+        .iter()
+        .map(|(module, _, _)| *module)
+        .collect();
+    for (module, _) in core_root_modules() {
+        if named_by_destination.contains(module) {
+            continue;
+        }
+        assert!(
+            !source.contains(&format!("\"{module}\"")),
+            "`{module}` is written into {this_file} instead of {CORE_MODULES_FILE} — the loop \
+             reads the file, so a literal here is a copy it cannot see"
+        );
+    }
 }
 
 /// The core's root modules are exactly the registered ones, and so are its root
