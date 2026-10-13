@@ -472,6 +472,62 @@ async fn a_corrected_declaration_reaches_the_accounts_citation_of_its_document()
     cleanup(&pool, &marker).await;
 }
 
+/// A declaration nobody has measured enters as work still owed, not as a stuck
+/// row.
+///
+/// `undecided` is not "nobody has looked yet": it is what a measurement writes
+/// when a check cannot be settled for a reason that is a property of the row, and
+/// the store couples it to that reason -- there is no way to build a reason-less
+/// `undecided` measurement, and a row carrying one reads as a stuck row whose
+/// reason was lost. A freshly folded declaration is neither, so it enters
+/// `pending` with no `measured_at`; that absence is what a reader uses to tell a
+/// row nothing has looked at from one measured a while ago. Entering as
+/// `undecided` would state a verdict no look reached and hide the row among the
+/// ones that predate the reason column.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_freshly_folded_declaration_enters_pending_and_unmeasured() {
+    let (store, pool, marker) = store().await;
+    let id = identity(&marker, "fresh");
+    store
+        .declare(&[ChangeReading {
+            identity: id.clone(),
+            title: Some("a change the probe declares".into()),
+            assertion: Some("the probe's assertion".into()),
+            source: ChangeSource {
+                doc: format!("docs/{marker}.md"),
+                verdict: Some("pending".into()),
+            },
+        }])
+        .await
+        .expect("queue the declaration");
+    store
+        .fold_declarations(100, Some("probe-rev"))
+        .await
+        .expect("fold the declaration");
+
+    let row = store
+        .get(&id)
+        .await
+        .expect("read the row")
+        .expect("the row exists");
+    assert_eq!(
+        row.state,
+        ChangeState::Pending,
+        "a declaration nothing has measured is outstanding work, not a row stuck on a reason"
+    );
+    assert_eq!(
+        row.unsettled_reason, None,
+        "a state that is not undecided carries no reason"
+    );
+    assert!(
+        row.measured_at.is_none(),
+        "nothing has measured it, and the row must not read as measured"
+    );
+
+    cleanup(&pool, &marker).await;
+}
+
 /// Take one declaration back off the intake, the way the producer's withdrawal
 /// verb does: a plain delete on the four columns the intake is keyed on, not
 /// through the store -- the store has no withdrawal, and the whole point of the

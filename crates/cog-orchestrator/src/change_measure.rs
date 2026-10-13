@@ -188,8 +188,8 @@ pub enum UnsettledReason {
     /// this tree and no search for it can match.
     PredicateIsARendering,
     /// The check names a path this tree structurally cannot hold -- a host
-    /// absolute path, another repository's path -- so it never ran and no
-    /// revision will change that.
+    /// absolute path, another repository's path, a field holding several paths
+    /// where one belongs -- so it never ran and no revision will change that.
     ScopeOutsideTree,
     /// The check's scope is a path this revision does not have, but the tree
     /// could hold it -- a directory not yet created. Unlike
@@ -345,9 +345,10 @@ impl Snapshot {
     ///
     /// A scope naming a location the project does not have at its top level is
     /// not a check that came back empty; it is a check about some other tree -- a
-    /// sibling repository, or a filesystem path on somebody's machine. From a
-    /// single `ls-tree` the two are the same empty answer, and only one of them
-    /// means "not landed yet", so they are separated here, before the check runs.
+    /// sibling repository, a filesystem path on somebody's machine, or a field
+    /// that is not a single path at all. From a single `ls-tree` all of those are
+    /// the same empty answer, and only one of them means "not landed yet", so
+    /// they are separated here, before the check runs.
     ///
     /// The test is the top-level entry and not the whole path on purpose. A path
     /// that is missing deeper down is what a change which has not landed looks
@@ -363,6 +364,24 @@ impl Snapshot {
         // own deployment has no business answering for somebody's home
         // directory.
         if scope.starts_with('/') {
+            return false;
+        }
+        // A scope is one path, so a field holding whitespace holds something
+        // other than a path: the usual way this happens is a line written with
+        // two things and split on the wrong side of the separator, leaving
+        // `crates/ deploy/` in the scope column. Such a field is not a path this
+        // tree has or could ever have -- no revision joins the halves -- so it
+        // belongs with the foreign paths above rather than with the paths below.
+        //
+        // It has to be refused here rather than left to the top-level test,
+        // because that test reads the first segment only and this field passes
+        // it by accident: `crates` is a real entry. The row would then read as a
+        // path that has drifted and become answerable again in some later
+        // revision, and it would be measured again every retry window forever
+        // without ever reaching the row as the thing it actually is -- a check
+        // nothing can run. Refusing it says that once, and the row is retracted
+        // with the reason written on it.
+        if scope.contains(char::is_whitespace) {
             return false;
         }
         match scope.split('/').next() {
@@ -987,6 +1006,29 @@ mod tests {
     fn a_path_missing_below_a_real_root_stays_answerable() {
         assert!(snapshot().could_hold("crates/cog-nothing/src/lib.rs"));
         assert!(snapshot().could_hold("deploy/helm/cogneva/gone.yaml"));
+    }
+
+    /// A field holding more than one path is not a path, and it must be refused
+    /// as one even though it starts with an entry this root really has. Left to
+    /// the top-level test, `crates/ deploy/` passes on `crates` and reads as a
+    /// path that has drifted -- a row measured every retry window forever, never
+    /// reaching the row as the thing it is. A check about a path this tree cannot
+    /// hold is retracted with its reason written on it instead.
+    #[tokio::test]
+    async fn a_scope_holding_two_paths_is_not_a_path_this_tree_can_hold() {
+        let snapshot = snapshot();
+        assert!(!snapshot.could_hold("crates/ deploy/"));
+        assert!(!snapshot.could_hold("crates/cog-collaboration/src :: crew.rs"));
+
+        let tree = CheckTree::new("/nonexistent", "main");
+        let outcome = tree
+            .judge(
+                &snapshot,
+                &identity("grep", "crates/ deploy/", "node-agent"),
+            )
+            .await;
+        assert_eq!(outcome.reason(), Some(UnsettledReason::ScopeOutsideTree));
+        assert_eq!(outcome.state(), Some(ChangeState::Undecided));
     }
 
     /// The two absence kinds never settle to a verdict, and say so in their own

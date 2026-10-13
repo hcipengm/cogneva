@@ -190,9 +190,20 @@ impl PostgresChangeLedgerStore {
 /// the conflict clause leaves it alone, so a second document citing an existing
 /// change does not move the revision that change entered at. It is the tree the
 /// row entered at, not the tree this reading was made against.
+///
+/// A new row enters as `pending`, not as `undecided`. `undecided` is not "nobody
+/// has looked yet": it is the state a measurement writes when a check could not
+/// be settled for a reason that is a property of the row, and it is coupled to
+/// that reason -- there is no way to build a reason-less `undecided`
+/// measurement, and a row carrying one reads as a stuck row whose reason was
+/// lost. A declaration nobody has measured yet is neither: it is work still
+/// owed, which is what `pending` says, and `measured_at IS NULL` is what tells a
+/// reader it has not been looked at. Writing `undecided` here would state a
+/// verdict no look reached and hide the row in the reason-less bucket reserved
+/// for rows that predate the reason column.
 const RECORD_READING_SQL: &str = "\
 INSERT INTO change_ledger (kind, scope, literal, state, title, assertion, sources, first_seen_rev)
-VALUES ($1, $2, $3, 'undecided', $4, $5, jsonb_build_array(jsonb_build_object('doc', $6, 'verdict', $7)), $8)
+VALUES ($1, $2, $3, 'pending', $4, $5, jsonb_build_array(jsonb_build_object('doc', $6, 'verdict', $7)), $8)
 ON CONFLICT (kind, scope, literal) DO UPDATE SET
     title = COALESCE(EXCLUDED.title, change_ledger.title),
     assertion = COALESCE(EXCLUDED.assertion, change_ledger.assertion),
