@@ -463,6 +463,27 @@ pub trait ChangeLedgerStore: Send + Sync {
         first_seen_rev: Option<&str>,
     ) -> SFResult<usize>;
 
+    /// Fold up to `limit` unfolded retirement declarations into the account,
+    /// answering how many were folded.
+    ///
+    /// A retirement declaration is not a reading: it asserts that a row's
+    /// identity is one the account should not hold -- a fixture, an identity a
+    /// later declaration renamed, a path no criterion can read -- with the reason.
+    /// Folding it applies a [`ChangeMeasurement::retired`] through the same
+    /// [`Self::apply_measurement`] door every other state goes through, so the
+    /// ledger still has exactly one way a state is written and the party that
+    /// classified the row never wrote the account itself.
+    ///
+    /// Like the declaration fold, the retirement is written *before* the intake
+    /// row is marked folded, and for the same reason: an interrupted fold repeats
+    /// idempotently rather than dropping the retirement. Applying a retirement
+    /// twice is applying it once.
+    ///
+    /// A retirement is re-examinable. A later measurement that finds the row in
+    /// any other state clears it, the way a later measurement clears `landed`; this
+    /// fold asserts the retirement as of now, it does not make it permanent.
+    async fn fold_retirements(&self, limit: usize) -> SFResult<usize>;
+
     /// How many declarations are queued and not yet folded: the intake's backlog.
     ///
     /// This is the one reading that says whether "the ledger was told" actually
@@ -470,6 +491,14 @@ pub trait ChangeLedgerStore: Send + Sync {
     /// nowhere else, so zero is the only state in which the account is known to
     /// have caught up with what has been declared.
     async fn pending_declarations(&self) -> SFResult<u64>;
+
+    /// How many retirements are queued and not yet folded.
+    ///
+    /// The same reading the declaration backlog gives, for the retirement intake:
+    /// a retirement handed over and not yet folded appears here and nowhere else,
+    /// and a backlog that stays non-zero across passes is the one reading that
+    /// says the account has not caught up with what the classifier retired.
+    async fn pending_retirements(&self) -> SFResult<u64>;
 
     /// Apply one measurement: move the row's state, stamp `measured_at`, and
     /// stamp or clear `landed_at` to match.

@@ -370,6 +370,30 @@ WHERE folded_at IS NULL AND kind = $1 AND scope = $2 AND literal = $3 AND doc = 
 const PENDING_SQL: &str =
     "SELECT count(*) AS n FROM change_ledger_declared WHERE folded_at IS NULL";
 
+/// The retirements one fold takes, oldest first.
+///
+/// The identity breaks ties on `declared_at` for the same reason the declaration
+/// fold does: a batch written in one statement shares a timestamp, and without the
+/// tiebreak which of them a half-full fold takes would follow the scan order,
+/// which differs between runs and between dialects.
+const FOLD_RETIRE_SELECT_SQL: &str = "\
+SELECT kind, scope, literal, reason
+FROM change_ledger_retired
+WHERE folded_at IS NULL
+ORDER BY declared_at ASC, kind ASC, scope ASC, literal ASC
+LIMIT $1";
+
+/// Mark one retirement folded, and only if it is still unfolded. The guard makes
+/// the stamp a statement about this fold rather than an overwrite, so a re-run
+/// does not move a time an earlier fold set -- the same rule the declaration
+/// fold's mark follows.
+const FOLD_RETIRE_MARK_SQL: &str = "\
+UPDATE change_ledger_retired SET folded_at = now()
+WHERE folded_at IS NULL AND kind = $1 AND scope = $2 AND literal = $3";
+
+const PENDING_RETIRE_SQL: &str =
+    "SELECT count(*) AS n FROM change_ledger_retired WHERE folded_at IS NULL";
+
 #[async_trait]
 impl ChangeLedgerStore for PostgresChangeLedgerStore {
     async fn record_readings(
@@ -471,6 +495,68 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         Ok(folded)
     }
 
+    async fn fold_retirements(&self, limit: usize) -> SFResult<usize> {
+        let rows = sqlx::query(FOLD_RETIRE_SELECT_SQL)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("read retirements to fold: {e}")))?;
+
+        // A retirement whose reason does not parse fails the fold rather than
+        // being skipped: a dropped retirement is indistinguishable from one that
+        // was never made, and the row it names would stay outstanding with nothing
+        // to say it was meant to be gone.
+        let mut retirements: Vec<(ChangeIdentity, RetireReason)> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let identity = ChangeIdentity::new(
+                row.try_get::<String, _>("kind")
+                    .map_err(|e| SFError::Database(format!("kind: {e}")))?,
+                row.try_get::<String, _>("scope")
+                    .map_err(|e| SFError::Database(format!("scope: {e}")))?,
+                row.try_get::<String, _>("literal")
+                    .map_err(|e| SFError::Database(format!("literal: {e}")))?,
+            );
+            let reason: String = row
+                .try_get("reason")
+                .map_err(|e| SFError::Database(format!("reason: {e}")))?;
+            let reason = reason.parse::<RetireReason>().map_err(|e| {
+                SFError::Database(format!("reason column holds {e} for {}", identity.as_key()))
+            })?;
+            retirements.push((identity, reason));
+        }
+        if retirements.is_empty() {
+            return Ok(0);
+        }
+
+        // The account first, the marks second, for the reason the declaration fold
+        // gives: a fold that stops in between repeats on the next pass, and
+        // applying a retirement twice is applying it once, because the measurement
+        // path writes the state rather than appending to it. The other order would
+        // drop the retirement instead, and nothing would say so.
+        for (identity, reason) in &retirements {
+            self.apply_measurement(&ChangeMeasurement::retired(identity.clone(), *reason))
+                .await?;
+        }
+
+        let mut folded = 0usize;
+        for (identity, _) in &retirements {
+            sqlx::query(FOLD_RETIRE_MARK_SQL)
+                .bind(&identity.kind)
+                .bind(&identity.scope)
+                .bind(&identity.literal)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| {
+                    SFError::Database(format!(
+                        "mark retirement folded for {}: {e}",
+                        identity.as_key()
+                    ))
+                })?;
+            folded += 1;
+        }
+        Ok(folded)
+    }
+
     async fn pending_declarations(&self) -> SFResult<u64> {
         let row = sqlx::query(PENDING_SQL)
             .fetch_one(&self.pool)
@@ -479,6 +565,17 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         let n: i64 = row
             .try_get("n")
             .map_err(|e| SFError::Database(format!("pending count: {e}")))?;
+        Ok(n.max(0) as u64)
+    }
+
+    async fn pending_retirements(&self) -> SFResult<u64> {
+        let row = sqlx::query(PENDING_RETIRE_SQL)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("count pending retirements: {e}")))?;
+        let n: i64 = row
+            .try_get("n")
+            .map_err(|e| SFError::Database(format!("pending retirement count: {e}")))?;
         Ok(n.max(0) as u64)
     }
 

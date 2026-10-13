@@ -110,6 +110,16 @@ const OUTSTANDING_PEEK: usize = 50;
 /// reaching it means the fold is behind, which the backlog reading says anyway.
 const DECLARATIONS_PER_PASS: usize = 200;
 
+/// How many queued retirements one pass folds into the account.
+///
+/// The same shape as the declaration fold's bound and for the same reason: a
+/// pass takes a bounded slice and the next takes the rest, so an intake that grew
+/// large cannot make a single tick unbounded or hold the owner lease past its
+/// cadence. Retirements are written by a classifier in batches of tens, so this
+/// bound is generous for how it is used -- reaching it means the fold is behind,
+/// which the backlog reading says anyway.
+const RETIREMENTS_PER_PASS: usize = 200;
+
 /// How many rows one pass measures against the tree.
 ///
 /// The ledger holds rows in the thousands and a pass that walked all of them
@@ -321,6 +331,11 @@ pub fn spawn_change_ledger_loop(
                     // reason [`registry_pass`] gives: a row read this pass is
                     // judged by this pass.
                     registry_pass(&tree, first_seen_rev.as_deref(), &*store).await;
+                    // The classifier's retirements go in after the readings and
+                    // before the measurement, for the reason [`retire_pass`]
+                    // gives: a fixture retired this pass is not measured and
+                    // re-said as unsettled by the same pass.
+                    retire_pass(&*store).await;
                     measure_pass(&*store, &tree, &mut unsettled).await;
                     // Handing over comes last, and that order is the point: the
                     // set dispatched is then the set as of this pass, so a change
@@ -386,6 +401,41 @@ async fn fold_pass(store: &dyn ChangeLedgerStore, first_seen_rev: Option<&str>) 
             "change ledger: declarations queued and not yet folded"
         ),
         Err(e) => warn!(error = %e, "change ledger: could not read the intake backlog"),
+    }
+}
+
+/// Fold the retirements queued by the classifier, then say how many are still
+/// queued.
+///
+/// A retirement is not a reading and does not ride the declaration intake: it
+/// asserts that a row's identity is one the account should not hold, which is a
+/// state, and the declaration intake's contract is that it never carries one. So
+/// the classifier queues into a second intake and this pass -- the account's one
+/// writer -- folds it, the same single-writer shape the declarations use. Folding
+/// here, before the measurement, means a fixture the classifier retired this pass
+/// is not handed back to the tree to be re-measured and re-said as unsettled in
+/// the same pass.
+///
+/// Neither the fold's failure nor the count's is raised or retried: the next pass
+/// is the retry, and every pass that had something to say leaves a line. A
+/// non-zero backlog across passes is the reading that says the fold is behind
+/// what it was told.
+async fn retire_pass(store: &dyn ChangeLedgerStore) {
+    match store.fold_retirements(RETIREMENTS_PER_PASS).await {
+        Ok(0) => {}
+        Ok(folded) => info!(folded, "change ledger: retirements folded into the account"),
+        Err(e) => warn!(
+            error = %e,
+            "change ledger: folding the retirement intake failed; no row was retired this pass"
+        ),
+    }
+    match store.pending_retirements().await {
+        Ok(0) => {}
+        Ok(pending) => info!(
+            pending,
+            "change ledger: retirements queued and not yet folded"
+        ),
+        Err(e) => warn!(error = %e, "change ledger: could not read the retirement backlog"),
     }
 }
 

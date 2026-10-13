@@ -3,12 +3,14 @@
 //! What these tests check is what the database decides: that the reason a row is
 //! `undecided` reaches its own column and reads back, that a later measurement of
 //! another state clears it the way `landed` clears `landed_at`, that a reason
-//! outside the closed set is refused rather than stored, and that the revision a
-//! row entered at is written once and never moved. None of it can be checked
-//! without a server -- the coupling between the reason and the state lives in the
-//! statement and in a CHECK the server enforces, "a reason outside the set is
-//! refused" is a fact about an ENUM or a CHECK, and the set-once rule of the entry
-//! revision is a fact about which branch of an `ON CONFLICT` writes a column.
+//! outside the closed set is refused rather than stored, that the revision a row
+//! entered at is written once and never moved, and that a retirement queued on
+//! its own intake is folded into the account by the ledger's writer and is
+//! idempotent to re-fold. None of it can be checked without a server -- the
+//! coupling between the reason and the state lives in the statement and in a CHECK
+//! the server enforces, "a reason outside the set is refused" is a fact about an
+//! ENUM or a CHECK, and the set-once rule of the entry revision is a fact about
+//! which branch of an `ON CONFLICT` writes a column.
 //!
 //! It is ignored by default and needs `COGNEVA_TEST_DATABASE_URL` pointing at a
 //! throwaway database:
@@ -27,6 +29,7 @@ use sqlx::PgPool;
 
 use cog_core::{
     ChangeIdentity, ChangeLedgerStore, ChangeMeasurement, ChangeReading, ChangeSource, ChangeState,
+    RetireReason,
 };
 use cog_storage::PostgresChangeLedgerStore;
 
@@ -240,6 +243,127 @@ async fn a_row_created_by_a_measurement_enters_at_that_measurements_revision() {
     cleanup(&pool, &marker).await;
 }
 
+/// A queued retirement, folded by the account's own writer, moves the row to
+/// `retired` with its reason and marks the intake row folded -- and applying it
+/// twice is applying it once.
+///
+/// The retirement is not a reading and cannot ride the declaration intake, so it
+/// is queued on its own table and folded here. What is under test is the coupling
+/// the fold is responsible for: that the reason the classifier gave reaches the
+/// ledger row rather than being dropped, that the intake row is marked folded so
+/// the backlog returns to zero, and that a re-fold of the same identity changes
+/// nothing -- the idempotence that lets an interrupted fold simply be repeated.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_queued_retirement_folds_into_the_account_and_is_idempotent() {
+    let (store, pool, marker) = store().await;
+    let id = identity(&marker, "fixture");
+
+    // The row exists in the account as outstanding before it is retired: a
+    // retirement moves a row's state, it does not merely annotate an absent one.
+    store
+        .apply_measurement(&ChangeMeasurement::undecided(id.clone(), "scope_outside_tree"))
+        .await
+        .expect("write the row to be retired");
+    assert_eq!(store.pending_retirements().await.expect("read the backlog"), 0);
+
+    queue_retirement(&pool, &id, "fixture", "classifier:probe", &marker).await;
+    assert_eq!(
+        store.pending_retirements().await.expect("read the backlog"),
+        1,
+        "a queued retirement is the backlog until it is folded"
+    );
+
+    let folded = store.fold_retirements(10).await.expect("fold the retirement");
+    assert_eq!(folded, 1, "the one queued retirement must be folded");
+
+    let row = store.get(&id).await.expect("read").expect("the row exists");
+    assert_eq!(row.state, ChangeState::Retired);
+    assert_eq!(
+        row.retire_reason,
+        Some(RetireReason::Fixture),
+        "the reason the classifier gave must reach the row, or a retired row cannot say why"
+    );
+    assert_eq!(
+        row.unsettled_reason, None,
+        "a reason beside a state it no longer describes would read as one"
+    );
+    assert_eq!(
+        store.pending_retirements().await.expect("read the backlog"),
+        0,
+        "the intake row must be marked folded, or the backlog never clears"
+    );
+
+    // Applying the same retirement again is applying it once: the marker is
+    // already down, so nothing is taken.
+    let again = store.fold_retirements(10).await.expect("fold again");
+    assert_eq!(again, 0, "a folded retirement is not folded twice");
+
+    cleanup(&pool, &marker).await;
+}
+
+/// A retirement is re-examinable: a later measurement of another state clears it
+/// the way a later measurement clears `landed`.
+///
+/// The retirement records what the classifier found, not a verdict that is true
+/// for good. The check is the same rule `retired_at` and `retire_reason` follow
+/// in the write statement -- a row re-measured out of `retired` carries no reason
+/// beside a state that is no longer retired.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_later_measurement_clears_a_retirement() {
+    let (store, pool, marker) = store().await;
+    let id = identity(&marker, "re-examined");
+
+    queue_retirement(&pool, &id, "fixture", "classifier:probe", &marker).await;
+    store.fold_retirements(10).await.expect("fold the retirement");
+    assert_eq!(
+        store.get(&id).await.expect("read").expect("the row exists").state,
+        ChangeState::Retired
+    );
+
+    store
+        .apply_measurement(
+            &ChangeMeasurement::new(id.clone(), ChangeState::Landed).at_revision("probe-rev"),
+        )
+        .await
+        .expect("measure the row again");
+
+    let row = store.get(&id).await.expect("read back").expect("the row exists");
+    assert_eq!(row.state, ChangeState::Landed);
+    assert_eq!(
+        row.retire_reason, None,
+        "a reason left beside a state that is no longer retired would read as one"
+    );
+
+    cleanup(&pool, &marker).await;
+}
+
+/// Queue one retirement the way the classifier does: a plain write to the intake
+/// table, not through the store -- the store is the account's writer, and the
+/// whole point of the intake is that a classifier is not.
+async fn queue_retirement(
+    pool: &PgPool,
+    id: &ChangeIdentity,
+    reason: &str,
+    source: &str,
+    marker: &str,
+) {
+    sqlx::query(
+        "INSERT INTO change_ledger_retired (kind, scope, literal, reason, source) \
+         VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT (kind, scope, literal) DO NOTHING",
+    )
+    .bind(&id.kind)
+    .bind(&id.scope)
+    .bind(&id.literal)
+    .bind(reason)
+    .bind(source)
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| panic!("queue the retirement for {marker}: {e}"));
+}
+
 async fn entry_rev(pool: &PgPool, id: &ChangeIdentity) -> Option<String> {
     sqlx::query_scalar(
         "SELECT first_seen_rev FROM change_ledger \
@@ -259,4 +383,11 @@ async fn cleanup(pool: &PgPool, marker: &str) {
         .execute(pool)
         .await
         .expect("clean up the probe rows");
+    // The intake is left as it was too: a queued retirement names the same
+    // marker, and a row left behind would be folded by a later run's pass.
+    sqlx::query("DELETE FROM change_ledger_retired WHERE scope LIKE $1")
+        .bind(format!("{marker}/%"))
+        .execute(pool)
+        .await
+        .expect("clean up the probe retirements");
 }
