@@ -50,6 +50,9 @@
 //! stops listing it. A registry nobody edited would otherwise be able to close an
 //! account by deleting its own line, which is the self-reported completion this
 //! whole loop is built to refuse.
+//!
+//! principle: feedback_a_version_bit_on_a_dispatch_id_must_keep_generation_zero_identical
+//! principle: feedback_a_typed_field_that_exists_may_never_have_been_filled
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1689,6 +1692,19 @@ mod tests {
         dead_work.status = TaskStatus::Failed;
         dead_work.error = Some("degenerate_loop: the same failure repeated".into());
         assert!(matches!(classify_handover(&dead_work), Handover::DeadWork));
+
+        // The typed channel answers on its own: a task that carries the cause as
+        // a value is judged by it even when its text names nothing. The live
+        // table leaves this field empty today, so both channels have to reach
+        // the same verdict or the answer would depend on which one a task wrote.
+        let mut typed = env.clone();
+        typed.status = TaskStatus::Failed;
+        typed.error = Some("Agent execution error: the run did not finish".into());
+        typed.error_cause = Some(UpstreamFailure::Auth);
+        assert!(matches!(
+            classify_handover(&typed),
+            Handover::DeadEnvironment
+        ));
 
         let mut in_flight = env;
         in_flight.status = TaskStatus::Running;
