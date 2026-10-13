@@ -45,6 +45,7 @@ pub use contract::notification::*;
 pub use contract::observability::*;
 pub use contract::orchestrator::*;
 pub use contract::owner_lease;
+pub use contract::owner_lease::{OwnerLease, OwnerLeaseBroker, Ownership, RoleClaim, RoleHold};
 pub use contract::plugin::*;
 pub use contract::principle_ledger::*;
 pub use contract::project_kind::*;
@@ -67,7 +68,6 @@ pub use contract::taste::*;
 pub use contract::tool::*;
 pub use contract::wiki::*;
 pub use error::{SFError, SFResult};
-pub use contract::owner_lease::{OwnerLease, OwnerLeaseBroker, Ownership, RoleClaim, RoleHold};
 pub use secrets::{
     redact_json_secrets, redact_secrets, ChainedSecretProvider, EnvSecretProvider,
     FileSecretProvider, SecretProvider,
