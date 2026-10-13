@@ -402,69 +402,6 @@ pub struct PrincipleOrphan {
     pub source: String,
 }
 
-/// One pass of the debt dispatcher, as the loop that ran it reports it.
-///
-/// A reading about the work rather than about a principle: how many debt rows
-/// the tree owed, how many the pass could hand to the pipeline and how many it
-/// could not, measured against a ceiling whose origin is named. It is recorded
-/// per pass with the store's own clock because the only number that answers "is
-/// the dispatcher moving the debt" is one a later pass compares with an earlier
-/// -- and on this host a log line is not durable, so a count that lives only in
-/// a log is a count nobody can compare anything with.
-///
-/// The counts are kept apart rather than summed. `submitted` is work handed over,
-/// `already` is work that was in flight or done, `failed` is work the pass could
-/// not hand over: a total of the three moves for reasons that are not progress,
-/// and a dispatcher tuned to the total would count a pass that re-proposed
-/// everything as a good one.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PrincipleDebtReading {
-    /// How many rows the pass saw per debt kind, rendered `kind=count` and
-    /// comma-joined, in the order the kinds are known. Kept as the mix rather
-    /// than only as the sum: "which kind of debt is not moving" is a question a
-    /// bare total cannot be asked.
-    pub by_kind: String,
-    /// Rows the pass proposed to the pipeline.
-    pub submitted: u64,
-    /// Rows already in flight or already done, which the pass left alone.
-    pub already: u64,
-    /// Rows the pass could not hand over.
-    pub failed: u64,
-    /// Rows the pass saw but did not propose, because the in-flight ceiling was
-    /// reached.
-    pub over_bound: u64,
-    /// The ceiling the pass held itself to.
-    pub bound: u64,
-    /// Where that ceiling came from, so a reading taken with the built-in
-    /// fallback is not read as one taken with the discovered limit.
-    pub bound_source: String,
-    /// The revision the tree was read at, or `None` when the pass had none to
-    /// name.
-    ///
-    /// Kept because the counts above are a claim about a tree, and the tree
-    /// moves: without it a row says how much debt there was without saying when,
-    /// and two rows a week apart cannot be compared by anyone but the process
-    /// that happened to write both.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rev: Option<String>,
-    /// How many debt rows the tree lost, or gained, since the revision recorded
-    /// on the row before this one -- positive when the debt shrank.
-    ///
-    /// Read off the tree rather than off this table: the count at the older
-    /// revision is recovered from that revision's own carrier files, so any
-    /// reader holding the two revisions can recompute this number and check it.
-    /// A delta the process remembered about itself would be a claim, and the
-    /// question it answers -- is the debt actually falling -- is exactly the one
-    /// a process cannot be trusted to grade itself on.
-    ///
-    /// `None` when there is no earlier revision to compare against: the first
-    /// pass of a process, or a pass whose earlier revision can no longer be read.
-    /// Both are the absence of a comparison rather than a comparison that came
-    /// out zero, and a zero would read as a week of no progress.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub delta: Option<i64>,
-}
-
 /// Durable storage for the principle ledger.
 ///
 /// The only way to move a row's state is
@@ -582,14 +519,4 @@ pub trait PrincipleLedgerStore: Send + Sync {
 
     /// How many refusal events are queued and not yet folded.
     async fn pending_refusals(&self) -> SFResult<u64>;
-
-    /// Record one pass of the debt dispatcher: how many rows the tree owed and
-    /// what the pass did with them.
-    ///
-    /// Appended, never upserted: a reading is only a reading beside the one that
-    /// came before it, so a pass overwriting its predecessor's row would leave
-    /// nothing to compare a fall in the debt against. The store stamps the time
-    /// from its own clock, so a caller cannot backdate a pass to look like it ran
-    /// before the work it moved.
-    async fn record_debt_reading(&self, reading: &PrincipleDebtReading) -> SFResult<()>;
 }
