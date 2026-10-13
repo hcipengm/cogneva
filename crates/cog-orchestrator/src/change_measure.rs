@@ -90,6 +90,43 @@ pub const ABSENCE_KINDS: [&str; 3] = [
     MODULE_RELOCATION_KIND,
 ];
 
+/// The check written by hand to demand that a literal be present.
+pub const GREP_KIND: &str = "grep";
+
+/// The check written by hand to demand that a path be present.
+pub const EXISTS_KIND: &str = "exists";
+
+/// The check written by hand to demand that something be gone.
+///
+/// The free-standing mirror of [`GREP_KIND`] and [`EXISTS_KIND`], and a name of
+/// its own rather than a reuse of `absent`/`missing`: those two were written by
+/// hand to mean both this demand and the evidence of an empty search, and no look
+/// at the tree can tell the two apart. Splitting the demand out under its own
+/// name is what keeps the evidence from reading as a demand -- a line recording
+/// "I searched and found nothing" would otherwise land the row the moment the
+/// artifact was gone, which is the opposite of what such a line records, and it
+/// would land the whole backlog of things not yet built in one pass.
+///
+/// An empty literal degrades to the path itself (see [`CheckTree::judge_absence`]),
+/// so this one kind carries both the inverse of [`GREP_KIND`] and the inverse of
+/// [`EXISTS_KIND`].
+pub const GONE_KIND: &str = "gone";
+
+/// Every kind the judge can answer, for a reader that has to enumerate them.
+///
+/// The one place the kind vocabulary is written down. A kind the intake accepts
+/// but this does not name is a row nothing will ever measure -- it reads as
+/// outstanding for good -- so the intake's set and this one are meant to be the
+/// same set, and the intake is meant to read this one rather than carry its own.
+pub const JUDGEABLE_KINDS: [&str; 6] = [
+    GREP_KIND,
+    EXISTS_KIND,
+    GONE_KIND,
+    ABSENCE_KINDS[0],
+    ABSENCE_KINDS[1],
+    ABSENCE_KINDS[2],
+];
+
 /// The tree this deployment measures against.
 ///
 /// Read from the environment rather than from the configuration document because
@@ -326,20 +363,23 @@ impl CheckTree {
     pub async fn judge(&self, snapshot: &Snapshot, identity: &ChangeIdentity) -> CheckOutcome {
         let scope = scope_of(identity);
         match identity.kind.as_str() {
-            "grep" => self.judge_grep(snapshot, scope, &identity.literal).await,
-            "exists" => self.judge_exists(snapshot, scope).await,
-            // The mirror of the two above. These are named by the reading and
-            // not written by hand, so -- unlike `absent`/`missing` below -- the
-            // direction is not in doubt: each of them asks that the artifact be
-            // gone, which is what the registry row itself stops saying once it is.
-            kind if ABSENCE_KINDS.contains(&kind) => {
+            GREP_KIND => self.judge_grep(snapshot, scope, &identity.literal).await,
+            EXISTS_KIND => self.judge_exists(snapshot, scope).await,
+            // The mirror of the two above, and one predicate for several names:
+            // the registry kinds below ask for an artifact's absence, which is
+            // what the registry row itself stops saying once it is, and `gone`
+            // asks for it under a direction written on the name.
+            kind if ABSENCE_KINDS.contains(&kind) || kind == GONE_KIND => {
                 self.judge_absence(snapshot, scope, &identity.literal).await
             }
             // Both of these name a literal's absence, and both are written by
             // hand to mean two opposite things: the demand that it be gone, and
             // the evidence that a search came back empty. The identity holds the
             // same three parts either way, so a look at the tree cannot tell
-            // which one it is looking at.
+            // which one it is looking at. The demand has [`GONE_KIND`] now; these
+            // two stay unsettled so that the rows already written under them keep
+            // reading as a criterion to rewrite rather than settling as a verdict
+            // no look reached.
             "absent" | "missing" => CheckOutcome::unsettled(
                 UnsettledReason::KindWithoutPredicate,
                 "a check written as an absence is written both for `this must be gone` \
@@ -871,6 +911,39 @@ mod tests {
         }
     }
 
+    /// Every kind published as judgeable actually reaches a predicate. The list
+    /// is the intake's, and a name on it that this judge can only refuse is a row
+    /// that never settles, so the two sets have to be one set.
+    #[tokio::test]
+    async fn every_published_kind_reaches_a_predicate() {
+        let tree = CheckTree::new("/nonexistent", "main");
+        for kind in JUDGEABLE_KINDS {
+            // A scope no tree could hold, so the predicate is reached without a
+            // repository: the answer is "another tree", not "no evaluator".
+            let outcome = tree
+                .judge(&snapshot(), &identity(kind, "no_such_root/x", "y"))
+                .await;
+            assert_ne!(
+                outcome.reason(),
+                Some(UnsettledReason::KindWithoutPredicate),
+                "`{kind}` is published as judgeable but the judge has no predicate for it"
+            );
+        }
+    }
+
+    /// The two kinds written for both directions are not among the judgeable
+    /// ones: their absence from the list is what keeps a line recording an empty
+    /// search from landing the row it was evidence against.
+    #[test]
+    fn the_ambiguous_kinds_are_not_published_as_judgeable() {
+        for kind in ["absent", "missing"] {
+            assert!(
+                !JUDGEABLE_KINDS.contains(&kind),
+                "`{kind}` means two opposite things and has no predicate"
+            );
+        }
+    }
+
     /// An unknown kind is refused by name rather than treated as a miss: a check
     /// this platform cannot evaluate is not a check that came back empty.
     #[tokio::test]
@@ -1171,6 +1244,36 @@ mod tests {
             )
             .await,
             CheckOutcome::Absent
+        );
+    }
+
+    /// `gone` is the mirror of `grep` under a name whose direction is written on
+    /// it: a literal the tree still holds reads as owed, and one it no longer
+    /// holds reads as landed -- the opposite of what `grep` answers for the same
+    /// line, which is the whole reason the demand needs a name of its own.
+    #[tokio::test]
+    async fn a_gone_check_is_a_grep_read_the_other_way() {
+        let dir = repo(&[("crates/x/src/lib.rs", "pub struct ProjectKind;\n")]);
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let snapshot = fixture_snapshot(&tree).await;
+        let scope = "crates/x/src/lib.rs";
+        assert_eq!(
+            tree.judge(&snapshot, &identity(GONE_KIND, scope, "ProjectKind"))
+                .await,
+            CheckOutcome::Absent,
+            "the tree still holds it, so the demand to be gone is not met"
+        );
+        assert_eq!(
+            tree.judge(&snapshot, &identity(GONE_KIND, scope, "SomeOtherName"))
+                .await,
+            CheckOutcome::Landed,
+            "the tree does not hold it, so the demand is met"
+        );
+        // The ordinary check reads the same line the other way round.
+        assert_eq!(
+            tree.judge(&snapshot, &identity(GREP_KIND, scope, "ProjectKind"))
+                .await,
+            CheckOutcome::Landed
         );
     }
 
