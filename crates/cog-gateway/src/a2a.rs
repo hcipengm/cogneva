@@ -30,7 +30,7 @@ use cog_core::{A2aTaskStatus, OrchestratorControl, Task, TaskStatus};
 
 use crate::GatewayState;
 
-// ─── 端点与它支撑的那两杆旗 ────────────────────────────────────────────────
+// ─── 端点、旗子，与那张「哪杆旗指着哪张端点」的表 ──────────────────────────
 
 /// 本模块服务的那张 A2A 端点。路由注册与名片上的旗子都读这一处。
 ///
@@ -40,24 +40,56 @@ use crate::GatewayState;
 /// 两件事当时分别落在两个文件的两个字面量上。
 pub const MESSAGE_STREAM: &str = "/api/v1/protocol/a2a/message/stream";
 
-/// 名片宣称的能力，逐杆从「本模块真的有哪张端点」读出来。
+/// A2A 的流式方法名。一杆旗成立的条件是「表里有一行，它指名的端点以这个名字
+/// 结尾」，不是「那一行非空」：端点换个前缀照旧成立，指到别的路由上旗子就灭。
+const A2A_STREAM_METHOD: &str = "message/stream";
+
+/// 名片上的一杆旗，以及这杆旗指名的端点。
+pub struct Advertised {
+    /// 名片上的字段名，与 [`cog_core::AgentCapabilities`] 的字段一一对应。
+    pub capability: &'static str,
+    /// 这杆旗指名的路径，与路由注册读的是同一个常量。
+    pub endpoint: &'static str,
+}
+
+/// 名片宣称了哪几杆旗、各指着哪张端点。**没有对应端点的能力不进这张表**。
+///
+/// 表本身买到的是「旗由端点算出」：一杆旗的真假不再是函数体里那个字面量，
+/// 而是「这里有没有一行」。于是「旗亮着、端点不存在」这件事有了一份待查清单——
+/// 对端就是照这张清单动作的：它读名片上 `streaming: true`，然后请求旗子指名的
+/// 那张路径。清单在，才有东西可查；只读常量与旗子查不出「路由被删了」，那两处
+/// 会一起留在原处。
+///
+/// 如实报关的能力，形状是**不写这一行**。`push_notifications` 就是这样报 false
+/// 的：A2A 的 push 要服务端拿到客户端给的 webhook 地址后回调任务更新，而本平台
+/// 既没有接收那个地址的端点、也没有回调器；报 true 会让对端配一个永远收不到推送
+/// 的地址，它那边看到的是「通知注册成功了但什么都没有」。写在函数体里的 `false`
+/// 与这里的「缺一行」读起来一样，但后者在端点补上那天会自己变亮。
+pub const ADVERTISED: &[Advertised] = &[
+    Advertised {
+        capability: "streaming",
+        endpoint: MESSAGE_STREAM,
+    },
+    Advertised {
+        capability: "state_transition_history",
+        endpoint: MESSAGE_STREAM,
+    },
+];
+
+/// 名片宣称的能力，逐杆从上面那张表算出来。
 pub fn capabilities() -> cog_core::AgentCapabilities {
     cog_core::AgentCapabilities {
-        streaming: streaming_supported(),
-        // push notification 面如实报 false：A2A 的 push 是服务端按客户端给的
-        // webhook 地址回调任务更新，而本平台既没有接收那个地址的端点，也没有
-        // 回调器。报 true 会让对端配一个永远收不到推送的地址，它那边看到的
-        // 是「通知注册成功了但什么都没有」。
-        push_notifications: false,
-        state_transition_history: streaming_supported(),
+        streaming: advertises("streaming"),
+        push_notifications: advertises("push_notifications"),
+        state_transition_history: advertises("state_transition_history"),
     }
 }
 
-/// 流式能力 = 那张端点存在。判据落在**端点的 A2A 方法名**上，不落在常量自身
-/// 非空上：`MESSAGE_STREAM` 换个路径、只要里面还是 A2A 的 `message/stream`，
-/// 旗子照旧成立；把它改成别的某个方法，旗子就跟着变成 false。
-fn streaming_supported() -> bool {
-    MESSAGE_STREAM.contains("message/stream")
+/// 这杆旗在表里有没有一行指着 A2A 的流式方法。
+fn advertises(capability: &str) -> bool {
+    ADVERTISED
+        .iter()
+        .any(|a| a.capability == capability && a.endpoint.ends_with(A2A_STREAM_METHOD))
 }
 
 // ─── 两个旋钮 ──────────────────────────────────────────────────────────────
@@ -462,19 +494,38 @@ mod tests {
         serde_json::from_str(line).expect("the data line is a JSON-RPC message")
     }
 
-    /// 名片上那两杆 true 的旗，指向的必须是本模块真的服务的那张端点。
+    /// 名片上每一杆旗，都得是表里那一行算出来的；指名的端点必须是那张 A2A 方法。
     ///
-    /// 这条用例判的是**旗与端点是同一件事**：把 `streaming` 改成硬编码的 `true`、
-    /// 同时把路径换成一个不含 `message/stream` 的方法，这里就红。它挡不住「路
-    /// 由被删掉、常量留着」——axum 没有枚举路由的接口——但那一半由常量本身承担：
-    /// 删掉路由的人手边就是那行 `.route(a2a::MESSAGE_STREAM, ...)`。
+    /// 这里判的是**旗由端点算出**：某一杆写成硬编码的 `true`、或表里那一行被指到
+    /// 别的路由上，这里就红。判不了「路由被删、常量与表都留着」——axum 没有枚举
+    /// 路由的接口，旗子与表读的又是同一个常量，三处会一起留在原处。那一半只有
+    /// 对**真正在跑的路由**发一次请求才看得见：旗指名而路由上没有，对端拿到的是
+    /// 404，本仓的集成用例照这张清单打这一枪。
     #[test]
-    fn the_capability_flags_name_the_method_this_module_serves() {
+    fn every_capability_flag_is_derived_from_a_row_naming_the_stream_method() {
         let caps = capabilities();
-        assert_eq!(
+        let flags = [
+            ("streaming", caps.streaming),
+            ("push_notifications", caps.push_notifications),
+            ("state_transition_history", caps.state_transition_history),
+        ];
+        for (name, on) in flags {
+            let row = ADVERTISED.iter().find(|a| a.capability == name);
+            assert_eq!(
+                on,
+                row.is_some(),
+                "`{name}` 的真假只能来自表里有没有那一行，不能另有出处"
+            );
+            if let Some(a) = row {
+                assert!(
+                    a.endpoint.ends_with(A2A_STREAM_METHOD),
+                    "`{name}` 指名的端点必须还是 A2A 的那张流式方法，指到别处旗子就该灭"
+                );
+            }
+        }
+        assert!(
             caps.streaming,
-            MESSAGE_STREAM.contains("message/stream"),
-            "`streaming` 说的是 A2A 的 message/stream，旗子只能跟着那张端点走"
+            "流式是这张名片对外的承诺，也是设计里要落地的那张端点；旗灭等于宣告 cogneva 不做流式对端"
         );
         assert!(
             caps.state_transition_history,
