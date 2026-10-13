@@ -119,6 +119,13 @@ pub struct Supervisor {
     pub behavior_monitors: std::sync::Mutex<
         std::collections::HashMap<String, crate::behavior_monitor::BehaviorMonitor>,
     >,
+    /// The command stream into the agents. `cog-protocol` implements
+    /// [`cog_core::AgentLifecycleServer`] over its gRPC command router and
+    /// publishes it; taking it here is what turns `kill_agent` /
+    /// `restart_agent` / `checkpoint_agent` from a broadcast-only notice into
+    /// a real dispatch. Unset only where a Supervisor is built without the
+    /// protocol plugin.
+    lifecycle_server: Option<Arc<dyn cog_core::AgentLifecycleServer>>,
     /// Optional watch receiver for dynamic config reload.
     config_rx: Option<watch::Receiver<SupervisorConfig>>,
     /// Where each pass of the loop reports how it ended. Unset when the metrics
@@ -231,9 +238,21 @@ impl Supervisor {
             control_plane,
             last_rebalance: tokio::sync::Mutex::new(None),
             behavior_monitors: std::sync::Mutex::new(std::collections::HashMap::new()),
+            lifecycle_server: None,
             config_rx: None,
             metrics: None,
         }
+    }
+
+    /// Attach the command stream used to actually dispatch lifecycle commands
+    /// to the agents. Without it the three lifecycle methods can only report
+    /// that they did nothing.
+    pub fn with_lifecycle_server(
+        mut self,
+        server: Arc<dyn cog_core::AgentLifecycleServer>,
+    ) -> Self {
+        self.lifecycle_server = Some(server);
+        self
     }
 
     /// Attach a [`watch::Receiver`] so the Supervisor can react to config
@@ -779,12 +798,27 @@ impl cog_core::Supervisor for Supervisor {
         if !found {
             return Ok(false);
         }
+        // Push into the agent's command stream. A push failure (the agent is in
+        // the registry but not subscribed to the command stream) is a real
+        // error, not `false`: the caller named a known agent and the command
+        // did not reach it, and reporting a dispatch that never happened is the
+        // exact bug this replaces.
+        let dispatched = self
+            .lifecycle_server
+            .as_ref()
+            .ok_or_else(|| {
+                cog_core::SFError::Config(
+                    "no AgentLifecycleServer published: cannot dispatch kill".into(),
+                )
+            })?
+            .kill(agent_id, reason)
+            .await?;
         let _ = self.event_tx.send(cog_core::SupervisorEvent::AgentKilled {
             agent_id: agent_id.into(),
             reason: reason.into(),
             timestamp: chrono::Utc::now(),
         });
-        Ok(true)
+        Ok(dispatched)
     }
 
     async fn restart_agent(
@@ -796,6 +830,16 @@ impl cog_core::Supervisor for Supervisor {
         if !found {
             return Ok(false);
         }
+        let dispatched = self
+            .lifecycle_server
+            .as_ref()
+            .ok_or_else(|| {
+                cog_core::SFError::Config(
+                    "no AgentLifecycleServer published: cannot dispatch restart".into(),
+                )
+            })?
+            .restart(agent_id, preserve_context)
+            .await?;
         let _ = self
             .event_tx
             .send(cog_core::SupervisorEvent::AgentRestarted {
@@ -803,7 +847,7 @@ impl cog_core::Supervisor for Supervisor {
                 preserve_context,
                 timestamp: chrono::Utc::now(),
             });
-        Ok(true)
+        Ok(dispatched)
     }
 
     async fn checkpoint_agent(&self, agent_id: &str, task_id: &str) -> cog_core::SFResult<String> {
@@ -814,7 +858,18 @@ impl cog_core::Supervisor for Supervisor {
                 agent_id
             )));
         }
-        let checkpoint_id = uuid::Uuid::new_v4().to_string();
+        // The checkpoint id now comes from the dispatch path rather than from a
+        // locally minted UUID that no agent ever received.
+        let checkpoint_id = self
+            .lifecycle_server
+            .as_ref()
+            .ok_or_else(|| {
+                cog_core::SFError::Config(
+                    "no AgentLifecycleServer published: cannot dispatch checkpoint".into(),
+                )
+            })?
+            .checkpoint(agent_id, task_id)
+            .await?;
         let _ = self
             .event_tx
             .send(cog_core::SupervisorEvent::CheckpointRequested {

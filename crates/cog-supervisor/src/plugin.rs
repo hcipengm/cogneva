@@ -129,6 +129,10 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
         let event_tx = (*event_tx).clone();
         let meta_learning = ctx.consume_service::<dyn cog_core::MetaLearning>();
         let fault_classifier = ctx.consume_service::<dyn cog_core::FaultClassifier>();
+        // The gRPC command router, published by the protocol plugin. Required,
+        // not optional: without it the lifecycle commands gateways expose to
+        // the UI could only report that they did nothing.
+        let lifecycle_server = ctx.require_service::<dyn cog_core::AgentLifecycleServer>()?;
 
         // ── Consume observability gateway ──
         let gateway = ctx
@@ -161,6 +165,8 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
             meta_learning,
         )
         .with_config_watch(supervisor_config_rx)
+        // Real dispatch path for the lifecycle commands the gateway exposes.
+        .with_lifecycle_server(lifecycle_server)
         // The per-pass outcome reading needs the metrics backend; this plugin
         // declares `storage` in its descriptor, so that backend is published
         // before this `init` runs and the handle is available here.
@@ -306,6 +312,10 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
         "orchestrator",
         "stream",
         "observability",
+        // Supplies the AgentLifecycleServer this plugin requires to dispatch
+        // lifecycle commands. The protocol plugin requires nothing itself, so
+        // this adds an ordering edge, not a cycle.
+        "protocol",
     ],
     optional_requires: &["reflection"],
     factory: || Box::new(SupervisorPlugin::new()),
