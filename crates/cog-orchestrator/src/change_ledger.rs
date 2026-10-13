@@ -653,6 +653,7 @@ async fn measure_pass(
 
     let mut landed = 0usize;
     let mut absent = 0usize;
+    let mut undecided = 0usize;
     let mut by_reason: HashMap<UnsettledReason, usize> = HashMap::new();
     let mut known_unsettled = 0usize;
     let mut considered = 0usize;
@@ -698,10 +699,17 @@ async fn measure_pass(
         match state {
             ChangeState::Landed => landed += 1,
             ChangeState::Pending => absent += 1,
-            // A settled look answers with one of exactly two states, both named
-            // above. A third reaching here would be one the evaluator grew
-            // without this count being told, and counting it as "not landed"
-            // would hide that.
+            // A row whose predicate is a finding written out is retracted to
+            // `undecided` by the evaluator: it carried a tree verdict that no
+            // look could have reached with that predicate. Counted separately
+            // from the unsettled kinds below, because this one *did* write its
+            // state -- it is the count of rows that left the outstanding set by
+            // being unmeasurable rather than by being done.
+            ChangeState::Undecided => undecided += 1,
+            // A settled look otherwise answers with one of exactly two states,
+            // both named above. A fourth reaching here would be one the
+            // evaluator grew without this count being told, and counting it as
+            // "not landed" would hide that.
             other => warn!(
                 change = %row.identity,
                 state = other.as_str(),
@@ -729,6 +737,7 @@ async fn measure_pass(
         measured = considered,
         landed,
         absent,
+        undecided,
         unsettled = %reason_summary(&by_reason),
         already_unsettled = known_unsettled,
         revision = snapshot.rev(),

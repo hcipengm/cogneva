@@ -177,6 +177,18 @@ impl UnsettledReason {
         UnsettledReason::GitFailed,
     ];
 
+    /// Whether this reason is a property of the row rather than of the look.
+    ///
+    /// A look that failed -- git did not answer, the revision could not be read
+    /// -- can be run again, and until one succeeds the row keeps whatever a
+    /// document said about it. A predicate that is a rendering is not like that:
+    /// running it again measures the same nothing forever, so the row will never
+    /// be answered by a later pass and the reason has to reach the row rather
+    /// than only the pass's summary.
+    pub fn is_about_the_row(self) -> bool {
+        matches!(self, UnsettledReason::PredicateIsARendering)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             UnsettledReason::RevisionUnreadable => "revision_unreadable",
@@ -220,13 +232,29 @@ impl CheckOutcome {
 
     /// The state this outcome moves the row to, or `None` when it moves nothing.
     ///
-    /// `None` does not mean the check passed. It means this look does not speak
+    /// `None` does not mean the check passed. It means this *look* does not speak
     /// to the row: writing a state anyway would replace what a document said with
     /// a verdict no look ever reached, and the row would read as answered.
+    ///
+    /// One unsettled reason is not about the look, and it does move the row. A
+    /// predicate that is a finding written out is a property of the row itself:
+    /// no revision will ever make it measurable, so the state the row carries
+    /// cannot have come from measuring it -- an earlier evaluator ran a search
+    /// for the whole rendering, found nothing, and answered `pending`. Leaving
+    /// that answer in place is not caution about the document's word, it is
+    /// freezing an answer from a look that could not have been measuring the
+    /// row: the row goes on reading as work still owed to anything that selects
+    /// by state, while no artifact can ever close it. `Undecided` is what this
+    /// shape is -- "what it found does not settle the question" -- and writing
+    /// it is a retraction of that earlier answer rather than a claim about the
+    /// tree.
     pub fn state(&self) -> Option<ChangeState> {
         match self {
             CheckOutcome::Landed => Some(ChangeState::Landed),
             CheckOutcome::Absent => Some(ChangeState::Pending),
+            CheckOutcome::Unsettled { reason, .. } if reason.is_about_the_row() => {
+                Some(ChangeState::Undecided)
+            }
             CheckOutcome::Unsettled { .. } => None,
         }
     }
@@ -786,8 +814,9 @@ mod tests {
         }
     }
 
-    /// Only two outcomes move a row. `Unsettled` moves nothing: the row keeps
-    /// whatever a document gave it rather than gaining a verdict no look reached.
+    /// A settled look is what moves a row to a verdict about the tree, and a
+    /// look that failed moves nothing: the row keeps whatever a document gave it
+    /// rather than gaining a verdict no look reached.
     #[test]
     fn only_a_settled_look_carries_a_state() {
         assert_eq!(CheckOutcome::Landed.state(), Some(ChangeState::Landed));
@@ -796,6 +825,25 @@ mod tests {
             CheckOutcome::unsettled(UnsettledReason::GitFailed, "whatever").state(),
             None
         );
+    }
+
+    /// Every reason that is not about the row leaves it alone. Enumerated over
+    /// the closed set rather than listed, so a reason added later is either
+    /// classified or fails here -- the two ways it can go are "a later pass can
+    /// still answer this" and "no pass ever can", and only the second may
+    /// overwrite what the row says.
+    #[test]
+    fn a_reason_about_the_look_leaves_the_row_where_it_was() {
+        for reason in UnsettledReason::ALL {
+            if reason.is_about_the_row() {
+                continue;
+            }
+            assert_eq!(
+                CheckOutcome::unsettled(reason, "whatever").state(),
+                None,
+                "{reason:?} is about a look that can be re-run, so it must move nothing"
+            );
+        }
     }
 
     /// A row measured as not there is `pending` -- wanted, not there yet -- and
@@ -1026,7 +1074,7 @@ mod tests {
     /// it -- the second finding's own rendering included -- lands in the
     /// predicate field.
     #[tokio::test]
-    async fn a_predicate_that_is_a_written_out_finding_never_settles_a_row() {
+    async fn a_predicate_that_is_a_written_out_finding_retracts_the_row() {
         let tree = CheckTree::new("/nonexistent", "main");
         let outcome = tree
             .judge(
@@ -1040,11 +1088,15 @@ mod tests {
                 ),
             )
             .await;
-        assert_eq!(outcome.state(), None, "{outcome:?}");
+        // `undecided`, not `pending`: the row cannot be owed, because nothing
+        // can ever measure it. The state an earlier evaluator wrote is retracted
+        // rather than kept -- see `CheckOutcome::state`.
+        assert_eq!(outcome.state(), Some(ChangeState::Undecided), "{outcome:?}");
         assert_eq!(
             outcome.reason(),
             Some(UnsettledReason::PredicateIsARendering)
         );
+        assert!(outcome.reason().is_some_and(|r| r.is_about_the_row()));
     }
 
     /// The separator and nothing else. `||`, `&&` and backticks are all ordinary
