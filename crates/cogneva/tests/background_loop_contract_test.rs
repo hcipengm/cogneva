@@ -76,7 +76,7 @@ const NOT_REGISTERED: &[(&str, &str)] = &[
          a defect, and the age of a demand-driven flush means nothing",
     ),
     (
-        "crates/cog-core/src/owner_lease.rs",
+        "crates/cog-core/src/contract/owner_lease.rs",
         "not-a-loop: the ticker asks the arbiter again on behalf of a loop that is \
          itself registered — it ends when the holder is dropped or the process shuts \
          down, both intended, and an accidental end is what losing the role means, \
