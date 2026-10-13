@@ -10,6 +10,7 @@ pub mod vault;
 pub mod websocket;
 
 pub use factory::build_client;
+pub use factory::build_streaming_client;
 pub use factory::ReqwestHttpClient;
 pub use vault::VaultSecretProvider;
 pub use websocket::TungsteniteWebSocketClient;

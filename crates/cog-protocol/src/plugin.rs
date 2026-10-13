@@ -52,7 +52,11 @@ impl cog_core::SystemPlugin for ProtocolPlugin {
         // ── MCP client ──
         if self.mcp_client.is_none() {
             if let Ok(ref mcp_endpoint) = std::env::var("COGNEVA_MCP_ENDPOINT") {
-                let transport = Box::new(crate::SseTransport::new(mcp_endpoint));
+                // Built here rather than at the first call: the client comes from
+                // the `http_client` config section, and an endpoint or a config
+                // that cannot be used is a startup finding, not something to
+                // discover as a failed tool call much later.
+                let transport = Box::new(crate::SseTransport::new(mcp_endpoint)?);
                 let client: Arc<dyn cog_core::McpClient> =
                     Arc::new(crate::McpClient::new(transport));
                 self.mcp_client = Some(client.clone());

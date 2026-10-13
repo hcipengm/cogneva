@@ -17,8 +17,34 @@ use tracing::{info, warn};
 /// they asked for, and a silently substituted one reads downstream exactly like
 /// a configured one — the caller cannot tell which settings are in force.
 pub fn build_client(config: &HttpClientConfig) -> SFResult<Client> {
-    let mut builder = Client::builder()
+    builder(config)?
         .timeout(Duration::from_secs(config.timeout_secs))
+        .build()
+        .map_err(|e| SFError::Config(format!("http client could not be built from config: {e}")))
+}
+
+/// Build a [`reqwest::Client`] for a request that is expected to stay open —
+/// a server-sent-events stream, a long poll — and return it.
+///
+/// Same settings as [`build_client`] (connect timeout, idle pool, proxy, user
+/// agent) minus the **overall request timeout**. That one is a deadline for a
+/// short exchange; a stream is supposed to outlive it, so a client carrying it
+/// would cut exactly the connections this one exists for. The connect timeout
+/// stays: a stream from a host that never answers should still fail rather
+/// than hang.
+///
+/// The settings are read from the same config section, so a long-lived client
+/// is not a second set of numbers — only the deadline that makes no sense for
+/// one is left out.
+pub fn build_streaming_client(config: &HttpClientConfig) -> SFResult<Client> {
+    builder(config)?
+        .build()
+        .map_err(|e| SFError::Config(format!("http client could not be built from config: {e}")))
+}
+
+/// The settings both constructors share, without either one's deadline.
+fn builder(config: &HttpClientConfig) -> SFResult<reqwest::ClientBuilder> {
+    let mut builder = Client::builder()
         .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
         .pool_max_idle_per_host(config.pool_max_idle_per_host)
         .user_agent(&config.user_agent);
@@ -42,9 +68,7 @@ pub fn build_client(config: &HttpClientConfig) -> SFResult<Client> {
         builder = builder.proxy(proxy);
     }
 
-    builder
-        .build()
-        .map_err(|e| SFError::Config(format!("http client could not be built from config: {e}")))
+    Ok(builder)
 }
 
 /// A [`cog_core::HttpClient`] implementation backed by [`reqwest::Client`].

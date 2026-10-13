@@ -12,6 +12,7 @@ pub mod convert;
 pub mod grpc_agent_lifecycle;
 pub mod mcp;
 pub mod plugin;
+pub mod transport;
 
 /// Protobuf-generated types for agent lifecycle gRPC service.
 /// tonic 生成的 service 方法以 `tonic::Status` 作 Err 变体（体积大），
@@ -34,4 +35,5 @@ pub mod wal {
 pub use a2a::{
     A2aClient, A2aTask, AgentAuthentication, AgentCapabilities, AgentCard, AgentSkill, TaskStatus,
 };
-pub use mcp::{McpClient, McpServer, McpTransport, SseTransport};
+pub use mcp::{McpClient, McpServer, McpTransport};
+pub use transport::{SseTransport, MCP_PROTOCOL_VERSION};

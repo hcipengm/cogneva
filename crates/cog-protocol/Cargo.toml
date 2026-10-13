@@ -8,8 +8,16 @@ license.workspace = true
 repository.workspace = true
 [dependencies]
 cog-core = { workspace = true }
+# The MCP client reaches an external server over HTTP, so it takes its client
+# from the same factory every other outbound call uses: one place defines the
+# timeouts, the pool and the proxy, and a stream that has to outlive a request
+# is the streaming variant of that same client rather than a second set of
+# numbers.
+cog-net = { workspace = true }
 
 serde = { workspace = true }
+reqwest = { workspace = true }
+eventsource-stream = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

@@ -1,7 +1,7 @@
 //! MCP (Model Context Protocol) 支持。
 //! - Server: 将 cogneva 的 ToolRegistry 以 MCP 协议暴露
 //! - Client: 调用外部 MCP servers 的 tools
-//! - Transport: SSE / stdio
+//! - Transport: 见 [`crate::transport`]（HTTP+SSE），以及 stdio
 
 use cog_core::{ToolCall, ToolDefinition, ToolExecutor};
 use serde::{Deserialize, Serialize};
@@ -157,56 +157,6 @@ impl cog_core::McpClient for McpClient {
 pub trait McpTransport: Send + Sync {
     async fn list_tools(&self) -> anyhow::Result<Vec<McpTool>>;
     async fn call_tool(&self, call: McpToolCall) -> anyhow::Result<McpToolResult>;
-}
-
-/// SSE 传输层。
-pub struct SseTransport {
-    endpoint: String,
-    client: Option<Arc<dyn cog_core::HttpClient>>,
-}
-
-impl SseTransport {
-    pub fn new(endpoint: impl Into<String>) -> Self {
-        Self {
-            endpoint: endpoint.into(),
-            client: None,
-        }
-    }
-
-    pub fn with_client(mut self, client: Arc<dyn cog_core::HttpClient>) -> Self {
-        self.client = Some(client);
-        self
-    }
-
-    fn client(&self) -> anyhow::Result<&Arc<dyn cog_core::HttpClient>> {
-        self.client
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("SseTransport has no HttpClient configured"))
-    }
-}
-
-#[async_trait::async_trait]
-impl McpTransport for SseTransport {
-    async fn list_tools(&self) -> anyhow::Result<Vec<McpTool>> {
-        let req = cog_core::HttpRequest::get(format!("{}/tools/list", self.endpoint)).timeout(30);
-        let resp = self.client()?.execute(req).await?;
-        let tools: Vec<McpTool> = resp
-            .json()
-            .map_err(|e| anyhow::anyhow!("JSON parse failed: {}", e))?;
-        Ok(tools)
-    }
-
-    async fn call_tool(&self, call: McpToolCall) -> anyhow::Result<McpToolResult> {
-        let req = cog_core::HttpRequest::post(format!("{}/tools/call", self.endpoint))
-            .json(&call)
-            .map_err(|e| anyhow::anyhow!("JSON serialization failed: {}", e))?
-            .timeout(30);
-        let resp = self.client()?.execute(req).await?;
-        let result: McpToolResult = resp
-            .json()
-            .map_err(|e| anyhow::anyhow!("JSON parse failed: {}", e))?;
-        Ok(result)
-    }
 }
 
 // ==========================================================================
