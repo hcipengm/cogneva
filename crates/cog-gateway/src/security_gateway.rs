@@ -1543,16 +1543,21 @@ fn pool_status_ttl_secs(state: &AppState, next_attempt_unix: i64) -> u64 {
 /// upstream returned and whether that upstream stated when it recovers.
 ///
 /// The status alone cannot carry this: a spent allowance and a rejected
-/// credential both arrive as 401/403, and a subscription the provider has
-/// stopped honouring arrives as 400 — the shape of a request of ours that is
-/// malformed. The upstream's own statement that it will serve again is the one
-/// fact that separates a wait from a verdict, and only the gateway holds it.
-/// When that statement contradicts a cause that does not clear on its own, the
-/// refusal is a wait and is reported as one; otherwise the status stands.
+/// credential both arrive as 401/403. Both are terminal — no amount of retrying
+/// clears them — so an upstream that says it will serve again is the one fact
+/// that turns the verdict into a wait, and only the gateway holds it. When that
+/// statement contradicts a terminal cause, the refusal is a wait and is
+/// reported as one; otherwise the status stands.
+///
+/// A 400 is deliberately left standing. A provider that has stopped honouring a
+/// subscription and a request of ours that is malformed both arrive as 400, and
+/// one response cannot separate them: the shape-error path records no recovery
+/// of its own, so any evidence seen here belongs to an earlier failure and says
+/// nothing about this one. A malformed request is a defect on our side and must
+/// keep being reported as one.
 fn refusal_cause(status: u16, upstream_states_recovery: bool) -> cog_core::UpstreamFailure {
-    use cog_core::contract::outcome::a_refusal_clears_on_its_own;
     let cause = cog_core::UpstreamFailure::from_status(status);
-    if upstream_states_recovery && !a_refusal_clears_on_its_own(cause) {
+    if upstream_states_recovery && cause.is_terminal() {
         cog_core::UpstreamFailure::RateLimited
     } else {
         cause
@@ -5720,10 +5725,11 @@ mod tests {
         // 402 同理：窗口未到是定论，窗口会复位是等待。
         assert_eq!(refusal_cause(402, false), UpstreamFailure::QuotaExhausted);
         assert_eq!(refusal_cause(402, true), UpstreamFailure::RateLimited);
-        // 400 通常是"我们的请求写错了"（我方缺陷），但订阅失效也回 400——这条
-        // 证据把后者从"我方缺陷"里摘出来。
+        // 400 保持不变：订阅失效与"我们的请求写错了"都回 400，一次响应分不出；
+        // 形状错自己又不留恢复证据，这里看到的证据属于更早的失败、与这次无关。
+        // 「我方缺陷」必须继续报成我方缺陷。
         assert_eq!(refusal_cause(400, false), UpstreamFailure::BadRequest);
-        assert_eq!(refusal_cause(400, true), UpstreamFailure::RateLimited);
+        assert_eq!(refusal_cause(400, true), UpstreamFailure::BadRequest);
         // 本来就会自愈的状态码不因这条证据改变。
         assert_eq!(refusal_cause(503, true), UpstreamFailure::ServerError);
         assert_eq!(refusal_cause(429, true), UpstreamFailure::RateLimited);
