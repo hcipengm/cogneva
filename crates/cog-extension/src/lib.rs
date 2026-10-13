@@ -89,4 +89,18 @@ pub fn build_extension_backend() -> Arc<dyn cog_core::SandboxBackend> {
     }
 }
 
+/// 环境类工具（shell 命令、文件读写）落在哪个后端上，由配置里的那一个地址决定：
+/// 配了地址就发给独立的执行器 Pod（生产形态），没配就在本进程里跑（嵌入式/开发）。
+///
+/// 只有这一处做这个判断。第二个调用点各写一份三元判断的下场是两边对「没配地址」
+/// 给出不同答案——而它们都自称在跑环境工具。
+pub fn executor_backend(
+    url: Option<String>,
+) -> cog_core::SFResult<Arc<dyn cog_core::SandboxBackend>> {
+    Ok(match url {
+        Some(url) => Arc::new(RemoteExecutor::new(url)?),
+        None => Arc::new(LocalExecutor::new()),
+    })
+}
+
 pub use executor::TaskSandboxExecutor;

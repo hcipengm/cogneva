@@ -1,6 +1,5 @@
 //! Guardrail plugin — implements [`cog_core::SystemPlugin`].
 
-use std::sync::Arc;
 use tracing::info;
 
 /// Guardrail plugin that self-assembles and publishes the composite guardrail.
@@ -40,23 +39,11 @@ impl cog_core::SystemPlugin for GuardrailPlugin {
                 std::sync::Arc::new(crate::InMemoryAuditRecorder::new())
             };
 
-        let mut composite = crate::CompositeGuardrail::new(audit);
-        composite.add_guard(Box::new(crate::PromptGuard::new(
-            crate::PromptGuardConfig::default(),
-        )));
-        composite.add_guard(Box::new(crate::ContentFilter::new(
-            crate::ContentFilterConfig::default(),
-        )));
-        composite.add_guard(Box::new(crate::PiiDetector::new(
-            crate::PiiDetectorConfig::default(),
-        )));
-        composite.add_guard(Box::new(crate::ToolGuard::new(
-            crate::ToolGuardConfig::default(),
-        )));
-        composite.add_guard(Box::new(crate::principle_shapes::PrincipleShapeGuard));
+        // 组装在 `build_default_guardrail` 里，这样「和主应用同一套护栏」不是一份
+        // 需要各自维护的清单，而是一次调用。
+        let guardrail = crate::build_default_guardrail(audit);
         info!("Guardrail initialized (Prompt + Content + PII + Tool + PrincipleShapes)");
 
-        let guardrail: Arc<dyn cog_core::Guardrail> = Arc::new(composite);
         ctx.publish_service(guardrail);
         info!("GuardrailPlugin guardrail published");
 

@@ -82,6 +82,114 @@ impl McpServer {
             }
         }
     }
+
+    /// 一条 JSON-RPC 消息的应答；`None` 表示不必答。
+    ///
+    /// `None` 只有一种来由，且是协议规定的：**通知**（不带 `id` 的消息）没有应答。
+    /// 给它编一条应答，对面拿不到任何东西去配对——它没有 id。
+    ///
+    /// 三种失败分得开（这一层是协议面，不是业务面）：
+    /// - **协议错误**：方法不存在（`-32601`）、参数不是 `tools/call` 要的形状
+    ///   （`-32602`）。这类错误的正文是给调用方看的，它必须能据此知道自己发错了什么。
+    /// - **工具错误**：工具跑了但失败了 —— 那不是协议错误，是一条 `isError: true` 的
+    ///   **正常应答**。把它写成协议错误，等于告诉调用方「你请求的方法不存在」。
+    /// - **解析错误**：整个消息不是 JSON —— 那时连 `id` 都不存在，只能按协议的
+    ///   `-32700` 用 `id: null` 回，见 [`crate::transport::serve`]。
+    pub async fn handle(&self, message: &serde_json::Value) -> Option<serde_json::Value> {
+        let Some(id) = message.get("id").cloned() else {
+            // 通知：`notifications/initialized` 就在这一类里，它本就无应答。
+            return None;
+        };
+        let Some(method) = message.get("method").and_then(|m| m.as_str()) else {
+            return Some(error_reply(id, -32600, "Invalid Request: no method"));
+        };
+
+        match method {
+            "initialize" => Some(result_reply(
+                id,
+                serde_json::json!({
+                    "protocolVersion": crate::transport::MCP_PROTOCOL_VERSION,
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {
+                        "name": "cogneva",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    },
+                }),
+            )),
+            "ping" => Some(result_reply(id, serde_json::json!({}))),
+            "tools/list" => Some(result_reply(
+                id,
+                serde_json::json!({"tools": self.list_tools()}),
+            )),
+            "tools/call" => Some(self.call_reply(id, message).await),
+            other => Some(error_reply(
+                id,
+                -32601,
+                format!("Method not found: {other}"),
+            )),
+        }
+    }
+
+    /// `tools/call` 一路：参数先判形状，工具不存在按协议错误回。
+    async fn call_reply(
+        &self,
+        id: serde_json::Value,
+        message: &serde_json::Value,
+    ) -> serde_json::Value {
+        let params = message.get("params");
+        let Some(name) = params.and_then(|p| p.get("name")).and_then(|n| n.as_str()) else {
+            return error_reply(id, -32602, "Invalid params: tools/call needs a tool name");
+        };
+        let arguments = params
+            .and_then(|p| p.get("arguments"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let serde_json::Value::Object(arguments) = arguments else {
+            // 参数是工具自己的 inputSchema 决定的对象；不是对象就是调用方给错了，
+            // 在这里就断，别把它猜成 `{}`——那样一次参数错误的调用会看起来像一次
+            // 不带参数的调用。
+            return error_reply(
+                id,
+                -32602,
+                "Invalid params: tools/call arguments must be a JSON object",
+            );
+        };
+
+        match self
+            .call_tool(McpToolCall {
+                name: name.to_string(),
+                arguments: arguments.into_iter().collect(),
+            })
+            .await
+        {
+            // 工具跑了但失败：这是**结果**，不是协议错误（见 `handle` 的说明）。
+            Ok(result) => result_reply(id, serde_json::to_value(result).unwrap_or_else(|e| {
+                serde_json::json!({
+                    "content": [{"type": "text", "text": format!("unserializable tool result: {e}")}],
+                    "isError": true,
+                })
+            })),
+            // 工具不在表里（或参数序列化不了）：请求本身不成立。
+            Err(e) => error_reply(id, -32602, format!("Invalid params: {e}")),
+        }
+    }
+}
+
+/// 一条应答信封：`id` 原样回声——它是调用方唯一的配对凭据，数字与字符串不能互换。
+fn result_reply(id: serde_json::Value, result: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
+}
+
+pub(crate) fn error_reply(
+    id: serde_json::Value,
+    code: i64,
+    message: impl std::fmt::Display,
+) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {"code": code, "message": message.to_string()},
+    })
 }
 
 // ==========================================================================

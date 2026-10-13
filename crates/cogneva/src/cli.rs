@@ -30,12 +30,13 @@ pub enum Command {
     RepairAof,
     EvalTable,
     EvalCaseSubset,
+    McpServe,
     WindowsService,
 }
 
 /// Subcommands, in the order they appear in [`USAGE`]. A command added here but
 /// not documented fails the usage test.
-const SUBCOMMANDS: [(&str, Command); 12] = [
+const SUBCOMMANDS: [(&str, Command); 13] = [
     ("security-gateway", Command::SecurityGateway),
     ("sandbox-executor", Command::SandboxExecutor),
     ("volume-walker", Command::VolumeWalker),
@@ -48,6 +49,7 @@ const SUBCOMMANDS: [(&str, Command); 12] = [
     ("repair-aof", Command::RepairAof),
     ("eval-table", Command::EvalTable),
     ("eval-case-subset", Command::EvalCaseSubset),
+    ("mcp-serve", Command::McpServe),
 ];
 
 /// Flags that take effect wherever they appear in the argument list.
@@ -81,6 +83,7 @@ COMMANDS:
                            against a pinned data root, then exit; --pins names the pins file
     eval-case-subset       Draw a fixed-seed subset of cases and archive it; runs read that
                            archive through `eval-table --subset` instead of redrawing
+    mcp-serve              Serve this machine's tool set to an MCP client on stdin/stdout
 
     With no COMMAND the full application starts.
 

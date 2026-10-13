@@ -13,6 +13,12 @@
 //!   读的是行。这一条上有两件事与 HTTP 那边不同源，都是「进程」带来的：子进程会把
 //!   诊断信息写到**标准错误**上（不读它，管道写满，子进程就停在那里），以及子进程
 //!   会**退出**（那时标准输出到尽头，还在等的调用必须当场失败，而不是等下去）。
+//!
+//! 另一头也在这个文件里：[`serve`] 是**服务端**方向——把 cogneva 的工具按同一份协议
+//! 回答出去。两个方向共用一套 JSON-RPC 形状（`mcp.rs` 里的类型与 `McpServer::handle`
+//! 的应答规则），差别只在谁拉起了谁：客户端这边是它去拉一个子进程，服务端这边是它
+//! 被一个客户端拉起，所以服务端那条上没有「子进程会退出」的问题，多出来的是**输出
+//! 就是线**——服务端往标准输出写诊断信息，等于给对面发了一条读不懂的消息。
 
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -719,6 +725,81 @@ impl McpTransport for StdioTransport {
     async fn call_tool(&self, call: McpToolCall) -> anyhow::Result<McpToolResult> {
         parse_tool_result(self.request("tools/call", tool_call_params(&call)).await?)
     }
+}
+
+// ==========================================================================
+// 服务端方向：把 cogneva 的工具当 MCP tools 回答出去
+// ==========================================================================
+
+/// 服务一个 MCP 客户端：输入一行一条 JSON-RPC，输出一行一条应答。
+///
+/// 读的方向反了，但**要求一样是「输出就是线」**：既然是行分隔的 JSON，那么任何
+/// 一行不是 JSON-RPC 的东西都会被对面当成一条读不懂的消息——诊断信息必须走标准错误。
+/// 这条在这里不是提醒，`serve` 只往 `output` 写应答。
+///
+/// 一条读不懂的行要回 `-32700`（`id: null`）：`id` 就藏在解析失败的那段文本里，
+/// 拿不到它，协议给的形状就是空 id。丢掉不回在这里是错的选择——调用方会一直等一条
+/// 永远不会来的应答。
+///
+/// 输入读到尽头（客户端关了自己那一头）就正常收工：那是「问完了」，不是故障。
+pub async fn serve<R, W>(server: &crate::McpServer, input: R, mut output: W) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut lines = input.lines();
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(e) => {
+                warn!("mcp server: reading a line from the client failed: {e}");
+                break;
+            }
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let message = match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(message) => message,
+            Err(e) => {
+                warn!("mcp server: a line from the client is not JSON: {e}");
+                let reply = crate::mcp::error_reply(
+                    serde_json::Value::Null,
+                    -32700,
+                    format!("Parse error: {e}"),
+                );
+                write_message(&mut output, &reply).await?;
+                continue;
+            }
+        };
+        // 通知（没有 id）没有应答，`handle` 用 `None` 说了这件事。
+        if let Some(reply) = server.handle(&message).await {
+            write_message(&mut output, &reply).await?;
+        }
+    }
+    Ok(())
+}
+
+/// 在本进程的标准输入输出上服务一个 MCP 客户端。
+///
+/// 写一行就冲一次：对面按行读，攒着不发等于对面的调用一直不返回。
+async fn write_message<W: tokio::io::AsyncWrite + Unpin>(
+    output: &mut W,
+    message: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let mut line = serde_json::to_vec(message)?;
+    line.push(b'\n');
+    output.write_all(&line).await?;
+    output.flush().await?;
+    Ok(())
+}
+
+/// 用本进程的标准输入输出跑一个 MCP 服务端（stdio 是**由客户端拉起**的那条传输：
+/// 谁来拉起它，谁就是它的信任边界）。
+pub async fn serve_stdio(server: &crate::McpServer) -> anyhow::Result<()> {
+    let input = tokio::io::BufReader::new(tokio::io::stdin());
+    serve(server, input, tokio::io::stdout()).await
 }
 
 // ==========================================================================

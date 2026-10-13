@@ -47,16 +47,11 @@ impl cog_core::SystemPlugin for ExtensionPlugin {
         // environment payloads go to the remote executor pod when configured
         // (production) or run in-process (embedded/development).
         let wasm_backend: Arc<dyn cog_core::SandboxBackend> = Arc::new(crate::WasmRuntime::new());
-        let executor_backend: Arc<dyn cog_core::SandboxBackend> = match executor_url {
-            Some(url) => {
-                info!(url = %url, "environment tools routed to remote sandbox executor");
-                Arc::new(crate::RemoteExecutor::new(url)?)
-            }
-            None => {
-                info!("no sandbox executor configured; environment tools run in-process");
-                Arc::new(crate::LocalExecutor::new())
-            }
-        };
+        match &executor_url {
+            Some(url) => info!(url = %url, "environment tools routed to remote sandbox executor"),
+            None => info!("no sandbox executor configured; environment tools run in-process"),
+        }
+        let executor_backend = crate::executor_backend(executor_url)?;
         let sandbox_backend: Arc<dyn cog_core::SandboxBackend> =
             Arc::new(crate::CompositeSandbox::new(wasm_backend, executor_backend));
         ctx.publish_service(sandbox_backend.clone());

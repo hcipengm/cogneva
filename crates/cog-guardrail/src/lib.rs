@@ -151,6 +151,21 @@ impl Guardrail for CompositeGuardrail {
     }
 }
 
+/// 本仓默认的那套护栏：Prompt 注入 + 内容 + PII + 工具 + 原则形状。
+///
+/// 组装这件事只有这一处定义。谁要一套「和主应用一样的护栏」就调它，不要照抄一遍
+/// 子护栏清单——抄一遍的下场是有一天主应用多了一层、这一份没跟上，而两个调用点都
+/// 在报「护栏已就绪」，看起来完全一样。
+pub fn build_default_guardrail(audit: Arc<dyn GuardAuditRecorder>) -> Arc<dyn Guardrail> {
+    let mut composite = CompositeGuardrail::new(audit);
+    composite.add_guard(Box::new(PromptGuard::new(PromptGuardConfig::default())));
+    composite.add_guard(Box::new(ContentFilter::new(ContentFilterConfig::default())));
+    composite.add_guard(Box::new(PiiDetector::new(PiiDetectorConfig::default())));
+    composite.add_guard(Box::new(ToolGuard::new(ToolGuardConfig::default())));
+    composite.add_guard(Box::new(principle_shapes::PrincipleShapeGuard));
+    Arc::new(composite)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

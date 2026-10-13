@@ -106,6 +106,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 与「这一列没跑成」在表里必须分得开。
         Command::EvalTable => cogneva::eval_table::run_from_args().await,
         Command::EvalCaseSubset => cogneva::eval_subset::run_from_args(),
+        // 把本机的工具集按 MCP 协议交给一个外部 MCP 客户端：这条传输由客户端拉起
+        // 本进程，标准输入输出就是协议本身，所以这条路上不许有别的输出。
+        Command::McpServe => cogneva::mcp_serve::run_from_env().await,
         Command::WindowsService => {
             #[cfg(windows)]
             {

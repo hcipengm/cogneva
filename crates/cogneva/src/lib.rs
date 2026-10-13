@@ -16,6 +16,7 @@ pub mod eval_table;
 pub mod health_check;
 pub mod host_ledger;
 pub mod hot_reload;
+pub mod mcp_serve;
 pub mod pidfile;
 pub mod platform;
 pub mod plugin_registry;
