@@ -12,7 +12,7 @@
 //! is what answers a red CI run with a revert, minutes later, in a different
 //! process than the one that landed the commit.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -1903,7 +1903,8 @@ pub fn ensure_contribution_allowed(diff: &str) -> Result<()> {
     } else {
         Err(CogGitHubError::PrivacyRejected(format!(
             "change touches non-contributable paths: {} \
-             (whitelist: crates/**/src/**/*.rs, prompts/**, root README/CHANGELOG)",
+             (whitelist: crates/<workspace member>/src/**/*.rs, prompts/**, \
+             root README/CHANGELOG)",
             denied.join(", ")
         )))
     }
@@ -1938,11 +1939,18 @@ fn is_allowed_path(path: &str) -> bool {
     let p = path.strip_prefix("./").unwrap_or(path);
 
     if let Some(rest) = p.strip_prefix("crates/") {
-        // crates/<crate>/src/<...>.rs — the src segment is mandatory and the
-        // final path segment must be a Rust source file.
+        // crates/<crate>/src/<...>.rs — the crate segment has to name a
+        // workspace member, the src segment is mandatory, and the final path
+        // segment must be a Rust source file. The membership test is what keeps
+        // the shape from being the whole rule: `crates/<anything>/src/x.rs`
+        // satisfies every other condition while naming a directory no compiler
+        // is pointed at, which is how a file comes to read as landed while
+        // nothing ever builds it.
         let mut segs = rest.split('/');
-        let crate_seg = segs.next();
-        if crate_seg.is_none_or(|s| s.is_empty()) || segs.next() != Some("src") {
+        let Some(crate_dir) = segs.next().filter(|s| !s.is_empty()) else {
+            return false;
+        };
+        if segs.next() != Some("src") || !is_a_workspace_member(crate_dir) {
             return false;
         }
         return matches!(segs.next_back(), Some(file) if file.ends_with(".rs"));
@@ -1963,6 +1971,62 @@ fn is_allowed_path(path: &str) -> bool {
     }
 
     false
+}
+
+/// The root manifest, embedded so the answer describes the tree this binary was
+/// built from.
+///
+/// Embedded rather than read at run time because this check runs on a diff's
+/// text before any git operation, and the contribution path has no checkout at
+/// that point to read a manifest out of.
+const ROOT_MANIFEST: &str = include_str!("../../../Cargo.toml");
+
+/// Whether a directory name under `crates/` is one the workspace compiles.
+///
+/// The members come from the manifest rather than from a list kept beside this
+/// function: a list here would be a second copy of the workspace's shape, and
+/// the copy is the one that goes stale while the check keeps answering.
+fn is_a_workspace_member(crate_dir: &str) -> bool {
+    workspace_members().contains(&format!("crates/{crate_dir}"))
+}
+
+/// The workspace's member directories, as the root manifest spells them.
+///
+/// Read once and cached. Two shapes leave the set empty, and empty refuses
+/// every `crates/…` path — the direction that keeps a change out rather than
+/// one that lets it in:
+///
+/// - a manifest that does not parse, and
+/// - a member list written with globs, which would take re-implementing what
+///   cargo resolves against the filesystem to answer.
+///
+/// Neither is silent: this crate's tests read the embedded manifest back and
+/// assert it names this crate, so a set nothing can be admitted into fails the
+/// suite instead of refusing every contribution in the cluster.
+fn workspace_members() -> &'static BTreeSet<String> {
+    static MEMBERS: OnceLock<BTreeSet<String>> = OnceLock::new();
+    MEMBERS.get_or_init(|| {
+        let Ok(doc) = ROOT_MANIFEST.parse::<toml::Value>() else {
+            return BTreeSet::new();
+        };
+        doc.get("workspace")
+            .and_then(|ws| ws.get("members"))
+            .and_then(|members| members.as_array())
+            .map(|members| {
+                members
+                    .iter()
+                    .filter_map(|m| m.as_str())
+                    .map(|m| {
+                        m.trim()
+                            .trim_start_matches("./")
+                            .trim_end_matches('/')
+                            .to_string()
+                    })
+                    .filter(|m| !m.contains(['*', '?']))
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
 }
 
 /// Whether `path` matches a configured `forbidden_paths` entry.
@@ -2311,6 +2375,42 @@ mod tests {
         for path in denied {
             assert!(!is_allowed_path(path), "should deny {path}");
         }
+    }
+
+    /// 形状对不等于落点存在。
+    ///
+    /// `crates/<seg>/src/x.rs` 满足白名单的每一段，`<seg>` 却可以是一个**不是
+    /// crate** 的目录——文件读起来像落地了，而没有编译器被指到它那里。判据因此
+    /// 不能停在形状上：段名要与 workspace 成员对表。
+    #[test]
+    fn whitelist_rejects_a_crate_directory_the_workspace_does_not_compile() {
+        assert!(
+            !is_allowed_path("crates/not_a_workspace_member/src/lib.rs"),
+            "a crate segment no workspace member carries is not a landing target"
+        );
+        assert!(
+            !is_allowed_path("./crates/not_a_workspace_member/src/deep/mod.rs"),
+            "the leading `./` is stripped before the same answer is given"
+        );
+        assert!(
+            is_allowed_path("crates/cog-github/src/lib.rs"),
+            "the rule refuses unknown crate names, it does not refuse crate names"
+        );
+    }
+
+    /// 内嵌的那份成员表必须真读得出东西。
+    ///
+    /// 读不出（清单改形、成员写成 glob）时的行为是**全拒**——安全的方向，但同样
+    /// 是「一条变更也落不了」。少了这条断言，上面那句「拒绝」会把这份清单的坏掉
+    /// 读成白名单变严。
+    #[test]
+    fn the_embedded_manifest_names_this_crate_as_a_member() {
+        let members = workspace_members();
+        assert!(
+            members.contains("crates/cog-github"),
+            "the embedded workspace manifest yielded {members:?}, which does not name this \
+             crate — a member set this check cannot read refuses every contribution"
+        );
     }
 
     #[test]

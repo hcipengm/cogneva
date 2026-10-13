@@ -16,6 +16,9 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
+# The contribution whitelist resolves `crates/<dir>` against the workspace
+# members, and it reads them out of the root manifest it embeds.
+toml = { workspace = true }
 
 # GitHub API client (chosen in design doc).
 octocrab = "0.41"
