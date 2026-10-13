@@ -18,11 +18,21 @@
 -- revision, and a second stored copy would be a second source of truth that can
 -- disagree with it.
 --
+-- It is the *fold pass's* tree, not the declaring document's: a declaration waits
+-- in the intake until a pass folds it, up to one pass interval, so a commit that
+-- lands in that window is already in `first_seen_rev^` and the row reads as true on
+-- entry. The window is bounded by the pass interval -- far smaller than the
+-- unbounded `landed_at - first_seen_at` gap it replaces -- but it is not zero, and
+-- a reader must not take this revision for the tree the document was written
+-- against.
+--
 -- Written once, on entry, and never moved -- `first_seen_at`'s rule. `ON
 -- CONFLICT` does not overwrite it, so a later reading of the same document, or a
 -- later measurement, leaves the revision the row entered at where it is. NULL
--- means the account could not resolve a revision the pass it folded the row, and
--- that is kept rather than filled: an entry whose revision is unknown is not an
--- entry at a revision the account guessed.
+-- means the account could not resolve a revision on the pass that folded the row,
+-- and that is kept rather than filled -- and kept for good: a later pass must not
+-- backfill it, because the only revision it could write is one later than entry,
+-- which is the very bias this column exists to remove.
+
 ALTER TABLE change_ledger
     ADD COLUMN IF NOT EXISTS first_seen_rev VARCHAR(64);
