@@ -100,6 +100,10 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_build_target_scan_interval_seconds",
         "crates/cog-core/src/build_cache.rs",
     ),
+    (
+        "cogneva_build_target_over_cap_total",
+        "crates/cog-core/src/build_cache.rs",
+    ),
     // Which gates a change was routed to, labelled by the tier it landed in.
     // The pipeline publishes it; the cells are seeded at zero on the first
     // change it tiers, so from that change on the rule below can read
