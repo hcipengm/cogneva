@@ -308,6 +308,11 @@ jobs:
       # 域名、模型品牌这些**带身份的形状**上，所以那两个词不会被误伤。
       - name: Check business side is vendor-neutral
         run: bash .github/scripts/check-llm-equality.sh
+      # README 里标成 Trait「定义」的成员表必须与源一致。少列不比列错好：字面上一句话
+      # 都没错，错的是读者从这里读出的「这个 Trait 没有那个能力」。分档是它的全部——
+      # `example`/`示例` 允许不全（只报数），`definition`/`定义` 差一个就红。
+      - name: Check README trait member lists match the source
+        run: bash .github/scripts/check-readme-trait-members.sh
 
   entry-scripts:
     name: Entry Scripts Lint

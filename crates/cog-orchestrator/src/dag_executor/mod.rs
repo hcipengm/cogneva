@@ -908,6 +908,15 @@ mod consumer_ack_tests {
     type AckLog = Vec<(String, String, Vec<String>)>;
     type PendingLog = Vec<(String, Vec<u8>)>;
 
+    /// 一笔死信写：它回答「哪条消息、带着什么字节、为什么、写回哪条流」。
+    #[derive(Clone, Debug)]
+    struct DlqWrite {
+        stream: String,
+        msg_id: String,
+        payload: Vec<u8>,
+        reason: String,
+    }
+
     /// Scripted backend: subscribe replays a fixed queue per subject then
     /// blocks forever; ack calls are recorded for assertions.
     #[derive(Clone, Default)]
@@ -937,11 +946,13 @@ mod consumer_ack_tests {
         /// refuses a payload over it, the way a real server does, so a test
         /// cannot pass by declaring a bound and then accepting everything.
         payload_limit: Arc<Mutex<Option<usize>>>,
-        /// 死信写的记录：`(stream, msg_id, payload, reason)`。
+        /// 死信写的记录。
         ///
         /// 记的是**参数**而不是发出去的那条 JSON——测试要钉的是「哪条消息、带着什么字节、
-        /// 为什么」被交给了死信队列，记录本身长什么样由契约自己的往返测试钉。
-        dlq_writes: Arc<Mutex<Vec<(String, String, Vec<u8>, String)>>>,
+        /// 为什么」被交给了死信队列，记录本身长什么样由契约自己的往返测试钉。四个字段
+        /// 各自有名字而不是攒成一个元组：元组里第 3 位和第 4 位都是「一串东西」，
+        /// 断言写反了编译器也放行，而这条测试的全部意义就在于那串字节。
+        dlq_writes: Arc<Mutex<Vec<DlqWrite>>>,
     }
 
     impl ScriptedBackend {
@@ -993,7 +1004,7 @@ mod consumer_ack_tests {
                 .collect()
         }
 
-        fn dlq_writes(&self) -> Vec<(String, String, Vec<u8>, String)> {
+        fn dlq_writes(&self) -> Vec<DlqWrite> {
             self.dlq_writes.lock().unwrap().clone()
         }
     }
@@ -1054,12 +1065,12 @@ mod consumer_ack_tests {
             payload: &[u8],
             reason: &str,
         ) -> SFResult<()> {
-            self.dlq_writes.lock().unwrap().push((
-                stream.to_string(),
-                msg_id.to_string(),
-                payload.to_vec(),
-                reason.to_string(),
-            ));
+            self.dlq_writes.lock().unwrap().push(DlqWrite {
+                stream: stream.to_string(),
+                msg_id: msg_id.to_string(),
+                payload: payload.to_vec(),
+                reason: reason.to_string(),
+            });
             Ok(())
         }
         async fn claim_pending(
@@ -1310,19 +1321,20 @@ mod consumer_ack_tests {
 
         let writes = backend.dlq_writes();
         assert_eq!(writes.len(), 1, "一条毒消息对应一笔死信写");
-        let (stream, msg_id, payload, reason) = &writes[0];
+        let write = &writes[0];
         assert_eq!(
-            stream, "orchestrator:results:ws-ack-test",
+            write.stream, "orchestrator:results:ws-ack-test",
             "写回它来的那条流"
         );
-        assert_eq!(msg_id, "rid-poison");
+        assert_eq!(write.msg_id, "rid-poison");
         assert_eq!(
-            payload, &poison,
+            write.payload, poison,
             "原样带过去——这一格丢了，死信记录就只剩「有个消息死了」"
         );
         assert!(
-            reason.contains("unparsable"),
-            "理由要说明它为什么会在这儿，实际是 {reason:?}"
+            write.reason.contains("unparsable"),
+            "理由要说明它为什么会在这儿，实际是 {:?}",
+            write.reason
         );
     }
 
