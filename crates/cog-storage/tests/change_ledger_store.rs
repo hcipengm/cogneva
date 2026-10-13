@@ -43,9 +43,15 @@ fn database_url() -> String {
 async fn store() -> (PostgresChangeLedgerStore, PgPool, String) {
     let url = database_url();
     migrate_once(&url).await;
-    let pool = PgPool::connect(&url).await.expect("connect to the database");
+    let pool = PgPool::connect(&url)
+        .await
+        .expect("connect to the database");
     let store = PostgresChangeLedgerStore::new(pool.clone());
-    (store, pool, format!("probe-change-ledger:{}", uuid::Uuid::new_v4()))
+    (
+        store,
+        pool,
+        format!("probe-change-ledger:{}", uuid::Uuid::new_v4()),
+    )
 }
 
 /// Apply the migrations under a session advisory lock.
@@ -57,7 +63,9 @@ async fn store() -> (PostgresChangeLedgerStore, PgPool, String) {
 /// applied. The lock is held on a connection separate from the migrator's own
 /// pool, so it stays held while the migrator runs.
 async fn migrate_once(url: &str) {
-    let pool = PgPool::connect(url).await.expect("connect to take the lock");
+    let pool = PgPool::connect(url)
+        .await
+        .expect("connect to take the lock");
     let mut conn = pool.acquire().await.expect("acquire the schema lock");
     sqlx::query("SELECT pg_advisory_lock($1)")
         .bind(97_002_i64)
@@ -101,7 +109,11 @@ async fn an_undecided_reason_reaches_its_column_and_clears_when_the_state_leaves
         .await
         .expect("write an undecided measurement");
 
-    let row = store.get(&id).await.expect("read the row").expect("the row exists");
+    let row = store
+        .get(&id)
+        .await
+        .expect("read the row")
+        .expect("the row exists");
     assert_eq!(row.state, ChangeState::Undecided);
     assert_eq!(
         row.unsettled_reason.as_deref(),
@@ -120,7 +132,11 @@ async fn an_undecided_reason_reaches_its_column_and_clears_when_the_state_leaves
         .await
         .expect("write a landed measurement");
 
-    let row = store.get(&id).await.expect("read the row back").expect("the row exists");
+    let row = store
+        .get(&id)
+        .await
+        .expect("read the row back")
+        .expect("the row exists");
     assert_eq!(row.state, ChangeState::Landed);
     assert_eq!(
         row.unsettled_reason, None,
@@ -143,18 +159,31 @@ async fn a_plain_row_carries_no_reason_and_a_reason_outside_the_set_is_refused()
 
     let pending = identity(&marker, "pending");
     store
-        .apply_measurement(&ChangeMeasurement::new(pending.clone(), ChangeState::Pending))
+        .apply_measurement(&ChangeMeasurement::new(
+            pending.clone(),
+            ChangeState::Pending,
+        ))
         .await
         .expect("write a pending measurement");
-    let row = store.get(&pending).await.expect("read").expect("the row exists");
-    assert_eq!(row.unsettled_reason, None, "a pending row carries no unsettled reason");
+    let row = store
+        .get(&pending)
+        .await
+        .expect("read")
+        .expect("the row exists");
+    assert_eq!(
+        row.unsettled_reason, None,
+        "a pending row carries no unsettled reason"
+    );
 
     // The store's coupling accepts this -- undecided with a reason -- so the
     // refusal has to come from the column's own closed set, which is the fact
     // under test.
     let bogus = identity(&marker, "bogus");
     let result = store
-        .apply_measurement(&ChangeMeasurement::undecided(bogus.clone(), "not_a_real_reason"))
+        .apply_measurement(&ChangeMeasurement::undecided(
+            bogus.clone(),
+            "not_a_real_reason",
+        ))
         .await;
     assert!(
         result.is_err(),
@@ -262,10 +291,16 @@ async fn a_queued_retirement_folds_into_the_account_and_is_idempotent() {
     // The row exists in the account as outstanding before it is retired: a
     // retirement moves a row's state, it does not merely annotate an absent one.
     store
-        .apply_measurement(&ChangeMeasurement::undecided(id.clone(), "scope_outside_tree"))
+        .apply_measurement(&ChangeMeasurement::undecided(
+            id.clone(),
+            "scope_outside_tree",
+        ))
         .await
         .expect("write the row to be retired");
-    assert_eq!(store.pending_retirements().await.expect("read the backlog"), 0);
+    assert_eq!(
+        store.pending_retirements().await.expect("read the backlog"),
+        0
+    );
 
     queue_retirement(&pool, &id, "fixture", "classifier:probe", &marker).await;
     assert_eq!(
@@ -274,7 +309,10 @@ async fn a_queued_retirement_folds_into_the_account_and_is_idempotent() {
         "a queued retirement is the backlog until it is folded"
     );
 
-    let folded = store.fold_retirements(10).await.expect("fold the retirement");
+    let folded = store
+        .fold_retirements(10)
+        .await
+        .expect("fold the retirement");
     assert_eq!(folded, 1, "the one queued retirement must be folded");
 
     let row = store.get(&id).await.expect("read").expect("the row exists");
@@ -316,9 +354,17 @@ async fn a_later_measurement_clears_a_retirement() {
     let id = identity(&marker, "re-examined");
 
     queue_retirement(&pool, &id, "fixture", "classifier:probe", &marker).await;
-    store.fold_retirements(10).await.expect("fold the retirement");
+    store
+        .fold_retirements(10)
+        .await
+        .expect("fold the retirement");
     assert_eq!(
-        store.get(&id).await.expect("read").expect("the row exists").state,
+        store
+            .get(&id)
+            .await
+            .expect("read")
+            .expect("the row exists")
+            .state,
         ChangeState::Retired
     );
 
@@ -329,7 +375,11 @@ async fn a_later_measurement_clears_a_retirement() {
         .await
         .expect("measure the row again");
 
-    let row = store.get(&id).await.expect("read back").expect("the row exists");
+    let row = store
+        .get(&id)
+        .await
+        .expect("read back")
+        .expect("the row exists");
     assert_eq!(row.state, ChangeState::Landed);
     assert_eq!(
         row.retire_reason, None,

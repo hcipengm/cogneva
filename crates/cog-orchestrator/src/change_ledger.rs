@@ -383,7 +383,10 @@ async fn read_pass(store: &dyn ChangeLedgerStore, first_seen_rev: Option<&str>) 
 /// what it was told. Neither the fold's failure nor the count's is raised or
 /// retried -- the next pass is the retry, and every pass leaves a line.
 async fn fold_pass(store: &dyn ChangeLedgerStore, first_seen_rev: Option<&str>) {
-    match store.fold_declarations(DECLARATIONS_PER_PASS, first_seen_rev).await {
+    match store
+        .fold_declarations(DECLARATIONS_PER_PASS, first_seen_rev)
+        .await
+    {
         Ok(0) => {}
         Ok(folded) => info!(
             folded,

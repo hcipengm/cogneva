@@ -1469,11 +1469,7 @@ mod tests {
         let absent = tree
             .judge(
                 &snapshot,
-                &identity(
-                    DEPENDENCY_EDGE_KIND,
-                    "crates/gone/Cargo.toml",
-                    "cog-llm =",
-                ),
+                &identity(DEPENDENCY_EDGE_KIND, "crates/gone/Cargo.toml", "cog-llm ="),
             )
             .await;
         assert_eq!(

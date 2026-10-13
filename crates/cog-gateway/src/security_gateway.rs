@@ -2320,8 +2320,10 @@ impl Drop for UsageRecorder {
         // than a request.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                record_llm_tokens(&state, &upstream, "ok", reading, latency_ms, &actor, &origin)
-                    .await;
+                record_llm_tokens(
+                    &state, &upstream, "ok", reading, latency_ms, &actor, &origin,
+                )
+                .await;
             });
         }
     }
@@ -5818,8 +5820,10 @@ mod tests {
     #[test]
     fn a_successful_call_is_not_landed_twice() {
         // 成功那条由 record_llm_tokens 带着真实用量落，这里必须让位。
-        assert!(failed_attempt_usage(&test_upstream(), "ok", 12, "agent:generator", "sandbox")
-            .is_none());
+        assert!(
+            failed_attempt_usage(&test_upstream(), "ok", 12, "agent:generator", "sandbox")
+                .is_none()
+        );
     }
 
     #[test]

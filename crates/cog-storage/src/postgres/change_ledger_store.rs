@@ -319,8 +319,7 @@ fn check_measurement(m: &ChangeMeasurement) -> Result<(), String> {
     }
     match (m.state, m.unsettled_reason.as_deref()) {
         (ChangeState::Undecided, None) => Err(
-            "an undecided measurement carries no reason, which would read as answered"
-                .to_string(),
+            "an undecided measurement carries no reason, which would read as answered".to_string(),
         ),
         (state, Some(reason)) if state != ChangeState::Undecided => Err(format!(
             "a {} measurement carries the unsettled reason {reason}, which belongs only to \
