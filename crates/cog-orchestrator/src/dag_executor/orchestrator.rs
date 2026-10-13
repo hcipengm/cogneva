@@ -1,5 +1,5 @@
 //! DAG 执行器编排核心：任务状态、租约、续跑与自修复都在这里汇合。
-use cog_core::{SFError, SFResult, Task, TaskStatus, UpstreamFailure};
+use cog_core::{SFError, SFResult, Task, TaskStatus, TaskType, UpstreamFailure};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -1130,12 +1130,9 @@ impl DagExecutor {
             return Ok((requeued, Vec::new(), false));
         }
 
-        // 与内存路径同一个判据：不能靠重跑清除的失败不给重试预算。
-        let max_retries = if Self::is_retryable_failure(&error, cause) {
-            self.retry_matrix.max_retries(&task.task_type)
-        } else {
-            0
-        };
+        // 与内存路径同一个判据：不能靠重跑清除的失败不给重试预算。两处调的是
+        // 同一个函数，所以「同一个判据」是结构上成立的，不是靠两边都写对。
+        let max_retries = self.effective_max_retries(&error, cause, &task.task_type);
         // 退避随任务一起落库，不留在调度循环的内存里：判定重试的进程与之后
         // 重新投递它的进程可能不是同一个。
         let retry_delay =
@@ -1932,6 +1929,31 @@ impl DagExecutor {
             && !cog_core::contract::outcome::is_deterministic_failure(error)
     }
 
+    /// The retry budget a failure actually gets.
+    ///
+    /// Not the task type's declared budget, which is only what a failure a
+    /// re-run could clear receives: one that nothing about a re-run can change
+    /// is given none, so the number its verdict compares against is zero. A row
+    /// therefore carries one number and is judged by another, and which is
+    /// which depends on the class of the failure -- never on the field.
+    ///
+    /// Both backends ask here rather than each branching on their own: a stored
+    /// verdict and an in-memory one that disagreed about the same failure would
+    /// be two retry semantics wearing one name, and both would look right on
+    /// whichever backend the reader happened to be looking at.
+    fn effective_max_retries(
+        &self,
+        error: &str,
+        cause: Option<UpstreamFailure>,
+        task_type: &TaskType,
+    ) -> u32 {
+        if Self::is_retryable_failure(error, cause) {
+            self.retry_matrix.max_retries(task_type)
+        } else {
+            0
+        }
+    }
+
     /// 这笔账谁付：任务，还是它撞上的环境。
     ///
     /// [`Self::is_retryable_failure`] 答的是"预算适不适用"，这条答的是同族的
@@ -2067,12 +2089,7 @@ impl DagExecutor {
         // 确定性失败不受重试预算约束：同样的输入在同一环境里再来一次必然同样
         // 失败，多付的只是那一轮烧掉的 token 和上游调用。预算清零比"重试三次
         // 都白跑"更省，也让失败原因在第一轮就浮出来而不是被三次重试盖住。
-        let retryable = Self::is_retryable_failure(&error, cause);
-        let max_retries = if retryable {
-            self.retry_matrix.max_retries(&task_type)
-        } else {
-            0
-        };
+        let max_retries = self.effective_max_retries(&error, cause, &task_type);
 
         let task = inner.tasks.get_mut(task_id).expect("task exists");
         if retry_count < max_retries {
@@ -4469,6 +4486,40 @@ mod tests {
         assert!(
             totals.iter().all(|sample| sample.value == 0.0),
             "the vocabulary lands at zero; the rounds add the values"
+        );
+    }
+
+    /// 行里带的界与判决用的界是两个数，差在失败类上：靠重跑清除不了的失败拿
+    /// 不到预算，因为重跑改变不了它。判据钉在这里——哪天有人让判决改读行里那
+    /// 个字段，这条会红。
+    #[test]
+    fn a_failure_a_rerun_cannot_clear_is_judged_by_no_budget() {
+        let orchestrator = DagExecutor::new("ws".to_string());
+        let task_type = TaskType::Custom("change_ledger".to_string());
+        let declared = orchestrator.retry_matrix().max_retries(&task_type);
+        assert!(
+            declared > 0,
+            "the case only means anything while the declared budget is a real one"
+        );
+
+        // 暂态失败：判决用的就是声明值。
+        assert_eq!(
+            orchestrator.effective_max_retries(
+                "upstream_unavailable",
+                Some(UpstreamFailure::ServerError),
+                &task_type,
+            ),
+            declared
+        );
+
+        // 判死的失败：声明值一格不动，判决用的是 0。
+        assert_eq!(
+            orchestrator.effective_max_retries(
+                "terminal_env_failure: environment_error",
+                Some(UpstreamFailure::Auth),
+                &task_type,
+            ),
+            0
         );
     }
 }
