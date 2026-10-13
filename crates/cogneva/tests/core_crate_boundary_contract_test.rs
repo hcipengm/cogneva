@@ -164,10 +164,16 @@ const RELOCATION_TARGET: &[(&str, &str, Owed)] = &[
     // Read for the sizes of the layers it caches, by the crate whose workdir
     // owns that cache.
     ("build_cache_readings", "cog-extension", Owed::Split),
-    // One reader, and it is the destination.
-    ("build_cache_reclaim", "cog-reflection", Owed::Direct),
-    // Twenty-eight call sites in the destination and five in the assembly root.
-    ("build_gate", "cog-reflection", Owed::Direct),
+    // The crate whose scan loop runs the reclaim: its `measure_and_enforce` is
+    // the only producer call, and it drives the slot. `cog-reflection` only
+    // re-exports the module, and the core reads `plan_reclaim` itself, so both
+    // the shape and the destination are the halves'.
+    ("build_cache_reclaim", "cog-extension", Owed::Split),
+    // The destination's rollout and change-pipeline paths are the ones that
+    // acquire the slot, so the mechanism half goes there; the core reads
+    // `dir_identity` and the `CacheSlot` registration, so the contract half
+    // stays.
+    ("build_gate", "cog-reflection", Owed::Split),
     // The crate that publishes the health readings the loops are watched by.
     ("loop_health", "cog-observability", Owed::Split),
 ];
@@ -613,8 +619,8 @@ fn any_source_names(dir: &Path, module: &str) -> bool {
     false
 }
 
-/// The crates that read `module`, the core excluded, read from the sources
-/// rather than from the registry.
+/// The crates that read `module`, read from the sources rather than from the
+/// registry.
 ///
 /// The question here is not who is *allowed* to reach a module but who does, and
 /// no manifest records that: an edge can be resolved and unused. The scan is of
@@ -629,7 +635,17 @@ fn any_source_names(dir: &Path, module: &str) -> bool {
 /// kind, but it is not a reader, and reporting it here would say a relocation is
 /// blocked when what has happened is that a file was written where nothing
 /// builds.
-fn consumers_of(root: &Path, members: &BTreeSet<String>, module: &str) -> BTreeSet<String> {
+///
+/// `include_core` decides whether the core counts as a reader. The core is a
+/// reader like any other for a `Split` row and for the non-empty reading, but it
+/// is the one reader a `Direct` row cannot survive: the core depends on no
+/// crate, so a module the core reads can never reach a destination whole.
+fn readers_of(
+    root: &Path,
+    members: &BTreeSet<String>,
+    module: &str,
+    include_core: bool,
+) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     let crates = match std::fs::read_dir(root.join("crates")) {
         Ok(crates) => crates,
@@ -637,7 +653,7 @@ fn consumers_of(root: &Path, members: &BTreeSet<String>, module: &str) -> BTreeS
     };
     for entry in crates.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name == CORE || !members.contains(&name) {
+        if !members.contains(&name) || (!include_core && name == CORE) {
             continue;
         }
         if any_source_names(&entry.path().join("src"), module) {
@@ -645,6 +661,37 @@ fn consumers_of(root: &Path, members: &BTreeSet<String>, module: &str) -> BTreeS
         }
     }
     out
+}
+
+/// Where under `dir` a `.rs` file names `module`, as `path:line` strings, read
+/// the way [`readers_of`] reads a reader: a whole word anywhere in the line.
+fn reader_sites(dir: &Path, module: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_reader_sites(dir, module, &mut out);
+    out
+}
+
+fn collect_reader_sites(dir: &Path, module: &str, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            collect_reader_sites(&path, module, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                for (i, line) in text.lines().enumerate() {
+                    if names_module(line, module) {
+                        out.push(format!("{}:{}", path.display(), i + 1));
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The workspace root, from this crate's manifest directory.
@@ -668,19 +715,29 @@ fn a_relocation_the_readers_already_reach_names_an_edge_that_is_there() {
     let ws = Workspace::read();
     let root = workspace_root();
     let mut unreachable = Vec::new();
-    let mut checked = 0usize;
     for (module, destination, owed) in RELOCATION_TARGET {
         if *owed != Owed::Direct {
             continue;
         }
-        for consumer in consumers_of(&root, &ws.members, module) {
+        // The core is included: a `Direct` row claims the module can move whole,
+        // and the core reading it makes that claim impossible — the core depends
+        // on no crate, so it could never reach the destination.
+        for consumer in readers_of(&root, &ws.members, module, true) {
             // A crate does not depend on itself, so the destination reading its
             // own module says nothing about whether the move invents an edge --
             // that half of the module leaves by not leaving.
             if consumer == *destination {
                 continue;
             }
-            checked += 1;
+            if consumer == CORE {
+                let sites = reader_sites(&root.join("crates").join(CORE).join("src"), module);
+                unreachable.push(format!(
+                    "the core itself reads `{module}`, which this row would move to `{destination}` \
+                     whole ({sites:?}) — the core depends on no crate, so this module leaves in \
+                     halves and the row is `split`, not `direct`"
+                ));
+                continue;
+            }
             let reaches = ws
                 .member_deps
                 .get(&consumer)
@@ -699,10 +756,20 @@ fn a_relocation_the_readers_already_reach_names_an_edge_that_is_there() {
          {unreachable:#?} — either the destination is wrong for the module, or the module is not \
          `direct` and leaves in halves"
     );
+
+    // A row is a claim about a module, and a module nothing reads is a claim about
+    // nothing. This reads over every row rather than counting the `direct` ones:
+    // that count reached zero the moment the last module the core reads was
+    // correctly relabelled, which is a legal end state, not an empty check.
+    let unread: Vec<&str> = RELOCATION_TARGET
+        .iter()
+        .filter(|(module, _, _)| readers_of(&root, &ws.members, module, true).is_empty())
+        .map(|(module, _, _)| *module)
+        .collect();
     assert!(
-        checked > 0,
-        "no `direct` row had a consumer outside the core, so this check read nothing: a row whose \
-         reading is empty is a row that is not describing the tree"
+        unread.is_empty(),
+        "these rows name modules no crate reads, the core included: {unread:?} — a row describes \
+         the tree, and a module nothing reads is not in it"
     );
 }
 
