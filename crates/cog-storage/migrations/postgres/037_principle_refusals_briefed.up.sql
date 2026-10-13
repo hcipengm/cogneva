@@ -1,0 +1,44 @@
+-- Migration: 037_principle_refusals_briefed
+-- Whether the principle a gate refused on had been told to the executor before
+-- it broke it.
+--
+-- A gate refuses correctly either way; this column is not about the refusal. It
+-- is about the delivery that should have preceded it. A principle the executor
+-- was never told about is a gap in the briefing, and that gap is closed by
+-- delivering wider -- never by weakening the gate, which would make the same
+-- number fall while fixing nothing. Without this column the two are the same
+-- event: a refusal that happened because the rule was known and ignored and a
+-- refusal that happened because the rule arrived after the transgression both
+-- add one to `refusals`.
+--
+-- Three values, and the third is not a gap. `briefed` is a reading a host made
+-- at the instant of the refusal, by looking up the principle in the set it had
+-- handed to that session. `unbriefed` is that look concluding the principle was
+-- not in it. `unknown` is a refusal reported by a path that made no such look --
+-- the platform's own gate has no session to have briefed, and a row written
+-- before this column existed had nobody asking either. Defaulting the third to
+-- `unbriefed` would report an unasked question as a delivery failure and make
+-- the gap reading un-fallable, which is the failure mode this column exists to
+-- keep out; defaulting it to `briefed` would hide the gap instead. The reader
+-- that computes the gap counts `unbriefed` and reports `unknown` beside it,
+-- because a ratio whose denominator quietly excludes the rows nobody could
+-- judge is a ratio that moves when the recording changes rather than when the
+-- delivery does.
+--
+-- NOT NULL with a default rather than nullable, unlike the ledgers' `state`:
+-- there, NULL means "no look has settled this row" and is the whole point of a
+-- column that is only ever written by a measurement. Here the question is asked
+-- of every refusal, and the honest answer for a path that did not ask it is a
+-- value -- `unknown` -- not an absence. A NULL would read as "the row is old"
+-- and a reader selecting by value would silently skip it, which is the same
+-- hidden-denominator problem one column over.
+--
+-- The CHECK is written inline with the ADD COLUMN because the alternative -- a
+-- second `ADD CONSTRAINT` -- cannot be made re-runnable: Postgres has no `ADD
+-- CONSTRAINT IF NOT EXISTS`, so a manual re-run against a table that already
+-- has the column would fail on the duplicate rather than the no-op it should
+-- be. The house style is a migration that can be run twice by hand.
+
+ALTER TABLE principle_refusals
+    ADD COLUMN IF NOT EXISTS briefed VARCHAR(12) NOT NULL DEFAULT 'unknown'
+        CHECK (briefed IN ('briefed', 'unbriefed', 'unknown'));
