@@ -185,11 +185,15 @@ impl LLMProvider for OllamaProvider {
                 // 上游明说的等待时长要在读掉响应体之前取出来：头与体一起被
                 // 消费，先取则留着，后取就只剩空表。
                 response.retry_after_secs = cog_core::retry_after_hint(&http_response.headers);
+                let declared_cause =
+                    cog_core::declared_upstream_cause(&http_response.headers);
                 let text = http_response.drain_text().await;
                 response.stop_reason = StopReason::Error;
                 // 状态码是这次失败的**类型**，文本只是它的措辞。留在这里，
                 // 下游的故障转移与退避就不必再去猜上游用了哪些词。
-                response.upstream_failure = Some(UpstreamFailure::from_status(status));
+                response.upstream_failure = Some(declared_cause.unwrap_or_else(|| {
+                    UpstreamFailure::from_status(status)
+                }));
                 response.error_message = Some(format!("API error (HTTP {status}): {text}"));
                 if producer
                     .push(AssistantMessageEvent::Error {

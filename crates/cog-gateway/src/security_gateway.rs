@@ -1539,6 +1539,26 @@ fn pool_status_ttl_secs(state: &AppState, next_attempt_unix: i64) -> u64 {
         .clamp(30, 7 * 24 * 3600)
 }
 
+/// The cause the gateway declares on a pooled refusal, from the status the
+/// upstream returned and whether that upstream stated when it recovers.
+///
+/// The status alone cannot carry this: a spent allowance and a rejected
+/// credential both arrive as 401/403, and a subscription the provider has
+/// stopped honouring arrives as 400 — the shape of a request of ours that is
+/// malformed. The upstream's own statement that it will serve again is the one
+/// fact that separates a wait from a verdict, and only the gateway holds it.
+/// When that statement contradicts a cause that does not clear on its own, the
+/// refusal is a wait and is reported as one; otherwise the status stands.
+fn refusal_cause(status: u16, upstream_states_recovery: bool) -> cog_core::UpstreamFailure {
+    use cog_core::contract::outcome::a_refusal_clears_on_its_own;
+    let cause = cog_core::UpstreamFailure::from_status(status);
+    if upstream_states_recovery && !a_refusal_clears_on_its_own(cause) {
+        cog_core::UpstreamFailure::RateLimited
+    } else {
+        cause
+    }
+}
+
 // ─── 池健康的四类落盘 ────────────────────────────────────────
 
 /// 记一次 gauge。指标注册表是进程内的，写失败只可能是标签类型冲突，降级为
@@ -3372,7 +3392,13 @@ async fn stream_forward(
     // 最后一个真实上游错误响应（状态码、content-type、原始 body、上游自己说的
     // 重试等待）：池耗尽时优先透传它，而不是合成 502 文本。等待时长要一起透传：
     // 调用侧据此决定何时重试，头丢在这里，它就只能拿状态码去猜。
-    let mut last_failure: Option<(reqwest::StatusCode, String, String, Option<String>)> = None;
+    let mut last_failure: Option<(
+        reqwest::StatusCode,
+        String,
+        String,
+        Option<String>,
+        &LlmUpstream,
+    )> = None;
     for upstream in candidates {
         let base = upstream.base_url.trim_end_matches('/');
         let url = match style {
@@ -3568,7 +3594,7 @@ async fn stream_forward(
                 mark_upstream_failure(&state, upstream, base, quota_reset, quota_window).await;
             }
             last_err = format!("上游 {base} 返回 HTTP {status}: {}", error_excerpt(&text));
-            last_failure = Some((status, ctype, text, retry_after));
+            last_failure = Some((status, ctype, text, retry_after, upstream));
             continue;
         }
         if state.note_upstream_success(upstream) {
@@ -3602,11 +3628,26 @@ async fn stream_forward(
     }
     // 池耗尽：有真实上游错误响应就透传状态码与原始 body（保留厂商
     // 错误标记，调用侧终止性退避据此分类），连真实响应都没有才合成 502。
-    if let Some((status, ctype, body, retry_after)) = last_failure {
+    //
+    // 但透传的那个状态码，本身不足以定这次失败的**类型**：配额用尽与凭证被拒
+    // 都回 401/403，订阅失效回 400，与"我们的请求写错了"同形。判据只有一条，
+    // 且只有网关拿得到——这个上游有没有自述过何时恢复。报过恢复证据的，任何
+    // 本会被读成"已成定论"的状态码（配额/凭证/请求形态）都只是一次等待。于是
+    // 把网关的分类显式附在回复头上，调用侧优先读它而不是状态码；状态码与原始
+    // body 原样透传，别的消费者不受影响。
+    if let Some((status, ctype, body, retry_after, refused)) = last_failure {
+        let bounds = state
+            .llm_health
+            .recovery_bounds(std::slice::from_ref(refused));
+        let upstream_states_recovery = bounds.evidenced_unix > 0 || bounds.window_secs > 0;
         let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let mut builder = axum::response::Response::builder()
             .status(status)
-            .header("content-type", ctype);
+            .header("content-type", ctype)
+            .header(
+                cog_core::UPSTREAM_CAUSE_HEADER,
+                refusal_cause(status.as_u16(), upstream_states_recovery).name(),
+            );
         if let Some(wait) = retry_after {
             builder = builder.header(cog_core::RETRY_AFTER_HEADER, wait);
         }
@@ -5665,6 +5706,27 @@ mod tests {
             requires_temperature_one: None,
             supports_usage_in_streaming: None,
         }
+    }
+
+    /// 上游自述过何时恢复时，任何"已成定论"的状态码都降级成一次等待；没自述过
+    /// 就照状态码判。这条证据只有网关拿得到，调用侧看不到。
+    #[test]
+    fn a_stated_recovery_turns_a_settled_status_into_a_wait() {
+        use cog_core::UpstreamFailure;
+        // 403 落在"凭证被拒"：没有别的证据时它是定论。
+        assert_eq!(refusal_cause(403, false), UpstreamFailure::Auth);
+        // 但配额用尽的周窗口也回 403，且上游明说了何时复位——那时它是一次等待。
+        assert_eq!(refusal_cause(403, true), UpstreamFailure::RateLimited);
+        // 402 同理：窗口未到是定论，窗口会复位是等待。
+        assert_eq!(refusal_cause(402, false), UpstreamFailure::QuotaExhausted);
+        assert_eq!(refusal_cause(402, true), UpstreamFailure::RateLimited);
+        // 400 通常是"我们的请求写错了"（我方缺陷），但订阅失效也回 400——这条
+        // 证据把后者从"我方缺陷"里摘出来。
+        assert_eq!(refusal_cause(400, false), UpstreamFailure::BadRequest);
+        assert_eq!(refusal_cause(400, true), UpstreamFailure::RateLimited);
+        // 本来就会自愈的状态码不因这条证据改变。
+        assert_eq!(refusal_cause(503, true), UpstreamFailure::ServerError);
+        assert_eq!(refusal_cause(429, true), UpstreamFailure::RateLimited);
     }
 
     #[test]

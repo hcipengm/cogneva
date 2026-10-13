@@ -52,6 +52,34 @@ pub fn retry_after_hint(headers: &HashMap<String, String>) -> Option<u64> {
         .and_then(|(_, value)| parse_retry_after_secs(value))
 }
 
+/// Outbound header the LLM proxy sets on a refusal to name the cause it
+/// classified the refusal under.
+///
+/// The status code alone is lossy for a proxy fronting a pool: a spent
+/// allowance and a rejected credential both arrive as 401/403, and a
+/// subscription the provider has stopped honouring arrives as 400 — the same
+/// shape as a request of ours that is malformed. The proxy holds the upstream's
+/// own statement about when it will serve again, which the caller cannot see, so
+/// it declares the cause here and the caller prefers it over the status.
+///
+/// A value that names no cause in [`UpstreamFailure`]'s closed set is ignored,
+/// so an unknown token reads as "nothing was declared" and the caller falls back
+/// to the status rather than guessing.
+pub const UPSTREAM_CAUSE_HEADER: &str = "x-cogneva-upstream-cause";
+
+/// The cause a refusal declared on [`UPSTREAM_CAUSE_HEADER`], or `None` when the
+/// header is absent or names no cause.
+///
+/// Header names are compared case-insensitively for the same reason
+/// [`retry_after_hint`] does: the concrete client's map preserves whatever
+/// casing the wire carried.
+pub fn declared_upstream_cause(headers: &HashMap<String, String>) -> Option<UpstreamFailure> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(UPSTREAM_CAUSE_HEADER))
+        .and_then(|(_, value)| UpstreamFailure::from_name(value.trim()))
+}
+
 /// The token a rendered refusal carries its stated wait under, and the reader
 /// for it.
 ///
@@ -541,6 +569,26 @@ mod retry_after_tests {
                 "{name}"
             );
         }
+    }
+
+    /// 网关在回复头上声明的分类按名字读回；闭集之外的名字当作没声明，交给状态码
+    /// 兜底，不猜。
+    #[test]
+    fn a_declared_cause_reads_back_and_an_unknown_name_is_no_declaration() {
+        let named = |v: &str| HashMap::from([(UPSTREAM_CAUSE_HEADER.to_string(), v.to_string())]);
+        assert_eq!(
+            declared_upstream_cause(&named("rate_limited")),
+            Some(UpstreamFailure::RateLimited)
+        );
+        assert_eq!(
+            declared_upstream_cause(&HashMap::from([(
+                UPSTREAM_CAUSE_HEADER.to_uppercase(),
+                "quota_exhausted".to_string()
+            )])),
+            Some(UpstreamFailure::QuotaExhausted)
+        );
+        assert_eq!(declared_upstream_cause(&named("kinda_slow")), None);
+        assert_eq!(declared_upstream_cause(&HashMap::new()), None);
     }
 
     /// 认不出来就是没有：猜一个不存在的时间点，等于把下一次尝试瞄准上游从没
