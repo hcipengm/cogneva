@@ -290,6 +290,24 @@ jobs:
           if [ -n "${base}" ]; then range="${base}..${HEAD_SHA}"; else range="${HEAD_SHA}"; fi
           echo "judging ${range}"
           bash deploy/scripts/check-commit-attribution.sh "${range}"
+      # 公开树里不许把私有仓指出来。第一层锚在所有者句柄上（结构判据），第二层要一份
+      # 裸标识名单，而名单进公开文件本身就是泄露 —— 它从 secret 注入。
+      #
+      # 这里**没有**打开 `REQUIRE_PRIVATE_IDENTIFIERS`（脚本支持它，测试也钉了它四种
+      # 状态）。理由：secret 在不在，只有配了它的人读得出来；从这棵树里读不出来。对一个
+      # 读不出来的前提做 fail-closed，等于把「secret 没配」这个状态变成主线常红 —— 而
+      # `release-tag` 依赖本 job，常红就是发布停摆，一条把发布卡死的门活不过下一次
+      # 有人赶时间。所以这一层缺席时**明说它没跑**（那行 `这一遍没跑` 就是它的读数），
+      # 不冒充通过。配上 secret 之后要转 fail-closed，是把上面那行 env 加回来。
+      - name: Check public surface carries no private identifier
+        env:
+          PRIVATE_IDENTIFIERS: ${{ secrets.PRIVATE_IDENTIFIERS }}
+        run: bash .github/scripts/check-private-identifiers.sh
+      # LLM 平等：业务侧的清单与配置零厂商名、零厂商 env，真上游只住在网关的上游池。
+      # 方言词（openai/anthropic）是协议名，不是厂商身份——判据锚在凭证 env、端点、
+      # 域名、模型品牌这些**带身份的形状**上，所以那两个词不会被误伤。
+      - name: Check business side is vendor-neutral
+        run: bash .github/scripts/check-llm-equality.sh
 
   entry-scripts:
     name: Entry Scripts Lint
