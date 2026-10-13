@@ -33,7 +33,7 @@ use cog_observability::analytics::{
 use cog_observability::config::ObservabilityExportersConfig;
 use cog_observability::logs::{init_subscriber_with_pusher, LokiBackgroundPusher, LokiPushClient};
 use cog_observability::metrics::PrometheusMetricsBackend;
-use cog_observability::usage_store::{LlmUsageRecord, LlmUsageStore};
+use cog_observability::usage_store::{LlmOrigin, LlmUsageRecord, LlmUsageStore, LLM_ORIGIN_HEADER};
 use serde::{Deserialize, Serialize};
 
 /// 单个 LLM 上游：凭证只从环境变量读取（K8s Secret 仅注入本服务），永不转发给沙盒。
@@ -1674,6 +1674,7 @@ async fn record_llm_call(
     result: &str,
     latency_ms: u64,
     actor: &str,
+    origin: &str,
 ) {
     let key = LlmHealthTable::key(upstream);
     // `model` travels alongside `upstream` rather than instead of it: a pool
@@ -1706,7 +1707,7 @@ async fn record_llm_call(
             .property("actor", serde_json::json!(actor))
             .property("latency_ms", serde_json::json!(latency_ms)),
     );
-    if let Some(record) = failed_attempt_usage(upstream, result, latency_ms, actor) {
+    if let Some(record) = failed_attempt_usage(upstream, result, latency_ms, actor, origin) {
         land_usage_record(state, record);
     }
 }
@@ -1726,6 +1727,7 @@ fn failed_attempt_usage(
     result: &str,
     latency_ms: u64,
     actor: &str,
+    origin: &str,
 ) -> Option<LlmUsageRecord> {
     if result == "ok" {
         return None;
@@ -1736,6 +1738,7 @@ fn failed_attempt_usage(
         model: upstream.model.clone(),
         result: result.to_string(),
         actor: actor.to_string(),
+        origin: origin.to_string(),
         tokens_input: 0,
         tokens_output: 0,
         tokens_cached: 0,
@@ -1982,6 +1985,7 @@ async fn record_llm_tokens(
     reading: UsageReading,
     latency_ms: u64,
     actor: &str,
+    origin: &str,
 ) {
     let key = LlmHealthTable::key(upstream);
     // Zero is recorded, not skipped: the two cells answer "has this metering
@@ -2047,6 +2051,7 @@ async fn record_llm_tokens(
             model: upstream.model.clone(),
             result: result.to_string(),
             actor: actor.to_string(),
+            origin: origin.to_string(),
             tokens_input: reading.input,
             tokens_output: reading.output,
             tokens_cached: reading.cached,
@@ -2258,6 +2263,11 @@ struct UsageRecorder {
     state: AppState,
     upstream: LlmUpstream,
     actor: String,
+    /// Environment the caller declared, carried beside `actor` so the row a
+    /// dropped stream lands still reads under the right origin. The two travel
+    /// together because a stream that outlives its request is exactly the case
+    /// where they cannot be re-read from the headers.
+    origin: String,
     start: std::time::Instant,
     /// Set by whichever of the two paths takes the reading first. A plain flag
     /// is enough because the two paths cannot run at once — both need to own
@@ -2302,6 +2312,7 @@ impl Drop for UsageRecorder {
         let state = self.state.clone();
         let upstream = self.upstream.clone();
         let actor = std::mem::take(&mut self.actor);
+        let origin = std::mem::take(&mut self.origin);
         let latency_ms = self.start.elapsed().as_millis() as u64;
         // [`Drop`] cannot await and the caller is already on its way out, so
         // the write rides a task of its own. Only a runtime that is itself
@@ -2309,7 +2320,8 @@ impl Drop for UsageRecorder {
         // than a request.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                record_llm_tokens(&state, &upstream, "ok", reading, latency_ms, &actor).await;
+                record_llm_tokens(&state, &upstream, "ok", reading, latency_ms, &actor, &origin)
+                    .await;
             });
         }
     }
@@ -2326,6 +2338,7 @@ fn wrap_usage_scan(
     stream: impl futures::Stream<Item = Result<axum::body::Bytes, reqwest::Error>> + Send + 'static,
     start: std::time::Instant,
     actor: String,
+    origin: String,
     asked: bool,
 ) -> impl futures::Stream<Item = Result<axum::body::Bytes, reqwest::Error>> + Send {
     use futures::StreamExt;
@@ -2352,6 +2365,7 @@ fn wrap_usage_scan(
         state,
         upstream,
         actor,
+        origin,
         start,
         claimed: false,
     };
@@ -2365,6 +2379,7 @@ fn wrap_usage_scan(
             reading,
             latency_ms,
             &recorder.actor,
+            &recorder.origin,
         )
         .await;
         Ok(axum::body::Bytes::new())
@@ -3311,6 +3326,18 @@ async fn stream_forward(
             .get(cog_core::LLM_ACTOR_HEADER)
             .and_then(|v| v.to_str().ok()),
     );
+    // The environment axis, read the same way the actor is and from the same
+    // caller: the caller knows where it runs, and a table mapping component
+    // names to environments would go stale the moment a deployment moved. An
+    // absent or unrecognised value reads as `unknown`, which is not an
+    // environment -- see the note on `LlmOrigin::Unknown`.
+    let origin = LlmOrigin::declared(
+        req.headers()
+            .get(LLM_ORIGIN_HEADER)
+            .and_then(|v| v.to_str().ok()),
+    )
+    .as_str()
+    .to_string();
     let body = axum::body::to_bytes(req.into_body(), 32 * 1024 * 1024)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -3536,6 +3563,7 @@ async fn stream_forward(
                     "error",
                     start.elapsed().as_millis() as u64,
                     &actor,
+                    &origin,
                 )
                 .await;
                 mark_upstream_failure(&state, upstream, base, None, None).await;
@@ -3585,6 +3613,7 @@ async fn stream_forward(
                 "error",
                 start.elapsed().as_millis() as u64,
                 &actor,
+                &origin,
             )
             .await;
             if request_shape_error {
@@ -3608,7 +3637,7 @@ async fn stream_forward(
         }
         let elapsed_ms = start.elapsed().as_millis() as u64;
         state.llm_stats.record(elapsed_ms);
-        record_llm_call(&state, upstream, "ok", elapsed_ms, &actor).await;
+        record_llm_call(&state, upstream, "ok", elapsed_ms, &actor, &origin).await;
 
         let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let content_type = resp
@@ -3623,6 +3652,7 @@ async fn stream_forward(
             resp.bytes_stream(),
             start,
             actor.clone(),
+            origin.clone(),
             asked_for_usage,
         );
         return Ok(axum::response::Response::builder()
@@ -3926,11 +3956,14 @@ async fn call_llm(
     let candidates = order_by_health(next_candidates, &state.llm_health);
     let mut last_err = String::new();
     // This endpoint is the gateway's own intent classifier, not a proxied
-    // business call, so its actor dimension is fixed rather than headered.
+    // business call, so its actor dimension is fixed rather than headered, and
+    // it is reached from the interactive UI rather than from a pool or sandbox,
+    // so its environment is fixed too.
     let actor = "intent_gateway";
+    let origin = LlmOrigin::Interactive.as_str();
     for upstream in candidates {
         let start = std::time::Instant::now();
-        match call_one_upstream(state, upstream, &messages, actor).await {
+        match call_one_upstream(state, upstream, &messages, actor, origin).await {
             Ok(resp) => {
                 if state.note_upstream_success(upstream) {
                     tracing::info!(upstream = %upstream.base_url, "LLM 上游恢复健康（真实请求实证）");
@@ -3942,6 +3975,7 @@ async fn call_llm(
                     "ok",
                     start.elapsed().as_millis() as u64,
                     actor,
+                    origin,
                 )
                 .await;
                 return Ok(resp);
@@ -3954,6 +3988,7 @@ async fn call_llm(
                     "error",
                     start.elapsed().as_millis() as u64,
                     actor,
+                    origin,
                 )
                 .await;
                 mark_upstream_failure(
@@ -3979,6 +4014,7 @@ async fn call_one_upstream(
     upstream: &LlmUpstream,
     messages: &[ChatMessage],
     actor: &str,
+    origin: &str,
 ) -> Result<Json<LlmResponse>, (String, Option<i64>, Option<u64>)> {
     let start = std::time::Instant::now();
     let base = upstream.base_url.trim_end_matches('/');
@@ -4039,6 +4075,7 @@ async fn call_one_upstream(
             reading,
             start.elapsed().as_millis() as u64,
             actor,
+            origin,
         )
         .await;
         let content = v["content"][0]["text"]
@@ -4092,6 +4129,7 @@ async fn call_one_upstream(
         reading,
         start.elapsed().as_millis() as u64,
         actor,
+        origin,
     )
     .await;
     let content = v["choices"][0]["message"]["content"]
@@ -5767,19 +5805,21 @@ mod tests {
     #[test]
     fn a_failed_attempt_lands_a_zero_token_row() {
         // 失败尝试没有用量可带，于是曾经一条台账都不落，result 列只剩 ok。
-        let row = failed_attempt_usage(&test_upstream(), "error", 12, "agent:generator")
+        let row = failed_attempt_usage(&test_upstream(), "error", 12, "agent:generator", "sandbox")
             .expect("a failed attempt must be visible in the ledger");
         assert_eq!(row.result, "error");
         assert_eq!(row.tokens_input, 0);
         assert_eq!(row.tokens_output, 0);
         assert_eq!(row.actor, "agent:generator");
+        assert_eq!(row.origin, "sandbox");
         assert_eq!(row.model, "m");
     }
 
     #[test]
     fn a_successful_call_is_not_landed_twice() {
         // 成功那条由 record_llm_tokens 带着真实用量落，这里必须让位。
-        assert!(failed_attempt_usage(&test_upstream(), "ok", 12, "agent:generator").is_none());
+        assert!(failed_attempt_usage(&test_upstream(), "ok", 12, "agent:generator", "sandbox")
+            .is_none());
     }
 
     #[test]
@@ -6078,6 +6118,7 @@ mod tests {
             body,
             std::time::Instant::now(),
             "agent:planner".to_string(),
+            "gateway_pool".to_string(),
             true,
         ));
         let first = stream.next().await.expect("a frame").expect("ok bytes");

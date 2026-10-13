@@ -440,13 +440,18 @@ pub trait ObservabilityGateway: Send + Sync {
 
 // ─── Token spend, read from the durable rollup ─────────────────────────────
 
-/// One `(actor, upstream, protocol)` line of token spend, summed over the
-/// closed accounting windows a reader asked for.
+/// One `(actor, origin, upstream, protocol)` line of token spend, summed over
+/// the closed accounting windows a reader asked for.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActorUsage {
     /// Calling component as the gateway normalized it (`self_review`,
     /// `agent:<role>`, `unknown`).
     pub actor: String,
+    /// Environment the calls were made from, one of the ledger's closed set:
+    /// `gateway_pool`, `resident_worker`, `interactive`, `sandbox`, or
+    /// `unknown` for a caller that declared none. A separate axis from `actor`
+    /// because the same component runs in more than one environment.
+    pub origin: String,
     /// Pool identity of the upstream that served the calls.
     pub upstream: String,
     /// Wire protocol family the tokens were counted under. Carried because

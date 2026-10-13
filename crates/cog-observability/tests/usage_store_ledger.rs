@@ -51,6 +51,7 @@ async fn the_cache_dimension_reaches_the_ledger_and_the_column_migration_spares_
         model: "ledger-test-model".to_string(),
         result: "ok".to_string(),
         actor,
+        origin: "sandbox".to_string(),
         tokens_input: 1000,
         tokens_output: 50,
         tokens_cached: cached,

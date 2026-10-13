@@ -37,8 +37,8 @@
 //! Per-call rows are fine-grained but answered only by scanning a table that
 //! grows forever, and a question asked repeatedly ("where did last Tuesday's
 //! tokens go") should not make every reader scan it. So the ledger is also
-//! folded into [`ROLLUP_TABLE`], one row per actor × upstream × protocol per
-//! closed hour. The fold is derived — every row in it can be recomputed from
+//! folded into [`ROLLUP_TABLE`], one row per actor × origin × upstream ×
+//! protocol per closed hour. The fold is derived — every row in it can be recomputed from
 //! this table — which is what makes it legitimate to run from a process that
 //! restarts: a window rolled twice lands the same key with the same values, and
 //! a window missed while the process was down is rolled on the next pass. The
@@ -56,6 +56,78 @@ pub const LEDGER_TABLE: &str = "gateway_llm_usage";
 /// The durable per-window fold of [`LEDGER_TABLE`].
 pub const ROLLUP_TABLE: &str = "cog_llm_usage_rollup";
 
+/// Inbound header a caller sets to name the environment a call is made from.
+///
+/// The ledger's other dimensions say what was called and who called it; this
+/// one says where the call was made from, which is the only face that answers
+/// "which environment burned these tokens". It rides a header rather than being
+/// read off the caller's identity because the same component runs in more than
+/// one environment: a table mapping names to environments would go stale the
+/// moment a deployment moved, while the caller always knows where it is.
+pub const LLM_ORIGIN_HEADER: &str = "x-cogneva-origin";
+
+/// The environment a metered call was made in, as a closed set.
+///
+/// Closed because it is read as counts and a reader selects rows by it: a value
+/// outside the set is not a new environment, it is a caller that did not say.
+/// [`Self::declared`] is the only way in, and [`Self::Unknown`] is deliberately
+/// outside the four -- an undeclared caller is not attributable to any
+/// environment, and folding it into one would credit that environment with
+/// tokens it did not burn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LlmOrigin {
+    /// The platform's own task pool driving agents (planner, generator, ...).
+    GatewayPool,
+    /// A long-lived resident worker session.
+    ResidentWorker,
+    /// An interactive, human-driven session.
+    Interactive,
+    /// A sandbox executor run.
+    Sandbox,
+    /// No usable declaration arrived. Not a place a call comes from, so it is
+    /// kept out of [`Self::DECLARED`] and out of any environment's total.
+    Unknown,
+}
+
+impl LlmOrigin {
+    /// The four an environment may declare, in the order the ledger reads them.
+    /// [`Self::Unknown`] is not one of them.
+    pub const DECLARED: [LlmOrigin; 4] = [
+        LlmOrigin::GatewayPool,
+        LlmOrigin::ResidentWorker,
+        LlmOrigin::Interactive,
+        LlmOrigin::Sandbox,
+    ];
+
+    /// The origin a caller declared, or [`Self::Unknown`] when it declared none
+    /// or named one outside the set.
+    ///
+    /// An unrecognised value reads as "nothing was declared" rather than being
+    /// stored as free text: the column is a closed set a reader groups by, and
+    /// letting an arbitrary token in would make every new misspelling its own
+    /// series. Trimming is the only repair -- a value that names an environment
+    /// after trimming is accepted.
+    pub fn declared(raw: Option<&str>) -> Self {
+        match raw.map(str::trim) {
+            Some("gateway_pool") => LlmOrigin::GatewayPool,
+            Some("resident_worker") => LlmOrigin::ResidentWorker,
+            Some("interactive") => LlmOrigin::Interactive,
+            Some("sandbox") => LlmOrigin::Sandbox,
+            _ => LlmOrigin::Unknown,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LlmOrigin::GatewayPool => "gateway_pool",
+            LlmOrigin::ResidentWorker => "resident_worker",
+            LlmOrigin::Interactive => "interactive",
+            LlmOrigin::Sandbox => "sandbox",
+            LlmOrigin::Unknown => "unknown",
+        }
+    }
+}
+
 /// One metered LLM call.
 #[derive(Debug, Clone)]
 pub struct LlmUsageRecord {
@@ -70,6 +142,11 @@ pub struct LlmUsageRecord {
     /// Calling component as normalized by the gateway (`self_review`,
     /// `agent:<role>`, `unknown`); lets per-actor token spend be audited.
     pub actor: String,
+    /// Environment the call was made from, as one of [`LlmOrigin`]'s values --
+    /// the gateway's reading of the caller's own [`LLM_ORIGIN_HEADER`]. Answers
+    /// a question `actor` cannot: the same component runs in more than one
+    /// environment, so "who spent this" and "where it was spent" are two axes.
+    pub origin: String,
     pub tokens_input: u64,
     pub tokens_output: u64,
     /// Input tokens the upstream served from its own prefix cache. Its own
@@ -95,6 +172,11 @@ pub struct LlmUsageRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorSpend {
     pub actor: String,
+    /// Environment the calls were made from, one of [`LlmOrigin`]'s values.
+    /// Carried beside `actor` rather than folded into it: the same component
+    /// can call from more than one environment, and a reader asking "which
+    /// environment burned this" needs it as its own axis.
+    pub origin: String,
     pub upstream: String,
     /// Wire protocol family the tokens were counted under. Carried because
     /// `tokens_input` means different things per protocol — on an
@@ -237,6 +319,15 @@ impl LlmUsageStore {
         )
         .execute(&self.pool)
         .await?;
+        // Additive migration for the environment dimension, same shape as the
+        // actor one above. Rows written before it existed default to `unknown`,
+        // which is the honest reading -- they are not attributable to any one
+        // environment and must not be counted into one.
+        sqlx::query(
+            "ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'unknown'",
+        )
+        .execute(&self.pool)
+        .await?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_gateway_llm_usage_ts ON gateway_llm_usage (ts)",
         )
@@ -254,6 +345,7 @@ impl LlmUsageStore {
                 window_start   TIMESTAMPTZ NOT NULL,
                 window_end     TIMESTAMPTZ NOT NULL,
                 actor          TEXT NOT NULL,
+                origin         TEXT NOT NULL,
                 upstream       TEXT NOT NULL,
                 api_style      TEXT NOT NULL,
                 calls          BIGINT NOT NULL DEFAULT 0,
@@ -263,8 +355,44 @@ impl LlmUsageStore {
                 tokens_cached  BIGINT NOT NULL DEFAULT 0,
                 avg_latency_ms BIGINT NOT NULL DEFAULT 0,
                 first_rolled_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (window_start, window_end, actor, upstream, api_style)
+                PRIMARY KEY (window_start, window_end, actor, origin, upstream, api_style)
             )
+            "#
+        ))
+        .execute(&self.pool)
+        .await?;
+        // The environment dimension reaches the fold as well as the ledger: a
+        // fold that dropped an axis the ledger carries would lose it, and the
+        // question this axis exists for is read again and again -- which is what
+        // the fold is for. Both steps are guarded, so a table already carrying
+        // the column and key is left alone. The new column goes **last** in the
+        // key: every row written before it existed carries the same default, so
+        // the enlarged key is still unique and the swap is safe in place, with
+        // no rebuild -- which matters because a first fold is bounded by the
+        // lookback and could not re-create history older than it.
+        sqlx::query(&format!(
+            r#"
+            DO $mig$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = '{ROLLUP_TABLE}' AND column_name = 'origin'
+                ) THEN
+                    ALTER TABLE {ROLLUP_TABLE}
+                        ADD COLUMN origin TEXT NOT NULL DEFAULT 'unknown';
+                END IF;
+                IF EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conrelid = '{ROLLUP_TABLE}'::regclass AND contype = 'p'
+                      AND pg_get_constraintdef(oid) NOT LIKE '%origin%'
+                ) THEN
+                    ALTER TABLE {ROLLUP_TABLE} DROP CONSTRAINT {ROLLUP_TABLE}_pkey;
+                    ALTER TABLE {ROLLUP_TABLE}
+                        ADD PRIMARY KEY
+                            (window_start, window_end, actor, origin, upstream, api_style);
+                END IF;
+            END
+            $mig$;
             "#
         ))
         .execute(&self.pool)
@@ -276,9 +404,9 @@ impl LlmUsageStore {
         sqlx::query(
             r#"
             INSERT INTO gateway_llm_usage
-                (id, upstream, api_style, model, result, actor,
+                (id, upstream, api_style, model, result, actor, origin,
                  tokens_input, tokens_output, tokens_cached, latency_ms)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             "#,
         )
         .bind(uuid::Uuid::new_v4())
@@ -287,6 +415,7 @@ impl LlmUsageStore {
         .bind(&r.model)
         .bind(&r.result)
         .bind(&r.actor)
+        .bind(&r.origin)
         .bind(r.tokens_input as i64)
         .bind(r.tokens_output as i64)
         .bind(r.tokens_cached as i64)
@@ -296,7 +425,7 @@ impl LlmUsageStore {
         Ok(())
     }
 
-    /// The window's token composition, grouped by `(actor, upstream,
+    /// The window's token composition, grouped by `(actor, origin, upstream,
     /// api_style)`.
     ///
     /// This is the reader A1 promises: a spend question is answered from the
@@ -313,7 +442,7 @@ impl LlmUsageStore {
     ) -> anyhow::Result<Vec<ActorSpend>> {
         let rows = sqlx::query(&format!(
             r#"
-            SELECT actor, upstream, api_style,
+            SELECT actor, origin, upstream, api_style,
                    COUNT(*) AS calls,
                    COUNT(*) FILTER (WHERE result <> 'ok') AS failed_calls,
                    COALESCE(SUM(tokens_input), 0)::BIGINT  AS tokens_input,
@@ -322,8 +451,8 @@ impl LlmUsageStore {
                    COALESCE(AVG(latency_ms), 0)::BIGINT    AS avg_latency_ms
             FROM {LEDGER_TABLE}
             WHERE ts >= $1 AND ts < $2
-            GROUP BY actor, upstream, api_style
-            ORDER BY actor, upstream, api_style
+            GROUP BY actor, origin, upstream, api_style
+            ORDER BY actor, origin, upstream, api_style
             "#
         ))
         .bind(since)
@@ -334,6 +463,7 @@ impl LlmUsageStore {
             .iter()
             .map(|r| ActorSpend {
                 actor: r.get("actor"),
+                origin: r.get("origin"),
                 upstream: r.get("upstream"),
                 api_style: r.get("api_style"),
                 calls: r.get("calls"),
@@ -346,19 +476,20 @@ impl LlmUsageStore {
             .collect())
     }
 
-    /// Every `(actor, upstream, api_style)` the ledger has ever recorded.
+    /// Every `(actor, origin, upstream, api_style)` the ledger has ever recorded.
     ///
     /// This is the set a window is completed against so that "no traffic" still
     /// lands rows instead of vanishing. It is read off the ledger rather than
-    /// declared, because the actor vocabulary is open (`agent:{role}` is a role
-    /// string, not a fixed enum) and any declared list would go stale the moment
-    /// a new role ran. Any combination that has ever fired a call gets a row in
-    /// every later window, zero when idle, which is what makes a dead upstream
-    /// period distinguishable from a period the fold did not run.
-    pub async fn known_combos(&self) -> anyhow::Result<Vec<(String, String, String)>> {
+    /// declared, because the vocabulary is open (`agent:{role}` is a role
+    /// string, and origins are whatever callers declare) and any declared list
+    /// would go stale the moment a new role ran or a new caller appeared. Any
+    /// combination that has ever fired a call gets a row in every later window,
+    /// zero when idle, which is what makes a dead upstream period
+    /// distinguishable from a period the fold did not run.
+    pub async fn known_combos(&self) -> anyhow::Result<Vec<(String, String, String, String)>> {
         let rows = sqlx::query(&format!(
-            "SELECT DISTINCT actor, upstream, api_style FROM {LEDGER_TABLE} \
-             ORDER BY actor, upstream, api_style"
+            "SELECT DISTINCT actor, origin, upstream, api_style FROM {LEDGER_TABLE} \
+             ORDER BY actor, origin, upstream, api_style"
         ))
         .fetch_all(&self.pool)
         .await?;
@@ -367,6 +498,7 @@ impl LlmUsageStore {
             .map(|r| {
                 (
                     r.get::<String, _>("actor"),
+                    r.get::<String, _>("origin"),
                     r.get::<String, _>("upstream"),
                     r.get::<String, _>("api_style"),
                 )
@@ -396,11 +528,11 @@ impl LlmUsageStore {
         let insert = format!(
             r#"
             INSERT INTO {ROLLUP_TABLE}
-                (window_start, window_end, actor, upstream, api_style,
+                (window_start, window_end, actor, origin, upstream, api_style,
                  calls, failed_calls, tokens_input, tokens_output, tokens_cached,
                  avg_latency_ms)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            ON CONFLICT (window_start, window_end, actor, upstream, api_style)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            ON CONFLICT (window_start, window_end, actor, origin, upstream, api_style)
             DO UPDATE SET
                 calls          = EXCLUDED.calls,
                 failed_calls   = EXCLUDED.failed_calls,
@@ -413,12 +545,14 @@ impl LlmUsageStore {
         let mut written = 0u64;
         for w in windows {
             let spend = self.usage_by_actor(w.start, w.end).await?;
-            let mut seen: HashSet<(String, String, String)> = HashSet::with_capacity(spend.len());
+            let mut seen: HashSet<(String, String, String, String)> =
+                HashSet::with_capacity(spend.len());
             for s in &spend {
                 sqlx::query(&insert)
                     .bind(w.start)
                     .bind(w.end)
                     .bind(&s.actor)
+                    .bind(&s.origin)
                     .bind(&s.upstream)
                     .bind(&s.api_style)
                     .bind(s.calls)
@@ -429,17 +563,28 @@ impl LlmUsageStore {
                     .bind(s.avg_latency_ms)
                     .execute(&self.pool)
                     .await?;
-                seen.insert((s.actor.clone(), s.upstream.clone(), s.api_style.clone()));
+                seen.insert((
+                    s.actor.clone(),
+                    s.origin.clone(),
+                    s.upstream.clone(),
+                    s.api_style.clone(),
+                ));
                 written += 1;
             }
-            for (actor, upstream, api_style) in &vocab {
-                if seen.contains(&(actor.clone(), upstream.clone(), api_style.clone())) {
+            for (actor, origin, upstream, api_style) in &vocab {
+                if seen.contains(&(
+                    actor.clone(),
+                    origin.clone(),
+                    upstream.clone(),
+                    api_style.clone(),
+                )) {
                     continue;
                 }
                 sqlx::query(&insert)
                     .bind(w.start)
                     .bind(w.end)
                     .bind(actor)
+                    .bind(origin)
                     .bind(upstream)
                     .bind(api_style)
                     .bind(0i64)
@@ -468,7 +613,7 @@ impl LlmUsageStore {
         Ok(row.and_then(|r| r.get::<Option<DateTime<Utc>>, _>("last")))
     }
 
-    /// Token spend per `(actor, upstream, api_style)` over the closed windows
+    /// Token spend per `(actor, origin, upstream, api_style)` over the closed windows
     /// inside `[since, until)`, summed across them, together with the endpoints
     /// of the range those windows cover.
     ///
@@ -516,7 +661,7 @@ impl LlmUsageStore {
             });
         };
         let rows = sqlx::query(&format!(
-            "SELECT actor, upstream, api_style, \
+            "SELECT actor, origin, upstream, api_style, \
                     SUM(calls)::BIGINT AS calls, \
                     SUM(failed_calls)::BIGINT AS failed_calls, \
                     SUM(tokens_input)::BIGINT AS tokens_input, \
@@ -527,9 +672,9 @@ impl LlmUsageStore {
                          ELSE 0::BIGINT END AS avg_latency_ms \
              FROM {ROLLUP_TABLE} \
              WHERE window_start >= $1 AND window_end <= $2 \
-             GROUP BY actor, upstream, api_style \
+             GROUP BY actor, origin, upstream, api_style \
              ORDER BY (SUM(tokens_input) + SUM(tokens_output)) DESC, \
-                      actor, upstream, api_style"
+                      actor, origin, upstream, api_style"
         ))
         .bind(covered_since)
         .bind(covered_until)
@@ -539,6 +684,7 @@ impl LlmUsageStore {
             .iter()
             .map(|r| ActorSpend {
                 actor: r.get::<String, _>("actor"),
+                origin: r.get::<String, _>("origin"),
                 upstream: r.get::<String, _>("upstream"),
                 api_style: r.get::<String, _>("api_style"),
                 calls: r.get::<i64, _>("calls"),
@@ -592,6 +738,7 @@ impl cog_core::LlmUsageReader for RolledUsageReader {
                 .into_iter()
                 .map(|s| cog_core::ActorUsage {
                     actor: s.actor,
+                    origin: s.origin,
                     upstream: s.upstream,
                     api_style: s.api_style,
                     calls: s.calls,
@@ -603,5 +750,51 @@ impl cog_core::LlmUsageReader for RolledUsageReader {
                 })
                 .collect(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The four declared origins are the whole closed set, and `unknown` is not
+    /// one of them: it reads as "this environment cannot be named", which must
+    /// not be counted into any environment's total.
+    #[test]
+    fn the_declared_set_is_the_four_and_unknown_is_outside_it() {
+        let declared: Vec<&str> = LlmOrigin::DECLARED.iter().map(|o| o.as_str()).collect();
+        assert_eq!(
+            declared,
+            vec!["gateway_pool", "resident_worker", "interactive", "sandbox"]
+        );
+        assert!(!declared.contains(&LlmOrigin::Unknown.as_str()));
+    }
+
+    /// A caller that declares one of the four is read as it declared; anything
+    /// else reads as `unknown` rather than being stored as free text, so a
+    /// reader that groups by origin never sees a misspelling as its own series.
+    #[test]
+    fn only_a_declared_name_reads_as_itself() {
+        assert_eq!(
+            LlmOrigin::declared(Some("gateway_pool")),
+            LlmOrigin::GatewayPool
+        );
+        assert_eq!(
+            LlmOrigin::declared(Some("resident_worker")),
+            LlmOrigin::ResidentWorker
+        );
+        assert_eq!(
+            LlmOrigin::declared(Some("interactive")),
+            LlmOrigin::Interactive
+        );
+        assert_eq!(LlmOrigin::declared(Some("sandbox")), LlmOrigin::Sandbox);
+        // Whitespace is the one repair: a trimmed name still names an origin.
+        assert_eq!(LlmOrigin::declared(Some("  sandbox ")), LlmOrigin::Sandbox);
+        // Everything else -- absent, empty, case-wrong, or unknown -- is
+        // `unknown`, and never a value outside the closed set.
+        assert_eq!(LlmOrigin::declared(None), LlmOrigin::Unknown);
+        assert_eq!(LlmOrigin::declared(Some("")), LlmOrigin::Unknown);
+        assert_eq!(LlmOrigin::declared(Some("Sandbox")), LlmOrigin::Unknown);
+        assert_eq!(LlmOrigin::declared(Some("host")), LlmOrigin::Unknown);
     }
 }
