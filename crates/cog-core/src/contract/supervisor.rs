@@ -367,8 +367,14 @@ pub enum LoopSeverity {
 }
 
 /// Events emitted by the Supervisor on its broadcast channel.
-/// Other parts of the platform (Web UI, alerting, audit log) subscribe
-/// to these to react to cluster health changes.
+///
+/// What reads this channel today is the alert store and the observability event
+/// bridge, and between them they match a subset of the variants below. A variant
+/// neither of them matches is sent and read by nobody — and whether that is a
+/// gap or a deliberate exemption is decided one variant at a time, so each such
+/// variant carries its own note at its declaration. A list of subscribers
+/// written up here goes stale the moment one is added, and reads the same
+/// whether it is still true or not.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)]
@@ -393,21 +399,30 @@ pub enum SupervisorEvent {
         timestamp: DateTime<Utc>,
     },
 
-    /// An Agent was killed via gRPC command.
+    /// An Agent was killed by an operator command.
+    ///
+    /// A record of something a person did, not a condition that wants an
+    /// acknowledgement, so neither alert reader maps it: in the alert store it
+    /// would sit active forever at Info severity, and the other bridge is for
+    /// outbound alerts a human should be interrupted by. The audit stream it is
+    /// meant for does not exist yet, so until one does this is a named
+    /// exemption to "a landing needs a reader" rather than an unnoticed gap.
     AgentKilled {
         agent_id: String,
         reason: String,
         timestamp: DateTime<Utc>,
     },
 
-    /// An Agent was restarted via gRPC command.
+    /// An Agent was restarted by an operator command. See [`AgentKilled`] for
+    /// why no alert reader maps this one.
     AgentRestarted {
         agent_id: String,
         preserve_context: bool,
         timestamp: DateTime<Utc>,
     },
 
-    /// A checkpoint was requested for an Agent via gRPC command.
+    /// A checkpoint was requested for an Agent by an operator command. See
+    /// [`AgentKilled`] for why no alert reader maps this one.
     CheckpointRequested {
         agent_id: String,
         task_id: String,
