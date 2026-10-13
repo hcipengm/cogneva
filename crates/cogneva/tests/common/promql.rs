@@ -177,6 +177,66 @@ pub fn metric_names_in(expr: &str) -> BTreeSet<String> {
     names
 }
 
+/// The label sets each aggregation's `by (...)` clause keeps, in expression
+/// order.
+///
+/// `without (...)` names what an aggregation *drops*, so the set it keeps is
+/// everything else and cannot be read off the text — a rule whose only clause is
+/// `without` yields nothing here, and a caller owes it as unjudged rather than
+/// treating an empty result as "keeps nothing".
+///
+/// Quoted spans and `{...}` matchers are blanked first, so a label value or a
+/// selector cannot be read as a clause.
+#[allow(dead_code)]
+pub fn kept_labels_by_clause(expr: &str) -> Vec<BTreeSet<String>> {
+    let s = strip_braces(&strip_quoted(expr));
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let is_by = bytes[i] == b'b'
+            && bytes.get(i + 1) == Some(&b'y')
+            && (i == 0 || !token_char(bytes[i - 1]))
+            && (i + 2 == bytes.len() || !token_char(bytes[i + 2]));
+        if is_by {
+            let after = i + 2;
+            let trimmed = s[after..].trim_start();
+            if trimmed.starts_with('(') {
+                let open = after + (s[after..].len() - trimmed.len());
+                let mut depth = 0usize;
+                let mut close = None;
+                let mut j = open;
+                while j < bytes.len() {
+                    match bytes[j] {
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                close = Some(j);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if let Some(close) = close {
+                    let set: BTreeSet<String> = s[open + 1..close]
+                        .split(',')
+                        .map(|part| part.trim().to_string())
+                        .filter(|part| !part.is_empty())
+                        .collect();
+                    out.push(set);
+                    i = close + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Binary operators. Two operands cannot stand side by side without one of
 /// these between them, and neither can a matching clause be put there instead.
 const BINARY_OPERATORS: &[&str] = &[

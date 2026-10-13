@@ -30,9 +30,9 @@ mod promql;
 
 use producer::carries_the_producer;
 use promql::{
-    bare_observation_reads, companion_age_bound, lagged_equality_complaints, metric_names_in,
-    shape_complaints, uncovered_window_complaints, unguarded_store_reading_complaints,
-    windows_over,
+    bare_observation_reads, companion_age_bound, kept_labels_by_clause, lagged_equality_complaints,
+    metric_names_in, shape_complaints, uncovered_window_complaints,
+    unguarded_store_reading_complaints, windows_over,
 };
 
 const CHART_CONFIG: &str = "deploy/helm/cogneva/files/cogneva.json";
@@ -987,6 +987,92 @@ fn a_rule_that_promises_a_duration_reads_a_window_not_two_samples() {
         "告警规则用一个采样点和它 offset 之后的自己判「持续」，周期性的产出方会让它在健康系统上反复触发:\n{}",
         complaints.join("\n")
     );
+}
+
+/// The placeholder names a summary interpolates as `{name}`. A span whose inner
+/// text is not a bare identifier is not a placeholder and is left alone.
+fn summary_placeholders(summary: &str) -> Vec<String> {
+    let bytes = summary.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            if let Some(rel) = summary[i + 1..].find('}') {
+                let close = i + 1 + rel;
+                let inner = summary[i + 1..close].trim();
+                if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    out.push(inner.to_string());
+                }
+                i = close + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// A summary that names a label reads a rule whose expression keeps that label.
+///
+/// `{name}` in a summary is filled from the label's value on the firing series,
+/// so a placeholder the expression does not keep renders empty on the alert it
+/// was written to carry. The two halves drift the way the series names do:
+/// editing an aggregation's `by (...)` says nothing to the summary that reads
+/// it, and the alert keeps firing while the label it names goes blank. `{value}`
+/// is reserved for the sample value and is always available.
+///
+/// Only rules with an explicit `by (...)` are judged. `without (...)` names the
+/// labels an aggregation *drops*, so the set it keeps is everything its inputs
+/// carry and is not readable from the text; a bare aggregation drops them all.
+/// Those rules are unjudged, counted, and reported — counting them as passing
+/// would be an all-green over a denominator that shrank.
+#[test]
+fn a_summary_names_only_labels_its_expression_keeps() {
+    let rules = chart_json()["observability"]["infra_watch"]["rules"]
+        .as_array()
+        .expect("observability.infra_watch.rules is not an array")
+        .clone();
+
+    let mut complaints: Vec<String> = Vec::new();
+    let mut judged = 0usize;
+    let mut unjudged = 0usize;
+    for rule in &rules {
+        let name = rule["name"].as_str().unwrap_or_default();
+        let expression = rule["promql"].as_str().unwrap_or_default();
+        let summary = rule["summary"].as_str().unwrap_or_default();
+
+        let clauses = kept_labels_by_clause(expression);
+        if clauses.is_empty() {
+            unjudged += 1;
+            continue;
+        }
+        judged += 1;
+
+        let kept: BTreeSet<&str> = clauses.iter().flatten().map(String::as_str).collect();
+        for placeholder in summary_placeholders(summary) {
+            if placeholder == "value" || kept.contains(placeholder.as_str()) {
+                continue;
+            }
+            complaints.push(format!(
+                "{name}: summary 点了 {{{placeholder}}}，而表达式保留的是 {kept:?}\n    {expression}"
+            ));
+        }
+    }
+
+    // 分母：只带 by(...) 的规则有保留集可静态读；without(...) 与裸聚合的规则记为未判。
+    // 分母塌了（判过的规则太少）这条判据就形同虚设，所以先断言它还在。
+    assert!(
+        judged >= 55,
+        "带 by(...) 的告警规则只剩 {judged} 条（未判 {unjudged} 条），读 summary 标签的判据已形同虚设：这条判据的分母是它"
+    );
+    assert!(
+        complaints.is_empty(),
+        "告警规则的 summary 点了一个它表达式不保留的标签，报警里那一格会是空的:\n{}",
+        complaints.join("\n")
+    );
+    // 未判的规则数是分母的另一半：静态算不出保留集，只报数，不当通过。
+    println!("summary 标签判据：判过 {judged} 条，未判 {unjudged} 条（无 by(...) 子句）");
 }
 
 /// The rule that says a role is unowned has to wait out the handover the lease
