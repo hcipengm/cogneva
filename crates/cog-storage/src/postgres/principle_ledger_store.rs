@@ -16,9 +16,9 @@ use async_trait::async_trait;
 use sqlx::{PgPool, Row};
 
 use cog_core::{
-    PrincipleCensus, PrincipleCheckKind, PrincipleCheckKindCensus, PrincipleDrift, PrincipleFold,
-    PrincipleLedgerStore, PrincipleMeasurement, PrincipleReading, PrincipleRefusal, PrincipleRow,
-    PrincipleState, SFError, SFResult,
+    PrincipleCensus, PrincipleCheckKind, PrincipleCheckKindCensus, PrincipleDebtReading,
+    PrincipleDrift, PrincipleFold, PrincipleLedgerStore, PrincipleMeasurement, PrincipleReading,
+    PrincipleRefusal, PrincipleRow, PrincipleState, SFError, SFResult,
 };
 
 /// Every read returns these, in one place so no two readers can come back with
@@ -36,6 +36,8 @@ const ROW_COLUMNS: &str = "slug, lead, carrier_path, carrier_sha256, host_gate, 
 const SLUG_MAX: usize = 191;
 const SOURCE_MAX: usize = 512;
 const REFUSAL_SOURCE_MAX: usize = 256;
+const BOUND_SOURCE_MAX: usize = 64;
+const REV_MAX: usize = 64;
 const SHA256_MAX: usize = 64;
 
 /// PostgreSQL principle ledger store.
@@ -511,6 +513,24 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
             .map_err(|e| SFError::Database(e.to_string()))?;
         Ok(count.max(0) as u64)
     }
+
+    async fn record_debt_reading(&self, reading: &PrincipleDebtReading) -> SFResult<()> {
+        check_debt_reading(reading).map_err(SFError::Database)?;
+        sqlx::query(RECORD_DEBT_SQL)
+            .bind(&reading.by_kind)
+            .bind(debt_count("submitted", reading.submitted)?)
+            .bind(debt_count("already", reading.already)?)
+            .bind(debt_count("failed", reading.failed)?)
+            .bind(debt_count("over_bound", reading.over_bound)?)
+            .bind(debt_count("bound", reading.bound)?)
+            .bind(&reading.bound_source)
+            .bind(reading.rev.as_deref())
+            .bind(reading.delta)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("record a debt reading: {e}")))?;
+        Ok(())
+    }
 }
 
 /// Write one reading: the identity, the sentence, the carrier and its hash, and
@@ -686,6 +706,22 @@ WHERE folded_at IS NULL AND slug = $1 AND refused_at = $2 AND source = $3";
 const PENDING_REFUSALS_SQL: &str = "\
 SELECT count(*) AS n FROM principle_refusals WHERE folded_at IS NULL";
 
+/// Append one pass of the debt dispatcher.
+///
+/// An insert with no conflict clause, and that is deliberate: the row has no
+/// natural key, because the identity of a reading is its position in the series
+/// rather than any of its values. A pass that measured the same numbers as the
+/// one before it is a second observation of the same state, not the same
+/// observation twice -- an upsert keyed on the values would collapse the two and
+/// the series would lose the very stretches a reader is looking for.
+///
+/// `observed_at` comes from the column default rather than a bound parameter, so
+/// the time is the store's on both dialects and a caller has no way to name it.
+const RECORD_DEBT_SQL: &str = "\
+INSERT INTO principle_debt \
+    (by_kind, submitted, already, failed, over_bound, bound, bound_source, rev, delta) \
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)";
+
 /// Refuse a reading whose keys do not fit their columns.
 ///
 /// Checked here rather than left to the database because the dialects disagree
@@ -738,6 +774,41 @@ fn check_reading(reading: &PrincipleReading) -> Result<(), String> {
 /// count is what a reader takes as how often a principle was broken, so a count
 /// of zero or less is refused rather than stored as a value that adds nothing
 /// and looks like a data point.
+/// A pass's count, as the column holds it.
+///
+/// Checked rather than cast: a count too large for the column would wrap
+/// negative under a cast and store a reading that says the pass submitted a
+/// negative number of rows, which a reader comparing two rows would take for a
+/// fall. The value is a row count of a tree's debt files, so the bound is
+/// unreachable in practice -- which is the reason to refuse it loudly instead of
+/// writing a number nothing would ever look at.
+fn debt_count(what: &str, value: u64) -> SFResult<i64> {
+    i64::try_from(value)
+        .map_err(|_| SFError::Database(format!("{what} is {value}, over what the column holds")))
+}
+
+/// A debt reading is checked before it is written, for the same reason a reading
+/// and a refusal are.
+///
+/// `bound_source` is the one width-checked field, and it is checked because the
+/// column exists to tell a bound discovered from the host apart from the
+/// built-in fallback: MySQL would shorten an over-long source rather than refuse
+/// it, and a shortened one names a different origin than the reading found.
+///
+/// `by_kind` may not be empty. A pass always knows at least the kinds it looked
+/// for, so a blank rendering is a reading that was never taken, not a pass that
+/// found nothing -- and a stored blank would read as the latter.
+fn check_debt_reading(reading: &PrincipleDebtReading) -> Result<(), String> {
+    check_fits("bound source", &reading.bound_source, BOUND_SOURCE_MAX)?;
+    if let Some(rev) = &reading.rev {
+        check_fits("revision", rev, REV_MAX)?;
+    }
+    if reading.by_kind.is_empty() {
+        return Err("a debt reading carries no kinds, which is no reading".to_string());
+    }
+    Ok(())
+}
+
 fn check_refusal(event: &PrincipleRefusal) -> Result<(), String> {
     check_fits("slug", &event.slug, SLUG_MAX)?;
     check_fits("source", &event.source, REFUSAL_SOURCE_MAX)?;
