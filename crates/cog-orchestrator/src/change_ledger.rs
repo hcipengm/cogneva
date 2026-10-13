@@ -307,12 +307,20 @@ pub fn spawn_change_ledger_loop(
                     if !hold.may_act().await {
                         continue;
                     }
-                    read_pass(&*store).await;
+                    // The revision the pass folds and measures against, resolved
+                    // once here so a row's entry revision is the pass's and not a
+                    // second resolution's. A tree that cannot be opened leaves it
+                    // `None`: the fold still happens -- declarations must enter
+                    // the account whether or not the tree can be read -- and a row
+                    // that enters then records no revision rather than a guessed
+                    // one.
+                    let first_seen_rev = tree.rev().await.ok();
+                    read_pass(&*store, first_seen_rev.as_deref()).await;
                     // The tree's own registries are the second intake, and they
                     // go in after the fold and before the measurement for the
                     // reason [`registry_pass`] gives: a row read this pass is
                     // judged by this pass.
-                    registry_pass(&tree, &*store).await;
+                    registry_pass(&tree, first_seen_rev.as_deref(), &*store).await;
                     measure_pass(&*store, &tree, &mut unsettled).await;
                     // Handing over comes last, and that order is the point: the
                     // set dispatched is then the set as of this pass, so a change
@@ -335,8 +343,8 @@ pub fn spawn_change_ledger_loop(
 /// A failed read is neither raised nor retried here: in a periodic loop the next
 /// round is the retry, and repeated failure is never silent -- every round
 /// leaves a warning.
-async fn read_pass(store: &dyn ChangeLedgerStore) {
-    fold_pass(store).await;
+async fn read_pass(store: &dyn ChangeLedgerStore, first_seen_rev: Option<&str>) {
+    fold_pass(store, first_seen_rev).await;
 
     match store.outstanding(OUTSTANDING_PEEK).await {
         Ok(rows) if rows.is_empty() => {
@@ -359,8 +367,8 @@ async fn read_pass(store: &dyn ChangeLedgerStore) {
 /// across passes is the one reading that says the account has not caught up with
 /// what it was told. Neither the fold's failure nor the count's is raised or
 /// retried -- the next pass is the retry, and every pass leaves a line.
-async fn fold_pass(store: &dyn ChangeLedgerStore) {
-    match store.fold_declarations(DECLARATIONS_PER_PASS).await {
+async fn fold_pass(store: &dyn ChangeLedgerStore, first_seen_rev: Option<&str>) {
+    match store.fold_declarations(DECLARATIONS_PER_PASS, first_seen_rev).await {
         Ok(0) => {}
         Ok(folded) => info!(
             folded,
@@ -399,7 +407,11 @@ async fn fold_pass(store: &dyn ChangeLedgerStore) {
 /// could not be read is not recorded as an empty one -- the account keeps the
 /// rows it already holds and the warning says this pass contributed none, so "no
 /// debt" and "no registry read" stay apart.
-async fn registry_pass(tree: &CheckTree, store: &dyn ChangeLedgerStore) {
+async fn registry_pass(
+    tree: &CheckTree,
+    first_seen_rev: Option<&str>,
+    store: &dyn ChangeLedgerStore,
+) {
     let readings = match registry_readings(tree).await {
         Ok(readings) => readings,
         Err(why) => {
@@ -411,7 +423,7 @@ async fn registry_pass(tree: &CheckTree, store: &dyn ChangeLedgerStore) {
             return;
         }
     };
-    match store.record_readings(&readings).await {
+    match store.record_readings(&readings, first_seen_rev).await {
         Ok(_) => info!(
             readings = readings.len(),
             "change ledger: read the tree's own debt registries into the account"

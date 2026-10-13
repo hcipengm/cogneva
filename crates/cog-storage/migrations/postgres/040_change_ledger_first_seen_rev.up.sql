@@ -1,0 +1,28 @@
+-- Migration: 040_change_ledger_first_seen_rev
+-- The tree revision the account was reading when a row first entered it, kept
+-- beside the row.
+--
+-- `first_seen_at` records *when* a row entered the account but not *which*
+-- revision of the tree the account was at then. So a row that entered already
+-- true -- a document that described the tree's current state rather than a change
+-- still to make -- and a row the tree gained later are, after the fact, told
+-- apart only by timing: `landed_at - first_seen_at` under a period is a proxy for
+-- "the tree already held this", not the fact, and it carries the whole window's
+-- confound (the tree can move between entry and the first look).
+--
+-- This column makes the fact storable: the revision in hand the pass that folded
+-- the row. Whether the row was already true entering is then a function of this
+-- column alone -- ask the row's predicate at `first_seen_rev^`, the revision
+-- before it entered, which is exactly the question "was this true before the
+-- account was told about it". The verdict is not stored: it is derived from this
+-- revision, and a second stored copy would be a second source of truth that can
+-- disagree with it.
+--
+-- Written once, on entry, and never moved -- `first_seen_at`'s rule. `ON
+-- CONFLICT` does not overwrite it, so a later reading of the same document, or a
+-- later measurement, leaves the revision the row entered at where it is. NULL
+-- means the account could not resolve a revision the pass it folded the row, and
+-- that is kept rather than filled: an entry whose revision is unknown is not an
+-- entry at a revision the account guessed.
+ALTER TABLE change_ledger
+    ADD COLUMN IF NOT EXISTS first_seen_rev VARCHAR(64);

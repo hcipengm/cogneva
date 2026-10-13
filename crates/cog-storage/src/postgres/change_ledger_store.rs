@@ -170,9 +170,14 @@ impl PostgresChangeLedgerStore {
 /// document's reading and reading it again, which is what keeps "which document
 /// said what" a statement about one reading of one document rather than a
 /// merge of two.
+///
+/// `first_seen_rev` is written only on the row's first entry and never refreshed:
+/// the conflict clause leaves it alone, so a second document citing an existing
+/// change does not move the revision that change entered at. It is the tree the
+/// row entered at, not the tree this reading was made against.
 const RECORD_READING_SQL: &str = "\
-INSERT INTO change_ledger (kind, scope, literal, state, title, assertion, sources)
-VALUES ($1, $2, $3, 'undecided', $4, $5, jsonb_build_array(jsonb_build_object('doc', $6, 'verdict', $7)))
+INSERT INTO change_ledger (kind, scope, literal, state, title, assertion, sources, first_seen_rev)
+VALUES ($1, $2, $3, 'undecided', $4, $5, jsonb_build_array(jsonb_build_object('doc', $6, 'verdict', $7)), $8)
 ON CONFLICT (kind, scope, literal) DO UPDATE SET
     title = COALESCE(EXCLUDED.title, change_ledger.title),
     assertion = COALESCE(EXCLUDED.assertion, change_ledger.assertion),
@@ -208,13 +213,24 @@ ON CONFLICT (kind, scope, literal) DO UPDATE SET
 /// measurement that named no revision must clear whatever revision was there
 /// rather than leave a stale one beside a fresh state, which would read as a
 /// state measured against a tree it was never measured against.
+///
+/// `first_seen_rev` is the one revision this statement does *not* overwrite: it
+/// is the tree the row entered at, stamped once and left, the same rule
+/// `first_seen_at` follows. Only a measurement that *creates* the row sets it --
+/// such a row entered by being measured, so its entry revision is this
+/// measurement's. A row that already existed, whether folded in from a reading or
+/// measured before, keeps the revision it entered at, which is why the conflict
+/// clause leaves the column alone.
 const APPLY_MEASUREMENT_SQL: &str = "\
 INSERT INTO change_ledger (
     kind, scope, literal, state, measured_rev, retire_reason, unsettled_reason,
+    first_seen_rev,
     measured_at, landed_at, retired_at
 )
 VALUES (
-    $1, $2, $3, $4, $5, $6, $7, now(),
+    $1, $2, $3, $4, $5, $6, $7,
+    $5,
+    now(),
     CASE WHEN $4 = 'landed' THEN now() ELSE NULL END,
     CASE WHEN $4 = 'retired' THEN now() ELSE NULL END
 )
@@ -356,7 +372,11 @@ const PENDING_SQL: &str =
 
 #[async_trait]
 impl ChangeLedgerStore for PostgresChangeLedgerStore {
-    async fn record_readings(&self, readings: &[ChangeReading]) -> SFResult<usize> {
+    async fn record_readings(
+        &self,
+        readings: &[ChangeReading],
+        first_seen_rev: Option<&str>,
+    ) -> SFResult<usize> {
         let mut stored = 0usize;
         for reading in readings {
             check_reading(reading).map_err(SFError::Validation)?;
@@ -368,6 +388,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
                 .bind(&reading.assertion)
                 .bind(&reading.source.doc)
                 .bind(&reading.source.verdict)
+                .bind(first_seen_rev)
                 .execute(&self.pool)
                 .await
                 .map_err(|e| {
@@ -406,7 +427,11 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         Ok(queued)
     }
 
-    async fn fold_declarations(&self, limit: usize) -> SFResult<usize> {
+    async fn fold_declarations(
+        &self,
+        limit: usize,
+        first_seen_rev: Option<&str>,
+    ) -> SFResult<usize> {
         let rows = sqlx::query(FOLD_SELECT_SQL)
             .bind(limit as i64)
             .fetch_all(&self.pool)
@@ -424,7 +449,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // leaves the declarations unfolded and repeats this work on the next
         // pass, which the reading path absorbs as an idempotent upsert; the
         // other order would drop the change instead, and nothing would say so.
-        self.record_readings(&readings).await?;
+        self.record_readings(&readings, first_seen_rev).await?;
 
         let mut folded = 0usize;
         for reading in &readings {

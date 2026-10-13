@@ -377,16 +377,14 @@ impl CheckTree {
     /// The commit this pass reads, or why the repository cannot answer for the
     /// reference at all.
     ///
-    /// Asked once per pass, and its failure is the whole pass's: a check cannot
-    /// answer for a tree nobody could open, and the caller names that once rather
-    /// than once per row. Resolving the revision is a separate step from asking
-    /// about a path on purpose: `ls-tree` and `grep` report "no such revision"
-    /// and "no such path" the same way, so a revision that could not be resolved
-    /// would otherwise be read as every change being unlanded.
-    pub async fn snapshot(&self) -> Result<Snapshot, String> {
-        let rev = format!("{}^{{commit}}", self.reference);
+    /// Resolving the revision is a separate step from asking about a path on
+    /// purpose: `ls-tree` and `grep` report "no such revision" and "no such path"
+    /// the same way, so a revision that could not be resolved would otherwise be
+    /// read as every change being unlanded.
+    pub async fn rev(&self) -> Result<String, String> {
+        let spec = format!("{}^{{commit}}", self.reference);
         let out = self
-            .git(&["rev-parse", "--verify", rev.as_str()])
+            .git(&["rev-parse", "--verify", spec.as_str()])
             .await
             .map_err(|e| {
                 format!(
@@ -395,7 +393,16 @@ impl CheckTree {
                     self.reference
                 )
             })?;
-        let rev = out.trim().to_string();
+        Ok(out.trim().to_string())
+    }
+
+    /// The commit this pass reads together with the shape of its root.
+    ///
+    /// Asked once per pass, and its failure is the whole pass's: a check cannot
+    /// answer for a tree nobody could open, and the caller names that once rather
+    /// than once per row.
+    pub async fn snapshot(&self) -> Result<Snapshot, String> {
+        let rev = self.rev().await?;
         let listing = self
             .git(&["ls-tree", "--name-only", rev.as_str()])
             .await

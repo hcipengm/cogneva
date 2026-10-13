@@ -403,7 +403,19 @@ pub trait ChangeLedgerStore: Send + Sync {
     /// outlives any one reading of the corpus, and a reading that omitted a row
     /// because its document was dropped from the corpus is not a statement that
     /// the change is gone.
-    async fn record_readings(&self, readings: &[ChangeReading]) -> SFResult<usize>;
+    ///
+    /// `first_seen_rev` is the tree revision in hand the pass folds the reading,
+    /// stamped onto a row the first time it enters and never moved, the same rule
+    /// `first_seen_at` follows. It is not a verdict -- it says which tree the
+    /// account was reading, not what the tree said -- so it does not violate the
+    /// line this method draws between a reading and a measurement. `None` when the
+    /// pass could not resolve a revision, which is kept rather than filled: a row
+    /// that entered while the tree was unreadable has no entry revision.
+    async fn record_readings(
+        &self,
+        readings: &[ChangeReading],
+        first_seen_rev: Option<&str>,
+    ) -> SFResult<usize>;
 
     /// Queue a reading to be folded into the account: what a document asks for,
     /// waiting for the ledger's own writer to pick it up.
@@ -436,7 +448,8 @@ pub trait ChangeLedgerStore: Send + Sync {
     ///
     /// The fold is the ledger's only way in, and it adds nothing of its own:
     /// every declaration becomes exactly one [`Self::record_readings`] call, so
-    /// a state still comes only from a measurement.
+    /// a state still comes only from a measurement. `first_seen_rev` is carried
+    /// through to that call as the revision the folded rows entered at.
     ///
     /// Declarations are marked folded *after* their reading is written. A fold
     /// interrupted in between leaves them unfolded and the next pass repeats the
@@ -444,7 +457,11 @@ pub trait ChangeLedgerStore: Send + Sync {
     /// upsert. Marking first would instead drop the reading, and a change that
     /// was declared but never entered the account is the failure the intake
     /// exists to make impossible.
-    async fn fold_declarations(&self, limit: usize) -> SFResult<usize>;
+    async fn fold_declarations(
+        &self,
+        limit: usize,
+        first_seen_rev: Option<&str>,
+    ) -> SFResult<usize>;
 
     /// How many declarations are queued and not yet folded: the intake's backlog.
     ///

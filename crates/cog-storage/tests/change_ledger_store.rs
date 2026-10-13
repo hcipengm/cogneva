@@ -2,11 +2,13 @@
 //!
 //! What these tests check is what the database decides: that the reason a row is
 //! `undecided` reaches its own column and reads back, that a later measurement of
-//! another state clears it the way `landed` clears `landed_at`, and that a reason
-//! outside the closed set is refused rather than stored. None of it can be checked
+//! another state clears it the way `landed` clears `landed_at`, that a reason
+//! outside the closed set is refused rather than stored, and that the revision a
+//! row entered at is written once and never moved. None of it can be checked
 //! without a server -- the coupling between the reason and the state lives in the
-//! statement and in a CHECK the server enforces, and "a reason outside the set is
-//! refused" is a fact about an ENUM or a CHECK, not about our code.
+//! statement and in a CHECK the server enforces, "a reason outside the set is
+//! refused" is a fact about an ENUM or a CHECK, and the set-once rule of the entry
+//! revision is a fact about which branch of an `ON CONFLICT` writes a column.
 //!
 //! It is ignored by default and needs `COGNEVA_TEST_DATABASE_URL` pointing at a
 //! throwaway database:
@@ -24,7 +26,7 @@
 use sqlx::PgPool;
 
 use cog_core::{
-    ChangeIdentity, ChangeLedgerStore, ChangeMeasurement, ChangeState,
+    ChangeIdentity, ChangeLedgerStore, ChangeMeasurement, ChangeReading, ChangeSource, ChangeState,
 };
 use cog_storage::PostgresChangeLedgerStore;
 
@@ -161,6 +163,94 @@ async fn a_plain_row_carries_no_reason_and_a_reason_outside_the_set_is_refused()
     );
 
     cleanup(&pool, &marker).await;
+}
+
+/// A row's entry revision is written once and never moved: not by a second
+/// document citing the same change, and not by a measurement.
+///
+/// The set-once rule is the whole point of the column -- it records which tree
+/// the account was reading when the row entered, so anything that moves it later
+/// turns "the tree it entered at" into "some tree it was touched by".
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn the_entry_revision_is_written_once_and_never_moved() {
+    let (store, pool, marker) = store().await;
+    let id = identity(&marker, "entered");
+    let reading = |doc: &str| ChangeReading {
+        identity: id.clone(),
+        title: None,
+        assertion: None,
+        source: ChangeSource {
+            doc: doc.to_string(),
+            verdict: None,
+        },
+    };
+
+    // The row enters at one revision...
+    store
+        .record_readings(&[reading("doc-a")], Some("rev-one"))
+        .await
+        .expect("record the reading");
+    assert_eq!(entry_rev(&pool, &id).await.as_deref(), Some("rev-one"));
+
+    // ...a second document citing the same change does not move it...
+    store
+        .record_readings(&[reading("doc-b")], Some("rev-two"))
+        .await
+        .expect("record a second reading");
+    assert_eq!(
+        entry_rev(&pool, &id).await.as_deref(),
+        Some("rev-one"),
+        "a second reading must not move the revision the row entered at"
+    );
+
+    // ...and neither does a measurement.
+    store
+        .apply_measurement(
+            &ChangeMeasurement::new(id.clone(), ChangeState::Landed).at_revision("rev-three"),
+        )
+        .await
+        .expect("measure the row");
+    assert_eq!(
+        entry_rev(&pool, &id).await.as_deref(),
+        Some("rev-one"),
+        "a measurement must not move the revision the row entered at"
+    );
+
+    cleanup(&pool, &marker).await;
+}
+
+/// A row created by a measurement entered by being measured, so its entry
+/// revision is that measurement's -- the one path that sets the column without a
+/// reading.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_row_created_by_a_measurement_enters_at_that_measurements_revision() {
+    let (store, pool, marker) = store().await;
+    let id = identity(&marker, "measured-in");
+
+    store
+        .apply_measurement(
+            &ChangeMeasurement::new(id.clone(), ChangeState::Landed).at_revision("rev-born"),
+        )
+        .await
+        .expect("create the row by measuring it");
+    assert_eq!(entry_rev(&pool, &id).await.as_deref(), Some("rev-born"));
+
+    cleanup(&pool, &marker).await;
+}
+
+async fn entry_rev(pool: &PgPool, id: &ChangeIdentity) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT first_seen_rev FROM change_ledger \
+         WHERE kind = $1 AND scope = $2 AND literal = $3",
+    )
+    .bind(&id.kind)
+    .bind(&id.scope)
+    .bind(&id.literal)
+    .fetch_one(pool)
+    .await
+    .expect("read the entry revision")
 }
 
 async fn cleanup(pool: &PgPool, marker: &str) {
