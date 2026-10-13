@@ -16,6 +16,12 @@ use cog_core::{MessageBackend, MessageStream, SFError, SFResult};
 const PENDING_STATS_PAGE: usize = 1024;
 
 /// Redis Streams-backed [`MessageBackend`].
+///
+/// Hidden from the docs because the backend is chosen by the deployment's
+/// configuration, never by a caller naming the type: consumers hold a
+/// [`MessageBackend`], so the concrete type is an implementation detail rather
+/// than part of the API this crate promises to keep stable.
+#[doc(hidden)]
 pub struct RedisMessageBackend {
     client: redis::Client,
     connection: ConnectionManager,

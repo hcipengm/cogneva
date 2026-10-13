@@ -19,6 +19,12 @@ use cog_core::{MessageBackend, MessageStream, NatsConfig, SFError, SFResult};
 /// Received messages are held in an internal map so that [`Self::ack`] can
 /// reference them; the map is keyed by stream, consumer group and sequence
 /// together, since a sequence number is unique only within one stream.
+///
+/// Hidden from the docs because the backend is chosen by the deployment's
+/// configuration, never by a caller naming the type: consumers hold a
+/// [`MessageBackend`], so the concrete type is an implementation detail rather
+/// than part of the API this crate promises to keep stable.
+#[doc(hidden)]
 pub struct NatsMessageBackend {
     jetstream: jetstream::Context,
     /// 连接本身，只用来读服务器声明的消息大小上限。JetStream 的发布路径

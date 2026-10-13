@@ -14,6 +14,12 @@ struct MemoryChannelState {
 }
 
 /// In-memory [`MessageBackend`] for testing and local development.
+///
+/// Hidden from the docs because the backend is chosen by the deployment's
+/// configuration, never by a caller naming the type: consumers hold a
+/// [`MessageBackend`], so the concrete type is an implementation detail rather
+/// than part of the API this crate promises to keep stable.
+#[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct MemoryMessageBackend {
     channels: Arc<Mutex<HashMap<String, MemoryChannelState>>>,
