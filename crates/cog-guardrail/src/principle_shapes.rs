@@ -211,6 +211,37 @@ mod tests {
         }
     }
 
+    /// The layout the header promises: every pattern sits complete on one line,
+    /// so a reader that walks the file line by line still finds it.
+    ///
+    /// The host reads this file whole, so *today* a wrapped literal would still
+    /// be found. This test is not for today's reader; it is for the promise the
+    /// header makes -- "a line reader can take the file apart without a Rust
+    /// parser" -- and for the case where a pattern is written across lines or
+    /// built by `concat!`. Either of those is invisible to any reader that is not
+    /// the compiler, and the shape it hides is one the host silently stops
+    /// checking, with the count and every other reading still green. The
+    /// compiler cannot catch it because the code compiles perfectly; only asking
+    /// the file about its own text can.
+    #[test]
+    fn every_pattern_sits_complete_on_one_line_of_this_file() {
+        let source = include_str!("principle_shapes.rs");
+        let mut patterns: Vec<&str> = DEFERRAL_SHAPES.to_vec();
+        for (_, pattern) in ALL_SHAPES {
+            patterns.push(pattern);
+        }
+        patterns.push(DEFERRAL_EXEMPT);
+        patterns.push(DEFERRAL_STRIKING);
+        for pattern in patterns {
+            assert!(
+                source.lines().any(|line| line.contains(pattern)),
+                "the pattern {pattern:?} is not written complete on any single line, so a \
+                 reader that walks the file line by line would miss it and the host would \
+                 quietly check one shape fewer"
+            );
+        }
+    }
+
     #[test]
     fn each_shape_still_fires_on_a_form_it_was_written_for() {
         assert_eq!(
