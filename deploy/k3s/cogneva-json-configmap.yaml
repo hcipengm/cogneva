@@ -1804,7 +1804,7 @@ data:
         "sandbox_mode": true,
         "force_autonomous": false,
         "manual_approve": false,
-        "change_dir": "./evolution-changes",
+        "change_dir": "/opt/cogneva/sandbox/changes",
         "binary_dir": "/opt/cogneva/bin",
         "backup_dir": "/opt/cogneva/bin/backups",
         "switch_mode": "self_exec",
