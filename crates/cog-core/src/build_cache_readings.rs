@@ -307,11 +307,22 @@ impl BuildCacheReadings {
     /// one.
     pub async fn measure_and_enforce(&self, slot: Option<&dyn CacheSlot>) {
         let path = self.dir.clone();
-        let walked =
-            tokio::task::spawn_blocking(move || fs_size::dir_files(&path, CACHE_LAYER_DEPTH, &[]))
-                .await;
+        // Bounded, not only awaited: a walk stuck on an unresponsive or
+        // contended volume must not freeze the loop that owns the only reading
+        // of it. A scan that never comes back looks, in every series this
+        // watcher publishes, like a cache that stopped growing, while the
+        // measurement age is the one series that keeps the truth. The
+        // abandoned task only reads metadata, so it is harmless if it finishes
+        // after the pass gave up on it; the deletion still runs below, inside
+        // the slot, and is never what this timeout can drop halfway.
+        let budget = Duration::from_secs(self.scan_interval_secs());
+        let walked = tokio::time::timeout(
+            budget,
+            tokio::task::spawn_blocking(move || fs_size::dir_files(&path, CACHE_LAYER_DEPTH, &[])),
+        )
+        .await;
         match walked {
-            Ok(Ok(files)) => {
+            Ok(Ok(Ok(files))) => {
                 let now = unix_now();
                 self.set_layers(fs_size::layer_totals(&files), now);
                 self.set_rewritten(fs_size::recently_written_totals(
@@ -321,12 +332,17 @@ impl BuildCacheReadings {
                 ));
                 self.enforce_cap(&files, slot).await;
             }
-            Ok(Err(e)) => warn!(
+            Ok(Ok(Err(e))) => warn!(
                 error = %e,
                 dir = %self.dir.display(),
                 "build cache scan failed; keeping the last measurement"
             ),
-            Err(e) => warn!(error = %e, "build cache scan task panicked"),
+            Ok(Err(e)) => warn!(error = %e, "build cache scan task panicked"),
+            Err(_) => warn!(
+                dir = %self.dir.display(),
+                budget_secs = budget.as_secs(),
+                "build cache scan did not finish within one interval; skipping this pass so the next walk still runs"
+            ),
         }
     }
 
