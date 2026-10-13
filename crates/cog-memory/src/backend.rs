@@ -664,7 +664,7 @@ impl cog_core::MemoryBackend for MemoryMemoryBackend {
             .map_err(|_| SFError::Agent("lock poisoned".into()))?;
         let now = Utc::now();
         let mut decayed = 0usize;
-        let mut archived_ids: Vec<String> = Vec::new();
+        let mut archived: Vec<SummaryEntry> = Vec::new();
 
         for entry in store.summary.values_mut() {
             if entry.namespace != namespace {
@@ -680,20 +680,23 @@ impl cog_core::MemoryBackend for MemoryMemoryBackend {
             // entry to the floor. The two counts are disjoint.
             entry.importance = (entry.importance * DECAY_IMPORTANCE_FACTOR).max(0.0);
             if entry.importance <= DECAY_ARCHIVE_FLOOR {
-                archived_ids.push(entry.id.clone());
+                archived.push(entry.clone());
             } else {
                 decayed += 1;
             }
         }
 
-        for id in &archived_ids {
-            store.summary.remove(id);
+        for entry in &archived {
+            store.summary.remove(&entry.id);
+            // After the removal, never before: the name is emitted only for a
+            // drop that actually happened.
+            crate::drop_log::entry_dropped(entry);
         }
 
         Ok(DecayReport {
             namespace: namespace.to_string(),
             entries_decayed: decayed,
-            entries_archived: archived_ids.len(),
+            entries_archived: archived.len(),
         })
     }
 

@@ -691,6 +691,9 @@ impl MemoryBackend for CompositeMemoryBackend {
             entry.importance = (entry.importance * DECAY_IMPORTANCE_FACTOR).max(0.0);
             if entry.importance <= DECAY_ARCHIVE_FLOOR {
                 self.summary.delete_summary(namespace, &entry.id).await?;
+                // After the removal, never before: the name is emitted only for
+                // a drop that actually happened.
+                crate::drop_log::entry_dropped(&entry);
                 archived += 1;
             } else {
                 self.summary.update_summary(namespace, &entry).await?;

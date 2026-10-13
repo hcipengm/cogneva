@@ -17,7 +17,9 @@ pub mod causal;
 pub mod composite;
 pub mod config;
 pub mod consolidator;
+mod drop_log;
 pub mod embedding_provider;
+
 pub mod entry_store;
 pub mod extractor;
 pub mod ingestor;
