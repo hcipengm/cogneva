@@ -26,10 +26,34 @@ pub struct ListNotificationsQuery {
     pub unread_only: Option<bool>,
 }
 
+/// The owner every handler here answers for.
+///
+/// These routes are behind the auth layer, so claims are normally present; the
+/// `Option` is what the layer's own contract gives us. Absent claims are
+/// answered with 401 rather than a default id: a notification list is a
+/// question about one person, and there is no person to ask it about.
+fn owner_of(claims: &Option<axum::Extension<cog_core::Claims>>) -> Option<String> {
+    claims
+        .as_ref()
+        .map(|axum::Extension(claims)| claims.sub.clone())
+}
+
+fn unauthenticated() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"error": "authentication required"})),
+    )
+        .into_response()
+}
+
 pub async fn list_notifications_handler(
     State(state): State<Arc<GatewayState>>,
+    claims: Option<axum::Extension<cog_core::Claims>>,
     Query(q): Query<ListNotificationsQuery>,
 ) -> Response {
+    let Some(owner) = owner_of(&claims) else {
+        return unauthenticated();
+    };
     let store = match state.notification_store {
         Some(ref s) => s,
         None => {
@@ -60,7 +84,7 @@ pub async fn list_notifications_handler(
         cursor: q.cursor,
     };
 
-    let list = match store.list(filter).await {
+    let list = match store.list(&owner, filter).await {
         Ok(l) => l,
         Err(e) => {
             return (
@@ -103,8 +127,12 @@ pub async fn list_notifications_handler(
 
 pub async fn mark_read_handler(
     State(state): State<Arc<GatewayState>>,
+    claims: Option<axum::Extension<cog_core::Claims>>,
     Path(notification_id): Path<String>,
 ) -> Response {
+    let Some(owner) = owner_of(&claims) else {
+        return unauthenticated();
+    };
     let store = match state.notification_store {
         Some(ref s) => s,
         None => {
@@ -120,7 +148,7 @@ pub async fn mark_read_handler(
         }
     };
 
-    match store.mark_read(&notification_id).await {
+    match store.mark_read(&owner, &notification_id).await {
         Ok(true) => (
             StatusCode::OK,
             Json(json!({
@@ -150,7 +178,13 @@ pub async fn mark_read_handler(
     }
 }
 
-pub async fn mark_all_read_handler(State(state): State<Arc<GatewayState>>) -> Response {
+pub async fn mark_all_read_handler(
+    State(state): State<Arc<GatewayState>>,
+    claims: Option<axum::Extension<cog_core::Claims>>,
+) -> Response {
+    let Some(owner) = owner_of(&claims) else {
+        return unauthenticated();
+    };
     let store = match state.notification_store {
         Some(ref s) => s,
         None => {
@@ -168,7 +202,7 @@ pub async fn mark_all_read_handler(State(state): State<Arc<GatewayState>>) -> Re
         }
     };
 
-    match store.mark_all_read().await {
+    match store.mark_all_read(&owner).await {
         Ok(_count) => (
             StatusCode::OK,
             Json(json!({

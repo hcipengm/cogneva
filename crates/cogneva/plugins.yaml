@@ -241,6 +241,7 @@ plugins:
   consumes:
   - { type: cog_core::LlmClient, required: false }
   - { type: cog_core::MemoryBackend, required: false }
+  - { type: cog_core::UserStore, required: false }
   - { type: cog_core::SkillRegistry, required: true }
   - { type: cog_core::PromptProvider, required: true }
   - { type: cog_core::HookEngine, required: true }

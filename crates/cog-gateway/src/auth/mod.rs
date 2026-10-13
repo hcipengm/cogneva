@@ -162,6 +162,15 @@ impl InMemoryUserStore {
 
         let id = Uuid::new_v4();
         let now = Utc::now();
+        // The first user of an instance is its owner, and every later one is
+        // Standard. The persistent store decides this the same way; a dev
+        // store that gave everyone Standard would be a deployment where
+        // `find_owner` finds nobody and the two stores tell different stories.
+        let user_type = if self.users.read().await.is_empty() {
+            UserType::Admin
+        } else {
+            UserType::Standard
+        };
         let user = User {
             id,
             phone: phone.clone(),
@@ -170,7 +179,7 @@ impl InMemoryUserStore {
             display_name: display_name.clone(),
             avatar_url: None,
             status: UserStatus::Active,
-            user_type: UserType::Standard,
+            user_type,
             created_at: now,
             updated_at: now,
         };
@@ -306,6 +315,19 @@ impl cog_core::UserStore for InMemoryUserStore {
             phone: updates.phone,
         };
         Ok(self.update(id, payload).await)
+    }
+
+    async fn find_owner(&self) -> Result<Option<cog_core::User>, cog_core::SFError> {
+        let users = self.users.read().await;
+        // Same rule as the persistent store: `admin` names the owner, because
+        // `create` gives that marker to the first user and to nobody else.
+        // `created_at` decides only which admin, if there is ever more than
+        // one, and `id` keeps that answer from moving between calls.
+        Ok(users
+            .values()
+            .filter(|stored| stored.user.user_type == UserType::Admin)
+            .min_by_key(|stored| (stored.user.created_at, stored.user.id))
+            .map(|stored| stored.user.clone()))
     }
 }
 

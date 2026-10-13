@@ -242,6 +242,23 @@ impl UserStore for PostgresUserStore {
         .map_err(to_sf)?;
         Ok(Some(user_from_row(row)))
     }
+
+    async fn find_owner(&self) -> SFResult<Option<User>> {
+        // Selecting on the `admin` marker rather than on being first: the
+        // creation rule gives that marker to the first user and to nobody
+        // else, so it names the owner directly, while `created_at` alone would
+        // need two separate transactions to not land in the same microsecond
+        // to stay right. `created_at` decides only which admin, if an instance
+        // ever ends up with more than one.
+        let row: Option<UserRow> = sqlx::query_as(&format!(
+            "SELECT {USER_COLS} FROM users WHERE user_type = 'admin' \
+             ORDER BY created_at ASC, id ASC LIMIT 1"
+        ))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(to_sf)?;
+        Ok(row.map(user_from_row))
+    }
 }
 
 #[async_trait]

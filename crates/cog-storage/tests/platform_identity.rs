@@ -20,7 +20,7 @@
 //! The schema is created by the store itself and the tables are cleared first,
 //! so the database is left as it was found.
 
-use cog_core::contract::auth::{PlatformIdentityStore, UserType};
+use cog_core::contract::auth::{PlatformIdentityStore, UserStore, UserType};
 use cog_storage::PostgresUserStore;
 use sqlx::PgPool;
 
@@ -99,4 +99,18 @@ async fn identity_lookup_runs_and_first_arrival_owns_the_instance() {
         .expect("lookup")
         .expect("the identity was just written");
     assert_eq!(found.id, owner.id);
+
+    // The owner is the account a notice with no user of its own goes to, so
+    // "who owns this instance" has to be answerable from the store and has to
+    // stay the same answer after a second account arrives.
+    let resolved = store
+        .find_owner()
+        .await
+        .expect("the owner lookup must be a statement the server accepts")
+        .expect("an instance with an account has an owner");
+    assert_eq!(
+        resolved.id, owner.id,
+        "the second arrival must not have taken ownership"
+    );
+    assert_eq!(resolved.user_type, UserType::Admin);
 }

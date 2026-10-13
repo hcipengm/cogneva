@@ -8,10 +8,62 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// What a notification is about.
+///
+/// The variants are the ones the `notifications` table accepts and
+/// [`Self::as_str`] spells them the way its check constraint does. The set is
+/// closed here rather than left to each producer because a kind with no
+/// spelling there is a row no persistent store can write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationType {
+    TaskCompleted,
+    QuotaWarning,
+    Mention,
+    System,
+}
+
+impl NotificationType {
+    /// Canonical storage representation (matches the `notifications.ntype` column).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TaskCompleted => "task_completed",
+            Self::QuotaWarning => "quota_warning",
+            Self::Mention => "mention",
+            Self::System => "system",
+        }
+    }
+
+    /// Inverse of [`Self::as_str`]. Unknown values fall back to [`Self::System`]:
+    /// a row whose kind this build does not know is still a notification of
+    /// some kind, and dropping it would make the list shorter than the table.
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s {
+            "task_completed" => Self::TaskCompleted,
+            "quota_warning" => Self::QuotaWarning,
+            "mention" => Self::Mention,
+            _ => Self::System,
+        }
+    }
+}
+
 /// A user-facing notification.
+///
+/// A notification belongs to exactly one user. The `notifications` table makes
+/// that column `NOT NULL` with no default, so "a notification for nobody" is
+/// not a row that can exist — and a read that is not told which user to answer
+/// for has no question to answer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Notification {
+    /// The row's identity.
+    ///
+    /// The table stores it as a UUID, so an id that is not one is a
+    /// notification no persistent store can write. A store that assigns
+    /// identity itself may ignore what it is handed.
     pub id: String,
+    /// The user this is for, spelled as a UUID string.
+    pub user_id: String,
+    pub ntype: NotificationType,
     pub title: String,
     pub body: String,
     pub is_read: bool,
@@ -20,6 +72,10 @@ pub struct Notification {
 }
 
 /// Filter arguments for listing notifications.
+///
+/// The owner is deliberately not a field here: it is a required argument of
+/// [`NotificationStore::list`]. A filter can be defaulted and an owner cannot,
+/// and the difference matters — see the trait.
 #[derive(Debug, Clone, Default)]
 pub struct NotificationFilter {
     pub unread_only: bool,
@@ -37,16 +93,25 @@ pub struct NotificationList {
 }
 
 /// Abstraction over notification persistence.
+///
+/// Every read takes the **owner** as its own argument rather than trusting a
+/// caller to put one in a filter. A store asked only for a notification id
+/// answers for every user in the deployment, and the caller that forgot to
+/// scope is not the one who can tell: an unscoped answer looks exactly like a
+/// scoped one, only longer.
 #[async_trait]
 pub trait NotificationStore: Send + Sync {
-    /// List notifications matching the filter, sorted by `created_at` descending.
-    async fn list(&self, filter: NotificationFilter) -> SFResult<NotificationList>;
+    /// List `user_id`'s notifications matching the filter, sorted by
+    /// `created_at` descending.
+    async fn list(&self, user_id: &str, filter: NotificationFilter) -> SFResult<NotificationList>;
 
-    /// Mark a single notification as read. Returns `true` if the ID was found.
-    async fn mark_read(&self, id: &str) -> SFResult<bool>;
+    /// Mark one of `user_id`'s notifications as read. Returns `true` if the ID
+    /// was found **and** belongs to that user.
+    async fn mark_read(&self, user_id: &str, id: &str) -> SFResult<bool>;
 
-    /// Mark all unread notifications as read. Returns the number affected.
-    async fn mark_all_read(&self) -> SFResult<usize>;
+    /// Mark all of `user_id`'s unread notifications as read. Returns the number
+    /// affected.
+    async fn mark_all_read(&self, user_id: &str) -> SFResult<usize>;
 
     /// Create a new notification.
     async fn create(&self, notification: Notification) -> SFResult<()>;
@@ -140,13 +205,17 @@ mod tests {
 
     #[async_trait]
     impl NotificationStore for Recorder {
-        async fn list(&self, _filter: NotificationFilter) -> SFResult<NotificationList> {
+        async fn list(
+            &self,
+            _user_id: &str,
+            _filter: NotificationFilter,
+        ) -> SFResult<NotificationList> {
             unimplemented!("not exercised here")
         }
-        async fn mark_read(&self, _id: &str) -> SFResult<bool> {
+        async fn mark_read(&self, _user_id: &str, _id: &str) -> SFResult<bool> {
             unimplemented!("not exercised here")
         }
-        async fn mark_all_read(&self) -> SFResult<usize> {
+        async fn mark_all_read(&self, _user_id: &str) -> SFResult<usize> {
             unimplemented!("not exercised here")
         }
         async fn create(&self, _notification: Notification) -> SFResult<()> {
@@ -168,7 +237,9 @@ mod tests {
 
     fn notification() -> Notification {
         Notification {
-            id: "n-1".into(),
+            id: "00000000-0000-4000-8000-000000000001".into(),
+            user_id: "00000000-0000-4000-8000-0000000000ff".into(),
+            ntype: NotificationType::System,
             title: "t".into(),
             body: "b".into(),
             is_read: false,

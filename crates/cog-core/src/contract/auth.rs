@@ -299,6 +299,16 @@ pub trait UserStore: Send + Sync {
 
     /// Update a user's profile.
     async fn update(&self, id: uuid::Uuid, updates: UserUpdate) -> crate::SFResult<Option<User>>;
+
+    /// The instance owner: the user an instance gives [`UserType::Admin`] to,
+    /// which is the first one to arrive.
+    ///
+    /// This exists for the producers that have no user of their own to name —
+    /// an operator notice about the deployment is for whoever owns it, and
+    /// there is no other answer that is not an invented id. `None` means an
+    /// instance with no users yet, which is a deployment that has not been set
+    /// up rather than an error.
+    async fn find_owner(&self) -> crate::SFResult<Option<User>>;
 }
 
 /// A code-platform identity (GitHub/Gitee account) linked to a local user.

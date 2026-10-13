@@ -55,6 +55,10 @@ pub struct HumanApprovalGate {
     pub rules: Vec<ApprovalRule>,
     pub pending_approvals: Vec<ApprovalRequest>,
     pub notification_dispatcher: Option<Arc<dyn cog_core::NotificationDispatcher>>,
+    /// 审批通知的收件人（实例属主）。审批请求自己不带用户：它问的是"谁能批"，
+    /// 而答案就是拥有这个实例的人。没设时 `submit` 只记日志、不投递——一条没有
+    /// 收件人的通知不是一行能被读到的通知。
+    pub recipient: Option<String>,
 }
 
 impl HumanApprovalGate {
@@ -63,6 +67,7 @@ impl HumanApprovalGate {
             rules,
             pending_approvals: Vec::new(),
             notification_dispatcher: None,
+            recipient: None,
         }
     }
 
@@ -71,6 +76,13 @@ impl HumanApprovalGate {
         dispatcher: Arc<dyn cog_core::NotificationDispatcher>,
     ) -> Self {
         self.notification_dispatcher = Some(dispatcher);
+        self
+    }
+
+    /// 指定审批通知的收件人。通常由持有 `UserStore` 的一方在装配时传入
+    /// `find_owner()` 的结果——本类型不认识用户存储，也不该认识。
+    pub fn with_recipient(mut self, user_id: impl Into<String>) -> Self {
+        self.recipient = Some(user_id.into());
         self
     }
 
@@ -96,25 +108,38 @@ impl HumanApprovalGate {
     /// Agent 提交审批请求，暂停执行直到人类响应
     pub async fn submit(&mut self, request: ApprovalRequest) {
         self.pending_approvals.push(request.clone());
-        if let Some(ref dispatcher) = self.notification_dispatcher {
-            let notification = cog_core::Notification {
-                id: request.request_id.to_string(),
-                title: format!("审批请求: {}", request.description),
-                body: format!(
-                    "Agent `{}` 触发规则 `{:?}`\n\n请求ID: `{}`\n状态: {:?}\n到期时间: {}",
-                    request.agent_id,
-                    request.rule_triggered,
-                    request.request_id,
-                    request.status,
-                    request.expires_at.to_rfc3339(),
-                ),
-                is_read: false,
-                created_at: request.created_at,
-                read_at: None,
-            };
-            if let Err(e) = dispatcher.dispatch(&notification).await {
-                tracing::warn!(error = %e, "Approval gate notification dispatch failed");
+        let (Some(dispatcher), Some(recipient)) = (&self.notification_dispatcher, &self.recipient)
+        else {
+            // 缺出口或缺收件人都是"没人在外面能收到"，但它们不是同一件事：
+            // 前者是部署没配投递，后者是装配时没告诉这条通知该给谁。
+            if self.notification_dispatcher.is_some() {
+                tracing::warn!(
+                    request_id = %request.request_id,
+                    "Approval gate has a dispatcher but no recipient; \
+                     the request is recorded and not delivered"
+                );
             }
+            return;
+        };
+        let notification = cog_core::Notification {
+            id: request.request_id.to_string(),
+            user_id: recipient.clone(),
+            ntype: cog_core::NotificationType::System,
+            title: format!("审批请求: {}", request.description),
+            body: format!(
+                "Agent `{}` 触发规则 `{:?}`\n\n请求ID: `{}`\n状态: {:?}\n到期时间: {}",
+                request.agent_id,
+                request.rule_triggered,
+                request.request_id,
+                request.status,
+                request.expires_at.to_rfc3339(),
+            ),
+            is_read: false,
+            created_at: request.created_at,
+            read_at: None,
+        };
+        if let Err(e) = dispatcher.dispatch(&notification).await {
+            tracing::warn!(error = %e, "Approval gate notification dispatch failed");
         }
     }
 

@@ -1,14 +1,13 @@
-//! The notifications table requires columns the notification contract cannot
-//! supply, and this names them.
+//! The notifications table requires columns the notification contract can
+//! supply, and this keeps it that way.
 //!
 //! A table and a struct describing the same records are two statements about one
-//! shape, and nothing makes them agree. Here they do not: the migration makes
-//! `user_id` and `ntype` `NOT NULL` with no default, and `cog_core::Notification`
-//! has no field for either -- there is no user dimension in the contract at all,
-//! and no type/category field. So `NotificationStore::create(&Notification)`
-//! cannot fill the table it is the store for. That is not "not implemented yet":
-//! the two sides are contradicting each other, and either the contract grows the
-//! dimension or the table is wrong.
+//! shape, and nothing makes them agree. They did not: the migration made
+//! `user_id` and `ntype` `NOT NULL` with no default while `cog_core::Notification`
+//! had no field for either, so `NotificationStore::create(&Notification)` could
+//! not fill the table it was the store for. The contract was the side that
+//! changed -- a notification belongs to one user, and the table had said so all
+//! along. This file used to name that disagreement; now it holds the answer open.
 //!
 //! The check is a census, not a verdict. It derives the required columns from
 //! the migration and the suppliable ones from the contract type itself -- by
@@ -16,9 +15,8 @@
 //! renamed-for-the-wire moves the answer without anyone editing this file -- and
 //! then asserts the difference is exactly the list below. That makes it read in
 //! both directions: a new required column the contract cannot supply fails, and
-//! so does a gap that quietly closes while this list still names it. Which side
-//! is right about `user_id` is a decision this file does not take; that the two
-//! sides disagree is a reading, and the reading has to stay true.
+//! so does a gap that quietly closes while this list still names it. The list is
+//! empty, which is a reading too: it says the two sides agree today.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -30,7 +28,11 @@ use chrono::Utc;
 /// A gap written down by name is a gap someone can act on; one behind a count is
 /// a number nobody can look up. When this list changes, the reason has to be in
 /// the commit that changes it.
-const COLUMNS_THE_CONTRACT_CANNOT_SUPPLY: &[&str] = &["ntype", "user_id"];
+///
+/// Empty since the contract grew `user_id` and `ntype`. It is not a list that
+/// can be deleted: the assertion below is what makes a *new* required column,
+/// or a dropped field, fail here instead of at the first insert.
+const COLUMNS_THE_CONTRACT_CANNOT_SUPPLY: &[&str] = &[];
 
 /// The migration that creates the table, found by name rather than by number so
 /// a renumbering does not turn this into a test about a missing file.
@@ -106,7 +108,9 @@ fn columns() -> Vec<(String, bool, bool)> {
 /// -- including a serde rename, which is what decides the key.
 fn what_the_contract_supplies() -> BTreeSet<String> {
     let sample = cog_core::Notification {
-        id: "probe".into(),
+        id: "00000000-0000-4000-8000-000000000001".into(),
+        user_id: "00000000-0000-4000-8000-0000000000ff".into(),
+        ntype: cog_core::NotificationType::System,
         title: "probe".into(),
         body: String::new(),
         is_read: false,

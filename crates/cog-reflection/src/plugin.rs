@@ -1605,8 +1605,38 @@ async fn resolve_port_instance_id() -> String {
 /// downgrades the pipeline to dry-run. Both services are optional: when no
 /// notification backend is configured, the warn log remains the only signal.
 async fn notify_sandbox_downgrade(ctx: &cog_core::PluginContext, reason: &str) {
+    // A downgrade is a fact about the deployment, not about a person, so the
+    // recipient is whoever owns the instance. Inventing an id here would be a
+    // row addressed to nobody that still counts as delivered.
+    let Some(owner) = ctx.consume_service::<dyn cog_core::UserStore>() else {
+        warn!(
+            "Self-evolution downgraded to dry-run, but no user store is configured to \
+             address the notice to; the log line above is the only signal"
+        );
+        return;
+    };
+    let recipient = match owner.find_owner().await {
+        Ok(Some(user)) => user.id.to_string(),
+        Ok(None) => {
+            warn!(
+                "Self-evolution downgraded to dry-run, but this instance has no user yet, \
+                 so there is nobody to notify; the log line above is the only signal"
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(error = %e, "Could not resolve the instance owner for the downgrade notice");
+            return;
+        }
+    };
+
     let notification = cog_core::Notification {
-        id: format!("sandbox-downgrade-{}", uuid::Uuid::new_v4()),
+        // The table stores the id as a UUID, and a persistent store writes what
+        // it is handed rather than minting its own. A prefixed id would be a
+        // notification the durable backend could not write.
+        id: uuid::Uuid::new_v4().to_string(),
+        user_id: recipient,
+        ntype: cog_core::NotificationType::System,
         title: "Self-evolution downgraded to dry-run".into(),
         body: reason.to_string(),
         is_read: false,

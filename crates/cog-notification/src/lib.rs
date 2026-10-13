@@ -86,6 +86,11 @@ fn envelope_verdict(body: &[u8], code_fields: &[&str], message_fields: &[&str]) 
 }
 
 /// In-memory notification store backed by a [`Vec`] inside a [`RwLock`].
+///
+/// One process's view, and only that: a notification produced in another Pod is
+/// not here, and the whole vec is gone on restart. Suitable for a single-node
+/// deployment; anything with more than one writer needs a store that outlives
+/// the process.
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryNotificationStore {
     inner: Arc<RwLock<Vec<Notification>>>,
@@ -99,17 +104,23 @@ impl InMemoryNotificationStore {
 
 #[async_trait]
 impl NotificationStore for InMemoryNotificationStore {
-    async fn list(&self, filter: NotificationFilter) -> SFResult<NotificationList> {
+    async fn list(&self, user_id: &str, filter: NotificationFilter) -> SFResult<NotificationList> {
         let guard = self.inner.read().await;
+        // The owner is selected first and counted separately: unread_count is
+        // this user's unread total, not the deployment's.
+        let mine = guard.iter().filter(|n| n.user_id == user_id);
         let mut items: Vec<Notification> = if filter.unread_only {
-            guard.iter().filter(|n| !n.is_read).cloned().collect()
+            mine.filter(|n| !n.is_read).cloned().collect()
         } else {
-            guard.iter().cloned().collect()
+            mine.cloned().collect()
         };
 
         items.sort_by_key(|a| std::cmp::Reverse(a.created_at));
 
-        let unread_count = guard.iter().filter(|n| !n.is_read).count() as u32;
+        let unread_count = guard
+            .iter()
+            .filter(|n| n.user_id == user_id && !n.is_read)
+            .count() as u32;
         let limit = filter.limit.min(1000);
         let has_more = items.len() > limit;
         let items: Vec<Notification> = items.into_iter().take(limit).collect();
@@ -136,9 +147,15 @@ impl NotificationStore for InMemoryNotificationStore {
         })
     }
 
-    async fn mark_read(&self, id: &str) -> SFResult<bool> {
+    async fn mark_read(&self, user_id: &str, id: &str) -> SFResult<bool> {
         let mut guard = self.inner.write().await;
-        match guard.iter_mut().find(|n| n.id == id) {
+        // Both halves are required. An id that exists but belongs to someone
+        // else is "not found" for this caller: answering `true` would confirm
+        // the id exists, and the caller has no business knowing that.
+        match guard
+            .iter_mut()
+            .find(|n| n.id == id && n.user_id == user_id)
+        {
             Some(n) => {
                 n.is_read = true;
                 n.read_at = Some(chrono::Utc::now());
@@ -152,12 +169,12 @@ impl NotificationStore for InMemoryNotificationStore {
         }
     }
 
-    async fn mark_all_read(&self) -> SFResult<usize> {
+    async fn mark_all_read(&self, user_id: &str) -> SFResult<usize> {
         let mut guard = self.inner.write().await;
         let now = chrono::Utc::now();
         let mut count = 0;
         for n in guard.iter_mut() {
-            if !n.is_read {
+            if n.user_id == user_id && !n.is_read {
                 n.is_read = true;
                 n.read_at = Some(now);
                 count += 1;
@@ -573,9 +590,19 @@ mod tests {
     use chrono::Utc;
     use cog_core::{Notification, NotificationDispatcher as _};
 
+    /// The owner these dispatch fixtures belong to. Fixed so that a test that
+    /// only cares about delivery does not have to invent one.
+    const OWNER: &str = "00000000-0000-4000-8000-0000000000ff";
+
     fn make_notification(id: &str, is_read: bool) -> Notification {
+        make_notification_for(OWNER, id, is_read)
+    }
+
+    fn make_notification_for(user_id: &str, id: &str, is_read: bool) -> Notification {
         Notification {
             id: id.into(),
+            user_id: user_id.into(),
+            ntype: cog_core::NotificationType::System,
             title: format!("Title {}", id),
             body: format!("Body {}", id),
             is_read,
@@ -906,6 +933,17 @@ mod tests {
         assert_eq!(counted(BAD, delivery::DeliveryResult::Unreachable), 1);
     }
 
+    /// A second user, so that "scoped" is distinguishable from "everything".
+    const OTHER: &str = "00000000-0000-4000-8000-0000000000ee";
+
+    fn filter(unread_only: bool, limit: usize) -> NotificationFilter {
+        NotificationFilter {
+            unread_only,
+            limit,
+            cursor: None,
+        }
+    }
+
     #[tokio::test]
     async fn list_all_sorted_descending() {
         let store = InMemoryNotificationStore::new();
@@ -913,18 +951,41 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         store.create(make_notification("b", false)).await.unwrap();
 
-        let list = store
-            .list(NotificationFilter {
-                unread_only: false,
-                limit: 10,
-                cursor: None,
-            })
-            .await
-            .unwrap();
+        let list = store.list(OWNER, filter(false, 10)).await.unwrap();
 
         assert_eq!(list.items.len(), 2);
         assert_eq!(list.items[0].id, "b");
         assert_eq!(list.items[1].id, "a");
+    }
+
+    /// The reason the owner is an argument and not a filter field: two users'
+    /// rows sit in one store, and each list is one user's.
+    #[tokio::test]
+    async fn a_list_is_one_users_notifications() {
+        let store = InMemoryNotificationStore::new();
+        store
+            .create(make_notification_for(OWNER, "mine", false))
+            .await
+            .unwrap();
+        store
+            .create(make_notification_for(OTHER, "theirs", false))
+            .await
+            .unwrap();
+
+        let mine = store.list(OWNER, filter(false, 10)).await.unwrap();
+        assert_eq!(
+            mine.items.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            vec!["mine"],
+            "another user's notification is not in this list"
+        );
+        assert_eq!(
+            mine.unread_count, 1,
+            "the unread badge counts this user's unread, not the store's"
+        );
+
+        let theirs = store.list(OTHER, filter(false, 10)).await.unwrap();
+        assert_eq!(theirs.items.len(), 1);
+        assert_eq!(theirs.items[0].id, "theirs");
     }
 
     #[tokio::test]
@@ -932,25 +993,39 @@ mod tests {
         let store = InMemoryNotificationStore::new();
         store.create(make_notification("x", false)).await.unwrap();
 
-        let found = store.mark_read("x").await.unwrap();
+        let found = store.mark_read(OWNER, "x").await.unwrap();
         assert!(found);
 
-        let list = store
-            .list(NotificationFilter {
-                unread_only: true,
-                limit: 10,
-                cursor: None,
-            })
-            .await
-            .unwrap();
+        let list = store.list(OWNER, filter(true, 10)).await.unwrap();
         assert_eq!(list.items.len(), 0);
     }
 
     #[tokio::test]
     async fn mark_read_missing() {
         let store = InMemoryNotificationStore::new();
-        let found = store.mark_read("missing").await.unwrap();
+        let found = store.mark_read(OWNER, "missing").await.unwrap();
         assert!(!found);
+    }
+
+    /// An id that exists but is somebody else's is not this caller's to mark,
+    /// and the answer has to be the same one a nonexistent id gets: the
+    /// difference between the two is what tells an id apart from a wrong guess.
+    #[tokio::test]
+    async fn mark_read_refuses_another_users_notification() {
+        let store = InMemoryNotificationStore::new();
+        store
+            .create(make_notification_for(OTHER, "theirs", false))
+            .await
+            .unwrap();
+
+        assert!(!store.mark_read(OWNER, "theirs").await.unwrap());
+
+        let theirs = store.list(OTHER, filter(true, 10)).await.unwrap();
+        assert_eq!(
+            theirs.items.len(),
+            1,
+            "the row is untouched: the read was refused, not performed"
+        );
     }
 
     #[tokio::test]
@@ -959,9 +1034,23 @@ mod tests {
         store.create(make_notification("a", false)).await.unwrap();
         store.create(make_notification("b", false)).await.unwrap();
         store.create(make_notification("c", true)).await.unwrap();
+        store
+            .create(make_notification_for(OTHER, "d", false))
+            .await
+            .unwrap();
 
-        let count = store.mark_all_read().await.unwrap();
-        assert_eq!(count, 2);
+        let count = store.mark_all_read(OWNER).await.unwrap();
+        assert_eq!(count, 2, "only this user's unread rows are affected");
+        assert_eq!(
+            store
+                .list(OTHER, filter(true, 10))
+                .await
+                .unwrap()
+                .items
+                .len(),
+            1,
+            "another user's unread row is still unread"
+        );
     }
 
     #[tokio::test]
@@ -975,14 +1064,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
 
-        let list = store
-            .list(NotificationFilter {
-                unread_only: false,
-                limit: 2,
-                cursor: None,
-            })
-            .await
-            .unwrap();
+        let list = store.list(OWNER, filter(false, 2)).await.unwrap();
 
         assert_eq!(list.items.len(), 2);
         assert!(list.has_more);
