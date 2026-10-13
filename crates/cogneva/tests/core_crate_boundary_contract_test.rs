@@ -79,7 +79,13 @@ const CORE_ROOT_MODULES: &[(&str, &str)] = &[
     // sit where both reach — the core — and the driver stays with it, so the
     // reason names the driver rather than reading as a pure definition.
     ("build_cache_readings", "shared-definition-with-driver"),
-    ("build_cache_reclaim", "pending-relocation"),
+    // Stays: the core's own `enforce_cap` is the only caller, and both processes
+    // that measure a cache reach it through `measure_and_enforce` -- the
+    // `cog-extension` workdir directly, and the core's watch, which
+    // `cog-reflection` spawns. Neither `cog-extension` nor `cog-reflection`
+    // depends on the other, so no destination crate reaches every consumer, and
+    // the mechanism stays with the core driver that runs it.
+    ("build_cache_reclaim", "shared-mechanism-with-core-driver"),
     ("build_gate", "pending-relocation"),
     ("claim_footprint", "shared-definition"),
     ("config", "shared-config"),
@@ -117,6 +123,15 @@ const MODULE_REASONS: &[&str] = &[
     // also read a `#[cfg(test)]` spawn as a production one. The word is a claim
     // a reviewer reads, not a property this gate verifies.
     "shared-definition-with-driver",
+    // A shared mechanism rather than a definition: it acts on the host -- the
+    // reclaim removes files -- and the core's own driver is what runs it, while
+    // the consumers reach it only through the core. The driver is named in the
+    // word, as in the definition above, so a reader scanning the registry sees
+    // an actor and not a type.
+    //
+    // Not checked, for the same reason as the definition above: nothing here
+    // decides whether a module has a driver.
+    "shared-mechanism-with-core-driver",
     // Configuration types: every crate that reads the configuration reads the
     // same fields, and a second definition would be a second configuration.
     "shared-config",
@@ -190,11 +205,14 @@ const RELOCATION_TARGET: &[(&str, &str, Owed)] = &[
     // readers both reach the core and neither reaches the other, so no shared
     // destination exists, and the module stays whole under a definition reason
     // that names its driver.
-    // The crate whose scan loop runs the reclaim: its `measure_and_enforce` is
-    // the only producer call, and it drives the slot. `cog-reflection` only
-    // re-exports the module, and the core reads `plan_reclaim` itself, so both
-    // the shape and the destination are the halves'.
-    ("build_cache_reclaim", "cog-extension", Owed::Split),
+    // `build_cache_reclaim` was registered here and is not any more. Its row
+    // said `cog-extension` runs the reclaim because `measure_and_enforce` is the
+    // only producer call, which is not true: the call is in the core's own
+    // `enforce_cap`, reached from the `cog-extension` workdir and from the
+    // core's watch that `cog-reflection` spawns, and those two crates do not
+    // depend on each other. No destination reaches every consumer, so the
+    // mechanism stays in the core under a reason that names the driver the core
+    // keeps running it.
     // The destination's rollout and change-pipeline paths are the ones that
     // acquire the slot, so the mechanism half goes there; the core reads
     // `dir_identity` and the `CacheSlot` registration, so the contract half
