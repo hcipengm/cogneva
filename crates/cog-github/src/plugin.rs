@@ -412,6 +412,11 @@ impl cog_core::SystemPlugin for GitHubPlugin {
         let lease_role = ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>();
         let orchestrator = ctx.consume_service::<dyn cog_core::OrchestratorControl>();
         let reflection = ctx.consume_service::<dyn cog_core::ReflectionEngine>();
+        if reflection.is_none() {
+            info!(
+                "GitHubPlugin: no reflection engine; the landing CI watch still rolls back and re-drives a red commit, but records no reflection for it"
+            );
+        }
         // 池全灭时 supervisor 只暂停 LLM 依赖型任务；发现循环每轮入口据此跳过，
         // 不再发注定失败的 LLM 请求。gate 由 supervisor 插件发布，可选。
         let gate = ctx.consume_service::<dyn cog_core::SchedulerGate>();

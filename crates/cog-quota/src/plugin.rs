@@ -59,6 +59,15 @@ impl cog_core::SystemPlugin for QuotaPlugin {
         };
         if let Some(ref hm) = hierarchy_manager {
             ctx.publish(hm.clone());
+            // The reader takes `dyn cog_core::HierarchyManager` through the
+            // service table, which is a different pin than the concrete value
+            // published above -- the two are stored under different keys and
+            // never meet, so the gateway's pre-create 5-level quota check was
+            // silently skipped. Published both ways, exactly as the quota
+            // manager is just above: the value-typed pin for a concrete
+            // reader, the service pin for the trait-object one.
+            let hm_service: Arc<dyn cog_core::HierarchyManager> = hm.clone();
+            ctx.publish_service(hm_service);
             info!("QuotaPlugin hierarchy manager published");
         }
 

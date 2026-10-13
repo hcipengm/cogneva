@@ -393,6 +393,14 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         info!(dir = %policy_dir, "artifact-level evolution policy store enabled");
 
         ctx.publish(engine.clone());
+        // Readers take `dyn cog_core::ReflectionEngine` through the service
+        // table -- a different pin than the concrete value published above,
+        // stored under a different key -- so without this the collaboration
+        // and github plugins read `None` and carry on as though no engine
+        // existed. Published both ways, like the quota manager: the concrete
+        // pin for value-typed readers, the service pin for trait-object ones.
+        let engine_service: Arc<dyn cog_core::ReflectionEngine> = engine.clone();
+        ctx.publish_service(engine_service);
         info!("ReflectionPlugin reflection engine published");
 
         // 被门禁拒绝的变更回流主流程那条支路的属主门与读数。读数在这里发布：
