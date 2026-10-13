@@ -34,8 +34,14 @@
 //!
 //! The cap family, published only when a cap is configured:
 //!
-//! - `cogneva_build_target_bytes_cap{dir}` -- the cap itself, so a panel can
-//!   draw the wall the other lines are measured against.
+//! - `cogneva_build_target_bytes_cap{dir,source}` -- the cap itself, so a panel
+//!   can draw the wall the other lines are measured against. The `source` label
+//!   says where the number came from: `derived` (a measurement loop set it, so it
+//!   moves when the volume behind the cache moves) or `override` (the deployment
+//!   named it), because the number alone cannot tell a cap that is tracking the
+//!   cache from one that has stopped. The line exists only while a cap is in
+//!   force, so a cache with no cap is this line being absent rather than a value
+//!   of it.
 //! - `cogneva_build_target_over_limit_bytes{dir}` -- how far above it the cache
 //!   is, as of the last walk. The earlier of the two numbers that say the cap is
 //!   not holding.
@@ -194,6 +200,14 @@ pub struct BuildCacheReadings {
     /// Bytes the cache may hold, or 0 when it is measured but not bounded.
     cap_bytes: u64,
     scan_interval_secs: u64,
+    /// Where the cap came from, or `None` to read it as the deployment's.
+    ///
+    /// A cap in force that nothing said otherwise about is one the deployment
+    /// named, so the label is right without every caller restating it. A cap a
+    /// measurement loop derives cannot be read from the number, and a loop that
+    /// sets one states it with [`Self::with_cap_source`]; a loop that forgot is
+    /// the one mismatch the number cannot reveal.
+    cap_source: Option<CapSource>,
     reclaim: Mutex<ReclaimState>,
     reclaimed_bytes: AtomicU64,
     /// Passes that found the cache over its cap, by outcome.
@@ -220,6 +234,7 @@ impl BuildCacheReadings {
             scanned_at: AtomicU64::new(0),
             cap_bytes: 0,
             scan_interval_secs: 0,
+            cap_source: None,
             reclaim: Mutex::new(ReclaimState::default()),
             reclaimed_bytes: AtomicU64::new(0),
             over_cap: Mutex::new(BTreeMap::new()),
@@ -239,6 +254,19 @@ impl BuildCacheReadings {
         self
     }
 
+    /// Say where this cache's cap came from, for the `source` label on the cap
+    /// reading.
+    ///
+    /// Only a derived cap needs this: a cap a deployment named, and the absence
+    /// of one, are both readable from the number, and [`Self::cap_source`] reads
+    /// them. What the number cannot say is whether a value that *looks* pinned
+    /// was in fact computed each walk -- and that is exactly the cap whose value
+    /// silently stops tracking the volume it sits on.
+    pub fn with_cap_source(mut self, source: CapSource) -> Self {
+        self.cap_source = Some(source);
+        self
+    }
+
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -246,6 +274,12 @@ impl BuildCacheReadings {
     /// The cap, or `None` when this cache is not bounded.
     pub fn cap_bytes(&self) -> Option<u64> {
         (self.cap_bytes > 0).then_some(self.cap_bytes)
+    }
+
+    /// Where the cap came from: what was stated, or the deployment's, which is
+    /// what a cap in force with nothing said about its origin is.
+    fn cap_source(&self) -> CapSource {
+        self.cap_source.unwrap_or(CapSource::Override)
     }
 
     /// How long between walks.
@@ -469,7 +503,9 @@ impl BuildCacheReadings {
         };
         let state = *self.reclaim.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = vec![
-            RawMetric::new(BUILD_TARGET_CAP_METRIC, cap as f64).with_label(DIR_LABEL, dir),
+            RawMetric::new(BUILD_TARGET_CAP_METRIC, cap as f64)
+                .with_label(DIR_LABEL, dir)
+                .with_label(SOURCE_LABEL, self.cap_source().as_str()),
             RawMetric::new(
                 BUILD_TARGET_SCAN_INTERVAL_METRIC,
                 self.scan_interval_secs() as f64,
@@ -1204,6 +1240,43 @@ mod tests {
         assert!(
             secs_over(reading(&readings, BUILD_TARGET_OVER_CAP_SECS_METRIC, None).await) < 5.0,
             "a new run begins at the walk that found it over again"
+        );
+    }
+
+    /// The cap reading says where the cap came from. A cap the deployment named
+    /// reads as an override without the caller restating it -- "a cap is in
+    /// force" and "no cap is in force" are the two states a named cap has, and
+    /// the number is its own account of which. A derived cap cannot be read from
+    /// the number, so it is stated, and that is the case this proves lands.
+    #[tokio::test]
+    async fn the_cap_reading_carries_where_the_cap_came_from() {
+        let root = tempfile::tempdir().unwrap();
+        let cap_label = |m: &RawMetric| m.labels.get(SOURCE_LABEL).cloned();
+
+        let named = BuildCacheReadings::new(root.path()).with_cap(4096, 300);
+        let metrics = named.collect_metrics("").await.unwrap();
+        let cap = metrics
+            .iter()
+            .find(|m| m.name == BUILD_TARGET_CAP_METRIC)
+            .expect("a cap is configured, so the cap reading is published");
+        assert_eq!(
+            cap_label(cap),
+            Some(CapSource::Override.as_str().to_string()),
+            "a cap the deployment named reads as an override"
+        );
+
+        let derived = BuildCacheReadings::new(root.path())
+            .with_cap(4096, 300)
+            .with_cap_source(CapSource::Derived);
+        let metrics = derived.collect_metrics("").await.unwrap();
+        let cap = metrics
+            .iter()
+            .find(|m| m.name == BUILD_TARGET_CAP_METRIC)
+            .expect("the cap reading is published");
+        assert_eq!(
+            cap_label(cap),
+            Some(CapSource::Derived.as_str().to_string()),
+            "a cap a loop derived says so, which the number cannot"
         );
     }
 

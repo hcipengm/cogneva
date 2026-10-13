@@ -47,6 +47,36 @@ pub const REWRITE_WINDOW_SECS: u64 = 3600;
 /// The cap the cache is held to, in bytes. Published only when one is set.
 pub const BUILD_TARGET_CAP_METRIC: &str = "cogneva_build_target_bytes_cap";
 
+/// The label naming where a bound's value came from.
+pub const SOURCE_LABEL: &str = "source";
+
+/// Where a cache's cap came from, as the `source` label on the cap reading.
+///
+/// Two values, not three: the cap line is published only while a cap is in
+/// force, so "no cap" is the line being absent rather than a value of it -- a
+/// cache with no cap publishes no cap reading at all. Of the two that remain,
+/// `derived` is a cap a measurement loop set, so it moves when the volume behind
+/// the cache moves, and `override` is one the deployment named, which stays where
+/// it was pinned. The number alone does not say which, and a cap that stopped
+/// tracking its volume reads as a steady number either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapSource {
+    /// A measurement loop set the cap: it moves when the input it reads moves.
+    Derived,
+    /// The deployment named the cap.
+    Override,
+}
+
+impl CapSource {
+    /// The word this source is published under.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CapSource::Derived => "derived",
+            CapSource::Override => "override",
+        }
+    }
+}
+
 /// Bytes the cache is above its cap, as of the last walk.
 pub const BUILD_TARGET_OVER_LIMIT_METRIC: &str = "cogneva_build_target_over_limit_bytes";
 

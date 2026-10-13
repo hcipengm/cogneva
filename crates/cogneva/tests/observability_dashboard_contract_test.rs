@@ -283,12 +283,15 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         "crates/cog-core/src/build_cache.rs",
     ),
     // What the cap is, so a panel can draw the cache against it rather than
-    // beside it. Published as a flat zero when no cap is set: measured and
-    // uncapped is a reading, and a missing line would be the same shape as no
-    // cache being measured at all.
+    // beside it. The source label says where the number came from -- a cap the
+    // deployment pinned reads `override`, one a measurement loop derived reads
+    // `derived` -- so a reader can tell a cap that tracks the volume from one
+    // that has stopped without reading the deployment's config beside it. The
+    // line is published only while a cap is in force; a cache with no cap
+    // publishes no cap line at all.
     (
         "cogneva_build_target_bytes_cap",
-        &["dir"],
+        &["dir", "source"],
         "crates/cog-core/src/build_cache.rs",
     ),
     // The part of what is held that the cap says should not be there.
