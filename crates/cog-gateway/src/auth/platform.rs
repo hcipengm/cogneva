@@ -43,7 +43,7 @@ pub async fn fetch_platform_profile(
     provider: &str,
     token: &str,
 ) -> Result<PlatformProfile, String> {
-    let client = contrib::http_client();
+    let client = contrib::http_client()?;
     let body: serde_json::Value = match provider {
         "github" => {
             let resp = client

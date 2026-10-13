@@ -36,7 +36,7 @@ impl GiteeProvider {
     pub fn new(repo: &str, api_base: Option<&str>, token: Option<String>) -> Result<Self> {
         let (owner, repo_name) = super::github::split_repo(repo)?;
         Ok(Self {
-            http: reqwest::Client::new(),
+            http: super::configured_http_client()?,
             owner,
             repo: repo_name,
             base: api_base

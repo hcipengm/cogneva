@@ -776,7 +776,7 @@ async fn resolve_secret_ref(reference: &str) -> cog_core::SFResult<Option<String
                 .get(abs.trim_start_matches('/'))
                 .await
         }
-        "vault" => match cog_net::VaultSecretProvider::from_env() {
+        "vault" => match cog_net::VaultSecretProvider::from_env()? {
             Some(provider) => provider.get(path).await,
             None => Err(cog_core::SFError::Config(
                 "secret://vault reference requires VAULT_ADDR and VAULT_TOKEN".into(),

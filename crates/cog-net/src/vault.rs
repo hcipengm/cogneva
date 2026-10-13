@@ -14,21 +14,30 @@ pub struct VaultSecretProvider {
 
 impl VaultSecretProvider {
     /// `addr` 例如 `http://127.0.0.1:8200`；`token` 为 Vault token。
-    pub fn new(addr: impl Into<String>, token: impl Into<String>) -> Self {
-        Self {
-            client: reqwest::Client::new(),
+    ///
+    /// 客户端走 [`crate::build_client`]：本 crate 的约定是所有出站客户端都取同一份
+    /// `http_client` 段，而裸 `reqwest::Client::new()` 连超时都没有——Vault 不应答时
+    /// 取密钥这一路会一直挂着。
+    pub fn new(addr: impl Into<String>, token: impl Into<String>) -> SFResult<Self> {
+        Ok(Self {
+            client: crate::build_client(&crate::HttpClientConfig::load()?)?,
             addr: addr.into().trim_end_matches('/').to_string(),
             token: token.into(),
-        }
+        })
     }
 
     /// 从环境变量构造：`VAULT_ADDR` + `VAULT_TOKEN`。
-    pub fn from_env() -> Option<Self> {
-        let addr = std::env::var("VAULT_ADDR").ok().filter(|v| !v.is_empty())?;
-        let token = std::env::var("VAULT_TOKEN")
-            .ok()
-            .filter(|v| !v.is_empty())?;
-        Some(Self::new(addr, token))
+    ///
+    /// 两个环境变量缺席是 `Ok(None)`——「这里没配 vault」。客户端建不出来是 `Err`：
+    /// 把配置坏了读成「没配 vault」会把读的人送去查环境变量，而坏的是 `http_client` 段。
+    pub fn from_env() -> SFResult<Option<Self>> {
+        let Some(addr) = std::env::var("VAULT_ADDR").ok().filter(|v| !v.is_empty()) else {
+            return Ok(None);
+        };
+        let Some(token) = std::env::var("VAULT_TOKEN").ok().filter(|v| !v.is_empty()) else {
+            return Ok(None);
+        };
+        Ok(Some(Self::new(addr, token)?))
     }
 }
 
@@ -86,17 +95,20 @@ impl SecretProvider for VaultSecretProvider {
 mod tests {
     use super::*;
 
+    fn provider() -> VaultSecretProvider {
+        VaultSecretProvider::new("http://127.0.0.1:1", "token")
+            .expect("the default http client config is a buildable one")
+    }
+
     #[tokio::test]
     async fn rejects_reference_without_field() {
-        let provider = VaultSecretProvider::new("http://127.0.0.1:1", "token");
-        let err = provider.get("secret/data/llm").await.unwrap_err();
+        let err = provider().get("secret/data/llm").await.unwrap_err();
         assert!(err.to_string().contains("mount/path#field"));
     }
 
     #[tokio::test]
     async fn rejects_path_escape() {
-        let provider = VaultSecretProvider::new("http://127.0.0.1:1", "token");
-        let err = provider.get("secret/../admin#key").await.unwrap_err();
+        let err = provider().get("secret/../admin#key").await.unwrap_err();
         assert!(err.to_string().contains("escapes mount"));
     }
 
@@ -104,11 +116,11 @@ mod tests {
     fn from_env_requires_both_vars() {
         std::env::remove_var("VAULT_ADDR");
         std::env::remove_var("VAULT_TOKEN");
-        assert!(VaultSecretProvider::from_env().is_none());
+        assert!(VaultSecretProvider::from_env().unwrap().is_none());
         std::env::set_var("VAULT_ADDR", "http://127.0.0.1:8200");
-        assert!(VaultSecretProvider::from_env().is_none());
+        assert!(VaultSecretProvider::from_env().unwrap().is_none());
         std::env::set_var("VAULT_TOKEN", "tok");
-        assert!(VaultSecretProvider::from_env().is_some());
+        assert!(VaultSecretProvider::from_env().unwrap().is_some());
         std::env::remove_var("VAULT_ADDR");
         std::env::remove_var("VAULT_TOKEN");
     }

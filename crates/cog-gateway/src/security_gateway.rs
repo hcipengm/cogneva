@@ -5582,8 +5582,11 @@ pub async fn run(
     config: SecurityGatewayConfig,
     build_revision: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let http_client: Arc<dyn cog_core::HttpClient> =
-        Arc::new(cog_net::ReqwestHttpClient::new(reqwest::Client::new()));
+    // 走系统的 `http_client` 段：本进程其余出站（含 contribution_admin 那些
+    // 调 github/gitee 的请求）都用同一份设置，网关自己的这一份没有理由是第二份。
+    let http_client: Arc<dyn cog_core::HttpClient> = Arc::new(
+        cog_net::ReqwestHttpClient::from_config(&cog_net::HttpClientConfig::load()?)?,
+    );
     let loki_pusher = init_gateway_logging(&config.observability, &http_client);
 
     let (pool_obs, pool_signal) = build_pool_observability(&config, &http_client).await;

@@ -245,12 +245,18 @@ pub struct DevicePollRequest {
     pub device_code: String,
 }
 
-pub(crate) fn http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(12))
-        .user_agent("cogneva-contribution")
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+/// 本模块所有出站请求用的客户端：取系统 `http_client` 段的超时、连接池与代理，
+/// 与本进程其余出站流量同一份设置。
+///
+/// 两处刻意不这么做，各自都有代价：本模块原来自己钉一个 12s 超时与一个 UA——
+/// 那是本文件的第 2、3 份设置，没有来源，改一处不影响另一处；失败时又回落到裸
+/// `reqwest::Client::new()`——裸客户端连超时都没有，而下游读到的和配置好的
+/// 一模一样，调用方分不出手上这份是哪一份。现在失败即 Err，由调用方在它本来就
+/// 有的「连不上」分支里报出去（每个调用点都已经有那一个分支）。
+pub(crate) fn http_client() -> Result<reqwest::Client, String> {
+    let config =
+        cog_net::HttpClientConfig::load().map_err(|e| format!("http_client 配置无效：{e}"))?;
+    cog_net::build_client(&config).map_err(|e| format!("HTTP 客户端构造失败：{e}"))
 }
 
 pub(crate) fn oauth_client_id(explicit: Option<&str>) -> Option<String> {
@@ -277,7 +283,10 @@ pub(crate) fn oauth_gateway_base() -> String {
 /// 主应用不另立近似判据。
 pub(crate) async fn gitee_oauth_client_id() -> Option<String> {
     let url = format!("{}/v1/oauth/gitee/app", oauth_gateway_base());
+    // 借不到客户端与网关不可达在返回面上同形（本函数只说"这个来源没给出
+    // client_id"），调用方据此走「未配置 OAuth App」的引导。
     let body: serde_json::Value = http_client()
+        .ok()?
         .get(url)
         .send()
         .await
@@ -301,7 +310,7 @@ async fn oauth_gateway_call(
     payload: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let url = format!("{}{path}", oauth_gateway_base());
-    let resp = http_client()
+    let resp = http_client()?
         .post(url)
         .json(&payload)
         .send()
@@ -518,7 +527,7 @@ pub(crate) async fn exchange_gitee_code_with(
     code: &str,
     redirect_uri: &str,
 ) -> Result<GiteeTokenSet, String> {
-    let resp = http_client()
+    let resp = http_client()?
         .post(GITEE_TOKEN_URL)
         .query(&[
             ("grant_type", "authorization_code"),
@@ -549,7 +558,7 @@ pub(crate) async fn refresh_gitee_token_with(
         params.push(("client_id", id));
         params.push(("client_secret", secret));
     }
-    let resp = http_client()
+    let resp = http_client()?
         .post(GITEE_TOKEN_URL)
         .query(&params)
         .send()
@@ -581,7 +590,7 @@ pub(crate) async fn exchange_github_code_with(
     code: &str,
     redirect_uri: &str,
 ) -> Result<String, String> {
-    let resp = http_client()
+    let resp = http_client()?
         .post(GITHUB_TOKEN_URL)
         .header("Accept", "application/json")
         .json(&json!({
@@ -636,7 +645,7 @@ pub async fn refresh_gitee_token(refresh_token: &str) -> Result<GiteeTokenSet, S
 
 /// Verify a token and return the account login it authenticates as.
 async fn verify_token(provider: &str, token: &str) -> Result<String, String> {
-    let client = http_client();
+    let client = http_client()?;
     match provider {
         "github" => {
             let resp = client
@@ -687,7 +696,7 @@ async fn verify_token(provider: &str, token: &str) -> Result<String, String> {
 /// token lacking the key-write scope) only warns — API and git-over-proxy
 /// still work with the token.
 async fn upload_public_key(provider: &str, token: &str, public_line: &str) -> Result<(), String> {
-    let client = http_client();
+    let client = http_client()?;
     let title = "cogneva-contribution";
     match provider {
         "github" => {
@@ -1047,7 +1056,17 @@ pub async fn github_app_manifest_handler(
             .into_response();
     }
     let url = format!("{GITHUB_API}/app-manifests/{code}/conversions");
-    let resp = match http_client()
+    let client = match http_client() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "manifest_exchange_failed", "message": e})),
+            )
+                .into_response();
+        }
+    };
+    let resp = match client
         .post(&url)
         .header("Accept", "application/vnd.github+json")
         .header("User-Agent", "cogneva-security-gateway")
@@ -1212,7 +1231,17 @@ pub async fn github_app_discover_handler(
                 .into_response();
         }
     };
-    let resp = match http_client()
+    let client = match http_client() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "installations_lookup_failed", "message": e})),
+            )
+                .into_response();
+        }
+    };
+    let resp = match client
         .get(format!("{GITHUB_API}/app/installations"))
         .bearer_auth(jwt)
         .header("Accept", "application/vnd.github+json")
@@ -1372,7 +1401,16 @@ pub async fn device_start_handler(
             .into_response();
     };
 
-    let client = http_client();
+    let client = match http_client() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "device_start_failed", "message": e})),
+            )
+                .into_response();
+        }
+    };
     let resp = match client
         .post(GITHUB_DEVICE_CODE_URL)
         .header("Accept", "application/json")
@@ -1427,7 +1465,16 @@ pub async fn device_poll_handler(
     State(_state): State<Arc<crate::GatewayState>>,
     Json(req): Json<DevicePollRequest>,
 ) -> Response {
-    let client = http_client();
+    let client = match http_client() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "device_poll_failed", "message": e})),
+            )
+                .into_response();
+        }
+    };
     let resp = match client
         .post(GITHUB_TOKEN_URL)
         .header("Accept", "application/json")

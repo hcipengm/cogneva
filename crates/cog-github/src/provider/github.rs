@@ -48,6 +48,8 @@ pub struct GitHubProvider {
     base_branch: String,
     /// API 基址覆盖（安全网关透传端点）。None = 直连 api.github.com。
     api_base: Option<String>,
+    /// 非 octocrab 那几路（附件、CI job 日志）用的客户端，走系统 `http_client` 配置。
+    http: reqwest::Client,
 }
 
 impl GitHubProvider {
@@ -91,6 +93,7 @@ impl GitHubProvider {
             account: account.clone(),
             base_branch: base_branch.to_string(),
             api_base: api_base.map(|s| s.trim_end_matches('/').to_string()),
+            http: super::configured_http_client()?,
         })
     }
 
@@ -372,8 +375,7 @@ impl CodePlatformProvider for GitHubProvider {
         // Gateway mode (api_base like http://gw/github): fetch through the
         // zero-credential /attach proxy; direct mode: fetch the public URL.
         let root = self.api_base.as_deref().and_then(gateway_attach_root);
-        let http = reqwest::Client::new();
-        http_fetch_attachment(&http, root.as_deref(), url).await
+        http_fetch_attachment(&self.http, root.as_deref(), url).await
     }
 
     async fn fetch_ci_failure_logs(&self, run_id: u64) -> Result<Vec<CiJobLog>> {
@@ -409,7 +411,7 @@ impl CodePlatformProvider for GitHubProvider {
             return Ok(Vec::new());
         }
         let base = self.api_base.as_deref().unwrap_or("https://api.github.com");
-        let http = reqwest::Client::new();
+        let http = &self.http;
 
         let mut logs = Vec::new();
         let mut total_bytes = 0usize;

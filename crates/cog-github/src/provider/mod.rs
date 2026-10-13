@@ -11,6 +11,21 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 
+/// The HTTP client every provider here makes its non-SDK calls with.
+///
+/// Built from the system's `http_client` config section, like every other
+/// outbound client in this workspace: the settings that matter (timeouts,
+/// connection pool, proxy) belong to one place, and a provider that builds its
+/// own `reqwest::Client::new()` has none of them — no timeout at all, which
+/// means an upstream that stops answering hangs the caller instead of failing
+/// it. Fails loudly when that section is malformed rather than falling back to
+/// an unconfigured client, because the substituted one is indistinguishable
+/// downstream from the configured one.
+pub(crate) fn configured_http_client() -> Result<reqwest::Client> {
+    let config = cog_net::HttpClientConfig::load()?;
+    Ok(cog_net::build_client(&config)?)
+}
+
 /// Generic code platform operations used by Cogneva's self-evolution loop.
 #[async_trait]
 pub trait CodePlatformProvider: Send + Sync {

@@ -9,6 +9,9 @@ repository.workspace = true
 
 [dependencies]
 cog-core = { workspace = true }
+# 出站 HTTP 客户端取 cog-net 的那一份配置（超时/连接池/代理），
+# 不在这里自建裸客户端。
+cog-net = { workspace = true }
 
 tokio = { workspace = true }
 serde = { workspace = true }
