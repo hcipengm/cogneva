@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
@@ -97,6 +98,12 @@ pub struct GlobalAgentManager {
     /// the snapshot loads and everything that happened after it is gone, while
     /// every surface reports the checkpoint was written.
     wal_backend: Option<Arc<dyn cog_core::WalBackend>>,
+    /// Whether the pool has already said, out loud, that no backend was
+    /// attached. One line per pool: the wiring that supplies the backend is a
+    /// single call in the plugin, and a call that can be deleted without a word
+    /// is the same failure one level up from the two `with_wal` call sites. A
+    /// line per agent would bury it under its own repetition.
+    wal_missing_reported: AtomicBool,
     /// Where a spawned worker's loop archives a tool output too large for the
     /// context window. Shared by every worker, like the observability gateway.
     tool_output_archive: Option<Arc<dyn crate::archive::ToolOutputArchive>>,
@@ -138,6 +145,7 @@ impl GlobalAgentManager {
             observability: None,
             checkpoint_store: None,
             wal_backend: None,
+            wal_missing_reported: AtomicBool::new(false),
             tool_output_archive: None,
             heartbeat_interval_secs: cog_core::config::AgentConfig::default()
                 .heartbeat_interval_secs,
@@ -251,9 +259,22 @@ impl GlobalAgentManager {
     /// to spawn would turn a missing history into an outage. The log line names
     /// the consequence, because "no WAL" and "an empty WAL" look the same to
     /// every reader downstream.
+    ///
+    /// No backend at all reaches the same consequence from a different cause and
+    /// is reported the same way, once per pool at the first agent that asks. The
+    /// distinction is the whole point of the line: an empty WAL is this agent's
+    /// history, a missing backend is this process's wiring, and only the second
+    /// is fixed by editing a line of setup.
     async fn wal_for(&self, agent_id: impl AsRef<str>) -> Option<Arc<crate::wal::AgentWal>> {
         let agent_id = agent_id.as_ref();
-        let backend = self.wal_backend.as_ref()?;
+        let Some(backend) = self.wal_backend.as_ref() else {
+            if !self.wal_missing_reported.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "no WAL backend attached to this pool: every agent's checkpoint records event_offset 0, so a restore replays nothing after the snapshot"
+                );
+            }
+            return None;
+        };
         match crate::wal::AgentWal::new(backend.clone(), agent_id).await {
             Ok(wal) => Some(Arc::new(wal)),
             Err(e) => {

@@ -562,14 +562,23 @@ pub struct UnorderedInitRead {
 /// wiring break with no error anywhere. It is visible only across the two
 /// anomaly lists: the concrete value sits in `unconsumed` (published, nobody
 /// read it) and the trait object sits in `unsatisfied` (read, nobody published
-/// it), and the two answer to the same trailing type name. Read apart they
-/// look like two unrelated dead ends; together they are one break, and this is
-/// the pair that names it.
+/// it). Read apart they look like two unrelated dead ends; this pair names the
+/// two, and this is the shape the break takes.
+///
+/// What paired them is their **trailing type name** and nothing else, because
+/// the paths on the two sides differ by construction. Two different types can
+/// share one — a concrete `registry::AgentRegistry` and a contract's
+/// `dyn contract::agent::AgentRegistry` do — so a pair here is a suspicion to
+/// confirm against the two full names, not a verdict that they are the same
+/// type. The full names are both printed for exactly that: the reader is the
+/// one who can tell, and a pairing that claimed to know would be right on the
+/// samples it was built from and wrong on the first type that collides.
 #[derive(Clone, Debug)]
 pub struct PinIdentityMismatch {
     /// The pin a reader asked for and nothing published.
     pub read: Pin,
-    /// The pin something published and nobody read, under the same type name.
+    /// The pin something published and nobody read, under a trailing type name
+    /// the two sides share.
     pub published: Pin,
 }
 
@@ -721,7 +730,7 @@ impl PinAudit {
         }
         for m in &self.identity_mismatches {
             tracing::warn!(
-                "pin '{}' was read but never published, and pin '{}' was published but never read: the same type under two identities, so the publish and the read cannot meet",
+                "pin '{}' was read but never published, and pin '{}' was published but never read: they share a trailing type name, which is what paired them here -- read the two full names and confirm they really are the same type before treating this as one break",
                 m.read.name(),
                 m.published.name()
             );
