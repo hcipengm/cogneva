@@ -147,11 +147,21 @@ pub fn tree_from_environment() -> CheckTree {
 /// Why a check could not be settled, as a closed set.
 ///
 /// Closed because these are read as counts, and a count keyed by free text makes
-/// every distinct wording its own series. The five are five different owners and
-/// five different actions -- the tree could not be opened, the check has no
+/// every distinct wording its own series. The six are six different owners and
+/// six different actions -- the tree could not be opened, the check has no
 /// predicate, the predicate is a finding written out rather than a fragment, the
-/// check is about something this tree cannot hold, git itself failed -- and a
-/// number covering all five would name none of them.
+/// check is about something this tree cannot hold, the path the check names is
+/// simply not in this revision, git itself failed -- and a number covering all
+/// six would name none of them.
+///
+/// The line the set is drawn along is not which part of the judge failed but
+/// whether **a re-run of the same measurement could answer differently**. A look
+/// that failed ([`Self::GitFailed`], [`Self::RevisionUnreadable`]) and a path a
+/// later revision may have added ([`Self::ScopeAbsentInRevision`]) sit on the
+/// re-runnable side: the row keeps whatever a document said about it and is
+/// asked again. The rest name the row itself -- no evaluator for its kind, a
+/// predicate no line can hold, a path this tree structurally cannot hold -- and
+/// no later pass will ever move them, so they belong to the row instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnsettledReason {
     /// No revision to judge against could be resolved.
@@ -161,32 +171,49 @@ pub enum UnsettledReason {
     /// The predicate is a whole finding written out, so it names no fragment of
     /// this tree and no search for it can match.
     PredicateIsARendering,
-    /// The check names something this tree cannot hold, so it never ran.
+    /// The check names a path this tree structurally cannot hold -- a host
+    /// absolute path, another repository's path -- so it never ran and no
+    /// revision will change that.
     ScopeOutsideTree,
+    /// The check's scope is a path this revision does not have, but the tree
+    /// could hold it -- a directory not yet created. Unlike
+    /// [`Self::ScopeOutsideTree`] a later revision can answer differently, so
+    /// this leaves the row where it was rather than retracting it.
+    ScopeAbsentInRevision,
     /// git was asked and did not answer.
     GitFailed,
 }
 
 impl UnsettledReason {
     /// Every reason, for a reader that has to enumerate them.
-    pub const ALL: [UnsettledReason; 5] = [
+    pub const ALL: [UnsettledReason; 6] = [
         UnsettledReason::RevisionUnreadable,
         UnsettledReason::KindWithoutPredicate,
         UnsettledReason::PredicateIsARendering,
         UnsettledReason::ScopeOutsideTree,
+        UnsettledReason::ScopeAbsentInRevision,
         UnsettledReason::GitFailed,
     ];
 
     /// Whether this reason is a property of the row rather than of the look.
     ///
-    /// A look that failed -- git did not answer, the revision could not be read
-    /// -- can be run again, and until one succeeds the row keeps whatever a
-    /// document said about it. A predicate that is a rendering is not like that:
-    /// running it again measures the same nothing forever, so the row will never
-    /// be answered by a later pass and the reason has to reach the row rather
-    /// than only the pass's summary.
+    /// The test is whether re-running the same measurement could answer
+    /// differently. A look that failed -- git did not answer, the revision could
+    /// not be read -- can be run again, and a path this revision happens not to
+    /// have may be there next hour; until something changes those rows keep
+    /// whatever a document said about them. The rest cannot be moved by any
+    /// re-run: a check whose kind has no evaluator, a predicate that is a whole
+    /// finding, a path this tree structurally cannot hold. Running those again
+    /// measures the same nothing forever, so the reason has to reach the row
+    /// rather than only the pass's summary -- otherwise the row freezes in a
+    /// retry window that will never resolve it.
     pub fn is_about_the_row(self) -> bool {
-        matches!(self, UnsettledReason::PredicateIsARendering)
+        matches!(
+            self,
+            UnsettledReason::KindWithoutPredicate
+                | UnsettledReason::PredicateIsARendering
+                | UnsettledReason::ScopeOutsideTree
+        )
     }
 
     pub fn as_str(self) -> &'static str {
@@ -195,6 +222,7 @@ impl UnsettledReason {
             UnsettledReason::KindWithoutPredicate => "kind_without_predicate",
             UnsettledReason::PredicateIsARendering => "predicate_is_a_rendering",
             UnsettledReason::ScopeOutsideTree => "scope_outside_tree",
+            UnsettledReason::ScopeAbsentInRevision => "scope_absent_in_revision",
             UnsettledReason::GitFailed => "git_failed",
         }
     }
@@ -478,7 +506,7 @@ impl CheckTree {
                 Ok(true) => {}
                 Ok(false) => {
                     return CheckOutcome::unsettled(
-                        UnsettledReason::ScopeOutsideTree,
+                        UnsettledReason::ScopeAbsentInRevision,
                         format!("this revision has no `{scope}`, so the check cannot be run"),
                     )
                 }
@@ -565,7 +593,7 @@ impl CheckTree {
                 Ok(true) => {}
                 Ok(false) => {
                     return CheckOutcome::unsettled(
-                        UnsettledReason::ScopeOutsideTree,
+                        UnsettledReason::ScopeAbsentInRevision,
                         format!("this revision has no `{scope}`, so the check cannot be run"),
                     )
                 }
@@ -938,16 +966,23 @@ mod tests {
         assert!(snapshot().could_hold("deploy/helm/cogneva/gone.yaml"));
     }
 
-    /// The two absence kinds never settle, and say so in their own words: the
-    /// same three parts are written for both directions of the demand.
+    /// The two absence kinds never settle to a verdict, and say so in their own
+    /// words: the same three parts are written for both directions of the
+    /// demand. The row is retracted to `undecided` rather than left as it was --
+    /// no evaluator will ever read them, so the row would otherwise sit in a
+    /// retry window that never resolves, re-asked every hour for good.
     #[tokio::test]
-    async fn an_absence_check_never_settles_a_row() {
+    async fn an_absence_check_retracts_its_row_rather_than_landing_it() {
         let tree = CheckTree::new("/nonexistent", "main");
         for kind in ["absent", "missing"] {
             let outcome = tree
                 .judge(&snapshot(), &identity(kind, "crates/x", "y"))
                 .await;
-            assert_eq!(outcome.state(), None, "{kind} must not move a row");
+            assert_eq!(
+                outcome.state(),
+                Some(ChangeState::Undecided),
+                "{kind} is unmeasurable and must read as a criterion to rewrite"
+            );
             assert_eq!(
                 outcome.reason(),
                 Some(UnsettledReason::KindWithoutPredicate)
@@ -993,14 +1028,15 @@ mod tests {
     }
 
     /// An unknown kind is refused by name rather than treated as a miss: a check
-    /// this platform cannot evaluate is not a check that came back empty.
+    /// this platform cannot evaluate is not a check that came back empty. It is a
+    /// property of the row, so the row is retracted to `undecided`.
     #[tokio::test]
     async fn an_unknown_kind_is_named_rather_than_missed() {
         let tree = CheckTree::new("/nonexistent", "main");
         let outcome = tree
             .judge(&snapshot(), &identity("resembles", "crates/x", "y"))
             .await;
-        assert_eq!(outcome.state(), None);
+        assert_eq!(outcome.state(), Some(ChangeState::Undecided));
         assert_eq!(
             outcome.reason(),
             Some(UnsettledReason::KindWithoutPredicate)
@@ -1012,14 +1048,15 @@ mod tests {
     }
 
     /// A `grep` with no literal names nothing, so it cannot be run. Reading it as
-    /// a miss would land the row on an empty search.
+    /// a miss would land the row on an empty search; it is a property of the row,
+    /// so the row is retracted to `undecided`.
     #[tokio::test]
     async fn a_grep_with_no_literal_does_not_run() {
         let tree = CheckTree::new("/nonexistent", "main");
         let outcome = tree
             .judge(&snapshot(), &identity("grep", "crates/x", ""))
             .await;
-        assert_eq!(outcome.state(), None);
+        assert_eq!(outcome.state(), Some(ChangeState::Undecided));
         assert_eq!(
             outcome.reason(),
             Some(UnsettledReason::KindWithoutPredicate)
@@ -1032,7 +1069,9 @@ mod tests {
 
     /// A check about another tree is refused before any git call, and refused as
     /// its own reason rather than as a miss -- this is the whole difference
-    /// between a row about a sibling repository and an outstanding one.
+    /// between a row about a sibling repository and an outstanding one. No
+    /// revision can ever make this tree hold the path, so it is a property of the
+    /// row and the row is retracted to `undecided`.
     #[tokio::test]
     async fn a_cross_repository_scope_is_unsettled_not_missed() {
         let tree = CheckTree::new("/nonexistent", "main");
@@ -1045,7 +1084,7 @@ mod tests {
                 .await;
             assert_eq!(
                 outcome.state(),
-                None,
+                Some(ChangeState::Undecided),
                 "{kind} must not answer for another tree"
             );
             assert_eq!(outcome.reason(), Some(UnsettledReason::ScopeOutsideTree));
@@ -1392,25 +1431,50 @@ mod tests {
     /// Both ways a scope can fail to answer are exercised -- a top-level entry
     /// the project does not have at all, and a directory that is there but does
     /// not hold the file -- because they arrive by different routes and only the
-    /// first is caught by the root check.
+    /// first is caught by the root check. The two are different reasons, and the
+    /// difference is the whole point: the first is structural and no revision
+    /// will change it, so it is a property of the row and the row is retracted;
+    /// the second may be answered by a later revision, so the row is left where a
+    /// document put it. Sharing one reason froze the second kind in a retry
+    /// window that could never resolve them.
     #[tokio::test]
     async fn a_debt_check_about_a_path_outside_the_tree_is_left_unsettled() {
         let dir = repo(&[("crates/other/src/lib.rs", "pub fn x() {}\n")]);
         let tree = CheckTree::new(dir.path().join("bare"), "main");
         let snapshot = fixture_snapshot(&tree).await;
-        for scope in ["elsewhere/Cargo.toml", "crates/gone/Cargo.toml"] {
-            let outcome = tree
-                .judge(
-                    &snapshot,
-                    &identity(DEPENDENCY_EDGE_KIND, scope, "cog-llm ="),
-                )
-                .await;
-            assert_eq!(
-                outcome.reason(),
-                Some(UnsettledReason::ScopeOutsideTree),
-                "`{scope}` answered {outcome:?}"
-            );
-            assert_eq!(outcome.state(), None, "`{scope}` moved a row");
-        }
+        // `elsewhere` is not a top-level entry this project has, so the tree can
+        // never hold the path -- a row property.
+        let outside = tree
+            .judge(
+                &snapshot,
+                &identity(DEPENDENCY_EDGE_KIND, "elsewhere/Cargo.toml", "cog-llm ="),
+            )
+            .await;
+        assert_eq!(
+            outside.reason(),
+            Some(UnsettledReason::ScopeOutsideTree),
+            "{outside:?}"
+        );
+        assert!(outside.reason().is_some_and(|r| r.is_about_the_row()));
+        assert_eq!(outside.state(), Some(ChangeState::Undecided), "{outside:?}");
+        // `crates` exists but `crates/gone` does not: a later revision can add it,
+        // so this is about the look and the row is not touched.
+        let absent = tree
+            .judge(
+                &snapshot,
+                &identity(
+                    DEPENDENCY_EDGE_KIND,
+                    "crates/gone/Cargo.toml",
+                    "cog-llm =",
+                ),
+            )
+            .await;
+        assert_eq!(
+            absent.reason(),
+            Some(UnsettledReason::ScopeAbsentInRevision),
+            "{absent:?}"
+        );
+        assert!(!absent.reason().is_some_and(|r| r.is_about_the_row()));
+        assert_eq!(absent.state(), None, "a re-runnable scope must move no row");
     }
 }

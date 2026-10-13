@@ -31,9 +31,13 @@
 //! A row whose check could not be run keeps the state a document gave it and is
 //! named in the pass's own line, so "nothing has looked at this" and "something
 //! looked and could not tell" stay apart -- and the count of the second is a
-//! reading rather than a silence. Not being able to tell is not final either:
-//! such a row is asked again after [`UNMEASURABLE_RETRY`], because why it could
-//! not be settled is a property of a tree that moves.
+//! reading rather than a silence. Whether the row is asked again turns on
+//! whether a re-run could answer differently: a look that failed, or a path this
+//! revision happens not to have, is a property of a tree that moves and is asked
+//! again after [`UNMEASURABLE_RETRY`]; a reason that is a property of the row
+//! itself -- no evaluator for its kind, a predicate no line can hold, a path the
+//! tree structurally cannot hold -- is retracted to `undecided` instead of being
+//! re-asked forever, because re-asking measures the same nothing every time.
 //!
 //! The second reading source is the project's own debt registries: two files in
 //! the tree listing dependencies that are owed removal and core modules that are
@@ -595,11 +599,15 @@ fn module_readings(lines: &[(String, String)]) -> Vec<ChangeReading> {
 /// does have is the reason, which is said once per identity and then counted, so
 /// the steady state is a number rather than a wall of repeats.
 ///
-/// Leaving a row alone is not the same as giving up on it. What could not be
-/// settled is a property of the tree, and the tree moves: a path that is not
-/// there this hour can be there the next. So an identity is unanswered for
-/// [`UNMEASURABLE_RETRY`] and then asked again, which is what keeps "we cannot
-/// tell" from hardening into a row that is never looked at again.
+/// Leaving a row alone is not the same as giving up on it. When what could not
+/// be settled is a property of the tree, the tree moves: a path that is not
+/// there this hour can be there the next, so an identity is unanswered for
+/// [`UNMEASURABLE_RETRY`] and then asked again. That covers only the reasons a
+/// re-run could change -- a failed look, a scope this revision lacks. A reason
+/// that is a property of the row itself never resolves on a re-run, so it is not
+/// left in this window at all: the evaluator retracts the row to `undecided`
+/// (see [`UnsettledReason::is_about_the_row`]), which is what keeps a
+/// bad check from being re-asked every hour forever.
 ///
 /// Nothing here is raised: a pass is a maintenance tick, the next tick is the
 /// retry, and every tick leaves a line either way.
@@ -699,12 +707,14 @@ async fn measure_pass(
         match state {
             ChangeState::Landed => landed += 1,
             ChangeState::Pending => absent += 1,
-            // A row whose predicate is a finding written out is retracted to
-            // `undecided` by the evaluator: it carried a tree verdict that no
-            // look could have reached with that predicate. Counted separately
-            // from the unsettled kinds below, because this one *did* write its
-            // state -- it is the count of rows that left the outstanding set by
-            // being unmeasurable rather than by being done.
+            // A row whose reason is a property of the row rather than of the
+            // look -- no evaluator for its kind, a predicate that is a finding
+            // written out, a path this tree structurally cannot hold -- is
+            // retracted to `undecided` by the evaluator: it carried a state no
+            // later pass could ever reach. Counted separately from the unsettled
+            // kinds below, because this one *did* write its state -- it is the
+            // count of rows that left the outstanding set by being unmeasurable
+            // rather than by being done.
             ChangeState::Undecided => undecided += 1,
             // A settled look otherwise answers with one of exactly two states,
             // both named above. A fourth reaching here would be one the
@@ -1256,7 +1266,7 @@ mod tests {
         by_reason.insert(UnsettledReason::GitFailed, 1);
         assert_eq!(
             reason_summary(&by_reason),
-            "revision_unreadable 0, kind_without_predicate 0, predicate_is_a_rendering 0, scope_outside_tree 12, git_failed 1"
+            "revision_unreadable 0, kind_without_predicate 0, predicate_is_a_rendering 0, scope_outside_tree 12, scope_absent_in_revision 0, git_failed 1"
         );
     }
 
@@ -1267,7 +1277,7 @@ mod tests {
     fn a_pass_that_could_settle_everything_still_names_the_reasons() {
         assert_eq!(
             reason_summary(&HashMap::new()),
-            "revision_unreadable 0, kind_without_predicate 0, predicate_is_a_rendering 0, scope_outside_tree 0, git_failed 0"
+            "revision_unreadable 0, kind_without_predicate 0, predicate_is_a_rendering 0, scope_outside_tree 0, scope_absent_in_revision 0, git_failed 0"
         );
     }
 
