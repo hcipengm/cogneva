@@ -42,15 +42,7 @@ impl ObservedLlmClient {
     /// 后端记**——路由为了绕开限流会在一条流里换后端，那是路由的事；在这里
     /// 重数一遍会把同一次调用报成多次，按用量算的成本就随换手次数涨价了。
     fn record_response(&self, response: &ChatResponse, latency_ms: u64) {
-        if response.error_message.is_some() {
-            self.obs.record_error();
-        } else {
-            self.obs.record_call(
-                response.usage.input as u64,
-                response.usage.output as u64,
-                latency_ms,
-            );
-        }
+        record_terminal(&self.obs, response, latency_ms);
     }
 }
 
@@ -65,6 +57,22 @@ fn is_content_delta(event: &AssistantMessageEvent) -> bool {
             | AssistantMessageEvent::ThinkingDelta { .. }
             | AssistantMessageEvent::ToolCallDelta { .. }
     )
+}
+
+/// 按最终响应记这一跳的账：响应带错误只记一次错误，成功才记 usage 和耗时。
+///
+/// 非流式收尾和转发流读到底后的收尾是同一笔账，挂在同一个入口上，
+/// 两条路径才不会各写各的、把同一次调用数出两个结果。
+fn record_terminal(obs: &LlmObservable, response: &ChatResponse, latency_ms: u64) {
+    if response.error_message.is_some() {
+        obs.record_error();
+    } else {
+        obs.record_call(
+            response.usage.input as u64,
+            response.usage.output as u64,
+            latency_ms,
+        );
+    }
 }
 
 /// 把内部流原样转发出去，途中记 TTFT，流结束时记这一跳的结果。
@@ -93,15 +101,7 @@ fn observed_stream(
         }
         let response = stream.result().await;
         let latency_ms = start.elapsed().as_millis() as u64;
-        if response.error_message.is_some() {
-            obs.record_error();
-        } else {
-            obs.record_call(
-                response.usage.input as u64,
-                response.usage.output as u64,
-                latency_ms,
-            );
-        }
+        record_terminal(&obs, &response, latency_ms);
         producer.end(response);
     });
     out
