@@ -36,4 +36,4 @@ pub use a2a::{
     A2aClient, A2aTask, AgentAuthentication, AgentCapabilities, AgentCard, AgentSkill, TaskStatus,
 };
 pub use mcp::{McpClient, McpServer, McpTransport};
-pub use transport::{SseTransport, MCP_PROTOCOL_VERSION};
+pub use transport::{transport_from_config, SseTransport, StdioTransport, MCP_PROTOCOL_VERSION};

@@ -51,19 +51,25 @@ impl cog_core::SystemPlugin for ProtocolPlugin {
     async fn init(&mut self, ctx: &cog_core::PluginContext) -> cog_core::SFResult<()> {
         // ── MCP client ──
         if self.mcp_client.is_none() {
-            if let Ok(ref mcp_endpoint) = std::env::var("COGNEVA_MCP_ENDPOINT") {
-                // Built here rather than at the first call: the client comes from
-                // the `http_client` config section, and an endpoint or a config
-                // that cannot be used is a startup finding, not something to
-                // discover as a failed tool call much later.
-                let transport = Box::new(crate::SseTransport::new(mcp_endpoint)?);
-                let client: Arc<dyn cog_core::McpClient> =
-                    Arc::new(crate::McpClient::new(transport));
-                self.mcp_client = Some(client.clone());
-                ctx.publish_service(client);
-                info!("ProtocolPlugin MCP client initialized: {}", mcp_endpoint);
-            } else {
-                info!("ProtocolPlugin MCP client not configured");
+            // Built here rather than at the first call: the client comes from
+            // the `http_client` config section, and an endpoint or a config
+            // that cannot be used is a startup finding, not something to
+            // discover as a failed tool call much later. The same goes for the
+            // stdio side, whose command is spawned on the same terms.
+            let selection = crate::transport_from_config(
+                std::env::var("COGNEVA_MCP_ENDPOINT").ok(),
+                std::env::var("COGNEVA_MCP_COMMAND").ok(),
+                std::env::var("COGNEVA_MCP_ARGS").ok(),
+            )?;
+            match selection {
+                Some((transport, how)) => {
+                    let client: Arc<dyn cog_core::McpClient> =
+                        Arc::new(crate::McpClient::new(transport));
+                    self.mcp_client = Some(client.clone());
+                    ctx.publish_service(client);
+                    info!("ProtocolPlugin MCP client initialized: {how}");
+                }
+                None => info!("ProtocolPlugin MCP client not configured"),
             }
         }
 
