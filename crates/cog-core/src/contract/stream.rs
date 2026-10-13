@@ -147,12 +147,25 @@ pub trait MessageBackend: Send + Sync {
     }
 
     /// Publish a message after a delay.
-    /// The default implementation spawns a local timer and calls
-    /// [`Self::publish`] when it fires.  Redis-backed implementations
-    /// may override this with a sorted-set + background worker for
-    /// durability across restarts.
-    async fn delay_publish(&self, _subject: &str, _payload: &[u8], _delay_ms: u64) -> SFResult<()> {
-        Ok(())
+    ///
+    /// The default waits `delay_ms` and then calls [`Self::publish`], so a
+    /// backend that does not override this still delivers the message; what it
+    /// does not do is deliver it *without holding the caller*: the default
+    /// cannot spawn, because a trait-object method only ever has `&self` and a
+    /// spawned task must own a `'static` handle. A backend that can hand one
+    /// out overrides this and returns immediately — the NATS backend does, with
+    /// a timer and a clone of itself, which is the shape the default cannot
+    /// express.
+    ///
+    /// The body used to be `Ok(())`, while this comment promised a timer that
+    /// published when it fired. Every backend that did not override it
+    /// therefore dropped the message and reported success — the one outcome no
+    /// caller can see, from the one method whose whole job is to not lose it.
+    async fn delay_publish(&self, subject: &str, payload: &[u8], delay_ms: u64) -> SFResult<()> {
+        if delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+        self.publish(subject, payload).await
     }
 }
 
