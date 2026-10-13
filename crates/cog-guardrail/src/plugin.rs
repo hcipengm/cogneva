@@ -53,7 +53,8 @@ impl cog_core::SystemPlugin for GuardrailPlugin {
         composite.add_guard(Box::new(crate::ToolGuard::new(
             crate::ToolGuardConfig::default(),
         )));
-        info!("Guardrail initialized (Prompt + Content + PII + Tool)");
+        composite.add_guard(Box::new(crate::principle_shapes::PrincipleShapeGuard));
+        info!("Guardrail initialized (Prompt + Content + PII + Tool + PrincipleShapes)");
 
         let guardrail: Arc<dyn cog_core::Guardrail> = Arc::new(composite);
         ctx.publish_service(guardrail);

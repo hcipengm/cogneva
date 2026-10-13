@@ -9,6 +9,7 @@ pub mod observable;
 pub mod pii_detector;
 pub mod plugin;
 pub mod policy;
+pub mod principle_shapes;
 pub mod prompt_guard;
 pub mod tool_guard;
 

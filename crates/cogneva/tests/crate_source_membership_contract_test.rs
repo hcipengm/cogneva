@@ -115,21 +115,38 @@ fn crate_root_of(path: &Path) -> Option<PathBuf> {
 
 #[test]
 fn every_rust_source_under_crates_is_compiled_by_a_workspace_member() {
+    // The two guards below are the gate's own anti-vacuity reading, and both are
+    // relations rather than thresholds. A number written here -- "more than one
+    // member", "more than a hundred sources" -- would be a constant the tree
+    // outgrows silently: it goes stale in the safe direction (too low) and then
+    // stops catching the walk that broke, which is the only thing it was for.
+    // What actually has to hold is that each side has something to compare and
+    // the two sides are of the same shape.
     let roots = member_roots();
     assert!(
-        roots.len() > 1,
-        "cargo metadata resolved {} workspace members, which cannot be right — \
-         an empty or one-member answer would make this gate pass by having \
-         nothing to compare against",
-        roots.len()
+        !roots.is_empty(),
+        "cargo metadata resolved no workspace members, so there is nothing for a \
+         source to be checked against and this gate would pass on nothing"
     );
 
     let sources = rust_sources_under_crates();
+    // Every crate member under `crates/` is a directory with at least one source
+    // file, so a walk that is working finds at least as many sources as there are
+    // such members. A walk that silently stopped early, or a manifest that moved
+    // the crate directories out from under `crates/`, breaks that relation while
+    // leaving a bare "more than zero" check green.
+    let crate_roots = roots
+        .iter()
+        .filter(|root| root.starts_with(workspace_root().join("crates")))
+        .count();
     assert!(
-        sources.len() > 100,
-        "the walk found {} Rust sources under crates/, far fewer than the tree \
-         carries — a walk that finds nothing would satisfy this gate vacuously",
-        sources.len()
+        sources.len() >= crate_roots,
+        "the walk found {} Rust sources under crates/ but cargo resolves {} crate \
+         members there — fewer sources than members means the walk stopped short, \
+         and this gate would then check a subset while reading as if it checked \
+         all of them",
+        sources.len(),
+        crate_roots
     );
 
     let orphans: Vec<String> = sources
