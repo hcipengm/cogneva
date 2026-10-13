@@ -36,9 +36,10 @@ async fn http_client_posts_json_to_mock_server() {
         socket.write_all(response).await.unwrap();
     });
 
-    let http: Arc<dyn HttpClient> = Arc::new(cog_net::ReqwestHttpClient::from_config(
-        &cog_net::HttpClientConfig::default(),
-    ));
+    let http: Arc<dyn HttpClient> = Arc::new(
+        cog_net::ReqwestHttpClient::from_config(&cog_net::HttpClientConfig::default())
+            .expect("the default config is a buildable one"),
+    );
     let client = HttpControlPlaneClient::new(endpoint).with_client(http);
     let status = SupervisorStatus {
         cycle: 42,
@@ -69,9 +70,10 @@ async fn http_client_returns_error_on_non_2xx() {
         socket.write_all(response.as_bytes()).await.unwrap();
     });
 
-    let http: Arc<dyn HttpClient> = Arc::new(cog_net::ReqwestHttpClient::from_config(
-        &cog_net::HttpClientConfig::default(),
-    ));
+    let http: Arc<dyn HttpClient> = Arc::new(
+        cog_net::ReqwestHttpClient::from_config(&cog_net::HttpClientConfig::default())
+            .expect("the default config is a buildable one"),
+    );
     let client = HttpControlPlaneClient::new(endpoint).with_client(http);
     let status = SupervisorStatus {
         cycle: 1,

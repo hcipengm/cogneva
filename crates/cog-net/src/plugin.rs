@@ -5,17 +5,18 @@ use tracing::info;
 
 /// Network plugin that provides HTTP and WebSocket clients.
 pub struct NetPlugin {
-    #[allow(dead_code)]
-    http_config: Option<crate::HttpClientConfig>,
     http_client: Option<Arc<crate::ReqwestHttpClient>>,
     websocket_client: Option<Arc<crate::TungsteniteWebSocketClient>>,
 }
 
 impl NetPlugin {
     /// Create a plugin that will build clients from config during `init`.
+    ///
+    /// The config it builds from is cog-net's own `http_client` section of
+    /// `cogneva.json`, read at init time; there is no constructor that takes
+    /// one, so the file is the single source for it.
     pub fn new() -> Self {
         Self {
-            http_config: None,
             http_client: None,
             websocket_client: None,
         }
@@ -27,7 +28,6 @@ impl NetPlugin {
         websocket_client: Arc<crate::TungsteniteWebSocketClient>,
     ) -> Self {
         Self {
-            http_config: None,
             http_client: Some(http_client),
             websocket_client: Some(websocket_client),
         }
@@ -52,7 +52,7 @@ impl cog_core::SystemPlugin for NetPlugin {
         } else {
             // http_client 是 cog-net 自有配置段，自读 cogneva.json。
             let config = crate::HttpClientConfig::load()?;
-            Arc::new(crate::ReqwestHttpClient::from_config(&config))
+            Arc::new(crate::ReqwestHttpClient::from_config(&config)?)
         };
 
         let ws = if let Some(ref client) = self.websocket_client {

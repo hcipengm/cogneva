@@ -1199,21 +1199,30 @@ pub fn operands(argv: &[String]) -> Vec<String> {
 /// 函数在 `wiring_from_config` 里先于任何骨干的早退被调用。
 fn platform_from_env() -> Option<(Arc<dyn PlatformRunner>, String)> {
     let settings = BridgeSettings::from_env()?;
-    let (runner, base) = platform_from_settings(settings);
+    let (runner, base) = platform_from_settings(settings)?;
     Some((Arc::new(runner), base))
 }
 
 /// 把一份端点配置变成平台端口，并把它的身份一并交出。端点从环境读还是从别处读与这里无关，
 /// 所以这两段分开：接线本身能被单测钉住，而不用去动进程的环境变量。
-fn platform_from_settings(settings: BridgeSettings) -> (PlatformApiRunner, String) {
+///
+/// http 客户端建不出来时交回 `None` 而不是拿默认客户端顶上：配好的 http_client 段就是
+/// 调用方要的那一份，换一个没超时没代理的顶上，读起来与配过的一模一样。
+fn platform_from_settings(settings: BridgeSettings) -> Option<(PlatformApiRunner, String)> {
     let base = settings.base.clone();
-    let http: Arc<dyn HttpClient> = Arc::new(cog_net::factory::ReqwestHttpClient::from_config(
-        &cog_net::HttpClientConfig::load().unwrap_or_else(|e| {
-            tracing::warn!("http client config is unreadable ({e}); platform bridge uses defaults");
-            Default::default()
-        }),
-    ));
-    (PlatformApiRunner::new(http, settings), base)
+    let config = cog_net::HttpClientConfig::load().unwrap_or_else(|e| {
+        tracing::warn!("http client config is unreadable ({e}); platform bridge uses defaults");
+        Default::default()
+    });
+    let http: Arc<dyn HttpClient> = match cog_net::factory::ReqwestHttpClient::from_config(&config)
+    {
+        Ok(client) => Arc::new(client),
+        Err(e) => {
+            tracing::warn!("http client cannot be built from http_client ({e}); platform bridge is absent rather than unconfigured");
+            return None;
+        }
+    };
+    Some((PlatformApiRunner::new(http, settings), base))
 }
 
 /// 组装这一次跑的依赖：骨干与裁判来自 `llm_routing`，缺了就缺席，不猜。
@@ -2053,7 +2062,8 @@ mod tests {
     fn a_configured_endpoint_is_wired_and_a_missing_one_is_not() {
         let settings = BridgeSettings::from_parts(Some("http://platform.test/"), None, None)
             .expect("a base is enough to configure the bridge");
-        let (runner, base) = platform_from_settings(settings);
+        let (runner, base) = platform_from_settings(settings)
+            .expect("the default http client config is a buildable one");
         // 报出去的身份与真正用上的端点是同一个：两处走散的端点比不报还坏。
         assert_eq!(base, "http://platform.test");
         assert_eq!(runner.base(), "http://platform.test");

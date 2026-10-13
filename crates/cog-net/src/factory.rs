@@ -11,7 +11,12 @@ use tracing::{info, warn};
 
 /// Build a [`reqwest::Client`] from [`HttpClientConfig`].
 /// This is the simplest entry-point when you just need a concrete client.
-pub fn build_client(config: &HttpClientConfig) -> Client {
+///
+/// Fails rather than handing back an unconfigured client. A client built
+/// without the timeouts, pool and proxy the caller asked for is not the client
+/// they asked for, and a silently substituted one reads downstream exactly like
+/// a configured one — the caller cannot tell which settings are in force.
+pub fn build_client(config: &HttpClientConfig) -> SFResult<Client> {
     let mut builder = Client::builder()
         .timeout(Duration::from_secs(config.timeout_secs))
         .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
@@ -24,21 +29,22 @@ pub fn build_client(config: &HttpClientConfig) -> Client {
     }
 
     if let Some(ref proxy_url) = config.proxy_url {
-        match reqwest::Proxy::all(proxy_url) {
-            Ok(proxy) => {
-                info!(proxy_url = %proxy_url, "HTTP proxy configured");
-                builder = builder.proxy(proxy);
-            }
-            Err(e) => {
-                warn!(proxy_url = %proxy_url, error = %e, "Failed to parse proxy URL; skipping proxy");
-            }
-        }
+        // An unparsable proxy is a configuration error, not a reason to carry
+        // on without one: going direct is the one thing a caller who
+        // configured a proxy did not ask for, and it would be discovered only
+        // by the traffic appearing where it was not meant to.
+        let proxy = reqwest::Proxy::all(proxy_url).map_err(|e| {
+            SFError::Config(format!(
+                "http_client.proxy_url {proxy_url:?} is not a URL: {e}"
+            ))
+        })?;
+        info!(proxy_url = %proxy_url, "HTTP proxy configured");
+        builder = builder.proxy(proxy);
     }
 
-    builder.build().unwrap_or_else(|e| {
-        warn!(error = %e, "Failed to build HTTP client from config; falling back to default");
-        Client::new()
-    })
+    builder
+        .build()
+        .map_err(|e| SFError::Config(format!("http client could not be built from config: {e}")))
 }
 
 /// A [`cog_core::HttpClient`] implementation backed by [`reqwest::Client`].
@@ -54,8 +60,8 @@ impl ReqwestHttpClient {
     }
 
     /// Build from [`HttpClientConfig`] via [`build_client`].
-    pub fn from_config(config: &HttpClientConfig) -> Self {
-        Self::new(build_client(config))
+    pub fn from_config(config: &HttpClientConfig) -> SFResult<Self> {
+        Ok(Self::new(build_client(config)?))
     }
 }
 
@@ -169,7 +175,8 @@ mod tests {
 
     #[test]
     fn default_factory_builds_client() {
-        let _client = build_client(&HttpClientConfig::default());
+        let _client = build_client(&HttpClientConfig::default())
+            .expect("the default config is a buildable one");
     }
 
     #[test]
@@ -179,12 +186,29 @@ mod tests {
             connect_timeout_secs: 5,
             ..Default::default()
         };
-        let _client = build_client(&config);
+        let _client = build_client(&config).expect("a timeout is a buildable config");
     }
 
     #[test]
     fn reqwest_http_client_from_config() {
-        let client = ReqwestHttpClient::from_config(&HttpClientConfig::default());
+        let client = ReqwestHttpClient::from_config(&HttpClientConfig::default())
+            .expect("the default config is a buildable one");
         let _ = client.inner;
+    }
+
+    /// The point of the failure path: a config that cannot be honoured has to
+    /// come back as an error. Handing back a client built without the proxy
+    /// would leave the caller sending their traffic direct while believing it
+    /// goes through the proxy they configured.
+    #[test]
+    fn an_unusable_config_is_an_error_and_not_a_default_client() {
+        let config = HttpClientConfig {
+            proxy_url: Some("not a url".into()),
+            ..Default::default()
+        };
+        assert!(
+            build_client(&config).is_err(),
+            "an unparsable proxy has to fail the build, not be dropped"
+        );
     }
 }
