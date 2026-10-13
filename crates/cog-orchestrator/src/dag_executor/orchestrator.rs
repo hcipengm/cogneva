@@ -48,7 +48,7 @@ pub struct DagExecutor {
     task_lease: chrono::Duration,
     inner: RwLock<Inner>,
     retry_matrix: RetryMatrix,
-    dlq: Option<Box<dyn DeadLetterQueue>>,
+    dlq: Option<Arc<dyn DeadLetterQueue>>,
     circuit_registry: Option<Arc<CircuitBreakerRegistry>>,
     event_tx: Option<broadcast::Sender<cog_core::TaskEvent>>,
     raw_logger: Option<Arc<dyn cog_core::RawLogger>>,
@@ -740,7 +740,7 @@ impl DagExecutor {
         self
     }
 
-    pub fn with_dlq(mut self, dlq: Box<dyn DeadLetterQueue>) -> Self {
+    pub fn with_dlq(mut self, dlq: Arc<dyn DeadLetterQueue>) -> Self {
         self.dlq = Some(dlq);
         self
     }
@@ -759,7 +759,7 @@ impl DagExecutor {
     }
 
     pub fn dlq(&self) -> Option<&dyn DeadLetterQueue> {
-        self.dlq.as_ref().map(|b| b.as_ref())
+        self.dlq.as_deref()
     }
 
     /// Submit a goal by dynamically injecting tasks into the existing DAG.

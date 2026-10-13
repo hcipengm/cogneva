@@ -27,10 +27,21 @@ impl RedisDeadLetterQueue {
         let connection = cog_redis::connect(&client)
             .await
             .map_err(|e| SFError::Redis(e.to_string()))?;
-        Ok(Self {
+        Ok(Self::from_connection(connection, queue_key))
+    }
+
+    /// Wrap a connection the caller already holds. A deployment opens one
+    /// connection to Redis and hands the same manager to every backend that
+    /// needs one, so a component that is wired from that shared channel takes
+    /// this rather than dialling a second one of its own.
+    pub fn from_connection(
+        connection: redis::aio::ConnectionManager,
+        queue_key: impl Into<String>,
+    ) -> Self {
+        Self {
             connection,
             queue_key: queue_key.into(),
-        })
+        }
     }
 }
 

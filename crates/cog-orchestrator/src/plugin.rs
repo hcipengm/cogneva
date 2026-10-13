@@ -106,11 +106,35 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
             )
         };
 
+        // ── Dead-letter queue ──
+        //
+        // The executor writes a task here once `fail_task` reports it can never
+        // succeed. The concrete backend is the storage plugin's to own; this
+        // plugin speaks the `cog-core` trait and consumes the service, exactly
+        // as it takes the state backend, raw logger and message backend above.
+        // Taken with `require_service`, not `consume_service`, so a deployment
+        // that publishes no queue fails here by name rather than starting an
+        // executor whose permanently-failed tasks silently go nowhere -- which
+        // is the state this wiring exists to end.
+        let dlq = ctx.require_service::<dyn cog_core::DeadLetterQueue>()?;
+
         // ── Build DagExecutor ──
+        //
+        // The circuit-breaker registry is deliberately not wired here. The
+        // executor records successes and failures into it, but nothing ever
+        // calls the registry's `allow()` gate and no metric reads its state, so
+        // a wired registry would accumulate breaker state nobody consumes -- a
+        // mechanism with no reader, which is a second source of truth about
+        // task health rather than a control on it. Making it live is a separate
+        // change that has to add the reader (a dispatch-site `allow()` check);
+        // until then the field stays `None` on purpose, and the reason is
+        // written down here so "never built" and "built but never read" do not
+        // look the same from outside.
         let dag_executor = crate::DagExecutor::new(workspace_id.clone())
             .with_event_tx(task_event_tx.clone())
             .with_raw_logger(raw_logger.clone())
             .with_state_backend(state_backend.clone())
+            .with_dlq(dlq)
             .with_batch_persistence(
                 batch_persistence_enabled,
                 batch_persistence_max_changes,

@@ -57,6 +57,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
             pg_acquire_timeout_secs,
             pg_idle_timeout_secs,
             redis_url,
+            dag_workspace_id,
             raw_logger_config,
             _tier_migrator_enabled,
             data_dir,
@@ -92,6 +93,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
                 config.system.pg_acquire_timeout_secs,
                 config.system.pg_idle_timeout_secs,
                 config.dag_executor.redis_url.clone(),
+                config.dag_executor.workspace_id.clone(),
                 config.raw_logger.clone(),
                 config.tier_migrator.enabled,
                 config.app.data_dir.clone(),
@@ -550,6 +552,26 @@ impl cog_core::SystemPlugin for StoragePlugin {
             .map_err(|e| cog_core::SFError::Config(format!("Redis connection failed: {}", e)))?;
         info!("Redis connection established");
         ctx.publish(Arc::new(RedisClient(redis_client)));
+
+        // ── Dead-letter queue (Redis) ──
+        //
+        // The executor moves a task here after `fail_task` reports that it can
+        // never succeed; with no queue on the other end that move is a return
+        // value nobody acts on and the task is dropped with nothing recording
+        // it. Published rather than built by the orchestrator because the
+        // concrete backend lives in this crate: the orchestrator speaks the
+        // `DeadLetterQueue` trait from `cog-core` and consumes the service, the
+        // same shape as the state backend, raw logger and object backend above.
+        // It reuses the connection opened just above -- one process keeps one
+        // shared Redis manager, not one per backend.
+        let dead_letter_queue: Arc<dyn cog_core::DeadLetterQueue> = Arc::new(
+            crate::RedisDeadLetterQueue::from_connection(
+                redis_conn.clone(),
+                format!("orchestrator:dlq:{dag_workspace_id}"),
+            ),
+        );
+        ctx.publish_service(dead_letter_queue);
+        info!("StoragePlugin dead-letter queue published");
 
         // ── AgentRegistry (Redis) ──
         let agent_registry = crate::RedisAgentRegistry::new(redis_conn)
