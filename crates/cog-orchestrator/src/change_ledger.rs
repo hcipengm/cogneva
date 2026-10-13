@@ -60,8 +60,11 @@ use tracing::{debug, info, warn};
 use cog_core::{
     ChangeIdentity, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement, ChangeReading,
     ChangeSource, ChangeState, DispatchDecision, DispatchState, LlmPoolStatus, OrchestratorControl,
-    OwnerLeaseBroker, PoolReading, ShutdownSignal, Task, TaskType,
+    OwnerLeaseBroker, PoolReading, ShutdownSignal, Task, TaskStatus, TaskType,
 };
+
+use cog_core::contract::llm::UpstreamFailure;
+use cog_core::contract::outcome::{declares, TERMINAL_ENV_FAILURE_PREFIX};
 
 use crate::change_measure::{
     CheckTree, UnsettledReason, DEPENDENCY_EDGE_KIND, DEV_DEPENDENCY_EDGE_KIND,
@@ -194,7 +197,7 @@ const RELOCATION_REASON: &str = "pending-relocation";
 /// about the registry row.
 const CORE_MODULE_LIST: &str = "crates/cog-core/src/lib.rs";
 
-/// The task id a change is dispatched under.
+/// The task id a change is dispatched under, at a given handover generation.
 ///
 /// Derived from the identity, because that is the whole mechanism: this loop
 /// re-reads the same outstanding set every few minutes, and an id that moved
@@ -207,14 +210,100 @@ const CORE_MODULE_LIST: &str = "crates/cog-core/src/lib.rs";
 /// second one finds the first one's row in the graph and takes it for its own.
 /// Each part is terminated as it is fed in, so no split of the same characters
 /// hashes the same either.
-fn dispatch_task_id(identity: &ChangeIdentity) -> String {
+///
+/// The generation is the one part that is not the identity. A handover whose
+/// task died to the environment leaves the change exactly as owed, so handing it
+/// over again needs an id the graph does not already hold. Generation 0 is the
+/// identity alone -- the id every handover carried before generations existed --
+/// so a change dispatched earlier is still found under its own id and taken to
+/// be in flight, not filed a second time. Only a re-arm moves the generation, and
+/// only on the arm of [`classify_handover`] that says the environment, not the
+/// change, is why the last attempt did not happen.
+fn dispatch_task_id(identity: &ChangeIdentity, generation: u32) -> String {
     let mut hasher = blake3::Hasher::new();
     for part in [&identity.kind, &identity.scope, &identity.literal] {
         hasher.update(part.as_bytes());
         hasher.update(&[0]);
     }
     let hex = hasher.finalize().to_hex();
-    format!("{DISPATCH_TASK_PREFIX}{}", &hex[..16])
+    if generation == 0 {
+        format!("{DISPATCH_TASK_PREFIX}{}", &hex[..16])
+    } else {
+        format!("{DISPATCH_TASK_PREFIX}{}-r{generation}", &hex[..16])
+    }
+}
+
+/// What the graph's row for a change says about that change.
+///
+/// Reading the row rather than its mere presence. `is_some` was the whole test
+/// until now, and it cannot tell a change being worked from one whose task died
+/// to the environment: both leave a row under the id. The two are opposite. An
+/// environment refusal is not the change being unworkable, it is the work not
+/// having happened -- the change is still owed, and its row is not the handover
+/// it looks like. A failure for a reason that is the change's own is the
+/// opposite: the graph is the one retry authority, so a task that died on what
+/// the change asked for is a row this loop must not file again.
+enum Handover {
+    /// A task is queued, scheduled or running: the change is being worked now.
+    InFlight,
+    /// The task finished. The tree is about to show it and the next measurement
+    /// is what moves the row, so this loop files nothing.
+    Completed,
+    /// The task died for a reason that is the work's. The change stayed put, the
+    /// one retry authority has spent its budget, and a second handover here
+    /// would be a second answer to "was this tried enough".
+    DeadWork,
+    /// The task died to the environment -- a refusal that says "not this time",
+    /// not "not this change". The change is still owed.
+    DeadEnvironment,
+}
+
+/// Whether a failure named the environment rather than the work.
+///
+/// Read from the two channels the fail path writes, because the typed one is not
+/// always there: the transport fills `error_cause` only when it saw a status
+/// code, and a refusal discovered a crate deeper travels as text alone. A reason
+/// that declares `terminal_env_failure` is an environment refusal even when its
+/// typed cause was lost, and a reason that names a typed environment failure is
+/// one even when the text never wrote the word.
+fn is_environment_failure(reason: Option<&str>, cause: Option<UpstreamFailure>) -> bool {
+    if cause.is_some_and(UpstreamFailure::is_environment_failure) {
+        return true;
+    }
+    let Some(reason) = reason else {
+        return false;
+    };
+    declares(reason, TERMINAL_ENV_FAILURE_PREFIX)
+        || UpstreamFailure::named_in(reason).is_some_and(UpstreamFailure::is_environment_failure)
+}
+
+/// What a dispatched change's graph row says about it. See [`Handover`].
+fn classify_handover(task: &Task) -> Handover {
+    match task.status {
+        TaskStatus::Pending | TaskStatus::Scheduled | TaskStatus::Running => Handover::InFlight,
+        TaskStatus::Completed => Handover::Completed,
+        TaskStatus::Failed | TaskStatus::Cancelled => {
+            if is_environment_failure(task.error.as_deref(), task.error_cause) {
+                Handover::DeadEnvironment
+            } else {
+                Handover::DeadWork
+            }
+        }
+    }
+}
+
+/// How many generations a change may be handed over under before this loop
+/// leaves it to the graph.
+///
+/// Not a number chosen here: it is the retry budget the change's own task type
+/// carries ([`crate::dag_executor::RetryMatrix::defaults`]), so an environment
+/// failure costs the change the same number of attempts a work failure would
+/// have. The cap only binds the pathological case -- an upstream reporting
+/// itself available and then refusing every handover -- and reaching it leaves
+/// the change owed and named in the pass line rather than re-filed forever.
+fn dispatch_rearm_limit() -> u32 {
+    crate::dag_executor::RetryMatrix::defaults()
+        .max_retries(&TaskType::Custom(DISPATCH_TASK_KIND.to_string()))
 }
 
 /// What a dispatched change is worked on as.
@@ -874,12 +963,17 @@ fn dispatchable(
 /// good, and the tree would never show why.
 ///
 /// The task's id is derived from the change's identity, so a change handed over
-/// once is never handed over twice: this loop re-reads the same outstanding set
-/// every period, and the graph's own row is what remembers the handover. That is
-/// also why nothing here re-submits a change whose task has failed. Retrying is a
-/// policy with a budget, and the task already carries one; a second retry
-/// authority inside the ledger would be a second answer to "has this been tried
-/// enough", in the same table whose point is one answer per question.
+/// once is not handed over again by accident: this loop re-reads the same
+/// outstanding set every period, and the graph's own row is what remembers the
+/// handover. Retrying is a policy with a budget, and the task carries one; the
+/// ledger runs no second retry authority. What the ledger does is read the row
+/// the graph holds rather than only whether it holds one, and act on the one
+/// answer that is not a retry question at all: an attempt that did not happen at
+/// all -- a handover the environment returned -- is not a change that has been
+/// tried, so it is handed over again under the next generation. Which reason is
+/// the environment's is [`classify_handover`]'s answer, and the generation is
+/// bounded by the task type's own retry budget, so this is one authority reading
+/// its own verdict and not a second one.
 ///
 /// A dispatched change's state is not touched. Handing work over is not doing it,
 /// and a row moved because a task was filed would have the ledger reporting a
@@ -975,17 +1069,50 @@ async fn dispatch_pass(
 
     let mut submitted = 0usize;
     let mut already = 0usize;
+    let mut rearmed = 0usize;
+    let mut dead_environment = 0usize;
     let mut failed = 0usize;
+    let rearm_limit = dispatch_rearm_limit();
     for row in &pending {
-        let task_id = dispatch_task_id(&row.identity);
         // The graph is read before the submission rather than the submission's
         // answer being read after it: the goal path treats a repeated id as a
         // fault, so a pass that submitted blind would leave a line saying the
-        // handover failed while the change was in fact handed over.
-        if orchestrator.get_task(&task_id).await.is_some() {
-            already += 1;
+        // handover failed while the change was in fact handed over. What is read
+        // is the row and not its presence: a change whose last handover the
+        // environment returned is still owed, and the id it already holds would
+        // otherwise read as work in progress for the rest of the account's life.
+        // The generation the handover goes out under is the first slot the graph
+        // does not hold.
+        let mut generation = 0u32;
+        let mut held: Option<Handover> = None;
+        while generation <= rearm_limit {
+            let id = dispatch_task_id(&row.identity, generation);
+            let Some(task) = orchestrator.get_task(&id).await else {
+                break;
+            };
+            match classify_handover(&task) {
+                // An environment's refusal is not this change's answer, so the
+                // next generation is where its handover goes -- unless the budget
+                // is spent, and then the change is left owed and named instead of
+                // re-filed forever.
+                Handover::DeadEnvironment if generation < rearm_limit => generation += 1,
+                verdict => {
+                    held = Some(verdict);
+                    break;
+                }
+            }
+        }
+        if let Some(verdict) = held {
+            match verdict {
+                Handover::DeadEnvironment => dead_environment += 1,
+                _ => already += 1,
+            }
             continue;
         }
+        if generation > 0 {
+            rearmed += 1;
+        }
+        let task_id = dispatch_task_id(&row.identity, generation);
         let goal = dispatch_goal(row);
         let task = Task::new(
             task_id,
@@ -1022,7 +1149,9 @@ async fn dispatch_pass(
     info!(
         pending = pending.len(),
         submitted,
+        rearmed,
         already_handed_over = already,
+        already_dead_environment = dead_environment,
         failed,
         unmeasurable,
         pool = verdict.reading.as_str(),
@@ -1499,8 +1628,23 @@ mod tests {
     fn the_task_id_is_the_same_string_for_the_same_identity() {
         let one = ChangeIdentity::new("grep", "crates/x", "fn thing");
         let two = ChangeIdentity::new("grep", "crates/x", "fn thing");
-        assert_eq!(dispatch_task_id(&one), dispatch_task_id(&two));
-        assert!(dispatch_task_id(&one).starts_with(DISPATCH_TASK_PREFIX));
+        assert_eq!(dispatch_task_id(&one, 0), dispatch_task_id(&two, 0));
+        assert!(dispatch_task_id(&one, 0).starts_with(DISPATCH_TASK_PREFIX));
+    }
+
+    /// Generation 0 is the identity alone -- the id every handover carried before
+    /// generations existed -- so a change dispatched earlier is still found under
+    /// its own id and read as in flight rather than filed a second time. A re-arm
+    /// is the one thing that moves it, and it has to move it, or the goal path
+    /// would take the repeated id for the handover already under way.
+    #[test]
+    fn only_a_rearm_moves_the_generation() {
+        let id = ChangeIdentity::new("grep", "crates/x", "fn thing");
+        let base = dispatch_task_id(&id, 0);
+        assert_eq!(base.len(), DISPATCH_TASK_PREFIX.len() + 16);
+        assert_ne!(dispatch_task_id(&id, 1), base);
+        assert_ne!(dispatch_task_id(&id, 1), dispatch_task_id(&id, 2));
+        assert!(!dispatch_task_id(&id, 1).starts_with(&format!("{base}-r0")));
     }
 
     /// Two identities that render the same string must not share an id. The
@@ -1514,8 +1658,52 @@ mod tests {
         let split_late = ChangeIdentity::new("grep", "a:b", "c");
         assert_eq!(split_early.as_key(), split_late.as_key());
         assert_ne!(
-            dispatch_task_id(&split_early),
-            dispatch_task_id(&split_late)
+            dispatch_task_id(&split_early, 0),
+            dispatch_task_id(&split_late, 0)
+        );
+    }
+
+    /// The two verdicts a finished task can carry are opposites, and the row the
+    /// graph holds does not say which without being read. An environment refusal
+    /// leaves the change owed; the change's own failure does not.
+    #[test]
+    fn an_environment_refusal_is_told_from_the_works_own_failure() {
+        let env = Task::new(
+            "id".to_string(),
+            TaskType::Custom("change_ledger".into()),
+            serde_json::json!({}),
+        );
+        let mut dead_env = env.clone();
+        dead_env.status = TaskStatus::Failed;
+        dead_env.error = Some(
+            "Agent execution error: terminal_env_failure: environment_error: \
+             LLM upstream refused (auth_rejected)"
+                .into(),
+        );
+        assert!(matches!(
+            classify_handover(&dead_env),
+            Handover::DeadEnvironment
+        ));
+
+        let mut dead_work = env.clone();
+        dead_work.status = TaskStatus::Failed;
+        dead_work.error = Some("degenerate_loop: the same failure repeated".into());
+        assert!(matches!(classify_handover(&dead_work), Handover::DeadWork));
+
+        let mut in_flight = env;
+        in_flight.status = TaskStatus::Running;
+        assert!(matches!(classify_handover(&in_flight), Handover::InFlight));
+    }
+
+    /// The re-arm budget is the task type's own retry budget, not a number this
+    /// module chose: an environment failure must cost the change the same number
+    /// of attempts a work failure would have.
+    #[test]
+    fn the_rearm_budget_is_the_task_types_rearm_budget() {
+        assert_eq!(
+            dispatch_rearm_limit(),
+            crate::dag_executor::RetryMatrix::defaults()
+                .max_retries(&TaskType::Custom(DISPATCH_TASK_KIND.to_string()))
         );
     }
 
