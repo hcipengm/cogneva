@@ -34,10 +34,10 @@
 //!   list fails, and so does a directory, so a mechanism cannot arrive by being
 //!   added — only by being registered, which is a decision someone has to write
 //!   down.
-//! - The mechanisms the relocation owes are registered in [`RELOCATION_TARGET`]
-//!   with the crate they are going to, so the entry that lets a mechanism stay
-//!   is the entry that says where it is going. That list is asserted in both
-//!   directions, so it empties itself as the work lands.
+//! - The mechanisms the relocation owes register their destination in the
+//!   registry's own `destination` column, so the entry that lets a mechanism
+//!   stay is the entry that says where it is going. That column is asserted in
+//!   both directions, so the debt empties itself as the work lands.
 //! - The core's own dependencies are a closed set with no workspace crate in it,
 //!   and [`DEPS_TO_DROP`] names what the relocation is going to make unnecessary.
 //!
@@ -75,8 +75,25 @@ use std::sync::OnceLock;
 /// against the list.
 const CORE_MODULES_FILE: &str = "debt/core-modules.tsv";
 
-fn core_root_modules() -> &'static [(&'static str, &'static str)] {
-    static ROWS: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
+/// One row of the module registry: the module, why it is a contract, and — when
+/// a move is owed — where it is going and in which shape.
+struct CoreModuleRow {
+    module: &'static str,
+    reason: &'static str,
+    destination: Option<(&'static str, Owed)>,
+}
+
+/// The rows of the module registry, parsed once.
+///
+/// The destination is read from the registry's own `destination` column rather
+/// than from a second list in this file, because the file has two readers and a
+/// `const` has one. A running binary cannot see a `const`, so the loop that
+/// hands these rows over could not learn where a module was going and left every
+/// module row undispatched; a column the tree carries is readable by both, so the
+/// registry and the loop agree about the destination by construction rather than
+/// by being kept in step.
+fn core_root_rows() -> &'static [CoreModuleRow] {
+    static ROWS: OnceLock<Vec<CoreModuleRow>> = OnceLock::new();
     ROWS.get_or_init(|| {
         read_debt(CORE_MODULES_FILE)
             .lines()
@@ -87,7 +104,77 @@ fn core_root_modules() -> &'static [(&'static str, &'static str)] {
                 if module == "module" {
                     return None;
                 }
-                Some((leak(module), leak(field.next().unwrap_or(""))))
+                let reason = field.next().unwrap_or("");
+                let destination = match field.next().map(str::trim) {
+                    None | Some("") => None,
+                    Some(spec) => Some(parse_destination(spec, module)),
+                };
+                Some(CoreModuleRow {
+                    module: leak(module),
+                    reason: leak(reason),
+                    destination,
+                })
+            })
+            .collect()
+    })
+}
+
+/// The registry as `(module, reason)` pairs, for the readers that do not care
+/// where a module is going.
+fn core_root_modules() -> &'static [(&'static str, &'static str)] {
+    static ROWS: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
+    ROWS.get_or_init(|| {
+        core_root_rows()
+            .iter()
+            .map(|row| (row.module, row.reason))
+            .collect()
+    })
+}
+
+/// A row's `destination` column as `(crate, owed)`.
+///
+/// The column is `target shape`, the shape drawn from [`Owed`]. Anything else
+/// fails loudly rather than being dropped: a row silently losing its destination
+/// would read as "not owed a move" and stop being dispatched, which is the one
+/// failure the column was added to make impossible, and an empty crate or a
+/// second word is a plan nothing downstream could carry out.
+fn parse_destination(spec: &str, module: &str) -> (&'static str, Owed) {
+    let mut parts = spec.split_whitespace();
+    let crate_name = parts.next().unwrap_or("");
+    let owed = match parts.next() {
+        Some("direct") => Owed::Direct,
+        Some("split") => Owed::Split,
+        other => panic!(
+            "{CORE_MODULES_FILE} registers `{module}` with destination `{spec}`, whose shape \
+             `{other:?}` is not one of `direct|split`"
+        ),
+    };
+    assert!(
+        parts.next().is_none(),
+        "{CORE_MODULES_FILE} registers `{module}` with destination `{spec}`, which carries more \
+         than a crate and a shape"
+    );
+    assert!(
+        !crate_name.is_empty(),
+        "{CORE_MODULES_FILE} registers `{module}` with an empty destination crate"
+    );
+    (leak(crate_name), owed)
+}
+
+/// Where each mechanism is going, from the registry's own destination column:
+/// `(module, destination crate, owed)`.
+///
+/// Derived rather than written down a second time — the registry is the one
+/// carrier, and a list here would be a second copy the loop could not read and
+/// free to disagree with the column it is meant to describe.
+fn relocation_target() -> &'static [(String, String, Owed)] {
+    static ROWS: OnceLock<Vec<(String, String, Owed)>> = OnceLock::new();
+    ROWS.get_or_init(|| {
+        core_root_rows()
+            .iter()
+            .filter_map(|row| {
+                let (destination, owed) = row.destination?;
+                Some((row.module.to_string(), destination.to_string(), owed))
             })
             .collect()
     })
@@ -157,7 +244,8 @@ const MODULE_REASONS: &[&str] = &[
     // The crate root itself.
     "crate-root",
     // A mechanism that is in the core today and is owed a move to the crate
-    // that owns it. See `RELOCATION_TARGET`.
+    // that owns it. Such a row's `destination` column names that crate and the
+    // shape of the move.
     "pending-relocation",
 ];
 
@@ -175,12 +263,11 @@ enum Owed {
     /// the destination. Nothing else has to change for the move to be legal, so
     /// the work is the move and nothing here can be satisfied by relabelling.
     ///
-    /// No row claims this shape today: every module the registry sends has a
-    /// reader the destination cannot reach. The variant stays because the shape
-    /// stays -- the day a module's readers all reach its destination is the day
-    /// this gate is looking for, and dropping the variant would drop the ability
-    /// to register that module.
-    #[allow(dead_code)]
+    /// No row claims this shape today, but the registry can spell it: a
+    /// `destination` column reading `direct` yields this variant. The shape
+    /// stays because the day a module's readers all reach its destination is the
+    /// day this gate is looking for, and dropping the variant would drop the
+    /// ability to register that module.
     Direct,
     /// The module is a contract and a mechanism in one file, and no existing
     /// crate both reads it and is reachable from the destination. It leaves in
@@ -191,53 +278,12 @@ enum Owed {
     Split,
 }
 
-/// Where each mechanism is going: `(module, destination crate, owed)`.
-///
-/// The two directions are both asserted, so this is a debt list and not a
-/// permission: a module registered as awaiting relocation has to name its
-/// destination, and the destination has to be a module that is registered that
-/// way. The list ends at empty, and until it does, each row says which crate the
-/// work goes to rather than why the module may stay.
-///
-/// The destinations are existing crates rather than a new one: the direction of
-/// the dependency graph decides who can hold what, and a crate the consumers
-/// already depend on is the one whose relocation does not invent an edge. The
-/// modules that reach `/proc` or take a `flock` are the same family and have to
-/// land together, because they call each other.
-///
-/// What each destination means depends on [`Owed`]: for a `Direct` row it is
-/// where the module ends up, and for a `Split` row it is where the half that
-/// keeps state ends up. A `Split` row's destination is therefore *not* a crate
-/// its readers depend on -- it is chosen by which crate already runs the
-/// mechanism, and the readers never touch it.
-const RELOCATION_TARGET: &[(&str, &str, Owed)] = &[
-    // Runs the control law in `cog-eval`, the crate that drives the gate through
-    // a whole cycle. `cog-reflection` was named here before the readers were
-    // counted, and it cannot be the destination: `cog-eval` is a reader, so the
-    // move would add `cog-eval -> cog-reflection`, and `cog-reflection` already
-    // depends on `cog-eval` -- the edge would close a cycle rather than lengthen
-    // a path.
-    ("admission", "cog-eval", Owed::Split),
-    // `build_cache_readings` was registered here and is not any more: its two
-    // readers both reach the core and neither reaches the other, so no shared
-    // destination exists, and the module stays whole under a definition reason
-    // that names its driver.
-    // `build_cache_reclaim` was registered here and is not any more. Its row
-    // said `cog-extension` runs the reclaim because `measure_and_enforce` is the
-    // only producer call, which is not true: the call is in the core's own
-    // `enforce_cap`, reached from the `cog-extension` workdir and from the
-    // core's watch that `cog-reflection` spawns, and those two crates do not
-    // depend on each other. No destination reaches every consumer, so the
-    // mechanism stays in the core under a reason that names the driver the core
-    // keeps running it.
-    // The destination's rollout and change-pipeline paths are the ones that
-    // acquire the slot, so the mechanism half goes there; the core reads
-    // `dir_identity` and the `CacheSlot` registration, so the contract half
-    // stays.
-    ("build_gate", "cog-reflection", Owed::Split),
-    // The crate that publishes the health readings the loops are watched by.
-    ("loop_health", "cog-observability", Owed::Split),
-];
+/// Where each mechanism is going is not written here: it is the registry's own
+/// `destination` column, read by [`relocation_target`]. What each destination
+/// means depends on [`Owed`]: for a `Direct` row it is where the module ends up,
+/// and for a `Split` row it is where the half that keeps state ends up, which is
+/// *not* a crate the module's readers depend on -- it is chosen by which crate
+/// already runs the mechanism, and the readers never touch it.
 
 /// Where a split module's contract half lands: the core's `contract` module,
 /// under the module's own name.
@@ -487,26 +533,20 @@ fn pending_relocation() -> BTreeSet<String> {
 /// to drift from the bytes it reads, which is the drift the move to the file
 /// forbids.
 ///
-/// The modules owed a move are named again by [`RELOCATION_TARGET`], a second
-/// list by design, so their names are skipped: every other module has no home in
-/// this file, and a hit means the table has grown back.
+/// The destinations used to be named here too, in a `const` the loop could not
+/// read; they live in the registry's `destination` column now, so there is no
+/// module name this file is entitled to spell and every one of them is checked.
 #[test]
 fn the_module_rows_live_in_the_file_and_not_in_this_test() {
     assert!(
-        !core_root_modules().is_empty(),
+        !core_root_rows().is_empty(),
         "{CORE_MODULES_FILE} parsed to no rows — the registry reads nothing and would pass every \
          assertion by having nothing to check"
     );
     let this_file = file!();
     let source = read_own_source();
-    let named_by_destination: BTreeSet<&str> = RELOCATION_TARGET
-        .iter()
-        .map(|(module, _, _)| *module)
-        .collect();
-    for (module, _) in core_root_modules() {
-        if named_by_destination.contains(module) {
-            continue;
-        }
+    for row in core_root_rows() {
+        let module = row.module;
         assert!(
             !source.contains(&format!("\"{module}\"")),
             "`{module}` is written into {this_file} instead of {CORE_MODULES_FILE} — the loop \
@@ -565,24 +605,34 @@ fn every_mechanism_owed_a_move_names_where_it_is_going() {
     let ws = Workspace::read();
     let owed = pending_relocation();
 
+    // A destination only exists for a module owed a move. A row carrying one
+    // under any other reason is the registry disagreeing with itself: the
+    // destination column says "going here" while the reason says "staying".
+    let stray: Vec<&str> = core_root_rows()
+        .iter()
+        .filter(|row| row.destination.is_some() && row.reason != "pending-relocation")
+        .map(|row| row.module)
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "these modules name a destination but are not registered as awaiting relocation: \
+         {stray:?} — a module is owed a move when its reason says so, and the destination column \
+         is that statement's other half"
+    );
+
     let mut destinations: BTreeMap<String, String> = BTreeMap::new();
-    for (module, destination, _owed) in RELOCATION_TARGET {
+    for (module, destination, _owed) in relocation_target() {
         assert!(
-            ws.members.contains(*destination),
-            "RELOCATION_TARGET sends `{module}` to `{destination}`, which is not a workspace member"
+            ws.members.contains(destination.as_str()),
+            "the registry sends `{module}` to `{destination}`, which is not a workspace member"
         );
         assert_ne!(
-            *destination, CORE,
-            "RELOCATION_TARGET sends `{module}` to the core, which is where it already is — a \
+            destination.as_str(),
+            CORE,
+            "the registry sends `{module}` to the core, which is where it already is — a \
              relocation whose destination is its source is not a plan"
         );
-        assert!(
-            owed.contains(*module),
-            "RELOCATION_TARGET names `{module}` as a module to move, but CORE_ROOT_MODULES does \
-             not register it as awaiting relocation — either it has moved and the row here is \
-             stale, or the two lists have stopped agreeing about what is a mechanism"
-        );
-        destinations.insert(module.to_string(), destination.to_string());
+        destinations.insert(module.clone(), destination.clone());
     }
     // The other direction: a module registered as awaiting relocation has to
     // name where it is going, or the registration is a description of a problem
@@ -881,7 +931,7 @@ fn a_relocation_the_readers_already_reach_names_an_edge_that_is_there() {
     let root = workspace_root();
     let mut unreachable = Vec::new();
     let mut understated = Vec::new();
-    for (module, destination, owed) in RELOCATION_TARGET {
+    for (module, destination, owed) in relocation_target() {
         let blocking = blocking_readers(&root, &ws, module, destination);
         match owed {
             // A `Direct` row claims the move needs no new edge, read against the
@@ -890,7 +940,7 @@ fn a_relocation_the_readers_already_reach_names_an_edge_that_is_there() {
             // A `Split` row claims the opposite, that no whole move is possible.
             // An empty set is a module that could have moved whole, under a label
             // that says it could not.
-            Owed::Split if blocking.is_empty() => understated.push(*module),
+            Owed::Split if blocking.is_empty() => understated.push(module.as_str()),
             Owed::Split => {}
         }
     }
@@ -911,10 +961,10 @@ fn a_relocation_the_readers_already_reach_names_an_edge_that_is_there() {
     // nothing. This reads over every row rather than counting the `direct` ones:
     // that count reached zero the moment the last module the core reads was
     // correctly relabelled, which is a legal end state, not an empty check.
-    let unread: Vec<&str> = RELOCATION_TARGET
+    let unread: Vec<&str> = relocation_target()
         .iter()
         .filter(|(module, _, _)| readers_of(&root, &ws.members, module, true).is_empty())
-        .map(|(module, _, _)| *module)
+        .map(|(module, _, _)| module.as_str())
         .collect();
     assert!(
         unread.is_empty(),

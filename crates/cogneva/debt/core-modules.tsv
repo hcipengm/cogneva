@@ -1,18 +1,36 @@
 # core 源根里的模块欠账的单一来源。契约测试与本树的运行环读同一份字节。
 #
-# 一个模块一行，制表符分隔：module  reason
-#   module  core 源根里的模块名（目录与 .rs 都登记，只是 kind 不同）
-#   reason  它为什么是契约而不是能力，取值见下面的闭集。
+# 一个模块一行，制表符分隔：module  reason  destination
+#   module       core 源根里的模块名（目录与 .rs 都登记，只是 kind 不同）
+#   reason       它为什么是契约而不是能力，取值见下面的闭集。
+#   destination  欠账的去处，只有 reason = pending-relocation 的行才非空
 #
 # reason 出自闭集（见契约测试里的 MODULE_REASONS），不是散文：一条写句子的登记
 # 不管句子真假都作同样的声明，而登记一个模块的意义正在于这句话能被拿去对着闭集
 # 核对。
 #
+# destination 编码成「目标crate 形状」，形状出自闭集 direct|split（见契约测试里的
+# Owed）：光有目的地不算计划，能不能整体搬取决于谁读它。
+#   direct  模块整体搬过去，每个读它的 crate 都已经依赖目标，别的什么都不用改。
+#   split   模块一半契约一半机制，没有既读它又够得着目标的 crate：契约那半留在
+#           core 的 contract/ 下（根部的登记看不见它），留状态的那半搬到目标。
+#           读者不动，因为它们已经够得着 cog-core。
+# 空列＝还没定终点。一个还在搬迁、却没有终点的行没有可下发的目标，因此只当读数、
+# 不派活；这也正是这个文件如今长出一列的原因——环要读到终点才派得出去。
+#
+# 目标都是既有 crate 而不是新开的：依赖图的方向决定谁能装谁，读者的依赖已经指向
+# 的 crate 才是搬过去不凭空造一条边的那个；够得着 /proc、取 flock 的模块是同一族，
+# 得一起落，因为它们互相调用。
+#
 # 与 dependency-edges.tsv 同一个理由放在树里：运行中的二进制读不到 const，只能
 # 读树；一份文件两个读者（编译期测试 + 运行期环）读同字节，改一个字节两边同时变。
 
-module	reason
-admission	pending-relocation
+module	reason	destination
+# 在 cog-eval 里跑控制律——那个 crate 驱动整个门的一次完整循环。早先记的是
+# cog-reflection，数过读者之后不行：cog-eval 是读者，整体搬会加上
+# cog-eval -> cog-reflection，而 cog-reflection 已经依赖 cog-eval，那条边会成环
+# 而不是接长一条路。
+admission	pending-relocation	cog-eval split
 audit	shared-definition
 build_cache	shared-definition
 # cog-extension 与 cog-reflection 各自构造一个 readings 对象并 spawn watch 环，
@@ -25,14 +43,17 @@ build_cache_readings	shared-definition-with-driver
 # （由 cog-reflection spawn）到达。cog-extension 与 cog-reflection 互不依赖，
 # 所以没有目标 crate 够得着每个消费者，机制随运行它的 core driver 留下。
 build_cache_reclaim	shared-mechanism-with-core-driver
-build_gate	pending-relocation
+# 目标 crate 的 rollout 与 change-pipeline 路径才是取构建槽的人，所以留状态的那半
+# 去那里；core 自己读 dir_identity 与 CacheSlot 登记，所以契约那半留下。
+build_gate	pending-relocation	cog-reflection split
 claim_footprint	shared-definition
 config	shared-config
 config_sections	shared-config
 error	shared-error
 fs_size	shared-definition
 lib	crate-root
-loop_health	pending-relocation
+# 发布 loop 健康读数、以此为生地被监视的那个 crate。
+loop_health	pending-relocation	cog-observability split
 observability_text	shared-definition
 secrets	shared-definition
 token_estimate	shared-definition
