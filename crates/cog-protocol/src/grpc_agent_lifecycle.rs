@@ -122,6 +122,15 @@ pub struct AgentLifecycleGrpcHandler {
     /// a durable fact: after a restart it reads unknown until the next
     /// heartbeat, which is exactly what it knows.
     states: std::sync::Mutex<HashMap<String, String>>,
+    /// The last ReAct iteration each agent reported, by agent id.
+    ///
+    /// The agent already puts this number on the wire: every reasoning step
+    /// emits a `ReActStepStart`/`ReActStepEnd` event carrying it, and both
+    /// arrive here through the same upload path as any other event. What was
+    /// missing was a place to keep it -- so `QueryState` had to answer the
+    /// proto's `iteration` field as a constant zero, which is indistinguishable
+    /// from an agent that genuinely never took a step.
+    iterations: std::sync::Mutex<HashMap<String, u32>>,
 }
 
 impl AgentLifecycleGrpcHandler {
@@ -135,6 +144,31 @@ impl AgentLifecycleGrpcHandler {
             event_tx,
             router,
             states: std::sync::Mutex::new(HashMap::new()),
+            iterations: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Record the iteration an event carries, when it carries one.
+    ///
+    /// Only the ReAct step events do. This is called on the way in for every
+    /// event, so keeping the newest is the rule: an agent's iteration only
+    /// moves forward, and a late-delivered older step must not pull the answer
+    /// back down.
+    fn note_iteration(&self, event: &AgentEvent) {
+        let iteration = match event {
+            AgentEvent::ReActStepStart { iteration, .. }
+            | AgentEvent::ReActStepEnd { iteration, .. } => *iteration,
+            _ => return,
+        };
+        let agent_id = match event {
+            AgentEvent::ReActStepStart { agent_id, .. }
+            | AgentEvent::ReActStepEnd { agent_id, .. } => agent_id,
+            _ => return,
+        };
+        let mut map = self.iterations.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = map.entry(agent_id.clone()).or_insert(iteration);
+        if iteration > *entry {
+            *entry = iteration;
         }
     }
 }
@@ -354,10 +388,23 @@ impl AgentLifecycle for AgentLifecycleGrpcHandler {
             }
             (None, None) => "unknown".into(),
         };
+        // Zero is the honest answer for an agent that has reported no step
+        // yet: it is the value the field holds before any reasoning has
+        // happened, which is exactly the state of an agent that has not run.
+        let iteration = self
+            .iterations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&req.agent_id)
+            .copied()
+            .unwrap_or(0);
+        // The wire field is signed and the count is not; an agent cannot take
+        // more steps than fit, so the cap is a formality, not a value.
+        let iteration = i32::try_from(iteration).unwrap_or(i32::MAX);
         Ok(Response::new(QueryStateResp {
             agent_id: req.agent_id,
             state,
-            iteration: 0,
+            iteration,
         }))
     }
 
@@ -368,6 +415,7 @@ impl AgentLifecycle for AgentLifecycleGrpcHandler {
         let req = request.into_inner();
         let event: AgentEvent = serde_json::from_str(&req.event_json)
             .map_err(|e| Status::invalid_argument(format!("invalid event_json: {}", e)))?;
+        self.note_iteration(&event);
         let _ = self.event_tx.send(SupervisorEvent::AgentEventReported {
             agent_id: req.agent_id.clone(),
             event: event.clone(),
@@ -390,6 +438,7 @@ impl AgentLifecycle for AgentLifecycleGrpcHandler {
         while let Some(req) = stream.message().await? {
             agent_id = req.agent_id.clone();
             if let Ok(event) = serde_json::from_str::<AgentEvent>(&req.event_json) {
+                self.note_iteration(&event);
                 let _ = self.event_tx.send(SupervisorEvent::AgentEventReported {
                     agent_id: req.agent_id.clone(),
                     event,
@@ -908,5 +957,103 @@ mod tests {
             .expect("the query answers")
             .into_inner();
         assert_eq!(stranger.state, "unknown");
+    }
+
+    /// The iteration an agent reports has to come back out of the query, on the
+    /// same basis as the state above: the agent already puts the number on the
+    /// wire with every reasoning step, and the field it answers with is read by
+    /// whoever asks. A constant zero is not a safe default -- it is the same
+    /// answer a query for an agent that never took a step gets.
+    ///
+    /// Driven the same way, over a real socket, for the same reason: the claim
+    /// is about what a client of this service gets.
+    #[tokio::test]
+    async fn the_iteration_an_agent_reports_is_the_iteration_the_query_answers() {
+        let addr = free_port();
+        let handler = {
+            let registry = Arc::new(StubRegistry::default());
+            registry.register(&registration("a-1")).await.unwrap();
+            let (tx, _rx) = broadcast::channel(16);
+            AgentLifecycleGrpcHandler::new(
+                registry as Arc<dyn AgentRegistry>,
+                tx,
+                AgentCommandRouter::new(),
+            )
+        };
+        let server =
+            crate::agent_lifecycle::agent_lifecycle_server::AgentLifecycleServer::new(handler);
+        let (_handle, _stop) = crate::plugin::spawn_grpc_server(server, addr);
+
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let mut client =
+            crate::agent_lifecycle::agent_lifecycle_client::AgentLifecycleClient::connect(format!(
+                "http://{addr}"
+            ))
+            .await
+            .expect("the server is listening on the port it was given");
+
+        let step = |iteration: u32| {
+            serde_json::to_string(&AgentEvent::ReActStepStart {
+                agent_id: "a-1".into(),
+                iteration,
+                timestamp: chrono::Utc::now(),
+            })
+            .expect("a step is serialisable")
+        };
+        for iteration in [3u32, 4] {
+            client
+                .report_event(ReportEventReq {
+                    agent_id: "a-1".into(),
+                    event_json: step(iteration),
+                })
+                .await
+                .expect("the event is accepted");
+        }
+
+        let answered = client
+            .query_state(QueryStateReq {
+                agent_id: "a-1".into(),
+            })
+            .await
+            .expect("the query answers")
+            .into_inner();
+        assert_eq!(
+            answered.iteration, 4,
+            "the query answers with the step the agent reached"
+        );
+
+        // A late-delivered step carries a number the agent has already moved
+        // past; the answer does not walk backwards to meet it.
+        client
+            .report_event(ReportEventReq {
+                agent_id: "a-1".into(),
+                event_json: step(2),
+            })
+            .await
+            .expect("the event is accepted");
+        let answered = client
+            .query_state(QueryStateReq {
+                agent_id: "a-1".into(),
+            })
+            .await
+            .expect("the query answers")
+            .into_inner();
+        assert_eq!(answered.iteration, 4, "an older step does not pull it back");
+
+        // An agent that never took a step is not given one it never took.
+        let stranger = client
+            .query_state(QueryStateReq {
+                agent_id: "nobody".into(),
+            })
+            .await
+            .expect("the query answers")
+            .into_inner();
+        assert_eq!(stranger.iteration, 0, "no step reported, no step answered");
     }
 }
