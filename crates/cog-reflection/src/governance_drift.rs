@@ -653,9 +653,7 @@ mod tests {
             .iter()
             .all(|m| m.name == GOVERNANCE_CHECK_FAILURES_METRIC));
         assert!(!metrics.iter().any(|m| m.name == GOVERNANCE_DRIFT_METRIC));
-        assert!(!metrics
-            .iter()
-            .any(|m| m.name == OBSERVABILITY_DRIFT_METRIC));
+        assert!(!metrics.iter().any(|m| m.name == OBSERVABILITY_DRIFT_METRIC));
 
         drift.record_comparison(
             DriftClass::Governance,

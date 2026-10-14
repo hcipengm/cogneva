@@ -5795,7 +5795,10 @@ impl MainlineDeployer {
             // earlier revision goes with the declaration: without this the last
             // ceiling the repository used to declare would stay on the scrape
             // face with nothing able to bring it down.
-            drift.record_comparison(crate::governance_drift::DriftClass::Governance, &BTreeMap::new());
+            drift.record_comparison(
+                crate::governance_drift::DriftClass::Governance,
+                &BTreeMap::new(),
+            );
             return;
         }
         let live = match self
@@ -5814,7 +5817,9 @@ impl MainlineDeployer {
             },
             Err(e) => {
                 warn!(error = %e, "governance drift: the enforced quotas could not be read");
-                drift.record_check_failure(crate::governance_drift::CheckFailure::GovernanceLiveUnreadable);
+                drift.record_check_failure(
+                    crate::governance_drift::CheckFailure::GovernanceLiveUnreadable,
+                );
                 return;
             }
         };
@@ -21817,7 +21822,10 @@ exit 0
             "被跟踪 rev 上的声明读不出来，就不该有比对失败的读数"
         );
         assert_eq!(
-            drift.drift_fields(crate::governance_drift::DriftClass::Governance, "resourcequota/cogneva-quota"),
+            drift.drift_fields(
+                crate::governance_drift::DriftClass::Governance,
+                "resourcequota/cogneva-quota"
+            ),
             Some(1),
             "仓库声明 18.5、集群执行 17 是一个字段的差"
         );
@@ -21825,7 +21833,13 @@ exit 0
         // 安装面 apply 之后（同一只部署器、下一轮）：读数要回到 0。
         fake_kubectl_quota(root, &quota_listing("18.5"));
         deployer.compare_governance().await;
-        assert_eq!(drift.drift_fields(crate::governance_drift::DriftClass::Governance, "resourcequota/cogneva-quota"), Some(0));
+        assert_eq!(
+            drift.drift_fields(
+                crate::governance_drift::DriftClass::Governance,
+                "resourcequota/cogneva-quota"
+            ),
+            Some(0)
+        );
     }
 
     /// 声明侧读不出来时只记一次「这次比对没做成」，且**不写下任何逐对象读数**：
@@ -21849,17 +21863,23 @@ exit 0
         deployer.compare_governance().await;
         assert_eq!(drift.check_failures(), 1);
         assert_eq!(
-            drift.check_failures_for(crate::governance_drift::CheckFailure::GovernanceDeclarationUnreadable),
+            drift.check_failures_for(
+                crate::governance_drift::CheckFailure::GovernanceDeclarationUnreadable
+            ),
             1,
             "三格里的哪一格：声明侧读不出来时计数必须指得出是哪一条路"
         );
         assert_eq!(
-            drift.check_failures_for(crate::governance_drift::CheckFailure::GovernanceLiveUnreadable),
+            drift.check_failures_for(
+                crate::governance_drift::CheckFailure::GovernanceLiveUnreadable
+            ),
             0,
             "集群侧这一格没被碰过——它和声明侧那一格是同形的总数，读成总数就看不出是哪一边"
         );
         assert!(
-            drift.objects(crate::governance_drift::DriftClass::Governance).is_empty(),
+            drift
+                .objects(crate::governance_drift::DriftClass::Governance)
+                .is_empty(),
             "读不到声明侧却写下了逐对象读数：{:?}",
             drift.objects(crate::governance_drift::DriftClass::Governance)
         );
@@ -21932,7 +21952,13 @@ exit 0
         .with_governance_drift(drift.clone());
 
         deployer.compare_governance().await;
-        assert_eq!(drift.drift_fields(crate::governance_drift::DriftClass::Governance, "resourcequota/cogneva-quota"), Some(1));
+        assert_eq!(
+            drift.drift_fields(
+                crate::governance_drift::DriftClass::Governance,
+                "resourcequota/cogneva-quota"
+            ),
+            Some(1)
+        );
 
         // 有人把这只对象改了名，而这个进程从不组包。
         let rev_d = release_set_declaring_a_quota(&work, &rev_c, "cogneva-quota-v2", "17").await;
