@@ -5697,6 +5697,15 @@ pub async fn run(
     }
     drop(spawn_llm_health_prober(state.clone()));
     drop(spawn_pool_state_publisher(state.clone()));
+    // git 身份自举：网关自己得有上游身份，否则装完机没人给它配密钥。它落在本进程
+    // 而不是主应用里，因为这条链要用的东西都只在这边——挂进来的生效私钥（自证握手读
+    // 的就是它）、到上游的 SSH 通道、以及带外那一片 Secret 的写权。该由哪个进程跑
+    // 这条循环，判据里含部署面给出的那一半声明，所以同一个二进制在主应用那一侧会如实
+    // 早退：不是"读不到"，是不归它做。
+    // 停机信号与卷走查同源：网关的五个监听面不设优雅停机，进程退出即结束。
+    drop(crate::git_identity::spawn_git_identity_bootstrap(
+        cog_core::ShutdownSignal::default(),
+    ));
     // Nothing hands these a stop signal either: the reading belongs to the pod,
     // and a walker that stopped would leave its last measurement in place, which
     // is what a volume that is not growing looks like too. A declaration that

@@ -2020,18 +2020,16 @@ pub async fn oauth_app_secret_handler(
         .into_response()
 }
 
-/// 本进程是不是刷新任务的属主：只有能读写贡献那段 Secret 的那个才算。
+/// 本进程能不能碰那两个凭证 Secret 对象——**只看能力**。
 ///
 /// 「集群里配了 Gitee OAuth 应用」是每个进程都能问到的集群级事实，不足以回答
-/// 这个问题——刷新要把新 token 写回 Secret 并滚动安全网关，部署里只有主应用的
-/// ServiceAccount 绑了 `cogneva-llm-admin`（secrets get/patch + 网关 deployment
-/// patch）。判据取 apiserver 自己的权限判决。
+/// 这个问题；判据取 apiserver 自己的权限判决。
 ///
-/// 探的是内部那一片：刷新同时写两片，而唯一一个被授权的身份两片都能碰，所以
-/// 探哪片答的都是同一个问题；取内部那片是因为它的名字不随分片而变。
+/// 探的是内部那一片：写者同时写两片，而拿到授权的身份两片都能碰，所以探哪片答的
+/// 都是同一个问题；取内部那片是因为它的名字不随分片而变。
 ///
-/// 判不出来（建不出 in-cluster 客户端、探测本身报错）按**属主**处理：那可能是
-/// 启动瞬间的抖动，属主不该因此被静默停掉；后续每次刷新仍会照常报告。
+/// 判不出来（建不出 in-cluster 客户端、探测本身报错）按**能碰**处理：那可能是
+/// 启动瞬间的抖动，不该因此被静默停掉；后续每次写入仍会照常报告。
 pub(crate) async fn is_contribution_secret_owner() -> bool {
     let kube = match KubeClient::in_cluster() {
         Ok(kube) => kube,
@@ -2058,6 +2056,40 @@ pub(crate) async fn is_contribution_secret_owner() -> bool {
             true
         }
     }
+}
+
+/// 本进程是不是那批**必须读写凭证 Secret 的后台循环**的属主。
+///
+/// 判据由两半合成，顺序是先声明后能力：
+///
+/// - **声明**（`COGNEVA_CREDENTIAL_LOOP_OWNER`，缺省 false）由部署给出，恰好一个
+///   工作负载置真。为什么光有能力判据不够：能力是身份的属性，而**两个**身份都持有
+///   那两个对象的今天，两边能力判据都答"能"，同一件事就被两个进程各做一遍——
+///   git 身份自举会各生成一对密钥、各登记一次部署密钥，Gitee 续期会各换一次
+///   refresh token（而 refresh token 是一次性的，第二次兑换会把第一次换出来的那
+///   对作废）。能力面分不出该由谁做，只有部署面的声明能。
+/// - **能力**（[`is_contribution_secret_owner`]）确认那个声明真的做得到。声明说真而
+///   授权没跟上时，这里答"不是属主"并留下一行日志，而不是让循环每轮对着 403 空转。
+///
+/// 所以这个判据只会**收窄**：置真但无授权 ⇒ 不是属主；没置真 ⇒ 不是属主。
+///
+/// 循环搬进网关是逐个进行的，没搬的那些（今天还有 Gitee 续期）仍按能力判定，
+/// 所以这里管的是「已搬走的那批」，不是一个永久的名字。
+pub(crate) async fn is_credential_loop_owner() -> bool {
+    if !declared_credential_loop_owner() {
+        return false;
+    }
+    is_contribution_secret_owner().await
+}
+
+/// 部署面给本进程的属主声明。只认显式的真值：读不到、读成空串、读成别的字面量
+/// 都按 false——一个"非空即真"的判据会让 `COGNEVA_CREDENTIAL_LOOP_OWNER=false`
+/// 这类写法反转成属主，而它读起来正好是"关掉"。
+fn declared_credential_loop_owner() -> bool {
+    matches!(
+        std::env::var("COGNEVA_CREDENTIAL_LOOP_OWNER").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("True")
+    )
 }
 
 /// Periodic refresher for Gitee OAuth tokens: the access token expires in 24h,

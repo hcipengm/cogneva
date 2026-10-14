@@ -145,6 +145,16 @@ spec:
             # 选路的实测也拿它当探测目标。空 = 不自动登记，只把公钥挂出来等人。
             - name: COGNEVA_GATEWAY_GIT_IDENTITY_REPO
               value: "hcipengm/cogneva"
+            # 凭证后台循环的归属声明：值恰好落在一个工作负载上。
+            #
+            # 为什么要有这样一个声明：判据若只看「本进程碰不碰得到那两个 Secret
+            # 对象」，在两个身份都持有授权的迁移窗口里两边都会答"是"——于是同一对
+            # git 密钥被登记两遍、Gitee 的 refresh token 被兑换两次（它是一次性的，
+            # 第二次会把第一次换出来的那对作废）。能力面答不了「该谁做」，只有部署面
+            # 答得了。写死成字面量而不是旋钮：它声明的是这份拓扑里谁是那个进程，
+            # 与 serviceAccountName 同类。
+            - name: COGNEVA_CREDENTIAL_LOOP_OWNER
+              value: "true"
             # 部署期网络画像：restricted / open。空 = 由网关自己探（首个 git
             # 请求按开放网络的策略表走，实测结论落地后按证据走）。它只是首帧
             # 默认值，压不过实测结论。

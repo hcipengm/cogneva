@@ -790,8 +790,9 @@ async fn register_deploy_key(token: &str, repo: &str, public_line: &str) -> Resu
     Ok(())
 }
 
-/// 后台自举任务。**只由能读写 Secret 的进程运行**（属主判定复用贡献通道那一份：
-/// 同一份资源、同一个权限面）。
+/// 后台自举任务。**只在声明自己是属主、且确实碰得到那两个 Secret 对象的那个进程里
+/// 运行**（判据见 `contribution_admin::is_credential_loop_owner`）：能力面分不出
+/// 「该谁做」，两个身份都持授权时两边答的都是"能"，同一对密钥会被登记两遍。
 ///
 /// 停在"等人输入"时按 `retry_secs` 轮询，其它结论都收工——登记与晋级都已经
 /// 写进 Secret 且滚了网关，本进程即将被换掉，继续跑没有意义。
@@ -800,8 +801,11 @@ pub fn spawn_git_identity_bootstrap(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let config = IdentityConfig::from_env();
-        if !crate::contribution_admin::is_contribution_secret_owner().await {
-            info!("git 身份自举未启动：本进程读不到 cogneva-secrets（非属主）");
+        if !crate::contribution_admin::is_credential_loop_owner().await {
+            info!(
+                "git 身份自举未启动：本进程不是凭证循环的属主（部署面的属主声明未置真，\
+                 或本进程碰不到那两个 Secret 对象）"
+            );
             return;
         }
         loop {
