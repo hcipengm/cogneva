@@ -413,6 +413,62 @@ impl EvolutionDeployer {
 mod tests {
     use super::*;
 
+    /// 一个在构建阶段就睡着的 crate：`build.rs` 睡够，`cargo build --release`
+    /// 必定超过一秒的预算，而慢的原因握在测试手里，与机器快慢无关。
+    fn write_slow_build_crate(root: &std::path::Path) {
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"budget-probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+             \n[[bin]]\nname = \"budget-probe\"\npath = \"src/main.rs\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(
+            root.join("build.rs"),
+            "fn main() {\n    std::thread::sleep(std::time::Duration::from_secs(30));\n}\n",
+        )
+        .unwrap();
+    }
+
+    /// 部署侧那条界与测试侧是两条：`build_timeout_secs` 与 `test_timeout_secs`。
+    /// 「超预算被杀、且错误里点名是哪条预算杀的」原先只在测试侧有实测（真跑一次
+    /// `cargo test`），部署侧的界只剩「代码里写着」这一个证据——调这个旋钮时，
+    /// 需要的正是「这个界真的在拦」的读数。
+    ///
+    /// 真跑一次 `cargo build --release`。杀掉的这个动作要留两处痕：错误里点名预算
+    /// （否则事后读这条变更的人分不出「没判过」与「判失败」），结局记成 `TimedOut`
+    /// 而不是「构建失败」（两者占用的宿主时间含义相反，合成一个数就没有哪个数可
+    /// 用来定界）。
+    ///
+    /// 槽位传 `None`：这个测试量的是界本身，不是闸门；在测试里拿一个真槽位会把本
+    /// 进程其它同样真跑构建的测试挤进排队。
+    #[tokio::test]
+    async fn a_release_build_that_outlives_its_budget_is_killed_with_the_budget_named() {
+        let root = tempfile::tempdir().unwrap();
+        write_slow_build_crate(root.path());
+
+        let deployer = EvolutionDeployer::new(root.path(), root.path(), root.path())
+            .with_binary_name("budget-probe")
+            .with_build_timeout(1);
+
+        let err = deployer
+            .run_cargo_build(root.path(), None, None)
+            .await
+            .expect_err("a build that cannot finish in a second must not be waited on");
+
+        assert!(
+            err.to_string()
+                .contains("cargo build --release exceeded the 1s deployment budget"),
+            "the rejection has to name the budget that caused it: {err}"
+        );
+        assert_eq!(
+            deployer.last_build_ending(),
+            Some(BuildEnding::TimedOut(Duration::from_secs(1))),
+            "a build cut off at the budget is a timeout, not a failure of the change"
+        );
+    }
+
     #[test]
     fn build_artifact_fields() {
         let artifact = BuildArtifact {
