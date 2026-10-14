@@ -205,6 +205,9 @@ async fn build_test_state() -> Option<AutonomousTestState> {
         object_backend: None,
         notification_store: None,
         supervisor: None,
+        supervisor_event_cache: Arc::new(
+            cog_gateway::supervisor_control::SupervisorEventCache::default(),
+        ),
         alert_store: None,
         active_alert_source: None,
         backend_health_probe: None,

@@ -142,6 +142,12 @@ pub struct GatewayState {
     pub action_plan_store: action_plan::ActionPlanStore,
     pub collaboration_graph: Option<Arc<collaboration::CollaborationGraph>>,
     pub supervisor: Option<Arc<dyn cog_core::Supervisor>>,
+    /// Cache of the supervisor's event channel — the last scale-out
+    /// recommendation and the last tick's cycle — filled by a drain task
+    /// started when this state is assembled. Kept beside [`Self::supervisor`]
+    /// because the supervisor's contract exposes no accessor for either fact:
+    /// the event channel it already broadcasts is their only source.
+    pub supervisor_event_cache: Arc<supervisor_control::SupervisorEventCache>,
     pub alert_store: Option<Arc<dyn cog_core::AlertStore>>,
     /// Durable alert state machine (firing/resolved rows in PostgreSQL),
     /// published by the observability plugin when a database is configured.
@@ -1866,11 +1872,14 @@ async fn supervisor_queue_stats_handler(State(state): State<Arc<GatewayState>>) 
             let pending_handoffs = supervisor.autonomous_pending_count().await;
             let retry_count = supervisor.autonomous_retry_count().await;
             let dlq_count = supervisor.orchestrator_dlq_len().await.unwrap_or(0);
+            let ready_tasks = state.orchestrator.get_ready_tasks().await.len();
             let stats = supervisor_control::QueueStats {
                 pending_handoffs,
                 retry_count,
                 dlq_count,
-                cycle: 0,
+                ready_tasks,
+                cycle: state.supervisor_event_cache.cycle(),
+                scale_recommendation: state.supervisor_event_cache.scale_recommendation(),
                 timestamp: chrono::Utc::now(),
             };
             (StatusCode::OK, Json(stats)).into_response()

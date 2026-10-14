@@ -75,6 +75,12 @@ pub async fn build_gateway_state(
     taste_intent_sink: &Option<Arc<dyn cog_core::TasteIntentSink>>,
     llm_usage_reader: &Option<Arc<dyn cog_core::LlmUsageReader>>,
 ) -> Result<Arc<crate::GatewayState>, Box<dyn std::error::Error>> {
+    // Cache of the supervisor's event channel, filled by the drain task below.
+    // The supervisor's contract exposes neither the last scale-out
+    // recommendation nor its cycle, so the broadcast it already produces is
+    // the only source for both.
+    let supervisor_event_cache =
+        Arc::new(crate::supervisor_control::SupervisorEventCache::default());
     let gateway_state = Arc::new(crate::GatewayState {
         config: std::sync::RwLock::new(config.gateway.clone()),
         data_dir: config.app.data_dir.clone(),
@@ -116,6 +122,7 @@ pub async fn build_gateway_state(
         contribution_control: contribution_control.clone(),
         login_rate_limiter: login_rate_limiter.clone(),
         supervisor: Some(supervisor.clone()),
+        supervisor_event_cache: supervisor_event_cache.clone(),
         alert_store: Some(alert_store.clone()),
         active_alert_source: active_alert_source.clone(),
         backend_health_probe: backend_health_probe.clone(),
@@ -149,6 +156,30 @@ pub async fn build_gateway_state(
         llm_client: Arc::new(std::sync::RwLock::new(None)),
         chat_sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     });
+
+    // Drain the supervisor's event channel into the cache. A lagged reader
+    // keeps going (the channel dropped the oldest events under back-pressure —
+    // the cache is "the last event seen", not a count, so a gap is a gap, not
+    // a lost fact to recover); a closed channel ends the task so the cache
+    // stops being fed stale values.
+    {
+        let cache = supervisor_event_cache.clone();
+        let mut rx = supervisor.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => cache.observe(&event),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            skipped,
+                            "supervisor event cache lagged; the last recommendation may be stale"
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
 
     Ok(gateway_state)
 }
