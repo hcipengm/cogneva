@@ -35,6 +35,9 @@ spec:
         app.kubernetes.io/component: security-gateway
         app.kubernetes.io/version: "0.5.8"
     spec:
+      # 它自己的身份，不复用主应用那个：下面那群后台循环要按 apiserver 的权限判决
+      # 回答「这两个 Secret 对象是不是我的活」，而判据只有在主体是网关时才答得对。
+      serviceAccountName: cogneva-security-gateway
       containers:
         - name: security-gateway
           image: localhost:30500/cogneva:local

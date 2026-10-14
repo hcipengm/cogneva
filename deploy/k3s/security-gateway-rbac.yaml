@@ -1,0 +1,50 @@
+# 安全网关自己的 ServiceAccount。网关是唯一代持带外凭证的进程，所以「读得写得到
+# 那两个 Secret 对象」这件事必须落在它自己这个主体上——RBAC 的对象级约束不认
+# 「谁是网关」，只认被绑的主体，给主应用那个主体多写一个对象名等于把权限发给它。
+#
+# 两个 Secret 对象都要：写进集群的每一条路径都按键位表分派目标对象，一份身份事实
+# 横跨两片（生效私钥在带外片、状态位与公钥在内部片），读的那一侧两片都读、任一片
+# 读不到就整体报错。Deployment 那一条是自举换私钥后滚自己用的。
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cogneva-security-gateway
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: security-gateway
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cogneva-security-gateway
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: security-gateway
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["cogneva-secrets", "cogneva-secrets-oob"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["cogneva-security-gateway"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cogneva-security-gateway
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: security-gateway
+subjects:
+  - kind: ServiceAccount
+    name: cogneva-security-gateway
+    namespace: cogneva
+roleRef:
+  kind: Role
+  name: cogneva-security-gateway
+  apiGroup: rbac.authorization.k8s.io

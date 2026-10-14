@@ -1,5 +1,6 @@
 # 主应用 Pod 使用的 ServiceAccount：LLM 设置页写 Secret/滚网关、GitOps 拉取端
-# apply 配置与金丝雀，都靠下面两个 Role 授权。网关/沙盒执行器不使用 SA。
+# apply 配置与金丝雀，都靠下面两个 Role 授权。安全网关有自己的 SA（见文件尾），
+# 沙盒执行器不使用 SA。
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -121,4 +122,64 @@ subjects:
 roleRef:
   kind: Role
   name: cogneva-gitops-puller
+  apiGroup: rbac.authorization.k8s.io
+---
+# 安全网关自己的 ServiceAccount。它是唯一代持带外凭证的进程，所以「读得写得到
+# 那两个 Secret 对象」这件事必须落在它自己这个主体上。
+#
+# 为什么不继续用 `cogneva`：RBAC 的对象级约束不认「谁是网关」，只认被绑的主体。
+# 给旧主体多写一个对象名（`resourceNames` 加 `cogneva-secrets-oob`）等于把权限
+# 发给主应用——这不是收窄，是把扩权写成了收窄的样子。
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cogneva-security-gateway
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: security-gateway
+---
+# 网关的最小权限：两个 Secret 对象的 get/patch，加上对**自己**那个 Deployment 的
+# get/patch。
+#
+# 两个对象都要，不是只要带外那片：写进集群的每一条路径都按键位表分派目标对象，
+# 而一份身份事实横跨两片（生效私钥在带外片，状态位与公钥在内部片），读的那一侧
+# （合并视图）两片都读、任一片读不到就整体报错。只给一片等于让同一批写入一半成功
+# 一半 403，而且是静默的一半——写失败的那半在功能上表现为「这个键一直没有值」。
+#
+# Deployment 那一条是自举要用的：私钥换了以后要滚一次网关，让容器重新读挂载卷。
+# 只指自己的名字——网关没有任何理由碰别的工作负载的 Pod 模板。
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cogneva-security-gateway
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: security-gateway
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["cogneva-secrets", "cogneva-secrets-oob"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["cogneva-security-gateway"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cogneva-security-gateway
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: security-gateway
+subjects:
+  - kind: ServiceAccount
+    name: cogneva-security-gateway
+    namespace: {{ include "cogneva.namespace" . }}
+roleRef:
+  kind: Role
+  name: cogneva-security-gateway
   apiGroup: rbac.authorization.k8s.io

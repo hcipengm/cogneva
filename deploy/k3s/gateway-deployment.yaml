@@ -36,6 +36,7 @@ spec:
         app.kubernetes.io/component: security-gateway
         app.kubernetes.io/version: "0.5.8"
     spec:
+      serviceAccountName: cogneva-security-gateway
       containers:
         - name: security-gateway
           image: localhost:30500/cogneva:local
