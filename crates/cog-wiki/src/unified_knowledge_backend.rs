@@ -1372,6 +1372,65 @@ mod tests {
         }
     }
 
+    /// The same embedder, counting how many times it was asked.
+    ///
+    /// A retrieval that embeds the query once per layer that reads an embedding
+    /// is not merely paying twice: the two layers would be ranking against two
+    /// vectors that came out of two calls, and nothing in the answer would say
+    /// they differed.
+    struct CountingEmbedder(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait]
+    impl EmbeddingProvider for CountingEmbedder {
+        async fn embed(&self, texts: Vec<String>) -> SFResult<Vec<Vec<f32>>> {
+            self.0
+                .fetch_add(texts.len(), std::sync::atomic::Ordering::SeqCst);
+            Ok(texts.into_iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
+        }
+
+        async fn embed_sparse(
+            &self,
+            _texts: Vec<String>,
+        ) -> SFResult<Vec<cog_core::SparseEmbedding>> {
+            Ok(Vec::new())
+        }
+
+        fn supports_sparse(&self) -> bool {
+            false
+        }
+
+        fn model_id(&self) -> &str {
+            "counting-test-embedder"
+        }
+
+        fn dimension(&self) -> usize {
+            3
+        }
+    }
+
+    /// One query is one embedding, however many layers read it.
+    #[tokio::test]
+    async fn both_layers_rank_against_the_same_embedding() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = UnifiedKnowledgeBackend::new()
+            .with_wiki(Arc::new(TwoFacedWiki))
+            .with_embedding(Arc::new(CountingEmbedder(calls.clone())));
+        let task = Task::new(
+            "t1".to_string(),
+            cog_core::TaskType::Custom("test".into()),
+            serde_json::json!({}),
+        );
+
+        backend.retrieve_relevant(&task, "query", 5).await.unwrap();
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the query was embedded more than once: the layers ranked against \
+             different vectors and the answer does not say so"
+        );
+    }
+
     /// The wiki layer's semantic face is what answers a query whose words no
     /// page uses, so a retrieval that consults only the keyword face returns
     /// nothing for exactly the questions the face was added for -- and it
