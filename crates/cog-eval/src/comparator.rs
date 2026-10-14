@@ -5,28 +5,13 @@ use serde::{Deserialize, Serialize};
 use statrs::distribution::ContinuousCDF;
 use std::collections::HashMap;
 
-/// Two-proportion z-test: H0 = the two pass rates are equal. Returns
-/// `(z, |z| > 1.96)`.
+/// 两比例 z 检验：H0 = 两组成功率相同。返回 `(z, |z| > 1.96)`。
 ///
-/// This is the workspace's single home for the test: the eval A/B gate here and
-/// the self-evolution verdict mapping in `cog-reflection` both read it, so the
-/// formula — and the significance cut — live in one place rather than being
-/// re-derived per consumer.
-pub fn two_proportion_z_test(s1: usize, n1: usize, s2: usize, n2: usize) -> (f64, bool) {
-    if n1 == 0 || n2 == 0 {
-        return (0.0, false);
-    }
-    let p1 = s1 as f64 / n1 as f64;
-    let p2 = s2 as f64 / n2 as f64;
-    let pooled = (s1 + s2) as f64 / (n1 + n2) as f64;
-    let se = (pooled * (1.0 - pooled) * (1.0 / n1 as f64 + 1.0 / n2 as f64)).sqrt();
-    if se == 0.0 {
-        // Both rates are 0 or 1: no variance, the two are indistinguishable.
-        return (0.0, false);
-    }
-    let z = (p2 - p1) / se;
-    (z, z.abs() > 1.96)
-}
+/// 实现只有一处，在 `cog_core::contract::eval`：本 crate 的 A/B 门与自进化那条
+/// 把结果映射成判定的路径读的是同一份公式，这里转发而不另写一份。公式住在契约
+/// 层而不是本 crate，是因为 `cog-reflection` 也要读它——它要的只是一把尺子，
+/// 不该为此依赖整个 `cog-eval`。
+pub use cog_core::contract::eval::two_proportion_z_test;
 
 /// 单指标对比结果。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -330,39 +315,5 @@ fn cohens_d_for_proportions(p1: f64, p2: f64, n1: f64, n2: f64) -> f64 {
         (h2 - h1) / pooled_sd
     } else {
         0.0
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // The shared test's cut is |z| > 1.96; a large, clean difference must clear
-    // it and a same-rate pair must not. Pinning both directions keeps the
-    // significance boundary from drifting when the formula is touched.
-    #[test]
-    fn the_z_test_separates_a_clear_gap_from_no_gap() {
-        let (z, significant) = two_proportion_z_test(90, 100, 50, 100);
-        assert!(
-            z.abs() > 1.96,
-            "a 90% vs 50% gap over 100 each is significant: z={z}"
-        );
-        assert!(significant);
-
-        let (z, significant) = two_proportion_z_test(50, 100, 51, 100);
-        assert!(
-            !significant,
-            "a 1-point gap over 100 each is not significant: z={z}"
-        );
-    }
-
-    // Zero samples and the degenerate all-pass / all-fail pair have no variance
-    // to separate; the test must say "cannot tell" rather than divide by zero.
-    #[test]
-    fn a_degenerate_pair_is_not_called_significant() {
-        assert_eq!(two_proportion_z_test(0, 0, 5, 10), (0.0, false));
-        assert_eq!(two_proportion_z_test(0, 0, 0, 0), (0.0, false));
-        assert_eq!(two_proportion_z_test(10, 10, 10, 10), (0.0, false));
-        assert_eq!(two_proportion_z_test(0, 10, 0, 10), (0.0, false));
     }
 }

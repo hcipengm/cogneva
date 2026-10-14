@@ -79,9 +79,10 @@ pub struct EvalComparison {
 
 /// 两比例 z 检验：H0 = 两组成功率相同。返回 (z, |z|>1.96)。
 ///
-/// 实现只有一处（在 `cog-eval`）：本 crate 的判定调用点与 eval 门读同一份公式。
-/// 这里转发而不另写一份，避免「同一能力两处半成品」。
-pub use cog_eval::comparator::two_proportion_z_test;
+/// 实现只有一处，在 `cog_core::contract::eval`：本 crate 的判定调用点与 eval 门
+/// 读同一份公式。这里转发而不另写一份，避免「同一能力两处半成品」。它住在契约层
+/// 而不是 `cog-eval`，所以本 crate 拿这把尺子不必依赖整个 `cog-eval`。
+pub use cog_core::contract::eval::two_proportion_z_test;
 
 /// 对比 change 前后两组执行结果。
 pub fn compare(before: &[EvalOutcome], after: &[EvalOutcome]) -> EvalComparison {

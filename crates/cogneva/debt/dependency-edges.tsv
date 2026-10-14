@@ -30,7 +30,6 @@ allowed	cog-gateway	cog-storage	contract::storage::MetricsBackend
 allowed	cog-memory	cog-storage	contract::storage::VectorBackend
 allowed	cog-quota	cog-redis	contract::kv::KeyValueStore
 allowed	cog-quota	cog-storage	contract::kv::KeyValueStore
-allowed	cog-reflection	cog-eval	contract::eval::EvalService
 # storage 拥有什么、redis 是什么：driver 属于 storage 是一个关于实现落在哪个
 # crate 的论证，不是一个关于每个 crate 都该够得着的能力的论证。无论哪种，这个
 # 到达都是一个键值契约；这条边没有以直接链接收尾的版本。
