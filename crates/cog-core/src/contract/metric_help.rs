@@ -100,7 +100,12 @@ const COUNTER_HELP: &[(&str, &str)] = &[
     ),
     (
         "llm_calls_total",
-        "Total number of LLM upstream calls by result",
+        "Total number of LLM upstream calls by result. The `actor` axis takes \
+         only the values the security gateway declares: a caller that sends no \
+         actor, or a word the platform does not carry, is counted under \
+         `unknown` rather than opening a series of its own, so a rising \
+         `unknown` cell is a call site that lost its tag and never a new actor \
+         appearing",
     ),
     (
         "llm_tokens_total",
@@ -110,7 +115,10 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          on Anthropic it is disjoint from it, so read the ratio according to the \
          upstream's protocol. Published at zero too: a missing cell says the \
          metering path never ran for that upstream and actor, a cell holding \
-         zero says it ran and found nothing",
+         zero says it ran and found nothing. The `actor` axis is the same \
+         closed set as on `llm_calls_total`: spend under `unknown` is spend by \
+         a caller that did not declare itself, so it is real money that no \
+         per-actor view accounts for",
     ),
     (
         crate::metric_names::LLM_USAGE_READINGS_TOTAL.as_str(),
