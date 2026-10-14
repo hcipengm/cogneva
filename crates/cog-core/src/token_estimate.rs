@@ -9,8 +9,10 @@
 //!
 //! The estimate counts words, which is what fits text a model will read and
 //! unfits text it will not: a payload with no whitespace at all — a binary dump,
-//! one long line of JSON — is a single word however long it is. A caller that
-//! bounds such a payload measures characters instead.
+//! one long line of JSON — is a single word. A word is priced by the characters
+//! in it, so such a payload is priced by its length rather than by the fact that
+//! it happens to contain no spaces: the estimate does not go blind on the text
+//! it cannot recognize.
 //!
 //! It is an estimate, not a tokenizer: no model's vocabulary is consulted, and
 //! the answer is only meaningful against another estimate from this function.
@@ -23,15 +25,30 @@ pub fn estimate_tokens(text: &str) -> usize {
     Parts::new(text).map(|(_, _, cost)| cost).sum()
 }
 
+/// 非 CJK 字符每多少个算一个 token（英文约 4 字符 1 token）。
+const CHARS_PER_TOKEN: usize = 4;
+
+/// 一个英文词的代价，也是任何一个词的下限。
+///
+/// 这是旧口径给每个非 CJK 词的定价，留着当**下限**是为了让短词的价一分不变：
+/// 两个调用方的既有预算都是按它定过的，下限一动，同一段英文的窗口账就整体变了。
+/// 它与 `CHARS_PER_TOKEN` 同源——一个词大约四个字符一个 token——所以一个词超过
+/// 这一档的长度之后，涨价由字符数自己给出，不需要另立一个阈值。
+const ENGLISH_WORD_TOKENS: usize = 4;
+
 /// 一个词在估计口径里的代价。
 ///
-/// 含 CJK 的词按字符逐个算，纯非 CJK 词按一个英文词算——后者与词长无关，
-/// 正是「没有空白的巨块永远是 4 token」这条已知性质的来源。
+/// 含 CJK 的词按字符逐个算（CJK 每个 2），纯非 CJK 词取「按 `CHARS_PER_TOKEN`
+/// 折算」与「一个英文词的代价」里大的那个：短词与旧口径逐字同价，长词随长度涨。
+/// 一个不含空白的整块是一个词，于是它的价随它的长度走——长度就是这种文本
+/// 唯一的成本，没有空格不该是它免费的理由。
 fn word_cost(cjk_chars: usize, other_chars: usize) -> usize {
     if cjk_chars > 0 {
-        cjk_chars * 2 + other_chars.div_ceil(4)
+        cjk_chars * 2 + other_chars.div_ceil(CHARS_PER_TOKEN)
     } else {
-        4 // 英文单词约 4 token
+        other_chars
+            .div_ceil(CHARS_PER_TOKEN)
+            .max(ENGLISH_WORD_TOKENS)
     }
 }
 
@@ -124,11 +141,48 @@ mod tests {
     }
 
     /// 连写的汉字是**一个**词，整块按字符数计价：五个字 10 token。CJK 分支
-    /// 按字符算而不是按词算，所以「一个词」不会让一段中文变成 4 token——
-    /// 无空白大块那条盲区只落在非 CJK 的整块上。
+    /// 按字符算而不是按词算，所以「一个词」不会让一段中文降价成 4 token。
     #[test]
     fn a_run_of_cjk_without_spaces_is_priced_by_character() {
         assert_eq!(estimate_tokens("一二三四五"), 10);
+    }
+
+    /// 修复只动「不含空白的巨块恒记 4」这一格，短词的价必须逐字不变：两个
+    /// 调用方的既有预算口径都按旧价定过，动了下限或换了取整，同一段英文的
+    /// 窗口账就整体变了——那是退化，不是修复。
+    ///
+    /// 涨价起点由「`CHARS_PER_TOKEN` 字符 1 token」这一档自己给出（17 字符
+    /// 才超过旧口径给每个词定的 4），所以下面量的是档位边界，不是某个被挑中
+    /// 的阈值。
+    #[test]
+    fn a_short_word_costs_what_it_always_did() {
+        assert_eq!(estimate_tokens("hello"), 4);
+        assert_eq!(estimate_tokens("a b c"), 12);
+        assert_eq!(estimate_tokens(&"z".repeat(16)), 4);
+        assert_eq!(estimate_tokens(&"z".repeat(17)), 5);
+    }
+
+    /// 无空白、非 CJK 的整块按**长度**计价，不按「它是一个词」计价。
+    ///
+    /// 修复前 `word_cost` 的 else 分支不看字符数、恒返 4，于是二进制倾倒与单行
+    /// 大 JSON 在窗口账面上永远只值 4 token，`trim_if_needed` 判它没超限——这一条
+    /// 要红的正是那个形状，所以它量的是 MB 级的那一段，不是最大到几千字符的样本。
+    ///
+    /// 断言写成关系：同一个词长一倍价就长一倍，且落在「`CHARS_PER_TOKEN` 字符
+    /// 1 token」这一档的量级上。钉死一个数会被换单位或换取整搞红，而这里要守的
+    /// 从来不是那个数。
+    #[test]
+    fn a_run_without_whitespace_is_priced_by_its_length() {
+        let one = estimate_tokens(&"A".repeat(1 << 20));
+        let two = estimate_tokens(&"A".repeat(2 << 20));
+        assert_eq!(two, one * 2, "同一个词长一倍，价就该长一倍");
+        assert!(
+            ((1 << 18) / 2..=(1 << 18) * 2).contains(&one),
+            "1 MiB 的无空白块记了 {one} token，不在 4 字符 1 token 这一档上"
+        );
+        // 空白是唯一让整块降价的形状，而它一出现就分词：同样 1 MiB 的
+        // 「单字符 + 空格」由每个短词的下限定价，比实心块贵。
+        assert!(estimate_tokens(&"A ".repeat(1 << 19)) > one);
     }
 
     /// 中英混排的一个词：汉字按 2、其余按四分之一计（取整向上，宁可多算），

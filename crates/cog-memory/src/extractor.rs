@@ -424,10 +424,9 @@ impl LlmMemoryExtractor {
         }
         let Ok(messages) = serde_json::from_str::<Vec<cog_core::Message>>(&text) else {
             // 这条链路写下的 payload 是 `Vec<Message>` 的 JSON；解析不出来说明
-            // 这份 raw 不是它写的（更早的格式、别处放进来的对象）。估算按词
-            // 算，而这一份可能一个词都没有——按估算卡，一个 200KB 的无空白
-            // 大块永远只值 4 token，等于没有界。按字符切是保守的那一侧：一个
-            // 字符最多两个 token（汉字），最多超出一倍。
+            // 这份 raw 不是它写的（更早的格式、别处放进来的对象）。这一份按字符
+            // 切，不走估算：界是硬的那一侧——一个字符最多两个 token（汉字），
+            // 最多超出一倍——而且切法与内容无关，对它是什么格式不作假设。
             return Self::cut_head_chars(&text, budget_tokens);
         };
         let cost = |m: &cog_core::Message| cog_core::estimate_tokens(&m.content());
@@ -969,8 +968,8 @@ mod tests {
         );
     }
 
-    /// 解析不出消息数组的载荷按字符切。这一条守的是估算口径的已知盲区：
-    /// 没有空白的大块在估算里永远是一个词，按 token 卡根本不会触发。
+    /// 解析不出消息数组的载荷按字符切，与估算无关：估算对这一份能给价（无空白
+    /// 的整块按长度定价），但这条路量的是**字符**的硬界，换上估算就不是同一条界了。
     #[test]
     fn an_unparsable_payload_is_cut_by_characters_not_by_estimate() {
         // 用一个不会出现在提示词正文里的字符：任务说明里本来就有几个 `x`
@@ -978,8 +977,8 @@ mod tests {
         let blob = "~".repeat(2_000);
         let source = raw("raw-not-a-transcript", &blob);
         assert!(
-            cog_core::estimate_tokens(&blob) <= 50,
-            "the estimate cannot see a whitespace-free blob"
+            cog_core::estimate_tokens(&blob) > 50,
+            "这一份按估算早就超预算了，所以下面量的是字符界不是估算界"
         );
 
         let (prompt, outcome) = LlmMemoryExtractor::build_combined_prompt(&source, 50);
