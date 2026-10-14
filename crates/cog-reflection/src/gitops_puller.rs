@@ -3940,11 +3940,13 @@ spec:
     /// ——一个经 `envFrom` 读这份文档的工作负载，在集群那一面是消费者、在这一面
     /// 不存在，于是按内容判该滚的那一轮漏掉它。
     ///
-    /// 这里钉两处：这一面在**每一种形态上单独**都要认出来（每种形态一个工作负载，
+    /// 这里钉三处：这一面在**每一种形态上单独**都要认出来（每种形态一个工作负载，
     /// 只经那一种读这份文档——同一个工作负载六种都写，少认一种也还是被卷那条认出来，
-    /// 门就白钉），以及发给 kubectl 的 jsonpath 的列必须逐个来自同一份清单（多写
-    /// 一列或少写一列都当场红）。解析器那一面按 `fields[1..]` 平摊所有列，列序对它
-    /// 无所谓，所以列数与列内容就是这里要钉的全部。
+    /// 门就白钉）；发给 kubectl 的 jsonpath 的每一列**整段**等于按同一份清单算出来
+    /// 的样子（多写一列或少写一列、取错数组那一层、多一层取字段都当场红）；以及整条
+    /// jsonpath 的括号里没有嵌套动作——那是它的语法，不是我的偏好，加倍的大括号会让
+    /// kubectl 直接拒绝整条读法，而不是只错一列。解析器那一面按 `fields[1..]` 平摊
+    /// 所有列，列序对它无所谓，所以列数与列内容就是这里要钉的全部。
     #[test]
     fn the_two_config_consumer_faces_read_the_same_paths() {
         // 六个工作负载，除最后一个外各只经一种形态读这份文档；最后一个读的是
@@ -4062,7 +4064,20 @@ spec:
 
         let template = "spec.template.spec";
         let jsonpath = crate::mainline_deployer::config_consumer_jsonpath(template);
-        let groups: Vec<&str> = jsonpath.split("{'|'}").skip(1).collect();
+        // 收尾那一段先摘掉，剩下的每一列才是一整列：不摘的话最后一列会把
+        // `{'\n'}{end}` 一起带上，逐列整段比对就在这里假红。
+        const TAIL: &str = "{'\\n'}{end}";
+        let body = jsonpath
+            .strip_prefix("jsonpath=")
+            .and_then(|s| s.strip_suffix(TAIL))
+            .expect("这条读法必须有前导 `jsonpath=` 与收尾的换行、结束");
+        let mut groups = body.split("{'|'}");
+        assert_eq!(
+            groups.next(),
+            Some("{range .items[*]}{.metadata.name}"),
+            "第一列必须是工作负载名：{jsonpath}"
+        );
+        let groups: Vec<&str> = groups.collect();
         assert_eq!(
             groups.len(),
             crate::mainline_deployer::CONFIG_CONSUMPTION_PATHS.len(),
@@ -4072,16 +4087,39 @@ spec:
             .iter()
             .zip(crate::mainline_deployer::CONFIG_CONSUMPTION_PATHS)
         {
-            let (array, leaf) = path.split_once("[*]").expect("每条路径点名一个数组");
-            assert!(
-                group.contains(&format!(".{template}.{array}[*]")),
-                "路径 {path} 的那一列没有扫它自己那个数组：{group}"
-            );
-            assert!(
-                group.contains(&format!("{{{{.{leaf}}}}}")),
-                "路径 {path} 的那一列取的不是它自己的叶子：{group}"
+            // 这一列**整段**等于按那份清单算出来的样子：起止、分隔、取哪一层
+            // 数组、打印哪个字段，一处不对就红。断"包含某个子串"只证明我写的
+            // 那一段在我写的位置——上一版就是这么放过一个把整条 jsonpath 变成
+            // 解析失败的加倍大括号的。
+            let (array, leaf) = path.rsplit_once("[*]").expect("每条路径点名一个数组");
+            let leaf = leaf.strip_prefix('.').expect("数组后面跟一个字段");
+            assert_eq!(
+                group,
+                &format!("{{range .{template}.{array}[*]}}{{.{leaf}}}{{','}}{{end}}"),
+                "路径 {path} 的那一列与清单对不上：{group}"
             );
         }
+        // 括号是 jsonpath 自己的语法，一个动作里不能再套一个：`{{…}}` 在
+        // kubectl 里是 `unrecognized character in action: '{'`，整条读法当场
+        // 失败。这一条断的是"目标语言能不能读"，不是"我生成的是不是我想要的
+        // 那个字符串"——后者在我把带转义的大括号从 `format!` 搬进拼接时同样为
+        // 真，而部署器每一轮滚动都会死在上面。
+        let mut depth = 0usize;
+        for ch in jsonpath.chars() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    assert!(
+                        depth <= 1,
+                        "jsonpath 的动作里不能套动作（kubectl：unrecognized character \
+                         in action: '{{'）：{jsonpath}"
+                    );
+                }
+                '}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        assert_eq!(depth, 0, "jsonpath 的括号没有配平：{jsonpath}");
     }
 
     /// The seam the roll depends on: a section the reload path re-applies must

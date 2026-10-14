@@ -718,8 +718,8 @@ const SUPPORT_CAUSE_MESSAGE_CHARS: usize = 200;
 /// （[`live_config_consumers`]）。两者必须认同一批形态，否则一边多认一种，另一边
 /// 的名单就少一个人——两份答案各自自洽，只有把两份摆在一起才看得出来。
 /// 路径语法只有 `field` 与 `field[*]`（数组展开）两种，走 YAML 的读法用它，
-/// 翻成 jsonpath 的读法也用它（[`config_consumer_jsonpath`]，取第一个 `[*]` 当
-/// `range` 的那一层，其余留在表达式里）。
+/// 翻成 jsonpath 的读法也用它（[`config_consumer_jsonpath`]，取**最后一个** `[*]`
+/// 当 `range` 的那一层，它后面的字段就是每次迭代要打印的那个）。
 pub(crate) const CONFIG_CONSUMPTION_PATHS: [&str; 6] = [
     "volumes[*].configMap.name",
     "volumes[*].projected.sources[*].configMap.name",
@@ -776,22 +776,36 @@ pub(crate) fn config_path_values(spec: &serde_json::Value, path: &str) -> Vec<St
 /// keeps its template under `jobTemplate`, and a read written for the shorter
 /// path answers "reads nothing" about it -- which is exactly the shape of a
 /// silent miss.
+///
+/// The braces below are jsonpath's own, written out one at a time: this string is
+/// assembled by concatenation, so nothing unescapes it. The same text inside a
+/// `format!` would need `{{`/`}}` to survive the macro, and moving it here without
+/// dropping that doubling is how a jsonpath that parses becomes one that does
+/// not -- kubectl stops at `unrecognized character in action: '{'` and the whole
+/// reading fails, not just the column that was written twice.
 pub(crate) fn config_consumer_jsonpath(pod_template: &str) -> String {
-    let mut out = String::from("jsonpath={range .items[*]}{{.metadata.name}}");
+    let mut out = String::from("jsonpath={range .items[*]}{.metadata.name}");
     for path in CONFIG_CONSUMPTION_PATHS {
-        // The path's first `[*]` is the array the jsonpath ranges over; any
-        // further `[*]` (a projected volume's sources, a container's env) stays
-        // inside the expression.
+        // The path's **last** `[*]` is the array the jsonpath ranges over, so the
+        // expression the loop prints is a single field. Ranging over an earlier
+        // array and leaving a `[*]` inside the printed expression still reads the
+        // right array -- and prints every match of it concatenated into one word,
+        // with the separator emitted once per outer element instead of once per
+        // match. Two ConfigMap sources in one projected volume then arrive as
+        // `cog-a cog-b`, which parses as one name nobody declared.
         let (array, leaf) = path
-            .split_once("[*]")
+            .rsplit_once("[*]")
             .expect("every consumption path names one array to range over");
+        let leaf = leaf
+            .strip_prefix('.')
+            .expect("every consumption path names a field after its array");
         out.push_str("{'|'}{range .");
         out.push_str(pod_template);
         out.push('.');
         out.push_str(array);
-        out.push_str("[*]}{{.");
+        out.push_str("[*]}{.");
         out.push_str(leaf);
-        out.push_str("}}{','}{end}");
+        out.push_str("}{','}{end}");
     }
     out.push_str("{'\\n'}{end}");
     out
