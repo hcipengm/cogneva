@@ -28,9 +28,43 @@
 //! The key name lives here instead of being spelled out at each site: producer
 //! (the actors) and consumer (the agent runtime) read one constant, whereas two
 //! literals for one agreement drift.
+//!
+//! The other half of the subject lives here as well: where the declarations come
+//! from. [`split_contract`] and [`render_varying_half`] decide the shape of one
+//! rendered document; [`PromptManager`] is the store those documents are read out
+//! of, for a caller that has to ask which keys exist rather than ask for one.
+
+use crate::PromptProvider;
 
 /// The key that carries the stable half of an input document.
 pub const PROMPT_CONTRACT_KEY: &str = "contract";
+
+/// The store declared prompt templates are read from.
+///
+/// [`PromptProvider`] is the one-answer face -- get a key, render a key -- and is
+/// deliberately not redeclared here: a capability with two spellings is two
+/// things to keep in step. What a caller needs beyond one answer is the store
+/// itself, which is what this adds: the set of keys that are actually declared.
+/// Without it, a check that the declarations match what the code falls back to
+/// has to carry its own hand-copied list of keys, and that list is a second
+/// declaration free to drift from the one being checked -- including by
+/// shrinking, which is the direction where the check quietly stops covering
+/// something.
+///
+/// Loading a directory is **not** on this trait, and cannot be made to fit: a
+/// loader names the type it builds, so a caller with no store handed to it has to
+/// name an implementation to obtain one, and an object-safe trait cannot hand out
+/// a constructor. That construction step, and the dependency it implies, is the
+/// residuum this contract does not remove; everything downstream of it -- the
+/// reads, the rendering, and the key set -- is this face.
+pub trait PromptManager: PromptProvider {
+    /// Every key this store has a template for.
+    ///
+    /// The set, not a count: the caller that needs this is comparing it against
+    /// the keys it renders, and a count answers "how many", never "which". The
+    /// order carries no meaning; a caller that needs one sorts.
+    fn keys(&self) -> Vec<String>;
+}
 
 /// Document keys that state the request rather than this attempt at it.
 ///

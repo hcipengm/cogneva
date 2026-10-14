@@ -168,6 +168,21 @@ impl cog_core::PromptProvider for PromptManager {
     }
 }
 
+impl cog_core::contract::prompt::PromptManager for PromptManager {
+    /// The key set as the registry currently holds it.
+    ///
+    /// A poisoned lock panics rather than answering: the two alternatives are an
+    /// empty set, which reads as "nothing is declared" and sends a caller
+    /// checking the declarations after a missing key that is not missing, and a
+    /// partial set, which fails a comparison against the full one with a verdict
+    /// about the declarations. A panic here can only follow a panic elsewhere,
+    /// and it says which one.
+    fn keys(&self) -> Vec<String> {
+        let registry = self.registry.read().expect("prompt registry lock poisoned");
+        registry.keys().into_iter().cloned().collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

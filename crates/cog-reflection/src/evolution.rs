@@ -1289,7 +1289,9 @@ mod tests {
 #[cfg(test)]
 mod declared_prompt_matches_fallback {
     use super::fallback;
-    use cog_prompt::{PromptManager, TemplateVars, WatchMode};
+    use cog_prompt::{PromptManager, WatchMode};
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     /// Every key this guard compares. The list is checked against what
     /// `prompts/` actually declares in both directions, so a declaration added
@@ -1306,11 +1308,18 @@ mod declared_prompt_matches_fallback {
 
     /// Load `prompts/` the way a process does: from the directory as shipped,
     /// not from a copy written by the test.
-    async fn manager() -> PromptManager {
+    ///
+    /// Built by name and read through the contract. A loader names the type it
+    /// builds, so this is the one line that reaches for the implementation; every
+    /// read below goes through [`cog_core::contract::prompt::PromptManager`],
+    /// which is what makes the key set below the declarations' own rather than a
+    /// second copy of them.
+    async fn manager() -> Arc<dyn cog_core::contract::prompt::PromptManager> {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../prompts");
-        PromptManager::from_dir(dir, WatchMode::None)
+        let manager = PromptManager::from_dir(dir, WatchMode::None)
             .await
-            .unwrap_or_else(|e| panic!("prompts/ must load from {dir}: {e}"))
+            .unwrap_or_else(|e| panic!("prompts/ must load from {dir}: {e}"));
+        Arc::new(manager)
     }
 
     /// A `|` block scalar keeps one trailing newline; the code's literal has
@@ -1320,25 +1329,27 @@ mod declared_prompt_matches_fallback {
         rendered.trim_end_matches('\n') == text.trim_end_matches('\n')
     }
 
-    fn refinement_vars() -> (TemplateVars, &'static str, &'static str) {
+    fn refinement_vars() -> (HashMap<String, String>, &'static str, &'static str) {
         let json = "{\"skill_id\":\"sk-1\"}";
         let id = "sk-1";
         (
-            TemplateVars::new()
-                .with("skill_json", json)
-                .with("skill_id", id),
+            HashMap::from([
+                ("skill_json".to_string(), json.to_string()),
+                ("skill_id".to_string(), id.to_string()),
+            ]),
             json,
             id,
         )
     }
 
-    fn tool_vars() -> (TemplateVars, &'static str, &'static str) {
+    fn tool_vars() -> (HashMap<String, String>, &'static str, &'static str) {
         let name = "read_file";
         let errors = "timeout\nbad path";
         (
-            TemplateVars::new()
-                .with("tool_name", name)
-                .with("error_patterns", errors),
+            HashMap::from([
+                ("tool_name".to_string(), name.to_string()),
+                ("error_patterns".to_string(), errors.to_string()),
+            ]),
             name,
             errors,
         )
@@ -1347,10 +1358,7 @@ mod declared_prompt_matches_fallback {
     #[tokio::test]
     async fn every_declared_prompt_is_the_text_the_code_falls_back_to() {
         let pm = manager().await;
-        let mut keys: Vec<String> = {
-            let reg = pm.registry.read().expect("registry readable");
-            reg.keys().into_iter().cloned().collect()
-        };
+        let mut keys: Vec<String> = pm.keys();
         keys.sort();
         let compared: Vec<String> = COMPARED.iter().map(|k| k.to_string()).collect();
         assert_eq!(

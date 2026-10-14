@@ -181,14 +181,13 @@ const REPLACEMENT_TARGETS: &[&str] = &[
 /// written. It is asserted in both directions so that it empties itself: a
 /// target listed here that now exists is a stale entry, which is the same
 /// failure as a stale edge row.
-const TARGETS_TO_INTRODUCE: &[&str] = &[
-    // `cog-prompt` owns prompt templates; the core publishes the rendering
-    // contract (`split_contract`, `render_varying_half`) but no way to *obtain*
-    // a rendered prompt. What the reader side needs is the manager rather than a
-    // one-shot source: it loads the declared templates, takes the rendering
-    // parameters, and can say which keys are declared.
-    "contract::prompt::PromptManager",
-];
+///
+/// **Empty since 2026-10-15.** Both contracts it ever carried were written:
+/// `contract::kv::KeyValueStore`, and `contract::prompt::PromptManager` last.
+/// Empty is the state this list is for, and the assertion is what keeps it from
+/// being a place to park a name: the next entry added here is a claim that the
+/// core is missing something, and it fails the moment the core has it.
+const TARGETS_TO_INTRODUCE: &[&str] = &[];
 
 /// The members that assemble the business crates, and the only ones permitted
 /// to name one directly.

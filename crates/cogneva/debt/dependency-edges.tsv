@@ -40,5 +40,9 @@ allowed	cog-stream	cog-redis	contract::stream::MessageBackend
 allowed_dev	cog-github	cog-storage	contract::storage::MetricsBackend
 allowed_dev	cog-memory	cog-stream	contract::stream::MessageBackend
 allowed_dev	cog-orchestrator	cog-storage	contract::storage::StateBackend
+# 这条边只剩「构造」这一个点：守卫拿真加载器读 `prompts/`（加载器按名构造，契约给不出
+# 构造函数），所以 `cog_prompt::PromptManager::from_dir(dir, WatchMode::None)` 那一行必须
+# 点名实现。除此之外这条边一个点都不剩——取键、读取、渲染全部走
+# `contract::prompt::PromptManager`，那条契约 2026-10-15 已写进 core。
 allowed_dev	cog-reflection	cog-prompt	contract::prompt::PromptManager
 allowed_dev	cog-reflection	cog-storage	contract::storage::StateBackend
