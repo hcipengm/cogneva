@@ -94,6 +94,35 @@ pub fn init_config_watcher() -> (
     }
 }
 
+/// Open the shared key-value face at `redis_url`, or `None` when none is configured.
+///
+/// Who implements the store is a fact about this binary, not about the consumer:
+/// [`cog_storage::RedisKeyValueStore`] is named here and nowhere downstream, so a
+/// component that only needs the read/write face (the standalone security gateway
+/// has no plugin context to consume one from) still receives a trait object. An
+/// empty or absent URL means this deployment has no shared face — which is not the
+/// same answer as a URL that failed to open, so the failure is reported and `None`
+/// is returned while the URL stays configured, leaving the caller able to tell the
+/// two apart.
+///
+/// The URL itself is never logged: it is a connection string, and connection
+/// strings carry credentials on deployments that put them there.
+pub async fn key_value_store_from_url(
+    redis_url: Option<&str>,
+) -> Option<std::sync::Arc<dyn cog_core::KeyValueStore>> {
+    let url = redis_url.filter(|url| !url.is_empty())?;
+    match cog_storage::RedisKeyValueStore::connect(url).await {
+        Ok(store) => {
+            info!("Shared key-value face attached for the standalone security gateway");
+            Some(std::sync::Arc::new(store))
+        }
+        Err(e) => {
+            warn!(error = %e, "Shared key-value face unavailable; the cross-process pool verdict will not be published");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

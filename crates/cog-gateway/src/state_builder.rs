@@ -8,9 +8,10 @@ pub fn init_backend_health_probe(
     config: &cog_core::Config,
     pg_pool_explain: &Option<sqlx::PgPool>,
     memory_backend: &Option<Arc<dyn cog_core::MemoryBackend>>,
+    key_value: &Option<Arc<dyn cog_core::KeyValueStore>>,
 ) -> Option<Arc<crate::backend_health::BackendHealthProbe>> {
     Some(Arc::new(crate::backend_health::BackendHealthProbe {
-        redis_url: config.dag_executor.redis_url.clone(),
+        key_value: key_value.clone(),
         pg_pool: pg_pool_explain.clone(),
         nats_url: config.dag_executor.nats_url.clone(),
         memory_backend: memory_backend.clone(),

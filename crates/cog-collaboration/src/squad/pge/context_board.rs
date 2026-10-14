@@ -255,6 +255,10 @@ mod tests {
             unreachable!("the context board does not count")
         }
 
+        async fn incr_ex(&self, _key: &str, _by: i64, _ttl_secs: u64) -> SFResult<i64> {
+            unreachable!("the context board does not count")
+        }
+
         async fn decr(&self, _key: &str, _by: i64) -> SFResult<i64> {
             unreachable!("the context board does not count")
         }

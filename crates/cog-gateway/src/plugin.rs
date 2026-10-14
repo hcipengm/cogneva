@@ -117,23 +117,19 @@ impl cog_core::SystemPlugin for GatewayPlugin {
         // 缺失时策略/暂存路由降级为显式错误。
         let contribution_control: Option<Arc<dyn cog_core::ContributionControl>> =
             ctx.consume_service::<dyn cog_core::ContributionControl>();
-        // Login rate limiting shares the Redis the session manager uses;
-        // without Redis the limiter stays off (login itself still works).
+        // Login rate limiting shares the key-value face the session manager uses;
+        // without one the limiter stays off (login itself still works).
+        let key_value: Option<Arc<dyn cog_core::KeyValueStore>> =
+            ctx.consume_service::<dyn cog_core::KeyValueStore>();
         let login_rate_limiter: Option<Arc<crate::auth::LoginRateLimiter>> =
-            match ctx.consume::<cog_storage::RedisClient>() {
-                Some(client) => match cog_redis::connect(&client.0).await {
-                    Ok(conn) => Some(Arc::new(crate::auth::LoginRateLimiter::new(
-                        conn,
-                        crate::auth::LOGIN_MAX_ATTEMPTS,
-                        crate::auth::LOGIN_WINDOW_SECONDS,
-                    ))),
-                    Err(e) => {
-                        warn!("login rate limiter disabled — redis connection failed: {e}");
-                        None
-                    }
-                },
+            match key_value.as_ref() {
+                Some(store) => Some(Arc::new(crate::auth::LoginRateLimiter::new(
+                    store.clone(),
+                    crate::auth::LOGIN_MAX_ATTEMPTS,
+                    crate::auth::LOGIN_WINDOW_SECONDS,
+                ))),
                 None => {
-                    warn!("login rate limiter disabled — redis client not published");
+                    warn!("login rate limiter disabled — no key-value store published");
                     None
                 }
             };
@@ -182,6 +178,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             config,
             &pg_pool_explain,
             &memory_backend,
+            &key_value,
         );
         // media_backend is consumed from cog-storage plugin as dyn MediaBackend
         let notification_dispatcher = ctx.consume_service::<dyn cog_core::NotificationDispatcher>();

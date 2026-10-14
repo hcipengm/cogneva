@@ -21,11 +21,21 @@ pub struct BackendHealthMatrix {
 /// Probes infrastructure backend health directly.
 #[derive(Clone)]
 pub struct BackendHealthProbe {
-    pub redis_url: String,
+    /// The shared key-value face this deployment was given, if any. `None` is
+    /// "this deployment has none" rather than "the one it has is down": the two
+    /// have different answers, and only the second is a fault.
+    pub key_value: Option<Arc<dyn cog_core::KeyValueStore>>,
     pub pg_pool: Option<sqlx::PgPool>,
     pub nats_url: Option<String>,
     pub memory_backend: Option<Arc<dyn cog_core::MemoryBackend>>,
 }
+
+/// The key whose time-to-live the probe reads. Any key will do — what is being
+/// asked is whether the store answers at all, and a read of a key that does not
+/// exist (which is the normal answer here) is exactly as much of an answer as a
+/// read of one that does, while writing a probe key would put a row in the store
+/// that nothing else knows about.
+const PROBE_KEY: &str = "cogneva:backend-health:probe";
 
 impl BackendHealthProbe {
     pub async fn probe(&self) -> BackendHealthMatrix {
@@ -33,28 +43,29 @@ impl BackendHealthProbe {
         let mut overall = "up".to_string();
 
         let redis_start = std::time::Instant::now();
-        let redis_status = match redis::Client::open(self.redis_url.clone()) {
-            Ok(client) => match cog_redis::connect(&client).await {
+        let redis_status = match self.key_value.as_ref() {
+            Some(store) => match store.ttl(PROBE_KEY).await {
                 Ok(_) => "up".to_string(),
                 Err(e) => {
                     overall = "degraded".to_string();
                     format!("down: {}", e)
                 }
             },
-            Err(e) => {
-                overall = "degraded".to_string();
-                format!("down: {}", e)
-            }
+            None => "unknown".to_string(),
         };
         backends.push(BackendHealth {
             name: "redis".to_string(),
             status: redis_status.clone(),
             latency_ms: Some(redis_start.elapsed().as_millis() as u64),
             last_checked: Some(chrono::Utc::now().to_rfc3339()),
-            error: if redis_status == "up" {
-                None
-            } else {
-                Some(redis_status)
+            // "unknown" is not a fault: it says no store was configured here, and
+            // repeating it in the error column would read as a failure that
+            // somebody has to investigate. Whether a deployment wants one is a
+            // deployment's decision, and a single-process one that made the other
+            // choice is not broken.
+            error: match redis_status.as_str() {
+                "up" | "unknown" => None,
+                other => Some(other.to_string()),
             },
         });
 

@@ -18,7 +18,7 @@
 //!   [`del`](KeyValueStore::del), [`expire`](KeyValueStore::expire),
 //!   [`ttl`](KeyValueStore::ttl);
 //! - **atomic counters**: [`incr`](KeyValueStore::incr),
-//!   [`decr`](KeyValueStore::decr);
+//!   [`decr`](KeyValueStore::decr), [`incr_ex`](KeyValueStore::incr_ex);
 //! - **sets**: [`sadd`](KeyValueStore::sadd), [`srem`](KeyValueStore::srem),
 //!   [`smembers`](KeyValueStore::smembers);
 //! - **hash fields**: [`hset`](KeyValueStore::hset),
@@ -91,6 +91,22 @@ pub trait KeyValueStore: Send + Sync {
     /// Subtract `by` from the integer stored at `key`, atomically, and return
     /// the new value.
     async fn decr(&self, key: &str, by: i64) -> SFResult<i64>;
+
+    /// Add `by` to the integer at `key` and set a time-to-live of `ttl_secs`
+    /// seconds **only if this call created the key**, then return the new value.
+    ///
+    /// One operation rather than [`incr`](KeyValueStore::incr) followed by
+    /// [`expire`](KeyValueStore::expire): the two-call form leaves a window in
+    /// which the key exists with no expiry, and a process that dies inside that
+    /// window leaves a counter that never resets. Its caller counts failed login
+    /// attempts by identifier, where a counter that never resets is that
+    /// identifier locked out permanently.
+    ///
+    /// The TTL is **not** refreshed by later increments. A caller that wants a
+    /// window ending N seconds after the first attempt rather than after the
+    /// most recent one depends on that: refreshing on every write lets the
+    /// counter be kept alive indefinitely by the very attempts it is counting.
+    async fn incr_ex(&self, key: &str, by: i64, ttl_secs: u64) -> SFResult<i64>;
 
     /// Add `member` to the set at `key`, creating the set if it is absent.
     async fn sadd(&self, key: &str, member: &str) -> SFResult<()>;

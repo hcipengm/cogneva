@@ -114,12 +114,6 @@ impl IntoResponse for AuthError {
     }
 }
 
-impl From<redis::RedisError> for AuthError {
-    fn from(e: redis::RedisError) -> Self {
-        AuthError::RedisError(e.to_string())
-    }
-}
-
 impl From<cog_core::SFError> for AuthError {
     fn from(e: cog_core::SFError) -> Self {
         match e {

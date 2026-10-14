@@ -18,11 +18,13 @@ kind	consumer	dep	contract
 allowed	cog-agent	cog-redis	contract::stream::MessageBackend
 allowed	cog-gateway	cog-llm	contract::llm::LlmClient
 allowed	cog-gateway	cog-observability	contract::alerts::AlertStore
-allowed	cog-gateway	cog-redis	contract::kv::KeyValueStore
-# 这条边多数的用途由 metrics 后端覆盖，余下两处：一处是直接的 client 句柄
-# （即 contract::kv::KeyValueStore），另一处是一个池化连接句柄，它今天还没有
-# 契约——那条要在做这条边时给它一个自己的终点，也是这条边不能只靠 metrics
-# 那一笔就撤掉的原因。
+# 这条边今天压在三个点上，都不在 metrics 契约的覆盖范围内：一个是具体的
+# `cog_storage::ExplainPool` 值 pin（它还没有契约），一个是消费方自己
+# `PostgresMetricsBackend::new(pool)` 造出的一个具体实现（耐久读数面，选哪家
+# 是实现的事实，今天由消费方选），还有一个是消费方自己测试里用的
+# `mem::MemoryMetricsBackend`。曾经还压着两个键值面句柄（直接的 client 句柄
+# 与一个池化连接句柄），那两个已在 2026-10-15 随 cog-gateway→cog-redis 一起
+# 撤掉。这三个点各自要自己的终点，所以撤这条边不是把 contract 列换一个字。
 allowed	cog-gateway	cog-storage	contract::storage::MetricsBackend
 allowed	cog-memory	cog-storage	contract::storage::VectorBackend
 # storage 拥有什么、redis 是什么：driver 属于 storage 是一个关于实现落在哪个

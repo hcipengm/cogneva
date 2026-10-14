@@ -4,8 +4,10 @@
 //! clients can submit, retrieve, list and delete plans without going through
 //! the orchestrator's task-DAG flow.
 //! The store is a [`tokio::sync::Mutex<HashMap<String, StoredActionPlan>>`]
-//! attached to [`crate::GatewayState`]. Replace with a Redis-
-//! backed implementation when persistence across restarts is required.
+//! attached to [`crate::GatewayState`], optionally backed by a shared
+//! [`cog_core::KeyValueStore`] when one is handed in at construction: that is
+//! what makes plans persist across restarts, and without it the map is the
+//! whole store.
 
 use axum::{
     extract::{Path, State},
@@ -19,26 +21,25 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{error::ApiError, GatewayState};
-use cog_core::{validate_dag, ActionPlan, AtomicTask, SFError, SFResult, Skill};
+use cog_core::{validate_dag, ActionPlan, AtomicTask, KeyValueStore, Skill};
 
 /// Hybrid store for [`ActionPlan`] resources.
-/// When a Redis connection is configured, all operations persist to Redis
-/// (hash key `sf:action_plans`) so plans survive process restarts. Without
-/// Redis the store falls back to an in-memory `HashMap`.
+/// When a shared key-value store is configured, all operations persist to it
+/// (hash key `sf:action_plans`) so plans survive process restarts. Without one
+/// the store falls back to an in-memory `HashMap`.
 #[derive(Clone)]
 pub struct ActionPlanStore {
     inner: Arc<Mutex<HashMap<String, StoredActionPlan>>>,
-    redis: Option<redis::aio::ConnectionManager>,
+    shared: Option<Arc<dyn KeyValueStore>>,
 }
 
 impl std::fmt::Debug for ActionPlanStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The connection manager has no `Debug` of its own: whether this store
-        // persists to Redis at all is what a reader needs, its socket internals
-        // are not.
+        // Whether this store persists to a shared store at all is what a reader
+        // needs from this type; the store's internals are not.
         f.debug_struct("ActionPlanStore")
             .field("inner", &self.inner)
-            .field("redis", &self.redis.as_ref().map(|_| "redis connection"))
+            .field("shared", &self.shared.as_ref().map(|_| "key-value store"))
             .finish()
     }
 }
@@ -47,7 +48,7 @@ impl Default for ActionPlanStore {
     fn default() -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
-            redis: None,
+            shared: None,
         }
     }
 }
@@ -57,40 +58,29 @@ impl ActionPlanStore {
         Self::default()
     }
 
-    /// Create a store backed by Redis.
-    pub async fn with_redis(redis_url: &str) -> SFResult<Self> {
-        let client = redis::Client::open(redis_url)
-            .map_err(|e| SFError::Redis(format!("redis client: {}", e)))?;
-        let conn = cog_redis::connect(&client)
-            .await
-            .map_err(|e| SFError::Redis(format!("redis connection: {}", e)))?;
-        Ok(Self {
+    /// Create a store that also persists to `store`, the shared key-value face.
+    ///
+    /// The caller supplies the face rather than a URL: which implementation is
+    /// behind it, and which process holds the connection, is not this crate's
+    /// fact to know.
+    pub fn with_store(store: Arc<dyn KeyValueStore>) -> Self {
+        Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
-            redis: Some(conn),
-        })
+            shared: Some(store),
+        }
     }
 
     pub async fn insert(&self, id: String, plan: StoredActionPlan) {
-        if let Some(ref mut conn) = self.redis.clone() {
+        if let Some(ref store) = self.shared {
             let json = serde_json::to_string(&plan).unwrap_or_default();
-            let _: redis::RedisResult<()> = redis::cmd("HSET")
-                .arg("sf:action_plans")
-                .arg(&id)
-                .arg(json)
-                .query_async(conn)
-                .await;
+            let _ = store.hset(PLANS_KEY, &id, &json).await;
         }
         self.inner.lock().await.insert(id, plan);
     }
 
     pub async fn get(&self, id: &str) -> Option<StoredActionPlan> {
-        if let Some(ref mut conn) = self.redis.clone() {
-            let json: redis::RedisResult<Option<String>> = redis::cmd("HGET")
-                .arg("sf:action_plans")
-                .arg(id)
-                .query_async(conn)
-                .await;
-            if let Ok(Some(s)) = json {
+        if let Some(ref store) = self.shared {
+            if let Ok(Some(s)) = store.hget(PLANS_KEY, id).await {
                 if let Ok(plan) = serde_json::from_str::<StoredActionPlan>(&s) {
                     return Some(plan);
                 }
@@ -100,23 +90,15 @@ impl ActionPlanStore {
     }
 
     pub async fn remove(&self, id: &str) -> Option<StoredActionPlan> {
-        if let Some(ref mut conn) = self.redis.clone() {
-            let _: redis::RedisResult<()> = redis::cmd("HDEL")
-                .arg("sf:action_plans")
-                .arg(id)
-                .query_async(conn)
-                .await;
+        if let Some(ref store) = self.shared {
+            let _ = store.hdel(PLANS_KEY, id).await;
         }
         self.inner.lock().await.remove(id)
     }
 
     pub async fn list(&self) -> Vec<StoredActionPlan> {
-        if let Some(ref mut conn) = self.redis.clone() {
-            let result: redis::RedisResult<Vec<String>> = redis::cmd("HVALS")
-                .arg("sf:action_plans")
-                .query_async(conn)
-                .await;
-            if let Ok(values) = result {
+        if let Some(ref store) = self.shared {
+            if let Ok(values) = store.hvals(PLANS_KEY).await {
                 let mut plans = Vec::with_capacity(values.len());
                 for v in values {
                     if let Ok(plan) = serde_json::from_str::<StoredActionPlan>(&v) {
@@ -130,12 +112,8 @@ impl ActionPlanStore {
     }
 
     pub async fn len(&self) -> usize {
-        if let Some(ref mut conn) = self.redis.clone() {
-            let result: redis::RedisResult<i64> = redis::cmd("HLEN")
-                .arg("sf:action_plans")
-                .query_async(conn)
-                .await;
-            if let Ok(n) = result {
+        if let Some(ref store) = self.shared {
+            if let Ok(n) = store.hlen(PLANS_KEY).await {
                 return n as usize;
             }
         }
@@ -146,6 +124,9 @@ impl ActionPlanStore {
         self.len().await == 0
     }
 }
+
+/// The hash the plans are kept under when a shared store is configured.
+const PLANS_KEY: &str = "sf:action_plans";
 
 /// An [`ActionPlan`] augmented with server-side metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]

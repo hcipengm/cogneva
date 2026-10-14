@@ -13,7 +13,6 @@ cog-core = { workspace = true }
 # 厂商身份，只有网关知道真实上游。这里复用 cog-llm 的同一张表，而不是在网关
 # 另写一份按域名的映射——两份定义必然漂移，且两边都看不出来。
 cog-llm = { workspace = true }
-cog-redis = { workspace = true }
 cog-storage = { workspace = true }
 # 横切关注点：网关是上游池健康的唯一掌握者，指标/日志/时序/告警四类
 # 落盘复用 cog-observability 既有设施（无环：observability 只依赖 core）。
@@ -33,7 +32,6 @@ tracing = { workspace = true }
 futures = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
-redis = { workspace = true }
 base64 = "0.22"
 argon2 = { workspace = true }
 async-trait = "0.1"
@@ -56,7 +54,6 @@ libc = "0.2"
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
 tokio-test = "0.4"
-redis = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tokio-tungstenite = { workspace = true }

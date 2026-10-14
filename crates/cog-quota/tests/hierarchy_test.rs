@@ -63,6 +63,10 @@ impl KeyValueStore for FakeStore {
         Ok(next)
     }
 
+    async fn incr_ex(&self, _key: &str, _by: i64, _ttl_secs: u64) -> cog_core::SFResult<i64> {
+        unreachable!("the hierarchy manager expires counters separately")
+    }
+
     async fn decr(&self, key: &str, by: i64) -> cog_core::SFResult<i64> {
         self.incr(key, -by).await
     }

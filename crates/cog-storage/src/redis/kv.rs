@@ -13,6 +13,22 @@ fn err(error: redis::RedisError) -> SFError {
     SFError::Redis(error.to_string())
 }
 
+/// INCRBY with the expiry set in the same round trip, when the key has none.
+///
+/// Server-side rather than two commands from here: between an INCRBY and a
+/// separate EXPIRE there is a window in which the key exists with no expiry,
+/// and a process that dies inside that window leaves a counter that never
+/// resets. `TTL < 0` covers both the key this call created and one that already
+/// existed without an expiry, so the script also repairs a counter a previous
+/// crash left permanent.
+const INCR_WITH_TTL_SCRIPT: &str = r#"
+local count = redis.call('INCRBY', KEYS[1], ARGV[1])
+if redis.call('TTL', KEYS[1]) < 0 then
+    redis.call('EXPIRE', KEYS[1], ARGV[2])
+end
+return count
+"#;
+
 /// Redis implementation of [`KeyValueStore`].
 ///
 /// Wraps a connection manager rather than a client: the manager clones cheaply
@@ -84,6 +100,17 @@ impl KeyValueStore for RedisKeyValueStore {
 
     async fn decr(&self, key: &str, by: i64) -> SFResult<i64> {
         self.connection.clone().decr(key, by).await.map_err(err)
+    }
+
+    async fn incr_ex(&self, key: &str, by: i64, ttl_secs: u64) -> SFResult<i64> {
+        let mut connection = self.connection.clone();
+        redis::Script::new(INCR_WITH_TTL_SCRIPT)
+            .key(key)
+            .arg(by)
+            .arg(ttl_secs)
+            .invoke_async(&mut connection)
+            .await
+            .map_err(err)
     }
 
     async fn sadd(&self, key: &str, member: &str) -> SFResult<()> {

@@ -82,9 +82,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let http_client: std::sync::Arc<dyn cog_core::HttpClient> = std::sync::Arc::new(
                 cog_net::ReqwestHttpClient::from_config(&cog_net::HttpClientConfig::load()?)?,
             );
-            cog_gateway::security_gateway::run_from_env(
+            // 跨进程池状态的键值面同理由这里造：独立网关模式没有插件上下文可
+            // 消费，而"用哪个实现"是本进程的事实，不该由网关那一层去链一个驱动。
+            let gateway_config = cog_gateway::security_gateway::SecurityGatewayConfig::from_env();
+            let key_value = cogneva::assembly::infra::key_value_store_from_url(
+                gateway_config.redis_url.as_deref(),
+            )
+            .await;
+            cog_gateway::security_gateway::run(
+                gateway_config,
                 Some(env!("COGNEVA_GIT_REVISION")),
                 http_client,
+                key_value,
             )
             .await
         }

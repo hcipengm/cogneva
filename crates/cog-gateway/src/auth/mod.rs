@@ -7,7 +7,6 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
-use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -341,31 +340,18 @@ pub const LOGIN_MAX_ATTEMPTS: u32 = 5;
 /// Sliding window (seconds) for failed-login counting.
 pub const LOGIN_WINDOW_SECONDS: u64 = 300;
 
-/// INCR with the TTL set atomically on first increment — a separate EXPIRE
-/// racing a crash would leave the counter key without TTL and lock the
-/// identifier forever.
-const INCR_WITH_TTL_SCRIPT: &str = r#"
-local count = redis.call('INCR', KEYS[1])
-if count == 1 then
-    redis.call('EXPIRE', KEYS[1], ARGV[1])
-end
-return count
-"#;
-
 /// Rate-limits failed login attempts per identifier.
 #[derive(Clone)]
 pub struct LoginRateLimiter {
-    redis: Arc<tokio::sync::Mutex<redis::aio::ConnectionManager>>,
+    store: Arc<dyn cog_core::KeyValueStore>,
     max_attempts: u32,
     window_seconds: u64,
 }
 
 impl std::fmt::Debug for LoginRateLimiter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The connection manager has no `Debug` of its own: whether one is held
-        // is what a reader needs from this type, its socket internals are not.
         f.debug_struct("LoginRateLimiter")
-            .field("redis", &"redis connection")
+            .field("store", &"key-value store")
             .field("max_attempts", &self.max_attempts)
             .field("window_seconds", &self.window_seconds)
             .finish()
@@ -374,12 +360,12 @@ impl std::fmt::Debug for LoginRateLimiter {
 
 impl LoginRateLimiter {
     pub fn new(
-        redis: redis::aio::ConnectionManager,
+        store: Arc<dyn cog_core::KeyValueStore>,
         max_attempts: u32,
         window_seconds: u64,
     ) -> Self {
         Self {
-            redis: Arc::new(tokio::sync::Mutex::new(redis)),
+            store,
             max_attempts,
             window_seconds,
         }
@@ -391,9 +377,7 @@ impl LoginRateLimiter {
 
     /// Check if the identifier is currently rate-limited.
     pub async fn is_limited(&self, identifier: &str) -> bool {
-        let mut conn = self.redis.lock().await;
-        let count: Option<u32> = conn.get(Self::key(identifier)).await.ok();
-        count.unwrap_or(0) >= self.max_attempts
+        self.count(&Self::key(identifier)).await >= self.max_attempts
     }
 
     /// Record a failed login attempt.
@@ -403,16 +387,12 @@ impl LoginRateLimiter {
 
     /// Clear attempts on successful login.
     pub async fn clear(&self, identifier: &str) {
-        let mut conn = self.redis.lock().await;
-        let _: Result<(), _> = conn.del(Self::key(identifier)).await;
+        let _ = self.store.del(&Self::key(identifier)).await;
     }
 
     /// Generic rate-limit check with a custom prefix.
     pub async fn is_limited_prefix(&self, prefix: &str, identifier: &str) -> bool {
-        let mut conn = self.redis.lock().await;
-        let key = format!("{}:{}", prefix, identifier);
-        let count: Option<u32> = conn.get(&key).await.ok();
-        count.unwrap_or(0) >= self.max_attempts
+        self.count(&format!("{}:{}", prefix, identifier)).await >= self.max_attempts
     }
 
     /// Record a generic attempt with a custom prefix.
@@ -421,13 +401,27 @@ impl LoginRateLimiter {
             .await;
     }
 
+    /// The counter behind an identifier, or zero. An unreadable counter is
+    /// reported as zero rather than as "limited": failing closed here would turn
+    /// a store outage into an outage of the login path as well, and the limiter
+    /// exists to slow an attacker down, not to be the thing that decides whether
+    /// anyone can sign in.
+    async fn count(&self, key: &str) -> u32 {
+        self.store
+            .get(key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(0)
+    }
+
     async fn record_attempt(&self, key: String) {
-        let mut conn = self.redis.lock().await;
-        let _: Result<u32, _> = redis::Script::new(INCR_WITH_TTL_SCRIPT)
-            .key(key)
-            .arg(self.window_seconds)
-            .invoke_async(&mut *conn)
-            .await;
+        // The counter carries its own expiry, set in the same round trip that
+        // creates it: a separate expiry would leave a window in which the key
+        // exists without one, and a crash inside that window locks the
+        // identifier out permanently.
+        let _ = self.store.incr_ex(&key, 1, self.window_seconds).await;
     }
 }
 
