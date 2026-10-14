@@ -319,12 +319,38 @@ impl ReflectionEngine {
     pub fn new_in_memory(
         skill_registry: Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>,
     ) -> Self {
+        Self::in_memory(skill_registry, None)
+    }
+
+    /// Build the in-memory engine, reporting its promotion decisions into
+    /// `readings`.
+    ///
+    /// A second constructor rather than a parameter on `new_in_memory`: that one
+    /// is the shape every test builds, and a reading is attached only where a
+    /// deployment publishes one. A deployment that falls back to this engine is
+    /// exactly where the promotion gate has to be readable from outside — its
+    /// corpus lives and dies with the process, so the log of a restart is the
+    /// only other place a closed gate leaves a trace.
+    pub fn new_in_memory_reporting(
+        skill_registry: Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>,
+        readings: Arc<crate::skill_promotion_readings::SkillPromotionReadings>,
+    ) -> Self {
+        Self::in_memory(skill_registry, Some(readings))
+    }
+
+    fn in_memory(
+        skill_registry: Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>,
+        readings: Option<Arc<crate::skill_promotion_readings::SkillPromotionReadings>>,
+    ) -> Self {
         let recorder: Arc<dyn LearningRecorder> = Arc::new(InMemoryRecorder::new());
         let detector: Arc<dyn LearningDetector> = Arc::new(DefaultLearningDetector::new());
         let matcher: Arc<dyn LearningMatcher> =
             Arc::new(DefaultLearningMatcher::new(recorder.clone(), None));
-        let promoter: Arc<dyn LearningPromoter> =
-            Arc::new(DefaultLearningPromoter::new(skill_registry));
+        let mut promoter = DefaultLearningPromoter::new(skill_registry);
+        if let Some(readings) = readings {
+            promoter = promoter.with_readings(readings);
+        }
+        let promoter: Arc<dyn LearningPromoter> = Arc::new(promoter);
 
         Self {
             detector,
@@ -1591,6 +1617,42 @@ mod tests {
                 "occurrence {occurrence} of a pattern must be stored as {occurrence}"
             );
         }
+    }
+
+    /// A deployment with no reachable memory backend runs the in-memory engine,
+    /// and that engine's corpus dies with the process — so the decisions its
+    /// promoter takes have to be readable from outside the process. A readings
+    /// handle that is published but never handed to this constructor leaves the
+    /// series at a constant zero, which is indistinguishable from a gate that
+    /// nothing is reaching.
+    #[tokio::test]
+    async fn the_engine_a_deployment_falls_back_to_reports_its_promotion_decisions() {
+        use crate::skill_promotion_readings::{PromotionDecision, SkillPromotionReadings};
+
+        let registry = Arc::new(tokio::sync::RwLock::new(SkillRegistry::new()));
+        let readings = Arc::new(SkillPromotionReadings::new());
+        let engine = ReflectionEngine::new_in_memory_reporting(registry, readings.clone());
+
+        let learning = cog_core::Learning::new(
+            cog_core::LearningCategory::Insight,
+            cog_core::Priority::Medium,
+            cog_core::Area::Backend,
+            "a pattern seen once",
+            "details",
+            "act on it",
+            cog_core::LearningSource::SelfReview,
+        );
+        engine.promoter.promote_if_ready(&learning).await.unwrap();
+
+        assert_eq!(readings.decisions(PromotionDecision::NotReady), 1);
+        assert_eq!(readings.decisions(PromotionDecision::Promoted), 0);
+        assert_eq!(
+            readings.decided_on(crate::skill_promotion_readings::recurrence_bucket(
+                learning.recurrence_count
+            )),
+            1,
+            "the recurrence the decision was taken on is reported beside the decision"
+        );
     }
 
     /// A fake LLM that returns a fixed JSON payload for testing channel flows.

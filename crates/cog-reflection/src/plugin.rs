@@ -316,21 +316,23 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             }
         }
 
+        // What the learning-to-skill promotion gate decided, and the recurrence
+        // it decided on. Built here, ahead of the branch, because both engines
+        // below take that decision: the production one on its persistent store,
+        // and the in-memory fallback — which is the engine a deployment without a
+        // reachable memory backend actually runs on, and whose corpus dies with
+        // the process, so a reading published from only one branch would be a
+        // series that is constant zero exactly where the gate matters most.
+        //
+        // Published while the plugins initialise: the gateway takes its snapshot
+        // of the observables during `init`, so a handle published from `start()`
+        // reaches no scrape at all.
+        let promotion_readings =
+            std::sync::Arc::new(crate::skill_promotion_readings::SkillPromotionReadings::new());
+        ctx.publish_observable(promotion_readings.clone());
+
         let engine = if let (Some(ref mb), Some(ref llm)) = (memory_backend, llm_provider) {
             info!("ReflectionEngine initialized in production mode (persistent learning)");
-            // What the learning-to-skill promotion gate decided, and the
-            // recurrence it decided on. The handle is published here rather than
-            // beside the other observables below because it belongs to the
-            // promoter built on this branch: published from a deployment that
-            // has no persistent learning, it would be a series nothing writes,
-            // which reads exactly like a gate that never opens.
-            //
-            // Published while the plugins initialise: the gateway takes its
-            // snapshot of the observables during `init`, so a handle published
-            // from `start()` reaches no scrape at all.
-            let promotion_readings =
-                std::sync::Arc::new(crate::skill_promotion_readings::SkillPromotionReadings::new());
-            ctx.publish_observable(promotion_readings.clone());
             // The wiki backend is published by another plugin in this layer and
             // the promoter is built here, in the same layer: a backend read now
             // would be in time only when that plugin's init happens to finish
@@ -353,7 +355,10 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         } else {
             warn!("ReflectionEngine falling back to in-memory mode (memory_backend or llm_provider unavailable)");
             info!("ReflectionEngine initialized in in-memory mode");
-            let mut engine = crate::ReflectionEngine::new_in_memory(skill_registry.clone());
+            let mut engine = crate::ReflectionEngine::new_in_memory_reporting(
+                skill_registry.clone(),
+                promotion_readings,
+            );
             if let Some(ref evo) = evolution_engine {
                 engine.evolution = Some(evo.clone());
                 info!("ReflectionEngine evolution engine attached in in-memory mode");
