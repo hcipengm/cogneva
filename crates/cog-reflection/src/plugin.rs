@@ -75,6 +75,11 @@ pub struct ReflectionPlugin {
     /// 被门禁拒绝的变更回流主流程那条支路的门与读数。init 建好并发布，
     /// `start()` 把编排器填进它的槽——跨插件消费只能在 start。
     rework_gate: Option<Arc<crate::change_rework::ChangeReworkGate>>,
+    /// eval A/B 门求值器的「后填」槽：晋级器在 init 构造，而求值器要一个
+    /// `OrchestratorControl`（只能在 start 消费）。init 把这个槽交给晋级器，
+    /// start 拿到编排器后把求值器塞进去。
+    promotion_eval_slot:
+        Arc<std::sync::OnceLock<Arc<dyn crate::promotion_eval::PromotionEvaluator>>>,
 }
 
 impl ReflectionPlugin {
@@ -92,6 +97,7 @@ impl ReflectionPlugin {
             governance_drift: None,
             signal_readings: Arc::new(crate::signal_readings::SignalWatcherReadings::new()),
             rework_gate: None,
+            promotion_eval_slot: Arc::new(std::sync::OnceLock::new()),
         }
     }
 }
@@ -881,7 +887,8 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                                 promotion_channel,
                                 engine.clone(),
                             )
-                            .with_switch(promotion_switch.clone()),
+                            .with_switch(promotion_switch.clone())
+                            .with_eval_slot(self.promotion_eval_slot.clone()),
                         )
                     });
                 if promoter.is_none() {
@@ -1286,6 +1293,41 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 ),
                 None => {}
             }
+        }
+        // eval A/B 门求值器：晋级器在 init 就构造好，而它要的编排器只能在这里
+        // 消费。把求值器填进 init 交出的那个槽，之后每一轮晋级判定前都会当次重跑
+        // A/B。拿不到编排器就留空槽——门不测、也不拦（「门没接上」不是「门判了回归」）。
+        //
+        // 播种晋升站点那六格也在这里，跟着晋级器**自己的**接线走：移植循环那六格由
+        // 移植循环自己播（见 `baseline_port`）。若改由移植侧一起播，移植侧被配置关掉
+        // 时晋升侧的「0 而不缺席」会跟着消失——那正是 `site` 这一维要分开的两件事。
+        if let Some(orch) = orchestrator.clone() {
+            let eval_metrics = ctx.consume_service::<dyn cog_core::MetricsBackend>();
+            if eval_metrics.is_none() {
+                warn!(
+                    "MetricsBackend not published; eval A/B gate outcomes (promotion site) \
+                     will not be reported"
+                );
+            }
+            // 晋级器只在 PromotionLedger 被发布时才构造（见 init），所以有台账即
+            // 有这道门；没有台账就不播它的 0，免得摆出「门接好了却没跑」的假象。
+            if ctx
+                .consume_service::<dyn cog_core::PromotionLedger>()
+                .is_some()
+            {
+                crate::promotion_eval::seed_eval_gate_site(
+                    &eval_metrics,
+                    crate::promotion_eval::EvalGateSite::Promotion,
+                )
+                .await;
+            }
+            let evaluator = crate::promotion_eval::PromotionEval::new(
+                orch,
+                crate::promotion_eval::DEFAULT_EVAL_TIMEOUT_SECS,
+                crate::promotion_eval::DEFAULT_EVAL_POLL_INTERVAL_SECS,
+                eval_metrics,
+            );
+            let _ = self.promotion_eval_slot.set(Arc::new(evaluator));
         }
         if !sw_config.enabled {
             info!("signal watcher disabled by config");

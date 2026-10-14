@@ -19,13 +19,14 @@
 //! 晋级结果（含回滚原因）同时调 `record_change_outcome` 回流
 //! Reflection，喂给下一轮变更生成（全进化第六步的闭环回环）。
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use cog_core::{PromotionGateKind, PromotionLedger, PromotionRecord, PromotionStatus, SFResult};
 use tracing::{info, warn};
 
+use crate::promotion_eval::PromotionEvaluator;
 use crate::promotion_gate::{classify, count_diff_lines, GateVerdict};
 use crate::types::{EvolutionResult, EvolutionStatus};
 use crate::ReflectionEngine;
@@ -95,6 +96,13 @@ pub struct AutoPromoter {
     switch: Option<Arc<crate::PromotionSwitch>>,
     /// 台账 cluster 字段标识；推送端固定为 "publisher"。
     cluster: String,
+    /// eval A/B 门的求值器槽位。
+    ///
+    /// 求值器要一个 `OrchestratorControl`，而编排器只在插件 `start` 阶段可得
+    /// （`init` 里还没有）。晋级器本身在 `init` 就构造好，所以这里开一个**后填**
+    /// 的槽：`init` 建槽传进来，`start` 拿到编排器后把求值器塞进去。槽为空
+    /// （还没接线 / 还在启动）时门不测、也不拦——那是「门没接上」，不是「门判了回归」。
+    eval_slot: Option<Arc<OnceLock<Arc<dyn PromotionEvaluator>>>>,
 }
 
 impl AutoPromoter {
@@ -111,12 +119,25 @@ impl AutoPromoter {
             engine,
             switch: None,
             cluster: "publisher".into(),
+            eval_slot: None,
         }
     }
 
     /// 接线运行时一键暂停开关（admin API 侧共享同一实例）。
     pub fn with_switch(mut self, switch: Arc<crate::PromotionSwitch>) -> Self {
         self.switch = Some(switch);
+        self
+    }
+
+    /// 接线 eval A/B 门的求值器槽位（`start` 阶段填入）。
+    ///
+    /// `pub(crate)` 而非 `pub`：求值器类型是本 crate 内部件，把它摆进公开接口会
+    /// 让 core 侧（跨 crate）也看得见一个本该内聚在这里的东西。
+    pub(crate) fn with_eval_slot(
+        mut self,
+        slot: Arc<OnceLock<Arc<dyn PromotionEvaluator>>>,
+    ) -> Self {
+        self.eval_slot = Some(slot);
         self
     }
 
@@ -165,27 +186,6 @@ impl AutoPromoter {
     ) -> SFResult<()> {
         let change_id = change.artifact_id.clone();
 
-        // eval 门：评估明确否决的 change 不晋级。判定读**类型**（判词），不读散文。
-        if let Some(report) = &change.eval_summary {
-            if report.verdict.blocks_promotion() {
-                let reason = format!("eval gate rejected: {}", report.summary);
-                self.record(
-                    &change_id,
-                    "unknown",
-                    PromotionStatus::Failed,
-                    &reason,
-                    None,
-                    Some(report.summary.as_str()),
-                )
-                .await?;
-                let _ = self
-                    .engine
-                    .record_change_outcome(&change_id, false, &reason)
-                    .await;
-                return Ok(());
-            }
-        }
-
         let files: Vec<String> = crate::ChangePipeline::parse_diff(&change.content)?
             .iter()
             .map(|t| t.path.replace('\\', "/"))
@@ -194,9 +194,42 @@ impl AutoPromoter {
         let verdict = classify(&files, diff_lines, &self.policy);
 
         // 幂等：同一 change 已有终态/进行中的晋级记录则跳过。
+        //
+        // 判在最贵的动作之前：eval 门现在要提交一次沙盒双构建（最多等一个
+        // `DEFAULT_EVAL_TIMEOUT_SECS`），一条**已录过**的变更若先过门，会白花掉那次
+        // 评估再被这里挡下——而且门若判拦，还会再写一条 `Failed`（重复行），那正是
+        // 这条守卫存在的理由。纯读判词的年代这个顺序无所谓，门变成重跑之后它才是缺陷。
         if self.always_recorded(&change_id).await? {
             info!(change_id = %change_id, "Change already has a promotion record; skipping");
             return Ok(());
+        }
+
+        // eval 门：晋级前对 `(rev, rev^)` **当次重跑** A/B 评估，判词拦下就不晋级。
+        //
+        // 放在 `classify` 之后：分级已经判死的变更（`Reject`）下面那段自会落 Failed
+        // 并返回，不必先花一次沙盒双构建。
+        //
+        // 判词只读**类型**。这里说的是「不作为**门的判据**」：`change.eval_summary`
+        // 这个存量判词**不拦**——生产上没有任何东西给它写 `Some`（变更从盘上重建成
+        // `None`），拿它当门等于把「门从没跑」记成「门放行」。它仍会作为展示判词写进
+        // 台账那一列（见下面几处 `record`），那是留痕，不是判据。
+        if !matches!(verdict, GateVerdict::Reject { .. }) {
+            if let Some(reason) = self.eval_gate_blocks(&change_id, source).await {
+                self.record(
+                    &change_id,
+                    "unknown",
+                    PromotionStatus::Failed,
+                    &reason,
+                    None,
+                    None,
+                )
+                .await?;
+                let _ = self
+                    .engine
+                    .record_change_outcome(&change_id, false, &reason)
+                    .await;
+                return Ok(());
+            }
         }
 
         let (level, auto) = match &verdict {
@@ -412,6 +445,25 @@ impl AutoPromoter {
 
     /// 熔断判定：台账最近记录中，连续 RolledBack ≥ 阈值或
     /// 连续 Failed ≥ 阈值。返回触发原因。
+    /// 跑当次 eval A/B 门；判词拦下时返回理由，否则 `None`。
+    ///
+    /// 门没接上（槽位为空 / 还没填）返回 `None`：那是「门没测」，不是「门判了回归」，
+    /// 因一处接线未完成就拦下整条晋升线，会把「没接线」误判成「全仓都回归了」。求值器
+    /// 自己在没有来源时也记 `Unavailable` 并放行——同一个道理。
+    async fn eval_gate_blocks(
+        &self,
+        change_id: &str,
+        source: Option<&PromotionSource>,
+    ) -> Option<String> {
+        let evaluator = self.eval_slot.as_ref().and_then(|slot| slot.get())?;
+        let outcome = evaluator.evaluate(change_id, source).await;
+        if outcome.blocks_promotion() {
+            Some(outcome.block_reason())
+        } else {
+            None
+        }
+    }
+
     async fn breaker_tripped(&self) -> SFResult<Option<String>> {
         let recent = self.ledger.recent(20).await?;
         let mut consecutive_rollback = 0u32;
@@ -566,6 +618,7 @@ impl AutoPromoter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::promotion_eval::PromotionEvalOutcome;
     use std::sync::Mutex;
 
     struct FakeChannel {
@@ -1146,6 +1199,40 @@ mod tests {
         assert_eq!(records[0].status, PromotionStatus::Failed);
     }
 
+    /// 返回一个固定结局的求值器：考的是**门本身**（拦不拦、记哪一格），不是那台
+    /// 真跑沙盒双构建的机器。跟 `FakeChannel` 同一个路子。
+    struct FakeEvaluator {
+        outcome: PromotionEvalOutcome,
+    }
+
+    #[async_trait]
+    impl crate::promotion_eval::PromotionEvaluator for FakeEvaluator {
+        async fn evaluate(
+            &self,
+            _change_id: &str,
+            _source: Option<&PromotionSource>,
+        ) -> PromotionEvalOutcome {
+            match &self.outcome {
+                PromotionEvalOutcome::Measured(v, s) => {
+                    PromotionEvalOutcome::Measured(*v, s.clone())
+                }
+                PromotionEvalOutcome::NotApplicable => PromotionEvalOutcome::NotApplicable,
+                PromotionEvalOutcome::Unreadable(r) => PromotionEvalOutcome::Unreadable(r.clone()),
+                PromotionEvalOutcome::Unavailable => PromotionEvalOutcome::Unavailable,
+            }
+        }
+    }
+
+    /// 造一个已填好的求值器槽。`start` 阶段填真求值器，测试里填假的。
+    fn wired(
+        outcome: PromotionEvalOutcome,
+    ) -> Arc<OnceLock<Arc<dyn crate::promotion_eval::PromotionEvaluator>>> {
+        let slot: Arc<OnceLock<Arc<dyn crate::promotion_eval::PromotionEvaluator>>> =
+            Arc::new(OnceLock::new());
+        let _ = slot.set(Arc::new(FakeEvaluator { outcome }));
+        slot
+    }
+
     #[tokio::test]
     async fn eval_rejected_change_never_promotes() {
         let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
@@ -1157,15 +1244,24 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        let p = promoter(policy, ledger.clone(), Some(channel.clone()));
-        let mut pt = change("p7", "crates/cog-agent/src/tools.rs");
-        pt.eval_summary = Some(cog_core::EvalReport {
-            verdict: cog_core::EvalVerdict::Reject,
-            summary: "Reject z=-1.2 uplift -8%".into(),
-        });
-        p.decide_and_promote(&pt).await.unwrap();
+        let p = promoter(policy, ledger.clone(), Some(channel.clone())).with_eval_slot(wired(
+            PromotionEvalOutcome::Measured(
+                cog_core::EvalVerdict::Reject,
+                "Reject z=-1.2, success 20/20 -> 16/20; failing tasks: t3, t7".into(),
+            ),
+        ));
+        p.decide_and_promote(&change("p7", "crates/cog-agent/src/tools.rs"))
+            .await
+            .unwrap();
         let records = ledger.recent(10).await.unwrap();
         assert_eq!(records[0].status, PromotionStatus::Failed);
+        assert!(
+            records[0]
+                .outcome
+                .contains("eval A/B gate blocked promotion"),
+            "拦下的理由要落进台账：{}",
+            records[0].outcome
+        );
         assert!(channel.published.lock().unwrap().is_empty());
     }
 
@@ -1183,13 +1279,15 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        let p = promoter(policy, ledger.clone(), Some(channel.clone()));
-        let mut pt = change("p10", "crates/cog-agent/src/tools.rs");
-        pt.eval_summary = Some(cog_core::EvalReport {
-            verdict: cog_core::EvalVerdict::Inconclusive,
-            summary: "Inconclusive z=1.1 uplift +3%".into(),
-        });
-        p.decide_and_promote(&pt).await.unwrap();
+        let p = promoter(policy, ledger.clone(), Some(channel.clone())).with_eval_slot(wired(
+            PromotionEvalOutcome::Measured(
+                cog_core::EvalVerdict::Inconclusive,
+                "Inconclusive z=1.1, success 20/20 -> 21/21".into(),
+            ),
+        ));
+        p.decide_and_promote(&change("p10", "crates/cog-agent/src/tools.rs"))
+            .await
+            .unwrap();
         let records = ledger.recent(10).await.unwrap();
         assert_eq!(records[0].status, PromotionStatus::Failed);
         assert!(channel.published.lock().unwrap().is_empty());
@@ -1209,24 +1307,55 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        let p = promoter(policy, ledger.clone(), Some(channel.clone()));
-        let mut pt = change("p11", "crates/cog-agent/src/tools.rs");
-        pt.eval_summary = Some(cog_core::EvalReport {
-            verdict: cog_core::EvalVerdict::Adopt,
-            summary: "Adopt z=2.31 uplift +18%".into(),
-        });
-        p.decide_and_promote(&pt).await.unwrap();
+        let p = promoter(policy, ledger.clone(), Some(channel.clone())).with_eval_slot(wired(
+            PromotionEvalOutcome::Measured(
+                cog_core::EvalVerdict::Adopt,
+                "Adopt z=2.31, success 18/20 -> 20/20".into(),
+            ),
+        ));
+        p.decide_and_promote(&change("p11", "crates/cog-agent/src/tools.rs"))
+            .await
+            .unwrap();
         let records = ledger.recent(10).await.unwrap();
         assert_eq!(records[0].status, PromotionStatus::Promoted);
         assert_eq!(channel.published.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
-    async fn a_change_with_no_eval_verdict_is_not_gated_on_eval() {
-        // Today no independent producer is wired, so every change arrives with
-        // no verdict and the eval gate does not fire. Pinned so that a later
-        // edit which starts refusing changes merely for lacking a verdict has
-        // to change this test rather than silently halt all promotions.
+    async fn a_stale_stored_eval_verdict_no_longer_gates_by_itself() {
+        // 门改成当次重跑之后，`change.eval_summary` 这个**存量判词**不再是门：
+        // 生产上没有任何东西给它写 `Some`（变更从盘上重建成 `None`），读它等于
+        // 把「门从没跑」记成「门放行」。这条钉子钉住那个改动——把存量判词重新接
+        // 回门里，这条必须红。
+        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let channel = Arc::new(FakeChannel {
+            published: Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let policy = crate::PromotionGateConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let p = promoter(policy, ledger.clone(), Some(channel.clone()));
+        let mut pt = change("stale", "crates/cog-agent/src/tools.rs");
+        pt.eval_summary = Some(cog_core::EvalReport {
+            verdict: cog_core::EvalVerdict::Reject,
+            summary: "Reject z=-1.2 uplift -8%".into(),
+        });
+        p.decide_and_promote(&pt).await.unwrap();
+        let records = ledger.recent(10).await.unwrap();
+        assert_eq!(
+            records[0].status,
+            PromotionStatus::Promoted,
+            "存量判词不拦——拦的是当次重跑，不是这条陈年结论"
+        );
+        assert_eq!(channel.published.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_change_with_no_eval_gate_wired_is_not_gated_on_eval() {
+        // 求值器槽没填（没接线 / 还在启动）时门不测、也不拦。钉住这一点：一处接线
+        // 未完成不该把整条晋升线停住——那是「门没测」，不是「全仓都回归了」。
         let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
         let channel = Arc::new(FakeChannel {
             published: Mutex::new(Vec::new()),

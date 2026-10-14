@@ -2351,17 +2351,17 @@ enum Unread {
 /// yet, or a repair that is a policy decision rather than a reader to write.
 /// `GAPS_AT_CENSUS` counts them so the next one must be classified deliberately.
 const UNREAD: &[(&str, Unread)] = &[
-    // The port's eval A/B gate ends in "did not measure" more often than not
-    // right now: the repository ships no fixed eval task set, so the sandbox
-    // agent reports `applicable=false` on every run. What would make a run of
-    // those skips a fault is whether a suite is expected to exist, and until one
-    // does no threshold can be declared -- so the reader is a debt, not an
-    // omission. The closed outcome set is seeded at zero when the loop starts, so
-    // the fact the rule needs is present on every scrape: five zeroed cells say
-    // the gate has not run, and an absent series would only say the binary never
-    // published it. That turns "the gate is idling" and "the reading was never
-    // wired" into different pictures, which is what makes the rule authorable the
-    // moment the suite lands.
+    // An eval A/B gate ends in "did not measure" more often than not right now:
+    // the repository ships no fixed eval task set, so the sandbox agent reports
+    // `applicable=false` on every run. What would make a run of those skips a
+    // fault is whether a suite is expected to exist, and until one does no
+    // threshold can be declared -- so the reader is a debt, not an omission. The
+    // closed outcome set, per site, is seeded at zero when the loop starts, so
+    // the fact the rule needs is present on every scrape: two sites times six
+    // zeroed cells say the gate has not run, and an absent series would only say
+    // the binary never published it. That turns "the gate is idling" and "the
+    // reading was never wired" into different pictures, which is what makes the
+    // rule authorable the moment the suite lands.
     (
         "cogneva_eval_gate_outcomes_total",
         Unread::Gap("what would make a run of self-exempted or unavailable gate runs a fault is whether a fixed eval suite is expected to exist, and the repository ships none, so no threshold is declarable yet"),

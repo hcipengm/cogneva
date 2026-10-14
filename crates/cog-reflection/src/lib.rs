@@ -73,6 +73,7 @@ pub mod policy_evolution;
 pub mod policy_store;
 pub(crate) mod project_kind;
 pub mod promoter;
+pub(crate) mod promotion_eval;
 pub mod promotion_gate;
 pub mod promotion_switch;
 pub mod promotion_trend;

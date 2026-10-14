@@ -238,21 +238,28 @@ const COUNTER_HELP: &[(&str, &str)] = &[
     ),
     (
         "cogneva_eval_gate_outcomes_total",
-        "How each run of the baseline port's eval A/B gate ended, labelled by \
-         `outcome`, written once per run. The gate refuses a port that \
+        "How each run of an eval A/B gate ended, labelled by `outcome` and \
+         `site`, written once per run. The gate refuses a change that \
          regresses a fixed eval suite; its verdict comes from a sandbox agent \
          that runs the suite twice and reports the outcomes, and the gate \
-         z-tests what came back. Whether it measured at all is a separate fact \
-         from what it decided, and only the second had a reading: the agent \
-         reporting `applicable=false` and there being no orchestrator both \
-         returned success and left no series, so a port that was never \
-         measured and one that was measured and passed read the same. The \
-         cells are the closed set of ends -- `passed` and `rejected` are the \
-         gate deciding, `not_applicable` and `unreadable` are a run that did \
-         not measure, and `unavailable` is a run that never reached a verdict. \
-         A reader separates a gate that keeps passing from one that keeps \
-         skipping; the skip's own tick-failure reading cannot, because a gate \
-         that skips is not a tick that failed",
+         z-tests what came back. The same gate runs at two sites -- `port` \
+         (before a baseline port lands) and `promotion` (before a change is \
+         promoted) -- and the two block by different rules, so the site is its \
+         own label: a gate gone inert at one site says nothing about the other. \
+         Whether it measured at all is a separate fact from what it decided, \
+         and only the second had a reading: the agent reporting \
+         `applicable=false` and there being no orchestrator both returned \
+         success and left no series, so a change that was never measured and \
+         one that was measured and passed read the same. The cells are the \
+         closed set of ends -- `passed`, `rejected` and `inconclusive` are the \
+         gate deciding (a z-test that found no significant difference is \
+         neither a pass nor a regression and keeps its own cell, so a run that \
+         was blocked on the doubt is not stamped `passed`), `not_applicable` \
+         and `unreadable` are a run that did not measure, and `unavailable` is \
+         a run that never reached a verdict. A reader separates a gate that \
+         keeps passing from one that keeps skipping; the skip's own \
+         tick-failure reading cannot, because a gate that skips is not a tick \
+         that failed",
     ),
     (
         "cogneva_landing_failures_total",

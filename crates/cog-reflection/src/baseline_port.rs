@@ -22,16 +22,19 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use cog_core::{
-    ActionPlannerMeta, ActionPlannerSource, OrchestratorControl, SFError, SFResult, Task,
-    TaskStatus, TaskType,
+    ActionPlannerMeta, ActionPlannerSource, OrchestratorControl, SFError, SFResult, Task, TaskType,
 };
 use tracing::{debug, info, warn};
 
-use crate::eval_harness::{compare as eval_compare, EvalOutcome, EvalVerdict};
+use crate::eval_harness::EvalVerdict;
 use crate::gitops_puller::parse_tag_message;
+use crate::promotion_eval::{
+    compare_result, report_eval_gate_outcome, seed_eval_gate_site, CompareOutcome, EvalGateOutcome,
+    EvalGateSite,
+};
 
 /// 一条历代晋级变更（从 `promote/<change_id>` annotated tag 解析）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,48 +255,21 @@ impl BaselinePorter {
     /// 任务没跑成、判词可读或不可读），写点逐一排在每个返回点之前，让「每轮都写」
     /// 按构造成立——排在它们之后就会被门控掉，而「没测」恰好走的就是那些提前返回。
     async fn report_eval_gate_outcome(&self, outcome: EvalGateOutcome) {
-        let Some(ref metrics) = self.metrics else {
-            return;
-        };
-        let mut labels = HashMap::new();
-        labels.insert("outcome".to_string(), outcome.as_cell().to_string());
-        if let Err(e) = metrics
-            .record_counter(
-                cog_core::metric_names::EVAL_GATE_OUTCOMES_TOTAL,
-                1.0,
-                labels,
-            )
-            .await
-        {
-            warn!(error = %e, "eval gate outcome emit failed");
-        }
+        report_eval_gate_outcome(&self.metrics, outcome, EvalGateSite::Port).await;
     }
 
-    /// 开机把闭集的五格按 0 摆出来。
+    /// 开机把移植站点那六格按 0 摆出来。
     ///
-    /// 这格只在 eval A/B 门被走到时才写，而门走的是「有变更可移植」那条路径：
-    /// 没有变更在途（例如上游断供、提升队列空）时整条路一次都不进，于是**门没
-    /// 跑过**与**读数没接线**在 `/metrics` 上是同一个样子——五格一条序列都不
-    /// 出现。播种之后「本进程起来后门一次都没跑」是五个可读的 0，而不是一片
-    /// 缺席；缺席只留给「这个二进制根本没有这条读数」。
+    /// 这格只在 eval A/B 门被走到时才写，而门走的是「有变更可移植」那条路径：没有
+    /// 变更在途（例如上游断供、提升队列空）时整条路一次都不进，于是**门没跑过**与
+    /// **读数没接线**在 `/metrics` 上是同一个样子——一条序列都不出现。播种之后「本
+    /// 进程起来后门一次都没跑」是一排可读的 0，而不是一片缺席；缺席只留给「这个
+    /// 二进制根本没有这条读数」。
+    ///
+    /// 只播**移植站点**：晋升站点由晋级器自己的接线播（见 `plugin` 的 `start`），
+    /// 免得一个站点的开关决定另一个站点的 0 在不在。
     async fn seed_eval_gate_outcomes(&self) {
-        let Some(ref metrics) = self.metrics else {
-            return;
-        };
-        for outcome in EvalGateOutcome::ALL {
-            let mut labels = HashMap::new();
-            labels.insert("outcome".to_string(), outcome.as_cell().to_string());
-            if let Err(e) = metrics
-                .record_counter(
-                    cog_core::metric_names::EVAL_GATE_OUTCOMES_TOTAL,
-                    0.0,
-                    labels,
-                )
-                .await
-            {
-                warn!(error = %e, "eval gate outcome seed failed");
-            }
-        }
+        seed_eval_gate_site(&self.metrics, EvalGateSite::Port).await;
     }
 
     /// LLM 上游池当前是否暂停了 LLM 依赖型工作。
@@ -1035,6 +1011,9 @@ impl BaselinePorter {
 
     /// 提交任务给主流程并轮询至终态。Completed 返回任务本身（带 result），
     /// Failed/Cancelled/超时返回原因文本。
+    ///
+    /// 实现只有一处，在 [`crate::promotion_eval::submit_and_wait`]：晋升侧那道门
+    /// 也提交并等待同一类评估任务，两处走同一份轮询。
     async fn submit_and_wait(
         &self,
         orch: &Arc<dyn OrchestratorControl>,
@@ -1042,30 +1021,14 @@ impl BaselinePorter {
         goal: String,
         timeout_secs: u64,
     ) -> SFResult<Result<Task, String>> {
-        let task_id = task.id.clone();
-        let ids = orch
-            .submit_goal_auto(&goal, vec![task])
-            .await
-            .map_err(|e| SFError::Internal(format!("submit task {task_id} failed: {e}")))?;
-        let id = ids.into_iter().next().unwrap_or(task_id);
-
-        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-        loop {
-            if let Some(t) = orch.get_task(&id).await {
-                match t.status {
-                    TaskStatus::Completed => return Ok(Ok(t)),
-                    TaskStatus::Failed => {
-                        return Ok(Err(format!("failed: {}", t.error.unwrap_or_default())))
-                    }
-                    TaskStatus::Cancelled => return Ok(Err("cancelled".into())),
-                    _ => {}
-                }
-            }
-            if Instant::now() >= deadline {
-                return Ok(Err(format!("timed out after {timeout_secs}s")));
-            }
-            tokio::time::sleep(Duration::from_secs(self.poll_interval_secs)).await;
-        }
+        crate::promotion_eval::submit_and_wait(
+            orch,
+            self.poll_interval_secs,
+            task,
+            goal,
+            timeout_secs,
+        )
+        .await
     }
 
     fn verified_meta(note: &str) -> ActionPlannerMeta {
@@ -1623,112 +1586,47 @@ fn tail(s: &str, max: usize) -> String {
     format!("[tail {max} of {} bytes]\n{}", s.len(), &s[start..])
 }
 
-/// 这次 eval A/B 门把移植判成了哪一种结局。
-///
-/// 门的判据来自被判方——沙箱 LLM 自己跑两遍评估集、自己报 `success` 布尔，
-/// 控制器只对报回来的两组数跑 z 检验。所以「门测过并放行」与「门没测」是两件
-/// 不同的事实，而原先只有第一件有读数：`applicable=false`（被判方自报没有套件）
-/// 与编排器缺席都直接返回成功，一个从没量过的移植和一个量过且不回归的移植，
-/// 在所有既有读数上一模一样。这几格就是那道区别。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EvalGateOutcome {
-    /// 跑了 z 检验，未拒绝：移植不回归。
-    Passed,
-    /// 跑了 z 检验，拒绝：移植回归。
-    Rejected,
-    /// 被判方自报没有评估套件可跑。门没有测量。
-    NotApplicable,
-    /// 被判方返回的东西读不成两组结果集。门没有测量。
-    Unreadable,
-    /// 根本没走到判词：无编排器、或评估任务没跑成。两者在
-    /// `baseline_port_tick_failed` 上分得开——任务失败把它置 1，编排器缺席不会。
-    Unavailable,
-}
-
-impl EvalGateOutcome {
-    /// 读数标签的取值。闭集，读的人按这一格把「测过且通过」与三种「没测」分开。
-    fn as_cell(self) -> &'static str {
-        match self {
-            EvalGateOutcome::Passed => "passed",
-            EvalGateOutcome::Rejected => "rejected",
-            EvalGateOutcome::NotApplicable => "not_applicable",
-            EvalGateOutcome::Unreadable => "unreadable",
-            EvalGateOutcome::Unavailable => "unavailable",
-        }
-    }
-
-    /// 闭集全集，供开机播种用。
-    const ALL: [EvalGateOutcome; 5] = [
-        EvalGateOutcome::Passed,
-        EvalGateOutcome::Rejected,
-        EvalGateOutcome::NotApplicable,
-        EvalGateOutcome::Unreadable,
-        EvalGateOutcome::Unavailable,
-    ];
-}
-
 /// eval A/B 任务结果的纯判定：移植只要求"不回归"——成功率统计显著下降
 /// （z 检验 Reject）才判失败；显著提升或无统计差异都通过。数据缺失/无法
 /// 解析按失败处理（验收权在统计检验，不能静默放行）。
 ///
 /// 返回两半：落在哪一格（喂读数），以及给调用方的判词。闸门决定不变——
 /// 自报不适用仍然是放行，不是拒绝：全仓一份评估集都没有，把「没套件」判成
-/// 拒绝会让移植线整条停住。变的只是这件事现在有了自己的读数。
+/// 拒绝会让移植线整条停住。变的只是这件事现在有了自己的读数：三种统计结论
+/// （`Adopt` / `Inconclusive` / `Reject`）各落一格，不再把 `Inconclusive` 压进
+/// `Passed`——那会让一个「没测出差异」的结论冒充通过。
 fn eval_regression_feedback(result: &serde_json::Value) -> (EvalGateOutcome, Result<(), String>) {
-    let applicable = result
-        .get("applicable")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    if !applicable {
-        return (EvalGateOutcome::NotApplicable, Ok(()));
-    }
-    let parse = |key: &str| -> Result<Vec<EvalOutcome>, String> {
-        let raw = result
-            .get(key)
-            .ok_or_else(|| format!("eval result missing `{key}` outcomes"))?;
-        serde_json::from_value(raw.clone())
-            .map_err(|e| format!("eval result `{key}` outcomes unparseable: {e}"))
-    };
-    let before = match parse("before") {
-        Ok(v) => v,
-        Err(e) => return (EvalGateOutcome::Unreadable, Err(e)),
-    };
-    let after = match parse("after") {
-        Ok(v) => v,
-        Err(e) => return (EvalGateOutcome::Unreadable, Err(e)),
-    };
-    if before.is_empty() || after.is_empty() {
-        return (
-            EvalGateOutcome::Unreadable,
-            Err("eval result returned empty outcome sets".into()),
-        );
-    }
-    let cmp = eval_compare(&before, &after);
-    if cmp.verdict == EvalVerdict::Reject {
-        let failing: Vec<&str> = after
-            .iter()
-            .filter(|o| !o.success)
-            .map(|o| o.task_id.as_str())
-            .collect();
-        (
-            EvalGateOutcome::Rejected,
-            Err(format!(
-                "eval A/B regression: z={:.2}, success rate {}/{} (baseline) -> {}/{} (ported); \
-                 failing tasks: {}",
-                cmp.z_score,
-                cmp.before.succeeded,
-                cmp.before.total,
-                cmp.after.succeeded,
-                cmp.after.total,
-                if failing.is_empty() {
-                    "(none reported)".to_string()
-                } else {
-                    failing.join(", ")
-                }
-            )),
-        )
-    } else {
-        (EvalGateOutcome::Passed, Ok(()))
+    match compare_result(result) {
+        CompareOutcome::NotApplicable => (EvalGateOutcome::NotApplicable, Ok(())),
+        CompareOutcome::Unreadable(reason) => (EvalGateOutcome::Unreadable, Err(reason)),
+        CompareOutcome::Measured(cmp, after) => match cmp.verdict {
+            EvalVerdict::Reject => {
+                let failing: Vec<&str> = after
+                    .iter()
+                    .filter(|o| !o.success)
+                    .map(|o| o.task_id.as_str())
+                    .collect();
+                (
+                    EvalGateOutcome::Rejected,
+                    Err(format!(
+                        "eval A/B regression: z={:.2}, success rate {}/{} (baseline) -> {}/{} (ported); \
+                         failing tasks: {}",
+                        cmp.z_score,
+                        cmp.before.succeeded,
+                        cmp.before.total,
+                        cmp.after.succeeded,
+                        cmp.after.total,
+                        if failing.is_empty() {
+                            "(none reported)".to_string()
+                        } else {
+                            failing.join(", ")
+                        }
+                    )),
+                )
+            }
+            EvalVerdict::Inconclusive => (EvalGateOutcome::Inconclusive, Ok(())),
+            EvalVerdict::Adopt => (EvalGateOutcome::Passed, Ok(())),
+        },
     }
 }
 
@@ -1765,6 +1663,7 @@ fn parse_release_version(tag: &str) -> Option<(u64, u64, u64)> {
 mod tests {
     use super::*;
     use cog_core::MetricsBackend as _;
+    use cog_core::TaskStatus;
     use std::path::Path;
 
     async fn git(dir: &Path, args: &[&str]) -> String {
@@ -1995,8 +1894,10 @@ mod tests {
     #[test]
     fn eval_gate_names_the_two_ends_it_can_reach_without_measuring() {
         // 「测过且通过」与两种「没测」各占一格：这是这条读数的全部意义所在。
+        // 显著的提升（10/20 -> 20/20，z≈3.65）才是真的 `passed`；无显著差异落
+        // `inconclusive`，那也是它自己的一格，不冒充通过。
         let passed = serde_json::json!({
-            "before": eval_outcomes(20, 20),
+            "before": eval_outcomes(10, 20),
             "after": eval_outcomes(20, 20),
         });
         let (outcome, verdict) = eval_regression_feedback(&passed);
@@ -2013,22 +1914,25 @@ mod tests {
     }
 
     #[test]
-    fn eval_gate_passes_without_significant_difference() {
-        // 18/20 -> 20/20：z≈1.45，不显著，移植不判回归。
+    fn eval_gate_records_inconclusive_without_blocking() {
+        // 18/20 -> 20/20：z≈1.45，不显著。移植侧只拦统计显著回归（Reject），
+        // 所以**决策**是放行；但**读数**必须记成 `Inconclusive`，不能冒充
+        // `passed`——一个「没测出差异」的结论读成「通过」是假绿。
         let result = serde_json::json!({
             "before": eval_outcomes(18, 20),
             "after": eval_outcomes(20, 20),
         });
         let (outcome, verdict) = eval_regression_feedback(&result);
-        assert_eq!(outcome, EvalGateOutcome::Passed);
-        assert!(verdict.is_ok());
-        // 完全相同（无方差）同样放行。
+        assert_eq!(outcome, EvalGateOutcome::Inconclusive);
+        assert!(verdict.is_ok(), "移植侧不显著不判回归");
+
+        // 完全相同（零方差）走同一条路：z 检验给不出显著差异，落 `Inconclusive`。
         let same = serde_json::json!({
             "before": eval_outcomes(20, 20),
             "after": eval_outcomes(20, 20),
         });
         let (outcome, verdict) = eval_regression_feedback(&same);
-        assert_eq!(outcome, EvalGateOutcome::Passed);
+        assert_eq!(outcome, EvalGateOutcome::Inconclusive);
         assert!(verdict.is_ok());
     }
 
@@ -2678,44 +2582,76 @@ mod tests {
 
     /// 开机播种让「门一轮都没跑」是一个可读的 0，而不是一条不存在的序列。
     ///
-    /// 这格只在门被走到时才写，而门走的是「有变更可移植」那条路径。没有播种时，
-    /// 上游断供（没有变更在途）⇒ 一条序列都不出现，与「这个二进制根本没接这条
-    /// 读数」在 `/metrics` 上同形——本轮实测现网就是这个样子。播种后五格齐全、
-    /// 全 0 即「跑过 0 次门」；真跑过一轮时动的只有那一格。
+    /// 这格只在门被走到时才写，而门走的是「有变更可移植 / 有变更待晋级」那条路径。
+    /// 没有播种时，上游断供（没有变更在途）⇒ 一条序列都不出现，与「这个二进制根本
+    /// 没接这条读数」在 `/metrics` 上同形——本轮实测现网就是这个样子。播种后本站点
+    /// 六格齐全、全 0 即「跑过 0 次门」；真跑过一轮时动的只有那一格。
+    ///
+    /// 移植循环只播**自己那个站点**：另一站点的 0 该由它自己的接线播，否则一个站点
+    /// 的开关一关，另一个站点的「0 而不缺席」也跟着消失——那正是 `site` 这一维要分
+    /// 开的东西。
     #[tokio::test]
     async fn the_closed_outcome_set_is_seeded_so_a_gate_that_never_ran_reads_as_zero() {
         let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
         let porter = BaselinePorter::new(".").with_metrics(Some(metrics.clone()));
         let name = cog_core::metric_names::EVAL_GATE_OUTCOMES_TOTAL.as_str();
 
+        // 按 (site, outcome) 取格：两个站点各有自己的六格，只按 outcome 取会把
+        // 两个站点并成一格，读数差就藏进了键里。
+        type Cells = std::collections::BTreeMap<(String, String), f64>;
+
         // 播种前：一条序列都没有——正是「没接线」与「没跑过」同形的那个样子。
         assert!(metrics.query_counter_totals(name).await.unwrap().is_empty());
 
         porter.seed_eval_gate_outcomes().await;
-        let seeded = metrics.query_counter_totals(name).await.unwrap();
-        let cells: std::collections::BTreeMap<String, f64> = seeded
-            .iter()
-            .map(|s| (s.labels["outcome"].clone(), s.value))
-            .collect();
-        assert_eq!(cells.len(), EvalGateOutcome::ALL.len(), "五格全在");
-        assert!(cells.values().all(|v| *v == 0.0), "每一格都按 0 摆出");
-
-        // 真跑一轮：只有那一格动，其余仍是可读的 0。
-        porter
-            .report_eval_gate_outcome(EvalGateOutcome::Passed)
-            .await;
-        let after: std::collections::BTreeMap<String, f64> = metrics
+        let seeded: Cells = metrics
             .query_counter_totals(name)
             .await
             .unwrap()
             .iter()
-            .map(|s| (s.labels["outcome"].clone(), s.value))
+            .map(|s| {
+                (
+                    (s.labels["site"].clone(), s.labels["outcome"].clone()),
+                    s.value,
+                )
+            })
             .collect();
-        assert_eq!(after["passed"], 1.0);
-        assert_eq!(after["rejected"], 0.0);
-        assert_eq!(after["not_applicable"], 0.0);
-        assert_eq!(after["unreadable"], 0.0);
-        assert_eq!(after["unavailable"], 0.0);
+        assert_eq!(seeded.len(), EvalGateOutcome::ALL.len(), "移植站点六格全在");
+        assert!(
+            seeded.keys().all(|(site, _)| site == "port"),
+            "移植循环只播自己那个站点"
+        );
+        assert!(seeded.values().all(|v| *v == 0.0), "每一格都按 0 摆出");
+        assert!(
+            !seeded.contains_key(&("promotion".into(), "passed".into())),
+            "晋升站点那六格由晋级器自己播——一个站点的开关不该决定另一个的 0 在不在"
+        );
+
+        // 真跑一轮（移植站点）：只有那一格动，其余仍是可读的 0。
+        porter
+            .report_eval_gate_outcome(EvalGateOutcome::Passed)
+            .await;
+        let after: Cells = metrics
+            .query_counter_totals(name)
+            .await
+            .unwrap()
+            .iter()
+            .map(|s| {
+                (
+                    (s.labels["site"].clone(), s.labels["outcome"].clone()),
+                    s.value,
+                )
+            })
+            .collect();
+        assert_eq!(after[&("port".into(), "passed".into())], 1.0);
+        assert_eq!(after[&("port".into(), "rejected".into())], 0.0);
+        assert_eq!(after[&("port".into(), "not_applicable".into())], 0.0);
+        assert_eq!(after[&("port".into(), "unreadable".into())], 0.0);
+        assert_eq!(after[&("port".into(), "unavailable".into())], 0.0);
+        assert!(
+            !after.contains_key(&("promotion".into(), "passed".into())),
+            "写移植站点那一格不凭空造出晋升站点的格子"
+        );
     }
 
     /// 循环把**每一轮**的结局都盖下来：仓库不可达时 port_tick 返回 Err，读数必须是
