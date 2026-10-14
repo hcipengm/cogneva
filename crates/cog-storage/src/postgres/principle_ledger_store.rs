@@ -706,9 +706,12 @@ GROUP BY check_kind";
 /// The session is written as the empty string, the value the column documents
 /// for a side that has no session to name: this method is called by the
 /// platform's own gate, which refuses inside a process that belongs to no
-/// session, and the host gate does not come through here at all. Naming the
-/// column rather than letting the default apply is what it costs to keep the
-/// conflict target equal to the primary key -- a target listing fewer columns
+/// session, and the host gate does not come through here at all. That is the
+/// empty string's one meaning, and the rows that predate the column do not share
+/// it: they hold `-`, the marker for a session nobody recorded, so a reader
+/// taking every blank for "there was no session" is not describing these rows.
+/// Naming the column rather than letting the default apply is what it costs to
+/// keep the conflict target equal to the primary key -- a target listing fewer columns
 /// than the key matches no unique constraint, and the insert fails at run time
 /// rather than merging. `hits` is left out for the opposite reason: a magnitude
 /// is counted by the side that did the refusing, and this side counts none.
