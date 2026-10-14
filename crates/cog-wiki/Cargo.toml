@@ -21,7 +21,3 @@ async-trait = "0.1"
 regex = "1.10"
 pathdiff = "0.2"
 schemars = { workspace = true }
-
-[dev-dependencies]
-cog-memory = { workspace = true }
-

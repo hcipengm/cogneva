@@ -1050,7 +1050,8 @@ mod tests {
     use super::*;
     use crate::WIKI_PAGE_PROMPT_CHARS;
     use cog_core::contract::knowledge::RETRIEVAL_OUTCOMES;
-    use cog_core::{SFError, WikiDocument, WikiSearchResult};
+    use cog_core::{DateTime, SFError, Utc, WikiDocument, WikiSearchResult};
+    use std::collections::HashMap;
 
     /// The cells this producer writes have to be exactly the series'
     /// vocabulary: the seeding pass walks the vocabulary, so a cell that is
@@ -1480,12 +1481,282 @@ mod tests {
         )
     }
 
+    /// Two tables of rows the stamping tests can read back.
+    ///
+    /// The tests below ask a question about this backend's own rows — which of
+    /// them carry a retrieval count after an answer is assembled — so they need
+    /// a store, not a storage engine. Only the path that question walks is
+    /// implemented: put a row in, get it back, match a query against it, stamp
+    /// the ids the caller names. The rest of the contract is out of reach here
+    /// and says so, because a stand-in that quietly answered `Ok` everywhere
+    /// would let the tests pass without the rows ever being written.
+    #[derive(Default)]
+    struct StampMemory {
+        schema: std::sync::Mutex<HashMap<(String, String), SchemaEntry>>,
+        summary: std::sync::Mutex<HashMap<(String, String), SummaryEntry>>,
+    }
+
+    impl StampMemory {
+        fn new() -> Self {
+            Self::default()
+        }
+    }
+
+    fn row_key(namespace: &str, id: &str) -> (String, String) {
+        (namespace.to_string(), id.to_string())
+    }
+
+    #[async_trait]
+    impl MemoryBackend for StampMemory {
+        async fn store_schema(&self, namespace: &str, entry: &SchemaEntry) -> SFResult<()> {
+            self.schema
+                .lock()
+                .unwrap()
+                .insert(row_key(namespace, &entry.id), entry.clone());
+            Ok(())
+        }
+
+        async fn get_schema(&self, namespace: &str, id: &str) -> SFResult<Option<SchemaEntry>> {
+            Ok(self
+                .schema
+                .lock()
+                .unwrap()
+                .get(&row_key(namespace, id))
+                .cloned())
+        }
+
+        async fn update_schema(&self, namespace: &str, entry: &SchemaEntry) -> SFResult<()> {
+            self.store_schema(namespace, entry).await
+        }
+
+        async fn store_summary(&self, namespace: &str, entry: &SummaryEntry) -> SFResult<()> {
+            self.summary
+                .lock()
+                .unwrap()
+                .insert(row_key(namespace, &entry.id), entry.clone());
+            Ok(())
+        }
+
+        async fn get_summary(&self, namespace: &str, id: &str) -> SFResult<Option<SummaryEntry>> {
+            Ok(self
+                .summary
+                .lock()
+                .unwrap()
+                .get(&row_key(namespace, id))
+                .cloned())
+        }
+
+        /// A term match over the row's own text: the tests query with a word the
+        /// rows were named after, so substring overlap is enough to put the
+        /// right rows in the candidate pool. Every hit scores the same, which is
+        /// the interesting case — the caller then has to truncate on its own
+        /// width rather than inherit an order from the store.
+        async fn search_all(
+            &self,
+            namespace: &str,
+            query: &str,
+            _embedding: Option<&[f32]>,
+            top_k: usize,
+            _time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        ) -> SFResult<Vec<UnifiedSearchResult>> {
+            let needle = query.to_lowercase();
+            let hits = |text: &str| text.to_lowercase().contains(&needle);
+            let mut out: Vec<UnifiedSearchResult> = Vec::new();
+            let mut rows: Vec<SchemaEntry> = self
+                .schema
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|((ns, _), e)| ns == namespace && hits(&e.name))
+                .map(|(_, e)| e.clone())
+                .collect();
+            rows.sort_by(|a, b| a.id.cmp(&b.id));
+            for entry in rows {
+                out.push(UnifiedSearchResult::Schema(cog_core::SchemaSearchResult {
+                    entry,
+                    score: 1.0,
+                }));
+            }
+            let mut rows: Vec<SummaryEntry> = self
+                .summary
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|((ns, _), e)| ns == namespace && hits(&e.text))
+                .map(|(_, e)| e.clone())
+                .collect();
+            rows.sort_by(|a, b| a.id.cmp(&b.id));
+            for entry in rows {
+                out.push(UnifiedSearchResult::Summary(
+                    cog_core::SummarySearchResult::new(entry, 1.0),
+                ));
+            }
+            out.truncate(top_k);
+            Ok(out)
+        }
+
+        /// Stamp the ids the caller names, each on the table it came from. The
+        /// count and the instant move together: a row that was counted but has
+        /// no time would read as half-retrieved to whatever looks at it next.
+        async fn record_retrievals(
+            &self,
+            schema_ids: &[String],
+            summary_ids: &[String],
+        ) -> SFResult<()> {
+            let now = Utc::now();
+            for ((_, id), entry) in self.schema.lock().unwrap().iter_mut() {
+                if schema_ids.iter().any(|s| s == id) {
+                    entry.retrieval_count += 1;
+                    entry.last_retrieved_at = Some(now);
+                }
+            }
+            for ((_, id), entry) in self.summary.lock().unwrap().iter_mut() {
+                if summary_ids.iter().any(|s| s == id) {
+                    entry.retrieval_count += 1;
+                    entry.last_retrieved_at = Some(now);
+                }
+            }
+            Ok(())
+        }
+
+        // The rest of the contract is not on any path these tests walk.
+
+        async fn archive_raw(&self, _source: &cog_core::RawSource) -> SFResult<String> {
+            unimplemented!("StampMemory stands in only for the stamping path")
+        }
+
+        async fn get_raw(
+            &self,
+            _namespace: &str,
+            _id: &str,
+        ) -> SFResult<Option<cog_core::RawSource>> {
+            unimplemented!("StampMemory stands in only for the stamping path")
+        }
+
+        async fn list_raw(
+            &self,
+            _namespace: &str,
+            _content_type_prefix: Option<&str>,
+        ) -> SFResult<Vec<String>> {
+            unimplemented!("StampMemory stands in only for the stamping path")
+        }
+
+        async fn delete_raw(&self, _namespace: &str, _id: &str) -> SFResult<()> {
+            unimplemented!("StampMemory stands in only for the stamping path")
+        }
+
+        async fn presign_raw(
+            &self,
+            _namespace: &str,
+            _id: &str,
+            _expiry_secs: u64,
+        ) -> SFResult<Option<String>> {
+            unimplemented!("StampMemory stands in only for the stamping path")
+        }
+
+        async fn search_schema(
+            &self,
+            _namespace: &str,
+            _query: &str,
+            _limit: usize,
+        ) -> SFResult<Vec<cog_core::SchemaSearchResult>> {
+            unimplemented!("StampMemory stands in only for the stamping path")
+        }
+
+        async fn schema_for_raw(
+            &self,
+            _namespace: &str,
+            _raw_id: &str,
+        ) -> SFResult<Vec<SchemaEntry>> {
+            unimplemented!("StampMemory stands in only for the stamping path")
+        }
+
+        async fn list_schema(&self, _namespace: &str) -> SFResult<Vec<SchemaEntry>> {
+            unimplemented!("StampMemory stands in only for the stamping path")
+        }
+
+        async fn delete_schema(&self, _namespace: &str, _id: &str) -> SFResult<()> {
+            unimplemented!("StampMemory stands in only for the stamping path")
+        }
+
+        async fn query_relations(
+            &self,
+            _namespace: &str,
+            _entity: &str,
+            _direction: cog_core::RelationDirection,
+            _relation_type: Option<&str>,
+        ) -> SFResult<Vec<SchemaEntry>> {
+            unimplemented!("StampMemory stands in only for the stamping path")
+        }
+
+        async fn search_summary(
+            &self,
+            _namespace: &str,
+            _query_embedding: &[f32],
+            _top_k: usize,
+            _time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        ) -> SFResult<Vec<cog_core::SummarySearchResult>> {
+            unimplemented!("StampMemory stands in only for the stamping path")
+        }
+
+        async fn summary_for_raw(
+            &self,
+            _namespace: &str,
+            _raw_id: &str,
+        ) -> SFResult<Vec<SummaryEntry>> {
+            unimplemented!("StampMemory stands in only for the stamping path")
+        }
+
+        async fn list_summary(&self, _namespace: &str) -> SFResult<Vec<SummaryEntry>> {
+            unimplemented!("StampMemory stands in only for the stamping path")
+        }
+
+        async fn delete_summary(&self, _namespace: &str, _id: &str) -> SFResult<()> {
+            unimplemented!("StampMemory stands in only for the stamping path")
+        }
+
+        async fn update_summary(&self, _namespace: &str, _entry: &SummaryEntry) -> SFResult<()> {
+            unimplemented!("StampMemory stands in only for the stamping path")
+        }
+
+        fn metrics(&self) -> cog_core::MemoryMetrics {
+            unimplemented!("StampMemory stands in only for the stamping path")
+        }
+
+        async fn health_check(&self) -> SFResult<()> {
+            unimplemented!("StampMemory stands in only for the stamping path")
+        }
+
+        async fn ingest_explicit(
+            &self,
+            _namespace: &str,
+            _text: &str,
+            _importance: f32,
+            _tags: Vec<String>,
+        ) -> SFResult<()> {
+            unimplemented!("StampMemory stands in only for the stamping path")
+        }
+
+        async fn forget(&self, _namespace: &str, _id: &str) -> SFResult<()> {
+            unimplemented!("StampMemory stands in only for the stamping path")
+        }
+
+        async fn decay(
+            &self,
+            _namespace: &str,
+            _age_threshold_secs: u64,
+            _importance_threshold: f32,
+        ) -> SFResult<cog_core::DecayReport> {
+            unimplemented!("StampMemory stands in only for the stamping path")
+        }
+    }
+
     /// The reading counts what reached the model, not what a search returned:
     /// a row the answer's own width pushed out was never handed over, and
     /// counting it would reward the recall window rather than the value.
     #[tokio::test]
     async fn only_the_rows_in_the_answer_are_stamped() {
-        let memory = Arc::new(cog_memory::MemoryMemoryBackend::new());
+        let memory = Arc::new(StampMemory::new());
         for id in ["s1", "s2", "s3"] {
             memory
                 .store_schema(NS_KNOWLEDGE, &knowledge_schema(id, "alpha term"))
@@ -1536,7 +1807,7 @@ mod tests {
     /// other layer's rows looking never-retrieved.
     #[tokio::test]
     async fn each_layer_is_stamped_on_its_own_table() {
-        let memory = Arc::new(cog_memory::MemoryMemoryBackend::new());
+        let memory = Arc::new(StampMemory::new());
         memory
             .store_schema(NS_KNOWLEDGE, &knowledge_schema("schema-row", "alpha"))
             .await
