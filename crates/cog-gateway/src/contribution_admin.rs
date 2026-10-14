@@ -31,6 +31,7 @@ use axum::{
     Json,
 };
 use base64::Engine;
+use cog_core::HttpRequest;
 use rand_core::RngCore;
 use serde::Deserialize;
 use serde_json::json;
@@ -245,18 +246,35 @@ pub struct DevicePollRequest {
     pub device_code: String,
 }
 
-/// 本模块所有出站请求用的客户端：取系统 `http_client` 段的超时、连接池与代理，
-/// 与本进程其余出站流量同一份设置。
+/// 本模块所有出站请求用的客户端，由装配层在进程启动时交进来。
 ///
-/// 两处刻意不这么做，各自都有代价：本模块原来自己钉一个 12s 超时与一个 UA——
-/// 那是本文件的第 2、3 份设置，没有来源，改一处不影响另一处；失败时又回落到裸
-/// `reqwest::Client::new()`——裸客户端连超时都没有，而下游读到的和配置好的
-/// 一模一样，调用方分不出手上这份是哪一份。现在失败即 Err，由调用方在它本来就
-/// 有的「连不上」分支里报出去（每个调用点都已经有那一个分支）。
-pub(crate) fn http_client() -> Result<reqwest::Client, String> {
-    let config =
-        cog_net::HttpClientConfig::load().map_err(|e| format!("http_client 配置无效：{e}"))?;
-    cog_net::build_client(&config).map_err(|e| format!("HTTP 客户端构造失败：{e}"))
+/// 契约（[`cog_core::HttpClient`]）在这里，具体实现（reqwest、超时、连接池、
+/// 代理）在装配层——网关插件与安全网关进程各自持有那一份，并把它交进来。于是
+/// 本模块不认实现，而**本进程的出站客户端只有一份设置**：此前这里自己从
+/// `http_client` 段造一个，读的是同一份配置、造出来的却是第二个客户端，改一处
+/// 不影响另一处。
+///
+/// 没装配就是 Err，不回落到一个自己现造的客户端：回落的那个与配置好的那份在
+/// 调用方看来一模一样，于是「装配漏了」读起来和「装配好了」一样。调用方本来就
+/// 有「连不上」分支，这个错误就报在那里。
+pub(crate) fn http_client() -> Result<Arc<dyn cog_core::HttpClient>, String> {
+    INJECTED_HTTP
+        .get()
+        .cloned()
+        .ok_or_else(|| "出站客户端尚未装配（本进程还没把 cog_core::HttpClient 交进来）".to_string())
+}
+
+/// 本进程交进来的那一份，进程内只有一个。
+static INJECTED_HTTP: OnceLock<Arc<dyn cog_core::HttpClient>> = OnceLock::new();
+
+/// 装配层调用一次，交出本进程的出站客户端。
+///
+/// 第二次调用返回 Err 而不是把前一个静默顶掉：出现了两个装配点、两份客户端时，
+/// 「用哪一个」不该由调用顺序决定，而该被说出来。
+pub(crate) fn install_http_client(client: Arc<dyn cog_core::HttpClient>) -> Result<(), String> {
+    INJECTED_HTTP
+        .set(client)
+        .map_err(|_| "出站客户端已经装配过".to_string())
 }
 
 pub(crate) fn oauth_client_id(explicit: Option<&str>) -> Option<String> {
@@ -287,12 +305,10 @@ pub(crate) async fn gitee_oauth_client_id() -> Option<String> {
     // client_id"），调用方据此走「未配置 OAuth App」的引导。
     let body: serde_json::Value = http_client()
         .ok()?
-        .get(url)
-        .send()
+        .execute(HttpRequest::get(url))
         .await
         .ok()?
         .json()
-        .await
         .ok()?;
     body.get("client_id")
         .and_then(|v| v.as_str())
@@ -310,15 +326,15 @@ async fn oauth_gateway_call(
     payload: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let url = format!("{}{path}", oauth_gateway_base());
-    let resp = http_client()?
-        .post(url)
+    let request = HttpRequest::post(url)
         .json(&payload)
-        .send()
+        .map_err(|e| format!("请求体序列化失败（{e}）"))?;
+    let resp = http_client()?
+        .execute(request)
         .await
         .map_err(|e| format!("无法连接安全网关（{e}）"))?;
-    let status = resp.status();
-    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    if !status.is_success() {
+    let body: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
+    if !resp.is_success() {
         let msg = body
             .get("error_description")
             .or_else(|| body.get("message"))
@@ -501,6 +517,19 @@ fn urlencoding_encode(value: &str) -> String {
     out
 }
 
+/// A query string (`k=v&k=v`) with both sides escaped by the one encoder above.
+///
+/// The endpoints that take parameters in the URL are OAuth token ones, whose
+/// values are secrets; escaping them at the call site is how a `+` or `/` in a
+/// client secret silently truncates the parameter instead of authenticating.
+pub(crate) fn encode_query(params: &[(&str, &str)]) -> String {
+    params
+        .iter()
+        .map(|(k, v)| format!("{}={}", urlencoding_encode(k), urlencoding_encode(v)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
 /// Extract the authorization code from either a bare code or a full redirect
 /// URL the user pasted from the browser address bar.
 pub fn extract_gitee_code(code: Option<&str>, redirect_url: Option<&str>) -> Option<String> {
@@ -527,19 +556,21 @@ pub(crate) async fn exchange_gitee_code_with(
     code: &str,
     redirect_uri: &str,
 ) -> Result<GiteeTokenSet, String> {
-    let resp = http_client()?
-        .post(GITEE_TOKEN_URL)
-        .query(&[
+    let url = format!(
+        "{GITEE_TOKEN_URL}?{}",
+        encode_query(&[
             ("grant_type", "authorization_code"),
             ("code", code),
             ("client_id", client_id),
             ("redirect_uri", redirect_uri),
             ("client_secret", client_secret),
         ])
-        .send()
+    );
+    let resp = http_client()?
+        .execute(HttpRequest::post(url))
         .await
         .map_err(|e| format!("无法连接 Gitee（{e}）"))?;
-    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let body: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
     parse_gitee_token(&body, unix_now())
 }
 
@@ -558,13 +589,12 @@ pub(crate) async fn refresh_gitee_token_with(
         params.push(("client_id", id));
         params.push(("client_secret", secret));
     }
+    let url = format!("{GITEE_TOKEN_URL}?{}", encode_query(&params));
     let resp = http_client()?
-        .post(GITEE_TOKEN_URL)
-        .query(&params)
-        .send()
+        .execute(HttpRequest::post(url))
         .await
         .map_err(|e| format!("无法连接 Gitee（{e}）"))?;
-    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let body: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
     parse_gitee_token(&body, unix_now())
 }
 
@@ -590,8 +620,7 @@ pub(crate) async fn exchange_github_code_with(
     code: &str,
     redirect_uri: &str,
 ) -> Result<String, String> {
-    let resp = http_client()?
-        .post(GITHUB_TOKEN_URL)
+    let request = HttpRequest::post(GITHUB_TOKEN_URL)
         .header("Accept", "application/json")
         .json(&json!({
             "client_id": client_id,
@@ -599,10 +628,12 @@ pub(crate) async fn exchange_github_code_with(
             "code": code,
             "redirect_uri": redirect_uri,
         }))
-        .send()
+        .map_err(|e| format!("请求体序列化失败（{e}）"))?;
+    let resp = http_client()?
+        .execute(request)
         .await
         .map_err(|e| format!("无法连接 GitHub（{e}）"))?;
-    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let body: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
     if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
         let desc = body
             .get("error_description")
@@ -649,19 +680,20 @@ async fn verify_token(provider: &str, token: &str) -> Result<String, String> {
     match provider {
         "github" => {
             let resp = client
-                .get(format!("{GITHUB_API}/user"))
-                .bearer_auth(token)
-                .header("Accept", "application/vnd.github+json")
-                .send()
+                .execute(
+                    HttpRequest::get(format!("{GITHUB_API}/user"))
+                        .header("Authorization", format!("Bearer {token}"))
+                        .header("Accept", "application/vnd.github+json"),
+                )
                 .await
                 .map_err(|e| format!("无法连接 GitHub（{e}）；国内网络可改用 Gitee 通道"))?;
-            if !resp.status().is_success() {
+            if !resp.is_success() {
                 return Err(format!(
                     "GitHub 拒绝该令牌（HTTP {}），请检查权限",
-                    resp.status()
+                    resp.status
                 ));
             }
-            let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+            let body: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
             Ok(body
                 .get("login")
                 .and_then(|v| v.as_str())
@@ -669,19 +701,21 @@ async fn verify_token(provider: &str, token: &str) -> Result<String, String> {
                 .to_string())
         }
         "gitee" => {
+            let url = format!(
+                "{GITEE_API}/user?{}",
+                encode_query(&[("access_token", token)])
+            );
             let resp = client
-                .get(format!("{GITEE_API}/user"))
-                .query(&[("access_token", token)])
-                .send()
+                .execute(HttpRequest::get(url))
                 .await
                 .map_err(|e| format!("无法连接 Gitee（{e}）"))?;
-            if !resp.status().is_success() {
+            if !resp.is_success() {
                 return Err(format!(
                     "Gitee 拒绝该令牌（HTTP {}），请检查权限",
-                    resp.status()
+                    resp.status
                 ));
             }
-            let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+            let body: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
             Ok(body
                 .get("login")
                 .and_then(|v| v.as_str())
@@ -700,33 +734,32 @@ async fn upload_public_key(provider: &str, token: &str, public_line: &str) -> Re
     let title = "cogneva-contribution";
     match provider {
         "github" => {
-            let resp = client
-                .post(format!("{GITHUB_API}/user/keys"))
-                .bearer_auth(token)
+            let request = HttpRequest::post(format!("{GITHUB_API}/user/keys"))
+                .header("Authorization", format!("Bearer {token}"))
                 .header("Accept", "application/vnd.github+json")
                 .json(&json!({"title": title, "key": public_line}))
-                .send()
-                .await
                 .map_err(|e| e.to_string())?;
+            let resp = client.execute(request).await.map_err(|e| e.to_string())?;
             // 201 created; 422 = key already present (fine).
-            if resp.status().as_u16() == 201 || resp.status().as_u16() == 422 {
+            if resp.status == 201 || resp.status == 422 {
                 Ok(())
             } else {
-                Err(format!("GitHub 上传公钥返回 HTTP {}", resp.status()))
+                Err(format!("GitHub 上传公钥返回 HTTP {}", resp.status))
             }
         }
         "gitee" => {
-            let resp = client
-                .post(format!("{GITEE_API}/user/keys"))
-                .query(&[("access_token", token)])
+            let url = format!(
+                "{GITEE_API}/user/keys?{}",
+                encode_query(&[("access_token", token)])
+            );
+            let request = HttpRequest::post(url)
                 .json(&json!({"title": title, "key": public_line}))
-                .send()
-                .await
                 .map_err(|e| e.to_string())?;
-            if resp.status().is_success() {
+            let resp = client.execute(request).await.map_err(|e| e.to_string())?;
+            if resp.is_success() {
                 Ok(())
             } else {
-                Err(format!("Gitee 上传公钥返回 HTTP {}", resp.status()))
+                Err(format!("Gitee 上传公钥返回 HTTP {}", resp.status))
             }
         }
         other => Err(format!("未知平台: {other}")),
@@ -1066,13 +1099,10 @@ pub async fn github_app_manifest_handler(
                 .into_response();
         }
     };
-    let resp = match client
-        .post(&url)
+    let request = HttpRequest::post(&url)
         .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "cogneva-security-gateway")
-        .send()
-        .await
-    {
+        .header("User-Agent", "cogneva-security-gateway");
+    let resp = match client.execute(request).await {
         Ok(r) => r,
         Err(e) => {
             return (
@@ -1082,9 +1112,9 @@ pub async fn github_app_manifest_handler(
                 .into_response();
         }
     };
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+    let status = resp.status;
+    if !resp.is_success() {
+        let body = resp.text().unwrap_or_default();
         let body: String = body.chars().take(300).collect();
         return (
             StatusCode::BAD_GATEWAY,
@@ -1092,7 +1122,7 @@ pub async fn github_app_manifest_handler(
         )
             .into_response();
     }
-    let v: serde_json::Value = match resp.json().await {
+    let v: serde_json::Value = match resp.json() {
         Ok(v) => v,
         Err(e) => {
             return (
@@ -1241,14 +1271,11 @@ pub async fn github_app_discover_handler(
                 .into_response();
         }
     };
-    let resp = match client
-        .get(format!("{GITHUB_API}/app/installations"))
-        .bearer_auth(jwt)
+    let request = HttpRequest::get(format!("{GITHUB_API}/app/installations"))
+        .header("Authorization", format!("Bearer {jwt}"))
         .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "cogneva-security-gateway")
-        .send()
-        .await
-    {
+        .header("User-Agent", "cogneva-security-gateway");
+    let resp = match client.execute(request).await {
         Ok(r) => r,
         Err(e) => {
             return (
@@ -1258,9 +1285,9 @@ pub async fn github_app_discover_handler(
                 .into_response();
         }
     };
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+    let status = resp.status;
+    if !resp.is_success() {
+        let body = resp.text().unwrap_or_default();
         let body: String = body.chars().take(300).collect();
         return (
             StatusCode::BAD_GATEWAY,
@@ -1268,7 +1295,7 @@ pub async fn github_app_discover_handler(
         )
             .into_response();
     }
-    let installs: Vec<serde_json::Value> = match resp.json().await {
+    let installs: Vec<serde_json::Value> = match resp.json() {
         Ok(v) => v,
         Err(e) => {
             return (
@@ -1411,13 +1438,20 @@ pub async fn device_start_handler(
                 .into_response();
         }
     };
-    let resp = match client
-        .post(GITHUB_DEVICE_CODE_URL)
+    let request = HttpRequest::post(GITHUB_DEVICE_CODE_URL)
         .header("Accept", "application/json")
-        .json(&json!({"client_id": client_id, "scope": GITHUB_DEVICE_SCOPE}))
-        .send()
-        .await
-    {
+        .json(&json!({"client_id": client_id, "scope": GITHUB_DEVICE_SCOPE}));
+    let request = match request {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "device_start_failed", "message": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let resp = match client.execute(request).await {
         Ok(r) => r,
         Err(e) => {
             return (
@@ -1428,7 +1462,7 @@ pub async fn device_start_handler(
                 .into_response();
         }
     };
-    let body: serde_json::Value = match resp.json().await {
+    let body: serde_json::Value = match resp.json() {
         Ok(b) => b,
         Err(e) => {
             return (
@@ -1475,17 +1509,14 @@ pub async fn device_poll_handler(
                 .into_response();
         }
     };
-    let resp = match client
-        .post(GITHUB_TOKEN_URL)
+    let request = HttpRequest::post(GITHUB_TOKEN_URL)
         .header("Accept", "application/json")
         .json(&json!({
             "client_id": req.client_id,
             "device_code": req.device_code,
             "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-        }))
-        .send()
-        .await
-    {
+        }));
+    let request = match request {
         Ok(r) => r,
         Err(e) => {
             return (
@@ -1495,7 +1526,17 @@ pub async fn device_poll_handler(
                 .into_response();
         }
     };
-    let body: serde_json::Value = match resp.json().await {
+    let resp = match client.execute(request).await {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": "device_poll_failed", "message": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let body: serde_json::Value = match resp.json() {
         Ok(b) => b,
         Err(e) => {
             return (

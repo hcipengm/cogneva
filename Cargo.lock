@@ -1548,7 +1548,6 @@ dependencies = [
  "chrono",
  "cog-core",
  "cog-llm",
- "cog-net",
  "cog-observability",
  "cog-redis",
  "cog-storage",

@@ -48,6 +48,14 @@ impl cog_core::SystemPlugin for GatewayPlugin {
 
         let config = ctx.config();
 
+        // 出站客户端：由 net 插件发布，本进程所有出站（含贡献通道调
+        // github/gitee 的那些）都用这一份，不再各自从配置造一份。
+        let http_client: Arc<dyn cog_core::HttpClient> =
+            ctx.require_service::<dyn cog_core::HttpClient>()?;
+        crate::contribution_admin::install_http_client(http_client).map_err(|e| {
+            cog_core::SFError::Config(format!("outbound client install failed: {e}"))
+        })?;
+
         // ── Consume dependencies ──
         let event_tx = ctx.require::<tokio::sync::broadcast::Sender<cog_core::AgentEvent>>()?;
         let event_tx = (*event_tx).clone();

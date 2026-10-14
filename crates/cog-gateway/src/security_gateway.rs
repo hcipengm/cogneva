@@ -5632,12 +5632,13 @@ fn identity_default_headers(identity: &str) -> reqwest::header::HeaderMap {
 pub async fn run(
     config: SecurityGatewayConfig,
     build_revision: Option<&str>,
+    http_client: Arc<dyn cog_core::HttpClient>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // 走系统的 `http_client` 段：本进程其余出站（含 contribution_admin 那些
-    // 调 github/gitee 的请求）都用同一份设置，网关自己的这一份没有理由是第二份。
-    let http_client: Arc<dyn cog_core::HttpClient> = Arc::new(
-        cog_net::ReqwestHttpClient::from_config(&cog_net::HttpClientConfig::load()?)?,
-    );
+    // 本进程的出站客户端由装配层造好交进来（本 crate 不认具体实现）。交回给
+    // `contribution_admin`，那些调 github/gitee 的请求与这里其余出站就确实是
+    // 同一份设置，而不是各自从配置造出来的第二份。
+    crate::contribution_admin::install_http_client(http_client.clone())
+        .map_err(|e| format!("安全网关出站客户端装配失败：{e}"))?;
     let loki_pusher = init_gateway_logging(&config.observability, &http_client);
 
     let (pool_obs, pool_signal) = build_pool_observability(&config, &http_client).await;
@@ -5795,8 +5796,16 @@ pub async fn run(
 }
 
 /// 从环境变量启动（`cogneva security-gateway` 子命令入口）。
-pub async fn run_from_env(build_revision: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-    run(SecurityGatewayConfig::from_env(), build_revision).await
+pub async fn run_from_env(
+    build_revision: Option<&str>,
+    http_client: Arc<dyn cog_core::HttpClient>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run(
+        SecurityGatewayConfig::from_env(),
+        build_revision,
+        http_client,
+    )
+    .await
 }
 
 #[cfg(test)]

@@ -20,7 +20,6 @@ allowed	cog-auth	cog-redis	contract::kv::KeyValueStore
 allowed	cog-auth	cog-storage	contract::kv::KeyValueStore
 allowed	cog-collaboration	cog-redis	contract::kv::KeyValueStore
 allowed	cog-gateway	cog-llm	contract::llm::LlmClient
-allowed	cog-gateway	cog-net	contract::net::HttpClient
 allowed	cog-gateway	cog-observability	contract::alerts::AlertStore
 allowed	cog-gateway	cog-redis	contract::kv::KeyValueStore
 # 这条边多数的用途由 metrics 后端覆盖，余下两处：一处是直接的 client 句柄

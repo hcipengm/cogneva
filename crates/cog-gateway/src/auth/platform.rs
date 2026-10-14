@@ -47,34 +47,38 @@ pub async fn fetch_platform_profile(
     let body: serde_json::Value = match provider {
         "github" => {
             let resp = client
-                .get(format!("{}/user", contrib::GITHUB_API))
-                .bearer_auth(token)
-                .header("Accept", "application/vnd.github+json")
-                .send()
+                .execute(
+                    cog_core::HttpRequest::get(format!("{}/user", contrib::GITHUB_API))
+                        .header("Authorization", format!("Bearer {token}"))
+                        .header("Accept", "application/vnd.github+json"),
+                )
                 .await
                 .map_err(|e| format!("无法连接 GitHub（{e}）；国内网络可改用 Gitee 通道"))?;
-            if !resp.status().is_success() {
+            if !resp.is_success() {
                 return Err(format!(
                     "GitHub 拒绝该令牌（HTTP {}），请检查权限",
-                    resp.status()
+                    resp.status
                 ));
             }
-            resp.json().await.map_err(|e| e.to_string())?
+            resp.json().map_err(|e| e.to_string())?
         }
         "gitee" => {
+            let url = format!(
+                "{}/user?{}",
+                contrib::GITEE_API,
+                contrib::encode_query(&[("access_token", token)])
+            );
             let resp = client
-                .get(format!("{}/user", contrib::GITEE_API))
-                .query(&[("access_token", token)])
-                .send()
+                .execute(cog_core::HttpRequest::get(url))
                 .await
                 .map_err(|e| format!("无法连接 Gitee（{e}）"))?;
-            if !resp.status().is_success() {
+            if !resp.is_success() {
                 return Err(format!(
                     "Gitee 拒绝该令牌（HTTP {}），请检查权限",
-                    resp.status()
+                    resp.status
                 ));
             }
-            resp.json().await.map_err(|e| e.to_string())?
+            resp.json().map_err(|e| e.to_string())?
         }
         other => return Err(format!("未知平台: {other}")),
     };

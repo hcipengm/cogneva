@@ -76,7 +76,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 字段会让不认这些字段的端点首字节前 400（ark.cn-beijing.volces.com
         // 实证），而池读数对此按设计不动，启动日志是早于告警的那条线索。
         Command::SecurityGateway => {
-            cog_gateway::security_gateway::run_from_env(Some(env!("COGNEVA_GIT_REVISION"))).await
+            // 出站客户端在这里造：装配层认实现（cog-net），安全网关只认
+            // `cog_core::HttpClient` 契约。造在这里而不是网关里，是因为网关
+            // 这一层没有理由知道本进程用的是哪个 HTTP 实现。
+            let http_client: std::sync::Arc<dyn cog_core::HttpClient> = std::sync::Arc::new(
+                cog_net::ReqwestHttpClient::from_config(&cog_net::HttpClientConfig::load()?)?,
+            );
+            cog_gateway::security_gateway::run_from_env(
+                Some(env!("COGNEVA_GIT_REVISION")),
+                http_client,
+            )
+            .await
         }
         // 独立沙箱执行器模式（deploy/k3s/sandbox-executor-deployment.yaml 的启动命令）。
         Command::SandboxExecutor => cog_extension::command_server::run_from_env().await,

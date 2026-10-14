@@ -34,6 +34,12 @@ const INIT_CONSUMES: &[(&str, &str)] = &[
     ("gateway", "storage"),
     // ActiveAlertSource
     ("gateway", "observability"),
+    // 本进程的出站客户端在 init 里就装配好（贡献通道那些调 github/gitee 的
+    // 请求读的是它）。晚于 net 发布就会读到一个还没交进来的模块：那时每一次
+    // 出站都报「尚未装配」，而启动日志上这与「装好了」没有区别——差别要等
+    // 有人真的去用贡献通道才出现。
+    // HttpClient
+    ("gateway", "net"),
     // The agent pool binds each role's skill — its iteration budget above all —
     // when it is built inside init. Losing this edge to a soft dependency would
     // not fail: every role would quietly run on its configured seed, which is
