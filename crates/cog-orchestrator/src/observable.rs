@@ -426,6 +426,15 @@ mod tests {
         async fn ack(&self, _stream: &str, _group: &str, _ids: &[String]) -> SFResult<()> {
             Ok(())
         }
+        async fn claim_pending(
+            &self,
+            _stream: &str,
+            _group: &str,
+            _min_idle_ms: u64,
+            _count: usize,
+        ) -> SFResult<Option<Vec<(String, Vec<u8>)>>> {
+            Ok(None)
+        }
         async fn pending_stats(
             &self,
             _stream: &str,

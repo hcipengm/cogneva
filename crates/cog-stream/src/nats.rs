@@ -457,6 +457,21 @@ impl MessageBackend for NatsMessageBackend {
         Ok(None)
     }
 
+    /// No reclaim path: JetStream redelivers on its own once `ack_wait` lapses,
+    /// so nothing here has to be claimed back and nothing is lost by not
+    /// claiming. Saying "nothing pending" instead would be the wrong answer in
+    /// the other direction — it would read as a reclaim loop that ran and found
+    /// the queue clean, on a backend where that loop has nothing to do at all.
+    async fn claim_pending(
+        &self,
+        _stream: &str,
+        _group: &str,
+        _min_idle_ms: u64,
+        _count: usize,
+    ) -> SFResult<Option<Vec<(String, Vec<u8>)>>> {
+        Ok(None)
+    }
+
     async fn delay_publish(&self, subject: &str, payload: &[u8], delay_ms: u64) -> SFResult<()> {
         let subject = subject.to_string();
         let payload = payload.to_vec();

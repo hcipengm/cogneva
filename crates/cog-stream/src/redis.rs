@@ -315,7 +315,7 @@ impl MessageBackend for RedisMessageBackend {
         group: &str,
         min_idle_ms: u64,
         count: usize,
-    ) -> SFResult<Vec<(String, Vec<u8>)>> {
+    ) -> SFResult<Option<Vec<(String, Vec<u8>)>>> {
         // 认领对象固定为 subscribe 同款 "consumer-1"，保证认领回来的消息
         // 后续 ack（同组同消费者语义）能对上。
         let opts = redis::streams::StreamAutoClaimOptions::default().count(count);
@@ -338,7 +338,7 @@ impl MessageBackend for RedisMessageBackend {
                 messages.push((item.id, b.clone()));
             }
         }
-        Ok(messages)
+        Ok(Some(messages))
     }
 
     async fn pending_stats(

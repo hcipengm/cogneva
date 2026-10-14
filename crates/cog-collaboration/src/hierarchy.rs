@@ -561,6 +561,19 @@ mod tests {
         ) -> SFResult<Option<cog_core::PendingStats>> {
             Ok(None)
         }
+
+        async fn claim_pending(
+            &self,
+            _stream: &str,
+            _group: &str,
+            _min_idle_ms: u64,
+            _count: usize,
+        ) -> SFResult<Option<Vec<(String, Vec<u8>)>>> {
+            // Messages live in an in-process broadcast buffer, and there is no
+            // ownership record a claim could take back. Answering `Some(empty)`
+            // would report a reclaim loop that ran and found nothing.
+            Ok(None)
+        }
     }
 
     // --- identifier helpers --------------------------------------------------

@@ -883,7 +883,17 @@ impl MemoryIngestor {
                                 .claim_pending(&channel, &group, claim_min_idle_ms, claim_batch)
                                 .await
                             {
-                                Ok(claimed) => {
+                                // This backend has no reclaim path, which is not
+                                // an outcome of the loop: neither a success nor
+                                // a failure is recorded. Counting it as a run
+                                // would make `bus_claim` tick every interval on
+                                // a bus that cannot claim anything, reading as a
+                                // reclaim loop doing its job; counting it as a
+                                // failure would turn a correct backend into a
+                                // per-tick alarm. Both mint a reading that is
+                                // not true.
+                                Ok(None) => {}
+                                Ok(Some(claimed)) => {
                                     inner.record_claim_outcome(CLAIM_RAN_OPERATION).await;
                                     if !claimed.is_empty() {
                                         info!(
@@ -2774,7 +2784,7 @@ mod tests {
             _group: &str,
             _min_idle_ms: u64,
             _count: usize,
-        ) -> SFResult<Vec<(String, Vec<u8>)>> {
+        ) -> SFResult<Option<Vec<(String, Vec<u8>)>>> {
             Err(cog_core::SFError::Internal(
                 "claim backend unreachable".into(),
             ))
@@ -2910,6 +2920,58 @@ mod tests {
             Some(0.0),
             "the claim never ran while the gate was closed"
         );
+    }
+
+    /// 后端没有回收路径时，认领这一轮既不落成功也不落失败。
+    ///
+    /// 内存总线就是这种后端：消息在进程内的表里，没有属主记录可以收回。
+    /// 把它折成「认领成功、本轮零条」会让 `bus_claim` 每拍都跳，读起来像一个
+    /// 正在干活的回收循环；折成失败则把一个正确的后端变成永不消停的告警。
+    /// 两种都是把一条不成立的读数铸出来——所以这一支什么也不落，三格停在零。
+    #[tokio::test]
+    async fn a_backend_without_a_reclaim_path_lands_no_claim_outcome() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let ingestor = MemoryIngestor::new(
+            Arc::new(MemoryMemoryBackend::new()),
+            Arc::new(RuleBasedExtractor::new()),
+        )
+        .with_metrics(metrics.clone())
+        .with_config(MemoryIngestorConfig {
+            bus_claim_interval_secs: 1,
+            ..MemoryIngestorConfig::default()
+        });
+
+        let _handle = ingestor.spawn_bus(
+            Arc::new(cog_stream::MemoryMessageBackend::new()),
+            "cogneva-events",
+        );
+
+        // 三格先发布（含零），否则「没进过这个状态」与「这一支没在发」同形。
+        let seeded = metrics.clone();
+        assert!(
+            wait_for(move || {
+                let m = seeded.clone();
+                Box::pin(async move {
+                    m.counter_total("memory_operations_total", "bus_claim")
+                        .is_some()
+                        && m.counter_total("memory_operations_total", "bus_claim_failed")
+                            .is_some()
+                })
+            })
+            .await,
+            "the loop must publish its outcome cells from the first round"
+        );
+
+        // 让认领循环真跳过几拍再读：一拍不足，得让 interval 走过。
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+
+        for cell in ["bus_claim", "bus_claim_failed", "bus_claim_held"] {
+            assert_eq!(
+                metrics.counter_total("memory_operations_total", cell),
+                Some(0.0),
+                "a backend with no reclaim path must not mint a claim outcome: {cell}"
+            );
+        }
     }
 
     fn quick_retry_config() -> MemoryIngestorConfig {

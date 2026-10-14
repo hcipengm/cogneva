@@ -187,6 +187,20 @@ impl MessageBackend for MemoryMessageBackend {
     ) -> SFResult<Option<cog_core::PendingStats>> {
         Ok(None)
     }
+
+    /// No reclaim path, and saying so is the whole answer. Messages live in a
+    /// map inside this process, so a message a consumer never took is not
+    /// anywhere a claim could reach; there is nothing to hand back and no way
+    /// to have failed to.
+    async fn claim_pending(
+        &self,
+        _stream: &str,
+        _group: &str,
+        _min_idle_ms: u64,
+        _count: usize,
+    ) -> SFResult<Option<Vec<(String, Vec<u8>)>>> {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

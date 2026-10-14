@@ -121,16 +121,25 @@ pub trait MessageBackend: Send + Sync {
     /// (delivered to a consumer that never acked — e.g. the pod died
     /// mid-processing). Returns the claimed `(message_id, payload)` tuples,
     /// now owned by the calling consumer.
-    /// Default: backend has no pending-recovery support, returns empty.
+    ///
+    /// `None` means this backend has no reclaim path at all — it brokers no
+    /// persistent queue, or it redelivers on its own and needs no explicit
+    /// claim. `Some(empty)` is a different answer: the backend can reclaim and
+    /// there is nothing to reclaim right now. Folding the two into an empty
+    /// list would let a backend that does hold pending messages inherit
+    /// "nothing is pending", which is why this is required rather than
+    /// defaulted, on the same terms as [`Self::ack`] and [`Self::pending_stats`].
+    /// It answers with a value rather than an error for the reason
+    /// [`Self::pending_stats`]'s `None` does: "this backend cannot" is not a
+    /// failure, and a caller that reads it as one turns a correct backend into
+    /// a per-tick alarm that never clears.
     async fn claim_pending(
         &self,
-        _stream: &str,
-        _group: &str,
-        _min_idle_ms: u64,
-        _count: usize,
-    ) -> SFResult<Vec<(String, Vec<u8>)>> {
-        Ok(Vec::new())
-    }
+        stream: &str,
+        group: &str,
+        min_idle_ms: u64,
+        count: usize,
+    ) -> SFResult<Option<Vec<(String, Vec<u8>)>>>;
 
     /// Read a consumer group's pending state without changing it.
     ///

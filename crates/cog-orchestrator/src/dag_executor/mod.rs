@@ -280,7 +280,12 @@ impl DagExecutorRuntime {
                                         .claim_pending(&stream, &group, claim_idle_ms, batch)
                                         .await
                                     {
-                                        Ok(claimed) => {
+                                        // No reclaim path on this backend: no
+                                        // outcome to record, and nothing to
+                                        // sweep. See the contract's note on
+                                        // `claim_pending`'s `None`.
+                                        Ok(None) => {}
+                                        Ok(Some(claimed)) => {
                                             for (msg_id, bytes) in claimed {
                                                 tracing::warn!(
                                                     stream = %stream, msg_id = %msg_id,
@@ -1079,14 +1084,14 @@ mod consumer_ack_tests {
             _group: &str,
             _min_idle_ms: u64,
             _count: usize,
-        ) -> SFResult<Vec<(String, Vec<u8>)>> {
+        ) -> SFResult<Option<Vec<(String, Vec<u8>)>>> {
             if self.stall_claims.load(std::sync::atomic::Ordering::Relaxed) {
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
             }
             if self.hold_claims.load(std::sync::atomic::Ordering::Relaxed) {
-                return Ok(Vec::new());
+                return Ok(Some(Vec::new()));
             }
-            Ok(std::mem::take(&mut *self.pending.lock().unwrap()))
+            Ok(Some(std::mem::take(&mut *self.pending.lock().unwrap())))
         }
         /// The same split a real queue makes: an entry counts as unreclaimed
         /// once its outstanding time passes the caller's threshold.
@@ -1687,6 +1692,15 @@ mod orphan_reconciler_tests {
         }
         async fn ack(&self, _stream: &str, _group: &str, _ids: &[String]) -> SFResult<()> {
             Ok(())
+        }
+        async fn claim_pending(
+            &self,
+            _stream: &str,
+            _group: &str,
+            _min_idle_ms: u64,
+            _count: usize,
+        ) -> SFResult<Option<Vec<(String, Vec<u8>)>>> {
+            Ok(None)
         }
         async fn pending_stats(
             &self,

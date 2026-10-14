@@ -207,7 +207,7 @@ impl TaskExecutorRouter {
                                         )
                                         .await
                                     {
-                                        Ok(claimed) if !claimed.is_empty() => {
+                                        Ok(Some(claimed)) if !claimed.is_empty() => {
                                             tracing::warn!(
                                                 stream = %sweep_pipe.ready_stream,
                                                 count = claimed.len(),
@@ -696,8 +696,8 @@ mod ready_pipeline_tests {
             _group: &str,
             _min_idle_ms: u64,
             _count: usize,
-        ) -> SFResult<Vec<(String, Vec<u8>)>> {
-            Ok(Vec::new())
+        ) -> SFResult<Option<Vec<(String, Vec<u8>)>>> {
+            Ok(Some(Vec::new()))
         }
         async fn pending_stats(
             &self,
@@ -1016,8 +1016,8 @@ mod ready_pipeline_tests {
             _group: &str,
             _min_idle_ms: u64,
             _count: usize,
-        ) -> SFResult<Vec<(String, Vec<u8>)>> {
-            Ok(Vec::new())
+        ) -> SFResult<Option<Vec<(String, Vec<u8>)>>> {
+            Ok(Some(Vec::new()))
         }
         async fn pending_stats(
             &self,
@@ -1245,8 +1245,8 @@ mod ready_queue_placement_tests {
             _group: &str,
             _min_idle_ms: u64,
             _count: usize,
-        ) -> SFResult<Vec<(String, Vec<u8>)>> {
-            Ok(Vec::new())
+        ) -> SFResult<Option<Vec<(String, Vec<u8>)>>> {
+            Ok(Some(Vec::new()))
         }
         async fn pending_stats(
             &self,
