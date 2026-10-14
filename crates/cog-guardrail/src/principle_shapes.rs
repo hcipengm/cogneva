@@ -76,6 +76,22 @@ pub const DESTRUCTIVE_GIT_RE: &str = r"reset[[:space:]]+--hard|push[[:space:]].*
 /// placeholder name: the trailer's presence is what the rule forbids.
 pub const AI_TRAILER_RE: &str = r"^[[:space:]]*Co-[Aa]uthored-[Bb]y:|^[[:space:]]*Generated with .*[Cc]laude|noreply@anthropic\.com";
 
+/// A commit that names no paths (`git commit` with no `-- <path>` tail) commits
+/// whatever is in the index, and the index is shared: two sessions add to the
+/// same one, so a bare commit folds the other writer's staged work into this
+/// commit and "who changed this" stops being answerable. The narrow add is only
+/// half the discipline; the commit has to name the same paths.
+///
+/// Why the pattern is shaped the way it is: the hazard is the *absence* of a
+/// separator, and neither `grep -E` nor the `regex` crate has a lookahead to ask
+/// for that, so the absence is read as a positive form instead -- the arguments
+/// tail may be built from anything that is not a standalone `--`. A `--flag`
+/// (`--amend`, `--no-edit`) is not a separator, so `--` followed by a non-space
+/// is allowed; only `--` with a space or the line end after it ends the match.
+/// That is what separates `git commit --amend` (still bare, refused) from
+/// `git commit -m x -- crates/` (names its paths, allowed).
+pub const BARE_COMMIT_RE: &str = r"git[[:space:]]+commit([^-]|-[^-]|--[^[:space:]])*$";
+
 /// A frozen document is append-only by new dated document, so editing one in
 /// place is refused.
 pub const FROZEN_DOC_RE: &str = r"internal-docs/.*\.md$";
@@ -90,6 +106,7 @@ pub const ALL_SHAPES: &[(&str, &str)] = &[
     ("NARROW_ADD_RE", NARROW_ADD_RE),
     ("DESTRUCTIVE_GIT_RE", DESTRUCTIVE_GIT_RE),
     ("AI_TRAILER_RE", AI_TRAILER_RE),
+    ("BARE_COMMIT_RE", BARE_COMMIT_RE),
     ("FROZEN_DOC_RE", FROZEN_DOC_RE),
 ];
 
@@ -254,6 +271,7 @@ mod tests {
             "NARROW_ADD_RE",
             "DESTRUCTIVE_GIT_RE",
             "AI_TRAILER_RE",
+            "BARE_COMMIT_RE",
             "FROZEN_DOC_RE",
         ] {
             assert!(
@@ -310,6 +328,18 @@ mod tests {
             Some("AI_TRAILER_RE")
         );
         assert_eq!(first_match("a ① b"), Some("CIRCLED_CHARS"));
+        // A commit with no pathspec is the whole hazard; a flag that merely
+        // opens with `--` (`--amend`) does not name a path and must still be
+        // read as bare rather than excused by the two dashes.
+        assert_eq!(
+            first_match("git commit -m 'fix a bug'"),
+            Some("BARE_COMMIT_RE")
+        );
+        assert_eq!(
+            first_match("git commit --amend --no-edit"),
+            Some("BARE_COMMIT_RE"),
+            "a long flag is not a path separator, so an amend is still bare"
+        );
     }
 
     /// The negative half, said out loud: the shapes are nets, and a net that
@@ -317,7 +347,11 @@ mod tests {
     #[test]
     fn clean_text_matches_nothing() {
         assert_eq!(first_match("git add crates/x/src/y.rs"), None);
-        assert_eq!(first_match("git commit -m 'fix a bug'"), None);
+        assert_eq!(
+            first_match("git commit -m 'fix a bug' -- crates/x/src/y.rs"),
+            None,
+            "a commit that names its paths is the discipline this shape is for"
+        );
         assert_eq!(first_match("see item one first"), None);
     }
 
@@ -422,6 +456,20 @@ mod tests {
             "principle_shapes:AI_TRAILER_RE"
         );
 
+        // A commit naming no paths: the command is the field, and the shape has
+        // to survive the guard reading the call rather than a bare string.
+        assert_eq!(
+            rule_of(
+                guard
+                    .check_tool_call(&call(
+                        "Bash",
+                        serde_json::json!({"command": "git commit -m 'a fix'"})
+                    ))
+                    .await
+            ),
+            "principle_shapes:BARE_COMMIT_RE"
+        );
+
         // A deferral written into a file's content.
         assert_eq!(
             rule_of(
@@ -455,7 +503,7 @@ mod tests {
             ),
             call(
                 "Bash",
-                serde_json::json!({"command": "git commit -m 'fix the thing'"}),
+                serde_json::json!({"command": "git commit -m 'fix the thing' -- crates/x/src/y.rs"}),
             ),
             call(
                 "Write",
