@@ -1874,7 +1874,6 @@ version = "0.5.8"
 dependencies = [
  "async-trait",
  "cog-core",
- "cog-storage",
  "dirs 5.0.1",
  "reqwest 0.12.28",
  "serde",

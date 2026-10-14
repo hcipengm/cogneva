@@ -61,5 +61,4 @@ allowed_dev	cog-memory	cog-stream	contract::stream::MessageBackend
 allowed_dev	cog-orchestrator	cog-storage	contract::storage::StateBackend
 allowed_dev	cog-reflection	cog-prompt	contract::prompt::PromptManager
 allowed_dev	cog-reflection	cog-storage	contract::storage::StateBackend
-allowed_dev	cog-skill	cog-storage	contract::storage::MetricsBackend
 allowed_dev	cog-wiki	cog-memory	contract::memory::MemoryBackend

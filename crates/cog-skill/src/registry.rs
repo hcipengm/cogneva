@@ -581,7 +581,118 @@ impl SkillRegistryImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cog_core::{ExternalSkillRegistry, MetricsBackend};
+    use cog_core::{
+        DateTime, ExternalSkillRegistry, HistogramTotals, MetricName, MetricSample, MetricType,
+        MetricsBackend, SFResult, Utc,
+    };
+
+    /// The round-outcome test asserts on a real counter, and it used to borrow
+    /// the memory backend from another business crate to get one — which made
+    /// that crate a rebuild dependency of this crate's tests for a single
+    /// method. This records the counters a round writes and answers the one
+    /// query the test reads. Every other trait method is `unimplemented!`, so a
+    /// test that starts calling one fails loudly rather than reading a
+    /// stand-in's guess at what it should have returned.
+    #[derive(Default)]
+    struct OutcomeCounters {
+        // metric name -> (label set, running total)
+        series: std::sync::Mutex<HashMap<String, Vec<(HashMap<String, String>, f64)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MetricsBackend for OutcomeCounters {
+        async fn record_counter(
+            &self,
+            name: MetricName,
+            value: f64,
+            labels: HashMap<String, String>,
+        ) -> SFResult<()> {
+            let mut guard = self.series.lock().unwrap();
+            let entry = guard.entry(name.as_str().to_string()).or_default();
+            match entry.iter_mut().find(|(l, _)| *l == labels) {
+                Some((_, total)) => *total += value,
+                None => entry.push((labels, value)),
+            }
+            Ok(())
+        }
+
+        async fn query_counter_totals(&self, name: &str) -> SFResult<Vec<MetricSample>> {
+            let guard = self.series.lock().unwrap();
+            Ok(guard
+                .get(name)
+                .map(|rows| {
+                    rows.iter()
+                        .map(|(labels, value)| MetricSample {
+                            timestamp: Utc::now(),
+                            value: *value,
+                            labels: labels.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default())
+        }
+
+        async fn record_gauge(
+            &self,
+            _name: MetricName,
+            _value: f64,
+            _labels: HashMap<String, String>,
+        ) -> SFResult<()> {
+            unimplemented!("OutcomeCounters records counters only")
+        }
+
+        async fn record_histogram(
+            &self,
+            _name: MetricName,
+            _value: f64,
+            _labels: HashMap<String, String>,
+        ) -> SFResult<()> {
+            unimplemented!("OutcomeCounters records counters only")
+        }
+
+        async fn query_gauge_range(
+            &self,
+            _name: &str,
+            _start: DateTime<Utc>,
+            _end: DateTime<Utc>,
+        ) -> SFResult<Vec<MetricSample>> {
+            unimplemented!("OutcomeCounters records counters only")
+        }
+
+        async fn query_gauge_latest(&self, _name: &str) -> SFResult<Vec<MetricSample>> {
+            unimplemented!("OutcomeCounters records counters only")
+        }
+
+        async fn query_counter_range(
+            &self,
+            _name: &str,
+            _start: DateTime<Utc>,
+            _end: DateTime<Utc>,
+        ) -> SFResult<Vec<MetricSample>> {
+            unimplemented!("OutcomeCounters records counters only")
+        }
+
+        async fn query_histogram_totals(&self, _name: &str) -> SFResult<Vec<HistogramTotals>> {
+            unimplemented!("OutcomeCounters records counters only")
+        }
+
+        async fn query_histogram_range(
+            &self,
+            _name: &str,
+            _start: DateTime<Utc>,
+            _end: DateTime<Utc>,
+        ) -> SFResult<Vec<MetricSample>> {
+            unimplemented!("OutcomeCounters records counters only")
+        }
+
+        async fn list_metric_names(&self, _metric_type: MetricType) -> SFResult<Vec<String>> {
+            unimplemented!("OutcomeCounters records counters only")
+        }
+
+        async fn health_check(&self) -> SFResult<()> {
+            unimplemented!("OutcomeCounters records counters only")
+        }
+    }
 
     /// 内置 PGE prompt skills（prompts/skills/pge_*）必须能被 registry
     /// 完整解析：SKILL.md 正文 + output_schema.json 资源。
@@ -700,7 +811,7 @@ mod tests {
             directories: vec![dir.path().to_path_buf()],
             hot_reload_interval_secs: 60,
         });
-        let metrics = Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = Arc::new(OutcomeCounters::default());
         registry.set_metrics(Some(metrics.clone()));
         // 空目录：扫描与缓存一致。
         registry.run_round().await;
