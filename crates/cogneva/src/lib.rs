@@ -18,6 +18,7 @@ pub mod host_ledger;
 pub mod hot_reload;
 pub mod mcp_serve;
 pub mod pidfile;
+pub mod pin_census;
 pub mod platform;
 pub mod plugin_registry;
 pub mod shutdown_coordinator;
@@ -109,6 +110,14 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // it enabled.
     ctx.publish_observable(cog_core::loop_health::observable());
 
+    // The census the runner takes at the end of startup, published as a reading.
+    // It has to be published here rather than where it is filled: the gateway
+    // takes its snapshot of the observables during `init`, and the census is not
+    // taken until every plugin has started. A handle published from `start`
+    // would be a series the exposition never renders.
+    let pin_census = Arc::new(pin_census::PinCensusObservable::new());
+    ctx.publish_observable(pin_census.clone());
+
     // The restart budget belongs to the process's loops rather than to any one of
     // them, so it is installed once here, from the same document every plugin
     // reads — a loop that panicked must not be judged differently depending on
@@ -189,6 +198,10 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     ctx.publish(Arc::new(shutdown_signal));
 
     plugin_runner.start_all(&ctx).await?;
+
+    // Every plugin has started, so the graph is as observed as it will ever be:
+    // take the same census the runner logs and hand it to the reading.
+    pin_census.record(pin_census::census(&ctx)).await;
 
     // Wire the LLM client into the gateway's WebSocket chat handler. The llm
     // plugin is not topologically ordered before gateway, so the slot is
