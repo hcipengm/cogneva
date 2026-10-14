@@ -14,9 +14,18 @@ metadata:
 # 把 provider/base_url/model 写进安全网关 Deployment env（模板变更自动滚网关），
 # 读集群组件健康与晋级门端点。真 key 只在安全网关 Pod。
 #
-# 两个对象都在这条规则里：凭证分成两片之后，向导与贡献通道的写点仍然落在同一批
-# 键上，只是目标对象不同。逐个键看，授权集合与切分前完全一样，没有变宽也没有变窄
-# ——写者搬进网关、这条授权随之收窄到只指带外那一片，是后面一批的事。
+# 两个对象都在这条规则里，因为主应用进程今天真的往两片都写——**收窄的终点要逐键
+# 算，不能按片切**（"只留带外那一片"是错的读法：内部那一半不是残留，它有写者）。
+# 逐键看：带外那一片它写 llm-upstreams、github/gitee token、两把 OAuth 应用密钥、
+# GitHub App 三件、gitee-refresh-token、git-ssh-private-key；内部那一片它写
+# contribution-config（贡献策略与 OAuth 状态都在这一个键里）。授权集合与切分前
+# 逐键相同，既没变宽也没变窄。真正的终点是：哪个键的写点搬进网关，那个键就从这条
+# 规则里退出——带外那一半随向导/贡献通道的写点搬走而退，内部那一半要等
+# contribution-config 的写点一起搬走。
+#
+# 这条断言不是散文：持有面登记表（crates/cogneva/debt/credential-holders.tsv）
+# 把这两条授权记成迁移窗，凭证持有面门禁判它与清单逐条对齐——收窄那天它会红，
+# 红在登记表没跟着改，而不是红在一个没人读的注释里。
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
