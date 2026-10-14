@@ -1010,21 +1010,32 @@ mod tests {
 
     /// A field holding more than one path is not a path, and it must be refused
     /// as one even though it starts with an entry this root really has. Left to
-    /// the top-level test, `crates/ deploy/` passes on `crates` and reads as a
-    /// path that has drifted -- a row measured every retry window forever, never
-    /// reaching the row as the thing it is. A check about a path this tree cannot
-    /// hold is retracted with its reason written on it instead.
+    /// the top-level test, `crates/ deploy-nowhere/` passes on `crates` and reads
+    /// as a path that has drifted -- a row measured every retry window forever,
+    /// never reaching the row as the thing it is. A check about a path this tree
+    /// cannot hold is retracted with its reason written on it instead.
+    ///
+    /// The samples below are deliberately spelled as nothing real. A sample that
+    /// repeats a row's `(scope, literal)` becomes that row's whole-tree carrier:
+    /// the judge greps the tree for the literal, this file is in the tree, and a
+    /// row whose scope is `.` carries no pathspec to exclude it -- so the row
+    /// reads as done on the strength of the test written about it. Keep these
+    /// names nonsense, and never lift them from the ledger.
     #[tokio::test]
     async fn a_scope_holding_two_paths_is_not_a_path_this_tree_can_hold() {
         let snapshot = snapshot();
-        assert!(!snapshot.could_hold("crates/ deploy/"));
-        assert!(!snapshot.could_hold("crates/cog-collaboration/src :: crew.rs"));
+        assert!(!snapshot.could_hold("crates/ deploy-nowhere/"));
+        assert!(!snapshot.could_hold("crates/cog-nothing/src :: not_a_real_file.rs"));
 
         let tree = CheckTree::new("/nonexistent", "main");
         let outcome = tree
             .judge(
                 &snapshot,
-                &identity("grep", "crates/ deploy/", "node-agent"),
+                &identity(
+                    "grep",
+                    "crates/ deploy-nowhere/",
+                    "zzz-not-a-ledger-literal",
+                ),
             )
             .await;
         assert_eq!(outcome.reason(), Some(UnsettledReason::ScopeOutsideTree));
