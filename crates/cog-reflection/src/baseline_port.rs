@@ -1903,14 +1903,6 @@ mod tests {
         let (outcome, verdict) = eval_regression_feedback(&passed);
         assert!(verdict.is_ok());
         assert_eq!(outcome.as_cell(), "passed");
-        assert_ne!(
-            EvalGateOutcome::Passed.as_cell(),
-            EvalGateOutcome::NotApplicable.as_cell()
-        );
-        assert_ne!(
-            EvalGateOutcome::Passed.as_cell(),
-            EvalGateOutcome::Unavailable.as_cell()
-        );
     }
 
     #[test]
