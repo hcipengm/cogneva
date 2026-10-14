@@ -52,10 +52,25 @@ async fn the_binary_lists_its_tools_and_reads_a_file_on_request() {
         .expect("the server has to answer the handshake and the list")
         .expect("list the tools");
     let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+    // The whole built-in set, not the environment three it used to be. This
+    // case previously pinned three names, which read as "the tool set is the
+    // environment one" but was in fact the server's own shorter list -- the
+    // module header had said all along that it serves the same batch as the
+    // main application, and a closed list here cannot tell the difference
+    // between that promise and a copy that lost half of it. The list is now
+    // built once, by `register_builtins`, and this is the end-to-end reading
+    // that the process a client launches really carries it.
     assert_eq!(
         names,
-        vec!["read_file", "run_command", "write_file"],
-        "the tool set is the environment one, in a stable order"
+        vec![
+            "http_request",
+            "raw_fetch",
+            "raw_list",
+            "read_file",
+            "run_command",
+            "write_file",
+        ],
+        "the tool set is the whole built-in one, in a stable order"
     );
     assert!(
         tools

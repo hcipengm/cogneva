@@ -180,27 +180,17 @@ impl cog_core::SystemPlugin for AgentPlugin {
         // tool definitions and squads can plan but never act on the
         // environment. search_code stays unregistered until it really
         // searches — an always-empty tool teaches agents to distrust tools.
-        cog_core::ToolRegistry::register(&*tool_registry, crate::tools::builtins::read_file());
-        cog_core::ToolRegistry::register(&*tool_registry, crate::tools::builtins::write_file());
-        cog_core::ToolRegistry::register(&*tool_registry, crate::tools::builtins::run_command());
+        //
+        // The list is registered through the one constructor for it rather
+        // than laid out here, because this process is not the only caller: the
+        // MCP server serves the same built-ins to an external client, and a
+        // second list here would be a second answer to which tools exist.
         // `agent_loop` is a cog-agent-owned config section, read once here for
         // the memory API base the archiving tools borrow, for the fetched-body
         // threshold, and for the evaluator's budgets below; changing a value
         // needs no new image.
         let agent_loop_config = crate::AgentLoopConfig::load()?;
         let memory_api_base = agent_loop_config.memory_api_base.clone();
-        if let Some(http_client) = ctx.consume_service::<dyn cog_core::HttpClient>() {
-            cog_core::ToolRegistry::register(
-                &*tool_registry,
-                crate::tools::builtins::http_request(
-                    http_client,
-                    memory_api_base.clone(),
-                    agent_loop_config.external_archive_threshold_chars,
-                ),
-            );
-        } else {
-            warn!("HttpClient unavailable; http_request tool not registered");
-        }
         // Memory tools read through the platform memory API over HTTP rather
         // than an in-process backend: the process that runs the loops holds no
         // memory dataset on purpose, so an in-process handle is absent exactly
@@ -209,19 +199,15 @@ impl cog_core::SystemPlugin for AgentPlugin {
         // is missing, so a squad can tell "this layer is absent" from "this
         // namespace is empty": registered-but-failing says the first, while a
         // skipped registration would look like the second.
-        let memory_raw_client = ctx.consume_service::<dyn cog_core::HttpClient>();
-        let memory_raw_metrics = ctx.consume_service::<dyn cog_core::MetricsBackend>();
-        cog_core::ToolRegistry::register(
+        crate::tools::builtins::register_builtins(
             &*tool_registry,
-            crate::tools::builtins::raw_list(memory_raw_client.clone(), memory_api_base.clone()),
-        );
-        cog_core::ToolRegistry::register(
-            &*tool_registry,
-            crate::tools::builtins::raw_fetch(
-                memory_raw_client,
-                memory_api_base.clone(),
-                memory_raw_metrics,
-            ),
+            crate::tools::builtins::BuiltinInputs {
+                http_client: ctx.consume_service::<dyn cog_core::HttpClient>(),
+                metrics: ctx.consume_service::<dyn cog_core::MetricsBackend>(),
+                memory_api_base: memory_api_base.clone(),
+                external_archive_threshold_chars: agent_loop_config
+                    .external_archive_threshold_chars,
+            },
         );
         info!(
             tools = ?tool_registry.names(),

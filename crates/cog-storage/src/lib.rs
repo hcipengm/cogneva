@@ -63,7 +63,9 @@ pub use postgres::{
 };
 
 #[cfg(feature = "redis")]
-pub use redis::{MemoryAgentRegistry, RedisAgentRegistry, RedisBackend, RedisKeyValueStore, RedisTraceStore};
+pub use redis::{
+    MemoryAgentRegistry, RedisAgentRegistry, RedisBackend, RedisKeyValueStore, RedisTraceStore,
+};
 
 pub use agent_id::generate_agent_id;
 pub use etcd::registry::EtcdAgentRegistry;

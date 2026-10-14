@@ -44,9 +44,8 @@ impl cog_core::SystemPlugin for AuthPlugin {
         ctx.publish_service(jwt_manager);
         info!("AuthPlugin JWT manager published");
 
-        let session_manager: Arc<dyn cog_core::SessionManager> = {
-            Arc::new(crate::SessionManager::new(store))
-        };
+        let session_manager: Arc<dyn cog_core::SessionManager> =
+            Arc::new(crate::SessionManager::new(store));
         ctx.publish_service(session_manager);
         info!("AuthPlugin session manager published");
 

@@ -1353,6 +1353,66 @@ pub mod builtins {
         }
     }
 
+    /// What the built-in set is built from when the two outside-world inputs
+    /// are available.
+    ///
+    /// Every field is optional, and none of them is required to keep the list
+    /// whole: a process with no HTTP client registers the same tools, and the
+    /// ones that need a client then fail with a message naming what is
+    /// missing. A caller that could tell "this layer is absent" from "this
+    /// namespace is empty" through the tool result loses that ability the
+    /// moment the tool is left out of the list instead.
+    #[derive(Clone, Default)]
+    pub struct BuiltinInputs {
+        pub http_client: Option<Arc<dyn HttpClient>>,
+        pub metrics: Option<Arc<dyn MetricsBackend>>,
+        pub memory_api_base: Option<String>,
+        pub external_archive_threshold_chars: usize,
+    }
+
+    /// Register every built-in tool into `registry`.
+    ///
+    /// One list, in one place. The same built-ins are served to two callers --
+    /// the agent loops in this process, and an external MCP client over stdio
+    /// -- and both mean the same thing by "this platform's tools". A list laid
+    /// out a second time at the second caller is a second answer to which
+    /// tools exist, and the two answers drift in the direction that is hard to
+    /// see: the shorter list looks fine, works, and is quietly weaker than
+    /// what the process claims to offer. So the factories above have exactly
+    /// one caller and it is this one.
+    pub fn register_builtins(registry: &dyn cog_core::ToolRegistry, inputs: BuiltinInputs) {
+        cog_core::ToolRegistry::register(registry, read_file());
+        cog_core::ToolRegistry::register(registry, write_file());
+        cog_core::ToolRegistry::register(registry, run_command());
+        match inputs.http_client.clone() {
+            Some(client) => cog_core::ToolRegistry::register(
+                registry,
+                http_request(
+                    client,
+                    inputs.memory_api_base.clone(),
+                    inputs.external_archive_threshold_chars,
+                ),
+            ),
+            // Not a silent omission: the caller that wanted it can read why it
+            // is absent off this line, and the rest of the list is unaffected.
+            None => tracing::warn!(
+                "no HttpClient available; the http_request built-in is not registered"
+            ),
+        }
+        cog_core::ToolRegistry::register(
+            registry,
+            raw_list(inputs.http_client.clone(), inputs.memory_api_base.clone()),
+        );
+        cog_core::ToolRegistry::register(
+            registry,
+            raw_fetch(
+                inputs.http_client.clone(),
+                inputs.memory_api_base.clone(),
+                inputs.metrics.clone(),
+            ),
+        );
+    }
+
     pub fn search_code() -> Tool {
         Tool {
             name: "search_code".into(),

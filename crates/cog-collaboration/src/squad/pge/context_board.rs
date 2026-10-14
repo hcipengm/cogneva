@@ -1,11 +1,14 @@
 //! Shared **Context Board** for Roundtable PGE mode.
-//! the three roundtable agents (Planner, Generator,
+//!
+//! In PGE mode the three roundtable agents (Planner, Generator,
 //! Evaluator) communicate **not directly** but through a shared structured
 //! "context board" — a key/value bag scoped to a single Squad. The Roundtable
 //! orchestrator reads the latest state into each agent's prompt context, and
 //! writes the agent's output back to the board after each phase so the next
 //! agent (or the next round) can see it.
+//!
 //! Two implementations are provided:
+//!
 //! - [`InMemoryContextBoard`]: a `Mutex<HashMap>` for single-process use and
 //!   for tests. Backwards-compatible with the existing
 //!   `RoundtableConfig::context_board: Option<serde_json::Value>` field.
@@ -13,6 +16,7 @@
 //!   `orchestrator:squad:{squad_id}:board`, held through the core
 //!   [`cog_core::KeyValueStore`] contract rather than through a driver, so the
 //!   debate logic does not link the cache implementation.
+//!
 //! Both implementations expose the same async [`ContextBoard`] trait so the
 //! Roundtable can be configured with either at construction time without
 //! changing the debate logic.

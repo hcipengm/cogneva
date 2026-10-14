@@ -216,8 +216,8 @@ fn comment_len(text: &str, at: usize) -> usize {
     if let Some(body) = rest.strip_prefix("//") {
         return body.find('\n').map(|i| i + 3).unwrap_or(2 + body.len());
     }
-    if rest.starts_with("/*") {
-        return rest[2..].find("*/").map(|i| i + 4).unwrap_or(rest.len());
+    if let Some(body) = rest.strip_prefix("/*") {
+        return body.find("*/").map(|i| i + 4).unwrap_or(rest.len());
     }
     1
 }

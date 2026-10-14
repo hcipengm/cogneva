@@ -41,12 +41,37 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
         )))
         .with_require_identity(system.require_tool_identity);
 
-    // 内建环境工具三件套，与主应用注册的是同一批函数（read_file / write_file /
-    // run_command）。它们都是 shell 类实现，即都要经过上面那个沙箱后端——所以这一
-    // 层不是「有一张工具表」而是一张**跑得动**的工具表。
-    cog_core::ToolRegistry::register(&registry, cog_agent::tools::builtins::read_file());
-    cog_core::ToolRegistry::register(&registry, cog_agent::tools::builtins::write_file());
-    cog_core::ToolRegistry::register(&registry, cog_agent::tools::builtins::run_command());
+    // 内建工具**整批**取自与主应用同一个构造函数（`register_builtins`），不在这里
+    // 另列一份。列一份更短的表曾经就写在下面这一行：它看起来完成度更高（少三个
+    // 需要外部依赖的工具），实际上是把「这一层不存在」和「这个命名空间是空的」两
+    // 件事合并成同一句「没有这个工具」，而模块头说的「同一批内建工具」也就不成立
+    // 了。三个 shell 类实现都经过上面那个沙箱后端——所以这一层不是「有一张工具
+    // 表」而是一张**跑得动**的工具表。HTTP 客户端在这里建（与主进程同一条工厂，
+    // 超时/连接池/代理一致），内存 API 地址与归档阈值读同一个 `agent_loop` 配置节。
+    // 客户端按「尽力而为」建：建不出来只少 `http_request` 一个工具，服务照起。
+    // 让这一句 `?` 掉是拿一条与 MCP 无关的失败换掉整个服务端——本进程主要的活是
+    // 交工具，不是发 HTTP。
+    let http_client: Option<Arc<dyn cog_core::HttpClient>> = match cog_net::HttpClientConfig::load()
+        .and_then(|config| cog_net::ReqwestHttpClient::from_config(&config))
+    {
+        Ok(client) => Some(Arc::new(client)),
+        Err(e) => {
+            tracing::warn!(error = %e, "mcp-serve: no HTTP client; http_request is not offered");
+            None
+        }
+    };
+    let agent_loop = cog_agent::AgentLoopConfig::load()?;
+    cog_agent::tools::builtins::register_builtins(
+        &registry,
+        cog_agent::tools::builtins::BuiltinInputs {
+            http_client,
+            // 这个进程没有指标后端：`raw_fetch` 的预算耗尽读数随之为空，工具本身
+            // 照常注册——缺读数不等于缺能力，二者在读面上不同形。
+            metrics: None,
+            memory_api_base: agent_loop.memory_api_base.clone(),
+            external_archive_threshold_chars: agent_loop.external_archive_threshold_chars,
+        },
+    );
 
     let definitions: Vec<ToolDefinition> = registry
         .list()
