@@ -593,10 +593,12 @@ mod tests {
     /// query the test reads. Every other trait method is `unimplemented!`, so a
     /// test that starts calling one fails loudly rather than reading a
     /// stand-in's guess at what it should have returned.
+    /// Metric name -> (label set, running total).
+    type Series = HashMap<String, Vec<(HashMap<String, String>, f64)>>;
+
     #[derive(Default)]
     struct OutcomeCounters {
-        // metric name -> (label set, running total)
-        series: std::sync::Mutex<HashMap<String, Vec<(HashMap<String, String>, f64)>>>,
+        series: std::sync::Mutex<Series>,
     }
 
     #[async_trait::async_trait]

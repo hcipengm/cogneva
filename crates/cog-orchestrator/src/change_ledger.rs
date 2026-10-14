@@ -1379,7 +1379,15 @@ async fn dispatch_pass(
             "change ledger: handed the pending set to the goal path"
         );
     }
-    record_dispatch_state(store, metrics, &verdict, pending.len(), unmeasurable, &counts).await;
+    record_dispatch_state(
+        store,
+        metrics,
+        &verdict,
+        pending.len(),
+        unmeasurable,
+        &counts,
+    )
+    .await;
 }
 
 /// What one owed row's graph row says about it.
@@ -1506,10 +1514,7 @@ impl DispatchReadout {
 /// record the row is: the pass already happened, and a loop that gave up the
 /// handover because the reading face was closed would trade the working half for
 /// the recorded half.
-async fn publish_dispatch_rows(
-    metrics: Option<&Arc<dyn MetricsBackend>>,
-    state: &DispatchState,
-) {
+async fn publish_dispatch_rows(metrics: Option<&Arc<dyn MetricsBackend>>, state: &DispatchState) {
     let Some(metrics) = metrics else {
         return;
     };
@@ -2111,15 +2116,9 @@ mod tests {
     #[test]
     fn the_id_a_ledger_row_derives_is_the_one_the_live_graph_was_given() {
         let veto = ChangeIdentity::new("grep", "crates/cog-eval/src", "veto");
-        assert_eq!(
-            dispatch_task_id(&veto, 0),
-            "change-ledger-be840a05eb11635e"
-        );
+        assert_eq!(dispatch_task_id(&veto, 0), "change-ledger-be840a05eb11635e");
         let gap = ChangeIdentity::new("grep", "crates/cog-reflection/src", "capability_gap");
-        assert_eq!(
-            dispatch_task_id(&gap, 0),
-            "change-ledger-6622446d99af92a0"
-        );
+        assert_eq!(dispatch_task_id(&gap, 0), "change-ledger-6622446d99af92a0");
     }
 
     /// A re-arm is a different row in the graph under a different id, and the
@@ -2751,7 +2750,11 @@ mod tests {
     /// predicate that reads it.
     fn assert_the_counts_add_up(state: &DispatchState) {
         assert_eq!(
-            state.submitted + state.already + state.failed + state.dead_environment + state.held_back,
+            state.submitted
+                + state.already
+                + state.failed
+                + state.dead_environment
+                + state.held_back,
             state.pending,
             "the columns do not add up to what was owed: {state:?}"
         );
@@ -2786,7 +2789,8 @@ mod tests {
             ],
             ..Default::default()
         };
-        let at = |row: &ChangeLedgerRow, generation: u32| dispatch_task_id(&row.identity, generation);
+        let at =
+            |row: &ChangeLedgerRow, generation: u32| dispatch_task_id(&row.identity, generation);
         let graph = Arc::new(
             FakeGraph::default()
                 .holding(&at(&store.rows[0], 0), TaskStatus::Running)
@@ -3012,7 +3016,10 @@ mod tests {
         // number no reader can select, and a cell with no count is a series
         // nothing fills.
         assert_eq!(
-            published.keys().cloned().collect::<std::collections::BTreeSet<_>>(),
+            published
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
             DispatchReadout::ALL
                 .iter()
                 .map(|readout| readout.as_str().to_string())

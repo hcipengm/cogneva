@@ -33,8 +33,8 @@ mod promql;
 use producer::carries_the_producer;
 use promql::{
     bare_observation_reads, companion_age_bound, difference_reads, kept_labels_by_clause,
-    lagged_equality_complaints, metric_names_in, shape_complaints,
-    uncovered_window_complaints, unguarded_store_reading_complaints, windows_over,
+    lagged_equality_complaints, metric_names_in, shape_complaints, uncovered_window_complaints,
+    unguarded_store_reading_complaints, windows_over,
 };
 
 const CHART_CONFIG: &str = "deploy/helm/cogneva/files/cogneva.json";
@@ -953,9 +953,7 @@ fn a_difference_read_of_a_metering_family_is_one_the_producer_declared() {
                     ));
                 }
             }
-            RangeReadBaseline::Exempt {
-                readers: named, ..
-            } => {
+            RangeReadBaseline::Exempt { readers: named, .. } => {
                 let named: BTreeSet<String> = named.iter().map(|s| s.to_string()).collect();
                 if named != actual {
                     missing_cost.push(format!(
