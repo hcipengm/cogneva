@@ -274,6 +274,13 @@ const CORE_MODULE_LIST: &str = "crates/cog-core/src/lib.rs";
 /// be in flight, not filed a second time. Only a re-arm moves the generation, and
 /// only on the arm of [`classify_handover`] that says the environment, not the
 /// change, is why the last attempt did not happen.
+///
+/// This is also the edge a reader uses to get back to a change's product. The
+/// graph's task table is pruned and cleared per workspace, so a row there is not
+/// something to join against, but a ledger row is kept, and its identity fixes
+/// the id of every handover the change ever made. Recompute the id, match it as a
+/// prefix against the event stream, and the product is found again without
+/// anything having been stored to connect the two.
 fn dispatch_task_id(identity: &ChangeIdentity, generation: u32) -> String {
     let mut hasher = blake3::Hasher::new();
     for part in [&identity.kind, &identity.scope, &identity.literal] {
@@ -2089,6 +2096,45 @@ mod tests {
         assert_ne!(
             dispatch_task_id(&split_early, 0),
             dispatch_task_id(&split_late, 0)
+        );
+    }
+
+    /// The derivation is the edge between a ledger row and the product of its
+    /// handover: the graph's task table is pruned and cleared per workspace, so a
+    /// reader cannot join to it, but a ledger row is kept, and its identity fixes
+    /// the id of every handover it ever made. Recomputing the id and matching it
+    /// as a prefix against the event stream is how the product is found again --
+    /// which only works while this function still produces the id the graph was
+    /// actually given. The pairs below were read off the live platform; if this
+    /// function ever changes, those readers stop finding their rows and this goes
+    /// red first, so the change has to be a migration rather than a quiet edit.
+    #[test]
+    fn the_id_a_ledger_row_derives_is_the_one_the_live_graph_was_given() {
+        let veto = ChangeIdentity::new("grep", "crates/cog-eval/src", "veto");
+        assert_eq!(
+            dispatch_task_id(&veto, 0),
+            "change-ledger-be840a05eb11635e"
+        );
+        let gap = ChangeIdentity::new("grep", "crates/cog-reflection/src", "capability_gap");
+        assert_eq!(
+            dispatch_task_id(&gap, 0),
+            "change-ledger-6622446d99af92a0"
+        );
+    }
+
+    /// A re-arm is a different row in the graph under a different id, and the
+    /// ledger fixes that id too -- so a reader looking for the product has to
+    /// reach the generation the change actually died on, not only the first.
+    #[test]
+    fn a_re_arm_derives_an_id_the_first_handover_did_not_use() {
+        let identity = ChangeIdentity::new("grep", "crates/cog-eval/src", "veto");
+        assert_eq!(
+            dispatch_task_id(&identity, 1),
+            "change-ledger-be840a05eb11635e-r1"
+        );
+        assert_ne!(
+            dispatch_task_id(&identity, 1),
+            dispatch_task_id(&identity, 0)
         );
     }
 
