@@ -1388,6 +1388,64 @@ fn widens(guarded: &CounterRead, guard: &CounterRead) -> bool {
     })
 }
 
+/// The families a rule reads through a difference function, by name.
+///
+/// `changes()`, `increase()`, `rate()` and their kin are all a difference
+/// between adjacent samples, so what they can see depends on whether the cell
+/// existed before the event: a family published at zero at startup shows its
+/// first increment, and a family created on demand shows nothing, because the
+/// sample that appeared *is* the first increment. Which families are read this
+/// way is therefore a fact a rule author needs and cannot read off the
+/// expression's subject, so it is extracted here rather than left to whoever
+/// remembers.
+///
+/// A family counts only when the name sits directly in front of a range
+/// selector: `changes(foo_total[6h])` and `changes(foo_total{a="b"}[6h])` are
+/// reads of `foo_total`, while a nested expression (`increase(sum(x[1h])[1h:1m])`)
+/// and a bare mention are not reads of anything this returns. The argument is
+/// read after quoting and label matchers are blanked, both of which hold text
+/// that is not a series name.
+pub fn difference_reads(expr: &str) -> BTreeSet<String> {
+    const FNS: [&str; 8] = [
+        "changes", "increase", "rate", "irate", "delta", "idelta", "deriv", "resets",
+    ];
+    let stripped = strip_braces(&strip_quoted(expr));
+    let bytes = stripped.as_bytes();
+    let mut out = BTreeSet::new();
+    for f in FNS {
+        let opener = format!("{f}(");
+        let mut from = 0usize;
+        while let Some(rel) = stripped[from..].find(&opener) {
+            let at = from + rel;
+            from = at + opener.len();
+            // Whole tokens only: `xchanges(` is another name.
+            if at > 0 && token_char(bytes[at - 1]) {
+                continue;
+            }
+            let mut i = from;
+            while i < bytes.len() && bytes[i] == b' ' {
+                i += 1;
+            }
+            let start = i;
+            while i < bytes.len() && token_char(bytes[i]) {
+                i += 1;
+            }
+            if i == start {
+                continue;
+            }
+            let name = &stripped[start..i];
+            let mut j = i;
+            while j < bytes.len() && bytes[j] == b' ' {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'[' {
+                out.insert(name.to_string());
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1901,5 +1959,37 @@ mod tests {
              and on () (count_over_time(up[30m]) > count_over_time(up[15m]))"
         )
         .is_empty());
+    }
+
+    #[test]
+    fn a_difference_read_is_the_name_in_front_of_a_range_selector() {
+        let got = difference_reads(
+            "(sum by (upstream) (changes(llm_calls_total{result=\"error\"}[6h])) > 0) \
+             unless on () (sum(changes(llm_usage_readings_total[6h])) > 0)",
+        );
+        assert_eq!(
+            got.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["llm_calls_total", "llm_usage_readings_total"]
+        );
+        // 区间选择符跟前不是族名的不算：嵌套表达式里读的是里面那一族，不是 `sum`。
+        assert!(difference_reads("increase(sum(x_total[1h])[1h:1m])").is_empty());
+        // 整个 token 才认：`idelta(` 里的 `delta(` 是同一个函数名的一部分。
+        assert_eq!(
+            difference_reads("idelta(foo_total[5m])")
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["foo_total"]
+        );
+        // 裸读不算：没有区间选择符就没有差值。
+        assert!(difference_reads("sum(foo_total) > 0").is_empty());
+        // 标签匹配器里的文本不是族名。
+        assert_eq!(
+            difference_reads("changes(x_total{pod=\"rate(foo_total[1h])\"}[6h])")
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["x_total"]
+        );
     }
 }

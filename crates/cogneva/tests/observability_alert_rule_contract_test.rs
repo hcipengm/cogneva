@@ -19,6 +19,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+use cog_gateway::security_gateway::{RangeReadBaseline, RANGE_READ_BASELINES};
+
 #[path = "common/closed_set.rs"]
 mod closed_set;
 #[path = "common/dashboard.rs"]
@@ -30,9 +32,9 @@ mod promql;
 
 use producer::carries_the_producer;
 use promql::{
-    bare_observation_reads, companion_age_bound, kept_labels_by_clause, lagged_equality_complaints,
-    metric_names_in, shape_complaints, uncovered_window_complaints,
-    unguarded_store_reading_complaints, windows_over,
+    bare_observation_reads, companion_age_bound, difference_reads, kept_labels_by_clause,
+    lagged_equality_complaints, metric_names_in, shape_complaints,
+    uncovered_window_complaints, unguarded_store_reading_complaints, windows_over,
 };
 
 const CHART_CONFIG: &str = "deploy/helm/cogneva/files/cogneva.json";
@@ -340,13 +342,28 @@ const PRODUCED: &[(&str, &str)] = &[
         "llm_pool_available",
         "crates/cog-gateway/src/security_gateway.rs",
     ),
-    // Request outcomes per upstream. This is where a pool that serves nothing
-    // shows up at all, and its failure half is the only cell that cannot be
-    // produced by idleness: the success half is published lazily, so a rule that
-    // reads absence alone could not tell "nobody called" from "every call
-    // failed", while a rule that requires the failure side to have moved can.
+    // Request outcomes per upstream. Its failure half is the only cell that
+    // cannot be produced by idleness: the success half is published lazily, so a
+    // rule that reads absence alone could not tell "nobody called" from "every
+    // call failed", while a rule that requires the failure side to have moved
+    // can. It is no longer what a pool that serves nothing is read *through* --
+    // the rule that was built on this family asked for a difference it cannot
+    // show, so it moved to the two failure families below -- but the per-caller
+    // counts are read here still.
     (
         "llm_calls_total",
+        "crates/cog-gateway/src/security_gateway.rs",
+    ),
+    // The pool's transport-failure counter, one cell per configured upstream,
+    // published at zero for every one of them at startup. That is what makes it
+    // readable by a difference function at all: the family beside it is created
+    // on demand, so a series born from a burst carries the whole burst in its
+    // first sample and `changes()` reads zero for it. Measured 2026-10-14: 348
+    // failed calls inside one 14-second window, a first sample already holding
+    // 348, and the rule built on that family computed empty for the fifteen
+    // hours that followed.
+    (
+        "llm_upstream_failures_total",
         "crates/cog-gateway/src/security_gateway.rs",
     ),
     (
@@ -877,6 +894,83 @@ fn every_series_an_alert_rule_reads_is_one_something_produces() {
             .map(|(name, rules)| format!("  {name} <- {}", rules.join(", ")))
             .collect::<Vec<_>>()
             .join("\n")
+    );
+}
+
+/// A difference read shows only what the cell looked like *before* the event, so
+/// which of these families a rule may read that way is a decision with a
+/// published baseline behind it -- declared next to the producers, in
+/// `cog_gateway::security_gateway::RANGE_READ_BASELINES`, and reconciled here.
+///
+/// This is the reconciliation the rule table never had. Three directions, and
+/// each of them is a way the pair drifts: a rule reading an undeclared family
+/// (nobody decided how its first sample is produced), a declaration no rule
+/// reads (a claim kept alive past its reader), and an exemption that does not
+/// name every rule paying its cost (the cost is then paid by someone who never
+/// wrote it down). Measured 2026-10-14 on the way to writing it: the old
+/// `llm_calls_all_failing` read the exempt `llm_calls_total`, and 348 failures
+/// inside one 14-second window created the series with the whole burst already
+/// in its first sample, so `changes()` read zero and the rule computed to
+/// nothing through the fifteen hours that followed a pool going fully down.
+///
+/// What it cannot judge is whether a baseline declared `SeededAtZero` really is
+/// published before the first increment: the table is a claim about a publisher
+/// in another crate, and the reader for that half is the publisher's own test,
+/// which walks the same table.
+#[test]
+fn a_difference_read_of_a_metering_family_is_one_the_producer_declared() {
+    let declared: BTreeSet<&str> = RANGE_READ_BASELINES.iter().map(|(n, _)| *n).collect();
+    let mut undeclared: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut readers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (rule, promql) in chart_rules() {
+        for family in difference_reads(&promql) {
+            if declared.contains(family.as_str()) {
+                readers.entry(family).or_default().insert(rule.clone());
+            } else if family.starts_with("llm_") {
+                undeclared.entry(family).or_default().push(rule.clone());
+            }
+        }
+    }
+    assert!(
+        undeclared.is_empty(),
+        "规则用差分函数（changes/increase/rate/…）读了 `llm_` 前缀的族，而产出侧没有为它\
+         声明过基线（`RANGE_READ_BASELINES`）：按需创建的族在这种读法下首个事件读不出来\n{}",
+        undeclared
+            .iter()
+            .map(|(name, rules)| format!("  {name} <- {}", rules.join(", ")))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    let mut missing_cost: Vec<String> = Vec::new();
+    for (family, baseline) in RANGE_READ_BASELINES {
+        let actual: BTreeSet<String> = readers.get(*family).cloned().unwrap_or_default();
+        match baseline {
+            RangeReadBaseline::SeededAtZero => {
+                if actual.is_empty() {
+                    missing_cost.push(format!(
+                        "  {family} 声明为 SeededAtZero，但没有任何规则用差分函数读它：要么写一条规则，要么删掉这一条"
+                    ));
+                }
+            }
+            RangeReadBaseline::Exempt {
+                readers: named, ..
+            } => {
+                let named: BTreeSet<String> = named.iter().map(|s| s.to_string()).collect();
+                if named != actual {
+                    missing_cost.push(format!(
+                        "  {family} 的豁免名单与真正读它的规则对不上\n      名单里多出：{:?}\n      实际在读：{:?}",
+                        named.difference(&actual).collect::<Vec<_>>(),
+                        actual.difference(&named).collect::<Vec<_>>()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        missing_cost.is_empty(),
+        "基线表与规则表对不上（豁免的代价要由点得出名字的规则承担，声明也不能没有读者）:\n{}",
+        missing_cost.join("\n")
     );
 }
 
@@ -2361,13 +2455,6 @@ const UNREAD: &[(&str, Unread)] = &[
     (
         "cogneva_mainline_superseded_rollout_total",
         Unread::Gap("the share of rounds the guard saved by leaving the carried revision alone. It counts answers, not questions: the producer writes a zero on an unskipped round and a zero sample does not move a counter's value, so this series cannot say whether a quiet stretch was a guard that kept answering no or a guard that stopped being called -- that half is now carried by a pair of its own, cogneva_mainline_rollout_attempts_total against cogneva_mainline_supersession_checks_total, which is what mainline_supersession_question_stopped reads. What is left here is the share itself, and what would make a run of skips a fault is how much upstream movement counts as normal on this repository: a bound nobody declared, so the missing half is a bound rather than a reader"),
-    ),
-    (
-        "llm_upstream_failures_total",
-        Unread::Elsewhere {
-            readers: &["llm_calls_total"],
-            reason: "llm_calls_all_failing reads llm_calls_total{result=error} and the health table states the current consecutive failures; the help says this cumulative total and the backoff window describe one history",
-        },
     ),
     (
         "llm_request_param_clamped_total",

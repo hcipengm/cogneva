@@ -1904,7 +1904,21 @@ async fn publish_usage_vocabulary(state: &AppState) {
 /// cannot be enumerated from the configured list; a seed that omitted that
 /// label would publish a series no call can ever add to, and an unmoving cell
 /// reads as traffic that never came, which is the same confusion this publisher
-/// removes, pointed the other way.
+/// removes, pointed the other way. Its `model` label is upstream data on top of
+/// that, so the guess a partial seed would have to make is two labels deep.
+///
+/// The consequence reaches further than the missing cells, and it is the reason
+/// this paragraph is longer than the one above: a family that is not published
+/// at zero cannot be read with a difference function and expected to show its
+/// first event. A series born from a burst carries the whole burst in its first
+/// sample, and `changes()` and `increase()` -- differences between adjacent
+/// samples -- read zero for it for as long as it stays constant. That is not a
+/// corner: an event that arrives on a label combination nothing has used before
+/// is invisible to every such reader, however long its window. So a rule that
+/// has to see the first failure of a process generation is built on the
+/// families published here, and the ones that still read the exempt families
+/// are each recorded, with what they therefore cannot see, in
+/// [`RANGE_READ_BASELINES`].
 ///
 /// The per-upstream gauges have no first increment to lose, so seeding them
 /// would fix nothing and cost something: they are verdicts, and their readers
@@ -1933,6 +1947,82 @@ async fn publish_upstream_vocabulary(state: &AppState) {
         .await;
     }
 }
+
+/// 一个计数族被「差分类区间函数」读时，它的第一个增量从哪来。
+///
+/// `changes()` / `increase()` 是相邻两笔样本之差，所以它们看得见什么，取决于
+/// 事件发生前那一格在不在：启动时按零发布过，第一次失败就是 0→1 的一次变化；
+/// 首次用到才创建，那笔样本本身就是事件，差值恒读 0。
+///
+/// 两种状态都留着，而且代价不一样，所以不能只说「没种子」了事。格子集合能从
+/// 配置枚举出来的族按零发布、不需要豁免；带调用方外来文本的族做不到，能从那
+/// 一族读到的就只限于它给得出的东西。这张表是**清单**：规则表那边的合同测试
+/// 要求每条用差分函数读 `llm_` 前缀族的规则，其族名都在这里；而每一条豁免都
+/// 要列出**仍然读它**的规则名——于是「豁免的代价由谁承担」是可查的，规则改名
+/// 或搬走后豁免不会悄悄留着。
+///
+/// 边界挑的是 `llm_` 这个前缀：它正好是这套计量面的命名空间。前缀之外的族
+/// （审计通道的 `audited_llm_requests_total`、签名面的 `cogneva_notification_sign_total`）
+/// 同样按零发布，但由各自的模块在自己的测试里守着，不在这里再列一遍——列了
+/// 也只是第二份名单，而这份表要能替一条规则回答「这一族读得动吗」。
+pub enum RangeReadBaseline {
+    /// 启动时按零发布过每一格，先于第一次调用。
+    SeededAtZero,
+    /// 没有种子：给出为什么不能种，以及仍然读它的规则因此看不见什么。
+    Exempt {
+        /// 仍用差分函数读这一族的规则名，逐个对应规则表里的 `name`。
+        readers: &'static [&'static str],
+        /// 为什么种不了 + 读者因此看不见什么。
+        reason: &'static str,
+    },
+}
+
+/// 见 [`RangeReadBaseline`]：差分读法的族清单。
+pub const RANGE_READ_BASELINES: &[(&str, RangeReadBaseline)] = &[
+    (
+        cog_core::metric_names::LLM_USAGE_READINGS_TOTAL.as_str(),
+        RangeReadBaseline::SeededAtZero,
+    ),
+    (
+        cog_core::metric_names::LLM_UPSTREAM_FAILURES_TOTAL.as_str(),
+        RangeReadBaseline::SeededAtZero,
+    ),
+    (
+        cog_core::metric_names::LLM_UPSTREAM_CLIENT_ERRORS_TOTAL.as_str(),
+        RangeReadBaseline::SeededAtZero,
+    ),
+    (
+        cog_core::metric_names::LLM_CALLS_TOTAL.as_str(),
+        RangeReadBaseline::Exempt {
+            readers: &[
+                "llm_usage_ledger_incomplete",
+                "llm_call_without_declared_actor",
+                "llm_context_per_call_above_its_own_week",
+            ],
+            reason: "格子是 (upstream, model, result, actor)，其中两维在本进程之外：model 是上游数据，\
+                     actor 是调用方给的文本、这里的取值由配置的角色派生。猜得出的那些格子种下去，发布的是\
+                     没有调用能推动的序列（不动的格子读起来就是「流量从没来过」，正是发布词汇要消掉的那种\
+                     混淆，只是方向相反），而落在没猜中的格子上的爆发仍然看不见。读者因此看不见的是「还不\
+                     存在的那一格的第一个增量」：对按代重建的格子是一次调用，对落在新格子上的爆发则是整个\
+                     事件。三条读者都是 warning，读的是「发生了多少次」而不是「有没有发生」，所以少掉一次\
+                     不会把判词的方向读反；那条必须看见整个事件的规则（llm_calls_all_failing）改挂在下面两个\
+                     失败族上。",
+        },
+    ),
+    (
+        cog_core::metric_names::LLM_TOKENS_TOTAL.as_str(),
+        RangeReadBaseline::Exempt {
+            readers: &[
+                "llm_context_per_call_above_its_own_week",
+                "llm_cached_tokens_exceed_input",
+            ],
+            reason: "格子带 actor，理由与 llm_calls_total 同一条。两条读者都把这个族与另一个计数相减或\
+                     相除：某一侧看不见的第一个增量，在一小时窗口的和里至多值一次调用，而两条都是 warning。\
+                     缓存的那些格子（kind=cached）由 `llm_cached_tokens_exceed_input` 读，它的判词是\
+                     「缓存数超过输入数」这种按构造不可能的事，方向不靠第一个增量。",
+        },
+    ),
+];
 
 /// 签名面上一次成功发放的结果名。
 const SIGN_OUTCOME_SIGNED: &str = "signed";
@@ -7074,28 +7164,52 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         // 这一族是按需创建的：第一次失败会把自增值直接带进首个样本，于是
         // changes()/increase() 看不见它。种子跑完后格子必须已经在，且是诚实
         // 的"什么都还没观测到"的值，第一次自增才成为一次可见的变化。
+        //
+        // 要检哪些族不在这里写第二遍，从 `RANGE_READ_BASELINES` 的 SeededAtZero
+        // 一档派生——上一版这里是两个写死的名字，新加一族没人会记得加，而没人
+        // 记得的那一族正好就是会漏种的那一族。表的另一档（Exempt）这里管不着：
+        // 它没有种子可测，承担它代价的是规则表那边的核对。
         let configured = stub_upstream("https://a.example.com", "m1");
         let state = test_state(vec![configured.clone()]);
         let key = LlmHealthTable::key(&configured);
 
-        // 没有种子时，这一族一条样本都没有——这正是缺陷本身。
+        // 没有种子时，这些族一条样本都没有——这正是缺陷本身。
         let before = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
         assert!(
             !before.contains(cog_core::metric_names::LLM_UPSTREAM_CLIENT_ERRORS_TOTAL.as_str()),
             "前提：未跑种子时这一族不存在: {before}"
         );
 
+        publish_usage_vocabulary(&state).await;
         publish_upstream_vocabulary(&state).await;
         let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
-        for name in [
-            cog_core::metric_names::LLM_UPSTREAM_FAILURES_TOTAL.as_str(),
-            cog_core::metric_names::LLM_UPSTREAM_CLIENT_ERRORS_TOTAL.as_str(),
-        ] {
+        let mut checked = 0;
+        for (name, baseline) in RANGE_READ_BASELINES {
+            if !matches!(baseline, RangeReadBaseline::SeededAtZero) {
+                continue;
+            }
+            checked += 1;
             assert!(
-                text.contains(&format!("{name}{{upstream=\"{key}\"}} 0")),
-                "启动种子必须给出 {name} 的零值格子: {text}"
+                !before.contains(name),
+                "前提：未跑种子时 {name} 不存在，否则这一格量的是别的东西: {before}"
+            );
+            assert!(
+                text.lines()
+                    .any(|l| l.starts_with(&format!("{name}{{")) && l.ends_with(" 0")),
+                "表里声明为 SeededAtZero 的 {name} 必须在启动种子里有零值样本: {text}"
             );
         }
+        assert!(
+            checked > 0,
+            "表里 SeededAtZero 一档不能是空的，否则这一格什么都没量"
+        );
+        assert!(
+            text.contains(&format!(
+                "{}{{upstream=\"{key}\"}} 0",
+                cog_core::metric_names::LLM_UPSTREAM_FAILURES_TOTAL.as_str()
+            )),
+            "启动种子必须给出按配置逐条的零值格子: {text}"
+        );
         // 负例：健康那一格**不能**被种出来。它是判决，而读者取的是跨 pod
         // 的窗口最大值——种一个 1 会让 `llm_usage_verdict_unmeasured` 对每条
         // 配置上游长鸣（滚动中的网关上永远有个刚启动的 pod 在说 1）。
