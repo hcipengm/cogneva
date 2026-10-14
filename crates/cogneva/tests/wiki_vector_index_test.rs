@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use cog_core::{EmbeddingProvider, ObjectBackend, SearchTier, SFResult, WikiBackend};
+use cog_core::{EmbeddingProvider, ObjectBackend, SFResult, SearchTier, WikiBackend};
 use cog_storage::{MemoryObjectBackend, MemoryVectorBackend};
 use cog_wiki::{WikiManager, WikiVectorIndex};
 
@@ -51,10 +51,7 @@ impl EmbeddingProvider for BagOfWords {
         Ok(texts.iter().map(|t| embed(t)).collect())
     }
 
-    async fn embed_sparse(
-        &self,
-        _texts: Vec<String>,
-    ) -> SFResult<Vec<cog_core::SparseEmbedding>> {
+    async fn embed_sparse(&self, _texts: Vec<String>) -> SFResult<Vec<cog_core::SparseEmbedding>> {
         Ok(Vec::new())
     }
 
@@ -90,7 +87,8 @@ fn wiki(embedding: Option<Arc<dyn EmbeddingProvider>>) -> WikiManager {
     WikiManager::new(objects).with_vector_index(Arc::new(index))
 }
 
-const SESSION_PAGE: &str = "# Sessions\n\nA short lived credential is issued once the caller proves identity.";
+const SESSION_PAGE: &str =
+    "# Sessions\n\nA short lived credential is issued once the caller proves identity.";
 
 #[tokio::test]
 async fn a_stored_page_is_reachable_through_the_semantic_face() {
@@ -106,7 +104,11 @@ async fn a_stored_page_is_reachable_through_the_semantic_face() {
         .await
         .unwrap();
 
-    assert_eq!(results.len(), 1, "the stored page should be findable: {results:?}");
+    assert_eq!(
+        results.len(),
+        1,
+        "the stored page should be findable: {results:?}"
+    );
     assert_eq!(results[0].path, "auth/sessions.md");
     assert_eq!(results[0].source, SearchTier::Vector);
     assert!(
@@ -122,9 +124,13 @@ async fn deleting_a_page_takes_its_vector_with_it() {
     WikiBackend::ingest_document(&manager, "auth/sessions.md", SESSION_PAGE)
         .await
         .unwrap();
-    WikiBackend::ingest_document(&manager, "billing/invoices.md", "# Invoices\n\nMonthly billing.")
-        .await
-        .unwrap();
+    WikiBackend::ingest_document(
+        &manager,
+        "billing/invoices.md",
+        "# Invoices\n\nMonthly billing.",
+    )
+    .await
+    .unwrap();
 
     WikiBackend::delete_document(&manager, "auth/sessions.md")
         .await

@@ -159,7 +159,11 @@ impl WikiManager {
         let doc = match wiki_doc_from_key(rel, content) {
             Ok(doc) => doc,
             Err(e) => {
-                tracing::warn!("wiki document {} could not be described for indexing: {}", rel, e);
+                tracing::warn!(
+                    "wiki document {} could not be described for indexing: {}",
+                    rel,
+                    e
+                );
                 return;
             }
         };
@@ -180,7 +184,6 @@ impl WikiManager {
             ),
         }
     }
-
 
     /// Read a document from the wiki by relative path.
     pub async fn read_document(
