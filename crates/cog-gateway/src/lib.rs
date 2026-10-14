@@ -21,6 +21,7 @@ use tower_http::trace::TraceLayer;
 
 pub mod a2a;
 pub mod action_plan;
+pub mod actor_labels;
 pub mod agents;
 pub mod alert_store;
 pub mod approval_gate;

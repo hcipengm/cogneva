@@ -1648,22 +1648,20 @@ fn record_event(state: &AppState, event: AnalyticsEvent) {
     }
 }
 
-/// Actor label fallthrough when the caller did not identify itself or sent a
-/// malformed value. Keep the metric vocabulary bounded at this edge: accept
-/// only short lowercase tokens so arbitrary request input cannot explode
-/// Prometheus label cardinality.
+/// Actor label fallthrough when the caller did not identify itself, sent a
+/// malformed value, or named an actor the platform does not declare. Keep the
+/// metric vocabulary closed at this edge: shape alone bounded the cardinality
+/// but not the vocabulary, so any caller could add a series by inventing a
+/// short lowercase token, and the result was indistinguishable from a feature
+/// someone meant to add. Declared values are listed in [`crate::actor_labels`];
+/// everything else lands on the unknown cell, which is where a caller that
+/// declared nothing is readable.
 fn normalize_actor(raw: Option<&str>) -> String {
     match raw {
-        Some(v)
-            if !v.is_empty()
-                && v.len() <= 32
-                && v.bytes().all(|b| {
-                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b':' | b'_' | b'-')
-                }) =>
-        {
+        Some(v) if !v.is_empty() && v.len() <= 32 && crate::actor_labels::declared(v) => {
             v.to_string()
         }
-        _ => "unknown".to_string(),
+        _ => crate::actor_labels::UNKNOWN_ACTOR.to_string(),
     }
 }
 
@@ -5833,14 +5831,20 @@ mod tests {
     fn actor_header_normalized_to_bounded_labels() {
         assert_eq!(normalize_actor(Some("self_review")), "self_review");
         assert_eq!(normalize_actor(Some("agent:generator")), "agent:generator");
-        // Missing header, empty value, uppercase, illegal characters, and an
-        // over-long value all collapse to the single bounded fallthrough label.
+        // A well-shaped token nobody declared is not an actor either: shape
+        // bounded the length, not the vocabulary, so any caller could add a
+        // series by inventing a short lowercase word, and that series read as a
+        // feature someone meant to add.
+        assert_eq!(normalize_actor(Some(&"a".repeat(32))), "unknown");
+        // Missing header, empty value, an undeclared word, uppercase, illegal
+        // characters, and an over-long value all collapse to the single bounded
+        // fallthrough label.
         assert_eq!(normalize_actor(None), "unknown");
         assert_eq!(normalize_actor(Some("")), "unknown");
+        assert_eq!(normalize_actor(Some("planner")), "unknown");
         assert_eq!(normalize_actor(Some("Agent")), "unknown");
         assert_eq!(normalize_actor(Some("bad/actor")), "unknown");
         assert_eq!(normalize_actor(Some(&"a".repeat(33))), "unknown");
-        assert_eq!(normalize_actor(Some(&"a".repeat(32))), "a".repeat(32));
     }
 
     #[test]
