@@ -660,7 +660,7 @@ cargo fmt --check
 - 核心框架已搭建完成，workspace 内每个 Crate 均有实质性实现
 - 编译通过；`cargo clippy --workspace --all-targets -- -D warnings`（零告警）与 `cargo fmt --check` 由 CI 强制
 - `cargo test --workspace` 全 workspace 通过
-- **已上生产**：已在商业生产环境中部署运行
+- **已在环境中部署运行**
 - **持续推进**：全进化强RSI
 
 ---

@@ -664,7 +664,7 @@ For manual compilation: `cargo build --release`. Container image: see `Dockerfil
 - Core framework complete; every crate in the workspace has a substantive implementation
 - Builds cleanly; CI enforces `cargo clippy --workspace --all-targets -- -D warnings` (zero warnings) and `cargo fmt --check`
 - `cargo test --workspace` passes across the workspace
-- **Running in production**: deployed and operating in commercial production environments
+- **Deployed and operating in live environments**
 - **Ongoing**: full-evolution toward strong RSI
 
 ---
