@@ -64,16 +64,20 @@ fn columns() -> Vec<(String, bool, bool)> {
     let path = notification_migration();
     let sql = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("{} is unreadable: {e}", path.display()));
+    column_definitions(&sql, &path.display().to_string())
+}
 
+/// Read the column list out of a `CREATE TABLE notifications` statement.
+///
+/// Shared with the store's own DDL below, so that both sides are read by one
+/// scanner: a difference the comparison reports is then a difference in the
+/// statements, not in how they were read.
+fn column_definitions(sql: &str, label: &str) -> Vec<(String, bool, bool)> {
     let body = sql
         .split_once("CREATE TABLE IF NOT EXISTS notifications (")
         .or_else(|| sql.split_once("CREATE TABLE notifications ("))
         .map(|(_, rest)| rest)
-        .unwrap_or_else(|| panic!("{} has no notifications CREATE TABLE", path.display()));
-    let body = body
-        .split_once("\n);")
-        .map(|(body, _)| body)
-        .unwrap_or_else(|| panic!("the CREATE TABLE in {} is not closed", path.display()));
+        .unwrap_or_else(|| panic!("{label} has no notifications CREATE TABLE"));
 
     let mut columns = Vec::new();
     for line in body.lines() {
@@ -81,8 +85,12 @@ fn columns() -> Vec<(String, bool, bool)> {
         if line.is_empty() || line.starts_with("--") {
             continue;
         }
+        // The closing parenthesis ends the column list; nothing past it belongs
+        // to this table's shape.
+        if line.starts_with(')') {
+            break;
+        }
         let upper = line.to_uppercase();
-        // Only column definitions reach here; the table body holds nothing else.
         let name = line
             .split_whitespace()
             .next()
@@ -96,8 +104,7 @@ fn columns() -> Vec<(String, bool, bool)> {
     }
     assert!(
         !columns.is_empty(),
-        "parsed no columns out of {}: the scanner stopped matching the file",
-        path.display()
+        "parsed no columns out of {label}: the scanner stopped matching it"
     );
     columns
 }
@@ -154,5 +161,31 @@ fn the_table_requires_only_columns_the_contract_can_supply() {
          has moved. Each name here is a column a row cannot be written without and \
          the contract has no field for -- the table and the contract disagree about \
          the shape of a notification"
+    );
+}
+
+/// The table a store creates at startup has to be the table the migration
+/// describes.
+///
+/// Two statements about one shape, and the store's copy is the one that runs:
+/// `PostgresNotificationStore::init_schema` creates the table itself, because
+/// the migration's index statements cannot be applied twice and the store
+/// starts more than once. The migration is what the running cluster already
+/// has, so a store whose copy drifts does not fail loudly -- it writes to
+/// whatever columns it names and reads whatever the migration left there, and
+/// the first insert to notice is a `NOT NULL` column the store does not fill.
+#[test]
+fn the_store_creates_the_table_the_migration_describes() {
+    let migration = columns();
+    let store = column_definitions(
+        cog_storage::postgres::notification_store::CREATE_TABLE_SQL,
+        "the notification store's own DDL",
+    );
+
+    assert_eq!(
+        migration, store,
+        "the table the store creates has a different shape from the one the \
+         migration describes. Whichever of the two is wrong, a row written by the \
+         store is read by the other"
     );
 }

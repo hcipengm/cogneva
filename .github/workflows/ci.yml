@@ -196,6 +196,15 @@ jobs:
         run: cargo test -p cog-storage --test platform_identity -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The notification store's insert is a statement only the server parses,
+      # and its owner is a column the contract carries as a string. Without a
+      # server a row that can never be written, a page boundary that repeats
+      # rows, or a read that answers for every user at once all leave every
+      # DB-free test green.
+      - name: Live-DB notification store
+        run: cargo test -p cog-storage --test notification_store -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The token ledger's cache column is added by an ALTER that has to land on
       # a table already holding rows, and the INSERT that fills it is a
       # statement only the server parses. Neither face is visible without a

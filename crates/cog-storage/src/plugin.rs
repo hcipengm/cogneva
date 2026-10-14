@@ -447,6 +447,33 @@ impl cog_core::SystemPlugin for StoragePlugin {
             }
         }
 
+        // ── Notification store（通知的耐久面） ──
+        // 生产者与读者分处两个 Pod：写通知的是演化/审批那一侧，读通知的是
+        // 服务端列表。进程内的存储只会把行留在写它的那个 Pod 里，读者永远
+        // 看不到，重启就没了。落库后这一面才是两边共用的。
+        if let Some(ref pool) = config_pool {
+            let notification_store = crate::PostgresNotificationStore::new(pool.clone());
+            match notification_store.init_schema().await {
+                Ok(()) => {
+                    let store: Arc<dyn cog_core::NotificationStore> = Arc::new(notification_store);
+                    ctx.publish_service(store);
+                    info!("StoragePlugin notification store published");
+                }
+                Err(e) => {
+                    if strict_persistence {
+                        return Err(cog_core::SFError::Config(format!(
+                            "PostgresNotificationStore init_schema failed (strict_persistence=true): {}",
+                            e
+                        )));
+                    }
+                    warn!(
+                        "PostgresNotificationStore init_schema failed: {}. Notifications stay in-process.",
+                        e
+                    );
+                }
+            }
+        }
+
         // ── Promotion ledger（晋级台账：配额/熔断/审计事实源，与 state
         //    backend 同一存储，避免双副本读到不同账本） ──
         let promotion_ledger: Arc<dyn cog_core::PromotionLedger> = if state_backend_pg {

@@ -192,8 +192,29 @@ impl cog_core::SystemPlugin for NotificationPlugin {
         }
 
         let dispatcher: Arc<dyn cog_core::NotificationDispatcher> = Arc::new(dispatcher);
-        let store: Arc<dyn cog_core::NotificationStore> =
-            Arc::new(crate::InMemoryNotificationStore::new());
+
+        // 通知的存法由存得下的那一方决定：storage 拿到池子时已经发布了一张
+        // 落库的通知表，这里只在没有人发布时才补进程内实现。判据是"读一次
+        // 再决定"，不是"抢着发布"——同一个针上有两个发布者时 `consume_service`
+        // 取先到的那个，而同一层的插件并发初始化，"先到"每次启动都可能不同，
+        // 于是同一份配置会轮流拿到两种存法。这条读发生在 storage 之后，因为
+        // DESCRIPTOR 里声明了这条边。
+        if ctx
+            .consume_service::<dyn cog_core::NotificationStore>()
+            .is_some()
+        {
+            info!("Notification store: the persistent store is in use");
+        } else {
+            info!(
+                "Notification store: in-process (no persistent store published). \
+                 Rows written here are lost on restart and invisible to another Pod."
+            );
+            // 只有这一支才发布：同一个针收到第二个发布者，审计会记一条
+            // "一个针多个发布者"，而读者取到的仍是原来那个。
+            let in_process: Arc<dyn cog_core::NotificationStore> =
+                Arc::new(crate::InMemoryNotificationStore::new());
+            ctx.publish_service(in_process);
+        }
 
         // "通知发出去了"这件事从进程外读不出来：出口配错、被 egress 拦掉、被平台
         // 以报文里的错误码拒收，三种都只表现为"没人收到"。读数按出口分开报，
@@ -203,7 +224,6 @@ impl cog_core::SystemPlugin for NotificationPlugin {
 
         ctx.publish(Arc::new(tx.clone()));
         ctx.publish_service(dispatcher);
-        ctx.publish_service(store);
         info!("NotificationPlugin initialized");
         Ok(())
     }
@@ -221,7 +241,11 @@ impl cog_core::SystemPlugin for NotificationPlugin {
 /// Static descriptor for auto-discovery.
 pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "notification",
-    requires: &["net"],
+    // storage 排在前面不是因为它有 notification 要用的服务，而是因为选择存法要
+    // 先读完它已经发布的东西：进程内实现只在没人发布持久面时才补上。没有这条边
+    // 两个插件同层并发初始化，读到的可能是"还没发布"，于是同一份配置每次启动
+    // 拿到不同的存法。
+    requires: &["net", "storage"],
     optional_requires: &[],
     factory: || Box::new(NotificationPlugin::new()),
 };
