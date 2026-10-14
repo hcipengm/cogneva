@@ -873,7 +873,10 @@ const GAUGE_HELP: &[(&str, &str)] = &[
         "Subset of the above that aged past the re-drive window. These are not \
          given up on: the reconcile pass picks them up on its own, at most \
          aged_out_redrive_batch per round, so the reading falls as the debt is \
-         repaid. What it cannot say on its own is whether it is falling: a \
+         repaid. A debt deeper than that batch still moves from both ends -- \
+         a quarter of the batch buys the oldest entries -- so a value that \
+         stays put cannot be explained by the newest debt crowding out the rest. \
+         What it cannot say on its own is whether it is falling: a \
          value that stays put is a debt larger than the batch, a pass that \
          stopped, or a batch of zero, and the count of sources each pass \
          re-drove separates the first from the other two -- it is on \

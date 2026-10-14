@@ -210,6 +210,10 @@ pub struct MemoryIngestorConfig {
     /// [`UnextractedScan::aged_out_due`]：这批欠账按固定速率还，速率与事件
     /// 洪峰解耦——不设上限时一次长断供会在恢复后把全部欠账一次塞进队列，占满
     /// 抽取并发，新事件反而排在它们后面。0 = 不补。
+    ///
+    /// 欠账比这个数深时，批量的四分之一留给最老的那几条（不足四条时不留）：
+    /// 只从最新的一头取，每一拍补进来的新欠账都会把界推着走，最老的那条永远
+    /// 排在界外——积压读数里有一截因此不会再变。
     pub aged_out_redrive_batch: usize,
     /// 周期对账间隔（秒）；0 = 只在启动时对账。周期重扫让窗口内的欠账在上游
     /// 恢复后的下一拍就被补驱动，不依赖进程重启时机。
@@ -1576,9 +1580,22 @@ impl MemoryIngestor {
         // agent 名前缀排的，与年龄无关。
         debt.sort_by_key(|id| std::cmp::Reverse(raw_id_timestamp(id)));
         let aged_out_total = debt.len();
-        let due_take = self.config.aged_out_redrive_batch.min(debt.len());
-        let mut aged_out_due = Vec::with_capacity(due_take);
-        for id in debt.drain(..due_take) {
+        let batch = self.config.aged_out_redrive_batch;
+        // 欠账比批量深时，只从队首取会让队尾永远轮不到：每一拍都有新的欠账补进
+        // 队首，界一到，最老的那条就一直排在界外——积压读数里有一截因此是死的，
+        // 而它正是「记忆静默丢失」的观测面。留四分之一给队尾，队尾每拍至少前进
+        // 一条。批量不足四条时不切：那里四分之一不足一条，抬成一条要占掉一半以
+        // 上，「新的先还」就反过来了。
+        let tail_take = if batch >= 4 && debt.len() > batch {
+            batch / 4
+        } else {
+            0
+        };
+        let fresh_take = batch - tail_take;
+        let tail_ids = debt.split_off(debt.len() - tail_take);
+        let fresh_ids = debt.into_iter().take(fresh_take);
+        let mut aged_out_due = Vec::with_capacity(fresh_take + tail_ids.len());
+        for id in fresh_ids.chain(tail_ids) {
             if let Some(raw) = self.backend.get_raw("default", &id).await? {
                 // 同上：判在这里而不是另读一次。这一批本身有上限，所以被排除
                 // 的那些每拍最多花掉这个上限次读，且不会进欠账。
@@ -3885,6 +3902,50 @@ mod tests {
         assert_eq!(
             job.raw.id, recent.id,
             "the batch must buy the newest debt, not whichever id sorted first"
+        );
+    }
+
+    /// 欠账比批量深时，队尾也要每拍前进一条。只取队首时，每一拍补进来的新欠账
+    /// 会把界推着走，最老的那条永远排在界外：积压读数里有一截再怎么等也不会变，
+    /// 而「记忆静默丢失」正是靠这条读数看的。
+    #[tokio::test]
+    async fn reconcile_advances_the_oldest_debt_when_the_backlog_outruns_the_batch() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        let now = Utc::now();
+        for i in 0..5 {
+            backend
+                .archive_raw(&transcript_raw_at(
+                    &format!("debt-{i}"),
+                    now - chrono::Duration::hours(48 + i),
+                ))
+                .await
+                .unwrap();
+        }
+        let oldest = transcript_raw_at("oldest", now - chrono::Duration::hours(96));
+        backend.archive_raw(&oldest).await.unwrap();
+
+        let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(RuleBasedExtractor::new()))
+            .with_config(MemoryIngestorConfig {
+                aged_out_redrive_batch: 4,
+                ..MemoryIngestorConfig::default()
+            });
+
+        let (job_tx, mut job_rx) = mpsc::unbounded_channel();
+        let backlog = std::sync::atomic::AtomicUsize::new(0);
+        ingestor.reconcile(&job_tx, &backlog, true).await;
+
+        let mut re_driven = Vec::new();
+        while let Ok(job) = job_rx.try_recv() {
+            re_driven.push(job.raw.id);
+        }
+        assert_eq!(
+            re_driven.len(),
+            4,
+            "the batch is still the cap; the tail share comes out of it, not on top of it"
+        );
+        assert!(
+            re_driven.contains(&oldest.id),
+            "the oldest debt must get a turn every round, got {re_driven:?}"
         );
     }
 
