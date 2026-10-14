@@ -294,6 +294,27 @@ impl PostgresAlertStore {
         }
     }
 
+    /// The `dedup_key` of the row currently firing under `rule`, if any.
+    ///
+    /// A rule whose identity carries the event it belongs to holds one row per
+    /// occurrence, and at most one of them is open at a time. A producer that
+    /// only saw the firing edge can hold the key of the row it opened itself,
+    /// but a producer that starts up mid-event -- a rolling restart, a crash,
+    /// a second process elected to the seat -- never saw that edge and has no
+    /// key to resolve. Reading the open key back is what lets it close the row
+    /// it did not open, instead of either leaving it firing forever or minting
+    /// a second row for an event already in progress.
+    pub async fn firing_key_for_rule(&self, rule: &str) -> anyhow::Result<Option<String>> {
+        let row = sqlx::query(
+            "SELECT dedup_key FROM alerts WHERE rule = $1 AND state = 'firing' \
+             ORDER BY fired_at DESC LIMIT 1",
+        )
+        .bind(rule)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get("dedup_key")))
+    }
+
     /// Alerts currently in the `firing` state, newest first.
     pub async fn list_active(&self, limit: i64) -> anyhow::Result<Vec<AlertRecord>> {
         let rows = sqlx::query(

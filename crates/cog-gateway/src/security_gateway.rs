@@ -2560,11 +2560,49 @@ fn pool_down_message(pool_size: usize, unavailable: &[String], bounds: &Recovery
     )
 }
 
+/// 池全灭告警的规则名。写一次：`dedup_key` 要从它派生事件身份，规则名再抄一遍
+/// 就有两处会漂的地方。
+const POOL_ALERT_RULE: &str = "llm_upstream_pool_down";
+
+/// 一次池全灭**事件**的告警身份。
+///
+/// 告警表按稳定的 `dedup_key` 去重，这对"一直为真的条件"是对的，却把条件里的
+/// **事件**藏了起来：两次池全灭，只要中间恢复过一次，就落在同一行上，按行计数的
+/// 读者说不出池到底灭过几次。所以身份里带上它所属的那次事件——池走下沿的那个
+/// unix 秒——但在**同一次事件内保持不变**，因为恢复那一步要按名字精确关掉那一行。
+///
+/// 有开着的行时，身份跟着那一行的 key 走，而不是跟着时钟走：进程在事件中途起来
+/// （滚动、崩溃、重新选主）只看到"池是坏的"、没看到下沿，按当下时钟新铸一个就会
+/// 给同一次事件开第二行，而恢复又只关得掉其中一行。把开着的 key 读回来，是这个
+/// 进程能接上别人开头的那次事件、并且关得掉它的唯一办法。时钟只在「池走下沿、
+/// 且没有任何开着的行」那一次被问。
+fn pool_event_dedup_key(rule: &str, down: bool, open_key: Option<&str>, now_unix: i64) -> String {
+    match open_key {
+        // 事件开着：这一拍接着它，不管条件是往哪边走。恢复要走这一支——关一行
+        // 就得叫出它的名字，而开着的 key 正是它的名字。
+        Some(key) => key.to_string(),
+        // 什么都没开着：走下沿就开一次新事件、当场盖章；走上沿没有东西要关，
+        // 这个 key 根本不会被写下来，只需要让 store 读成「没在 fire」。
+        None if down => format!("{rule}@{now_unix}"),
+        None => rule.to_string(),
+    }
+}
+
 /// 推进 PG 告警状态机（幂等）。每拍调用，让 PG 里的告警状态始终是池状态的投影；
 /// Fired/Resolved 各打一条日志——告警历史落在 PG，重启后仍可查。
 async fn sync_pool_alert(state: &AppState, down: bool) {
     let Some(alerts) = &state.pool_obs.alerts else {
         return;
+    };
+    // 开着的行读不回来时这一拍不做对账，而不是当成「没有开着的行」继续：
+    // 后者会在每个拍上新铸一个身份，一次事件被写成几十行、恢复只关得掉最后一行。
+    // 下一拍重试；告警面本来就在 PG 够不着时整体降级。
+    let open_key = match alerts.firing_key_for_rule(POOL_ALERT_RULE).await {
+        Ok(key) => key,
+        Err(e) => {
+            tracing::warn!(error = %e, "池告警的开行读不回来，这一拍不做告警对账");
+            return;
+        }
     };
     let bounds = state
         .llm_health
@@ -2578,8 +2616,13 @@ async fn sync_pool_alert(state: &AppState, down: bool) {
         .collect();
     let pool_size = state.config.llm_upstreams.len();
     let alert = NewAlert {
-        rule: "llm_upstream_pool_down".into(),
-        dedup_key: "llm_upstream_pool_down".into(),
+        rule: POOL_ALERT_RULE.into(),
+        dedup_key: pool_event_dedup_key(
+            POOL_ALERT_RULE,
+            down,
+            open_key.as_deref(),
+            Utc::now().timestamp(),
+        ),
         severity: "critical".into(),
         message: if down {
             pool_down_message(pool_size, &unavailable, &bounds)
@@ -6928,6 +6971,47 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         // 任一上游恢复即解除熔断，真实请求立刻有机会试它。
         state.llm_health.note_success(&c);
         assert_eq!(state.pool_circuit_break(&all), None, "有上游可用即放行");
+    }
+
+    /// 池告警的身份必须带事件，否则两次池全灭被去重成一行、灭过几次不可数。
+    ///
+    /// 判据分两半，缺一半都会放过一种坏写法：**同一次事件内身份不变**
+    /// （否则每个拍新铸一个身份，一次事件被写成一堆行），**两次事件之间身份不同**
+    /// （否则又退回「一行说了算」）。只钉前者的话，「每拍都新铸」也绿；只钉后者的
+    /// 话，「永远用同一个名字」也绿。
+    #[test]
+    fn pool_alert_identity_carries_the_event_and_both_halves_are_needed() {
+        let rule = "llm_upstream_pool_down";
+
+        // 第一次下沿：没有开着的行，现场铸一个带时刻的身份。
+        let first = pool_event_dedup_key(rule, true, None, 1_000);
+        assert_eq!(first, "llm_upstream_pool_down@1000");
+
+        // 同一次事件还在持续：开着的行是它自己，接着它走，时钟往后走也不换身份。
+        assert_eq!(
+            pool_event_dedup_key(rule, true, Some(&first), 1_060),
+            first,
+            "同一次事件的下一个拍必须复用身份，而不是按当前时钟再开一个"
+        );
+
+        // 恢复：必须叫出开着的那个名字，关的才是它那一行。
+        assert_eq!(
+            pool_event_dedup_key(rule, false, Some(&first), 1_120),
+            first,
+            "恢复那一步要按身份关行，身份必须与开火时相同"
+        );
+
+        // 恢复之后再灭：没有开着的行了，第二次事件铸出**不同**的身份。
+        let second = pool_event_dedup_key(rule, true, None, 2_000);
+        assert_ne!(
+            second, first,
+            "两次池全灭必须落两个身份（两行），否则按行计数读不出灭过几次"
+        );
+        assert_eq!(second, "llm_upstream_pool_down@2000");
+
+        // 没有任何开着的行、也没灭：这个身份永远不被写下来，只需要不等于一个
+        // 「在 fire」的行。
+        assert_eq!(pool_event_dedup_key(rule, false, None, 2_060), rule);
     }
 
     #[tokio::test]
