@@ -11,7 +11,7 @@ use cog_core::{SFResult, SkillConfig, SkillRegistry};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::types::PromotionResult;
+use crate::types::{FallbackCause, PromotionResult};
 use cog_core::{Learning, LearningCategory};
 
 /// Promotes mature learnings to system configurations.
@@ -180,17 +180,26 @@ impl DefaultLearningPromoter {
     }
 
     /// Write a learning to the wiki as a Markdown document.
-    async fn write_to_wiki(&self, learning: &Learning) -> SFResult<String> {
+    ///
+    /// Returns the cause rather than an error: the caller falls back either way,
+    /// and the two causes are what tell a reader whether the wiki layer is
+    /// missing from this process or is there and refused the write. Folding
+    /// both into one `Err` made them the same line in the log and the same
+    /// outcome for whoever counted the promotions.
+    async fn write_to_wiki(&self, learning: &Learning) -> Result<String, FallbackCause> {
         let Some(adapter) = self.wiki() else {
-            return Err(cog_core::SFError::Validation(
-                "Wiki adapter not configured".into(),
-            ));
+            return Err(FallbackCause::LayerAbsent);
         };
 
         let path = format!("reflections/{}-{:?}.md", learning.id, learning.area);
         let content = Self::learning_to_markdown(learning);
 
-        adapter.ingest_document(&path, &content).await?;
+        adapter
+            .ingest_document(&path, &content)
+            .await
+            .map_err(|e| FallbackCause::LayerRefused {
+                reason: e.to_string(),
+            })?;
         info!("wrote learning {} to wiki at {}", learning.id, path);
         Ok(path)
     }
@@ -275,10 +284,10 @@ impl LearningPromoter for DefaultLearningPromoter {
                             value: path,
                         }
                     }
-                    Err(e) => {
+                    Err(cause) => {
                         warn!(
-                            "failed to write learning {} to wiki: {}. Falling back to SkillRegistry.",
-                            learning.id, e
+                            "failed to write learning {} to wiki ({cause}). Falling back to SkillRegistry.",
+                            learning.id
                         );
                         // Fallback: write to SkillRegistry as a documentation skill.
                         let mut registry = self.skill_registry.write().await;
@@ -292,9 +301,16 @@ impl LearningPromoter for DefaultLearningPromoter {
                             role_type: "documentation".into(),
                         };
                         registry.insert_skill_config(config);
-                        PromotionResult::Promoted {
-                            target: "SkillRegistry(fallback)".into(),
+                        // Reported as `Degraded`, not as a promotion with a
+                        // differently-spelled target: the learning did not reach
+                        // the layer it was promoted for, and a caller counting
+                        // how many reached the wiki has to be able to see that
+                        // without parsing a name.
+                        PromotionResult::Degraded {
+                            intended: "Wiki".into(),
+                            target: "SkillRegistry".into(),
                             value: skill_id,
+                            cause,
                         }
                     }
                 }
@@ -409,6 +425,10 @@ mod tests {
     /// process was in before the handle was wired, and it is what the wiki path
     /// above has to be distinguished from — a handle that never resolves must
     /// fall back, not fail.
+    ///
+    /// The outcome has to say so as a fallback, not as a promotion whose target
+    /// reads differently: a caller tallying how many learnings reached the wiki
+    /// otherwise counts this one among them.
     #[tokio::test]
     async fn a_promoted_insight_without_a_wiki_falls_back_to_the_registry() {
         let ctx = PluginContext::new(Config::default());
@@ -421,10 +441,65 @@ mod tests {
             .unwrap();
 
         match result {
-            PromotionResult::Promoted { target, .. } => {
-                assert_eq!(target, "SkillRegistry(fallback)")
+            PromotionResult::Degraded {
+                intended,
+                target,
+                cause,
+                ..
+            } => {
+                assert_eq!(intended, "Wiki");
+                assert_eq!(target, "SkillRegistry");
+                assert!(
+                    matches!(cause, crate::types::FallbackCause::LayerAbsent),
+                    "nothing published a wiki layer, so the cause is absence, not a refusal: {cause:?}"
+                );
             }
-            other => panic!("expected the registry fallback, got {other:?}"),
+            other => {
+                panic!("expected the registry fallback to be reported as degraded, got {other:?}")
+            }
+        }
+    }
+
+    /// A wiki that is there and refuses is a different fact from one that was
+    /// never published: the first says the store is in trouble, the second says
+    /// the wiring is. Both end on the same fallback, so the outcome is the only
+    /// place the two can be told apart.
+    #[tokio::test]
+    async fn a_wiki_that_refuses_is_not_reported_as_a_wiki_that_is_absent() {
+        struct RefusingWiki;
+
+        #[async_trait]
+        impl cog_core::WikiBackend for RefusingWiki {
+            async fn health_check(&self) -> bool {
+                true
+            }
+            fn provider_name(&self) -> &str {
+                "refusing"
+            }
+            async fn ingest_document(&self, _relative_path: &str, _content: &str) -> SFResult<()> {
+                Err(cog_core::SFError::IO("the wiki store is down".into()))
+            }
+        }
+
+        let ctx = PluginContext::new(Config::default());
+        let handle = cog_core::LateService::<dyn cog_core::WikiBackend>::new(ctx.clone());
+        let promoter = DefaultLearningPromoter::new(registry()).with_wiki_late(handle);
+        ctx.publish_service::<dyn cog_core::WikiBackend>(Arc::new(RefusingWiki));
+
+        let result = promoter
+            .promote_if_ready(&promotable_insight())
+            .await
+            .unwrap();
+
+        match result {
+            PromotionResult::Degraded {
+                cause: crate::types::FallbackCause::LayerRefused { reason },
+                ..
+            } => assert!(
+                reason.contains("the wiki store is down"),
+                "the refusal has to carry what the store said: {reason}"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
         }
     }
 }

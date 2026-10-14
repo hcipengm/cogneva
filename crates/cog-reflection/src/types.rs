@@ -27,8 +27,55 @@ pub enum Frequency {
 /// Result of a promotion attempt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PromotionResult {
-    Promoted { target: String, value: String },
-    NotReady { reason: String },
+    Promoted {
+        target: String,
+        value: String,
+    },
+    /// The layer this learning was meant for did not take it, and the fallback
+    /// did.
+    ///
+    /// Its own variant rather than a `Promoted` whose `target` happens to spell
+    /// the fallback: a reader asking "did the wiki get this" would otherwise
+    /// have to match on a string, and the two are opposite facts — the intended
+    /// layer took the item, or it did not and something else did. `cause` keeps
+    /// the last two apart as well, because nothing having published the layer
+    /// is a wiring question and the layer refusing is a store question.
+    Degraded {
+        /// The layer the learning was promoted *for*.
+        intended: String,
+        /// Where it actually landed.
+        target: String,
+        value: String,
+        cause: FallbackCause,
+    },
+    NotReady {
+        reason: String,
+    },
+}
+
+/// Why a learning's intended layer did not take it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FallbackCause {
+    /// Nothing in this process published that layer at all.
+    LayerAbsent,
+    /// The layer is there and the write into it failed.
+    LayerRefused { reason: String },
+}
+
+impl std::fmt::Display for FallbackCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FallbackCause::LayerAbsent => write!(f, "no layer is published in this process"),
+            FallbackCause::LayerRefused { reason } => write!(f, "{reason}"),
+        }
+    }
+}
+
+/// One promotion a review pass carried out, and where it ended up.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromotionOutcome {
+    pub learning_id: String,
+    pub result: PromotionResult,
 }
 
 /// A feature request captured from user conversations.
@@ -105,7 +152,13 @@ pub struct ReviewReport {
     pub high_priority_pending: Vec<Learning>,
     pub recently_resolved: Vec<Learning>,
     pub patterns_detected: Vec<Pattern>,
+    /// What this pass found promotable, before it acted.
     pub promotions_ready: Vec<Learning>,
+    /// What it then did about each of them, with the layer each one actually
+    /// reached. `promotions_ready` alone cannot say whether anything was
+    /// promoted, and a pass that listed without acting was indistinguishable
+    /// from one that acted and had every write refused.
+    pub promotions: Vec<PromotionOutcome>,
     pub reviewed_at: DateTime<Utc>,
 }
 

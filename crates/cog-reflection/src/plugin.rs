@@ -8,6 +8,8 @@ use tracing::{error, info, warn};
 pub const MICROVM_EVOLUTION_LOOP: &str = "reflection_microvm_evolution";
 /// Loop name reported through the background-loop liveness family.
 pub const CHANGE_VERIFICATION_LOOP: &str = "reflection_change_verification";
+/// Loop name reported through the background-loop liveness family.
+pub const LEARNING_REVIEW_LOOP: &str = "reflection_learning_review";
 
 /// 延迟持有的 LLM 上游池暂停句柄。`SchedulerGate` 由 supervisor 插件在
 /// init 阶段发布，而 reflection 的 init 早于 supervisor（supervisor 可选依赖
@@ -40,6 +42,9 @@ impl PoolGate {
 /// evolution bridges.
 pub struct ReflectionPlugin {
     initialized: bool,
+    /// 学习语料的定期复审循环。init 从引擎上取下来，`start()` 挂载成一条
+    /// 后台循环——它是这份进程里唯一会把学习推给 wiki / 技能注册表的驱动。
+    reviewer: Option<Arc<crate::PeriodicReviewer>>,
     /// init 确认自进化管线真实启动且沙盒边界放行后为 true：start() 据此
     /// 挂基线移植触发循环（跨插件消费 OrchestratorControl 只能在 start，
     /// 见插件生命周期 init_all → start_all）。
@@ -87,6 +92,7 @@ impl ReflectionPlugin {
     pub fn new() -> Self {
         Self {
             initialized: false,
+            reviewer: None,
             porter_armed: false,
             pool_gate: Arc::new(PoolGate::default()),
             workspaces: None,
@@ -429,6 +435,11 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         let engine_service: Arc<dyn cog_core::ReflectionEngine> = engine.clone();
         ctx.publish_service(engine_service);
         info!("ReflectionPlugin reflection engine published");
+
+        // 学习语料的定期复审由 `start()` 挂载，但那一步要拿到这个对象。此前
+        // 它只挂在引擎上、没有任何人启动：复审循环是「谁调用谁跑」，而这份
+        // 进程里没有调用者，于是引擎手上那个 wiki 句柄一次也没被解引用过。
+        self.reviewer = engine.reviewer.clone();
 
         // 被门禁拒绝的变更回流主流程那条支路的属主门与读数。读数在这里发布：
         // 采集侧的快照是插件初始化期间抓的，从 `start()` 发布的句柄没人读。提交
@@ -1435,6 +1446,86 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             ));
         } else {
             info!("artifact-level evolution driver: no meta-learning engine; skipping");
+        }
+
+        // 学习语料的定期复审。在此之前这份进程里没有任何驱动去调晋级器：
+        // 引擎带着一个 wiki 句柄、也带着复审器，但复审器要么只挂在那台由
+        // `cog-agent` 自建的引擎上（那台没有 wiki 句柄），要么挂上了却没有
+        // 任何调用者——两边各有半个条件，合起来是一次也没跑到落点。而唯一
+        // 的读数（复审报告里「ready for promotion」的条数）在有驱动和没驱
+        // 动时一模一样，所以缺的正是这条循环。
+        //
+        // 挂在 `porter_armed` 那道门**之前**：那道门管的是沙盒边界放没放行
+        // 代码变更，而把一条学习写进 wiki 不跑沙盒、不改代码。落在这道门后
+        // 面，等于「沙盒没就绪」时连带把落点也关掉，而两者无关。
+        //
+        // 周期取自复审器自己，不在这里再写一个数：一个参数两处定义时，
+        // 漂掉的那处永远是这份。
+        //
+        // 每个部署都挂（插件表整表加载、配置同源），学习语料又是各部署自己
+        // 那份，所以同一个 id 可能被写两遍。落点的键都由 learning id 派生
+        // （wiki 文档路径、技能 id），重复是同一把键的改写而不是多一行；
+        // 语料侧的 `Promoted` 回写让后跑的那份下一轮就跳过它。
+        if let Some(ref reviewer) = self.reviewer {
+            let reviewer = reviewer.clone();
+            let period = reviewer.interval();
+            let shutdown = cog_core::ShutdownSignal::new();
+            if let Some(broadcast_tx) = ctx.consume::<cog_core::ShutdownBroadcastTx>() {
+                let shutdown = shutdown.clone();
+                let mut rx = broadcast_tx.0.subscribe();
+                tokio::spawn(async move {
+                    let _ = rx.recv().await;
+                    shutdown.trigger();
+                });
+            }
+            cog_core::loop_health::spawn(
+                LEARNING_REVIEW_LOOP,
+                cog_core::loop_health::Cadence::Periodic(period),
+                shutdown.clone(),
+                move |beat| {
+                    let reviewer = reviewer.clone();
+                    let shutdown = shutdown.clone();
+                    async move {
+                        let mut ticker = tokio::time::interval(period);
+                        loop {
+                            beat.beat();
+                            tokio::select! {
+                                _ = ticker.tick() => {}
+                                _ = shutdown.wait() => return,
+                            }
+                            match reviewer.review_once().await {
+                                Ok(report) => {
+                                    // 按每条实际落到的层计数，不按「够格晋级」
+                                    // 那批的条数：一整轮每一篇都降级与一整轮
+                                    // 一篇都没降级，在「ready」那一格上是同一
+                                    // 个数字。
+                                    let (mut promoted, mut degraded) = (0usize, 0usize);
+                                    for outcome in &report.promotions {
+                                        match outcome.result {
+                                            crate::types::PromotionResult::Promoted { .. } => {
+                                                promoted += 1
+                                            }
+                                            crate::types::PromotionResult::Degraded { .. } => {
+                                                degraded += 1
+                                            }
+                                            crate::types::PromotionResult::NotReady { .. } => {}
+                                        }
+                                    }
+                                    info!(
+                                        "periodic review complete: {} pending, {} patterns, {} ready for promotion, {} reached their layer, {} fell back",
+                                        report.total_pending,
+                                        report.patterns_detected.len(),
+                                        report.promotions_ready.len(),
+                                        promoted,
+                                        degraded
+                                    );
+                                }
+                                Err(e) => warn!("periodic review failed: {e}"),
+                            }
+                        }
+                    }
+                },
+            );
         }
 
         if !self.porter_armed {
