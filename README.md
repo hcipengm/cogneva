@@ -122,13 +122,13 @@ Recursive self-improvement (RSI) itself has degrees of maturity. This ladder gra
 | R0 | Tool | human intent / human implementation / human verification |
 | R1 | Assistant | human intent / AI implementation / human review |
 | R2 | Auto-repair | the system raises its own defect signals and fixes known breakage; no objective function |
-| R3 | Goal-driven self-improvement | system-set goals + eval as a real gate + memory priors —— **Cogneva's current position** |
-| R4 | Capability invention | the system authors its own curriculum / new dimensions; benchmark freshness; bandit balancing |
+| R3 | Goal-driven self-improvement | system-set goals + eval as a real gate + memory priors |
+| R4 | Capability invention | the system authors its own curriculum / new dimensions; benchmark freshness; bandit balancing —— **Cogneva's current position** |
 | R5 | Full RSI | the eval, the goal generator and the learning algorithm are rewritten too; the self-reference trap demands an external anchor |
 
 Three questions place a system on the ladder: is the intent fed in by a human, or discovered by the system? Is verification eyeballed, or a statistical gate? When the gate trips, does a human clean up, or does the system roll back on its own? All three answers "the system" starts at R2; a gate that genuinely consumes eval reaches R3; intent that includes authoring its own problems reaches R4.
 
-**Current position: R3 (goal-driven self-improvement).** All three things the criterion asks for are in the system: the goal is not fed in by a human — Reflection raises evolution tasks on its own when a class of errors recurs, a skill's effectiveness degrades, or a pattern matures; verification is not eyeballed — evaluation results enter the promotion path as a typed verdict rather than a prose string, and a change that eval has explicitly refused is no longer promoted; and the result outlives the run — the change ledger carries what the system learned across runs, and the promotion path reads an eval verdict back when it picks what to promote next.
+**Current position: R4 (capability invention).** The placement questions are all answered by the system: the goal is not fed in by a human — Reflection raises evolution tasks on its own when a class of errors recurs, a skill's effectiveness degrades, or a pattern matures; verification is not eyeballed — evaluation results enter the promotion path as a typed verdict rather than a prose string, a change that eval has explicitly refused is no longer promoted, and every change is re-measured on the current benchmark instead of against a fixed scoreboard; and the result outlives the run — what each run distils feeds back into what the next one selects, and the change ledger carries it across runs. What puts the loop at R4 rather than R3 is the curriculum: the problems it works on are not a human backlog. The system picks the dimension it evolves in — source-level changes to the engine, or artifact-level changes to private policy artifacts — and MetaLearning records each round's outcome so the next round chooses differently instead of replaying a fixed script.
 
 In one sentence: **meta-bootstrapping lets the system stand up, real-autonomy lets the system run itself, omni-evolution lets the system keep getting stronger.**
 
@@ -208,7 +208,7 @@ Today's Agent frameworks:
 
 **Cogneva's answer**: built-in **L0–L3 four-layer self-evolution system**
 - L0: per-run self-review (instant quality check)
-- L1: cross-session learning (every run's successes and failures persist as experience entries across sessions)
+- L1: cross-session learning (distilling successful experience into Skills)
 - L2: code evolution (automatically improving system code, verified by cargo check)
 - L3: meta-learning (discovering new patterns, autonomously exploring capabilities)
 
@@ -437,7 +437,7 @@ Agentic Engineering = giving Agents the ability to autonomously plan, execute, c
 | Layer | Capability |
 |-------|-----------|
 | L0 per-run self-review | automatic quality check after every Agent run |
-| L1 cross-session learning | every run's successes and failures persist as experience entries across sessions |
+| L1 cross-session learning | distill Skills from successes/failures, write into Registry |
 | L2 code evolution | **automatically generate Rust code changes, verified by cargo check** |
 | L3 meta-learning | autonomously discover new patterns, explore new capabilities |
 
