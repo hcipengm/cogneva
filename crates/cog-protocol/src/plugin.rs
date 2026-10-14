@@ -6,7 +6,6 @@ use tracing::{info, warn};
 /// Protocol plugin that provides MCP, A2A, and gRPC lifecycle services.
 pub struct ProtocolPlugin {
     mcp_client: Option<Arc<dyn cog_core::McpClient>>,
-    a2a_client: Option<Arc<crate::A2aClient>>,
     /// The lifecycle server published at init. `start` keeps the handle so it
     /// can hand the server the process's event channel, which is published by
     /// the supervisor plugin after this one's init has already run.
@@ -28,7 +27,6 @@ impl ProtocolPlugin {
     pub fn new() -> Self {
         Self {
             mcp_client: None,
-            a2a_client: None,
             grpc_server: None,
             grpc_shutdown: Mutex::new(None),
             grpc_serve: Mutex::new(None),
@@ -36,13 +34,9 @@ impl ProtocolPlugin {
     }
 
     /// Create a plugin that wraps existing clients.
-    pub fn from_clients(
-        mcp_client: Option<Arc<dyn cog_core::McpClient>>,
-        a2a_client: Arc<crate::A2aClient>,
-    ) -> Self {
+    pub fn from_clients(mcp_client: Option<Arc<dyn cog_core::McpClient>>) -> Self {
         Self {
             mcp_client,
-            a2a_client: Some(a2a_client),
             grpc_server: None,
             grpc_shutdown: Mutex::new(None),
             grpc_serve: Mutex::new(None),
@@ -97,20 +91,14 @@ impl cog_core::SystemPlugin for ProtocolPlugin {
         }
 
         // ── A2A client ──
-        if self.a2a_client.is_none() {
-            // Built around the process's HTTP client, not around an empty slot.
-            // An `A2aClient` with nothing wired answers every call with an
-            // error, and it looks exactly like a working one to whoever
-            // fetched it -- so publishing it would advertise a capability and
-            // then fail on first use, which is worse than not publishing at
-            // all. Taking the client from `net` here makes its absence a
-            // startup finding, on the same terms as the MCP transport above.
-            let http = ctx.require_service::<dyn cog_core::HttpClient>()?;
-            let a2a = Arc::new(crate::A2aClient::new().with_client(http));
-            self.a2a_client = Some(a2a.clone());
-            ctx.publish(a2a);
-            info!("ProtocolPlugin A2A client initialized");
-        }
+        //
+        // This used to build an `A2aClient` during init and publish it, and
+        // nothing in the workspace ever read that service: the process
+        // advertised a capability, took one of the `HttpClient` pin's readers
+        // on its behalf, and never called it. The client itself stays --
+        // `A2aClient` is still exported, and `new` now takes the `HttpClient`
+        // as a required argument, so whoever needs one builds it at the call
+        // site and an unwired instance cannot be constructed at all.
 
         // ── gRPC lifecycle server handle (command router) ──
         let router = crate::grpc_agent_lifecycle::AgentCommandRouter::new();

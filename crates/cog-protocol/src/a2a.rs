@@ -40,35 +40,25 @@ use std::sync::Arc;
 
 /// A2A Client — 向外部 Agent 发送任务。
 pub struct A2aClient {
-    client: Option<Arc<dyn cog_core::HttpClient>>,
-}
-
-impl Default for A2aClient {
-    fn default() -> Self {
-        Self::new()
-    }
+    client: Arc<dyn cog_core::HttpClient>,
 }
 
 impl A2aClient {
-    pub fn new() -> Self {
-        Self { client: None }
-    }
-
-    pub fn with_client(mut self, client: Arc<dyn cog_core::HttpClient>) -> Self {
-        self.client = Some(client);
-        self
-    }
-
-    fn client(&self) -> anyhow::Result<&Arc<dyn cog_core::HttpClient>> {
-        self.client
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("A2aClient has no HttpClient configured"))
+    /// 必须交出 HttpClient 才能构造。
+    ///
+    /// 这里曾经可以空着手造（`new()` + `Default` + `with_client`），代价是
+    /// 一个没有 client 的实例每个调用都返回「没有配置 HttpClient」——它和能
+    /// 干活的实例在类型上完全一样，谁取到都看不出来。构造器要求交出 client，
+    /// 就把这件事挪到编译期：没有 client 的 `A2aClient` 造不出来，也就没有
+    /// 「发布了却在第一次调用失败」这条路径。
+    pub fn new(client: Arc<dyn cog_core::HttpClient>) -> Self {
+        Self { client }
     }
 
     /// 获取目标 Agent 的 Agent Card。
     pub async fn fetch_agent_card(&self, url: &str) -> anyhow::Result<AgentCard> {
         let req = cog_core::HttpRequest::get(url);
-        let resp = self.client()?.execute(req).await?;
+        let resp = self.client.execute(req).await?;
         let card: AgentCard = resp
             .json()
             .map_err(|e| anyhow::anyhow!("JSON parse failed: {}", e))?;
@@ -81,7 +71,7 @@ impl A2aClient {
             .json(&task)
             .map_err(|e| anyhow::anyhow!("JSON serialization failed: {}", e))?
             .timeout(30);
-        let resp = self.client()?.execute(req).await?;
+        let resp = self.client.execute(req).await?;
         let result: A2aTask = resp
             .json()
             .map_err(|e| anyhow::anyhow!("JSON parse failed: {}", e))?;
@@ -92,7 +82,7 @@ impl A2aClient {
     pub async fn get_task(&self, agent_url: &str, task_id: &str) -> anyhow::Result<A2aTask> {
         let req =
             cog_core::HttpRequest::get(format!("{}/tasks/{}", agent_url, task_id)).timeout(30);
-        let resp = self.client()?.execute(req).await?;
+        let resp = self.client.execute(req).await?;
         let task: A2aTask = resp
             .json()
             .map_err(|e| anyhow::anyhow!("JSON parse failed: {}", e))?;
