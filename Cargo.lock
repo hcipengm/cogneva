@@ -1805,7 +1805,6 @@ version = "0.5.8"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum 0.8.9",
  "chrono",
  "cog-core",
  "prometheus",
