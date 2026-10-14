@@ -13,7 +13,10 @@
 #   1. 真文件 -> 绿；
 #   2. 一条普通规则丢掉聚合 -> 红，并点名它；
 #   3. 豁免表 / 控制集里点名了一条**不存在**的规则 -> 红（豁免与规则一起过期）；
-#   4. 一条已收敛规则的两侧配不上 -> 红（C78：合法但产不出序列）。
+#   4. 一条已收敛规则的两侧配不上 -> 红（C78：合法但产不出序列）；
+#   5. 两参形态（`quantile_over_time(0.99, v)` / `topk(5, v)`）按**第二个实参**判：
+#      第二个实参收敛 -> 绿；第二个实参是裸选择器 -> 红（不能因为「函数有两个实参」
+#      就一律算收敛——那样一条身份随 Pod 走的 topk 规则会静默通过）。
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -62,6 +65,20 @@ for r in paired:
         r['promql'] = ('sum by (loop) (cogneva_loop_role_declared)'
                        ' > 12 * max(cogneva_loop_owner_held)')
 dump('unpaired', paired)
+
+# 5. 两参形态按第二个实参判。同一个函数名，只换第二个实参：
+#    收敛的第二个实参 -> 整条收敛；裸选择器 -> 未收敛。
+twoparam_ok = json.loads(json.dumps(rules))
+twoparam_bad = json.loads(json.dumps(rules))
+for r in twoparam_ok:
+    if r['name'] == 'background_loop_restarted':
+        r['promql'] = ('quantile_over_time(0.99, (sum by (loop)'
+                       ' (cogneva_loop_role_declared))[30m:1m])')
+for r in twoparam_bad:
+    if r['name'] == 'background_loop_restarted':
+        r['promql'] = 'topk(5, cogneva_loop_role_declared)'
+dump('twoparam_ok', twoparam_ok)
+dump('twoparam_bad', twoparam_bad)
 PYEOF
 
 run() { # run <config> -> 打印合并输出，回传退出码
@@ -101,6 +118,17 @@ grep -q 'background_loop_restarted' <<<"${out}" \
   || fail "配不上的判词没点名规则：${out}"
 grep -q 'label-less right side against a labelled left side' <<<"${out}" \
   || fail "配不上的判词没说清哪一侧：${out}"
+
+# 5a. 两参形态、第二个实参收敛 -> 绿（这条也钉住 `background_loop_restarted` 在控制集里）
+if ! out="$(run "${work}/twoparam_ok.json")"; then
+  fail "两参函数的第二个实参已收敛，却被判红：${out}"; fi
+grep -q 'ALERT SUBJECT OK' <<<"${out}" || fail "绿的时候也要报判词：${out}"
+
+# 5b. 两参形态、第二个实参是裸选择器 -> 红，且点名它
+if out="$(run "${work}/twoparam_bad.json")"; then
+  fail "两参函数的第二个实参没收敛，却被判绿：${out}"; fi
+grep -q 'background_loop_restarted' <<<"${out}" || fail "判红却没点名那条规则：${out}"
+grep -q 'LEAF' <<<"${out}" || fail "判词要给出没收敛的那段子表达式：${out}"
 
 # 少了参数以外的路径不存在时，是依赖错误不是判词
 if bash "${gate}" "${work}/does-not-exist.json" >/dev/null 2>&1; then

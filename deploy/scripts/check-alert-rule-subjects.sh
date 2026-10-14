@@ -71,6 +71,18 @@ def strip_parens(e):
         e = e[1:-1].strip()
     return e
 
+def last_arg(e):
+    """实参列表里最后一个实参。`quantile_over_time(0.99, v)`、`topk(5, v)` 这类
+    两参形态的第一个实参是**参数**（分位、条数），标签集只由第二个实参决定；
+    把整个实参串当一个操作数读，会读成一个没有运算符的叶子，于是收敛判定只看
+    得到 `0.99, ((sum by ...))` 这样一段文本、把一条已经收敛的规则判成未收敛。"""
+    depth = 0; last = 0
+    for i, ch in enumerate(e):
+        if ch in '([{': depth += 1
+        elif ch in ')]}': depth -= 1
+        elif ch == ',' and depth == 0: last = i + 1
+    return e[last:].strip()
+
 def close_of(e, open_idx):
     d = 0
     for i in range(open_idx, len(e)):
@@ -119,7 +131,7 @@ def lint(expr, depth=0):
     m = re.match(PASSTHRU + r'\s*\(', e)
     if m and close_of(e, m.end() - 1) == len(e) - 1: return lint(e[m.end():-1], depth + 1)
     m = re.match(RANGE + r'\s*\(', e)
-    if m and close_of(e, m.end() - 1) == len(e) - 1: return lint(e[m.end():-1], depth + 1)
+    if m and close_of(e, m.end() - 1) == len(e) - 1: return lint(last_arg(e[m.end():-1]), depth + 1)
     m = re.match(AGG + r'\s*(by|without)\s*\(([^)]*)\)', e)
     if m:
         kind, labs = m.group(2), [x.strip() for x in m.group(3).split(',') if x.strip()]
@@ -129,6 +141,11 @@ def lint(expr, depth=0):
     m2 = re.match(AGG + r'\s*\(', e)
     if m2 and close_of(e, m2.end() - 1) == len(e) - 1:
         if e.startswith('count_values'): return 'KEEPS:' + e[:80]
+        # `topk` / `bottomk` / `quantile` 与单参聚合不同：它们**保留**标签，标签集
+        # 由第二个实参决定（第一个是条数或分位）。一律算收敛会让一条身份随 Pod
+        # 走的 topk 规则静默通过——这与 `quantile_over_time` 是同一个盲区。
+        if re.match(r'(topk|bottomk|quantile)\b', e):
+            return lint(last_arg(e[m2.end():-1]), depth + 1)
         return None
     ops = top_ops(e)
     if not ops: return 'LEAF:' + e[:120]
@@ -162,14 +179,20 @@ def side_arity(e, depth=0):
         return side_arity(e[m.end():-1], depth + 1)
     m = re.match(RANGE + r'\s*\(', e)
     if m and close_of(e, m.end() - 1) == len(e) - 1:
-        return side_arity(e[m.end():-1], depth + 1)
+        return side_arity(last_arg(e[m.end():-1]), depth + 1)
     m = re.match(AGG + r'\s*(by|without)\s*\(([^)]*)\)', e)
     if m:
         if m.group(2) == 'without': return SIDE_UNKNOWN
         return SIDE_LABELLED if m.group(3).strip() else SIDE_EMPTY
     m2 = re.match(AGG + r'\s*\(', e)
     if m2 and close_of(e, m2.end() - 1) == len(e) - 1:
-        return SIDE_UNKNOWN if e.startswith('count_values') else SIDE_EMPTY
+        if e.startswith('count_values'): return SIDE_UNKNOWN
+        # 两参形态（`topk(5, v)`、`quantile(0.9, v)`）保留标签，一侧的 arity 由第二个
+        # 实参定。按单参聚合一律读成无标签，会让「`topk` 那侧带标签、另一侧是裸聚合」
+        # 这种配不上的比较静默通过——与上面 RANGE 那一处是同一个盲区。
+        if re.match(r'(topk|bottomk|quantile)\b', e):
+            return side_arity(last_arg(e[m2.end():-1]), depth + 1)
+        return SIDE_EMPTY
     ops = top_ops(e)
     if not ops:
         # 裸选择器：这套部署里每条序列都来自抓取，至少带抓取侧自己的标签
@@ -239,6 +262,11 @@ PAIRING_CONTROLS = [
     ('max(a) > max(b)', False),
     ('a > on(stream) max(b)', False),
     ('sum by (stream) (a) > 12 * sum by (stream) (b)', None),
+    # 两参形态的 arity 由第二个实参定：`quantile_over_time(0.99, 12)` 是标量、
+    # `topk(5, x)` 保留标签。读到第一个实参（分位/条数）上，前一条会被读成带标签、
+    # 后一条被读成无标签，两条的判词都反了。
+    ('quantile_over_time(0.99, 12) > max(a)', None),
+    ('topk(5, x) > 12 * max(a)', True),
 ]
 
 def main(path):
