@@ -113,22 +113,22 @@ In this loop, every crate does its own job:
 
 All high-risk operations happen inside a cloud-native sandbox (adaptively choosing the lightweight K3s branch or the production K8s branch by environment): `git apply --check` pre-validation, `cargo test` verification, `cargo build --release` compilation, atomic binary switching, and health checks. Failure at any stage triggers automatic rollback — the system never crashes because of a failed "self-improvement".
 
-#### RSI maturity ladder
+#### RSI maturity ladder (recursive self-improvement)
 
-Self-evolution itself has degrees of maturity. This ladder grades the evolution loop as a whole (Cogneva's own scale, not an industry standard) — orthogonal to the four-layer self-evolution system described elsewhere in this README: that one is about which capabilities the system has, this one is about how mature the loop itself is.
+Recursive self-improvement (RSI) itself has degrees of maturity. This ladder grades the loop as a whole (Cogneva's own scale, not an industry standard) — orthogonal to the four-layer capability scale elsewhere in this README: that one is about which capabilities the system has, this one is about how mature the loop itself is.
 
 | Tier | Name | Criterion |
 | --- | --- | --- |
 | L0 | Tool | human intent / human implementation / human verification |
 | L1 | Assistant | human intent / AI implementation / human review |
-| L2 | Auto-repair | the system raises its own defect signals and fixes known breakage; no objective function —— **Cogneva's current position (upper end, moving into L3)** |
-| L3 | Goal-driven self-improvement | system-set goals + eval as a real gate + memory priors |
+| L2 | Auto-repair | the system raises its own defect signals and fixes known breakage; no objective function |
+| L3 | Goal-driven self-improvement | system-set goals + eval as a real gate + memory priors —— **Cogneva's current position** |
 | L4 | Capability invention | the system authors its own curriculum / new dimensions; benchmark freshness; bandit balancing |
 | L5 | Full RSI | the eval, the goal generator and the learning algorithm are rewritten too; the self-reference trap demands an external anchor |
 
 Three questions place a system on the ladder: is the intent fed in by a human, or discovered by the system? Is verification eyeballed, or a statistical gate? When the gate trips, does a human clean up, or does the system roll back on its own? All three answers "the system" starts at L2; a gate that genuinely consumes eval reaches L3; intent that includes authoring its own problems reaches L4.
 
-**Current position: the upper end of L2, moving into L3.** L3's criterion is "system-set goals + eval as a real gate + memory priors", and the eval-gate part has landed: evaluation results enter the promotion path as a typed verdict rather than a prose string, and a change that eval has explicitly refused is no longer promoted.
+**Current position: L3 (goal-driven self-improvement).** All three things the criterion asks for are in the system: the goal is not fed in by a human — Reflection raises evolution tasks on its own when a class of errors recurs, a skill's effectiveness degrades, or a pattern matures; verification is not eyeballed — evaluation results enter the promotion path as a typed verdict rather than a prose string, and a change that eval has explicitly refused is no longer promoted; and the result outlives the run — skill effectiveness and the experience entries it distils feed back into what gets selected next.
 
 In one sentence: **meta-bootstrapping lets the system stand up, real-autonomy lets the system run itself, omni-evolution lets the system keep getting stronger.**
 
