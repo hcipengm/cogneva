@@ -235,4 +235,36 @@ mod tests {
             "字节原样带过去；丢了这一格，死信队列就只剩一条『有个消息死了』的读数"
         );
     }
+
+    /// 延迟投递的默认实现要真的延迟、再真的投出去——不是「报个成功就完」。
+    ///
+    /// 这一具后端不覆写 `delay_publish`，走的就是契约默认体。默认体曾经是 `Ok(())`：
+    /// 调用方拿到成功，消息没了——一个「不丢消息」的方法把消息丢了，而丢的方式恰好是
+    /// 任何调用点都看不见的那种。断言因此必须落在**消息真的到了**上：只断言返回 `Ok`
+    /// 的话，那条缺陷原样能过。等长也用 `timeout` 兜底，让「没投」表现为红而不是挂住。
+    #[tokio::test]
+    async fn a_delayed_publish_waits_then_delivers_instead_of_just_reporting_success() {
+        let backend = MemoryMessageBackend::new();
+        let mut stream = backend
+            .subscribe("delayed:subject", "g")
+            .await
+            .expect("subscribe before the publish");
+
+        let started = std::time::Instant::now();
+        backend
+            .delay_publish("delayed:subject", b"late but here", 50)
+            .await
+            .expect("the default reports the publish");
+        assert!(
+            started.elapsed().as_millis() >= 50,
+            "默认体先等满 delay_ms 再投，不该提前返回"
+        );
+
+        let (_, payload) = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("延迟投递必须真的到达，而不是只报成功")
+            .expect("stream stays open")
+            .expect("readable message");
+        assert_eq!(payload, b"late but here");
+    }
 }
