@@ -1,9 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use cog_core::{SFResult, SkillRegistry, VectorBackend};
+use cog_core::{SFError, SFResult, SkillRegistry};
 
 use crate::indexer::WikiIndexer;
+use crate::unified_knowledge_backend::clip;
+use crate::vector_index::WikiVectorIndex;
 
 /// A single search result from any tier.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -20,17 +22,22 @@ pub struct WikiSearchResult {
 /// Search strategy:
 /// 1. **Index tier** reads `index.md` to locate relevant directories, then
 ///    BM25-ranks documents within those directories.
-/// 2. **Vector tier** (optional) performs semantic similarity search via the
-///    configured `VectorBackend`.  Document-level embeddings are used (no
-///    chunking).
+/// 2. **Vector tier** (optional) performs semantic similarity search through a
+///    [`WikiVectorIndex`].  Document-level embeddings are used (no chunking).
 /// 3. **Skill tier** (optional) queries the `SkillRegistry` for structured
 ///    skill matches that map to wiki domains.
 ///
 /// Results from all tiers are merged and deduplicated by `doc_id`, keeping
 /// the highest score.
+///
+/// The vector tier takes an index rather than a bare `VectorBackend` because a
+/// query arrives as text and a backend cannot turn text into a vector on its
+/// own: handed a backend with no embedder beside it, the tier has no way to
+/// answer, which is how the tier came to be written as a stub that returned
+/// nothing while the backend field made it look wired.
 pub struct ThreeTierSearch<'a> {
     indexer: &'a WikiIndexer,
-    vector_backend: Option<&'a dyn VectorBackend>,
+    vector_index: Option<&'a WikiVectorIndex>,
     skill_registry: Option<&'a SkillRegistry>,
 }
 
@@ -38,13 +45,13 @@ impl<'a> ThreeTierSearch<'a> {
     pub fn new(indexer: &'a WikiIndexer) -> Self {
         Self {
             indexer,
-            vector_backend: None,
+            vector_index: None,
             skill_registry: None,
         }
     }
 
-    pub fn set_vector_backend(&mut self, backend: Option<&'a dyn VectorBackend>) {
-        self.vector_backend = backend;
+    pub fn set_vector_index(&mut self, index: Option<&'a WikiVectorIndex>) {
+        self.vector_index = index;
     }
 
     pub fn set_skill_registry(&mut self, registry: Option<&'a SkillRegistry>) {
@@ -62,7 +69,7 @@ impl<'a> ThreeTierSearch<'a> {
         }
 
         // Tier 2: Vector (optional)
-        if self.vector_backend.is_some() {
+        if self.vector_index.is_some() {
             let vector_results = self.search_vector_tier(query, top_k).await?;
             for r in vector_results {
                 merged
@@ -126,7 +133,13 @@ impl<'a> ThreeTierSearch<'a> {
 
         for (doc_id, score) in bm25_results {
             if let Some(path) = self.indexer.doc_path(&doc_id) {
-                // Build a simple excerpt from the first non-empty paragraph
+                // Not an excerpt, and deliberately not an empty string: a BM25
+                // hit carries the terms it matched and the page they were in,
+                // and this tier's index holds no text to draw one from. An
+                // empty excerpt would read as a page with no words in it, so
+                // the placeholder stays visible until the tier can be handed
+                // the page it is describing. A reader that needs the words
+                // reads the page from the backend by `path`.
                 let excerpt = "...".to_string();
                 results.push(WikiSearchResult {
                     source: cog_core::SearchTier::Index,
@@ -150,15 +163,35 @@ impl<'a> ThreeTierSearch<'a> {
 
     async fn search_vector_tier(
         &self,
-        _query: &str,
-        _top_k: usize,
+        query: &str,
+        top_k: usize,
     ) -> SFResult<Vec<WikiSearchResult>> {
-        // Vector search requires an embedding for the query.
-        // In a real implementation this would call an embedding service
-        // to convert the query text to a vector, then search the backend.
-        // For now we return empty results — the integration point is wired.
-        tracing::debug!("Vector tier search called but no query embedding available");
-        Ok(vec![])
+        // Asking for a tier this search does not hold is a refusal, not an
+        // empty answer: `execute_single_tier(Vector)` on a search built without
+        // an index would otherwise be indistinguishable from a wiki in which
+        // nothing is similar to the query.
+        let Some(index) = self.vector_index else {
+            return Err(SFError::Config(
+                "the vector tier was asked for on a search with no vector index attached".into(),
+            ));
+        };
+
+        let hits = index.search_text(query, top_k).await?;
+        Ok(hits
+            .into_iter()
+            .map(|hit| WikiSearchResult {
+                source: cog_core::SearchTier::Vector,
+                doc_id: hit.document.id,
+                title: hit.document.title,
+                path: hit.document.path,
+                score: hit.score,
+                // The excerpt carries the page's text because the tier's own
+                // result type has nowhere else to put it, and clipped to the
+                // same bound the retrieval read side applies so that the two
+                // do not hand one caller rows of two different sizes.
+                excerpt: clip(&hit.document.content, crate::WIKI_PAGE_PROMPT_CHARS),
+            })
+            .collect())
     }
 
     async fn search_skill_tier(

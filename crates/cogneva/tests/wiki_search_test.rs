@@ -23,7 +23,7 @@ async fn test_three_tier_index_only() {
 
     let indexer = WikiIndexer::with_prefix(backend, "");
     let mut search = ThreeTierSearch::new(&indexer);
-    search.set_vector_backend(None);
+    search.set_vector_index(None);
     search.set_skill_registry(None);
 
     // Before building BM25 index, search returns empty

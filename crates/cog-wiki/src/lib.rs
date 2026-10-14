@@ -7,6 +7,7 @@ pub mod meilisearch;
 pub mod page;
 pub mod search;
 pub mod unified_knowledge_backend;
+pub mod vector_index;
 
 pub use bounds::WIKI_PAGE_PROMPT_CHARS;
 pub use indexer::{WikiIndexEntry, WikiIndexer};
@@ -19,5 +20,6 @@ pub use manager::WikiManager;
 pub use page::{WikiPage, WikiPageType};
 pub use search::{ThreeTierSearch, WikiSearchResult};
 pub use unified_knowledge_backend::UnifiedKnowledgeBackend;
+pub use vector_index::{IndexOutcome, WikiVectorIndex, DEFAULT_WIKI_COLLECTION};
 
 pub mod plugin;

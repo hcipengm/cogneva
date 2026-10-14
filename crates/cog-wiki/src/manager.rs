@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
-use cog_core::{ObjectBackend, SFResult, SkillRegistry, VectorBackend};
+use cog_core::{ObjectBackend, SFError, SFResult, SkillRegistry};
 
 use crate::indexer::WikiIndexer;
 use crate::search::{ThreeTierSearch, WikiSearchResult};
+use crate::vector_index::{IndexOutcome, WikiVectorIndex};
 
 /// Build a [`cog_core::WikiDocument`] from a key and content.
 fn wiki_doc_from_key(key: &str, content: &str) -> SFResult<cog_core::WikiDocument> {
@@ -71,7 +72,14 @@ pub struct WikiManager {
     object_backend: Arc<dyn ObjectBackend>,
     key_prefix: String,
     indexer: WikiIndexer,
-    vector_collection: String,
+    /// The semantic face, when this process holds one.
+    ///
+    /// Held here rather than passed per call because the object store is the
+    /// only thing that makes a document, and a caller that had to hand in the
+    /// index could hand in a different one -- or none, which is how this wiki
+    /// came to answer every query with the keyword face alone while the type
+    /// said it could search by meaning.
+    vector_index: Option<Arc<WikiVectorIndex>>,
 }
 
 impl WikiManager {
@@ -85,13 +93,23 @@ impl WikiManager {
             object_backend: object_backend.clone(),
             key_prefix: prefix.clone(),
             indexer: WikiIndexer::with_prefix(object_backend, prefix),
-            vector_collection: "wiki".into(),
+            vector_index: None,
         }
     }
 
-    pub fn with_vector_collection(mut self, name: impl Into<String>) -> Self {
-        self.vector_collection = name.into();
+    /// Attach the semantic face.
+    ///
+    /// The index carries its own embedding provider, so a manager built without
+    /// one is a manager whose `search` is the keyword tier and nothing else --
+    /// a state it reports rather than hides.
+    pub fn with_vector_index(mut self, index: Arc<WikiVectorIndex>) -> Self {
+        self.vector_index = Some(index);
         self
+    }
+
+    /// Whether this manager can answer a query the keywords do not cover.
+    pub fn has_vector_index(&self) -> bool {
+        self.vector_index.is_some()
     }
 
     fn make_key(&self, relative_path: &str) -> String {
@@ -112,18 +130,62 @@ impl WikiManager {
     }
 
     /// Ingest a markdown document into the wiki.
+    ///
+    /// Stores it and, when this manager holds a semantic face, indexes it in
+    /// the same call. Indexing here rather than in a pass of its own is what
+    /// makes "a document that is in the wiki can be found by meaning" hold: a
+    /// face filled by a later sweep is empty until that sweep runs, and an
+    /// empty face answers every query with nothing.
     pub async fn ingest_document(
         &self,
         relative_path: impl AsRef<std::path::Path>,
         content: impl Into<String>,
     ) -> SFResult<()> {
         let rel = relative_path.as_ref().to_string_lossy().replace('\\', "/");
+        let content = content.into();
         let key = self.make_key(&rel);
-        self.object_backend
-            .put(&key, content.into().as_bytes())
-            .await?;
+        self.object_backend.put(&key, content.as_bytes()).await?;
+        self.index_for_semantic_search(&rel, &content).await;
         Ok(())
     }
+
+    /// Put one document into the semantic face, reporting what happened.
+    ///
+    /// Never fails the ingest. By the time this runs the document is already in
+    /// the object store, and the keyword face already answers for it; turning a
+    /// missing embedder or a refused vector write into an ingest error would
+    /// take a working wiki down over a face that is meant to widen it. The
+    /// outcome is logged instead, because the difference between "no embedder"
+    /// and "indexed" is not otherwise readable from the wiki's own contents.
+    async fn index_for_semantic_search(&self, rel: &str, content: &str) {
+        let Some(index) = self.vector_index.as_ref() else {
+            return;
+        };
+        let doc = match wiki_doc_from_key(rel, content) {
+            Ok(doc) => doc,
+            Err(e) => {
+                tracing::warn!("wiki document {} could not be described for indexing: {}", rel, e);
+                return;
+            }
+        };
+        match index.index_document(&doc).await {
+            Ok(IndexOutcome::Indexed) => {}
+            Ok(IndexOutcome::NoEmbedder) => tracing::warn!(
+                "wiki document {} is stored but not searchable by meaning: no embedding provider is published",
+                rel
+            ),
+            Ok(IndexOutcome::EmptyEmbedding) => tracing::warn!(
+                "wiki document {} is stored but not searchable by meaning: the embedding provider returned no vector",
+                rel
+            ),
+            Err(e) => tracing::warn!(
+                "wiki document {} is stored but its vector was refused: {}",
+                rel,
+                e
+            ),
+        }
+    }
+
 
     /// Read a document from the wiki by relative path.
     pub async fn read_document(
@@ -176,15 +238,19 @@ impl WikiManager {
     }
 
     /// Execute a three-tier search across the wiki.
+    ///
+    /// The vector tier runs whenever this manager holds a semantic face. It
+    /// used to be reachable only through a `VectorBackend` argument, and since
+    /// a backend cannot turn a query into a vector, a caller passing one still
+    /// got nothing back.
     pub async fn search(
         &self,
         query: &str,
         top_k: usize,
-        vector_backend: Option<&dyn VectorBackend>,
         skill_registry: Option<&SkillRegistry>,
     ) -> SFResult<Vec<WikiSearchResult>> {
         let mut search = ThreeTierSearch::new(&self.indexer);
-        search.set_vector_backend(vector_backend);
+        search.set_vector_index(self.vector_index.as_deref());
         search.set_skill_registry(skill_registry);
         search.execute(query, top_k).await
     }
@@ -196,7 +262,8 @@ impl WikiManager {
         tier: cog_core::SearchTier,
         top_k: usize,
     ) -> SFResult<Vec<WikiSearchResult>> {
-        let search = ThreeTierSearch::new(&self.indexer);
+        let mut search = ThreeTierSearch::new(&self.indexer);
+        search.set_vector_index(self.vector_index.as_deref());
         search.execute_single_tier(query, tier, top_k).await
     }
 }
@@ -225,11 +292,42 @@ impl cog_core::WikiBackend for WikiManager {
 
     async fn delete_document(&self, relative_path: &str) -> SFResult<()> {
         let key = self.make_key(relative_path);
-        self.object_backend.delete(&key).await
+        self.object_backend.delete(&key).await?;
+        // The vector goes with the document. A point left behind is a page the
+        // wiki no longer holds that a query can still be handed, and the
+        // keyword face cannot undo that: its own copy is gone, so the vector
+        // face would be the only place still claiming the page exists.
+        if let Some(index) = self.vector_index.as_ref() {
+            let rel = relative_path.replace('\\', "/");
+            let id = rel.replace(['/', '\\'], "-");
+            if let Err(e) = index.remove_document(&id).await {
+                tracing::warn!(
+                    "wiki document {} was removed but its vector was not: {}",
+                    rel,
+                    e
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn semantic_search(
+        &self,
+        query_embedding: &[f32],
+        top_k: usize,
+    ) -> SFResult<Vec<cog_core::WikiSearchResult>> {
+        let Some(index) = self.vector_index.as_ref() else {
+            return Err(SFError::Config(
+                "this wiki has no semantic face: no vector index is attached, so a query \
+                 embedding cannot be answered here"
+                    .into(),
+            ));
+        };
+        index.semantic_search(query_embedding, top_k).await
     }
 
     async fn search(&self, query: &str, top_k: usize) -> SFResult<Vec<cog_core::WikiSearchResult>> {
-        let results = WikiManager::search(self, query, top_k, None, None).await?;
+        let results = WikiManager::search(self, query, top_k, None).await?;
         let mut typed = Vec::with_capacity(results.len());
         for r in results {
             typed.push(cog_core::WikiSearchResult {

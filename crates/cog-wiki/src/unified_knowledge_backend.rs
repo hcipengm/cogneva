@@ -90,14 +90,17 @@ impl Outcome {
 /// answer a query gives when the service is there and has nothing to hand
 /// back: a retrieval that comes up with nothing has to be able to say which of
 /// the two it was.
-enum MaybeService<T: ?Sized> {
+/// `pub(crate)` because the wiki's vector face stands on the same problem: it
+/// is built inside an `init` alongside the plugin that publishes its embedding
+/// provider, so it too has to defer that lookup to first use.
+pub(crate) enum MaybeService<T: ?Sized> {
     None,
     Ready(Arc<T>),
     Late(cog_core::LateService<T>),
 }
 
 impl<T: ?Sized + Send + Sync + 'static> MaybeService<T> {
-    fn resolve(&self) -> Option<Arc<T>> {
+    pub(crate) fn resolve(&self) -> Option<Arc<T>> {
         match self {
             MaybeService::None => None,
             MaybeService::Ready(service) => Some(service.clone()),
@@ -379,11 +382,37 @@ fn fold_decomposition(
 }
 
 /// The leading `max_chars` characters of `text`, never splitting one.
-fn clip(text: &str, max_chars: usize) -> String {
+pub(crate) fn clip(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
     }
     text.chars().take(max_chars).collect()
+}
+
+/// One wiki hit as the caller receives it.
+///
+/// Shared by both faces so that a page found by meaning and a page found by
+/// spelling arrive in the same shape: a reader that had to tell them apart by
+/// which field was filled would be reading the two faces separately, and the
+/// reranker above would be handed the same page in two shapes.
+fn wiki_entry(r: cog_core::WikiSearchResult) -> KnowledgeEntry {
+    KnowledgeEntry {
+        id: r.document.id.clone(),
+        source: "wiki".into(),
+        title: r.document.title.clone(),
+        // A page arrives whole and has no size bound of its own, unlike the
+        // memory rows above: those were already clipped by the layer that wrote
+        // them, so the two layers would otherwise hand the same caller rows
+        // whose sizes differ by whatever the wiki happens to hold. Clipped here,
+        // at the read side, because the backend has to go on returning the
+        // document it holds.
+        content: clip(&r.document.content, crate::WIKI_PAGE_PROMPT_CHARS),
+        relevance_score: r.score,
+        metadata: Some(serde_json::json!({
+            "path": r.document.path,
+            "match_type": r.match_type,
+        })),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -412,23 +441,35 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
             top_k
         };
 
+        // One embedding for the whole retrieval, computed before the layers
+        // because two of them read it: the memory layer ranks rows against it,
+        // and the wiki's vector face needs the same vector. Asking the provider
+        // once is not only one call instead of two -- it is the only way the
+        // two layers can be said to have answered the same query, since two
+        // calls are two chances to embed different text.
+        let query_embedding = if let Some(provider) = self.embedding.resolve() {
+            match provider.embed(vec![query.into()]).await {
+                Ok(mut vecs) if !vecs.is_empty() => Some(vecs.remove(0)),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::warn!("embedding failed for knowledge query: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // --- Memory layer ---
         if let Some(memory) = self.memory.resolve() {
-            let embedding = if let Some(provider) = self.embedding.resolve() {
-                match provider.embed(vec![query.into()]).await {
-                    Ok(mut vecs) if !vecs.is_empty() => Some(vecs.remove(0)),
-                    Ok(_) => None,
-                    Err(e) => {
-                        tracing::warn!("embedding failed for knowledge query: {}", e);
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-
             match memory
-                .search_all(NS_KNOWLEDGE, query, embedding.as_deref(), recall, None)
+                .search_all(
+                    NS_KNOWLEDGE,
+                    query,
+                    query_embedding.as_deref(),
+                    recall,
+                    None,
+                )
                 .await
             {
                 Ok(results) => {
@@ -477,38 +518,70 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
         }
 
         // --- Wiki layer ---
+        //
+        // Two faces, one layer. The keyword face answers a query that uses the
+        // words a page uses; the vector face answers one that does not, which
+        // is the only reason it exists. They share one outcome cell because the
+        // cell reads "what did the wiki layer give this retrieval": split into
+        // two cells, a wiki whose two faces disagree would read as two layers,
+        // and the series would stop meaning one thing per layer.
         if let Some(ref wiki) = self.wiki {
+            let mut contributed = 0usize;
+            let mut refused = false;
+            // A page both faces found is one page. The dedup is not cosmetic:
+            // the two faces score with different measures -- term overlap and
+            // cosine -- so keeping both rows would hand the caller, and the
+            // reranker behind it, the same document twice under two numbers
+            // that were never comparable.
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
             match wiki.search(query, recall).await {
                 Ok(results) => {
-                    let contributed = results.len();
                     for r in results {
-                        entries.push(KnowledgeEntry {
-                            id: r.document.id.clone(),
-                            source: "wiki".into(),
-                            title: r.document.title.clone(),
-                            // A page arrives whole and has no size bound of its
-                            // own, unlike the memory rows above: those were
-                            // already clipped by the layer that wrote them, so
-                            // the two layers would otherwise hand the same
-                            // caller rows whose sizes differ by whatever the
-                            // wiki happens to hold. Clipped here, at the read
-                            // side, because the backend has to go on returning
-                            // the document it holds.
-                            content: clip(&r.document.content, crate::WIKI_PAGE_PROMPT_CHARS),
-                            relevance_score: r.score,
-                            metadata: Some(serde_json::json!({
-                                "path": r.document.path,
-                                "match_type": r.match_type,
-                            })),
-                        });
+                        if seen.insert(r.document.id.clone()) {
+                            entries.push(wiki_entry(r));
+                            contributed += 1;
+                        }
                     }
-                    self.record(LAYER_WIKI, Outcome::of_rows(contributed)).await;
                 }
                 Err(e) => {
                     tracing::warn!("wiki search failed: {}", e);
-                    self.record(LAYER_WIKI, Outcome::Error).await;
+                    refused = true;
                 }
             }
+
+            // The vector face runs only when this process holds an embedder,
+            // which is also the only case in which it can be written. A wiki
+            // built without one is not a wiki that was asked and had nothing --
+            // it is a wiki with no such face, and the two must not share a
+            // reading.
+            if let Some(vector) = query_embedding.as_deref() {
+                match wiki.semantic_search(vector, recall).await {
+                    Ok(results) => {
+                        for r in results {
+                            if seen.insert(r.document.id.clone()) {
+                                entries.push(wiki_entry(r));
+                                contributed += 1;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("wiki semantic search failed: {}", e);
+                        refused = true;
+                    }
+                }
+            }
+
+            // One refused face makes the layer's cell `Error` even when the
+            // other face answered: "the wiki contributed fewer rows" is exactly
+            // what a refusal looks like from the outside, and telling them
+            // apart is the reason this series exists at all.
+            let outcome = if refused {
+                Outcome::Error
+            } else {
+                Outcome::of_rows(contributed)
+            };
+            self.record(LAYER_WIKI, outcome).await;
         } else {
             self.record(LAYER_WIKI, Outcome::Absent).await;
         }
@@ -1208,6 +1281,132 @@ mod tests {
             reranked.len(),
             2,
             "the answer is still top_k, not the window"
+        );
+    }
+
+    /// An embedder that always answers, so a retrieval can reach the wiki's
+    /// semantic face. What it embeds does not matter here: this test is about
+    /// the retrieval consulting the face and merging what it hands back, not
+    /// about how a model would rank the pages.
+    struct FixedEmbedder;
+
+    #[async_trait]
+    impl EmbeddingProvider for FixedEmbedder {
+        async fn embed(&self, texts: Vec<String>) -> SFResult<Vec<Vec<f32>>> {
+            Ok(texts.into_iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
+        }
+
+        async fn embed_sparse(
+            &self,
+            _texts: Vec<String>,
+        ) -> SFResult<Vec<cog_core::SparseEmbedding>> {
+            Ok(Vec::new())
+        }
+
+        fn supports_sparse(&self) -> bool {
+            false
+        }
+
+        fn model_id(&self) -> &str {
+            "fixed-test-embedder"
+        }
+
+        fn dimension(&self) -> usize {
+            3
+        }
+    }
+
+    /// A wiki whose two faces disagree, which is the ordinary case rather than
+    /// an arranged one: the keyword face finds the page that spells the query
+    /// out, the semantic face finds a page that never uses those words, and one
+    /// page is found by both.
+    struct TwoFacedWiki;
+
+    fn two_faced_row(id: &str, score: f32) -> WikiSearchResult {
+        WikiSearchResult {
+            document: WikiDocument {
+                id: id.into(),
+                path: format!("{id}.md"),
+                title: id.into(),
+                content: format!("{id} content"),
+                tags: None,
+                created_at: None,
+                updated_at: None,
+            },
+            score,
+            match_type: None,
+            highlights: Vec::new(),
+        }
+    }
+
+    #[async_trait]
+    impl WikiBackend for TwoFacedWiki {
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        fn provider_name(&self) -> &str {
+            "two-faced"
+        }
+
+        async fn ingest_document(&self, _relative_path: &str, _content: &str) -> SFResult<()> {
+            Ok(())
+        }
+
+        async fn search(&self, _query: &str, _top_k: usize) -> SFResult<Vec<WikiSearchResult>> {
+            Ok(vec![
+                two_faced_row("shared-page", 0.9),
+                two_faced_row("keyword-page", 0.5),
+            ])
+        }
+
+        async fn semantic_search(
+            &self,
+            _query_embedding: &[f32],
+            _top_k: usize,
+        ) -> SFResult<Vec<WikiSearchResult>> {
+            Ok(vec![
+                two_faced_row("shared-page", 0.9),
+                two_faced_row("semantic-page", 0.5),
+            ])
+        }
+    }
+
+    /// The wiki layer's semantic face is what answers a query whose words no
+    /// page uses, so a retrieval that consults only the keyword face returns
+    /// nothing for exactly the questions the face was added for -- and it
+    /// returns it as a shorter list, which no caller can tell from a wiki that
+    /// holds nothing relevant.
+    ///
+    /// The page both faces found appears once: the two faces score with term
+    /// overlap and cosine, so handing the same page up twice would put two
+    /// numbers that were never comparable in front of the reranker.
+    #[tokio::test]
+    async fn the_wiki_layer_answers_with_both_faces_and_each_page_once() {
+        let backend = UnifiedKnowledgeBackend::new()
+            .with_wiki(Arc::new(TwoFacedWiki))
+            .with_embedding(Arc::new(FixedEmbedder));
+        let task = Task::new(
+            "t1".to_string(),
+            cog_core::TaskType::Custom("test".into()),
+            serde_json::json!({}),
+        );
+
+        let entries = backend.retrieve_relevant(&task, "query", 5).await.unwrap();
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+
+        assert!(
+            ids.contains(&"keyword-page"),
+            "the keyword face's page is missing: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"semantic-page"),
+            "a page only the semantic face finds is the reason that face exists: {ids:?}"
+        );
+        assert_eq!(
+            ids.iter().filter(|id| **id == "shared-page").count(),
+            1,
+            "a page both faces found is one page: {ids:?}"
         );
     }
 

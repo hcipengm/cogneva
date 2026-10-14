@@ -181,7 +181,7 @@ async fn test_three_tier_search_index_tier() {
     let (_temp, mut mgr, _backend) = create_test_wiki().await;
     mgr.build_index().await.unwrap();
 
-    let results = mgr.search("setup docker", 2, None, None).await.unwrap();
+    let results = mgr.search("setup docker", 2, None).await.unwrap();
     assert!(!results.is_empty());
     assert!(results[0].path.contains("setup"));
     assert_eq!(results[0].source, SearchTier::Index);
@@ -192,7 +192,7 @@ async fn test_three_tier_search_no_backend_returns_index_results() {
     let (_temp, mut mgr, _backend) = create_test_wiki().await;
     mgr.build_index().await.unwrap();
 
-    let results = mgr.search("JWT tokens", 5, None, None).await.unwrap();
+    let results = mgr.search("JWT tokens", 5, None).await.unwrap();
     assert!(!results.is_empty());
 }
 
@@ -202,7 +202,7 @@ async fn test_three_tier_search_dedup_by_doc_id() {
     mgr.build_index().await.unwrap();
 
     // Even if multiple tiers match the same doc, it should appear once
-    let results = mgr.search("authentication", 10, None, None).await.unwrap();
+    let results = mgr.search("authentication", 10, None).await.unwrap();
     let auth_count = results.iter().filter(|r| r.path.contains("auth")).count();
     assert_eq!(auth_count, 1);
 }

@@ -94,11 +94,38 @@ impl cog_core::SystemPlugin for WikiPlugin {
     }
 }
 
+/// Build the wiki's semantic face over whatever this process holds.
+///
+/// Returns `None` when no vector store is published, which is a wiki that
+/// answers by keyword only. That is a state worth a warning at wiring time and
+/// not a silence: every query whose words no page uses comes back empty from
+/// such a wiki, and nothing downstream can tell that from a wiki that holds
+/// nothing relevant.
+fn build_vector_index(ctx: &cog_core::PluginContext) -> Option<Arc<crate::WikiVectorIndex>> {
+    let Some(vector) = ctx.consume_service::<dyn cog_core::VectorBackend>() else {
+        warn!(
+            "no VectorBackend published; the wiki will answer by keyword only and a query \
+             whose words no page uses will find nothing"
+        );
+        return None;
+    };
+    Some(Arc::new(crate::WikiVectorIndex::new(
+        vector,
+        crate::vector_index::DEFAULT_WIKI_COLLECTION,
+        cog_core::LateService::new(ctx.clone()),
+    )))
+}
+
 async fn build_wiki_adapter(
     config: &cog_core::Config,
     ctx: &cog_core::PluginContext,
 ) -> cog_core::SFResult<Option<Arc<dyn cog_core::WikiBackend>>> {
     let strict = config.system.strict_persistence;
+    let vector_index = build_vector_index(ctx);
+    // Read once here, before either branch moves the index into the backend:
+    // whether the wiki can search by meaning is the one fact about this wiring
+    // that no later reading of the wiki's own contents can recover.
+    let has_semantic_face = vector_index.is_some();
 
     if let Some(ref wiki_cfg) = config.providers.wiki {
         if wiki_cfg.enabled && wiki_cfg.provider == "meilisearch" {
@@ -113,12 +140,16 @@ async fn build_wiki_adapter(
                 .get("index")
                 .and_then(|v| v.as_str())
                 .unwrap_or("wiki");
-            let adapter = crate::meilisearch::MeilisearchWikiBackend::new(host, api_key, index);
+            let mut adapter = crate::meilisearch::MeilisearchWikiBackend::new(host, api_key, index);
+            if let Some(index) = vector_index.clone() {
+                adapter = adapter.with_vector_index(index);
+            }
             if cog_core::WikiBackend::health_check(&adapter).await {
                 tracing::info!(
-                    "WikiBackend initialized: provider=meilisearch host={} index={}",
+                    "WikiBackend initialized: provider=meilisearch host={} index={} semantic={}",
                     host,
-                    index
+                    index,
+                    has_semantic_face
                 );
                 return Ok(Some(Arc::new(adapter)));
             }
@@ -143,8 +174,14 @@ async fn build_wiki_adapter(
         }
         return Ok(None);
     };
-    let adapter = crate::WikiManager::new(object_backend);
-    tracing::info!("WikiBackend initialized: provider=local-wiki prefix=wiki");
+    let mut adapter = crate::WikiManager::new(object_backend);
+    if let Some(index) = vector_index {
+        adapter = adapter.with_vector_index(index);
+    }
+    tracing::info!(
+        "WikiBackend initialized: provider=local-wiki prefix=wiki semantic={}",
+        has_semantic_face
+    );
     Ok(Some(Arc::new(adapter)))
 }
 
