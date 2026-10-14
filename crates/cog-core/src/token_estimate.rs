@@ -42,9 +42,22 @@ const ENGLISH_WORD_TOKENS: usize = 4;
 /// 折算」与「一个英文词的代价」里大的那个：短词与旧口径逐字同价，长词随长度涨。
 /// 一个不含空白的整块是一个词，于是它的价随它的长度走——长度就是这种文本
 /// 唯一的成本，没有空格不该是它免费的理由。
+///
+/// 下限加在**词**上、不加在分支上：混排词里的非 CJK 部分**不比它单独成词时便宜**。
+/// 否则给一个词添一个汉字会让它降价（`aa` 记 4、`a中` 记 3），估算就不再单调——
+/// 而估算是预算的**下界**，一段内容多加一点反而算得更少，是按它裁剪的那一侧
+/// 唯一不能有的方向。汉字本身仍是 2（一个纯汉字词不受这条影响）。
 fn word_cost(cjk_chars: usize, other_chars: usize) -> usize {
-    if cjk_chars > 0 {
-        cjk_chars * 2 + other_chars.div_ceil(CHARS_PER_TOKEN)
+    (cjk_chars * 2 + other_chars.div_ceil(CHARS_PER_TOKEN)).max(non_cjk_part_cost(other_chars))
+}
+
+/// 一个词里**纯非 CJK 的那一部分**单独成词时的代价。
+///
+/// 没有非 CJK 字符就是 0：一个词的全部字符都是汉字时，它的价只有汉字那一半，
+/// 不该被一个并不存在的英文词抬起来。
+fn non_cjk_part_cost(other_chars: usize) -> usize {
+    if other_chars == 0 {
+        0
     } else {
         other_chars
             .div_ceil(CHARS_PER_TOKEN)
@@ -190,5 +203,51 @@ mod tests {
     #[test]
     fn a_mixed_word_prices_both_scripts() {
         assert_eq!(estimate_tokens("部署done"), 5);
+    }
+
+    /// 加一个字符不会让估算**变便宜**。
+    ///
+    /// 单调性是估算是**预算下界**的前提：按它裁剪的那一侧要能说「内容多了，账只会
+    /// 更多」。一段文本多加一个字符反而算得更少，裁剪就没有方向了。这里量的是**性质**
+    /// 不是几个数——逐字符把可加的都试一遍，改口径时它替我们守住这个方向。
+    #[test]
+    fn adding_a_character_never_lowers_the_estimate() {
+        let bases = [
+            "",
+            "a",
+            "aa",
+            "aaaa",
+            "aaaaaaaaa",
+            "zzzzzzzzzzzzzzzzz",
+            "alpha",
+            "中",
+            "中文",
+            "部署done",
+        ];
+        for base in bases {
+            let before = estimate_tokens(base);
+            for ch in ['a', 'Z', '4', '.', '中', '文', ' '] {
+                let after = estimate_tokens(&format!("{base}{ch}"));
+                assert!(
+                    after >= before,
+                    "「{base}」记 {before} token，加一个 {ch:?} 之后记 {after}：内容多了账反而少了"
+                );
+            }
+        }
+    }
+
+    /// 混排词里的非 CJK 部分**不比它单独成词时便宜**：`aa` 记 4，`a中` 就不该记 3。
+    ///
+    /// 这是上一条性质当初破的那个形状——旧口径把下限只加在非 CJK 分支上，于是给一个
+    /// 词添一个汉字会让它降价。修法是把下限加在**词**上，不是把汉字抬价：
+    #[test]
+    fn a_cjk_character_never_discounts_the_word_it_joins() {
+        assert_eq!(estimate_tokens("aa"), 4);
+        assert_eq!(estimate_tokens("a中"), 4, "添了一个汉字，价不该低于添之前");
+        // 反过来钉住修法没走错路：纯汉字词仍按 2/字，一个字记 2（没被那条下限抬高）。
+        assert_eq!(estimate_tokens("中"), 2);
+        // 非 CJK 部分本来就超过下限的词，价一分不变。
+        assert_eq!(estimate_tokens("部署done"), 5);
+        assert_eq!(estimate_tokens("K3s沙盒"), 5);
     }
 }
