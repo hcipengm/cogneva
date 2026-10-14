@@ -9,8 +9,6 @@ repository.workspace = true
 
 [dependencies]
 cog-core = { workspace = true }
-cog-redis = { workspace = true }
-cog-storage = { workspace = true }
 
 async-trait = "0.1"
 axum = { workspace = true }
@@ -19,7 +17,6 @@ tower-http = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 
-redis = { workspace = true }
 sqlx = { workspace = true }
 
 serde = { workspace = true }

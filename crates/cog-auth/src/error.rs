@@ -120,12 +120,6 @@ impl From<sqlx::Error> for AuthError {
     }
 }
 
-impl From<redis::RedisError> for AuthError {
-    fn from(e: redis::RedisError) -> Self {
-        AuthError::RedisError(e.to_string())
-    }
-}
-
 impl From<bcrypt::BcryptError> for AuthError {
     fn from(e: bcrypt::BcryptError) -> Self {
         AuthError::HashError(e.to_string())

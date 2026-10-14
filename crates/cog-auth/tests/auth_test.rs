@@ -3,7 +3,7 @@ use cog_auth::{
     jwt::{JwtConfig, JwtManager},
     RoleChecker, SessionManager,
 };
-use cog_core::{Permission, Role, SessionInfo, User, UserStatus, UserType};
+use cog_core::{KeyValueStore, Permission, Role, SessionInfo, User, UserStatus, UserType};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -227,62 +227,129 @@ fn rbac_org_admin_has_user_admin() {
 }
 
 // ---------------------------------------------------------------------------
-// Session tests against a real Redis-backed session store
+// Session tests against an in-memory key-value store
 // ---------------------------------------------------------------------------
 
-/// Redis endpoint for the session suite. CI supplies one through a service
-/// container; a developer machine usually has one on the default port.
+/// An in-memory [`KeyValueStore`] for the session suite.
 ///
-/// Callers must tolerate its absence: the suite also runs inside the
-/// evolution sandbox, which has no Redis, and a red suite there would say
-/// nothing about the code under test.
-fn test_redis_url() -> String {
-    std::env::var("COGNEVA_TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into())
+/// The session manager speaks the core contract, so its tests no longer need a
+/// running Redis — which is the point of the contract: a test supplies its own
+/// implementation rather than linking a neighbour's driver and inheriting that
+/// neighbour's fixtures. The suite therefore runs everywhere, including the
+/// evolution sandbox, instead of skipping where no server happens to be up.
+///
+/// Values are stored without expiry: these tests exercise the key layout, the
+/// JSON round-trip and the per-user session set, not expiry, so a TTL is
+/// accepted and ignored. Expiry is the driver's behaviour, and its tests belong
+/// with the driver.
+#[derive(Default)]
+struct FakeStore {
+    strings: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    sets: std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>,
 }
 
-/// Connect to the session store, or return `None` when none is reachable so
-/// the test can skip instead of panicking.
-async fn open_test_redis() -> Option<redis::aio::ConnectionManager> {
-    open_test_redis_at(&test_redis_url()).await
-}
+#[async_trait::async_trait]
+impl KeyValueStore for FakeStore {
+    async fn get(&self, key: &str) -> cog_core::SFResult<Option<String>> {
+        Ok(self.strings.lock().unwrap().get(key).cloned())
+    }
 
-/// The endpoint is a parameter so the skip rule can be checked without
-/// mutating the environment the parallel session tests read.
-async fn open_test_redis_at(redis_url: &str) -> Option<redis::aio::ConnectionManager> {
-    let client = match redis::Client::open(redis_url) {
-        Ok(client) => client,
-        Err(e) => {
-            eprintln!("SKIP: unusable Redis url ({e})");
-            return None;
+    async fn set(&self, key: &str, value: &str) -> cog_core::SFResult<()> {
+        self.strings
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), value.to_string());
+        Ok(())
+    }
+
+    async fn set_ex(&self, key: &str, value: &str, _ttl_secs: u64) -> cog_core::SFResult<()> {
+        self.set(key, value).await
+    }
+
+    async fn del(&self, key: &str) -> cog_core::SFResult<()> {
+        self.strings.lock().unwrap().remove(key);
+        Ok(())
+    }
+
+    async fn expire(&self, _key: &str, _ttl_secs: i64) -> cog_core::SFResult<()> {
+        Ok(())
+    }
+
+    async fn ttl(&self, _key: &str) -> cog_core::SFResult<i64> {
+        Ok(-1)
+    }
+
+    async fn incr(&self, key: &str, by: i64) -> cog_core::SFResult<i64> {
+        let mut strings = self.strings.lock().unwrap();
+        let next = strings
+            .get(key)
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0)
+            + by;
+        strings.insert(key.to_string(), next.to_string());
+        Ok(next)
+    }
+
+    async fn decr(&self, key: &str, by: i64) -> cog_core::SFResult<i64> {
+        self.incr(key, -by).await
+    }
+
+    async fn sadd(&self, key: &str, member: &str) -> cog_core::SFResult<()> {
+        self.sets
+            .lock()
+            .unwrap()
+            .entry(key.to_string())
+            .or_default()
+            .insert(member.to_string());
+        Ok(())
+    }
+
+    async fn srem(&self, key: &str, member: &str) -> cog_core::SFResult<()> {
+        if let Some(set) = self.sets.lock().unwrap().get_mut(key) {
+            set.remove(member);
         }
-    };
-    match cog_redis::connect(&client).await {
-        Ok(conn) => Some(conn),
-        Err(e) => {
-            eprintln!("SKIP: no Redis reachable ({e})");
-            None
-        }
+        Ok(())
+    }
+
+    async fn smembers(&self, key: &str) -> cog_core::SFResult<Vec<String>> {
+        Ok(self
+            .sets
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    async fn hset(&self, _key: &str, _field: &str, _value: &str) -> cog_core::SFResult<()> {
+        unreachable!("the session store does not use hash fields")
+    }
+
+    async fn hget(&self, _key: &str, _field: &str) -> cog_core::SFResult<Option<String>> {
+        unreachable!("the session store does not use hash fields")
+    }
+
+    async fn hdel(&self, _key: &str, _field: &str) -> cog_core::SFResult<()> {
+        unreachable!("the session store does not use hash fields")
+    }
+
+    async fn hvals(&self, _key: &str) -> cog_core::SFResult<Vec<String>> {
+        unreachable!("the session store does not use hash fields")
+    }
+
+    async fn hlen(&self, _key: &str) -> cog_core::SFResult<u64> {
+        unreachable!("the session store does not use hash fields")
     }
 }
 
-/// The sandbox has no Redis. A connection failure there has to read as "not
-/// applicable" rather than as a broken session store, or the verdict says
-/// which services happened to be up instead of whether the change is sound.
-#[tokio::test]
-async fn unreachable_redis_skips_instead_of_panicking() {
-    let conn = open_test_redis_at("redis://127.0.0.1:1").await;
-    assert!(
-        conn.is_none(),
-        "an unreachable Redis must skip, not connect"
-    );
+/// A session manager over a fresh in-memory store.
+fn session_manager() -> SessionManager {
+    SessionManager::new(std::sync::Arc::new(FakeStore::default()))
 }
 
 #[tokio::test]
 async fn session_create_and_get() {
-    let Some(redis) = open_test_redis().await else {
-        return;
-    };
-    let mgr = SessionManager::new(redis);
+    let mgr = session_manager();
 
     let user_id = Uuid::new_v4();
     let session = SessionInfo {
@@ -307,10 +374,7 @@ async fn session_create_and_get() {
 
 #[tokio::test]
 async fn session_refresh_updates_last_active() {
-    let Some(redis) = open_test_redis().await else {
-        return;
-    };
-    let mgr = SessionManager::new(redis);
+    let mgr = session_manager();
 
     let user_id = Uuid::new_v4();
     let session = SessionInfo {
@@ -333,10 +397,7 @@ async fn session_refresh_updates_last_active() {
 
 #[tokio::test]
 async fn session_destroy() {
-    let Some(redis) = open_test_redis().await else {
-        return;
-    };
-    let mgr = SessionManager::new(redis);
+    let mgr = session_manager();
 
     let user_id = Uuid::new_v4();
     let session = SessionInfo {
@@ -358,10 +419,7 @@ async fn session_destroy() {
 
 #[tokio::test]
 async fn session_destroy_all() {
-    let Some(redis) = open_test_redis().await else {
-        return;
-    };
-    let mgr = SessionManager::new(redis);
+    let mgr = session_manager();
 
     let user_id = Uuid::new_v4();
     let s1 = SessionInfo {

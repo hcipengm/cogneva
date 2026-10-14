@@ -1,9 +1,9 @@
 use chrono::Utc;
-use redis::{aio::ConnectionManager, AsyncCommands};
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::error::{AuthError, AuthResult};
-use cog_core::SessionInfo;
+use cog_core::{KeyValueStore, SessionInfo};
 
 /// Session TTL in seconds (7 days).
 const SESSION_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -16,17 +16,32 @@ fn user_sessions_key(user_id: Uuid) -> String {
     format!("user_sessions:{user_id}")
 }
 
-/// Redis-backed session manager.
+/// Map a store failure into the auth error type.
+///
+/// The store reports a cache failure as `SFError::Redis`; keeping that as
+/// `AuthError::RedisError` rather than letting it fall through the blanket
+/// `From<SFError>` (which maps to `Internal`) preserves the `redis_error` code
+/// the HTTP layer already returns for a cache outage.
+fn store_error(e: cog_core::SFError) -> AuthError {
+    AuthError::RedisError(e.to_string())
+}
+
+/// Key-value-backed session manager.
+///
+/// Holds the contract rather than a driver connection: the session payloads are
+/// JSON strings and the bookkeeping is a set of session ids per user, both of
+/// which [`KeyValueStore`] covers, so this crate links no cache implementation.
 #[derive(Clone)]
 pub struct SessionManager {
-    redis: std::sync::Arc<tokio::sync::Mutex<ConnectionManager>>,
+    store: Arc<dyn KeyValueStore>,
     ttl_seconds: u64,
 }
 
 impl SessionManager {
-    pub fn new(redis: ConnectionManager) -> Self {
+    /// Build a session manager over a key-value store.
+    pub fn new(store: Arc<dyn KeyValueStore>) -> Self {
         Self {
-            redis: std::sync::Arc::new(tokio::sync::Mutex::new(redis)),
+            store,
             ttl_seconds: SESSION_TTL_SECONDS,
         }
     }
@@ -37,23 +52,22 @@ impl SessionManager {
         let key = session_redis_key(session.user_id, session_id);
         let value = serde_json::to_string(&session)?;
 
-        let mut conn = self.redis.lock().await;
-        let _: () = conn
-            .set_ex(&key, value, self.ttl_seconds)
+        self.store
+            .set_ex(&key, &value, self.ttl_seconds)
             .await
-            .map_err(|e| AuthError::RedisError(e.to_string()))?;
+            .map_err(store_error)?;
 
         // Track session in user's session set
         let set_key = user_sessions_key(session.user_id);
-        let _: () = conn
-            .sadd(&set_key, session_id.to_string())
+        self.store
+            .sadd(&set_key, &session_id.to_string())
             .await
-            .map_err(|e| AuthError::RedisError(e.to_string()))?;
+            .map_err(store_error)?;
         // Expire the set key alongside individual sessions
-        let _: () = conn
+        self.store
             .expire(&set_key, self.ttl_seconds as i64)
             .await
-            .map_err(|e| AuthError::RedisError(e.to_string()))?;
+            .map_err(store_error)?;
 
         Ok(session_id)
     }
@@ -61,11 +75,7 @@ impl SessionManager {
     /// Retrieve a session by user ID and session ID.
     pub async fn get(&self, user_id: Uuid, session_id: Uuid) -> AuthResult<Option<SessionInfo>> {
         let key = session_redis_key(user_id, session_id);
-        let mut conn = self.redis.lock().await;
-        let value: Option<String> = conn
-            .get(&key)
-            .await
-            .map_err(|e| AuthError::RedisError(e.to_string()))?;
+        let value = self.store.get(&key).await.map_err(store_error)?;
 
         match value {
             Some(v) => {
@@ -80,11 +90,7 @@ impl SessionManager {
     /// Refresh the TTL of an existing session and update `last_active`.
     pub async fn refresh(&self, user_id: Uuid, session_id: Uuid) -> AuthResult<()> {
         let key = session_redis_key(user_id, session_id);
-        let mut conn = self.redis.lock().await;
-        let value: Option<String> = conn
-            .get(&key)
-            .await
-            .map_err(|e| AuthError::RedisError(e.to_string()))?;
+        let value = self.store.get(&key).await.map_err(store_error)?;
 
         let mut session: SessionInfo = match value {
             Some(v) => serde_json::from_str(&v).map_err(|e| AuthError::Internal(e.to_string()))?,
@@ -94,10 +100,10 @@ impl SessionManager {
         session.last_active = Utc::now();
         let updated = serde_json::to_string(&session)?;
 
-        let _: () = conn
-            .set_ex(&key, updated, self.ttl_seconds)
+        self.store
+            .set_ex(&key, &updated, self.ttl_seconds)
             .await
-            .map_err(|e| AuthError::RedisError(e.to_string()))?;
+            .map_err(store_error)?;
 
         Ok(())
     }
@@ -105,17 +111,13 @@ impl SessionManager {
     /// Destroy a single session.
     pub async fn destroy(&self, user_id: Uuid, session_id: Uuid) -> AuthResult<()> {
         let key = session_redis_key(user_id, session_id);
-        let mut conn = self.redis.lock().await;
-        let _: () = conn
-            .del(&key)
-            .await
-            .map_err(|e| AuthError::RedisError(e.to_string()))?;
+        self.store.del(&key).await.map_err(store_error)?;
 
         let set_key = user_sessions_key(user_id);
-        let _: () = conn
-            .srem(&set_key, session_id.to_string())
+        self.store
+            .srem(&set_key, &session_id.to_string())
             .await
-            .map_err(|e| AuthError::RedisError(e.to_string()))?;
+            .map_err(store_error)?;
 
         Ok(())
     }
@@ -123,24 +125,14 @@ impl SessionManager {
     /// Destroy all sessions for a user.
     pub async fn destroy_all(&self, user_id: Uuid) -> AuthResult<()> {
         let set_key = user_sessions_key(user_id);
-        let mut conn = self.redis.lock().await;
-        let session_ids: Vec<String> = conn
-            .smembers(&set_key)
-            .await
-            .map_err(|e| AuthError::RedisError(e.to_string()))?;
+        let session_ids = self.store.smembers(&set_key).await.map_err(store_error)?;
 
         for sid in session_ids {
             let key = format!("session:{user_id}:{sid}");
-            let _: () = conn
-                .del(&key)
-                .await
-                .map_err(|e| AuthError::RedisError(e.to_string()))?;
+            self.store.del(&key).await.map_err(store_error)?;
         }
 
-        let _: () = conn
-            .del(&set_key)
-            .await
-            .map_err(|e| AuthError::RedisError(e.to_string()))?;
+        self.store.del(&set_key).await.map_err(store_error)?;
 
         Ok(())
     }

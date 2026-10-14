@@ -580,6 +580,18 @@ impl cog_core::SystemPlugin for StoragePlugin {
         info!("Redis connection established");
         ctx.publish(Arc::new(RedisClient(redis_client)));
 
+        // The key-value contract, over the same shared connection the rest of
+        // this crate's backends use. Published as a service rather than handing
+        // consumers this crate's driver handle: a session manager or a quota
+        // counter needs the operations, not the driver, and a consumer that
+        // links the driver is a consumer that rebuilds whenever the driver
+        // moves. The driver handle above stays published for the callers that
+        // genuinely need to open their own connection.
+        let key_value_store: Arc<dyn cog_core::KeyValueStore> =
+            Arc::new(crate::RedisKeyValueStore::new(redis_conn.clone()));
+        ctx.publish_service(key_value_store);
+        info!("StoragePlugin key-value store published");
+
         // ── Dead-letter queue (Redis) ──
         //
         // The executor moves a task here after `fail_task` reports that it can

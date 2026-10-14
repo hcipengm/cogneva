@@ -34,6 +34,7 @@ pub use contract::guardrail::*;
 pub use contract::hook::*;
 pub use contract::host_documents;
 pub use contract::knowledge::*;
+pub use contract::kv::*;
 pub use contract::llm::*;
 pub use contract::media::*;
 pub use contract::memory::*;
