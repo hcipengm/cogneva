@@ -3433,6 +3433,11 @@ async fn stream_forward(
     // 直接 503 + Retry-After 让调用方立刻知道何时可再来。
     if let Some((retry_after, quota_window)) = state.pool_circuit_break(&candidates) {
         tracing::warn!(
+            // 拒绝面必须自称：503 是熔断期"一个上游都没试"的结果，与"试遍了
+            // 都不行"在状态码、在响应体上都同形（两者都可能是 503），唯一分得开
+            // 的地方就是这一行。没有它，读者只能从"这次花了多久"反推，而那是
+            // 一个会被网络抖动污染的代理量。
+            refused_by_circuit = true,
             retry_after_secs = retry_after,
             quota_window_secs = quota_window,
             "LLM 上游池当前无可用上游，快速失败 503"
@@ -3981,6 +3986,11 @@ async fn call_llm(
     let next_candidates: Vec<&LlmUpstream> = state.config.llm_upstreams.iter().collect();
     if let Some((retry_after, quota_window)) = state.pool_circuit_break(&next_candidates) {
         tracing::warn!(
+            // 拒绝面必须自称：503 是熔断期"一个上游都没试"的结果，与"试遍了
+            // 都不行"在状态码、在响应体上都同形（两者都可能是 503），唯一分得开
+            // 的地方就是这一行。没有它，读者只能从"这次花了多久"反推，而那是
+            // 一个会被网络抖动污染的代理量。
+            refused_by_circuit = true,
             retry_after_secs = retry_after,
             quota_window_secs = quota_window,
             "LLM 上游池当前无可用上游，快速失败 503"
