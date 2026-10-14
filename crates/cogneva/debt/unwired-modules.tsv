@@ -21,6 +21,3 @@
 # 契约测试没有东西可查。空表是合法终态，不是没登记。
 #
 file	disposition	destination
-crates/cog-extension/src/runtime/security.rs	pending-deletion
-crates/cogneva/src/build_cache_reclaim.rs	pending-deletion
-crates/cogneva/src/build_gate.rs	pending-deletion

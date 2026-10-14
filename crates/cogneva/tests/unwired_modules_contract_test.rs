@@ -316,11 +316,10 @@ fn code_only(text: &str) -> String {
         // A character literal holds exactly one character, escapes included. A lone
         // quote that opens neither is a lifetime, and the quote itself is code.
         if c[i] == '\'' {
-            let is_char = match (c.get(i + 1), c.get(i + 2)) {
-                (Some(&'\\'), _) => true,
-                (Some(_), Some(&'\'')) => true,
-                _ => false,
-            };
+            let is_char = matches!(
+                (c.get(i + 1), c.get(i + 2)),
+                (Some(&'\\'), _) | (Some(_), Some(&'\''))
+            );
             if is_char {
                 let start = i;
                 i += 1;
@@ -429,10 +428,7 @@ fn is_keyword(code: &[char], at: usize, word: &str) -> bool {
     if at > 0 && ident(code[at - 1]) {
         return false;
     }
-    match code.get(at + chars.len()) {
-        Some(c) if ident(*c) => false,
-        _ => true,
-    }
+    !matches!(code.get(at + chars.len()), Some(c) if ident(*c))
 }
 
 /// The directory a module's child modules are declared in.
@@ -536,7 +532,10 @@ fn every_rust_source_a_crate_carries_reaches_a_build_target() {
     // whole tree would read as unreached, which is a broken gate and not a finding.
     let mut universe: BTreeSet<PathBuf> = BTreeSet::new();
     for source in carried_sources() {
-        if members.keys().any(|dir| source.starts_with(dir.join("src"))) {
+        if members
+            .keys()
+            .any(|dir| source.starts_with(dir.join("src")))
+        {
             universe.insert(source);
         }
     }
@@ -605,7 +604,10 @@ fn every_debt_row_names_a_disposition_and_a_matching_destination() {
     let members = member_roots();
     let mut carried: BTreeSet<PathBuf> = BTreeSet::new();
     for source in carried_sources() {
-        if members.keys().any(|dir| source.starts_with(dir.join("src"))) {
+        if members
+            .keys()
+            .any(|dir| source.starts_with(dir.join("src")))
+        {
             carried.insert(source);
         }
     }

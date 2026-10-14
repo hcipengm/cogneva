@@ -535,6 +535,13 @@ fn reclaimable_file_bytes(stat: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// The mount the cgroup filesystem is read from on this host.
+///
+/// A cgroup namespace makes the process's own cgroup be `/` inside this mount, so
+/// joining the path out of `/proc/self/cgroup` onto it is right whether the
+/// container has a namespace of its own or not.
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
 impl BuildBudget {
     /// Reads this process's cgroup, if it has one and it is bounded.
     ///
@@ -546,16 +553,24 @@ impl BuildBudget {
     /// `cgroup_memory` about a number that had stopped describing the builds.
     fn read() -> Option<Self> {
         // Either a full path (`/kubepods.slice/...`) or `/` when the container
-        // has its own cgroup namespace; joining it onto the mount that the
-        // process can see is right either way, because a cgroup namespace makes
-        // `/` be the cgroup the process is in.
+        // has its own cgroup namespace.
         let text = std::fs::read_to_string("/proc/self/cgroup").ok()?;
         let path = text
             .lines()
             .find_map(|l| l.strip_prefix("0::"))
-            .unwrap_or("/")
-            .trim();
-        let base = Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/'));
+            .unwrap_or("/");
+        Self::read_at(Path::new(CGROUP_ROOT), path.trim())
+    }
+
+    /// Reads one cgroup out of a given filesystem root.
+    ///
+    /// The root is an argument rather than the constant itself so a test can aim
+    /// it at a fixture and move the limit between two reads. Nothing is
+    /// remembered between calls: the limit is re-derived from the files every
+    /// time, which is what lets a container whose memory limit is raised
+    /// mid-life stop being bound by the number it started with.
+    fn read_at(root: &Path, cgroup_path: &str) -> Option<Self> {
+        let base = root.join(cgroup_path.trim_start_matches('/'));
         let mem_max = read_u64_file(&base.join("memory.max"))?;
         let mem_current = read_u64_file(&base.join("memory.current"))?;
         // A cgroup whose accounting cannot be read is charged in full, which is
@@ -2679,6 +2694,44 @@ unevictable 28532736
             reclaimable_file_bytes(""),
             0,
             "and neither does a cgroup whose accounting cannot be parsed at all"
+        );
+    }
+
+    /// 同一个夹具，把 `memory.max` 抬上去之后再读一次，ceiling 必须跟着抬。
+    ///
+    /// 这是这个模块被欠下的那笔账：容量是**每次读现算**的，不是开机记住的——容器
+    /// 中生命期被抬高内存限额（改 manifest、换一台机器）之后，它不该继续被启动那一刻
+    /// 的数箍着。**射程说清**：这里钉的是「读这件事本身」每次重新从文件推，它钉不住
+    /// 「以后有人在它上面加一层一次性缓存」——两者在读数上同形，隔一层只能靠读代码。
+    /// 另外，`step()` 那条路上真值每 `BOUND_WINDOW` 才动一次，所以中生命期的调整是
+    /// **一个窗口之内**被看见、不是立刻；那个窗口是有意留的，不在这里判。
+    #[test]
+    fn a_raised_limit_is_seen_by_the_next_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let cg = dir.path().join("kubepods.slice/cogneva");
+        fs::create_dir_all(&cg).unwrap();
+        fs::write(cg.join("memory.current"), "1000000000").unwrap();
+        fs::write(cg.join("memory.stat"), "anon 1000000000\nfile 0\n").unwrap();
+        fs::write(cg.join("memory.max"), "4000000000").unwrap();
+
+        let before = BuildBudget::read_at(dir.path(), "/kubepods.slice/cogneva")
+            .unwrap()
+            .ceiling();
+
+        // 只改限额，别的一个字节不动。
+        fs::write(cg.join("memory.max"), "16000000000").unwrap();
+        let after = BuildBudget::read_at(dir.path(), "/kubepods.slice/cogneva")
+            .unwrap()
+            .ceiling();
+
+        assert!(
+            after > before,
+            "限额从 4 GB 抬到 16 GB，ceiling 却从 {before} 变成 {after}：读到的是记住的那个数"
+        );
+        // 抬上来的应当是**整个差**，不是在某个被挑中的数附近晃：高处那 12 GB 全进 ceiling。
+        assert!(
+            (after - before - 12_000_000_000f64 / BUILD_PEAK_RSS_BYTES as f64).abs() < 1e-9,
+            "抬高的 12 GB 没有整个进 ceiling：{before} -> {after}"
         );
     }
 
