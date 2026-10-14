@@ -402,7 +402,7 @@ Harness Engineering = 给 Agent 提供完整的执行环境（工具、上下文
 | **反馈（Feedback）** | `cog-reflection` L0-L3 自我进化：SelfReview → ReflectionEngine → EvolutionEngine |
 | **沙箱（Sandbox）** | `cog-agent` 运行时隔离 + `cog-supervisor` 监控-驱动闭环 |
 
-**Context Engineering（上下文工程）**——模型能看到什么，是唯一还握在手里的变量。模型能力在调用那一刻是固定的，剩下的旋钮只有三个：哪些知识进窗口、以什么形状进、装不下时怎么办。Cogneva 的立场是：**窗口里放的是完整记录中按预算放得下的那部分，它不等于记录本身**。
+**Context Engineering（上下文工程）**——harness engineering 的一个子集，也就是上表里的「上下文（Context）」这一格。模型能看到什么，是唯一还握在手里的变量。模型能力在调用那一刻是固定的，剩下的旋钮只有三个：哪些知识进窗口、以什么形状进、装不下时怎么办。Cogneva 的立场是：**窗口里放的是完整记录中按预算放得下的那部分，它不等于记录本身**。
 
 - **什么进**——三层记忆是检索后注入，不是拼接：Raw 事实、Schema 关系、Summary 语义各自回答不同类的问题；知识库先把全文与向量命中融合，再往 prompt 里送。
 - **什么形状**——Prompt 模板带版本、可热重载、可 A/B，所以「一个任务怎么被表述」本身是一次可度量的变更，而不是手工改字。

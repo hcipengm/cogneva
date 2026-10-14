@@ -404,7 +404,7 @@ Harness Engineering = providing Agents with a complete execution environment (to
 | **Feedback** | `cog-reflection` L0–L3 self-evolution: SelfReview → ReflectionEngine → EvolutionEngine |
 | **Sandbox** | `cog-agent` runtime isolation + `cog-supervisor` sense-decide-act loop |
 
-**Context engineering** — what the model gets to see is the one lever still in your hand. Model capability is fixed at call time, so the only knobs left are which knowledge enters the window, in what shape, and what happens when it does not fit. Cogneva's stance is that **the window holds the part of the record that fits the budget — it is not the record**:
+**Context engineering** — a subset of harness engineering: the Context element of the table above. What the model gets to see is the one lever still in your hand. Model capability is fixed at call time, so the only knobs left are which knowledge enters the window, in what shape, and what happens when it does not fit. Cogneva's stance is that **the window holds the part of the record that fits the budget — it is not the record**:
 
 - **What enters** — the three memory layers are retrieved and injected, not concatenated: raw facts, schema relations and semantic summaries each answer a different kind of question, and the knowledge base fuses full-text and vector hits before anything reaches the prompt.
 - **In what shape** — prompt templates are versioned, hot-reloadable and A/B-testable, so how a task is framed is a measurable change rather than a hand edit.
