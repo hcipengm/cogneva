@@ -1809,14 +1809,19 @@ async fn supervisor_status_handler(State(state): State<Arc<GatewayState>>) -> Re
         Some(ref supervisor) => {
             let report = supervisor.run_health_pass().await.unwrap_or_default();
             let snapshot = supervisor_status::SupervisorStatusSnapshot {
-                cycle: 0,
+                cycle: state.supervisor_event_cache.cycle(),
                 healthy_agents: report.healthy.len(),
                 dead_agents: report.dead.len(),
                 suspect_agents: report.suspect.len(),
                 stuck_agents: report.stuck.len(),
-                pending_handoffs: 0,
+                pending_handoffs: supervisor.autonomous_pending_count().await,
                 scheduler_paused: supervisor.gate().is_paused(),
-                last_rebalance: None,
+                // Read off the event channel, not the supervisor's mutex: that
+                // mutex is on no trait method, and the only event carrying a
+                // rebalance is `SupervisorEvent::Rebalance`, which fires when a
+                // plan moved something (not on every successful pass). See
+                // `SupervisorEventCache::last_rebalance`.
+                last_rebalance: state.supervisor_event_cache.last_rebalance(),
                 timestamp: chrono::Utc::now(),
             };
             (StatusCode::OK, Json(snapshot)).into_response()

@@ -50,17 +50,19 @@ pub struct ScaleRecommendation {
 
 /// Gateway-side cache of the supervisor's event channel.
 ///
-/// Two facts are read from the broadcast and nowhere else:
-/// - the last [`ScaleRecommendation`], and
+/// Three facts are read from the broadcast and nowhere else:
+/// - the last [`ScaleRecommendation`],
 /// - the last [`cog_core::SupervisorEvent::Tick`]'s `cycle`, which the
 ///   supervisor loop already broadcasts — its contract exposes no cycle
-///   accessor, so the tick is the only source.
+///   accessor, so the tick is the only source, and
+/// - the last [`cog_core::SupervisorEvent::Rebalance`]'s timestamp.
 #[derive(Debug, Default)]
 pub struct SupervisorEventCache {
     last_scale_recommendation: Mutex<Option<ScaleRecommendation>>,
     /// `0` reads as "no tick seen yet": the supervisor's cycle starts at 0 and
     /// its first tick carries 1.
     cycle: AtomicU64,
+    last_rebalance: Mutex<Option<DateTime<Utc>>>,
 }
 
 impl SupervisorEventCache {
@@ -84,6 +86,12 @@ impl SupervisorEventCache {
             cog_core::SupervisorEvent::Tick { cycle, .. } => {
                 self.cycle.store(*cycle, Ordering::Relaxed);
             }
+            cog_core::SupervisorEvent::Rebalance { timestamp, .. } => {
+                *self
+                    .last_rebalance
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(*timestamp);
+            }
             _ => {}
         }
     }
@@ -99,6 +107,22 @@ impl SupervisorEventCache {
     /// The last tick's cycle, or `0` before the first tick.
     pub fn cycle(&self) -> u64 {
         self.cycle.load(Ordering::Relaxed)
+    }
+
+    /// The last rebalance the supervisor reported, or `None` before any.
+    ///
+    /// This reads the last [`cog_core::SupervisorEvent::Rebalance`], which the
+    /// supervisor sends when a rebalance pass produced a non-empty plan, and
+    /// also when a health pass recovered checkpoints for dead agents. It is
+    /// therefore "the last rebalance that moved something", not "the last
+    /// successful rebalance pass" — the control plane's `last_rebalance` is
+    /// that other fact, read off a mutex no accessor exposes. The two names
+    /// answer different questions; do not read one as the other.
+    pub fn last_rebalance(&self) -> Option<DateTime<Utc>> {
+        *self
+            .last_rebalance
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -137,11 +161,39 @@ mod tests {
         }
     }
 
+    fn rebalance(at: DateTime<Utc>) -> cog_core::SupervisorEvent {
+        cog_core::SupervisorEvent::Rebalance {
+            ready_tasks: 1,
+            active_agents: 1,
+            plan_size: 1,
+            checkpoint_recoveries: 0,
+            timestamp: at,
+        }
+    }
+
     #[test]
     fn an_empty_cache_reads_as_no_recommendation_and_cycle_zero() {
         let cache = SupervisorEventCache::default();
         assert!(cache.scale_recommendation().is_none());
         assert_eq!(cache.cycle(), 0);
+        assert!(cache.last_rebalance().is_none());
+    }
+
+    #[test]
+    fn the_last_rebalance_wins_and_other_events_leave_it_alone() {
+        // `last_rebalance` has no accessor on the supervisor's contract either;
+        // the Rebalance event is its only source, so the tick and the scale
+        // recommendation must not move it.
+        let cache = SupervisorEventCache::default();
+        let first = Utc::now();
+        cache.observe(&rebalance(first));
+        cache.observe(&tick(3));
+        cache.observe(&scale(2, "ratio 1.1"));
+        assert_eq!(cache.last_rebalance(), Some(first));
+
+        let second = first + chrono::Duration::seconds(30);
+        cache.observe(&rebalance(second));
+        assert_eq!(cache.last_rebalance(), Some(second));
     }
 
     #[test]
