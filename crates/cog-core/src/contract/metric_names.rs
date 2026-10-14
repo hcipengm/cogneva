@@ -848,6 +848,30 @@ metric_names! {
     // cog-orchestrator — task delivery.
     DAG_STALLED_SCHEDULED_RECLAIMED => "cogneva_dag_stalled_scheduled_reclaimed_total",
 
+    // cog-orchestrator — what one change-ledger dispatch pass did with the set
+    // still owed, per tick.
+    //
+    // The ledger records a row per pass in its own table, and that row answers
+    // the question only while someone is querying the database: a curve that
+    // nothing serves to the metric store cannot be alerted on, and the shape
+    // that matters -- a set that is owed and is not coming down -- was published
+    // nowhere. Every count in the row is a cell here, named by `readout`, so the
+    // pass's own arithmetic is readable as a series and the reader can ask
+    // whether the debt fell without opening the table.
+    //
+    // The counts are published together because they only mean anything
+    // together: `pending` alone says work is owed, and the per-row outcomes say
+    // where this pass's share of it went. A pass that is holding work back has
+    // `held_back` where a pass that dispatched has `submitted`/`failed`, and the
+    // two columns of `decision` and `pool_reading` are the pass's own answer to
+    // "why this tick" -- so a reader who sees an unmoving debt reads the reason
+    // on the same series rather than inferring it from a second family.
+    //
+    // The values are the ones the pass wrote to its table, not a second
+    // computation: the reading face is a view of the account, and a view that
+    // measured again would be a second account.
+    CHANGE_DISPATCH_ROWS => "cogneva_change_dispatch_rows",
+
     // cog-orchestrator — keeping a running task's progress resumable.
     //
     // The write side of the resume chain: a task that loses its process (a

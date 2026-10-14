@@ -61,9 +61,10 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use cog_core::{
-    ChangeIdentity, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement, ChangeReading,
-    ChangeReopen, ChangeSource, ChangeState, DispatchDecision, DispatchState, LlmPoolStatus,
-    OrchestratorControl, OwnerLeaseBroker, PoolReading, ShutdownSignal, Task, TaskStatus, TaskType,
+    metric_names, ChangeIdentity, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement,
+    ChangeReading, ChangeReopen, ChangeSource, ChangeState, DispatchDecision, DispatchState,
+    LlmPoolStatus, MetricsBackend, OrchestratorControl, OwnerLeaseBroker, PoolReading,
+    ShutdownSignal, Task, TaskStatus, TaskType,
 };
 
 use cog_core::contract::llm::UpstreamFailure;
@@ -400,6 +401,7 @@ pub fn spawn_change_ledger_loop(
     role: Option<Arc<dyn OwnerLeaseBroker>>,
     orchestrator: Option<Arc<dyn OrchestratorControl>>,
     pool: Option<Arc<dyn cog_core::LlmPoolStatusSource>>,
+    metrics: Option<Arc<dyn MetricsBackend>>,
     shutdown: ShutdownSignal,
     tree: CheckTree,
 ) {
@@ -408,6 +410,7 @@ pub fn spawn_change_ledger_loop(
         arbitrated = role.is_some(),
         dispatching = orchestrator.is_some(),
         pool_gated = pool.is_some(),
+        readable = metrics.is_some(),
         "Change ledger loop enabled"
     );
     if orchestrator.is_none() {
@@ -433,6 +436,7 @@ pub fn spawn_change_ledger_loop(
             let role = role.clone();
             let orchestrator = orchestrator.clone();
             let pool = pool.clone();
+            let metrics = metrics.clone();
             let shutdown = shutdown.clone();
             let tree = tree.clone();
             async move {
@@ -494,7 +498,8 @@ pub fn spawn_change_ledger_loop(
                     // the same pass that found it, rather than one period later.
                     if let Some(ref orchestrator) = orchestrator {
                         let pool = pool.as_deref();
-                        dispatch_pass(&*store, orchestrator, &unsettled, pool).await;
+                        dispatch_pass(&*store, orchestrator, &unsettled, pool, metrics.as_ref())
+                            .await;
                     }
                 }
             }
@@ -1206,6 +1211,7 @@ async fn dispatch_pass(
     orchestrator: &Arc<dyn OrchestratorControl>,
     unsettled: &HashMap<ChangeIdentity, UnsettledCheck>,
     pool: Option<&dyn cog_core::LlmPoolStatusSource>,
+    metrics: Option<&Arc<dyn MetricsBackend>>,
 ) {
     // The read is bounded by the ledger's own census rather than by a number
     // chosen here, and it has to be that wide because of where pending rows sit
@@ -1273,10 +1279,76 @@ async fn dispatch_pass(
     // the process -- a pending set that nothing is acting on reads the same as a
     // pending set nobody has reached yet, which is how a whole day of dispatch
     // could land on a dead pool without the account saying so.
-    if verdict.decision == DispatchDecision::PausedLlmPoolUnavailable {
+    //
+    // The classification below runs either way. What the pause withholds is the
+    // handover, and only the handover: whether a task already holds a row, and
+    // whether the environment has already killed one, are answers that come from
+    // the graph and are not the pool's to give. A pass that wrote zeros for
+    // every count but `pending` on exactly the passes it exists to describe
+    // would be a reading face that is blind where it is read.
+    let pausing = verdict.decision == DispatchDecision::PausedLlmPoolUnavailable;
+
+    let rearm_limit = dispatch_rearm_limit();
+    let mut counts = TickCounts::default();
+    for row in &pending {
+        match owed_row(orchestrator, row, rearm_limit).await {
+            Owed::Held(Handover::DeadEnvironment) => counts.dead_environment += 1,
+            Owed::Held(_) => counts.already += 1,
+            Owed::NoTask { generation } => {
+                if pausing {
+                    // Owed, held by no task, and not handed over because this
+                    // pass decided to hand nothing over. Not `failed`: nothing
+                    // was attempted, and a refusal the pool never gave is not
+                    // this change's answer.
+                    counts.held_back += 1;
+                    continue;
+                }
+                if generation > 0 {
+                    counts.rearmed += 1;
+                }
+                let task_id = dispatch_task_id(&row.identity, generation);
+                let goal = dispatch_goal(row);
+                let task = Task::new(
+                    task_id,
+                    TaskType::Custom(DISPATCH_TASK_KIND.into()),
+                    serde_json::json!({
+                        "goal": goal,
+                        "evolution_mode": "generate_change",
+                        "task_kind": DISPATCH_TASK_KIND,
+                        "change_identity": {
+                            "kind": row.identity.kind,
+                            "scope": row.identity.scope,
+                            "literal": row.identity.literal,
+                        },
+                        "change_sources": row
+                            .sources
+                            .iter()
+                            .map(|source| source.doc.as_str())
+                            .collect::<Vec<_>>(),
+                    }),
+                );
+                match orchestrator.submit_goal_auto(&goal, vec![task]).await {
+                    Ok(_) => counts.submitted += 1,
+                    Err(e) => {
+                        counts.failed += 1;
+                        warn!(
+                            change = %row.identity,
+                            error = %e,
+                            "change ledger: a change still owed could not be handed over"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if pausing {
         warn!(
             pending = pending.len(),
             unmeasurable,
+            held_back = counts.held_back,
+            already_handed_over = counts.already,
+            already_dead_environment = counts.dead_environment,
             resume_at_unix = verdict.resume_at_unix,
             evidenced_recovery_unix = verdict.evidenced_recovery_unix,
             quota_window_secs = verdict.quota_window_secs,
@@ -1286,111 +1358,181 @@ async fn dispatch_pass(
                 .unwrap_or_default(),
             "change ledger: no configured upstream can serve, so this pass handed nothing over"
         );
-        record_dispatch_state(store, &verdict, pending.len(), 0, 0, 0, unmeasurable).await;
-        return;
-    }
-
-    let mut submitted = 0usize;
-    let mut already = 0usize;
-    let mut rearmed = 0usize;
-    let mut dead_environment = 0usize;
-    let mut failed = 0usize;
-    let rearm_limit = dispatch_rearm_limit();
-    for row in &pending {
-        // The graph is read before the submission rather than the submission's
-        // answer being read after it: the goal path treats a repeated id as a
-        // fault, so a pass that submitted blind would leave a line saying the
-        // handover failed while the change was in fact handed over. What is read
-        // is the row and not its presence: a change whose last handover the
-        // environment returned is still owed, and the id it already holds would
-        // otherwise read as work in progress for the rest of the account's life.
-        // The generation the handover goes out under is the first slot the graph
-        // does not hold.
-        let mut generation = 0u32;
-        let mut held: Option<Handover> = None;
-        while generation <= rearm_limit {
-            let id = dispatch_task_id(&row.identity, generation);
-            let Some(task) = orchestrator.get_task(&id).await else {
-                break;
-            };
-            match classify_handover(&task) {
-                // An environment's refusal is not this change's answer, so the
-                // next generation is where its handover goes -- unless the budget
-                // is spent, and then the change is left owed and named instead of
-                // re-filed forever.
-                Handover::DeadEnvironment if generation < rearm_limit => generation += 1,
-                verdict => {
-                    held = Some(verdict);
-                    break;
-                }
-            }
-        }
-        if let Some(verdict) = held {
-            match verdict {
-                Handover::DeadEnvironment => dead_environment += 1,
-                _ => already += 1,
-            }
-            continue;
-        }
-        if generation > 0 {
-            rearmed += 1;
-        }
-        let task_id = dispatch_task_id(&row.identity, generation);
-        let goal = dispatch_goal(row);
-        let task = Task::new(
-            task_id,
-            TaskType::Custom(DISPATCH_TASK_KIND.into()),
-            serde_json::json!({
-                "goal": goal,
-                "evolution_mode": "generate_change",
-                "task_kind": DISPATCH_TASK_KIND,
-                "change_identity": {
-                    "kind": row.identity.kind,
-                    "scope": row.identity.scope,
-                    "literal": row.identity.literal,
-                },
-                "change_sources": row
-                    .sources
-                    .iter()
-                    .map(|source| source.doc.as_str())
-                    .collect::<Vec<_>>(),
-            }),
+    } else {
+        info!(
+            pending = pending.len(),
+            submitted = counts.submitted,
+            rearmed = counts.rearmed,
+            already_handed_over = counts.already,
+            already_dead_environment = counts.dead_environment,
+            failed = counts.failed,
+            unmeasurable,
+            pool = verdict.reading.as_str(),
+            not_handed_over = %held_back_summary(&rows),
+            "change ledger: handed the pending set to the goal path"
         );
-        match orchestrator.submit_goal_auto(&goal, vec![task]).await {
-            Ok(_) => submitted += 1,
-            Err(e) => {
-                failed += 1;
-                warn!(
-                    change = %row.identity,
-                    error = %e,
-                    "change ledger: a change still owed could not be handed over"
-                );
-            }
+    }
+    record_dispatch_state(store, metrics, &verdict, pending.len(), unmeasurable, &counts).await;
+}
+
+/// What one owed row's graph row says about it.
+///
+/// Two answers, and every row read reaches exactly one of them: that is what
+/// makes the pass's counts add up to the set it read, whichever way the pass
+/// went. A pass that hands nothing over is not a pass that found nothing.
+enum Owed {
+    /// A task holds the row, and its own row says what became of the change.
+    Held(Handover),
+    /// No task holds it: this is the generation its handover goes out under.
+    NoTask { generation: u32 },
+}
+
+/// Whether a task holds this owed row, and the generation the handover goes out
+/// under when none does.
+///
+/// The graph is read before the submission rather than the submission's answer
+/// being read after it: the goal path treats a repeated id as a fault, so a pass
+/// that submitted blind would leave a line saying the handover failed while the
+/// change was in fact handed over. What is read is the row and not its presence:
+/// a change whose last handover the environment returned is still owed, and the
+/// id it already holds would otherwise read as work in progress for the rest of
+/// the account's life. The generation the handover goes out under is the first
+/// slot the graph does not hold.
+async fn owed_row(
+    orchestrator: &Arc<dyn OrchestratorControl>,
+    row: &ChangeLedgerRow,
+    rearm_limit: u32,
+) -> Owed {
+    let mut generation = 0u32;
+    while generation <= rearm_limit {
+        let id = dispatch_task_id(&row.identity, generation);
+        let Some(task) = orchestrator.get_task(&id).await else {
+            break;
+        };
+        match classify_handover(&task) {
+            // An environment's refusal is not this change's answer, so the next
+            // generation is where its handover goes -- unless the budget is
+            // spent, and then the change is left owed and named instead of
+            // re-filed forever.
+            Handover::DeadEnvironment if generation < rearm_limit => generation += 1,
+            verdict => return Owed::Held(verdict),
         }
     }
+    Owed::NoTask { generation }
+}
 
-    info!(
-        pending = pending.len(),
-        submitted,
-        rearmed,
-        already_handed_over = already,
-        already_dead_environment = dead_environment,
-        failed,
-        unmeasurable,
-        pool = verdict.reading.as_str(),
-        not_handed_over = %held_back_summary(&rows),
-        "change ledger: handed the pending set to the goal path"
-    );
-    record_dispatch_state(
-        store,
-        &verdict,
-        pending.len(),
-        submitted,
-        already,
-        failed,
-        unmeasurable,
-    )
-    .await;
+/// One pass's own counts, as the account records them and the reading face
+/// publishes them.
+///
+/// The fields are the columns of one row of the dispatch table and the cells of
+/// one tick of the metric store, and they are one struct so the two cannot
+/// drift: a count added here is added to both or to neither. `rearmed` is the
+/// one that is an annotation rather than an outcome -- a row re-armed and then
+/// submitted is in both numbers -- so the pass's arithmetic is `submitted +
+/// already + failed + dead_environment + held_back == pending`, with
+/// `unmeasurable` counted separately because those rows were never in the
+/// dispatched set to begin with.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TickCounts {
+    submitted: usize,
+    already: usize,
+    dead_environment: usize,
+    held_back: usize,
+    rearmed: usize,
+    failed: usize,
+}
+
+/// The names the per-pass counts are published under.
+///
+/// A closed set, so a reader counts cells rather than parsing names, and the
+/// order here is the order they are written in. The values are the account's own
+/// numbers, taken after they were computed and before they were written -- the
+/// same ones, not a second computation of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchReadout {
+    Pending,
+    Submitted,
+    Already,
+    Failed,
+    DeadEnvironment,
+    HeldBack,
+    Rearmed,
+    Unmeasurable,
+}
+
+impl DispatchReadout {
+    const ALL: &'static [DispatchReadout] = &[
+        DispatchReadout::Pending,
+        DispatchReadout::Submitted,
+        DispatchReadout::Already,
+        DispatchReadout::Failed,
+        DispatchReadout::DeadEnvironment,
+        DispatchReadout::HeldBack,
+        DispatchReadout::Rearmed,
+        DispatchReadout::Unmeasurable,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Submitted => "submitted",
+            Self::Already => "already",
+            Self::Failed => "failed",
+            Self::DeadEnvironment => "dead_environment",
+            Self::HeldBack => "held_back",
+            Self::Rearmed => "rearmed",
+            Self::Unmeasurable => "unmeasurable",
+        }
+    }
+}
+
+/// Publish one pass's counts, with the pass's own answer to why it did only
+/// that much.
+///
+/// The decision and the pool reading are labels rather than cells of their own:
+/// they are the reason this tick's numbers look the way they do, and a reader
+/// who has to join two families to ask "was the debt held back, and by what"
+/// will read the number without the reason. They are closed sets, so the series
+/// a fleet of passes can create stay bounded by the counts times the reasons.
+///
+/// A failure to publish is raised and not fatal, for the reason a failure to
+/// record the row is: the pass already happened, and a loop that gave up the
+/// handover because the reading face was closed would trade the working half for
+/// the recorded half.
+async fn publish_dispatch_rows(
+    metrics: Option<&Arc<dyn MetricsBackend>>,
+    state: &DispatchState,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    for readout in DispatchReadout::ALL {
+        let value = match readout {
+            DispatchReadout::Pending => state.pending,
+            DispatchReadout::Submitted => state.submitted,
+            DispatchReadout::Already => state.already,
+            DispatchReadout::Failed => state.failed,
+            DispatchReadout::DeadEnvironment => state.dead_environment,
+            DispatchReadout::HeldBack => state.held_back,
+            DispatchReadout::Rearmed => state.rearmed,
+            DispatchReadout::Unmeasurable => state.unmeasurable,
+        };
+        let mut labels = HashMap::new();
+        labels.insert("readout".to_string(), readout.as_str().to_string());
+        labels.insert("decision".to_string(), state.decision.as_str().to_string());
+        labels.insert("pool_reading".to_string(), state.pool.as_str().to_string());
+        if let Err(e) = metrics
+            .record_gauge(metric_names::CHANGE_DISPATCH_ROWS, value as f64, labels)
+            .await
+        {
+            warn!(
+                error = %e,
+                readout = readout.as_str(),
+                "change ledger: this pass's count could not be published, so the reading face \
+                 is missing a cell this pass held"
+            );
+        }
+    }
 }
 
 /// Write one pass's own reading, and never let a failure to write it stop the
@@ -1403,20 +1545,22 @@ async fn dispatch_pass(
 /// silent stop, and that is the one thing this table exists to prevent.
 async fn record_dispatch_state(
     store: &dyn ChangeLedgerStore,
+    metrics: Option<&Arc<dyn MetricsBackend>>,
     verdict: &PoolVerdict,
     pending: usize,
-    submitted: usize,
-    already: usize,
-    failed: usize,
     unmeasurable: usize,
+    counts: &TickCounts,
 ) {
     let state = DispatchState {
         decision: verdict.decision,
         pool: verdict.reading,
         pending: pending as u64,
-        submitted: submitted as u64,
-        already: already as u64,
-        failed: failed as u64,
+        submitted: counts.submitted as u64,
+        already: counts.already as u64,
+        failed: counts.failed as u64,
+        dead_environment: counts.dead_environment as u64,
+        held_back: counts.held_back as u64,
+        rearmed: counts.rearmed as u64,
         unmeasurable: unmeasurable as u64,
         resume_at_unix: verdict.resume_at_unix,
         evidenced_recovery_unix: verdict.evidenced_recovery_unix,
@@ -1430,6 +1574,10 @@ async fn record_dispatch_state(
              only in this line"
         );
     }
+    // Published from the same struct the row was built from, and after it: the
+    // account is the record and the reading face is a view of it, so the two
+    // cannot say different things about one pass.
+    publish_dispatch_rows(metrics, &state).await;
 }
 
 /// What the pool's snapshot says this pass should do.
@@ -1653,7 +1801,7 @@ fn outstanding_summary(rows: &[ChangeLedgerRow]) -> String {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
-    use cog_core::ChangeIdentity;
+    use cog_core::{ChangeIdentity, SFError, SFResult};
 
     fn row(state: ChangeState, measured_at: Option<i64>) -> ChangeLedgerRow {
         ChangeLedgerRow {
@@ -2291,5 +2439,556 @@ mod tests {
         assert_eq!(verdict.reading, PoolReading::Absent);
         assert_eq!(verdict.resume_at_unix, 0);
         assert_ne!(verdict.reading, PoolReading::Available);
+    }
+
+    // ── The pass's own arithmetic, driven end to end ──
+    //
+    // The counts a pass writes are the only reading of what it did, and the way
+    // they fail is by not adding up to the set the pass read -- most of all on
+    // the pass that handed nothing over, whose counts used to be four structural
+    // zeroes because the pause returned before the classification ran. So these
+    // drive the real `dispatch_pass` over a ledger in memory and a graph the test
+    // writes, and read back the row and the cells it produced.
+
+    /// A ledger holding what a test put in it, keeping the rows the pass wrote.
+    ///
+    /// The read side is the two calls the pass makes, with the same exclusions
+    /// the real store applies; everything else answers empty, because a pass that
+    /// never asks for it has no business getting an answer out of a double.
+    #[derive(Default)]
+    struct FakeLedger {
+        rows: Vec<ChangeLedgerRow>,
+        written: std::sync::Mutex<Vec<DispatchState>>,
+    }
+
+    impl FakeLedger {
+        fn written(&self) -> Vec<DispatchState> {
+            self.written.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChangeLedgerStore for FakeLedger {
+        async fn record_readings(
+            &self,
+            _readings: &[ChangeReading],
+            _first_seen_rev: Option<&str>,
+        ) -> SFResult<usize> {
+            Ok(0)
+        }
+        async fn declare(&self, _readings: &[ChangeReading]) -> SFResult<usize> {
+            Ok(0)
+        }
+        async fn fold_declarations(
+            &self,
+            _limit: usize,
+            _first_seen_rev: Option<&str>,
+        ) -> SFResult<usize> {
+            Ok(0)
+        }
+        async fn fold_retirements(&self, _limit: usize) -> SFResult<usize> {
+            Ok(0)
+        }
+        async fn pending_declarations(&self) -> SFResult<u64> {
+            Ok(0)
+        }
+        async fn pending_retirements(&self) -> SFResult<u64> {
+            Ok(0)
+        }
+        async fn apply_measurement(&self, _measurement: &ChangeMeasurement) -> SFResult<()> {
+            Ok(())
+        }
+        async fn outstanding(&self, limit: usize) -> SFResult<Vec<ChangeLedgerRow>> {
+            Ok(self
+                .rows
+                .iter()
+                .filter(|row| row.state.is_outstanding())
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+        async fn landed_due(&self, _limit: usize) -> SFResult<Vec<ChangeLedgerRow>> {
+            Ok(Vec::new())
+        }
+        async fn record_reopen(&self, _reopen: &ChangeReopen) -> SFResult<()> {
+            Ok(())
+        }
+        async fn get(&self, identity: &ChangeIdentity) -> SFResult<Option<ChangeLedgerRow>> {
+            Ok(self
+                .rows
+                .iter()
+                .find(|row| row.identity == *identity)
+                .cloned())
+        }
+        async fn census(&self) -> SFResult<Vec<(ChangeState, u64)>> {
+            let mut by_state: HashMap<ChangeState, u64> = HashMap::new();
+            for row in &self.rows {
+                *by_state.entry(row.state).or_default() += 1;
+            }
+            Ok(by_state.into_iter().collect())
+        }
+        async fn record_dispatch_state(&self, state: &DispatchState) -> SFResult<()> {
+            self.written.lock().unwrap().push(state.clone());
+            Ok(())
+        }
+    }
+
+    /// A graph the test writes, with the two calls the pass makes answered from
+    /// it: `get_task` says what holds a row, and `submit_goal_auto` records what
+    /// was handed over -- or refuses everything, for the pass whose handovers
+    /// cannot be taken.
+    #[derive(Default)]
+    struct FakeGraph {
+        tasks: HashMap<String, Task>,
+        refuse_submissions: bool,
+        submitted: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeGraph {
+        fn holding(mut self, id: &str, status: TaskStatus) -> Self {
+            let mut task = Task::new(
+                id.to_string(),
+                TaskType::Custom(DISPATCH_TASK_KIND.into()),
+                serde_json::json!({}),
+            );
+            task.status = status;
+            if status == TaskStatus::Failed {
+                // The environment's own refusal, which is the one failure a
+                // re-arm is for.
+                task.error_cause = Some(UpstreamFailure::Auth);
+            }
+            self.tasks.insert(id.to_string(), task);
+            self
+        }
+
+        fn holding_dead_work(mut self, id: &str) -> Self {
+            let mut task = Task::new(
+                id.to_string(),
+                TaskType::Custom(DISPATCH_TASK_KIND.into()),
+                serde_json::json!({}),
+            );
+            task.status = TaskStatus::Failed;
+            task.error = Some("degenerate_loop: the same failure repeated".into());
+            self.tasks.insert(id.to_string(), task);
+            self
+        }
+
+        fn refusing(mut self) -> Self {
+            self.refuse_submissions = true;
+            self
+        }
+
+        fn submitted(&self) -> Vec<String> {
+            self.submitted.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl OrchestratorControl for FakeGraph {
+        async fn submit_goal(&self, _goal: &str, _tasks: Vec<Task>) -> SFResult<()> {
+            Ok(())
+        }
+        async fn submit_goal_auto(&self, _goal: &str, tasks: Vec<Task>) -> SFResult<Vec<String>> {
+            if self.refuse_submissions {
+                return Err(SFError::Agent("the goal path would not take it".into()));
+            }
+            let ids = tasks.iter().map(|task| task.id.clone()).collect::<Vec<_>>();
+            self.submitted.lock().unwrap().extend(ids.clone());
+            Ok(ids)
+        }
+        async fn assign_task(&self, _task_id: &str, _agent_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn add_task(&self, _task: Task) -> SFResult<()> {
+            Ok(())
+        }
+        async fn crew_can_retry(&self, _task_ids: &[String]) -> bool {
+            false
+        }
+        async fn crew_retry_all(&self, _task_ids: &[String]) -> usize {
+            0
+        }
+        async fn get_ready_tasks(&self) -> Vec<Task> {
+            Vec::new()
+        }
+        async fn get_all_tasks(&self) -> Vec<Task> {
+            self.tasks.values().cloned().collect()
+        }
+        async fn push_to_dlq(&self, _task_id: &str, _error: String) -> SFResult<bool> {
+            Ok(false)
+        }
+        async fn retry_task(&self, _task_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn dlq_len(&self) -> SFResult<usize> {
+            Ok(0)
+        }
+        async fn start_task(&self, _task_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn complete_task(
+            &self,
+            _task_id: &str,
+            _result: serde_json::Value,
+        ) -> SFResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn fail_task(
+            &self,
+            _task_id: &str,
+            _error: String,
+            _cause: Option<UpstreamFailure>,
+        ) -> SFResult<(bool, Vec<String>, bool)> {
+            Ok((false, Vec::new(), false))
+        }
+        async fn fail_task_after(
+            &self,
+            _task_id: &str,
+            _error: String,
+            _cause: Option<UpstreamFailure>,
+            _retry_after_secs: Option<u64>,
+        ) -> SFResult<(bool, Vec<String>, bool)> {
+            Ok((false, Vec::new(), false))
+        }
+        async fn cancel_task(&self, _task_id: &str) -> SFResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn get_task(&self, task_id: &str) -> Option<Task> {
+            self.tasks.get(task_id).cloned()
+        }
+        async fn schedule_task(&self, _task_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn check_timeouts(&self) -> Vec<(String, bool, Vec<String>, bool)> {
+            Vec::new()
+        }
+        async fn get_dependents(&self, _task_id: &str) -> Option<Vec<Task>> {
+            None
+        }
+        async fn get_dependencies(&self, _task_id: &str) -> Option<Vec<Task>> {
+            None
+        }
+        async fn get_graph(&self) -> (Vec<Task>, Vec<(String, String)>) {
+            (Vec::new(), Vec::new())
+        }
+        async fn delete_task(&self, _task_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn all_completed(&self) -> bool {
+            false
+        }
+        async fn replay_dlq(&self, _task_id: &str) -> SFResult<bool> {
+            Ok(false)
+        }
+    }
+
+    /// A pool whose snapshot says no configured upstream can serve.
+    struct DeadPool;
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmPoolStatusSource for DeadPool {
+        async fn status(&self) -> Option<LlmPoolStatus> {
+            Some(LlmPoolStatus {
+                unavailable: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    /// The identity every column of one pass has to add up to: the rows it was
+    /// owed are exactly the rows it placed somewhere, whichever way it went.
+    ///
+    /// `rearmed` is not in the sum because it is an annotation rather than a
+    /// placement -- a row re-armed and then submitted is in both numbers -- and
+    /// `unmeasurable` is not either because those rows were never dispatched:
+    /// they are `pending` in state and excluded from the set by the very
+    /// predicate that reads it.
+    fn assert_the_counts_add_up(state: &DispatchState) {
+        assert_eq!(
+            state.submitted + state.already + state.failed + state.dead_environment + state.held_back,
+            state.pending,
+            "the columns do not add up to what was owed: {state:?}"
+        );
+        assert!(
+            state.rearmed <= state.submitted,
+            "a row re-armed and not submitted is not a re-arm the pass performed: {state:?}"
+        );
+    }
+
+    fn pending_row(scope: &str) -> ChangeLedgerRow {
+        ChangeLedgerRow {
+            identity: ChangeIdentity::new("grep", scope, "fn thing"),
+            ..row(ChangeState::Pending, None)
+        }
+    }
+
+    /// A pass that hands over places every owed row: the one the graph already
+    /// holds, the one whose handover the environment killed and which therefore
+    /// goes out again, and the one nothing has ever held.
+    #[tokio::test]
+    async fn the_counts_of_a_pass_that_hands_over_add_up_to_the_pending_set() {
+        let store = FakeLedger {
+            rows: vec![
+                pending_row("crates/a"),
+                pending_row("crates/b"),
+                pending_row("crates/c"),
+                // A terminal state is not owed, and must not be counted.
+                ChangeLedgerRow {
+                    state: ChangeState::Landed,
+                    ..pending_row("crates/d")
+                },
+            ],
+            ..Default::default()
+        };
+        let at = |row: &ChangeLedgerRow, generation: u32| dispatch_task_id(&row.identity, generation);
+        let graph = Arc::new(
+            FakeGraph::default()
+                .holding(&at(&store.rows[0], 0), TaskStatus::Running)
+                .holding(&at(&store.rows[1], 0), TaskStatus::Failed),
+        );
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        dispatch_pass(&store, &control, &HashMap::new(), None, None).await;
+
+        let state = store.written().pop().expect("the pass wrote its row");
+        assert_eq!(state.decision, DispatchDecision::Proceed);
+        assert_eq!(state.pending, 3);
+        assert_eq!(state.already, 1, "the row the graph already holds");
+        assert_eq!(state.submitted, 2, "the re-armed row and the fresh one");
+        assert_eq!(state.rearmed, 1, "the row whose first handover was killed");
+        assert_eq!(state.failed, 0);
+        assert_eq!(state.dead_environment, 0);
+        assert_eq!(state.held_back, 0);
+        assert_the_counts_add_up(&state);
+        // And the handovers are on the graph: the re-arm goes out under the
+        // first generation nothing holds, and the fresh row under generation 0.
+        let mut handed_over = graph.submitted();
+        handed_over.sort();
+        assert_eq!(
+            handed_over,
+            vec![at(&store.rows[1], 1), at(&store.rows[2], 0)]
+        );
+    }
+
+    /// The pass that hands nothing over still places every owed row. This is the
+    /// one that used to fail: the pause returned before the classification ran,
+    /// so the row said four zeroes beside a `pending` that was not zero, and the
+    /// reading face was blind on exactly the passes it exists to describe.
+    #[tokio::test]
+    async fn a_pass_that_hands_nothing_over_still_accounts_for_every_owed_row() {
+        let store = FakeLedger {
+            rows: vec![
+                pending_row("crates/a"),
+                pending_row("crates/b"),
+                pending_row("crates/c"),
+            ],
+            ..Default::default()
+        };
+        let held = dispatch_task_id(&store.rows[0].identity, 0);
+        let graph = Arc::new(FakeGraph::default().holding(&held, TaskStatus::Running));
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        dispatch_pass(&store, &control, &HashMap::new(), Some(&DeadPool), None).await;
+
+        let state = store.written().pop().expect("the pass wrote its row");
+        assert_eq!(state.decision, DispatchDecision::PausedLlmPoolUnavailable);
+        assert_eq!(state.pending, 3);
+        // Whether a task holds a row, and what became of it, are answers the
+        // graph gives and the pool's state does not change.
+        assert_eq!(state.already, 1);
+        assert_eq!(state.held_back, 2, "owed, held by nothing, handed nowhere");
+        assert_eq!(state.submitted, 0);
+        assert_eq!(state.failed, 0, "nothing was attempted, so nothing failed");
+        assert_the_counts_add_up(&state);
+        assert!(
+            graph.submitted().is_empty(),
+            "a paused pass hands nothing over"
+        );
+    }
+
+    /// A row whose handovers the environment refused, at every generation the
+    /// budget allows, is placed in the column that names it -- and it is not the
+    /// same column as `already`, which is what the rows the graph holds read as.
+    #[tokio::test]
+    async fn the_environment_killed_rows_are_counted_apart_from_the_ones_in_flight() {
+        let limit = dispatch_rearm_limit();
+        let store = FakeLedger {
+            rows: vec![pending_row("crates/a")],
+            ..Default::default()
+        };
+        let mut graph = FakeGraph::default();
+        for generation in 0..=limit {
+            let id = dispatch_task_id(&store.rows[0].identity, generation);
+            graph = graph.holding(&id, TaskStatus::Failed);
+        }
+        let graph: Arc<dyn OrchestratorControl> = Arc::new(graph);
+
+        dispatch_pass(&store, &graph, &HashMap::new(), None, None).await;
+
+        let state = store.written().pop().expect("the pass wrote its row");
+        assert_eq!(state.pending, 1);
+        assert_eq!(state.dead_environment, 1);
+        assert_eq!(state.already, 0);
+        assert_eq!(state.submitted, 0);
+        assert_eq!(state.rearmed, 0, "the budget is spent, so nothing re-armed");
+        assert_the_counts_add_up(&state);
+    }
+
+    /// A handover the goal path would not take is a row placed, not a row
+    /// dropped: the pass failed to file it, and the change is exactly as owed as
+    /// it was.
+    #[tokio::test]
+    async fn a_handover_the_goal_path_would_not_take_is_counted_as_failed() {
+        let store = FakeLedger {
+            rows: vec![pending_row("crates/a"), pending_row("crates/b")],
+            ..Default::default()
+        };
+        let graph: Arc<dyn OrchestratorControl> = Arc::new(FakeGraph::default().refusing());
+
+        dispatch_pass(&store, &graph, &HashMap::new(), None, None).await;
+
+        let state = store.written().pop().expect("the pass wrote its row");
+        assert_eq!(state.pending, 2);
+        assert_eq!(state.failed, 2);
+        assert_eq!(state.submitted, 0);
+        assert_eq!(state.held_back, 0);
+        assert_the_counts_add_up(&state);
+    }
+
+    /// The generation a row's handover goes out under, read off the graph
+    /// without submitting anything: nothing held is generation zero, an
+    /// environment refusal moves it on, and anything else the graph holds is the
+    /// row's answer rather than a reason to file it again.
+    #[tokio::test]
+    async fn the_generation_walk_stops_at_the_first_slot_nothing_holds() {
+        let limit = dispatch_rearm_limit();
+        let row = pending_row("crates/a");
+        let id = |generation: u32| dispatch_task_id(&row.identity, generation);
+        let empty: Arc<dyn OrchestratorControl> = Arc::new(FakeGraph::default());
+        assert!(matches!(
+            owed_row(&empty, &row, limit).await,
+            Owed::NoTask { generation: 0 }
+        ));
+
+        let killed_once = FakeGraph::default().holding(&id(0), TaskStatus::Failed);
+        let killed_once: Arc<dyn OrchestratorControl> = Arc::new(killed_once);
+        assert!(matches!(
+            owed_row(&killed_once, &row, limit).await,
+            Owed::NoTask { generation: 1 }
+        ));
+
+        // The re-armed handover is in flight: the row is placed, and no third
+        // generation is filed behind it.
+        let in_flight = FakeGraph::default()
+            .holding(&id(0), TaskStatus::Failed)
+            .holding(&id(1), TaskStatus::Running);
+        let in_flight: Arc<dyn OrchestratorControl> = Arc::new(in_flight);
+        assert!(matches!(
+            owed_row(&in_flight, &row, limit).await,
+            Owed::Held(Handover::InFlight)
+        ));
+
+        // The work's own failure is the change's answer, and it is not re-armed:
+        // filing it again would hand over a change the graph has already judged.
+        let dead_work: Arc<dyn OrchestratorControl> =
+            Arc::new(FakeGraph::default().holding_dead_work(&id(0)));
+        assert!(matches!(
+            owed_row(&dead_work, &row, limit).await,
+            Owed::Held(Handover::DeadWork)
+        ));
+
+        // Every generation the budget allows was refused by the environment, so
+        // there is no next slot to file under: the row is left owed and named.
+        let mut spent = FakeGraph::default();
+        for generation in 0..=limit {
+            spent = spent.holding(&id(generation), TaskStatus::Failed);
+        }
+        let spent: Arc<dyn OrchestratorControl> = Arc::new(spent);
+        assert!(matches!(
+            owed_row(&spent, &row, limit).await,
+            Owed::Held(Handover::DeadEnvironment)
+        ));
+    }
+
+    /// Every count the pass holds is a cell a reader can name, and the cells
+    /// carry the numbers the row carries: one publish per readout, labelled with
+    /// the reason this tick reads the way it does, so a reader asking "what was
+    /// held back, and by what" joins no two families to answer it.
+    #[tokio::test]
+    async fn the_reading_face_publishes_one_cell_per_count_under_this_passs_reason() {
+        let state = DispatchState {
+            decision: DispatchDecision::PausedLlmPoolUnavailable,
+            pool: PoolReading::Unavailable,
+            pending: 143,
+            submitted: 3,
+            already: 12,
+            failed: 1,
+            dead_environment: 7,
+            held_back: 120,
+            rearmed: 2,
+            unmeasurable: 5,
+            resume_at_unix: 0,
+            evidenced_recovery_unix: 0,
+            quota_window_secs: 0,
+        };
+        let metrics = Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics: Arc<dyn MetricsBackend> = metrics.clone();
+        publish_dispatch_rows(Some(&metrics), &state).await;
+
+        let end = Utc::now() + chrono::Duration::seconds(1);
+        let start = end - chrono::Duration::seconds(600);
+        let samples = metrics
+            .query_gauge_range(metric_names::CHANGE_DISPATCH_ROWS.as_str(), start, end)
+            .await
+            .expect("the reading face is readable");
+        let mut published: HashMap<String, f64> = HashMap::new();
+        for sample in &samples {
+            assert_eq!(
+                sample.labels.get("decision").map(String::as_str),
+                Some("paused_llm_pool_unavailable"),
+                "the reason this tick reads the way it does is on the cell"
+            );
+            assert_eq!(
+                sample.labels.get("pool_reading").map(String::as_str),
+                Some("unavailable")
+            );
+            let readout = sample
+                .labels
+                .get("readout")
+                .expect("every cell names its readout")
+                .clone();
+            assert!(
+                published.insert(readout, sample.value).is_none(),
+                "a readout published twice would be a reader's sum counting it twice"
+            );
+        }
+        // The closed set, all of it and nothing else: a count with no cell is a
+        // number no reader can select, and a cell with no count is a series
+        // nothing fills.
+        assert_eq!(
+            published.keys().cloned().collect::<std::collections::BTreeSet<_>>(),
+            DispatchReadout::ALL
+                .iter()
+                .map(|readout| readout.as_str().to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert_eq!(published["pending"], 143.0);
+        assert_eq!(published["submitted"], 3.0);
+        assert_eq!(published["already"], 12.0);
+        assert_eq!(published["failed"], 1.0);
+        assert_eq!(published["dead_environment"], 7.0);
+        assert_eq!(published["held_back"], 120.0);
+        assert_eq!(published["rearmed"], 2.0);
+        assert_eq!(published["unmeasurable"], 5.0);
+        // The reader's own arithmetic, done on the cells rather than on the row:
+        // the numbers a dashboard subtracts are the numbers the pass placed.
+        assert_eq!(
+            published["submitted"]
+                + published["already"]
+                + published["failed"]
+                + published["dead_environment"]
+                + published["held_back"],
+            published["pending"]
+        );
     }
 }

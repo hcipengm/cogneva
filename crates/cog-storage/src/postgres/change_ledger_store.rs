@@ -308,9 +308,10 @@ VALUES ($1, $2, $3, $4, $5)";
 /// that stamped its own clock would be reporting a time it supplied.
 const RECORD_DISPATCH_STATE_SQL: &str = "\
 INSERT INTO change_dispatch_state (
-    decision, pool_reading, pending, submitted, already, failed, unmeasurable,
+    decision, pool_reading, pending, submitted, already, failed,
+    dead_environment, held_back, rearmed, unmeasurable,
     resume_at_unix, evidenced_recovery_unix, quota_window_secs
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)";
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)";
 
 /// Refuse a reading whose identity or document does not fit its column.
 ///
@@ -774,6 +775,9 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
             .bind(state.submitted as i64)
             .bind(state.already as i64)
             .bind(state.failed as i64)
+            .bind(state.dead_environment as i64)
+            .bind(state.held_back as i64)
+            .bind(state.rearmed as i64)
             .bind(state.unmeasurable as i64)
             .bind(state.resume_at_unix)
             .bind(state.evidenced_recovery_unix)

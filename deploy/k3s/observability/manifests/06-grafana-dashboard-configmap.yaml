@@ -1383,6 +1383,77 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 38,
+          "title": "Change Ledger Debt and Where It Went",
+          "description": "What the change ledger's dispatch pass did with the set of changes still owed, one tick per pass. The panel is the reading the account's own record was missing: the ledger writes a row per pass to its table, and a row in a table is not a curve -- nothing served it to the metric store, so 'the debt is not coming down' had no reader and neither did the reason. The owed line is the whole pending set; the lines under it are where this pass's share of that set went: handed over, already held by a task the goal path had, refused by the goal path, killed by the environment (a task held it, every handover the budget allowed was refused, and no further one is filed), or held back (owed, no task holds it, and the pass handed nothing over because no configured upstream could serve a request). Held back and killed are the two the record could not name before: the first because a pass that handed nothing over wrote zeros in every other column, the second because the count was computed and dropped. The last line is the arithmetic as a reading -- owed minus everything accounted for -- and it has to sit at zero: a pass whose counts do not add up to the set it read is a pass that lost track of rows, which is exactly how the environment-killed ones went unrecorded. Read the decision and pool_reading labels on the raw series to see why a tick looks the way it does; they are on the same family rather than a second one so an unmoving debt and its stated reason are read together. Every series is a verdict for the whole account and is republished by whichever process holds the pass, so the reading is taken as a maximum across label sets rather than a sum: a sum would double the debt for the staleness window in which a label change has left two series behind.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 144
+          },
+          "targets": [
+            {
+              "expr": "max(cogneva_change_dispatch_rows{readout=\"pending\"})",
+              "legendFormat": "owed (pending)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max(cogneva_change_dispatch_rows{readout=\"held_back\"})",
+              "legendFormat": "held back by the pass",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max(cogneva_change_dispatch_rows{readout=\"submitted\"})",
+              "legendFormat": "handed over this pass",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max(cogneva_change_dispatch_rows{readout=\"dead_environment\"})",
+              "legendFormat": "killed by the environment",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max(cogneva_change_dispatch_rows{readout=\"failed\"})",
+              "legendFormat": "handover refused",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max(cogneva_change_dispatch_rows{readout=\"pending\"}) - max(cogneva_change_dispatch_rows{readout=\"submitted\"}) - max(cogneva_change_dispatch_rows{readout=\"already\"}) - max(cogneva_change_dispatch_rows{readout=\"failed\"}) - max(cogneva_change_dispatch_rows{readout=\"dead_environment\"}) - max(cogneva_change_dispatch_rows{readout=\"held_back\"})",
+              "legendFormat": "unaccounted for (should be zero)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {

@@ -1121,6 +1121,29 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          which is what the fate counter is for",
     ),
     (
+        "cogneva_change_dispatch_rows",
+        "What one change-ledger dispatch pass did with the set still owed, by \
+         readout, on the pass that recorded it: pending is the whole owed set, \
+         and the rows that set broke into are submitted (handed over this pass), \
+         already (a task the goal path already had), failed (this pass tried to \
+         hand one over and the goal path refused), dead_environment (a task held \
+         it, the environment refused every handover the budget allowed, and it \
+         is given up on), held_back (owed, no task holds it, and this pass \
+         handed nothing over) and unmeasurable (owed, and this pass could not \
+         settle what is being asked of it). rearmed counts handovers that had to \
+         be re-filed at a later generation and is an annotation over those \
+         outcomes, not one of them, so submitted + already + failed + \
+         dead_environment + held_back is what has to equal pending -- and the \
+         equality is the reading: a pass whose counts do not add up to the set it \
+         read is a pass that lost track of rows, which is how the environment- \
+         killed ones went unrecorded once. The decision and pool_reading labels \
+         are the pass's own answer to why the pass did only that much, carried on \
+         the same series so an unmoving debt and its reason are read together. \
+         Written once per pass, so a pass that stops writing is visible as the \
+         companion timestamp going stale rather than as a value that stops \
+         changing",
+    ),
+    (
         "cogneva_worktree_index_present",
         "Whether a resident worktree's git index file exists, 1 or 0, by \
          worktree. Read with the missing-files series: 'the index remembers no \

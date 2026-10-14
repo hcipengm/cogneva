@@ -633,6 +633,25 @@ pub struct DispatchState {
     /// Rows whose task the goal path already had: handed over on an earlier pass.
     pub already: u64,
     pub failed: u64,
+    /// Rows the pass gave up on: a task held them, every generation its handover
+    /// was allowed arrived at the environment and was refused, and the budget for
+    /// trying another one is spent. They are owed and they are not in flight,
+    /// which is a state no other column states -- without this one they were in
+    /// `pending` and in nothing else, so the rows the environment killed were the
+    /// rows the account could not name.
+    pub dead_environment: u64,
+    /// Rows this pass did not hand over and no task holds: the work that was owed
+    /// at the moment the pass decided to hand nothing over. Only a pass that
+    /// dispatched nothing has any, which is what lets the counts add up to
+    /// `pending` on that pass as well as on one that dispatched -- the same
+    /// subtraction, with the reason the remainder is a remainder.
+    pub held_back: u64,
+    /// Rows this pass handed over again at a later generation, their earlier
+    /// handovers having been refused by the environment. Counted beside the
+    /// outcome they reached rather than instead of it: a row re-armed and then
+    /// submitted is in both numbers, and it is the pair that says how much of a
+    /// pass's work went into getting back to where it started.
+    pub rearmed: u64,
     /// Rows this pass's own measurement could not settle, so they were not handed
     /// over. Counted apart from `pending` because the state alone cannot show
     /// them.

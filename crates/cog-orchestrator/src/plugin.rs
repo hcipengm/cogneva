@@ -712,6 +712,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                     ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>(),
                     ctx.consume_service::<dyn cog_core::OrchestratorControl>(),
                     ctx.consume_service::<dyn cog_core::LlmPoolStatusSource>(),
+                    ctx.consume_service::<dyn cog_core::MetricsBackend>(),
                     ledger_shutdown,
                     crate::change_measure::tree_from_environment(),
                 );
