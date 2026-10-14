@@ -13,6 +13,7 @@
 //!would drift, and the one that wins is whichever ran last.
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 
 use cog_core::{
@@ -444,15 +445,18 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
             .fetch_all(&self.pool)
             .await
             .map_err(|e| SFError::Database(format!("read refusals to fold: {e}")))?;
-        let events: Vec<PrincipleRefusal> = rows
+        let events: Vec<QueuedRefusal> = rows
             .iter()
             .map(|row| {
-                Ok(PrincipleRefusal {
+                Ok(QueuedRefusal {
                     slug: row.try_get("slug").map_err(|e| format!("slug: {e}"))?,
                     refused_at: row
                         .try_get("refused_at")
                         .map_err(|e| format!("refused_at: {e}"))?,
                     source: row.try_get("source").map_err(|e| format!("source: {e}"))?,
+                    session_id: row
+                        .try_get("session_id")
+                        .map_err(|e| format!("session_id: {e}"))?,
                     count: row.try_get("count").map_err(|e| format!("count: {e}"))?,
                 })
             })
@@ -492,6 +496,7 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
                 .bind(&event.slug)
                 .bind(event.refused_at)
                 .bind(&event.source)
+                .bind(&event.session_id)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| {
@@ -686,8 +691,6 @@ const CHECK_KIND_CENSUS_SQL: &str = "\
 SELECT check_kind, count(*) AS n FROM principle_ledger
 GROUP BY check_kind";
 
-/// Queue one refusal, or leave the one already queued for this principle,
-/// instant and source exactly as it is.
 /// Queue one refusal, keeping the largest report for its second.
 ///
 /// Not `DO NOTHING`: the row's key is the second it happened in, so a second
@@ -699,19 +702,48 @@ GROUP BY check_kind";
 /// prevent. The `WHERE` is what keeps the row count honest: a repeat that says
 /// nothing new affects no row, so the caller can still tell "queued" from
 /// "already known".
+///
+/// The session is written as the empty string, the value the column documents
+/// for a side that has no session to name: this method is called by the
+/// platform's own gate, which refuses inside a process that belongs to no
+/// session, and the host gate does not come through here at all. Naming the
+/// column rather than letting the default apply is what it costs to keep the
+/// conflict target equal to the primary key -- a target listing fewer columns
+/// than the key matches no unique constraint, and the insert fails at run time
+/// rather than merging. `hits` is left out for the opposite reason: a magnitude
+/// is counted by the side that did the refusing, and this side counts none.
 const REPORT_REFUSAL_SQL: &str = "\
-INSERT INTO principle_refusals (slug, refused_at, source, count)
-VALUES ($1, $2, $3, $4)
-ON CONFLICT (slug, refused_at, source) DO UPDATE
+INSERT INTO principle_refusals (slug, refused_at, source, session_id, count)
+VALUES ($1, $2, $3, '', $4)
+ON CONFLICT (slug, refused_at, source, session_id) DO UPDATE
 SET count = GREATEST(principle_refusals.count, EXCLUDED.count)
 WHERE principle_refusals.count < EXCLUDED.count";
 
+/// A refusal queued for the fold, carrying the whole of its key.
+///
+/// Not `PrincipleRefusal`: that type is the intake's payload, and a payload has
+/// no session -- the side that reports through the contract's `report_refusals`
+/// belongs to no session at all. A queued row does, and the fold has to carry it,
+/// because a row is marked folded by its key and a mark that named less than the
+/// key would stamp a row this pass never read.
+struct QueuedRefusal {
+    slug: String,
+    refused_at: DateTime<Utc>,
+    source: String,
+    session_id: String,
+    count: i64,
+}
+
 /// The refusals one fold takes, oldest first.
+///
+/// Ordered by the whole key rather than by the three columns that used to be one:
+/// `LIMIT` cuts this list, and a tie broken differently between two passes would
+/// leave a row unread on one pass and read twice on the next.
 const REFUSAL_FOLD_SELECT_SQL: &str = "\
-SELECT slug, refused_at, source, count
+SELECT slug, refused_at, source, session_id, count
 FROM principle_refusals
 WHERE folded_at IS NULL
-ORDER BY refused_at ASC, slug ASC, source ASC
+ORDER BY refused_at ASC, slug ASC, source ASC, session_id ASC
 LIMIT $1";
 
 /// Move one refusal into its principle's count.
@@ -731,9 +763,17 @@ ON CONFLICT (slug) DO UPDATE SET
     refusals = principle_ledger.refusals + EXCLUDED.refusals,
     last_refused_at = GREATEST(principle_ledger.last_refused_at, EXCLUDED.last_refused_at)";
 
+/// Mark one queued refusal as counted, by the whole of its key.
+///
+/// The batch this pass read is bounded, so two rows can share a slug, an instant
+/// and a source and differ only in session. A mark that stopped at the source
+/// would stamp the sibling this pass never read, and that sibling's count would
+/// then never be added to the account -- the counter would fall behind the queue
+/// with nothing in the reading to say so.
 const REFUSAL_FOLD_MARK_SQL: &str = "\
 UPDATE principle_refusals SET folded_at = now()
-WHERE folded_at IS NULL AND slug = $1 AND refused_at = $2 AND source = $3";
+WHERE folded_at IS NULL AND slug = $1 AND refused_at = $2 AND source = $3
+  AND session_id = $4";
 
 const PENDING_REFUSALS_SQL: &str = "\
 SELECT count(*) AS n FROM principle_refusals WHERE folded_at IS NULL";
