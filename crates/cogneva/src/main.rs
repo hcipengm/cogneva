@@ -87,8 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let gateway_config = cog_gateway::security_gateway::SecurityGatewayConfig::from_env();
             let key_value = cogneva::assembly::infra::key_value_store_from_url(
                 gateway_config.redis_url.as_deref(),
-            )
-            .await;
+            );
             cog_gateway::security_gateway::run(
                 gateway_config,
                 Some(env!("COGNEVA_GIT_REVISION")),

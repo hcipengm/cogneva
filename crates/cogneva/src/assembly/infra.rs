@@ -94,30 +94,36 @@ pub fn init_config_watcher() -> (
     }
 }
 
-/// Open the shared key-value face at `redis_url`, or `None` when none is configured.
+/// Attach the shared key-value face at `redis_url`, or `None` when none is configured.
 ///
 /// Who implements the store is a fact about this binary, not about the consumer:
 /// [`cog_storage::RedisKeyValueStore`] is named here and nowhere downstream, so a
 /// component that only needs the read/write face (the standalone security gateway
 /// has no plugin context to consume one from) still receives a trait object. An
-/// empty or absent URL means this deployment has no shared face — which is not the
-/// same answer as a URL that failed to open, so the failure is reported and `None`
-/// is returned while the URL stays configured, leaving the caller able to tell the
+/// empty or absent URL means this deployment has no shared face — a different
+/// answer from a URL that does not parse, so the latter is reported and `None`
+/// returned while the URL stays configured, leaving the caller able to tell the
 /// two apart.
+///
+/// The face is built, not connected: this process may well start in the same
+/// second as the store it reads, and a connection attempted at that instant
+/// would decide, once, whether this process can ever see the store. The store
+/// answers per call instead, and a call it could not answer is retried by the
+/// next one.
 ///
 /// The URL itself is never logged: it is a connection string, and connection
 /// strings carry credentials on deployments that put them there.
-pub async fn key_value_store_from_url(
+pub fn key_value_store_from_url(
     redis_url: Option<&str>,
 ) -> Option<std::sync::Arc<dyn cog_core::KeyValueStore>> {
     let url = redis_url.filter(|url| !url.is_empty())?;
-    match cog_storage::RedisKeyValueStore::connect(url).await {
+    match cog_storage::RedisKeyValueStore::on_demand(url) {
         Ok(store) => {
             info!("Shared key-value face attached for the standalone security gateway");
             Some(std::sync::Arc::new(store))
         }
         Err(e) => {
-            warn!(error = %e, "Shared key-value face unavailable; the cross-process pool verdict will not be published");
+            warn!(error = %e, "Shared key-value face unusable; the cross-process pool verdict will not be published");
             None
         }
     }
@@ -168,5 +174,38 @@ mod tests {
         std::fs::write(&blocker, b"x").unwrap();
 
         assert!(create_pid_file(&blocker.join("a.pid"), &blocker.join("b.pid")).is_none());
+    }
+
+    /// An address that refuses immediately: the shape of "the store is not up".
+    const REFUSED: &str = "redis://127.0.0.1:1";
+
+    /// A process may start in the same second as the store it reads — the
+    /// standalone security gateway and the redis pod were recreated together on
+    /// 2026-10-01, and a connection attempted at that instant made one failure
+    /// decide that the gateway would never see the store again. So a configured
+    /// address yields a face, and "could not reach it this second" is a per-call
+    /// answer. `None` is kept for "none is configured", which is a different
+    /// fact and the one the callers read as "this deployment is single-process".
+    #[tokio::test]
+    async fn a_configured_url_yields_a_face_even_while_the_store_is_away() {
+        assert!(key_value_store_from_url(None).is_none(), "没配就没有共享面");
+        assert!(key_value_store_from_url(Some("")).is_none(), "空串按没配算");
+
+        let face = key_value_store_from_url(Some(REFUSED))
+            .expect("a configured address gives a face; reaching the store is asked per call");
+        assert!(
+            face.get("cogneva:test:absent").await.is_err(),
+            "a call that reached nothing must say so rather than answer with a value"
+        );
+    }
+
+    /// A URL that does not parse is a fact about the deployment, not about this
+    /// second, so it is reported and stays distinguishable from "not configured".
+    #[test]
+    fn a_url_that_does_not_parse_is_reported_rather_than_read_as_unconfigured() {
+        assert!(
+            key_value_store_from_url(Some("not-a-url")).is_none(),
+            "an unparsable url is not the same answer as no url"
+        );
     }
 }
