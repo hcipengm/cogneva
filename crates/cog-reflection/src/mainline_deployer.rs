@@ -711,33 +711,90 @@ const SUPPORT_CAUSE_POD_LIMIT: usize = 3;
 const SUPPORT_CAUSE_CONTAINER_LIMIT: usize = 4;
 const SUPPORT_CAUSE_MESSAGE_CHARS: usize = 200;
 
+/// 一个 Pod 模板里「读到某个 ConfigMap」的形态，写成相对 Pod 模板根的路径。
+///
+/// **这是唯一一份。** 同一个问题有两个读者：交付端从清单里扫挂载者（
+/// [`crate::gitops_puller`] 的 `mounters_of_config`），部署器从集群里读消费者
+/// （[`live_config_consumers`]）。两者必须认同一批形态，否则一边多认一种，另一边
+/// 的名单就少一个人——两份答案各自自洽，只有把两份摆在一起才看得出来。
+/// 路径语法只有 `field` 与 `field[*]`（数组展开）两种，走 YAML 的读法用它，
+/// 翻成 jsonpath 的读法也用它（[`config_consumer_jsonpath`]，取第一个 `[*]` 当
+/// `range` 的那一层，其余留在表达式里）。
+pub(crate) const CONFIG_CONSUMPTION_PATHS: [&str; 6] = [
+    "volumes[*].configMap.name",
+    "volumes[*].projected.sources[*].configMap.name",
+    "containers[*].envFrom[*].configMapRef.name",
+    "containers[*].env[*].valueFrom.configMapKeyRef.name",
+    "initContainers[*].envFrom[*].configMapRef.name",
+    "initContainers[*].env[*].valueFrom.configMapKeyRef.name",
+];
+
+/// 按 [`CONFIG_CONSUMPTION_PATHS`] 的一条路径，从一个 Pod 模板里取出所有叶子字
+/// 符串。取不到就少一项，不是报错：这些字段全是可选，缺一列与写了个空值是同一
+/// 件事。
+pub(crate) fn config_path_values(spec: &serde_json::Value, path: &str) -> Vec<String> {
+    let mut current = vec![spec];
+    for segment in path.split('.') {
+        let (field, wildcard) = match segment.strip_suffix("[*]") {
+            Some(field) => (field, true),
+            None => (segment, false),
+        };
+        let mut next = Vec::new();
+        for node in current {
+            let Some(value) = node.get(field) else {
+                continue;
+            };
+            if wildcard {
+                if let Some(items) = value.as_array() {
+                    next.extend(items.iter());
+                }
+            } else {
+                next.push(value);
+            }
+        }
+        current = next;
+    }
+    current
+        .iter()
+        .filter_map(|v| v.as_str())
+        .map(str::to_string)
+        .collect()
+}
+
 /// The read of which ConfigMaps each workload of one kind reads: its name, then
 /// one section per consumption face, separated by pipes.
 ///
-/// The faces are volumes, ConfigMap sources inside a projected volume, envFrom,
-/// and env.valueFrom, the last two for containers and initContainers. The pipes
-/// hold their position: a workload with no volumes leaves a section empty, and a
-/// missing field must not pull the later sections forward.
+/// The faces come from [`CONFIG_CONSUMPTION_PATHS`], in its order: volumes,
+/// ConfigMap sources inside a projected volume, envFrom and env.valueFrom for
+/// containers, then the same two for initContainers. The pipes hold their
+/// position: a workload with no volumes leaves a section empty, and a missing
+/// field must not pull the later sections forward. One section per path, so a
+/// path added there is a column here and in the parser without a second edit.
 ///
 /// The pod template path is the caller's, taken from the kind being read. It is
 /// not a constant here because it is not the same path for every kind: a CronJob
 /// keeps its template under `jobTemplate`, and a read written for the shorter
 /// path answers "reads nothing" about it -- which is exactly the shape of a
 /// silent miss.
-fn config_consumer_jsonpath(pod_template: &str) -> String {
-    format!(
-        concat!(
-            "jsonpath={{range .items[*]}}{{.metadata.name}}{{'|'}}",
-            "{{range .{path}.volumes[*]}}{{.configMap.name}}{{','}}{{end}}{{'|'}}",
-            "{{range .{path}.volumes[*]}}{{.projected.sources[*].configMap.name}}{{','}}{{end}}{{'|'}}",
-            "{{range .{path}.containers[*].envFrom[*]}}{{.configMapRef.name}}{{','}}{{end}}{{'|'}}",
-            "{{range .{path}.containers[*].env[*].valueFrom.configMapKeyRef.name}}{{','}}{{end}}{{'|'}}",
-            "{{range .{path}.initContainers[*].envFrom[*]}}{{.configMapRef.name}}{{','}}{{end}}{{'|'}}",
-            "{{range .{path}.initContainers[*].env[*].valueFrom.configMapKeyRef.name}}{{','}}{{end}}",
-            "{{'\\n'}}{{end}}"
-        ),
-        path = pod_template
-    )
+pub(crate) fn config_consumer_jsonpath(pod_template: &str) -> String {
+    let mut out = String::from("jsonpath={range .items[*]}{{.metadata.name}}");
+    for path in CONFIG_CONSUMPTION_PATHS {
+        // The path's first `[*]` is the array the jsonpath ranges over; any
+        // further `[*]` (a projected volume's sources, a container's env) stays
+        // inside the expression.
+        let (array, leaf) = path
+            .split_once("[*]")
+            .expect("every consumption path names one array to range over");
+        out.push_str("{'|'}{range .");
+        out.push_str(pod_template);
+        out.push('.');
+        out.push_str(array);
+        out.push_str("[*]}{{.");
+        out.push_str(leaf);
+        out.push_str("}}{','}{end}");
+    }
+    out.push_str("{'\\n'}{end}");
+    out
 }
 
 /// 滚动内部轮询间隔：探测、致命态复查、部署态查询共用同一节拍。

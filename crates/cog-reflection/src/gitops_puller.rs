@@ -2499,12 +2499,16 @@ fn config_document(manifest: &str) -> serde_json::Value {
         .unwrap_or(serde_json::Value::Null)
 }
 
-/// Names of the workloads whose pod template mounts the config ConfigMap.
+/// Names of the workloads whose pod template reads the config ConfigMap.
 ///
 /// Read from the manifest rather than listed in code, so a workload that starts
 /// mounting the config is rolled without anyone remembering to add it here. Any
 /// workload kind with a pod template counts; what makes a workload a consumer is
-/// the mount, not its kind.
+/// the read, not its kind.
+///
+/// 读的形态走 [`crate::mainline_deployer::CONFIG_CONSUMPTION_PATHS`]——与部署器从集群读消费者的那一
+/// 面**共用同一份清单**。只认卷里的 `configMap` 会让一个经 `envFrom` 读这份文档的
+/// 工作负载在这一面不存在：部署端会滚它、交付端不会，两份答案各自都说得通。
 fn mounters_of_config(manifest: &str) -> SFResult<Vec<(&'static str, String)>> {
     use serde::Deserialize;
 
@@ -2536,17 +2540,16 @@ fn mounters_of_config(manifest: &str) -> SFResult<Vec<(&'static str, String)>> {
         if !kind.long_lived_pods {
             continue;
         }
-        let volumes = format!("/{}/volumes", kind.pod_template.replace('.', "/"));
-        let mounts = value
-            .pointer(&volumes)
-            .and_then(|v| v.as_array())
-            .map(|volumes| {
-                volumes.iter().any(|volume| {
-                    volume.pointer("/configMap/name").and_then(|n| n.as_str())
-                        == Some(cog_core::config_sections::CONFIG_CONFIGMAP)
-                })
-            })
-            .unwrap_or(false);
+        let Some(spec) = value.pointer(&format!("/{}", kind.pod_template.replace('.', "/"))) else {
+            continue;
+        };
+        let mounts = crate::mainline_deployer::CONFIG_CONSUMPTION_PATHS
+            .iter()
+            .any(|path| {
+                crate::mainline_deployer::config_path_values(spec, path)
+                    .iter()
+                    .any(|name| name == cog_core::config_sections::CONFIG_CONFIGMAP)
+            });
         if !mounts {
             continue;
         }
@@ -3929,6 +3932,156 @@ spec:
             mounters_of_config(manifest).expect("readable"),
             vec![("deployment", "cogneva".to_string())]
         );
+    }
+
+    /// 两面的消费形态必须是同一份清单。这一面（交付端）从清单扫读这份文档的工作
+    /// 负载，部署器那一面从集群读消费者；两面各自都自洽，少认一种形态时另一面的
+    /// 名单里就多一个人，没有任何读数看得出来。原先这一面**只认卷里的 `configMap`**
+    /// ——一个经 `envFrom` 读这份文档的工作负载，在集群那一面是消费者、在这一面
+    /// 不存在，于是按内容判该滚的那一轮漏掉它。
+    ///
+    /// 这里钉两处：这一面在**每一种形态上单独**都要认出来（每种形态一个工作负载，
+    /// 只经那一种读这份文档——同一个工作负载六种都写，少认一种也还是被卷那条认出来，
+    /// 门就白钉），以及发给 kubectl 的 jsonpath 的列必须逐个来自同一份清单（多写
+    /// 一列或少写一列都当场红）。解析器那一面按 `fields[1..]` 平摊所有列，列序对它
+    /// 无所谓，所以列数与列内容就是这里要钉的全部。
+    #[test]
+    fn the_two_config_consumer_faces_read_the_same_paths() {
+        // 六个工作负载，除最后一个外各只经一种形态读这份文档；最后一个读的是
+        // 另一份 ConfigMap，用来证明这一面不是"见到 Deployment 就算"。
+        let manifest = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: by-volume
+spec:
+  template:
+    spec:
+      volumes:
+        - name: cfg
+          configMap:
+            name: cogneva-json
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: by-projection
+spec:
+  template:
+    spec:
+      volumes:
+        - name: cfg
+          projected:
+            sources:
+              - configMap:
+                  name: cogneva-json
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: by-envfrom
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          envFrom:
+            - configMapRef:
+                name: cogneva-json
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: by-env-valuefrom
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          env:
+            - name: KEY
+              valueFrom:
+                configMapKeyRef:
+                  name: cogneva-json
+                  key: k
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: by-init-envfrom
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: init
+          envFrom:
+            - configMapRef:
+                name: cogneva-json
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: by-init-env-valuefrom
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: init
+          env:
+            - name: KEY
+              valueFrom:
+                configMapKeyRef:
+                  name: cogneva-json
+                  key: k
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: reads-another-configmap
+spec:
+  template:
+    spec:
+      volumes:
+        - name: other
+          configMap:
+            name: cogneva-prompts
+"#;
+        assert_eq!(
+            mounters_of_config(manifest).expect("readable"),
+            vec![
+                ("deployment", "by-volume".to_string()),
+                ("deployment", "by-projection".to_string()),
+                ("deployment", "by-envfrom".to_string()),
+                ("deployment", "by-env-valuefrom".to_string()),
+                ("deployment", "by-init-envfrom".to_string()),
+                ("deployment", "by-init-env-valuefrom".to_string()),
+            ],
+            "六种形态（卷、projected 源、envFrom、env.valueFrom，容器与 initContainer 各\
+             占一种）每一种都要单独被认出来，读别的 ConfigMap 的不算"
+        );
+
+        let template = "spec.template.spec";
+        let jsonpath = crate::mainline_deployer::config_consumer_jsonpath(template);
+        let groups: Vec<&str> = jsonpath.split("{'|'}").skip(1).collect();
+        assert_eq!(
+            groups.len(),
+            crate::mainline_deployer::CONFIG_CONSUMPTION_PATHS.len(),
+            "jsonpath 的列数必须等于消费形态清单的长度：{jsonpath}"
+        );
+        for (group, path) in groups
+            .iter()
+            .zip(crate::mainline_deployer::CONFIG_CONSUMPTION_PATHS)
+        {
+            let (array, leaf) = path.split_once("[*]").expect("每条路径点名一个数组");
+            assert!(
+                group.contains(&format!(".{template}.{array}[*]")),
+                "路径 {path} 的那一列没有扫它自己那个数组：{group}"
+            );
+            assert!(
+                group.contains(&format!("{{{{.{leaf}}}}}")),
+                "路径 {path} 的那一列取的不是它自己的叶子：{group}"
+            );
+        }
     }
 
     /// The seam the roll depends on: a section the reload path re-applies must
