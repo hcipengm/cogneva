@@ -248,3 +248,56 @@ export async function saveLlmConfig(
 ): Promise<LlmConfigResult> {
   return api.post<LlmConfigResult>('/api/v1/admin/llm-config', payload);
 }
+
+// ── 令牌花销（按 actor，读耐久 rollup） ──
+
+/** 一条 `(actor, origin, upstream, 协议)` 的花销汇总行。 */
+export interface ActorUsage {
+  /** 网关归一化后的调用方（`self_review`、`agent:<role>`、`unknown`） */
+  actor: string;
+  /** 调用来自哪种环境（`gateway_pool`／`resident_worker`／`interactive`／`sandbox`／`unknown`） */
+  origin: string;
+  /** 服务这次调用的上游池身份 */
+  upstream: string;
+  /**
+   * 计数所用的线路协议族。`tokens_input` 的含义**逐协议不同**——
+   * OpenAI 兼容上游里它已含 `tokens_cached`，Anthropic 上两者不相交——
+   * 所以缓存命中率只在一个协议内可比，不能跨协议对消。
+   */
+  api_style: string;
+  /** 区间内所有计量调用，含失败的 */
+  calls: number;
+  /** `calls` 里失败的那部分。它单独留着，因为失败行按构造不产 token：
+   *  「全失败」与「完全没流量」的 token 数一样，靠这个数分开 */
+  failed_calls: number;
+  tokens_input: number;
+  tokens_output: number;
+  tokens_cached: number;
+  /** 覆盖到的调用按次数加权的平均墙钟耗时 */
+  avg_latency_ms: number;
+}
+
+/**
+ * 一次汇总读：花销行，以及它们所汇总的窗口范围。
+ *
+ * 范围必须跟着行一起读：**没有折叠的区间与空闲的区间给出同一个答案（空列表）**。
+ * 折叠每整点落一行，所以调用方最先伸手要的那个尾窗恰好就是还没折的那个；
+ * 没有端点，读者分不出「没折」与「没花」。
+ */
+export interface TokenUsage {
+  /** 折叠层答出的窗口起点；请求范围内没有折叠窗口时与 `covered_until` 同为 null */
+  covered_since: string | null;
+  covered_until: string | null;
+  actors: ActorUsage[];
+}
+
+/**
+ * 过去 `hours` 小时各 actor 的令牌花销。
+ *
+ * 不传 `hours` 用服务端默认；服务端对窗口上限有截断，且回的是**它答出的**
+ * 窗口而不是请求的窗口，所以展示以响应的 `covered_*` 为准。
+ */
+export async function getTokenUsage(hours?: number): Promise<TokenUsage> {
+  const query = hours === undefined ? '' : `?hours=${hours}`;
+  return api.get<TokenUsage>(`/api/v1/observability/token-usage${query}`);
+}

@@ -3,6 +3,7 @@ import { CanvasStage } from './canvas/CanvasStage';
 import { InputOverlay } from './overlay/InputOverlay';
 import { AuthOverlay } from './overlay/AuthOverlay';
 import { LlmSetupOverlay } from './overlay/LlmSetupOverlay';
+import { TokenUsageOverlay } from './overlay/TokenUsageOverlay';
 import { useEventStream } from './hooks/useEventStream';
 import { useAuth } from './hooks/useAuth';
 import { useLlmStatus } from './hooks/useLlmStatus';
@@ -32,6 +33,7 @@ export default function App() {
     refresh: refreshLlmStatus,
   } = useLlmStatus(!USE_MOCK && isAuthenticated);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [usageOpen, setUsageOpen] = useState(false);
 
   const llmReady = !!llmStatus?.configured;
   const showLlmWizard =
@@ -63,8 +65,18 @@ export default function App() {
         />
       )}
 
+      {!USE_MOCK && isAuthenticated && usageOpen && (
+        <TokenUsageOverlay onClose={() => setUsageOpen(false)} />
+      )}
+
       {!USE_MOCK && isAuthenticated && (
         <div className="absolute right-4 top-12 z-10 flex gap-2">
+          <button
+            onClick={() => setUsageOpen(true)}
+            className="rounded-lg border border-slate-700/60 bg-slate-900/80 px-3 py-1.5 text-xs text-slate-300 backdrop-blur-sm transition hover:bg-slate-800"
+          >
+            用量
+          </button>
           {llmReady && (
             <button
               onClick={() => setSettingsOpen(true)}

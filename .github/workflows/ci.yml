@@ -335,6 +335,12 @@ jobs:
       # `example`/`示例` 允许不全（只报数），`definition`/`定义` 差一个就红。
       - name: Check README trait member lists match the source
         run: bash .github/scripts/check-readme-trait-members.sh
+      # 令牌花销那条路由的判据是「不写 SQL 的人能看见」——成品是那一屏，不是路由。
+      # 路由在、契约测试绿、账上那行也读 landed（它的字面量就是路由自己的路径串），
+      # 而面板可以整块消失不让任何东西失败。判的是「从入口可达且被渲染的消费者」，
+      # 并要求那一屏读覆盖端点（不读就会把「这段没折叠」显示成「这期间没花销」）。
+      - name: Check the token spend route has a rendered consumer
+        run: bash deploy/scripts/check-web-token-panel.sh
 
   entry-scripts:
     name: Entry Scripts Lint
