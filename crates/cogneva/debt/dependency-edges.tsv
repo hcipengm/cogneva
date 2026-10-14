@@ -15,7 +15,6 @@
 # 同一份字节，改一个字节两边同时变，不会有第二份会悄悄漂走的名册。
 
 kind	consumer	dep	contract
-allowed	cog-agent	cog-redis	contract::stream::MessageBackend
 allowed	cog-gateway	cog-llm	contract::llm::LlmClient
 allowed	cog-gateway	cog-observability	contract::alerts::AlertStore
 # 这条边今天压在三个点上，都不在 metrics 契约的覆盖范围内：一个是具体的

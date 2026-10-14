@@ -17,7 +17,7 @@ pub use archive::{HttpToolOutputArchive, ToolOutputArchive};
 pub use config::{AgentLoopConfig, AgentManagerConfig};
 
 pub use agent::Agent;
-pub use consumer::{AgentInboxConsumer, InboxMessage};
+pub use consumer::AgentConsumer;
 pub use event_bus_sink::EventBusSink;
 
 // Re-export the canonical AgentState from cog-core so consumers see a single type.
