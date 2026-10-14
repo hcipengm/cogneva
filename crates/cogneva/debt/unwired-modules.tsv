@@ -1,0 +1,26 @@
+# 模块树外的文件欠账的单一来源：仓库带着、却没有任何 mod 声明能到达的 .rs。
+#
+# 一个文件一行，制表符分隔：file  disposition  destination
+#   file         仓根相对的路径，落在某个 crates/<crate>/src/ 下
+#   disposition  这条欠账的去处，取值见下面的闭集
+#   destination  只有 disposition = pending-wiring 的行才非空，且必须是**树里carried
+#                的那个父模块文件**——将来收它进来的那条 mod 会写在这个文件里
+#
+# 一份这样的文件形态上完全合法：cargo 从 crate 根出发、顺着 mod 声明往下走，没有声明
+# 到达的文件不进任何编译目标——编译器、clippy、一切从符号出发的门都读不到它，而它躺在
+# 源码树里、读起来像已落地。这正是它值得一行欠账、而不是一句注释的原因。判的是**声明**
+# 不是**这次构建编不编**：`#[cfg(feature = "rhai")] pub mod script;` 有声明，算到达。
+#
+# disposition 出自闭集（见契约测试里的 DISPOSITIONS），不是散文：一条写句子的登记不管
+# 句子真假都作同样的声明，而登记一个文件的意义正在于这句话能被拿去对着闭集核对。
+#   pending-wiring    文件是要接进模块树的，destination 指它该被哪条 mod 声明收进去。
+#   pending-deletion  文件是须删的：它没有读者，或者是别处已有机制的副本。空 destination
+#                     列就是它的终点。
+#
+# 表是描述树的一份欠账，会自己清空：删掉最后一个文件、或把它接进模块树之后，两半都空，
+# 契约测试没有东西可查。空表是合法终态，不是没登记。
+#
+file	disposition	destination
+crates/cog-extension/src/runtime/security.rs	pending-deletion
+crates/cogneva/src/build_cache_reclaim.rs	pending-deletion
+crates/cogneva/src/build_gate.rs	pending-deletion
