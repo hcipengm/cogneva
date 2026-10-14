@@ -42,14 +42,6 @@ use crate::mcp::{McpTool, McpToolCall, McpToolResult, McpTransport};
 /// 版本号**，不是可以随手改的配置——换掉它等于换了对面该按哪份规范答话。
 pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
-/// 一次请求—应答的期限，以及握手（连上到拿到 `endpoint`）的期限。
-///
-/// 默认取系统 `http_client.timeout_secs`：这是本仓里「一次请求能等多久」的那一处
-/// 定义，传输层不另立一个。
-fn default_request_timeout() -> Duration {
-    Duration::from_secs(cog_net::HttpClientConfig::default().timeout_secs)
-}
-
 /// 一条会话上按 `id` 等着的应答方。
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<serde_json::Value, String>>>>>;
 
@@ -152,7 +144,11 @@ struct SseSession {
 /// MCP 的 HTTP+SSE 传输。真的按事件流解析（见本文件头部）。
 pub struct SseTransport {
     endpoint: String,
-    http: reqwest::Client,
+    /// 由 `net` 插件发布的那一份**流式**客户端：整体请求期限不在它身上，事件流才
+    /// 不会在短交互的期限上被切断。请求—应答自己的期限由 `request_timeout` 逐次
+    /// 给（POST 走 [`cog_core::HttpRequest::timeout`]，等应答与等 `endpoint` 事件
+    /// 各包一层 `tokio::time::timeout`）。
+    http: Arc<dyn cog_core::HttpClient>,
     request_timeout: Duration,
     /// 会话按需建立：第一次请求时才连流、握手，之后复用。流断掉之后下一次请求会
     /// 重新建一条，而不是在这一条上继续等。
@@ -160,41 +156,30 @@ pub struct SseTransport {
 }
 
 impl SseTransport {
-    /// 用系统 `http_client` 段构造（流式客户端：没有总超时，见
-    /// [`cog_net::build_streaming_client`]）。
+    /// 用调用方交进来的客户端与请求期限构造。
+    ///
+    /// 客户端与期限都来自 `net` 插件发布的那两份服务，传输层不自己读配置、不另立
+    /// 一个数字：这里的等待不在 HTTP 调用本身上——应答是**另一条连接**上回来的，
+    /// 客户端的整体期限管不到它——但两个期限是同一件事的两面，各写一份迟早会一个
+    /// 先到时另一个还在等。
     ///
     /// 地址在这里就解析一次：写错的端点是一条**启动时**就该报的配置错误，而拖到第一次
     /// 工具调用才报，找到它的时候那个配变量的人早已不在现场。
-    pub fn new(endpoint: impl Into<String>) -> cog_core::SFResult<Self> {
+    pub fn new(
+        endpoint: impl Into<String>,
+        http: Arc<dyn cog_core::HttpClient>,
+        request_timeout: Duration,
+    ) -> cog_core::SFResult<Self> {
         let endpoint = endpoint.into();
         reqwest::Url::parse(&endpoint).map_err(|e| {
             cog_core::SFError::Config(format!("mcp sse endpoint {endpoint:?} is not a URL: {e}"))
         })?;
-        let config = cog_net::HttpClientConfig::load()?;
-        let http = cog_net::build_streaming_client(&config)?;
-        Ok(Self::with_client_and_timeout(
+        Ok(Self {
             endpoint,
-            http,
-            Duration::from_secs(config.timeout_secs),
-        ))
-    }
-
-    /// 用给定的客户端构造，期限取系统默认。测试注入用，生产走 [`Self::new`]。
-    pub fn with_client(endpoint: impl Into<String>, http: reqwest::Client) -> Self {
-        Self::with_client_and_timeout(endpoint, http, default_request_timeout())
-    }
-
-    fn with_client_and_timeout(
-        endpoint: impl Into<String>,
-        http: reqwest::Client,
-        request_timeout: Duration,
-    ) -> Self {
-        Self {
-            endpoint: endpoint.into(),
             http,
             request_timeout,
             session: Mutex::new(None),
-        }
+        })
     }
 
     /// 取一条可用会话：没有、或上一条的流已经断了，就重连一次。
@@ -216,25 +201,25 @@ impl SseTransport {
         let url = reqwest::Url::parse(&self.endpoint).map_err(|e| {
             anyhow::anyhow!("mcp sse endpoint {:?} is not a URL: {e}", self.endpoint)
         })?;
+        // 连流这一笔**不带**请求期限：它会一直开着，期限由客户端持有（流式那一份
+        // 没有整体期限）。
         let resp = self
             .http
-            .get(url.clone())
-            .header(reqwest::header::ACCEPT, "text/event-stream")
-            .send()
+            .execute_stream(
+                cog_core::HttpRequest::get(url.as_str()).header("Accept", "text/event-stream"),
+            )
             .await
             .map_err(|e| anyhow::anyhow!("mcp sse connect to {url} failed: {e}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            anyhow::bail!("mcp sse endpoint {url} -> HTTP {status}");
+        if !(200..300).contains(&resp.status) {
+            anyhow::bail!("mcp sse endpoint {url} -> HTTP {}", resp.status);
         }
         // 内容类型不对就当场报：把一份 HTML 错误页当事件流读，会读成「一个事件都没
         // 有」；而服务端说的其实是别的意思。
         let content_type = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
+            .headers
+            .get("content-type")
+            .cloned()
+            .unwrap_or_default();
         if !content_type.starts_with("text/event-stream") {
             anyhow::bail!(
                 "mcp sse endpoint {url} answered Content-Type {content_type:?}, not text/event-stream"
@@ -245,7 +230,7 @@ impl SseTransport {
         let closed = Arc::new(AtomicBool::new(false));
         let (endpoint_tx, endpoint_rx) = oneshot::channel::<Result<String, String>>();
         tokio::spawn(read_sse_stream(
-            resp,
+            resp.stream,
             url.clone(),
             pending.clone(),
             closed.clone(),
@@ -314,20 +299,21 @@ impl SseTransport {
         session.pending.lock().await.insert(id, tx);
 
         let body = jsonrpc_request(id, method, params);
-        let posted = self
-            .http
-            .post(&session.message_url)
+        let post = cog_core::HttpRequest::post(&session.message_url)
             .json(&body)
-            .send()
-            .await;
+            .map(|req| req.timeout(self.request_timeout.as_secs().max(1)));
+        let posted = match post {
+            Ok(req) => self.http.execute(req).await,
+            Err(e) => Err(e),
+        };
         match posted {
-            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) if resp.is_success() => {}
             Ok(resp) => {
                 session.pending.lock().await.remove(&id);
                 anyhow::bail!(
                     "mcp {method}: POST to {} -> HTTP {}",
                     session.message_url,
-                    resp.status()
+                    resp.status
                 );
             }
             Err(e) => {
@@ -359,20 +345,17 @@ impl SseTransport {
         params: serde_json::Value,
     ) -> anyhow::Result<()> {
         let body = jsonrpc_notification(method, params);
-        let resp = self
-            .http
-            .post(&session.message_url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!("mcp {method}: POST to {} failed: {e}", session.message_url)
-            })?;
-        if !resp.status().is_success() {
+        let req = cog_core::HttpRequest::post(&session.message_url)
+            .json(&body)?
+            .timeout(self.request_timeout.as_secs().max(1));
+        let resp = self.http.execute(req).await.map_err(|e| {
+            anyhow::anyhow!("mcp {method}: POST to {} failed: {e}", session.message_url)
+        })?;
+        if !resp.is_success() {
             anyhow::bail!(
                 "mcp {method}: POST to {} -> HTTP {}",
                 session.message_url,
-                resp.status()
+                resp.status
             );
         }
         Ok(())
@@ -382,13 +365,13 @@ impl SseTransport {
 /// 读事件流那一头：把 `endpoint` 事件交给连接方，把 `message` 事件里的 JSON-RPC
 /// 应答按 `id` 交给等着的人。
 async fn read_sse_stream(
-    resp: reqwest::Response,
+    body: cog_core::HttpBodyStream,
     stream_url: reqwest::Url,
     pending: Pending,
     closed: Arc<AtomicBool>,
     endpoint_tx: oneshot::Sender<Result<String, String>>,
 ) {
-    let mut events = resp.bytes_stream().eventsource();
+    let mut events = body.eventsource();
     let mut endpoint_tx = Some(endpoint_tx);
     while let Some(event) = events.next().await {
         let event = match event {
@@ -491,7 +474,11 @@ impl StdioTransport {
     /// 空命令在这里就拒：这是一条**配置错误**，而拖到第一次工具调用才报，找到它的
     /// 时候配它的那个人早已不在现场。（子进程起不起得来要等真去起的时候才知道，
     /// 与 SSE 那条一样属于连接期的事。）
-    pub fn new(program: impl Into<String>, args: Vec<String>) -> cog_core::SFResult<Self> {
+    pub fn new(
+        program: impl Into<String>,
+        args: Vec<String>,
+        request_timeout: Duration,
+    ) -> cog_core::SFResult<Self> {
         let program = program.into();
         if program.trim().is_empty() {
             return Err(cog_core::SFError::Config(
@@ -502,7 +489,7 @@ impl StdioTransport {
             program,
             args,
             env: Vec::new(),
-            request_timeout: default_request_timeout(),
+            request_timeout,
             session: Mutex::new(None),
         })
     }
@@ -818,6 +805,8 @@ pub fn transport_from_config(
     endpoint: Option<String>,
     command: Option<String>,
     args: Option<String>,
+    http: Arc<dyn cog_core::HttpClient>,
+    request_timeout: Duration,
 ) -> cog_core::SFResult<Option<(Box<dyn McpTransport>, String)>> {
     match (endpoint, command) {
         (Some(_), Some(_)) => Err(cog_core::SFError::Config(
@@ -827,12 +816,12 @@ pub fn transport_from_config(
                 .into(),
         )),
         (Some(endpoint), None) => {
-            let transport = SseTransport::new(endpoint.clone())?;
+            let transport = SseTransport::new(endpoint.clone(), http, request_timeout)?;
             Ok(Some((Box::new(transport), format!("sse {endpoint}"))))
         }
         (None, Some(command)) => {
             let args = parse_command_args(args.as_deref())?;
-            let transport = StdioTransport::new(command.clone(), args)?;
+            let transport = StdioTransport::new(command.clone(), args, request_timeout)?;
             Ok(Some((Box::new(transport), format!("stdio {command}"))))
         }
         (None, None) => match args {
@@ -881,6 +870,26 @@ fn parse_command_args(raw: Option<&str>) -> cog_core::SFResult<Vec<String>> {
 mod tests {
     use super::*;
 
+    /// The selection tests never send a request — they ask which configuration
+    /// wins — so a client that says so is the honest one: a stand-in that
+    /// answered anything would hide a construction path that tried to use it.
+    #[derive(Debug)]
+    struct UnusedClient;
+
+    #[async_trait::async_trait]
+    impl cog_core::HttpClient for UnusedClient {
+        async fn execute(
+            &self,
+            _req: cog_core::HttpRequest,
+        ) -> cog_core::SFResult<cog_core::HttpResponse> {
+            unimplemented!("the selection tests never send a request")
+        }
+    }
+
+    fn unused_http() -> Arc<dyn cog_core::HttpClient> {
+        Arc::new(UnusedClient)
+    }
+
     /// 选中的是哪条配置。把传输层丢掉：测试只问「选了谁」，起进程是另一条路的事
     /// （在 `tests/mcp_stdio.rs` 里问）。
     fn selected(
@@ -892,6 +901,8 @@ mod tests {
             endpoint.map(str::to_string),
             command.map(str::to_string),
             args.map(str::to_string),
+            unused_http(),
+            Duration::from_secs(30),
         )
         .map(|selection| selection.map(|(_, what)| what))
     }

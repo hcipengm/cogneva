@@ -10,6 +10,7 @@ use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::Arc;
 
 /// A stream of HTTP response body chunks.
 pub type HttpBodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, SFError>> + Send>>;
@@ -53,6 +54,32 @@ impl HttpStreamResponse {
 // ─── Configuration ──────────────────────────────────────────────────────────
 
 // ─── Request / Response ─────────────────────────────────────────────────────
+
+/// The request deadline the published [`HttpClient`] was built with.
+///
+/// A consumer that has to bound a wait of its own — a protocol handshake, or a
+/// reply that arrives on a different connection than the request went out on —
+/// reads this instead of defining a second number. The deadline is one setting
+/// with one value; two copies of it that are supposed to agree are two copies
+/// that drift, and the drift shows up as one side timing out while the other
+/// waits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpRequestTimeout(pub std::time::Duration);
+
+/// An [`HttpClient`] that carries no overall request deadline of its own, for a
+/// connection meant to outlive a short exchange — a server-sent-events stream,
+/// a long poll.
+///
+/// It is a distinct published service rather than a second trait because the
+/// deadline lives in the client, not in the request: a per-request timeout can
+/// only shorten the client's, so a consumer holding the ordinary client cannot
+/// open a connection that outlives it. One client handed out for both jobs is
+/// how a stream gets cut at the short-exchange deadline and the server is
+/// blamed for it; the choice of which client to hold *is* the choice, so the
+/// two are published separately. A bare request that needs a deadline still
+/// sets it per request ([`HttpRequest::timeout`]).
+#[derive(Debug, Clone)]
+pub struct StreamingHttpClient(pub Arc<dyn HttpClient>);
 
 /// An HTTP request description.
 /// Callers build requests with the builder-style methods (`get`, `post`,

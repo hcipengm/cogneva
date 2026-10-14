@@ -47,13 +47,24 @@ impl cog_core::SystemPlugin for NetPlugin {
     }
 
     async fn init(&mut self, ctx: &cog_core::PluginContext) -> cog_core::SFResult<()> {
+        // http_client 是 cog-net 自有配置段，自读 cogneva.json。配置在这里读一次，
+        // 两条构造路径都用它：客户端要的是超时/连接池/代理，而消费者还要那个
+        // 请求期限本身（见下面发布的 `HttpRequestTimeout`），后者不能靠在别处
+        // 再读一遍配置得到。
+        let config = crate::HttpClientConfig::load()?;
         let http = if let Some(ref client) = self.http_client {
             client.clone()
         } else {
-            // http_client 是 cog-net 自有配置段，自读 cogneva.json。
-            let config = crate::HttpClientConfig::load()?;
             Arc::new(crate::ReqwestHttpClient::from_config(&config)?)
         };
+
+        // 流式那一份：同一段配置，去掉整体请求期限。期限活在客户端上，而一次请求
+        // 的超时只能把它调小、不能取消，所以「连接要不要活过短交互的期限」只能是
+        // 持有哪一个客户端的选择——见 `StreamingHttpClient`。少了这一份，事件流会
+        // 在短交互的期限上被切断，而读的人会把账记到服务端头上。
+        let streaming = Arc::new(cog_core::StreamingHttpClient(Arc::new(
+            crate::ReqwestHttpClient::new(crate::build_streaming_client(&config)?),
+        )));
 
         let ws = if let Some(ref client) = self.websocket_client {
             client.clone()
@@ -67,6 +78,10 @@ impl cog_core::SystemPlugin for NetPlugin {
         ctx.publish(http.clone());
         let http_dyn: Arc<dyn cog_core::HttpClient> = http;
         ctx.publish_service(http_dyn);
+        ctx.publish(streaming);
+        ctx.publish(Arc::new(cog_core::HttpRequestTimeout(
+            std::time::Duration::from_secs(config.timeout_secs),
+        )));
         ctx.publish(ws.clone());
         let ws_dyn: Arc<dyn cog_core::WebSocketClient> = ws;
         ctx.publish_service(ws_dyn);

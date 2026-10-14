@@ -27,8 +27,12 @@ use cog_protocol::{McpTransport, StdioTransport};
 
 /// The server this suite is about, launched the way a client launches it.
 fn client() -> StdioTransport {
-    StdioTransport::new(env!("CARGO_BIN_EXE_cogneva"), vec!["mcp-serve".to_string()])
-        .expect("the path of this binary is a command with something in it")
+    StdioTransport::new(
+        env!("CARGO_BIN_EXE_cogneva"),
+        vec!["mcp-serve".to_string()],
+        Duration::from_secs(30),
+    )
+    .expect("the path of this binary is a command with something in it")
 }
 
 fn text_of(result: &cog_protocol::mcp::McpToolResult) -> String {

@@ -29,11 +29,6 @@ allowed	cog-gateway	cog-redis	contract::kv::KeyValueStore
 # 那一笔就撤掉的原因。
 allowed	cog-gateway	cog-storage	contract::storage::MetricsBackend
 allowed	cog-memory	cog-storage	contract::storage::VectorBackend
-# 这条边是 MCP 的 HTTP+SSE 传输要一个**能流式读**的客户端：契约同样是
-# contract::net::HttpClient，它自带 execute_stream（后端支持真流式就覆写它，
-# reqwest 那一份覆写了），所以「长过请求的那条流」不需要第二个客户端概念。
-# 余下的与上一条同形：配置加载与从它读出来的默认超时。
-allowed	cog-protocol	cog-net	contract::net::HttpClient
 allowed	cog-quota	cog-redis	contract::kv::KeyValueStore
 allowed	cog-quota	cog-storage	contract::kv::KeyValueStore
 allowed	cog-reflection	cog-eval	contract::eval::EvalService

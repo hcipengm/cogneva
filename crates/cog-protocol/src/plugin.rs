@@ -70,10 +70,19 @@ impl cog_core::SystemPlugin for ProtocolPlugin {
             // that cannot be used is a startup finding, not something to
             // discover as a failed tool call much later. The same goes for the
             // stdio side, whose command is spawned on the same terms.
+            //
+            // Both the client and the deadline come from `net`: the streaming
+            // client (an MCP session outlives a short exchange, so it cannot be
+            // the one carrying the request deadline) and the request timeout
+            // that bounds each handshake, POST and reply wait.
+            let http = ctx.require::<cog_core::StreamingHttpClient>()?.0.clone();
+            let request_timeout = ctx.require::<cog_core::HttpRequestTimeout>()?.0;
             let selection = crate::transport_from_config(
                 std::env::var("COGNEVA_MCP_ENDPOINT").ok(),
                 std::env::var("COGNEVA_MCP_COMMAND").ok(),
                 std::env::var("COGNEVA_MCP_ARGS").ok(),
+                http,
+                request_timeout,
             )?;
             match selection {
                 Some((transport, how)) => {
@@ -236,7 +245,9 @@ pub(crate) fn spawn_grpc_server(
 /// Static descriptor for auto-discovery.
 pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "protocol",
-    requires: &[],
+    // The MCP transport is built during `init` from `net`'s streaming client and
+    // request deadline, so `net` has to have run first.
+    requires: &["net"],
     optional_requires: &[],
     factory: || Box::new(ProtocolPlugin::new()),
 };

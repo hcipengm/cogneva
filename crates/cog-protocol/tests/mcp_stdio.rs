@@ -117,15 +117,19 @@ fn probe(behaviour: &str) -> Probe {
         uuid::Uuid::new_v4()
     ));
     let _ = std::fs::remove_file(&receipt);
-    let transport = StdioTransport::new("sh", vec!["-c".to_string(), STUB.to_string()])
-        .expect("a command with something in it")
-        .with_env(vec![
-            (
-                "COGNEVA_PROBE_RECEIPT".to_string(),
-                receipt.display().to_string(),
-            ),
-            ("COGNEVA_PROBE_BEHAVIOUR".to_string(), behaviour.to_string()),
-        ]);
+    let transport = StdioTransport::new(
+        "sh",
+        vec!["-c".to_string(), STUB.to_string()],
+        Duration::from_secs(30),
+    )
+    .expect("a command with something in it")
+    .with_env(vec![
+        (
+            "COGNEVA_PROBE_RECEIPT".to_string(),
+            receipt.display().to_string(),
+        ),
+        ("COGNEVA_PROBE_BEHAVIOUR".to_string(), behaviour.to_string()),
+    ]);
     Probe { transport, receipt }
 }
 

@@ -213,11 +213,96 @@ async fn stub(behaviour: Behaviour) -> (String, Shared) {
     (format!("http://{addr}"), shared)
 }
 
-/// The transport under test, on a client with no overall deadline of its own so
-/// that a case asserting a hang can only fail by hanging rather than by a
-/// timeout this test set.
+/// A `reqwest`-backed client for the tests: the transport is handed its client
+/// through the same contract the plugin uses, so the stub has to be reachable
+/// through that contract and not through a private one.
+///
+/// No overall deadline of its own (a bare `reqwest::Client`), so a case that
+/// asserts a hang can only fail by hanging, not by a timeout this test set.
+#[derive(Debug)]
+struct TestHttpClient(reqwest::Client);
+
+impl TestHttpClient {
+    fn build(&self, req: &cog_core::HttpRequest) -> reqwest::RequestBuilder {
+        let method = reqwest::Method::from_bytes(req.method.as_bytes())
+            .expect("the transport builds its own methods");
+        let mut builder = self.0.request(method, &req.url);
+        for (k, v) in &req.headers {
+            builder = builder.header(k, v);
+        }
+        if let Some(body) = &req.body {
+            builder = builder.body(body.clone());
+        }
+        if let Some(secs) = req.timeout_secs {
+            builder = builder.timeout(Duration::from_secs(secs));
+        }
+        builder
+    }
+}
+
+fn headers_of(resp: &reqwest::Response) -> std::collections::HashMap<String, String> {
+    resp.headers()
+        .iter()
+        .filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string())))
+        .collect()
+}
+
+#[async_trait::async_trait]
+impl cog_core::HttpClient for TestHttpClient {
+    async fn execute(
+        &self,
+        req: cog_core::HttpRequest,
+    ) -> cog_core::SFResult<cog_core::HttpResponse> {
+        let resp = self
+            .build(&req)
+            .send()
+            .await
+            .map_err(|e| cog_core::SFError::Agent(format!("test client: {e}")))?;
+        let status = resp.status().as_u16();
+        let headers = headers_of(&resp);
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| cog_core::SFError::Agent(format!("test client: {e}")))?
+            .to_vec();
+        Ok(cog_core::HttpResponse {
+            status,
+            headers,
+            body,
+        })
+    }
+
+    async fn execute_stream(
+        &self,
+        req: cog_core::HttpRequest,
+    ) -> cog_core::SFResult<cog_core::HttpStreamResponse> {
+        use futures::TryStreamExt;
+        let resp = self
+            .build(&req)
+            .send()
+            .await
+            .map_err(|e| cog_core::SFError::Agent(format!("test client: {e}")))?;
+        let status = resp.status().as_u16();
+        let headers = headers_of(&resp);
+        let stream = resp
+            .bytes_stream()
+            .map_err(|e| cog_core::SFError::Agent(format!("test client stream: {e}")));
+        Ok(cog_core::HttpStreamResponse {
+            status,
+            headers,
+            stream: Box::pin(stream),
+        })
+    }
+}
+
+/// The transport under test, handed a client the way the plugin hands it one.
 fn transport(base: &str) -> SseTransport {
-    SseTransport::with_client(format!("{base}/sse"), reqwest::Client::new())
+    SseTransport::new(
+        format!("{base}/sse"),
+        Arc::new(TestHttpClient(reqwest::Client::new())),
+        Duration::from_secs(30),
+    )
+    .expect("the stub URL is a URL")
 }
 
 async fn paths(shared: &Shared) -> Vec<String> {
@@ -350,8 +435,12 @@ async fn a_stream_that_ends_fails_the_waiting_call_instead_of_hanging() {
 #[tokio::test]
 async fn a_response_that_is_not_an_event_stream_is_refused() {
     let (base, shared) = stub(Behaviour::Answers).await;
-    let transport =
-        SseTransport::with_client(format!("{base}/not-a-stream"), reqwest::Client::new());
+    let transport = SseTransport::new(
+        format!("{base}/not-a-stream"),
+        Arc::new(TestHttpClient(reqwest::Client::new())),
+        Duration::from_secs(30),
+    )
+    .expect("the stub URL is a URL");
 
     let error = transport
         .list_tools()

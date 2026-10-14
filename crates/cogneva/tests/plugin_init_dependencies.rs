@@ -46,6 +46,12 @@ const INIT_CONSUMES: &[(&str, &str)] = &[
     // never published, and the failure would be a resume chain with no write
     // side rather than a startup diagnostic.
     ("orchestrator", "agent"),
+    // HttpClient — the code-platform providers reach the platform over the web,
+    // and the client is taken from `net` when the plugin resolves it at init.
+    ("github", "net"),
+    // StreamingHttpClient + HttpRequestTimeout — the MCP transport is built at
+    // init and takes both its client and its deadline from `net` there.
+    ("protocol", "net"),
 ];
 
 /// Every plugin `name` transitively depends on.

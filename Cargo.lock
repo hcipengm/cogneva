@@ -1792,7 +1792,6 @@ dependencies = [
  "bytes",
  "chrono",
  "cog-core",
- "cog-net",
  "eventsource-stream",
  "futures",
  "prost 0.13.5",
