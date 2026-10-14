@@ -333,6 +333,41 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         // from the outside. Publishing the count is what tells them apart.
         ctx.publish_observable(Arc::new(crate::process_zombies::ProcessZombieObservable));
 
+        // ── Host producers that feed the platform's accounts ──
+        // The row is written by the producer on the host, once per successful
+        // cycle whether or not that cycle had anything new to queue; the intake
+        // is idempotent, so every other trace of a delivery is a trace of
+        // content that arrived and says nothing about a producer that stopped.
+        // Read here at scrape time rather than published by the account's own
+        // loop, so that the reading goes quiet with the *producer* rather than
+        // with the platform: a loop that reported its own feeder's silence would
+        // be reporting it from inside the thing the feeder feeds.
+        match std::env::var("COGNEVA_DATABASE_URL") {
+            Ok(url) if !url.trim().is_empty() => {
+                match crate::producer_heartbeat::ProducerHeartbeatStore::connect(&url).await {
+                    Ok(store) => match store.init_schema().await {
+                        Ok(()) => {
+                            ctx.publish_observable(Arc::new(
+                                crate::producer_heartbeat::ProducerHeartbeatObservable::new(
+                                    store,
+                                    crate::producer_heartbeat::PRINCIPLE_PRODUCER_SOURCE,
+                                ),
+                            ));
+                            info!("producer heartbeat readings published");
+                        }
+                        Err(e) => warn!(
+                            error = %e,
+                            "producer heartbeat table init failed; the producers' last \
+                             deliveries are not readable and their rules read that as a \
+                             producer that has delivered nothing"
+                        ),
+                    },
+                    Err(e) => warn!(error = %e, "producer heartbeat store connect failed"),
+                }
+            }
+            _ => info!("COGNEVA_DATABASE_URL unset; producer heartbeats not readable"),
+        }
+
         // ── Persistent alert state machine ──
         // Created here (not in start) so the read-side ActiveAlertSource is
         // published before any plugin's start runs — init_all completes

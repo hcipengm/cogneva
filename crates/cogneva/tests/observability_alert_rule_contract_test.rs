@@ -382,6 +382,22 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_host_ledger_slices_readable",
         "crates/cog-observability/src/host_ledger.rs",
     ),
+    // The host producer's heartbeat: when the process that feeds the principle
+    // account last completed a delivery, and the period it declared on that
+    // delivery. Both are read together and neither is a constant here -- the
+    // moment is stamped by the database at receipt, the period is measured from
+    // the timer that drives the producer, and the rule multiplies one by the
+    // other. A producer that stopped and one that is running over an unchanged
+    // corpus leave the same account, so these two series are the only reading
+    // that tells them apart.
+    (
+        "cogneva_principle_producer_last_push_timestamp_seconds",
+        "crates/cog-observability/src/producer_heartbeat.rs",
+    ),
+    (
+        "cogneva_principle_producer_push_period_seconds",
+        "crates/cog-observability/src/producer_heartbeat.rs",
+    ),
     (
         "cogneva_process_zombies",
         "crates/cog-observability/src/process_zombies.rs",

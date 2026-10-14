@@ -1744,6 +1744,24 @@ data:
               },
               "severity": "warning",
               "summary": "节点 {node} 的宿主账本跑起来了，但它能读到的 cgroup slice 少于 3 个（{value} 个，3 个是 user.slice / system.slice / kubepods.slice）。这不是「这个 slice 是空的」，是「这个节点的挂载点下面没有这些目录」——cgroup v1 的宿主上 /sys/fs/cgroup 存在，但里面不是这三个 slice 目录，于是账本进程一个 memory.stat 都读不到。产出方对 kubepods 这一格认两种拼法——systemd 的 kubepods.slice 与 cgroupfs 驱动的 kubepods（后者是没有 .slice 后缀的目录，kubelet 的默认驱动之一），两种都读不到才算缺席——所以这里数的是「读不到整棵树」，不是「这台节点的驱动名字和我们不一样」：一个用 cgroupfs 驱动的节点是健康的，把它报成故障只会让这条界常年红着、最后没人看。把这种情况报成 0 是错读数：0 是量出来的，看不见是没量到，而两者在图上同形。所以产出方把「读到几个」单独发成 cogneva_host_ledger_slices_readable，本规则读它；账本 Pod 自己也会在日志里按 slice 各打一条 warn。读数在读到 0 个时最危险也最容易混过去：那个节点上宿主侧的内存账整个是空的，而节点在场序列照发，所以另一条 host_ledger_node_unreported 不会报——两条规则各管一半，缺一不可。"
+            },
+            {
+              "name": "principle_producer_never_delivered",
+              "promql": "absent(max by (source) (cogneva_principle_producer_last_push_timestamp_seconds))",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "原则总账的收件台从来没有收到过任何一次投递：平台上没有一条「生产者最近一次成功投递」的时刻，而不是「它很久没投了」——后者是另一条 principle_producer_stopped 的题目。这一格之所以要单列，是因为缺席读起来像健康：账上没有新行、收件台积压为 0、折账 loop 每一拍都绿，三样都成立，而生产者可能一次都没跑过。本规则的缺席还有第二个成因，报出来时要一并看：能读这张表的进程读不到它（库连不上、表没建出来、这一族的读数没被抓取），此时所有 principle_producer_* 一起消失。所以本规则是 principle_producer_stopped 的前置——那条规则要一个时刻与一个周期才算得出界，而两者都由生产者自己写：从来没投过的时候分母不存在，用 0 去凑会让它拿一个没人声明过的周期去比。修法是让宿主上的生产者（cogneva-principle-producer.timer）真的跑起来并投一次；投递按 (slug, 来源) 幂等，所以重跑不会排出第二遍。表达式先 max by (source) 聚一次再交给 absent：这一族的序列抓下来带 pod/container，而这条规则讲的主体是生产者（source），不聚合掉的话告警身份会跟着报信的 Pod 重建而换新——同一个「从来没有投过」会在每次滚动之后作为一条全新告警重报一遍。序列真的缺席时，裸选择器与聚合后的选择器给的是同一件事：一条没有标签的序列，所以这层聚合不改变这条规则判什么。"
+            },
+            {
+              "name": "principle_producer_stopped",
+              "promql": "(time() - max by (source) (cogneva_principle_producer_last_push_timestamp_seconds)) > 6 * max by (source) (cogneva_principle_producer_push_period_seconds)",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "原则总账的生产者已经 {value} 秒没有成功投递了，超过它自己声明的投递周期的六倍。两个操作数都是生产者自己写的，不是写在这条规则里的常数：时刻是平台收到它那一刻的本机 now()（所以年龄是同一条钟上的两个读数之差），周期是它上一拍从驱动它的 timer 上量出来的间隔。调度改了，这条界跟着改；把周期写成常数的话，规则会在旧节拍上等下去——那是静默而不是吵闹，停跑的生产者会被读成健康的。六倍是这台机器上「一个声明的周期被错过」的既有倍数（background_loop_stalled 用的是同一个），不是为这一条拍的。为什么需要这条：投递按 (slug, 来源) 幂等，语料没变的一拍什么都不排，于是账上唯一的痕迹都是「有内容到达过」——一条行的 first_seen_at 说的是那条原则第一次被描述的时刻，不是生产者最后一次运行。一个昨天停掉的生产者与一个正常跑在没变的语料上的生产者，留下的是同一份账、同一个积压深度、同一组计数。两侧的 max by (source) 是把报信者聚合掉：序列带 pod/container，而这里讲的主体是生产者，不聚合的话同一个停跑会在每次 Pod 滚动后变成一条全新的告警。读它要连同 cogneva_loop_tick_age_seconds{loop=\"principle_ledger\"} 一起读：投递新而折账停是积压，折账新而生产者停是没有人喂的账。"
             }
           ]
         },
