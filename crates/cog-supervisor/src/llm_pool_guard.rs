@@ -1,9 +1,10 @@
 //! LLM upstream pool awareness for the scheduler.
 //!
 //! The security gateway owns upstream health (it is the only process holding
-//! upstream credentials) and publishes a snapshot to Redis. This module reads
-//! that snapshot on a tick and cooperatively pauses the *LLM-dependent* task
-//! class while every upstream is unusable, resuming it once one comes back.
+//! upstream credentials) and publishes a snapshot to the shared key-value face.
+//! This module reads that snapshot on a tick and cooperatively pauses the
+//! *LLM-dependent* task class while every upstream is unusable, resuming it
+//! once one comes back.
 //!
 //! Pausing is class-scoped on purpose: builds, image publishing, mainline
 //! deployment and metric collection keep running without an LLM, so a pool
@@ -25,43 +26,49 @@ use crate::scheduler_gate::SchedulerGate;
 /// Loop name reported through the background-loop liveness family.
 pub const LLM_POOL_GUARD_LOOP: &str = "supervisor_llm_pool_guard";
 
-/// Reads the snapshot the gateway writes to Redis.
+/// Reads the snapshot the gateway writes, through the shared key-value face.
 ///
-/// The channel is established on demand and retried after a failure, so a redis
-/// that is briefly away -- the gateway and redis rolling together, a resolver
-/// not up yet -- does not disable the guard for the life of the process. Only a
-/// url that cannot be parsed does that, and that one is a configuration fault
-/// rather than a blip.
-pub struct RedisLlmPoolStatusSource {
-    channel: cog_redis::Reconnecting,
+/// The face is handed in rather than built from a connection string: reaching
+/// the store is the storage layer's business, and a reader that opens its own
+/// connection is a reader that has to be rebuilt whenever the transport moves.
+///
+/// Nothing here connects on demand and nothing latches: a face that answers
+/// with an error this pass is asked again next pass, so a store that is briefly
+/// away -- the gateway and the store rolling together, a resolver not up yet --
+/// does not disable the guard for the life of the process.
+pub struct KeyValuePoolStatusSource {
+    store: Arc<dyn cog_core::KeyValueStore>,
 }
 
-impl RedisLlmPoolStatusSource {
-    pub fn new(redis_url: &str) -> Result<Self, redis::RedisError> {
-        let client = redis::Client::open(redis_url)?;
-        Ok(Self {
-            channel: cog_redis::Reconnecting::new(client),
-        })
+impl KeyValuePoolStatusSource {
+    pub fn new(store: Arc<dyn cog_core::KeyValueStore>) -> Self {
+        Self { store }
     }
 }
 
 #[async_trait::async_trait]
-impl LlmPoolStatusSource for RedisLlmPoolStatusSource {
+impl LlmPoolStatusSource for KeyValuePoolStatusSource {
     async fn status(&self) -> Option<LlmPoolStatus> {
-        let mut conn = self.channel.get().await?;
-        let raw: redis::RedisResult<Option<String>> = redis::cmd("GET")
-            .arg(cog_core::LLM_POOL_STATUS_KEY)
-            .query_async(&mut conn)
-            .await;
+        let raw = match self.store.get(cog_core::LLM_POOL_STATUS_KEY).await {
+            Ok(raw) => raw,
+            Err(e) => {
+                // Not a verdict about the pool: nothing was read. Said out loud
+                // because on this channel an unreadable store and an absent
+                // snapshot both leave the gate where it was, and only one of
+                // them is a fault.
+                tracing::warn!(error = %e, "LLM pool status unreadable this pass, no verdict");
+                return None;
+            }
+        };
         match raw {
-            Ok(Some(text)) => match serde_json::from_str(&text) {
+            Some(text) => match serde_json::from_str(&text) {
                 Ok(status) => Some(status),
                 Err(e) => {
                     tracing::warn!(error = %e, "LLM pool status snapshot malformed, no verdict this pass");
                     None
                 }
             },
-            _ => None,
+            None => None,
         }
     }
 }
@@ -99,7 +106,7 @@ impl LlmPoolGuard {
     ///
     /// A pass that reads no snapshot changes nothing: the gate keeps the state
     /// the last reading put it in and no edge is reported. Both halves of the
-    /// signal roll — the gateway publishes it and redis holds it, and every
+    /// signal roll — the gateway publishes it and the store holds it, and every
     /// deployment restarts both — so an absent snapshot is an ordinary sight
     /// during a rollout. Reading it as "the pool is fine" would resume work that
     /// cannot succeed, and would report a recovery on every restart, which makes
@@ -253,7 +260,7 @@ mod tests {
         assert!(!gate.is_paused_kind(TaskClass::LlmDependent));
     }
 
-    /// The gateway and redis both restart on every deployment, so a pass with no
+    /// The gateway and the store both restart on every deployment, so a pass with no
     /// snapshot is routine. It must not undo the pause, and it must not report a
     /// recovery: a reported recovery resolves the alert and the next firing edge
     /// re-dates it, which turns the pool-down alert's start time into the time of
@@ -291,5 +298,120 @@ mod tests {
         let guard = LlmPoolGuard::new(source, gate.clone());
         assert_eq!(guard.enforce().await, PoolTransition::Steady);
         assert!(!gate.is_paused_kind(TaskClass::LlmDependent));
+    }
+
+    /// The store side of the source, scripted: one answer, whatever it is.
+    ///
+    /// Written against the contract rather than against a live store: what is
+    /// under test is which answers count as a verdict, and that is a property of
+    /// this adapter, not of the store's reachability. A real store would make
+    /// the test a statement about whether one is running.
+    struct ScriptedStore {
+        answer: Mutex<Option<cog_core::SFResult<Option<String>>>>,
+    }
+
+    impl ScriptedStore {
+        fn answering(result: cog_core::SFResult<Option<String>>) -> Arc<Self> {
+            Arc::new(Self {
+                answer: Mutex::new(Some(result)),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::KeyValueStore for ScriptedStore {
+        async fn get(&self, _key: &str) -> cog_core::SFResult<Option<String>> {
+            self.answer.lock().unwrap().take().expect("one answer")
+        }
+
+        async fn set(&self, _: &str, _: &str) -> cog_core::SFResult<()> {
+            unreachable!("the pool status source only reads")
+        }
+        async fn set_ex(&self, _: &str, _: &str, _: u64) -> cog_core::SFResult<()> {
+            unreachable!("the pool status source only reads")
+        }
+        async fn del(&self, _: &str) -> cog_core::SFResult<()> {
+            unreachable!("the pool status source only reads")
+        }
+        async fn expire(&self, _: &str, _: i64) -> cog_core::SFResult<()> {
+            unreachable!("the pool status source only reads")
+        }
+        async fn ttl(&self, _: &str) -> cog_core::SFResult<i64> {
+            unreachable!("the pool status source only reads")
+        }
+        async fn incr(&self, _: &str, _: i64) -> cog_core::SFResult<i64> {
+            unreachable!("the pool status source only reads")
+        }
+        async fn decr(&self, _: &str, _: i64) -> cog_core::SFResult<i64> {
+            unreachable!("the pool status source only reads")
+        }
+        async fn incr_ex(&self, _: &str, _: i64, _: u64) -> cog_core::SFResult<i64> {
+            unreachable!("the pool status source only reads")
+        }
+        async fn sadd(&self, _: &str, _: &str) -> cog_core::SFResult<()> {
+            unreachable!("the pool status source only reads")
+        }
+        async fn srem(&self, _: &str, _: &str) -> cog_core::SFResult<()> {
+            unreachable!("the pool status source only reads")
+        }
+        async fn smembers(&self, _: &str) -> cog_core::SFResult<Vec<String>> {
+            unreachable!("the pool status source only reads")
+        }
+        async fn hset(&self, _: &str, _: &str, _: &str) -> cog_core::SFResult<()> {
+            unreachable!("the pool status source only reads")
+        }
+        async fn hget(&self, _: &str, _: &str) -> cog_core::SFResult<Option<String>> {
+            unreachable!("the pool status source only reads")
+        }
+        async fn hdel(&self, _: &str, _: &str) -> cog_core::SFResult<()> {
+            unreachable!("the pool status source only reads")
+        }
+        async fn hvals(&self, _: &str) -> cog_core::SFResult<Vec<String>> {
+            unreachable!("the pool status source only reads")
+        }
+        async fn hgetall(&self, _: &str) -> cog_core::SFResult<Vec<(String, String)>> {
+            unreachable!("the pool status source only reads")
+        }
+        async fn hlen(&self, _: &str) -> cog_core::SFResult<u64> {
+            unreachable!("the pool status source only reads")
+        }
+    }
+
+    async fn read_from(result: cog_core::SFResult<Option<String>>) -> Option<LlmPoolStatus> {
+        let store: Arc<dyn cog_core::KeyValueStore> = ScriptedStore::answering(result);
+        KeyValuePoolStatusSource::new(store).status().await
+    }
+
+    #[tokio::test]
+    async fn a_readable_snapshot_is_the_only_thing_that_reads_as_a_verdict() {
+        assert_eq!(
+            read_from(Ok(Some(
+                serde_json::to_string(&down_status()).expect("serializes")
+            )))
+            .await,
+            Some(down_status())
+        );
+        assert_eq!(
+            read_from(Ok(Some(
+                serde_json::to_string(&available_status()).expect("serializes")
+            )))
+            .await,
+            Some(available_status())
+        );
+    }
+
+    /// The three ways of having no verdict stay apart from the two ways of
+    /// having one. A store that could not be read says nothing about the pool,
+    /// and neither does a snapshot that does not parse: folding either into
+    /// "available" would resume work that cannot succeed, folding them into
+    /// "down" would report an outage nobody measured.
+    #[tokio::test]
+    async fn an_unreadable_or_unparsable_or_absent_snapshot_is_no_verdict() {
+        assert_eq!(read_from(Ok(None)).await, None);
+        assert_eq!(read_from(Ok(Some("not json".into()))).await, None);
+        assert_eq!(
+            read_from(Err(cog_core::SFError::Redis("store away".into()))).await,
+            None
+        );
     }
 }

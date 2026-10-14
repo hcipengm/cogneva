@@ -45,24 +45,21 @@ impl SupervisorPlugin {
     /// 插件并行跑的，摄取器在 `start` 里取这个服务，只有 `init` 阶段发布才
     /// 保证它一定取得到。同一个实例既驱动调度器的 LLM 类暂停，也供摄取器
     /// 判断"该不该拉下一条"——池的判定只有网关一个观测面，消费方共用这一个
-    /// 来源而不是各读一遍 Redis。
+    /// 来源而不是各读一遍存储。
+    ///
+    /// 来源建在存储层发布的那张键值面上，而不是自己按地址开一条连接：本插件
+    /// 已经在 `requires` 里声明了 storage，读到的一定是本进程共用的那一张面。
+    /// 拿不到面就是这套部署没有共享存储（单进程），池判定本来就没有第二个
+    /// 读者，守护循环随之不启动。
     async fn init_llm_pool_source(&mut self, ctx: &cog_core::PluginContext) {
-        let redis_url = ctx.config().dag_executor.redis_url.clone();
-        if redis_url.is_empty() {
-            info!("LLM pool guard disabled: no redis_url configured");
+        let Some(store) = ctx.consume_service::<dyn cog_core::KeyValueStore>() else {
+            info!("LLM pool guard disabled: no shared key-value face");
             return;
-        }
-        // 只建通道，不建连接：Redis 恰好在这一秒不可达（两者同时滚动、解析器
-        // 还没起来）不能让这一侧终生失明——那样池判定在网关手里，而暂停门读
-        // 不到它，读不到又与"池是好的"同形。连不上按拍重试。
-        match crate::llm_pool_guard::RedisLlmPoolStatusSource::new(&redis_url) {
-            Ok(source) => {
-                let source: Arc<dyn cog_core::LlmPoolStatusSource> = Arc::new(source);
-                ctx.publish_service(source.clone());
-                self.pool_source = Some(source);
-            }
-            Err(e) => warn!("LLM pool guard disabled: unusable redis url: {e}"),
-        }
+        };
+        let source: Arc<dyn cog_core::LlmPoolStatusSource> =
+            Arc::new(crate::llm_pool_guard::KeyValuePoolStatusSource::new(store));
+        ctx.publish_service(source.clone());
+        self.pool_source = Some(source);
     }
 
     /// Start the LLM upstream pool awareness loop. Needs both the scheduler

@@ -31,7 +31,6 @@ allowed	cog-memory	cog-storage	contract::storage::VectorBackend
 # 到达都是一个键值契约；这条边没有以直接链接收尾的版本。
 allowed	cog-storage	cog-redis	contract::kv::KeyValueStore
 allowed	cog-stream	cog-redis	contract::stream::MessageBackend
-allowed	cog-supervisor	cog-redis	contract::supervisor::LlmPoolStatusSource
 # 仅测试期的内部依赖，同样冻结、同样严厉断言。
 #
 # 测试边不下发，但会重编：从 `#[cfg(test)]` 链接一个邻居，同样把那个邻居放进本
