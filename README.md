@@ -659,7 +659,7 @@ For manual compilation: `cargo build --release`. Container image: see `Dockerfil
 
 ## 📊 Project Status
 
-**Current stage**: In production use
+**Current stage**: In use
 
 - Core framework complete; every crate in the workspace has a substantive implementation
 - Builds cleanly; CI enforces `cargo clippy --workspace --all-targets -- -D warnings` (zero warnings) and `cargo fmt --check`
