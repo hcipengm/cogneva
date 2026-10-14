@@ -17,6 +17,7 @@ pub mod guardrail;
 pub mod hook;
 pub mod host_documents;
 pub mod knowledge;
+pub mod kv;
 pub mod llm;
 pub mod media;
 pub mod memory;

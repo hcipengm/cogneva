@@ -182,13 +182,6 @@ const REPLACEMENT_TARGETS: &[&str] = &[
 /// target listed here that now exists is a stale entry, which is the same
 /// failure as a stale edge row.
 const TARGETS_TO_INTRODUCE: &[&str] = &[
-    // Most of the edges that reach the redis driver directly — five of the
-    // eight, the ones that are not already covered by a contract for what they
-    // do — want the same thing, and so do the two that reach `cog-storage`'s
-    // client: a handle to a key-value store with the operations they use. No
-    // such contract exists. The core has one for streams, objects, vectors and
-    // metrics, and the plain key-value operations are the gap.
-    "contract::kv::KeyValueStore",
     // `cog-prompt` owns prompt templates; the core publishes the rendering
     // contract (`split_contract`, `render_varying_half`) but no way to *obtain*
     // a rendered prompt. What the reader side needs is the manager rather than a
