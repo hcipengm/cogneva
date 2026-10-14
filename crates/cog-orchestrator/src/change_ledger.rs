@@ -192,9 +192,9 @@ fn reopen_quota(landed: u64, pass: Duration, bound: Duration) -> usize {
     // otherwise divide by zero, and neither is a period this loop can run at.
     let swept = (landed as u128).saturating_mul(pass.as_secs().max(1) as u128);
     let window = bound.as_secs().max(1) as u128;
-    // Rounded up by hand rather than with `div_ceil`, which is newer than the
-    // toolchain this workspace pins against.
-    ((swept + window - 1) / window).min(usize::MAX as u128) as usize
+    // Rounded up: a partially swept window buys one re-ask, so the quota is the
+    // number of windows the sweep lands in, not the number it fits inside.
+    swept.div_ceil(window).min(usize::MAX as u128) as usize
 }
 
 /// A check this process could not settle, and when it last tried.
@@ -1717,11 +1717,11 @@ mod tests {
     #[test]
     fn the_window_holds_as_the_landed_set_grows() {
         let pass = CHANGE_LEDGER_PASS_INTERVAL;
-        let budget = (REOPEN_BOUND.as_secs() / pass.as_secs()) as u64;
+        let budget = REOPEN_BOUND.as_secs() / pass.as_secs();
         for landed in [1u64, 10, 1000, 10_000, 100_000, 1_000_000] {
             let quota = reopen_quota(landed, pass, REOPEN_BOUND) as u64;
             assert!(quota > 0, "a landed set of {landed} must get a batch");
-            let rounds = (landed + quota - 1) / quota;
+            let rounds = landed.div_ceil(quota);
             assert!(
                 rounds <= budget,
                 "a landed set of {landed} sweeps in {rounds} passes, past the {budget} \

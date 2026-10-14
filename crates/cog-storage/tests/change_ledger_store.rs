@@ -30,8 +30,8 @@
 use sqlx::PgPool;
 
 use cog_core::{
-    ChangeIdentity, ChangeLedgerStore, ChangeMeasurement, ChangeReading, ChangeReopen, ChangeSource,
-    ChangeState, RetireReason,
+    ChangeIdentity, ChangeLedgerStore, ChangeMeasurement, ChangeReading, ChangeReopen,
+    ChangeSource, ChangeState, RetireReason,
 };
 use cog_storage::PostgresChangeLedgerStore;
 
@@ -550,21 +550,25 @@ async fn landed_rows_are_the_other_half_of_outstanding_read_oldest_first() {
         (&stale, ChangeState::Landed),
     ] {
         store
-            .apply_measurement(&ChangeMeasurement::new(id.clone(), state).at_revision("probe-rev-1"))
+            .apply_measurement(
+                &ChangeMeasurement::new(id.clone(), state).at_revision("probe-rev-1"),
+            )
             .await
             .expect("measure a probe row");
     }
     // Two measurements in one run can share a timestamp, and the order under test
     // is the one the column decides -- so one of the two is aged by hand rather
     // than by sleeping, which would put the test's runtime in its verdict.
-    sqlx::query("UPDATE change_ledger SET measured_at = now() - interval '2 hours' \
-                 WHERE kind = $1 AND scope = $2 AND literal = $3")
-        .bind(&stale.kind)
-        .bind(&stale.scope)
-        .bind(&stale.literal)
-        .execute(&pool)
-        .await
-        .expect("age one landed row");
+    sqlx::query(
+        "UPDATE change_ledger SET measured_at = now() - interval '2 hours' \
+                 WHERE kind = $1 AND scope = $2 AND literal = $3",
+    )
+    .bind(&stale.kind)
+    .bind(&stale.scope)
+    .bind(&stale.literal)
+    .execute(&pool)
+    .await
+    .expect("age one landed row");
 
     let due: Vec<ChangeIdentity> = store
         .landed_due(10)
@@ -589,7 +593,9 @@ async fn landed_rows_are_the_other_half_of_outstanding_read_oldest_first() {
         .map(|row| row.identity)
         .collect();
     assert!(
-        outstanding.contains(&owing) && !outstanding.contains(&fresh) && !outstanding.contains(&stale),
+        outstanding.contains(&owing)
+            && !outstanding.contains(&fresh)
+            && !outstanding.contains(&stale),
         "a landed row is not work, and the row that is must still be in the other read"
     );
 
@@ -646,7 +652,9 @@ async fn a_reopen_keeps_the_landed_time_the_next_measurement_clears() {
     let id = identity(&marker, "was-done");
 
     store
-        .apply_measurement(&ChangeMeasurement::new(id.clone(), ChangeState::Landed).at_revision("probe-rev-1"))
+        .apply_measurement(
+            &ChangeMeasurement::new(id.clone(), ChangeState::Landed).at_revision("probe-rev-1"),
+        )
         .await
         .expect("measure the row as landed");
     let landed_at = store
@@ -666,7 +674,9 @@ async fn a_reopen_keeps_the_landed_time_the_next_measurement_clears() {
         .await
         .expect("record the reopen");
     store
-        .apply_measurement(&ChangeMeasurement::new(id.clone(), ChangeState::Pending).at_revision("probe-rev-2"))
+        .apply_measurement(
+            &ChangeMeasurement::new(id.clone(), ChangeState::Pending).at_revision("probe-rev-2"),
+        )
         .await
         .expect("measure the row as no longer holding");
 
@@ -681,16 +691,17 @@ async fn a_reopen_keeps_the_landed_time_the_next_measurement_clears() {
         "the account cleared the landed time, which is why the record below is the only copy of it"
     );
 
-    let (recorded_at, recorded_rev): (Option<chrono::DateTime<chrono::Utc>>, String) = sqlx::query_as(
-        "SELECT was_landed_at, measured_rev FROM change_reopen \
+    let (recorded_at, recorded_rev): (Option<chrono::DateTime<chrono::Utc>>, String) =
+        sqlx::query_as(
+            "SELECT was_landed_at, measured_rev FROM change_reopen \
          WHERE kind = $1 AND scope = $2 AND literal = $3",
-    )
-    .bind(&id.kind)
-    .bind(&id.scope)
-    .bind(&id.literal)
-    .fetch_one(&pool)
-    .await
-    .expect("read the reopen back");
+        )
+        .bind(&id.kind)
+        .bind(&id.scope)
+        .bind(&id.literal)
+        .fetch_one(&pool)
+        .await
+        .expect("read the reopen back");
     assert_eq!(
         recorded_at,
         Some(landed_at),
