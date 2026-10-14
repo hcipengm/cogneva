@@ -30,8 +30,8 @@
 use sqlx::PgPool;
 
 use cog_core::{
-    ChangeIdentity, ChangeLedgerStore, ChangeMeasurement, ChangeReading, ChangeSource, ChangeState,
-    RetireReason,
+    ChangeIdentity, ChangeLedgerStore, ChangeMeasurement, ChangeReading, ChangeReopen, ChangeSource,
+    ChangeState, RetireReason,
 };
 use cog_storage::PostgresChangeLedgerStore;
 
@@ -528,6 +528,179 @@ async fn a_freshly_folded_declaration_enters_pending_and_unmeasured() {
     cleanup(&pool, &marker).await;
 }
 
+/// The landed set is the outstanding set's complement, read oldest-looked-at
+/// first -- and the ordering is the half a query like this gets wrong, because a
+/// caller takes a slice of it and a slice off the wrong end re-asks the same rows
+/// forever.
+///
+/// Both orders are asserted against the same three rows, since the reading that
+/// matters is that the two reads partition the state: a row in the landed set is
+/// absent from the outstanding one, and the other way round.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn landed_rows_are_the_other_half_of_outstanding_read_oldest_first() {
+    let (store, pool, marker) = store().await;
+    let owing = identity(&marker, "owing");
+    let fresh = identity(&marker, "fresh");
+    let stale = identity(&marker, "stale");
+
+    for (id, state) in [
+        (&owing, ChangeState::Pending),
+        (&fresh, ChangeState::Landed),
+        (&stale, ChangeState::Landed),
+    ] {
+        store
+            .apply_measurement(&ChangeMeasurement::new(id.clone(), state).at_revision("probe-rev-1"))
+            .await
+            .expect("measure a probe row");
+    }
+    // Two measurements in one run can share a timestamp, and the order under test
+    // is the one the column decides -- so one of the two is aged by hand rather
+    // than by sleeping, which would put the test's runtime in its verdict.
+    sqlx::query("UPDATE change_ledger SET measured_at = now() - interval '2 hours' \
+                 WHERE kind = $1 AND scope = $2 AND literal = $3")
+        .bind(&stale.kind)
+        .bind(&stale.scope)
+        .bind(&stale.literal)
+        .execute(&pool)
+        .await
+        .expect("age one landed row");
+
+    let due: Vec<ChangeIdentity> = store
+        .landed_due(10)
+        .await
+        .expect("read the landed set")
+        .into_iter()
+        .map(|row| row.identity)
+        .filter(|id| id.scope.starts_with(&marker))
+        .collect();
+    assert_eq!(
+        due,
+        vec![stale.clone(), fresh.clone()],
+        "the landed set is both landed rows, the one nothing has looked at in \
+         two hours first"
+    );
+
+    let outstanding: Vec<ChangeIdentity> = store
+        .outstanding(50)
+        .await
+        .expect("read the outstanding set")
+        .into_iter()
+        .map(|row| row.identity)
+        .collect();
+    assert!(
+        outstanding.contains(&owing) && !outstanding.contains(&fresh) && !outstanding.contains(&stale),
+        "a landed row is not work, and the row that is must still be in the other read"
+    );
+
+    // Re-asking a row that still holds writes the same state back, and that write
+    // is what moves the row off the head of this order. A caller takes a slice,
+    // so a write-back that did not move it would re-ask the same rows every pass
+    // and never reach the rest of the set -- the batch would be a fixture.
+    store
+        .apply_measurement(
+            &ChangeMeasurement::new(stale.clone(), ChangeState::Landed).at_revision("probe-rev-2"),
+        )
+        .await
+        .expect("re-measure a row that still holds");
+    let after: Vec<ChangeIdentity> = store
+        .landed_due(10)
+        .await
+        .expect("read the landed set again")
+        .into_iter()
+        .map(|row| row.identity)
+        .filter(|id| id.scope.starts_with(&marker))
+        .collect();
+    assert_eq!(
+        after,
+        vec![fresh.clone(), stale.clone()],
+        "the row re-measured must now be the last one this order reaches, not the first"
+    );
+    let kept = store
+        .get(&stale)
+        .await
+        .expect("read the row back")
+        .expect("the row is there")
+        .landed_at;
+    assert!(
+        kept.is_some(),
+        "re-measuring a row that still holds must not take its landed time away"
+    );
+
+    cleanup(&pool, &marker).await;
+}
+
+/// The reopen record keeps the landed time the account is about to clear.
+///
+/// The clearing is the whole reason the record exists: `landed_at` goes NULL the
+/// moment the state leaves `landed`, so "the ledger had this as done" and
+/// "nothing ever measured this" are one row apart afterwards. Checked by reading
+/// the column back after the second measurement, not by trusting the update
+/// clause's text -- and by comparing the recorded time against the one the store
+/// itself had stamped, so a record that carried a time of its own making would
+/// fail here.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_reopen_keeps_the_landed_time_the_next_measurement_clears() {
+    let (store, pool, marker) = store().await;
+    let id = identity(&marker, "was-done");
+
+    store
+        .apply_measurement(&ChangeMeasurement::new(id.clone(), ChangeState::Landed).at_revision("probe-rev-1"))
+        .await
+        .expect("measure the row as landed");
+    let landed_at = store
+        .get(&id)
+        .await
+        .expect("read the row back")
+        .expect("the row is there")
+        .landed_at
+        .expect("a landed row carries the time it landed");
+
+    store
+        .record_reopen(&ChangeReopen {
+            identity: id.clone(),
+            was_landed_at: Some(landed_at),
+            measured_rev: "probe-rev-2".to_string(),
+        })
+        .await
+        .expect("record the reopen");
+    store
+        .apply_measurement(&ChangeMeasurement::new(id.clone(), ChangeState::Pending).at_revision("probe-rev-2"))
+        .await
+        .expect("measure the row as no longer holding");
+
+    let row = store
+        .get(&id)
+        .await
+        .expect("read the row back")
+        .expect("the row is there");
+    assert_eq!(row.state, ChangeState::Pending);
+    assert!(
+        row.landed_at.is_none(),
+        "the account cleared the landed time, which is why the record below is the only copy of it"
+    );
+
+    let (recorded_at, recorded_rev): (Option<chrono::DateTime<chrono::Utc>>, String) = sqlx::query_as(
+        "SELECT was_landed_at, measured_rev FROM change_reopen \
+         WHERE kind = $1 AND scope = $2 AND literal = $3",
+    )
+    .bind(&id.kind)
+    .bind(&id.scope)
+    .bind(&id.literal)
+    .fetch_one(&pool)
+    .await
+    .expect("read the reopen back");
+    assert_eq!(
+        recorded_at,
+        Some(landed_at),
+        "the record carries the time the account had stamped, not one of its own"
+    );
+    assert_eq!(recorded_rev, "probe-rev-2", "the revision the pass read");
+
+    cleanup(&pool, &marker).await;
+}
+
 /// Take one declaration back off the intake, the way the producer's withdrawal
 /// verb does: a plain delete on the four columns the intake is keyed on, not
 /// through the store -- the store has no withdrawal, and the whole point of the
@@ -599,4 +772,11 @@ async fn cleanup(pool: &PgPool, marker: &str) {
         .execute(pool)
         .await
         .expect("clean up the probe retirements");
+    // And the reopen series, which nothing else ever deletes: its rows name the
+    // same marker and outlive the account rows they were written beside.
+    sqlx::query("DELETE FROM change_reopen WHERE scope LIKE $1")
+        .bind(format!("{marker}/%"))
+        .execute(pool)
+        .await
+        .expect("clean up the probe reopens");
 }

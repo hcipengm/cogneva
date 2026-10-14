@@ -377,6 +377,35 @@ impl ChangeMeasurement {
     }
 }
 
+/// One row the account had called done, whose check a later pass found no longer
+/// holds.
+///
+/// Not a state and not a measurement. The state moves through
+/// [`ChangeLedgerStore::apply_measurement`] like every other, and this is the
+/// record of what that move took away: the account clears `landed_at` on the way
+/// out of `landed`, so without a row here "the ledger had this as done and was
+/// wrong" is indistinguishable from "nothing ever measured it" -- and only the
+/// first of those is a fact about the tree having moved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeReopen {
+    pub identity: ChangeIdentity,
+    /// When the row had landed, as the account held it just before the pass
+    /// moved it.
+    ///
+    /// `None` when `landed_at` was already missing on a row whose state said
+    /// `landed`. That is a row disagreeing with itself, and it is recorded rather
+    /// than skipped: the disagreement is one of the two things this row exists to
+    /// make readable, and a call that refused to write it would hide it at the
+    /// one moment it is visible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub was_landed_at: Option<DateTime<Utc>>,
+    /// The revision the pass read the tree at, empty when it had none to name.
+    /// Beside the identity for the same reason a measurement carries one: the
+    /// tree moves, and "this stopped being true" without a revision is a claim
+    /// nothing can be re-read against.
+    pub measured_rev: String,
+}
+
 /// Durable storage for the change ledger.
 ///
 /// The only way to move a row's state is [`Self::apply_measurement`]. Rows enter
@@ -520,6 +549,48 @@ pub trait ChangeLedgerStore: Send + Sync {
     /// `None` in `measured_at` sorts first: nothing has looked at those, which
     /// is less known than a stale measurement, not more current.
     async fn outstanding(&self, limit: usize) -> SFResult<Vec<ChangeLedgerRow>>;
+
+    /// The rows the account calls done, stalest measurement first, whose check a
+    /// later pass is due to ask again.
+    ///
+    /// [`Self::outstanding`] excluded [`ChangeState::Landed`] to define the work,
+    /// and that exclusion is what left the account's strongest claim as the one
+    /// claim nothing ever re-read: `landed` says a check came out satisfied, and
+    /// a row that no read reaches keeps whatever it was first given. Measured on
+    /// the live ledger before this call existed: 1369 landed rows, the oldest
+    /// measured a day and fifteen hours earlier, none of them due to be looked at
+    /// again ever -- while the tree they were judged against moves.
+    ///
+    /// A call of its own rather than a widened [`Self::outstanding`], because of
+    /// where those rows sit in the latter's order. `measured_at ASC NULLS FIRST`
+    /// makes an unmeasured row the least known and the first read, which is right
+    /// for work; landed rows are measured, and the stale ones among them are
+    /// measured *oldest*, so folding them into that set would put rows older than
+    /// any pending row at its head and starve the work of the batch it shares.
+    /// The caller takes a slice here and the whole set there, and the two bounds
+    /// belong to two different questions.
+    ///
+    /// Stalest first for the same reason the other read is: a caller that takes
+    /// `limit` rows has to sweep the state, not re-ask the same head of it.
+    async fn landed_due(&self, limit: usize) -> SFResult<Vec<ChangeLedgerRow>>;
+
+    /// Record that a row the account called done no longer holds.
+    ///
+    /// What this keeps is what the next write destroys. Moving a row out of
+    /// `landed` clears `landed_at` -- the account's columns agree with its state
+    /// by construction -- so after the measurement lands, "the account had this
+    /// as done and the tree disagreed" and "nothing ever measured this" are one
+    /// row apart and read the same. This is where the difference survives: the
+    /// identity, the time it had landed, and the revision the pass read.
+    ///
+    /// Recording a reopen moves no state. The state moves through
+    /// [`Self::apply_measurement`] like every other, and this call is made beside
+    /// that one rather than instead of it, so the account still has exactly one
+    /// door a state is written through.
+    ///
+    /// Appended, never updated: a row reopened three times is three observations,
+    /// and an upserted row would only ever answer the last of them.
+    async fn record_reopen(&self, reopen: &ChangeReopen) -> SFResult<()>;
 
     /// One row, by the identity that names it.
     async fn get(&self, identity: &ChangeIdentity) -> SFResult<Option<ChangeLedgerRow>>;

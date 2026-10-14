@@ -16,7 +16,7 @@ use sqlx::{PgPool, Row};
 
 use cog_core::{
     ChangeIdentity, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement, ChangeReading,
-    ChangeSource, ChangeState, DispatchState, RetireReason, SFError, SFResult,
+    ChangeReopen, ChangeSource, ChangeState, DispatchState, RetireReason, SFError, SFResult,
 };
 
 /// Every read returns these, in one place so no two readers can come back with
@@ -288,6 +288,17 @@ ON CONFLICT (kind, scope, literal) DO UPDATE SET
         WHEN EXCLUDED.state = 'retired' THEN COALESCE(change_ledger.retired_at, now())
         ELSE NULL
     END";
+
+/// Append one reopen: a row the account had as done whose check no longer holds.
+///
+/// A plain insert with no conflict clause, like every other observation kept
+/// here: the identity is not this table's key, because a row reopened twice was
+/// two facts about the tree, and an upserted row could only ever answer the last
+/// one. The time is the database's own, from the column default, so no caller
+/// supplies the moment it is recorded.
+const RECORD_REOPEN_SQL: &str = "\
+INSERT INTO change_reopen (kind, scope, literal, was_landed_at, measured_rev) \
+VALUES ($1, $2, $3, $4, $5)";
 
 /// Append one dispatch pass's own reading.
 ///
@@ -668,6 +679,38 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
             .fetch_all(&self.pool)
             .await,
         )
+    }
+
+    async fn landed_due(&self, limit: usize) -> SFResult<Vec<ChangeLedgerRow>> {
+        // The mirror of `outstanding`: the one state that call excludes, read
+        // alone. Kept as its own statement rather than a parameter, because the
+        // two reads answer two questions and their bounds are set by two
+        // different callers -- a bound wide enough to sweep the work would put a
+        // day-old landed row at the head of this one.
+        Self::entries(
+            sqlx::query(&format!(
+                "SELECT {ROW_COLUMNS} FROM change_ledger \
+                 WHERE state = 'landed' \
+                 ORDER BY measured_at ASC NULLS FIRST, first_seen_at ASC \
+                 LIMIT $1"
+            ))
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await,
+        )
+    }
+
+    async fn record_reopen(&self, reopen: &ChangeReopen) -> SFResult<()> {
+        sqlx::query(RECORD_REOPEN_SQL)
+            .bind(&reopen.identity.kind)
+            .bind(&reopen.identity.scope)
+            .bind(&reopen.identity.literal)
+            .bind(reopen.was_landed_at)
+            .bind(&reopen.measured_rev)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("record reopen: {e}")))?;
+        Ok(())
     }
 
     async fn get(&self, identity: &ChangeIdentity) -> SFResult<Option<ChangeLedgerRow>> {

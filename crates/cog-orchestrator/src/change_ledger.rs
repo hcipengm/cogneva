@@ -62,15 +62,15 @@ use tracing::{debug, info, warn};
 
 use cog_core::{
     ChangeIdentity, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement, ChangeReading,
-    ChangeSource, ChangeState, DispatchDecision, DispatchState, LlmPoolStatus, OrchestratorControl,
-    OwnerLeaseBroker, PoolReading, ShutdownSignal, Task, TaskStatus, TaskType,
+    ChangeReopen, ChangeSource, ChangeState, DispatchDecision, DispatchState, LlmPoolStatus,
+    OrchestratorControl, OwnerLeaseBroker, PoolReading, ShutdownSignal, Task, TaskStatus, TaskType,
 };
 
 use cog_core::contract::llm::UpstreamFailure;
 use cog_core::contract::outcome::{declares, TERMINAL_ENV_FAILURE_PREFIX};
 
 use crate::change_measure::{
-    CheckTree, UnsettledReason, DEPENDENCY_EDGE_KIND, DEV_DEPENDENCY_EDGE_KIND,
+    CheckTree, Snapshot, UnsettledReason, DEPENDENCY_EDGE_KIND, DEV_DEPENDENCY_EDGE_KIND,
     MODULE_RELOCATION_KIND,
 };
 
@@ -145,6 +145,57 @@ const MEASUREMENTS_PER_PASS: usize = 200;
 /// short enough that a tree that changed is noticed within the same working
 /// session.
 const UNMEASURABLE_RETRY: Duration = Duration::from_secs(3600);
+
+/// How long a row the account calls done may go before its check is asked again.
+///
+/// `landed` is the account's strongest claim -- that a check came out satisfied
+/// -- and it was the one claim nothing re-read: the outstanding set excludes the
+/// state by definition, so a landed row kept whatever it was first given while
+/// the tree moved under it. Measured before this bound existed: the oldest of
+/// 1369 landed rows had been measured a day and fifteen hours earlier, and eight
+/// rows whose checks had stopped holding were still being reported as done.
+///
+/// The number is not chosen here, it is taken from the bound the platform
+/// already gives a weaker claim. A row nothing could settle is re-asked within
+/// [`UNMEASURABLE_RETRY`], and "I could not answer this" is a smaller claim than
+/// "this is done"; a stronger claim answered less often than a weaker one would
+/// be the account trusting the statement it makes most. So a landed row is
+/// re-asked within the same window, and the compile-time assertion below is what
+/// keeps that true: raising this past it, or lowering that one below it, is a
+/// decision about which claim the account trusts more, and it does not get to be
+/// made by editing one constant.
+const REOPEN_BOUND: Duration = UNMEASURABLE_RETRY;
+
+const _: () = assert!(
+    REOPEN_BOUND.as_secs() <= UNMEASURABLE_RETRY.as_secs(),
+    "a landed row may not be re-asked less often than a row nothing could settle: \
+     that would make the account's strongest claim its least checked one"
+);
+
+/// How many landed rows one pass re-asks, given how many there are.
+///
+/// Derived rather than picked, because the number that matters is the window,
+/// not the batch: a quota of `K` rows per pass over `N` landed rows at a pass
+/// interval of `T` sweeps the state in `N * T / K`, and what a reader wants to be
+/// true is that this is no longer than [`REOPEN_BOUND`]. Solving for the batch
+/// gives the ceiling below, so the constant a person would otherwise have to
+/// re-tune every time the ledger grows does not exist.
+///
+/// Rounded up: a quota that rounds down sweeps a little later than the bound
+/// promises, and the promise is the point. Zero when there are no landed rows,
+/// which keeps a caller from asking for a batch of nothing.
+fn reopen_quota(landed: u64, pass: Duration, bound: Duration) -> usize {
+    if landed == 0 || bound.is_zero() {
+        return 0;
+    }
+    // In seconds, floored at one on both sides: a sub-second pass or bound would
+    // otherwise divide by zero, and neither is a period this loop can run at.
+    let swept = (landed as u128).saturating_mul(pass.as_secs().max(1) as u128);
+    let window = bound.as_secs().max(1) as u128;
+    // Rounded up by hand rather than with `div_ceil`, which is newer than the
+    // toolchain this workspace pins against.
+    ((swept + window - 1) / window).min(usize::MAX as u128) as usize
+}
 
 /// A check this process could not settle, and when it last tried.
 ///
@@ -923,16 +974,177 @@ async fn measure_pass(
         }
     }
 
+    let (rechecked, reopened) = reopen_pass(store, tree, &snapshot, unsettled).await;
+
     info!(
         measured = considered,
         landed,
         absent,
         undecided,
+        rechecked,
+        reopened,
         unsettled = %reason_summary(&by_reason),
         already_unsettled = known_unsettled,
         revision = snapshot.rev(),
         "change ledger: measured the outstanding set against the tree"
     );
+}
+
+/// Ask the rows the account calls done whether that is still true.
+///
+/// The outstanding set is the work, and it excludes `landed` by definition --
+/// which left the account's strongest claim as the only one nothing re-read: a
+/// landed row kept whatever it was first given while the tree moved under it.
+/// Measured before this ran: eight rows whose checks had stopped holding were
+/// still being reported as done, and nothing in the account distinguished them
+/// from the ones that were.
+///
+/// A read of its own, with a bound of its own, and the two bounds are not
+/// interchangeable: [`OUTSTANDING_PEEK`]'s ordering puts the least-measured rows
+/// first, so a batch wide enough to sweep the work would put a day-old landed row
+/// at the head of it and starve the work of the pass it shares. The batch here is
+/// [`reopen_quota`]'s answer -- whatever sweeps every landed row within
+/// [`REOPEN_BOUND`] -- so the ledger growing changes how much one pass spends
+/// without changing how long a wrong answer stands.
+///
+/// A row whose check cannot be settled is left exactly as it is. Its state is the
+/// account's last word on it and a look that settled nothing has nothing to put
+/// in its place; the answer, not the asking, is what moves a row.
+///
+/// Returns how many rows were re-asked and how many came back as something other
+/// than what they said. The second is the reading this whole pass exists for: a
+/// count of moments the account was wrong, and the rows it names are in
+/// `change_reopen`, which is where the identity survives the state it loses.
+async fn reopen_pass(
+    store: &dyn ChangeLedgerStore,
+    tree: &CheckTree,
+    snapshot: &Snapshot,
+    unsettled: &mut HashMap<ChangeIdentity, UnsettledCheck>,
+) -> (usize, usize) {
+    let landed = match store.census().await {
+        Ok(census) => census
+            .iter()
+            .filter(|(state, _)| *state == ChangeState::Landed)
+            .map(|(_, count)| *count)
+            .sum::<u64>(),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: the census could not be read, so no landed row was re-asked"
+            );
+            return (0, 0);
+        }
+    };
+    let quota = reopen_quota(landed, CHANGE_LEDGER_PASS_INTERVAL, REOPEN_BOUND);
+    if quota == 0 {
+        return (0, 0);
+    }
+    // The batch is widened by the rows already known unsettleable, the same way
+    // the outstanding pass widens its own, and for the same reason: a row whose
+    // check cannot be settled keeps its `measured_at`, so it holds the head of
+    // this order every pass and would spend the whole batch on itself. Without
+    // the widening the quota would be a claim the pass makes and quietly stops
+    // keeping -- the sweep would lengthen by exactly how many rows the tree
+    // cannot answer for, which is the state the bound is supposed to survive.
+    //
+    // Widened by the whole map rather than by its landed part: the read that
+    // would filter it is the one being widened.
+    let take = quota.saturating_add(unsettled.len());
+    let rows = match store.landed_due(take).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: the landed set could not be read, so nothing was re-asked"
+            );
+            return (0, 0);
+        }
+    };
+
+    let now = Instant::now();
+    let mut rechecked = 0usize;
+    let mut reopened = 0usize;
+    for row in rows {
+        // The same window the outstanding pass keeps, for the same reason: a row
+        // whose check cannot be settled keeps its old `measured_at`, so it would
+        // hold the head of the staleness order and spend this pass's batch every
+        // pass. Asking again before the window is up would buy nothing -- what
+        // makes the check unsettleable is a property of the tree, and the tree is
+        // what the window is waiting for.
+        if let Some(known) = unsettled.get(&row.identity) {
+            if still_unanswered(known, now) {
+                continue;
+            }
+        }
+        let outcome = tree.judge(snapshot, &row.identity).await;
+        let Some(state) = outcome.state() else {
+            let reason = outcome.reason().unwrap_or(UnsettledReason::GitFailed);
+            let why = outcome
+                .why()
+                .unwrap_or("the look settled nothing and gave no reason")
+                .to_string();
+            unsettled.insert(row.identity.clone(), UnsettledCheck { why, since: now });
+            debug!(
+                change = %row.identity,
+                reason = reason.as_str(),
+                "change ledger: a landed row's check cannot be settled, so it keeps its state"
+            );
+            continue;
+        };
+        unsettled.remove(&row.identity);
+        rechecked += 1;
+        if state != ChangeState::Landed {
+            // Written before the measurement, and that order is the point: the
+            // measurement clears `landed_at` on the way out of `landed`, so
+            // afterwards there is nothing left in the row that says it was ever
+            // done. This is the only place that time survives, and it has to be
+            // read off the row before the write that takes it away.
+            reopened += 1;
+            let reopen = ChangeReopen {
+                identity: row.identity.clone(),
+                was_landed_at: row.landed_at,
+                measured_rev: snapshot.rev().to_string(),
+            };
+            if let Err(e) = store.record_reopen(&reopen).await {
+                warn!(
+                    change = %row.identity,
+                    error = %e,
+                    "change ledger: a reopen could not be recorded, so the row loses its \
+                     landed time with nothing to say it was there"
+                );
+            }
+            warn!(
+                change = %row.identity,
+                was_landed_at = ?row.landed_at,
+                state = state.as_str(),
+                revision = snapshot.rev(),
+                "change ledger: a row the account had as done no longer holds"
+            );
+        }
+        // Written back even when it still holds, and that write is not a
+        // formality: `measured_at` is what this read orders by, so a pass that
+        // re-asked and wrote nothing would re-ask the same head of the set
+        // forever and never reach the rest of it.
+        let measurement = match state {
+            ChangeState::Undecided => ChangeMeasurement::undecided(
+                row.identity.clone(),
+                outcome
+                    .reason()
+                    .expect("an undecided state is reached only through a reason")
+                    .as_str(),
+            )
+            .at_revision(snapshot.rev()),
+            _ => ChangeMeasurement::new(row.identity.clone(), state).at_revision(snapshot.rev()),
+        };
+        if let Err(e) = store.apply_measurement(&measurement).await {
+            warn!(
+                change = %row.identity,
+                error = %e,
+                "change ledger: a second look could not be written back"
+            );
+        }
+    }
+    (rechecked, reopened)
 }
 
 /// The rows a pass hands over: the ones still owed that this pass has not just
@@ -1457,6 +1669,64 @@ mod tests {
             unsettled_reason: None,
             retire_reason: None,
             retired_at: None,
+        }
+    }
+
+    /// The quota is the smallest batch that sweeps the landed set within the
+    /// bound, at both ends: the sweep it buys fits, and one row fewer does not.
+    ///
+    /// Only the first half would pass for any large number, and a quota that is
+    /// merely big enough is a quota nobody can argue about when it is raised --
+    /// the reading that has to hold is that nothing smaller would do.
+    #[test]
+    fn the_quota_is_the_smallest_batch_that_sweeps_within_the_bound() {
+        let pass = Duration::from_secs(300);
+        let bound = Duration::from_secs(3600);
+        let landed = 1369u64;
+        let quota = reopen_quota(landed, pass, bound) as u128;
+        // The window the sweep takes: quota passes, each `pass` long, covering
+        // `landed` rows.
+        let swept_in = |batch: u128| (landed as u128) * pass.as_secs() as u128 / batch;
+        assert!(
+            swept_in(quota) <= bound.as_secs() as u128,
+            "a batch of {quota} takes {}s to sweep the landed set, past the {}s bound",
+            swept_in(quota),
+            bound.as_secs()
+        );
+        assert!(
+            swept_in(quota - 1) > bound.as_secs() as u128,
+            "a batch of {} would already have stayed within the bound",
+            quota - 1
+        );
+    }
+
+    /// A ledger with nothing landed asks for no batch at all.
+    #[test]
+    fn no_landed_rows_ask_for_nothing() {
+        assert_eq!(reopen_quota(0, Duration::from_secs(300), REOPEN_BOUND), 0);
+    }
+
+    /// The quota moves with the size of the set, so the window does not: the
+    /// parameter a person would otherwise re-tune as the ledger grows is derived
+    /// instead, and this is the reading that says so.
+    ///
+    /// Stated as a number of passes rather than as a ratio, because a ratio is
+    /// what the rounding breaks: ten times the rows buys a batch one ceiling
+    /// short of ten times the batch, and the window -- which is the thing the
+    /// bound is about -- is unmoved.
+    #[test]
+    fn the_window_holds_as_the_landed_set_grows() {
+        let pass = CHANGE_LEDGER_PASS_INTERVAL;
+        let budget = (REOPEN_BOUND.as_secs() / pass.as_secs()) as u64;
+        for landed in [1u64, 10, 1000, 10_000, 100_000, 1_000_000] {
+            let quota = reopen_quota(landed, pass, REOPEN_BOUND) as u64;
+            assert!(quota > 0, "a landed set of {landed} must get a batch");
+            let rounds = (landed + quota - 1) / quota;
+            assert!(
+                rounds <= budget,
+                "a landed set of {landed} sweeps in {rounds} passes, past the {budget} \
+                 the bound allows -- the batch is too small for the window it promises"
+            );
         }
     }
 
