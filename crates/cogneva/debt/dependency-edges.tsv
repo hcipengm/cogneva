@@ -16,7 +16,6 @@
 
 kind	consumer	dep	contract
 allowed	cog-agent	cog-redis	contract::stream::MessageBackend
-allowed	cog-collaboration	cog-redis	contract::kv::KeyValueStore
 allowed	cog-gateway	cog-llm	contract::llm::LlmClient
 allowed	cog-gateway	cog-observability	contract::alerts::AlertStore
 allowed	cog-gateway	cog-redis	contract::kv::KeyValueStore

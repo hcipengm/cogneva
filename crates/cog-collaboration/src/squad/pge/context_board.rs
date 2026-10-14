@@ -9,15 +9,16 @@
 //! - [`InMemoryContextBoard`]: a `Mutex<HashMap>` for single-process use and
 //!   for tests. Backwards-compatible with the existing
 //!   `RoundtableConfig::context_board: Option<serde_json::Value>` field.
-//! - [`RedisContextBoard`]: a Redis Hash at the key
-//!   `orchestrator:squad:{squad_id}:board`, matching the storage layout in
-//!   Both implementations expose the same async [`ContextBoard`] trait so the
-//!   Roundtable can be configured with either at construction time without
-//!   changing the debate logic.
+//! - [`KeyValueContextBoard`]: a hash at the key
+//!   `orchestrator:squad:{squad_id}:board`, held through the core
+//!   [`cog_core::KeyValueStore`] contract rather than through a driver, so the
+//!   debate logic does not link the cache implementation.
+//! Both implementations expose the same async [`ContextBoard`] trait so the
+//! Roundtable can be configured with either at construction time without
+//! changing the debate logic.
 
 use async_trait::async_trait;
-use cog_core::{SFError, SFResult};
-use redis::AsyncCommands;
+use cog_core::{KeyValueStore, SFError, SFResult};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -101,50 +102,41 @@ impl ContextBoard for InMemoryContextBoard {
 }
 
 // ---------------------------------------------------------------------------
-// Redis implementation
+// Shared key-value implementation
 // ---------------------------------------------------------------------------
 
-/// Redis-backed [`ContextBoard`] that persists to a single Redis Hash.
+/// [`ContextBoard`] that persists to a hash in a shared key-value store: one
+/// field per board entry, addressed by
+/// `orchestrator:squad:{squad_id}:board`.
+///
 /// Each field is stored as JSON-encoded text so structured values round-trip
-/// through `redis-rs`'s string commands without further encoding hops.
+/// through the store's string commands without further encoding hops.
 #[derive(Clone)]
-pub struct RedisContextBoard {
-    connection: redis::aio::ConnectionManager,
+pub struct KeyValueContextBoard {
+    store: Arc<dyn KeyValueStore>,
     key: String,
 }
 
-impl std::fmt::Debug for RedisContextBoard {
+impl std::fmt::Debug for KeyValueContextBoard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RedisContextBoard")
+        f.debug_struct("KeyValueContextBoard")
             .field("key", &self.key)
             .finish_non_exhaustive()
     }
 }
 
-impl RedisContextBoard {
-    /// Connect to Redis and bind this board to the given Squad ID.
+impl KeyValueContextBoard {
+    /// Bind a board to the given Squad ID over an already-published store.
+    ///
+    /// The caller supplies the store rather than a URL: which process holds the
+    /// connection, and whether it is a cache or another key-value backend, is
+    /// the publisher's decision, and a board built from a URL would take that
+    /// decision back — along with a link to the driver that implements it.
     /// The key is computed as `orchestrator:squad:{squad_id}:board`.
-    pub async fn connect(redis_url: &str, squad_id: impl Into<String>) -> SFResult<Self> {
-        let client = redis::Client::open(redis_url).map_err(|e| SFError::Redis(e.to_string()))?;
-        let connection = cog_redis::connect(&client)
-            .await
-            .map_err(|e| SFError::Redis(e.to_string()))?;
-        let squad: String = squad_id.into();
-        Ok(Self {
-            connection,
-            key: format!("orchestrator:squad:{}:board", squad),
-        })
-    }
-
-    /// Re-use an existing Redis connection. Useful when the caller already
-    /// has a connection pool bound to other infrastructure.
-    pub fn with_connection(
-        connection: redis::aio::ConnectionManager,
-        squad_id: impl Into<String>,
-    ) -> Self {
+    pub fn with_store(store: Arc<dyn KeyValueStore>, squad_id: impl Into<String>) -> Self {
         let squad: String = squad_id.into();
         Self {
-            connection,
+            store,
             key: format!("orchestrator:squad:{}:board", squad),
         }
     }
@@ -156,15 +148,9 @@ impl RedisContextBoard {
 }
 
 #[async_trait]
-impl ContextBoard for RedisContextBoard {
+impl ContextBoard for KeyValueContextBoard {
     async fn get(&self, field: &str) -> SFResult<Option<serde_json::Value>> {
-        let raw: Option<String> = self
-            .connection
-            .clone()
-            .hget(&self.key, field)
-            .await
-            .map_err(|e: redis::RedisError| SFError::Redis(e.to_string()))?;
-        match raw {
+        match self.store.hget(&self.key, field).await? {
             Some(s) => {
                 let v = serde_json::from_str(&s).map_err(SFError::Serialization)?;
                 Ok(Some(v))
@@ -175,24 +161,13 @@ impl ContextBoard for RedisContextBoard {
 
     async fn set(&self, field: &str, value: serde_json::Value) -> SFResult<()> {
         let json = serde_json::to_string(&value).map_err(SFError::Serialization)?;
-        let _: () = self
-            .connection
-            .clone()
-            .hset(&self.key, field, json)
-            .await
-            .map_err(|e: redis::RedisError| SFError::Redis(e.to_string()))?;
-        Ok(())
+        self.store.hset(&self.key, field, &json).await
     }
 
     async fn snapshot(&self) -> SFResult<serde_json::Value> {
-        let map: HashMap<String, String> = self
-            .connection
-            .clone()
-            .hgetall(&self.key)
-            .await
-            .map_err(|e: redis::RedisError| SFError::Redis(e.to_string()))?;
-        let mut out = serde_json::Map::with_capacity(map.len());
-        for (k, v) in map {
+        let fields = self.store.hgetall(&self.key).await?;
+        let mut out = serde_json::Map::with_capacity(fields.len());
+        for (k, v) in fields {
             let parsed: serde_json::Value =
                 serde_json::from_str(&v).map_err(SFError::Serialization)?;
             out.insert(k, parsed);
@@ -201,13 +176,7 @@ impl ContextBoard for RedisContextBoard {
     }
 
     async fn clear(&self) -> SFResult<()> {
-        let _: () = self
-            .connection
-            .clone()
-            .del(&self.key)
-            .await
-            .map_err(|e: redis::RedisError| SFError::Redis(e.to_string()))?;
-        Ok(())
+        self.store.del(&self.key).await
     }
 }
 
@@ -246,14 +215,161 @@ mod tests {
         assert_eq!(board.snapshot().await.unwrap(), serde_json::json!({}));
     }
 
-    #[test]
-    fn redis_context_board_key_uses_design_doc_layout() {
-        // `connect` requires a real Redis but the key formatting is independent
-        // of the connection. Construct via with_connection on a placeholder.
-        // We can't stand up a connection in unit tests, so verify only that
-        // the key formatting matches the documented layout via a ZST helper:
-        let key = format!("orchestrator:squad:{}:board", "squad-42");
-        assert_eq!(key, "orchestrator:squad:squad-42:board");
+    /// The hash operations the shared board uses, over a map. The board is
+    /// reached through the core contract, so the suite exercises it without a
+    /// server, and the store's own expiry behaviour is tested with the driver
+    /// that implements it.
+    #[derive(Default)]
+    struct FakeStore {
+        hashes: Mutex<HashMap<String, HashMap<String, String>>>,
+    }
+
+    #[async_trait]
+    impl KeyValueStore for FakeStore {
+        async fn get(&self, _key: &str) -> SFResult<Option<String>> {
+            unreachable!("the context board does not use plain keys")
+        }
+
+        async fn set(&self, _key: &str, _value: &str) -> SFResult<()> {
+            unreachable!("the context board does not use plain keys")
+        }
+
+        async fn set_ex(&self, _key: &str, _value: &str, _ttl_secs: u64) -> SFResult<()> {
+            unreachable!("the context board does not use plain keys")
+        }
+
+        async fn del(&self, key: &str) -> SFResult<()> {
+            self.hashes.lock().await.remove(key);
+            Ok(())
+        }
+
+        async fn expire(&self, _key: &str, _ttl_secs: i64) -> SFResult<()> {
+            unreachable!("the context board sets no expiry")
+        }
+
+        async fn ttl(&self, _key: &str) -> SFResult<i64> {
+            unreachable!("the context board sets no expiry")
+        }
+
+        async fn incr(&self, _key: &str, _by: i64) -> SFResult<i64> {
+            unreachable!("the context board does not count")
+        }
+
+        async fn decr(&self, _key: &str, _by: i64) -> SFResult<i64> {
+            unreachable!("the context board does not count")
+        }
+
+        async fn sadd(&self, _key: &str, _member: &str) -> SFResult<()> {
+            unreachable!("the context board does not use sets")
+        }
+
+        async fn srem(&self, _key: &str, _member: &str) -> SFResult<()> {
+            unreachable!("the context board does not use sets")
+        }
+
+        async fn smembers(&self, _key: &str) -> SFResult<Vec<String>> {
+            unreachable!("the context board does not use sets")
+        }
+
+        async fn hset(&self, key: &str, field: &str, value: &str) -> SFResult<()> {
+            self.hashes
+                .lock()
+                .await
+                .entry(key.to_string())
+                .or_default()
+                .insert(field.to_string(), value.to_string());
+            Ok(())
+        }
+
+        async fn hget(&self, key: &str, field: &str) -> SFResult<Option<String>> {
+            Ok(self
+                .hashes
+                .lock()
+                .await
+                .get(key)
+                .and_then(|hash| hash.get(field))
+                .cloned())
+        }
+
+        async fn hdel(&self, key: &str, field: &str) -> SFResult<()> {
+            if let Some(hash) = self.hashes.lock().await.get_mut(key) {
+                hash.remove(field);
+            }
+            Ok(())
+        }
+
+        async fn hvals(&self, key: &str) -> SFResult<Vec<String>> {
+            Ok(self
+                .hashes
+                .lock()
+                .await
+                .get(key)
+                .map(|hash| hash.values().cloned().collect())
+                .unwrap_or_default())
+        }
+
+        async fn hgetall(&self, key: &str) -> SFResult<Vec<(String, String)>> {
+            Ok(self
+                .hashes
+                .lock()
+                .await
+                .get(key)
+                .map(|hash| hash.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                .unwrap_or_default())
+        }
+
+        async fn hlen(&self, key: &str) -> SFResult<u64> {
+            Ok(self
+                .hashes
+                .lock()
+                .await
+                .get(key)
+                .map(|hash| hash.len() as u64)
+                .unwrap_or(0))
+        }
+    }
+
+    #[tokio::test]
+    async fn key_value_board_roundtrip_uses_the_design_doc_key() {
+        let board = KeyValueContextBoard::with_store(Arc::new(FakeStore::default()), "squad-42");
+        assert_eq!(board.key(), "orchestrator:squad:squad-42:board");
+
+        board
+            .set(
+                "latest_plan",
+                serde_json::json!({"approach": "incremental"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            board.get("latest_plan").await.unwrap(),
+            Some(serde_json::json!({"approach": "incremental"}))
+        );
+        assert_eq!(board.get("absent").await.unwrap(), None);
+
+        assert_eq!(
+            board.snapshot().await.unwrap(),
+            serde_json::json!({"latest_plan": {"approach": "incremental"}})
+        );
+
+        board.clear().await.unwrap();
+        assert_eq!(board.snapshot().await.unwrap(), serde_json::json!({}));
+        assert_eq!(board.get("latest_plan").await.unwrap(), None);
+    }
+
+    /// Two boards for the same squad over the same store see each other's
+    /// writes: that sharing is the whole reason the durable board exists, and
+    /// it is also what the in-memory one cannot do across processes.
+    #[tokio::test]
+    async fn key_value_boards_for_one_squad_share_state() {
+        let store: Arc<dyn KeyValueStore> = Arc::new(FakeStore::default());
+        let planner = KeyValueContextBoard::with_store(store.clone(), "squad-7");
+        let generator = KeyValueContextBoard::with_store(store, "squad-7");
+        planner.set("round", serde_json::json!(2)).await.unwrap();
+        assert_eq!(
+            generator.get("round").await.unwrap(),
+            Some(serde_json::json!(2))
+        );
     }
 
     /// Concurrent setters from multiple tasks must serialize cleanly through

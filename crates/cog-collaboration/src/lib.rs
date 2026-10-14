@@ -31,9 +31,9 @@ pub use profile::{
 };
 pub use squad::pge::{
     parse_evaluation_result, parse_generator_output, parse_planner_output, Artifact, ContextBoard,
-    Criterion, EvaluationResult, GeneratorOutput, InMemoryContextBoard, PgePipeline,
-    PgePipelineAttempt, PgePipelineConfig, PgePipelineResult, PgeRoundtable, PgeRoundtableConfig,
-    PgeRoundtableIteration, PgeRoundtableResult, PlannerOutput, RedisContextBoard, TaskSpec,
+    Criterion, EvaluationResult, GeneratorOutput, InMemoryContextBoard, KeyValueContextBoard,
+    PgePipeline, PgePipelineAttempt, PgePipelineConfig, PgePipelineResult, PgeRoundtable,
+    PgeRoundtableConfig, PgeRoundtableIteration, PgeRoundtableResult, PlannerOutput, TaskSpec,
     Verdict,
 };
 pub use squad::ralph::{

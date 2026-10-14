@@ -9,7 +9,6 @@ repository.workspace = true
 
 [dependencies]
 cog-core = { workspace = true }
-cog-redis = { workspace = true }
 
 async-trait = "0.1"
 schemars = { workspace = true }
@@ -23,7 +22,6 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 futures = { workspace = true }
-redis = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

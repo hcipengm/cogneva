@@ -34,8 +34,9 @@ pub struct PgeRoundtableConfig {
     /// reads the latest snapshot at the start of each iteration and writes
     /// each phase's output back via [`ContextBoard::set`]. Use
     /// [`InMemoryContextBoard`](crate::squad::pge::InMemoryContextBoard) for
-    /// single-process tests or [`RedisContextBoard`](crate::squad::pge::RedisContextBoard)
-    /// for production multi-agent debates.
+    /// single-process tests or
+    /// [`KeyValueContextBoard`](crate::squad::pge::KeyValueContextBoard) over a
+    /// published `cog_core::KeyValueStore` for production multi-agent debates.
     pub board_store: Option<Arc<dyn ContextBoard>>,
     /// Optional moderator agent. When set, it is consulted at the end of every
     /// round that did not end on a consensus, a deterministic stop, or a stall;

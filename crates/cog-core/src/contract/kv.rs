@@ -23,7 +23,8 @@
 //!   [`smembers`](KeyValueStore::smembers);
 //! - **hash fields**: [`hset`](KeyValueStore::hset),
 //!   [`hget`](KeyValueStore::hget), [`hdel`](KeyValueStore::hdel),
-//!   [`hvals`](KeyValueStore::hvals), [`hlen`](KeyValueStore::hlen).
+//!   [`hvals`](KeyValueStore::hvals), [`hgetall`](KeyValueStore::hgetall),
+//!   [`hlen`](KeyValueStore::hlen).
 //!
 //! Deliberately **not** here: pub/sub and Streams. Those are a different
 //! capability with a different contract
@@ -115,6 +116,14 @@ pub trait KeyValueStore: Send + Sync {
 
     /// Every value of the hash at `key`, empty if the key is absent.
     async fn hvals(&self, key: &str) -> SFResult<Vec<String>>;
+
+    /// Every field and value of the hash at `key` as pairs, empty if the key is
+    /// absent.
+    ///
+    /// Distinct from [`hvals`](KeyValueStore::hvals) because the caller here
+    /// reassembles a structured document and the field names are the keys of
+    /// that document: values alone lose which field each one came from.
+    async fn hgetall(&self, key: &str) -> SFResult<Vec<(String, String)>>;
 
     /// How many fields the hash at `key` has, zero if the key is absent.
     async fn hlen(&self, key: &str) -> SFResult<u64>;

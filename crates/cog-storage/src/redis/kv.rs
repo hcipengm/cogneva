@@ -138,6 +138,12 @@ impl KeyValueStore for RedisKeyValueStore {
         self.connection.clone().hvals(key).await.map_err(err)
     }
 
+    async fn hgetall(&self, key: &str) -> SFResult<Vec<(String, String)>> {
+        let fields: std::collections::HashMap<String, String> =
+            self.connection.clone().hgetall(key).await.map_err(err)?;
+        Ok(fields.into_iter().collect())
+    }
+
     async fn hlen(&self, key: &str) -> SFResult<u64> {
         let count: i64 = self.connection.clone().hlen(key).await.map_err(err)?;
         Ok(count.max(0) as u64)

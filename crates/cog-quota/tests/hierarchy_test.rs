@@ -95,6 +95,10 @@ impl KeyValueStore for FakeStore {
         unreachable!("the hierarchy manager does not use hash fields")
     }
 
+    async fn hgetall(&self, _key: &str) -> cog_core::SFResult<Vec<(String, String)>> {
+        unreachable!("the session store does not use whole-hash reads")
+    }
+
     async fn hlen(&self, _key: &str) -> cog_core::SFResult<u64> {
         unreachable!("the hierarchy manager does not use hash fields")
     }
