@@ -65,7 +65,30 @@ pub const CIRCLED_CHARS: &[char] = &[
 /// A sweeping `git add` folds another writer's work into this commit, which
 /// makes "who changed this" unanswerable. The tree is written by two sessions at
 /// once, so a narrow add is a discipline rather than neatness.
-pub const NARROW_ADD_RE: &str = r"git[[:space:]]+add[[:space:]]+(-A|--all|\.)([[:space:]]|$)";
+///
+/// What a sweep looks like was measured rather than guessed: 4175 `git add`
+/// invocations across the session transcripts, and the forms that stage more
+/// than the files they name are three. `-A` / `--all` / `.`, which the shape was
+/// first written for. A directory written with a trailing slash -- `git add
+/// memory/`, six times, and `projects/cogneva/specs/`, `crates/cogneva/debt/`,
+/// `projects/cogneva/specs/ledger/inputs/` once each -- which the first shape
+/// missed and which is the form that actually blocked two sessions' commits. And
+/// a broad target reached through a flag, `git add -N .`, fourteen times.
+///
+/// The trailing slash separates the directory case, which is safe to add, from
+/// the bare name, which is not: `memory/` can only be a directory, while
+/// `memory` may be a directory or a file with no extension, and a shape that
+/// cannot tell them apart would refuse `git add LICENSE`. So the slash is in and
+/// the bare name stays out -- the half this pattern does not check, written down
+/// rather than left to look covered. A quoted path is the other uncaught form,
+/// and deliberately so: the host strips quoted spans before matching, the same
+/// exemption that keeps a rule's own name from tripping it.
+///
+/// What the flag allowance costs, said plainly: `git add -n .` is a dry run, and
+/// a regex cannot separate it from `git add -N .`. The dry-run spelling does not
+/// occur in the corpus and intent-to-add of the whole tree does, so refusing a
+/// harmless spelling beat leaving the whole tree unwatched.
+pub const NARROW_ADD_RE: &str = r"git[[:space:]]+add([[:space:]]+-[^[:space:]]+)*[[:space:]]+(-A|--all|\.|[^[:space:]]*/)([[:space:]]|$)";
 
 /// A destructive git command is allowed only when the owner asked for that exact
 /// action.
@@ -320,6 +343,28 @@ mod tests {
             "a sweeping add is what the shape is for"
         );
         assert_eq!(
+            first_match("git add memory/"),
+            Some("NARROW_ADD_RE"),
+            "a directory named with a trailing slash stages everything under it, \
+             which is the claim `-A` makes and the form that blocked two commits"
+        );
+        assert_eq!(
+            first_match("git add -A memory/"),
+            Some("NARROW_ADD_RE"),
+            "a flag in front of the directory does not narrow it"
+        );
+        assert_eq!(
+            first_match("git add -- crates/"),
+            Some("NARROW_ADD_RE"),
+            "the same directory behind a path separator is still the whole tree"
+        );
+        assert_eq!(
+            first_match("git add -N ."),
+            Some("NARROW_ADD_RE"),
+            "intent-to-add of the whole tree is reached through a flag, and the \
+             target is still every file"
+        );
+        assert_eq!(
             first_match("git push --force origin main"),
             Some("DESTRUCTIVE_GIT_RE")
         );
@@ -347,6 +392,17 @@ mod tests {
     #[test]
     fn clean_text_matches_nothing() {
         assert_eq!(first_match("git add crates/x/src/y.rs"), None);
+        assert_eq!(
+            first_match("git add projects/cogneva/specs/ledger.tsv"),
+            None,
+            "a path that merely contains slashes is still one file, so the \
+             directory branch must not fire on the last segment being a file"
+        );
+        assert_eq!(
+            first_match("git add Cargo.lock crates/cog-guardrail/src/lib.rs"),
+            None,
+            "a list of files is the discipline, not a sweep"
+        );
         assert_eq!(
             first_match("git commit -m 'fix a bug' -- crates/x/src/y.rs"),
             None,
@@ -387,8 +443,20 @@ mod tests {
             other => panic!("a sweeping add must be refused, got {other:?}"),
         }
 
-        let clean = cog_core::ToolCall {
+        let by_directory = cog_core::ToolCall {
             id: "2".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({"command": "git add memory/"}),
+        };
+        match guard.check_tool_call(&by_directory).await {
+            cog_core::GuardResult::Block { rule, .. } => {
+                assert_eq!(rule, "principle_shapes:NARROW_ADD_RE");
+            }
+            other => panic!("a directory add must be refused, got {other:?}"),
+        }
+
+        let clean = cog_core::ToolCall {
+            id: "3".into(),
             name: "bash".into(),
             arguments: serde_json::json!({"command": "git add crates/x/src/y.rs"}),
         };
