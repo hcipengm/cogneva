@@ -267,7 +267,7 @@ Cogneva: Agents emit Events → the Hook system responds dynamically → Skills 
 - **Memory**: externalized to the vector database; Agents inject context via retrieval
 - **Skills**: externalized to the Registry; Agents load them dynamically at runtime
 - **Configuration**: externalized to the config center; hot reload without restarting Agents
-- **Notifications**: pushed via the Event Stream, not occupying the Agent's context window
+- **Notifications**: delivered by the notification centre to WebSocket subscribers and outbound webhooks, not occupying the Agent's context window
 
 **Effect**: stateless Agents can restart and scale at any time with no concurrency conflicts; the context window is used only for "thinking", not "bookkeeping". The system layer manages all state through a state machine.
 
