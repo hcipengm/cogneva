@@ -318,6 +318,19 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
 
         let engine = if let (Some(ref mb), Some(ref llm)) = (memory_backend, llm_provider) {
             info!("ReflectionEngine initialized in production mode (persistent learning)");
+            // What the learning-to-skill promotion gate decided, and the
+            // recurrence it decided on. The handle is published here rather than
+            // beside the other observables below because it belongs to the
+            // promoter built on this branch: published from a deployment that
+            // has no persistent learning, it would be a series nothing writes,
+            // which reads exactly like a gate that never opens.
+            //
+            // Published while the plugins initialise: the gateway takes its
+            // snapshot of the observables during `init`, so a handle published
+            // from `start()` reaches no scrape at all.
+            let promotion_readings =
+                std::sync::Arc::new(crate::skill_promotion_readings::SkillPromotionReadings::new());
+            ctx.publish_observable(promotion_readings.clone());
             // The wiki backend is published by another plugin in this layer and
             // the promoter is built here, in the same layer: a backend read now
             // would be in time only when that plugin's init happens to finish
@@ -335,6 +348,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 engine_root.clone(),
                 Some(wiki),
                 change_dir.clone(),
+                promotion_readings,
             )
         } else {
             warn!("ReflectionEngine falling back to in-memory mode (memory_backend or llm_provider unavailable)");

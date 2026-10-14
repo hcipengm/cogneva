@@ -83,6 +83,7 @@ pub mod runtime_assets;
 pub mod sandbox;
 pub mod signal_readings;
 pub mod signal_watcher;
+pub mod skill_promotion_readings;
 pub mod squad;
 pub mod types;
 pub mod verification_budget;
@@ -370,6 +371,12 @@ impl ReflectionEngine {
         project_root: Option<std::path::PathBuf>,
         wiki: Option<cog_core::LateService<dyn cog_core::WikiBackend>>,
         change_dir: impl Into<std::path::PathBuf>,
+        // Where the promotion gate reports. Required rather than optional: the
+        // production gate is the one that was silent for three weeks, and a
+        // default here would make "the reading is wired" something a caller can
+        // omit without noticing. The plugin publishes this handle, so it has to
+        // exist before the engine does.
+        promotion_readings: Arc<crate::skill_promotion_readings::SkillPromotionReadings>,
     ) -> Self {
         let recorder: Arc<dyn LearningRecorder> = Arc::new(MemoryBackendRecorder::new(
             memory_backend.clone(),
@@ -378,7 +385,8 @@ impl ReflectionEngine {
         let detector: Arc<dyn LearningDetector> = Arc::new(DefaultLearningDetector::new());
         let matcher: Arc<dyn LearningMatcher> =
             Arc::new(DefaultLearningMatcher::new(recorder.clone(), None));
-        let mut promoter = DefaultLearningPromoter::new(skill_registry.clone());
+        let mut promoter =
+            DefaultLearningPromoter::new(skill_registry.clone()).with_readings(promotion_readings);
         if let Some(wiki) = wiki {
             promoter = promoter.with_wiki_late(wiki);
         }
@@ -568,9 +576,17 @@ impl ReflectionEngine {
         // 2. Self-review extraction
         let learnings = self.detector.detect_from_self_review(event);
         for learning in learnings {
+            // The recurrence bump is computed **before** the row is written.
+            // `record_learning` is the only writer of `recurrence_count`, and it
+            // writes the value it is handed: run the increment afterwards and the
+            // incremented value is dropped on the floor, leaving every stored row
+            // at the initial 1 however many times the pattern recurs -- which is
+            // what kept `min_recurrence` from ever being reached. The matcher
+            // reads the stored corpus, and `find_similar` filters out the row's
+            // own id, so writing afterwards cannot make the row match itself.
             let mut l = learning;
-            self.recorder.record_learning(l.clone()).await?;
             self.matcher.update_recurrence(&mut l).await?;
+            self.recorder.record_learning(l.clone()).await?;
 
             // Attempt promotion immediately
             let _ = self.promoter.promote_if_ready(&l).await;
@@ -826,9 +842,12 @@ impl ReflectionEngine {
     pub async fn process_context(&self, messages: &[cog_core::Message]) -> cog_core::SFResult<()> {
         let learnings = self.detector.detect_from_context(messages);
         for learning in learnings {
+            // Bump first, write second -- same reason as `process_event`: the
+            // stored row is where the count is read from, and an increment that
+            // runs after the write is never stored.
             let mut l = learning;
-            self.recorder.record_learning(l.clone()).await?;
             self.matcher.update_recurrence(&mut l).await?;
+            self.recorder.record_learning(l.clone()).await?;
             let _ = self.promoter.promote_if_ready(&l).await;
             self.maybe_trigger_evolution_from_learning(&l).await;
         }
@@ -1537,6 +1556,41 @@ mod tests {
             c >= 1,
             "Should trigger synthesize_hook when recurrence_count reaches threshold"
         );
+    }
+
+    /// The stored recurrence is the value the promoter reads, so an increment
+    /// that never reaches the row cannot open the gate however often the
+    /// pattern recurs. Asserting on the count in memory passes while every
+    /// stored row still says 1 -- which is what the pipeline did for three
+    /// weeks: the bump ran after `record_learning`, and `record_learning` is
+    /// the only writer of the column.
+    ///
+    /// The assertion is on `list_learnings`, not on the local variable: that
+    /// is the read-back the promotion check actually performs.
+    #[tokio::test]
+    async fn the_recurrence_of_a_repeat_is_stored_and_not_only_counted() {
+        let registry = Arc::new(tokio::sync::RwLock::new(SkillRegistry::new()));
+        let engine = ReflectionEngine::new_in_memory(registry);
+
+        let event = cog_core::AgentEvent::SelfReview {
+            agent_id: "test-agent".into(),
+            status: "NEED_REVISION".into(),
+            score: 0.5,
+            critique: Some("The agent keeps making the same mistake.".into()),
+            suggestions: Some(vec!["Add working-memory reminders".into()]),
+            summary: None,
+            timestamp: chrono::Utc::now(),
+        };
+
+        for occurrence in 1..=3u32 {
+            engine.process_event(&event).await.unwrap();
+            let stored = engine.recorder.list_learnings(None).await.unwrap();
+            let highest = stored.iter().map(|l| l.recurrence_count).max().unwrap_or(0);
+            assert_eq!(
+                highest, occurrence,
+                "occurrence {occurrence} of a pattern must be stored as {occurrence}"
+            );
+        }
     }
 
     /// A fake LLM that returns a fixed JSON payload for testing channel flows.

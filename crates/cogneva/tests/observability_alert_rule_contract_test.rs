@@ -172,6 +172,21 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_evolution_build_outcomes_total",
         "crates/cog-reflection/src/evolution_build_readings.rs",
     ),
+    // What the learning-to-skill promotion gate decided, and the recurrence
+    // each decision was taken on. Both are read by
+    // `evolution_learning_promotion_never_opens`: the decision alone cannot
+    // tell a gate whose threshold is out of reach from a pipeline with nothing
+    // mature, and the pair is what separates them. The input series is here
+    // rather than only in the dashboard table because the rule is the reader
+    // that says whether the counts climb.
+    (
+        "cogneva_evolution_learning_promotion_decisions_total",
+        "crates/cog-reflection/src/skill_promotion_readings.rs",
+    ),
+    (
+        "cogneva_evolution_learning_recurrence_decided_total",
+        "crates/cog-reflection/src/skill_promotion_readings.rs",
+    ),
     (
         "cogneva_change_fate_total",
         "crates/cog-github/src/change_funnel.rs",
