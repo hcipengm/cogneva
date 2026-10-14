@@ -1818,10 +1818,9 @@ async fn supervisor_status_handler(State(state): State<Arc<GatewayState>>) -> Re
                 scheduler_paused: supervisor.gate().is_paused(),
                 // Read off the event channel, not the supervisor's mutex: that
                 // mutex is on no trait method, and the only event carrying a
-                // rebalance is `SupervisorEvent::Rebalance`, which fires when a
-                // plan moved something (not on every successful pass). See
-                // `SupervisorEventCache::last_rebalance`.
-                last_rebalance: state.supervisor_event_cache.last_rebalance(),
+                // rebalance is `SupervisorEvent::Rebalance`. See
+                // `SupervisorEventCache::last_plan_emitted_at`.
+                last_plan_emitted_at: state.supervisor_event_cache.last_plan_emitted_at(),
                 timestamp: chrono::Utc::now(),
             };
             (StatusCode::OK, Json(snapshot)).into_response()

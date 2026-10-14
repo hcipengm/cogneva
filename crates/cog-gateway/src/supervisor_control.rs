@@ -55,14 +55,15 @@ pub struct ScaleRecommendation {
 /// - the last [`cog_core::SupervisorEvent::Tick`]'s `cycle`, which the
 ///   supervisor loop already broadcasts — its contract exposes no cycle
 ///   accessor, so the tick is the only source, and
-/// - the last [`cog_core::SupervisorEvent::Rebalance`]'s timestamp.
+/// - when the last rebalance plan was emitted, from the last
+///   [`cog_core::SupervisorEvent::Rebalance`].
 #[derive(Debug, Default)]
 pub struct SupervisorEventCache {
     last_scale_recommendation: Mutex<Option<ScaleRecommendation>>,
     /// `0` reads as "no tick seen yet": the supervisor's cycle starts at 0 and
     /// its first tick carries 1.
     cycle: AtomicU64,
-    last_rebalance: Mutex<Option<DateTime<Utc>>>,
+    last_plan_emitted_at: Mutex<Option<DateTime<Utc>>>,
 }
 
 impl SupervisorEventCache {
@@ -88,7 +89,7 @@ impl SupervisorEventCache {
             }
             cog_core::SupervisorEvent::Rebalance { timestamp, .. } => {
                 *self
-                    .last_rebalance
+                    .last_plan_emitted_at
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = Some(*timestamp);
             }
@@ -109,18 +110,22 @@ impl SupervisorEventCache {
         self.cycle.load(Ordering::Relaxed)
     }
 
-    /// The last rebalance the supervisor reported, or `None` before any.
+    /// When the last rebalance plan was emitted, or `None` before any.
     ///
-    /// This reads the last [`cog_core::SupervisorEvent::Rebalance`], which the
-    /// supervisor sends when a rebalance pass produced a non-empty plan, and
-    /// also when a health pass recovered checkpoints for dead agents. It is
-    /// therefore "the last rebalance that moved something", not "the last
-    /// successful rebalance pass" — the control plane's `last_rebalance` is
-    /// that other fact, read off a mutex no accessor exposes. The two names
-    /// answer different questions; do not read one as the other.
-    pub fn last_rebalance(&self) -> Option<DateTime<Utc>> {
+    /// This reads the last [`cog_core::SupervisorEvent::Rebalance`]. That event
+    /// has two producers: the rebalance pass, when the plan it built is
+    /// non-empty, and the health pass, when a checkpoint recovery for dead
+    /// agents produced one. Both carry the same meaning for their `timestamp`
+    /// ("a plan went out now"), so this is "when did a plan last go out".
+    ///
+    /// It is deliberately not named after the control plane's
+    /// `SupervisorStatus.last_rebalance`, which reads a mutex set on every
+    /// successful rebalance pass (each `rebalance_interval`, 300s) and so
+    /// answers "when did the pass last run clean". The two are different facts,
+    /// so they carry different names; do not read one as the other.
+    pub fn last_plan_emitted_at(&self) -> Option<DateTime<Utc>> {
         *self
-            .last_rebalance
+            .last_plan_emitted_at
             .lock()
             .unwrap_or_else(|e| e.into_inner())
     }
@@ -176,24 +181,24 @@ mod tests {
         let cache = SupervisorEventCache::default();
         assert!(cache.scale_recommendation().is_none());
         assert_eq!(cache.cycle(), 0);
-        assert!(cache.last_rebalance().is_none());
+        assert!(cache.last_plan_emitted_at().is_none());
     }
 
     #[test]
-    fn the_last_rebalance_wins_and_other_events_leave_it_alone() {
-        // `last_rebalance` has no accessor on the supervisor's contract either;
-        // the Rebalance event is its only source, so the tick and the scale
-        // recommendation must not move it.
+    fn the_last_plan_wins_and_other_events_leave_it_alone() {
+        // `last_plan_emitted_at` has no accessor on the supervisor's contract
+        // either; the Rebalance event is its only source, so the tick and the
+        // scale recommendation must not move it.
         let cache = SupervisorEventCache::default();
         let first = Utc::now();
         cache.observe(&rebalance(first));
         cache.observe(&tick(3));
         cache.observe(&scale(2, "ratio 1.1"));
-        assert_eq!(cache.last_rebalance(), Some(first));
+        assert_eq!(cache.last_plan_emitted_at(), Some(first));
 
         let second = first + chrono::Duration::seconds(30);
         cache.observe(&rebalance(second));
-        assert_eq!(cache.last_rebalance(), Some(second));
+        assert_eq!(cache.last_plan_emitted_at(), Some(second));
     }
 
     #[test]
