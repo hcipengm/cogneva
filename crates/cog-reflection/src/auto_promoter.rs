@@ -1201,8 +1201,12 @@ mod tests {
 
     /// 返回一个固定结局的求值器：考的是**门本身**（拦不拦、记哪一格），不是那台
     /// 真跑沙盒双构建的机器。跟 `FakeChannel` 同一个路子。
+    ///
+    /// 带一个可选的调用计数：考「门什么时候被走到」时用它，比如「已录过的变更不该
+    /// 再被评估一次」。
     struct FakeEvaluator {
         outcome: PromotionEvalOutcome,
+        calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
     }
 
     #[async_trait]
@@ -1212,6 +1216,9 @@ mod tests {
             _change_id: &str,
             _source: Option<&PromotionSource>,
         ) -> PromotionEvalOutcome {
+            if let Some(calls) = &self.calls {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             match &self.outcome {
                 PromotionEvalOutcome::Measured(v, s) => {
                     PromotionEvalOutcome::Measured(*v, s.clone())
@@ -1227,9 +1234,17 @@ mod tests {
     fn wired(
         outcome: PromotionEvalOutcome,
     ) -> Arc<OnceLock<Arc<dyn crate::promotion_eval::PromotionEvaluator>>> {
+        wired_counting(outcome, None)
+    }
+
+    /// 同上，但求值器会记下被调用的次数。
+    fn wired_counting(
+        outcome: PromotionEvalOutcome,
+        calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    ) -> Arc<OnceLock<Arc<dyn crate::promotion_eval::PromotionEvaluator>>> {
         let slot: Arc<OnceLock<Arc<dyn crate::promotion_eval::PromotionEvaluator>>> =
             Arc::new(OnceLock::new());
-        let _ = slot.set(Arc::new(FakeEvaluator { outcome }));
+        let _ = slot.set(Arc::new(FakeEvaluator { outcome, calls }));
         slot
     }
 
@@ -1390,6 +1405,41 @@ mod tests {
         p.decide_and_promote(&pt).await.unwrap();
         p.decide_and_promote(&pt).await.unwrap();
         assert_eq!(channel.published.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_already_recorded_change_is_not_re_evaluated() {
+        // 幂等守卫判在最贵的动作之前。eval 门现在要提交一次沙盒双构建，一条已录过
+        // 的变更若先过门，会白花掉那次评估再被守卫挡下——纯读判词的年代这个顺序
+        // 无所谓，门变成重跑之后它才是缺陷。
+        //
+        // 这条钉住那个顺序：把门挪回守卫之前，求值器会被调两次，`calls` 就变 2。
+        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let channel = Arc::new(FakeChannel {
+            published: Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let policy = crate::PromotionGateConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let p =
+            promoter(policy, ledger.clone(), Some(channel.clone())).with_eval_slot(wired_counting(
+                PromotionEvalOutcome::Measured(
+                    cog_core::EvalVerdict::Adopt,
+                    "Adopt z=2.31, success 18/20 -> 20/20".into(),
+                ),
+                Some(calls.clone()),
+            ));
+        let pt = change("p8", "crates/cog-agent/src/tools.rs");
+        p.decide_and_promote(&pt).await.unwrap();
+        p.decide_and_promote(&pt).await.unwrap();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "第二次是已录过的变更，应在守卫处短路，不该再走一次门"
+        );
     }
 
     #[tokio::test]
