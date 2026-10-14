@@ -3,6 +3,8 @@
 //! Uses `octocrab` for GitHub API calls.  The GitHub token is resolved from the
 //! configured account and is kept out of the evolution sandbox.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use octocrab::Octocrab;
 
@@ -48,8 +50,10 @@ pub struct GitHubProvider {
     base_branch: String,
     /// API 基址覆盖（安全网关透传端点）。None = 直连 api.github.com。
     api_base: Option<String>,
-    /// 非 octocrab 那几路（附件、CI job 日志）用的客户端，走系统 `http_client` 配置。
-    http: reqwest::Client,
+    /// 非 octocrab 那几路（附件、CI job 日志）用的客户端，由装配层注入：
+    /// 系统 `http_client` 段的超时/连接池/代理只在一个地方定义，这里经
+    /// `cog_core::HttpClient` 契约取用而不认具体实现。
+    http: Arc<dyn cog_core::HttpClient>,
 }
 
 impl GitHubProvider {
@@ -66,6 +70,7 @@ impl GitHubProvider {
         repo: &str,
         base_branch: &str,
         api_base: Option<&str>,
+        http: Arc<dyn cog_core::HttpClient>,
     ) -> Result<Self> {
         let client = match api_base {
             Some(base) => Octocrab::builder()
@@ -93,7 +98,7 @@ impl GitHubProvider {
             account: account.clone(),
             base_branch: base_branch.to_string(),
             api_base: api_base.map(|s| s.trim_end_matches('/').to_string()),
-            http: super::configured_http_client()?,
+            http,
         })
     }
 
@@ -375,7 +380,7 @@ impl CodePlatformProvider for GitHubProvider {
         // Gateway mode (api_base like http://gw/github): fetch through the
         // zero-credential /attach proxy; direct mode: fetch the public URL.
         let root = self.api_base.as_deref().and_then(gateway_attach_root);
-        http_fetch_attachment(&self.http, root.as_deref(), url).await
+        http_fetch_attachment(self.http.as_ref(), root.as_deref(), url).await
     }
 
     async fn fetch_ci_failure_logs(&self, run_id: u64) -> Result<Vec<CiJobLog>> {
@@ -411,7 +416,6 @@ impl CodePlatformProvider for GitHubProvider {
             return Ok(Vec::new());
         }
         let base = self.api_base.as_deref().unwrap_or("https://api.github.com");
-        let http = &self.http;
 
         let mut logs = Vec::new();
         let mut total_bytes = 0usize;
@@ -423,15 +427,15 @@ impl CodePlatformProvider for GitHubProvider {
                 "{base}/repos/{}/{}/actions/jobs/{}/logs",
                 self.owner, self.repo, job.id
             );
-            // The endpoint answers 302 to a signed download URL; reqwest
+            // The endpoint answers 302 to a signed download URL; the client
             // follows it and drops the Authorization header cross-origin.
-            let mut req = http.get(&url);
+            let mut req = cog_core::HttpRequest::get(&url);
             if let Some(t) = &token {
-                req = req.bearer_auth(t);
+                req = req.header("Authorization", format!("Bearer {t}"));
             }
-            match req.send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    let text = resp.text().await.unwrap_or_default();
+            match self.http.execute(req).await {
+                Ok(resp) if (200..300).contains(&resp.status) => {
+                    let text = String::from_utf8_lossy(&resp.body).into_owned();
                     let remaining = MAX_TOTAL_LOG_BYTES - total_bytes;
                     let cap = MAX_JOB_LOG_BYTES.min(remaining);
                     let tail = log_tail(&text, cap);
@@ -445,7 +449,7 @@ impl CodePlatformProvider for GitHubProvider {
                 Ok(resp) => {
                     tracing::warn!(
                         job = %job.name,
-                        status = %resp.status(),
+                        status = %resp.status,
                         "Failed to fetch CI job log"
                     );
                 }
@@ -746,11 +750,18 @@ mod tests {
             token: None,
             ..Default::default()
         });
+        let http: Arc<dyn cog_core::HttpClient> = Arc::new(crate::provider::UnusedHttpClient);
         // 直连模式：无 token 拒绝构建（凭证缺失响亮报错）。
-        assert!(GitHubProvider::new(&account, "o/r", "main", None).is_err());
+        assert!(GitHubProvider::new(&account, "o/r", "main", None, http.clone()).is_err());
         // 网关模式：本进程零 token，凭证由透传端点出口注入。
-        let p =
-            GitHubProvider::new(&account, "o/r", "main", Some("http://gw:8081/github/")).unwrap();
+        let p = GitHubProvider::new(
+            &account,
+            "o/r",
+            "main",
+            Some("http://gw:8081/github/"),
+            http,
+        )
+        .unwrap();
         assert_eq!(p.api_base.as_deref(), Some("http://gw:8081/github"));
         assert_eq!(p.base_branch(), "main");
     }

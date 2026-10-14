@@ -11,19 +11,67 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 
-/// The HTTP client every provider here makes its non-SDK calls with.
+/// A client that never sends anything, for tests that only build a provider.
 ///
-/// Built from the system's `http_client` config section, like every other
-/// outbound client in this workspace: the settings that matter (timeouts,
-/// connection pool, proxy) belong to one place, and a provider that builds its
-/// own `reqwest::Client::new()` has none of them — no timeout at all, which
-/// means an upstream that stops answering hangs the caller instead of failing
-/// it. Fails loudly when that section is malformed rather than falling back to
-/// an unconfigured client, because the substituted one is indistinguishable
-/// downstream from the configured one.
-pub(crate) fn configured_http_client() -> Result<reqwest::Client> {
-    let config = cog_net::HttpClientConfig::load()?;
-    Ok(cog_net::build_client(&config)?)
+/// A provider stores the client and does not touch it until a call is made, so
+/// the tests that check URL assembly and config handling never reach a
+/// request. Saying so is the point: a stand-in that answered an empty `200`
+/// would let a test that meant to exercise a request pass without one.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct UnusedHttpClient;
+
+#[cfg(test)]
+#[async_trait]
+impl cog_core::HttpClient for UnusedHttpClient {
+    async fn execute(
+        &self,
+        _req: cog_core::HttpRequest,
+    ) -> cog_core::SFResult<cog_core::HttpResponse> {
+        unimplemented!("UnusedHttpClient never sends a request")
+    }
+}
+
+/// Append query parameters to a URL, percent-encoding the values.
+///
+/// The providers build their own URLs — the gateway passthrough base is a
+/// config value, not a constant — so the encoding cannot be left to a request
+/// builder that is no longer on this side of the contract. A media URL or a
+/// token carrying `&` or `#` would otherwise truncate the request at that
+/// character, and the upstream would answer something that reads like a
+/// missing resource rather than a malformed one.
+pub(crate) fn with_query(base: &str, params: &[(&str, &str)]) -> String {
+    match reqwest::Url::parse(base) {
+        Ok(mut url) => {
+            {
+                let mut pairs = url.query_pairs_mut();
+                for (k, v) in params {
+                    pairs.append_pair(k, v);
+                }
+            }
+            url.into()
+        }
+        // A base that does not parse is a URL the caller wrote; report it from
+        // the request, where the failure has a name, rather than here.
+        Err(_) => base.to_string(),
+    }
+}
+
+/// Form-encode a set of fields for an `application/x-www-form-urlencoded` body.
+///
+/// The two form-encoded endpoints (Gitee PR create/comment/merge/labels) need
+/// a body, and the contract carries bodies as bytes with the content type
+/// stated by the sender. Encoding it here keeps the `+`/`%XX` rules in one
+/// place instead of at each call site.
+pub(crate) fn form_body(fields: &[(&str, &str)]) -> String {
+    let mut url = reqwest::Url::parse("http://form.invalid").expect("static form base parses");
+    {
+        let mut pairs = url.query_pairs_mut();
+        for (k, v) in fields {
+            pairs.append_pair(k, v);
+        }
+    }
+    url.query().unwrap_or_default().to_string()
 }
 
 /// Generic code platform operations used by Cogneva's self-evolution loop.
@@ -307,36 +355,35 @@ pub fn gateway_attach_root(api_base: &str) -> Option<String> {
 /// there), else directly. Returns the bytes and a MIME type (from the
 /// response `Content-Type`, inferred from the URL extension when absent).
 pub(crate) async fn http_fetch_attachment(
-    client: &reqwest::Client,
+    client: &dyn cog_core::HttpClient,
     gateway_root: Option<&str>,
     url: &str,
 ) -> Result<AttachmentData> {
-    // reqwest percent-encodes the `url` query parameter for us.
-    let req = match gateway_root {
-        Some(root) => client
-            .get(format!("{}/attach", root.trim_end_matches('/')))
-            .query(&[("url", url)]),
-        None => client.get(url),
+    // The `url` query parameter is percent-encoded here: the gateway proxy
+    // takes the media URL as a query value, and one carrying `&` or `#` would
+    // otherwise send a different request than the one the caller meant.
+    let target = match gateway_root {
+        Some(root) => with_query(
+            &format!("{}/attach", root.trim_end_matches('/')),
+            &[("url", url)],
+        ),
+        None => url.to_string(),
     };
-    let resp = req
-        .send()
+    let resp = client
+        .execute(cog_core::HttpRequest::get(target))
         .await
-        .map_err(crate::error::CogGitHubError::Http)?;
-    let status = resp.status();
-    if !status.is_success() {
+        .map_err(crate::error::CogGitHubError::Upstream)?;
+    if !(200..300).contains(&resp.status) {
         return Err(crate::error::CogGitHubError::Provider(format!(
-            "attachment fetch returned HTTP {status} for {url}"
+            "attachment fetch returned HTTP {} for {url}",
+            resp.status
         )));
     }
     let header_mime = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
+        .headers
+        .get("content-type")
         .map(|s| s.split(';').next().unwrap_or(s).trim().to_string());
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(crate::error::CogGitHubError::Http)?;
+    let bytes = resp.body;
     if bytes.len() > MAX_ATTACHMENT_BYTES {
         return Err(crate::error::CogGitHubError::Provider(format!(
             "attachment too large ({} bytes) for {url}",
@@ -347,10 +394,7 @@ pub(crate) async fn http_fetch_attachment(
         .filter(|m| is_media_mime(m))
         .or_else(|| ext_mime(url))
         .unwrap_or_else(|| "application/octet-stream".to_string());
-    Ok(AttachmentData {
-        bytes: bytes.to_vec(),
-        mime_type,
-    })
+    Ok(AttachmentData { bytes, mime_type })
 }
 
 /// True when a MIME type is a media kind we accept as an attachment.

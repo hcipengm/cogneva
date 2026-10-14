@@ -278,6 +278,13 @@ impl cog_core::SystemPlugin for GitHubPlugin {
         let mut config = crate::config::GitHubIntegrationConfig::load()?;
         let gitee_config = crate::config::GiteeIntegrationConfig::load()?;
 
+        // Outbound HTTP comes from the assembly's client: the timeouts, pool and
+        // proxy that turn an upstream which stops answering into a failure
+        // rather than a hang are defined once, and this plugin consumes the
+        // contract instead of naming the crate that builds it. `requires: ["net"]`
+        // on the descriptor is what makes it published by the time this runs.
+        let http = ctx.require_service::<dyn cog_core::HttpClient>()?;
+
         // 实例自治身份（Alice#a3f9d2c1 式）：首次进化时按机器指纹自动生成，
         // 后续提交作者 / evol 分支 / PR 元数据统一引用；纯确定性，可重入。
         let identity = crate::identity::resolve(&mut config.bot_identity).await;
@@ -294,7 +301,7 @@ impl cog_core::SystemPlugin for GitHubPlugin {
 
         if config.enabled {
             let mut channel_published = false;
-            match crate::default_provider(&config) {
+            match crate::default_provider(&config, http.clone()) {
                 Ok(provider) => {
                     let provider: Arc<dyn CodePlatformProvider> = Arc::from(provider);
                     ctx.publish_service::<dyn CodePlatformProvider>(provider.clone());
@@ -383,7 +390,7 @@ impl cog_core::SystemPlugin for GitHubPlugin {
         // gitee_integration 覆盖。Gitee 暂无开放 CI API 与 ChangeSink，
         // 发现循环承担 scan→triage→clarify→submit 全链。
         if gitee_config.enabled {
-            match crate::gitee_provider(&gitee_config) {
+            match crate::gitee_provider(&gitee_config, http.clone()) {
                 Ok(provider) => {
                     let mut loop_cfg = config.clone();
                     loop_cfg.enabled = true;
@@ -649,7 +656,9 @@ impl cog_core::SystemPlugin for GitHubPlugin {
 /// Static plugin descriptor used by the generated plugin registry.
 pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "github",
-    requires: &[],
+    // Every provider here makes its calls through the published HTTP client,
+    // so the net plugin has to have run its init first.
+    requires: &["net"],
     // 池全灭时按 SchedulerGate 跳过 LLM 依赖轮次；supervisor 缺席也能跑。
     optional_requires: &["supervisor"],
     factory: || Box::new(GitHubPlugin::new()),

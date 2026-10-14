@@ -57,7 +57,10 @@ use tracing::debug;
 /// provider is built token-free (the gateway injects credentials on egress);
 /// otherwise the token is resolved from the primary account's environment
 /// variable or inline field and held only in the calling process's memory.
-pub fn default_provider(config: &GitHubIntegrationConfig) -> Result<Box<dyn CodePlatformProvider>> {
+pub fn default_provider(
+    config: &GitHubIntegrationConfig,
+    http: std::sync::Arc<dyn cog_core::HttpClient>,
+) -> Result<Box<dyn CodePlatformProvider>> {
     let account = config
         .primary_account()
         .map_err(|e| CogGitHubError::InvalidConfig(e.to_string()))?;
@@ -72,6 +75,7 @@ pub fn default_provider(config: &GitHubIntegrationConfig) -> Result<Box<dyn Code
         &config.repo,
         &config.base_branch,
         config.api_base.as_deref(),
+        http,
     )?))
 }
 
@@ -79,6 +83,7 @@ pub fn default_provider(config: &GitHubIntegrationConfig) -> Result<Box<dyn Code
 /// （api_base 已设）零 token；直连模式才解析 token_env。
 pub fn gitee_provider(
     config: &config::GiteeIntegrationConfig,
+    http: std::sync::Arc<dyn cog_core::HttpClient>,
 ) -> Result<Box<dyn CodePlatformProvider>> {
     let token = match config.api_base {
         Some(_) => None,
@@ -92,6 +97,7 @@ pub fn gitee_provider(
         &config.repo,
         config.api_base.as_deref(),
         token,
+        http,
     )?))
 }
 

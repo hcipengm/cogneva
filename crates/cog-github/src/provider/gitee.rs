@@ -8,19 +8,23 @@
 //! Gitee 没有与 GitHub Actions 对应的开放 API，CI 失败相关方法保持
 //! trait 默认（返回空列表，发现循环自动降级）。
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use crate::error::{CogGitHubError, Result};
 use crate::provider::{
-    gateway_attach_root, http_fetch_attachment, AttachmentData, CiFailureEvent, CiJobLog,
-    CodePlatformProvider, CreatePullRequest, PlatformComment, PlatformIssue, PlatformPullRequest,
-    PullRequestDetail,
+    form_body, gateway_attach_root, http_fetch_attachment, with_query, AttachmentData,
+    CiFailureEvent, CiJobLog, CodePlatformProvider, CreatePullRequest, PlatformComment,
+    PlatformIssue, PlatformPullRequest, PullRequestDetail,
 };
 
 /// Gitee code platform provider (API v5).
 #[derive(Clone, Debug)]
 pub struct GiteeProvider {
-    http: reqwest::Client,
+    /// 由装配层注入的出站客户端：超时/连接池/代理只有一个来源，本 crate
+    /// 经 `cog_core::HttpClient` 契约取用，不认具体实现。
+    http: Arc<dyn cog_core::HttpClient>,
     owner: String,
     repo: String,
     base: String,
@@ -33,10 +37,15 @@ impl GiteeProvider {
     ///
     /// `api_base` 为空时直连 `https://gitee.com/api/v5`；`token` 仅在直连
     /// 模式需要（以 access_token query 参数附带），网关模式传 None。
-    pub fn new(repo: &str, api_base: Option<&str>, token: Option<String>) -> Result<Self> {
+    pub fn new(
+        repo: &str,
+        api_base: Option<&str>,
+        token: Option<String>,
+        http: Arc<dyn cog_core::HttpClient>,
+    ) -> Result<Self> {
         let (owner, repo_name) = super::github::split_repo(repo)?;
         Ok(Self {
-            http: super::configured_http_client()?,
+            http,
             owner,
             repo: repo_name,
             base: api_base
@@ -51,32 +60,47 @@ impl GiteeProvider {
     fn url(&self, path: &str) -> String {
         let raw = format!("{}/repos/{}/{}{}", self.base, self.owner, self.repo, path);
         match &self.token {
-            Some(t) => {
-                let mut url = reqwest::Url::parse(&raw).expect("provider-built url is valid");
-                url.query_pairs_mut().append_pair("access_token", t);
-                url.into()
-            }
+            Some(t) => with_query(&raw, &[("access_token", t)]),
             None => raw,
         }
     }
 
     /// 发送请求并把非 2xx 统一映射为 Provider 错误（含状态码，便于诊断
     /// 网关未配置 token 的 503 与 Gitee 自身的 401/403）。
-    async fn send(&self, req: reqwest::RequestBuilder) -> Result<serde_json::Value> {
-        let resp = req.send().await.map_err(CogGitHubError::Http)?;
-        let status = resp.status();
-        let text = resp.text().await.map_err(CogGitHubError::Http)?;
-        if !status.is_success() {
+    async fn send(&self, req: cog_core::HttpRequest) -> Result<serde_json::Value> {
+        let resp = self
+            .http
+            .execute(req)
+            .await
+            .map_err(CogGitHubError::Upstream)?;
+        let status = resp.status;
+        let text = String::from_utf8_lossy(&resp.body).into_owned();
+        if !(200..300).contains(&status) {
+            let snippet: String = text.chars().take(200).collect();
             return Err(CogGitHubError::Provider(format!(
-                "gitee api returned HTTP {status}: {}",
-                &text[..text.len().min(200)]
+                "gitee api returned HTTP {status}: {snippet}"
             )));
         }
         Ok(serde_json::from_str(&text).unwrap_or(serde_json::Value::Null))
     }
 
-    fn get(&self, path: &str) -> reqwest::RequestBuilder {
-        self.http.get(self.url(path))
+    /// 一个带 query 参数的 GET。参数在这里编码：`url()` 拼出的地址已经可能
+    /// 带一个 `access_token`，直接字符串拼接会与它抢 `?`。
+    fn get(&self, path: &str, params: &[(&str, &str)]) -> cog_core::HttpRequest {
+        cog_core::HttpRequest::get(with_query(&self.url(path), params))
+    }
+
+    /// 一个 form 编码的请求；Gitee v5 的写接口（建 PR、评论、合并、打标签）
+    /// 收 `application/x-www-form-urlencoded` 而非 JSON。
+    fn form_request(
+        &self,
+        method: &str,
+        path: &str,
+        fields: &[(&str, &str)],
+    ) -> cog_core::HttpRequest {
+        cog_core::HttpRequest::new(method, self.url(path))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(form_body(fields).into_bytes())
     }
 
     /// trait 的 issue_number 是 u64，承载 Gitee issue 的数值 `id`；而
@@ -84,10 +108,7 @@ impl GiteeProvider {
     /// 做一次列表扫描完成 id → 字符串编号翻译（发现循环低频调用，可接受）。
     async fn issue_string_number(&self, issue_id: u64) -> Result<String> {
         let v = self
-            .send(
-                self.get("/issues")
-                    .query(&[("state", "all"), ("per_page", "100")]),
-            )
+            .send(self.get("/issues", &[("state", "all"), ("per_page", "100")]))
             .await?;
         v.as_array()
             .and_then(|a| {
@@ -141,12 +162,15 @@ impl CodePlatformProvider for GiteeProvider {
 
     async fn list_open_issues(&self) -> Result<Vec<PlatformIssue>> {
         let v = self
-            .send(self.get("/issues").query(&[
-                ("state", "open"),
-                ("per_page", "100"),
-                ("sort", "created"),
-                ("direction", "desc"),
-            ]))
+            .send(self.get(
+                "/issues",
+                &[
+                    ("state", "open"),
+                    ("per_page", "100"),
+                    ("sort", "created"),
+                    ("direction", "desc"),
+                ],
+            ))
             .await?;
         Ok(v.as_array()
             .map(|a| a.iter().map(parse_issue).collect())
@@ -156,24 +180,31 @@ impl CodePlatformProvider for GiteeProvider {
     async fn create_pull_request(&self, req: CreatePullRequest) -> Result<PlatformPullRequest> {
         // Gitee v5 创建 PR 接受 form 参数。
         let v = self
-            .send(self.http.post(self.url("/pulls")).form(&[
-                ("title", req.title.as_str()),
-                ("head", req.head_branch.as_str()),
-                ("base", req.base_branch.as_str()),
-                ("body", req.body.as_str()),
-            ]))
+            .send(self.form_request(
+                "POST",
+                "/pulls",
+                &[
+                    ("title", req.title.as_str()),
+                    ("head", req.head_branch.as_str()),
+                    ("base", req.base_branch.as_str()),
+                    ("body", req.body.as_str()),
+                ],
+            ))
             .await?;
         Ok(parse_pr(&v, &req))
     }
 
     async fn list_open_pull_requests(&self) -> Result<Vec<PlatformPullRequest>> {
         let v = self
-            .send(self.get("/pulls").query(&[
-                ("state", "open"),
-                ("per_page", "100"),
-                ("sort", "created"),
-                ("direction", "desc"),
-            ]))
+            .send(self.get(
+                "/pulls",
+                &[
+                    ("state", "open"),
+                    ("per_page", "100"),
+                    ("sort", "created"),
+                    ("direction", "desc"),
+                ],
+            ))
             .await?;
         Ok(v.as_array()
             .map(|a| a.iter().map(parse_pr_list_item).collect())
@@ -182,21 +213,21 @@ impl CodePlatformProvider for GiteeProvider {
 
     async fn comment_on_issue(&self, issue_number: u64, body: String) -> Result<()> {
         let number = self.issue_string_number(issue_number).await?;
-        self.send(
-            self.http
-                .post(self.url(&format!("/issues/{number}/comments")))
-                .form(&[("body", body.as_str())]),
-        )
+        self.send(self.form_request(
+            "POST",
+            &format!("/issues/{number}/comments"),
+            &[("body", body.as_str())],
+        ))
         .await?;
         Ok(())
     }
 
     async fn merge_pull_request(&self, pr_number: u64, _sha: String) -> Result<()> {
-        self.send(
-            self.http
-                .put(self.url(&format!("/pulls/{pr_number}/merge")))
-                .form(&[("merge_method", "merge")]),
-        )
+        self.send(self.form_request(
+            "PUT",
+            &format!("/pulls/{pr_number}/merge"),
+            &[("merge_method", "merge")],
+        ))
         .await?;
         Ok(())
     }
@@ -204,11 +235,11 @@ impl CodePlatformProvider for GiteeProvider {
     async fn add_labels(&self, issue_number: u64, labels: &[String]) -> Result<()> {
         // Gitee v5 给 PR 打标签走 pulls 端点，labels 为逗号分隔名单。
         let joined = labels.join(",");
-        self.send(
-            self.http
-                .post(self.url(&format!("/pulls/{issue_number}/labels")))
-                .form(&[("labels", joined.as_str())]),
-        )
+        self.send(self.form_request(
+            "POST",
+            &format!("/pulls/{issue_number}/labels"),
+            &[("labels", joined.as_str())],
+        ))
         .await?;
         Ok(())
     }
@@ -216,10 +247,10 @@ impl CodePlatformProvider for GiteeProvider {
     async fn list_issue_comments(&self, issue_number: u64) -> Result<Vec<PlatformComment>> {
         let number = self.issue_string_number(issue_number).await?;
         let v = self
-            .send(
-                self.get(&format!("/issues/{number}/comments"))
-                    .query(&[("per_page", "100")]),
-            )
+            .send(self.get(
+                &format!("/issues/{number}/comments"),
+                &[("per_page", "100")],
+            ))
             .await?;
         Ok(v.as_array()
             .map(|a| {
@@ -237,10 +268,10 @@ impl CodePlatformProvider for GiteeProvider {
     async fn list_pull_comments(&self, pr_number: u64) -> Result<Vec<PlatformComment>> {
         // Gitee PR 评论端点与 issue 不同（PR 用数值 number，直接进路径）。
         let v = self
-            .send(
-                self.get(&format!("/pulls/{pr_number}/comments"))
-                    .query(&[("per_page", "100")]),
-            )
+            .send(self.get(
+                &format!("/pulls/{pr_number}/comments"),
+                &[("per_page", "100")],
+            ))
             .await?;
         Ok(v.as_array()
             .map(|a| {
@@ -256,11 +287,11 @@ impl CodePlatformProvider for GiteeProvider {
     }
 
     async fn comment_on_pull(&self, pr_number: u64, body: String) -> Result<()> {
-        self.send(
-            self.http
-                .post(self.url(&format!("/pulls/{pr_number}/comments")))
-                .form(&[("body", body.as_str())]),
-        )
+        self.send(self.form_request(
+            "POST",
+            &format!("/pulls/{pr_number}/comments"),
+            &[("body", body.as_str())],
+        ))
         .await?;
         Ok(())
     }
@@ -269,13 +300,15 @@ impl CodePlatformProvider for GiteeProvider {
         // Gateway mode (base like http://gw/gitee): zero-credential /attach
         // proxy; direct mode: fetch the public URL.
         let root = gateway_attach_root(&self.base);
-        http_fetch_attachment(&self.http, root.as_deref(), url).await
+        http_fetch_attachment(self.http.as_ref(), root.as_deref(), url).await
     }
 
     async fn get_pull_request(&self, pr_number: u64) -> Result<PullRequestDetail> {
-        let pr = self.send(self.get(&format!("/pulls/{pr_number}"))).await?;
+        let pr = self
+            .send(self.get(&format!("/pulls/{pr_number}"), &[]))
+            .await?;
         let files = self
-            .send(self.get(&format!("/pulls/{pr_number}/files")))
+            .send(self.get(&format!("/pulls/{pr_number}/files"), &[]))
             .await
             .ok();
         let (affected_files, changed_lines) = files
@@ -384,14 +417,19 @@ fn parse_labels(v: &serde_json::Value) -> Vec<String> {
 mod tests {
     use super::*;
 
+    fn unused_http() -> std::sync::Arc<dyn cog_core::HttpClient> {
+        std::sync::Arc::new(crate::provider::UnusedHttpClient)
+    }
+
     #[test]
     fn url_carries_token_only_in_direct_mode() {
-        let direct = GiteeProvider::new("o/r", None, Some("tok".into())).unwrap();
+        let direct = GiteeProvider::new("o/r", None, Some("tok".into()), unused_http()).unwrap();
         assert_eq!(
             direct.url("/issues"),
             "https://gitee.com/api/v5/repos/o/r/issues?access_token=tok"
         );
-        let gateway = GiteeProvider::new("o/r", Some("http://gw:8081/gitee/"), None).unwrap();
+        let gateway =
+            GiteeProvider::new("o/r", Some("http://gw:8081/gitee/"), None, unused_http()).unwrap();
         assert_eq!(
             gateway.url("/issues"),
             "http://gw:8081/gitee/repos/o/r/issues"
