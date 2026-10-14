@@ -1454,6 +1454,37 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 39,
+          "title": "Learning Recurrence: Is the Corpus Accumulating?",
+          "description": "Every consultation of a recurrence threshold, bucketed by the count it was consulted on, over 6h, split by which threshold asked. `recurrence_count` is what the store holds for a learning, and it is the one column that says whether the same pattern is being seen again: a distribution sitting entirely in bucket 1 over a whole window says the pipeline detects learnings and never meets one twice, which is what the store said for three weeks while every other reading stayed green -- the increment was computed and then dropped, because the write ran after the only writer of the column. The two gates act at different counts (the hook threshold on every detected learning, the change threshold on the code-defect half), so they are drawn separately rather than summed into one distribution. Buckets stop at 4+ because the question is whether the count is climbing, not how large it gets. This is the reading a recurring-pattern claim has to cite: work that decides what to try next from what has repeated (bandit balance, benchmark freshness) reads the count, and this panel is where the count's own accumulation is visible. Ceiling: the counter belongs to one process and starts at zero again when the pod does, so read the shape over the window rather than a lifetime total, and treat a gate line pinned at zero as nothing having been counted yet rather than as a corpus that is empty.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 152
+          },
+          "targets": [
+            {
+              "expr": "sum by (gate, recurrence) (increase(cogneva_evolution_learning_recurrence_at_threshold_total[6h]))",
+              "legendFormat": "{{gate}} {{recurrence}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {

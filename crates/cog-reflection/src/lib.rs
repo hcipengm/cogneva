@@ -63,6 +63,7 @@ pub mod gitops_publisher;
 pub mod gitops_puller;
 pub mod governance_drift;
 pub mod image_rollout;
+pub mod learning_recurrence_readings;
 pub mod mainline_deployer;
 pub mod matcher;
 pub mod meta_learning;
@@ -83,7 +84,6 @@ pub mod runtime_assets;
 pub mod sandbox;
 pub mod signal_readings;
 pub mod signal_watcher;
-pub mod skill_promotion_readings;
 pub mod squad;
 pub mod types;
 pub mod verification_budget;
@@ -284,6 +284,14 @@ pub struct ReflectionEngine {
     hook_recurrence_threshold: u32,
     /// How many recurrences before generating a code change.
     change_recurrence_threshold: u32,
+    /// Where the recurrence is reported at the moment a threshold looks at it.
+    ///
+    /// Read here rather than beside the decision that follows, because this is
+    /// where the column is consumed: the two thresholds above are the readers
+    /// `recurrence_count` has, and a reading taken anywhere else would be a
+    /// second description of the same count rather than the one the thresholds
+    /// act on.
+    recurrence_readings: Arc<crate::learning_recurrence_readings::LearningRecurrenceReadings>,
 }
 
 impl std::fmt::Debug for ReflectionEngine {
@@ -319,38 +327,38 @@ impl ReflectionEngine {
     pub fn new_in_memory(
         skill_registry: Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>,
     ) -> Self {
-        Self::in_memory(skill_registry, None)
+        Self::in_memory(
+            skill_registry,
+            Arc::new(crate::learning_recurrence_readings::LearningRecurrenceReadings::new()),
+        )
     }
 
-    /// Build the in-memory engine, reporting its promotion decisions into
-    /// `readings`.
+    /// Build the in-memory engine, reporting where a learning's recurrence
+    /// stands into `readings`.
     ///
     /// A second constructor rather than a parameter on `new_in_memory`: that one
-    /// is the shape every test builds, and a reading is attached only where a
-    /// deployment publishes one. A deployment that falls back to this engine is
-    /// exactly where the promotion gate has to be readable from outside — its
-    /// corpus lives and dies with the process, so the log of a restart is the
-    /// only other place a closed gate leaves a trace.
+    /// is the shape every test builds, and the handle is only worth reaching
+    /// where someone publishes it. A deployment that falls back to this engine is
+    /// exactly where the reading matters — its corpus lives and dies with the
+    /// process, so the recurrence distribution is the only place the accumulation
+    /// of patterns can be seen at all.
     pub fn new_in_memory_reporting(
         skill_registry: Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>,
-        readings: Arc<crate::skill_promotion_readings::SkillPromotionReadings>,
+        readings: Arc<crate::learning_recurrence_readings::LearningRecurrenceReadings>,
     ) -> Self {
-        Self::in_memory(skill_registry, Some(readings))
+        Self::in_memory(skill_registry, readings)
     }
 
     fn in_memory(
         skill_registry: Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>,
-        readings: Option<Arc<crate::skill_promotion_readings::SkillPromotionReadings>>,
+        recurrence_readings: Arc<crate::learning_recurrence_readings::LearningRecurrenceReadings>,
     ) -> Self {
         let recorder: Arc<dyn LearningRecorder> = Arc::new(InMemoryRecorder::new());
         let detector: Arc<dyn LearningDetector> = Arc::new(DefaultLearningDetector::new());
         let matcher: Arc<dyn LearningMatcher> =
             Arc::new(DefaultLearningMatcher::new(recorder.clone(), None));
-        let mut promoter = DefaultLearningPromoter::new(skill_registry);
-        if let Some(readings) = readings {
-            promoter = promoter.with_readings(readings);
-        }
-        let promoter: Arc<dyn LearningPromoter> = Arc::new(promoter);
+        let promoter: Arc<dyn LearningPromoter> =
+            Arc::new(DefaultLearningPromoter::new(skill_registry));
 
         Self {
             detector,
@@ -372,6 +380,7 @@ impl ReflectionEngine {
             tool_error_threshold: 3,
             hook_recurrence_threshold: 3,
             change_recurrence_threshold: 5,
+            recurrence_readings,
         }
     }
 
@@ -397,12 +406,12 @@ impl ReflectionEngine {
         project_root: Option<std::path::PathBuf>,
         wiki: Option<cog_core::LateService<dyn cog_core::WikiBackend>>,
         change_dir: impl Into<std::path::PathBuf>,
-        // Where the promotion gate reports. Required rather than optional: the
-        // production gate is the one that was silent for three weeks, and a
-        // default here would make "the reading is wired" something a caller can
-        // omit without noticing. The plugin publishes this handle, so it has to
-        // exist before the engine does.
-        promotion_readings: Arc<crate::skill_promotion_readings::SkillPromotionReadings>,
+        // Where the recurrence at each threshold is reported. Required rather
+        // than optional: the count that this reports on was unread for three
+        // weeks, and a default here would make "the reading is wired" something
+        // a caller can omit without noticing. The plugin publishes this handle,
+        // so it has to exist before the engine does.
+        recurrence_readings: Arc<crate::learning_recurrence_readings::LearningRecurrenceReadings>,
     ) -> Self {
         let recorder: Arc<dyn LearningRecorder> = Arc::new(MemoryBackendRecorder::new(
             memory_backend.clone(),
@@ -411,8 +420,7 @@ impl ReflectionEngine {
         let detector: Arc<dyn LearningDetector> = Arc::new(DefaultLearningDetector::new());
         let matcher: Arc<dyn LearningMatcher> =
             Arc::new(DefaultLearningMatcher::new(recorder.clone(), None));
-        let mut promoter =
-            DefaultLearningPromoter::new(skill_registry.clone()).with_readings(promotion_readings);
+        let mut promoter = DefaultLearningPromoter::new(skill_registry.clone());
         if let Some(wiki) = wiki {
             promoter = promoter.with_wiki_late(wiki);
         }
@@ -464,6 +472,7 @@ impl ReflectionEngine {
             tool_error_threshold: 3,
             hook_recurrence_threshold: 3,
             change_recurrence_threshold: 5,
+            recurrence_readings,
         }
     }
 
@@ -514,6 +523,12 @@ impl ReflectionEngine {
             tool_error_threshold: 3,
             hook_recurrence_threshold: 3,
             change_recurrence_threshold: 5,
+            // Nothing publishes this handle: this constructor builds a store,
+            // not the deployment's engine. The count is still recorded, so the
+            // call sites are one shape rather than two.
+            recurrence_readings: Arc::new(
+                crate::learning_recurrence_readings::LearningRecurrenceReadings::new(),
+            ),
         }
     }
 
@@ -558,14 +573,20 @@ impl ReflectionEngine {
             tool_error_threshold: 3,
             hook_recurrence_threshold: 3,
             change_recurrence_threshold: 5,
+            recurrence_readings: Arc::new(
+                crate::learning_recurrence_readings::LearningRecurrenceReadings::new(),
+            ),
         }
     }
 
-    /// Convenience: detect + record + match in one call.
+    /// Convenience: detect + match + record in one call. The bump runs before the
+    /// write on purpose — `record_learning` is the only writer of
+    /// `recurrence_count` and it writes the value it is handed, so the reverse
+    /// order drops the increment.
     pub async fn process_learning(&self, learning: Learning) -> cog_core::SFResult<Learning> {
         let mut learning = learning;
-        self.recorder.record_learning(learning.clone()).await?;
         self.matcher.update_recurrence(&mut learning).await?;
+        self.recorder.record_learning(learning.clone()).await?;
         Ok(learning)
     }
 
@@ -628,6 +649,13 @@ impl ReflectionEngine {
     /// the hand-off to the main flow, if recurrence thresholds are crossed and
     /// cooldown allows.
     async fn maybe_trigger_evolution_from_learning(&self, l: &cog_core::Learning) {
+        use crate::learning_recurrence_readings::Gate;
+        // Report where the count stands, whichever way the threshold answers.
+        // Sampling the crossing instead would make "the counts are climbing and
+        // nothing has matured yet" indistinguishable from "nothing is being
+        // counted at all", which is the reading this exists to separate.
+        self.recurrence_readings
+            .record(Gate::Hook, l.recurrence_count);
         if l.recurrence_count >= self.hook_recurrence_threshold {
             let hook_key = format!(
                 "hook:{}:{:?}",
@@ -665,6 +693,13 @@ impl ReflectionEngine {
         // first one is worth acting on, and holding it until the count matured
         // is how the same defect got generated, refused and generated again.
         let refused_by_a_gate = matches!(l.source, cog_core::LearningSource::ChangeRefusal);
+        // The change half only: this threshold is not consulted for the other
+        // categories, and reporting it for them would put counts in the change
+        // gate's distribution that the change gate never saw.
+        if is_code_related {
+            self.recurrence_readings
+                .record(Gate::Change, l.recurrence_count);
+        }
         if is_code_related
             && (refused_by_a_gate || l.recurrence_count >= self.change_recurrence_threshold)
         {
@@ -1006,8 +1041,8 @@ impl ReflectionEngine {
             cog_core::LearningSource::SelfReview,
         );
         learning.related_tasks.push(task_id.to_string());
-        self.recorder.record_learning(learning.clone()).await?;
         self.matcher.update_recurrence(&mut learning).await?;
+        self.recorder.record_learning(learning.clone()).await?;
 
         if let Some(ref tracker) = self.effectiveness_tracker {
             let outcome = cog_core::SkillOutcome {
@@ -1069,8 +1104,8 @@ impl ReflectionEngine {
             cog_core::LearningSource::SelfReview,
         );
         learning.related_tasks.push(change_id.to_string());
-        self.recorder.record_learning(learning.clone()).await?;
         self.matcher.update_recurrence(&mut learning).await?;
+        self.recorder.record_learning(learning.clone()).await?;
 
         self.note_change_skill_outcome(change_id, success).await?;
 
@@ -1149,8 +1184,8 @@ impl ReflectionEngine {
             .map(str::to_string)
             .collect();
         learning.related_tasks.push(change_id.to_string());
-        self.recorder.record_learning(learning.clone()).await?;
         self.matcher.update_recurrence(&mut learning).await?;
+        self.recorder.record_learning(learning.clone()).await?;
         self.note_change_skill_outcome(change_id, false).await?;
 
         self.maybe_trigger_evolution_from_learning(&learning).await;
@@ -1620,38 +1655,41 @@ mod tests {
     }
 
     /// A deployment with no reachable memory backend runs the in-memory engine,
-    /// and that engine's corpus dies with the process — so the decisions its
-    /// promoter takes have to be readable from outside the process. A readings
+    /// and that engine's corpus dies with the process — so the count the
+    /// thresholds act on has to be readable from outside the process. A readings
     /// handle that is published but never handed to this constructor leaves the
-    /// series at a constant zero, which is indistinguishable from a gate that
-    /// nothing is reaching.
+    /// series at a constant zero, which is indistinguishable from a pipeline
+    /// that detects nothing.
     #[tokio::test]
-    async fn the_engine_a_deployment_falls_back_to_reports_its_promotion_decisions() {
-        use crate::skill_promotion_readings::{PromotionDecision, SkillPromotionReadings};
+    async fn the_engine_a_deployment_falls_back_to_reports_the_recurrence_at_its_thresholds() {
+        use crate::learning_recurrence_readings::{Gate, LearningRecurrenceReadings};
 
         let registry = Arc::new(tokio::sync::RwLock::new(SkillRegistry::new()));
-        let readings = Arc::new(SkillPromotionReadings::new());
+        let readings = Arc::new(LearningRecurrenceReadings::new());
         let engine = ReflectionEngine::new_in_memory_reporting(registry, readings.clone());
 
-        let learning = cog_core::Learning::new(
-            cog_core::LearningCategory::Insight,
-            cog_core::Priority::Medium,
-            cog_core::Area::Backend,
-            "a pattern seen once",
-            "details",
-            "act on it",
-            cog_core::LearningSource::SelfReview,
-        );
-        engine.promoter.promote_if_ready(&learning).await.unwrap();
+        let event = cog_core::AgentEvent::SelfReview {
+            agent_id: "test-agent".into(),
+            status: "NEED_REVISION".into(),
+            score: 0.5,
+            critique: Some("The agent keeps making the same mistake.".into()),
+            suggestions: Some(vec!["Add working-memory reminders".into()]),
+            summary: None,
+            timestamp: chrono::Utc::now(),
+        };
+        engine.process_event(&event).await.unwrap();
 
-        assert_eq!(readings.decisions(PromotionDecision::NotReady), 1);
-        assert_eq!(readings.decisions(PromotionDecision::Promoted), 0);
+        // The hook threshold is consulted on every detected learning; the change
+        // threshold only on the code-defect half, which a self-review is not.
         assert_eq!(
-            readings.decided_on(crate::skill_promotion_readings::recurrence_bucket(
-                learning.recurrence_count
-            )),
+            readings.consulted(Gate::Hook, "1"),
             1,
-            "the recurrence the decision was taken on is reported beside the decision"
+            "the count a detected learning carries has to reach the reading"
+        );
+        assert_eq!(
+            readings.consulted(Gate::Change, "1"),
+            0,
+            "the change threshold was never consulted, so it must not be counted"
         );
     }
 

@@ -11,7 +11,6 @@ use cog_core::{SFResult, SkillConfig, SkillRegistry};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::skill_promotion_readings::{PromotionDecision, SkillPromotionReadings};
 use crate::types::PromotionResult;
 use cog_core::{Learning, LearningCategory};
 
@@ -49,12 +48,6 @@ pub struct DefaultLearningPromoter {
     /// resolves on first use, after every `init` has returned.
     wiki_late: Option<cog_core::LateService<dyn cog_core::WikiBackend>>,
     on_promoted: Option<Arc<OnPromotedFn>>,
-    /// Where the decisions this promoter takes are reported.
-    ///
-    /// Held here rather than on the engine because this is the object that
-    /// takes the decision: a reading recorded one layer away from the branch it
-    /// describes is a second description of the same event, and the two drift.
-    readings: Option<Arc<SkillPromotionReadings>>,
 }
 
 impl std::fmt::Debug for DefaultLearningPromoter {
@@ -65,7 +58,6 @@ impl std::fmt::Debug for DefaultLearningPromoter {
             .field("max_age_days", &self.max_age_days)
             .field("skill_registry", &"<SkillRegistry>")
             .field("wiki_late", &self.wiki_late.is_some())
-            .field("readings", &self.readings.is_some())
             .finish()
     }
 }
@@ -79,26 +71,6 @@ impl DefaultLearningPromoter {
             skill_registry,
             wiki_late: None,
             on_promoted: None,
-            readings: None,
-        }
-    }
-
-    /// Report every promotion decision into `readings`, and the recurrence it
-    /// was taken on.
-    ///
-    /// Without this the gate's outcome exists only as an `info!` line at the
-    /// moment it happens, and "this gate has never opened" is indistinguishable
-    /// from "nothing has reached the gate" to everyone who was not watching the
-    /// log at the time.
-    pub fn with_readings(mut self, readings: Arc<SkillPromotionReadings>) -> Self {
-        self.readings = Some(readings);
-        self
-    }
-
-    /// Report one decision. A promoter built without readings reports nothing.
-    fn report(&self, decision: PromotionDecision, recurrence_count: u32) {
-        if let Some(readings) = &self.readings {
-            readings.record(decision, recurrence_count);
         }
     }
 
@@ -244,7 +216,6 @@ impl LearningPromoter for DefaultLearningPromoter {
                 learning.related_tasks.len(),
                 (learning.last_seen - learning.first_seen).num_days()
             );
-            self.report(PromotionDecision::NotReady, learning.recurrence_count);
             return Ok(PromotionResult::NotReady { reason });
         }
 
@@ -334,7 +305,6 @@ impl LearningPromoter for DefaultLearningPromoter {
             cb(&result);
         }
 
-        self.report(PromotionDecision::Promoted, learning.recurrence_count);
         Ok(result)
     }
 }

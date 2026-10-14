@@ -89,8 +89,8 @@ impl cog_core::SquadReflection for DefaultSquadReflection {
             for learning in &contrib.learnings {
                 let mut l = learning.clone();
                 l.related_tasks.push(format!("squad:{}", squad_id));
-                self.recorder.record_learning(l.clone()).await?;
                 self.matcher.update_recurrence(&mut l).await?;
+                self.recorder.record_learning(l.clone()).await?;
                 all_learnings.push(l);
             }
             for error in &contrib.errors {
@@ -103,8 +103,8 @@ impl cog_core::SquadReflection for DefaultSquadReflection {
         let disagreements = self.detect_disagreements(contributions).await;
         for mut d in disagreements {
             d.related_tasks.push(format!("squad:{}", squad_id));
-            self.recorder.record_learning(d.clone()).await?;
             self.matcher.update_recurrence(&mut d).await?;
+            self.recorder.record_learning(d.clone()).await?;
             all_learnings.push(d);
         }
 
@@ -116,8 +116,8 @@ impl cog_core::SquadReflection for DefaultSquadReflection {
         let upgrade_reason = upgrades.first().map(|u| u.summary.clone());
         for mut u in upgrades {
             u.related_tasks.push(format!("squad:{}", squad_id));
-            self.recorder.record_learning(u.clone()).await?;
             self.matcher.update_recurrence(&mut u).await?;
+            self.recorder.record_learning(u.clone()).await?;
             all_learnings.push(u);
         }
 

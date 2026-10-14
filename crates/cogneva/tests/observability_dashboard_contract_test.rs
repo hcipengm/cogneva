@@ -250,6 +250,18 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["intent", "outcome"],
         "crates/cog-reflection/src/evolution_build_readings.rs",
     ),
+    // The corpus-accumulation reading: every consultation of a recurrence
+    // threshold, bucketed by the count it was consulted on. A distribution
+    // pinned in the `1` bucket is a corpus that is not accumulating -- the same
+    // defect that let the store hold `1` for three weeks with every reading
+    // green. The `gate` axis is what keeps the two thresholds from being
+    // averaged: the hook gate sees every detected learning, the change gate only
+    // the code-defect half, and they act at different counts.
+    (
+        "cogneva_evolution_learning_recurrence_at_threshold_total",
+        &["gate", "recurrence"],
+        "crates/cog-reflection/src/learning_recurrence_readings.rs",
+    ),
     // What the shared build cache holds. The layer label is what makes the
     // reading actionable -- dropping the compiled layers is a cold rebuild and
     // dropping the scratch ones is not -- and the dir label is what keeps two

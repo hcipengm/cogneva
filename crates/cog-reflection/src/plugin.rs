@@ -316,20 +316,22 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             }
         }
 
-        // What the learning-to-skill promotion gate decided, and the recurrence
-        // it decided on. Built here, ahead of the branch, because both engines
-        // below take that decision: the production one on its persistent store,
-        // and the in-memory fallback — which is the engine a deployment without a
-        // reachable memory backend actually runs on, and whose corpus dies with
-        // the process, so a reading published from only one branch would be a
-        // series that is constant zero exactly where the gate matters most.
+        // Where a learning's recurrence stands when the thresholds that act on
+        // it look at it. Built here, ahead of the branch, because both engines
+        // below consult those thresholds: the production one on its persistent
+        // store, and the in-memory fallback — which is the engine a deployment
+        // without a reachable memory backend actually runs on, and whose corpus
+        // dies with the process, so a reading published from only one branch
+        // would be a series that is constant zero exactly where the count is the
+        // only trace left.
         //
         // Published while the plugins initialise: the gateway takes its snapshot
         // of the observables during `init`, so a handle published from `start()`
         // reaches no scrape at all.
-        let promotion_readings =
-            std::sync::Arc::new(crate::skill_promotion_readings::SkillPromotionReadings::new());
-        ctx.publish_observable(promotion_readings.clone());
+        let recurrence_readings = std::sync::Arc::new(
+            crate::learning_recurrence_readings::LearningRecurrenceReadings::new(),
+        );
+        ctx.publish_observable(recurrence_readings.clone());
 
         let engine = if let (Some(ref mb), Some(ref llm)) = (memory_backend, llm_provider) {
             info!("ReflectionEngine initialized in production mode (persistent learning)");
@@ -350,14 +352,14 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 engine_root.clone(),
                 Some(wiki),
                 change_dir.clone(),
-                promotion_readings,
+                recurrence_readings,
             )
         } else {
             warn!("ReflectionEngine falling back to in-memory mode (memory_backend or llm_provider unavailable)");
             info!("ReflectionEngine initialized in in-memory mode");
             let mut engine = crate::ReflectionEngine::new_in_memory_reporting(
                 skill_registry.clone(),
-                promotion_readings,
+                recurrence_readings,
             );
             if let Some(ref evo) = evolution_engine {
                 engine.evolution = Some(evo.clone());
