@@ -18,19 +18,23 @@
 //! automatic.
 
 use chrono::{Duration, Timelike, Utc};
-use redis::AsyncCommands;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::error::{QuotaError, QuotaResult};
+use crate::store::{read_int, store_error};
 use crate::{
     HierarchyDecision, QuotaContext, QuotaLimits, QuotaScope, ScopeStatus, UsageHistoryEntry,
 };
+use cog_core::KeyValueStore;
 
-/// Hierarchy checker built on top of Redis.
+/// Hierarchy checker over a key-value store.
 #[derive(Clone)]
 pub struct HierarchyManager {
-    redis: Arc<Mutex<redis::aio::ConnectionManager>>,
+    /// Held behind a lock so that the read-modify-write sequences below (and the
+    /// per-scope cascades, which touch several keys) stay a single step for
+    /// concurrent calls through this manager.
+    store: Arc<Mutex<Arc<dyn KeyValueStore>>>,
     default_limits: QuotaLimits,
     /// History retention in days (default 30).
     history_days: u32,
@@ -38,10 +42,10 @@ pub struct HierarchyManager {
 
 impl std::fmt::Debug for HierarchyManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The connection manager has no `Debug` of its own: whether one is held
-        // is what a reader needs from this type, its socket internals are not.
+        // Whether a store is held is what a reader needs from this type; the
+        // store's own internals are not.
         f.debug_struct("HierarchyManager")
-            .field("redis", &"redis connection")
+            .field("store", &"key-value store")
             .field("default_limits", &self.default_limits)
             .field("history_days", &self.history_days)
             .finish()
@@ -49,9 +53,9 @@ impl std::fmt::Debug for HierarchyManager {
 }
 
 impl HierarchyManager {
-    pub fn new(redis: redis::aio::ConnectionManager, default_limits: QuotaLimits) -> Self {
+    pub fn new(store: Arc<dyn KeyValueStore>, default_limits: QuotaLimits) -> Self {
         Self {
-            redis: Arc::new(Mutex::new(redis)),
+            store: Arc::new(Mutex::new(store)),
             default_limits,
             history_days: 30,
         }
@@ -85,19 +89,19 @@ impl HierarchyManager {
         target_id: &str,
         limits: QuotaLimits,
     ) -> QuotaResult<()> {
-        let mut conn = self.redis.lock().await;
+        let store = self.store.lock().await;
         let payload = serde_json::to_string(&limits)?;
         let key = Self::key(scope, "limits", target_id);
-        let _: () = conn.set(&key, payload).await?;
+        store.set(&key, &payload).await.map_err(store_error)?;
         Ok(())
     }
 
     /// Read the soft/hard limits for `(scope, target)`. Falls back to the
     /// manager's default if no override is set.
     pub async fn get_limits(&self, scope: QuotaScope, target_id: &str) -> QuotaLimits {
-        let mut conn = self.redis.lock().await;
+        let store = self.store.lock().await;
         let key = Self::key(scope, "limits", target_id);
-        let raw: Option<String> = conn.get(&key).await.ok();
+        let raw = store.get(&key).await.ok().flatten();
         match raw {
             Some(s) => serde_json::from_str(&s).unwrap_or(self.default_limits),
             None => self.default_limits,
@@ -105,9 +109,9 @@ impl HierarchyManager {
     }
 
     async fn used_today(&self, scope: QuotaScope, target_id: &str) -> u64 {
-        let mut conn = self.redis.lock().await;
+        let store = self.store.lock().await;
         let key = Self::key(scope, "used", target_id);
-        let used: Option<i64> = conn.get(&key).await.ok();
+        let used = read_int(&**store, &key).await;
         used.unwrap_or(0).max(0) as u64
     }
 
@@ -170,13 +174,13 @@ impl HierarchyManager {
                 let req_key = Self::key(scope, "requests", target);
                 let history_key = Self::history_key(scope, target, &today);
 
-                let mut conn = self.redis.lock().await;
-                let _: Result<(), _> = conn.incr(&used_key, actual_tokens).await;
-                let _: Result<(), _> = conn.expire(&used_key, ttl as i64).await;
-                let _: Result<(), _> = conn.incr(&req_key, 1u64).await;
-                let _: Result<(), _> = conn.expire(&req_key, ttl as i64).await;
-                let _: Result<(), _> = conn.incr(&history_key, actual_tokens).await;
-                let _: Result<(), _> = conn
+                let store = self.store.lock().await;
+                let _ = store.incr(&used_key, actual_tokens as i64).await;
+                let _ = store.expire(&used_key, ttl as i64).await;
+                let _ = store.incr(&req_key, 1).await;
+                let _ = store.expire(&req_key, ttl as i64).await;
+                let _ = store.incr(&history_key, actual_tokens as i64).await;
+                let _ = store
                     .expire(&history_key, (self.history_days as i64) * 86_400)
                     .await;
             }
@@ -189,9 +193,9 @@ impl HierarchyManager {
     pub async fn refund(&self, ctx: &QuotaContext, tokens: u64) -> QuotaResult<()> {
         for scope in QuotaScope::cascade_order() {
             if let Some(target) = ctx.target(scope) {
-                let mut conn = self.redis.lock().await;
+                let store = self.store.lock().await;
                 let used_key = Self::key(scope, "used", target);
-                let _: Result<(), _> = conn.decr(&used_key, tokens).await;
+                let _ = store.decr(&used_key, tokens as i64).await;
             }
         }
         Ok(())
@@ -232,9 +236,9 @@ impl HierarchyManager {
         for n in 0..days {
             let date = Utc::now().date_naive() - chrono::Duration::days(n as i64);
             let ymd = date.to_string();
-            let mut conn = self.redis.lock().await;
+            let store = self.store.lock().await;
             let key = Self::history_key(scope, target_id, &ymd);
-            let used: Option<i64> = conn.get(&key).await.ok();
+            let used = read_int(&**store, &key).await;
             out.push(UsageHistoryEntry {
                 date: ymd,
                 tokens_used: used.unwrap_or(0).max(0) as u64,

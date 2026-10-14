@@ -1,45 +1,109 @@
 //! Integration tests for the 5-level quota hierarchy.
-//! These tests connect to a Redis instance configured by the
-//! `COGNEVA_TEST_REDIS_URL` env var (default: `redis://127.0.0.1:6379/`). Each
-//! test uses a unique target ID prefix so parallel tests do not collide,
-//! and cleans up the keys it creates.
+//!
+//! The manager speaks the core key-value contract, so these tests run against
+//! an in-memory implementation and need no Redis: the same suite runs on a
+//! developer machine, in CI and in the evolution sandbox instead of skipping
+//! wherever no server happens to be up. Each test builds its own store, so
+//! there is nothing to clean up between them.
 
-use cog_core::{QuotaContext, QuotaLimits, QuotaScope};
+use cog_core::{KeyValueStore, QuotaContext, QuotaLimits, QuotaScope};
 use cog_quota::HierarchyManager;
+use std::sync::{Arc, Mutex};
 
-use redis::AsyncCommands;
-
-fn redis_url() -> String {
-    std::env::var("COGNEVA_TEST_REDIS_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string())
+/// An in-memory [`KeyValueStore`] for the hierarchy suite.
+///
+/// Values are stored without expiry and the set and hash operations are not
+/// implemented: the hierarchy manager keeps counters and JSON limit documents,
+/// so those are the shapes this provides. Expiry is the driver's behaviour and
+/// its tests belong with the driver.
+#[derive(Default)]
+struct FakeStore {
+    strings: Mutex<std::collections::HashMap<String, String>>,
 }
 
-async fn fresh_manager(prefix: &str) -> Option<(HierarchyManager, redis::Client)> {
-    let client = match redis::Client::open(redis_url()) {
-        Ok(c) => c,
-        Err(_) => return None,
-    };
-    let conn = match cog_redis::connect(&client).await {
-        Ok(c) => c,
-        Err(_) => return None,
-    };
-    let mgr = HierarchyManager::new(conn, QuotaLimits::new(80, 100));
-    cleanup(&client, prefix).await;
-    Some((mgr, client))
-}
-
-async fn cleanup(client: &redis::Client, prefix: &str) {
-    let mut conn = match client.get_multiplexed_async_connection().await {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let keys: Vec<String> = conn
-        .keys(format!("quota:*:*:{}*", prefix))
-        .await
-        .unwrap_or_default();
-    for k in keys {
-        let _: Result<(), _> = conn.del(k).await;
+#[async_trait::async_trait]
+impl KeyValueStore for FakeStore {
+    async fn get(&self, key: &str) -> cog_core::SFResult<Option<String>> {
+        Ok(self.strings.lock().unwrap().get(key).cloned())
     }
+
+    async fn set(&self, key: &str, value: &str) -> cog_core::SFResult<()> {
+        self.strings
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), value.to_string());
+        Ok(())
+    }
+
+    async fn set_ex(&self, key: &str, value: &str, _ttl_secs: u64) -> cog_core::SFResult<()> {
+        self.set(key, value).await
+    }
+
+    async fn del(&self, key: &str) -> cog_core::SFResult<()> {
+        self.strings.lock().unwrap().remove(key);
+        Ok(())
+    }
+
+    async fn expire(&self, _key: &str, _ttl_secs: i64) -> cog_core::SFResult<()> {
+        Ok(())
+    }
+
+    async fn ttl(&self, _key: &str) -> cog_core::SFResult<i64> {
+        Ok(-1)
+    }
+
+    async fn incr(&self, key: &str, by: i64) -> cog_core::SFResult<i64> {
+        let mut strings = self.strings.lock().unwrap();
+        let next = strings
+            .get(key)
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0)
+            + by;
+        strings.insert(key.to_string(), next.to_string());
+        Ok(next)
+    }
+
+    async fn decr(&self, key: &str, by: i64) -> cog_core::SFResult<i64> {
+        self.incr(key, -by).await
+    }
+
+    async fn sadd(&self, _key: &str, _member: &str) -> cog_core::SFResult<()> {
+        unreachable!("the hierarchy manager does not use sets")
+    }
+
+    async fn srem(&self, _key: &str, _member: &str) -> cog_core::SFResult<()> {
+        unreachable!("the hierarchy manager does not use sets")
+    }
+
+    async fn smembers(&self, _key: &str) -> cog_core::SFResult<Vec<String>> {
+        unreachable!("the hierarchy manager does not use sets")
+    }
+
+    async fn hset(&self, _key: &str, _field: &str, _value: &str) -> cog_core::SFResult<()> {
+        unreachable!("the hierarchy manager does not use hash fields")
+    }
+
+    async fn hget(&self, _key: &str, _field: &str) -> cog_core::SFResult<Option<String>> {
+        unreachable!("the hierarchy manager does not use hash fields")
+    }
+
+    async fn hdel(&self, _key: &str, _field: &str) -> cog_core::SFResult<()> {
+        unreachable!("the hierarchy manager does not use hash fields")
+    }
+
+    async fn hvals(&self, _key: &str) -> cog_core::SFResult<Vec<String>> {
+        unreachable!("the hierarchy manager does not use hash fields")
+    }
+
+    async fn hlen(&self, _key: &str) -> cog_core::SFResult<u64> {
+        unreachable!("the hierarchy manager does not use hash fields")
+    }
+}
+
+/// A hierarchy manager over a fresh in-memory store. Default limits are
+/// soft 80 / hard 100, which the cases below are written against.
+fn fresh_manager() -> HierarchyManager {
+    HierarchyManager::new(Arc::new(FakeStore::default()), QuotaLimits::new(80, 100))
 }
 
 #[tokio::test]
@@ -85,10 +149,7 @@ async fn test_quota_context_target_lookup() {
 #[tokio::test]
 async fn test_check_allows_when_below_soft_limit() {
     let prefix = "ti1";
-    let Some((mgr, client)) = fresh_manager(prefix).await else {
-        eprintln!("skipping: redis not available");
-        return;
-    };
+    let mgr = fresh_manager();
     let ctx = QuotaContext {
         user_id: Some(format!("{}:user", prefix)),
         workspace_id: Some(format!("{}:ws", prefix)),
@@ -99,16 +160,12 @@ async fn test_check_allows_when_below_soft_limit() {
     assert!(decision.warnings.is_empty());
     assert!(decision.blocked_by.is_empty());
     assert_eq!(decision.scopes.len(), 2);
-    cleanup(&client, prefix).await;
 }
 
 #[tokio::test]
 async fn test_check_warns_at_soft_limit() {
     let prefix = "ti2";
-    let Some((mgr, client)) = fresh_manager(prefix).await else {
-        eprintln!("skipping: redis not available");
-        return;
-    };
+    let mgr = fresh_manager();
     let user = format!("{}:user", prefix);
     let ctx = QuotaContext {
         user_id: Some(user.clone()),
@@ -121,16 +178,12 @@ async fn test_check_warns_at_soft_limit() {
     assert!(decision.allowed);
     assert_eq!(decision.warnings.len(), 1);
     assert!(decision.blocked_by.is_empty());
-    cleanup(&client, prefix).await;
 }
 
 #[tokio::test]
 async fn test_check_blocks_at_hard_limit() {
     let prefix = "ti3";
-    let Some((mgr, client)) = fresh_manager(prefix).await else {
-        eprintln!("skipping: redis not available");
-        return;
-    };
+    let mgr = fresh_manager();
     let user = format!("{}:user", prefix);
     let ctx = QuotaContext {
         user_id: Some(user.clone()),
@@ -141,16 +194,12 @@ async fn test_check_blocks_at_hard_limit() {
     assert!(!decision.allowed);
     assert_eq!(decision.blocked_by.len(), 1);
     assert_eq!(decision.blocked_by[0].scope, QuotaScope::User);
-    cleanup(&client, prefix).await;
 }
 
 #[tokio::test]
 async fn test_set_limits_overrides_default() {
     let prefix = "ti4";
-    let Some((mgr, client)) = fresh_manager(prefix).await else {
-        eprintln!("skipping: redis not available");
-        return;
-    };
+    let mgr = fresh_manager();
     let team = format!("{}:team", prefix);
     mgr.set_limits(QuotaScope::Team, &team, QuotaLimits::new(40, 50))
         .await
@@ -158,16 +207,12 @@ async fn test_set_limits_overrides_default() {
     let limits = mgr.get_limits(QuotaScope::Team, &team).await;
     assert_eq!(limits.soft_limit, 40);
     assert_eq!(limits.hard_limit, 50);
-    cleanup(&client, prefix).await;
 }
 
 #[tokio::test]
 async fn test_full_hierarchy_blocks_at_team() {
     let prefix = "ti5";
-    let Some((mgr, client)) = fresh_manager(prefix).await else {
-        eprintln!("skipping: redis not available");
-        return;
-    };
+    let mgr = fresh_manager();
     let team = format!("{}:team", prefix);
     // Force the team to a tiny limit so it dominates.
     mgr.set_limits(QuotaScope::Team, &team, QuotaLimits::new(5, 10))
@@ -183,16 +228,12 @@ async fn test_full_hierarchy_blocks_at_team() {
     let d = mgr.check(&ctx, 12).await;
     assert!(!d.allowed);
     assert!(d.blocked_by.iter().any(|s| s.scope == QuotaScope::Team));
-    cleanup(&client, prefix).await;
 }
 
 #[tokio::test]
 async fn test_consume_increments_history() {
     let prefix = "ti6";
-    let Some((mgr, client)) = fresh_manager(prefix).await else {
-        eprintln!("skipping: redis not available");
-        return;
-    };
+    let mgr = fresh_manager();
     let user = format!("{}:user", prefix);
     let ctx = QuotaContext {
         user_id: Some(user.clone()),
@@ -206,16 +247,12 @@ async fn test_consume_increments_history() {
         .expect("history ok");
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].tokens_used, 35);
-    cleanup(&client, prefix).await;
 }
 
 #[tokio::test]
 async fn test_refund_undoes_consumption() {
     let prefix = "ti7";
-    let Some((mgr, client)) = fresh_manager(prefix).await else {
-        eprintln!("skipping: redis not available");
-        return;
-    };
+    let mgr = fresh_manager();
     let user = format!("{}:user", prefix);
     let ctx = QuotaContext {
         user_id: Some(user.clone()),
@@ -231,32 +268,24 @@ async fn test_refund_undoes_consumption() {
         .find(|s| s.scope == QuotaScope::User)
         .expect("user scope present");
     assert_eq!(user_status.used_today, 10);
-    cleanup(&client, prefix).await;
 }
 
 #[tokio::test]
 async fn test_pre_deduct_returns_decision_when_allowed() {
     let prefix = "ti8";
-    let Some((mgr, client)) = fresh_manager(prefix).await else {
-        eprintln!("skipping: redis not available");
-        return;
-    };
+    let mgr = fresh_manager();
     let ctx = QuotaContext {
         user_id: Some(format!("{}:user", prefix)),
         ..Default::default()
     };
     let d = mgr.pre_deduct(&ctx, 10).await.expect("ok");
     assert!(d.allowed);
-    cleanup(&client, prefix).await;
 }
 
 #[tokio::test]
 async fn test_pre_deduct_returns_err_when_blocked() {
     let prefix = "ti9";
-    let Some((mgr, client)) = fresh_manager(prefix).await else {
-        eprintln!("skipping: redis not available");
-        return;
-    };
+    let mgr = fresh_manager();
     let user = format!("{}:user", prefix);
     let ctx = QuotaContext {
         user_id: Some(user.clone()),
@@ -268,5 +297,4 @@ async fn test_pre_deduct_returns_err_when_blocked() {
         res.is_err(),
         "should error when projected exceeds hard limit"
     );
-    cleanup(&client, prefix).await;
 }

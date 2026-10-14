@@ -32,17 +32,9 @@ impl cog_core::SystemPlugin for QuotaPlugin {
             return Ok(());
         }
 
-        let redis_client = ctx.require::<cog_storage::RedisClient>()?.0.clone();
+        let store = ctx.require_service::<dyn cog_core::KeyValueStore>()?;
 
-        let quota_manager = {
-            let conn = cog_redis::connect(&redis_client).await.map_err(|e| {
-                cog_core::SFError::Config(format!(
-                    "Redis connection for quota manager failed: {}",
-                    e
-                ))
-            })?;
-            Arc::new(crate::QuotaManager::new(conn, 50_000))
-        };
+        let quota_manager = Arc::new(crate::QuotaManager::new(store.clone(), 50_000));
         ctx.publish(quota_manager.clone());
         let quota_dyn: Arc<dyn cog_core::QuotaManager> = quota_manager.clone();
         ctx.publish_service(quota_dyn);
@@ -50,26 +42,19 @@ impl cog_core::SystemPlugin for QuotaPlugin {
         ctx.publish_service(workspace_quota_dyn);
         info!("QuotaPlugin quota manager published");
 
-        let hierarchy_manager = {
-            let conn = cog_redis::connect(&redis_client).await.ok();
-            conn.map(|c| {
-                let limits = crate::QuotaLimits::from_hard(50_000, 0.8);
-                Arc::new(crate::HierarchyManager::new(c, limits))
-            })
-        };
-        if let Some(ref hm) = hierarchy_manager {
-            ctx.publish(hm.clone());
-            // The reader takes `dyn cog_core::HierarchyManager` through the
-            // service table, which is a different pin than the concrete value
-            // published above -- the two are stored under different keys and
-            // never meet, so the gateway's pre-create 5-level quota check was
-            // silently skipped. Published both ways, exactly as the quota
-            // manager is just above: the value-typed pin for a concrete
-            // reader, the service pin for the trait-object one.
-            let hm_service: Arc<dyn cog_core::HierarchyManager> = hm.clone();
-            ctx.publish_service(hm_service);
-            info!("QuotaPlugin hierarchy manager published");
-        }
+        let limits = crate::QuotaLimits::from_hard(50_000, 0.8);
+        let hierarchy_manager = Arc::new(crate::HierarchyManager::new(store, limits));
+        ctx.publish(hierarchy_manager.clone());
+        // The reader takes `dyn cog_core::HierarchyManager` through the
+        // service table, which is a different pin than the concrete value
+        // published above -- the two are stored under different keys and
+        // never meet, so the gateway's pre-create 5-level quota check was
+        // silently skipped. Published both ways, exactly as the quota
+        // manager is just above: the value-typed pin for a concrete
+        // reader, the service pin for the trait-object one.
+        let hm_service: Arc<dyn cog_core::HierarchyManager> = hierarchy_manager;
+        ctx.publish_service(hm_service);
+        info!("QuotaPlugin hierarchy manager published");
 
         self.initialized = true;
         Ok(())

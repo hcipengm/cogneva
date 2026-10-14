@@ -33,9 +33,3 @@ impl From<sqlx::Error> for QuotaError {
         QuotaError::DatabaseError(e.to_string())
     }
 }
-
-impl From<redis::RedisError> for QuotaError {
-    fn from(e: redis::RedisError) -> Self {
-        QuotaError::RedisError(e.to_string())
-    }
-}

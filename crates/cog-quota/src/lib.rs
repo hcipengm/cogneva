@@ -20,6 +20,7 @@ pub mod metrics;
 pub mod middleware;
 pub mod model;
 pub mod quota;
+mod store;
 
 pub use agent_budget::{AgentBudget, BudgetAction, BudgetResult, BudgetTemplates};
 pub use billing::{BillingRecord, BillingRepository, RechargeRecord};

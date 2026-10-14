@@ -115,7 +115,10 @@ async fn spawn_app_full(
     let jwt_manager: Arc<dyn cog_core::AuthProvider> =
         Arc::new(JwtManager::new(JwtConfig::default()));
     // Generous default so a single request doesn't exhaust quota during E2E.
-    let quota_manager = Arc::new(QuotaManager::new(redis_conn, 1_000_000_000));
+    let quota_manager = Arc::new(QuotaManager::new(
+        Arc::new(cog_storage::RedisKeyValueStore::new(redis_conn)),
+        1_000_000_000,
+    ));
 
     let raw_logger = Arc::new(MemoryRawLogger::new());
     let raw_logger_clone: Arc<dyn RawLogger> = raw_logger.clone();
