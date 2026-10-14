@@ -56,7 +56,9 @@ const INIT_CONSUMES: &[(&str, &str)] = &[
     // and the client is taken from `net` when the plugin resolves it at init.
     ("github", "net"),
     // StreamingHttpClient + HttpRequestTimeout — the MCP transport is built at
-    // init and takes both its client and its deadline from `net` there.
+    // init and takes both its client and its deadline from `net` there; the A2A
+    // client is built in the same `init` and takes the plain HttpClient service,
+    // so all three reads have to be ordered behind `net`.
     ("protocol", "net"),
 ];
 

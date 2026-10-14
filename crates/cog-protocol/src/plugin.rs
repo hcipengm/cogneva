@@ -98,7 +98,15 @@ impl cog_core::SystemPlugin for ProtocolPlugin {
 
         // ── A2A client ──
         if self.a2a_client.is_none() {
-            let a2a = Arc::new(crate::A2aClient::new());
+            // Built around the process's HTTP client, not around an empty slot.
+            // An `A2aClient` with nothing wired answers every call with an
+            // error, and it looks exactly like a working one to whoever
+            // fetched it -- so publishing it would advertise a capability and
+            // then fail on first use, which is worse than not publishing at
+            // all. Taking the client from `net` here makes its absence a
+            // startup finding, on the same terms as the MCP transport above.
+            let http = ctx.require_service::<dyn cog_core::HttpClient>()?;
+            let a2a = Arc::new(crate::A2aClient::new().with_client(http));
             self.a2a_client = Some(a2a.clone());
             ctx.publish(a2a);
             info!("ProtocolPlugin A2A client initialized");
