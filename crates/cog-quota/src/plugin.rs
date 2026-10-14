@@ -36,6 +36,12 @@ impl cog_core::SystemPlugin for QuotaPlugin {
 
         let quota_manager = Arc::new(crate::QuotaManager::new(store.clone(), 50_000));
         ctx.publish(quota_manager.clone());
+        // The manager's decisions, published while initialising: the metrics
+        // endpoint takes its snapshot of the observables during init, so a
+        // handle published later is held by nobody who renders it.
+        ctx.publish_observable(Arc::new(crate::QuotaObservable::new(
+            quota_manager.readings(),
+        )));
         let quota_dyn: Arc<dyn cog_core::QuotaManager> = quota_manager.clone();
         ctx.publish_service(quota_dyn);
         let workspace_quota_dyn: Arc<dyn cog_core::WorkspaceQuotaSource> = quota_manager;

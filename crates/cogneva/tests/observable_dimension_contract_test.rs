@@ -56,6 +56,11 @@ const PRODUCERS: &[(&str, &[(&str, bool)])] = &[
     ("crates/cog-guardrail/src/observable.rs", &[("D6", true)]),
     ("crates/cog-llm/src/observable.rs", &[("D9", true)]),
     ("crates/cog-memory/src/observable.rs", &[("D4", true)]),
+    // Declares no dimension either: the quota's counters are process-wide, the
+    // same number whichever dimension is asked for. Its published set is pinned
+    // by `crates/cog-quota/tests/quota_reading_test.rs`, and the family's only
+    // reader is the `quota_refusals_happening` rule.
+    ("crates/cog-quota/src/observable.rs", &[]),
     (
         "crates/cog-observability/src/observable.rs",
         &[("D5", true)],

@@ -227,6 +227,7 @@ plugins:
   - { type: cog_core::QuotaManager }
   - { type: cog_core::HierarchyManager }
   - { type: cog_core::WorkspaceQuotaSource }
+  - { type: cog_core::Observable }
   consumes:
   - { type: cog_core::RedisClient, required: true }
 

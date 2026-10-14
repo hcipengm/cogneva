@@ -7,7 +7,12 @@
 //!   [`hierarchy::HierarchyManager`].
 //! - Per-day usage history with TTL-based daily resets at UTC midnight.
 //! - Two-phase quota consumption (`pre_deduct` → `consume` / `refund`).
-//! - Prometheus metrics via [`metrics::QuotaMetrics`].
+//! - Prometheus families via [`metrics::QuotaMetrics`]: per-account, and so
+//!   per-account keys are unbounded — which is why no periodic scrape carries
+//!   them and nothing serves them today.
+//! - The decisions themselves, at the process metrics face:
+//!   [`observable::QuotaObservable`] publishes how many checks ran and how many
+//!   were refused, and the `quota_refusals_happening` rule reads the refusals.
 //!
 //! In-flight enforcement has one implementation and it is not here: the axum
 //! middleware lives in `cog_gateway::quota_middleware`, and it reaches this
@@ -24,6 +29,7 @@ pub mod error;
 pub mod hierarchy;
 pub mod metrics;
 pub mod model;
+pub mod observable;
 pub mod quota;
 mod store;
 
@@ -34,6 +40,7 @@ pub use error::{QuotaError, QuotaResult};
 pub use hierarchy::HierarchyManager;
 pub use metrics::QuotaMetrics;
 pub use model::{ModelConfig, ModelRegistry, TaskType};
+pub use observable::{QuotaObservable, QuotaReadings};
 pub use quota::{DailyUsage, QuotaChecker, QuotaManager};
 
 // Re-export core DTOs so consumers see them under cog_quota::* as before.

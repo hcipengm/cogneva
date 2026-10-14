@@ -24,6 +24,13 @@ pub struct QuotaManager {
     /// the same total and each write back its own deduction.
     store: Arc<Mutex<Arc<dyn KeyValueStore>>>,
     default_quota: u64,
+    /// This process's own decisions, counted where they are made.
+    ///
+    /// Held here rather than read back out of the store at scrape time because
+    /// the store is shared with every other replica: counting the fleet's
+    /// traffic under one pod's name would make the reading depend on how many
+    /// replicas happened to be up.
+    readings: Arc<crate::observable::QuotaReadings>,
 }
 
 impl std::fmt::Debug for QuotaManager {
@@ -42,7 +49,16 @@ impl QuotaManager {
         Self {
             store: Arc::new(Mutex::new(store)),
             default_quota,
+            readings: Arc::new(crate::observable::QuotaReadings::default()),
         }
+    }
+
+    /// This manager's decision counters, for the process's metrics face.
+    ///
+    /// A clone of the handle, so the reader keeps counting into the same
+    /// counters the reader was built over.
+    pub fn readings(&self) -> Arc<crate::observable::QuotaReadings> {
+        self.readings.clone()
     }
 
     /// Build the Redis key for a user's remaining quota.
@@ -127,6 +143,15 @@ impl QuotaManager {
         // remaining == 0 means the quota is exhausted: reject even zero-cost
         // requests so callers get a clear 429 instead of silent pass-through.
         let allowed = remaining > 0 && remaining >= estimated_tokens;
+
+        // Counted at the decision, which is the only place that knows it: the
+        // middleware turns the refusal into a bodyless 429, so this counter is
+        // the whole of what an operator can learn about it.
+        if allowed {
+            self.readings.record_allowed();
+        } else {
+            self.readings.record_refused();
+        }
 
         if allowed {
             // Deduct: read current (or default), compute new value, and set it.
