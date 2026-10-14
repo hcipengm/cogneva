@@ -35,9 +35,9 @@ const INIT_CONSUMES: &[(&str, &str)] = &[
     // ActiveAlertSource
     ("gateway", "observability"),
     // 本进程的出站客户端在 init 里就装配好（贡献通道那些调 github/gitee 的
-    // 请求读的是它）。晚于 net 发布就会读到一个还没交进来的模块：那时每一次
-    // 出站都报「尚未装配」，而启动日志上这与「装好了」没有区别——差别要等
-    // 有人真的去用贡献通道才出现。
+    // 请求读的是它）。晚于 net 发布就是启动失败：装配点用 `require_service` 取，
+    // 未发布时返回 Err 并被 `?` 抛出去，进程压根起不来——不是拖到某次出站才
+    // 暴露。它记的又是 required 一族，正落在启动普查表会点名的那一半。
     // HttpClient
     ("gateway", "net"),
     // The agent pool binds each role's skill — its iteration budget above all —

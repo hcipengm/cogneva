@@ -2282,6 +2282,26 @@ async fn gitee_refresh_tick(refresh_threshold_secs: u64) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    // The OAuth token endpoints carry their parameters in the URL, and the
+    // values are secrets. A `+` or `/` left unescaped turns "authenticate" into
+    // "the parameter was truncated", which reads as a rejected credential and
+    // sends the reader to check the wrong thing; an unescaped `&` splits one
+    // parameter into two. Both sides get escaped, so the only `&` in the output
+    // is the separator.
+    #[test]
+    fn encode_query_escapes_both_sides_and_keeps_the_separators() {
+        let encoded = encode_query(&[
+            ("client_secret", "a+b/c=d%e&f g"),
+            ("refresh_token", "x?y#z"),
+        ]);
+        assert_eq!(
+            encoded,
+            "client_secret=a%2Bb%2Fc%3Dd%25e%26f%20g&refresh_token=x%3Fy%23z"
+        );
+        assert_eq!(encoded.split('&').count(), 2);
+        assert!(!encoded.contains(' '), "a space must not be sent literally");
+    }
+
     #[test]
     fn public_key_line_has_ed25519_prefix_and_base64_blob() {
         let pubkey = [9u8; 32];
