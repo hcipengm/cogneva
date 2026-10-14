@@ -1901,7 +1901,6 @@ dependencies = [
  "chrono",
  "clap",
  "cog-core",
- "cog-protocol",
  "cog-redis",
  "etcd-client",
  "futures",

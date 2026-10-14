@@ -146,6 +146,15 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Validate that filtering did not break required dependencies
     plugin_runner.validate_after_filter()?;
 
+    // The raw-record wire format lives in the protocol crate; the assembly is
+    // what links the two crates together. Publishing it here is what lets the
+    // storage plugin stay on the core contract alone — it reads the codec from
+    // the context instead of naming the crate that carries it. Published before
+    // `init_all` because the storage plugin builds its raw logger in `init`.
+    ctx.publish_service::<dyn cog_core::RawRecordCodec>(Arc::new(
+        cog_protocol::convert::ProtoCodec,
+    ));
+
     plugin_runner.init_all(&ctx).await?;
 
     // Register shutdown hook now that RawLogger is available

@@ -576,7 +576,52 @@ async fn read_one_file(path: &Path, codec: &dyn RawRecordCodec) -> SFResult<Vec<
 mod file_logger_tests {
     use super::*;
     use cog_core::RawLogger as _;
-    use cog_protocol::convert::ProtoCodec;
+
+    /// The wire format is `cog-protocol`'s; reaching for its concrete codec from
+    /// this crate's tests is the dev edge this crate is meant not to carry.
+    /// These tests exercise rotation, the flush timer, and warm-tier
+    /// compression — none of which depend on the protobuf schema — so a codec
+    /// that only has to round-trip with itself is the right stand-in. Production
+    /// gets the real codec: the assembly publishes it and the plugin consumes it.
+    #[derive(Debug)]
+    struct TestCodec;
+
+    impl RawRecordCodec for TestCodec {
+        fn append_delimited(&self, buf: &mut Vec<u8>, record: &RawRecord) -> SFResult<()> {
+            let body = serde_json::to_vec(record)
+                .map_err(|e| SFError::Agent(format!("test codec encode failed: {e}")))?;
+            buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&body);
+            Ok(())
+        }
+
+        fn decode_all_delimited(&self, bytes: &[u8]) -> SFResult<Vec<RawRecord>> {
+            let mut out = Vec::new();
+            let mut rest = bytes;
+            while rest.len() >= 4 {
+                let len = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
+                rest = &rest[4..];
+                if rest.len() < len {
+                    return Err(SFError::Agent("test codec: truncated frame".into()));
+                }
+                let (frame, tail) = rest.split_at(len);
+                out.push(
+                    serde_json::from_slice(frame)
+                        .map_err(|e| SFError::Agent(format!("test codec decode failed: {e}")))?,
+                );
+                rest = tail;
+            }
+            Ok(out)
+        }
+
+        fn decode_record(&self, bytes: &[u8]) -> SFResult<RawRecord> {
+            let mut records = self.decode_all_delimited(bytes)?;
+            if records.is_empty() {
+                return Err(SFError::Agent("test codec: empty frame".into()));
+            }
+            Ok(records.remove(0))
+        }
+    }
 
     fn record(stream: &str, sequence: u64) -> RawRecord {
         RawRecord {
@@ -611,7 +656,7 @@ mod file_logger_tests {
     }
 
     async fn records_on_disk(base_dir: &str, stream: &str) -> Vec<RawRecord> {
-        read_stream_files(base_dir, stream, &ProtoCodec)
+        read_stream_files(base_dir, stream, &TestCodec)
             .await
             .unwrap()
     }
@@ -623,7 +668,7 @@ mod file_logger_tests {
     async fn timer_writes_a_buffered_record_with_no_explicit_flush() {
         let dir = tempfile::tempdir().unwrap();
         let base_dir = dir.path().to_str().unwrap().to_string();
-        let logger = FileRawLogger::new(config(&base_dir, 1), Arc::new(ProtoCodec))
+        let logger = FileRawLogger::new(config(&base_dir, 1), Arc::new(TestCodec))
             .await
             .unwrap();
 
@@ -652,7 +697,7 @@ mod file_logger_tests {
     async fn a_zero_interval_leaves_only_the_count_trigger() {
         let dir = tempfile::tempdir().unwrap();
         let base_dir = dir.path().to_str().unwrap().to_string();
-        let logger = FileRawLogger::new(config(&base_dir, 0), Arc::new(ProtoCodec))
+        let logger = FileRawLogger::new(config(&base_dir, 0), Arc::new(TestCodec))
             .await
             .unwrap();
 
@@ -695,7 +740,7 @@ mod file_logger_tests {
         tokio::fs::create_dir_all(&stream_dir).await.unwrap();
 
         let mut framed = Vec::new();
-        ProtoCodec
+        TestCodec
             .append_delimited(&mut framed, &record("system_raw", 9))
             .unwrap();
         let compressed = zstd_compress(&framed, 3).unwrap();

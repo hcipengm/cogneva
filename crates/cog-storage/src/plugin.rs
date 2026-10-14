@@ -732,12 +732,18 @@ impl cog_core::SystemPlugin for StoragePlugin {
                 logger_config.max_buffer_size,
                 logger_config.flush_interval_secs
             );
-            match crate::FileRawLogger::new(
-                logger_config,
-                Arc::new(cog_protocol::convert::ProtoCodec),
-            )
-            .await
-            {
+            // The wire format is the protocol crate's business: the assembly
+            // publishes the codec and this plugin consumes it, so no concrete
+            // codec is named here. A codec that was never published is the same
+            // failure as one that could not be built — the logger still cannot
+            // be created, and the branch below says so out loud.
+            let built = match ctx.consume_service::<dyn cog_core::RawRecordCodec>() {
+                Some(codec) => crate::FileRawLogger::new(logger_config, codec).await,
+                None => Err(cog_core::SFError::Config(
+                    "raw logging is enabled but the assembly published no RawRecordCodec".into(),
+                )),
+            };
+            match built {
                 Ok(logger) => {
                     info!("FileRawLogger enabled");
                     Arc::new(logger)
