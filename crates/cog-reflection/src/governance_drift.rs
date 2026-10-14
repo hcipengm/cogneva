@@ -42,6 +42,50 @@ use cog_core::{SFError, SFResult};
 /// How many fields of one governance object disagree (gauge).
 pub const GOVERNANCE_DRIFT_METRIC: &str = "cogneva_governance_drift_fields";
 
+/// How many lines of one delivered observability manifest disagree (gauge).
+///
+/// The second object class on the same spine. A resource ceiling belongs to the
+/// operator and is applied at install time; the observability stack's manifests
+/// belong to the installer and are delivered only by the install script. Both
+/// therefore sit in the repository at the revision being tracked while the
+/// cluster holds whatever the last install left there, and in both cases a
+/// change that has landed and a change that has taken effect look the same from
+/// every reading that already exists.
+///
+/// The two are two series rather than two label values on one because neither
+/// the objects nor the counts are the same kind. The ceilings come back from the
+/// cluster as a flat map, so the governance side counts named fields and keys
+/// them `resourcequota/cogneva-quota`. This side has a `kubectl diff` of a whole
+/// manifest file and no per-object attribution that could be trusted -- the only
+/// thing that would give one is the temp paths `kubectl diff` prints its headers
+/// with, which are an internal convention and would silently degrade to
+/// per-file on the day they move. So the count here is the differing lines of
+/// that file's own diff and the key is the file. Two units, two label names, and
+/// a query has to say which it is reading.
+pub const OBSERVABILITY_DRIFT_METRIC: &str = "cogneva_observability_drift_lines";
+
+/// The object classes this reading carries.
+///
+/// A closed set. A class picks the gauge its counts are published under, the
+/// label its keys ride in -- the two key spaces hold different things, so one
+/// label name for both would invite a reader to compare a ceiling with a
+/// filename -- and, together with [`CheckFailure`], the reason label of a
+/// comparison that could not be made: the two classes read different documents
+/// through different commands, so where they fail is a different place to go and
+/// look.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DriftClass {
+    /// The resource ceilings the operator owns.
+    Governance,
+    /// The observability stack's own manifests, keyed by file.
+    Observability,
+}
+
+impl DriftClass {
+    /// Every class, in the order the label values are listed.
+    pub const ALL: [DriftClass; 2] = [DriftClass::Governance, DriftClass::Observability];
+}
+
 /// How many comparisons could not be made at all (counter), by reason.
 ///
 /// Deliberately a series of its own rather than folded into the drift: when the
@@ -49,9 +93,10 @@ pub const GOVERNANCE_DRIFT_METRIC: &str = "cogneva_governance_drift_fields";
 /// facts, and one cell for both leaves no way to tell "the two sides agree"
 /// from "nobody looked".
 ///
-/// The count carries its reason for the same kind of reason. The comparison
-/// has three ways to fail and they point at three different things to go and
-/// look at, so a bare total hands a reader a number with no direction. The
+/// The count carries its reason for the same kind of reason. Each comparison
+/// has three ways to fail, and across the two classes they point at six
+/// different things to go and look at, so a bare total hands a reader a number
+/// with no direction. The
 /// `warn!` beside each failure used to carry that difference, and the process
 /// that wrote it is gone exactly when the count is still being read -- the
 /// count outlives the log by design, so the reason has to travel in the count.
@@ -59,19 +104,30 @@ pub const GOVERNANCE_CHECK_FAILURES_METRIC: &str = "cogneva_governance_check_fai
 
 /// The ways a comparison can fail to happen.
 ///
-/// A closed set: the label value is one of these three words and nothing else,
-/// so a query can be written against the reason without a reader having to
-/// guess at the spelling.
+/// A closed set: the label value is one of these words and nothing else, so a
+/// query can be written against the reason without a reader having to guess at
+/// the spelling. The axis is the class crossed with the side that could not be
+/// read, and both halves are in the label because both are a different place to
+/// go and look: a ceiling the repository stopped declaring and a manifest
+/// directory that could not be listed fail the same way and are fixed in
+/// different files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckFailure {
     /// The declared ceilings could not be read from the tracked revision: the
     /// repository, the directory in it, or the declaration's own text.
-    DeclarationUnreadable,
+    GovernanceDeclarationUnreadable,
     /// The enforced ceilings could not be read: `kubectl` did not run, or ran
     /// and could not reach the cluster.
-    QuotasUnreadable,
+    GovernanceLiveUnreadable,
     /// The cluster answered, and the answer is not text this side will parse.
-    QuotasUnparseable,
+    GovernanceLiveUnparseable,
+    /// The observability stack's declared manifests could not be read from the
+    /// tracked revision.
+    ObservabilityDeclarationUnreadable,
+    /// The stack's live objects could not be read.
+    ObservabilityLiveUnreadable,
+    /// The stack's live objects came back as text this side will not parse.
+    ObservabilityLiveUnparseable,
 }
 
 impl CheckFailure {
@@ -80,18 +136,26 @@ impl CheckFailure {
     /// All of them are published whether or not they have happened: an absent
     /// series and a series at zero are different readings, and "this failure
     /// mode has not occurred" is the second one.
-    pub const ALL: [CheckFailure; 3] = [
-        CheckFailure::DeclarationUnreadable,
-        CheckFailure::QuotasUnreadable,
-        CheckFailure::QuotasUnparseable,
+    pub const ALL: [CheckFailure; 6] = [
+        CheckFailure::GovernanceDeclarationUnreadable,
+        CheckFailure::GovernanceLiveUnreadable,
+        CheckFailure::GovernanceLiveUnparseable,
+        CheckFailure::ObservabilityDeclarationUnreadable,
+        CheckFailure::ObservabilityLiveUnreadable,
+        CheckFailure::ObservabilityLiveUnparseable,
     ];
 
     /// The label value, which is also the word to search the source for.
     pub fn as_str(self) -> &'static str {
         match self {
-            CheckFailure::DeclarationUnreadable => "declaration_unreadable",
-            CheckFailure::QuotasUnreadable => "quotas_unreadable",
-            CheckFailure::QuotasUnparseable => "quotas_unparseable",
+            CheckFailure::GovernanceDeclarationUnreadable => "governance_declaration_unreadable",
+            CheckFailure::GovernanceLiveUnreadable => "governance_live_unreadable",
+            CheckFailure::GovernanceLiveUnparseable => "governance_live_unparseable",
+            CheckFailure::ObservabilityDeclarationUnreadable => {
+                "observability_declaration_unreadable"
+            }
+            CheckFailure::ObservabilityLiveUnreadable => "observability_live_unreadable",
+            CheckFailure::ObservabilityLiveUnparseable => "observability_live_unparseable",
         }
     }
 
@@ -337,13 +401,19 @@ pub fn drift_by_object(
         .collect()
 }
 
-/// How many fields differ between each governance object and the declaration.
+/// How many fields differ between each object and the declaration, per class.
 ///
 /// The drift count is a gauge rather than a counter: it answers "how far apart
 /// are the two sides right now", and accumulating that answers nothing.
+///
+/// One table per class rather than one table keyed by object. A comparison
+/// replaces its whole table (see [`Self::record_comparison`]), so a single table
+/// would let the class that compared last erase the other's objects -- and the
+/// erasure would look exactly like the ceiling it removed having been applied.
 #[derive(Default)]
 pub struct GovernanceDrift {
-    entries: Mutex<BTreeMap<String, usize>>,
+    governance: Mutex<BTreeMap<String, usize>>,
+    observability: Mutex<BTreeMap<String, usize>>,
     /// One cell per [`CheckFailure`], in that order.
     check_failures: [AtomicU64; CheckFailure::ALL.len()],
 }
@@ -353,8 +423,16 @@ impl GovernanceDrift {
         Self::default()
     }
 
-    /// Record the whole comparison: one entry per declared object, zero counts
-    /// included, and nothing else.
+    /// The table one class's objects are counted in.
+    fn table(&self, class: DriftClass) -> &Mutex<BTreeMap<String, usize>> {
+        match class {
+            DriftClass::Governance => &self.governance,
+            DriftClass::Observability => &self.observability,
+        }
+    }
+
+    /// Record the whole comparison of one class: one entry per declared object,
+    /// zero counts included, and nothing else.
     ///
     /// Replacing the table rather than inserting into it is what keeps the
     /// reading clearable in both directions. A revision can stop declaring an
@@ -367,29 +445,29 @@ impl GovernanceDrift {
     /// A comparison that could not be made does not come through here at all: it
     /// records a failure instead and leaves the last table standing, because
     /// nobody looked is not a reading that the two sides agree.
-    pub fn record_comparison(&self, drifted: &BTreeMap<String, usize>) {
-        *self.entries.lock().unwrap_or_else(|e| e.into_inner()) = drifted.clone();
+    pub fn record_comparison(&self, class: DriftClass, drifted: &BTreeMap<String, usize>) {
+        *self.table(class).lock().unwrap_or_else(|e| e.into_inner()) = drifted.clone();
     }
 
     /// Record one comparison that could not be made, and why.
     ///
     /// The reason is not optional: a caller that has a failure in hand knows
-    /// which of the three it is, and a default would put the reason back to
-    /// being unrecorded for whichever caller took it.
+    /// which of the six it is, and a default would put the reason back to being
+    /// unrecorded for whichever caller took it.
     pub fn record_check_failure(&self, reason: CheckFailure) {
         self.check_failures[reason.index()].fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn drift_fields(&self, object: &str) -> Option<usize> {
-        self.entries
+    pub fn drift_fields(&self, class: DriftClass, object: &str) -> Option<usize> {
+        self.table(class)
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(object)
             .copied()
     }
 
-    pub fn objects(&self) -> Vec<String> {
-        self.entries
+    pub fn objects(&self, class: DriftClass) -> Vec<String> {
+        self.table(class)
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .keys()
@@ -436,16 +514,31 @@ impl Observable for GovernanceDrift {
                 .with_label("reason", reason.as_str())
             })
             .collect();
-        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        for (object, fields) in entries.iter() {
+        // One loop per class rather than one over [`DriftClass::ALL`]: the two
+        // key spaces hold different things (a ceiling's name against a manifest
+        // file), so the label they ride in is named after what it holds rather
+        // than shared. Spelled as literals, not through a constant, because the
+        // name is what a rule's summary selectors are written against.
+        for (object, fields) in self
+            .table(DriftClass::Governance)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
             out.push(
                 RawMetric::new(GOVERNANCE_DRIFT_METRIC, *fields as f64)
-                    // Spelled as a literal rather than through a constant: the
-                    // shipped-summary gate reads label names out of the source
-                    // text of this call, so a constant here would make the label
-                    // invisible to it and the summaries naming {object} would
-                    // fail it.
                     .with_label("object", object.clone()),
+            );
+        }
+        for (manifest, lines) in self
+            .table(DriftClass::Observability)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            out.push(
+                RawMetric::new(OBSERVABILITY_DRIFT_METRIC, *lines as f64)
+                    .with_label("manifest", manifest.clone()),
             );
         }
         Ok(out)
@@ -560,12 +653,15 @@ mod tests {
             .iter()
             .all(|m| m.name == GOVERNANCE_CHECK_FAILURES_METRIC));
         assert!(!metrics.iter().any(|m| m.name == GOVERNANCE_DRIFT_METRIC));
+        assert!(!metrics
+            .iter()
+            .any(|m| m.name == OBSERVABILITY_DRIFT_METRIC));
 
-        drift.record_comparison(&BTreeMap::from([(
-            "resourcequota/cogneva-quota".to_string(),
-            0,
-        )]));
-        drift.record_check_failure(CheckFailure::QuotasUnreadable);
+        drift.record_comparison(
+            DriftClass::Governance,
+            &BTreeMap::from([("resourcequota/cogneva-quota".to_string(), 0)]),
+        );
+        drift.record_check_failure(CheckFailure::GovernanceLiveUnreadable);
         let metrics = drift.collect_metrics("default").await.unwrap();
         let found = metrics
             .iter()
@@ -580,11 +676,98 @@ mod tests {
         assert_eq!(
             failures,
             vec![
-                ("declaration_unreadable", 0.0),
-                ("quotas_unreadable", 1.0),
-                ("quotas_unparseable", 0.0)
+                ("governance_declaration_unreadable", 0.0),
+                ("governance_live_unreadable", 1.0),
+                ("governance_live_unparseable", 0.0),
+                ("observability_declaration_unreadable", 0.0),
+                ("observability_live_unreadable", 0.0),
+                ("observability_live_unparseable", 0.0),
             ],
             "每一种失败原因都是自己的一格，且没发生过的那种读成 0 而不是消失"
+        );
+    }
+
+    /// The two classes publish under two gauges and keep two tables: a class
+    /// that compares must not erase the other's objects, which is what one
+    /// table would do and what would look like the other side agreeing.
+    ///
+    /// The keys are the ones the production paths really write -- a ceiling's
+    /// name from the governance comparison, a manifest file from the stack
+    /// convergence loop. Seeding this with a `kind/name` for the observability
+    /// side would test the table and say nothing about the two key spaces, which
+    /// is the disagreement a reader would actually meet.
+    #[tokio::test]
+    async fn a_class_that_compares_leaves_the_other_class_standing() {
+        let drift = GovernanceDrift::new();
+        drift.record_comparison(
+            DriftClass::Governance,
+            &BTreeMap::from([("resourcequota/cogneva-quota".to_string(), 2)]),
+        );
+        drift.record_comparison(
+            DriftClass::Observability,
+            &BTreeMap::from([("10-loki.yaml".to_string(), 3)]),
+        );
+        drift.record_comparison(
+            DriftClass::Observability,
+            &BTreeMap::from([("10-loki.yaml".to_string(), 0)]),
+        );
+        assert_eq!(
+            drift.drift_fields(DriftClass::Governance, "resourcequota/cogneva-quota"),
+            Some(2),
+            "the second class's comparison erased the first class's object"
+        );
+        assert_eq!(
+            drift.drift_fields(DriftClass::Observability, "10-loki.yaml"),
+            Some(0)
+        );
+        let metrics = drift.collect_metrics("default").await.unwrap();
+        let names: Vec<&str> = metrics.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&GOVERNANCE_DRIFT_METRIC));
+        assert!(names.contains(&OBSERVABILITY_DRIFT_METRIC));
+    }
+
+    /// Each class's keys ride in the label named after what they hold, and the
+    /// two names differ.
+    ///
+    /// Both rules aggregate the label away, so nothing on the alerting side
+    /// notices if the two collapse into one name -- but a person reading the raw
+    /// series does, and would be invited to compare a ceiling with a filename.
+    /// One name for both is exactly the kind of drift this pair of readings
+    /// exists to make visible, so it is pinned here.
+    #[tokio::test]
+    async fn each_class_publishes_its_keys_under_its_own_label() {
+        let drift = GovernanceDrift::new();
+        drift.record_comparison(
+            DriftClass::Governance,
+            &BTreeMap::from([("resourcequota/cogneva-quota".to_string(), 2)]),
+        );
+        drift.record_comparison(
+            DriftClass::Observability,
+            &BTreeMap::from([("10-loki.yaml".to_string(), 3)]),
+        );
+        let metrics = drift.collect_metrics("default").await.unwrap();
+
+        let ceiling = metrics
+            .iter()
+            .find(|m| m.name == GOVERNANCE_DRIFT_METRIC)
+            .expect("the ceiling was compared");
+        assert_eq!(
+            ceiling.labels.get("object").map(String::as_str),
+            Some("resourcequota/cogneva-quota")
+        );
+        assert!(!ceiling.labels.contains_key("manifest"));
+
+        let manifest = metrics
+            .iter()
+            .find(|m| m.name == OBSERVABILITY_DRIFT_METRIC)
+            .expect("the manifest was compared");
+        assert_eq!(
+            manifest.labels.get("manifest").map(String::as_str),
+            Some("10-loki.yaml")
+        );
+        assert!(
+            !manifest.labels.contains_key("object"),
+            "一份清单文件挂在名叫 object 的标签下，读的人会拿它去和一条 ceiling 比"
         );
     }
 
@@ -604,20 +787,39 @@ mod tests {
 
     #[test]
     fn a_reason_lands_in_its_own_cell_and_the_total_is_the_sum() {
-        // The three reasons are three different things to go and look at, so
-        // they must not share a cell -- and the total must not be a fourth
-        // place the same fact is kept.
+        // Every reason is a different thing to go and look at, so they must not
+        // share a cell -- and the total must not be a seventh place the same
+        // fact is kept.
         let drift = GovernanceDrift::new();
-        drift.record_check_failure(CheckFailure::DeclarationUnreadable);
-        drift.record_check_failure(CheckFailure::QuotasUnreadable);
-        drift.record_check_failure(CheckFailure::QuotasUnreadable);
+        drift.record_check_failure(CheckFailure::GovernanceDeclarationUnreadable);
+        drift.record_check_failure(CheckFailure::GovernanceLiveUnreadable);
+        drift.record_check_failure(CheckFailure::GovernanceLiveUnreadable);
+        drift.record_check_failure(CheckFailure::ObservabilityLiveUnreadable);
         assert_eq!(
-            drift.check_failures_for(CheckFailure::DeclarationUnreadable),
+            drift.check_failures_for(CheckFailure::GovernanceDeclarationUnreadable),
             1
         );
-        assert_eq!(drift.check_failures_for(CheckFailure::QuotasUnreadable), 2);
-        assert_eq!(drift.check_failures_for(CheckFailure::QuotasUnparseable), 0);
-        assert_eq!(drift.check_failures(), 3);
+        assert_eq!(
+            drift.check_failures_for(CheckFailure::GovernanceLiveUnreadable),
+            2
+        );
+        assert_eq!(
+            drift.check_failures_for(CheckFailure::GovernanceLiveUnparseable),
+            0
+        );
+        assert_eq!(
+            drift.check_failures_for(CheckFailure::ObservabilityDeclarationUnreadable),
+            0
+        );
+        assert_eq!(
+            drift.check_failures_for(CheckFailure::ObservabilityLiveUnreadable),
+            1
+        );
+        assert_eq!(
+            drift.check_failures_for(CheckFailure::ObservabilityLiveUnparseable),
+            0
+        );
+        assert_eq!(drift.check_failures(), 4);
     }
 
     #[test]
@@ -642,24 +844,30 @@ mod tests {
     #[tokio::test]
     async fn an_object_that_stops_being_declared_stops_being_published() {
         let drift = GovernanceDrift::new();
-        drift.record_comparison(&BTreeMap::from([
-            ("resourcequota/cogneva-quota".to_string(), 2),
-            ("resourcequota/cogneva-quota-old".to_string(), 1),
-        ]));
-        assert_eq!(drift.objects().len(), 2);
+        drift.record_comparison(
+            DriftClass::Governance,
+            &BTreeMap::from([
+                ("resourcequota/cogneva-quota".to_string(), 2),
+                ("resourcequota/cogneva-quota-old".to_string(), 1),
+            ]),
+        );
+        assert_eq!(drift.objects(DriftClass::Governance).len(), 2);
 
         // The next revision declares only the renamed object, and now matches.
-        drift.record_comparison(&BTreeMap::from([(
-            "resourcequota/cogneva-quota-v2".to_string(),
-            0,
-        )]));
+        drift.record_comparison(
+            DriftClass::Governance,
+            &BTreeMap::from([("resourcequota/cogneva-quota-v2".to_string(), 0)]),
+        );
 
         assert_eq!(
-            drift.objects(),
+            drift.objects(DriftClass::Governance),
             vec!["resourcequota/cogneva-quota-v2"],
             "an object the revision no longer declares is still being published"
         );
-        assert_eq!(drift.drift_fields("resourcequota/cogneva-quota-old"), None);
+        assert_eq!(
+            drift.drift_fields(DriftClass::Governance, "resourcequota/cogneva-quota-old"),
+            None
+        );
     }
 
     #[test]

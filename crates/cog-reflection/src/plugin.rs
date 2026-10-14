@@ -1449,10 +1449,15 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 if alert_sink.is_none() {
                     warn!("PersistentAlertSink not published; observability stack verdicts stay report-only");
                 }
+                // 漂移读数与主线部署器共用同一个句柄：两条循环比的是同一件事
+                // （声明的与现场的不一样），一处分格、一处发序列，才读得出
+                // 「哪一类在漂」。句柄本身在 init 里发布，见它的字段说明。
+                let drift = self.governance_drift.clone();
                 let stack = crate::observability_stack::StackConvergence::new(
                     deployer.clone(),
                     ml_config.observability_stack.clone(),
                     alert_sink,
+                    drift,
                 );
                 info!(
                     namespace = %ml_config.observability_stack.namespace,

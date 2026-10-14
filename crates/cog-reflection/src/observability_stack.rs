@@ -22,6 +22,7 @@
 //! （`delivery-dispositions.txt`）说了算——安装脚本读同一张表。两处各留一份
 //! 名单必然分叉，分叉的样子是"装的时候跳过、收敛的时候照做"。
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,6 +30,7 @@ use cog_core::{PersistentAlertDraft, PersistentAlertSink, SFError, SFResult};
 use tracing::{info, warn};
 
 use crate::config::ObservabilityStackConfig;
+use crate::governance_drift::{CheckFailure, DriftClass, GovernanceDrift};
 use crate::mainline_deployer::{classify_doc, split_docs, DocFate, MainlineDeployer};
 
 /// 收敛面自己拥有的规则名。与配置里的规则集无关：这条判据不能在配置里，
@@ -224,6 +226,38 @@ pub fn drifted_files(readings: &[(String, DiffOutcome)]) -> Result<Vec<String>, 
     Ok(drifted)
 }
 
+/// 一份 `kubectl diff` 输出里有多少行不一样。
+///
+/// 这是这个面上最接近"差了几个字段"的读数：清单是 YAML，一对一的差异就落在
+/// 增删行上。`+++`／`---` 是统一差分自己的文件头，不是内容。
+///
+/// 数不清的时候它给 0，而**调用方不能把 0 当成"没有差异"**——`Differs` 是
+/// 退出码说的，比这行文字更硬。见调用处怎么处理这个 0。
+pub fn differing_lines(diff: &str) -> usize {
+    diff.lines()
+        .filter(|l| {
+            (l.starts_with('+') || l.starts_with('-'))
+                && !l.starts_with("+++")
+                && !l.starts_with("---")
+        })
+        .count()
+}
+
+/// `Differs` 的下界：退出码说两边不一样，差分文字至少也要读成一处不同。
+///
+/// 这不是一个调出来的数，而是 `DiffOutcome::Differs` 的含义本身——"至少一处"，
+/// 所以它不需要从哪次实测导出，名字就是它的出处。
+const AT_LEAST_ONE_DIFFERENCE: usize = 1;
+
+/// 一个 `Differs` 文件的读数：`(值, 这次读数是不是没解出来)`。
+///
+/// 值**下界是 [`AT_LEAST_ONE_DIFFERENCE`]**——`DiffOutcome` 是退出码给的结论，
+/// 比差分那行文字硬。文字一行都解不出来时，值报 1、同时把"读不出来"报出去：把 0
+/// 写进这张表就等于替一次没读成的比较声明"两边一致"。
+pub fn differs_reading(lines: usize) -> (usize, bool) {
+    (lines.max(AT_LEAST_ONE_DIFFERENCE), lines == 0)
+}
+
 /// apply 没成的原因，按**能不能自己修**分组。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Obstacle {
@@ -400,21 +434,44 @@ pub struct StackConvergence {
     deployer: Arc<MainlineDeployer>,
     cfg: ObservabilityStackConfig,
     sink: Option<Arc<dyn PersistentAlertSink>>,
+    /// 这个面的漂移读数落在哪。与治理面共用同一张表结构、同一个失败计数器
+    /// （按因分格），因为两边要回答的是同一句话：声明的与现场的不一样，而
+    /// 这句话的读数只有一个地方收，才有人能把它当序列读。
+    drift: Option<Arc<GovernanceDrift>>,
 }
 
 impl StackConvergence {
     /// `sink` 是持久化告警口。没有它结论只进日志——一条只在日志里的事实，
     /// 和"没人报"长得一样。
+    ///
+    /// `drift` 是漂移读数。没有它这一轮照样比、照样修，只是没人量得到——与
+    /// `sink` 缺席同一个形状，构造处因此也要说一声。
     pub fn new(
         deployer: Arc<MainlineDeployer>,
         cfg: ObservabilityStackConfig,
         sink: Option<Arc<dyn PersistentAlertSink>>,
+        drift: Option<Arc<GovernanceDrift>>,
     ) -> Arc<Self> {
+        if drift.is_none() {
+            warn!(
+                "observability stack convergence running with no drift handle; the per-file \
+                 comparison will reach no scrape"
+            );
+        }
         Arc::new(Self {
             deployer,
             cfg,
             sink,
+            drift,
         })
+    }
+
+    /// 记一次做不成的比较。没有句柄时什么也不记：那是"这个进程没有读数面"，
+    /// 与"比较失败"不是一回事，构造处已经说过。
+    fn note_failure(&self, reason: CheckFailure) {
+        if let Some(drift) = &self.drift {
+            drift.record_check_failure(reason);
+        }
     }
 
     /// 后台循环：先跑一轮（把"装完就没再管"这件事立刻显形），之后按间隔跑。
@@ -450,6 +507,7 @@ impl StackConvergence {
         let files = match self.deployer.git_ls_dir(rev, &dir).await {
             Ok(files) => files,
             Err(e) => {
+                self.note_failure(CheckFailure::ObservabilityDeclarationUnreadable);
                 return ConvergenceVerdict::NoEvidence(format!("{dir} 列不出文件: {e}"));
             }
         };
@@ -461,13 +519,15 @@ impl StackConvergence {
             Ok(text) => match parse_dispositions(&text) {
                 Ok(entries) => entries,
                 Err(e) => {
+                    self.note_failure(CheckFailure::ObservabilityDeclarationUnreadable);
                     return ConvergenceVerdict::NoEvidence(format!(
                         "{DISPOSITIONS_FILE} 读不了: {e}"
-                    ))
+                    ));
                 }
             },
             Err(e) => {
-                return ConvergenceVerdict::NoEvidence(format!("{DISPOSITIONS_FILE} 读不到: {e}"))
+                self.note_failure(CheckFailure::ObservabilityDeclarationUnreadable);
+                return ConvergenceVerdict::NoEvidence(format!("{DISPOSITIONS_FILE} 读不到: {e}"));
             }
         };
         // 漏登记的清单按交付处理，但要说出来：门禁拦得住提交，拦不住一个别人
@@ -496,13 +556,15 @@ impl StackConvergence {
             let text = match self.deployer.git_show(rev, &path).await {
                 Ok(text) => text,
                 Err(e) => {
+                    self.note_failure(CheckFailure::ObservabilityDeclarationUnreadable);
                     return ConvergenceVerdict::NoEvidence(format!("{path} 读不到: {e}"));
                 }
             };
             let docs = match split_docs(&text, &path) {
                 Ok(docs) => docs,
                 Err(e) => {
-                    return ConvergenceVerdict::Obstructed(Obstacle::Unusable(format!("{e}")))
+                    self.note_failure(CheckFailure::ObservabilityDeclarationUnreadable);
+                    return ConvergenceVerdict::Obstructed(Obstacle::Unusable(format!("{e}")));
                 }
             };
             let mut file_body = String::new();
@@ -570,6 +632,7 @@ impl StackConvergence {
         let deadline =
             tokio::time::Instant::now() + Duration::from_secs(self.cfg.apply_timeout_secs);
         let mut readings: Vec<(String, DiffOutcome)> = Vec::with_capacity(per_file.len());
+        let mut line_counts: BTreeMap<String, usize> = BTreeMap::new();
         for (file, body) in &per_file {
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
             if left.is_zero() {
@@ -595,8 +658,57 @@ impl StackConvergence {
             if !diff.trim().is_empty() {
                 info!(file = %file, diff = %clip(&diff, DIFF_LOG_CHARS), "observability stack: live state differs from the declared manifest");
             }
+            line_counts.insert(file.clone(), differing_lines(&diff));
             readings.push((file.clone(), outcome));
         }
+
+        // 读数**先发、再修**。倒过来的顺序（先 apply 再发）会让一次成功的愈合
+        // 把刚量到的漂移抹掉：下一轮 diff 必然 `Clean`，读数面上于是只剩"从来不
+        // 漂"——而漂移只在被修掉之前的这一瞬间存在，正好是最该有人看见的那一瞬。
+        //
+        // 一个文件读不出来，这一轮就**不是**一次比较：按因计一格，表留在上一轮
+        // 的样子。让比较失败的轮次去写表，等于替没做过的那次比较声明"两边一致"。
+        //
+        // 代价要说清：表是整张写的，所以冻住是**整张**冻住——连这一轮读得好好的
+        // 那些文件的漂移读数也一起停在上一轮的数上。于是"冻住"与"真在漂"在
+        // `cogneva_observability_drift_lines` 上长得一样，分辨它们的地方只有一个：
+        // 同一次故障里 `cogneva_governance_check_failures_total` 按因分格的那一格
+        // 同时在涨。这是**故意的两信号读数**，不是一处疏漏；只读 gauge 那一侧会把
+        // 一次读不出来的比较读成一场修不好的漂移。
+        let mut compared: BTreeMap<String, usize> = BTreeMap::new();
+        let mut uncomparable = false;
+        for (file, outcome) in &readings {
+            match outcome {
+                DiffOutcome::Clean => {
+                    compared.insert(file.clone(), 0);
+                }
+                DiffOutcome::Differs => {
+                    let (value, unparsed) =
+                        differs_reading(line_counts.get(file).copied().unwrap_or(0));
+                    if unparsed {
+                        // 退出码说两边不一样，而这份差异里一行 `+`/`-` 都没解出
+                        // 来：那是**这次比较的读数**读不出来，不是"没有差异"。
+                        self.note_failure(CheckFailure::ObservabilityLiveUnparseable);
+                    }
+                    compared.insert(file.clone(), value);
+                }
+                DiffOutcome::Failed(detail) => {
+                    warn!(
+                        file = %file,
+                        error = %detail,
+                        "observability stack: this file's comparison could not be made"
+                    );
+                    self.note_failure(CheckFailure::ObservabilityLiveUnreadable);
+                    uncomparable = true;
+                }
+            }
+        }
+        if !uncomparable {
+            if let Some(drift) = &self.drift {
+                drift.record_comparison(DriftClass::Observability, &compared);
+            }
+        }
+
         let drifted = match drifted_files(&readings) {
             Ok(drifted) => drifted,
             Err(detail) => return ConvergenceVerdict::NoEvidence(detail),
@@ -849,6 +961,34 @@ mod tests {
     fn a_warning_does_not_turn_a_diff_into_a_failure() {
         let stderr = "W0927 04:58:42.717875 1662054 diff.go:723] Object (apps/v1, Kind=StatefulSet: loki) keeps changing, diffing without lock\n";
         assert_eq!(classify_diff(1, stderr), DiffOutcome::Differs);
+    }
+
+    /// 差异行数只数内容行：统一差分自己的 `+++`／`---` 是文件头，不是"改了这
+    /// 一行"，算进去会让每个对象每次至少多算两行。
+    #[test]
+    fn only_content_lines_count_as_a_difference() {
+        let diff = concat!(
+            "diff -u -N /tmp/LIVE-1/v1.ConfigMap.a /tmp/MERGED-1/v1.ConfigMap.a\n",
+            "--- /tmp/LIVE-1/v1.ConfigMap.a\n",
+            "+++ /tmp/MERGED-1/v1.ConfigMap.a\n",
+            "@@ -1,4 +1,5 @@\n",
+            " data:\n",
+            "-  old: 1\n",
+            "+  new: 1\n",
+            "+  more: 2\n",
+        );
+        assert_eq!(differing_lines(diff), 3);
+        assert_eq!(differing_lines(""), 0);
+    }
+
+    /// `Differs` 是退出码给的结论，比差分那行文字硬：文字解不出行数时值取 1
+    /// 并把"读不出来"报出去。把它写成 0 就是替一次没读成的比较说"两边一致"，
+    /// 而那一格正是告警规则靠 `> 0` 判漂移的地方。
+    #[test]
+    fn a_diff_that_parses_to_nothing_is_not_published_as_agreement() {
+        assert_eq!(differs_reading(0), (1, true));
+        assert_eq!(differs_reading(3), (3, false));
+        assert_eq!(differs_reading(1), (1, false));
     }
 
     /// 逐文件读数折成漂移清单：干净的一轮必须是空清单——告警靠它解除。

@@ -563,6 +563,19 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_governance_check_failures_total",
         "crates/cog-reflection/src/governance_drift.rs",
     ),
+    // The observability stack's half of the same pair. Its manifests have one
+    // delivery path -- the install script -- so once installed, the repository
+    // and the cluster each go their own way, and the convergence loop that
+    // compares and re-applies them published its verdict only as a persistent
+    // alert. That alert says a stack is not converged; it cannot say which
+    // file, how long, or that a re-apply is not landing. This is the differing
+    // lines of each delivered file's own diff -- the per-file reading the loop
+    // already computes -- published before it applies: a repair that ran first
+    // would clear the reading it was meant to be measured by.
+    (
+        "cogneva_observability_drift_lines",
+        "crates/cog-reflection/src/governance_drift.rs",
+    ),
     // Four series whose producers each carry a sentence saying what should read
     // them and which nothing read: the census below found them by walking the
     // closed set against both reader faces rather than by looking for rules to

@@ -712,13 +712,23 @@ data:
             },
             {
               "name": "governance_comparison_unreadable",
-              "promql": "sum by (namespace) (increase(cogneva_governance_check_failures_total[6h])) > 6",
+              "promql": "sum by (namespace, reason) (increase(cogneva_governance_check_failures_total[6h])) > 6",
               "condition": {
                 "greater_than": 6.0
               },
               "severity": "warning",
-              "summary": "The comparison between the declared resource ceilings and the enforced ones has failed {value} time(s) in the last 6h: the drift reading is stale, so a ceiling the two sides agree on and a ceiling nobody could look at are indistinguishable right now. Six failures is about an hour of consecutive rounds at the deployer's own poll interval, which is past anything a single unreadable moment explains. The count is summed over every process in the namespace rather than read per process: the failures belong to the deployment's rounds, and a per-process counter goes back to zero with the process that reports it, so the alert would resolve on a rollout with the comparison just as broken on the far side"
+              "summary": "The {reason} comparison has failed {value} time(s) in the last 6h: the drift reading behind that reason is stale, so \"the two sides agree\" and \"nobody could look\" are indistinguishable right now. One counter carries every comparison -- the declared resource ceilings and the observability stack's delivered manifests each run on their own loop and their own schedule -- and the reason is what says which one is failing, so the count is split by it rather than summed into a number that names neither. Six failures is about an hour of consecutive rounds at either loop's own poll interval, which is past anything a single unreadable moment explains. The count is summed over every process in the namespace rather than read per process: the failures belong to the deployment's rounds, and a per-process counter goes back to zero with the process that reports it, so the alert would resolve on a rollout with the comparison just as broken on the far side"
             },
+            {
+              "name": "observability_stack_drift_not_repaired",
+              "promql": "(max without (pod, container, instance) (min_over_time(cogneva_observability_drift_lines[30m])) > 0) and (max without (pod, container, instance) (count_over_time(cogneva_observability_drift_lines[1h])) > max without (pod, container, instance) (count_over_time(cogneva_observability_drift_lines[30m])))",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "On {manifest}, {value} line(s) of a delivered observability manifest have differed from the live stack at every scrape for 30m: the convergence loop compares each file against the cluster before it applies anything, and re-applies whatever differs, so a difference still standing after half an hour means the re-apply is not landing -- the cluster keeps a version of {object} the repository no longer has, and every alert rule, scrape target and dashboard that file declares is served off the stale copy instead of off the declaration. The count is the differing lines of that file's own diff, so it says how far apart the two sides are rather than merely that they disagree. The loop's own verdict says why the apply is not landing"
+            },
+
             {
               "name": "orphans_unreaped",
               "promql": "(min_over_time(cogneva_process_zombies[30m]) > 0) and (count_over_time(cogneva_process_zombies[1h]) > count_over_time(cogneva_process_zombies[30m]))",
