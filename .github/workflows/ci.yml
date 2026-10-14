@@ -342,6 +342,44 @@ jobs:
       - name: Check the token spend route has a rendered consumer
         run: bash deploy/scripts/check-web-token-panel.sh
 
+  # 上面那条门证的是**消费面**（从入口沿 import 图可达、被一格渲染出来、那一屏读
+  # 覆盖端点），它结构上证明不了 `web/` 编得过：类型错、装不上的依赖、打包不进
+  # bundle，三条它一条也看不见。构建这一半必须自己有一个作业，否则「新增功能不得
+  # 退化」在 web 这一侧没有兑现者——本机跑过一次绿的失败形态是「本机恰好是对的」。
+  #
+  # 本机变异对照（2026-10-14，跑的就是下面这两步）：`web/src/` 里塞一个类型错 ⇒
+  # `npm run build` 退出码 2 并指到那一行；还原后逐字节一致、退出码 0。
+  web:
+    name: Web Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Node 的版本只有一个来源：镜像里构建 WebUI 的那一段。两处各钉各的，某天镜像
+      # 升了而这里没跟，就会出现「作业绿、镜像编不过」这种最难归因的形态；所以版本
+      # 是从 Dockerfile 读出来的，读不到就红，不是在这里再写一个数。
+      - name: Resolve the pinned Node version
+        id: nodever
+        run: |
+          v=$(grep -oP '^FROM node:\K[0-9]+' Dockerfile | head -1)
+          [ -n "$v" ] || { echo "未从 Dockerfile 读到 node 基础镜像的版本"; exit 1; }
+          echo "Resolved node $v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.nodever.outputs.version }}
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      # `npm ci` 而不是 `npm install`：按 lockfile 装，装出来的依赖树与镜像里那一份
+      # 同形。改了 package.json 而没更新 lockfile 时它会红，这正是要它红的形态。
+      - name: Install the WebUI dependencies
+        working-directory: web
+        run: npm ci
+      # package.json 的 build 就是 `tsc && vite build`：类型错在 tsc 那一半红，
+      # 打包失败在 vite 那一半红。
+      - name: Build the WebUI
+        working-directory: web
+        run: npm run build
+
   entry-scripts:
     name: Entry Scripts Lint
     runs-on: ubuntu-latest
