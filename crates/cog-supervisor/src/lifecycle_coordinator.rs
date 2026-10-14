@@ -241,17 +241,13 @@ impl LifecycleCoordinator {
             timestamp: Utc::now(),
         };
         let _ = self.event_tx.send(event);
-
-        // Also emit a dedicated lifecycle transition event so that downstream
-        // hook handlers (Web UI, audit log, alerting) can react specifically
-        // to state changes.
-        let lifecycle_event = SupervisorEvent::Tick {
-            timestamp: Utc::now(),
-            cycle: 0, // lifecycle events are not tied to a health-check cycle
-        };
-        // We reuse Tick as a lightweight heartbeat; downstream consumers can
-        // filter by the preceding AgentUnhealthy event.
-        let _ = self.event_tx.send(lifecycle_event);
+        // No second, dedicated event: `AgentUnhealthy` is already the lifecycle
+        // transition, and `kind` above names which one it was. A previous
+        // version also sent a `Tick { cycle: 0 }` here as a "heartbeat", which
+        // was wrong twice over -- it carried no information the event above did
+        // not, and `Tick.cycle` means the health-check cycle number (the
+        // health-check loop's own tick), so a lifecycle transition writing 0
+        // there read as "no health-check has run yet".
 
         debug!(
             agent_id = %agent_id,

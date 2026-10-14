@@ -217,4 +217,16 @@ async fn lifecycle_event_broadcasted() {
         matches!(event.unwrap(), SupervisorEvent::AgentUnhealthy { .. }),
         "expected AgentUnhealthy event"
     );
+    // A transition emits exactly that one event. A `Tick` used to follow it as
+    // a stand-in heartbeat, carrying a hardcoded `cycle: 0`; but `Tick.cycle`
+    // is the health-check loop's cycle number, so a lifecycle transition
+    // writing 0 there read to every cache as "no health-check has run yet" --
+    // a reading that moves backwards whenever an agent goes suspect, dies or
+    // gets stuck. Nothing consumed that Tick, so this asserts the transition
+    // stays a single, truthful event.
+    assert!(
+        rx.try_recv().is_err(),
+        "a lifecycle transition must emit one event, not a heartbeat that \
+         overwrites the health-check cycle with 0"
+    );
 }
