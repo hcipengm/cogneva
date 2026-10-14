@@ -402,11 +402,11 @@ Harness Engineering = 给 Agent 提供完整的执行环境（工具、上下文
 | **反馈（Feedback）** | `cog-reflection` L0-L3 自我进化：SelfReview → ReflectionEngine → EvolutionEngine |
 | **沙箱（Sandbox）** | `cog-agent` 运行时隔离 + `cog-supervisor` 监控-驱动闭环 |
 
-**Context Engineering 子集**：
-- Prompt 模板热重载 + A/B 测试
-- 三层记忆自动注入上下文（Raw 事实 → Schema 关系 → Summary 语义）
-- 知识库全文检索 + 向量语义检索 Hybrid 融合
-- 上下文窗口自适应压缩（TokenBudgetManager）
+**Context Engineering（上下文工程）**——模型能看到什么，是唯一还握在手里的变量。模型能力在调用那一刻是固定的，剩下的旋钮只有三个：哪些知识进窗口、以什么形状进、装不下时怎么办。Cogneva 的立场是：**窗口是完整记录按预算做出来的一份投影，不是记录本身**。
+
+- **什么进**——三层记忆是检索后注入，不是拼接：Raw 事实、Schema 关系、Summary 语义各自回答不同类的问题；知识库先把全文与向量命中融合，再往 prompt 里送。
+- **什么形状**——Prompt 模板带版本、可热重载、可 A/B，所以「一个任务怎么被表述」本身是一次可度量的变更，而不是手工改字。
+- **装不下怎么办**——`ContextWindow` 有两个面：`messages` 是模型看到的那份，按预算裁剪；`history` 是这个窗口见过的全部，从不裁。被裁掉的是视图，不是对话——记录保持完整，缩小的只是投影。真正「不留引用就丢字节」的地方只有一处：一条过大的工具结果在进入上下文那一刻，因为它可能独自超过整个窗口，而它恰是最新的一条、丢不掉。
 
 ### 🛠️ 优势 10：对 Agentic Engineering 的原生支持
 
@@ -524,7 +524,7 @@ Cogneva 有 20+ 业务 crate，如果让它们直接互相依赖，很快会变�
 | 数据类型 | Trait | 当前实现 | 可替换为 |
 |---------|-------|---------|---------|
 | 关系型数据 | — | PostgreSQL | TiDB / Neon / MySQL（同协议扩展） |
-| 向量数据 | `VectorBackend` | Qdrant | Milvus / LanceDB / Memory（测试） |
+| 向量数据 | `VectorBackend` | Qdrant | Milvus / LanceDB / Memory |
 | 状态/Checkpoint | `StateBackend` | PostgreSQL | Redis / 任意 KV 存储 |
 | 对象存储 | `ObjectBackend` | SeaweedFS / S3 | MinIO / Azure Blob |
 | 消息队列 | `MessageBackend` | NATS JetStream | Redis Streams / Kafka |

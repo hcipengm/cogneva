@@ -404,11 +404,11 @@ Harness Engineering = providing Agents with a complete execution environment (to
 | **Feedback** | `cog-reflection` L0–L3 self-evolution: SelfReview → ReflectionEngine → EvolutionEngine |
 | **Sandbox** | `cog-agent` runtime isolation + `cog-supervisor` sense-decide-act loop |
 
-**Context Engineering subset**:
-- Prompt template hot reload + A/B testing
-- Three-layer memory auto-injected into context (Raw facts → Schema relations → Summary semantics)
-- Knowledge base full-text search + vector semantic search Hybrid fusion
-- Adaptive context-window compression (TokenBudgetManager)
+**Context engineering** — what the model gets to see is the one lever still in your hand. Model capability is fixed at call time, so the only knobs left are which knowledge enters the window, in what shape, and what happens when it does not fit. Cogneva's stance is that **the window is a budgeted projection of a complete record, not the record itself**:
+
+- **What enters** — the three memory layers are retrieved and injected, not concatenated: raw facts, schema relations and semantic summaries each answer a different kind of question, and the knowledge base fuses full-text and vector hits before anything reaches the prompt.
+- **In what shape** — prompt templates are versioned, hot-reloadable and A/B-testable, so how a task is framed is a measurable change rather than a hand edit.
+- **When it does not fit** — `ContextWindow` carries two faces: `messages`, what the model sees, trimmed to the budget; and `history`, everything the window ever saw, never trimmed. A trimmed view never becomes a lost conversation — the record stays whole and only the projection shrinks. Bytes are dropped without a reference in exactly one place: an oversized tool result, at the moment it enters, because a single result can exceed the whole window on its own and — being the newest message — cannot simply be discarded.
 
 ### 🛠️ Advantage 10: Native support for Agentic Engineering
 
@@ -528,7 +528,7 @@ All storage layers are likewise abstracted through `cog-core` Backend Traits —
 | Data type | Trait | Current implementation | Replaceable with |
 |-----------|-------|------------------------|------------------|
 | Relational data | — | PostgreSQL | TiDB / Neon / MySQL (same-protocol extension) |
-| Vector data | `VectorBackend` | Qdrant | Milvus / LanceDB / Memory (testing) |
+| Vector data | `VectorBackend` | Qdrant | Milvus / LanceDB / Memory |
 | State/Checkpoint | `StateBackend` | PostgreSQL | Redis / any KV store |
 | Object storage | `ObjectBackend` | SeaweedFS / S3 | MinIO / Azure Blob |
 | Message queue | `MessageBackend` | NATS JetStream | Redis Streams / Kafka |
