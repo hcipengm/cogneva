@@ -72,20 +72,21 @@ impl EmbeddingProvider for BagOfWords {
 }
 
 /// A wiki over in-memory stores, with the semantic face wired the way the
-/// plugin wires it -- through a handle that resolves against a context holding
-/// no embedding provider when `embedding` is `None`.
+/// plugin wires it: the index holds a handle that resolves against a context,
+/// and the provider (when there is one) is published into that context. The
+/// `None` arm is the plugin's "no embedding provider published" state.
 fn wiki(embedding: Option<Arc<dyn EmbeddingProvider>>) -> WikiManager {
     let objects: Arc<dyn ObjectBackend> = Arc::new(MemoryObjectBackend::new());
     let vectors = Arc::new(MemoryVectorBackend::new());
-    let index = match embedding {
-        Some(provider) => WikiVectorIndex::with_ready_embedding(vectors, "wiki", provider),
-        None => WikiVectorIndex::new(
-            vectors,
-            "wiki",
-            cog_core::LateService::new(cog_core::PluginContext::new(cog_core::Config::default())
-                .as_owner("wiki_vector_index_test")),
-        ),
-    };
+    let ctx = cog_core::PluginContext::new(cog_core::Config::default());
+    if let Some(provider) = embedding {
+        ctx.publish_service::<dyn EmbeddingProvider>(provider);
+    }
+    let index = WikiVectorIndex::new(
+        vectors,
+        "wiki",
+        cog_core::LateService::new(ctx.as_owner("wiki_vector_index_test")),
+    );
     WikiManager::new(objects).with_vector_index(Arc::new(index))
 }
 

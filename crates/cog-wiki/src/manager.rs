@@ -107,11 +107,6 @@ impl WikiManager {
         self
     }
 
-    /// Whether this manager can answer a query the keywords do not cover.
-    pub fn has_vector_index(&self) -> bool {
-        self.vector_index.is_some()
-    }
-
     fn make_key(&self, relative_path: &str) -> String {
         if self.key_prefix.is_empty() {
             relative_path.to_string()

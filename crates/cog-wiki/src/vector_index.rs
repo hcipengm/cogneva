@@ -87,36 +87,6 @@ impl WikiVectorIndex {
         }
     }
 
-    /// Build an index whose embedder is already in hand.
-    ///
-    /// The form a caller that resolved the provider itself uses, so that this
-    /// index never has to be the one place that decides a service is missing.
-    pub fn with_ready_embedding(
-        vector: Arc<dyn VectorBackend>,
-        collection: impl Into<String>,
-        embedding: Arc<dyn EmbeddingProvider>,
-    ) -> Self {
-        Self {
-            vector,
-            embedding: MaybeService::Ready(embedding),
-            collection: collection.into(),
-        }
-    }
-
-    /// The collection this index reads and writes.
-    pub fn collection(&self) -> &str {
-        &self.collection
-    }
-
-    /// Whether an embedding provider is reachable right now.
-    ///
-    /// Asked before indexing a document rather than discovered per call: the
-    /// answer cannot change while the process runs, and a wiki ingested without
-    /// one is a wiki whose vector face is empty for a reason worth naming once.
-    pub fn has_embedder(&self) -> bool {
-        self.embedding.resolve().is_some()
-    }
-
     /// Create the collection on first write.
     ///
     /// The dimension comes from the provider, which is why this runs at the
