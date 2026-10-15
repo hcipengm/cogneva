@@ -69,10 +69,15 @@ const DASHBOARD_TABLE_OPENS: &str = "const PRODUCED: &[(&str, &[&str], &str)] = 
 /// not a series at all, the other is a series the tree publishes on purpose
 /// without any build being able to write it.
 ///
-/// An entry here is an exclusion, so both directions are checked: the name has
-/// to be a literal the tree really carries, and it must not be on any face --
-/// a name a face records is recorded, and exempting it would silence the check
-/// that says so.
+/// An entry here is an exclusion from the population, so the directions that
+/// can be checked are: the name has to be a literal the tree really carries,
+/// it has to say why, and it must not be in the closed set -- a name the store
+/// writes is a series whatever the sentence beside it says.
+///
+/// What that leaves is the honest limit of this table, and it is worth naming
+/// rather than leaving for someone to find: a scrape-only series put here is
+/// exempted from a census that would otherwise have demanded a verdict, and
+/// nothing can tell such an entry apart from a real table name.
 const NOT_A_SERIES: &[(&str, &str)] = &[
     (
         "cogneva_owner_leases",
@@ -371,6 +376,18 @@ fn every_series_name_literal_in_the_tree_is_accounted_for() {
         assert!(
             reason.split_whitespace().count() >= 5,
             "NOT_A_SERIES 里的 {name} 没写清它为什么不是序列"
+        );
+        // One half of the exemption is checkable and this is it: a name the
+        // closed set holds is a series the store writes, whatever a sentence
+        // here says, so the store is the answer to "is this a series" for
+        // every name it carries. What this cannot decide is a name the store
+        // does not hold -- a scrape-only series put in this table would be a
+        // series exempted from the census, and nothing can tell that apart
+        // from a table name. That residue is written up as a memory with the
+        // gate it does not have.
+        assert!(
+            !registry.contains(*name),
+            "NOT_A_SERIES 里的 {name} 在闭集里——闭集里的名字是这个 build 会写进 store 的序列，不是标签也不是表名，把它豁免掉等于让这条序列整个在门的射程之外（{reason}）"
         );
     }
 
