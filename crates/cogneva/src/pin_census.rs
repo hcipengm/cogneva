@@ -18,6 +18,13 @@
 //! family of zero are different readings, and only one of them means "nothing
 //! is left in this state".
 //!
+//! A member is its label set, so the count is the number of distinct members: a
+//! plugin that reads the same pin twice while initialising is one member, not
+//! two. That diverges from the startup log, which prints one line per read
+//! record and so can name one more line than the exposition carries. The extra
+//! line is the duplication showing itself -- the two lines carry the same three
+//! names, which is why the exposition cannot hold both.
+//!
 //! The parties of a member are a label rather than a series each, so a pin with
 //! two publishers stays one pin in its family instead of reading as two.
 //!
@@ -33,6 +40,8 @@
 //! says why it cannot be read as a verdict -- the two names it pairs may be
 //! different types that happen to end the same way. A reader who wants it can
 //! pair the two published families by the same rule the audit uses.
+
+use std::collections::BTreeSet;
 
 use cog_core::{
     DimensionSpec, Observable, PinAudit, PluginContext, RawMetric, SFResult, TraceFragment,
@@ -57,7 +66,8 @@ pub const PIN_CENSUS_MULTI_PUBLISHED_COUNT_METRIC: &str =
 /// One series per such pin, value 1, labels `pin` and `publisher`.
 pub const PIN_CENSUS_MULTI_PUBLISHED_METRIC: &str = "cogneva_plugin_pin_multi_published";
 
-/// How many init-time reads a missing `requires` edge left unordered.
+/// How many init-time reads a missing `requires` edge left unordered, counting
+/// a read once however many times the same plugin registered it.
 pub const PIN_CENSUS_UNORDERED_INIT_READ_COUNT_METRIC: &str =
     "cogneva_plugin_pin_unordered_init_read_count";
 
@@ -118,16 +128,34 @@ impl PinCensusObservable {
 }
 
 /// Emit one family: its size, then one series per member with the names in
-/// labels. `members` is empty exactly when `size` is zero.
+/// labels.
+///
+/// The size is the number of *distinct* members, which is not always the number
+/// of rows the audit hands over. A plugin that reads the same pin twice while
+/// initialising is recorded twice -- the demand list is a list of read calls,
+/// not of pins -- and both records carry the same three names. The exposition
+/// identifies a series by its label set, so those two rows are one series
+/// whatever is published here: Prometheus keeps one sample and drops the other.
+/// A size that added them up would be a number no scrape can ever show, and a
+/// count nothing can check is worse than a count one smaller, because the one
+/// claim this reading makes is that its size and its members agree.
+///
+/// The labels are sorted before they are compared, so two members are the same
+/// member when they carry the same names with the same values, in whatever
+/// order the caller wrote them.
 fn publish_family(
     out: &mut Vec<RawMetric>,
     count_metric: &'static str,
     member_metric: &'static str,
-    size: usize,
     members: impl Iterator<Item = Vec<(&'static str, String)>>,
 ) {
-    out.push(RawMetric::new(count_metric, size as f64));
-    for labels in members {
+    let mut distinct: BTreeSet<Vec<(&'static str, String)>> = BTreeSet::new();
+    for mut labels in members {
+        labels.sort();
+        distinct.insert(labels);
+    }
+    out.push(RawMetric::new(count_metric, distinct.len() as f64));
+    for labels in distinct {
         let mut metric = RawMetric::new(member_metric, 1.0);
         for (label, value) in labels {
             metric = metric.with_label(label, value);
@@ -159,7 +187,6 @@ impl Observable for PinCensusObservable {
             &mut out,
             PIN_CENSUS_UNSATISFIED_COUNT_METRIC,
             PIN_CENSUS_UNSATISFIED_METRIC,
-            audit.unsatisfied.len(),
             audit.unsatisfied.iter().map(|(pin, consumers)| {
                 vec![
                     (PIN_LABEL, pin.name().to_string()),
@@ -172,7 +199,6 @@ impl Observable for PinCensusObservable {
             &mut out,
             PIN_CENSUS_UNCONSUMED_COUNT_METRIC,
             PIN_CENSUS_UNCONSUMED_METRIC,
-            audit.unconsumed.len(),
             audit.unconsumed.iter().map(|(pin, publishers)| {
                 vec![
                     (PIN_LABEL, pin.name().to_string()),
@@ -185,7 +211,6 @@ impl Observable for PinCensusObservable {
             &mut out,
             PIN_CENSUS_MULTI_PUBLISHED_COUNT_METRIC,
             PIN_CENSUS_MULTI_PUBLISHED_METRIC,
-            audit.multi_published.len(),
             audit.multi_published.iter().map(|(pin, publishers)| {
                 vec![
                     (PIN_LABEL, pin.name().to_string()),
@@ -198,7 +223,6 @@ impl Observable for PinCensusObservable {
             &mut out,
             PIN_CENSUS_UNORDERED_INIT_READ_COUNT_METRIC,
             PIN_CENSUS_UNORDERED_INIT_READ_METRIC,
-            audit.unordered_init_reads.len(),
             audit.unordered_init_reads.iter().map(|read| {
                 vec![
                     (PIN_LABEL, read.pin.name().to_string()),
@@ -241,6 +265,14 @@ mod tests {
             owner: Some(owner),
             required: false,
             during_init: false,
+        }
+    }
+
+    /// The same read, taken while the plugin is still initialising.
+    fn init_reader(owner: &'static str) -> PinConsumer {
+        PinConsumer {
+            during_init: true,
+            ..reader(owner)
         }
     }
 
@@ -426,6 +458,69 @@ mod tests {
         assert_eq!(unordered.len(), 1);
         assert_eq!(label_of(unordered[0], READER_LABEL), "cog-reader");
         assert_eq!(label_of(unordered[0], PUBLISHER_LABEL), "cog-first");
+    }
+
+    /// A read the same plugin registered twice is one member, and the size is
+    /// the number of members.
+    ///
+    /// The demand list holds read calls, not pins: a plugin that reads one pin
+    /// twice while initialising is recorded twice, and both records carry the
+    /// same pin, reader and publisher. The exposition identifies a series by
+    /// its label set, so those two records are one series whatever is
+    /// published -- which is the shape the first live reading of this family
+    /// had, a size one larger than the number of series any query could count.
+    /// A reading whose two halves cannot be reconciled is not a reading.
+    #[tokio::test]
+    async fn a_read_registered_twice_is_one_member_and_the_size_says_so() {
+        let audit = PinAudit::evaluate(
+            &[PinWiring {
+                pin: Pin::of::<TwoPublishers>(),
+                publishers: vec![Some("cog-publisher")],
+                consumers: vec![init_reader("cog-reader"), init_reader("cog-reader")],
+            }],
+            &[],
+        );
+        assert_eq!(
+            audit.unordered_init_reads.len(),
+            2,
+            "the audit keeps one entry per read call, and there were two"
+        );
+
+        let observable = PinCensusObservable::new();
+        observable.record(audit).await;
+        let metrics = observable.collect_metrics("").await.unwrap();
+
+        let families = [
+            (
+                PIN_CENSUS_UNSATISFIED_COUNT_METRIC,
+                PIN_CENSUS_UNSATISFIED_METRIC,
+            ),
+            (
+                PIN_CENSUS_UNCONSUMED_COUNT_METRIC,
+                PIN_CENSUS_UNCONSUMED_METRIC,
+            ),
+            (
+                PIN_CENSUS_MULTI_PUBLISHED_COUNT_METRIC,
+                PIN_CENSUS_MULTI_PUBLISHED_METRIC,
+            ),
+            (
+                PIN_CENSUS_UNORDERED_INIT_READ_COUNT_METRIC,
+                PIN_CENSUS_UNORDERED_INIT_READ_METRIC,
+            ),
+        ];
+        for (count, member) in families {
+            let named = members(&metrics, member);
+            assert_eq!(
+                value_of(&metrics, count),
+                Some(named.len() as f64),
+                "the size of {member} has to be the number of its series, or the two halves of the reading disagree"
+            );
+        }
+        assert_eq!(
+            value_of(&metrics, PIN_CENSUS_UNORDERED_INIT_READ_COUNT_METRIC),
+            Some(1.0),
+            "two records under one label set are one member"
+        );
     }
 
     #[tokio::test]

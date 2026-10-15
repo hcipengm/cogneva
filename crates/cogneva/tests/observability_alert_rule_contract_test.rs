@@ -29,6 +29,8 @@ mod dashboard;
 mod producer;
 #[path = "common/promql.rs"]
 mod promql;
+#[path = "common/unread.rs"]
+mod unread;
 
 use producer::carries_the_producer;
 use promql::{
@@ -36,6 +38,7 @@ use promql::{
     lagged_equality_complaints, metric_names_in, shape_complaints, uncovered_window_complaints,
     unguarded_store_reading_complaints, windows_over,
 };
+use unread::{unresolved_readers, Unread};
 
 const CHART_CONFIG: &str = "deploy/helm/cogneva/files/cogneva.json";
 
@@ -2302,43 +2305,11 @@ fn the_tables_hold_no_series_that_no_rule_reads() {
     );
 }
 
-/// Every name the closed set publishes, against every face that reads one.
-///
-/// The test above asks the question in one direction only: a series registered
-/// in `PRODUCED` must be read by a rule. It cannot see a name that was never
-/// registered anywhere, which is exactly the shape of a series that is
-/// published, described in `metric_help`, and read by nobody. This walks the
-/// other way -- from `cog_core::metric_names::ALL`, which the recording macros
-/// generate, so a name in it is published by this build by construction -- and
-/// requires each one to be accounted for by an alert rule, by a dashboard
-/// panel, or by an entry here.
-///
-/// There are three verdicts and no fourth. `Elsewhere` names the series the
-/// same fact is read from, which makes leaving this name unread a decision
-/// instead of an oversight. `NotAReading` says no rule can state the fact,
-/// because this series does not carry one. `Gap` records a fact that nothing
-/// states and nothing reports: it is a debt, kept as a count by
-/// `GAPS_AT_CENSUS` so the next one cannot arrive unnoticed, and never a
-/// statement that the reading is not worth having.
-///
-/// The reader is a series name rather than prose on purpose. The census filed
-/// two of these as `Elsewhere` with a reason saying a rule read one of their
-/// operands, and that rule reads neither -- the two names occurred nowhere in
-/// it. A reason is a sentence the gate can only count words in, so a true
-/// exemption and a false one look the same; a series name is looked up, and the
-/// lookup is what separates them.
-enum Unread {
-    /// The same fact is read from these series, each by a shipped rule.
-    Elsewhere {
-        readers: &'static [&'static str],
-        reason: &'static str,
-    },
-    /// No rule can state it: the series carries no measurement -- a label, a
-    /// timestamp, or a copy of something published where it is read.
-    NotAReading(&'static str),
-    /// Nothing states it. A debt, counted by `GAPS_AT_CENSUS`.
-    Gap(&'static str),
-}
+// `enum Unread` and `unresolved_readers` live in `common/unread.rs`. The scrape
+// census gives the same three verdicts to a different population -- the names a
+// build can render, which the store never holds -- and one copy of the type is
+// what keeps the two censuses from answering "what does `Elsewhere` claim"
+// differently.
 
 /// Names no face reads, with the verdict.
 ///
@@ -2528,21 +2499,6 @@ const UNREAD: &[(&str, Unread)] = &[
         Unread::Gap("tasks whose declared `role` named no row in the executor table, by `face`. The role is carried through verbatim and the dispatch path maps it to nothing, so a task can be injected with `is_executable` set and a role no hand answers to -- and that is a fact no other series states, since the injected count beside it is the same whether or not anything can pick the work up. The lookup itself is not missing: the executor table already answers it through its own role-to-skill mapping, and the count is taken against that answer rather than against a table spelled here. What a rule would have to say is which of these are faults, and that turns on a mapping nobody has declared: the roles a face's document uses and the role kinds the executor table registers are two vocabularies with no published correspondence between them, so at the moment this name is minted every role a face declares is unmapped until an operator adds a row for it, and a rule firing on any nonzero would flag the wiring of a new face rather than a fault. The bound is what the actor loop's own entry says is missing -- the population that needs a threshold is the one that took a fallback -- and here the fallback is simply that nobody picks the task up"),
     ),
 ];
-
-/// Entries an `Elsewhere` reader claim cannot be resolved against.
-///
-/// A reader has to be a name some face reads -- the same closure the census
-/// walks, rules and panels together. That is the whole claim the entry makes,
-/// and it is the one the census shipped two false entries under: a reason
-/// saying the floor rule read one of the sample log's operands, where the rule
-/// reads neither.
-fn unresolved_readers(read: &BTreeSet<String>, name: &str, readers: &[&str]) -> Vec<String> {
-    readers
-        .iter()
-        .filter(|reader| !read.contains(**reader))
-        .map(|reader| format!("  {name} -> {reader}"))
-        .collect()
-}
 
 /// How many `Gap` entries the census left. A new series that no face reads and
 /// that nothing else states must be classified, and calling it a gap raises
