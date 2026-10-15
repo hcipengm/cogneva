@@ -43,14 +43,16 @@ fn ident_of(method: &str) -> String {
     format!("METHOD_{}", method.to_ascii_uppercase().replace('/', "_"))
 }
 
-/// The declared method set as identifiers, sorted the way [`dispatch_arms`]
-/// sorts -- the two are compared directly, and the spelling rule above is not
-/// order-preserving (a `/` becomes `_`, which sorts after a letter), so both
-/// sides are sorted after mapping rather than before.
-fn sorted_idents_of_served_methods() -> Vec<String> {
-    let mut idents: Vec<String> = served_methods().iter().map(|m| ident_of(m)).collect();
-    idents.sort();
-    idents
+/// The declared method set as identifiers.
+///
+/// A set, not an ordered list, and deliberately so: the spelling rule above is
+/// not order-preserving (a `/` becomes `_`, which sorts after a letter), so two
+/// sides that arrive at their order by different routes -- one sorted by method
+/// name, the other by identifier -- can disagree on order while agreeing on
+/// membership. Comparing sets keeps the ordering out of the criterion entirely,
+/// rather than pinning which route sorted when.
+fn ident_set_of_served_methods() -> BTreeSet<String> {
+    served_methods().iter().map(|m| ident_of(m)).collect()
 }
 
 /// The `pub const METHOD_*: &str = "...";` declarations the server file makes.
@@ -79,26 +81,24 @@ fn declared_method_constants(src: &str) -> Vec<(String, String)> {
 /// A match arm is read as "a *line* whose first token is a `METHOD_` constant
 /// and whose remainder starts with `=>`". Bounding it to the `handle` function
 /// keeps a `METHOD_` name used in a doc comment or an assertion out of the set.
-fn dispatch_arms(src: &str) -> Vec<String> {
+fn dispatch_arms(src: &str) -> BTreeSet<String> {
     let Some(start) = src.find("pub async fn handle(") else {
-        return Vec::new();
+        return BTreeSet::new();
     };
     let body = &src[start..];
     // The dispatch ends with its catch-all arm; take everything up to it so a
     // later function's arms cannot leak in.
     let end = body.find("other =>").unwrap_or(body.len());
-    let mut out = Vec::new();
+    let mut out = BTreeSet::new();
     for line in body[..end].lines() {
         let t = line.trim();
         let Some((name, rest)) = t.split_once(char::is_whitespace) else {
             continue;
         };
         if name.starts_with("METHOD_") && rest.trim_start().starts_with("=>") {
-            out.push(name.to_string());
+            out.insert(name.to_string());
         }
     }
-    out.sort();
-    out.dedup();
     out
 }
 
@@ -144,7 +144,7 @@ async fn the_dispatch_answers_exactly_the_declared_methods() {
         "the dispatch has to be found in src/mcp.rs, not skipped"
     );
 
-    let expected = sorted_idents_of_served_methods();
+    let expected = ident_set_of_served_methods();
     assert_eq!(
         arms, expected,
         "the dispatch's arms and the declared method set have to be the same set: an \
@@ -281,7 +281,7 @@ fn dropping_an_arm_makes_the_dispatch_and_the_declaration_disagree() {
     let before = dispatch_arms(&src);
     assert_eq!(
         before,
-        sorted_idents_of_served_methods(),
+        ident_set_of_served_methods(),
         "the unmutated source is the control: it has to agree first"
     );
 
@@ -294,7 +294,7 @@ fn dropping_an_arm_makes_the_dispatch_and_the_declaration_disagree() {
     assert_eq!(mutated.len(), src.len() - anchor.len(), "the mutation applied");
 
     let after = dispatch_arms(&mutated);
-    let expected = sorted_idents_of_served_methods();
+    let expected = ident_set_of_served_methods();
     assert_ne!(
         after, expected,
         "with the arm gone, the dispatch no longer answers everything the table \
