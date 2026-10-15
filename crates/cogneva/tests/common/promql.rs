@@ -1483,6 +1483,60 @@ mod tests {
         }
     }
 
+    /// The names a rule reads are the ones a rule names.
+    ///
+    /// Both contract tests build their reader set from this function, so a name
+    /// it fails to extract is a series neither contract checks -- and nothing
+    /// on any reading surface would say so, because the missing name is missing
+    /// from the list rather than wrong on it. The cases below are the positions
+    /// an identifier can sit in; the absence check is the one that prompted
+    /// this: `absent(X)` reads X, and it reads it *by X being missing*, which is
+    /// still a reader -- a series whose only reader is an absence check would
+    /// otherwise never be able to have one.
+    ///
+    /// Every name and every expression below is assembled at run time rather
+    /// than written whole, and that is not decoration: this file is inside the
+    /// tree the scrape census walks for series-name literals, so a bare quoted
+    /// name here -- as an expression *or* as an expectation -- would be read
+    /// there as a producer of a series that has none. The prefix is split for
+    /// the same reason the census splits its own needle.
+    #[test]
+    fn the_names_a_rule_reads_are_the_ones_it_names() {
+        const P: &str = concat!("cog", "neva_");
+        let n = |suffix: &str| format!("{P}{suffix}");
+        let a = n("a");
+        let b = n("b");
+        let c = n("c");
+        let d = n("d");
+        let e = n("e");
+        let f = n("f");
+        let g = n("g");
+        let h = n("h");
+        let cases: Vec<(String, Vec<String>)> = vec![
+            // A function's argument is a series; the function name is not.
+            (format!("rate({a}[5m])"), vec![a.clone()]),
+            // An absence check reads the name whose absence it asserts.
+            (format!("absent({b})"), vec![b.clone()]),
+            // A clause names labels, never series.
+            (format!("sum by (job) ({c})"), vec![c.clone()]),
+            // Neither a label name nor a label value is a series name.
+            (
+                format!("{d}{{job=\"x\", node=~\"a|b\"}} > 0"),
+                vec![d.clone()],
+            ),
+            // A duration is not a name, in a range selector or a subquery.
+            (format!("avg_over_time({e}[30m:1m])"), vec![e.clone()]),
+            // A scalar argument is not a name.
+            (format!("topk(3, {f})"), vec![f.clone()]),
+            // Both operands, in expression order.
+            (format!("rate({g}[5m]) / {h}"), vec![g.clone(), h.clone()]),
+        ];
+        for (expr, expected) in &cases {
+            let got: Vec<String> = metric_names_in(expr).into_iter().collect();
+            assert_eq!(&got, expected, "{expr}");
+        }
+    }
+
     /// The defect this gate was written for: the operator between the two
     /// operands was dropped, every series name survived, and the name-level
     /// checks in both contract tests still pass.
