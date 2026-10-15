@@ -412,7 +412,7 @@ mod tests {
     /// and read back under its own label.
     #[tokio::test]
     async fn each_holder_index_publishes_under_its_own_label() {
-        for index in 0..PULL_GATE_OPERATIONS.len() {
+        for (index, operation) in PULL_GATE_OPERATIONS.iter().enumerate() {
             let observable = MemoryObservable::new();
             observable.set_pull_gate_holder(index);
 
@@ -441,13 +441,10 @@ mod tests {
             );
             assert_eq!(
                 raised[0].0,
-                PULL_GATE_OPERATIONS[index].to_string(),
+                operation.to_string(),
                 "the cell raised is the one the holder's own index names: {published:?}"
             );
-            assert_eq!(
-                observable.reported_holder(),
-                Some(PULL_GATE_OPERATIONS[index])
-            );
+            assert_eq!(observable.reported_holder(), Some(*operation));
         }
     }
 
