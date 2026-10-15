@@ -805,8 +805,8 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          and a different defect: a drop is the bus refusing to hand an event \
          out, a lag is a subscriber too slow to take one the bus offered, and \
          the repair for the second is on the reader, not on the bus. Written \
-         because every `Lagged` arm in the platform already computes the count \
-         -- `RecvError::Lagged(n)` hands it over -- and then has nowhere to read \
+         because every `Lagged` arm in the platform already computed the count \
+         -- `RecvError::Lagged(n)` hands it over -- and then had nowhere to read \
          it, so a subscriber that was silently shedding events looked exactly \
          like one that had nothing to do. Read it per `consumer`: two consumers \
          falling behind are two incidents with two owners, and the sum names \
@@ -816,7 +816,27 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          on every wake, so `min_over_time(..._loop_tick_age_seconds{loop=...}[W])` \
          low says the loop woke and a rising lag beside it says it woke and could \
          not keep up -- idle and stuck are then two different readings instead of \
-         one.",
+         one. Zero here is not the same as healthy: it is also what a consumer \
+         that never wakes publishes, which is why the throughput counter beside \
+         it is the half that says whether anything was taken at all.",
+    ),
+    (
+        crate::metric_names::EVENT_BUS_CONSUMED_TOTAL.as_str(),
+        "Events a broadcast subscriber took off its channel, labelled by \
+         `consumer`, one increment per event it handled. The positive side of \
+         the same channel as the dropped and lagged counters, and the only one \
+         of the three that a stopped consumer has to stop writing: zero lag is \
+         what a subscriber that is keeping up publishes and also what a \
+         subscriber that never wakes publishes, and the loop age gauge cannot \
+         separate them for an event-driven loop, whose age is the process's age. \
+         Read it per `consumer`; the throughput of one says nothing about \
+         another. A reader comparing an interval with no takings against a \
+         sibling the same interval needs to know what the channel carried, \
+         because an event-driven consumer with nothing to take and one that is \
+         gone write the same flat line -- so the two are told apart by their \
+         producer, not by this series alone. It is registered as a debt: no \
+         alert rule or panel reads it yet, and the entry in the reader census \
+         says so.",
     ),
     (
         crate::metric_names::TOOL_OUTPUT_FETCH_BUDGET_EXHAUSTED_TOTAL.as_str(),

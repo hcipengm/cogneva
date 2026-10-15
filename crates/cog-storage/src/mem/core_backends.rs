@@ -1265,6 +1265,11 @@ pub struct MemoryObservabilityGateway {
     squads: RwLock<HashMap<String, SquadState>>,
     event_tx: broadcast::Sender<AgentEvent>,
     event_channel_capacity: usize,
+    /// 订阅流落后广播时，丢掉的条数写到哪里。字段名带 `_backend` 是为了跟上面的
+    /// `metrics`（这个是**任务指标表**，不是平台指标后端）分开——两者同名过，
+    /// 而它们一个存任务读数、一个写平台指标面，混起来正好是最难发现的那种错。
+    /// 见 [`crate::consumer_lag::record_consumer_lag`]。
+    metrics_backend: Option<Arc<dyn cog_core::MetricsBackend>>,
 }
 
 impl MemoryObservabilityGateway {
@@ -1279,7 +1284,17 @@ impl MemoryObservabilityGateway {
             squads: RwLock::new(HashMap::new()),
             event_tx,
             event_channel_capacity: 256,
+            metrics_backend: None,
         }
+    }
+
+    /// 接上指标面。缺席是正常的（嵌入式运行没有后端），不是错误。
+    pub fn with_metrics_backend(
+        mut self,
+        metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
+    ) -> Self {
+        self.metrics_backend = metrics;
+        self
     }
 
     pub fn with_event_channel_capacity(mut self, capacity: usize) -> Self {
@@ -1330,19 +1345,26 @@ impl ObservabilityGateway for MemoryObservabilityGateway {
         filter: EventFilter,
     ) -> SFResult<cog_core::observability::AgentEventStream> {
         let rx = self.event_tx.subscribe();
-        let stream = futures::stream::unfold((rx, filter), |(mut rx, filter)| async move {
-            loop {
-                match rx.recv().await {
-                    Ok(event) => {
-                        if crate::event_filter::event_matches(&filter, &event) {
-                            return Some((Ok(event), (rx, filter)));
+        // 随闭包一起走的一份句柄：返回的流是 `'static` 的，借不到 `self`。
+        let lag_metrics = self.metrics_backend.clone();
+        let stream = futures::stream::unfold(
+            (rx, filter, lag_metrics),
+            |(mut rx, filter, metrics)| async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(event) => {
+                            if crate::event_filter::event_matches(&filter, &event) {
+                                return Some((Ok(event), (rx, filter, metrics)));
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return None,
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            crate::consumer_lag::record_consumer_lag(&metrics, skipped).await;
                         }
                     }
-                    Err(broadcast::error::RecvError::Closed) => return None,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 }
-            }
-        });
+            },
+        );
         Ok(Box::pin(stream))
     }
 

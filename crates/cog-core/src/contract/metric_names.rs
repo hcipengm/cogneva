@@ -985,13 +985,43 @@ metric_names! {
     // doctrine (`max by (cause)`, never a bare sum) transfers with only the axis
     // renamed.
     //
-    // At the time this was introduced only the gateway's three consumers emit it
-    // (the collaboration listener, the supervisor event cache, and the evolution
-    // stream). The rest of the platform's `Lagged` arms still compute the count
-    // and hand it to a `warn!` with nowhere to read it; each is named in the
-    // memory this family came from. A reader must treat an absent `consumer` as
-    // "that consumer does not publish yet", not as "it never fell behind".
+    // At the time this was introduced only the gateway's three consumers emitted
+    // it (the collaboration listener, the supervisor event cache, and the
+    // evolution stream) while the rest of the platform's `Lagged` arms computed
+    // the count and handed it to a `warn!` with nowhere to read it. Every
+    // production arm that has a metrics backend now carries it, and two of the
+    // arms that had none were `while let Ok(..)` loops that read a lag as "the
+    // channel closed" and exited -- a consumer that swallowed its own death.
+    // A reader must still treat an absent `consumer` as "that consumer does not
+    // publish yet", not as "it never fell behind", because that is how a
+    // consumer in a crate with no metrics backend reads.
     EVENT_BUS_LAGGED_TOTAL => "cogneva_event_bus_lagged_total",
+
+    // The same channel's other direction: what a subscriber actually took. Sits
+    // beside the two loss counters because the three are one question -- the bus
+    // offered, the reader took, and these are the two ways the offer failed to
+    // become work done.
+    //
+    // A loss counter cannot answer "is this consumer alive". Zero lag is what a
+    // consumer that is keeping up publishes *and* what a consumer that never
+    // wakes publishes, and the loop's own age gauge does not separate them
+    // either: for an event-driven loop the age is the process's age, so a
+    // consumer that stopped is covered by no reading at all. This is the reading
+    // that a stopped consumer has to fail to write.
+    //
+    // Labelled by `consumer`, the same axis as the lag beside it, so the two
+    // divide: a rate of losses over a rate of takings is what "it is behind"
+    // means, and neither series says it alone.
+    //
+    // Deliberately not wired to every consumer that emits the lag counter. This
+    // one is incremented per event taken, and a store write is two statements,
+    // so a consumer whose channel carries heartbeats or hook events would pay a
+    // database round trip per event -- a reading that slows down the loop it
+    // measures. It is wired where the channel is a task or a decision, and
+    // adding a consumer to it means arguing the rate first. Absent means "this
+    // consumer does not publish its throughput", the same reading as an absent
+    // `consumer` on the lag counter.
+    EVENT_BUS_CONSUMED_TOTAL => "cogneva_event_bus_consumed_total",
 
     // cog-agent — what happened to a tool output too large for the context.
     //

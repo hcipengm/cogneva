@@ -17,6 +17,7 @@ pub mod alert_store;
 pub mod autonomous;
 pub mod behavior_monitor;
 pub mod binary_switcher;
+pub mod consumer_lag;
 pub mod control_plane;
 pub mod error;
 pub mod event_aggregator;

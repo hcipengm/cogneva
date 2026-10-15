@@ -23,6 +23,7 @@ pub use qdrant::QdrantVectorBackend;
 pub mod agent_id;
 pub mod audit_stream;
 pub mod backends;
+pub(crate) mod consumer_lag;
 pub mod dlq;
 pub mod etcd;
 pub mod event_filter;

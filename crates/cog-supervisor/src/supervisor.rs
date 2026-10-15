@@ -483,6 +483,17 @@ impl Supervisor {
     /// Drive a single event-aggregation pass.
     pub async fn run_event_pass(&self) -> SupervisorResult<()> {
         let stats = self.aggregator.drain(1024).await?;
+        // 每一轮 `drain` 自立一份 stats，所以这里的数就是**这一轮**丢掉的条数，
+        // 累加进计数器正是「每丢掉一条加一」的语义。放在这里而不是 `drain` 里面，
+        // 是因为聚合器自己不带后端，而调它的这一层（supervisor）带。
+        if stats.dropped > 0 {
+            crate::consumer_lag::record_consumer_lag(
+                &self.metrics,
+                crate::consumer_lag::LAG_CONSUMER_SUPERVISOR_EVENT_AGGREGATOR,
+                stats.dropped,
+            )
+            .await;
+        }
         if let Some(event) = EventAggregator::build_supervisor_event(
             &stats,
             self.config
@@ -552,8 +563,9 @@ impl Supervisor {
         let _autonomous_handle = tokio::spawn({
             let collaborator = Arc::clone(&self.autonomous);
             let rx = self.agent_event_rx.resubscribe();
+            let lag_metrics = self.metrics.clone();
             async move {
-                crate::autonomous::run_autonomous_event_loop(collaborator, rx).await;
+                crate::autonomous::run_autonomous_event_loop(collaborator, rx, lag_metrics).await;
             }
         });
 

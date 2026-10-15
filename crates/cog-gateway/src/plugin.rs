@@ -350,6 +350,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
                         hook_engine.clone(),
                         (*event_tx).clone(),
                         Some(publisher),
+                        ctx.consume_service::<dyn cog_core::MetricsBackend>(),
                     );
                 }
             }

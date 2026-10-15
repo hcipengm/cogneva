@@ -96,7 +96,19 @@ pub fn spawn_collaboration_listener(
                             biased;
                             _ = shutdown.wait() => return,
                             recv = task_event_rx.recv() => match recv {
-                                Ok(event) => match event {
+                                Ok(event) => {
+                                    // Counted for every event taken, before the
+                                    // handler: a completion whose task has no
+                                    // dependents is work taken that leaves no link
+                                    // behind, so the link count alone would read
+                                    // this loop as idle while it is working.
+                                    crate::record_consumer_consumed(
+                                        &state.metrics_backend,
+                                        crate::LAG_CONSUMER_COLLABORATION_LISTENER,
+                                        1,
+                                    )
+                                    .await;
+                                    match event {
                                     cog_core::TaskEvent::TaskCompleted { task_id, timestamp, .. } => {
                                         let dependents: Vec<String> = {
                                             state.orchestrator.get_dependents(&task_id).await
@@ -128,7 +140,8 @@ pub fn spawn_collaboration_listener(
                                         }).await;
                                     }
                                     _ => {}
-                                },
+                                    }
+                                }
                                 // 落后说明这个消费者没跟上，不是它坏了：丢掉的几环补不回来，
                                 // 继续消费即可。让它静默卡在一条永不就绪的分支上，才是把
                                 // 「循环还在但事件丢了」变成看不出来的那种做法。

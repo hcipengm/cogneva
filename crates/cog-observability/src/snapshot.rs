@@ -89,11 +89,57 @@ impl Default for TraceSerializer {
 /// `S3TraceStore`, `MemoryTraceStore`).
 pub struct TraceCollector {
     trace_store: std::sync::Arc<dyn cog_core::TraceStore>,
+    /// 采集任务落后广播时把丢掉的条数写到哪里。缺席时那一格只剩日志行，见
+    /// [`Self::record_consumer_lag`]。
+    metrics: Option<std::sync::Arc<dyn cog_core::MetricsBackend>>,
 }
+
+/// `consumer` 标签值，写在 [`cog_core::metric_names::EVENT_BUS_LAGGED_TOTAL`] 上。
+/// 它读的是 `AgentEvent` 那条广播，名字点是这个采集任务而不是整层可观测性。
+pub const LAG_CONSUMER_TRACE_COLLECTOR: &str = "trace_collector";
 
 impl TraceCollector {
     pub fn new(trace_store: std::sync::Arc<dyn cog_core::TraceStore>) -> Self {
-        Self { trace_store }
+        Self {
+            trace_store,
+            metrics: None,
+        }
+    }
+
+    /// 接上指标面。缺席是正常的（嵌入式运行没有后端），不是错误。
+    pub fn with_metrics(
+        mut self,
+        metrics: Option<std::sync::Arc<dyn cog_core::MetricsBackend>>,
+    ) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// 记下采集任务落后广播、丢掉 `skipped` 条事件这件事。
+    ///
+    /// 采集任务是 `Cadence::EventDriven`：它没有周期，所以 `loop_tick_age_seconds`
+    /// 量到的是「上次醒来距今多久」，空转与卡住同形。落后计数是那一对读数里
+    /// 「醒过并丢了行」的半个——没有它，一个长期落后却还在转的采集任务，在
+    /// 读数面上与一个没事干的完全一样。
+    async fn record_consumer_lag(&self, skipped: u64) {
+        let Some(metrics) = self.metrics.as_ref() else {
+            return;
+        };
+        let mut labels = std::collections::HashMap::new();
+        labels.insert(
+            "consumer".to_string(),
+            LAG_CONSUMER_TRACE_COLLECTOR.to_string(),
+        );
+        if let Err(e) = metrics
+            .record_counter(
+                cog_core::metric_names::EVENT_BUS_LAGGED_TOTAL,
+                skipped as f64,
+                labels,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "trace collector: could not record the events it missed");
+        }
     }
 
     /// Collect and persist an execution trace.
@@ -349,6 +395,9 @@ impl TraceCollector {
                                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                     tracing::warn!("Trace collector lagged by {} events", n);
+                                    // 日志随 Pod 换代消失，计数器留着：这是
+                                    // 「这个环醒过并丢了行」那半条读数。
+                                    this.record_consumer_lag(n).await;
                                 }
                             }
                         }
@@ -943,6 +992,7 @@ mod tests {
         let store = Arc::new(MemTraceStore::default());
         let collector = Arc::new(TraceCollector {
             trace_store: store.clone(),
+            metrics: None,
         });
         let (tx, rx) = tokio::sync::broadcast::channel(64);
         let shutdown = cog_core::ShutdownSignal::new();
@@ -982,6 +1032,7 @@ mod tests {
         let store = Arc::new(MemTraceStore::default());
         let collector = Arc::new(TraceCollector {
             trace_store: store.clone(),
+            metrics: None,
         });
         let (tx, rx) = tokio::sync::broadcast::channel(64);
         let shutdown = cog_core::ShutdownSignal::new();

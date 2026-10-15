@@ -48,7 +48,18 @@ impl AlertStore {
 
     /// Subscribe to a SupervisorEvent broadcast channel and persist alert-worthy events.
     pub async fn run(&self, mut rx: broadcast::Receiver<SupervisorEvent>) {
-        while let Ok(event) = rx.recv().await {
+        // `Lagged` 也是一个 `Err`：把它与 `Closed` 一起读成「订阅结束」，这条环就
+        // 会在一次普通背压之后静静退出，而告警从此不再落库——从外面看与「这段时间
+        // 没有值得告警的事」一模一样。丢几条与不再订阅是两种故障，分开写。
+        loop {
+            let event = match rx.recv().await {
+                Ok(event) => event,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "alert store fell behind; it keeps consuming");
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            };
             if let Some(alert) = Self::event_to_alert(&event) {
                 let mut alerts = self.alerts.lock().unwrap();
                 alerts.push_back(alert);

@@ -13,11 +13,29 @@ impl HookToWsForwarder {
         hook_engine: Arc<dyn cog_core::HookEngine>,
         event_tx: tokio::sync::broadcast::Sender<cog_core::AgentEvent>,
         event_publisher: Option<Arc<dyn cog_core::EventPublisher>>,
+        metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
     ) -> JoinHandle<()> {
         let mut rx = hook_engine.subscribe();
 
         tokio::spawn(async move {
-            while let Ok(hook_event) = rx.recv().await {
+            // 三种结局分开写：`Lagged` 也是一个 `Err`，`while let Ok(..)` 会把广播
+            // 里一次普通的背压读成「通道关了」，于是这条转发**静静退出**——钩子事件
+            // 从此不再进 WebSocket，与「没有钩子触发」在读数面上同形。
+            loop {
+                let hook_event = match rx.recv().await {
+                    Ok(hook_event) => hook_event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "hook forwarder fell behind; it keeps forwarding");
+                        crate::record_consumer_lag(
+                            &metrics,
+                            crate::LAG_CONSUMER_HOOK_FORWARDER,
+                            skipped,
+                        )
+                        .await;
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
                 let event = cog_core::AgentEvent::TaskStatusChange {
                     task_id: hook_event
                         .task_id

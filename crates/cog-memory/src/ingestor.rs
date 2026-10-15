@@ -669,6 +669,10 @@ impl SharedReading {
     }
 }
 
+/// `consumer` 标签值，写在 [`cog_core::metric_names::EVENT_BUS_LAGGED_TOTAL`]
+/// 上。它命名的是**订阅这条广播的那个环**（人查它时按这个名字找），不是它读的通道。
+pub const LAG_CONSUMER_MEMORY_INGESTOR: &str = "memory_ingestor";
+
 /// Background service that listens to the AgentEvent broadcast stream and
 /// automatically archives + extracts memories when conversations end.
 /// Spawn this with [`MemoryIngestor::spawn`] and drop the returned handle
@@ -718,6 +722,33 @@ impl MemoryIngestor {
         ));
         self.config = config;
         self
+    }
+
+    /// 记下订阅循环落后广播、丢掉 `skipped` 条事件这件事。
+    ///
+    /// `RecvError::Lagged(n)` 本来就把条数交出来了，缺的只是把它送到一个地方去；
+    /// `warn!` 只把数写进日志，而日志寿命＝Pod 寿命，于是「这个环曾经跟不上」在
+    /// 下一条日志盖上来之后就再也问不出来了。没有后端不是错误（嵌入式运行没有），
+    /// 写失败只 `warn!`：事件已经丢了，为了记账把它升级成失败只会换来更大的损失。
+    async fn record_consumer_lag(&self, skipped: u64) {
+        let Some(metrics) = self.metrics.as_ref() else {
+            return;
+        };
+        let mut labels = HashMap::new();
+        labels.insert(
+            "consumer".to_string(),
+            LAG_CONSUMER_MEMORY_INGESTOR.to_string(),
+        );
+        if let Err(e) = metrics
+            .record_counter(
+                cog_core::metric_names::EVENT_BUS_LAGGED_TOTAL,
+                skipped as f64,
+                labels,
+            )
+            .await
+        {
+            warn!("Failed to record the events the ingestor missed: {}", e);
+        }
     }
 
     /// 接线池状态快照来源。缺席时闸门退化为纯本地判据——上游断供仍然会被
@@ -785,6 +816,11 @@ impl MemoryIngestor {
                                 // 说明上游事件速率高过单条 select 的分发能力，
                                 // 必须响亮可见。
                                 warn!("MemoryIngestor lagged, skipped {} events", n);
+                                // 日志会老化，计数器不会：这是「这个环醒过并丢了行」
+                                // 那半条读数。这个订阅环没有登记进 loop_health，
+                                // 所以它连一条 `cogneva_loop_*` 序列都没有——在它
+                                // 之前，这个环要是停了，读数面上什么都没有。
+                                inner.record_consumer_lag(n).await;
                             }
                             Err(broadcast::error::RecvError::Closed) => {
                                 info!("AgentEvent broadcast closed; MemoryIngestor stopping");

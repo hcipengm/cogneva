@@ -95,6 +95,7 @@ pub type ChatSessionStore = Arc<
 pub(crate) const LAG_CONSUMER_COLLABORATION_LISTENER: &str = "collaboration_listener";
 pub(crate) const LAG_CONSUMER_EVOLUTION_STREAM: &str = "evolution_stream";
 pub(crate) const LAG_CONSUMER_SUPERVISOR_EVENT_CACHE: &str = "supervisor_event_cache";
+pub(crate) const LAG_CONSUMER_HOOK_FORWARDER: &str = "hook_forwarder";
 
 /// Record that a broadcast subscriber fell behind and lost `skipped` events.
 ///
@@ -122,6 +123,40 @@ pub(crate) async fn record_consumer_lag(
         .await
     {
         tracing::warn!(error = %e, consumer, "could not record the events this consumer missed");
+    }
+}
+
+/// Record that a broadcast subscriber took `taken` events off its channel.
+///
+/// The positive side of the counter [`record_consumer_lag`] writes: a consumer
+/// that is gone stops incrementing this one, which is the only way a reader can
+/// tell it from one that is keeping up, since not falling behind and not waking
+/// both leave the lag counter flat. The same `consumer` label value as the lag,
+/// so the two are read as a pair.
+///
+/// It is called per event rather than per pass, so it is only wired where the
+/// channel carries tasks or decisions. A channel carrying heartbeats or hook
+/// events would pay a store round trip for every one of them, which is a reading
+/// that slows down the loop it measures.
+pub(crate) async fn record_consumer_consumed(
+    metrics: &Option<Arc<dyn cog_core::MetricsBackend>>,
+    consumer: &str,
+    taken: u64,
+) {
+    let Some(backend) = metrics.as_ref() else {
+        return;
+    };
+    let mut labels = std::collections::HashMap::new();
+    labels.insert("consumer".to_string(), consumer.to_string());
+    if let Err(e) = backend
+        .record_counter(
+            cog_core::metric_names::EVENT_BUS_CONSUMED_TOTAL,
+            taken as f64,
+            labels,
+        )
+        .await
+    {
+        tracing::warn!(error = %e, consumer, "could not record the events this consumer took");
     }
 }
 

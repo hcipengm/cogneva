@@ -269,7 +269,10 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         info!("ObservabilityPlugin trace store consumed");
 
         // ── Trace collector & replay engine ──
-        let trace_collector = Arc::new(crate::snapshot::TraceCollector::new(trace_store.clone()));
+        let trace_collector = Arc::new(
+            crate::snapshot::TraceCollector::new(trace_store.clone())
+                .with_metrics(ctx.consume_service::<dyn cog_core::MetricsBackend>()),
+        );
         let replay_engine: Arc<dyn cog_core::ReplayEngine> =
             Arc::new(crate::snapshot::ReplayEngine::new(trace_store.clone()));
         ctx.publish(trace_collector.clone());
@@ -564,6 +567,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                         http_client,
                         alert_store,
                         &supervisor,
+                        ctx.consume_service::<dyn cog_core::MetricsBackend>(),
                     );
                     // Report both outlets, not just the HTTP ones. With no
                     // outlet wired the bridge still runs and still persists, so
@@ -958,18 +962,50 @@ fn alert_manager(
 /// and feed both outlets — every configured alert channel and the persistent
 /// state machine (PostgreSQL `alerts` table). One mapping result drives both,
 /// so what the notification says and what is stored agree.
+/// `consumer` 标签值，写在 [`cog_core::metric_names::EVENT_BUS_LAGGED_TOTAL`] 上。
+const LAG_CONSUMER_ALERT_BRIDGE: &str = "alert_bridge";
+
 fn spawn_alert_bridge(
     channels: Vec<AlertChannel>,
     timeout_secs: u64,
     http_client: Option<Arc<dyn cog_core::HttpClient>>,
     store: Option<Arc<PostgresAlertStore>>,
     supervisor: &Arc<dyn cog_core::Supervisor>,
+    metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
 ) -> Option<Arc<crate::alerts::AlertManager>> {
     let manager = alert_manager(Vec::new(), &channels, timeout_secs, http_client);
     let mut alert_rx = supervisor.subscribe();
     let manager_for_task = manager.clone();
     tokio::spawn(async move {
-        while let Ok(event) = alert_rx.recv().await {
+        // 三种结局分开写：`Lagged` 也是一个 `Err`，`while let Ok(..)` 会把它读成
+        // 「订阅结束」，于是这条桥静静退出——告警**从此不再落库**，而数据库里那张
+        // 表看起来与「这段时间没有告警」一模一样。这条桥没有别的存活读数。
+        loop {
+            let event = match alert_rx.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "alert bridge fell behind; it keeps consuming");
+                    if let Some(backend) = metrics.as_ref() {
+                        let mut labels = std::collections::HashMap::new();
+                        labels.insert(
+                            "consumer".to_string(),
+                            LAG_CONSUMER_ALERT_BRIDGE.to_string(),
+                        );
+                        if let Err(e) = backend
+                            .record_counter(
+                                cog_core::metric_names::EVENT_BUS_LAGGED_TOTAL,
+                                skipped as f64,
+                                labels,
+                            )
+                            .await
+                        {
+                            tracing::warn!(error = %e, "alert bridge: could not record the events it missed");
+                        }
+                    }
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
             let alerts = supervisor_event_to_alert_events(&event);
             if alerts.is_empty() {
                 continue;

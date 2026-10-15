@@ -103,9 +103,19 @@ pub struct PostgresObservabilityGateway {
     /// `None` — the census lives on the task-state surface, and this gateway
     /// has no way to answer it alone.
     state_backend: Option<Arc<dyn cog_core::StateBackend>>,
+    /// 订阅流落后广播时，丢掉的条数写到哪里。见
+    /// [`crate::consumer_lag::record_consumer_lag`]：缺席时那一格只剩订阅方看见的
+    /// **少了的事件**，没有任何地方记着「它漏了几条」。
+    metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
 }
 
 impl PostgresObservabilityGateway {
+    /// 接上指标面。缺席是正常的（嵌入式运行没有后端），不是错误。
+    pub fn with_metrics(mut self, metrics: Option<Arc<dyn cog_core::MetricsBackend>>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
     pub fn new(pool: PgPool) -> Self {
         let (event_tx, _event_rx) = broadcast::channel(256);
         Self {
@@ -113,6 +123,7 @@ impl PostgresObservabilityGateway {
             event_tx,
             event_channel_capacity: 256,
             state_backend: None,
+            metrics: None,
         }
     }
 
@@ -351,22 +362,30 @@ impl ObservabilityGateway for PostgresObservabilityGateway {
     ) -> SFResult<cog_core::observability::AgentEventStream> {
         let historical = self.query_historical_events(&filter).await?;
         let rx = self.event_tx.subscribe();
+        // 随闭包一起走的一份句柄：返回的流是 `'static` 的，借不到 `self`。
+        let lag_metrics = self.metrics.clone();
 
-        let stream = futures::stream::iter(historical.into_iter().map(Ok)).chain(
-            futures::stream::unfold((rx, filter), |(mut rx, filter)| async move {
-                loop {
-                    match rx.recv().await {
-                        Ok(event) => {
-                            if crate::event_filter::event_matches(&filter, &event) {
-                                return Some((Ok(event), (rx, filter)));
+        let stream =
+            futures::stream::iter(historical.into_iter().map(Ok)).chain(futures::stream::unfold(
+                (rx, filter, lag_metrics),
+                |(mut rx, filter, metrics)| async move {
+                    loop {
+                        match rx.recv().await {
+                            Ok(event) => {
+                                if crate::event_filter::event_matches(&filter, &event) {
+                                    return Some((Ok(event), (rx, filter, metrics)));
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Closed) => return None,
+                            // 落后不是坏掉：丢掉的几环补不回来，继续消费即可。但「漏了
+                            // 几条」要有人记着——订阅方只看得见少掉的事件。
+                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                crate::consumer_lag::record_consumer_lag(&metrics, skipped).await;
                             }
                         }
-                        Err(broadcast::error::RecvError::Closed) => return None,
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     }
-                }
-            }),
-        );
+                },
+            ));
 
         Ok(Box::pin(stream))
     }

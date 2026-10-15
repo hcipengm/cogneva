@@ -75,7 +75,19 @@ impl EventAggregator {
     /// so the aggregator runs continuously.
     pub async fn next_event(&self) -> Option<AgentEvent> {
         let mut rx = self.receiver.lock().await;
-        rx.recv().await.ok()
+        // `None` 在这里只有一个意思：广播通道关了。若把 `Lagged` 也压成 `None`
+        // （`.recv().await.ok()`），一次普通背压就被读成「流结束」——调用方会
+        // 平静地收摊，而「丢了几条」与「再也不订阅」在返回值上同形。所以背上
+        // 之后重取，只把 `Closed` 报成 `None`。
+        loop {
+            match rx.recv().await {
+                Ok(event) => return Some(event),
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "event aggregator fell behind; it keeps consuming");
+                }
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
     }
 
     /// Convenience publisher used internally to record aggregated stats

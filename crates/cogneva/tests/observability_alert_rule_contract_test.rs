@@ -2527,6 +2527,10 @@ const UNREAD: &[(&str, Unread)] = &[
         "sop_unmapped_role_total",
         Unread::Gap("tasks whose declared `role` named no row in the executor table, by `face`. The role is carried through verbatim and the dispatch path maps it to nothing, so a task can be injected with `is_executable` set and a role no hand answers to -- and that is a fact no other series states, since the injected count beside it is the same whether or not anything can pick the work up. The lookup itself is not missing: the executor table already answers it through its own role-to-skill mapping, and the count is taken against that answer rather than against a table spelled here. What a rule would have to say is which of these are faults, and that turns on a mapping nobody has declared: the roles a face's document uses and the role kinds the executor table registers are two vocabularies with no published correspondence between them, so at the moment this name is minted every role a face declares is unmapped until an operator adds a row for it, and a rule firing on any nonzero would flag the wiring of a new face rather than a fault. The bound is what the actor loop's own entry says is missing -- the population that needs a threshold is the one that took a fallback -- and here the fallback is simply that nobody picks the task up"),
     ),
+    (
+        "cogneva_event_bus_consumed_total",
+        Unread::Gap("what each broadcast subscriber took off its channel, by `consumer`, one increment per event handled. It is the only one of the three counters on this channel that a stopped consumer has to stop writing: the lag counter beside it is written only when a reader falls behind, so a consumer that stopped and a consumer keeping up both leave it flat, and the dropped counter is the publisher's side of the same loss. The consumer it is wired for today is the gateway's collaboration listener, whose channel carries task completions and failures; a reader comparing its rate against the previous interval learns whether the loop is taking anything at all. What a rule would need is the other operand -- how much traffic that channel carried, so that flat takings read as a fault rather than as a quiet hour -- and the platform publishes no counter on these channels' producers, which is the same missing operand the build store's volume entries name. The consumer axis is why this is one entry: the other subscribers of the same broadcast could publish here too, and each would need the same producer-side operand, so a rule over the name would fire on the first subscriber with a quiet channel"),
+    ),
 ];
 
 /// How many `Gap` entries the census left. A new series that no face reads and
@@ -2651,7 +2655,14 @@ const UNREAD: &[(&str, Unread)] = &[
 /// published correspondence to the executor table, once -- and the tick
 /// counter's entry is the one worth reading, since it is the series a reader
 /// would assume a rule already covers.
-const GAPS_AT_CENSUS: usize = 21;
+///
+/// It went to 22 in the pass that gave a consumer's takings a series of their
+/// own. That one is a debt for a reason no bound can close: what makes a
+/// throughput reading actionable is the traffic it should have carried, and the
+/// platform publishes no traffic counter on the channels these consumers read,
+/// so "flat takings" cannot be turned into a rule by picking a threshold. The
+/// entry says which consumer it is wired for and what the missing operand is.
+const GAPS_AT_CENSUS: usize = 22;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {

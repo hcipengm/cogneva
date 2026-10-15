@@ -285,7 +285,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
             }
             Arc::new(crate::MemoryMetricsBackend::new())
         };
-        ctx.publish_service(metrics_backend);
+        ctx.publish_service(metrics_backend.clone());
         info!("StoragePlugin metrics backend published");
 
         // ── CheckpointStore (must happen before explain_pool is moved into ExplainPool) ──
@@ -487,12 +487,17 @@ impl cog_core::SystemPlugin for StoragePlugin {
         info!("StoragePlugin promotion ledger published");
 
         // ── ObservabilityGateway (must happen before explain_pool is moved into ExplainPool) ──
+        //
+        // 网关自己的 `subscribe_events` 只能把事件流交给订阅方，没有第二条通道
+        // 带上「我漏了几条」，所以那一格要后端才写得下——而它就在这个作用域里。
+        let lag_metrics: Option<Arc<dyn cog_core::MetricsBackend>> = Some(metrics_backend.clone());
         let observability_gateway: Arc<dyn cog_core::ObservabilityGateway> = match explain_pool {
             Some(ref pool) => {
                 let gateway = crate::PostgresObservabilityGateway::new(pool.clone())
                     .with_event_channel_capacity(
                         ctx.config().system.observability_event_channel_capacity,
                     )
+                    .with_metrics(lag_metrics.clone())
                     // The overview reports task counts, and the task-state
                     // surface is the thing that has them: hand over the store
                     // this process writes DAG state to, so both the counts and
@@ -511,9 +516,10 @@ impl cog_core::SystemPlugin for StoragePlugin {
                             )));
                         }
                         warn!("PostgresObservabilityGateway init_schema failed: {}. Falling back to memory.", e);
-                        Arc::new(crate::MemoryObservabilityGateway::new(
-                            state_backend.clone(),
-                        ))
+                        Arc::new(
+                            crate::MemoryObservabilityGateway::new(state_backend.clone())
+                                .with_metrics_backend(lag_metrics.clone()),
+                        )
                     }
                 }
             }
@@ -524,9 +530,10 @@ impl cog_core::SystemPlugin for StoragePlugin {
                             .into(),
                     ));
                 }
-                Arc::new(crate::MemoryObservabilityGateway::new(
-                    state_backend.clone(),
-                ))
+                Arc::new(
+                    crate::MemoryObservabilityGateway::new(state_backend.clone())
+                        .with_metrics_backend(lag_metrics.clone()),
+                )
             }
         };
         ctx.publish_service(observability_gateway);

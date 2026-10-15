@@ -56,9 +56,31 @@ pub struct AutonomousCollaborator {
 pub async fn run_autonomous_event_loop(
     collaborator: Arc<AutonomousCollaborator>,
     mut rx: broadcast::Receiver<cog_core::AgentEvent>,
+    metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
 ) {
-    while let Ok(event) = rx.recv().await {
-        collaborator.handle_event(&event).await;
+    // 三种结局要分开写，`while let Ok(..)` 分不开它们：`Lagged` 也是一个 `Err`，
+    // 于是广播里一次普通的背压会被读成「通道关了」，整条循环静静退出——从此不再
+    // 消费任何事件，也没有一行日志。丢几条事件与从此不再消费，是两种量级完全
+    // 不同的故障，而后者当时看起来与「上游没动静」一模一样。
+    loop {
+        match rx.recv().await {
+            Ok(event) => collaborator.handle_event(&event).await,
+            // 落后：丢掉的几环补不回来，接着消费即可。
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(
+                    skipped,
+                    "autonomous event loop fell behind; it keeps consuming"
+                );
+                crate::consumer_lag::record_consumer_lag(
+                    &metrics,
+                    crate::consumer_lag::LAG_CONSUMER_AUTONOMOUS_EVENT_LOOP,
+                    skipped,
+                )
+                .await;
+            }
+            // 生产者没了：再等也等不到事件，这条环的活干完了。
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
     }
 }
 
