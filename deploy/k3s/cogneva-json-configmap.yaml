@@ -864,7 +864,7 @@ data:
                 "greater_than": 0.0
               },
               "severity": "critical",
-              "summary": "Consumer group {consumer_group} of stream {stream} has had no answer from the message bus for {value}s — more than twelve read periods. A consumer with nothing to deliver is still answered every block, so this one is failing rather than idle: it is retrying with backoff and everything fed by that stream has stopped moving, while the process stays up and its health checks stay green. The count of refused reads is in cogneva_stream_read_failures_total, and the period this was measured against in cogneva_stream_read_block_seconds"
+              "summary": "Consumer group {consumer_group} of stream {stream} has had no answer from the message bus for {value}s — more than twelve read periods. A consumer with nothing to deliver is still answered every block, so this one is failing rather than idle: it is retrying with backoff and everything fed by that stream has stopped moving, while the process stays up and its health checks stay green. Which cause it is retrying through is in cogneva_stream_read_failures_total under the reason label, and how many read loops stand behind this name is in cogneva_stream_read_loops — read the three together, because the pooled refusal count is a scar that stays where it landed until the pod is replaced, so neither its value nor its rate admits a threshold of its own. The period this was measured against is in cogneva_stream_read_block_seconds"
             },
             {
               "name": "runtime_asset_manifest_unusable",
