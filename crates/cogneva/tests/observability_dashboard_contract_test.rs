@@ -10,6 +10,9 @@
 //! The table below states the contract for the series this workspace produces.
 //! Series from outside it (cAdvisor's `container_*`) are not covered: their
 //! label sets belong to the kubelet, not to this repository.
+//!
+//! principle: feedback_a_gate_keyed_on_the_artifacts_purpose_needs_a_fail_closed_type_table
+//! principle: feedback_a_judge_reading_only_its_own_green_corpus_cannot_be_shown_to_red
 
 use std::collections::BTreeSet;
 
@@ -23,9 +26,11 @@ mod promql;
 #[path = "common/dashboard.rs"]
 mod dashboard;
 
-use dashboard::{is_log_query, json_field, metric_exprs, repo_root, text as dashboard_text};
+use dashboard::{
+    is_log_query, json_field, metric_exprs, repo_root, text as dashboard_text, PanelExpr,
+};
 use producer::carries_the_producer;
-use promql::{metric_names_in, shape_complaints};
+use promql::{metric_names_in, shape_complaints, uses_an_aggregation, AGGREGATIONS};
 
 /// Series this workspace produces: the labels each one carries, and the file
 /// that publishes it.
@@ -663,8 +668,8 @@ fn every_series_the_dashboard_reads_is_one_something_produces() {
     let foreign: BTreeSet<&str> = FOREIGN.iter().map(|(n, _)| *n).collect();
 
     let mut unknown: BTreeSet<String> = BTreeSet::new();
-    for (_, expr) in metric_exprs(&text) {
-        for name in metric_names_in(&expr) {
+    for panel in metric_exprs(&text) {
+        for name in metric_names_in(&panel.expr) {
             if produced.contains(name.as_str())
                 || foreign.contains(name.as_str())
                 // A classic histogram is exposed as three series derived from the
@@ -706,9 +711,12 @@ fn every_series_the_dashboard_reads_is_one_something_produces() {
 #[test]
 fn no_panel_expression_has_a_known_unparseable_shape() {
     let mut complaints: Vec<String> = Vec::new();
-    for (line, expr) in metric_exprs(&dashboard_text()) {
-        for complaint in shape_complaints(&expr) {
-            complaints.push(format!("第 {line} 行: {complaint}\n    {expr}"));
+    for panel in metric_exprs(&dashboard_text()) {
+        for complaint in shape_complaints(&panel.expr) {
+            complaints.push(format!(
+                "第 {} 行: {complaint}\n    {}",
+                panel.line, panel.expr
+            ));
         }
     }
 
@@ -717,6 +725,92 @@ fn no_panel_expression_has_a_known_unparseable_shape() {
         "面板表达式含一种已知的、Prometheus 一定拒绝的形状，面板会一直是空的:\n{}",
         complaints.join("\n")
     );
+}
+
+/// Panels whose whole use is to show one number, and panels whose use is to
+/// show one line per series. Named, both of them, because which list a panel
+/// kind belongs in is the judgement the check below rests on, and a table that
+/// silently covers a kind it was never told about would be a check that reads
+/// a new panel as though it had been decided.
+const SINGLE_VALUE_PANELS: &[&str] = &["stat", "singlestat", "gauge", "bargauge", "piechart"];
+const PER_SERIES_PANELS: &[&str] = &["timeseries", "logs", "table", "heatmap"];
+
+/// A single-value panel handed an expression over a metric with more than one
+/// series shows one series and hides the rest: `sum(ALERTS{...})` and
+/// `ALERTS{...}` render the same 44-pixel box, and only the first says
+/// "how many alerts are firing". The second says "18" because 18 happens to be
+/// one of the pods, and the panel has no way to look wrong.
+///
+/// The check is over the panel's kind, not over an expression: whether
+/// several series are meant to be compared is a question only the panel answers,
+/// and 50 of the 84 expressions here are right to have no aggregation.
+#[test]
+fn every_single_value_panel_collapses_the_series_it_reads() {
+    let panels = metric_exprs(&dashboard_text());
+    assert!(
+        !panels.is_empty(),
+        "一条表达式都没读到：门禁会空转，先查抽取器对这个文件还看不看得懂"
+    );
+
+    let complaints = single_value_complaints(&panels);
+    assert!(
+        complaints.is_empty(),
+        "单值面板与被比较的序列对不上（聚合算子：{}）:\n{}",
+        AGGREGATIONS.join("`/`"),
+        complaints.join("\n")
+    );
+}
+
+/// The complaints the check above raises, over panels handed in rather than
+/// read.
+///
+/// Split out because the file this repository has cannot show the check
+/// working: every one of its panels is right, so a version of the check that
+/// reds on nothing -- or a predicate that answers `true` to everything -- reads
+/// exactly the same. The test below feeds it the shapes it exists to catch.
+fn single_value_complaints(panels: &[PanelExpr]) -> Vec<String> {
+    let mut complaints: Vec<String> = Vec::new();
+    for panel in panels {
+        let kind = panel.panel_type.as_str();
+        if SINGLE_VALUE_PANELS.contains(&kind) {
+            if !uses_an_aggregation(&panel.expr) {
+                complaints.push(format!(
+                    "第 {} 行: 面板类型 `{kind}` 只显示一个值，而这条表达式没有聚合算子 —— \
+                     一个序列一个值，面板会显示其中一条、其余看不见\n    {}",
+                    panel.line, panel.expr
+                ));
+            }
+        } else if !PER_SERIES_PANELS.contains(&kind) {
+            complaints.push(format!(
+                "第 {} 行: 面板类型 `{kind:?}` 不在任何一栏里 —— 要么它整块是一个值\
+                 （加进 SINGLE_VALUE_PANELS 并给出聚合），要么它一条线一个序列\
+                 （加进 PER_SERIES_PANELS 具名豁免）\n    {}",
+                panel.line, panel.expr
+            ));
+        }
+    }
+    complaints
+}
+
+/// The three ways this check can be satisfied wrongly, and the one way it can
+/// be refused wrongly.
+#[test]
+fn a_single_value_panel_that_does_not_collapse_its_series_is_reported() {
+    let panel = |kind: &str, expr: &str| PanelExpr {
+        line: 7,
+        panel_type: kind.to_string(),
+        expr: expr.to_string(),
+    };
+    let reported = |kind: &str, expr: &str| single_value_complaints(&[panel(kind, expr)]).len();
+
+    // 该红的三种：单值面板没有聚合算子；面板类型没归栏（含抽取器没读到 `type`）；
+    // 名字像单值但不在表里的新面板类型。
+    assert_eq!(reported("stat", "ALERTS{alertstate=\"firing\"}"), 1);
+    assert_eq!(reported("", "sum(x)"), 1);
+    assert_eq!(reported("piechart2", "sum(x)"), 1);
+    // 不该红的两种：带从句的聚合是聚合；多序列面板本来就不欠聚合。
+    assert_eq!(reported("stat", "sum by (pod) (rate(x_total[5m]))"), 0);
+    assert_eq!(reported("timeseries", "rate(x_total[5m])"), 0);
 }
 
 /// The other half of the same claim, and the half no other check can make: the

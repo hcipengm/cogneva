@@ -244,8 +244,13 @@ const BINARY_OPERATORS: &[&str] = &[
     "unless", "atan2",
 ];
 
-/// Aggregations, i.e. the words a `by`/`without` clause may follow.
-const AGGREGATIONS: &[&str] = &[
+/// Aggregations, i.e. the words a `by`/`without` clause may follow, and the
+/// words that turn several series into one reading.
+///
+/// Published because the dashboard contract asks the second question of it
+/// (a panel showing one number owes an aggregation), and a second list of the
+/// same operators would answer that question differently from this one.
+pub const AGGREGATIONS: &[&str] = &[
     "sum",
     "avg",
     "min",
@@ -261,6 +266,46 @@ const AGGREGATIONS: &[&str] = &[
     "limitk",
     "limit_ratio",
 ];
+
+/// Whether the expression applies an aggregation.
+///
+/// A panel that shows one number draws one series: hand it an expression over
+/// a metric with three series and it shows three lines in a box the size of
+/// one, or the last one, depending on the renderer — never the reading the
+/// panel was written for. The operator that collapses them is the difference,
+/// so this asks whether one of [`AGGREGATIONS`] is *applied*.
+///
+/// Applies, not appears: `label_replace(sum, ...)` names a label `sum`, and a
+/// word followed by anything other than `(` or its clause is one. Both
+/// spellings of the operation count — `sum(x)` and `sum by (k) (x)` — because
+/// the clause says which labels survive, not whether the aggregation happens.
+pub fn uses_an_aggregation(expr: &str) -> bool {
+    // Neither a quoted label value nor a `{...}` matcher can hold an operator.
+    let s = strip_braces(&strip_quoted(expr));
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !token_char(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && token_char(bytes[i]) {
+            i += 1;
+        }
+        if !AGGREGATIONS.contains(&&s[start..i]) {
+            continue;
+        }
+        if s[i..]
+            .chars()
+            .next()
+            .is_some_and(|c| c == '(' || c.is_whitespace())
+        {
+            return true;
+        }
+    }
+    false
+}
 
 /// Which kind of unit a clause keyword is: one that selects the labels a binary
 /// operation matches on, or one that selects the labels an aggregation keeps.
@@ -2045,5 +2090,47 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["x_total"]
         );
+    }
+
+    /// The two lists are read by different questions and neither is derived
+    /// from the other, so they can only drift silently: an operator missing
+    /// from `NOT_SERIES` is invented as a series name, and one missing from
+    /// `AGGREGATIONS` is an operator the single-value-panel check cannot see.
+    #[test]
+    fn every_aggregation_is_a_word_that_names_no_series() {
+        for op in AGGREGATIONS {
+            assert!(
+                NOT_SERIES.contains(op),
+                "`{op}` 是聚合算子却在 NOT_SERIES 之外，它会被当成序列名读出来"
+            );
+        }
+    }
+
+    /// Both directions, because either one alone is a gate that can be
+    /// satisfied by a wrong reading: dropping the appliedness test would count
+    /// a label called `sum`, and dropping the clause spelling would reject the
+    /// `by` form this repository writes.
+    #[test]
+    fn an_aggregation_counts_only_when_it_is_applied() {
+        for expr in [
+            "sum(ALERTS{alertstate=\"firing\"})",
+            "sum by (pod) (rate(x_total[5m]))",
+            "max\n\t(cogneva_build_seconds)",
+            "count(up)",
+        ] {
+            assert!(uses_an_aggregation(expr), "`{expr}` 是聚合却没被认出来");
+        }
+        for expr in [
+            // A label named after an operator, and one passed as an argument.
+            "label_replace(x_total, \"sum\", \"$1\", \"pod\", \"(.*)\")",
+            "x_total{sum=\"1\"}",
+            // Reads a series, reduces over time: no series is collapsed.
+            "sum_over_time(x_total[5m])",
+            "x_total",
+            // The clause is not the operation.
+            "x_total by (pod)",
+        ] {
+            assert!(!uses_an_aggregation(expr), "`{expr}` 没有聚合却被认成有");
+        }
     }
 }

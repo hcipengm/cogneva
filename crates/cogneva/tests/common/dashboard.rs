@@ -44,21 +44,61 @@ pub fn is_log_query(expr: &str) -> bool {
     expr.trim_start().starts_with('{')
 }
 
-/// Every metric `expr` in the dashboard, with the line it sits on.
+/// One metric expression as written, and the kind of panel that carries it.
+pub struct PanelExpr {
+    /// The line the expression sits on, as a complaint points at it.
+    pub line: usize,
+    /// The `type` of the panel this expression belongs to, as the manifest
+    /// writes it. Empty when no `"type"` stands at the panel's own depth: that
+    /// is a reading the caller has to refuse rather than assume, because a
+    /// panel nobody classified and a panel that draws nothing look the same
+    /// from here.
+    pub panel_type: String,
+    pub expr: String,
+}
+
+/// Every metric `expr` in the dashboard, with the line it sits on and the kind
+/// of panel it is drawn by.
 ///
-/// One reader for the name check and the shape check both, so a panel one of
-/// them refuses to see is not a panel the other silently stops covering.
-pub fn metric_exprs(text: &str) -> Vec<(usize, String)> {
+/// One reader for the name check, the shape check and the panel-kind check, so
+/// a panel one of them refuses to see is not a panel the others silently stop
+/// covering.
+///
+/// The panel's `type` is read by depth: a `"type"` line replaces the one held
+/// when it is no deeper than it, and it is attributed to an expression when it
+/// is no deeper than *that*. In this file the panel's own fields are written at
+/// one depth and each target four spaces deeper, so the guard is what keeps
+/// `"datasource": {"type": "prometheus"}` from making every expression read as a
+/// panel of its own kind -- the depth-blind version of this walk files all 84
+/// under `prometheus`. A kind this walk gets wrong lands outside the caller's
+/// table and fails there, which is what the table being closed is for.
+pub fn metric_exprs(text: &str) -> Vec<PanelExpr> {
+    let mut panel: Option<(usize, String)> = None;
     text.lines()
         .enumerate()
         .filter_map(|(n, line)| {
+            let indent = line.len() - line.trim_start().len();
+            if let Some(kind) = json_field(line, "type") {
+                // Siblings replace each other, so `<=`; a nested object's
+                // `type` is deeper and does not.
+                if panel.as_ref().is_none_or(|(d, _)| indent <= *d) {
+                    panel = Some((indent, kind));
+                }
+            }
             let expr = json_field(line, "expr")?;
             // A log query selects by label, not by series name; the extractor
             // would read its `$variable` references as metrics.
             if expr.is_empty() || is_log_query(&expr) {
                 return None;
             }
-            Some((n + 1, expr))
+            Some(PanelExpr {
+                line: n + 1,
+                panel_type: match &panel {
+                    Some((d, kind)) if *d <= indent => kind.clone(),
+                    _ => String::new(),
+                },
+                expr,
+            })
         })
         .collect()
 }
@@ -74,7 +114,7 @@ pub fn metric_exprs(text: &str) -> Vec<(usize, String)> {
 pub fn series_in(text: &str) -> BTreeSet<String> {
     metric_exprs(text)
         .iter()
-        .flat_map(|(_, expr)| metric_names_in(expr))
+        .flat_map(|panel| metric_names_in(&panel.expr))
         .collect()
 }
 
@@ -95,4 +135,62 @@ pub fn text() -> String {
 
 pub fn repo_root() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The depth guard, on a file shaped like the one this reads: a panel's
+    /// fields at one depth, the target's own `datasource` deeper, two sibling
+    /// panels, and a templating variable's `type` after them.
+    ///
+    /// Without the guard every expression is filed under `prometheus` -- the
+    /// last `"type"` line above it -- and `prometheus` is a kind no caller's
+    /// table lists, so the check that reads this reds on all 84 panels rather
+    /// than on none. Which is also why the shape is worth a test of its own:
+    /// the reading is not "empty or wrong", it is "wrong in a way the caller
+    /// notices".
+    #[test]
+    fn a_panels_kind_is_the_type_at_or_above_its_expression() {
+        let text = r#"
+  cogneva-overview.json: |
+    {
+      "panels": [
+        {
+          "type": "stat",
+          "targets": [
+            {
+              "expr": "sum(ALERTS{alertstate=\"firing\"})",
+              "datasource": { "type": "prometheus" }
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "targets": [
+            {
+              "expr": "rate(x_total[5m])",
+              "datasource": { "type": "prometheus" }
+            }
+          ]
+        }
+      ],
+      "templating": { "list": [ { "name": "pod", "type": "textbox" } ] }
+    }
+"#;
+        let got: Vec<(&str, &str)> = metric_exprs(text)
+            .iter()
+            .map(|p| (p.panel_type.as_str(), p.expr.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("stat", "sum(ALERTS{alertstate=\"firing\"})"),
+                // 换了面板就换类型（同级覆盖），不是第一个说了算。
+                ("timeseries", "rate(x_total[5m])"),
+            ],
+            "面板类型按深度归属：目标自带的 `datasource` 更深、不算，模板变量的 `type` 不在面板里"
+        );
+    }
 }
