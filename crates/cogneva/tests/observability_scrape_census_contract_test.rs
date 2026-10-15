@@ -30,6 +30,11 @@
 //! -- the drift those tables exist to prevent. Renaming one fails this test
 //! loudly instead of emptying a face in silence.
 //!
+//! The last two are not the same kind of face as the first three. A rule and a
+//! panel read a series; a table records who publishes it. A series carried by a
+//! table and by nothing else is registered, not read, and the difference is its
+//! own count below -- otherwise the union would read as coverage.
+//!
 //! The ceiling, so a reader does not have to guess it. A name built at run time
 //! (`format!`, `concat!`) has no literal to parse and is outside the
 //! denominator; today the tree has none. Everything else is covered, and the
@@ -241,6 +246,33 @@ const UNREGISTERED: &[(&str, Unread)] = &[
 /// that is a change to this constant plus the removal of the entry.
 const GAPS_AT_SCRAPE_CENSUS: usize = 17;
 
+/// How many scrape-only series are carried by a produced table and by nothing
+/// that reads them.
+///
+/// A registration is not a reader. The two produced tables say which file
+/// publishes a series, and a rule or a panel is licensed against them -- but a
+/// name can sit in a table forever with nothing drawing it, which is the state
+/// the dashboard contract's own comment describes for the signal watcher ("no
+/// panel draws these yet ... recorded here so their names and their producer
+/// stay pinned together until something does draw them"). That is a decision
+/// someone made, and this number is what keeps it visible as a decision rather
+/// than letting it read as a covered series.
+///
+/// So the three faces are not interchangeable and this is the count that says
+/// so: the closed set is a face for the store, a rule or a panel is a face for a
+/// reader, and a table is a face for the producer. Collapsing the three into one
+/// "is it on anything" would have made these indistinguishable from a series a
+/// rule watches.
+///
+/// Eight, and the eighth is the reason the reader set is built from query
+/// expressions: `cogneva_build_target_rewrite_window_seconds` occurs in the
+/// dashboard manifest exactly once, in the prose of another panel's
+/// description -- "the window travels beside the count as ..." -- so a reading
+/// that asks "does this name occur in the file" counts it as drawn, and a
+/// reading that parses the queries does not. That is the difference between the
+/// two, measured on the first run of this test.
+const REGISTERED_BUT_UNREAD_AT_CENSUS: usize = 8;
+
 #[test]
 fn every_series_a_build_can_render_is_on_a_face_or_has_a_verdict() {
     let faces = faces();
@@ -340,6 +372,60 @@ fn every_series_a_build_can_render_is_on_a_face_or_has_a_verdict() {
     assert_eq!(
         gaps, GAPS_AT_SCRAPE_CENSUS,
         "没有面的序列的欠账数与 GAPS_AT_SCRAPE_CENSUS 不再相等（表内 {gaps} 笔，常数 {GAPS_AT_SCRAPE_CENSUS}）。多一笔：新序列要当轮补面，或把成因写进 UNREGISTERED 并同步改这个数（改它就是承认多欠一笔）。少一笔：那是补上了面，同样要改回来——这个数就是「还有几笔没面」的账"
+    );
+}
+
+/// A registration is not a reader, and the difference is counted.
+///
+/// The census above accepts a produced table as a face, and that is right: the
+/// table is where a series' producer is pinned, and a rule or a panel is
+/// licensed against it. But it does not read the series, so a name can be
+/// recorded there and read by nothing -- deliberately, as the dashboard
+/// contract says of the signal watcher, whose whole family exists so that "the
+/// watcher has gone quiet" has a reading at all. Deliberate or not, it is the
+/// shape that reads as covered while nothing covers it, so it gets its own
+/// number rather than disappearing into the union of the faces.
+#[test]
+fn a_registration_no_rule_and_no_panel_reads_is_a_counted_row() {
+    let registry: BTreeSet<String> = cog_core::metric_names::ALL
+        .iter()
+        .map(|n| n.as_str().to_string())
+        .collect();
+    let mut read: BTreeSet<String> = rule_expressions()
+        .iter()
+        .flat_map(|expr| metric_names_in(expr))
+        .collect();
+    read.extend(dashboard::series());
+    let mut registered = table_names(ALERT_RULE_CONTRACT, ALERT_TABLE_OPENS);
+    registered.extend(table_names(DASHBOARD_CONTRACT, DASHBOARD_TABLE_OPENS));
+    let excluded: BTreeSet<&str> = NOT_A_SERIES.iter().map(|(n, _)| *n).collect();
+
+    assert!(
+        !read.is_empty(),
+        "规则与面板一条都没读到，这一行数的是「有登记没读者」，读数会全靠坏掉的那一面"
+    );
+    assert!(!registered.is_empty(), "两张产出表一条都没读到，同上");
+
+    // A name in the closed set is store-backed and the reader-face census
+    // already judges it there; this is about the ones only a build can render.
+    let published = published_names();
+    let registered_unread: Vec<&str> = published
+        .iter()
+        .map(String::as_str)
+        .filter(|n| {
+            registered.contains(*n)
+                && !read.contains(*n)
+                && !registry.contains(*n)
+                && !excluded.contains(n)
+        })
+        .collect();
+
+    assert_eq!(
+        registered_unread.len(),
+        REGISTERED_BUT_UNREAD_AT_CENSUS,
+        "有登记、没有读者的序列数与 REGISTERED_BUT_UNREAD_AT_CENSUS 不再相等（现在 {} 条，常数 {REGISTERED_BUT_UNREAD_AT_CENSUS}）:\n{}\n多一条：新登记的序列要当轮给它一个读者（规则或面板），否则它不是「已覆盖」而是「记下了却没人看」；少一条：补齐了读者，这个数要跟着减",
+        registered_unread.len(),
+        registered_unread.join("\n")
     );
 }
 
