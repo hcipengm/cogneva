@@ -11,6 +11,12 @@
 //! the period this process actually reads at, not from a constant written next
 //! to the rule: the two would otherwise drift apart silently, and a bound
 //! tighter than the read period fires on a healthy idle consumer.
+//!
+//! A name covers every loop reading it, and the three series aggregate over
+//! those loops in the three ways the readings call for: failures summed,
+//! silence worst, and the population published on its own because it is what
+//! the other two cannot state. Eighteen loops failing slowly and one failing
+//! the same way agree on both of the first two and are different situations.
 
 use std::sync::Arc;
 
@@ -37,6 +43,19 @@ pub const READ_FAILURES_METRIC: &str = "cogneva_stream_read_failures_total";
 /// The label `cogneva_stream_read_failures_total` is broken down by.
 pub const READ_FAILURE_REASON_LABEL: &str = "reason";
 
+/// How many read loops are behind this stream and consumer group.
+///
+/// The series that says what the other two cannot. A consumer group read by one
+/// loop and one read by eighteen publish the same silence and the same refusal
+/// rate, and they are not the same situation: the second is eighteen chances for
+/// one of them to be wedged, and a fix verified by watching the name is verified
+/// against whichever loops happened to report. It is a gauge rather than a
+/// counter because loops come and go with the pods, and it is published per name
+/// rather than summed over names because what a reader acts on is the name: a
+/// process reading a stream from eighteen loops that are all working is not the
+/// same reading as a process reading eighteen streams once each.
+pub const READ_LOOPS_METRIC: &str = "cogneva_stream_read_loops";
+
 /// The block period the reads are issued with — the bound below which silence
 /// is just an idle stream.
 pub const READ_BLOCK_SECONDS_METRIC: &str = "cogneva_stream_read_block_seconds";
@@ -60,15 +79,20 @@ impl Observable for StreamReadObservable {
             READ_BLOCK_SECONDS_METRIC,
             self.health.block_seconds(),
         )];
-        for ((stream, group), slot) in self.health.snapshot() {
+        for ((stream, group), family) in self.health.families(now) {
             out.push(
-                RawMetric::new(READ_SILENT_SECONDS_METRIC, slot.silent_seconds(now) as f64)
+                RawMetric::new(READ_LOOPS_METRIC, family.loops as f64)
+                    .with_label("stream", stream.as_str())
+                    .with_label("consumer_group", group.as_str()),
+            );
+            out.push(
+                RawMetric::new(READ_SILENT_SECONDS_METRIC, family.silent_seconds as f64)
                     .with_label("stream", stream.as_str())
                     .with_label("consumer_group", group.as_str()),
             );
             for refusal in ReadRefusal::ALL {
                 out.push(
-                    RawMetric::new(READ_FAILURES_METRIC, slot.failures_of(refusal) as f64)
+                    RawMetric::new(READ_FAILURES_METRIC, family.failures_of(refusal) as f64)
                         .with_label("stream", stream.as_str())
                         .with_label("consumer_group", group.as_str())
                         .with_label(READ_FAILURE_REASON_LABEL, refusal.label()),
@@ -96,8 +120,8 @@ mod tests {
     #[tokio::test]
     async fn every_live_consumer_is_visible_with_the_bound_it_is_read_at() {
         let health = Arc::new(ReadHealth::new(5000));
-        let _goals = ReadHealth::track(&health, "goals", "worker");
-        health.note_ok("goals", "worker");
+        let goals = ReadHealth::track(&health, "goals", "worker");
+        goals.note_ok();
         let _inbox = ReadHealth::track(&health, "inbox", "worker");
         let observable = StreamReadObservable::new(Arc::clone(&health));
 
@@ -113,9 +137,13 @@ mod tests {
 
         let block = named(READ_BLOCK_SECONDS_METRIC, &[]).expect("the bound is published");
         assert_eq!(block.value, 5.0);
-        let goals = named(READ_SILENT_SECONDS_METRIC, &[("stream", "goals")])
+        let goals_silent = named(READ_SILENT_SECONDS_METRIC, &[("stream", "goals")])
             .expect("an answered consumer is published");
-        assert!(goals.value <= 1.0, "answered just now: {}", goals.value);
+        assert!(
+            goals_silent.value <= 1.0,
+            "answered just now: {}",
+            goals_silent.value
+        );
         let inbox = named(READ_SILENT_SECONDS_METRIC, &[("stream", "inbox")])
             .expect("a consumer that never got an answer is published too");
         assert!(
@@ -124,6 +152,11 @@ mod tests {
             inbox.value
         );
         assert!(named(READ_FAILURES_METRIC, &[("stream", "goals")]).is_some());
+        assert_eq!(
+            named(READ_LOOPS_METRIC, &[("stream", "goals")]).map(|m| m.value),
+            Some(1.0),
+            "how many loops read this name is published, not inferred"
+        );
     }
 
     #[tokio::test]
@@ -133,9 +166,9 @@ mod tests {
         let observable = StreamReadObservable::new(Arc::clone(&health));
         assert_eq!(
             observable.collect_metrics("").await.unwrap().len(),
-            4,
-            "the bound, silence, and one failure series per cause for the one \
-             live consumer"
+            5,
+            "the bound, the population, silence, and one failure series per \
+             cause for the one live consumer"
         );
         drop(guard);
         let metrics = observable.collect_metrics("").await.unwrap();
@@ -143,6 +176,41 @@ mod tests {
             metrics.len(),
             1,
             "only the bound is left once the consumer is gone: {metrics:?}"
+        );
+    }
+
+    /// Two loops on one name are one name's worth of series, and the
+    /// population is what tells it apart from one loop.
+    #[tokio::test]
+    async fn the_population_separates_two_loops_from_one() {
+        let health = Arc::new(ReadHealth::new(5000));
+        let first = ReadHealth::track(&health, "goals", "worker");
+        let second = ReadHealth::track(&health, "goals", "worker");
+        first.note_failure(ReadRefusal::NoGroup);
+        second.note_failure(ReadRefusal::Other);
+        let observable = StreamReadObservable::new(Arc::clone(&health));
+
+        let metrics = observable.collect_metrics("").await.unwrap();
+        assert_eq!(
+            metrics.len(),
+            5,
+            "one name, however many loops read it, is still one set of series: \
+             {metrics:?}"
+        );
+        let loops = metrics
+            .iter()
+            .find(|m| m.name == READ_LOOPS_METRIC)
+            .expect("the population is published");
+        assert_eq!(loops.value, 2.0, "two loops are reading this name");
+        let pooled: f64 = metrics
+            .iter()
+            .filter(|m| m.name == READ_FAILURES_METRIC)
+            .map(|m| m.value)
+            .sum();
+        assert_eq!(
+            pooled, 2.0,
+            "and both loops' refusals are in the name's count, not the last \
+             registration's"
         );
     }
 
@@ -154,10 +222,10 @@ mod tests {
     #[tokio::test]
     async fn every_cause_is_published_and_the_pooled_number_is_their_sum() {
         let health = Arc::new(ReadHealth::new(5000));
-        let _goals = ReadHealth::track(&health, "goals", "worker");
-        health.note_failure("goals", "worker", ReadRefusal::NoGroup);
-        health.note_failure("goals", "worker", ReadRefusal::Other);
-        health.note_failure("goals", "worker", ReadRefusal::Other);
+        let goals = ReadHealth::track(&health, "goals", "worker");
+        goals.note_failure(ReadRefusal::NoGroup);
+        goals.note_failure(ReadRefusal::Other);
+        goals.note_failure(ReadRefusal::Other);
         let observable = StreamReadObservable::new(Arc::clone(&health));
 
         let metrics = observable.collect_metrics("").await.unwrap();
@@ -183,9 +251,9 @@ mod tests {
             );
         }
         let pooled: f64 = failures.iter().map(|m| m.value).sum();
+        let read_back: f64 = health.families(now_seconds())[0].1.failures() as f64;
         assert_eq!(
-            pooled,
-            health.snapshot()[0].1.failures() as f64,
+            pooled, read_back,
             "summing over the cause label has to give the number this series \
              held before it was broken down"
         );

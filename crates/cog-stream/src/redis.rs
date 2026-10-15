@@ -186,7 +186,9 @@ impl MessageBackend for RedisMessageBackend {
         // Retrying in place is only half of it: a loop that never recovers
         // looks exactly like an idle one from outside. The guard and the health
         // record are the other half — they are what says, in the observation
-        // surface, that this consumer has not been answered for a while.
+        // surface, that this consumer has not been answered for a while. Every
+        // write goes through this loop's own guard, which is what keeps two
+        // loops on one stream from writing into each other's row.
         let health = self.read_health();
         let guard = ReadHealth::track(&health, &subject, &group);
         let block_ms = self.read_block_ms;
@@ -195,20 +197,19 @@ impl MessageBackend for RedisMessageBackend {
             move |(mut conn, mut backoff, guard)| {
                 let subject = subject.clone();
                 let group = group.clone();
-                let health = Arc::clone(&health);
                 async move {
                     loop {
                         match group_read(&mut conn, &subject, &group, ">", block_ms).await {
                             Ok(Some(item)) => {
-                                health.note_ok(&subject, &group);
+                                guard.note_ok();
                                 return Ok(Some((item, (conn, 0, guard))));
                             }
                             Ok(None) => {
-                                health.note_ok(&subject, &group);
+                                guard.note_ok();
                                 backoff = 0;
                             }
                             Err(e) => {
-                                health.note_failure(&subject, &group, read_refusal(&e));
+                                guard.note_failure(read_refusal(&e));
                                 tracing::warn!(
                                     stream = %subject,
                                     "XREADGROUP failed, retrying with backoff: {e}"
@@ -247,7 +248,6 @@ impl MessageBackend for RedisMessageBackend {
             move |(mut conn, mut first_id, mut backoff, guard)| {
                 let subject = subject.clone();
                 let group = group.clone();
-                let health = Arc::clone(&health);
                 async move {
                     loop {
                         let id = first_id.as_deref().unwrap_or(">");
@@ -258,16 +258,16 @@ impl MessageBackend for RedisMessageBackend {
                         };
                         match group_read(&mut conn, &subject, &group, id, block_ms).await {
                             Ok(Some(item)) => {
-                                health.note_ok(&subject, &group);
+                                guard.note_ok();
                                 return Ok(Some((item, (conn, None, 0, guard))));
                             }
                             Ok(None) => {
-                                health.note_ok(&subject, &group);
+                                guard.note_ok();
                                 first_id = None;
                                 backoff = 0;
                             }
                             Err(e) => {
-                                health.note_failure(&subject, &group, read_refusal(&e));
+                                guard.note_failure(read_refusal(&e));
                                 tracing::warn!(
                                     stream = %subject,
                                     "XREADGROUP failed, retrying with backoff: {e}"
@@ -863,6 +863,96 @@ mod tests {
             ReadRefusal::NoGroup,
             "only the server's NOGROUP goes under that label, and this one is \
              {e:?}"
+        );
+
+        let _: i64 = redis::cmd("DEL")
+            .arg(stream.as_str())
+            .query_async(&mut raw)
+            .await
+            .expect("del");
+    }
+
+    /// Two loops reading one name are two rows, and the name carries both.
+    ///
+    /// The unit tests in `read_health` build the loops themselves, so what they
+    /// can show is what the record does with rows it was handed. This one takes
+    /// the loops from the backend: the refusals come from the server -- the
+    /// stream key holds a string, so group creation and every read of it are
+    /// refused -- and the questions are whether the two subscriptions the
+    /// backend hands out are counted as two, whether the second one's
+    /// registration leaves the first one's refusals in place, and whether the
+    /// surviving loop keeps counting after its sibling is dropped.
+    #[tokio::test]
+    async fn two_live_loops_on_one_name_are_counted_together_and_outlive_each_other() {
+        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let raw_client = redis::Client::open(redis_url.as_str()).expect("redis client");
+        let mut raw = match raw_client.get_multiplexed_async_connection().await {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("SKIP: Redis not available");
+                return;
+            }
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let stream = format!("cog-test:loops-{suffix}");
+        let group = format!("loops-{suffix}");
+        let _: () = redis::cmd("SET")
+            .arg(stream.as_str())
+            .arg("not-a-stream")
+            .query_async(&mut raw)
+            .await
+            .expect("set");
+
+        let backend = RedisMessageBackend::new(&redis_url).await.unwrap();
+        let health = backend.read_health();
+        let family = |health: &Arc<ReadHealth>| {
+            health
+                .families(crate::read_health::now_seconds())
+                .into_iter()
+                .find(|((seen, _), _)| seen == &stream)
+                .map(|(_, family)| family)
+                .unwrap_or_else(|| panic!("no family published for {stream}"))
+        };
+
+        // Two refusals of its own: one at once, one after the second of
+        // backoff. One is enough for what is asserted, and the second makes the
+        // reading below unlikely to be a single attempt's accident.
+        let mut first = backend.subscribe(&stream, &group).await.unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(2100), first.next()).await;
+        let first_alone = family(&health).failures();
+        assert!(
+            first_alone >= 2,
+            "the first loop's refusals are counted while it is the only one: {first_alone}"
+        );
+
+        // The second loop gets one refusal attempt, which is all it needs: the
+        // question is whether its registration leaves the first loop's count
+        // standing.
+        let mut second = backend.subscribe(&stream, &group).await.unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(700), second.next()).await;
+        let both = family(&health);
+        assert_eq!(both.loops, 2, "the name covers both loops: {both:?}");
+        assert!(
+            both.failures() > first_alone,
+            "the second loop's refusal is in the name beside the first's, not \
+             in place of it: {both:?} against {first_alone} before it registered"
+        );
+
+        // One loop leaves. The name is still read by the other, and the other
+        // keeps counting: with the row keyed by the name, this drop deleted the
+        // row and every later write was skipped, so the reading went to zero in
+        // the one moment it mattered.
+        drop(first);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(2400), second.next()).await;
+        let after = family(&health);
+        assert_eq!(after.loops, 1, "the name outlives its first loop: {after:?}");
+        assert!(
+            after.failures() >= 2,
+            "the loop still reading keeps counting after its sibling is gone: {after:?}"
         );
 
         let _: i64 = redis::cmd("DEL")

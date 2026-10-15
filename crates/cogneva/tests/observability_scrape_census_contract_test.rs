@@ -169,10 +169,20 @@ const UNREGISTERED: &[(&str, Unread)] = &[
         "cogneva_plugin_pin_unordered_init_read_count",
         Unread::Gap("how many such reads a missing `requires` edge left unordered, as the always-answering half of the family above. The first reading of this family is also what found its own defect: the number was one larger than the series any query could count, because a read registered twice at init is one series on the exposition. That half is closed now -- the members are collapsed where the series are built, so the size and the series agree -- and what remains owed is the reader nothing has given it"),
     ),
-    (
-        "cogneva_stream_read_failures_total",
-        Unread::Gap("reads this consumer's loop has had refused since it started, published as the deliberate pair to the silence reading -- silence says whether the bus is moving, this says what it cost to keep up. The stalled-consumer rule's own summary already tells a human to look at this series for the count of refused reads, so the reading is addressed to a reader and the face that would carry it does not exist. Nor is a rule that face yet, and this stays a gap after the cause label lands, because the value is a pulse rather than a state: on the live series every consumer of a pod steps 0 to 4 inside the first minute of a new pod -- four refusals in the first seven seconds of the backoff ladder -- and then holds there for the rest of that pod's life, so a threshold of greater than zero is true until the carrier is replaced and a rate reads that replacement as the noise subsiding. A cause label separates the startup NOGROUP from the refusal that never clears; it does not turn the number into something a bound can be derived from. What is readable is the pair of how long the consumer has gone unanswered and how many refusals it took in the window, and the second half of that pair wants a bound taken from the split rates rather than guessed"),
-    ),
+    // A name that had a `Gap` here until a panel was written to carry it:
+    // `cogneva_stream_read_failures_total`, the count of reads a consumer's loop
+    // had refused, split by the cause the bus itself named. The entry is gone
+    // and `GAPS_AT_SCRAPE_CENSUS` came down by one because the face it was owed
+    // now exists -- the stream-consumer panel draws it against the silence and
+    // the loop population it is read with. What that does not settle is a bound
+    // on the number, and that was never this table's to give: the value is a
+    // pulse rather than a state (on the live series every consumer of a pod
+    // steps 0 to 4 inside the first seconds of a new pod and then holds there
+    // for the rest of that pod's life, so greater than zero is true until the
+    // carrier is replaced and a rate reads that replacement as the noise
+    // subsiding), and a rule that reads it has to take its bound from the split
+    // rates rather than guess one. That debt sits on the alert side.
+
     // A name whose fact a face already carries, looked up rather than asserted
     // in prose.
     (
@@ -196,12 +206,14 @@ const UNREGISTERED: &[(&str, Unread)] = &[
 /// How many `Gap` entries this census left.
 ///
 /// The first run is where this number comes from, and it is meant to be read as
-/// it is: nine names the tree publishes into a scrape with no face carrying
+/// it is: eight names the tree publishes into a scrape with no face carrying
 /// them. The ratchet is the same one the reader-face census keeps -- a new
 /// series nothing reads must be classified deliberately, and calling it a gap
 /// raises this number on purpose. It comes down when a face is written, and
-/// that is a change to this constant plus the removal of the entry.
-const GAPS_AT_SCRAPE_CENSUS: usize = 9;
+/// that is a change to this constant plus the removal of the entry: the ninth,
+/// the consumer read-failure counter, left when the stream-consumer panel was
+/// written to carry it.
+const GAPS_AT_SCRAPE_CENSUS: usize = 8;
 
 /// How many scrape-only series are carried by a produced table and by nothing
 /// that reads them.

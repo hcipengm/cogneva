@@ -1665,6 +1665,53 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 44,
+          "title": "Stream Consumers: Loops, Silence and Refused Reads",
+          "description": "Read health of every stream consumer, one line per stream and consumer group. Three readings are drawn together because none of them decides anything alone. Silence is how long the worst read loop under that name has gone without an answer from the bus -- a consumer with nothing to deliver is still answered every block, so a line drifting past a multiple of cogneva_stream_read_block_seconds is failing rather than idle, and this line is what the rule stream_consumer_stalled reads. Refused reads is what keeping up cost, split by the cause the bus itself reported: a nogroup refusal is either a group that does not exist yet, which the next attempt wins, or one that is gone for good, which the loop retries against until the pod is replaced, and the server answers the same code for both. The pooled count is the sum over the cause label and is not something a threshold can be written on: on a live series it steps from zero to a handful inside the first seconds of a new pod and then holds there for the rest of that pod's life, so greater than zero stays true until the carrier is replaced and a rate over the window reads that replacement as the noise going away. What is decidable is the pair -- a name whose refusal line keeps climbing while its silence line stays flat is a consumer retrying its way through, and one whose silence line climbs while the refusals stay put is a loop nothing is answering any more. Loops is how many read loops are behind the name, and it is the reading the other two cannot state: one loop failing slowly and eighteen failing the same way publish the same silence and the same rate, and an experiment watched on this name is watched against whichever loops happened to report. The three aggregate differently on purpose and the difference is the point: cost is what every loop under the name paid, so both the refusals and the population are summed over the pods reporting them, while silence is a state and is taken as the worst value, because a sum of silences would rise with the population and an average would let a broken loop hide behind healthy ones. Every process publishes these for its own loops, so all three queries aggregate by stream and consumer group rather than selecting bare.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 184
+          },
+          "targets": [
+            {
+              "expr": "max by (stream, consumer_group) (cogneva_stream_read_silent_seconds)",
+              "legendFormat": "{{stream}}/{{consumer_group}} silent",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "sum by (stream, consumer_group, reason) (increase(cogneva_stream_read_failures_total[1h]))",
+              "legendFormat": "{{stream}}/{{consumer_group}} refused in 1h ({{reason}})",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "sum by (stream, consumer_group) (cogneva_stream_read_loops)",
+              "legendFormat": "{{stream}}/{{consumer_group}} loops",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {

@@ -14,7 +14,7 @@ pub mod read_health;
 pub mod redis;
 
 pub use observable::StreamReadObservable;
-pub use read_health::{ReadGuard, ReadHealth};
+pub use read_health::{ReadFamily, ReadGuard, ReadHealth, ReadRefusal};
 
 #[cfg(feature = "mem")]
 pub use memory::MemoryMessageBackend;

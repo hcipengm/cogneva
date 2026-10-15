@@ -591,6 +591,28 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["outcome"],
         "crates/cog-memory/src/observable.rs",
     ),
+    // The three readings of a stream consumer's read health, published per
+    // stream and consumer group. They are drawn together because none of them
+    // decides anything alone: the silence says whether the bus is moving, the
+    // refusals say what keeping up cost with the cause the bus named, and the
+    // population says how many loops are behind the name -- the two loops that
+    // a name covers are invisible in the other two, which is why neither of
+    // them can be read as a statement about one consumer.
+    (
+        "cogneva_stream_read_loops",
+        &["stream", "consumer_group"],
+        "crates/cog-stream/src/observable.rs",
+    ),
+    (
+        "cogneva_stream_read_silent_seconds",
+        &["stream", "consumer_group"],
+        "crates/cog-stream/src/observable.rs",
+    ),
+    (
+        "cogneva_stream_read_failures_total",
+        &["stream", "consumer_group", "reason"],
+        "crates/cog-stream/src/observable.rs",
+    ),
 ];
 
 /// Series the dashboard may read that this workspace does not produce, with the
