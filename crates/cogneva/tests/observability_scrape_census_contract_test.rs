@@ -405,7 +405,8 @@ fn a_registration_no_rule_and_no_panel_reads_is_a_counted_row() {
 /// gate that is invisible precisely because nothing in it is missing a verdict.
 /// This closes it by walking the other way: the well-formed literals are
 /// enumerated from the text with no shape assumed, and each has to be one of
-/// the two shapes, a closed set name, a derived name, or a declared exception.
+/// the two shapes, a closed set name, a derived name, a name the retirement
+/// list holds, or a declared exception.
 #[test]
 fn every_series_name_literal_in_the_tree_is_accounted_for() {
     let registry: BTreeSet<String> = cog_core::metric_names::ALL
@@ -458,6 +459,33 @@ fn every_series_name_literal_in_the_tree_is_accounted_for() {
         })
     };
 
+    // A retired name is the third face a `cogneva_` literal can come from: the
+    // retirement list the exporter and the deletion pass both read. It is read
+    // from the constant rather than copied into a table here, because retiring
+    // a name is how a served series' identity is changed, so that list grows --
+    // and a copy would go stale in the direction that hurts, a retirement
+    // landing as a red census whose fix looks like "add one line to the test".
+    let retired: BTreeSet<&str> = cog_core::RETIRED_METRIC_NAMES.iter().copied().collect();
+    for name in &retired {
+        // The scan sees only prefixed literals, so only a prefixed retirement
+        // can be asserted present: the unprefixed one is a legacy name and
+        // appears here for the retirement pass, not for a producer.
+        if name.contains(NAME_PREFIX) {
+            assert!(
+                literals.contains(*name),
+                "退场的 {name} 在树里读不到字面量了——退场名单里的这条要么拼错了，要么连声明一起被删了，那样退场这件事本身就没有载体"
+            );
+        }
+        // The half that stays dangerous: a rule or panel reading a retired name
+        // reads a series this build no longer serves, and the retirement is
+        // what makes it stop -- so the reading fails silently rather than
+        // loudly, which is exactly the shape nothing else here would catch.
+        assert!(
+            !published.contains(*name),
+            "退场的 {name} 还被声明为产出（仍是 `pub const ...: &str` 或 `RawMetric::new`）——退场和产出同时写着，读它的人会拿到一条不再被服务的序列"
+        );
+    }
+
     let unexplained: Vec<&str> = literals
         .iter()
         .map(String::as_str)
@@ -466,6 +494,7 @@ fn every_series_name_literal_in_the_tree_is_accounted_for() {
                 && !registry.contains(*n)
                 && !derived(n)
                 && !excluded.contains(n)
+                && !retired.contains(n)
         })
         .collect();
     assert!(
