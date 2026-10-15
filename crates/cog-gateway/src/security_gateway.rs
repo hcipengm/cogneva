@@ -2677,7 +2677,15 @@ fn pool_down_message(pool_size: usize, unavailable: &[String], bounds: &Recovery
 /// 池全灭告警的规则名。写一次：`dedup_key` 要从它派生事件身份，规则名再抄一遍
 /// 就有两处会漂的地方。
 ///
-/// 这里是池全灭**唯一**的发布者。规则面曾经另有一条读 Prometheus 同一个条件的
+/// 这里是池全灭**落进告警表的唯一一行**，不是这个条件唯一的判词。同类还有第二个
+/// 发布者：监督者那条 `SupervisorEvent::LlmUpstreamPoolDown`（`llm_pool_guard` 在池
+/// 走下沿时发）经通知出口与进程内告警列表各说一遍，用的是 `cog_core::pool_down_verdict`
+/// 那句英文。两边落在不同载体上（这张表 vs 进程内列表与出口），所以"只写了一次"这句话
+/// 只在**载体**的范围内成立；`/alerts` 那条读口会把两边的同规则条目合成一条，
+/// 挑哪一条见 `merge_active_alerts` 自己的判据——今天挑的是这一行，因为进程内那条不带
+/// agent/task/crew。要改这里的措辞，先看那张合并判据会不会把读者换到另一边去。
+///
+/// 规则面曾经另有一条读 Prometheus 同一个条件的
 /// `llm_pool_down`：同一个条件两处写，两条的 `fired_at` 都是各自规则被引入的时刻，
 /// 于是"池断了多久"有两个数，长的那个看着更严重、短的那个看着更新鲜，看图的人
 /// 分不出该信哪条。那条已停用（`observability.infra_watch.retired_rules`），

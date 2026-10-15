@@ -2218,25 +2218,43 @@ async fn agent_heartbeats_handler(
 /// itself (orphaned decompositions, OOM-killed pods, over-declared volumes).
 /// Serving only one of them hides the other's alerts from whoever asks.
 ///
-/// Alerts the in-memory store already carries keep their richer record — it
-/// knows the agent/task/crew the condition belongs to — so a durable row for
-/// the same rule contributes nothing. Identity across the two is the rule
-/// name, which both sides derive from the same string.
+/// Identity across the two is the rule name, which both sides derive from the
+/// same string, and for a rule both carry the listing keeps exactly one entry.
+/// Which one is decided by what the process-local entry actually holds, not by
+/// which surface it came from:
+///
+/// * it names the agent, task or crew the condition belongs to — the durable
+///   table has no columns for those, so the row cannot compete and keeping the
+///   entry is the only way the listing gets them;
+/// * it names none of the three, and then it is the poorer record on every
+///   count. It is also the older one: an entry comes from an event the
+///   supervisor raised on a transition, so it is a snapshot of that edge which
+///   never updates, while the durable row is re-sighted by its producer every
+///   cycle and carries `last_seen_at`. Keeping the snapshot answers "is this
+///   still true?" with `None` and prints a sentence frozen at the edge.
+///
+/// Both shapes are live, and they are one rule each: the pool-down event is the
+/// second — the supervisor sets all three to `None` for it — while the health
+/// events are the first. A rule the process-local store never saw still reaches
+/// the listing from its durable row.
 fn merge_active_alerts(
     in_memory: Vec<alert_store::AlertEntry>,
     durable: Vec<cog_core::PersistedAlert>,
 ) -> Vec<alert_store::AlertEntry> {
+    // The slot each rule is already listed in, so a durable row lands on its
+    // twin rather than beside it.
+    let mut slot: std::collections::HashMap<String, usize> = in_memory
+        .iter()
+        .enumerate()
+        .map(|(i, a)| (a.event_type.clone(), i))
+        .collect();
     let mut merged = in_memory;
-    let mut known: std::collections::HashSet<String> =
-        merged.iter().map(|a| a.event_type.clone()).collect();
     for alert in durable {
-        if !known.insert(alert.rule.clone()) {
-            continue;
-        }
-        merged.push(alert_store::AlertEntry {
+        let rule = alert.rule;
+        let entry = alert_store::AlertEntry {
             id: alert.dedup_key,
             severity: alert.severity,
-            event_type: alert.rule,
+            event_type: rule.clone(),
             message: alert.message,
             agent_id: None,
             task_id: None,
@@ -2245,9 +2263,27 @@ fn merge_active_alerts(
             last_seen_at: alert.last_seen_at.map(|t| t.to_rfc3339()),
             resolved: false,
             source: "durable",
-        });
+        };
+        match slot.get(&rule) {
+            // The entry knows who the condition is about; the row cannot.
+            Some(&i) if names_its_subject(&merged[i]) => {}
+            // It knows nothing the row does not, and only the row has a
+            // sighting clock.
+            Some(&i) => merged[i] = entry,
+            None => {
+                slot.insert(rule, merged.len());
+                merged.push(entry);
+            }
+        }
     }
     merged
+}
+
+/// Whether a process-local entry names the agent, task or crew a condition
+/// belongs to — the three the durable table has no columns for, and the only
+/// thing that makes such an entry the richer of two records of one rule.
+fn names_its_subject(a: &alert_store::AlertEntry) -> bool {
+    a.agent_id.is_some() || a.task_id.is_some() || a.crew_id.is_some()
 }
 
 async fn alerts_active_handler(State(state): State<Arc<GatewayState>>) -> Response {
@@ -3487,13 +3523,23 @@ mod active_alert_merge_tests {
         }
     }
 
+    /// A process-local entry for an event that names who it is about, which is
+    /// how the supervisor's health events arrive.
     fn in_memory(event_type: &str) -> alert_store::AlertEntry {
+        in_memory_about(event_type, Some("agent-1"))
+    }
+
+    /// The subject is a parameter because the real producers differ on it: the
+    /// health events name an agent, the pool-down event names nobody. A fixture
+    /// that hands every event type the same `agent_id` makes the two shapes
+    /// indistinguishable here while they are opposite in the running system.
+    fn in_memory_about(event_type: &str, agent_id: Option<&str>) -> alert_store::AlertEntry {
         alert_store::AlertEntry {
             id: "mem-1".to_string(),
             severity: "warning".to_string(),
             event_type: event_type.to_string(),
             message: "from the supervisor".to_string(),
-            agent_id: Some("agent-1".to_string()),
+            agent_id: agent_id.map(str::to_string),
             task_id: None,
             crew_id: None,
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -3554,28 +3600,65 @@ mod active_alert_merge_tests {
     }
 
     /// The source label survives the merge on the half that stays: the record
-    /// kept for a rule both surfaces know is still the process-local one.
+    /// kept for a rule both surfaces know, where the entry names its subject,
+    /// is still the process-local one.
     #[test]
     fn a_supervisor_entry_keeps_its_source_label_through_the_merge() {
         let merged = merge_active_alerts(
-            vec![in_memory("llm_upstream_pool_down")],
-            vec![durable("llm_upstream_pool_down")],
+            vec![in_memory("agent_unhealthy")],
+            vec![durable("agent_unhealthy")],
         );
         assert_eq!(merged[0].source, "supervisor");
     }
 
     /// When both surfaces carry the same rule they describe one condition, so
-    /// it must appear once — and the in-memory record wins, because it knows
-    /// the agent/task the condition belongs to and the durable row does not.
+    /// it must appear once — and the record that knows the agent wins, because
+    /// the durable row has no column to carry one.
     #[test]
     fn a_rule_both_surfaces_carry_is_listed_once_with_the_richer_record() {
         let merged = merge_active_alerts(
-            vec![in_memory("llm_upstream_pool_down")],
-            vec![durable("llm_upstream_pool_down")],
+            vec![in_memory("agent_unhealthy")],
+            vec![durable("agent_unhealthy")],
         );
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].id, "mem-1");
         assert_eq!(merged[0].agent_id.as_deref(), Some("agent-1"));
+    }
+
+    /// The pool-down pair is the one rule where the halves compare the other
+    /// way: its entry names nobody, and it is a snapshot of the down edge that
+    /// never updates, while the row is re-sighted every cycle. Listing the
+    /// snapshot answers "is this still true?" with `None` and hands the reader
+    /// a sentence frozen at the edge — so the row takes the slot, and it keeps
+    /// its sighting clock and its own wording.
+    #[test]
+    fn a_pool_down_entry_that_names_nobody_gives_way_to_the_row_with_a_sighting() {
+        let fired_at = chrono::Utc::now() - chrono::Duration::hours(6);
+        let merged = merge_active_alerts(
+            vec![in_memory_about("llm_upstream_pool_down", None)],
+            vec![durable_at("llm_upstream_pool_down", fired_at)],
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].source, "durable");
+        assert_eq!(merged[0].message, "llm_upstream_pool_down is firing");
+        let seen = merged[0]
+            .last_seen_at
+            .as_deref()
+            .expect("the row carries the sighting the entry has no field for");
+        assert!(chrono::DateTime::parse_from_rfc3339(seen).expect("a valid instant") > fired_at);
+    }
+
+    /// The entry that names nobody wins only when there is no row to lose to:
+    /// the process-local half still answers the listing on its own.
+    #[test]
+    fn an_entry_that_names_nobody_is_still_listed_without_a_row() {
+        let merged = merge_active_alerts(
+            vec![in_memory_about("llm_upstream_pool_down", None)],
+            vec![],
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].source, "supervisor");
     }
 
     /// Two durable rules are distinct alerts; neither may shadow the other.
