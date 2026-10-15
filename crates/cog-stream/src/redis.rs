@@ -854,7 +854,10 @@ mod tests {
         );
 
         // Now the group exists and the refusal is of another kind entirely.
-        backend.create_consumer_group(&stream, &group).await.unwrap();
+        backend
+            .create_consumer_group(&stream, &group)
+            .await
+            .unwrap();
         let e = group_read(&mut conn, &stream, &group, "not-an-id", 0)
             .await
             .expect_err("an unparsable id is refused");
@@ -949,7 +952,10 @@ mod tests {
         drop(first);
         let _ = tokio::time::timeout(std::time::Duration::from_millis(2400), second.next()).await;
         let after = family(&health);
-        assert_eq!(after.loops, 1, "the name outlives its first loop: {after:?}");
+        assert_eq!(
+            after.loops, 1,
+            "the name outlives its first loop: {after:?}"
+        );
         assert!(
             after.failures() >= 2,
             "the loop still reading keeps counting after its sibling is gone: {after:?}"

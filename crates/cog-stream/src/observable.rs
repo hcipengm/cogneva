@@ -241,8 +241,10 @@ mod tests {
         for refusal in ReadRefusal::ALL {
             let series = failures
                 .iter()
-                .find(|m| m.labels.get(READ_FAILURE_REASON_LABEL).map(String::as_str)
-                    == Some(refusal.label()))
+                .find(|m| {
+                    m.labels.get(READ_FAILURE_REASON_LABEL).map(String::as_str)
+                        == Some(refusal.label())
+                })
                 .unwrap_or_else(|| panic!("no series under {}: {failures:?}", refusal.label()));
             assert!(
                 series.labels.get("consumer_group").map(String::as_str) == Some("worker"),

@@ -388,7 +388,11 @@ mod tests {
         let family = family_of(&health, "s", now_seconds());
         assert_eq!(family.failures_of(ReadRefusal::NoGroup), 1);
         assert_eq!(family.failures_of(ReadRefusal::Other), 2);
-        assert_eq!(family.failures(), 3, "the number this counter used to publish");
+        assert_eq!(
+            family.failures(),
+            3,
+            "the number this counter used to publish"
+        );
     }
 
     /// A second loop on the same name takes nothing from the first.
