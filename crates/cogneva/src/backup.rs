@@ -64,31 +64,40 @@ const DISCOVER_TABLES_SQL: &str = r#"
     ORDER BY c.relname
 "#;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TableReport {
     pub name: String,
     pub rows: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CollectionReport {
     pub name: String,
     pub snapshot: String,
     pub points: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PostgresReport {
     pub tables: Vec<TableReport>,
     pub sequences: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ObjectsReport {
     pub files: u64,
     pub bytes: u64,
 }
 
+/// 备份包的清单：备份端写下的「这个包该有什么」。
+///
+/// 它是恢复端**唯一**能拿包内实测去比对的声明——`run_restore` 除了把这几个字段
+/// 打进日志，还要拿它逐段核包（见 `verify_package_against_manifest`）。
+///
+/// 每个内容段都带 `#[serde(default)]`：旧版本打出来的包可能整段没有，那种包
+/// 按原设计仍然可恢复（缺段不是错，是当时的格式里没有这一段），所以读不出来时
+/// 退成默认值、在核包时按「这一段当年没声明」跳过，而不是拿「没声明」当
+/// 「声明为零」去拦一次合法的恢复。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupManifest {
     pub version: String,
@@ -96,9 +105,13 @@ pub struct BackupManifest {
     pub instance_fingerprint: String,
     pub namespace: String,
     pub created_at: String,
+    #[serde(default)]
     pub secrets_keys: Vec<String>,
+    #[serde(default)]
     pub postgres: PostgresReport,
+    #[serde(default)]
     pub qdrant: Vec<CollectionReport>,
+    #[serde(default)]
     pub objects: ObjectsReport,
 }
 
@@ -578,7 +591,12 @@ fn tar_package(staging: &Path, staging_name: &str, out: &Path) -> std::io::Resul
     let tmp = out.with_extension("tmp");
     {
         let file = std::fs::File::create(&tmp)?;
-        let encoder = zstd::Encoder::new(file, 3)?;
+        let mut encoder = zstd::Encoder::new(file, 3)?;
+        // zstd 默认不写内容校验和（frame header 的 `Content_Checksum_flag` 为 0），
+        // 于是 `zstd -t` 只解不校，一个位数翻转的文件仍会被判通过。打开它，让
+        // 压缩帧自带的 xxhash 在校验时被真正算到——只对**这行之后**打出来的包生效，
+        // 已经落盘的旧包没有校验和，改变不了，也不该假装它们有。
+        encoder.include_checksum(true)?;
         let mut builder = tar::Builder::new(encoder);
         builder.append_dir_all(staging_name, staging)?;
         let encoder = builder.into_inner()?;
@@ -870,8 +888,225 @@ fn now_rfc3339() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
+/// 只数不搬：与 `copy_tree` 同一套口径（只算普通文件、只累加 `metadata().len()`），
+/// 用在核包时量包内实测的 objects 段。
+fn measure_tree(dir: &Path) -> std::io::Result<(u64, u64)> {
+    if !dir.exists() {
+        return Ok((0, 0));
+    }
+    let mut files = 0u64;
+    let mut bytes = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(from) = stack.pop() {
+        for entry in std::fs::read_dir(&from)? {
+            let entry = entry?;
+            let ty = entry.file_type()?;
+            if ty.is_dir() {
+                stack.push(entry.path());
+            } else if ty.is_file() {
+                bytes += entry.metadata()?.len();
+                files += 1;
+            }
+        }
+    }
+    Ok((files, bytes))
+}
+
+/// 数一个 `COPY ... WITH (FORMAT csv, HEADER true)` 导出文件里有几**条数据行**
+/// （表头那一条不算）。
+///
+/// 不能直接数换行：CSV 字段里可以嵌换行（文本列里带 `\n` 很常见），Postgres 会
+/// 把这种字段整体加上引号，于是「文件里的换行数」比「记录数」多，拿它当行数会
+/// 在一批合法包上误报。这里按 RFC4180 的状态机走一遍：引号里的换行不算记录界，
+/// 引号里成对的 `""` 是一个转义引号。流式读，因为 metrics 表的 CSV 可达数百 MB。
+fn count_csv_rows(path: &Path) -> std::io::Result<i64> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut in_quotes = false;
+    // 引号里刚读到一个 `"`，它到底是「转义引号的前半个」还是「字段结束」要看
+    // 下一个字节，跨缓冲区也不能丢，所以它是持久的。
+    let mut saw_quote = false;
+    let mut newlines: i64 = 0;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        for &b in &buf[..n] {
+            if in_quotes {
+                if saw_quote {
+                    saw_quote = false;
+                    if b == b'"' {
+                        continue; // "" → 一个转义引号，仍在引号里
+                    }
+                    in_quotes = false; // 字段在这里收尾，这一字节按引号外处理
+                } else if b == b'"' {
+                    saw_quote = true;
+                    continue;
+                } else {
+                    continue;
+                }
+            }
+            if b == b'"' {
+                in_quotes = true;
+            } else if b == b'\n' {
+                newlines += 1;
+            }
+        }
+    }
+    // 表头也占一行；COPY TO STDOUT 每行都以换行收尾，故数据行 = 换行数 - 1。
+    Ok((newlines - 1).max(0))
+}
+
+/// 核包：把包里**实测**到的东西与 manifest **声明**的逐段比。不一致就退非零，
+/// 恢复一个内容与清单对不上的包比拒绝它更危险——`restore_postgres` 第一步是
+/// `TRUNCATE`，被删掉的是当前库；而一份截断的 CSV 会让一张表只灌回一半。
+///
+/// 只核 manifest 声明到的段；某段在 manifest 里是空的（旧格式整段没写），按
+/// 「当年没声明这一段」跳过——缺段不是错。声明了却不符才是错。
+fn verify_package_against_manifest(
+    pkg_dir: &Path,
+    manifest: &BackupManifest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut problems: Vec<String> = Vec::new();
+
+    // postgres：声明的表集与包内 `pg/public.<表>.csv` 集相等，且每张表的行数与
+    // 声明一致；`sequences.sql` 的语句数等于声明的序列数。
+    if !manifest.postgres.tables.is_empty() {
+        let pg_dir = pkg_dir.join("pg");
+        let declared: BTreeMap<&str, i64> = manifest
+            .postgres
+            .tables
+            .iter()
+            .map(|t| (t.name.as_str(), t.rows))
+            .collect();
+        let mut found: BTreeMap<String, i64> = BTreeMap::new();
+        if pg_dir.is_dir() {
+            for entry in std::fs::read_dir(&pg_dir)? {
+                let name = entry?.file_name().to_string_lossy().into_owned();
+                if let Some(table) = name
+                    .strip_prefix("public.")
+                    .and_then(|rest| rest.strip_suffix(".csv"))
+                {
+                    let rows = count_csv_rows(&pg_dir.join(&name))?;
+                    found.insert(table.to_string(), rows);
+                }
+            }
+        }
+        for (table, rows) in &declared {
+            match found.get(*table) {
+                None => problems.push(format!(
+                    "pg: declared table {table:?} is not in the package"
+                )),
+                Some(f) if f != rows => problems.push(format!(
+                    "pg: table {table:?} declared {rows} row(s), package holds {f}"
+                )),
+                Some(_) => {}
+            }
+        }
+        for table in found.keys() {
+            if !declared.contains_key(table.as_str()) {
+                problems.push(format!(
+                    "pg: package table {table:?} is not in the manifest"
+                ));
+            }
+        }
+        let seq_path = pg_dir.join("sequences.sql");
+        let seqs = if seq_path.exists() {
+            std::fs::read_to_string(&seq_path)?
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .count()
+        } else {
+            0
+        };
+        if seqs != manifest.postgres.sequences {
+            problems.push(format!(
+                "pg: manifest declares {} sequence(s), sequences.sql holds {seqs}",
+                manifest.postgres.sequences
+            ));
+        }
+    }
+
+    // qdrant：声明的集合集与包内 `qdrant/<集合>.snapshot` 集相等。快照的
+    // 服务端名字（`snapshot`）落进文件后无从复算，只核文件在不在。
+    if !manifest.qdrant.is_empty() {
+        let qdrant_dir = pkg_dir.join("qdrant");
+        let mut found: BTreeMap<String, ()> = BTreeMap::new();
+        if qdrant_dir.is_dir() {
+            for entry in std::fs::read_dir(&qdrant_dir)? {
+                let name = entry?.file_name().to_string_lossy().into_owned();
+                if let Some(collection) = name.strip_suffix(".snapshot") {
+                    found.insert(collection.to_string(), ());
+                }
+            }
+        }
+        for report in &manifest.qdrant {
+            if !found.contains_key(&report.name) {
+                problems.push(format!(
+                    "qdrant: declared collection {:?} has no {}.snapshot in the package",
+                    report.name, report.name
+                ));
+            }
+        }
+        for collection in found.keys() {
+            if !manifest.qdrant.iter().any(|r| &r.name == collection) {
+                problems.push(format!(
+                    "qdrant: package holds a {collection}.snapshot the manifest does not declare"
+                ));
+            }
+        }
+    }
+
+    // objects：声明的文件数与字节数与包内实测一致。两个数都为 0 视作没有这一段
+    // （旧格式），跳过——不然一个真有对象的包会拿默认值去撞一次误报。
+    if manifest.objects.files != 0 || manifest.objects.bytes != 0 {
+        let (files, bytes) = measure_tree(&pkg_dir.join("objects").join("storage"))?;
+        if files != manifest.objects.files || bytes != manifest.objects.bytes {
+            problems.push(format!(
+                "objects: manifest declares {} file(s)/{} byte(s), package holds {files}/{bytes}",
+                manifest.objects.files, manifest.objects.bytes
+            ));
+        }
+    }
+
+    // secrets：声明里每个键都属于某个对象，包内该对象的 `<对象名>.yaml` 必须在。
+    // 只核对象粒度——键的内容是 base64，写进 manifest 的只有键名清单。
+    if !manifest.secrets_keys.is_empty() {
+        let secrets_dir = pkg_dir.join("secrets");
+        let mut declared_objects: BTreeMap<String, ()> = BTreeMap::new();
+        for key in &manifest.secrets_keys {
+            if let Some((object, _)) = key.split_once('/') {
+                declared_objects.insert(object.to_string(), ());
+            }
+        }
+        for object in declared_objects.keys() {
+            if !secrets_dir.join(format!("{object}.yaml")).is_file() {
+                problems.push(format!(
+                    "secrets: manifest lists keys of object {object:?} but the package has no {object}.yaml"
+                ));
+            }
+        }
+    }
+
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "package does not match its manifest ({}):\n  - {}",
+            pkg_dir.display(),
+            problems.join("\n  - ")
+        )
+        .into())
+    }
+}
+
 /// 恢复入口：`pkg` 可为 .tar.zst 或已解包目录。逐段恢复存在的部分，
 /// 缺段记日志不判负——包可能来自只备份了部分段的旧版本。
+///
+/// 动手恢复之前先拿 manifest 逐段核包（`verify_package_against_manifest`）：
+/// 内容与清单对不上就退非零，绝不带着分歧走到 `TRUNCATE` 那一步。
 pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let database_url = std::env::var("COGNEVA_DATABASE_URL")
         .map_err(|_| "COGNEVA_DATABASE_URL is required for restore")?;
@@ -901,6 +1136,8 @@ pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
             created_at = %manifest.created_at,
             "restoring package"
         );
+        // 清单说这个包里有什么，此刻盘上是事实——两者对不上就停在这里。
+        verify_package_against_manifest(&pkg_dir, &manifest)?;
     } else {
         return Err(format!("{} missing manifest.json", pkg_dir.display()).into());
     }
@@ -1075,6 +1312,153 @@ mod tests {
             b"a,b\n1,2\n"
         );
         assert!(root.join("manifest.json").exists());
+    }
+
+    #[test]
+    fn the_package_frame_carries_a_content_checksum() {
+        let staging = tempfile::tempdir().unwrap();
+        std::fs::write(staging.path().join("f"), b"x").unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let pkg = out_dir
+            .path()
+            .join("cogneva-backup-20260914T000000Z.tar.zst");
+        tar_package(staging.path(), "cogneva-backup-20260914T000000Z", &pkg).unwrap();
+
+        // zstd frame: 4 字节 magic，第 5 字节是 Frame_Header_Descriptor，其
+        // bit2(0x04) 即 Content_Checksum_flag。默认不写，这里必须为 1——否则
+        // `zstd -t` 只解不校，翻转一个位仍然判通过。
+        let bytes = std::fs::read(&pkg).unwrap();
+        assert_eq!(&bytes[..4], &[0x28, 0xb5, 0x2f, 0xfd], "not a zstd frame");
+        assert_ne!(
+            bytes[4] & 0x04,
+            0,
+            "the zstd frame must set Content_Checksum_flag"
+        );
+    }
+
+    #[test]
+    fn csv_rows_are_counted_by_records_not_by_newlines() {
+        let dir = tempfile::tempdir().unwrap();
+        // 普通两行；0 行只有表头；字段里嵌换行；字段里是成对的转义引号。
+        let cases: [(&str, &[u8], i64); 4] = [
+            ("plain.csv", b"a,b\n1,2\n3,4\n", 2),
+            ("header-only.csv", b"a,b\n", 0),
+            ("embedded-newline.csv", b"a,b\n\"x\ny\",2\n", 1),
+            ("escaped-quotes.csv", b"a,b\n\"he said \"\"hi\"\"\",2\n", 1),
+        ];
+        for (name, body, want) in cases {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            assert_eq!(count_csv_rows(&path).unwrap(), want, "{name}");
+        }
+    }
+
+    fn manifest_for(pkg: &BackupManifest) -> String {
+        serde_json::to_string(pkg).unwrap()
+    }
+
+    fn sample_manifest() -> BackupManifest {
+        BackupManifest {
+            version: "1.0.0".into(),
+            revision: "abc".into(),
+            instance_fingerprint: "fp".into(),
+            namespace: "cogneva".into(),
+            created_at: now_rfc3339(),
+            secrets_keys: vec!["cogneva-secrets/jwt-secret".into()],
+            postgres: PostgresReport {
+                tables: vec![TableReport {
+                    name: "t".into(),
+                    rows: 2,
+                }],
+                sequences: 1,
+            },
+            qdrant: vec![CollectionReport {
+                name: "c1".into(),
+                snapshot: "c1-123.snapshot".into(),
+                points: 7,
+            }],
+            objects: ObjectsReport { files: 1, bytes: 5 },
+        }
+    }
+
+    fn write_package_like(manifest: &BackupManifest, dir: &Path) {
+        std::fs::create_dir_all(dir.join("pg")).unwrap();
+        std::fs::create_dir_all(dir.join("qdrant")).unwrap();
+        std::fs::create_dir_all(dir.join("objects/storage")).unwrap();
+        std::fs::create_dir_all(dir.join("secrets")).unwrap();
+        std::fs::write(dir.join("manifest.json"), manifest_for(manifest)).unwrap();
+        std::fs::write(dir.join("pg/public.t.csv"), b"a,b\n1,2\n3,4\n").unwrap();
+        std::fs::write(
+            dir.join("pg/sequences.sql"),
+            b"SELECT setval('t_id_seq', 2, true);\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("qdrant/c1.snapshot"), b"snap").unwrap();
+        std::fs::write(dir.join("objects/storage/x.bin"), b"12345").unwrap();
+        std::fs::write(
+            dir.join("secrets/cogneva-secrets.yaml"),
+            b"apiVersion: v1\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_package_that_matches_its_manifest_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = sample_manifest();
+        write_package_like(&manifest, dir.path());
+        verify_package_against_manifest(dir.path(), &manifest).unwrap();
+    }
+
+    #[test]
+    fn a_package_that_disagrees_with_its_manifest_is_rejected() {
+        // 行数对不上：包被截断过的典型形状。
+        let dir = tempfile::tempdir().unwrap();
+        let mut manifest = sample_manifest();
+        write_package_like(&manifest, dir.path());
+        manifest.postgres.tables[0].rows = 3;
+        let err = verify_package_against_manifest(dir.path(), &manifest).unwrap_err();
+        assert!(err.to_string().contains("declared 3 row"), "{err}");
+
+        // 声明的表不在包里。
+        let dir = tempfile::tempdir().unwrap();
+        let mut manifest = sample_manifest();
+        write_package_like(&manifest, dir.path());
+        std::fs::remove_file(dir.path().join("pg/public.t.csv")).unwrap();
+        manifest.postgres.tables[0].rows = 0;
+        let err = verify_package_against_manifest(dir.path(), &manifest).unwrap_err();
+        assert!(err.to_string().contains("is not in the package"), "{err}");
+
+        // objects 计数对不上。
+        let dir = tempfile::tempdir().unwrap();
+        let mut manifest = sample_manifest();
+        write_package_like(&manifest, dir.path());
+        manifest.objects.bytes = 6;
+        assert!(verify_package_against_manifest(dir.path(), &manifest).is_err());
+
+        // 声明的集合缺快照文件。
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = sample_manifest();
+        write_package_like(&manifest, dir.path());
+        std::fs::remove_file(dir.path().join("qdrant/c1.snapshot")).unwrap();
+        assert!(verify_package_against_manifest(dir.path(), &manifest).is_err());
+    }
+
+    #[test]
+    fn an_older_manifest_missing_a_section_is_not_an_error() {
+        // 旧格式的包：manifest 里没有 qdrant / objects / postgres 段。按原设计
+        // 缺段不是错——解析要能过（serde default），核包要跳过该段而不是当成
+        // 「声明为零」去拦。
+        let json = r#"{"version":"0.1.0","revision":"old","instance_fingerprint":"fp",
+                       "namespace":"cogneva","created_at":"2026-01-01T00:00:00Z"}"#;
+        let manifest: BackupManifest = serde_json::from_str(json).unwrap();
+        assert!(manifest.qdrant.is_empty());
+        assert!(manifest.postgres.tables.is_empty());
+        assert_eq!(manifest.objects.files, 0);
+
+        // 一个空目录（没有 pg/qdrant/objects/secrets）不该被判非零。
+        let dir = tempfile::tempdir().unwrap();
+        verify_package_against_manifest(dir.path(), &manifest).unwrap();
     }
 
     #[test]
