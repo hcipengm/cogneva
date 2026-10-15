@@ -1,3 +1,6 @@
+//! principle: feedback_an_advertised_capability_is_a_row_in_the_serving_table
+//! principle: feedback_a_two_sided_equality_over_a_renaming_pins_where_the_sort_happens
+//!
 //! The MCP server's advertised capability set has to be computed from what it
 //! actually answers, not written next to it.
 //!
