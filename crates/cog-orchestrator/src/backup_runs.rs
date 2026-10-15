@@ -500,9 +500,92 @@ mod tests {
             .collect()
     }
 
-    /// The selector that reads one value out of the account's family.
-    fn selector(readout: BackupReadout) -> String {
-        format!("readout=\"{}\"", readout.as_str())
+    /// The operators a `readout` selector can be written with, longest first so
+    /// that `=~` is not read as `=`.
+    const SELECTOR_OPERATORS: [&str; 4] = ["!~", "=~", "!=", "="];
+
+    /// What one expression's `readout` selectors name.
+    #[derive(Default)]
+    struct ReadoutSelectors {
+        /// Values the expression can return.
+        selected: BTreeSet<String>,
+        /// Values the expression excludes (`!=`, `!~`).
+        excluded: BTreeSet<String>,
+    }
+
+    /// Every value one expression's `readout` selectors name.
+    ///
+    /// Both halves of the ledger check run on this, and neither can use a bare
+    /// substring: `readout="kept"` is only the simplest form of the selector. An
+    /// alternation names several values at once and names none of them literally
+    /// -- read as text it leaves a line recorded as having no reader while a rule
+    /// already reads it. A negation names everything except its operand, which is
+    /// a different claim from selecting, so the two are reported apart.
+    ///
+    /// Alternatives have to be literal names: the roster is a closed set, so
+    /// enumerating costs nothing, and a selector this cannot enumerate is one it
+    /// cannot check in either direction.
+    fn readout_selectors(promql: &str) -> ReadoutSelectors {
+        let mut selectors = ReadoutSelectors::default();
+        let mut rest = promql;
+        while let Some(at) = rest.find("readout") {
+            rest = &rest[at + "readout".len()..];
+            let trimmed = rest.trim_start();
+            let Some((operator, after)) = SELECTOR_OPERATORS.iter().find_map(|operator| {
+                trimmed
+                    .strip_prefix(operator)
+                    .map(|after| (*operator, after))
+            }) else {
+                // A mention that is not a selector -- `by (readout)` is the one
+                // the rules actually use. Reading on past it keeps the scan
+                // linear and makes such a mention cost nothing.
+                continue;
+            };
+            let after = after.trim_start();
+            let Some(after) = after.strip_prefix('"') else {
+                continue;
+            };
+            let Some(end) = after.find('"') else {
+                continue;
+            };
+            let named = &after[..end];
+            rest = &after[end + 1..];
+
+            let values: Vec<&str> = if operator.ends_with('~') {
+                named.split('|').map(str::trim).collect()
+            } else {
+                vec![named]
+            };
+            for value in values {
+                assert!(
+                    !value.is_empty()
+                        && value
+                            .chars()
+                            .all(|character| character.is_ascii_alphanumeric() || character == '_'),
+                    "a readout selector this check cannot enumerate: {value:?} in {promql} -- name \
+                     the values one at a time, so that both directions can read them"
+                );
+                if operator.starts_with('!') {
+                    selectors.excluded.insert(value.to_string());
+                } else {
+                    selectors.selected.insert(value.to_string());
+                }
+            }
+        }
+        selectors
+    }
+
+    /// The shipped rules whose expression names this value, by selecting it or by
+    /// excluding it. Either way the rule is coupled to the value.
+    fn rules_naming(rules: &BTreeMap<String, String>, value: &str) -> Vec<String> {
+        rules
+            .iter()
+            .filter(|(_, promql)| {
+                let selectors = readout_selectors(promql);
+                selectors.selected.contains(value) || selectors.excluded.contains(value)
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     /// Every value the loop can publish has exactly one line in
@@ -547,7 +630,6 @@ mod tests {
         let rules = shipped_rules();
 
         for (readout, reader) in READOUT_READERS {
-            let selector = selector(readout);
             match reader {
                 ReadoutReader::Rule(name) => {
                     let promql = rules.get(name).unwrap_or_else(|| {
@@ -556,8 +638,9 @@ mod tests {
                             readout.as_str()
                         )
                     });
+                    let selected = readout_selectors(promql).selected;
                     assert!(
-                        promql.contains(&selector),
+                        selected.contains(readout.as_str()),
                         "readout {} is recorded as read by {name}, whose expression does not \
                          select it: {promql}",
                         readout.as_str()
@@ -569,19 +652,51 @@ mod tests {
                         "readout {} has no reader and no reason it is still published",
                         readout.as_str()
                     );
-                    let naming: Vec<&String> = rules
-                        .iter()
-                        .filter(|(_, promql)| promql.contains(&selector))
-                        .map(|(name, _)| name)
-                        .collect();
+                    let naming = rules_naming(&rules, readout.as_str());
                     assert!(
                         naming.is_empty(),
-                        "readout {} is recorded as having no reader, but these rules select it: \
+                        "readout {} is recorded as having no reader, but these rules read it: \
                          {naming:?}",
                         readout.as_str()
                     );
                 }
             }
         }
+    }
+
+    /// No rule reads a value the account cannot publish.
+    ///
+    /// The table above is keyed by the producer's roster, so nothing in it can
+    /// catch a name the *rules* have that the producer does not: a mistyped
+    /// selector leaves a rule waiting on a cell that is never published, and a
+    /// rule that cannot match anything never fires. Nothing else looks at that
+    /// name, so the rule would stay dark with every gate green.
+    #[test]
+    fn every_value_a_rule_reads_is_one_the_account_publishes() {
+        let rules = shipped_rules();
+        let published: BTreeSet<&str> = BackupReadout::ALL
+            .iter()
+            .map(|readout| readout.as_str())
+            .collect();
+
+        let mut read = 0usize;
+        for (name, promql) in &rules {
+            let selectors = readout_selectors(promql);
+            for value in selectors.selected.iter().chain(selectors.excluded.iter()) {
+                read += 1;
+                assert!(
+                    published.contains(value.as_str()),
+                    "rule {name} reads readout {value:?}, which the account never publishes; it \
+                     can only be a mistyped selector, and a rule that matches nothing never fires. \
+                     The account publishes {published:?}"
+                );
+            }
+        }
+
+        assert!(
+            read > 0,
+            "no rule reads the backup account at all -- either the rules moved, or the selectors \
+             are spelled a way this check no longer recognises"
+        );
     }
 }
