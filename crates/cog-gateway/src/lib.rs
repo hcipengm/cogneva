@@ -1385,6 +1385,16 @@ pub const UNPRODUCED_SERIES_METRIC: &str = "cogneva_metric_held_without_producer
 /// one series cannot carry both.
 pub const UNREADABLE_HELD_METRIC: &str = "cogneva_metric_held_unreadable";
 
+/// The series name the count of registered observables is published under.
+///
+/// Declared here for the same reason as the two above -- it reaches the scrape
+/// body rather than the store, so the registry, which lists the names a
+/// `record_*` call can write, is not where it belongs. It is a constant rather
+/// than a literal inside the format string for a second reason: a name spelled
+/// only inside a literal the producer builds is invisible to any census that
+/// reads declarations, so it is a reading on the wire that no gate can name.
+pub const OBSERVABLES_REGISTERED_METRIC: &str = "cogneva_observables_registered";
+
 /// A label value with the three characters the text format reserves escaped.
 ///
 /// The values are series names, which are declared in this crate's own registry
@@ -1548,14 +1558,12 @@ async fn prometheus_metrics_handler(State(state): State<Arc<GatewayState>>) -> R
     // 以具体类型注册就对这里不可见，指标静默消失。暴露注册数量让告警面
     // 能发现"指标缺席"本身，而不是等人工察觉。
     if !body.is_empty() {
-        body.push_str(
-            "\n# HELP cogneva_observables_registered Observable services visible to the metrics endpoint\n\
-             # TYPE cogneva_observables_registered gauge\n",
-        );
+        let name = OBSERVABLES_REGISTERED_METRIC;
         body.push_str(&format!(
-            "cogneva_observables_registered {}\n",
-            state.observables.len()
+            "\n# HELP {name} Observable services visible to the metrics endpoint\n\
+             # TYPE {name} gauge\n"
         ));
+        body.push_str(&format!("{name} {}\n", state.observables.len()));
     }
 
     if body.is_empty() {

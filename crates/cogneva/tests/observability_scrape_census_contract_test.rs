@@ -169,6 +169,16 @@ const UNREGISTERED: &[(&str, Unread)] = &[
         "cogneva_plugin_pin_unordered_init_read_count",
         Unread::Gap("how many such reads a missing `requires` edge left unordered, as the always-answering half of the family above. The first reading of this family is also what found its own defect: the number was one larger than the series any query could count, because a read registered twice at init is one series on the exposition. That half is closed now -- the members are collapsed where the series are built, so the size and the series agree -- and what remains owed is the reader nothing has given it"),
     ),
+    // A series a build publishes with nothing anywhere reading it, found by a
+    // scan rather than by a reader: the count of observables registered for
+    // scraping. Its producer spelled the name inline in the exposition body,
+    // which is a shape the declaration scan cannot read, so the series was live
+    // on the wire and named by no gate until the literal scan was widened to
+    // see it. What it is owed is the face its own comment intends.
+    (
+        "cogneva_observables_registered",
+        Unread::Gap("how many observables are registered for scraping, rendered into the exposition body rather than recorded, which is why the registry does not hold it. The producer's own comment gives the reason it exists: registration is keyed on a static type id, so a service registered as a concrete type is invisible to this endpoint and its metrics leave the scrape silently -- the count is what lets a reader see the family go missing rather than wait for a person to notice. Two sibling series in that file are both read by a rule and this one is read by nothing, so the face is owed rather than decided"),
+    ),
     // A name that had a `Gap` here until a panel was written to carry it:
     // `cogneva_stream_read_failures_total`, the count of reads a consumer's loop
     // had refused, split by the cause the bus itself named. The entry is gone
@@ -206,14 +216,22 @@ const UNREGISTERED: &[(&str, Unread)] = &[
 /// How many `Gap` entries this census left.
 ///
 /// The first run is where this number comes from, and it is meant to be read as
-/// it is: eight names the tree publishes into a scrape with no face carrying
-/// them. The ratchet is the same one the reader-face census keeps -- a new
-/// series nothing reads must be classified deliberately, and calling it a gap
-/// raises this number on purpose. It comes down when a face is written, and
-/// that is a change to this constant plus the removal of the entry: the ninth,
-/// the consumer read-failure counter, left when the stream-consumer panel was
-/// written to carry it.
-const GAPS_AT_SCRAPE_CENSUS: usize = 8;
+/// it is: names the tree publishes into a scrape with no face carrying them.
+/// The ratchet is the same one the reader-face census keeps -- a new series
+/// nothing reads must be classified deliberately, and calling it a gap raises
+/// this number on purpose. It comes down when a face is written, and that is a
+/// change to this constant plus the removal of the entry: one name that was
+/// here, the consumer read-failure counter, left when the stream-consumer panel
+/// was written to carry it.
+///
+/// Nine, and the ninth is not a first-run reading: `cogneva_observables_registered`
+/// was published by a shape neither the declaration scan nor the face census
+/// could read, so it never became a row here. Widening the literal scan is what
+/// made it visible, and the honest close was to file the debt that series had
+/// been carrying -- the alternative, exempting it, would have taken a series
+/// that answers on the live scrape out of the census' reach and left the count
+/// saying eight while nine were owed.
+const GAPS_AT_SCRAPE_CENSUS: usize = 9;
 
 /// How many scrape-only series are carried by a produced table and by nothing
 /// that reads them.
@@ -589,7 +607,10 @@ fn published_names() -> BTreeSet<String> {
 ///
 /// The name has to be closed on both sides by a quote and contain nothing but
 /// the characters a series name uses, so the exposition fixtures a test writes
-/// as text -- `"cogneva_x{node=\"a\"} 1"` -- are not read as declarations.
+/// as text -- `"cogneva_no_such_series{node=\"a\"} 1"` -- are not read as
+/// declarations. (The example names a series already listed in `NOT_A_SERIES`:
+/// the literal scan below reads quoted names whatever follows them, so an
+/// example naming a real series would red on its own prose.)
 fn declared_names(text: &str) -> Vec<String> {
     let mut found = Vec::new();
     let needle = format!("\"{NAME_PREFIX}");
@@ -641,6 +662,19 @@ fn is_a_declaration(before: &str) -> bool {
 }
 
 /// Every well-formed series-name literal in `text`, with no shape assumed.
+///
+/// What the name may be followed by is not assumed either, and that is the
+/// whole point of this scan: the declaration scan above reads a name closed on
+/// both sides by a quote, so a producer that splices its name into a format
+/// string -- `format!("cogneva_no_such_series {}\n", n)` -- spells a series
+/// into the scrape with no shape any declaration reader can see. The
+/// right-hand delimiter is
+/// therefore "whatever ends a name": a quote (the declaration shape), a `{`
+/// (a selector, the shape an exposition fixture writes), whitespace or the end
+/// of the text (a name starting a line being built). The opening quote on the
+/// left is still required, so a name in prose is not read as a literal unless
+/// it is quoted -- which is why the example above is written with quotes and
+/// has to name a series that is already exempt.
 fn series_name_literals(text: &str) -> Vec<String> {
     let mut found = Vec::new();
     let needle = format!("\"{NAME_PREFIX}");
@@ -650,7 +684,11 @@ fn series_name_literals(text: &str) -> Vec<String> {
         let name_end = text[name_start..]
             .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
             .map_or(text.len(), |i| name_start + i);
-        if text[name_end..].starts_with('"') {
+        let delimited = match text[name_end..].chars().next() {
+            None => true,
+            Some(c) => c == '"' || c == '{' || c.is_whitespace(),
+        };
+        if delimited {
             found.push(text[name_start..name_end].to_string());
         }
         from = name_end.max(name_start);
