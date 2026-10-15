@@ -575,7 +575,7 @@ data:
         {
           "id": 16,
           "title": "Host Build Slots",
-          "description": "Builds running on the host against the bound, and builds queued behind them. The bound is per host, but each process publishes its own reading of it, which is why both roles are drawn: a builder line is a process that takes slots, and a control-plane line flat at zero is a process that runs no builds and deliberately bounds nothing. Two builders whose slot directories differ bound only themselves and would both look normal here, so the dir label is on the series for whoever is comparing them by hand; the rule build_gate_not_in_force is what notices. The ceiling is what the machine could take rather than what is being admitted, and it carries the dimension that is setting it: a bound sitting below its ceiling with the dimension reading io is the control law holding back on a busy disk, and one that is at its ceiling all the way up is the machine's own size - reading cgroup_memory means the container's memory limit, not the host, is what is limiting it.",
+          "description": "Builds running on the host against the bound, and builds queued behind them. The bound is per host, but each process publishes its own reading of it, which is why both roles are drawn: a builder line is a process that takes slots, and a control-plane line flat at zero is a process that runs no builds and deliberately bounds nothing. Two builders whose slot directories differ bound only themselves and would both look normal here, so the dir label is on the series for whoever is comparing them by hand; the rule build_gate_not_in_force is what notices. The ceiling is what the machine could take rather than what is being admitted, and it carries the dimension that is setting it: a bound sitting below its ceiling with the dimension reading io is the control law holding back on a busy disk, and one that is at its ceiling all the way up is the machine's own size - reading cgroup_memory means the container's memory limit, not the host, is what is limiting it. Two cells of the same reading are drawn beside them. occupied is the slot files locked right now in the shared directory, so it counts every builder on this host rather than this process alone: a process admitting up to its own bound while another builds beside it reads exactly like one admitting up to its bound, and occupied beside the bound is what tells the two apart. excluded is 1 while a holder that is not a build is holding every slot to keep builds out -- a cache sweep or an image-registry restart -- and it exists because every other reading in this family answers the question a refusal raises wrongly, counting that holder as a build. Neither is alerted on, and neither is late by omission: exclusion is the mechanism this gate exists for, so a rule on it would fire on the gate working, and how long a sweep should take has no derivable answer here.",
           "type": "timeseries",
           "gridPos": {
             "h": 8,
@@ -611,6 +611,22 @@ data:
             {
               "expr": "cogneva_build_gate_waiting",
               "legendFormat": "{{role}} queued",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_build_gate_occupied",
+              "legendFormat": "{{role}} occupied",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_build_gate_excluded",
+              "legendFormat": "{{role}} excluded (not a build)",
               "datasource": {
                 "type": "prometheus",
                 "uid": "${datasource}"
@@ -1470,6 +1486,170 @@ data:
             {
               "expr": "sum by (gate, recurrence) (increase(cogneva_evolution_learning_recurrence_at_threshold_total[6h]))",
               "legendFormat": "{{gate}} {{recurrence}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 40,
+          "title": "Orphan Reaping",
+          "description": "Orphans each process has collected since it started, summed over the processes publishing it, against the ones still waiting. The gauge is what the rule orphans_unreaped watches, and it can only say a reaper has stopped: a process that reaps everything and one that reaps nothing have the same zero waiting. That reaping is happening at all is the other half of the claim and the half the gauge cannot carry, which is what this counter is for. It is summed rather than drawn per pod because the counter belongs to one process and starts again when the pod does, so what the sum answers is what this deployment has collected. There is no bound to alert on and none is wanted: collections follow the git fetches and sandbox commands that leave children behind, so a rate is a property of the workload's shape rather than of the reaper, and the number that would be needed to alert is exactly the number nobody has declared. A line that keeps climbing is the reaper working; a line that is flat while the waiting gauge is above zero is the reading that pairs with the rule.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 160
+          },
+          "targets": [
+            {
+              "expr": "increase(cogneva_orphans_reaped_total[6h])",
+              "legendFormat": "collected in 6h",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_process_zombies",
+              "legendFormat": "waiting now",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 41,
+          "title": "Consumed Streams: Pending Against Unreclaimed",
+          "description": "Entries waiting on each consumed stream, split into the ones a reclaim pass would already have taken back and the rest. The two are drawn together because a queue that is busy and a queue that is stuck look alike in one number: pending counts everything on the stream, unreclaimed counts only what has been pending longer than the stream's own claim threshold. A pending line that stays up while the unreclaimed one sits near zero is churn -- work arriving and being taken -- which is a stream under load doing its job, not a defect. What makes this a panel rather than a rule is that a backlog is a property of how much arrived against how fast it is consumed, both of the workload's, and the one reading in this family a threshold can be built on is the age of the oldest unreclaimed entry, whose bound is a multiple of the reclaim policy the deployment configured -- that is the rule stream_pending_unreclaimed, and it is where a stuck consumer is alerted on. This panel is the size the rule deliberately does not judge; read it to tell a backlog that is moving from one whose age is climbing. These cells are measured on the stream's own cadence rather than the loop's, so a sweep that blocks freezes them rather than hanging the loop that writes them, and the family's last-measurement cell is the series that says the measurement itself is still running.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 160
+          },
+          "targets": [
+            {
+              "expr": "cogneva_stream_pending_count",
+              "legendFormat": "{{stream}} pending",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_stream_pending_unreclaimed_count",
+              "legendFormat": "{{stream}} unreclaimed",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 42,
+          "title": "Host Slices: Page Cache Against Anonymous",
+          "description": "Page cache and other file-backed memory held under each host slice, beside the anonymous memory sharing the same cell. They are published separately on purpose, and drawing them together is what the separation is for: a slice's total is anonymous plus file-backed plus a kernel remainder, so a slice under pressure from page cache and one under pressure from a process's own heap read the same on any total. The rule in this family reads the anonymous cell only -- host_slice_anon_floor_unmeasured, a floor held flat over fifteen minutes -- because anonymous memory does not fall on its own while page cache does, which is what makes a floor on it mean something a floor on the total would not. So read this panel as the second half of that rule rather than as a second threshold: a file line rising under a slice the rule has flagged says the pressure is cache, and a file line flat while the anonymous line climbs says it is the process. Neither line has a bound to alert on: how much page cache a host should be carrying follows what it reads, and these slices are the host's own rather than a workload's.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 168
+          },
+          "targets": [
+            {
+              "expr": "cogneva_host_slice_file_bytes",
+              "legendFormat": "{{slice}} file-backed ({{node}})",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_host_slice_anon_bytes",
+              "legendFormat": "{{slice}} anonymous ({{node}})",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 43,
+          "title": "Background Loop Roles: Holders Against the Books",
+          "description": "Who holds each single-writer role, and whether the books that record the handovers add up. A loop declared once per deployment takes a lease on the role it guards, so the holders line is 1 for the process holding it and 0 for one that asked and was refused, summed over the processes publishing it: a loop whose work nobody holds and one whose every replica is standing down both read as a flat zero here, and the declaration -- which no line on this panel shows -- is what separates them. That is why a rule rather than a threshold reads it (background_loop_role_unowned). The books line is the arithmetic the alert asserts, drawn signed on purpose: terms taken, minus terms lost, minus the holder reading, which is zero while the three agree. A positive value is a term counted as taken that the holder reading does not show; a negative one is a term whose ending was counted and whose taking never was. The rule reads the absolute value only, because a comparison operator in PromQL hands back the left operand's value and a negative mismatch would fall out of its condition -- the sign lives here and nowhere else, which is why this panel is not optional. Read either sign beside the third line: asks that came back unanswered in the last hour are what makes the holder reading absent rather than zero, and while that is so the arithmetic has nothing to compare and the rules over it are quiet by design, so an unanswered ask with the books line flat is the cause and the silence together. The counts belong to one process and start again when the pod does, so a mismatch does not outlive the pod it happened in: a line that returns to zero after a restart is a defect that went with its process, and one that comes back on the next pod is a defect that keeps happening.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 176
+          },
+          "targets": [
+            {
+              "expr": "sum by (loop) (cogneva_loop_owner_held)",
+              "legendFormat": "{{loop}} holders",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "sum by (loop) (cogneva_loop_owner_acquisitions_total) - sum by (loop) (cogneva_loop_owner_losses_total) - sum by (loop) (cogneva_loop_owner_held)",
+              "legendFormat": "{{loop}} books, signed (should be zero)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "sum by (loop) (increase(cogneva_loop_owner_probe_failures_total[1h]))",
+              "legendFormat": "{{loop}} asks unanswered in 1h",
               "datasource": {
                 "type": "prometheus",
                 "uid": "${datasource}"

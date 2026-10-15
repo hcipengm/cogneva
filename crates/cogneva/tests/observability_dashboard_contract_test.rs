@@ -196,6 +196,22 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["dir", "role"],
         "crates/cog-core/src/build_gate.rs",
     ),
+    // The two gauges drawn beside the bound. Neither states how much of the
+    // bound this process is using -- occupied counts the slot files locked in
+    // the shared directory, so it is every builder on the host, and excluded is
+    // 1 while a holder that is not a build is keeping builds out. They are on a
+    // panel rather than behind a rule because exclusion is the gate working,
+    // and how long a cache sweep may hold the field has no derivable answer.
+    (
+        "cogneva_build_gate_occupied",
+        &["dir", "role"],
+        "crates/cog-core/src/build_gate.rs",
+    ),
+    (
+        "cogneva_build_gate_excluded",
+        &["dir", "role"],
+        "crates/cog-core/src/build_gate.rs",
+    ),
     (
         "cogneva_build_gate_acquired_total",
         &["dir", "role"],
@@ -383,6 +399,80 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         "cogneva_loop_restarts_total",
         &["loop"],
         "crates/cog-core/src/loop_health.rs",
+    ),
+    // The single-writer roles, drawn as one panel because none of the four
+    // answers its own question: the holder cell cannot say the work moved, and
+    // the two counters cannot say who is holding it now. The books panel draws
+    // the arithmetic signed, which the rule cannot: a comparison hands back the
+    // left operand's value, so the rule reads the absolute value and the
+    // direction of a mismatch is only readable here.
+    (
+        "cogneva_loop_owner_held",
+        &["loop"],
+        "crates/cog-core/src/loop_health.rs",
+    ),
+    (
+        "cogneva_loop_owner_acquisitions_total",
+        &["loop"],
+        "crates/cog-core/src/loop_health.rs",
+    ),
+    (
+        "cogneva_loop_owner_losses_total",
+        &["loop"],
+        "crates/cog-core/src/loop_health.rs",
+    ),
+    (
+        "cogneva_loop_owner_probe_failures_total",
+        &["loop"],
+        "crates/cog-core/src/loop_health.rs",
+    ),
+    // Orphans collected, against the zombies still waiting. The gauge is what
+    // the rule `orphans_unreaped` watches and it can only say a reaper stopped:
+    // a process that reaps everything and one that reaps nothing both show a
+    // zero. The counter is the half no threshold carries -- that reaping is
+    // happening at all -- and it has no bound to alert on, because what a host
+    // leaves behind follows the work it does.
+    (
+        "cogneva_orphans_reaped_total",
+        &[],
+        "crates/cog-observability/src/process_zombies.rs",
+    ),
+    (
+        "cogneva_process_zombies",
+        &[],
+        "crates/cog-observability/src/process_zombies.rs",
+    ),
+    // A consumed stream's backlog, split into what a reclaim pass would already
+    // have taken back and the rest. Drawn together because one number cannot
+    // tell a busy queue from a stuck one, and it is a panel rather than a rule
+    // because the size of a backlog is the workload's own shape -- the one
+    // reading here a threshold can be built on is the age of the oldest
+    // unreclaimed entry, and that rule exists.
+    (
+        "cogneva_stream_pending_count",
+        &["stream"],
+        "crates/cog-orchestrator/src/observable.rs",
+    ),
+    (
+        "cogneva_stream_pending_unreclaimed_count",
+        &["stream"],
+        "crates/cog-orchestrator/src/observable.rs",
+    ),
+    // The two cells of one host slice's memory, drawn beside each other because
+    // the rule in this family reads the anonymous one only: anonymous memory
+    // does not fall on its own while page cache does, so a floor on the anon
+    // cell means something a floor on their sum would not -- and a slice under
+    // pressure from cache and one under pressure from a process read alike on
+    // any total.
+    (
+        "cogneva_host_slice_file_bytes",
+        &["slice", "node"],
+        "crates/cog-observability/src/host_ledger.rs",
+    ),
+    (
+        "cogneva_host_slice_anon_bytes",
+        &["slice", "node"],
+        "crates/cog-observability/src/host_ledger.rs",
     ),
     // What the self-discovery watcher does with each round's signals. No panel
     // draws these yet -- they are published so that "the watcher has gone quiet"

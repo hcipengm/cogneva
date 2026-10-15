@@ -169,51 +169,12 @@ const UNREGISTERED: &[(&str, Unread)] = &[
         "cogneva_plugin_pin_unordered_init_read_count",
         Unread::Gap("how many such reads a missing `requires` edge left unordered, as the always-answering half of the family above. The first reading of this family is also what found its own defect: the number was one larger than the series any query could count, because a read registered twice at init is one series on the exposition. That half is closed now -- the members are collapsed where the series are built, so the size and the series agree -- and what remains owed is the reader nothing has given it"),
     ),
-    // Two gauges on the build gate, each published because the series beside it
-    // cannot state its fact. Both are read by nobody.
-    (
-        "cogneva_build_gate_occupied",
-        Unread::Gap("slot files locked right now in the shared directory, so every builder on the host counted rather than this process alone. The doc says the two gauges exist for the difference between them -- one process admitting up to its bound while another builds beside it reads exactly like one process admitting up to its bound -- and no face reads this one, so whether the host is carrying one build or two is still unreadable everywhere"),
-    ),
-    (
-        "cogneva_build_gate_excluded",
-        Unread::Gap("1 while a holder that is not a build holds every slot to keep builds out. It is its own series because it answers the question a refusal raises -- did a build take the slot or something else -- and every other reading in the family answers that wrongly, counting a cache sweep as a build. No face reads it, so a refusal it caused still points at a build that does not exist"),
-    ),
-    // The ownership pair: the gauge and the probe-failure counter beside them
-    // are read, and neither states what either of these counts.
-    (
-        "cogneva_loop_owner_acquisitions_total",
-        Unread::Gap("times this process took the loop's role, including every term won back after losing one. The holder gauge is read and cannot state it: a first acquisition and a takeover leave the same pair of gauge values, and only this counter says the work moved to someone"),
-    ),
-    (
-        "cogneva_loop_owner_losses_total",
-        Unread::Gap("times this process held the role and then stopped. A loss is a takeover seen from the losing side and is not the winner's acquisition -- the loser has stopped doing work it was doing, and everything it had published is last-known from that moment. It is counted where it happened because the loser may be the only process that can say so, and no face reads it"),
-    ),
-    (
-        "cogneva_orphans_reaped_total",
-        Unread::Gap("orphans this process has collected since it started, published beside the gauge of zombies still waiting. The gauge's rule fires on a zombie that stays, which is a reaper that has stopped; this counter is the other half -- that reaping is happening at all -- and no face reads it. What a rule would need is a bound on how many collections are ordinary, and collections follow git fetches, so the missing half is a rate nobody has declared"),
-    ),
-    (
-        "cogneva_host_slice_file_bytes",
-        Unread::Gap("page cache and other file-backed memory held under one host slice. The rule on the neighbouring anon cell reads a floor and a flatness over fifteen minutes, and this cell is published separately on purpose -- a slice's memory.current is anon plus file plus a kernel remainder, so folding them would hide which of the two moved. No face reads it, so a slice whose pressure is page cache and one whose pressure is a process read the same on the rule that exists"),
-    ),
-    (
-        "cogneva_stream_pending_count",
-        Unread::Gap("entries pending right now on one consumed stream, measured on its own cadence because a sweep that blocks would otherwise freeze the reading. The rules on this family read the claim idle time, the measure cadence and the age of the oldest unreclaimed entry, and none of them states the size of the population: a stream holding one message and one holding a thousand read alike"),
-    ),
     (
         "cogneva_stream_read_failures_total",
         Unread::Gap("reads this consumer's loop has had refused since it started, published as the deliberate pair to the silence reading -- silence says whether the bus is moving, this says what it cost to keep up. The stalled-consumer rule's own summary already tells a human to look at this series for the count of refused reads, so the reading is addressed to a reader and the face that would carry it does not exist"),
     ),
-    // Two names whose fact a face already carries, each looked up rather than
-    // asserted in prose.
-    (
-        "cogneva_stream_pending_unreclaimed_count",
-        Unread::Elsewhere {
-            readers: &["cogneva_stream_pending_unreclaimed_oldest_idle_seconds"],
-            reason: "the rule reads the age of the longest-outstanding entry past the reclaim threshold, which is the maximum of exactly the population this counts",
-        },
-    ),
+    // A name whose fact a face already carries, looked up rather than asserted
+    // in prose.
     (
         "cogneva_aof_repair_examined_increments",
         Unread::Elsewhere {
@@ -235,12 +196,12 @@ const UNREGISTERED: &[(&str, Unread)] = &[
 /// How many `Gap` entries this census left.
 ///
 /// The first run is where this number comes from, and it is meant to be read as
-/// it is: sixteen names the tree publishes into a scrape with no face carrying
+/// it is: nine names the tree publishes into a scrape with no face carrying
 /// them. The ratchet is the same one the reader-face census keeps -- a new
 /// series nothing reads must be classified deliberately, and calling it a gap
 /// raises this number on purpose. It comes down when a face is written, and
 /// that is a change to this constant plus the removal of the entry.
-const GAPS_AT_SCRAPE_CENSUS: usize = 16;
+const GAPS_AT_SCRAPE_CENSUS: usize = 9;
 
 /// How many scrape-only series are carried by a produced table and by nothing
 /// that reads them.

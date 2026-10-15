@@ -277,17 +277,30 @@ const PRODUCED: &[(&str, &str)] = &[
     // could not be answered, which is why the unowned rule needs the
     // declaration as well: an absent series and a refusal mean different things,
     // and only the declaration distinguishes "nobody holds it" from "nobody is
-    // asking any more". The acquisitions and losses counters sit on the same
-    // scrape and no rule reads them: which replica holds a role is a question
-    // about a state, and how many times it changed hands is a different
-    // question, answered by the difference of two counter readings rather than
-    // by a threshold written here.
+    // asking any more".
+    //
+    // The acquisitions and losses counters below are read by
+    // `background_loop_role_books_unbalanced`, which asserts the arithmetic
+    // between them and the holder: the terms a process took, minus the ones it
+    // lost, is the state it publishes. That rule states an identity rather than
+    // a number, so nothing here has to say how many handovers are ordinary --
+    // and its blind spot is the absent holder above: while no process can answer,
+    // the holder side of the comparison is empty and the rule goes quiet with the
+    // family, which is what the probe-failure counter beside it is read for.
     (
         "cogneva_loop_role_declared",
         "crates/cog-core/src/loop_health.rs",
     ),
     (
         "cogneva_loop_owner_held",
+        "crates/cog-core/src/loop_health.rs",
+    ),
+    (
+        "cogneva_loop_owner_acquisitions_total",
+        "crates/cog-core/src/loop_health.rs",
+    ),
+    (
+        "cogneva_loop_owner_losses_total",
         "crates/cog-core/src/loop_health.rs",
     ),
     (
