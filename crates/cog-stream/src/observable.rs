@@ -16,14 +16,26 @@ use std::sync::Arc;
 
 use cog_core::{DimensionSpec, Observable, RawMetric, SFResult, TraceFragment};
 
-use crate::read_health::{now_seconds, ReadHealth};
+use crate::read_health::{now_seconds, ReadHealth, ReadRefusal};
 
 /// Seconds the server has been silent to this consumer (message or empty
 /// reply both count as an answer).
 pub const READ_SILENT_SECONDS_METRIC: &str = "cogneva_stream_read_silent_seconds";
 
-/// Reads this consumer's loop has had refused since it started.
+/// Reads this consumer's loop has had refused since it started, one series per
+/// cause (`reason`).
+///
+/// The label is why this reading can be used at all. `NOGROUP` is answered both
+/// by a group that does not exist yet — benign, and the loop's next attempt
+/// wins — and by one that is gone for good, which the consumer retries against
+/// until the pod dies. A threshold on the pooled number fires on the first and
+/// misses the second; read per cause, the pair is decidable against the silence
+/// published beside it. A reader that wants the pooled number sums over
+/// `reason`, which is what the series held before the label existed.
 pub const READ_FAILURES_METRIC: &str = "cogneva_stream_read_failures_total";
+
+/// The label `cogneva_stream_read_failures_total` is broken down by.
+pub const READ_FAILURE_REASON_LABEL: &str = "reason";
 
 /// The block period the reads are issued with — the bound below which silence
 /// is just an idle stream.
@@ -54,11 +66,14 @@ impl Observable for StreamReadObservable {
                     .with_label("stream", stream.as_str())
                     .with_label("consumer_group", group.as_str()),
             );
-            out.push(
-                RawMetric::new(READ_FAILURES_METRIC, slot.failures as f64)
-                    .with_label("stream", stream.as_str())
-                    .with_label("consumer_group", group.as_str()),
-            );
+            for refusal in ReadRefusal::ALL {
+                out.push(
+                    RawMetric::new(READ_FAILURES_METRIC, slot.failures_of(refusal) as f64)
+                        .with_label("stream", stream.as_str())
+                        .with_label("consumer_group", group.as_str())
+                        .with_label(READ_FAILURE_REASON_LABEL, refusal.label()),
+                );
+            }
         }
         Ok(out)
     }
@@ -118,8 +133,9 @@ mod tests {
         let observable = StreamReadObservable::new(Arc::clone(&health));
         assert_eq!(
             observable.collect_metrics("").await.unwrap().len(),
-            3,
-            "the bound plus silence and failures for the one live consumer"
+            4,
+            "the bound, silence, and one failure series per cause for the one \
+             live consumer"
         );
         drop(guard);
         let metrics = observable.collect_metrics("").await.unwrap();
@@ -127,6 +143,51 @@ mod tests {
             metrics.len(),
             1,
             "only the bound is left once the consumer is gone: {metrics:?}"
+        );
+    }
+
+    /// The pair `silent_seconds` / `failures_total` is only decidable when the
+    /// counter says which of the two `NOGROUP` cases it is showing, and a
+    /// consumer that has refused nothing is published at zero for both causes
+    /// rather than absent — an absent series and a zero one read the same in a
+    /// chart and differently in a rule.
+    #[tokio::test]
+    async fn every_cause_is_published_and_the_pooled_number_is_their_sum() {
+        let health = Arc::new(ReadHealth::new(5000));
+        let _goals = ReadHealth::track(&health, "goals", "worker");
+        health.note_failure("goals", "worker", ReadRefusal::NoGroup);
+        health.note_failure("goals", "worker", ReadRefusal::Other);
+        health.note_failure("goals", "worker", ReadRefusal::Other);
+        let observable = StreamReadObservable::new(Arc::clone(&health));
+
+        let metrics = observable.collect_metrics("").await.unwrap();
+        let failures: Vec<_> = metrics
+            .iter()
+            .filter(|m| m.name == READ_FAILURES_METRIC)
+            .collect();
+        assert_eq!(
+            failures.len(),
+            ReadRefusal::ALL.len(),
+            "one series per cause, no more: {failures:?}"
+        );
+        for refusal in ReadRefusal::ALL {
+            let series = failures
+                .iter()
+                .find(|m| m.labels.get(READ_FAILURE_REASON_LABEL).map(String::as_str)
+                    == Some(refusal.label()))
+                .unwrap_or_else(|| panic!("no series under {}: {failures:?}", refusal.label()));
+            assert!(
+                series.labels.get("consumer_group").map(String::as_str) == Some("worker"),
+                "the cause is a second dimension, not a replacement for the \
+                 consumer: {series:?}"
+            );
+        }
+        let pooled: f64 = failures.iter().map(|m| m.value).sum();
+        assert_eq!(
+            pooled,
+            health.snapshot()[0].1.failures() as f64,
+            "summing over the cause label has to give the number this series \
+             held before it was broken down"
         );
     }
 

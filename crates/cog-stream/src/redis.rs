@@ -1,11 +1,19 @@
 //! Redis Streams-backed [`MessageBackend`] implementation.
+//!
+//! Refusals the read loops count are classified by the server's own error code,
+//! because the same code answers both a group that does not exist yet and one
+//! that is gone for good, and a counter that pools them admits no threshold.
+//! The live tests below take both causes from the server rather than from a
+//! fixture, since a fixture only proves the counter files what it is told.
+//!
+//! principle: feedback_two_opposite_causes_pooled_into_one_counter_admit_no_threshold
 
 use async_trait::async_trait;
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, RedisError};
 use std::sync::Arc;
 
-use crate::read_health::ReadHealth;
+use crate::read_health::{ReadHealth, ReadRefusal};
 use cog_core::{MessageBackend, MessageStream, SFError, SFResult};
 
 /// Upper bound on how many over-threshold entries one measurement lists. The
@@ -200,7 +208,7 @@ impl MessageBackend for RedisMessageBackend {
                                 backoff = 0;
                             }
                             Err(e) => {
-                                health.note_failure(&subject, &group);
+                                health.note_failure(&subject, &group, read_refusal(&e));
                                 tracing::warn!(
                                     stream = %subject,
                                     "XREADGROUP failed, retrying with backoff: {e}"
@@ -259,7 +267,7 @@ impl MessageBackend for RedisMessageBackend {
                                 backoff = 0;
                             }
                             Err(e) => {
-                                health.note_failure(&subject, &group);
+                                health.note_failure(&subject, &group, read_refusal(&e));
                                 tracing::warn!(
                                     stream = %subject,
                                     "XREADGROUP failed, retrying with backoff: {e}"
@@ -471,6 +479,25 @@ async fn group_read(
         .block(block_ms);
     let reply = conn.xread_options(&[subject], &[id], &opts).await?;
     Ok(extract_messages(reply).into_iter().next())
+}
+
+/// Which of the two `NOGROUP` cases this refusal is, as far as the error says.
+///
+/// The same code is answered by a group that does not exist yet — the one read
+/// that races `create_consumer_group` at startup, which the next attempt wins —
+/// and by a group that is gone for good, which the consumer retries against
+/// until the pod is replaced. The error cannot tell them apart and this function
+/// does not pretend to: it only stops the two from being the same number, so the
+/// rate can be read beside how long the consumer has gone unanswered.
+///
+/// `code()` is the server's own error name and the same test `pending_stats`
+/// uses, so one spelling decides this question everywhere in the crate.
+fn read_refusal(error: &RedisError) -> ReadRefusal {
+    if error.code() == Some("NOGROUP") {
+        ReadRefusal::NoGroup
+    } else {
+        ReadRefusal::Other
+    }
 }
 
 /// Sleep an exponential backoff (1s→30s cap) and return the next delay.
@@ -769,6 +796,80 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    /// The two causes are told apart by the server's own error name, so the
+    /// inputs have to come from the server.
+    ///
+    /// A fixture that hands `note_failure` a cause it picked itself would only
+    /// prove the counter files what it is given, and the question is which
+    /// cause a real refusal is given. Both halves are read off live replies:
+    /// `XREADGROUP` against a stream whose group was never created answers
+    /// `NOGROUP`, and the same command with an id the server will not parse
+    /// answers `ERR` — neither `Test` nor a malformed string, the two errors
+    /// this crate sees in the field.
+    #[tokio::test]
+    async fn a_live_refusal_is_filed_by_the_servers_own_error_code() {
+        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let raw_client = redis::Client::open(redis_url.as_str()).expect("redis client");
+        let mut raw = match raw_client.get_multiplexed_async_connection().await {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("SKIP: Redis not available");
+                return;
+            }
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let stream = format!("cog-test:refusal-{suffix}");
+        let group = format!("refusal-{suffix}");
+        let _: i64 = redis::cmd("DEL")
+            .arg(stream.as_str())
+            .query_async(&mut raw)
+            .await
+            .expect("del");
+
+        let backend = RedisMessageBackend::new(&redis_url).await.unwrap();
+        let mut conn = backend.connection.clone();
+
+        // The stream exists, the group does not: the read that races group
+        // creation, which is the benign case the label has to separate.
+        backend.publish(&stream, b"one").await.unwrap();
+        let e = group_read(&mut conn, &stream, &group, ">", 0)
+            .await
+            .expect_err("reading a group that does not exist is refused");
+        assert_eq!(
+            e.code(),
+            Some("NOGROUP"),
+            "the server's own code, not this test's idea of it: {e}"
+        );
+        assert_eq!(
+            read_refusal(&e),
+            ReadRefusal::NoGroup,
+            "a group that does not exist yet has to be counted apart from the \
+             refusals that never clear: {e}"
+        );
+
+        // Now the group exists and the refusal is of another kind entirely.
+        backend.create_consumer_group(&stream, &group).await.unwrap();
+        let e = group_read(&mut conn, &stream, &group, "not-an-id", 0)
+            .await
+            .expect_err("an unparsable id is refused");
+        assert_ne!(
+            read_refusal(&e),
+            ReadRefusal::NoGroup,
+            "only the server's NOGROUP goes under that label, and this one is \
+             {e:?}"
+        );
+
+        let _: i64 = redis::cmd("DEL")
+            .arg(stream.as_str())
+            .query_async(&mut raw)
+            .await
+            .expect("del");
     }
 
     #[tokio::test]

@@ -19,6 +19,42 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Why a read came back refused, as far as the loop can tell from the error.
+///
+/// Two causes share one code and mean opposite things. `XREADGROUP` answers
+/// `NOGROUP` when the group has not been created yet — a race this loop loses
+/// once at startup and the next attempt wins — and again when the group is gone
+/// for good: deleted, or the stream flushed under a live consumer, which leaves
+/// it retrying against nothing for as long as the pod lives. Pooled into one
+/// number neither can be read. A rate loose enough to ignore the startup race
+/// is loose enough to miss the consumer that will never recover, and a rate
+/// tight enough to catch that one fires on every restart. Which of the two a
+/// series is showing is decided by the reading beside it (how long the consumer
+/// has gone unanswered), not by this label: the label is what makes the pair
+/// readable at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadRefusal {
+    /// The server answered that the group does not exist.
+    NoGroup,
+    /// Everything else: the transport, the server, the shape of the answer.
+    Other,
+}
+
+impl ReadRefusal {
+    /// The label the counter is published under. A reader that wants the pooled
+    /// number sums over this label rather than reading one series of it.
+    pub fn label(self) -> &'static str {
+        match self {
+            ReadRefusal::NoGroup => "nogroup",
+            ReadRefusal::Other => "other",
+        }
+    }
+
+    /// Every cause a series is published for, so a cause added here cannot be
+    /// counted and left unpublished.
+    pub const ALL: [ReadRefusal; 2] = [ReadRefusal::NoGroup, ReadRefusal::Other];
+}
+
 /// One consumer's read loop, as the loop itself observes it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ReadSlot {
@@ -30,8 +66,10 @@ pub struct ReadSlot {
     /// empty reply both count: the question is whether the connection works,
     /// not whether there was work to do.
     pub last_ok_seconds: u64,
-    /// Reads that came back as errors since this loop started.
-    pub failures: u64,
+    /// Reads refused because the server answered `NOGROUP`.
+    pub failures_no_group: u64,
+    /// Reads refused for any other reason.
+    pub failures_other: u64,
 }
 
 impl ReadSlot {
@@ -39,6 +77,19 @@ impl ReadSlot {
     pub fn silent_seconds(&self, now: u64) -> u64 {
         let anchor = self.last_ok_seconds.max(self.since_seconds);
         now.saturating_sub(anchor)
+    }
+
+    /// Refused reads of one cause.
+    pub fn failures_of(&self, refusal: ReadRefusal) -> u64 {
+        match refusal {
+            ReadRefusal::NoGroup => self.failures_no_group,
+            ReadRefusal::Other => self.failures_other,
+        }
+    }
+
+    /// Refused reads of every cause — the number this counter used to publish.
+    pub fn failures(&self) -> u64 {
+        self.failures_no_group.saturating_add(self.failures_other)
     }
 }
 
@@ -88,9 +139,18 @@ impl ReadHealth {
     }
 
     /// This read failed; the loop is backing off and will try again.
-    pub fn note_failure(&self, stream: &str, group: &str) {
+    ///
+    /// The cause is the caller's to name, because only the caller holds the
+    /// error: by the time it is a count here the code that told the two causes
+    /// apart is gone, and a counter that pools them is one no threshold can be
+    /// written against.
+    pub fn note_failure(&self, stream: &str, group: &str, refusal: ReadRefusal) {
         self.update(stream, group, |slot| {
-            slot.failures = slot.failures.saturating_add(1);
+            let cell = match refusal {
+                ReadRefusal::NoGroup => &mut slot.failures_no_group,
+                ReadRefusal::Other => &mut slot.failures_other,
+            };
+            *cell = cell.saturating_add(1);
         });
     }
 
@@ -157,8 +217,8 @@ mod tests {
         let _goals = ReadHealth::track(&health, "goals", "worker");
         let _results = ReadHealth::track(&health, "results", "worker");
         health.note_ok("goals", "worker");
-        health.note_failure("goals", "worker");
-        health.note_failure("goals", "worker");
+        health.note_failure("goals", "worker", ReadRefusal::NoGroup);
+        health.note_failure("goals", "worker", ReadRefusal::NoGroup);
 
         let rows = health.snapshot();
         assert_eq!(rows.len(), 2, "one row per stream+group: {rows:?}");
@@ -169,7 +229,12 @@ mod tests {
             .map(|(_, slot)| *slot)
             .unwrap();
         assert!(goals.last_ok_seconds > 0, "an answered read is a timestamp");
-        assert_eq!(goals.failures, 2, "failures accumulate");
+        assert_eq!(goals.failures(), 2, "failures accumulate");
+        assert_eq!(
+            goals.failures_of(ReadRefusal::NoGroup),
+            2,
+            "and the cause they are counted under is the one the caller named"
+        );
         assert!(goals.silent_seconds(now) <= 1, "it was answered just now");
 
         let results = rows
@@ -195,11 +260,31 @@ mod tests {
         // retrying.
         let health = Arc::new(ReadHealth::new(1000));
         let _guard = ReadHealth::track(&health, "s", "g");
-        health.note_failure("s", "g");
+        health.note_failure("s", "g", ReadRefusal::NoGroup);
         health.note_ok("s", "g");
         let rows = health.snapshot();
-        assert_eq!(rows[0].1.failures, 1);
+        assert_eq!(rows[0].1.failures(), 1);
         assert!(rows[0].1.last_ok_seconds > 0);
+    }
+
+    /// The two causes are counted apart, and the two counts are the whole.
+    ///
+    /// Both halves are load-bearing: without the first, a change that files
+    /// every refusal under one label passes every other case here; without the
+    /// second, a cause that is counted but never published would read as a
+    /// consumer that has refused less than it has.
+    #[test]
+    fn the_two_causes_are_counted_apart_and_sum_to_the_old_number() {
+        let health = Arc::new(ReadHealth::new(1000));
+        let _guard = ReadHealth::track(&health, "s", "g");
+        health.note_failure("s", "g", ReadRefusal::NoGroup);
+        health.note_failure("s", "g", ReadRefusal::Other);
+        health.note_failure("s", "g", ReadRefusal::Other);
+
+        let slot = health.snapshot()[0].1;
+        assert_eq!(slot.failures_of(ReadRefusal::NoGroup), 1);
+        assert_eq!(slot.failures_of(ReadRefusal::Other), 2);
+        assert_eq!(slot.failures(), 3, "the number this counter used to publish");
     }
 
     #[test]
