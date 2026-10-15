@@ -3,9 +3,10 @@
 //! Where alerts come from is not decided here. The infra watcher polls
 //! Prometheus rules and drives each series into the persistent `alerts` table,
 //! and the supervisor event bridge maps events; both hand the resulting
-//! `AlertEvent`s to `notify`. The rules this type holds are carried only so a
-//! webhook payload can resolve a rule's summary text — nothing evaluates them
-//! here.
+//! `AlertEvent`s to `notify`. The rules this type holds are carried only as the
+//! text for an event that arrives without a rendered sentence — nothing
+//! evaluates them here, and the sentence the producer rendered wins (see
+//! [`AlertManager::summary_for`]).
 use cog_core::alerts::*;
 
 /// Formats alert events and dispatches them to the configured channels.
@@ -65,27 +66,7 @@ impl AlertManager {
                     .client
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("AlertManager has no HttpClient configured"))?;
-                let payload = serde_json::json!({
-                    "alerts": events.iter().map(|e| match e {
-                        AlertEvent::Firing(a) => serde_json::json!({
-                            "status": "firing",
-                            "labels": a.labels,
-                            "annotations": {
-                                "summary": self.rule_summary(&a.rule_name),
-                            },
-                            "startsAt": a.starts_at,
-                            "severity": a.severity.as_str(),
-                            "value": a.value,
-                        }),
-                        AlertEvent::Resolved(a) => serde_json::json!({
-                            "status": "resolved",
-                            "labels": a.labels,
-                            "endsAt": a.ends_at,
-                            "severity": a.severity.as_str(),
-                        }),
-                    }).collect::<Vec<_>>(),
-                    "version": "1",
-                });
+                let payload = self.webhook_payload(events);
 
                 let mut req = cog_core::HttpRequest::post(url)
                     .json(&payload)
@@ -108,16 +89,7 @@ impl AlertManager {
                 if to.is_empty() {
                     return Ok(());
                 }
-                let body = events
-                    .iter()
-                    .map(|e| {
-                        let rule_name = match e {
-                            AlertEvent::Firing(a) | AlertEvent::Resolved(a) => a.rule_name.clone(),
-                        };
-                        let msg = AlertMessage::from_event(e, &self.rule_summary(&rule_name));
-                        format!("{}\n{}\n---\n", msg.title, msg.body)
-                    })
-                    .collect::<String>();
+                let body = self.email_body(events);
 
                 let subject = if subject_template.is_empty() {
                     format!(
@@ -224,5 +196,136 @@ impl AlertManager {
             .find(|r| r.name == rule_name)
             .map(|r| r.summary.clone())
             .unwrap_or_default()
+    }
+
+    /// The sentence a human is meant to read for one event.
+    ///
+    /// The producers render the rule's template against the sample that fired it
+    /// and carry the result as the event's `message` label — the infra watcher
+    /// (`alert_labels`), the supervisor bridge and the config-declaration watcher
+    /// all do, so that sentence is written exactly once, where the value and the
+    /// labels are still in hand. This type holds the rules only to have *some*
+    /// text for an event that arrives without one; it cannot render, because
+    /// rendering needs that sample and a placeholder naming neither the value nor
+    /// a label is left in the text as written. Re-reading the template here
+    /// therefore puts `{value}` in front of a reader, which is why the label
+    /// wins whenever it is there.
+    fn summary_for(&self, a: &AlertInstance) -> String {
+        a.labels
+            .get("message")
+            .filter(|m| !m.is_empty())
+            .cloned()
+            .unwrap_or_else(|| self.rule_summary(&a.rule_name))
+    }
+
+    /// The Alertmanager-shaped payload for one batch of events.
+    fn webhook_payload(&self, events: &[AlertEvent]) -> serde_json::Value {
+        serde_json::json!({
+            "alerts": events.iter().map(|e| match e {
+                AlertEvent::Firing(a) => serde_json::json!({
+                    "status": "firing",
+                    "labels": a.labels,
+                    "annotations": {
+                        "summary": self.summary_for(a),
+                    },
+                    "startsAt": a.starts_at,
+                    "severity": a.severity.as_str(),
+                    "value": a.value,
+                }),
+                AlertEvent::Resolved(a) => serde_json::json!({
+                    "status": "resolved",
+                    "labels": a.labels,
+                    "endsAt": a.ends_at,
+                    "severity": a.severity.as_str(),
+                }),
+            }).collect::<Vec<_>>(),
+            "version": "1",
+        })
+    }
+
+    /// The plain-text body for one batch of events, as an email carries it.
+    fn email_body(&self, events: &[AlertEvent]) -> String {
+        events
+            .iter()
+            .map(|e| {
+                let summary = match e {
+                    AlertEvent::Firing(a) | AlertEvent::Resolved(a) => self.summary_for(a),
+                };
+                let msg = AlertMessage::from_event(e, &summary);
+                format!("{}\n{}\n---\n", msg.title, msg.body)
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use cog_core::alerts::AlertRuleBuilder;
+
+    /// A rule whose template is unfinished on purpose: if the payload ever goes
+    /// back to reading it, the assertion below sees the placeholder.
+    fn manager() -> AlertManager {
+        AlertManager::new(
+            vec![AlertRuleBuilder::new("r", "m")
+                .summary("queue {queue} is at {value}")
+                .build()],
+            Vec::new(),
+        )
+    }
+
+    fn event(labels: &[(&str, &str)]) -> AlertEvent {
+        let now = Utc::now();
+        AlertEvent::Firing(AlertInstance {
+            rule_name: "r".into(),
+            labels: labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            state: AlertState::Firing,
+            severity: AlertSeverity::Warning,
+            value: 7.0,
+            starts_at: now,
+            ends_at: None,
+            updated_at: now,
+        })
+    }
+
+    /// The rendered sentence the producer already wrote wins over the template.
+    #[test]
+    fn the_rendered_message_is_what_goes_out() {
+        let m = manager();
+        let e = event(&[("queue", "build"), ("message", "queue build is at 7.00")]);
+
+        let payload = m.webhook_payload(std::slice::from_ref(&e));
+        assert_eq!(
+            payload["alerts"][0]["annotations"]["summary"],
+            serde_json::json!("queue build is at 7.00")
+        );
+        let body = m.email_body(std::slice::from_ref(&e));
+        assert!(
+            body.contains("**Summary**: queue build is at 7.00"),
+            "email body carries the rendered sentence: {body}"
+        );
+        for out in [payload.to_string(), body] {
+            assert!(
+                !out.contains("{value}") && !out.contains("{queue}"),
+                "no template placeholder may reach a reader: {out}"
+            );
+        }
+    }
+
+    /// An event with no rendered sentence still gets the rule's text, so the
+    /// fallback stays visible instead of an empty field.
+    #[test]
+    fn an_event_without_a_message_falls_back_to_the_rule_text() {
+        let m = manager();
+        let e = event(&[("queue", "build")]);
+        let payload = m.webhook_payload(std::slice::from_ref(&e));
+        assert_eq!(
+            payload["alerts"][0]["annotations"]["summary"],
+            serde_json::json!("queue {queue} is at {value}")
+        );
     }
 }
