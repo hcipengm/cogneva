@@ -93,11 +93,17 @@ const BENCHMARK_REFUSED_OPERATIONS: [&str; 3] = [
 ///
 /// 换手才记，不按拍记：闸门状态稳定时增量为零，`rate(...)` 为 0 就是「这一路
 /// 这阵子没掌过权」，而一次故障里的几次换手各记一格。
-const PULL_GATE_SHARED_OPERATION: &str = "pull_gate_shared";
-const PULL_GATE_LOCAL_OPERATION: &str = "pull_gate_local";
-const PULL_GATE_BOTH_OPERATION: &str = "pull_gate_both";
-const PULL_GATE_OPEN_OPERATION: &str = "pull_gate_open";
-const PULL_GATE_BLIND_OPERATION: &str = "pull_gate_blind";
+///
+/// **谁在掌权**这一问另有读数：同一组 operation 值还挂在一个 gauge 上
+/// （[`crate::observable::PULL_GATE_HOLDER_METRIC`]，五格 0/1，启动时播 0）。
+/// 两个读数答的是两个问——计数答「换过几次手」，gauge 答「此刻谁在掌权」——
+/// 而一次从不换手的暂停在计数上是一条平线，与「一直在跑」同形。值与 labels
+/// 都取自 [`crate::observable::PULL_GATE_OPERATIONS`]，不在这里写第二遍。
+const PULL_GATE_OPEN_OPERATION: &str = crate::observable::PULL_GATE_OPERATIONS[0];
+const PULL_GATE_BLIND_OPERATION: &str = crate::observable::PULL_GATE_OPERATIONS[1];
+const PULL_GATE_LOCAL_OPERATION: &str = crate::observable::PULL_GATE_OPERATIONS[2];
+const PULL_GATE_SHARED_OPERATION: &str = crate::observable::PULL_GATE_OPERATIONS[3];
+const PULL_GATE_BOTH_OPERATION: &str = crate::observable::PULL_GATE_OPERATIONS[4];
 
 /// 拉取闸门此刻的掌权者。见 [`PULL_GATE_SHARED_OPERATION`] 一族。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +126,19 @@ impl GateHolder {
             (false, true) => GateHolder::Shared,
             (false, false) if shared_read => GateHolder::Open,
             (false, false) => GateHolder::Blind,
+        }
+    }
+
+    /// 这一格在 [`Self::ALL`] 与 [`crate::observable::PULL_GATE_OPERATIONS`]
+    /// 里的位置。两个数组的次序由这条索引串起来，而次序本身没有编译器保证
+    /// ——`each_holder_index_publishes_under_its_own_label` 是那条保证。
+    fn index(self) -> usize {
+        match self {
+            GateHolder::Open => 0,
+            GateHolder::Blind => 1,
+            GateHolder::Local => 2,
+            GateHolder::Shared => 3,
+            GateHolder::Both => 4,
         }
     }
 
@@ -634,12 +653,17 @@ impl PullGate {
         }
     }
 
-    /// 把「闸门换手到谁」记一格。见 [`PULL_GATE_SHARED_OPERATION`] 一族。
+    /// 把「闸门换手到谁」记一格，并把「此刻谁在掌权」这一读数跟着换过去。
+    /// 见 [`PULL_GATE_SHARED_OPERATION`] 一族。
     ///
-    /// 记在 `memory_operations_total` 上而不是新开一个指标名：这是拉取这条路上
-    /// 的一次具名状态，与 `bus_claim_*` 那三格同类，而新名字要为一次「谁在掌权」
-    /// 付告警规则普查的代价。
+    /// 两个读数分开记，因为它们答的不是同一个问：换手计数在
+    /// `memory_operations_total` 上（与 `bus_claim_*` 那三格同类），而「此刻
+    /// 由谁掌权」是一个**状态**，只有 gauge 才读得出来——一次从不换手的暂停
+    /// 在计数上是平线，读起来与「一直在跑」同形。gauge 走 observable 那条
+    /// 路（它在抓取面上），不进 store：状态不累计，落库只会得到一行行一样的
+    /// 值，而每一行都要有人回收。
     async fn record_gate_holder(&self, holder: GateHolder) {
+        crate::observable::global_observable().set_pull_gate_holder(holder.index());
         let Some(metrics) = self.metrics.as_ref() else {
             return;
         };
@@ -656,7 +680,12 @@ impl PullGate {
     /// 把五个掌权者格子按 0 播种。与认领结局同一条理由：「这一路从来没掌过权」
     /// 与「从来没发布过这一路」在只看得见已存在序列的查询里同形，而这两句要答的
     /// 是不同的问题。
+    ///
+    /// 两个读数各播一遍：计数那五格在 store 上，gauge 那五格在抓取面上。只播
+    /// store 的话，gauge 要到第一次换手才出现，而「刚起来、闸门正开着」这段
+    /// 时间恰恰是它最该有读数的时候。
     async fn seed_gate_holders(&self) {
+        crate::observable::global_observable().seed_pull_gate_holder();
         let Some(metrics) = self.metrics.as_ref() else {
             return;
         };
@@ -3448,6 +3477,27 @@ mod tests {
             GateHolder::from_parts(false, false, true),
             GateHolder::from_parts(false, false, false),
             "reading a healthy snapshot and reading nothing must not collapse to one state"
+        );
+    }
+
+    /// 掌权者的序号与那五个值的次序是两处写法、没有编译器连着：gauge 的格子按
+    /// 序号取，label 按 [`crate::observable::PULL_GATE_OPERATIONS`] 取，错一格
+    /// 就把掌权安到邻居头上——而五个值都是 0/1 的状态，读起来一样合理。这条把
+    /// 两处钉在一起：枚举的序号、闭集的次序、以及每个序号对上的那个值。
+    #[test]
+    fn the_holder_order_is_the_same_in_the_enum_and_in_the_published_values() {
+        for (i, holder) in GateHolder::ALL.iter().enumerate() {
+            assert_eq!(holder.index(), i, "the closed set is in index order");
+            assert_eq!(
+                holder.as_operation(),
+                crate::observable::PULL_GATE_OPERATIONS[i],
+                "the change count's constant and the gauge's label are the same value"
+            );
+        }
+        assert_eq!(
+            PULL_GATE_LOCAL_OPERATION,
+            crate::observable::PULL_GATE_OPERATIONS[GateHolder::Local.index()],
+            "the value the alert reads for the local pause is the local cell's label"
         );
     }
 
