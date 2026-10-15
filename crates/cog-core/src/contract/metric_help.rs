@@ -596,7 +596,10 @@ const COUNTER_HELP: &[(&str, &str)] = &[
     (
         "cogneva_mainline_ci_no_verdict_reason_total",
         "Why the deployer's CI question came back without a verdict, one count \
-         per silent upstream, by reason: pending (the upstream had not finished \
+         per silent upstream, labelled by platform (the upstream's \
+         CodePlatform, so a mirror that structurally has no check-runs reads \
+         apart from the same reason on the platform that does) and by reason: \
+         pending (the upstream had not finished \
          the checks), no_runs (asked and there was nothing to judge), \
          status_unreadable, bad_api_base, connect_failed, unusable_body, and \
          http_auth_rejected / http_not_found / http_rate_limited / \

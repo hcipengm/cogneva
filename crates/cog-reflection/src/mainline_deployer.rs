@@ -3178,10 +3178,17 @@ impl MainlineDeployer {
     /// `sum(reason) = no_evidence × 配置的上游数`，且**这条等式只自上游列表最后一次
     /// 变更起成立**（两个计数都不带纪元，见那个方法的注释）；折出结论的那些轮不问
     /// 原因——它已经在 `verdict` 那一格里说完了。
+    ///
+    /// 每条原因还带上它自己的**平台**（`platform` 标签，取自上游配置里的
+    /// `CodePlatform`，值域是那个枚举的闭集）：镜到两端的同一个仓库里，一端可能
+    /// **结构上**就不会回答 check-runs，于是它的沉默是每一轮都加一的常数。常数本身
+    /// 没有信息，却会把另一端真实的同名原因淹掉——不带平台时，读的人只能靠
+    /// 「一轮里几条」去猜是哪一条在沉默。
     async fn ci_verdict_for_rev(&self, rev: &str) -> Option<bool> {
         let mut verdicts = Vec::new();
-        let mut reasons = Vec::new();
+        let mut reasons: Vec<(&'static str, CiNoVerdictReason)> = Vec::new();
         for up in &self.cfg.upstreams {
+            let platform = up.platform.slug();
             let Some(base) = up
                 .api_base
                 .as_deref()
@@ -3190,7 +3197,7 @@ impl MainlineDeployer {
             else {
                 // 配了这个上游却没给基址：它不会去问，也就永远不会有结论，
                 // 属于配置面。记成原因，别让它悄悄消失。
-                reasons.push(CiNoVerdictReason::BadApiBase);
+                reasons.push((platform, CiNoVerdictReason::BadApiBase));
                 continue;
             };
             let repo = up.repo.trim().trim_end_matches(".git");
@@ -3199,7 +3206,7 @@ impl MainlineDeployer {
                 verdicts.push(v);
             }
             if let Some(r) = reason {
-                reasons.push(r);
+                reasons.push((platform, r));
             }
         }
         let verdict = if verdicts.iter().any(|v| !*v) {
@@ -3298,17 +3305,30 @@ impl MainlineDeployer {
     /// 就不再从零成立，只从那次变更起成立；两个累计值直接相减会留下一笔残差，
     /// 那不是丢写。
     ///
-    /// 它**不能**说出是哪一条上游在沉默：原因只有 `reason` 一个标签，没有上游维度；
-    /// 而且原因只在 `no_evidence` 时记，`no_evidence` 的定义就是所有上游都没给结论，
-    /// 所以「一条沉默、另一条给了结论」根本不进这个面。它给的是**分格**——一轮里
-    /// 几条在沉默、各落在哪个 `reason` 上（一轮里 `pending` 与 `no_runs` 各加一，
-    /// 就是一台还在跑、另一台问了没东西）。
-    async fn record_ci_verdict_reason_reading(&self, reasons: &[CiNoVerdictReason]) {
+    /// 每条原因还带 `platform` 标签（取自该上游配置的 `CodePlatform`），所以它**能**
+    /// 说出是哪一条上游在沉默。这一格不是修饰：同一个仓库镜到两端时，一端可能
+    /// **结构上**就答不出 check-runs，它的沉默于是变成每一轮都加一的常数——只按
+    /// `reason` 记的话，那个常数会和另一端真实的同名原因叠在一起，读的人看到一个
+    /// 既非零也不动的格子，等于两端都看不见。带上平台之后，常数一行、真原因一行，
+    /// 各自可判。
+    ///
+    /// 这一族经共享指标存储写（`(name, labels)` 是主键），换代不清零，所以那个常数
+    /// 会一直摊在累计值里：2026-10-15 实测 `no_runs` 366 对 `no_evidence` 384——
+    /// 一个一个上游的沉默几乎等于整轮的沉默数，正是「一端恒定、另一端在动」的形状。
+    ///
+    /// 它仍然说不出「一条沉默、另一条给了结论」：原因只在 `no_evidence` 时记，而
+    /// `no_evidence` 的定义就是所有上游都没给结论。它给的是**分格**——一轮里几条在
+    /// 沉默、各落在哪个平台的哪个 `reason` 上。
+    async fn record_ci_verdict_reason_reading(
+        &self,
+        reasons: &[(&'static str, CiNoVerdictReason)],
+    ) {
         let Some(metrics) = &self.metrics else {
             return;
         };
-        for reason in reasons {
+        for (platform, reason) in reasons {
             let mut labels = std::collections::HashMap::new();
+            labels.insert("platform".to_string(), (*platform).to_string());
             labels.insert("reason".to_string(), reason.label().to_string());
             let _ = metrics
                 .record_counter(
@@ -13758,9 +13778,8 @@ exit 0
         let deployer = asks("   ", &metrics);
         assert_eq!(deployer.ci_verdict_for_rev("fff").await, None);
 
-        // 一轮里两条上游都没说话：原因各记一次。这个倍数是可核的，但只自上游列表
-        // 最后一次变更起成立；它分开的是"几条在沉默、各落在哪个 reason 上"，不是
-        // "哪一条在沉默"——原因读数没有上游维度。
+        // 一轮里两条上游都没说话：原因各记一次，各带自己的平台。这个倍数是可核的，
+        // 但只自上游列表最后一次变更起成立。
         let mut cfg = upstream_config(root, Path::new("/nonexistent"));
         cfg.upstreams[0].api_base = Some("http://127.0.0.1:1/github".into());
         cfg.upstreams[1].api_base = Some("http://127.0.0.1:1/gitee".into());
@@ -13772,30 +13791,54 @@ exit 0
             .query_counter_totals(MAINLINE_CI_NO_VERDICT_REASON_TOTAL.as_str())
             .await
             .unwrap();
-        let count = |want: &str| {
+        // 两维一起问：同一个仓库镜到两端时，一端可能**结构上**永远不回答 check-runs，
+        // 它的沉默就是每轮加一的常数。常数与真原因落在同一个 reason 上时，只有平台
+        // 这一维能把它们分开——只按 reason 求和，读的人看到的是一个既非零也不动的
+        // 格子，等于两端都看不见。
+        let count = |platform: &str, want: &str| -> f64 {
             rows.iter()
-                .find(|r| r.labels.get("reason").map(String::as_str) == Some(want))
+                .filter(|r| {
+                    r.labels.get("platform").map(String::as_str) == Some(platform)
+                        && r.labels.get("reason").map(String::as_str) == Some(want)
+                })
                 .map(|r| r.value)
+                .sum()
         };
-        assert_eq!(count("pending"), Some(1.0), "{rows:?}");
-        assert_eq!(count("no_runs"), Some(1.0), "{rows:?}");
-        assert_eq!(count("status_unreadable"), Some(1.0), "{rows:?}");
-        assert_eq!(count("http_auth_rejected"), Some(1.0), "{rows:?}");
-        assert_eq!(count("unusable_body"), Some(1.0), "{rows:?}");
-        assert_eq!(count("bad_api_base"), Some(1.0), "{rows:?}");
+        assert_eq!(count("github", "pending"), 1.0, "{rows:?}");
+        assert_eq!(count("github", "no_runs"), 1.0, "{rows:?}");
+        assert_eq!(count("github", "status_unreadable"), 1.0, "{rows:?}");
+        assert_eq!(count("github", "http_auth_rejected"), 1.0, "{rows:?}");
+        assert_eq!(count("github", "unusable_body"), 1.0, "{rows:?}");
+        assert_eq!(count("github", "bad_api_base"), 1.0, "{rows:?}");
+        // 并行那一轮两条上游各沉默一次：按 reason 求和是 2，按 (平台, reason) 问则是
+        // 各 1。这一对断言就是「常数淹不掉真原因」的证据。
+        assert_eq!(count("github", "connect_failed"), 1.0, "{rows:?}");
+        assert_eq!(count("gitee", "connect_failed"), 1.0, "{rows:?}");
+        let gitee: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.labels.get("platform").map(String::as_str) == Some("gitee"))
+            .map(|r| {
+                r.labels
+                    .get("reason")
+                    .map(String::as_str)
+                    .unwrap_or("<没有 reason>")
+            })
+            .collect();
         assert_eq!(
-            count("connect_failed"),
-            Some(2.0),
-            "两条上游各沉默一次: {rows:?}"
+            gitee,
+            vec!["connect_failed"],
+            "只有并行那一轮问过 gitee: {rows:?}"
         );
-        assert_eq!(
-            count("http_not_found"),
-            None,
-            "兜底那一次读的 404 不许改写原因，否则主人就跟着最后一次失败跑了: {rows:?}"
+        // 兜底那一次读的 404 不许改写原因，否则主人就跟着最后一次失败跑了。
+        assert!(
+            rows.iter()
+                .all(|r| r.labels.get("reason").map(String::as_str) != Some("http_not_found")),
+            "{rows:?}"
         );
+        // 七个 reason 各一行，加并行那一轮多出来的第二个平台，共八行。
         assert_eq!(
             rows.len(),
-            7,
+            8,
             "标签域是闭集，多出来的行不属于这个读数: {rows:?}"
         );
 
