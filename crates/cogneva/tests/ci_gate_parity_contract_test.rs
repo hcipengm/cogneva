@@ -75,15 +75,18 @@ const NOT_ENFORCED: &[(&str, &str)] = &[
     (
         "clippy",
         "The observed failure of 2026-09-28, answered narrowly rather than \
-         fully. The stage runs the same whole-tree `cargo clippy --workspace \
-         -- -D warnings` before the suite, and refuses a change only on \
-         diagnostics whose primary span lands on a line that change writes — \
+         fully. The stage runs this job's command before the suite — the argv \
+         itself, held equal to this job's `run:` line by \
+         `cog-reflection`'s `the_stages_linter_is_the_ci_jobs_linter`, which \
+         reads the line out of this workflow rather than restating it, so the \
+         two cannot drift apart one flag at a time — and refuses a change only \
+         on diagnostics whose primary span lands on a line that change writes — \
          the worktree diff against the tree the linter read, and nothing at all \
          on a baseline the formatter would rewrite, since that rewrite would be \
-         in the same diff. It is narrower than the job, not equivalent and \
-         cheaper: a lint whose span stays on a line the change never wrote \
-         passes here and dies in the job, as deleting the only caller of an \
-         unmodified function leaves `dead_code` on that function's line. \
+         in the same diff. What is left narrower than the job is the verdict, \
+         not the command: a lint whose span stays on a line the change never \
+         wrote passes here and dies in the job, as deleting the only caller of \
+         an unmodified function leaves `dead_code` on that function's line. \
          Reading the tree's own lint set per revision would close that half and \
          was declined for its cost — a second whole-tree compile per change, \
          against a build slot that is the ceiling on how many changes the stage \

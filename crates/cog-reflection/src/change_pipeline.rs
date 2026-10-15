@@ -88,11 +88,20 @@ const BUILTIN_FMT_CONFORM: &[&str] = &["cargo", "fmt", "--all"];
 /// The linter this workspace's deployments ran while the stage was hardcoded.
 /// `--message-format=json` is what makes its findings comparable against the
 /// lines a change wrote, and it changes what the run says, not what it finds.
+///
+/// Every other argument is the CI job's, `--all-targets` included, and that one
+/// is not a detail: without it the run lints the library and binary targets and
+/// leaves the test targets out of the compile, so a change whose only offence is
+/// in a test target passes the stage and dies in the job -- which is the whole
+/// of what this stage exists to prevent. The two commands are held equal by
+/// [`tests::the_stages_linter_is_the_ci_jobs_linter`] rather than by this
+/// comment: a comment cannot go red.
 const BUILTIN_LINT: &[&str] = &[
     "cargo",
     "clippy",
     "--workspace",
     "--message-format=json",
+    "--all-targets",
     "--",
     "-D",
     "warnings",
@@ -111,7 +120,12 @@ const NO_LINTER_NOTE: &str =
 /// The built-in linter as it is named in a change's evidence: the command a
 /// reader recognises, not the full argv that carries `--message-format=json`
 /// and the warning promotion.
-const BUILTIN_LINT_LINE: &str = "cargo clippy --workspace";
+///
+/// The scope stays in: a reader of the evidence is being told which files were
+/// judged, and "test targets too" is part of that answer. What is dropped is
+/// only what this stage adds to the *report* -- the machine-readable format and
+/// the promotion that turns a finding into a refusal.
+const BUILTIN_LINT_LINE: &str = "cargo clippy --workspace --all-targets";
 
 /// [`ChangePipeline::run_cargo_fmt`] 里最多几趟命令：探针、判、改写、复判。
 /// 判干净就提前返回，所以这是上界不是次数。
@@ -2203,8 +2217,8 @@ impl ChangePipeline {
     /// so that this command and a deployment's own are one gated command each
     /// to the wall bound rather than two.
     async fn run_cargo_clippy(&self, workdir: &Path) -> SFResult<(bool, String)> {
-        info!("Running cargo clippy --workspace");
         let argv: Vec<String> = BUILTIN_LINT.iter().map(|arg| (*arg).to_string()).collect();
+        info!(command = %argv.join(" "), "Running the built-in linter");
         self.run_verification_command(workdir, &argv, self.test_timeout_secs)
             .await
     }
@@ -5298,6 +5312,135 @@ index 1111111..2222222 100644\n\
             ChangeVerdict::Refused(cog_core::RejectionCause::ForbiddenPath),
             "声明文档必须落在受保护清单里，否则一条变更可以先改写它、再让分派按改写后的判它：{:?}",
             result.test_output
+        );
+    }
+
+    /// The workflow whose gating jobs the verification stage answers for.
+    const CI_WORKFLOW: &str = "../../.github/workflows/ci.yml";
+
+    /// The job the stage's built-in linter answers.
+    ///
+    /// Named rather than searched for: the block is read out of this job, and
+    /// finding a `clippy` somewhere else in the file would turn the assertion
+    /// below into one that judges another job's command.
+    const CI_LINT_JOB: &str = "clippy";
+
+    /// What the stage adds to that command to read the run rather than to change
+    /// it. Everything else in [`BUILTIN_LINT`] has to be the job's.
+    const STAGE_ONLY_LINT_ARGS: &[&str] = &["--message-format=json"];
+
+    /// The tokens the argv carries and the evidence line does not: the two ways
+    /// this stage turns a run into a reading, plus the promotion that turns a
+    /// finding into a refusal. A reader of the evidence is being told which
+    /// command read the tree; `--` and `-D warnings` are the policy, not the
+    /// command.
+    const NOT_IN_THE_EVIDENCE_LINE: &[&str] = &["--message-format=json", "--", "-D", "warnings"];
+
+    /// The `clippy` job's body, read out of the workflow.
+    ///
+    /// The block runs from the job's own line to the next line that is a job,
+    /// which is the next non-blank, non-comment line indented two spaces.
+    /// Refusing to find it is a failure rather than an empty block: a parse that
+    /// reads nothing agrees with everything, and this file's whole subject is a
+    /// command that quietly stops matching.
+    fn ci_lint_job_block(workflow: &str) -> &str {
+        let header = format!("\n  {CI_LINT_JOB}:\n");
+        let body = workflow
+            .split_once(&header)
+            .unwrap_or_else(|| {
+                panic!("{CI_WORKFLOW} has no `{CI_LINT_JOB}` job at two spaces of indent")
+            })
+            .1;
+        let end = body
+            .lines()
+            .take_while(|line| {
+                if line.trim().is_empty() || line.trim_start().starts_with('#') {
+                    return true;
+                }
+                line.len() - line.trim_start().len() > 2
+            })
+            .map(|line| line.len() + 1)
+            .sum::<usize>();
+        &body[..end]
+    }
+
+    /// The stage's linter is the CI job's linter, flags and all.
+    ///
+    /// The two commands are spelled in two files and nothing else compares them,
+    /// so a flag added to one is invisible from the other: CI gets a scope the
+    /// stage never exercises, and the difference shows only as a change that
+    /// passes verification, is committed, is built in release and dies in the
+    /// job — the arrival this stage exists to make unnecessary. That is not
+    /// hypothetical: the job gained `--all-targets` on 2026-10-06 and the stage
+    /// did not, and on 2026-10-15 a change whose only offence was a `dead_code`
+    /// field in a shared test helper was green here and red there.
+    ///
+    /// Read from the workflow rather than restated, so a rename or a re-scoping
+    /// of the job lands here on the next run instead of licensing a linter that
+    /// no longer matches. Comparison is by token multiset: the order cargo
+    /// accepts is the job's business, membership is the claim.
+    #[test]
+    fn the_stages_linter_is_the_ci_jobs_linter() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(CI_WORKFLOW);
+        let workflow = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
+        let block = ci_lint_job_block(&workflow);
+
+        let commands: Vec<&str> = block
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("- run: "))
+            .collect();
+        assert_eq!(
+            commands.len(),
+            1,
+            "the `{CI_LINT_JOB}` job has {} run steps, so this test cannot tell which \
+             command the stage is supposed to answer: {commands:?}",
+            commands.len()
+        );
+        let job_argv: Vec<&str> = commands[0].split_whitespace().collect();
+        assert!(
+            job_argv.first() == Some(&"cargo") && job_argv.contains(&"clippy"),
+            "the `{CI_LINT_JOB}` job's only run step is {job_argv:?}, which is not cargo \
+             clippy; the job this test reads is not the one it names"
+        );
+
+        // Both sides as multisets, with the stage's own argument taken out of
+        // its side rather than added to the job's: what is being asserted is
+        // that the stage runs the job's command, and the one thing it adds is
+        // the run's format.
+        let mut expected: Vec<&str> = job_argv.clone();
+        expected.sort_unstable();
+        let mut actual: Vec<&str> = BUILTIN_LINT
+            .iter()
+            .copied()
+            .filter(|arg| !STAGE_ONLY_LINT_ARGS.contains(arg))
+            .collect();
+        actual.sort_unstable();
+        assert_eq!(
+            actual, expected,
+            "the verification stage lints with {BUILTIN_LINT:?}, which is not what CI's \
+             `{CI_LINT_JOB}` job runs ({job_argv:?}) once this stage's own \
+             {STAGE_ONLY_LINT_ARGS:?} is taken out. A change that fails only what the job \
+             checks and the stage does not passes verification, is committed, is built in \
+             release, and is refused after all that — which is the cost this equality exists \
+             to avoid."
+        );
+
+        // And the line the change's own record carries names that command: it is
+        // the argv with the report's formatting and the verdict's policy taken
+        // out, and nothing else, so a flag added above cannot leave the evidence
+        // describing a different command than the one that ran.
+        let line_tokens: Vec<&str> = BUILTIN_LINT_LINE.split_whitespace().collect();
+        let line_expected: Vec<&str> = BUILTIN_LINT
+            .iter()
+            .copied()
+            .filter(|arg| !NOT_IN_THE_EVIDENCE_LINE.contains(arg))
+            .collect();
+        assert_eq!(
+            line_tokens, line_expected,
+            "BUILTIN_LINT_LINE is {BUILTIN_LINT_LINE:?}, which is not {BUILTIN_LINT:?} with \
+             {NOT_IN_THE_EVIDENCE_LINE:?} taken out; the evidence a change carries would \
+             name a command the stage did not run"
         );
     }
 }
