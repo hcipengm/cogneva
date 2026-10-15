@@ -878,6 +878,10 @@ const FOREIGN: &[(&str, &str)] = &[
         "kube-state-metrics (present only while deletionTimestamp is set: a graceful deletion clears it in seconds, so a timestamp that persists is the wedge itself -- the API took the deletion and the runtime did not release the container, a state no other series reports)",
     ),
     ("kube_pod_owner", "kube-state-metrics"),
+    (
+        "kube_pod_start_time",
+        "kube-state-metrics (the pod object's creation instant, in epoch seconds; read as `time() - kube_pod_start_time` it is the pod's age. `kube_pod_status_phase` reads Running from the instant the container starts, while a scrape target appears only after endpoint discovery has run, so the two are a discovery cycle apart -- an age bound is what tells a pod that has only just started from one that has been up with no scrape face at all)",
+    ),
     ("kube_pod_status_phase", "kube-state-metrics"),
     ("node_filesystem_avail_bytes", "node-exporter"),
     ("node_filesystem_size_bytes", "node-exporter"),
