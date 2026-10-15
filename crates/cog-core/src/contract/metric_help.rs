@@ -152,12 +152,21 @@ const COUNTER_HELP: &[(&str, &str)] = &[
     (
         "llm_upstream_failures_total",
         "Total LLM upstream failures this process recorded against an upstream, \
-         counting failures of serving requests and of the health probes that \
-         retest a suspect window alike -- the backoff window beside it is driven \
-         by the same events, so the two readings describe one history. Rejections \
-         as malformed requests are counted separately. Absent until the first \
-         failure: a missing series is neither a zero nor a broken exporter, and \
-         only this counter's own reader can tell which",
+         split by which side observed them. `source=\"caller\"` is a call this \
+         gateway was serving that came back with nothing usable, and \
+         `source=\"probe\"` is a health probe retesting an upstream already in a \
+         suspicion window. Both are real failures and both feed the backoff \
+         window beside this counter, but they answer different questions, and \
+         telling them apart is not a refinement: while the pool is latched down \
+         requests never leave this gateway, so the caller cells sit still while \
+         the probe cells climb every probe interval. A reader asking \"are the \
+         callers failing\" has to select `source=\"caller\"` -- summing the \
+         family over both sources reads the gateway's own heartbeat as traffic, \
+         and it moves on every probe whether or not a single call was made. \
+         Rejections as malformed requests are counted separately. Both cells are \
+         published at zero for every configured upstream before the first call, \
+         so the first failure of a process generation is a difference a reader \
+         can see",
     ),
     (
         crate::metric_names::NOTIFICATION_SIGN_TOTAL.as_str(),

@@ -168,6 +168,17 @@ pub struct InfraWatchConfig {
     /// disables this self-alert.
     pub eval_failure_alert_after: u32,
     pub rules: Vec<InfraRule>,
+    /// 已经停用的规则名。这里点名一条规则，是为了让它留下的行有个归宿。
+    ///
+    /// 从配置里删掉一条规则，并不会动它已经开着的行：告警表按 `state='firing'`
+    /// 选行的那一面照旧读得到它，而 `resolved_at` 永远是空、`last_seen_at` 停在
+    /// 删除那一刻——它看起来和一条**正在持续**的告警一模一样。会去关它的只有
+    /// 这条规则自己，而它已经不在了。
+    ///
+    /// 停用写成一份名单、而不是给被停的那条规则挂个 `retired: true`：挂了标记的
+    /// 规则仍在 `rules` 里，于是所有按规则集合计数的读者都会把一条**没人求值**的
+    /// 规则算进去。名单是负空间，规则集合只装真在跑的那些。
+    pub retired_rules: Vec<String>,
 }
 
 impl Default for InfraWatchConfig {
@@ -178,6 +189,7 @@ impl Default for InfraWatchConfig {
             poll_interval_secs: 0,
             eval_failure_alert_after: 3,
             rules: Vec::new(),
+            retired_rules: Vec::new(),
         }
     }
 }

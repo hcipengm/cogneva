@@ -355,6 +355,8 @@
       "prometheus_url": "http://cog-observability-prometheus.monitoring:9090",
       "poll_interval_secs": 60,
       "eval_failure_alert_after": 3,
+      "_retired_rules_comment": "已经停用的规则名。从 rules 里删掉一条规则不会动它已经开着的行，那些行会以「正在持续」的样子一直留在 state=firing 那一面上（resolved_at 空、last_seen_at 停在删除那一刻），会去关它的只有那条规则自己，而它已经不在了。点名在这里的，watcher 启动时按普通解析的同一路径把它们结算掉。停用的名字不能同时出现在 rules 里。",
+      "retired_rules": [],
       "rules": [
         {
           "name": "node_disk_usage_high",

@@ -1932,13 +1932,20 @@ async fn publish_upstream_vocabulary(state: &AppState) {
     for upstream in &state.config.llm_upstreams {
         let key = LlmHealthTable::key(upstream);
         let labels = [("upstream", key.as_str())];
-        record_counter_add(
-            state,
-            cog_core::metric_names::LLM_UPSTREAM_FAILURES_TOTAL,
-            0.0,
-            &labels,
-        )
-        .await;
+        // 失败这一族的格子是 `upstream` × `source`，两维都能从配置枚举
+        // （`source` 那一维的取值见 [`FAILURE_SOURCE_CALLER`]），所以两侧都种。
+        // 只种一侧不够：读它的规则按 `source` 取行，没被种过的那一行是首次
+        // 用到才创建的，而那样创建出来的第一条样本本身就是事件——差分函数
+        // 恰好对那个事件读零，正是这一族按零发布要消掉的那件事。
+        for source in [FAILURE_SOURCE_CALLER, FAILURE_SOURCE_PROBE] {
+            record_counter_add(
+                state,
+                cog_core::metric_names::LLM_UPSTREAM_FAILURES_TOTAL,
+                0.0,
+                &[("upstream", key.as_str()), ("source", source)],
+            )
+            .await;
+        }
         record_counter_add(
             state,
             cog_core::metric_names::LLM_UPSTREAM_CLIENT_ERRORS_TOTAL,
@@ -2650,6 +2657,12 @@ fn pool_down_message(pool_size: usize, unavailable: &[String], bounds: &Recovery
 
 /// 池全灭告警的规则名。写一次：`dedup_key` 要从它派生事件身份，规则名再抄一遍
 /// 就有两处会漂的地方。
+///
+/// 这里是池全灭**唯一**的发布者。规则面曾经另有一条读 Prometheus 同一个条件的
+/// `llm_pool_down`：同一个条件两处写，两条的 `fired_at` 都是各自规则被引入的时刻，
+/// 于是"池断了多久"有两个数，长的那个看着更严重、短的那个看着更新鲜，看图的人
+/// 分不出该信哪条。那条已停用（`observability.infra_watch.retired_rules`），
+/// 要再给这个条件加第二条规则，先看这一段。
 const POOL_ALERT_RULE: &str = "llm_upstream_pool_down";
 
 /// 一次池全灭**事件**的告警身份。
@@ -3845,8 +3858,14 @@ async fn mark_upstream_failure(
     quota_reset_unix: Option<i64>,
     quota_window_secs: Option<u64>,
 ) {
-    if let Some((consecutive, secs)) =
-        record_upstream_failure(state, upstream, quota_reset_unix, quota_window_secs).await
+    if let Some((consecutive, secs)) = record_upstream_failure(
+        state,
+        upstream,
+        FAILURE_SOURCE_CALLER,
+        quota_reset_unix,
+        quota_window_secs,
+    )
+    .await
     {
         tracing::warn!(
             upstream = %base,
@@ -3859,26 +3878,46 @@ async fn mark_upstream_failure(
     }
 }
 
+/// 是哪一条路径观测到这次上游失败。取值是闭集的两个名字，进
+/// [`cog_core::metric_names::LLM_UPSTREAM_FAILURES_TOTAL`] 的 `source` 标签。
+///
+/// 这一维存在，是因为同一个计数族的两个写者回答的是两个不同的问题，而读这条族的
+/// 规则问的是其中一个：`"caller"` 是"有人在调用上游、调用失败了"，`"probe"` 是
+/// "网关自己在复测一台已经进嫌疑窗的上游"。池级锁死期间请求根本到不了上游，
+/// 只有探测在写——那时把两侧合起来读，读到的就全是网关自己的心跳，而
+/// 「调用方在失败吗」这个问题一个字也没答。合成一族而不是拆成两族，是为了让
+/// 已有的读者不必知道这一维：按上游求和仍然读得动，取样只需要多带一个选择器。
+const FAILURE_SOURCE_CALLER: &str = "caller";
+/// 见 [`FAILURE_SOURCE_CALLER`]：主动探测这一侧。
+const FAILURE_SOURCE_PROBE: &str = "probe";
+
 /// 上游失败记账的共用体：计数、进/加嫌疑窗、落读数。请求路径与主动探测路径都走这里，
-/// 各自只保留自己那条 WARN。
+/// 各自只保留自己那条 WARN，并各自在 `source` 上写自己的名字。
 ///
 /// 两条路径非共用这一份不可，因为探测失败与请求失败是同一类事件：都进同一个嫌疑窗、
 /// 都进同一个 `consecutive_failures`。各写一份的代价已经发生过——探测那份漏掉了计数器，
 /// 而池级锁死期间请求根本到不了上游，于是最需要这条计数的那次故障里它一条样本都没有。
+/// 共用的代价则落在别处：那个数从此有三个写者（两个调用点＋启动种子），
+/// 谁把它读成"调用方的失败"就同时在读探测的节拍，所以写点必须带上 `source` 这一维。
 ///
 /// 返回 `Some((consecutive, secs))` 表示这次失败**开了新窗**：每一次失败的尝试都进计数，
 /// 但只有开窗那一次值得打日志（窗口内的并发失败刷屏盖掉真正的那条），
-/// 所以调用侧只在拿到 `Some` 时打。
+/// 所以调用侧只在拿到 `Some` 时打。探测一侧同样走这里，它开的新窗与请求开的一样真：
+/// 「多久没有一次成功的接触」是两侧共同的。
 async fn record_upstream_failure(
     state: &AppState,
     upstream: &LlmUpstream,
+    source: &'static str,
     quota_reset_unix: Option<i64>,
     quota_window_secs: Option<u64>,
 ) -> Option<(u32, u64)> {
     record_counter(
         state,
         cog_core::metric_names::LLM_UPSTREAM_FAILURES_TOTAL,
-        &[("upstream", &LlmHealthTable::key(upstream))],
+        &[
+            ("upstream", &LlmHealthTable::key(upstream)),
+            ("source", source),
+        ],
     )
     .await;
     let opened = state.llm_health.note_failure(
@@ -3990,8 +4029,14 @@ async fn probe_suspect_upstreams(state: &AppState) {
                 }
             }
             Err((msg, quota_reset, quota_window)) => {
-                if let Some((consecutive, secs)) =
-                    record_upstream_failure(state, &upstream, quota_reset, quota_window).await
+                if let Some((consecutive, secs)) = record_upstream_failure(
+                    state,
+                    &upstream,
+                    FAILURE_SOURCE_PROBE,
+                    quota_reset,
+                    quota_window,
+                )
+                .await
                 {
                     tracing::warn!(
                         upstream = %base,
@@ -7172,13 +7217,21 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             checked > 0,
             "表里 SeededAtZero 一档不能是空的，否则这一格什么都没量"
         );
-        assert!(
-            text.contains(&format!(
-                "{}{{upstream=\"{key}\"}} 0",
-                cog_core::metric_names::LLM_UPSTREAM_FAILURES_TOTAL.as_str()
-            )),
-            "启动种子必须给出按配置逐条的零值格子: {text}"
-        );
+        // 失败这一族的格子是 `upstream` × `source`，两维都要种到。逐个来源断言，
+        // 不是断言"这个名字有零值样本"——漏种一侧在那种读法下看不出来，而漏种的
+        // 那一侧正是首次失败要被差分函数看见的那一侧。
+        for source in [FAILURE_SOURCE_CALLER, FAILURE_SOURCE_PROBE] {
+            assert_eq!(
+                series_value_by_source(
+                    &text,
+                    cog_core::metric_names::LLM_UPSTREAM_FAILURES_TOTAL.as_str(),
+                    &key,
+                    Some(source),
+                ),
+                Some(0.0),
+                "启动种子必须给出按配置逐条、按来源分侧的零值格子（缺 {source}）: {text}"
+            );
+        }
         // 负例：健康那一格**不能**被种出来。它是判决，而读者取的是跨 pod
         // 的窗口最大值——种一个 1 会让 `llm_usage_verdict_unmeasured` 对每条
         // 配置上游长鸣（滚动中的网关上永远有个刚启动的 pod 在说 1）。
@@ -7852,19 +7905,32 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         // 两个失败上游都进了嫌疑窗。
         assert!(state.llm_health.is_suspect(&stub_upstream(&dead, "m1")));
         assert!(state.llm_health.is_suspect(&stub_upstream(&dead2, "m2")));
-        // 请求路径的失败也要落进计数：请求与探测共用同一份记账，这一侧钉住，
-        // 免得共用体哪天只剩一侧在用。
+        // 请求路径的失败也要落进计数，而且要落在**调用方那一侧**：请求与探测共用
+        // 同一份记账，读这条计的规则问的是"调用方在失败吗"，所以断言必须点名来源——
+        // 只断言"这个名字动了"的话，探测那一侧写进去也能让这格变绿，
+        // 而那样记出来的正是这条维度要分开的那件事。
         let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
         for (base, model) in [(&dead, "m1"), (&dead2, "m2")] {
             let key = LlmHealthTable::key(&stub_upstream(base, model));
             assert_eq!(
-                series_value(
+                series_value_by_source(
                     &text,
                     cog_core::metric_names::LLM_UPSTREAM_FAILURES_TOTAL.as_str(),
-                    &key
+                    &key,
+                    Some(FAILURE_SOURCE_CALLER),
                 ),
                 Some(1.0),
-                "上游 {base} 的一次请求失败要进计数:\n{text}"
+                "上游 {base} 的一次请求失败要记到 caller 那一侧:\n{text}"
+            );
+            assert_eq!(
+                series_value_by_source(
+                    &text,
+                    cog_core::metric_names::LLM_UPSTREAM_FAILURES_TOTAL.as_str(),
+                    &key,
+                    Some(FAILURE_SOURCE_PROBE),
+                ),
+                None,
+                "请求路径不该写 probe 那一侧——写了这格就分不出是谁在失败:\n{text}"
             );
         }
     }
@@ -7872,6 +7938,8 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
     /// 探测失败也是上游失败，进同一条计数——因为池锁死期间请求根本到不了上游
     ///（网关本地就回 503），那时唯一在发生的上游失败就是探测本身。探测这一侧原先
     /// 自己内联记账、漏了计数器，于是最需要这条计数的那次故障里它一条样本都没有。
+    /// 它写进的是 `source="probe"` 那一格：读这条计的规则问的是调用方有没有在失败，
+    /// 而池锁死期间调用方一个请求都到不了这里。
     #[tokio::test]
     async fn a_failed_health_probe_counts_as_an_upstream_failure() {
         let dead = spawn_stub_upstream(429, r#"{"error":{"type":"rate_limit_exceeded"}}"#).await;
@@ -7883,10 +7951,11 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
 
         let before = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
         assert_eq!(
-            series_value(
+            series_value_by_source(
                 &before,
                 cog_core::metric_names::LLM_UPSTREAM_FAILURES_TOTAL.as_str(),
-                &key
+                &key,
+                Some(FAILURE_SOURCE_PROBE),
             ),
             None,
             "一次失败都没发生时不发布这条序列（缺席不是 0）:\n{before}"
@@ -7898,13 +7967,24 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
 
         let after = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
         assert_eq!(
-            series_value(
+            series_value_by_source(
                 &after,
                 cog_core::metric_names::LLM_UPSTREAM_FAILURES_TOTAL.as_str(),
-                &key
+                &key,
+                Some(FAILURE_SOURCE_PROBE),
             ),
             Some(1.0),
-            "探测失败要进计数:\n{after}"
+            "探测失败要记到 probe 那一侧:\n{after}"
+        );
+        assert_eq!(
+            series_value_by_source(
+                &after,
+                cog_core::metric_names::LLM_UPSTREAM_FAILURES_TOTAL.as_str(),
+                &key,
+                Some(FAILURE_SOURCE_CALLER),
+            ),
+            None,
+            "探测路径不该写 caller 那一侧——写了池锁死期就会读成调用方在失败:\n{after}"
         );
         assert_eq!(
             series_value(
@@ -8519,9 +8599,26 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
 
     /// 从 exposition 里读一条序列的值；读不到 = None，不读成 0。
     fn series_value(text: &str, series: &str, upstream: &str) -> Option<f64> {
+        series_value_by_source(text, series, upstream, None)
+    }
+
+    /// 取一格的读数，可以再按 `source` 那一维收窄。
+    ///
+    /// 单维的那个不分来源，所以一族里同一个 `upstream` 有几个 `source` 时它只
+    /// 认第一条——那正是需要这一维的时候不能用的读法：读"调用方失败了吗"而
+    /// 抓到探测那一行，结论正好相反。带 `Some(source)` 时按两维取。
+    fn series_value_by_source(
+        text: &str,
+        series: &str,
+        upstream: &str,
+        source: Option<&str>,
+    ) -> Option<f64> {
         text.lines()
             .filter(|l| l.starts_with(series))
-            .find(|l| l.contains(&format!("upstream=\"{upstream}\"")))
+            .find(|l| {
+                l.contains(&format!("upstream=\"{upstream}\""))
+                    && source.is_none_or(|s| l.contains(&format!("source=\"{s}\"")))
+            })
             .and_then(|l| l.split_whitespace().last())
             .and_then(|v| v.parse::<f64>().ok())
     }

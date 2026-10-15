@@ -269,14 +269,42 @@ PAIRING_CONTROLS = [
     ('topk(5, x) > 12 * max(a)', True),
 ]
 
+def find_container(o):
+    """装着规则清单的那一层。停用名单与 rules 是兄弟键，所以要拿容器而不是列表。"""
+    if isinstance(o, dict):
+        if isinstance(o.get('rules'), list) and o['rules'] and 'promql' in o['rules'][0]:
+            return o
+        for v in o.values():
+            r = find_container(v)
+            if r: return r
+    if isinstance(o, list):
+        for v in o:
+            r = find_container(v)
+            if r: return r
+
+
 def main(path):
-    rules = find(json.load(open(path, encoding='utf-8')))
+    container = find_container(json.load(open(path, encoding='utf-8')))
+    rules = container['rules'] if container else None
     if not rules:
         print(f'FAIL: 没读到任何规则：{path}', file=sys.stderr)
         return 1
     by_name = {r['name']: r for r in rules}
     exempt = {**POD_SUBJECT, **CONTRACT_PINNED}
     problems = []
+
+    # 停用名单与在跑的规则必须是不相交的两份：名字同时出现在两边时，那条规则
+    # 每一拍被求值、每拍重报一次，而启动时的结算又把它的行关掉——同一拍里开与关
+    # 互相打架，读数上只会看到一行时亮时灭。停用是一件单向的事：要说它不在了，
+    # 就把它从 rules 里拿掉。
+    retired = container.get('retired_rules', [])
+    for name in retired:
+        if name in by_name:
+            problems.append(f'停用名单里的 {name} 同时在 rules 里（停用与在跑不能是同一个名字）')
+        if not name.strip():
+            problems.append('停用名单里有空名字')
+    if len(set(retired)) != len(retired):
+        problems.append('停用名单里有重复的名字')
 
     unreduced = [r['name'] for r in rules if lint(r['promql'])]
     offenders = [n for n in unreduced if n not in exempt]
@@ -303,7 +331,8 @@ def main(path):
             problems.append(f'第二读数的控制集被改坏了：{expr} -> {got}')
 
     print(f'规则 {len(rules)} 条，未收敛 {len(unreduced)} 条'
-          f'（其中豁免 {len(unreduced) - len(offenders)} 条），两侧配不上 {len(unpaired)} 条',
+          f'（其中豁免 {len(unreduced) - len(offenders)} 条），两侧配不上 {len(unpaired)} 条，'
+          f'已停用 {len(retired)} 条',
           flush=True)
     if problems:
         for p in problems:

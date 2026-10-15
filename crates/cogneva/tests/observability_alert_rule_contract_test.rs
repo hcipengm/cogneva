@@ -364,14 +364,18 @@ const PRODUCED: &[(&str, &str)] = &[
         "llm_calls_total",
         "crates/cog-gateway/src/security_gateway.rs",
     ),
-    // The pool's transport-failure counter, one cell per configured upstream,
-    // published at zero for every one of them at startup. That is what makes it
-    // readable by a difference function at all: the family beside it is created
-    // on demand, so a series born from a burst carries the whole burst in its
-    // first sample and `changes()` reads zero for it. Measured 2026-10-14: 348
-    // failed calls inside one 14-second window, a first sample already holding
-    // 348, and the rule built on that family computed empty for the fifteen
-    // hours that followed.
+    // The pool's transport-failure counter, one cell per configured upstream per
+    // `source`, published at zero for every one of them at startup. That is what
+    // makes it readable by a difference function at all: the family beside it is
+    // created on demand, so a series born from a burst carries the whole burst in
+    // its first sample and `changes()` reads zero for it. Measured 2026-10-14:
+    // 348 failed calls inside one 14-second window, a first sample already
+    // holding 348, and the rule built on that family computed empty for the
+    // fifteen hours that followed. The `source` split is read here too: the
+    // request path and the health prober share this counter, so a pool that is
+    // latched down -- requests never leaving the gateway -- would otherwise read
+    // as callers failing, and `llm_calls_all_failing` selects `source="caller"`
+    // for exactly that reason.
     (
         "llm_upstream_failures_total",
         "crates/cog-gateway/src/security_gateway.rs",

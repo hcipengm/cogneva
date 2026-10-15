@@ -17,7 +17,10 @@
 //! resolved; a series that disappeared entirely (target gone, pod deleted)
 //! is resolved too — a vanished signal source must not leave a row firing
 //! forever. Rows from before a process restart are adopted on the first
-//! tick so restarts neither duplicate nor strand alerts.
+//! tick so restarts neither duplicate nor strand alerts. A rule taken out of
+//! the configuration is the one case adoption cannot cover, because nothing
+//! adopts what it no longer runs: `retired_rules` names those, and the watcher
+//! closes their rows on startup.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -28,7 +31,7 @@ use tracing::{info, warn};
 
 use cog_core::{AlertEvent, AlertInstance, AlertState};
 
-use crate::alert_store::{AlertTransition, NewAlert, PostgresAlertStore};
+use crate::alert_store::{AlertRecord, AlertTransition, NewAlert, PostgresAlertStore};
 use crate::alerts::AlertManager;
 use crate::config::InfraWatchConfig;
 
@@ -116,6 +119,9 @@ pub async fn run_infra_watch_loop(
                 let mut eval_failure_firing: HashSet<String> = HashSet::new();
                 let mut failure_streaks: HashMap<String, u32> = HashMap::new();
                 let mut adopted = false;
+                // 没有停用规则时这一趟本来就没事可做，标成已跑完，免得每拍都去
+                // 问一次 store——空名单不是"还没跑"，是"跑完了，没有要结算的"。
+                let mut retired = config.retired_rules.is_empty();
 
                 let mut ticker = tokio::time::interval(interval);
                 loop {
@@ -132,6 +138,11 @@ pub async fn run_infra_watch_loop(
                                 if let Some(store) = &outlets.store {
                                     adopt_active_alerts(store, &config, &mut known_firing, &mut eval_failure_firing).await;
                                 }
+                            }
+                            // 在求值之前结算停用的规则：这些行不在任何一条规则的
+                            // 身份里，晚一拍只是让一条已经没人求值的告警多亮一拍。
+                            if !retired {
+                                retired = retire_rules(&config, &outlets).await;
                             }
                             tick(&config, &outlets, &http, &mut known_firing, &mut eval_failure_firing, &mut failure_streaks).await;
                         }
@@ -166,6 +177,50 @@ async fn adopt_active_alerts(
         }
         Err(e) => warn!(error = %e, "infra watch: adopting active alerts failed"),
     }
+}
+
+/// 结算本部署已经停用的规则留下的行。
+///
+/// 一条从配置里被删掉的规则，它的行从此没人认领：watcher 只接手它**现在**有的
+/// 规则的行，而这条规则已经不在其中——于是那行停在 `state='firing'`、`resolved_at`
+/// 永远为空、`last_seen_at` 不再走动。而运营问"现在有什么在响"读的正是
+/// `state='firing'` 那一面，于是它读起来跟一条**正在持续**的告警没有区别，
+/// 只有把三个时钟放在一起看才分得出来。这里按名单把它关掉，走的是和普通解析
+/// 同一条路（含通知），不是从表里悄悄删掉：一次停用是一次**结算**，不是抹掉记录。
+///
+/// 返回这趟有没有够到 store。够不到时调用侧下一拍重试——停用是持久的，第一拍
+/// store 还没起来就把它当"结算过了"，那些行就再也没人关了。
+async fn retire_rules(config: &InfraWatchConfig, outlets: &InfraWatchOutlets) -> bool {
+    if config.retired_rules.is_empty() {
+        return true;
+    }
+    let Some(store) = &outlets.store else {
+        return true;
+    };
+    match store.list_active(1000).await {
+        Ok(records) => {
+            for key in retired_keys(&config.retired_rules, &records) {
+                resolve(key, outlets).await;
+            }
+            true
+        }
+        Err(e) => {
+            warn!(error = %e, "infra watch: 开着的行读不回来，停用规则的结算下一拍重试");
+            false
+        }
+    }
+}
+
+/// 开着的行里，属于已停用规则的那些的 `dedup_key`。
+///
+/// 按规则名而不是按身份挑：停用说的是"这条规则不在了"，它留下几行就是几行——
+/// 一条每台上游各一行的规则停用时会有多行，只取第一行等于只结算一部分。
+fn retired_keys<'a>(retired: &[String], records: &'a [AlertRecord]) -> Vec<&'a str> {
+    records
+        .iter()
+        .filter(|record| retired.iter().any(|name| name == &record.rule))
+        .map(|record| record.dedup_key.as_str())
+        .collect()
 }
 
 /// What one rule's successful evaluation does to the rows it owns.
@@ -1441,7 +1496,62 @@ mod tests {
             poll_interval_secs: 60,
             eval_failure_alert_after: threshold,
             rules: vec![test_rule("rule_a")],
+            retired_rules: Vec::new(),
         }
+    }
+
+    fn firing_record(rule: &str, key: &str) -> AlertRecord {
+        AlertRecord {
+            id: "id".into(),
+            rule: rule.into(),
+            dedup_key: key.into(),
+            severity: "warning".into(),
+            state: "firing".into(),
+            message: String::new(),
+            labels: serde_json::json!({}),
+            fired_at: Utc::now(),
+            resolved_at: None,
+            updated_at: Utc::now(),
+            last_seen_at: Some(Utc::now()),
+        }
+    }
+
+    /// 停用一条规则要把它**所有**开着的行都结算掉，而不只是第一条。
+    ///
+    /// 一条按序列开多行的规则（每台上游一行）停用时，只关掉其中一行会让剩下的
+    /// 行继续以"正在持续"的样子留在 `state='firing'` 那一面上，而它们的规则
+    /// 已经不在了——那正是这份名单要消掉的东西。
+    #[test]
+    fn retirement_selects_every_open_row_of_a_retired_rule() {
+        let records = vec![
+            firing_record("llm_pool_down", "llm_pool_down"),
+            firing_record("llm_calls_all_failing", "llm_calls_all_failing:a"),
+            firing_record("llm_calls_all_failing", "llm_calls_all_failing:b"),
+            firing_record("llm_upstream_pool_down", "llm_upstream_pool_down@1"),
+        ];
+        let retired = vec!["llm_pool_down".to_string()];
+        assert_eq!(retired_keys(&retired, &records), vec!["llm_pool_down"]);
+
+        // 另一条生产者（代码侧那条按事件身份开的行）不在名单里，就不该被动到：
+        // 停用的语义是"这条规则不在了"，不是"凡是不在名单上的都关掉"。
+        let retired = vec![
+            "llm_pool_down".to_string(),
+            "llm_calls_all_failing".to_string(),
+        ];
+        let mut keys = retired_keys(&retired, &records);
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "llm_calls_all_failing:a",
+                "llm_calls_all_failing:b",
+                "llm_pool_down"
+            ]
+        );
+
+        // 名单里的名字没有任何行时无事发生，不是错误。
+        let keys = retired_keys(&["never_existed".to_string()], &records);
+        assert!(keys.is_empty());
     }
 
     #[tokio::test]
