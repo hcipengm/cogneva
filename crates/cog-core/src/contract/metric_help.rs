@@ -1436,6 +1436,23 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          the store should have been reclaimed",
     ),
     (
+        crate::metric_names::MAINLINE_CI_HOLD_SECONDS.as_str(),
+        "Seconds the rollout has been held by the upstream CI gate: 0 while it is \
+         not held, and the age of the current hold while it is. It is the \
+         observation the hold bound is on -- the state file and the heartbeat \
+         line say that a hold exists and which revision it holds, and this says \
+         how long it has lasted, which is what tells a round that is waiting out \
+         a red upstream from a rollout that has stopped for the week. 0 is a \
+         reading and not an absence: the store only adds and overwrites, so a \
+         hold that ends is written back as 0 by the round that ends it -- and \
+         since the gate fails open (only an explicit failure holds), most rounds \
+         write that 0. No label per revision, for the reason the build-duration \
+         gauge beside it gives: a hold describes one revision, and a series per \
+         revision would leave a permanent row for a value that describes only \
+         itself; the revision is carried by the state file's `ci_hold.rev` and \
+         by the heartbeat's `ci_hold=` cell",
+    ),
+    (
         crate::metric_names::MAINLINE_BUILD_SECONDS.as_str(),
         "Duration in seconds of the most recent round's `cargo build --release`, \
          by `outcome`. The poll-cycles counter beside it answers whether the \

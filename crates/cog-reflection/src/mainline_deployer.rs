@@ -2008,6 +2008,17 @@ struct InFlight {
     phase: Phase,
 }
 
+/// 上游 CI 报失败、因此被按住不滚的那一次扣住：哪个 rev，以及从哪一刻起。
+///
+/// 一个值而不是两栏：见 [`MainlineState::ci_hold`]。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CiHold {
+    rev: String,
+    /// 开始扣住的那一刻，unix 秒。它是被扣住时长的起点，也是
+    /// `cogneva_mainline_ci_hold_seconds` 那条读数的来源。
+    since_unix: i64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct MainlineState {
     last_good_tag: Option<String>,
@@ -2031,10 +2042,18 @@ struct MainlineState {
     /// 没有这一格，缺省按版本类（保守：宁可重建）。
     #[serde(default)]
     failed_class: FailureClass,
-    /// 上游 CI 已经报失败、因此被按住不滚的 rev。没有这一格，"被门禁按住"
-    /// 与"没有新 rev 可滚"在心跳上完全同形。
+    /// 上游 CI 已经报失败、因此被按住不滚的那一次扣住：哪个 rev，以及从哪一刻起。
+    ///
+    /// 两栏合成一个值而不是两个 `Option`：它们说的是一件事，分开放就会出现
+    /// "有 rev 没有起点"与"有起点没有 rev"两种读不出来的状态，而这一格存在的
+    /// 理由本来就是"按住的时长"。没有它，"被门禁按住"与"没有新 rev 可滚"在心跳上
+    /// 完全同形，"刚按住一分钟"与"昨天按住到现在"也同形——而后一对的处置相反
+    /// （一个是等，一个是去看上游为什么一直是红的）。
+    ///
+    /// 落在盘上而不是只放在内存里，理由与 `advance_deferrals` 同一条：重启这个
+    /// 进程正是它自己会做的事，而重启正是"已经等了多久"最容易被抹掉的时候。
     #[serde(default)]
-    ci_hold_rev: Option<String>,
+    ci_hold: Option<CiHold>,
     /// 连续多少轮没从构建闸拿到槽。拿不到就原样回下一轮，不留状态，于是这一支
     /// 在读数上完全同形——无论撞的是一次别人的构建，还是槽被一个永远不松手的
     /// 持有者占着。落盘是因为重启正是这个进程自己会做的事：计数在内存里的话，
@@ -3234,23 +3253,64 @@ impl MainlineDeployer {
     ///
     /// 读不到结论一律放行（只有 `Some(false)` 才扣）：拿一次平台抖动停掉整条
     /// 主线跟踪，代价比偶尔滚一个恰好红的 rev 更大。
+    ///
+    /// 这条判据也把**扣了多久**发出去。只记"扣没扣"（状态文件与心跳那一格）答不了
+    /// 时长，而时长正是要判的那件事：一段扣住是三分钟还是三小时，其余读数上完全
+    /// 同形，而处置相反。扣住这一支与放行这一支都要发：库里只增不改，一次扣住结束
+    /// 之后必须有人把这一格读回 0，否则最后那个值会一直留在库里，读它的规则点着
+    /// 而没有任何东西能让它灭。
     async fn hold_if_ci_reports_failure(
         &self,
         state: &mut MainlineState,
         rev: &str,
     ) -> SFResult<bool> {
         if self.ci_verdict_for_rev(rev).await != Some(false) {
+            self.record_ci_hold_reading(0).await;
             return Ok(false);
         }
         warn!(
             rev = %rev12(rev),
             "upstream CI reports a failure for this rev; holding the rollout"
         );
-        if state.ci_hold_rev.as_deref() != Some(rev) {
-            state.ci_hold_rev = Some(rev.to_string());
+        let now = chrono::Utc::now().timestamp();
+        if state.ci_hold.as_ref().map(|h| h.rev.as_str()) != Some(rev) {
+            state.ci_hold = Some(CiHold {
+                rev: rev.to_string(),
+                since_unix: now,
+            });
             self.save_state(state)?;
         }
+        let held_secs = state
+            .ci_hold
+            .as_ref()
+            .map(|h| (now - h.since_unix).max(0))
+            .unwrap_or(0);
+        self.record_ci_hold_reading(held_secs).await;
         Ok(true)
+    }
+
+    /// 被扣住了多久：这条读数自己就是那条界的观测值。
+    ///
+    /// 0 是一个真读数而不是缺席。库里只增不改，一条扣住结束之后必须有人把这一格
+    /// 读回 0，否则最后那个值会一直在，规则点着而没有任何东西能让它灭——所以放行
+    /// 的那一支也写。
+    ///
+    /// 不带 rev 标签。一次扣住描述的就是那一个 rev，按 rev 建序列会为每一个只描述
+    /// 过它自己的值留一行永久行（与 `MAINLINE_BUILD_SECONDS` 同一条判据，那里写着
+    /// "一个 rev 只构建一次，按 rev 建序列会留下一行永远在的、只描述它自己的行"）。
+    /// "扣的是哪个 rev"不是靠这格标签答的：状态文件里的 `ci_hold.rev`、心跳那一行的
+    /// `ci_hold=` 与日志都按 rev 记，而这一格答的是"多久"，两者读在一起才成句。
+    async fn record_ci_hold_reading(&self, held_secs: i64) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let _ = metrics
+            .record_gauge(
+                cog_core::metric_names::MAINLINE_CI_HOLD_SECONDS,
+                held_secs as f64,
+                std::collections::HashMap::new(),
+            )
+            .await;
     }
 
     /// The judgement's own reading: which question it asked upstream and which
@@ -4831,9 +4891,11 @@ impl MainlineDeployer {
         if self.hold_if_ci_reports_failure(&mut state, &bare).await? {
             return Ok(());
         }
-        if state.ci_hold_rev.take().is_some() {
+        if let Some(held) = state.ci_hold.take() {
             info!(
                 rev = %rev12(&bare),
+                held_rev = %rev12(&held.rev),
+                held_secs = chrono::Utc::now().timestamp() - held.since_unix,
                 "upstream CI no longer reports a failure; resuming the rollout"
             );
             self.save_state(&state)?;
@@ -6430,12 +6492,23 @@ fn heartbeat_message(
         .map(|f| format!("{}@{:?}", rev12(&f.rev), f.phase))
         .unwrap_or_else(|| "none".into());
     format!(
-        "bare={} upstream={} last_good={} in_flight={} ci_hold={} registry_hold_secs={} failed_rev={} failed_class={} failed_loci={} failed_repeated={} cooldown_remaining_secs={}",
+        "bare={} upstream={} last_good={} in_flight={} ci_hold={} ci_hold_secs={} registry_hold_secs={} failed_rev={} failed_class={} failed_loci={} failed_repeated={} cooldown_remaining_secs={}",
         rev12(bare_rev),
         upstream,
         state.last_good_rev.as_deref().map(rev12).unwrap_or("none"),
         in_flight,
-        state.ci_hold_rev.as_deref().map(rev12).unwrap_or("none"),
+        state
+            .ci_hold
+            .as_ref()
+            .map(|h| rev12(&h.rev))
+            .unwrap_or("none"),
+        // 被上游 CI 按住多久，与 `registry_hold_secs` 同一格理由：没有它，"刚按住"
+        // 与"按住一整天"在这一行上完全同形，而后者的处置是去看上游为什么一直是红的。
+        state
+            .ci_hold
+            .as_ref()
+            .map(|h| (now_unix - h.since_unix).to_string())
+            .unwrap_or_else(|| "none".into()),
         // 被"tag 服务正在重建索引"按住多久：没有这一格，"等它答话"与"没有新 rev 可滚"
         // 在同一行上完全同形，而两者的处置相反（一个是等，一个是没事干）。
         state
@@ -11609,7 +11682,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             failed_rev: None,
             failed_cooldown_until: 0,
             failed_class: FailureClass::Version,
-            ci_hold_rev: None,
+            ci_hold: None,
             ..Default::default()
         };
         let msg = heartbeat_message(&state, "4dfd51ff1209abcdef", "off", 100);
@@ -11617,6 +11690,8 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         assert!(msg.contains("upstream=off"), "{msg}");
         // 门禁按住与"没有新 rev"必须在这行上分开：两者都不前进。
         assert!(msg.contains("ci_hold=none"), "{msg}");
+        // 按住多久也是一格：没有它，"刚按住"与"按住一整天"同形。
+        assert!(msg.contains("ci_hold_secs=none"), "{msg}");
         assert!(msg.contains("last_good=4dfd51ff1209"), "{msg}");
         assert!(msg.contains("in_flight=none"), "{msg}");
         assert!(msg.contains("failed_rev=none"), "{msg}");
@@ -11643,7 +11718,10 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             ],
             failed_repeated: false,
             failed_class: FailureClass::Version,
-            ci_hold_rev: Some("deadbeef0011".into()),
+            ci_hold: Some(CiHold {
+                rev: "deadbeef0011".into(),
+                since_unix: 300,
+            }),
             advance_deferrals: 0,
             registry_maintenance_unix: 0,
             registry_restart_unix: Some(940),
@@ -11664,6 +11742,8 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         assert!(msg.contains("failed_repeated=false"), "{msg}");
         assert!(msg.contains("cooldown_remaining_secs=500"), "{msg}");
         assert!(msg.contains("ci_hold=deadbeef0011"), "{msg}");
+        // 同一个 rev 也要说出扣了多久：now_unix=1000 而起点 300。
+        assert!(msg.contains("ci_hold_secs=700"), "{msg}");
     }
 
     /// 环境类失败不占证据面，`failed_rev` 与 `failed_loci=0` 会同时出现：
@@ -11997,7 +12077,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             failed_signatures: vec![None, Some("version:wait:web:observed".into())],
             failed_repeated: true,
             failed_class: FailureClass::Environment,
-            ci_hold_rev: None,
+            ci_hold: None,
             advance_deferrals: 0,
             registry_maintenance_unix: 0,
             registry_restart_unix: None,
@@ -13578,6 +13658,85 @@ exit 0
         cfg.upstreams[0].api_base = Some("http://127.0.0.1:1/github".into());
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
         assert_eq!(deployer.ci_verdict_for_rev("abc123").await, None);
+    }
+
+    /// 扣住的时长是这条读数的全部内容。
+    ///
+    /// 状态文件与心跳说"扣住了、扣的是哪个 rev"，答不了"扣了多久"，而时长正是
+    /// 唯一要判的那件事：刚按住与按住一整天在别的读数上完全同形。0 也是一个真
+    /// 读数——库里只增不改，一段扣住结束之后必须有人把它写回去，否则最后那个值
+    /// 会一直在，读它的规则点着而没有任何东西能让它灭。
+    #[tokio::test]
+    async fn the_hold_reading_carries_how_long_and_goes_back_to_zero() {
+        use cog_core::metric_names::MAINLINE_CI_HOLD_SECONDS;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        // 三次提问各一次应答：红、红（一小时后再问）、绿（放行）。
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(r#"{"check_runs":[{"conclusion":"failure"}]}"#),
+            http_200(r#"{"check_runs":[{"conclusion":"failure"}]}"#),
+            http_200(r#"{"check_runs":[{"conclusion":"success"}]}"#),
+        ])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_metrics(metrics.clone());
+
+        let read = || {
+            let metrics = metrics.clone();
+            async move {
+                metrics
+                    .query_gauge_latest(MAINLINE_CI_HOLD_SECONDS.as_str())
+                    .await
+                    .unwrap()
+                    .first()
+                    .map(|s| s.value)
+            }
+        };
+
+        // 上游说这条 rev 红：扣住，起点落盘。
+        let mut state = deployer.load_state();
+        assert!(deployer
+            .hold_if_ci_reports_failure(&mut state, "abc123")
+            .await
+            .unwrap());
+        let held = deployer.load_state().ci_hold.expect("扣住了就要有起点");
+        assert_eq!(held.rev, "abc123");
+        let first = read().await.expect("按住这一支也要写这一格");
+        assert!(first < 5.0, "刚按住，读出来的是 {first}");
+
+        // 把起点挪到一小时前再问一次：这一格跟着走，不是一次性的。
+        let mut state = deployer.load_state();
+        state.ci_hold = Some(CiHold {
+            rev: "abc123".into(),
+            since_unix: chrono::Utc::now().timestamp() - 3600,
+        });
+        deployer.save_state(&state).unwrap();
+        assert!(deployer
+            .hold_if_ci_reports_failure(&mut state, "abc123")
+            .await
+            .unwrap());
+        let aged = read().await.unwrap();
+        assert!(
+            (3600.0..3720.0).contains(&aged),
+            "读出来的该是这一次真扣住的墙钟时长，记到的是 {aged}"
+        );
+
+        // 上游不再说红：这一支放行，并把这一格读回 0。清掉状态里的起点是
+        // `poll_once` 那一侧的事（`take()`），这里只管读数。
+        assert!(!deployer
+            .hold_if_ci_reports_failure(&mut state, "abc123")
+            .await
+            .unwrap());
+        assert_eq!(
+            read().await.unwrap(),
+            0.0,
+            "扣住结束必须写回 0，否则最后那个值会一直在库里"
+        );
+        handle.await.unwrap();
     }
 
     /// 三支判定各自留下的是哪一支。

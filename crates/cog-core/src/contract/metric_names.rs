@@ -663,6 +663,27 @@ metric_names! {
     // unactionable for lack of exactly this label. Recording it changes no
     // verdict: the gate still fails open by design.
     MAINLINE_CI_NO_VERDICT_REASON_TOTAL => "cogneva_mainline_ci_no_verdict_reason_total",
+    // How long the rollout has been held by the CI gate, in seconds: 0 when it is
+    // not held, the age of the current hold while it is. The state file and the
+    // heartbeat line say *that* the gate is holding and which rev it holds; this
+    // says for how long, and that is the quantity the bound is on -- a hold of
+    // three minutes and a hold of three hours are the same row everywhere else,
+    // while one of them means "wait" and the other means "go and read why the
+    // upstream is still red".
+    //
+    // 0 is published while not held rather than the series being left absent:
+    // the store only ever adds and overwrites, so a hold that ends has to be
+    // written back as 0 by something, or its last value stays in the store
+    // forever and a rule reading it stays lit with nothing able to clear it.
+    // The gate is fail-open, so most rounds publish this as 0.
+    //
+    // No label per revision, for the reason MAINLINE_BUILD_SECONDS gives beside
+    // it: a hold describes one revision, and a series per revision would leave
+    // one permanent row per hold for a value that describes only itself. Which
+    // revision is being held is answered where revisions are already the key --
+    // the state file's `ci_hold.rev`, the heartbeat's `ci_hold=` cell and the
+    // log -- and it is read together with this number rather than inside it.
+    MAINLINE_CI_HOLD_SECONDS => "cogneva_mainline_ci_hold_seconds",
     // Rounds the deployer's poll loop finished, by how they finished: `ok` when
     // the round ran to the end, `failed` when it returned an error.
     //
