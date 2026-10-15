@@ -880,6 +880,31 @@ impl cog_core::SystemPlugin for StoragePlugin {
             warn!("No PostgreSQL pool; the principle ledger is unavailable in this deployment");
         }
 
+        // ── BackupRunStore ──
+        // The backup account is the table, the same as the two ledgers above, and
+        // the same rule applies for the same reason: without a pool nothing is
+        // published and the loop that reads it stays away. There is no in-memory
+        // fallback, and here that matters more than for the ledgers -- the rows
+        // are written by a *different process* on a schedule, so a
+        // process-local account would not merely report its own state as the
+        // platform's, it would report nothing at all and look empty.
+        //
+        // The writers do not come through here. Each backup run holds its own
+        // connection and writes its own row; this publication is the read side,
+        // which is the half that has to be resident to be worth anything.
+        if let Some(pool) = self.pg_pool.clone() {
+            let store: Arc<dyn cog_core::BackupRunStore> =
+                Arc::new(crate::PostgresBackupRunStore::new(pool));
+            ctx.publish_service(store);
+            info!("StoragePlugin backup run store published");
+        } else if strict_persistence {
+            return Err(cog_core::SFError::Config(
+                "No PostgreSQL pool for BackupRunStore (strict_persistence=true)".into(),
+            ));
+        } else {
+            warn!("No PostgreSQL pool; the backup account is unavailable in this deployment");
+        }
+
         // ── ObjectBackend (singleton for all modules) ──
         let http_client = ctx.consume_service::<dyn cog_core::HttpClient>();
         let object_backend =

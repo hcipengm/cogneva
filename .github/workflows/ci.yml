@@ -111,6 +111,20 @@ jobs:
         run: cargo test -p cog-storage --test change_ledger_store -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The backup account's write path is statements whose whole content is what
+      # the server does with them: whether the conflict clause wrote a row decides
+      # if a repeated opening moved a start instant already recorded, whether the
+      # closing's guard matched is what makes a terminal row unrewritable, and
+      # whether the pass over the overdue runs concluded one row or two is decided
+      # by the deadline each of those rows carries rather than by anything the
+      # caller passes in. All of those are facts about `rows_affected` and about a
+      # `WHERE` the server evaluated, so a DB-free test cannot see any of them --
+      # the closed set on the outcome, likewise, is the column's constraint and
+      # not a check in the caller.
+      - name: Live-DB backup-run store
+        run: cargo test -p cog-storage --test backup_run_store -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The principle ledger's intake is keyed on `(slug, source)`, so every
       # later reading of a principle lands on the row already queued for it, and
       # whether that row is rewritten is decided by the conflict clause alone --

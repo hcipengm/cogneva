@@ -1,0 +1,279 @@
+//!PostgreSQL-backed store for the backup account.
+//!
+//!The table is created by the storage migrations, not by an `init_schema` on
+//!this type. Its columns are the contract's own record -- the package, the
+//!instants, the retention pair -- and a second CREATE TABLE here would be a
+//!second definition of that record: the two would drift, and the one that wins
+//!is whichever ran last.
+//!
+//!Unlike the ledgers, this table has more than one writer by design: every
+//!backup run writes its own row, and the runs are separate processes launched on
+//!a schedule. What keeps that from being several accounts is the key -- one run
+//!identity, derived from the clock, and a closing that is refused unless the row
+//!is still open. Two writers therefore cannot both conclude the same run.
+//!
+//!There is a second author of conclusions, and it is the account's own pass
+//!rather than a run: `abandon_overdue` closes rows whose run stopped reporting.
+//!It cannot collide with a run either, for the same reason a run cannot collide
+//!with itself -- both move a row out of `running`, and only one of them can find
+//!the row still there. What separates their conclusions is the outcome they
+//!write, so a reader selecting by state can tell which author it is looking at.
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use sqlx::{PgPool, Row};
+
+use cog_core::{
+    BackupAccountReading, BackupPackageRecord, BackupRunClosing, BackupRunOpening, BackupRunStore,
+    SFError, SFResult,
+};
+
+/// PostgreSQL backup account store.
+#[derive(Clone)]
+pub struct PostgresBackupRunStore {
+    pool: PgPool,
+}
+
+impl PostgresBackupRunStore {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+/// Open a run. The conflict clause writes nothing, so the statement's own row
+/// count is the answer to "was this row newly written" rather than a second
+/// query that could race with it.
+///
+/// The clause is what makes a repeated opening harmless rather than destructive:
+/// without it a second run claiming an identity already in the table would move
+/// a start instant that has already been recorded and read.
+const OPEN_RUN_SQL: &str = "\
+INSERT INTO backup_runs (run_id, started_at, outcome, keep_target, run_deadline_seconds) \
+VALUES ($1, $2, 'running', $3, $4) \
+ON CONFLICT (run_id) DO NOTHING";
+
+/// Close a run, and only if it is still open. The guard makes the statement a
+/// conclusion about this run rather than an assignment: a row that already holds
+/// a terminal outcome is left where it is, so the first answer a run gave stands
+/// and a second report cannot move it.
+const CLOSE_RUN_SQL: &str = "\
+UPDATE backup_runs \
+SET outcome = $2, finished_at = $3, package = $4, bytes = $5, \
+    kept_after = $6, oldest_kept_at = $7, error = $8 \
+WHERE run_id = $1 AND outcome = 'running'";
+
+/// Conclude every run that has outlived the deadline it was opened under.
+///
+/// The bound is read from each row rather than passed in, so the statement
+/// cannot conclude a run that is still inside the time it was given -- which is
+/// the one thing this pass must never do, since the row it would close is a run
+/// that may still be working. The same clause is what makes the pass safe to run
+/// at any moment and any number of times: a row leaves `running` once.
+///
+/// `finished_at` is left as it is, which for these rows is NULL. There is no
+/// instant at which the run finished; inventing one would put a number in a
+/// column that means "when this run ended" while the end is exactly what nobody
+/// saw. The error text carries the number that decided it, so the row can be
+/// read without knowing the configuration in force that day.
+const ABANDON_OVERDUE_SQL: &str = "\
+UPDATE backup_runs \
+SET outcome = 'abandoned', \
+    error = format('%s (the deadline it was opened under is %s s)', $1, run_deadline_seconds) \
+WHERE outcome = 'running' \
+  AND started_at + make_interval(secs => run_deadline_seconds) <= $2";
+
+/// The whole account in one look.
+///
+/// The snapshot is materialized so that its counts, both halves of the open-run
+/// pair and the newest package come from one instant. Read as separate
+/// statements they could straddle a run finishing, and the reading would carry a
+/// count from before that run and a package from after it -- two moments
+/// presented as one, which is exactly the shape of error a reader cannot see.
+///
+/// The newest package is taken from the rows that concluded `ok` and not from
+/// the newest row: the package fields are the ones a run that produced something
+/// wrote, and a failed run has none to offer.
+///
+/// The open run is joined rather than aggregated twice. Its start instant and
+/// the deadline it was opened under are one row's two columns, and two scalar
+/// subqueries over the same predicate would be two lookups that a tie in
+/// `started_at` could resolve to two different rows -- an age from one run
+/// measured against another run's deadline, which is a comparison nobody asked
+/// for and nobody could see.
+const READ_ACCOUNT_SQL: &str = "\
+WITH snapshot AS MATERIALIZED ( \
+    SELECT run_id, started_at, finished_at, outcome, package, bytes, \
+           keep_target, run_deadline_seconds, kept_after, oldest_kept_at \
+    FROM backup_runs \
+) \
+SELECT \
+    (SELECT count(*) FROM snapshot WHERE outcome = 'running')        AS running, \
+    (SELECT count(*) FROM snapshot WHERE outcome = 'ok')             AS ok_count, \
+    (SELECT count(*) FROM snapshot WHERE outcome = 'failed')         AS failed, \
+    (SELECT count(*) FROM snapshot WHERE outcome = 'abandoned')      AS abandoned, \
+    (SELECT max(finished_at) FROM snapshot)                          AS latest_finish_at, \
+    open.started_at            AS open_started_at, \
+    open.run_deadline_seconds  AS open_run_deadline_seconds, \
+    newest.run_id          AS package_run_id, \
+    newest.finished_at     AS package_finished_at, \
+    newest.package         AS package, \
+    newest.bytes           AS package_bytes, \
+    newest.keep_target     AS package_keep_target, \
+    newest.kept_after      AS package_kept_after, \
+    newest.oldest_kept_at  AS package_oldest_kept_at \
+FROM (SELECT 1) AS one \
+LEFT JOIN LATERAL ( \
+    SELECT * FROM snapshot WHERE outcome = 'running' ORDER BY started_at LIMIT 1 \
+) AS open ON TRUE \
+LEFT JOIN LATERAL ( \
+    SELECT * FROM snapshot WHERE outcome = 'ok' ORDER BY started_at DESC LIMIT 1 \
+) AS newest ON TRUE";
+
+#[async_trait]
+impl BackupRunStore for PostgresBackupRunStore {
+    async fn open_run(&self, opening: &BackupRunOpening) -> SFResult<bool> {
+        if opening.run_id.trim().is_empty() {
+            return Err(SFError::Validation(
+                "a backup run's identity cannot be empty: the row would be unreadable as a name \
+                 for the run it records"
+                    .into(),
+            ));
+        }
+        let outcome = sqlx::query(OPEN_RUN_SQL)
+            .bind(&opening.run_id)
+            .bind(opening.started_at)
+            .bind(opening.keep_target)
+            .bind(opening.run_deadline_seconds)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("open backup run {}: {e}", opening.run_id)))?;
+        Ok(outcome.rows_affected() > 0)
+    }
+
+    async fn close_run(&self, run_id: &str, closing: &BackupRunClosing) -> SFResult<bool> {
+        if !closing.outcome.is_a_runs_own_report() {
+            return Err(SFError::Validation(format!(
+                "a backup run cannot close itself as {}: a run either reports how it ended or it \
+                 stops being able to, and the second conclusion is the account's to write",
+                closing.outcome.as_str()
+            )));
+        }
+        let outcome = sqlx::query(CLOSE_RUN_SQL)
+            .bind(run_id)
+            .bind(closing.outcome.as_str())
+            .bind(closing.finished_at)
+            .bind(closing.package.as_deref())
+            .bind(closing.bytes)
+            .bind(closing.kept_after)
+            .bind(closing.oldest_kept_at)
+            .bind(closing.error.as_deref())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("close backup run {run_id}: {e}")))?;
+        Ok(outcome.rows_affected() > 0)
+    }
+
+    async fn abandon_overdue(&self, now: DateTime<Utc>) -> SFResult<u64> {
+        let outcome = sqlx::query(ABANDON_OVERDUE_SQL)
+            .bind(
+                "the run never reported and its deadline has passed, so the account concludes it \
+                 here: the process that opened this row was killed or wedged and cannot close it",
+            )
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("abandon overdue backup runs: {e}")))?;
+        Ok(outcome.rows_affected())
+    }
+
+    async fn read_account(&self) -> SFResult<BackupAccountReading> {
+        let row = sqlx::query(READ_ACCOUNT_SQL)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("read the backup account: {e}")))?;
+
+        // The open run's two columns are absent together -- the lateral join
+        // yields one row of nulls when nothing is open -- so the start instant
+        // decides whether there is a pair to read. The deadline is NOT NULL in
+        // the column, which makes a start without one unreadable rather than
+        // silently paired with a zero.
+        let oldest_running_at: Option<chrono::DateTime<chrono::Utc>> = row
+            .try_get("open_started_at")
+            .map_err(|e| SFError::Database(format!("open_started_at: {e}")))?;
+        let oldest_running_deadline_seconds = match oldest_running_at {
+            None => None,
+            Some(_) => Some(
+                row.try_get::<Option<i32>, _>("open_run_deadline_seconds")
+                    .map_err(|e| SFError::Database(format!("open_run_deadline_seconds: {e}")))?
+                    .ok_or_else(|| {
+                        SFError::Database(
+                            "a backup run is open without the deadline it was opened under, so \
+                             nothing can decide whether it is late or gone"
+                                .into(),
+                        )
+                    })?,
+            ),
+        };
+
+        let package_run_id: Option<String> = row
+            .try_get("package_run_id")
+            .map_err(|e| SFError::Database(format!("package_run_id: {e}")))?;
+        // The newest package's columns are all absent together -- the lateral
+        // join yields one row of nulls when no run has ever concluded `ok` --
+        // so the identity decides whether there is a record to read at all.
+        let newest_package = match package_run_id {
+            None => None,
+            Some(run_id) => {
+                let finished_at: Option<chrono::DateTime<chrono::Utc>> = row
+                    .try_get("package_finished_at")
+                    .map_err(|e| SFError::Database(format!("package_finished_at: {e}")))?;
+                let finished_at = finished_at.ok_or_else(|| {
+                    SFError::Database(format!(
+                        "backup run {run_id} concluded ok without a finish instant, so the \
+                         account cannot say when it finished"
+                    ))
+                })?;
+                Some(BackupPackageRecord {
+                    run_id,
+                    finished_at,
+                    package: row
+                        .try_get("package")
+                        .map_err(|e| SFError::Database(format!("package: {e}")))?,
+                    bytes: row
+                        .try_get("package_bytes")
+                        .map_err(|e| SFError::Database(format!("package_bytes: {e}")))?,
+                    keep_target: row
+                        .try_get("package_keep_target")
+                        .map_err(|e| SFError::Database(format!("package_keep_target: {e}")))?,
+                    kept_after: row
+                        .try_get("package_kept_after")
+                        .map_err(|e| SFError::Database(format!("package_kept_after: {e}")))?,
+                    oldest_kept_at: row
+                        .try_get("package_oldest_kept_at")
+                        .map_err(|e| SFError::Database(format!("package_oldest_kept_at: {e}")))?,
+                })
+            }
+        };
+
+        Ok(BackupAccountReading {
+            running: row
+                .try_get("running")
+                .map_err(|e| SFError::Database(format!("running: {e}")))?,
+            ok: row
+                .try_get("ok_count")
+                .map_err(|e| SFError::Database(format!("ok_count: {e}")))?,
+            failed: row
+                .try_get("failed")
+                .map_err(|e| SFError::Database(format!("failed: {e}")))?,
+            abandoned: row
+                .try_get("abandoned")
+                .map_err(|e| SFError::Database(format!("abandoned: {e}")))?,
+            latest_finish_at: row
+                .try_get("latest_finish_at")
+                .map_err(|e| SFError::Database(format!("latest_finish_at: {e}")))?,
+            oldest_running_at,
+            oldest_running_deadline_seconds,
+            newest_package,
+        })
+    }
+}

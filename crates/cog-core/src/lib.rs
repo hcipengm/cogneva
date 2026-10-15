@@ -21,6 +21,7 @@ pub use config::*;
 pub use contract::agent::*;
 pub use contract::alerts::*;
 pub use contract::auth::*;
+pub use contract::backup_run::*;
 pub use contract::change_ledger::*;
 pub use contract::codec::*;
 pub use contract::context_builder::*;

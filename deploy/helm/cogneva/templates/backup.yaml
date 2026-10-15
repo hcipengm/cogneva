@@ -42,6 +42,11 @@ spec:
     spec:
       # 备份失败不重试成串：下一个周期自然再来，连续失败由 history 留证。
       backoffLimit: 1
+      # 卡死的运行必须有人来杀。concurrencyPolicy 是 Forbid，一次挂住的运行会
+      # 让它之后每一次都不再开始——备份停掉，连「谁来给挂住那笔收尾」也一起停。
+      # 这个界杀的是容器，同一个值经 env 进运行自己写的账本行，判超期用的是那一
+      # 行上的数（见 backup.rs 的 run_deadline_seconds）。
+      activeDeadlineSeconds: {{ .Values.backup.runDeadlineSeconds }}
       ttlSecondsAfterFinished: 86400
       template:
         metadata:
@@ -68,6 +73,11 @@ spec:
                   value: "http://qdrant.{{ include "cogneva.namespace" . }}.svc.cluster.local:6333"
                 - name: COGNEVA_BACKUP_KEEP
                   value: {{ .Values.backup.keepCount | quote }}
+                # 与 jobTemplate 的 activeDeadlineSeconds 是同一个值的两个载体：
+                # 一个让 kubelet 到点杀容器，一个让运行把「这次我被给了多久」写
+                # 进账本那一行。分开写两个数会漂，超期判断就跟着漂。
+                - name: COGNEVA_BACKUP_RUN_DEADLINE_SECONDS
+                  value: {{ .Values.backup.runDeadlineSeconds | quote }}
                 - name: COGNEVA_NAMESPACE
                   valueFrom:
                     fieldRef:

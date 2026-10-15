@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use chrono::{SecondsFormat, Utc};
+use cog_core::{BackupOutcome, BackupRunClosing, BackupRunOpening, BackupRunStore};
+use cog_storage::PostgresBackupRunStore;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
@@ -28,6 +30,18 @@ use sqlx::PgPool;
 pub const PACKAGE_PREFIX: &str = "cogneva-backup-";
 pub const PACKAGE_SUFFIX: &str = ".tar.zst";
 const TIMESTAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
+
+/// 落库的错误文本上限。错误本身通常只有一行，这个界是为了让一条失控的长错误
+/// （整段响应体、整张表名清单）不至于把行撑成不可读的东西。
+const ERROR_TEXT_MAX_CHARS: usize = 2000;
+
+/// 一次运行默认的期限，也是集群清单里那个 `activeDeadlineSeconds` 的默认值。
+///
+/// 实测一次运行 41 秒（含导出、快照、打包、裁剪），一小时的界是它的一百多倍：
+/// 落在里面的运行照跑，落在外面的那个不是慢，是卡死了——而它卡着的时候，
+/// 调度器的 `Forbid` 会让后面每一次都不再开始。没有这个界，一次挂住的运行
+/// 就能把备份永久停掉，顺带把「谁来给它收尾」也一并停掉。
+const DEFAULT_RUN_DEADLINE_SECONDS: i32 = 3600;
 
 /// 内部实例密钥对象名：业务 Pod 读的那一份（数据库/缓存/内部签名/S3/邮件）。
 pub const SECRET_NAME_INTERNAL: &str = "cogneva-secrets";
@@ -102,6 +116,14 @@ pub struct BackupConfig {
     /// cogneva-data-pvc 挂载根；对象子树取其下 `storage/`。
     pub data_dir: PathBuf,
     pub keep_count: usize,
+    /// 这一次运行最长能跑多久。集群侧同一个值同时是 Job 的
+    /// `activeDeadlineSeconds`（到点由 kubelet 杀容器）和这里的 env——一个值
+    /// 两处承载，不许各自写一份。
+    ///
+    /// 它落进账本那一行的 `run_deadline_seconds`，因为那个数要跟着这一行走：
+    /// 一行运行中的记录没人在跑，只有拿**它自己被开出来时**的期限才能判，用
+    /// 今天的旋钮去判昨天那一次是两回事。
+    pub run_deadline_seconds: i32,
     pub namespace: String,
 }
 
@@ -131,6 +153,10 @@ impl BackupConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(7),
+            run_deadline_seconds: std::env::var("COGNEVA_BACKUP_RUN_DEADLINE_SECONDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_RUN_DEADLINE_SECONDS),
             namespace: std::env::var("COGNEVA_NAMESPACE").unwrap_or_else(|_| "cogneva".into()),
         })
     }
@@ -496,9 +522,12 @@ impl QdrantHttp {
     }
 }
 
-/// 保留策略：包名时间戳字典序即新旧序，留最新 N 份。删除旧包失败只告警——
-/// 保留失败绝不能反过来弄丢新包。
-pub fn enforce_retention(dir: &Path, keep: usize) -> Vec<PathBuf> {
+/// 目录里现存的备份包，按包名排序即按时间排序。
+///
+/// 单独一个函数是因为它有两个读者：保留策略要按它裁，账要按它报「留下了几个、
+/// 最老的那个是哪一刻」。两处各自 `read_dir` 一遍会走出两个目录快照，而它们
+/// 说的是同一件事。
+pub fn packages_in(dir: &Path) -> Vec<PathBuf> {
     let mut packages: Vec<PathBuf> = match std::fs::read_dir(dir) {
         Ok(entries) => entries
             .filter_map(|e| e.ok())
@@ -512,6 +541,25 @@ pub fn enforce_retention(dir: &Path, keep: usize) -> Vec<PathBuf> {
         Err(_) => return Vec::new(),
     };
     packages.sort();
+    packages
+}
+
+/// 包名里的时刻。保留策略靠「名字字典序即时间序」，账上要判「最老的包有多老」
+/// 也只能从这个时刻来：mtime 会被拷贝、rsync、恢复 drill 改写，而包名就是产生
+/// 它的那次运行写在行上的 `started_at` 的来源——两边同一个钟读出来的数才可比。
+pub fn package_instant(name: &str) -> Option<chrono::DateTime<Utc>> {
+    let stem = name
+        .strip_prefix(PACKAGE_PREFIX)?
+        .strip_suffix(PACKAGE_SUFFIX)?;
+    chrono::NaiveDateTime::parse_from_str(stem, TIMESTAMP_FORMAT)
+        .ok()
+        .map(|naive| naive.and_utc())
+}
+
+/// 保留策略：包名时间戳字典序即新旧序，留最新 N 份。删除旧包失败只告警——
+/// 保留失败绝不能反过来弄丢新包。
+pub fn enforce_retention(dir: &Path, keep: usize) -> Vec<PathBuf> {
+    let mut packages = packages_in(dir);
     let mut deleted = Vec::new();
     while packages.len() > keep {
         let victim = packages.remove(0);
@@ -558,6 +606,85 @@ fn untar_package(pkg: &Path, dest: &Path) -> std::io::Result<PathBuf> {
     Ok(dest.join(name))
 }
 
+/// 一次运行收尾时留下的东西，就是要记进账的那几列。它们一起算、一起交出去，
+/// 免得「留下了几个」和「最老的是哪一刻」分别去读两次目录。
+struct LeftBehind {
+    package: PathBuf,
+    bytes: Option<i64>,
+    kept_after: Option<i32>,
+    oldest_kept_at: Option<chrono::DateTime<Utc>>,
+}
+
+/// 这一次运行跑完之后，目录里还剩什么。两个数出自同一次枚举。
+fn retained_state(dir: &Path) -> (Option<i32>, Option<chrono::DateTime<Utc>>) {
+    let packages = packages_in(dir);
+    let oldest = packages
+        .first()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .and_then(package_instant);
+    (Some(packages.len() as i32), oldest)
+}
+
+/// 账本库的连接。连不上就返回 None，**绝不因此判备份失败**。
+///
+/// 理由是不对称的：一次已经跑完的备份，被「记录写不进去」判失败，等于拿被保护
+/// 的东西换了那张说明事情的纸。所以这一路的每个失败都只留一条 warn，而 warn 是
+/// 有声音的——账上少一行这件事必须在日志里看得见，否则「没写」和「没跑」同形。
+async fn open_run_store(cfg: &BackupConfig) -> Option<PostgresBackupRunStore> {
+    match PgPool::connect(&cfg.database_url).await {
+        Ok(pool) => Some(PostgresBackupRunStore::new(pool)),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "备份：账本库连不上，这一次运行不会在账上留痕（备份本身继续）"
+            );
+            None
+        }
+    }
+}
+
+/// 落库前把错误文本洗干净：常见的密钥形态交给公共脱敏，连接串里的口令另外按
+/// 值整段换掉——错误多半来自 PG 客户端，而它会把整条 URL 连同口令一起抄进
+/// 错误消息里，行一旦落库，口令就跟着备份包走到恢复端去了。
+fn recordable_error(err: &dyn std::error::Error, cfg: &BackupConfig) -> String {
+    let scrubbed = url_password(&cfg.database_url)
+        .map(|secret| cog_core::redact_secrets(&err.to_string()).replace(&secret, "[redacted]"))
+        .unwrap_or_else(|| cog_core::redact_secrets(&err.to_string()));
+    scrubbed.chars().take(ERROR_TEXT_MAX_CHARS).collect()
+}
+
+/// 连接串里的口令，取「scheme://user:password@host」的这一段。取不到就没有要
+/// 换的东西——那也说明这条 URL 里本来就没有口令。
+fn url_password(url: &str) -> Option<String> {
+    let authority = url.split_once("://")?.1.split(['/', '?']).next()?;
+    let userinfo = authority.rsplit_once('@')?.0;
+    let password = userinfo.split_once(':')?.1;
+    (!password.is_empty()).then(|| password.to_string())
+}
+
+/// 把开口与收尾都记进账，然后按结局返回。
+///
+/// 开口在任何工作之前写：这个进程可能活不到收尾（OOM／驱逐／被 kill），而那一行
+/// 的开口就是它来过的唯一见证——只记终局的表恰恰在最需要它的时候是空的。
+async fn record_run(
+    store: Option<&PostgresBackupRunStore>,
+    run_id: &str,
+    closing: BackupRunClosing,
+) {
+    let Some(store) = store else {
+        return;
+    };
+    match store.close_run(run_id, &closing).await {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            run = %run_id,
+            "备份：账上没有这一笔还开着的运行，收尾没写进去（开工那行要么没落，要么已经结过）"
+        ),
+        Err(e) => tracing::warn!(error = %e, run = %run_id, "备份：收尾那一行没写进去"),
+    }
+}
+
 pub async fn run_backup(cfg: &BackupConfig) -> Result<PathBuf, Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&cfg.backup_dir)?;
     let now = Utc::now();
@@ -567,26 +694,103 @@ pub async fn run_backup(cfg: &BackupConfig) -> Result<PathBuf, Box<dyn std::erro
     let staging = cfg.backup_dir.join(&staging_name);
     std::fs::create_dir_all(&staging)?;
 
-    let result = run_backup_into(cfg, &staging).await;
-    match result {
+    let run_store = open_run_store(cfg).await;
+    if let Some(store) = &run_store {
+        match store
+            .open_run(&BackupRunOpening {
+                run_id: staging_name.clone(),
+                started_at: now,
+                keep_target: cfg.keep_count as i32,
+                run_deadline_seconds: cfg.run_deadline_seconds,
+            })
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(
+                run = %staging_name,
+                "备份：这个标识已经在账上了，开工的行保持原样——同一个标识不会开两次"
+            ),
+            Err(e) => tracing::warn!(error = %e, "备份：开工那一行没写进去"),
+        }
+    }
+
+    match finish_backup(cfg, now, &staging, &staging_name).await {
+        Ok(left) => {
+            record_run(
+                run_store.as_ref(),
+                &staging_name,
+                BackupRunClosing {
+                    outcome: BackupOutcome::Ok,
+                    // 收尾的时刻在包写完、保留裁完之后取：先取的钟会让「结」早于
+                    // 「产」，而这两列的差就是这次运行花了多久。
+                    finished_at: Utc::now(),
+                    package: left
+                        .package
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(str::to_string),
+                    bytes: left.bytes,
+                    kept_after: left.kept_after,
+                    oldest_kept_at: left.oldest_kept_at,
+                    error: None,
+                },
+            )
+            .await;
+            Ok(left.package)
+        }
+        Err(e) => {
+            record_run(
+                run_store.as_ref(),
+                &staging_name,
+                BackupRunClosing {
+                    outcome: BackupOutcome::Failed,
+                    finished_at: Utc::now(),
+                    package: None,
+                    bytes: None,
+                    kept_after: None,
+                    oldest_kept_at: None,
+                    error: Some(recordable_error(e.as_ref(), cfg)),
+                },
+            )
+            .await;
+            Err(e)
+        }
+    }
+}
+
+/// 真正跑一次备份并收尾：导出、写清单、打包、清 staging、裁保留。
+async fn finish_backup(
+    cfg: &BackupConfig,
+    now: chrono::DateTime<Utc>,
+    staging: &Path,
+    staging_name: &str,
+) -> Result<LeftBehind, Box<dyn std::error::Error>> {
+    match run_backup_into(cfg, staging).await {
         Ok(manifest) => {
             let manifest_json = serde_json::to_string_pretty(&manifest)?;
             std::fs::write(staging.join("manifest.json"), format!("{manifest_json}\n"))?;
-            let final_path = cfg.backup_dir.join(package_name(now));
-            tar_package(&staging, &staging_name, &final_path)?;
-            std::fs::remove_dir_all(&staging)?;
+            let package = cfg.backup_dir.join(package_name(now));
+            tar_package(staging, staging_name, &package)?;
+            std::fs::remove_dir_all(staging)?;
             let deleted = enforce_retention(&cfg.backup_dir, cfg.keep_count);
+            let (kept_after, oldest_kept_at) = retained_state(&cfg.backup_dir);
             tracing::info!(
-                package = %final_path.display(),
+                package = %package.display(),
                 kept = cfg.keep_count,
                 pruned = deleted.len(),
                 "backup package complete"
             );
-            Ok(final_path)
+            let bytes = std::fs::metadata(&package).ok().map(|m| m.len() as i64);
+            Ok(LeftBehind {
+                package,
+                bytes,
+                kept_after,
+                oldest_kept_at,
+            })
         }
         Err(e) => {
             // 半成品 staging 必须清掉：留在原地会被当成可恢复包误用。
-            let _ = std::fs::remove_dir_all(&staging);
+            let _ = std::fs::remove_dir_all(staging);
             Err(e)
         }
     }
@@ -871,6 +1075,92 @@ mod tests {
             b"a,b\n1,2\n"
         );
         assert!(root.join("manifest.json").exists());
+    }
+
+    #[test]
+    fn package_instant_reads_the_clock_out_of_the_name() {
+        let at = Utc.with_ymd_and_hms(2026, 10, 15, 3, 17, 0).unwrap();
+        assert_eq!(package_instant(&package_name(at)), Some(at));
+        // 不是包名，或者名字里没有可解的时刻：宁可没有这个数，也不要一个猜的。
+        assert_eq!(package_instant("notes.txt"), None);
+        assert_eq!(
+            package_instant("cogneva-backup-notatimestamp.tar.zst"),
+            None
+        );
+        assert_eq!(package_instant("other-20261015T031700Z.tar.zst"), None);
+    }
+
+    #[test]
+    fn retained_state_reports_the_count_and_the_oldest_name_instant() {
+        let dir = tempfile::tempdir().unwrap();
+        for day in [9, 11, 10] {
+            std::fs::write(
+                dir.path().join(package_name(
+                    Utc.with_ymd_and_hms(2026, 10, day, 3, 17, 0).unwrap(),
+                )),
+                b"x",
+            )
+            .unwrap();
+        }
+        std::fs::write(dir.path().join("notes.txt"), b"keep me").unwrap();
+
+        let (kept, oldest) = retained_state(dir.path());
+
+        assert_eq!(kept, Some(3), "非包文件不算留下的份数");
+        assert_eq!(
+            oldest,
+            Some(Utc.with_ymd_and_hms(2026, 10, 9, 3, 17, 0).unwrap()),
+            "最老的那个要按名字里的时刻算，不是按目录里读到的顺序"
+        );
+    }
+
+    #[test]
+    fn url_password_finds_only_what_is_there() {
+        assert_eq!(
+            url_password("postgres://cog_user:s3cret@postgres:5432/cogneva").as_deref(),
+            Some("s3cret")
+        );
+        // 没有口令的 URL 没有要抹的东西，也不能凭空抹出个空串再到处替换。
+        assert_eq!(
+            url_password("postgres://cog_user@postgres:5432/cogneva"),
+            None
+        );
+        assert_eq!(
+            url_password("postgres://cog_user:@postgres:5432/cogneva"),
+            None
+        );
+        assert_eq!(url_password("http://qdrant:6333"), None);
+        assert_eq!(url_password("not a url"), None);
+    }
+
+    #[test]
+    fn the_recorded_error_does_not_carry_the_database_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = BackupConfig {
+            database_url: "postgres://cog_user:s3cret@postgres:5432/cogneva".into(),
+            qdrant_http_url: "http://qdrant:6333".into(),
+            backup_dir: dir.path().to_path_buf(),
+            secrets_dir: dir.path().to_path_buf(),
+            oob_secrets_dir: dir.path().to_path_buf(),
+            data_dir: dir.path().to_path_buf(),
+            keep_count: 7,
+            run_deadline_seconds: DEFAULT_RUN_DEADLINE_SECONDS,
+            namespace: "cogneva".into(),
+        };
+        let err: Box<dyn std::error::Error> = Box::new(std::io::Error::other(
+            "connect failed for postgres://cog_user:s3cret@postgres:5432/cogneva",
+        ));
+
+        let recorded = recordable_error(err.as_ref(), &cfg);
+
+        assert!(
+            !recorded.contains("s3cret"),
+            "口令跟着行一起进备份包了：{recorded}"
+        );
+        assert!(
+            recorded.contains("[redacted]"),
+            "抹掉之后要留下痕迹，不然读的人以为错误本来就没写 URL：{recorded}"
+        );
     }
 
     #[test]

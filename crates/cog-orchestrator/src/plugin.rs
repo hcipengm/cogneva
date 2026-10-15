@@ -748,6 +748,38 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
             None => info!("principle ledger loop not started: no PrincipleLedgerStore published"),
         }
 
+        // Backup account loop.
+        //
+        // The account's rows are written by the backup runs -- separate
+        // processes on a schedule, each with its own connection -- and this is
+        // the only reader. It is resident rather than part of the backup program
+        // because the case it exists for is a run that was killed: the process
+        // that would have published a reading for it is the one that died, so
+        // nothing inside a run can report that the run never came back. The same
+        // residency is what lets this loop be the one that concludes such a row:
+        // a run that was killed cannot come back to close its own row, and the
+        // next run is a day away at best -- long after every reader has spent
+        // that day counting a run that is not going.
+        //
+        // Started only where the store was published, and not started is not a
+        // fault: a deployment without a shared database holds no account to
+        // read, and the backup runner writes its rows there too.
+        match ctx.consume_service::<dyn cog_core::BackupRunStore>() {
+            Some(store) => {
+                let backup_shutdown = ctx
+                    .consume::<cog_core::ShutdownSignal>()
+                    .map(|s| (*s).clone())
+                    .unwrap_or_default();
+                crate::backup_runs::spawn_backup_runs_loop(
+                    store,
+                    ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>(),
+                    ctx.consume_service::<dyn cog_core::MetricsBackend>(),
+                    backup_shutdown,
+                );
+            }
+            None => info!("backup account loop not started: no BackupRunStore published"),
+        }
+
         // SOP dispatch loop.
         //
         // Which faces to keep planned is configuration, not code: the loop runs

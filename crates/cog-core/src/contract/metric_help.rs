@@ -1166,6 +1166,39 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          changing",
     ),
     (
+        "cogneva_backup_run_readings",
+        "What the backup account holds, by readout, read from the rows the backup \
+         runs wrote rather than measured again from the volume. The run counts, \
+         runs_ok / runs_failed / runs_running, cover the whole account and never \
+         drop — every run leaves one row and no row is ever deleted. \
+         runs_abandoned counts the runs the account had to conclude itself, \
+         because they stopped reporting, and it is counted apart from \
+         runs_failed: a run that reported a failure was there to say so, and a \
+         run that went missing leaves a different repair behind. \
+         latest_finish_age_seconds is how long ago a run last concluded anything, \
+         and latest_success_age_seconds how long ago one last succeeded: the two \
+         together separate a backup loop that is running and failing from one \
+         that is not running at all, and a count cannot tell either from a week \
+         of health, because a failing run prunes nothing and leaves the same \
+         number of packages behind. oldest_running_age_seconds is the age of the \
+         oldest run still open — the only reading a run that was killed mid-flight \
+         ever leaves, since a process that dies writes nothing else — and it is \
+         absent, not zero, when no run is open; \
+         oldest_running_deadline_seconds is the deadline that same run was \
+         opened under, published beside the age because the two are compared to \
+         each other to decide a run is gone, and an age judged against a bound \
+         copied from configuration would be one run's duration measured against \
+         another's allowance. The retention pair is one run's \
+         own answer, kept together: kept and keep_target are what the newest \
+         successful run left against the bound it ran under, and \
+         oldest_kept_age_seconds is the age of the oldest package that survived \
+         its pass, which is the half a count cannot falsify. \
+         newest_package_bytes is that run's package size in bytes — a backup \
+         that suddenly shrinks is one that stopped capturing, and nothing else on \
+         this series moves when that happens. Absent readouts are absent facts: \
+         latest_success_age_seconds is missing until a run has ever succeeded",
+    ),
+    (
         "cogneva_worktree_index_present",
         "Whether a resident worktree's git index file exists, 1 or 0, by \
          worktree. Read with the missing-files series: 'the index remembers no \

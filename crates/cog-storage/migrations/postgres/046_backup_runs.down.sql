@@ -1,0 +1,11 @@
+-- Migration: 046_backup_runs (down)
+-- Drops the account. What is lost is the record of every run whose package has
+-- already been pruned, and there is no way to reconstruct it: the surviving
+-- packages carry a manifest for themselves, but the runs that failed left no
+-- package, and the runs that were killed left nothing at all -- `running` rows
+-- are the only trace those ever had.
+--
+-- Re-running the up migration against an empty table therefore reads as "this
+-- deployment has never backed up", which is the one wrong answer that is
+-- indistinguishable from a true one.
+DROP TABLE IF EXISTS backup_runs;

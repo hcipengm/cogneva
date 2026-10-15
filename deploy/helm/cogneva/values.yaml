@@ -152,6 +152,12 @@ backup:
   timeZone: "Etc/UTC"
   # 保留最新 N 份，更老的落盘即删。
   keepCount: 7
+  # 一次运行最多能跑多久，秒。一个值两处承载：Job 的 activeDeadlineSeconds
+  # （到点 kubelet 杀容器）和运行 env 里的同一个数（写进账本那一行，超期判断
+  # 用它）。实测一次运行 41 秒，一小时的界是它的一百多倍，落在里面的是正常
+  # 运行、落在外面的那次是卡死了——而卡死的那次不杀掉，Forbid 会让后面每
+  # 一次都不再开始。
+  runDeadlineSeconds: 3600
   storage: 10Gi
   # 空 = 跟随集群默认 SC（与 pg/redis/qdrant 同策略，不绑厂商）。
   storageClass: ""

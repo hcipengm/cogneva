@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod alerts;
 pub mod auth;
+pub mod backup_run;
 pub mod build_cache_reclaim;
 pub mod change_ledger;
 pub mod ci;

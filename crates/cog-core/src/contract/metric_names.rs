@@ -977,6 +977,34 @@ metric_names! {
     TOOL_OUTPUT_TRUNCATED_CHARS_TOTAL => "cogneva_tool_output_truncated_chars_total",
     TOOL_OUTPUT_ARCHIVE_FAILED_TOTAL => "cogneva_tool_output_archive_failed_total",
     TOOL_OUTPUT_FETCH_BUDGET_EXHAUSTED_TOTAL => "cogneva_tool_output_fetch_budget_exhausted_total",
+
+    // cog-orchestrator -- what the backup account holds, folded into one series
+    // by `readout`.
+    //
+    // Every value is read from the account rather than computed a second time:
+    // the reading face is a view of the row a run wrote, and a view that
+    // measured the volume again would be a second account, disagreeing with the
+    // first exactly when it mattered.
+    //
+    // The readouts are one family rather than one series each because they are
+    // only meaningful together, and a reader who has to join families to ask
+    // "is the backup working" reads one of the numbers without the other. The
+    // two that decide that question are the ones that cannot be told apart from
+    // a count: a week of successes and a week of failures leave the same number
+    // of packages, so what separates them is the age of the newest success. That
+    // age and the count of successes are one reading about one thing.
+    //
+    // Units are in the readout's own name -- `_seconds`, `_bytes` -- because one
+    // series carries several, and a value whose unit has to be inferred from the
+    // metric name is a value that will be read in the wrong one.
+    //
+    // Two readouts are absent rather than zero when they have nothing to say,
+    // and the absence is the fact: `latest_success_age_seconds` is missing until
+    // a run has ever succeeded (a zero would claim one just did), and
+    // `oldest_running_age_seconds` is missing unless a run is still open (a zero
+    // would claim one just started). A reader that needs "is anything open"
+    // reads `runs_running`, which is always present.
+    BACKUP_RUN_READINGS => "cogneva_backup_run_readings",
 }
 
 /// Whether `name` is a series a build can still write.
