@@ -826,7 +826,7 @@ data:
         {
           "id": 21,
           "title": "Container Memory Against Its Limit",
-          "description": "How much of the memory limit each container is using, over 6h. Only containers that have a limit: an unbounded container is not near anything, and the division drops the ones given none. This is the reading container_memory_near_limit's floor was derived from -- the killed observability backend sat between 0.74 and 0.93 of its cap for hours, its own burst amplitude crossing the rest, while nothing else in the cluster came near -- so a container holding above three quarters here is one burst away from being killed at its limit, which is what the OOM panel counts. No threshold is drawn on purpose: what counts as close is the alert's decision, and a second copy of it here would be a constant to keep in step with the first.",
+          "description": "How much of the memory limit each container is holding that the kernel cannot take back, over 6h -- anonymous pages against the limit kube-state-metrics reports. Only containers that have a limit: an unbounded container is not near anything, and the division drops the ones given none. This is the same reading container_memory_near_limit judges, on the same numerator, so the panel and the alert cannot drift apart. Divide the working set instead and the panel is flat against the ceiling and says nothing: each of the three large containers on this platform reaches 0.9998 to 1.0000 of its cap on usage, because a working set counts reclaimable page cache, while the shares drawn here are 0.78 (the app), 0.59 (the sandbox executor) and 0.24 to 0.39 (the evolution container). A container holding above three quarters here is one burst away from being killed at its limit, which is what the OOM panel counts. No threshold is drawn on purpose: what counts as close is the alert's decision, and a second copy of it here would be a constant to keep in step with the first. The alert's own threshold is not re-derived either -- it is carried over from a band measured on the working set (the killed observability backend sat between 0.74 and 0.93 of its cap for hours), so treat it as a carried-over number until someone measures one here.",
           "type": "timeseries",
           "gridPos": {
             "h": 8,
@@ -836,7 +836,7 @@ data:
           },
           "targets": [
             {
-              "expr": "container_memory_working_set_bytes{container!=\"\", container!=\"POD\"} / on(namespace, pod, container) (kube_pod_container_resource_limits{resource=\"memory\"} > 0)",
+              "expr": "container_memory_rss{container!=\"\", container!=\"POD\"} / on(namespace, pod, container) (kube_pod_container_resource_limits{resource=\"memory\"} > 0)",
               "legendFormat": "{{pod}}/{{container}}",
               "datasource": {
                 "type": "prometheus",
