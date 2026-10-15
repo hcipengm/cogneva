@@ -47,6 +47,15 @@ pub fn is_log_query(expr: &str) -> bool {
 /// One metric expression as written, and the kind of panel that carries it.
 pub struct PanelExpr {
     /// The line the expression sits on, as a complaint points at it.
+    ///
+    /// Only the dashboard contract reads it: the two census targets reach the
+    /// same expressions through [`series_in`], which keeps the names and drops
+    /// the position. This module is compiled into each of the three test
+    /// binaries on its own, so in those two the field is read by nobody, and
+    /// `cargo clippy --workspace --all-targets -- -D warnings` turns that into
+    /// an error where plain `cargo test` only warns. Same reason the two
+    /// functions below carry the attribute.
+    #[allow(dead_code)]
     pub line: usize,
     /// The `type` of the panel this expression belongs to, as the manifest
     /// writes it. Empty when no `"type"` stands at the panel's own depth: that
