@@ -459,6 +459,16 @@ pub fn spawn_change_ledger_loop(
                 // it could not and when it was last tried.
                 let mut unsettled: HashMap<ChangeIdentity, UnsettledCheck> = HashMap::new();
 
+                // The pool posture the last pass that read the pool put dispatch
+                // in. Kept across ticks and nowhere else: the only pass that
+                // needs it is one whose source answered nothing, and the
+                // posture a rollout interrupted is always the one from just
+                // before it. A restart loses this, and losing it lands back on
+                // the cold-start answer -- a state fact worth knowing, and one
+                // the row keeps: a carried pause records `absent` as its
+                // reading, so "blind since when" is readable from the series.
+                let mut pool_posture: Option<PoolVerdict> = None;
+
                 let mut ticker = tokio::time::interval(CHANGE_LEDGER_PASS_INTERVAL);
                 // The first tick is immediately ready; eating it puts the first
                 // read one period after the start rather than contending with
@@ -505,8 +515,18 @@ pub fn spawn_change_ledger_loop(
                     // the same pass that found it, rather than one period later.
                     if let Some(ref orchestrator) = orchestrator {
                         let pool = pool.as_deref();
-                        dispatch_pass(&*store, orchestrator, &unsettled, pool, metrics.as_ref())
-                            .await;
+                        if let Some(read) = dispatch_pass(
+                            &*store,
+                            orchestrator,
+                            &unsettled,
+                            pool,
+                            pool_posture,
+                            metrics.as_ref(),
+                        )
+                        .await
+                        {
+                            pool_posture = Some(read);
+                        }
                     }
                 }
             }
@@ -1218,8 +1238,9 @@ async fn dispatch_pass(
     orchestrator: &Arc<dyn OrchestratorControl>,
     unsettled: &HashMap<ChangeIdentity, UnsettledCheck>,
     pool: Option<&dyn cog_core::LlmPoolStatusSource>,
+    carried: Option<PoolVerdict>,
     metrics: Option<&Arc<dyn MetricsBackend>>,
-) {
+) -> Option<PoolVerdict> {
     // The read is bounded by the ledger's own census rather than by a number
     // chosen here, and it has to be that wide because of where pending rows sit
     // in it. A state of `pending` *is* a measurement's result, so those rows are
@@ -1243,7 +1264,7 @@ async fn dispatch_pass(
                 error = %e,
                 "change ledger: the census could not be read, so this pass handed nothing over"
             );
-            return;
+            return None;
         }
     };
     let rows = match store.outstanding(outstanding_total as usize).await {
@@ -1254,7 +1275,7 @@ async fn dispatch_pass(
                 "change ledger: the outstanding set could not be read, so this pass handed \
                  nothing over"
             );
-            return;
+            return None;
         }
     };
 
@@ -1269,15 +1290,36 @@ async fn dispatch_pass(
         .filter(|row| unsettled.contains_key(&row.identity))
         .count();
 
+    // Three cases, and the middle one is why this is not one call to
+    // `pool_verdict`: no source published at all, a snapshot that says the pool
+    // is sick or well, and a source that is published and answers nothing this
+    // pass. The last one is not a verdict about the pool -- both halves of the
+    // signal roll with every deployment, so an unanswered read is an ordinary
+    // sight during a rollout -- and taking it as a healthy pool is what hands a
+    // whole batch over blind, measured: one such tick handed 133 rows to a pool
+    // whose next request came back refused. The posture the last real read put
+    // dispatch in is the answer, and the reading column says plainly that this
+    // pass read nothing, so "handed over blind" stays distinguishable from
+    // "handed over behind a healthy pool". A pass with nothing to carry over is
+    // the first pass after a start, and it proceeds as it always did.
+    let now = now_unix();
     let snapshot = match pool {
         Some(source) => source.status().await,
         None => None,
     };
-    let verdict = pool_verdict(
-        snapshot.as_ref(),
-        now_unix(),
-        CHANGE_LEDGER_PASS_INTERVAL.as_secs(),
-    );
+    let verdict = match pool {
+        None => pool_verdict(None, now, CHANGE_LEDGER_PASS_INTERVAL.as_secs()),
+        Some(_) => match snapshot.as_ref() {
+            Some(status) => pool_verdict(Some(status), now, CHANGE_LEDGER_PASS_INTERVAL.as_secs()),
+            None => match carried.filter(|posture| posture.reading != PoolReading::Absent) {
+                Some(posture) => PoolVerdict {
+                    reading: PoolReading::Absent,
+                    ..posture
+                },
+                None => pool_verdict(None, now, CHANGE_LEDGER_PASS_INTERVAL.as_secs()),
+            },
+        },
+    };
 
     // A pass whose tasks could only fail is not a pass: no configured upstream
     // can serve a request, so every task handed over now is work that will come
@@ -1388,6 +1430,12 @@ async fn dispatch_pass(
         &counts,
     )
     .await;
+
+    // Back to the loop, which keeps it for the next pass's empty read. Handed
+    // back only when the pool was actually read: an `absent` verdict carried
+    // forward would be the posture of a pass that knew nothing, which is the
+    // thing being fixed.
+    (verdict.reading != PoolReading::Absent).then_some(verdict)
 }
 
 /// What one owed row's graph row says about it.
@@ -1603,6 +1651,15 @@ async fn record_dispatch_state(
 /// it as a sick pool would stop dispatch for a missing observer, which is a
 /// driver traded for a reading.
 ///
+/// `None` here means one thing only: whatever asked has nothing to go on. The
+/// two ways that happens are told apart by the caller, not by this function --
+/// a process with no pool source published at all, which is a deployment fact
+/// and is warned about where the loop is built, and a source that is published
+/// and answered nothing this pass, which is what the caller carries the last
+/// real reading over for. Reading only this function would show the cold-start
+/// answer being taken in both cases; that is the caller's business to narrow,
+/// and it is narrowed there because the answer differs.
+///
 /// The resume bound is whatever the snapshot's own evidence supports, read
 /// through the contract's [`LlmPoolStatus::resume_wait_secs`] rather than chosen
 /// here: an upstream that stated when it serves again is waited for to that
@@ -1654,6 +1711,11 @@ fn pool_verdict(
 }
 
 /// One pass's decision and the bounds it was read against.
+///
+/// `Copy` because the loop keeps the last one that read the pool and hands it to
+/// the next pass as its fallback: a small value travels better than a shared
+/// cell, and nothing in it needs to be mutated in place.
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct PoolVerdict {
     decision: DispatchDecision,
     reading: PoolReading,
@@ -2740,6 +2802,18 @@ mod tests {
         }
     }
 
+    /// A pool source that is published and answers nothing this pass -- the
+    /// gateway and the store rolling together, which is an ordinary sight during
+    /// a deployment rather than a fault.
+    struct SilentPool;
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmPoolStatusSource for SilentPool {
+        async fn status(&self) -> Option<LlmPoolStatus> {
+            None
+        }
+    }
+
     /// The identity every column of one pass has to add up to: the rows it was
     /// owed are exactly the rows it placed somewhere, whichever way it went.
     ///
@@ -2798,7 +2872,7 @@ mod tests {
         );
         let control: Arc<dyn OrchestratorControl> = graph.clone();
 
-        dispatch_pass(&store, &control, &HashMap::new(), None, None).await;
+        dispatch_pass(&store, &control, &HashMap::new(), None, None, None).await;
 
         let state = store.written().pop().expect("the pass wrote its row");
         assert_eq!(state.decision, DispatchDecision::Proceed);
@@ -2820,6 +2894,120 @@ mod tests {
         );
     }
 
+    /// A source that answers nothing does not become permission to hand work
+    /// over: the posture the last real reading put dispatch in is what a silent
+    /// pass does, and the reading says the pass read nothing so a reader can tell
+    /// it from one that read a healthy pool.
+    ///
+    /// This is the shape that cost a batch: one tick during a rollout read
+    /// nothing, took it for a healthy pool, and handed 133 rows to a pool whose
+    /// every request came back refused.
+    #[tokio::test]
+    async fn a_silent_source_keeps_the_posture_the_last_reading_put_dispatch_in() {
+        let store = FakeLedger {
+            rows: vec![pending_row("crates/a"), pending_row("crates/b")],
+            ..Default::default()
+        };
+        let graph = Arc::new(FakeGraph::default());
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+        let paused = PoolVerdict {
+            decision: DispatchDecision::PausedLlmPoolUnavailable,
+            reading: PoolReading::Unavailable,
+            resume_at_unix: 1_760_000_000,
+            evidenced_recovery_unix: 1_759_999_000,
+            quota_window_secs: 2_592_000,
+        };
+
+        let read_back = dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            Some(&SilentPool),
+            Some(paused),
+            None,
+        )
+        .await;
+
+        let state = store.written().pop().expect("the pass wrote its row");
+        assert_eq!(state.decision, DispatchDecision::PausedLlmPoolUnavailable);
+        assert_eq!(
+            state.pool,
+            PoolReading::Absent,
+            "the reading is this pass's own: it read nothing"
+        );
+        assert_eq!(state.pending, 2);
+        assert_eq!(state.held_back, 2, "owed, and not handed anywhere");
+        assert_eq!(state.submitted, 0);
+        assert!(
+            graph.submitted().is_empty(),
+            "an unanswered read must not hand work over"
+        );
+        // The bounds travel with the posture: a pause carried over without them
+        // would read as a pause with no known end, which is a different fact.
+        assert_eq!(state.resume_at_unix, 1_760_000_000);
+        assert_eq!(state.evidenced_recovery_unix, 1_759_999_000);
+        assert_eq!(state.quota_window_secs, 2_592_000);
+        assert!(
+            read_back.is_none(),
+            "an absent reading is not the posture to carry into the next pass"
+        );
+    }
+
+    /// The first pass after a start has nothing to carry over, and it behaves as
+    /// it always did: it proceeds. A source that has never answered is the one
+    /// case where a silent read is not evidence about the pool at all.
+    #[tokio::test]
+    async fn a_silent_source_with_nothing_to_carry_over_proceeds() {
+        let store = FakeLedger {
+            rows: vec![pending_row("crates/a")],
+            ..Default::default()
+        };
+        let graph = Arc::new(FakeGraph::default());
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            Some(&SilentPool),
+            None,
+            None,
+        )
+        .await;
+
+        let state = store.written().pop().expect("the pass wrote its row");
+        assert_eq!(state.decision, DispatchDecision::Proceed);
+        assert_eq!(state.pool, PoolReading::Absent);
+        assert_eq!(state.submitted, 1, "the cold start still hands over");
+        assert!(
+            !graph.submitted().is_empty(),
+            "nothing to carry over is not a reason to stop"
+        );
+    }
+
+    /// A reading that was taken is what the loop carries forward. Read off the
+    /// return value rather than the row, because that is the channel the loop
+    /// uses and an absent reading must not travel through it.
+    #[tokio::test]
+    async fn only_a_reading_that_was_taken_travels_to_the_next_pass() {
+        let store = FakeLedger::default();
+        let control: Arc<dyn OrchestratorControl> = Arc::new(FakeGraph::default());
+
+        let read = dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            Some(&DeadPool),
+            None,
+            None,
+        )
+        .await
+        .expect("a snapshot that said the pool is sick is a reading");
+
+        assert_eq!(read.decision, DispatchDecision::PausedLlmPoolUnavailable);
+        assert_eq!(read.reading, PoolReading::Unavailable);
+    }
+
     /// The pass that hands nothing over still places every owed row. This is the
     /// one that used to fail: the pause returned before the classification ran,
     /// so the row said four zeroes beside a `pending` that was not zero, and the
@@ -2838,7 +3026,15 @@ mod tests {
         let graph = Arc::new(FakeGraph::default().holding(&held, TaskStatus::Running));
         let control: Arc<dyn OrchestratorControl> = graph.clone();
 
-        dispatch_pass(&store, &control, &HashMap::new(), Some(&DeadPool), None).await;
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            Some(&DeadPool),
+            None,
+            None,
+        )
+        .await;
 
         let state = store.written().pop().expect("the pass wrote its row");
         assert_eq!(state.decision, DispatchDecision::PausedLlmPoolUnavailable);
@@ -2873,7 +3069,7 @@ mod tests {
         }
         let graph: Arc<dyn OrchestratorControl> = Arc::new(graph);
 
-        dispatch_pass(&store, &graph, &HashMap::new(), None, None).await;
+        dispatch_pass(&store, &graph, &HashMap::new(), None, None, None).await;
 
         let state = store.written().pop().expect("the pass wrote its row");
         assert_eq!(state.pending, 1);
@@ -2895,7 +3091,7 @@ mod tests {
         };
         let graph: Arc<dyn OrchestratorControl> = Arc::new(FakeGraph::default().refusing());
 
-        dispatch_pass(&store, &graph, &HashMap::new(), None, None).await;
+        dispatch_pass(&store, &graph, &HashMap::new(), None, None, None).await;
 
         let state = store.written().pop().expect("the pass wrote its row");
         assert_eq!(state.pending, 2);
