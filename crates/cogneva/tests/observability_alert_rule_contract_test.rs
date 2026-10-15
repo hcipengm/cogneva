@@ -837,8 +837,8 @@ const PRODUCED: &[(&str, &str)] = &[
 /// test rather than being silently ignored.
 const FOREIGN: &[(&str, &str)] = &[
     (
-        "container_memory_working_set_bytes",
-        "cadvisor（kubelet 内置）",
+        "container_memory_rss",
+        "cadvisor（kubelet 内置）。判内存余量读的是**不可回收**的那部分：工作集把可回收的页缓存算进分子，在这棵树上足以把每一个大容器都推到上限（app／沙箱／进化三族的 usage 峰值都在 0.9998–1.0000 of limit，而 rss 是 0.78／0.59／0.24–0.39），所以拿工作集当分子时「顶到上限」不携带信息。工作集名字本身仍在别的面板上被读，但**没有任何告警规则读它**，按 the_tables_hold_no_series_that_no_rule_reads 不能留在本表",
     ),
     ("kube_deployment_spec_replicas", "kube-state-metrics"),
     (

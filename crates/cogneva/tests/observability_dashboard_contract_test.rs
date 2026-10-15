@@ -629,6 +629,10 @@ const FOREIGN: &[(&str, &str)] = &[
         "container_memory_working_set_bytes",
         "kubelet/cAdvisor 采集",
     ),
+    (
+        "container_memory_rss",
+        "kubelet/cAdvisor 采集（21 号面板与告警规则 container_memory_near_limit 用同一个分子，面板与规则不许漂开：分子是不可回收的那部分，工作集里可回收的页缓存不算）",
+    ),
     ("kube_pod_container_resource_limits", "kube-state-metrics"),
     (
         "kube_pod_container_status_restarts_total",
