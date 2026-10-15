@@ -1036,6 +1036,36 @@ metric_names! {
     // `consumer` on the lag counter.
     EVENT_BUS_CONSUMED_TOTAL => "cogneva_event_bus_consumed_total",
 
+    // The producer side of the same channel: what the pipeline handed to the
+    // broadcast the two consumer-side counters above read.
+    //
+    // The three are one question and any two of them are not. `..._lagged_total`
+    // is written only when a reader falls behind, so a consumer keeping up and
+    // one that stopped both leave it flat; `..._consumed_total` is the reading a
+    // stopped consumer has to fail to write, but a rate of takings on its own
+    // cannot say whether the flat line is a reader that stopped or a channel
+    // nothing was put on. This is the operand that decides it -- how much
+    // traffic the channel carried -- and it is the one both of the others are
+    // read against.
+    //
+    // Labelled by `kind`, the event variant. The label is what turns a firing
+    // alert into a repair: "the consumer stopped taking" is the fault, and which
+    // kinds were offered while nothing took them is the first thing the person
+    // holding it asks. A single total would answer the first question only.
+    //
+    // Counted where the executor offers the event, not where a send returned, so
+    // the series is the producer's own claim and does not depend on how many
+    // subscribers happen to be attached. An event offered to a channel with no
+    // reader is the one case the consumer side can never show, and counting only
+    // the delivered ones would hide exactly it.
+    //
+    // The pair is the one `crate::loop_health` asks for in its own words: for a
+    // loop marked event-driven it documents an idle-on-empty-queue consumer and
+    // one wedged inside a handler as the same picture from the loop's age face,
+    // and names the queue's reading as the one that separates them. This is that
+    // reading from the offering side.
+    EVENT_BUS_EMITTED_TOTAL => "cogneva_event_bus_emitted_total",
+
     // cog-agent — what happened to a tool output too large for the context.
     //
     // Two cells that must be read together. `truncated` says a tool's output did

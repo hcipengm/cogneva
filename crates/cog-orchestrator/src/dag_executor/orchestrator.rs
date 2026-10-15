@@ -357,7 +357,8 @@ impl DagExecutor {
             task_id: task_id.into(),
             retry_count: updated.retry_count,
             timestamp: chrono::Utc::now(),
-        });
+        })
+        .await;
         Ok(true)
     }
 
@@ -700,8 +701,59 @@ impl DagExecutor {
         self.event_tx.as_ref().map(|tx| tx.subscribe())
     }
 
-    fn emit_event(&self, event: cog_core::TaskEvent) {
+    /// The `kind` label value one event is counted under.
+    ///
+    /// One arm per variant, spelled out rather than caught by a wildcard arm, so
+    /// that adding a variant to `TaskEvent` stops this from compiling instead of
+    /// landing the new one under whatever the catch-all happened to say. The
+    /// string is the `event` tag the same type serializes with, so a reader
+    /// holding a raw log line finds the same word on the counter.
+    fn event_kind(event: &cog_core::TaskEvent) -> &'static str {
+        use cog_core::TaskEvent as E;
+        match event {
+            E::TaskCreated { .. } => "task_created",
+            E::TaskScheduled { .. } => "task_scheduled",
+            E::TaskStarted { .. } => "task_started",
+            E::TaskCompleted { .. } => "task_completed",
+            E::TaskFailed { .. } => "task_failed",
+            E::TaskCancelled { .. } => "task_cancelled",
+            E::TaskRetried { .. } => "task_retried",
+            E::TaskTimeout { .. } => "task_timeout",
+            E::TaskLeaseExpired { .. } => "task_lease_expired",
+        }
+    }
+
+    /// Publish a task event and count the offer.
+    ///
+    /// The count is the producing half of a pair the consumer-side counters
+    /// cannot complete alone. `..._consumed_total` going flat means one of two
+    /// things -- nothing was put on the channel, or the reader stopped taking --
+    /// and the loop's own age gauge cannot separate them for an event-driven
+    /// loop, whose age is the process's age. This is the series that says the
+    /// channel was handed something, and the rule that fires on the pair is what
+    /// makes a stalled consumer a reading instead of a quiet hour.
+    ///
+    /// Counted before the send, so the total is what the executor offered rather
+    /// than what the channel delivered. `send` reports failure only when no
+    /// receiver is subscribed, and an offer nobody is subscribed to is the case
+    /// the consumer side can never show: counting only the delivered ones would
+    /// hide exactly it.
+    async fn emit_event(&self, event: cog_core::TaskEvent) {
         if let Some(ref tx) = self.event_tx {
+            if let Some(backend) = self.metrics_backend() {
+                let labels =
+                    HashMap::from([("kind".to_string(), Self::event_kind(&event).to_string())]);
+                if let Err(e) = backend
+                    .record_counter(cog_core::metric_names::EVENT_BUS_EMITTED_TOTAL, 1.0, labels)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        kind = Self::event_kind(&event),
+                        "cannot record the task events this executor offered"
+                    );
+                }
+            }
             let _ = tx.send(event.clone());
         }
         if let Some(ref logger) = self.raw_logger {
@@ -835,7 +887,8 @@ impl DagExecutor {
             self.emit_event(cog_core::TaskEvent::TaskCreated {
                 task_id: task_id.clone(),
                 timestamp: chrono::Utc::now(),
-            });
+            })
+            .await;
             // Fine-grained persist for each newly added task
             let task_snapshot = {
                 let inner = self.inner.read().await;
@@ -908,7 +961,8 @@ impl DagExecutor {
         self.emit_event(cog_core::TaskEvent::TaskCreated {
             task_id: task_id.clone(),
             timestamp: chrono::Utc::now(),
-        });
+        })
+        .await;
         let task_snapshot = {
             let inner = self.inner.read().await;
             inner.tasks.get(&task_id).cloned()
@@ -984,7 +1038,7 @@ impl DagExecutor {
         be.dag_transition_task(&self.workspace_id, task_id, expected, &task)
             .await?;
         if let Some(ev) = event {
-            self.emit_event(ev);
+            self.emit_event(ev).await;
         }
         Ok(())
     }
@@ -1020,7 +1074,8 @@ impl DagExecutor {
             self.emit_event(cog_core::TaskEvent::TaskCreated {
                 task_id: task_id.clone(),
                 timestamp: chrono::Utc::now(),
-            });
+            })
+            .await;
             added.push(task_id);
         }
         Ok(added)
@@ -1072,7 +1127,8 @@ impl DagExecutor {
             result: Some(result),
             scheduled_dependents: scheduled.clone(),
             timestamp: chrono::Utc::now(),
-        });
+        })
+        .await;
         crate::observable::global_observable().record_task(true);
         Ok(scheduled)
     }
@@ -1156,7 +1212,8 @@ impl DagExecutor {
                     task_id
                 ),
                 timestamp: chrono::Utc::now(),
-            });
+            })
+            .await;
         }
         self.emit_event(cog_core::TaskEvent::TaskFailed {
             task_id: task_id.into(),
@@ -1164,7 +1221,8 @@ impl DagExecutor {
             retried,
             cancelled: cancelled.clone(),
             timestamp: chrono::Utc::now(),
-        });
+        })
+        .await;
         crate::observable::global_observable().record_task(false);
         let dlq_pushed = !retried && self.dlq.is_some();
         Ok((retried, cancelled, dlq_pushed))
@@ -1179,7 +1237,8 @@ impl DagExecutor {
             task_id: task_id.into(),
             reason: "Direct cancellation".into(),
             timestamp: chrono::Utc::now(),
-        });
+        })
+        .await;
         for dep_id in &cancelled {
             self.emit_event(cog_core::TaskEvent::TaskCancelled {
                 task_id: dep_id.clone(),
@@ -1188,7 +1247,8 @@ impl DagExecutor {
                     task_id
                 ),
                 timestamp: chrono::Utc::now(),
-            });
+            })
+            .await;
         }
         Ok(cancelled)
     }
@@ -1212,7 +1272,7 @@ impl DagExecutor {
                 Ok(Some(cur)) if cur.status == TaskStatus::Running => {}
                 _ => continue,
             }
-            self.emit_reclaim(&t, &cause);
+            self.emit_reclaim(&t, &cause).await;
             // 该不该记账由类型说了算（见 `ReclaimCause::charges_retry_budget`）：
             // 不记账的回收不走通用的失败处理，那条路只剩预算一个判据。
             if !cause.charges_retry_budget() {
@@ -1340,7 +1400,8 @@ impl DagExecutor {
             task_id: task_id.into(),
             retry_count: next.retry_count,
             timestamp: chrono::Utc::now(),
-        });
+        })
+        .await;
         Ok(true)
     }
 
@@ -1590,7 +1651,8 @@ impl DagExecutor {
             retried: false,
             cancelled: Vec::new(),
             timestamp: chrono::Utc::now(),
-        });
+        })
+        .await;
         self.persist_state().await;
         Ok(())
     }
@@ -1633,7 +1695,8 @@ impl DagExecutor {
         self.emit_event(cog_core::TaskEvent::TaskScheduled {
             task_id: task_id.into(),
             timestamp: chrono::Utc::now(),
-        });
+        })
+        .await;
         self.persist_task_fine_grained(&task_snapshot).await;
         self.persist_state().await;
         Ok(())
@@ -1677,7 +1740,8 @@ impl DagExecutor {
         self.emit_event(cog_core::TaskEvent::TaskScheduled {
             task_id: task_id.into(),
             timestamp: chrono::Utc::now(),
-        });
+        })
+        .await;
         self.persist_task_fine_grained(&task_snapshot).await;
         self.persist_state().await;
         Ok(())
@@ -1722,7 +1786,8 @@ impl DagExecutor {
         self.emit_event(cog_core::TaskEvent::TaskStarted {
             task_id: task_id.into(),
             timestamp: chrono::Utc::now(),
-        });
+        })
+        .await;
         self.persist_task_fine_grained(&task_snapshot).await;
         self.persist_state().await;
         Ok(())
@@ -1865,7 +1930,8 @@ impl DagExecutor {
             result: Some(result.clone()),
             scheduled_dependents: scheduled.clone(),
             timestamp: chrono::Utc::now(),
-        });
+        })
+        .await;
 
         // Fine-grained persist for completed task and newly scheduled dependents
         let completed_task = {
@@ -2074,7 +2140,8 @@ impl DagExecutor {
                 task_id: task_id.into(),
                 retry_count,
                 timestamp: chrono::Utc::now(),
-            });
+            })
+            .await;
             let task_snapshot = {
                 let inner = self.inner.read().await;
                 inner.tasks.get(task_id).cloned()
@@ -2112,7 +2179,8 @@ impl DagExecutor {
                 retried: true,
                 cancelled: Vec::new(),
                 timestamp: chrono::Utc::now(),
-            });
+            })
+            .await;
             let task_snapshot = {
                 let inner = self.inner.read().await;
                 inner.tasks.get(task_id).cloned()
@@ -2163,7 +2231,8 @@ impl DagExecutor {
                                 task_id
                             ),
                             timestamp: chrono::Utc::now(),
-                        });
+                        })
+                        .await;
                         inner = self.inner.write().await;
                     }
                 }
@@ -2176,7 +2245,8 @@ impl DagExecutor {
                 retried: false,
                 cancelled: cancelled.clone(),
                 timestamp: chrono::Utc::now(),
-            });
+            })
+            .await;
 
             // Fine-grained persist for failed task and all cascade-cancelled tasks
             let failed_task = {
@@ -2280,7 +2350,8 @@ impl DagExecutor {
             task_id: task_id.into(),
             reason: "Direct cancellation".into(),
             timestamp: chrono::Utc::now(),
-        });
+        })
+        .await;
         self.persist_task_fine_grained(&task_snapshot).await;
 
         let mut inner = self.inner.write().await;
@@ -2308,7 +2379,8 @@ impl DagExecutor {
                             task_id
                         ),
                         timestamp: chrono::Utc::now(),
-                    });
+                    })
+                    .await;
                     let dep_snapshot = {
                         let inner = self.inner.read().await;
                         inner.tasks.get(&dep_id).cloned()
@@ -2389,7 +2461,8 @@ impl DagExecutor {
             task_id: task_id.into(),
             retry_count: 0,
             timestamp: chrono::Utc::now(),
-        });
+        })
+        .await;
         self.persist_task_fine_grained(&task_snapshot).await;
         self.persist_state().await;
         Ok(())
@@ -2433,7 +2506,7 @@ impl DagExecutor {
                 continue;
             }
 
-            self.emit_reclaim(&task, &cause);
+            self.emit_reclaim(&task, &cause).await;
 
             // 该不该记账由类型说了算（见 `ReclaimCause::charges_retry_budget`）：
             // 不记账的回收不走通用的失败处理，那条路只剩预算一个判据。
@@ -2456,7 +2529,8 @@ impl DagExecutor {
                     task_id: task_id.clone(),
                     retry_count: snapshot.retry_count,
                     timestamp: chrono::Utc::now(),
-                });
+                })
+                .await;
                 results.push((task_id, true, Vec::new(), false));
                 continue;
             }
@@ -2637,7 +2711,7 @@ impl DagExecutor {
         }
     }
 
-    fn emit_reclaim(&self, task: &Task, cause: &ReclaimCause) {
+    async fn emit_reclaim(&self, task: &Task, cause: &ReclaimCause) {
         let event = match cause {
             ReclaimCause::LeaseExpired { owner, expired_at } => {
                 cog_core::TaskEvent::TaskLeaseExpired {
@@ -2653,7 +2727,7 @@ impl DagExecutor {
                 timestamp: chrono::Utc::now(),
             },
         };
-        self.emit_event(event);
+        self.emit_event(event).await;
     }
 
     pub async fn get_task(&self, task_id: &str) -> Option<Task> {

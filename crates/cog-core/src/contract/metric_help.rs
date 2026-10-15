@@ -834,9 +834,11 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          sibling the same interval needs to know what the channel carried, \
          because an event-driven consumer with nothing to take and one that is \
          gone write the same flat line -- so the two are told apart by their \
-         producer, not by this series alone. It is registered as a debt: no \
-         alert rule or panel reads it yet, and the entry in the reader census \
-         says so. Two things a reader has to carry. The unit is one event, so a \
+         producer, not by this series alone. That producer is \
+         `cogneva_event_bus_emitted_total`, and the two are read together by \
+         `event_bus_consumer_stopped_taking`, which fires when the channel was \
+         offered events and this series took none of them. Two things a reader \
+         has to carry. The unit is one event, so a \
          consumer that wants to count whole passes has to mint its own name \
          rather than publish here: mixing per-event and per-pass under one name \
          makes `rate()` mean different things per label value, and two series of \
@@ -848,6 +850,28 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          throughput, and a store that slows down moves this series and the lag \
          beside it in opposite directions, which means the two are not two \
          independent readings of a failure but one event seen twice.",
+    ),
+    (
+        crate::metric_names::EVENT_BUS_EMITTED_TOTAL.as_str(),
+        "Task events the orchestrator handed to the broadcast its consumers \
+         read, labelled by `kind`, one increment per event offered. It is the \
+         producer side of the same channel the dropped, lagged and consumed \
+         counters describe, and the operand those two consumer-side readings \
+         cannot supply on their own: a consumer that is gone and one with an \
+         empty channel both stop taking, so a flat `cogneva_event_bus_consumed_total` \
+         is a fault only beside this series, which is what says the channel was \
+         not empty. `event_bus_consumer_stopped_taking` is that comparison. The \
+         `kind` label is the event variant and matches the `event` tag the same \
+         events are serialized with, so a raw log line and a counter cell are \
+         read with one word. Counted where the event is offered rather than \
+         where a send returned, so the total is what the executor published and \
+         does not shrink when a subscriber detaches: an event offered to a \
+         channel with no reader is the case the consumer side can never show, \
+         and counting only the delivered ones would hide it. It is a counter and \
+         not a gauge for the same reason as its siblings: the interesting \
+         quantity is how much traffic the channel carried over a window, which \
+         is a difference between two samples, and a gauge would have to be reset \
+         by whoever read it.",
     ),
     (
         crate::metric_names::TOOL_OUTPUT_FETCH_BUDGET_EXHAUSTED_TOTAL.as_str(),
