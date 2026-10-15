@@ -75,8 +75,20 @@ pub const HOST_LEDGER_SLICES_INVISIBLE_RULE: &str = "host_ledger_slices_invisibl
 
 /// The floor the anon rule compares `user.slice` against, in bytes.
 ///
-/// A declared number rather than a measured one: it exists to name a scale, and
-/// it is expected to be re-derived from the series once the series exists.
+/// Re-derived from the series now that it exists, against the rule's own
+/// reading -- `max by (node) (min_over_time(...[15m]))`, so the number this
+/// floor is compared with is the fifteen-minute *minimum*, not the instant.
+/// Over the first week of it running, that minimum peaked at 4.61 GB on this
+/// host, putting this floor just under twice (1.87x) above the worst the
+/// window has produced, and the rule did not fire once.
+///
+/// The raw series is a different number and the window is the whole reason:
+/// it peaked at 12.84 GB in the same week, with 31 of 10080 scrape-minutes
+/// over this floor. Those minutes are ordinary build work rather than a host
+/// in trouble, so a floor on the instant would have to sit above 12.84 GB to
+/// stay quiet -- and a bound nothing reaches says nothing about anything.
+/// What this floor is set to catch is the host being *held* under pressure,
+/// which is why the derived number comes from the minimum and not the peak.
 pub const HOST_SLICE_ANON_FLOOR_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Environment variable naming the node this process is running on.
@@ -551,13 +563,18 @@ mod tests {
             "rule {HOST_SLICE_ANON_FLOOR_RULE} compares against 8 GiB but its summary does not \
              say so: {summary}"
         );
-        // The number is declared, not measured, and the sentence a reader sees
-        // is where that has to be said: a floor that reads as a reading is the
-        // one nobody re-derives.
+        // Where the number comes from is the sentence a reader sees, and it has
+        // to name both halves of the derivation: that the floor was set from the
+        // measured distribution, and that what it is compared against is the
+        // window minimum rather than the instant. A summary that stayed silent
+        // on the second half describes a floor a peak crosses, which is a
+        // different rule from the one deployed -- and the number was declared
+        // from a guess until the series existed, so the sentence is also the
+        // only place saying that is no longer true.
         assert!(
-            summary.contains("拍的"),
-            "rule {HOST_SLICE_ANON_FLOOR_RULE} must say its floor is declared rather than \
-             measured: {summary}"
+            summary.contains("实测") && summary.contains("最小值"),
+            "rule {HOST_SLICE_ANON_FLOOR_RULE} must say the floor came from the measured \
+             distribution and is compared against the window minimum: {summary}"
         );
         // Persistence is a property of a whole window, which only a range
         // aggregate reads. The coverage term is required by the shared gate; it
