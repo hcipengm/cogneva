@@ -1850,7 +1850,7 @@ data:
             },
             {
               "name": "backup_no_recent_success",
-              "promql": "max(cogneva_backup_run_readings{readout=\"latest_success_age_seconds\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds) < 1800)) > 93600",
+              "promql": "max(cogneva_backup_run_readings{readout=\"latest_success_age_seconds\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds) < 1800))",
               "condition": {
                 "greater_than": 93600.0
               },

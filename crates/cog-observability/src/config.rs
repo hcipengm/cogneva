@@ -197,6 +197,16 @@ impl Default for InfraWatchConfig {
 /// One PromQL-backed alert rule. Every series the query returns is evaluated
 /// against `condition`; each matching series is one alert instance keyed by
 /// rule name plus its identity labels.
+///
+/// The bound belongs in one of the two and not in both. A comparison in the
+/// expression is a filter: written without `bool` it keeps the operand's own
+/// value, so a series below the threshold is dropped rather than reported as
+/// zero -- and a bound that stands in the expression *and* in `condition` has
+/// two carriers, of which the tighter one wins without saying so, so lowering
+/// the condition under its own filter changes nothing and reads as a change. A
+/// single scalar bound therefore goes in `condition` alone; the expression
+/// carries a comparison only where firing is decided by two series compared to
+/// each other, or by the presence of one series, which a scalar cannot state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InfraRule {
     pub name: String,
