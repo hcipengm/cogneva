@@ -50,6 +50,7 @@ pub mod llm_admin;
 pub mod memory;
 pub mod notifications;
 pub mod observability;
+pub mod observable;
 pub mod plugin;
 pub mod processes;
 pub mod prometheus_render;

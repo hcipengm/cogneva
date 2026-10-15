@@ -53,6 +53,13 @@ const PRODUCERS: &[(&str, &[(&str, bool)])] = &[
         "crates/cog-collaboration/src/observable.rs",
         &[("D8", true)],
     ),
+    // Declares no dimension either, and is not reached through the collector at
+    // all: it is rendered by the security gateway's own `/metrics`, in the
+    // process that dropped the writes. The counting is process-wide, so no
+    // dimension would separate anything -- but the reason it is listed here is
+    // the other direction of this table: a producer file the scan can see and
+    // the table does not name is the silence this file exists to catch.
+    ("crates/cog-gateway/src/observable.rs", &[]),
     ("crates/cog-guardrail/src/observable.rs", &[("D6", true)]),
     ("crates/cog-llm/src/observable.rs", &[("D9", true)]),
     ("crates/cog-memory/src/observable.rs", &[("D4", true)]),

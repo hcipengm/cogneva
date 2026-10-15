@@ -1342,6 +1342,11 @@ struct DurableGauges {
     /// 写失败只报一次：池不可用期间每拍都会失败，每拍一条告警等于把日志刷满，
     /// 而刷满的日志没人读。写成功时复位，于是每次故障各报一次。
     reported: AtomicBool,
+    /// 没落地的写，按失败方式分开累计。日志那一半（上面）只服务人，这一半是
+    /// 给读数面的：**日志报一次的那条**与**已经丢了多少拍**是两个问题，前者有
+    /// 上界、后者没有。它随这个结构生死——没有耐久面就没有"写失败"这回事，
+    /// 于是「没有耐久面」与「耐久面一次没失败」在暴露面上分得开。
+    failures: crate::observable::DurableWriteFailures,
     /// 值没变时的重写周期。做成字段而不是直接读常量，好让测试按秒级验证这条规则，
     /// 不必等半小时。
     heartbeat: std::time::Duration,
@@ -1368,8 +1373,14 @@ impl DurableGauges {
             metrics,
             written: std::sync::Mutex::new(HashMap::new()),
             reported: AtomicBool::new(false),
+            failures: crate::observable::DurableWriteFailures::new(),
             heartbeat: DURABLE_GAUGE_HEARTBEAT,
         }
+    }
+
+    /// 这条耐久面的丢写读数，交给本进程的 `/metrics` 渲染。
+    fn failures(&self) -> &crate::observable::DurableWriteFailures {
+        &self.failures
     }
 
     /// 只给测试用：把心跳周期缩到可观测的尺度。
@@ -1412,8 +1423,16 @@ impl DurableGauges {
                     .insert(key, (value, std::time::Instant::now()));
                 self.reported.store(false, Ordering::Relaxed);
             }
-            Ok(Err(e)) => self.report_once(&e.to_string()),
-            Err(_) => self.report_once("写入超时"),
+            Ok(Err(e)) => {
+                self.failures
+                    .record(crate::observable::DurableWriteFailure::StoreError);
+                self.report_once(&e.to_string());
+            }
+            Err(_) => {
+                self.failures
+                    .record(crate::observable::DurableWriteFailure::Timeout);
+                self.report_once("写入超时");
+            }
         }
     }
 
@@ -5316,6 +5335,15 @@ async fn metrics_handler(State(state): State<AppState>) -> axum::response::Respo
     match cog_core::Observable::collect_metrics(loops.as_ref(), "").await {
         Ok(readings) => body.push_str(&crate::prometheus_render::render_raw_metrics(&readings)),
         Err(e) => tracing::warn!(error = %e, "background loop readings unavailable this scrape"),
+    }
+    // 池读数的耐久面写砸了多少拍。只有这一拍知道：写失败时进程内那份读数不受
+    // 影响，所以没有这条读数的话，"这个网关正在丢写"在它自己之外没有任何形状。
+    // 没有耐久面（未配库、建表失败）时它缺席——那不是"零次失败"，是没有写者。
+    if let Some(durable) = state.pool_obs.durable.as_ref() {
+        match cog_core::Observable::collect_metrics(durable.failures(), "").await {
+            Ok(readings) => body.push_str(&crate::prometheus_render::render_raw_metrics(&readings)),
+            Err(e) => tracing::warn!(error = %e, "durable write failures unavailable this scrape"),
+        }
     }
     // The volumes this pod writes are readable from nowhere else — the kubelet's
     // per-volume number for a directory-backed volume is the node's filesystem —
@@ -9791,6 +9819,9 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         /// 还剩几次调用要失败。用来验证失败之后下一拍会重试，
         /// 而不是把失败的那次当成已经写进去。
         fail_first: AtomicUsize,
+        /// 置上以后写调用永不返回：这是"后端不答"那一半，它与"后端答了个错"
+        /// 是两个结局，而耐久面的上界只挡得住前一半。
+        hang: AtomicBool,
         gauges: std::sync::Mutex<Vec<RecordedGauge>>,
     }
 
@@ -9813,6 +9844,9 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             labels: HashMap<String, String>,
         ) -> cog_core::SFResult<()> {
             self.writes.fetch_add(1, Ordering::SeqCst);
+            if self.hang.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
             if self.fail_first.load(Ordering::SeqCst) > 0 {
                 self.fail_first.fetch_sub(1, Ordering::SeqCst);
                 return Err(cog_core::SFError::Database("store 不可达".into()));
@@ -9957,6 +9991,67 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             .await;
         assert_eq!(backend.writes(), 2, "第二拍必须再试一次");
         assert_eq!(backend.recorded().len(), 1);
+    }
+
+    /// 丢写这件事要有一条读数，而读数的第一格是"谁来加这个数"。写失败的分支有
+    /// 两条（后端答了个错、后端不答），两条都要各自记账——只记一条的话，另一种
+    /// 失败在暴露面上就与"没失败过"同形。
+    #[tokio::test]
+    async fn a_store_that_refuses_a_write_is_counted_as_a_store_error() {
+        let backend = Arc::new(CountingMetricsBackend::default());
+        backend.fail_first.store(1, Ordering::SeqCst);
+        let durable = DurableGauges::new(backend.clone());
+        durable
+            .record(cog_core::metric_names::LLM_POOL_AVAILABLE, 1.0, &[])
+            .await;
+
+        assert_eq!(
+            durable.failures().counts(),
+            [
+                (crate::observable::DurableWriteFailure::StoreError, 1),
+                (crate::observable::DurableWriteFailure::Timeout, 0),
+            ]
+        );
+    }
+
+    /// 时间推进到上界之上：`record` 返回了，说明这次写没落地，而它必须以"超时"
+    /// 入账而不是不入账——把超时读成成功会让耐久面停在一个旧值上而读数面干净。
+    #[tokio::test(start_paused = true)]
+    async fn a_store_that_never_answers_is_counted_as_a_timeout() {
+        let backend = Arc::new(CountingMetricsBackend::default());
+        backend.hang.store(true, Ordering::SeqCst);
+        let durable = DurableGauges::new(backend.clone());
+        durable
+            .record(cog_core::metric_names::LLM_POOL_AVAILABLE, 1.0, &[])
+            .await;
+
+        assert_eq!(
+            durable.failures().counts(),
+            [
+                (crate::observable::DurableWriteFailure::StoreError, 0),
+                (crate::observable::DurableWriteFailure::Timeout, 1),
+            ]
+        );
+    }
+
+    /// 写成功过的那些拍不进这一族：它数的是丢掉的写，不是写过的写。一条把成功也
+    /// 计进去的读数会让"这族是不是一直在涨"这个问题失去意义。
+    #[tokio::test]
+    async fn a_write_that_lands_is_not_counted_anywhere() {
+        let backend = Arc::new(CountingMetricsBackend::default());
+        let durable = DurableGauges::new(backend.clone());
+        for value in [1.0, 0.0, 1.0] {
+            durable
+                .record(cog_core::metric_names::LLM_POOL_AVAILABLE, value, &[])
+                .await;
+        }
+        assert_eq!(
+            durable.failures().counts(),
+            [
+                (crate::observable::DurableWriteFailure::StoreError, 0),
+                (crate::observable::DurableWriteFailure::Timeout, 0),
+            ]
+        );
     }
 
     #[tokio::test]

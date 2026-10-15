@@ -396,6 +396,14 @@ const PRODUCED: &[(&str, &str)] = &[
         "llm_upstream_failures_total",
         "crates/cog-gateway/src/security_gateway.rs",
     ),
+    // 耐久面丢掉的写。进程内那一份读数与它无关，所以写失败时这个网关与一个一切
+    // 正常的网关是同一种画面：同样的值、同样的序列、同样的端点——差别只在这些读数
+    // 能不能活得比 Pod 久，而那正是耐久面存在的全部理由。它按理由分格，两格都是
+    // 抓取面读数、随进程重启归零；没有耐久面的进程在这个名字下一个字节都不发布。
+    (
+        "cogneva_gateway_durable_write_failures_total",
+        "crates/cog-gateway/src/observable.rs",
+    ),
     (
         "cogneva_metric_held_without_producer",
         "crates/cog-gateway/src/lib.rs",
