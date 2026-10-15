@@ -630,7 +630,10 @@ pub fn series_endpoint(line: &str) -> Option<&str> {
 /// series' current value — and it is the one a gate holds down: the names here
 /// must appear nowhere else in the workspace outside this declaration, so a
 /// producer cannot come back without turning it red.
-pub const RETIRED_METRIC_NAMES: &[&str] = &["metrics_samples_retention_seconds"];
+pub const RETIRED_METRIC_NAMES: &[&str] = &[
+    "metrics_samples_retention_seconds",
+    "cogneva_change_dispatch_rows",
+];
 
 /// Whether `name` is a retired metric. See [`RETIRED_METRIC_NAMES`].
 ///

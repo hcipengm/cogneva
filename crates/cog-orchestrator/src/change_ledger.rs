@@ -1549,14 +1549,21 @@ impl DispatchReadout {
     }
 }
 
-/// Publish one pass's counts, with the pass's own answer to why it did only
-/// that much.
+/// Publish one pass's counts, one cell per readout.
 ///
-/// The decision and the pool reading are labels rather than cells of their own:
-/// they are the reason this tick's numbers look the way they do, and a reader
-/// who has to join two families to ask "was the debt held back, and by what"
-/// will read the number without the reason. They are closed sets, so the series
-/// a fleet of passes can create stay bounded by the counts times the reasons.
+/// The readout is the whole label set, and the pass's own answer to why the tick
+/// looks the way it does is a family of its own -- [`publish_dispatch_verdict`].
+/// It used to be two more labels here, so that a count and its reason were one
+/// series, and that is the shape a gauge cannot carry: a label whose value
+/// changes with the tick is not part of a series' identity, and the store keeps
+/// the newest row of every label set it has ever held and exempts it from its
+/// own sweep, so every combination a pass ever reached stayed behind as its last
+/// value and was served for ever. A combination nothing produces any more then
+/// read as a live count -- and the panel's `max` across label sets preferred it
+/// whenever it was the larger of the two, which for a count that falls to zero
+/// is every time it matters. The same reasoning, and the same repair, as the
+/// verdict's own family: enumerate a closed set under a fixed key set and write
+/// every cell, rather than let the value move the key.
 ///
 /// A failure to publish is raised and not fatal, for the reason a failure to
 /// record the row is: the pass already happened, and a loop that gave up the
@@ -1579,10 +1586,8 @@ async fn publish_dispatch_rows(metrics: Option<&Arc<dyn MetricsBackend>>, state:
         };
         let mut labels = HashMap::new();
         labels.insert("readout".to_string(), readout.as_str().to_string());
-        labels.insert("decision".to_string(), state.decision.as_str().to_string());
-        labels.insert("pool_reading".to_string(), state.pool.as_str().to_string());
         if let Err(e) = metrics
-            .record_gauge(metric_names::CHANGE_DISPATCH_ROWS, value as f64, labels)
+            .record_gauge(metric_names::CHANGE_DISPATCH_READOUTS, value as f64, labels)
             .await
         {
             warn!(
@@ -1591,6 +1596,62 @@ async fn publish_dispatch_rows(metrics: Option<&Arc<dyn MetricsBackend>>, state:
                 "change ledger: this pass's count could not be published, so the reading face \
                  is missing a cell this pass held"
             );
+        }
+    }
+}
+
+/// Publish the verdict the pass reached, as one cell per combination of the two
+/// closed sets: `1` on the combination this pass holds and `0` on the rest.
+///
+/// Every cell on every pass, rather than the one the pass reached. A key set
+/// whose cells are written only when they occur is a key set that goes on being
+/// served: the store renders a gauge from the newest row of each of its label
+/// sets and releases none of them, so the pass that moves from one verdict to
+/// another would leave the old one at `1` and a reader asking "what is the
+/// reason now" would be answered by both for ever. Writing the zero is also what
+/// makes the two closed sets readable as a set: a reader sees that a combination
+/// it never encounters is not one the pass is holding, which an absent cell
+/// cannot say, because absent is also what a deployment with no dispatch loop at
+/// all renders as.
+///
+/// Bounded by construction, and small: the cells a fleet of passes can create
+/// are the product of the two enumerations, not of the ticks they have run.
+/// The reason half of the reading is not on the counts' own family, which is
+/// where it was: the reason is what changes, and a value that changes belongs in
+/// the cells rather than in the key.
+///
+/// A failure to publish is raised and not fatal, on the same grounds as the
+/// counts: the pass already happened, and the verdict is in the account's own
+/// row whether or not the reading face took it.
+async fn publish_dispatch_verdict(
+    metrics: Option<&Arc<dyn MetricsBackend>>,
+    state: &DispatchState,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    for decision in DispatchDecision::ALL {
+        for pool in PoolReading::ALL {
+            let holds = decision == state.decision && pool == state.pool;
+            let mut labels = HashMap::new();
+            labels.insert("decision".to_string(), decision.as_str().to_string());
+            labels.insert("pool_reading".to_string(), pool.as_str().to_string());
+            if let Err(e) = metrics
+                .record_gauge(
+                    metric_names::CHANGE_DISPATCH_VERDICT,
+                    if holds { 1.0 } else { 0.0 },
+                    labels,
+                )
+                .await
+            {
+                warn!(
+                    error = %e,
+                    decision = decision.as_str(),
+                    pool_reading = pool.as_str(),
+                    "change ledger: this pass's verdict could not be published, so the reading \
+                     face is missing a cell of it"
+                );
+            }
         }
     }
 }
@@ -1638,6 +1699,7 @@ async fn record_dispatch_state(
     // account is the record and the reading face is a view of it, so the two
     // cannot say different things about one pass.
     publish_dispatch_rows(metrics, &state).await;
+    publish_dispatch_verdict(metrics, &state).await;
 }
 
 /// What the pool's snapshot says this pass should do.
@@ -3157,11 +3219,18 @@ mod tests {
     }
 
     /// Every count the pass holds is a cell a reader can name, and the cells
-    /// carry the numbers the row carries: one publish per readout, labelled with
-    /// the reason this tick reads the way it does, so a reader asking "what was
-    /// held back, and by what" joins no two families to answer it.
+    /// carry the numbers the row carries.
+    ///
+    /// One publish per readout, and the readout is the whole label set: the
+    /// reason is a family of its own, and what this pins is that the counts did
+    /// not take a label that moves. A count that carries the tick's reason is a
+    /// count whose series changes identity whenever the reason does, and every
+    /// identity the pass leaves behind is served for ever -- so the assertion
+    /// below is the one that caught the old shape being unreadable, in the
+    /// direction that matters: the frozen cell was the larger of the two and the
+    /// reader's `max` believed it.
     #[tokio::test]
-    async fn the_reading_face_publishes_one_cell_per_count_under_this_passs_reason() {
+    async fn the_reading_face_publishes_one_cell_per_count_and_the_passs_verdict() {
         let state = DispatchState {
             decision: DispatchDecision::PausedLlmPoolUnavailable,
             pool: PoolReading::Unavailable,
@@ -3180,23 +3249,23 @@ mod tests {
         let metrics = Arc::new(cog_storage::MemoryMetricsBackend::new());
         let metrics: Arc<dyn MetricsBackend> = metrics.clone();
         publish_dispatch_rows(Some(&metrics), &state).await;
+        publish_dispatch_verdict(Some(&metrics), &state).await;
 
         let end = Utc::now() + chrono::Duration::seconds(1);
         let start = end - chrono::Duration::seconds(600);
         let samples = metrics
-            .query_gauge_range(metric_names::CHANGE_DISPATCH_ROWS.as_str(), start, end)
+            .query_gauge_range(metric_names::CHANGE_DISPATCH_READOUTS.as_str(), start, end)
             .await
             .expect("the reading face is readable");
         let mut published: HashMap<String, f64> = HashMap::new();
         for sample in &samples {
             assert_eq!(
-                sample.labels.get("decision").map(String::as_str),
-                Some("paused_llm_pool_unavailable"),
-                "the reason this tick reads the way it does is on the cell"
-            );
-            assert_eq!(
-                sample.labels.get("pool_reading").map(String::as_str),
-                Some("unavailable")
+                sample.labels.len(),
+                1,
+                "a count carries its readout and nothing else: a second label whose value \
+                 moves with the tick is a new series on every move, and the store serves the \
+                 last value of every series it has ever held: {:?}",
+                sample.labels
             );
             let readout = sample
                 .labels
@@ -3238,6 +3307,63 @@ mod tests {
                 + published["dead_environment"]
                 + published["held_back"],
             published["pending"]
+        );
+
+        // The verdict: the whole product of the two closed sets, every pass, so
+        // that the cell the previous pass held is written back to zero rather
+        // than left standing as the reason the debt is not moving.
+        let samples = metrics
+            .query_gauge_range(metric_names::CHANGE_DISPATCH_VERDICT.as_str(), start, end)
+            .await
+            .expect("the verdict is readable");
+        let mut verdicts: HashMap<(String, String), f64> = HashMap::new();
+        for sample in &samples {
+            let decision = sample
+                .labels
+                .get("decision")
+                .expect("every cell names its decision")
+                .clone();
+            let pool = sample
+                .labels
+                .get("pool_reading")
+                .expect("every cell names its pool reading")
+                .clone();
+            assert!(
+                verdicts.insert((decision, pool), sample.value).is_none(),
+                "a combination published twice is two cells a reader cannot take apart"
+            );
+        }
+        let expected: std::collections::BTreeSet<(String, String)> = DispatchDecision::ALL
+            .iter()
+            .flat_map(|decision| {
+                PoolReading::ALL
+                    .iter()
+                    .map(move |pool| (decision.as_str().to_string(), pool.as_str().to_string()))
+            })
+            .collect();
+        assert_eq!(
+            verdicts
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected,
+            "the covered cells are the product of the two closed sets: a cell that is only \
+             written when its combination occurs is a cell that goes on being served after \
+             the pass has moved off it"
+        );
+        let held: Vec<&(String, String)> = verdicts
+            .iter()
+            .filter(|(_, value)| **value == 1.0)
+            .map(|(cell, _)| cell)
+            .collect();
+        assert_eq!(
+            held,
+            vec![&(
+                "paused_llm_pool_unavailable".to_string(),
+                "unavailable".to_string()
+            )],
+            "exactly this pass's combination reads as one; two ones is a reader asking which \
+             pass is current and being told there are two"
         );
     }
 }

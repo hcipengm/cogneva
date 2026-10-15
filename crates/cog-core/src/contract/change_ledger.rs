@@ -686,6 +686,16 @@ pub enum DispatchDecision {
 }
 
 impl DispatchDecision {
+    /// Every decision, for a reader that has to enumerate the set.
+    ///
+    /// The reading face publishes one cell per combination of this set and
+    /// [`PoolReading::ALL`] on every pass, so a combination is written as zero
+    /// before its pass ever reaches it and no combination is left holding a
+    /// value from a pass that has moved on. A variant missing from this list
+    /// would be a cell no pass ever writes, and the count that the cells exist
+    /// for would go on missing it.
+    pub const ALL: [DispatchDecision; 2] = [Self::Proceed, Self::PausedLlmPoolUnavailable];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Proceed => "proceed",
@@ -712,6 +722,10 @@ pub enum PoolReading {
 }
 
 impl PoolReading {
+    /// Every reading of the pool snapshot, for a reader that has to enumerate
+    /// the set. See [`DispatchDecision::ALL`] for what enumerating it is for.
+    pub const ALL: [PoolReading; 3] = [Self::Available, Self::Unavailable, Self::Absent];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Available => "available",
@@ -777,6 +791,44 @@ mod tests {
         let unique = reasons.len();
         reasons.dedup();
         assert_eq!(unique, reasons.len(), "two reasons share a name");
+    }
+
+    /// The two sets the dispatch reading face enumerates name each value once.
+    ///
+    /// The cells of `cogneva_change_dispatch_verdict` are the product of these
+    /// two lists, so two variants sharing a name would make two cells one
+    /// series, and whichever the pass wrote last would decide what the pair
+    /// reads as -- a cell a reader can no longer take apart, and one whose
+    /// count no longer answers its own question. Neither list has a name to
+    /// parse back, so this is the whole of what can be asserted here; what a
+    /// value *means* is asserted where it is read.
+    #[test]
+    fn the_dispatch_sets_name_each_of_their_values_once() {
+        let mut decisions: Vec<&str> = DispatchDecision::ALL
+            .iter()
+            .map(|decision| decision.as_str())
+            .collect();
+        let listed = decisions.len();
+        decisions.sort_unstable();
+        decisions.dedup();
+        assert_eq!(
+            listed,
+            decisions.len(),
+            "two decisions share a name, so two cells of the verdict's key set are one series"
+        );
+
+        let mut readings: Vec<&str> = PoolReading::ALL
+            .iter()
+            .map(|reading| reading.as_str())
+            .collect();
+        let listed = readings.len();
+        readings.sort_unstable();
+        readings.dedup();
+        assert_eq!(
+            listed,
+            readings.len(),
+            "two pool readings share a name, so two cells of the verdict's key set are one series"
+        );
     }
 
     /// The two terminal states are the two that are not outstanding.

@@ -1143,7 +1143,7 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          which is what the fate counter is for",
     ),
     (
-        "cogneva_change_dispatch_rows",
+        "cogneva_change_dispatch_readouts",
         "What one change-ledger dispatch pass did with the set still owed, by \
          readout, on the pass that recorded it: pending is the whole owed set, \
          and the rows that set broke into are submitted (handed over this pass), \
@@ -1158,12 +1158,31 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          dead_environment + held_back is what has to equal pending -- and the \
          equality is the reading: a pass whose counts do not add up to the set it \
          read is a pass that lost track of rows, which is how the environment- \
-         killed ones went unrecorded once. The decision and pool_reading labels \
-         are the pass's own answer to why the pass did only that much, carried on \
-         the same series so an unmoving debt and its reason are read together. \
-         Written once per pass, so a pass that stops writing is visible as the \
-         companion timestamp going stale rather than as a value that stops \
-         changing",
+         killed ones went unrecorded once. Written once per pass, so a pass that \
+         stops writing is visible as the companion timestamp going stale rather \
+         than as a value that stops changing. Why this tick looks the way it does \
+         is the pass's own verdict, read from cogneva_change_dispatch_verdict: \
+         the two are separate families because the verdict changes with the tick \
+         and a cell's identity must not, and a label that changes would leave one \
+         frozen cell behind per combination the pass ever reached",
+    ),
+    (
+        "cogneva_change_dispatch_verdict",
+        "The verdict one change-ledger dispatch pass reached, as one cell for \
+         each combination of the two closed sets -- decision (proceed, or \
+         paused_llm_pool_unavailable when no configured upstream could serve a \
+         request) and pool_reading (available, unavailable, or absent when no \
+         snapshot said anything either way). The cell the pass reached is 1 and \
+         the other five are 0, written on every pass: a cell that stopped being \
+         written would go on being served at its last value, so a pass that \
+         stops reaching a verdict would read as a verdict that never moved, and \
+         a zero answers the question a reader actually asks -- whether this \
+         pass's reason was this one -- without having to know which combination \
+         is absent. The cells pair with the counts in \
+         cogneva_change_dispatch_readouts by being published from the same pass \
+         rather than by a label: a reader takes the two at one timestamp, which \
+         is what the debt's own panel does, and neither family has to carry a \
+         value that changes under its own label",
     ),
     (
         "cogneva_backup_run_readings",

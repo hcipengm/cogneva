@@ -862,15 +862,46 @@ metric_names! {
     // The counts are published together because they only mean anything
     // together: `pending` alone says work is owed, and the per-row outcomes say
     // where this pass's share of it went. A pass that is holding work back has
-    // `held_back` where a pass that dispatched has `submitted`/`failed`, and the
-    // two columns of `decision` and `pool_reading` are the pass's own answer to
-    // "why this tick" -- so a reader who sees an unmoving debt reads the reason
-    // on the same series rather than inferring it from a second family.
+    // `held_back` where a pass that dispatched has `submitted`/`failed`.
     //
     // The values are the ones the pass wrote to its table, not a second
     // computation: the reading face is a view of the account, and a view that
     // measured again would be a second account.
-    CHANGE_DISPATCH_ROWS => "cogneva_change_dispatch_rows",
+    //
+    // `readout` is the whole label set, and that is a correction rather than a
+    // simplification. This family once carried the pass's tick-varying answer to
+    // "why does this tick look the way it does" -- the decision and the pool
+    // reading -- in two more labels, so that the count and its reason were one
+    // series. A label whose value changes with the tick is not part of a series'
+    // identity, and on a gauge the store keeps the newest row of every label set
+    // it has ever held and exempts it from its own sweep, so every combination
+    // the pass ever reached left its last value frozen and served for ever: a
+    // retired combination read as a live count, and the reader's `max` across
+    // label sets preferred the frozen one whenever it was larger. The reason has
+    // a family of its own now -- `cogneva_change_dispatch_verdict`, whose key
+    // set is fixed and whose every cell is written on every pass -- and this
+    // name is retired rather than re-scoped, because a name cannot be served
+    // under two label sets at once and the rows already stored under the old one
+    // would go on being served. Retirement is what stops the exposition serving
+    // them and what lets the release pass delete them.
+    CHANGE_DISPATCH_READOUTS => "cogneva_change_dispatch_readouts",
+
+    // cog-orchestrator — the verdict one change-ledger dispatch pass reached,
+    // as one cell per combination of the two closed sets.
+    //
+    // Every cell is written on every pass, the current one as `1` and the rest
+    // as `0`, and that is what makes the family readable rather than merely
+    // present: a family that published only the combination its pass reached
+    // would leave the previous combination's `1` standing, and a reader of the
+    // debt would see a pass that stopped happening as a verdict that never
+    // changes. The key set is fixed by the two enumerations, so the cells a
+    // pass's future can mint are bounded by the sets, and a pass that a new
+    // combination would otherwise have frozen has already been written as `0`.
+    //
+    // `0` here is a reading and not a placeholder: it says this pass did not
+    // reach that verdict, which is the same answer a pass that never reaches it
+    // gives, and the two are told apart by reading the cell that is `1`.
+    CHANGE_DISPATCH_VERDICT => "cogneva_change_dispatch_verdict",
 
     // cog-orchestrator — keeping a running task's progress resumable.
     //
