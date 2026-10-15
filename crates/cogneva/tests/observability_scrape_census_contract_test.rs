@@ -668,13 +668,21 @@ fn is_a_declaration(before: &str) -> bool {
 /// both sides by a quote, so a producer that splices its name into a format
 /// string -- `format!("cogneva_no_such_series {}\n", n)` -- spells a series
 /// into the scrape with no shape any declaration reader can see. The
-/// right-hand delimiter is
-/// therefore "whatever ends a name": a quote (the declaration shape), a `{`
-/// (a selector, the shape an exposition fixture writes), whitespace or the end
-/// of the text (a name starting a line being built). The opening quote on the
-/// left is still required, so a name in prose is not read as a literal unless
-/// it is quoted -- which is why the example above is written with quotes and
-/// has to name a series that is already exempt.
+/// right-hand delimiter is therefore "whatever ends a name": a quote (the
+/// declaration shape), a `{` (a selector, the shape an exposition fixture
+/// writes), whitespace or the end of the text (a name starting a line being
+/// built). The opening quote on the left is still required, so a name in prose
+/// is not read as a literal unless it is quoted -- which is why the example
+/// above is written with quotes and has to name a series that is already exempt.
+///
+/// The reach of this scan is therefore "every literal that begins with the
+/// prefix", and that covers every shape a producer in this tree uses. The one
+/// remaining way for a name to reach the scrape while never appearing as itself
+/// -- spliced together at run time -- leaves the bare prefix in the text with
+/// nothing after it, and the scan reads that as a name the population does not
+/// hold. Stated as a reading rather than a proof: no file under `crates/`
+/// carries `cogneva_{` today, and the unit test below pins the shape it would
+/// arrive in.
 fn series_name_literals(text: &str) -> Vec<String> {
     let mut found = Vec::new();
     let needle = format!("\"{NAME_PREFIX}");
@@ -778,6 +786,28 @@ mod tests {
         assert!(
             declared_names(&fixture).is_empty(),
             "an exposition fixture is a value being written as text, not a producer"
+        );
+    }
+
+    /// A name spliced at run time leaves the bare prefix in the text, and the
+    /// literal scan reads that as a name nothing produces.
+    ///
+    /// This is the boundary the scan is left with once the right-hand delimiter
+    /// is read as "whatever ends a name": every other shape writes the whole
+    /// name into the text somewhere, and a spliced one writes in as much of it
+    /// as is written. That `cogneva_{` occurs in no file under `crates/` today
+    /// is a reading rather than a property -- a name assembled in a way that
+    /// leaves no trace would be nameless to the scan -- so the shape a splice
+    /// does leave is pinned here instead of being asserted in prose. The
+    /// specimen is assembled at run time for the same reason the other one is:
+    /// this file sits inside the tree the scan walks.
+    #[test]
+    fn a_name_spliced_at_run_time_leaves_the_bare_prefix_in_the_text() {
+        let spliced = format!("\"{NAME_PREFIX}{{}} 1\"");
+        assert_eq!(
+            series_name_literals(&spliced),
+            vec![NAME_PREFIX.to_string()],
+            "a spliced name is read as the bare prefix, which no population holds"
         );
     }
 }
