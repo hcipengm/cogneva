@@ -832,8 +832,9 @@ const PRODUCED: &[(&str, &str)] = &[
     ),
     // 闸门**此刻**由哪一路掌权，与上面那条同形：五格由产出进程按 `RawMetric` 渲染，
     // 随产出者消失，store 里没有行（所以同样不进 `metric_names::ALL` 那个闭集），
-    // 登记点就是 `memory_raw_backlog_aged_out` 的抑制子句——它读 `pull_gate_local`
-    // 这一格，好让「本地退避在暂停」不再被那条规则读成「扫不动／漏」。名字取自
+    // 登记点就是 `memory_raw_backlog_aged_out` 的抑制子句——它读
+    // `pull_gate_local|pull_gate_shared|pull_gate_both` 这三格，好让「闸门被任何一路
+    // 按住」不再被那条规则读成「扫不动／漏」。名字取自
     // `crates/cog-memory/src/observable.rs` 的 `PULL_GATE_HOLDER_METRIC`，五个标签
     // 值与换手计数共用 `PULL_GATE_OPERATIONS`，是同一套拼写而不是第二份。
     (
