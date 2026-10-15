@@ -691,3 +691,57 @@ fn read(rel: &str) -> String {
     let path = repo_root().join(rel);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both shapes a producer spells a name with are read, and this file cannot
+    /// carry a specimen of either.
+    ///
+    /// The name is assembled at run time for the same reason the needle is:
+    /// this file sits inside the tree the literal scan walks, so a fixture
+    /// written as a literal would be found by that scan and reported as a
+    /// series nothing produces.
+    ///
+    /// The construction shape needs this most. No producer in the tree writes
+    /// `RawMetric::new` with a literal today, so without a specimen here that
+    /// branch could be wrong and nothing would say so -- and the literal scan
+    /// is only half a backstop for it, because a name the closed set also holds
+    /// is explained by the set and never reaches the population. What the
+    /// census would then miss is a series rendered by a producer whose name is
+    /// also a store name: exactly the kind that appears on the scrape and in
+    /// nobody's census.
+    #[test]
+    fn both_shapes_a_producer_spells_a_name_with_are_read() {
+        let name = format!("{NAME_PREFIX}a_series_a_test_builds");
+
+        let declared = format!("pub const SOMETHING_METRIC: &str = \"{name}\";");
+        assert_eq!(
+            declared_names(&declared),
+            vec![name.clone()],
+            "the declaration shape is read"
+        );
+
+        let constructed = format!("RawMetric::new(\"{name}\")");
+        assert_eq!(
+            declared_names(&constructed),
+            vec![name.clone()],
+            "and so is the construction shape"
+        );
+
+        // Not a third shape, and the census reads neither of these -- which is
+        // what makes the literal scan necessary rather than a belt and braces.
+        let rebound = format!("let name: &str = \"{name}\";");
+        assert!(
+            declared_names(&rebound).is_empty(),
+            "a binding is not a producer, so it is not in the population"
+        );
+
+        let fixture = format!("\"{name}{{node=\\\"a\\\"}} 1\"");
+        assert!(
+            declared_names(&fixture).is_empty(),
+            "an exposition fixture is a value being written as text, not a producer"
+        );
+    }
+}
