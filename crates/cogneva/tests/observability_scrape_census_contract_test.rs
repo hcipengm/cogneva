@@ -205,10 +205,6 @@ const UNREGISTERED: &[(&str, Unread)] = &[
         "cogneva_stream_read_failures_total",
         Unread::Gap("reads this consumer's loop has had refused since it started, published as the deliberate pair to the silence reading -- silence says whether the bus is moving, this says what it cost to keep up. The stalled-consumer rule's own summary already tells a human to look at this series for the count of refused reads, so the reading is addressed to a reader and the face that would carry it does not exist"),
     ),
-    (
-        "cogneva_runtime_asset_check_seconds",
-        Unread::Gap("when the startup check last ran, published as a separate series for the reason the module gives: only the problem states are exported, so a check that found nothing and a check that never ran leave the same reading, and this timestamp is what separates them. The four rules read the state gauges and none of them reads it, so the staleness it exists to make visible is visible to nobody"),
-    ),
     // Two names whose fact a face already carries, each looked up rather than
     // asserted in prose.
     (
@@ -239,12 +235,12 @@ const UNREGISTERED: &[(&str, Unread)] = &[
 /// How many `Gap` entries this census left.
 ///
 /// The first run is where this number comes from, and it is meant to be read as
-/// it is: seventeen names the tree publishes into a scrape with no face
-/// carrying them. The ratchet is the same one the reader-face census keeps --
-/// a new series nothing reads must be classified deliberately, and calling it a
-/// gap raises this number on purpose. It comes down when a face is written, and
+/// it is: sixteen names the tree publishes into a scrape with no face carrying
+/// them. The ratchet is the same one the reader-face census keeps -- a new
+/// series nothing reads must be classified deliberately, and calling it a gap
+/// raises this number on purpose. It comes down when a face is written, and
 /// that is a change to this constant plus the removal of the entry.
-const GAPS_AT_SCRAPE_CENSUS: usize = 17;
+const GAPS_AT_SCRAPE_CENSUS: usize = 16;
 
 /// How many scrape-only series are carried by a produced table and by nothing
 /// that reads them.

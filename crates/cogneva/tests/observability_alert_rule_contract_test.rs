@@ -472,6 +472,14 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_stream_read_silent_seconds",
         "crates/cog-stream/src/observable.rs",
     ),
+    // The check's own timestamp, which is the only series in the family that
+    // says the check ran. It is read by absence rather than by value: it holds
+    // an epoch second, not a duration, so there is no threshold to compare it
+    // against -- what it answers is whether the report exists at all.
+    (
+        "cogneva_runtime_asset_check_seconds",
+        "crates/cog-reflection/src/runtime_assets.rs",
+    ),
     (
         "cogneva_runtime_asset_manifest_absent",
         "crates/cog-reflection/src/runtime_assets.rs",

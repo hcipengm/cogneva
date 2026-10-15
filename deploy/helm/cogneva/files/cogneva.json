@@ -866,6 +866,15 @@
           "summary": "The runtime asset record this image carries cannot be read, so every declared asset is unjudged — the per-asset rules are silent because the comparison never happened, not because the assets matched. The path and the parse error are in this process's own log line for the check"
         },
         {
+          "name": "runtime_asset_check_never_ran",
+          "promql": "absent(max without (pod, container, instance, job) (cogneva_runtime_asset_check_seconds))",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "平台上一个进程都没有报出启动资产检查的时刻。这条读数问的不是「检查很久没跑了」——那不是这条序列的能量：它存的是 epoch 时刻而不是时长，没有可比的界，唯一的读法是「这份报告还在不在」，所以这里用 absent()。为什么这份报告必须有一条自己的读者：这一族只导出「出问题的状态」，一个判定为「没问题」的落点根本不发序列，于是「检查跑了、什么都没发现」与「检查从没跑过」在既有的四条规则上一模一样地安静——这个时刻就是用来把这两件事分开的，而在本规则之前没有任何一条规则读它，那份「检查还在不在」的可见性谁也看不见。这条读数本身是一个启动一次性检查：镜像里的资产在构建时就定死、运行期不会变，所以每个进程只跑一次、只留一个答案。同一份报告还把 manifest_absent 与 manifest_unusable（0 或 1）一起推出来，所以这几个序列要么同时在、要么同时不在：本规则亮起来的字面意思是「没有任何进程在报这份报告」，成因有三，要看连带的那几条才好判——启动检查的调用点被删掉、跑它的进程不在（或这一族的抓取没到）、或读数没进到库里。后两种情况下 runtime_asset_not_refreshed、content_drift、manifest_absent、manifest_unusable 会一起消失，那种「四条都绿」是四条一起失明，不是资产全对。表达式的 max without 是把报信者聚合掉：序列带 pod/container/instance/job，而这里讲的主体不是某个 Pod，不聚合的话一次滚动就会被读成一条属于那个 Pod 的告警。反过来这条规则也读不到「只有一部分进程没报」——那需要一份「谁应该跑这次检查」的名册，今天不存在，所以能判的只有整族消失。"
+        },
+        {
           "name": "node_capacity_overcommitted",
           "promql": "sum by (node, resource) (kube_pod_container_resource_limits{resource=~\"cpu|memory\"} and on(namespace, pod) kube_pod_status_phase{phase=\"Running\"} == 1) / on(node, resource) group_left sum by (node, resource) (kube_node_status_allocatable{resource=~\"cpu|memory\"})",
           "condition": {
