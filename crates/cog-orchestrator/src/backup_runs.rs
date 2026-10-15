@@ -124,6 +124,123 @@ impl BackupReadout {
     }
 }
 
+/// Who selects one of the account's values, or why nobody does.
+///
+/// A value with no reader is not the same thing as a value nobody needs: the
+/// account answers several questions no rule asks, and it is right to publish
+/// them -- but the difference has to be written down per value, because a
+/// blanket "these are for whoever looks" is how a published cell stops having
+/// anyone to be for while still costing a row on every scrape.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ReadoutReader {
+    /// A shipped rule's expression selects this value by name.
+    Rule(&'static str),
+    /// No shipped rule selects it. `why` is why it is published anyway, and
+    /// what would have to change before one did.
+    Unread { why: &'static str },
+}
+
+/// What happens to each value the account publishes, keyed by the producer's
+/// own roster.
+///
+/// This table is the other half of [`BackupReadout::ALL`] and not a second
+/// roster: the keys are compared against `ALL` as a set (so a value added to the
+/// exposition without a line here fails, and so does a name spelled twice), the
+/// length is fixed by `ALL`, and every `Rule` line is checked against the rule
+/// it names -- a line claiming a rule reads a value that rule does not select is
+/// the one failure this table could hide from itself.
+///
+/// It is built only for the tests, because nothing in the loop reads it: the
+/// account publishes the same values whether or not this table exists, and the
+/// table's whole job is to be checked -- against the producer for which values
+/// there are, and against the chart for who reads them.
+#[cfg(test)]
+const READOUT_READERS: [(BackupReadout, ReadoutReader); BackupReadout::ALL.len()] = [
+    (
+        BackupReadout::RunsRunning,
+        ReadoutReader::Unread {
+            why: "the only positive reading that a run is open right now, and it is published even \
+                  when the account holds nothing -- so its zero is a number a reader can act on \
+                  rather than an absence. It is owed a rule, and until then an open run is visible \
+                  only through its age, which is absent when there is none.",
+        },
+    ),
+    (
+        BackupReadout::RunsOk,
+        ReadoutReader::Rule("backup_never_succeeded"),
+    ),
+    (
+        BackupReadout::RunsFailed,
+        ReadoutReader::Rule("backup_never_succeeded"),
+    ),
+    (
+        BackupReadout::RunsAbandoned,
+        ReadoutReader::Unread {
+            why: "the only exit for a run the account had to conclude itself, and it is published \
+                  even when the account holds nothing. The rule that reads runs_failed cannot see \
+                  this state at all -- a run that went missing reported nothing -- so this is owed \
+                  a rule of its own, and a rule added here has to say what it means when the value \
+                  is zero, which is not the same as absent.",
+        },
+    ),
+    (
+        BackupReadout::LatestFinishAgeSeconds,
+        ReadoutReader::Unread {
+            why: "read with latest_success_age_seconds, which has a rule: the two together separate \
+                  a loop that runs and fails from one that is not running, and only the success half \
+                  is read today. A rule for this half has to say what its absence means -- it is \
+                  absent until a run concludes anything, which is a different fact from an old \
+                  finish.",
+        },
+    ),
+    (
+        BackupReadout::LatestSuccessAgeSeconds,
+        ReadoutReader::Rule("backup_no_recent_success"),
+    ),
+    (
+        BackupReadout::OldestRunningAgeSeconds,
+        ReadoutReader::Rule("backup_run_over_its_own_deadline"),
+    ),
+    (
+        BackupReadout::OldestRunningDeadlineSeconds,
+        ReadoutReader::Rule("backup_run_over_its_own_deadline"),
+    ),
+    (
+        BackupReadout::Kept,
+        ReadoutReader::Unread {
+            why: "read with keep_target: a retention pass that keeps nothing is invisible to a \
+                  count of runs, since the run still succeeded. Owed a rule; its absence means the \
+                  newest successful run was older than any package age recorded, which the rule \
+                  reading it would have to say.",
+        },
+    ),
+    (
+        BackupReadout::KeepTarget,
+        ReadoutReader::Unread {
+            why: "the bound that kept is measured against. Published so that the pair is read \
+                  together rather than by comparing a count against a number baked into a rule; \
+                  owed a rule that reads the two against each other.",
+        },
+    ),
+    (
+        BackupReadout::OldestKeptAgeSeconds,
+        ReadoutReader::Unread {
+            why: "the half a count cannot falsify: packages can stop being pruned while every run \
+                  keeps succeeding, and then the surviving set ages without any other value on this \
+                  series moving. Owed a rule.",
+        },
+    ),
+    (
+        BackupReadout::NewestPackageBytes,
+        ReadoutReader::Unread {
+            why: "a backup that stops capturing shrinks, and nothing else on this series moves when \
+                  it does -- a run that wrote a smaller package still concluded ok. Owed a rule; \
+                  being a size, its bound belongs to the rule rather than here.",
+        },
+    ),
+];
+
 /// How old an instant is, in whole seconds, floored at zero.
 ///
 /// The floor is not cosmetic. The instant was written by the backup process and
@@ -342,4 +459,129 @@ pub fn spawn_backup_runs_loop(
             }
         },
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// The shipped rules, by name, as the chart holds them.
+    ///
+    /// Read from the chart's own file rather than from a rendered profile: the
+    /// profiles are generated from it, so a rule renamed in the rendered copies
+    /// and not here would be a rule the deployment does not have.
+    fn shipped_rules() -> BTreeMap<String, String> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let path = root.join("deploy/helm/cogneva/files/cogneva.json");
+        let text = std::fs::read_to_string(&path).expect("read the chart's cogneva.json");
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("chart JSON parses");
+        let rules = parsed["observability"]["infra_watch"]["rules"]
+            .as_array()
+            .expect("the chart ships an infra_watch rules array");
+        assert!(
+            !rules.is_empty(),
+            "the path to the rules moved: the chart parsed but holds no rules"
+        );
+        rules
+            .iter()
+            .map(|rule| {
+                (
+                    rule["name"]
+                        .as_str()
+                        .expect("every rule carries a name")
+                        .to_string(),
+                    rule["promql"]
+                        .as_str()
+                        .expect("every rule carries an expression")
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// The selector that reads one value out of the account's family.
+    fn selector(readout: BackupReadout) -> String {
+        format!("readout=\"{}\"", readout.as_str())
+    }
+
+    /// Every value the loop can publish has exactly one line in
+    /// [`READOUT_READERS`], and the table names nothing else.
+    ///
+    /// An equality rather than a bound in either direction: a missing line means
+    /// a value on the exposition with nobody asked to read it, and a line for a
+    /// value the account cannot publish means a reader waiting for a cell that
+    /// never comes. The second is the one an upper bound would hide.
+    #[test]
+    fn every_published_readout_has_exactly_one_line_here() {
+        let keyed: BTreeSet<String> = READOUT_READERS
+            .iter()
+            .map(|(readout, _)| readout.as_str().to_string())
+            .collect();
+        let published: BTreeSet<String> = BackupReadout::ALL
+            .iter()
+            .map(|readout| readout.as_str().to_string())
+            .collect();
+
+        assert_eq!(
+            READOUT_READERS.len(),
+            published.len(),
+            "one line per published value, no value twice: {keyed:?}"
+        );
+        assert_eq!(
+            keyed, published,
+            "the values the account publishes and the values this table accounts for have to be \
+             the same set"
+        );
+    }
+
+    /// Each line is checked against the carrier it names, in both directions.
+    ///
+    /// The check is what keeps this table from being a second, self-consistent
+    /// roster: a `Rule` line is verified against that rule's own expression, and
+    /// an `Unread` line is verified against every shipped rule -- a value
+    /// recorded as unread that some rule already selects would leave the rest of
+    /// the lines worth nothing.
+    #[test]
+    fn the_readers_are_checked_against_the_rules_they_name() {
+        let rules = shipped_rules();
+
+        for (readout, reader) in READOUT_READERS {
+            let selector = selector(readout);
+            match reader {
+                ReadoutReader::Rule(name) => {
+                    let promql = rules.get(name).unwrap_or_else(|| {
+                        panic!(
+                            "readout {} names a rule the chart does not ship: {name}",
+                            readout.as_str()
+                        )
+                    });
+                    assert!(
+                        promql.contains(&selector),
+                        "readout {} is recorded as read by {name}, whose expression does not \
+                         select it: {promql}",
+                        readout.as_str()
+                    );
+                }
+                ReadoutReader::Unread { why } => {
+                    assert!(
+                        !why.trim().is_empty(),
+                        "readout {} has no reader and no reason it is still published",
+                        readout.as_str()
+                    );
+                    let naming: Vec<&String> = rules
+                        .iter()
+                        .filter(|(_, promql)| promql.contains(&selector))
+                        .map(|(name, _)| name)
+                        .collect();
+                    assert!(
+                        naming.is_empty(),
+                        "readout {} is recorded as having no reader, but these rules select it: \
+                         {naming:?}",
+                        readout.as_str()
+                    );
+                }
+            }
+        }
+    }
 }
