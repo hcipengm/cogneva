@@ -165,6 +165,7 @@ pub async fn build_gateway_state(
     // stops being fed stale values.
     {
         let cache = supervisor_event_cache.clone();
+        let lag_metrics = metrics_backend.clone();
         let mut rx = supervisor.subscribe();
         tokio::spawn(async move {
             loop {
@@ -175,6 +176,12 @@ pub async fn build_gateway_state(
                             skipped,
                             "supervisor event cache lagged; the last recommendation may be stale"
                         );
+                        crate::record_consumer_lag(
+                            &lag_metrics,
+                            crate::LAG_CONSUMER_SUPERVISOR_EVENT_CACHE,
+                            skipped,
+                        )
+                        .await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }

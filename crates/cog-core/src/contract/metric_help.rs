@@ -798,6 +798,27 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          `cause`.",
     ),
     (
+        crate::metric_names::EVENT_BUS_LAGGED_TOTAL.as_str(),
+        "Events a broadcast subscriber missed because it fell behind its \
+         channel, labelled by `consumer`, one increment per event the channel \
+         dropped under it. It is the consumer-side twin of the dropped counter \
+         and a different defect: a drop is the bus refusing to hand an event \
+         out, a lag is a subscriber too slow to take one the bus offered, and \
+         the repair for the second is on the reader, not on the bus. Written \
+         because every `Lagged` arm in the platform already computes the count \
+         -- `RecvError::Lagged(n)` hands it over -- and then has nowhere to read \
+         it, so a subscriber that was silently shedding events looked exactly \
+         like one that had nothing to do. Read it per `consumer`: two consumers \
+         falling behind are two incidents with two owners, and the sum names \
+         neither. A `consumer` label that is absent means that subscriber does \
+         not publish this yet, not that it never fell behind. Pair it with \
+         `cogneva_loop_tick_age_seconds` for an event-driven loop: the age resets \
+         on every wake, so `min_over_time(..._loop_tick_age_seconds{loop=...}[W])` \
+         low says the loop woke and a rising lag beside it says it woke and could \
+         not keep up -- idle and stuck are then two different readings instead of \
+         one.",
+    ),
+    (
         crate::metric_names::TOOL_OUTPUT_FETCH_BUDGET_EXHAUSTED_TOTAL.as_str(),
         "Reads of an archived tool output that found the source but stopped \
          short of its bytes because the payload outgrew the byte budget the \

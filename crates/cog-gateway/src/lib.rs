@@ -87,6 +87,44 @@ pub type ChatSessionStore = Arc<
     >,
 >;
 
+/// Consumer names for [`cog_core::metric_names::EVENT_BUS_LAGGED_TOTAL`].
+///
+/// Each is the loop or task that subscribes to a broadcast channel and can fall
+/// behind it. The string is the label value a reader filters by, so it names the
+/// consumer as a person would look it up, not the channel it reads.
+pub(crate) const LAG_CONSUMER_COLLABORATION_LISTENER: &str = "collaboration_listener";
+pub(crate) const LAG_CONSUMER_EVOLUTION_STREAM: &str = "evolution_stream";
+pub(crate) const LAG_CONSUMER_SUPERVISOR_EVENT_CACHE: &str = "supervisor_event_cache";
+
+/// Record that a broadcast subscriber fell behind and lost `skipped` events.
+///
+/// `RecvError::Lagged(n)` already hands the count over; the only reason it went
+/// unread was that nobody carried it to a store, so this is the one line that
+/// does. A missing backend is not an error (embedded runs have none) and a write
+/// failure is a `warn!`, never a panic: the events are already lost and failing
+/// the consumer over the bookkeeping would trade one loss for a larger one.
+pub(crate) async fn record_consumer_lag(
+    metrics: &Option<Arc<dyn cog_core::MetricsBackend>>,
+    consumer: &str,
+    skipped: u64,
+) {
+    let Some(backend) = metrics.as_ref() else {
+        return;
+    };
+    let mut labels = std::collections::HashMap::new();
+    labels.insert("consumer".to_string(), consumer.to_string());
+    if let Err(e) = backend
+        .record_counter(
+            cog_core::metric_names::EVENT_BUS_LAGGED_TOTAL,
+            skipped as f64,
+            labels,
+        )
+        .await
+    {
+        tracing::warn!(error = %e, consumer, "could not record the events this consumer missed");
+    }
+}
+
 /// Gateway 应用状态，包含所有服务组件。
 pub struct GatewayState {
     pub config: std::sync::RwLock<cog_core::GatewayConfig>,

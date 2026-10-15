@@ -134,6 +134,17 @@ pub fn spawn_collaboration_listener(
                                 // 「循环还在但事件丢了」变成看不出来的那种做法。
                                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                                     warn!(skipped, "collaboration listener fell behind on task events");
+                                    // The count the warn carries is gone once the
+                                    // log line ages out; the counter is what a
+                                    // reader can still ask "did this ever happen"
+                                    // against, now that the age gauge alone cannot
+                                    // tell idle from a loop that woke and lost.
+                                    crate::record_consumer_lag(
+                                        &state.metrics_backend,
+                                        crate::LAG_CONSUMER_COLLABORATION_LISTENER,
+                                        skipped,
+                                    )
+                                    .await;
                                 }
                                 // 生产者没了：再等也等不到事件，这个循环的活干完了。
                                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {

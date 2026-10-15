@@ -233,19 +233,32 @@ pub async fn stream_handler(
     };
 
     let rx = tx.subscribe();
-    let stream = futures::stream::unfold(rx, |mut rx| async move {
-        loop {
-            match rx.recv().await {
-                Ok(row) => {
-                    let data = serde_json::to_string(&row).unwrap_or_default();
-                    let event = Ok::<_, std::convert::Infallible>(Event::default().data(data));
-                    return Some((event, rx));
+    let lag_metrics = state.metrics_backend.clone();
+    let stream = futures::stream::unfold(rx, move |mut rx| {
+        let lag_metrics = lag_metrics.clone();
+        async move {
+            loop {
+                match rx.recv().await {
+                    Ok(row) => {
+                        let data = serde_json::to_string(&row).unwrap_or_default();
+                        let event = Ok::<_, std::convert::Infallible>(Event::default().data(data));
+                        return Some((event, rx));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "evolution stream lagged, dropping stale rows");
+                        // A browser that fell behind is a reader losing rows, not
+                        // a broken stream; the counter is what turns "the stream
+                        // is up" into "the stream is up and this client missed N".
+                        crate::record_consumer_lag(
+                            &lag_metrics,
+                            crate::LAG_CONSUMER_EVOLUTION_STREAM,
+                            skipped,
+                        )
+                        .await;
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::warn!(skipped, "evolution stream lagged, dropping stale rows");
-                    continue;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
             }
         }
     });

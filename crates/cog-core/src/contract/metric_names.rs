@@ -970,6 +970,29 @@ metric_names! {
     // from "this conversation was lost".
     EVENT_BUS_DROPPED_TOTAL => "cogneva_event_bus_dropped_total",
 
+    // The consumer side of the same bus: how many events a subscriber missed
+    // because it fell behind its broadcast channel.
+    //
+    // The publisher counts what it could not hand out (`..._dropped_total`); this
+    // counts what a subscriber could not keep up with. Both are losses on the
+    // same channel and they want different repairs, so they are two families and
+    // not two cells of one: a drop is the bus refusing, a lag is a reader that
+    // was too slow to take what the bus offered.
+    //
+    // Labelled by `consumer` -- the axis that separates these, the way `cause`
+    // separates the drops. Two consumers falling behind are two incidents with
+    // two owners, so a reader must not sum the label away; the sibling rule's
+    // doctrine (`max by (cause)`, never a bare sum) transfers with only the axis
+    // renamed.
+    //
+    // At the time this was introduced only the gateway's three consumers emit it
+    // (the collaboration listener, the supervisor event cache, and the evolution
+    // stream). The rest of the platform's `Lagged` arms still compute the count
+    // and hand it to a `warn!` with nowhere to read it; each is named in the
+    // memory this family came from. A reader must treat an absent `consumer` as
+    // "that consumer does not publish yet", not as "it never fell behind".
+    EVENT_BUS_LAGGED_TOTAL => "cogneva_event_bus_lagged_total",
+
     // cog-agent — what happened to a tool output too large for the context.
     //
     // Two cells that must be read together. `truncated` says a tool's output did
