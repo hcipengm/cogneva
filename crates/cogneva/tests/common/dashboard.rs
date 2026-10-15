@@ -179,7 +179,10 @@ mod tests {
       "templating": { "list": [ { "name": "pod", "type": "textbox" } ] }
     }
 "#;
-        let got: Vec<(&str, &str)> = metric_exprs(text)
+        // 解析结果先绑一次：`Vec<PanelExpr>` 里的字段是 String，直接对临时值取
+        // 引用会在这一句结束时就悬空，而这个测试是唯一读深度归属的地方。
+        let panels = metric_exprs(text);
+        let got: Vec<(&str, &str)> = panels
             .iter()
             .map(|p| (p.panel_type.as_str(), p.expr.as_str()))
             .collect();
