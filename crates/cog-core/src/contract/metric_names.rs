@@ -988,13 +988,26 @@ metric_names! {
     // At the time this was introduced only the gateway's three consumers emitted
     // it (the collaboration listener, the supervisor event cache, and the
     // evolution stream) while the rest of the platform's `Lagged` arms computed
-    // the count and handed it to a `warn!` with nowhere to read it. Every
-    // production arm that has a metrics backend now carries it, and two of the
-    // arms that had none were `while let Ok(..)` loops that read a lag as "the
+    // the count and handed it to a `warn!` with nowhere to read it. As of
+    // 2026-10-15 the tree holds 17 real arms (counted line by line:
+    // `grep -rn "RecvError::Lagged" --include=*.rs crates/` minus the prose
+    // lines), of which 12 record here, over ten `consumer` values: the three
+    // above, the hook forwarder, the memory ingestor, the trace collector, the
+    // supervisor's event aggregator, its autonomous event loop, its alert store,
+    // the alert bridge, and the observability event stream (two arms, the
+    // Postgres and the in-memory gateway, deliberately one consumer value).
+    // Five do not, and each for a reason that is not an omission: two are
+    // `#[cfg(test)]` mocks, two are the development stream backend in
+    // `cog-stream` (no metrics backend in that crate at all), and one is
+    // `EventAggregator::next_event`, which has no callers. Two of the arms that
+    // had no counter were also `while let Ok(..)` loops that read a lag as "the
     // channel closed" and exited -- a consumer that swallowed its own death.
-    // A reader must still treat an absent `consumer` as "that consumer does not
-    // publish yet", not as "it never fell behind", because that is how a
-    // consumer in a crate with no metrics backend reads.
+    // Write the count as a count with a date rather than as a rule over "every
+    // production arm": a rule's denominator is chosen by the rule ("an arm that
+    // has a backend" is "an arm already wired"), so it is true however many arms
+    // are missed and reads like a census. A reader must treat an absent
+    // `consumer` as "that consumer does not publish yet", not as "it never fell
+    // behind".
     EVENT_BUS_LAGGED_TOTAL => "cogneva_event_bus_lagged_total",
 
     // The same channel's other direction: what a subscriber actually took. Sits

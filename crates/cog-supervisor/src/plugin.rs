@@ -150,6 +150,13 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
 
         let scheduler_gate = Arc::new(crate::SchedulerGate::new());
 
+        // Resolved once and cloned: the alert store's consumer loop below needs
+        // the same handle and runs in a task of its own, and passing this call
+        // straight into `with_metrics` moved it out of this scope -- which is
+        // how that loop came to be the one production `Lagged` arm with nowhere
+        // to say what it missed.
+        let metrics = ctx.consume_service::<dyn cog_core::MetricsBackend>();
+
         let mut supervisor = crate::Supervisor::new(
             supervisor_config.into(),
             supervisor_registry.clone(),
@@ -167,7 +174,7 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
         // The per-pass outcome reading needs the metrics backend; this plugin
         // declares `storage` in its descriptor, so that backend is published
         // before this `init` runs and the handle is available here.
-        .with_metrics(ctx.consume_service::<dyn cog_core::MetricsBackend>());
+        .with_metrics(metrics.clone());
         if let Some(classifier) = fault_classifier {
             supervisor = supervisor.with_fault_classifier(classifier);
         }
@@ -179,7 +186,12 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
         let alert_store = Arc::new(crate::AlertStore::with_max_alerts(alert_history_max));
         let alert_event_rx = supervisor.subscribe();
         let alert_store_for_task = alert_store.clone();
-        tokio::spawn(async move { alert_store_for_task.run(alert_event_rx).await });
+        let alert_lag_metrics = metrics.clone();
+        tokio::spawn(async move {
+            alert_store_for_task
+                .run(alert_event_rx, alert_lag_metrics)
+                .await
+        });
 
         // ── Publish everything ──
         ctx.publish_service(supervisor.clone() as Arc<dyn cog_core::Supervisor>);

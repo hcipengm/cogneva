@@ -25,6 +25,12 @@ pub const LAG_CONSUMER_SUPERVISOR_EVENT_AGGREGATOR: &str = "supervisor_event_agg
 /// 与聚合器分开命名，因为它们是两个独立的订阅：一条落后不代表另一条落后。
 pub const LAG_CONSUMER_AUTONOMOUS_EVENT_LOOP: &str = "autonomous_event_loop";
 
+/// 告警存储：读 supervisor 发布的 `SupervisorEvent` 广播、把值得告警的事件留在内存表里。
+///
+/// 它与上面两条读的**不是同一条广播**（那条是 gateway 发的事件，这条是 supervisor
+/// 自己的事件），所以它落后与它们落后是两件事。
+pub const LAG_CONSUMER_SUPERVISOR_ALERT_STORE: &str = "supervisor_alert_store";
+
 /// 记下消费者落后广播、丢掉 `skipped` 条事件这件事。
 ///
 /// 没有后端不是错误（嵌入式运行就没有），写失败只 `warn!`：事件已经丢了，为了

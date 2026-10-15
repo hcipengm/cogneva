@@ -102,6 +102,14 @@ pub fn spawn_collaboration_listener(
                                     // dependents is work taken that leaves no link
                                     // behind, so the link count alone would read
                                     // this loop as idle while it is working.
+                                    //
+                                    // 这句在 `task_event_rx` 的锁里——那把锁从
+                                    // `recv()` 一直握到 handler 结束，所以这里的
+                                    // 一次存储往返是串在消费路径上的：它给这条环
+                                    // 加的那点延迟，正好也是 `Lagged` 的成因。任务
+                                    // 事件低频，代价可以接受；但读这个 rate 的人要
+                                    // 知道它是「通道载了多少」的下界，且写变慢时它
+                                    // 与 lagged 会一起动。
                                     crate::record_consumer_consumed(
                                         &state.metrics_backend,
                                         crate::LAG_CONSUMER_COLLABORATION_LISTENER,

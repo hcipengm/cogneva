@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
 use cog_core::{AlertSeverity, SupervisorEvent};
@@ -47,7 +47,11 @@ impl AlertStore {
     }
 
     /// Subscribe to a SupervisorEvent broadcast channel and persist alert-worthy events.
-    pub async fn run(&self, mut rx: broadcast::Receiver<SupervisorEvent>) {
+    pub async fn run(
+        &self,
+        mut rx: broadcast::Receiver<SupervisorEvent>,
+        metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
+    ) {
         // `Lagged` 也是一个 `Err`：把它与 `Closed` 一起读成「订阅结束」，这条环就
         // 会在一次普通背压之后静静退出，而告警从此不再落库——从外面看与「这段时间
         // 没有值得告警的事」一模一样。丢几条与不再订阅是两种故障，分开写。
@@ -56,6 +60,12 @@ impl AlertStore {
                 Ok(event) => event,
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     tracing::warn!(skipped, "alert store fell behind; it keeps consuming");
+                    crate::consumer_lag::record_consumer_lag(
+                        &metrics,
+                        crate::consumer_lag::LAG_CONSUMER_SUPERVISOR_ALERT_STORE,
+                        skipped,
+                    )
+                    .await;
                     continue;
                 }
                 Err(broadcast::error::RecvError::Closed) => break,

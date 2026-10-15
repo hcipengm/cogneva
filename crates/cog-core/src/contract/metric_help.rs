@@ -836,7 +836,18 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          gone write the same flat line -- so the two are told apart by their \
          producer, not by this series alone. It is registered as a debt: no \
          alert rule or panel reads it yet, and the entry in the reader census \
-         says so.",
+         says so. Two things a reader has to carry. The unit is one event, so a \
+         consumer that wants to count whole passes has to mint its own name \
+         rather than publish here: mixing per-event and per-pass under one name \
+         makes `rate()` mean different things per label value, and two series of \
+         the same family stop being comparable. And the increment is written by \
+         the consumer while it is consuming -- for the collaboration listener, \
+         under the same lock that is held from the receive through the handler \
+         -- so the store round trip sits on the consumption path. A rate read \
+         here is therefore a floor on what the channel carried, not the channel's \
+         throughput, and a store that slows down moves this series and the lag \
+         beside it in opposite directions, which means the two are not two \
+         independent readings of a failure but one event seen twice.",
     ),
     (
         crate::metric_names::TOOL_OUTPUT_FETCH_BUDGET_EXHAUSTED_TOTAL.as_str(),
