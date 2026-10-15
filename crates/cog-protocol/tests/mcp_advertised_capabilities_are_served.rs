@@ -107,8 +107,12 @@ fn dispatch_arms(src: &str) -> BTreeSet<String> {
 
 fn server_source() -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp.rs");
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("the server source has to be readable at {}: {e}", path.display()))
+    std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "the server source has to be readable at {}: {e}",
+            path.display()
+        )
+    })
 }
 
 fn server() -> McpServer {
@@ -163,10 +167,7 @@ async fn the_dispatch_answers_exactly_the_declared_methods() {
             .iter()
             .find(|(name, _)| *name == ident)
             .unwrap_or_else(|| panic!("{ident} has to be declared in src/mcp.rs"));
-        assert_eq!(
-            value.1, method,
-            "{ident} has to hold the method's own name"
-        );
+        assert_eq!(value.1, method, "{ident} has to hold the method's own name");
     }
 }
 
@@ -294,7 +295,11 @@ fn dropping_an_arm_makes_the_dispatch_and_the_declaration_disagree() {
         "the mutation's anchor has to be present, or the control below proves nothing"
     );
     let mutated = src.replace(anchor, "");
-    assert_eq!(mutated.len(), src.len() - anchor.len(), "the mutation applied");
+    assert_eq!(
+        mutated.len(),
+        src.len() - anchor.len(),
+        "the mutation applied"
+    );
 
     let after = dispatch_arms(&mutated);
     let expected = ident_set_of_served_methods();
