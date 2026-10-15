@@ -100,3 +100,5 @@ crates/cog-collaboration/src/squad/pge/types.rs	single-axis	TaskSpec
 crates/cog-gateway/src/git_identity.rs	single-axis	spawn_git_identity_bootstrap
 crates/bootstrap/src/lib.rs	single-axis	ManagementPlan
 crates/cog-storage/src/mem/core_backends.rs	exempt	test-harness
+crates/cogneva/src/backup.rs	single-axis	run_backup
+crates/cog-observability/src/plugin.rs	single-axis	ObservabilityPlugin
