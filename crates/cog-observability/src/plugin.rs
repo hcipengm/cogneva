@@ -568,7 +568,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                     let bridge_stop = ctx
                         .consume::<cog_core::ShutdownSignal>()
                         .map(|s| (*s).clone())
-                        .unwrap_or_else(cog_core::ShutdownSignal::new);
+                        .unwrap_or_default();
                     let bridged = spawn_alert_bridge(
                         alert_channels.clone(),
                         alert_timeout,

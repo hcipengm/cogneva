@@ -246,7 +246,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             // 信号，语义等同于「没有人给过它停的办法」。
             &ctx.consume::<cog_core::ShutdownSignal>()
                 .map(|s| (*s).clone())
-                .unwrap_or_else(cog_core::ShutdownSignal::new),
+                .unwrap_or_default(),
         )
         .await
         .map_err(|e| cog_core::SFError::Config(format!("gateway state build failed: {}", e)))?;
@@ -360,7 +360,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
                     let forwarder_stop = ctx
                         .consume::<cog_core::ShutdownSignal>()
                         .map(|s| (*s).clone())
-                        .unwrap_or_else(cog_core::ShutdownSignal::new);
+                        .unwrap_or_default();
                     crate::hook_forwarder::HookToWsForwarder::spawn(
                         hook_engine.clone(),
                         (*event_tx).clone(),

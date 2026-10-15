@@ -208,7 +208,7 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
         let alert_stop = ctx
             .consume::<cog_core::ShutdownSignal>()
             .map(|s| (*s).clone())
-            .unwrap_or_else(cog_core::ShutdownSignal::new);
+            .unwrap_or_default();
         drop(cog_core::loop_health::spawn(
             ALERT_STORE_LOOP,
             cog_core::loop_health::Cadence::EventDriven,
