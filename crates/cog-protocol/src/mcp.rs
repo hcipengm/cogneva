@@ -12,6 +12,80 @@ use std::sync::Arc;
 // MCP Server
 // ==========================================================================
 
+// ─── 服务端应答哪些方法，以及对外声明了哪些能力 ──────────────────────────────
+//
+// 这两件事过去各写各的：派发是一个 `match` 字面量，`initialize` 的应答体里
+// `"capabilities": {"tools": {}}` 是另一个字面量。于是「对外声明」与「实际应答」
+// 可以各自漂移——补一个 `resources/list` 的应答臂，名片照旧只报 tools；把两个
+// tools 臂删掉，名片照旧报 tools。对端照着名片动作，看到的是「能力列表」与
+// 「真能调用的东西」不符。
+//
+// 修法与 A2A 名片那一处同形：**声明由端点算出**，不由函数体里的字面量给出。
+// 方法名只有这一份拼写，派发与声明都引它；能力表列出每项能力由哪些方法支撑，
+// `initialize` 的 `capabilities` 逐项从表算出。如实报关的能力（本服务端不支持的）
+// 形状是**不写这一行**，与写在函数体里的 `false`/`{}` 读起来一样，但补上端点
+// 那天会自己变亮。
+
+/// `initialize` —— 建连握手。MCP 规定每个服务端都答它。
+pub const METHOD_INITIALIZE: &str = "initialize";
+/// `ping` —— 活性探测。同上，协议级方法，不是客户端可选的能力。
+pub const METHOD_PING: &str = "ping";
+/// `tools/list`。
+pub const METHOD_TOOLS_LIST: &str = "tools/list";
+/// `tools/call`。
+pub const METHOD_TOOLS_CALL: &str = "tools/call";
+
+/// 服务端对外声明的一项能力：名字，以及支撑它的那些方法。
+///
+/// **没有方法支撑的能力不进这张表**：写进来就等于代表一个从未实现的端点宣布它
+/// 做成了。
+pub struct AdvertisedCapability {
+    pub capability: &'static str,
+    pub methods: &'static [&'static str],
+}
+
+/// 名片上宣称的能力。今天只有 `tools` 一项，它由 `tools/list` 与 `tools/call`
+/// 两个方法支撑——两个都在，这一项才亮。
+pub const ADVERTISED_CAPABILITIES: &[AdvertisedCapability] = &[AdvertisedCapability {
+    capability: "tools",
+    methods: &[METHOD_TOOLS_LIST, METHOD_TOOLS_CALL],
+}];
+
+/// 服务端应答、但**不是**「客户端可选的能力」的那几个方法：协议本身要求每个
+/// 服务端都答的握手与探活。它们进不了能力表（没有任何客户端会去开启它们），但
+/// 它们是应答集的一部分，所以要有名字，否则「应答集＝声明集」这条不变式会把它
+/// 们算成没声明过的方法。
+pub const NON_CAPABILITY_METHODS: &[&str] = &[METHOD_INITIALIZE, METHOD_PING];
+
+/// 服务端应答的方法全集：声明出来的能力所支撑的方法，加协议级的那些。
+///
+/// 派发只许应答案集里的名字，而这个名字集由上面两处声明拼出——于是一边加应答臂
+/// 一边忘声明这件事，在集合上就已经不成立。
+pub fn served_methods() -> Vec<&'static str> {
+    let mut methods: Vec<&'static str> = ADVERTISED_CAPABILITIES
+        .iter()
+        .flat_map(|capability| capability.methods.iter().copied())
+        .chain(NON_CAPABILITY_METHODS.iter().copied())
+        .collect();
+    methods.sort_unstable();
+    methods.dedup();
+    methods
+}
+
+/// `initialize` 应答里的 `capabilities` 对象，逐项从 [`ADVERTISED_CAPABILITIES`]
+/// 算出。
+///
+/// 每项的值是空对象：MCP 里子字段（如 `listChanged`）都是可选的，本服务端一个
+/// 都不提供；写 `{}` 是「这项能力在，但它没有可选项」，与「这项能力不在」是
+/// 两件事——后者是键根本不出现。
+pub fn capabilities_json() -> serde_json::Value {
+    let mut declared = serde_json::Map::new();
+    for capability in ADVERTISED_CAPABILITIES {
+        declared.insert(capability.capability.to_string(), serde_json::json!({}));
+    }
+    serde_json::Value::Object(declared)
+}
+
 /// MCP Server 实现 — 暴露 cogneva tools 为 MCP tools。
 pub struct McpServer {
     tools: Vec<ToolDefinition>,
@@ -95,6 +169,10 @@ impl McpServer {
     ///   **正常应答**。把它写成协议错误，等于告诉调用方「你请求的方法不存在」。
     /// - **解析错误**：整个消息不是 JSON —— 那时连 `id` 都不存在，只能按协议的
     ///   `-32700` 用 `id: null` 回，见 [`crate::transport::serve`]。
+    ///
+    /// 下面 `match` 的每个模式都取 [`served_methods`] 里的那个常量，不写第二遍
+    /// 方法名——应答集与声明集共用一个拼写，是「对外声明的能力与实际应答一致」
+    /// 这条不变式的落点：多一个应答臂就多一个名字，而这个名字必须先在某处声明过。
     pub async fn handle(&self, message: &serde_json::Value) -> Option<serde_json::Value> {
         let Some(id) = message.get("id").cloned() else {
             // 通知：`notifications/initialized` 就在这一类里，它本就无应答。
@@ -105,23 +183,23 @@ impl McpServer {
         };
 
         match method {
-            "initialize" => Some(result_reply(
+            METHOD_INITIALIZE => Some(result_reply(
                 id,
                 serde_json::json!({
                     "protocolVersion": crate::transport::MCP_PROTOCOL_VERSION,
-                    "capabilities": {"tools": {}},
+                    "capabilities": capabilities_json(),
                     "serverInfo": {
                         "name": "cogneva",
                         "version": env!("CARGO_PKG_VERSION"),
                     },
                 }),
             )),
-            "ping" => Some(result_reply(id, serde_json::json!({}))),
-            "tools/list" => Some(result_reply(
+            METHOD_PING => Some(result_reply(id, serde_json::json!({}))),
+            METHOD_TOOLS_LIST => Some(result_reply(
                 id,
                 serde_json::json!({"tools": self.list_tools()}),
             )),
-            "tools/call" => Some(self.call_reply(id, message).await),
+            METHOD_TOOLS_CALL => Some(self.call_reply(id, message).await),
             other => Some(error_reply(
                 id,
                 -32601,
