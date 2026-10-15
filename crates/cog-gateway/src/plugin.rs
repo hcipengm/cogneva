@@ -242,6 +242,11 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             &audit_stream,
             &taste_intent_sink,
             &llm_usage_reader,
+            // 拿不到就是这套部署没有发布停机信号，那它拿到的是一个永不触发的
+            // 信号，语义等同于「没有人给过它停的办法」。
+            &ctx.consume::<cog_core::ShutdownSignal>()
+                .map(|s| (*s).clone())
+                .unwrap_or_else(cog_core::ShutdownSignal::new),
         )
         .await
         .map_err(|e| cog_core::SFError::Config(format!("gateway state build failed: {}", e)))?;
@@ -346,11 +351,22 @@ impl cog_core::SystemPlugin for GatewayPlugin {
                 ctx.consume::<tokio::sync::broadcast::Sender<cog_core::AgentEvent>>()
             {
                 if let Some(publisher) = ctx.consume_service::<dyn cog_core::EventPublisher>() {
+                    // 停机信号：拿得到就挂在进程的停机信号上（触发后退出的那一次
+                    // 不算「循环死了」）；拿不到就是这套部署没有发布停机信号，
+                    // 那它拿到的是一个永不触发的信号，语义等同于「没有人给过它
+                    // 停的办法」。两种情况都比「退出不可见」好。
+                    // `consume` 交回的是 `Arc<ShutdownSignal>`（发布侧存的就是那个），
+                    // 这里取信号本身，所以多一层解引用克隆。
+                    let forwarder_stop = ctx
+                        .consume::<cog_core::ShutdownSignal>()
+                        .map(|s| (*s).clone())
+                        .unwrap_or_else(cog_core::ShutdownSignal::new);
                     crate::hook_forwarder::HookToWsForwarder::spawn(
                         hook_engine.clone(),
                         (*event_tx).clone(),
                         Some(publisher),
                         ctx.consume_service::<dyn cog_core::MetricsBackend>(),
+                        forwarder_stop,
                     );
                 }
             }

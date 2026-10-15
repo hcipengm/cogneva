@@ -561,6 +561,14 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                         info!("alert outlets configured but no HttpClient; alerts persist only");
                     }
                     let persistent_store = alert_store.is_some();
+                    // 停机信号：拿得到就挂在进程的停机信号上（触发后退出的那一次
+                    // 不算「循环死了」）；拿不到就是这套部署没有发布停机信号，
+                    // 那它拿到的是一个永不触发的信号，语义等同于「没有人给过它
+                    // 停的办法」。
+                    let bridge_stop = ctx
+                        .consume::<cog_core::ShutdownSignal>()
+                        .map(|s| (*s).clone())
+                        .unwrap_or_else(cog_core::ShutdownSignal::new);
                     let bridged = spawn_alert_bridge(
                         alert_channels.clone(),
                         alert_timeout,
@@ -568,6 +576,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                         alert_store,
                         &supervisor,
                         ctx.consume_service::<dyn cog_core::MetricsBackend>(),
+                        bridge_stop,
                     );
                     // Report both outlets, not just the HTTP ones. With no
                     // outlet wired the bridge still runs and still persists, so
@@ -965,6 +974,13 @@ fn alert_manager(
 /// `consumer` 标签值，写在 [`cog_core::metric_names::EVENT_BUS_LAGGED_TOTAL`] 上。
 const LAG_CONSUMER_ALERT_BRIDGE: &str = "alert_bridge";
 
+/// 循环名：告警桥那条消费环，报在 `cogneva_loop_*` 的 `loop` 标签上。
+///
+/// 与它落后时写的 `consumer` 标签值（[`LAG_CONSUMER_ALERT_BRIDGE`]）后半段同字面：
+/// 两个面说的是同一个消费者，前缀标的是它在哪个组件里（与 `observability_*`
+/// 那族循环名同约定）。
+pub const ALERT_BRIDGE_LOOP: &str = "observability_alert_bridge";
+
 fn spawn_alert_bridge(
     channels: Vec<AlertChannel>,
     timeout_secs: u64,
@@ -972,52 +988,81 @@ fn spawn_alert_bridge(
     store: Option<Arc<PostgresAlertStore>>,
     supervisor: &Arc<dyn cog_core::Supervisor>,
     metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
+    stop: cog_core::ShutdownSignal,
 ) -> Option<Arc<crate::alerts::AlertManager>> {
     let manager = alert_manager(Vec::new(), &channels, timeout_secs, http_client);
-    let mut alert_rx = supervisor.subscribe();
+    // 订阅一次、跨重启共用：body 每次尝试都重建，重新订阅会落在通道当前的尾巴上，
+    // 环死期间到达的事件就再也补不回来——而那正是它最该补上的那一段。
+    let alert_rx = Arc::new(tokio::sync::Mutex::new(supervisor.subscribe()));
     let manager_for_task = manager.clone();
-    tokio::spawn(async move {
-        // 三种结局分开写：`Lagged` 也是一个 `Err`，`while let Ok(..)` 会把它读成
-        // 「订阅结束」，于是这条桥静静退出——告警**从此不再落库**，而数据库里那张
-        // 表看起来与「这段时间没有告警」一模一样。这条桥没有别的存活读数。
-        loop {
-            let event = match alert_rx.recv().await {
-                Ok(event) => event,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::warn!(skipped, "alert bridge fell behind; it keeps consuming");
-                    if let Some(backend) = metrics.as_ref() {
-                        let mut labels = std::collections::HashMap::new();
-                        labels.insert(
-                            "consumer".to_string(),
-                            LAG_CONSUMER_ALERT_BRIDGE.to_string(),
-                        );
-                        if let Err(e) = backend
-                            .record_counter(
-                                cog_core::metric_names::EVENT_BUS_LAGGED_TOTAL,
-                                skipped as f64,
-                                labels,
-                            )
-                            .await
-                        {
-                            tracing::warn!(error = %e, "alert bridge: could not record the events it missed");
+    // 这条桥以前是个裸 `tokio::spawn`：它退出之后读数面上什么都没有——**告警从此
+    // 不再落库**，而数据库里那张表看起来与「这段时间没有告警」同形。登记之后，
+    // 它的退出落进 `cogneva_loop_deaths_total`。
+    let _bridge_loop = cog_core::loop_health::spawn(
+        ALERT_BRIDGE_LOOP,
+        cog_core::loop_health::Cadence::EventDriven,
+        stop.clone(),
+        move |beat| {
+            let alert_rx = Arc::clone(&alert_rx);
+            let manager_for_task = manager_for_task.clone();
+            let store = store.clone();
+            let metrics = metrics.clone();
+            let stop = stop.clone();
+            async move {
+                // 三种结局分开写：`Lagged` 也是一个 `Err`，`while let Ok(..)` 会把它读成
+                // 「订阅结束」，于是这条桥静静退出——告警**从此不再落库**，而数据库里那张
+                // 表看起来与「这段时间没有告警」一模一样。这条桥没有别的存活读数。
+                loop {
+                    // 每一轮都盖一次章，无论队列里有没有东西：事件驱动的环大部分时间
+                    // 停在空队列上，只在有事件时才盖，报出来的是队列的安静。
+                    beat.beat();
+                    let received = {
+                        let mut rx = alert_rx.lock().await;
+                        tokio::select! {
+                            biased;
+                            _ = stop.wait() => return,
+                            received = rx.recv() => received,
                         }
+                    };
+                    let event = match received {
+                        Ok(event) => event,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(skipped, "alert bridge fell behind; it keeps consuming");
+                            if let Some(backend) = metrics.as_ref() {
+                                let mut labels = std::collections::HashMap::new();
+                                labels.insert(
+                                    "consumer".to_string(),
+                                    LAG_CONSUMER_ALERT_BRIDGE.to_string(),
+                                );
+                                if let Err(e) = backend
+                                    .record_counter(
+                                        cog_core::metric_names::EVENT_BUS_LAGGED_TOTAL,
+                                        skipped as f64,
+                                        labels,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(error = %e, "alert bridge: could not record the events it missed");
+                                }
+                            }
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    };
+                    let alerts = supervisor_event_to_alert_events(&event);
+                    if alerts.is_empty() {
+                        continue;
                     }
-                    continue;
+                    if let Some(manager) = &manager_for_task {
+                        manager.notify(&alerts).await;
+                    }
+                    if let Some(store) = &store {
+                        persist_alerts(store, &alerts).await;
+                    }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            };
-            let alerts = supervisor_event_to_alert_events(&event);
-            if alerts.is_empty() {
-                continue;
             }
-            if let Some(manager) = &manager_for_task {
-                manager.notify(&alerts).await;
-            }
-            if let Some(store) = &store {
-                persist_alerts(store, &alerts).await;
-            }
-        }
-    });
+        },
+    );
     manager
 }
 

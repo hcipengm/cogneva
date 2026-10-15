@@ -6,7 +6,7 @@ use cog_core::{AgentEvent, ObservabilityGateway, OrchestratorControl, StateBacke
 use tokio::sync::{broadcast, watch};
 use tracing::{debug, info, warn};
 
-use crate::autonomous::{AutonomousCollaborator, AutonomousConfig};
+use crate::autonomous::{AutonomousCollaborator, AutonomousConfig, AUTONOMOUS_EVENT_LOOP};
 
 /// Loop name reported through the background-loop liveness family.
 pub const SUPERVISOR_LOOP: &str = "supervisor_main";
@@ -560,14 +560,41 @@ impl Supervisor {
         // Spawn autonomous event loop. Outside the supervised body: it is a loop
         // of its own, and rebuilding it per attempt would leave the previous one
         // running with nothing holding its handle.
-        let _autonomous_handle = tokio::spawn({
-            let collaborator = Arc::clone(&self.autonomous);
-            let rx = self.agent_event_rx.resubscribe();
-            let lag_metrics = self.metrics.clone();
-            async move {
-                crate::autonomous::run_autonomous_event_loop(collaborator, rx, lag_metrics).await;
-            }
-        });
+        //
+        // 登记进循环表：它以前是个裸 `tokio::spawn`，退出之后读数面上什么都没有
+        // ——交接与失败恢复从此不再被驱动，而看起来与「没有值得协调的事」同形。
+        // 停机信号与下面那条 supervisor 环同一个：停机时退出的那一次不算「死了」。
+        // 订阅一次、跨重启共用：body 每次尝试都重建，重新订阅会落在通道当前的
+        // 尾巴上，环死期间到达的事件就再也补不回来——而那正是它最该补上的那一段。
+        let autonomous_rx = Arc::new(tokio::sync::Mutex::new(self.agent_event_rx.resubscribe()));
+        // 这条环的停条件也取自 `supervisor_stop`，但那个信号下面那条环还要用，
+        // 所以这里先克隆一份再移进闭包。
+        let autonomous_stop = supervisor_stop.clone();
+        // 登记名写成裸标识符（用上面导入的常量）：门要求登记名来自一个 `*_LOOP`
+        // 声明，路径形式的 `crate::…::NAME` 会被读成「在调用点现写的字面量」。
+        let _autonomous_handle = cog_core::loop_health::spawn(
+            AUTONOMOUS_EVENT_LOOP,
+            cog_core::loop_health::Cadence::EventDriven,
+            autonomous_stop.clone(),
+            {
+                let this = Arc::clone(&self);
+                move |beat| {
+                    let this = Arc::clone(&this);
+                    let rx = Arc::clone(&autonomous_rx);
+                    let stop = autonomous_stop.clone();
+                    async move {
+                        crate::autonomous::run_autonomous_event_loop(
+                            Arc::clone(&this.autonomous),
+                            rx,
+                            this.metrics.clone(),
+                            stop,
+                            beat,
+                        )
+                        .await;
+                    }
+                }
+            },
+        );
 
         info!(
             "Supervisor starting (intervals: health={:?}, quota={:?}, rebalance={:?}, event={:?})",

@@ -8,6 +8,13 @@ use tracing::{info, warn};
 /// Holder so `watch::Sender<SupervisorConfig>` can be stored in [`cog_core::PluginContext`].
 pub struct SupervisorConfigTxHolder(pub tokio::sync::watch::Sender<crate::SupervisorConfig>);
 
+/// 循环名：告警存储那条消费环，报在 `cogneva_loop_*` 的 `loop` 标签上。
+///
+/// 与它落后时写的 `consumer` 标签值（
+/// [`crate::consumer_lag::LAG_CONSUMER_SUPERVISOR_ALERT_STORE`]）同字面：两个面
+/// 说的是同一个消费者，字面一致才能把「它丢了事件」和「它停了」并排读。
+pub const ALERT_STORE_LOOP: &str = "supervisor_alert_store";
+
 /// Supervisor plugin that self-assembles the supervision lifecycle.
 pub struct SupervisorPlugin {
     initialized: bool,
@@ -184,14 +191,36 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
 
         // ── Build alert store ──
         let alert_store = Arc::new(crate::AlertStore::with_max_alerts(alert_history_max));
-        let alert_event_rx = supervisor.subscribe();
+        // 订阅一次、跨重启共用：重启时重新订阅会落在通道当前的尾巴上，环死
+        // 期间到达的告警就再也补不回来——而那正是它最该补上的那一段。
+        let alert_event_rx = Arc::new(tokio::sync::Mutex::new(supervisor.subscribe()));
         let alert_store_for_task = alert_store.clone();
         let alert_lag_metrics = metrics.clone();
-        tokio::spawn(async move {
-            alert_store_for_task
-                .run(alert_event_rx, alert_lag_metrics)
-                .await
-        });
+        // 这条环以前是个裸 `tokio::spawn`：它退出（订阅关闭）之后读数面上什么
+        // 都没有——内存里那张告警表不再更新，而看起来与「这段时间没有值得告警
+        // 的事」同形。登记之后它的退出落进 `cogneva_loop_deaths_total`。
+        //
+        // 停机信号取自插件上下文；取不到就是这套部署没有发布停机信号，那么它
+        // 拿到的是一个永不触发的信号，语义等同于「没有人给过它停的办法」——
+        // 每一次退出都算死。两种情况都比「退出不可见」好。
+        // `consume` 交回的是 `Arc<ShutdownSignal>`（发布侧存的就是那个），这里取的
+        // 是信号本身，所以多一层解引用克隆。
+        let alert_stop = ctx
+            .consume::<cog_core::ShutdownSignal>()
+            .map(|s| (*s).clone())
+            .unwrap_or_else(cog_core::ShutdownSignal::new);
+        drop(cog_core::loop_health::spawn(
+            ALERT_STORE_LOOP,
+            cog_core::loop_health::Cadence::EventDriven,
+            alert_stop.clone(),
+            move |beat| {
+                let store = alert_store_for_task.clone();
+                let rx = Arc::clone(&alert_event_rx);
+                let lag_metrics = alert_lag_metrics.clone();
+                let stop = alert_stop.clone();
+                async move { store.run(rx, lag_metrics, stop, beat).await }
+            },
+        ));
 
         // ── Publish everything ──
         ctx.publish_service(supervisor.clone() as Arc<dyn cog_core::Supervisor>);

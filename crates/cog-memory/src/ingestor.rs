@@ -15,6 +15,17 @@ use crate::IngestConfig;
 pub const MEMORY_RECONCILE_LOOP: &str = "memory_ingest_reconcile";
 /// Loop name reported through the background-loop liveness family.
 pub const MEMORY_BUS_CLAIM_LOOP: &str = "memory_ingest_bus_claim";
+/// 广播模式的接收环：读 `AgentEvent` 广播、把 `AgentEnd` 入队。
+///
+/// 与它落后时写的 `consumer` 标签值（[`LAG_CONSUMER_MEMORY_INGESTOR`]）后半段
+/// 同字面：两个面说的是同一个消费者，前缀标的是它在哪个组件里。
+pub const MEMORY_INGEST_EVENTS_LOOP: &str = "memory_ingest_events";
+/// 总线模式的消费环：从持久事件面按消费组拉消息、归档+抽取完才 ack。
+///
+/// 与广播模式的接收环分开命名：它们是两条互不相干的订阅，而且总线上没有
+/// `Lagged`——背压在那里是流的错误与重订阅，所以这条环在
+/// `cogneva_event_bus_lagged_total` 上没有对应的 `consumer` 值。
+pub const MEMORY_BUS_CONSUME_LOOP: &str = "memory_ingest_bus_consume";
 
 /// `memory_operations_total` 上「这次没抽，因为同一份 raw 已有人在办」的
 /// operation 取值。放在这里而不是指标名常量里：它不是一条新的操作，是抽取
@@ -772,7 +783,7 @@ impl MemoryIngestor {
     /// 抽取（两次 LLM 调用，分钟级）由 worker 池按配置并发在队列后做。爆发
     /// 期积压变长、按 LLM 吞吐自然排空，事件本身不丢。进程崩溃只丢"已入队
     /// 未归档"的一小段，启动对账扫描会把已归档未抽取的 raw 补回来。
-    pub fn spawn(self, mut event_rx: broadcast::Receiver<AgentEvent>) -> mpsc::Sender<()> {
+    pub fn spawn(self, event_rx: broadcast::Receiver<AgentEvent>) -> mpsc::Sender<()> {
         let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
         let (job_tx, job_rx) = mpsc::unbounded_channel::<QueuedRaw>();
         let backlog = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -791,54 +802,113 @@ impl MemoryIngestor {
             loop_stop.clone(),
         );
 
-        tokio::spawn(async move {
-            info!("MemoryIngestor started");
-            inner.pull_gate.seed_gate_holders().await;
-            if inner.config.startup_reconcile {
-                // 与周期对账同一条判据：扫描照跑（它是纯 SQL 加对象存储读，
-                // 产出的是积压量这个观测），闸门关着就只报不入队——往一个已知
-                // 接不住的上游灌活，换来的是重试与死信，不是进度。积压本身现在
-                // 有 gauge 报出来，窗口逼近时看得见。
-                let upstream_available = inner.pull_gate.blocked_for().await.is_none();
-                inner.reconcile(&job_tx, &backlog, upstream_available).await;
-            }
-            loop {
-                tokio::select! {
-                    result = event_rx.recv() => {
-                        match result {
-                            Ok(AgentEvent::AgentEnd { agent_id, messages, .. }) => {
-                                let raw = build_raw(&agent_id, &messages);
-                                enqueue(&job_tx, &backlog, QueuedRaw { raw, ack: None }, inner.config.backlog_warn_at);
-                            }
-                            Ok(_) => {}
-                            Err(broadcast::error::RecvError::Lagged(n)) => {
-                                // 接收循环零 I/O 之后这里理论上到不了；真出现
-                                // 说明上游事件速率高过单条 select 的分发能力，
-                                // 必须响亮可见。
-                                warn!("MemoryIngestor lagged, skipped {} events", n);
-                                // 日志会老化，计数器不会：这是「这个环醒过并丢了行」
-                                // 那半条读数。这个订阅环没有登记进 loop_health，
-                                // 所以它连一条 `cogneva_loop_*` 序列都没有——在它
-                                // 之前，这个环要是停了，读数面上什么都没有。
-                                inner.record_consumer_lag(n).await;
-                            }
-                            Err(broadcast::error::RecvError::Closed) => {
-                                info!("AgentEvent broadcast closed; MemoryIngestor stopping");
-                                break;
+        // 接收环的停条件自成一个信号，调用方那个停止句柄折进来一次：句柄不是
+        // `Clone`，而下面的 body 每次尝试都重建。折成信号还有一个作用——接收环
+        // 因「广播关闭」退出时**不**触发它，于是那一次退出在循环表里是「死了」，
+        // 而不是被自己顺手写成「停机」。
+        let receive_stop = cog_core::ShutdownSignal::new();
+        {
+            let from_caller = receive_stop.clone();
+            tokio::spawn(async move {
+                // 发出停止与调用方丢弃这个句柄同义：原来的 select 把两件事都读成
+                // 「停」，这里的 `recv()` 也一样——`None` 就是发送端都没了。
+                let _ = stop_rx.recv().await;
+                from_caller.trigger();
+            });
+        }
+
+        // 接收环以前是个裸 `tokio::spawn`：它退出之后读数面上什么都没有——摄取
+        // 从此不再入队，而看起来与「上游没有 AgentEnd」同形。订阅句柄跨重启共用
+        // （重启落在原来的位置上，环死期间的事件仍读得到）。
+        drop(cog_core::loop_health::spawn(
+            MEMORY_INGEST_EVENTS_LOOP,
+            cog_core::loop_health::Cadence::EventDriven,
+            receive_stop.clone(),
+            {
+                let event_rx = Arc::new(tokio::sync::Mutex::new(event_rx));
+                // 队列入口只有这一份，闭包每次尝试把它取走、不还回来：留在闭包里
+                // 的话「关掉入口」就永远关不掉——派发循环要等最后一份发送端被丢弃
+                // 才收尾。取空了就是入口已经关过（上一次尝试走到过结尾，或崩在了
+                // 取走之后），那次尝试没有活可干。
+                let mut job_tx_slot = Some(job_tx);
+                move |beat| {
+                    let job_tx = job_tx_slot.take();
+                    let inner = Arc::clone(&inner);
+                    let backlog = backlog.clone();
+                    let stopping = stopping.clone();
+                    let loop_stop = loop_stop.clone();
+                    let event_rx = Arc::clone(&event_rx);
+                    let stop = receive_stop.clone();
+                    async move {
+                        let Some(job_tx) = job_tx else {
+                            info!("MemoryIngestor queue entry is already closed; nothing to start");
+                            return;
+                        };
+                        info!("MemoryIngestor started");
+                        // 每次尝试都从零开始：种子与启动对账都是幂等的（确定性 raw id
+                        // 让重放幂等），重启一次只是把启动时该做的事再做一遍。
+                        inner.pull_gate.seed_gate_holders().await;
+                        if inner.config.startup_reconcile {
+                            // 与周期对账同一条判据：扫描照跑（它是纯 SQL 加对象存储读，
+                            // 产出的是积压量这个观测），闸门关着就只报不入队——往一个已知
+                            // 接不住的上游灌活，换来的是重试与死信，不是进度。积压本身现在
+                            // 有 gauge 报出来，窗口逼近时看得见。
+                            let upstream_available = inner.pull_gate.blocked_for().await.is_none();
+                            inner.reconcile(&job_tx, &backlog, upstream_available).await;
+                        }
+                        loop {
+                            // 每一轮都盖一次章，无论队列里有没有事件：事件驱动的环大
+                            // 部分时间停在空队列上，只在有事件时才盖，报出来的是队列
+                            // 的安静。
+                            beat.beat();
+                            let result = {
+                                let mut event_rx = event_rx.lock().await;
+                                tokio::select! {
+                                    biased;
+                                    _ = stop.wait() => break,
+                                    result = event_rx.recv() => result,
+                                }
+                            };
+                            match result {
+                                Ok(AgentEvent::AgentEnd {
+                                    agent_id, messages, ..
+                                }) => {
+                                    let raw = build_raw(&agent_id, &messages);
+                                    enqueue(
+                                        &job_tx,
+                                        &backlog,
+                                        QueuedRaw { raw, ack: None },
+                                        inner.config.backlog_warn_at,
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(broadcast::error::RecvError::Lagged(n)) => {
+                                    // 接收循环零 I/O 之后这里理论上到不了；真出现
+                                    // 说明上游事件速率高过单条 select 的分发能力，
+                                    // 必须响亮可见。
+                                    warn!("MemoryIngestor lagged, skipped {} events", n);
+                                    // 日志会老化，计数器不会：这是「这个环醒过并丢了行」
+                                    // 那半条读数。另一半（「它停了」）由现在登记上的这条
+                                    // 循环自己报——`cogneva_loop_deaths_total`。
+                                    inner.record_consumer_lag(n).await;
+                                }
+                                Err(broadcast::error::RecvError::Closed) => {
+                                    // 上游没了：不再触发 `receive_stop`，于是这一次退出
+                                    // 在循环表里算「死了」——生产者没了而进程还活着，
+                                    // 正是该有人知道的那种停。
+                                    info!("AgentEvent broadcast closed; MemoryIngestor stopping");
+                                    break;
+                                }
                             }
                         }
-                    }
-                    _ = stop_rx.recv() => {
-                        info!("MemoryIngestor stopping");
-                        break;
+                        // 关掉入口：派发循环收完残余任务后自然退出，在途抽取跑完。
+                        stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+                        loop_stop.trigger();
+                        drop(job_tx);
                     }
                 }
-            }
-            // 关掉入口：派发循环收完残余任务后自然退出，在途抽取跑完。
-            stopping.store(true, std::sync::atomic::Ordering::SeqCst);
-            loop_stop.trigger();
-            drop(job_tx);
-        });
+            },
+        ));
 
         stop_tx
     }
@@ -958,79 +1028,126 @@ impl MemoryIngestor {
             ));
         }
 
-        tokio::spawn(async move {
-            info!("MemoryIngestor bus consumer started (channel={channel}, group={group})");
-            inner.pull_gate.seed_gate_holders().await;
-            if inner.config.startup_reconcile {
-                // 同 quiescent 启动路径：扫描照跑，闸门关着只报不入队。
-                let upstream_available = inner.pull_gate.blocked_for().await.is_none();
-                inner.reconcile(&job_tx, &backlog, upstream_available).await;
-            }
-            // durable 消费组：已存在时创建是幂等 no-op，失败也不挡订阅——
-            // 订阅失败下面的重订阅循环会接着退避重试。
-            if let Err(e) = bus.create_consumer_group(&channel, &group).await {
-                warn!("Memory ingest create_consumer_group failed (continuing): {e}");
-            }
-            let mut stopped = false;
-            while !stopped {
-                // 消费循环必须自愈：订阅失败/流中断就地退避重订阅，瞬时错误
-                // 绝不终结整个摄取服务。
-                let mut stream = match bus.subscribe(&channel, &group).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        warn!("Memory ingest bus subscribe failed: {e}; retrying in 5s");
-                        tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
-                            _ = stop_rx.recv() => { break; }
+        // 总线消费环的停条件自成一个信号，调用方那个停止句柄折进来一次（它出现
+        // 在两处 select 里，而 body 每次尝试都重建）：折成信号之后每一次尝试拿
+        // 到的停条件是同一个。
+        let bus_consume_stop = cog_core::ShutdownSignal::new();
+        {
+            let from_caller = bus_consume_stop.clone();
+            tokio::spawn(async move {
+                // 同广播模式的接收环：发出停止与调用方丢弃句柄同义。
+                let _ = stop_rx.recv().await;
+                from_caller.trigger();
+            });
+        }
+        // 这条消费环以前是个裸 `tokio::spawn`：它退出之后读数面上什么都没有——
+        // 总线上的消息不再被拉走（红投与 ack_wait 会照常发生），而看起来与「总线
+        // 上没有新消息」同形。它与广播模式那条不是同一条环，各有各的名字。
+        drop(cog_core::loop_health::spawn(
+            MEMORY_BUS_CONSUME_LOOP,
+            cog_core::loop_health::Cadence::EventDriven,
+            bus_consume_stop.clone(),
+            {
+                // 同广播模式的接收环：队列入口取走不还，见那里的说明。
+                let mut job_tx_slot = Some(job_tx);
+                move |beat| {
+                    let job_tx = job_tx_slot.take();
+                    let inner = Arc::clone(&inner);
+                    let backlog = backlog.clone();
+                    let stopping = stopping.clone();
+                    let loop_stop = loop_stop.clone();
+                    let bus = Arc::clone(&bus);
+                    let channel = channel.clone();
+                    let group = group.clone();
+                    let stop = bus_consume_stop.clone();
+                    async move {
+                        let Some(job_tx) = job_tx else {
+                            info!(
+                                "MemoryIngestor queue entry is already closed; nothing to consume"
+                            );
+                            return;
+                        };
+                        info!("MemoryIngestor bus consumer started (channel={channel}, group={group})");
+                        inner.pull_gate.seed_gate_holders().await;
+                        if inner.config.startup_reconcile {
+                            // 同 quiescent 启动路径：扫描照跑，闸门关着只报不入队。
+                            let upstream_available = inner.pull_gate.blocked_for().await.is_none();
+                            inner.reconcile(&job_tx, &backlog, upstream_available).await;
                         }
-                        continue;
-                    }
-                };
-                loop {
-                    tokio::select! {
-                        _ = stop_rx.recv() => {
-                            info!("MemoryIngestor stopping");
-                            stopped = true;
-                            break;
+                        // durable 消费组：已存在时创建是幂等 no-op，失败也不挡订阅——
+                        // 订阅失败下面的重订阅循环会接着退避重试。
+                        if let Err(e) = bus.create_consumer_group(&channel, &group).await {
+                            warn!("Memory ingest create_consumer_group failed (continuing): {e}");
                         }
-                        item = async {
-                            // 闸门关着就不拉：拉下一条就是投递给一个已知接不住
-                            // 的摄取器，消息白白走一遍失败与红投计数，而留在流里
-                            // 什么都不损失。
-                            loop {
-                                if let Some(wait) = inner.pull_gate.blocked_for().await {
-                                    debug!(
-                                        wait_secs = wait.as_secs(),
-                                        "Memory ingest pull paused: LLM upstream unavailable"
+                        let mut stopped = false;
+                        while !stopped {
+                            // 消费循环必须自愈：订阅失败/流中断就地退避重订阅，瞬时错误
+                            // 绝不终结整个摄取服务。
+                            let mut stream = match bus.subscribe(&channel, &group).await {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    warn!(
+                                        "Memory ingest bus subscribe failed: {e}; retrying in 5s"
                                     );
-                                    tokio::time::sleep(wait).await;
+                                    tokio::select! {
+                                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                                        _ = stop.wait() => { break; }
+                                    }
                                     continue;
                                 }
-                                return futures::StreamExt::next(&mut stream).await;
-                            }
-                        } => {
-                            match item {
-                                Some(Ok((id, payload))) => {
-                                    inner.enqueue_bus_payload(&job_tx, &backlog, &bus, &channel, id, &payload);
-                                }
-                                Some(Err(e)) => {
-                                    warn!("Memory ingest bus stream error: {e}; resubscribing");
-                                    break;
-                                }
-                                None => {
-                                    warn!("Memory ingest bus stream closed; resubscribing");
-                                    break;
+                            };
+                            loop {
+                                // 每一轮都盖一次章，无论流里有没有消息：事件驱动的环
+                                // 大部分时间停在空流上，只在有消息时才盖，报出来的是
+                                // 流的安静。
+                                beat.beat();
+                                tokio::select! {
+                                    _ = stop.wait() => {
+                                        info!("MemoryIngestor stopping");
+                                        stopped = true;
+                                        break;
+                                    }
+                                    item = async {
+                                        // 闸门关着就不拉：拉下一条就是投递给一个已知接不住
+                                        // 的摄取器，消息白白走一遍失败与红投计数，而留在流里
+                                        // 什么都不损失。
+                                        loop {
+                                            if let Some(wait) = inner.pull_gate.blocked_for().await {
+                                                debug!(
+                                                    wait_secs = wait.as_secs(),
+                                                    "Memory ingest pull paused: LLM upstream unavailable"
+                                                );
+                                                tokio::time::sleep(wait).await;
+                                                continue;
+                                            }
+                                            return futures::StreamExt::next(&mut stream).await;
+                                        }
+                                    } => {
+                                        match item {
+                                            Some(Ok((id, payload))) => {
+                                                inner.enqueue_bus_payload(&job_tx, &backlog, &bus, &channel, id, &payload);
+                                            }
+                                            Some(Err(e)) => {
+                                                warn!("Memory ingest bus stream error: {e}; resubscribing");
+                                                break;
+                                            }
+                                            None => {
+                                                warn!("Memory ingest bus stream closed; resubscribing");
+                                                break;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
+                        // 关掉入口：派发循环收完残余任务后自然退出，在途抽取跑完。
+                        stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+                        loop_stop.trigger();
+                        drop(job_tx);
                     }
                 }
-            }
-            // 关掉入口：派发循环收完残余任务后自然退出，在途抽取跑完。
-            stopping.store(true, std::sync::atomic::Ordering::SeqCst);
-            loop_stop.trigger();
-            drop(job_tx);
-        });
+            },
+        ));
 
         stop_tx
     }

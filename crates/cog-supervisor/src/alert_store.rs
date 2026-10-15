@@ -47,16 +47,33 @@ impl AlertStore {
     }
 
     /// Subscribe to a SupervisorEvent broadcast channel and persist alert-worthy events.
+    ///
+    /// The receiver is shared rather than owned: the body is rebuilt per attempt,
+    /// and a restart that subscribed afresh would land at the channel's current
+    /// tail, so every alert that arrived while this loop was dead would be gone —
+    /// the one window in which the store most needs to catch up.
     pub async fn run(
         &self,
-        mut rx: broadcast::Receiver<SupervisorEvent>,
+        rx: Arc<tokio::sync::Mutex<broadcast::Receiver<SupervisorEvent>>>,
         metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
+        stop: cog_core::ShutdownSignal,
+        beat: cog_core::loop_health::Beat,
     ) {
         // `Lagged` 也是一个 `Err`：把它与 `Closed` 一起读成「订阅结束」，这条环就
         // 会在一次普通背压之后静静退出，而告警从此不再落库——从外面看与「这段时间
         // 没有值得告警的事」一模一样。丢几条与不再订阅是两种故障，分开写。
         loop {
-            let event = match rx.recv().await {
+            // Stamped every cycle, before the wait: an event-driven loop spends
+            // most of its life parked on an empty queue, and a beat only after
+            // something arrived would report the queue's silence as this loop's.
+            beat.beat();
+            let mut rx = rx.lock().await;
+            let received = tokio::select! {
+                biased;
+                _ = stop.wait() => return,
+                received = rx.recv() => received,
+            };
+            let event = match received {
                 Ok(event) => event,
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     tracing::warn!(skipped, "alert store fell behind; it keeps consuming");
@@ -68,7 +85,7 @@ impl AlertStore {
                     .await;
                     continue;
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Closed) => return,
             };
             if let Some(alert) = Self::event_to_alert(&event) {
                 let mut alerts = self.alerts.lock().unwrap();

@@ -52,18 +52,40 @@ pub struct AutonomousCollaborator {
     meta_learning: Option<Arc<dyn cog_core::MetaLearning>>,
 }
 
+/// 循环名：自主协作环，报在 `cogneva_loop_*` 的 `loop` 标签上。
+///
+/// 与它落后时写的 `consumer` 标签值
+/// （[`crate::consumer_lag::LAG_CONSUMER_AUTONOMOUS_EVENT`]）同字面：两个面
+/// 说的是同一个消费者，字面一致才能把「它丢了事件」和「它停了」并排读。
+pub const AUTONOMOUS_EVENT_LOOP: &str = "autonomous_event_loop";
+
 /// Async event consumer for the autonomous collaborator.
 pub async fn run_autonomous_event_loop(
     collaborator: Arc<AutonomousCollaborator>,
-    mut rx: broadcast::Receiver<cog_core::AgentEvent>,
+    rx: Arc<tokio::sync::Mutex<broadcast::Receiver<cog_core::AgentEvent>>>,
     metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
+    stop: cog_core::ShutdownSignal,
+    beat: cog_core::loop_health::Beat,
 ) {
     // 三种结局要分开写，`while let Ok(..)` 分不开它们：`Lagged` 也是一个 `Err`，
     // 于是广播里一次普通的背压会被读成「通道关了」，整条循环静静退出——从此不再
     // 消费任何事件，也没有一行日志。丢几条事件与从此不再消费，是两种量级完全
     // 不同的故障，而后者当时看起来与「上游没动静」一模一样。
     loop {
-        match rx.recv().await {
+        // 每一轮都盖一次章，无论队列里有没有东西：事件驱动的环大部分时间停在空
+        // 队列上，只在有事件时才盖，报出来的是队列的安静。
+        beat.beat();
+        // 锁只在取事件这一段里：句柄跨尝试共用是为了让重启落在原来的位置上，
+        // 不是为了把处理也串进去。
+        let received = {
+            let mut rx = rx.lock().await;
+            tokio::select! {
+                biased;
+                _ = stop.wait() => return,
+                received = rx.recv() => received,
+            }
+        };
+        match received {
             Ok(event) => collaborator.handle_event(&event).await,
             // 落后：丢掉的几环补不回来，接着消费即可。
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -73,13 +95,13 @@ pub async fn run_autonomous_event_loop(
                 );
                 crate::consumer_lag::record_consumer_lag(
                     &metrics,
-                    crate::consumer_lag::LAG_CONSUMER_AUTONOMOUS_EVENT_LOOP,
+                    crate::consumer_lag::LAG_CONSUMER_AUTONOMOUS_EVENT,
                     skipped,
                 )
                 .await;
             }
             // 生产者没了：再等也等不到事件，这条环的活干完了。
-            Err(broadcast::error::RecvError::Closed) => break,
+            Err(broadcast::error::RecvError::Closed) => return,
         }
     }
 }

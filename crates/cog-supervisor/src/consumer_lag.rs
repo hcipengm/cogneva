@@ -23,7 +23,13 @@ pub const LAG_CONSUMER_SUPERVISOR_EVENT_AGGREGATOR: &str = "supervisor_event_agg
 /// 自主协作环：读同一条 `AgentEvent` 广播、驱动交接与失败恢复。
 ///
 /// 与聚合器分开命名，因为它们是两个独立的订阅：一条落后不代表另一条落后。
-pub const LAG_CONSUMER_AUTONOMOUS_EVENT_LOOP: &str = "autonomous_event_loop";
+///
+/// 标识符**故意不以 `_LOOP` 结尾**：这条常量装的是一个**标签值**，不是一条环的名字，
+/// 而循环门把「凡 `pub const …_LOOP: &str = "…"`」读成一条环的名字声明——它的值与本文件
+/// 外那条真环（`crate::autonomous::AUTONOMOUS_EVENT_LOOP`）同字面，正是这个同字面让两处
+/// 读法可以并排；标识符跟着叫 `…_LOOP` 则会让门看到「同一个名字被两条环声明」而红。
+/// 值必须保持同字面，名字不能让出去。
+pub const LAG_CONSUMER_AUTONOMOUS_EVENT: &str = "autonomous_event_loop";
 
 /// 告警存储：读 supervisor 发布的 `SupervisorEvent` 广播、把值得告警的事件留在内存表里。
 ///

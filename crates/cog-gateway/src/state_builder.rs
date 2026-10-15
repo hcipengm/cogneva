@@ -3,6 +3,15 @@
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
+/// 循环名：把 supervisor 事件排进网关缓存的消费环，报在 `cogneva_loop_*` 的
+/// `loop` 标签上。
+///
+/// 前缀是本仓库已有的约定（[`crate::executor::COLLABORATION_LISTENER_LOOP`] 也叫
+/// `gateway_*`）；与它落后时写的 `consumer` 标签值
+/// （[`crate::LAG_CONSUMER_SUPERVISOR_EVENT_CACHE`]）只在后半段同字面——两个面说
+/// 的是同一个消费者，用后缀对起来。
+pub const SUPERVISOR_EVENT_CACHE_LOOP: &str = "gateway_supervisor_event_cache";
+
 /// Backend health probe.
 pub fn init_backend_health_probe(
     config: &cog_core::Config,
@@ -75,6 +84,7 @@ pub async fn build_gateway_state(
     audit_stream: &Option<Arc<dyn cog_core::AuditStream>>,
     taste_intent_sink: &Option<Arc<dyn cog_core::TasteIntentSink>>,
     llm_usage_reader: &Option<Arc<dyn cog_core::LlmUsageReader>>,
+    shutdown: &cog_core::ShutdownSignal,
 ) -> Result<Arc<crate::GatewayState>, Box<dyn std::error::Error>> {
     // Cache of the supervisor's event channel, filled by the drain task below.
     // The supervisor's contract exposes neither the last scale-out
@@ -161,32 +171,61 @@ pub async fn build_gateway_state(
     // Drain the supervisor's event channel into the cache. A lagged reader
     // keeps going (the channel dropped the oldest events under back-pressure —
     // the cache is "the last event seen", not a count, so a gap is a gap, not
-    // a lost fact to recover); a closed channel ends the task so the cache
+    // a lost fact to recover); a closed channel ends the loop so the cache
     // stops being fed stale values.
+    //
+    // 这条环以前是个裸 `tokio::spawn`：它退出之后读数面上什么都没有——缓存从此
+    // 不再更新，而看起来与「supervisor 一直没说话」同形。登记之后它的退出落进
+    // `cogneva_loop_deaths_total`，停与不动才分得开。
     {
         let cache = supervisor_event_cache.clone();
         let lag_metrics = metrics_backend.clone();
-        let mut rx = supervisor.subscribe();
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(event) => cache.observe(&event),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(
-                            skipped,
-                            "supervisor event cache lagged; the last recommendation may be stale"
-                        );
-                        crate::record_consumer_lag(
-                            &lag_metrics,
-                            crate::LAG_CONSUMER_SUPERVISOR_EVENT_CACHE,
-                            skipped,
-                        )
-                        .await;
+        let stop = shutdown.clone();
+        // 订阅一次、跨重启共用：body 每次尝试都重建，重新订阅会落在通道当前的
+        // 尾巴上，环死期间的事件就再也补不回来。
+        let rx = Arc::new(tokio::sync::Mutex::new(supervisor.subscribe()));
+        drop(cog_core::loop_health::spawn(
+            SUPERVISOR_EVENT_CACHE_LOOP,
+            cog_core::loop_health::Cadence::EventDriven,
+            stop.clone(),
+            move |beat| {
+                let cache = cache.clone();
+                let lag_metrics = lag_metrics.clone();
+                let rx = Arc::clone(&rx);
+                let stop = stop.clone();
+                async move {
+                    loop {
+                        // 每一轮都盖一次章，无论队列里有没有东西：事件驱动的环大部分
+                        // 时间停在空队列上，只在有事件时才盖，报出来的是队列的安静。
+                        beat.beat();
+                        let received = {
+                            let mut rx = rx.lock().await;
+                            tokio::select! {
+                                biased;
+                                _ = stop.wait() => return,
+                                received = rx.recv() => received,
+                            }
+                        };
+                        match received {
+                            Ok(event) => cache.observe(&event),
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                tracing::warn!(
+                                    skipped,
+                                    "supervisor event cache lagged; the last recommendation may be stale"
+                                );
+                                crate::record_consumer_lag(
+                                    &lag_metrics,
+                                    crate::LAG_CONSUMER_SUPERVISOR_EVENT_CACHE,
+                                    skipped,
+                                )
+                                .await;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                        }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
-            }
-        });
+            },
+        ));
     }
 
     Ok(gateway_state)
