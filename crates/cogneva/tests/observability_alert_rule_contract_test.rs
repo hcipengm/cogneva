@@ -856,6 +856,10 @@ const FOREIGN: &[(&str, &str)] = &[
         "kube-state-metrics（Deployment 层面的可用副本数；读数取自各 Pod 的 ready，而 Pod 卡在 Terminating 时 API 仍把它记为 ready，所以这份计数在那种故障下不动）",
     ),
     (
+        "kube_cronjob_status_last_successful_time",
+        "kube-state-metrics（CronJob 自己答的完成时刻，只有当某次班次真的成功过才有这条序列）。它是备份账上「最后一次成功」唯一的对照物：账那一侧记的同样是「某个成功班次完成的时刻」，两者相减是同一台机器上两件本该同步的事；比一个写死进规则的周期，改班次那天就过期。而账空的时候根本不存在「最后一次」可比，所以读它的规则必须先有一支 absent 支来承载那个状态——两个面同时缺席正是它没法单独回答的情形",
+    ),
+    (
         "kube_node_info",
         "kube-state-metrics（每个节点一条常量序列；它是「集群当前认为自己有哪些节点」的那份清单，所以节点被移除时它也消失——按它来判断账本缺席，才不会把「节点没了」和「节点在但不报」混成一件事）",
     ),
