@@ -17,6 +17,8 @@
 #   5. 两参形态（`quantile_over_time(0.99, v)` / `topk(5, v)`）按**第二个实参**判：
 #      第二个实参收敛 -> 绿；第二个实参是裸选择器 -> 红（不能因为「函数有两个实参」
 #      就一律算收敛——那样一条身份随 Pod 走的 topk 规则会静默通过）。
+#   6. 缺席函数（`absent`/`absent_over_time`）的身份只来自实参选择器的**等值**匹配器：
+#      选择器里点名 Pod -> 红；选择器只带常量标签、或实参是聚合 -> 绿。
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -79,6 +81,27 @@ for r in twoparam_bad:
         r['promql'] = 'topk(5, cogneva_loop_role_declared)'
 dump('twoparam_ok', twoparam_ok)
 dump('twoparam_bad', twoparam_bad)
+
+# 6. 缺席函数：身份只来自实参选择器的**等值**匹配器，不是从被选序列继承的。
+#    三个用例各隔离一件事——点名了 Pod 的选择器（红）、没点名 Pod 的选择器（绿）、
+#    实参是聚合（绿，实测结果为空标签，也正是 runtime_asset_check_never_ran 的形态）。
+#    真文件里那条 `absent(...{readout="..."})` 由用例 1 钉住：把它再读回成区间函数，
+#    用例 1 立刻红。
+absent_pod = json.loads(json.dumps(rules))
+absent_plain = json.loads(json.dumps(rules))
+absent_agg = json.loads(json.dumps(rules))
+for r in absent_pod:
+    if r['name'] == 'background_loop_restarted':
+        r['promql'] = 'absent(cogneva_loop_role_declared{pod="p1"})'
+for r in absent_plain:
+    if r['name'] == 'background_loop_restarted':
+        r['promql'] = 'absent(cogneva_loop_role_declared{loop="owner"})'
+for r in absent_agg:
+    if r['name'] == 'background_loop_restarted':
+        r['promql'] = 'absent(max without (pod, container) (cogneva_loop_role_declared))'
+dump('absent_pod', absent_pod)
+dump('absent_plain', absent_plain)
+dump('absent_agg', absent_agg)
 PYEOF
 
 run() { # run <config> -> 打印合并输出，回传退出码
@@ -129,6 +152,22 @@ if out="$(run "${work}/twoparam_bad.json")"; then
   fail "两参函数的第二个实参没收敛，却被判绿：${out}"; fi
 grep -q 'background_loop_restarted' <<<"${out}" || fail "判红却没点名那条规则：${out}"
 grep -q 'LEAF' <<<"${out}" || fail "判词要给出没收敛的那段子表达式：${out}"
+
+# 6a. 缺席函数的选择器里点名了 Pod -> 红（结果身份仍随 Pod 走）
+if out="$(run "${work}/absent_pod.json")"; then
+  fail "缺席函数的实参点名了 Pod，却被判绿：${out}"; fi
+grep -q 'background_loop_restarted' <<<"${out}" || fail "判红却没点名那条规则：${out}"
+grep -q 'LEAF' <<<"${out}" || fail "判词要给出没收敛的那段子表达式：${out}"
+
+# 6b. 选择器只带常量标签 -> 绿（这正是 backup_success_not_recorded 的形态）
+if ! out="$(run "${work}/absent_plain.json")"; then
+  fail "缺席函数的实参没点名 Pod，却被判红：${out}"; fi
+grep -q 'ALERT SUBJECT OK' <<<"${out}" || fail "绿的时候也要报判词：${out}"
+
+# 6c. 实参是聚合 -> 绿（实测结果为空标签）
+if ! out="$(run "${work}/absent_agg.json")"; then
+  fail "缺席函数的实参是聚合，却被判红：${out}"; fi
+grep -q 'ALERT SUBJECT OK' <<<"${out}" || fail "绿的时候也要报判词：${out}"
 
 # 少了参数以外的路径不存在时，是依赖错误不是判词
 if bash "${gate}" "${work}/does-not-exist.json" >/dev/null 2>&1; then

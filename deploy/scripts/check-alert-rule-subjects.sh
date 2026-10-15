@@ -19,6 +19,8 @@
 #   - 最外层聚合的 by/without 子句单独决定结果标签集；不带子句的聚合把标签全丢掉
 #   - and/unless 取左侧的标签集；or 与算术/比较要两侧都收敛
 #   - 区间函数（increase/rate/...）与透传函数把内层的标签集带出来
+#   - 缺席函数（absent/absent_over_time）相反：不从被选序列继承标签，只把实参选择器里的
+#     等值（`=`）匹配器抄成身份——实参不是选择器时结果是空标签（见 lint 里那组实测）
 #   - 只查 pod/container，**不查 instance**：node-exporter 的 instance 是节点地址，
 #     在那族规则里它是主体而不是报信者（`node_disk_usage_*` 靠它区分节点）
 #
@@ -46,9 +48,16 @@ def find(o):
             if r: return r
 
 AGG = r'(sum|max|min|avg|count|group|stddev|stdvar|last|topk|bottomk|quantile)'
-RANGE = r'(increase|rate|irate|delta|idelta|deriv|resets|changes|absent|absent_over_time|avg_over_time|min_over_time|max_over_time|sum_over_time|count_over_time|last_over_time|present_over_time|stddev_over_time|stdvar_over_time|quantile_over_time)'
+RANGE = r'(increase|rate|irate|delta|idelta|deriv|resets|changes|avg_over_time|min_over_time|max_over_time|sum_over_time|count_over_time|last_over_time|present_over_time|stddev_over_time|stdvar_over_time|quantile_over_time)'
+# 缺席函数单列一格：它们的身份**不是**从被选序列继承的，方向与 RANGE 那族相反（见 lint）。
+ABSENT = r'(absent|absent_over_time)'
 NOLABEL = r'(vector|scalar|time|pi|rand)'
 PASSTHRU = r'(abs|ceil|floor|sqrt|exp|ln|log2|log10|round|clamp|clamp_max|clamp_min|sort|sort_desc|sgn|timestamp|day_of_week|day_of_month|days_in_month|hour|minute|month|year)'
+# 缺席函数的实参：裸度量名带一个选择器，后面可以跟区间与 `offset`/`@` 修饰。只有这个
+# 形态才会把等值匹配器带进结果身份；实参是聚合或函数调用时实测结果是空标签。
+SELECTOR_WITH_LABELS = re.compile(
+    r'^[a-zA-Z_:][a-zA-Z0-9_:]*\s*\{([^}]*)\}'
+    r'\s*(?:\[[^\]]*\])?\s*(?:(?:offset|@)\s+[^\s)]+\s*)*$')
 
 SUBQ = re.compile(r'\[[^\]]*\]\s*$')
 SCALAR = re.compile(r'^[-+]?(\d+(\.\d*)?|\.\d+)(e[-+]?\d+)?$')
@@ -130,6 +139,26 @@ def lint(expr, depth=0):
     if m and close_of(e, m.end() - 1) == len(e) - 1: return None
     m = re.match(PASSTHRU + r'\s*\(', e)
     if m and close_of(e, m.end() - 1) == len(e) - 1: return lint(e[m.end():-1], depth + 1)
+    # `absent` / `absent_over_time` 与下面那族区间函数**方向相反**：区间函数把内层的标签
+    # 带出来，缺席函数不从被选的序列上继承任何标签，只把**实参选择器里的等值（`=`）匹配器**
+    # 抄成身份。实测（2026-10-16，cog-observability-prometheus；用一个不存在的度量名逼出
+    # 那条唯一的合成序列，再看它的标签）：
+    #   absent(m{pod="p1",job="j1"})        -> {pod="p1", job="j1"}
+    #   absent(m{pod=~"p1",job="j1"})       -> {job="j1"}   （正则匹配器不算等值）
+    #   absent(m{pod!="p1",job="j1"})       -> {job="j1"}   （否定匹配器也不算）
+    #   absent(m)                           -> {}
+    #   absent(max by (pod) (m))            -> {}           （实参是聚合/函数时为空标签）
+    #   absent_over_time(m{pod="p1"}[5m])   -> {pod="p1"}   （矩阵选择器同理）
+    # 判据因此是「实参是选择器、且里面用 `=` 点名了 pod/container」才红。把缺席函数当区间
+    # 函数去 lint 实参，会把身份只带常量标签的缺席规则误报成没收敛——这正是它被单列的原因。
+    m = re.match(ABSENT + r'\s*\(', e)
+    if m and close_of(e, m.end() - 1) == len(e) - 1:
+        sel = re.match(SELECTOR_WITH_LABELS, last_arg(e[m.end():-1]))
+        if not sel: return None
+        for matcher in sel.group(1).split(','):
+            if re.match(r'\s*(pod|container)\s*=(?!=|~)', matcher):
+                return 'LEAF:' + e[:120]
+        return None
     m = re.match(RANGE + r'\s*\(', e)
     if m and close_of(e, m.end() - 1) == len(e) - 1: return lint(last_arg(e[m.end():-1]), depth + 1)
     m = re.match(AGG + r'\s*(by|without)\s*\(([^)]*)\)', e)
@@ -177,6 +206,12 @@ def side_arity(e, depth=0):
     m = re.match(PASSTHRU + r'\s*\(', e)
     if m and close_of(e, m.end() - 1) == len(e) - 1:
         return side_arity(e[m.end():-1], depth + 1)
+    m = re.match(ABSENT + r'\s*\(', e)
+    if m and close_of(e, m.end() - 1) == len(e) - 1:
+        # arity 这一面不细究实参形态：实参是选择器时结果确实带那几个等值标签（LABELLED），
+        # 是聚合或函数时实测为空标签（EMPTY），两种都可能。照实参的 arity 读——与给缺席
+        # 函数单列之前的行为一致，判词不动。
+        return side_arity(last_arg(e[m.end():-1]), depth + 1)
     m = re.match(RANGE + r'\s*\(', e)
     if m and close_of(e, m.end() - 1) == len(e) - 1:
         return side_arity(last_arg(e[m.end():-1]), depth + 1)
