@@ -132,14 +132,16 @@ impl GateHolder {
     /// 这一格在 [`Self::ALL`] 与 [`crate::observable::PULL_GATE_OPERATIONS`]
     /// 里的位置。两个数组的次序由这条索引串起来，而次序本身没有编译器保证
     /// ——`each_holder_index_publishes_under_its_own_label` 是那条保证。
+    /// 格号就是这个掌权者在 [`Self::ALL`] 里的位次。
+    ///
+    /// 这里原先手写 0..4，与 `ALL` 的数组顺序是两个各自写死的序——重排
+    /// `ALL` 而忘了改这里，读数会把一个掌权者的 1 发到邻格上，而邻格也是
+    /// 零或一，读起来完全合理。改成从 `ALL` 导出后，这个序只有一份。
     fn index(self) -> usize {
-        match self {
-            GateHolder::Open => 0,
-            GateHolder::Blind => 1,
-            GateHolder::Local => 2,
-            GateHolder::Shared => 3,
-            GateHolder::Both => 4,
-        }
+        Self::ALL
+            .iter()
+            .position(|holder| *holder == self)
+            .expect("ALL lists every holder")
     }
 
     fn as_operation(self) -> &'static str {
