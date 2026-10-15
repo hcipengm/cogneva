@@ -785,8 +785,8 @@ const PRODUCED: &[(&str, &str)] = &[
         "crates/cog-core/src/contract/knowledge.rs",
     ),
     // 配额自己的决定。它此前在指标面上完全不可见：`QuotaMetrics` 把五个 family
-    // 注册进自己建的私有 registry、唯一调用点在测试里，而中间件把拒绝变成没有
-    // 响应体的 429 ⇒ 「配额在拦谁」只有被拦的人手里的 429 能回答。这条读数走的不是
+    // 注册进自己建的私有 registry、唯一调用点在测试里，而中间件发出的 429 只把
+    // 理由回给那一个调用方 ⇒ 「配额在拦谁」在单个响应里拼不出来。这条读数走的不是
     // 那条路：`cog-quota` 的 Observable 在 init 时发布，网关在 init 时取快照，
     // `/metrics` 按 `RawMetric` 渲染 ⇒ 它随产出者消失，没有行留在 store 里
     // （所以不进 `metric_names::ALL` 那个闭集），登记点就是这条规则。

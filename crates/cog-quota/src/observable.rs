@@ -1,7 +1,9 @@
 //! The quota's own reading — what it decided, at the one face that needs no
 //! credentials.
 //!
-//! The quota refuses requests, and nothing outside the refused request says so.
+//! The quota refuses requests, and a refusal reaches only the caller it refused:
+//! the 429 carries the reason back to that one request, while how many were
+//! refused — and of what — reaches nobody.
 //! The account it spends is one key per user in the key-value store, and that
 //! contract has no enumeration — [`cog_core::KeyValueStore`] reads a key you
 //! already know (`get`, `hget`, `hgetall`) — so a scrape cannot walk the users
@@ -63,9 +65,12 @@ impl QuotaReadings {
         self.allowed.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The check was refused. This is the 429 the caller never sees the reason
-    /// for: the middleware turns `allowed == false` into a response with no
-    /// body, so the refusal reaches an operator only through this counter.
+    /// The check was refused. The middleware turns `allowed == false` into a 429
+    /// that carries the reason back to that one caller (`error`, `remaining`,
+    /// `estimated_tokens`), so what this counter adds is not the reason but the
+    /// aggregate: every refusal lands on the caller it refused and nowhere else,
+    /// and "how many were refused over a window" is not recoverable from any
+    /// single response.
     pub fn record_refused(&self) {
         self.refused.fetch_add(1, Ordering::Relaxed);
     }
