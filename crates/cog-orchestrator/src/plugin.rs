@@ -383,6 +383,12 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                         // 这个开关和执行器循环、基线移植、自我发现用的是同一个。
                         let owns_executor_role = ctx.config().self_evolution.executor_enabled;
 
+                        // Seeded before either consumer starts, so the series is
+                        // present from the first scrape rather than from the
+                        // first task event: a counter absent for want of
+                        // traffic reads the same as one that was never wired.
+                        runtime.orchestrator().seed_event_bus_kinds().await;
+
                         let dag_shutdown = cog_core::ShutdownSignal::new();
                         let dag_shutdown_clone = dag_shutdown.clone();
                         let mut shutdown_rx = broadcast_tx.0.subscribe();

@@ -708,6 +708,25 @@ impl DagExecutor {
     /// landing the new one under whatever the catch-all happened to say. The
     /// string is the `event` tag the same type serializes with, so a reader
     /// holding a raw log line finds the same word on the counter.
+    /// Every label [`Self::event_kind`] can produce, in one place so the seed
+    /// below and the match beside it cannot drift apart unnoticed.
+    ///
+    /// The store keys one series per kind, and the pairing rule reads this
+    /// counter through `increase()`, which returns nothing over a window
+    /// holding no samples — so a kind that has never been emitted is
+    /// indistinguishable from one whose series was never wired.
+    pub const TASK_EVENT_KINDS: [&str; 9] = [
+        "task_created",
+        "task_scheduled",
+        "task_started",
+        "task_completed",
+        "task_failed",
+        "task_cancelled",
+        "task_retried",
+        "task_timeout",
+        "task_lease_expired",
+    ];
+
     fn event_kind(event: &cog_core::TaskEvent) -> &'static str {
         use cog_core::TaskEvent as E;
         match event {
@@ -720,6 +739,33 @@ impl DagExecutor {
             E::TaskRetried { .. } => "task_retried",
             E::TaskTimeout { .. } => "task_timeout",
             E::TaskLeaseExpired { .. } => "task_lease_expired",
+        }
+    }
+
+    /// Record a zero for every kind this executor can offer, once at startup.
+    ///
+    /// The rule that pairs this counter with the consumer's reads both sides
+    /// through `increase()`, and that returns nothing over a window holding no
+    /// samples. A kind that has never been offered therefore leaves no series,
+    /// which reads the same as a series that was never wired — the question a
+    /// person asks when a reading looks flat, and one the traffic cannot
+    /// answer. Seeded once, the series is present at 0 and that question is
+    /// settled without waiting for a task event to arrive.
+    ///
+    /// The seed adds zero rather than assigning, so a process that restarts
+    /// into a store that already holds counts does not erase them.
+    pub async fn seed_event_bus_kinds(&self) {
+        let Some(backend) = self.metrics_backend() else {
+            return;
+        };
+        for kind in Self::TASK_EVENT_KINDS {
+            let labels = HashMap::from([("kind".to_string(), kind.to_string())]);
+            if let Err(e) = backend
+                .record_counter(cog_core::metric_names::EVENT_BUS_EMITTED_TOTAL, 0.0, labels)
+                .await
+            {
+                tracing::warn!(error = %e, kind, "cannot seed the task event counter");
+            }
         }
     }
 
@@ -4594,6 +4640,76 @@ mod tests {
                 &task_type,
             ),
             0
+        );
+    }
+
+    /// 播种用的那一串 kind 与 `event_kind` 的 match 是同一份规格的两处写法：
+    /// 这里逐个造一个变体走一遍 match，把结果与那串比。任一边加了变体而另一边
+    /// 没跟上，`increase()` 都会给它留下一条永远缺席的序列——而未写的格与
+    /// 值为 0 的格在读数面上同形。
+    #[test]
+    fn the_seeded_kind_set_is_what_event_kind_produces() {
+        let now = chrono::Utc::now();
+        let events = vec![
+            cog_core::TaskEvent::TaskCreated {
+                task_id: "t".into(),
+                timestamp: now,
+            },
+            cog_core::TaskEvent::TaskScheduled {
+                task_id: "t".into(),
+                timestamp: now,
+            },
+            cog_core::TaskEvent::TaskStarted {
+                task_id: "t".into(),
+                timestamp: now,
+            },
+            cog_core::TaskEvent::TaskCompleted {
+                task_id: "t".into(),
+                result: None,
+                scheduled_dependents: Vec::new(),
+                timestamp: now,
+            },
+            cog_core::TaskEvent::TaskFailed {
+                task_id: "t".into(),
+                error: "e".into(),
+                retried: false,
+                cancelled: Vec::new(),
+                timestamp: now,
+            },
+            cog_core::TaskEvent::TaskCancelled {
+                task_id: "t".into(),
+                reason: "r".into(),
+                timestamp: now,
+            },
+            cog_core::TaskEvent::TaskRetried {
+                task_id: "t".into(),
+                retry_count: 1,
+                timestamp: now,
+            },
+            cog_core::TaskEvent::TaskTimeout {
+                task_id: "t".into(),
+                timeout_seconds: 1,
+                timestamp: now,
+            },
+            cog_core::TaskEvent::TaskLeaseExpired {
+                task_id: "t".into(),
+                owner: None,
+                expired_at: now,
+                timestamp: now,
+            },
+        ];
+
+        let produced: HashSet<&str> = events.iter().map(DagExecutor::event_kind).collect();
+        let seeded: HashSet<&str> = DagExecutor::TASK_EVENT_KINDS.into_iter().collect();
+
+        assert_eq!(
+            produced.len(),
+            events.len(),
+            "两个变体映射到同一个 kind：播种会把两条序列当成一条"
+        );
+        assert_eq!(
+            produced, seeded,
+            "播种的 kind 串与 event_kind 的 match 漂开了：差额的那一个会永远缺席"
         );
     }
 }

@@ -76,6 +76,32 @@ pub fn spawn_collaboration_listener(
         // link whose TaskCompleted/TaskFailed arrived while the loop was dead
         // would never be added. This lock has one holder.
         let task_event_rx = Arc::new(tokio::sync::Mutex::new(state.subscribe_task_events()));
+        // Seeded after the graph check, so a deployment without this loop seeds
+        // nothing, and before the first event, so the series is present at 0
+        // from the first scrape: the rule pairing this counter with the
+        // executor's reads both sides through `increase()`, and a series absent
+        // for want of traffic is indistinguishable from one never wired. The
+        // seed adds zero, so a restart into a store that already holds a count
+        // does not erase it.
+        if let Some(backend) = state.metrics_backend.as_ref() {
+            let labels = std::collections::HashMap::from([(
+                "consumer".to_string(),
+                crate::LAG_CONSUMER_COLLABORATION_LISTENER.to_string(),
+            )]);
+            if let Err(e) = backend
+                .record_counter(
+                    cog_core::metric_names::EVENT_BUS_CONSUMED_TOTAL,
+                    0.0,
+                    labels,
+                )
+                .await
+            {
+                warn!(
+                    error = %e,
+                    "cannot seed the collaboration listener's taken-events counter"
+                );
+            }
+        }
         drop(cog_core::loop_health::spawn(
             COLLABORATION_LISTENER_LOOP,
             // 只在任务事件到达时干活，所以没有周期可判：年龄照报，但不作为「卡住」的
