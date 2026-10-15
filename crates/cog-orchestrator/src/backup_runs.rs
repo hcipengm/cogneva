@@ -147,9 +147,11 @@ enum ReadoutReader {
 /// This table is the other half of [`BackupReadout::ALL`] and not a second
 /// roster: the keys are compared against `ALL` as a set (so a value added to the
 /// exposition without a line here fails, and so does a name spelled twice), the
-/// length is fixed by `ALL`, and every `Rule` line is checked against the rule
-/// it names -- a line claiming a rule reads a value that rule does not select is
-/// the one failure this table could hide from itself.
+/// length is fixed by `ALL`, and every line is checked against the chart in the
+/// direction it claims: a `Rule` line against that rule's own selector, an
+/// `Unread` line against every shipped rule, and the whole chart against this
+/// roster -- a rule reading a name the account cannot publish is a rule that can
+/// never match, which no line here could show.
 ///
 /// It is built only for the tests, because nothing in the loop reads it: the
 /// account publishes the same values whether or not this table exists, and the
@@ -160,10 +162,16 @@ const READOUT_READERS: [(BackupReadout, ReadoutReader); BackupReadout::ALL.len()
     (
         BackupReadout::RunsRunning,
         ReadoutReader::Unread {
-            why: "the only positive reading that a run is open right now, and it is published even \
-                  when the account holds nothing -- so its zero is a number a reader can act on \
-                  rather than an absence. It is owed a rule, and until then an open run is visible \
-                  only through its age, which is absent when there is none.",
+            why: "a person's reading, not a rule's: it says how many runs are open right now, and \
+                  the panel is the reader. A rule comparing it with one was ruled out by a \
+                  measurement rather than by taste -- the run is a CronJob under concurrencyPolicy \
+                  Forbid, holding its own deadline, so two open rows can only come from a run that \
+                  died before its deadline while the next one opened anyway. In that window this is \
+                  the only signal, because the dead row's age is still under its own deadline and \
+                  the deadline rule is not lit yet. That state has not happened: the highest this \
+                  value has ever read across the retained week is zero. The bar for revisiting is \
+                  that same reading crossing one -- and what such a rule would be reporting is the \
+                  account disagreeing with the cluster, not a backup in trouble.",
         },
     ),
     (
@@ -176,13 +184,7 @@ const READOUT_READERS: [(BackupReadout, ReadoutReader); BackupReadout::ALL.len()
     ),
     (
         BackupReadout::RunsAbandoned,
-        ReadoutReader::Unread {
-            why: "the only exit for a run the account had to conclude itself, and it is published \
-                  even when the account holds nothing. The rule that reads runs_failed cannot see \
-                  this state at all -- a run that went missing reported nothing -- so this is owed \
-                  a rule of its own, and a rule added here has to say what it means when the value \
-                  is zero, which is not the same as absent.",
-        },
+        ReadoutReader::Rule("backup_run_abandoned"),
     ),
     (
         BackupReadout::LatestFinishAgeSeconds,
