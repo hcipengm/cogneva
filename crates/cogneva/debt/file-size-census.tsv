@@ -7,11 +7,14 @@
 # file	verdict	witness
 #
 # verdict
-#   multi-axis   the file carries two or more runtime entities that do not share a
-#                process. That is the axis the owner's 2026-10-14 ruling names, and it
-#                is the only one that justifies a split by itself: the two sides are not
-#                co-present, so one side's failure is invisible from the other, and a
-#                change to one is not a change to the other.
+#   multi-axis   the file carries two runtime entities that do not share a process, and
+#                the `witness` column has to show it: the other side runs under its own
+#                process entry point, a binary subcommand nothing else runs. That is the
+#                axis the owner's 2026-10-14 ruling names, and it is the only one that
+#                justifies a split by itself: the two sides are not co-present, so one
+#                side's failure is invisible from the other, and a change to one is not a
+#                change to the other. Two loops in one resident process are not this:
+#                they are one subsystem, and splitting it buys no separation.
 #   single-axis  one runtime entity, or one flow with several stages. Large is what its
 #                job looks like, not a defect. Several of these are registries whose size
 #                is the number of entries they hold; splitting one splits a single source
@@ -20,8 +23,16 @@
 #                The witness is the reason, from the closed set {registry, test-harness}.
 #
 # witness
-#   multi-axis   two or more `;`-separated item names, each of which the file declares as
-#                a `fn`, `struct`, `enum`, `trait`, `impl` or `mod`. These are the axes.
+#   multi-axis   exactly two `;`-separated names. The first is the resident side's item,
+#                which the file declares as a `fn`, `struct`, `enum`, `trait`, `impl` or
+#                `mod`. The second is the other side's process entry point: a subcommand
+#                name out of `crates/cogneva/src/cli.rs`'s dispatch table, the one that
+#                Job's container runs. The entry point is what makes the claim structural
+#                -- it is read off a binary's own command table rather than off a story
+#                about a run that once happened. This file is why that distinction is
+#                written down: `crates/cog-github/src/landing.rs` was judged multi-axis
+#                on such a story, and its two sides are two loops in one resident
+#                process, with no entry point running either alone.
 #   single-axis  exactly one such name: the item that carries the file's one cadence.
 #   exempt       exactly one reason token from the closed set above.
 #
@@ -29,7 +40,7 @@
 # a number that was copied. A file that crosses the threshold needs a row, and a row whose
 # file fell below it — or left the tree — has to go.
 
-crates/cog-reflection/src/mainline_deployer.rs	multi-axis	run_mainline_loop;RolloutExecutor
+crates/cog-reflection/src/mainline_deployer.rs	multi-axis	run_mainline_loop;mainline-rollout
 crates/cog-gateway/src/security_gateway.rs	single-axis	run
 crates/cog-reflection/src/change_pipeline.rs	single-axis	ChangePipeline
 crates/cog-reflection/src/plugin.rs	single-axis	ReflectionPlugin
@@ -39,7 +50,7 @@ crates/cog-orchestrator/src/dag_executor/orchestrator.rs	single-axis	DagExecutor
 crates/cogneva/tests/observability_alert_rule_contract_test.rs	exempt	test-harness
 crates/cog-github/src/discovery_loop.rs	single-axis	GitHubDiscoveryLoop
 crates/cog-extension/src/hostdocs.rs	single-axis	HostDocPlan
-crates/cog-github/src/landing.rs	multi-axis	land;watch_landed
+crates/cog-github/src/landing.rs	single-axis	MainChannel
 crates/cog-core/src/build_gate.rs	single-axis	BuildGate
 crates/bootstrap/src/main.rs	single-axis	main
 crates/cog-core/src/contract/reflection.rs	single-axis	ReflectionEngine
@@ -55,7 +66,7 @@ crates/cog-collaboration/src/collaboration_executor.rs	single-axis	Collaboration
 crates/cog-gateway/src/contribution_admin.rs	single-axis	spawn_gitee_token_refresher
 crates/cog-reflection/src/signal_watcher.rs	single-axis	spawn_signal_watcher_loop
 crates/cog-reflection/src/lib.rs	single-axis	ReflectionEngine
-crates/cog-reflection/src/change_execution.rs	multi-axis	run_execute_change_cli;ChangeExecutionWorld
+crates/cog-reflection/src/change_execution.rs	multi-axis	ChangeExecutionWorld;execute-change
 crates/cog-gateway/src/git_mirror.rs	single-axis	GitTransport
 crates/cog-core/src/contract/metric_help.rs	exempt	registry
 crates/cogneva/src/eval_table.rs	single-axis	run_table

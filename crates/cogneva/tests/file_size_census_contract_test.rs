@@ -13,15 +13,23 @@
 //! change cadences, not when it is large. The hard form of that is two runtime entities
 //! that do not share a process — one side's failure is invisible from the other, and no
 //! single build, test or reader sees both. A file with one such entity can be a megabyte
-//! and still be one file.
+//! and still be one file. The separation has to be structural, too: the other side runs
+//! under its own process entry point, not merely at another time. Two loops in one
+//! resident process are one subsystem, and splitting one buys no separation between them.
 //!
 //! What is checked here, and what is not. The population and the sizes are read from the
 //! tree on every run, so a file that crosses the threshold with no row fails, and a row
 //! whose file fell below it — or left the tree — fails too. The verdicts are judgements and
 //! cannot be recomputed; what can be checked is that each one is a member of the closed set
-//! and that its witness is real. A `multi-axis` row has to name both axes, and each name
-//! has to be an item the file declares: a claim about two entities that points at nothing
-//! is prose in a column, and the column is the half a machine can hold down.
+//! and that its witness is real. A `multi-axis` row has to name both sides: the file's own
+//! item, which the file must declare, and the other side's process entry point, which has
+//! to be a subcommand in the binary's dispatch table. That is what `does not share a
+//! process` means in a form a machine can read — without it the verdict is a sentence
+//! about a run that once happened rather than a structure, and that reading is what this
+//! column was rewritten to catch. What the entry-point check still cannot say is that the
+//! command it finds runs *that* side: it says the command is real. Naming the right one is
+//! a judgement the column carries and the checker does not, the same ceiling the file's own
+//! item has.
 //!
 //! Not a size gate. Nothing here refuses a file for being large, and nothing here asks for
 //! one to be split. It refuses a *large file nobody has judged* — which is the state this
@@ -29,6 +37,7 @@
 //!
 //! principle: feedback_a_prohibitive_gate_needs_a_counterexample_census_first
 //! principle: feedback_split_a_file_by_change_axis_not_by_byte_size
+//! principle: feedback_two_running_entities_means_a_second_process_entrypoint_not_a_scenario
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -165,14 +174,47 @@ fn declares(file: &str, name: &str) -> bool {
         })
 }
 
+/// The process entry points the `cogneva` binary publishes: the subcommand names in
+/// `crates/cogneva/src/cli.rs`'s dispatch table, which is also what a Job's container
+/// command runs.
+///
+/// Read out of that table rather than by searching the crate for the string: a name sitting
+/// in a comment or a test is not an entry point, and the table is the one place a
+/// subcommand is declared. Reading it is what separates "the other side runs in a process
+/// of its own" from "the other side once ran in another process".
+fn process_entry_points() -> &'static BTreeSet<String> {
+    static POINTS: OnceLock<BTreeSet<String>> = OnceLock::new();
+    POINTS.get_or_init(|| {
+        let text = read_repo_file("src/cli.rs");
+        let rest = text
+            .split_once("const SUBCOMMANDS")
+            .expect("crates/cogneva/src/cli.rs no longer declares a SUBCOMMANDS table")
+            .1;
+        let body = rest
+            .split_once("= [")
+            .expect("the SUBCOMMANDS table is no longer a table of subcommand names")
+            .1;
+        let body = body
+            .split_once("];")
+            .expect("the SUBCOMMANDS table has no end, so its entries cannot be read")
+            .0;
+        // Every odd-numbered chunk of a split on the quote is inside a pair of them.
+        body.split('"')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect()
+    })
+}
+
 /// Every row's verdict is one of the closed set, its witness is the shape that verdict
-/// calls for, and — for a judged file — every name it points at is an item the file
-/// declares.
+/// calls for, and the file's own side of that witness is an item the file declares.
 ///
 /// The witness is asserted in both directions because that is what makes the column a
-/// claim rather than a label: a `multi-axis` row names two entities that must both be
-/// there, a `single-axis` row names exactly one, and an `exempt` row names a reason from
-/// the closed set instead of a file's contents.
+/// claim rather than a label: a `multi-axis` row names two sides that must both be real —
+/// the file's item, and the process entry point that runs only the other side — a
+/// `single-axis` row names exactly one item, and an `exempt` row names a reason from the
+/// closed set instead of a file's contents.
 #[test]
 fn every_row_carries_a_verdict_and_a_witness_of_that_shape() {
     let mut seen: BTreeSet<&str> = BTreeSet::new();
@@ -194,13 +236,25 @@ fn every_row_carries_a_verdict_and_a_witness_of_that_shape() {
         let witnesses = row.witnesses();
         match row.verdict.as_str() {
             "multi-axis" => {
-                assert!(
-                    witnesses.len() >= 2,
+                assert_eq!(
+                    witnesses.len(),
+                    2,
                     "{CENSUS_FILE} calls `{}` multi-axis but names {} witness(es) — the verdict \
-                     is a claim about two entities that do not share a process, so the row has \
-                     to name both, and a name the file does not declare is not one of them",
+                     is a claim about two entities that do not share a process, and it takes \
+                     exactly two names: the file's own item and the entry point that runs the \
+                     other side",
                     row.file,
                     witnesses.len()
+                );
+                assert!(
+                    process_entry_points().contains(witnesses[1]),
+                    "{CENSUS_FILE} calls `{}` multi-axis and names `{}` as the other side's \
+                     process entry point, but no such subcommand is in \
+                     crates/cogneva/src/cli.rs's dispatch table — two sides that do not share \
+                     a process means the other side has a process of its own, and a name that \
+                     runs nothing is a story about a process rather than a structure",
+                    row.file,
+                    witnesses[1]
                 );
             }
             "single-axis" => {
@@ -233,9 +287,13 @@ fn every_row_carries_a_verdict_and_a_witness_of_that_shape() {
             other => unreachable!("verdict `{other}` passed the closed-set check"),
         }
 
+        // The file's own side of the witness, which is what an item can be checked
+        // against. A `multi-axis` row's second name is the other side's entry point and is
+        // deliberately not in this file: it is checked against the dispatch table above.
         let missing: Vec<&str> = witnesses
             .iter()
             .copied()
+            .take(1)
             .filter(|name| !declares(&row.file, name))
             .collect();
         assert!(
@@ -297,15 +355,23 @@ fn the_table_covers_the_population_it_measures() {
     );
 }
 
-/// The judgement the declaration for this gate named, so that the criterion can go red.
+/// The judgements the census can be held to, so that they are pinned rather than prose.
 ///
-/// The three files are the reviewer's falsifiable reading: the deployer holds two runtime
+/// Three of these are the reviewer's falsifiable reading: the deployer holds two runtime
 /// entities in different pods and is the walk through the axes; the two metric tables are
 /// registries whose size is the number of series they name, and splitting either would give
 /// one closed set two carriers. A census that reads the same way about all three would have
 /// found no axis at all.
+///
+/// The fourth came out of checking the third: `crates/cog-github/src/landing.rs` was judged
+/// multi-axis when this table landed, and reading it against a process entry point moved it
+/// to one axis — its two sides are two loops in the same resident process, and the story
+/// that made it look otherwise (a landing that has to survive the process that made it) is
+/// a reason to persist state, not a second runtime entity. It is pinned here because the
+/// two ways of being wrong do not cost the same: one axis too few is a file nobody touches,
+/// and one axis too many sends someone to split a cohesive subsystem.
 #[test]
-fn the_census_reads_the_three_files_the_declaration_names() {
+fn the_census_reads_the_files_the_judgements_are_about() {
     let verdict_of = |file: &str| -> String {
         rows()
             .iter()
@@ -322,6 +388,16 @@ fn the_census_reads_the_three_files_the_declaration_names() {
          runs in the evolution pod and its rollout side in a job, and neither is present when \
          the other runs. A census that reads it as one axis has stopped distinguishing the \
          shape the ruling is about"
+    );
+
+    assert_eq!(
+        verdict_of("crates/cog-github/src/landing.rs"),
+        "single-axis",
+        "the landing side and the watch loop are two loops in one resident process — the \
+         landing is called in place by this crate's plugin and the watch is a loop that same \
+         plugin starts, and neither has a subcommand running it alone. A verdict of \
+         `multi-axis` here is a file sent to be split for a separation its two sides do not \
+         have"
     );
 
     for registry in [
