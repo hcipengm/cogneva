@@ -103,54 +103,66 @@ impl DiscoveryEngine {
             }
         }
 
-        // Strategy 2: Parameter space exploration for the first tool.
-        if let Some(tool) = tool_names.first() {
-            let combo = format!("param:{}", tool);
-            if !guard.contains(&combo) && tasks.len() < max_tasks {
-                tasks.push(DiscoveryTask {
-                    id: DiscoveryTask::generate_id(),
-                    explored_key: combo,
-                    hypothesis: format!(
-                        "Varying parameters for {} reveals optimal usage patterns.",
-                        tool
-                    ),
-                    strategy: DiscoveryStrategy::ParameterSpace,
-                    tools: vec![tool.clone()],
-                    prompt_variants: vec![
-                        format!("Use {} with conservative parameters.", tool),
-                        format!("Use {} with aggressive parameters.", tool),
-                    ],
-                    evaluation_criteria: vec![
-                        "Result quality improves with parameter change".into()
-                    ],
-                    status: DiscoveryStatus::Pending,
-                    created_at: Utc::now(),
-                });
+        // Strategy 2: Parameter space exploration, one attempt per tool.
+        //
+        // Every tool, not `tool_names.first()`: the caller's list arrives in roster
+        // order, so `first()` handed the same slot to the same tool for as long as
+        // that tool stayed first alphabetically, and the parameter face of this
+        // engine was one tool wide. A key is per-tool (`param:<tool>`), so the pool
+        // has room for all of them and nothing else has to change to use it.
+        for tool in tool_names {
+            if tasks.len() >= max_tasks {
+                break;
             }
+            let combo = format!("param:{}", tool);
+            if guard.contains(&combo) {
+                continue;
+            }
+            tasks.push(DiscoveryTask {
+                id: DiscoveryTask::generate_id(),
+                explored_key: combo,
+                hypothesis: format!(
+                    "Varying parameters for {} reveals optimal usage patterns.",
+                    tool
+                ),
+                strategy: DiscoveryStrategy::ParameterSpace,
+                tools: vec![tool.clone()],
+                prompt_variants: vec![
+                    format!("Use {} with conservative parameters.", tool),
+                    format!("Use {} with aggressive parameters.", tool),
+                ],
+                evaluation_criteria: vec!["Result quality improves with parameter change".into()],
+                status: DiscoveryStatus::Pending,
+                created_at: Utc::now(),
+            });
         }
 
-        // Strategy 3: Cross-domain transfer for the first skill.
-        if let Some(skill) = skill_ids.first() {
-            let combo = format!("xfer:{}", skill);
-            if !guard.contains(&combo) && tasks.len() < max_tasks {
-                tasks.push(DiscoveryTask {
-                    id: DiscoveryTask::generate_id(),
-                    explored_key: combo,
-                    hypothesis: format!(
-                        "Skill {} may be applicable to an unrelated domain.",
-                        skill
-                    ),
-                    strategy: DiscoveryStrategy::CrossDomainTransfer,
-                    tools: tool_names.to_vec(),
-                    prompt_variants: vec![format!(
-                        "Apply the principles of skill {} to a novel problem domain.",
-                        skill
-                    )],
-                    evaluation_criteria: vec!["Skill principles transfer meaningfully".into()],
-                    status: DiscoveryStatus::Pending,
-                    created_at: Utc::now(),
-                });
+        // Strategy 3: Cross-domain transfer, one attempt per skill. Same reason as
+        // strategy 2, and here `first()` was narrower still: the roster puts the
+        // widest, most general skill first, so the only skill ever transferred was
+        // the one least likely to need transferring.
+        for skill in skill_ids {
+            if tasks.len() >= max_tasks {
+                break;
             }
+            let combo = format!("xfer:{}", skill);
+            if guard.contains(&combo) {
+                continue;
+            }
+            tasks.push(DiscoveryTask {
+                id: DiscoveryTask::generate_id(),
+                explored_key: combo,
+                hypothesis: format!("Skill {} may be applicable to an unrelated domain.", skill),
+                strategy: DiscoveryStrategy::CrossDomainTransfer,
+                tools: tool_names.to_vec(),
+                prompt_variants: vec![format!(
+                    "Apply the principles of skill {} to a novel problem domain.",
+                    skill
+                )],
+                evaluation_criteria: vec!["Skill principles transfer meaningfully".into()],
+                status: DiscoveryStatus::Pending,
+                created_at: Utc::now(),
+            });
         }
 
         // Strategy 4: Boundary stress test.
@@ -310,6 +322,37 @@ mod tests {
                  retiring what it only proposed: first={:?} round{round}={:?}",
                 keys(&first),
                 keys(&again)
+            );
+        }
+    }
+
+    /// 参数面与迁移面各是**整份名册**宽，不是一个槽位宽。
+    ///
+    /// 这条守的是一个已修缺陷：那两处用 `tool_names.first()` / `skill_ids.first()`，于是
+    /// 参数探索恒只落在名册里字母序最前的那一个工具上，迁移面恒只落在第一个技能上——
+    /// 名册里其余的**从来没人试过**，而 `explored` 是干净的，读起来像「还没轮到」。
+    /// 键是逐个体的（`param:<tool>` / `xfer:<skill>`），池子里本来就放得下。
+    #[tokio::test]
+    async fn every_named_tool_and_skill_gets_an_attempt_not_just_the_first() {
+        let tools = tools();
+        let skills: Vec<String> = ["summarize", "translate"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let tasks = engine().generate_tasks(&tools, &skills, 64).await;
+        let keys = keys(&tasks);
+
+        for tool in &tools {
+            assert!(
+                keys.contains(&format!("param:{tool}")),
+                "工具 {tool} 没进参数面：{keys:?}"
+            );
+        }
+        for skill in &skills {
+            assert!(
+                keys.contains(&format!("xfer:{skill}")),
+                "技能 {skill} 没进迁移面：{keys:?}"
             );
         }
     }
