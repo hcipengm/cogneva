@@ -7,6 +7,14 @@
 //! 供调度侧的 `cog_supervisor::llm_pool_guard` 读取。写的是
 //! [`cog_core::KeyValueStore`] 而不是某个驱动：这条通道的读者在另一个进程里，
 //! 但两个进程之间同意的是一把键和一条载荷，不是谁在实现它。
+//!
+//! **这里只搬字节，不判定**：`unavailable` 由 `security_gateway` 按
+//! 「可服务的上游数 < 声明的下限」算出来（下限缺失时回落成 1，见
+//! [`cog_core::LlmPoolStatus::min_healthy`]），而且它是**锁存**的——低于下限就置位，
+//! 只有上游实证成功才解除，嫌疑窗到期不解除。所以它**不是** (池大小, 嫌疑列表) 的
+//! 纯函数，本模块不该再长出一个「由嫌疑列表现算池判定」的构造函数：那样的函数
+//! 会在嫌疑窗到期时自己翻回「可用」，把锁存让掉（2026-10-17 之前这里有一个
+//! `pool_snapshot`，零生产调用点，算的正是那条旧规则，已删）。
 
 use std::sync::Arc;
 
@@ -42,24 +50,6 @@ pub fn routing_provider_from_config(
     )
 }
 
-/// 由当前嫌疑上游列表汇总池级快照。
-///
-/// 池大小为 0 时不产出“全灭”结论：未配置上游与全部上游故障不是一回事，
-/// 读这个快照的消费者靠它决定要不要暂停工作。其余字段是各上游的实证
-/// 输入，由探测侧补齐，这里不替它们说话。
-pub fn pool_snapshot(
-    pool_size: usize,
-    unavailable_upstreams: Vec<String>,
-) -> cog_core::LlmPoolStatus {
-    let unavailable = pool_size > 0 && unavailable_upstreams.len() >= pool_size;
-    cog_core::LlmPoolStatus {
-        unavailable,
-        unavailable_upstreams,
-        pool_size,
-        ..Default::default()
-    }
-}
-
 /// 把池快照序列化后带 TTL 写入共享键值面，返回是否送达。
 ///
 /// 判定向上、向下两个方向必须由同一个写者落同一条载荷，所以这里只做
@@ -92,26 +82,6 @@ pub async fn write_pool_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn empty_pool_is_not_marked_unavailable() {
-        let status = pool_snapshot(0, Vec::new());
-        assert!(!status.unavailable);
-        assert_eq!(status.pool_size, 0);
-    }
-
-    #[test]
-    fn all_suspect_upstreams_mark_the_pool_down() {
-        let status = pool_snapshot(2, vec!["a|m".into(), "b|m".into()]);
-        assert!(status.unavailable);
-        assert_eq!(status.unavailable_upstreams.len(), 2);
-    }
-
-    #[test]
-    fn one_healthy_upstream_keeps_the_pool_up() {
-        let status = pool_snapshot(2, vec!["a|m".into()]);
-        assert!(!status.unavailable);
-    }
 
     #[test]
     fn an_empty_backend_list_still_builds() {
