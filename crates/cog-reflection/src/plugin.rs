@@ -1578,11 +1578,6 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     ctx.consume_service::<dyn cog_core::LlmClient>();
                 let period =
                     std::time::Duration::from_secs(ctx.config().self_evolution.poll_interval_secs);
-                info!(
-                    period_secs = period.as_secs(),
-                    refines = self.executor_role,
-                    "skill effectiveness loop enabled"
-                );
                 spawn_skill_effectiveness_loop(
                     engine,
                     skill_registry,
@@ -1821,6 +1816,15 @@ fn spawn_skill_effectiveness_loop(
         info!("no shared skill registry published; skill effectiveness actions disabled");
         return;
     };
+    // 「已启用」这句话打在**注册表检查之后**，不是调用点上。打在调用点上的话，
+    // 注册表缺席那次会先印一行「enabled」、再在下面一条早退里一个循环都不 spawn
+    // 就返回——于是「日志有、循环注册表里没有」这一组读数会被读成「改动没生效」，
+    // 而真因是这个进程没发布那张注册表，它自己的原话就在上面那行。宣告「启用」
+    // 的位置必须与真的启用在同一个分支里，否则那句宣告只证明代码走到了那里。
+    info!(
+        period_secs = period.as_secs(),
+        refines, "skill effectiveness loop enabled"
+    );
     drop(cog_core::loop_health::spawn_unstoppable(
         SKILL_EFFECTIVENESS_LOOP,
         cog_core::loop_health::Cadence::Periodic(period),
