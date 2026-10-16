@@ -239,4 +239,19 @@ fn the_rounds_beat_is_not_behind_either_gate() {
          读数推不出来：池级 gauge 只说闸关着，说不了这条环在不在跑，跳过那句就得\n\
          是唯一读数面。"
     );
+
+    // 「位置在前」不等于「每轮都走」。把这一拍包进分支——`if held_rounds == 0 { beat.beat(); }`
+    // ——时上面那四个偏移一个都没动、那条链照样绿，而这条测试真正要防的那件事已经破了：
+    // 被扣住的那一轮不再 beat。（2026-10-16 只读复核实测；变异只跑在源码的文本复现上。）
+    // 所以再钉一条**各自能被单独证伪**的：循环开头到这一拍之间没有条件词，这一拍无条件走。
+    let between = &body[loop_at..beat];
+    let guard = between
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .find(|t| ["if", "match", "while", "for"].contains(t));
+    assert!(
+        guard.is_none(),
+        "循环开头到 beat.beat() 之间出现了条件词 `{}`：这一拍被包进了分支，被扣住的那一轮\n\
+         就不再 beat，「这条环被闸扣住」于是从别处读数推不出来。这一拍要无条件走。",
+        guard.unwrap_or("")
+    );
 }
