@@ -2,7 +2,7 @@
 //! A host that gave no build slot is consumed as `ExecutedChange::NoBuildSlot`, not charged to the change's failure account.
 
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Loop name reported through the background-loop liveness family.
 pub const MICROVM_EVOLUTION_LOOP: &str = "reflection_microvm_evolution";
@@ -12,6 +12,12 @@ pub const CHANGE_VERIFICATION_LOOP: &str = "reflection_change_verification";
 pub const LEARNING_REVIEW_LOOP: &str = "reflection_learning_review";
 /// Loop name reported through the background-loop liveness family.
 pub const SKILL_EFFECTIVENESS_LOOP: &str = "reflection_skill_effectiveness";
+/// Loop name reported through the background-loop liveness family.
+///
+/// 「发现」这个词在本仓还有另一个意思：`cog-github` 的 `discovery_enabled`
+/// 发现的是上游仓库里的 issue。这条发现的是**本系统自己**还没试过的能力组合
+/// （工具配对），与那边不共用配置、也不共用那条环的属主仲裁。
+pub const DISCOVERY_LOOP: &str = "reflection_discovery";
 
 /// 延迟持有的 LLM 上游池暂停句柄。`SchedulerGate` 由 supervisor 插件在
 /// init 阶段发布，而 reflection 的 init 早于 supervisor（supervisor 可选依赖
@@ -1578,6 +1584,18 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     ctx.consume_service::<dyn cog_core::LlmClient>();
                 let period =
                     std::time::Duration::from_secs(ctx.config().self_evolution.poll_interval_secs);
+                // 自主能力发现与技能有效性同址：两者读的注册表都由别的插件的
+                // init 发布，只有全部 init 跑完才可靠可见。工具注册表在这里
+                // 消费，是因为契约面刚刚才有列举方法——在那之前这一侧读不到它。
+                spawn_discovery_loop(
+                    engine.clone(),
+                    ctx.consume_service::<dyn cog_core::ToolRegistry>(),
+                    skill_registry.clone(),
+                    orchestrator.clone(),
+                    owns_self_discovery,
+                    period,
+                    self.pool_gate.clone(),
+                );
                 spawn_skill_effectiveness_loop(
                     engine,
                     skill_registry,
@@ -1845,6 +1863,155 @@ fn spawn_skill_effectiveness_loop(
                     {
                         warn!(error = %e, "applying skill effectiveness actions failed");
                     }
+                }
+            }
+        },
+    ));
+}
+
+/// 一条探针怎么变成任务图里的一行。
+///
+/// 抽成纯函数是为了让它能被单独量：这里的字段名拼错了不会让那条环停下来，
+/// 只会让执行侧读到一个空的 `goal`——一条跑起来、什么也没问的探针，与一条
+/// 真的在探的探针在日志面上同形。返回的 goal 单独给出来，是因为提交那一跳要
+/// 它当目标文本，而它是任务的同一个字段，不该有两份。
+fn discovery_probe_task(probe: &crate::types::DiscoveryTask) -> (String, cog_core::Task) {
+    let goal = probe.hypothesis.clone();
+    let task = cog_core::Task::new(
+        probe.id.clone(),
+        cog_core::TaskType::Custom("capability_discovery".into()),
+        serde_json::json!({
+            "goal": goal,
+            "task_kind": "capability_discovery",
+            "strategy": probe.strategy,
+            "tools": probe.tools,
+            "prompt_variants": probe.prompt_variants,
+            "evaluation_criteria": probe.evaluation_criteria,
+        }),
+    );
+    (goal, task)
+}
+
+/// 挂上「把还没试过的工具配对拿去试」的那条循环。
+///
+/// 引擎早就造好了（自进化档里 `ReflectionEngine::discovery` 是
+/// `Some(DiscoveryEngine::new(..))`），`generate_tasks` 也早就写完，可全仓
+/// **没有一个调用者**：没有工具名喂进去，它一条也生不出来。而工具名的唯一列举面
+/// 此前只挂在 cog-agent 的**具体类型**上（`tools.rs` 的 `names()`），契约 trait
+/// 只有 `register`——于是这一侧连「现在有哪些工具」都读不到，两个 crate 隔着一条
+/// 边界各看不见对方。契约补上 `names()` 之后，这条环才有东西可喂。
+///
+/// 三道门，各自挡的是一件会重复做的事：
+///
+/// - **属主**：每条探针都在任务图里落一行、都要过池子，两份部署各跑一遍就是同一条
+///   组合问两遍；而且 `DiscoveryEngine` 的「已试过」集合是**进程内内存、没有回读
+///   路径**，跑在别的进程里读到的永远是空集合。与自发现信号 watcher 同一把尺子
+///   （`self_evolution.executor_enabled`）。
+/// - **供给面**：工具注册表由别的插件的 init 发布，编排器句柄也只能在 `start`
+///   跨插件消费。两个都缺就一条也交不出去，此时**不挂**这条环——并且把「enabled」
+///   那句话打在这道门**里面**：打在调用点上的宣告只证明代码走到了那里，而
+///   「日志有、循环注册表里没有」这一组读数会被读成「改动没生效」。
+/// - **池闸**：探针要过 LLM。池被闸住的那一轮连生成都不做——生成出来也不该交出去，
+///   交出去的每一条都会在图里留下一行注定失败的任务，与「真的有探针在跑」在账面上
+///   同形（现网池自报 2026-10-18T16:00Z 才可能回来）。
+fn spawn_discovery_loop(
+    engine: Arc<crate::ReflectionEngine>,
+    tool_registry: Option<Arc<dyn cog_core::ToolRegistry>>,
+    skill_registry: Option<Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>>,
+    orchestrator: Option<Arc<dyn cog_core::OrchestratorControl>>,
+    owns_discovery: bool,
+    period: std::time::Duration,
+    pool_gate: Arc<PoolGate>,
+) {
+    if !owns_discovery {
+        info!("not the self-discovery owner in this deployment; autonomous discovery disabled");
+        return;
+    }
+    let (Some(tool_registry), Some(orchestrator)) = (tool_registry, orchestrator) else {
+        warn!(
+            "autonomous discovery has no way out (no tool registry or no orchestrator \
+             published); loop not armed"
+        );
+        return;
+    };
+    info!(
+        period_secs = period.as_secs(),
+        "autonomous discovery loop enabled"
+    );
+    drop(cog_core::loop_health::spawn_unstoppable(
+        DISCOVERY_LOOP,
+        cog_core::loop_health::Cadence::Periodic(period),
+        // 每轮重建，所以循环体要用到的都先克隆出来。
+        move |beat| {
+            let engine = engine.clone();
+            let tool_registry = tool_registry.clone();
+            let skill_registry = skill_registry.clone();
+            let orchestrator = orchestrator.clone();
+            let pool_gate = pool_gate.clone();
+            async move {
+                let mut interval = tokio::time::interval(period);
+                loop {
+                    beat.beat();
+                    interval.tick().await;
+
+                    // 闸住的那一轮不生成也不提交：省下的是必然失败的任务行，
+                    // 不是「这一轮没事发生」。
+                    if pool_gate.llm_paused() {
+                        debug!("discovery round held off: the LLM pool gate is closed");
+                        continue;
+                    }
+
+                    let tool_names = tool_registry.names();
+                    // 一轮的宽度以工具面自身的大小为界，不钉一个数：工具面翻倍时
+                    // 这一轮跟着放宽，而生成器自己按组合去重，试过的不再出现——
+                    // 稳态下这一轮生成 0 条，循环的代价就不在生成上。
+                    let max_tasks = tool_names.len().max(1);
+                    let skill_ids: Vec<String> = match skill_registry.as_ref() {
+                        Some(reg) => {
+                            let guard = reg.read().await;
+                            guard.get_all().iter().map(|s| s.id.clone()).collect()
+                        }
+                        None => Vec::new(),
+                    };
+                    let tasks = engine
+                        .generate_discovery_tasks(&tool_names, &skill_ids, max_tasks)
+                        .await;
+                    if tasks.is_empty() {
+                        debug!(
+                            tools = tool_names.len(),
+                            "discovery round: every combination in reach has been tried"
+                        );
+                        continue;
+                    }
+
+                    let mut submitted = 0usize;
+                    let mut refused = 0usize;
+                    for probe in tasks {
+                        let (goal, task) = discovery_probe_task(&probe);
+                        // 返回值不当成败判：它只说这一趟往图里加了几行（已经在图里的
+                        // 幂等提交不算数），离「这条探针跑成了没有」还隔着一整条回路。
+                        // 那一段要先把 `TaskType::Custom` 的结局在哪个面可读量出来，
+                        // 在那之前把 Ok 读成成功就是拿「提交成功」冒充「任务成功」。
+                        // 所以这里只看 Err。
+                        match orchestrator.submit_goal_auto(&goal, vec![task]).await {
+                            Ok(_) => submitted += 1,
+                            Err(e) => {
+                                refused += 1;
+                                warn!(
+                                    task_id = %probe.id,
+                                    error = %e,
+                                    "discovery probe refused by the orchestrator"
+                                );
+                            }
+                        }
+                    }
+                    info!(
+                        tools = tool_names.len(),
+                        skills = skill_ids.len(),
+                        submitted,
+                        refused,
+                        "autonomous discovery round"
+                    );
                 }
             }
         },
@@ -3605,6 +3772,37 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 探针 → 任务那一跳单独量：目标文本与 payload 里的 `goal` 必须是同一个值
+    /// （两处分家时，执行侧读到的问句与提交时写下的目标就不是一回事），工具对
+    /// 要原样到执行侧，`task_kind` 要与 `TaskType::Custom` 里那个串对上——拼错的
+    /// 字段名不会让这条环停下来，只会让执行侧读到一条什么也没问的探针。
+    #[test]
+    fn a_discovery_probe_carries_its_own_question_into_the_task() {
+        let probe = crate::types::DiscoveryTask {
+            id: "DSC-20261016-ABCDEF01".into(),
+            hypothesis: "Combining read_file and write_file may yield a new composite capability."
+                .into(),
+            strategy: crate::types::DiscoveryStrategy::ToolCombination,
+            tools: vec!["read_file".into(), "write_file".into()],
+            prompt_variants: vec!["Use read_file then write_file to solve a general task.".into()],
+            evaluation_criteria: vec!["Does not error".into()],
+            status: crate::types::DiscoveryStatus::Pending,
+            created_at: chrono::Utc::now(),
+        };
+
+        let (goal, task) = discovery_probe_task(&probe);
+
+        assert_eq!(task.id, probe.id);
+        assert_eq!(goal, probe.hypothesis);
+        assert_eq!(task.input["goal"], goal);
+        assert_eq!(task.input["task_kind"], "capability_discovery");
+        assert_eq!(task.input["tools"], serde_json::json!(probe.tools));
+        assert_eq!(
+            task.task_type,
+            cog_core::TaskType::Custom("capability_discovery".into())
+        );
+    }
 
     /// 执行侧的"没做出判定"按**坏在哪一步**分账，不合并成一句话。
     ///

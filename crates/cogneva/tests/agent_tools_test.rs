@@ -24,6 +24,22 @@ async fn test_tool_registry_builtins() {
     assert!(registry.names().contains(&"search_code".to_string()));
 }
 
+/// The listing has to be reachable through the contract, not only through the
+/// concrete type. A crate that holds `Arc<dyn cog_core::ToolRegistry>` — which is
+/// how the reflection discovery loop gets its tool names — can name the trait and
+/// nothing else, because the concrete type lives in a crate that one does not
+/// depend on. Registered out of order on purpose: the listing is sorted, and this
+/// is the only place that says so.
+#[tokio::test]
+async fn test_tool_names_are_listable_through_the_contract_trait() {
+    let registry = ToolRegistry::new();
+    registry.register(cog_agent::tools::builtins::write_file());
+    registry.register(cog_agent::tools::builtins::read_file());
+
+    let contract: &dyn cog_core::ToolRegistry = &registry;
+    assert_eq!(contract.names(), ["read_file", "write_file"]);
+}
+
 #[tokio::test]
 async fn test_tool_registry_execute_not_found() {
     let registry = ToolRegistry::new();

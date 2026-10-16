@@ -1291,6 +1291,15 @@ impl cog_core::ToolRegistry for ToolRegistry {
     fn register(&self, tool: cog_core::Tool) {
         self.tools.write().unwrap().insert(tool.name.clone(), tool);
     }
+
+    /// The contract face of the inherent `names()` above — one listing, not a
+    /// second one that could drift from it. Spelled with the type path so the
+    /// call cannot be read as an alias for this method: an inherent method
+    /// outranks a trait method of the same name, so `self.names()` here means
+    /// the one above, but only a reader who already knows that rule can tell.
+    fn names(&self) -> Vec<String> {
+        ToolRegistry::names(self)
+    }
 }
 
 /// 内置工具工厂。

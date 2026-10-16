@@ -67,4 +67,17 @@ impl std::fmt::Debug for Tool {
 pub trait ToolRegistry: crate::ToolExecutor + Send + Sync {
     /// Register a single tool, replacing any existing tool with the same name.
     fn register(&self, tool: Tool);
+
+    /// Every tool name the registry currently holds, sorted.
+    ///
+    /// No default body, deliberately. A default returning an empty list would
+    /// make "no registry is wired up" and "this registry holds nothing" the
+    /// same reading at every call site, and the second one is the quiet answer
+    /// that outlives the wiring bug which produced it: a consumer that lists
+    /// tools to decide what to exercise would find none and go on working, on
+    /// a tree where the capability it should be exercising exists. There is
+    /// exactly one implementor in this workspace (`cog_agent::ToolRegistry`),
+    /// so the cost of stating it is paid once; an implementor this workspace
+    /// cannot see must say what it holds rather than inherit that silence.
+    fn names(&self) -> Vec<String>;
 }
