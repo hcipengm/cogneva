@@ -62,13 +62,18 @@ pub async fn read_base_deployments(
     namespace: &str,
 ) -> Result<String, UnreadableDeployment> {
     let mut out = String::new();
+    // `-o` 的值必须是 `jsonpath=<模板>` 这**一个**参数：kubectl 按 `=` 左边挑打印机，
+    // 只给裸模板会「unable to match a printer suitable for the output format」并非零退出
+    // ——而那条路读出来的是 `ClusterUnreadable`，长得像「集群读不了」，与真正的原因
+    // （参数拼错了）隔着一层。2026-10-16 现网实测：裸模板恒失败，加前缀立刻对。
+    let format = format!("jsonpath={DEPLOYMENTS_JSONPATH}");
     for name in BASE_DEPLOYMENTS {
         // 名字只在这一处拼成目标。
         let target = format!("deployment/{name}");
         match runner
             .run(
                 kubectl_bin,
-                &["-n", namespace, "get", &target, "-o", DEPLOYMENTS_JSONPATH],
+                &["-n", namespace, "get", &target, "-o", &format],
                 30,
             )
             .await
@@ -419,6 +424,73 @@ mod tests {
             .await
             .expect_err("非零退出是失败，不是空输出");
         assert!(err.to_string().contains("denied"), "{err}");
+    }
+
+    /// **装配层**要有自己的判据：`-o` 交出去的那**一个**参数必须是 kubectl 认的形状
+    /// （`jsonpath=<模板>`），给裸模板它会「unable to match a printer」并非零退出，而那条
+    /// 路读出来的是 `ClusterUnreadable`——长得像「集群读不了」，与真正的原因隔着一层。
+    ///
+    /// 这一格此前没有任何东西钉着：`FakeRunner` 把进程那一层整个换掉（它按
+    /// `starts_with("deployment/")` 认目标，**不看**格式参数），`Subprocess` 那两条测试跑的是
+    /// `sh -c`。测试覆盖了逻辑、没覆盖装配。2026-10-16 现网实测到：A5 那条读数每拍都落
+    /// `cluster_unreadable`，恒等着一个永远不会出现的 `Known`。
+    ///
+    /// 替身是**真跑进程**的：一个假 `kubectl`，它按 kubectl 自己的规矩挑打印机——认
+    /// `jsonpath=` 前缀、拒裸模板。所以这一格量的是「交出去的 argv 对不对」，不是「源码里
+    /// 有没有那几个字面量」。
+    #[tokio::test]
+    async fn the_format_handed_to_kubectl_is_one_it_accepts() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("kubectl");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n\
+             target=; fmt=\n\
+             while [ $# -gt 0 ]; do\n\
+             \x20 case \"$1\" in\n\
+             \x20   -o) fmt=\"$2\"; shift 2 ;;\n\
+             \x20   deployment/*) target=\"$1\"; shift ;;\n\
+             \x20   *) shift ;;\n\
+             \x20 esac\n\
+             done\n\
+             case \"$fmt\" in\n\
+             \x20 jsonpath=*) ;;\n\
+             \x20 *) echo \"error: unable to match a printer suitable for the output format \\\"$fmt\\\"\" >&2; exit 1 ;;\n\
+             esac\n\
+             name=\"${target#deployment/}\"\n\
+             printf '%s\\t%s=reg/cogneva:main-abc,\\n' \"$name\" \"$name\"\n",
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&fake).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+        std::fs::set_permissions(&fake, perm).unwrap();
+        let bin = fake.to_str().unwrap();
+
+        // 反向对照：先证明这个替身**真的**会拒裸模板，否则上面那一格的绿是瞎的
+        // （一个什么都不看的替身，也能让「读成功」这一格绿）。
+        let bare = Subprocess
+            .run(
+                bin,
+                &[
+                    "-n",
+                    "cogneva",
+                    "get",
+                    "deployment/cogneva",
+                    "-o",
+                    DEPLOYMENTS_JSONPATH,
+                ],
+                5,
+            )
+            .await;
+        assert!(
+            bare.is_err(),
+            "替身必须拒裸模板，否则这一格量不到东西：{bare:?}"
+        );
+
+        let out = read_base_deployments(&Subprocess, bin, "cogneva")
+            .await
+            .expect("交出去的格式要是 kubectl 认的那一种");
+        assert_eq!(deployed_main_rev(&out).as_deref(), Some("abc"));
     }
 
     /// 三种结局各进各的格子。这张对照表是这一格的判据，不是实现细节：把「没读到」
