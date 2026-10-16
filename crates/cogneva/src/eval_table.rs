@@ -644,6 +644,10 @@ pub struct Wiring {
     /// NQL 那一行的读数出于哪个平台，是这张表能不能被别人复跑的一部分，所以它跟骨干、
     /// 裁判的模型名一样要随表出去——不能只有「接上了」这一个字。
     pub platform_base: Option<String>,
+    /// 传输建不出来时的那句原因。有了它，`backbone` 为 `None` 才说得分明：是**没有上游**，
+    /// 还是**上游配了、传输没建出来**。两件事要读的人做的事不同（配 llm_routing 还是修
+    /// http_client），一句「没有上游」把指引抹平，还会把它读成一次配置缺失而不是一次故障。
+    pub no_transport: Option<String>,
 }
 
 /// 一次跑的结果：要写出去的那段文本，以及这次跑是不是一次完整的实验。
@@ -705,6 +709,50 @@ fn run_checkpoint(
     Checkpoint { path, run_id }
 }
 
+/// 开跑**之前**就看得出来缺什么。收窄到这三样而不是整份参数：判词只跟「哪一列、哪个外壳、
+/// 哪条臂」有关，跟数据根、闸门那些无关，所以它是一条纯函数，能被单测直接钉住。
+///
+/// 一条依赖缺席的原因要说得准：`backbone` 与平台都可能「没配」，也可能「配了、传输建不出来」。
+/// 这两种情况留在同一句话里，读的人会去配一个本来已经配好的东西。
+fn missing_dependencies(
+    tools: ToolArm,
+    benchmarks: &[&str],
+    scaffolds: &[&str],
+    wiring: &Wiring,
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    // 诊断臂不是缺席的依赖，但它同样意味着这次跑不是一次完整的实验：没有主表那一臂的
+    // 工具面，格子就不能作表行。记进来，退出码于是不会把一次诊断跑当成一次成表跑。
+    if !tools.is_table_arm() {
+        missing.push(
+            "tools: this run used the tools-off diagnostic arm, so it is not a main-table row"
+                .to_string(),
+        );
+    }
+    if wiring.backbone.is_none() {
+        missing.push(match &wiring.no_transport {
+            Some(why) => format!("backbone: {why}"),
+            None => "backbone: no LLM upstream is configured".to_string(),
+        });
+    }
+    if wiring.judge.is_none() {
+        missing.push("judge: no generative judge upstream is configured".to_string());
+    }
+    if benchmarks.contains(&"swe-bench-pro") && wiring.swe_pro.is_none() {
+        missing.push("swe-bench-pro: no container backend is wired".to_string());
+    }
+    if benchmarks.contains(&"toolathlon") && wiring.toolathlon.is_none() {
+        missing.push("toolathlon: no compose backend is wired".to_string());
+    }
+    if scaffolds.contains(&"nql") && wiring.platform.is_none() {
+        missing.push(match &wiring.no_transport {
+            Some(why) => format!("nql: the platform endpoint cannot be reached: {why}"),
+            None => "nql: no platform is wired".to_string(),
+        });
+    }
+    missing
+}
+
 pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Result<Outcome> {
     let data_root = match &args.data_root {
         Some(root) => root.clone(),
@@ -761,31 +809,9 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
 
     let verified = pins.verify(&data_root, &args.benchmarks)?;
 
-    // 每一处缺席都记名字：报表里缺什么、怎么补，比一个非零退出码有用。
-    let mut missing = Vec::new();
-    // 诊断臂不是缺席的依赖，但它同样意味着这次跑不是一次完整的实验：没有主表那一臂的
-    // 工具面，格子就不能作表行。记进来，退出码于是不会把一次诊断跑当成一次成表跑。
-    if !args.tools.is_table_arm() {
-        missing.push(
-            "tools: this run used the tools-off diagnostic arm, so it is not a main-table row"
-                .to_string(),
-        );
-    }
-    if wiring.backbone.is_none() {
-        missing.push("backbone: no LLM upstream is configured".to_string());
-    }
-    if wiring.judge.is_none() {
-        missing.push("judge: no generative judge upstream is configured".to_string());
-    }
-    if args.benchmarks.contains(&"swe-bench-pro") && wiring.swe_pro.is_none() {
-        missing.push("swe-bench-pro: no container backend is wired".to_string());
-    }
-    if args.benchmarks.contains(&"toolathlon") && wiring.toolathlon.is_none() {
-        missing.push("toolathlon: no compose backend is wired".to_string());
-    }
-    if args.scaffolds.contains(&"nql") && wiring.platform.is_none() {
-        missing.push("nql: no platform is wired".to_string());
-    }
+    // 每一处缺席都记名字：报表里缺什么、怎么补，比一个非零退出码有用。跑起来之后才发现的
+    // 缺席（读不出题的列）在下面追加，两批各写各的。
+    let mut missing = missing_dependencies(args.tools, &args.benchmarks, &args.scaffolds, wiring);
 
     let backbone: Arc<dyn LlmClient> = wiring
         .backbone
@@ -1190,39 +1216,37 @@ pub fn operands(argv: &[String]) -> Vec<String> {
     rest
 }
 
-/// 组合根把平台接进 `PlatformRunner` 端口：端点、令牌、时限都从环境取。
+/// 这次跑要用的传输：平台与骨干**共用同一个**客户端，所以这条组合根上只建这一次。
 ///
-/// 端点缺席时交回 `None` 而不是一个会立刻失败的实现——驱动那边留着 `NoPlatform`，
-/// NQL 那一行于是报「跑不起来」，而不是拿一个假答复去计分。
+/// 各建一个的代价不是多一个连接池，是配好的超时与代理只对其中一条上游生效，而两边的
+/// 读数看起来一模一样。
 ///
-/// 平台与骨干是两条独立的上游：`llm_routing` 读不出来不该顺手把平台也丢掉，所以这个
-/// 函数在 `wiring_from_config` 里先于任何骨干的早退被调用。
-fn platform_from_env() -> Option<(Arc<dyn PlatformRunner>, String)> {
-    let settings = BridgeSettings::from_env()?;
-    let (runner, base) = platform_from_settings(settings)?;
-    Some((Arc::new(runner), base))
+/// 建不出来时交回原因而不是拿默认客户端顶上：配好的 `http_client` 段就是调用方要的
+/// 那一份，换一个没超时没代理的顶上，读起来与配过的一模一样。
+fn http_client() -> Result<Arc<dyn HttpClient>, String> {
+    let config = cog_net::HttpClientConfig::load().unwrap_or_else(|e| {
+        tracing::warn!("http client config is unreadable ({e}); the configured defaults are used");
+        Default::default()
+    });
+    match cog_net::factory::ReqwestHttpClient::from_config(&config) {
+        Ok(client) => Ok(Arc::new(client)),
+        Err(e) => Err(format!(
+            "cannot build an http client from http_client ({e})"
+        )),
+    }
 }
 
 /// 把一份端点配置变成平台端口，并把它的身份一并交出。端点从环境读还是从别处读与这里无关，
-/// 所以这两段分开：接线本身能被单测钉住，而不用去动进程的环境变量。
+/// 所以这段能被单测钉住，而不用去动进程的环境变量。
 ///
-/// http 客户端建不出来时交回 `None` 而不是拿默认客户端顶上：配好的 http_client 段就是
-/// 调用方要的那一份，换一个没超时没代理的顶上，读起来与配过的一模一样。
-fn platform_from_settings(settings: BridgeSettings) -> Option<(PlatformApiRunner, String)> {
+/// 传输由调用方给——它就是 `http_client()` 建出来的那一个。所以这里不再有「建不出来」这一支：
+/// 那一支已经在上游决定了，它同时决定骨干也缺席。
+fn platform_from_settings(
+    settings: BridgeSettings,
+    http: Arc<dyn HttpClient>,
+) -> (PlatformApiRunner, String) {
     let base = settings.base.clone();
-    let config = cog_net::HttpClientConfig::load().unwrap_or_else(|e| {
-        tracing::warn!("http client config is unreadable ({e}); platform bridge uses defaults");
-        Default::default()
-    });
-    let http: Arc<dyn HttpClient> = match cog_net::factory::ReqwestHttpClient::from_config(&config)
-    {
-        Ok(client) => Arc::new(client),
-        Err(e) => {
-            tracing::warn!("http client cannot be built from http_client ({e}); platform bridge is absent rather than unconfigured");
-            return None;
-        }
-    };
-    Some((PlatformApiRunner::new(http, settings), base))
+    (PlatformApiRunner::new(http, settings), base)
 }
 
 /// 组装这一次跑的依赖：骨干与裁判来自 `llm_routing`，缺了就缺席，不猜。
@@ -1231,8 +1255,30 @@ fn platform_from_settings(settings: BridgeSettings) -> Option<(PlatformApiRunner
 /// 这里把它记成缺席而不是直接失败：表仍然出得来，读的人从 wiring 段看见真相。
 async fn wiring_from_config(args: &EvalTableArgs) -> Wiring {
     let mut wiring = Wiring::default();
-    if let Some((platform, base)) = platform_from_env() {
-        wiring.platform = Some(platform);
+    // 传输先建：平台与骨干都要它，而且它建不出来时**两条上游一起缺席**。
+    //
+    // 这里不拿默认客户端顶上，因为骨干的每一家上游都是「没有客户端就报 no HttpClient
+    // configured」——那种 provider 建得出来、一次调用也发不出去，把它记成「在」，报表就
+    // 读成一次完整的实验，而它连一句答复都没收到过。所以传输这一层失败时骨干是缺席的，
+    // 且 `missing` 那一行要说的是传输，不是「没有上游」。
+    let http = match http_client() {
+        Ok(http) => Some(http),
+        Err(why) => {
+            tracing::warn!(
+                "no http client could be built ({why}); the platform bridge and the backbone \
+                 are absent rather than defaulted"
+            );
+            wiring.no_transport = Some(why);
+            None
+        }
+    };
+    // 平台与骨干是两条独立的上游：`llm_routing` 读不出来不该顺手把平台也丢掉，所以这一段
+    // 先于任何骨干的早退。端点没配、或传输没建出来，平台都交回 `None` 而不是一个会立刻
+    // 失败的实现——驱动那边留着 `NoPlatform`，NQL 那一行于是报「跑不起来」，而不是拿一个
+    // 假答复去计分。
+    if let (Some(settings), Some(http)) = (BridgeSettings::from_env(), http.clone()) {
+        let (runner, base) = platform_from_settings(settings, http);
+        wiring.platform = Some(Arc::new(runner));
         wiring.platform_base = Some(base);
     }
     let routing = match cog_llm::LLMRoutingConfig::load() {
@@ -1277,7 +1323,13 @@ async fn wiring_from_config(args: &EvalTableArgs) -> Wiring {
         .core
         .system
         .anthropic_default_max_tokens;
-    match cog_llm::plugin::build_llm_provider(capacity, max_tokens, &routing, None) {
+    let http = match http {
+        Some(http) => http,
+        // 传输这一条已经记在 `no_transport` 里，`missing` 那一行照着它写。这里不再往下走：
+        // 下面每一步都是为了建一个能发请求的骨干，而它已经建不出来了。
+        None => return wiring,
+    };
+    match cog_llm::plugin::build_llm_provider(capacity, max_tokens, &routing, Some(http)) {
         Ok(llm) => {
             // 骨干与裁判今天是同一个上游：判分那一路的模型选择属配置面（llm_routing
             // 单入口），不在这里再开一个。
@@ -2062,8 +2114,8 @@ mod tests {
     fn a_configured_endpoint_is_wired_and_a_missing_one_is_not() {
         let settings = BridgeSettings::from_parts(Some("http://platform.test/"), None, None)
             .expect("a base is enough to configure the bridge");
-        let (runner, base) = platform_from_settings(settings)
-            .expect("the default http client config is a buildable one");
+        let http = http_client().expect("the default http client config is a buildable one");
+        let (runner, base) = platform_from_settings(settings, http);
         // 报出去的身份与真正用上的端点是同一个：两处走散的端点比不报还坏。
         assert_eq!(base, "http://platform.test");
         assert_eq!(runner.base(), "http://platform.test");
@@ -2072,5 +2124,35 @@ mod tests {
             BridgeSettings::from_parts(None, Some("t"), None).is_none(),
             "没有端点就不算接上了平台"
         );
+    }
+
+    /// 一条骨干**建得出来但发不出请求**时，`missing` 那一行说的必须是这件事。
+    ///
+    /// 每一家上游都是「没有 http 客户端就报 `no HttpClient configured`」，所以不带传输的
+    /// provider 记成「在」，报表就读成一次完整的实验，而它一次调用都没发出去过。这一条
+    /// 同时钉住反方向：因传输而缺席**不许**写成「没有上游配置」——那句话把读的人送去配
+    /// 一个已经配好的东西。
+    #[test]
+    fn a_backbone_with_no_transport_is_missing_for_that_reason() {
+        let wiring = Wiring {
+            no_transport: Some("cannot build an http client from http_client (boom)".into()),
+            ..Default::default()
+        };
+        let missing = missing_dependencies(ToolArm::Platform, &["hle"], &["nql"], &wiring);
+        let backbone = missing
+            .iter()
+            .find(|line| line.starts_with("backbone: "))
+            .expect("a backbone that cannot send a request is not present");
+        assert!(backbone.contains("http_client"), "{backbone}");
+        assert!(
+            !backbone.contains("no LLM upstream is configured"),
+            "absent for want of transport is not absent for want of an upstream: {backbone}"
+        );
+        // 平台这一侧同理：它跟骨干共用同一个客户端，所以传输没了它也没了。
+        let nql = missing
+            .iter()
+            .find(|line| line.starts_with("nql: "))
+            .expect("the platform column cannot run without the shared transport");
+        assert!(nql.contains("http_client"), "{nql}");
     }
 }
