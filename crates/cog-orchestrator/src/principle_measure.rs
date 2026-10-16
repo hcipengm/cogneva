@@ -57,7 +57,19 @@ pub use cog_core::PLATFORM_DECLARATION_PREFIX;
 /// The expression the platform's registry is read with: the prefix at the start
 /// of a line, which is where a module header sits and where prose about the
 /// convention does not.
-pub const PLATFORM_DECLARATION_PATTERN: &str = "^//! principle:";
+///
+/// Built from the prefix rather than spelled a second time. One shape is read
+/// from two directions here -- a line is stripped with the prefix, and the tree
+/// is searched with the expression -- and a second spelling is a second thing to
+/// keep in step.
+///
+/// Anchoring is a concatenation and not an escape because the prefix carries no
+/// expression metacharacter, which the test below holds down: it is what makes
+/// this line mean "at the start of a line" rather than "somewhere in it", and it
+/// is a fact about the value, not about the spelling.
+pub fn platform_declaration_pattern() -> String {
+    format!("^{PLATFORM_DECLARATION_PREFIX}")
+}
 
 /// Which files may declare. Rust sources, because a declaration is a header of
 /// the test module that enforces it, and the tree's prose about the convention
@@ -619,5 +631,33 @@ mod tests {
         assert!(!is_slug("feedback-x"));
         assert!(!is_slug("feedback x"));
         assert!(!is_slug("feedback_x/y"));
+    }
+
+    /// The registry expression is the prefix anchored, built by concatenation --
+    /// which is only the same as anchoring while the prefix holds no expression
+    /// metacharacter. That is a fact about the value rather than about the
+    /// spelling, so it is asserted rather than assumed: if one ever appears, the
+    /// line that builds the expression stops meaning "at the start of a line",
+    /// and has to escape what it concatenates.
+    ///
+    /// The body is read back off the expression because that is the whole of what
+    /// makes the two readers one shape -- a body that had drifted from the prefix
+    /// would be the second spelling this derivation exists to not have.
+    #[test]
+    fn the_registry_expression_may_be_built_by_concatenation() {
+        let pattern = platform_declaration_pattern();
+        assert_eq!(
+            pattern.strip_prefix('^'),
+            Some(PLATFORM_DECLARATION_PREFIX),
+            "the expression is read by an unanchored matcher: the anchor is the whole of what \
+             separates a module header from a sentence about the convention"
+        );
+        for c in PLATFORM_DECLARATION_PREFIX.chars() {
+            assert!(
+                !"\\.^$*+?()[]{}|".contains(c),
+                "the declaration prefix now carries {c:?}: concatenating it no longer anchors \
+                 it, so the expression has to escape it instead"
+            );
+        }
     }
 }

@@ -49,8 +49,8 @@ use cog_core::{
 
 use crate::change_measure::CheckTree;
 use crate::principle_measure::{
-    drift_annotation, judge, measurable, Declarations, UnsettledReason, Verdict,
-    PLATFORM_DECLARATION_PATTERN, PLATFORM_REGISTRY_FILES,
+    drift_annotation, judge, measurable, platform_declaration_pattern, Declarations,
+    UnsettledReason, Verdict, PLATFORM_REGISTRY_FILES,
 };
 
 /// This loop's name in the process liveness registry, and the value of
@@ -340,7 +340,7 @@ async fn read_registry(
         .matching_lines(
             snapshot.rev(),
             PLATFORM_REGISTRY_FILES,
-            PLATFORM_DECLARATION_PATTERN,
+            &platform_declaration_pattern(),
         )
         .await
         .map_err(|why| {

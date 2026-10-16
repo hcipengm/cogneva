@@ -1685,4 +1685,47 @@ mod tests {
         assert!(!absent.reason().is_some_and(|r| r.is_about_the_row()));
         assert_eq!(absent.state(), None, "a re-runnable scope must move no row");
     }
+
+    /// The expression the principle registry is read with, through the reader
+    /// that actually uses it.
+    ///
+    /// Two things ride on that expression and neither is visible to a test that
+    /// hands the parser its lines itself -- which is every other test of it. The
+    /// first is that it carries the prefix the stripper carries, because the two
+    /// are read as one shape from two directions. The second is the anchor: an
+    /// unanchored pattern is a hit anywhere on the line, and this tree is full of
+    /// prose that names the convention, so a file saying so in a sentence would
+    /// be read as declaring a gate in the account that is keyed by slug.
+    #[tokio::test]
+    async fn the_registry_read_selects_a_header_and_not_prose_about_the_convention() {
+        use crate::principle_measure::{
+            platform_declaration_pattern, Declarations, PLATFORM_REGISTRY_FILES,
+        };
+
+        let dir = repo(&[
+            ("crates/x/tests/a.rs", "//! principle: feedback_x\n"),
+            (
+                "crates/x/src/lib.rs",
+                "// the //! principle: marker belongs on the test module\n",
+            ),
+        ]);
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let rev = tree.rev().await.expect("the fixture head resolves");
+        let lines = tree
+            .matching_lines(
+                &rev,
+                PLATFORM_REGISTRY_FILES,
+                &platform_declaration_pattern(),
+            )
+            .await
+            .expect("git answers for the fixture tree");
+
+        assert_eq!(
+            lines.len(),
+            1,
+            "the expression selected {lines:?}: it is not the prefix at the start of a line"
+        );
+        let registry = Declarations::parse(&lines);
+        assert_eq!(registry.gate_for("feedback_x"), Some("crates/x/tests/a.rs"));
+    }
 }
