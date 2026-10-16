@@ -52,7 +52,7 @@ Benchmark data is a few hundred MB of parquet and tarballs; it is not committed.
 directory of your choice (default `/srv/cogneva/benchmarks`):
 
 ```sh
-deploy/scripts/fetch-benchmark-data.sh --dest /srv/cogneva/benchmarks          # all three
+deploy/scripts/fetch-benchmark-data.sh --dest /srv/cogneva/benchmarks          # everything the catalog holds
 deploy/scripts/fetch-benchmark-data.sh --benchmark hle --dest /path/to/data    # one
 deploy/scripts/fetch-benchmark-data.sh --print-files                           # what, no network
 deploy/scripts/fetch-benchmark-data.sh --dest /srv/cogneva/benchmarks --verify # re-check what is there
@@ -69,11 +69,14 @@ downloaded artifacts only; the derived text form the rig actually reads is check
 `--convert` is passed too (`--verify --convert`), because building and checking it are one opt-in
 step — so `--verify` alone is not a full check of what the rig reads.
 
-The three benchmarks and their pins:
+The catalog's entries and their pins — the benchmarks the rig has columns for, plus the run scripts
+SWE-bench Pro is scored by (a support artifact, not a column of its own, which is why the fetch
+catalog is wider than the table):
 
-| benchmark | source | revision | artifact(s) |
+| catalog entry | source | revision | artifact(s) |
 |---|---|---|---|
 | `swe-bench-pro` | ModelScope `ScaleAI/SWE-bench_Pro` | `0c470e9c…` | `test-00000-of-00001.parquet` (7.5 MiB, 731 rows); `test-00000-of-00001.jsonl` under `--convert` |
+| `swe-bench-pro-os` | GitHub `scaleapi/SWE-bench_Pro-os` | `66f92766…` | tarball (15.5 MiB), unpacked to `swe-bench-pro-os/run_scripts` — the per-instance scoring scripts |
 | `toolathlon-gym` | GitHub `eigent-ai/toolathlon_gym` | `ed735ba0…` | tarball (104 MiB, 503 tasks), extracted to `toolathlon-gym/` |
 | `hle` | ModelScope `cais/hle` | `1ec1f1f2…` | `test-00000-of-00001.parquet` (262 MiB, ~2,500 questions); `test-00000-of-00001.jsonl` under `--convert` |
 
