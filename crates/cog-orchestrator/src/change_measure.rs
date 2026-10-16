@@ -25,6 +25,7 @@
 //! [`CheckOutcome::Unsettled`], carrying both a reason from a closed set and the
 //! detail, and the caller leaves those rows' states alone.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -391,6 +392,38 @@ impl Snapshot {
     }
 }
 
+/// The line of development one revision sits on: that commit and every commit it
+/// descends from.
+///
+/// Asked once per pass rather than once per revision. `git merge-base
+/// --is-ancestor` answers exactly this, one process per question, and the
+/// question is asked about every landed row; a pass that swept the account would
+/// spend a few hundred processes learning one set. The set is that set.
+///
+/// Membership is the whole interface, and a revision outside it means one of
+/// three things to a caller -- another branch, a history that was rewritten, or a
+/// revision this repository was never given -- which are the same thing here:
+/// whatever named it is not part of what this line carries. Callers that have to
+/// tell those apart do it where they can, from the naming side, not from this
+/// set.
+#[derive(Debug, Clone)]
+pub struct Reach {
+    head: String,
+    ancestors: HashSet<String>,
+}
+
+impl Reach {
+    /// The commit the set was read from.
+    pub fn head(&self) -> &str {
+        &self.head
+    }
+
+    /// Whether `rev` is this commit or one of the commits it descends from.
+    pub fn contains(&self, rev: &str) -> bool {
+        self.ancestors.contains(rev)
+    }
+}
+
 /// The project's source, read at one commit out of a git repository.
 ///
 /// Cheap to clone (a path and a ref) so that every check in a pass reads the same
@@ -455,6 +488,38 @@ impl CheckTree {
             .map(str::to_string)
             .collect();
         Ok(Snapshot { rev, top_level })
+    }
+
+    /// The line of development `revision` sits on, or why it could not be read.
+    ///
+    /// The revision is resolved rather than compared as written, because the two
+    /// sides of a revision comparison are not the same string: an image tag
+    /// carries as many characters of the commit as fit in it, a measurement
+    /// carries all of them, and comparing the two as text would report every row
+    /// as foreign. Resolving is also what separates the two failures this can
+    /// have -- a revision the repository cannot resolve at all, and one that
+    /// resolves to a commit this line does not carry -- and those reach a caller
+    /// differently, as an error here and a `false` from [`Reach::contains`].
+    pub async fn reach(&self, revision: &str) -> Result<Reach, String> {
+        let spec = format!("{revision}^{{commit}}");
+        let head = self
+            .git(&["rev-parse", "--verify", spec.as_str()])
+            .await
+            .map_err(|e| {
+                format!("the revision {revision} does not name a commit in this repository: {e}")
+            })?
+            .trim()
+            .to_string();
+        let listing = self
+            .git(&["rev-list", head.as_str()])
+            .await
+            .map_err(|e| format!("no line of development could be read from {head}: {e}"))?;
+        let ancestors = listing
+            .split_whitespace()
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect();
+        Ok(Reach { head, ancestors })
     }
 
     /// One check, against the snapshot [`Self::snapshot`] returned.
@@ -1352,6 +1417,77 @@ mod tests {
         tree.snapshot()
             .await
             .expect("the fixture repository is readable")
+    }
+
+    /// The line a revision sits on is read once, and three things about it are
+    /// what the live-revision reading rests on: a commit is on its own line, the
+    /// commits before it are too, and the prefix an image tag carries names the
+    /// same commit as the full hash a measurement carries.
+    ///
+    /// The last one is the whole reason the revision is resolved instead of
+    /// compared: the two sides of that comparison are written by different
+    /// producers, and a reading that compared them as text would report every
+    /// row as foreign.
+    #[tokio::test]
+    async fn a_revision_is_read_into_the_line_it_sits_on() {
+        let dir = repo(&[("crates/a/src/lib.rs", "pub fn a() {}\n")]);
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let first = tree.rev().await.expect("the fixture head resolves");
+
+        let work = dir.path().join("work");
+        std::fs::write(
+            work.join("crates/a/src/lib.rs"),
+            "pub fn a() {}\npub fn b() {}\n",
+        )
+        .expect("a second revision to commit");
+        let out = std::process::Command::new("git")
+            .args([
+                "--git-dir",
+                dir.path().join("bare").to_str().expect("a spellable path"),
+                "--work-tree",
+                work.to_str().expect("a spellable path"),
+                "commit",
+                "-q",
+                "-a",
+                "-m",
+                "second",
+            ])
+            .output()
+            .expect("git on the test host");
+        assert!(
+            out.status.success(),
+            "the second fixture commit: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let head = tree.rev().await.expect("the second head resolves");
+        let reach = tree
+            .reach("main")
+            .await
+            .expect("main is a line of development");
+        assert_eq!(reach.head(), head.as_str());
+        assert!(reach.contains(&head), "a commit is on its own line");
+        assert!(
+            reach.contains(&first),
+            "a commit the head descends from is on the same line"
+        );
+
+        let tag = &head[..12];
+        let from_tag = tree
+            .reach(tag)
+            .await
+            .expect("a tag's prefix names the commit");
+        assert_eq!(from_tag.head(), head.as_str());
+        assert!(from_tag.contains(&first));
+
+        assert!(
+            !reach.contains(&"0".repeat(40)),
+            "a commit this repository does not carry is not on the line"
+        );
+        assert!(
+            tree.reach("no-such-revision").await.is_err(),
+            "a revision nothing can resolve is a failure, not an empty line"
+        );
     }
 
     /// The literal of a debt check is the dependency's own assignment, not its

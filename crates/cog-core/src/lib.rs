@@ -36,6 +36,7 @@ pub use contract::hook::*;
 pub use contract::host_documents;
 pub use contract::knowledge::*;
 pub use contract::kv::*;
+pub use contract::live_revision::*;
 pub use contract::llm::*;
 pub use contract::media::*;
 pub use contract::memory::*;

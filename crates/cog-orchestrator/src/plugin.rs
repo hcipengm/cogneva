@@ -728,6 +728,15 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                     // either, and refusing to keep the change account over that
                     // would trade a missing intake for a missing ledger.
                     ctx.consume_service::<dyn cog_core::PrincipleLedgerStore>(),
+                    // The second face of "is it done": whoever can read which
+                    // revision the workloads are running publishes it, and this
+                    // loop compares its landed rows against that. Optional, like
+                    // the other collaborators -- a process with no client or no
+                    // grant to the cluster has no such reading to offer, and a
+                    // loop that refused to keep the account over that would
+                    // trade a missing reading for a missing ledger. Which it is
+                    // is said at start-up.
+                    ctx.consume_service::<dyn cog_core::LiveRevisionSource>(),
                 );
             }
             None => info!("change ledger loop not started: no ChangeLedgerStore published"),

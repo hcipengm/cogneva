@@ -64,10 +64,21 @@
 //! carrying a header declaring the gate, which is the same declaration the
 //! principle ledger's own look reads, so both accounts close a row on one fact.
 //!
+//! And the last reading is the second face of "is it done". The tree answers
+//! whether the project's own line carries a change, and nothing in the tree
+//! answers whether the workloads are running that revision -- they are apart for
+//! the whole of every rollout, and no reading of the tree can see across the
+//! gap. That second answer comes from a source published by whoever can read the
+//! cluster, and this loop compares the account's landed rows against it, naming
+//! the ones the running revision does not carry and saying so differently when
+//! the comparison cannot be taken at all. It moves no row: being out of effect
+//! is a fact about a face this account does not own, and the tree's own answer
+//! stands.
+//!
 //! principle: feedback_a_version_bit_on_a_dispatch_id_must_keep_generation_zero_identical
 //! principle: feedback_a_typed_field_that_exists_may_never_have_been_filled
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -76,9 +87,9 @@ use tracing::{debug, info, warn};
 use cog_core::{
     metric_names, ChangeIdentity, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement,
     ChangePriority, ChangeReading, ChangeReopen, ChangeSource, ChangeState, DispatchDecision,
-    DispatchState, LlmPoolStatus, MetricsBackend, OrchestratorControl, OwnerLeaseBroker,
-    PoolReading, PrincipleCheckKind, PrincipleLedgerStore, PrincipleRow, ShutdownSignal, Task,
-    TaskStatus, TaskType,
+    DispatchState, LiveRevision, LiveRevisionSource, LlmPoolStatus, MetricsBackend,
+    OrchestratorControl, OwnerLeaseBroker, PoolReading, PrincipleCheckKind, PrincipleLedgerStore,
+    PrincipleRow, ShutdownSignal, Task, TaskStatus, TaskType,
 };
 
 use cog_core::contract::llm::UpstreamFailure;
@@ -453,6 +464,12 @@ fn dispatch_goal(row: &ChangeLedgerRow) -> String {
 /// unpaid principles to read, which is different from having some and not
 /// looking.
 ///
+/// `live_revision` is the second face of "is it done": a source that can read
+/// which revision the workloads are running, published by the component whose
+/// client and grants reach the cluster. Optional like the others, and the loop
+/// says which it is at start-up rather than measuring landed rows against
+/// nothing and reporting that as nothing being out of effect.
+///
 /// One parameter per collaborator the process may or may not publish, so the
 /// list grows with the number of source accounts rather than with anything this
 /// loop decides; grouping them into a struct would only move the same list to a
@@ -467,6 +484,7 @@ pub fn spawn_change_ledger_loop(
     shutdown: ShutdownSignal,
     tree: CheckTree,
     principles: Option<Arc<dyn PrincipleLedgerStore>>,
+    live_revision: Option<Arc<dyn LiveRevisionSource>>,
 ) {
     info!(
         interval_secs = CHANGE_LEDGER_PASS_INTERVAL.as_secs(),
@@ -474,6 +492,7 @@ pub fn spawn_change_ledger_loop(
         dispatching = orchestrator.is_some(),
         pool_gated = pool.is_some(),
         readable = metrics.is_some(),
+        live_revision_read = live_revision.is_some(),
         "Change ledger loop enabled"
     );
     if principles.is_none() {
@@ -498,6 +517,16 @@ pub fn spawn_change_ledger_loop(
              without knowing whether any upstream can serve it -- seen, and recorded as absent"
         );
     }
+    if live_revision.is_none() {
+        // Said at start-up, once, rather than by a pass that measures nothing
+        // against nothing: the tree's answer is then the account's only answer,
+        // and a reader of the account has to know that the second face is not
+        // being read rather than read as empty.
+        warn!(
+            "change ledger: nothing publishes the running revision, so this loop cannot say \
+             whether the changes it has landed are in effect -- the tree's answer stands alone"
+        );
+    }
 
     drop(cog_core::loop_health::spawn(
         CHANGE_LEDGER_LOOP,
@@ -513,6 +542,7 @@ pub fn spawn_change_ledger_loop(
             let shutdown = shutdown.clone();
             let tree = tree.clone();
             let principles = principles.clone();
+            let live_revision = live_revision.clone();
             async move {
                 // The role is renewed on the lease contract's own cadence rather
                 // than once per pass: a pass can be long, and a term that ran out
@@ -535,6 +565,17 @@ pub fn spawn_change_ledger_loop(
                 // the row keeps: a carried pause records `absent` as its
                 // reading, so "blind since when" is readable from the series.
                 let mut pool_posture: Option<PoolVerdict> = None;
+
+                // The landed rows the running revision does not carry, by
+                // identity, with the revision each of them was measured at. Held
+                // across ticks because what a reader acts on is a row *entering*
+                // or *leaving* this set: a set rebuilt from scratch every pass
+                // can only say how many are in it, not which way any row moved,
+                // and the arrival is the event -- the duration is not news.
+                // Nothing here is written to the account; see
+                // [`live_revision_pass`] for why the state stays where the tree
+                // put it.
+                let mut out_of_effect: HashMap<ChangeIdentity, String> = HashMap::new();
 
                 let mut ticker = tokio::time::interval(CHANGE_LEDGER_PASS_INTERVAL);
                 // The first tick is immediately ready; eating it puts the first
@@ -582,6 +623,19 @@ pub fn spawn_change_ledger_loop(
                     // re-said as unsettled by the same pass.
                     retire_pass(&*store).await;
                     measure_pass(&*store, &tree, &mut unsettled).await;
+                    // The second face of "is it done", read after the
+                    // measurement so that a row this pass just found landed is
+                    // checked in the same pass it landed in -- the gap between
+                    // landing and running opens with the landing, and a check
+                    // one period behind would report the first period of every
+                    // rollout as nothing being out of effect.
+                    //
+                    // It moves no row, so its position relative to the hand-over
+                    // below carries no ordering: what it reads is the landed
+                    // set, and the hand-over reads the pending one.
+                    if let Some(ref live) = live_revision {
+                        live_revision_pass(&*store, &tree, &**live, &mut out_of_effect).await;
+                    }
                     // Handing over comes last, and that order is the point: the
                     // set dispatched is then the set as of this pass, so a change
                     // this pass just found in the tree is never handed to anyone,
@@ -1431,6 +1485,181 @@ async fn reopen_pass(
     (rechecked, reopened)
 }
 
+/// Check the account's landed rows against the revision the workloads are
+/// running.
+///
+/// "Landed" is a claim about the project's own line of development, and
+/// [`measure_pass`] reads it out of the tree. Whether that revision is also the
+/// one *running* is a question about a second face, and the two are apart for
+/// the whole of every rollout -- a build, a CI verdict, an admission decision and
+/// a rolling update all sit inside that gap, which is measured in minutes and
+/// sometimes hours. No reading of the tree crosses it, so an account that only
+/// looks at the tree reports a merged change as done while nothing is running it
+/// and goes on saying so until the rollout lands, with nothing anywhere that says
+/// the two are apart.
+///
+/// So this pass takes the second reading and compares the two. It **moves no
+/// row**: the account's own answer about the tree is right, and being out of
+/// effect is a fact about a face this account does not own. What it produces is
+/// the annotation -- one line per row the running revision does not carry, said
+/// when the row *enters* that set, beside a line per pass carrying the counts.
+///
+/// Said on arrival rather than every pass, and that is not a saving. A row out of
+/// effect is out of effect for exactly as long as the rollout takes, so a line
+/// per row per pass would repeat the arrival until it could not be told from the
+/// duration, and the reader who has to act -- somebody is looking at a rollout
+/// that is not finishing -- would be reading the one fact this pass exists to
+/// report. The count is on every pass, so "how many" is never lost; only the
+/// repetition is.
+///
+/// Three readings, and the third is why this is not a boolean. The workloads may
+/// be on one main revision, they may be split across two because a rollout is
+/// between them, or the cluster may not answer at all. The last two are different
+/// faults with different remedies -- one is a rollout in progress, the other is a
+/// grant or an API server -- and neither is "nothing is out of effect". A bare
+/// revision plus a default would say exactly that about both, which is why the
+/// source answers with a shape that has no default in it.
+///
+/// Nothing here is raised: this is a maintenance tick, the next tick is the retry,
+/// and a pass that could not take the reading leaves a line saying so rather than
+/// leaving a count that reads as zero.
+async fn live_revision_pass(
+    store: &dyn ChangeLedgerStore,
+    tree: &CheckTree,
+    source: &dyn LiveRevisionSource,
+    out_of_effect: &mut HashMap<ChangeIdentity, String>,
+) {
+    let live = match source.live_revision().await {
+        LiveRevision::Known(rev) => rev,
+        LiveRevision::Unmeasurable(gap) => {
+            warn!(
+                gap = gap.as_str(),
+                held = out_of_effect.len(),
+                "change ledger: the revision the workloads are running could not be read, so no \
+                 landed row was checked against it this pass -- which is not the same as a pass \
+                 that found nothing out of effect"
+            );
+            return;
+        }
+    };
+    // A revision the tree cannot place is the third fault, and it belongs with
+    // the two above rather than with the rows: nothing was learned about any row
+    // here either. It is also the one fault that can be a row's own property
+    // inverted -- the account may hold revisions this repository was never given
+    // -- so it is named with the revision rather than counted as an answer.
+    let reach = match tree.reach(&live).await {
+        Ok(reach) => reach,
+        Err(why) => {
+            warn!(
+                live_rev = %live,
+                why = %why,
+                held = out_of_effect.len(),
+                "change ledger: the revision the workloads are running names no commit in this \
+                 tree, so no landed row was checked against it this pass -- a revision this tree \
+                 cannot place is not a row that is out of effect"
+            );
+            return;
+        }
+    };
+    let landed = match store.census().await {
+        Ok(census) => census
+            .iter()
+            .filter(|(state, _)| *state == ChangeState::Landed)
+            .map(|(_, count)| *count)
+            .sum::<u64>(),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: the landed count could not be read, so no landed row was checked \
+                 against the revision the workloads are running"
+            );
+            return;
+        }
+    };
+    // The bound is the population itself rather than a number chosen for it. The
+    // question is "is anything the account calls landed not in effect", and an
+    // answer over a share of the landed rows would read as an answer over all of
+    // them -- a count of the rows that happened to sort first, which is the
+    // shape the dispatch bound's own comment calls a claim the pass stops
+    // keeping. A constant here would be a guess at how large the account gets,
+    // and the account already answered that: its own count is the read.
+    let rows = match store.landed_due(landed as usize).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: the landed rows could not be read, so nothing was checked against \
+                 the revision the workloads are running"
+            );
+            return;
+        }
+    };
+
+    let mut still_landed: HashSet<ChangeIdentity> = HashSet::with_capacity(rows.len());
+    let mut checked = 0usize;
+    let mut in_effect = 0usize;
+    let mut entered = 0usize;
+    let mut recovered = 0usize;
+    let mut no_revision = 0usize;
+    for row in rows {
+        let Some(measured) = row.measured_rev.as_deref() else {
+            // Landed with no revision named: a measurement taken by a process
+            // that had none to name. It cannot be placed on any line, so it is
+            // counted apart rather than folded into either side -- the same
+            // three-valued discipline the tree reading keeps, one level up.
+            no_revision += 1;
+            continue;
+        };
+        still_landed.insert(row.identity.clone());
+        checked += 1;
+        if reach.contains(measured) {
+            in_effect += 1;
+            if out_of_effect.remove(&row.identity).is_some() {
+                recovered += 1;
+                info!(
+                    change = %row.identity,
+                    measured_rev = %measured,
+                    live_rev = reach.head(),
+                    "change ledger: this change is in the revision the workloads are running now"
+                );
+            }
+            continue;
+        }
+        let arrived = match out_of_effect.get(&row.identity) {
+            Some(known) => known != measured,
+            None => true,
+        };
+        if arrived {
+            out_of_effect.insert(row.identity.clone(), measured.to_string());
+            entered += 1;
+            warn!(
+                change = %row.identity,
+                measured_rev = %measured,
+                live_rev = reach.head(),
+                "change ledger: this change's revision is not in the live rev -- the project's own \
+                 line carries it and the workloads are not running it"
+            );
+        }
+    }
+    // A row that is no longer landed at all -- reopened, or retired -- is not out
+    // of effect any more, and dropping it here is what keeps the next landing of
+    // the same identity an arrival rather than a state it was already in.
+    out_of_effect.retain(|identity, _| still_landed.contains(identity));
+
+    info!(
+        landed_rows = landed,
+        checked,
+        in_effect,
+        out_of_effect = out_of_effect.len(),
+        entered,
+        back_in_effect = recovered,
+        no_revision,
+        live_rev = reach.head(),
+        "change ledger: checked the account's landed rows against the revision the workloads are \
+         running"
+    );
+}
+
 /// The rows a pass hands over: the ones still owed that this pass has not just
 /// found it cannot measure.
 ///
@@ -2189,7 +2418,7 @@ fn outstanding_summary(rows: &[ChangeLedgerRow]) -> String {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
-    use cog_core::{ChangeIdentity, SFError, SFResult};
+    use cog_core::{ChangeIdentity, LiveRevisionGap, SFError, SFResult};
 
     fn row(state: ChangeState, measured_at: Option<i64>) -> ChangeLedgerRow {
         ChangeLedgerRow {
@@ -3071,8 +3300,14 @@ mod tests {
                 .cloned()
                 .collect())
         }
-        async fn landed_due(&self, _limit: usize) -> SFResult<Vec<ChangeLedgerRow>> {
-            Ok(Vec::new())
+        async fn landed_due(&self, limit: usize) -> SFResult<Vec<ChangeLedgerRow>> {
+            Ok(self
+                .rows
+                .iter()
+                .filter(|row| row.state == ChangeState::Landed)
+                .take(limit)
+                .cloned()
+                .collect())
         }
         async fn record_reopen(&self, _reopen: &ChangeReopen) -> SFResult<()> {
             Ok(())
@@ -3293,6 +3528,226 @@ mod tests {
             state.rearmed <= state.submitted,
             "a row re-armed and not submitted is not a re-arm the pass performed: {state:?}"
         );
+    }
+
+    // ── The second face of "is it done" ──
+    //
+    // Driven over a real repository and a ledger in memory, because what the pass
+    // turns on is a revision being or not being on a line of development, and
+    // that question is answered by git. The state a reader acts on is the set the
+    // pass keeps across ticks -- a row arriving in it, leaving it, or staying
+    // where it was when the reading could not be taken -- so the tests read that
+    // set back rather than the counts, which are the pass's own line.
+
+    /// A repository with two commits on `main`, and both hashes: a landed row
+    /// can have been measured at either, and only one of them is running.
+    fn two_revision_repo() -> (tempfile::TempDir, String, String) {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let bare = dir.path().join("bare");
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).expect("the scratch worktree");
+        let bare = bare
+            .to_str()
+            .expect("a path this host can spell")
+            .to_string();
+        let work = work
+            .to_str()
+            .expect("a path this host can spell")
+            .to_string();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .output()
+                .expect("git on the test host");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        git(&["init", "-q", "--bare", "-b", "main", &bare]);
+        git(&[
+            "--git-dir",
+            &bare,
+            "config",
+            "user.email",
+            "tree@cogneva.invalid",
+        ]);
+        git(&["--git-dir", &bare, "config", "user.name", "tree"]);
+        let commit = |text: &str| {
+            std::fs::write(std::path::Path::new(&work).join("file"), text)
+                .expect("the fixture file");
+            git(&["--git-dir", &bare, "--work-tree", &work, "add", "--all"]);
+            git(&[
+                "--git-dir",
+                &bare,
+                "--work-tree",
+                &work,
+                "commit",
+                "-q",
+                "-m",
+                "fixture",
+            ]);
+            git(&["--git-dir", &bare, "rev-parse", "HEAD"])
+                .trim()
+                .to_string()
+        };
+        let first = commit("first");
+        let second = commit("second");
+        (dir, first, second)
+    }
+
+    /// A landed row that names the revision it was measured at.
+    fn landed_row(scope: &str, measured_rev: Option<&str>) -> ChangeLedgerRow {
+        ChangeLedgerRow {
+            state: ChangeState::Landed,
+            measured_rev: measured_rev.map(str::to_string),
+            ..pending_row(scope)
+        }
+    }
+
+    /// The revision the workloads are running, held fixed for one test.
+    struct FixedLive(LiveRevision);
+
+    #[async_trait::async_trait]
+    impl LiveRevisionSource for FixedLive {
+        async fn live_revision(&self) -> LiveRevision {
+            self.0.clone()
+        }
+    }
+
+    /// A landed row the running revision does not carry is named, and one it
+    /// does carry is not: the same tree, the same account, two rows, and the
+    /// second face is the only thing that tells them apart.
+    #[tokio::test]
+    async fn a_landed_row_the_running_revision_does_not_carry_is_named() {
+        let (dir, first, second) = two_revision_repo();
+        let store = FakeLedger {
+            rows: vec![
+                landed_row("crates/in-effect", Some(&first)),
+                landed_row("crates/undeployed", Some(&second)),
+                // Landed with no revision named. It cannot be placed on any
+                // line, which is a third answer and not "in effect".
+                landed_row("crates/unnamed", None),
+            ],
+            ..Default::default()
+        };
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let mut out_of_effect = HashMap::new();
+
+        live_revision_pass(
+            &store,
+            &tree,
+            &FixedLive(LiveRevision::Known(first.clone())),
+            &mut out_of_effect,
+        )
+        .await;
+
+        assert_eq!(
+            out_of_effect.len(),
+            1,
+            "only the row measured past the running revision is out of effect: {out_of_effect:?}"
+        );
+        let undeployed = ChangeIdentity::new("grep", "crates/undeployed", "fn thing");
+        assert_eq!(
+            out_of_effect.get(&undeployed).map(String::as_str),
+            Some(second.as_str()),
+            "the row is held with the revision it was measured at, not with a flag"
+        );
+        assert!(
+            !out_of_effect.contains_key(&ChangeIdentity::new("grep", "crates/unnamed", "fn thing")),
+            "a row nothing can place is counted apart, not reported as out of effect"
+        );
+
+        // And the same account against a revision that carries both: the row
+        // leaves the set, which is the reading that says the rollout finished.
+        live_revision_pass(
+            &store,
+            &tree,
+            &FixedLive(LiveRevision::Known(second.clone())),
+            &mut out_of_effect,
+        )
+        .await;
+        assert!(
+            out_of_effect.is_empty(),
+            "a row in the running revision is not out of effect: {out_of_effect:?}"
+        );
+    }
+
+    /// A row that stops being landed leaves the set: it is not out of effect any
+    /// more, it is not done any more, and those are two different facts that the
+    /// next landing of the same identity would otherwise read as one.
+    #[tokio::test]
+    async fn a_row_that_is_no_longer_landed_leaves_the_set() {
+        let (dir, first, second) = two_revision_repo();
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let mut out_of_effect = HashMap::new();
+
+        let landed = FakeLedger {
+            rows: vec![landed_row("crates/x", Some(&second))],
+            ..Default::default()
+        };
+        live_revision_pass(
+            &landed,
+            &tree,
+            &FixedLive(LiveRevision::Known(first.clone())),
+            &mut out_of_effect,
+        )
+        .await;
+        assert_eq!(out_of_effect.len(), 1);
+
+        let reopened = FakeLedger {
+            rows: vec![pending_row("crates/x")],
+            ..Default::default()
+        };
+        live_revision_pass(
+            &reopened,
+            &tree,
+            &FixedLive(LiveRevision::Known(first)),
+            &mut out_of_effect,
+        )
+        .await;
+        assert!(
+            out_of_effect.is_empty(),
+            "a row that is no longer landed is not held as out of effect: {out_of_effect:?}"
+        );
+    }
+
+    /// Every way this reading can fail to be taken leaves the set exactly as it
+    /// was. That is not the same as clearing it and not the same as reporting
+    /// nothing out of effect: what the pass knew is still true as of the last
+    /// time it could look, and the line says which reading could not be taken.
+    #[tokio::test]
+    async fn a_reading_that_cannot_be_taken_moves_nothing() {
+        let (dir, first, _second) = two_revision_repo();
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        // A row that a reading, if it were taken, would find in effect -- so a
+        // pass that took the reading and failed to take it would be visible as a
+        // change to the set rather than as nothing happening.
+        let store = FakeLedger {
+            rows: vec![landed_row("crates/in-effect", Some(&first))],
+            ..Default::default()
+        };
+        let held = ChangeIdentity::new("grep", "crates/undeployed", "fn thing");
+        let mut out_of_effect = HashMap::new();
+        out_of_effect.insert(held.clone(), "0".repeat(40));
+
+        for live in [
+            LiveRevision::Unmeasurable(LiveRevisionGap::NoUnanimousMainTag),
+            LiveRevision::Unmeasurable(LiveRevisionGap::ClusterUnreadable),
+            // A revision the cluster names and this tree cannot place: a third
+            // fault, and the one that would otherwise be read as every landed
+            // row being out of effect at once.
+            LiveRevision::Known("0".repeat(40)),
+        ] {
+            live_revision_pass(&store, &tree, &FixedLive(live.clone()), &mut out_of_effect).await;
+            assert_eq!(
+                out_of_effect.keys().collect::<Vec<_>>(),
+                vec![&held],
+                "{live:?} moved the set instead of leaving it as it was"
+            );
+        }
     }
 
     fn pending_row(scope: &str) -> ChangeLedgerRow {
