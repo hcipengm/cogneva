@@ -205,3 +205,38 @@ fn a_held_round_is_readable_and_its_stretch_has_an_end() {
         "「恢复」那句没有把 held_rounds 写回 0。"
     );
 }
+
+/// 被扣住的那一轮**照样 beat**——这是「这一支被扣住」能从别处读数推出来的前提。
+///
+/// 判据写成**位置关系**而不是**当时的状态**：曾经的依据是「扣住时 beat 缺席」，
+/// 而那条依据只对本函数当时的写法成立，函数一改，依据就作废而判词看着没变。
+/// 「beat 在两道闸之前」是能用文本位置机检的形状，所以钉这个。
+#[test]
+fn the_rounds_beat_is_not_behind_either_gate() {
+    let source = plugin_source();
+    let body = fn_body(production_source(&source), LOOP_FN);
+
+    let loop_at = body
+        .find("loop {")
+        .expect("spawn_discovery_loop 里没有循环");
+    let beat = body.find("beat.beat()").expect("循环体里没有 beat.beat()");
+    let next = body
+        .find("interval.tick().await")
+        .expect("循环里没有节拍等待");
+    let hold = body.find(ROLE_ASK).expect("循环体里没有 hold.may_act()");
+    let gate = body
+        .find("pool_gate.llm_paused()")
+        .expect("循环体里没有池闸那一问");
+
+    // 一条链，不是两条断言：四个位置构成同一个形状（这一拍每轮走一次、且走在两道闸
+    // 之前）。拆成两条时其中一条永远轮不到红——消融把 beat 挪到闸后，先断的那条
+    // 是「在不在循环开头」，第二条就成了没被证过的半条。
+    assert!(
+        loop_at < beat && beat < next && next < hold && next < gate,
+        "这一拍的位置不对（循环体起点第 {loop_at} 字节、beat 第 {beat}、节拍等待第 {next}、\n\
+         may_act 第 {hold}、池闸第 {gate}）：要的是「每轮一拍，且走在两道闸之前」。\n\
+         走到闸之后就变成——被扣住的那一轮不再 beat，于是「这条环被闸扣住」从别处的\n\
+         读数推不出来：池级 gauge 只说闸关着，说不了这条环在不在跑，跳过那句就得\n\
+         是唯一读数面。"
+    );
+}
