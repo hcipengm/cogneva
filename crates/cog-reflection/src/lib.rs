@@ -985,31 +985,6 @@ impl ReflectionEngine {
         Ok(())
     }
 
-    /// Generate a batch of discovery tasks.
-    pub async fn generate_discovery_tasks(
-        &self,
-        tool_names: &[String],
-        skill_ids: &[String],
-        max_tasks: usize,
-    ) -> Vec<crate::types::DiscoveryTask> {
-        match self.discovery {
-            Some(ref disc) => disc.generate_tasks(tool_names, skill_ids, max_tasks).await,
-            None => Vec::new(),
-        }
-    }
-
-    /// Retire the combination a discovery task is one attempt at.
-    ///
-    /// Deliberately not part of generating: only the caller that submits the
-    /// task learns whether the submission was accepted, and an engine that
-    /// retired its own proposals would retire the refused ones too -- spending
-    /// the combination on an attempt that never happened.
-    pub async fn mark_discovery_explored(&self, task: &crate::types::DiscoveryTask) {
-        if let Some(ref disc) = self.discovery {
-            disc.mark_explored(task).await;
-        }
-    }
-
     /// Evaluate a discovery task result.
     pub async fn evaluate_discovery_result(
         &self,

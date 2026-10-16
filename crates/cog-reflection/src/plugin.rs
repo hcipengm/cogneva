@@ -1899,6 +1899,11 @@ fn discovery_probe_task(probe: &crate::types::DiscoveryTask) -> (String, cog_cor
         serde_json::json!({
             "goal": goal,
             "task_kind": "capability_discovery",
+            // 这道探针是**哪一个组合**的一次尝试，按生成器过滤用的那个串写出来。
+            // 它随工作一起走，因为下游只有这一条路能知道：从 `tools` 反推只复现得出
+            // 配对那一种语法（`tool:a+b`），另外三种（参数 / 迁移 / 边界）反推不出来，
+            // 于是「这条探针的结局」就再也接不回它该退场的那一格。
+            "explored_key": probe.explored_key,
             "strategy": probe.strategy,
             "tools": probe.tools,
             "prompt_variants": probe.prompt_variants,
@@ -1906,6 +1911,59 @@ fn discovery_probe_task(probe: &crate::types::DiscoveryTask) -> (String, cog_cor
         }),
     );
     (goal, task)
+}
+
+/// 一轮发现：生成、逐条提交、**按受理**退场。返回（生成数、受理数、被拒数）。
+///
+/// 抽成函数不是为了复用，是为了让这一格的判据**能被打断地量到**：拿一次受理与一次
+/// 拒绝喂进来，看被拒的那条组合下一轮还在不在池子里。此前它只由源码形状守（退场调用
+/// 夹在 `Ok` 与 `Err` 之间），而形状不判行为——把 `mark_explored` 提到 `match` 之前，
+/// 形状照旧、行为已经变成「拒一次也算试过」。
+async fn run_discovery_round<F, Fut>(
+    engine: &crate::DiscoveryEngine,
+    submit: F,
+    tool_names: &[String],
+    skill_ids: &[String],
+    max_tasks: usize,
+) -> (usize, usize, usize)
+where
+    F: Fn(String, cog_core::Task) -> Fut + Send,
+    Fut: std::future::Future<Output = cog_core::SFResult<Vec<String>>> + Send,
+{
+    let tasks = engine
+        .generate_tasks(tool_names, skill_ids, max_tasks)
+        .await;
+    let generated = tasks.len();
+    let mut submitted = 0usize;
+    let mut refused = 0usize;
+
+    for probe in tasks {
+        let (goal, task) = discovery_probe_task(&probe);
+        // 返回值不当成败判：它只说这一趟往图里加了几行（已经在图里的幂等提交不算数），
+        // 离「这条探针跑成了没有」还隔着一整条回路。那一段要先把 `TaskType::Custom`
+        // 的结局在哪个面可读量出来，在那之前把 Ok 读成成功就是拿「提交成功」冒充
+        // 「任务成功」。所以这里只看 Err。
+        match submit(goal, task).await {
+            Ok(_) => {
+                // 组合在**受理**之后才退场，不在生成时。被拒的那条留在池子里、下一轮
+                // 原样再来：拒一次不是试过一次，在生成时就退掉等于拿一次拒把组合
+                // 花掉——第一轮即可清空池子，此后每轮都读到「没有新组合」，与
+                // 「搜索空间已穷尽」同形。
+                engine.mark_explored(&probe).await;
+                submitted += 1;
+            }
+            Err(e) => {
+                refused += 1;
+                warn!(
+                    task_id = %probe.id,
+                    error = %e,
+                    "discovery probe refused by the orchestrator"
+                );
+            }
+        }
+    }
+
+    (generated, submitted, refused)
 }
 
 /// 挂上「把还没试过的工具配对拿去试」的那条循环。
@@ -1943,10 +2001,12 @@ fn spawn_discovery_loop(
         info!("not the self-discovery owner in this deployment; autonomous discovery disabled");
         return;
     }
-    let (Some(tool_registry), Some(orchestrator)) = (tool_registry, orchestrator) else {
+    let (Some(tool_registry), Some(orchestrator), Some(discovery)) =
+        (tool_registry, orchestrator, engine.discovery.clone())
+    else {
         warn!(
-            "autonomous discovery has no way out (no tool registry or no orchestrator \
-             published); loop not armed"
+            "autonomous discovery has no way out (no tool registry, no orchestrator or \
+             no discovery engine); loop not armed"
         );
         return;
     };
@@ -1959,10 +2019,10 @@ fn spawn_discovery_loop(
         cog_core::loop_health::Cadence::Periodic(period),
         // 每轮重建，所以循环体要用到的都先克隆出来。
         move |beat| {
-            let engine = engine.clone();
             let tool_registry = tool_registry.clone();
             let skill_registry = skill_registry.clone();
             let orchestrator = orchestrator.clone();
+            let discovery = discovery.clone();
             let pool_gate = pool_gate.clone();
             async move {
                 let mut interval = tokio::time::interval(period);
@@ -1989,10 +2049,18 @@ fn spawn_discovery_loop(
                         }
                         None => Vec::new(),
                     };
-                    let tasks = engine
-                        .generate_discovery_tasks(&tool_names, &skill_ids, max_tasks)
-                        .await;
-                    if tasks.is_empty() {
+                    let (generated, submitted, refused) = run_discovery_round(
+                        &discovery,
+                        |goal, task| {
+                            let orchestrator = orchestrator.clone();
+                            async move { orchestrator.submit_goal_auto(&goal, vec![task]).await }
+                        },
+                        &tool_names,
+                        &skill_ids,
+                        max_tasks,
+                    )
+                    .await;
+                    if generated == 0 {
                         debug!(
                             tools = tool_names.len(),
                             "discovery round: every combination in reach has been tried"
@@ -2000,34 +2068,6 @@ fn spawn_discovery_loop(
                         continue;
                     }
 
-                    let mut submitted = 0usize;
-                    let mut refused = 0usize;
-                    for probe in tasks {
-                        let (goal, task) = discovery_probe_task(&probe);
-                        // 返回值不当成败判：它只说这一趟往图里加了几行（已经在图里的
-                        // 幂等提交不算数），离「这条探针跑成了没有」还隔着一整条回路。
-                        // 那一段要先把 `TaskType::Custom` 的结局在哪个面可读量出来，
-                        // 在那之前把 Ok 读成成功就是拿「提交成功」冒充「任务成功」。
-                        // 所以这里只看 Err。
-                        match orchestrator.submit_goal_auto(&goal, vec![task]).await {
-                            Ok(_) => {
-                                // 组合在**受理**之后才退场，不在生成时。被拒的那条留在
-                                // 池子里、下一轮原样再来：拒一次不是试过一次，在生成时
-                                // 就退掉等于拿一次拒把组合花掉——第一轮即可清空池子，
-                                // 此后每轮都读到「没有新组合」，与「搜索空间已穷尽」同形。
-                                engine.mark_discovery_explored(&probe).await;
-                                submitted += 1;
-                            }
-                            Err(e) => {
-                                refused += 1;
-                                warn!(
-                                    task_id = %probe.id,
-                                    error = %e,
-                                    "discovery probe refused by the orchestrator"
-                                );
-                            }
-                        }
-                    }
                     info!(
                         tools = tool_names.len(),
                         skills = skill_ids.len(),
@@ -4609,34 +4649,84 @@ mod tests {
         );
     }
 
-    /// 「受理才退场」落在环的哪个分支里，是一条只能读源码的判据：那个闭包要一条
-    /// 真 orchestrator 才跑得起来，测试里到不了。所以钉形状——退场调用必须在 `Ok`
-    /// 分支里、且在 `Err` 分支之前；把它挪进 `Err`、或挪到 `match` 之后（两种都会
-    /// 让被拒的组合也退场），这条就红。
+    /// **受理才退场**：一轮里受理一条、拒一条，被拒的那条下一轮必须还在池子里。
     ///
-    /// 窗口取到本轮那条汇总日志为止：不封口的话窗口会一直伸到本测试模块，把下面
-    /// 这个字符串自己找出来当命中。
-    #[test]
-    fn only_an_accepted_probe_retires_its_combination() {
-        let source = include_str!("plugin.rs");
-        let site = source
-            .find("match orchestrator.submit_goal_auto")
-            .expect("the submission site is gone");
-        let rest = &source[site..];
-        let window = &rest[..rest
-            .find("info!(")
-            .expect("the round's summary log is gone")];
+    /// 这条替掉了原先那版只能读源码形状的判据（退场调用夹在 `Ok` 与 `Err` 之间）：
+    /// 形状不判行为——把退场提到 `match` 之前，形状照旧而行为已经变成「拒一次也算
+    /// 试过」。行为面同样是那个缺陷的破坏面：一轮生成的是**整批**组合，这里只放行
+    /// 一条、其余全拒，被拒的那些要一条不少地留在池子里，而受理的那条要走。
+    ///
+    /// 替身是一个闭包，不是 `OrchestratorControl` 的一条完整实现：这一轮只用到「提交
+    /// 一件事」这一件能力，为它造一份二十个方法的图实现等于在测试里放第二份没人读的
+    /// 编排器。组合名从**交出去的载荷**里读——下一轮的池子正是按它过滤的。
+    #[tokio::test]
+    async fn only_an_accepted_probe_retires_its_combination() {
+        let tools: Vec<String> = ["read_file", "run_command", "write_file"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let engine = crate::DiscoveryEngine::new(std::sync::Arc::new(
+            crate::recorder::InMemoryRecorder::new(),
+        ));
 
-        let accepted = window.find("Ok(_) =>").expect("no accepted arm");
-        let retired = window
-            .find("mark_discovery_explored")
-            .expect("nothing in the round retires a combination");
-        let refused = window.find("Err(e) =>").expect("no refusal arm");
+        let first = engine.generate_tasks(&tools, &[], 64).await;
+        let accepted = first
+            .iter()
+            .find(|t| t.explored_key.starts_with("tool:"))
+            .expect("no tool combination proposed")
+            .explored_key
+            .clone();
+        let refused_keys: Vec<String> = first
+            .iter()
+            .map(|t| t.explored_key.clone())
+            .filter(|k| *k != accepted)
+            .collect();
+        assert!(!refused_keys.is_empty(), "one round proposes more than one");
 
-        assert!(
-            accepted < retired && retired < refused,
-            "retirement must sit in the accepted arm: accepted={accepted} \
-             retired={retired} refused={refused}"
+        let (generated, submitted, refused) = run_discovery_round(
+            &engine,
+            |_goal, task| {
+                let key = task
+                    .input
+                    .get("explored_key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let accepted = accepted.clone();
+                async move {
+                    if key == accepted {
+                        Ok(vec![task.id.clone()])
+                    } else {
+                        Err(cog_core::SFError::Validation(
+                            "the orchestrator refused this probe".into(),
+                        ))
+                    }
+                }
+            },
+            &tools,
+            &[],
+            64,
+        )
+        .await;
+
+        assert_eq!(
+            (generated, submitted, refused),
+            (first.len(), 1, first.len() - 1),
+            "一轮的账：生成 {} 条、受理一条、其余全拒",
+            first.len()
         );
+
+        let after = engine.generate_tasks(&tools, &[], 64).await;
+        let after_keys: Vec<String> = after.iter().map(|t| t.explored_key.clone()).collect();
+        assert!(
+            !after_keys.contains(&accepted),
+            "受理过的组合要退场：{after_keys:?}"
+        );
+        for key in &refused_keys {
+            assert!(
+                after_keys.contains(key),
+                "被拒的 {key} 也要留在池子里等下一轮，否则一次拒绝就把组合花掉了：{after_keys:?}"
+            );
+        }
     }
 }
