@@ -169,6 +169,24 @@ pub struct LlmUsageRecord {
     /// cached is a subset of input, on Anthropic the two are disjoint), which
     /// is why they stay apart here instead of being netted out.
     pub tokens_cached: u64,
+    /// What this platform's own estimator priced the request at, before any
+    /// upstream counted the prompt.
+    ///
+    /// The row's other input figure is the upstream's truth; this one is the
+    /// estimate the window budget is judged against, so one row carries both
+    /// rulers and the gap between them is readable. The estimate is a
+    /// deliberate lower bound ([`cog_core::estimate_tokens`], the unit the
+    /// agent's context window trims by) over the serialized body this gateway
+    /// sent, so `estimated_input` below `tokens_input` is expected and its
+    /// *size* is the finding: a gap that tracks the content mix is the
+    /// estimator's, a request the estimator also called over budget is the
+    /// window's. Without both numbers on the same row those two read alike,
+    /// which is why this is a column and not a counter of over-budget calls.
+    ///
+    /// `None` on rows landed by a path that does not price a request (failed
+    /// attempts and pooled refusals). Absent is not zero here: a row priced at
+    /// zero would read as an empty prompt, and the two have opposite repairs.
+    pub estimated_input: Option<u64>,
     /// Wall time of the call; for streams this is first-byte to last-byte.
     pub latency_ms: u64,
 }
@@ -346,6 +364,17 @@ impl LlmUsageStore {
         )
         .execute(&self.pool)
         .await?;
+        // Additive migration for the estimate dimension, and the one column here
+        // that is nullable on purpose. "This row was not priced" (older rows, and
+        // rows landed by the failure path) is not "this row was priced at zero" --
+        // a NOT NULL DEFAULT 0 would make both read as an empty prompt, and a
+        // reader grouping by the gap between the two rulers has to handle the
+        // absence rather than silently pair it with the truth.
+        sqlx::query(
+            "ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS estimated_input BIGINT",
+        )
+        .execute(&self.pool)
+        .await?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_gateway_llm_usage_ts ON gateway_llm_usage (ts)",
         )
@@ -423,8 +452,8 @@ impl LlmUsageStore {
             r#"
             INSERT INTO gateway_llm_usage
                 (id, upstream, api_style, model, result, actor, origin,
-                 tokens_input, tokens_output, tokens_cached, latency_ms)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                 tokens_input, tokens_output, tokens_cached, estimated_input, latency_ms)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             "#,
         )
         .bind(uuid::Uuid::new_v4())
@@ -437,6 +466,7 @@ impl LlmUsageStore {
         .bind(r.tokens_input as i64)
         .bind(r.tokens_output as i64)
         .bind(r.tokens_cached as i64)
+        .bind(r.estimated_input.map(|v| v as i64))
         .bind(r.latency_ms as i64)
         .execute(&self.pool)
         .await?;

@@ -1988,6 +1988,11 @@ fn failed_attempt_usage(
         tokens_input: 0,
         tokens_output: 0,
         tokens_cached: 0,
+        // 没量过，而且是故意的：这一行说的是"试过但被拒"，它没有上游真值可以配对
+        // （`tokens_input` 是 0，一个 token 都没读回来），单独一个估算放上去会被读成
+        // "估算 X、真值 0"的一次超额。定价只落在有真值的那一行上。填 0 更糟：会读成
+        // 空提示词。
+        estimated_input: None,
         latency_ms,
     })
 }
@@ -2026,6 +2031,9 @@ fn pooled_refusal_usage(style: &str, actor: &str, origin: &str) -> LlmUsageRecor
         tokens_input: 0,
         tokens_output: 0,
         tokens_cached: 0,
+        // 同 [`failed_attempt_usage`]：这一行说的是"一个上游都没发出去"，那份请求的
+        // 估算在这里没有真值可配对，不填。
+        estimated_input: None,
         latency_ms: 0,
     }
 }
@@ -2379,6 +2387,36 @@ async fn publish_sign_vocabulary(state: &AppState) {
     }
 }
 
+/// 这次请求在本平台的尺子上值多少 token——与上游回来后回报的真值落在同一行台账上。
+///
+/// 量的是**真发出去的那串序列化字节**，不是消息本身：工具 schema、信封、按上游改写
+/// 过的字段都在里面。少算它们，两把尺子的差就既不是估算器的、也不是窗口的，读的人
+/// 分不出差从哪一头来。用的估算器就是 agent 装配上下文时裁剪所依据的那一个（同一个
+/// 单位），所以台账上这一对数是同一把尺子的两次读数——**差多大**才是发现：随内容
+/// 配比走的差是估算器的账，连估算器都判这一次超预算的才是窗口的账。
+///
+/// 逐次尝试各算各的：每次尝试的 body 都按那台上游的模型名与兼容改写重建过，要量的
+/// 是真正发出去的那一份。
+fn price_request(serialized: &str) -> u64 {
+    cog_core::estimate_tokens(serialized) as u64
+}
+
+/// 一个请求侧的三件事实：谁问的、从哪个环境问的、我们自己那把尺量这次请求值多少。
+///
+/// 三件合成一个值，因为它们有同一个寿命问题：一个活得比请求长的流，从任何一个头里都
+/// 读不回它们，而那份被定价的字节在 body 发出去的那一刻就没了。绑在一起还让"带上了
+/// 几件"没有中间态可走——一个只有 actor 而没有估算的调用点，读起来会与"装配面从没
+/// 接过线"同形，而那正是这条边要能分辨的东西。
+#[derive(Clone)]
+struct RequestSide {
+    actor: String,
+    origin: String,
+    /// [`price_request`] 的读数。`None` 是"这条路径没量过"，不是"量出来是 0"：台账
+    /// 那一列可空正是因为两者修法相反——一个说明装配面还没接上，一个是空提示词——
+    /// 所以量不出来的路径一律传 `None`，绝不填 0 冒充量过。
+    estimated_input: Option<u64>,
+}
+
 /// 一次调用的 token 计量落点（三处同写）：Prometheus counter、ClickHouse 明细、
 /// PG 台账。只在拿到真实 usage 或确知为零时调用；任何落点失败只降级为
 /// warn/debug，绝不影响请求路径——计量是观测，不是业务。
@@ -2388,9 +2426,11 @@ async fn record_llm_tokens(
     result: &str,
     reading: UsageReading,
     latency_ms: u64,
-    actor: &str,
-    origin: &str,
+    request: &RequestSide,
 ) {
+    let actor = request.actor.as_str();
+    let origin = request.origin.as_str();
+    let estimated_input = request.estimated_input;
     let key = LlmHealthTable::key(upstream);
     // Zero is recorded, not skipped: the two cells answer "has this metering
     // path ever run for this upstream and actor", and a skipped zero leaves
@@ -2445,6 +2485,10 @@ async fn record_llm_tokens(
             // 明细里同一格也带上：Prometheus 那条是"命中率在动吗"，这条是"哪一次
             // 命中、命中多少"——事件表按 JSON 属性存，加一个键不欠 schema 迁移。
             .property("tokens_cached", serde_json::json!(reading.cached))
+            // 估算也一并带上，理由同上一格：明细读的是"哪一次差了多少"。没有它，
+            // 这一面对"超额的那一次长什么样"是哑的，而 Prometheus 那边按数据点
+            // 分不出是哪一次调用。`None` 落成 JSON null，与 0 不同形。
+            .property("estimated_input", serde_json::json!(estimated_input))
             .property("latency_ms", serde_json::json!(latency_ms)),
     );
     land_usage_record(
@@ -2459,6 +2503,7 @@ async fn record_llm_tokens(
             tokens_input: reading.input,
             tokens_output: reading.output,
             tokens_cached: reading.cached,
+            estimated_input,
             latency_ms,
         },
     );
@@ -2666,12 +2711,10 @@ struct UsageRecorder {
     scanner: Arc<Mutex<UsageScanner>>,
     state: AppState,
     upstream: LlmUpstream,
-    actor: String,
-    /// Environment the caller declared, carried beside `actor` so the row a
-    /// dropped stream lands still reads under the right origin. The two travel
-    /// together because a stream that outlives its request is exactly the case
-    /// where they cannot be re-read from the headers.
-    origin: String,
+    /// 请求侧的三件事实（谁、哪个环境、这份字节值多少），在请求还在手上的那一刻就
+    /// 钉死在这里：一个活得比请求长的流从任何一个头里都读不回它们，而被定价的那份
+    /// 字节在 body 发出去之后就已经不在了。被丢掉的流更是只剩这一份可以配对。
+    request: RequestSide,
     start: std::time::Instant,
     /// Set by whichever of the two paths takes the reading first. A plain flag
     /// is enough because the two paths cannot run at once — both need to own
@@ -2715,8 +2758,10 @@ impl Drop for UsageRecorder {
         let reading = self.reading(true);
         let state = self.state.clone();
         let upstream = self.upstream.clone();
-        let actor = std::mem::take(&mut self.actor);
-        let origin = std::mem::take(&mut self.origin);
+        // Cloned, not taken: an empty request side is a shape this type exists to
+        // keep out of the ledger, so `Drop` leaves a whole one behind rather
+        // than a hollow that reads like one.
+        let request = self.request.clone();
         let latency_ms = self.start.elapsed().as_millis() as u64;
         // [`Drop`] cannot await and the caller is already on its way out, so
         // the write rides a task of its own. Only a runtime that is itself
@@ -2724,10 +2769,7 @@ impl Drop for UsageRecorder {
         // than a request.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                record_llm_tokens(
-                    &state, &upstream, "ok", reading, latency_ms, &actor, &origin,
-                )
-                .await;
+                record_llm_tokens(&state, &upstream, "ok", reading, latency_ms, &request).await;
             });
         }
     }
@@ -2743,8 +2785,7 @@ fn wrap_usage_scan(
     upstream: LlmUpstream,
     stream: impl futures::Stream<Item = Result<axum::body::Bytes, reqwest::Error>> + Send + 'static,
     start: std::time::Instant,
-    actor: String,
-    origin: String,
+    request: RequestSide,
     asked: bool,
 ) -> impl futures::Stream<Item = Result<axum::body::Bytes, reqwest::Error>> + Send {
     use futures::StreamExt;
@@ -2770,8 +2811,7 @@ fn wrap_usage_scan(
         scanner,
         state,
         upstream,
-        actor,
-        origin,
+        request,
         start,
         claimed: false,
     };
@@ -2784,8 +2824,7 @@ fn wrap_usage_scan(
             "ok",
             reading,
             latency_ms,
-            &recorder.actor,
-            &recorder.origin,
+            &recorder.request,
         )
         .await;
         Ok(axum::body::Bytes::new())
@@ -4099,6 +4138,11 @@ async fn stream_forward(
             }
         }
 
+        // 定价点就在 body 定稿之后、发出去之前：这一份字节是这次尝试真发出去的
+        // 那一份（模型名与兼容改写都已落进 body），而它一旦被 `.body(body)` 移走就
+        // 只剩流里那份可以配对，重算就要把装配面搬进响应侧——那是另一条会漂移的路。
+        let estimated_input = price_request(&String::from_utf8_lossy(&body));
+
         let start = std::time::Instant::now();
         let builder = state
             .stream_client
@@ -4218,8 +4262,11 @@ async fn stream_forward(
             upstream.clone(),
             resp.bytes_stream(),
             start,
-            actor.clone(),
-            origin.clone(),
+            RequestSide {
+                actor: actor.clone(),
+                origin: origin.clone(),
+                estimated_input: Some(estimated_input),
+            },
             asked_for_usage,
         );
         return Ok(axum::response::Response::builder()
@@ -4649,17 +4696,24 @@ async fn call_one_upstream(
                 messages.iter().filter(|m| m.role != "system").collect(),
             )
         };
+        let request = serde_json::json!({
+            "model": upstream.model,
+            "max_tokens": 4096,
+            "system": system,
+            "messages": msgs.iter().map(|m| serde_json::json!({"role": m.role, "content": m.content})).collect::<Vec<_>>(),
+        });
+        let estimated_input = price_request(&request.to_string());
+        let request_side = RequestSide {
+            actor: actor.to_string(),
+            origin: origin.to_string(),
+            estimated_input: Some(estimated_input),
+        };
         let resp = state
             .client
             .post(format!("{base}/v1/messages"))
             .header("x-api-key", &upstream.api_key)
             .header("anthropic-version", "2023-06-01")
-            .json(&serde_json::json!({
-                "model": upstream.model,
-                "max_tokens": 4096,
-                "system": system,
-                "messages": msgs.iter().map(|m| serde_json::json!({"role": m.role, "content": m.content})).collect::<Vec<_>>(),
-            }))
+            .json(&request)
             .send()
             .await
             .map_err(|e| UpstreamRefusal::transport(format!("连接上游 {base} 失败: {e}")))?;
@@ -4690,8 +4744,7 @@ async fn call_one_upstream(
             "ok",
             reading,
             start.elapsed().as_millis() as u64,
-            actor,
-            origin,
+            &request_side,
         )
         .await;
         let content = v["content"][0]["text"]
@@ -4704,14 +4757,21 @@ async fn call_one_upstream(
         }));
     }
 
+    let request = serde_json::json!({
+        "model": upstream.model,
+        "messages": messages,
+    });
+    let estimated_input = price_request(&request.to_string());
+    let request_side = RequestSide {
+        actor: actor.to_string(),
+        origin: origin.to_string(),
+        estimated_input: Some(estimated_input),
+    };
     let resp = state
         .client
         .post(format!("{base}/chat/completions"))
         .bearer_auth(&upstream.api_key)
-        .json(&serde_json::json!({
-            "model": upstream.model,
-            "messages": messages,
-        }))
+        .json(&request)
         .send()
         .await
         .map_err(|e| UpstreamRefusal::transport(format!("连接上游 {base} 失败: {e}")))?;
@@ -4742,8 +4802,7 @@ async fn call_one_upstream(
         "ok",
         reading,
         start.elapsed().as_millis() as u64,
-        actor,
-        origin,
+        &request_side,
     )
     .await;
     let content = v["choices"][0]["message"]["content"]
@@ -6740,8 +6799,15 @@ mod tests {
             upstream.clone(),
             body,
             std::time::Instant::now(),
-            "agent:planner".to_string(),
-            "gateway_pool".to_string(),
+            RequestSide {
+                actor: "agent:planner".to_string(),
+                origin: "gateway_pool".to_string(),
+                // 这条夹具没有请求体可定价，取一个非零数只为了让这条路径落的是
+                // "量过"而不是"没量过"——被丢掉的流要带的就是请求侧钉下的那一份。
+                // 它到不到台账，在这个进程里看不见（测试的 `durable`/`usage` 都是
+                // None），所以这里断言的是计数器那一面。
+                estimated_input: Some(4),
+            },
             true,
         ));
         let first = stream.next().await.expect("a frame").expect("ok bytes");
@@ -6785,6 +6851,33 @@ mod tests {
             .map(|s| s.value)
             .sum();
         assert_eq!(input, 11.0, "数字本身也要落账");
+    }
+
+    /// 定价量的是**要发出去的那串字节**，不是消息本身。
+    ///
+    /// 这条差的正是这次量它要抓到的东西：同一段消息，带上工具 schema 之后字节多了
+    /// 一倍，而上游按字节计价。若定价只看 `messages`，台账上那对数的差里就混进了
+    /// "我们少算了多少"这一块，与估算器的偏差同形，读的人分不出是哪一头的账。
+    #[test]
+    fn the_price_is_taken_over_the_bytes_that_go_out() {
+        let bare = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "read the file and tell me what it does"}],
+        });
+        let mut with_schema = bare.clone();
+        with_schema["tools"] = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read one file from the workspace and return its contents.",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+            },
+        }]);
+        assert!(
+            price_request(&with_schema.to_string()) > price_request(&bare.to_string()),
+            "工具 schema 与消息同在要发出去的那串字节里，漏掉它的价格不是这次请求的价格"
+        );
+        assert_eq!(price_request(""), 0, "空串没有 token 可算");
     }
 
     #[test]
