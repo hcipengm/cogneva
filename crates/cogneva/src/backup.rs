@@ -128,6 +128,17 @@ pub struct BackupConfig {
     pub oob_secrets_dir: PathBuf,
     /// cogneva-data-pvc 挂载根；对象子树取其下 `storage/`。
     pub data_dir: PathBuf,
+    /// 保留几个包：**覆盖位**（`COGNEVA_BACKUP_KEEP`，构造时 `unwrap_or(7)`）。
+    ///
+    /// 7 的来历量过、不是拍的：备份卷 `cogneva-backup-pvc` 声明 10 GiB，而
+    /// 2026-10-09…10-15 那七个包实测 42–195 MB、合计 788 MB ⇒ 按**最大的那个**
+    /// 外推 7 个包 ≈ 1.4 GiB，约占声明容量的 14%。取「一周」是因为 CronJob 一天
+    /// 一趟，一周覆盖「发现坏了到修好」的窗口。
+    ///
+    /// 它**不能**建成闭环：留几个包是策略不是测量，按剩余空间算只会让「留多久的
+    /// 账」随磁盘水位漂。生效值由 `cogneva_backup_run_readings{readout="keep_target"}`
+    /// 发出去。**缺判据**：那条读数没有 `source` 标签（界读数该标来源），也没有
+    /// 东西在包体量长期贴住卷容量时报。
     pub keep_count: usize,
     /// 这一次运行最长能跑多久。集群侧同一个值同时是 Job 的
     /// `activeDeadlineSeconds`（到点由 kubelet 杀容器）和这里的 env——一个值
