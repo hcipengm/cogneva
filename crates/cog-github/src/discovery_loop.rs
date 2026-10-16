@@ -1173,8 +1173,42 @@ impl GitHubDiscoveryLoop {
                     .collect();
                 self.verdicts_reap_closed(&open).await;
             }
-            _ => {
-                tracing::debug!("skipping verdict reap: incomplete open-intent listing")
+            (open_issues, open_prs) => {
+                // 这一支原先是一句 `debug!("skipping verdict reap: incomplete
+                // open-intent listing")`。两个问题，都不是措辞问题：
+                //
+                // 1. 三种原因并成一句，而三者的处置不同——两次列取各自失败（哪一面、
+                //    什么错，都要留住），与「两次都成了但撞上分页上限」（那不是故障，
+                //    是今天开着的意图超过一页）。并成一句之后，reap 不跑这件事只剩
+                //    一个读法：「账只增不减」，而读者要的是「为什么」。所以逐面点名，
+                //    每面一行只说自己的那一样。
+                // 2. `debug!` 在这个平台的采集面里不存在（实测七天零行，同一窗口
+                //    info 几千行）⇒ 连「reap 没在跑」都读不到。级别跟着同族的跳过走：
+                //    列取失败是 `warn!`（同一个 provider 在上一处同样的失败也是 warn），
+                //    「可能被截断」是 `info!`（同 crate 的池闸跳过、以及本文件
+                //    `intent in terminal-failure backoff` 那种自带解除条件的跳过）。
+                if let Err(e) = &open_issues {
+                    tracing::warn!(
+                        error = %e,
+                        surface = "issues",
+                        "verdict reap skipped: cannot list open issues"
+                    );
+                }
+                if let Err(e) = &open_prs {
+                    tracing::warn!(
+                        error = %e,
+                        surface = "pull requests",
+                        "verdict reap skipped: cannot list open pull requests"
+                    );
+                }
+                if let (Ok(issues), Ok(prs)) = (&open_issues, &open_prs) {
+                    tracing::info!(
+                        open_issues = issues.len(),
+                        open_pull_requests = prs.len(),
+                        page_cap = PROVIDER_LIST_PAGE_SIZE,
+                        "verdict reap skipped: open-intent listing may be truncated"
+                    );
+                }
             }
         }
 
