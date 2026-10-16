@@ -17,7 +17,20 @@ use cog_core::{SFError, SFResult};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PromotionGateConfig {
-    /// 自动晋级总开关；false = 一键暂停，全部变更转人工处理。
+    /// 自动晋级总开关；false = 一键暂停自动晋级**通道**。
+    ///
+    /// 停的是通道选择这一轴：`AutoConfig` / `AutoRollout` 两档本来可以自动
+    /// 落地，关掉之后它们与未分类一样转人工。
+    ///
+    /// 黑名单那一轴不在这个开关的射程里。拒收是与契约取并集的底座（见
+    /// [`Self::forbidden_names`]），说的是「这条变更连沙盒都不让进」，它
+    /// 不是一条通道、也没有自动/人工之分——总开关是策略，放宽不了一条底座。
+    /// 判定侧的读法据此分成两处，且**两处都按这句走**：自动那一半读这个
+    /// 开关（`auto_promoter` 在分级之后据此降级），拒收那一半不读它
+    /// （`change_pipeline` 只看分级是不是 `Reject`）。
+    ///
+    /// 这句话是规格不是解释：`apply_and_test_rejects_forbidden_files_at_gate`
+    /// 正是在 `enabled = false` 下要求拒收照旧生效的。
     pub enabled: bool,
     /// diff 超过该行数强制转人工审批。
     pub max_diff_lines: usize,

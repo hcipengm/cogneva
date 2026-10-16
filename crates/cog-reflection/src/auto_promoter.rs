@@ -6,7 +6,8 @@
 //! ```text
 //! 沙盒 deploy_success
 //!   → soak 试跑等待（期间进程崩了晋级自然作废，台账留 Pending）
-//!   → 一键暂停检查（promotion.enabled=false 全部转人工）
+//!   → 一键暂停检查（promotion.enabled=false 时，自动两档一并转人工；
+//!     走到这一步的都已经不是 Reject，拒收那一轴在此检查之前就判完了）
 //!   → 熔断检查（连续回滚/失败超阈值 → 转人工，人批准的成功晋级会
 //!     把窗口推出去，熔断自然解除）
 //!   → 配额检查（24h 内自动晋级次数超 quota_per_day → 转人工）
