@@ -961,16 +961,23 @@ impl ReflectionEngine {
     }
 
     /// Apply effectiveness-tracker recommendations to the skill registry.
+    ///
+    /// `refines` is the caller saying it is the one process allowed to run the
+    /// refinement branch: that one spends an LLM call and writes a skill config,
+    /// so two processes doing it would each get their own answer for the same
+    /// skill and overwrite one another. Every other branch is in-process state
+    /// and is meant to run wherever the outcomes are recorded.
     pub async fn apply_effectiveness_actions(
         &self,
         skill_registry: Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>,
         llm: Option<Arc<dyn cog_core::LlmClient>>,
+        refines: bool,
     ) -> cog_core::SFResult<()> {
         if let Some(ref tracker) = self.effectiveness_tracker {
             let skill_ids = tracker.tracked_skill_ids().await;
             for sid in skill_ids {
                 tracker
-                    .apply_action(&sid, skill_registry.clone(), llm.clone())
+                    .apply_action(&sid, skill_registry.clone(), llm.clone(), refines)
                     .await?;
             }
         }

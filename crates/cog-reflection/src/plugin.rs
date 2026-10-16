@@ -51,6 +51,13 @@ pub struct ReflectionPlugin {
     /// 挂基线移植触发循环（跨插件消费 OrchestratorControl 只能在 start，
     /// 见插件生命周期 init_all → start_all）。
     porter_armed: bool,
+    /// 本进程是否承担变更执行器职责（配置里的 `executor_enabled`）。与
+    /// `porter_armed` 分开：那道门还要求沙盒边界放行，因为越过它的循环会写
+    /// git 工作树；而这里问的是「这份进程是不是那个唯一写者」，与边界无关。
+    /// 判据：一份动作在多进程里各跑一次会得到互相覆盖的两份结果时，它只该
+    /// 在持有这个位的进程里跑；反过来，读的是本进程内存态的环必须跑在填那份
+    /// 内存的进程里——否则它读到的永远是空，并把「空」报成「没事要动」。
+    executor_role: bool,
     /// 见 [`PoolGate`]；init 阶段 spawn 的循环据此跳过 LLM 依赖轮次。
     pool_gate: Arc<PoolGate>,
     /// 全插件唯一的分配器：部署器、各进化消费者都从这里取工作树。
@@ -96,6 +103,7 @@ impl ReflectionPlugin {
             initialized: false,
             reviewer: None,
             porter_armed: false,
+            executor_role: false,
             pool_gate: Arc::new(PoolGate::default()),
             workspaces: None,
             meta_learning: None,
@@ -1273,6 +1281,9 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 // git 写操作）。start() 里消费 OrchestratorControl。
                 self.porter_armed = executor_enabled
                     && matches!(boundary, crate::sandbox::BoundaryDecision::Allowed(_));
+                // 与上面那道门分开记：越门写工作树的循环要「执行器 + 边界放行」，
+                // 而「这份进程是不是唯一写者」只要执行器这一点就够了。
+                self.executor_role = executor_enabled;
             }
         }
 
@@ -1538,6 +1549,51 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             );
         }
 
+        // 技能面那条反馈环的驱动。记录与动作是两半，此前只有前一半有属主：
+        // `process_skill_outcome` 之外，唯一会动注册表的
+        // `apply_effectiveness_actions` 全仓没有一个调用者——退化被记下来了，
+        // 却推不动任何东西，而这件事在读数上不可见（记了就是记了）。注册表由
+        // 另一个插件的 init 发布，只有在全部 init 跑完之后才可靠可见，所以接线
+        // 点在这里而不是 init。
+        //
+        // 挂在 `porter_armed` 那道门**之前**（与上面的复审循环同一个理由，
+        // 再加一条更要紧的）：驱动这个环的判断都取自 `effectiveness_tracker`，
+        // 而那份追踪器是**进程内内存、没有任何回读路径**——结局由跑 agent 的
+        // 那份进程写进去，别的进程里的环读到的永远是空 tracker。空 tracker 不
+        // 报错，它让 `tracked_skill_ids()` 返回空、动作一个都不跑，于是「这个
+        // 技能已经退化到该被降级」的存在证据在读数上表现为「从来没有技能需要
+        // 动」：一个安静的正常值。落在那道门后面，等于只有执行器 pod 能跑这条
+        // 环，而执行器 pod 的追踪器是空的，反过来 app 侧（真正跑 agent、真正在
+        // 记结局）连这条环都挂不上——两半被拆到了两个进程，各自看都「没问题」。
+        // 边界放行与这件事无关：`Strengthen`/`Deprecate` 只改本进程那份注册表，
+        // 不做任何 git 写。
+        //
+        // 唯一会被两个进程各跑一遍的是 `Refine`：它要调 LLM 再落技能配置，两边
+        // 跑会同一条技能各拿一份答案、互相覆盖，还白烧一倍 token。所以门只门
+        // 这一支，粒度按动作给，不整块收口。
+        let skill_registry = ctx.consume::<tokio::sync::RwLock<cog_core::SkillRegistry>>();
+        match ctx.consume::<crate::ReflectionEngine>() {
+            Some(engine) => {
+                let llm: Option<Arc<dyn cog_core::LlmClient>> =
+                    ctx.consume_service::<dyn cog_core::LlmClient>();
+                let period =
+                    std::time::Duration::from_secs(ctx.config().self_evolution.poll_interval_secs);
+                info!(
+                    period_secs = period.as_secs(),
+                    refines = self.executor_role,
+                    "skill effectiveness loop enabled"
+                );
+                spawn_skill_effectiveness_loop(
+                    engine,
+                    skill_registry,
+                    llm,
+                    period,
+                    self.executor_role,
+                );
+            }
+            None => info!("no reflection engine published; skill effectiveness actions disabled"),
+        }
+
         if !self.porter_armed {
             return Ok(());
         }
@@ -1725,27 +1781,6 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             shutdown,
         ));
 
-        // 技能面那条反馈环的驱动。记录与动作是两半，此前只有前一半有属主：
-        // `process_skill_outcome` 之外，唯一会动注册表的
-        // `apply_effectiveness_actions` 全仓没有一个调用者——退化被记下来了，
-        // 却推不动任何东西，而这件事在读数上不可见（记了就是记了）。注册表由
-        // 另一个插件的 init 发布，只有在全部 init 跑完之后才可靠可见，所以接线
-        // 点在这里而不是 init。
-        let skill_registry = ctx.consume::<tokio::sync::RwLock<cog_core::SkillRegistry>>();
-        match ctx.consume::<crate::ReflectionEngine>() {
-            Some(engine) => {
-                let llm: Option<Arc<dyn cog_core::LlmClient>> =
-                    ctx.consume_service::<dyn cog_core::LlmClient>();
-                let period =
-                    std::time::Duration::from_secs(ctx.config().self_evolution.poll_interval_secs);
-                info!(
-                    period_secs = period.as_secs(),
-                    "skill effectiveness loop enabled"
-                );
-                spawn_skill_effectiveness_loop(engine, skill_registry, llm, period);
-            }
-            None => info!("no reflection engine published; skill effectiveness actions disabled"),
-        }
         Ok(())
     }
 
@@ -1772,11 +1807,15 @@ fn current_version(ctx: &cog_core::PluginContext) -> String {
 /// `apply_effectiveness_actions` 全仓没有一个调用者，于是一个有效性已经退化的技能
 /// 照旧被选中。注册表在缺失时不建这条循环——没有技能面就没有任何东西可动，
 /// 说一次比开一条空转的循环好。
+///
+/// `refines` 说明本进程是不是那个唯一写者：不在时这条环照跑，只是不落 `Refine`
+/// ——那一支要调 LLM 再写技能配置，多进程各来一次就是同一条技能的两份答案。
 fn spawn_skill_effectiveness_loop(
     engine: Arc<crate::ReflectionEngine>,
     registry: Option<Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>>,
     llm: Option<Arc<dyn cog_core::LlmClient>>,
     period: std::time::Duration,
+    refines: bool,
 ) {
     let Some(registry) = registry else {
         info!("no shared skill registry published; skill effectiveness actions disabled");
@@ -1790,13 +1829,14 @@ fn spawn_skill_effectiveness_loop(
             let engine = engine.clone();
             let registry = registry.clone();
             let llm = llm.clone();
+            let refines = refines;
             async move {
                 let mut interval = tokio::time::interval(period);
                 loop {
                     beat.beat();
                     interval.tick().await;
                     if let Err(e) = engine
-                        .apply_effectiveness_actions(registry.clone(), llm.clone())
+                        .apply_effectiveness_actions(registry.clone(), llm.clone(), refines)
                         .await
                     {
                         warn!(error = %e, "applying skill effectiveness actions failed");

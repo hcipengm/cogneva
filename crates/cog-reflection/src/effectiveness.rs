@@ -114,6 +114,7 @@ impl SkillEffectivenessTracker {
         skill_id: &str,
         registry: Arc<RwLock<cog_core::SkillRegistry>>,
         llm: Option<Arc<dyn cog_core::LlmClient>>,
+        refines: bool,
     ) -> SFResult<()> {
         let registered = registry.read().await.get_skill(skill_id).is_some();
         if !registered {
@@ -152,13 +153,25 @@ impl SkillEffectivenessTracker {
                 reg.remove_skill_config(skill_id);
             }
             EffectivenessAction::Refine => {
-                info!(skill_id, "Refining skill — triggering evolution");
-                if let Some(llm) = llm {
-                    let evolution =
-                        crate::evolution::EvolutionEngine::new(llm, registry.clone(), None);
-                    evolution.refine_skill(skill_id).await?;
+                // The one branch with effects outside this process. Said out
+                // loud rather than silently skipped: a process that is not
+                // allowed to refine still *decides* the skill needs it, and a
+                // reader seeing no refinement has to be able to tell "nobody is
+                // allowed here" from "nobody judged it worth refining".
+                if !refines {
+                    info!(
+                        skill_id,
+                        "Refinement recommended; this process is not the one that runs it"
+                    );
                 } else {
-                    warn!(skill_id, "Cannot refine skill: no LLM provider available");
+                    info!(skill_id, "Refining skill — triggering evolution");
+                    if let Some(llm) = llm {
+                        let evolution =
+                            crate::evolution::EvolutionEngine::new(llm, registry.clone(), None);
+                        evolution.refine_skill(skill_id).await?;
+                    } else {
+                        warn!(skill_id, "Cannot refine skill: no LLM provider available");
+                    }
                 }
             }
             EffectivenessAction::NoAction => {
@@ -271,11 +284,11 @@ mod tests {
         let registry = Arc::new(RwLock::new(registry_holding("real")));
 
         tracker
-            .apply_action("ghost", registry.clone(), None)
+            .apply_action("ghost", registry.clone(), None, true)
             .await
             .unwrap();
         tracker
-            .apply_action("real", registry.clone(), None)
+            .apply_action("real", registry.clone(), None, true)
             .await
             .unwrap();
 
@@ -306,6 +319,115 @@ mod tests {
         assert!(
             summaries.contains(&"Skill real effectiveness high".to_string()),
             "真技能那条动作学习应当照旧落下：{summaries:?}"
+        );
+    }
+
+    /// 一条把 `recommend_action` 推到 `Refine` 的结局：成功率 0（0.40）、
+    /// 质量分 1.0（0.30）、延迟与 token 都贴着软上限（各 0.15），合起来 0.60
+    /// ——落在 `0.3..=0.8` 那一段里，而不是靠边（0.3 与 0.8 两侧都是别的动作，
+    /// 贴着界写会让这条测试在浮点上变成掷硬币）。
+    fn refinable_outcome(skill_id: &str) -> SkillOutcome {
+        SkillOutcome {
+            skill_id: skill_id.to_string(),
+            task_signature: "role".to_string(),
+            success: false,
+            score: Some(1.0),
+            latency_ms: 1,
+            token_cost: 1,
+            observed_at: chrono::Utc::now(),
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingLlm {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmClient for CountingLlm {
+        async fn chat(
+            &self,
+            _messages: &[cog_core::Message],
+            _options: &cog_core::ChatOptions,
+        ) -> cog_core::SFResult<cog_core::ChatResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(cog_core::ChatResponse {
+                content: vec![cog_core::ContentBlock::text("{}")],
+                api: "mock".into(),
+                provider: "mock".into(),
+                model: "mock".into(),
+                response_id: None,
+                usage: cog_core::Usage::default(),
+                stop_reason: cog_core::StopReason::Stop,
+                error_message: None,
+                upstream_failure: None,
+                retry_after_secs: None,
+                timestamp: chrono::Utc::now(),
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[cog_core::Message],
+            _options: &cog_core::ChatOptions,
+        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!("这支动作只走 chat")
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!("这支动作只走 chat")
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    /// `Refine` 是全仓唯一有跨进程副作用的一支动作：它调 LLM 再写技能配置。
+    /// 不是那个唯一写者的进程**照样**要跑这条环、照样应用本进程的动作——它只是
+    /// 不落这一支，因为两个进程各自问一次 LLM 会拿回两份答案写同一条技能。
+    ///
+    /// 两个方向都量：同一批结局在 `refines=false` 下一次 LLM 调用都不许有，
+    /// 在 `refines=true` 下必须有一次。只量「不调」的话，一个把 `Refine` 判成
+    /// 别的动作（或压根不动作）的实现也能通过。
+    #[tokio::test]
+    async fn a_process_that_is_not_the_writer_recommends_refinement_without_spending_it() {
+        let mut calls_by_role = Vec::new();
+        for refines in [false, true] {
+            let recorder = Arc::new(crate::InMemoryRecorder::new());
+            let tracker = SkillEffectivenessTracker::new(recorder.clone());
+            for _ in 0..5 {
+                tracker
+                    .record_outcome(refinable_outcome("real"))
+                    .await
+                    .unwrap();
+            }
+            let registry = Arc::new(RwLock::new(registry_holding("real")));
+
+            // 先钉住这批结局推的确实是 `Refine`。少了这一句，「一次 LLM 调用都
+            // 没有」可以由「这条结局推的是别的动作」满足，而那种形状下这条测试
+            // 一个字都没量到它要量的那件事。
+            assert_eq!(
+                tracker.recommend_action("real").await,
+                EffectivenessAction::Refine,
+                "这批结局应当推 Refine，否则下面量的是别的动作"
+            );
+
+            let llm = Arc::new(CountingLlm::default());
+            tracker
+                .apply_action("real", registry.clone(), Some(llm.clone()), refines)
+                .await
+                .unwrap();
+            calls_by_role.push(llm.calls.load(std::sync::atomic::Ordering::SeqCst));
+        }
+        assert_eq!(
+            calls_by_role,
+            vec![0, 1],
+            "非写者进程不许花掉这次精炼，写者进程必须花掉"
         );
     }
 }
