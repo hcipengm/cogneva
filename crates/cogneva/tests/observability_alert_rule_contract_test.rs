@@ -368,6 +368,18 @@ const PRODUCED: &[(&str, &str)] = &[
         "llm_pool_available",
         "crates/cog-gateway/src/security_gateway.rs",
     ),
+    // Why an upstream left the serving side, which `llm_upstream_healthy` cannot
+    // say: a 0 there is the same reading for a quota window that has to run out
+    // and for a subscription that expired, and those two call for opposite
+    // repairs. Only the upstream's own words are classified, and a refusal that
+    // cannot be read is published as `unclassified` rather than folded into
+    // either. All three kinds are republished for every suspect upstream on each
+    // pass, so a kind that stops holding is written back to zero instead of
+    // staying at 1.
+    (
+        "llm_upstream_refusal_kind",
+        "crates/cog-gateway/src/security_gateway.rs",
+    ),
     // Request outcomes per upstream. Its failure half is the only cell that
     // cannot be produced by idleness: the success half is published lazily, so a
     // rule that reads absence alone could not tell "nobody called" from "every

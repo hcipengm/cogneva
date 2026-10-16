@@ -1091,6 +1091,20 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          actually succeeded clears it — the same rule the pool verdict uses",
     ),
     (
+        "llm_upstream_refusal_kind",
+        "Why an upstream is refusing, as the `kind` label on a constant 1, by \
+         `upstream`. One of `quota_cycle` (a quota or rate window, which comes \
+         back when the window turns), `entitlement` (the account may not use \
+         this model or subscription at all, which waiting never fixes), or \
+         `unclassified` (there is a refusal and its text does not say why). \
+         Every kind is published for every suspect upstream so the one that \
+         stops holding is written back to 0. The cause is read out of the \
+         upstream's own refusal body and never guessed: a refusal that cannot \
+         be read is `unclassified`, because reading a never-heals refusal as \
+         the healing kind is what turns waiting into a plan. It is not a health \
+         verdict -- llm_upstream_healthy is that -- and it does not feed one",
+    ),
+    (
         "llm_upstream_shape_errored",
         "Whether each LLM upstream is holding a shape-class rejection \
          (400/404/422) that has not been settled yet, 1 or 0. Such a status \

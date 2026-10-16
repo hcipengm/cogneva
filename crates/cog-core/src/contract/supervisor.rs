@@ -204,6 +204,20 @@ pub struct LlmUpstreamEvidence {
     /// Quota window the upstream stated (seconds); `0` when it stated none.
     #[serde(default)]
     pub quota_window_secs: u64,
+    /// What kind of refusal the upstream gave, as the gateway names it. Empty
+    /// in a payload from a build that did not carry it, which reads as "no
+    /// cause on record" — the same starting point as a first boot.
+    ///
+    /// Travels because it decides something a restart would otherwise erase:
+    /// whether waiting is the repair. A quota window that has to run out comes
+    /// back on its own; a subscription that expired, a model that was never
+    /// bought, an account that was suspended answer the same way forever. The
+    /// reading that says which one this is drives an alert whose whole subject
+    /// is "nobody has to wait for this", and a gateway restart that dropped the
+    /// cause would resolve that alert and re-fire it on every rollout, dating a
+    /// standing condition to the last deployment.
+    #[serde(default)]
+    pub refusal_kind: String,
     /// When this upstream may be probed again, unix seconds; `0` when the
     /// record carries no window. Absolute rather than a remaining count so a
     /// payload sitting in Redis keeps its meaning while it waits.

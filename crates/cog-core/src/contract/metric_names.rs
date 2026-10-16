@@ -837,6 +837,25 @@ metric_names! {
     LLM_UPSTREAM_SHAPE_ERRORED => "llm_upstream_shape_errored",
     LLM_UPSTREAM_QUOTA_WINDOW_SECS => "llm_upstream_quota_window_secs",
     LLM_UPSTREAM_QUOTA_RESET_UNIX => "llm_upstream_quota_reset_unix",
+    // Why an upstream is refusing, as a label on a constant 1, by `upstream`
+    // and `kind`.
+    //
+    // Every refusal looks the same on the health series -- `llm_upstream_healthy`
+    // 0 -- and the causes call for opposite repairs. A quota cycle comes back on
+    // its own, so waiting is the plan; an invalid subscription, an unpurchased
+    // model or a suspended account never comes back, so waiting is the mistake,
+    // and how long the operator waits for a recovery that cannot arrive is set
+    // by whatever they read. One series cannot carry that difference, which is
+    // why this one exists rather than a second value on the health series.
+    //
+    // Only the upstream's own words are classified. A refusal whose cause is not
+    // in its text is reported as `unclassified` rather than guessed: guessing a
+    // never-heals refusal into the healing class is precisely the error that
+    // makes waiting look like a plan. All three values are published for every
+    // suspect upstream, the current one 1 and the others 0, so a kind that stops
+    // holding is written back to zero instead of standing as the last thing ever
+    // said.
+    LLM_UPSTREAM_REFUSAL_KIND => "llm_upstream_refusal_kind",
     LLM_UPSTREAM_CONSECUTIVE_FAILURES => "llm_upstream_consecutive_failures",
     // Where each upstream sits in the order a call tries the pool, 0 first, by
     // `upstream`. The order is not the declared one: candidates are demoted by

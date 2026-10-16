@@ -576,6 +576,145 @@ fn parse_quota_window_secs(body: &str) -> Option<u64> {
 /// 解析错了或上游文案变了，按一年截断并保留"这只是个窗口"的语义。
 const MAX_QUOTA_WINDOW_SECS: u64 = 366 * 86_400;
 
+/// 一条拒绝的可决策归类：**修它的动作**是哪一种。
+///
+/// 为什么要有这一格：上游的拒绝在池的读数面上本来是同一个形状——`llm_upstream_healthy`
+/// 为 0。而该做的动作在成因之间是相反的：配额窗口走完会自己好（等是对的），订阅失效、
+/// 模型未购买、账号被停**再等多少秒都一样**（等就是错的，而且等多久由读的人自己定）。
+/// 一个布尔读不出这个差别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefusalKind {
+    /// 配额／用量类：窗口走完会自己好。
+    QuotaCycle,
+    /// 资格类：这台账号对上游没有使用权。等不会让它好。
+    Entitlement,
+    /// 有拒绝，但正文里读不出成因。
+    Unclassified,
+}
+
+impl RefusalKind {
+    /// 闭集里的全部取值。发布时**每一拍按这三种各发一条**，当前那一种 1、其余 0：
+    /// 只发当前那一种，上一拍那种会永远停在 1 上，而「这条上游是资格类」是一个
+    /// 会结束的状态。
+    const ALL: [RefusalKind; 3] = [Self::QuotaCycle, Self::Entitlement, Self::Unclassified];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::QuotaCycle => "quota_cycle",
+            Self::Entitlement => "entitlement",
+            Self::Unclassified => "unclassified",
+        }
+    }
+
+    /// 从它自己发布出去的名字读回来（跨进程载荷里存的就是这个名字）。
+    ///
+    /// 认不出的一律 `None`，不落到 `Unclassified`：认不出说明写它的那一代与读它的
+    /// 这一代对不齐，那是"这一格没有值"，而 `Unclassified` 是"上游写了话但我们没
+    /// 读懂"——把前者写成后者，会让一次版本错位看起来像上游回答得含糊。
+    fn from_name(name: &str) -> Option<Self> {
+        if name.is_empty() {
+            return None;
+        }
+        Self::ALL.into_iter().find(|k| k.as_str() == name)
+    }
+}
+
+/// 把一条拒绝的正文读成 [`RefusalKind`]。
+///
+/// 只认**上游自己写的词**，不按厂商、主机名或状态码判定：池里哪几家是配置，明天可能
+/// 就换了，而"订阅失效"这句话是上游自己说的。判不准的一律 [`RefusalKind::Unclassified`]
+/// ——宁可少说。把一条读不懂的拒绝猜进"会自愈"那一类，正好会让该去办事的那一类被等下去，
+/// 而这两个错误的代价不对称：少说的代价是有人多看一眼，猜错的代价是永远等一个不会来的恢复。
+fn classify_refusal(body: &str) -> RefusalKind {
+    let lowered = body.to_ascii_lowercase();
+    // 资格类先判。两类的文本会同时出现配额词（"订阅已过期"与"月用量用尽"都可能在同一段里
+    // 被上一条规则命中），而并存时动作取资格类那个：等不会让订阅复活。
+    for needle in [
+        "invalidsubscription",
+        "invalid subscription",
+        "subscription has expired",
+        "does not have a valid",
+        "unpurchased",
+        "accessdenied",
+        "access denied",
+        "not eligible",
+        "eligible",
+        "not authorized",
+        "unauthorized",
+        "account has been suspended",
+        "account is suspended",
+    ] {
+        if lowered.contains(needle) {
+            return RefusalKind::Entitlement;
+        }
+    }
+    for needle in [
+        "accountquotaexceeded",
+        "insufficient_quota",
+        "quota",
+        "usage limit",
+        "rate limit",
+        "rate_limit",
+        "access_terminated_error",
+    ] {
+        if lowered.contains(needle) {
+            return RefusalKind::QuotaCycle;
+        }
+    }
+    RefusalKind::Unclassified
+}
+
+/// 把一次新读到的成因并进已经持有的那一格。
+///
+/// 读得出来的成因总是覆盖旧的——它就是更新的一条证据，上游换了说法就该照新的走。
+/// 读不出来的那条（[`RefusalKind::Unclassified`]）只在还是空的时候落：那一格要驱动
+/// 告警，一次读不懂的拒绝把上一拍读明白的"资格类"抹掉，会让告警在拍与拍之间闪断。
+/// 完全没拿到正文的那次失败（`None`）什么也不写，它对"为什么"没有任何信息。
+fn absorb_refusal_kind(held: &mut Option<RefusalKind>, new: Option<RefusalKind>) {
+    match new {
+        Some(RefusalKind::Unclassified) if held.is_some() => {}
+        Some(kind) => *held = Some(kind),
+        None => {}
+    }
+}
+
+/// 一次上游拒绝带回来的全部证据。
+///
+/// 做成具名结构而不是元组：四个字段里三个是 `Option`，元组要靠位置分辨"哪个是恢复
+/// 时刻、哪个是窗口、哪个是成因`，而这三者恰恰是要分开报的——成因甚至不依赖另外
+/// 两个（资格类拒绝永远不给时刻，而它正是"等也白等"的那一类）。
+struct UpstreamRefusal {
+    /// 给人读的那一句（进 WARN，也进最后那条 502 的文案）。
+    message: String,
+    quota_reset_unix: Option<i64>,
+    quota_window_secs: Option<u64>,
+    /// 从拒绝正文读出的成因。连接层与解析层失败没有上游的话可读，这里是 `None`
+    /// ——"没拿到话"与"拿到了但读不懂"（`Unclassified`）不是同一格。
+    refusal_kind: Option<RefusalKind>,
+}
+
+impl UpstreamRefusal {
+    /// 连不上、响应体读不出来：这一类失败没有上游的话可读。
+    fn transport(message: String) -> Self {
+        Self {
+            message,
+            quota_reset_unix: None,
+            quota_window_secs: None,
+            refusal_kind: None,
+        }
+    }
+
+    /// 上游给了非 2xx：三样证据都从这一次的正文里读。
+    fn from_body(message: String, text: &str, retry_after: Option<&str>) -> Self {
+        Self {
+            message,
+            quota_reset_unix: parse_quota_reset(text, retry_after),
+            quota_window_secs: parse_quota_window_secs(text),
+            refusal_kind: Some(classify_refusal(text)),
+        }
+    }
+}
+
 /// 补年份（无年份格式）：落在过去一天以上说明跨年了，加一年。
 fn fix_year(naive: chrono::NaiveDateTime) -> i64 {
     let now = Utc::now();
@@ -609,6 +748,10 @@ struct UpstreamHealth {
     /// 上游自述的配额窗口长度（秒），仅当它报的是周期而非时刻时有值。窗口不是
     /// 恢复时刻，进不了嫌疑窗的长度计算，只用来把"多久之后"如实报给调用侧。
     quota_window_secs: Option<u64>,
+    /// 最近一条真实请求被拒时，从它的正文读出的成因归类。`None` = 当前没有挂着的
+    /// 失败（或那次失败没带正文）。恢复成功时清回 `None`：这一格回答的是"现在
+    /// 该做什么"，不是"历史上遇到过什么"。
+    refusal_kind: Option<RefusalKind>,
 }
 
 /// 池内两个恢复上界，来源不同、结论强度也不同，因此分开持有而不是先取 min
@@ -670,6 +813,9 @@ struct UpstreamReading {
     quota_reset_unix: Option<i64>,
     /// 上游自述的配额窗口长度（秒）。
     quota_window_secs: Option<u64>,
+    /// 挂着的失败是哪一种成因。这一格与 `quota_reset_unix` 的区别是它**不依赖
+    /// 上游给出时刻**：资格类拒绝永远不给时刻，而它恰恰是"等也白等"的那一类。
+    refusal_kind: Option<RefusalKind>,
 }
 
 /// 两个"0 表示未知"的 unix 时刻里更早的那个。
@@ -827,6 +973,7 @@ impl LlmHealthTable {
         probe_interval_secs: u64,
         quota_reset_unix: Option<i64>,
         quota_window_secs: Option<u64>,
+        refusal_kind: Option<RefusalKind>,
     ) -> Option<(u32, u64)> {
         // 一次**已定性**的失败把"等探测定性"的那个问号消掉：答案已经有了，
         // 再挂着会让 `due_for_probe` 对这个上游恒真、退避窗失效。
@@ -838,6 +985,7 @@ impl LlmHealthTable {
             suspect_until: None,
             quota_reset_unix: None,
             quota_window_secs: None,
+            refusal_kind: None,
         });
         if entry.suspect_until.is_some_and(|t| now < t) {
             // 窗口内的重复失败不重开窗，但一旦上游给了恢复时刻或窗口就吸收它：
@@ -848,6 +996,7 @@ impl LlmHealthTable {
             if quota_window_secs.is_some() {
                 entry.quota_window_secs = quota_window_secs;
             }
+            absorb_refusal_kind(&mut entry.refusal_kind, refusal_kind);
             return None;
         }
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
@@ -858,6 +1007,7 @@ impl LlmHealthTable {
         }
         entry.quota_reset_unix = quota_reset_unix;
         entry.quota_window_secs = quota_window_secs;
+        absorb_refusal_kind(&mut entry.refusal_kind, refusal_kind);
         entry.suspect_until = Some(now + std::time::Duration::from_secs(secs));
         Some((entry.consecutive_failures, secs))
     }
@@ -989,6 +1139,7 @@ impl LlmHealthTable {
                         consecutive_failures: h.consecutive_failures,
                         quota_reset_unix: h.quota_reset_unix,
                         quota_window_secs: h.quota_window_secs,
+                        refusal_kind: h.refusal_kind,
                     },
                     None => UpstreamReading {
                         key: key.clone(),
@@ -996,6 +1147,7 @@ impl LlmHealthTable {
                         consecutive_failures: 0,
                         quota_reset_unix: None,
                         quota_window_secs: None,
+                        refusal_kind: None,
                     },
                 }
             })
@@ -1183,6 +1335,7 @@ impl LlmHealthTable {
                     consecutive_failures: h.consecutive_failures,
                     quota_reset_unix: h.quota_reset_unix.unwrap_or(0),
                     quota_window_secs: h.quota_window_secs.unwrap_or(0),
+                    refusal_kind: h.refusal_kind.map(|k| k.as_str()).unwrap_or("").to_string(),
                     // 绝对时刻：载荷在共享键值面里放着的时候，"还剩几秒"会自己过期，
                     // 而"到什么时候"不会。
                     suspect_until_unix: h
@@ -1228,6 +1381,7 @@ impl LlmHealthTable {
                     suspect_until: Some(now_instant + std::time::Duration::from_secs(remaining)),
                     quota_reset_unix: (e.quota_reset_unix > 0).then_some(e.quota_reset_unix),
                     quota_window_secs: (e.quota_window_secs > 0).then_some(e.quota_window_secs),
+                    refusal_kind: RefusalKind::from_name(&e.refusal_kind),
                 },
             );
             restored += 1;
@@ -1315,6 +1469,7 @@ pub const DURABLE_POOL_GAUGES: &[cog_core::MetricName] = &[
     cog_core::metric_names::LLM_UPSTREAM_QUOTA_WINDOW_SECS,
     cog_core::metric_names::LLM_UPSTREAM_QUOTA_RESET_UNIX,
     cog_core::metric_names::LLM_UPSTREAM_CONSECUTIVE_FAILURES,
+    cog_core::metric_names::LLM_UPSTREAM_REFUSAL_KIND,
     cog_core::metric_names::LLM_USAGE_VERDICT_MEASURED,
     cog_core::metric_names::LLM_TOOL_CALLS_VERDICT_MEASURED,
     cog_core::metric_names::LLM_TEMPERATURE_VERDICT_MEASURED,
@@ -2569,8 +2724,12 @@ fn wrap_usage_scan(
     scanned.chain(finalize)
 }
 
-/// 上游健康状态变化的落点：时序明细（状态、连续失败数、配额恢复时刻），
+/// 上游健康状态变化的落点：时序明细（状态、连续失败数、配额恢复时刻、拒绝成因），
 /// 由失败/成功/探测三处调用，天然只在边沿发生（窗口内重复失败不重开窗）。
+///
+/// `refusal_kind` 在这条事件里是**这一次跃迁带上来的成因**，不是表里累积的那一格
+/// （那一格由读数面逐拍发布）。恢复那一侧写 `"none"`：跃迁到健康时没有成因可言，
+/// 而这一格在事件面缺席会与"当时读不出成因"同形，读事件的人分不出这两件事。
 fn record_upstream_state(
     state: &AppState,
     upstream: &LlmUpstream,
@@ -2578,6 +2737,7 @@ fn record_upstream_state(
     failures: u32,
     quota_reset_unix: Option<i64>,
     quota_window_secs: Option<u64>,
+    refusal_kind: Option<RefusalKind>,
 ) {
     let key = LlmHealthTable::key(upstream);
     let reset = quota_reset_unix.unwrap_or(0);
@@ -2594,6 +2754,10 @@ fn record_upstream_state(
             .property(
                 "quota_window_secs",
                 serde_json::json!(quota_window_secs.unwrap_or(0)),
+            )
+            .property(
+                "refusal_kind",
+                serde_json::json!(refusal_kind.map(|k| k.as_str()).unwrap_or("none")),
             ),
     );
 }
@@ -2957,6 +3121,26 @@ async fn refresh_pool_state(state: &AppState) {
             &[("upstream", &reading.key)],
         )
         .await;
+        // 拒绝的**成因**。上面那条 healthy 为 0 只说"它现在接不了"，而该做什么在
+        // 成因之间是相反的：配额走完自己会好，"等"是对的；订阅失效／模型未购买再
+        // 等多少秒都一样，"等"就是错的。这两件事在别的序列上完全同形。
+        //
+        // 闭集里三种**每一拍全发**（命中那种 1、另外两种 0），不是只发命中的那种：
+        // 只发命中的序列，它在成因改变或上游恢复之后就停在 1 上，而"这条上游不再
+        // 是资格类了"这句话再没有任何一拍写得回去。
+        for kind in RefusalKind::ALL {
+            record_gauge(
+                state,
+                cog_core::metric_names::LLM_UPSTREAM_REFUSAL_KIND,
+                if reading.refusal_kind == Some(kind) {
+                    1.0
+                } else {
+                    0.0
+                },
+                &[("upstream", &reading.key), ("kind", kind.as_str())],
+            )
+            .await;
+        }
         if let Some(upstream) = upstreams
             .iter()
             .find(|u| LlmHealthTable::key(u) == reading.key)
@@ -3809,7 +3993,7 @@ async fn stream_forward(
                     &origin,
                 )
                 .await;
-                mark_upstream_failure(&state, upstream, base, None, None).await;
+                mark_upstream_failure(&state, upstream, base, None, None, None).await;
                 continue;
             }
         };
@@ -3868,7 +4052,15 @@ async fn stream_forward(
                 .await;
                 state.llm_health.note_shape_error(upstream);
             } else {
-                mark_upstream_failure(&state, upstream, base, quota_reset, quota_window).await;
+                mark_upstream_failure(
+                    &state,
+                    upstream,
+                    base,
+                    quota_reset,
+                    quota_window,
+                    Some(classify_refusal(&text)),
+                )
+                .await;
             }
             last_err = format!("上游 {base} 返回 HTTP {status}: {}", error_excerpt(&text));
             last_failure = Some((status, ctype, text, retry_after, upstream));
@@ -3876,7 +4068,7 @@ async fn stream_forward(
         }
         if state.note_upstream_success(upstream) {
             tracing::info!(upstream = %base, "LLM 上游恢复健康（真实请求实证）");
-            record_upstream_state(&state, upstream, true, 0, None, None);
+            record_upstream_state(&state, upstream, true, 0, None, None, None);
         }
         let elapsed_ms = start.elapsed().as_millis() as u64;
         state.llm_stats.record(elapsed_ms);
@@ -3945,12 +4137,15 @@ async fn stream_forward(
 /// 它让嫌疑窗精确覆盖到恢复时刻，窗口内不再浪费探测请求；
 /// `quota_window_secs` 是上游自述的窗口长度（只有周期、没有时刻时才有），
 /// 它不进嫌疑窗长度，只跟着读数走——两者的区别见 `RecoveryBounds`。
+/// `refusal_kind` 是这条拒绝的成因归类（读得出来才有），它不进窗长度也不改判定，
+/// 只跟着读数走，供读的人决定"等"还是"去办事"。
 async fn mark_upstream_failure(
     state: &AppState,
     upstream: &LlmUpstream,
     base: &str,
     quota_reset_unix: Option<i64>,
     quota_window_secs: Option<u64>,
+    refusal_kind: Option<RefusalKind>,
 ) {
     if let Some((consecutive, secs)) = record_upstream_failure(
         state,
@@ -3958,6 +4153,7 @@ async fn mark_upstream_failure(
         FAILURE_SOURCE_CALLER,
         quota_reset_unix,
         quota_window_secs,
+        refusal_kind,
     )
     .await
     {
@@ -3967,6 +4163,7 @@ async fn mark_upstream_failure(
             suspect_window_secs = secs,
             quota_reset_unix = quota_reset_unix.unwrap_or(0),
             quota_window_secs = quota_window_secs.unwrap_or(0),
+            refusal_kind = refusal_kind.map(|k| k.as_str()).unwrap_or("none"),
             "LLM 上游标记嫌疑，探测窗口到期后复测"
         );
     }
@@ -4004,6 +4201,7 @@ async fn record_upstream_failure(
     source: &'static str,
     quota_reset_unix: Option<i64>,
     quota_window_secs: Option<u64>,
+    refusal_kind: Option<RefusalKind>,
 ) -> Option<(u32, u64)> {
     record_counter(
         state,
@@ -4019,6 +4217,7 @@ async fn record_upstream_failure(
         state.config.llm_health_probe_secs,
         quota_reset_unix,
         quota_window_secs,
+        refusal_kind,
     );
     if let Some((consecutive, _)) = opened {
         record_upstream_state(
@@ -4028,6 +4227,7 @@ async fn record_upstream_failure(
             consecutive,
             quota_reset_unix,
             quota_window_secs,
+            refusal_kind,
         );
     }
     opened
@@ -4119,16 +4319,17 @@ async fn probe_suspect_upstreams(state: &AppState) {
             Ok(()) => {
                 if state.note_upstream_success(&upstream) {
                     tracing::info!(upstream = %base, "LLM 上游探测复通，热恢复进池");
-                    record_upstream_state(state, &upstream, true, 0, None, None);
+                    record_upstream_state(state, &upstream, true, 0, None, None, None);
                 }
             }
-            Err((msg, quota_reset, quota_window)) => {
+            Err(refusal) => {
                 if let Some((consecutive, secs)) = record_upstream_failure(
                     state,
                     &upstream,
                     FAILURE_SOURCE_PROBE,
-                    quota_reset,
-                    quota_window,
+                    refusal.quota_reset_unix,
+                    refusal.quota_window_secs,
+                    refusal.refusal_kind,
                 )
                 .await
                 {
@@ -4136,9 +4337,10 @@ async fn probe_suspect_upstreams(state: &AppState) {
                         upstream = %base,
                         consecutive_failures = consecutive,
                         suspect_window_secs = secs,
-                        quota_reset_unix = quota_reset.unwrap_or(0),
-                        quota_window_secs = quota_window.unwrap_or(0),
-                        error = %msg,
+                        quota_reset_unix = refusal.quota_reset_unix.unwrap_or(0),
+                        quota_window_secs = refusal.quota_window_secs.unwrap_or(0),
+                        refusal_kind = refusal.refusal_kind.map(|k| k.as_str()).unwrap_or("none"),
+                        error = %refusal.message,
                         "LLM 上游探测仍失败，指数加窗"
                     );
                 }
@@ -4149,10 +4351,7 @@ async fn probe_suspect_upstreams(state: &AppState) {
 
 /// 最小连通性探测：max_tokens=1 的单轮 ping，只认 HTTP 状态码。
 /// 不带 tools（探测目标是"这家还能不能用"，能力准入另有探测）。
-async fn probe_upstream(
-    state: &AppState,
-    upstream: &LlmUpstream,
-) -> Result<(), (String, Option<i64>, Option<u64>)> {
+async fn probe_upstream(state: &AppState, upstream: &LlmUpstream) -> Result<(), UpstreamRefusal> {
     let base = upstream.base_url.trim_end_matches('/');
     let url = match upstream.api_style.as_str() {
         "anthropic" => format!("{base}/v1/messages"),
@@ -4177,7 +4376,7 @@ async fn probe_upstream(
     let resp = builder
         .send()
         .await
-        .map_err(|e| (format!("连接失败: {e}"), None, None))?;
+        .map_err(|e| UpstreamRefusal::transport(format!("连接失败: {e}")))?;
     let status = resp.status();
     if status.is_success() {
         Ok(())
@@ -4188,12 +4387,10 @@ async fn probe_upstream(
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
         let text = resp.text().await.unwrap_or_default();
-        let quota_reset = parse_quota_reset(&text, retry_after.as_deref());
-        let quota_window = parse_quota_window_secs(&text);
-        Err((
+        Err(UpstreamRefusal::from_body(
             format!("HTTP {status}: {}", error_excerpt(&text)),
-            quota_reset,
-            quota_window,
+            &text,
+            retry_after.as_deref(),
         ))
     }
 }
@@ -4254,7 +4451,7 @@ async fn call_llm(
             Ok(resp) => {
                 if state.note_upstream_success(upstream) {
                     tracing::info!(upstream = %upstream.base_url, "LLM 上游恢复健康（真实请求实证）");
-                    record_upstream_state(state, upstream, true, 0, None, None);
+                    record_upstream_state(state, upstream, true, 0, None, None, None);
                 }
                 record_llm_call(
                     state,
@@ -4267,7 +4464,8 @@ async fn call_llm(
                 .await;
                 return Ok(resp);
             }
-            Err((msg, quota_reset, quota_window)) => {
+            Err(refusal) => {
+                let msg = refusal.message;
                 tracing::warn!(upstream = %upstream.base_url, error = %msg, "LLM 上游调用失败，切换池内下一个");
                 record_llm_call(
                     state,
@@ -4282,8 +4480,9 @@ async fn call_llm(
                     state,
                     upstream,
                     upstream.base_url.trim_end_matches('/'),
-                    quota_reset,
-                    quota_window,
+                    refusal.quota_reset_unix,
+                    refusal.quota_window_secs,
+                    refusal.refusal_kind,
                 )
                 .await;
                 last_err = msg;
@@ -4302,7 +4501,7 @@ async fn call_one_upstream(
     messages: &[ChatMessage],
     actor: &str,
     origin: &str,
-) -> Result<Json<LlmResponse>, (String, Option<i64>, Option<u64>)> {
+) -> Result<Json<LlmResponse>, UpstreamRefusal> {
     let start = std::time::Instant::now();
     let base = upstream.base_url.trim_end_matches('/');
     if upstream.api_style == "anthropic" {
@@ -4331,7 +4530,7 @@ async fn call_one_upstream(
             }))
             .send()
             .await
-            .map_err(|e| (format!("连接上游 {base} 失败: {e}"), None, None))?;
+            .map_err(|e| UpstreamRefusal::transport(format!("连接上游 {base} 失败: {e}")))?;
         let status = resp.status();
         if !status.is_success() {
             let retry_after = resp
@@ -4340,18 +4539,16 @@ async fn call_one_upstream(
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
             let text = resp.text().await.unwrap_or_default();
-            let quota_reset = parse_quota_reset(&text, retry_after.as_deref());
-            let quota_window = parse_quota_window_secs(&text);
-            return Err((
+            return Err(UpstreamRefusal::from_body(
                 format!("上游 {base} 返回 HTTP {status}: {}", error_excerpt(&text)),
-                quota_reset,
-                quota_window,
+                &text,
+                retry_after.as_deref(),
             ));
         }
         let v: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| (format!("上游 {base} 响应解析失败: {e}"), None, None))?;
+            .map_err(|e| UpstreamRefusal::transport(format!("上游 {base} 响应解析失败: {e}")))?;
         // 这条是非流式调用：响应的 usage 在 body 里本来就该有，不需要我们开口要，
         // 所以它缺席是上游的账（absent），不是我们没问。
         let reading = UsageReading::from_usage(extract_usage(&v), true);
@@ -4385,7 +4582,7 @@ async fn call_one_upstream(
         }))
         .send()
         .await
-        .map_err(|e| (format!("连接上游 {base} 失败: {e}"), None, None))?;
+        .map_err(|e| UpstreamRefusal::transport(format!("连接上游 {base} 失败: {e}")))?;
     let status = resp.status();
     if !status.is_success() {
         let retry_after = resp
@@ -4394,18 +4591,16 @@ async fn call_one_upstream(
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
         let text = resp.text().await.unwrap_or_default();
-        let quota_reset = parse_quota_reset(&text, retry_after.as_deref());
-        let quota_window = parse_quota_window_secs(&text);
-        return Err((
+        return Err(UpstreamRefusal::from_body(
             format!("上游 {base} 返回 HTTP {status}: {}", error_excerpt(&text)),
-            quota_reset,
-            quota_window,
+            &text,
+            retry_after.as_deref(),
         ));
     }
     let v: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| (format!("上游 {base} 响应解析失败: {e}"), None, None))?;
+        .map_err(|e| UpstreamRefusal::transport(format!("上游 {base} 响应解析失败: {e}")))?;
     // 这条是非流式调用：响应的 usage 在 body 里本来就该有，不需要我们开口要，
     // 所以它缺席是上游的账（absent），不是我们没问。
     let reading = UsageReading::from_usage(extract_usage(&v), true);
@@ -6792,11 +6987,14 @@ mod tests {
         };
         assert!(!table.is_suspect(&u));
         // 首次失败开新窗：返回计数供调用方打 WARN。
-        assert_eq!(table.note_failure(&u, 300, None, None), Some((1, 300)));
+        assert_eq!(
+            table.note_failure(&u, 300, None, None, None),
+            Some((1, 300))
+        );
         assert!(table.is_suspect(&u));
         assert!(!table.due_for_probe(&u));
         // 窗口内的后续失败静默（不重复计数、不刷日志）。
-        assert_eq!(table.note_failure(&u, 300, None, None), None);
+        assert_eq!(table.note_failure(&u, 300, None, None, None), None);
         // 成功即恢复健康；note_success 报告此前确实处于嫌疑。
         assert!(table.note_success(&u));
         assert!(!table.is_suspect(&u));
@@ -6898,7 +7096,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         };
         let pool = vec![u.clone()];
         assert_eq!(
-            table.note_failure(&u, 300, None, Some(7 * 86_400)),
+            table.note_failure(&u, 300, None, Some(7 * 86_400), None),
             Some((1, 300)),
             "窗口不参与嫌疑窗长度计算，首窗仍是探测间隔"
         );
@@ -6911,9 +7109,145 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             base_url: "https://b".into(),
             ..u.clone()
         };
-        table.note_failure(&v, 300, None, Some(86_400));
+        table.note_failure(&v, 300, None, Some(86_400), None);
         let bounds = table.recovery_bounds(&[u, v]);
         assert_eq!(bounds.window_secs, 7 * 86_400);
+    }
+
+    /// 拒绝的成因只从**上游自己写的字**里读，四段正文是现场逐台读出来的原话。
+    ///
+    /// 两类的判别不是"哪家厂商"，是上游说的那句话：配额类会自己好，资格类再等也
+    /// 一样。用真实正文而不是编的样例，是因为要证明的恰恰是"它认得出上游实际会写
+    /// 的那几种说法"——编一刀切样例只能证明这把尺子认识我写的东西。
+    #[test]
+    fn refusal_kinds_are_read_from_the_upstreams_own_words() {
+        // 每一条都是现场从上游响应体里逐字读出来的（截断前）。
+        let kimi = r#"{"error":{"type":"access_terminated_error","message":"You've reached your monthly usage limit for this billing cycle. Your quota will be refreshed in the next cycle."}}"#;
+        let ark_plan = r#"{"error":{"code":"AccountQuotaExceeded","message":"You have exceeded the weekly usage quota. It will reset at 2026-10-19 00:00:00 +0800 CST"}}"#;
+        let ark_coding = r#"{"error":{"code":"InvalidSubscription","message":"Your account (2121781755) does not have a valid CodingPlan subscription, or your subscription has expired."}}"#;
+        let qwen = r#"{"error":{"type":"AccessDenied.Unpurchased","message":"Access to model denied. Please make sure you are eligible for using the model."}}"#;
+
+        assert_eq!(classify_refusal(kimi), RefusalKind::QuotaCycle);
+        assert_eq!(classify_refusal(ark_plan), RefusalKind::QuotaCycle);
+        assert_eq!(classify_refusal(ark_coding), RefusalKind::Entitlement);
+        assert_eq!(classify_refusal(qwen), RefusalKind::Entitlement);
+
+        // 配额与资格的话同在一段时取资格类那条：两个动作只有一个对——等不会让
+        // 订阅复活，而"先等一会儿"这句话在等不到的时候是错的，反过来先买只是
+        // 早了一点。
+        let both = r#"{"error":{"code":"InvalidSubscription","message":"Your subscription has expired and you have exceeded the quota."}}"#;
+        assert_eq!(classify_refusal(both), RefusalKind::Entitlement);
+
+        // 读不出成因的落 `Unclassified`，不落任何一个具体类：把读不懂的拒绝猜进
+        // "会自愈"会让该去办事的那一类被等下去，而这两个错误的代价不对称。
+        for unreadable in [
+            "",
+            "{\"error\":\"internal server error\"}",
+            "<html><body>502 Bad Gateway</body></html>",
+        ] {
+            assert_eq!(
+                classify_refusal(unreadable),
+                RefusalKind::Unclassified,
+                "读不出成因时不许猜：{unreadable}"
+            );
+        }
+    }
+
+    /// 一次读不懂的拒绝不许把已经读明白的成因抹掉，但读明白的一条总是覆盖旧的。
+    #[test]
+    fn a_blank_reading_never_erases_a_readable_refusal_kind() {
+        let mut held = None;
+        absorb_refusal_kind(&mut held, Some(RefusalKind::Unclassified));
+        assert_eq!(
+            held,
+            Some(RefusalKind::Unclassified),
+            "还没有成因时，读不懂也算一条（它说的是'有拒绝，但读不出为什么'）"
+        );
+        absorb_refusal_kind(&mut held, Some(RefusalKind::Entitlement));
+        assert_eq!(held, Some(RefusalKind::Entitlement), "读得出来的总是覆盖");
+        absorb_refusal_kind(&mut held, Some(RefusalKind::Unclassified));
+        assert_eq!(
+            held,
+            Some(RefusalKind::Entitlement),
+            "上游换了说法但这一条读不懂时，不许把上一拍读明白的那格抹成'读不懂'"
+        );
+        absorb_refusal_kind(&mut held, None);
+        assert_eq!(held, Some(RefusalKind::Entitlement), "没拿到正文什么也不写");
+        absorb_refusal_kind(&mut held, Some(RefusalKind::QuotaCycle));
+        assert_eq!(
+            held,
+            Some(RefusalKind::QuotaCycle),
+            "上游换了成因就照新的走"
+        );
+    }
+
+    /// 成因挂在嫌疑态上：成功那一刻它就没了。它答的是"现在该做什么"，不是
+    /// "历史上遇到过什么"。
+    #[test]
+    fn a_recovered_upstream_carries_no_refusal_kind() {
+        let table = LlmHealthTable::default();
+        let u = stub_upstream("https://entitlement.example.com", "m1");
+        table.note_failure(&u, 300, None, None, Some(RefusalKind::Entitlement));
+        let reading = table.snapshot(std::slice::from_ref(&u)).remove(0);
+        assert_eq!(reading.refusal_kind, Some(RefusalKind::Entitlement));
+
+        assert!(table.note_success(&u));
+        let reading = table.snapshot(std::slice::from_ref(&u)).remove(0);
+        assert_eq!(
+            reading.refusal_kind, None,
+            "上游实证成功之后还挂着成因，读的人会去修一个已经不存在的问题"
+        );
+    }
+
+    /// 成因跨进程活着：网关重启不该把"这是资格类、等没用"变成"没有成因"。
+    ///
+    /// 掉这一格不是少一条读数：那条告警的整个主题就是"这件事不用等"，重启把它
+    /// 解掉、下一拍再点起来，等于把一条长期存在的状况的起始时间改写成每次发布的
+    /// 时间。
+    #[test]
+    fn the_refusal_kind_survives_a_cross_process_round_trip() {
+        let table = LlmHealthTable::default();
+        let u = stub_upstream("https://entitlement.example.com", "m1");
+        table.note_failure(&u, 300, None, None, Some(RefusalKind::Entitlement));
+
+        let evidence = table.evidence(std::slice::from_ref(&u));
+        assert_eq!(evidence[0].refusal_kind, "entitlement");
+        // 载荷过一遍 JSON：这才是它真正要走的路。
+        let payload = serde_json::to_string(&evidence).expect("serializes");
+        let back: Vec<cog_core::LlmUpstreamEvidence> =
+            serde_json::from_str(&payload).expect("parses");
+        assert_eq!(back[0].refusal_kind, "entitlement");
+
+        let resumed = LlmHealthTable::default();
+        assert_eq!(resumed.seed(&back, std::slice::from_ref(&u)), (1, 0));
+        let reading = resumed.snapshot(std::slice::from_ref(&u)).remove(0);
+        assert_eq!(reading.refusal_kind, Some(RefusalKind::Entitlement));
+
+        // 旧构建写下的载荷里没有这一格：读成"没有成因"，不是读成"读不懂"。
+        let mut older = back.clone();
+        older[0].refusal_kind = String::new();
+        let from_older = LlmHealthTable::default();
+        assert_eq!(from_older.seed(&older, std::slice::from_ref(&u)), (1, 0));
+        assert_eq!(
+            from_older
+                .snapshot(std::slice::from_ref(&u))
+                .remove(0)
+                .refusal_kind,
+            None
+        );
+
+        // 认不出的名字也是"没有值"：那是版本对不齐，不是上游回答得含糊。
+        let mut alien = back.clone();
+        alien[0].refusal_kind = "some_future_kind".into();
+        let from_alien = LlmHealthTable::default();
+        from_alien.seed(&alien, std::slice::from_ref(&u));
+        assert_eq!(
+            from_alien
+                .snapshot(std::slice::from_ref(&u))
+                .remove(0)
+                .refusal_kind,
+            None
+        );
     }
 
     /// 上游自述的恢复证据不挂在我们的嫌疑窗上。
@@ -6931,8 +7265,8 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let pool = vec![with_reset.clone(), window_only.clone()];
         let reset = Utc::now().timestamp() + 7_200;
 
-        table.note_failure(&with_reset, 300, Some(reset), Some(86_400));
-        table.note_failure(&window_only, 300, None, Some(7 * 86_400));
+        table.note_failure(&with_reset, 300, Some(reset), Some(86_400), None);
+        table.note_failure(&window_only, 300, None, Some(7 * 86_400), None);
         assert!(table.all_suspect(&pool));
         assert_eq!(table.recovery_bounds(&pool).evidenced_unix, reset);
 
@@ -7135,13 +7469,13 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert_eq!(table.recovery_bounds(&pool), RecoveryBounds::default());
 
         // 配额窗：窗口被拉到恢复时刻，且给出恢复时间上界。
-        table.note_failure(&a, 300, Some(far), None);
+        table.note_failure(&a, 300, Some(far), None, None);
         assert!(table.is_suspect(&a));
         assert!(!table.all_suspect(&pool), "还有健康上游时池未全灭");
         assert_eq!(table.recovery_bounds(&pool).evidenced_unix, far);
 
         // 第二个上游只是瞬时失败（无 reset）→ 同样计入"全灭"：它当下也承接不了。
-        table.note_failure(&b, 300, None, None);
+        table.note_failure(&b, 300, None, None, None);
         assert!(table.all_suspect(&pool));
         // b 的退避窗（300s）比 a 的配额恢复上界（7200s）近，等待用的一刻取 b 的窗；
         // 但 a 报告过的恢复时刻不能被它顶掉——那是两种证据。合并成一个数就会把
@@ -7182,7 +7516,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             }
             drop(states);
             assert!(before
-                .note_failure(&u, 300, Some(reset), Some(604_800))
+                .note_failure(&u, 300, Some(reset), Some(604_800), None)
                 .is_some());
         }
 
@@ -7284,10 +7618,14 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
 
         assert_eq!(state.pool_circuit_break(&all), None, "池健康时不熔断");
 
-        state.llm_health.note_failure(&a, 300, Some(far), None);
+        state
+            .llm_health
+            .note_failure(&a, 300, Some(far), None, None);
         assert_eq!(state.pool_circuit_break(&all), None, "池内仍有健康上游");
 
-        state.llm_health.note_failure(&b, 300, Some(far), None);
+        state
+            .llm_health
+            .note_failure(&b, 300, Some(far), None, None);
         let (wait, window) = state.pool_circuit_break(&all).expect("全在嫌疑窗内即熔断");
         assert!((3_500..=3_600).contains(&wait), "Retry-After 指向最早恢复");
         assert_eq!(window, 0, "没有上游报过窗口时不编造一个");
@@ -7301,8 +7639,10 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         ]);
         let c = stub_upstream("https://c.example.com", "m3");
         let d = stub_upstream("https://d.example.com", "m4");
-        state.llm_health.note_failure(&c, 300, Some(far), None);
-        state.llm_health.note_failure(&d, 300, None, None);
+        state
+            .llm_health
+            .note_failure(&c, 300, Some(far), None, None);
+        state.llm_health.note_failure(&d, 300, None, None, None);
         let all: Vec<&LlmUpstream> = state.config.llm_upstreams.iter().collect();
         assert!(
             state.pool_circuit_break(&all).is_some(),
@@ -7349,7 +7689,9 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let far = Utc::now().timestamp() + 3_600;
         let state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
         let a = stub_upstream("https://a.example.com", "m1");
-        state.llm_health.note_failure(&a, 300, Some(far), None);
+        state
+            .llm_health
+            .note_failure(&a, 300, Some(far), None, None);
         let all: Vec<&LlmUpstream> = state.config.llm_upstreams.iter().collect();
         let verdict = pooled_refusal(&state, &all, "openai", "intent_gateway", "interactive");
         let (wait, _) = verdict.expect("全灭时判定仍为真：落账不许改判定");
@@ -7403,7 +7745,9 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let far = Utc::now().timestamp() + 1_200;
         let state = test_state(vec![stub_upstream("https://dead.example.com", "m1")]);
         let u = stub_upstream("https://dead.example.com", "m1");
-        state.llm_health.note_failure(&u, 300, Some(far), None);
+        state
+            .llm_health
+            .note_failure(&u, 300, Some(far), None, None);
 
         let req = axum::extract::Request::builder()
             .method("POST")
@@ -7515,7 +7859,9 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
 
         // 配额全灭：池不可用，边沿置位。
         let far = Utc::now().timestamp() + 600;
-        state.llm_health.note_failure(&u, 300, Some(far), None);
+        state
+            .llm_health
+            .note_failure(&u, 300, Some(far), None, None);
         refresh_pool_state(&state).await;
         assert!(state.pool_down.load(Ordering::SeqCst));
         let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
@@ -7542,13 +7888,71 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert!(!state.pool_down.load(Ordering::SeqCst));
     }
 
+    /// 成因这一格在观测面上必须**三种全发**，而且换成因那一刻旧的那条要落回 0。
+    ///
+    /// 只把命中的那一种发出去、别的不管，旧的那条序列就永远停在 1 上：一条上游
+    /// 从资格类恢复成健康之后，"它是资格类"这句话会在读数面上留着不走，而这条
+    /// 序列正是"要不要有人去动手"这个判断的输入。
+    #[tokio::test]
+    async fn every_refusal_kind_is_republished_so_a_stale_one_goes_back_to_zero() {
+        let state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        let u = stub_upstream("https://a.example.com", "m1");
+        let key = LlmHealthTable::key(&u);
+
+        state
+            .llm_health
+            .note_failure(&u, 300, None, None, Some(RefusalKind::Entitlement));
+        refresh_pool_state(&state).await;
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert_eq!(
+            refusal_kind_value(&text, &key, "entitlement"),
+            Some(1.0),
+            "资格类要发出来:\n{text}"
+        );
+        assert_eq!(
+            refusal_kind_value(&text, &key, "quota_cycle"),
+            Some(0.0),
+            "没命中的那一种也要发 0——缺席的家数与'不是它'分不开:\n{text}"
+        );
+        assert_eq!(refusal_kind_value(&text, &key, "unclassified"), Some(0.0));
+
+        // 上游换了说法：同一台上游、同一拍之后，旧的那条必须落回 0。
+        state.llm_health.note_success(&u);
+        state
+            .llm_health
+            .note_failure(&u, 300, None, None, Some(RefusalKind::QuotaCycle));
+        refresh_pool_state(&state).await;
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert_eq!(
+            refusal_kind_value(&text, &key, "entitlement"),
+            Some(0.0),
+            "成因变了之后旧的那条不许还停在 1 上:\n{text}"
+        );
+        assert_eq!(refusal_kind_value(&text, &key, "quota_cycle"), Some(1.0));
+
+        // 上游好了：三种全落 0，而且这一格答的是"现在"，不是"历史"。
+        state.note_upstream_success(&u);
+        refresh_pool_state(&state).await;
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        for kind in RefusalKind::ALL {
+            assert_eq!(
+                refusal_kind_value(&text, &key, kind.as_str()),
+                Some(0.0),
+                "{} 在池恢复后必须落回 0:\n{text}",
+                kind.as_str()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn pool_verdict_holds_without_recovery_evidence() {
         let state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
         let u = stub_upstream("https://a.example.com", "m1");
         let far = Utc::now().timestamp() + 600;
 
-        state.llm_health.note_failure(&u, 300, Some(far), None);
+        state
+            .llm_health
+            .note_failure(&u, 300, Some(far), None, None);
         refresh_pool_state(&state).await;
         assert!(state.pool_down.load(Ordering::SeqCst), "全上游不可用即置位");
 
@@ -7571,7 +7975,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
         let u = stub_upstream("https://a.example.com", "m1");
         let key = LlmHealthTable::key(&u);
-        state.llm_health.note_failure(&u, 300, None, None);
+        state.llm_health.note_failure(&u, 300, None, None, None);
         refresh_pool_state(&state).await;
 
         let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
@@ -7627,7 +8031,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             "配置里有、却一次都没发过调用，就不该有判定"
         );
 
-        state.llm_health.note_failure(&tried, 300, None, None);
+        state.llm_health.note_failure(&tried, 300, None, None, None);
         refresh_pool_state(&state).await;
         let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
         assert!(
@@ -7652,7 +8056,9 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let recovered_key = LlmHealthTable::key(&recovered);
         let untouched_key = LlmHealthTable::key(&untouched);
 
-        state.llm_health.note_failure(&recovered, 300, None, None);
+        state
+            .llm_health
+            .note_failure(&recovered, 300, None, None, None);
         state.note_upstream_success(&recovered);
 
         let readings = state.llm_health.snapshot(&state.config.llm_upstreams);
@@ -8022,7 +8428,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         // 这一家不可用：载荷是"池不可用"。
         state
             .llm_health
-            .note_failure(&u, 300, Some(Utc::now().timestamp() + 600), None);
+            .note_failure(&u, 300, Some(Utc::now().timestamp() + 600), None, None);
         refresh_pool_state(&state).await;
         let down_payload: cog_core::LlmPoolStatus = serde_json::from_str(
             &channel
@@ -8073,7 +8479,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let a = mk("https://a");
         let b = mk("https://b");
         let c = mk("https://c");
-        table.note_failure(&b, 300, None, None);
+        table.note_failure(&b, 300, None, None, None);
         let ordered = order_by_health(vec![&a, &b, &c], &table);
         assert_eq!(ordered[0].base_url, "https://a");
         assert_eq!(ordered[1].base_url, "https://c");
@@ -8111,7 +8517,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
 
         // 中间那家失败：它沉到后面，另外两家保持配置序。
         let b = stub_upstream("https://b.example.com", "m2");
-        state.llm_health.note_failure(&b, 300, None, None);
+        state.llm_health.note_failure(&b, 300, None, None, None);
         refresh_pool_state(&state).await;
         let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
         let at = |position: usize, key: &str| {
@@ -8388,7 +8794,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         // 手工把第一个上游标记为嫌疑（模拟上一轮失败开窗）。
         state
             .llm_health
-            .note_failure(&stub_upstream(&first, "m1"), 300, None, None);
+            .note_failure(&stub_upstream(&first, "m1"), 300, None, None, None);
 
         let req = axum::extract::Request::builder()
             .method("POST")
@@ -8534,7 +8940,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         table.note_shape_error(&u);
         assert!(table.due_for_probe(&u));
 
-        table.note_failure(&u, 300, None, None);
+        table.note_failure(&u, 300, None, None, None);
         assert!(
             !table.shape_errored.lock().unwrap().contains(&key),
             "判词一到手，那个问号就该消掉"
@@ -8586,7 +8992,9 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         );
 
         // 探测给出结论（这里直接记一次失败代表"这台确实坏了"）之后问号消掉。
-        state.llm_health.note_failure(&configured, 300, None, None);
+        state
+            .llm_health
+            .note_failure(&configured, 300, None, None, None);
         refresh_pool_state(&state).await;
         let settled = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
         assert!(
@@ -8605,7 +9013,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         .await;
         let state = test_state(vec![stub_upstream(&alive, "m1")]);
         let u = stub_upstream(&alive, "m1");
-        state.llm_health.note_failure(&u, 300, None, None);
+        state.llm_health.note_failure(&u, 300, None, None, None);
         assert!(state.llm_health.is_suspect(&u));
         assert!(!state.llm_health.due_for_probe(&u));
 
@@ -8851,6 +9259,23 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
     /// 从 exposition 里读一条序列的值；读不到 = None，不读成 0。
     fn series_value(text: &str, series: &str, upstream: &str) -> Option<f64> {
         series_value_by_source(text, series, upstream, None)
+    }
+
+    /// 取一格拒绝成因的读数：`upstream` 与 `kind` 两维一起定位。
+    ///
+    /// 单维那个读法在这里一定读错：同一台上游名下**三种成因同时各有一条序列**
+    /// （命中那种 1、其余 0），只按 `upstream` 取第一条，取到的是哪一种全看编码
+    /// 顺序——而这条序列回答的恰恰是"是哪一种"。
+    fn refusal_kind_value(text: &str, upstream: &str, kind: &str) -> Option<f64> {
+        let series = cog_core::metric_names::LLM_UPSTREAM_REFUSAL_KIND.as_str();
+        text.lines()
+            .filter(|l| l.starts_with(series))
+            .find(|l| {
+                l.contains(&format!("upstream=\"{upstream}\""))
+                    && l.contains(&format!("kind=\"{kind}\""))
+            })
+            .and_then(|l| l.split_whitespace().last())
+            .and_then(|v| v.parse::<f64>().ok())
     }
 
     /// 取一格的读数，可以再按 `source` 那一维收窄。
@@ -9386,7 +9811,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             spawn_stub_upstream(403, r#"{"error":{"type":"access_terminated_error"}}"#).await;
         let state = test_state(vec![stub_upstream(&dead, "m1")]);
         let u = stub_upstream(&dead, "m1");
-        state.llm_health.note_failure(&u, 300, None, None);
+        state.llm_health.note_failure(&u, 300, None, None, None);
         {
             let mut states = state.llm_health.states.lock().unwrap();
             let entry = states
