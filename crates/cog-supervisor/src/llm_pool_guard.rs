@@ -162,15 +162,18 @@ impl LlmPoolGuard {
                                     evidenced_recovery_unix = status.evidenced_recovery_unix,
                                     next_attempt_unix = status.next_attempt_unix,
                                     upstreams = ?status.unavailable_upstreams,
-                                    "LLM 上游池全灭，暂停 LLM 依赖型任务"
+                                    "LLM 上游池可用数低于冗余下限，暂停 LLM 依赖型任务"
                                 );
                                 let _ = event_tx.send(SupervisorEvent::LlmUpstreamPoolDown {
                                     evidenced_recovery_unix: status.evidenced_recovery_unix,
                                     next_attempt_unix: status.next_attempt_unix,
                                     unavailable: status.unavailable_upstreams,
-                                    // 池的大小与窗口长度一起转发：本模块只是搬运，
-                                    // 图里没有配置面，读 event 的那几处更没有。
+                                    // 池的大小、声明的下限与窗口长度一起转发：本模块
+                                    // 只是搬运，图里没有配置面，读 event 的那几处更没有。
+                                    // 下限尤其不能漏——判定从"零家可服务"改成"低于声明的
+                                    // 下限"之后，判词要从这两个数算出"按谁的界判的"。
                                     pool_size: status.pool_size,
+                                    declared_min_healthy: status.declared_min_healthy,
                                     quota_window_secs: status.quota_window_secs,
                                     timestamp: chrono::Utc::now(),
                                 });

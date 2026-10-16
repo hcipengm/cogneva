@@ -171,6 +171,58 @@ pub trait SchedulerGate: Send + Sync {
 /// scheduler open or closed forever.
 pub const LLM_POOL_STATUS_KEY: &str = "llm:pool:status";
 
+/// Source label for a floor that an operator declared on the llm-config
+/// surface: the bound in force is the number they wrote down.
+pub const MIN_HEALTHY_SOURCE_DECLARED: &str = "llm_config";
+
+/// Source label for the bound that applies when nothing is declared: the pool
+/// is judged down only when no configured upstream can serve.
+///
+/// This is the rule that predates the field, kept as a **fallback** rather
+/// than as a floor of its own, and labelled so a reader can tell the two
+/// apart. It is the *loosest* bound there is, which is why an operator who
+/// declares nothing gets exactly the behaviour they had before: no traffic is
+/// paused that was not already being paused. It is also why the value is not
+/// zero — a floor of zero is satisfied by a pool nobody can call, and that is
+/// a different rule from this one, not a weaker spelling of it.
+pub const MIN_HEALTHY_SOURCE_FALLBACK: &str = "fallback_all_down";
+
+/// The floor in force for a pool of `pool_size` upstreams whose declaration is
+/// `declared`: the declared number clamped into `1..=pool_size`, or the
+/// fallback `1` when nothing is declared, or `0` for a pool with no upstreams
+/// configured at all (nothing to be below).
+///
+/// One function because the producer and the readers must agree on it exactly:
+/// the gateway decides `unavailable` from the live health table, and every
+/// consumer of the payload recomputes it from the payload's own numbers. Two
+/// implementations of the clamp would be two rules, and the disagreement would
+/// show up as a pause the payload does not explain.
+pub fn pool_floor(pool_size: usize, declared: Option<usize>) -> usize {
+    if pool_size == 0 {
+        return 0;
+    }
+    match declared {
+        Some(declared) => declared.clamp(1, pool_size),
+        None => 1,
+    }
+}
+
+/// Which of the two labels above describes the floor in force for a
+/// declaration of `declared`.
+///
+/// The declaration is the whole of the state and the label is read off it, so
+/// this lives here rather than being spelled again by each surface that
+/// publishes one: the gateway's alert row, the payload's own reader, the
+/// metrics exporter and the llm-config response all report the same label, and
+/// four copies of a two-arm match are four chances for one of them to say
+/// `llm_config` about a pool that never declared anything.
+pub fn min_healthy_source(declared: Option<usize>) -> &'static str {
+    match declared {
+        Some(_) => MIN_HEALTHY_SOURCE_DECLARED,
+        None => MIN_HEALTHY_SOURCE_FALLBACK,
+    }
+}
+
 /// What one upstream told us the last time it was tried, as a value that can
 /// outlive the process that heard it.
 ///
@@ -270,6 +322,31 @@ pub struct LlmPoolStatus {
     /// "not reported", never a pool of no upstreams.
     #[serde(default)]
     pub pool_size: usize,
+    /// How many upstreams have to be serving for the pool to count as able to
+    /// carry LLM-dependent work, as declared on the llm-config surface;
+    /// `None` when nothing is declared.
+    ///
+    /// The declaration is an operator statement about the *pool*, not about
+    /// any one upstream: the members are interchangeable by construction (the
+    /// router walks them in order), so "at least two must serve" is a fact
+    /// about the pool's capacity that no single member's health can carry.
+    /// It travels in this payload rather than being read from configuration by
+    /// each consumer because the consumers live in other processes (the
+    /// scheduler gate) or have no configuration surface at all (the alert
+    /// history and the notification egress).
+    ///
+    /// `None` is not a floor of zero and must not be read as one: it means no
+    /// floor was declared, and the verdict then falls back to "down only when
+    /// nothing serves" (see [`MIN_HEALTHY_SOURCE_FALLBACK`]). Zero is likewise
+    /// not a value a writer produces — the single entry point rejects it — and
+    /// a payload that somehow carries one is read at the strict end rather
+    /// than the lax one (see [`Self::min_healthy`]).
+    ///
+    /// The value is clamped to `pool_size` when read, because a floor above
+    /// the size of the pool can never be met and a bound that cannot be met is
+    /// not a bound -- it is a permanent pause.
+    #[serde(default)]
+    pub declared_min_healthy: Option<usize>,
     /// Longest quota window any suspect upstream stated, seconds; `0` when none
     /// stated one. An upstream that only says its weekly window has to run out
     /// states no instant, so this is then the only statement of how long the
@@ -304,6 +381,42 @@ pub struct LlmPoolStatus {
 }
 
 impl LlmPoolStatus {
+    /// How many upstreams this payload counts as serving, from its own numbers.
+    ///
+    /// The suspect list is what the writer saw when it wrote; this is that
+    /// list subtracted from the pool size, not a fresh observation. A payload
+    /// from a build that carried neither field reads `0` here, which is the
+    /// same "cannot answer" the fields themselves report.
+    pub fn available_upstreams(&self) -> usize {
+        self.pool_size
+            .saturating_sub(self.unavailable_upstreams.len())
+    }
+
+    /// The floor in force for this payload: the declared one when there is
+    /// one, otherwise `1` — the fallback, under which the pool is down only
+    /// when nothing serves.
+    ///
+    /// Clamped to `1..=pool_size` so neither end of a malformed declaration
+    /// becomes a rule nobody meant: above the size of the pool is a bound no
+    /// amount of upstream recovery could clear, and zero is a bound satisfied
+    /// by a pool nobody can call, which would turn a typo into "never pause".
+    /// Both ends are read at the strict end instead.
+    ///
+    /// An unconfigured pool (`pool_size == 0`) has no floor and reads `0`: the
+    /// pool cannot be "below" a bound it does not have, and a scheduler parked
+    /// by a deployment that never configured an upstream would be a pause
+    /// nothing on the upstream side could ever lift.
+    pub fn min_healthy(&self) -> usize {
+        pool_floor(self.pool_size, self.declared_min_healthy)
+    }
+
+    /// Where the floor in force came from, as a label value: the declaration
+    /// itself is the only state, so the source is read off it rather than
+    /// carried beside it (two fields would be able to disagree).
+    pub fn min_healthy_source(&self) -> &'static str {
+        min_healthy_source(self.declared_min_healthy)
+    }
+
     /// Seconds from `now_unix` until a caller should resume the work it is
     /// holding back, given how long that caller needs to observe one trial run.
     ///
@@ -511,6 +624,19 @@ pub enum SupervisorEvent {
         /// question and answers it differently every time a window expires.
         #[serde(default)]
         pool_size: usize,
+        /// The floor the verdict was taken against, as declared on the
+        /// llm-config surface; `None` when nothing was declared.
+        ///
+        /// Carried because it is the only thing that explains the verdict in
+        /// the case that made this field necessary: an upstream pool can be
+        /// down with several upstreams still serving, and a consumer that
+        /// words the verdict from the suspect count alone then prints "3 of 4
+        /// upstreams are suspect" as the reason work stopped -- true, and
+        /// reading as a contradiction. `None` is not "floor of zero": it is
+        /// the fallback, where the pool is judged down only when nothing
+        /// serves.
+        #[serde(default)]
+        declared_min_healthy: Option<usize>,
         /// Longest quota window any suspect upstream stated, seconds; `0` when
         /// none stated one. Carried so a consumer does not have to report "no
         /// upstream stated a recovery time" when one did state how long it is.
@@ -616,6 +742,7 @@ pub enum SupervisorEvent {
 pub fn pool_down_verdict(
     pool_size: usize,
     unavailable: &[String],
+    declared_min_healthy: Option<usize>,
     evidenced_recovery_unix: i64,
     next_attempt_unix: i64,
     quota_window_secs: u64,
@@ -636,6 +763,21 @@ pub fn pool_down_verdict(
             unavailable.len(),
             pool_size
         )
+    };
+    // The ground the verdict was taken on, named. A pool can be judged down
+    // while several upstreams still serve -- that is the whole point of a
+    // declared floor -- and without this clause the count above reads as the
+    // reason when it is only part of the state. The undeclared case says what
+    // it fell back to rather than leaving the reader to assume a floor of zero:
+    // "nothing is declared" and "nothing has to serve" are different rules and
+    // the second one is not the one in force.
+    let floor = match declared_min_healthy {
+        Some(_) => format!(
+            ", below the floor in force of {}, declared on the llm-config surface",
+            pool_floor(pool_size, declared_min_healthy)
+        ),
+        None => ", with no floor declared, so the pool is judged down only when nothing serves"
+            .to_string(),
     };
     // A stated reset instant and a stated window are statements of different
     // strength: only the first one says when the upstream will serve again. With
@@ -664,7 +806,7 @@ pub fn pool_down_verdict(
     // that only exists as a unix count in someone's notification is a number
     // they have to convert before they can act on it.
     format!(
-        "LLM upstream pool unavailable: {scope} ({recovery}; next attempt {next_attempt}); \
+        "LLM upstream pool unavailable: {scope}{floor} ({recovery}; next attempt {next_attempt}); \
          LLM-dependent tasks paused, supply a reachable upstream"
     )
 }
@@ -743,9 +885,11 @@ mod tests {
         let status: LlmPoolStatus = serde_json::from_str(old).expect("old payload parses");
         assert_eq!(status.pool_size, 0);
         assert_eq!(status.quota_window_secs, 0);
+        assert_eq!(status.declared_min_healthy, None);
         let verdict = pool_down_verdict(
             status.pool_size,
             &status.unavailable_upstreams,
+            status.declared_min_healthy,
             status.evidenced_recovery_unix,
             status.next_attempt_unix,
             status.quota_window_secs,
@@ -762,7 +906,7 @@ mod tests {
     #[test]
     fn the_verdict_names_the_pool_and_the_suspect_subset_separately() {
         let suspect = vec!["https://a.example.com|m1".to_string()];
-        let verdict = pool_down_verdict(4, &suspect, 1_789_315_200, 1_789_314_600, 0);
+        let verdict = pool_down_verdict(4, &suspect, Some(2), 1_789_315_200, 1_789_314_600, 0);
         assert!(
             verdict.contains("1 of 4 upstreams are suspect right now"),
             "两个口径都要有名字: {verdict}"
@@ -782,7 +926,7 @@ mod tests {
     /// time" while dropping that window is true and still reads as a hiccup.
     #[test]
     fn a_stated_window_survives_the_absence_of_a_stated_instant() {
-        let verdict = pool_down_verdict(4, &[], 0, 1_789_314_600, 7 * 86_400);
+        let verdict = pool_down_verdict(4, &[], Some(3), 0, 1_789_314_600, 7 * 86_400);
         assert!(
             verdict.contains("no upstream reported a recovery time"),
             "没有时刻就得直说没有: {verdict}"
@@ -791,6 +935,120 @@ mod tests {
             verdict.contains("longest upstream-quota window is 7 d"),
             "只报了窗口的上游不能被漏掉: {verdict}"
         );
+    }
+
+    /// The floor is what explains a verdict that the suspect count contradicts:
+    /// a pool can be down with several upstreams still serving. The verdict has
+    /// to name the rule it was taken against, or a reader who sees "1 of 4
+    /// upstreams are suspect" reads a pool that has three good ones and asks why
+    /// anything stopped.
+    #[test]
+    fn a_declared_floor_is_named_as_the_ground_of_the_verdict() {
+        let suspect = vec!["https://a.example.com|m1".to_string()];
+        let verdict = pool_down_verdict(4, &suspect, Some(2), 0, 0, 0);
+        assert!(
+            verdict.contains("1 of 4 upstreams are suspect right now"),
+            "{verdict}"
+        );
+        assert!(
+            verdict.contains("below the floor in force of 2"),
+            "判定所依据的那条规则要点名，否则读者拿嫌疑家数当理由: {verdict}"
+        );
+        // The number named is the one in force, i.e. clamped into the pool. A
+        // declaration above the pool is not satisfiable at all, and naming it
+        // would put a number in the sentence that no reading of this pool can
+        // ever meet — while the alert row beside it carries the clamped value.
+        let above = pool_down_verdict(4, &suspect, Some(9), 0, 0, 0);
+        assert!(above.contains("below the floor in force of 4"), "{above}");
+        assert!(!above.contains("of 9"), "{above}");
+    }
+
+    /// The undeclared case is the fallback, and the fallback has to say so.
+    /// It is A9's rule (down only when nothing serves), which is the *only*
+    /// rule that keeps a pool of one serving upstream labelled up — and "no
+    /// floor" must not read as "no requirement", which is the other rule an
+    /// undeclared value could be mistaken for.
+    #[test]
+    fn no_declaration_reads_as_the_fallback_not_as_a_floor_of_zero() {
+        let verdict =
+            pool_down_verdict(4, &["https://a.example.com|m1".to_string()], None, 0, 0, 0);
+        assert!(
+            verdict.contains(
+                "with no floor declared, so the pool is judged down only when nothing serves"
+            ),
+            "{verdict}"
+        );
+        assert!(
+            !verdict.contains("declared floor of 0"),
+            "没声明不是「下限为零」: {verdict}"
+        );
+    }
+
+    /// Reading the floor off a payload: the declaration when there is one, the
+    /// fallback when there is not, and the strict end of both malformed cases.
+    #[test]
+    fn the_floor_in_force_is_the_declaration_or_the_fallback() {
+        let mut status = LlmPoolStatus {
+            pool_size: 4,
+            unavailable_upstreams: vec!["a|m".into()],
+            ..Default::default()
+        };
+        assert_eq!(status.available_upstreams(), 3);
+        assert_eq!(
+            status.min_healthy(),
+            1,
+            "没声明时回落到的界是「一个都不供才算不可用」，不是「每家都得供」"
+        );
+        assert_eq!(status.min_healthy_source(), MIN_HEALTHY_SOURCE_FALLBACK);
+
+        status.declared_min_healthy = Some(2);
+        assert_eq!(status.min_healthy(), 2);
+        assert_eq!(status.min_healthy_source(), MIN_HEALTHY_SOURCE_DECLARED);
+
+        status.declared_min_healthy = Some(9);
+        assert_eq!(
+            status.min_healthy(),
+            4,
+            "声明比池还大的界永远达不成，读的时候夹到池的大小"
+        );
+        // 写者两端都不产 0（单入口拒掉它），落成 0 的载荷按最严那一端读：
+        // 「下限为零」是一条被空池满足的界，把它读成界就等于把笔误读成永不暂停。
+        status.declared_min_healthy = Some(0);
+        assert_eq!(status.min_healthy(), 1);
+
+        // 没带池大小的旧载荷：可用数是「答不了」而不是「一个都没有」。
+        let unknown = LlmPoolStatus::default();
+        assert_eq!(unknown.available_upstreams(), 0);
+        assert_eq!(unknown.min_healthy(), 0, "没配池就没有界可言");
+    }
+
+    /// The event is a payload across processes, so the floor has to survive the
+    /// wire and a payload from a build that predates it has to read as
+    /// "nothing declared" rather than failing to parse — a rejected event
+    /// loses the edge itself.
+    #[test]
+    fn the_event_carries_the_floor_and_defaults_when_it_is_absent() {
+        let mut status = LlmPoolStatus {
+            pool_size: 4,
+            declared_min_healthy: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(status.min_healthy(), 2);
+        let round_tripped: LlmPoolStatus =
+            serde_json::from_str(&serde_json::to_string(&status).unwrap()).unwrap();
+        assert_eq!(round_tripped.declared_min_healthy, Some(2));
+        assert_eq!(
+            round_tripped.min_healthy_source(),
+            MIN_HEALTHY_SOURCE_DECLARED
+        );
+
+        let old = r#"{"unavailable":true,"evidenced_recovery_unix":0,"next_attempt_unix":0,
+                      "unavailable_upstreams":[],"pool_size":4}"#;
+        let parsed: LlmPoolStatus = serde_json::from_str(old).expect("old payload parses");
+        assert_eq!(parsed.declared_min_healthy, None);
+        assert_eq!(status.pool_size, 4);
+        status.declared_min_healthy = None;
+        assert_eq!(status.min_healthy_source(), MIN_HEALTHY_SOURCE_FALLBACK);
     }
 
     /// The event is consumed by processes that may still be running an older

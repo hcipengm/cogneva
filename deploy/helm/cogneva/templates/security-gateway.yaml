@@ -75,6 +75,16 @@ spec:
                   name: cogneva-secrets-oob
                   key: llm-upstreams
                   optional: true
+            # 声明的冗余下限（llm-config 里随上游池一起声明的一个整数，空 = 没
+            # 声明）。网关拿它当池判定的界：当刻能承接的上游数低于它就按"池不可用"
+            # 判。与上游池同一个 Secret、同一次写入——声明池里有哪几家与声明池要
+            # 几家是同一件事，分两处写就会有一段时间里两边说的不是同一个池。
+            - name: COGNEVA_LLM_POOL_MIN_HEALTHY
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets-oob
+                  key: llm-pool-min-healthy
+                  optional: true
             - name: COGNEVA_GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:

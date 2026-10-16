@@ -59,8 +59,15 @@ LLM_ADMIN_BINDING="deploy/rendered/k3s-single/17-rolebinding-cogneva-llm-admin.y
 # 1) 真树绿，且读数是真读数
 out="$(run_gate)" || fail "真树应当绿，实际红：${out}"
 grep -q "CREDENTIAL HOLDER SURFACE OK" <<<"${out}" || fail "绿时没有报出判词：${out}"
-grep -qE "48 条登记" <<<"${out}" || fail "绿时没报出登记条数：${out}"
-grep -qE "声明键 26 个" <<<"${out}" || fail "绿时没报出写者声明键数（解析可能被截断）：${out}"
+# 登记条数不钉死在这个文件里，改成与登记表自己的数据行数比：这是两侧的一致性
+# 断言（门报的条数必须就是表里的行数），钉一个数只会随每次加键过期一次——加
+# `llm-pool-min-healthy` 那次就是这么红的，红得对，但红在了一个不该红的字面量上。
+ledger_rows="$(grep -v '^#' "${repo}/${registry}" | grep -c .)"
+grep -qE "${ledger_rows} 条登记" <<<"${out}" || fail "绿时没报出登记条数（表里 ${ledger_rows} 行）：${out}"
+# 写者声明键数只能钉：它来自 helm 渲染后的模板解析，这个测试复刻不出来（复刻
+# 一份解析就是第二处正本）。它在这里的作用是挡"解析被截断"——截断时报一个小得
+# 多的数。加了键就改这一处。
+grep -qE "声明键 27 个" <<<"${out}" || fail "绿时没报出写者声明键数（解析可能被截断）：${out}"
 
 # 2) 新出现一个持有者：主应用多挂一个带外键（三种形态都改，才落到登记表那一侧）
 mirror

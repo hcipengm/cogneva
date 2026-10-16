@@ -717,6 +717,9 @@ secrets:
   s3SecretKey: ""
   # 带外凭证（网关专用）：真实值带外写入，默认空（未配置时对应功能 fail-closed）。
   llmUpstreams: ""
+  # 池的冗余下限（正整数，空 = 未声明）。与上游池同一次 llm-config 写入，放在同一
+  # 条注释下是因为它俩属于同一份声明：哪些家在池里、要几家同时能供才够。
+  llmPoolMinHealthy: ""
   githubToken: ""
   giteeToken: ""
   githubWebhookSecret: ""

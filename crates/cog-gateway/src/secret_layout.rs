@@ -25,6 +25,10 @@ pub(crate) const SECRET_NAME_OOB: &str = "cogneva-secrets-oob";
 /// 的唯一执行者**——少列一个键，老安装里就会留一份副本在被业务 Pod 读得到的地方。
 pub(crate) const OOB_SECRET_KEYS: &[&str] = &[
     "llm-upstreams",
+    // 池的冗余下限：与上游池同一次 llm-config 写入的第二个键。它在带外片里
+    // 而不是内部片，理由与上游池同一条——它决定「还剩几家才停派活」，也就是
+    // 平台的 LLM 容量策略；业务 Pod 零持有这条策略，也不需要它。
+    "llm-pool-min-healthy",
     "github-token",
     "gitee-token",
     "github-webhook-secret",

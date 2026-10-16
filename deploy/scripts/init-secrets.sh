@@ -25,6 +25,7 @@ OOB_SECRET=cogneva-secrets-oob
 # 空值。多列一个不存在的键是无害的空操作，少列一个才会留下残留副本。
 OOB_KEYS=(
   llm-upstreams
+  llm-pool-min-healthy
   github-token
   gitee-token
   github-webhook-secret
@@ -388,6 +389,7 @@ ensure_s3_identity
 
 echo "==> 带外凭证占位（留空，由 WebUI 向导或 kubectl edit secret ${OOB_SECRET} 写入）"
 ensure_blank_oob llm-upstreams
+ensure_blank_oob llm-pool-min-healthy
 ensure_blank_oob github-token
 ensure_blank_oob gitee-token
 ensure_blank_oob github-webhook-secret

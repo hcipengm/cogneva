@@ -188,6 +188,7 @@ impl AlertStore {
                 next_attempt_unix,
                 unavailable,
                 pool_size,
+                declared_min_healthy,
                 quota_window_secs,
                 timestamp,
             } => {
@@ -199,6 +200,7 @@ impl AlertStore {
                 let message = cog_core::pool_down_verdict(
                     *pool_size,
                     unavailable,
+                    *declared_min_healthy,
                     *evidenced_recovery_unix,
                     *next_attempt_unix,
                     *quota_window_secs,
@@ -285,6 +287,7 @@ mod tests {
             next_attempt_unix: 1_789_314_600,
             unavailable: vec!["https://a.example|model-a".into()],
             pool_size: 4,
+            declared_min_healthy: None,
             quota_window_secs: 0,
             timestamp: Utc::now(),
         };
@@ -315,6 +318,7 @@ mod tests {
             next_attempt_unix: 1_789_314_600,
             unavailable: vec!["https://a.example|model-a".into()],
             pool_size: 4,
+            declared_min_healthy: None,
             quota_window_secs: 0,
             timestamp: Utc::now(),
         };

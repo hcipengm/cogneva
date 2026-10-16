@@ -763,7 +763,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
 
 /// Convert a [`SupervisorEvent`] into [`AlertEvent`]s for Alertmanager webhook dispatch.
 fn supervisor_event_to_alert_events(event: &cog_core::SupervisorEvent) -> Vec<AlertEvent> {
-    // LLM 上游池全灭是"无人可用"级别的故障：不补可联通的上游，整条 LLM
+    // LLM 上游池不可用是"派不动活"级别的故障：不补可联通的上游，整条 LLM
     // 依赖链停摆，所以路由到通知出口（Critical），恢复时自动 resolve。
     match event {
         cog_core::SupervisorEvent::LlmUpstreamPoolDown {
@@ -771,6 +771,7 @@ fn supervisor_event_to_alert_events(event: &cog_core::SupervisorEvent) -> Vec<Al
             next_attempt_unix,
             unavailable,
             pool_size,
+            declared_min_healthy,
             quota_window_secs,
             timestamp,
         } => {
@@ -781,6 +782,18 @@ fn supervisor_event_to_alert_events(event: &cog_core::SupervisorEvent) -> Vec<Al
             // 者、还把它叫 `unavailable_count`，读的人会以为池就这么大。
             labels.insert("suspect_count".into(), unavailable.len().to_string());
             labels.insert("pool_size".into(), pool_size.to_string());
+            // 第三个数：这条判定是按哪条界做出来的。池判定收在**容量**上之后，
+            // "3 of 4 在嫌疑窗内"与"4 of 4"可以是同一个判定（声明要求两家时，
+            // 剩两家就是够的），而只报前两个数的读者会把它读成"还剩一家在供，
+            // 为什么派活停了"。界与它的来源一起给，值不是别处抄的。
+            labels.insert(
+                "min_healthy".into(),
+                cog_core::pool_floor(*pool_size, *declared_min_healthy).to_string(),
+            );
+            labels.insert(
+                "min_healthy_source".into(),
+                cog_core::min_healthy_source(*declared_min_healthy).to_string(),
+            );
             labels.insert(
                 "evidenced_recovery_unix".into(),
                 evidenced_recovery_unix.to_string(),
@@ -794,7 +807,7 @@ fn supervisor_event_to_alert_events(event: &cog_core::SupervisorEvent) -> Vec<Al
             // 得通，没有一层会报错，读的人也无从判断该信哪句；时刻与窗口长度同样
             // 由那一句分开措辞。
             //
-            // 「共用同一句」的范围到此为止：池全灭**落进 PG 告警表**那一行不在里
+            // 「共用同一句」的范围到此为止：池不可用**落进 PG 告警表**那一行不在里
             // 面，它由 `cog-gateway::security_gateway::pool_down_message` 本地措辞
             // （并且点名在嫌疑窗内的上游，这一句不含名单）。两边落在不同载体上，
             // `/alerts` 那条读口会把同规则的两条合成一条，理由与挑哪一条见
@@ -804,6 +817,7 @@ fn supervisor_event_to_alert_events(event: &cog_core::SupervisorEvent) -> Vec<Al
                 cog_core::pool_down_verdict(
                     *pool_size,
                     unavailable,
+                    *declared_min_healthy,
                     *evidenced_recovery_unix,
                     *next_attempt_unix,
                     *quota_window_secs,

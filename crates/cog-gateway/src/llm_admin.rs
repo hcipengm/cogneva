@@ -24,6 +24,10 @@ const API_BASE: &str = "https://kubernetes.default.svc";
 /// 它住带外片——这个键只被安全网关读，放内部片等于铺给持那一份的每个业务 Pod
 /// （那份是整对象 get）。键位表与归属见 `secret_layout`。
 const SECRET_UPSTREAMS_KEY: &str = "llm-upstreams";
+/// 池的冗余下限（十进制整数，空串 = 没有声明）。它与上游池同一次写入、同一片
+/// Secret：声明池需要几家、与声明池里有哪几家是同一件事，分两处写就会有一段时间
+/// 里两边说的不是同一个池。
+const SECRET_MIN_HEALTHY_KEY: &str = "llm-pool-min-healthy";
 const GATEWAY_DEPLOYMENT: &str = "cogneva-security-gateway";
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +52,18 @@ pub struct LlmConfigRequest {
     pub skip_verify: Option<bool>,
     /// 追加的故障转移上游：主上游 429/402 时按声明顺序顶上。
     pub extra_upstreams: Option<Vec<LlmUpstreamRequest>>,
+    /// 声明的冗余下限：池里至少要有几家上游能承接请求，低于它就按"池不可用"
+    /// 判（告警 + 暂停 LLM 依赖型派活）。缺省 = 不声明，判定回落到"一家都不供
+    /// 才算不可用"。
+    ///
+    /// 这**不是**一个可有可无的旋钮：池的成员按构造可以互相顶替，所以"还剩几家
+    /// 能供"是池自己的容量。这个字段缺省时，一个只剩一家的池读起来与四家齐供
+    /// 完全一样，而下一次 429 就会把整条链停掉。
+    ///
+    /// 取值必须是 `1..=上游家数`：0 家是空池也能满足的界（等于"永不判不可用"），
+    /// 超过池的大小则永远达不成（等于"永不判可用"），两个方向都是把笔误读成规则，
+    /// 所以这一层直接拒单而不是替调用方夹一个数——它夹出来的那个值调用方看不见。
+    pub min_healthy: Option<usize>,
 }
 
 /// GET /api/v1/admin/llm-status — whether the security gateway holds a
@@ -58,9 +74,14 @@ pub struct LlmConfigRequest {
 pub async fn llm_status_handler(State(_state): State<Arc<crate::GatewayState>>) -> Response {
     if let Ok(kube) = KubeClient::in_cluster() {
         if let Ok(configured) = kube.secret_has_key().await {
+            let pool = kube.secret_pool_policy().await.ok().flatten();
             return (
                 StatusCode::OK,
-                Json(json!({ "configured": configured, "backends": local_backends() })),
+                Json(json!({
+                    "configured": configured,
+                    "backends": local_backends(),
+                    "pool": pool,
+                })),
             )
                 .into_response();
         }
@@ -130,6 +151,27 @@ pub async fn llm_config_handler(
     let mut requests = vec![primary];
     requests.extend(req.extra_upstreams.unwrap_or_default());
 
+    // 声明的下限在落库前对**这次要落的那个池**校验：超过池大小的界永远达不成，
+    // 0 的界永远满足，两者都不是运营者想写的那条规则，而它们都会安静地生效。
+    if let Some(declared) = req.min_healthy {
+        if declared == 0 || declared > requests.len() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "min_healthy_out_of_range",
+                    "message": format!(
+                        "冗余下限必须在 1..={} 之间（这次声明了 {} 个上游）",
+                        requests.len(),
+                        requests.len()
+                    ),
+                    "upstreams": requests.len(),
+                    "min_healthy": declared,
+                })),
+            )
+                .into_response();
+        }
+    }
+
     // 逐条校验 + 实证探测：地址/可达性不过关则整单拒绝，避免落下半残池；
     // 上游明确拒服（额度/限流/鉴权）不算不过关——池内条目互相独立，运行
     // 时会按序转移，这类条目照样落池，只是如实标记为未验证。
@@ -173,8 +215,19 @@ pub async fn llm_config_handler(
         }
     };
 
-    if let Err(e) =
-        crate::secret_layout::patch_fields(&kube, json!({ SECRET_UPSTREAMS_KEY: pool_json })).await
+    // 两个键同一次写入：池与它的下限是同一份声明的两半。缺省写空串而不是删键
+    // ——merge patch 删键要靠 null，而那与"把值写成空的 base64"在这一层分不开；
+    // 空串在读者那侧就是「没有声明」（见 `min_healthy_from_env`）。旧镜像读到这个
+    // 键不认，也不受影响：它按 `COGNEVA_LLM_UPSTREAMS` 一个键判池。
+    let min_healthy_value = req.min_healthy.map(|n| n.to_string()).unwrap_or_default();
+    if let Err(e) = crate::secret_layout::patch_fields(
+        &kube,
+        json!({
+            SECRET_UPSTREAMS_KEY: pool_json,
+            SECRET_MIN_HEALTHY_KEY: min_healthy_value,
+        }),
+    )
+    .await
     {
         return (
             StatusCode::BAD_GATEWAY,
@@ -199,6 +252,8 @@ pub async fn llm_config_handler(
             "ok": true,
             "restarted": [GATEWAY_DEPLOYMENT],
             "upstreams": pool.len(),
+            "min_healthy": req.min_healthy,
+            "min_healthy_source": cog_core::min_healthy_source(req.min_healthy),
             "unverified_upstreams": unverified,
             "message": "配置已保存，安全网关正在滚动重启，约一分钟后生效",
         })),
@@ -798,6 +853,66 @@ impl KubeClient {
             .map(|v| !v.is_empty())
             .unwrap_or(false);
         Ok(has)
+    }
+
+    /// 池的声明面：池里有几家、声明的冗余下限是几、以及这个值是从哪来的。
+    ///
+    /// 三个数一起给，因为「界」这个读数的全部意义就在这三个数的关系上：只有池的
+    /// 大小看不出该在哪停下来，只有下限看不出它是不是一句被写下来的话。**没有声明**
+    /// 与「声明为 1」在这一面必须分得开——两者算出的界相同，而一个运营者看得出来
+    /// 的区别是：前者是他还没决定的，后者是他已经决定过的。
+    ///
+    /// `min_healthy_in_force` 是那份声明生效时的界，按 `cog_core::pool_floor` 一处
+    /// 的定义算出来（含夹取），不是这一面自己再算一遍——两面各夹一次就会出现"页面
+    /// 上说 3、实际按 4 判"这种没有一处报错的漂移。
+    ///
+    /// 读不到 Secret 时返回 `Ok(None)` 而不是一个默认值：这一面无话可说与「池里
+    /// 一家都没有」是两件事，把前者印成后者等于替一次读失败编一个池。
+    async fn secret_pool_policy(&self) -> Result<Option<serde_json::Value>, String> {
+        let resp = self
+            .http
+            .get(format!(
+                "{API_BASE}{}",
+                crate::secret_layout::oob_secret_api_path(&self.namespace)
+            ))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| format!("读取 secret 失败: {e}"))?;
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
+        let secret: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("secret 响应解析失败: {e}"))?;
+        let Some(data) = secret.get("data") else {
+            return Ok(None);
+        };
+        let decode = |key: &str| -> Option<String> {
+            let raw = data.get(key)?.as_str()?;
+            use base64::Engine as _;
+            let bytes = base64::engine::general_purpose::STANDARD.decode(raw).ok()?;
+            String::from_utf8(bytes).ok()
+        };
+        let Some(upstreams_raw) = decode(SECRET_UPSTREAMS_KEY) else {
+            // 池那个键都读不出来（没有、或不是我们写的形状）：这一面无话可说。
+            return Ok(None);
+        };
+        let upstreams = serde_json::from_str::<Vec<serde_json::Value>>(&upstreams_raw)
+            .map(|list| list.len())
+            .unwrap_or(0);
+        // 同一条语法由判定那一路定义：这一面若自己再写一遍"trim、非空、大于 0"，
+        // 两处就会漂——配置面读得出一个界、判定面读不出，而两边都自报成功。
+        let declared = decode(SECRET_MIN_HEALTHY_KEY)
+            .as_deref()
+            .and_then(crate::security_gateway::parse_min_healthy);
+        Ok(Some(json!({
+            "upstreams": upstreams,
+            "min_healthy": declared,
+            "min_healthy_source": cog_core::min_healthy_source(declared),
+            "min_healthy_in_force": cog_core::pool_floor(upstreams, declared),
+        })))
     }
 
     /// 滚动重启安全网关：上游池整体在 Secret 里（env 引用 Secret 条目，

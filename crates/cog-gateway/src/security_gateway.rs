@@ -102,6 +102,14 @@ pub struct SecurityGatewayConfig {
     /// 失败上游进嫌疑窗（指数退避），后台探测器在窗口到期时最小请求复测。
     /// 空 = 未配置，LLM 通道一律 503。
     pub llm_upstreams: Vec<LlmUpstream>,
+    /// How many upstreams the pool is declared to need in order to carry
+    /// LLM-dependent work（COGNEVA_LLM_POOL_MIN_HEALTHY，与上游池同一次写入
+    /// llm-config 的 Secret）。
+    ///
+    /// `None` = 没有声明，池按「一家都不供才算不可用」判；这个回落是写进
+    /// 载荷里的（`LlmPoolStatus::min_healthy_source`），读者分得出「声明了 1」
+    /// 与「什么都没声明」——这两件事在监控上同形，而它们对运营者的含义不同。
+    pub llm_pool_min_healthy: Option<usize>,
     /// 嫌疑上游的主动探测间隔秒数（COGNEVA_LLM_HEALTH_PROBE_SECS，默认 300），
     /// 同时是嫌疑窗指数退避的基数。
     pub llm_health_probe_secs: u64,
@@ -231,6 +239,7 @@ impl SecurityGatewayConfig {
             domain_allowlist: list("COGNEVA_SG_DOMAIN_ALLOWLIST"),
             domain_denylist: list("COGNEVA_SG_DOMAIN_DENYLIST"),
             llm_upstreams: upstreams_from_env(),
+            llm_pool_min_healthy: min_healthy_from_env(),
             llm_health_probe_secs: env_u64("COGNEVA_LLM_HEALTH_PROBE_SECS", 300),
             github_token: token("COGNEVA_GITHUB_TOKEN"),
             gitee_token: token("COGNEVA_GITEE_TOKEN"),
@@ -312,6 +321,51 @@ fn upstreams_from_env() -> Vec<LlmUpstream> {
     std::env::var("COGNEVA_LLM_UPSTREAMS")
         .map(|raw| parse_upstreams(&raw))
         .unwrap_or_default()
+}
+
+/// 声明的冗余下限送进来的那个环境变量名。写成常量而不是散在读取点上的字面量：
+/// 同一个名字还要出现在两份部署清单里，三处各写一遍就等于让它们各自漂，而漂的结果
+/// 是「清单里接了、进程不读」或反过来——两边都不报错，只是判定一直按未声明走。
+pub(crate) const LLM_POOL_MIN_HEALTHY_ENV: &str = "COGNEVA_LLM_POOL_MIN_HEALTHY";
+
+/// 声明的冗余下限：上面那个环境变量，与上游池同一次写入 Secret 的那个值
+/// （llm-config 单入口里的一个整数）。
+///
+/// 缺席、空串、解析不出、以及 0 一律读成「没有声明」：声明的值必须是个正整数
+/// 才谈得上「最少几家」——0 家是空池也能满足的界，把它读成界等于把一次笔误读成
+/// 「永不判不可用」，而这条路径没有别的地方拦得住它。读不出来不是静默的：它落
+/// 在载荷的 `min_healthy_source = fallback_all_down` 上，任何读者都看得见这一格
+/// 是回落而不是声明。夹到池的大小不在这里做——要夹的那个池的大小由同一个进程
+/// 刚解析出来的上游数组决定，落在 `LlmPoolStatus::min_healthy` 一处做。
+fn min_healthy_from_env() -> Option<usize> {
+    let raw = std::env::var(LLM_POOL_MIN_HEALTHY_ENV).ok()?;
+    match parse_min_healthy(&raw) {
+        Some(n) => Some(n),
+        None => {
+            if !raw.trim().is_empty() {
+                tracing::warn!(
+                    value = %raw.trim(),
+                    "COGNEVA_LLM_POOL_MIN_HEALTHY 不是正整数，这条声明不生效，池按下限未声明判"
+                );
+            }
+            None
+        }
+    }
+}
+
+/// 冗余下限那条声明的取值语法：一个十进制正整数，允许两侧空白；空串、0、负数、
+/// 别的东西一律是「没有声明」。
+///
+/// 抽成纯函数是为了让"什么算一条声明"能被单独断言——它与"这个值是几"是两个
+/// 判断，而只有前者决定判定回落到哪条规则上。两处读者共用它：本进程从 Secret
+/// 注入的环境变量那一路，以及 llm-config 状态面直接读 Secret 那一路。两处各写一
+/// 遍"trim 一下、非空、大于 0"，就等于两套语法：同一条声明在配置面读得出来、
+/// 在判定面读不出来（或少一层过滤），而两边都自报成功。
+pub(crate) fn parse_min_healthy(raw: &str) -> Option<usize> {
+    match raw.trim().parse::<usize>() {
+        Ok(n) if n > 0 => Some(n),
+        _ => None,
+    }
 }
 
 /// 解析上游池 JSON：字段缺失/为空的条目丢弃，整体不是合法 JSON 数组时返回空。
@@ -1679,13 +1733,28 @@ impl AppState {
     /// （全在嫌疑窗内），就返回 `Retry-After` 秒数（到下次可试时刻，至少 60s），
     /// 否则 None。调用方据此在入口快速失败，不再逐个上游重试。
     ///
-    /// 判据必须与"池不可用"的其它观测面同源（告警、调度侧暂停、Redis 信号都取
-    /// `all_suspect`），否则会出现"调度侧已暂停、请求路径仍在遍历全池"的分裂：
-    /// 池里只要有一个上游的失败不带可解析的配额恢复时刻（例如配额耗尽以 403
-    /// 形式给出、正文里没有时间戳），任何"仅当全部配额确定耗尽才熔断"的更窄
-    /// 判据都会失效，于是每次调用照样把整个池打一遍。窗口到期即离开全灭态，
-    /// 真实请求仍会立刻试一次，所以按全灭熔断不损失机会性恢复；窗口内的遍历
-    /// 才是纯烧请求。
+    /// 这里的判据是「一家都承接不了」，而**不是**池判定用的那条「低于声明的
+    /// 冗余下限」——两条判据答的是两个问题，故意的不同源：
+    ///
+    /// - 池判定（告警、调度侧暂停、Redis 信号）答的是"还能不能派新的 LLM 依赖
+    ///   型活"。它是**容量**问题：声明要两家以上时，只剩一家的池接不住下一批活，
+    ///   所以派活要停。
+    /// - 这一条答的是"这一次请求有没有人接"。它是**可达性**问题：还剩一家能供，
+    ///   就不该把一个能服务的请求拒掉——把容量不足折算成 503，等于把仅存的那点
+    ///   产线也关掉，那是真退化。
+    ///
+    /// 两条判据在本文件里各有唯一的出处，且都不是对方的复制品：这里是
+    /// `all_suspect`，池判定那侧是 `cog_core::pool_floor` 对当刻可用数之比。
+    /// 曾经两者同为 `all_suspect`，那时"池不可用"就等于"一家都不供"；界收到容量
+    /// 上之后它们必须分开，而且分开的方向是明确的——不可达才拒请求，容量不足只
+    /// 停派活。
+    ///
+    /// 剩下那条要注意的一致性仍然成立：池里只要有一个上游的失败不带可解析的
+    /// 配额恢复时刻（例如配额耗尽以 403 形式给出、正文里没有时间戳），任何"仅当
+    /// 全部配额确定耗尽才熔断"的更窄判据都会失效，于是每次调用照样把整个池打一遍。
+    /// 所以这里的判据仍然是**能承接的家数为零**，而不是"配额确定耗尽"。窗口到期
+    /// 即离开这个状态，真实请求仍会立刻试一次，所以按它熔断不损失机会性恢复；
+    /// 窗口内的遍历才是纯烧请求。
     /// 池级熔断：返回 `(何时可重试, 上游自述的配额窗口)`。两个数分开给，因为
     /// 它们答的是不同的问题——前者是"我们什么时候值得再试一次"（由探测节拍决定，
     /// 封顶 6h），后者是"上游自己说还要多久"（可能是整整一周）。合成一个数播报，
@@ -2839,6 +2908,11 @@ async fn publish_pool_status(
         // 它们手上只有 `unavailable_upstreams`——那是**当刻还在嫌疑窗内**的
         // 子集，会随窗到期自己缩小，报出去就成了"池只有这么大"。
         pool_size: state.config.llm_upstreams.len(),
+        // 判定所依据的那条界跟着判定走。判定从「零家可服务」变成「低于声明
+        // 的下限」之后，这条载荷自己那两列（池多大、几家在嫌疑窗内）已经不能
+        // 解释它了：1/4 与 4/4 在旧读数上是两件事，在新判定下是同一个判定，
+        // 而读者只有拿到界才看得出这一格为什么会是「不可用」。
+        declared_min_healthy: state.config.llm_pool_min_healthy,
         quota_window_secs: bounds.window_secs,
         // 判定与它的输入同一条载荷、同一次写入：分开写就会有一段时间里
         // 一边说池不可用、另一边说没有证据，读的人无从判断该信哪边。
@@ -2860,7 +2934,12 @@ async fn publish_pool_status(
 /// 内那几家是一个**当刻**读数。把后者写进"所有 N 个 LLM 上游"这句话里，读告警
 /// 的人会以为池就这么大，而池里另外几家的处境（包括它们自述过的复位时刻）就被
 /// 这句话盖掉了。
-fn pool_down_message(pool_size: usize, unavailable: &[String], bounds: &RecoveryBounds) -> String {
+fn pool_down_message(
+    pool_size: usize,
+    unavailable: &[String],
+    bounds: &RecoveryBounds,
+    declared_min_healthy: Option<usize>,
+) -> String {
     // 两种上界分开措辞：上游报了配额恢复时刻就是一条关于上游的事实，只够说明
     // "我们下次会再试"的退避节拍不能借"恢复"这个词播出去，否则读告警的人会以为
     // 上游一分钟后就回来。上游自述的窗口长度（只有窗口、没有时刻时才有的那一条）
@@ -2897,16 +2976,33 @@ fn pool_down_message(pool_size: usize, unavailable: &[String], bounds: &Recovery
             unavailable.join("、")
         )
     };
+    // 判定所依据的那条界，以及它是声明还是回落。界收在容量上之后，「池不可用」
+    // 不再等于「一家也供不了」：还供着几家的池可以是不可用的。这一句不点出界，
+    // 读者会拿嫌疑家数当理由——那正是这条判定改口径时要防的误读。回落那一侧明说
+    // 是回落：声明未给出时规则退回到「一家都不供才算不可用」，这与「声明了下限
+    // 为 1」不是同一件事，两者在读数上同形，而它们对运营者的含义不同。
+    let floor_note = match declared_min_healthy {
+        Some(_) => format!(
+            "，低于下限 {} 家（来源：llm-config 声明）",
+            cog_core::pool_floor(pool_size, declared_min_healthy)
+        ),
+        None => "，未声明下限，按回落规则判：一家都不供才算不可用".to_string(),
+    };
     format!(
-        "LLM 上游池不可用（池内 {pool_size} 个上游{suspect_note}）（{recovery_note}）；\
-         LLM 依赖型任务已暂停，请补充可联通的上游"
+        "LLM 上游池不可用（池内 {pool_size} 个上游{suspect_note}{floor_note}）\
+         （{recovery_note}）；LLM 依赖型任务已暂停，请补充可联通的上游"
     )
 }
 
-/// 池全灭告警的规则名。写一次：`dedup_key` 要从它派生事件身份，规则名再抄一遍
+/// 池不可用告警的规则名。写一次：`dedup_key` 要从它派生事件身份，规则名再抄一遍
 /// 就有两处会漂的地方。
 ///
-/// 这里是池全灭**落进告警表的唯一一行**，不是这个条件唯一的判词。同类还有第二个
+/// 规则名里的 `pool_down` 是**名字**，不是判据：这条判定今天量的是"当刻能承接的
+/// 上游数低于声明的冗余下限"（下限未声明时回落成"一家都不供"），所以它还供着一
+/// 家的池也可以是 firing 的。名字不改是因为它是告警身份的一部分（`dedup_key`
+/// 从它派生、A9 的判据按它取行），改名等于把"池断了多久"这条历史切成两段。
+///
+/// 这里是池不可用**落进告警表的唯一一行**，不是这个条件唯一的判词。同类还有第二个
 /// 发布者：监督者那条 `SupervisorEvent::LlmUpstreamPoolDown`（`llm_pool_guard` 在池
 /// 走下沿时发）经通知出口与进程内告警列表各说一遍，用的是 `cog_core::pool_down_verdict`
 /// 那句英文。两边落在不同载体上（这张表 vs 进程内列表与出口），所以"只写了一次"这句话
@@ -2972,6 +3068,13 @@ async fn sync_pool_alert(state: &AppState, down: bool) {
         .map(LlmHealthTable::key)
         .collect();
     let pool_size = state.config.llm_upstreams.len();
+    let floor = cog_core::pool_floor(pool_size, state.config.llm_pool_min_healthy);
+    // 判词里的「供着几家 / 池多大」两个数一直有，缺的是第三个：这条判定是按哪
+    // 条界做出来的。界收在容量上之后，3/4 与 4/4 可以是同一个判定（声明要 2 家
+    // 以上时两家就是够的），而只印前两个数的读者会把它读成「还有三家在供，为什么
+    // 停了」。界与它的来源同时进 labels，值不是从别处抄的——它就在这一行的两列里，
+    // 两列又都由声明这一处状态导出来。
+    let floor_source = cog_core::min_healthy_source(state.config.llm_pool_min_healthy);
     let alert = NewAlert {
         rule: POOL_ALERT_RULE.into(),
         dedup_key: pool_event_dedup_key(
@@ -2982,13 +3085,21 @@ async fn sync_pool_alert(state: &AppState, down: bool) {
         ),
         severity: "critical".into(),
         message: if down {
-            pool_down_message(pool_size, &unavailable, &bounds)
+            pool_down_message(
+                pool_size,
+                &unavailable,
+                &bounds,
+                state.config.llm_pool_min_healthy,
+            )
         } else {
             "LLM 上游池已恢复，LLM 依赖型任务自动继续".into()
         },
         labels: serde_json::json!({
-            "unavailable": unavailable,
+            "serving": pool_size.saturating_sub(unavailable.len()),
             "pool_size": pool_size,
+            "unavailable": unavailable,
+            "min_healthy": floor,
+            "min_healthy_source": floor_source,
             "evidenced_recovery_unix": bounds.evidenced_unix,
             "next_attempt_unix": bounds.next_probe_unix,
             "quota_window_secs": bounds.window_secs,
@@ -3000,11 +3111,11 @@ async fn sync_pool_alert(state: &AppState, down: bool) {
                 evidenced_recovery_unix = bounds.evidenced_unix,
                 next_attempt_unix = bounds.next_probe_unix,
                 note = %alert.message,
-                "池全灭告警已落 PG（firing）"
+                "池可用数低于下限告警已落 PG（firing）"
             );
         }
         Ok(AlertTransition::Resolved) => {
-            tracing::info!("池全灭告警已落 PG（resolved）");
+            tracing::info!("池可用数低于下限告警已落 PG（resolved）");
         }
         Ok(AlertTransition::NoChange) => {}
         Err(e) => tracing::warn!(error = %e, "池告警落 PG 失败"),
@@ -3012,7 +3123,7 @@ async fn sync_pool_alert(state: &AppState, down: bool) {
 }
 
 /// 池状态节拍：刷新指标 → 续期跨进程信号 → 边沿处告警与日志。
-/// 只在进入/离开"池全灭"时发告警与 ERROR 日志；指标每拍都刷新，
+/// 只在进入/离开"低于冗余下限"时发告警与 ERROR 日志；指标每拍都刷新，
 /// 保证 Prometheus 抓到的永远是当前值。
 async fn refresh_pool_state(state: &AppState) {
     // 初值还没落地就补读，且必须在任何探测之前：这张表是这一拍判断谁该被探测
@@ -3024,12 +3135,27 @@ async fn refresh_pool_state(state: &AppState) {
     if upstreams.is_empty() {
         return;
     }
-    let all_out = state.llm_health.all_suspect(upstreams);
+    // 池的可用数是**当刻不在嫌疑窗内**的家数，界是声明的那个下限（没有声明时
+    // 回落成 1，见 `cog_core::pool_floor`）。
+    //
+    // 为什么不是「全上游都承接不了才停」：这个池的成员按构造是可以互相顶替的
+    // （路由按顺序走），所以「还剩几家能供」是池自己的容量，不是任何一家上游
+    // 的处境——一家独供与四家齐供都读成「可用」，而前者的容量只够一条线，下一
+    // 次 429 就整条停摆。界收在这里之后，「池不可用」这句话的判据是容量不足，
+    // 不再等于零家：几家里掉掉剩一家、且声明要求两家时，池就是不可用的，这一点
+    // 以前没有任何读数说得出来。
+    let serving = upstreams
+        .iter()
+        .filter(|upstream| !state.llm_health.is_suspect(upstream))
+        .count();
+    let floor = cog_core::pool_floor(upstreams.len(), state.config.llm_pool_min_healthy);
+    let below_floor = serving < floor;
     let recovered = state.pool_recovered.swap(false, Ordering::SeqCst);
-    // 池判定按证据走：观测到"全上游都承接不了"即置位；只有上游实证成功才清除。
+    // 池判定按证据走：观测到"低于下限"即置位；只有上游实证成功才清除。
     // 窗口到期只说明"可以再试一次"，不是恢复的证据，所以不解除锁存——否则告警会
-    // 随退避窗到期反复 resolve→firing，而池其实一直不可用。
-    let down = if all_out {
+    // 随退避窗到期反复 resolve→firing，而池其实一直不可用。回到下限之上仍是同
+    // 一条规矩：判据变成容量之后的这一类恢复，也由上游实证成功来报。
+    let down = if below_floor {
         true
     } else if recovered {
         false
@@ -3254,13 +3380,19 @@ async fn refresh_pool_state(state: &AppState) {
     if down != was_down {
         if down {
             tracing::error!(
+                serving,
+                floor,
                 evidenced_recovery_unix = bounds.evidenced_unix,
                 next_attempt_unix = bounds.next_probe_unix,
                 upstreams = ?upstreams.iter().map(LlmHealthTable::key).collect::<Vec<_>>(),
-                "LLM 上游池全灭，进入熔断；LLM 依赖型任务应暂停，需补充可联通的上游"
+                "LLM 上游池可用数低于冗余下限，进入熔断；LLM 依赖型任务应暂停，需补充可联通的上游"
             );
         } else {
-            tracing::info!("LLM 上游池恢复，熔断解除；LLM 依赖型任务自动继续");
+            tracing::info!(
+                serving,
+                floor,
+                "LLM 上游池回到下限之上，熔断解除；LLM 依赖型任务自动继续"
+            );
         }
     }
     // 告警状态的对账每拍都做，不只在进程内边沿上做：告警的真值在 PG，进程内的
@@ -6758,6 +6890,7 @@ mod tests {
             domain_allowlist: allow.iter().map(|s| s.to_string()).collect(),
             domain_denylist: deny.iter().map(|s| s.to_string()).collect(),
             llm_upstreams: Vec::new(),
+            llm_pool_min_healthy: None,
             llm_health_probe_secs: 300,
             github_token: None,
             gitee_token: None,
@@ -7295,7 +7428,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             "探测节拍相反：窗都到期了就没有'下次的钟'，那是在催我们试"
         );
         assert!(
-            pool_down_message(pool.len(), &[], &bounds).contains("7 天"),
+            pool_down_message(pool.len(), &[], &bounds, None).contains("7 天"),
             "只有窗口、没有时刻时，窗口长度是'还要多久'的唯一说法，判词必须带上"
         );
 
@@ -7328,6 +7461,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             4,
             &["https://api.example.com/coding/v1|kimi-k3".to_string()],
             &bounds,
+            None,
         );
         assert!(msg.contains("池内 4 个上游"), "{msg}");
         assert!(
@@ -7344,9 +7478,17 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         );
 
         // 一家都不在窗内：锁存仍为真，但判词不能说"0 个上游"。
-        let msg = pool_down_message(4, &[], &RecoveryBounds::default());
+        let msg = pool_down_message(4, &[], &RecoveryBounds::default(), None);
         assert!(msg.contains("此刻没有上游处在嫌疑窗内"), "{msg}");
         assert!(msg.contains("没有任何上游报告恢复时刻"), "{msg}");
+        // 界那一半：没声明就得说清是回落，且不许印成一个数字——回落到「一家都不
+        // 供才算不可用」与「声明下限为 1」在读数上同形，只说一个数就把后者说成了
+        // 前者。
+        assert!(msg.contains("未声明下限，按回落规则判"), "{msg}");
+        assert!(
+            !msg.contains("低于下限"),
+            "没声明就没有「低于下限」这句话，界的来路要与数一起出现: {msg}"
+        );
     }
 
     /// 同一份事件载荷、两个载体、两句各自措辞的判词——**它们不是两个正本**。
@@ -7380,10 +7522,11 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             next_probe_unix: 1_790_936_536,
             window_secs: 7 * 86_400,
         };
-        let gateway = pool_down_message(pool_size, &suspect, &bounds);
+        let gateway = pool_down_message(pool_size, &suspect, &bounds, None);
         let contract = cog_core::pool_down_verdict(
             pool_size,
             &suspect,
+            None,
             evidenced,
             bounds.next_attempt_unix(),
             bounds.window_secs,
@@ -7422,10 +7565,11 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             next_probe_unix: 1_790_936_536,
             window_secs: 7 * 86_400,
         };
-        let gateway = pool_down_message(pool_size, &[], &bounds);
+        let gateway = pool_down_message(pool_size, &[], &bounds, None);
         let contract = cog_core::pool_down_verdict(
             pool_size,
             &[],
+            None,
             0,
             bounds.next_attempt_unix(),
             bounds.window_secs,
@@ -7434,13 +7578,53 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert!(gateway.contains("池内 4 个上游"), "{gateway}");
         assert!(contract.contains("0 of 4 upstreams"), "{contract}");
 
+        // 界收在容量上之后，这一条判定的理由多了一个数：界是几、从哪来。两句各自
+        // 措辞，中间没有任何东西会比，所以同一个界、同一个来源也要在这里对一次。
+        let bounds = RecoveryBounds {
+            evidenced_unix: evidenced,
+            next_probe_unix: 1_790_936_536,
+            window_secs: 7 * 86_400,
+        };
+        let gateway = pool_down_message(pool_size, &suspect, &bounds, Some(2));
+        let contract = cog_core::pool_down_verdict(
+            pool_size,
+            &suspect,
+            Some(2),
+            evidenced,
+            bounds.next_attempt_unix(),
+            bounds.window_secs,
+        );
+        assert!(gateway.contains("低于下限 2 家"), "{gateway}");
+        assert!(contract.contains("floor in force of 2"), "{contract}");
+        assert!(
+            !gateway.contains("未声明下限") && !contract.contains("no floor declared"),
+            "声明了就不许再念回落那一句：{gateway} / {contract}"
+        );
+        // 声明高过池大小那一天：界是夹取之后生效的那个数，两句都得说同一个数，
+        // 而那个数不能是没人满足得了的 9。
+        let gateway = pool_down_message(pool_size, &suspect, &bounds, Some(9));
+        let contract = cog_core::pool_down_verdict(
+            pool_size,
+            &suspect,
+            Some(9),
+            evidenced,
+            bounds.next_attempt_unix(),
+            bounds.window_secs,
+        );
+        assert!(gateway.contains("低于下限 4 家"), "{gateway}");
+        assert!(contract.contains("floor in force of 4"), "{contract}");
+        assert!(
+            !gateway.contains("下限 9 家") && !contract.contains("of 9"),
+            "界是在池的大小上夹取之后生效的那个数：{gateway} / {contract}"
+        );
+
         // 池里一个上游都没有：这里**两句故意不同**，不是漂移。落库那句的读者
         // 就在告警行上，池大小同时以 `pool_size` 标签结构化地在那一行里，句子说
         // 「池内 0 个」是真的；而事件载荷那侧分不开「池是空的」与「载荷没带这个
         // 数」，所以它宁可自报「没有池大小」——报 0 会把「没带」说成「空池」。
         // 要合一，先得让载荷带上这个区分，那时这一格才该改。
-        let gateway = pool_down_message(0, &suspect, &RecoveryBounds::default());
-        let contract = cog_core::pool_down_verdict(0, &suspect, 0, 0, 0);
+        let gateway = pool_down_message(0, &suspect, &RecoveryBounds::default(), None);
+        let contract = cog_core::pool_down_verdict(0, &suspect, None, 0, 0, 0);
         assert!(gateway.contains("池内 0 个上游"), "{gateway}");
         assert!(
             contract.contains("carries no pool size"),
@@ -7886,6 +8070,119 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         state.note_upstream_success(&u);
         refresh_pool_state(&state).await;
         assert!(!state.pool_down.load(Ordering::SeqCst));
+    }
+
+    /// 池判定量的是**容量**，判据是声明的冗余下限；没声明时回落到「一家都不供」。
+    ///
+    /// 两向都要钉住。收紧那一向（声明 2 家、只供 1 家 ⇒ 不可用）是这条改动本身；
+    /// 放宽那一向（没声明时就供 1 家 ⇒ 仍然可用）是**不许退化**：A9 的规矩是
+    /// 「一家都不供才算不可用」，没有声明的部署必须原样保留那条行为，否则这次
+    /// 改动会把所有没写这个字段的安装在只剩一家时整条停掉。
+    #[tokio::test]
+    async fn the_pool_verdict_follows_the_declared_floor() {
+        let pool: Vec<LlmUpstream> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|n| stub_upstream(&format!("https://{n}.example.com"), "m1"))
+            .collect();
+        let far = Utc::now().timestamp() + 600;
+        let suspect_three = |state: &AppState| {
+            for u in &pool[..3] {
+                state.llm_health.note_failure(u, 300, Some(far), None, None);
+            }
+        };
+
+        // 没声明：三家在嫌疑窗内、一家还供着 ⇒ 池仍可用（A9 那条规矩）。
+        let state = test_state(pool.clone());
+        suspect_three(&state);
+        refresh_pool_state(&state).await;
+        assert!(
+            !state.pool_down.load(Ordering::SeqCst),
+            "没声明下限时「还有一家能供」就是可用，这条老规矩不许被这次的界改掉"
+        );
+        assert!(
+            scrape(&state).contains("llm_pool_available 1"),
+            "{}",
+            scrape(&state)
+        );
+
+        // 声明要两家：同样的一家在供 ⇒ 池不可用。
+        let mut state = test_state(pool.clone());
+        state.config.llm_pool_min_healthy = Some(2);
+        suspect_three(&state);
+        refresh_pool_state(&state).await;
+        assert!(
+            state.pool_down.load(Ordering::SeqCst),
+            "声明要两家而只有一家能承接，池就是不可用的——这条读数以前不存在"
+        );
+        assert!(
+            scrape(&state).contains("llm_pool_available 0"),
+            "{}",
+            scrape(&state)
+        );
+
+        // 边界：等于下限不算低于下限。声明 2 家、供 2 家 ⇒ 可用。
+        let mut state = test_state(pool.clone());
+        state.config.llm_pool_min_healthy = Some(2);
+        for u in &pool[..2] {
+            state.llm_health.note_failure(u, 300, Some(far), None, None);
+        }
+        refresh_pool_state(&state).await;
+        assert!(
+            !state.pool_down.load(Ordering::SeqCst),
+            "供着的家数等于下限就是够的：判据是「低于」不是「不高于」"
+        );
+    }
+
+    /// 判定所依据的那条界要跟着判定一起进跨进程载荷：调度侧的暂停门与告警历史
+    /// 只读这份载荷，它们手上没有配置面，也不该各自现算一份界。
+    #[tokio::test]
+    async fn the_pool_payload_carries_the_declared_floor() {
+        let pool: Vec<LlmUpstream> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|n| stub_upstream(&format!("https://{n}.example.com"), "m1"))
+            .collect();
+        let mut state = test_state(pool.clone());
+        state.config.llm_pool_min_healthy = Some(2);
+        let far = Utc::now().timestamp() + 600;
+        for u in &pool[..3] {
+            state.llm_health.note_failure(u, 300, Some(far), None, None);
+        }
+        let channel = Arc::new(GatedStore::default());
+        channel.open();
+        state.pool_signal = Some(Arc::clone(&channel) as Arc<dyn cog_core::KeyValueStore>);
+        refresh_pool_state(&state).await;
+
+        let raw = channel
+            .peek(cog_core::LLM_POOL_STATUS_KEY)
+            .expect("池判定必须落到跨进程载荷上");
+        let status: cog_core::LlmPoolStatus = serde_json::from_str(&raw).expect("载荷能被读者解析");
+        assert_eq!(status.declared_min_healthy, Some(2));
+        assert_eq!(status.min_healthy(), 2);
+        assert_eq!(
+            status.min_healthy_source(),
+            cog_core::MIN_HEALTHY_SOURCE_DECLARED
+        );
+        assert!(
+            status.unavailable,
+            "载荷自报的判定要与它自己那两列一致：1 家能供、界是 2"
+        );
+        assert_eq!(status.available_upstreams(), 1);
+    }
+
+    /// 「什么算一条声明」与「这个值是几」是两个判断，只有前者决定回落到哪条规则。
+    /// 0 与解析不出都得读成「没有声明」：0 是空池也满足的界，把它读成界等于把一次
+    /// 笔误读成「永不判不可用」。
+    #[test]
+    fn only_a_positive_integer_counts_as_a_declaration() {
+        assert_eq!(parse_min_healthy("2"), Some(2));
+        assert_eq!(parse_min_healthy("  3 "), Some(3));
+        for raw in ["", "   ", "0", "-1", "1.5", "two", "2x"] {
+            assert_eq!(
+                parse_min_healthy(raw),
+                None,
+                "{raw:?} 不是一条声明，按下限未声明判"
+            );
+        }
     }
 
     /// 成因这一格在观测面上必须**三种全发**，而且换成因那一刻旧的那条要落回 0。
@@ -8351,6 +8648,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             next_attempt_unix: now + 600,
             unavailable_upstreams: vec![key.clone()],
             pool_size: 4,
+            declared_min_healthy: None,
             quota_window_secs: 0,
             upstream_evidence: vec![cog_core::LlmUpstreamEvidence {
                 identity: key.clone(),

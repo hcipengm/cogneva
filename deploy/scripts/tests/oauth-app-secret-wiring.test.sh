@@ -129,6 +129,7 @@ done
 # leave it out.
 out_of_band=(
   llm-upstreams
+  llm-pool-min-healthy
   github-token
   gitee-token
   github-webhook-secret
@@ -238,6 +239,7 @@ for env in "${sign_envs[@]}"; do
   done
 done
 
+
 # --- 2c) the borrow face reaches every workload that can sign --------------
 # The signing secret lives in the gateway, so what a business workload needs is
 # the address of the borrowing face. Both workloads run the same binary and the
@@ -267,6 +269,46 @@ app_workloads=(
 for manifest in "${app_workloads[@]}"; do
   grep -qF "${sign_base}" "${manifest}" \
     || fail "${manifest} 没有 ${sign_base}：这个进程发出的通知会退回未签名"
+done
+
+# --- 2d) the pool's declared floor is wired the same way -------------------
+# Same class as the OAuth secrets above -- written by the wizard on the
+# llm-config surface, read by the gateway -- so it gets the same assertions,
+# and it needs them for the same reason: a declaration nobody delivers reads
+# exactly like a declaration nobody made. Nothing else covers this key: the set
+# in section 1 is derived from the OAuth constant names, section 2b's from the
+# signing ones, and this one's writer is a third place.
+#
+# Both names are read from the sides that own them -- the env from the reader's
+# constant, the Secret key from the writer's -- rather than written here, so
+# this section keeps naming what those two actually use.
+min_healthy_env="$(sed -n 's/.*const LLM_POOL_MIN_HEALTHY_ENV: &str = "\([^"]*\)".*/\1/p' \
+  "${repo}/crates/cog-gateway/src/security_gateway.rs")"
+[ -n "${min_healthy_env}" ] || fail "没能从 security_gateway.rs 提取出冗余下限的 env 名，这一节会变成空转"
+llm_admin="${repo}/crates/cog-gateway/src/llm_admin.rs"
+[ -f "${llm_admin}" ] || fail "找不到 ${llm_admin}"
+min_healthy_key="$(sed -n 's/.*const SECRET_MIN_HEALTHY_KEY: &str = "\([^"]*\)".*/\1/p' "${llm_admin}")"
+[ -n "${min_healthy_key}" ] || fail "没能从 ${llm_admin} 提取出冗余下限的 Secret 键名，这一节会变成空转"
+
+for manifest in \
+  "${repo}/deploy/helm/cogneva/templates/security-gateway.yaml" \
+  "${repo}/deploy/k3s/gateway-deployment.yaml" \
+  "${rendered_gateways[@]}"
+do
+  [ -f "${manifest}" ] || fail "找不到 ${manifest}"
+  got_key="$(key_for_env "${manifest}" "${min_healthy_env}")"
+  [ "${got_key}" = "${min_healthy_key}" ] \
+    || fail "${manifest} 的 ${min_healthy_env} 读的是「${got_key:-空}」，应读 ${min_healthy_key}（声明送不进来，判定就永远按未声明走）"
+  got_object="$(object_for_env "${manifest}" "${min_healthy_env}")"
+  [ "${got_object}" = "${OBJ_OOB}" ] \
+    || fail "${manifest} 的 ${min_healthy_env} 从 ${got_object:-空} 读，应读 ${OBJ_OOB}"
+
+  grep -qE "^ensure_blank_oob[[:space:]]+${min_healthy_key}$" "${repo}/deploy/scripts/init-secrets.sh" \
+    || fail "init-secrets.sh 没有为 ${min_healthy_key} 在 ${OBJ_OOB} 建空占位，全新安装时向导无处可写"
+  grep -qE "^[[:space:]]*${min_healthy_key}:" "${repo}/deploy/helm/cogneva/templates/secret-oob.yaml" \
+    || fail "chart 的 ${OBJ_OOB} 模板没有声明 ${min_healthy_key}"
+  printf '%s\n' "${out_of_band[@]}" | grep -qx "${min_healthy_key}" \
+    || fail "${min_healthy_key} 不在带外凭证清单里，升级保留规则没覆盖它"
 done
 
 # --- 3) out-of-band credentials survive a chart upgrade -------------------
@@ -331,10 +373,9 @@ layout="${repo}/crates/cog-gateway/src/secret_layout.rs"
 [ -f "${layout}" ] || fail "找不到 ${layout}"
 
 mapfile -t rust_oob < <(
-  awk '/^pub\(crate\) const OOB_SECRET_KEYS/{in_list=1} in_list && /"/{
-         while (match($0, /"[^"]+"/)) { print substr($0, RSTART+1, RLENGTH-2); $0 = substr($0, RSTART+RLENGTH) }
-       }
-       in_list && /^];/{exit}' "${layout}"
+  awk '/^pub\(crate\) const OOB_SECRET_KEYS/{in_list=1} in_list && /^];/{exit}
+       in_list { sub(/\/\/.*/, ""); while (match($0, /"[^"]+"/)) { print substr($0, RSTART+1, RLENGTH-2); $0 = substr($0, RSTART+RLENGTH) } }' \
+    "${layout}"
 )
 [ "${#rust_oob[@]}" -gt 0 ] || fail "没能从 ${layout} 读出带外键表，这一节会变成空转"
 
