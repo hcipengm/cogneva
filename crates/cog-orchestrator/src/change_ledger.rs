@@ -89,7 +89,7 @@ use cog_core::{
     ChangePriority, ChangeReading, ChangeReopen, ChangeSource, ChangeState, DispatchDecision,
     DispatchState, LiveRevision, LiveRevisionSource, LlmPoolStatus, MetricsBackend,
     OrchestratorControl, OwnerLeaseBroker, PoolReading, PrincipleCheckKind, PrincipleLedgerStore,
-    PrincipleRow, ShutdownSignal, Task, TaskStatus, TaskType,
+    PrincipleRow, SFResult, ShutdownSignal, StateBackend, Task, TaskStatus, TaskType,
 };
 
 use cog_core::contract::llm::UpstreamFailure;
@@ -307,7 +307,7 @@ const PRINCIPLE_DECLARATION_PREFIX: &str = "principle: ";
 /// reader follows back to it.
 const PRINCIPLE_LEDGER_SOURCE: &str = "principle_ledger";
 
-/// The task id a change is dispatched under, at a given handover generation.
+/// The id prefix every handover of one change carries.
 ///
 /// Derived from the identity, because that is the whole mechanism: this loop
 /// re-reads the same outstanding set every few minutes, and an id that moved
@@ -321,6 +321,26 @@ const PRINCIPLE_LEDGER_SOURCE: &str = "principle_ledger";
 /// Each part is terminated as it is fed in, so no split of the same characters
 /// hashes the same either.
 ///
+/// This is also the edge a reader uses to get back to a change's product. The
+/// graph's task table is pruned and cleared per workspace, so a row there is not
+/// something to join against, but a ledger row is kept, and its identity fixes
+/// the id of every handover the change ever made. The account's own row is
+/// therefore enough: recompute the id from the identity it already holds, and the
+/// product is found again without anything having been stored to connect the two.
+/// A stored copy of a derivable hash is a second original of an edge that cannot
+/// disagree with the identity while being read as though it could.
+pub fn handover_task_prefix(identity: &ChangeIdentity) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for part in [&identity.kind, &identity.scope, &identity.literal] {
+        hasher.update(part.as_bytes());
+        hasher.update(&[0]);
+    }
+    let hex = hasher.finalize().to_hex();
+    format!("{DISPATCH_TASK_PREFIX}{}", &hex[..16])
+}
+
+/// The task id a change is dispatched under, at a given handover generation.
+///
 /// The generation is the one part that is not the identity. A handover whose
 /// task died to the environment leaves the change exactly as owed, so handing it
 /// over again needs an id the graph does not already hold. Generation 0 is the
@@ -330,24 +350,184 @@ const PRINCIPLE_LEDGER_SOURCE: &str = "principle_ledger";
 /// only on the arm of [`classify_handover`] that says the environment, not the
 /// change, is why the last attempt did not happen.
 ///
-/// This is also the edge a reader uses to get back to a change's product. The
-/// graph's task table is pruned and cleared per workspace, so a row there is not
-/// something to join against, but a ledger row is kept, and its identity fixes
-/// the id of every handover the change ever made. Recompute the id, match it as a
-/// prefix against the event stream, and the product is found again without
-/// anything having been stored to connect the two.
+/// The generations are a closed set ([`dispatch_rearm_limit`]), which is what a
+/// reader enumerates: the ids are exact and few, so a reader gets from the
+/// identity to a change's product without a pattern query and without anything
+/// from the storage contract beyond the read every backend already has.
 fn dispatch_task_id(identity: &ChangeIdentity, generation: u32) -> String {
-    let mut hasher = blake3::Hasher::new();
-    for part in [&identity.kind, &identity.scope, &identity.literal] {
-        hasher.update(part.as_bytes());
-        hasher.update(&[0]);
-    }
-    let hex = hasher.finalize().to_hex();
+    let prefix = handover_task_prefix(identity);
     if generation == 0 {
-        format!("{DISPATCH_TASK_PREFIX}{}", &hex[..16])
+        prefix
     } else {
-        format!("{DISPATCH_TASK_PREFIX}{}-r{generation}", &hex[..16])
+        format!("{prefix}-r{generation}")
     }
+}
+
+/// The name a run's deliverable carries.
+///
+/// Named rather than matched as a kind of artifact: the acceptance this reading
+/// answers is stated at the field layer under *this* name, so a reader that took
+/// any artifact of a change-like type would count runs its own criterion does
+/// not, and the reading and the criterion would be two definitions of one fact.
+const HANDOVER_ARTIFACT: &str = "changes.diff";
+
+/// Where the plan-generation segment of a run records its deliverable: one
+/// artifact, at the top of the snapshot's generation.
+const HANDOVER_GENERATION_ARTIFACTS: &str = "/snapshot/generation/artifacts";
+
+/// Where the roundtable segment of a run records its deliverable: one per round,
+/// under the round's own generation.
+///
+/// Both segments are read because both are measured in the stream: the
+/// plan-generation path writes the first shape and the roundtable path the
+/// second, and a reader that knew one of them would answer "no product" about a
+/// run that produced one -- which is the one answer this reading exists to keep
+/// separate from "produced nothing". The roundtable's own final generation is
+/// not read as well: every measured round about which it is set also has its
+/// artifact in the history, so history is the wider of the two and the final
+/// entry is not a second fact.
+const HANDOVER_ROUNDTABLE_HISTORY: &str = "/snapshot/roundtable/history";
+
+/// How many events of one handover are read per page.
+///
+/// Measured, not chosen: the longest task in the live stream holds 146 events
+/// (p99 is 48, the mean 4.9), and one of the deliverable-carrying events sits at
+/// position 146, so a single page would have to be longer than the longest run
+/// there has ever been. Paging at a bound under that keeps the read correct for
+/// a stream longer than any of them rather than correct for the ones observed.
+const HANDOVER_EVENTS_PER_PAGE: usize = 100;
+
+/// The deliverable one handover left.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandoverProduct {
+    /// The generation the handover that produced it went out under.
+    pub generation: u32,
+    /// The field path inside the run's own payload the artifact was recorded at,
+    /// so a reader can tell which of the run's segments produced it.
+    pub recorded_at: &'static str,
+    /// The diff itself, verbatim, as the run wrote it.
+    pub diff: String,
+}
+
+/// What one change's handovers left in the event stream.
+///
+/// Two answers rather than one, because the question has two that a single
+/// number cannot tell apart: a generation whose events are gone is a change
+/// nothing was ever handed to, and a generation with events and no artifact is a
+/// run that ran and recorded nothing. Read as one number, a segment that never
+/// ran becomes a product that was lost.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HandoverReadback {
+    /// The generations whose events are still in the stream, oldest first.
+    pub generations: Vec<u32>,
+    /// The newest handover that left a deliverable. Newest rather than first,
+    /// for the same reason the newest generation is the one a handover goes out
+    /// under: a later handover is the change's current attempt at itself.
+    pub product: Option<HandoverProduct>,
+}
+
+/// The deliverable inside one `artifacts` array, if the array holds one.
+fn change_artifact_in(artifacts: Option<&serde_json::Value>) -> Option<&str> {
+    artifacts?
+        .as_array()?
+        .iter()
+        .find(|artifact| {
+            artifact.get("name").and_then(|name| name.as_str()) == Some(HANDOVER_ARTIFACT)
+        })
+        .and_then(|artifact| artifact.get("content"))
+        .and_then(|content| content.as_str())
+}
+
+/// The deliverable one run's own payload carries, and the field path it was
+/// recorded at.
+///
+/// Read from the event's payload rather than from the text of the event: a
+/// serialized run quotes the deliverable's name in the plan and in the
+/// evaluation's feedback as well, so a reader matching the serialized event as a
+/// string counts the request echoed back to it as the product itself. Measured on
+/// the live stream: 97 events carry the artifact at the plan-generation path, 82
+/// at the roundtable one, and 179 match the diff's own header as text -- the
+/// third number is the first two added together, which is what makes the text
+/// layer an upper bound and not an answer.
+fn change_artifact(payload: &serde_json::Value) -> Option<(&'static str, &str)> {
+    if let Some(diff) = change_artifact_in(payload.pointer(HANDOVER_GENERATION_ARTIFACTS)) {
+        return Some((HANDOVER_GENERATION_ARTIFACTS, diff));
+    }
+    payload
+        .pointer(HANDOVER_ROUNDTABLE_HISTORY)?
+        .as_array()?
+        .iter()
+        .rev()
+        .find_map(|round| {
+            change_artifact_in(round.pointer("/generation/artifacts"))
+                .map(|diff| (HANDOVER_ROUNDTABLE_HISTORY, diff))
+        })
+}
+
+/// Read back what a change's handovers left in the event stream.
+///
+/// The edge is the identity and nothing else. Every handover of a change is
+/// filed under an id the identity fixes ([`handover_task_prefix`]), so the
+/// product is found again with nothing stored to connect the two -- no mapping
+/// table, and no join onto the graph, whose task rows are cleared per workspace
+/// while the account's rows are kept. That is why this is a function of the
+/// identity: storing the edge would be keeping a second copy of something
+/// already derivable, and the copy is the one that goes stale.
+///
+/// The generations are enumerated over the closed set the dispatcher can produce
+/// rather than matched as a pattern. Enumeration is what keeps the reader off the
+/// storage contract: exact ids and the read every backend already has, so there
+/// is no new method to implement three times and no pattern query to get wrong,
+/// and the same code path runs wherever the loop does -- which is also what lets
+/// its own tests exercise it without a database.
+///
+/// What this does not answer: whether the change was worked on. That is the
+/// graph's answer, read by [`owed_row`], and the two are deliberately not one
+/// call -- this one has to keep answering after the graph's row is gone.
+pub async fn read_handover_products(
+    backend: &dyn StateBackend,
+    identity: &ChangeIdentity,
+) -> SFResult<HandoverReadback> {
+    let mut readback = HandoverReadback::default();
+    for generation in 0..=dispatch_rearm_limit() {
+        let task_id = dispatch_task_id(identity, generation);
+        let mut from = 0u64;
+        let mut any = false;
+        loop {
+            let page = backend
+                .get_events(&task_id, from, HANDOVER_EVENTS_PER_PAGE)
+                .await?;
+            let Some(last) = page.last() else { break };
+            any = true;
+            for event in &page {
+                if let Some((recorded_at, diff)) = change_artifact(&event.payload) {
+                    readback.product = Some(HandoverProduct {
+                        generation,
+                        recorded_at,
+                        diff: diff.to_string(),
+                    });
+                }
+            }
+            if page.len() < HANDOVER_EVENTS_PER_PAGE {
+                break;
+            }
+            // Where the next page starts, from the backend's own answer about
+            // the page it just returned. The two answers are not the same one:
+            // Postgres reads the argument as a row's position, and hands back
+            // the position each row holds, while the in-memory and Redis
+            // backends read it as an index into the run's events and hand back
+            // the offset the appender passed, which is zero. The larger of the
+            // two is the one that is further along under both readings, and
+            // taking the maximum is also what makes this loop able to finish:
+            // the count always advances, so a backend whose events all carry the
+            // same offset cannot hold it at one page for ever.
+            from = last.offset.saturating_add(1).max(from + page.len() as u64);
+        }
+        if any {
+            readback.generations.push(generation);
+        }
+    }
+    Ok(readback)
 }
 
 /// What the graph's row for a change says about that change.
@@ -485,6 +665,7 @@ pub fn spawn_change_ledger_loop(
     tree: CheckTree,
     principles: Option<Arc<dyn PrincipleLedgerStore>>,
     live_revision: Option<Arc<dyn LiveRevisionSource>>,
+    events: Option<Arc<dyn StateBackend>>,
 ) {
     info!(
         interval_secs = CHANGE_LEDGER_PASS_INTERVAL.as_secs(),
@@ -527,6 +708,17 @@ pub fn spawn_change_ledger_loop(
              whether the changes it has landed are in effect -- the tree's answer stands alone"
         );
     }
+    if events.is_none() {
+        // The events are where a handover's product lands, and this is the one
+        // reader that gets back to them from the account's own rows. Said at
+        // start-up for the reason the others are: without it the readback cells
+        // are zero on every pass, which is the same number a pass that read
+        // nothing writes.
+        warn!(
+            "change ledger: no event store is published, so this loop cannot read back what \
+             the changes it handed over produced -- the handover counts are not read at all"
+        );
+    }
 
     drop(cog_core::loop_health::spawn(
         CHANGE_LEDGER_LOOP,
@@ -543,6 +735,7 @@ pub fn spawn_change_ledger_loop(
             let tree = tree.clone();
             let principles = principles.clone();
             let live_revision = live_revision.clone();
+            let events = events.clone();
             async move {
                 // The role is renewed on the lease contract's own cadence rather
                 // than once per pass: a pass can be long, and a term that ran out
@@ -650,6 +843,7 @@ pub fn spawn_change_ledger_loop(
                             pool,
                             pool_posture,
                             metrics.as_ref(),
+                            events.as_deref(),
                         )
                         .await
                         {
@@ -1721,6 +1915,7 @@ async fn dispatch_pass(
     pool: Option<&dyn cog_core::LlmPoolStatusSource>,
     carried: Option<PoolVerdict>,
     metrics: Option<&Arc<dyn MetricsBackend>>,
+    events: Option<&dyn StateBackend>,
 ) -> Option<PoolVerdict> {
     // The read is bounded by the ledger's own census rather than by a number
     // chosen here, and it has to be that wide because of where pending rows sit
@@ -1820,7 +2015,28 @@ async fn dispatch_pass(
 
     let rearm_limit = dispatch_rearm_limit();
     let mut counts = TickCounts::default();
+    let mut readback = HandoverCensus::default();
     for row in &pending {
+        // What the change's handovers left behind, read before anything is
+        // decided about the row: this is a reading of the event stream, and it
+        // is asked either way -- a pass that decided to hand nothing over still
+        // read the same set, and a reading face that went blind on exactly the
+        // passes it exists to describe would be the fault this whole loop is
+        // written against.
+        if let Some(backend) = events {
+            match read_handover_products(backend, &row.identity).await {
+                Ok(found) => readback.absorb(&found),
+                Err(e) => {
+                    readback.unreadable += 1;
+                    warn!(
+                        change = %row.identity,
+                        error = %e,
+                        "change ledger: a change's handovers could not be read back, so this \
+                         pass cannot say what it produced"
+                    );
+                }
+            }
+        }
         match owed_row(orchestrator, row, rearm_limit).await {
             Owed::Held(Handover::DeadEnvironment) => counts.dead_environment += 1,
             Owed::Held(_) => counts.already += 1,
@@ -1879,6 +2095,9 @@ async fn dispatch_pass(
             held_back = counts.held_back,
             already_handed_over = counts.already,
             already_dead_environment = counts.dead_environment,
+            handovers_on_record = readback.events,
+            handovers_with_product = readback.products,
+            handovers_unreadable = readback.unreadable,
             resume_at_unix = verdict.resume_at_unix,
             evidenced_recovery_unix = verdict.evidenced_recovery_unix,
             quota_window_secs = verdict.quota_window_secs,
@@ -1897,6 +2116,9 @@ async fn dispatch_pass(
             already_dead_environment = counts.dead_environment,
             failed = counts.failed,
             unmeasurable,
+            handovers_on_record = readback.events,
+            handovers_with_product = readback.products,
+            handovers_unreadable = readback.unreadable,
             pool = verdict.reading.as_str(),
             not_handed_over = %held_back_summary(&rows),
             "change ledger: handed the pending set to the goal path"
@@ -1911,6 +2133,13 @@ async fn dispatch_pass(
         &counts,
     )
     .await;
+    // The readback is published from here rather than from the row's own state:
+    // it is a reading of the event stream and not a column of the account's
+    // dispatch row, and giving the row columns it does not need would make the
+    // account carry a second copy of something the stream already answers. The
+    // two families name the same metric and are written from the same pass, so a
+    // reader that selects by name still sees one tick.
+    publish_handover_readback(metrics, &readback).await;
 
     // Back to the loop, which keeps it for the next pass's empty read. Handed
     // back only when the pool was actually read: an `absent` verdict carried
@@ -1986,12 +2215,48 @@ struct TickCounts {
     failed: usize,
 }
 
+/// What one pass read back off the set it handed over.
+///
+/// Counted over the same rows the counts above are counted over, and in the same
+/// pass, so the two readings are about one set: `events` is how many owed changes
+/// still have their handovers in the stream, `products` how many of those left a
+/// deliverable, and `unreadable` how many the pass could not read at all. The
+/// third one is not a nicety -- without it a read that failed and a run that
+/// produced nothing are the same two numbers, which is the confusion this whole
+/// reading exists to end.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct HandoverCensus {
+    events: usize,
+    products: usize,
+    unreadable: usize,
+}
+
+impl HandoverCensus {
+    /// Count one change's handovers into the pass's totals.
+    ///
+    /// One row per change, so the entries add: a change with handovers and
+    /// without a deliverable is counted in the first number only, and that is
+    /// the difference between the two that a reader subtracts.
+    fn absorb(&mut self, readback: &HandoverReadback) {
+        if !readback.generations.is_empty() {
+            self.events += 1;
+        }
+        if readback.product.is_some() {
+            self.products += 1;
+        }
+    }
+}
+
 /// The names the per-pass counts are published under.
 ///
 /// A closed set, so a reader counts cells rather than parsing names, and the
 /// order here is the order they are written in. The values are the account's own
 /// numbers, taken after they were computed and before they were written -- the
 /// same ones, not a second computation of them.
+///
+/// This is one half of the metric's label set and [`HandoverReadout`] is the
+/// other: these are what the pass did with the set it read, and those are what
+/// the handovers had left behind when it read them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DispatchReadout {
     Pending,
@@ -2076,6 +2341,81 @@ async fn publish_dispatch_rows(metrics: Option<&Arc<dyn MetricsBackend>>, state:
                 readout = readout.as_str(),
                 "change ledger: this pass's count could not be published, so the reading face \
                  is missing a cell this pass held"
+            );
+        }
+    }
+}
+
+/// The names what the pass read back off the handovers is published under.
+///
+/// A closed set of its own, on the same metric and the same `readout` label as
+/// [`DispatchReadout`]: both answer questions about the one set the pass read, and
+/// a reader selecting by that name sees one tick rather than two. They are two
+/// enumerations rather than one because one of them is a column of the account's
+/// dispatch row and this one is not -- a readback that went into that struct
+/// would need columns for numbers the event stream already answers, and a column
+/// is a second original. Together the two are the metric's whole label set, which
+/// is what the reading face's own test asserts.
+///
+/// The three cells are one reading and have to be taken together: a change whose
+/// handovers left nothing and a change whose handovers could not be read are both
+/// absent from the second cell, and a reader that took the second cell alone
+/// would call a failed read a change that produced nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandoverReadout {
+    Events,
+    Products,
+    Unreadable,
+}
+
+impl HandoverReadout {
+    const ALL: &'static [HandoverReadout] = &[
+        HandoverReadout::Events,
+        HandoverReadout::Products,
+        HandoverReadout::Unreadable,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Events => "handover_events",
+            Self::Products => "handover_products",
+            Self::Unreadable => "handover_unreadable",
+        }
+    }
+}
+
+/// Publish what the pass read back off the handovers, one cell per readout.
+///
+/// Every cell on every pass, like the counts beside it and for the same reason:
+/// the store renders a gauge from the newest row of every label set it has ever
+/// held and releases none, so a cell written only when it has a value would go on
+/// being served at its last one. A failure to publish is raised and not fatal, on
+/// the same grounds as the rest of the reading face: the pass happened, and the
+/// reading is its view rather than its record.
+async fn publish_handover_readback(
+    metrics: Option<&Arc<dyn MetricsBackend>>,
+    readback: &HandoverCensus,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    for readout in HandoverReadout::ALL {
+        let value = match readout {
+            HandoverReadout::Events => readback.events,
+            HandoverReadout::Products => readback.products,
+            HandoverReadout::Unreadable => readback.unreadable,
+        };
+        let mut labels = HashMap::new();
+        labels.insert("readout".to_string(), readout.as_str().to_string());
+        if let Err(e) = metrics
+            .record_gauge(metric_names::CHANGE_DISPATCH_READOUTS, value as f64, labels)
+            .await
+        {
+            warn!(
+                error = %e,
+                readout = readout.as_str(),
+                "change ledger: what this pass read back off the handovers could not be \
+                 published, so the reading face is missing a cell this pass held"
             );
         }
     }
@@ -3784,7 +4124,7 @@ mod tests {
         );
         let control: Arc<dyn OrchestratorControl> = graph.clone();
 
-        dispatch_pass(&store, &control, &HashMap::new(), None, None, None).await;
+        dispatch_pass(&store, &control, &HashMap::new(), None, None, None, None).await;
 
         let state = store.written().pop().expect("the pass wrote its row");
         assert_eq!(state.decision, DispatchDecision::Proceed);
@@ -3837,6 +4177,7 @@ mod tests {
             Some(&SilentPool),
             Some(paused),
             None,
+            None,
         )
         .await;
 
@@ -3884,6 +4225,7 @@ mod tests {
             Some(&SilentPool),
             None,
             None,
+            None,
         )
         .await;
 
@@ -3910,6 +4252,7 @@ mod tests {
             &control,
             &HashMap::new(),
             Some(&DeadPool),
+            None,
             None,
             None,
         )
@@ -3943,6 +4286,7 @@ mod tests {
             &control,
             &HashMap::new(),
             Some(&DeadPool),
+            None,
             None,
             None,
         )
@@ -3981,7 +4325,7 @@ mod tests {
         }
         let graph: Arc<dyn OrchestratorControl> = Arc::new(graph);
 
-        dispatch_pass(&store, &graph, &HashMap::new(), None, None, None).await;
+        dispatch_pass(&store, &graph, &HashMap::new(), None, None, None, None).await;
 
         let state = store.written().pop().expect("the pass wrote its row");
         assert_eq!(state.pending, 1);
@@ -4003,7 +4347,7 @@ mod tests {
         };
         let graph: Arc<dyn OrchestratorControl> = Arc::new(FakeGraph::default().refusing());
 
-        dispatch_pass(&store, &graph, &HashMap::new(), None, None, None).await;
+        dispatch_pass(&store, &graph, &HashMap::new(), None, None, None, None).await;
 
         let state = store.written().pop().expect("the pass wrote its row");
         assert_eq!(state.pending, 2);
@@ -4068,6 +4412,321 @@ mod tests {
         ));
     }
 
+    /// One cell of the reading face, selected the way a reader selects it.
+    async fn published_cell(metrics: &Arc<dyn MetricsBackend>, readout: &str) -> f64 {
+        let end = Utc::now() + chrono::Duration::seconds(1);
+        let start = end - chrono::Duration::seconds(600);
+        let samples = metrics
+            .query_gauge_range(metric_names::CHANGE_DISPATCH_READOUTS.as_str(), start, end)
+            .await
+            .expect("the reading face is readable");
+        samples
+            .iter()
+            .find(|sample| sample.labels.get("readout").map(String::as_str) == Some(readout))
+            .unwrap_or_else(|| panic!("this pass published no cell for {readout}"))
+            .value
+    }
+
+    /// The pass reads the handovers back over the same set it hands over, and
+    /// the reading face carries what it found.
+    ///
+    /// The publish test below would stay green if nothing ever called the
+    /// reader: the census would be published as zeros, and zeros are exactly
+    /// what a reader cannot tell from a pass that read nothing. This is the test
+    /// that fails when the wiring is dropped rather than when the shape is
+    /// wrong.
+    #[tokio::test]
+    async fn the_pass_reads_back_what_the_handovers_of_the_set_it_read_have_left() {
+        let store = FakeLedger {
+            rows: vec![pending_row("crates/a"), pending_row("crates/b")],
+            ..Default::default()
+        };
+        let graph: Arc<dyn OrchestratorControl> = Arc::new(FakeGraph::default());
+        let events = cog_storage::MemoryStateBackend::new();
+        events
+            .append_event(
+                &dispatch_task_id(&store.rows[0].identity, 0),
+                &handover_event(serde_json::json!([{
+                    "name": CRITERION_ARTIFACT_NAME,
+                    "content": "diff --git a/kept b/kept\n",
+                    "artifact_type": "change",
+                }])),
+            )
+            .await
+            .unwrap();
+        events
+            .append_event(
+                &dispatch_task_id(&store.rows[1].identity, 0),
+                &handover_event(serde_json::json!([])),
+            )
+            .await
+            .unwrap();
+        let metrics = Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics: Arc<dyn MetricsBackend> = metrics.clone();
+
+        dispatch_pass(
+            &store,
+            &graph,
+            &HashMap::new(),
+            Some(&SilentPool),
+            None,
+            Some(&metrics),
+            Some(&events),
+        )
+        .await;
+
+        // Both rows were handed over and both left events; one of them produced.
+        // The two numbers are the reading: a pass that reported one of them
+        // would be answering "did anything get produced" with "was anything
+        // handed over".
+        assert_eq!(published_cell(&metrics, "handover_events").await, 2.0);
+        assert_eq!(published_cell(&metrics, "handover_products").await, 1.0);
+        assert_eq!(published_cell(&metrics, "handover_unreadable").await, 0.0);
+    }
+
+    // ── Getting back to what a handover produced ──
+
+    /// The id a change's handovers carry, and the one a re-arm moves.
+    ///
+    /// Read before anything is built on it, because everything is: the reader
+    /// below, and the graph's own answer about a change, both ask for the id of a
+    /// generation out of the identity alone. Generation zero is asserted to be
+    /// the bare prefix and not a prefix with a zero in it -- the ids handed out
+    /// before generations existed are the ones already in the stream, and a
+    /// reader that recomputed them differently would find nothing and call it a
+    /// product that was never kept.
+    #[test]
+    fn the_id_is_the_prefix_the_identity_fixes_and_a_rearm_appends_its_generation() {
+        let identity = ChangeIdentity::new("grep", "crates/a", "fn thing");
+        let prefix = handover_task_prefix(&identity);
+
+        assert!(prefix.starts_with(DISPATCH_TASK_PREFIX), "{prefix}");
+        assert_eq!(dispatch_task_id(&identity, 0), prefix);
+        assert_eq!(dispatch_task_id(&identity, 2), format!("{prefix}-r2"));
+        // Two changes that differ only in where a part ends are two changes:
+        // the parts are terminated as they are hashed, so the split of the same
+        // characters cannot land on one id.
+        assert_ne!(
+            handover_task_prefix(&ChangeIdentity::new("grep", "crates/a", "fn thing")),
+            handover_task_prefix(&ChangeIdentity::new("grep", "crates/a:fn", "thing")),
+            "an id shared by two changes is one of them never being dispatched"
+        );
+    }
+
+    /// The deliverable's name, written out here rather than read from the
+    /// constant the reader matches on.
+    ///
+    /// The name is one string that two things have to agree about -- the reader
+    /// in this file, and the acceptance criterion that counts artifacts under it
+    /// at the field layer -- and a test that took it from the reader's own
+    /// constant could only ever show the reader agreeing with itself. Written
+    /// out, a change to what the reader looks for fails here instead of passing
+    /// twice.
+    const CRITERION_ARTIFACT_NAME: &str = "changes.diff";
+
+    /// The deliverable of a run, as the plan-generation segment writes it.
+    fn handover_event(artifacts: serde_json::Value) -> cog_core::Event {
+        cog_core::Event {
+            offset: 0,
+            task_id: String::new(),
+            event_type: "ralph_iteration".to_string(),
+            payload: serde_json::json!({
+                "iteration": 1,
+                "snapshot": {
+                    "plan": { "steps": [] },
+                    "generation": { "content": serde_json::Value::Null, "artifacts": artifacts },
+                },
+            }),
+            timestamp: Utc.timestamp_opt(1_760_000_000, 0).unwrap(),
+        }
+    }
+
+    /// The change's product is found from the identity, and what it produced is
+    /// what comes back.
+    ///
+    /// The id is recomputed from the identity and the events are read back
+    /// through it, with nothing stored to connect the two -- which is the whole
+    /// of what the identity edge is for. The diff comes back verbatim: a reader
+    /// that only counted the artifact would leave "it can be retrieved" and "the
+    /// count went up" as the same assertion, and they are not.
+    #[tokio::test]
+    async fn a_changes_product_is_read_back_from_the_id_its_identity_fixes() {
+        let identity = ChangeIdentity::new("grep", "crates/a", "fn thing");
+        let events = cog_storage::MemoryStateBackend::new();
+        events
+            .append_event(
+                &dispatch_task_id(&identity, 0),
+                &handover_event(serde_json::json!([{
+                    "name": CRITERION_ARTIFACT_NAME,
+                    "content": "diff --git a/x b/x\n",
+                    "artifact_type": "change",
+                }])),
+            )
+            .await
+            .unwrap();
+
+        let readback = read_handover_products(&events, &identity).await.unwrap();
+
+        assert_eq!(readback.generations, vec![0], "the events are still there");
+        let product = readback.product.expect("the run recorded a deliverable");
+        assert_eq!(product.generation, 0);
+        assert_eq!(product.recorded_at, HANDOVER_GENERATION_ARTIFACTS);
+        assert_eq!(product.diff, "diff --git a/x b/x\n");
+        // And nothing of it is in another change's reading: the id is the
+        // identity's, so a neighbour's events are not an answer about this one.
+        let other = ChangeIdentity::new("grep", "crates/b", "fn thing");
+        let readback = read_handover_products(&events, &other).await.unwrap();
+        assert!(readback.generations.is_empty());
+        assert!(readback.product.is_none());
+    }
+
+    /// A handover that ran and recorded nothing is not a handover that is gone,
+    /// and the reading keeps the two apart.
+    ///
+    /// This is the shape production is in: the dispatched changes write their
+    /// iterations and their generation's artifacts come back empty, because the
+    /// pool refuses every one of them before the generator runs. Read as one
+    /// number, that is the same zero as a change nothing was ever handed to --
+    /// and a reader of the account would be told a product was lost.
+    #[tokio::test]
+    async fn a_handover_that_recorded_no_artifact_is_not_one_whose_events_are_gone() {
+        let identity = ChangeIdentity::new("grep", "crates/a", "fn thing");
+        let events = cog_storage::MemoryStateBackend::new();
+        events
+            .append_event(
+                &dispatch_task_id(&identity, 0),
+                &handover_event(serde_json::json!([])),
+            )
+            .await
+            .unwrap();
+
+        let ran_and_recorded_nothing = read_handover_products(&events, &identity).await.unwrap();
+        let never_handed_over = read_handover_products(
+            &events,
+            &ChangeIdentity::new("grep", "crates/z", "fn thing"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ran_and_recorded_nothing.generations, vec![0]);
+        assert!(ran_and_recorded_nothing.product.is_none());
+        assert!(never_handed_over.generations.is_empty());
+        assert!(never_handed_over.product.is_none());
+        assert_ne!(
+            HandoverCensus::default(),
+            {
+                let mut census = HandoverCensus::default();
+                census.absorb(&ran_and_recorded_nothing);
+                census
+            },
+            "a run that produced nothing still has to move the events count, or the two \
+             readings are one number again"
+        );
+    }
+
+    /// The other segment's shape is read too, and the reading says which one it
+    /// came from.
+    ///
+    /// A run that goes through the roundtable records its deliverable per round
+    /// rather than once, and a reader that knew only the plan-generation path
+    /// would answer "produced nothing" about it. Which path it was found at is
+    /// part of the answer rather than a detail: it is how a reader tells which
+    /// segment of the run produced the change.
+    #[tokio::test]
+    async fn the_roundtables_own_shape_is_read_and_named_as_where_it_came_from() {
+        let identity = ChangeIdentity::new("grep", "crates/a", "fn thing");
+        let events = cog_storage::MemoryStateBackend::new();
+        let mut event = handover_event(serde_json::json!([{
+            "name": CRITERION_ARTIFACT_NAME,
+            "content": "diff --git a/round-2 b/round-2\n",
+            "artifact_type": "change",
+        }]));
+        // One round with nothing and a later one with the deliverable: the
+        // newest round is the change's current attempt, so the later one is the
+        // answer, and a reader that took the first match would report the round
+        // that produced nothing.
+        event.payload["snapshot"] = serde_json::json!({
+            "roundtable": {
+                "history": [
+                    { "generation": { "content": "first", "artifacts": [] } },
+                    { "generation": { "content": "second", "artifacts": [
+                        { "name": CRITERION_ARTIFACT_NAME, "content": "diff --git a/r2 b/r2\n",
+                          "artifact_type": "change" },
+                    ] } },
+                ],
+            },
+        });
+        events
+            .append_event(&dispatch_task_id(&identity, 0), &event)
+            .await
+            .unwrap();
+
+        let readback = read_handover_products(&events, &identity).await.unwrap();
+
+        let product = readback.product.expect("the roundtable recorded one");
+        assert_eq!(product.recorded_at, HANDOVER_ROUNDTABLE_HISTORY);
+        assert_eq!(product.diff, "diff --git a/r2 b/r2\n");
+    }
+
+    /// A deliverable the run recorded after more events than one page holds is
+    /// still found.
+    ///
+    /// Measured against the live stream before it was written: the longest task
+    /// holds 146 events and one of the deliverable-carrying events is the last of
+    /// them, so a reader that read one page and stopped would answer "produced
+    /// nothing" about the runs that took the longest -- the ones most likely to
+    /// have produced something.
+    #[tokio::test]
+    async fn a_deliverable_past_the_first_page_is_still_found() {
+        let identity = ChangeIdentity::new("grep", "crates/a", "fn thing");
+        let events = cog_storage::MemoryStateBackend::new();
+        let task_id = dispatch_task_id(&identity, 0);
+        for _ in 0..HANDOVER_EVENTS_PER_PAGE {
+            events
+                .append_event(&task_id, &handover_event(serde_json::json!([])))
+                .await
+                .unwrap();
+        }
+        events
+            .append_event(
+                &task_id,
+                &handover_event(serde_json::json!([{
+                    "name": CRITERION_ARTIFACT_NAME,
+                    "content": "diff --git a/late b/late\n",
+                    "artifact_type": "change",
+                }])),
+            )
+            .await
+            .unwrap();
+
+        let readback = read_handover_products(&events, &identity).await.unwrap();
+
+        assert_eq!(readback.generations, vec![0]);
+        assert_eq!(
+            readback.product.expect("the last page carries it").diff,
+            "diff --git a/late b/late\n"
+        );
+
+        // The whole stream was read, not just the two pages it happens to take:
+        // a page loop that stopped early, or one that re-read the page it just
+        // had, would be correct about this run and wrong about a longer one.
+        for _ in 0..HANDOVER_EVENTS_PER_PAGE {
+            events
+                .append_event(
+                    &dispatch_task_id(&identity, 1),
+                    &handover_event(serde_json::json!([])),
+                )
+                .await
+                .unwrap();
+        }
+        let readback = read_handover_products(&events, &identity).await.unwrap();
+        assert_eq!(
+            readback.generations,
+            vec![0, 1],
+            "every generation that left events is one of the answers, in order"
+        );
+    }
+
     /// Every count the pass holds is a cell a reader can name, and the cells
     /// carry the numbers the row carries.
     ///
@@ -4079,6 +4738,12 @@ mod tests {
     /// below is the one that caught the old shape being unreadable, in the
     /// direction that matters: the frozen cell was the larger of the two and the
     /// reader's `max` believed it.
+    ///
+    /// Both enumerations are published here because one metric carries both: the
+    /// pass's own counts and what the handovers had left when it read them. The
+    /// set asserted below is therefore their union, which is also what the panel
+    /// selects over -- a cell written under this name and left out of both
+    /// enumerations would be a series with no reader that nothing counts.
     #[tokio::test]
     async fn the_reading_face_publishes_one_cell_per_count_and_the_passs_verdict() {
         let state = DispatchState {
@@ -4096,10 +4761,16 @@ mod tests {
             evidenced_recovery_unix: 0,
             quota_window_secs: 0,
         };
+        let readback = HandoverCensus {
+            events: 40,
+            products: 6,
+            unreadable: 1,
+        };
         let metrics = Arc::new(cog_storage::MemoryMetricsBackend::new());
         let metrics: Arc<dyn MetricsBackend> = metrics.clone();
         publish_dispatch_rows(Some(&metrics), &state).await;
         publish_dispatch_verdict(Some(&metrics), &state).await;
+        publish_handover_readback(Some(&metrics), &readback).await;
 
         let end = Utc::now() + chrono::Duration::seconds(1);
         let start = end - chrono::Duration::seconds(600);
@@ -4137,7 +4808,9 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>(),
             DispatchReadout::ALL
                 .iter()
-                .map(|readout| readout.as_str().to_string())
+                .map(|readout| readout.as_str())
+                .chain(HandoverReadout::ALL.iter().map(|readout| readout.as_str()))
+                .map(str::to_string)
                 .collect::<std::collections::BTreeSet<_>>()
         );
         assert_eq!(published["pending"], 143.0);
@@ -4148,6 +4821,14 @@ mod tests {
         assert_eq!(published["held_back"], 120.0);
         assert_eq!(published["rearmed"], 2.0);
         assert_eq!(published["unmeasurable"], 5.0);
+        // The readback's own cells, and the difference between the two that is
+        // the whole reason there are two: 40 changes still have handovers on
+        // record and 6 of them left a deliverable, so the reading says 34 ran
+        // and recorded nothing -- which is not the same statement as a change
+        // nothing was ever handed to, and that one is the 0 in the first cell.
+        assert_eq!(published["handover_events"], 40.0);
+        assert_eq!(published["handover_products"], 6.0);
+        assert_eq!(published["handover_unreadable"], 1.0);
         // The reader's own arithmetic, done on the cells rather than on the row:
         // the numbers a dashboard subtracts are the numbers the pass placed.
         assert_eq!(

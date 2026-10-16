@@ -1250,7 +1250,19 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          dead_environment + held_back is what has to equal pending -- and the \
          equality is the reading: a pass whose counts do not add up to the set it \
          read is a pass that lost track of rows, which is how the environment- \
-         killed ones went unrecorded once. Written once per pass, so a pass that \
+         killed ones went unrecorded once. Three further cells answer a different \
+         question about that same set, taken from the same pass: what the \
+         handovers had left behind when it read them. handover_events counts the \
+         owed changes whose handovers are still in the event stream -- their \
+         tasks are found again from the account's own identity, with no edge \
+         stored anywhere -- and handover_products counts those of them that left \
+         a deliverable. The two are read together and never as one number: a \
+         change whose run recorded no deliverable and a change nothing was ever \
+         handed to differ in the first cell and are the same zero in the second, \
+         and telling the two apart is the whole point of the reading. \
+         handover_unreadable counts the rows whose handovers could not be read at \
+         all, so a failed read cannot pass for changes that produced nothing. \
+         Written once per pass, so a pass that \
          stops writing is visible as the companion timestamp going stale rather \
          than as a value that stops changing. Why this tick looks the way it does \
          is the pass's own verdict, read from cogneva_change_dispatch_verdict: \

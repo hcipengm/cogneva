@@ -737,6 +737,16 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                     // trade a missing reading for a missing ledger. Which it is
                     // is said at start-up.
                     ctx.consume_service::<dyn cog_core::LiveRevisionSource>(),
+                    // The event store, which is where a handover's product
+                    // lands. This loop is the reader that gets back to it from
+                    // the account's own rows: the id a change was dispatched
+                    // under is a function of its identity, so what it produced
+                    // is found again without an edge stored anywhere. Optional
+                    // like the loop's other collaborators, and said so at
+                    // start-up when it is absent: a reader with no store would
+                    // write the same zeros on every pass as a pass that read
+                    // nothing.
+                    ctx.consume_service::<dyn cog_core::StateBackend>(),
                 );
             }
             None => info!("change ledger loop not started: no ChangeLedgerStore published"),
