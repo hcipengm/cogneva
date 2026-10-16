@@ -948,6 +948,22 @@ const HISTOGRAM_HELP: &[(&str, &str)] = &[
 /// Descriptions for the gauge series. See [`COUNTER_HELP`].
 const GAUGE_HELP: &[(&str, &str)] = &[
     (
+        crate::metric_names::PROMOTION_WEEK_CHANGES.as_str(),
+        "Promotion-ledger entries of one ISO week, by how they ended: \
+         `promoted`, `rolled_back`, `failed`, `pending` (decided and still in \
+         flight -- pushed, or not yet picked up by a cluster) and \
+         `awaiting_review`. Labelled by `week` (e.g. `2026-W42`) and by \
+         `outcome`; one cell per week inside the trend report's window, \
+         re-written every report cycle rather than incremented, so a cell \
+         standing at 0 and a cell nobody wrote stay different readings. The \
+         cells are what separates a channel that generates nothing from one \
+         that generates and cannot land: on `promoted` alone both read as a \
+         quiet week, and that is the reading a six-week stall hid behind. \
+         A week older than the window has no series at all rather than a zero \
+         -- absent there says the report stopped covering it, not that it \
+         landed nothing",
+    ),
+    (
         "memory_unextracted_raw",
         "Archived raw sources whose summary is still owed: missing a summary \
          and not already diagnosed as unextractable, as last scanned. A source \

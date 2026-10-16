@@ -1720,6 +1720,69 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 45,
+          "title": "Promotion Outcomes by Week",
+          "description": "Where the promotion channel's own weekly tally lands. The report behind it aggregates the promotion ledger by ISO week and counts how each entry of that week ended -- promoted, rolled back, failed, pending, awaiting review -- and before this series none of those numbers reached a face a monitor could read: the report itself is a file under reports/ that someone has to open, the decline alert writes only the audit stream and only while the trend is falling, and the stall alert carries the same five counts but only ever while stalled and only into the persisted-alert table, which is the table the in-process watcher writes its own rows to. Read the five cells of a week together, because a promoted count of zero means one thing when the other four are zero as well -- nothing was generated -- and another when they are not, changes having been generated and left sitting in review or in flight; those want opposite repairs, and the promoted line alone cannot tell them apart. A week stops moving when it ends rather than when the channel goes quiet: the reporter rewrites every week of its window on every cycle, and the store keeps serving the last value written for a label set, so an ended week's cells stand at the counts it finished with and their _observed_timestamp_seconds companions are what say whether a cell is being rewritten or has settled. The window is the report's own, eight weeks, and its period is the same week, which is the order of the retention this Prometheus is configured with -- the oldest weeks fall out of the query window while newer ones arrive, so the left edge of this panel moves on its own. Each week is one account-wide number written by whichever process holds the pass: the lines are reduced by week rather than summed, so two replicas reporting the same count are not added together.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 192
+          },
+          "targets": [
+            {
+              "expr": "max by (week) (cogneva_promotion_week_changes{outcome=\"promoted\"})",
+              "legendFormat": "{{week}} promoted",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max by (week) (cogneva_promotion_week_changes{outcome=\"rolled_back\"})",
+              "legendFormat": "{{week}} rolled back",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max by (week) (cogneva_promotion_week_changes{outcome=\"failed\"})",
+              "legendFormat": "{{week}} failed",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max by (week) (cogneva_promotion_week_changes{outcome=\"pending\"})",
+              "legendFormat": "{{week}} pending (decided, still in flight)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max by (week) (cogneva_promotion_week_changes{outcome=\"awaiting_review\"})",
+              "legendFormat": "{{week}} awaiting review",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {

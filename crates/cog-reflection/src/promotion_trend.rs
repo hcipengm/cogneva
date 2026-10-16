@@ -27,6 +27,22 @@ const DECLINE_RUN: usize = 3;
 /// 单周完结对决样本下限（低于则该周不参与趋势判定，避免小样本抖动误报）。
 const MIN_WEEK_SAMPLES: u64 = 2;
 
+/// 抓取面上这一族的两个标签。
+const WEEK_LABEL: &str = "week";
+const OUTCOME_LABEL: &str = "outcome";
+
+/// `outcome` 的取值闭集：一条变更在一个 ISO 周里能落进的那几档，两两不交。
+///
+/// 只用这五档，不带 `awaiting_by_gate` / `awaiting_over_diff_limit`：那两个是
+/// `awaiting_review` 的**子集**（分级拦截转入人工的那部分，以及其中因 diff 超限
+/// 转入的那部分），发出来这一族就不再是划分，`sum by (outcome)` 会重复计。它们
+/// 该去的地方是调阈值的证据，不是这条按周分档的读数。
+const OUTCOME_PROMOTED: &str = "promoted";
+const OUTCOME_ROLLED_BACK: &str = "rolled_back";
+const OUTCOME_FAILED: &str = "failed";
+const OUTCOME_PENDING: &str = "pending";
+const OUTCOME_AWAITING_REVIEW: &str = "awaiting_review";
+
 /// 从台账记录聚合周报。纯函数，便于测试。
 pub fn aggregate(
     records: &[cog_core::PromotionRecord],
@@ -251,6 +267,12 @@ pub struct PromotionTrendReporter {
     interval: std::time::Duration,
     audit_stream: Option<Arc<dyn cog_core::AuditStream>>,
     alert_sink: Option<Arc<dyn cog_core::PersistentAlertSink>>,
+    /// 抓取面的写入口。缺它时报告仍落在盘上、趋势告警仍进审计流、停摆仍进
+    /// 持久化告警面，但这几周的计数在抓取面上一条都没有——而那一面正是它
+    /// 此前唯一的缺口：盘上的文件要人去读，audit 只在趋势向下时写，停摆告警
+    /// 只在停摆时写且把五个数塞在它的 labels 里，于是「通道在落地」与
+    /// 「通道彻底不动」在监控栈上的每一张面板上都同形。
+    metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
     latest: Arc<tokio::sync::RwLock<Option<PromotionTrendReport>>>,
 }
 
@@ -259,12 +281,17 @@ impl PromotionTrendReporter {
     /// still lands in the report file and the audit stream, but stays a
     /// document a human has to go and read rather than a firing alert the rest
     /// of the system can turn into work.
+    ///
+    /// `metrics` is the scrape-side port. Without it every other face this
+    /// reporter writes to is still written, and the one that is missing is the
+    /// one the monitoring stack reads -- see the field's own comment.
     pub fn new(
         ledger: Arc<dyn PromotionLedger>,
         report_dir: std::path::PathBuf,
         interval: std::time::Duration,
         audit_stream: Option<Arc<dyn cog_core::AuditStream>>,
         alert_sink: Option<Arc<dyn cog_core::PersistentAlertSink>>,
+        metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             ledger,
@@ -272,6 +299,7 @@ impl PromotionTrendReporter {
             interval,
             audit_stream,
             alert_sink,
+            metrics,
             latest: Arc::new(tokio::sync::RwLock::new(None)),
         })
     }
@@ -339,9 +367,57 @@ impl PromotionTrendReporter {
         }
 
         self.publish_stall(&report).await;
+        self.report_week_counts(&report).await;
 
         *self.latest.write().await = Some(report);
         Ok(())
+    }
+
+    /// 把这一期的逐周计数推到抓取面。
+    ///
+    /// 写在 `generate_once` 收尾、与 [`Self::publish_stall`] 并列：两者是同一份
+    /// 报告的两个出口，一个进持久化告警面、一个进抓取面，这个函数不新增任何
+    /// 判据，只把 [`aggregate`] 已经算出来的数搬过去。
+    ///
+    /// **读不到台账时一行都不写**，这是有意的：`generate_once` 在
+    /// `ledger.list()` 失败时提前返回，此刻这五档的真实值无从得知，而写下去
+    /// 就是拿上一期或者零冒充实测。不写的结果是这一族跟着 `_observed_timestamp_seconds`
+    /// 过期——读它的规则带新鲜度守卫，会因此闭口，而不是照着陈值继续判。
+    ///
+    /// 逐周都写，不写「只写最新一周」：五档分开读才是这面读数存在的理由
+    /// （只发 `promoted` 的话，「没生成」与「生成了卡在通道里」在抓取面上
+    /// 仍旧同形），而窗口里的周要能横向比，就必须每期一起刷新。
+    async fn report_week_counts(&self, report: &PromotionTrendReport) {
+        let Some(ref metrics) = self.metrics else {
+            return;
+        };
+        for week in &report.weeks {
+            for (outcome, value) in [
+                (OUTCOME_PROMOTED, week.promoted),
+                (OUTCOME_ROLLED_BACK, week.rolled_back),
+                (OUTCOME_FAILED, week.failed),
+                (OUTCOME_PENDING, week.pending),
+                (OUTCOME_AWAITING_REVIEW, week.awaiting_review),
+            ] {
+                let labels = std::collections::HashMap::from([
+                    (WEEK_LABEL.to_string(), week.week.clone()),
+                    (OUTCOME_LABEL.to_string(), outcome.to_string()),
+                ]);
+                if let Err(e) = metrics
+                    .record_gauge(
+                        cog_core::metric_names::PROMOTION_WEEK_CHANGES,
+                        value as f64,
+                        labels,
+                    )
+                    .await
+                {
+                    warn!(
+                        error = %e, week = %week.week, outcome,
+                        "promotion week count emit failed"
+                    );
+                }
+            }
+        }
     }
 
     /// Drive the stall condition into the persisted alert state machine.
@@ -755,6 +831,7 @@ mod tests {
             std::time::Duration::from_secs(60),
             None,
             Some(sink.clone()),
+            None,
         );
         stalled.generate_once().await.unwrap();
 
@@ -764,6 +841,7 @@ mod tests {
             std::time::Duration::from_secs(60),
             None,
             Some(sink.clone()),
+            None,
         );
         recovered.generate_once().await.unwrap();
 
@@ -776,6 +854,89 @@ mod tests {
                 (false, rule, "critical".to_string()),
             ],
             "停摆要报出来，恢复要解除，且用同一条 rule：{calls:?}"
+        );
+    }
+
+    /// 报告算出来的每一格都要到抓取面上，且带对了周与结局。
+    ///
+    /// 判据比对的是「抓取面读到的数」与「报告自己算的数」：一份把周标签写错、
+    /// 或把五档写成一档、或整族只发零的发射，在报告文件与告警面上都看不出来——
+    /// 那两份正本照样是对的，只是监控栈上那一族从第一条起就是假的。
+    #[tokio::test]
+    async fn every_cell_of_the_report_reaches_the_scrape_under_its_own_week() {
+        // `query_gauge_latest` is a trait method: the reading side is the
+        // `MetricsBackend` interface, not an inherent method of the test double.
+        use cog_core::MetricsBackend as _;
+        let metrics = Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let reporter = PromotionTrendReporter::new(
+            Arc::new(FixedLedger(vec![
+                rec(0, PromotionStatus::Promoted),
+                rec(0, PromotionStatus::Failed),
+                rec(1, PromotionStatus::RolledBack),
+            ])),
+            temp_report_dir("metrics"),
+            std::time::Duration::from_secs(60),
+            None,
+            None,
+            Some(metrics.clone()),
+        );
+        reporter.generate_once().await.unwrap();
+
+        let report = reporter
+            .latest()
+            .read()
+            .await
+            .clone()
+            .expect("报告已经生成过一次");
+        let samples = metrics
+            .query_gauge_latest(cog_core::metric_names::PROMOTION_WEEK_CHANGES.as_str())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            samples.len(),
+            report.weeks.len() * 5,
+            "{} 周应有 {} 条样本（每周五档），实得 {}",
+            report.weeks.len(),
+            report.weeks.len() * 5,
+            samples.len()
+        );
+
+        let mut promoted_on_the_face = 0u64;
+        for week in &report.weeks {
+            for (outcome, expected) in [
+                (OUTCOME_PROMOTED, week.promoted),
+                (OUTCOME_ROLLED_BACK, week.rolled_back),
+                (OUTCOME_FAILED, week.failed),
+                (OUTCOME_PENDING, week.pending),
+                (OUTCOME_AWAITING_REVIEW, week.awaiting_review),
+            ] {
+                let sample = samples
+                    .iter()
+                    .find(|s| {
+                        s.labels.get(WEEK_LABEL).map(String::as_str) == Some(week.week.as_str())
+                            && s.labels.get(OUTCOME_LABEL).map(String::as_str) == Some(outcome)
+                    })
+                    .unwrap_or_else(|| panic!("抓取面上没有 {}/{} 这一格", week.week, outcome));
+                assert_eq!(
+                    sample.value, expected as f64,
+                    "{}/{} 抓取面与报告不一致：{:?} 对 {:?}",
+                    week.week, outcome, sample.value, expected
+                );
+                assert_eq!(
+                    sample.labels.len(),
+                    2,
+                    "这一族只带 week/outcome 两个标签，实得 {:?}",
+                    sample.labels
+                );
+                if outcome == OUTCOME_PROMOTED {
+                    promoted_on_the_face += expected;
+                }
+            }
+        }
+        assert!(
+            promoted_on_the_face > 0,
+            "标本一条都没落地：全零的发射与正确的发射在这条判据下同形，分母是空的"
         );
     }
 }

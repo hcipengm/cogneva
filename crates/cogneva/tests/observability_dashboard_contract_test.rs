@@ -618,6 +618,17 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["stream", "consumer_group", "reason"],
         "crates/cog-stream/src/observable.rs",
     ),
+    // The promotion channel's weekly tally: how many ledger entries of one ISO
+    // week ended each way, so `promoted` alone can be read against the four
+    // cells beside it. It is drawn rather than alarmed on -- the in-process
+    // stall condition already judges the same window, and a rule here would be
+    // a strictly later, blunter statement of it, written into the same alerts
+    // table from an uncoupled carrier.
+    (
+        "cogneva_promotion_week_changes",
+        &["week", "outcome"],
+        "crates/cog-reflection/src/promotion_trend.rs",
+    ),
 ];
 
 /// Series the dashboard may read that this workspace does not produce, with the

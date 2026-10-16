@@ -258,6 +258,27 @@ metric_names! {
     // which the task failure sets to 1 and the missing orchestrator does not.
     EVAL_GATE_OUTCOMES_TOTAL => "cogneva_eval_gate_outcomes_total",
 
+    // cog-reflection — the promotion trend report's per-week counts, labelled by
+    // `week` (the ISO week, e.g. `2026-W42`) and `outcome`, written once per
+    // cycle for every week in the report's window.
+    //
+    // The report answers "is this channel still landing anything", and until
+    // this series it answered it on no face the monitoring stack can read: the
+    // file under `reports/` is a document someone has to open, the decline
+    // alert only writes the audit stream and only when the trend is falling,
+    // and the stall alert carries the same five counts but only ever *while
+    // stalled* -- it is written to the persisted-alert table, not to any scrape,
+    // and it is resolved the moment a week lands. So "the channel is landing"
+    // and "the channel has stopped" were the same picture on every panel: for
+    // the weeks that do land, nothing anywhere published a number.
+    //
+    // A gauge, because each cell is that week's standing count, not an event:
+    // the report re-aggregates the whole window every cycle, so a week's cell is
+    // the same question asked again rather than an increment. A reader telling
+    // "nothing generated" from "generated and stuck in the channel" reads the
+    // other cells of the same week beside `promoted`.
+    PROMOTION_WEEK_CHANGES => "cogneva_promotion_week_changes",
+
     // cog-reflection — which gates a change was routed to, labelled by `tier`,
     // written once per change the pipeline reaches.
     //

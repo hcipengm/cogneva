@@ -949,6 +949,13 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                         if alert_sink.is_none() {
                             warn!("PersistentAlertSink not published; promotion stall alerts stay report-only");
                         }
+                        // 抓取面那一份。缺了它报告照写、告警照进持久化面，只是
+                        // 这几周的计数一条都不到 Prometheus——而监控栈上那张
+                        // 「通道在不在落地」的面板读的正是这一份。
+                        let trend_metrics = ctx.consume_service::<dyn cog_core::MetricsBackend>();
+                        if trend_metrics.is_none() {
+                            warn!("MetricsBackend not published; promotion weekly counts will not reach the scrape");
+                        }
                         let reporter = crate::PromotionTrendReporter::new(
                             ledger.clone(),
                             std::path::PathBuf::from(format!(
@@ -958,6 +965,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                             std::time::Duration::from_secs(promotion.trend_report_interval_secs),
                             audit_stream.clone(),
                             alert_sink,
+                            trend_metrics,
                         );
                         admin = admin.with_trend_latest(reporter.latest());
                         trend_reporter = Some(reporter);
