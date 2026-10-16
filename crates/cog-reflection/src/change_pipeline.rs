@@ -5152,9 +5152,13 @@ index 1111111..2222222 100644\n\
         );
         assert_eq!(cells["tests"], 1.0, "源码变更落到测试档");
         assert_eq!(cells["real_gate"], 1.0, "动载体的变更落到真门档");
-        for cell in ["minimal", "compile", "structural"] {
+        for cell in ["minimal", "structural"] {
             assert_eq!(cells[cell], 0.0, "{cell} 没人走过，读到的必须是 0");
         }
+        // `compile` 不在这张表里，不是因为它没人走过，而是因为**没有一条判词能落到它**：
+        // 播种一个走不到的格，读到的 0 与「接了线、只是还没人落进去」完全同形，而这两件事
+        // 正是这套播种存在的理由要分开的。可达性由 `criteria_face` 的
+        // `every_tier_the_reading_publishes_has_a_producer` 逐档钉住。
     }
 
     /// The dispatch reading has to publish the whole cross product of recipes

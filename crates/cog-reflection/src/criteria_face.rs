@@ -141,9 +141,17 @@ pub struct CriteriaFace {
 pub enum Tier {
     /// Nothing runs: the change touches only prose.
     Minimal,
-    /// The change has to compile.
-    Compile,
     /// The existing tests have to pass.
+    ///
+    /// Source that is not a criterion lands here rather than in a compile-only
+    /// rung of its own. "This has to compile" cannot be the strongest row of a
+    /// change: the pipeline compiles the tree before it runs the suite, so
+    /// every change that reaches a compile also reaches the tests, and a level
+    /// below this one would only ever be shadowed by it. That is measured, not
+    /// assumed — a `Compile` rung used to sit here, and no row in the decision
+    /// could return it (2026-10-16: it read zero in the fleet while a zero from
+    /// a tier that *can* fire read the same way, which is the one thing the
+    /// seeding exists to keep apart).
     Tests,
     /// A structural gate applies (topology parity; the security allow-list).
     Structural,
@@ -160,7 +168,6 @@ impl Tier {
     pub fn as_cell(self) -> &'static str {
         match self {
             Tier::Minimal => "minimal",
-            Tier::Compile => "compile",
             Tier::Tests => "tests",
             Tier::Structural => "structural",
             Tier::RealGate => "real_gate",
@@ -174,13 +181,14 @@ impl Tier {
     /// never wired up" stay different readings: the first is a zero, the second
     /// an absent series. Before that first change nothing is published at all,
     /// and the two cannot yet be told apart.
-    pub const ALL: [Tier; 5] = [
-        Tier::Minimal,
-        Tier::Compile,
-        Tier::Tests,
-        Tier::Structural,
-        Tier::RealGate,
-    ];
+    ///
+    /// That is also why a tier listed here has to be one `tier` can return: a
+    /// seeded zero is a claim that the cell is being watched, and a cell no row
+    /// can move keeps that claim while reading exactly like a tier that is
+    /// wired and idle. `every_tier_the_reading_publishes_has_a_producer` is the
+    /// gate — a tier added without a path to it fails there rather than
+    /// shipping as a permanent zero.
+    pub const ALL: [Tier; 4] = [Tier::Minimal, Tier::Tests, Tier::Structural, Tier::RealGate];
 }
 
 /// Why a tier was reached. Carried so the real gate does not have to re-derive
@@ -498,6 +506,50 @@ mod tests {
         );
         assert_eq!(t.tier, Tier::Tests);
         assert!(!t.touches_criteria_code);
+    }
+
+    /// One change that reaches `tier`, derived by running the decision on it.
+    ///
+    /// The match is exhaustive on purpose: adding a tier to the enum lands
+    /// here as a compile error, and the arm has to return its tier by calling
+    /// `tier` — a tier that no row can reach cannot be faked into this table.
+    fn specimen(want: Tier) -> Tiering {
+        let empty = face(&[], &[]);
+        match want {
+            Tier::Minimal => tier(&empty, &[target("docs/README.md")], &DiffShape::default()),
+            Tier::Tests => tier(
+                &empty,
+                &[target("crates/cog-core/src/lib.rs")],
+                &DiffShape::default(),
+            ),
+            Tier::Structural => tier(
+                &empty,
+                &[target("deploy/k3s/cogneva-json-configmap.yaml")],
+                &DiffShape::default(),
+            ),
+            Tier::RealGate => tier(
+                &empty,
+                &[target("eval_datasets/humaneval.jsonl")],
+                &DiffShape::default(),
+            ),
+        }
+    }
+
+    #[test]
+    fn every_tier_the_reading_publishes_has_a_producer() {
+        // The publisher seeds one cell per tier in `Tier::ALL` and reads a
+        // zero there as "wired up, nothing has landed in it yet". A tier in
+        // that list with no row to reach it would read exactly the same way,
+        // which is the one failure the seeding exists to prevent — so the list
+        // is checked against the decision rather than trusted.
+        for tier in Tier::ALL {
+            assert_eq!(
+                specimen(tier).tier,
+                tier,
+                "{} is published as a cell but no change reaches it",
+                tier.as_cell()
+            );
+        }
     }
 
     #[test]

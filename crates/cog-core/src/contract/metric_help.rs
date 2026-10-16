@@ -230,10 +230,10 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          per change the pipeline reaches. The routing reads what the change \
          touches -- its paths, the configuration keys it moves, the names it \
          takes out and does not put back -- and the cells are the closed set it \
-         can land in: `minimal` for prose only, `compile` and `tests` for source \
-         that is not a criterion, `structural` for a configuration value no \
+         can land in: `minimal` for prose only, `tests` for source that is not \
+         a criterion, `structural` for a configuration value no \
          criterion reads and for the deployment's own topology, and `real_gate` \
-         for a change that can move a criterion. The five cells are seeded at \
+         for a change that can move a criterion. The four cells are seeded at \
          zero by the first change the pipeline tiers: from that change on, a \
          tier that never fired reads as a zero while an absent series means the \
          reading was never wired. Before that first change nothing is published \
