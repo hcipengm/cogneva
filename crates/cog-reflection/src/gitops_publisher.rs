@@ -4,8 +4,11 @@
 //! 并打 `promote/<change_id>` annotated tag（tag message 带审计元数据：
 //! change_id、级别、eval 摘要）。各集群拉取端 poll 该分支各自金丝雀。
 //!
-//! 安全边界：本模块只跟 Git 中央仓库说话（三仓库同步既有通道），
-//! 全程不持有、不使用任何集群凭证（kubeconfig / API token）。
+//! 安全边界：**发布那条路**只跟 Git 中央仓库说话（三仓库同步既有通道），
+//! 不持有、不使用任何集群凭证（kubeconfig / API token）。金丝雀基底那条路是
+//! 例外且是刻意的：它按名读四个主负载当前在跑的 tag（读法在
+//! [`crate::live_revision`]），走的是本 Pod 自己的 service account，凭的是
+//! 那条具名 get 的授权——`deployer_rbac_covers_its_reads_test` 是它的门。
 //!
 //! 镜像分发双态，拉取端永远只 pull 不构建：`registry` 配置外部仓库时
 //! push 外部仓库（跨集群生产形态）；缺省 push 到集群内 registry
@@ -22,6 +25,7 @@ use cog_core::{SFError, SFResult};
 use tracing::{info, warn};
 
 use crate::auto_promoter::{PromotionChannel, PromotionSource};
+use crate::live_revision::{self, CommandRunner};
 use crate::types::EvolutionResult;
 
 /// change_id 只保留 [A-Za-z0-9-_]，其余替换为 '-'（git ref / 镜像 tag
@@ -278,52 +282,50 @@ impl GitOpsPublisher {
         Ok(())
     }
 
-    /// 金丝雀 overlay 基底：优先取四个 cogneva deployment 当前在跑的
-    /// 不可变 `main-<rev>` tag。主线前进后浮动 :local 虽已同步前移，
-    /// 但构建机可能缓存着旧 :local 层，用不可变 tag 保证基底就是线上版本，
-    /// 避免金丝雀基于旧基线自我放大。查询失败/未迁移/混合态退回 :local。
+    /// 金丝雀 overlay 基底：优先取四个主负载当前在跑的不可变 `main-<rev>` tag。
+    /// 主线前进后浮动 :local 虽已同步前移，但构建机可能缓存着旧 :local 层，用不可变
+    /// tag 保证基底就是线上版本，避免金丝雀基于旧基线自我放大。查询失败/未迁移/混合态
+    /// 退回 :local。
     ///
-    /// 逐个**按名字**读，而不是列一遍命名空间的 deployment：集合级 list 在
-    /// 按名授权下必被拒（RBAC 的 `resourceNames` 与 list 组合要求请求带对应的
-    /// field selector），而同一个推送端也可能跑在只按名授权的 Pod 里；按名读
-    /// 只要那个名字上的 get。任何一个名字读不出来都算「读不出来」——退回
-    /// :local，并把**哪个名字、为什么**写进日志：权限被拒与「集群里确实还是
-    /// 浮动 tag」是两件事，落成同一行日志就再也没人分得出来。
+    /// 名字清单、jsonpath、按名读、解析都在 [`crate::live_revision`]：那条读法马上会有
+    /// 第三个读者（「落地≠生效」那一格问的是同一个事实），多一个读者不该多一份名单。
+    /// 读不出来时**哪个名字、为什么**仍旧写在这里的日志里——权限被拒与「集群里确实还是
+    /// 浮动 tag」是两件事，落成同一行就再也没人分得出来。
     async fn resolve_base_image(&self, endpoint: &str) -> String {
         let fallback = format!("{endpoint}/cogneva:local");
-        // 单个对象不是 list，所以名字取 `.metadata.name` 而不是
-        // `{range .items[*]}`；`deployed_main_rev` 认的仍是同一份 tab 分隔文本。
-        const JSONPATH: &str = "{.metadata.name}{\"\\t\"}{range .spec.template.spec.containers[*]}{.name}={.image}{\",\"}{end}{\"\\n\"}";
-        let mut out = String::new();
-        for name in CANARY_BASE_DEPLOYMENTS {
-            let target = format!("deployment/{name}");
-            match self
-                .run(
-                    &self.config.kubectl_bin,
-                    &["-n", &self.config.namespace, "get", &target, "-o", JSONPATH],
-                    30,
-                )
-                .await
-            {
-                Ok(o) => out.push_str(&o),
-                Err(e) => {
-                    warn!(
-                        deployment = %name,
-                        error = %e,
-                        "canary base: the running revision could not be read; falling back to :local"
-                    );
-                    return fallback;
+        let read = live_revision::read_base_deployments(
+            self,
+            &self.config.kubectl_bin,
+            &self.config.namespace,
+        )
+        .await;
+        match read {
+            Ok(out) => match live_revision::deployed_main_rev(&out) {
+                Some(rev) => {
+                    let base = format!("{endpoint}/cogneva:main-{rev}");
+                    info!(base = %base, "canary overlay base resolved from deployed main tag");
+                    base
                 }
+                None => fallback,
+            },
+            Err(unreadable) => {
+                warn!(
+                    deployment = %unreadable.name,
+                    error = %unreadable.why,
+                    "canary base: the running revision could not be read; falling back to :local"
+                );
+                fallback
             }
         }
-        match deployed_main_rev(&out) {
-            Some(rev) => {
-                let base = format!("{endpoint}/cogneva:main-{rev}");
-                info!(base = %base, "canary overlay base resolved from deployed main tag");
-                base
-            }
-            None => fallback,
-        }
+    }
+}
+
+/// 本推送端跑命令的那条缝（[`crate::live_revision::CommandRunner`]）：读四个主负载的
+/// 现役 tag 与它自己推镜像走的是同一个执行路径，别为读数另开一条。
+#[async_trait]
+impl CommandRunner for GitOpsPublisher {
+    async fn run(&self, program: &str, args: &[&str], timeout_secs: u64) -> SFResult<String> {
+        GitOpsPublisher::run(self, program, args, timeout_secs).await
     }
 }
 
@@ -335,57 +337,6 @@ const MAINLINE_REF: &str = "refs/heads/main";
 /// 落地通道撤回一条判红变更时用的提交标题前缀。撤回提交的信息里同样逐字带
 /// change id，所以「历史里有这个 id」不等于「这条变更此刻在主线上」。
 const REVERT_SUBJECT_PREFIX: &str = "revert(cogneva): undo change";
-
-/// 金丝雀 overlay 基底要读的四个工作负载：只有它们**全部**跑在同一个
-/// `main-<rev>` tag 上，那个 tag 才是可信的基底。
-///
-/// 两个读者共用这一份名字——按名把集群读回来的那条命令，与按名字过滤出这四行
-/// 的解析函数——所以它写在模块作用域，只此一份。
-const CANARY_BASE_DEPLOYMENTS: [&str; 4] = [
-    "cogneva",
-    "cogneva-security-gateway",
-    "cogneva-sandbox-executor",
-    "cogneva-evolution",
-];
-
-/// 解析 `kubectl get deploy` 的 tab 分隔输出：仅当四个 cogneva deployment
-/// 的所有容器都跑在同一个 `main-<rev>` tag 上时返回该 rev；Legacy（:local
-/// 时代）、混合态、空输出都返回 None。
-fn deployed_main_rev(jsonpath_out: &str) -> Option<String> {
-    let mut revs = std::collections::BTreeSet::new();
-    let mut total = 0usize;
-    let mut on_main = 0usize;
-    for line in jsonpath_out.lines() {
-        let Some((name, rest)) = line.split_once('\t') else {
-            continue;
-        };
-        if !CANARY_BASE_DEPLOYMENTS.contains(&name) {
-            continue;
-        }
-        for pair in rest.split(',') {
-            let Some((_, image)) = pair.split_once('=') else {
-                continue;
-            };
-            if image.is_empty() {
-                continue;
-            }
-            total += 1;
-            if let Some(rev) = image
-                .rsplit(':')
-                .next()
-                .and_then(|tag| tag.strip_prefix("main-"))
-            {
-                revs.insert(rev.to_string());
-                on_main += 1;
-            }
-        }
-    }
-    if total > 0 && on_main == total && revs.len() == 1 {
-        revs.into_iter().next()
-    } else {
-        None
-    }
-}
 
 #[async_trait]
 impl PromotionChannel for GitOpsPublisher {
@@ -701,59 +652,6 @@ mod tests {
         assert!(err.is_err());
     }
 
-    #[test]
-    fn deployed_main_rev_requires_unanimous_main_tag() {
-        let line =
-            |deploy: &str, container: &str, image: &str| format!("{deploy}\t{container}={image},");
-        let uniform = [
-            line("cogneva", "cogneva", "r:5000/cogneva:main-abcdef012345"),
-            line(
-                "cogneva-security-gateway",
-                "security-gateway",
-                "r:5000/cogneva:main-abcdef012345",
-            ),
-            line(
-                "cogneva-sandbox-executor",
-                "sandbox-executor",
-                "r:5000/cogneva:main-abcdef012345",
-            ),
-            line(
-                "cogneva-evolution",
-                "cogneva",
-                "r:5000/cogneva:main-abcdef012345",
-            ),
-        ]
-        .join("\n");
-        assert_eq!(deployed_main_rev(&uniform).as_deref(), Some("abcdef012345"));
-
-        // 迁移前（全 :local）→ None，回退 :local 基底。
-        let legacy = line("cogneva", "cogneva", "localhost/cogneva:local");
-        assert_eq!(deployed_main_rev(&legacy), None);
-
-        // 混合态（部分主线部分旧 tag）→ None。
-        let mixed = line("cogneva", "cogneva", "localhost/cogneva:local")
-            + "\n"
-            + &line(
-                "cogneva-security-gateway",
-                "security-gateway",
-                "r:5000/cogneva:main-abcdef012345",
-            );
-        assert_eq!(deployed_main_rev(&mixed), None);
-
-        // rev 不一致（滚动未收敛）→ None。
-        let diverged = line("cogneva", "cogneva", "r:5000/cogneva:main-aaaaaaaaaaaa")
-            + "\n"
-            + &line(
-                "cogneva-security-gateway",
-                "security-gateway",
-                "r:5000/cogneva:main-bbbbbbbbbbbb",
-            );
-        assert_eq!(deployed_main_rev(&diverged), None);
-
-        // 空输出 → None。
-        assert_eq!(deployed_main_rev(""), None);
-    }
-
     /// 基底那四读是**逐个按名**发出的，读的是 `动词 目标` 一样一行落到 argv.log
     /// 供断言：集合级 list 在按名授权下会被拒，所以这条路径不能靠一次列全命名
     /// 空间。落日志用 printf 而不是 echo —— dash 的 echo 会解释参数里的 `\n`，
@@ -797,10 +695,10 @@ mod tests {
         let reads: Vec<&str> = argv.lines().collect();
         assert_eq!(
             reads.len(),
-            CANARY_BASE_DEPLOYMENTS.len(),
+            crate::live_revision::BASE_DEPLOYMENTS.len(),
             "基底要一个名字一条读，不是列一遍命名空间：{argv}"
         );
-        for name in CANARY_BASE_DEPLOYMENTS {
+        for name in crate::live_revision::BASE_DEPLOYMENTS {
             assert!(
                 reads
                     .iter()

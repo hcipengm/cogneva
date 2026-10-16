@@ -64,6 +64,7 @@ pub mod gitops_puller;
 pub mod governance_drift;
 pub mod image_rollout;
 pub mod learning_recurrence_readings;
+pub mod live_revision;
 pub mod mainline_deployer;
 pub mod mainline_rollout;
 pub mod matcher;

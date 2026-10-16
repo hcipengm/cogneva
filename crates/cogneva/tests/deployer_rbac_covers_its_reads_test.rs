@@ -82,6 +82,11 @@ const OTHER_PRINCIPALS: &[(&str, &str)] = &[
         "crates/cog-reflection/src/gitops_publisher.rs",
         "app pod: SA cogneva, Roles cogneva-gitops-puller / llm-admin",
     ),
+    (
+        "crates/cog-reflection/src/live_revision.rs",
+        "app pod: SA cogneva, Role cogneva-gitops-puller (same reads as gitops_publisher, \
+         which is its only production caller today)",
+    ),
 ];
 
 fn repo_root() -> PathBuf {
@@ -1014,16 +1019,28 @@ fn quoted(src: &str, needle: &str) -> Option<String> {
 /// ——「拿不到授权」与「集群里确实还是浮动 tag」在判决里同形。
 #[test]
 fn every_identity_that_can_publish_can_read_the_canary_base_names() {
-    let publisher = read("crates/cog-reflection/src/gitops_publisher.rs");
-    let names = const_string_list(&publisher, "CANARY_BASE_DEPLOYMENTS");
+    let revision = read("crates/cog-reflection/src/live_revision.rs");
+    let names = const_string_list(&revision, "BASE_DEPLOYMENTS");
     assert_eq!(
         names.len(),
         4,
-        "金丝雀基底名单读出来是 {names:?}：这条判据靠它才算有内容"
+        "现役 rev 的四个主负载名单读出来是 {names:?}：这条判据靠它才算有内容"
     );
     assert!(
-        publisher.contains("\"deployment/{name}\""),
-        "基底不再按名读：resourceNames 授权下集合级 list 必被拒，而读不到只静默退回浮动 tag"
+        revision.contains("\"deployment/{name}\""),
+        "这份读法不再按名读：resourceNames 授权下集合级 list 必被拒，而读不到只静默退回浮动 tag"
+    );
+
+    // 名单只此一份：推送端引用它，自己不再留一份。两份会各自漂，而漂掉的那份不报错，
+    // 它只会让某个读者少认一个名字——那时这条判据读的还是那份没人用的。
+    let publisher = read("crates/cog-reflection/src/gitops_publisher.rs");
+    assert!(
+        publisher.contains("live_revision::read_base_deployments"),
+        "推送端不再引用现役 rev 那一份读法：两份名单意味着有一个读者会少认一个名字"
+    );
+    assert!(
+        !publisher.contains("const CANARY_BASE_DEPLOYMENTS"),
+        "推送端又长出了自己那份名单"
     );
 
     let app = env_value(
