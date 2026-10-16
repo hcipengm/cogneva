@@ -16,7 +16,7 @@
 #     「一天 ＋ 宽限」，漏了这一项——于是有人把 `runDeadlineSeconds` 抬到 5400 以上时
 #     （最坏健康年龄 = 86400 ＋ 1800 ＋ 5400 = 93600，正好顶到界上），一次跑得慢但
 #     **成功** 的运行会在成功之前把灯点亮，而门禁照样绿。
-# 任何一个动了，界都该跟着动。这个脚本把三件事钉住：
+# 任何一个动了，界都该跟着动。这个脚本把四件事钉住：
 #   1. 四条出现（三条日尺度规则的 `condition.greater_than` ＋ `backup_success_not_recorded`
 #      的 promql 里那一个 `<(数字)`）必须是同一个数；
 #   2. 那个数必须落在一条**从 chart 自己推出来的带子**里：下端是「一天 ＋ 迟到宽限
@@ -24,7 +24,12 @@
 #      上端是「两天」（`backup_no_recent_success` 的摘要写明它要「一次漏跑就亮、
 #      下次成功就灭」，并点名「界定在 48 小时就整天不响」）；
 #   3. **摘要说的操作数就是上面相加的那三个**——摘要要么自己点名这组，要么点名它从
-#      哪条规则复用这个界（复述会造出第二份算式，而第二份算式正是漂移的成因）。
+#      哪条规则复用这个界（复述会造出第二份算式，而第二份算式正是漂移的成因）；
+#   4. **摘要把派生数写进散文时，那些数必须与门算出的相等**——整点小时数 == 界、
+#      余量秒数 == 界减最坏健康年龄。前三条核的是摘要点了哪些**名字**，一条都不核
+#      它说的**数**；摘要正是告警唯一的散文面（人读的是它），只核名字就等于允许
+#      散文里的数无声地变假：改 chart 换了界，门算出的数动了，「the 26 hours」与
+#      「headroom is 1800 seconds」一字不动地留着，门照样绿。
 # 两个端点的操作数都是读出来的，所以改排班 / 改宽限 / 改运行时长的人都会在这里被拦；
 # 至于界在带子里落在哪一点是运维取舍，本脚本不替它拍。
 #
@@ -196,10 +201,64 @@ for name in list(BY_CONDITION) + [BY_PROMQL]:
             f"必须自己写清楚）——两边各写一份算式，就没人会发现另一份算错了"
         )
 
+# 第四个前提：**摘要把派生数写进散文时，那些数必须与门自己算出的相等**。
+#
+# 为什么它必须在这里：前三个前提核的是「摘要点名了哪几个操作数」（名字），一个都
+# **不核它说的数**。摘要可以把界写成「the 26 hours」、把余量写成「headroom is 1800
+# seconds」，而这两句都是**从操作数算出来的派生数**——改了排班 / 宽限 / 运行时长，
+# 门算出的数变了，散文里的数**一字不动**地留着，门照样绿。摘要正是告警唯一的散文
+# 面（人读的是它），所以这句话无声地变假＝人按着一句错的话判断。名字由第三前提核，
+# 数由这一个核。
+#
+# 判据能**从环境读出来**，不是待决策项：门已经算出 bound（四个出现那个数）与 floor
+# （三操作数之和），摘要点名的两个派生数分别等于它们：
+#   - 整点小时数（`the 26 hours` / `a round 26 hours` / `the same 26 hours`）== bound / 3600；
+#   - 余量秒数（`headroom is 1800 seconds`）== bound - floor（「最坏健康年龄之上还留多少」）。
+# **只核出现形式，不做全文件搜数字**：摘要里还有别的 `<N> hours`——`backup_no_recent_success`
+# 写的「一次漏跑约 48 小时」那个 **48**，说的是**被否掉的那个界的替代方案**、不是本族
+# 的界，拿它比 26 会误红。所以整点小时数只认「(the|a round|the same) <N> hours」这种
+# **指界**的形状，与第三个前提认操作数名字同一路数。
+HOURS_CLAIM = re.compile(r"\b(?:round|the|same)\s+(\d+)\s+hours?\b")
+HEADROOM_CLAIM = re.compile(r"\bheadroom\s+(?:is\s+|of\s+)?(\d+)\s+seconds?\b")
+
+
+def mismatched_derived_numbers(name):
+    """返回摘要里「说的数」与门算出的数对不上的那几处（人类可读）。
+    没写这类数、或写了且对得上，返回空表。"""
+    summary = rules[name].get("summary", "")
+    bad = []
+    for token in HOURS_CLAIM.findall(summary):
+        stated = int(token) * 3600
+        if stated != bound:
+            bad.append(
+                f"整点小时数「{token} hours」= {stated} 秒，而界是 {bound:g} 秒"
+                f"（{bound / 3600:.2f} 小时）"
+            )
+    headroom = bound - floor
+    for token in HEADROOM_CLAIM.findall(summary):
+        if int(token) != headroom:
+            bad.append(
+                f"余量「headroom is {token} seconds」，而界比最坏健康年龄 {floor} "
+                f"高 {headroom:g} 秒"
+            )
+    return bad
+
+
+for name in list(BY_CONDITION) + [BY_PROMQL]:
+    bad = mismatched_derived_numbers(name)
+    if bad:
+        fail(
+            f"规则 {name} 的摘要把派生数写进了散文，而它与门算出的对不上："
+            f"{'；'.join(bad)}。这两个数是从操作数算出来的——改了 chart 就必须跟着改；"
+            f"摘要正是告警唯一的散文面，人读的是它，只核名字不核数等于允许它无声地变假"
+        )
+
 print(
     f"OK: 四条出现一致（{bound:g} = {bound / 3600:.2f}h）；"
     f"四条摘要都交代了门禁相加的三个操作数（排班周期、startingDeadlineSeconds、"
     f"runDeadlineSeconds——自己点名，或点名它复用界的那条）；"
+    f"摘要里点名的派生数（整点小时数 == {bound:g}、余量 == {bound - floor:g}）"
+    f"与门算出的相符；"
     f"带的端点由 chart 推得：下 {floor}（排班 `{schedule}` → {period} ＋ "
     f"startingDeadlineSeconds {grace} ＋ runDeadlineSeconds {run_seconds}）、"
     f"上 {ceiling}（两天）"

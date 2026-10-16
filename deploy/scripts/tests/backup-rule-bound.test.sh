@@ -26,7 +26,12 @@
 #       那是某次测量的结果、门禁从没相加过，而真在相加的 `runDeadlineSeconds`
 #       摘要里没有——两份算式各写各的）；
 #  10. 负对照：摘要改写措辞但仍点名那三个操作数 -> 仍绿（判据是「点没点名」，
-#      不是逐字比对，否则每一次正当改写都会被判红）。
+#      不是逐字比对，否则每一次正当改写都会被判红）；
+#  11. 界整体抬到 95400（四者一致、仍在带内），但摘要里的「the 26 hours」与
+#      「headroom is 1800 seconds」没跟着改 -> 红，点名那条规则与对不上的派生数
+#      （只 sed 数字串换不到这两个散文里的数，正是缺口所在）；
+#  12. 负对照：摘要改写措辞、但说的派生数仍是门算出的那两个，且写进被否掉的
+#      48 小时替代方案 -> 仍绿（判据是「指界的那个数对不对」，48 那个数不属本族）。
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -115,12 +120,32 @@ def reword_but_keep(rules):
 
 dump("summary-drops-operand", drop_operand)
 dump("summary-reworded", reword_but_keep)
+
+
+def reword_derived_keeping_numbers(rules):
+    """负对照：换措辞、但说的派生数是门算出的那两个（26 hours / 1800 seconds），
+    还把**被否掉的那个 48 小时替代方案**也写进去——判据是「指界的那个数对不对」，
+    48 那个数指的不是本族的界，不该被这条判据卷进来。"""
+    rule(rules, "backup_no_recent_success")["summary"] = (
+        "The run is scheduled once a day; a startingDeadlineSeconds of slack plus a "
+        "runDeadlineSeconds of allowance bound a healthy age well under this rule's "
+        "a round 26 hours, whose headroom of 1800 seconds keeps a slow day from reading "
+        "as a missed backup. A single missed day peaks at about 48 hours, which is the "
+        "alternative this bound rejects."
+    )
+
+
+dump("summary-derived-reworded", reword_derived_keeping_numbers)
 PYEOF
 
 # 排班改成每天两次（每 12 小时一次）：周期不再是 86400，界必须重推。
 sed 's/^  schedule: .*/  schedule: "17 3,15 * * *"/' "${values}" >"${work}/values-notdaily.yaml"
 # 迟到宽限抬到 3 小时：一天 ＋ 宽限 = 97200，已高过 93600。
 sed 's/^  startingDeadlineSeconds: .*/  startingDeadlineSeconds: 10800/' "${template}" >"${work}/backup-wide-grace.yaml"
+# 界整体抬到 95400：把配置里所有 `93600` 数字串换掉（四者一致、仍在带内）。
+# 这一格正是工单 110 的复现——只 sed 数字串，摘要里「the 26 hours」「1800 seconds」
+# 这类**不带数字串的散文**换不到，于是界动了、散文没动。
+sed 's/93600/95400/g' "${config}" >"${work}/bound-moved.json"
 
 run_gate() {
     local out
@@ -206,6 +231,26 @@ grep -q 'backup_no_recent_success' <<<"${out}" || fail "红的时候没点名是
 if ! out="$(run_gate "${work}/summary-reworded.json" "${values}" "${template}")"; then
     printf '%s\n' "${out}" >&2
     fail "摘要改写了措辞但仍点名那三个操作数，这条门禁红了——判据滑成了逐字比对"
+fi
+
+# 11. 界整体抬到 95400，摘要里的派生数没跟着改：红，并点名哪条规则、对不上的是哪个数。
+#     这一格测的是**第四个前提**：摘要里的派生数（整点小时数、余量秒数）必须与门自己
+#     算出的相等。只 sed 数字串换不到「the 26 hours」「headroom is 1800 seconds」——
+#     它们是从操作数算出来的散文，改 chart 的人搜数字串搜不到，于是界动了、散文没动、
+#     门照样绿。摘要正是告警唯一的散文面，人读的是它。
+if out="$(run_gate "${work}/bound-moved.json" "${values}" "${template}")"; then
+    fail "界抬到 95400 了，摘要还写着「the 26 hours」「headroom is 1800 seconds」，这条门禁还是绿的——散文里的派生数没人核"
+fi
+grep -q 'backup_no_recent_success' <<<"${out}" || fail "红的时候没点名哪条规则的摘要：${out}"
+grep -q '95400' <<<"${out}" || fail "红的时候没印出门算出的界：${out}"
+grep -q 'headroom' <<<"${out}" || fail "红的时候没点名摘要里对不上的那个余量：${out}"
+
+# 12. 负对照：摘要改写措辞、但说的派生数仍是门算出的那两个（26 / 1800），还把被否掉的
+#     48 小时替代方案也写进去 -> 仍绿。判据是「指界的那个数对不对」，不是逐字比对；
+#     而且 48 那个数指的是**别的界**，不该被这条判据卷进来。
+if ! out="$(run_gate "${work}/summary-derived-reworded.json" "${values}" "${template}")"; then
+    printf '%s\n' "${out}" >&2
+    fail "摘要改写了措辞但仍说对数，这条门禁红了——判据滑成了逐字比对，或把 48 小时也当成了本族的界"
 fi
 
 # 自报的格数**从本文件里数出来**，不手写：手写的数会在加了一格之后仍旧印旧值，
