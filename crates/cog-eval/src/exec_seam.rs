@@ -29,8 +29,8 @@ use crate::scaffold::FinishReason;
 ///
 /// [`Budget`]: crate::scaffold::Budget
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ForeignLimits {
-    /// 墙上时钟上限。到点即失败，不算「没做出来」——见 [`ForeignFace`] 那一节。
+pub struct ExecLimits {
+    /// 墙上时钟上限。到点即失败，不算「没做出来」——见 [`ExecSeam`] 那一节。
     pub wall_clock: Duration,
     /// 容器能用的 CPU 核数。
     pub cpus: f32,
@@ -42,19 +42,19 @@ pub struct ForeignLimits {
 ///
 /// 题面与入口都给**文本**而不是路径：外部流派自己怎么读题、怎么落补丁由它定，
 /// 我们只承诺「这段文字是这道题」与「这条命令能起它」。
-pub struct ForeignRequest<'a> {
+pub struct ExecRequest<'a> {
     /// 这一行在表里的名字。进 trace 与判词，不进外部程序（它不该知道自己叫什么）。
     pub flow: &'a str,
     /// 在环境里怎么起这支流派。
     pub entrypoint: &'a str,
     /// 题面：与判分读的**同一份**。外部流派看不到判分器，也看不到答案键。
     pub problem: &'a str,
-    pub limits: ForeignLimits,
+    pub limits: ExecLimits,
 }
 
 /// 外部流派交回来的东西。
 #[derive(Debug, Clone)]
-pub struct ForeignOutcome {
+pub struct ExecOutcome {
     /// 这一步在环境里留下的补丁（unified diff）。判分器怎么用它由基准定。
     pub patch: String,
     /// 它为什么停下。撞上限必须与「自己收工」分开，否则读不出是流派不行还是上限给少了。
@@ -65,25 +65,25 @@ pub struct ForeignOutcome {
 ///
 /// 实现由基准的后端提供（谁拥有那台机器，谁才知道怎么在里面起程序）。本 crate 不造实现。
 #[async_trait]
-pub trait ForeignRunner: Send + Sync {
-    async fn run(&self, req: ForeignRequest<'_>) -> anyhow::Result<ForeignOutcome>;
+pub trait ExecRunner: Send + Sync {
+    async fn run(&self, req: ExecRequest<'_>) -> anyhow::Result<ExecOutcome>;
 }
 
 /// 这个环境对外部流派的态度：能跑，或者**因为一个具体理由**不能跑。
 ///
-/// 不用 `Option<Arc<dyn ForeignRunner>>`：那样「这个基准本来就不托管外部程序」与
+/// 不用 `Option<Arc<dyn ExecRunner>>`：那样「这个基准本来就不托管外部程序」与
 /// 「环境起不来」会压成同一个 `None`，而这两件事一件正常、一件该报警——同
 /// [`NoEnv`] 存在的理由。理由是一句话而不是一个旗标，因为它要能被印进表里那行
 /// `missing`，读的人据此知道该去修哪里。
 ///
 /// [`NoEnv`]: crate::scaffold::NoEnv
-pub enum ForeignFace {
-    Ready(Arc<dyn ForeignRunner>),
+pub enum ExecSeam {
+    Ready(Arc<dyn ExecRunner>),
     /// 装不下外部程序的理由。
     Absent(&'static str),
 }
 
-impl ForeignFace {
+impl ExecSeam {
     /// 能不能跑。判据只看这一位，不看理由里的措辞。
     pub fn is_ready(&self) -> bool {
         matches!(self, Self::Ready(_))

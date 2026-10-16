@@ -1825,7 +1825,7 @@ mod tests {
             name: name.to_string(),
             columns: vec!["swe-bench-pro".to_string()],
             entrypoint: "sweagent solve".to_string(),
-            limits: cog_eval::ForeignLimits {
+            limits: cog_eval::ExecLimits {
                 wall_clock: std::time::Duration::from_secs(900),
                 cpus: 2.0,
                 memory_bytes: 4 * 1024 * 1024 * 1024,

@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use cog_core::{LlmClient, SFError, SFResult, Tool, ToolDefinition, ToolExecutor};
 
 use crate::dataset::EvalCase;
-use crate::foreign::ForeignFace;
+use crate::exec_seam::ExecSeam;
 use crate::metric::StepRecord;
 
 /// 外壳跑完一题交回来的东西。
@@ -97,8 +97,8 @@ pub trait CaseEnv: Send + Sync {
     /// 默认是**带理由的缺席**：一个环境不给这一位，说明的是「这个基准不托管外部程序」，
     /// 不是「外部流派在这道题上得零分」——后者是一个假读数，而它长得像真读数（补丁为空
     /// 就是没做对）。托管得了的后端覆写它，并给出自己那台机器。
-    fn foreign_face(&self) -> ForeignFace {
-        ForeignFace::Absent("this environment hosts no external agent program")
+    fn exec_seam(&self) -> ExecSeam {
+        ExecSeam::Absent("this environment hosts no external agent program")
     }
     /// 回收。判分读过它之后调用；重复调用必须是空操作（一条 case 失败也要回收）。
     async fn teardown(&self);

@@ -24,9 +24,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use cog_core::{SFError, SFResult, ToolExecutor};
 use cog_eval::{
-    parse_test_list, swe_pro_tool_definitions, tools_bound_to, CaseEnv, EvalCase, FinishReason,
-    ForeignFace, ForeignLimits, ForeignOutcome, ForeignRequest, ForeignRunner, SweProBackend,
-    SweProTestReport, ToolFactory,
+    parse_test_list, swe_pro_tool_definitions, tools_bound_to, CaseEnv, EvalCase, ExecLimits,
+    ExecOutcome, ExecRequest, ExecRunner, ExecSeam, FinishReason, SweProBackend, SweProTestReport,
+    ToolFactory,
 };
 
 /// 容器里工作树的根。镜像是「起了就挂着等 exec」的服务形状，代码在 `/app`。
@@ -89,7 +89,7 @@ pub const ENV_FOREIGN_FLOWS: &str = "COGNEVA_EVAL_FOREIGN_FLOWS";
 ///
 /// 不给一个猜来的默认值：外部流派的循环不在我们手里，上限就是这次跑唯一能管的那个旋钮，
 /// 而「上限是多少」是被实验定义的东西，不是这里能替人拍的数。给个默认值，读表的人会以为
-/// 那个数是量出来的——见 `ForeignLimits`。
+/// 那个数是量出来的——见 `ExecLimits`。
 pub const ENV_FOREIGN_WALL_SECS: &str = "COGNEVA_EVAL_FOREIGN_WALL_SECS";
 pub const ENV_FOREIGN_CPUS: &str = "COGNEVA_EVAL_FOREIGN_CPUS";
 pub const ENV_FOREIGN_MEMORY_MB: &str = "COGNEVA_EVAL_FOREIGN_MEMORY_MB";
@@ -121,7 +121,7 @@ pub fn foreign_flows() -> Result<Vec<ForeignFlowSpec>, String> {
 
 /// 读一块声明。纯函数：它读的是**文本**，环境那一步在外面——所以「哪种声明算写坏了」
 /// 能被单测直接钉住，不必去动进程级的环境变量。
-fn parse_flows(raw: &str, limits: ForeignLimits) -> Result<Vec<ForeignFlowSpec>, String> {
+fn parse_flows(raw: &str, limits: ExecLimits) -> Result<Vec<ForeignFlowSpec>, String> {
     let lines: Vec<&str> = raw
         .lines()
         .map(str::trim)
@@ -177,7 +177,7 @@ fn parse_flows(raw: &str, limits: ForeignLimits) -> Result<Vec<ForeignFlowSpec>,
 }
 
 /// 三条上限。缺一条就整条声明不成立，理由要说得出缺的是哪一条。
-fn foreign_limits() -> Result<ForeignLimits, String> {
+fn foreign_limits() -> Result<ExecLimits, String> {
     let number = |key: &str| -> Result<f64, String> {
         std::env::var(key)
             .map_err(|_| {
@@ -201,7 +201,7 @@ fn foreign_limits() -> Result<ForeignLimits, String> {
     let wall = number(ENV_FOREIGN_WALL_SECS)?;
     let cpus = number(ENV_FOREIGN_CPUS)?;
     let memory_mb = number(ENV_FOREIGN_MEMORY_MB)?;
-    Ok(ForeignLimits {
+    Ok(ExecLimits {
         wall_clock: Duration::from_secs(wall as u64),
         cpus: cpus as f32,
         memory_bytes: (memory_mb * 1024.0 * 1024.0) as u64,
@@ -218,7 +218,7 @@ pub struct ForeignFlowSpec {
     /// 它在哪些列上有定义（基准名）。列外的地方这一行**不建格子**，不是零分。
     pub columns: Vec<String>,
     pub entrypoint: String,
-    pub limits: ForeignLimits,
+    pub limits: ExecLimits,
 }
 
 /// 一次容器命令的结局。
@@ -601,10 +601,10 @@ impl CaseEnv for SweProContainerEnv {
         self
     }
 
-    fn foreign_face(&self) -> ForeignFace {
+    fn exec_seam(&self) -> ExecSeam {
         // 外部程序跑的机器就是**这道题的那台容器**，所以缝开在这里而不是组合根：题面依赖的
         // 那棵树、判分要读的现场都在它里面，换一台机器跑出来的补丁不是这道题的补丁。
-        ForeignFace::Ready(Arc::new(ContainerForeignRunner {
+        ExecSeam::Ready(Arc::new(ContainerForeignRunner {
             container: self.container.clone(),
         }))
     }
@@ -710,8 +710,8 @@ struct ContainerForeignRunner {
 }
 
 #[async_trait]
-impl ForeignRunner for ContainerForeignRunner {
-    async fn run(&self, req: ForeignRequest<'_>) -> anyhow::Result<ForeignOutcome> {
+impl ExecRunner for ContainerForeignRunner {
+    async fn run(&self, req: ExecRequest<'_>) -> anyhow::Result<ExecOutcome> {
         // 题面进容器：外部流派怎么读它由它定，我们只承诺「这一段文字是这道题」。
         self.container
             .write_text(FOREIGN_PROBLEM_PATH, req.problem)
@@ -741,7 +741,7 @@ impl ForeignRunner for ContainerForeignRunner {
         }
         // 撞上限也照样读补丁：它可能改了一半，而判分判的是那棵树。空补丁在这里是**真读数**
         // （它什么都没改），与「它根本没起起来」（那是 `Err`）不是一件事。
-        Ok(ForeignOutcome { patch, finish })
+        Ok(ExecOutcome { patch, finish })
     }
 }
 
@@ -749,7 +749,7 @@ impl ForeignRunner for ContainerForeignRunner {
 ///
 /// 上限落在**这一次执行**上而不是容器上：这台容器判分那一步还要用，给容器上一条内存界会把
 /// 判分自己也框住，那是另一个改动。所以用 shell 能设的这几条界，它们只作用在这段里。
-fn foreign_script(entrypoint: &str, limits: ForeignLimits) -> String {
+fn foreign_script(entrypoint: &str, limits: ExecLimits) -> String {
     let wall = limits.wall_clock.as_secs().max(1);
     // `RLIMIT_CPU` 的单位是**核·秒**：给 n 个核、T 秒，最多就是 n·T 个 CPU 秒。这是从那
     // 一对值**导出**的一条界，不是另拍的一个数。
@@ -1122,8 +1122,8 @@ fn pick_delimiter(content: &str) -> String {
 mod tests {
     use super::*;
 
-    fn limits() -> ForeignLimits {
-        ForeignLimits {
+    fn limits() -> ExecLimits {
+        ExecLimits {
             wall_clock: Duration::from_secs(900),
             cpus: 2.0,
             memory_bytes: 4 * 1024 * 1024 * 1024,

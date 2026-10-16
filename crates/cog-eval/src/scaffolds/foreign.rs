@@ -1,6 +1,6 @@
 //! 外部流派那一行：把「在题目的机器上执行一支别人写的 agent 程序」包成主表认的一行。
 //!
-//! 这一行自己不求解任何东西——它把题面交给 [`ForeignRunner`]（由**环境**提供，因为跑的
+//! 这一行自己不求解任何东西——它把题面交给 [`ExecRunner`]（由**环境**提供，因为跑的
 //! 地方就是那道题的那台机器），拿回一个补丁。所以它在本 crate 里是薄的一层，厚的那一层
 //! 在拥有机器的那个后端里。
 //!
@@ -10,7 +10,7 @@
 //!    靠 [`AgentScaffold::applies_to`] 说出来，而不是等到跑起来报错——后者会把「这一列
 //!    本来就没有这一行」记成一次缺陷。
 //! 2. **上限**：循环不在我们手里，步数管不到它，能管的只有时间与这台机器分给它的资源。
-//!    上限由组合根一次给定、所有行共用（见 [`ForeignLimits`]）。
+//!    上限由组合根一次给定、所有行共用（见 [`ExecLimits`]）。
 //!
 //! 环境不能托管外部程序时，这一行**报错**而不是交一个空补丁：空补丁在判分器那里长得
 //! 就是「没做对」，而真相是这支流派根本没被跑起来——两种读数的处置相反。
@@ -20,7 +20,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 
 use crate::dataset::EvalCase;
-use crate::foreign::{ForeignFace, ForeignLimits, ForeignRequest, ForeignRunner};
+use crate::exec_seam::{ExecLimits, ExecRequest, ExecRunner, ExecSeam};
 use crate::metric::StepRecord;
 use crate::scaffold::{AgentOutput, AgentScaffold, SolveContext};
 use crate::scaffolds::task_text;
@@ -34,7 +34,7 @@ pub struct ForeignFlow {
     /// 只有摆镜像的那些人知道。
     entrypoint: String,
     /// 它能跑多久、能用多少资源。四行三列共用一份。
-    limits: ForeignLimits,
+    limits: ExecLimits,
     /// 它在哪些列上有定义（基准名）。空 = 哪一列都没有，那样这一行一个格子也不建，
     /// 是声明写错了而不是跑不动。
     columns: Vec<String>,
@@ -44,7 +44,7 @@ impl ForeignFlow {
     pub fn new(
         name: impl Into<String>,
         entrypoint: impl Into<String>,
-        limits: ForeignLimits,
+        limits: ExecLimits,
         columns: Vec<String>,
     ) -> Self {
         Self {
@@ -70,9 +70,9 @@ impl AgentScaffold for ForeignFlow {
     // 猜来的名字等于给它加工具。并集那一半对它于是是恒等的，它的工具由它的入口点自己备。
 
     async fn solve(&self, case: &EvalCase, ctx: &SolveContext) -> anyhow::Result<AgentOutput> {
-        let runner: std::sync::Arc<dyn ForeignRunner> = match ctx.env.foreign_face() {
-            ForeignFace::Ready(runner) => runner,
-            ForeignFace::Absent(why) => {
+        let runner: std::sync::Arc<dyn ExecRunner> = match ctx.env.exec_seam() {
+            ExecSeam::Ready(runner) => runner,
+            ExecSeam::Absent(why) => {
                 anyhow::bail!("the `{}` row cannot run case {}: {why}", self.name, case.id)
             }
         };
@@ -80,7 +80,7 @@ impl AgentScaffold for ForeignFlow {
         let problem = task_text(case);
         let started = Instant::now();
         let outcome = runner
-            .run(ForeignRequest {
+            .run(ExecRequest {
                 flow: &self.name,
                 entrypoint: &self.entrypoint,
                 problem: &problem,
@@ -131,7 +131,7 @@ mod tests {
     use cog_core::ToolExecutor;
 
     use super::*;
-    use crate::foreign::{ForeignFace, ForeignOutcome};
+    use crate::exec_seam::{ExecOutcome, ExecSeam};
     use crate::scaffold::{Budget, CaseEnv, FinishReason, NoEnv, ToolSet};
 
     /// 一个答应跑什么就回什么的执行面。它记下每一次请求，好让「题面真的到了它手上」可断言。
@@ -154,11 +154,11 @@ mod tests {
     }
 
     #[async_trait]
-    impl ForeignRunner for ScriptedRunner {
-        async fn run(&self, req: ForeignRequest<'_>) -> anyhow::Result<ForeignOutcome> {
+    impl ExecRunner for ScriptedRunner {
+        async fn run(&self, req: ExecRequest<'_>) -> anyhow::Result<ExecOutcome> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.seen.lock().unwrap().push(req.problem.to_string());
-            Ok(ForeignOutcome {
+            Ok(ExecOutcome {
                 patch: self.patch.clone(),
                 finish: self.finish,
             })
@@ -166,7 +166,7 @@ mod tests {
     }
 
     /// 一台肯托管外部程序的环境。
-    struct HostingEnv(Arc<dyn ForeignRunner>);
+    struct HostingEnv(Arc<dyn ExecRunner>);
 
     #[async_trait]
     impl CaseEnv for HostingEnv {
@@ -179,14 +179,14 @@ mod tests {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
-        fn foreign_face(&self) -> ForeignFace {
-            ForeignFace::Ready(self.0.clone())
+        fn exec_seam(&self) -> ExecSeam {
+            ExecSeam::Ready(self.0.clone())
         }
         async fn teardown(&self) {}
     }
 
     impl HostingEnv {
-        fn boxed(runner: Arc<dyn ForeignRunner>) -> Arc<dyn CaseEnv> {
+        fn boxed(runner: Arc<dyn ExecRunner>) -> Arc<dyn CaseEnv> {
             Arc::new(Self(runner))
         }
     }
@@ -204,8 +204,8 @@ mod tests {
         }
     }
 
-    fn limits() -> ForeignLimits {
-        ForeignLimits {
+    fn limits() -> ExecLimits {
+        ExecLimits {
             wall_clock: Duration::from_secs(600),
             cpus: 2.0,
             memory_bytes: 4 * 1024 * 1024 * 1024,
