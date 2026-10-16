@@ -1408,6 +1408,9 @@ mod tests {
         fn executor(&self) -> Option<Arc<dyn cog_core::ToolExecutor>> {
             None
         }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
         async fn teardown(&self) {
             let mut live = self.live.lock().unwrap();
             *live = live.saturating_sub(1);

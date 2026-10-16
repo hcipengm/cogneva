@@ -648,6 +648,12 @@ pub struct Wiring {
     /// 还是**上游配了、传输没建出来**。两件事要读的人做的事不同（配 llm_routing 还是修
     /// http_client），一句「没有上游」把指引抹平，还会把它读成一次配置缺失而不是一次故障。
     pub no_transport: Option<String>,
+    /// `swe_pro` 为 `None` 时的那句原因。
+    ///
+    /// 这一列缺的不是代码了，缺的可能是三样互不相同的东西：这台宿主上没有可用的容器机器、
+    /// 数据根里没有官方那两件脚本、或者这次被显式关了。三样要做的下一步分别是装机器、取脚本、
+    /// 改开关——压成一句「没接上」，读的人会去翻一个翻不出东西的地方。
+    pub swe_pro_reason: Option<String>,
 }
 
 /// 一次跑的结果：要写出去的那段文本，以及这次跑是不是一次完整的实验。
@@ -903,22 +909,29 @@ fn missing_dependencies(
             "no generative judge upstream is configured",
         ));
     }
-    // 这两个是 `NotImplemented` 而不是 `NotWired`：树里没有它们的实现（只有测试替身），
-    // 所以「接上」这一步今天无物可接。写成「没接上」会把读的人送去翻配置，翻不出东西。
+    // 这一条是 `NotWired` 了：树里有实现（`eval_container` 里那个 buildah 后端），缺的只可能
+    // 是「这次没把它接进来」——宿主上没有容器机器、数据根里没有官方脚本、或者被开关关掉了。
+    // 原因由接线那一步写下来，照着念；没有再写上「没接上」这个不含指引的兜底。
     if benchmarks.contains(&"swe-bench-pro") && wiring.swe_pro.is_none() {
         missing.push(Missing::new(
             "swe-bench-pro",
             MissingScope::Column("swe-bench-pro".to_string()),
-            Absence::NotImplemented,
-            "no container backend is implemented in this build, so there is nothing to wire",
+            Absence::NotWired,
+            wiring
+                .swe_pro_reason
+                .clone()
+                .unwrap_or_else(|| "the container backend is not wired into this run".to_string()),
         ));
     }
+    // 这一条仍然是 `NotImplemented`：compose 后端树里没有实现（只有测试替身），所以「接上」
+    // 这一步今天无物可接。写成「没接上」会把读的人送去翻配置，翻不出东西。
     if benchmarks.contains(&"toolathlon") && wiring.toolathlon.is_none() {
         missing.push(Missing::new(
             "toolathlon",
             MissingScope::Column("toolathlon".to_string()),
             Absence::NotImplemented,
-            "no compose backend is implemented in this build, so there is nothing to wire",
+            "no compose backend is implemented in this build, so there is nothing to wire; this \
+             host has no compose runtime and the pack image has never been built",
         ));
     }
     if scaffolds.contains(&"nql") && wiring.platform.is_none() {
@@ -936,10 +949,7 @@ fn missing_dependencies(
 }
 
 pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Result<Outcome> {
-    let data_root = match &args.data_root {
-        Some(root) => root.clone(),
-        None => RunConfig::from_env()?.data_root,
-    };
+    let data_root = resolve_data_root(args)?;
     if !data_root.is_dir() {
         bail!("the data root {} is not a directory", data_root.display());
     }
@@ -1106,29 +1116,46 @@ pub(crate) fn build_benchmark(
     wiring: &Wiring,
     tools: ToolArm,
 ) -> Result<Benchmark> {
-    // 工具臂在这一处收口：`None` 是诊断臂；有工具臂（主表那一臂）要一整套工具实现，而
-    // 今天组合根没有。少给几个工具会让这一格因为「工具面不同」得分——那是在量别的东西，
-    // 所以宁可不跑。要现在就跑，只能显式选诊断臂。
-    if tools == ToolArm::Platform {
+    // 工具臂在这一处收口：`None` 是诊断臂。有工具臂（主表那一臂）要一整套工具实现，而组合根
+    // 今天只接得上 swe-bench-pro 那一束（bash/file_edit 落在这道题自己的容器里）；HLE 点名的
+    // web_search/python 与 toolathlon 点名的那些 MCP server 都还没有实现。
+    //
+    // 少给几个工具会让这一格因为「工具面不同」得分——那是在量别的东西，所以宁可不跑：一个
+    // 基准只要**有一件**工具没有实现，就整个不收工具臂，而不是拿半束工具顶上去。
+    let with_tools = tools == ToolArm::Platform;
+    if with_tools && !has_tool_implementations(name) {
         bail!(
-            "--tools platform (the default): the with-tools arm needs implementations for the \
-             tools each benchmark pins (web_search/python, bash/file_edit, the MCP servers), and \
-             the composition root has none. Running the tools-off arm instead would score every \
-             case on a different tool face; pass `--tools none` explicitly if all you want is a \
+            "--tools platform (the default): `{name}` pins tools the composition root has no \
+             implementation for, and running it with a smaller tool face would score a different \
+             thing. Today only swe-bench-pro's face (bash/file_edit, bound to the instance's own \
+             container) is implemented; pass `--tools none` explicitly if all you want is a \
              diagnostic run."
         );
     }
     Ok(match name {
         "hle" => hle_benchmark(judge, HleToolkit::without_tools()),
-        "swe-bench-pro" => {
-            swe_pro_benchmark(wiring.swe_pro.clone(), SweProToolkit::without_tools())
-        }
+        "swe-bench-pro" => swe_pro_benchmark(
+            wiring.swe_pro.clone(),
+            if with_tools {
+                SweProToolkit::with_factory(crate::eval_container::swe_pro_container_tools())
+            } else {
+                SweProToolkit::without_tools()
+            },
+        ),
         "toolathlon" => toolathlon_benchmark(
             wiring.toolathlon.clone(),
             ToolathlonToolkit::without_tools(),
         ),
         other => bail!("unknown benchmark `{other}`"),
     })
+}
+
+/// 这个基准点名的工具，组合根今天有没有实现。
+///
+/// 与 [`build_benchmark`] 分开，是为了让「哪一列收工具臂」是一条**读得出来的**判据，而不是
+/// 埋在 match 分支里的一个 if：加一列的工具实现时，改的是这里一处。
+fn has_tool_implementations(name: &str) -> bool {
+    matches!(name, "swe-bench-pro")
 }
 
 /// 报表里 `## wiring` 那一段要的两样东西：说不出话的依赖（缺席），以及接上了的那个平台
@@ -1531,6 +1558,21 @@ async fn wiring_from_config(args: &EvalTableArgs) -> Wiring {
         wiring.platform = Some(Arc::new(runner));
         wiring.platform_base = Some(base);
     }
+    // 容器后端与上游是**两条互不相干**的依赖：诊断臂（关掉工具的那一次跑）一样要起容器、
+    // 一样要跑判分，所以这一段必须排在下面任何一条骨干的早退**之前**——排到后面去，一次没有
+    // 上游的跑就会连「这一列的容器接没接上」都读不出来。
+    match resolve_data_root(args) {
+        Ok(root) => match crate::eval_container::swe_pro_container_backend(&root).await {
+            Ok(backend) => wiring.swe_pro = Some(backend),
+            Err(why) => wiring.swe_pro_reason = Some(why),
+        },
+        Err(e) => {
+            wiring.swe_pro_reason = Some(format!(
+                "the data root could not be resolved, so this instance's run scripts cannot be \
+                 located: {e}"
+            ))
+        }
+    }
     let routing = match cog_llm::LLMRoutingConfig::load() {
         Ok(routing) => routing,
         Err(e) => {
@@ -1589,6 +1631,18 @@ async fn wiring_from_config(args: &EvalTableArgs) -> Wiring {
         Err(e) => tracing::warn!("no backbone provider could be built: {e}"),
     }
     wiring
+}
+
+/// 这一次跑的数据根在哪。
+///
+/// 接线那一步也要它（每题的官方判分脚本按这个根去磁盘上找），所以只留这一处口径：
+/// 命令行给了就用命令行那个，没给才回落到环境里那个。两处各写一遍，会出现「表读的是这儿、
+/// 脚本找的是那儿」这种只有跑完才发现的错位。
+fn resolve_data_root(args: &EvalTableArgs) -> Result<std::path::PathBuf> {
+    match &args.data_root {
+        Some(root) => Ok(root.clone()),
+        None => Ok(RunConfig::from_env()?.data_root),
+    }
 }
 
 /// 子命令主入口。
@@ -2513,8 +2567,8 @@ mod tests {
             Missing::new(
                 "swe-bench-pro",
                 MissingScope::Column("swe-bench-pro".into()),
-                Absence::NotImplemented,
-                "no container backend is implemented in this build, so there is nothing to wire",
+                Absence::NotWired,
+                "no container machine is usable on this host",
             ),
             Missing::new(
                 "nql",
@@ -2596,9 +2650,12 @@ mod tests {
 
     /// `## wiring` 那一行要说清**管到哪**与**哪一类**。
     ///
-    /// 只有「缺 X」时，读的人看不出照着做的那一步是写代码还是改配置（`swe-bench-pro`
-    /// 今天树里根本没有容器后端，不是少配一段），也看不出 `## per seed` 里那些 `errored`
-    /// 算不算缺陷。
+    /// 只有「缺 X」时，读的人看不出照着做的那一步是写代码还是改配置，也看不出 `## per seed`
+    /// 里那些 `errored` 算不算缺陷。
+    ///
+    /// 两类缺席各钉一次，而且钉的是**各自那个类**：`toolathlon` 树里没有 compose 后端，所以
+    /// 是 `not-implemented`；`swe-bench-pro` 树里有容器后端，缺席只可能是没接进来，所以是
+    /// `not-wired`。把后者的类别写成前者，读的人会去做一件已经做完的事。
     #[test]
     fn a_wiring_line_says_what_it_covers_and_what_kind_of_absence_it_is() {
         let mut raw = minimal();
@@ -2608,7 +2665,7 @@ mod tests {
         let args = EvalTableArgs::parse(&raw).unwrap();
         let declared = missing_dependencies(
             ToolArm::Platform,
-            &["hle", "swe-bench-pro"],
+            &["hle", "swe-bench-pro", "toolathlon"],
             &["nql"],
             &Wiring::default(),
         );
@@ -2629,7 +2686,8 @@ mod tests {
             },
         );
         for expected in [
-            "missing\tswe-bench-pro\tcolumn:swe-bench-pro\tnot-implemented\t",
+            "missing\tswe-bench-pro\tcolumn:swe-bench-pro\tnot-wired\t",
+            "missing\ttoolathlon\tcolumn:toolathlon\tnot-implemented\t",
             "missing\tnql\trow:nql\tnot-wired\t",
             "missing\tbackbone\tevery-cell\tnot-wired\t",
             "missing\tjudge\tevery-cell\tnot-wired\t",
@@ -2644,5 +2702,39 @@ mod tests {
             .expect("平台这一行在这里是缺席的")
             .as_line();
         assert_eq!(nql, "nql: no platform is wired");
+    }
+
+    /// 容器后端没接上时，那条声明要把**接线的原因**念出来。
+    ///
+    /// 这一列缺的可能是三样互不相同的东西（这台宿主上没有容器机器 / 数据根里没有官方脚本 /
+    /// 这次被开关关了），下一步分别是装机器、取脚本、改开关。原因没传下来时印的那句兜底必须
+    /// 仍然说得出「是接线这一步的事」——写成「树里没有实现」，读的人会去做一件已经做完的事。
+    #[test]
+    fn an_unwired_container_backend_reports_why_it_was_not_wired() {
+        let why = "no container machine is usable on this host: …";
+        let with_reason = Wiring {
+            swe_pro_reason: Some(why.into()),
+            ..Default::default()
+        };
+        let line = |wiring: &Wiring| {
+            missing_dependencies(ToolArm::Platform, &["swe-bench-pro"], &[], wiring)
+                .iter()
+                .find(|m| m.subject == "swe-bench-pro")
+                .expect("这一列在这里是缺席的")
+                .wiring_line()
+        };
+        assert_eq!(
+            line(&with_reason),
+            format!("missing\tswe-bench-pro\tcolumn:swe-bench-pro\tnot-wired\t{why}")
+        );
+        let fallback = line(&Wiring::default());
+        assert!(
+            fallback.ends_with("not-wired\tthe container backend is not wired into this run"),
+            "{fallback}"
+        );
+        assert!(
+            !fallback.contains("no container backend is implemented"),
+            "缺席的类别已经变了，这句会把人送去写一个已经写好的后端：{fallback}"
+        );
     }
 }

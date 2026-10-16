@@ -42,7 +42,7 @@ die() { echo "error: $*" >&2; exit 1; }
 
 usage() {
   cat <<'EOF'
-usage: fetch-benchmark-data.sh [--benchmark <swe-bench-pro|toolathlon-gym|hle|all>]
+usage: fetch-benchmark-data.sh [--benchmark <swe-bench-pro|swe-bench-pro-os|toolathlon-gym|hle|all>]
                                [--dest <dir>] [--endpoint <url>] [--convert]
                                [--verify] [--print-files] [--print-pins]
 
@@ -61,9 +61,10 @@ usage: fetch-benchmark-data.sh [--benchmark <swe-bench-pro|toolathlon-gym|hle|al
   -h, --help   this text
 
 benchmarks and their pins:
-  swe-bench-pro    ModelScope dataset ScaleAI/SWE-bench_Pro, public test split (731 rows)
-  toolathlon-gym   GitHub eigent-ai/toolathlon_gym, 503 tasks, fetched as a tarball
-  hle              ModelScope dataset cais/hle, the full split (one parquet)
+  swe-bench-pro     ModelScope dataset ScaleAI/SWE-bench_Pro, public test split (731 rows)
+  swe-bench-pro-os  GitHub scaleapi/SWE-bench_Pro-os, the run scripts swe-bench-pro is scored by
+  toolathlon-gym    GitHub eigent-ai/toolathlon_gym, 503 tasks, fetched as a tarball
+  hle               ModelScope dataset cais/hle, the full split (one parquet)
 EOF
 }
 
@@ -74,6 +75,9 @@ EOF
 #   a_*  artifacts fetched from the mirror (.part + hash checked before install)
 #   d_*  artifacts derived locally from another artifact (only built under --convert)
 #   m_*  files checked inside an extracted tarball, a spot check that extraction happened
+#   r_*  directories a reader walks. A directory has no hash of its own, so what pins it is
+#        the archive record above plus these member checks; saying which directories those
+#        are here is what keeps a reader from having to guess it from `extract_dir`.
 catalog() {
   source=""
   repo=""
@@ -82,6 +86,7 @@ catalog() {
   a_dest=(); a_src=(); a_sha=(); a_size=()
   d_dest=(); d_src=(); d_sha=(); d_size=()
   m_path=(); m_sha=(); m_size=()
+  r_dir=()
 
   case "$1" in
     swe-bench-pro)
@@ -101,6 +106,31 @@ catalog() {
       d_sha=("a1a67075e95009f25709b64792df2fcebef59884473f83c792e25886bd07e1bd")
       d_size=("24882378")
       ;;
+    swe-bench-pro-os)
+      # How a v1 instance's tests are run and how their output is read: one directory per
+      # instance under run_scripts/, holding run_script.sh, parser.py and the row's before/
+      # selected-test bookkeeping. The dataset above says which tests must pass; this says
+      # how to find out, and nothing here reimplements either. Kept as its own provisionable
+      # entry rather than folded into swe-bench-pro because it is a different repository at a
+      # different revision, and one pin per benchmark cannot name two sources at once.
+      source="github-tarball"
+      repo="scaleapi/SWE-bench_Pro-os"
+      revision="66f92766bba642462d4bbe5479e83f91f9211862"
+      extract_dir="swe-bench-pro-os"
+      a_dest=("swe-bench-pro-os.tar.gz")
+      a_src=("$revision")
+      a_sha=("a459a929729c95d15cb7b4c5c599d36ea4e9a067bedc9d018cee6032b577e6cc")
+      a_size=("16271243")
+      # One instance's two scripts, hashed after extraction. Which instance does not matter:
+      # the archive hash above pins all of them, and these check that extraction produced a
+      # tree rather than an empty directory.
+      m_path=("run_scripts/instance_NodeBB__NodeBB-04998908ba6721d64eba79ae3b65a351dcfbc5b5-vnan/run_script.sh" \
+              "run_scripts/instance_NodeBB__NodeBB-04998908ba6721d64eba79ae3b65a351dcfbc5b5-vnan/parser.py")
+      m_sha=("335f9bfcfcf5e3d7d36d9590e51b7b59290f391d4c44350649f5134e1bdcac90" \
+             "6a3732209126dc9b86c9a1af48b4adc869ca8b914c4d9c46a8ed32054c5859c2")
+      m_size=("2662" "4528")
+      r_dir=("swe-bench-pro-os/run_scripts")
+      ;;
     toolathlon-gym)
       source="github-tarball"
       repo="eigent-ai/toolathlon_gym"
@@ -118,6 +148,7 @@ catalog() {
       m_sha=("9d48204b20dd0b474d2766e40ce2d53f0d68a5d69706709cdbbacc33d8fd8511" \
              "59beee37084adb84f84d1462a5d05f451c2dc5a5b4a5f95fa278a847949087e7")
       m_size=("8236215" "1392")
+      r_dir=("toolathlon-gym/tasks/finalpool")
       ;;
     hle)
       source="modelscope-dataset"
@@ -139,7 +170,7 @@ catalog() {
       d_sha=("8efbca01f176a40d4aa6139c4b99794da2cb7f797a818af2f2ddd84916d9519d")
       d_size=("122979896")
       ;;
-    *) die "unknown --benchmark: $1 (available: swe-bench-pro, toolathlon-gym, hle)" ;;
+    *) die "unknown --benchmark: $1 (available: swe-bench-pro, swe-bench-pro-os, toolathlon-gym, hle)" ;;
   esac
 }
 
@@ -173,9 +204,9 @@ while [ $# -gt 0 ]; do
 done
 
 case "$benchmark" in
-  all) benchmarks=("swe-bench-pro" "toolathlon-gym" "hle") ;;
-  swe-bench-pro | toolathlon-gym | hle) benchmarks=("$benchmark") ;;
-  *) die "unknown --benchmark: $benchmark (available: swe-bench-pro, toolathlon-gym, hle, all)" ;;
+  all) benchmarks=("swe-bench-pro" "swe-bench-pro-os" "toolathlon-gym" "hle") ;;
+  swe-bench-pro | swe-bench-pro-os | toolathlon-gym | hle) benchmarks=("$benchmark") ;;
+  *) die "unknown --benchmark: $benchmark (available: swe-bench-pro, swe-bench-pro-os, toolathlon-gym, hle, all)" ;;
 esac
 
 if [ -n "$print_files" ]; then
@@ -184,6 +215,7 @@ if [ -n "$print_files" ]; then
     printf '%s\n' "${a_dest[@]}"
     if [ -n "$extract_dir" ]; then printf '%s\n' "${m_path[@]/#/$extract_dir/}"; fi
     if [ -n "$convert" ]; then printf '%s\n' "${d_dest[@]}"; fi
+    if [ -n "${r_dir[*]:-}" ]; then printf '%s\n' "${r_dir[@]}"; fi
   done
   exit 0
 fi
@@ -214,12 +246,12 @@ print_pins_and_exit() {
       pin_record read-file "$b" "$revision" "${d_dest[$i]}" "${d_sha[$i]}" "${d_size[$i]}" \
         "derived by --convert"
     done
-    if [ -n "$extract_dir" ]; then
+    for i in "${!r_dir[@]}"; do
       # The path is the archive's own layout (the top-level directory is stripped on
       # extraction); no hash names a directory, so the archive's record above is the pin.
-      pin_record read-dir "$b" "$revision" "${extract_dir}/tasks/finalpool" - - \
+      pin_record read-dir "$b" "$revision" "${r_dir[$i]}" - - \
         "unpacked from the source archive; a directory has no hash"
-    fi
+    done
   done
   exit 0
 }

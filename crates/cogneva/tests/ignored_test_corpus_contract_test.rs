@@ -73,6 +73,18 @@ const UNNAMED: &[(&str, &str)] = &[
          an answer where a weight directory exists. It is a manual reading \
          against a materialised model, not a step.",
     ),
+    (
+        "crates/cogneva/tests/swe_pro_container.rs",
+        "These two ask whether the container backend can actually be run, and \
+         each needs three things a CI runner does not have: a host with a \
+         container engine on it, the ~1 GB per-instance image pulled from the \
+         registry, and an `npm install` inside that container -- about three \
+         minutes of run per case once the image is local. What they pin is a \
+         measurement of one instance rather than a regression guard, so they \
+         are a manual reading taken where a container machine exists: `cargo \
+         test -p cogneva --test swe_pro_container -- --ignored --nocapture \
+         --test-threads=1`.",
+    ),
 ];
 
 /// What a step selects, as far as naming tests goes.

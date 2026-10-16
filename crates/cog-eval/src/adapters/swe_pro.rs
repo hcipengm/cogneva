@@ -14,7 +14,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use cog_core::Tool;
+use cog_core::{Tool, ToolDefinition};
 use serde::Deserialize;
 
 use crate::bench::{CaseJudge, CaseSource, EnvProvider, ToolFactory, Toolkit, Verdict};
@@ -344,6 +344,58 @@ impl SweProToolkit {
     pub fn without_tools() -> Self {
         Self { factory: None }
     }
+}
+
+/// SWE-bench Pro 工具面的定义：给模型看的规格，恰好这两件。
+///
+/// 协议是**基准的**（名字、件数、参数形状），所以规格与名字放在同一侧；命令要落进哪台容器
+/// 是组合根的事，规格里不出现任何执行方式。参数形状按公开的 code agent 配置逐类比照。
+pub fn swe_pro_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: SWE_PRO_TOOL_BASH.to_string(),
+            description:
+                "Run a shell command in this instance's repository and return its stdout, \
+                          stderr and exit code. The working directory is the repository root."
+                    .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to run."
+                    }
+                },
+                "required": ["command"]
+            }),
+        },
+        ToolDefinition {
+            name: SWE_PRO_TOOL_FILE_EDIT.to_string(),
+            description:
+                "Replace an exact string in a file of this instance's repository. Reports \
+                          an error when the string is absent or occurs more than once, so a caller \
+                          cannot silently edit the wrong occurrence."
+                    .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path, absolute or relative to the repository root."
+                    },
+                    "old_string": {
+                        "type": "string",
+                        "description": "The exact text to replace."
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "The text to put in its place."
+                    }
+                },
+                "required": ["path", "old_string", "new_string"]
+            }),
+        },
+    ]
 }
 
 /// SWE-bench Pro 的工具面**恰好**是这两件。每次造出来的清单都要过这一关：工厂能按题变，

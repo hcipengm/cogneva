@@ -206,6 +206,9 @@ mod tests {
         fn executor(&self) -> Option<Arc<dyn cog_core::ToolExecutor>> {
             self.executor.clone()
         }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
         async fn teardown(&self) {}
     }
 

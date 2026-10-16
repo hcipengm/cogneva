@@ -76,6 +76,12 @@ pub trait CaseEnv: Send + Sync {
     fn id(&self) -> &str;
     /// 环境给的执行面。无环境基准返回 `None`。
     fn executor(&self) -> Option<Arc<dyn ToolExecutor>>;
+    /// 收回这个环境**本来的**那一个类型。
+    ///
+    /// 基准的后端起完环境、判分那一步又拿到同一个 `Arc<dyn CaseEnv>`：它要读的（容器句柄、
+    /// compose 工程名）在具体类型上，不在这个接口上。拿不到就报错——**不许**顺手换一个执行面
+    /// 顶上，那等于对着一个不相干的环境判这道题。实现一律是 `self`。
+    fn as_any(&self) -> &dyn std::any::Any;
     /// 回收。判分读过它之后调用；重复调用必须是空操作（一条 case 失败也要回收）。
     async fn teardown(&self);
 }
@@ -93,6 +99,9 @@ impl CaseEnv for NoEnv {
     }
     fn executor(&self) -> Option<Arc<dyn ToolExecutor>> {
         None
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
     async fn teardown(&self) {}
 }
