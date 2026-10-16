@@ -16,6 +16,7 @@
 //! 这一层只做**接线**：起容器、按官方口径跑官方脚本、把「哪些测试过了」读回来。判分规则、
 //! 工具面的名字与规格、数据格式都在 `cog-eval` 那一侧——在这一侧重写一份就是另起一份正本。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -237,6 +238,10 @@ pub struct BuildahRuntime {
     prefix: Vec<String>,
     mirror: Option<String>,
     timeout: Duration,
+    /// 这台宿主的 store 里现在有哪些镜像 ref。**问一次，整跑记着**：这是一条普查读数，
+    /// 每道题各问一遍等于把一次便宜的问摊成题数那么多次。`None` ＝ 问不出来（命令失败或
+    /// 这份 buildah 不认 `images`），这时调用方不许把「问不出来」当成「本地没有」。
+    images: tokio::sync::OnceCell<Option<HashSet<String>>>,
 }
 
 impl BuildahRuntime {
@@ -280,6 +285,7 @@ impl BuildahRuntime {
                     prefix,
                     mirror,
                     timeout,
+                    images: tokio::sync::OnceCell::new(),
                 }));
             }
         }
@@ -290,6 +296,33 @@ impl BuildahRuntime {
     fn image_ref(&self, instance_id: &str) -> String {
         let host = self.mirror.as_deref().unwrap_or(IMAGE_HOST);
         format!("{host}/{IMAGE_REPO}:{instance_id}")
+    }
+
+    /// 本地 store 里现在有哪些镜像 ref（问一次，整跑缓存）。
+    ///
+    /// 存在的理由是一条**要分开的两件事**：`buildah from <ref>` 在镜像不在本地时会顺手去拉，
+    /// 而「拉」与「跑」共用一个时间界，界到点报出来的是一句「命令没跑完」——读的人从这句里
+    /// 分不出缺的是一份镜像、还是这台机器坏了。实测（2026-10-17，本机）：宿主默认路由换到了
+    /// WiFi，实测吞吐 150–220 KB/s，一题 2.26 GB 的镜像在 900 秒的界里拉不完，整整一跑报回来
+    /// 的却是 `sudo -n buildah from did not finish within 900s`。
+    async fn image_refs(&self) -> Option<&HashSet<String>> {
+        self.images
+            .get_or_init(|| async {
+                let out = self
+                    .exec(&[
+                        "images".into(),
+                        "--format".into(),
+                        "{{.Name}}:{{.Tag}}".into(),
+                    ])
+                    .await
+                    .ok()?;
+                if out.code != Some(0) {
+                    return None;
+                }
+                Some(parse_image_refs(&out.stdout))
+            })
+            .await
+            .as_ref()
     }
 
     fn command(&self) -> tokio::process::Command {
@@ -350,6 +383,24 @@ async fn probe(prefix: &[String]) -> bool {
         }
         _ => false,
     }
+}
+
+/// `buildah images --format '{{.Name}}:{{.Tag}}'` 的正文 → 一份 ref 集合。
+///
+/// 单独成一个不吃运行时的函数，是因为这里有一处**会静默读错**的形状：buildah 对没有 tag 的
+/// （以及中间层）镜像把 `Name` 或 `Tag` 打成字面量 `<none>`，于是输出里会有
+/// `<none>:<none>` 这样的行。把它们当成 ref 收进来，集合里就多出几个永远匹配不上的名字，
+/// 而「镜像在不在本地」这条判据只会在该说「不在」的时候说对——多出来的那些名字**永远不会**
+/// 被问到，所以这份错在读数是看不出来的：它只会让集合大一点。
+fn parse_image_refs(stdout: &str) -> HashSet<String> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        // `<none>` 不是 ref，是「这里没有名字」这个读数的打印形状。尾部那个 tag 也是。
+        .filter(|line| *line != "<none>:<none>" && !line.ends_with(":<none>"))
+        .map(str::to_string)
+        .collect()
 }
 
 /// 这台机器上的一台工作容器。
@@ -893,7 +944,32 @@ impl SweProBackend for SweProContainerBackend {
 
         let image = self.runtime.image_ref(instance);
         let name = format!("cog-{}", case.id);
-        let container = Arc::new(Container::create(self.runtime.clone(), &image, &name).await?);
+        // 起容器之前先读一次「这份镜像在不在本地」。**行为一个字不改**——`buildah from` 仍会
+        // 在缺镜像时顺手去拉——改的只是它失败时那句话说得清缺的是哪一样：与「这台机器坏了」
+        // 共用一句「命令没跑完」时，读的人会被送去查 buildah，而真正缺的是一份没取下来的镜像。
+        let refs = self.runtime.image_refs().await;
+        let present = refs.map(|set| set.contains(&image));
+        if present == Some(false) {
+            tracing::warn!(
+                image = %image,
+                local_refs = refs.map(|set| set.len()).unwrap_or(0),
+                "this instance's image is not in the host's container store; starting a container \
+                 from it means fetching it first"
+            );
+        }
+        let container = match Container::create(self.runtime.clone(), &image, &name).await {
+            Ok(container) => Arc::new(container),
+            // 只有「查过、且不在」时才改判词。查不出来（`None`）时原样往上抛——把「问不出来」
+            // 说成「本地没有」是拿一个没量到的读数当量到了。
+            Err(e) if present == Some(false) => anyhow::bail!(
+                "the instance image {image} is not in this host's container store ({} refs are), \
+                 and starting a container from it did not finish: this is the fetch, not the case \
+                 failing to run. Fetch it once (`buildah pull {image}`) and the case can run; the \
+                 underlying failure was: {e}",
+                refs.map(|set| set.len()).unwrap_or(0)
+            ),
+            Err(e) => return Err(e),
+        };
 
         // 起完容器之后任一步失败都要回收：留着它既占盘（一份题镜像近 1 GB），又会让下一次
         // 同名起容器失败。
@@ -1121,6 +1197,76 @@ fn pick_delimiter(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 收进来的必须是**能匹配上的 ref**。实测里那份 `buildah images` 的输出长这样：
+    /// 有 tag 的题镜像、有 tag 的普通镜像，加上没有名字的中间层（`<none>:<none>`）。
+    /// 中间层被收进来时集合会大几个，而这条判据**照样绿**——所以这一格的见证要反过来：
+    /// 断言那些 `<none>` **不在**结果里，而不是断言总数。
+    #[test]
+    fn the_image_census_keeps_refs_and_drops_the_unnamed() {
+        let stdout = "\
+docker.io/library/ubuntu:24.04
+ghcr.nju.edu.cn/scaleapi/swe-bench_pro-v2:instance_NodeBB__NodeBB-04998908ba6721d64eba79ae3b65a351dcfbc5b5-vnan
+<none>:<none>
+docker.m.daocloud.io/library/busybox:1.36
+<none>:<none>
+
+";
+        let refs = parse_image_refs(stdout);
+        assert_eq!(refs.len(), 3, "got {refs:?}");
+        assert!(refs.contains(
+            "ghcr.nju.edu.cn/scaleapi/swe-bench_pro-v2:\
+             instance_NodeBB__NodeBB-04998908ba6721d64eba79ae3b65a351dcfbc5b5-vnan"
+        ));
+        assert!(!refs.contains("<none>:<none>"));
+        // 空输出是「这台机器上什么镜像都没有」，不是「问不出来」——两者由调用方分开表示
+        // （`Some(empty)` 与 `None`），所以这里必须是空集合而不是别的。
+        assert!(parse_image_refs("").is_empty());
+    }
+
+    /// 我们拿去查的那个 ref，必须与普查印出来的**逐字节同形**。
+    ///
+    /// 这是这一层唯一会**静默**读错的地方：形状一旦分家（换过镜像站、`Name` 打出来带上了
+    /// 默认 registry 前缀、或者题号里的斜杠被规范化过），普查里就一条都匹配不上 ⇒ 每一道题
+    /// 都被判成「镜像不在本地」，而那是一句**假读数**——镜像明明在。这条判据不看条数，
+    /// 看的是「同一个名字在两个方向上相等」。
+    #[test]
+    fn the_ref_we_look_up_is_the_ref_the_census_prints() {
+        let runtime = runtime_pointing_at(Some("ghcr.nju.edu.cn"));
+        let upstream = runtime_pointing_at(None);
+        let instance = "instance_NodeBB__NodeBB-04998908ba6721d64eba79ae3b65a351dcfbc5b5-vnan";
+
+        let wanted = runtime.image_ref(instance);
+        assert_eq!(
+            wanted,
+            format!("ghcr.nju.edu.cn/{IMAGE_REPO}:{instance}"),
+            "the ref carries the instance id as its tag"
+        );
+        // 镜像站没设时落回上游那一个：两者是同一段代码的两个分支，都要能对上。
+        assert_eq!(
+            upstream.image_ref(instance),
+            format!("{IMAGE_HOST}/{IMAGE_REPO}:{instance}")
+        );
+
+        let printed = format!("docker.io/library/ubuntu:24.04\n{wanted}\n<none>:<none>\n");
+        let refs = parse_image_refs(&printed);
+        assert!(
+            refs.contains(&wanted),
+            "the census prints the very name we look up; got {refs:?}"
+        );
+        // 反面：换过镜像站之后，同一个 store 里的那份镜像就**不该**再被认成在本地——它是
+        // 另一个 ref 底下的东西。少了这一句，上面那条断言在「怎么都算命中」的实现下也绿。
+        assert!(!refs.contains(&upstream.image_ref(instance)));
+    }
+
+    fn runtime_pointing_at(mirror: Option<&str>) -> BuildahRuntime {
+        BuildahRuntime {
+            prefix: vec!["sudo".into(), "-n".into(), "buildah".into()],
+            mirror: mirror.map(str::to_string),
+            timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            images: tokio::sync::OnceCell::new(),
+        }
+    }
 
     fn limits() -> ExecLimits {
         ExecLimits {
