@@ -57,6 +57,7 @@ crates/bootstrap/src/main.rs	single-axis	main
 crates/cog-core/src/contract/reflection.rs	single-axis	ReflectionEngine
 crates/cog-agent/src/agent_kernel/runtime.rs	single-axis	AgentRuntime
 crates/cog-orchestrator/src/change_ledger.rs	single-axis	spawn_change_ledger_loop
+crates/cog-core/src/contract/change_ledger.rs	single-axis	ChangeLedgerStore
 crates/cog-gateway/src/lib.rs	single-axis	GatewayState
 crates/cog-collaboration/src/squad/ralph/ralph_loop.rs	single-axis	RalphLoop
 crates/cog-orchestrator/src/action_planner/action_plan_orchestrator.rs	single-axis	ActionPlanOrchestrator

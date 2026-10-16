@@ -51,8 +51,10 @@ const CENSUS_FILE: &str = "debt/file-size-census.tsv";
 ///
 /// 50 KiB is the threshold the ruling counted against, not a bound anyone derived. It is a
 /// screening line: the point is to have looked at every file a size rule would plausibly
-/// name, and the smallest file here is 52,428 bytes — so the population is not an artefact
-/// of the line, and a file just under it is not obviously a different kind of file.
+/// name. The smallest file here is 51,223 bytes, 23 above the line — so the line is a
+/// screen and not a bound: a file just under it is not obviously a different kind of file,
+/// and the next crossing is expected to arrive as a row to judge rather than as a debate
+/// about bytes.
 const THRESHOLD_BYTES: u64 = 50 * 1024;
 
 /// The closed set of verdicts.
