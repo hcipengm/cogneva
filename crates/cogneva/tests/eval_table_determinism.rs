@@ -17,6 +17,7 @@ use cog_core::{
 };
 use cog_eval::scaffolds::nql::PlatformReply;
 use cog_eval::scaffolds::{PlatformRequest, PlatformRunner};
+use cogneva::eval_platform::PLATFORM_BASE_ENV;
 use cogneva::eval_table::{run_table, EvalTableArgs, Pins, Wiring};
 
 /// 每次都交回同一句话的骨干替身。
@@ -363,18 +364,21 @@ async fn a_missing_platform_is_an_error_not_a_zero_score() {
         out.text
     );
     assert!(
-        out.text
-            .contains("missing\tnql\trow:nql\tnot-wired\tno platform is wired"),
+        out.text.contains(&format!(
+            "missing\tnql\trow:nql\tnot-wired\t{PLATFORM_BASE_ENV} is unset in this run's environment"
+        )),
         "管到哪与哪一类都要写出来：{}",
         out.text
     );
     assert!(
-        out.missing.iter().any(|m| m.contains("platform")),
-        "{:?}",
+        out.missing.iter().any(|m| m.contains(PLATFORM_BASE_ENV)),
+        "人读那一份要点名缺的是哪个值：{:?}",
         out.missing
     );
+    // 判词要留下缺席的原因，而不是「没接上」这句不含指引的兜底：这一行缺的是**这一次跑的
+    // 环境里一个值**，不点名那个变量，读的人会去翻组合根——那里三处都在，翻不出东西来。
     assert!(
-        out.text.contains("no platform is wired"),
+        out.text.contains(PLATFORM_BASE_ENV),
         "判词要留下缺席的原因：{}",
         out.text
     );

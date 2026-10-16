@@ -27,7 +27,9 @@ use cog_eval::scaffolds::{table_scaffolds, ForeignFlow, PlatformRunner};
 use cog_eval::{Benchmark, CaseSubset, Checkpoint, Rig, RunConfig, Table};
 use sha2::Digest;
 
-use crate::eval_platform::{BridgeSettings, NoBackbone, NoPlatform, PlatformApiRunner};
+use crate::eval_platform::{
+    BridgeSettings, NoBackbone, NoPlatform, PlatformApiRunner, PLATFORM_BASE_ENV,
+};
 
 /// 基准的规范顺序，也就是表里列的顺序。
 ///
@@ -908,6 +910,21 @@ fn error_split(table: &Table, declared: &[Missing]) -> (usize, usize) {
     (errored, blocked)
 }
 
+/// 平台缺席的那一句原因。**两处渲染都念这一份**：`## wiring` 的 `missing` 行，以及格子里
+/// 那句 `scaffold failed`（驱动那一侧拿它当兜底平台的报错）。两边各写一句，读的人就会照着
+/// 其中一份去找错地方。
+///
+/// 两种情况要分开，与骨干、容器后端那两条同理：
+/// - 传输建不出来 ⇒ 与骨干共用同一个客户端，缺的是客户端，不是端点；
+/// - 传输在、端点没配 ⇒ 缺的是**这一次跑的环境里一个值**，点名那个变量，否则读的人会去翻
+///   组合根——那里三处都在（读环境、建桥、兜底），翻不出东西来。
+fn platform_absence(wiring: &Wiring) -> String {
+    match &wiring.no_transport {
+        Some(why) => format!("the platform endpoint cannot be reached: {why}"),
+        None => format!("{PLATFORM_BASE_ENV} is unset in this run's environment"),
+    }
+}
+
 /// 开跑**之前**就看得出来缺什么。收窄到这几样而不是整份参数：判词只跟「哪一列、哪个外壳、
 /// 哪条臂」有关，跟数据根、闸门那些无关，所以它是一条纯函数，能被单测直接钉住。
 ///
@@ -986,10 +1003,7 @@ fn missing_dependencies(
             "nql",
             MissingScope::Row("nql".to_string()),
             Absence::NotWired,
-            match &wiring.no_transport {
-                Some(why) => format!("the platform endpoint cannot be reached: {why}"),
-                None => "no platform is wired".to_string(),
-            },
+            platform_absence(wiring),
         ));
     }
     // 外部流派的声明写坏了：**整块不成立**，所以这次跑的行集里没有它们。`Run` 而不是
@@ -1085,7 +1099,7 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
     let platform: Arc<dyn PlatformRunner> = wiring
         .platform
         .clone()
-        .unwrap_or_else(|| Arc::new(NoPlatform::new("the composition root wires no platform")));
+        .unwrap_or_else(|| Arc::new(NoPlatform::new(platform_absence(&wiring))));
 
     let checkpoint = run_checkpoint(args, &verified, subset.as_deref());
     let mut rig = Rig::new(
@@ -2668,6 +2682,42 @@ mod tests {
         assert!(nql.contains("http_client"), "{nql}");
     }
 
+    /// 端点没配时，两处说这件事的判词必须点名**同一个变量**，而且必须是那个变量。
+    ///
+    /// 这一格钉的是 2026-10-16 那一跑读出来的形状：1440 例里 120 例（hle × nql）的失败判词
+    /// 是 `no platform endpoint is wired: the composition root wires no platform`。那句话把读的
+    /// 人送到组合根去找一段没写的代码，而组合根三处都在（读环境、建桥、兜底）——缺的是**这一次
+    /// 跑的环境里一个值**：实测那次跑的 Pod（`eval-table-3b100eeb`）`env: []`、全树设这个变量的
+    /// 地方一处也没有（只有它的常量、命令行帮助、README 三处**读**）。
+    ///
+    /// 反向也要钉：因传输而缺席时**不许**念这句话——那句话把读的人送去配一个已经配好的东西。
+    #[test]
+    fn an_unconfigured_platform_names_the_variable_both_faces_read() {
+        let wiring = Wiring::default();
+        let missing =
+            missing_dependencies(ToolArm::Platform, &["hle"], &["nql".to_string()], &wiring);
+        let nql = missing
+            .iter()
+            .find(|m| m.subject == "nql")
+            .expect("没有平台时 nql 这一行是缺席的")
+            .as_line();
+        assert!(nql.contains(PLATFORM_BASE_ENV), "{nql}");
+        // 驱动那一侧拿同一句当兜底平台的报错，两处必须同源。
+        assert!(
+            platform_absence(&wiring).contains(PLATFORM_BASE_ENV),
+            "两个渲染面点名的不是同一个量"
+        );
+        // 反向：传输没建出来时缺的是客户端。
+        let no_transport = Wiring {
+            no_transport: Some("cannot build an http client from http_client (boom)".into()),
+            ..Default::default()
+        };
+        assert!(
+            !platform_absence(&no_transport).contains(PLATFORM_BASE_ENV),
+            "传输缺失不是端点没配"
+        );
+    }
+
     /// 一张有真读数的表：两行（外壳）× 两列（基准），每格一个种子、每题 40 个例、
     /// 四格全都跑不动。
     ///
@@ -2871,7 +2921,10 @@ mod tests {
             .find(|m| m.subject == "nql")
             .expect("平台这一行在这里是缺席的")
             .as_line();
-        assert_eq!(nql, "nql: no platform is wired");
+        assert_eq!(
+            nql,
+            format!("nql: {PLATFORM_BASE_ENV} is unset in this run's environment")
+        );
     }
 
     /// 容器后端没接上时，那条声明要把**接线的原因**念出来。
