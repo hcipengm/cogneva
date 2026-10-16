@@ -127,6 +127,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 把本机的工具集按 MCP 协议交给一个外部 MCP 客户端：这条传输由客户端拉起
         // 本进程，标准输入输出就是协议本身，所以这条路上不许有别的输出。
         Command::McpServe => cogneva::mcp_serve::run_from_env().await,
+        // 带外写者问一次的入口。退出码**就是**答案（0 拿到 / 1 不该写 / 2 没问成 /
+        // 3 仲裁读不到 / 4 池读不到），所以这里显式 exit：走 `Err` 会被本函数末尾的
+        // 错误路径统一折成 1，「不该写」与「这条命令失败了」就再也分不开。
+        Command::WriteRole => std::process::exit(cogneva::write_role::run().await),
         Command::WindowsService => {
             #[cfg(windows)]
             {

@@ -275,3 +275,64 @@ async fn the_table_is_the_reading_of_who_holds_what() {
 
     clear_role(&pool, &role).await;
 }
+
+/// The read a writer outside the loops takes: the term still on the row, and
+/// the same row once the term has run out.
+///
+/// This is the half the statement's text cannot carry. A row whose term ran out
+/// has to stay readable as a row — "the holder stopped asking" is the reading a
+/// takeover needs, and reporting it as absent would spell it the same way as a
+/// role nobody ever asked for. And the remaining term has to be the database's
+/// arithmetic: a reader that subtracted its own clock would report a different
+/// term than the arbiter acts on.
+#[tokio::test]
+#[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+async fn the_read_reports_the_term_and_keeps_a_spent_one_as_a_row() {
+    let role = format!("{PROBE}_read");
+    let pool = connect().await;
+    let a = broker(&pool, "probe-read-a").await;
+    let outside = broker(&pool, "probe-read-outside").await;
+    clear_role(&pool, &role).await;
+
+    assert_eq!(
+        outside.read(&role).await.unwrap(),
+        None,
+        "a role no one has asked for has no row to read"
+    );
+
+    let ttl = Duration::from_secs(60);
+    assert!(a.lease(&role, ttl).try_hold().await.unwrap());
+    let seen = outside
+        .read(&role)
+        .await
+        .unwrap()
+        .expect("the holder's term is on the row");
+    assert_eq!(seen.holder, "probe-read-a");
+    assert!(
+        seen.seconds_left > 0 && seen.seconds_left <= 60,
+        "a term just written has time left on it, got {}",
+        seen.seconds_left
+    );
+
+    // The state the out-of-band meets when the in-band has stood down: the term
+    // is over, the row is not. Read before the takeover, because the takeover
+    // is what overwrites it.
+    expire_role(&pool, &role).await;
+    let spent = outside
+        .read(&role)
+        .await
+        .unwrap()
+        .expect("a spent term is still a row, not an absent one");
+    assert_eq!(spent.holder, "probe-read-a");
+    assert!(
+        spent.seconds_left <= 0,
+        "a term that has run out must read as spent, got {}",
+        spent.seconds_left
+    );
+
+    // And the arbiter agrees with what the reader was told: the free role goes
+    // to the next asker.
+    assert!(outside.lease(&role, ttl).try_hold().await.unwrap());
+
+    clear_role(&pool, &role).await;
+}

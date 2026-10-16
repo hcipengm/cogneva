@@ -31,12 +31,13 @@ pub enum Command {
     EvalTable,
     EvalCaseSubset,
     McpServe,
+    WriteRole,
     WindowsService,
 }
 
 /// Subcommands, in the order they appear in [`USAGE`]. A command added here but
 /// not documented fails the usage test.
-const SUBCOMMANDS: [(&str, Command); 13] = [
+const SUBCOMMANDS: [(&str, Command); 14] = [
     ("security-gateway", Command::SecurityGateway),
     ("sandbox-executor", Command::SandboxExecutor),
     ("volume-walker", Command::VolumeWalker),
@@ -50,6 +51,7 @@ const SUBCOMMANDS: [(&str, Command); 13] = [
     ("eval-table", Command::EvalTable),
     ("eval-case-subset", Command::EvalCaseSubset),
     ("mcp-serve", Command::McpServe),
+    ("write-role", Command::WriteRole),
 ];
 
 /// Flags that take effect wherever they appear in the argument list.
@@ -84,6 +86,11 @@ COMMANDS:
     eval-case-subset       Draw a fixed-seed subset of cases and archive it; runs read that
                            archive through `eval-table --subset` instead of redrawing
     mcp-serve              Serve this machine's tool set to an MCP client on stdin/stdout
+    write-role [OPTIONS]   Ask the shared write-role lease from outside the process that
+                           usually holds it; --holder names this writer, --role picks the
+                           role. Exit code is the answer: 0 holds, 1 must not write,
+                           2 the ask could not be made, 3 no arbiter reading, 4 no pool
+                           reading
 
     With no COMMAND the full application starts.
 

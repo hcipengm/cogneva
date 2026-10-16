@@ -26,6 +26,7 @@ pub mod shutdown_coordinator;
 pub mod startup_guard;
 pub mod validate_config;
 pub mod volume_walker;
+pub mod write_role;
 
 #[cfg(test)]
 mod upstream_request_shape_rejection_contract;

@@ -108,6 +108,30 @@ impl OwnerLease for PgOwnerLease {
     }
 }
 
+/// The statement that reads one role's term.
+///
+/// The term is measured against the server's `now()`, the same clock the take
+/// compares against, so the remaining term a reader is told is the one the
+/// arbiter will act on. It does not filter a used-up term out: the row is what
+/// names the holder that stopped asking, and that is the handover's evidence.
+fn read_role_sql() -> String {
+    format!(
+        "SELECT holder, extract(epoch from (expires_at - now()))::bigint AS seconds_left \
+         FROM {LEASE_TABLE} WHERE role = $1"
+    )
+}
+
+/// One role's row, with the term still on it, as a reader outside the loops
+/// sees it. See [`PgOwnerLeaseBroker::read`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseRow {
+    /// Who the row names right now.
+    pub holder: String,
+    /// Seconds until that holder's term runs out, by the database's clock.
+    /// Zero or below is a term that ran out and was not renewed.
+    pub seconds_left: i64,
+}
+
 /// The leases this deployment can arbitrate, backed by the shared database.
 pub struct PgOwnerLeaseBroker {
     pool: PgPool,
@@ -154,6 +178,32 @@ impl PgOwnerLeaseBroker {
     /// has to say which pod a takeover displaced.
     pub fn holder(&self) -> &str {
         &self.holder
+    }
+
+    /// The row for one role, as a reader outside the loops sees it.
+    ///
+    /// Separate from [`Self::holders`] because a caller deciding whether to ask
+    /// needs the term, not only the name: a row whose term has run out is a
+    /// role nobody is holding, and one that still has time on it is the other
+    /// writer. A row that has run out is still reported as a row rather than as
+    /// absent — the holder that stopped asking is a reading, and a takeover that
+    /// erased it would leave "just gave it up" and "nobody ever asked" spelled
+    /// the same way.
+    ///
+    /// `seconds_left` is the database's arithmetic, not this process's: the
+    /// term's end and the comparison against it come off one clock, and a reader
+    /// that subtracted a local one would report a different remaining term than
+    /// the arbiter will act on.
+    pub async fn read(&self, role: &str) -> SFResult<Option<LeaseRow>> {
+        let row = sqlx::query(&read_role_sql())
+            .bind(role)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("read {LEASE_TABLE}: {e}")))?;
+        Ok(row.map(|r| LeaseRow {
+            holder: r.get::<String, _>("holder"),
+            seconds_left: r.get::<i64, _>("seconds_left"),
+        }))
     }
 
     /// The row as an operator would read it, for the log line that reports what
@@ -221,6 +271,30 @@ mod tests {
         assert!(
             TAKE_ROLE_SQL.contains("RETURNING holder"),
             "the answer must be the row's, not the caller's belief"
+        );
+    }
+
+    /// The read's statement measures the term against the database's clock.
+    ///
+    /// The half of the read that can be read off the text: subtracting a local
+    /// `now()` would make the remaining term a property of this process's clock
+    /// rather than of the one the arbiter compares against. What the text
+    /// cannot carry — that a term which has run out is still reported as a row
+    /// — is the live case in `tests/owner_lease.rs`.
+    #[test]
+    fn the_read_measures_the_term_against_the_database_clock() {
+        let sql = read_role_sql();
+        assert!(
+            sql.contains("expires_at - now()"),
+            "the term has to be measured by the server's clock"
+        );
+        assert!(
+            !sql.contains("AND expires_at"),
+            "a term that has run out is a row the caller must see, not a filter"
+        );
+        assert!(
+            sql.contains(LEASE_TABLE) && sql.contains("WHERE role = $1"),
+            "the read has to be scoped to one role: {sql}"
         );
     }
 }
