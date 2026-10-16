@@ -46,6 +46,17 @@ const PARSER_SCRIPT: &str = "parser.py";
 const IMAGE_REPO: &str = "scaleapi/swe-bench_pro-v2";
 const IMAGE_HOST: &str = "ghcr.io";
 
+/// 跑**别人的程序**那一跑显式要的隔离档。
+///
+/// 要出来，不继承：`--isolation` 与 `--network` 的默认值来自宿主（`BUILDAH_ISOLATION`
+/// 环境变量、`containers.conf` 的 `isolation` 与 `default_network`）。实测（本机 rootful
+/// buildah）默认与 `--isolation oci --network private` 逐项相同——私有 net/pid 命名空间、
+/// CNI 网段里的 eth0；而 `--isolation chroot` 下容器的 net 与 pid 命名空间**与宿主逐字相同**
+/// （`/proc/net/dev` 里看得到宿主真实的网卡），也就是「第三方代码跑在哪儿」这件事会随宿主的
+/// 一处配置静默改变。判分那一跑不动它（那一跑本来就跑上游自己的脚本，改它的读数是另一个
+/// 改动），这一条只挂在外部流派那一跑上。
+const FOREIGN_RUN_ISOLATION: [&str; 4] = ["--isolation", "oci", "--network", "private"];
+
 /// 把容器命令换成别的。整条命令（含空格分隔的参数）都从这里读，所以换 `podman`、或指到
 /// 另一台机器上，都走这一个旋钮而不必改代码。
 const ENV_BUILDAH: &str = "COGNEVA_EVAL_BUILDAH";
@@ -376,21 +387,14 @@ impl Container {
     /// bash 会报 `syntax error near unexpected token ';'`（实测）。空脚本补一个 `:`——`{` 与 `}`
     /// 之间什么也没有同样是语法错误，而不带 `;` 的写法没法靠加分隔符绕开它。
     async fn shell(&self, script: &str) -> anyhow::Result<RunOutcome> {
-        let body = if script.trim().is_empty() {
-            ":"
-        } else {
-            script
-        };
-        let full = format!("cd {WORK_DIR} && {{\n{body}\n}}");
+        self.shell_with(script, &[]).await
+    }
+
+    /// 同上，外加这一跑自己要的开关（`extra`）。隔离档走这条：它是**这一跑**的属性，
+    /// 不是这台容器的属性——同一台容器，判分那一跑要默认，别人的程序那一跑要出来。
+    async fn shell_with(&self, script: &str, extra: &[&str]) -> anyhow::Result<RunOutcome> {
         self.runtime
-            .exec(&[
-                "run".into(),
-                self.name.clone(),
-                "--".into(),
-                "bash".into(),
-                "-c".into(),
-                full,
-            ])
+            .exec(&run_argv(&self.name, script, extra))
             .await
     }
 
@@ -548,6 +552,32 @@ impl Container {
     }
 }
 
+/// 一条「在容器里跑一段 shell」的 argv。
+///
+/// `extra` 放在子命令与容器名**之间**：buildah 的 flag 只在那一位上被认，放到容器名后面会被
+/// 当成要执行的命令的一部分。工作目录**显式**切到 `/app`：不靠 buildah 去读镜像的
+/// `WorkingDir`，那样这一层的行为就随 buildah 版本漂。
+///
+/// 分组写成 `{ 换行 … 换行 }`：换行本身已经终结了那串命令，再补一个 `;` 就成了第二个分隔符，
+/// bash 会报 `syntax error near unexpected token ';'`（实测）。空脚本补一个 `:`——`{` 与 `}`
+/// 之间什么也没有同样是语法错误，而不带 `;` 的写法没法靠加分隔符绕开它。
+fn run_argv(name: &str, script: &str, extra: &[&str]) -> Vec<String> {
+    let body = if script.trim().is_empty() {
+        ":"
+    } else {
+        script
+    };
+    let full = format!("cd {WORK_DIR} && {{\n{body}\n}}");
+    let mut argv: Vec<String> = vec!["run".to_string()];
+    argv.extend(extra.iter().map(|arg| arg.to_string()));
+    argv.push(name.to_string());
+    argv.push("--".to_string());
+    argv.push("bash".to_string());
+    argv.push("-c".to_string());
+    argv.push(full);
+    argv
+}
+
 /// 一道题的环境：一台容器。外壳在里面改代码，判分也在同一台里跑——换一台判就是在判另一道题。
 pub struct SweProContainerEnv {
     container: Arc<Container>,
@@ -690,7 +720,10 @@ impl ForeignRunner for ContainerForeignRunner {
         let started = std::time::Instant::now();
         let out = self
             .container
-            .shell(&foreign_script(req.entrypoint, req.limits))
+            .shell_with(
+                &foreign_script(req.entrypoint, req.limits),
+                &FOREIGN_RUN_ISOLATION,
+            )
             .await?;
         let elapsed = started.elapsed();
         let after = self.container.snapshot_tree().await?;
@@ -1190,5 +1223,91 @@ mod tests {
         assert_eq!(foreign_finish(Some(1)), FinishReason::Failed);
         // 没有退出码＝被信号打断，不是它自己收工。
         assert_eq!(foreign_finish(None), FinishReason::Failed);
+    }
+
+    #[test]
+    fn the_foreign_run_asks_for_its_isolation_and_the_grading_run_does_not() {
+        let foreign = run_argv("c1", "echo hi", &FOREIGN_RUN_ISOLATION);
+        // 四个开关都在，且都在容器名**之前**：buildah 的 flag 只在那一位上被认，放到容器名
+        // 后面会被当成要执行的命令的一部分。
+        let name_at = foreign.iter().position(|arg| arg == "c1").expect("名字在");
+        for flag in FOREIGN_RUN_ISOLATION {
+            let at = foreign
+                .iter()
+                .position(|arg| arg == flag)
+                .unwrap_or_else(|| panic!("{flag} 要出现在这一跑里"));
+            assert!(at < name_at, "{flag} 要在容器名之前");
+        }
+        // 判分那一跑不带它们：它跑的是上游自己的脚本，改那一跑的读数是另一个改动。
+        let grading = run_argv("c1", "echo hi", &[]);
+        assert!(!grading.iter().any(|arg| arg == "--isolation"));
+        assert!(!grading.iter().any(|arg| arg == "--network"));
+        assert_eq!(grading[0], "run");
+        assert_eq!(grading[1], "c1");
+    }
+
+    #[test]
+    fn the_isolation_flags_do_not_rewrite_the_script_the_run_gets() {
+        let bare = run_argv("c1", "echo hi", &[]);
+        let isolated = run_argv("c1", "echo hi", &FOREIGN_RUN_ISOLATION);
+        // 脚本是 argv 的最后一段，两种跑法给出的是同一段：隔离是**这一跑**的属性，不是
+        // 换一种脚本。
+        assert_eq!(bare.last(), isolated.last());
+        assert_eq!(
+            bare.last().unwrap(),
+            &format!("cd {WORK_DIR} && {{\necho hi\n}}")
+        );
+    }
+
+    // 这一跑拿到的是**私有**的命名空间，且拿不到宿主进程的环境。这两条是「别人的程序跑在
+    // 哪儿」的判据，不是 buildah 的默认值——默认值来自宿主配置（实测 `--isolation chroot`
+    // 下容器的 net/pid 命名空间与宿主逐字相同），所以它要由这一侧的开关要来，且要能被量。
+    //
+    // 要一台能起容器的机器，以及 store 里已经有的一份镜像。手工跑法：
+    //   cargo test -p cogneva --lib eval_container::tests::the_foreign_run_gets_its_own_namespaces -- --ignored --nocapture
+    #[ignore = "needs a container machine with a buildah store and an image already in it"]
+    #[tokio::test]
+    async fn the_foreign_run_gets_its_own_namespaces() {
+        let runtime = Arc::new(
+            BuildahRuntime::detect()
+                .await
+                .expect("探测不该失败")
+                .expect("这台宿主上要有可用的容器机器"),
+        );
+        let name = format!("cogneva-isolation-probe-{}", std::process::id());
+        let container = Container::create(runtime.clone(), "docker.io/library/ubuntu:24.04", &name)
+            .await
+            .expect("从 store 里起一台探针容器");
+        // 工作目录先建出来：`run_argv` 显式 `cd /app`，不靠镜像的 WorkingDir 恰好是什么。
+        let setup: Vec<String> = ["run", name.as_str(), "--", "mkdir", "-p", WORK_DIR]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        runtime.exec(&setup).await.expect("建工作目录");
+        // 探针要量的那条环境变量，先在**本进程**里设上：这样「容器里没有它」才是读出来的。
+        std::env::set_var("COGNEVA_ISOLATION_PROBE", "1");
+
+        let out = runtime
+            .exec(&run_argv(
+                &name,
+                "readlink /proc/self/ns/net /proc/self/ns/pid; env",
+                &FOREIGN_RUN_ISOLATION,
+            ))
+            .await
+            .expect("跑探针");
+        assert_eq!(out.code, Some(0), "探针要跑完：{}", tail(&out.stderr, 400));
+
+        let host_net = std::fs::read_link("/proc/self/ns/net")
+            .expect("读宿主自己的 net 命名空间")
+            .display()
+            .to_string();
+        let first = out.stdout.lines().next().unwrap_or_default().to_string();
+        assert_ne!(first, host_net, "容器要有自己的 net 命名空间");
+        assert!(
+            !out.stdout.contains("COGNEVA_ISOLATION_PROBE"),
+            "宿主的进程环境不许漏进容器：{}",
+            out.stdout
+        );
+        container.remove().await.expect("把探针容器收掉");
     }
 }
