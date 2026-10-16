@@ -1,4 +1,5 @@
 //! Reflection plugin — implements [`cog_core::SystemPlugin`].
+//! principle: feedback_a_source_shape_gate_is_a_false_green_for_behaviour
 //! A host that gave no build slot is consumed as `ExecutedChange::NoBuildSlot`, not charged to the change's failure account.
 
 use std::sync::Arc;
@@ -1916,9 +1917,10 @@ fn discovery_probe_task(probe: &crate::types::DiscoveryTask) -> (String, cog_cor
 /// 一轮发现：生成、逐条提交、**按受理**退场。返回（生成数、受理数、被拒数）。
 ///
 /// 抽成函数不是为了复用，是为了让这一格的判据**能被打断地量到**：拿一次受理与一次
-/// 拒绝喂进来，看被拒的那条组合下一轮还在不在池子里。此前它只由源码形状守（退场调用
-/// 夹在 `Ok` 与 `Err` 之间），而形状不判行为——把 `mark_explored` 提到 `match` 之前，
-/// 形状照旧、行为已经变成「拒一次也算试过」。
+/// 拒绝喂进来，看被拒的那条组合下一轮还在不在池子里。此前它只由源码形状守（窗口夹在
+/// `match …` 与汇总日志之间，断言 `Ok` 臂 < 退场调用 < `Err` 臂），而那扇门**锚在这段
+/// 代码自己的文本上**：抽成函数之后提交点换了名字，它当场 panic——绿树上的红。形状能
+/// 拦住的坏法取决于「字面量顺序」与「行为」的巧合，它拦不住的坏法也就无从测起。
 async fn run_discovery_round<F, Fut>(
     engine: &crate::DiscoveryEngine,
     submit: F,
@@ -4651,9 +4653,14 @@ mod tests {
 
     /// **受理才退场**：一轮里受理一条、拒一条，被拒的那条下一轮必须还在池子里。
     ///
-    /// 这条替掉了原先那版只能读源码形状的判据（退场调用夹在 `Ok` 与 `Err` 之间）：
-    /// 形状不判行为——把退场提到 `match` 之前，形状照旧而行为已经变成「拒一次也算
-    /// 试过」。行为面同样是那个缺陷的破坏面：一轮生成的是**整批**组合，这里只放行
+    /// 这条替掉了原先那版只能读源码形状的判据（窗口夹在 `match …` 与汇总日志之间，
+    /// 断言 `Ok` 臂 < `mark_discovery_explored` < `Err` 臂）。**替掉它的理由不是它漏
+    /// 了坏法**：实测三种改法（退场提到生成处、挪进 `Err` 臂、挪到 `match` 之后）旧门
+    /// 都会红。理由是**它守的是文本顺序，而文本顺序只是行为的代理**——它红在「正确但
+    /// 换了写法」上：这一轮抽成函数之后提交点写成 `match submit(goal, task).await`，
+    /// 旧门的锚点 `match orchestrator.submit_goal_auto` 已不存在，`.expect()` 当场
+    /// panic，即 **绿树上的红**。锚点就是它守的那段代码自己的文本，于是重构与写坏在
+    /// 它眼里同形。行为面同样是那个缺陷的破坏面：一轮生成的是**整批**组合，这里只放行
     /// 一条、其余全拒，被拒的那些要一条不少地留在池子里，而受理的那条要走。
     ///
     /// 替身是一个闭包，不是 `OrchestratorControl` 的一条完整实现：这一轮只用到「提交

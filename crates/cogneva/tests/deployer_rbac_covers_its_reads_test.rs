@@ -1,5 +1,6 @@
 //! The cluster rights the evolution ServiceAccount is granted, against the ones
 //! its commands need.
+//! principle: feedback_a_second_reader_of_a_fact_references_the_one_definition
 //!
 //! A missing grant is invisible from every other face. The process starts, the
 //! loop runs, every other gate is green — the command that needed the right

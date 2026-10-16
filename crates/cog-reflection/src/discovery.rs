@@ -1,4 +1,5 @@
 //! Autonomous capability discovery through exploratory task generation.
+//! principle: feedback_a_first_element_is_a_silent_narrowing_of_the_face
 //! The engine proactively constructs tasks that exercise untried tool
 //! combinations, parameter ranges, cross-domain transfers, and boundary
 //! conditions.  Successful discoveries enter the standard five-phase

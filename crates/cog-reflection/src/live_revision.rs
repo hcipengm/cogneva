@@ -1,4 +1,5 @@
 //! 集群**现役**的是哪个 rev：四个主负载是否全部落在同一个不可变 `main-<rev>` tag 上。
+//! principle: feedback_an_answer_that_does_not_name_the_object_asked_for_is_a_read_failure
 //!
 //! 这一格读数有两个读者：金丝雀 overlay 的基底（直接调本模块的读法），与「落地≠生效」
 //! 那一格（经 [`cog_core::LiveRevisionSource`] 服务面，由 [`KubectlLiveRevision`] 接上）。
