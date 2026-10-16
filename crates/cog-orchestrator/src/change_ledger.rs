@@ -62,9 +62,9 @@ use tracing::{debug, info, warn};
 
 use cog_core::{
     metric_names, ChangeIdentity, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement,
-    ChangeReading, ChangeReopen, ChangeSource, ChangeState, DispatchDecision, DispatchState,
-    LlmPoolStatus, MetricsBackend, OrchestratorControl, OwnerLeaseBroker, PoolReading,
-    ShutdownSignal, Task, TaskStatus, TaskType,
+    ChangePriority, ChangeReading, ChangeReopen, ChangeSource, ChangeState, DispatchDecision,
+    DispatchState, LlmPoolStatus, MetricsBackend, OrchestratorControl, OwnerLeaseBroker,
+    PoolReading, ShutdownSignal, Task, TaskStatus, TaskType,
 };
 
 use cog_core::contract::llm::UpstreamFailure;
@@ -779,6 +779,10 @@ fn edge_readings(lines: &[(String, String)]) -> Vec<ChangeReading> {
             source: ChangeSource {
                 doc: DEBT_EDGE_FILE.to_string(),
                 verdict: None,
+                // The debt file names the edge, not how urgent it is: nothing
+                // in it states a band, so the reading carries the one that says
+                // so rather than a band this path invented.
+                priority: ChangePriority::Unstated,
             },
         });
     }
@@ -827,6 +831,7 @@ fn module_readings(lines: &[(String, String)]) -> Vec<ChangeReading> {
             source: ChangeSource {
                 doc: DEBT_MODULE_FILE.to_string(),
                 verdict: None,
+                priority: ChangePriority::Unstated,
             },
         });
     }

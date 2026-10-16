@@ -201,6 +201,96 @@ impl std::str::FromStr for RetireReason {
     }
 }
 
+/// How urgent the document that asked for a change said that change was.
+///
+/// Only a document can answer this. Nothing measures urgency: there is no tree
+/// that says one change matters more than another, so a band computed from
+/// whatever happens to be stuck at the moment would be a stored answer to a
+/// question whose input keeps moving -- written once, never revisited, and read
+/// afterwards as if it still held. The band therefore rides on the source, and
+/// a row's band is the highest one any document still asking for it stated.
+///
+/// `Unstated` is a member of the set rather than an absence from it. A band
+/// that fell back to something when no document said would put every
+/// unprioritised change in one band, and a reader could no longer tell "the
+/// document said P0" from "no document said" -- which is the reading the column
+/// exists for. It ranks below every band, so the maximum over a row's sources
+/// is the band to act on and a row nobody prioritised stays unstated. That is
+/// why the order is written out rather than derived: `P0` is the highest, and a
+/// derived `Ord` would take the position of the variant in this list for its
+/// rank and answer `P3`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangePriority {
+    /// No document that asks for this change said how urgent it was.
+    #[default]
+    Unstated,
+    P0,
+    P1,
+    P2,
+    P3,
+}
+
+impl ChangePriority {
+    /// Every band: `unstated` first, then `P0` through `P3` by name.
+    ///
+    /// Not by rank -- `P0` outranks `P3`, so a rank-ordered list would read
+    /// `unstated, p3, p2, p1, p0`. This is the order a reading prints, the same
+    /// one the projection's census uses, so two readings of the same account are
+    /// compared line by line.
+    pub const ALL: [ChangePriority; 5] = [
+        ChangePriority::Unstated,
+        ChangePriority::P0,
+        ChangePriority::P1,
+        ChangePriority::P2,
+        ChangePriority::P3,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChangePriority::Unstated => "unstated",
+            ChangePriority::P0 => "p0",
+            ChangePriority::P1 => "p1",
+            ChangePriority::P2 => "p2",
+            ChangePriority::P3 => "p3",
+        }
+    }
+
+    /// Rank, with `P0` highest and `Unstated` below every band.
+    fn rank(self) -> u8 {
+        match self {
+            ChangePriority::P0 => 4,
+            ChangePriority::P1 => 3,
+            ChangePriority::P2 => 2,
+            ChangePriority::P3 => 1,
+            ChangePriority::Unstated => 0,
+        }
+    }
+}
+
+impl Ord for ChangePriority {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank().cmp(&other.rank())
+    }
+}
+
+impl PartialOrd for ChangePriority {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::str::FromStr for ChangePriority {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|band| band.as_str() == s)
+            .ok_or_else(|| format!("unknown change priority: {s}"))
+    }
+}
+
 /// One document that asks for a change, and what that document said about it.
 ///
 /// Kept beside the row rather than folded into its state: what a document says
@@ -213,6 +303,16 @@ pub struct ChangeSource {
     /// The document's own verdict, when it gave one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verdict: Option<String>,
+    /// The band this document asked for, or [`ChangePriority::Unstated`].
+    ///
+    /// Defaulted rather than required so a source written before the column
+    /// existed reads back as unstated instead of failing to parse: those rows
+    /// were never asked the question, and refusing to read them would lose an
+    /// answer the account already has. Written out rather than skipped when
+    /// unstated, so the two renderings of a source -- this one and the
+    /// `jsonb_build_object` the store builds -- carry the same keys.
+    #[serde(default)]
+    pub priority: ChangePriority,
 }
 
 /// One row of the ledger.
@@ -259,6 +359,24 @@ pub struct ChangeLedgerRow {
     /// measurement, so `state == Retired` and this being present agree by
     /// construction, the same way `landed_at` agrees with `Landed`.
     pub retired_at: Option<DateTime<Utc>>,
+}
+
+impl ChangeLedgerRow {
+    /// The band to act on: the highest any document still asking for this
+    /// change stated, or [`ChangePriority::Unstated`] when none of them said.
+    ///
+    /// Derived from the sources on every read rather than stored in a column of
+    /// its own. A stored band would be a second answer to a question the
+    /// sources already answer, and the two would drift the first time a
+    /// declaration was corrected -- the reading path updates the source, and
+    /// nothing would update the copy.
+    pub fn priority(&self) -> ChangePriority {
+        self.sources
+            .iter()
+            .map(|source| source.priority)
+            .max()
+            .unwrap_or_default()
+    }
 }
 
 /// The result of looking at the tree for one change.
@@ -905,5 +1023,93 @@ mod tests {
             ChangeState::Pending,
         );
         assert_eq!(pending.unsettled_reason, None);
+    }
+
+    /// The band order is the one a reader acts on: `P0` outranks `P1`, and a
+    /// row nobody prioritised sits below every band rather than above them.
+    ///
+    /// Written out rather than derived, so this is the gate that says the
+    /// written-out order says what the names say -- a derived `Ord` would rank
+    /// `P0` by its position in the declaration and answer `P3`.
+    #[test]
+    fn p0_outranks_every_band_and_unstated_outranks_none() {
+        assert!(ChangePriority::P0 > ChangePriority::P1);
+        assert!(ChangePriority::P1 > ChangePriority::P2);
+        assert!(ChangePriority::P2 > ChangePriority::P3);
+        assert!(ChangePriority::P3 > ChangePriority::Unstated);
+        assert_eq!(
+            ChangePriority::ALL.iter().copied().max(),
+            Some(ChangePriority::P0)
+        );
+        assert_eq!(
+            ChangePriority::ALL.iter().copied().min(),
+            Some(ChangePriority::Unstated)
+        );
+    }
+
+    /// Every band round-trips through its name, and the set is closed: a name
+    /// outside it is a caller error rather than a sixth band, which is what
+    /// lets the column refuse one instead of storing it.
+    #[test]
+    fn every_band_round_trips_through_its_name() {
+        for band in ChangePriority::ALL {
+            assert_eq!(
+                band.as_str().parse::<ChangePriority>(),
+                Ok(band),
+                "{} did not parse back",
+                band.as_str()
+            );
+        }
+        assert!("urgent".parse::<ChangePriority>().is_err());
+        assert_eq!(ChangePriority::ALL.len(), 5);
+    }
+
+    /// A source written before the column existed reads back as unstated
+    /// instead of failing: those rows were never asked, and refusing to read
+    /// them would drop an answer the account already holds.
+    #[test]
+    fn a_source_that_states_no_band_reads_back_as_unstated() {
+        let source: ChangeSource =
+            serde_json::from_str(r#"{"doc":"2026-01-01_x.md","verdict":"pending"}"#).unwrap();
+        assert_eq!(source.priority, ChangePriority::Unstated);
+    }
+
+    /// A row's band is the highest its sources stated, not the first and not
+    /// the last: two documents asking for the same change at different bands
+    /// are one row whose band is the one to act on.
+    #[test]
+    fn a_rows_band_is_the_highest_its_sources_stated() {
+        let row = |bands: &[ChangePriority]| ChangeLedgerRow {
+            identity: ChangeIdentity::new("grep", "crates/", "x"),
+            state: ChangeState::Pending,
+            title: None,
+            assertion: None,
+            sources: bands
+                .iter()
+                .enumerate()
+                .map(|(i, band)| ChangeSource {
+                    doc: format!("doc{i}.md"),
+                    verdict: None,
+                    priority: *band,
+                })
+                .collect(),
+            first_seen_at: Utc::now(),
+            measured_at: None,
+            measured_rev: None,
+            landed_at: None,
+            unsettled_reason: None,
+            retire_reason: None,
+            retired_at: None,
+        };
+        assert_eq!(
+            row(&[ChangePriority::P2, ChangePriority::P0]).priority(),
+            ChangePriority::P0
+        );
+        assert_eq!(row(&[ChangePriority::P3]).priority(), ChangePriority::P3);
+        assert_eq!(row(&[]).priority(), ChangePriority::Unstated);
+        assert_eq!(
+            row(&[ChangePriority::Unstated, ChangePriority::P1]).priority(),
+            ChangePriority::P1
+        );
     }
 }

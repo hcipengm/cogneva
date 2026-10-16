@@ -30,8 +30,8 @@
 use sqlx::PgPool;
 
 use cog_core::{
-    ChangeIdentity, ChangeLedgerStore, ChangeMeasurement, ChangeReading, ChangeReopen,
-    ChangeSource, ChangeState, RetireReason,
+    ChangeIdentity, ChangeLedgerStore, ChangeMeasurement, ChangePriority, ChangeReading,
+    ChangeReopen, ChangeSource, ChangeState, RetireReason,
 };
 use cog_storage::PostgresChangeLedgerStore;
 
@@ -217,6 +217,7 @@ async fn the_entry_revision_is_written_once_and_never_moved() {
         source: ChangeSource {
             doc: doc.to_string(),
             verdict: None,
+            priority: ChangePriority::Unstated,
         },
     };
 
@@ -414,6 +415,7 @@ async fn a_corrected_declaration_reaches_the_accounts_citation_of_its_document()
         source: ChangeSource {
             doc: doc.clone(),
             verdict: Some(verdict.to_string()),
+            priority: ChangePriority::Unstated,
         },
     };
 
@@ -472,6 +474,125 @@ async fn a_corrected_declaration_reaches_the_accounts_citation_of_its_document()
     cleanup(&pool, &marker).await;
 }
 
+/// A statement about urgency rides the declaration that made it, and the row's
+/// own band is the most urgent of the ones still standing.
+///
+/// What makes this a storage fact rather than a formatting one: the band is
+/// written into the same JSONB entry as the verdict, so a reader of a citation
+/// gets the two together, and there is no column on the row that could hold a
+/// second answer. The two halves below are the two ways that can go wrong --
+/// a band averaged or overwritten by the last writer (both would read as
+/// agreement between documents that disagree) and a band that can only rise,
+/// which is what turns a priority into a label.
+///
+/// `P0` is the most urgent, so "the highest the sources stated" means `max` over
+/// the band's own order and not over its spelling. A row that took `P3` over
+/// `P1` -- the larger name -- would be reading the band backwards, and it would
+/// do it silently, which is why the first assertion here is the whole range
+/// rather than one adjacent pair.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_declarations_band_rides_the_citation_and_the_row_takes_the_highest() {
+    let (store, pool, marker) = store().await;
+    let id = identity(&marker, "band");
+    let urgent = format!("docs/{marker}-urgent.md");
+    let quiet = format!("docs/{marker}-quiet.md");
+    let silent = format!("docs/{marker}-silent.md");
+    let declare = |doc: &str, band: ChangePriority| ChangeReading {
+        identity: id.clone(),
+        title: Some("a change the probe declares".into()),
+        assertion: None,
+        source: ChangeSource {
+            doc: doc.to_string(),
+            verdict: Some("unlanded".into()),
+            priority: band,
+        },
+    };
+
+    // One document asks at P1, another at P3, a third states nothing at all.
+    assert_eq!(
+        store
+            .declare(&[
+                declare(&urgent, ChangePriority::P1),
+                declare(&quiet, ChangePriority::P3),
+                declare(&silent, ChangePriority::Unstated),
+            ])
+            .await
+            .unwrap(),
+        3,
+        "three documents, three declarations"
+    );
+    store
+        .fold_declarations(100, Some("probe-rev"))
+        .await
+        .expect("fold the declarations");
+    let row = store
+        .get(&id)
+        .await
+        .expect("read the row")
+        .expect("the row exists");
+    let cited: Vec<(String, ChangePriority)> = row
+        .sources
+        .iter()
+        .map(|s| (s.doc.clone(), s.priority))
+        .collect();
+    assert!(
+        cited.contains(&(urgent.clone(), ChangePriority::P1))
+            && cited.contains(&(quiet.clone(), ChangePriority::P3))
+            && cited.contains(&(silent.clone(), ChangePriority::Unstated)),
+        "each citation carries the band its own document stated, including the \
+         one that stated none: {cited:?}"
+    );
+    assert_eq!(
+        row.priority(),
+        ChangePriority::P1,
+        "the row's band is the most urgent its sources stated: P1 over P3, and \
+         a document that stated nothing does not outrank either -- the band as \
+         written, not the band as spelled"
+    );
+
+    // The band has to be able to fall, or `P1` is a label rather than a reading:
+    // the urgent document takes its declaration back, and the row is left with
+    // what the other two said.
+    withdraw_declaration(&pool, &id, &urgent).await;
+    assert_eq!(
+        store
+            .declare(&[declare(&urgent, ChangePriority::Unstated)])
+            .await
+            .unwrap(),
+        1,
+        "re-declaring is a fresh row, which is how a band is corrected"
+    );
+    store
+        .fold_declarations(100, Some("probe-rev"))
+        .await
+        .expect("fold the corrected band");
+    let row = store
+        .get(&id)
+        .await
+        .expect("read the row back")
+        .expect("the row is there");
+    assert_eq!(
+        row.sources
+            .iter()
+            .find(|s| s.doc == urgent)
+            .map(|s| s.priority),
+        Some(ChangePriority::Unstated),
+        "the corrected declaration replaces the citation rather than adding one: {:?}",
+        row.sources
+    );
+    assert_eq!(
+        row.priority(),
+        ChangePriority::P3,
+        "the row's band fell to the most urgent that is still stated"
+    );
+
+    withdraw_declaration(&pool, &id, &urgent).await;
+    withdraw_declaration(&pool, &id, &quiet).await;
+    withdraw_declaration(&pool, &id, &silent).await;
+    cleanup(&pool, &marker).await;
+}
+
 /// A declaration nobody has measured enters as work still owed, not as a stuck
 /// row.
 ///
@@ -497,6 +618,7 @@ async fn a_freshly_folded_declaration_enters_pending_and_unmeasured() {
             source: ChangeSource {
                 doc: format!("docs/{marker}.md"),
                 verdict: Some("pending".into()),
+                priority: ChangePriority::Unstated,
             },
         }])
         .await

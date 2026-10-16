@@ -158,6 +158,11 @@ impl PostgresChangeLedgerStore {
                 verdict: row
                     .try_get::<Option<String>, _>("verdict")
                     .map_err(|e| format!("verdict: {e}"))?,
+                priority: row
+                    .try_get::<String, _>("priority")
+                    .map_err(|e| format!("priority: {e}"))?
+                    .parse()
+                    .map_err(|e| format!("priority: {e}"))?,
             },
         })
     }
@@ -179,12 +184,20 @@ impl PostgresChangeLedgerStore {
 /// "what this document said" has to be what it says now.
 ///
 /// The rewrite is guarded twice: an entry is added for a document not yet cited,
-/// and an entry already there is rebuilt only when its verdict actually differs.
-/// Without the second guard every re-reading of an unchanged document would
-/// rewrite the row, which is a write per citation per pass for no reading.
-/// Rebuilding rather than appending keeps one entry per document: two entries
-/// for one document would be the same merge the guard exists to avoid, in the
-/// other direction.
+/// and an entry already there is rebuilt only when what it says about the change
+/// actually differs -- its verdict or the band it asked for. Without the second
+/// guard every re-reading of an unchanged document would rewrite the row, which
+/// is a write per citation per pass for no reading. Rebuilding rather than
+/// appending keeps one entry per document: two entries for one document would be
+/// the same merge the guard exists to avoid, in the other direction.
+///
+/// The band is part of what the entry says for the same reason the verdict is:
+/// re-prioritising a change is a withdrawal and a fresh declaration, which lands
+/// here as the same document citing the same identity with a different band, and
+/// a clause that kept the old entry would leave the row reading at the urgency
+/// the document no longer asks for. There is no default band anywhere in this
+/// path -- a declaration that states none is stored as `unstated`, which is a
+/// band a reader can see rather than a value it has to guess at.
 ///
 /// `first_seen_rev` is written only on the row's first entry and never refreshed:
 /// the conflict clause leaves it alone, so a second document citing an existing
@@ -201,9 +214,18 @@ impl PostgresChangeLedgerStore {
 /// reader it has not been looked at. Writing `undecided` here would state a
 /// verdict no look reached and hide the row in the reason-less bucket reserved
 /// for rows that predate the reason column.
+///
+/// The parameters are, in order: kind, scope, literal, title, assertion, doc,
+/// verdict, band, entry revision. The ninth is the last *column* but not the
+/// last parameter -- it takes the value slot after `sources`, whose expression
+/// needs the band before it. That gap is where a bind can be written down in
+/// the wrong place and still compile: binding the band after the revision made
+/// the band column hold a revision, and nothing but a live database reading the
+/// row back could tell. The parameter list is written here, next to the
+/// statement, because the numbering is not the column order.
 const RECORD_READING_SQL: &str = "\
 INSERT INTO change_ledger (kind, scope, literal, state, title, assertion, sources, first_seen_rev)
-VALUES ($1, $2, $3, 'pending', $4, $5, jsonb_build_array(jsonb_build_object('doc', $6, 'verdict', $7)), $8)
+VALUES ($1, $2, $3, 'pending', $4, $5, jsonb_build_array(jsonb_build_object('doc', $6, 'verdict', $7, 'priority', $8)), $9)
 ON CONFLICT (kind, scope, literal) DO UPDATE SET
     title = COALESCE(EXCLUDED.title, change_ledger.title),
     assertion = COALESCE(EXCLUDED.assertion, change_ledger.assertion),
@@ -215,12 +237,13 @@ ON CONFLICT (kind, scope, literal) DO UPDATE SET
         WHEN EXISTS (
             SELECT 1 FROM jsonb_array_elements(change_ledger.sources) AS cited(entry)
             WHERE cited.entry->>'doc' = $6
-              AND cited.entry->>'verdict' IS DISTINCT FROM $7
+              AND (cited.entry->>'verdict' IS DISTINCT FROM $7
+                   OR cited.entry->>'priority' IS DISTINCT FROM $8)
         ) THEN (
             SELECT jsonb_agg(
                 CASE
                     WHEN cited.entry->>'doc' = $6
-                    THEN jsonb_build_object('doc', $6, 'verdict', $7)
+                    THEN jsonb_build_object('doc', $6, 'verdict', $7, 'priority', $8)
                     ELSE cited.entry
                 END
             )
@@ -399,8 +422,8 @@ fn check_measurement(m: &ChangeMeasurement) -> Result<(), String> {
 /// because the reading path kept a cited document's entry as it was. See
 /// [`RECORD_READING_SQL`].
 const DECLARE_SQL: &str = "\
-INSERT INTO change_ledger_declared (kind, scope, literal, doc, title, assertion, verdict)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+INSERT INTO change_ledger_declared (kind, scope, literal, doc, title, assertion, verdict, priority)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 ON CONFLICT (kind, scope, literal, doc) DO NOTHING";
 
 /// The declarations one fold takes, oldest first.
@@ -411,7 +434,7 @@ ON CONFLICT (kind, scope, literal, doc) DO NOTHING";
 /// different set on the next run, and a different one again on the other
 /// dialect.
 const FOLD_SELECT_SQL: &str = "\
-SELECT kind, scope, literal, doc, title, assertion, verdict
+SELECT kind, scope, literal, doc, title, assertion, verdict, priority
 FROM change_ledger_declared
 WHERE folded_at IS NULL
 ORDER BY declared_at ASC, kind ASC, scope ASC, literal ASC, doc ASC
@@ -471,6 +494,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
                 .bind(&reading.assertion)
                 .bind(&reading.source.doc)
                 .bind(&reading.source.verdict)
+                .bind(reading.source.priority.as_str())
                 .bind(first_seen_rev)
                 .execute(&self.pool)
                 .await
@@ -497,6 +521,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
                 .bind(&reading.title)
                 .bind(&reading.assertion)
                 .bind(&reading.source.verdict)
+                .bind(reading.source.priority.as_str())
                 .execute(&self.pool)
                 .await
                 .map_err(|e| {

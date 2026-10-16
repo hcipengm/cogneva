@@ -1,0 +1,53 @@
+-- Migration: 047_change_ledger_declared_priority
+-- How urgent the document making a declaration said the change was.
+--
+-- Numbered 047, not 042 where it was first written: `042_change_reopen` already
+-- held that number, and the runner tracks migrations by version alone -- two
+-- files numbered 042 are one migration, and whichever the directory happens to
+-- list second is skipped with no error at all. The column would then simply not
+-- exist on any database that had already applied the other 042, and the failure
+-- would surface much later and somewhere else, as an insert naming a column the
+-- table does not have.
+--
+-- A band cannot be measured. The account's state comes from looking at the tree,
+-- and no tree says that one change matters more than another; the only thing a
+-- look could offer is what happens to be stuck at the moment, which moves. A
+-- column holding that answer would be written once and never revisited, and read
+-- afterwards as if it still held -- the failure mode being that it looks exactly
+-- like a value somebody keeps current. So the band is not derived here at all: it
+-- is transcribed from the document that asks for the change, which is the only
+-- party that can state one, and it is kept per declaration rather than per change
+-- because two documents asking for the same change may ask at different bands.
+--
+-- `unstated` is a member of the closed set rather than NULL. A nullable column
+-- invites a reader to coalesce it into a band, and a coalesced band is
+-- indistinguishable from one a document actually asked for -- the reader could no
+-- longer tell "the document said P0" from "no document said", which is the
+-- reading this column exists to give. As a member it also backfills honestly:
+-- every declaration queued before this column had no band because nothing asked
+-- the question, and `unstated` is exactly that fact.
+--
+-- The default is the same member, for the same reason. It is not a default band:
+-- it is what a declaration that states none gets, and it is the value the reader
+-- is meant to see.
+--
+-- Kept on the intake rather than on `change_ledger` directly, because a
+-- declaration is where a document's own words live and the fold is what carries
+-- them into the row's cited sources. The `doc` half of the key is what makes
+-- this per-document: the same change declared by two documents keeps both bands,
+-- and a row's band is the highest of them.
+--
+-- Not part of any key. Re-prioritising a change is a withdrawal and a fresh
+-- declaration -- the same rule every other correction follows -- and folding a
+-- band into the key would make that re-prioritisation land as a second change
+-- rather than as the same change asked for more urgently.
+--
+-- The closed set is held here as well as in the contract's enum, the same
+-- three-way `state` is held: the contract names the band, this column refuses a
+-- name outside the set, and the store writes only names the enum produced. A
+-- CHECK only Postgres can hold would be a rule MySQL could not enforce; both
+-- dialects' versions are below their own file.
+
+ALTER TABLE change_ledger_declared
+    ADD COLUMN IF NOT EXISTS priority VARCHAR(16) NOT NULL DEFAULT 'unstated'
+        CHECK (priority IN ('unstated', 'p0', 'p1', 'p2', 'p3'));
