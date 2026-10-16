@@ -694,9 +694,17 @@ fn supervisor_event_to_alert_events(event: &cog_core::SupervisorEvent) -> Vec<Al
             labels.insert("next_attempt_unix".into(), next_attempt_unix.to_string());
             labels.insert("quota_window_secs".into(), quota_window_secs.to_string());
             labels.insert("unavailable".into(), unavailable.join(","));
-            // 文案在契约层只写一次，所有消费者共用同一句：这里和告警历史各写一
-            // 遍就会漂移，而漂移是静默的——两句都读得通，没有一层会报错，读的人
-            // 也无从判断该信哪句。时刻与窗口长度同样由那一句分开措辞。
+            // 文案在契约层只写一次，共用它的消费者是**这两个**：这里的通知出口，
+            // 和监督者那条进程内告警史（`cog-supervisor::alert_store`，容量
+            // `ALERT_HISTORY_MAX`）。各写一遍就会漂移，而漂移是静默的——两句都读
+            // 得通，没有一层会报错，读的人也无从判断该信哪句；时刻与窗口长度同样
+            // 由那一句分开措辞。
+            //
+            // 「共用同一句」的范围到此为止：池全灭**落进 PG 告警表**那一行不在里
+            // 面，它由 `cog-gateway::security_gateway::pool_down_message` 本地措辞
+            // （并且点名在嫌疑窗内的上游，这一句不含名单）。两边落在不同载体上，
+            // `/alerts` 那条读口会把同规则的两条合成一条，理由与挑哪一条见
+            // `POOL_ALERT_RULE` 那段注释。
             labels.insert(
                 "message".into(),
                 cog_core::pool_down_verdict(
