@@ -409,12 +409,28 @@ mod tests {
 
     #[tokio::test]
     async fn a_revision_whose_time_cannot_be_read_is_not_reported() {
+        // A tree is not a commit: the file it names is readable, but there is no
+        // instant belonging to it. The refusal is then not reported at all --
+        // stamping it with the clock instead would mint a fresh row on every
+        // pass over the same failure, which is why the instant is taken from
+        // the revision to begin with. A revision git cannot resolve at all would
+        // not tell these two behaviours apart, because the file would be
+        // unreadable too and no slug would come out either way.
         let (dir, _) = repo_with_a_declaring_file().await;
+        let tree = run_git(dir.path(), &["rev-parse", "HEAD^{tree}"])
+            .await
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(
+            commit_instant(dir.path(), &tree).await.is_none(),
+            "a tree must not have an instant of its own, or this case proves nothing"
+        );
         let store = RecordingStore::default();
         report(
             dir.path(),
             &store,
-            "0000000000000000000000000000000000000000",
+            &tree,
             "thread 'a' (1) panicked at crates/x/tests/a.rs:3:5:\n",
         )
         .await;
