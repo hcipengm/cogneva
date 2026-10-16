@@ -467,6 +467,27 @@ impl StateBackend for PostgresStateBackend {
 
         let mut events = Vec::with_capacity(rows.len());
         for (event_type, payload, offset_num, created_at) in rows {
+            // The column holds the serialized event, not its payload: the writer
+            // above stores `serde_json::to_value(event)`, so an event's own
+            // payload sits under the envelope's `payload` key. Returning the
+            // column directly put a level of wrapping in front of readers that
+            // the sibling backends do not add -- Redis round-trips the event
+            // through `serde_json` and the in-memory one keeps the `Event`
+            // itself -- so the same append read back meant two different things
+            // depending on which backend the process was wired with, and the one
+            // that diverged is the one production runs. A reader that scans a
+            // payload for a field found nothing here and everything under the
+            // backend its own tests run against.
+            //
+            // Only the payload is taken from the envelope: the row's position is
+            // the offset. A row that is not an envelope comes back as itself
+            // rather than as NULL, because appending is the only way this column
+            // is ever written -- such a row is a defect elsewhere, not a shape
+            // for this read to invent.
+            let payload = match payload.get("payload") {
+                Some(inner) => inner.clone(),
+                None => payload,
+            };
             events.push(Event {
                 offset: offset_num as u64,
                 task_id: task_id.into(),

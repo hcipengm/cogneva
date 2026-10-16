@@ -194,6 +194,16 @@ jobs:
         run: cargo test -p cog-storage --test events_offset_sequence -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The same append read back through `get_events` must mean the same event
+      # whichever backend is wired, and the one production runs stored the event
+      # itself in the payload column rather than the payload. Whether the read
+      # undoes exactly that much is a question only a server answers: an
+      # in-memory double answers it the way its own implementation behaves, and
+      # that is the implementation that was right.
+      - name: Live-DB event payload round trip
+        run: cargo test -p cog-storage --test events_payload_round_trip -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       - name: Live-DB retires a metrics name
         run: cargo test -p cog-storage --test metrics_retirement -- --ignored
         env:
