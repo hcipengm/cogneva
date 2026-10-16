@@ -160,19 +160,15 @@ enum ReadoutReader {
 #[cfg(test)]
 const READOUT_READERS: [(BackupReadout, ReadoutReader); BackupReadout::ALL.len()] = [
     (
+        // Read as a conjunction and not as a subject: the rule requires this
+        // count to be zero, so what it keeps out is a run that is open right
+        // now -- the one reading under which "nothing has ever been recorded"
+        // is still true of an installation that is being reached. A rule
+        // firing on this count rising above one was ruled out by a measurement
+        // rather than by taste, and that reasoning has not changed; the reading
+        // is here so its absence stays a fact the rule can state.
         BackupReadout::RunsRunning,
-        ReadoutReader::Unread {
-            why: "a person's reading, not a rule's: it says how many runs are open right now, and \
-                  the panel is the reader. A rule comparing it with one was ruled out by a \
-                  measurement rather than by taste -- the run is a CronJob under concurrencyPolicy \
-                  Forbid, holding its own deadline, so two open rows can only come from a run that \
-                  died before its deadline while the next one opened anyway. In that window this is \
-                  the only signal, because the dead row's age is still under its own deadline and \
-                  the deadline rule is not lit yet. That state has not happened: the highest this \
-                  value has ever read across the retained week is zero. The bar for revisiting is \
-                  that same reading crossing one -- and what such a rule would be reporting is the \
-                  account disagreeing with the cluster, not a backup in trouble.",
-        },
+        ReadoutReader::Rule("backup_nothing_ever_recorded"),
     ),
     (
         BackupReadout::RunsOk,
