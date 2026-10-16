@@ -197,6 +197,25 @@ impl ContextWindow {
                 .map(|m| estimate_tokens(&m.content()))
                 .sum();
         }
+        // 裁到底仍然超预算：这一轮就带着超额内容出站了。循环只剩 `len() <= 2`
+        // 一条出路，也就是剩下的全是地板（system 与首条 user，见上面那段 why），
+        // 没有可裁的东西了。
+        //
+        // 为什么单列这一行：外面能读到的那个数是**上游回报的真值**
+        // （账上的 `tokens_input`），而这里裁的是**估算**——两者不同尺，且估算
+        // 刻意是下界。缺这一行时，「估算低估了多少」与「窗口真的带着超额内容
+        // 出站」在读数上同形，而两种情况的处置相反：前者调估算，后者调预算或
+        // 地板。上面那条逐次裁剪留在 debug（常态，按窗口预算反复发生），
+        // 这一条是**例外**，所以报在被采集的那一级。
+        if self.current_tokens > self.max_tokens {
+            tracing::warn!(
+                budget = self.max_tokens,
+                estimated = self.current_tokens,
+                excess = self.current_tokens - self.max_tokens,
+                kept_messages = self.messages.len(),
+                "the context window goes out over budget: the floor of system plus the first user message does not fit, so trimming ran out of messages to drop"
+            );
+        }
     }
 }
 
@@ -334,6 +353,143 @@ pub use cog_core::estimate_tokens;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    /// 采集面会收到的那些字段，按值取出来——断言「打过日志」是空的，
+    /// 一个有字段名写错的读数照样会让它绿。
+    #[derive(Default, Clone, Debug)]
+    struct OverBudgetFields {
+        message: Option<String>,
+        budget: Option<u64>,
+        estimated: Option<u64>,
+        excess: Option<u64>,
+    }
+
+    impl tracing::field::Visit for OverBudgetFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = Some(format!("{value:?}").trim_matches('"').to_string());
+            }
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            match field.name() {
+                "budget" => self.budget = Some(value),
+                "estimated" => self.estimated = Some(value),
+                "excess" => self.excess = Some(value),
+                _ => {}
+            }
+        }
+    }
+
+    struct CaptureOverBudget(Arc<Mutex<Vec<OverBudgetFields>>>);
+
+    impl<S: tracing::Subscriber> Layer<S> for CaptureOverBudget {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut seen = OverBudgetFields::default();
+            event.record(&mut seen);
+            if seen
+                .message
+                .as_deref()
+                .is_some_and(|m| m.starts_with("the context window goes out over budget"))
+            {
+                self.0.lock().unwrap().push(seen);
+            }
+        }
+    }
+
+    /// 裁到底仍超预算时，这一轮必须**被自己报出来**，且报的是能拿去对账的三个数。
+    ///
+    /// 这是账侧缺的那一半：账上的 `tokens_input` 是上游回报的真值，窗口裁的是估算
+    /// 且刻意是下界 ⇒ 没有这一行时，「估算低了多少」与「真的带着超额内容出站」
+    /// 在外面同形。所以这条只判「读数在不在采集面、三个数对不对」，判不了
+    /// 「预算该不该抬」——那是另一条。
+    #[test]
+    fn a_window_that_cannot_trim_to_budget_reports_its_excess() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        // 装一层**按级别过滤**的订阅者：采集面装的就是 `COGNEVA_LOG_LEVEL`
+        // 那一级（部署里是 info），所以断言必须经过同一道闸——不然把它写回
+        // `debug!`（今天那行就是这么被挡在采集面之外的）这条用例照样绿。
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::INFO)
+            .with(CaptureOverBudget(captured.clone()));
+        let observed = tracing::subscriber::with_default(subscriber, || {
+            // 地板本身就超预算：两条消息，循环的 `len() > 2` 立刻为假。
+            let mut ctx = ContextWindow::new(10);
+            ctx.add_message(Message::system(&"系统提示词 很长 ".repeat(4)));
+            ctx.add_message(Message::user(&"任务输入 很长 ".repeat(4)));
+            assert!(
+                ctx.token_count() > 10,
+                "地板必须真的超预算，否则这条用例没有题目：{}",
+                ctx.token_count()
+            );
+            ctx.token_count()
+        });
+
+        let seen = captured.lock().unwrap().clone();
+        // 一次 `add_message` 报一条（每条消息加进来都各裁一次），所以条数对得上
+        // 「结束在预算之外的那几次调用」；这里两条都对得上，没多报也没漏报。
+        assert_eq!(seen.len(), 2, "每条落在预算外的入队各报一条：{seen:?}");
+        for ev in &seen {
+            assert_eq!(ev.budget, Some(10), "报的必须是**这次生效**的预算：{ev:?}");
+            assert_eq!(
+                ev.excess,
+                ev.estimated.map(|e| e - 10),
+                "超额量必须是估算减预算，不是另算一遍：{ev:?}"
+            );
+        }
+        let last = seen.last().unwrap();
+        assert_eq!(
+            last.estimated,
+            Some(observed as u64),
+            "最后一条报的必须是**最终出站**那一份估算"
+        );
+    }
+
+    /// 另一侧：裁得下来的窗口**不许**报超额——不然这一行会退化成「每次调用都报」，
+    /// 而它唯一的价值就是指出例外。
+    #[test]
+    fn a_window_that_trims_to_budget_reports_no_excess() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        // 装一层**按级别过滤**的订阅者：采集面装的就是 `COGNEVA_LOG_LEVEL`
+        // 那一级（部署里是 info），所以断言必须经过同一道闸——不然把它写回
+        // `debug!`（今天那行就是这么被挡在采集面之外的）这条用例照样绿。
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::INFO)
+            .with(CaptureOverBudget(captured.clone()));
+        let over = tracing::subscriber::with_default(subscriber, || {
+            let mut ctx = ContextWindow::new(200);
+            ctx.add_message(Message::system("系统提示词"));
+            ctx.add_message(Message::user("任务输入"));
+            ctx.add_message(Message::assistant(vec![cog_core::ContentBlock::tool_call(
+                "c1",
+                "run_command",
+                serde_json::json!({"command": "ls"}),
+            )]));
+            ctx.add_message(Message::tool_result_text(
+                "c1",
+                "run_command",
+                &"输出 ".repeat(400),
+            ));
+            assert!(
+                ctx.token_count() <= 200,
+                "裁完之后必须在预算内，否则这条用例的另一侧不成立：{}",
+                ctx.token_count()
+            );
+            ctx.token_count()
+        });
+        assert!(over <= 200);
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "裁得下来的窗口报了超额：{:?}",
+            captured.lock().unwrap()
+        );
+    }
 
     #[test]
     fn trim_never_leaves_orphan_tool_result_at_head() {

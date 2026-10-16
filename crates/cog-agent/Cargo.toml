@@ -27,4 +27,7 @@ futures = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# 断言「这一行读数到了采集面」要按**字段值**读它，不是断言「打过日志」——
+# 与 cog-memory 的落库读数同一条纪律，所以这里也直接装一层捕获。
+tracing-subscriber = { workspace = true }
 
