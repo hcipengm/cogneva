@@ -1009,3 +1009,90 @@ fn every_dashboard_a_configmap_ships_is_one_grafana_can_load() {
         }
     }
 }
+
+const PANELS_JUDGING_A_SERIES_THIS_BUILD_PUBLISHES: usize = 0;
+
+/// 带阈值、且阈值画在这棵树自己产出的序列上的面板，有几块。
+///
+/// 这个数**不是判词，是读数**，钉成常数是为了让「这个总体第一次非空」变成一次红灯，
+/// 而不是一件要有人记得去看的事。
+///
+/// 它守的边界是：一块面板可以把它自己的判据（`fieldConfig.defaults.thresholds.steps`
+/// 的档）画在某根序列上，而一条规则在同一根序列上按 promql 里的比较判——两边给出
+/// **不同的界**，今天没有任何东西会红。这条边界的第一版谓词（「面板读的序列不许同时
+/// 出现在规则的 promql 里」）被反例普查打死：同读一根是**正当布局**（规则侧 122 个名字、
+/// 面板侧 58 个、交集 20，20/20 都正当），照它落门会恒红。订正后的谓词改为判**判断**
+/// 而不是判**对象**（面板的档 vs 规则的比较），于是可判的前提是**面板侧的判据要被读出来**
+/// ——而今天没有读者：`dashboard::metric_exprs` 只走 `expr`，不读 `thresholds`。
+///
+/// 所以这条测试先把那个读者建出来：它替「届时要写的那条禁令」产出**输入**。今天这个数
+/// 是 0，因为唯一带阈值的那块面板读的是 `sum(ALERTS{alertstate="firing"})`，不是本进程
+/// 能写出的任何一根序列 ⇒ 这个危害今天没有主体（在没有主体的地方写禁令就是写一条恒绿的
+/// 门，那是记账不是判据）。第一次非空的那天，这条边界才第一次可判，要写的是禁令本身。
+#[test]
+fn a_panel_that_judges_a_series_this_build_publishes_is_counted() {
+    let text = dashboard_text();
+    let blocks = configmap_data_blocks(&text);
+    let mut judging: Vec<String> = Vec::new();
+    let mut panels_seen = 0usize;
+    for (key, value) in blocks {
+        let model: serde_json::Value = serde_json::from_str(&value)
+            .unwrap_or_else(|e| panic!("{key} 不是合法 JSON，面板读不出来: {e}"));
+        let Some(panels) = model.get("panels").and_then(|p| p.as_array()) else {
+            continue;
+        };
+        for panel in panels {
+            panels_seen += 1;
+            let judged: BTreeSet<String> = panel
+                .get("targets")
+                .and_then(|t| t.as_array())
+                .map(|targets| {
+                    targets
+                        .iter()
+                        .filter_map(|t| t.get("expr").and_then(|e| e.as_str()))
+                        // 日志查询按 label 选、不点序列名，抽取器会把 `$var` 读成名字。
+                        .filter(|expr| !is_log_query(expr))
+                        .flat_map(metric_names_in)
+                        .filter(|n| closed_set::a_series_this_build_publishes(n))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if judged.is_empty() {
+                continue;
+            }
+            // `steps` 的第一档是 Grafana 的底色（`value: null`），不是判据的界；有 `steps`
+            // 的块就算带判据，档数只用来报数。
+            let steps = panel
+                .pointer("/fieldConfig/defaults/thresholds/steps")
+                .and_then(|s| s.as_array())
+                .map(Vec::len)
+                .unwrap_or(0);
+            if steps == 0 {
+                continue;
+            }
+            let title = panel
+                .get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or("<无标题>");
+            judging.push(format!(
+                "{key} / {title}：{steps} 档，画在 {}",
+                judged.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
+    }
+    assert!(
+        panels_seen > 0,
+        "一块面板都没读到，这条读数会变成空转（面板 JSON 的解析面换了形状？）"
+    );
+    assert_eq!(
+        judging.len(),
+        PANELS_JUDGING_A_SERIES_THIS_BUILD_PUBLISHES,
+        "带阈值、且阈值画在这棵树自己产出的序列上的面板数变了（现在 {}，常数 {}）：\n{}\n\
+         第一次非空 ⇒ 这条边界第一次可判，该写的是禁令（一块面板的档不许与同一根序列上某条\n\
+         规则的比较给出不同的界），而不是继续钉着这个数；变少 ⇒ 那是把判据从面板上撤了，\n\
+         同样要说明为什么。",
+        judging.len(),
+        PANELS_JUDGING_A_SERIES_THIS_BUILD_PUBLISHES,
+        judging.join("\n")
+    );
+}
