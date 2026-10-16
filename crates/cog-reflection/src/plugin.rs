@@ -1965,7 +1965,8 @@ fn discovery_probe_task(probe: &crate::types::DiscoveryTask) -> (String, cog_cor
     (goal, task)
 }
 
-/// 一轮发现：生成、逐条提交、**按受理**退场。返回（生成数、受理数、被拒数）。
+/// 一轮发现：生成、逐条提交、**按受理**退场。返回这一轮的账（`DiscoveryRound`），
+/// 其中交出去的那几条带着 id 出去——结局要等编排器跑完，下一拍才收得回来。
 ///
 /// 抽成函数不是为了复用，是为了让这一格的判据**能被打断地量到**：拿一次受理与一次
 /// 拒绝喂进来，看被拒的那条组合下一轮还在不在池子里。此前它只由源码形状守（窗口夹在
@@ -1978,7 +1979,7 @@ async fn run_discovery_round<F, Fut>(
     tool_names: &[String],
     skill_ids: &[String],
     max_tasks: usize,
-) -> (usize, usize, usize)
+) -> DiscoveryRound
 where
     F: Fn(String, cog_core::Task) -> Fut + Send,
     Fut: std::future::Future<Output = cog_core::SFResult<Vec<String>>> + Send,
@@ -1989,21 +1990,32 @@ where
     let generated = tasks.len();
     let mut submitted = 0usize;
     let mut refused = 0usize;
+    let mut handed_over: Vec<(String, crate::types::DiscoveryTask, u64)> = Vec::new();
 
     for probe in tasks {
         let (goal, task) = discovery_probe_task(&probe);
+        // 交出去之前把这条任务**自己声明的执行契约**取下来：它决定这条探针多久
+        // 没结局就该作废，见 `outcome_deadline`。取在这里是因为 `task` 下面那一步
+        // 就交给编排器了，交出去之后这一侧再也读不到它。
+        let timeout_secs = task.timeout_seconds;
         // 返回值不当成败判：它只说这一趟往图里加了几行（已经在图里的幂等提交不算数），
         // 离「这条探针跑成了没有」还隔着一整条回路。那一段要先把 `TaskType::Custom`
         // 的结局在哪个面可读量出来，在那之前把 Ok 读成成功就是拿「提交成功」冒充
         // 「任务成功」。所以这里只看 Err。
         match submit(goal, task).await {
-            Ok(_) => {
+            Ok(ids) => {
                 // 组合在**受理**之后才退场，不在生成时。被拒的那条留在池子里、下一轮
                 // 原样再来：拒一次不是试过一次，在生成时就退掉等于拿一次拒把组合
                 // 花掉——第一轮即可清空池子，此后每轮都读到「没有新组合」，与
                 // 「搜索空间已穷尽」同形。
                 engine.mark_explored(&probe).await;
                 submitted += 1;
+                // 受理和跑完是两件事，所以受理的这一刻要把「欠着一条结局」记下来。
+                // 空列表（幂等提交，那件事已经在图里）不记：它的结局归**早先交出
+                // 它的那一拍**管，这里再记一行就是同一件事记两遍。
+                if let Some(id) = ids.first() {
+                    handed_over.push((id.clone(), probe, timeout_secs));
+                }
             }
             Err(e) => {
                 refused += 1;
@@ -2016,7 +2028,151 @@ where
         }
     }
 
-    (generated, submitted, refused)
+    DiscoveryRound {
+        generated,
+        submitted,
+        refused,
+        handed_over,
+    }
+}
+
+/// 一轮交出去之后的账：生成／受理／被拒，加上这一轮交出去、**结局还没回来**的探针。
+///
+/// 把「交出去的每一条」从这一层带出去，是因为收回结局的那一拍在别处：
+/// 结局要等编排器把任务跑完，而这一轮不等它（见 `settle_discovery_outcomes`）。
+#[derive(Debug, Default)]
+pub(crate) struct DiscoveryRound {
+    pub generated: usize,
+    pub submitted: usize,
+    pub refused: usize,
+    /// 每条是（编排器给的任务 id，探针本体，这条任务声明的执行契约秒数）。
+    pub handed_over: Vec<(String, crate::types::DiscoveryTask, u64)>,
+}
+
+/// 一条已经交出去、结局还没收回来的探针。
+struct PendingProbe {
+    task_id: String,
+    probe: crate::types::DiscoveryTask,
+    /// 过了这一刻还没结束，这条探针就从册子上作废（记成 `expired`）。
+    deadline: std::time::Instant,
+}
+
+/// 一条探针的结局最晚什么时候该回来。
+///
+/// 由**那条任务自己的执行契约**导出，不钉一个数：`Task::new` 写的
+/// `timeout_seconds` 就是这套系统对「这条任务最多跑多久」的声明，越界的那条路径
+/// 会把它收成 `Failed`——于是它走 `run_ended_without_result` 那一格，而不是
+/// 留在这里。
+///
+/// 契约之外再加 `OUTCOME_QUEUE_MARGIN_ROUNDS` 轮，因为执行契约只覆盖**开跑之后**：
+/// 探针还要在 ready 队列里等一个执行槽，而那段没有任何声明。余量按这条环自己的
+/// 节拍算是就地可读的（一轮的时长就是 `period`），比钉一个秒数更经得起节拍调整。
+///
+/// 这个边界怎么重新量：轮次那一行里 `still_open` 长期非零而任务其实早就结束了 ⇒
+/// 余量偏小；`expired` 有值而任务随后仍跑出结果 ⇒ 同一个方向。两者恒为 0 而
+/// `row_missing` 有值 ⇒ 这块册子根本收不到东西，别再抬。
+fn outcome_deadline(timeout_secs: u64, period: std::time::Duration) -> std::time::Instant {
+    std::time::Instant::now()
+        + std::time::Duration::from_secs(timeout_secs)
+        + period * OUTCOME_QUEUE_MARGIN_ROUNDS
+}
+
+/// 执行契约之外多等几轮。见 `outcome_deadline`：它是一段**没有声明**的排队时间
+/// 的覆盖位，所以是一个标了来源的数，而不是一条实测出来的界。
+const OUTCOME_QUEUE_MARGIN_ROUNDS: u32 = 3;
+
+/// 一拍里每条在册探针各走了哪个出口，一个出口一个数。
+///
+/// 不合并计数：`0 个已判` 在合并下有两种含义同形——册子是空的，和在册的全都
+/// 没带判词回来——而那两种含义指向完全不同的下一步（一个什么都不用做，一个是
+/// 「这条环没有判官」本身）。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OutcomeTally {
+    /// 结局带回判词且已记账。
+    pub validated: usize,
+    pub rejected: usize,
+    pub inconclusive: usize,
+    /// 结局读到了，里面没有判词。
+    pub unanswered: usize,
+    /// 任务以失败／取消收场，没有结果可读。
+    pub run_ended_without_result: usize,
+    /// 册子上的那条任务这一拍查不到了。
+    pub row_missing: usize,
+    /// 等过寿命，这条探针作废，不再等在册上。
+    pub expired: usize,
+    /// 还没结束，留在册上。
+    pub still_open: usize,
+    /// 判词读到了，学习没记进去（记录器报错）。
+    pub not_recorded: usize,
+}
+
+/// 把已经交出去的探针的结局收回来：每条只读一次，**不等它跑完**。
+///
+/// 每轮每条探针读一次 `get_task`，读完立刻判：结局面里带着判词就交给引擎记账，
+/// 没带判词就记「未测」，还没结束就留在册上等下一轮。不在任何一条上 await 到
+/// 结束——探针走的是普通任务路径，一条要跑几分钟到几十分钟，等它就把整条环停在
+/// 那一条上（同文件那条「认领消息不能串行处理」的理由）。
+///
+/// 结局是什么由引擎判，这里不自己解释载荷：判断的入口只有
+/// `ReflectionEngine::evaluate_discovery_result` 一处，第二处读法就是第二份语法。
+async fn settle_discovery_outcomes<G, FutG>(
+    engine: &crate::ReflectionEngine,
+    pending: &mut Vec<PendingProbe>,
+    fetch: G,
+) -> OutcomeTally
+where
+    G: Fn(String) -> FutG,
+    FutG: std::future::Future<Output = Option<cog_core::Task>>,
+{
+    let mut tally = OutcomeTally::default();
+    let mut kept: Vec<PendingProbe> = Vec::with_capacity(pending.len());
+    for entry in pending.drain(..) {
+        let row = fetch(entry.task_id.clone()).await;
+        match row.as_ref().map(|t| t.status) {
+            None => tally.row_missing += 1,
+            Some(cog_core::TaskStatus::Completed) => {
+                let payload = row.as_ref().and_then(|t| t.result.as_ref());
+                match engine
+                    .evaluate_discovery_result(&entry.probe, payload)
+                    .await
+                {
+                    Ok(crate::types::DiscoveryStatus::Validated) => tally.validated += 1,
+                    Ok(crate::types::DiscoveryStatus::Rejected) => tally.rejected += 1,
+                    Ok(crate::types::DiscoveryStatus::Inconclusive) => tally.inconclusive += 1,
+                    Ok(crate::types::DiscoveryStatus::Unmeasured) => tally.unanswered += 1,
+                    // 判词这一路写不出这两个非终态。真出现了说明上面那张表被改过，
+                    // 这里不吞掉它，也不把它记成上面任何一格。
+                    Ok(other) => debug!(
+                        task_id = %entry.task_id,
+                        status = ?other,
+                        "discovery probe came back with a status this reading does not expect"
+                    ),
+                    Err(e) => {
+                        tally.not_recorded += 1;
+                        warn!(
+                            task_id = %entry.task_id,
+                            error = %e,
+                            "discovery verdict read but not recorded"
+                        );
+                    }
+                }
+            }
+            Some(cog_core::TaskStatus::Failed) | Some(cog_core::TaskStatus::Cancelled) => {
+                tally.run_ended_without_result += 1;
+            }
+            // 还在路上（Pending / Scheduled / Running）：到期就作废，否则留着。
+            Some(_) => {
+                if std::time::Instant::now() >= entry.deadline {
+                    tally.expired += 1;
+                } else {
+                    tally.still_open += 1;
+                    kept.push(entry);
+                }
+            }
+        }
+    }
+    *pending = kept;
+    tally
 }
 
 /// 这条环缺的是哪几样输入——**逐样点名，缺几样印几行**。
@@ -2179,6 +2335,10 @@ fn spawn_discovery_loop(
             let skill_registry = skill_registry.clone();
             let orchestrator = orchestrator.clone();
             let discovery = discovery.clone();
+            // 收结局那一拍要的是**引擎**而不是 `DiscoveryEngine`：判词怎么读只有一处
+            // （`ReflectionEngine::evaluate_discovery_result`），这一侧不自己再读一遍
+            // 载荷。
+            let outcome_engine = engine.clone();
             let pool_gate = pool_gate.clone();
             let role_broker = role_broker.clone();
             let shutdown = shutdown.clone();
@@ -2198,6 +2358,9 @@ fn spawn_discovery_loop(
                 // 下一轮 `RoleHold::start` 就把空着的角色领回来。
                 let mut held: Option<cog_core::RoleHold> = None;
                 let mut interval = tokio::time::interval(period);
+                // 交出去、结局还没回来的探针。**跨轮**留着，所以声明在 `loop` 外面：
+                // 受理与跑完之间隔着编排器那一整条路，同一拍里收不回来。
+                let mut pending: Vec<PendingProbe> = Vec::new();
                 // 连续被扣住的轮数，这一支**唯一**的时长读数：池闸关着是正常态，
                 // 而「刚关上」与「关了 6 小时」在这一句里长得一模一样。
                 let mut held_rounds: u64 = 0;
@@ -2284,6 +2447,35 @@ fn spawn_discovery_loop(
                         held_rounds = 0;
                     }
 
+                    // 先把已经交出去的探针的结局收回来。**在生成之前**：这一拍要不要再
+                    // 生成看的是池子（受理那一刻已过滤），与结局无关；但两件事放在同一拍
+                    // 的日志里，读数才在同一个窗口上。
+                    let waiting_before = pending.len();
+                    let outcomes = settle_discovery_outcomes(&outcome_engine, &mut pending, |id| {
+                        let orchestrator = orchestrator.clone();
+                        async move { orchestrator.get_task(&id).await }
+                    })
+                    .await;
+                    if waiting_before > 0 {
+                        // 一处出口、一行读数、每个出口一个数：合并成「收了 N 条」会让
+                        // 「全都读到了判词」与「全都没带判词回来」逐字同形，而后者正是
+                        // 「这条环还没有判官」那条发现本身。
+                        info!(
+                            role = SELF_DISCOVERY_ROLE,
+                            waited = waiting_before,
+                            validated = outcomes.validated,
+                            rejected = outcomes.rejected,
+                            inconclusive = outcomes.inconclusive,
+                            unanswered = outcomes.unanswered,
+                            run_ended_without_result = outcomes.run_ended_without_result,
+                            row_missing = outcomes.row_missing,
+                            expired = outcomes.expired,
+                            still_open = outcomes.still_open,
+                            not_recorded = outcomes.not_recorded,
+                            "discovery probe outcomes read back"
+                        );
+                    }
+
                     let tool_names = tool_registry.names();
                     // 一轮的宽度以工具面自身的大小为界，不钉一个数：工具面翻倍时
                     // 这一轮跟着放宽，而生成器自己按组合去重，试过的不再出现——
@@ -2296,7 +2488,7 @@ fn spawn_discovery_loop(
                         }
                         None => Vec::new(),
                     };
-                    let (generated, submitted, refused) = run_discovery_round(
+                    let round = run_discovery_round(
                         &discovery,
                         |goal, task| {
                             let orchestrator = orchestrator.clone();
@@ -2307,7 +2499,17 @@ fn spawn_discovery_loop(
                         max_tasks,
                     )
                     .await;
-                    if generated == 0 {
+                    // 受理了就要欠着一条结局——**这一句是回程的入口**。少了它，
+                    // `evaluate_discovery_result` 又一次没有调用者，而这条环会在每一拍
+                    // 重新问同一个问题、没有任何一条证据留下来。
+                    for (task_id, probe, timeout_secs) in round.handed_over {
+                        pending.push(PendingProbe {
+                            task_id,
+                            probe,
+                            deadline: outcome_deadline(timeout_secs, period),
+                        });
+                    }
+                    if round.generated == 0 {
                         debug!(
                             tools = tool_names.len(),
                             "discovery round: every combination in reach has been tried"
@@ -2318,8 +2520,8 @@ fn spawn_discovery_loop(
                     info!(
                         tools = tool_names.len(),
                         skills = skill_ids.len(),
-                        submitted,
-                        refused,
+                        submitted = round.submitted,
+                        refused = round.refused,
                         "autonomous discovery round"
                     );
                 }
@@ -4935,7 +5137,7 @@ mod tests {
             .collect();
         assert!(!refused_keys.is_empty(), "one round proposes more than one");
 
-        let (generated, submitted, refused) = run_discovery_round(
+        let round = run_discovery_round(
             &engine,
             |_goal, task| {
                 let key = task
@@ -4962,10 +5164,18 @@ mod tests {
         .await;
 
         assert_eq!(
-            (generated, submitted, refused),
+            (round.generated, round.submitted, round.refused),
             (first.len(), 1, first.len() - 1),
             "一轮的账：生成 {} 条、受理一条、其余全拒",
             first.len()
+        );
+        // 受理的那一条必须**带着 id 出去**：回程靠它把结局认回来。只数受理数
+        // 不够——交出去的账要是空的，这一轮照样报「受理 1 条」，而那条探针的结局
+        // 永远不会有人读，与「没有回程」逐字同形。
+        assert_eq!(
+            round.handed_over.len(),
+            1,
+            "受理的那条探针要带着 id 出去，否则它的结局没人收"
         );
 
         let after = engine.generate_tasks(&tools, &[], 64).await;
@@ -4980,6 +5190,136 @@ mod tests {
                 "被拒的 {key} 也要留在池子里等下一轮，否则一次拒绝就把组合花掉了：{after_keys:?}"
             );
         }
+    }
+
+    /// 一条探针的结局在册子上长什么样：一条跑完的任务行。
+    fn task_row(
+        task_id: &str,
+        status: cog_core::TaskStatus,
+        result: Option<serde_json::Value>,
+    ) -> cog_core::Task {
+        let mut task = cog_core::Task::new(
+            task_id.to_string(),
+            cog_core::TaskType::Custom("capability_discovery".into()),
+            serde_json::json!({}),
+        );
+        task.status = status;
+        task.result = result;
+        task
+    }
+
+    fn pending_probe(
+        probe: &crate::types::DiscoveryTask,
+        task_id: &str,
+        timeout_secs: u64,
+    ) -> PendingProbe {
+        PendingProbe {
+            task_id: task_id.to_string(),
+            probe: probe.clone(),
+            deadline: outcome_deadline(timeout_secs, std::time::Duration::from_secs(60)),
+        }
+    }
+
+    /// **结局收回来了，但里面没有判词**——这一格要数得出来，不能沉默。
+    ///
+    /// 守的是这条环今天真实的形态：探针被通用执行者接走（`CollaborationExecutor`
+    /// 的 `supports` 除 `WasmSkill` 外全认），跑完之后那条任务的结局里写的是
+    /// 「那次 codegen 的产出」，与「这条组合被评估过没有」是两个命题。这条测试量
+    /// 四个出口：读到这种结局记 `unanswered`（不记学习、也不算没发生）；一条带真
+    /// 判词的结局落到它自己那一格并留下一条学习；还在跑的那条留在册上等下一轮；
+    /// **带判词这个键、值却不在闭集里的那条也记 `unanswered`**——两个没人答的取值
+    /// 在读数上合成一格，但它们在**解析**上必须是两格：少了这一条，「闭集外的取值当场
+    /// 读成 `validated`」这个变异在整棵树上没有用例会红（解析器只有这一个调用点）。
+    ///
+    /// 计数不是装饰：合并成一句「收了 N 条」会让「全都答了」与「全都没答」逐字
+    /// 同形，而后者正是「这条环还没有判官」那条发现本身。
+    #[tokio::test]
+    async fn an_outcome_without_a_verdict_is_counted_rather_than_silent() {
+        use cog_core::contract::task::DISCOVERY_VERDICT_FIELD;
+
+        let recorder = std::sync::Arc::new(crate::recorder::InMemoryRecorder::new());
+        // 读回学习要用 trait 上的 `list_learnings`，它不在本模块的作用域里。
+        use crate::recorder::LearningRecorder;
+        let mut engine = crate::ReflectionEngine::new_in_memory(std::sync::Arc::new(
+            tokio::sync::RwLock::new(cog_core::SkillRegistry::new()),
+        ));
+        engine.discovery = Some(std::sync::Arc::new(crate::DiscoveryEngine::new(
+            recorder.clone(),
+        )));
+
+        let tools: Vec<String> = ["read_file", "run_command", "write_file"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let probes = engine
+            .discovery
+            .as_ref()
+            .expect("discovery engine attached")
+            .generate_tasks(&tools, &[], 4)
+            .await;
+        assert!(
+            probes.len() >= 4,
+            "这一格要四条探针，只生成到 {} 条",
+            probes.len()
+        );
+
+        let mut pending: Vec<PendingProbe> = vec![
+            // 结局里没有判词：正是通用 codegen 那条路今天交回来的东西。
+            pending_probe(&probes[0], "p-unmeasured", 60),
+            // 结局里带着判词。
+            pending_probe(&probes[1], "p-validated", 60),
+            // 还没跑完：契约没过期，留在册上。
+            pending_probe(&probes[2], "p-running", 3600),
+            // 有判词这个键，值却不在闭集里：一个改了措辞的生产者。
+            pending_probe(&probes[3], "p-unrecognized", 60),
+        ];
+
+        let tally = settle_discovery_outcomes(&engine, &mut pending, |id| async move {
+            match id.as_str() {
+                "p-unmeasured" => Some(task_row(
+                    "p-unmeasured",
+                    cog_core::TaskStatus::Completed,
+                    Some(serde_json::json!({ "output": "codegen finished" })),
+                )),
+                "p-validated" => Some(task_row(
+                    "p-validated",
+                    cog_core::TaskStatus::Completed,
+                    Some(serde_json::json!({
+                        DISCOVERY_VERDICT_FIELD: "validated",
+                        "discovery_notes": "held on 3/3 cases",
+                    })),
+                )),
+                "p-unrecognized" => Some(task_row(
+                    "p-unrecognized",
+                    cog_core::TaskStatus::Completed,
+                    Some(serde_json::json!({ DISCOVERY_VERDICT_FIELD: "looks-good" })),
+                )),
+                _ => Some(task_row("p-running", cog_core::TaskStatus::Running, None)),
+            }
+        })
+        .await;
+
+        assert_eq!(
+            tally,
+            OutcomeTally {
+                validated: 1,
+                unanswered: 2,
+                still_open: 1,
+                ..Default::default()
+            },
+            "四个出口各一条，其余格必须是 0：多出来的那一格说明有探针走了别的路"
+        );
+        assert_eq!(pending.len(), 1, "只有还没结束的那条留在册上");
+        assert_eq!(pending[0].task_id, "p-running");
+        assert_eq!(
+            recorder
+                .list_learnings(None)
+                .await
+                .expect("list_learnings")
+                .len(),
+            1,
+            "带判词的那条要留下一条学习；没判词的那两条一条都不许留"
+        );
     }
 
     /// **供给面那道门拒的时候，缺的是哪一样要点得出来。**

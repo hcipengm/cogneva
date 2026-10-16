@@ -985,16 +985,35 @@ impl ReflectionEngine {
         Ok(())
     }
 
-    /// Evaluate a discovery task result.
+    /// Read a finished discovery probe's outcome off the task row it completed
+    /// as, and hand the verdict to the engine.
+    ///
+    /// The caller passes the **payload**, not a success flag: the probe is
+    /// claimed by whichever executor accepts its task type, so the outcome of
+    /// the run that carried it is a statement about that run. Only a verdict
+    /// the producer wrote about the combination itself is a statement about the
+    /// combination, and it is looked up under the key the two sides agree on
+    /// (`cog_core::contract::task`). A payload that does not carry one reads as
+    /// [`crate::types::DiscoveryStatus::Unmeasured`] — a reading of its own,
+    /// which is what makes "no producer answers yet" countable rather than
+    /// silent.
     pub async fn evaluate_discovery_result(
         &self,
         task: &crate::types::DiscoveryTask,
-        success: bool,
-        notes: &str,
+        result: Option<&serde_json::Value>,
     ) -> cog_core::SFResult<crate::types::DiscoveryStatus> {
+        let verdict = cog_core::contract::task::DiscoveryVerdict::of(result);
+        let notes = result
+            .and_then(|r| r.get(cog_core::contract::task::DISCOVERY_NOTES_FIELD))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         match self.discovery {
-            Some(ref disc) => disc.evaluate_result(task, success, notes).await,
-            None => Ok(crate::types::DiscoveryStatus::Inconclusive),
+            Some(ref disc) => disc.evaluate_result(task, verdict, notes).await,
+            // No engine means no reader for this probe's outcome, which is not
+            // a verdict about it either: reporting `Inconclusive` here would
+            // put a measurement that never happened into the same cell as one
+            // that did and settled nothing.
+            None => Ok(crate::types::DiscoveryStatus::Unmeasured),
         }
     }
 

@@ -4,7 +4,11 @@
 //! combinations, parameter ranges, cross-domain transfers, and boundary
 //! conditions.  Successful discoveries enter the standard five-phase
 //! learning pipeline; failures are recorded as negative learnings to avoid
-//! repeated exploration.
+//! repeated exploration.  Both of those need a verdict about the combination
+//! itself, which the probe's run carries back under its own key: a run that
+//! comes back without one is recorded as unmeasured, and nothing is written to
+//! the pipeline for it — a probe that was never evaluated has no finding to
+//! file, and a finding filed there is promoted to a skill.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -15,6 +19,7 @@ use tracing::{debug, info, warn};
 
 use crate::types::{DiscoveryStatus, DiscoveryStrategy, DiscoveryTask};
 use crate::LearningRecorder;
+use cog_core::contract::task::DiscoveryVerdict;
 use cog_core::SFResult;
 
 /// Engine that generates and evaluates exploratory discovery tasks.
@@ -194,24 +199,37 @@ impl DiscoveryEngine {
         tasks
     }
 
-    /// Evaluate the result of an executed discovery task and decide whether
-    /// it produced a valuable new capability.
+    /// Record what a probe's **own** verdict says about the combination it was
+    /// one attempt at, and decide whether it enters the learning pipeline.
+    ///
+    /// The verdict is an argument type rather than a `bool` for the reason the
+    /// probe is easy to get wrong: the probe is claimed by whichever executor
+    /// accepts its task type, so the run that carries it reports whether *it*
+    /// succeeded, and passing that here is now a compile error instead of a
+    /// judgement call. Nobody's answer is not an answer.
+    ///
+    /// [`DiscoveryVerdict::Absent`] and [`DiscoveryVerdict::Unrecognized`] —
+    /// a producer that said nothing, or said it in a vocabulary this reader
+    /// does not know — record nothing and return
+    /// [`DiscoveryStatus::Unmeasured`]. A learning filed against a question
+    /// nobody asked costs more than no learning: it enters the same pipeline
+    /// that promotes skills and it reads exactly like a real finding. The
+    /// combination is left where it is as well — it left the pool when its
+    /// submission was accepted, and this reading does not move it, because
+    /// "the attempt was never answered" says nothing about the combination.
     pub async fn evaluate_result(
         &self,
         task: &DiscoveryTask,
-        success: bool,
+        verdict: DiscoveryVerdict,
         notes: &str,
     ) -> SFResult<DiscoveryStatus> {
-        let status = if success {
-            // Heuristic: if the task succeeded and notes are non-empty,
-            // consider it validated.
-            if !notes.is_empty() && notes.len() > 20 {
-                DiscoveryStatus::Validated
-            } else {
-                DiscoveryStatus::Inconclusive
+        let status = match verdict {
+            DiscoveryVerdict::Validated => DiscoveryStatus::Validated,
+            DiscoveryVerdict::Rejected => DiscoveryStatus::Rejected,
+            DiscoveryVerdict::Inconclusive => DiscoveryStatus::Inconclusive,
+            DiscoveryVerdict::Absent | DiscoveryVerdict::Unrecognized => {
+                DiscoveryStatus::Unmeasured
             }
-        } else {
-            DiscoveryStatus::Rejected
         };
 
         match status {
@@ -228,7 +246,7 @@ impl DiscoveryEngine {
                     cog_core::Priority::High,
                     cog_core::Area::Config,
                     format!("Discovery: {}", task.hypothesis),
-                    format!("Result: {}\nNotes: {}", success, notes),
+                    format!("Verdict: {}\nNotes: {}", verdict.as_str(), notes),
                     "Extract as new skill or best practice",
                     cog_core::LearningSource::SelfReview,
                 );
@@ -244,7 +262,7 @@ impl DiscoveryEngine {
                     cog_core::Priority::Low,
                     cog_core::Area::Config,
                     format!("Negative discovery: {}", task.hypothesis),
-                    format!("Failed with notes: {}", notes),
+                    format!("Refuted with notes: {}", notes),
                     "Avoid this combination in future",
                     cog_core::LearningSource::SelfReview,
                 );
@@ -256,7 +274,22 @@ impl DiscoveryEngine {
                     "Discovery inconclusive — needs more data"
                 );
             }
-            _ => {}
+            // The two unanswered cases record no learning and say which one it
+            // was: a producer that ran and said nothing is the shape of a probe
+            // with no judge, while a value outside the closed set is a broken
+            // agreement between the two sides. Printing them as one line would
+            // make a producer that changed its wording read as a path that was
+            // simply never finished.
+            DiscoveryStatus::Unmeasured => {
+                info!(
+                    task_id = %task.id,
+                    cause = verdict.as_str(),
+                    "Discovery unmeasured — no verdict came back, nothing recorded"
+                );
+            }
+            // The two non-terminal states are written at generation; a verdict
+            // is read off a finished run, so neither can appear here.
+            DiscoveryStatus::Pending | DiscoveryStatus::Running => {}
         }
 
         Ok(status)
@@ -397,5 +430,69 @@ mod tests {
                 keys(&after)
             );
         }
+    }
+
+    /// **没人答的探针不记学习、也不动退场**，而「没人答」是一格有名字的读数。
+    ///
+    /// 这条守的是一个真跑得出来的坏法：探针被通用执行者认领，跑完之后它那条结局
+    /// 里写的是「那次 codegen 成没成」——与「这条组合被评估过没有」是两个命题。
+    /// 旧形状（一个 `success: bool` 加一句 `notes` 长度判据）会把这句无关的跑成功
+    /// 记成 `Insight` 学习，而 `Insight` 要进五阶段、会被提成技能：等于拿一次
+    /// 无关的跑成功去推动「这条组合值得推广」。现在这一格从**类型**上关掉了——
+    /// 判词是闭集，「没人答」在里面有两个各自有名字的取值，两者都只能得到
+    /// `Unmeasured`，走不进任何一条记学习的臂。
+    ///
+    /// 反面对照是同一个入口上的 `Validated`：它**要**记一条学习。没有这一半，
+    /// 「没记」也可能只是因为这条路整个没接上，两种成因在读数上同形。
+    ///
+    /// 退场也一并钉住：组合只在**受理**那一刻离池，读到一个没判词的结局不是
+    /// 「它被评估过」的证据，所以这一读法不许把它推走。
+    #[tokio::test]
+    async fn a_probe_nobody_answered_records_nothing_and_retires_nothing() {
+        let recorder = Arc::new(InMemoryRecorder::new());
+        let engine = DiscoveryEngine::new(recorder.clone());
+        let tools = tools();
+        let probe = engine.generate_tasks(&tools, &[], 8).await.remove(0);
+
+        for verdict in [DiscoveryVerdict::Absent, DiscoveryVerdict::Unrecognized] {
+            let status = engine
+                .evaluate_result(&probe, verdict, "the codegen run succeeded")
+                .await
+                .expect("evaluate_result");
+            assert_eq!(
+                status,
+                DiscoveryStatus::Unmeasured,
+                "{} 不是判词，不许读成任何一档结局",
+                verdict.as_str()
+            );
+        }
+        assert!(
+            recorder
+                .list_learnings(None)
+                .await
+                .expect("list_learnings")
+                .is_empty(),
+            "没人答的探针不许留下学习：那条学习会进五阶段、被提成技能"
+        );
+        let again = engine.generate_tasks(&tools, &[], 8).await;
+        assert!(
+            again.iter().any(|t| t.explored_key == probe.explored_key),
+            "读到一个没判词的结局就把组合退掉，等于拿「没人答」当「不用再试」"
+        );
+
+        let status = engine
+            .evaluate_result(&probe, DiscoveryVerdict::Validated, "held on 3/3 cases")
+            .await
+            .expect("evaluate_result");
+        assert_eq!(status, DiscoveryStatus::Validated);
+        assert_eq!(
+            recorder
+                .list_learnings(None)
+                .await
+                .expect("list_learnings")
+                .len(),
+            1,
+            "有判词的探针要留下学习，否则上面那两格「没记」分不出是纪律还是没接上"
+        );
     }
 }

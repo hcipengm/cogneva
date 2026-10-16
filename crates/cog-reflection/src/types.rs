@@ -297,6 +297,15 @@ pub enum DiscoveryStatus {
     Validated,
     Rejected,
     Inconclusive,
+    /// The probe came back carrying no answer about its combination.
+    ///
+    /// A state of its own, not a weaker `Inconclusive`: that one says a
+    /// producer looked and the reading settled nothing, this one says nobody
+    /// answered. Folding them together would make "the combination was
+    /// evaluated and the result was uninformative" and "the combination was
+    /// never evaluated at all" the same reading, and the second is the one
+    /// that says whether this loop has a judge.
+    Unmeasured,
 }
 
 /// Strategy used to generate a discovery task.
