@@ -1540,10 +1540,23 @@ async fn principle_readings(
         .refused(usize::try_from(census.total()).unwrap_or(usize::MAX))
         .await
         .map_err(|e| format!("the principle ledger's refused set could not be read: {e}"))?;
-    // Joined by slug, keeping the unpaid set's order (stalest first) and appending
-    // what only the refused face holds. Both faces answer with the account's own
-    // row, so which of them a slug was seen in first makes no difference to what
-    // the row carries -- only to whether it is read at all.
+    Ok(principle_debt_readings(&principle_faces(unpaid, refused)))
+}
+
+/// The account's two faces as one list, one row per principle.
+///
+/// The unpaid set's order is kept (stalest first) and what only the refused face
+/// holds is appended. A rule can be in both at once -- unenforced and refused is
+/// an ordinary combination -- and both queries answer with the account's own row
+/// from the same table, so the copy kept here carries the refusal count either
+/// way and nothing is lost by dropping the second. What must not happen is two
+/// copies: the account is written by identity, and two writers of one identity
+/// leave the row's words depending on which one ran last, because the write keeps
+/// the title it was handed.
+///
+/// Split out of the reading so this is what a test can stand on: whether one
+/// subject becomes one row is not a property of how the read went.
+fn principle_faces(unpaid: Vec<PrincipleRow>, refused: Vec<PrincipleRow>) -> Vec<PrincipleRow> {
     let mut seen = HashSet::new();
     let mut rows = Vec::with_capacity(unpaid.len() + refused.len());
     for row in unpaid.into_iter().chain(refused) {
@@ -1551,7 +1564,7 @@ async fn principle_readings(
             rows.push(row);
         }
     }
-    Ok(principle_debt_readings(&rows))
+    rows
 }
 
 /// The principles the account says are not enforced, or that a gate has had to
@@ -4109,6 +4122,57 @@ mod tests {
             )),
             "2 times, by the host gate declared as `CIRCLED_CHARS`"
         );
+    }
+
+    /// One principle is one row, however many faces read it.
+    ///
+    /// A rule can be unenforced and refused at once, which puts it in both faces,
+    /// and both queries answer with the account's own row -- so the refusal count
+    /// is on whichever copy is kept and the dropped one carries nothing the kept
+    /// one lacks. Asserted rather than argued because two rows for one subject is
+    /// what the write cannot express: identity is the key, and the title of
+    /// whichever write ran last is the one that stays.
+    #[test]
+    fn a_rule_read_off_both_faces_becomes_one_row() {
+        let faces = principle_faces(
+            vec![refused_principle_row(
+                "feedback_x",
+                Some(PrincipleCheckKind::Tree),
+                Some("a rule"),
+                None,
+                2,
+                None,
+            )],
+            vec![
+                refused_principle_row(
+                    "feedback_x",
+                    Some(PrincipleCheckKind::Tree),
+                    Some("a rule"),
+                    None,
+                    2,
+                    None,
+                ),
+                refused_principle_row(
+                    "feedback_y",
+                    Some(PrincipleCheckKind::Tree),
+                    Some("another rule"),
+                    None,
+                    1,
+                    None,
+                ),
+            ],
+        );
+        assert_eq!(faces.len(), 2, "{faces:?}");
+        assert_eq!(faces[0].slug, "feedback_x");
+        assert_eq!(faces[1].slug, "feedback_y");
+        // And the readings minted from the merged list are one identity per
+        // subject, each carrying the violation it was read with.
+        let (rows, unaimed) = principle_debt_readings(&faces);
+        assert!(unaimed.is_empty(), "{}", unaimed.summary());
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].identity.literal, "principle: feedback_x");
+        assert_eq!(rows[1].identity.literal, "principle: feedback_y");
+        assert!(rows.iter().all(|row| row.assertion.is_some()), "{rows:?}");
     }
 
     /// Every tier of the closed set is classified, and exactly three of them are
