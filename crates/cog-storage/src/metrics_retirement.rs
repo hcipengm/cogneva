@@ -29,6 +29,21 @@
 //! belongs where the names are known — [`cog_core::RETIRED_METRIC_NAMES`] — and
 //! a guess made here from age or from rank would delete a live series' current
 //! value whenever its producer was slow.
+//!
+//! A name is only one way a series falls out of use. The other is a shape: a
+//! producer gains a label, so every label set written before that gain is
+//! orphaned while the name itself stays alive. Those are declared too, in
+//! [`SUPERSEDED_SHAPES`], and released by this same pass under the same rule —
+//! a person counted the writes and said so, the pass does not guess. The
+//! difference is what makes the claim safe. A retired name is safe because the
+//! list is curated and nothing contradicts it; a retired shape is safe because
+//! the name has a newer row carrying the label — the orphan's own replacement.
+//! Age is the third leg, and the sentence above is about *that* leg: it decides
+//! when the release may act, not whether the row is dead. That makes it a
+//! statistical promise rather than a structural one — a producer that pauses
+//! longer than any pause this shape has ever been seen to take is still
+//! released — so its value is a measured maximum times a stated multiplier, and
+//! never a median or a round number picked to look safe.
 
 use std::collections::HashMap;
 
@@ -51,6 +66,61 @@ pub const HISTOGRAM_SUMS_TABLE: &str = "cog_metric_histogram_sums";
 /// the larger part of the log, and deleting it in one statement would block
 /// every writer for as long as that takes.
 const RELEASE_BATCH: i64 = 5_000;
+
+/// 申报：一个名字**后来长出来的标签**，与长出之前那批标签集。
+///
+/// 每项是一对 `(name, mandatory label)`：这个名字还在被生产，而它的生产者现在
+/// **必须**带这个标签，于是这个名字下所有不带该标签的行都不会再被写了。
+///
+/// 它与 [`cog_core::RETIRED_METRIC_NAMES`] 是同一条纪律，理由也一样：删除会清掉一个
+/// 序列的当前值，只有**数过写入**的人能说「它的生产者已经停了」。区别在于这里要读的
+/// 是**计数**不是名字——每一项都在这里，是因为它那几行不带标签的账停了、而带标签的
+/// 兄弟还在走（2026-10-16 实测：`cogneva_eval_gate_outcomes_total` 的 `outcome` 那批
+/// 停在 10-14 15:07Z、值全 0；`cogneva_mainline_ci_no_verdict_reason_total` 的 `reason`
+/// 那批停在 10-15 04:37Z、值 3/364/367；同刻带标签的行一分钟内刚写过）。
+///
+/// 一项管这个名字所在的**每一张表**：计数器的孤儿与它自己在样本日志里的历史行是同
+/// 一个形状。标签本身正是守卫要测的那个键，所以一个名字若日后又把标签丢了回去，它
+/// 就没有带标签的兄弟、守卫找不到可删的行——不会反过来删活行。
+pub const SUPERSEDED_SHAPES: &[(&str, &str)] = &[
+    ("cogneva_eval_gate_outcomes_total", "site"),
+    ("cogneva_mainline_ci_no_verdict_reason_total", "platform"),
+    ("metrics_retired_rows_removed", DEPLOYMENT_LABEL),
+    ("metrics_samples_rows", DEPLOYMENT_LABEL),
+    ("metrics_samples_bytes", DEPLOYMENT_LABEL),
+    ("metrics_samples_budget_rows", DEPLOYMENT_LABEL),
+    ("metrics_samples_over_capacity", DEPLOYMENT_LABEL),
+];
+
+/// 一个被判为孤儿的标签集要**安静多久**，release 才允许动它。
+///
+/// 这是形状守卫唯一一条**统计**腿；另两条是结构性的（这行不带那个标签、且同名有个
+/// 带那个标签的更年轻的行）。它的值要**导出来**不能挑：`source=` 2026-10-16 从样本
+/// 日志逐标签集量**活形状**两次写入之间的最大空档 —— 16416 s（4.56 h，
+/// `{site="port",outcome=…}`），`{reason="no_runs",platform="gitee"}` 13902 s。
+/// 取 21600 s ＝ 6 h，就是那个最大值 × 约 1.32。
+///
+/// 取最大值是因为失败方向**不对称**：取小了会删一个**还在被写**的计数器行，而
+/// `increment_counter_total` 是 `SET value = t.value + EXCLUDED.value`，下一笔从增量
+/// 重起、Prometheus 读成 reset ⇒ 比不删更坏。取大了只是把一个没有截止期的删除推后。
+/// 中位数落在被保护的形状自己正常的节奏里，压根不是候选。
+pub const SUPERSEDED_QUIET_SECS: i64 = 6 * 3600;
+
+/// 一张表把时钟放在哪——形状守卫要按它判年龄。
+///
+/// 四张表里两张自带钟列、日志每行一次观测自带时刻，而 `cog_metric_histogram_buckets`
+/// **没有钟列**（只有 `name, labels, bucket, observations`）：它的钟在同名同标签的
+/// `cog_metric_histogram_sums` 行上。两者由**两条无事务的语句**写
+/// （`increment_histogram_bucket` 先写 bucket 行、再写 sums 行并盖 `updated_at`），
+/// 中间失败会让伙伴的钟消失。**没有钟不是钟很旧**：下面那个标量子查询取不到伙伴时是
+/// NULL，与它比较的谓词全为 NULL ⇒ 那行不删。
+#[derive(Debug, Clone, Copy)]
+enum ShapeClock {
+    /// 钟就是本表这一列。
+    Column(&'static str),
+    /// 本表没有钟列：取同名同标签的 `histogram_sums` 行的 `updated_at`。
+    ViaSums,
+}
 
 /// Gauge reporting the rows this pass removed, per table.
 ///
@@ -140,26 +210,50 @@ impl MetricsRetirement {
     /// the same list, and two of them deleting the same rows is two statements
     /// where the second finds none.
     pub async fn release(&self) -> SFResult<RetirementOutcome> {
-        if self.retired_names.is_empty() {
-            return Ok(RetirementOutcome::default());
-        }
-
-        // The accumulation tables hold one row per series rather than one per
-        // observation, so their share of a retirement is bounded by how many
-        // label sets the name ever carried and one statement is enough. The log
-        // is the append-only one and gets the batched loop.
-        let counter_totals = self.delete_by_name(&self.counter_totals).await?;
-        let histogram_buckets = self.delete_by_name(&self.histogram_buckets).await?;
-        let histogram_sums = self.delete_by_name(&self.histogram_sums).await?;
-
+        // 两条通道：按名字（申报的退役名）与按形状（申报的标签集）。名字集为空
+        // **不是**整体早退——形状那一步不依赖它，而「一个名字都没退役、只有形状要
+        // 清」正是一趟必须照样推计数的输入。
+        let mut counter_totals = 0u64;
+        let mut histogram_buckets = 0u64;
+        let mut histogram_sums = 0u64;
         let mut samples = 0u64;
-        loop {
-            let deleted = self.delete_log_batch().await?;
-            samples += deleted;
-            if deleted < RELEASE_BATCH as u64 {
-                break;
+
+        if !self.retired_names.is_empty() {
+            // The accumulation tables hold one row per series rather than one per
+            // observation, so their share of a retirement is bounded by how many
+            // label sets the name ever carried and one statement is enough. The log
+            // is the append-only one and gets the batched loop.
+            counter_totals += self.delete_by_name(&self.counter_totals).await?;
+            histogram_buckets += self.delete_by_name(&self.histogram_buckets).await?;
+            histogram_sums += self.delete_by_name(&self.histogram_sums).await?;
+            loop {
+                let deleted = self.delete_log_batch().await?;
+                samples += deleted;
+                if deleted < RELEASE_BATCH as u64 {
+                    break;
+                }
             }
         }
+
+        // 形状那一步的删除数**折回它所属的那张表**，不开第五格：这张表读数的读者
+        // 问的是「哪张表没在排水」，而「从那张表删掉了多少」正是答案的一部分；
+        // 「哪个名字退休完了」是另一个问题，读的也是同一张表。开第五格会造出一个
+        // 既非前者也非后者的对角项，两个问题都答不了。
+        counter_totals += self
+            .delete_superseded_shapes(&self.counter_totals, ShapeClock::Column("updated_at"), None)
+            .await?;
+        // 桶行拿 sums 行当自己的钟（[`ShapeClock::ViaSums`]），所以这一步**必须先于**
+        // 下面 sums 那一步：反过来的话，同一个形状的 sums 孤儿先被删掉，桶行就取不到
+        // 伙伴、钟变 NULL ⇒ 它按「量不了」被留下，那个形状的桶行于是永远清不掉。
+        histogram_buckets += self
+            .delete_superseded_shapes(&self.histogram_buckets, ShapeClock::ViaSums, None)
+            .await?;
+        histogram_sums += self
+            .delete_superseded_shapes(&self.histogram_sums, ShapeClock::Column("updated_at"), None)
+            .await?;
+        samples += self
+            .delete_superseded_shapes(&self.samples, ShapeClock::Column("timestamp"), Some("id"))
+            .await?;
 
         Ok(RetirementOutcome {
             samples,
@@ -202,6 +296,108 @@ impl MetricsRetirement {
             .await
             .map_err(|e| SFError::Database(e.to_string()))?
             .rows_affected())
+    }
+
+    /// 读某一行时刻的 SQL 表达式（`row` 是那一行在语句里的别名）。
+    ///
+    /// `ViaSums` 那一支在取不到伙伴行时是 NULL —— 与它比较的谓词全为 NULL，于是那行
+    /// 不删（见 [`ShapeClock::ViaSums`]）。
+    fn clock_expr(&self, row: &str, clock: ShapeClock) -> String {
+        match clock {
+            ShapeClock::Column(column) => format!("{row}.{column}"),
+            ShapeClock::ViaSums => format!(
+                "(SELECT _clock.updated_at FROM {sums} _clock \
+                 WHERE _clock.name = {row}.name AND _clock.labels = {row}.labels)",
+                sums = crate::partition_maintainer::quote_ident(&self.histogram_sums),
+            ),
+        }
+    }
+
+    /// 形状那一步：把申报形状的孤儿标签集从一张表里删掉。
+    ///
+    /// 三条腿缺一不可：这行不带申报的那个标签、同名有个带该标签的**更年轻**的行、
+    /// 这行已安静超过 [`SUPERSEDED_QUIET_SECS`]。这里没有任何一步在**自己判定一行
+    /// 死了**——[`SUPERSEDED_SHAPES`] 里的那一对是申报，三条腿只是「可以安全动手」
+    /// 的条件。
+    ///
+    /// `batch_by`：本表一行一次观测时传它的主键列（样本日志是 `id`），删除按
+    /// [`RELEASE_BATCH`] 分批——理由与 [`Self::delete_log_batch`] 相同，一个标签集的
+    /// 历史无上界；一行一个序列的累加表传 `None`，一条语句即可。
+    async fn delete_superseded_shapes(
+        &self,
+        table: &str,
+        clock: ShapeClock,
+        batch_by: Option<&'static str>,
+    ) -> SFResult<u64> {
+        if SUPERSEDED_SHAPES.is_empty() {
+            return Ok(0);
+        }
+        let names: Vec<String> = SUPERSEDED_SHAPES
+            .iter()
+            .map(|(n, _)| (*n).to_string())
+            .collect();
+        let labels: Vec<String> = SUPERSEDED_SHAPES
+            .iter()
+            .map(|(_, l)| (*l).to_string())
+            .collect();
+        let table = crate::partition_maintainer::quote_ident(table);
+        let mine = self.clock_expr("t", clock);
+        let sibling = self.clock_expr("s", clock);
+        let legs = format!(
+            "t.name = d.name
+               AND NOT (t.labels ? d.label)
+               AND {mine} < NOW() - ($3::double precision * INTERVAL '1 second')
+               AND EXISTS (
+                     SELECT 1 FROM {table} s
+                      WHERE s.name = t.name
+                        AND s.labels ? d.label
+                        AND {sibling} > {mine}
+                   )"
+        );
+
+        match batch_by {
+            None => {
+                let sql = format!(
+                    "DELETE FROM {table} t \
+                     USING unnest($1::text[], $2::text[]) AS d(name, label) \
+                     WHERE {legs}"
+                );
+                Ok(sqlx::query(&sql)
+                    .bind(names)
+                    .bind(labels)
+                    .bind(SUPERSEDED_QUIET_SECS as f64)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| SFError::Database(e.to_string()))?
+                    .rows_affected())
+            }
+            Some(id) => {
+                let sql = format!(
+                    "DELETE FROM {table} WHERE {id} IN (
+                         SELECT t.{id} FROM {table} t, unnest($1::text[], $2::text[]) AS d(name, label)
+                          WHERE {legs}
+                          LIMIT $4
+                     )"
+                );
+                let mut total = 0u64;
+                loop {
+                    let deleted = sqlx::query(&sql)
+                        .bind(&names)
+                        .bind(&labels)
+                        .bind(SUPERSEDED_QUIET_SECS as f64)
+                        .bind(RELEASE_BATCH)
+                        .execute(&self.pool)
+                        .await
+                        .map_err(|e| SFError::Database(e.to_string()))?
+                        .rows_affected();
+                    total += deleted;
+                    if deleted < RELEASE_BATCH as u64 {
+                        break;
+                    }
+                }
+                Ok(total)
+            }
+        }
     }
 
     fn names(&self) -> Vec<String> {

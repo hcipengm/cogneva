@@ -96,7 +96,9 @@ pub use migrate::{
 };
 
 pub use dlq::MemoryDeadLetterQueue;
-pub use metrics_retirement::{MetricsRetirement, RetirementOutcome, RetirementPass};
+pub use metrics_retirement::{
+    MetricsRetirement, RetirementOutcome, RetirementPass, SUPERSEDED_QUIET_SECS, SUPERSEDED_SHAPES,
+};
 pub use metrics_sample_cap::{delete_surplus_sql, SampleLogCap, SweepOutcome};
 pub use owner_lease::{lease_holder, PgOwnerLeaseBroker, LEASE_TABLE};
 pub use partition_maintainer::PartitionMaintainer;
