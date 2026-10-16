@@ -477,6 +477,24 @@ pub trait PrincipleLedgerStore: Send + Sync {
     /// is less known than a stale look, not more current.
     async fn outstanding(&self, limit: usize) -> SFResult<Vec<PrincipleRow>>;
 
+    /// The rows a gate has refused work because of, most recently refused first.
+    ///
+    /// A reading of the same table as [`Self::outstanding`] and a different
+    /// question: that one asks which rules no gate enforces, this one asks which
+    /// rules a gate has had to stop something for. The two are independent -- a
+    /// row can be enforced and refused at once, and a row with no gate at all is
+    /// refused by nothing -- which is why this is a method and not a field of
+    /// [`PrincipleCensus`]. A count folded into that census would sit in two of
+    /// its buckets at once and make `total` a number no reader could add up, which
+    /// is the same reason the tiers have a census of their own.
+    ///
+    /// `refusals > 0` is the whole selector, and deliberately not a window of
+    /// recent ones. The column counts what was reported; a second bound written
+    /// here would be a second answer to "how much of the corpus has been
+    /// refused", and one that moves when the clock does rather than when a gate
+    /// refuses something.
+    async fn refused(&self, limit: usize) -> SFResult<Vec<PrincipleRow>>;
+
     /// One row, by the slug that names it.
     async fn get(&self, slug: &str) -> SFResult<Option<PrincipleRow>>;
 

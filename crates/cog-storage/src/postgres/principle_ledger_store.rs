@@ -325,6 +325,25 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
         Self::entries(rows)
     }
 
+    async fn refused(&self, limit: usize) -> SFResult<Vec<PrincipleRow>> {
+        // Most recently refused first, so a bound cuts the rows whose evidence is
+        // oldest rather than the live ones. A row may hold a count and no instant
+        // -- events counted before that column was kept -- and it sorts last
+        // rather than first: no instant is not the freshest evidence, it is the
+        // absence of one.
+        let rows = sqlx::query(&format!(
+            "SELECT {ROW_COLUMNS} FROM principle_ledger \
+             WHERE refusals > 0 \
+             ORDER BY last_refused_at DESC NULLS LAST, slug ASC \
+             LIMIT $1"
+        ))
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+        Self::entries(rows)
+    }
+
     async fn get(&self, slug: &str) -> SFResult<Option<PrincipleRow>> {
         let row = sqlx::query(&format!(
             "SELECT {ROW_COLUMNS} FROM principle_ledger WHERE slug = $1"

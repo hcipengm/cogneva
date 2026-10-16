@@ -15,12 +15,13 @@
 //! The loop folds the intake into the account -- declarations queued by other
 //! parties become readings, through the same reading path a direct write would
 //! use -- it reads the tree's own debt registries into the account the same way,
-//! it reads what the platform's own principle ledger still calls unpaid the same
-//! way again, it reads the outstanding set back out, saying plainly when a read
-//! failed, and it measures that set against the tree, through the one call that
-//! may move a state. Every intake is mechanical: it carries what a document, a
-//! registry or another account asked for and adds nothing of its own, so this
-//! loop cannot make a change look done by reading anything into it.
+//! it reads what the platform's own principle account says about the rules it
+//! holds the same way again, it reads the outstanding set back out, saying
+//! plainly when a read failed, and it measures that set against the tree, through
+//! the one call that may move a state. Every intake is mechanical: it carries
+//! what a document, a registry or another account asked for and adds nothing of
+//! its own, so this loop cannot make a change look done by reading anything into
+//! it.
 //!
 //! The fourth thing is what makes the ledger a driver rather than a record: the
 //! rows a measurement found `pending` are handed to the goal path, one task
@@ -40,9 +41,10 @@
 //! tree structurally cannot hold -- is retracted to `undecided` instead of being
 //! re-asked forever, because re-asking measures the same nothing every time.
 //!
-//! The second reading source is the project's own debt registries: two files in
-//! the tree listing dependencies that are owed removal and core modules that are
-//! owed a move. They are readings and not a second account -- every row they name
+//! The second reading source is the project's own debt registries: files in the
+//! tree listing dependencies that are owed removal, core modules that are owed a
+//! move, and `.rs` files that no `mod` declaration reaches. They are readings and
+//! not a second account -- every row they name
 //! enters through the same call a declaration does, and only a measurement of the
 //! tree can move it. What makes them a source rather than a table is where the
 //! news comes from and how a row is retired: nothing queues these, the loop reads
@@ -52,17 +54,37 @@
 //! account by deleting its own line, which is the self-reported completion this
 //! whole loop is built to refuse.
 //!
-//! The third is the platform's own principle ledger, and that it is an account
-//! rather than a file is the whole of the difference. Its rows are principles
-//! nothing has found a gate for, and this intake takes the ones whose tier a
-//! reading has already declared: the tier is what turns a slug into a goal,
-//! because it says which lane the missing check belongs in, and a slug alone
-//! tells a generator where to look and not what is wanted there. A principle a
-//! person holds is left out, for the reason that ledger's own look refuses to
-//! call it a debt -- no machine gate is meant to exist for it, so a task would be
-//! work nothing could ever close. What closes one of these rows is the tree
-//! carrying a header declaring the gate, which is the same declaration the
-//! principle ledger's own look reads, so both accounts close a row on one fact.
+//! The third is the platform's own principle account, and that it is an account
+//! rather than a file is the whole of the difference. What is wrong with a rule
+//! is read there, and there are two things it knows: the rules nothing has found
+//! a gate for, and the rules a gate has had to refuse work for. They are one
+//! intake and not two, because the subject is one -- a gate is the organ that
+//! enforces a rule, not the rule -- and a principle that is in both faces has one
+//! piece of work, which two intakes would write twice under one identity with the
+//! second overwriting the first one's words on every tick.
+//!
+//! The tier a memory declares says which lane a missing check belongs in, and it
+//! is reported rather than required: a principle whose tier nobody has declared
+//! has no lane to name, and the goal says that instead of naming one this loop
+//! would have had to invent. Leaving such a rule out is the one place this intake
+//! could lose a rule that only ever existed as a memory, which is the largest
+//! part of that account. A principle a person holds is left out, for the reason
+//! that account's own look refuses to call it a debt -- no machine gate is meant
+//! to exist for it, so a task would be work nothing could ever close -- and it is
+//! counted, because how many rules no machine may ever check is a reading in its
+//! own right. What closes one of these rows is the tree carrying a header
+//! declaring the gate, which is the same declaration the principle account's own
+//! look reads, so both accounts close a row on one fact.
+//!
+//! The refusal reading rides on the row rather than being an intake of its own: a
+//! rule screened only at the moment of the act is one whose state the platform
+//! cannot see, so a rule that keeps being broken there wants exactly what an
+//! ungated rule wants, and the ask is the same. What a refusal adds is the reason
+//! the row exists rather than a different row. Closing it therefore says the rule
+//! became judgeable and says nothing about the refusals; what would settle "they
+//! stopped" is a fact about the account and not about the tree, and a row that
+//! claimed it without naming such a fact would be the permanent debt this loop
+//! refuses to mint.
 //!
 //! And the last reading is the second face of "is it done". The tree answers
 //! whether the project's own line carries a change, and nothing in the tree
@@ -78,7 +100,7 @@
 //! principle: feedback_a_version_bit_on_a_dispatch_id_must_keep_generation_zero_identical
 //! principle: feedback_a_typed_field_that_exists_may_never_have_been_filled
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -97,8 +119,9 @@ use cog_core::contract::outcome::{declares, TERMINAL_ENV_FAILURE_PREFIX};
 
 use crate::change_measure::{
     CheckTree, Snapshot, UnsettledReason, DEPENDENCY_EDGE_KIND, DEV_DEPENDENCY_EDGE_KIND,
-    GREP_KIND, MODULE_RELOCATION_KIND,
+    GONE_KIND, GREP_KIND, MODULE_RELOCATION_KIND,
 };
+use crate::principle_measure::HOST_REGISTRY_READ_NO_GATE;
 
 /// This loop's name in the process liveness registry, and the value of
 /// `cogneva_loop_tick_age_seconds{loop=...}`.
@@ -301,6 +324,25 @@ const DEBT_EDGE_FILE: &str = "crates/cogneva/debt/dependency-edges.tsv";
 /// and -- when a move is owed -- where it is going.
 const DEBT_MODULE_FILE: &str = "crates/cogneva/debt/core-modules.tsv";
 
+/// The unwired-module registry, relative to the repository root.
+///
+/// The third reading source, and the same file the module-membership contract
+/// test reads its own table from. That test is a gate and a person reads its red:
+/// "a `.rs` this repository carries and no `mod` declaration reaches" is a
+/// finding whose whole cost is that nobody notices it -- the file is legal, it
+/// compiles nowhere, and it reads as landed code. A registry row the account can
+/// hold and hand over is what turns that red into work, which is why this file
+/// has a second reader at all.
+const DEBT_UNWIRED_FILE: &str = "crates/cogneva/debt/unwired-modules.tsv";
+
+/// The disposition a row of the unwired registry carries when the file is to be
+/// reached by a declaration of its parent module.
+const WIRING_DISPOSITION: &str = "pending-wiring";
+
+/// The disposition a row of the unwired registry carries when the file is to be
+/// deleted.
+const DELETION_DISPOSITION: &str = "pending-deletion";
+
 /// The `reason` a module row carries when it is owed a move.
 ///
 /// Read here so that a registry which grew a destination under any other reason
@@ -343,6 +385,13 @@ const PRINCIPLE_DECLARATION_PREFIX: &str = "principle: ";
 /// The account the rows were read out of, where the other two intakes name a file
 /// in the tree: this reading's origin is another ledger, and the column is what a
 /// reader follows back to it.
+///
+/// One name for one subject, and the subject is the principle. A gate is the
+/// organ that enforces a rule, not the thing the change account is about, so a
+/// rule nothing enforces and a rule a gate has had to refuse work for cite this
+/// same account: naming the face each was read off would put two names on one
+/// row's subject, and reading an account's two faces as two sources is the
+/// mistake this one name exists to not make.
 const PRINCIPLE_LEDGER_SOURCE: &str = "principle_ledger";
 
 /// The id prefix every handover of one change carries.
@@ -846,6 +895,14 @@ pub fn spawn_change_ledger_loop(
                     // read this pass is judged by this pass. Skipped where no
                     // ledger was published, which the start-up line says.
                     if let Some(ref principles) = principles {
+                        // Both faces of that account in one read, because they are
+                        // two things known about one subject: the rules nothing
+                        // enforces and the rules a gate has had to refuse work
+                        // for. In beside the rest, for the reason the registries
+                        // give -- a row read this pass is judged by this pass --
+                        // and read whatever the tree did, because what a refusal
+                        // has news of is an act somebody took and not a line in
+                        // this revision.
                         principle_pass(&**principles, first_seen_rev.as_deref(), &*store).await;
                     }
                     // The classifier's retirements go in after the readings and
@@ -1007,8 +1064,8 @@ async fn registry_pass(
     first_seen_rev: Option<&str>,
     store: &dyn ChangeLedgerStore,
 ) {
-    let readings = match registry_readings(tree).await {
-        Ok(readings) => readings,
+    let (readings, unaimed) = match registry_readings(tree).await {
+        Ok(read) => read,
         Err(why) => {
             warn!(
                 why = %why,
@@ -1018,6 +1075,17 @@ async fn registry_pass(
             return;
         }
     };
+    // Said before the write and said whether or not it lands: what a registry
+    // holds and this intake cannot aim is a property of the registry, and a
+    // pass that read it has to report it even on a tick whose write the account
+    // refused. Not a warning about the account, so it does not share the
+    // warning below.
+    if !unaimed.is_empty() {
+        warn!(
+            unaimed = %unaimed.summary(),
+            "change ledger: the tree's own debt registries hold rows this intake cannot aim"
+        );
+    }
     match store.record_readings(&readings, first_seen_rev).await {
         Ok(_) => info!(
             readings = readings.len(),
@@ -1043,7 +1111,7 @@ async fn registry_pass(
 /// for a tree that has since changed -- where sharing the measurement's snapshot
 /// would mean threading one pass's revision through an intake that a caller other
 /// than the loop could not supply.
-async fn registry_readings(tree: &CheckTree) -> Result<Vec<ChangeReading>, String> {
+async fn registry_readings(tree: &CheckTree) -> Result<(Vec<ChangeReading>, Unaimed), String> {
     let snapshot = tree
         .snapshot()
         .await
@@ -1061,9 +1129,54 @@ async fn registry_readings(tree: &CheckTree) -> Result<Vec<ChangeReading>, Strin
         .map_err(|why| {
             format!("the module registry {DEBT_MODULE_FILE} could not be read at {rev}: {why}")
         })?;
+    let unwired = tree
+        .matching_lines(rev, DEBT_UNWIRED_FILE, ".")
+        .await
+        .map_err(|why| {
+            format!("the unwired registry {DEBT_UNWIRED_FILE} could not be read at {rev}: {why}")
+        })?;
     let mut readings = edge_readings(&edges);
     readings.extend(module_readings(&modules));
-    Ok(readings)
+    let (unwired_readings, unaimed) = unwired_readings(&unwired);
+    readings.extend(unwired_readings);
+    Ok((readings, unaimed))
+}
+
+/// The rows of a registry this intake read and could not turn into a check, by
+/// cause.
+///
+/// Counted rather than dropped, and by cause rather than in one total, because an
+/// empty account has two very different explanations: a registry with nothing in
+/// it, and a registry whose every row is one this intake cannot aim. Both
+/// contribute zero readings, and only one of them is news. The causes are
+/// separate for the second reason: the fix for a disposition nobody has taught
+/// this intake is not the fix for a file it deliberately refuses to resolve.
+#[derive(Debug, Default)]
+struct Unaimed {
+    /// How many rows each cause accounted for. A `BTreeMap` rather than a
+    /// `HashMap` so two passes over one registry print their counts in the same
+    /// order and can be compared by eye.
+    counts: BTreeMap<&'static str, usize>,
+}
+
+impl Unaimed {
+    fn note(&mut self, cause: &'static str) {
+        *self.counts.entry(cause).or_default() += 1;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.counts.is_empty()
+    }
+
+    /// The counts as one field, causes in a fixed order: `{cause}={n}` pairs
+    /// separated by spaces; the empty string when there is nothing to say.
+    fn summary(&self) -> String {
+        self.counts
+            .iter()
+            .map(|(cause, n)| format!("{cause}={n}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
 }
 
 /// Where a crate's manifest is, relative to the repository root.
@@ -1198,6 +1311,132 @@ fn module_readings(lines: &[(String, String)]) -> Vec<ChangeReading> {
     readings
 }
 
+/// The unwired rows the module-membership registry carries, as readings, and the
+/// rows this intake could not aim.
+///
+/// One row per line, tab-separated `file disposition destination`, exactly as the
+/// module-membership contract test reads it. The two dispositions are two
+/// different asks, and each is measured by the fact that ends it:
+///
+/// - `pending-wiring`: the file has to be reached, so the check is the parent
+///   module file holding the declaration the test resolves. Judged by `grep`,
+///   whose demand is that the literal be there -- and the literal is the
+///   declaration itself rather than the file's bare name, because a name is
+///   ordinary writing inside a comment and a row a comment could settle is a row
+///   that reads as done while the compiler still cannot see the file.
+/// - `pending-deletion`: the file has to be gone, and the path is the whole of
+///   the ask. Judged by `gone` with an empty literal, whose documented reading is
+///   the inverse of `exists`: this file must not be here.
+///
+/// A row under any other disposition names an ask nobody registered and a fact
+/// nothing would settle, so it stays out of the account rather than entering it as
+/// work no gate could close. It is counted, and so is a wiring row this intake
+/// cannot resolve, so that "the registry is empty" and "the registry holds rows
+/// nothing here can aim" stay two readings.
+fn unwired_readings(lines: &[(String, String)]) -> (Vec<ChangeReading>, Unaimed) {
+    let mut readings = Vec::new();
+    let mut unaimed = Unaimed::default();
+    for (_path, text) in lines {
+        let text = text.trim();
+        if text.is_empty() || text.starts_with('#') {
+            continue;
+        }
+        let mut field = text.split('\t');
+        let file = field.next().unwrap_or("").trim();
+        // The column-name line is the table's header, not a row, and a line
+        // naming no path names nothing to check -- which is a different thing
+        // from a row this intake read and refused.
+        if file.is_empty() || file == "file" {
+            continue;
+        }
+        let disposition = field.next().unwrap_or("").trim();
+        let destination = field.next().unwrap_or("").trim();
+        match disposition {
+            WIRING_DISPOSITION => match module_declaration(file, destination) {
+                Ok((scope, literal)) => readings.push(unwired_reading(
+                    ChangeIdentity::new(GREP_KIND, scope, literal),
+                    unwired_goal(file, WIRING_DISPOSITION, destination),
+                )),
+                Err(cause) => unaimed.note(cause),
+            },
+            DELETION_DISPOSITION => readings.push(unwired_reading(
+                ChangeIdentity::new(GONE_KIND, file.to_string(), String::new()),
+                unwired_goal(file, DELETION_DISPOSITION, ""),
+            )),
+            _ => unaimed.note("disposition-not-one-this-intake-knows"),
+        }
+    }
+    (readings, unaimed)
+}
+
+/// One unwired row as a reading: both dispositions carry a goal and no assertion,
+/// because the registry states where the file is going and not what it will look
+/// like when it gets there.
+fn unwired_reading(identity: ChangeIdentity, title: String) -> ChangeReading {
+    ChangeReading {
+        identity,
+        title: Some(title),
+        assertion: None,
+        source: ChangeSource {
+            doc: DEBT_UNWIRED_FILE.to_string(),
+            verdict: None,
+            // The registry names the file and where it is going, not how urgent
+            // it is: nothing in it states a band, so the reading carries the one
+            // that says so rather than a band this path invented.
+            priority: ChangePriority::Unstated,
+        },
+    }
+}
+
+/// The scope and literal that say a file has been wired in, or the cause this
+/// intake cannot say it for.
+///
+/// A `mod` declaration names a module and not a path, so the module's name is
+/// read off the path the registry holds -- beside its parent, a file is declared
+/// by its own stem. The one other shape the resolver accepts is a directory's own
+/// `mod.rs`, declared by the directory's name, and that is refused here rather
+/// than resolved: this intake would be spelling the contract test's resolver a
+/// second time, in a place nothing exercises it, and the day such a row appears a
+/// count is a better answer than a resolver that is quietly wrong.
+fn module_declaration(file: &str, destination: &str) -> Result<(String, String), &'static str> {
+    if destination.is_empty() {
+        return Err("wiring-row-without-a-destination");
+    }
+    let name = file.rsplit('/').next().unwrap_or(file);
+    let Some(stem) = name.strip_suffix(".rs") else {
+        return Err("row-names-no-rust-file");
+    };
+    if stem.is_empty() {
+        return Err("row-names-no-module");
+    }
+    if stem == "mod" {
+        return Err("directory-module-this-intake-does-not-resolve");
+    }
+    Ok((destination.to_string(), format!("mod {stem};")))
+}
+
+/// What an unwired row asks for, in the words the goal path is handed.
+///
+/// Both dispositions say what is wrong in the sources rather than only that the
+/// registry lists a file: a file no declaration reaches is compiled by nothing,
+/// and a file with no reader is weight that no measurement has counted. The
+/// destination is named only where there is one -- a deletion row's is empty by
+/// construction, and "the declaration goes in ``" would be a goal naming a place
+/// that is not a place.
+fn unwired_goal(file: &str, disposition: &str, destination: &str) -> String {
+    if disposition == DELETION_DISPOSITION {
+        return format!(
+            "Delete `{file}`: no `mod` declaration reaches it, so no build target compiles it \
+             and nothing that starts from a symbol reads a byte of it, while it sits in the \
+             sources reading as landed code."
+        );
+    }
+    format!(
+        "Wire `{file}` into the module tree: the declaration belongs in `{destination}`, and \
+         until some `mod` declaration reaches the file no build target carries it."
+    )
+}
+
 /// Read the principles the platform's own ledger still calls unpaid into the
 /// account.
 ///
@@ -1221,8 +1460,8 @@ async fn principle_pass(
     first_seen_rev: Option<&str>,
     store: &dyn ChangeLedgerStore,
 ) {
-    let readings = match principle_readings(principles).await {
-        Ok(readings) => readings,
+    let (readings, unaimed) = match principle_readings(principles).await {
+        Ok(read) => read,
         Err(why) => {
             warn!(
                 why = %why,
@@ -1232,10 +1471,19 @@ async fn principle_pass(
             return;
         }
     };
+    // Said before the write and whether or not the write lands: the rows this
+    // intake cannot aim are a property of that account, and a pass that read them
+    // has to report them even on a tick whose write was refused.
+    if !unaimed.is_empty() {
+        warn!(
+            unaimed = %unaimed.summary(),
+            "change ledger: the principle ledger holds rows this intake cannot aim"
+        );
+    }
     match store.record_readings(&readings, first_seen_rev).await {
         Ok(_) => info!(
             readings = readings.len(),
-            "change ledger: read the principles the platform's own ledger calls unpaid"
+            "change ledger: read the principle account for the rules it says are not enforced"
         ),
         // The account keeps what it has: this pass added nothing, and the next is
         // the retry. Said with the count it was carrying so a reader can tell a
@@ -1249,54 +1497,102 @@ async fn principle_pass(
     }
 }
 
-/// What the platform's own principle ledger says is unpaid, as readings.
+/// What the platform's own principle account says about each of its rules, as
+/// readings.
 ///
-/// The batch is sized from the source account's own census rather than from a
-/// number chosen here: the population this reads is exactly the rows that account
-/// calls unpaid, and a constant would be a second answer to a question it already
-/// answers -- one that goes stale as principles are added. Unmeasured rows are
-/// part of that population, because a row no look has settled is not a row with a
-/// gate: the count this reads is the one the account's own coverage reading is
-/// taken against.
+/// Two faces of one account, and the reason they are one intake rather than two
+/// is the subject: the account is about principles, and a gate is the organ that
+/// enforces one. So "nothing enforces this rule" and "a gate has had to refuse
+/// work for this rule" are two things known about one principle, not two
+/// principles -- and a rule that is both must enter the change account once, with
+/// both readings on it. Read as two intakes they would write the same identity
+/// twice, and the second write would overwrite the first one's goal on every
+/// tick, making the row's words depend on which pass ran last.
+///
+/// The two faces are independent, which is why both are read. A rule can be
+/// enforced and refused at once: that is a gate working, and the reading it
+/// leaves is that the rule keeps being broken at the moment of the act -- work
+/// whose end is a check the tree can be judged by, exactly as for a rule nothing
+/// enforces. A rule with no gate at all is refused by nothing, so the unpaid set
+/// alone would miss every one of them.
+///
+/// Each batch is sized from the source account's own census rather than from a
+/// number chosen here: a constant would be a second answer to a question the
+/// account already answers, and one that goes stale as principles are added. The
+/// refused face is bounded by the account's whole size and not by its unpaid
+/// part, because a refused row can be one the account counts as enforced.
 async fn principle_readings(
     principles: &dyn PrincipleLedgerStore,
-) -> Result<Vec<ChangeReading>, String> {
+) -> Result<(Vec<ChangeReading>, Unaimed), String> {
     let census = principles
         .census()
         .await
         .map_err(|e| format!("the principle ledger's census could not be read: {e}"))?;
+    // Unmeasured rows are part of the unpaid population, because a row no look
+    // has settled is not a row with a gate: the count this is taken against is
+    // the one the account's own coverage reading is taken against.
     let owed = census.unenforced.saturating_add(census.unmeasured);
-    let rows = principles
+    let unpaid = principles
         .outstanding(usize::try_from(owed).unwrap_or(usize::MAX))
         .await
         .map_err(|e| format!("the principle ledger's unpaid set could not be read: {e}"))?;
+    let refused = principles
+        .refused(usize::try_from(census.total()).unwrap_or(usize::MAX))
+        .await
+        .map_err(|e| format!("the principle ledger's refused set could not be read: {e}"))?;
+    // Joined by slug, keeping the unpaid set's order (stalest first) and appending
+    // what only the refused face holds. Both faces answer with the account's own
+    // row, so which of them a slug was seen in first makes no difference to what
+    // the row carries -- only to whether it is read at all.
+    let mut seen = HashSet::new();
+    let mut rows = Vec::with_capacity(unpaid.len() + refused.len());
+    for row in unpaid.into_iter().chain(refused) {
+        if seen.insert(row.slug.clone()) {
+            rows.push(row);
+        }
+    }
     Ok(principle_debt_readings(&rows))
 }
 
-/// The unpaid principles whose tier a machine can check, as readings.
+/// The principles the account says are not enforced, or that a gate has had to
+/// refuse work for, as readings.
 ///
-/// A row enters on two conditions and both are the source account's own: a
-/// reading has declared its tier, and that tier is one of the three a machine
-/// checks. The first is what makes it work rather than a note -- the tier says
-/// which lane the missing check belongs in, so the goal can name what is wanted
-/// instead of only where to look. The second is why `judgement` stays out: it is
-/// the record that the rule is a person's to decide, and that account's own look
-/// writes no state for such a row at all, so it stays in the unpaid set forever
-/// by construction. Reading it here would mint a task no gate could ever close,
-/// which is the same permanent debt its own verdict refuses to state.
+/// A row enters on one condition, and it is the account's own: its tier is not
+/// the one a person holds. Everything else in that account is a rule whose state
+/// this platform cannot see, and that is the whole of what a change needs to
+/// exist about it.
+///
+/// `judgement` stays out, and it is the class the account itself defines as the
+/// rules that cannot be made into a gate: its own look writes no state for such a
+/// row at all, so it stays in the unpaid set forever by construction, and reading
+/// it as work would mint a task no gate could ever close -- the same permanent
+/// debt that account's own verdict refuses to state. It is counted rather than
+/// dropped, because "how many of these rules no machine may ever check" is a
+/// reading somebody has to be able to take.
+///
+/// A tier nobody has declared is work and not a gap in the reading: the tier says
+/// which lane the missing check belongs in, and its absence is what the goal
+/// reports. Leaving it out charged nobody for the rule -- which is the account's
+/// largest bucket, and the one where a rule that only ever existed as a memory
+/// would go unnoticed.
 ///
 /// The check is the tree carrying a header that declares the gate, which is the
 /// declaration the principle ledger's own look reads as the platform-side gate
 /// column. Both accounts therefore close this row on one fact, and neither can
 /// close it while the other still calls it owed.
-fn principle_debt_readings(rows: &[PrincipleRow]) -> Vec<ChangeReading> {
+fn principle_debt_readings(rows: &[PrincipleRow]) -> (Vec<ChangeReading>, Unaimed) {
     let mut readings = Vec::new();
+    let mut unaimed = Unaimed::default();
     for row in rows {
-        let Some(kind) = row.check_kind else {
-            continue;
-        };
-        let Some(lane) = check_lane(kind) else {
-            continue;
+        let lane = match row.check_kind {
+            Some(kind) => match check_lane(kind) {
+                Some(lane) => Some(lane),
+                None => {
+                    unaimed.note("a-person-holds-this-by-its-own-declaration");
+                    continue;
+                }
+            },
+            None => None,
         };
         readings.push(ChangeReading {
             identity: ChangeIdentity::new(
@@ -1305,7 +1601,13 @@ fn principle_debt_readings(rows: &[PrincipleRow]) -> Vec<ChangeReading> {
                 principle_literal(&row.slug),
             ),
             title: Some(principle_goal(row, lane)),
-            assertion: None,
+            // The violation rides on the row and not only inside the goal: a
+            // reader of the account has to be able to see that this rule was
+            // refused in practice, which is the difference between "nobody has
+            // written the check yet" and "the rule keeps being broken at the
+            // moment of the act". A rule the account has never seen refused
+            // carries none -- an assertion is not a place to say nothing happened.
+            assertion: refusal_sentence(row),
             source: ChangeSource {
                 doc: PRINCIPLE_LEDGER_SOURCE.to_string(),
                 verdict: None,
@@ -1316,7 +1618,7 @@ fn principle_debt_readings(rows: &[PrincipleRow]) -> Vec<ChangeReading> {
             },
         });
     }
-    readings
+    (readings, unaimed)
 }
 
 /// The lane a tier's check answers from, or `None` for the tier a person holds.
@@ -1351,24 +1653,115 @@ fn principle_literal(slug: &str) -> String {
 /// What a row of the principle ledger asks for, in the words the goal path is
 /// handed.
 ///
-/// The slug, the lane its declared tier puts the missing check in, and the rule's
-/// own sentence. The sentence is carried because a goal that names only where to
-/// look is a goal a generator cannot act on, and the rule's own words are what
-/// the gate has to answer to -- the same reason the registry intake carries the
-/// destination and not only the module.
-fn principle_goal(row: &PrincipleRow, lane: &str) -> String {
-    let rule = row
-        .lead
+/// The slug, the lane its declared tier puts the missing check in, the rule's own
+/// sentence, and the violation if a gate has had to refuse work for it. The
+/// sentence is carried because a goal that names only where to look is a goal a
+/// generator cannot act on, and the rule's own words are what the gate has to
+/// answer to -- the same reason the registry intake carries the destination and
+/// not only the module.
+///
+/// The lane is optional and its absence is said rather than filled in. A principle
+/// whose memory declares no tier has no lane to name, and inventing one here would
+/// hand a generator this path's guess about the rule; what the goal can still say
+/// is the part that does not depend on the tier: what lands the row is a check the
+/// tree can be judged by. The criterion is the same either way, and it is the
+/// criterion that has to be worded exactly -- a goal ending in "decide how to
+/// check this" would be work whose end nothing could read.
+fn principle_goal(row: &PrincipleRow, lane: Option<&str>) -> String {
+    let owed = match lane {
+        Some(lane) => format!("a check answering from {lane}, declared"),
+        None => "a check the tree can be judged by, declared".to_string(),
+    };
+    let mut goal = format!(
+        "Give the principle `{}` the gate it is owed: {owed} in the header of the test that carries \
+         it.{}",
+        row.slug,
+        rule_sentence(row)
+    );
+    if let Some(violation) = refusal_sentence(row) {
+        // The rule's own sentence is quoted as the memory wrote it, and a memory
+        // is free to write a fragment; the violation is a sentence of its own and
+        // must not run into one. Terminated here rather than in the rule's own
+        // words, because a goal that added a stop to a quotation would be quoting
+        // something the memory does not say.
+        if !goal.ends_with('.') {
+            goal.push('.');
+        }
+        goal.push(' ');
+        goal.push_str(&violation);
+    }
+    goal
+}
+
+/// The violation as a sentence in its own right, or nothing when the account has
+/// never seen the rule refused.
+///
+/// One function for the two places it is used -- appended to the goal a handover
+/// carries and read on the row's own assertion -- because they say the same thing
+/// about the same subject, and the subject is the principle: the gates are named
+/// as the organ that refused, not as the thing the sentence is about.
+///
+/// Empty rather than a sentence saying nothing was refused: the account holds a
+/// count and not a claim about its absence, and "has not been refused yet" is not
+/// something a zero in that column establishes.
+fn refusal_sentence(row: &PrincipleRow) -> Option<String> {
+    (row.refusals > 0).then(|| {
+        format!(
+            "This principle has been refused work {}.",
+            refusal_evidence(row)
+        )
+    })
+}
+
+/// The rule's own sentence, as a clause to append to a goal, or nothing.
+///
+/// Carried because a goal that names only where to look is one a generator cannot
+/// act on, and the rule's own words are what its gate has to answer to. Absent
+/// rather than replaced when the reading carried no sentence: a clause introducing
+/// a rule and then naming none reads as a rule that says nothing, which is a worse
+/// goal than one that stops where it knows.
+fn rule_sentence(row: &PrincipleRow) -> String {
+    row.lead
         .as_deref()
         .map(str::trim)
         .filter(|lead| !lead.is_empty())
         .map(|lead| format!(" The rule itself: {lead}"))
-        .unwrap_or_default();
-    format!(
-        "Give the principle `{}` the gate it is declared to be owed: a check answering from \
-         {lane}, declared in the header of the test that carries it.{rule}",
-        row.slug
-    )
+        .unwrap_or_default()
+}
+
+/// The refusal a row was read for, as the counted part of a sentence.
+///
+/// Phrased to fit the two places it is used: the goal a handover carries, where it
+/// says why the row exists at all, and the row's own assertion, where it is what a
+/// reader of the account has to be able to find. A count with no instant drops the
+/// instant rather than substituting one -- events counted before the column was
+/// kept are not events from long ago.
+///
+/// The gate column has a sentinel and it is not a gate: `-` is what that column
+/// holds when the host's registry was read and the rule was not in it, which is a
+/// reading of the registry and not a gate, so it is dropped rather than printed as
+/// the name of one. Empty is dropped with it -- the column's own contract is that
+/// it always carries something, so a blank here is a value nobody meant to write
+/// and naming it as a gate would turn it into one.
+fn refusal_evidence(row: &PrincipleRow) -> String {
+    let last = match row.last_refused_at {
+        Some(at) => format!(", most recently at {}", at.to_rfc3339()),
+        None => String::new(),
+    };
+    let gate = match row.host_gate.as_deref().map(str::trim) {
+        Some(HOST_REGISTRY_READ_NO_GATE) | None | Some("") => String::new(),
+        Some(gate) => format!(", by the host gate declared as `{gate}`"),
+    };
+    format!("{}{last}{gate}", times(row.refusals))
+}
+
+/// How many times, in words: a bare numeral in a sentence about a count of one
+/// reads as a placeholder, and this count is small by construction.
+fn times(n: i64) -> String {
+    match n {
+        1 => "once".to_string(),
+        n => format!("{n} times"),
+    }
 }
 
 /// Measure the outstanding set against the tree, and record what each row came
@@ -3424,6 +3817,85 @@ mod tests {
         }
     }
 
+    /// A principle ledger row as the gates left it: refused, with the count, the
+    /// instant of the last refusal and the gate that did the refusing.
+    ///
+    /// Built on `principle_row` so that the two readings' fixtures differ in
+    /// exactly what the readings differ in -- a fixture assembled from scratch
+    /// could drift in a column neither intake reads and hide that.
+    fn refused_principle_row(
+        slug: &str,
+        check_kind: Option<PrincipleCheckKind>,
+        lead: Option<&str>,
+        host_gate: Option<&str>,
+        refusals: i64,
+        last_refused_at: Option<i64>,
+    ) -> PrincipleRow {
+        PrincipleRow {
+            host_gate: host_gate.map(str::to_string),
+            refusals,
+            last_refused_at: last_refused_at.map(|at| Utc.timestamp_opt(at, 0).unwrap()),
+            ..principle_row(slug, check_kind, lead)
+        }
+    }
+
+    /// An unwired row is measured by the fact that ends its disposition, and a row
+    /// under a disposition this intake does not know is counted rather than
+    /// entering as work nothing settles.
+    ///
+    /// The two dispositions are two different checks and not one with a flag:
+    /// wiring a file is the parent module file *holding* a declaration, which
+    /// `grep` asks for, and deleting one is a path *not* being there, which is
+    /// `gone` with an empty literal. A row measured by the wrong one of those
+    /// would read as done the moment the other thing happened.
+    #[test]
+    fn an_unwired_row_becomes_the_check_that_would_end_it() {
+        let (rows, unaimed) = unwired_readings(&[
+            (
+                "registry".to_string(),
+                "file\tdisposition\tdestination".to_string(),
+            ),
+            ("registry".to_string(), "# a comment".to_string()),
+            (
+                "registry".to_string(),
+                "crates/cog-x/src/orphan.rs\tpending-wiring\tcrates/cog-x/src/lib.rs".to_string(),
+            ),
+            (
+                "registry".to_string(),
+                "crates/cog-x/src/second-copy.rs\tpending-deletion\t".to_string(),
+            ),
+            (
+                "registry".to_string(),
+                "crates/cog-x/src/tbd.rs\tpending-rewrite\tcrates/cog-x/src/lib.rs".to_string(),
+            ),
+            (
+                "registry".to_string(),
+                "crates/cog-x/src/nodest.rs\tpending-wiring\t".to_string(),
+            ),
+        ]);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].identity.kind, GREP_KIND);
+        assert_eq!(rows[0].identity.scope, "crates/cog-x/src/lib.rs");
+        // The declaration and not the file's bare name: a name is ordinary
+        // writing inside a comment, and a row a comment could settle is a row
+        // that reads as done while the compiler still cannot see the file.
+        assert_eq!(rows[0].identity.literal, "mod orphan;");
+        assert_eq!(rows[0].source.doc, DEBT_UNWIRED_FILE);
+        assert_eq!(rows[0].assertion, None);
+        assert_eq!(rows[1].identity.kind, GONE_KIND);
+        assert_eq!(rows[1].identity.scope, "crates/cog-x/src/second-copy.rs");
+        // An empty literal is the whole of what "this path must not be here"
+        // says: the scope is the artifact and there is nothing to search for.
+        assert_eq!(rows[1].identity.literal, "");
+        assert_eq!(rows[1].source.doc, DEBT_UNWIRED_FILE);
+        // Two causes have to be two notes and not one total, or a mistyped
+        // destination and an ask nobody registered read the same.
+        assert_eq!(
+            unaimed.summary(),
+            "disposition-not-one-this-intake-knows=1 wiring-row-without-a-destination=1"
+        );
+    }
+
     /// An unpaid principle whose tier is declared becomes a check against the
     /// tree's own declaration of its gate.
     ///
@@ -3437,28 +3909,32 @@ mod tests {
     /// keeps a longer slug from closing this row.
     #[test]
     fn an_unpaid_principle_becomes_a_check_against_the_trees_declaration() {
-        let rows = principle_debt_readings(&[principle_row(
+        let (rows, unaimed) = principle_debt_readings(&[principle_row(
             "feedback_x",
             Some(PrincipleCheckKind::Tree),
             Some("a reading must be quoted with its construction"),
         )]);
         assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(unaimed.is_empty(), "{}", unaimed.summary());
         assert_eq!(rows[0].identity.kind, GREP_KIND);
         assert_eq!(rows[0].identity.scope, PRINCIPLE_GATE_SCOPE);
         assert_eq!(rows[0].identity.literal, "principle: feedback_x");
         assert_eq!(rows[0].source.doc, PRINCIPLE_LEDGER_SOURCE);
         assert_eq!(rows[0].source.verdict, None);
         assert_eq!(rows[0].source.priority, ChangePriority::Unstated);
+        // A rule nothing has refused carries no assertion: the account holds a
+        // count, and a zero in it is not a statement that the rule was kept.
+        assert_eq!(rows[0].assertion, None);
         // The goal names the lane the tier puts the check in and the rule's own
         // sentence: a goal that named only the slug would tell a generator where
         // to look and not what is wanted there.
         assert_eq!(
             rows[0].title.as_deref(),
             Some(
-                "Give the principle `feedback_x` the gate it is declared to be owed: a check \
-                 answering from this tree at one revision, the way the platform's own tests \
-                 answer, declared in the header of the test that carries it. The rule itself: \
-                 a reading must be quoted with its construction"
+                "Give the principle `feedback_x` the gate it is owed: a check answering from this \
+                 tree at one revision, the way the platform's own tests answer, declared in the \
+                 header of the test that carries it. The rule itself: a reading must be quoted \
+                 with its construction"
             )
         );
     }
@@ -3486,17 +3962,23 @@ mod tests {
         assert!(literal.ends_with("feedback_x"));
     }
 
-    /// The tier a person holds is not work, and neither is a row with no tier.
+    /// A tier a person holds is not work; a tier nobody declared still is.
     ///
-    /// The first is the reading the source account itself makes: its look writes
-    /// no state for a `judgement` row, so such a row stays in its unpaid set
-    /// forever -- reading it here as work would mint a task no gate could close.
-    /// The second is a principle nobody has said anything about: it has no lane to
-    /// aim at, so it stays a number in that account's census rather than becoming
-    /// a change with a goal nothing can act on.
+    /// The first is the class the account itself defines as the rules that cannot
+    /// be made into a gate: its look writes no state for a `judgement` row, so
+    /// such a row stays in its unpaid set forever, and reading it here as work
+    /// would mint a task no gate could close. It is counted rather than dropped,
+    /// because how many rules no machine may ever check is a reading in its own
+    /// right.
+    ///
+    /// The second is a rule that exists only as a memory. It enters, and the goal
+    /// says what is missing about it -- the tier, which is what names the lane --
+    /// instead of naming a lane this path would have had to invent. The criterion
+    /// does not depend on the tier and so is the same either way: what lands the
+    /// row is the tree carrying a header that declares the gate.
     #[test]
-    fn a_principle_a_person_holds_and_one_with_no_tier_are_not_work() {
-        let rows = principle_debt_readings(&[
+    fn a_principle_a_person_holds_is_not_work_and_one_with_no_tier_is() {
+        let (rows, unaimed) = principle_debt_readings(&[
             principle_row(
                 "feedback_held",
                 Some(PrincipleCheckKind::Judgement),
@@ -3505,18 +3987,127 @@ mod tests {
             principle_row("feedback_untiered", None, Some("nobody said")),
             principle_row("feedback_owed", Some(PrincipleCheckKind::Live), None),
         ]);
-        assert_eq!(rows.len(), 1, "{rows:?}");
-        assert_eq!(rows[0].identity.literal, "principle: feedback_owed");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].identity.literal, "principle: feedback_untiered");
+        assert_eq!(
+            rows[0].title.as_deref(),
+            Some(
+                "Give the principle `feedback_untiered` the gate it is owed: a check the tree can \
+                 be judged by, declared in the header of the test that carries it. The rule \
+                 itself: nobody said"
+            )
+        );
+        assert_eq!(rows[1].identity.literal, "principle: feedback_owed");
         // A row that arrived with no sentence still gets a goal: the rule's words
         // are carried when the reading has them, and their absence is not a reason
         // to hand over a bare slug.
         assert_eq!(
+            rows[1].title.as_deref(),
+            Some(
+                "Give the principle `feedback_owed` the gate it is owed: a check answering from \
+                 the running deployment's own readings, declared in the header of the test that \
+                 carries it."
+            )
+        );
+        assert_eq!(
+            unaimed.summary(),
+            "a-person-holds-this-by-its-own-declaration=1"
+        );
+    }
+
+    /// The account's two faces are one subject, and the violation rides on the
+    /// row the ungated face would have minted anyway.
+    ///
+    /// A rule can be enforced and refused at once -- that is a gate working -- and
+    /// such a row is in the refused face and not in the unpaid one. Read as two
+    /// intakes it would be written twice under one identity, and the second write
+    /// would overwrite the first one's goal on every tick; read as one, the words
+    /// do not depend on which face a slug arrived by.
+    #[test]
+    fn a_refused_principle_carries_the_violation_on_the_row_it_already_had() {
+        let (rows, unaimed) = principle_debt_readings(&[
+            refused_principle_row(
+                "feedback_refused",
+                Some(PrincipleCheckKind::Shape),
+                Some("only stage your own paths"),
+                Some("NARROW_ADD_RE"),
+                3,
+                Some(1_762_000_000),
+            ),
+            // Refused, and counted rather than aimed at, because the tier says no
+            // machine may judge it: the count is the reading, and it is counted
+            // apart from the rows this intake can aim.
+            refused_principle_row(
+                "feedback_refused_held",
+                Some(PrincipleCheckKind::Judgement),
+                Some("a person's"),
+                Some("NARROW_ADD_RE"),
+                1,
+                Some(1_762_000_000),
+            ),
+        ]);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        // Refused is not the same as aimable: the second fixture is in the
+        // account's refused face and is still counted rather than read as work,
+        // because its tier says no machine may ever judge it.
+        assert_eq!(
+            unaimed.summary(),
+            "a-person-holds-this-by-its-own-declaration=1"
+        );
+        assert_eq!(rows[0].identity.kind, GREP_KIND);
+        assert_eq!(rows[0].identity.scope, PRINCIPLE_GATE_SCOPE);
+        assert_eq!(rows[0].identity.literal, "principle: feedback_refused");
+        // One name for one subject, whichever face the row was read off.
+        assert_eq!(rows[0].source.doc, PRINCIPLE_LEDGER_SOURCE);
+        assert_eq!(
+            rows[0].assertion.as_deref(),
+            Some(
+                "This principle has been refused work 3 times, most recently at \
+                 2025-11-01T12:26:40+00:00, by the host gate declared as `NARROW_ADD_RE`."
+            )
+        );
+        assert_eq!(
             rows[0].title.as_deref(),
             Some(
-                "Give the principle `feedback_owed` the gate it is declared to be owed: a check \
-                 answering from the running deployment's own readings, declared in the header \
-                 of the test that carries it."
+                "Give the principle `feedback_refused` the gate it is owed: a check answering from \
+                 the shape of the act it rules out, decided before the act, declared in the \
+                 header of the test that carries it. The rule itself: only stage your own paths. \
+                 This principle has been refused work 3 times, most recently at \
+                 2025-11-01T12:26:40+00:00, by the host gate declared as `NARROW_ADD_RE`."
             )
+        );
+    }
+
+    /// The gate column's sentinel is not a gate, and a refusal whose evidence has
+    /// no gate to name is still a refusal.
+    ///
+    /// `-` is what that column holds when the host's registry was read and the
+    /// rule was not in it -- a reading of the registry and not an organ that
+    /// refused -- so printing it would put a gate named `` `-` `` into the goal and
+    /// the assertion. The count and the instant are the evidence either way, and a
+    /// count with no instant drops the instant instead of substituting one.
+    #[test]
+    fn a_refusal_with_no_gate_to_name_still_carries_its_count() {
+        let evidence = refusal_evidence(&refused_principle_row(
+            "feedback_x",
+            Some(PrincipleCheckKind::Tree),
+            None,
+            Some(HOST_REGISTRY_READ_NO_GATE),
+            1,
+            None,
+        ));
+        assert_eq!(evidence, "once");
+        // And a count with no instant names the gate when there is one.
+        assert_eq!(
+            refusal_evidence(&refused_principle_row(
+                "feedback_x",
+                Some(PrincipleCheckKind::Tree),
+                None,
+                Some("CIRCLED_CHARS"),
+                2,
+                None,
+            )),
+            "2 times, by the host gate declared as `CIRCLED_CHARS`"
         );
     }
 
