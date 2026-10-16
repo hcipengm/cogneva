@@ -19,6 +19,9 @@
 #      就一律算收敛——那样一条身份随 Pod 走的 topk 规则会静默通过）。
 #   6. 缺席函数（`absent`/`absent_over_time`）的身份只来自实参选择器的**等值**匹配器：
 #      选择器里点名 Pod -> 红；选择器只带常量标签、或实参是聚合 -> 绿。
+#   7. 摘要里以**指路口吻**点名了停用名单里的名字 -> 红（读者被派去找一条不存在的
+#      规则）；同一个名字以**裸名字**出现 -> 绿（判据取的是出现形式，不是裸子串：
+#      停用名单那一行本身就是判据的依据，沿革注释与夹具另有正当的裸出现）。
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -102,6 +105,24 @@ for r in absent_agg:
 dump('absent_pod', absent_pod)
 dump('absent_plain', absent_plain)
 dump('absent_agg', absent_agg)
+
+# 7. 摘要里点名了一个**已停用**的名字。判据取反引号形态（散文的写法），所以同一个
+#    名字的裸出现必须仍然是绿的——停用名单那一行就是裸名字，判据要是取裸子串，
+#    它会把判据自己的依据一起判红。
+retired_name = doc['observability']['infra_watch'].get('retired_rules', [None])[0]
+if not retired_name:
+    raise SystemExit('配置里没有停用名单，这一族用例无从构造')
+
+prose_quoted = json.loads(json.dumps(rules))
+prose_bare = json.loads(json.dumps(rules))
+for r in prose_quoted:
+    if r['name'] == 'background_loop_restarted':
+        r['summary'] = r['summary'] + f' 把它与 `{retired_name}` 并读。'
+for r in prose_bare:
+    if r['name'] == 'background_loop_restarted':
+        r['summary'] = r['summary'] + f' 这一行讲的是 {retired_name} 的沿革，裸名字。'
+dump('prose_quoted', prose_quoted)
+dump('prose_bare', prose_bare)
 PYEOF
 
 run() { # run <config> -> 打印合并输出，回传退出码
@@ -167,6 +188,17 @@ grep -q 'ALERT SUBJECT OK' <<<"${out}" || fail "绿的时候也要报判词：${
 # 6c. 实参是聚合 -> 绿（实测结果为空标签）
 if ! out="$(run "${work}/absent_agg.json")"; then
   fail "缺席函数的实参是聚合，却被判红：${out}"; fi
+grep -q 'ALERT SUBJECT OK' <<<"${out}" || fail "绿的时候也要报判词：${out}"
+
+# 7a. 摘要里以反引号点名了停用名单里的名字 -> 红，且点名那条规则和那个名字
+if out="$(run "${work}/prose_quoted.json")"; then
+  fail "摘要点名了已停用的规则名，却被判绿：${out}"; fi
+grep -q 'background_loop_restarted' <<<"${out}" || fail "判红却没点名那条规则：${out}"
+grep -q '摘要里点名了已停用' <<<"${out}" || fail "判词没说清是摘要点名：${out}"
+
+# 7b. 同一个名字的**裸**出现 -> 绿（判据取形式，不取裸子串）
+if ! out="$(run "${work}/prose_bare.json")"; then
+  fail "摘要里的裸名字是正当写法，却被判红：${out}"; fi
 grep -q 'ALERT SUBJECT OK' <<<"${out}" || fail "绿的时候也要报判词：${out}"
 
 # 少了参数以外的路径不存在时，是依赖错误不是判词

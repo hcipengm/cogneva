@@ -341,6 +341,25 @@ def main(path):
     if len(set(retired)) != len(retired):
         problems.append('停用名单里有重复的名字')
 
+    # 第五件：停用名单里的名字不许以**散文的写法**（反引号）再出现在任何规则摘要里。
+    # 停用改的是「名单」那一侧——名单和「它不在了」是同一件事，改的时候一起改；而散文里
+    # 以**指路口吻**点名它的地方散在摘要里，改不改都不报错。读者是被派去找东西的：他带着
+    # 一个已经不存在的名字去找，什么都不找到，而读数面上「找不到」与「不存在」同形，他分不
+    # 出是印错了还是这条路真的没了。停用/改名本来常常就是为了消掉歧义（两处写同一个条件、
+    # 于是同一个状况有两个数），留在散文里的旧名字把那个歧义原样放回来。
+    #
+    # 判据取**反引号形态**，不取裸子串：同一个名字在这里有两种正当的裸出现——停用名单那一行
+    # 本身（它就是上面第一件的依据），以及沿革注释与单测夹具里讲「它曾存在、为什么停用」的
+    # 地方（改掉等于抹掉理由）。裸子串会把这两种一起判红，而它们恰恰是判据自己的依据。
+    BACKTICKED = re.compile(r'`([^`\n]+)`')
+    prose_hits = 0
+    for r in rules:
+        for token in dict.fromkeys(BACKTICKED.findall(r.get('summary') or '')):
+            if token in retired:
+                prose_hits += 1
+                problems.append(
+                    f'{r["name"]}：摘要里点名了已停用的 {token}，读者会去找一条不存在的规则')
+
     unreduced = [r['name'] for r in rules if lint(r['promql'])]
     offenders = [n for n in unreduced if n not in exempt]
     for n in offenders:
@@ -367,7 +386,7 @@ def main(path):
 
     print(f'规则 {len(rules)} 条，未收敛 {len(unreduced)} 条'
           f'（其中豁免 {len(unreduced) - len(offenders)} 条），两侧配不上 {len(unpaired)} 条，'
-          f'已停用 {len(retired)} 条',
+          f'已停用 {len(retired)} 条，摘要点名停用名 {prose_hits} 处',
           flush=True)
     if problems:
         for p in problems:
