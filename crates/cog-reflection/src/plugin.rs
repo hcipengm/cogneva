@@ -904,6 +904,22 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     } else {
                         None
                     };
+
+                // 现役 rev 的读数：变更账 loop 靠它把「已落地」与「在生效」分开——
+                // 两者之间隔着构建、CI、准入与滚动，中间那段时间账上写着已完成而没有
+                // 任何东西在跑它。名字与读法就是 live_revision 那一份（推送端读金丝雀
+                // 基底也走它），这里只把同一件事接到服务面上。
+                //
+                // 与推送端是否启用无关：`gitops.enabled` 管的是往中央仓库推，读集群
+                // 是另一回事。真读不到时它会报 ClusterUnreadable，那是一条真读数，
+                // 不是「没有东西脱离生效」。
+                ctx.publish_service::<dyn cog_core::LiveRevisionSource>(Arc::new(
+                    crate::live_revision::KubectlLiveRevision::new(
+                        &promotion.gitops.kubectl_bin,
+                        &promotion.gitops.namespace,
+                    ),
+                ));
+
                 let promoter: Option<Arc<crate::AutoPromoter>> = ctx
                     .consume_service::<dyn cog_core::PromotionLedger>()
                     .map(|ledger| {

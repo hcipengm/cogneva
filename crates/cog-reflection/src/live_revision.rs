@@ -1,8 +1,9 @@
 //! 集群**现役**的是哪个 rev：四个主负载是否全部落在同一个不可变 `main-<rev>` tag 上。
 //!
-//! 这一格读数有两个读者（金丝雀 overlay 的基底、以及「落地≠生效」那一格），第三个马上
-//! 就到。三处问的是同一个事实，所以**名字、jsonpath、解析**各只此一份：多一个读者不该
-//! 多一份名单——两份名单会各自漂，而漂掉的那份不会报错，它只会让某个读者少认一个名字。
+//! 这一格读数有两个读者：金丝雀 overlay 的基底（直接调本模块的读法），与「落地≠生效」
+//! 那一格（经 [`cog_core::LiveRevisionSource`] 服务面，由 [`KubectlLiveRevision`] 接上）。
+//! 两处问的是同一个事实，所以**名字、jsonpath、解析**各只此一份：多一个读者不该多一份
+//! 名单——两份名单会各自漂，而漂掉的那份不会报错，它只会让某个读者少认一个名字。
 //!
 //! 与 `mainline_deployer` 里那处按名读 deployment 的 image **不是**同一个问题：那里问
 //! 「某一个具名容器的 image 是什么」（判一条变更要不要重打），这里问「四个主负载的**全部**
@@ -14,7 +15,7 @@
 //! 且**要点名是哪个名字、为什么**——「权限被拒」与「集群里确实还是浮动 tag」是两件事，
 //! 落成同一行就再也没人分得出来。
 
-use cog_core::SFResult;
+use cog_core::{SFError, SFResult};
 
 /// 主负载：只有它们**全部**跑在同一个 `main-<rev>` tag 上，那个 tag 才是可信的现役版本。
 ///
@@ -71,7 +72,27 @@ pub async fn read_base_deployments(
             )
             .await
         {
-            Ok(o) => out.push_str(&o),
+            Ok(o) => {
+                // 交回来的必须**就是问的那个对象**。一次成功但空（或张冠李戴）的回答，
+                // 在解析层只表现为「这个名字不在 `main-<rev>` 上」——那是另一个结论。
+                // 一个没读出内容的回答与一个读出来不是 main 的负载，处置相反：前者要
+                // 再读一次，后者要去看滚动。所以这一条在这一层判，不进合并文本。
+                let answered_as = o.lines().next().and_then(|l| l.split('\t').next());
+                if answered_as != Some(name) {
+                    return Err(UnreadableDeployment {
+                        name,
+                        why: format!(
+                            "the answer does not name {name}: {}",
+                            if o.trim().is_empty() {
+                                "empty output".to_string()
+                            } else {
+                                format!("first line reads {:?}", o.lines().next().unwrap_or(""))
+                            }
+                        ),
+                    });
+                }
+                out.push_str(&o);
+            }
             Err(e) => {
                 return Err(UnreadableDeployment {
                     name,
@@ -127,6 +148,80 @@ pub fn deployed_main_rev(jsonpath_out: &str) -> Option<String> {
         revs.into_iter().next()
     } else {
         None
+    }
+}
+
+/// `CommandRunner` 的生产实现：起一个进程，交回它的 stdout。
+///
+/// 这道缝存在只为让「第一个读不出来的名字就中止」那一条能在没有集群时被量到。生产路径
+/// 上它就是一次普通的进程执行：不认得 kubectl，也不碰命名空间——命名空间是
+/// [`read_base_deployments`] 拼进 argv 的，形状只有一处。
+pub struct Subprocess;
+
+#[async_trait::async_trait]
+impl CommandRunner for Subprocess {
+    async fn run(&self, program: &str, args: &[&str], timeout_secs: u64) -> SFResult<String> {
+        let cmdline = format!("{program} {}", args.join(" "));
+        let fut = tokio::process::Command::new(program)
+            .args(args)
+            .kill_on_drop(true)
+            .output();
+        let out = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut)
+            .await
+            .map_err(|_| SFError::IO(format!("{cmdline} timed out after {timeout_secs}s")))?
+            .map_err(|e| SFError::IO(format!("failed to run {program}: {e}")))?;
+        if !out.status.success() {
+            return Err(SFError::IO(format!(
+                "{cmdline} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+}
+
+/// 现役 rev 作为一项读数交给别的组件（[`cog_core::LiveRevisionSource`]）。
+///
+/// 读法就是本模块的逐名读 + 解析——这个类型不做任何判据，只把**两种失败分到各自的
+/// 格子里**，因为它们的处置相反：一个还滚着（该去看滚动），一个根本没读到（该去查授权
+/// 或 API server）。合成一个 `None` 会让读者去追错的那个。
+pub struct KubectlLiveRevision {
+    kubectl_bin: String,
+    namespace: String,
+}
+
+impl KubectlLiveRevision {
+    pub fn new(kubectl_bin: impl Into<String>, namespace: impl Into<String>) -> Self {
+        Self {
+            kubectl_bin: kubectl_bin.into(),
+            namespace: namespace.into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl cog_core::LiveRevisionSource for KubectlLiveRevision {
+    async fn live_revision(&self) -> cog_core::LiveRevision {
+        as_reading(read_base_deployments(&Subprocess, &self.kubectl_bin, &self.namespace).await)
+    }
+}
+
+/// 一次读取的结局 → 一格读数：三种结局各进各的格子，一个都不许并进另一个。
+///
+/// 单独一个函数，是因为**要测的就是这张对照表**，而不是进程那一层；把它埋进
+/// `live_revision()` 里，就没有办法在没有集群时把三种结局都喂进来。
+fn as_reading(read: Result<String, UnreadableDeployment>) -> cog_core::LiveRevision {
+    use cog_core::{LiveRevision, LiveRevisionGap};
+
+    match read {
+        // 「读不出来」的所有形状都落 ClusterUnreadable：进程起不来、非零退出（授权被拒）、
+        // 超时、以及**读回来是空的**。最后一种由 `read_base_deployments` 判掉——空回答在
+        // 解析层会变成「不在 `main-<rev>` 上」，那是滚动，不是没读到。
+        Err(_) => LiveRevision::Unmeasurable(LiveRevisionGap::ClusterUnreadable),
+        Ok(out) => match deployed_main_rev(&out) {
+            Some(rev) => LiveRevision::Known(rev),
+            None => LiveRevision::Unmeasurable(LiveRevisionGap::NoUnanimousMainTag),
+        },
     }
 }
 
@@ -274,5 +369,85 @@ mod tests {
     fn the_parser_cannot_tell_it_was_handed_a_truncated_read() {
         let only_one = "cogneva\tcogneva=reg/cogneva:main-aaa\n";
         assert_eq!(deployed_main_rev(only_one).as_deref(), Some("aaa"));
+    }
+
+    /// 一次成功但**空**的回答是「没读到」，不是「这个负载不在 main 上」。
+    ///
+    /// 后者（滚动中间、或还挂着浮动 tag）要人去看滚动，前者要人再读一次或查授权；
+    /// 空回答若被拼进合并文本，它在那层就变成后者——同一个错的脸，看着像另一个结论。
+    #[tokio::test]
+    async fn an_answer_that_does_not_name_the_object_asked_for_is_unreadable() {
+        let mut runner = FakeRunner::on_main();
+        runner.answers[2] = (BASE_DEPLOYMENTS[2], Ok(""));
+        let empty = read_base_deployments(&runner, "kubectl", "cogneva")
+            .await
+            .expect_err("空回答不是「不在 main 上」");
+        assert_eq!(empty.name, BASE_DEPLOYMENTS[2]);
+        assert!(empty.why.contains("empty output"), "{}", empty.why);
+
+        // 张冠李戴同样算没读到：交回来的是别的对象，我们对这个名字一无所知。
+        let mut runner = FakeRunner::on_main();
+        runner.answers[3] = (
+            BASE_DEPLOYMENTS[3],
+            Ok("some-other-deployment\tx=reg/cogneva:main-aaa\n"),
+        );
+        let wrong = read_base_deployments(&runner, "kubectl", "cogneva")
+            .await
+            .expect_err("答的不是问的那个对象");
+        assert_eq!(wrong.name, BASE_DEPLOYMENTS[3]);
+        assert!(wrong.why.contains("does not name"), "{}", wrong.why);
+    }
+
+    /// 生产那条进程路径本身：失败要报成失败，不能报成空输出。
+    ///
+    /// 这两者在这条读法里处置相反——空输出是「没读到」（该再读一次或查授权），而一次
+    /// 非零退出若被读成空字符串，就会以「读到了、内容是空」的形状流下去，在解析层变成
+    /// 「这个负载不在 `main-<rev>` 上」。
+    #[tokio::test]
+    async fn the_subprocess_runner_reports_failure_rather_than_empty_output() {
+        assert_eq!(
+            Subprocess
+                .run("sh", &["-c", "printf 'a\\tb\\n'"], 5)
+                .await
+                .expect("成功的命令要交回 stdout"),
+            "a\tb"
+        );
+
+        let err = Subprocess
+            .run("sh", &["-c", "echo denied >&2; exit 1"], 5)
+            .await
+            .expect_err("非零退出是失败，不是空输出");
+        assert!(err.to_string().contains("denied"), "{err}");
+    }
+
+    /// 三种结局各进各的格子。这张对照表是这一格的判据，不是实现细节：把「没读到」
+    /// 并进「不在现役 rev」会让读者去追滚动，把「读不齐」并进「没读到」会让它去查
+    /// 授权——两边的处置相反。
+    #[test]
+    fn the_three_outcomes_stay_three() {
+        use cog_core::{LiveRevision, LiveRevisionGap};
+
+        let on_main: String = ON_MAIN_AAA.iter().map(|(_, o)| *o).collect();
+        assert_eq!(
+            as_reading(Ok(on_main)),
+            LiveRevision::Known("aaa".to_string())
+        );
+
+        // 四个都读到了、但没全落在同一个 main tag 上：集群读得动，只是没有现役 rev。
+        let rolling = "cogneva\tcogneva=reg/cogneva:main-aaa\n\
+                       cogneva-security-gateway\tsecurity-gateway=reg/cogneva:local\n";
+        assert_eq!(
+            as_reading(Ok(rolling.to_string())),
+            LiveRevision::Unmeasurable(LiveRevisionGap::NoUnanimousMainTag)
+        );
+
+        // 读不动：授权被拒、超时、进程起不来，以及空回答（由读的那一层判成 Err）。
+        assert_eq!(
+            as_reading(Err(UnreadableDeployment {
+                name: BASE_DEPLOYMENTS[0],
+                why: "Forbidden".into(),
+            })),
+            LiveRevision::Unmeasurable(LiveRevisionGap::ClusterUnreadable)
+        );
     }
 }
