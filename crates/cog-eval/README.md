@@ -168,8 +168,16 @@ cogneva eval-table --pins /srv/cogneva/benchmarks/pins.tsv \
   enabled `llm_routing` backends. A pin naming a model no upstream serves is reported as a missing
   dependency, not printed as though it were in force.
 - Missing dependencies (backbone, judge, container backend, Compose backend, platform) do not stop
-  the table: they are listed under `## wiring`, the cells they touch come out `errored`, and the
-  process exits non-zero. The table is the report; the exit code is the verdict.
+  the table: they are listed under `## wiring`, and the process exits non-zero. The table is the
+  report; the exit code is the verdict. Each such line says four things: the subject, **what it
+  covers** (`run`, `every-cell`, `column:<benchmark>`, `row:<scaffold>`), **what kind of absence it
+  is** (`not-implemented`, `not-wired`, `out-of-arm`, `no-reading`), and why. The per-seed rows then
+  name the declarations covering them in `blocked-by=`, and those cases are counted in `blocked`
+  rather than `errored`: they were never going to run, and the remedy is to add the missing piece or
+  change arm — not to chase a failure. `errored` keeps only the cases nothing declared (environment
+  or upstream failures), which is what a red table should be read as. A `run`-scoped declaration
+  covers no cell at all: the tools-off diagnostic arm prints readings that *did* happen, and only its
+  right to be a table row is withheld.
 
 Two runs with one data root and one command line print the **same bytes**: no wall clock, no
 container iteration order, no scheduler-dependent ordering (the failure list is sorted by case id,

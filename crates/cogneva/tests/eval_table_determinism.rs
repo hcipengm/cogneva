@@ -143,6 +143,19 @@ impl PlatformRunner for EchoPlatform {
     }
 }
 
+/// 接上了、但每次跑都失败的平台替身。
+///
+/// 它造的是「没有声明过的缺陷」：`Wiring.platform` 有值，所以 `## wiring` 里没有平台
+/// 那一条声明——那么这一格的跑不动就只能是它自己的问题，必须照旧进 `errored`。
+struct BrokenPlatform;
+
+#[async_trait]
+impl PlatformRunner for BrokenPlatform {
+    async fn run(&self, _request: PlatformRequest) -> anyhow::Result<PlatformReply> {
+        anyhow::bail!("the platform is wired but every run fails")
+    }
+}
+
 /// 两个题的 HLE 文本形式，外加一份把这两个字节钉住的 pins 文件。
 fn fixture(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     let jsonl = root.join("hle/test-00000-of-00001.jsonl");
@@ -336,20 +349,106 @@ async fn a_missing_platform_is_an_error_not_a_zero_score() {
     let out = run_table(&args, &wired(false), &pins).await.unwrap();
     let again = run_table(&args, &wired(false), &pins).await.unwrap();
 
-    // 两题 × 三个种子都记成跑不动。
-    assert_eq!(out.errored, 6, "{}", out.text);
+    // 两题 × 三个种子。这些题**不是跑错了**：平台这一行是被提前声明过的缺席挡住的，
+    // 这一格本来就没轮到跑。两个数分开印，是为了让「这一行少配了一段」与「这一格有
+    // 缺陷」在被读的那一刻就不是一回事——合在一起时读的人只能自己猜该去修哪一半。
+    assert_eq!(out.errored, 0, "{}", out.text);
+    assert_eq!(out.blocked, 6, "{}", out.text);
+    // 逐格读数上要能看见是被谁挡的，名字能回到 `## wiring` 那一行。
+    assert!(
+        out.text.contains(
+            "cell\thle\tnql\tseed=0\tresolved=0\ttotal=2\terrored=0\tblocked=2\tblocked-by=nql\t"
+        ),
+        "{}",
+        out.text
+    );
+    assert!(
+        out.text
+            .contains("missing\tnql\trow:nql\tnot-wired\tno platform is wired"),
+        "管到哪与哪一类都要写出来：{}",
+        out.text
+    );
     assert!(
         out.missing.iter().any(|m| m.contains("platform")),
         "{:?}",
         out.missing
     );
     assert!(
-        out.text.contains("no platform endpoint is wired"),
+        out.text.contains("no platform is wired"),
         "判词要留下缺席的原因：{}",
         out.text
     );
     // 有判词的那张表也要逐字节可 diff：失败明细按题 id 排，不按并发完成的先后。
     assert_eq!(out.text, again.text, "失败明细的顺序不能由调度决定");
+}
+
+/// 提前声明过的缺席只盖它点名的那些格子：同一次跑里别的行照出真读数。
+///
+/// 少了这一条，「凡有声明就把整表算成没轮到跑」的实现也会过掉——而那会把真缺陷一起洗掉。
+#[tokio::test]
+async fn a_declared_absence_blocks_only_the_row_it_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, pins_path) = fixture(dir.path());
+    let pins = Pins::load(&pins_path).unwrap();
+    let args = args(dir.path(), &pins_path, "gepa,nql");
+
+    let out = run_table(&args, &wired(false), &pins).await.unwrap();
+
+    // nql 那一行：平台没接上，两题 × 三种子都算没轮到跑。
+    assert_eq!(out.blocked, 6, "{}", out.text);
+    assert_eq!(out.errored, 0, "{}", out.text);
+    assert!(
+        out.text.contains(
+            "cell\thle\tnql\tseed=0\tresolved=0\ttotal=2\terrored=0\tblocked=2\tblocked-by=nql\t"
+        ),
+        "{}",
+        out.text
+    );
+    // gepa 那一行不靠平台，一格一题都不许被这条声明碰到。
+    assert!(
+        out.text.contains(
+            "cell\thle\tgepa\tseed=0\tresolved=2\ttotal=2\terrored=0\tblocked=0\tblocked-by=-\t"
+        ),
+        "{}",
+        out.text
+    );
+    assert!(
+        !out.text
+            .contains("cell\thle\tgepa\tseed=0\tresolved=2\ttotal=2\terrored=0\tblocked=2"),
+        "声明盖到了没被点名的行：{}",
+        out.text
+    );
+}
+
+/// 平台接上了、但每次都失败：这是**没有声明过**的缺陷，必须照旧印 `errored`。
+///
+/// 同时钉住另一半：整次跑那一类的声明（这里只有诊断臂那一条）一个格子都不许盖——
+/// 它说的是「这次跑不构成一行表」，而那些格子是真跑过的读数。
+#[tokio::test]
+async fn an_undeclared_failure_is_errored_and_the_run_wide_absence_covers_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, pins_path) = fixture(dir.path());
+    let pins = Pins::load(&pins_path).unwrap();
+    let args = args(dir.path(), &pins_path, "nql");
+
+    let mut wiring = wired(false);
+    wiring.platform = Some(Arc::new(BrokenPlatform));
+    wiring.platform_base = Some("http://platform.test".into());
+
+    let out = run_table(&args, &wiring, &pins).await.unwrap();
+
+    // 只有诊断臂那一条声明，平台这一侧没有任何声明。
+    assert_eq!(out.missing.len(), 1, "{:?}", out.missing);
+    assert!(!out.text.contains("missing\tnql\t"), "{}", out.text);
+    assert_eq!(out.blocked, 0, "{}", out.text);
+    assert_eq!(out.errored, 6, "{}", out.text);
+    assert!(
+        out.text.contains(
+            "cell\thle\tnql\tseed=0\tresolved=0\ttotal=2\terrored=2\tblocked=0\tblocked-by=-\t"
+        ),
+        "{}",
+        out.text
+    );
 }
 
 /// 跑一份存档点名的子集：分母是存档里的题数，表头要说清跑的是哪一批题。

@@ -655,8 +655,17 @@ pub struct Outcome {
     pub text: String,
     /// 缺了什么（人为可读）。非空即这次跑不是一次完整的实验。
     pub missing: Vec<String>,
-    /// 报出来跑不动的题数（不是答错，是没能给出答案）。
+    /// 报出来跑不动的题数，**只数没人提前声明过的那部分**：这些格子本来该跑得动，跑不动是缺陷。
+    ///
+    /// 与 `blocked` 分开是这条读数的要点：同一个 `errored` 底下混着「上游挂了／代码断了」与
+    /// 「这一格本来就没有那个后端」，而两者的处置正相反——前者要修，后者要去做那个后端，
+    /// 或者换一条臂。**总数不是人口**：一个把 1080 例「没有容器后端」与 240 例「少配一段」
+    /// 加在一起的总数，读不出该去修哪一半。
     pub errored: usize,
+    /// 被**开跑前就声明过的缺席**挡住的题数。
+    ///
+    /// 它按未解决计分（分母不缩），但它不是「跑错了」，是「没轮到这个格子跑」。
+    pub blocked: usize,
 }
 
 /// 跑一次表并渲染。依赖由调用方注入：命令行注入真上游与真平台，测试注入替身。
@@ -709,46 +718,219 @@ fn run_checkpoint(
     Checkpoint { path, run_id }
 }
 
-/// 开跑**之前**就看得出来缺什么。收窄到这三样而不是整份参数：判词只跟「哪一列、哪个外壳、
+/// 一条缺席声明**管到哪些格子**。
+///
+/// 这一格补的是报表里两段各说各话的那道缝：`## wiring` 说「缺 X」，而 `## per seed` 里那些
+/// 格子照样印 `errored=40`。没有「管到哪」，读的人只能猜那 40 是不是就是 X 害的——而猜错的
+/// 方向很贵：把它读成「这一格有缺陷要修」，就会去修一个本来就没打算跑的格子；反过来把
+/// 「少配一段」读成「这一格烂了」，就会去查一个查不出东西的格子。
+///
+/// 所以每一条声明自己说是哪一类，由这一类决定它盖住哪些格子。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MissingScope {
+    /// 整次跑。**故意一个格子都不盖**：这一类的判词是「这次跑不构成一行表」，而格子照跑、
+    /// 读数照有（诊断臂就是这一种）。盖住它会把「这一格本来跑得动」这件事一起抹掉，而那正是
+    /// 拒收为表行时要保住的信息。
+    Run,
+    /// 每一个格子。上游骨干、裁判这种缺了没有一格出得来读数。
+    EveryCell,
+    /// 某一列（基准）：缺的是这个基准要的后端。
+    Column(String),
+    /// 某一行（外壳）：缺的是这个外壳要的东西。
+    Row(String),
+}
+
+impl MissingScope {
+    /// 报表里那一格。列名行名带上，因为它就是这条声明管到哪的全部信息。
+    fn render(&self) -> String {
+        match self {
+            MissingScope::Run => "run".to_string(),
+            MissingScope::EveryCell => "every-cell".to_string(),
+            MissingScope::Column(name) => format!("column:{name}"),
+            MissingScope::Row(name) => format!("row:{name}"),
+        }
+    }
+
+    /// 这条声明盖不盖「这一列 × 这一行」的格子。
+    fn covers(&self, benchmark: &str, scaffold: &str) -> bool {
+        match self {
+            MissingScope::Run => false,
+            MissingScope::EveryCell => true,
+            MissingScope::Column(name) => name == benchmark,
+            MissingScope::Row(name) => name == scaffold,
+        }
+    }
+}
+
+/// 这条缺席是**哪一类**。四类的处置互不相同，所以缺了它这句「缺 X」还不够读：
+/// 没实现要写代码，没接上要接线（可能只是少配一段），这条臂按定义不供要换臂或换读法，
+/// 而读不出题既不是代码也不是配置的事。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Absence {
+    /// 树里没有这个东西的实现，所以没有可接的东西——不是一个配置旋钮。
+    NotImplemented,
+    /// 实现了，这次跑没把它接进来（上游没配、传输建不出来、端点没指）。
+    NotWired,
+    /// 这条臂按定义就不提供它。不是缺陷，是这次实验的定义。
+    OutOfArm,
+    /// 缺的不是代码也不是配置，是读数本身：这个基准的题一份也没读出来。
+    NoReading,
+}
+
+impl Absence {
+    fn render(&self) -> String {
+        match self {
+            Absence::NotImplemented => "not-implemented".to_string(),
+            Absence::NotWired => "not-wired".to_string(),
+            Absence::OutOfArm => "out-of-arm".to_string(),
+            Absence::NoReading => "no-reading".to_string(),
+        }
+    }
+}
+
+/// 一条缺席：谁缺、管到哪些格子、是哪一类缺、为什么。
+///
+/// 四样缺一不可，因为它们回答的是四个不同的问题：读的人要照着做的那一步（怎么补）、
+/// 这一步有多大（影响多少格子）、这一步属于哪一类活（写代码还是改配置）、以及为什么会这样。
+pub struct Missing {
+    subject: String,
+    scope: MissingScope,
+    kind: Absence,
+    why: String,
+}
+
+impl Missing {
+    fn new(subject: &str, scope: MissingScope, kind: Absence, why: impl Into<String>) -> Self {
+        Self {
+            subject: subject.to_string(),
+            scope,
+            kind,
+            why: why.into(),
+        }
+    }
+
+    /// `## wiring` 那一行：五格，前四格是结构化的判据，最后一格是给人读的因。
+    fn wiring_line(&self) -> String {
+        format!(
+            "missing\t{}\t{}\t{}\t{}",
+            self.subject,
+            self.scope.render(),
+            self.kind.render(),
+            self.why
+        )
+    }
+
+    /// 人读的那一句话。与加 scope 之前**逐字节相同**：退出码那一路上念的就是这些句子，
+    /// 而它今天已经是一份能 diff 的契约，不因为这里多记了两样东西就换一个写法。
+    fn as_line(&self) -> String {
+        format!("{}: {}", self.subject, self.why)
+    }
+
+    fn covers(&self, benchmark: &str, scaffold: &str) -> bool {
+        self.scope.covers(benchmark, scaffold)
+    }
+}
+
+/// 把每一格跑出来的 `errored` 按「这一格有没有被**提前声明过**的缺席盖住」分成两半。
+///
+/// 这不是换一个说法，是分开两件处置相反的事：盖住的那半本来就没轮到跑（去做那个后端、
+/// 或者换一条臂），没盖住的那半才是这一列的读数要指的东西（上游挂了、环境建不出来，要修）。
+/// 合成一个数时，一个把 1080 例「这一列没有后端」与 360 例「少配一段」加在一起的总数，
+/// 读不出该去修哪一半——**总数不是人口**。
+///
+/// 报表与退出码都从这一个函数取这两个数，所以两处不可能对不上。
+fn error_split(table: &Table, declared: &[Missing]) -> (usize, usize) {
+    let mut errored = 0;
+    let mut blocked = 0;
+    for cell in &table.cells {
+        let covered = declared
+            .iter()
+            .any(|m| m.covers(&cell.benchmark, &cell.scaffold));
+        if covered {
+            blocked += cell.errored();
+        } else {
+            errored += cell.errored();
+        }
+    }
+    (errored, blocked)
+}
+
+/// 开跑**之前**就看得出来缺什么。收窄到这几样而不是整份参数：判词只跟「哪一列、哪个外壳、
 /// 哪条臂」有关，跟数据根、闸门那些无关，所以它是一条纯函数，能被单测直接钉住。
 ///
 /// 一条依赖缺席的原因要说得准：`backbone` 与平台都可能「没配」，也可能「配了、传输建不出来」。
 /// 这两种情况留在同一句话里，读的人会去配一个本来已经配好的东西。
+///
+/// 每条还要说清**管到哪些格子**与**是哪一类**：这两样决定 `## per seed` 里那些 `errored`
+/// 该算缺陷还是算没轮到跑，见 `MissingScope` 与 `Absence`。
 fn missing_dependencies(
     tools: ToolArm,
     benchmarks: &[&str],
     scaffolds: &[&str],
     wiring: &Wiring,
-) -> Vec<String> {
+) -> Vec<Missing> {
     let mut missing = Vec::new();
     // 诊断臂不是缺席的依赖，但它同样意味着这次跑不是一次完整的实验：没有主表那一臂的
     // 工具面，格子就不能作表行。记进来，退出码于是不会把一次诊断跑当成一次成表跑。
+    //
+    // `Run` 而不是 `EveryCell`：这条说的是「这次跑不构成一行表」，格子本身照跑照有读数
+    // （下面 `## per seed` 里那些数字就是诊断的全部用处），把它算成「这些格子被挡住了」
+    // 会连「这一格本来跑得动」一起抹掉。
     if !tools.is_table_arm() {
-        missing.push(
-            "tools: this run used the tools-off diagnostic arm, so it is not a main-table row"
-                .to_string(),
-        );
+        missing.push(Missing::new(
+            "tools",
+            MissingScope::Run,
+            Absence::OutOfArm,
+            "this run used the tools-off diagnostic arm, so it is not a main-table row",
+        ));
     }
     if wiring.backbone.is_none() {
-        missing.push(match &wiring.no_transport {
-            Some(why) => format!("backbone: {why}"),
-            None => "backbone: no LLM upstream is configured".to_string(),
-        });
+        missing.push(Missing::new(
+            "backbone",
+            MissingScope::EveryCell,
+            Absence::NotWired,
+            match &wiring.no_transport {
+                Some(why) => why.clone(),
+                None => "no LLM upstream is configured".to_string(),
+            },
+        ));
     }
     if wiring.judge.is_none() {
-        missing.push("judge: no generative judge upstream is configured".to_string());
+        missing.push(Missing::new(
+            "judge",
+            MissingScope::EveryCell,
+            Absence::NotWired,
+            "no generative judge upstream is configured",
+        ));
     }
+    // 这两个是 `NotImplemented` 而不是 `NotWired`：树里没有它们的实现（只有测试替身），
+    // 所以「接上」这一步今天无物可接。写成「没接上」会把读的人送去翻配置，翻不出东西。
     if benchmarks.contains(&"swe-bench-pro") && wiring.swe_pro.is_none() {
-        missing.push("swe-bench-pro: no container backend is wired".to_string());
+        missing.push(Missing::new(
+            "swe-bench-pro",
+            MissingScope::Column("swe-bench-pro".to_string()),
+            Absence::NotImplemented,
+            "no container backend is implemented in this build, so there is nothing to wire",
+        ));
     }
     if benchmarks.contains(&"toolathlon") && wiring.toolathlon.is_none() {
-        missing.push("toolathlon: no compose backend is wired".to_string());
+        missing.push(Missing::new(
+            "toolathlon",
+            MissingScope::Column("toolathlon".to_string()),
+            Absence::NotImplemented,
+            "no compose backend is implemented in this build, so there is nothing to wire",
+        ));
     }
     if scaffolds.contains(&"nql") && wiring.platform.is_none() {
-        missing.push(match &wiring.no_transport {
-            Some(why) => format!("nql: the platform endpoint cannot be reached: {why}"),
-            None => "nql: no platform is wired".to_string(),
-        });
+        missing.push(Missing::new(
+            "nql",
+            MissingScope::Row("nql".to_string()),
+            Absence::NotWired,
+            match &wiring.no_transport {
+                Some(why) => format!("the platform endpoint cannot be reached: {why}"),
+                None => "no platform is wired".to_string(),
+            },
+        ));
     }
     missing
 }
@@ -851,14 +1033,21 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
     }
 
     let table = rig.run(&benchmarks).await?;
-    let errored: usize = table.cells.iter().map(|c| c.errored()).sum();
 
     // 读不出题的基准会留下一整列「题数为 0」的格子。那不是一个读数为零的格子，是这一列
     // 没有读数——两者在表里都写 0，必须在这里分开。运行器把原因带了出来（数据读不出来／
     // 子集点名的题不在这一版数据里），照它的原话记：这两条追查方向完全不同，合成一句
     // 「题数为 0」就等于把因说成了命。
+    //
+    // 这两条与上面那批同一次跑里才发现，所以管到哪要按**列**说：一列读不出来就是整列
+    // 没有读数，不是某一格的事。
     for (benchmark, why) in &table.unreadable {
-        missing.push(format!("{benchmark}: {why}"));
+        missing.push(Missing::new(
+            benchmark,
+            MissingScope::Column(benchmark.clone()),
+            Absence::NoReading,
+            why.clone(),
+        ));
     }
     for cell in &table.cells {
         let named = table
@@ -866,15 +1055,25 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
             .iter()
             .any(|(benchmark, _)| benchmark == &cell.benchmark);
         if !named && cell.per_seed.iter().all(|s| s.total == 0) {
-            let why = format!(
-                "{}: the case source read no cases (the column would read as a score of zero)",
-                cell.benchmark
+            let line = Missing::new(
+                &cell.benchmark,
+                MissingScope::Column(cell.benchmark.clone()),
+                Absence::NoReading,
+                "the case source read no cases (the column would read as a score of zero)",
             );
-            if !missing.contains(&why) {
-                missing.push(why);
+            // 同一列的每一行都会走到这里，所以按「同一件事」去重，而不是按那句话重去重。
+            if !missing
+                .iter()
+                .any(|m| m.subject == line.subject && m.why == line.why)
+            {
+                missing.push(line);
             }
         }
     }
+
+    // 报表与退出码读的都是这两个数，而且都从这个函数取：一处算、两处念，才不会出现
+    // 「表上印着 0，退出码却说有题跑不动」这种自相矛盾。
+    let (errored, blocked) = error_split(&table, &missing);
 
     let text = render(
         args,
@@ -889,13 +1088,13 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
             subset: subset.as_deref(),
             checkpoint: &checkpoint,
             table: &table,
-            errored,
         },
     );
     Ok(Outcome {
         text,
-        missing,
+        missing: missing.iter().map(Missing::as_line).collect(),
         errored,
+        blocked,
     })
 }
 
@@ -934,16 +1133,22 @@ pub(crate) fn build_benchmark(
 
 /// 报表里 `## wiring` 那一段要的两样东西：说不出话的依赖（缺席），以及接上了的那个平台
 /// 是谁。两者都是「这次跑的外部上游是什么」，所以一起递。
+///
+/// 缺席这条也喂给 `## per seed`：那一段要按它把 `errored` 分成「没轮到跑」与「跑不动」。
 struct WiringReport<'a> {
-    missing: &'a [String],
+    missing: &'a [Missing],
     platform_base: Option<&'a str>,
 }
 
 /// 要渲染的那次跑读了什么、跑出了什么。
 ///
-/// 数据是哪一份（`data_root`、`pins`、`verified`、`subset`）与结果是哪一份（`table`、
-/// `errored`）是同一件事的两半——「这张表说的是哪次跑」缺了任何一半都答不出来，所以
-/// 一起递，而不是在参数表上排成一串。
+/// 数据是哪一份（`data_root`、`pins`、`verified`、`subset`）与结果是哪一份（`table`）
+/// 是同一件事的两半——「这张表说的是哪次跑」缺了任何一半都答不出来，所以一起递，而不是
+/// 在参数表上排成一串。
+///
+/// `errored`／`blocked` 这两个数**不在这里递**：它们是由 `table` 与 `wiring.missing` 算出来的，
+/// 递进来就等于给了第二个来源，两处可以对不上——而「报表说 0、退出码说有题跑不动」正是
+/// 这次改动要消灭的那种自相矛盾。所以 `render` 自己调那个共用的 `error_split`。
 struct Readings<'a> {
     data_root: &'a Path,
     pins: &'a Pins,
@@ -951,7 +1156,6 @@ struct Readings<'a> {
     subset: Option<&'a CaseSubset>,
     checkpoint: &'a Checkpoint,
     table: &'a Table,
-    errored: usize,
 }
 
 fn render(args: &EvalTableArgs, wiring: WiringReport<'_>, readings: Readings<'_>) -> String {
@@ -962,8 +1166,8 @@ fn render(args: &EvalTableArgs, wiring: WiringReport<'_>, readings: Readings<'_>
         subset,
         checkpoint,
         table,
-        errored,
     } = readings;
+    let (errored, blocked) = error_split(table, wiring.missing);
     let mut out = String::new();
     out.push_str("# eval-table\n\n## pins\n");
     out.push_str(&format!("backbone\t{}\n", args.backbone.render()));
@@ -1051,8 +1255,12 @@ fn render(args: &EvalTableArgs, wiring: WiringReport<'_>, readings: Readings<'_>
     if wiring.missing.is_empty() {
         out.push_str("complete\n");
     } else {
+        // 每一行五格：谁缺、管到哪些格子、哪一类、为什么。后两格不是修饰——它们决定
+        // 下面那些格子里的 `errored` 该读成缺陷还是读成没轮到跑，也决定照着做的那一步
+        // 是写代码还是改配置。
         for line in wiring.missing {
-            out.push_str(&format!("missing\t{line}\n"));
+            out.push_str(&line.wiring_line());
+            out.push('\n');
         }
     }
 
@@ -1162,16 +1370,41 @@ fn render(args: &EvalTableArgs, wiring: WiringReport<'_>, readings: Readings<'_>
             let Some(cell) = table.cell(row, col) else {
                 continue;
             };
+            // 这一格被哪些**提前声明过**的缺席盖住，把名字点出来。名字是可点回去的：
+            // 从 `blocked-by=` 里的每一个名字都能回到 `## wiring` 那一行，看是哪一类、怎么补。
+            let covering: Vec<&str> = wiring
+                .missing
+                .iter()
+                .filter(|m| m.covers(col, row))
+                .map(|m| m.subject.as_str())
+                .collect();
+            let blocked_by = if covering.is_empty() {
+                "-".to_string()
+            } else {
+                covering.join(",")
+            };
             for seed in &cell.per_seed {
+                // `errored` 与 `blocked` 互斥，和两格都由「这一格有没有被声明盖住」定：
+                // 盖住的那些题**不是跑错了**，是这一格本来就没轮到跑（后端没实现、平台没接），
+                // 所以它们进 `blocked`；没盖住的才是 `errored`——那些题本来该跑得动。
+                // 两个数写在一行上、且总是相加等于原先那一个：并排放着才读得出「这一格里
+                // 有多少是缺陷、多少是没轮到」，而不会把两者当成同一个数。
+                let (errored, blocked) = if covering.is_empty() {
+                    (seed.errored, 0)
+                } else {
+                    (0, seed.errored)
+                };
                 // `resumed` 单列出来：接回来的那些题用的是**当时**那份外壳与那次上游，
                 // 与这一轮跑出来的不是同一个条件。归零（没有检查点或全新一次跑）就是
                 // 这一格全是这一轮的读数。
                 out.push_str(&format!(
-                    "cell\t{col}\t{row}\tseed={}\tresolved={}\ttotal={}\terrored={}\tresumed={}\ttokens={}\tsteps={}\n",
+                    "cell\t{col}\t{row}\tseed={}\tresolved={}\ttotal={}\terrored={}\tblocked={}\tblocked-by={}\tresumed={}\ttokens={}\tsteps={}\n",
                     seed.seed,
                     seed.resolved,
                     seed.total,
-                    seed.errored,
+                    errored,
+                    blocked,
+                    blocked_by,
                     seed.resumed,
                     seed.tokens,
                     seed.steps
@@ -1209,7 +1442,9 @@ fn render(args: &EvalTableArgs, wiring: WiringReport<'_>, readings: Readings<'_>
         }
     }
 
-    out.push_str(&format!("\nerrored\t{errored}\n"));
+    // 两个数一起出。少一个，读的人就只能把 `blocked` 混进 `errored` 读——那正是这一版要
+    // 拆开的东西。
+    out.push_str(&format!("\nerrored\t{errored}\tblocked\t{blocked}\n"));
     out
 }
 
@@ -1399,6 +1634,8 @@ pub async fn run_from_args() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 逐格读数要能在夹具里摆出来，才有东西可测 `## per seed` 那一段。
+    use cog_eval::{Cell, SeedScore};
 
     fn args(raw: &[&str]) -> Result<EvalTableArgs, String> {
         EvalTableArgs::parse(&raw.iter().map(|s| s.to_string()).collect::<Vec<_>>())
@@ -1575,7 +1812,6 @@ mod tests {
                 subset: None,
                 checkpoint: &checkpoint_at("/tmp/table.md"),
                 table: &one_cell_table(),
-                errored: 0,
             },
         );
         assert!(text.contains("tools\tnone\n"), "{text}");
@@ -1606,7 +1842,6 @@ mod tests {
                 subset: None,
                 checkpoint: &checkpoint_at("/tmp/table.md"),
                 table: &one_cell_table(),
-                errored: 0,
             },
         );
         assert!(
@@ -1642,7 +1877,6 @@ mod tests {
                 subset: None,
                 checkpoint: &checkpoint_at("/tmp/table.md"),
                 table: &one_cell_table(),
-                errored: 0,
             },
         );
         let line = text
@@ -1714,7 +1948,6 @@ mod tests {
                 subset: None,
                 checkpoint: &checkpoint_at("/tmp/table.md"),
                 table: &one_cell_table(),
-                errored: 0,
             },
         );
         assert!(text.contains("## gate\n"), "{text}");
@@ -1744,7 +1977,6 @@ mod tests {
                 subset: None,
                 checkpoint: &checkpoint_at("/tmp/table.md"),
                 table: &table,
-                errored: 0,
             },
         );
         assert!(text.contains("concurrency-slot\t2\n"), "{text}");
@@ -1855,7 +2087,6 @@ mod tests {
                 subset: None,
                 checkpoint: &checkpoint_at("/tmp/table.md"),
                 table: &one_cell_table_with_gate(gate_reading()),
-                errored: 0,
             },
         );
         assert!(
@@ -1901,7 +2132,6 @@ mod tests {
                 subset: None,
                 checkpoint: &checkpoint_at("/tmp/table.md"),
                 table: &one_cell_table_with_gate(reading),
-                errored: 0,
             },
         );
         assert!(text.contains("gate-pressure\tunreadable"), "{text}");
@@ -1929,7 +2159,6 @@ mod tests {
                 subset: None,
                 checkpoint: &checkpoint_at("/tmp/table.md"),
                 table: &one_cell_table(),
-                errored: 0,
             },
         );
         assert!(!text.contains("diagnostic\t"), "{text}");
@@ -2198,8 +2427,9 @@ mod tests {
         let missing = missing_dependencies(ToolArm::Platform, &["hle"], &["nql"], &wiring);
         let backbone = missing
             .iter()
-            .find(|line| line.starts_with("backbone: "))
-            .expect("a backbone that cannot send a request is not present");
+            .find(|m| m.subject == "backbone")
+            .expect("a backbone that cannot send a request is not present")
+            .as_line();
         assert!(backbone.contains("http_client"), "{backbone}");
         assert!(
             !backbone.contains("no LLM upstream is configured"),
@@ -2208,8 +2438,211 @@ mod tests {
         // 平台这一侧同理：它跟骨干共用同一个客户端，所以传输没了它也没了。
         let nql = missing
             .iter()
-            .find(|line| line.starts_with("nql: "))
-            .expect("the platform column cannot run without the shared transport");
+            .find(|m| m.subject == "nql")
+            .expect("the platform column cannot run without the shared transport")
+            .as_line();
         assert!(nql.contains("http_client"), "{nql}");
+    }
+
+    /// 一张有真读数的表：两行（外壳）× 两列（基准），每格一个种子、每题 40 个例、
+    /// 四格全都跑不动。
+    ///
+    /// 夹具必须带 `per_seed` 才走得到 `## per seed` 那一段。原来那些渲染用例的表都是空的
+    /// （`cells: vec![]`），所以那一段**一条都没被测过**——这也正是这次那条缺陷能藏住的原因。
+    fn table_with_cells() -> Table {
+        let cell = |benchmark: &str, scaffold: &str| Cell {
+            benchmark: benchmark.to_string(),
+            metric: "accuracy".to_string(),
+            scaffold: scaffold.to_string(),
+            per_seed: vec![SeedScore {
+                seed: 0,
+                resolved: 0,
+                total: 40,
+                errored: 40,
+                failures: vec![],
+                resumed: 0,
+                tokens: 0,
+                steps: 0,
+                duration_ms: 0,
+            }],
+        };
+        Table {
+            rows: vec!["gepa".into(), "nql".into()],
+            cols: vec!["hle".into(), "swe-bench-pro".into()],
+            cells: vec![
+                cell("hle", "gepa"),
+                cell("hle", "nql"),
+                cell("swe-bench-pro", "gepa"),
+                cell("swe-bench-pro", "nql"),
+            ],
+            wanted_seeds: 1,
+            unreadable: vec![],
+            gate: None,
+            column_ceilings: vec![("hle".into(), None), ("swe-bench-pro".into(), None)],
+        }
+    }
+
+    /// 把一张表和一批声明渲出来，只看两段：`## wiring` 与 `## per seed`。
+    fn render_with(table: &Table, declared: &[Missing]) -> String {
+        let args = EvalTableArgs::parse(&minimal()).unwrap();
+        let verified = BTreeMap::new();
+        render(
+            &args,
+            WiringReport {
+                missing: declared,
+                platform_base: None,
+            },
+            Readings {
+                data_root: Path::new("/data"),
+                pins: &Pins::default(),
+                verified: &verified,
+                subset: None,
+                checkpoint: &checkpoint_at("/tmp/table.md"),
+                table,
+            },
+        )
+    }
+
+    /// 声明过的缺席**不许**再在它盖住的那一格上印 `errored>0`；没被点名的格子**必须**照印。
+    ///
+    /// 两向都钉在这一条上：正向少了它，一个「凡是跑不动就算没轮到跑」的实现会过掉；
+    /// 反向少了它，一个「凡有声明就整表洗干净」的实现会过掉——而后者会把真缺陷一起抹掉。
+    #[test]
+    fn a_declared_absence_moves_its_own_cells_to_blocked_and_no_others() {
+        let declared = [
+            Missing::new(
+                "swe-bench-pro",
+                MissingScope::Column("swe-bench-pro".into()),
+                Absence::NotImplemented,
+                "no container backend is implemented in this build, so there is nothing to wire",
+            ),
+            Missing::new(
+                "nql",
+                MissingScope::Row("nql".into()),
+                Absence::NotWired,
+                "no platform is wired",
+            ),
+        ];
+        let text = render_with(&table_with_cells(), &declared);
+
+        // 正向：被点名的三格。
+        assert!(
+            text.contains(
+                "cell\thle\tnql\tseed=0\tresolved=0\ttotal=40\terrored=0\tblocked=40\tblocked-by=nql\t"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "cell\tswe-bench-pro\tgepa\tseed=0\tresolved=0\ttotal=40\terrored=0\tblocked=40\tblocked-by=swe-bench-pro\t"
+            ),
+            "{text}"
+        );
+        // 两处声明都盖到这一格：两个名字都要点出来，少一个就读不出是谁挡的。
+        assert!(text.contains("blocked-by=swe-bench-pro,nql\t"), "{text}");
+        // 反向：没人点名的那一格照印 `errored`。
+        assert!(
+            text.contains(
+                "cell\thle\tgepa\tseed=0\tresolved=0\ttotal=40\terrored=40\tblocked=0\tblocked-by=-\t"
+            ),
+            "{text}"
+        );
+        // 尾数两个一起出，且与逐格的和对得上。
+        assert!(text.contains("\nerrored\t40\tblocked\t120\n"), "{text}");
+    }
+
+    /// 整次跑那一类的声明**一个格子都不盖**。
+    ///
+    /// 它说的是「这次跑不构成一行表」（诊断臂），而格子是真跑过的读数，被洗成 `blocked`
+    /// 就把「这一格本来跑得动」一起抹掉了。
+    #[test]
+    fn a_run_wide_absence_covers_no_cell() {
+        let declared = [Missing::new(
+            "tools",
+            MissingScope::Run,
+            Absence::OutOfArm,
+            "this run used the tools-off diagnostic arm, so it is not a main-table row",
+        )];
+        let text = render_with(&table_with_cells(), &declared);
+
+        assert!(
+            text.contains(
+                "cell\thle\tgepa\tseed=0\tresolved=0\ttotal=40\terrored=40\tblocked=0\tblocked-by=-\t"
+            ),
+            "{text}"
+        );
+        // 四格全没被盖住：160 条跑不动，一条都不进 `blocked`。
+        assert!(text.contains("\nerrored\t160\tblocked\t0\n"), "{text}");
+    }
+
+    /// 另一向的整次跑缺席：骨干与裁判缺了，**每一格**都没读数，所以它们算没轮到跑。
+    #[test]
+    fn a_whole_run_absence_that_every_cell_needs_covers_every_cell() {
+        let declared = [Missing::new(
+            "backbone",
+            MissingScope::EveryCell,
+            Absence::NotWired,
+            "no LLM upstream is configured",
+        )];
+        let text = render_with(&table_with_cells(), &declared);
+        assert!(text.contains("\nerrored\t0\tblocked\t160\n"), "{text}");
+        assert!(
+            text.contains(
+                "cell\thle\tgepa\tseed=0\tresolved=0\ttotal=40\terrored=0\tblocked=40\tblocked-by=backbone\t"
+            ),
+            "{text}"
+        );
+    }
+
+    /// `## wiring` 那一行要说清**管到哪**与**哪一类**。
+    ///
+    /// 只有「缺 X」时，读的人看不出照着做的那一步是写代码还是改配置（`swe-bench-pro`
+    /// 今天树里根本没有容器后端，不是少配一段），也看不出 `## per seed` 里那些 `errored`
+    /// 算不算缺陷。
+    #[test]
+    fn a_wiring_line_says_what_it_covers_and_what_kind_of_absence_it_is() {
+        let mut raw = minimal();
+        // 这一段测的是几条声明本身；诊断臂那一条会混进来，所以换成主表那一臂。
+        let at = raw.iter().position(|s| s == "none").expect("--tools none");
+        raw[at] = "platform".to_string();
+        let args = EvalTableArgs::parse(&raw).unwrap();
+        let declared = missing_dependencies(
+            ToolArm::Platform,
+            &["hle", "swe-bench-pro"],
+            &["nql"],
+            &Wiring::default(),
+        );
+        let verified = BTreeMap::new();
+        let text = render(
+            &args,
+            WiringReport {
+                missing: &declared,
+                platform_base: None,
+            },
+            Readings {
+                data_root: Path::new("/data"),
+                pins: &Pins::default(),
+                verified: &verified,
+                subset: None,
+                checkpoint: &checkpoint_at("/tmp/table.md"),
+                table: &table_with_cells(),
+            },
+        );
+        for expected in [
+            "missing\tswe-bench-pro\tcolumn:swe-bench-pro\tnot-implemented\t",
+            "missing\tnql\trow:nql\tnot-wired\t",
+            "missing\tbackbone\tevery-cell\tnot-wired\t",
+            "missing\tjudge\tevery-cell\tnot-wired\t",
+        ] {
+            assert!(text.contains(expected), "{expected} 不在：{text}");
+        }
+        // 人读那句与原样一致。它**不在这段文本里**：`## wiring` 印的是上面那种五格的结构，
+        // 人读那句随 `Outcome.missing` 出去（退出码那一路上念的就是它），所以两处各钉一次。
+        let nql = declared
+            .iter()
+            .find(|m| m.subject == "nql")
+            .expect("平台这一行在这里是缺席的")
+            .as_line();
+        assert_eq!(nql, "nql: no platform is wired");
     }
 }
