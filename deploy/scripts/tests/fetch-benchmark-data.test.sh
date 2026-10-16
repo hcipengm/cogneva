@@ -43,25 +43,79 @@ trap cleanup EXIT
 [ -x "${fetcher}" ] || fail "${fetcher} is not executable"
 
 # --- the committed catalog's identity ----------------------------------------
-# The revision is not printed (it lives in the source), but the paths a provision produces
-# must be exactly these, whether or not the fetch ever runs.
+# The revision is not printed (it lives in the source), but the shape of what a provision
+# produces is asserted here, whether or not the fetch ever runs.
+#
+# What is asserted is *shape and agreement*, not an exact roster. A roster checked for
+# equality reds on every legitimate addition -- adding a benchmark, or a member path to an
+# existing one -- and a gate that reds on legitimate work is a gate somebody has to keep
+# editing, which is how it ends up red at HEAD instead of being read. The dangerous
+# direction is the other one (a path a reader opens silently changing shape or dropping
+# out), so the paths the rigs actually open are named below on purpose and asserted as a
+# *subset*, and the two reports have to agree with each other in both directions.
 mapfile -t committed < <("${fetcher}" --print-files)
-expected_committed=(
+[ "${#committed[@]}" -gt 0 ] || fail "--print-files printed nothing"
+for p in "${committed[@]}"; do
+  [ -n "${p}" ] ||
+    fail "--print-files printed an empty path: a blank row reads as a path nobody can open"
+  case "${p}" in
+    /* | .. | ../* | */../* | */..) fail "--print-files printed a path outside --dest: ${p}" ;;
+  esac
+done
+[ "$(printf '%s\n' "${committed[@]}" | sort -u | wc -l)" -eq "${#committed[@]}" ] ||
+  fail "--print-files printed the same path twice"
+
+# Every source a pin names has to be a path a provision installs, or the pin table points at
+# bytes the fetch never writes. This is also what catches a benchmark dropping out of one
+# report: its source is still pinned, so its path stops being installed.
+source_paths=()
+while IFS=$'\t' read -r kind _bench _rev path _sha _size _note; do
+  [ "${kind}" = "source" ] || continue
+  source_paths+=("${path}")
+  printf '%s\n' "${committed[@]}" | grep -qxF "${path}" ||
+    fail "a source pin names ${path}, which --print-files does not install"
+done < <("${fetcher}" --print-pins)
+
+# And the other direction: nothing is installed that no benchmark declares. A path is
+# declared when it is a pinned source, or when it sits inside a directory a benchmark owns.
+pins_benches="$("${fetcher}" --print-pins | cut -f2 | sort -u)"
+for p in "${committed[@]}"; do
+  printf '%s\n' "${source_paths[@]}" | grep -qxF "${p}" && continue
+  covered=""
+  for b in ${pins_benches}; do
+    case "${p}" in "${b}"/*) covered="1"; break ;; esac
+  done
+  [ -n "${covered}" ] ||
+    fail "--print-files installs ${p}, which is neither a pinned source nor inside a benchmark's directory"
+done
+
+# The paths a reader opens, named here on purpose. Adding a benchmark must not red this; a
+# reader's path changing shape must, because nothing else would notice.
+anchored=(
   "swe-bench-pro/test-00000-of-00001.parquet"
-  "toolathlon-gym.tar.gz"
   "toolathlon-gym/db/init.sql.gz"
   "toolathlon-gym/docker-compose.yml"
   "hle/test-00000-of-00001.parquet"
 )
-[ "${#committed[@]}" -eq "${#expected_committed[@]}" ] ||
-  fail "--print-files listed ${#committed[@]} paths, the catalog is expected to hold ${#expected_committed[@]}"
-for i in "${!expected_committed[@]}"; do
-  [ "${committed[$i]}" = "${expected_committed[$i]}" ] ||
-    fail "--print-files line $((i + 1)) is '${committed[$i]}', expected '${expected_committed[$i]}'"
+for p in "${anchored[@]}"; do
+  printf '%s\n' "${committed[@]}" | grep -qxF "${p}" ||
+    fail "the catalog no longer installs ${p}, which a reader opens"
 done
+
 mapfile -t committed_conv < <("${fetcher}" --print-files --convert)
 printf '%s\n' "${committed_conv[@]}" | grep -qx 'swe-bench-pro/test-00000-of-00001.jsonl' ||
   fail "--print-files --convert does not list the derived JSONL"
+# --convert adds rows and removes none: a benchmark with no derived artifact must not lose
+# the rows it had, and must not print a blank one in their place.
+[ "${#committed_conv[@]}" -gt "${#committed[@]}" ] ||
+  fail "--print-files --convert listed ${#committed_conv[@]} paths, no more than the ${#committed[@]} without it"
+for p in "${committed_conv[@]}"; do
+  [ -n "${p}" ] || fail "--print-files --convert printed an empty path"
+done
+for p in "${committed[@]}"; do
+  printf '%s\n' "${committed_conv[@]}" | grep -qxF "${p}" ||
+    fail "--print-files --convert dropped ${p}"
+done
 
 # The pins a reader needs: what each path is pinned *by*, and whether it is a file or a
 # directory. The hashes are not asserted here (they are read at fetch time; a second copy in
@@ -69,8 +123,11 @@ printf '%s\n' "${committed_conv[@]}" | grep -qx 'swe-bench-pro/test-00000-of-000
 # the derived JSONL the rig actually opens rather than the parquet behind it, and Toolathlon
 # -- whose reader walks a directory -- must appear as a read-dir row rather than silently
 # dropping out for having no hash of its own.
+("${fetcher}" --print-pins | awk -F'\t' 'NF != 7 { bad = 1 } END { exit bad }') ||
+  fail "a pin record is not seven tab-separated fields"
 mapfile -t committed_pins < <("${fetcher}" --print-pins | awk -F'\t' '{ printf "%s\t%s\t%s\n", $1, $2, $4 }')
-expected_pins=(
+[ "${#committed_pins[@]}" -gt 0 ] || fail "--print-pins printed nothing"
+anchored_pins=(
   "source	swe-bench-pro	swe-bench-pro/test-00000-of-00001.parquet"
   "read-file	swe-bench-pro	swe-bench-pro/test-00000-of-00001.jsonl"
   "source	toolathlon-gym	toolathlon-gym.tar.gz"
@@ -78,14 +135,10 @@ expected_pins=(
   "source	hle	hle/test-00000-of-00001.parquet"
   "read-file	hle	hle/test-00000-of-00001.jsonl"
 )
-[ "${#committed_pins[@]}" -eq "${#expected_pins[@]}" ] ||
-  fail "--print-pins printed ${#committed_pins[@]} records, expected ${#expected_pins[@]}"
-for i in "${!expected_pins[@]}"; do
-  [ "${committed_pins[$i]}" = "${expected_pins[$i]}" ] ||
-    fail "--print-pins record $((i + 1)) is '${committed_pins[$i]}', expected '${expected_pins[$i]}'"
+for p in "${anchored_pins[@]}"; do
+  printf '%s\n' "${committed_pins[@]}" | grep -qxF "${p}" ||
+    fail "the pins no longer carry '${p//$'\t'/ }'"
 done
-("${fetcher}" --print-pins | awk -F'\t' 'NF != 7 { bad = 1 } END { exit bad }') ||
-  fail "a pin record is not seven tab-separated fields"
 
 # --- the fixture mirror ------------------------------------------------------
 hub="${work}/hub"
@@ -295,6 +348,7 @@ catalog() {
       a_sha=("$3"); a_size=("$4")
       m_path=("db/init.sql.gz" "docker-compose.yml")
       m_sha=("${m1_sha}" "${m2_sha}"); m_size=("${m1_size}" "${m2_size}")
+      r_dir=("toolathlon-gym/tasks/finalpool")
       ;;
     *) return 1 ;;
   esac

@@ -212,10 +212,16 @@ esac
 if [ -n "$print_files" ]; then
   for b in "${benchmarks[@]}"; do
     catalog "$b"
-    printf '%s\n' "${a_dest[@]}"
-    if [ -n "$extract_dir" ]; then printf '%s\n' "${m_path[@]/#/$extract_dir/}"; fi
-    if [ -n "$convert" ]; then printf '%s\n' "${d_dest[@]}"; fi
-    if [ -n "${r_dir[*]:-}" ]; then printf '%s\n' "${r_dir[@]}"; fi
+    # Every one of these is guarded on a non-empty array: `printf '%s\n' "${empty[@]}"`
+    # still prints one empty line, and a blank line here is a row that names nothing --
+    # a consumer that prefixes --dest onto each line gets the destination directory back
+    # and reads it as a path. A benchmark with no derived artifact printed one.
+    if [ "${#a_dest[@]}" -gt 0 ]; then printf '%s\n' "${a_dest[@]}"; fi
+    if [ -n "$extract_dir" ] && [ "${#m_path[@]}" -gt 0 ]; then
+      printf '%s\n' "${m_path[@]/#/$extract_dir/}"
+    fi
+    if [ -n "$convert" ] && [ "${#d_dest[@]}" -gt 0 ]; then printf '%s\n' "${d_dest[@]}"; fi
+    if [ "${#r_dir[@]}" -gt 0 ]; then printf '%s\n' "${r_dir[@]}"; fi
   done
   exit 0
 fi
