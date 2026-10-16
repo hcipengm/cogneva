@@ -362,6 +362,10 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         );
         ctx.publish_observable(recurrence_readings.clone());
 
+        // 在**解构之前**把「哪一样在」问出来：下面那个 `if let` 的初始化式会把两个
+        // Option 移进元组，else 那一支里就再也问不出它们了（借用检查器的要求，不是风格）。
+        let has_memory_backend = memory_backend.is_some();
+        let has_llm_provider = llm_provider.is_some();
         let engine = if let (Some(ref mb), Some(ref llm)) = (memory_backend, llm_provider) {
             info!("ReflectionEngine initialized in production mode (persistent learning)");
             // The wiki backend is published by another plugin in this layer and
@@ -384,7 +388,18 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 recurrence_readings,
             )
         } else {
-            warn!("ReflectionEngine falling back to in-memory mode (memory_backend or llm_provider unavailable)");
+            // 两种缺法的处置不同（memory 后端是存储面接线，LLM provider 是上游面），
+            // 合成一句会让读的人两遍都核；而且这一支**顺带**决定了另一件看上去不相干
+            // 的事：in-memory 构造不建发现引擎 ⇒ 自主发现环在这一进程上永远挂不上
+            // （2026-10-16 现网实测：进化 Pod 就是走这一支，而它的诊断只印了三个可能
+            // 缺因里的那一个笼统说法）。两个 flag 各自印出来，缺的是哪个一眼可读。
+            warn!(
+                memory_backend = has_memory_backend,
+                llm_provider = has_llm_provider,
+                "ReflectionEngine falling back to in-memory mode; this construction builds no \
+                 discovery engine, so the autonomous discovery loop cannot be armed on this \
+                 process"
+            );
             info!("ReflectionEngine initialized in in-memory mode");
             let mut engine = crate::ReflectionEngine::new_in_memory_reporting(
                 skill_registry.clone(),
@@ -1968,6 +1983,69 @@ where
     (generated, submitted, refused)
 }
 
+/// 这条环缺的是哪几样输入——**逐样点名，缺几样印几行**。
+///
+/// 抽成纯函数是为了让「每种缺法各说各的」能被单独量：合成一句（旧形状是
+/// `(no tool registry, no orchestrator or no discovery engine)`）在**数字上**是
+/// 对的——三样里至少缺一样——却把读的人送去核两样没坏的东西，而真正要改的那一样
+/// 往往一个字没提。判据就取在这一点上：每一样自己的话里只许出现自己（反例对照写
+/// 在同文件的单测里，谁把它合成一句，那一格当场红）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoveryInput {
+    ToolRegistry,
+    Orchestrator,
+    DiscoveryEngine,
+}
+
+impl DiscoveryInput {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::ToolRegistry => "tool_registry",
+            Self::Orchestrator => "orchestrator",
+            Self::DiscoveryEngine => "discovery_engine",
+        }
+    }
+
+    /// 这一样缺了**意味着什么、要动哪一段**——不是「它不在」的同义反复。
+    fn why(&self) -> &'static str {
+        match self {
+            Self::ToolRegistry => {
+                "no tool registry was published before this plugin's start; the loop \
+                 enumerates tool names to pair them, so with none there is no probe to \
+                 generate (a wiring gap: some other plugin publishes it in its init)"
+            }
+            Self::Orchestrator => {
+                "no orchestrator control was published; a probe would have nowhere to be \
+                 submitted (a wiring gap, not a defect in this loop)"
+            }
+            Self::DiscoveryEngine => {
+                "this process's reflection engine carries no discovery engine; the \
+                 in-memory construction sets `discovery: None`, and that construction is \
+                 chosen whenever the memory backend or the LLM provider is absent — so \
+                 this one is fixed by the engine's construction, not by wiring"
+            }
+        }
+    }
+}
+
+fn discovery_loop_missing_inputs(
+    has_tool_registry: bool,
+    has_orchestrator: bool,
+    has_discovery_engine: bool,
+) -> Vec<DiscoveryInput> {
+    let mut missing = Vec::new();
+    if !has_tool_registry {
+        missing.push(DiscoveryInput::ToolRegistry);
+    }
+    if !has_orchestrator {
+        missing.push(DiscoveryInput::Orchestrator);
+    }
+    if !has_discovery_engine {
+        missing.push(DiscoveryInput::DiscoveryEngine);
+    }
+    missing
+}
+
 /// 挂上「把还没试过的工具配对拿去试」的那条循环。
 ///
 /// 引擎早就造好了（自进化档里 `ReflectionEngine::discovery` 是
@@ -1990,6 +2068,18 @@ where
 /// - **池闸**：探针要过 LLM。池被闸住的那一轮连生成都不做——生成出来也不该交出去，
 ///   交出去的每一条都会在图里留下一行注定失败的任务，与「真的有探针在跑」在账面上
 ///   同形（现网池自报 2026-10-18T16:00Z 才可能回来）。
+///
+/// **供给面那道门拒的时候，必须点名缺的是哪一样。** 2026-10-16 现网实测（保留期内
+/// 3 次重启，两句话在时间上成对）：**持这条环的进程与「引擎是 in-memory 造的」是同
+/// 一个进程**——`ReflectionEngine initialized in in-memory mode` 之后 1 秒就是这句
+/// `loop not armed`（09:55:15 → 09:55:16，另两次同形）；而 `production mode` 那句后面
+/// 跟着的是 `not the self-discovery owner`（09:52:34 → 09:52:35，1 秒）。也就是说：
+/// 有真引擎的进程不持这条环，持这条环的进程用的是 in-memory 构造、而这一种构造根本
+/// 不建发现引擎，于是三样输入里缺的永远是**发现引擎**那一格，且缺法是**构造**而非
+/// 接线（同一个进程里 `AgentPlugin tool registry published` 与
+/// `OrchestratorPlugin DAG executor control published` 都发布过、时间戳都在这句之前）。
+/// 旧的那一句把三样一起念出来，读的人会去核两样**没坏**的东西，而且那两样**在这个
+/// 进程里不可能坏**。
 fn spawn_discovery_loop(
     engine: Arc<crate::ReflectionEngine>,
     tool_registry: Option<Arc<dyn cog_core::ToolRegistry>>,
@@ -2003,13 +2093,26 @@ fn spawn_discovery_loop(
         info!("not the self-discovery owner in this deployment; autonomous discovery disabled");
         return;
     }
+    // 三样在不在**先问一遍**再解构：`let … else` 的初始化式会把两个 Option 移进那个
+    // 元组，else 那一支里就再也问不出它们了（这一句不是风格，是借用检查器的要求）。
+    let inputs_present = (
+        tool_registry.is_some(),
+        orchestrator.is_some(),
+        engine.discovery.is_some(),
+    );
     let (Some(tool_registry), Some(orchestrator), Some(discovery)) =
         (tool_registry, orchestrator, engine.discovery.clone())
     else {
-        warn!(
-            "autonomous discovery has no way out (no tool registry, no orchestrator or \
-             no discovery engine); loop not armed"
-        );
+        // 缺几样印几行、每行只说自己那一样（判据在 `DiscoveryInput::why` 上）。
+        for input in
+            discovery_loop_missing_inputs(inputs_present.0, inputs_present.1, inputs_present.2)
+        {
+            warn!(
+                missing = input.name(),
+                why = input.why(),
+                "autonomous discovery loop not armed"
+            );
+        }
         return;
     };
     info!(
@@ -4734,6 +4837,81 @@ mod tests {
                 after_keys.contains(key),
                 "被拒的 {key} 也要留在池子里等下一轮，否则一次拒绝就把组合花掉了：{after_keys:?}"
             );
+        }
+    }
+
+    /// **供给面那道门拒的时候，缺的是哪一样要点得出来。**
+    ///
+    /// 旧形状是一句 `(no tool registry, no orchestrator or no discovery engine)`：
+    /// 「三样里至少缺一样」——在数字上它没错，可它把读的人送去核两样**没坏**的东西。
+    /// 2026-10-16 现网实测（进化 Pod，本部署里唯一持这条环的进程）：三样里缺的只有
+    /// **发现引擎**（那句 in-memory 构造把 `discovery` 留成 `None`），而工具注册表与
+    /// 编排器控制都在同一个进程里发布过、时间戳都在那句之前 —— 照那句话去查，两处
+    /// 都查得到「已发布」，于是这一格读起来像「三样都在，环却挂不上」。
+    ///
+    /// 判据四条，一条都不许少：
+    ///   1. 三样都在 ⇒ 一条都不缺（否则正常启动也会被念一遍，这一格就没人信了）；
+    ///   2. 只缺一样 ⇒ 恰好点名那一样；
+    ///   3. 缺两样以上 ⇒ **各出各的**，缺几样出几行（合成一句正是要替掉的形状）；
+    ///   4. 每一样自己的话里**只出现自己**（第 4 条是这一组存在的理由：前三条只钉
+    ///      「点得出名字」，合成一句照样能让它们全绿）。
+    #[test]
+    fn each_absent_discovery_input_is_named_on_its_own() {
+        use DiscoveryInput::*;
+        const ALL: [DiscoveryInput; 3] = [ToolRegistry, Orchestrator, DiscoveryEngine];
+
+        assert!(
+            discovery_loop_missing_inputs(true, true, true).is_empty(),
+            "三样都在时不许说缺了什么"
+        );
+
+        for (i, want) in ALL.into_iter().enumerate() {
+            let mut flags = [true, true, true];
+            flags[i] = false;
+            assert_eq!(
+                discovery_loop_missing_inputs(flags[0], flags[1], flags[2]),
+                vec![want],
+                "只缺 {} 时要恰好点名它、不多不少",
+                want.name()
+            );
+        }
+
+        assert_eq!(
+            discovery_loop_missing_inputs(false, false, true),
+            vec![ToolRegistry, Orchestrator],
+            "缺两样就要出两行，不许合成一行"
+        );
+        assert_eq!(
+            discovery_loop_missing_inputs(false, false, false),
+            ALL.to_vec(),
+            "三样都缺就三行都出"
+        );
+
+        let names: std::collections::HashSet<&str> = ALL.iter().map(|i| i.name()).collect();
+        assert_eq!(
+            names.len(),
+            ALL.len(),
+            "三个名字要互不相同，否则分不出是哪一样"
+        );
+
+        // 第 4 条：每一样的话里只许出现自己。合成一句（旧形状）在这一格上必红。
+        let nouns = ["tool registry", "orchestrator", "discovery engine"];
+        for (i, input) in ALL.into_iter().enumerate() {
+            let why = input.why();
+            assert!(
+                why.contains(nouns[i]),
+                "{} 的话里点不出自己，读的人对不上是哪一样：{why}",
+                input.name()
+            );
+            for (j, noun) in nouns.iter().enumerate() {
+                if i != j {
+                    assert!(
+                        !why.contains(noun),
+                        "{} 的话里捎带了 {noun} —— 把三种缺法合成一句正是被替掉的形状：{why}",
+                        input.name()
+                    );
+                }
+            }
         }
     }
 }
