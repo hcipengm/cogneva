@@ -15,11 +15,12 @@
 //! The loop folds the intake into the account -- declarations queued by other
 //! parties become readings, through the same reading path a direct write would
 //! use -- it reads the tree's own debt registries into the account the same way,
-//! it reads the outstanding set back out, saying plainly when a read failed, and
-//! it measures that set against the tree, through the one call that may move a
-//! state. Both intakes are mechanical: they carry what a document or a registry
-//! asked for and add nothing of their own, so this loop cannot make a change look
-//! done by reading anything into it.
+//! it reads what the platform's own principle ledger still calls unpaid the same
+//! way again, it reads the outstanding set back out, saying plainly when a read
+//! failed, and it measures that set against the tree, through the one call that
+//! may move a state. Every intake is mechanical: it carries what a document, a
+//! registry or another account asked for and adds nothing of its own, so this
+//! loop cannot make a change look done by reading anything into it.
 //!
 //! The fourth thing is what makes the ledger a driver rather than a record: the
 //! rows a measurement found `pending` are handed to the goal path, one task
@@ -51,6 +52,18 @@
 //! account by deleting its own line, which is the self-reported completion this
 //! whole loop is built to refuse.
 //!
+//! The third is the platform's own principle ledger, and that it is an account
+//! rather than a file is the whole of the difference. Its rows are principles
+//! nothing has found a gate for, and this intake takes the ones whose tier a
+//! reading has already declared: the tier is what turns a slug into a goal,
+//! because it says which lane the missing check belongs in, and a slug alone
+//! tells a generator where to look and not what is wanted there. A principle a
+//! person holds is left out, for the reason that ledger's own look refuses to
+//! call it a debt -- no machine gate is meant to exist for it, so a task would be
+//! work nothing could ever close. What closes one of these rows is the tree
+//! carrying a header declaring the gate, which is the same declaration the
+//! principle ledger's own look reads, so both accounts close a row on one fact.
+//!
 //! principle: feedback_a_version_bit_on_a_dispatch_id_must_keep_generation_zero_identical
 //! principle: feedback_a_typed_field_that_exists_may_never_have_been_filled
 
@@ -64,7 +77,8 @@ use cog_core::{
     metric_names, ChangeIdentity, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement,
     ChangePriority, ChangeReading, ChangeReopen, ChangeSource, ChangeState, DispatchDecision,
     DispatchState, LlmPoolStatus, MetricsBackend, OrchestratorControl, OwnerLeaseBroker,
-    PoolReading, ShutdownSignal, Task, TaskStatus, TaskType,
+    PoolReading, PrincipleCheckKind, PrincipleLedgerStore, PrincipleRow, ShutdownSignal, Task,
+    TaskStatus, TaskType,
 };
 
 use cog_core::contract::llm::UpstreamFailure;
@@ -72,7 +86,7 @@ use cog_core::contract::outcome::{declares, TERMINAL_ENV_FAILURE_PREFIX};
 
 use crate::change_measure::{
     CheckTree, Snapshot, UnsettledReason, DEPENDENCY_EDGE_KIND, DEV_DEPENDENCY_EDGE_KIND,
-    MODULE_RELOCATION_KIND,
+    GREP_KIND, MODULE_RELOCATION_KIND,
 };
 
 /// This loop's name in the process liveness registry, and the value of
@@ -252,6 +266,36 @@ const RELOCATION_REASON: &str = "pending-relocation";
 /// about the registry row.
 const CORE_MODULE_LIST: &str = "crates/cog-core/src/lib.rs";
 
+/// Where a principle's gate is looked for, as a path of the repository.
+///
+/// The platform's own sources, which is where the principle ledger reads its own
+/// registry from: a contract test states in its header which principle it
+/// enforces, and a running deployment has no checkout of its own source, so both
+/// readings take it out of the same tree. A narrower scope would report a
+/// principle as ungated while the ledger's look, over the whole of the sources,
+/// finds the very gate that row was measured by -- two accounts disagreeing about
+/// one fact, in the direction that mints work nobody owes.
+const PRINCIPLE_GATE_SCOPE: &str = "crates";
+
+/// The words a gate for a principle is declared with, up to its slug.
+///
+/// Spelled without the comment marker the header itself carries, and that is not
+/// a shorthand. The judge anchors a literal whose ends are both word characters
+/// on word boundaries, and the marker's last character is not one: a literal
+/// beginning with it would land this change on a longer slug that merely begins
+/// with this one, which is a closed row with no gate behind it. Measured on the
+/// tree at `38167225`, with the pair the fixtures use -- `feedback_x` searched
+/// against a file holding only `feedback_xy` -- the anchored search misses, the
+/// plain fixed-string search hits, and the exact slug hits either way.
+const PRINCIPLE_DECLARATION_PREFIX: &str = "principle: ";
+
+/// What the source column of a principle reading says.
+///
+/// The account the rows were read out of, where the other two intakes name a file
+/// in the tree: this reading's origin is another ledger, and the column is what a
+/// reader follows back to it.
+const PRINCIPLE_LEDGER_SOURCE: &str = "principle_ledger";
+
 /// The task id a change is dispatched under, at a given handover generation.
 ///
 /// Derived from the identity, because that is the whole mechanism: this loop
@@ -403,6 +447,17 @@ fn dispatch_goal(row: &ChangeLedgerRow) -> String {
 /// still keeps an account, and refusing to run the loop at all would trade a
 /// missing driver for a missing ledger. Where it is absent the pass says so
 /// once, by name, rather than skipping the handover silently.
+///
+/// `principles` is the account the third intake reads. Also optional, and for
+/// the same reason: a deployment that publishes no principle ledger has no
+/// unpaid principles to read, which is different from having some and not
+/// looking.
+///
+/// One parameter per collaborator the process may or may not publish, so the
+/// list grows with the number of source accounts rather than with anything this
+/// loop decides; grouping them into a struct would only move the same list to a
+/// type that exists to hold it.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_change_ledger_loop(
     store: Arc<dyn ChangeLedgerStore>,
     role: Option<Arc<dyn OwnerLeaseBroker>>,
@@ -411,6 +466,7 @@ pub fn spawn_change_ledger_loop(
     metrics: Option<Arc<dyn MetricsBackend>>,
     shutdown: ShutdownSignal,
     tree: CheckTree,
+    principles: Option<Arc<dyn PrincipleLedgerStore>>,
 ) {
     info!(
         interval_secs = CHANGE_LEDGER_PASS_INTERVAL.as_secs(),
@@ -420,6 +476,16 @@ pub fn spawn_change_ledger_loop(
         readable = metrics.is_some(),
         "Change ledger loop enabled"
     );
+    if principles.is_none() {
+        // Said once at start-up rather than once per pass: a deployment with no
+        // principle ledger has none to read, and a pass that repeated this every
+        // five minutes would be a wall of lines saying what the start-up line
+        // already said.
+        info!(
+            "change ledger: no principle ledger is published, so this loop reads the tree's own \
+             registries and not the principles that ledger would call unpaid"
+        );
+    }
     if orchestrator.is_none() {
         warn!(
             "change ledger: no goal path is available, so a change found still owed will be \
@@ -446,6 +512,7 @@ pub fn spawn_change_ledger_loop(
             let metrics = metrics.clone();
             let shutdown = shutdown.clone();
             let tree = tree.clone();
+            let principles = principles.clone();
             async move {
                 // The role is renewed on the lease contract's own cadence rather
                 // than once per pass: a pass can be long, and a term that ran out
@@ -502,6 +569,13 @@ pub fn spawn_change_ledger_loop(
                     // reason [`registry_pass`] gives: a row read this pass is
                     // judged by this pass.
                     registry_pass(&tree, first_seen_rev.as_deref(), &*store).await;
+                    // The third intake, from the platform's own principle ledger,
+                    // in beside the registries and for the same reason: a row
+                    // read this pass is judged by this pass. Skipped where no
+                    // ledger was published, which the start-up line says.
+                    if let Some(ref principles) = principles {
+                        principle_pass(&**principles, first_seen_rev.as_deref(), &*store).await;
+                    }
                     // The classifier's retirements go in after the readings and
                     // before the measurement, for the reason [`retire_pass`]
                     // gives: a fixture retired this pass is not measured and
@@ -836,6 +910,179 @@ fn module_readings(lines: &[(String, String)]) -> Vec<ChangeReading> {
         });
     }
     readings
+}
+
+/// Read the principles the platform's own ledger still calls unpaid into the
+/// account.
+///
+/// The third intake, and the first whose source is an account rather than a file
+/// in the tree: what it carries is another account's finding that nothing
+/// enforces this rule, which is a reading rather than a second answer -- the row
+/// enters through the same call a declaration does, and only a measurement of the
+/// tree moves it.
+///
+/// Run beside the registries and before the measurement, for the reason
+/// [`registry_pass`] gives: a row read for the first time in a pass is judged in
+/// that same pass.
+///
+/// Nothing here is raised: a pass is a maintenance tick and the next tick is the
+/// retry. A ledger that could not be read is not recorded as an empty one -- the
+/// account keeps the rows it already holds and the warning says this pass
+/// contributed none, so "no principle is owed a gate" and "the ledger could not
+/// be read" stay apart.
+async fn principle_pass(
+    principles: &dyn PrincipleLedgerStore,
+    first_seen_rev: Option<&str>,
+    store: &dyn ChangeLedgerStore,
+) {
+    let readings = match principle_readings(principles).await {
+        Ok(readings) => readings,
+        Err(why) => {
+            warn!(
+                why = %why,
+                "change ledger: the platform's principle ledger could not be read, so this pass \
+                 contributed no readings from it"
+            );
+            return;
+        }
+    };
+    match store.record_readings(&readings, first_seen_rev).await {
+        Ok(_) => info!(
+            readings = readings.len(),
+            "change ledger: read the principles the platform's own ledger calls unpaid"
+        ),
+        // The account keeps what it has: this pass added nothing, and the next is
+        // the retry. Said with the count it was carrying so a reader can tell a
+        // rejection from a ledger that named nothing.
+        Err(e) => warn!(
+            error = %e,
+            readings = readings.len(),
+            "change ledger: the principles the platform's own ledger calls unpaid could not be \
+             written into the account"
+        ),
+    }
+}
+
+/// What the platform's own principle ledger says is unpaid, as readings.
+///
+/// The batch is sized from the source account's own census rather than from a
+/// number chosen here: the population this reads is exactly the rows that account
+/// calls unpaid, and a constant would be a second answer to a question it already
+/// answers -- one that goes stale as principles are added. Unmeasured rows are
+/// part of that population, because a row no look has settled is not a row with a
+/// gate: the count this reads is the one the account's own coverage reading is
+/// taken against.
+async fn principle_readings(
+    principles: &dyn PrincipleLedgerStore,
+) -> Result<Vec<ChangeReading>, String> {
+    let census = principles
+        .census()
+        .await
+        .map_err(|e| format!("the principle ledger's census could not be read: {e}"))?;
+    let owed = census.unenforced.saturating_add(census.unmeasured);
+    let rows = principles
+        .outstanding(usize::try_from(owed).unwrap_or(usize::MAX))
+        .await
+        .map_err(|e| format!("the principle ledger's unpaid set could not be read: {e}"))?;
+    Ok(principle_debt_readings(&rows))
+}
+
+/// The unpaid principles whose tier a machine can check, as readings.
+///
+/// A row enters on two conditions and both are the source account's own: a
+/// reading has declared its tier, and that tier is one of the three a machine
+/// checks. The first is what makes it work rather than a note -- the tier says
+/// which lane the missing check belongs in, so the goal can name what is wanted
+/// instead of only where to look. The second is why `judgement` stays out: it is
+/// the record that the rule is a person's to decide, and that account's own look
+/// writes no state for such a row at all, so it stays in the unpaid set forever
+/// by construction. Reading it here would mint a task no gate could ever close,
+/// which is the same permanent debt its own verdict refuses to state.
+///
+/// The check is the tree carrying a header that declares the gate, which is the
+/// declaration the principle ledger's own look reads as the platform-side gate
+/// column. Both accounts therefore close this row on one fact, and neither can
+/// close it while the other still calls it owed.
+fn principle_debt_readings(rows: &[PrincipleRow]) -> Vec<ChangeReading> {
+    let mut readings = Vec::new();
+    for row in rows {
+        let Some(kind) = row.check_kind else {
+            continue;
+        };
+        let Some(lane) = check_lane(kind) else {
+            continue;
+        };
+        readings.push(ChangeReading {
+            identity: ChangeIdentity::new(
+                GREP_KIND,
+                PRINCIPLE_GATE_SCOPE,
+                principle_literal(&row.slug),
+            ),
+            title: Some(principle_goal(row, lane)),
+            assertion: None,
+            source: ChangeSource {
+                doc: PRINCIPLE_LEDGER_SOURCE.to_string(),
+                verdict: None,
+                // The ledger names the principle and its tier, not how urgent it
+                // is: nothing there states a band, so the reading carries the one
+                // that says so rather than a band this path invented.
+                priority: ChangePriority::Unstated,
+            },
+        });
+    }
+    readings
+}
+
+/// The lane a tier's check answers from, or `None` for the tier a person holds.
+///
+/// One place rather than two, so what this intake reads into the account and what
+/// it leaves out cannot disagree about a tier. The match is exhaustive over the
+/// closed set, so a tier added later is a compile error here until someone
+/// decides which of the two it is -- a tier silently falling out of the intake
+/// would be a debt nothing ever asks for.
+fn check_lane(kind: PrincipleCheckKind) -> Option<&'static str> {
+    match kind {
+        PrincipleCheckKind::Shape => {
+            Some("the shape of the act it rules out, decided before the act")
+        }
+        PrincipleCheckKind::Tree => {
+            Some("this tree at one revision, the way the platform's own tests answer")
+        }
+        PrincipleCheckKind::Live => Some("the running deployment's own readings"),
+        PrincipleCheckKind::Judgement => None,
+    }
+}
+
+/// The line a principle's gate is declared on, as the judge looks for it.
+///
+/// The declaration prefix and the slug, and nothing else: what the judge is asked
+/// is whether the tree carries the declaration, and the rest of the header line
+/// is the declaring test's own business.
+fn principle_literal(slug: &str) -> String {
+    format!("{PRINCIPLE_DECLARATION_PREFIX}{slug}")
+}
+
+/// What a row of the principle ledger asks for, in the words the goal path is
+/// handed.
+///
+/// The slug, the lane its declared tier puts the missing check in, and the rule's
+/// own sentence. The sentence is carried because a goal that names only where to
+/// look is a goal a generator cannot act on, and the rule's own words are what
+/// the gate has to answer to -- the same reason the registry intake carries the
+/// destination and not only the module.
+fn principle_goal(row: &PrincipleRow, lane: &str) -> String {
+    let rule = row
+        .lead
+        .as_deref()
+        .map(str::trim)
+        .filter(|lead| !lead.is_empty())
+        .map(|lead| format!(" The rule itself: {lead}"))
+        .unwrap_or_default();
+    format!(
+        "Give the principle `{}` the gate it is declared to be owed: a check answering from \
+         {lane}, declared in the header of the test that carries it.{rule}",
+        row.slug
+    )
 }
 
 /// Measure the outstanding set against the tree, and record what each row came
@@ -2517,6 +2764,149 @@ mod tests {
                  core's contract layer."
             )
         );
+    }
+
+    /// A principle ledger row, with only the columns this intake reads set.
+    fn principle_row(
+        slug: &str,
+        check_kind: Option<PrincipleCheckKind>,
+        lead: Option<&str>,
+    ) -> PrincipleRow {
+        PrincipleRow {
+            slug: slug.to_string(),
+            lead: lead.map(str::to_string),
+            carrier_path: None,
+            carrier_sha256: None,
+            host_gate: None,
+            platform_gate: None,
+            check_kind,
+            state: None,
+            refusals: 0,
+            last_refused_at: None,
+            first_seen_at: Utc.timestamp_opt(1_760_000_000, 0).unwrap(),
+            measured_at: None,
+            measured_rev: None,
+        }
+    }
+
+    /// An unpaid principle whose tier is declared becomes a check against the
+    /// tree's own declaration of its gate.
+    ///
+    /// All three parts of the identity are the mapping. The kind is `grep`,
+    /// because what lands the row is the tree carrying a declaration. The scope is
+    /// the platform's sources, where the principle ledger's own look reads that
+    /// declaration from -- a narrower one would report a principle as ungated
+    /// while the account that says it is owed finds its gate. The literal is the
+    /// declaration's own words up to the slug, without the comment marker: both
+    /// ends are word characters, which is what makes the judge anchor it and what
+    /// keeps a longer slug from closing this row.
+    #[test]
+    fn an_unpaid_principle_becomes_a_check_against_the_trees_declaration() {
+        let rows = principle_debt_readings(&[principle_row(
+            "feedback_x",
+            Some(PrincipleCheckKind::Tree),
+            Some("a reading must be quoted with its construction"),
+        )]);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].identity.kind, GREP_KIND);
+        assert_eq!(rows[0].identity.scope, PRINCIPLE_GATE_SCOPE);
+        assert_eq!(rows[0].identity.literal, "principle: feedback_x");
+        assert_eq!(rows[0].source.doc, PRINCIPLE_LEDGER_SOURCE);
+        assert_eq!(rows[0].source.verdict, None);
+        assert_eq!(rows[0].source.priority, ChangePriority::Unstated);
+        // The goal names the lane the tier puts the check in and the rule's own
+        // sentence: a goal that named only the slug would tell a generator where
+        // to look and not what is wanted there.
+        assert_eq!(
+            rows[0].title.as_deref(),
+            Some(
+                "Give the principle `feedback_x` the gate it is declared to be owed: a check \
+                 answering from this tree at one revision, the way the platform's own tests \
+                 answer, declared in the header of the test that carries it. The rule itself: \
+                 a reading must be quoted with its construction"
+            )
+        );
+    }
+
+    /// Both ends of the literal are word characters, which is the condition the
+    /// judge reads as "anchor this on word boundaries".
+    ///
+    /// Asserted here rather than left to a comment because the marker this
+    /// constant deliberately omits is the thing that would break it: a literal
+    /// beginning with the comment marker ends on a character no word can follow,
+    /// so it stops being anchored and a longer slug that merely begins with this
+    /// one closes the row. Measured in a fixture repository holding only
+    /// `//! principle: feedback_xy`: `principle: feedback_x` misses when anchored,
+    /// hits when not, and the exact slug hits either way.
+    #[test]
+    fn the_principle_literal_is_anchored_at_both_ends() {
+        let literal = principle_literal("feedback_x");
+        let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        assert!(literal.starts_with(PRINCIPLE_DECLARATION_PREFIX));
+        assert!(!literal.starts_with("//"));
+        assert!(word(literal.chars().next().expect("a literal has a first")));
+        assert!(word(literal.chars().last().expect("a literal has a last")));
+        // And the slug's own end is where it ends: nothing is appended that a
+        // boundary would have to be found after.
+        assert!(literal.ends_with("feedback_x"));
+    }
+
+    /// The tier a person holds is not work, and neither is a row with no tier.
+    ///
+    /// The first is the reading the source account itself makes: its look writes
+    /// no state for a `judgement` row, so such a row stays in its unpaid set
+    /// forever -- reading it here as work would mint a task no gate could close.
+    /// The second is a principle nobody has said anything about: it has no lane to
+    /// aim at, so it stays a number in that account's census rather than becoming
+    /// a change with a goal nothing can act on.
+    #[test]
+    fn a_principle_a_person_holds_and_one_with_no_tier_are_not_work() {
+        let rows = principle_debt_readings(&[
+            principle_row(
+                "feedback_held",
+                Some(PrincipleCheckKind::Judgement),
+                Some("a person's"),
+            ),
+            principle_row("feedback_untiered", None, Some("nobody said")),
+            principle_row("feedback_owed", Some(PrincipleCheckKind::Live), None),
+        ]);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].identity.literal, "principle: feedback_owed");
+        // A row that arrived with no sentence still gets a goal: the rule's words
+        // are carried when the reading has them, and their absence is not a reason
+        // to hand over a bare slug.
+        assert_eq!(
+            rows[0].title.as_deref(),
+            Some(
+                "Give the principle `feedback_owed` the gate it is declared to be owed: a check \
+                 answering from the running deployment's own readings, declared in the header \
+                 of the test that carries it."
+            )
+        );
+    }
+
+    /// Every tier of the closed set is classified, and exactly three of them are
+    /// work.
+    ///
+    /// Read off `PrincipleCheckKind::ALL` rather than written out as three names,
+    /// so a tier added to the contract without a decision here fails this test as
+    /// well as the exhaustive match -- the count is the assertion that catches a
+    /// tier silently falling out of the intake.
+    #[test]
+    fn the_machine_tiers_are_the_three_the_intake_aims_at() {
+        let lanes: Vec<&str> = PrincipleCheckKind::ALL
+            .iter()
+            .filter_map(|kind| check_lane(*kind))
+            .collect();
+        assert_eq!(lanes.len(), 3, "{lanes:?}");
+        assert_eq!(check_lane(PrincipleCheckKind::Judgement), None);
+        for kind in PrincipleCheckKind::ALL
+            .iter()
+            .filter(|kind| **kind != PrincipleCheckKind::Judgement)
+        {
+            let lane = check_lane(*kind).unwrap_or_else(|| panic!("{kind} has no lane"));
+            assert!(!lane.is_empty());
+        }
     }
 
     /// A snapshot saying no upstream can serve stops the pass, and the bound it

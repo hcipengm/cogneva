@@ -721,6 +721,13 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                     ctx.consume_service::<dyn cog_core::MetricsBackend>(),
                     ledger_shutdown,
                     crate::change_measure::tree_from_environment(),
+                    // The principle ledger is the third intake: the rows it calls
+                    // unpaid are what this account aims a change at. Optional,
+                    // the same way the arbitrating role is -- a process whose
+                    // storage holds no shared database keeps no principle ledger
+                    // either, and refusing to keep the change account over that
+                    // would trade a missing intake for a missing ledger.
+                    ctx.consume_service::<dyn cog_core::PrincipleLedgerStore>(),
                 );
             }
             None => info!("change ledger loop not started: no ChangeLedgerStore published"),
