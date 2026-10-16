@@ -1027,6 +1027,21 @@ fn render(args: &EvalTableArgs, wiring: WiringReport<'_>, readings: Readings<'_>
         }
     }
 
+    // 这份报告是**哪一段代码**跑出来的：验收要求「跑前登记的 rev 与报告内的记录一致」，
+    // 而在此之前这句话只有**操作者给 `--out` 起的文件名**里那个短 sha 撑着——那是手写
+    // 约定，不是产物自带的。少了这一行，两 rev 的对照表读起来就是「两份同名格式的报告」，
+    // 谁也没法从报告本身说出它跑的是哪一版；`run-id` 里其实已经把这个值卷进了摘要
+    // （`run_checkpoint` 的 `software` 那一行），但卷进去与读得出来是两件事。
+    //
+    // 两个戳都印：`COGNEVA_VERSION_ID` 是检出标签（与 run-id 用的同一个），
+    // `COGNEVA_GIT_REVISION` 是那笔提交本身。判据是「哪一版」时按后者比——标签是派生的，
+    // 同一条提交在两次派生里可能得到不同的距离数。
+    out.push_str(&format!(
+        "software\t{} (rev {})\n",
+        env!("COGNEVA_VERSION_ID"),
+        env!("COGNEVA_GIT_REVISION")
+    ));
+
     out.push_str("\n## wiring\n");
     // 平台接上了就要说出接在哪：NQL 那一行的读数长在哪个平台上，跟骨干的模型名一样
     // 是这张表能被复跑的前提，不能只剩「接上了」三个字。
@@ -1602,6 +1617,48 @@ mod tests {
         assert!(
             text.contains("run again on resume rather than remembered as failed"),
             "{text}"
+        );
+    }
+
+    /// 报告要说出**自己是哪一段代码**跑出来的。「跑前登记的 rev 与报告内的记录一致」这半条
+    /// 验收，在此之前只有操作者给 `--out` 起的文件名撑着——那是手写约定，不是产物自带的身份。
+    ///
+    /// 两个戳都印、且印在 pins 段里：标签与提交分开读（登记比的是提交），位置在「这次跑用了
+    /// 什么」那一段，读的人才不用去别处找。
+    #[test]
+    fn the_report_names_the_code_that_produced_it() {
+        let args = EvalTableArgs::parse(&minimal()).unwrap();
+        let verified = BTreeMap::new();
+        let text = render(
+            &args,
+            WiringReport {
+                missing: &[],
+                platform_base: None,
+            },
+            Readings {
+                data_root: Path::new("/data"),
+                pins: &Pins::default(),
+                verified: &verified,
+                subset: None,
+                checkpoint: &checkpoint_at("/tmp/table.md"),
+                table: &one_cell_table(),
+                errored: 0,
+            },
+        );
+        let line = text
+            .lines()
+            .find(|line| line.starts_with("software\t"))
+            .expect("a report that does not name its code cannot be paired with a registration");
+        assert!(line.contains(env!("COGNEVA_VERSION_ID")), "{line}");
+        assert!(line.contains(env!("COGNEVA_GIT_REVISION")), "{line}");
+        assert!(line.contains("(rev "), "{line}");
+        let pins = text
+            .split("\n## wiring")
+            .next()
+            .expect("the report has a pins section");
+        assert!(
+            pins.contains("software\t"),
+            "the code stamp belongs in the pins section, where what-ran is read: {pins}"
         );
     }
 
