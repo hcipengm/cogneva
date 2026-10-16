@@ -387,23 +387,24 @@ mod tests {
         assert!(events.iter().all(|e| e.refused_at == expected));
 
         // The second job of the same run sees the same site: reported again, it
-        // computes exactly the same key.
+        // computes exactly the same key -- all three columns of it, the instant
+        // included. That is what makes the account's upsert fold the two jobs
+        // into one row instead of minting a row per job.
         let store2 = RecordingStore::default();
         report(dir.path(), &store2, &rev, log).await;
-        let mut second: Vec<(String, String)> = store2
-            .events
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|e| (e.slug.clone(), e.source.clone()))
-            .collect();
-        second.sort();
-        let mut first: Vec<(String, String)> = events
-            .iter()
-            .map(|e| (e.slug.clone(), e.source.clone()))
-            .collect();
-        first.sort();
-        assert_eq!(first, second);
+        let key = |events: &[PrincipleRefusal]| {
+            let mut keys: Vec<(String, DateTime<Utc>, String)> = events
+                .iter()
+                .map(|e| (e.slug.clone(), e.refused_at, e.source.clone()))
+                .collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(
+            key(&events),
+            key(&store2.events.lock().unwrap().clone()),
+            "a second observer of one failure must compute the same key"
+        );
     }
 
     #[tokio::test]
