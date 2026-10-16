@@ -200,25 +200,59 @@ fn oldest_age_secs<'a>(dir: &Path, ids: impl Iterator<Item = &'a str>) -> Option
     Some(ages.into_iter().max().unwrap_or(0))
 }
 
+/// What one pass over the queue directory found.
+///
+/// The three answers are kept apart because they are three different facts about
+/// the process, and `read_dir` reports the first two with the same error kind:
+///
+/// - a directory that is not there means this process holds no queue at all;
+/// - a directory that is there and could not be read is the blind spot this pass
+///   exists to notice;
+/// - a count is the reading itself.
+///
+/// Pooling the first two is what made a process without a queue directory log a
+/// warning on every cycle, and a warning that fires on a state a process is
+/// permanently in is a line readers learn to skip.
+enum QueueFiles {
+    /// No queue directory in this process.
+    Absent,
+    /// The directory is there and this pass could not read it.
+    Unreadable,
+    /// The number of change files it holds.
+    Counted(usize),
+}
+
 /// How many change files the queue directory holds, whatever their state.
 ///
 /// The count is of the files, not of the pending subset: a change the pipeline
 /// is not offering is still a change the engine may legitimately remember, and
 /// the comparison the pair is read by is against the files that exist at all.
 ///
-/// `None` when the directory could not be read -- published as nothing, for the
-/// same reason the depth is: a zero from a directory that was never read is the
-/// empty-queue reading this module exists to prevent.
-fn count_change_files(dir: &Path) -> Option<usize> {
-    let entries = std::fs::read_dir(dir).ok()?;
+/// Nothing is published for either failure, for the same reason the depth is
+/// not: a zero from a directory that was never read is the empty-queue reading
+/// this module exists to prevent. Which failure it was decides whether the pass
+/// says so -- see [`QueueFiles`].
+fn count_change_files(dir: &Path) -> QueueFiles {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // Only a missing component reads as "no queue here". Everything else --
+        // a permission, a path that is not a directory, a mount that went away
+        // -- is a directory this process was meant to read and could not.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return QueueFiles::Absent,
+        Err(_) => return QueueFiles::Unreadable,
+    };
     let mut count = 0;
     for entry in entries {
-        let entry = entry.ok()?;
-        if entry.path().extension().and_then(|e| e.to_str()) == Some("diff") {
-            count += 1;
+        match entry {
+            Ok(entry) => {
+                if entry.path().extension().and_then(|e| e.to_str()) == Some("diff") {
+                    count += 1;
+                }
+            }
+            Err(_) => return QueueFiles::Unreadable,
         }
     }
-    Some(count)
+    QueueFiles::Counted(count)
 }
 
 /// Where the process actually reads the queue, resolved the way it does.
@@ -261,7 +295,7 @@ impl Observable for EvolutionQueueReadings {
         // necessarily the one draining the queue.
         if let Some(engine) = &self.engine {
             match count_change_files(&self.dir) {
-                Some(files) => {
+                QueueFiles::Counted(files) => {
                     out.push(
                         RawMetric::new(
                             RESIDENT_RESULTS_METRIC,
@@ -274,10 +308,20 @@ impl Observable for EvolutionQueueReadings {
                             .with_label(DIR_LABEL, dir.clone()),
                     );
                 }
-                None => warn!(
+                QueueFiles::Unreadable => warn!(
                     dir = %self.dir.display(),
                     "could not count the change files; publishing no resident reading this pass"
                 ),
+                // A process that holds no queue directory is not a blind spot and
+                // says nothing, unless it is the one meant to drain that queue --
+                // there a missing directory is the defect, and it is a different
+                // one from a directory that is present but unreadable, so it gets
+                // its own words rather than the line above.
+                QueueFiles::Absent if self.owner => warn!(
+                    dir = %self.dir.display(),
+                    "the queue directory this process drains is not there; publishing no resident reading this pass"
+                ),
+                QueueFiles::Absent => {}
             }
         }
 
@@ -513,9 +557,49 @@ mod tests {
         assert_eq!(value(&readings, QUEUE_OLDEST_METRIC).await, None);
     }
 
-    /// The view a listing reports is the same directory the metrics are
-    /// published under, so a reader can join "which queue did this listing read"
-    /// to "what does that queue hold".
+    /// The three answers a pass over the directory can come back with are told
+    /// apart by kind, not pooled into one failure: a process that holds no queue
+    /// directory is a different fact from one that holds a directory it cannot
+    /// read, and only the second is a blind spot worth a line every cycle.
+    #[test]
+    fn a_missing_directory_is_told_apart_from_one_that_cannot_be_read() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            count_change_files(&root.path().join("gone")),
+            QueueFiles::Absent
+        ));
+
+        // A path that exists and is not a directory: the directory this process
+        // was meant to read is not the one it got.
+        let not_a_dir = root.path().join("a-file");
+        std::fs::write(&not_a_dir, b"").unwrap();
+        assert!(matches!(
+            count_change_files(&not_a_dir),
+            QueueFiles::Unreadable
+        ));
+
+        let queue = root.path().join("queue");
+        std::fs::create_dir(&queue).unwrap();
+        std::fs::write(queue.join("one.diff"), b"").unwrap();
+        std::fs::write(queue.join("not-a-change.txt"), b"").unwrap();
+        assert!(matches!(count_change_files(&queue), QueueFiles::Counted(1)));
+    }
+
+    /// An engine in a process that holds no queue directory publishes the role
+    /// flag and nothing else -- and, because it is not the process meant to
+    /// drain that queue, stays quiet about it. This is the shape the control
+    /// plane runs in: the directory is mounted only on the process that drains
+    /// it, so a warning here would fire on every cycle forever.
+    #[tokio::test]
+    async fn an_engine_without_a_queue_directory_publishes_only_the_role_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone");
+        let readings = readings_with(&gone, false, engine(&gone));
+        assert_eq!(value(&readings, QUEUE_OWNER_METRIC).await, Some(0.0));
+        assert_eq!(value(&readings, RESIDENT_RESULTS_METRIC).await, None);
+        assert_eq!(value(&readings, QUEUE_FILES_METRIC).await, None);
+    }
+
     #[tokio::test]
     async fn the_view_names_the_directory_the_metrics_name() {
         let dir = tempfile::tempdir().unwrap();
@@ -601,14 +685,19 @@ mod tests {
         assert_eq!(value(&readings, QUEUE_PENDING_METRIC).await, None);
     }
 
-    /// A directory that could not be counted publishes no pair: absence is not a
-    /// leak, and a zero beside a non-zero index would read as one.
+    /// A directory that is there and could not be counted publishes no pair:
+    /// absence is not a leak, and a zero beside a non-zero index would read as
+    /// one. The path is one that exists and is not a directory, so this is the
+    /// uncountable case rather than the missing one -- the two are answered
+    /// differently, and only this one is a blind spot.
     #[tokio::test]
     async fn an_unreadable_directory_publishes_no_resident_reading() {
         let dir = tempfile::tempdir().unwrap();
         let engine = engine(dir.path());
         generate(&engine, "chg-1").await;
-        let readings = readings_with(&dir.path().join("gone"), true, engine);
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, b"").unwrap();
+        let readings = readings_with(&blocked, true, engine);
 
         assert_eq!(value(&readings, RESIDENT_RESULTS_METRIC).await, None);
         assert_eq!(value(&readings, QUEUE_FILES_METRIC).await, None);
