@@ -6941,6 +6941,105 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert!(msg.contains("没有任何上游报告恢复时刻"), "{msg}");
     }
 
+    /// 同一份事件载荷、两个载体、两句各自措辞的判词——**它们不是两个正本**。
+    ///
+    /// 分开的是口气与名单（列表口那句点名上游、通知口那句只给家数），不是事实：
+    /// 两句都把「池有多大」和「当刻几家在嫌疑窗内」说出来。载体分开之后没有任何
+    /// 东西会比对这两句，所以这一格要有测试——两句话都读得通，漂移是静默的，
+    /// 最坏的那一种漂移是**把嫌疑家数说成池的大小**（`pool_down_message_names_both_scopes`
+    /// 已经单独钉了这一句的半个面，这里钉的是**两句之间**）。
+    ///
+    /// 断言按**出现形式**写，不按裸子串：`"4"` 在任意一句的时间戳里都可能撞上，
+    /// 那种断言会绿着放过一次真漂移。
+    #[test]
+    fn the_two_pool_down_sentences_agree_on_the_event_they_render() {
+        // 取两个**不相同**的数（池 4、嫌疑 2），否则「把嫌疑数说成池大小」这种
+        // 漂移正好落在断言看不见的方向上。
+        let suspect = [
+            "https://api.example.com/coding/v1|kimi-k3".to_string(),
+            "https://ark.cn-beijing.volces.com/api/v3|doubao".to_string(),
+        ];
+        let (pool_size, n) = (4usize, suspect.len());
+        assert_ne!(pool_size, n, "这一格要的是两个不同的数");
+
+        // 上游报了复位时刻：两句都必须带上**同一个**瞬间。两个渲染器
+        // （`unix_to_rfc3339` 与契约里的 `rfc3339`）各自实现对同一个 unix 秒的
+        // 输出，这里断言的是它们对得上——对不上就是同一个时刻在两张面
+        // 上是两个字符串。
+        let evidenced = 1_790_956_800i64;
+        let bounds = RecoveryBounds {
+            evidenced_unix: evidenced,
+            next_probe_unix: 1_790_936_536,
+            window_secs: 7 * 86_400,
+        };
+        let gateway = pool_down_message(pool_size, &suspect, &bounds);
+        let contract = cog_core::pool_down_verdict(
+            pool_size,
+            &suspect,
+            evidenced,
+            bounds.next_attempt_unix(),
+            bounds.window_secs,
+        );
+
+        // 池的大小：两句都用自己那句模板说同一个数。
+        assert!(
+            gateway.contains(&format!("池内 {pool_size} 个上游")),
+            "{gateway}"
+        );
+        assert!(
+            contract.contains(&format!("{n} of {pool_size} upstreams")),
+            "通知口那句必须自报「几家 / 池多大」两个数：{contract}"
+        );
+        // 嫌疑家数：列表口点名 n 个上游，通知口给同一个人数。
+        let named = suspect
+            .iter()
+            .filter(|u| gateway.contains(u.as_str()))
+            .count();
+        assert_eq!(named, n, "落库那句要点名全部嫌疑上游：{gateway}");
+        assert!(gateway.contains(&format!("此刻仍有 {n} 个")), "{gateway}");
+        // 漂移守卫：两句都不得把嫌疑家数当成池的大小。
+        assert!(!gateway.contains(&format!("池内 {n} 个上游")), "{gateway}");
+        assert!(
+            !contract.contains(&format!("{n} of {n} upstreams")),
+            "{contract}"
+        );
+        // 同一个复位时刻，两张面上逐字相同。
+        let instant = "2026-10-02T16:00:00+00:00";
+        assert!(gateway.contains(instant), "{gateway}");
+        assert!(contract.contains(instant), "{contract}");
+
+        // 一家都不在窗内：两句都要说「零家」，而不是把零家说成池空了。
+        let bounds = RecoveryBounds {
+            evidenced_unix: 0,
+            next_probe_unix: 1_790_936_536,
+            window_secs: 7 * 86_400,
+        };
+        let gateway = pool_down_message(pool_size, &[], &bounds);
+        let contract = cog_core::pool_down_verdict(
+            pool_size,
+            &[],
+            0,
+            bounds.next_attempt_unix(),
+            bounds.window_secs,
+        );
+        assert!(gateway.contains("此刻没有上游处在嫌疑窗内"), "{gateway}");
+        assert!(gateway.contains("池内 4 个上游"), "{gateway}");
+        assert!(contract.contains("0 of 4 upstreams"), "{contract}");
+
+        // 池里一个上游都没有：这里**两句故意不同**，不是漂移。落库那句的读者
+        // 就在告警行上，池大小同时以 `pool_size` 标签结构化地在那一行里，句子说
+        // 「池内 0 个」是真的；而事件载荷那侧分不开「池是空的」与「载荷没带这个
+        // 数」，所以它宁可自报「没有池大小」——报 0 会把「没带」说成「空池」。
+        // 要合一，先得让载荷带上这个区分，那时这一格才该改。
+        let gateway = pool_down_message(0, &suspect, &RecoveryBounds::default());
+        let contract = cog_core::pool_down_verdict(0, &suspect, 0, 0, 0);
+        assert!(gateway.contains("池内 0 个上游"), "{gateway}");
+        assert!(
+            contract.contains("carries no pool size"),
+            "没有池大小时要说「没带」，不能拿嫌疑家数顶替：{contract}"
+        );
+    }
+
     #[test]
     fn health_table_quota_window_and_pool_verdicts() {
         let table = LlmHealthTable::default();
