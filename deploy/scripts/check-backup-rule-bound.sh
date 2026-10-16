@@ -8,16 +8,23 @@
 # 而且两个都改得动：
 #   - 排班周期：`values.yaml` 的 `backup.schedule`（cron 串，`17 3 * * *`）；
 #   - 迟到宽限：`templates/backup.yaml` 的 `startingDeadlineSeconds`（**模板里的字面量，
-#     连 values 口都没有**，`values.yaml` 的 `backup:` 块里没有这一项）。
+#     连 values 口都没有**，`values.yaml` 的 `backup:` 块里没有这一项）；
+#   - 运行时长：`values.yaml` 的 `backup.runDeadlineSeconds`——健康的一次运行最长能跑
+#     这么久才被 kubelet 杀掉，所以它进「最坏健康年龄」。**摘要里那句「实测 41 秒」
+#     不是这个操作数**：41 是某一次测量的结果（最新一次实测 72 秒，见下），会随包变大
+#     而漂；能进推演的只有「一次运行被允许跑多久」这个上界。上一版这条门禁只算了
+#     「一天 ＋ 宽限」，漏了这一项——于是有人把 `runDeadlineSeconds` 抬到 5400 以上时
+#     （最坏健康年龄 = 86400 ＋ 1800 ＋ 5400 = 93600，正好顶到界上），一次跑得慢但
+#     **成功** 的运行会在成功之前把灯点亮，而门禁照样绿。
 # 任何一个动了，界都该跟着动。这个脚本把两件事钉住：
 #   1. 四条出现（三条日尺度规则的 `condition.greater_than` ＋ `backup_success_not_recorded`
 #      的 promql 里那一个 `<(数字)`）必须是同一个数；
-#   2. 那个数必须落在一条**从 chart 自己推出来的带子**里：上端是「一天 ＋ 迟到宽限」
-#      （健康部署的年龄下界，界掉到它以下正常部署会常年亮灯），下端是「两天」
-#      （`backup_no_recent_success` 的摘要写明它要「一次漏跑就亮、下次成功就灭」，
-#      并点名「界定在 48 小时就整天不响」）。
-# 两个端点的操作数都是读出来的，所以改排班的人会在这里被拦；至于界在带子里落在哪
-# 一点是运维取舍，本脚本不替它拍。
+#   2. 那个数必须落在一条**从 chart 自己推出来的带子**里：下端是「一天 ＋ 迟到宽限
+#      ＋ 允许的运行时长」（健康部署的年龄上界，界掉到它以下正常部署会常年亮灯），
+#      上端是「两天」（`backup_no_recent_success` 的摘要写明它要「一次漏跑就亮、
+#      下次成功就灭」，并点名「界定在 48 小时就整天不响」）。
+# 两个端点的操作数都是读出来的，所以改排班 / 改宽限 / 改运行时长的人都会在这里被拦；
+# 至于界在带子里落在哪一点是运维取舍，本脚本不替它拍。
 #
 # 判据取的是**出现形式**，不是全文件搜数字：日尺度那三条按规则名取
 # `condition.greater_than`，成功那条取 promql 里第一个 `<(数字)`。同族的
@@ -117,12 +124,19 @@ if deadline is None:
     fail(f"{template_path} 里没有 `startingDeadlineSeconds: <数字>`，读不到迟到宽限")
 grace = int(deadline.group(1))
 
-floor = period + grace
+# 第三个操作数：一次运行被允许跑多久。它也在同一个 `backup:` 块里，读得到。
+run_deadline = re.search(r"^\s+runDeadlineSeconds:\s*(\d+)\s*(?:#.*)?$", block.group(1), re.MULTILINE)
+if run_deadline is None:
+    fail(f"{values_path} 的 `backup:` 块里没有 `runDeadlineSeconds`，读不到允许的运行时长")
+run_seconds = int(run_deadline.group(1))
+
+floor = period + grace + run_seconds
 ceiling = 2 * period
 if not bound > floor:
     fail(
-        f"备份族的界 {bound:g} 没有高过「一天 {period} ＋ startingDeadlineSeconds {grace}」"
-        f"= {floor}：每天成功一次的健康部署也会被它照到"
+        f"备份族的界 {bound:g} 没有高过「一天 {period} ＋ startingDeadlineSeconds {grace} "
+        f"＋ runDeadlineSeconds {run_seconds}」= {floor}：一次跑满允许时长的**成功**运行"
+        f"会在成功之前把灯点亮（健康部署被照到）"
     )
 if not bound < ceiling:
     fail(
@@ -133,6 +147,7 @@ if not bound < ceiling:
 print(
     f"OK: 四条出现一致（{bound:g} = {bound / 3600:.2f}h）；"
     f"带的端点由 chart 推得：下 {floor}（排班 `{schedule}` → {period} ＋ "
-    f"startingDeadlineSeconds {grace}）、上 {ceiling}（两天）"
+    f"startingDeadlineSeconds {grace} ＋ runDeadlineSeconds {run_seconds}）、"
+    f"上 {ceiling}（两天）"
 )
 PYEOF

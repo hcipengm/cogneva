@@ -14,10 +14,13 @@
 #   3. 排班改成不是「每天一次」 -> 红（周期推不出来，界必须跟着重推）；
 #   4. `startingDeadlineSeconds` 抬高到界之下 -> 红（健康部署会被照到）；
 #   5. 界抬到两天以上 -> 红（漏一天不响，而摘要写的是漏一次就亮）；
-#   6. 负对照：改的是一条**不属于**这一族的规则的 condition -> 仍绿
-#      （判据取的是出现形式：按规则名取界，不是全文件搜数字）；
+#   6. 负对照：把**别的**规则的 condition 改成**同一个数** -> 仍绿
+#      （判据取的是出现形式：按规则名取界；若滑成「在整份配置里搜这个数」，
+#       这一格就会因为多出一处而红——写别的数（如 999）则滑了也不红，白搭）；
 #   7. 负对照：`backup_success_not_recorded` 被改名 -> 红并点名它
-#      （界在它的 promql 里，规则没了界也就没了，不能静默少一条）。
+#      （界在它的 promql 里，规则没了界也就没了，不能静默少一条）；
+#   8. `runDeadlineSeconds` 抬到「一天 ＋ 宽限」之上 -> 红，点名它
+#      （一次跑满允许时长的**成功**运行会在成功之前把灯点亮）。
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,6 +42,7 @@ cp "${template}" "${work}/backup.yaml"
 # 夹具：按名字改一条规则的 condition.greater_than / 改名 / 改别的规则。
 python3 - "${config}" "${work}" <<'PYEOF'
 import json
+import re
 import sys
 
 src, out = sys.argv[1], sys.argv[2]
@@ -65,12 +69,20 @@ def widen(rules, value):
                  "backup_nothing_ever_recorded"):
         rule(rules, name)["condition"]["greater_than"] = float(value)
     r = rule(rules, "backup_success_not_recorded")
-    r["promql"] = r["promql"].replace("< 93600", f"< {value}")
+    # 按**出现形式**改（`<(数字)`），不绑字面量：上一版写 `replace("< 93600", …)`，
+    # 源配置里只要空格变一下（`<93600`）这个替换就静默不动，夹具少了第四条、门在
+    # 「不一致」上红，于是这一格红得和它宣称的理由无关——门自己还是绿的、也没改名。
+    new_promql, n = re.subn(r"<\s*\d+(?:\.\d+)?", f"< {value}", r["promql"], count=1)
+    if n != 1:
+        raise SystemExit(
+            f"夹具改不动 {r['name']} 的 promql：里面没有 `<(数字)`，这一格量不到东西"
+        )
+    r["promql"] = new_promql
 
 
 dump("drift", lambda rules: rule(rules, "backup_nothing_ever_recorded")["condition"].__setitem__("greater_than", 43200.0))
 dump("too-wide", lambda rules: widen(rules, 259200))
-dump("unrelated", lambda rules: rule(rules, "container_memory_near_limit")["condition"].__setitem__("greater_than", 999.0))
+dump("unrelated", lambda rules: rule(rules, "container_memory_near_limit")["condition"].__setitem__("greater_than", 93600.0))
 dump("renamed", lambda rules: rule(rules, "backup_success_not_recorded").__setitem__("name", "backup_success_unrecorded"))
 PYEOF
 
@@ -94,7 +106,7 @@ if ! out="$(run_gate "${config}" "${values}" "${template}")"; then
     fail "真 chart 上这条门禁就该是绿的"
 fi
 grep -q '93600' <<<"${out}" || fail "绿色读数里没有印出界本身：${out}"
-grep -q '88200' <<<"${out}" || fail "绿色读数里没有印出一＋宽限推得的端点：${out}"
+grep -q '91800' <<<"${out}" || fail "绿色读数里没有印出一＋宽限＋运行时长推得的端点：${out}"
 grep -q '172800' <<<"${out}" || fail "绿色读数里没有印出两天的端点：${out}"
 
 # 2. 界漂了：红，并点名那条规则与两个数。
@@ -116,7 +128,7 @@ if out="$(run_gate "${config}" "${values}" "${work}/backup-wide-grace.yaml")"; t
     fail "一天 + 宽限已经高过界了，这条门禁还是绿的"
 fi
 grep -q 'startingDeadlineSeconds' <<<"${out}" || fail "红的时候没点名宽限这一项：${out}"
-grep -q '97200' <<<"${out}" || fail "红的时候没印出推得的端点：${out}"
+grep -q '100800' <<<"${out}" || fail "红的时候没印出推得的端点：${out}"
 
 # 5. 界抬到两天以上：红，念的是「漏一天不响」。
 if out="$(run_gate "${work}/too-wide.json" "${values}" "${template}")"; then
@@ -136,11 +148,32 @@ if out="$(run_gate "${work}/renamed.json" "${values}" "${template}")"; then
 fi
 grep -q 'backup_success_not_recorded' <<<"${out}" || fail "红的时候没点名那条找不到的规则：${out}"
 
+# 8. 允许的运行时长抬到「一天 ＋ 宽限」之上：红，并点名 runDeadlineSeconds。
+#    最坏健康年龄 = 86400 ＋ 1800 ＋ 7200 = 95400，已高过界 93600——一次跑得慢但**成功**
+#    的运行会在成功之前把灯点亮，而上一版门禁只算「一天 ＋ 宽限」，照样绿。
+sed 's/^  runDeadlineSeconds: .*/  runDeadlineSeconds: 7200/' "${values}" >"${work}/values-longrun.yaml"
+if out="$(run_gate "${config}" "${work}/values-longrun.yaml" "${template}")"; then
+    fail "允许的运行时长抬高到最坏健康年龄高过界了，这条门禁还是绿的"
+fi
+grep -q 'runDeadlineSeconds' <<<"${out}" || fail "红的时候没点名运行时长这一项：${out}"
+grep -q '95400' <<<"${out}" || fail "红的时候没印出推得的端点：${out}"
+
 # 自报的格数**从本文件里数出来**，不手写：手写的数会在加了一格之后仍旧印旧值，
 # 而「少了一格」正是这个数唯一要提醒的事。标记＝正文里 `# <数字>. ` 开头的注释行
 # （开头那三行是 `#   ` 缩进，不在此列）。
+#
+# 单数一个选择子不够——它数的是**标记的形状**，把一格缩进一下就少一个、加一行别的
+# 注释就多一个，两种漂都不经过真的删格。所以再数一个**定义上每格恰好一个**的真值
+# （调用点＝以 `if ` 开头且跑一次 run_gate 的那些行）与它对账，对不上就红：这样
+# 「标记与用例不一致」这件事本身有了判据，而不是印个数了事。
 cases="$(grep -c '^# [0-9]' "${BASH_SOURCE[0]}")" ||
     { echo "FAIL: 数不出用例数（正文里的 `# <数字>. ` 标记不在了）" >&2; exit 1; }
+calls="$(grep -cE '^if .*\$\(run_gate ' "${BASH_SOURCE[0]}")" ||
+    { echo "FAIL: 数不出 run_gate 的调用点" >&2; exit 1; }
+if [ "${cases}" != "${calls}" ]; then
+    echo "FAIL: 正文标记数（${cases}）与真正跑过的格数（${calls}，按 run_gate 调用点数的）对不上——要么有标记没有格，要么有格没有标记" >&2
+    exit 1
+fi
 
 echo "backup-rule-bound: ${cases} passed, 0 failed"
 
