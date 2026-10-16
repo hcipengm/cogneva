@@ -72,6 +72,7 @@ crates/cog-reflection/src/change_execution.rs	multi-axis	ChangeExecutionWorld;ex
 crates/cog-gateway/src/git_mirror.rs	single-axis	GitTransport
 crates/cog-core/src/contract/metric_help.rs	exempt	registry
 crates/cogneva/src/eval_table.rs	single-axis	run_table
+crates/cogneva/src/eval_container.rs	single-axis	swe_pro_container_backend
 crates/cogneva/tests/common/promql.rs	exempt	test-harness
 crates/cog-extension/src/workdir.rs	single-axis	WorkdirRouter
 crates/cog-orchestrator/src/dag_executor/mod.rs	single-axis	DagExecutorConfig
@@ -94,6 +95,7 @@ crates/cog-collaboration/src/squad/executor.rs	single-axis	SquadExecutor
 crates/cog-core/src/build_cache_readings.rs	single-axis	BuildCacheReadings
 crates/cog-reflection/src/auto_promoter.rs	single-axis	AutoPromoter
 crates/cog-core/src/contract/memory.rs	single-axis	MemoryBackend
+crates/cog-core/src/contract/supervisor.rs	single-axis	Supervisor
 crates/cog-reflection/src/evolution.rs	single-axis	EvolutionEngine
 crates/cog-storage/src/plugin.rs	single-axis	StoragePlugin
 crates/cog-reflection/src/evolution_admin.rs	single-axis	EvolutionAdminService

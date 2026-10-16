@@ -255,6 +255,22 @@ jobs:
         run: cargo test -p cog-observability --test usage_rollup -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The saved calls a call site decided not to make and the verdict a
+      # window's silence gets are two claims about rows one writer leaves and
+      # another reads: a skip is read back under the stage it named with the
+      # reason kept apart from the count, and the fold turns usage rows and
+      # silence into `necessary` / `documented_skip` / `unexpected_absent`. Both
+      # hinge on the server -- a `GROUP BY` that folds two stages into one, a
+      # conflict clause whose key is not the key the reader reads with, and
+      # whether a re-run lands the same rows are all decided there, and each of
+      # them passes every DB-free test beside it. The three verdicts are checked
+      # in one run because the difference between them is the claim: a face that
+      # can report only one of them answers the same word every time and passes
+      # any single assertion.
+      - name: Live-DB LLM skip and spend verdict
+        run: cargo test -p cog-observability --test skip_and_verdict_round_trip -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # A taste submission is evidence and a claimable row at once, and both
       # faces are decided by one statement each: whether a second disposition
       # rewrites the first fate, and whether a re-sent id replaces the words

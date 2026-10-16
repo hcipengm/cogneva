@@ -85,6 +85,18 @@ const UNNAMED: &[(&str, &str)] = &[
          test -p cogneva --test swe_pro_container -- --ignored --nocapture \
          --test-threads=1`.",
     ),
+    (
+        "crates/cogneva/src/eval_container.rs",
+        "The one test here asks whether the run it starts really gets its own \
+         namespaces and cannot see the host process's environment, and it needs \
+         the same three things the container harness above needs: a host with a \
+         container engine on it, a store with the instance image already pulled, \
+         and a live run to read the namespace off. It pins a measurement of one \
+         run rather than a regression guard, so it is a manual reading taken \
+         where a container machine exists: `cargo test -p cogneva --lib \
+         eval_container::tests::the_foreign_run_gets_its_own_namespaces -- \
+         --ignored --nocapture`.",
+    ),
 ];
 
 /// What a step selects, as far as naming tests goes.
