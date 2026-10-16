@@ -854,6 +854,27 @@ mod tests {
         assert_eq!(verdict_for(&f, true), None);
     }
 
+    /// A first run asks for the newest closed window and nothing before it.
+    ///
+    /// One of this fold's two inputs cannot be recomputed from history: the
+    /// saving record only exists from the moment its writer does. A run that
+    /// reached back would therefore judge every hour before that against a
+    /// silence it has no way to explain, and report each deliberate saving as
+    /// an absence — the false red the `unsettled` arm exists to prevent, minted
+    /// by the fold itself. The bound is stated as the behaviour a raised
+    /// lookback would change rather than as the value of the constant, so the
+    /// number is free to move as long as the reach does not.
+    #[test]
+    fn a_first_run_judges_only_the_newest_closed_window() {
+        let asked = windows_to_roll(None, Utc::now(), WINDOW_SECS, LOOKBACK_SECS);
+        assert_eq!(
+            asked.len(),
+            1,
+            "a first run asked for {asked:?}: every window before the saving \
+             record existed would be judged against silence it cannot explain"
+        );
+    }
+
     /// The closed vocabulary, spelled out: a value outside it is not a new
     /// verdict, it is a reader selecting by a column that grew without it.
     #[test]
