@@ -55,8 +55,9 @@ use cog_core::SelfEvolutionConfig;
 /// `cogneva_build_gate_wait_ms_max` reached 1693s against a longest hold of
 /// 1424s, so waits on this host already outlive any single hold. A refusal of
 /// that kind is a capacity reading, not a misconfiguration, and telling the two
-/// apart requires the refusal to say which wall it hit -- which the counter
-/// does not carry yet.
+/// apart requires the refusal to say which wall it hit and which work was
+/// refused -- which the counter now carries on the `reason` and `asker` labels,
+/// so a refusal reads as the work that did not run and the wall that stopped it.
 ///
 /// The floor also tracks one field and the slot is held under two: a build is
 /// killed at `build_timeout_secs` and a change's verification run is killed at

@@ -172,6 +172,13 @@ pub const BUILD_GATE_ACQUIRED_TOTAL: &str = "cogneva_build_gate_acquired_total";
 /// doing its job — and one number over all four cannot say which of them is
 /// happening. Summed over `reason` this is the number the counter carried
 /// before the label existed, so a reader that wants the old total keeps it.
+///
+/// It carries `asker` for the same reason read the other way: the walls do not
+/// fall on the works alike, so a refusal count says which wall and not who paid
+/// for it, and a work refused every round is the one a reader has to find. See
+/// [`BUILD_GATE_ASKERS`] for the closed set and for why the caller's own words
+/// are not the label. Summed over `asker` this is likewise the number the
+/// counter carried before that label existed.
 pub const BUILD_GATE_REFUSED_TOTAL: &str = "cogneva_build_gate_refused_total";
 /// Time builds have spent waiting for a slot, in milliseconds, summed over the
 /// builds that went on to take one.
@@ -455,10 +462,11 @@ struct Counters {
     excluded: u64,
     waiting: u64,
     acquired: u64,
-    /// One count per wall, indexed by [`RefusedBy::index`], so the refusal
-    /// counter publishes a fixed series set rather than a set that grows with
-    /// the walls a process happens to have hit.
-    refused: [u64; RefusedBy::ALL.len()],
+    /// One count per ask and per wall, indexed by [`asker_index`] and
+    /// [`RefusedBy::index`], so the refusal counter publishes a fixed series set
+    /// rather than one that grows with the walls a process happens to have hit
+    /// or the works it happens to have refused.
+    refused: [[u64; RefusedBy::ALL.len()]; ASKER_CELLS],
     wait_ms_total: u64,
     wait_ms_max: u64,
     held_ms_total: u64,
@@ -826,17 +834,22 @@ fn readings(
         label(RawMetric::new(BUILD_GATE_WAITING, c.waiting as f64)),
         label(RawMetric::new(BUILD_GATE_ACQUIRED_TOTAL, c.acquired as f64)),
     ];
-    // One row per wall, all of them always, so a reader summing the counter over
-    // its labels gets the same total the one-number version published and the
-    // series set does not depend on which walls this process has hit.
+    // One row per wall and per ask, all of them always, so a reader summing the
+    // counter over either label gets the same total the one-number version
+    // published and the series set depends on neither the walls this process has
+    // hit nor the works it has refused. The ask is the outer loop because the
+    // wall is the older axis and its rows keep their order.
     for wall in RefusedBy::ALL {
-        out.push(
-            label(RawMetric::new(
-                BUILD_GATE_REFUSED_TOTAL,
-                c.refused[wall.index()] as f64,
-            ))
-            .with_label("reason", wall.as_str().to_string()),
-        );
+        for asker in 0..ASKER_CELLS {
+            out.push(
+                label(RawMetric::new(
+                    BUILD_GATE_REFUSED_TOTAL,
+                    c.refused[asker][wall.index()] as f64,
+                ))
+                .with_label("reason", wall.as_str().to_string())
+                .with_label("asker", asker_label(asker).to_string()),
+            );
+        }
     }
     out.extend([
         label(RawMetric::new(
@@ -967,6 +980,74 @@ impl RefusedBy {
     }
 }
 
+/// The works that ask this gate for a slot, and the value each is counted
+/// under.
+///
+/// The `reason` label says which wall turned an ask away and cannot say who was
+/// asking, and the walls do not fall on the works alike. On a host with one
+/// slot, a single long `change verification` hold refuses `mainline advance`
+/// every time it comes back: the rollout is held for as long as that hold lasts
+/// and the counter cannot tell that from a build that merely arrived early.
+/// Read the other way it is the same gap — refusals under `maintenance_hold`
+/// say the sweeps and the builds are racing, but not which of the builds paid
+/// for it, and a work starved every round is exactly the one a reader has to
+/// find.
+///
+/// The set is closed, which is what makes the label admissible where the
+/// caller's own words are not. `what` is free text — it is also the name a
+/// holder writes into its slot file and the name in the refusal's warn line —
+/// and a free text as a label value would grow the series set with every new
+/// call site, which is the growth the closed set exists to bound. A `what` that
+/// is not one of these words is counted under [`BUILD_GATE_ASKER_UNNAMED`]
+/// rather than dropped: summed over `asker` the counter is then the number it
+/// carried before this label existed, and a call site asking under words that
+/// are not here shows up as an unnamed row with a number in it instead of
+/// vanishing into the whole.
+///
+/// Each pair is `(the words the call site asks with, the value the reading
+/// carries)`. It is a table rather than a type because `what` is a `&str` at
+/// every call site and most of them are tests asking as themselves — a test
+/// that asks as `"a build in the first slot"` is counted under the unnamed
+/// cell, which is what it is. The table is the whole of the vocabulary, so a
+/// caller that starts asking under new words is a reader's problem and not a
+/// silent one: the unnamed cell moves.
+pub const BUILD_GATE_ASKERS: [(&str, &str); 9] = [
+    ("evolution build", "evolution_build"),
+    ("baseline evaluation", "baseline_evaluation"),
+    ("change verification", "change_verification"),
+    ("change lint verification", "change_lint_verification"),
+    ("mainline advance", "mainline_advance"),
+    ("registry gc reissue", "registry_gc_reissue"),
+    ("registry maintenance", "registry_maintenance"),
+    ("buildah store reclaim", "buildah_store_reclaim"),
+    ("build-cache-reclaim", "build_cache_reclaim"),
+];
+
+/// The value an ask carries when it asks under words
+/// [`BUILD_GATE_ASKERS`] does not list.
+pub const BUILD_GATE_ASKER_UNNAMED: &str = "unnamed";
+
+/// How many asks the refusal counter publishes per wall: the named works and
+/// the unnamed one.
+const ASKER_CELLS: usize = BUILD_GATE_ASKERS.len() + 1;
+
+/// The cell an ask is counted in, in the order [`BUILD_GATE_ASKERS`] lists the
+/// works; anything else is the last cell.
+fn asker_index(what: &str) -> usize {
+    BUILD_GATE_ASKERS
+        .iter()
+        .position(|(words, _)| *words == what)
+        .unwrap_or(BUILD_GATE_ASKERS.len())
+}
+
+/// The value the ask in cell `index` is published under.
+fn asker_label(index: usize) -> &'static str {
+    match BUILD_GATE_ASKERS.get(index) {
+        Some((_, label)) => label,
+        None => BUILD_GATE_ASKER_UNNAMED,
+    }
+}
+
 /// Says that this process's work is waiting for the next build.
 ///
 /// The free-function half of [`BuildGate::reserve_build_field`], for a caller
@@ -1007,8 +1088,9 @@ pub struct BuildGate {
     excluded: AtomicU64,
     waiting: AtomicU64,
     acquired: AtomicU64,
-    /// One counter per wall, indexed by [`RefusedBy::index`].
-    refused: [AtomicU64; RefusedBy::ALL.len()],
+    /// One counter per ask and per wall, indexed by [`asker_index`] and
+    /// [`RefusedBy::index`].
+    refused: [[AtomicU64; RefusedBy::ALL.len()]; ASKER_CELLS],
     wait_ms_total: AtomicU64,
     wait_ms_max: AtomicU64,
     held_ms_total: AtomicU64,
@@ -1056,7 +1138,7 @@ impl BuildGate {
             excluded: AtomicU64::new(0),
             waiting: AtomicU64::new(0),
             acquired: AtomicU64::new(0),
-            refused: std::array::from_fn(|_| AtomicU64::new(0)),
+            refused: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
             wait_ms_total: AtomicU64::new(0),
             wait_ms_max: AtomicU64::new(0),
             held_ms_total: AtomicU64::new(0),
@@ -1385,7 +1467,9 @@ impl BuildGate {
             excluded: self.excluded.load(Ordering::Relaxed),
             waiting: self.waiting.load(Ordering::Relaxed),
             acquired: self.acquired.load(Ordering::Relaxed),
-            refused: std::array::from_fn(|i| self.refused[i].load(Ordering::Relaxed)),
+            refused: std::array::from_fn(|asker| {
+                std::array::from_fn(|wall| self.refused[asker][wall].load(Ordering::Relaxed))
+            }),
             wait_ms_total: self.wait_ms_total.load(Ordering::Relaxed),
             wait_ms_max: self.wait_ms_max.load(Ordering::Relaxed),
             held_ms_total: self.held_ms_total.load(Ordering::Relaxed),
@@ -1609,7 +1693,12 @@ impl BuildGate {
                     None if budget.is_zero() => RefusedBy::Busy,
                     None => RefusedBy::WaitedOut,
                 };
-                let total = self.refused[by.index()].fetch_add(1, Ordering::Relaxed) + 1;
+                // Counted against the ask as well as the wall: which work was
+                // turned away is the half of a refusal a reader cannot get back
+                // from the wall, and it is only known here, while the caller's
+                // own words are still in hand.
+                let asker = asker_index(what);
+                let total = self.refused[asker][by.index()].fetch_add(1, Ordering::Relaxed) + 1;
                 // Who is holding, read from the holders themselves. A refusal's
                 // own duration is not a reading -- it is fixed by whether the
                 // caller waited -- but the holder's is: it is the length of one
@@ -1634,6 +1723,7 @@ impl BuildGate {
                 let reason = format!("{opening}{} ({held})", by.reason(bound, budget));
                 tracing::warn!(
                     what,
+                    asker = asker_label(asker),
                     refusal = by.as_str(),
                     slots = bound,
                     holder = %held,
@@ -3386,14 +3476,30 @@ unevictable 28532736
         SFError::ResourceExhausted("busy".into()).is_environment_failure()
     }
 
-    /// Refusals this gate counted on one wall.
+    /// Refusals this gate counted on one wall, whoever asked.
     fn refused_on(gate: &BuildGate, wall: RefusedBy) -> u64 {
-        gate.refused[wall.index()].load(Ordering::Relaxed)
+        gate.refused
+            .iter()
+            .map(|asks| asks[wall.index()].load(Ordering::Relaxed))
+            .sum()
     }
 
-    /// Refusals this gate counted over every wall.
+    /// Refusals this gate counted for one asker, on whatever wall.
+    fn refused_by_asker(gate: &BuildGate, what: &str) -> u64 {
+        let asker = asker_index(what);
+        gate.refused[asker]
+            .iter()
+            .map(|counter| counter.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// Refusals this gate counted over every wall and every asker.
     fn refused_total(gate: &BuildGate) -> u64 {
-        gate.refused.iter().map(|c| c.load(Ordering::Relaxed)).sum()
+        gate.refused
+            .iter()
+            .flatten()
+            .map(|counter| counter.load(Ordering::Relaxed))
+            .sum()
     }
 
     /// A build turned away because the field is being swept is not a host that is
@@ -3655,26 +3761,28 @@ unevictable 28532736
         let dir = tempfile::tempdir().unwrap();
         let published = inactive(dir.path()).collect_metrics("D5").await.unwrap();
         let names: Vec<&str> = published.iter().map(|m| m.name.as_str()).collect();
+        let mut expected = vec![
+            BUILD_GATE_SLOTS,
+            BUILD_GATE_CEILING,
+            BUILD_GATE_OCCUPIED,
+            BUILD_GATE_IN_FLIGHT,
+            BUILD_GATE_EXCLUDED,
+            BUILD_GATE_WAITING,
+            BUILD_GATE_ACQUIRED_TOTAL,
+        ];
+        expected.extend(std::iter::repeat_n(
+            BUILD_GATE_REFUSED_TOTAL,
+            ASKER_CELLS * RefusedBy::ALL.len(),
+        ));
+        expected.extend([
+            BUILD_GATE_WAIT_MS_TOTAL,
+            BUILD_GATE_WAIT_MS_MAX,
+            BUILD_GATE_HELD_MS_TOTAL,
+            BUILD_GATE_HELD_MS_MAX,
+            BUILD_GATE_WAIT_BUDGET_MS,
+        ]);
         assert_eq!(
-            names,
-            vec![
-                BUILD_GATE_SLOTS,
-                BUILD_GATE_CEILING,
-                BUILD_GATE_OCCUPIED,
-                BUILD_GATE_IN_FLIGHT,
-                BUILD_GATE_EXCLUDED,
-                BUILD_GATE_WAITING,
-                BUILD_GATE_ACQUIRED_TOTAL,
-                BUILD_GATE_REFUSED_TOTAL,
-                BUILD_GATE_REFUSED_TOTAL,
-                BUILD_GATE_REFUSED_TOTAL,
-                BUILD_GATE_REFUSED_TOTAL,
-                BUILD_GATE_WAIT_MS_TOTAL,
-                BUILD_GATE_WAIT_MS_MAX,
-                BUILD_GATE_HELD_MS_TOTAL,
-                BUILD_GATE_HELD_MS_MAX,
-                BUILD_GATE_WAIT_BUDGET_MS,
-            ],
+            names, expected,
             "the series set does not depend on whether this process builds"
         );
         for metric in &published {
@@ -3684,21 +3792,94 @@ unevictable 28532736
                 metric.name
             );
         }
-        // One row per wall, all of them, even where none has been hit: a reader
-        // summing the counter over `reason` has to get the whole number, not the
-        // walls this process happens to have reached.
-        let reasons: Vec<&str> = published
+        // One row per wall and per ask, all of them, even where none has been
+        // hit: a reader summing the counter over either label has to get the
+        // whole number, not the walls this process happens to have reached nor
+        // the works it happens to have refused.
+        let grid: Vec<(&str, &str)> = published
             .iter()
             .filter(|m| m.name == BUILD_GATE_REFUSED_TOTAL)
-            .filter_map(|m| m.labels.get("reason").map(String::as_str))
+            .filter_map(|m| {
+                let reason = m.labels.get("reason")?.as_str();
+                let asker = m.labels.get("asker")?.as_str();
+                Some((reason, asker))
+            })
             .collect();
+        let mut expected_grid: Vec<(&str, &str)> = Vec::new();
+        for wall in RefusedBy::ALL {
+            for asker in 0..ASKER_CELLS {
+                expected_grid.push((wall.as_str(), asker_label(asker)));
+            }
+        }
         assert_eq!(
-            reasons,
-            RefusedBy::ALL
+            grid, expected_grid,
+            "every wall and every ask is published, so a refusal can be attributed to both"
+        );
+        assert_eq!(
+            expected_grid
                 .iter()
-                .map(|wall| wall.as_str())
-                .collect::<Vec<_>>(),
-            "every wall is published, so the refusals can be attributed"
+                .filter(|(_, asker)| *asker == BUILD_GATE_ASKER_UNNAMED)
+                .count(),
+            RefusedBy::ALL.len(),
+            "the unnamed ask is a cell of its own, once per wall"
+        );
+    }
+
+    /// A refusal has to say which work paid for it and not only which wall
+    /// stopped it, because the wall is where the reading is and the work is
+    /// where the remedy is: a host with one slot refuses whichever work comes
+    /// back, and the work starved every round is the one nobody can see.
+    ///
+    /// The words the works ask under are a closed set, so an ask that is not on
+    /// it is counted rather than lost: the total over the asks is still the
+    /// total the counter published before this label existed.
+    #[tokio::test]
+    async fn a_refusal_says_which_work_paid_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 0);
+        let _held = gate.try_acquire("change verification").await.unwrap();
+
+        for _ in 0..2 {
+            assert!(
+                gate.try_acquire("mainline advance").await.is_err(),
+                "the one slot is held, so the rollout is refused"
+            );
+        }
+        assert!(
+            gate.try_acquire("a build in the first slot").await.is_err(),
+            "an ask the table does not name is refused like any other"
+        );
+
+        assert_eq!(refused_by_asker(&gate, "mainline advance"), 2);
+        assert_eq!(refused_by_asker(&gate, "change verification"), 0);
+        assert_eq!(
+            refused_by_asker(&gate, "a build in the first slot"),
+            1,
+            "an ask under words the gate does not list is counted, not dropped"
+        );
+        assert_eq!(refused_total(&gate), 3);
+
+        let published = gate.collect_metrics("D5").await.unwrap();
+        let row = |asker: &str| -> Option<f64> {
+            published
+                .iter()
+                .find(|m| {
+                    m.name == BUILD_GATE_REFUSED_TOTAL
+                        && m.labels.get("asker").map(String::as_str) == Some(asker)
+                })
+                .map(|m| m.value)
+        };
+        assert_eq!(row("mainline_advance"), Some(2.0));
+        assert_eq!(row("change_verification"), Some(0.0));
+        assert_eq!(row(BUILD_GATE_ASKER_UNNAMED), Some(1.0));
+        assert_eq!(
+            published
+                .iter()
+                .filter(|m| m.name == BUILD_GATE_REFUSED_TOTAL)
+                .map(|m| m.value)
+                .sum::<f64>(),
+            3.0,
+            "summed over the asks the counter is the number it carried before the label"
         );
     }
 
