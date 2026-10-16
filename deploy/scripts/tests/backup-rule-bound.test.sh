@@ -20,7 +20,13 @@
 #   7. 负对照：`backup_success_not_recorded` 被改名 -> 红并点名它
 #      （界在它的 promql 里，规则没了界也就没了，不能静默少一条）；
 #   8. `runDeadlineSeconds` 抬到「一天 ＋ 宽限」之上 -> 红，点名它
-#      （一次跑满允许时长的**成功**运行会在成功之前把灯点亮）。
+#      （一次跑满允许时长的**成功**运行会在成功之前把灯点亮）；
+#   9. 摘要不再点名 `runDeadlineSeconds` -> 红，并点名缺的那一项与那条规则
+#      （摘要里的算式必须就是门禁里的那一份：此前写的是「41 秒实测」，
+#       那是某次测量的结果、门禁从没相加过，而真在相加的 `runDeadlineSeconds`
+#       摘要里没有——两份算式各写各的）；
+#  10. 负对照：摘要改写措辞但仍点名那三个操作数 -> 仍绿（判据是「点没点名」，
+#      不是逐字比对，否则每一次正当改写都会被判红）。
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -84,6 +90,31 @@ dump("drift", lambda rules: rule(rules, "backup_nothing_ever_recorded")["conditi
 dump("too-wide", lambda rules: widen(rules, 259200))
 dump("unrelated", lambda rules: rule(rules, "container_memory_near_limit")["condition"].__setitem__("greater_than", 93600.0))
 dump("renamed", lambda rules: rule(rules, "backup_success_not_recorded").__setitem__("name", "backup_success_unrecorded"))
+
+
+def drop_operand(rules):
+    """把摘要里 `runDeadlineSeconds` 这个名字换掉——门禁相加的那一项还在配置里，
+    只是摘要不再点它的名。这正是本族此前的形状：摘要写的是「41 秒实测」，一个门禁
+    从没相加过的项，而真在相加的那项没被写出来。"""
+    r = rule(rules, "backup_no_recent_success")
+    before = "".join(r.get("summary", "").split())
+    after = before.replace("runDeadlineSeconds", "a-run-allowance")
+    if after == before:
+        raise SystemExit("夹具改不动摘要：真摘要里没有 `runDeadlineSeconds`，这一格量不到东西")
+    r["summary"] = after
+
+
+def reword_but_keep(rules):
+    """正当改写：换措辞、换语序，三个操作数的名字一个不少（负对照）。"""
+    rule(rules, "backup_no_recent_success")["summary"] = (
+        "The run is scheduled once a day, so a day plus one startingDeadlineSeconds "
+        "of slack plus one runDeadlineSeconds of allowance bounds a healthy age; "
+        "an age above the bound means a run has been missed."
+    )
+
+
+dump("summary-drops-operand", drop_operand)
+dump("summary-reworded", reword_but_keep)
 PYEOF
 
 # 排班改成每天两次（每 12 小时一次）：周期不再是 86400，界必须重推。
@@ -157,6 +188,25 @@ if out="$(run_gate "${config}" "${work}/values-longrun.yaml" "${template}")"; th
 fi
 grep -q 'runDeadlineSeconds' <<<"${out}" || fail "红的时候没点名运行时长这一项：${out}"
 grep -q '95400' <<<"${out}" || fail "红的时候没印出推得的端点：${out}"
+
+# 9. 摘要不再点 `runDeadlineSeconds` 的名：红，并点名缺的是哪一项。
+#    这一格测的是**第三个前提**：摘要说的操作数必须就是门禁相加的那三个。此前这一族
+#    的摘要写的是「一天 ＋ 宽限 ＋ 41 秒实测 ＋ 一个读数周期」——41 秒是某次测量的
+#    结果，门禁从没相加过它；而门禁真在相加的 runDeadlineSeconds 摘要里没有。两份
+#    算式谁也没在看另一份，所以前两格全绿而散文是错的。
+if out="$(run_gate "${work}/summary-drops-operand.json" "${values}" "${template}")"; then
+    fail "摘要不再点名门禁相加的操作数，这条门禁还是绿的——散文里的算式与门禁里的算式又成了两份"
+fi
+grep -q 'runDeadlineSeconds' <<<"${out}" || fail "红的时候没点名摘要缺的那个操作数：${out}"
+grep -q 'backup_no_recent_success' <<<"${out}" || fail "红的时候没点名是哪条规则的摘要：${out}"
+
+# 10. 负对照：摘要**改写**但仍点名那三个操作数 -> 仍绿。
+#     判据取的是「点没点名」，不是「原文一字不差」；写成逐字比对会把每一次正当改写
+#     都判红，而正当改写正是这条门禁希望发生的事。
+if ! out="$(run_gate "${work}/summary-reworded.json" "${values}" "${template}")"; then
+    printf '%s\n' "${out}" >&2
+    fail "摘要改写了措辞但仍点名那三个操作数，这条门禁红了——判据滑成了逐字比对"
+fi
 
 # 自报的格数**从本文件里数出来**，不手写：手写的数会在加了一格之后仍旧印旧值，
 # 而「少了一格」正是这个数唯一要提醒的事。标记＝正文里 `# <数字>. ` 开头的注释行

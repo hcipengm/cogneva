@@ -16,13 +16,15 @@
 #     「一天 ＋ 宽限」，漏了这一项——于是有人把 `runDeadlineSeconds` 抬到 5400 以上时
 #     （最坏健康年龄 = 86400 ＋ 1800 ＋ 5400 = 93600，正好顶到界上），一次跑得慢但
 #     **成功** 的运行会在成功之前把灯点亮，而门禁照样绿。
-# 任何一个动了，界都该跟着动。这个脚本把两件事钉住：
+# 任何一个动了，界都该跟着动。这个脚本把三件事钉住：
 #   1. 四条出现（三条日尺度规则的 `condition.greater_than` ＋ `backup_success_not_recorded`
 #      的 promql 里那一个 `<(数字)`）必须是同一个数；
 #   2. 那个数必须落在一条**从 chart 自己推出来的带子**里：下端是「一天 ＋ 迟到宽限
 #      ＋ 允许的运行时长」（健康部署的年龄上界，界掉到它以下正常部署会常年亮灯），
 #      上端是「两天」（`backup_no_recent_success` 的摘要写明它要「一次漏跑就亮、
-#      下次成功就灭」，并点名「界定在 48 小时就整天不响」）。
+#      下次成功就灭」，并点名「界定在 48 小时就整天不响」）；
+#   3. **摘要说的操作数就是上面相加的那三个**——摘要要么自己点名这组，要么点名它从
+#      哪条规则复用这个界（复述会造出第二份算式，而第二份算式正是漂移的成因）。
 # 两个端点的操作数都是读出来的，所以改排班 / 改宽限 / 改运行时长的人都会在这里被拦；
 # 至于界在带子里落在哪一点是运维取舍，本脚本不替它拍。
 #
@@ -144,8 +146,60 @@ if not bound < ceiling:
         f"漏掉的那一天它不响，要等第二天也漏掉才亮——而摘要写的是漏一次就亮"
     )
 
+# 第三个前提：**摘要点名的操作数，就是本门禁相加的那三个**。
+#
+# 为什么它必须在这里：这一族此前的摘要写着自己的算式——「一天 ＋ 宽限 ＋ 41 秒实测 ＋
+# 一个读数周期」。那段算式里既有本门禁**没有相加**的项（实测时长是按包大小漂的结果，
+# 不是一个上界），又缺了本门禁**真在相加**的那一项（`runDeadlineSeconds`）。于是摘要
+# 里的算式与门禁里的算式是分开的两份，谁也没在看另一份——`93600` 与两份算式都不相等
+# 这件事，就这样同时躲过了散文和人。
+#
+# 判据取**名字**，并且**认两种正当形状**：
+#   a. 摘要自己点名那三个操作数（`backup_no_recent_success` 就是这么写的）；
+#   b. 摘要**不复述算式**、而是点名它从哪条规则那里复用这个界——复述会造出第二份算式，
+#      而第二份算式正是这次漂移的成因；`backup_never_succeeded_by_the_cronjob` 走这条，
+#      它写的是「93600 不是新数：它就是 backup_no_recent_success 带的那个界」。
+#      走这条时，被点名的那条规则必须自己满足 (a)，否则这条链子在空处落脚——所以是
+#      递归地查，不是「提了别人的名字就算数」。
+DEFERRAL = re.compile(r"the bound ([a-z0-9_]+) carries")
+OPERAND_TOKENS = [
+    ("每天一次", ("once a day", "daily run", "run a day", "once per day")),
+    ("startingDeadlineSeconds", ("startingDeadlineSeconds",)),
+    ("runDeadlineSeconds", ("runDeadlineSeconds",)),
+]
+
+
+def unstated_operands(summary):
+    return [label for label, forms in OPERAND_TOKENS if not any(f in summary for f in forms)]
+
+
+def operands_unaccounted_for(name, seen=()):
+    """返回 None 表示这条规则的摘要（或它点名的那条）把三个操作数说清了；
+    否则返回没被说到的那几项。"""
+    summary = rules[name].get("summary", "")
+    missing = unstated_operands(summary)
+    if not missing:
+        return None
+    src = DEFERRAL.search(summary)
+    if src is not None and src.group(1) in rules and src.group(1) not in seen:
+        return operands_unaccounted_for(src.group(1), seen + (name,))
+    return missing
+
+
+for name in list(BY_CONDITION) + [BY_PROMQL]:
+    missing = operands_unaccounted_for(name)
+    if missing is not None:
+        fail(
+            f"规则 {name} 的摘要没有点名本门禁相加的操作数：{'、'.join(missing)}。"
+            f"门禁相加的是「排班周期 ＋ startingDeadlineSeconds ＋ runDeadlineSeconds」，"
+            f"摘要要么自己写这一组，要么点名它从哪条规则那里复用这个界（被点名的那条"
+            f"必须自己写清楚）——两边各写一份算式，就没人会发现另一份算错了"
+        )
+
 print(
     f"OK: 四条出现一致（{bound:g} = {bound / 3600:.2f}h）；"
+    f"四条摘要都交代了门禁相加的三个操作数（排班周期、startingDeadlineSeconds、"
+    f"runDeadlineSeconds——自己点名，或点名它复用界的那条）；"
     f"带的端点由 chart 推得：下 {floor}（排班 `{schedule}` → {period} ＋ "
     f"startingDeadlineSeconds {grace} ＋ runDeadlineSeconds {run_seconds}）、"
     f"上 {ceiling}（两天）"
