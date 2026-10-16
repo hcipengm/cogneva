@@ -17,8 +17,25 @@ pub const SKILL_EFFECTIVENESS_LOOP: &str = "reflection_skill_effectiveness";
 ///
 /// 「发现」这个词在本仓还有另一个意思：`cog-github` 的 `discovery_enabled`
 /// 发现的是上游仓库里的 issue。这条发现的是**本系统自己**还没试过的能力组合
-/// （工具配对），与那边不共用配置、也不共用那条环的属主仲裁。
+/// （工具配对）：不共用配置、不共用被发现的物件，**但共用同一套属主仲裁机制**
+/// （`OwnerLeaseBroker` 的那些角色，各领一个）——2026-10-16 起如此，在那之前
+/// 这条环的属主由 `self_evolution.executor_enabled` 决定，而那个开关管的是
+/// 「谁执行变更」，两者本来是两件事（见 `SELF_DISCOVERY_ROLE`）。
 pub const DISCOVERY_LOOP: &str = "reflection_discovery";
+
+/// 这条环在属主仲裁里领的角色名。
+///
+/// 与 `cog-github` 的 `issue_discovery` 并列：两条环发现的东西不同、各自领
+/// 一个角色，但**仲裁机制是同一套**（`RoleHold` ＋ `may_act()`，读数是
+/// `cogneva_loop_owner_held` 一族与三张规则 `background_loop_role_unowned` /
+/// `_split` / `_probe_failing`）。
+///
+/// 为什么这条环需要一个角色而不是一句配置判断：`DiscoveryEngine` 的「已试过」
+/// 集合是**进程内内存、没有回读路径**（同目录 `discovery.rs`），两个进程各挂
+/// 一次就是同一条组合问两遍、各烧一份 token。副本数=1 是**今天的事实**、不是
+/// **保证**——它写在渲染清单的五个 Deployment 上（各一处），没有任何门会在它
+/// 变成 2 的时候红。角色把「至多一个持有者」变成账上可读的断言。
+pub const SELF_DISCOVERY_ROLE: &str = "self_discovery";
 
 /// 延迟持有的 LLM 上游池暂停句柄。`SchedulerGate` 由 supervisor 插件在
 /// init 阶段发布，而 reflection 的 init 早于 supervisor（supervisor 可选依赖
@@ -1619,12 +1636,31 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 // 自主能力发现与技能有效性同址：两者读的注册表都由别的插件的
                 // init 发布，只有全部 init 跑完才可靠可见。工具注册表在这里
                 // 消费，是因为契约面刚刚才有列举方法——在那之前这一侧读不到它。
+                //
+                // **这条环不再由 `owns_self_discovery` 门住**（2026-10-16）：那个
+                // 开关是「谁执行变更」的尺子（提交权，本文件里变更回流那一支也
+                // 读它），而这条环要的是「谁手里有发现引擎、并且拿得到工具注册表
+                // 与编排器」。两件事落在两个进程上：app 侧造的是 production 引擎
+                // 但没有提交权，进化侧有提交权而引擎是 in-memory 造的、根本不含
+                // 发现引擎。谁挂这条环改由角色仲裁给（`SELF_DISCOVERY_ROLE`）。
+                // 上面那处 signal watcher **仍然**读 `owns_self_discovery`——
+                // 它提交的是变更**执行**意图，属主本来就该是 executor_enabled。
+                let shutdown = cog_core::ShutdownSignal::new();
+                if let Some(broadcast_tx) = ctx.consume::<cog_core::ShutdownBroadcastTx>() {
+                    let shutdown = shutdown.clone();
+                    let mut rx = broadcast_tx.0.subscribe();
+                    tokio::spawn(async move {
+                        let _ = rx.recv().await;
+                        shutdown.trigger();
+                    });
+                }
                 spawn_discovery_loop(
                     engine.clone(),
                     ctx.consume_service::<dyn cog_core::ToolRegistry>(),
                     skill_registry.clone(),
                     orchestrator.clone(),
-                    owns_self_discovery,
+                    ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>(),
+                    shutdown,
                     period,
                     self.pool_gate.clone(),
                 );
@@ -2059,12 +2095,15 @@ fn discovery_loop_missing_inputs(
 ///
 /// - **属主**：每条探针都在任务图里落一行、都要过池子，两份部署各跑一遍就是同一条
 ///   组合问两遍；而且 `DiscoveryEngine` 的「已试过」集合是**进程内内存、没有回读
-///   路径**，跑在别的进程里读到的永远是空集合。与自发现信号 watcher 同一把尺子
-///   （`self_evolution.executor_enabled`）。
+///   路径**，跑在别的进程里读到的永远是空集合。所以至多一个进程挂它——由
+///   `SELF_DISCOVERY_ROLE` 这个**角色**保证（`cog_core::RoleHold` ＋ 每轮
+///   `may_act()`），不是由配置判断保证。**这一格 2026-10-16 之前读的是
+///   `self_evolution.executor_enabled`**，那是「谁执行变更」的尺子（提交权），
+///   与「谁手里有发现引擎」是两件事——实测它们落在两个不同的进程上（见下）。
 /// - **供给面**：工具注册表由别的插件的 init 发布，编排器句柄也只能在 `start`
-///   跨插件消费。两个都缺就一条也交不出去，此时**不挂**这条环——并且把「enabled」
-///   那句话打在这道门**里面**：打在调用点上的宣告只证明代码走到了那里，而
-///   「日志有、循环注册表里没有」这一组读数会被读成「改动没生效」。
+///   跨插件消费。三样缺一样就一条也交不出去，此时**不挂**这条环、也不去争角色——
+///   并且把「enabled」那句话打在这道门**里面**：打在调用点上的宣告只证明代码走到了
+///   那里，而「日志有、循环注册表里没有」这一组读数会被读成「改动没生效」。
 /// - **池闸**：探针要过 LLM。池被闸住的那一轮连生成都不做——生成出来也不该交出去，
 ///   交出去的每一条都会在图里留下一行注定失败的任务，与「真的有探针在跑」在账面上
 ///   同形（现网池自报 2026-10-18T16:00Z 才可能回来）。
@@ -2074,25 +2113,32 @@ fn discovery_loop_missing_inputs(
 /// 一个进程**——`ReflectionEngine initialized in in-memory mode` 之后 1 秒就是这句
 /// `loop not armed`（09:55:15 → 09:55:16，另两次同形）；而 `production mode` 那句后面
 /// 跟着的是 `not the self-discovery owner`（09:52:34 → 09:52:35，1 秒）。也就是说：
-/// 有真引擎的进程不持这条环，持这条环的进程用的是 in-memory 构造、而这一种构造根本
-/// 不建发现引擎，于是三样输入里缺的永远是**发现引擎**那一格，且缺法是**构造**而非
-/// 接线（同一个进程里 `AgentPlugin tool registry published` 与
+/// 有真引擎的进程因那条配置门不持这条环，持这条环的进程用的是 in-memory 构造、而这
+/// 一种构造根本不建发现引擎，于是三样输入里缺的永远是**发现引擎**那一格，且缺法是
+/// **构造**而非接线（同一个进程里 `AgentPlugin tool registry published` 与
 /// `OrchestratorPlugin DAG executor control published` 都发布过、时间戳都在这句之前）。
 /// 旧的那一句把三样一起念出来，读的人会去核两样**没坏**的东西，而且那两样**在这个
 /// 进程里不可能坏**。
+///
+/// **换掉配置门之后，行为会第一次真的变化**：app 侧（production 引擎、三样俱全）
+/// 从「不归我」变成会去争角色、争到就挂起来，而现网池要到 2026-10-18T16:00Z 才可能
+/// 回来 ⇒ 它的每一轮都会被池闸扣住。所以池闸那句必须是**可读的**（级别与同族的
+/// `cog-github` 对齐，并带上角色与连续被扣住的轮数）：症状从「安静地没挂上」翻成
+/// 「安静地挂上了又被扣住」，**两者读数同形**。
+// 八个参数是八样互不相同的接线（三样供给、仲裁者、停机信号、周期、池闸），
+// 没有哪两个能自然合成一个类型；同 crate 的 `ReflectionEngine::new_self_evolution`
+// 是同一个形状、同样的处置。
+#[allow(clippy::too_many_arguments)]
 fn spawn_discovery_loop(
     engine: Arc<crate::ReflectionEngine>,
     tool_registry: Option<Arc<dyn cog_core::ToolRegistry>>,
     skill_registry: Option<Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>>,
     orchestrator: Option<Arc<dyn cog_core::OrchestratorControl>>,
-    owns_discovery: bool,
+    role_broker: Option<Arc<dyn cog_core::OwnerLeaseBroker>>,
+    shutdown: cog_core::ShutdownSignal,
     period: std::time::Duration,
     pool_gate: Arc<PoolGate>,
 ) {
-    if !owns_discovery {
-        info!("not the self-discovery owner in this deployment; autonomous discovery disabled");
-        return;
-    }
     // 三样在不在**先问一遍**再解构：`let … else` 的初始化式会把两个 Option 移进那个
     // 元组，else 那一支里就再也问不出它们了（这一句不是风格，是借用检查器的要求）。
     let inputs_present = (
@@ -2119,6 +2165,11 @@ fn spawn_discovery_loop(
         period_secs = period.as_secs(),
         "autonomous discovery loop enabled"
     );
+    // 部署有没有发布仲裁者——**与「角色持有」必须同一句印**：`may_act()` 在
+    // `lease: None` 时早退返回真，既不调 `try_hold()` 也不在 beat 上记任何东西
+    // （`cog-core/src/contract/owner_lease.rs:201-204`），于是「没仲裁者」与
+    // 「我持有」在读数上同形。只印后者会让这个进程多一个安静的正常值。
+    let broker_present = role_broker.is_some();
     drop(cog_core::loop_health::spawn_unstoppable(
         DISCOVERY_LOOP,
         cog_core::loop_health::Cadence::Periodic(period),
@@ -2129,17 +2180,68 @@ fn spawn_discovery_loop(
             let orchestrator = orchestrator.clone();
             let discovery = discovery.clone();
             let pool_gate = pool_gate.clone();
+            let role_broker = role_broker.clone();
+            let shutdown = shutdown.clone();
+            let role_beat = beat.clone();
             async move {
+                // 角色领一次就够（`RoleHold` 自带按契约节拍续租的续期任务），
+                // 但「这一轮该不该我动手」要**每轮现问**——丢角色之后照跑才是
+                // 这条环真正的坏法（`explored` 是进程内集合，两个进程各跑一遍
+                // 就是同一条组合问两遍）。
+                let hold = cog_core::RoleHold::start(
+                    role_broker,
+                    SELF_DISCOVERY_ROLE,
+                    role_beat,
+                    &shutdown,
+                );
                 let mut interval = tokio::time::interval(period);
+                // 连续被扣住的轮数，这一支**唯一**的时长读数：池闸关着是正常态，
+                // 而「刚关上」与「关了 6 小时」在这一句里长得一模一样。
+                let mut held_rounds: u64 = 0;
                 loop {
                     beat.beat();
                     interval.tick().await;
 
+                    // 角色在别处：这一轮不动手。跳过的那一答 `may_act()` 已经记在
+                    // beat 上（`cogneva_loop_owner_held` 一族），所以这句是给人看的
+                    // 第二面而不是唯一读数面；级别与同族对齐（`cog-github` 那条环
+                    // 同样的跳过是 `info!`）。
+                    if !hold.may_act().await {
+                        held_rounds += 1;
+                        info!(
+                            role = SELF_DISCOVERY_ROLE,
+                            broker = broker_present,
+                            held_rounds,
+                            "discovery round skipped: another process holds the self-discovery role"
+                        );
+                        continue;
+                    }
+
                     // 闸住的那一轮不生成也不提交：省下的是必然失败的任务行，
                     // 不是「这一轮没事发生」。
                     if pool_gate.llm_paused() {
-                        debug!("discovery round held off: the LLM pool gate is closed");
+                        held_rounds += 1;
+                        info!(
+                            role = SELF_DISCOVERY_ROLE,
+                            broker = broker_present,
+                            held_rounds,
+                            period_secs = period.as_secs(),
+                            "discovery round held off: the LLM pool gate is closed"
+                        );
                         continue;
+                    }
+
+                    // 恢复后的**第一个真跑轮**把计数写回 0 并印一次：状态类读数必须由
+                    // 结束那一轮写回，否则「连续被扣住到某轮为止」永远读不到尾——池一
+                    // 恢复那句就不再出现，读者手上只剩最后一个非零值。
+                    if held_rounds > 0 {
+                        info!(
+                            role = SELF_DISCOVERY_ROLE,
+                            broker = broker_present,
+                            held_rounds,
+                            "discovery round resumed after being held off"
+                        );
+                        held_rounds = 0;
                     }
 
                     let tool_names = tool_registry.names();
