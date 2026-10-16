@@ -1242,15 +1242,22 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          already (a task the goal path already had), failed (this pass tried to \
          hand one over and the goal path refused), dead_environment (a task held \
          it, the environment refused every handover the budget allowed, and it \
-         is given up on), held_back (owed, no task holds it, and this pass \
-         handed nothing over) and unmeasurable (owed, and this pass could not \
+         is given up on), held_back (owed, no task holds it, and this pass did \
+         not hand it over -- either because no configured upstream could serve \
+         and the pass handed nothing over at all, or because the pass had \
+         already handed over its own slice of the set and left the rest for a \
+         later one) and unmeasurable (owed, and this pass could not \
          settle what is being asked of it). rearmed counts handovers that had to \
          be re-filed at a later generation and is an annotation over those \
          outcomes, not one of them, so submitted + already + failed + \
          dead_environment + held_back is what has to equal pending -- and the \
          equality is the reading: a pass whose counts do not add up to the set it \
          read is a pass that lost track of rows, which is how the environment- \
-         killed ones went unrecorded once. Three further cells answer a different \
+         killed ones went unrecorded once. Which of held_back's two causes a pass \
+         was is not in this family: a paused pass hands nothing over at all, so a \
+         pass that handed something over and still has rows held back is one whose \
+         own slice ran out, and the cells below say what the pool looked like \
+         either way. Three further cells answer a different \
          question about that same set, taken from the same pass: what the \
          handovers had left behind when it read them. handover_events counts the \
          owed changes whose handovers are still in the event stream -- their \

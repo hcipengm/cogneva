@@ -161,6 +161,44 @@ const RETIREMENTS_PER_PASS: usize = 200;
 /// takes.
 const MEASUREMENTS_PER_PASS: usize = 200;
 
+/// How many owed rows one pass hands over.
+///
+/// The same bound, of the same shape, as the three folds above: a pass is a
+/// maintenance tick, not a queue drain, so it hands over a bounded slice and the
+/// next tick takes the rest -- an owed set that grew large must not make a
+/// single tick unbounded, and unlike a fold a hand-over is not a write this
+/// process finishes: it is work the goal path then pays for, so handing over a
+/// whole backlog at once spends the pool on one tick's worth of rows.
+///
+/// This number is a **value with a stated source, and the source is not a
+/// measurement**: it is the tolerance this same tick already applies to every
+/// other set it touches, and those three were themselves chosen, for a reason
+/// that does not transfer here (their queues are written by a person or a script,
+/// in batches of tens). What would make it derived is a reading this tree does
+/// not have -- **what one hand-over costs**, in pool time and in run time. With
+/// that, the batch could be solved from "one tick's hand-overs must be paid for
+/// inside one tick" rather than borrowed. Until it exists this is a number a
+/// person may have to re-tune, and it says so instead of dressing the borrowing
+/// up as a derivation.
+///
+/// What the bound buys is checked rather than asserted in prose: an owed set of
+/// up to `HANDOVERS_PER_PASS * UNMEASURABLE_RETRY / CHANGE_LEDGER_PASS_INTERVAL`
+/// rows is swept inside `UNMEASURABLE_RETRY`, and the assertion below fails to
+/// compile if the three numbers drift apart.
+const HANDOVERS_PER_PASS: usize = 200;
+
+const _: () = assert!(
+    CHANGE_LEDGER_PASS_INTERVAL.as_secs() <= UNMEASURABLE_RETRY.as_secs()
+        && (HANDOVERS_PER_PASS as u64) * CHANGE_LEDGER_PASS_INTERVAL.as_secs()
+            >= UNMEASURABLE_RETRY.as_secs(),
+    "an owed row is handed over within UNMEASURABLE_RETRY, and that is a relation \
+     between three numbers rather than a property of any one of them: a pass \
+     interval longer than the window cannot meet it for any batch, and a batch \
+     smaller than the number of passes the window holds sweeps a one-batch set \
+     more slowly than the window promises. Which way the account is allowed to be \
+     late is not decided by editing one constant."
+);
+
 /// How long a check that could not be settled is left before it is asked again.
 ///
 /// Held alone it would be permanent, and a permanent answer to a question about
@@ -2049,6 +2087,20 @@ async fn dispatch_pass(
                     counts.held_back += 1;
                     continue;
                 }
+                if counts.submitted >= HANDOVERS_PER_PASS {
+                    // Owed, handable, and left for a later pass because this one
+                    // has handed over its slice. Counted with the rows a paused
+                    // pass withholds, because the fact about the row is the same
+                    // in both -- owed, no task holds it, and this pass did not
+                    // hand it over -- while what differs is the pass's reason,
+                    // which is the verdict's to say and not the count's.
+                    //
+                    // Left, not skipped over: the loop runs to the end so the
+                    // census of what the handovers left behind stays a reading of
+                    // the whole set on every pass, which is what it says it is.
+                    counts.held_back += 1;
+                    continue;
+                }
                 if generation > 0 {
                     counts.rearmed += 1;
                 }
@@ -2111,6 +2163,7 @@ async fn dispatch_pass(
         info!(
             pending = pending.len(),
             submitted = counts.submitted,
+            held_back = counts.held_back,
             rearmed = counts.rearmed,
             already_handed_over = counts.already,
             already_dead_environment = counts.dead_environment,
@@ -2121,7 +2174,7 @@ async fn dispatch_pass(
             handovers_unreadable = readback.unreadable,
             pool = verdict.reading.as_str(),
             not_handed_over = %held_back_summary(&rows),
-            "change ledger: handed the pending set to the goal path"
+            "change ledger: handed this pass's slice of the pending set to the goal path"
         );
     }
     record_dispatch_state(
@@ -2205,6 +2258,19 @@ async fn owed_row(
 /// already + failed + dead_environment + held_back == pending`, with
 /// `unmeasurable` counted separately because those rows were never in the
 /// dispatched set to begin with.
+///
+/// `held_back` is the one count with two causes: a pass with no upstream that
+/// can serve hands nothing over at all, and a pass that has already handed over
+/// [`HANDOVERS_PER_PASS`] rows leaves the rest to a later one. The fact about
+/// the row is the same either way -- owed, no task holds it, and this pass did
+/// not hand it over -- and which of the two it was is the pass's verdict rather
+/// than its count, since a paused pass submits nothing at all: a pass that
+/// submitted and still has rows left is one whose slice was spent. Keeping both
+/// in one cell is also what keeps the arithmetic above an equality. A cell added
+/// to absorb what the bound left behind, without being subtracted from the same
+/// sum, would put the reading a reader already takes off this row -- owed minus
+/// everything accounted for -- off zero, and that line sitting at zero is what
+/// catches a pass that lost track of rows.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct TickCounts {
     submitted: usize,
@@ -4144,6 +4210,43 @@ mod tests {
             handed_over,
             vec![at(&store.rows[1], 1), at(&store.rows[2], 0)]
         );
+    }
+
+    /// One pass hands over a bounded slice, and the rows it leaves are counted
+    /// where it counts the ones a pause withholds -- so the arithmetic still
+    /// closes on the set the pass read, not on the part of it the pass acted on.
+    ///
+    /// This is the row the bound exists for: without it a tick hands over
+    /// whatever the backlog happens to be, and a hundred and thirty-nine rows in
+    /// one tick is a burst the pool pays for at once and a reading no one can
+    /// compare with the tick before it. What it costs is one cell's worth of
+    /// meaning, which is why the rows left behind land in a cell that is already
+    /// published: the residual line a reader takes off this row -- owed minus
+    /// everything accounted for -- still has to come out at zero.
+    #[tokio::test]
+    async fn a_pass_hands_over_its_slice_and_the_rest_still_accounts_for_itself() {
+        let over = HANDOVERS_PER_PASS + 1;
+        let store = FakeLedger {
+            rows: (0..over)
+                .map(|i| pending_row(&format!("crates/slice{i}")))
+                .collect(),
+            ..Default::default()
+        };
+        let graph = Arc::new(FakeGraph::default());
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        dispatch_pass(&store, &control, &HashMap::new(), None, None, None, None).await;
+
+        let state = store.written().pop().expect("the pass wrote its row");
+        assert_eq!(state.decision, DispatchDecision::Proceed);
+        assert_eq!(state.pending, over as u64);
+        assert_eq!(
+            state.submitted, HANDOVERS_PER_PASS as u64,
+            "the pass handed over its slice and no more"
+        );
+        assert_eq!(state.held_back, 1, "and the row past the slice is counted");
+        assert_eq!(graph.submitted().len(), HANDOVERS_PER_PASS);
+        assert_the_counts_add_up(&state);
     }
 
     /// A source that answers nothing does not become permission to hand work

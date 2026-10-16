@@ -796,7 +796,15 @@ pub struct DispatchState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchDecision {
-    /// The pass handed over what was owed.
+    /// Nothing withheld the hand-over: whatever this pass did not hand over, it
+    /// did not leave because the pool could not serve.
+    ///
+    /// A pass that hands over its own slice of a large owed set and leaves the
+    /// rest is this one, so this is not the same claim as "everything owed went
+    /// out". The rows it left are counted with the rows a paused pass withholds,
+    /// and the two are told apart here: a paused pass hands nothing over at all,
+    /// so a pass that handed something over and still has rows left spent its own
+    /// slice and no more.
     Proceed,
     /// The pass handed nothing over: no configured upstream could serve a
     /// request, so every task it submitted would have failed for that reason.
