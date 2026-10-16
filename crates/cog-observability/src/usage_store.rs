@@ -141,7 +141,14 @@ pub struct LlmUsageRecord {
     pub api_style: String,
     /// Real model name as configured on the upstream.
     pub model: String,
-    /// `ok` or `error` — errors carry zero tokens but keep the attempt visible.
+    /// `ok`, `error`, or `refused_by_circuit` — the last two carry zero tokens
+    /// but keep the attempt visible. The refusal is kept apart from `error`
+    /// because they name opposite repairs: an `error` row is an upstream that
+    /// was tried and did not serve, a refusal row is one that was never tried
+    /// because the whole pool was known unusable, and the second is what makes
+    /// a down window readable instead of reading like a window with no traffic.
+    /// On a refusal row `upstream` and `model` are `-`: no single upstream is
+    /// its subject, so both columns say so rather than naming a candidate.
     pub result: String,
     /// Calling component as normalized by the gateway (`self_review`,
     /// `agent:<role>`, `unknown`); lets per-actor token spend be audited.
@@ -173,6 +180,13 @@ pub struct LlmUsageRecord {
 /// every call failed and a window with no traffic at all sum to the same token
 /// count. Keeping the failure count beside the token totals is what lets a
 /// reader tell the two apart instead of reading "this path records nothing".
+///
+/// A pooled refusal counts here too, and reads off on its own: its rows are the
+/// only ones whose `upstream` is `-`, so the group answers "how many calls were
+/// turned away before any upstream was tried" without the reader having to
+/// subtract anything. Excluding it instead would make a group of refusals read
+/// as `calls > 0, failed = 0, tokens = 0` — a path that answered everything and
+/// spent nothing, which is the one reading that is certainly false.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorSpend {
     pub actor: String,

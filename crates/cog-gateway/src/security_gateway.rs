@@ -1535,6 +1535,10 @@ impl AppState {
     /// 它们答的是不同的问题——前者是"我们什么时候值得再试一次"（由探测节拍决定，
     /// 封顶 6h），后者是"上游自己说还要多久"（可能是整整一周）。合成一个数播报，
     /// 调用侧就无法区分"刚断了一下"和"本周的额度已经用尽"。
+    ///
+    /// 请求路径**不要直接调这个**：它只回答判定，不管台账。到它为止的每一次拒绝
+    /// 都得在台账上留下那一条零用量行，否则池全灭的窗口读起来与"没有流量"同形，
+    /// 所以两个调用点都经 [`pooled_refusal`]，落账绑在取到 `Some` 的那一次上。
     fn pool_circuit_break(&self, candidates: &[&LlmUpstream]) -> Option<(u64, u64)> {
         let owned: Vec<LlmUpstream> = candidates.iter().map(|u| (*u).clone()).collect();
         if !self.llm_health.all_suspect(&owned) {
@@ -1762,6 +1766,67 @@ fn failed_attempt_usage(
         tokens_cached: 0,
         latency_ms,
     })
+}
+
+/// 池级熔断拒绝在台账 `result` 列上的取值。
+///
+/// 它是 `LlmUsageRecord::result` 的第三个值（前两个是 `ok` 与 `error`），因为
+/// 熔断拒的不是一次上游调用：池级判定在**选上游之前**就返回，一个上游都没试。
+/// 记成 `error` 会把"我们拒了"读成"上游答了错"，两者的修复方向正相反。
+pub const REFUSED_BY_CIRCUIT: &str = "refused_by_circuit";
+
+/// 池级拒绝那一行上，没有单一指名的列（`upstream` / `model`，以及在跨协议面
+/// 判定时的 `api_style`）取什么值。
+///
+/// 拒绝是**整个池或整个协议面**的判定，没有任何一个上游被试过；把这一行挂到某个
+/// 候选名下，读起来就是"那个上游拒了"。这个值不可能是任何真上游键、模型名或协议
+/// 名（前者是配置里的池标识，后两者是上游自报的数据），所以按这些列分组时不会与
+/// 它们混在一格里。
+const POOLED_REFUSAL_UNNAMED: &str = "-";
+
+/// 池级熔断的台账落点。
+///
+/// [`failed_attempt_usage`] 让"试过但失败"的尝试在台账里可见，可它挂在某个
+/// 上游上——而这条拒绝路径**根本没走到遍历**（[`AppState::pool_circuit_break`]
+/// 在无人可承接时直接返回）。少了这一行，池全灭的窗口在台账里仍然是一条安静的
+/// 缝，与"本来就没有流量"同形，而那正是这次拒绝要区分开的两件事。零用量是实情：
+/// 一个上游都没发出去，所以 latency 记 0 也是实情，不是没量到。
+fn pooled_refusal_usage(style: &str, actor: &str, origin: &str) -> LlmUsageRecord {
+    LlmUsageRecord {
+        upstream: POOLED_REFUSAL_UNNAMED.to_string(),
+        api_style: style.to_string(),
+        model: POOLED_REFUSAL_UNNAMED.to_string(),
+        result: REFUSED_BY_CIRCUIT.to_string(),
+        actor: actor.to_string(),
+        origin: origin.to_string(),
+        tokens_input: 0,
+        tokens_output: 0,
+        tokens_cached: 0,
+        latency_ms: 0,
+    }
+}
+
+/// 池级熔断的唯一出口：判定与落账在同一次调用里。
+///
+/// 落账写在 [`AppState::pool_circuit_break`] 的调用点上是**位置判据**——判据能证明
+/// 那一行在源码里挨着 `return`，证不了它每次真的跑（把它包进 `if false && …` 照样
+/// 绿）。放在这里，取到 `Some` 和写下那一行出自同一个 `is_some()`，调用点没有
+/// "判定为真而行没落"的中间态可走。
+///
+/// 调用点仍可以是新的，但**不许再直接调 `pool_circuit_break`**：那样绕开的是这一行，
+/// 而池全灭的窗口就会退回与"没有流量"同形。
+fn pooled_refusal(
+    state: &AppState,
+    candidates: &[&LlmUpstream],
+    style: &str,
+    actor: &str,
+    origin: &str,
+) -> Option<(u64, u64)> {
+    let verdict = state.pool_circuit_break(candidates);
+    if verdict.is_some() {
+        land_usage_record(state, pooled_refusal_usage(style, actor, origin));
+    }
+    verdict
 }
 
 /// 台账写入异步化：流结束的调用方不该等一次 PG insert。
@@ -3559,7 +3624,9 @@ async fn stream_forward(
 
     // 池级熔断：同协议面没有一个上游当下能承接请求时，遍历重试只烧请求。
     // 直接 503 + Retry-After 让调用方立刻知道何时可再来。
-    if let Some((retry_after, quota_window)) = state.pool_circuit_break(&candidates) {
+    if let Some((retry_after, quota_window)) =
+        pooled_refusal(&state, &candidates, style, &actor, &origin)
+    {
         tracing::warn!(
             // 拒绝面必须自称：503 是熔断期"一个上游都没试"的结果，与"试遍了
             // 都不行"在状态码、在响应体上都同形（两者都可能是 503），唯一分得开
@@ -4143,8 +4210,21 @@ async fn call_llm(
     }
     // 与透传路径同一套热切换语义：健康优先，任何单上游失败（含鉴权类——
     // 池内各家凭证互相独立，A 家 key 坏不代表 B 家坏）都切下一个。
+    // This endpoint is the gateway's own intent classifier, not a proxied
+    // business call, so its actor dimension is fixed rather than headered, and
+    // it is reached from the interactive UI rather than from a pool or sandbox,
+    // so its environment is fixed too. Declared before the pool check because a
+    // refusal is attributed on the same two axes as a call.
+    let actor = "intent_gateway";
+    let origin = LlmOrigin::Interactive.as_str();
     let next_candidates: Vec<&LlmUpstream> = state.config.llm_upstreams.iter().collect();
-    if let Some((retry_after, quota_window)) = state.pool_circuit_break(&next_candidates) {
+    if let Some((retry_after, quota_window)) = pooled_refusal(
+        state,
+        &next_candidates,
+        POOLED_REFUSAL_UNNAMED,
+        actor,
+        origin,
+    ) {
         tracing::warn!(
             // 拒绝面必须自称：503 是熔断期"一个上游都没试"的结果，与"试遍了
             // 都不行"在状态码、在响应体上都同形（两者都可能是 503），唯一分得开
@@ -4168,12 +4248,6 @@ async fn call_llm(
     }
     let candidates = order_by_health(next_candidates, &state.llm_health);
     let mut last_err = String::new();
-    // This endpoint is the gateway's own intent classifier, not a proxied
-    // business call, so its actor dimension is fixed rather than headered, and
-    // it is reached from the interactive UI rather than from a pool or sandbox,
-    // so its environment is fixed too.
-    let actor = "intent_gateway";
-    let origin = LlmOrigin::Interactive.as_str();
     for upstream in candidates {
         let start = std::time::Instant::now();
         match call_one_upstream(state, upstream, &messages, actor, origin).await {
@@ -7238,6 +7312,48 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         // 任一上游恢复即解除熔断，真实请求立刻有机会试它。
         state.llm_health.note_success(&c);
         assert_eq!(state.pool_circuit_break(&all), None, "有上游可用即放行");
+    }
+
+    /// 池级熔断拒绝必须在台账上留下一行，且这一行不能读成一次上游失败。
+    ///
+    /// 两半缺一不可。少了这一行，池全灭的窗口在台账里与「没有流量」同形——这正是
+    /// 熔断路径与失败尝试路径的差别：失败尝试走 `record_llm_call` 落行，而熔断在选
+    /// 上游之前就返回，一个上游都没试，落不到那里。少了第二个断言，这一行会被
+    /// `result = 'error'` 的读者认成「上游答了错」，而两者要修的方向正相反：一个是
+    /// 修上游，一个是等窗口。
+    #[tokio::test]
+    async fn a_pooled_refusal_is_one_ledger_row_and_is_not_an_upstream_error() {
+        let row = pooled_refusal_usage("openai", "agent:planner", "resident_worker");
+        assert_eq!(row.result, REFUSED_BY_CIRCUIT);
+        assert_ne!(row.result, "ok", "记成 ok 就不进 failed_calls");
+        assert_ne!(
+            row.result, "error",
+            "记成 error 会让读者去修上游，而要修的是池的窗口"
+        );
+        assert_eq!(
+            (row.tokens_input, row.tokens_output, row.tokens_cached),
+            (0, 0, 0),
+            "一个上游都没发出去，用量只能是零——不是「没量到」，是没发生"
+        );
+        assert_eq!(
+            (row.upstream.as_str(), row.model.as_str()),
+            (POOLED_REFUSAL_UNNAMED, POOLED_REFUSAL_UNNAMED),
+            "拒绝是整个面的判定，挂到某个候选名下会读成「那个上游拒了」"
+        );
+        // 两个归属轴与真调用同源；否则这一行在按 actor/origin 分组的读数里掉队。
+        assert_eq!(row.actor, "agent:planner");
+        assert_eq!(row.origin, "resident_worker");
+        assert_eq!(row.api_style, "openai");
+
+        // 落账绑在判定上，但不许改判定本身：全灭时仍返回 Some 与那两个数。
+        let far = Utc::now().timestamp() + 3_600;
+        let state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        let a = stub_upstream("https://a.example.com", "m1");
+        state.llm_health.note_failure(&a, 300, Some(far), None);
+        let all: Vec<&LlmUpstream> = state.config.llm_upstreams.iter().collect();
+        let verdict = pooled_refusal(&state, &all, "openai", "intent_gateway", "interactive");
+        let (wait, _) = verdict.expect("全灭时判定仍为真：落账不许改判定");
+        assert!(wait >= 60, "重试窗下界照旧，落账没有把它挪走");
     }
 
     /// 池告警的身份必须带事件，否则两次池全灭被去重成一行、灭过几次不可数。
