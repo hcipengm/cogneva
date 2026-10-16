@@ -59,11 +59,13 @@ const CRATE_SRC: &str = "crates/cog-reflection/src";
 const SERVICE_ACCOUNT: &str = "cogneva-evolution";
 
 /// Sources whose cluster commands run under that ServiceAccount. The rollout
-/// Job (dispatched from `mainline_deployer.rs`), the change Job (dispatched
-/// from `change_execution.rs`) and the in-Job rollout the change path runs
+/// Job (dispatched from `mainline_deployer.rs`, running the code in
+/// `mainline_rollout.rs`), the change Job (dispatched from
+/// `change_execution.rs`) and the in-Job rollout the change path runs
 /// (`image_rollout.rs`) all name it; the deployer pod itself is the first file.
 const SCANNED: &[&str] = &[
     "crates/cog-reflection/src/mainline_deployer.rs",
+    "crates/cog-reflection/src/mainline_rollout.rs",
     "crates/cog-reflection/src/change_execution.rs",
     "crates/cog-reflection/src/image_rollout.rs",
 ];
@@ -89,6 +91,21 @@ fn repo_root() -> PathBuf {
 fn read(relative: &str) -> String {
     let path = repo_root().join(relative);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()))
+}
+
+/// One file the `SCANNED` list names, read by path.
+///
+/// Not by position: the list is the set of sources that speak under this
+/// ServiceAccount, and adding a member is a statement about that set. A test
+/// that indexed into it would silently start reading whichever file the new
+/// member pushed aside -- which is exactly what a judgement about *this* source
+/// must not do.
+fn scanned(relative: &str) -> String {
+    assert!(
+        SCANNED.contains(&relative),
+        "{relative} is not in SCANNED, so nothing here judges it"
+    );
+    read(relative)
 }
 
 /// Everything up to the first test-only item: a fixture that writes an argv is
@@ -898,7 +915,7 @@ fn every_file_that_talks_to_the_cluster_is_named() {
 /// pod runs under that same one.
 #[test]
 fn the_job_specs_and_the_role_name_the_same_principal() {
-    let deployer = read(SCANNED[0]);
+    let deployer = scanned("crates/cog-reflection/src/mainline_deployer.rs");
     // The identity lives in one constant so the preflight's error message and the
     // Job's `serviceAccountName` cannot drift apart. Read that constant out and
     // compare it to the ServiceAccount the Role binds, then check the Job takes
@@ -916,7 +933,7 @@ fn the_job_specs_and_the_role_name_the_same_principal() {
         deployer.contains("\"serviceAccountName\": EVOLUTION_SERVICE_ACCOUNT"),
         "滚动 Job 的 serviceAccountName 不再取自那个常量：授权面绑的就不是它了"
     );
-    let change = read(SCANNED[1]);
+    let change = scanned("crates/cog-reflection/src/change_execution.rs");
     assert!(
         change.contains("serviceAccountName") && change.contains("facts.service_account"),
         "变更 Job 不再从父 Pod 继承 SA：它跑在哪个身份上没人知道"

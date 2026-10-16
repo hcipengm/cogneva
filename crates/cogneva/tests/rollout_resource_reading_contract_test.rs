@@ -15,6 +15,7 @@
 use std::path::PathBuf;
 
 const DEPLOYER: &str = "crates/cog-reflection/src/mainline_deployer.rs";
+const ROLLOUT: &str = "crates/cog-reflection/src/mainline_rollout.rs";
 const READING: &str = "crates/cog-reflection/src/rollout_resources.rs";
 
 fn repo_root() -> PathBuf {
@@ -45,7 +46,7 @@ fn occurrences(haystack: &str, needle: &str) -> usize {
 /// 最典型的一轮（跑通、但一直被 CPU 限流）恰好什么都不留，而它正是这条读数存在的理由。
 #[test]
 fn the_judgement_leaves_its_reading_on_the_way_out_of_both_outcomes() {
-    let source = read(DEPLOYER);
+    let source = read(ROLLOUT);
     let production = production_source(&source);
     assert_eq!(
         occurrences(production, "report_termination_message("),
@@ -88,7 +89,7 @@ fn the_deployer_reads_the_reading_wherever_the_run_ends() {
 /// `lines().next()`——两行一旦调换，落点读回端见到的就是一段陌生文本。
 #[test]
 fn the_locus_is_written_before_the_reading() {
-    let production = production_source(&read(DEPLOYER)).to_string();
+    let production = production_source(&read(ROLLOUT)).to_string();
     let Some(body) = production.split("fn write_termination_message(").nth(1) else {
         panic!("终止消息的写入器不在了")
     };

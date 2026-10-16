@@ -65,6 +65,7 @@ pub mod governance_drift;
 pub mod image_rollout;
 pub mod learning_recurrence_readings;
 pub mod mainline_deployer;
+pub mod mainline_rollout;
 pub mod matcher;
 pub mod meta_learning;
 pub mod observability_stack;
@@ -127,11 +128,11 @@ pub use gitops_puller::{
 };
 pub use image_rollout::ImageRollout;
 pub use mainline_deployer::{
-    api_resource_of, classify_doc, run_mainline_loop, run_rollout_cli, workload_kind,
-    workload_kind_of_resource, DocFate, FailureClass, MainlineDeployer, RolloutExecutor,
-    RolloutFailure, RolloutPlan, RolloutTarget, WorkloadKind, DELIVERABLE_MANIFEST_TREES,
-    WORKLOAD_KINDS,
+    api_resource_of, classify_doc, run_mainline_loop, workload_kind, workload_kind_of_resource,
+    DocFate, FailureClass, MainlineDeployer, RolloutTarget, WorkloadKind,
+    DELIVERABLE_MANIFEST_TREES, WORKLOAD_KINDS,
 };
+pub use mainline_rollout::{run_rollout_cli, RolloutExecutor, RolloutFailure, RolloutPlan};
 pub use matcher::{DefaultLearningMatcher, LearningMatcher};
 pub use meta_learning::{DecisionStatsSnapshot, MetaLearningEngine};
 pub use observability_stack::{StackConvergence, STACK_NOT_CONVERGED_RULE};

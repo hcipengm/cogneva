@@ -41,6 +41,7 @@
 # file fell below it — or left the tree — has to go.
 
 crates/cog-reflection/src/mainline_deployer.rs	multi-axis	run_mainline_loop;mainline-rollout
+crates/cog-reflection/src/mainline_rollout.rs	single-axis	RolloutExecutor
 crates/cog-gateway/src/security_gateway.rs	single-axis	run
 crates/cog-reflection/src/change_pipeline.rs	single-axis	ChangePipeline
 crates/cog-reflection/src/plugin.rs	single-axis	ReflectionPlugin

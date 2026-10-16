@@ -10,7 +10,7 @@
 //! 读不到时返回 `None`：那说明这个节点上没有一个能自读的 cgroup，是"没得读"，不是"读到了
 //! 零"——两者的区别正是本模块存在的理由。
 //!
-//! 读数写在容器的终止消息里（见 `mainline_deployer::report_termination_message`）：这个
+//! 读数写在容器的终止消息里（见 `mainline_rollout::report_termination_message`）：这个
 //! Job 上没有任何回调面可用——没有 DB、没有 metrics 后端，RBAC 也只给了 pods 的
 //! get/list/watch，没有 exec/log 通道。终止消息是 k8s 给"这个容器为什么结束"留的窄通道，
 //! 部署器本来就按结构化字段读它，第二行正好装得下。
