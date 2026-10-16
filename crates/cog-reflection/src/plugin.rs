@@ -10,6 +10,8 @@ pub const MICROVM_EVOLUTION_LOOP: &str = "reflection_microvm_evolution";
 pub const CHANGE_VERIFICATION_LOOP: &str = "reflection_change_verification";
 /// Loop name reported through the background-loop liveness family.
 pub const LEARNING_REVIEW_LOOP: &str = "reflection_learning_review";
+/// Loop name reported through the background-loop liveness family.
+pub const SKILL_EFFECTIVENESS_LOOP: &str = "reflection_skill_effectiveness";
 
 /// 延迟持有的 LLM 上游池暂停句柄。`SchedulerGate` 由 supervisor 插件在
 /// init 阶段发布，而 reflection 的 init 早于 supervisor（supervisor 可选依赖
@@ -1714,6 +1716,28 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             state_path,
             shutdown,
         ));
+
+        // 技能面那条反馈环的驱动。记录与动作是两半，此前只有前一半有属主：
+        // `process_skill_outcome` 之外，唯一会动注册表的
+        // `apply_effectiveness_actions` 全仓没有一个调用者——退化被记下来了，
+        // 却推不动任何东西，而这件事在读数上不可见（记了就是记了）。注册表由
+        // 另一个插件的 init 发布，只有在全部 init 跑完之后才可靠可见，所以接线
+        // 点在这里而不是 init。
+        let skill_registry = ctx.consume::<tokio::sync::RwLock<cog_core::SkillRegistry>>();
+        match ctx.consume::<crate::ReflectionEngine>() {
+            Some(engine) => {
+                let llm: Option<Arc<dyn cog_core::LlmClient>> =
+                    ctx.consume_service::<dyn cog_core::LlmClient>();
+                let period =
+                    std::time::Duration::from_secs(ctx.config().self_evolution.poll_interval_secs);
+                info!(
+                    period_secs = period.as_secs(),
+                    "skill effectiveness loop enabled"
+                );
+                spawn_skill_effectiveness_loop(engine, skill_registry, llm, period);
+            }
+            None => info!("no reflection engine published; skill effectiveness actions disabled"),
+        }
         Ok(())
     }
 
@@ -1732,6 +1756,47 @@ fn current_version(ctx: &cog_core::PluginContext) -> String {
         .unwrap_or_else(|| ctx.config().app.version.clone())
         .trim_start_matches('v')
         .to_string()
+}
+
+/// 挂上把「记下来的技能有效性」变成「注册表里的动作」的那条循环。
+///
+/// 记录与动作此前只有前一半有属主：结局进了追踪器，而唯一会用它们的
+/// `apply_effectiveness_actions` 全仓没有一个调用者，于是一个有效性已经退化的技能
+/// 照旧被选中。注册表在缺失时不建这条循环——没有技能面就没有任何东西可动，
+/// 说一次比开一条空转的循环好。
+fn spawn_skill_effectiveness_loop(
+    engine: Arc<crate::ReflectionEngine>,
+    registry: Option<Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>>,
+    llm: Option<Arc<dyn cog_core::LlmClient>>,
+    period: std::time::Duration,
+) {
+    let Some(registry) = registry else {
+        info!("no shared skill registry published; skill effectiveness actions disabled");
+        return;
+    };
+    drop(cog_core::loop_health::spawn_unstoppable(
+        SKILL_EFFECTIVENESS_LOOP,
+        cog_core::loop_health::Cadence::Periodic(period),
+        // 每轮重建，所以循环体要用到的都先克隆出来。
+        move |beat| {
+            let engine = engine.clone();
+            let registry = registry.clone();
+            let llm = llm.clone();
+            async move {
+                let mut interval = tokio::time::interval(period);
+                loop {
+                    beat.beat();
+                    interval.tick().await;
+                    if let Err(e) = engine
+                        .apply_effectiveness_actions(registry.clone(), llm.clone())
+                        .await
+                    {
+                        warn!(error = %e, "applying skill effectiveness actions failed");
+                    }
+                }
+            }
+        },
+    ));
 }
 
 /// 移植工作分支 `evol/<id>` 的实例 id 解析：显式 env 覆盖最优先，其次

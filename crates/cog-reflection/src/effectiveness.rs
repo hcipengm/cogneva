@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::types::{EffectivenessAction, SkillEffectivenessRecord};
 use crate::LearningRecorder;
@@ -101,12 +101,28 @@ impl SkillEffectivenessTracker {
     }
 
     /// Apply the recommended action to a [`cog_core::SkillRegistry`].
+    ///
+    /// An id the registry does not hold is not acted on. The tracker records
+    /// whatever it is told, and the engine reports two outcomes of its own
+    /// under names that are not skills (`squad_execution`,
+    /// `change_deployment`); an action aimed at one of those leaves selection
+    /// untouched — the registry has no such entry — while still writing a
+    /// learning that names a skill nobody can look up. Being tracked is not
+    /// evidence of being registered, so the registry is asked before acting.
     pub async fn apply_action(
         &self,
         skill_id: &str,
         registry: Arc<RwLock<cog_core::SkillRegistry>>,
         llm: Option<Arc<dyn cog_core::LlmClient>>,
     ) -> SFResult<()> {
+        let registered = registry.read().await.get_skill(skill_id).is_some();
+        if !registered {
+            debug!(
+                skill_id,
+                "tracked id is not a registered skill; nothing to act on"
+            );
+            return Ok(());
+        }
         let action = self.recommend_action(skill_id).await;
         match action {
             EffectivenessAction::Strengthen => {
@@ -204,5 +220,92 @@ impl SkillEffectivenessTracker {
             self.recorder.record_learning(learning).await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outcome(skill_id: &str) -> SkillOutcome {
+        SkillOutcome {
+            skill_id: skill_id.to_string(),
+            task_signature: "role".to_string(),
+            success: true,
+            score: Some(1.0),
+            latency_ms: 1,
+            token_cost: 1,
+            observed_at: chrono::Utc::now(),
+        }
+    }
+
+    fn registry_holding(skill_id: &str) -> cog_core::SkillRegistry {
+        let mut registry = cog_core::SkillRegistry::new();
+        registry.insert_skill_config(cog_core::SkillConfig {
+            skill_id: skill_id.to_string(),
+            name: skill_id.to_string(),
+            system_prompt: String::new(),
+            tools: Vec::new(),
+            max_iterations: 1,
+            role_type: "role".to_string(),
+        });
+        registry
+    }
+
+    /// 名单上的 id 不等于注册表认识的技能。
+    ///
+    /// 引擎自己拿 `squad_execution` / `change_deployment` 两个**不是技能**的名字报
+    /// 成绩（squad 那条与变更那条各一处），追踪器照单全收——名单从第一拍起就带着
+    /// 它们，`tracked_skill_ids` 不看注册表。所以「有动作可做」不能只问名单，要问
+    /// 注册表：否则动的是一个不存在的条目（选择照旧），却写出一条指名不存在技能的
+    /// 学习。这条判据**两个方向都量**：真技能必须照常被动到，否则这个门就成了
+    /// 「一律不动作」，而那种形状一样能让前半段断言通过。
+    #[tokio::test]
+    async fn an_action_is_never_taken_against_an_id_the_registry_does_not_hold() {
+        let recorder = Arc::new(crate::InMemoryRecorder::new());
+        let tracker = SkillEffectivenessTracker::new(recorder.clone());
+        for _ in 0..10 {
+            tracker.record_outcome(outcome("ghost")).await.unwrap();
+            tracker.record_outcome(outcome("real")).await.unwrap();
+        }
+        let registry = Arc::new(RwLock::new(registry_holding("real")));
+
+        tracker
+            .apply_action("ghost", registry.clone(), None)
+            .await
+            .unwrap();
+        tracker
+            .apply_action("real", registry.clone(), None)
+            .await
+            .unwrap();
+
+        let guard = registry.read().await;
+        assert_eq!(
+            guard.get_priority("ghost"),
+            0,
+            "注册表里没有的 id 不该被动到"
+        );
+        assert_eq!(
+            guard.get_priority("real"),
+            1,
+            "注册表里的技能要照常被动到——头一条断言不该靠「一律不动作」通过"
+        );
+        drop(guard);
+
+        let summaries: Vec<String> = recorder
+            .list_learnings(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|l| l.summary)
+            .collect();
+        assert!(
+            !summaries.contains(&"Skill ghost effectiveness high".to_string()),
+            "不该落下指名不存在技能的学习：{summaries:?}"
+        );
+        assert!(
+            summaries.contains(&"Skill real effectiveness high".to_string()),
+            "真技能那条动作学习应当照旧落下：{summaries:?}"
+        );
     }
 }

@@ -96,6 +96,19 @@ pub enum RunOutcome {
     BudgetExhausted,
 }
 
+impl RunOutcome {
+    /// Whether this ending handed an answer back.
+    ///
+    /// Two readers judge the same endings the same way — the per-role success
+    /// counter and whatever scores the skill the role was bound to — so the
+    /// rule sits here rather than being restated at each of them. A run cut off
+    /// at the ceiling that still answered counts, because it did hand something
+    /// back; one that spent the budget without an answer does not.
+    pub fn delivered(self) -> bool {
+        matches!(self, Self::Delivered | Self::DeliveredAfterExhaustion)
+    }
+}
+
 impl AgentObservable {
     pub fn new() -> Self {
         Self::default()
@@ -117,10 +130,7 @@ impl AgentObservable {
         tool_calls: usize,
     ) {
         self.run_count.fetch_add(1, Ordering::Relaxed);
-        if matches!(
-            outcome,
-            RunOutcome::Delivered | RunOutcome::DeliveredAfterExhaustion
-        ) {
+        if outcome.delivered() {
             self.success_count.fetch_add(1, Ordering::Relaxed);
         }
         self.total_steps.fetch_add(steps as u64, Ordering::Relaxed);

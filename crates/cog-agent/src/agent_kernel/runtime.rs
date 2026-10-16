@@ -231,6 +231,12 @@ pub struct AgentRuntime {
     run_usage: RunUsage,
     /// Turns the run in flight has actually started.
     run_iterations: u32,
+    /// How the run in flight ended. Reset by every [`Self::run_scoped`] and set
+    /// by [`Self::note_run_ending`], so the run's single exit can report the
+    /// skill the role was bound to with the same verdict the observable counted
+    /// — the ending is decided at three different places, and only the exit is
+    /// common to all of them.
+    run_outcome: Option<crate::observable::RunOutcome>,
 }
 
 /// The token census of one run: every billed LLM call the run made, folded into
@@ -424,6 +430,7 @@ impl AgentRuntime {
             tool_output_archive: None,
             run_usage: RunUsage::default(),
             run_iterations: 0,
+            run_outcome: None,
         }
     }
 
@@ -811,10 +818,76 @@ impl AgentRuntime {
         // those are the runs a token investigation is about.
         self.run_usage = RunUsage::default();
         self.run_iterations = 0;
+        self.run_outcome = None;
         let started = std::time::Instant::now();
         let outcome = self.run_turns(input, llm, run_task_id).await;
         self.report_run_census(run_task_id, started.elapsed()).await;
+        self.report_skill_outcome(started.elapsed()).await;
         outcome
+    }
+
+    /// Record this run's ending where both of its readers look for it.
+    ///
+    /// The per-role observable counts the ending on the spot, at each of the
+    /// three places a run can stop; the skill report reads it from the exit,
+    /// which is the only place common to all three. Writing both here keeps the
+    /// two from disagreeing about what this run did.
+    fn note_run_ending(&mut self, outcome: crate::observable::RunOutcome, iterations: u32) {
+        let steps = self.steps.len();
+        let tool_calls = self.steps.iter().map(|s| s.tool_calls.len()).sum();
+        crate::observable::global_observable().record_run(
+            &self.config.role,
+            outcome,
+            iterations,
+            steps,
+            tool_calls,
+        );
+        self.run_outcome = Some(outcome);
+    }
+
+    /// Report this run's ending against the skill its role was bound to.
+    ///
+    /// The effectiveness tracker aggregates per skill, and nothing ever fed it
+    /// one: the only outcomes recorded before this came from the squad and the
+    /// change pipeline, which name themselves (`squad_execution`,
+    /// `change_deployment`) — ids no skill registry holds. The binding and the
+    /// ending are both only here: the role's skill arrives in the config, and
+    /// the run's exit is the one place every ending reaches.
+    ///
+    /// A run that returned an error reports nothing. An upstream failure is no
+    /// evidence about the skill, and the ending has no error case, so scoring
+    /// it as a failure would charge the skill for someone else's outage.
+    ///
+    /// Best-effort: nothing about an unrecorded outcome may fail a run that
+    /// already delivered.
+    async fn report_skill_outcome(&self, elapsed: std::time::Duration) {
+        let (Some(skill), Some(reflection), Some(ending)) = (
+            self.config.skill_config.as_ref(),
+            self.reflection_engine.as_ref(),
+            self.run_outcome,
+        ) else {
+            return;
+        };
+        let delivered = ending.delivered();
+        let outcome = cog_core::SkillOutcome {
+            skill_id: skill.skill_id.clone(),
+            task_signature: self.config.role.clone(),
+            success: delivered,
+            // The run carries no quality verdict of its own, so the score
+            // encodes the ending — 1.0/0.0, the same thing every other caller
+            // that has only the ending writes.
+            score: Some(if delivered { 1.0 } else { 0.0 }),
+            latency_ms: elapsed.as_millis() as u64,
+            token_cost: self.run_usage.total_tokens,
+            observed_at: chrono::Utc::now(),
+        };
+        if let Err(e) = reflection.process_skill_outcome(outcome).await {
+            tracing::warn!(
+                skill_id = %skill.skill_id,
+                error = %e,
+                "this run's skill outcome was not recorded"
+            );
+        }
     }
 
     /// Write this run's token census where the per-task readers look for it.
@@ -1168,14 +1241,9 @@ impl AgentRuntime {
                 })
                 .await?;
 
-                let steps = self.steps.len();
-                let tool_calls = self.steps.iter().map(|s| s.tool_calls.len()).sum();
-                crate::observable::global_observable().record_run(
-                    &self.config.role,
+                self.note_run_ending(
                     crate::observable::RunOutcome::BudgetExhausted,
                     iteration + 1,
-                    steps,
-                    tool_calls,
                 );
 
                 return Ok(result);
@@ -1349,14 +1417,9 @@ impl AgentRuntime {
         }
 
         // Record observable metrics for this run
-        let steps = self.steps.len();
-        let tool_calls = self.steps.iter().map(|s| s.tool_calls.len()).sum();
-        crate::observable::global_observable().record_run(
-            &self.config.role,
+        self.note_run_ending(
             crate::observable::RunOutcome::BudgetExhausted,
             self.config.max_iterations,
-            steps,
-            tool_calls,
         );
 
         Ok(result)
@@ -1426,15 +1489,7 @@ impl AgentRuntime {
         })
         .await?;
 
-        let steps = self.steps.len();
-        let tool_calls = self.steps.iter().map(|s| s.tool_calls.len()).sum();
-        crate::observable::global_observable().record_run(
-            &self.config.role,
-            outcome,
-            iterations,
-            steps,
-            tool_calls,
-        );
+        self.note_run_ending(outcome, iterations);
 
         Ok(result)
     }
@@ -3622,5 +3677,117 @@ mod tests {
             archive.unkeyed.lock().unwrap().is_empty(),
             "有 task id 的运行不该走无键那条结局"
         );
+    }
+
+    /// 只收下 `SkillOutcome` 的反射引擎替身。这条判据问的是「谁报、报了什么」，
+    /// 其余七条方法都不在它要证的范围内，一律空实现。
+    #[derive(Debug, Default)]
+    struct SkillOutcomeRecorder {
+        seen: std::sync::Mutex<Vec<cog_core::SkillOutcome>>,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::ReflectionEngine for SkillOutcomeRecorder {
+        async fn process_skill_outcome(
+            &self,
+            outcome: cog_core::SkillOutcome,
+        ) -> cog_core::SFResult<()> {
+            self.seen.lock().unwrap().push(outcome);
+            Ok(())
+        }
+
+        async fn process_tool_result(
+            &self,
+            _tool_name: &str,
+            _result: &serde_json::Value,
+            _is_error: bool,
+        ) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn process_context(&self, _messages: &[Message]) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn process_event(&self, _event: &AgentEvent) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn extract_and_insert(
+            &self,
+            _pattern: &cog_core::Pattern,
+        ) -> cog_core::SFResult<Option<String>> {
+            Ok(None)
+        }
+
+        fn start_reviewer(&self) -> Option<tokio::task::JoinHandle<()>> {
+            None
+        }
+
+        async fn record_squad_result(
+            &self,
+            _task_id: &str,
+            _goal: &str,
+            _success: bool,
+            _pge_mode: &str,
+            _score: Option<f32>,
+            _latency_ms: u64,
+        ) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn record_change_outcome(
+            &self,
+            _change_id: &str,
+            _success: bool,
+            _test_output: &str,
+        ) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+    }
+
+    /// 这一趟跑的是哪个技能、成没成，要报到有效性追踪器上。
+    ///
+    /// 接上之前，报进追踪器的只有 squad 与变更流水那两条自报家门的结果
+    /// （`squad_execution` / `change_deployment`）——注册表里没有这两个名字
+    /// （技能名来自 skills 目录加载的那份），于是由它们推出来的动作改不动任何
+    /// 注册表，还会写下关于不存在技能的学习。角色绑定的那个技能与这一趟的结局
+    /// 只在这里拿得到，所以判据落在这里：跑一趟，报上来的技能名与结局就是这一趟的。
+    #[tokio::test]
+    async fn a_run_reports_its_ending_against_the_skill_its_role_was_bound_to() {
+        let llm = RecordingLlm::default();
+        let reflection = Arc::new(SkillOutcomeRecorder::default());
+        let skill = SkillConfig {
+            skill_id: "skill-outcome-skill".into(),
+            name: "Skill Outcome Test".into(),
+            system_prompt: String::new(),
+            tools: Vec::new(),
+            max_iterations: 1,
+            role_type: "skill-outcome-role".into(),
+        };
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let config = RuntimeConfig {
+            role: "skill-outcome-role".into(),
+            skill_config: Some(skill),
+            max_iterations: 1,
+            think_stall_timeout_secs: 5,
+            final_draft_timeout_secs: 300,
+            ..Default::default()
+        };
+        let mut runtime = AgentRuntime::new(config, tx).with_reflection_engine(reflection.clone());
+
+        runtime
+            .run(contract_input(1, "Emit JSON only"), &llm)
+            .await
+            .expect("the run delivers");
+
+        let seen = reflection.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "一趟运行报一条结局，不重不漏");
+        assert_eq!(
+            seen[0].skill_id, "skill-outcome-skill",
+            "报的必须是角色真正绑上的那个技能名"
+        );
+        assert!(seen[0].success, "交付了就是成功");
     }
 }
