@@ -454,6 +454,15 @@ impl cog_core::SystemPlugin for GitHubPlugin {
         ) {
             channel.attach_metrics(metrics);
         }
+        // 落地提交红了以后，它失败的那些文件自己申报的原则就是被违反的原则。这一条
+        // 也在这里取而不是 init 时，理由同上：原则账由 storage 的层发布，取不到就只
+        // 留日志，落地行为一个字不变。
+        if let (Some(channel), Some(ledger)) = (
+            self.channel.as_ref(),
+            ctx.consume_service::<dyn cog_core::PrincipleLedgerStore>(),
+        ) {
+            channel.attach_principle_ledger(ledger);
+        }
 
         let (tx, rx) = tokio::sync::watch::channel(false);
         let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();

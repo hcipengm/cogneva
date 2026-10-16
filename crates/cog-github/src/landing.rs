@@ -491,6 +491,12 @@ pub struct MainChannel {
     /// this plugin and the channel is built during `init`; none until then, in
     /// which case a failure stays a log line.
     metrics: OnceLock<Arc<dyn cog_core::MetricsBackend>>,
+    /// Where a red revision's violations of the principles its failing files
+    /// declare are queued. Set once, from `start`, for the same reason the
+    /// backend above is: the storage plugin that publishes the account inits in
+    /// a later layer than this one, in which case a red landing stays a log
+    /// line and the landing itself is unchanged.
+    principle_ledger: OnceLock<Arc<dyn cog_core::PrincipleLedgerStore>>,
     /// Whether this process has already published the fate counter's empty
     /// classes. The seed has to happen once per process and not once per tick:
     /// recording a zero still appends a sample row, and the fate domain is 18
@@ -546,6 +552,7 @@ impl MainChannel {
             controller,
             gate: tokio::sync::Mutex::new(()),
             metrics: OnceLock::new(),
+            principle_ledger: OnceLock::new(),
             fate_domain_seeded: std::sync::atomic::AtomicBool::new(false),
             census_written: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
@@ -570,6 +577,21 @@ impl MainChannel {
     /// layer above has to tolerate the window rather than panic in it.
     pub(crate) fn metrics_handle(&self) -> Option<Arc<dyn cog_core::MetricsBackend>> {
         self.metrics.get().cloned()
+    }
+
+    /// Queue a red revision's principle violations into `ledger`. Called once,
+    /// from the plugin's `start`, for the same reason and in the same window as
+    /// the metrics backend above: none until then, and a landing never waits on
+    /// it.
+    pub fn attach_principle_ledger(&self, ledger: Arc<dyn cog_core::PrincipleLedgerStore>) {
+        let _ = self.principle_ledger.set(ledger);
+    }
+
+    /// The principle account, once `start` has attached it.
+    pub(crate) fn principle_ledger_handle(
+        &self,
+    ) -> Option<Arc<dyn cog_core::PrincipleLedgerStore>> {
+        self.principle_ledger.get().cloned()
     }
 
     /// The base branch this channel commits to.
@@ -1676,6 +1698,25 @@ pub async fn watch_landed(
                             tracing::warn!(error = %e, "recording a red landing failed");
                         }
                     }
+                    // A red revision is also a violation of whatever the files
+                    // it failed in declare they enforce. Queued where a refusing
+                    // host gate queues, so the account's one intake reads it
+                    // with no second path, and stamped with the revision's own
+                    // instant so that a retried pass and the run's other jobs
+                    // land on the row this one made rather than on rows of
+                    // their own. Waited for rather than spawned: it is one read
+                    // per failing file, and a landing that raced it would report
+                    // a failure whose refusals arrive after the revert that
+                    // answered it.
+                    if let Some(ledger) = channel.principle_ledger_handle() {
+                        crate::ci_refusals::report(
+                            &channel.workdir,
+                            ledger.as_ref(),
+                            &record.landed_rev,
+                            &log,
+                        )
+                        .await;
+                    }
                     record.failure_recorded = true;
                     record.updated_at = Utc::now();
                     if let Err(e) = save_record(&record).await {
@@ -2218,7 +2259,7 @@ fn select_remote_url_for(
     }
 }
 
-async fn run_git(dir: &Path, args: &[&str]) -> Result<String> {
+pub(crate) async fn run_git(dir: &Path, args: &[&str]) -> Result<String> {
     let (ok, stdout, stderr) = run_git_status(dir, args).await?;
     if !ok {
         return Err(CogGitHubError::Provider(format!(

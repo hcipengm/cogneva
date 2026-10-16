@@ -48,13 +48,11 @@ pub const HOST_JUDGEMENT_STALE_PREFIX: &str = "stale:";
 /// The shape of a platform-side declaration, as a line of the platform's own
 /// source.
 ///
-/// The prefix alone: the slug is parsed out of it here rather than by narrowing
-/// the search, so that a declaration whose slug cannot be read is *found* and
-/// reported instead of being filtered out of the reading. A grep that only
-/// matched well-formed lines would answer "no declaration" for a file that
-/// declares something it spells badly, which is the one fault this reading most
-/// needs to be able to see.
-pub const PLATFORM_DECLARATION_PREFIX: &str = "//! principle:";
+/// Re-exported from the contract because a second reader reads the same shape
+/// from the other direction -- a run that failed, rather than the registry of
+/// what enforces what -- and one value keeps the two from drifting apart. Every
+/// reference below this line is to that one definition.
+pub use cog_core::PLATFORM_DECLARATION_PREFIX;
 
 /// The expression the platform's registry is read with: the prefix at the start
 /// of a line, which is where a module header sits and where prose about the

@@ -14,6 +14,7 @@
 #![deny(missing_docs)]
 
 pub mod change_funnel;
+pub mod ci_refusals;
 pub mod config;
 pub mod contribution;
 pub mod conversation;

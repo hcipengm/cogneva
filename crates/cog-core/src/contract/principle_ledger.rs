@@ -297,6 +297,24 @@ pub struct PrincipleRefusal {
     pub count: i64,
 }
 
+/// The shape of a platform-side declaration, as a line of the platform's own
+/// source.
+///
+/// The prefix alone: the slug is parsed out of it rather than by narrowing the
+/// search, so that a declaration whose slug cannot be read is *found* and
+/// reported instead of being filtered out of a reading. Reading with a pattern
+/// that only matched well-formed lines would answer "no declaration" for a file
+/// that declares something it spells badly, which is the one fault this shape
+/// most needs to be able to show.
+///
+/// It sits beside the refusal it feeds rather than in the crate that first read
+/// it, because a second reader reads it from the other direction: one side takes
+/// a file's text as the registry of what that file enforces, the other takes a
+/// run that failed as evidence that a file's gate is red. Both have to agree on
+/// the shape by being the same value rather than by two hand-written spellings
+/// of it that happen to match.
+pub const PLATFORM_DECLARATION_PREFIX: &str = "//! principle:";
+
 /// A principle whose carrier is no longer the text the account measured against.
 ///
 /// Named by slug with both hashes, because a bare count of drifted principles
