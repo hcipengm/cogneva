@@ -457,11 +457,23 @@ impl cog_core::SystemPlugin for GitHubPlugin {
         // 落地提交红了以后，它失败的那些文件自己申报的原则就是被违反的原则。这一条
         // 也在这里取而不是 init 时，理由同上：原则账由 storage 的层发布，取不到就只
         // 留日志，落地行为一个字不变。
-        if let (Some(channel), Some(ledger)) = (
-            self.channel.as_ref(),
-            ctx.consume_service::<dyn cog_core::PrincipleLedgerStore>(),
-        ) {
-            channel.attach_principle_ledger(ledger);
+        if let Some(channel) = self.channel.as_ref() {
+            match ctx.consume_service::<dyn cog_core::PrincipleLedgerStore>() {
+                Some(ledger) => {
+                    channel.attach_principle_ledger(ledger);
+                    tracing::info!(
+                        "a red landing's failing files will have their declared principles \
+                         queued as refusals"
+                    );
+                }
+                // Said out loud rather than passed over: without the ledger a red landing
+                // queues nothing at all, and a queue that is never fed reads exactly like
+                // a tree whose failures declare no principle.
+                None => tracing::warn!(
+                    "the principle ledger was not published before this plugin started; a \
+                     red landing's refused principles will not be queued"
+                ),
+            }
         }
 
         let (tx, rx) = tokio::sync::watch::channel(false);
