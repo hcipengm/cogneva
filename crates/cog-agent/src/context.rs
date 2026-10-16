@@ -421,8 +421,8 @@ mod tests {
         let observed = tracing::subscriber::with_default(subscriber, || {
             // 地板本身就超预算：两条消息，循环的 `len() > 2` 立刻为假。
             let mut ctx = ContextWindow::new(10);
-            ctx.add_message(Message::system(&"系统提示词 很长 ".repeat(4)));
-            ctx.add_message(Message::user(&"任务输入 很长 ".repeat(4)));
+            ctx.add_message(Message::system("系统提示词 很长 ".repeat(4)));
+            ctx.add_message(Message::user("任务输入 很长 ".repeat(4)));
             assert!(
                 ctx.token_count() > 10,
                 "地板必须真的超预算，否则这条用例没有题目：{}",
@@ -474,7 +474,7 @@ mod tests {
             ctx.add_message(Message::tool_result_text(
                 "c1",
                 "run_command",
-                &"输出 ".repeat(400),
+                "输出 ".repeat(400),
             ));
             assert!(
                 ctx.token_count() <= 200,
