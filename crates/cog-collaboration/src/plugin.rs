@@ -43,6 +43,20 @@ impl cog_core::SystemPlugin for CollaborationPlugin {
                  change-diff-source counters will not be recorded"
             );
         }
+        // The saved-call ledger, taken here for the same reason: this is the
+        // only place the plugin context is in hand. A deployment without it
+        // loses the durable half of every saving — the skips still show on the
+        // realtime series, so the absence is a narrowing of the account rather
+        // than a silence about it.
+        if let Some(sink) = ctx.consume_service::<dyn cog_core::LlmSkipSink>() {
+            observable.install_skip_sink(sink);
+        } else {
+            warn!(
+                "no saved-call sink published; skipped calls will not be recorded \
+                 durably, and the windows they were saved in will read as windows \
+                 with no spend"
+            );
+        }
         ctx.publish_observable(observable);
         info!("CollaborationPlugin observable published");
 

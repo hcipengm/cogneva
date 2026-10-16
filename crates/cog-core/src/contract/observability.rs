@@ -527,6 +527,44 @@ pub trait LlmUsageReader: Send + Sync {
     ) -> SFResult<RolledUsage>;
 }
 
+/// One LLM call a call site decided not to make, and the recorded reason.
+///
+/// A spend ledger can only ever hold the calls that happened, so a call site
+/// that stopped calling and a call site that was deliberately skipped are the
+/// same reading on that table: nothing. This is the other half — the saving
+/// stated where the decision is taken — and it is what lets a window with no
+/// spend be read as either a hole or a decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmSkipRecord {
+    /// The stage whose calls were saved, named by the call site itself. It is
+    /// the same string the realtime `self_review_skipped_total` series labels
+    /// `stage` with, so the durable record and the live series name one cell
+    /// rather than two that have to be matched up by hand.
+    pub stage: String,
+    /// Why the call was not made, from the call site's own closed set of
+    /// reasons. A `&'static str` rather than a `String` on purpose: the reason
+    /// is read as a cell of a fixed vocabulary, and a value built at run time
+    /// could open a cell no reader was ever told about while looking exactly
+    /// like a reason that stopped happening.
+    pub reason: &'static str,
+}
+
+/// Writing face of the saved-call ledger.
+///
+/// Implemented by `cog-observability`, which owns the durable side, and
+/// consumed by the crates whose call sites skip work. Required, with no
+/// default, for the reason the reading contracts give: a default would compile
+/// into every backend and answer "nothing was ever saved" from a source nothing
+/// derives — which is the reading this face exists to make impossible.
+#[async_trait::async_trait]
+pub trait LlmSkipSink: Send + Sync {
+    /// Record one saved call. The write is awaited rather than queued, so a
+    /// caller that returns from it knows the saving is on the record: a
+    /// background queue would lose exactly the records around a rollout, which
+    /// is when a pipeline is most likely to be skipping work.
+    async fn record_skip(&self, record: &LlmSkipRecord) -> SFResult<()>;
+}
+
 // ─── Self-Evolution Metrics ────────────────────────────────────────────────
 
 /// Counter-style metrics for the self-evolution pipeline.

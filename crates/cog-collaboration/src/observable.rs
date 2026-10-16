@@ -450,6 +450,22 @@ pub struct CollaborationObservable {
     /// Set once the first write finds no backend, so the warning is a
     /// transition rather than a line per event.
     uninstalled_backend_reported: AtomicBool,
+    /// The durable home of the savings below, installed once at plugin init.
+    ///
+    /// Deliberately not [`Self::metrics`]: that backend's names come from a
+    /// compile-time registry of metric families, and a saving is not a counter
+    /// to be scraped. It is the other half of the spend account — the half a
+    /// usage ledger cannot hold, because a call that is not made writes no row
+    /// — and it is joined against the ledger by `(stage, window)`, not summed.
+    ///
+    /// `None` is a wiring failure, not a mode: the writing method says so
+    /// rather than dropping the saving in silence, since a saving that was
+    /// never recorded is indistinguishable from a call site that never skipped
+    /// anything.
+    skip_sink: OnceLock<Arc<dyn cog_core::LlmSkipSink>>,
+    /// Set once the first write finds no sink, so the warning is a transition
+    /// rather than a line per skip.
+    uninstalled_skip_sink_reported: AtomicBool,
     /// 分类声明的计数（产生端：写出带前缀 reason/feedback 时记一次）。
     /// 与 [`Self::ralph_terminations`]（记录端）构成分类可达性自查的两端。
     /// 用同步锁而非 `try_lock` 丢弃：这一端是「有没有声明」的证据本身，
@@ -607,6 +623,18 @@ impl CollaborationObservable {
         let _ = self.metrics.set(backend);
     }
 
+    /// Take the durable home of the savings the skipping call sites state.
+    ///
+    /// Called once, from the plugin that already publishes this observable. The
+    /// first caller wins, which is what a second plugin init should be. A
+    /// deployment with no store connected leaves this unset, and the writing
+    /// method says so on the first skip rather than dropping savings quietly —
+    /// an unrecorded saving and a call site that never skipped anything are the
+    /// same reading otherwise.
+    pub fn install_skip_sink(&self, sink: Arc<dyn cog_core::LlmSkipSink>) {
+        let _ = self.skip_sink.set(sink);
+    }
+
     /// Write one counter cell, naming the wiring when there is no sink.
     ///
     /// A missing backend would otherwise drop the count in silence, and a
@@ -704,16 +732,50 @@ impl CollaborationObservable {
 
     /// Record one self-review that was not run, and why.
     ///
-    /// Synchronous for the same reason as the verdict counter: a dropped count
-    /// would read as reviews that were run, and the calls they cost, coming
-    /// back.
-    pub fn record_self_review_skip(&self, stage: &str, reason: &str) {
-        let mut map = self
-            .self_review_skips
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *map.entry((stage.to_string(), reason.to_string()))
-            .or_insert(0) += 1;
+    /// Two faces, written together. The in-process cell is the realtime one a
+    /// panel scrapes, and it is written under a synchronous lock for the same
+    /// reason as the verdict counter: a dropped count would read as reviews
+    /// that were run, and the calls they cost, coming back. The durable ledger
+    /// is the other half of the spend account — the saving survives the process
+    /// that made it, so a window with no spend can be read as a decision rather
+    /// than as a hole. Both carry the same `stage` and `reason`, so they name
+    /// one cell read on two clocks.
+    ///
+    /// The reason is a `&'static str` rather than free text: it is a cell of a
+    /// closed vocabulary, and a value built at run time could open a cell no
+    /// reader was ever told about while looking exactly like a reason that
+    /// stopped happening.
+    pub async fn record_self_review_skip(&self, stage: &str, reason: &'static str) {
+        {
+            let mut map = self
+                .self_review_skips
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *map.entry((stage.to_string(), reason.to_string()))
+                .or_insert(0) += 1;
+        }
+        let Some(sink) = self.skip_sink.get() else {
+            if !self
+                .uninstalled_skip_sink_reported
+                .swap(true, Ordering::Relaxed)
+            {
+                tracing::warn!(
+                    stage,
+                    reason,
+                    "no saved-call sink installed; this saving will not outlive \
+                     the process, and the window it was saved in will read as no \
+                     spend at all"
+                );
+            }
+            return;
+        };
+        let record = cog_core::LlmSkipRecord {
+            stage: stage.to_string(),
+            reason,
+        };
+        if let Err(e) = sink.record_skip(&record).await {
+            tracing::warn!(stage, reason, error = %e, "saved-call write failed");
+        }
     }
 
     /// Record how one self-review's revision step ended. Synchronous for the

@@ -123,8 +123,10 @@ pub(crate) fn review_spec(task: &cog_core::Task, declared: &[&str]) -> String {
 /// already deterministic, for instance — never reaches [`maybe_self_review`],
 /// and the calls it saved would otherwise be indistinguishable from a stage
 /// that stopped being reached at all.
-pub(crate) fn note_self_review_skip(stage: &str, reason: &'static str) {
-    crate::observable::global_observable().record_self_review_skip(stage, reason);
+pub(crate) async fn note_self_review_skip(stage: &str, reason: &'static str) {
+    crate::observable::global_observable()
+        .record_self_review_skip(stage, reason)
+        .await;
 }
 
 /// What a review of an actor's output would be held to, or why it is not run
@@ -164,13 +166,14 @@ pub(crate) async fn maybe_self_review(
     let observable = crate::observable::global_observable();
     let Some(config) = config.as_ref() else {
         observable
-            .record_self_review_skip(agent_kind, crate::observable::SELF_REVIEW_SKIP_DISABLED);
+            .record_self_review_skip(agent_kind, crate::observable::SELF_REVIEW_SKIP_DISABLED)
+            .await;
         return None;
     };
     let spec = match basis {
         ReviewBasis::HeldTo(spec) => spec,
         ReviewBasis::Skipped(reason) => {
-            observable.record_self_review_skip(agent_kind, reason);
+            observable.record_self_review_skip(agent_kind, reason).await;
             return None;
         }
     };

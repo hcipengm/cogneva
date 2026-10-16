@@ -19,7 +19,9 @@ pub mod process_zombies;
 pub mod producer_heartbeat;
 pub mod raw_stream;
 pub mod search_index;
+pub mod skip_store;
 pub mod snapshot;
+pub mod spend_verdict;
 pub mod traces;
 pub mod usage_store;
 

@@ -124,7 +124,8 @@ impl EvaluatorActor {
             crate::actors::note_self_review_skip(
                 "evaluator",
                 crate::observable::SELF_REVIEW_SKIP_SELF_EVOLUTION,
-            );
+            )
+            .await;
             let _ = output_str;
             return output;
         }

@@ -25,6 +25,16 @@ pub struct ObservabilityPlugin {
     /// The LLM usage ledger, created in `init` from the same database the alert
     /// store uses; the rollup loop reads through it in `start`.
     usage_store: Option<Arc<LlmUsageStore>>,
+    /// The saved-call ledger, created in `init` beside the usage ledger and
+    /// published as the write face the skipping call sites hold. Absent when
+    /// the database is absent, which is what makes a caller see "nothing to
+    /// write to" rather than a saving that silently did not land.
+    skip_store: Option<Arc<crate::skip_store::LlmSkipStore>>,
+    /// The verdict projection over the two ledgers, created in `init` beside
+    /// them and driven by its own loop in `start`. It exists only when the
+    /// usage ledger does: a verdict about a spend that cannot be read is not a
+    /// verdict, and the loop has nothing to resume from.
+    verdict_store: Option<Arc<crate::spend_verdict::SpendVerdictStore>>,
     /// Per-agent trace buffer budget, read in `init` from config and applied
     /// to the collection task in `start`.
     trace_buffer_max_bytes: usize,
@@ -44,6 +54,8 @@ impl ObservabilityPlugin {
             trace_tier_migrator: None,
             alert_store: None,
             usage_store: None,
+            skip_store: None,
+            verdict_store: None,
             trace_buffer_max_bytes: crate::config::TraceCollectorConfig::default().buffer_max_bytes,
             data_volume: Vec::new(),
         }
@@ -446,6 +458,74 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             info!("LLM usage rolled read face published");
         }
 
+        // ── Saved-call ledger ──
+        // The other half of the token account. A call that is deliberately not
+        // made writes no usage row, so the saving is stated where the decision
+        // is taken, in this same database, and read back by the verdict fold
+        // that joins it against the window's spend. Published as a write face
+        // for the reason the rolled read face above is published: the call
+        // sites hold a contract, never this crate's storage internals.
+        self.skip_store = match std::env::var("COGNEVA_DATABASE_URL") {
+            Ok(url) if !url.trim().is_empty() => {
+                match crate::skip_store::LlmSkipStore::connect(&url).await {
+                    Ok(store) => match store.init_schema().await {
+                        Ok(()) => {
+                            info!("saved-call ledger reachable");
+                            Some(Arc::new(store))
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "saved-call schema init failed; savings stay in-process");
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        warn!(error = %e, "saved-call store connect failed; savings stay in-process");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        if let Some(store) = self.skip_store.as_ref() {
+            let sink: Arc<dyn cog_core::LlmSkipSink> = Arc::new((**store).clone());
+            ctx.publish_service(sink);
+            info!("saved-call write face published");
+        }
+
+        // ── Spend verdict projection ──
+        // The face that says what each call site's window *amounts to*: the
+        // name of the direction on both sides of the account, which neither
+        // ledger can produce on its own (a usage row only ever describes calls
+        // that happened, and a saved call only ever describes a call that did
+        // not). Built here rather than in `start` so the store exists before
+        // the loop that drives it, and absent when there is no usage ledger to
+        // judge.
+        if let Some(ledger) = self.usage_store.as_ref() {
+            if let Ok(url) = std::env::var("COGNEVA_DATABASE_URL") {
+                if !url.trim().is_empty() {
+                    let skips = self.skip_store.as_ref().map(|s| (**s).clone());
+                    match crate::spend_verdict::SpendVerdictStore::connect(
+                        &url,
+                        (**ledger).clone(),
+                        skips,
+                    )
+                    .await
+                    {
+                        Ok(store) => match store.init_schema().await {
+                            Ok(()) => {
+                                info!("spend verdict projection armed");
+                                self.verdict_store = Some(Arc::new(store));
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "spend verdict schema init failed; the account keeps no verdicts")
+                            }
+                        },
+                        Err(e) => warn!(error = %e, "spend verdict store connect failed"),
+                    }
+                }
+            }
+        }
+
         self.initialized = true;
         Ok(())
     }
@@ -515,6 +595,20 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                 .map(|s| (*s).clone())
                 .unwrap_or_default();
             drop(crate::llm_usage_rollup::spawn(store, shutdown));
+        }
+
+        // ── Spend verdict fold ──
+        // Runs here for the same reason the fold above does, and after it in
+        // the same process: a verdict is read against the ledger directly
+        // rather than against the folded rows, so the two do not have to be
+        // ordered — but a deployment that restarts its gateway on every
+        // rollout must not be the process that decides what a spend meant.
+        if let Some(store) = self.verdict_store.clone() {
+            let shutdown = ctx
+                .consume::<cog_core::ShutdownSignal>()
+                .map(|s| (*s).clone())
+                .unwrap_or_default();
+            drop(crate::spend_verdict::spawn(store, shutdown));
         }
 
         // ── Data directory footprint ──
