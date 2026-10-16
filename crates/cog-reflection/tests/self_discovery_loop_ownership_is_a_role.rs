@@ -167,6 +167,7 @@ fn a_held_round_is_readable_and_its_stretch_has_an_end() {
     for message in [
         "discovery round held off: the LLM pool gate is closed",
         "discovery round skipped: another process holds the self-discovery role",
+        "discovery role released: the LLM pool gate is closed",
     ] {
         let at = body
             .find(message)
@@ -203,6 +204,60 @@ fn a_held_round_is_readable_and_its_stretch_has_an_end() {
     assert!(
         body[resumed..].contains("held_rounds = 0"),
         "「恢复」那句没有把 held_rounds 写回 0。"
+    );
+}
+
+/// 池闸关着的那几轮，这条环**让出**角色——这是带外写者能顶上来的前提。
+///
+/// 老写法是「进循环之前领一次，之后一直攥着」：池不可用时这条环已经不动手了，
+/// 但它照样续租，于是租约面上永远是「有人持着」。带外写者（宿主侧 claude code）
+/// 顶上来靠的就是每轮读那个租约——读到的永远是「有人持着」，它就永远拿不到，
+/// 而池不可用恰恰是**唯一**该它顶上的时候。
+///
+/// 位置关系而不是措辞，因为措辞会随改写漂移而这条要求不会：
+///   1. 池闸那一问走在角色那一问**之前**——闸关着就连问都不问、更不续租；
+///   2. 领角色发生在闸那一段**之后**（闸前领＝池关着也攥着，老写法）；
+///   3. 闸那一段里把角色取走（`held.take()`）并把 owner 读数写成**非持有**
+///      ——不写回的话 `cogneva_loop_owner_held` 上一次那个 1 会一直留着，
+///      这条 gauge 会一直说「我持着」，直到池恢复（可能在几小时之后）。
+#[test]
+fn a_closed_pool_gate_releases_the_role_instead_of_holding_through_it() {
+    let source = plugin_source();
+    let body = fn_body(production_source(&source), LOOP_FN);
+
+    let gate = body
+        .find("pool_gate.llm_paused()")
+        .expect("循环体里没有池闸那一问");
+    let release = body
+        .find("held.take()")
+        .expect("闸那一段没有把角色取走：池关着时这条环照旧攥着租约，带外永远拿不到");
+    let role_take = body
+        .find(ROLE_HOLD)
+        .expect("全仓没有 RoleHold::start：这条环的至多一个持有者没有任何东西保证");
+    let role_ask = body.find(ROLE_ASK).expect("循环体里没有 hold.may_act()");
+
+    assert!(
+        gate < release && release < role_ask,
+        "位置不对（池闸第 {gate} 字节、松手第 {release}、角色那一问第 {role_ask}）：\
+         要的是「闸关着 → 松手 → 才轮到角色那一问」。"
+    );
+    assert!(
+        gate < role_take,
+        "领角色在池闸之前（闸第 {gate}、领角色第 {role_take} 字节）：这是「进循环前领一次、\
+         之后一直攥着」的老写法，池关着时租约面上仍是「有人持着」。"
+    );
+
+    // 闸那一段（到它自己的 `continue` 为止）必须把 owner 读数写成**自己站开**。
+    let branch = &body[gate..];
+    let cont = branch
+        .find("continue;")
+        .expect("池闸那一段没有收尾的 continue");
+    assert!(
+        branch[..cont].contains("Ownership::Yielded"),
+        "闸那一段没有把 owner 读数写成 `Yielded`：`cogneva_loop_owner_held` 会停在上一轮的 1 上\
+         （这条 gauge 于是整段池不可用期间都说「我持着」），而写成 `Elsewhere` 则会让\
+         `cogneva_loop_role_declared` 仍是 1 ⇒ 「已声明但没人持」那条 critical 规则在池关了\
+         15 分钟之后报一条假红——那正是这条环按设计把角色让出去的时候。"
     );
 }
 

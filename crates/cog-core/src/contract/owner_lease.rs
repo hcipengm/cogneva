@@ -105,6 +105,16 @@ const _: () = assert!(
 /// holds the role has learned something about the deployment, and one that
 /// could not ask at all has learned nothing. Collapsing them would let an
 /// unreachable arbiter read as a healthy deployment with a single owner.
+///
+/// A fourth is here for a reason of the same kind: a process that **gave the
+/// role up on purpose** is not the holder either, but it is not in the same
+/// position as a process told the role is elsewhere. It did not lose a race and
+/// it did not fail to ask — it stood down because the thing it would have been
+/// working on cannot be worked on, and it stood down so that whoever can take
+/// over gets a free role rather than a leased one. Read on the holder gauge
+/// alone, that is a zero like the other; read against the role's declaration
+/// it is not, and the difference is what keeps a deliberate handover from
+/// being reported as a role nobody ever wanted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ownership {
     /// The role is this process's for the current term.
@@ -114,6 +124,9 @@ pub enum Ownership {
     /// The arbiter could not be consulted. This says nothing about who holds
     /// the role, and this process must not act either.
     Unprovable,
+    /// This process is not the holder because it stopped contending, not
+    /// because anything was decided against it. This one must not act.
+    Yielded,
 }
 
 impl Ownership {

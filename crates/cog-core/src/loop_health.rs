@@ -139,6 +139,13 @@ pub const LOOP_LABEL: &str = "loop";
 /// process is holding this role" apart from "no process was ever asked to": the
 /// holder gauge is silent in both, and a rule over the gauge alone would be
 /// quiet through a deployment that lost its owner for good.
+///
+/// `0` is the third state, and it is not the same as silence: this loop has the
+/// role and has stood down from it on purpose, so the role is free by design
+/// rather than lost. A loop that stands down is exactly the case the rule above
+/// must not treat as an incident — the seat is open because the work cannot be
+/// done from here right now, which is when the role is meant to leave this
+/// deployment — so it says "not in the running" instead of saying nothing.
 pub const LOOP_ROLE_DECLARED: &str = "cogneva_loop_role_declared";
 
 /// `1` on the process that holds the loop's role, `0` on one that asked and was
@@ -197,6 +204,9 @@ enum OwnerState {
     Elsewhere,
     /// The arbiter could not be consulted.
     Unprovable,
+    /// This process stood down from the role on purpose — it is not the holder
+    /// and nobody was told it is.
+    Yielded,
 }
 
 impl OwnerState {
@@ -206,6 +216,7 @@ impl OwnerState {
             OwnerState::Held => 1,
             OwnerState::Elsewhere => 2,
             OwnerState::Unprovable => 3,
+            OwnerState::Yielded => 4,
         }
     }
 
@@ -214,6 +225,7 @@ impl OwnerState {
             1 => OwnerState::Held,
             2 => OwnerState::Elsewhere,
             3 => OwnerState::Unprovable,
+            4 => OwnerState::Yielded,
             _ => OwnerState::Unread,
         }
     }
@@ -224,6 +236,7 @@ impl OwnerState {
             OwnerState::Held => "held",
             OwnerState::Elsewhere => "elsewhere",
             OwnerState::Unprovable => "unprovable",
+            OwnerState::Yielded => "yielded",
         }
     }
 }
@@ -732,6 +745,7 @@ impl Beat {
             Ownership::Held => OwnerState::Held,
             Ownership::Elsewhere => OwnerState::Elsewhere,
             Ownership::Unprovable => OwnerState::Unprovable,
+            Ownership::Yielded => OwnerState::Yielded,
         };
         if ownership == Ownership::Unprovable {
             self.state
@@ -875,12 +889,24 @@ impl Observable for LoopHealth {
             if owner == OwnerState::Unread {
                 continue;
             }
-            out.push(RawMetric::new(LOOP_ROLE_DECLARED, 1.0).with_label(LOOP_LABEL, label));
+            // A declared role with no holder is what `OWNER_UNOWNED_RULE` is
+            // written to catch, so a loop that stood down on purpose must not
+            // read as declared. Zero rather than absent, because those are two
+            // different statements and only one of them is true here: absent
+            // says no process was ever given this role, and the loop was — it
+            // simply is not in the running this minute, and will say so again
+            // the moment it takes the role back.
+            let declared = if owner == OwnerState::Yielded {
+                0.0
+            } else {
+                1.0
+            };
+            out.push(RawMetric::new(LOOP_ROLE_DECLARED, declared).with_label(LOOP_LABEL, label));
             match owner {
                 OwnerState::Held => {
                     out.push(RawMetric::new(LOOP_OWNER_HELD, 1.0).with_label(LOOP_LABEL, label))
                 }
-                OwnerState::Elsewhere => {
+                OwnerState::Elsewhere | OwnerState::Yielded => {
                     out.push(RawMetric::new(LOOP_OWNER_HELD, 0.0).with_label(LOOP_LABEL, label))
                 }
                 // Nothing: an unanswerable ask is not evidence about who holds
@@ -1572,6 +1598,58 @@ mod tests {
             metric(&metrics, LOOP_OWNER_LOSSES_TOTAL, "outage_probe"),
             Some(1.0),
             "a second unanswerable cycle is not a second loss"
+        );
+    }
+
+    /// Standing down from a role is a reading of its own, not a zero like the
+    /// others: the declaration goes to zero with it.
+    ///
+    /// The two halves have to be asserted together because either one alone is
+    /// satisfiable by a wrong state. Reporting only the holder as `0` leaves the
+    /// declaration at `1`, and `OWNER_UNOWNED_RULE` then announces a declared
+    /// role with no holder — a false alarm for a handover that was deliberate,
+    /// and one that lasts as long as the reason for the handover does. Reporting
+    /// only the declaration as `0` while the holder gauge still said `1` would
+    /// say the role is not contended and held at once.
+    #[tokio::test]
+    async fn standing_down_zeroes_the_declaration_as_well_as_the_holder() {
+        use crate::owner_lease::Ownership;
+
+        let readings = LoopHealth::new();
+        let beat = readings.register("yield_probe", Cadence::Periodic(Duration::from_secs(30)));
+
+        beat.note_ownership(Ownership::Held);
+        beat.note_ownership(Ownership::Yielded);
+        let metrics = collect(&readings).await;
+        assert_eq!(
+            metric(&metrics, LOOP_OWNER_HELD, "yield_probe"),
+            Some(0.0),
+            "the loop is not the holder"
+        );
+        assert_eq!(
+            metric(&metrics, LOOP_ROLE_DECLARED, "yield_probe"),
+            Some(0.0),
+            "and it is not in the running either; the unowned rule reads the declaration, \
+             so leaving this at 1 makes a deliberate handover an incident"
+        );
+        assert_eq!(
+            metric(&metrics, LOOP_OWNER_LOSSES_TOTAL, "yield_probe"),
+            Some(1.0),
+            "the work stopped here, and that is a loss wherever it lands"
+        );
+
+        // Taking it back is a second acquisition, and the declaration comes
+        // back with it — the zero above is a state, not an amnesty.
+        beat.note_ownership(Ownership::Held);
+        let metrics = collect(&readings).await;
+        assert_eq!(
+            metric(&metrics, LOOP_ROLE_DECLARED, "yield_probe"),
+            Some(1.0)
+        );
+        assert_eq!(metric(&metrics, LOOP_OWNER_HELD, "yield_probe"), Some(1.0));
+        assert_eq!(
+            metric(&metrics, LOOP_OWNER_ACQUISITIONS_TOTAL, "yield_probe"),
+            Some(2.0)
         );
     }
 

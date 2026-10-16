@@ -2184,16 +2184,19 @@ fn spawn_discovery_loop(
             let shutdown = shutdown.clone();
             let role_beat = beat.clone();
             async move {
-                // 角色领一次就够（`RoleHold` 自带按契约节拍续租的续期任务），
-                // 但「这一轮该不该我动手」要**每轮现问**——丢角色之后照跑才是
-                // 这条环真正的坏法（`explored` 是进程内集合，两个进程各跑一遍
-                // 就是同一条组合问两遍）。
-                let hold = cog_core::RoleHold::start(
-                    role_broker,
-                    SELF_DISCOVERY_ROLE,
-                    role_beat,
-                    &shutdown,
-                );
+                // 角色不是一个「领了就一直攥在手里」的东西：**池闸关着的那几轮要松手**。
+                //
+                // 池不可用，正是带外写者（宿主侧 claude code）该顶上来的时候；而它顶上来
+                // 靠的是**自己每轮来问**，读两个跨进程值——这个角色的租约**空着**，加上
+                // `llm:pool:status` 报不可用。只要这条环在闸门关着时还继续续租，第一格就
+                // 永远是「有人持着」：带外再怎么每轮来问都拿不到，而它拿不到就没人做这段
+                // 工作——这正是「池不可用时角色归带内」这条要求的反面。
+                //
+                // 松手＝丢掉 `RoleHold`（它的续期任务随 `Drop` 中止），**不再续租就是放弃**，
+                // 租约到期后角色就是空的。不显式删那一行：删行会让「刚放弃」与「从来没人
+                // 要过」在租约面上同形，而**到期**是这件事唯一自带时刻的证据。池一恢复，
+                // 下一轮 `RoleHold::start` 就把空着的角色领回来。
+                let mut held: Option<cog_core::RoleHold> = None;
                 let mut interval = tokio::time::interval(period);
                 // 连续被扣住的轮数，这一支**唯一**的时长读数：池闸关着是正常态，
                 // 而「刚关上」与「关了 6 小时」在这一句里长得一模一样。
@@ -2201,6 +2204,57 @@ fn spawn_discovery_loop(
                 loop {
                     beat.beat();
                     interval.tick().await;
+
+                    // 闸住的那一轮不生成也不提交：省下的是必然失败的任务行，
+                    // 不是「这一轮没事发生」。松手也在这里——见上。
+                    if pool_gate.llm_paused() {
+                        if held.take().is_some() {
+                            info!(
+                                role = SELF_DISCOVERY_ROLE,
+                                broker = broker_present,
+                                "discovery role released: the LLM pool gate is closed, so the \
+                                 out-of-band writer can take it"
+                            );
+                        }
+                        // 这一轮不是持有者。**必须显式写回**：`may_act()` 这一轮不再问，
+                        // `cogneva_loop_owner_held` 会上一次写的 1 一直留着，那条 gauge
+                        // 于是会一直说「我持着」，直到池恢复——而池恢复可能在几小时之后。
+                        //
+                        // 写的是 `Yielded` 而不是 `Elsewhere`：这条环不是**输了**这个角色
+                        // （没有别人持着它，也没有人告诉过它是别人的），是**自己站开了**。
+                        // 这个区别在告警面上是真金白银——`Yielded` 会把
+                        // `cogneva_loop_role_declared` 写成 0，而「已声明但没人持」那条
+                        // critical 规则要的是 1；塌成 `Elsewhere`（声明仍是 1、持有是 0）
+                        // 会让池一关超过 15 分钟就报一条「这条环没人管了」，而那时恰恰是
+                        // 它按设计把角色让出去的时候。
+                        beat.note_ownership(cog_core::Ownership::Yielded);
+                        held_rounds += 1;
+                        info!(
+                            role = SELF_DISCOVERY_ROLE,
+                            broker = broker_present,
+                            held_rounds,
+                            period_secs = period.as_secs(),
+                            "discovery round held off: the LLM pool gate is closed"
+                        );
+                        continue;
+                    }
+
+                    // 池开着：这一轮手里必须有角色。没有就现领一个（`RoleHold` 自带按契约
+                    // 节拍续租的续期任务；租约那一刻空着的话，这一领当轮即成）。
+                    // 克隆先落到局部变量，是为了让这次领角色的**实参表里不出现带括号的
+                    // 表达式**——源码判据按第一个 `)` 截实参表，`.clone()` 会让它截在
+                    // `role_broker.clone(` 上，于是「领的是不是这个角色」那一条恒假。
+                    if held.is_none() {
+                        let broker = role_broker.clone();
+                        let beat_for_role = role_beat.clone();
+                        held = Some(cog_core::RoleHold::start(
+                            broker,
+                            SELF_DISCOVERY_ROLE,
+                            beat_for_role,
+                            &shutdown,
+                        ));
+                    }
+                    let hold = held.as_ref().expect("上一行刚保证这里有一个 RoleHold");
 
                     // 角色在别处：这一轮不动手。跳过的那一答 `may_act()` 已经记在
                     // beat 上（`cogneva_loop_owner_held` 一族），所以这句是给人看的
@@ -2213,20 +2267,6 @@ fn spawn_discovery_loop(
                             broker = broker_present,
                             held_rounds,
                             "discovery round skipped: another process holds the self-discovery role"
-                        );
-                        continue;
-                    }
-
-                    // 闸住的那一轮不生成也不提交：省下的是必然失败的任务行，
-                    // 不是「这一轮没事发生」。
-                    if pool_gate.llm_paused() {
-                        held_rounds += 1;
-                        info!(
-                            role = SELF_DISCOVERY_ROLE,
-                            broker = broker_present,
-                            held_rounds,
-                            period_secs = period.as_secs(),
-                            "discovery round held off: the LLM pool gate is closed"
                         );
                         continue;
                     }
