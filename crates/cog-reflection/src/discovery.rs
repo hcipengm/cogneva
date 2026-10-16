@@ -19,7 +19,22 @@ use cog_core::SFResult;
 /// Engine that generates and evaluates exploratory discovery tasks.
 pub struct DiscoveryEngine {
     recorder: Arc<dyn LearningRecorder>,
-    /// Combinations that have already been explored (tool_set hash).
+    /// Combinations that have been **handed over** at least once, keyed as the
+    /// generation branches spell them (`tool:a+b` / `param:a` / `xfer:s` /
+    /// `boundary:stress`).
+    ///
+    /// Written by [`Self::mark_explored`] and by nobody else. Generation reads
+    /// it and does not write it: a combination leaves this set's complement only
+    /// once somebody accepted the work, because a combination retired at
+    /// generation time is retired by a refusal too, and a refusal is not
+    /// evidence that the combination was ever tried. Retiring on refusal would
+    /// also make the whole loop a one-shot: the first round refuses up to six
+    /// combinations, the pool empties, and every later round finds nothing new
+    /// to propose -- which reads exactly like "the search space is exhausted".
+    ///
+    /// Per process, in memory: it never protected against a second writer, and
+    /// it starts over on restart. That is a known limit of this face, not a
+    /// property to rely on.
     explored: Arc<RwLock<HashSet<String>>>,
 }
 
@@ -38,7 +53,14 @@ impl DiscoveryEngine {
     }
 
     /// Generate a batch of discovery tasks based on the available tools and
-    /// skills.  Tasks are filtered to remove already-explored combinations.
+    /// skills.  Tasks are filtered to remove combinations already handed over.
+    ///
+    /// This claims nothing. The combination a task is an attempt at is carried
+    /// on the task (`explored_key`), and it leaves the pool when the caller that
+    /// got the submission accepted says so ([`Self::mark_explored`]). Until
+    /// then it is proposed again next round, deliberately: a refused attempt has
+    /// not been made, and the alternative -- retiring at generation -- spends
+    /// the combination on a refusal.
     pub async fn generate_tasks(
         &self,
         tool_names: &[String],
@@ -46,7 +68,7 @@ impl DiscoveryEngine {
         max_tasks: usize,
     ) -> Vec<DiscoveryTask> {
         let mut tasks = Vec::with_capacity(max_tasks);
-        let mut guard = self.explored.write().await;
+        let guard = self.explored.read().await;
 
         // Strategy 1: Tool combination exploration (pair-wise).
         for i in 0..tool_names.len() {
@@ -58,9 +80,9 @@ impl DiscoveryEngine {
                 if tasks.len() >= max_tasks {
                     break;
                 }
-                guard.insert(combo.clone());
                 tasks.push(DiscoveryTask {
                     id: DiscoveryTask::generate_id(),
+                    explored_key: combo,
                     hypothesis: format!(
                         "Combining {} and {} may yield a new composite capability.",
                         tool_names[i], tool_names[j]
@@ -85,9 +107,9 @@ impl DiscoveryEngine {
         if let Some(tool) = tool_names.first() {
             let combo = format!("param:{}", tool);
             if !guard.contains(&combo) && tasks.len() < max_tasks {
-                guard.insert(combo.clone());
                 tasks.push(DiscoveryTask {
                     id: DiscoveryTask::generate_id(),
+                    explored_key: combo,
                     hypothesis: format!(
                         "Varying parameters for {} reveals optimal usage patterns.",
                         tool
@@ -111,9 +133,9 @@ impl DiscoveryEngine {
         if let Some(skill) = skill_ids.first() {
             let combo = format!("xfer:{}", skill);
             if !guard.contains(&combo) && tasks.len() < max_tasks {
-                guard.insert(combo.clone());
                 tasks.push(DiscoveryTask {
                     id: DiscoveryTask::generate_id(),
+                    explored_key: combo,
                     hypothesis: format!(
                         "Skill {} may be applicable to an unrelated domain.",
                         skill
@@ -134,9 +156,9 @@ impl DiscoveryEngine {
         // Strategy 4: Boundary stress test.
         let combo = "boundary:stress".to_string();
         if !guard.contains(&combo) && tasks.len() < max_tasks {
-            guard.insert(combo.clone());
             tasks.push(DiscoveryTask {
                 id: DiscoveryTask::generate_id(),
+                explored_key: combo,
                 hypothesis: "The system handles extreme inputs gracefully.".into(),
                 strategy: DiscoveryStrategy::BoundaryStressTest,
                 tools: tool_names.to_vec(),
@@ -227,17 +249,109 @@ impl DiscoveryEngine {
         Ok(status)
     }
 
-    /// Check whether a combination has already been explored.
-    pub async fn is_explored(&self, tool_set: &[String]) -> bool {
-        let key = format!("tool:{}", tool_set.join("+"));
-        let guard = self.explored.read().await;
-        guard.contains(&key)
+    /// Retire the combination this task is one attempt at.
+    ///
+    /// The key comes off the task and never off `tools`: a key rebuilt here is a
+    /// second grammar, and it would only reproduce one of the four -- the pair
+    /// branch's `tool:a+b`. The task carries the exact string the filter reads,
+    /// so there is one spelling and no way for the two to drift apart.
+    ///
+    /// Call it once the submission was accepted. Accepted is not executed:
+    /// whether the attempt then ran, and how it ended, is a different reading
+    /// and a different question -- retiring a combination only says this system
+    /// has asked for it.
+    pub async fn mark_explored(&self, task: &DiscoveryTask) {
+        let mut guard = self.explored.write().await;
+        guard.insert(task.explored_key.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::recorder::InMemoryRecorder;
+
+    fn tools() -> Vec<String> {
+        ["read_file", "run_command", "write_file"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
     }
 
-    /// Mark a combination as explored without generating a task.
-    pub async fn mark_explored(&self, tool_set: &[String]) {
-        let key = format!("tool:{}", tool_set.join("+"));
-        let mut guard = self.explored.write().await;
-        guard.insert(key);
+    fn engine() -> DiscoveryEngine {
+        DiscoveryEngine::new(Arc::new(InMemoryRecorder::new()))
+    }
+
+    fn keys(tasks: &[DiscoveryTask]) -> Vec<String> {
+        let mut keys: Vec<String> = tasks.iter().map(|t| t.explored_key.clone()).collect();
+        keys.sort();
+        keys
+    }
+
+    /// 生成不领走任何东西：同一批组合一轮一轮原样回来，池子抽不干。
+    ///
+    /// 这条是「被拒就回池」的机器面，也是那个已修缺陷的破坏面：生成时插入的话，
+    /// 每调用一次少一批键，几轮之后 `generate_tasks` 恒返回空——而它空的那一刻
+    /// 与「搜索空间真的穷尽了」逐字同形，且与有没有人受理过**无关**。跑 10 轮，
+    /// 因为一次拒与三次拒在这条测试里必须是同一件事。
+    #[tokio::test]
+    async fn generation_retires_nothing_so_a_refused_round_never_drains_the_pool() {
+        let engine = engine();
+        let tools = tools();
+
+        let first = engine.generate_tasks(&tools, &[], 64).await;
+        assert!(!first.is_empty(), "no combination to propose at all");
+        for round in 2..=10 {
+            let again = engine.generate_tasks(&tools, &[], 64).await;
+            assert_eq!(
+                keys(&first),
+                keys(&again),
+                "round {round} proposed something other than round 1, so generation is \
+                 retiring what it only proposed: first={:?} round{round}={:?}",
+                keys(&first),
+                keys(&again)
+            );
+        }
+    }
+
+    /// 每一条分支的键都必须是**它自己那条过滤读的那个串**。
+    ///
+    /// 逐条试：受理这一条之后，下一轮少的必须正好是它的键、且别的还在。一条分支
+    /// 的键与它带的串若分家，症状就是这一条要么永远退不掉（每轮重提），要么一退
+    /// 就退掉别人的（那一条再也不会被提）。四种策略各试一次，因为今天它们是四处
+    /// 各写各的字符串。
+    #[tokio::test]
+    async fn a_retired_task_takes_its_own_combination_and_nothing_else() {
+        let tools = tools();
+        let first = engine().generate_tasks(&tools, &[], 64).await;
+        assert!(first.len() >= 4, "expected every branch to fire: {first:?}");
+
+        for (i, task) in first.iter().enumerate() {
+            let engine = engine();
+            let before = engine.generate_tasks(&tools, &[], 64).await;
+            assert!(
+                keys(&before).contains(&task.explored_key),
+                "branch {i} ({}) is not proposed on a fresh engine",
+                task.explored_key
+            );
+
+            engine.mark_explored(task).await;
+            let after = engine.generate_tasks(&tools, &[], 64).await;
+
+            assert!(
+                !keys(&after).contains(&task.explored_key),
+                "retiring {} did not stop it: after={:?}",
+                task.explored_key,
+                keys(&after)
+            );
+            assert_eq!(
+                after.len(),
+                before.len() - 1,
+                "retiring {} took something else with it: before={:?} after={:?}",
+                task.explored_key,
+                keys(&before),
+                keys(&after)
+            );
+        }
     }
 }

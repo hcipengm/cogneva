@@ -997,6 +997,18 @@ impl ReflectionEngine {
         }
     }
 
+    /// Retire the combination a discovery task is one attempt at.
+    ///
+    /// Deliberately not part of generating: only the caller that submits the
+    /// task learns whether the submission was accepted, and an engine that
+    /// retired its own proposals would retire the refused ones too -- spending
+    /// the combination on an attempt that never happened.
+    pub async fn mark_discovery_explored(&self, task: &crate::types::DiscoveryTask) {
+        if let Some(ref disc) = self.discovery {
+            disc.mark_explored(task).await;
+        }
+    }
+
     /// Evaluate a discovery task result.
     pub async fn evaluate_discovery_result(
         &self,

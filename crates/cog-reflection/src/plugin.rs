@@ -1994,7 +1994,14 @@ fn spawn_discovery_loop(
                         // 在那之前把 Ok 读成成功就是拿「提交成功」冒充「任务成功」。
                         // 所以这里只看 Err。
                         match orchestrator.submit_goal_auto(&goal, vec![task]).await {
-                            Ok(_) => submitted += 1,
+                            Ok(_) => {
+                                // 组合在**受理**之后才退场，不在生成时。被拒的那条留在
+                                // 池子里、下一轮原样再来：拒一次不是试过一次，在生成时
+                                // 就退掉等于拿一次拒把组合花掉——第一轮即可清空池子，
+                                // 此后每轮都读到「没有新组合」，与「搜索空间已穷尽」同形。
+                                engine.mark_discovery_explored(&probe).await;
+                                submitted += 1;
+                            }
                             Err(e) => {
                                 refused += 1;
                                 warn!(
@@ -3781,6 +3788,7 @@ mod tests {
     fn a_discovery_probe_carries_its_own_question_into_the_task() {
         let probe = crate::types::DiscoveryTask {
             id: "DSC-20261016-ABCDEF01".into(),
+            explored_key: "tool:read_file+write_file".into(),
             hypothesis: "Combining read_file and write_file may yield a new composite capability."
                 .into(),
             strategy: crate::types::DiscoveryStrategy::ToolCombination,
@@ -3798,6 +3806,7 @@ mod tests {
         assert_eq!(task.input["goal"], goal);
         assert_eq!(task.input["task_kind"], "capability_discovery");
         assert_eq!(task.input["tools"], serde_json::json!(probe.tools));
+
         assert_eq!(
             task.task_type,
             cog_core::TaskType::Custom("capability_discovery".into())
@@ -4581,6 +4590,37 @@ mod tests {
             workspaces.head_of(&baseline).await.as_deref(),
             Some(old.as_str()),
             "没有 HEAD 证据时基线不能被移动"
+        );
+    }
+
+    /// 「受理才退场」落在环的哪个分支里，是一条只能读源码的判据：那个闭包要一条
+    /// 真 orchestrator 才跑得起来，测试里到不了。所以钉形状——退场调用必须在 `Ok`
+    /// 分支里、且在 `Err` 分支之前；把它挪进 `Err`、或挪到 `match` 之后（两种都会
+    /// 让被拒的组合也退场），这条就红。
+    ///
+    /// 窗口取到本轮那条汇总日志为止：不封口的话窗口会一直伸到本测试模块，把下面
+    /// 这个字符串自己找出来当命中。
+    #[test]
+    fn only_an_accepted_probe_retires_its_combination() {
+        let source = include_str!("plugin.rs");
+        let site = source
+            .find("match orchestrator.submit_goal_auto")
+            .expect("the submission site is gone");
+        let rest = &source[site..];
+        let window = &rest[..rest
+            .find("info!(")
+            .expect("the round's summary log is gone")];
+
+        let accepted = window.find("Ok(_) =>").expect("no accepted arm");
+        let retired = window
+            .find("mark_discovery_explored")
+            .expect("nothing in the round retires a combination");
+        let refused = window.find("Err(e) =>").expect("no refusal arm");
+
+        assert!(
+            accepted < retired && retired < refused,
+            "retirement must sit in the accepted arm: accepted={accepted} \
+             retired={retired} refused={refused}"
         );
     }
 }

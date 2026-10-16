@@ -313,6 +313,23 @@ pub enum DiscoveryStrategy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveryTask {
     pub id: String,
+    /// The combination this task is one attempt at, spelled exactly as the
+    /// engine's explored-set is keyed.
+    ///
+    /// It travels with the task because the caller is the only one that learns
+    /// whether the attempt was handed over, and a caller that cannot name the
+    /// thing it wants retired can only reconstruct it -- from `tools`, which is
+    /// not the key for three of the four strategies (the pair key is
+    /// `tool:a+b`, but the parameter branch is `param:a`, the transfer branch
+    /// `xfer:s`, and the boundary branch `boundary:stress`, and the last two
+    /// carry every tool name). An attempt that cannot be retired is one that
+    /// comes back every round; a combination retired by the wrong key is one
+    /// that never comes back and was never tried.
+    ///
+    /// No `serde(default)`: an empty key is not "this combination has no name",
+    /// it is an older payload, and a reader meeting one should say so rather
+    /// than file the attempt under a key nothing will ever look for.
+    pub explored_key: String,
     pub hypothesis: String,
     pub strategy: DiscoveryStrategy,
     pub tools: Vec<String>,
