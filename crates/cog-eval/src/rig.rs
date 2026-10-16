@@ -625,6 +625,12 @@ impl Rig {
                 }
             };
             for scaffold in &self.scaffolds {
+                // 这一行在哪些列上有定义由行自己说。不在定义域里的**不建格子**：建了就只能
+                // 用「跑一次、报一个错」来表达「这一列本来就没有这一行」，而那个错的形状
+                // （`errored`）读起来是「这一格有缺陷」。
+                if !scaffold.applies_to(&bench.name) {
+                    continue;
+                }
                 let mut per_seed = Vec::new();
                 for seed in &self.config.seeds {
                     per_seed.push(

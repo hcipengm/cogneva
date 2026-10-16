@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use cog_core::{LlmClient, SFError, SFResult, Tool, ToolDefinition, ToolExecutor};
 
 use crate::dataset::EvalCase;
+use crate::foreign::ForeignFace;
 use crate::metric::StepRecord;
 
 /// 外壳跑完一题交回来的东西。
@@ -42,6 +43,15 @@ pub enum FinishReason {
     StepBudget,
     /// 撞到上下文上限。
     ContextBudget,
+    /// 撞到组合根给这一行设的上限（时间 / CPU / 内存）。
+    ///
+    /// 只在**循环不在我们手里**的外壳上出现：外部流派的循环是别人写的，步数管不到它，
+    /// 能管的只有时间与这台机器分给它的资源。它与 [`Failed`] 必须分开——`Failed` 是它
+    /// 自己说做不下去，这一条是**我们设的界**把它收走了：前者要换方法，后者要问一句
+    /// 上限是不是给少了。
+    ///
+    /// [`Failed`]: FinishReason::Failed
+    ResourceLimit,
     /// 外壳自报的失败（上游报错、工具错误无法恢复……）。
     Failed,
 }
@@ -82,6 +92,14 @@ pub trait CaseEnv: Send + Sync {
     /// compose 工程名）在具体类型上，不在这个接口上。拿不到就报错——**不许**顺手换一个执行面
     /// 顶上，那等于对着一个不相干的环境判这道题。实现一律是 `self`。
     fn as_any(&self) -> &dyn std::any::Any;
+    /// 这个环境对外部流派的态度。
+    ///
+    /// 默认是**带理由的缺席**：一个环境不给这一位，说明的是「这个基准不托管外部程序」，
+    /// 不是「外部流派在这道题上得零分」——后者是一个假读数，而它长得像真读数（补丁为空
+    /// 就是没做对）。托管得了的后端覆写它，并给出自己那台机器。
+    fn foreign_face(&self) -> ForeignFace {
+        ForeignFace::Absent("this environment hosts no external agent program")
+    }
     /// 回收。判分读过它之后调用；重复调用必须是空操作（一条 case 失败也要回收）。
     async fn teardown(&self);
 }
@@ -259,6 +277,19 @@ pub trait AgentScaffold: Send + Sync {
     /// 旗标——外壳一旦能分辨臂就能特判，中立性就死了。
     fn action_space(&self) -> &'static [&'static str] {
         &[]
+    }
+
+    /// 这一行在**哪些列**上有定义。
+    ///
+    /// 默认全列有定义（仓里那四行都是这样：换一道基准它们还是同一个方法）。要有这一位，
+    /// 是因为有一类行的定义域本身就窄：吃「一棵树 ＋ 一个题面」、吐一个补丁的行，在一道
+    /// 没有树的基准上不是「跑坏了」，而是**这一列本来就没有这一行**。缺了这一位，那种行
+    /// 只能靠跑起来报错来表达自己不属于这里，而报错的形状（`errored`）读起来是「这一格
+    /// 有缺陷要修」——把一次定义域外的事故记成一次缺陷，就该有人去修一个没坏的东西。
+    ///
+    /// 不在定义域里的格子**不建**，也不计分：不是零分，是没有这一格。
+    fn applies_to(&self, _benchmark: &str) -> bool {
+        true
     }
 
     async fn solve(&self, case: &EvalCase, ctx: &SolveContext) -> anyhow::Result<AgentOutput>;

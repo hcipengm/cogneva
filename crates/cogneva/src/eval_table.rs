@@ -23,7 +23,7 @@ use cog_eval::adapters::{
     hle_benchmark, swe_pro_benchmark, toolathlon_benchmark, HleToolkit, SweProBackend,
     SweProToolkit, ToolathlonBackend, ToolathlonToolkit,
 };
-use cog_eval::scaffolds::{table_scaffolds, PlatformRunner};
+use cog_eval::scaffolds::{table_scaffolds, ForeignFlow, PlatformRunner};
 use cog_eval::{Benchmark, CaseSubset, Checkpoint, Rig, RunConfig, Table};
 use sha2::Digest;
 
@@ -57,7 +57,7 @@ pub const USAGE: &str = "\
 usage: cogneva eval-table --pins <file> --backbone <model>@<version> --judge <model>@<version>
                           [--tools <none|platform>] [--data-root <dir>]
                           [--benchmarks hle,swe-bench-pro,toolathlon]
-                          [--scaffolds codeact,gepa,agentflow,nql] [--seeds 0,1,2]
+                          [--scaffolds codeact,gepa,agentflow,nql[,<declared flow>]] [--seeds 0,1,2]
                           [--subset <file>] [--out <file>]
                           [--concurrency-slot <n>] [--admission <dir>]
                           [--admission-floor-unmeasured <n>]
@@ -75,7 +75,11 @@ usage: cogneva eval-table --pins <file> --backbone <model>@<version> --judge <mo
   --judge      the model that grades the columns whose judge is generative, name@version
   --data-root  the fetch script's --dest; falls back to COG_EVAL_DATA_ROOT
   --benchmarks comma-separated; default all three, in the canonical order
-  --scaffolds  comma-separated; default all four, in the table's row order
+  --scaffolds  comma-separated; default every row of this run's row set -- the four in-tree
+               scaffolds, plus whatever external flows the declaration in the environment names
+               (COGNEVA_EVAL_FOREIGN_FLOWS). An external flow is selected by the name it is
+               declared under; a name nobody declared is not a scaffold.
+
   --seeds      comma-separated independent runs per cell; default 0,1,2 (the main-table spec)
   --subset     run the cases an archived subset names, instead of every case. The archive is a
                file of `benchmark<TAB>case id` lines drawn once by `cogneva eval-case-subset`;
@@ -184,7 +188,11 @@ pub struct EvalTableArgs {
     pub data_root: Option<PathBuf>,
     /// 已经排成规范顺序。
     pub benchmarks: Vec<&'static str>,
-    pub scaffolds: Vec<&'static str>,
+    /// 已经排成规范顺序：仓里那四行在前，声明进来的外部流派按声明顺序跟在后面。
+    ///
+    /// 名字是 `String` 而不是 `&'static str`：外面的流派**从环境里声明进来**，它的名字
+    /// 不在编译期的那张表里。
+    pub scaffolds: Vec<String>,
     pub seeds: Vec<u64>,
     /// 只跑这份存档点名的题；`None` ＝全量。
     pub subset: Option<PathBuf>,
@@ -266,8 +274,33 @@ fn canonicalize<'a>(raw: &[String], known: &[&'a str], what: &str) -> Result<Vec
         .collect())
 }
 
+/// 与 [`canonicalize`] 同一件事，只是认识的名字分成两处来源：编译期那四个，加上环境里
+/// **声明**进来的外部流派。所以要 owned 的名字与 owned 的返回。
+fn canonicalize_owned(raw: &[String], known: &[String], what: &str) -> Result<Vec<String>, String> {
+    for name in raw {
+        if !known.contains(name) {
+            return Err(format!(
+                "unknown {what} `{name}` (have: {})",
+                known.join(", ")
+            ));
+        }
+    }
+    Ok(known.iter().filter(|k| raw.contains(k)).cloned().collect())
+}
+
 impl EvalTableArgs {
+    /// 只看仓里那四行是不是合法。认识**外部流派**名字的调用方走
+    /// [`EvalTableArgs::parse_with`]。
     pub fn parse(args: &[String]) -> Result<Self, String> {
+        Self::parse_with(args, &[])
+    }
+
+    /// `declared_scaffolds` ＝ 环境里声明进来的外部流派名字。
+    ///
+    /// 为什么要传进来而不是在这里读环境：`--scaffolds` 的合法取值是「这次实验的行集的
+    /// 那一份声明」，而那份声明来自环境——读在解析里，解析就不再是一个纯函数，命令行校验收
+    /// 到的就不再是参数本身。
+    pub fn parse_with(args: &[String], declared_scaffolds: &[String]) -> Result<Self, String> {
         let mut data_root = None;
         let mut tool_arm = None;
         let mut pins = None;
@@ -358,9 +391,18 @@ impl EvalTableArgs {
             Some(raw) => canonicalize(&raw, &BENCHMARKS, "benchmark")?,
             None => BENCHMARKS.to_vec(),
         };
+        // 行集的合法取值：仓里那四行 + 这次声明进来的外部流派。不去重也不排序声明进来的
+        // 那几个——它们按**声明的顺序**排在四行之后，表里行的次序于是与声明的次序一致。
+        let mut known_scaffolds: Vec<String> =
+            SCAFFOLDS.iter().map(|name| name.to_string()).collect();
+        for name in declared_scaffolds {
+            if !known_scaffolds.contains(name) {
+                known_scaffolds.push(name.clone());
+            }
+        }
         let scaffold_names = match scaffolds {
-            Some(raw) => canonicalize(&raw, &SCAFFOLDS, "scaffold")?,
-            None => SCAFFOLDS.to_vec(),
+            Some(raw) => canonicalize_owned(&raw, &known_scaffolds, "scaffold")?,
+            None => known_scaffolds.clone(),
         };
 
         // 两个界限只在闸门开着时才有意义。给了数却不开闸门，是「以为自己在设一个界」而
@@ -654,6 +696,11 @@ pub struct Wiring {
     /// 数据根里没有官方那两件脚本、或者这次被显式关了。三样要做的下一步分别是装机器、取脚本、
     /// 改开关——压成一句「没接上」，读的人会去翻一个翻不出东西的地方。
     pub swe_pro_reason: Option<String>,
+    /// 这次声明进来的外部流派（按声明顺序）。空 ＝ 这次跑只有仓里那四行。
+    pub foreign_flows: Vec<crate::eval_container::ForeignFlowSpec>,
+    /// 声明读不出来时的那句原因。它是**整块**不成立的原因：一块声明里有一行写坏，
+    /// 剩下的也不接——半块声明读起来像一次完整的实验，而它少了几行。
+    pub foreign_reason: Option<String>,
 }
 
 /// 一次跑的结果：要写出去的那段文本，以及这次跑是不是一次完整的实验。
@@ -872,7 +919,7 @@ fn error_split(table: &Table, declared: &[Missing]) -> (usize, usize) {
 fn missing_dependencies(
     tools: ToolArm,
     benchmarks: &[&str],
-    scaffolds: &[&str],
+    scaffolds: &[String],
     wiring: &Wiring,
 ) -> Vec<Missing> {
     let mut missing = Vec::new();
@@ -934,7 +981,7 @@ fn missing_dependencies(
              host has no compose runtime and the pack image has never been built",
         ));
     }
-    if scaffolds.contains(&"nql") && wiring.platform.is_none() {
+    if scaffolds.iter().any(|name| name == "nql") && wiring.platform.is_none() {
         missing.push(Missing::new(
             "nql",
             MissingScope::Row("nql".to_string()),
@@ -944,6 +991,32 @@ fn missing_dependencies(
                 None => "no platform is wired".to_string(),
             },
         ));
+    }
+    // 外部流派的声明写坏了：**整块不成立**，所以这次跑的行集里没有它们。`Run` 而不是
+    // 某一行：一行都没有建出来，没有格子可盖——它说的是「这一次跑不是你以为的那次实验」，
+    // 而这正是要有人去看的那件事（一个写错的声明与「今天不接外部流派」不能长得一样）。
+    if let Some(why) = &wiring.foreign_reason {
+        missing.push(Missing::new(
+            "foreign-flows",
+            MissingScope::Run,
+            Absence::NotWired,
+            why.clone(),
+        ));
+    }
+    // 声明了、也选了，但托管它们的机器没接上。盖**整行**：这一行的每一列都要那台机器。
+    // 理由照念容器后端那句——今天能托管外部程序的机器只有它那一台。
+    for flow in &wiring.foreign_flows {
+        if scaffolds.iter().any(|name| name == &flow.name) && wiring.swe_pro.is_none() {
+            missing.push(Missing::new(
+                &flow.name,
+                MissingScope::Row(flow.name.clone()),
+                Absence::NotWired,
+                wiring.swe_pro_reason.clone().unwrap_or_else(|| {
+                    "the container backend that would host this flow is not wired into this run"
+                        .to_string()
+                }),
+            ));
+        }
     }
     missing
 }
@@ -1027,8 +1100,20 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
         },
     );
     for scaffold in table_scaffolds(platform) {
-        if args.scaffolds.contains(&scaffold.name()) {
+        if args.scaffolds.iter().any(|name| name == scaffold.name()) {
             rig = rig.with_scaffold(scaffold);
+        }
+    }
+    // 外部流派那一维：谁、落在哪几列上、怎么起它、上限多少都由环境里的声明给定，所以这一侧
+    // 不加任何一支具体流派的名字——接一支新的就是改一次声明。
+    for flow in &wiring.foreign_flows {
+        if args.scaffolds.iter().any(|name| name == &flow.name) {
+            rig = rig.with_scaffold(Arc::new(ForeignFlow::new(
+                flow.name.clone(),
+                flow.entrypoint.clone(),
+                flow.limits,
+                flow.columns.clone(),
+            )));
         }
     }
 
@@ -1532,6 +1617,12 @@ fn platform_from_settings(
 /// 这里把它记成缺席而不是直接失败：表仍然出得来，读的人从 wiring 段看见真相。
 async fn wiring_from_config(args: &EvalTableArgs) -> Wiring {
     let mut wiring = Wiring::default();
+    // 外部流派的声明与下面的骨干、容器后端都无关，所以先读它：一块写坏的声明读不出来时
+    // 也要留下那句原因，而不是被后面某一条早退盖掉。
+    match crate::eval_container::foreign_flows() {
+        Ok(flows) => wiring.foreign_flows = flows,
+        Err(why) => wiring.foreign_reason = Some(why),
+    }
     // 传输先建：平台与骨干都要它，而且它建不出来时**两条上游一起缺席**。
     //
     // 这里不拿默认客户端顶上，因为骨干的每一家上游都是「没有客户端就报 no HttpClient
@@ -1648,7 +1739,13 @@ fn resolve_data_root(args: &EvalTableArgs) -> Result<std::path::PathBuf> {
 /// 子命令主入口。
 pub async fn run_from_args() -> Result<(), Box<dyn std::error::Error>> {
     let argv: Vec<String> = std::env::args().collect();
-    let args = match EvalTableArgs::parse(&operands(&argv)) {
+    // 声明里的名字要先读出来：`--scaffolds` 的合法取值是「这次实验的行集」，而外部流派是
+    // 环境声明进来的。读不出来时这里是空的——那时命令行上点它们会报「不认识的 scaffold」，
+    // 而报表里另有一行说着声明为什么读不出来。
+    let declared: Vec<String> = crate::eval_container::foreign_flows()
+        .map(|flows| flows.into_iter().map(|flow| flow.name).collect())
+        .unwrap_or_default();
+    let args = match EvalTableArgs::parse_with(&operands(&argv), &declared) {
         Ok(args) => args,
         // 用法跟着错误走：缺一个必填项与写错一个选项名，读的人都要能当场看见这个
         // 子命令收什么。
@@ -1722,6 +1819,78 @@ mod tests {
         .collect()
     }
 
+    /// 外部流派那几行的夹具：一支落在 swe-bench-pro 上的外部流派。
+    fn one_flow(name: &str) -> crate::eval_container::ForeignFlowSpec {
+        crate::eval_container::ForeignFlowSpec {
+            name: name.to_string(),
+            columns: vec!["swe-bench-pro".to_string()],
+            entrypoint: "sweagent solve".to_string(),
+            limits: cog_eval::ForeignLimits {
+                wall_clock: std::time::Duration::from_secs(900),
+                cpus: 2.0,
+                memory_bytes: 4 * 1024 * 1024 * 1024,
+            },
+        }
+    }
+
+    #[test]
+    fn a_declared_flow_is_a_scaffold_and_a_name_nobody_declared_is_not() {
+        let mut raw = minimal();
+        raw.extend(
+            ["--scaffolds", "swe-agent,nql"]
+                .iter()
+                .map(|s| s.to_string()),
+        );
+        let declared = vec!["swe-agent".to_string()];
+        let parsed = EvalTableArgs::parse_with(&raw, &declared).unwrap();
+        // 声明的行排在仓里那四行之后：行序由行集定，不由命令行的先后定。
+        assert_eq!(parsed.scaffolds, vec!["nql", "swe-agent"]);
+
+        // 没人声明过的名字仍然不是 scaffold，而且报错要把**认识的那几个**列出来，
+        // 否则读的人不知道是自己拼错了还是这次没声明。
+        let err = EvalTableArgs::parse_with(&raw, &[]).unwrap_err();
+        assert!(err.contains("swe-agent"), "{err}");
+        assert!(err.contains("codeact"), "{err}");
+    }
+
+    #[test]
+    fn a_declared_flow_with_no_machine_behind_it_is_blocked_not_errored() {
+        let wiring = Wiring {
+            foreign_flows: vec![one_flow("swe-agent")],
+            swe_pro_reason: Some("no container machine is usable on this host".to_string()),
+            ..Default::default()
+        };
+        let missing = missing_dependencies(
+            ToolArm::Platform,
+            &["swe-bench-pro"],
+            &["swe-agent".to_string()],
+            &wiring,
+        );
+        let flow = missing
+            .iter()
+            .find(|m| m.subject == "swe-agent")
+            .expect("this row has no machine, and that is a declaration, not a defect");
+        assert_eq!(flow.scope, MissingScope::Row("swe-agent".to_string()));
+        assert_eq!(flow.kind, Absence::NotWired);
+        // 理由照念容器后端那句：读的人据此知道该去装机器，而不是去改这一行。
+        assert!(flow.why.contains("no container machine"), "{}", flow.why);
+    }
+
+    #[test]
+    fn a_broken_flow_declaration_rejects_the_whole_run_as_an_experiment() {
+        let wiring = Wiring {
+            foreign_reason: Some("`COGNEVA_EVAL_FOREIGN_FLOWS` has a line that is not ...".into()),
+            ..Default::default()
+        };
+        let missing = missing_dependencies(ToolArm::Platform, &["hle"], &[], &wiring);
+        let declaration = missing
+            .iter()
+            .find(|m| m.subject == "foreign-flows")
+            .expect("a row set that is not what was asked for is not a complete experiment");
+        // `Run` 而不是某一行：一块写坏的声明一行都没建出来，没有格子可盖。
+        assert_eq!(declaration.scope, MissingScope::Run);
+    }
+
     #[test]
     fn benchmarks_and_scaffolds_come_out_in_the_canonical_order() {
         let mut raw = minimal();
@@ -1766,7 +1935,7 @@ mod tests {
         );
 
         let mut other = EvalTableArgs::parse(&minimal()).unwrap();
-        other.scaffolds = vec!["nql"];
+        other.scaffolds = vec!["nql".to_string()];
         assert_ne!(
             one.run_id,
             run_checkpoint(&other, &verified, None).run_id,
@@ -2478,7 +2647,8 @@ mod tests {
             no_transport: Some("cannot build an http client from http_client (boom)".into()),
             ..Default::default()
         };
-        let missing = missing_dependencies(ToolArm::Platform, &["hle"], &["nql"], &wiring);
+        let missing =
+            missing_dependencies(ToolArm::Platform, &["hle"], &["nql".to_string()], &wiring);
         let backbone = missing
             .iter()
             .find(|m| m.subject == "backbone")
@@ -2666,7 +2836,7 @@ mod tests {
         let declared = missing_dependencies(
             ToolArm::Platform,
             &["hle", "swe-bench-pro", "toolathlon"],
-            &["nql"],
+            &["nql".to_string()],
             &Wiring::default(),
         );
         let verified = BTreeMap::new();

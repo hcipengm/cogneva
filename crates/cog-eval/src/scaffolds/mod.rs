@@ -6,11 +6,13 @@
 
 pub mod agentflow;
 pub mod codeact;
+pub mod foreign;
 pub mod gepa;
 pub mod nql;
 
 pub use agentflow::AgentFlow;
 pub use codeact::CodeAct;
+pub use foreign::ForeignFlow;
 pub use gepa::Gepa;
 pub use nql::{Nql, PlatformRequest, PlatformRunner};
 

@@ -16,6 +16,7 @@ pub mod comparator;
 pub mod cross_system;
 pub mod dataset;
 pub mod dimensions;
+pub mod foreign;
 pub mod gateway;
 pub mod harness;
 pub mod judge;
@@ -52,6 +53,7 @@ pub use cross_system::{
     CrossSystemBenchmark, CrossSystemReport, ExternalSystem, MethodologyConfig, SystemScore,
 };
 pub use dataset::{EvalCase, EvalDataset};
+pub use foreign::{ForeignFace, ForeignLimits, ForeignOutcome, ForeignRequest, ForeignRunner};
 pub use harness::{HarnessConfig, RegressionHarness};
 pub use judge::{
     execution_efficiency_judge, goal_judge, logic_judge, plan_adherence_judge, plan_judge,

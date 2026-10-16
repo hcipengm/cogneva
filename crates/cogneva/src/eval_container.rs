@@ -24,7 +24,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use cog_core::{SFError, SFResult, ToolExecutor};
 use cog_eval::{
-    parse_test_list, swe_pro_tool_definitions, tools_bound_to, CaseEnv, EvalCase, SweProBackend,
+    parse_test_list, swe_pro_tool_definitions, tools_bound_to, CaseEnv, EvalCase, FinishReason,
+    ForeignFace, ForeignLimits, ForeignOutcome, ForeignRequest, ForeignRunner, SweProBackend,
     SweProTestReport, ToolFactory,
 };
 
@@ -64,6 +65,150 @@ const ENV_TIMEOUT_SECS: &str = "COGNEVA_EVAL_CONTAINER_TIMEOUT_SECS";
 const DEFAULT_TIMEOUT_SECS: u64 = 900;
 /// 运行时的开关：设成 `off` 就是这一次不接。
 const ENV_RUNTIME: &str = "COGNEVA_EVAL_CONTAINER_RUNTIME";
+
+/// 外部流派的声明：一行一支，制表符分三段——`名字 <TAB> 列名,列名 <TAB> 在这道题里怎么起它`。
+///
+/// 为什么是一块而不是每支流派一组旋钮：**这次跑的是哪几行**是这次实验的组成，声明在一处
+/// 才读得出来；拆成每支几条，读的人要凑几条 `env` 才拼得出这一张表有几行。
+///
+/// 为什么是制表符：名字与列名里不会出现制表符，而命令里什么都会出现——命令是这三段里
+/// 唯一一段自由文本，所以它放最后、占满余下全部。
+pub const ENV_FOREIGN_FLOWS: &str = "COGNEVA_EVAL_FOREIGN_FLOWS";
+/// 一支外部流派跑一次的三条上限：时间、核数、内存。**一起给，缺一条整条声明不成立**。
+///
+/// 不给一个猜来的默认值：外部流派的循环不在我们手里，上限就是这次跑唯一能管的那个旋钮，
+/// 而「上限是多少」是被实验定义的东西，不是这里能替人拍的数。给个默认值，读表的人会以为
+/// 那个数是量出来的——见 `ForeignLimits`。
+pub const ENV_FOREIGN_WALL_SECS: &str = "COGNEVA_EVAL_FOREIGN_WALL_SECS";
+pub const ENV_FOREIGN_CPUS: &str = "COGNEVA_EVAL_FOREIGN_CPUS";
+pub const ENV_FOREIGN_MEMORY_MB: &str = "COGNEVA_EVAL_FOREIGN_MEMORY_MB";
+
+/// 容器里那一段题面的落点。外部流派怎么读题由它定，我们只承诺「这一段文字是这道题」。
+const FOREIGN_PROBLEM_PATH: &str = "/tmp/foreign_problem.txt";
+/// 给这棵树拍照用的那一份索引，与仓库自己的工作索引分开。
+///
+/// 分开是必须的：外部程序自己怎么动 `git`（`add`、`stash`、`commit`……）都在我们管不到
+/// 的地方，用同一份索引取补丁，它动一下就变了——而这份补丁要拿去判分。
+const FOREIGN_INDEX_PATH: &str = "/tmp/foreign.index";
+
+/// 环境里声明的、可用的外部流派声明。
+///
+/// 读不出来就是 `Err(为什么)`，**不是**一个空列表：一块写坏的声明与「这次没有外部流派」
+/// 读起来一样，而处置相反——前者要去改声明，后者什么都不用做。
+pub fn foreign_flows() -> Result<Vec<ForeignFlowSpec>, String> {
+    let raw = std::env::var(ENV_FOREIGN_FLOWS).unwrap_or_default();
+    let lines: Vec<&str> = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    if lines.is_empty() {
+        return Ok(Vec::new());
+    }
+    parse_flows(&raw, foreign_limits()?)
+}
+
+/// 读一块声明。纯函数：它读的是**文本**，环境那一步在外面——所以「哪种声明算写坏了」
+/// 能被单测直接钉住，不必去动进程级的环境变量。
+fn parse_flows(raw: &str, limits: ForeignLimits) -> Result<Vec<ForeignFlowSpec>, String> {
+    let lines: Vec<&str> = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    if lines.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut flows: Vec<ForeignFlowSpec> = Vec::new();
+    for line in lines {
+        let mut parts = line.split('\t').map(str::trim);
+        let (Some(name), Some(columns), Some(entrypoint), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(format!(
+                "`{ENV_FOREIGN_FLOWS}` has a line that is not \
+                 `name<TAB>column,column<TAB>how to start it`: {line}"
+            ));
+        };
+        if name.is_empty() || entrypoint.is_empty() {
+            return Err(format!(
+                "`{ENV_FOREIGN_FLOWS}` has a line with no name or no entrypoint: {line}"
+            ));
+        }
+        let columns: Vec<String> = columns
+            .split(',')
+            .map(str::trim)
+            .filter(|column| !column.is_empty())
+            .map(String::from)
+            .collect();
+        if columns.is_empty() {
+            // 一支不落在任何列上的流派是一个永远不会跑的格子：它读起来像「这一行得了零分」，
+            // 而真相是这一行没有定义域。
+            return Err(format!(
+                "`{ENV_FOREIGN_FLOWS}` declares `{name}` on no column: a row that lands on no \
+                 column never runs, and reads like a row that scored zero"
+            ));
+        }
+        if flows.iter().any(|flow| flow.name == name) {
+            return Err(format!(
+                "`{ENV_FOREIGN_FLOWS}` declares `{name}` twice: two rows with one name cannot be \
+                 told apart in the table"
+            ));
+        }
+        flows.push(ForeignFlowSpec {
+            name: name.to_string(),
+            columns,
+            entrypoint: entrypoint.to_string(),
+            limits,
+        });
+    }
+    Ok(flows)
+}
+
+/// 三条上限。缺一条就整条声明不成立，理由要说得出缺的是哪一条。
+fn foreign_limits() -> Result<ForeignLimits, String> {
+    let number = |key: &str| -> Result<f64, String> {
+        std::env::var(key)
+            .map_err(|_| {
+                format!(
+                    "external flows are declared but `{key}` is not set: how long a foreign flow \
+                     may run and how much of this machine it may take is the one knob this run \
+                     can hold on a loop that is not ours, and this build will not invent it"
+                )
+            })?
+            .trim()
+            .parse::<f64>()
+            .map_err(|e| format!("`{key}` is not a number ({e})"))
+            .and_then(|value| {
+                if value.is_finite() && value > 0.0 {
+                    Ok(value)
+                } else {
+                    Err(format!("`{key}` must be a positive number, got {value}"))
+                }
+            })
+    };
+    let wall = number(ENV_FOREIGN_WALL_SECS)?;
+    let cpus = number(ENV_FOREIGN_CPUS)?;
+    let memory_mb = number(ENV_FOREIGN_MEMORY_MB)?;
+    Ok(ForeignLimits {
+        wall_clock: Duration::from_secs(wall as u64),
+        cpus: cpus as f32,
+        memory_bytes: (memory_mb * 1024.0 * 1024.0) as u64,
+    })
+}
+
+/// 一支外部流派的声明：谁、落在哪几列上、怎么起它、上限多少。
+///
+/// 这里只描述**形状**，不认识任何一支具体的流派：名字与命令都从环境里读进来，所以
+/// 接一支新的外部流派不用改这一侧的任何一行代码。
+#[derive(Debug, Clone)]
+pub struct ForeignFlowSpec {
+    pub name: String,
+    /// 它在哪些列上有定义（基准名）。列外的地方这一行**不建格子**，不是零分。
+    pub columns: Vec<String>,
+    pub entrypoint: String,
+    pub limits: ForeignLimits,
+}
 
 /// 一次容器命令的结局。
 #[derive(Debug, Clone)]
@@ -334,6 +479,58 @@ impl Container {
         }
     }
 
+    /// 给这棵树拍一张快照（一个 git 树对象）。
+    ///
+    /// 补丁取的是**两次快照之差**，不是「树上现在有什么」：判分前打进去的测试补丁也在树上，
+    /// 把它算成外部流派的功劳，读出来的补丁就不是它写的了。所以起跑前先拍一张。
+    ///
+    /// 快照走的一份**单独索引**：外部程序自己怎么动 `git` 都在我们管不到的地方（`add` 是
+    /// 外部流派最常见的动作），共用仓库那份工作索引时它动一下，读出来的差就变了。
+    async fn snapshot_tree(&self) -> anyhow::Result<String> {
+        let out = self
+            .shell(&format!(
+                "export GIT_INDEX_FILE={FOREIGN_INDEX_PATH}\n\
+                 [ -f {FOREIGN_INDEX_PATH} ] || git read-tree HEAD\n\
+                 git add -A -- .\n\
+                 git write-tree"
+            ))
+            .await?;
+        if out.code != Some(0) {
+            anyhow::bail!(
+                "cannot snapshot the instance's tree: {}",
+                tail(&out.stderr, 600)
+            );
+        }
+        // 判据是**形状**：`git write-tree` 只打一个对象 id。别的行（warn、钩子的输出）
+        // 混进 stdout 也不能被当成快照名——一个不是 id 的字符串要等到 `git diff` 那一步
+        // 才炸，而那时补丁已经取不回来了。
+        let tree = out.stdout.lines().last().unwrap_or("").trim().to_string();
+        let hex = tree.len() == 40 || tree.len() == 64;
+        if !hex || !tree.chars().all(|c| c.is_ascii_hexdigit()) {
+            anyhow::bail!(
+                "`git write-tree` did not report a tree id, so there is no snapshot to diff \
+                 against; it said: {}",
+                tail(&out.stdout, 300)
+            );
+        }
+        Ok(tree)
+    }
+
+    /// 两次快照之间的补丁。`--binary` 让二进制文件的改动也是一份能落地的补丁，而不是
+    /// 一行「Binary files differ」。
+    async fn tree_patch(&self, before: &str, after: &str) -> anyhow::Result<String> {
+        let out = self
+            .shell(&format!("git diff --binary --no-color {before} {after}"))
+            .await?;
+        if out.code != Some(0) {
+            anyhow::bail!(
+                "cannot read back what the foreign flow left in the tree: {}",
+                tail(&out.stderr, 600)
+            );
+        }
+        Ok(out.stdout)
+    }
+
     async fn remove(&self) -> anyhow::Result<()> {
         let out = self.runtime.exec(&["rm".into(), self.name.clone()]).await?;
         // 已经不在了不是错误：回收会被重复调用。分辨的办法只有 buildah 自己的措辞——实测
@@ -372,6 +569,14 @@ impl CaseEnv for SweProContainerEnv {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn foreign_face(&self) -> ForeignFace {
+        // 外部程序跑的机器就是**这道题的那台容器**，所以缝开在这里而不是组合根：题面依赖的
+        // 那棵树、判分要读的现场都在它里面，换一台机器跑出来的补丁不是这道题的补丁。
+        ForeignFace::Ready(Arc::new(ContainerForeignRunner {
+            container: self.container.clone(),
+        }))
     }
 
     async fn teardown(&self) {
@@ -466,6 +671,86 @@ impl ToolExecutor for ContainerExecutor {
                 cog_eval::SWE_PRO_TOOL_FILE_EDIT
             ))),
         }
+    }
+}
+
+/// 外部流派的执行面：在**这一道题的那台容器**里起它，收回它在树上留下的那个补丁。
+struct ContainerForeignRunner {
+    container: Arc<Container>,
+}
+
+#[async_trait]
+impl ForeignRunner for ContainerForeignRunner {
+    async fn run(&self, req: ForeignRequest<'_>) -> anyhow::Result<ForeignOutcome> {
+        // 题面进容器：外部流派怎么读它由它定，我们只承诺「这一段文字是这道题」。
+        self.container
+            .write_text(FOREIGN_PROBLEM_PATH, req.problem)
+            .await?;
+        let before = self.container.snapshot_tree().await?;
+        let started = std::time::Instant::now();
+        let out = self
+            .container
+            .shell(&foreign_script(req.entrypoint, req.limits))
+            .await?;
+        let elapsed = started.elapsed();
+        let after = self.container.snapshot_tree().await?;
+        let patch = self.container.tree_patch(&before, &after).await?;
+
+        let finish = foreign_finish(out.code);
+        if finish != FinishReason::Answered {
+            tracing::warn!(
+                flow = req.flow,
+                code = ?out.code,
+                elapsed_secs = elapsed.as_secs(),
+                stderr = %tail(&out.stderr, 400),
+                "the foreign flow did not report success; its tree changes are still read back"
+            );
+        }
+        // 撞上限也照样读补丁：它可能改了一半，而判分判的是那棵树。空补丁在这里是**真读数**
+        // （它什么都没改），与「它根本没起起来」（那是 `Err`）不是一件事。
+        Ok(ForeignOutcome { patch, finish })
+    }
+}
+
+/// 起一支外部流派的脚本：三条上限都落在这里。
+///
+/// 上限落在**这一次执行**上而不是容器上：这台容器判分那一步还要用，给容器上一条内存界会把
+/// 判分自己也框住，那是另一个改动。所以用 shell 能设的这几条界，它们只作用在这段里。
+fn foreign_script(entrypoint: &str, limits: ForeignLimits) -> String {
+    let wall = limits.wall_clock.as_secs().max(1);
+    // `RLIMIT_CPU` 的单位是**核·秒**：给 n 个核、T 秒，最多就是 n·T 个 CPU 秒。这是从那
+    // 一对值**导出**的一条界，不是另拍的一个数。
+    let cpu_secs = ((limits.cpus.max(0.0) as f64) * wall as f64)
+        .ceil()
+        .max(1.0) as u64;
+    let memory_kb = (limits.memory_bytes / 1024).max(1);
+    format!(
+        "if ! ulimit -v {memory_kb}; then \
+           echo \"cannot apply the memory cap: ulimit -v {memory_kb}\" >&2; exit 125; \
+         fi\n\
+         if ! ulimit -t {cpu_secs}; then \
+           echo \"cannot apply the cpu cap: ulimit -t {cpu_secs}\" >&2; exit 125; \
+         fi\n\
+         timeout -k 10 {wall} bash -lc {cmd}",
+        cmd = shq(entrypoint)
+    )
+}
+
+/// 这一跑算不算它自己收工的。
+///
+/// 撞上限与「它自己说不做了」必须分开：前者要问上限是不是给少了，后者要换方法。判据是退出码
+/// ——`timeout(1)` 到点动手用的是 124，`ulimit -t`（CPU 界）到点用的是 SIGXCPU（152），
+/// `ulimit -v` 撞上一般表现为进程被 OOM 掉（137）。这几个码只在这条脚本设的界上出现，而
+/// 这几个界都是组合根给的。
+fn foreign_finish(code: Option<i32>) -> FinishReason {
+    match code {
+        Some(0) => FinishReason::Answered,
+        // 152 = 128 + 24（SIGXCPU，CPU 界）。
+        Some(124) | Some(152) => FinishReason::ResourceLimit,
+        // 137 = 128 + 9（SIGKILL）：要么是 `timeout -k` 那一枪，要么是内存界把它 OOM 掉。
+        // 分不清是哪一件，但两件都是**我们设的界**打的，所以按界记。
+        Some(137) => FinishReason::ResourceLimit,
+        _ => FinishReason::Failed,
     }
 }
 
@@ -798,4 +1083,112 @@ fn pick_delimiter(content: &str) -> String {
         delimiter.push('_');
     }
     delimiter
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn limits() -> ForeignLimits {
+        ForeignLimits {
+            wall_clock: Duration::from_secs(900),
+            cpus: 2.0,
+            memory_bytes: 4 * 1024 * 1024 * 1024,
+        }
+    }
+
+    fn spec(name: &str, columns: &str, entrypoint: &str) -> String {
+        format!("{name}\t{columns}\t{entrypoint}")
+    }
+
+    #[test]
+    fn a_flow_declaration_carries_its_columns_and_its_command() {
+        let raw = format!(
+            "# 这次要接的两支\n{}\n{}\n",
+            spec(
+                "swe-agent",
+                "swe-bench-pro",
+                "sweagent run --problem /tmp/f.txt"
+            ),
+            spec(
+                "live-swe-agent",
+                "swe-bench-pro",
+                "python -m live --in /tmp/f.txt"
+            ),
+        );
+        let flows = parse_flows(&raw, limits()).unwrap();
+        assert_eq!(flows.len(), 2);
+        assert_eq!(flows[0].name, "swe-agent");
+        assert_eq!(flows[0].columns, vec!["swe-bench-pro".to_string()]);
+        // 命令里什么都会出现（引号、分号、管道），所以它必须原样读进来。
+        assert_eq!(flows[0].entrypoint, "sweagent run --problem /tmp/f.txt");
+        assert_eq!(flows[1].name, "live-swe-agent");
+        assert_eq!(flows[0].limits, limits());
+    }
+
+    #[test]
+    fn no_declaration_is_not_a_broken_declaration() {
+        assert!(parse_flows("", limits()).unwrap().is_empty());
+        assert!(parse_flows("\n\n  \n# 只有注释\n", limits())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_declaration_that_is_not_three_fields_is_refused_with_its_own_line() {
+        // 少一段：命令被吃成了列名。
+        let err = parse_flows("swe-agent\tswe-bench-pro", limits()).unwrap_err();
+        assert!(err.contains("swe-agent\tswe-bench-pro"), "{err}");
+        // 多一段：多半是命令里混进了制表符，读成两种意思都不对。
+        let err = parse_flows("a\tb\tcmd\textra", limits()).unwrap_err();
+        assert!(err.contains("TAB"), "{err}");
+        // 名字或命令是空的。
+        assert!(parse_flows("\tswe-bench-pro\tcmd", limits()).is_err());
+        assert!(parse_flows("a\tswe-bench-pro\t", limits()).is_err());
+    }
+
+    #[test]
+    fn a_row_that_lands_on_no_column_is_refused_rather_than_never_run() {
+        let err = parse_flows("swe-agent\t\tcmd", limits()).unwrap_err();
+        assert!(err.contains("no column"), "{err}");
+        // 重复的名字在表里分不开。
+        let raw = format!(
+            "{}\n{}",
+            spec("swe-agent", "swe-bench-pro", "a"),
+            spec("swe-agent", "swe-bench-pro", "b")
+        );
+        let err = parse_flows(&raw, limits()).unwrap_err();
+        assert!(err.contains("twice"), "{err}");
+    }
+
+    #[test]
+    fn the_three_caps_all_land_in_the_script() {
+        let script = foreign_script("sweagent solve", limits());
+        // 内存界按 KB 给（ulimit -v 的单位是 KB）。
+        assert!(script.contains("ulimit -v 4194304"), "{script}");
+        // CPU 界是**导出**的：2 核 × 900 秒 = 1800 核·秒，不是另拍的数。
+        assert!(script.contains("ulimit -t 1800"), "{script}");
+        assert!(script.contains("timeout -k 10 900"), "{script}");
+        // 命令原样进去，且被引起来：不引的话里面的元字符会静默改写参数。
+        assert!(script.contains("'sweagent solve'"), "{script}");
+    }
+
+    #[test]
+    fn the_command_is_quoted_so_its_metacharacters_do_not_rewrite_the_call() {
+        let script = foreign_script("a; rm -rf /tmp/x", limits());
+        assert!(script.contains("'a; rm -rf /tmp/x'"), "{script}");
+        let script = foreign_script("echo 'x'", limits());
+        assert!(script.contains(r"'echo '\''x'\'''"), "{script}");
+    }
+
+    #[test]
+    fn hitting_a_cap_we_set_is_not_reported_as_the_flow_giving_up() {
+        assert_eq!(foreign_finish(Some(0)), FinishReason::Answered);
+        assert_eq!(foreign_finish(Some(124)), FinishReason::ResourceLimit);
+        assert_eq!(foreign_finish(Some(152)), FinishReason::ResourceLimit);
+        assert_eq!(foreign_finish(Some(137)), FinishReason::ResourceLimit);
+        assert_eq!(foreign_finish(Some(1)), FinishReason::Failed);
+        // 没有退出码＝被信号打断，不是它自己收工。
+        assert_eq!(foreign_finish(None), FinishReason::Failed);
+    }
 }
