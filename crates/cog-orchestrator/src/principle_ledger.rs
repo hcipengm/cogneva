@@ -49,7 +49,7 @@ use cog_core::{
 
 use crate::change_measure::CheckTree;
 use crate::principle_measure::{
-    drift_annotation, judge, measurable, platform_declaration_pattern, Declarations,
+    drift_annotation, judge, measurable, platform_declaration_pattern, Declarations, DeclaredTwice,
     UnsettledReason, Verdict, PLATFORM_REGISTRY_FILES,
 };
 
@@ -535,6 +535,21 @@ async fn measure_pass(
         );
     }
 
+    // Two files claiming one slug is not a defect in either of them -- a
+    // principle may be asserted in more than one place -- but the map keys on
+    // the slug, so the account would record one carrier where the tree has two.
+    // The pair is printed rather than folded: which file owns the claim is a
+    // person's call, and a silent overwrite leaves them nothing to call it on.
+    let duplicate_declarations = declarations.duplicate_count();
+    if duplicate_declarations != 0 {
+        warn!(
+            duplicate_declarations,
+            duplicates = %duplicate_summary(declarations.duplicates()),
+            "principle ledger: more than one file declares the same principle, so the account \
+             records only the last one in tree order"
+        );
+    }
+
     let now = Instant::now();
     let mut enforced = 0usize;
     let mut unenforced = 0usize;
@@ -625,6 +640,7 @@ async fn measure_pass(
         unsettled = %reason_summary(&by_reason),
         already_unsettled = known_unsettled,
         orphan_declarations = ?orphan_declarations,
+        duplicate_declarations,
         revision = %revision,
         "principle ledger: judged the outstanding set against the two registries"
     );
@@ -782,6 +798,24 @@ fn orphan_summary(orphans: &[PrincipleOrphan]) -> String {
         .join(", ")
 }
 
+/// The slugs two files claim, one per line, with both files named.
+///
+/// The kept file first: it is the one the account records, so a reader who
+/// trusts that record can see which claim the tree actually carries and which
+/// one the map dropped.
+fn duplicate_summary(duplicates: &[DeclaredTwice]) -> String {
+    duplicates
+        .iter()
+        .map(|duplicate| {
+            format!(
+                "{}:{}<-{}",
+                duplicate.slug, duplicate.kept, duplicate.dropped
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The declarations the registry held but could not read, one per line.
 fn unreadable_summary(declarations: &Declarations) -> String {
     declarations
@@ -933,6 +967,22 @@ mod tests {
             row("b", Some("-"), Some(PrincipleState::Unenforced)),
         ];
         assert_eq!(outstanding_summary(&one), outstanding_summary(&two));
+    }
+
+    /// One slug claimed by two files reads as both files, kept first: a reader
+    /// trusting the account's carrier must be able to see which claim the map
+    /// dropped, or the overwrite is invisible exactly where it matters.
+    #[test]
+    fn the_duplicate_line_names_both_files_and_the_one_kept() {
+        let duplicates = vec![DeclaredTwice {
+            slug: "feedback_x".into(),
+            kept: "crates/x/tests/b.rs".into(),
+            dropped: "crates/x/tests/a.rs".into(),
+        }];
+        assert_eq!(
+            duplicate_summary(&duplicates),
+            "feedback_x:crates/x/tests/b.rs<-crates/x/tests/a.rs"
+        );
     }
 
     /// The reverse direction is by name and with the file. A total cannot tell a

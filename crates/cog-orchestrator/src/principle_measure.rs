@@ -201,6 +201,25 @@ pub struct Declarations {
     /// Declarations found that name a slug nothing can key on, as the file and
     /// the line as it was written.
     unreadable: Vec<(String, String)>,
+    /// Slugs two files both claim, with the file the map kept and the one it
+    /// overwrote.
+    duplicates: Vec<DeclaredTwice>,
+}
+
+/// One slug claimed by two files.
+///
+/// The map keys on the slug, so the second file silently replaces the first and
+/// the account records one carrier where the tree has two. Neither of them is
+/// wrong on its own: a principle may be asserted in more than one place. What
+/// must not happen is a reader concluding "one file enforces this" when two
+/// files claim to -- so the pair is kept and printed, not folded into the map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredTwice {
+    pub slug: String,
+    /// The file the map kept, which is the last one in tree order.
+    pub kept: String,
+    /// The file whose claim the map overwrote.
+    pub dropped: String,
 }
 
 impl Declarations {
@@ -215,6 +234,7 @@ impl Declarations {
     pub fn parse(lines: &[(String, String)]) -> Self {
         let mut gates = BTreeMap::new();
         let mut unreadable = Vec::new();
+        let mut duplicates = Vec::new();
         for (path, text) in lines {
             let Some(rest) = text.trim_start().strip_prefix(PLATFORM_DECLARATION_PREFIX) else {
                 // The pattern anchors the prefix at the start of the line, so a
@@ -224,12 +244,22 @@ impl Declarations {
             };
             let slug = rest.trim();
             if is_slug(slug) {
-                gates.insert(slug.to_string(), path.clone());
+                if let Some(dropped) = gates.insert(slug.to_string(), path.clone()) {
+                    duplicates.push(DeclaredTwice {
+                        slug: slug.to_string(),
+                        kept: path.clone(),
+                        dropped,
+                    });
+                }
             } else {
                 unreadable.push((path.clone(), text.trim().to_string()));
             }
         }
-        Self { gates, unreadable }
+        Self {
+            gates,
+            unreadable,
+            duplicates,
+        }
     }
 
     /// The file declaring a gate for this principle, if one does.
@@ -251,6 +281,20 @@ impl Declarations {
     /// How many such declarations the registry held.
     pub fn unreadable_count(&self) -> usize {
         self.unreadable.len()
+    }
+
+    /// The slugs more than one file claims, with both files named.
+    pub fn duplicates(&self) -> &[DeclaredTwice] {
+        &self.duplicates
+    }
+
+    /// How many slugs had a claim overwritten.
+    ///
+    /// Separate from the count of files: two declarations of one slug is one
+    /// duplicate, and the fix is to decide which file owns the claim, not to
+    /// delete one of them.
+    pub fn duplicate_count(&self) -> usize {
+        self.duplicates.len()
     }
 
     /// Whether the registry held anything it could not read.
@@ -554,6 +598,30 @@ mod tests {
             .unreadable
             .iter()
             .all(|(path, _)| path.starts_with("crates/x/tests/")));
+    }
+
+    /// Two files claiming one slug: the map keeps the last in tree order and
+    /// loses the first, and the lost one is named rather than silently dropped.
+    /// Without this the account records one carrier where the tree has two.
+    #[test]
+    fn a_second_file_claiming_one_slug_is_named_not_folded() {
+        let registry = declarations(&[
+            ("crates/x/tests/a.rs", "//! principle: feedback_x"),
+            ("crates/x/tests/b.rs", "//! principle: feedback_x"),
+            ("crates/x/tests/c.rs", "//! principle: feedback_y"),
+        ]);
+        assert_eq!(registry.duplicate_count(), 1);
+        assert_eq!(
+            registry.duplicates(),
+            &[DeclaredTwice {
+                slug: "feedback_x".to_string(),
+                kept: "crates/x/tests/b.rs".to_string(),
+                dropped: "crates/x/tests/a.rs".to_string(),
+            }]
+        );
+        // The unique declaration is not a duplicate, and the map still answers.
+        assert_eq!(registry.gate_for("feedback_x"), Some("crates/x/tests/b.rs"));
+        assert_eq!(registry.gate_for("feedback_y"), Some("crates/x/tests/c.rs"));
     }
 
     /// A line the expression matched but that does not carry the declaration
