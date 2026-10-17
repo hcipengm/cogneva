@@ -220,6 +220,15 @@ impl ToolathlonToolkit {
     pub fn without_tools() -> Self {
         Self { factory: None }
     }
+
+    /// 这一套是按题现造的工具面吗（`false` ＝ 关工具的那一臂）。
+    ///
+    /// 组合根要用它来判「主表那一臂真的绑上了工厂」：`with_factory` 与 `without_tools` 在
+    /// `toolset` 上的差别是空面与非空面，而空面在一题不声明 server 时也是合法的输出，
+    /// 所以只跑一题看不出来——那正是「零调用者」会以一条绿测试混过去的形状。
+    pub fn binds_factory(&self) -> bool {
+        self.factory.is_some()
+    }
 }
 
 /// 造出来的那批工具按名字认，重复的名字是错误（谁是那台 server 就说不清了）。

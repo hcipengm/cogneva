@@ -1221,8 +1221,8 @@ pub(crate) fn build_benchmark(
     tools: ToolArm,
 ) -> Result<Benchmark> {
     // 工具臂在这一处收口：`None` 是诊断臂。有工具臂（主表那一臂）要一整套工具实现，而组合根
-    // 今天只接得上 swe-bench-pro 那一束（bash/file_edit 落在这道题自己的容器里）；HLE 点名的
-    // web_search/python 与 toolathlon 点名的那些 MCP server 都还没有实现。
+    // 今天接得上两束：swe-bench-pro 的 bash/file_edit（落在这道题自己的容器里）与 toolathlon
+    // 按题面声明的 MCP server 现造的那一束；HLE 点名的 web_search/python 还没有实现。
     //
     // 少给几个工具会让这一格因为「工具面不同」得分——那是在量别的东西，所以宁可不跑：一个
     // 基准只要**有一件**工具没有实现，就整个不收工具臂，而不是拿半束工具顶上去。
@@ -1231,9 +1231,9 @@ pub(crate) fn build_benchmark(
         bail!(
             "--tools platform (the default): `{name}` pins tools the composition root has no \
              implementation for, and running it with a smaller tool face would score a different \
-             thing. Today only swe-bench-pro's face (bash/file_edit, bound to the instance's own \
-             container) is implemented; pass `--tools none` explicitly if all you want is a \
-             diagnostic run."
+             thing. Today two faces are implemented: swe-bench-pro's (bash/file_edit, bound to \
+             the instance's own container) and toolathlon's (the MCP servers each task declares, \
+             built per task); pass `--tools none` explicitly if all you want is a diagnostic run."
         );
     }
     Ok(match name {
@@ -1246,10 +1246,9 @@ pub(crate) fn build_benchmark(
                 SweProToolkit::without_tools()
             },
         ),
-        "toolathlon" => toolathlon_benchmark(
-            wiring.toolathlon.clone(),
-            ToolathlonToolkit::without_tools(),
-        ),
+        "toolathlon" => {
+            toolathlon_benchmark(wiring.toolathlon.clone(), toolathlon_toolkit(with_tools))
+        }
         other => bail!("unknown benchmark `{other}`"),
     })
 }
@@ -1259,7 +1258,19 @@ pub(crate) fn build_benchmark(
 /// 与 [`build_benchmark`] 分开，是为了让「哪一列收工具臂」是一条**读得出来的**判据，而不是
 /// 埋在 match 分支里的一个 if：加一列的工具实现时，改的是这里一处。
 fn has_tool_implementations(name: &str) -> bool {
-    matches!(name, "swe-bench-pro")
+    matches!(name, "swe-bench-pro" | "toolathlon")
+}
+
+/// toolathlon 那一列的工具面：带工具臂时绑上**按题现造**的工厂，只有诊断臂才关掉。
+///
+/// 单拿出来是为了让「这一列真的绑了工厂」有一条能测的判据：工厂缺席时 `toolset` 交回空面，
+/// 题照跑、分照出，只是量的不是这一列。绑工厂的那份实现与这一处调用必须一起看得到。
+fn toolathlon_toolkit(with_tools: bool) -> ToolathlonToolkit {
+    if with_tools {
+        ToolathlonToolkit::with_factory(crate::eval_toolathlon::toolathlon_tools())
+    } else {
+        ToolathlonToolkit::without_tools()
+    }
 }
 
 /// 报表里 `## wiring` 那一段要的两样东西：说不出话的依赖（缺席），以及接上了的那个平台
@@ -1863,6 +1874,20 @@ mod tests {
                 memory_bytes: 4 * 1024 * 1024 * 1024,
             },
         }
+    }
+
+    /// 工具臂不是「这一列存在」就够，得看它**真的绑了工厂**：`with_factory` 与
+    /// `without_tools` 都交得出一个 `Toolkit`，而后者在题不声明 server 时同样是合法空面。
+    /// 所以判据钉在工厂的有无上——把分支改回 `without_tools()` 这一格就红。
+    #[test]
+    fn the_toolathlon_arm_binds_a_factory_and_the_diagnostic_arm_does_not() {
+        assert!(
+            toolathlon_toolkit(true).binds_factory(),
+            "the tool arm must bind the per-task factory; an empty face would score this \
+             benchmark's name without its tools"
+        );
+        assert!(!toolathlon_toolkit(false).binds_factory());
+        assert!(has_tool_implementations("toolathlon"));
     }
 
     #[test]
