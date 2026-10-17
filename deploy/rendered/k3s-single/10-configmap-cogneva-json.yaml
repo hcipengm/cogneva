@@ -603,7 +603,7 @@ data:
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "{value} pod(s) that run the AOF repair are up while no repair reading reached Prometheus — the two sides are counted, not assumed, so a scaled-down redis is silent and a broken scrape path is not. Every aof_repair_* rule is silent in this state, and silence here is indistinguishable from a clean start, which is what makes it worth a rule of its own. Usual causes: the redis PodMonitor was never applied (the observability manifests have no automatic delivery path), its port selector no longer matches the port name the sidecar declares, or the exporter cannot read the textfile directory"
+              "summary": "{value} pod(s) that run the AOF repair are up while no repair reading reached Prometheus — the two sides are counted, not assumed, so a scaled-down redis is silent and a broken scrape path is not. Every aof_repair_* rule is silent in this state, and silence here is indistinguishable from a clean start, which is what makes it worth a rule of its own. Usual causes: the redis PodMonitor was never applied (the observability manifests ride the running rev: an in-cluster convergence loop applies them, so one missing from that rev is never applied), its port selector no longer matches the port name the sidecar declares, or the exporter cannot read the textfile directory"
             },
             {
               "name": "sandbox_command_oom_killed",
