@@ -1,3 +1,5 @@
+//! principle: feedback_a_paired_reading_lands_where_both_rulers_are_visible_and_is_measured_by_the_sender
+//!
 //! The durable per-call token ledger, against a live PostgreSQL.
 //!
 //! What these tests check is what the database decides: that a recorded call
