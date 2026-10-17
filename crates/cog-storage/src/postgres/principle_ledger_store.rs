@@ -12,6 +12,8 @@
 //!and a second CREATE TABLE here would be a second definition of it: the two
 //!would drift, and the one that wins is whichever ran last.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
@@ -343,6 +345,58 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
         .await
         .map_err(|e| SFError::Database(e.to_string()))?;
         Self::entries(rows)
+    }
+
+    async fn reopen_platform_gate_drift(
+        &self,
+        gates: &HashMap<String, String>,
+    ) -> SFResult<Vec<String>> {
+        // Read the settled rows and compare here rather than in one statement:
+        // the comparison is per slug, and expressing it in SQL would need the
+        // registry as a relation. `state = 'enforced'` is a small set (the rows a
+        // look has answered), so reading it whole costs less than carrying the
+        // registry into the database.
+        let settled: Vec<(String, Option<String>)> = sqlx::query(
+            "SELECT slug, platform_gate FROM principle_ledger \
+             WHERE state = 'enforced' AND check_kind IS DISTINCT FROM 'judgement'",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?
+        .iter()
+        .map(|row| {
+            Ok((
+                row.try_get("slug")
+                    .map_err(|e| SFError::Database(format!("slug: {e}")))?,
+                row.try_get("platform_gate")
+                    .map_err(|e| SFError::Database(format!("platform_gate: {e}")))?,
+            ))
+        })
+        .collect::<SFResult<_>>()?;
+
+        let moved: Vec<String> = settled
+            .into_iter()
+            .filter(|(slug, held)| gates.get(slug) != held.as_ref())
+            .map(|(slug, _)| slug)
+            .collect();
+        if moved.is_empty() {
+            return Ok(moved);
+        }
+
+        // The state goes back to "nothing has looked", not to `unenforced`: the
+        // row is one a look has to answer again, and writing an answer here would
+        // be this statement deciding what the next pass is for. `measured_at`
+        // clears with it so the row sorts with the other unmeasured ones rather
+        // than looking freshly looked at.
+        sqlx::query(
+            "UPDATE principle_ledger SET state = NULL, measured_at = NULL \
+             WHERE slug = ANY($1) AND state = 'enforced'",
+        )
+        .bind(&moved)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+        Ok(moved)
     }
 
     async fn refused(&self, limit: usize) -> SFResult<Vec<PrincipleRow>> {

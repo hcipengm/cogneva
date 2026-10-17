@@ -189,6 +189,106 @@ async fn a_held_row_does_not_crowd_a_settleable_one_out_of_the_pass() {
     cleanup(&pool, &marker).await;
 }
 
+/// Settle a row as `enforced`, recording `gate` as the platform-side file, which
+/// is what a measuring pass writes when it judges the row.
+async fn settle(store: &PostgresPrincipleLedgerStore, slug: &str, gate: Option<&str>) -> String {
+    let mut measurement =
+        cog_core::PrincipleMeasurement::new(slug.to_string(), cog_core::PrincipleState::Enforced);
+    measurement.platform_gate = gate.map(str::to_string);
+    store
+        .apply_principle_measurement(&measurement)
+        .await
+        .expect("write the measurement");
+    slug.to_string()
+}
+
+/// A gate the platform gains after a row was settled re-opens that row.
+///
+/// A settled row is out of the outstanding set for good, and no reading moves
+/// it: only a measurement writes the state. So a declaration added to a file
+/// after the row was judged would never be recorded against it, and the account
+/// would keep answering "the platform names no gate here" for a principle the
+/// platform now declares -- invisible on exactly the rows a gate is being moved
+/// onto, since the host's side settles them first.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_gate_the_platform_gains_reopens_a_row_a_look_had_settled() {
+    let _pass = PASS.lock().await;
+    let (store, pool, marker) = store().await;
+    let slug = file(&store, &marker, "settled", 1, PrincipleCheckKind::Tree).await[0].clone();
+    settle(&store, &slug, None).await;
+
+    let mut gates = std::collections::HashMap::new();
+    gates.insert(slug.clone(), "crates/probe/src/the_gate.rs".to_string());
+    let reopened = store
+        .reopen_platform_gate_drift(&gates)
+        .await
+        .expect("reconcile the platform gate");
+    assert_eq!(
+        reopened,
+        vec![slug.clone()],
+        "the row's gate came from nowhere"
+    );
+
+    let row = store
+        .get(&slug)
+        .await
+        .expect("read the row")
+        .expect("the row exists");
+    assert_eq!(
+        row.state, None,
+        "a re-opened row is one nothing has looked at"
+    );
+    assert_eq!(
+        row.measured_at, None,
+        "nor has anything looked at it recently"
+    );
+    let looked: Vec<String> = store
+        .outstanding(PASS_BOUND)
+        .await
+        .expect("read the outstanding set")
+        .into_iter()
+        .map(|row| row.slug)
+        .filter(|s| s.starts_with(&marker))
+        .collect();
+    assert!(
+        looked.contains(&slug),
+        "the row a pass is meant to judge is not in its set"
+    );
+    cleanup(&pool, &marker).await;
+}
+
+/// A row whose recorded gate is what the registry says is not touched: the
+/// reconciliation runs every pass, and re-opening an unchanged row would spend
+/// the pass on the same rows forever.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_row_whose_recorded_gate_already_matches_is_left_alone() {
+    let _pass = PASS.lock().await;
+    let (store, pool, marker) = store().await;
+    let slug = file(&store, &marker, "settled", 1, PrincipleCheckKind::Tree).await[0].clone();
+    settle(&store, &slug, Some("crates/probe/src/the_gate.rs")).await;
+
+    let mut gates = std::collections::HashMap::new();
+    gates.insert(slug.clone(), "crates/probe/src/the_gate.rs".to_string());
+    let reopened = store
+        .reopen_platform_gate_drift(&gates)
+        .await
+        .expect("reconcile the platform gate");
+    assert!(
+        reopened.is_empty(),
+        "an unchanged gate re-opened {reopened:?}"
+    );
+
+    let row = store
+        .get(&slug)
+        .await
+        .expect("read the row")
+        .expect("the row exists");
+    assert_eq!(row.state, Some(cog_core::PrincipleState::Enforced));
+    cleanup(&pool, &marker).await;
+}
+
 /// The rows a person holds stay in the set when there is room, because the pass
 /// line counts them.
 ///

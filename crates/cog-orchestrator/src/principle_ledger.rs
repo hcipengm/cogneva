@@ -405,7 +405,7 @@ async fn measure_pass(
     // for: without it, a large enough unanswerable set would mean nothing below
     // it is ever reached.
     let take = MEASUREMENTS_PER_PASS.saturating_add(unsettled.len());
-    let rows = match store.outstanding(take).await {
+    let mut rows = match store.outstanding(take).await {
         Ok(rows) => rows,
         Err(e) => {
             warn!(
@@ -436,6 +436,56 @@ async fn measure_pass(
             return;
         }
     };
+
+    // A row a look has settled leaves the outstanding set for good, and folding
+    // a reading in cannot put it back: only a measurement writes `state`. So a
+    // gate the platform gains after the row was settled would never be recorded
+    // against it, and the account would go on reporting "the platform names no
+    // gate here" through every pass for a principle the platform now declares.
+    // That is the exact shape of moving a gate onto the platform -- the host's
+    // side is already settled, so the move would be invisible on its own rows.
+    //
+    // The comparison is against what the row records, not against the tree's
+    // revision, so a row is asked again once per change rather than once per
+    // commit.
+    let gates: HashMap<String, String> = declarations
+        .slugs()
+        .filter_map(|slug| {
+            declarations
+                .gate_for(slug)
+                .map(|file| (slug.to_string(), file.to_string()))
+        })
+        .collect();
+    match store.reopen_platform_gate_drift(&gates).await {
+        Ok(reopened) if reopened.is_empty() => {}
+        Ok(reopened) => {
+            info!(
+                reopened = reopened.len(),
+                principles = %reopened.join(", "),
+                "principle ledger: the registry names a gate for rows whose recorded gate is \
+                 not that file, so they are asked again"
+            );
+            // The rows just re-opened were not in the set read before the
+            // registry was, so this pass would otherwise not judge them until
+            // the next one.
+            rows = match store.outstanding(take).await {
+                Ok(rows) => rows,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "principle ledger: the outstanding set could not be read after \
+                         re-opening rows, so this pass judged none"
+                    );
+                    return;
+                }
+            };
+        }
+        Err(e) => warn!(
+            error = %e,
+            "principle ledger: rows whose recorded platform gate is not the registry's could \
+             not be re-opened; they keep what they had"
+        ),
+    }
 
     // The reverse direction, before any verdict: a declaration naming a slug the
     // account has no row for is reported by name and with the file that says it.

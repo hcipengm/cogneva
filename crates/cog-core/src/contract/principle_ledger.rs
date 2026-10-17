@@ -25,6 +25,8 @@
 //!what keeps "we have a gate for this" from meaning "we say we have a gate for
 //!this".
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -517,6 +519,33 @@ pub trait PrincipleLedgerStore: Send + Sync {
     /// stays `None` and they would otherwise return to the head of every pass
     /// and take the whole bounded set with them.
     async fn outstanding(&self, limit: usize) -> SFResult<Vec<PrincipleRow>>;
+
+    /// Clear the measured state of the enforced rows whose recorded
+    /// platform-side gate is not the one the registry now names for them, and
+    /// answer which rows were re-opened.
+    ///
+    /// [`Self::outstanding`] leaves out every row a look has settled, and a
+    /// reading cannot settle a row -- only a measurement can ([`Self::declare`]).
+    /// Between the two, a gate the platform gains *after* the row was settled is
+    /// never recorded against it: the account goes on saying the platform names
+    /// no gate here, through every pass, for a principle the platform now
+    /// declares. The rows that hurts are exactly the ones a gate is being moved
+    /// onto, since a principle the host already enforces is already settled.
+    ///
+    /// `gates` is the registry as read this pass: slug to the file that declares
+    /// it. A row is re-opened when the two differ, which covers both directions
+    /// -- declared now and nothing recorded, and recorded from a declaration the
+    /// registry no longer carries. Rows that already agree are not touched, so
+    /// this re-asks a row once per change rather than once per pass.
+    ///
+    /// Only `enforced` rows are considered. The others are in the outstanding
+    /// set already, and clearing their state would make a row that a look has
+    /// answered look like one nothing has looked at, moving it to the head of the
+    /// set for no gain.
+    async fn reopen_platform_gate_drift(
+        &self,
+        gates: &HashMap<String, String>,
+    ) -> SFResult<Vec<String>>;
 
     /// The rows a gate has refused work because of, most recently refused first.
     ///

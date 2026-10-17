@@ -230,6 +230,7 @@ mod tests {
         PrincipleCensus, PrincipleCheckKindCensus, PrincipleFold, PrincipleMeasurement,
         PrincipleReading, PrincipleRow, SFResult,
     };
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
     /// A log excerpt carrying every shape the runner printed for one failing
@@ -315,6 +316,12 @@ mod tests {
             unimplemented!()
         }
         async fn outstanding(&self, _: usize) -> SFResult<Vec<PrincipleRow>> {
+            unimplemented!()
+        }
+        async fn reopen_platform_gate_drift(
+            &self,
+            _: &HashMap<String, String>,
+        ) -> SFResult<Vec<String>> {
             unimplemented!()
         }
         async fn refused(&self, _: usize) -> SFResult<Vec<PrincipleRow>> {
