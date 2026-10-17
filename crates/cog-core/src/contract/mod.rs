@@ -42,6 +42,7 @@ pub mod quota;
 pub mod reflection;
 pub mod reranker;
 pub mod resilience;
+pub mod resource_ledger;
 pub mod sandbox;
 pub mod shutdown;
 pub mod skill;

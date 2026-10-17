@@ -98,6 +98,7 @@
 //! Counting them into the maximum instead would compare two different events
 //! under one name.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -108,6 +109,7 @@ use async_trait::async_trait;
 use crate::admission::{sample, Pressure};
 use crate::config::BuildGateConfig;
 use crate::contract::observability::{DimensionSpec, Observable, RawMetric, TraceFragment};
+use crate::contract::resource_ledger::{ResourceEvent, ResourceEventKind, ResourceEventOutcome};
 use crate::{SFError, SFResult};
 
 /// Builds holding a slot in this process, as a gauge.
@@ -391,6 +393,19 @@ pub fn install(cfg: &BuildGateConfig) -> Arc<BuildGate> {
 /// The process-wide gate, when one has been installed.
 pub fn global() -> Option<Arc<BuildGate>> {
     GLOBAL.get().cloned()
+}
+
+/// Hands this process's queued resource events to the account's consumer.
+///
+/// Empty when no gate is in force: a process that bounds no builds makes no
+/// decisions about the host, so it has no events about the bound to report.
+pub fn drain_resource_events() -> Vec<ResourceEvent> {
+    global().map(|gate| gate.drain_events()).unwrap_or_default()
+}
+
+/// How many events a full ring pushed out before a consumer took them.
+pub fn dropped_resource_events() -> u64 {
+    global().map(|gate| gate.events_dropped()).unwrap_or(0)
 }
 
 /// What a process should publish about the build bound, given whether it runs
@@ -1058,6 +1073,77 @@ pub fn reserve_build_field(what: &str) {
     }
 }
 
+/// How many events a gate holds before it starts dropping the oldest.
+///
+/// Sized for a consumer that ticks every few minutes: a refusal burst is a few
+/// dozen asks, and a bound moves at most once per measurement window. The number
+/// is not a policy about how many events matter -- anything this large means the
+/// consumer is not running, which is what the dropped count is for.
+const EVENT_RING_CAPACITY: usize = 256;
+
+/// The process that made a decision about the host, as the account records it.
+///
+/// In a pod `HOSTNAME` is the pod name, which is the identity a reader can find
+/// in the cluster. Without one this falls back to the host's own name, and only
+/// then to a word that says the identity is unknown rather than inventing one.
+fn gate_actor() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty())
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The account's event for a bound that moved, or `None` when it did not.
+///
+/// Stated apart from the measurement so the shape can be judged without a host:
+/// the five things the account promises a reader -- who, when, on which reading,
+/// from what to what, and how it ended -- are all here, and none of them can be
+/// read off the log line this replaces after that line rotates away.
+#[allow(clippy::too_many_arguments)]
+fn bound_move_event(
+    current: usize,
+    next: usize,
+    ceiling: usize,
+    dimension: &'static str,
+    calm: bool,
+    dir: &Path,
+    cores: usize,
+    busy_cores: f64,
+) -> Option<ResourceEvent> {
+    if next == current {
+        // A decision not to move is not an event: the account records what
+        // happened, and a row per quiet window would bury the rows that matter
+        // under the ones that say nothing did.
+        return None;
+    }
+    Some(ResourceEvent {
+        kind: ResourceEventKind::BoundChange,
+        occurred_at: chrono::Utc::now(),
+        subject: "build_gate.bound".to_string(),
+        actor: gate_actor(),
+        reading: BUILD_GATE_CEILING.to_string(),
+        reading_value: Some(ceiling as f64),
+        from_value: Some(current as i64),
+        to_value: Some(next as i64),
+        outcome: ResourceEventOutcome::Applied,
+        detail: serde_json::json!({
+            "dimension": dimension,
+            "calm": calm,
+            "dir": dir.display().to_string(),
+            "cores": cores,
+            "busy_cores": busy_cores,
+        }),
+        count: 1,
+    })
+}
+
 /// The host-wide build bound.
 pub struct BuildGate {
     dir: PathBuf,
@@ -1095,6 +1181,22 @@ pub struct BuildGate {
     wait_ms_max: AtomicU64,
     held_ms_total: AtomicU64,
     held_ms_max: AtomicU64,
+    /// Events this process produced and has not handed to the account's
+    /// consumer yet.
+    ///
+    /// In this process's memory rather than written to the database here: the
+    /// gate is core, it has no store, and a producer that reached into storage
+    /// would make a bound's move fail on a database that is down -- a decision
+    /// about the host cannot wait on a database. The consumer drains this and
+    /// appends; an event therefore survives until the process that saw it ends,
+    /// which is longer than the counter it replaces survives (a counter loses
+    /// its whole history at restart, this loses only what it has not yet
+    /// handed over).
+    events: Mutex<VecDeque<ResourceEvent>>,
+    /// Events pushed out of the ring before a consumer took them. Published,
+    /// not hidden: a bounded queue that overflows silently turns "the account
+    /// is complete" into a claim nobody can check.
+    events_dropped: AtomicU64,
 }
 
 impl std::fmt::Debug for BuildGate {
@@ -1143,7 +1245,40 @@ impl BuildGate {
             wait_ms_max: AtomicU64::new(0),
             held_ms_total: AtomicU64::new(0),
             held_ms_max: AtomicU64::new(0),
+            events: Mutex::new(VecDeque::new()),
+            events_dropped: AtomicU64::new(0),
         }
+    }
+
+    /// Queues one event for the account's consumer.
+    ///
+    /// The ring is bounded, and what it drops is counted rather than silently
+    /// lost. A consumer that is not running is the case where the ring fills;
+    /// the count is what lets a reading say "events are being produced and
+    /// nothing is consuming them" instead of the account simply appearing
+    /// smaller than the world.
+    fn record_event(&self, event: ResourceEvent) {
+        let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        if events.len() >= EVENT_RING_CAPACITY {
+            events.pop_front();
+            self.events_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        events.push_back(event);
+    }
+
+    /// Hands over everything queued so far, oldest first.
+    ///
+    /// Draining is the consumer's act, in one step: an event is either still
+    /// here for the next consumer or already handed to this one. Two consumers
+    /// cannot both take it, because the queue is taken rather than copied.
+    pub fn drain_events(&self) -> Vec<ResourceEvent> {
+        let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        events.drain(..).collect()
+    }
+
+    /// How many events were lost to a full ring since this process started.
+    pub fn events_dropped(&self) -> u64 {
+        self.events_dropped.load(Ordering::Relaxed)
     }
 
     /// Whether this gate is excluding anything at all.
@@ -1357,6 +1492,25 @@ impl BuildGate {
                 dir = %self.dir.display(),
                 "host build bound moved"
             );
+            // The same move, into the account: a bound that moved at runtime
+            // left no commit behind, and a log line has rotated away by the
+            // time anyone asks why the bound is what it is. Only the controller
+            // records it -- one process makes the decision, and a process that
+            // merely held back below it did not make one.
+            if controller {
+                if let Some(event) = bound_move_event(
+                    current,
+                    enforce,
+                    ceiling,
+                    dimension,
+                    calm,
+                    &self.dir,
+                    load.cores,
+                    load.busy_cores,
+                ) {
+                    self.record_event(event);
+                }
+            }
         }
     }
 
@@ -1721,6 +1875,32 @@ impl BuildGate {
                     None => "",
                 };
                 let reason = format!("{opening}{} ({held})", by.reason(bound, budget));
+                // The refusal, into the account. The counter beside this says
+                // how many; it cannot say when, or which bound was in force, or
+                // who was holding -- and it dies with this process. The subject
+                // carries the wall as well as the ask, because the same work
+                // turned away by two different walls is two facts, not one
+                // counted twice.
+                self.record_event(ResourceEvent {
+                    kind: ResourceEventKind::AdmissionRefusal,
+                    occurred_at: chrono::Utc::now(),
+                    subject: format!("{what}:{}", by.as_str()),
+                    actor: gate_actor(),
+                    reading: BUILD_GATE_SLOTS.to_string(),
+                    reading_value: Some(bound as f64),
+                    from_value: None,
+                    to_value: None,
+                    outcome: ResourceEventOutcome::Refused,
+                    detail: serde_json::json!({
+                        "wall": by.as_str(),
+                        "what": what,
+                        "holder": held,
+                        "bound": bound,
+                        "ceiling": self.measured_ceiling.load(Ordering::Relaxed),
+                        "dir": self.dir.display().to_string(),
+                    }),
+                    count: 1,
+                });
                 tracing::warn!(
                     what,
                     asker = asker_label(asker),
@@ -3971,5 +4151,100 @@ unevictable 28532736
                 )
             })
             .collect()
+    }
+
+    /// A refusal has to reach the account with the four things a counter cannot
+    /// carry: when it happened, which wall, which bound was in force, and which
+    /// work paid for it. The counter beside it survives only as long as the
+    /// process does.
+    #[tokio::test]
+    async fn a_refusal_is_also_an_event_with_its_wall_and_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 1);
+
+        let _held = gate.try_acquire("holder").await.unwrap();
+        assert!(gate.acquire("one-shot build").await.is_err());
+
+        let events = gate.drain_events();
+        assert_eq!(events.len(), 1, "one refusal, one event: {events:?}");
+        let event = &events[0];
+        assert_eq!(event.kind, ResourceEventKind::AdmissionRefusal);
+        assert_eq!(event.outcome, ResourceEventOutcome::Refused);
+        assert!(
+            event.subject.starts_with("one-shot build:"),
+            "the subject names the work that was turned away: {}",
+            event.subject
+        );
+        assert!(
+            event.subject.ends_with(RefusedBy::WaitedOut.as_str()),
+            "and the wall that turned it away: {}",
+            event.subject
+        );
+        assert_eq!(event.reading, BUILD_GATE_SLOTS);
+        assert_eq!(
+            event.reading_value,
+            Some(1.0),
+            "the bound in force at the refusal is part of the row"
+        );
+        assert_eq!(event.count, 1);
+        assert!(
+            gate.drain_events().is_empty(),
+            "draining hands the events over once; a second consumer must not see the same refusal"
+        );
+    }
+
+    /// A bound that moved carries both ends and the reading it moved on; a bound
+    /// that did not move is not an event at all, or every quiet window would add
+    /// a row saying nothing happened.
+    #[test]
+    fn a_bound_that_moved_is_an_event_with_both_ends() {
+        let dir = Path::new("/tmp/gate-dir");
+        let moved = bound_move_event(1, 3, 3, DIM_IO, true, dir, 24, 20.0)
+            .expect("a move from 1 to 3 is an event");
+        assert_eq!(moved.kind, ResourceEventKind::BoundChange);
+        assert_eq!(moved.outcome, ResourceEventOutcome::Applied);
+        assert_eq!(moved.subject, "build_gate.bound");
+        assert_eq!(moved.reading, BUILD_GATE_CEILING);
+        assert_eq!(moved.reading_value, Some(3.0));
+        assert_eq!(moved.from_value, Some(1));
+        assert_eq!(moved.to_value, Some(3));
+        assert_eq!(moved.detail["dimension"], DIM_IO);
+        assert_eq!(moved.detail["calm"], true);
+        assert!(
+            bound_move_event(2, 2, 2, DIM_IO, false, dir, 24, 24.0).is_none(),
+            "a bound that stayed where it was is not a move"
+        );
+    }
+
+    /// The ring is bounded, and what it pushes out is counted: a consumer that
+    /// is not running must not make the account look like a world in which
+    /// nothing happened.
+    #[tokio::test]
+    async fn a_full_ring_drops_the_oldest_and_counts_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 1);
+        let event = |n: i64| ResourceEvent {
+            kind: ResourceEventKind::AdmissionRefusal,
+            occurred_at: chrono::Utc::now(),
+            subject: format!("asker-{n}"),
+            actor: "test".to_string(),
+            reading: BUILD_GATE_SLOTS.to_string(),
+            reading_value: Some(1.0),
+            from_value: None,
+            to_value: None,
+            outcome: ResourceEventOutcome::Refused,
+            detail: serde_json::json!({}),
+            count: 1,
+        };
+        for n in 0..(EVENT_RING_CAPACITY as i64 + 10) {
+            gate.record_event(event(n));
+        }
+        assert_eq!(gate.events_dropped(), 10);
+        let drained = gate.drain_events();
+        assert_eq!(drained.len(), EVENT_RING_CAPACITY);
+        assert_eq!(
+            drained[0].subject, "asker-10",
+            "the oldest are the ones pushed out, and the newest are what a consumer gets"
+        );
     }
 }

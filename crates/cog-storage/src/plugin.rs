@@ -887,6 +887,26 @@ impl cog_core::SystemPlugin for StoragePlugin {
             warn!("No PostgreSQL pool; the principle ledger is unavailable in this deployment");
         }
 
+        // ── ResourceEventStore ──
+        // The fourth account, and the same rule for the same reason: the table
+        // is where an event outlives the process that saw it, and a
+        // process-local one would lose every refusal with the pod that counted
+        // it -- which is the state this account was built to leave. Without a
+        // pool nothing is published, and the loop that carries the events finds
+        // no store and stays away.
+        if let Some(pool) = self.pg_pool.clone() {
+            let store: Arc<dyn cog_core::ResourceEventStore> =
+                Arc::new(crate::PostgresResourceEventStore::new(pool));
+            ctx.publish_service(store);
+            info!("StoragePlugin resource event store published");
+        } else if strict_persistence {
+            return Err(cog_core::SFError::Config(
+                "No PostgreSQL pool for ResourceEventStore (strict_persistence=true)".into(),
+            ));
+        } else {
+            warn!("No PostgreSQL pool; the resource account is unavailable in this deployment");
+        }
+
         // ── BackupRunStore ──
         // The backup account is the table, the same as the two ledgers above, and
         // the same rule applies for the same reason: without a pool nothing is

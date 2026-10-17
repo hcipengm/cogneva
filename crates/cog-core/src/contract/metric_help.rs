@@ -921,6 +921,17 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          whose plan names roles this deployment does not staff, which is a \
          configuration gap rather than a defect in the document.",
     ),
+    (
+        crate::metric_names::RESOURCE_EVENTS_DROPPED_TOTAL.as_str(),
+        "Events the build gate's evidential ring pushed out before the loop that \
+         carries them could take them, counted since the producing process \
+         started and accumulated by the store across restarts. This is the one \
+         loss the account cannot show any other way: a dropped event leaves no \
+         row, so the producer's own tally is the only place the loss exists -- \
+         which is why it is a counter and the census is not. Any increase means \
+         the ring is too small for the rate the gate produces at, or the \
+         carrying loop has stopped.",
+    ),
 ];
 
 /// Descriptions for the histogram series. See [`COUNTER_HELP`].
@@ -1519,6 +1530,41 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          rollout-stalling round shows before it stalls, and `failed` is a \
          reading of its own -- a compile that gave up in seconds is not a fast \
          build",
+    ),
+    (
+        crate::metric_names::RESOURCE_EVENTS.as_str(),
+        "How many events the resource account holds, by `kind` (bound_change or \
+         admission_refusal) and `outcome` (applied, refused, deferred). Every \
+         pair of the two closed sets is written on every pass, zero included, \
+         so an empty cell says none of that shape has happened rather than \
+         that nothing is publishing. It is a gauge because it is re-read out \
+         of the table each pass: the count is the account's, not the \
+         process's, and a restart re-reads the same total instead of starting \
+         at zero. The series it replaces was the in-process refusal counter, \
+         which published 244 series over three days of which 243 began at zero \
+         and only 6 ended non-zero -- the count of refusals died with each pod. \
+         A bound change is a decision about the host and a refusal is a \
+         decision about a piece of work; summing them answers \"something \
+         happened\", so read the kind.",
+    ),
+    (
+        crate::metric_names::RESOURCE_EVENTS_PENDING.as_str(),
+        "Events written to the resource account and not yet folded by the loop \
+         that consumes it. Rising and staying up is the reading that says \
+         nobody is consuming the account: the producer's evidential ring is \
+         bounded and drains into this table, so no backlog is a working \
+         consumer and a backlog that only grows is not. Read it with \
+         cogneva_resource_events_oldest_unfolded_age_seconds: the count says \
+         how much is waiting and the age says whether it is arriving or stuck.",
+    ),
+    (
+        crate::metric_names::RESOURCE_EVENTS_OLDEST_UNFOLDED_AGE_SECONDS.as_str(),
+        "How long ago the oldest unfolded resource event happened. Absent when \
+         nothing is pending, and absent rather than zero because a zero would \
+         claim an event is waiting right now. This is the half of the backlog \
+         reading a count cannot give: a handful of events from the last few \
+         seconds is a queue working, and the same handful from yesterday is a \
+         consumer that is not.",
     ),
 ];
 

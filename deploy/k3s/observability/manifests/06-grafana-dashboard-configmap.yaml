@@ -1902,6 +1902,61 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 47,
+          "title": "Resource Account: Events, Backlog and Lost Events",
+          "description": "The resource account's event half, read back out of the platform's own table. The per-kind lines are what the account holds: a bound change is a decision the platform made about the host, an admission refusal is a decision it made about a piece of work, and they are drawn apart because a sum of them answers only that something happened. Every kind and outcome is written on every pass, zero included, so a flat line at zero means none of that shape has happened and an absent line means nothing is publishing. The backlog lines are the consumer half: the pending count is how much is written and not yet folded, and the age of the oldest unfolded event is what separates a queue working from a consumer that has stopped -- a count alone reads the same in both cases. The lost-events line is the one the account cannot recover: an event the producer's ring pushed out before it was carried leaves no row anywhere, so it is counted at the producer and accumulated by the store, and any increase means either the ring is too small for the rate the gate produces at or the carrying loop has stopped. All of these are readings of the whole account, taken from the process that holds the fold seat, so they are read as maximum across label sets rather than summed.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 208
+          },
+          "targets": [
+            {
+              "expr": "max by (kind, outcome) (cogneva_resource_events)",
+              "legendFormat": "{{kind}} / {{outcome}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max(cogneva_resource_events_pending)",
+              "legendFormat": "unfolded events",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max(cogneva_resource_events_oldest_unfolded_age_seconds)",
+              "legendFormat": "age of the oldest unfolded event",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "sum(increase(cogneva_resource_events_dropped_total[10m]))",
+              "legendFormat": "events lost to a full ring",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {

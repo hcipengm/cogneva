@@ -787,6 +787,32 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
             None => info!("principle ledger loop not started: no PrincipleLedgerStore published"),
         }
 
+        // Resource ledger loop.
+        //
+        // The same four parts the accounts above play -- authoritative table,
+        // resident reader, consumer, write back -- over the two facts this
+        // platform makes about resources that leave nothing behind: a bound the
+        // control law moved at runtime, and a piece of work a gate turned away.
+        // Started only where an event store was published, and not being
+        // started is not a fault: a deployment without a shared database has
+        // nowhere to put either, and the process still counts its own refusals
+        // on the reading face it already publishes.
+        match ctx.consume_service::<dyn cog_core::ResourceEventStore>() {
+            Some(store) => {
+                let resource_shutdown = ctx
+                    .consume::<cog_core::ShutdownSignal>()
+                    .map(|s| (*s).clone())
+                    .unwrap_or_default();
+                crate::resource_ledger::spawn_resource_ledger_loop(
+                    store,
+                    ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>(),
+                    ctx.consume_service::<dyn cog_core::MetricsBackend>(),
+                    resource_shutdown,
+                );
+            }
+            None => info!("resource ledger loop not started: no ResourceEventStore published"),
+        }
+
         // Backup account loop.
         //
         // The account's rows are written by the backup runs -- separate

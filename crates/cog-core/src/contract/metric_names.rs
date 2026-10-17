@@ -1193,6 +1193,26 @@ metric_names! {
     // would claim one just started). A reader that needs "is anything open"
     // reads `runs_running`, which is always present.
     BACKUP_RUN_READINGS => "cogneva_backup_run_readings",
+
+    // cog-orchestrator — the resource account's event half, as the loop that
+    // folds it reads it back out of the table.
+    //
+    // The census is a gauge and not a counter, and the difference is the whole
+    // reason these series exist: the count it carries is republished from the
+    // table on every pass, so a process that restarts re-reads the same total
+    // rather than starting at zero. A counter here would have the shape of the
+    // in-process tally this account was built to replace -- the one that
+    // published 244 series of which 243 began at zero, because every pod's
+    // life was its own history.
+    //
+    // The labels are closed sets on both axes (`kind` and `outcome`), and every
+    // pair is written on every pass, zero included: a cell that appears only
+    // after its first event cannot be read as "none yet", which is exactly the
+    // reading a refusal count is asked for.
+    RESOURCE_EVENTS => "cogneva_resource_events",
+    RESOURCE_EVENTS_PENDING => "cogneva_resource_events_pending",
+    RESOURCE_EVENTS_OLDEST_UNFOLDED_AGE_SECONDS => "cogneva_resource_events_oldest_unfolded_age_seconds",
+    RESOURCE_EVENTS_DROPPED_TOTAL => "cogneva_resource_events_dropped_total",
 }
 
 /// Whether `name` is a series a build can still write.

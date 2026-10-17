@@ -59,8 +59,8 @@ pub use postgres::{
     HookArchiveRow, PostgresAuditRecorder, PostgresBackupRunStore, PostgresChangeLedgerStore,
     PostgresHookArchive, PostgresMetricsBackend, PostgresNotificationStore,
     PostgresObservabilityGateway, PostgresPrincipleLedgerStore, PostgresRawLogIndexStore,
-    PostgresSnapshotStore, PostgresStateBackend, PostgresTasteIntentStore, PostgresUserStore,
-    EVENTS_PAGE_SQL, GAUGE_LATEST_SQL,
+    PostgresResourceEventStore, PostgresSnapshotStore, PostgresStateBackend,
+    PostgresTasteIntentStore, PostgresUserStore, EVENTS_PAGE_SQL, GAUGE_LATEST_SQL,
 };
 
 #[cfg(feature = "redis")]
