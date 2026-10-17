@@ -16,7 +16,7 @@ use crate::github_app::{self, AppTokenCache, GitHubAppCreds};
 use axum::{
     extract::State,
     http::StatusCode,
-    response::Json,
+    response::{IntoResponse, Json},
     routing::{get, post},
     Router,
 };
@@ -6304,6 +6304,90 @@ fn llm_channel_router() -> Router<AppState> {
         .route("/v1/chat", post(chat_handler))
         .route("/v1/chat/completions", post(chat_completions_passthrough))
         .route("/v1/messages", post(anthropic_messages_passthrough))
+        .route(
+            crate::secret_write::SECRET_PATCH_PATH,
+            post(secret_patch_handler),
+        )
+}
+
+/// 主应用把要落盘的 Secret 字段转发到这里；写入由本进程的 ServiceAccount 执行。
+///
+/// 验签用与 webhook 转发同一把内部 HMAC——那条边界本来就在两个进程之间，多点
+/// 鉴权方式只会多一份要同步的凭证。请求体带 `fields`（按键位表分派到两片）、
+/// `b64`（删除键那支用 `null`）与 `restart`（写完滚自己，让新 Pod 读到新值）。
+async fn secret_patch_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let Some(secret) = state.config.webhook_internal_secret.as_deref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "internal_credential_missing",
+                "message": "网关未配置内部转发凭证（COGNEVA_WEBHOOK_INTERNAL_SECRET）",
+            })),
+        )
+            .into_response();
+    };
+    let Some(header) = headers
+        .get(crate::secret_write::SIGNATURE_HEADER)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "signature_missing"})),
+        )
+            .into_response();
+    };
+    if !crate::secret_write::signature_matches(secret, &body, header) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "signature_mismatch"})),
+        )
+            .into_response();
+    }
+    #[derive(serde::Deserialize)]
+    struct PatchRequest {
+        fields: serde_json::Value,
+        #[serde(default)]
+        b64: bool,
+        #[serde(default)]
+        restart: bool,
+    }
+    let req: PatchRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid_body", "message": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    use crate::secret_write::Restart;
+    match crate::secret_write::apply(req.fields, req.b64, req.restart).await {
+        Ok(Restart::Rolled) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "restart": "rolled"})),
+        )
+            .into_response(),
+        Ok(Restart::NotRequested) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "restart": "not-requested"})),
+        )
+            .into_response(),
+        Ok(Restart::Failed(e)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "restart": "failed", "message": e})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": "secret_patch_failed", "message": e})),
+        )
+            .into_response(),
+    }
 }
 
 /// 外网代理通道：`/proxy` 转发沙盒出站请求，是转发路径，挂统一留痕层。

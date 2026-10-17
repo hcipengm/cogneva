@@ -193,17 +193,6 @@ pub async fn llm_config_handler(
         }
     }
 
-    let kube = match KubeClient::in_cluster() {
-        Ok(k) => k,
-        Err(e) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "not_in_cluster", "message": e})),
-            )
-                .into_response();
-        }
-    };
-
     let pool_json = match serde_json::to_string(&pool) {
         Ok(s) => s,
         Err(e) => {
@@ -220,26 +209,19 @@ pub async fn llm_config_handler(
     // 空串在读者那侧就是「没有声明」（见 `min_healthy_from_env`）。旧镜像读到这个
     // 键不认，也不受影响：它按 `COGNEVA_LLM_UPSTREAMS` 一个键判池。
     let min_healthy_value = req.min_healthy.map(|n| n.to_string()).unwrap_or_default();
-    if let Err(e) = crate::secret_layout::patch_fields(
-        &kube,
+    if let Err(e) = crate::secret_write::forward(
         json!({
             SECRET_UPSTREAMS_KEY: pool_json,
             SECRET_MIN_HEALTHY_KEY: min_healthy_value,
         }),
+        false,
+        true,
     )
     .await
     {
         return (
             StatusCode::BAD_GATEWAY,
             Json(json!({"error": "secret_patch_failed", "message": e})),
-        )
-            .into_response();
-    }
-
-    if let Err(e) = kube.restart_gateway().await {
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "gateway_patch_failed", "message": e})),
         )
             .into_response();
     }

@@ -819,17 +819,10 @@ pub(crate) async fn persist_connected(
     string_data[SECRET_CONTRIB_CONFIG] =
         json!(serde_json::to_string(&config_json_val).unwrap_or_else(|_| "{}".to_string()));
 
-    if let Err(e) = crate::secret_layout::patch_fields(kube, string_data).await {
+    if let Err(e) = crate::secret_write::forward(string_data, false, true).await {
         return (
             StatusCode::BAD_GATEWAY,
             Json(json!({"error": "secret_patch_failed", "message": e})),
-        )
-            .into_response();
-    }
-    if let Err(e) = kube.restart_gateway().await {
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "gateway_restart_failed", "message": e})),
         )
             .into_response();
     }
@@ -973,36 +966,20 @@ pub async fn github_app_config_handler(
         )
             .into_response();
     }
-    let kube = match KubeClient::in_cluster() {
-        Ok(k) => k,
-        Err(e) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "not_in_cluster", "message": e})),
-            )
-                .into_response();
-        }
-    };
-    if let Err(e) = crate::secret_layout::patch_fields(
-        &kube,
+    if let Err(e) = crate::secret_write::forward(
         json!({
             SECRET_GITHUB_APP_ID: app_id,
             SECRET_GITHUB_APP_INSTALLATION_ID: installation_id,
             SECRET_GITHUB_APP_KEY: private_key,
         }),
+        false,
+        true,
     )
     .await
     {
         return (
             StatusCode::BAD_GATEWAY,
             Json(json!({"error": "secret_patch_failed", "message": e})),
-        )
-            .into_response();
-    }
-    if let Err(e) = kube.restart_gateway().await {
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "gateway_restart_failed", "message": e})),
         )
             .into_response();
     }
@@ -1020,37 +997,21 @@ pub async fn github_app_config_handler(
 /// DELETE /api/v1/admin/contribution/github-app — 移除 GitHub App 凭证，
 /// 网关出口回退静态 token（属主主流程不依赖 App，移除无功能损失）。
 pub async fn github_app_clear_handler(State(_state): State<Arc<crate::GatewayState>>) -> Response {
-    let kube = match KubeClient::in_cluster() {
-        Ok(k) => k,
-        Err(e) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "not_in_cluster", "message": e})),
-            )
-                .into_response();
-        }
-    };
     // Strategic merge patch: null values delete the keys from `data`.
-    if let Err(e) = crate::secret_layout::patch_fields_b64(
-        &kube,
+    if let Err(e) = crate::secret_write::forward(
         json!({
             SECRET_GITHUB_APP_ID: null,
             SECRET_GITHUB_APP_INSTALLATION_ID: null,
             SECRET_GITHUB_APP_KEY: null,
         }),
+        true,
+        true,
     )
     .await
     {
         return (
             StatusCode::BAD_GATEWAY,
             Json(json!({"error": "secret_patch_failed", "message": e})),
-        )
-            .into_response();
-    }
-    if let Err(e) = kube.restart_gateway().await {
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "gateway_restart_failed", "message": e})),
         )
             .into_response();
     }
@@ -1146,50 +1107,23 @@ pub async fn github_app_manifest_handler(
         )
             .into_response();
     };
-    let kube = match KubeClient::in_cluster() {
-        Ok(k) => k,
-        Err(e) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "not_in_cluster", "message": e})),
-            )
-                .into_response();
-        }
-    };
     // 新 App 与旧 installation 不匹配：清掉旧 installation id，安装后再 discover。
-    // 置空那一笔走 base64 那支只是为了让 null 与旁边两类字段同编码（见
-    // patch_fields_b64 的说明）；两笔都落在带外那一片，中间没有别的写者。
-    if let Err(e) = crate::secret_layout::patch_fields(
-        &kube,
+    // 三个字段同一次写入：App ID／私钥是这次创建的值，installation id 置空等
+    // discover 回填——`null` 在这条路径上表示删键。
+    if let Err(e) = crate::secret_write::forward(
         json!({
             SECRET_GITHUB_APP_ID: app_id.clone(),
             SECRET_GITHUB_APP_KEY: pem,
+            SECRET_GITHUB_APP_INSTALLATION_ID: null,
         }),
+        true,
+        true,
     )
     .await
     {
         return (
             StatusCode::BAD_GATEWAY,
             Json(json!({"error": "secret_patch_failed", "message": e})),
-        )
-            .into_response();
-    }
-    if let Err(e) = crate::secret_layout::patch_fields_b64(
-        &kube,
-        json!({ SECRET_GITHUB_APP_INSTALLATION_ID: null }),
-    )
-    .await
-    {
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "secret_patch_failed", "message": e})),
-        )
-            .into_response();
-    }
-    if let Err(e) = kube.restart_gateway().await {
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "gateway_restart_failed", "message": e})),
         )
             .into_response();
     }
@@ -1328,22 +1262,16 @@ pub async fn github_app_discover_handler(
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
-    if let Err(e) = crate::secret_layout::patch_fields(
-        &kube,
+    if let Err(e) = crate::secret_write::forward(
         json!({ SECRET_GITHUB_APP_INSTALLATION_ID: installation_id.to_string() }),
+        false,
+        true,
     )
     .await
     {
         return (
             StatusCode::BAD_GATEWAY,
             Json(json!({"error": "secret_patch_failed", "message": e})),
-        )
-            .into_response();
-    }
-    if let Err(e) = kube.restart_gateway().await {
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "gateway_restart_failed", "message": e})),
         )
             .into_response();
     }
@@ -1801,13 +1729,14 @@ pub async fn contribution_policy_set_handler(
                 ),
                 Some(config) => {
                     let raw = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
-                    match crate::secret_layout::patch_fields(
-                        &kube,
+                    match crate::secret_write::forward(
                         json!({ SECRET_CONTRIB_CONFIG: raw }),
+                        false,
+                        false,
                     )
                     .await
                     {
-                        Ok(()) => (true, None),
+                        Ok(_) => (true, None),
                         Err(e) => (false, Some(e)),
                     }
                 }
@@ -1911,21 +1840,10 @@ pub async fn contribution_flush_handler(
 pub async fn contribution_disconnect_handler(
     State(_state): State<Arc<crate::GatewayState>>,
 ) -> Response {
-    let kube = match KubeClient::in_cluster() {
-        Ok(k) => k,
-        Err(e) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "not_in_cluster", "message": e})),
-            )
-                .into_response();
-        }
-    };
     // Strategic merge patch: null values delete the keys from `data`. 这五个键横跨
     // 两片（token/私钥在带外片、配置文档在内部片），按键表分派后是两笔 patch：
     // 一笔删带外那四个，一笔删内部那一个。
-    if let Err(e) = crate::secret_layout::patch_fields_b64(
-        &kube,
+    if let Err(e) = crate::secret_write::forward(
         json!({
             SECRET_GITHUB_TOKEN: null,
             SECRET_GITEE_TOKEN: null,
@@ -1933,19 +1851,14 @@ pub async fn contribution_disconnect_handler(
             SECRET_SSH_KEY: null,
             SECRET_CONTRIB_CONFIG: null,
         }),
+        true,
+        true,
     )
     .await
     {
         return (
             StatusCode::BAD_GATEWAY,
             Json(json!({"error": "secret_patch_failed", "message": e})),
-        )
-            .into_response();
-    }
-    if let Err(e) = kube.restart_gateway().await {
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "gateway_restart_failed", "message": e})),
         )
             .into_response();
     }
@@ -2027,34 +1940,27 @@ pub async fn oauth_app_secret_handler(
         )
             .into_response();
     };
-    let kube = match KubeClient::in_cluster() {
-        Ok(kube) => kube,
+    let rolled = match crate::secret_write::forward(json!({ key: secret }), false, true).await {
+        Ok(outcome) => outcome,
         Err(e) => {
             return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "not_in_cluster", "message": e})),
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": "secret_patch_failed", "message": e})),
             )
                 .into_response();
         }
     };
-    if let Err(e) = crate::secret_layout::patch_fields(&kube, json!({ key: secret })).await {
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "secret_patch_failed", "message": e})),
-        )
-            .into_response();
-    }
-    let rolled = kube.restart_gateway().await;
     (
         StatusCode::OK,
         Json(json!({
             "ok": true,
             "provider": provider,
             "stored": true,
-            "restarted": rolled.is_ok(),
-            "message": match rolled {
-                Ok(()) => "已写入 Secret，安全网关正在滚动重启；重启完成后授权码通道即可用",
-                Err(_) => "已写入 Secret，但安全网关滚动重启失败；值已保存，待该 Deployment 下次重启生效",
+            "restarted": rolled.rolled(),
+            "message": if rolled.rolled() {
+                "已写入 Secret，安全网关正在滚动重启；重启完成后授权码通道即可用"
+            } else {
+                "已写入 Secret，但安全网关滚动重启失败；值已保存，待该 Deployment 下次重启生效"
             },
         })),
     )
@@ -2272,10 +2178,11 @@ async fn gitee_refresh_tick(refresh_threshold_secs: u64) -> Result<(), String> {
     if let Some(new_refresh) = &set.refresh_token {
         string_data[SECRET_GITEE_REFRESH] = json!(new_refresh);
     }
-    crate::secret_layout::patch_fields(&kube, string_data).await?;
     // The gateway reads the token from env at pod start; roll it so egress
     // picks up the fresh pair. The new pod sees a young token and idles.
-    kube.restart_gateway().await
+    crate::secret_write::forward(string_data, false, true)
+        .await
+        .map(|_| ())
 }
 
 #[cfg(test)]
