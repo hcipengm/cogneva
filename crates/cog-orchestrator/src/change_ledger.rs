@@ -345,6 +345,18 @@ const DEBT_MODULE_FILE: &str = "crates/cogneva/debt/core-modules.tsv";
 /// has a second reader at all.
 const DEBT_UNWIRED_FILE: &str = "crates/cogneva/debt/unwired-modules.tsv";
 
+/// The names a pass writes into `sources_unread` when an intake could not be
+/// read.
+///
+/// One word per intake, stable across releases: a reader counts passes carrying
+/// the same word, so renaming one resets the streak it was measuring and reads
+/// as "the outage ended". The registries are one intake because they share a
+/// source and a reader; the principle ledger is its own because it is the one
+/// that survives the tree's registries and the one whose failure has no other
+/// witness.
+const INTAKE_REGISTRIES: &str = "registries";
+const INTAKE_PRINCIPLES: &str = "principles";
+
 /// The disposition a row of the unwired registry carries when the file is to be
 /// reached by a declaration of its parent module.
 const WIRING_DISPOSITION: &str = "pending-wiring";
@@ -925,11 +937,21 @@ pub fn spawn_change_ledger_loop(
                         _ => Vec::new(),
                     };
                     read_pass(&*store, first_seen_rev.as_deref()).await;
+                    // The intakes this pass could not read, named for the row the
+                    // hand-over writes at the end of the pass. Collected here and
+                    // not read off the logs: a warning rolls away with the
+                    // process, and the account it left empty keeps looking like a
+                    // pass that found nothing to hold.
+                    let mut sources_unread: Vec<&'static str> = Vec::new();
                     // The tree's own registries are the second intake, and they
                     // go in after the fold and before the measurement for the
                     // reason [`registry_pass`] gives: a row read this pass is
                     // judged by this pass.
-                    registry_pass(&tree, first_seen_rev.as_deref(), &*store).await;
+                    if let Some(unread) =
+                        registry_pass(&tree, first_seen_rev.as_deref(), &*store).await
+                    {
+                        sources_unread.push(unread);
+                    }
                     // The third intake, from the platform's own principle ledger,
                     // in beside the registries and for the same reason: a row
                     // read this pass is judged by this pass. Skipped where no
@@ -943,7 +965,11 @@ pub fn spawn_change_ledger_loop(
                         // and read whatever the tree did, because what a refusal
                         // has news of is an act somebody took and not a line in
                         // this revision.
-                        principle_pass(&**principles, first_seen_rev.as_deref(), &*store).await;
+                        if let Some(unread) =
+                            principle_pass(&**principles, first_seen_rev.as_deref(), &*store).await
+                        {
+                            sources_unread.push(unread);
+                        }
                     }
                     // The classifier's retirements go in after the readings and
                     // before the measurement, for the reason [`retire_pass`]
@@ -979,6 +1005,7 @@ pub fn spawn_change_ledger_loop(
                             pool_posture,
                             metrics.as_ref(),
                             events.as_deref(),
+                            &sources_unread,
                         )
                         .await
                         {
@@ -1107,7 +1134,7 @@ async fn registry_pass(
     tree: &CheckTree,
     first_seen_rev: Option<&str>,
     store: &dyn ChangeLedgerStore,
-) {
+) -> Option<&'static str> {
     let (readings, unaimed) = match registry_readings(tree).await {
         Ok(read) => read,
         Err(why) => {
@@ -1116,7 +1143,7 @@ async fn registry_pass(
                 "change ledger: the tree's own debt registries could not be read, so this pass \
                  contributed no readings from them"
             );
-            return;
+            return Some(INTAKE_REGISTRIES);
         }
     };
     // Said before the write and said whether or not it lands: what a registry
@@ -1144,6 +1171,10 @@ async fn registry_pass(
             "change ledger: the tree's own debt registries could not be written into the account"
         ),
     }
+    // A write the account refused is not an unread source: the registries were
+    // read and their rows are in hand, so naming them here would report a tree
+    // nobody could open on a tick where the tree was open.
+    None
 }
 
 /// What the tree's own debt registries ask for, as readings.
@@ -1503,7 +1534,7 @@ async fn principle_pass(
     principles: &dyn PrincipleLedgerStore,
     first_seen_rev: Option<&str>,
     store: &dyn ChangeLedgerStore,
-) {
+) -> Option<&'static str> {
     let (readings, unaimed) = match principle_readings(principles).await {
         Ok(read) => read,
         Err(why) => {
@@ -1512,7 +1543,7 @@ async fn principle_pass(
                 "change ledger: the platform's principle ledger could not be read, so this pass \
                  contributed no readings from it"
             );
-            return;
+            return Some(INTAKE_PRINCIPLES);
         }
     };
     // Said before the write and whether or not the write lands: the rows this
@@ -1539,6 +1570,9 @@ async fn principle_pass(
              written into the account"
         ),
     }
+    // Said only for a read that failed: the ledger answered, and what failed was
+    // the write into this account.
+    None
 }
 
 /// What the platform's own principle account says about each of its rules, as
@@ -2439,6 +2473,7 @@ async fn dispatch_pass(
     carried: Option<PoolVerdict>,
     metrics: Option<&Arc<dyn MetricsBackend>>,
     events: Option<&dyn StateBackend>,
+    sources_unread: &[&'static str],
 ) -> Option<PoolVerdict> {
     // The read is bounded by the ledger's own census rather than by a number
     // chosen here, and it has to be that wide because of where pending rows sit
@@ -2669,6 +2704,7 @@ async fn dispatch_pass(
         pending.len(),
         unmeasurable,
         &counts,
+        sources_unread,
     )
     .await;
     // The readback is published from here rather than from the row's own state:
@@ -3043,8 +3079,13 @@ async fn record_dispatch_state(
     pending: usize,
     unmeasurable: usize,
     counts: &TickCounts,
+    sources_unread: &[&'static str],
 ) {
     let state = DispatchState {
+        // Written for every pass, empty when every intake answered: `None` is
+        // reserved for rows that predate the column, and a pass that reused it
+        // would make "we read everything" and "this row never said" one value.
+        sources_unread: Some(sources_unread.join(",")),
         decision: verdict.decision,
         pool: verdict.reading,
         pending: pending as u64,
@@ -5035,7 +5076,17 @@ mod tests {
         );
         let control: Arc<dyn OrchestratorControl> = graph.clone();
 
-        dispatch_pass(&store, &control, &HashMap::new(), None, None, None, None).await;
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await;
 
         let state = store.written().pop().expect("the pass wrote its row");
         assert_eq!(state.decision, DispatchDecision::Proceed);
@@ -5080,7 +5131,17 @@ mod tests {
         let graph = Arc::new(FakeGraph::default());
         let control: Arc<dyn OrchestratorControl> = graph.clone();
 
-        dispatch_pass(&store, &control, &HashMap::new(), None, None, None, None).await;
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await;
 
         let state = store.written().pop().expect("the pass wrote its row");
         assert_eq!(state.decision, DispatchDecision::Proceed);
@@ -5126,6 +5187,7 @@ mod tests {
             Some(paused),
             None,
             None,
+            &[],
         )
         .await;
 
@@ -5174,6 +5236,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .await;
 
@@ -5185,6 +5248,54 @@ mod tests {
             !graph.submitted().is_empty(),
             "nothing to carry over is not a reason to stop"
         );
+    }
+
+    /// A pass names the intakes it could not read on its own row.
+    ///
+    /// A failed intake contributes no readings and the account keeps what it
+    /// holds, which leaves exactly the rows of a pass that found nothing. The
+    /// name is the only thing that separates them, and it has to outlive the
+    /// process that wrote the warning.
+    #[tokio::test]
+    async fn a_pass_records_the_intakes_it_could_not_read() {
+        let store = FakeLedger::default();
+        let graph = Arc::new(FakeGraph::default());
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &[INTAKE_REGISTRIES, INTAKE_PRINCIPLES],
+        )
+        .await;
+        let state = store.written().pop().expect("the pass wrote its row");
+        assert_eq!(
+            state.sources_unread.as_deref(),
+            Some("registries,principles"),
+            "a pass that lost both intakes says so, and names them in the order it ran them"
+        );
+
+        // Every source read is an empty string and not `None`: `None` is what a
+        // row written before the column existed carries, and a reader that
+        // conflated the two would report a read nothing performed.
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await;
+        let state = store.written().pop().expect("the pass wrote its row");
+        assert_eq!(state.sources_unread.as_deref(), Some(""));
     }
 
     /// A reading that was taken is what the loop carries forward. Read off the
@@ -5203,6 +5314,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .await
         .expect("a snapshot that said the pool is sick is a reading");
@@ -5237,6 +5349,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .await;
 
@@ -5273,7 +5386,7 @@ mod tests {
         }
         let graph: Arc<dyn OrchestratorControl> = Arc::new(graph);
 
-        dispatch_pass(&store, &graph, &HashMap::new(), None, None, None, None).await;
+        dispatch_pass(&store, &graph, &HashMap::new(), None, None, None, None, &[]).await;
 
         let state = store.written().pop().expect("the pass wrote its row");
         assert_eq!(state.pending, 1);
@@ -5295,7 +5408,7 @@ mod tests {
         };
         let graph: Arc<dyn OrchestratorControl> = Arc::new(FakeGraph::default().refusing());
 
-        dispatch_pass(&store, &graph, &HashMap::new(), None, None, None, None).await;
+        dispatch_pass(&store, &graph, &HashMap::new(), None, None, None, None, &[]).await;
 
         let state = store.written().pop().expect("the pass wrote its row");
         assert_eq!(state.pending, 2);
@@ -5515,6 +5628,7 @@ mod tests {
             None,
             Some(&metrics),
             Some(&events),
+            &[],
         )
         .await;
 
@@ -5803,6 +5917,7 @@ mod tests {
             resume_at_unix: 0,
             evidenced_recovery_unix: 0,
             quota_window_secs: 0,
+            sources_unread: Some(String::new()),
         };
         let readback = HandoverCensus {
             events: 40,

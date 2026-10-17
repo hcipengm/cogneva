@@ -1,0 +1,25 @@
+-- Migration: 049_change_dispatch_unread_sources
+-- Which intake a pass ran and could not read.
+--
+-- The account has three intakes: the declarations queued for it, the tree's own
+-- debt registries, and the platform's principle ledger. Each one, when it cannot
+-- be read, contributes no readings and says so only in a log line -- the account
+-- keeps the rows it already holds, because a failed read is not an empty one.
+-- That was the right call for a single tick, and it leaves the failure mode the
+-- account cannot show: after the tree's registries leave the public tree, the
+-- only source of new debt is the principle ledger, and a ledger nobody can read
+-- looks exactly like a ledger that names nothing. A pass that loses its only
+-- source and a pass with no debt to record are the same row.
+--
+-- The column names the sources that pass could not read (comma-separated),
+-- empty when all of them answered. A reader counts consecutive passes carrying
+-- the same reason: one failed read is a retry, and a run of them is the intake
+-- being gone.
+--
+-- NULL and the empty string are different claims. Every row written before this
+-- column existed is NULL, which means "nothing said about sources", not "all
+-- sources read"; the column's default stays NULL for that reason, and a pass
+-- written since records its answer explicitly. A default of '' would have made
+-- historical passes testify to a read nothing performed.
+ALTER TABLE change_dispatch_state
+    ADD COLUMN IF NOT EXISTS sources_unread TEXT;

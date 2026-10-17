@@ -807,6 +807,25 @@ pub struct DispatchState {
     /// did. The only statement of how long a quota outage lasts when no instant
     /// was given.
     pub quota_window_secs: u64,
+    /// The intakes this pass ran and could not read, comma-separated; empty
+    /// when every one of them answered.
+    ///
+    /// An intake that fails contributes no readings and the account keeps the
+    /// rows it already holds, so a pass that read nothing leaves exactly the
+    /// rows of a pass that found nothing to read. While the tree's registries
+    /// are still an intake, losing one of them on a tick costs nothing visible;
+    /// once the account's only source of new debt is another account, that
+    /// silence is the whole failure mode. Naming the source here is what lets a
+    /// reader count consecutive passes instead of learning it from a log line
+    /// that rolled away.
+    ///
+    /// `None` is what every row written before this column existed carries, so
+    /// a reader must treat it as "nothing said" rather than as "every source
+    /// answered". Every pass written since writes a string: empty when all
+    /// sources were read, the names joined by commas when some were not -- which
+    /// keeps "this pass read everything" and "this row predates the column"
+    /// distinguishable instead of both reading as empty.
+    pub sources_unread: Option<String>,
 }
 
 /// The decision a dispatch pass reached, as a closed set.

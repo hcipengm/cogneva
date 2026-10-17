@@ -333,8 +333,8 @@ const RECORD_DISPATCH_STATE_SQL: &str = "\
 INSERT INTO change_dispatch_state (
     decision, pool_reading, pending, submitted, already, failed,
     dead_environment, held_back, rearmed, unmeasurable,
-    resume_at_unix, evidenced_recovery_unix, quota_window_secs
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)";
+    resume_at_unix, evidenced_recovery_unix, quota_window_secs, sources_unread
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)";
 
 /// Refuse a reading whose identity or document does not fit its column.
 ///
@@ -846,6 +846,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
             .bind(state.resume_at_unix)
             .bind(state.evidenced_recovery_unix)
             .bind(state.quota_window_secs as i64)
+            .bind(state.sources_unread.as_deref())
             .execute(&self.pool)
             .await
             .map_err(|e| SFError::Database(format!("record dispatch state: {e}")))?;
