@@ -16,6 +16,16 @@
 pub enum Command {
     /// No arguments: run the install.
     Run,
+    /// Rewrite the host's writeback watermarks from the reading in the
+    /// `COGNEVA_NODE_IO_*` variables, installing nothing.
+    ///
+    /// The install path writes the same drop-in, but only from inside the
+    /// K3s-install branch, which returns early once a cluster is up. On a host
+    /// that already has one, that condition is false forever: the derivation is
+    /// in the tree and the file is never on the disk, and both look like "done".
+    /// This subcommand is the same derivation and the same write, reachable
+    /// without the install.
+    NodeIo,
     Help,
     Version,
 }
@@ -33,8 +43,15 @@ Cogneva 元启动引导器
 
 用法：
     cogneva-bootstrap [选项]
+    cogneva-bootstrap node-io   只用环境变量重写宿主脏页水位，不安装任何东西
 
 不带选项即开始安装。安装参数一律经环境变量传入，不认参数即拒绝执行：
+
+`node-io` 做的是安装路径里同一件事：按设备稳态写重算 `vm.dirty_bytes` /
+`vm.dirty_background_bytes` 并写 `/etc/sysctl.d/99-cogneva-node-io.conf`。安装路径里那次
+写入只在「集群还没起」时执行，所以宿主一旦有集群，那份文件就再也不会由安装产生——代码在
+树里、文件不在盘上，两边看起来都像已经做了。这个子命令走同一个推导、同一个写入口，不需要
+装任何东西；`COGNEVA_NODE_IO_*` 五个变量在这里全部必需。
 
     COGNEVA_CN_MIRROR=1              强制国内镜像路径（0 强制海外），缺省自动探测
     COGNEVA_BOOTSTRAP_NONINTERACTIVE=1   全程不提问（无人值守）
@@ -74,9 +91,15 @@ impl Command {
             }
         }
 
-        match args.first() {
+        match args.first().map(String::as_str) {
             None => Ok(Self::Run),
-            Some(first) => Err(first.clone()),
+            // The subcommand takes no operands: everything it reads is in the
+            // environment, the same as the install. A second argument is
+            // therefore rejected by name rather than dropped, for the same
+            // reason the install rejects arguments it does not understand.
+            Some("node-io") if args.len() == 1 => Ok(Self::NodeIo),
+            Some("node-io") => Err(args[1].clone()),
+            Some(first) => Err(first.to_string()),
         }
     }
 }
@@ -100,6 +123,19 @@ mod tests {
         assert_eq!(parse(&["-h"]), Ok(Command::Help));
         assert_eq!(parse(&["--version"]), Ok(Command::Version));
         assert_eq!(parse(&["-V"]), Ok(Command::Version));
+    }
+
+    #[test]
+    fn node_io_is_a_subcommand_with_no_operands() {
+        // The one argument that is not a flag. It exists because the same write
+        // sits behind the K3s installer, which returns early once a cluster is
+        // up -- so on a live host the file could never be produced at all.
+        assert_eq!(parse(&["node-io"]), Ok(Command::NodeIo));
+        // Its operands are the environment variables, not arguments: a second
+        // word is refused by name instead of being quietly ignored.
+        assert_eq!(parse(&["node-io", "/etc/x"]), Err("/etc/x".into()));
+        // Near miss, same rule as the flags below.
+        assert_eq!(parse(&["node-ios"]), Err("node-ios".into()));
     }
 
     #[test]

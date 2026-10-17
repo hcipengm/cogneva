@@ -240,11 +240,13 @@ async fn probe_nodes() -> usize {
     }
 }
 
-async fn probe_hardware() -> Hardware {
-    let cpu_cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    let mem_total_mb = std::fs::read_to_string("/proc/meminfo")
+/// The host's total memory in MiB, or 0 when `/proc/meminfo` cannot be read.
+///
+/// Read from the kernel rather than from any config the installer wrote: this
+/// number sizes reservations and watermarks for exactly what is on the machine
+/// now, and a file on the disk says what was meant, not what is there.
+fn host_mem_total_mb() -> u64 {
+    std::fs::read_to_string("/proc/meminfo")
         .ok()
         .and_then(|s| {
             s.lines()
@@ -252,7 +254,14 @@ async fn probe_hardware() -> Hardware {
                 .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
         })
         .map(|kb| kb / 1024)
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+async fn probe_hardware() -> Hardware {
+    let cpu_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let mem_total_mb = host_mem_total_mb();
     Hardware {
         cpu_cores,
         mem_total_mb,
@@ -515,6 +524,37 @@ async fn write_node_io_sysctl_dropin(
         path.display()
     );
     Ok(())
+}
+
+/// The `node-io` subcommand: derive this host's writeback watermarks from the
+/// reading handed over in the environment and write the drop-in, installing
+/// nothing.
+///
+/// The install path writes the same file, but from inside the K3s-install
+/// branch, which returns as soon as a cluster answers. On a host that already
+/// has one that condition is false forever: the derivation is in the tree and
+/// the file is never on the disk, and both look like the work was done. This is
+/// the same derivation and the same write, reachable without the install.
+///
+/// A missing reading is an error here rather than the quiet "keep the kernel's
+/// own watermarks" the install path settles for. Whoever runs this command ran
+/// it for the sole purpose of that write; returning success without it would
+/// report a file that is not there.
+async fn node_io_subcommand() -> Result<()> {
+    let mem_total_mb = host_mem_total_mb();
+    if mem_total_mb == 0 {
+        bail!("读不到 /proc/meminfo 的 MemTotal：脏页水位要按内存总量推导，缺它推不出来");
+    }
+    let Some((rate, reading)) = node_io_reading_input() else {
+        bail!(
+            "读数不齐，什么都没写：node-io 的整个目的就是 {}，\
+             需 COGNEVA_NODE_IO_WRITE_BYTES_PER_SEC 连同 _DEVICE / _WINDOW / \
+             _BUSY_PERCENT / _MEASURED_AT 一起给",
+            cogneva_bootstrap::NODE_IO_SYSCTL_FILE
+        );
+    };
+    let disk = cogneva_bootstrap::node_disk_io(rate, mem_total_mb);
+    write_node_io_sysctl_dropin(&disk, &reading).await
 }
 
 /// Report the nodes whose allocatable memory equals their capacity.
@@ -3118,21 +3158,24 @@ async fn main() -> Result<()> {
     // Arguments are settled first, before the tracing subscriber and before the
     // asset unpacking below — the latter writes a work directory, and a run
     // that only prints the usage must not leave one behind.
-    match cli::Command::parse(std::env::args().skip(1)) {
-        Ok(cli::Command::Run) => {}
-        Ok(cli::Command::Help) => {
-            println!("{}", cli::USAGE);
-            return Ok(());
-        }
-        Ok(cli::Command::Version) => {
-            println!("cogneva-bootstrap {}", env!("CARGO_PKG_VERSION"));
-            return Ok(());
-        }
+    let command = match cli::Command::parse(std::env::args().skip(1)) {
+        Ok(command) => command,
         Err(unknown) => {
             eprintln!("cogneva-bootstrap: 无法识别的参数: {unknown}");
             eprintln!("{}", cli::USAGE);
             std::process::exit(2);
         }
+    };
+    match command {
+        cli::Command::Help => {
+            println!("{}", cli::USAGE);
+            return Ok(());
+        }
+        cli::Command::Version => {
+            println!("cogneva-bootstrap {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        cli::Command::Run | cli::Command::NodeIo => {}
     }
 
     tracing_subscriber::fmt()
@@ -3140,6 +3183,13 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+
+    // `node-io` touches exactly one file and installs nothing, so it stops here:
+    // before the asset unpacking below (which writes a work directory) and
+    // before anything that reads the cluster.
+    if command == cli::Command::NodeIo {
+        return node_io_subcommand().await;
+    }
 
     let noninteractive = std::env::var("COGNEVA_BOOTSTRAP_NONINTERACTIVE")
         .ok()
@@ -3777,6 +3827,45 @@ mod node_qos_wiring_tests {
                 "{path} 里 {write} 必须排在 {start} 之前（配置只在首启时被读一次）"
             );
         }
+    }
+
+    /// 脏页水位的写入在**已经有集群的宿主**上也必须够得着：安装路径一见到可用集群就
+    /// 返回，它上面那一步从来没有机会跑。所以 `node-io` 子命令必须走同一套推导
+    /// （`node_disk_io`）与同一个写入口（`write_node_io_sysctl_dropin`），而不是另写
+    /// 一份——两份推导迟早会给出两个数，而盘上只有一个文件。
+    #[test]
+    fn the_node_io_subcommand_reuses_the_install_paths_derivation_and_write() {
+        let src = include_str!("main.rs");
+        let body = src
+            .split("async fn node_io_subcommand(")
+            .nth(1)
+            .expect("node_io_subcommand 不在 main.rs 里")
+            .split("/// Report the nodes whose allocatable")
+            .next()
+            .expect("node_io_subcommand 之后没有下一段");
+        for call in [
+            "node_io_reading_input()",
+            "cogneva_bootstrap::node_disk_io(",
+            "write_node_io_sysctl_dropin(",
+        ] {
+            assert!(body.contains(call), "node-io 没有走 {call}");
+        }
+        // 分派必须排在解包资产之前：那条路会写出一个工作目录，而只写一个系统文件的
+        // 命令不该在宿主上留下别的东西。
+        let main = src
+            .split("async fn main()")
+            .nth(1)
+            .expect("main 不在 main.rs 里");
+        let branch_at = main
+            .find("node_io_subcommand().await")
+            .expect("main 没有分派 node-io 子命令");
+        let unpack_at = main
+            .find("materialize_assets()")
+            .expect("main 不再解包资产");
+        assert!(
+            branch_at < unpack_at,
+            "node-io 的分派必须排在解包资产之前（否则它会留下一个工作目录）"
+        );
     }
 
     /// kubespray 的节点配置是那次运行的输入：`host_vars` 必须在容器跑
