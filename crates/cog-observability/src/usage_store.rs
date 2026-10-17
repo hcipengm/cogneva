@@ -616,8 +616,14 @@ impl LlmUsageStore {
                  WHERE upstream = $1 AND refusal_kind = 'quota_cycle'
             )
             SELECT
-                (SELECT EXTRACT(EPOCH FROM ts)::BIGINT FROM last) AS last_ok_unix,
-                (SELECT EXTRACT(EPOCH FROM ts)::BIGINT FROM wall) AS last_quota_refusal_unix,
+                -- FLOOR, not a bare cast: a cast rounds to the nearest second,
+                -- so a row in the second half of a second came back stamped
+                -- after itself. A reader that sums from that instant then
+                -- starts *after* the row it was told about and loses it —
+                -- `spent_since` dropped the newest success half the time,
+                -- which reads as a window that served nothing.
+                (SELECT FLOOR(EXTRACT(EPOCH FROM ts))::BIGINT FROM last) AS last_ok_unix,
+                (SELECT FLOOR(EXTRACT(EPOCH FROM ts))::BIGINT FROM wall) AS last_quota_refusal_unix,
                 -- Measured around the refusal, and only around it: that row is
                 -- the one observation of the allowance running out. There is no
                 -- fallback to the last success — that instant only says where
