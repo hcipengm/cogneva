@@ -3408,9 +3408,8 @@ async fn refresh_window_pace(
 /// 一个上游的容量读数，优先用账上那一行撞墙记录，其次用本进程暂存的那一份。
 ///
 /// 撞墙记录是**正本**：它把窗口的终点直接写在行上（`ts`），容量就是对它前一个
-/// 窗口求和。暂存那份只在没有撞墙记录时出场——那一代的行还没带成因列，只能按
-/// "最后一次成功"推算，而推算值一旦窗口恢复就会被下一条成功推着往前跑，所以
-/// 必须在它还算数的时候钉住。
+/// 窗口求和。暂存那份只在没有撞墙记录时出场：它是同一个上游**上一次量到的墙**，
+/// 让读失败的那一拍沿用上次的读数，而不是掉回"不知道"。两样都没有就不配速。
 async fn measure_window(
     state: &AppState,
     store: &cog_observability::usage_store::LlmUsageStore,
@@ -3429,15 +3428,16 @@ async fn measure_window(
             return latched;
         }
     };
-    let (burned_at_unix, capacity_tokens) = match (
-        reading.last_quota_refusal_unix,
-        latched,
-        reading.last_ok_unix,
-    ) {
-        (Some(wall), _, _) => (wall, reading.burned_window_tokens),
-        (None, Some(measured), _) => return Some(measured),
-        (None, None, Some(last_ok)) => (last_ok, reading.burned_window_tokens),
-        (None, None, None) => return None,
+    // 窗口的起点只能来自**一次真实撞墙**（`quota_cycle` 拒绝对应的那一刻）。最后一次
+    // 成功调用不是墙：它只说明"这里停了"，不说明"这里是周期的尽头"。拿它当边界会
+    // 凭空造出一个窗口——实测见过它的形状：最后一笔 ok 停在 6 天前，于是
+    // `capacity * elapsed / window` 在配额真正复位的那一刻报出「这一窗还剩八成容量」，
+    // 而那八成是新一窗的容量，读成旧一窗的余额就把"一窗用一天"原样演一遍。
+    // 没有墙、也没有上一次量到的墙 ⇒ 这一家不配速（fail open），与模块开头那条一致。
+    let (burned_at_unix, capacity_tokens) = match (reading.last_quota_refusal_unix, latched) {
+        (Some(wall), _) => (wall, reading.burned_window_tokens),
+        (None, Some(measured)) => return Some(measured),
+        (None, None) => return None,
     };
     let measured = crate::window_pace::MeasuredWindow {
         capacity_tokens,
