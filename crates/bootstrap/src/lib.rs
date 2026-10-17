@@ -492,6 +492,15 @@ pub struct ThroughputReading {
 /// -- but the file is also what a person reads to see the node's writeback
 /// policy, and half a pair that looks unset reads as if the ratios were still in
 /// play. Both halves stated is what makes the answer whole.
+///
+/// The ratios come **first**, and that order is load-bearing: writing either
+/// ratio zeroes the byte key of its pair. Stated bytes-first, `sysctl --system`
+/// exits 0 and prints both byte values while it applies them, and the kernel
+/// then lands with `vm.dirty_background_bytes = 0` and `vm.dirty_background_ratio
+/// = 0` -- a background threshold of zero bytes, so the flusher starts the
+/// moment anything is dirty. The file would state 78 MB and the node would run
+/// the opposite policy, and both the file's own text and `vm.dirty_ratio`
+/// (which is zero either way) read as if it had worked.
 pub fn sysctl_node_io_conf(disk: &NodeDiskIo, reading: &ThroughputReading) -> String {
     format!(
         "# Writeback watermarks read from the device's sustained write throughput,\n\
@@ -503,10 +512,12 @@ pub fn sysctl_node_io_conf(disk: &NodeDiskIo, reading: &ThroughputReading) -> St
          # sustained write {throughput} bytes/s, read as the rate of\n\
          # node_disk_written_bytes_total over a window whose occupancy is the rate of\n\
          # node_disk_io_time_seconds_total.\n\
-         vm.dirty_background_bytes = {background}\n\
-         vm.dirty_bytes = {force}\n\
+         # The ratios are stated before the bytes: writing a ratio zeroes the byte\n\
+         # key of its pair, so the reverse order leaves both bytes keys unset.\n\
          vm.dirty_background_ratio = 0\n\
-         vm.dirty_ratio = 0\n",
+         vm.dirty_ratio = 0\n\
+         vm.dirty_background_bytes = {background}\n\
+         vm.dirty_bytes = {force}\n",
         device = reading.device,
         window = reading.window,
         busy = reading.busy_percent,
@@ -941,6 +952,21 @@ mod tests {
         // the whole policy and not half of one.
         assert!(conf.contains("vm.dirty_background_ratio = 0\n"), "{conf}");
         assert!(conf.contains("vm.dirty_ratio = 0\n"), "{conf}");
+        // ... and they are stated first. Writing a ratio zeroes the byte key of
+        // its pair, so the other order applies cleanly, prints both byte values
+        // as it goes, and leaves `vm.dirty_background_bytes` at 0 -- a threshold
+        // of zero bytes, the opposite of what the file says.
+        for (ratio, bytes) in [
+            ("vm.dirty_background_ratio = 0", "vm.dirty_background_bytes"),
+            ("vm.dirty_ratio = 0", "vm.dirty_bytes"),
+        ] {
+            let ratio_at = conf.find(ratio).expect("ratio line");
+            let bytes_at = conf.find(bytes).expect("bytes line");
+            assert!(
+                ratio_at < bytes_at,
+                "{ratio} must be stated before {bytes}, or the kernel zeroes the bytes"
+            );
+        }
     }
 
     /// A device reading, in the shape the measuring side hands one over: the
@@ -973,10 +999,10 @@ mod tests {
         assert_eq!(
             settings,
             vec![
-                "vm.dirty_background_bytes = 104000000",
-                "vm.dirty_bytes = 260000000",
                 "vm.dirty_background_ratio = 0",
                 "vm.dirty_ratio = 0",
+                "vm.dirty_background_bytes = 104000000",
+                "vm.dirty_bytes = 260000000",
             ],
             "{conf}"
         );
