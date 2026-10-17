@@ -3428,25 +3428,15 @@ async fn measure_window(
             return latched;
         }
     };
-    // 窗口的起点只能来自**一次真实撞墙**（`quota_cycle` 拒绝对应的那一刻）。最后一次
-    // 成功调用不是墙：它只说明"这里停了"，不说明"这里是周期的尽头"。拿它当边界会
-    // 凭空造出一个窗口——实测见过它的形状：最后一笔 ok 停在 6 天前，于是
-    // `capacity * elapsed / window` 在配额真正复位的那一刻报出「这一窗还剩八成容量」，
-    // 而那八成是新一窗的容量，读成旧一窗的余额就把"一窗用一天"原样演一遍。
-    // 没有墙、也没有上一次量到的墙 ⇒ 这一家不配速（fail open），与模块开头那条一致。
-    let (burned_at_unix, capacity_tokens) = match (reading.last_quota_refusal_unix, latched) {
-        (Some(wall), _) => (wall, reading.burned_window_tokens),
-        (None, Some(measured)) => return Some(measured),
-        (None, None) => return None,
-    };
-    let measured = crate::window_pace::MeasuredWindow {
-        capacity_tokens,
-        window_secs,
-        burned_at_unix,
-    };
-    if !measured.is_usable() {
-        return latched;
-    }
+    let measured = crate::window_pace::measured_window(
+        crate::window_pace::WindowEvidence {
+            last_quota_refusal_unix: reading.last_quota_refusal_unix,
+            last_ok_unix: reading.last_ok_unix,
+            burned_window_tokens: reading.burned_window_tokens,
+            window_secs,
+        },
+        latched,
+    )?;
     state
         .measured_windows
         .lock()

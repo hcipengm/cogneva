@@ -82,6 +82,56 @@ impl MeasuredWindow {
     }
 }
 
+/// What the ledger knows about one upstream's last window.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WindowEvidence {
+    /// When the upstream last answered "this cycle's limit is reached".
+    pub last_quota_refusal_unix: Option<i64>,
+    /// When the upstream last served a call. Recorded here so the rule below
+    /// can be stated against it: this instant is **not** a window boundary.
+    pub last_ok_unix: Option<i64>,
+    /// Tokens served in the window that ended at `last_quota_refusal_unix`.
+    pub burned_window_tokens: u64,
+    /// The upstream's own statement of its window length.
+    pub window_secs: u64,
+}
+
+/// The measurement that may pace this upstream, if any.
+///
+/// A window's boundary may only come from a refusal that says the cycle is
+/// spent: that instant is where the cycle ended, and the tokens before it are
+/// what the cycle allowed. The newest successful call is not a boundary — it
+/// marks where serving stopped, which is equally true of an upstream that was
+/// throttled and of one nobody called. Reading it as a boundary invents a
+/// window: measured on 2026-10-17, a window whose last success was six days old
+/// reported that 84% of its capacity was still unspent a moment before the
+/// quota really reset, and pacing against that reading would replay the failure
+/// this module exists to prevent — spending a whole window in a day.
+///
+/// So: a fresh refusal wins; without one, the window measured earlier still
+/// stands; without either, this upstream is left unpaced rather than paced
+/// against a window nobody observed.
+pub fn measured_window(
+    evidence: WindowEvidence,
+    latched: Option<MeasuredWindow>,
+) -> Option<MeasuredWindow> {
+    match evidence.last_quota_refusal_unix {
+        Some(wall) => {
+            let fresh = MeasuredWindow {
+                capacity_tokens: evidence.burned_window_tokens,
+                window_secs: evidence.window_secs,
+                burned_at_unix: wall,
+            };
+            if fresh.is_usable() {
+                Some(fresh)
+            } else {
+                latched
+            }
+        }
+        None => latched,
+    }
+}
+
 /// Seconds until the allowance covers one more whole job, or `None` when the
 /// pace is not what is holding work back.
 ///
@@ -194,6 +244,54 @@ mod tests {
             ..Default::default()
         };
         assert!(!pace.blocked(), "no measurement is not a zero allowance");
+    }
+
+    #[test]
+    fn a_window_opens_on_a_measured_quota_wall() {
+        let evidence = WindowEvidence {
+            last_quota_refusal_unix: Some(2_000_000),
+            last_ok_unix: Some(1_999_000),
+            burned_window_tokens: 30_000_000,
+            window_secs: (30 * DAY) as u64,
+        };
+        let measured = measured_window(evidence, None).expect("a refusal is a measurement");
+        assert_eq!(measured.burned_at_unix, 2_000_000);
+        assert_eq!(measured.capacity_tokens, 30_000_000);
+    }
+
+    #[test]
+    fn the_last_successful_call_is_not_a_window_boundary() {
+        // The shape that was live on 2026-10-17: the newest success was six
+        // days old, so pacing from it reported 84% of the window still unspent
+        // an instant before the quota actually reset. Nothing was measured, so
+        // nothing may be paced.
+        let evidence = WindowEvidence {
+            last_quota_refusal_unix: None,
+            last_ok_unix: Some(1_000_000),
+            burned_window_tokens: 30_000_000,
+            window_secs: (30 * DAY) as u64,
+        };
+        assert_eq!(measured_window(evidence, None), None);
+    }
+
+    #[test]
+    fn the_window_measured_earlier_stands_until_a_fresh_refusal_arrives() {
+        let earlier = month();
+        let no_refusal = WindowEvidence {
+            last_quota_refusal_unix: None,
+            last_ok_unix: None,
+            burned_window_tokens: 0,
+            window_secs: (30 * DAY) as u64,
+        };
+        assert_eq!(measured_window(no_refusal, Some(earlier)), Some(earlier));
+        // A refusal whose burn could not be summed (the rows it needs were
+        // pruned or never landed) is not a usable measurement either; the
+        // earlier one is still the best observation available.
+        let empty_burn = WindowEvidence {
+            last_quota_refusal_unix: Some(3_000_000),
+            ..no_refusal
+        };
+        assert_eq!(measured_window(empty_burn, Some(earlier)), Some(earlier));
     }
 
     #[test]
