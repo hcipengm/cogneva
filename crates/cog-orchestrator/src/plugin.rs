@@ -279,6 +279,13 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
         // holding unacked, not a per-dimension rollup, so it goes up as its own
         // observable that answers whatever dimension is asked.
         ctx.publish_observable(crate::observable::stream_pending_observable());
+        // The current shape of the task graph, read from the executor that owns
+        // it. Separate from the D1 counters above: those meter this process's
+        // outcomes, this one reports the graph itself, which outlives the
+        // process and is what a task ledger's readers ask about.
+        ctx.publish_observable(Arc::new(crate::observable::TaskGraphObservable::new(
+            shared_orchestrator.clone(),
+        )));
         info!("OrchestratorPlugin observable published");
 
         self.initialized = true;

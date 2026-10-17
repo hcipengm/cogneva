@@ -1039,12 +1039,19 @@ impl DagExecutor {
 
     /// 两种模式统一的任务集读取。
     async fn all_tasks_unified(&self) -> Vec<Task> {
+        self.all_tasks_checked().await.unwrap_or_default()
+    }
+
+    /// 同上，但保留读失败。
+    ///
+    /// 内部的调用方把失败当成空图就够了——它们各自还有一层判据。读数不行：一次
+    /// 读不出来的抓取若报成零行，读起来正好是「图里没有任务」，也就是最干净的那
+    /// 个形状。调用方必须能分清这两种。
+    pub async fn all_tasks_checked(&self) -> SFResult<Vec<Task>> {
         if let Some(be) = self.fg() {
-            be.dag_get_all_tasks(&self.workspace_id)
-                .await
-                .unwrap_or_default()
+            be.dag_get_all_tasks(&self.workspace_id).await
         } else {
-            self.inner.read().await.tasks.values().cloned().collect()
+            Ok(self.inner.read().await.tasks.values().cloned().collect())
         }
     }
 

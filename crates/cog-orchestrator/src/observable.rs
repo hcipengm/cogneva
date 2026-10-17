@@ -325,6 +325,188 @@ impl Observable for StreamPendingObservable {
     }
 }
 
+/// Tasks in the graph right now, one series per status.
+pub const TASKS_CURRENT_METRIC: &str = "cogneva_tasks_current";
+/// How long the oldest task an agent still owes has gone without changing
+/// state, in seconds.
+///
+/// This is the reading a stalled executor shows up in: the count by status says
+/// how much is waiting, this one says how long the oldest piece has been
+/// waiting, and only the second can grow while the first holds steady.
+pub const TASK_OLDEST_UNTOUCHED_METRIC: &str = "cogneva_task_oldest_untouched_seconds";
+/// Unix seconds of the last successful read of the task graph. The rows above
+/// are kept across a failed read, so staleness has to be its own series —
+/// otherwise a reader that stopped is indistinguishable from a graph that is
+/// exactly as it last appeared.
+pub const TASK_GRAPH_MEASURE_LAST_METRIC: &str = "cogneva_task_graph_measure_last_seconds";
+/// Reads of the task graph that failed.
+pub const TASK_GRAPH_MEASURE_FAILURES_METRIC: &str = "cogneva_task_graph_measure_failures_total";
+
+/// The `agent` label for tasks nobody has been assigned to.
+///
+/// They are the tasks a "who is stuck" reading would otherwise drop: an
+/// unassigned Pending row is the one shape where nothing is wrong with any
+/// single agent and the work still is not moving.
+pub const UNASSIGNED_AGENT: &str = "unassigned";
+
+/// What one read of the task graph found. Kept between scrapes so a failed
+/// read publishes the last known shape next to its age, not a zero.
+#[derive(Default)]
+struct TaskGraphSnapshot {
+    /// `None` until the first successful read. An empty graph and a graph
+    /// nobody has read yet must not publish the same zeros.
+    counts: Option<Vec<(&'static str, u64)>>,
+    oldest_by_agent: Vec<(String, f64)>,
+    last_measure_seconds: u64,
+    measure_failures: u64,
+}
+
+/// The live shape of the task graph.
+///
+/// Read at scrape time rather than on its own cadence: the graph is the thing
+/// being asked about, not a subscription this process maintains, and a scrape
+/// is already the moment someone wants the answer. The counters in
+/// [`OrchestratorObservable`] are cumulative outcomes of this process; these are
+/// the current graph, which outlives any one process.
+pub struct TaskGraphObservable {
+    source: Arc<crate::DagExecutor>,
+    snapshot: tokio::sync::Mutex<TaskGraphSnapshot>,
+}
+
+impl TaskGraphObservable {
+    pub fn new(source: Arc<crate::DagExecutor>) -> Self {
+        Self {
+            source,
+            snapshot: tokio::sync::Mutex::new(TaskGraphSnapshot::default()),
+        }
+    }
+
+    /// Read the graph and record what it holds.
+    ///
+    /// A failed read keeps the previous figures and does not advance
+    /// `last_measure_seconds`: the numbers stay readable as "the last thing we
+    /// knew", while the staleness and failure series say how old that is. The
+    /// lock is taken only after the read returns, so a slow store cannot hold
+    /// up the other observables' scrapes.
+    async fn refresh(&self) {
+        let read = self.source.all_tasks_checked().await;
+        self.record(read).await;
+    }
+
+    /// Fold one read into the snapshot.
+    ///
+    /// Split from [`Self::refresh`] so the failure branch can be exercised
+    /// without a store that refuses to read: the distinction these tests pin —
+    /// "nothing to report" versus "could not ask" — is the whole reason the
+    /// read keeps its error.
+    async fn record(&self, read: SFResult<Vec<cog_core::Task>>) {
+        let mut snapshot = self.snapshot.lock().await;
+        match read {
+            Ok(tasks) => {
+                let now = chrono::Utc::now();
+                let mut counts: Vec<(&'static str, u64)> = cog_core::TaskStatus::ALL
+                    .iter()
+                    .map(|status| (status.as_str(), 0))
+                    .collect();
+                let mut oldest: HashMap<String, f64> = HashMap::new();
+                for task in &tasks {
+                    if let Some(cell) = counts
+                        .iter_mut()
+                        .find(|(status, _)| *status == task.status.as_str())
+                    {
+                        cell.1 += 1;
+                    }
+                    // Only the states that can still move count as owed work.
+                    // A finished or cancelled row will not be touched again, so
+                    // its age is history rather than a stall.
+                    if !matches!(
+                        task.status,
+                        cog_core::TaskStatus::Pending
+                            | cog_core::TaskStatus::Scheduled
+                            | cog_core::TaskStatus::Running
+                    ) {
+                        continue;
+                    }
+                    let age_ms = (now - task.updated_at).num_milliseconds().max(0);
+                    let age = age_ms as f64 / 1000.0;
+                    let agent = task
+                        .agent_id
+                        .clone()
+                        .filter(|id| !id.is_empty())
+                        .unwrap_or_else(|| UNASSIGNED_AGENT.to_string());
+                    oldest
+                        .entry(agent)
+                        .and_modify(|held| *held = held.max(age))
+                        .or_insert(age);
+                }
+                snapshot.counts = Some(counts);
+                snapshot.oldest_by_agent = oldest.into_iter().collect();
+                snapshot.last_measure_seconds = now.timestamp().max(0) as u64;
+            }
+            Err(e) => {
+                snapshot.measure_failures = snapshot.measure_failures.saturating_add(1);
+                tracing::warn!("task graph measurement failed: {e}");
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Observable for TaskGraphObservable {
+    /// The dimension is ignored for the same reason as the stream-pending
+    /// gauges: none of this varies by dimension, and declaring none is what
+    /// gets it pulled once per scrape instead of once per dimension.
+    async fn collect_metrics(&self, _dimension: &str) -> SFResult<Vec<RawMetric>> {
+        self.refresh().await;
+        Ok(self.readings().await)
+    }
+
+    async fn collect_trace(&self, _task_id: &str) -> SFResult<Vec<TraceFragment>> {
+        Ok(Vec::new())
+    }
+
+    fn available_dimensions(&self) -> Vec<DimensionSpec> {
+        Vec::new()
+    }
+}
+
+impl TaskGraphObservable {
+    /// The published shape of the last recorded read, success or failure.
+    async fn readings(&self) -> Vec<RawMetric> {
+        let snapshot = self.snapshot.lock().await;
+        let mut out = Vec::new();
+        // A status at zero and a status that has never been mentioned are
+        // different readings: the first says the graph is clean on that state,
+        // the second says nobody has looked. That is why the counts are only
+        // published once a read has succeeded, and then all of them at once.
+        if let Some(counts) = &snapshot.counts {
+            for (status, count) in counts {
+                out.push(
+                    RawMetric::new(TASKS_CURRENT_METRIC, *count as f64)
+                        .with_label("status", *status),
+                );
+            }
+            for (agent, age) in &snapshot.oldest_by_agent {
+                out.push(
+                    RawMetric::new(TASK_OLDEST_UNTOUCHED_METRIC, *age)
+                        .with_label("agent", agent.as_str()),
+                );
+            }
+            out.push(RawMetric::new(
+                TASK_GRAPH_MEASURE_LAST_METRIC,
+                snapshot.last_measure_seconds as f64,
+            ));
+        }
+        if snapshot.measure_failures > 0 {
+            out.push(RawMetric::new(
+                TASK_GRAPH_MEASURE_FAILURES_METRIC,
+                snapshot.measure_failures as f64,
+            ));
+        }
+        out
+    }
+}
+
 /// Orchestrator-level observable state.
 ///
 /// It publishes the orchestrator's own task outcomes and nothing else. Message
@@ -708,5 +890,163 @@ mod tests {
             1,
             "the orchestrator declares a single dimension"
         );
+    }
+
+    fn task(id: &str, status: cog_core::TaskStatus) -> cog_core::Task {
+        let mut task = cog_core::Task::new(
+            id,
+            cog_core::TaskType::Custom("task-ledger-observable".into()),
+            serde_json::json!({}),
+        );
+        task.status = status;
+        task
+    }
+
+    fn labeled<'a>(
+        metrics: &'a [RawMetric],
+        name: &str,
+        label: &str,
+        value: &str,
+    ) -> &'a RawMetric {
+        metrics
+            .iter()
+            .find(|m| m.name == name && m.labels.get(label).map(String::as_str) == Some(value))
+            .unwrap_or_else(|| panic!("{name}{{{label}={value}}} missing"))
+    }
+
+    /// The reading a stalled executor shows up in: every status is published,
+    /// including the clean ones as zeros, and the oldest untouched age is
+    /// grouped by the agent that owes the work — with the terminal states left
+    /// out, since those will not move again.
+    #[tokio::test]
+    async fn the_task_graph_reads_count_by_status_and_age_by_agent() {
+        let dag = Arc::new(crate::DagExecutor::new("ws-task-obs".into()));
+        let now = chrono::Utc::now();
+
+        let mut running = task("t-running", cog_core::TaskStatus::Running);
+        running.agent_id = Some("agent-a".into());
+        running.updated_at = now - chrono::Duration::seconds(300);
+        let mut pending = task("t-pending", cog_core::TaskStatus::Pending);
+        pending.agent_id = Some("agent-a".into());
+        pending.updated_at = now - chrono::Duration::seconds(900);
+        let mut done = task("t-done", cog_core::TaskStatus::Completed);
+        done.agent_id = Some("agent-a".into());
+        done.updated_at = now - chrono::Duration::seconds(3600);
+        let mut unassigned = task("t-unassigned", cog_core::TaskStatus::Pending);
+        unassigned.updated_at = now - chrono::Duration::seconds(600);
+        for row in [running, pending, done, unassigned] {
+            dag.add_task(row).await.unwrap();
+        }
+
+        let observable = TaskGraphObservable::new(dag);
+        let metrics = observable.collect_metrics("").await.unwrap();
+
+        assert_eq!(
+            labeled(&metrics, TASKS_CURRENT_METRIC, "status", "pending").value,
+            2.0
+        );
+        assert_eq!(
+            labeled(&metrics, TASKS_CURRENT_METRIC, "status", "running").value,
+            1.0
+        );
+        assert_eq!(
+            labeled(&metrics, TASKS_CURRENT_METRIC, "status", "completed").value,
+            1.0
+        );
+        // A status nothing holds is a zero, not an absent series: the two
+        // readings differ in whether anyone looked at all.
+        for clean in ["scheduled", "failed", "cancelled"] {
+            assert_eq!(
+                labeled(&metrics, TASKS_CURRENT_METRIC, "status", clean).value,
+                0.0
+            );
+        }
+
+        // The oldest of agent-a's unfinished rows is the Pending one at 900s;
+        // the Completed row is an hour old and must not win.
+        let agent_a = labeled(&metrics, TASK_OLDEST_UNTOUCHED_METRIC, "agent", "agent-a").value;
+        assert!(
+            (895.0..=905.0).contains(&agent_a),
+            "agent-a's oldest untouched task is the 900s-old Pending row, got {agent_a}"
+        );
+        // Work nobody was assigned is where "no agent is stuck and the work
+        // still is not moving" shows up, so it gets its own cell.
+        let nobody = labeled(
+            &metrics,
+            TASK_OLDEST_UNTOUCHED_METRIC,
+            "agent",
+            UNASSIGNED_AGENT,
+        )
+        .value;
+        assert!(
+            (595.0..=605.0).contains(&nobody),
+            "the unassigned Pending row is 600s old, got {nobody}"
+        );
+        assert!(
+            metric(&metrics, TASK_GRAPH_MEASURE_LAST_METRIC)
+                .unwrap()
+                .value
+                > 0.0,
+            "a measured graph must carry the timestamp its staleness is judged against"
+        );
+        assert!(metric(&metrics, TASK_GRAPH_MEASURE_FAILURES_METRIC).is_none());
+    }
+
+    /// A failed read must not present the last known shape as fresh and must
+    /// not erase it either: the age and the failure count are what tell the
+    /// reader how much to trust it.
+    #[tokio::test]
+    async fn a_failed_task_graph_read_keeps_the_last_shape_and_counts_itself() {
+        let dag = Arc::new(crate::DagExecutor::new("ws-task-obs-fail".into()));
+        dag.add_task(task("t-1", cog_core::TaskStatus::Pending))
+            .await
+            .unwrap();
+        let observable = TaskGraphObservable::new(dag);
+
+        let first = observable.collect_metrics("").await.unwrap();
+        let last_ok = metric(&first, TASK_GRAPH_MEASURE_LAST_METRIC)
+            .unwrap()
+            .value;
+
+        observable
+            .record(Err(cog_core::SFError::Redis("stub failure".into())))
+            .await;
+        let after = observable.readings().await;
+
+        assert_eq!(
+            metric(&after, TASK_GRAPH_MEASURE_LAST_METRIC)
+                .unwrap()
+                .value,
+            last_ok,
+            "a failed read must not move the last-successful timestamp forward"
+        );
+        assert_eq!(
+            labeled(&after, TASKS_CURRENT_METRIC, "status", "pending").value,
+            1.0,
+            "the last known shape must survive a failed read"
+        );
+        assert_eq!(
+            metric(&after, TASK_GRAPH_MEASURE_FAILURES_METRIC)
+                .unwrap()
+                .value,
+            1.0
+        );
+    }
+
+    /// A graph nobody has read yet publishes no counts at all. Zeros there
+    /// would be a claim ("nothing is pending") that nobody has earned; count
+    /// the failure that kept us from earning it instead.
+    #[tokio::test]
+    async fn a_graph_nobody_read_yet_publishes_no_zeros() {
+        let dag = Arc::new(crate::DagExecutor::new("ws-task-obs-unread".into()));
+        let observable = TaskGraphObservable::new(dag);
+        assert!(observable.readings().await.is_empty());
+
+        observable
+            .record(Err(cog_core::SFError::Redis("stub failure".into())))
+            .await;
+        let readings = observable.readings().await;
+        assert_eq!(readings.len(), 1, "{readings:?}");
+        assert_eq!(readings[0].name, TASK_GRAPH_MEASURE_FAILURES_METRIC);
     }
 }

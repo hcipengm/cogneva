@@ -584,6 +584,10 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         )
         .route("/api/v1/tasks/{id}/retry", post(tasks::retry_task_handler))
         .route(
+            "/api/v1/tasks/{id}/assign",
+            post(tasks::assign_task_handler),
+        )
+        .route(
             "/api/v1/tasks/check-timeouts",
             post(tasks::check_timeouts_handler),
         )

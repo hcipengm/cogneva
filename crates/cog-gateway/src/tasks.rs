@@ -79,6 +79,25 @@ pub struct CreateTaskRequest {
     #[serde(default)]
     pub workspace_id: String,
     pub priority: Option<i32>,
+    /// What this submission is: a goal to be planned, or a task to be carried
+    /// out as given. It is declared by the submitter, never inferred from who
+    /// sent it -- the owner's own input takes this same field with the same
+    /// meaning.
+    #[serde(default)]
+    pub intent_kind: IntentKind,
+}
+
+/// The two input forms. A `Goal` is decomposed: the platform decides which
+/// steps it consists of. A `Task` is submitted as already decided, and is
+/// injected as-is only when the submitter also marks it verified -- an
+/// unverified task still goes through planning, because "here is a task" and
+/// "here is a task that is right" are different claims.
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentKind {
+    #[default]
+    Goal,
+    Task,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,6 +111,97 @@ pub struct TaskItem {
     pub blocked_by: Vec<String>,
     #[serde(default)]
     pub priority: i32,
+    /// The submitter's claim that this row needs no planning. Honoured only
+    /// for `intent_kind=task`; a goal submission is decomposed even if a row
+    /// arrives carrying it.
+    #[serde(default)]
+    pub planner: Option<PlannerClaim>,
+    /// The executor this row is declared for. Recorded on the task; routing it
+    /// to exactly that executor is a separate step.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct PlannerClaim {
+    #[serde(default)]
+    pub verified: bool,
+    /// `user_provided` | `optimized` | `decomposed`; anything else falls back
+    /// to `user_provided`, which is what an API submission is.
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+fn parse_planner_source(s: Option<&str>) -> cog_core::ActionPlannerSource {
+    match s.unwrap_or("user_provided") {
+        "optimized" => cog_core::ActionPlannerSource::Optimized,
+        "decomposed" => cog_core::ActionPlannerSource::Decomposed,
+        _ => cog_core::ActionPlannerSource::UserProvided,
+    }
+}
+
+/// Credential-shaped key names an input may not carry. The task graph is
+/// readable by every route that lists tasks, and a credential pasted into an
+/// input is a credential written to Postgres and to every log that records the
+/// input. A reference (`{"credential": "llm-upstream"}`) is the supported form;
+/// the values themselves live in the security gateway.
+const CREDENTIAL_KEY_SUFFIXES: [&str; 7] = [
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "apikey",
+    "privatekey",
+    "accesskey",
+];
+const CREDENTIAL_KEY_EXACT: [&str; 3] = ["key", "credentials", "authorization"];
+
+/// Return the first credential-shaped key path in `input`, if any.
+///
+/// Matching is on the normalised key (lower-cased, separators removed) and by
+/// suffix, so `github_token`, `client-secret` and `password` are caught while
+/// `token_budget` and `max_tokens` -- which describe a quantity, not a secret
+/// -- are not. Key *names* only: a value is not sniffed for looking like a
+/// credential, because that would reject honest payloads and still miss a
+/// renamed one.
+pub(crate) fn credential_key_in_input(input: &serde_json::Value) -> Option<String> {
+    fn walk(value: &serde_json::Value, path: &str) -> Option<String> {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (k, v) in map {
+                    let norm: String = k
+                        .chars()
+                        .filter(|c| !matches!(c, '_' | '-' | '.' | ' '))
+                        .flat_map(|c| c.to_lowercase())
+                        .collect();
+                    if CREDENTIAL_KEY_EXACT.contains(&norm.as_str())
+                        || CREDENTIAL_KEY_SUFFIXES.iter().any(|s| norm.ends_with(s))
+                    {
+                        return Some(if path.is_empty() {
+                            k.clone()
+                        } else {
+                            format!("{path}.{k}")
+                        });
+                    }
+                    let next = if path.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{path}.{k}")
+                    };
+                    if let Some(found) = walk(v, &next) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            serde_json::Value::Array(items) => items
+                .iter()
+                .enumerate()
+                .find_map(|(i, v)| walk(v, &format!("{path}[{i}]"))),
+            _ => None,
+        }
+    }
+    walk(input, "")
 }
 
 #[derive(Debug, Serialize)]
@@ -169,17 +279,55 @@ impl From<Task> for TaskView {
 }
 
 /// `/api/v1/tasks/list` 与 `/api/v1/tasks/graph` 的过滤参数。不带 query 时与从前逐字相同。
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct TaskQuery {
     /// 只看这一个 goal 下的任务。值就是提交响应里的 `message_id`；占位任务与它分解出的
     /// 子任务带同一个值，所以按它过滤能拿到一次提交的全貌。
     pub goal_id: Option<String>,
+    /// 只看这个执行者手上的（或声明给它的）任务。
+    pub agent_id: Option<String>,
+    /// 只看这个状态的任务，大小写不敏感，值与读面印出来的那个词一致。
+    pub status: Option<String>,
 }
 
 /// 一条任务是否属于被查询的 goal。没有 goal 条件时一律留下（既有行为不变）。
 fn in_goal(query: &TaskQuery, task: &Task) -> bool {
     match &query.goal_id {
         Some(want) => task.goal_id.as_deref() == Some(want.as_str()),
+        None => true,
+    }
+}
+
+/// The full query filter: goal, executor, and state. Separate from [`in_goal`]
+/// because the tests that pin "no goal means everything" are about that one
+/// dimension, and folding three dimensions into it would let a change to either
+/// of the other two turn them red for an unrelated reason.
+fn matches_query(query: &TaskQuery, task: &Task) -> bool {
+    in_goal(query, task)
+        && query
+            .agent_id
+            .as_deref()
+            .is_none_or(|want| task.agent_id.as_deref() == Some(want))
+        && query
+            .status
+            .as_deref()
+            .is_none_or(|want| format!("{:?}", task.status).eq_ignore_ascii_case(want))
+}
+
+/// Whether a reader holding `claims` may see `task`.
+///
+/// An empty scope is the same convention the submission side already uses (a
+/// token that declares no workspaces is not restricted by them), and a task
+/// with no workspace is one submitted before the field was recorded -- hiding
+/// those would make them disappear from every scoped reader without making
+/// them safer, since no workspace owns them.
+fn visible_to_claims(claims: Option<&cog_core::Claims>, task: &Task) -> bool {
+    let Some(claims) = claims else { return true };
+    if claims.workspace_ids.is_empty() {
+        return true;
+    }
+    match task.workspace_id.as_deref() {
+        Some(ws) => claims.workspace_ids.iter().any(|held| held == ws),
         None => true,
     }
 }
@@ -241,6 +389,27 @@ fn submitted_tasks(req: &CreateTaskRequest, goal_id: &str) -> Vec<Task> {
                     task.priority = item.priority;
                     task.workspace_id = Some(req.workspace_id.clone());
                     task.goal_id = Some(goal_id.to_string());
+                    task.agent_id = item.agent_id.clone();
+                    // Only a submission that says it is a task can carry the
+                    // "no planning needed" claim. A goal is decomposed by
+                    // definition; letting a verified flag on one of its rows
+                    // skip that would make the branch depend on a marker
+                    // rather than on the input's form.
+                    if req.intent_kind == IntentKind::Task {
+                        if let Some(claim) = item.planner.as_ref().filter(|c| c.verified) {
+                            task.action_planner_meta = Some(cog_core::ActionPlannerMeta {
+                                verified: true,
+                                version: None,
+                                note: Some(
+                                    "submitted as a verified task; injected without decomposition"
+                                        .into(),
+                                ),
+                                source: Some(parse_planner_source(claim.source.as_deref())),
+                                confidence: None,
+                                timestamp: Some(chrono::Utc::now()),
+                            });
+                        }
+                    }
                     task
                 })
                 .collect()
@@ -286,6 +455,32 @@ pub async fn create_task_handler(
                 req.workspace_id
             )));
         }
+    }
+
+    // A credential pasted into an input is a credential written to Postgres, to
+    // every task listing, and to every log that records a submission. Reject it
+    // before anything is queued: a task the platform accepted is a task it then
+    // copies around.
+    if let Some(items) = req.tasks.as_ref() {
+        for item in items {
+            if let Some(path) = credential_key_in_input(&item.input) {
+                return Err(ApiError::bad_request(format!(
+                    "task {} carries a credential-shaped key '{}' in its input; \
+                     task input may hold a reference to a credential, never its value",
+                    item.id, path
+                )));
+            }
+        }
+    }
+
+    // "Here is a task" with no rows is a goal stated in the wrong field; it
+    // would be decomposed anyway, and the caller would read a 202 as its task.
+    if req.intent_kind == IntentKind::Task
+        && req.tasks.as_ref().is_none_or(|items| items.is_empty())
+    {
+        return Err(ApiError::bad_request(
+            "intent_kind=task needs at least one task; a submission with no rows is a goal",
+        ));
     }
 
     // 按任务配额执法（审计 3.6）：创建前经 5 级 HierarchyManager 检查。
@@ -362,9 +557,14 @@ pub async fn create_task_handler(
 
 pub async fn get_task_handler(
     State(state): State<Arc<GatewayState>>,
+    claims: Option<axum::Extension<cog_core::Claims>>,
     Path(id): Path<String>,
 ) -> Result<Json<TaskView>, ApiError> {
+    let claims = claims.as_ref().map(|axum::Extension(c)| c);
     match state.orchestrator.get_task(&id).await {
+        Some(task) if !visible_to_claims(claims, &task) => {
+            Err(ApiError::not_found(format!("task '{id}' not found")))
+        }
         Some(task) => {
             let view: TaskView = task.into();
             Ok(Json(view))
@@ -375,12 +575,14 @@ pub async fn get_task_handler(
 
 pub async fn list_tasks_handler(
     State(state): State<Arc<GatewayState>>,
+    claims: Option<axum::Extension<cog_core::Claims>>,
     Query(query): Query<TaskQuery>,
 ) -> Result<Json<Vec<TaskView>>, ApiError> {
+    let claims = claims.as_ref().map(|axum::Extension(c)| c);
     let tasks = state.orchestrator.get_all_tasks().await;
     let views: Vec<TaskView> = tasks
         .into_iter()
-        .filter(|t| in_goal(&query, t))
+        .filter(|t| matches_query(&query, t) && visible_to_claims(claims, t))
         .map(|t| t.into())
         .collect();
     Ok(Json(views))
@@ -388,9 +590,15 @@ pub async fn list_tasks_handler(
 
 pub async fn get_ready_tasks_handler(
     State(state): State<Arc<GatewayState>>,
+    claims: Option<axum::Extension<cog_core::Claims>>,
 ) -> Result<Json<Vec<TaskView>>, ApiError> {
+    let claims = claims.as_ref().map(|axum::Extension(c)| c);
     let tasks = state.orchestrator.get_ready_tasks().await;
-    let views: Vec<TaskView> = tasks.into_iter().map(|t| t.into()).collect();
+    let views: Vec<TaskView> = tasks
+        .into_iter()
+        .filter(|t| visible_to_claims(claims, t))
+        .map(|t| t.into())
+        .collect();
     Ok(Json(views))
 }
 
@@ -466,6 +674,41 @@ pub async fn cancel_task_handler(
     Ok(Json(cancelled))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AssignTaskRequest {
+    pub agent_id: String,
+}
+
+/// POST /api/v1/tasks/{id}/assign -- name the executor a task belongs to.
+///
+/// Assignment is a step of its own: the planner says what the steps are, this
+/// says who carries one out. It only moves a task that has not started, so a
+/// finished or running task keeps the executor its state refers to.
+pub async fn assign_task_handler(
+    State(state): State<Arc<GatewayState>>,
+    claims: Option<axum::Extension<cog_core::Claims>>,
+    Path(id): Path<String>,
+    Json(req): Json<AssignTaskRequest>,
+) -> Result<StatusCode, ApiError> {
+    // Checked before the write: an unreadable task is one the caller may not
+    // assign either, and answering "not found" for both keeps the route from
+    // confirming which ids exist elsewhere.
+    let claims = claims.as_ref().map(|axum::Extension(c)| c);
+    match state.orchestrator.get_task(&id).await {
+        Some(task) if visible_to_claims(claims, &task) => {}
+        _ => return Err(ApiError::not_found(format!("task '{id}' not found"))),
+    }
+    if req.agent_id.trim().is_empty() {
+        return Err(ApiError::bad_request("agent_id must not be empty"));
+    }
+    state
+        .orchestrator
+        .assign_task(&id, req.agent_id.trim())
+        .await
+        .map_err(|e| ApiError::bad_request(format!("assign failed: {}", e)))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn retry_task_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
@@ -535,8 +778,10 @@ fn purge_matches(
 /// record (what matched, what was cancelled, what resisted).
 pub async fn purge_tasks_handler(
     State(state): State<Arc<GatewayState>>,
+    claims: Option<axum::Extension<cog_core::Claims>>,
     Json(req): Json<PurgeTasksRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let claims = claims.as_ref().map(|axum::Extension(c)| c);
     let dry_run = req.dry_run.unwrap_or(true);
     let statuses = match &req.statuses {
         Some(list) => list
@@ -557,7 +802,10 @@ pub async fn purge_tasks_handler(
         .get_all_tasks()
         .await
         .into_iter()
-        .filter(|t| purge_matches(t, &statuses, req.task_type_prefix.as_deref(), cutoff))
+        .filter(|t| {
+            visible_to_claims(claims, t)
+                && purge_matches(t, &statuses, req.task_type_prefix.as_deref(), cutoff)
+        })
         .collect();
 
     let mut cancelled: Vec<String> = Vec::new();
@@ -594,9 +842,30 @@ pub async fn purge_tasks_handler(
 
 pub async fn task_summary_handler(
     State(state): State<Arc<GatewayState>>,
+    claims: Option<axum::Extension<cog_core::Claims>>,
 ) -> Result<Json<TaskSummary>, ApiError> {
-    let all = state.orchestrator.get_all_tasks().await;
-    let ready = state.orchestrator.get_ready_tasks().await;
+    let claims = claims.as_ref().map(|axum::Extension(c)| c);
+    let all: Vec<Task> = state
+        .orchestrator
+        .get_all_tasks()
+        .await
+        .into_iter()
+        .filter(|t| visible_to_claims(claims, t))
+        .collect();
+    let ready: Vec<Task> = state
+        .orchestrator
+        .get_ready_tasks()
+        .await
+        .into_iter()
+        .filter(|t| visible_to_claims(claims, t))
+        .collect();
+    // Counted over what this reader can see, not the whole graph: a summary
+    // whose totals and body disagree sends the reader looking for tasks it is
+    // never shown.
+    let all_completed = !all.is_empty()
+        && all
+            .iter()
+            .all(|t| t.status == cog_core::TaskStatus::Completed);
     let running: Vec<_> = all
         .iter()
         .filter(|t| format!("{:?}", t.status) == "Running")
@@ -619,52 +888,68 @@ pub async fn task_summary_handler(
         running: running.len(),
         completed: completed.len(),
         failed: failed.len(),
-        all_completed: state.orchestrator.all_completed().await,
+        all_completed,
     }))
 }
 
 pub async fn get_task_dependents_handler(
     State(state): State<Arc<GatewayState>>,
+    claims: Option<axum::Extension<cog_core::Claims>>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<TaskView>>, ApiError> {
+    let claims = claims.as_ref().map(|axum::Extension(c)| c);
     let tasks = state
         .orchestrator
         .get_dependents(&id)
         .await
         .unwrap_or_default();
-    let views: Vec<TaskView> = tasks.into_iter().map(|t| t.into()).collect();
+    let views: Vec<TaskView> = tasks
+        .into_iter()
+        .filter(|t| visible_to_claims(claims, t))
+        .map(|t| t.into())
+        .collect();
     Ok(Json(views))
 }
 
 pub async fn get_task_dependencies_handler(
     State(state): State<Arc<GatewayState>>,
+    claims: Option<axum::Extension<cog_core::Claims>>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<TaskView>>, ApiError> {
+    let claims = claims.as_ref().map(|axum::Extension(c)| c);
     let tasks = state
         .orchestrator
         .get_dependencies(&id)
         .await
         .unwrap_or_default();
-    let views: Vec<TaskView> = tasks.into_iter().map(|t| t.into()).collect();
+    let views: Vec<TaskView> = tasks
+        .into_iter()
+        .filter(|t| visible_to_claims(claims, t))
+        .map(|t| t.into())
+        .collect();
     Ok(Json(views))
 }
 
 pub async fn get_task_graph_handler(
     State(state): State<Arc<GatewayState>>,
+    claims: Option<axum::Extension<cog_core::Claims>>,
     Query(query): Query<TaskQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let claims = claims.as_ref().map(|axum::Extension(c)| c);
     let (tasks, edges) = state.orchestrator.get_graph().await;
-    let kept: Vec<Task> = tasks.into_iter().filter(|t| in_goal(&query, t)).collect();
+    let kept: Vec<Task> = tasks
+        .into_iter()
+        .filter(|t| matches_query(&query, t) && visible_to_claims(claims, t))
+        .collect();
     // 过滤时边跟着节点收口：只留两端都还在的边，否则图里会出现指向已被滤掉节点的悬边，
-    // 读的人会以为那条边通向一张没被过滤掉的任务。
-    let edges: Vec<(String, String)> = if query.goal_id.is_some() {
+    // 读的人会以为那条边通向一张没被过滤掉的任务。工作区过滤也会滤掉节点，所以这一段
+    // 从「给了 goal_id 才收口」改成「只要滤掉了任何一个节点就收口」。
+    let edges: Vec<(String, String)> = {
         let ids: std::collections::HashSet<&str> = kept.iter().map(|t| t.id.as_str()).collect();
         edges
             .into_iter()
             .filter(|(from, to)| ids.contains(from.as_str()) && ids.contains(to.as_str()))
             .collect()
-    } else {
-        edges
     };
     let nodes: Vec<TaskView> = kept.into_iter().map(|t| t.into()).collect();
     Ok(Json(serde_json::json!({
@@ -855,7 +1140,7 @@ mod tests {
         in_g2.goal_id = Some("g2".into());
         let goal_less = task("c", cog_core::TaskStatus::Pending, "t", 0);
 
-        let unfiltered = TaskQuery { goal_id: None };
+        let unfiltered = TaskQuery::default();
         assert!(
             in_goal(&unfiltered, &in_g1)
                 && in_goal(&unfiltered, &in_g2)
@@ -865,6 +1150,7 @@ mod tests {
 
         let only_g1 = TaskQuery {
             goal_id: Some("g1".into()),
+            ..Default::default()
         };
         assert!(in_goal(&only_g1, &in_g1));
         assert!(!in_goal(&only_g1, &in_g2));
@@ -884,6 +1170,7 @@ mod tests {
             tasks: None,
             workspace_id: "ws".into(),
             priority: None,
+            intent_kind: IntentKind::Goal,
         };
         let tasks = submitted_tasks(&req, "goal-1");
         assert_eq!(tasks.len(), 1, "a bare goal must still be addressable");
@@ -911,9 +1198,12 @@ mod tests {
                 input: serde_json::json!({ "x": 1 }),
                 blocked_by: vec![],
                 priority: 0,
+                planner: None,
+                agent_id: None,
             }]),
             workspace_id: "ws".into(),
             priority: None,
+            intent_kind: IntentKind::Goal,
         };
         let tasks = submitted_tasks(&req, "goal-9");
         assert_eq!(tasks.len(), 1);
@@ -931,11 +1221,144 @@ mod tests {
             tasks: Some(vec![]),
             workspace_id: "ws".into(),
             priority: None,
+            intent_kind: IntentKind::Goal,
         };
         let tasks = submitted_tasks(&req, "goal-empty");
         assert_eq!(tasks.len(), 1, "an empty array is still a bare goal");
         assert_eq!(tasks[0].id, "goal-empty");
         assert_eq!(tasks[0].goal_id.as_deref(), Some("goal-empty"));
         assert!(!tasks[0].is_executable);
+    }
+
+    fn task_item(id: &str, verified: Option<bool>) -> TaskItem {
+        TaskItem {
+            id: id.into(),
+            task_type: "benchmark_case".into(),
+            input: serde_json::json!({ "x": 1 }),
+            blocked_by: vec![],
+            priority: 0,
+            planner: verified.map(|v| PlannerClaim {
+                verified: v,
+                source: Some("user_provided".into()),
+            }),
+            agent_id: None,
+        }
+    }
+
+    /// 声明为 task 且自称已验证的提交，逐行带上 `verified`：这是协调器直注分支
+    /// 唯一看的标记，少了它，一次「拿去执行」的提交会被再规划一遍。
+    #[test]
+    fn a_verified_task_submission_marks_every_row_for_direct_injection() {
+        let req = CreateTaskRequest {
+            goal_id: None,
+            goal: "run these".into(),
+            tasks: Some(vec![
+                task_item("t1", Some(true)),
+                task_item("t2", Some(true)),
+            ]),
+            workspace_id: "ws".into(),
+            priority: None,
+            intent_kind: IntentKind::Task,
+        };
+        let tasks = submitted_tasks(&req, "g");
+        assert_eq!(tasks.len(), 2);
+        for t in &tasks {
+            let meta = t
+                .action_planner_meta
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} lost its verified claim", t.id));
+            assert!(meta.verified);
+        }
+    }
+
+    /// 反过来：goal 提交不认这条声明。输入形态由 `intent_kind` 说，不由某一行上
+    /// 偶然带的标记说——否则「这条是目标」与「这一行别规划了」会互相顶掉。
+    #[test]
+    fn a_goal_submission_ignores_a_verified_claim_on_its_rows() {
+        let req = CreateTaskRequest {
+            goal_id: None,
+            goal: "plan this".into(),
+            tasks: Some(vec![task_item("t1", Some(true))]),
+            workspace_id: "ws".into(),
+            priority: None,
+            intent_kind: IntentKind::Goal,
+        };
+        let tasks = submitted_tasks(&req, "g");
+        assert!(
+            tasks[0].action_planner_meta.is_none(),
+            "a goal's rows are decomposed even when one of them claims to be verified"
+        );
+    }
+
+    /// 凭据类键名一律拒；只描述数量的名字（`token_budget`、`max_tokens`）不拒——
+    /// 按子串判会把它们一起打掉，而它们恰是正常载荷。
+    #[test]
+    fn credential_keys_are_rejected_but_quantities_are_not() {
+        for key in [
+            "api_key",
+            "github_token",
+            "client-secret",
+            "password",
+            "Authorization",
+        ] {
+            let input = serde_json::json!({ "step": { key: "x" } });
+            assert_eq!(
+                credential_key_in_input(&input).as_deref(),
+                Some(format!("step.{key}").as_str()),
+                "{key} is a credential key and must be refused"
+            );
+        }
+        for key in ["token_budget", "max_tokens", "keyword", "monkey"] {
+            let input = serde_json::json!({ key: 1 });
+            assert!(
+                credential_key_in_input(&input).is_none(),
+                "{key} describes a quantity or a word, not a secret"
+            );
+        }
+        assert!(
+            credential_key_in_input(&serde_json::json!([{"user": {"password": "x"}}]))
+                .is_some_and(|p| p.contains("password"))
+        );
+    }
+
+    fn claims_with_workspaces(ws: Vec<String>) -> cog_core::Claims {
+        cog_core::Claims {
+            sub: "user-1".into(),
+            iss: "test".into(),
+            aud: "test".into(),
+            exp: 0,
+            iat: 0,
+            jti: "jti".into(),
+            preferred_username: "tester".into(),
+            user_type: cog_core::UserType::Standard,
+            workspace_ids: ws,
+            permissions: Vec::new(),
+            roles: Vec::new(),
+        }
+    }
+
+    /// 读面的隔离：声明了 workspace 的 token 看不到别人的任务；没声明范围的口径
+    /// 与提交侧一致（不按范围限制）；没有归属的旧行不因隔离而从每个读者眼里消失。
+    #[test]
+    fn a_scoped_reader_sees_only_its_own_workspaces() {
+        let claims = claims_with_workspaces(vec!["ws-a".into()]);
+        let mut mine = task("a", cog_core::TaskStatus::Pending, "t", 0);
+        mine.workspace_id = Some("ws-a".into());
+        let mut theirs = task("b", cog_core::TaskStatus::Pending, "t", 0);
+        theirs.workspace_id = Some("ws-b".into());
+        let unattributed = task("c", cog_core::TaskStatus::Pending, "t", 0);
+
+        assert!(visible_to_claims(Some(&claims), &mine));
+        assert!(!visible_to_claims(Some(&claims), &theirs));
+        assert!(
+            visible_to_claims(Some(&claims), &unattributed),
+            "a row from before the field was recorded belongs to no workspace, so no scope hides it"
+        );
+        assert!(visible_to_claims(None, &theirs));
+        let unscoped = claims_with_workspaces(vec![]);
+        assert!(
+            visible_to_claims(Some(&unscoped), &theirs),
+            "a token that declares no scope is not restricted by one"
+        );
     }
 }

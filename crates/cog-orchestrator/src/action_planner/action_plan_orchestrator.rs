@@ -2743,6 +2743,54 @@ mod tests {
         assert!(sink.calls.lock().unwrap().is_empty());
     }
 
+    /// A submission that says "here is the work, already decided" must reach
+    /// the graph as those rows. The test fails the direct-injection branch if
+    /// the planner is consulted at all: the recording executor would hold the
+    /// hints, and the graph would hold whatever decomposition returned instead
+    /// of one node per submitted task.
+    #[tokio::test]
+    async fn a_verified_task_submission_is_injected_without_decomposition() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-verified-direct".to_string()));
+        let executor = Arc::new(RecordingAtomicExecutor::default());
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(executor.clone())
+            .with_dag_executor(dag.clone());
+        let registry = SkillRegistry::new();
+
+        let rows: Vec<Task> = ["t-a", "t-b"]
+            .iter()
+            .map(|id| {
+                let mut t = hint_task(id);
+                t.is_executable = true;
+                t.action_planner_meta = Some(cog_core::ActionPlannerMeta {
+                    verified: true,
+                    version: None,
+                    note: None,
+                    source: Some(cog_core::ActionPlannerSource::UserProvided),
+                    confidence: None,
+                    timestamp: Some(Utc::now()),
+                });
+                t
+            })
+            .collect();
+
+        let ids = planner
+            .process_goal_impl("run these as given", rows, &registry)
+            .await
+            .unwrap();
+        assert_eq!(ids, vec!["t-a".to_string(), "t-b".to_string()]);
+        assert!(
+            executor.seen.lock().unwrap().is_empty(),
+            "a verified submission must not be handed to the planner"
+        );
+        assert_eq!(
+            dag.get_all_tasks().await.len(),
+            2,
+            "one graph node per submitted task, and no decomposition nodes besides"
+        );
+    }
+
     #[tokio::test]
     async fn test_parse_tasks_from_json() {
         let orchestrator = ActionPlanOrchestrator::new();
