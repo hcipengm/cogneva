@@ -1284,8 +1284,11 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          handover_unreadable counts the rows whose handovers could not be read at \
          all, so a failed read cannot pass for changes that produced nothing. \
          Written once per pass, so a pass that \
-         stops writing is visible as the companion timestamp going stale rather \
-         than as a value that stops changing. Why this tick looks the way it does \
+         stops writing is visible as the stored sample's own timestamp going \
+         stale rather than as a value that stops changing -- not through this \
+         exposition, which carries no clock, and not through a scrape \
+         timestamp, which keeps moving while the value stands still. Why this \
+         tick looks the way it does \
          is the pass's own verdict, read from cogneva_change_dispatch_verdict: \
          the two are separate families because the verdict changes with the tick \
          and a cell's identity must not, and a label that changes would leave one \
