@@ -698,6 +698,9 @@ pub struct Wiring {
     /// 数据根里没有官方那两件脚本、或者这次被显式关了。三样要做的下一步分别是装机器、取脚本、
     /// 改开关——压成一句「没接上」，读的人会去翻一个翻不出东西的地方。
     pub swe_pro_reason: Option<String>,
+    /// `toolathlon` 为 `None` 时的那句原因，与上面那条同一个理由：这一列今天缺的不再是
+    /// 「树里没有实现」，而是**这台宿主上没有能起 Pod 的机器**、或者被开关关掉了。
+    pub toolathlon_reason: Option<String>,
     /// 这次声明进来的外部流派（按声明顺序）。空 ＝ 这次跑只有仓里那四行。
     pub foreign_flows: Vec<crate::eval_container::ForeignFlowSpec>,
     /// 声明读不出来时的那句原因。它是**整块**不成立的原因：一块声明里有一行写坏，
@@ -987,15 +990,17 @@ fn missing_dependencies(
                 .unwrap_or_else(|| "the container backend is not wired into this run".to_string()),
         ));
     }
-    // 这一条仍然是 `NotImplemented`：compose 后端树里没有实现（只有测试替身），所以「接上」
-    // 这一步今天无物可接。写成「没接上」会把读的人送去翻配置，翻不出东西。
+    // 这一条与 swe-bench-pro 同形：树里有实现（Pod 后端与工具面都在），缺的只可能是这次
+    // 没把它接进来。写成 `NotImplemented` 会把读的人送去等一个已经落地的功能。
     if benchmarks.contains(&"toolathlon") && wiring.toolathlon.is_none() {
         missing.push(Missing::new(
             "toolathlon",
             MissingScope::Column("toolathlon".to_string()),
-            Absence::NotImplemented,
-            "no compose backend is implemented in this build, so there is nothing to wire; this \
-             host has no compose runtime and the pack image has never been built",
+            Absence::NotWired,
+            wiring
+                .toolathlon_reason
+                .clone()
+                .unwrap_or_else(|| "the pod backend is not wired into this run".to_string()),
         ));
     }
     if scaffolds.iter().any(|name| name == "nql") && wiring.platform.is_none() {
@@ -1677,6 +1682,19 @@ async fn wiring_from_config(args: &EvalTableArgs) -> Wiring {
                  located: {e}"
             ))
         }
+    }
+    // toolathlon 与上游同样是两条互不相干的依赖：关工具的诊断臂一样要起 Pod、一样要跑
+    // 判分。所以它排在任何骨干早退之前，理由与上面那一段相同。
+    match crate::eval_toolathlon::PodToolathlonBackend::detect().await {
+        Ok(Some(backend)) => wiring.toolathlon = Some(Arc::new(backend)),
+        Ok(None) => {
+            wiring.toolathlon_reason = Some(
+                "this host has no pod runtime the backend can drive: no `kubectl` answered, or \
+                 COGNEVA_EVAL_TOOLATHLON_RUNTIME is set to off"
+                    .to_string(),
+            )
+        }
+        Err(why) => wiring.toolathlon_reason = Some(format!("{why:#}")),
     }
     let routing = match cog_llm::LLMRoutingConfig::load() {
         Ok(routing) => routing,
@@ -2873,9 +2891,8 @@ mod tests {
     /// 只有「缺 X」时，读的人看不出照着做的那一步是写代码还是改配置，也看不出 `## per seed`
     /// 里那些 `errored` 算不算缺陷。
     ///
-    /// 两类缺席各钉一次，而且钉的是**各自那个类**：`toolathlon` 树里没有 compose 后端，所以
-    /// 是 `not-implemented`；`swe-bench-pro` 树里有容器后端，缺席只可能是没接进来，所以是
-    /// `not-wired`。把后者的类别写成前者，读的人会去做一件已经做完的事。
+    /// 这几条都钉在 `not-wired` 上：两列的树里都有实现，缺席只可能是这次没接进来。
+    /// 把其中一条写成 `not-implemented`，读的人会去等一件已经落地的事。
     #[test]
     fn a_wiring_line_says_what_it_covers_and_what_kind_of_absence_it_is() {
         let mut raw = minimal();
@@ -2907,7 +2924,7 @@ mod tests {
         );
         for expected in [
             "missing\tswe-bench-pro\tcolumn:swe-bench-pro\tnot-wired\t",
-            "missing\ttoolathlon\tcolumn:toolathlon\tnot-implemented\t",
+            "missing\ttoolathlon\tcolumn:toolathlon\tnot-wired\t",
             "missing\tnql\trow:nql\tnot-wired\t",
             "missing\tbackbone\tevery-cell\tnot-wired\t",
             "missing\tjudge\tevery-cell\tnot-wired\t",
