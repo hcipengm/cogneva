@@ -532,6 +532,70 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &[],
         "crates/cog-reflection/src/signal_readings.rs",
     ),
+    // How each round of the discovery loop's probes ended, one series per exit.
+    // No panel draws these yet, and they are here for the reason the watcher
+    // readings above are: the loop has always counted these and the counts
+    // reached a reader exactly once, through one `info!` line, which cannot be
+    // looked at over time. The re-measure recipe standing next to the probe
+    // deadline is written in terms of how these move -- whether `still_open`
+    // keeps standing above zero, whether `row_missing` ever has a value -- so
+    // until a face draws them that recipe has nothing to read.
+    //
+    // One series per exit and never a total, because folded together "every
+    // probe was answered" and "every probe came back without an answer" print
+    // the same number, and the second one is the finding: it means the loop has
+    // no judge of its own and is reading whatever the generic task path
+    // returned. The last two are the pair the recipe leans on -- `still_open` is
+    // the probes still on the books, and it is read against the round's width
+    // rather than on its own, so the two are filed together; a probe that has
+    // never been counted anywhere is what `not_recorded` is for, and a verdict
+    // that was read but could not be written down is the one failure that would
+    // otherwise leave the other eight looking clean.
+    (
+        "cogneva_discovery_probe_validated",
+        &[],
+        "crates/cog-reflection/src/discovery_outcome_readings.rs",
+    ),
+    (
+        "cogneva_discovery_probe_rejected",
+        &[],
+        "crates/cog-reflection/src/discovery_outcome_readings.rs",
+    ),
+    (
+        "cogneva_discovery_probe_inconclusive",
+        &[],
+        "crates/cog-reflection/src/discovery_outcome_readings.rs",
+    ),
+    (
+        "cogneva_discovery_probe_unanswered",
+        &[],
+        "crates/cog-reflection/src/discovery_outcome_readings.rs",
+    ),
+    (
+        "cogneva_discovery_probe_run_ended_without_result",
+        &[],
+        "crates/cog-reflection/src/discovery_outcome_readings.rs",
+    ),
+    (
+        "cogneva_discovery_probe_row_missing",
+        &[],
+        "crates/cog-reflection/src/discovery_outcome_readings.rs",
+    ),
+    (
+        "cogneva_discovery_probe_expired",
+        &[],
+        "crates/cog-reflection/src/discovery_outcome_readings.rs",
+    ),
+    (
+        "cogneva_discovery_probe_still_open",
+        &[],
+        "crates/cog-reflection/src/discovery_outcome_readings.rs",
+    ),
+    (
+        "cogneva_discovery_probe_not_recorded",
+        &[],
+        "crates/cog-reflection/src/discovery_outcome_readings.rs",
+    ),
     // How much of a volume is in use: the claim label is what the alert rule
     // divides by the declared size. Every producer of it walks the volume, so the
     // panel is one wall per claim rather than one wall per kind of reader. A

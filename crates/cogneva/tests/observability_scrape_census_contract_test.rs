@@ -258,7 +258,19 @@ const GAPS_AT_SCRAPE_CENSUS: usize = 9;
 /// that asks "does this name occur in the file" counts it as drawn, and a
 /// reading that parses the queries does not. That is the difference between the
 /// two, measured on the first run of this test.
-const REGISTERED_BUT_UNREAD_AT_CENSUS: usize = 8;
+///
+/// Seventeen, and the nine added at once are the discovery loop's per-exit
+/// counts. They arrive together because the family arrives together: the loop
+/// has always distinguished these nine exits and the counts reached a reader
+/// once per round through one `info!` line, so the whole family is registered
+/// in the dashboard contract's table in the round that publishes them. Nothing
+/// draws them yet -- the re-measure recipe next to the probe deadline is a
+/// procedure rather than a rule -- and no threshold is derivable until the
+/// first rounds put probes on the books, which is why they are registered here
+/// rather than filed as gaps: the face they are owed is a reader of the
+/// population, and naming the producer is what keeps them from drifting apart
+/// while that reader is written.
+const REGISTERED_BUT_UNREAD_AT_CENSUS: usize = 17;
 
 #[test]
 fn every_series_a_build_can_render_is_on_a_face_or_has_a_verdict() {
