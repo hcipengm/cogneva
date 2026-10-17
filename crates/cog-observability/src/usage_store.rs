@@ -539,14 +539,16 @@ impl LlmUsageStore {
     /// ([`Self::spent_since`]) because its starting instant is what this read
     /// computes.
     ///
-    /// `last_quota_refusal_unix` is the instant the previous window ran out,
-    /// taken from the row's own classification rather than guessed from a gap
-    /// in traffic: only a `quota_cycle` refusal says the window is spent, while
-    /// an `entitlement` refusal says the capacity never existed — pacing against
+    /// `last_quota_refusal_unix` is when the allowance ran out, taken from the
+    /// row's own classification rather than guessed from a gap in traffic: only
+    /// a `quota_cycle` refusal says the allowance is spent, while an
+    /// `entitlement` refusal says the capacity never existed — pacing against
     /// the latter would spread a quota that will never arrive. It is `None` for
-    /// rows written before the classification column existed, and the caller
-    /// then falls back to the last success, which is the same reading minus the
-    /// seconds between the last call and the wall.
+    /// rows written before the classification column existed, and then there is
+    /// no capacity reading either: `burned_window_tokens` is 0 because nothing
+    /// was measured, and the newest successful call is not a substitute for a
+    /// boundary. It only says where serving stopped, which is equally true of an
+    /// upstream that was throttled and of one nobody called.
     pub async fn upstream_window(
         &self,
         upstream: &str,
@@ -568,20 +570,18 @@ impl LlmUsageStore {
             SELECT
                 (SELECT EXTRACT(EPOCH FROM ts)::BIGINT FROM last) AS last_ok_unix,
                 (SELECT EXTRACT(EPOCH FROM ts)::BIGINT FROM wall) AS last_quota_refusal_unix,
-                -- Measured around the refusal when one is on record: that
-                -- instant is the window's end, whereas the last success keeps
-                -- moving once the next window starts serving. The fallback
-                -- (no classified refusal -- rows written before the column
-                -- existed) measures around the last success, which is the same
-                -- quantity minus the seconds between the last call and the
-                -- wall.
+                -- Measured around the refusal, and only around it: that row is
+                -- the one observation of the allowance running out. There is no
+                -- fallback to the last success — that instant only says where
+                -- serving stopped, so a sum around it would be a capacity
+                -- nobody measured. Without a wall the reading is 0, which the
+                -- caller reads as "nothing measured" because the boundary is
+                -- NULL in the same row.
                 COALESCE(
                     (SELECT SUM(o.tokens) FROM ok o, wall w
                       WHERE w.ts IS NOT NULL
                         AND o.ts > w.ts - make_interval(secs => $2)
                         AND o.ts <= w.ts),
-                    (SELECT SUM(o.tokens) FROM ok o, last l
-                      WHERE o.ts > l.ts - make_interval(secs => $2)),
                     0
                 )::BIGINT AS burned_window_tokens
             "#
