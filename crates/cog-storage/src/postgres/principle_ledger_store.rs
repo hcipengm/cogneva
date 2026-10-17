@@ -320,10 +320,22 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
         // Rows nothing has looked at sort first: an unmeasured row is the least
         // known, not the freshest, and ordering it by insertion would put every
         // newly read principle ahead of one that has waited for a look.
+        //
+        // A row a person holds sorts after every row a pass could settle. Its
+        // verdict is the settled answer "no gate is meant to exist", and nothing
+        // a pass does can move it: no measurement is written, so `measured_at`
+        // stays null, so sorting it by `measured_at` returns it to the head of
+        // the next pass as well. Once there are more of them than one pass can
+        // take, the pass spends its whole budget on the same rows every five
+        // minutes and no other row is ever looked at again -- which reads in the
+        // log as a pass that judged 200 rows, not as a pass that stopped. They
+        // are kept in the set rather than filtered out so the line still reports
+        // how many rows a person holds.
         let rows = sqlx::query(&format!(
             "SELECT {ROW_COLUMNS} FROM principle_ledger \
              WHERE state IS DISTINCT FROM 'enforced' \
-             ORDER BY measured_at ASC NULLS FIRST, first_seen_at ASC \
+             ORDER BY (check_kind IS NOT DISTINCT FROM 'judgement') ASC, \
+                      measured_at ASC NULLS FIRST, first_seen_at ASC \
              LIMIT $1"
         ))
         .bind(limit as i64)

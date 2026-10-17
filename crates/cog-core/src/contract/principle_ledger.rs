@@ -510,6 +510,12 @@ pub trait PrincipleLedgerStore: Send + Sync {
     ///
     /// `None` in `measured_at` sorts first: nothing has looked at those, which
     /// is less known than a stale look, not more current.
+    ///
+    /// Rows of the `judgement` tier sort after all of those, whatever their
+    /// `measured_at`. Their verdict is that a person holds them, which is
+    /// settled and also unwritable: no measurement is applied, so `measured_at`
+    /// stays `None` and they would otherwise return to the head of every pass
+    /// and take the whole bounded set with them.
     async fn outstanding(&self, limit: usize) -> SFResult<Vec<PrincipleRow>>;
 
     /// The rows a gate has refused work because of, most recently refused first.

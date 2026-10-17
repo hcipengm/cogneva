@@ -138,6 +138,17 @@ jobs:
         run: cargo test -p cog-storage --test principle_ledger_intake -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The set a measuring pass looks at is a bounded query, and what the bound
+      # cuts is decided by an ordering the server evaluates. A row whose verdict
+      # is "a person holds this" writes no measurement, so it keeps a null
+      # `measured_at` and returns to the head of every pass; once more of them
+      # exist than the bound takes, the pass judges those same rows forever and
+      # reports a full set rather than a stopped one. No DB-free test can see
+      # which rows a `NULLS FIRST` ordering hands back.
+      - name: Live-DB principle-ledger outstanding set
+        run: cargo test -p cog-storage --test principle_ledger_outstanding -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The sample-log sweep is expressed almost entirely as one DELETE, so its
       # correctness cannot be checked without a server; the DB-free tests beside
       # it only cover the sweep period. Leaving these out of the gate is how a
