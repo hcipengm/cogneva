@@ -198,7 +198,16 @@ impl PostgresObservabilityGateway {
         Ok(())
     }
 
-    /// Record or update metrics for a task.
+    /// Add one run's metrics to its task's row.
+    ///
+    /// A task id is not a run id: the pipeline hands one task id to its
+    /// planner, generator and evaluator, and each of them is a separate run
+    /// that reports its own usage once at its exit. Overwriting the row would
+    /// leave the task's last run standing in for the task, and the book would
+    /// then answer "what did the role that finished last spend" while its
+    /// readers ask "what did this task cost" — the two differ by exactly the
+    /// roles that came before. So the counters add and the timestamp is the
+    /// last write, which is the only field where "latest" is the meaning.
     pub async fn record_metrics(&self, metrics: &TaskMetrics) -> SFResult<()> {
         sqlx::query(
             r#"
@@ -206,12 +215,12 @@ impl PostgresObservabilityGateway {
                 (task_id, total_tokens, prompt_tokens, completion_tokens, tool_calls, iterations, duration_ms, timestamp)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             ON CONFLICT (task_id) DO UPDATE SET
-                total_tokens      = EXCLUDED.total_tokens,
-                prompt_tokens     = EXCLUDED.prompt_tokens,
-                completion_tokens = EXCLUDED.completion_tokens,
-                tool_calls        = EXCLUDED.tool_calls,
-                iterations        = EXCLUDED.iterations,
-                duration_ms       = EXCLUDED.duration_ms,
+                total_tokens      = cog_observability_metrics.total_tokens      + EXCLUDED.total_tokens,
+                prompt_tokens     = cog_observability_metrics.prompt_tokens     + EXCLUDED.prompt_tokens,
+                completion_tokens = cog_observability_metrics.completion_tokens + EXCLUDED.completion_tokens,
+                tool_calls        = cog_observability_metrics.tool_calls        + EXCLUDED.tool_calls,
+                iterations        = cog_observability_metrics.iterations        + EXCLUDED.iterations,
+                duration_ms       = cog_observability_metrics.duration_ms       + EXCLUDED.duration_ms,
                 timestamp         = EXCLUDED.timestamp
             "#,
         )

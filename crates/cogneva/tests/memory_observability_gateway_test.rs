@@ -96,6 +96,37 @@ async fn test_gateway_metrics_and_logs() {
     assert_eq!(logs[0].message, "started");
 }
 
+/// One task id can span several runs — the pipeline hands the same id to its
+/// planner, generator and evaluator — and each run reports only its own usage.
+/// The per-task row is read as the task's cost, so a second write must add;
+/// a store that replaced would keep the last role and drop the ones before it,
+/// and every row would still look plausible.
+#[tokio::test]
+async fn test_gateway_metrics_accumulate_runs_of_one_task() {
+    let gw = mk_gateway();
+    let base = |tokens: u64, calls: u32, iterations: u32, ms: u64| TaskMetrics {
+        task_id: "t-shared".into(),
+        total_tokens: tokens,
+        prompt_tokens: tokens * 2 / 5,
+        completion_tokens: tokens * 3 / 5,
+        tool_calls: calls,
+        iterations,
+        duration_ms: ms,
+        timestamp: Utc::now(),
+    };
+
+    gw.record_metrics(base(100, 2, 3, 500));
+    gw.record_metrics(base(200, 5, 4, 700));
+
+    let metrics = gw.get_task_metrics("t-shared").await.unwrap();
+    assert_eq!(metrics.total_tokens, 300);
+    assert_eq!(metrics.prompt_tokens, 120);
+    assert_eq!(metrics.completion_tokens, 180);
+    assert_eq!(metrics.tool_calls, 7);
+    assert_eq!(metrics.iterations, 7);
+    assert_eq!(metrics.duration_ms, 1200);
+}
+
 #[tokio::test]
 async fn test_gateway_snapshot_and_raw_index() {
     let gw = mk_gateway();

@@ -184,6 +184,16 @@ jobs:
         run: cargo test -p cog-storage --test metrics_counter_accumulation -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # One task id is not one run: the pipeline hands the same id to its
+      # planner, generator and evaluator, and each reports only its own usage.
+      # The per-task row is read as the task's cost, so a later run has to add
+      # rather than replace it — and which one the conflict clause does is a
+      # fact about the server. Replacing keeps every row plausible and drops
+      # every role but the last, which no DB-free test can see.
+      - name: Live-DB task census accumulates runs
+        run: cargo test -p cog-storage --test observability_task_census -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # A task's event offsets are the backend's to assign, and Postgres derives
       # them from a count two writers can read before either has inserted --
       # while a reclaimed lease presumes the previous holder stopped rather than

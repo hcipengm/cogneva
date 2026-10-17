@@ -1313,10 +1313,28 @@ impl MemoryObservabilityGateway {
         logs.entry(task_id.into()).or_default().push(entry);
     }
 
-    /// Record metrics for a task.
+    /// Add one run's metrics to its task's row.
+    ///
+    /// Same rule as the persistent writer: one task id can span several runs,
+    /// so the counters add rather than replace, and only the timestamp takes
+    /// the latest value. A store that replaced here would make the memory
+    /// backend disagree with production about what a task cost.
     pub fn record_metrics(&self, metrics: TaskMetrics) {
         let mut m = self.metrics.write().unwrap();
-        m.insert(metrics.task_id.clone(), metrics);
+        match m.get_mut(&metrics.task_id) {
+            Some(row) => {
+                row.total_tokens += metrics.total_tokens;
+                row.prompt_tokens += metrics.prompt_tokens;
+                row.completion_tokens += metrics.completion_tokens;
+                row.tool_calls += metrics.tool_calls;
+                row.iterations += metrics.iterations;
+                row.duration_ms += metrics.duration_ms;
+                row.timestamp = metrics.timestamp;
+            }
+            None => {
+                m.insert(metrics.task_id.clone(), metrics);
+            }
+        }
     }
 
     /// Register a raw-log index entry.
