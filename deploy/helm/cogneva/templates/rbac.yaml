@@ -23,7 +23,7 @@ metadata:
 # 规则里退出——带外那一半随向导/贡献通道的写点搬走而退，内部那一半要等
 # contribution-config 的写点一起搬走。
 #
-# 这条断言不是散文：持有面登记表（crates/cogneva/debt/credential-holders.tsv）
+# 这条断言不是散文：持有面登记表（deploy/credential-holders.tsv）
 # 把这两条授权记成迁移窗，凭证持有面门禁判它与清单逐条对齐——收窄那天它会红，
 # 红在登记表没跟着改，而不是红在一个没人读的注释里。
 apiVersion: rbac.authorization.k8s.io/v1

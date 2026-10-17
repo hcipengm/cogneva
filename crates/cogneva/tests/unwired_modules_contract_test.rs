@@ -19,6 +19,14 @@
 //! build and not about the tree. Judging by "does this build compile it" would report a
 //! cfg-gated module as an orphan on every configuration that leaves it out.
 //!
+//! The gate has no roster. It used to carry one — a table of files known to be unreached,
+//! each with where it was going or that it was going away — so that a newly orphaned file
+//! could be recorded as debt instead of failing the build. That table stayed empty, which
+//! is the reading it was built to reach, and the rule it was protecting is the sentence
+//! above: a file nothing declares reaches no build target. A roster that is allowed to
+//! grow is also a place for an orphan to hide, so the rule is asserted whole and the
+//! roster is gone.
+//!
 //! Which files are in scope. The universe is what the repository *carries*:
 //! `git ls-files` decides, not a walk of the working tree. A file that is not in the
 //! repository has not landed, so nothing is owed for it — and one shape relies on
@@ -41,88 +49,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
 
-/// The one carrier of the debt: a `.rs` outside the module tree, where it is going, and
-/// — when it is being wired in rather than deleted — which parent module file the
-/// declaration will be written into.
-const UNWIRED_FILE: &str = "debt/unwired-modules.tsv";
-
-/// The closed set of dispositions a row may carry.
-///
-/// A row's disposition is a member of this list rather than prose: a sentence makes the
-/// same claim whether or not it is true, and registering a file is worth doing exactly
-/// because the claim can be checked against the list.
-const DISPOSITIONS: &[&str] = &[
-    // The file is to be wired into the module tree. Its `destination` names the parent
-    // module file whose `mod` declaration would reach it.
-    "pending-wiring",
-    // The file is to be deleted: nothing reads it, or it is a second copy of a
-    // mechanism that already lives elsewhere. An empty destination is its end state.
-    "pending-deletion",
-];
-
-/// One row of the debt: the file, its disposition, and — only for a file being wired in
-/// — the parent module file that would reach it.
-#[derive(Debug, Clone)]
-struct Row {
-    file: String,
-    disposition: String,
-    destination: Option<String>,
-}
-
-/// The rows, parsed once.
-///
-/// The rows live in [`UNWIRED_FILE`] and not in this file, so there is one carrier: a
-/// list here would be a second copy a reader of the table could not see and free to
-/// disagree with it. [`the_debt_rows_live_in_the_file_and_not_in_this_test`] holds that
-/// down by refusing to let a row's path be spelled here.
-fn rows() -> &'static [Row] {
-    static ROWS: OnceLock<Vec<Row>> = OnceLock::new();
-    ROWS.get_or_init(|| {
-        read_debt(UNWIRED_FILE)
-            .lines()
-            .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
-            .filter_map(|line| {
-                let mut field = line.split('\t');
-                let file = field.next()?.trim();
-                // The column-name line is the table's header, not a row.
-                if file == "file" {
-                    return None;
-                }
-                let disposition = field.next().unwrap_or("").trim().to_string();
-                let destination = field
-                    .next()
-                    .map(str::trim)
-                    .filter(|cell| !cell.is_empty())
-                    .map(str::to_string);
-                Some(Row {
-                    file: file.to_string(),
-                    disposition,
-                    destination,
-                })
-            })
-            .collect()
-    })
-}
-
-/// Read a repo file named relative to this crate's manifest, failing loudly: a debt
-/// table that reads nothing would pass every assertion by having no rows.
-fn read_debt(relative: &str) -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("cannot read the debt file {}: {error}", path.display()))
-}
-
-/// This test's own source, read back to prove the rows are not written here.
-fn read_own_source() -> String {
-    let name = Path::new(file!())
-        .file_name()
-        .expect("this test file has a name");
-    read_debt(&format!("tests/{}", name.to_string_lossy()))
-}
-
-/// The repository root, derived from this crate's own manifest so the test does not
+/// The workspace root, derived from this crate's own manifest so the test does not
 /// depend on the working directory it is run from.
 fn workspace_root() -> PathBuf {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -486,7 +414,7 @@ fn reachable(roots: &BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
     seen
 }
 
-/// A path as the debt table spells it: relative to the repository root, with `/`.
+/// A path as the report spells it: relative to the repository root, with `/`.
 fn repo_relative(path: &Path) -> String {
     let root = workspace_root();
     path.strip_prefix(&root)
@@ -495,18 +423,12 @@ fn repo_relative(path: &Path) -> String {
         .replace('\\', "/")
 }
 
-/// The debt table's rows as a set of the files they name.
-fn registered_files() -> BTreeSet<String> {
-    rows().iter().map(|row| row.file.clone()).collect()
-}
-
 /// Every `.rs` the repository carries under a workspace member's `src/` reaches a build
-/// target by a `mod` declaration, or a row in [`UNWIRED_FILE`] says where it is going.
+/// target by a `mod` declaration.
 ///
-/// Asserted from both sides, which is what makes the table a debt list rather than an
-/// exemption list: a file that reaches nothing and is unnamed fails, and a named file
-/// that reaches something — or is gone — fails too, so the table can only shrink toward
-/// empty. `feedback_prefer_not_to_touch_core`'s sibling list reads the same way.
+/// There is no exemption list: the assertion is the rule itself, in one direction. A
+/// file that reaches nothing fails the build with its own name in the message, which is
+/// the moment to either declare it where it belongs or delete it.
 #[test]
 fn every_rust_source_a_crate_carries_reaches_a_build_target() {
     let members = member_roots();
@@ -552,141 +474,15 @@ fn every_rust_source_a_crate_carries_reaches_a_build_target() {
     );
 
     let reached = reachable(&roots);
-    let unwired: BTreeSet<String> = universe
+    let unwired: Vec<String> = universe
         .iter()
         .filter(|source| !reached.contains(*source))
         .map(|source| repo_relative(source))
         .collect();
-
-    let registered = registered_files();
-    let unregistered: Vec<&String> = unwired.difference(&registered).collect();
     assert!(
-        unregistered.is_empty(),
-        "these source files reach no build target and no debt row names them: {unregistered:?} — a \
-         `.rs` under a crate's `src/` that no `mod` declaration reaches is compiled by nothing, so \
-         it reads as landed while the compiler has never seen it. Either declare it where it \
-         belongs, delete it, or register it in {UNWIRED_FILE} with a disposition from \
-         {DISPOSITIONS:?}"
+        unwired.is_empty(),
+        "these source files reach no build target: {unwired:?} — a `.rs` under a crate's `src/` \
+         that no `mod` declaration reaches is compiled by nothing, so it reads as landed while the \
+         compiler has never seen it. Either declare it where it belongs or delete it"
     );
-
-    let stale: Vec<String> = registered
-        .iter()
-        .filter(|file| !unwired.contains(*file))
-        .map(|file| {
-            let path = workspace_root().join(file);
-            if reached.contains(&path) {
-                format!("`{file}` — a declaration reaches it now")
-            } else if !universe.contains(&path) {
-                format!("`{file}` — the tree carries no such file")
-            } else {
-                format!("`{file}` — it is carried but not under any member's src/")
-            }
-        })
-        .collect();
-    assert!(
-        stale.is_empty(),
-        "these debt rows describe a tree that is no longer here: {stale:?} — the table is a \
-         description, and it only shrinks: a file that got wired in or deleted takes its row with \
-         it"
-    );
-}
-
-/// Every row's disposition is one of the closed set, and the destination column says the
-/// same thing the disposition does: a file being wired in names the parent module file
-/// that would reach it, and a file being deleted names nothing.
-///
-/// The destination is asserted in both directions for the same reason the file column
-/// is: a `pending-wiring` row with no destination is a plan with no first step, and a
-/// `pending-deletion` row with one is a row disagreeing with itself about whether the
-/// file stays.
-#[test]
-fn every_debt_row_names_a_disposition_and_a_matching_destination() {
-    let members = member_roots();
-    let mut carried: BTreeSet<PathBuf> = BTreeSet::new();
-    for source in carried_sources() {
-        if members
-            .keys()
-            .any(|dir| source.starts_with(dir.join("src")))
-        {
-            carried.insert(source);
-        }
-    }
-
-    let mut seen: BTreeSet<&str> = BTreeSet::new();
-    for row in rows() {
-        assert!(
-            DISPOSITIONS.contains(&row.disposition.as_str()),
-            "{UNWIRED_FILE} gives `{}` the disposition `{}`, which is not one of {DISPOSITIONS:?} — \
-             a disposition outside the set is a free-text reason wearing a label, and the label is \
-             the half this gate can check",
-            row.file,
-            row.disposition
-        );
-        assert!(
-            seen.insert(row.file.as_str()),
-            "{UNWIRED_FILE} registers `{}` twice",
-            row.file
-        );
-
-        match row.disposition.as_str() {
-            "pending-wiring" => {
-                let destination = row.destination.as_deref().unwrap_or_else(|| {
-                    panic!(
-                        "{UNWIRED_FILE} registers `{}` as pending-wiring with no destination — the \
-                         destination is the parent module file whose `mod` declaration would reach \
-                         the file, and a wiring with nowhere to be declared is not a plan",
-                        row.file
-                    )
-                });
-                let path = workspace_root().join(destination);
-                assert!(
-                    carried.contains(&path),
-                    "{UNWIRED_FILE} wires `{}` into `{destination}`, which is not a source the tree \
-                     carries — the destination has to be the existing parent module file the \
-                     declaration would be written in",
-                    row.file
-                );
-            }
-            "pending-deletion" => {
-                assert!(
-                    row.destination.is_none(),
-                    "{UNWIRED_FILE} registers `{}` as pending-deletion and also names a \
-                     destination — a file that is going away is not being wired anywhere",
-                    row.file
-                );
-            }
-            other => unreachable!("disposition `{other}` passed the closed-set check"),
-        }
-    }
-
-    // The empty table is a legal end state, so there is no "the table must not be empty"
-    // guard here: the point of the table is to empty itself. What must hold is the other
-    // relation — a row's file is one the tree carries — and the walk test above asserts
-    // it from the tree's side.
-    let absent: Vec<&str> = rows()
-        .iter()
-        .filter(|row| !carried.contains(&workspace_root().join(&row.file)))
-        .map(|row| row.file.as_str())
-        .collect();
-    assert!(
-        absent.is_empty(),
-        "{UNWIRED_FILE} names files the tree does not carry: {absent:?} — a row describes a file \
-         that is there, so one whose file is gone is a row to delete"
-    );
-}
-
-/// The debt rows have one carrier. A row's path spelled into this test would be a second
-/// copy the table's other readers cannot see and free to drift from the bytes they read.
-#[test]
-fn the_debt_rows_live_in_the_file_and_not_in_this_test() {
-    let this_file = file!();
-    let source = read_own_source();
-    for row in rows() {
-        assert!(
-            !source.contains(&format!("\"{}\"", row.file)),
-            "`{}` is written into {this_file} instead of {UNWIRED_FILE} — the table is the one \
-             carrier, so a literal here is a copy free to disagree with it",
-            row.file
-        );
-    }
 }

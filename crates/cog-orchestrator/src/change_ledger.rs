@@ -117,10 +117,7 @@ use cog_core::{
 use cog_core::contract::llm::UpstreamFailure;
 use cog_core::contract::outcome::{declares, TERMINAL_ENV_FAILURE_PREFIX};
 
-use crate::change_measure::{
-    CheckTree, Snapshot, UnsettledReason, DEPENDENCY_EDGE_KIND, DEV_DEPENDENCY_EDGE_KIND,
-    GONE_KIND, GREP_KIND, MODULE_RELOCATION_KIND,
-};
+use crate::change_measure::{CheckTree, Snapshot, UnsettledReason, GREP_KIND};
 use crate::principle_measure::HOST_REGISTRY_READ_NO_GATE;
 
 /// This loop's name in the process liveness registry, and the value of
@@ -318,66 +315,16 @@ const DISPATCH_TASK_PREFIX: &str = "change-ledger-";
 /// and the kind is what that path is looked up by.
 const DISPATCH_TASK_KIND: &str = "change_ledger";
 
-/// The dependency registry, relative to the repository root.
+/// The name a pass writes into `sources_unread` when the principle ledger could
+/// not be read.
 ///
-/// One of the two reading sources this loop reads out of the tree. The file is
-/// the same one the dependency contract test reads its own table from, so a row
-/// registered there is a row that reaches the account, and the two readers cannot
-/// drift apart: a running binary cannot read a test's constant, so the registry
-/// lives in the tree and both take it from there.
-const DEBT_EDGE_FILE: &str = "crates/cogneva/debt/dependency-edges.tsv";
-
-/// The module registry, relative to the repository root.
-///
-/// The other reading source, the same file the core boundary contract test reads:
-/// one row per module of the core's source root, with the reason it is a contract
-/// and -- when a move is owed -- where it is going.
-const DEBT_MODULE_FILE: &str = "crates/cogneva/debt/core-modules.tsv";
-
-/// The unwired-module registry, relative to the repository root.
-///
-/// The third reading source, and the same file the module-membership contract
-/// test reads its own table from. That test is a gate and a person reads its red:
-/// "a `.rs` this repository carries and no `mod` declaration reaches" is a
-/// finding whose whole cost is that nobody notices it -- the file is legal, it
-/// compiles nowhere, and it reads as landed code. A registry row the account can
-/// hold and hand over is what turns that red into work, which is why this file
-/// has a second reader at all.
-const DEBT_UNWIRED_FILE: &str = "crates/cogneva/debt/unwired-modules.tsv";
-
-/// The names a pass writes into `sources_unread` when an intake could not be
-/// read.
-///
-/// One word per intake, stable across releases: a reader counts passes carrying
-/// the same word, so renaming one resets the streak it was measuring and reads
-/// as "the outage ended". The registries are one intake because they share a
-/// source and a reader; the principle ledger is its own because it is the one
-/// that survives the tree's registries and the one whose failure has no other
-/// witness.
-const INTAKE_REGISTRIES: &str = "registries";
+/// Stable across releases: a reader counts passes carrying the same word, so
+/// renaming it resets the streak it was measuring and reads as "the outage
+/// ended". The tree's own registries were a second intake under a second name;
+/// they left with the registries themselves -- the debt they carried is in the
+/// platform's ledger now, declared under the same identities, so the tree no
+/// longer has an intake whose failure could go unwitnessed.
 const INTAKE_PRINCIPLES: &str = "principles";
-
-/// The disposition a row of the unwired registry carries when the file is to be
-/// reached by a declaration of its parent module.
-const WIRING_DISPOSITION: &str = "pending-wiring";
-
-/// The disposition a row of the unwired registry carries when the file is to be
-/// deleted.
-const DELETION_DISPOSITION: &str = "pending-deletion";
-
-/// The `reason` a module row carries when it is owed a move.
-///
-/// Read here so that a registry which grew a destination under any other reason
-/// names nothing to work on, rather than putting a move in the account that
-/// nobody registered.
-const RELOCATION_REASON: &str = "pending-relocation";
-
-/// The core's own module list, relative to the repository root.
-///
-/// Where a module's move is measured: a module owed a move out of the core is
-/// gone when this file stops declaring it, which is a fact about the tree and not
-/// about the registry row.
-const CORE_MODULE_LIST: &str = "crates/cog-core/src/lib.rs";
 
 /// Where a principle's gate is looked for, as a path of the repository.
 ///
@@ -943,19 +890,10 @@ pub fn spawn_change_ledger_loop(
                     // process, and the account it left empty keeps looking like a
                     // pass that found nothing to hold.
                     let mut sources_unread: Vec<&'static str> = Vec::new();
-                    // The tree's own registries are the second intake, and they
-                    // go in after the fold and before the measurement for the
-                    // reason [`registry_pass`] gives: a row read this pass is
-                    // judged by this pass.
-                    if let Some(unread) =
-                        registry_pass(&tree, first_seen_rev.as_deref(), &*store).await
-                    {
-                        sources_unread.push(unread);
-                    }
-                    // The third intake, from the platform's own principle ledger,
-                    // in beside the registries and for the same reason: a row
-                    // read this pass is judged by this pass. Skipped where no
-                    // ledger was published, which the start-up line says.
+                    // The intake, from the platform's own principle ledger,
+                    // after the fold and before the measurement: a row read this
+                    // pass is judged by this pass. Skipped where no ledger was
+                    // published, which the start-up line says.
                     if let Some(ref principles) = principles {
                         // Both faces of that account in one read, because they are
                         // two things known about one subject: the rules nothing
@@ -1112,111 +1050,6 @@ async fn retire_pass(store: &dyn ChangeLedgerStore) {
     }
 }
 
-/// Read the tree's own debt registries into the account.
-///
-/// The second intake, beside the queued declarations, and run after the fold so
-/// that a row named by both a document and a registry is one row either way: both
-/// doors lead to the same reading path, which is an idempotent upsert keyed by
-/// the identity.
-///
-/// Run before the measurement rather than after it, so a row read for the first
-/// time in a pass is judged in that same pass: the registry is read at the
-/// revision the pass measures, and a row read after the measurement would wait a
-/// whole period for its first look. The hand-over that follows the measurement
-/// reads the account, so it would not see such a row either.
-///
-/// Nothing here is raised: a pass is a maintenance tick and the next tick is the
-/// retry, which is the rule the fold and the read follow too. A registry that
-/// could not be read is not recorded as an empty one -- the account keeps the
-/// rows it already holds and the warning says this pass contributed none, so "no
-/// debt" and "no registry read" stay apart.
-async fn registry_pass(
-    tree: &CheckTree,
-    first_seen_rev: Option<&str>,
-    store: &dyn ChangeLedgerStore,
-) -> Option<&'static str> {
-    let (readings, unaimed) = match registry_readings(tree).await {
-        Ok(read) => read,
-        Err(why) => {
-            warn!(
-                why = %why,
-                "change ledger: the tree's own debt registries could not be read, so this pass \
-                 contributed no readings from them"
-            );
-            return Some(INTAKE_REGISTRIES);
-        }
-    };
-    // Said before the write and said whether or not it lands: what a registry
-    // holds and this intake cannot aim is a property of the registry, and a
-    // pass that read it has to report it even on a tick whose write the account
-    // refused. Not a warning about the account, so it does not share the
-    // warning below.
-    if !unaimed.is_empty() {
-        warn!(
-            unaimed = %unaimed.summary(),
-            "change ledger: the tree's own debt registries hold rows this intake cannot aim"
-        );
-    }
-    match store.record_readings(&readings, first_seen_rev).await {
-        Ok(_) => info!(
-            readings = readings.len(),
-            "change ledger: read the tree's own debt registries into the account"
-        ),
-        // The account keeps what it has: this pass added nothing, and the next is
-        // the retry. Said with the count it was carrying so a reader can tell a
-        // rejection from a registry that was empty.
-        Err(e) => warn!(
-            error = %e,
-            readings = readings.len(),
-            "change ledger: the tree's own debt registries could not be written into the account"
-        ),
-    }
-    // A write the account refused is not an unread source: the registries were
-    // read and their rows are in hand, so naming them here would report a tree
-    // nobody could open on a tick where the tree was open.
-    None
-}
-
-/// What the tree's own debt registries ask for, as readings.
-///
-/// The registries are read at their own snapshot rather than one carried in from
-/// the measuring pass. A reading carries no state and moves nothing: it says what
-/// a row is about and is measured a moment later by the same pass, so a revision
-/// that moved in between would only put a row in the account a few seconds early
-/// for a tree that has since changed -- where sharing the measurement's snapshot
-/// would mean threading one pass's revision through an intake that a caller other
-/// than the loop could not supply.
-async fn registry_readings(tree: &CheckTree) -> Result<(Vec<ChangeReading>, Unaimed), String> {
-    let snapshot = tree
-        .snapshot()
-        .await
-        .map_err(|why| format!("the platform's own tree could not be resolved: {why}"))?;
-    let rev = snapshot.rev();
-    let edges = tree
-        .matching_lines(rev, DEBT_EDGE_FILE, ".")
-        .await
-        .map_err(|why| {
-            format!("the dependency registry {DEBT_EDGE_FILE} could not be read at {rev}: {why}")
-        })?;
-    let modules = tree
-        .matching_lines(rev, DEBT_MODULE_FILE, ".")
-        .await
-        .map_err(|why| {
-            format!("the module registry {DEBT_MODULE_FILE} could not be read at {rev}: {why}")
-        })?;
-    let unwired = tree
-        .matching_lines(rev, DEBT_UNWIRED_FILE, ".")
-        .await
-        .map_err(|why| {
-            format!("the unwired registry {DEBT_UNWIRED_FILE} could not be read at {rev}: {why}")
-        })?;
-    let mut readings = edge_readings(&edges);
-    readings.extend(module_readings(&modules));
-    let (unwired_readings, unaimed) = unwired_readings(&unwired);
-    readings.extend(unwired_readings);
-    Ok((readings, unaimed))
-}
-
 /// The rows of a registry this intake read and could not turn into a check, by
 /// cause.
 ///
@@ -1254,264 +1087,6 @@ impl Unaimed {
     }
 }
 
-/// Where a crate's manifest is, relative to the repository root.
-///
-/// A dependency is declared in its consumer's manifest, so that file is the scope
-/// the debt is measured under -- and the literal searched for in it is the
-/// dependency's own assignment.
-fn manifest_of(consumer: &str) -> String {
-    format!("crates/{consumer}/Cargo.toml")
-}
-
-/// What an edge row asks for, in the words the goal path is handed.
-///
-/// The row's own two ends and the contract it should go through instead. The
-/// point of handing a registered debt over, rather than an ungated principle, is
-/// that it can say what to build and not only where to look.
-fn edge_goal(consumer: &str, dep: &str, contract: &str, dev: bool) -> String {
-    if contract.is_empty() {
-        return format!("Remove the {consumer} -> {dep} dependency by routing it through the core's contract layer.");
-    }
-    let when = if dev { "in its tests " } else { "" };
-    format!("Make {consumer} reach {dep} through the core contract {contract} {when}instead of depending on it directly.")
-}
-
-/// What a module row asks for, in the words the goal path is handed.
-///
-/// The module and the crate it is going to, and -- for a module that keeps state
-/// as well as defining a contract -- the shape of the move, so the generator is
-/// told the module leaves in halves rather than whole.
-fn module_goal(module: &str, destination: &str, split: bool) -> String {
-    let shape = if split {
-        " The module is a contract and a mechanism in one file: the half that keeps state moves, and the contract half stays in the core's contract layer."
-    } else {
-        ""
-    };
-    format!("Move the core module `{module}` out of cog-core's source root into the `{destination}` crate.{shape}")
-}
-
-/// The edge rows the dependency registry carries, as readings.
-///
-/// One row per line, tab-separated `kind consumer dep contract`, exactly as the
-/// contract test reads it: a `#`-led line and the `kind consumer dep contract`
-/// header carry no work, and a kind outside the two edge kinds is not a row this
-/// intake knows how to aim.
-///
-/// The literal is the dependency's own assignment and not its bare name. A
-/// manifest documents itself where the dependency is declared -- a comment naming
-/// the crate a few lines above it is ordinary writing -- and a bare name matches
-/// that comment too, which would keep a dependency that is already gone reading
-/// as owed for good. The trailing `=` also keeps a shorter name from matching a
-/// longer one that merely begins with it.
-fn edge_readings(lines: &[(String, String)]) -> Vec<ChangeReading> {
-    let mut readings = Vec::new();
-    for (_path, text) in lines {
-        let text = text.trim();
-        if text.is_empty() || text.starts_with('#') {
-            continue;
-        }
-        let mut field = text.split('\t');
-        let (kind, dev) = match field.next() {
-            Some("allowed") => (DEPENDENCY_EDGE_KIND, false),
-            Some("allowed_dev") => (DEV_DEPENDENCY_EDGE_KIND, true),
-            _ => continue,
-        };
-        let (Some(consumer), Some(dep)) = (field.next(), field.next()) else {
-            continue;
-        };
-        let contract = field.next().unwrap_or("").trim();
-        readings.push(ChangeReading {
-            identity: ChangeIdentity::new(kind, manifest_of(consumer), format!("{dep} =")),
-            title: Some(edge_goal(consumer, dep, contract, dev)),
-            assertion: None,
-            source: ChangeSource {
-                doc: DEBT_EDGE_FILE.to_string(),
-                verdict: None,
-                // The debt file names the edge, not how urgent it is: nothing
-                // in it states a band, so the reading carries the one that says
-                // so rather than a band this path invented.
-                priority: ChangePriority::Unstated,
-            },
-        });
-    }
-    readings
-}
-
-/// The module rows the module registry carries, as readings.
-///
-/// One row per line, tab-separated `module reason destination`, exactly as the
-/// core boundary contract test reads it. Only a module the registry marks as
-/// awaiting relocation *and* gives a destination is a row this intake can aim: a
-/// module owed a move with no destination has no endpoint to name, so it stays
-/// out of the account rather than entering it as work nobody registered.
-///
-/// The destination is `crate shape`, and the shape -- `direct` or `split` --
-/// rides into the goal so a split module is described as leaving in halves.
-fn module_readings(lines: &[(String, String)]) -> Vec<ChangeReading> {
-    let mut readings = Vec::new();
-    for (_path, text) in lines {
-        let text = text.trim();
-        if text.is_empty() || text.starts_with('#') {
-            continue;
-        }
-        let mut field = text.split('\t');
-        let (Some(module), Some(reason)) = (field.next(), field.next()) else {
-            continue;
-        };
-        if module == "module" || reason != RELOCATION_REASON {
-            continue;
-        }
-        let Some(destination) = field.next().map(str::trim) else {
-            continue;
-        };
-        let mut parts = destination.split_whitespace();
-        let (Some(crate_name), Some(shape)) = (parts.next(), parts.next()) else {
-            continue;
-        };
-        readings.push(ChangeReading {
-            identity: ChangeIdentity::new(
-                MODULE_RELOCATION_KIND,
-                CORE_MODULE_LIST,
-                format!("mod {module};"),
-            ),
-            title: Some(module_goal(module, crate_name, shape == "split")),
-            assertion: None,
-            source: ChangeSource {
-                doc: DEBT_MODULE_FILE.to_string(),
-                verdict: None,
-                priority: ChangePriority::Unstated,
-            },
-        });
-    }
-    readings
-}
-
-/// The unwired rows the module-membership registry carries, as readings, and the
-/// rows this intake could not aim.
-///
-/// One row per line, tab-separated `file disposition destination`, exactly as the
-/// module-membership contract test reads it. The two dispositions are two
-/// different asks, and each is measured by the fact that ends it:
-///
-/// - `pending-wiring`: the file has to be reached, so the check is the parent
-///   module file holding the declaration the test resolves. Judged by `grep`,
-///   whose demand is that the literal be there -- and the literal is the
-///   declaration itself rather than the file's bare name, because a name is
-///   ordinary writing inside a comment and a row a comment could settle is a row
-///   that reads as done while the compiler still cannot see the file.
-/// - `pending-deletion`: the file has to be gone, and the path is the whole of
-///   the ask. Judged by `gone` with an empty literal, whose documented reading is
-///   the inverse of `exists`: this file must not be here.
-///
-/// A row under any other disposition names an ask nobody registered and a fact
-/// nothing would settle, so it stays out of the account rather than entering it as
-/// work no gate could close. It is counted, and so is a wiring row this intake
-/// cannot resolve, so that "the registry is empty" and "the registry holds rows
-/// nothing here can aim" stay two readings.
-fn unwired_readings(lines: &[(String, String)]) -> (Vec<ChangeReading>, Unaimed) {
-    let mut readings = Vec::new();
-    let mut unaimed = Unaimed::default();
-    for (_path, text) in lines {
-        let text = text.trim();
-        if text.is_empty() || text.starts_with('#') {
-            continue;
-        }
-        let mut field = text.split('\t');
-        let file = field.next().unwrap_or("").trim();
-        // The column-name line is the table's header, not a row, and a line
-        // naming no path names nothing to check -- which is a different thing
-        // from a row this intake read and refused.
-        if file.is_empty() || file == "file" {
-            continue;
-        }
-        let disposition = field.next().unwrap_or("").trim();
-        let destination = field.next().unwrap_or("").trim();
-        match disposition {
-            WIRING_DISPOSITION => match module_declaration(file, destination) {
-                Ok((scope, literal)) => readings.push(unwired_reading(
-                    ChangeIdentity::new(GREP_KIND, scope, literal),
-                    unwired_goal(file, WIRING_DISPOSITION, destination),
-                )),
-                Err(cause) => unaimed.note(cause),
-            },
-            DELETION_DISPOSITION => readings.push(unwired_reading(
-                ChangeIdentity::new(GONE_KIND, file.to_string(), String::new()),
-                unwired_goal(file, DELETION_DISPOSITION, ""),
-            )),
-            _ => unaimed.note("disposition-not-one-this-intake-knows"),
-        }
-    }
-    (readings, unaimed)
-}
-
-/// One unwired row as a reading: both dispositions carry a goal and no assertion,
-/// because the registry states where the file is going and not what it will look
-/// like when it gets there.
-fn unwired_reading(identity: ChangeIdentity, title: String) -> ChangeReading {
-    ChangeReading {
-        identity,
-        title: Some(title),
-        assertion: None,
-        source: ChangeSource {
-            doc: DEBT_UNWIRED_FILE.to_string(),
-            verdict: None,
-            // The registry names the file and where it is going, not how urgent
-            // it is: nothing in it states a band, so the reading carries the one
-            // that says so rather than a band this path invented.
-            priority: ChangePriority::Unstated,
-        },
-    }
-}
-
-/// The scope and literal that say a file has been wired in, or the cause this
-/// intake cannot say it for.
-///
-/// A `mod` declaration names a module and not a path, so the module's name is
-/// read off the path the registry holds -- beside its parent, a file is declared
-/// by its own stem. The one other shape the resolver accepts is a directory's own
-/// `mod.rs`, declared by the directory's name, and that is refused here rather
-/// than resolved: this intake would be spelling the contract test's resolver a
-/// second time, in a place nothing exercises it, and the day such a row appears a
-/// count is a better answer than a resolver that is quietly wrong.
-fn module_declaration(file: &str, destination: &str) -> Result<(String, String), &'static str> {
-    if destination.is_empty() {
-        return Err("wiring-row-without-a-destination");
-    }
-    let name = file.rsplit('/').next().unwrap_or(file);
-    let Some(stem) = name.strip_suffix(".rs") else {
-        return Err("row-names-no-rust-file");
-    };
-    if stem.is_empty() {
-        return Err("row-names-no-module");
-    }
-    if stem == "mod" {
-        return Err("directory-module-this-intake-does-not-resolve");
-    }
-    Ok((destination.to_string(), format!("mod {stem};")))
-}
-
-/// What an unwired row asks for, in the words the goal path is handed.
-///
-/// Both dispositions say what is wrong in the sources rather than only that the
-/// registry lists a file: a file no declaration reaches is compiled by nothing,
-/// and a file with no reader is weight that no measurement has counted. The
-/// destination is named only where there is one -- a deletion row's is empty by
-/// construction, and "the declaration goes in ``" would be a goal naming a place
-/// that is not a place.
-fn unwired_goal(file: &str, disposition: &str, destination: &str) -> String {
-    if disposition == DELETION_DISPOSITION {
-        return format!(
-            "Delete `{file}`: no `mod` declaration reaches it, so no build target compiles it \
-             and nothing that starts from a symbol reads a byte of it, while it sits in the \
-             sources reading as landed code."
-        );
-    }
-    format!(
-        "Wire `{file}` into the module tree: the declaration belongs in `{destination}`, and \
-         until some `mod` declaration reaches the file no build target carries it."
-    )
-}
-
 /// Read the principles the platform's own ledger still calls unpaid into the
 /// account.
 ///
@@ -1521,9 +1096,8 @@ fn unwired_goal(file: &str, disposition: &str, destination: &str) -> String {
 /// enters through the same call a declaration does, and only a measurement of the
 /// tree moves it.
 ///
-/// Run beside the registries and before the measurement, for the reason
-/// [`registry_pass`] gives: a row read for the first time in a pass is judged in
-/// that same pass.
+/// Run before the measurement: a row read for the first time in a pass is
+/// judged in that same pass.
 ///
 /// Nothing here is raised: a pass is a maintenance tick and the next tick is the
 /// retry. A ledger that could not be read is not recorded as an empty one -- the
@@ -3808,132 +3382,6 @@ mod tests {
         assert_eq!(dispatchable(&rows, &HashMap::new()).len(), 2);
     }
 
-    /// The identity a registered dependency becomes: the consumer's manifest as
-    /// the scope, and the dependency's own assignment as the literal.
-    ///
-    /// Both halves are the mapping and not a preference. The scope has to be the
-    /// file the dependency is declared in, or the check would search the crate
-    /// rather than its manifest; and the literal has to be the assignment, or a
-    /// comment that merely names the crate would keep a removed dependency owed
-    /// for good.
-    #[test]
-    fn a_registered_dependency_becomes_a_check_against_its_consumers_manifest() {
-        let rows = edge_readings(&[(
-            "crates/cogneva/debt/dependency-edges.tsv".to_string(),
-            "allowed\tcog-gateway\tcog-llm\tcontract::llm::LlmClient".to_string(),
-        )]);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].identity.kind, DEPENDENCY_EDGE_KIND);
-        assert_eq!(rows[0].identity.scope, "crates/cog-gateway/Cargo.toml");
-        assert_eq!(rows[0].identity.literal, "cog-llm =");
-        assert_eq!(rows[0].source.doc, DEBT_EDGE_FILE);
-        assert_eq!(rows[0].source.verdict, None);
-    }
-
-    /// A test-time edge is a kind of its own, so the census can tell the two
-    /// apart, and the goal says the reach is from the tests rather than from the
-    /// crate.
-    #[test]
-    fn a_test_time_edge_is_a_kind_of_its_own() {
-        let rows = edge_readings(&[(
-            "registry".to_string(),
-            "allowed_dev\tcog-gateway\tcog-llm\tcontract::llm::LlmClient".to_string(),
-        )]);
-        assert_eq!(rows[0].identity.kind, DEV_DEPENDENCY_EDGE_KIND);
-        assert_eq!(rows[0].identity.scope, "crates/cog-gateway/Cargo.toml");
-        assert_eq!(
-            rows[0].title.as_deref(),
-            Some(
-                "Make cog-gateway reach cog-llm through the core contract \
-                 contract::llm::LlmClient in its tests instead of depending on it directly."
-            )
-        );
-    }
-
-    /// Lines that carry no work -- the header and a `#` comment -- and a kind
-    /// this intake cannot aim are skipped, rather than entering the account as a
-    /// row nothing measures. A row naming no contract still enters: the edge is
-    /// owed either way, and what carries it instead is what the goal then cannot
-    /// say.
-    #[test]
-    fn only_registered_edge_rows_become_readings() {
-        let rows = edge_readings(&[
-            (
-                "registry".to_string(),
-                "kind\tconsumer\tdep\tcontract".to_string(),
-            ),
-            (
-                "registry".to_string(),
-                "# allowed\tcog-y\tcog-z\tcontract::z".to_string(),
-            ),
-            (
-                "registry".to_string(),
-                "something\tcog-y\tcog-z\t".to_string(),
-            ),
-            (
-                "registry".to_string(),
-                "allowed\tcog-short\tcog-y".to_string(),
-            ),
-            (
-                "registry".to_string(),
-                "allowed\tcog-x\tcog-y\t".to_string(),
-            ),
-        ]);
-        assert_eq!(rows.len(), 2, "{rows:?}");
-        assert_eq!(rows[0].identity.scope, "crates/cog-short/Cargo.toml");
-        // A row whose contract column is empty -- whether the field is absent or
-        // blank -- still names an edge that is owed.
-        assert_eq!(rows[1].identity.scope, "crates/cog-x/Cargo.toml");
-        assert_eq!(
-            rows[1].title.as_deref(),
-            Some(
-                "Remove the cog-x -> cog-y dependency by routing it through the core's \
-                 contract layer."
-            )
-        );
-    }
-
-    /// A module is measured against the core's own module list and named the way
-    /// that file declares it, so the row still owed is the one whose declaration
-    /// is still there.
-    #[test]
-    fn a_registered_relocation_becomes_a_check_against_the_cores_module_list() {
-        let rows = module_readings(&[
-            (
-                "registry".to_string(),
-                "module\treason\tdestination".to_string(),
-            ),
-            (
-                "registry".to_string(),
-                "admission\tpending-relocation\tcog-eval split".to_string(),
-            ),
-            (
-                "registry".to_string(),
-                "audit\tshared-definition\t".to_string(),
-            ),
-            (
-                "registry".to_string(),
-                "build_gate\tpending-relocation\tcog-orchestrator".to_string(),
-            ),
-        ]);
-        assert_eq!(rows.len(), 1, "{rows:?}");
-        assert_eq!(rows[0].identity.kind, MODULE_RELOCATION_KIND);
-        assert_eq!(rows[0].identity.scope, CORE_MODULE_LIST);
-        assert_eq!(rows[0].identity.literal, "mod admission;");
-        assert_eq!(rows[0].source.doc, DEBT_MODULE_FILE);
-        // The shape rides into the goal, so a module that leaves in halves is
-        // described that way rather than as a file that moves whole.
-        assert_eq!(
-            rows[0].title.as_deref(),
-            Some(
-                "Move the core module `admission` out of cog-core's source root into the \
-                 `cog-eval` crate. The module is a contract and a mechanism in one file: \
-                 the half that keeps state moves, and the contract half stays in the \
-                 core's contract layer."
-            )
-        );
-    }
-
     /// A principle ledger row, with only the columns this intake reads set.
     fn principle_row(
         slug: &str,
@@ -3978,63 +3426,6 @@ mod tests {
             last_refused_at: last_refused_at.map(|at| Utc.timestamp_opt(at, 0).unwrap()),
             ..principle_row(slug, check_kind, lead)
         }
-    }
-
-    /// An unwired row is measured by the fact that ends its disposition, and a row
-    /// under a disposition this intake does not know is counted rather than
-    /// entering as work nothing settles.
-    ///
-    /// The two dispositions are two different checks and not one with a flag:
-    /// wiring a file is the parent module file *holding* a declaration, which
-    /// `grep` asks for, and deleting one is a path *not* being there, which is
-    /// `gone` with an empty literal. A row measured by the wrong one of those
-    /// would read as done the moment the other thing happened.
-    #[test]
-    fn an_unwired_row_becomes_the_check_that_would_end_it() {
-        let (rows, unaimed) = unwired_readings(&[
-            (
-                "registry".to_string(),
-                "file\tdisposition\tdestination".to_string(),
-            ),
-            ("registry".to_string(), "# a comment".to_string()),
-            (
-                "registry".to_string(),
-                "crates/cog-x/src/orphan.rs\tpending-wiring\tcrates/cog-x/src/lib.rs".to_string(),
-            ),
-            (
-                "registry".to_string(),
-                "crates/cog-x/src/second-copy.rs\tpending-deletion\t".to_string(),
-            ),
-            (
-                "registry".to_string(),
-                "crates/cog-x/src/tbd.rs\tpending-rewrite\tcrates/cog-x/src/lib.rs".to_string(),
-            ),
-            (
-                "registry".to_string(),
-                "crates/cog-x/src/nodest.rs\tpending-wiring\t".to_string(),
-            ),
-        ]);
-        assert_eq!(rows.len(), 2, "{rows:?}");
-        assert_eq!(rows[0].identity.kind, GREP_KIND);
-        assert_eq!(rows[0].identity.scope, "crates/cog-x/src/lib.rs");
-        // The declaration and not the file's bare name: a name is ordinary
-        // writing inside a comment, and a row a comment could settle is a row
-        // that reads as done while the compiler still cannot see the file.
-        assert_eq!(rows[0].identity.literal, "mod orphan;");
-        assert_eq!(rows[0].source.doc, DEBT_UNWIRED_FILE);
-        assert_eq!(rows[0].assertion, None);
-        assert_eq!(rows[1].identity.kind, GONE_KIND);
-        assert_eq!(rows[1].identity.scope, "crates/cog-x/src/second-copy.rs");
-        // An empty literal is the whole of what "this path must not be here"
-        // says: the scope is the artifact and there is nothing to search for.
-        assert_eq!(rows[1].identity.literal, "");
-        assert_eq!(rows[1].source.doc, DEBT_UNWIRED_FILE);
-        // Two causes have to be two notes and not one total, or a mistyped
-        // destination and an ask nobody registered read the same.
-        assert_eq!(
-            unaimed.summary(),
-            "disposition-not-one-this-intake-knows=1 wiring-row-without-a-destination=1"
-        );
     }
 
     /// An unpaid principle whose tier is declared becomes a check against the
@@ -5277,14 +4668,14 @@ mod tests {
             None,
             None,
             None,
-            &[INTAKE_REGISTRIES, INTAKE_PRINCIPLES],
+            &[INTAKE_PRINCIPLES],
         )
         .await;
         let state = store.written().pop().expect("the pass wrote its row");
         assert_eq!(
             state.sources_unread.as_deref(),
-            Some("registries,principles"),
-            "a pass that lost both intakes says so, and names them in the order it ran them"
+            Some("principles"),
+            "a pass that lost its intake says so by name"
         );
 
         // Every source read is an empty string and not `None`: `None` is what a

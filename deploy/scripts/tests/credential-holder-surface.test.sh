@@ -26,7 +26,7 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "${here}/../../.." && pwd)"
 gate="${repo}/deploy/scripts/check-credential-holder-surface.sh"
-registry="crates/cogneva/debt/credential-holders.tsv"
+registry="deploy/credential-holders.tsv"
 PROFILES=(k3s-single k3s-multi k8s-standard)
 fail() { echo "FAIL: $*"; exit 1; }
 

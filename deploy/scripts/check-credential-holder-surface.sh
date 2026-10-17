@@ -40,7 +40,7 @@ python3 - <<'PYEOF'
 import glob, os, sys, yaml
 
 RENDERED = "deploy/rendered"
-REGISTRY = "crates/cogneva/debt/credential-holders.tsv"
+REGISTRY = "deploy/credential-holders.tsv"
 TEMPLATES = {
     "cogneva-secrets": "deploy/helm/cogneva/templates/secret.yaml",
     "cogneva-secrets-oob": "deploy/helm/cogneva/templates/secret-oob.yaml",
