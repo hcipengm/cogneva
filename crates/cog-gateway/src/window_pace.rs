@@ -82,11 +82,22 @@ impl MeasuredWindow {
     }
 }
 
-/// What the ledger knows about one upstream's last window.
+/// What the process knows about one upstream's last window.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WindowEvidence {
-    /// When the upstream last answered "this cycle's limit is reached".
+    /// When the upstream last answered "this cycle's limit is reached", as the
+    /// ledger's own classification records it.
     pub last_quota_refusal_unix: Option<i64>,
+    /// Whether the **live** health reading says the outstanding refusal is a
+    /// spent cycle, and when the upstream said its quota returns.
+    ///
+    /// A refusal is an observation even when the ledger cannot name its cause:
+    /// rows written before the cause column existed still mark the moment the
+    /// allowance ran out, and the upstream names the reset in the refusal
+    /// itself. This is the same observation as `last_quota_refusal_unix`, read
+    /// from the live evidence rather than from a stored row, and it is what
+    /// lets pacing start before the next window is spent instead of after.
+    pub quota_cycle_observed: bool,
     /// When the upstream said its quota returns, when the refusal named it.
     ///
     /// This, not the refusal, is the window's end: an allowance can run out on
@@ -97,45 +108,82 @@ pub struct WindowEvidence {
     /// can be stated against it: this instant is **not** a window boundary.
     pub last_ok_unix: Option<i64>,
     /// Tokens served in the window that ended at `last_quota_refusal_unix`.
+    /// Unused when the boundary comes from the live reading; the caller sums
+    /// the named window instead.
     pub burned_window_tokens: u64,
     /// The upstream's own statement of its window length.
     pub window_secs: u64,
+    /// The instant the decision is made at, used only to reject a named reset
+    /// that cannot belong to the refusal in force.
+    pub now_unix: i64,
+}
+
+/// When the window this upstream last spent ended, if anything observed it.
+///
+/// Two observations are equally good and neither is a guess:
+/// - a ledger row the classification already names as a spent cycle, which is
+///   durable and survives restarts;
+/// - a live reading that says the outstanding refusal is a spent cycle and
+///   names when the quota returns.
+///
+/// The newest successful call is not one of them. It marks where serving
+/// stopped, which is equally true of an upstream that was throttled and of one
+/// nobody called: measured on 2026-10-17, a window whose last success was six
+/// days old reported that 84% of its capacity was still unspent a moment
+/// before the quota really reset, and pacing against that reading would replay
+/// the failure this module exists to prevent — spending a whole window in a
+/// day.
+pub fn window_end(evidence: WindowEvidence) -> Option<i64> {
+    if let Some(wall) = evidence.last_quota_refusal_unix {
+        // The refusal says the allowance ran out; it does not say the window
+        // ended there. When the upstream also names the reset instant, that
+        // instant is the boundary and the refusal is only where spending
+        // stopped. A reset outside `(wall, wall + window)` cannot belong to
+        // this refusal — it is a leftover from another window or a parse
+        // accident — so it is not used.
+        return Some(match evidence.quota_reset_unix {
+            Some(reset) if reset > wall && (reset - wall) < evidence.window_secs as i64 => reset,
+            _ => wall,
+        });
+    }
+    if evidence.quota_cycle_observed {
+        // Without a classified row, the live reading is the only witness to the
+        // wall, and the reset it names is the boundary. The plausibility guard
+        // is one window either side of now: a reset must be near enough to be
+        // this cycle's, and a refusal that has already reset is still this
+        // window's boundary (the phase rolls forward from it).
+        let window_secs = evidence.window_secs as i64;
+        if let Some(reset) = evidence.quota_reset_unix {
+            if window_secs > 0
+                && reset > evidence.now_unix - window_secs
+                && reset <= evidence.now_unix + window_secs
+            {
+                return Some(reset);
+            }
+        }
+    }
+    None
 }
 
 /// The measurement that may pace this upstream, if any.
 ///
-/// A window's boundary may only come from a refusal that says the allowance is
-/// spent, and when that refusal names the reset instant, the boundary is the
-/// reset: the tokens before the reset are what the window allowed. The newest
-/// successful call is not a boundary — it
-/// marks where serving stopped, which is equally true of an upstream that was
-/// throttled and of one nobody called. Reading it as a boundary invents a
-/// window: measured on 2026-10-17, a window whose last success was six days old
-/// reported that 84% of its capacity was still unspent a moment before the
-/// quota really reset, and pacing against that reading would replay the failure
-/// this module exists to prevent — spending a whole window in a day.
-///
-/// So: a fresh refusal wins; without one, the window measured earlier still
-/// stands; without either, this upstream is left unpaced rather than paced
-/// against a window nobody observed.
+/// `capacity_tokens` must be what the ledger served in the window
+/// [`window_end`] names: around the classified wall row when there is one
+/// (that row is the only burn evidence the ledger itself carries), otherwise
+/// summed between `end - window` and `end`. A fresh observation wins; without
+/// one, the window measured earlier still stands; without either, this
+/// upstream is left unpaced rather than paced against a window nobody
+/// observed.
 pub fn measured_window(
     evidence: WindowEvidence,
+    capacity_tokens: u64,
     latched: Option<MeasuredWindow>,
 ) -> Option<MeasuredWindow> {
-    let Some(wall) = evidence.last_quota_refusal_unix else {
+    let Some(end) = window_end(evidence) else {
         return latched;
     };
-    // The refusal says the allowance ran out; it does not say the window ended
-    // there. When the upstream also names the reset instant, that instant is
-    // the boundary and the refusal is only where spending stopped. A reset
-    // outside `(wall, wall + window)` cannot belong to this refusal — it is a
-    // leftover from another window or a parse accident — so it is not used.
-    let end = match evidence.quota_reset_unix {
-        Some(reset) if reset > wall && (reset - wall) < evidence.window_secs as i64 => reset,
-        _ => wall,
-    };
     let fresh = MeasuredWindow {
-        capacity_tokens: evidence.burned_window_tokens,
+        capacity_tokens,
         window_secs: evidence.window_secs,
         burned_at_unix: end,
     };
@@ -268,8 +316,10 @@ mod tests {
             quota_reset_unix: None,
             burned_window_tokens: 30_000_000,
             window_secs: (30 * DAY) as u64,
+            ..Default::default()
         };
-        let measured = measured_window(evidence, None).expect("a refusal is a measurement");
+        let measured =
+            measured_window(evidence, 30_000_000, None).expect("a refusal is a measurement");
         assert_eq!(measured.burned_at_unix, 2_000_000);
         assert_eq!(measured.capacity_tokens, 30_000_000);
     }
@@ -286,8 +336,10 @@ mod tests {
             quota_reset_unix: Some(2_000_000 + 3 * DAY),
             burned_window_tokens: 30_000_000,
             window_secs: (30 * DAY) as u64,
+            ..Default::default()
         };
-        let measured = measured_window(evidence, None).expect("a refusal is a measurement");
+        let measured =
+            measured_window(evidence, 30_000_000, None).expect("a refusal is a measurement");
         assert_eq!(
             measured.burned_at_unix,
             2_000_000 + 3 * DAY,
@@ -310,8 +362,9 @@ mod tests {
             quota_reset_unix: Some(2_000_000 + 40 * DAY),
             burned_window_tokens: 30_000_000,
             window_secs: (30 * DAY) as u64,
+            ..Default::default()
         };
-        let measured = measured_window(base, None).expect("a refusal is a measurement");
+        let measured = measured_window(base, 30_000_000, None).expect("a refusal is a measurement");
         assert_eq!(
             measured.burned_at_unix, 2_000_000,
             "a reset beyond the window it claims to end is left over from another one"
@@ -330,8 +383,60 @@ mod tests {
             quota_reset_unix: None,
             burned_window_tokens: 30_000_000,
             window_secs: (30 * DAY) as u64,
+            ..Default::default()
         };
-        assert_eq!(measured_window(evidence, None), None);
+        assert_eq!(measured_window(evidence, 30_000_000, None), None);
+    }
+
+    #[test]
+    fn a_live_quota_cycle_reading_opens_the_window_at_the_reset_it_names() {
+        // The shape the ledger cannot store yet: the refusal rows predate the
+        // cause column, so the only witness to the wall is the health reading.
+        // Ignoring it leaves the whole next window unpaced -- the burst the
+        // pacer exists to prevent happens before the wall it would pace from.
+        let now = 5_000_000;
+        let evidence = WindowEvidence {
+            last_quota_refusal_unix: None,
+            last_ok_unix: None,
+            quota_cycle_observed: true,
+            quota_reset_unix: Some(now + DAY),
+            burned_window_tokens: 0,
+            window_secs: (7 * DAY) as u64,
+            now_unix: now,
+        };
+        assert_eq!(window_end(evidence), Some(now + DAY));
+        let measured = measured_window(evidence, 138_000_000, None).expect("live evidence counts");
+        assert_eq!(measured.burned_at_unix, now + DAY);
+        assert_eq!(measured.allowance_at(now + DAY), 0);
+        assert_eq!(measured.allowance_at(now + DAY + 7 * DAY / 2), 69_000_000);
+    }
+
+    #[test]
+    fn a_live_entitlement_refusal_opens_no_window() {
+        // Entitlement never resets, so pacing it would spread quota that will
+        // never arrive; a reset named beside it is not this window's end.
+        let now = 5_000_000;
+        let evidence = WindowEvidence {
+            quota_cycle_observed: false,
+            quota_reset_unix: Some(now + DAY),
+            window_secs: (7 * DAY) as u64,
+            now_unix: now,
+            ..Default::default()
+        };
+        assert_eq!(window_end(evidence), None);
+    }
+
+    #[test]
+    fn a_reset_more_than_a_window_away_is_not_this_refusals_boundary() {
+        let now = 5_000_000;
+        let evidence = WindowEvidence {
+            quota_cycle_observed: true,
+            quota_reset_unix: Some(now + 3 * 7 * DAY),
+            window_secs: (7 * DAY) as u64,
+            now_unix: now,
+            ..Default::default()
+        };
+        assert_eq!(window_end(evidence), None);
     }
 
     #[test]
@@ -343,8 +448,9 @@ mod tests {
             quota_reset_unix: None,
             burned_window_tokens: 0,
             window_secs: (30 * DAY) as u64,
+            ..Default::default()
         };
-        assert_eq!(measured_window(no_refusal, Some(earlier)), Some(earlier));
+        assert_eq!(measured_window(no_refusal, 0, Some(earlier)), Some(earlier));
         // A refusal whose burn could not be summed (the rows it needs were
         // pruned or never landed) is not a usable measurement either; the
         // earlier one is still the best observation available.
@@ -352,7 +458,7 @@ mod tests {
             last_quota_refusal_unix: Some(3_000_000),
             ..no_refusal
         };
-        assert_eq!(measured_window(empty_burn, Some(earlier)), Some(earlier));
+        assert_eq!(measured_window(empty_burn, 0, Some(earlier)), Some(earlier));
     }
 
     #[test]

@@ -22,7 +22,7 @@
 //! writes carry a per-run marker and are deleted at the end, so the database is
 //! left as it was found.
 
-use cog_observability::usage_store::{LlmUsageRecord, LlmUsageStore};
+use cog_observability::usage_store::{LlmUsageRecord, LlmUsageStore, StoredWindow};
 use sqlx::{PgPool, Row};
 
 fn database_url() -> String {
@@ -367,6 +367,102 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         "with a completed job on the ledger the reserve has a reading"
     );
 
+    // A window whose end the upstream named can be measured before the ledger
+    // carries a labelled refusal: the sum runs against two fixed instants, so
+    // it counts the window that ended at the reset and not the one now in
+    // progress. Rows outside `(since, until]` are the ones that decide whether
+    // the bound is honored at all.
+    let bounded = format!("ledger-test-bounded:{}", uuid::Uuid::new_v4());
+    let bounded_actors = [
+        format!("bounded-old:{}", uuid::Uuid::new_v4()),
+        format!("bounded-in:{}", uuid::Uuid::new_v4()),
+        format!("bounded-new:{}", uuid::Uuid::new_v4()),
+    ];
+    for (actor, age_days) in bounded_actors.iter().zip([10_i64, 2, 0]) {
+        let mut call = record(actor.clone(), 0, None, None, None);
+        call.upstream = bounded.clone();
+        store.record(&call).await.expect("record a bounded call");
+        sqlx::query(&format!(
+            "UPDATE gateway_llm_usage SET ts = NOW() - make_interval(days => {age_days}) \
+             WHERE actor = $1"
+        ))
+        .bind(actor)
+        .execute(&pool)
+        .await
+        .expect("place the call on the window's timeline");
+    }
+    let now = chrono::Utc::now().timestamp();
+    let bounded_sum = store
+        .burned_between(&bounded, now - 7 * 86_400, now - 86_400)
+        .await
+        .expect("sum the window between two instants");
+    assert_eq!(
+        bounded_sum, 1_050,
+        "only the call inside the window counts; the older one is before its \
+         start and the newest one after its end"
+    );
+
+    // The measurement itself needs a home that outlives the process: if it dies
+    // with the gateway, the next rollout silently drops the bound and nothing in
+    // the readings says it went away. One row per upstream, overwritten when a
+    // newer window is measured.
+    let stored = StoredWindow {
+        upstream: bounded.clone(),
+        capacity_tokens: 1_050,
+        window_secs: 604_800,
+        boundary_unix: now - 86_400,
+        source: "named_reset".to_string(),
+    };
+    store
+        .record_window(&stored)
+        .await
+        .expect("store the window measurement");
+    assert_eq!(
+        store
+            .stored_window(&bounded)
+            .await
+            .expect("read the measurement back"),
+        Some(stored.clone()),
+        "the measurement has to survive a restart under the same boundary"
+    );
+    let newer = StoredWindow {
+        boundary_unix: now + 6 * 86_400,
+        capacity_tokens: 2_000,
+        ..stored.clone()
+    };
+    store
+        .record_window(&newer)
+        .await
+        .expect("a newer window supersedes the older one");
+    assert_eq!(
+        store
+            .stored_window(&bounded)
+            .await
+            .expect("read the superseding measurement"),
+        Some(newer),
+        "the newest boundary is the one in force"
+    );
+    let rows = sqlx::query("SELECT COUNT(*) AS n FROM gateway_llm_window WHERE upstream = $1")
+        .bind(&bounded)
+        .fetch_one(&pool)
+        .await
+        .expect("count the stored windows");
+    assert_eq!(
+        rows.get::<i64, _>("n"),
+        1,
+        "one row per upstream, or the pacing pass has to pick between two bounds"
+    );
+
+    sqlx::query("DELETE FROM gateway_llm_usage WHERE upstream = $1")
+        .bind(&bounded)
+        .execute(&pool)
+        .await
+        .expect("clean up the bounded window rows");
+    sqlx::query("DELETE FROM gateway_llm_window WHERE upstream = $1")
+        .bind(&bounded)
+        .execute(&pool)
+        .await
+        .expect("clean up the stored window");
     sqlx::query("DELETE FROM gateway_llm_usage WHERE upstream = $1")
         .bind(&upstream)
         .execute(&pool)

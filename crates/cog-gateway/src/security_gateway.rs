@@ -3335,10 +3335,14 @@ const WINDOW_PACE_RESERVE_QUANTILE: f64 = 0.75;
 /// 一拍窗口配速：量出每个上游的容量、算出这一窗的允许量、把用量对上去。
 ///
 /// 三个数各有一个出处，缺一个就整条不配速（而不是拿一个默认值顶上）：
-/// - 容量：上一个窗口烧穿的量，由撞墙那一行（`refusal_kind = quota_cycle`）
-///   与它之前的成功行求和得出，见 [`measure_window`]；
+/// - 容量：上一个窗口烧穿的量，围着撞墙那一行（`refusal_kind = quota_cycle`）
+///   求和；账上那行没定性时，改用活的健康读数里自报的恢复时刻把这一窗围起来
+///   求和。两条都是观测，见 [`measure_window`]；
 /// - 窗口长度：上游自报，存在健康表里、随池载荷跨重启；
 /// - 用量：本窗口起点之后的成功行之和。
+///
+/// 量出来的窗口另存一份到库里：它跨重启还在，进程内那张表只是缓存——只在内存里
+/// 活着的话，下一次滚动升级会让配速静默停止，而没有任何读数会说界没了。
 ///
 /// 聚合到池一级而不是逐上游判定，因为读它的调度器把活交给整个池、挑不了
 /// 谁来承接；池成员按构造可以互相顶替，所以它们的允许量可以相加。
@@ -3380,6 +3384,7 @@ async fn refresh_window_pace(
             &reading.key,
             window_secs,
             reading.quota_reset_unix,
+            reading.refusal_kind,
         )
         .await
         else {
@@ -3412,24 +3417,69 @@ async fn refresh_window_pace(
     (pace, rate)
 }
 
-/// 一个上游的容量读数，优先用账上那一行撞墙记录，其次用本进程暂存的那一份。
+/// 一个上游的容量读数：先看本进程暂存的那一份，没有就读库里存的那一份，再没有
+/// 就只看这次能不能观测到一个窗口。
 ///
-/// 撞墙记录是**正本**：它把"这一窗已经用尽"写在行上，容量就是对它前一个窗口
-/// 求和；窗口的**终点**取上游自报的恢复时刻（`quota_reset_unix`），拿不到时才
-/// 退回撞墙那一刻——配额可以在七天的第一天就用完，撞墙只说明花光了，不说明
-/// 周期到头了。两处起点因此**不完全重合**：求和围着撞墙行（唯一的烧穿证据），
-/// 相位围着恢复时刻。上一窗也是提前烧穿时两者覆盖的是同一批成功行；只有上一窗
-/// 一直供到窗尾时，求和会多吃进它尾巴上那一小段。这一格偏大而不是偏小——它只会
-/// 让允许量略宽，不会让配速比实测更紧。暂存那份只在没有撞墙记录时出场：它是同一个上游**上一次量到的
-/// 墙**，让读失败的那一拍沿用上次的读数，而不是掉回"不知道"。两样都没有就不配速。
+/// 窗口的观测有两种，都算数：
+/// - 账上有一行**已定性**的撞墙记录（`refusal_kind = quota_cycle`），容量就是对
+///   它前一个窗口求和。这行是持久证据，重启后还在；
+/// - 账上那行**没定性**（成因列是后来才加的，历史行补不出来），但健康读数这次
+///   亲眼看到成因是 `quota_cycle`、且上游自报了恢复时刻。这时边界就是那个恢复
+///   时刻，容量是对 `(恢复−窗口, 恢复]` 求和——同样是实测，只是证据来自活的读数
+///   而不是行上的标签。
+///
+/// 窗口的**终点**一律取上游自报的恢复时刻（`quota_reset_unix`），拿不到时才退回
+/// 撞墙那一刻——配额可以在七天的第一天就用完，撞墙只说明花光了，不说明周期到头。
+/// 两处起点因此**不完全重合**：有撞墙行时求和围着它（唯一的烧穿证据），相位围着
+/// 恢复时刻；上一窗也是提前烧穿时两者覆盖的是同一批成功行，只有上一窗一直供到
+/// 窗尾时求和会多吃进它尾巴上那一小段。这一格偏大而不是偏小——只会让允许量略宽。
+///
+/// 量到的东西要落库：只在内存里暂存的话，下一次滚动升级就把它清零，而配速会静默
+/// 停止——没有任何读数会说"界没了"。库里的行是这份测量的正本，进程内那张表只是
+/// 它的缓存。
 async fn measure_window(
     state: &AppState,
     store: &cog_observability::usage_store::LlmUsageStore,
     key: &str,
     window_secs: u64,
     quota_reset_unix: Option<i64>,
+    refusal_kind: Option<RefusalKind>,
 ) -> Option<crate::window_pace::MeasuredWindow> {
-    let latched = state.measured_windows.lock().unwrap().get(key).copied();
+    let now_unix = chrono::Utc::now().timestamp();
+    let cached = {
+        let windows = state.measured_windows.lock().unwrap();
+        windows.get(key).copied()
+    };
+    let latched = match cached {
+        Some(measured) => Some(measured),
+        None => match store.stored_window(key).await {
+            Ok(Some(stored)) => {
+                let measured = crate::window_pace::MeasuredWindow {
+                    capacity_tokens: stored.capacity_tokens,
+                    window_secs: stored.window_secs,
+                    burned_at_unix: stored.boundary_unix,
+                };
+                if measured.is_usable() {
+                    {
+                        let mut windows = state.measured_windows.lock().unwrap();
+                        windows.insert(key.to_string(), measured);
+                    }
+                    Some(measured)
+                } else {
+                    None
+                }
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(
+                    upstream = %key,
+                    error = %e,
+                    "窗口配速：读不出这一家存下的窗口，先按这次观测本身判"
+                );
+                None
+            }
+        },
+    };
     let reading = match store.upstream_window(key, window_secs).await {
         Ok(reading) => reading,
         Err(e) => {
@@ -3441,21 +3491,60 @@ async fn measure_window(
             return latched;
         }
     };
-    let measured = crate::window_pace::measured_window(
-        crate::window_pace::WindowEvidence {
-            last_quota_refusal_unix: reading.last_quota_refusal_unix,
-            last_ok_unix: reading.last_ok_unix,
-            quota_reset_unix,
-            burned_window_tokens: reading.burned_window_tokens,
-            window_secs,
-        },
-        latched,
-    )?;
-    state
-        .measured_windows
-        .lock()
-        .unwrap()
-        .insert(key.to_string(), measured);
+    let evidence = crate::window_pace::WindowEvidence {
+        last_quota_refusal_unix: reading.last_quota_refusal_unix,
+        quota_cycle_observed: refusal_kind == Some(RefusalKind::QuotaCycle),
+        quota_reset_unix,
+        last_ok_unix: reading.last_ok_unix,
+        burned_window_tokens: reading.burned_window_tokens,
+        window_secs,
+        now_unix,
+    };
+    let Some(end) = crate::window_pace::window_end(evidence) else {
+        return latched;
+    };
+    // 有已定性的撞墙行时用它围出来的和（同一处证据、少一次查询）；没有时按恢复
+    // 时刻把这一窗围起来求和。上界钉在恢复时刻，所以复位之后再算还是同一个数，
+    // 不会滑进新的一窗。
+    let (capacity, source) = match reading.last_quota_refusal_unix {
+        Some(_) => (reading.burned_window_tokens, "wall_row"),
+        None => {
+            let since = end.saturating_sub(window_secs as i64);
+            match store.burned_between(key, since, end).await {
+                Ok(capacity) => (capacity, "named_reset"),
+                Err(e) => {
+                    tracing::warn!(
+                        upstream = %key,
+                        error = %e,
+                        "窗口配速：算不出这一窗烧了多少，沿用上一次量到的容量"
+                    );
+                    return latched;
+                }
+            }
+        }
+    };
+    let measured = crate::window_pace::measured_window(evidence, capacity, latched)?;
+    if Some(measured) != latched {
+        state
+            .measured_windows
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), measured);
+        let stored = cog_observability::usage_store::StoredWindow {
+            upstream: key.to_string(),
+            capacity_tokens: measured.capacity_tokens,
+            window_secs: measured.window_secs,
+            boundary_unix: measured.burned_at_unix,
+            source: source.to_string(),
+        };
+        if let Err(e) = store.record_window(&stored).await {
+            tracing::warn!(
+                upstream = %key,
+                error = %e,
+                "窗口配速：量到的窗口没落库，这一进程内仍然按它配速"
+            );
+        }
+    }
     Some(measured)
 }
 

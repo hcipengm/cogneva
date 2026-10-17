@@ -56,6 +56,18 @@ pub const LEDGER_TABLE: &str = "gateway_llm_usage";
 /// The durable per-window fold of [`LEDGER_TABLE`].
 pub const ROLLUP_TABLE: &str = "cog_llm_usage_rollup";
 
+/// The last measured quota window per upstream.
+///
+/// A measurement is not a usage row, so it does not belong in the ledger; but
+/// it is also not a value the process may keep only in memory. The capacity
+/// number here is re-derivable from the ledger whenever the boundary is known,
+/// and the boundary is the one thing nothing else remembers once the upstream
+/// starts serving again. Kept in its own table so that a restart resumes pacing
+/// from the same window instead of silently dropping the bound -- a bound that
+/// disappears on the next deploy is worse than no bound, because nothing in the
+/// readings says it went away.
+pub const WINDOW_TABLE: &str = "gateway_llm_window";
+
 /// Inbound header a caller sets to name the environment a call is made from.
 ///
 /// The ledger's other dimensions say what was called and who called it; this
@@ -237,8 +249,25 @@ pub struct UpstreamWindowReading {
     /// Instant of the most recent refusal that said the window was spent;
     /// `None` when no such refusal is on record.
     pub last_quota_refusal_unix: Option<i64>,
-    /// What the window ending at the last success served.
+    /// What the window ending at the last classified refusal served; zero when
+    /// there is no such refusal, because nothing measured it.
     pub burned_window_tokens: u64,
+}
+
+/// One upstream's window measurement, as durable state.
+///
+/// `source` names where the boundary came from, not what kind of code wrote the
+/// row: `wall_row` is a refusal whose cause the ledger itself records,
+/// `named_reset` is the reset instant an upstream named in a refusal this
+/// process classified. The two are different observations of the same thing and
+/// a reader that sums by source can tell which one is carrying the pacing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredWindow {
+    pub upstream: String,
+    pub capacity_tokens: u64,
+    pub window_secs: u64,
+    pub boundary_unix: i64,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -433,6 +462,25 @@ impl LlmUsageStore {
         )
         .execute(&self.pool)
         .await?;
+        // One row per upstream, not one per measurement: the pacer only ever
+        // acts on the newest window it has an observation for, and a history
+        // of stale boundaries would make "which one is in force" a question the
+        // reader has to answer. The key is the upstream identity, which is what
+        // the pacing pass selects by.
+        sqlx::query(&format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS {WINDOW_TABLE} (
+                upstream        TEXT PRIMARY KEY,
+                boundary_unix   BIGINT NOT NULL,
+                window_secs     BIGINT NOT NULL,
+                capacity_tokens BIGINT NOT NULL,
+                source          TEXT NOT NULL,
+                measured_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            "#
+        ))
+        .execute(&self.pool)
+        .await?;
         // The window fold. `window_start`/`window_end` are the row's own
         // boundary fields, not a `now()` stamped at insert: a rerun has to key
         // and compare on the window it is recomputing, and a timestamp taken
@@ -595,6 +643,81 @@ impl LlmUsageStore {
             last_quota_refusal_unix: row.get("last_quota_refusal_unix"),
             burned_window_tokens: row.get::<i64, _>("burned_window_tokens").max(0) as u64,
         })
+    }
+
+    /// Tokens this upstream served in `(since_unix, until_unix]`.
+    ///
+    /// The bounded form exists because a window's end can be known before the
+    /// ledger holds a refusal that names it: an upstream tells us when its
+    /// quota returns, and the tokens served before that instant are what the
+    /// window allowed. Summing against a fixed upper bound also makes the
+    /// number stable -- recomputed after the reset, it still counts the same
+    /// window rather than sliding forward into the new one.
+    pub async fn burned_between(
+        &self,
+        upstream: &str,
+        since_unix: i64,
+        until_unix: i64,
+    ) -> anyhow::Result<u64> {
+        let row = sqlx::query(&format!(
+            "SELECT COALESCE(SUM(tokens_input + tokens_output), 0)::BIGINT AS tokens
+               FROM {LEDGER_TABLE}
+              WHERE upstream = $1 AND result = 'ok'
+                AND ts > to_timestamp($2::DOUBLE PRECISION)
+                AND ts <= to_timestamp($3::DOUBLE PRECISION)"
+        ))
+        .bind(upstream)
+        .bind(since_unix as f64)
+        .bind(until_unix as f64)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<i64, _>("tokens").max(0) as u64)
+    }
+
+    /// Durably remember an upstream's measured window.
+    ///
+    /// Overwrites the previous row: a newer boundary supersedes an older one,
+    /// and keeping both would leave the pacing pass to pick. `measured_at` is
+    /// refreshed so a reader can tell a window measured today from one measured
+    /// two cycles ago.
+    pub async fn record_window(&self, w: &StoredWindow) -> anyhow::Result<()> {
+        sqlx::query(&format!(
+            "INSERT INTO {WINDOW_TABLE}
+                 (upstream, boundary_unix, window_secs, capacity_tokens, source, measured_at)
+             VALUES ($1, $2, $3, $4, $5, NOW())
+             ON CONFLICT (upstream) DO UPDATE SET
+                 boundary_unix   = EXCLUDED.boundary_unix,
+                 window_secs     = EXCLUDED.window_secs,
+                 capacity_tokens = EXCLUDED.capacity_tokens,
+                 source          = EXCLUDED.source,
+                 measured_at     = NOW()"
+        ))
+        .bind(&w.upstream)
+        .bind(w.boundary_unix)
+        .bind(w.window_secs as i64)
+        .bind(w.capacity_tokens as i64)
+        .bind(&w.source)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The window measurement last stored for one upstream.
+    pub async fn stored_window(&self, upstream: &str) -> anyhow::Result<Option<StoredWindow>> {
+        let row = sqlx::query(&format!(
+            "SELECT upstream, boundary_unix, window_secs, capacity_tokens, source
+               FROM {WINDOW_TABLE} WHERE upstream = $1"
+        ))
+        .bind(upstream)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| StoredWindow {
+            upstream: r.get("upstream"),
+            boundary_unix: r.get("boundary_unix"),
+            window_secs: r.get::<i64, _>("window_secs").max(0) as u64,
+            capacity_tokens: r.get::<i64, _>("capacity_tokens").max(0) as u64,
+            source: r.get("source"),
+        }))
     }
 
     /// Tokens this upstream served from `since_unix` onwards.
