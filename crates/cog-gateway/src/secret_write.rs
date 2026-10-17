@@ -101,26 +101,30 @@ pub(crate) async fn forward(fields: Value, b64: bool, restart: bool) -> Result<R
         "restart": restart,
     }))
     .map_err(|e| format!("写入请求序列化失败: {e}"))?;
-    let resp = reqwest::Client::new()
-        .post(format!(
-            "{}{}",
-            base.trim_end_matches('/'),
-            SECRET_PATCH_PATH
-        ))
-        .header("Content-Type", "application/json")
-        .header(SIGNATURE_HEADER, sign(&secret, &body))
-        .body(body)
-        .send()
+    let request = cog_core::HttpRequest::post(format!(
+        "{}{}",
+        base.trim_end_matches('/'),
+        SECRET_PATCH_PATH
+    ))
+    .header("Content-Type", "application/json")
+    .header(SIGNATURE_HEADER, sign(&secret, &body))
+    .body(body);
+    // 出站走本进程装配进来的那一份客户端：这里的请求和本模块其他网关调用同属
+    // 一次短交换，超时、连接池、代理不应该由这个函数自钉一套——自己 `Client::new()`
+    // 造出来的那份没有超时，上游不应答就永远挂着，而调用方看不出用的是哪一份设置。
+    let resp = crate::contribution_admin::http_client()?
+        .execute(request)
         .await
         .map_err(|e| format!("转发安全网关失败: {e}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("安全网关返回 {status}: {text}"));
+    if !resp.is_success() {
+        return Err(format!(
+            "安全网关返回 {}: {}",
+            resp.status,
+            resp.text().unwrap_or_default()
+        ));
     }
     let body: Value = resp
         .json()
-        .await
         .map_err(|e| format!("安全网关响应解析失败: {e}"))?;
     Ok(match body.get("restart").and_then(Value::as_str) {
         Some("rolled") => Restart::Rolled,
