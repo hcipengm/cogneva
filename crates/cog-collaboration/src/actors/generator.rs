@@ -475,6 +475,7 @@ fn change_generation_contract() -> serde_json::Value {
             "lint_introduced": "lint",
             "lint_refused": "no_diff_can_avoid_it: the linter this deployment declares reports in a form the gate cannot compare against the lines a diff writes, so no diff can be shown not to have caused its findings; the deployment's declaration is what decides this, not the wording of a change",
             "unreachable_default": "effect",
+            "deploy_admission_failed": "no_diff_can_avoid_it: a change that reaches deploy/** is admitted only when the project declares executable admission conditions (render, parity, server-side dry-run) in its own configuration document, and that declaration is read from the tree the change lands on — no wording of a diff can supply it, and a family with no conditions is refused as the strictest tier rather than sent to a person; the declared commands themselves, and a rollback round-trip that must leave the tree byte-identical, decide whether the diff is admitted",
             "project_kind_unusable": "no_diff_can_avoid_it: the landing recipe a project is dispatched under is declared by the project itself, in its own configuration document, and that document is read from the tree the change is applied to before the change is applied — so nothing a diff contains or writes can decide this, and a project whose declaration cannot be read is refused before its diff is looked at"
         }
     })
