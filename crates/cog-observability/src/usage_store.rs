@@ -187,6 +187,19 @@ pub struct LlmUsageRecord {
     /// attempts and pooled refusals). Absent is not zero here: a row priced at
     /// zero would read as an empty prompt, and the two have opposite repairs.
     pub estimated_input: Option<u64>,
+    /// Why the upstream refused, as the gateway classified the refusal body:
+    /// `quota_cycle`, `entitlement`, or `unclassified`.
+    ///
+    /// Nullable, and `NULL` means either "this row is not a refusal" (a
+    /// successful call, a transport failure with no body to read, a pooled
+    /// refusal decided before any upstream was tried) or a row written before
+    /// this column existed -- the reader cannot tell those apart after the
+    /// fact, which is why the value is recorded at the refusal site and never
+    /// reconstructed. The distinction is the point: `quota_cycle` says this
+    /// window is spent and will come back, `entitlement` says it never existed,
+    /// and the two call for opposite actions. Folding both into `error` makes
+    /// "we have no capacity" and "we never bought this model" one cell.
+    pub refusal_kind: Option<String>,
     /// The unit of work this call was spent for, as the caller declared it --
     /// the same identity the caller reports its own per-run totals under.
     ///
@@ -395,6 +408,13 @@ impl LlmUsageStore {
         sqlx::query("ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS task_id TEXT")
             .execute(&self.pool)
             .await?;
+        // Why a refused attempt was refused. Additive and nullable for the same
+        // reason as the two columns above: rows written before it existed have
+        // no kind to report, and inventing one would make a past window's
+        // failures read as a cause nobody ever observed.
+        sqlx::query("ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS refusal_kind TEXT")
+            .execute(&self.pool)
+            .await?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_gateway_llm_usage_ts ON gateway_llm_usage (ts)",
         )
@@ -473,8 +493,8 @@ impl LlmUsageStore {
             INSERT INTO gateway_llm_usage
                 (id, upstream, api_style, model, result, actor, origin,
                  tokens_input, tokens_output, tokens_cached, estimated_input,
-                 task_id, latency_ms)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                 task_id, latency_ms, refusal_kind)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             "#,
         )
         .bind(uuid::Uuid::new_v4())
@@ -490,6 +510,7 @@ impl LlmUsageStore {
         .bind(r.estimated_input.map(|v| v as i64))
         .bind(r.task.as_deref())
         .bind(r.latency_ms as i64)
+        .bind(r.refusal_kind.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())

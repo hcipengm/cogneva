@@ -1940,6 +1940,7 @@ async fn record_llm_call(
     actor: &str,
     origin: &str,
     task: Option<&str>,
+    refusal_kind: Option<RefusalKind>,
 ) {
     let key = LlmHealthTable::key(upstream);
     // `model` travels alongside `upstream` rather than instead of it: a pool
@@ -1972,7 +1973,15 @@ async fn record_llm_call(
             .property("actor", serde_json::json!(actor))
             .property("latency_ms", serde_json::json!(latency_ms)),
     );
-    if let Some(record) = failed_attempt_usage(upstream, result, latency_ms, actor, origin, task) {
+    if let Some(record) = failed_attempt_usage(
+        upstream,
+        result,
+        latency_ms,
+        actor,
+        origin,
+        task,
+        refusal_kind,
+    ) {
         land_usage_record(state, record);
     }
 }
@@ -1994,6 +2003,7 @@ fn failed_attempt_usage(
     actor: &str,
     origin: &str,
     task: Option<&str>,
+    refusal_kind: Option<RefusalKind>,
 ) -> Option<LlmUsageRecord> {
     if result == "ok" {
         return None;
@@ -2013,6 +2023,13 @@ fn failed_attempt_usage(
         // "估算 X、真值 0"的一次超额。定价只落在有真值的那一行上。填 0 更糟：会读成
         // 空提示词。
         estimated_input: None,
+        // The classification travels with the row. Without it the ledger can
+        // say an attempt failed but not whether the window is spent (it comes
+        // back), the model was never bought (it does not), or the body said
+        // neither -- and those three call for opposite repairs. Only the site
+        // that read the body knows it, so it is passed in rather than inferred
+        // later from a status code that cannot tell them apart.
+        refusal_kind: refusal_kind.map(|k| k.as_str().to_string()),
         // 这件工作由调用方声明，失败不会改变"这笔钱是为谁花的"。
         task: task.map(str::to_string),
         latency_ms,
@@ -2061,6 +2078,9 @@ fn pooled_refusal_usage(
         // 同 [`failed_attempt_usage`]：这一行说的是"一个上游都没发出去"，那份请求的
         // 估算在这里没有真值可配对，不填。
         estimated_input: None,
+        // 池级拒绝时没有任何一家上游的正文可读，成因无从分类。把一个候选上游的
+        // 成因抄上来会让这一行读成"那一家拒的"，而它一个都没试过。
+        refusal_kind: None,
         // 拒绝发生在选上游之前，但"这次调用想为哪件事花钱"调用方已经说了，
         // 照记：被拒的调用正是按任务配速时最该看见的那一族。
         task: task.map(str::to_string),
@@ -2541,6 +2561,7 @@ async fn record_llm_tokens(
             tokens_output: reading.output,
             tokens_cached: reading.cached,
             estimated_input,
+            refusal_kind: None,
             task,
             latency_ms,
         },
@@ -4215,6 +4236,8 @@ async fn stream_forward(
                     &actor,
                     &origin,
                     task.as_deref(),
+                    // 连接没建立起来，没有上游正文可读——这是"没问到"，不是某一种拒绝。
+                    None,
                 )
                 .await;
                 mark_upstream_failure(&state, upstream, base, None, None, None).await;
@@ -4250,6 +4273,10 @@ async fn stream_forward(
             // 这类上游对**每一条**请求都回 400，而它就是被当成调用侧的错）。
             // 两种成因靠一次响应分不出来，交给探测器换一条请求问：见 `shape_errored`。
             let request_shape_error = matches!(status.as_u16(), 400 | 404 | 422);
+            // 分类只对"上游拒绝了这次调用"有意义。请求形态错误（400/404/422）分不出
+            // 是调用侧写坏了还是上游对谁都这样回，此时落一个成因会把它写成断言；
+            // 宁可留空，由探测器换一条请求去问。
+            let refusal_kind = (!request_shape_error).then(|| classify_refusal(&text));
             tracing::warn!(
                 upstream = %base,
                 status = %status,
@@ -4266,6 +4293,7 @@ async fn stream_forward(
                 &actor,
                 &origin,
                 task.as_deref(),
+                refusal_kind,
             )
             .await;
             if request_shape_error {
@@ -4283,7 +4311,7 @@ async fn stream_forward(
                     base,
                     quota_reset,
                     quota_window,
-                    Some(classify_refusal(&text)),
+                    refusal_kind,
                 )
                 .await;
             }
@@ -4305,6 +4333,8 @@ async fn stream_forward(
             &actor,
             &origin,
             task.as_deref(),
+            // 成功的一行没有拒绝可分类。
+            None,
         )
         .await;
 
@@ -4700,6 +4730,7 @@ async fn call_llm(
                     actor,
                     origin,
                     None,
+                    None,
                 )
                 .await;
                 return Ok(resp);
@@ -4715,6 +4746,9 @@ async fn call_llm(
                     actor,
                     origin,
                     None,
+                    // 这一条读的是上游正文，成因在这里已经分好；传输失败没有正文时
+                    // 它就是 `None`，两种"没有成因"在账上同形是实情。
+                    refusal.refusal_kind,
                 )
                 .await;
                 mark_upstream_failure(
@@ -6550,6 +6584,7 @@ mod tests {
             "agent:generator",
             "sandbox",
             None,
+            Some(RefusalKind::QuotaCycle),
         )
         .expect("a failed attempt must be visible in the ledger");
         assert_eq!(row.result, "error");
@@ -6558,6 +6593,10 @@ mod tests {
         assert_eq!(row.actor, "agent:generator");
         assert_eq!(row.origin, "sandbox");
         assert_eq!(row.model, "m");
+        // The cause travels with the row: without it a spent window and an
+        // unpurchased model are the same `error` cell, and they call for
+        // opposite repairs.
+        assert_eq!(row.refusal_kind.as_deref(), Some("quota_cycle"));
     }
 
     #[test]
@@ -6569,6 +6608,7 @@ mod tests {
             12,
             "agent:generator",
             "sandbox",
+            None,
             None
         )
         .is_none());

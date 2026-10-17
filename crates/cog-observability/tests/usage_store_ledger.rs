@@ -49,22 +49,27 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
     let after = format!("usage-ledger-test-after:{}", uuid::Uuid::new_v4());
     let unpriced = format!("usage-ledger-test-unpriced:{}", uuid::Uuid::new_v4());
     let task = format!("usage-ledger-test-task:{}", uuid::Uuid::new_v4());
+    let refusal = format!("usage-ledger-test-refusal:{}", uuid::Uuid::new_v4());
 
-    let record =
-        |actor: String, cached: u64, estimated: Option<u64>, task: Option<&str>| LlmUsageRecord {
-            upstream: "ledger-test-upstream".to_string(),
-            api_style: "openai".to_string(),
-            model: "ledger-test-model".to_string(),
-            result: "ok".to_string(),
-            actor,
-            origin: "sandbox".to_string(),
-            tokens_input: 1000,
-            tokens_output: 50,
-            tokens_cached: cached,
-            estimated_input: estimated,
-            task: task.map(str::to_string),
-            latency_ms: 12,
-        };
+    let record = |actor: String,
+                  cached: u64,
+                  estimated: Option<u64>,
+                  task: Option<&str>,
+                  refusal_kind: Option<&str>| LlmUsageRecord {
+        upstream: "ledger-test-upstream".to_string(),
+        api_style: "openai".to_string(),
+        model: "ledger-test-model".to_string(),
+        result: "ok".to_string(),
+        actor,
+        origin: "sandbox".to_string(),
+        tokens_input: 1000,
+        tokens_output: 50,
+        tokens_cached: cached,
+        estimated_input: estimated,
+        refusal_kind: refusal_kind.map(str::to_string),
+        task: task.map(str::to_string),
+        latency_ms: 12,
+    };
 
     store.init_schema().await.expect("init the schema");
 
@@ -73,7 +78,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
     // pass every other assertion in this file and still lose the one number the
     // ledger exists to carry.
     store
-        .record(&record(before.clone(), 800, Some(900), Some(&task)))
+        .record(&record(before.clone(), 800, Some(900), Some(&task), None))
         .await
         .expect("record a cached call");
     let row = sqlx::query(
@@ -113,7 +118,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
     // not, since "this row was never priced" is not "this row was priced at 0".
     sqlx::query(
         "ALTER TABLE gateway_llm_usage DROP COLUMN tokens_cached, DROP COLUMN estimated_input, \
-         DROP COLUMN task_id",
+         DROP COLUMN task_id, DROP COLUMN refusal_kind",
     )
     .execute(&pool)
     .await
@@ -124,7 +129,8 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         .expect("re-init against a table without the columns");
 
     let row = sqlx::query(
-        "SELECT tokens_input, tokens_cached, estimated_input, task_id FROM gateway_llm_usage WHERE actor = $1",
+        "SELECT tokens_input, tokens_cached, estimated_input, task_id, refusal_kind \
+         FROM gateway_llm_usage WHERE actor = $1",
     )
     .bind(&before)
     .fetch_one(&pool)
@@ -151,6 +157,12 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         None,
         "a row that predates the job column is unattributed, and a placeholder would \
          gather every such row into one job that never existed"
+    );
+    assert_eq!(
+        row.get::<Option<String>, _>("refusal_kind"),
+        None,
+        "a row written before the refusal column existed has no cause to report, and \
+         inventing one would make a past window read as a refusal nobody classified"
     );
 
     let shape = sqlx::query(
@@ -190,11 +202,11 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
     // including the estimate's own absence, which has to come back as an absence
     // rather than as the zero the reader would otherwise have to guess about.
     store
-        .record(&record(after.clone(), 640, Some(512), Some(&task)))
+        .record(&record(after.clone(), 640, Some(512), Some(&task), None))
         .await
         .expect("record after the migration");
     store
-        .record(&record(unpriced.clone(), 0, None, None))
+        .record(&record(unpriced.clone(), 0, None, None, None))
         .await
         .expect("record a call whose path prices nothing");
     let row = sqlx::query(
@@ -225,7 +237,45 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
          a neighbour's task or invent one"
     );
 
-    for actor in [&before, &after, &unpriced] {
+    // The refusal cause is a column of its own because the two values that reach
+    // it call for opposite actions: a spent window comes back, an unpurchased
+    // model never does. Folding them into `result = error` leaves the ledger able
+    // to say an attempt failed but unable to say which of the two it was.
+    store
+        .record(&record(refusal.clone(), 0, None, None, Some("quota_cycle")))
+        .await
+        .expect("record a refused attempt");
+    let row = sqlx::query("SELECT refusal_kind FROM gateway_llm_usage WHERE actor = $1")
+        .bind(&refusal)
+        .fetch_one(&pool)
+        .await
+        .expect("read the refusal back");
+    assert_eq!(
+        row.get::<Option<String>, _>("refusal_kind"),
+        Some("quota_cycle".to_string()),
+        "the cause has to survive the write under the same name the classifier emits, \
+         or a reader grouping by it joins nothing"
+    );
+    let refusal_shape = sqlx::query(
+        "SELECT is_nullable, column_default FROM information_schema.columns \
+         WHERE table_name = 'gateway_llm_usage' AND column_name = 'refusal_kind'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the refusal column must exist after the migration");
+    assert_eq!(
+        refusal_shape.get::<String, _>("is_nullable"),
+        "YES",
+        "most rows are not refusals; a NOT NULL column would have to carry a value for them"
+    );
+    assert!(
+        refusal_shape
+            .get::<Option<String>, _>("column_default")
+            .is_none(),
+        "a default would make every non-refusal row name a cause it never had"
+    );
+
+    for actor in [&before, &after, &unpriced, &refusal] {
         sqlx::query("DELETE FROM gateway_llm_usage WHERE actor = $1")
             .bind(actor)
             .execute(&pool)
