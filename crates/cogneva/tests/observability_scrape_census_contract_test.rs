@@ -193,6 +193,33 @@ const UNREGISTERED: &[(&str, Unread)] = &[
     // subsiding), and a rule that reads it has to take its bound from the split
     // rates rather than guess one. That debt sits on the alert side.
 
+    // The task graph's four readings. The count is the one a person would
+    // expect to be drawn and is not; the other three are what the count cannot
+    // say -- how long the oldest piece has been waiting, whether the reader
+    // itself is still reading, and how often it failed. The module publishes
+    // them together with a snapshot that survives a failed read: the age and
+    // the failure count are what let a stalled reader be told apart from a
+    // quiet graph, which is exactly the distinction no face currently draws.
+    // A threshold is derivable on the oldest-untouched age (it grows while the
+    // count holds steady) but not on the others, and the age's unit is the
+    // caller's stall budget rather than a number this table may invent; so the
+    // debt is a reader of the family, not a rule someone guesses here.
+    (
+        "cogneva_tasks_current",
+        Unread::Gap("tasks in the graph right now, one series per status. It is the shape a status panel is normally drawn from, and no panel or rule names it: a person reading the stack today sees no task count at all, and the three readings beside it are read with it"),
+    ),
+    (
+        "cogneva_task_oldest_untouched_seconds",
+        Unread::Gap("how long the oldest task an agent still owes has gone without changing state. The count by status says how much is waiting and this says how long the oldest piece has waited -- the only one of the pair that can grow while the other holds steady, which is what a stalled executor looks like. No rule or panel names it"),
+    ),
+    (
+        "cogneva_task_graph_measure_last_seconds",
+        Unread::Gap("unix seconds of the last successful read of the task graph. The rows are kept across a failed read, so this series is the only thing separating a reader that stopped from a graph that is exactly as it last appeared -- a distinction nothing on a face draws today"),
+    ),
+    (
+        "cogneva_task_graph_measure_failures_total",
+        Unread::Gap("reads of the task graph that failed. It is the counter beside the last-success second above, and like it has no reader: without one, a task face shows the last known shape indefinitely and reads as healthy while the reader is down"),
+    ),
     // A name whose fact a face already carries, looked up rather than asserted
     // in prose.
     (
@@ -231,7 +258,17 @@ const UNREGISTERED: &[(&str, Unread)] = &[
 /// been carrying -- the alternative, exempting it, would have taken a series
 /// that answers on the live scrape out of the census' reach and left the count
 /// saying eight while nine were owed.
-const GAPS_AT_SCRAPE_CENSUS: usize = 9;
+///
+/// Thirteen, and the four that took it there are the task graph's readings:
+/// the count by status, the oldest untouched age, the last successful read,
+/// and the read failures. The three arrived with the snapshot that survives a
+/// failed read, whose point is precisely the distinction none of them is drawn
+/// for; the count arrived earlier and was never drawn either. So they are
+/// gaps, not exemptions -- on this census' own reading, a series a person
+/// would expect to see is one nobody sees. One of the four has a derivable
+/// threshold in principle (the age grows while the count holds steady); none
+/// has a face. See the entries for what each is owed.
+const GAPS_AT_SCRAPE_CENSUS: usize = 13;
 
 /// How many scrape-only series are carried by a produced table and by nothing
 /// that reads them.
