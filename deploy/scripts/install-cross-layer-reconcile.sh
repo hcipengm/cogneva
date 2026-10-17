@@ -34,7 +34,9 @@ Type=oneshot
 ExecStart=${reconcile}
 # 只读，但会去问集群与 Prometheus；让它排在任何构建后面。
 Nice=10
-NoNewPrivileges=yes
+# 不能加 NoNewPrivileges=yes：读集群走的是 `sudo -n k3s kubectl`，而这个标志让
+# sudo 直接拒绝提权——装好之后每一次运行都以退出码 2 结束，看起来像「集群读不到」。
+# 这里不给的是常驻特权：脚本本身只读，sudo 仍然只到那一条 NOPASSWD 的 kubectl。
 TimeoutStartSec=300
 EOF
 
