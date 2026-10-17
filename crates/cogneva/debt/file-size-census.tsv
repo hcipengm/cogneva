@@ -106,3 +106,4 @@ crates/bootstrap/src/lib.rs	single-axis	ManagementPlan
 crates/cog-storage/src/mem/core_backends.rs	exempt	test-harness
 crates/cogneva/src/backup.rs	multi-axis	run_backup;restore
 crates/cog-observability/src/plugin.rs	single-axis	ObservabilityPlugin
+crates/cog-observability/src/usage_store.rs	single-axis	LlmUsageStore
