@@ -34,7 +34,18 @@ pub const DEFERRAL_SHAPES: &[&str] = &[
     r"归(你|您|用户)",
     r"用户(拍|定|判|决定|确认|批准)",
     r"归.*属主",
-    r"属主(拍|定|判)",
+    // Three branches rather than one alternation, because the compounds that
+    // made this match nouns differ per verb. `属主判据` and `属主判定` name the
+    // mechanism -- the owner criterion, the owner determination -- and a bare
+    // three-character alternation reads them as handing the decision over. The
+    // tree measured 183 matches for the bare form; 78 of them are those two
+    // compounds and every one of the 78 is a noun. `属主拍` takes no tail: 拍定
+    // and 拍板 are both the act, so narrowing that branch would drop the
+    // handover to keep the noun. The cost is the verb reading of 属主判定, which
+    // no pattern can separate from the noun; the tree holds no occurrence of it.
+    r"属主拍",
+    r"属主定($|[^义])",
+    r"属主判($|[^据定])",
     r"不由我拍",
     r"不要自拍",
     r"不是.*的自决项",
@@ -421,6 +432,41 @@ mod tests {
             !deferral_exempt("归属主定。"),
             "an act has to stay unexempted or the exemption eats the rule"
         );
+    }
+
+    /// Both sides of the owner shape, because a pattern that only narrows is a
+    /// pattern that may have stopped catching anything. The nouns on the left
+    /// are the wording this repository actually writes when it names the owner
+    /// check; the acts on the right are what the shape exists for.
+    #[test]
+    fn the_owner_shape_catches_handovers_and_not_the_nouns() {
+        for noun in [
+            "属主判据是 `executor_enabled` 这一个配置位",
+            "循环的属主判定改读该配置位",
+            "这条属主判定优先用显式配置",
+        ] {
+            assert_eq!(
+                first_match(noun),
+                None,
+                "a noun naming the mechanism is not a handover: {noun}"
+            );
+        }
+        for act in [
+            "归属主定。",
+            "这事由属主拍板",
+            "仍归部署属主定）",
+            "判据形状仍归属主拍板",
+            // 拍定 and 拍板 are both the act: a tail on the 拍 branch would have
+            // dropped this pair while keeping the noun it was aimed at.
+            "这条等属主拍定",
+            "属主拍板",
+        ] {
+            assert_eq!(
+                first_match(act),
+                Some("DEFERRAL_SHAPES"),
+                "an act must stay caught: {act}"
+            );
+        }
     }
 
     /// The guard the cluster actually runs: a tool call carrying a forbidden
