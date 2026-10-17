@@ -84,8 +84,12 @@ async fn two_runs_of_one_task_add_into_its_row_and_a_second_task_keeps_its_own()
     assert_eq!(row.tool_calls, 7);
     assert_eq!(row.iterations, 7);
     assert_eq!(row.duration_ms, 1200);
+    // PostgreSQL keeps timestamps to the microsecond while `Utc::now` carries
+    // nanoseconds, so the row comes back truncated. The comparison is made at
+    // the precision the column has; a stronger one would fail on every run.
     assert_eq!(
-        row.timestamp, second.timestamp,
+        row.timestamp.timestamp_micros(),
+        second.timestamp.timestamp_micros(),
         "timestamp is the one field where the latest write is the meaning"
     );
 
@@ -110,8 +114,8 @@ async fn two_runs_of_one_task_add_into_its_row_and_a_second_task_keeps_its_own()
             .get(0);
     assert_eq!(count, 1, "one task id is one row");
 
-    sqlx::query("DELETE FROM cog_observability_metrics WHERE task_id = ANY($1)")
-        .bind(vec![shared.clone(), other.clone()])
+    sqlx::query("DELETE FROM cog_observability_metrics WHERE task_id LIKE $1")
+        .bind(format!("{marker}%"))
         .execute(&pool)
         .await
         .expect("remove the probe rows");
