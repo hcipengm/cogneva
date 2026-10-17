@@ -356,9 +356,14 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
         // registry as a relation. `state = 'enforced'` is a small set (the rows a
         // look has answered), so reading it whole costs less than carrying the
         // registry into the database.
+        //
+        // `judgement` rows are in that set too, once the platform declares a gate
+        // for one: the tier stops a row being a debt when no machine names a
+        // gate, it does not stop a declaration from settling one. Leaving them
+        // out here would let a declaration that was later removed keep the row
+        // reported as enforced for good.
         let settled: Vec<(String, Option<String>)> = sqlx::query(
-            "SELECT slug, platform_gate FROM principle_ledger \
-             WHERE state = 'enforced' AND check_kind IS DISTINCT FROM 'judgement'",
+            "SELECT slug, platform_gate FROM principle_ledger WHERE state = 'enforced'",
         )
         .fetch_all(&self.pool)
         .await

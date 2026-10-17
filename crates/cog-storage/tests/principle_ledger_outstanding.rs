@@ -258,6 +258,43 @@ async fn a_gate_the_platform_gains_reopens_a_row_a_look_had_settled() {
     cleanup(&pool, &marker).await;
 }
 
+/// A declaration removed from a `judgement` row re-opens it like any other.
+///
+/// A judgement row can be settled by a platform declaration -- the tier stops a
+/// row being a debt when no machine names a gate, it does not stop a declaration
+/// from settling one. That makes it an `enforced` row, and the reconciliation
+/// has to see it: otherwise a declaration later taken out of the registry would
+/// leave the row reported as enforced for good, with no file naming it.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_declaration_removed_from_a_judgement_row_reopens_it() {
+    let _pass = PASS.lock().await;
+    let (store, pool, marker) = store().await;
+    let slug = file(&store, &marker, "held", 1, PrincipleCheckKind::Judgement).await[0].clone();
+    settle(&store, &slug, Some("crates/probe/src/the_gate.rs")).await;
+
+    let reopened = store
+        .reopen_platform_gate_drift(&std::collections::HashMap::new())
+        .await
+        .expect("reconcile the platform gate");
+    assert_eq!(
+        reopened,
+        vec![slug.clone()],
+        "the declaration this row was settled by is gone"
+    );
+
+    let row = store
+        .get(&slug)
+        .await
+        .expect("read the row")
+        .expect("the row exists");
+    assert_eq!(
+        row.state, None,
+        "the tier's answer has to be asked again, not left settled"
+    );
+    cleanup(&pool, &marker).await;
+}
+
 /// A row whose recorded gate is what the registry says is not touched: the
 /// reconciliation runs every pass, and re-opening an unchanged row would spend
 /// the pass on the same rows forever.

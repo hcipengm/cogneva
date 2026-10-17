@@ -351,17 +351,21 @@ fn is_slug(slug: &str) -> bool {
 /// is no fallback: a host column that is empty or absent is *not* a gate, and it
 /// is not the absence of one either.
 pub fn judge(row: &PrincipleRow, declarations: &Declarations) -> Verdict {
-    // A principle whose tier a person holds settles here, before either registry
-    // is asked. Asking them would report it as a debt the moment neither named a
-    // gate -- and no gate is meant to, so the debt would be permanent, and every
-    // count of ungated principles would carry it forever. The tier is the record
-    // that this is a person's to decide; nothing the registries say can change
-    // that, so the look stops here rather than reading their silence as an
-    // answer.
-    if row.check_kind == Some(cog_core::PrincipleCheckKind::Judgement) {
-        return Verdict::HumanOnly;
-    }
     let platform = declarations.gate_for(&row.slug);
+    // A principle whose tier a person holds settles here unless the platform's
+    // registry names a gate for it. The host's silence is still not a finding:
+    // the tier is the record that the host side is a person's to decide, and no
+    // missing host check is a debt. The platform's registry is a different
+    // claim -- a file that says it enforces this principle -- and refusing to
+    // read it would leave a gate the tree really has unrecorded on every pass,
+    // which is the one answer this ledger exists to give. So the declaration is
+    // read first and the tier decides the rest.
+    if row.check_kind == Some(cog_core::PrincipleCheckKind::Judgement) {
+        return match platform {
+            Some(_) => Verdict::Enforced(GateSide::Platform),
+            None => Verdict::HumanOnly,
+        };
+    }
     match row.host_gate.as_deref().map(str::trim) {
         // No value and an empty value are the same reading: the host's column
         // says nothing about this principle. Reported as its own reason rather
@@ -469,12 +473,12 @@ mod tests {
         assert_eq!(verdict.state(), Some(cog_core::PrincipleState::Unenforced));
     }
 
-    /// A `judgement` row settles on its tier, and the registries are never asked.
-    /// The row here carries exactly the reading that would otherwise be a debt --
+    /// A `judgement` row settles on its tier when no machine names a gate. The
+    /// row here carries exactly the reading that would otherwise be a debt --
     /// a `-` in the host column with nothing in the platform's -- and the tier is
     /// what keeps it from being written down as one. A person holds this
-    /// principle; no gate is meant to, so neither registry's silence is a finding
-    /// and the ungated count must not carry it forever.
+    /// principle; no host gate is meant to, so neither registry's silence is a
+    /// finding and the ungated count must not carry it forever.
     #[test]
     fn a_judgement_row_settles_on_its_tier_before_the_registries_are_asked() {
         let mut held = row("feedback_x", Some("-"));
@@ -483,6 +487,23 @@ mod tests {
         assert_eq!(verdict, Verdict::HumanOnly);
         assert_eq!(verdict.state(), None);
         assert_eq!(verdict.reason(), None);
+    }
+
+    /// The platform's registry outranks the tier, because it is the only one of
+    /// the two that can hold a machine check for a principle a person otherwise
+    /// holds. Without this, a `judgement` row's declaration would be read on
+    /// every pass and never recorded: the row is never measured, so the account
+    /// would go on saying the platform names no gate where the tree says it
+    /// does -- and a reader asking "where would this go red" gets silence about
+    /// the one file that can answer.
+    #[test]
+    fn a_judgement_row_the_platform_declares_is_enforced_by_the_platform() {
+        let mut held = row("feedback_x", Some("-"));
+        held.check_kind = Some(cog_core::PrincipleCheckKind::Judgement);
+        let declared = declarations(&[("crates/cogneva/tests/x.rs", "//! principle: feedback_x")]);
+        let verdict = judge(&held, &declared);
+        assert_eq!(verdict, Verdict::Enforced(GateSide::Platform));
+        assert_eq!(verdict.state(), Some(cog_core::PrincipleState::Enforced));
     }
 
     /// The tier is the whole reason the answer is HumanOnly: the same reading on
