@@ -5375,6 +5375,101 @@ mod tests {
             .value
     }
 
+    /// One cell of the reading face, or `None` while no pass has published.
+    ///
+    /// [`published_cell`] insists on a cell, which is right for a pass the test
+    /// drove itself; a test that starts the loop has to look before there is
+    /// anything to look at.
+    async fn readout_cell(metrics: &Arc<dyn MetricsBackend>, readout: &str) -> Option<f64> {
+        let end = Utc::now() + chrono::Duration::seconds(1);
+        let start = end - chrono::Duration::seconds(600);
+        let samples = metrics
+            .query_gauge_range(metric_names::CHANGE_DISPATCH_READOUTS.as_str(), start, end)
+            .await
+            .expect("the reading face is readable");
+        samples
+            .iter()
+            .find(|sample| sample.labels.get("readout").map(String::as_str) == Some(readout))
+            .map(|sample| sample.value)
+    }
+
+    /// The event store reaches the pass from the loop's own argument list.
+    ///
+    /// The test below starts at `dispatch_pass`, so it sees the store after the
+    /// loop has already handed it over: turning that hand-off into `None` leaves
+    /// it green while every deployment stops reading its handovers back, and the
+    /// cells it publishes are zeros -- the same number a pass that read nothing
+    /// writes. This one starts the loop and waits for the tick, so the value
+    /// that arrives at the pass is the thing under test.
+    #[tokio::test(start_paused = true)]
+    async fn the_loop_hands_the_event_store_to_the_pass_that_reads_handovers_back() {
+        let (dir, _first, _second) = two_revision_repo();
+        let rows = vec![pending_row("crates/a"), pending_row("crates/b")];
+        let ids: Vec<String> = rows
+            .iter()
+            .map(|row| dispatch_task_id(&row.identity, 0))
+            .collect();
+        let events = Arc::new(cog_storage::MemoryStateBackend::new());
+        events
+            .append_event(
+                &ids[0],
+                &handover_event(serde_json::json!([{
+                    "name": CRITERION_ARTIFACT_NAME,
+                    "content": "diff --git a/kept b/kept\n",
+                    "artifact_type": "change",
+                }])),
+            )
+            .await
+            .unwrap();
+        events
+            .append_event(&ids[1], &handover_event(serde_json::json!([])))
+            .await
+            .unwrap();
+        let store: Arc<dyn ChangeLedgerStore> = Arc::new(FakeLedger {
+            rows,
+            ..Default::default()
+        });
+        let metrics: Arc<dyn MetricsBackend> = Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let shutdown = ShutdownSignal::new();
+
+        spawn_change_ledger_loop(
+            store,
+            None,
+            Some(Arc::new(FakeGraph::default())),
+            Some(Arc::new(SilentPool)),
+            Some(Arc::clone(&metrics)),
+            shutdown.clone(),
+            CheckTree::new(dir.path().join("bare"), "main"),
+            None,
+            None,
+            Some(events),
+        );
+
+        // The first tick is one pass interval away. Paused time makes that a
+        // number of clock jumps rather than five minutes of waiting; the
+        // deadline is on the loop's own clock, so a loop that never publishes
+        // ends the test instead of hanging it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3600);
+        let value = loop {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if let Some(value) = readout_cell(&metrics, "handover_events").await {
+                break value;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the loop ran an hour without publishing a pass; the wiring below it is not \
+                 reaching the table"
+            );
+        };
+        shutdown.trigger();
+
+        // The same two numbers the driven pass reads, reached through the
+        // loop's own wiring: both handovers on record, one of them with a
+        // product.
+        assert_eq!(value, 2.0);
+        assert_eq!(readout_cell(&metrics, "handover_products").await, Some(1.0));
+    }
+
     /// The pass reads the handovers back over the same set it hands over, and
     /// the reading face carries what it found.
     ///
