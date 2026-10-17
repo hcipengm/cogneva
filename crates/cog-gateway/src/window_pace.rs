@@ -87,6 +87,12 @@ impl MeasuredWindow {
 pub struct WindowEvidence {
     /// When the upstream last answered "this cycle's limit is reached".
     pub last_quota_refusal_unix: Option<i64>,
+    /// When the upstream said its quota returns, when the refusal named it.
+    ///
+    /// This, not the refusal, is the window's end: an allowance can run out on
+    /// the first day of a seven-day window, so the refusal marks the exhaustion
+    /// and the reset marks the boundary.
+    pub quota_reset_unix: Option<i64>,
     /// When the upstream last served a call. Recorded here so the rule below
     /// can be stated against it: this instant is **not** a window boundary.
     pub last_ok_unix: Option<i64>,
@@ -98,9 +104,10 @@ pub struct WindowEvidence {
 
 /// The measurement that may pace this upstream, if any.
 ///
-/// A window's boundary may only come from a refusal that says the cycle is
-/// spent: that instant is where the cycle ended, and the tokens before it are
-/// what the cycle allowed. The newest successful call is not a boundary — it
+/// A window's boundary may only come from a refusal that says the allowance is
+/// spent, and when that refusal names the reset instant, the boundary is the
+/// reset: the tokens before the reset are what the window allowed. The newest
+/// successful call is not a boundary — it
 /// marks where serving stopped, which is equally true of an upstream that was
 /// throttled and of one nobody called. Reading it as a boundary invents a
 /// window: measured on 2026-10-17, a window whose last success was six days old
@@ -115,20 +122,27 @@ pub fn measured_window(
     evidence: WindowEvidence,
     latched: Option<MeasuredWindow>,
 ) -> Option<MeasuredWindow> {
-    match evidence.last_quota_refusal_unix {
-        Some(wall) => {
-            let fresh = MeasuredWindow {
-                capacity_tokens: evidence.burned_window_tokens,
-                window_secs: evidence.window_secs,
-                burned_at_unix: wall,
-            };
-            if fresh.is_usable() {
-                Some(fresh)
-            } else {
-                latched
-            }
-        }
-        None => latched,
+    let Some(wall) = evidence.last_quota_refusal_unix else {
+        return latched;
+    };
+    // The refusal says the allowance ran out; it does not say the window ended
+    // there. When the upstream also names the reset instant, that instant is
+    // the boundary and the refusal is only where spending stopped. A reset
+    // outside `(wall, wall + window)` cannot belong to this refusal — it is a
+    // leftover from another window or a parse accident — so it is not used.
+    let end = match evidence.quota_reset_unix {
+        Some(reset) if reset > wall && (reset - wall) < evidence.window_secs as i64 => reset,
+        _ => wall,
+    };
+    let fresh = MeasuredWindow {
+        capacity_tokens: evidence.burned_window_tokens,
+        window_secs: evidence.window_secs,
+        burned_at_unix: end,
+    };
+    if fresh.is_usable() {
+        Some(fresh)
+    } else {
+        latched
     }
 }
 
@@ -251,12 +265,57 @@ mod tests {
         let evidence = WindowEvidence {
             last_quota_refusal_unix: Some(2_000_000),
             last_ok_unix: Some(1_999_000),
+            quota_reset_unix: None,
             burned_window_tokens: 30_000_000,
             window_secs: (30 * DAY) as u64,
         };
         let measured = measured_window(evidence, None).expect("a refusal is a measurement");
         assert_eq!(measured.burned_at_unix, 2_000_000);
         assert_eq!(measured.capacity_tokens, 30_000_000);
+    }
+
+    #[test]
+    fn the_named_reset_is_the_boundary_the_refusal_is_not() {
+        // 2026-10-17 live shape: an upstream exhausted its seven-day allowance
+        // days before the cycle ended. Anchoring the window at the refusal
+        // would report most of the next window already elapsed the moment the
+        // quota returned -- an allowance nobody measured.
+        let evidence = WindowEvidence {
+            last_quota_refusal_unix: Some(2_000_000),
+            last_ok_unix: Some(1_999_000),
+            quota_reset_unix: Some(2_000_000 + 3 * DAY),
+            burned_window_tokens: 30_000_000,
+            window_secs: (30 * DAY) as u64,
+        };
+        let measured = measured_window(evidence, None).expect("a refusal is a measurement");
+        assert_eq!(
+            measured.burned_at_unix,
+            2_000_000 + 3 * DAY,
+            "the window ends where the upstream said it does"
+        );
+        // At the reset the next window starts with nothing spent, not with the
+        // three days between exhaustion and reset already banked.
+        assert_eq!(measured.allowance_at(2_000_000 + 3 * DAY), 0);
+        assert_eq!(
+            measured.allowance_at(2_000_000 + 3 * DAY + 15 * DAY),
+            15_000_000
+        );
+    }
+
+    #[test]
+    fn a_reset_that_cannot_belong_to_this_refusal_is_not_used() {
+        let base = WindowEvidence {
+            last_quota_refusal_unix: Some(2_000_000),
+            last_ok_unix: None,
+            quota_reset_unix: Some(2_000_000 + 40 * DAY),
+            burned_window_tokens: 30_000_000,
+            window_secs: (30 * DAY) as u64,
+        };
+        let measured = measured_window(base, None).expect("a refusal is a measurement");
+        assert_eq!(
+            measured.burned_at_unix, 2_000_000,
+            "a reset beyond the window it claims to end is left over from another one"
+        );
     }
 
     #[test]
@@ -268,6 +327,7 @@ mod tests {
         let evidence = WindowEvidence {
             last_quota_refusal_unix: None,
             last_ok_unix: Some(1_000_000),
+            quota_reset_unix: None,
             burned_window_tokens: 30_000_000,
             window_secs: (30 * DAY) as u64,
         };
@@ -280,6 +340,7 @@ mod tests {
         let no_refusal = WindowEvidence {
             last_quota_refusal_unix: None,
             last_ok_unix: None,
+            quota_reset_unix: None,
             burned_window_tokens: 0,
             window_secs: (30 * DAY) as u64,
         };

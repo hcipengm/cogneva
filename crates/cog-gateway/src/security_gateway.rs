@@ -3374,7 +3374,14 @@ async fn refresh_window_pace(
         let Some(window_secs) = reading.quota_window_secs.filter(|w| *w > 0) else {
             continue;
         };
-        let Some(measured) = measure_window(state, store.as_ref(), &reading.key, window_secs).await
+        let Some(measured) = measure_window(
+            state,
+            store.as_ref(),
+            &reading.key,
+            window_secs,
+            reading.quota_reset_unix,
+        )
+        .await
         else {
             continue;
         };
@@ -3407,14 +3414,17 @@ async fn refresh_window_pace(
 
 /// 一个上游的容量读数，优先用账上那一行撞墙记录，其次用本进程暂存的那一份。
 ///
-/// 撞墙记录是**正本**：它把窗口的终点直接写在行上（`ts`），容量就是对它前一个
-/// 窗口求和。暂存那份只在没有撞墙记录时出场：它是同一个上游**上一次量到的墙**，
-/// 让读失败的那一拍沿用上次的读数，而不是掉回"不知道"。两样都没有就不配速。
+/// 撞墙记录是**正本**：它把"这一窗已经用尽"写在行上，容量就是对它前一个窗口
+/// 求和；窗口的**终点**取上游自报的恢复时刻（`quota_reset_unix`），拿不到时才
+/// 退回撞墙那一刻——配额可以在七天的第一天就用完，撞墙只说明花光了，不说明
+/// 周期到头了。暂存那份只在没有撞墙记录时出场：它是同一个上游**上一次量到的
+/// 墙**，让读失败的那一拍沿用上次的读数，而不是掉回"不知道"。两样都没有就不配速。
 async fn measure_window(
     state: &AppState,
     store: &cog_observability::usage_store::LlmUsageStore,
     key: &str,
     window_secs: u64,
+    quota_reset_unix: Option<i64>,
 ) -> Option<crate::window_pace::MeasuredWindow> {
     let latched = state.measured_windows.lock().unwrap().get(key).copied();
     let reading = match store.upstream_window(key, window_secs).await {
@@ -3432,6 +3442,7 @@ async fn measure_window(
         crate::window_pace::WindowEvidence {
             last_quota_refusal_unix: reading.last_quota_refusal_unix,
             last_ok_unix: reading.last_ok_unix,
+            quota_reset_unix,
             burned_window_tokens: reading.burned_window_tokens,
             window_secs,
         },
