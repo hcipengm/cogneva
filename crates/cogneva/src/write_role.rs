@@ -31,6 +31,14 @@
 //! the pool carries the work renews nothing, so a writer that stops asking gives
 //! the role back inside one term. That is the handover: nobody has to be
 //! notified, and a notification that got lost cannot leave the role held.
+//!
+//! The cause also says **until when** the takeover is owed, and that half has
+//! its own expiry. "Top up until the stated reset" is a plan anchored to an
+//! instant; once that instant is in the past and the pool still says
+//! unavailable, the evidence behind the wait has run out. The plan then refuses
+//! to name a wait (`the_stated_reset_has_passed`) instead of repeating the same
+//! sentence forever — an open-ended top-up reading as a scheduled one is how a
+//! temporary takeover becomes a permanent unattributed writer.
 
 use cog_core::owner_lease::{ASK_PERIOD, TERM};
 use cog_core::OwnerLeaseBroker;
@@ -386,15 +394,83 @@ fn causes(status: &LlmPoolStatus) -> Vec<String> {
     out
 }
 
+const TOP_UP_UNTIL_THE_STATED_RESET: &str = "top_up_until_the_stated_reset";
+const CARRY_THE_WHOLE_STRETCH: &str = "carry_the_whole_stretch";
+const STATED_RESET_HAS_PASSED: &str = "the_stated_reset_has_passed";
+const UNKNOWN_PLAN: &str = "unknown";
+
+/// The instant the evidence names for the pool coming back, or 0 when it names
+/// none.
+///
+/// The pool-level field is the aggregate the gateway publishes; the per-entry
+/// resets are the fallback for a payload that carries only the entries. A
+/// window is a length, not an instant: without the window's start it cannot
+/// become a moment, and inventing that start would turn "some day" into a
+/// deadline nobody stated.
+fn stated_reset_unix(status: &LlmPoolStatus) -> i64 {
+    if status.evidenced_recovery_unix > 0 {
+        return status.evidenced_recovery_unix;
+    }
+    let (rows, _) = suspect_evidence(status);
+    rows.iter()
+        .filter(|entry| !entry.refusal_kind.trim().is_empty())
+        .map(|entry| entry.quota_reset_unix)
+        .filter(|reset| *reset > 0)
+        .max()
+        .unwrap_or(0)
+}
+
 /// How far this round can be planned from the cause. This is what the cause
 /// decides — not whether the role moves, but how the writer that takes it
-/// spends the stretch.
-fn plan(status: &LlmPoolStatus) -> &'static str {
+/// spends the stretch, and until when.
+///
+/// `now_unix` is what makes the plan expire: a stated reset that has already
+/// passed while the pool still reports itself unavailable is not a reset this
+/// writer may keep waiting for. The takeover is then carried without the
+/// evidence that justified it, and the report says so rather than naming the
+/// same wait a second time.
+fn plan(status: &LlmPoolStatus, now_unix: i64) -> &'static str {
     match repair_reading(status) {
-        WAITING_IS_THE_REPAIR => "top_up_until_the_stated_reset",
-        WAITING_CANNOT_REPAIR => "carry_the_whole_stretch",
-        _ => "unknown",
+        WAITING_IS_THE_REPAIR => {
+            let reset = stated_reset_unix(status);
+            if reset == 0 {
+                // Waiting is still the repair, but no instant was stated (a
+                // window without a start). Naming a reset here would put a
+                // deadline on evidence that has none.
+                UNKNOWN_PLAN
+            } else if reset <= now_unix {
+                STATED_RESET_HAS_PASSED
+            } else {
+                TOP_UP_UNTIL_THE_STATED_RESET
+            }
+        }
+        WAITING_CANNOT_REPAIR => CARRY_THE_WHOLE_STRETCH,
+        _ => UNKNOWN_PLAN,
     }
+}
+
+/// Whether the instant the plan would wait for is already behind this reader,
+/// in three states: `unknown` when no instant was stated, so "not passed" and
+/// "nothing to pass" stay apart.
+fn plan_until_passed(status: &LlmPoolStatus, now_unix: i64) -> &'static str {
+    let reset = stated_reset_unix(status);
+    if reset == 0 {
+        "unknown"
+    } else if reset <= now_unix {
+        "true"
+    } else {
+        "false"
+    }
+}
+
+/// Wall-clock seconds. The pool snapshot's instants are absolute unix times the
+/// gateway wrote, so the comparison is between two readings of the same epoch —
+/// no database round trip is needed to ask whether a moment has passed.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -462,7 +538,7 @@ fn lease_lines(lease: &Lease) -> Vec<String> {
     }
 }
 
-fn pool_lines(pool: &Pool) -> Vec<String> {
+fn pool_lines(pool: &Pool, now_unix: i64) -> Vec<String> {
     let mut lines = Vec::new();
     match pool {
         Pool::Unreadable(detail) => {
@@ -507,7 +583,16 @@ fn pool_lines(pool: &Pool) -> Vec<String> {
             lines.push(format!("pool_repair={}", repair_reading(status)));
             lines.push(format!("pool_cause_scope={}", suspect_evidence(status).1));
             lines.push(format!("pool_causes={}", causes(status).join(",")));
-            lines.push(format!("plan={}", plan(status)));
+            lines.push(format!("plan={}", plan(status, now_unix)));
+            // The instant the plan is anchored to, and whether it is already
+            // behind this reader. Both are printed even when there is nothing
+            // to wait for: `0`/`unknown` is "no instant was stated", which a
+            // reader must be able to tell from "the instant has not arrived".
+            lines.push(format!("plan_until_unix={}", stated_reset_unix(status)));
+            lines.push(format!(
+                "plan_until_passed={}",
+                plan_until_passed(status, now_unix)
+            ));
         }
     }
     lines
@@ -525,6 +610,7 @@ pub fn report(
     lease: &Lease,
     pool: &Pool,
     verdict: Option<(&str, i32)>,
+    now_unix: i64,
 ) -> String {
     let mut lines = vec![
         format!("role={}", ask.role),
@@ -537,7 +623,7 @@ pub fn report(
         format!("redis_url_source={}", ends.redis_source),
     ];
     lines.extend(lease_lines(lease));
-    lines.extend(pool_lines(pool));
+    lines.extend(pool_lines(pool, now_unix));
     if let Some((verdict, code)) = verdict {
         lines.push(format!("verdict={verdict}"));
         lines.push(format!("exit_code={code}"));
@@ -547,8 +633,16 @@ pub fn report(
 
 /// The no-verdict cases, whose reason is named rather than turned into a
 /// verdict-shaped line.
-fn no_verdict(ask: &Ask, ends: &Ends, lease: &Lease, pool: &Pool, why: &str, code: i32) -> i32 {
-    print!("{}", report(ask, ends, lease, pool, None));
+fn no_verdict(
+    ask: &Ask,
+    ends: &Ends,
+    lease: &Lease,
+    pool: &Pool,
+    why: &str,
+    code: i32,
+    now_unix: i64,
+) -> i32 {
+    print!("{}", report(ask, ends, lease, pool, None, now_unix));
     println!("no_verdict={why}");
     println!("exit_code={code}");
     code
@@ -574,6 +668,10 @@ pub async fn run() -> i32 {
         }
     };
 
+    // One instant for the whole report: the plan's expiry is judged against the
+    // round it is printed in, not against whatever clock each line happens to
+    // read.
+    let now = now_unix();
     let pool = read_pool(&ends.redis_url).await;
 
     // The arbiter's own reach is a reading like the other two: failing to open
@@ -598,6 +696,7 @@ pub async fn run() -> i32 {
                 &pool,
                 "the_arbiter_answered_nothing",
                 EXIT_ARBITER_SILENT,
+                now,
             );
         }
     };
@@ -618,6 +717,7 @@ pub async fn run() -> i32 {
                 &pool,
                 "the_pool_could_not_be_read",
                 EXIT_POOL_SILENT,
+                now,
             )
         }
         Step::Ask => match ask_the_arbiter(&broker, &ask).await {
@@ -639,13 +739,14 @@ pub async fn run() -> i32 {
                     &pool,
                     "the_arbiter_answered_nothing",
                     EXIT_ARBITER_SILENT,
+                    now,
                 );
             }
         },
     };
     print!(
         "{}",
-        report(&ask, &ends, &lease, &pool, Some((verdict, code)))
+        report(&ask, &ends, &lease, &pool, Some((verdict, code)), now)
     );
     code
 }
@@ -755,7 +856,7 @@ mod tests {
             })
         );
         // The report says which of the two nothing-states this is.
-        let text = report(&ask("out-of-band-70"), &ends(), &free(), &pool, None);
+        let text = report(&ask("out-of-band-70"), &ends(), &free(), &pool, None, 0);
         assert!(text.contains("pool_status=unreadable"), "{text}");
         assert!(text.contains("pool_error=no route to the store"), "{text}");
     }
@@ -774,7 +875,7 @@ mod tests {
     #[test]
     fn an_unreadable_lease_is_printed_as_its_own_state() {
         let lease = Lease::Unreadable("no route to the arbiter".into());
-        let text = report(&ask("out-of-band-70"), &ends(), &lease, &up_pool(), None);
+        let text = report(&ask("out-of-band-70"), &ends(), &lease, &up_pool(), None, 0);
         assert!(text.contains("lease_reading=unreadable"), "{text}");
         assert!(
             text.contains("lease_error=no route to the arbiter"),
@@ -802,14 +903,14 @@ mod tests {
             ..Default::default()
         }];
         assert_eq!(repair_reading(&clocked), WAITING_IS_THE_REPAIR);
-        assert_eq!(plan(&clocked), "top_up_until_the_stated_reset");
+        assert_eq!(plan(&clocked, 0), TOP_UP_UNTIL_THE_STATED_RESET);
 
         // The same entry with no clock of its own: waiting is not the repair,
         // and the name it carries does not move the answer.
         let mut clockless = clocked.clone();
         clockless.upstream_evidence[0].quota_reset_unix = 0;
         assert_eq!(repair_reading(&clockless), WAITING_CANNOT_REPAIR);
-        assert_eq!(plan(&clockless), "carry_the_whole_stretch");
+        assert_eq!(plan(&clockless, 0), CARRY_THE_WHOLE_STRETCH);
 
         // Mixed: some of the pool comes back on its own and some does not.
         let mut mixed = clockless.clone();
@@ -821,7 +922,7 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(repair_reading(&mixed), WAITING_IS_NOT_THE_WHOLE_REPAIR);
-        assert_eq!(plan(&mixed), "unknown");
+        assert_eq!(plan(&mixed, 0), UNKNOWN_PLAN);
     }
 
     /// The pool level and the per-upstream entries have to agree, or the
@@ -842,6 +943,62 @@ mod tests {
             ..Default::default()
         }];
         assert_eq!(repair_reading(&status), UNKNOWN_REPAIR);
+    }
+
+    /// The plan is anchored to an instant, and it expires. Once the stated
+    /// reset is behind this reader while the pool still reports itself
+    /// unusable, repeating "top up until the stated reset" would describe a
+    /// scheduled wait that no longer has a schedule. The two readings below
+    /// differ only in `now`, so "not yet" and "already past" cannot both stay
+    /// green under one implementation.
+    #[test]
+    fn a_stated_reset_that_has_passed_stops_being_a_plan() {
+        let mut status = LlmPoolStatus {
+            unavailable: true,
+            pool_size: 1,
+            unavailable_upstreams: vec!["a|m".into()],
+            ..Default::default()
+        };
+        status.upstream_evidence = vec![LlmUpstreamEvidence {
+            identity: "a|m".into(),
+            quota_reset_unix: 1_000_000,
+            refusal_kind: "quota_cycle".into(),
+            ..Default::default()
+        }];
+
+        // One second before the stated instant: still a scheduled wait.
+        assert_eq!(plan(&status, 999_999), TOP_UP_UNTIL_THE_STATED_RESET);
+        assert_eq!(plan_until_passed(&status, 999_999), "false");
+        // At and after the instant: the wait it named is over.
+        assert_eq!(plan(&status, 1_000_000), STATED_RESET_HAS_PASSED);
+        assert_eq!(plan_until_passed(&status, 1_000_000), "true");
+        assert_eq!(stated_reset_unix(&status), 1_000_000);
+
+        let text = report(
+            &ask("out-of-band-70"),
+            &ends(),
+            &free(),
+            &Pool::Snapshot(Box::new(status.clone())),
+            None,
+            1_000_000,
+        );
+        assert!(
+            text.contains(&format!("plan={STATED_RESET_HAS_PASSED}")),
+            "{text}"
+        );
+        assert!(text.contains("plan_until_unix=1000000"), "{text}");
+        assert!(text.contains("plan_until_passed=true"), "{text}");
+
+        // A window is a length, not an instant: with no start it cannot become
+        // a deadline, and the plan refuses to name one rather than inventing a
+        // start the gateway never stated.
+        let mut window_only = status;
+        window_only.upstream_evidence[0].quota_reset_unix = 0;
+        window_only.upstream_evidence[0].quota_window_secs = 604_800;
+        assert_eq!(repair_reading(&window_only), WAITING_IS_THE_REPAIR);
+        assert_eq!(stated_reset_unix(&window_only), 0);
+        assert_eq!(plan(&window_only, 0), UNKNOWN_PLAN);
+        assert_eq!(plan_until_passed(&window_only, 0), "unknown");
     }
 
     /// The cause is read off the upstreams that are unusable now, not off every
@@ -927,7 +1084,7 @@ mod tests {
         assert_eq!(resolved.database_url, named.database_url.clone().unwrap());
         assert_eq!(resolved.redis_url, named.redis_url.clone().unwrap());
 
-        let text = report(&named, &resolved, &free(), &up_pool(), None);
+        let text = report(&named, &resolved, &free(), &up_pool(), None, 0);
         assert!(
             text.contains(&format!("database_url_source={DATABASE_URL_FLAG}")),
             "{text}"
@@ -943,7 +1100,14 @@ mod tests {
 
         // The default surfaces are the ones the application reads, and they are
         // printed under their own names.
-        let defaults = report(&ask("out-of-band-70"), &ends(), &free(), &up_pool(), None);
+        let defaults = report(
+            &ask("out-of-band-70"),
+            &ends(),
+            &free(),
+            &up_pool(),
+            None,
+            0,
+        );
         assert!(
             defaults.contains(&format!("database_url_source={DATABASE_URL_ENV}")),
             "{defaults}"
@@ -988,6 +1152,7 @@ mod tests {
             &held_by("out-of-band-70", 240),
             &down_pool(),
             Some(("holds_the_role_renewed", EXIT_HOLDS_THE_ROLE)),
+            0,
         );
         assert!(text.contains("verdict=holds_the_role_renewed"), "{text}");
         assert!(text.contains("lease_holder=out-of-band-70"), "{text}");
@@ -1014,6 +1179,7 @@ mod tests {
             &free(),
             &Pool::AbsolutelyNothing,
             None,
+            0,
         );
         assert!(!silent.contains("verdict="), "{silent}");
     }
@@ -1042,6 +1208,7 @@ mod tests {
             &free(),
             &Pool::Snapshot(Box::new(status)),
             None,
+            0,
         );
         assert!(text.contains("pool_below_declared_floor=true"), "{text}");
         // One upstream of four serves and the floor is two, yet the snapshot's
@@ -1066,6 +1233,7 @@ mod tests {
             &free(),
             &Pool::Snapshot(Box::new(status)),
             None,
+            0,
         );
         assert!(text.contains("pool_below_declared_floor=unknown"), "{text}");
         assert!(!text.contains("pool_below_declared_floor=false"), "{text}");
