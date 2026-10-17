@@ -40,9 +40,10 @@ data:
   COGNEVA_SELF_EVOLUTION_WORKSPACES_EPHEMERAL_TTL_SECS: "21600"
   COGNEVA_SELF_EVOLUTION_WORKSPACES_ORPHAN_BRANCH_TTL_SECS: "2592000"
   COGNEVA_SELF_EVOLUTION_WORKSPACES_CACHE_SCAN_INTERVAL_SECS: "300"
-  # 共享构建缓存上限（表观字节）；"0" = 只量不封顶。取值 = 实测峰值（约 66 GiB）
-  # ＋余量，盖过工作集即可；压在工作集之下会每轮回收、把增量缓存废掉。设了上限才会回收。
-  COGNEVA_SELF_EVOLUTION_WORKSPACES_TARGET_MAX_BYTES: "85899345920"
+  # 共享构建缓存上限；"auto" = 由 pre-reclaim 工作集峰值导出（7 天峰 × 1.2，
+  # 夹在卷空闲之下），"0" = 只量不封顶，正整数 = 钉死。上限压在峰下会每轮回收、
+  # 把增量缓存废掉；写死的数只在写下那天盖得住工作集，导出值每次走查重算。
+  COGNEVA_SELF_EVOLUTION_WORKSPACES_TARGET_MAX_BYTES: "auto"
   # 晋级门（推送端）：沙盒验证全过的变更（change） 经分级策略判定后，L0/L1 自动
   # 晋级走 GitOps 发布（annotated tag + evolution-release 分支推到中央
   # 仓库），L2 留审批台。中央仓库即本 Pod 挂载的宿主 bare 仓库 /host-git

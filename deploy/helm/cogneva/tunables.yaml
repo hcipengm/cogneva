@@ -1,0 +1,920 @@
+# The tunable registry: one row per numeric leaf `values.yaml` carries.
+#
+# A number a deployment ships is one of three things, and the page shows all
+# three as the same number:
+#
+#   derived   a measurement sets it, so it moves when the input it reads moves.
+#             The row says which input, which reading the number lands on, and
+#             which test shows the value following its input.
+#   override  the deployment names it. It stays where it was pinned, and the row
+#             says why no loop closes over it yet -- that sentence is the debt.
+#   fixed     it is not a dial: a protocol port, an interface bound, a practice.
+#             No measurement should move it, and the row says which agreement.
+#
+# What the gate checks, and why it is shaped this way:
+#
+#   - every numeric leaf of the chart has exactly one row, and every row names a
+#     numeric leaf. This is the whole point: a key nobody has looked at must be a
+#     missing row, not an absence nobody notices. The set is read from the chart
+#     on every run, so a value that is added to `values.yaml` without a row goes
+#     red, and a row whose key left the chart goes red too.
+#   - every row says something. For `override`/`fixed` that is the reason it is
+#     not derived; for `derived` it is what the value reads.
+#   - a `derived` row has to name a reading and a test that moves its input. A
+#     comment claiming a number tracks the world is not evidence that it does;
+#     the test is the only part of the claim a machine can refuse.
+#   - a row that lands on a reading has to use a word the reading can carry
+#     (`derived`/`override`), and the file it names has to publish that metric
+#     and that label.
+#
+# The three words are not a maturity ladder. `fixed` is a complete answer for a
+# protocol constant; `override` is the honest answer for a cap whose loop has not
+# been built. What is not allowed is a value that is one of these and a row that
+# says none.
+version: 1
+rows:
+
+  # --- notification / alerting ------------------------------------------------
+  - key: alertmanager.email.smtpPort
+    source: fixed
+    why: >-
+      587 is the SMTP submission port with STARTTLS. The number belongs to the
+      protocol; a relay listening elsewhere is an operator's --set, not a
+      measurement for a loop to track.
+
+  # --- application data -------------------------------------------------------
+  - key: appData.storage
+    source: override
+    why: >-
+      A full day of trace writing measured about 19 GiB on this host, so 24Gi.
+      The application already publishes the used bytes as
+      cogneva_data_volume_used_bytes and a rule compares them against this
+      declaration; nothing writes that comparison back into the number, so a
+      declaration that fell behind the writing stays behind until a human reads
+      the alert.
+
+  # --- optional backends ------------------------------------------------------
+  - key: backends.meilisearch.storage
+    source: override
+    why: >-
+      The search index volume. A derived value would read the index's used bytes
+      against the volume's free space; the volume usage is alerted on, not fed
+      back into the declaration.
+
+  - key: backends.nats.storage
+    source: override
+    why: >-
+      JetStream stream storage. It is bounded by the stream's retention, so a
+      derived value would read that retention against the message rate; nothing
+      computes it.
+
+  - key: backends.postgres.storage
+    source: override
+    why: >-
+      The database volume, sized for the tables the platform owns plus WAL. A
+      derived value would follow the measured growth of pg_database_size; no loop
+      reads it back.
+
+  - key: backends.qdrant.storage
+    source: override
+    why: >-
+      The vector store volume. Its size tracks the number of indexed chunks, which
+      the application already knows; the declaration does not read that number.
+
+  - key: backends.redis.storage
+    source: override
+    why: >-
+      The persistence volume. An AOF rewrite can briefly need almost twice the
+      dataset on disk, which is why the declaration is not the dataset size. A
+      derived value would read the rewritten file size; nothing does.
+
+  - key: backends.seaweedfs.storage
+    source: override
+    why: >-
+      Write-once object storage for the permanent-memory raw and cold layers;
+      15 GiB was already in use when this was set, so 20Gi. The volume only grows,
+      and a cap that followed its growth has no loop.
+
+  # --- backup ----------------------------------------------------------------
+  - key: backup.keepCount
+    source: override
+    why: >-
+      Seven daily packages. A derived count would follow the measured size of one
+      package against the volume; the volume usage is alerted on, not read back.
+
+  - key: backup.runDeadlineSeconds
+    source: override
+    why: >-
+      One hour against runs the ledger measures in tens of seconds. The flow
+      already records started_at/finished_at per run, so a derived deadline could
+      be a multiple of the observed run time; nothing computes it.
+
+  - key: backup.storage
+    source: override
+    why: >-
+      The backup volume. Keep count times package size is the flow, and the
+      package size is measured per run; the declaration does not read it.
+
+  # --- node image builds ------------------------------------------------------
+  - key: buildah.resources.requests.cpu
+    source: override
+    why: >-
+      The daemon idles near 1Mi and is only busy during a build, so the request is
+      the resident draw. A derived pair would read this container's measured peak;
+      the resource face of a buildah DaemonSet is not published today.
+
+  - key: buildah.resources.requests.memory
+    source: override
+    why: >-
+      Sized for the idle daemon so a small node is not blocked by a permanent
+      half-gigabyte claim. The build burst is carried by the limit.
+
+  - key: buildah.resources.limits.cpu
+    source: override
+    why: >-
+      A burst bound, not a steady rate: the daemon is idle except while a build
+      runs, and no reading of that burst is fed back into the limit.
+
+  - key: buildah.resources.limits.memory
+    source: override
+    why: >-
+      Room for one image build; the node's actual headroom carries the rest. The
+      measured peak of a build is the input a derived limit would read, and the
+      build gate measures something adjacent (concurrent builds), not this.
+
+  # --- in-cluster registry ----------------------------------------------------
+  - key: clusterRegistry.nodePort
+    source: fixed
+    why: >-
+      The node port kubelets pull from (localhost:30500, http because containerd
+      treats localhost as plain). It is written into image.repository, so it is an
+      address, not a dial.
+
+  - key: clusterRegistry.resources.requests.cpu
+    source: override
+    why: >-
+      The registry is a third-party process that publishes no metrics of its own;
+      the request is a small floor. A derived pair would read the container's
+      measured working set, which nothing collects for this pod.
+
+  - key: clusterRegistry.resources.requests.memory
+    source: override
+    why: >-
+      A floor for an idle registry. The volume it serves is measured by the walker
+      sidecar, not this process's memory.
+
+  - key: clusterRegistry.resources.limits.cpu
+    source: override
+    why: >-
+      Burst room for a push. No reading of the registry's own CPU is available to
+      derive it from.
+
+  - key: clusterRegistry.resources.limits.memory
+    source: override
+    why: >-
+      Burst room for a push. The push rate and payload size are not measured back
+      into this bound.
+
+  - key: clusterRegistry.storage
+    source: override
+    why: >-
+      Canary overlays accumulate per revision; 7.4Gi was measured on disk when
+      this was set, so 10Gi. The disk usage is measured by the walker sidecar and
+      drives the retention loop, but the loop prunes revisions; it does not resize
+      the claim.
+
+  - key: clusterRegistry.walkerPort
+    source: fixed
+    why: >-
+      The walker sidecar's scrape port, referenced by the Service endpoint that
+      monitoring discovers. An address, not a dial.
+
+  - key: clusterRegistry.walkerResources.requests.cpu
+    source: override
+    why: >-
+      The walk is readdir+stat and does not eat CPU. A derived pair would read the
+      walk's own duration against the scan interval; nothing publishes that for
+      this sidecar.
+
+  - key: clusterRegistry.walkerResources.requests.memory
+    source: override
+    why: >-
+      Sized by the directory tree it walks; the store is far smaller than the
+      declaration. The tree size is a measurement the walk already takes, and it
+      is not read back into the request.
+
+  - key: clusterRegistry.walkerResources.limits.cpu
+    source: override
+    why: >-
+      A ceiling for a metadata walk. No reading of the sidecar's CPU is collected.
+
+  - key: clusterRegistry.walkerResources.limits.memory
+    source: override
+    why: >-
+      Room for one full walk of the store. The walk's peak is not published.
+
+  # --- evolution worker -------------------------------------------------------
+  - key: evolution.buildGate.maxConcurrent
+    source: derived
+    why: >-
+      The zero sentinel means "derive it": the gate takes the tightest of the
+      host's CPU, memory, IO-stall and build-cgroup-memory dimensions and labels
+      the published ceiling with the dimension that decided it. A positive value
+      is the override branch, and that branch is published as
+      dimension="override" so a pinned number and a measured one never read the
+      same.
+    published:
+      # The file that builds the value and the file that publishes the reading are
+      # the same one here: the gate derives the ceiling and reports it.
+      owner: crates/cog-core/src/build_gate.rs
+      file: crates/cog-core/src/build_gate.rs
+      metric: BUILD_GATE_CEILING
+      label: dimension
+    proof:
+      file: crates/cog-core/src/build_gate.rs
+      test: the_ceiling_is_the_tightest_dimension
+
+  - key: evolution.buildGate.waitSecs
+    source: override
+    why: >-
+      How long one build waits for a slot. A derived wait would follow the
+      measured time a slot is held, which the gate could record on release; it
+      does not record hold times yet.
+
+  - key: evolution.dataStorage
+    source: override
+    why: >-
+      The evolution process's own /var/lib/cogneva-data, a different writer from
+      the main application at the same path, so a separate claim. 49Gi measured,
+      almost all raw-logs, so 64Gi. raw-logs are only layered down, never deleted,
+      and nothing feeds the measured use back.
+
+  - key: evolution.gitRemote.storage
+    source: override
+    why: >-
+      The bare git mirror. Its size is a function of the repository's history,
+      which the mirror itself could measure; the declaration does not read it.
+
+  - key: evolution.resources.requests.cpu
+    source: override
+    why: >-
+      A scheduling claim for a workload whose real draw is a build burst. The
+      container's cgroup is read by the build gate's cgroup_memory dimension, but
+      that dimension reads the memory limit, not this request.
+
+  - key: evolution.resources.requests.memory
+    source: override
+    why: >-
+      A scheduling claim, separate from the limit the build gate reads. The
+      measured working set would be the derived input; it is not published for
+      this container.
+
+  - key: evolution.resources.limits.cpu
+    source: override
+    why: >-
+      Sized so the container can run its build with the rest of the workload.
+      CFS throttling is visible in the cluster's own readings, and nothing closes
+      that reading back into the limit.
+
+  - key: evolution.resources.limits.memory
+    source: override
+    why: >-
+      Read by the build gate's cgroup_memory dimension: the gate asks how many
+      concurrent builds this cgroup can hold, so the number has a consumer, but
+      the number itself is still named here. Raising it requires raising the
+      LimitRange's per-container maximum in the same change, or the Pod is
+      refused at admission.
+
+  - key: evolution.sandboxStorage
+    source: override
+    why: >-
+      The sandbox working area for evolution tasks. A derived value would read the
+      live working-set size against the volume's free space; the cache walk
+      publishes sizes per layer, and nothing turns them into this claim.
+
+  - key: evolution.sourceStorage
+    source: override
+    why: >-
+      Holds the shared CARGO_TARGET_DIR, measured at 57Gi and growing with every
+      build. This is the one claim whose shortfall stops builds outright (an
+      evicted cache means a full rebuild), and the cache walk already measures its
+      size; the claim does not follow it.
+
+  - key: evolution.workspaces.cacheScanIntervalSecs
+    source: override
+    why: >-
+      How often the shared cache's size is re-read. A derived interval would
+      follow the cost of one walk and the write rate between walks; neither is
+      measured back into it. The process has a floor, and a smaller value means
+      the floor.
+
+  - key: evolution.workspaces.ephemeralTtlSecs
+    source: override
+    why: >-
+      How long an ephemeral worktree may live. It has to outlast one evolution
+      round, and a PID cannot tell whether a task is still alive. A derived TTL
+      would follow the measured round duration; nothing reads it back.
+
+  - key: evolution.workspaces.orphanBranchTtlSecs
+    source: override
+    why: >-
+      How long an `evol/<old-id>` branch may go untouched before reclamation.
+      A live instance's branch is force-pushed every transplant, so a long idle
+      period means the instance is gone; the TTL is that judgement written as a
+      number rather than a measurement.
+
+  - key: evolution.workspaces.targetMaxBytes
+    source: derived
+    why: >-
+      The sentinel `auto` rather than a number: the cap is the pre-reclaim
+      working set's peak over the last week with 20% headroom, held under the
+      free space of the volume the directory sits on, and recomputed from every
+      walk. A number here is the same measurement taken once by hand, and it
+      stops being true the first time the cache outgrows it -- the growth the
+      cap exists to catch, and the one a pinned value cannot notice. `0` still
+      means measure without bounding, and a positive number still overrides.
+    published:
+      # The chart field reaches this number through the evolution plugin; the
+      # reading itself is built by the shared cache-readings module, which is
+      # where the `source` label is attached.
+      owner: crates/cog-reflection/src/plugin.rs
+      file: crates/cog-core/src/build_cache_readings.rs
+      metric: BUILD_TARGET_CAP_METRIC
+      label: source
+    proof:
+      # Moves the walk's total and the volume's free bytes, and reads the cap
+      # back: the two inputs are the whole of what the number may depend on.
+      file: crates/cog-core/src/build_cache_readings.rs
+      test: a_derived_cap_follows_its_two_inputs
+
+  # --- main application -------------------------------------------------------
+  - key: gateway.replicas
+    source: override
+    why: >-
+      One replica on a single-node cluster: two add memory and credential
+      copies without availability. Two nodes make this a two; nothing measures
+      per-replica load to derive it.
+
+  - key: gateway.resources.requests.cpu
+    source: override
+    why: >-
+      A scheduling claim for a workload whose draw is inference bursts. The
+      container's working set is published by the cluster, and nothing turns it
+      into the request.
+
+  - key: gateway.resources.requests.memory
+    source: override
+    why: >-
+      Declares what the scheduler reserves; the real consumption is read from
+      container_memory_working_set_bytes at runtime, and tightening this later
+      trims the margin rather than the capability. The reading is available; the
+      loop that would set the number is not.
+
+  - key: gateway.resources.limits.cpu
+    source: override
+    why: >-
+      Room for intra-thread inference during model load. CPU throttling is
+      visible in the cluster's readings; nothing feeds it back into this bound.
+
+  - key: gateway.resources.limits.memory
+    source: override
+    why: >-
+      Sized from measured RSS: about 1.67GiB per loaded session (the two embedding
+      sessions share one weight file) plus reranker and activation headroom, for
+      three sessions. The measurement exists; it was turned into a number by a
+      human, and no loop re-measures it.
+
+  # --- probe budgets ----------------------------------------------------------
+  - key: healthProbes.liveness.periodSeconds
+    source: fixed
+    why: >-
+      The kubelet probe contract. It is written out rather than omitted because
+      the kubelet default is one second -- an idle-node value that kills a backend
+      on a busy node (redis was killed this way). The period is the probe's own
+      convention, not a capacity measurement.
+
+  - key: healthProbes.liveness.timeoutSeconds
+    source: fixed
+    why: >-
+      Same contract, same reason for being explicit: the default timeout is the
+      idle-node number.
+
+  - key: healthProbes.liveness.failureThreshold
+    source: fixed
+    why: >-
+      The runtime budget, chosen so a busy node still gets answered. It is a
+      practice written as a constant; no measurement moves it.
+
+  - key: healthProbes.readiness.periodSeconds
+    source: fixed
+    why: >-
+      The readiness half of the probe contract; explicit for the same reason as
+      liveness.
+
+  - key: healthProbes.readiness.timeoutSeconds
+    source: fixed
+    why: >-
+      The readiness half of the probe contract.
+
+  - key: healthProbes.readiness.failureThreshold
+    source: fixed
+    why: >-
+      How many missed answers take a Pod out of the endpoints. A practice.
+
+  - key: healthProbes.startup.periodSeconds
+    source: fixed
+    why: >-
+      The startup half of the probe contract. The startup budget as a whole is
+      sized for the slowest legitimate start (loading a large AOF, first initdb,
+      building an index); it is a stated policy, and no loop measures start
+      durations back into it.
+
+  - key: healthProbes.startup.timeoutSeconds
+    source: fixed
+    why: >-
+      The startup half of the probe contract.
+
+  - key: healthProbes.startup.failureThreshold
+    source: fixed
+    why: >-
+      60 attempts at 5 seconds is the five-minute startup budget. The number is
+      the slowest legitimate start written down, not a derived bound.
+
+  # --- host document organising ----------------------------------------------
+  - key: hostDocuments.approvalTtlSecs
+    source: override
+    why: >-
+      How long a staged plan stays approvable, which is also the validity of an
+      approval. A derived TTL would follow how long approvals actually sit before
+      being acted on; nothing measures that.
+
+  - key: hostDocuments.assistBodyBytes
+    source: override
+    why: >-
+      How much of one body a classification question carries. It is a "do less"
+      bound: past it the question is not asked at all, because a partial answer
+      would make the plan depend on which files fit. A derived bound would read
+      the classifier's own input window; that window is not published.
+
+  - key: hostDocuments.assistMaxCandidates
+    source: override
+    why: >-
+      How many files one classification question may cover, for the same reason
+      as the body bound. Nothing measures the classification cost back into it.
+
+  - key: hostDocuments.maxPlanBytes
+    source: fixed
+    why: >-
+      A plan is staged for approval and has to be legible in one sitting, so it
+      shares the single-read order of magnitude rather than tracking storage. It
+      is an interface bound, not a capacity dial.
+
+  - key: hostDocuments.maxReadBytes
+    source: fixed
+    why: >-
+      The largest single read. Deliberately not tied to the audited channel's
+      body bound: that one limits how much text leaves through a model, this one
+      limits bytes read into memory at once. The two being close is a
+      coincidence, and tying them would drag one side when the other moves.
+
+  - key: hostDocuments.maxWriteBytes
+    source: fixed
+    why: >-
+      The largest single rewrite, which also bounds the rollback journal's copy.
+      An interface bound: the operation is atomic in one call, not a stream.
+
+  # --- host ledger ------------------------------------------------------------
+  - key: hostLedger.port
+    source: fixed
+    why: >-
+      The scrape port of the per-node ledger. An address.
+
+  - key: hostLedger.resources.requests.cpu
+    source: override
+    why: >-
+      Each scrape reads three small files; the resident and burst draw are noise.
+      A derived pair would read the process's own measured cost; nothing collects
+      it for this DaemonSet.
+
+  - key: hostLedger.resources.requests.memory
+    source: override
+    why: >-
+      Sized to the resident cost of a read-only reader. No measurement of it is
+      published.
+
+  - key: hostLedger.resources.limits.cpu
+    source: override
+    why: >-
+      Room for one scrape. Not derived from anything.
+
+  - key: hostLedger.resources.limits.memory
+    source: override
+    why: >-
+      Room for one scrape's buffers. Not derived from anything.
+
+  # --- mainline deployer ------------------------------------------------------
+  - key: mainlineDeployer.cargoBuildJobs
+    source: override
+    why: >-
+      How many cargo jobs a sandbox build runs. A derived value would read the
+      host's cores, which the build gate already measures for a different
+      question (how many builds at once, not how parallel one build is); nothing
+      feeds the core count into this number.
+
+  - key: mainlineDeployer.failureCooldownSecs
+    source: override
+    why: >-
+      How long after a failed rollout the deployer waits before trying the same
+      revision again. A derived cooldown would follow the observed recovery time;
+      the deployer records outcomes but does not turn them into this number.
+
+  - key: mainlineDeployer.observabilityStack.applyTimeoutSecs
+    source: override
+    why: >-
+      The convergence pass's own deadline. A derived value would read how long a
+      pass actually takes; the pass does not publish its duration.
+
+  - key: mainlineDeployer.observabilityStack.intervalSecs
+    source: override
+    why: >-
+      How often the manifests are re-applied. A derived interval would follow how
+      quickly the cluster is observed to drift; drift is detected per pass, not
+      measured as a rate.
+
+  - key: mainlineDeployer.observabilityStack.maxNamedResources
+    source: override
+    why: >-
+      How many resources one alert message may name before folding the rest into
+      a count. A derived bound would follow the measured message length a reader
+      tolerates; that is a judgement, not a reading.
+
+  - key: mainlineDeployer.pollIntervalSecs
+    source: override
+    why: >-
+      How often the bare repository is polled for a new main. A derived interval
+      would follow the observed push rate of the repository, which the repo's own
+      timestamps could tell; nothing reads it.
+
+  - key: mainlineDeployer.registryMaintenance.cooldownSecs
+    source: override
+    why: >-
+      The wait between two reclamations, so a volume whose resident floor stays
+      above the threshold is not restarted every poll. A derived cooldown would
+      follow the observed cost of a registry restart; that duration is not
+      measured.
+
+  - key: mainlineDeployer.registryMaintenance.retention
+    source: override
+    why: >-
+      Twenty revisions: the producer was measured at about one revision per 42
+      minutes, so this spans roughly 14 hours -- enough for "roll back one
+      version" and "look at the last round". The measurement exists and was made
+      once; the number does not re-derive from the current rate.
+
+  - key: mainlineDeployer.registryMaintenance.threshold
+    source: override
+    why: >-
+      The used-bytes-to-declared-bytes ratio that triggers reclamation. The
+      measurement it reads exists (the walker sidecar's on-disk bytes), so this is
+      the one number here closest to a loop: it is a hand-set threshold on a
+      measured input, and a derived version would weigh the reclaim cost against
+      the disk's free space.
+
+  - key: mainlineDeployer.rolloutJob.cpuRequest
+    source: override
+    why: >-
+      Both an admission claim and the container's CFS weight; 200m sits below the
+      busiest-minute average and well above the per-run average measured across
+      six rollouts. Those readings exist in the cluster and are not closed back
+      into the request.
+
+  - key: mainlineDeployer.rolloutJob.cpuLimit
+    source: override
+    why: >-
+      Two cores, after the container's own cgroup showed half its active CFS
+      periods throttled at one core. The throttle counts are the measurement a
+      derived limit would use; they are re-measured per rollout, not fed back.
+
+  - key: mainlineDeployer.rolloutJob.memoryRequest
+    source: override
+    why: >-
+      Covers the resident heap between kubectl bursts. The working-set reading
+      exists; nothing turns it into the request.
+
+  - key: mainlineDeployer.rolloutJob.memoryLimit
+    source: override
+    why: >-
+      512Mi against a measured working-set peak of 243MiB, because this is the
+      process that decides whether to roll back and its failure is an OOM kill.
+      The peak is measured per rollout; it is not read back into the limit.
+
+  - key: mainlineDeployer.rolloutTimeoutSecs
+    source: override
+    why: >-
+      How long a single deployment gets to converge after init finishes. A
+      derived value would follow the observed convergence time; rollout durations
+      are recorded as outcomes, not turned into the budget.
+
+  - key: mainlineDeployer.soakSecs
+    source: override
+    why: >-
+      How long a rolled-out version runs before it is called good. A derived soak
+      would follow how long a defect takes to show up in the outcomes; that is
+      not measured.
+
+  - key: mainlineDeployer.startupTimeoutSecs
+    source: override
+    why: >-
+      The init-container phase's own budget: the seed is a network clone whose
+      duration follows the link to the upstream. A derived value would read the
+      measured clone time; the seed's duration is not published.
+
+  # --- resource governance ----------------------------------------------------
+  # These are the literals whose invariants a render-time gate recomputes: the
+  # declared sums fit the quota, the per-container maximum covers the largest
+  # declaration, the per-PVC maximum covers the largest claim. The gate checks the
+  # inequality, not the value -- it stays green when a workload declaration moves
+  # and the number beside it should have moved too. That is the debt each row
+  # below names.
+  - key: resourceGovernance.quota.requestsCpu
+    source: override
+    why: >-
+      The namespace's total CPU request ceiling. The render-time gate recomputes
+      the sum of the workloads' requests and checks it fits; when a request moves,
+      the gate only speaks if this becomes too small, never if it has become
+      needlessly large.
+
+  - key: resourceGovernance.quota.requestsMemory
+    source: override
+    why: >-
+      The namespace's total memory request ceiling, checked by the same
+      inequality. A value derived from the declarations would make the gate
+      tautological; today the number and the gate are independent, which is why
+      the gate can still fail.
+
+  - key: resourceGovernance.quota.limitsCpu
+    source: override
+    why: >-
+      Steady-state limits plus the judging Job plus room for overlap during a
+      replacement, recomputed by hand at each re-sizing (the arithmetic is beside
+      the chart field). The render-time gate recomputes the sum; the value is
+      still typed.
+
+  - key: resourceGovernance.quota.limitsMemory
+    source: override
+    why: >-
+      The same sum for memory: the declared limits plus the judging Job plus
+      headroom. Every resizing so far was a human recomputation checked by the
+      render-time gate; the gate compares, it does not supply the number.
+
+  - key: resourceGovernance.quota.pods
+    source: override
+    why: >-
+      The namespace's Pod ceiling. It has to cover the four deployments, the
+      DaemonSets, rollout Jobs and transient sandbox Pods; the per-node ledger
+      Pods are known to consume from it. Nothing counts the population and sets
+      this.
+
+  - key: resourceGovernance.quota.requestsStorage
+    source: override
+    why: >-
+      The ceiling on the sum of all PVC declarations in the namespace, not a
+      per-volume capacity: directory-backed volumes do not enforce
+      requests.storage, so its only job is to refuse a manifest whose total is
+      out of bounds. The render-time gate recomputes the declared sum and checks
+      it fits; the number does not follow the sum.
+
+  - key: resourceGovernance.limitRange.defaultCpu
+    source: override
+    why: >-
+      The default for a container that declares no CPU. It is a hand-set
+      fallback; a derived value would follow the measured draw of the containers
+      that omit resources, and the render-time gate checks bounds, not this.
+
+  - key: resourceGovernance.limitRange.defaultMemory
+    source: override
+    why: >-
+      The default for a container that declares no memory; same reasoning as the
+      CPU default.
+
+  - key: resourceGovernance.limitRange.defaultRequestCpu
+    source: override
+    why: >-
+      The default request for a container that declares none; same reasoning as
+      the other defaults.
+
+  - key: resourceGovernance.limitRange.defaultRequestMemory
+    source: override
+    why: >-
+      The default memory request for a container that declares none; same
+      reasoning as the other defaults.
+
+  - key: resourceGovernance.limitRange.maxCpu
+    source: override
+    why: >-
+      The admission ceiling for one container. It must stay at or above the
+      largest declared container limit, and the render-time gate checks exactly
+      that. A derived value would be that maximum; right now a human copies it.
+
+  - key: resourceGovernance.limitRange.maxMemory
+    source: override
+    why: >-
+      The admission ceiling for one container, currently set exactly at the
+      largest declaration (the evolution Pod's 16Gi, which the build gate's
+      cgroup_memory dimension needs). The render-time gate checks the invariant;
+      the number is copied by hand.
+
+  - key: resourceGovernance.limitRange.minCpu
+    source: override
+    why: >-
+      The admission floor for one container. It exists so a manifest cannot ask
+      for a token amount; no measurement moves it.
+
+  - key: resourceGovernance.limitRange.minMemory
+    source: override
+    why: >-
+      The admission floor for one container's memory; same reasoning as the CPU
+      floor.
+
+  - key: resourceGovernance.limitRange.pvcMaxStorage
+    source: override
+    why: >-
+      The largest single PVC. It must cover the largest volume declaration (the
+      72Gi source volume), and the render-time gate checks each declaration
+      against it. A derived value would be that maximum; a human keeps the two in
+      step.
+
+  - key: resourceGovernance.limitRange.pvcMinStorage
+    source: override
+    why: >-
+      The smallest PVC the namespace admits. A practice that keeps an empty claim
+      from looking intentional; nothing measures it.
+
+  # --- sandbox executor -------------------------------------------------------
+  - key: sandboxExecutor.buildCacheMaxBytes
+    source: override
+    why: >-
+      3 GiB, the shared default for an executor that names no cap. The value a
+      derived cap would read is the free space of the volume its own directory
+      sits on, which this process can measure; nothing feeds one back into the
+      number yet. A separate row from the evolution cap rather than one knob
+      spelled twice: the two directories are the same string under two different
+      claims, so a bound that follows the path does not follow the volume.
+    published:
+      # Same reading module as the evolution cap, a different owner: the executor
+      # constructs its own cap for its own volume.
+      owner: crates/cog-extension/src/build_cache.rs
+      file: crates/cog-core/src/build_cache_readings.rs
+      metric: BUILD_TARGET_CAP_METRIC
+      label: source
+
+  - key: sandboxExecutor.buildCacheScanIntervalSecs
+    source: override
+    why: >-
+      How often this executor's cache size is re-read. A derived interval would
+      follow the cost of one walk and the write rate between walks; the process
+      has a floor and takes the floor below it.
+
+  - key: sandboxExecutor.maxTaskWorkspaces
+    source: override
+    why: >-
+      How many task worktrees may exist at once, with LRU eviction past the cap.
+      A derived cap would follow the measured concurrent demand; the executor
+      does not publish it.
+
+  - key: sandboxExecutor.repoFetchIntervalSecs
+    source: override
+    why: >-
+      How often the bare repository's main is fetched. A derived interval would
+      follow the observed push rate; nothing reads it.
+
+  - key: sandboxExecutor.resources.requests.cpu
+    source: override
+    why: >-
+      The container's parallelism is already one (cpu.max 100000/100000), so the
+      request is not a concurrency knob; it is a claim for a bursty workload. The
+      cgroup readings are available, and nothing turns them into the request.
+
+  - key: sandboxExecutor.resources.requests.memory
+    source: override
+    why: >-
+      Sized to the resident draw; this is a bursty workload, and a higher request
+      would only pin it to the node. The working-set reading exists and is not
+      fed back.
+
+  - key: sandboxExecutor.resources.limits.cpu
+    source: override
+    why: >-
+      Deliberately untouched when the memory limit moved: CFS throttling in the
+      window was 918 of 5012 periods and was not the cause of the OOM kills. The
+      throttle count is the measurement a derived limit would read; it is not
+      read back.
+
+  - key: sandboxExecutor.resources.limits.memory
+    source: override
+    why: >-
+      3 GiB, after one build was measured at 1.685 GiB of unreclaimable anon and
+      2 GiB left almost no growth room; the falsifier is the outcome reading
+      sandbox_oom_kills_total staying at zero, which a human judges against a
+      window. That is a decision procedure, not a loop that sets the value.
+
+  - key: sandboxExecutor.storage
+    source: override
+    why: >-
+      The executor's own volume. Its contents are enumerated beside the cache cap
+      (cargo home, bare repo, worktrees), so a derived value could add them up
+      against the volume's free space; nothing does.
+
+  - key: sandboxExecutor.workspaceGcIntervalSecs
+    source: override
+    why: >-
+      How often idle worktrees are collected. A derived interval would follow the
+      observed creation rate; nothing measures it.
+
+  - key: sandboxExecutor.workspaceTtlSecs
+    source: override
+    why: >-
+      How long an idle task worktree may live. A derived TTL would follow the
+      measured idle time before a task returns; the executor does not publish
+      that.
+
+  # --- security gateway -------------------------------------------------------
+  - key: securityGateway.auditedLlmMaxBodyBytes
+    source: fixed
+    why: >-
+      How much document text may leave in one request through the audited
+      channel. Eight MiB is the HTTP body convention, and it is deliberately not
+      tied to the document write bound: that one limits bytes written to disk,
+      this one limits text entering a model.
+
+  - key: securityGateway.auditedLlmPort
+    source: fixed
+    why: >-
+      The audited channel's own port, separate from 8080/8081 because its whole
+      value is a small reachable set. An address.
+
+  - key: securityGateway.metricsPort
+    source: fixed
+    why: >-
+      The observability channel's port, deliberately separate from the proxy
+      ports because those inject upstream credentials. An address.
+
+  - key: securityGateway.replicas
+    source: override
+    why: >-
+      One replica on a single-node cluster; a second adds memory and credential
+      copies without availability. Load per replica is not measured to derive it.
+
+  - key: securityGateway.gitMirror.stallSecs
+    source: override
+    why: >-
+      How long the SSH fallback may produce no output before the transfer is
+      declared dead. The floor is 30 in code. A derived value would read the
+      observed inter-output gap; a full mirror clone was measured at about 97
+      seconds and that is what the defaults are ordered around, not what sets
+      them.
+
+  - key: securityGateway.gitMirror.timeoutSecs
+    source: override
+    why: >-
+      The total bound on one clone/fetch/push, for the case that keeps emitting
+      progress and never finishes. Derived from the measured 97-second clone by a
+      human; nothing re-measures and adjusts.
+
+  - key: securityGateway.gitMirror.storage
+    source: override
+    why: >-
+      The mirror volume, rebuildable from the upstream, so the volume is sized
+      generously against the repository's measured size. Nothing reads that size
+      back into the declaration.
+
+  - key: securityGateway.resources.requests.cpu
+    source: override
+    why: >-
+      The gateway sits in front of every call chain; without a request the
+      scheduler treats it as BestEffort and evicts it first. Sized from its
+      measured resident cost; the reading is not fed back.
+
+  - key: securityGateway.resources.requests.memory
+    source: override
+    why: >-
+      The resident cost of the proxy process. A derived value would read the
+      measured working set; nothing does.
+
+  - key: securityGateway.resources.limits.cpu
+    source: override
+    why: >-
+      Burst room for proxy traffic. Not derived from a reading.
+
+  - key: securityGateway.resources.limits.memory
+    source: override
+    why: >-
+      Burst room over the resident cost. Not derived from a reading.
+
+  # --- platform webhook -------------------------------------------------------
+  - key: webhook.nodePort
+    source: fixed
+    why: >-
+      The cluster entry point for the GitHub and Gitee webhooks, forwarded to the
+      gateway's 8082. An address that outside senders are configured against; a
+      measurement must not move it.

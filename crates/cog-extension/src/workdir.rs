@@ -1462,7 +1462,7 @@ pub(crate) mod tests {
             data_volume_declaration_error: None,
             data_volume_interval: Duration::from_secs(30),
             build_cache: BuildCacheConfig {
-                max_bytes: 3000,
+                cap: cog_core::config::CacheCapSetting::Fixed(3000),
                 scan_interval: Duration::from_secs(300),
             },
         };

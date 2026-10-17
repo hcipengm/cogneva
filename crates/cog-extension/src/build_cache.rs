@@ -40,7 +40,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use cog_core::build_cache_readings::{BuildCacheReadings, CacheSlot};
+use cog_core::build_cache_readings::{BuildCacheReadings, CacheSlot, CapSource};
+use cog_core::config::CacheCapSetting;
 use tokio::sync::RwLock;
 use tracing::warn;
 
@@ -64,11 +65,12 @@ const DEFAULT_SCAN_INTERVAL_SECS: u64 = 300;
 /// deployment that needs another value sets `SANDBOX_BUILD_CACHE_MAX_BYTES`.
 const DEFAULT_MAX_BYTES: u64 = cog_core::build_cache_readings::DEFAULT_CACHE_MAX_BYTES;
 
-/// Bytes the cache may hold, and how often it is re-walked.
+/// How the cache is bounded, and how often it is re-walked.
 #[derive(Debug, Clone)]
 pub struct BuildCacheConfig {
-    /// Bytes the cache may hold, or 0 to measure it without bounding it.
-    pub max_bytes: u64,
+    /// Measure only (`Unbounded`), a number the deployment names (`Fixed`), or
+    /// one the walks derive (`Auto`).
+    pub cap: CacheCapSetting,
     /// How often the cache is re-walked and its cap re-enforced.
     pub scan_interval: Duration,
 }
@@ -76,7 +78,7 @@ pub struct BuildCacheConfig {
 impl Default for BuildCacheConfig {
     fn default() -> Self {
         Self {
-            max_bytes: DEFAULT_MAX_BYTES,
+            cap: CacheCapSetting::Fixed(DEFAULT_MAX_BYTES),
             scan_interval: Duration::from_secs(DEFAULT_SCAN_INTERVAL_SECS),
         }
     }
@@ -86,7 +88,10 @@ impl BuildCacheConfig {
     pub fn from_env() -> Self {
         // Bytes, not a float: a cap read as a float would be rounded to the
         // nearest representable integer, which is a number nobody configured.
-        let max_bytes = Self::env_u64_or("SANDBOX_BUILD_CACHE_MAX_BYTES", DEFAULT_MAX_BYTES);
+        let cap = Self::env_cap_or(
+            "SANDBOX_BUILD_CACHE_MAX_BYTES",
+            CacheCapSetting::Fixed(DEFAULT_MAX_BYTES),
+        );
         let scan_interval = Self::env_u64_or(
             "SANDBOX_BUILD_CACHE_SCAN_INTERVAL_SECS",
             DEFAULT_SCAN_INTERVAL_SECS,
@@ -98,8 +103,26 @@ impl BuildCacheConfig {
         // measure a cadence nothing runs at.
         .max(cog_core::build_cache::MIN_SCAN_INTERVAL_SECS);
         Self {
-            max_bytes,
+            cap,
             scan_interval: Duration::from_secs(scan_interval),
+        }
+    }
+
+    /// Read a cap: a number bounds it, `0` measures without bounding, and
+    /// `auto` derives it. Unset or unreadable takes `default`, which is not a
+    /// configured value -- the same rule as the interval.
+    fn env_cap_or(key: &str, default: CacheCapSetting) -> CacheCapSetting {
+        let Ok(raw) = std::env::var(key) else {
+            return default;
+        };
+        let raw = raw.trim();
+        if raw.eq_ignore_ascii_case("auto") {
+            return CacheCapSetting::Auto;
+        }
+        match raw.parse::<u64>() {
+            Ok(0) => CacheCapSetting::Unbounded,
+            Ok(bytes) => CacheCapSetting::Fixed(bytes),
+            Err(_) => default,
         }
     }
 
@@ -115,7 +138,14 @@ impl BuildCacheConfig {
 
     /// The readings this configuration asks for.
     pub fn readings(&self, dir: impl Into<std::path::PathBuf>) -> BuildCacheReadings {
-        BuildCacheReadings::new(dir).with_cap(self.max_bytes, self.scan_interval.as_secs())
+        let readings = BuildCacheReadings::new(dir);
+        match self.cap {
+            CacheCapSetting::Unbounded => readings,
+            CacheCapSetting::Fixed(bytes) => readings.with_cap(bytes, self.scan_interval.as_secs()),
+            CacheCapSetting::Auto => readings
+                .with_auto_cap(self.scan_interval.as_secs())
+                .with_cap_source(CapSource::Derived),
+        }
     }
 }
 
@@ -202,7 +232,10 @@ mod tests {
     fn a_missing_env_var_falls_back_to_the_default_cap() {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("SANDBOX_BUILD_CACHE_MAX_BYTES");
-        assert_eq!(BuildCacheConfig::from_env().max_bytes, DEFAULT_MAX_BYTES);
+        assert_eq!(
+            BuildCacheConfig::from_env().cap,
+            CacheCapSetting::Fixed(DEFAULT_MAX_BYTES)
+        );
     }
 
     #[test]
@@ -210,16 +243,25 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("SANDBOX_BUILD_CACHE_MAX_BYTES", "0");
         assert_eq!(
-            BuildCacheConfig::from_env().max_bytes,
-            0,
+            BuildCacheConfig::from_env().cap,
+            CacheCapSetting::Unbounded,
             "an explicit 0 still means measure-only"
         );
         std::env::set_var("SANDBOX_BUILD_CACHE_MAX_BYTES", "4096");
-        assert_eq!(BuildCacheConfig::from_env().max_bytes, 4096);
+        assert_eq!(
+            BuildCacheConfig::from_env().cap,
+            CacheCapSetting::Fixed(4096)
+        );
+        std::env::set_var("SANDBOX_BUILD_CACHE_MAX_BYTES", "auto");
+        assert_eq!(
+            BuildCacheConfig::from_env().cap,
+            CacheCapSetting::Auto,
+            "the sentinel asks for a cap derived from the walks, not for a number"
+        );
         std::env::set_var("SANDBOX_BUILD_CACHE_MAX_BYTES", "not-a-number");
         assert_eq!(
-            BuildCacheConfig::from_env().max_bytes,
-            DEFAULT_MAX_BYTES,
+            BuildCacheConfig::from_env().cap,
+            CacheCapSetting::Fixed(DEFAULT_MAX_BYTES),
             "an unparsable value is not a configured cap, so the default applies"
         );
         std::env::remove_var("SANDBOX_BUILD_CACHE_MAX_BYTES");
@@ -257,7 +299,7 @@ mod tests {
     #[test]
     fn a_cache_with_no_configured_cap_is_measured_and_left_alone() {
         let config = BuildCacheConfig {
-            max_bytes: 0,
+            cap: CacheCapSetting::Unbounded,
             scan_interval: Duration::from_secs(DEFAULT_SCAN_INTERVAL_SECS),
         };
         assert!(
@@ -269,7 +311,7 @@ mod tests {
     #[test]
     fn a_configured_cap_is_the_number_that_was_configured() {
         let config = BuildCacheConfig {
-            max_bytes: 4 * 1024 * 1024 * 1024,
+            cap: CacheCapSetting::Fixed(4 * 1024 * 1024 * 1024),
             scan_interval: Duration::from_secs(DEFAULT_SCAN_INTERVAL_SECS),
         };
         assert_eq!(
@@ -333,7 +375,7 @@ mod tests {
         let files =
             fs_size::dir_files(dir.path(), cog_core::build_cache::CACHE_LAYER_DEPTH, &[]).unwrap();
         let readings = BuildCacheConfig {
-            max_bytes: 64,
+            cap: CacheCapSetting::Fixed(64),
             scan_interval: Duration::from_secs(DEFAULT_SCAN_INTERVAL_SECS),
         }
         .readings(dir.path());

@@ -115,6 +115,7 @@ use async_trait::async_trait;
 use tracing::{info, warn};
 
 use crate::build_gate::{dir_identity, BuildGate};
+use crate::config::CacheCapSetting;
 use crate::fs_size::{self, FileEntry};
 use crate::observability::{DimensionSpec, Observable, RawMetric, TraceFragment};
 use crate::{SFResult, ShutdownSignal};
@@ -122,6 +123,20 @@ use crate::{SFResult, ShutdownSignal};
 // The names, labels and depths this family travels under live beside the
 // readings, so both publishers of it read one copy: see `crate::build_cache`.
 pub use crate::build_cache::*;
+
+/// How long a working-set peak stands when no walk re-reaches it.
+///
+/// A cap derived from a peak the cache has not come near for this long holds
+/// space for a build pattern that no longer happens; the window lets the next
+/// walk replace it with what is actually there.
+const PEAK_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Headroom over the peak, in percent.
+///
+/// A cap at the peak itself reclaims the bytes the next build is about to
+/// write: the peak is the largest working set seen, so bounding to it turns the
+/// busiest walk into an over-cap one every time it repeats.
+const CAP_HEADROOM_PERCENT: u64 = 120;
 
 /// The fact that says whether anything is currently building into a cache.
 ///
@@ -183,6 +198,16 @@ struct ReclaimState {
     over_since: Option<u64>,
 }
 
+/// The pre-reclaim working set's high-water mark and when it was set.
+#[derive(Debug, Default, Clone, Copy)]
+struct Peak {
+    /// Largest pre-reclaim total seen inside [`PEAK_WINDOW_SECS`]; 0 before any
+    /// walk has been made.
+    bytes: u64,
+    /// Unix seconds of the walk that set it; 0 before any.
+    at: u64,
+}
+
 /// The cache this process owns, as measured by the last completed walk.
 ///
 /// The measurement is written by the scan loop and read by the metrics pull,
@@ -200,8 +225,22 @@ pub struct BuildCacheReadings {
     rewritten: Mutex<BTreeMap<String, u64>>,
     /// Unix seconds of the last completed walk; 0 before one has happened.
     scanned_at: AtomicU64,
-    /// Bytes the cache may hold, or 0 when it is measured but not bounded.
-    cap_bytes: u64,
+    /// How the cap is set: measured but unbounded, named by the deployment, or
+    /// derived from the walk's own measurement.
+    cap: CacheCapSetting,
+    /// The cap the last walk derived, or 0 before one has.
+    ///
+    /// Stored rather than recomputed per scrape so that the wall the reading
+    /// draws and the wall the pass enforces are one number: a cap recomputed
+    /// from the clock would move between the pass that deleted to it and the
+    /// scrape that reported it.
+    derived_cap: AtomicU64,
+    /// The pre-reclaim working set's high-water mark and when it was set.
+    ///
+    /// Kept for derived caps: the cap is what the cache has to hold at its
+    /// busiest, not what it holds right now, or every walk would lower the cap
+    /// onto a cache that is merely between builds and reclaim it for no reason.
+    peak: Mutex<Peak>,
     scan_interval_secs: u64,
     /// Where the cap came from, or `None` to read it as the deployment's.
     ///
@@ -235,7 +274,9 @@ impl BuildCacheReadings {
             layers: Mutex::new(BTreeMap::new()),
             rewritten: Mutex::new(BTreeMap::new()),
             scanned_at: AtomicU64::new(0),
-            cap_bytes: 0,
+            cap: CacheCapSetting::Unbounded,
+            derived_cap: AtomicU64::new(0),
+            peak: Mutex::new(Peak::default()),
             scan_interval_secs: 0,
             cap_source: None,
             reclaim: Mutex::new(ReclaimState::default()),
@@ -252,7 +293,26 @@ impl BuildCacheReadings {
     /// derived from the volume behind the directory — and a default that started
     /// removing bytes on upgrade would be making that decision silently.
     pub fn with_cap(mut self, max_bytes: u64, scan_interval_secs: u64) -> Self {
-        self.cap_bytes = max_bytes;
+        self.cap = if max_bytes == 0 {
+            CacheCapSetting::Unbounded
+        } else {
+            CacheCapSetting::Fixed(max_bytes)
+        };
+        self.scan_interval_secs = scan_interval_secs;
+        self
+    }
+
+    /// Bound the cache to what its own walks measure, re-walked every
+    /// `scan_interval_secs`.
+    ///
+    /// The cap is the pre-reclaim working set's peak over the last week with
+    /// headroom, held under the free space of the volume the directory sits on.
+    /// Derived rather than named because the number a deployment would write
+    /// here is the same measurement taken once by hand, and it stops being true
+    /// the first time the cache outgrows it -- which is the failure the cap
+    /// exists to prevent, and the one a fixed number cannot notice.
+    pub fn with_auto_cap(mut self, scan_interval_secs: u64) -> Self {
+        self.cap = CacheCapSetting::Auto;
         self.scan_interval_secs = scan_interval_secs;
         self
     }
@@ -276,13 +336,64 @@ impl BuildCacheReadings {
 
     /// The cap, or `None` when this cache is not bounded.
     pub fn cap_bytes(&self) -> Option<u64> {
-        (self.cap_bytes > 0).then_some(self.cap_bytes)
+        match self.cap {
+            CacheCapSetting::Unbounded => None,
+            CacheCapSetting::Fixed(bytes) => Some(bytes),
+            // Nothing to derive from before the first walk: a cache that has not
+            // been measured is unbounded for that one interval rather than
+            // bounded by a guess, and the reading says so by being absent.
+            CacheCapSetting::Auto => {
+                let derived = self.derived_cap.load(Ordering::Acquire);
+                (derived > 0).then_some(derived)
+            }
+        }
     }
 
     /// Where the cap came from: what was stated, or the deployment's, which is
     /// what a cap in force with nothing said about its origin is.
     fn cap_source(&self) -> CapSource {
+        if self.cap.is_auto() {
+            // A derived cap is the one case where the number cannot say its own
+            // origin, and the label is the whole reason the state exists.
+            return CapSource::Derived;
+        }
         self.cap_source.unwrap_or(CapSource::Override)
+    }
+
+    /// Fold this walk's pre-reclaim total into the peak and publish the cap it
+    /// implies.
+    ///
+    /// `free` is the volume's own answer, and it wins over the working set's: a
+    /// cap above the free space is a promise to fill the disk the cache sits
+    /// on, which no build pattern justifies.
+    fn derive_cap(&self, total: u64, free: Option<u64>) {
+        let now = unix_now();
+        let peak = {
+            let mut peak = self.peak.lock().unwrap_or_else(|e| e.into_inner());
+            let stale = peak.at != 0 && now.saturating_sub(peak.at) > PEAK_WINDOW_SECS;
+            // A stale peak is a memory of a working set nothing has asked for
+            // in a week; letting it stand would keep the cap at a size no build
+            // reaches, so the window resets it to what this walk saw.
+            if stale || total > peak.bytes {
+                *peak = Peak {
+                    bytes: total,
+                    at: now,
+                };
+            }
+            peak.bytes
+        };
+        let with_headroom = peak.saturating_mul(CAP_HEADROOM_PERCENT) / 100;
+        let cap = match free {
+            Some(free) => with_headroom.min(free),
+            None => with_headroom,
+        };
+        // An empty cache derives 0, which `cap_bytes` reads as "nothing
+        // measured yet" and leaves unbounded -- correct, since there is nothing
+        // to reclaim. A non-zero working set under a full volume must not fall
+        // into that same reading, or a full disk would silently disable the
+        // cap, so a derived cap bottoms out at one byte.
+        let derived = if peak == 0 { 0 } else { cap.max(1) };
+        self.derived_cap.store(derived, Ordering::Release);
     }
 
     /// How long between walks.
@@ -393,10 +504,15 @@ impl BuildCacheReadings {
     /// has nothing to do with it, and that failure would be recorded against a
     /// change rather than against the host.
     pub async fn enforce_cap(&self, files: &[FileEntry], slot: Option<&dyn CacheSlot>) {
+        let total = fs_size::counted_bytes(files);
+        // A derived cap is computed from this walk before it is read, or the
+        // number would be one walk behind the cache it bounds.
+        if self.cap.is_auto() {
+            self.derive_cap(total, volume_free_bytes(&self.dir));
+        }
         let Some(cap) = self.cap_bytes() else {
             return;
         };
-        let total = fs_size::counted_bytes(files);
         let excess = total.saturating_sub(cap);
         {
             let mut state = self.reclaim.lock().unwrap_or_else(|e| e.into_inner());
@@ -576,6 +692,39 @@ pub fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Free bytes on the volume `path` sits on, or `None` when the filesystem
+/// cannot answer.
+///
+/// The free-space half of a derived cap has to come from the filesystem rather
+/// than from the deployment: it is the one bound nothing in this process set,
+/// and the one that moves without anything here changing.
+#[cfg(unix)]
+fn volume_free_bytes(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `path` is NUL-terminated and lives across the call, and `stats`
+    // is a writable `statvfs` that the call fills on success.
+    let stats = unsafe {
+        let mut stats: libc::statvfs = std::mem::zeroed();
+        (libc::statvfs(path.as_ptr(), &mut stats) == 0).then_some(stats)
+    }?;
+    // What a build can actually reach is `f_bavail`, not `f_bfree`: the
+    // reserved blocks `f_bfree` counts are not writable by it.
+    let unit = if stats.f_frsize > 0 {
+        stats.f_frsize
+    } else {
+        stats.f_bsize
+    } as u64;
+    Some((stats.f_bavail as u64).saturating_mul(unit))
+}
+
+#[cfg(not(unix))]
+fn volume_free_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
 #[async_trait]
 impl Observable for BuildCacheReadings {
     /// Nothing at all before the first walk completes, so the series a cap is
@@ -718,6 +867,69 @@ pub fn spawn_build_cache_watch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The derived cap is a function of two inputs and of nothing else: what the
+    /// walk saw the cache hold at its busiest, and what the volume has free.
+    /// Moving either one has to move the number, or the reading is a comment.
+    #[test]
+    fn a_derived_cap_follows_its_two_inputs() {
+        let readings = BuildCacheReadings::new("/nonexistent-cache").with_auto_cap(300);
+
+        // Nothing measured yet: unbounded rather than bounded by a guess.
+        assert_eq!(readings.cap_bytes(), None);
+
+        readings.derive_cap(1_000, None);
+        assert_eq!(readings.cap_bytes(), Some(1_200));
+        assert_eq!(readings.cap_source(), CapSource::Derived);
+
+        // A larger working set raises the cap ...
+        readings.derive_cap(2_000, None);
+        assert_eq!(readings.cap_bytes(), Some(2_400));
+
+        // ... and a quieter one does not lower it: the busiest build still has
+        // to fit, or every walk onto a cache between builds reclaims it.
+        readings.derive_cap(500, None);
+        assert_eq!(readings.cap_bytes(), Some(2_400));
+
+        // The volume's free space wins over the working set's.
+        readings.derive_cap(2_000, Some(2_100));
+        assert_eq!(readings.cap_bytes(), Some(2_100));
+
+        // A full volume is the smallest cap, not no cap: 0 already means "never
+        // measured", and a full disk must not read as unbounded.
+        readings.derive_cap(2_000, Some(0));
+        assert_eq!(readings.cap_bytes(), Some(1));
+    }
+
+    /// An `auto` cache bounds itself from the walk it is acting on: the first
+    /// pass both measures and derives, and what it publishes says the number
+    /// came from the walk rather than from the deployment.
+    #[tokio::test]
+    async fn an_auto_cap_is_derived_from_the_walk_that_enforces_it() {
+        let (root, files) = cache(&[("debug/deps/lib.rlib", 1_000)]);
+        let readings = BuildCacheReadings::new(root.path()).with_auto_cap(300);
+        assert_eq!(readings.cap_bytes(), None, "nothing measured yet");
+
+        // The derived cap is above what the walk found, so the pass stops at the
+        // derivation and needs no slot.
+        readings.enforce_cap(&files, None).await;
+
+        let cap = readings.cap_bytes().expect("the first walk derives a cap");
+        assert!(
+            cap >= 1_000,
+            "the cap covers the working set it measured: {cap}"
+        );
+
+        let metrics = readings.collect_metrics("").await.unwrap();
+        let published_cap = metrics
+            .iter()
+            .find(|m| m.name == BUILD_TARGET_CAP_METRIC)
+            .expect("a derived cap is published");
+        assert_eq!(
+            published_cap.labels.get(SOURCE_LABEL).map(String::as_str),
+            Some(CapSource::Derived.as_str())
+        );
+    }
 
     fn readings_with(layers: &[(&str, u64)]) -> BuildCacheReadings {
         let readings = BuildCacheReadings::new("/nonexistent-cache");

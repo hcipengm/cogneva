@@ -1097,6 +1097,116 @@ impl Default for MicroVmConfig {
 
 /// 工作区动态分配配置。取消共用固定树后，部署器与每个进化任务各自从裸仓库
 /// 检出 `git worktree`；本段决定这些检出去哪里、编译产物缓存在哪。
+/// How the shared build cache's cap is set.
+///
+/// Three states because "the number is the deployment's" and "the number is a
+/// reading" are different facts that a bare integer cannot tell apart:
+///
+/// - `0` (or absent) leaves the cache measured and unbounded.
+/// - a positive number is a cap the deployment names, and it does not move.
+/// - `"auto"` makes the cap a reading: the pre-reclaim working-set peak over the
+///   last week, with headroom, held under the free space of the volume the
+///   directory sits on. The published cap then carries `source="derived"`, so a
+///   cap that stopped tracking its volume can never read like one that is still
+///   tracking it.
+///
+/// The sentinel is a string rather than a reserved number because every number
+/// in this field is a legitimate cap; the only way to say "not a number" is to
+/// say something that is not a number.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CacheCapSetting {
+    /// Measured, not bounded.
+    #[default]
+    Unbounded,
+    /// A cap the deployment names.
+    Fixed(u64),
+    /// A cap the walk derives from what it measures.
+    Auto,
+}
+
+impl CacheCapSetting {
+    /// The bytes the deployment named, or `None` when it named none.
+    pub fn fixed_bytes(self) -> Option<u64> {
+        match self {
+            Self::Fixed(bytes) => Some(bytes),
+            Self::Unbounded | Self::Auto => None,
+        }
+    }
+
+    /// Whether the cap is a reading of the cache rather than a number.
+    pub fn is_auto(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+}
+
+impl Serialize for CacheCapSetting {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Unbounded => serializer.serialize_u64(0),
+            Self::Fixed(bytes) => serializer.serialize_u64(*bytes),
+            Self::Auto => serializer.serialize_str("auto"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CacheCapSetting {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct SettingVisitor;
+
+        impl serde::de::Visitor<'_> for SettingVisitor {
+            type Value = CacheCapSetting;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(
+                    "a byte count, or \"auto\" to derive the cap from the measured working set",
+                )
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, bytes: u64) -> Result<Self::Value, E> {
+                Ok(if bytes == 0 {
+                    CacheCapSetting::Unbounded
+                } else {
+                    CacheCapSetting::Fixed(bytes)
+                })
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, bytes: i64) -> Result<Self::Value, E> {
+                if bytes < 0 {
+                    Err(E::custom("a cache cap cannot be negative"))
+                } else {
+                    self.visit_u64(bytes as u64)
+                }
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, bytes: f64) -> Result<Self::Value, E> {
+                if bytes < 0.0 || bytes.fract() != 0.0 {
+                    Err(E::custom("a cache cap is a whole number of bytes"))
+                } else {
+                    self.visit_u64(bytes as u64)
+                }
+            }
+
+            fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Self::Value, E> {
+                let text = text.trim();
+                if text.eq_ignore_ascii_case("auto") {
+                    return Ok(CacheCapSetting::Auto);
+                }
+                match text.parse::<u64>() {
+                    Ok(bytes) => self.visit_u64(bytes),
+                    Err(_) => Err(E::custom(format!(
+                        "`{text}` is neither a byte count nor \"auto\""
+                    ))),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(SettingVisitor)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SelfEvolutionWorkspaceConfig {
@@ -1135,7 +1245,13 @@ pub struct SelfEvolutionWorkspaceConfig {
     /// upgrade would be a deployment's decision made silently by whoever wrote
     /// the default. The cache is measured either way, and the readings say which
     /// of the two states a cache is in.
-    pub target_max_bytes: u64,
+    ///
+    /// `"auto"` is the state where the deployment has said the number should be
+    /// a reading rather than a decision: the walk keeps the pre-reclaim
+    /// working-set peak and derives the cap from it, which is the only form in
+    /// which a cap can stop being correct the moment the working set outgrows
+    /// it while still being reported as a number.
+    pub target_max_bytes: CacheCapSetting,
 }
 
 impl Default for SelfEvolutionWorkspaceConfig {
@@ -1146,7 +1262,7 @@ impl Default for SelfEvolutionWorkspaceConfig {
             ephemeral_ttl_secs: 21600,
             orphan_branch_ttl_secs: 2592000,
             cache_scan_interval_secs: 300,
-            target_max_bytes: 0,
+            target_max_bytes: CacheCapSetting::Unbounded,
         }
     }
 }
@@ -1543,6 +1659,41 @@ fn set_json_path_at(current: &mut serde_json::Value, parts: &[&str], leaf: serde
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cache cap arrives as a string from the environment, through the same
+    /// path every other setting takes: a byte count, `0` for "measure only",
+    /// or `auto` for "derive it". The three have to survive that path, because
+    /// a sentinel that turns into 0 on the way in is a cap that silently stops
+    /// bounding anything.
+    #[test]
+    fn the_cache_cap_reads_a_count_zero_and_auto_from_the_environment() {
+        let parse = |raw: &str| -> CacheCapSetting {
+            let mut value = serde_json::to_value(Config::default()).unwrap();
+            set_json_path(
+                &mut value,
+                "self_evolution.workspaces.target_max_bytes",
+                raw,
+            );
+            let cfg: Config =
+                serde_json::from_value(value).expect("the write keeps the tree loadable");
+            cfg.self_evolution.workspaces.target_max_bytes
+        };
+
+        assert_eq!(parse("auto"), CacheCapSetting::Auto);
+        assert_eq!(parse("AUTO"), CacheCapSetting::Auto);
+        assert_eq!(parse("0"), CacheCapSetting::Unbounded);
+        assert_eq!(parse("1073741824"), CacheCapSetting::Fixed(1_073_741_824));
+
+        // A typo is refused rather than silently read as "unbounded": the one
+        // thing a cap must never do is stop existing without saying so.
+        let mut value = serde_json::to_value(Config::default()).unwrap();
+        set_json_path(
+            &mut value,
+            "self_evolution.workspaces.target_max_bytes",
+            "autp",
+        );
+        assert!(serde_json::from_value::<Config>(value).is_err());
+    }
 
     /// A dot path through a section the type leaves unset has to land.
     ///

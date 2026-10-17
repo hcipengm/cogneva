@@ -5,6 +5,8 @@
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
+use cog_core::build_cache_readings::CapSource;
+
 use crate::discovery_outcome_readings::{DiscoveryOutcomeReadings, OutcomeTally};
 
 /// Loop name reported through the background-loop liveness family.
@@ -1172,15 +1174,24 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 // a process with no cache of its own has nothing to report, and
                 // reporting zero for it would read as an empty cache. The scan
                 // loop is armed in start(), with the rest of the loops.
-                let build_cache = std::sync::Arc::new(
-                    crate::build_cache_readings::BuildCacheReadings::new(
-                        self_evolution.workspaces.target_dir.clone(),
-                    )
-                    .with_cap(
-                        self_evolution.workspaces.target_max_bytes,
-                        self_evolution.workspaces.cache_scan_interval_secs,
-                    ),
+                let cache_interval = self_evolution.workspaces.cache_scan_interval_secs;
+                let readings = crate::build_cache_readings::BuildCacheReadings::new(
+                    self_evolution.workspaces.target_dir.clone(),
                 );
+                // An `auto` cap is the deployment declining to name the number:
+                // the loop measures what the cache has to hold and bounds it
+                // there, so the value tracks the build pattern instead of the
+                // day somebody sized it.
+                let readings = match self_evolution.workspaces.target_max_bytes {
+                    cog_core::config::CacheCapSetting::Unbounded => readings,
+                    cog_core::config::CacheCapSetting::Fixed(bytes) => {
+                        readings.with_cap(bytes, cache_interval)
+                    }
+                    cog_core::config::CacheCapSetting::Auto => readings
+                        .with_auto_cap(cache_interval)
+                        .with_cap_source(CapSource::Derived),
+                };
+                let build_cache = std::sync::Arc::new(readings);
                 ctx.publish_observable(build_cache.clone());
                 self.build_cache = executor_enabled.then_some(build_cache);
 

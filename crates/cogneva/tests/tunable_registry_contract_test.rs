@@ -4,28 +4,49 @@
 //! other two look exactly like it, because a number a loop computed and a number
 //! somebody typed are the same number on the page.
 //!
-//! So the three are registered here, one row per dial, together with the reason
-//! each is not the first. The table is held to what the tree actually does in
-//! two directions: the row's declared source has to be what the code publishing
-//! that value does, and the reading the value lands on has to say where it came
-//! from. A value registered as derived while its publisher never says so reads
-//! as a number that tracks the world and is not one -- which is the failure this
-//! is here to catch, since a cap that stopped tracking its volume is a steady
-//! number either way.
+//! The registry (`deploy/helm/cogneva/tunables.yaml`) is where that judgement is
+//! written down, one row per numeric leaf of the chart. This test holds it to the
+//! chart and to the code in four directions:
 //!
-//! A key with no row is the same hole as a key with no loop: the registry is
-//! what makes "nobody has looked at this yet" visible as a row rather than as an
-//! absence. Rows for other families land as their loops land.
+//! - every numeric leaf has exactly one row, and every row names a numeric leaf.
+//!   The set is read from `values.yaml` on every run, so a value that is added
+//!   without a row is a hole this test names rather than an absence nobody
+//!   notices -- "nobody has looked at this yet" has to be a missing row, not a
+//!   silently unjudged number.
+//! - every row says something. For `override`/`fixed` that is the reason the
+//!   value is not derived; for `derived` it is what the value reads.
+//! - a `derived` row names the reading its number lands on and a test that shows
+//!   the number following its input. A comment claiming a value tracks the world
+//!   is not evidence that it does; the test is the part of the claim a machine
+//!   can refuse.
+//! - a row that lands on a reading uses a word the reading can carry, and the
+//!   file it names publishes that metric and that label. A value registered as
+//!   derived while its publisher never says so reads as a number that tracks the
+//!   world and is not one -- the failure this is here to catch, since a cap that
+//!   stopped tracking its volume is a steady number either way.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use cog_core::build_cache_readings::{
     BuildCacheReadings, CapSource, BUILD_TARGET_CAP_METRIC, SOURCE_LABEL,
 };
 use cog_core::Observable;
+use serde::Deserialize;
+
+/// The registry: one row per numeric leaf of the chart.
+const REGISTRY: &str = "deploy/helm/cogneva/tunables.yaml";
+
+/// The chart whose numeric leaves the registry has to cover.
+const VALUES: &str = "deploy/helm/cogneva/values.yaml";
+
+/// The metric identifier the `source`-labelled cache readings are published
+/// under. Rows that name it are the ones a bounded cache can be checked against.
+const CAP_METRIC: &str = "BUILD_TARGET_CAP_METRIC";
 
 /// Where a value comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum Source {
     /// A measurement loop sets it, so it moves when the input it reads moves.
     Derived,
@@ -34,7 +55,6 @@ enum Source {
     /// Not a dial: a protocol number or a practice, which no measurement should
     /// move. Registered so that "fixed by agreement" and "nobody has derived
     /// this yet" are told apart by the row rather than by whoever reads it next.
-    #[allow(dead_code)]
     Fixed,
 }
 
@@ -54,57 +74,51 @@ impl Source {
     }
 }
 
-/// The file whose code decides a value's source, and the reading the value
-/// lands on.
-type Published = (&'static str, &'static str);
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Registry {
+    version: u32,
+    rows: Vec<Row>,
+}
 
 /// One dial this repository ships.
-struct Tunable {
-    /// The chart key a deployment sets.
-    key: &'static str,
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Row {
+    /// The chart key a deployment sets, spelled as a dotted path into
+    /// `values.yaml`.
+    key: String,
     /// Where the value comes from today.
     source: Source,
     /// Why it is not derived. A derived row says what input it reads instead.
-    why: &'static str,
+    why: String,
     /// The publisher and the reading, for a value whose number reaches one.
+    #[serde(default)]
     published: Option<Published>,
+    /// For a derived row: the test that shows the value following its input.
+    #[serde(default)]
+    proof: Option<Proof>,
 }
 
-/// The build-cache family: two publishers of one cache shape, each holding a cap
-/// of its own, and both caps a number somebody typed.
-const TUNABLES: &[Tunable] = &[
-    Tunable {
-        key: "evolution.workspaces.targetMaxBytes",
-        source: Source::Override,
-        why: "80 GiB, named by the chart. The value a derived cap would read is \
-              the peak of the working set the cache walk already measures, held \
-              under the free space of the volume the directory sits on; the walk \
-              runs and publishes the size per layer, and nothing closes that back \
-              into the cap, so the number stays the deployment's to name. It is \
-              worth a row rather than a comment because a cap below the working \
-              set is reclaimed every pass -- the cache is emptied and rebuilt each \
-              round, and its size reads the same either way.",
-        published: Some((
-            "crates/cog-reflection/src/plugin.rs",
-            BUILD_TARGET_CAP_METRIC,
-        )),
-    },
-    Tunable {
-        key: "sandboxExecutor.buildCacheMaxBytes",
-        source: Source::Override,
-        why: "3 GiB, the shared default for an executor that names no cap. The \
-              value a derived cap would read is the free space of the volume its \
-              own directory sits on, which this process can measure; nothing feeds \
-              one back into the number yet. A separate row from the one above \
-              rather than one knob spelled twice: the two directories are the same \
-              string under two different claims, so a bound that follows the path \
-              does not follow the volume.",
-        published: Some((
-            "crates/cog-extension/src/build_cache.rs",
-            BUILD_TARGET_CAP_METRIC,
-        )),
-    },
-];
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Published {
+    /// The file that builds the value for this key.
+    owner: String,
+    /// The file that publishes the reading.
+    file: String,
+    /// The metric constant the reading is published under.
+    metric: String,
+    /// The label on that reading that carries where the value came from.
+    label: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Proof {
+    file: String,
+    test: String,
+}
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -112,6 +126,18 @@ fn repo_root() -> PathBuf {
 
 fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+fn registry() -> Registry {
+    let text = read(&repo_root().join(REGISTRY));
+    let registry: Registry = serde_yaml::from_str(&text)
+        .unwrap_or_else(|e| panic!("{REGISTRY} does not parse as a registry: {e}"));
+    assert_eq!(
+        registry.version, 1,
+        "{REGISTRY}: this test reads version 1, and the version is here so that a \
+         change to the row shape is a version bump rather than a silent reinterpretation"
+    );
+    registry
 }
 
 /// `text` without its line comments.
@@ -134,12 +160,126 @@ fn says_the_cap_is_derived(file: &str) -> bool {
         .contains(".with_cap_source(CapSource::Derived)")
 }
 
+/// Whether `text` holds `fn <name>(` and the attribute immediately above it is a
+/// test attribute. A function doesn't prove anything unless something runs it.
+fn has_test(text: &str, name: &str) -> bool {
+    let needle = format!("fn {name}(");
+    let Some(at) = text.find(&needle) else {
+        return false;
+    };
+    let above = &text[..at];
+    above
+        .rsplit_once('\n')
+        .map(|(_, line)| line.trim())
+        .is_some_and(|line| line == "#[test]" || line == "#[tokio::test]")
+        || above
+            .rsplit('\n')
+            .take(2)
+            .any(|line| line.trim() == "#[test]" || line.trim() == "#[tokio::test]")
+}
+
+/// Whether `text` is a number the chart would read as a value: `123`, `0.5`,
+/// `500m`, `80Gi`, with the decimal and binary suffixes Kubernetes accepts.
+fn is_quantity(text: &str) -> bool {
+    let text = text.trim();
+    let text = text.strip_prefix('-').unwrap_or(text);
+    const SUFFIXES: [&str; 11] = ["Ki", "Mi", "Gi", "Ti", "Pi", "k", "M", "G", "T", "P", "m"];
+    let core = SUFFIXES
+        .iter()
+        .find_map(|suffix| text.strip_suffix(suffix))
+        .unwrap_or(text);
+    let mut parts = core.split('.');
+    let Some(whole) = parts.next() else {
+        return false;
+    };
+    let fraction = parts.next();
+    if parts.next().is_some() {
+        return false;
+    }
+    let digits = |part: &str| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit());
+    digits(whole) && fraction.is_none_or(digits)
+}
+
+/// Collect the dotted path of every numeric leaf under `value`.
+fn numeric_leaves(value: &serde_yaml::Value, path: &mut Vec<String>, out: &mut BTreeSet<String>) {
+    match value {
+        serde_yaml::Value::Mapping(map) => {
+            for (key, child) in map {
+                let key = match key {
+                    serde_yaml::Value::String(s) => s.clone(),
+                    other => format!("{other:?}"),
+                };
+                path.push(key);
+                numeric_leaves(child, path, out);
+                path.pop();
+            }
+        }
+        serde_yaml::Value::Sequence(items) => {
+            for (index, child) in items.iter().enumerate() {
+                path.push(index.to_string());
+                numeric_leaves(child, path, out);
+                path.pop();
+            }
+        }
+        serde_yaml::Value::Number(_) => {
+            out.insert(path.join("."));
+        }
+        // `auto` is a number written as a word: a cap the walks derive is still
+        // a number the deployment ships, and a value that dropped out of the
+        // numeric set would read as prose rather than as a dial.
+        serde_yaml::Value::String(s) if is_quantity(s) || s.trim().eq_ignore_ascii_case("auto") => {
+            out.insert(path.join("."));
+        }
+        _ => {}
+    }
+}
+
 #[test]
-fn every_tunable_says_why_its_value_is_not_derived() {
+fn every_numeric_leaf_of_the_chart_has_exactly_one_row() {
+    let values: serde_yaml::Value = serde_yaml::from_str(&read(&repo_root().join(VALUES)))
+        .unwrap_or_else(|e| panic!("{VALUES} does not parse: {e}"));
+    let mut leaves = BTreeSet::new();
+    numeric_leaves(&values, &mut Vec::new(), &mut leaves);
+
+    let registry = registry();
+    let mut rows: BTreeMap<&str, usize> = BTreeMap::new();
+    for row in &registry.rows {
+        *rows.entry(row.key.as_str()).or_default() += 1;
+    }
+
+    let mut missing = Vec::new();
+    for leaf in &leaves {
+        if !rows.contains_key(leaf.as_str()) {
+            missing.push(leaf.as_str());
+        }
+    }
+    let mut unknown = Vec::new();
+    for (key, count) in &rows {
+        if *count > 1 {
+            unknown.push(format!("`{key}` has {count} rows"));
+        } else if !leaves.contains(*key) {
+            unknown.push(format!("`{key}` is not a numeric leaf of {VALUES}"));
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "these chart values have no row, so nobody has said whether a measurement \
+         should move them: {missing:#?}"
+    );
+    assert!(
+        unknown.is_empty(),
+        "these rows describe something the chart does not ship as a number: \
+         {unknown:#?}"
+    );
+}
+
+#[test]
+fn every_row_says_why_it_is_not_derived() {
     let mut silent = Vec::new();
-    for t in TUNABLES {
-        if t.why.trim().is_empty() {
-            silent.push(format!("`{}` ({:?})", t.key, t.source));
+    for row in &registry().rows {
+        if row.why.trim().is_empty() {
+            silent.push(format!("`{}` ({:?})", row.key, row.source));
         }
     }
     assert!(
@@ -151,62 +291,50 @@ fn every_tunable_says_why_its_value_is_not_derived() {
 }
 
 #[test]
-fn every_tunable_names_a_key_the_chart_sets() {
-    let values = read(&repo_root().join("deploy/helm/cogneva/values.yaml"));
-    let mut unknown = Vec::new();
-    for t in TUNABLES {
-        let leaf = t.key.rsplit('.').next().unwrap_or(t.key);
-        let set = values.lines().any(|line| {
-            line.trim_start()
-                .split_once(':')
-                .is_some_and(|(key, rest)| key == leaf && !rest.trim().is_empty())
-        });
-        if !set {
-            unknown.push(t.key);
-        }
-    }
-    assert!(
-        unknown.is_empty(),
-        "these rows name a key the chart does not set a value for, so the \
-         registry describes a dial no deployment has: {unknown:#?}"
-    );
-}
-
-#[test]
-fn a_tunable_is_registered_as_the_source_its_publisher_uses() {
+fn a_derived_row_names_the_test_that_moves_its_input() {
     let mut wrong = Vec::new();
-    for t in TUNABLES {
-        let Some((file, _)) = t.published else {
+    for row in &registry().rows {
+        if row.source != Source::Derived {
+            continue;
+        }
+        if row.published.is_none() {
+            wrong.push(format!(
+                "`{}` is registered as derived and names no reading, so a reader \
+                 cannot see where the number went",
+                row.key
+            ));
+        }
+        let Some(proof) = &row.proof else {
+            wrong.push(format!(
+                "`{}` is registered as derived and names no test, so nothing shows \
+                 the value following the input it claims to read",
+                row.key
+            ));
             continue;
         };
-        let published_as_derived = says_the_cap_is_derived(file);
-        if published_as_derived != (t.source == Source::Derived) {
+        let text = read(&repo_root().join(&proof.file));
+        if !has_test(&text, &proof.test) {
             wrong.push(format!(
-                "`{}` is registered as {:?}, and `{file}` publishes its cap {} \
-                 saying where the cap came from",
-                t.key,
-                t.source,
-                if published_as_derived {
-                    "while"
-                } else {
-                    "without"
-                }
+                "`{}` is registered as derived and its proof `{}` is not a test in \
+                 `{}`",
+                row.key, proof.test, proof.file
             ));
         }
     }
     assert!(
         wrong.is_empty(),
-        "a value registered as one thing and published as another reads as \
-         derived to everyone who only sees the reading: {wrong:#?}"
+        "a value registered as derived without a test that moves its input is a \
+         constant with a comment: {wrong:#?}"
     );
 }
 
 #[test]
 fn a_value_that_lands_on_a_reading_has_a_word_the_reading_can_carry() {
+    let registry = registry();
     let mut unnameable = Vec::new();
-    for t in TUNABLES {
-        if t.published.is_some() && t.source.as_label().is_none() {
-            unnameable.push(t.key);
+    for row in &registry.rows {
+        if row.published.is_some() && row.source.as_label().is_none() {
+            unnameable.push(row.key.as_str());
         }
     }
     assert!(
@@ -214,7 +342,104 @@ fn a_value_that_lands_on_a_reading_has_a_word_the_reading_can_carry() {
         "these values are registered as landing on a reading, and the source \
          they are registered with is one the reading's label cannot take, so the \
          reading would have to say something else about where the number came \
-         from: {unnameable:?}"
+         from: {unnameable:#?}"
+    );
+}
+
+#[test]
+fn a_published_row_names_a_file_that_publishes_its_metric_and_label() {
+    let mut wrong = Vec::new();
+    for row in &registry().rows {
+        let Some(published) = &row.published else {
+            continue;
+        };
+        let text = without_line_comments(&read(&repo_root().join(&published.file)));
+        if !text.contains(&published.metric) {
+            wrong.push(format!(
+                "`{}` lands on `{}`, and `{}` never mentions it",
+                row.key, published.metric, published.file
+            ));
+        }
+        let quoted = format!("\"{}\"", published.label);
+        let constant = format!("{}_LABEL", published.label.to_uppercase());
+        if !text.contains(&quoted) && !text.contains(&constant) {
+            wrong.push(format!(
+                "`{}` lands on a reading labelled `{}`, and `{}` carries neither \
+                 the word nor `{constant}`",
+                row.key, published.label, published.file
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "a row naming a reading that does not publish it is a claim about a \
+         number nobody can look up: {wrong:#?}"
+    );
+}
+
+/// The value at a dotted path, if the chart has one.
+fn leaf_at<'a>(value: &'a serde_yaml::Value, key: &str) -> Option<&'a serde_yaml::Value> {
+    let mut current = value;
+    for part in key.split('.') {
+        current = match current {
+            serde_yaml::Value::Mapping(map) => {
+                map.get(serde_yaml::Value::String(part.to_string()))?
+            }
+            serde_yaml::Value::Sequence(items) => items.get(part.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(current)
+}
+
+#[test]
+fn a_cap_rows_owner_does_not_publish_it_as_derived_unless_it_says_so() {
+    let values: serde_yaml::Value = serde_yaml::from_str(&read(&repo_root().join(VALUES)))
+        .unwrap_or_else(|e| panic!("{VALUES} does not parse: {e}"));
+    let mut wrong = Vec::new();
+    for row in &registry().rows {
+        let Some(published) = &row.published else {
+            continue;
+        };
+        if published.metric != CAP_METRIC {
+            continue;
+        }
+        let owner = without_line_comments(&read(&repo_root().join(&published.owner)));
+        if !owner.contains(".with_cap(") {
+            wrong.push(format!(
+                "`{}` names `{}` as the file that builds the cap, and that file \
+                 never sets one",
+                row.key, published.owner
+            ));
+        }
+        // Which of the two the reading says is decided by what the chart
+        // ships: `auto` makes the publisher derive the cap and say so, a number
+        // makes it publish the number. The row has to describe the reading the
+        // shipped chart actually produces, and a publisher that cannot read
+        // `auto` would ignore the sentinel in silence.
+        let ships_auto = leaf_at(&values, &row.key)
+            .is_some_and(|v| matches!(v, serde_yaml::Value::String(s) if s.trim() == "auto"));
+        if ships_auto && !says_the_cap_is_derived(&published.owner) {
+            wrong.push(format!(
+                "`{}` ships `auto`, and `{}` has no branch that derives a cap, so \
+                 the sentinel would be read as a value nobody configured",
+                row.key, published.owner
+            ));
+        }
+        if ships_auto != (row.source == Source::Derived) {
+            wrong.push(format!(
+                "`{}` is registered as {:?}, and the chart ships {}, so the reading \
+                 would carry the other word",
+                row.key,
+                row.source,
+                if ships_auto { "`auto`" } else { "a number" }
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "a value registered as one thing and published as another reads as \
+         derived to everyone who only sees the reading: {wrong:#?}"
     );
 }
 
@@ -272,17 +497,22 @@ async fn every_reading_a_tunable_lands_on_says_where_its_value_came_from() {
         }
     }
 
-    // And the reading each row names is one of those.
+    // And the reading each cap row names is one of those. A row that lands on a
+    // reading this test cannot build is not checked here; the file-level test
+    // above is what holds those.
     let mut checked = 0;
     let metrics = bounded().collect_metrics("").await.unwrap();
-    for t in TUNABLES {
-        let Some((_, metric)) = t.published else {
+    for row in &registry().rows {
+        let Some(published) = &row.published else {
             continue;
         };
-        if !metrics.iter().any(|m| m.name == metric) {
+        if published.metric != CAP_METRIC {
+            continue;
+        }
+        if !metrics.iter().any(|m| m.name == BUILD_TARGET_CAP_METRIC) {
             wrong.push(format!(
-                "`{}` lands on `{metric}`, which a bounded cache does not publish",
-                t.key
+                "`{}` lands on `{}`, which a bounded cache does not publish",
+                row.key, published.metric
             ));
             continue;
         }
