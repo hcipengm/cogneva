@@ -1,3 +1,9 @@
+//! principle: feedback_meta_autonomy_decide_from_principles
+//! principle: feedback_shared_tree_add_only_your_own_paths
+//! principle: feedback_no_claude_attribution
+//! principle: feedback_an_extracted_document_is_frozen_new_rounds_get_a_new_dated_doc
+//! principle: feedback_numbering_and_plain_language
+//!
 //! The sentence shapes this project's principles forbid, in one place.
 //!
 //! Every shape below is a form the project's own working memory has refused at
@@ -144,6 +150,54 @@ pub const ALL_SHAPES: &[(&str, &str)] = &[
     ("FROZEN_DOC_RE", FROZEN_DOC_RE),
 ];
 
+/// The principle each shape belongs to, keyed by the name a refusal reports.
+///
+/// A refusal that carries only this table's own rule name tells an operator which
+/// internal pattern fired and nothing about what was protected: the count lands
+/// on a string only this crate knows, and the account cannot file it against a
+/// principle. The second column is the name the account files it under, so the
+/// refusal can say it too.
+///
+/// The values are not free text. Every one but the first entry is a slug the
+/// platform's declaration reader accepts, and this file declares each of them in
+/// its own header; those header lines are how the account answers "which file
+/// goes red" without asking the host. The exception is `DESTRUCTIVE_GIT_RE`: its
+/// rule lives in the host's personal rules file, whose account row is keyed
+/// `CLAUDE`, and the platform's slug rule (lowercase, digits, underscore) cannot
+/// hold that word. Declaring it in the header would make the platform read its
+/// own header as an unreadable declaration on every pass, so it is deliberately
+/// left out and the test below pins it as the one such entry rather than letting
+/// the gap be discovered as a warning nobody expected.
+pub const SHAPE_PRINCIPLES: &[(&str, &str)] = &[
+    (
+        "DEFERRAL_SHAPES",
+        "feedback_meta_autonomy_decide_from_principles",
+    ),
+    (
+        "NARROW_ADD_RE",
+        "feedback_shared_tree_add_only_your_own_paths",
+    ),
+    (
+        "BARE_COMMIT_RE",
+        "feedback_shared_tree_add_only_your_own_paths",
+    ),
+    ("DESTRUCTIVE_GIT_RE", "CLAUDE"),
+    ("AI_TRAILER_RE", "feedback_no_claude_attribution"),
+    (
+        "FROZEN_DOC_RE",
+        "feedback_an_extracted_document_is_frozen_new_rounds_get_a_new_dated_doc",
+    ),
+    ("CIRCLED_CHARS", "feedback_numbering_and_plain_language"),
+];
+
+/// The principle a shape belongs to, if the table names it.
+pub fn principle_of(shape: &str) -> Option<&'static str> {
+    SHAPE_PRINCIPLES
+        .iter()
+        .find(|(name, _)| *name == shape)
+        .map(|(_, slug)| *slug)
+}
+
 /// The name of the first shape `text` matches, or `None` when it is clean.
 ///
 /// The name is what a refusal is reported under, so a caller that blocks on this
@@ -262,7 +316,10 @@ impl cog_core::Guardrail for PrincipleShapeGuard {
             .find_map(|subject| first_match(subject))
         {
             Some(shape) => cog_core::GuardResult::Block {
-                reason: format!("工具调用带着形状表禁止的一项（{shape}）"),
+                reason: match principle_of(shape) {
+                    Some(slug) => format!("工具调用带着形状表禁止的一项（{shape}，原则 {slug}）"),
+                    None => format!("工具调用带着形状表禁止的一项（{shape}）"),
+                },
                 rule: format!("principle_shapes:{shape}"),
             },
             None => cog_core::GuardResult::Pass,
@@ -313,6 +370,63 @@ mod tests {
                 "the host keys a shape {expected} that this table does not publish"
             );
         }
+    }
+
+    /// Every name a refusal can carry belongs to a principle, and the principles
+    /// this file declares in its own header are exactly the ones the table names.
+    ///
+    /// Two answers have to agree for the account to be able to say anything: the
+    /// table says which principle a fired shape belongs to, and the header says
+    /// which principles this file gates. A shape added with a pattern but no
+    /// entry here would be refused under a name the account cannot file; an entry
+    /// with no header line would be a principle the platform never reports as
+    /// gated by this file. Neither shows up as a failure at run time -- the gate
+    /// keeps refusing -- so this test is the only place they can be caught.
+    #[test]
+    fn every_shape_names_the_principle_it_stands_for() {
+        let mut names: Vec<&str> = ALL_SHAPES.iter().map(|(n, _)| *n).collect();
+        names.push("DEFERRAL_SHAPES");
+        names.push("CIRCLED_CHARS");
+        let mut slugs: Vec<&str> = names
+            .iter()
+            .map(|name| {
+                principle_of(name).unwrap_or_else(|| panic!("shape {name} names no principle"))
+            })
+            .collect();
+
+        let source = include_str!("principle_shapes.rs");
+        let declared: Vec<&str> = source
+            .lines()
+            .filter_map(|line| line.trim_start().strip_prefix("//! principle:"))
+            .map(str::trim)
+            .collect();
+
+        // `CLAUDE` is the one account key the platform's slug rule cannot hold,
+        // so it is deliberately not declared here (see `SHAPE_PRINCIPLES`). It
+        // stays in this test rather than out of it: the day that key becomes
+        // declarable, this expectation is what says so.
+        slugs.sort_unstable();
+        slugs.dedup();
+        let undeclared: Vec<&str> = slugs
+            .iter()
+            .copied()
+            .filter(|slug| !declared.contains(slug))
+            .collect();
+        assert_eq!(
+            undeclared,
+            vec!["CLAUDE"],
+            "these principles fire in this file but the header does not declare them"
+        );
+
+        let stale: Vec<&str> = declared
+            .iter()
+            .copied()
+            .filter(|slug| !slugs.contains(slug))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "the header declares principles no shape in this table belongs to: {stale:?}"
+        );
     }
 
     /// The layout the header promises: every pattern sits complete on one line,
