@@ -4,7 +4,9 @@
 //!
 //! - 黑名单（依赖清单 / 密钥文件）→ 直接拒收，连沙盒都不让进；
 //! - 全部落在 L0 配置路径 → 热更新通道（不碰二进制）；
-//! - 触及 L2 核心路径（存储 / 调度 / 安全网关 / 凭证 / 部署）→ 人工审批；
+//! - 触及 L2 核心路径（存储 / 调度 / 安全网关 / 凭证）→ 人工审批；
+//! - 全部落在 `deploy/**` → 自动晋级（这一族由应用侧的可执行准入条件判，判不过的
+//!   变更在应用那一步就被拒收，走不到这里）；
 //! - 全部落在 L1 白名单且 diff 不超限 → 自动金丝雀晋级；
 //! - 其余路径族 → 拒收，并点名是哪一族没有准入条件。
 //!
@@ -122,6 +124,21 @@ fn is_member_src(path: &str) -> bool {
         && parts.next() == Some("src")
 }
 
+/// `deploy/...`：部署拓扑这一族。
+///
+/// 按**分量**判，与流水线里那条准入条件的族边界逐字相同（`deploy/` 下不允许
+/// 空段、`.`、`..`）：分类与准入对「这一笔算不算部署」必须给同一个答案，否则
+/// 一笔 `deploy/../x` 会在准入那里被当成部署、在这里被当成别的族。
+fn is_deploy_path(path: &str) -> bool {
+    let path = path.replace('\\', "/");
+    path.strip_prefix("deploy/").is_some_and(|rest| {
+        !rest.is_empty()
+            && rest
+                .split('/')
+                .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+    })
+}
+
 /// The directory components a change may not reach into, on the same terms as
 /// [`forbidden_names`].
 ///
@@ -147,10 +164,11 @@ fn forbidden_dir_segments<'a>(
 /// 3. diff 行数超上限 → RequireApproval；
 /// 4. 全部文件落在 L0 配置路径 → AutoConfig（配置路径是核心路径的
 ///    特例，必须先判；混入任何非配置文件会自然掉到后续判定）；
-/// 5. 任一文件命中 L2 核心路径 → RequireApproval（准入条件里缺的那一条写进理由）；
-/// 6. 全部文件是成员 crate 的 `src/` → AutoRollout（编译 + 测试已在沙盒跑过）；
-/// 7. 全部文件落在 L1 白名单 → AutoRollout；
-/// 8. 其余 → Reject（这条路径族没有准入条件）。
+/// 5. 全部文件是 `deploy/**` → AutoRollout（这一族的准入条件在应用侧执行）；
+/// 6. 任一文件命中 L2 核心路径 → RequireApproval（准入条件里缺的那一条写进理由）；
+/// 7. 全部文件是成员 crate 的 `src/` → AutoRollout（编译 + 测试已在沙盒跑过）；
+/// 8. 全部文件落在 L1 白名单 → AutoRollout；
+/// 9. 其余 → Reject（这条路径族没有准入条件）。
 pub fn classify(files: &[String], diff_lines: usize, policy: &PromotionGateConfig) -> GateVerdict {
     if files.is_empty() {
         return GateVerdict::Reject {
@@ -197,6 +215,17 @@ pub fn classify(files: &[String], diff_lines: usize, policy: &PromotionGateConfi
         .all(|f| matches_any(f, &policy.config_prefixes))
     {
         return GateVerdict::AutoConfig;
+    }
+
+    // 部署拓扑这一族由**可执行条件**判，不由人判：条件在应用那一侧跑（渲染新鲜度、
+    // parity、服务端 dry-run、回滚走过一遍），跑不过的变更在那里就被拒收、连这一格
+    // 都到不了。所以到了这里还活着的部署变更，是条件全过的那些。
+    //
+    // 它此前落在下面的核心路径档，于是条件全过的变更仍要挂 24 小时等人，到点被
+    // 判失败——那不是更安全，那是把「有条件可落」实现成「有通路但没人走」。条件
+    // 已经由程序判完了，这一格再要一个人，等于同一件事判两遍、第二遍永远没人来。
+    if files.iter().all(|f| is_deploy_path(f)) {
+        return GateVerdict::AutoRollout;
     }
 
     if let Some(core) = files.iter().find(|f| matches_any(f, &policy.core_prefixes)) {
@@ -447,14 +476,45 @@ mod tests {
         assert!(matches!(v, GateVerdict::RequireApproval { .. }), "{v:?}");
     }
 
+    /// 部署拓扑这一族不进人工审批：它的条件是在应用那一侧逐条跑的可执行命令，
+    /// 跑不过的变更在那里就被拒收。条件全过还挂一个人，就是把「有条件可落」写成
+    /// 「有通路但没人走」——挂到期限后按理由判失败，等于程序判过一遍再让人空判一遍。
     #[test]
-    fn deploy_dir_requires_approval_except_configmap() {
+    fn deploy_change_rolls_on_its_own_admission_conditions() {
         let v = classify(
             &files(&["deploy/k3s/evolution-deployment.yaml"]),
             10,
             &policy(),
         );
+        assert_eq!(v, GateVerdict::AutoRollout);
+    }
+
+    /// 同时碰部署与别的族的一笔变更不进自动档：没有任何一族的准入条件整笔覆盖它，
+    /// 拿部署族的条件替它背书，等于让一个 `crates/cog-core` 的改动搭着部署变更
+    /// 的车过去。它仍落在核心路径那一档。
+    #[test]
+    fn a_mixed_change_that_touches_the_topology_still_waits_for_a_person() {
+        let v = classify(
+            &files(&["deploy/helm/x.yaml", "prompts/default.yaml"]),
+            10,
+            &policy(),
+        );
         assert!(matches!(v, GateVerdict::RequireApproval { .. }), "{v:?}");
+    }
+
+    /// 族边界按**分量**判，与准入那一侧同一个边界：`deploy/../x` 在准入那里不是
+    /// 部署路径（那一条要求每段都干净），所以部署族的条件不会为它跑。分级这一侧
+    /// 不能自作主张把它算成部署族的自动档——它拿不到那一族的背书，落回核心路径
+    /// 那一档，由人看。两边的结论可以不同，但**都不能说它是部署族**。
+    #[test]
+    fn a_deploy_path_that_escapes_the_directory_is_not_this_family() {
+        let v = classify(&files(&["deploy/../crates/x/src/lib.rs"]), 10, &policy());
+        match v {
+            GateVerdict::RequireApproval { kind, .. } => {
+                assert_eq!(kind, PromotionGateKind::ApprovalCorePath)
+            }
+            other => panic!("expected RequireApproval, got {other:?}"),
+        }
     }
 
     #[test]

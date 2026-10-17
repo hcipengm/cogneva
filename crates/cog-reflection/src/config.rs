@@ -102,6 +102,10 @@ impl Default for PromotionGateConfig {
                 "web/".into(),
                 "docs/".into(),
             ],
+            // `deploy/` 留在这张表里只是**混合变更的兜底**：纯粹的部署变更在分级
+            // 里更早地判成自动晋级（那一族的准入条件在应用侧由程序判，判不过的变更
+            // 到不了晋级门）。而一笔同时碰部署与别的族的变更，仍按核心路径转人工
+            // ——它没有被哪一族的条件整笔覆盖，这里不替它猜。
             core_prefixes: vec![
                 "crates/cog-core/".into(),
                 "crates/cog-storage/".into(),
