@@ -91,6 +91,10 @@ const ENV_NAMESPACE: &str = "COGNEVA_EVAL_TOOLATHLON_NAMESPACE";
 const ENV_PACK_IMAGE: &str = "COGNEVA_EVAL_TOOLATHLON_IMAGE";
 const ENV_PG_IMAGE: &str = "COGNEVA_EVAL_TOOLATHLON_PG_IMAGE";
 const ENV_TIMEOUT_SECS: &str = "COGNEVA_EVAL_TOOLATHLON_TIMEOUT_SECS";
+/// pack 容器的 limits 覆盖位。两个必须一起给：它们是一对，单独改一个只会在额度
+/// 或内存的另一侧撞墙（额度按 limits 求和，内存不够则是 OOM）。
+const ENV_PACK_CPU_LIMIT: &str = "COGNEVA_EVAL_TOOLATHLON_CPU_LIMIT";
+const ENV_PACK_MEMORY_LIMIT: &str = "COGNEVA_EVAL_TOOLATHLON_MEMORY_LIMIT";
 /// 运行时的开关：设成 `off` 就是这一次不接。
 const ENV_RUNTIME: &str = "COGNEVA_EVAL_TOOLATHLON_RUNTIME";
 const DEFAULT_NAMESPACE: &str = "cogneva";
@@ -102,6 +106,19 @@ const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 
 /// 等库就绪的上界（秒）。超过就报「库没起来」，不是继续跑下去把每一格都判成错。
 const PG_READY_DEADLINE_SECS: u64 = 300;
+
+/// pack 容器（跑题的那一个）的 limits。**这两个数是被额度逼出来的，不是拍的**：
+/// 命名空间的 `ResourceQuota` 按 limits 求和，而平台的常驻服务已经占掉其中七成半
+/// （实测 18100m / 23 CPU、41.6 / 46 GiB），剩下的只够一台这么宽的 Pod。
+/// 超过它就是 API server 直接 403，一题都跑不起来——比「跑得慢」更糟，所以这里取余量，
+/// 不取「这道题最多能用多少」。两个值成对给：单独抬一个只会换一种方式撞墙。
+/// 缺省值来自一次真跑：3 CPU / 3 GiB 的 Pod 里，一道真题的 `preprocess/main.py` 6 秒、
+/// `evaluation/main.py` 2 秒跑完。
+const DEFAULT_PACK_CPU_LIMIT: &str = "2";
+const DEFAULT_PACK_MEMORY_LIMIT: &str = "3Gi";
+/// postgres sidecar 的 limits。它只装一道题要用的那点数据，2 CPU 从来没有被用满过。
+const DEFAULT_PG_CPU_LIMIT: &str = "1";
+const DEFAULT_PG_MEMORY_LIMIT: &str = "1Gi";
 
 /// 一次 `kubectl` 调用的结局。
 #[derive(Debug, Clone)]
@@ -325,11 +342,31 @@ fn container_groundtruth_dir(case: &EvalCase) -> String {
     format!("{}/groundtruth_workspace", container_task_dir(case))
 }
 
-/// 一份 Pod 清单。纯函数、吃两个镜像名和一个 Pod 名，所以它的形状能被单测直接钉住。
+/// 一台 Pod 的资源上限。四个值都从构造时的那次探测/覆盖读进来，不在这里写第二遍。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PodLimits {
+    pack_cpu: String,
+    pack_memory: String,
+    pg_cpu: String,
+    pg_memory: String,
+}
+
+impl Default for PodLimits {
+    fn default() -> Self {
+        Self {
+            pack_cpu: DEFAULT_PACK_CPU_LIMIT.to_string(),
+            pack_memory: DEFAULT_PACK_MEMORY_LIMIT.to_string(),
+            pg_cpu: DEFAULT_PG_CPU_LIMIT.to_string(),
+            pg_memory: DEFAULT_PG_MEMORY_LIMIT.to_string(),
+        }
+    }
+}
+
+/// 一份 Pod 清单。纯函数、吃两个镜像名、一个 Pod 名和一组资源上限，所以它的形状能被单测直接钉住。
 ///
 /// 写 JSON 不写 YAML：`kubectl` 两条都收，而 JSON 是 serde_json 直接吐出来的，
 /// 少引一个 YAML 依赖、也少一处手写缩进会错的地方。
-fn manifest(pod: &str, pack_image: &str, pg_image: &str) -> serde_json::Value {
+fn manifest(pod: &str, pack_image: &str, pg_image: &str, limits: &PodLimits) -> serde_json::Value {
     let labels = serde_json::json!({
         // 一个新 component：现网那 5 条 NetworkPolicy 全部按这个键收窄，所以这台 Pod
         // **一条都不被选中**——同命名空间内的默认放行就是它要的网。这不是绕过策略，
@@ -375,7 +412,7 @@ fn manifest(pod: &str, pack_image: &str, pg_image: &str) -> serde_json::Value {
                     "volumeMounts": [{ "name": "initdb", "mountPath": PG_INITDB_DIR }],
                     "resources": {
                         "requests": { "cpu": "200m", "memory": "256Mi" },
-                        "limits": { "cpu": "2", "memory": "1Gi" }
+                        "limits": { "cpu": limits.pg_cpu, "memory": limits.pg_memory }
                     }
                 },
                 {
@@ -397,7 +434,7 @@ fn manifest(pod: &str, pack_image: &str, pg_image: &str) -> serde_json::Value {
                     ],
                     "resources": {
                         "requests": { "cpu": "200m", "memory": "512Mi" },
-                        "limits": { "cpu": "4", "memory": "6Gi" }
+                        "limits": { "cpu": limits.pack_cpu, "memory": limits.pack_memory }
                     }
                 }
             ]
@@ -448,6 +485,7 @@ pub struct PodToolathlonBackend {
     runtime: Arc<PodRuntime>,
     pack_image: String,
     pg_image: String,
+    limits: PodLimits,
 }
 
 impl PodToolathlonBackend {
@@ -463,10 +501,17 @@ impl PodToolathlonBackend {
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| fallback.to_string())
         };
+        let defaults = PodLimits::default();
         Ok(Some(Self {
             runtime: Arc::new(runtime),
             pack_image: image_or(ENV_PACK_IMAGE, DEFAULT_PACK_IMAGE),
             pg_image: image_or(ENV_PG_IMAGE, DEFAULT_PG_IMAGE),
+            limits: PodLimits {
+                pack_cpu: image_or(ENV_PACK_CPU_LIMIT, &defaults.pack_cpu),
+                pack_memory: image_or(ENV_PACK_MEMORY_LIMIT, &defaults.pack_memory),
+                pg_cpu: defaults.pg_cpu,
+                pg_memory: defaults.pg_memory,
+            },
         }))
     }
 
@@ -483,7 +528,7 @@ impl PodToolathlonBackend {
         let path = manifest_path(&name);
         std::fs::write(
             &path,
-            manifest(&name, &self.pack_image, &self.pg_image).to_string(),
+            manifest(&name, &self.pack_image, &self.pg_image, &self.limits).to_string(),
         )
         .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", path.display()))?;
         let out = self
@@ -983,7 +1028,12 @@ mod tests {
 
     #[test]
     fn the_manifest_gives_the_sidecar_its_init_script_by_the_official_mechanism() {
-        let m = manifest("ta-x-0", "localhost:30500/pack:latest", "postgres:15");
+        let m = manifest(
+            "ta-x-0",
+            "localhost:30500/pack:latest",
+            "postgres:15",
+            &PodLimits::default(),
+        );
         let containers = m["spec"]["containers"].as_array().unwrap();
         assert_eq!(containers.len(), 2);
         // 库那一台：镜像、库名/用户/口令、以及与 compose 同一个挂载点。
@@ -1020,6 +1070,19 @@ mod tests {
             .iter()
             .find_map(|e| (e["name"] == "PGHOST").then(|| e["value"].as_str().unwrap()));
         assert_eq!(host, Some("127.0.0.1"));
+        // 资源上限从调用方那一组流下来：额度按 limits 求和，这两个数决定这台 Pod 进不进得去。
+        assert_eq!(
+            app["resources"]["limits"]["cpu"],
+            serde_json::json!(DEFAULT_PACK_CPU_LIMIT)
+        );
+        assert_eq!(
+            app["resources"]["limits"]["memory"],
+            serde_json::json!(DEFAULT_PACK_MEMORY_LIMIT)
+        );
+        assert_eq!(
+            pg["resources"]["limits"]["memory"],
+            serde_json::json!(DEFAULT_PG_MEMORY_LIMIT)
+        );
         // 这台 Pod 不跟 API server 说话。
         assert_eq!(
             m["spec"]["automountServiceAccountToken"],
@@ -1029,6 +1092,31 @@ mod tests {
         assert_eq!(
             m["metadata"]["labels"]["app.kubernetes.io/component"],
             "eval-toolathlon"
+        );
+    }
+
+    #[test]
+    fn the_limits_are_the_callers_not_a_literal_in_the_manifest() {
+        // 覆盖位必须真的走到清单里：额度紧的时候这两个数要能被改，改不动就白搭。
+        let limits = PodLimits {
+            pack_cpu: "7".into(),
+            pack_memory: "9Gi".into(),
+            pg_cpu: "3".into(),
+            pg_memory: "2Gi".into(),
+        };
+        let m = manifest("ta-x-0", "pack", "pg", &limits);
+        let containers = m["spec"]["containers"].as_array().unwrap();
+        let app = containers.iter().find(|c| c["name"] == "app").unwrap();
+        let pg = containers.iter().find(|c| c["name"] == "postgres").unwrap();
+        assert_eq!(app["resources"]["limits"]["cpu"], serde_json::json!("7"));
+        assert_eq!(
+            app["resources"]["limits"]["memory"],
+            serde_json::json!("9Gi")
+        );
+        assert_eq!(pg["resources"]["limits"]["cpu"], serde_json::json!("3"));
+        assert_eq!(
+            pg["resources"]["limits"]["memory"],
+            serde_json::json!("2Gi")
         );
     }
 
