@@ -767,6 +767,12 @@ gitops:
   kubectlBin:
     enabled: false
     hostPath: /usr/local/bin/k3s
+  # 部署准入条件里的 chart 渲染 / parity 在进化 Pod 内跑，需要 helm。与 kubectl
+  # 同一条思路：挂宿主已有的二进制，版本由宿主管、镜像不背一个下载器；宿主没装
+  # 时置 false，这一族就没有可执行的渲染检查（变更会被点名缺条件，不会转人工）。
+  helmBin:
+    enabled: false
+    hostPath: /usr/local/bin/helm
 
 # 平台 webhook 集群入口（GitHub + Gitee 共用）：NodePort 转发安全网关 8082。
 webhook:

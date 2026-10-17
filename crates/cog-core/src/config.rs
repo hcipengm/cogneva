@@ -1272,6 +1272,16 @@ pub struct SelfEvolutionConfig {
     /// change's own evidence says the stage did not run, because a judge that
     /// never spoke and one that spoke and found nothing are different readings.
     pub fmt_check_command: Option<Vec<String>>,
+    /// The executable admission conditions for a change that touches the
+    /// deployment topology (`deploy/**`), as commands this deployment declares.
+    ///
+    /// Omitted: the family has no executable condition, and a change touching
+    /// it is refused by name. That refusal is deliberate — "wait for a person"
+    /// is not a condition, and a ticket no one owns neither lands nor closes.
+    /// Declared: `commands` run against the applied tree and all must pass;
+    /// `server_dry_run` is the argv prefix of a cluster-side dry run, with the
+    /// rendered file the change touched appended as its last argument.
+    pub deploy_admission: Option<DeployAdmissionConfig>,
     /// The command that lints a change's tree, as argv.
     ///
     /// Omitted: this workspace's own linter. It is the only one whose findings
@@ -1310,6 +1320,57 @@ pub struct SelfEvolutionConfig {
 /// reports no error. Both sides take the subpath from here instead.
 pub fn self_evolution_hook_dir(change_dir: impl AsRef<std::path::Path>) -> std::path::PathBuf {
     change_dir.as_ref().join("hooks")
+}
+
+/// What a change that touches `deploy/**` has to clear before it may land.
+///
+/// Every entry is executable. The family is judged by running these, never by
+/// asking someone: a topology change has an answer either way, and an answer
+/// that depends on a person being present is not a condition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DeployAdmissionConfig {
+    /// Commands run, in order, in the applied tree. Every one must succeed;
+    /// the first failure is the refusal, with its output as the reason.
+    ///
+    /// Argv, not a shell line: a configured value does not become code the
+    /// platform has to interpret, and a project declares what it runs rather
+    /// than what a shell would do with a string.
+    pub commands: Vec<Vec<String>>,
+    /// argv prefix for the server-side dry run. Each rendered file the change
+    /// touched is appended as the final argument, so the check is "does the
+    /// cluster accept this exact object", not "is the file syntactically
+    /// YAML". Omitted means the deployment has not enabled this check, and
+    /// the family is admitted without it — a deployment that cannot reach its
+    /// own API server from the judging process says so by leaving it out,
+    /// rather than by the check failing every time.
+    pub server_dry_run: Option<Vec<String>>,
+}
+
+impl Default for DeployAdmissionConfig {
+    fn default() -> Self {
+        Self {
+            commands: Vec::new(),
+            server_dry_run: None,
+        }
+    }
+}
+
+impl DeployAdmissionConfig {
+    /// Whether this declaration names anything that can actually run.
+    ///
+    /// An empty list, or a list holding an empty argv, is not a condition: it
+    /// would admit every change while reading as "conditions declared".
+    pub fn is_executable(&self) -> bool {
+        let commands_ok = !self.commands.is_empty()
+            && self.commands.iter().all(|c| !c.is_empty())
+            && self.commands.iter().all(|c| !c[0].is_empty());
+        let dry_run_ok = self
+            .server_dry_run
+            .as_ref()
+            .is_none_or(|p| !p.is_empty() && !p[0].is_empty());
+        commands_ok && dry_run_ok
+    }
 }
 
 impl SelfEvolutionConfig {
@@ -1356,6 +1417,7 @@ impl Default for SelfEvolutionConfig {
             test_command: Self::default_test_command(),
             fmt_check_command: None,
             lint_command: None,
+            deploy_admission: None,
             build_timeout_secs: 3600,
             poll_interval_secs: 60,
             schema_repair_interval_secs: 600,

@@ -304,6 +304,10 @@ spec:
             - name: kubectl-bin
               mountPath: /usr/local/bin/kubectl
               readOnly: true
+            # 部署准入条件（chart 渲染 + parity）在判定进程里跑，helm 来自宿主。
+            - name: helm-bin
+              mountPath: /usr/local/bin/helm
+              readOnly: true
           resources:
             limits:
               cpu: 4000m
@@ -341,4 +345,8 @@ spec:
         - name: kubectl-bin
           hostPath:
             path: /usr/local/bin/k3s
+            type: File
+        - name: helm-bin
+          hostPath:
+            path: /usr/local/bin/helm
             type: File

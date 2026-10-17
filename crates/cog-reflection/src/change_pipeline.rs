@@ -85,6 +85,15 @@ const BUILTIN_FMT_PROBE: &[&str] = &["cargo", "fmt", "--version"];
 const BUILTIN_FMT_CHECK: &[&str] = &["cargo", "fmt", "--all", "--", "--check"];
 const BUILTIN_FMT_CONFORM: &[&str] = &["cargo", "fmt", "--all"];
 
+/// Wall-clock bound on one deploy admission command.
+///
+/// Measured on the host that judges these changes (2026-10-17): the chart
+/// render-freshness check took 3.7s and the parity check 1.6s. The bound is
+/// two orders of magnitude above that pair on purpose — see the test-side
+/// bound's reasoning — while still being a bound: a command that outlives it
+/// is hung, and a hung command would hold the executor's only in-flight slot.
+const DEPLOY_ADMISSION_TIMEOUT_SECS: u64 = 300;
+
 /// The linter this workspace's deployments ran while the stage was hardcoded.
 /// `--message-format=json` is what makes its findings comparable against the
 /// lines a change wrote, and it changes what the run says, not what it finds.
@@ -349,6 +358,10 @@ pub struct ChangePipeline {
     /// `None` means this workspace's own linter, the only one whose findings
     /// this pipeline can compare against the lines the change wrote.
     lint_command: Option<Vec<String>>,
+    /// The executable admission conditions for changes that touch `deploy/**`.
+    /// `None` means this deployment declared none, and such a change is
+    /// refused by name rather than sent to a person.
+    deploy_admission: Option<cog_core::DeployAdmissionConfig>,
     /// Wall-clock bound on the format check. Short on purpose: the check does
     /// not compile anything, so a run this side of the bound is a hung process
     /// rather than a slow one — and a hung process would hold the executor's
@@ -485,6 +498,7 @@ impl ChangePipeline {
             test_command: cog_core::SelfEvolutionConfig::default().test_command,
             fmt_check_command: None,
             lint_command: None,
+            deploy_admission: None,
             fmt_timeout_secs: DEFAULT_FMT_TIMEOUT_SECS,
             promotion_policy: None,
             target_dir: None,
@@ -553,6 +567,17 @@ impl ChangePipeline {
     /// workspace's own; an empty list is a deployment declaring it has none.
     pub fn with_lint_command(mut self, command: Option<Vec<String>>) -> Self {
         self.lint_command = command;
+        self
+    }
+
+    /// The executable conditions a change touching `deploy/**` has to clear.
+    /// `None` means the deployment declared none, which is a refusal with a
+    /// reason, not a fallback to a person.
+    pub fn with_deploy_admission(
+        mut self,
+        config: Option<cog_core::DeployAdmissionConfig>,
+    ) -> Self {
+        self.deploy_admission = config;
         self
     }
 
@@ -1049,6 +1074,28 @@ impl ChangePipeline {
                 pre_existing_failures: 0,
                 verdict: ChangeVerdict::Refused(cog_core::RejectionCause::ApplyFailed),
                 test_output: format!("Change application failed: {}", e),
+                new_status: EvolutionStatus::ValidationFailed,
+                tiering: Some(tiering.clone()),
+            });
+        }
+
+        // 部署拓扑这一族由可执行条件判，不由人判。判定放在应用之后：渲染和
+        // parity 要读的正是被改过的那棵树。没有声明条件的部署，这一族就是拒收
+        // ——「等人工」不是条件，一张没人认领的待办既不会落地也不会消失。
+        if let Some(reason) = self.deploy_admission_reason(workdir, &targets).await? {
+            warn!(
+                change_id = %change.artifact_id,
+                reason = %reason,
+                "Change refused by the deployment admission conditions"
+            );
+            let _ = self.git_reset_hard(workdir).await;
+            return Ok(ApplyResult {
+                change_id: change.artifact_id.clone(),
+                files_changed,
+                reformatted: false,
+                pre_existing_failures: 0,
+                verdict: ChangeVerdict::Refused(cog_core::RejectionCause::DeployAdmissionFailed),
+                test_output: reason,
                 new_status: EvolutionStatus::ValidationFailed,
                 tiering: Some(tiering.clone()),
             });
@@ -1947,6 +1994,85 @@ impl ChangePipeline {
         {
             cmd.env(key, value);
         }
+    }
+
+    /// The targets that belong to the deployment topology family.
+    ///
+    /// Matched by directory component, not by prefix alone: `deploy2/x` does
+    /// not ride along on `deploy/`. The path is normalised the same way the
+    /// rest of the pipeline normalises diff paths, so the family is decided on
+    /// the same spelling the change was parsed into.
+    fn deploy_targets(targets: &[cog_core::DiffTarget]) -> Vec<String> {
+        targets
+            .iter()
+            .map(|t| t.path.replace('\\', "/"))
+            .filter(|p| {
+                p.strip_prefix("deploy/").is_some_and(|rest| {
+                    !rest.is_empty()
+                        && rest
+                            .split('/')
+                            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+                })
+            })
+            .collect()
+    }
+
+    /// Whether the executable admission conditions for a topology change hold.
+    ///
+    /// `Some(reason)` refuses the change and names the condition that failed;
+    /// `None` means the family was not touched, or every declared condition
+    /// passed. A deployment that declared no condition does not fall back to a
+    /// person: the family's most severe executable tier is refusal, and the
+    /// reason says which declaration is missing.
+    async fn deploy_admission_reason(
+        &self,
+        workdir: &Path,
+        targets: &[cog_core::DiffTarget],
+    ) -> SFResult<Option<String>> {
+        let touched = Self::deploy_targets(targets);
+        if touched.is_empty() {
+            return Ok(None);
+        }
+
+        let Some(config) = self.deploy_admission.as_ref().filter(|c| c.is_executable()) else {
+            return Ok(Some(format!(
+                "触及部署拓扑（{}），而这一族没有声明可执行的准入条件。\
+                 在 self_evolution.deploy_admission 里声明渲染 / parity / 服务端 dry-run；\
+                 这一档不转人工——没有条件的族按最严的可执行档处理。",
+                touched.join(", ")
+            )));
+        };
+
+        for command in &config.commands {
+            let (ok, output) = self
+                .run_verification_command(workdir, command, DEPLOY_ADMISSION_TIMEOUT_SECS)
+                .await?;
+            if !ok {
+                return Ok(Some(format!(
+                    "部署准入条件未通过：`{}` 退出非零。{}",
+                    command.join(" "),
+                    output.trim()
+                )));
+            }
+        }
+
+        if let Some(prefix) = &config.server_dry_run {
+            for path in touched.iter().filter(|p| p.starts_with("deploy/rendered/")) {
+                let mut argv = prefix.clone();
+                argv.push(path.clone());
+                let (ok, output) = self
+                    .run_verification_command(workdir, &argv, DEPLOY_ADMISSION_TIMEOUT_SECS)
+                    .await?;
+                if !ok {
+                    return Ok(Some(format!(
+                        "服务端 dry-run 拒绝了 {path}：{}",
+                        output.trim()
+                    )));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     /// Spawn one judge command under the verification environment and the
@@ -5445,6 +5571,147 @@ index 1111111..2222222 100644\n\
             "BUILTIN_LINT_LINE is {BUILTIN_LINT_LINE:?}, which is not {BUILTIN_LINT:?} with \
              {NOT_IN_THE_EVIDENCE_LINE:?} taken out; the evidence a change carries would \
              name a command the stage did not run"
+        );
+    }
+
+    fn targets(paths: &[&str]) -> Vec<cog_core::DiffTarget> {
+        paths
+            .iter()
+            .map(|p| cog_core::DiffTarget {
+                path: (*p).to_string(),
+                kind: cog_core::DiffTargetKind::Modify,
+            })
+            .collect()
+    }
+
+    /// 拓扑族按目录分量认，不按前缀认。
+    #[test]
+    fn the_deploy_family_is_a_directory_not_a_prefix() {
+        let family = ChangePipeline::deploy_targets(&targets(&[
+            "deploy/helm/cogneva/values.yaml",
+            "deploy/k3s/nats-deployment.yaml",
+            "deploy2/helm/values.yaml",
+            "crates/x/src/deploy/mod.rs",
+            "deploy/../.git/config",
+            "deploy/",
+        ]));
+        assert_eq!(
+            family,
+            vec![
+                "deploy/helm/cogneva/values.yaml",
+                "deploy/k3s/nats-deployment.yaml"
+            ],
+            "只有真正落在 deploy/ 下的路径属于这一族"
+        );
+    }
+
+    /// 没有声明条件的族不转人工：拒收，并点名缺的是哪份声明。
+    #[tokio::test]
+    async fn a_topology_change_without_a_declared_condition_is_refused_by_name() {
+        let root = tempfile::tempdir().unwrap();
+        let pipeline = ChangePipeline::new(root.path(), root.path(), false);
+        let reason = pipeline
+            .deploy_admission_reason(root.path(), &targets(&["deploy/helm/cogneva/values.yaml"]))
+            .await
+            .unwrap()
+            .expect("a family with no executable condition has to be refused");
+
+        assert!(
+            reason.contains("deploy/helm/cogneva/values.yaml"),
+            "拒收要点名是哪一族：{reason}"
+        );
+        assert!(
+            reason.contains("deploy_admission"),
+            "拒收要说清楚下一个动作是改哪份声明：{reason}"
+        );
+        assert!(
+            reason.contains("不转人工"),
+            "这一档不是「等人批」的另一种写法：{reason}"
+        );
+    }
+
+    /// 声明了就照跑：全过即准入，一条不过即拒收，理由里带着那条命令。
+    #[tokio::test]
+    async fn a_declared_condition_decides_the_family_by_its_exit_status() {
+        let root = tempfile::tempdir().unwrap();
+        let passing = ChangePipeline::new(root.path(), root.path(), false).with_deploy_admission(
+            Some(cog_core::DeployAdmissionConfig {
+                commands: vec![vec!["true".into()]],
+                server_dry_run: None,
+            }),
+        );
+        assert_eq!(
+            passing
+                .deploy_admission_reason(root.path(), &targets(&["deploy/helm/x.yaml"]))
+                .await
+                .unwrap(),
+            None,
+            "命令全过就该准入"
+        );
+
+        let failing = ChangePipeline::new(root.path(), root.path(), false).with_deploy_admission(
+            Some(cog_core::DeployAdmissionConfig {
+                commands: vec![vec!["false".into()]],
+                server_dry_run: None,
+            }),
+        );
+        let reason = failing
+            .deploy_admission_reason(root.path(), &targets(&["deploy/helm/x.yaml"]))
+            .await
+            .unwrap()
+            .expect("a failing command is a refusal");
+        assert!(
+            reason.contains("false"),
+            "拒收要点名是哪条命令没过：{reason}"
+        );
+    }
+
+    /// 服务端 dry-run 逐文件跑在变更触及的那份渲染产物上，命令由部署声明。
+    #[tokio::test]
+    async fn the_server_dry_run_judges_only_the_rendered_files_the_change_touched() {
+        let root = tempfile::tempdir().unwrap();
+        let pipeline = ChangePipeline::new(root.path(), root.path(), false).with_deploy_admission(
+            Some(cog_core::DeployAdmissionConfig {
+                commands: vec![vec!["true".into()]],
+                server_dry_run: Some(vec!["false".into()]),
+            }),
+        );
+
+        let reason = pipeline
+            .deploy_admission_reason(
+                root.path(),
+                &targets(&["deploy/rendered/k3s-single/30-service-cogneva.yaml"]),
+            )
+            .await
+            .unwrap()
+            .expect("the dry run refused");
+        assert!(
+            reason.contains("deploy/rendered/k3s-single/30-service-cogneva.yaml"),
+            "拒收要点名是哪份产物：{reason}"
+        );
+
+        // 只改 chart、没动渲染产物时，dry-run 没有可问的对象，不该自己造一个。
+        assert_eq!(
+            pipeline
+                .deploy_admission_reason(root.path(), &targets(&["deploy/helm/x.yaml"]))
+                .await
+                .unwrap(),
+            None,
+            "没有渲染产物被触及就不跑逐文件 dry-run"
+        );
+    }
+
+    /// 别的族不该被这条闸碰到。
+    #[tokio::test]
+    async fn a_change_outside_the_family_is_not_judged_by_its_conditions() {
+        let root = tempfile::tempdir().unwrap();
+        let pipeline = ChangePipeline::new(root.path(), root.path(), false);
+        assert_eq!(
+            pipeline
+                .deploy_admission_reason(root.path(), &targets(&["crates/x/src/lib.rs"]))
+                .await
+                .unwrap(),
+            None
         );
     }
 }

@@ -464,6 +464,12 @@ spec:
               mountPath: /usr/local/bin/kubectl
               readOnly: true
             {{- end }}
+            {{- if .Values.gitops.helmBin.enabled }}
+            # 部署准入条件（chart 渲染 + parity）在判定进程里跑，helm 来自宿主。
+            - name: helm-bin
+              mountPath: /usr/local/bin/helm
+              readOnly: true
+            {{- end }}
           resources:
             {{- toYaml .Values.evolution.resources | nindent 12 }}
       volumes:
@@ -503,6 +509,12 @@ spec:
         - name: kubectl-bin
           hostPath:
             path: {{ .Values.gitops.kubectlBin.hostPath }}
+            type: File
+        {{- end }}
+        {{- if .Values.gitops.helmBin.enabled }}
+        - name: helm-bin
+          hostPath:
+            path: {{ .Values.gitops.helmBin.hostPath }}
             type: File
         {{- end }}
 ---

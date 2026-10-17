@@ -38,6 +38,11 @@ gitops:
     # kubectl，版本与集群天然一致，零下载。
     enabled: true
     hostPath: /usr/local/bin/k3s
+  helmBin:
+    # 部署准入条件在进化 Pod 内跑 chart 渲染与 parity，helm 挂宿主同名二进制：
+    # bootstrap 在宿主上已经装过 helm（缺则自动装），预热链路不为它再背一份下载。
+    enabled: true
+    hostPath: /usr/local/bin/helm
 
 modelWeights:
   # 单节点：宿主就是 Pod 所在的节点，权重目录直挂进去，打开本进程的向量能力。

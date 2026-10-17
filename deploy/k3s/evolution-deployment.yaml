@@ -316,6 +316,10 @@ spec:
             - name: kubectl-bin
               mountPath: /usr/local/bin/kubectl
               readOnly: true
+            # 部署准入条件（chart 渲染 + parity）在判定进程里跑，helm 来自宿主。
+            - name: helm-bin
+              mountPath: /usr/local/bin/helm
+              readOnly: true
             # Mount the Docker socket only if you plan to build container images
             # from inside the evolution Pod. Remove for pure self_exec mode.
             # - name: docker-sock
@@ -374,6 +378,12 @@ spec:
           # 版本与集群天然一致）；bootstrap 先装 k3s 再部署，文件必然存在。
           hostPath:
             path: /usr/local/bin/k3s
+            type: File
+        - name: helm-bin
+          # 宿主 helm 挂载为 Pod 内 helm：bootstrap 在宿主上装 helm（缺则自动装），
+          # 部署准入的渲染 / parity 检查读它，镜像不必自带下载器。
+          hostPath:
+            path: /usr/local/bin/helm
             type: File
         # - name: docker-sock
         #   hostPath:

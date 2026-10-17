@@ -787,6 +787,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 .with_test_command(self_evolution.test_command.clone())
                 .with_fmt_check_command(self_evolution.fmt_check_command.clone())
                 .with_lint_command(self_evolution.lint_command.clone())
+                .with_deploy_admission(self_evolution.deploy_admission.clone())
                 .with_target_dir(&self_evolution.workspaces.target_dir);
                 // 变更忠实度读数的去处：调用点在这里，句柄也从这里给，不再
                 // 绕经生成引擎——那条路已经删了。
@@ -828,6 +829,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     test_command: self_evolution.test_command.clone(),
                     fmt_check_command: self_evolution.fmt_check_command.clone(),
                     lint_command: self_evolution.lint_command.clone(),
+                    deploy_admission: self_evolution.deploy_admission.clone(),
                     build_timeout_secs: self_evolution.build_timeout_secs,
                     auto_apply: self_evolution.auto_apply,
                     manual_approve: self_evolution.manual_approve,

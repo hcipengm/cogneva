@@ -142,6 +142,11 @@ pub struct ChangeExecutionWorld {
     /// own linter. Travels with the world for the same reason.
     #[serde(default)]
     pub lint_command: Option<Vec<String>>,
+    /// The executable admission conditions for a change that touches the
+    /// deployment topology. Travels with the world for the same reason: the
+    /// judging side must run the conditions the building side declared.
+    #[serde(default)]
+    pub deploy_admission: Option<cog_core::DeployAdmissionConfig>,
     pub build_timeout_secs: u64,
     pub auto_apply: bool,
     pub manual_approve: bool,
@@ -578,6 +583,7 @@ async fn run_in(
     .with_test_command(world.test_command.clone())
     .with_fmt_check_command(world.fmt_check_command.clone())
     .with_lint_command(world.lint_command.clone())
+    .with_deploy_admission(world.deploy_admission.clone())
     .with_target_dir(world.target_dir.as_path());
     let deployer = EvolutionDeployer::new(
         world.project_root.as_path(),
@@ -1531,6 +1537,7 @@ mod tests {
             test_command: cog_core::SelfEvolutionConfig::default_test_command(),
             fmt_check_command: None,
             lint_command: None,
+            deploy_admission: None,
             build_timeout_secs: 3600,
             auto_apply: true,
             manual_approve: false,

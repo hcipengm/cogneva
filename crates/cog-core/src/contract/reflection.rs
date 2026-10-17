@@ -209,6 +209,15 @@ pub enum RejectionCause {
     /// because retrying an error that no pass can clear would hold the change
     /// forever instead of reporting it once.
     ProjectKindUnusable,
+    /// The change touches the deployment topology and the admission checks for
+    /// that family did not pass: the chart did not render, the rendered
+    /// artifacts drifted from the chart, or the server refused the dry run.
+    ///
+    /// The family is judged by these checks rather than by a person because a
+    /// topology change has an executable answer: either the renderer and the
+    /// cluster accept it or they do not. A refusal here names which check
+    /// failed, so the next action is to fix the change, not to wait.
+    DeployAdmissionFailed,
 }
 
 impl RejectionCause {
@@ -228,6 +237,7 @@ impl RejectionCause {
         Self::LintRefused,
         Self::UnreachableDefault,
         Self::ProjectKindUnusable,
+        Self::DeployAdmissionFailed,
     ];
 
     /// The wire form, for label values and records.
@@ -246,6 +256,7 @@ impl RejectionCause {
             Self::LintRefused => "lint_refused",
             Self::UnreachableDefault => "unreachable_default",
             Self::ProjectKindUnusable => "project_kind_unusable",
+            Self::DeployAdmissionFailed => "deploy_admission_failed",
         }
     }
 

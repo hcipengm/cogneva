@@ -1931,12 +1931,19 @@ fn identity_signoff(identity: &BotIdentityConfig) -> String {
     )
 }
 
-/// Whitelist gate for public contributions. Every path the diff touches must
-/// fall inside the generic, shareable surface: Rust sources under
-/// `crates/**/src/`, files under `prompts/`, or the root README/CHANGELOG.
-/// Everything else — deploy manifests, configs, secrets, business data — is
+/// Whitelist gate for the paths a change may write. Every path the diff
+/// touches must fall inside a surface this platform knows how to judge:
+/// Rust sources under `crates/**/src/`, files under `prompts/`, the
+/// deployment topology under `deploy/`, or the root README/CHANGELOG.
+/// Everything else — credentials, evaluation data, unrelated configs — is
 /// hard-rejected before anything is pushed. A diff from which no paths can be
 /// parsed is rejected as well (fail closed).
+///
+/// `deploy/` is in the list because the topology is part of what this platform
+/// evolves: leaving it out did not keep the manifests safer, it only meant a
+/// change that had to touch them could not be committed at all. What keeps a
+/// deployment change honest is the admission gate that runs on its content
+/// (render, parity, server-side dry run), not the absence of a channel.
 pub fn ensure_contribution_allowed(diff: &str) -> Result<()> {
     let denied = non_contributable_paths(diff)?;
     if denied.is_empty() {
@@ -1945,7 +1952,7 @@ pub fn ensure_contribution_allowed(diff: &str) -> Result<()> {
         Err(CogGitHubError::PrivacyRejected(format!(
             "change touches non-contributable paths: {} \
              (whitelist: crates/<workspace member>/src/**/*.rs, prompts/**, \
-             root README/CHANGELOG)",
+             deploy/**, root README/CHANGELOG)",
             denied.join(", ")
         )))
     }
@@ -1999,10 +2006,16 @@ fn is_allowed_path(path: &str) -> bool {
 
     if let Some(rest) = p.strip_prefix("prompts/") {
         // Any file under prompts/, but no traversal/empty segments.
-        return !rest.is_empty()
-            && rest
-                .split('/')
-                .all(|seg| !seg.is_empty() && seg != "." && seg != "..");
+        return has_plain_segments(rest);
+    }
+
+    if let Some(rest) = p.strip_prefix("deploy/") {
+        // The deployment topology as a whole — chart, static manifests,
+        // pre-rendered artifacts, scripts. The shape check here is only
+        // traversal hygiene: what the change may contain is decided by the
+        // deploy admission gate, which runs the render/parity/dry-run checks
+        // on the applied tree rather than guessing from the path.
+        return has_plain_segments(rest);
     }
 
     // Root-level README*/CHANGELOG* only (no slash => repository root).
@@ -2014,7 +2027,16 @@ fn is_allowed_path(path: &str) -> bool {
     false
 }
 
-/// The root manifest, embedded so the answer describes the tree this binary was
+/// Whether a suffix is a real path below a whitelisted directory: at least one
+/// segment, and no traversal or empty ones. `deploy/../.git/config` and
+/// `prompts//x` both fail here; the point is that the prefix matched a
+/// directory that exists rather than an escape out of it.
+fn has_plain_segments(rest: &str) -> bool {
+    !rest.is_empty()
+        && rest
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
 /// built from.
 ///
 /// Embedded rather than read at run time because this check runs on a diff's
@@ -2401,10 +2423,34 @@ mod tests {
         assert!(is_allowed_path("CHANGELOG.md"));
     }
 
+    /// 拓扑也是这个平台自己要演进的东西。
+    ///
+    /// 这里断言的是**通道存在**：`deploy/**` 的文件进得了落地流程。它该不该落
+    /// 由准入条件判（渲染 / parity / 服务端 dry-run），不由路径判——把这族整体
+    /// 挡在通道外，只让「必须改清单」的变更永远只能人工落，挡不住任何风险。
+    #[test]
+    fn whitelist_carries_the_deployment_topology() {
+        for path in [
+            "deploy/helm/cogneva/values.yaml",
+            "deploy/helm/cogneva/files/cogneva.json",
+            "deploy/helm/cogneva/templates/evolution.yaml",
+            "deploy/k3s/evolution-deployment.yaml",
+            "deploy/rendered/k3s-single/cogneva.yaml",
+            "deploy/scripts/check-deploy-parity.sh",
+        ] {
+            assert!(is_allowed_path(path), "should allow {path}");
+        }
+        for path in ["deploy/../.git/config", "deploy//x", "deploy", "deploy/"] {
+            assert!(
+                !is_allowed_path(path),
+                "prefix match is not an escape: {path}"
+            );
+        }
+    }
+
     #[test]
     fn whitelist_rejects_private_infra_config_and_secrets() {
         let denied = [
-            "deploy/helm/cogneva/values.yaml",
             ".github/workflows/release.yml",
             "crates/cog-github/tests/it.rs",
             "Cargo.toml",
