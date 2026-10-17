@@ -405,6 +405,9 @@ pub enum RouteStage {
     DeclaredScale,
     /// A word in the goal.
     Keyword,
+    /// Recorded outcomes for this request group, when the evidence cleared the
+    /// configured margin.
+    HistoricalPrior,
     /// The static complexity score.
     Score,
     /// The mode-selection agent's own judgement.
@@ -420,9 +423,10 @@ impl RouteStage {
     /// stages that happened to fire: a series that is absent because a stage is
     /// dead and one that is absent because it was never wired up are the same
     /// reading otherwise, and the second is the one worth catching.
-    pub const ALL: [RouteStage; 5] = [
+    pub const ALL: [RouteStage; 6] = [
         RouteStage::DeclaredScale,
         RouteStage::Keyword,
+        RouteStage::HistoricalPrior,
         RouteStage::Score,
         RouteStage::Agent,
         RouteStage::Default,
@@ -432,6 +436,7 @@ impl RouteStage {
         match self {
             RouteStage::DeclaredScale => "declared_scale",
             RouteStage::Keyword => "keyword",
+            RouteStage::HistoricalPrior => "historical_prior",
             RouteStage::Score => "score",
             RouteStage::Agent => "agent",
             RouteStage::Default => "default",

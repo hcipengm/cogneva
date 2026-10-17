@@ -13,15 +13,16 @@ use crate::profile::{
 /// 1. **Keyword heuristics** — zero-cost inference from the goal text.
 ///    Strong signals ("debate", "compare", "review") → Roundtable immediately.
 ///    Strong simple signals ("hello", "greet", "simple") → Pipeline immediately.
-/// 2. **Static profile rule** — only when no keywords match and no Agent is wired.
-/// 3. **LLM semantic judgment** — delegated to the underlying [`Agent`] when
-///    keyword signals are ambiguous. The Agent runtime handles prompt formatting
+/// 2. **Recorded outcomes** — when the group's measured results clear the
+///    configured sample and margin, they decide. A measured result outranks
+///    the static rule below it.
+/// 3. **Static profile rule** — when no keywords matched and no recorded
+///    outcome cleared the margin.
+/// 4. **LLM semantic judgment** — delegated to the underlying [`Agent`] when
+///    everything above declined. The Agent runtime handles prompt formatting
 ///    and temperature control.
-/// 4. **Default to Roundtable** — when everything else is uncertain, prefer
+/// 5. **Default to Roundtable** — when everything else is uncertain, prefer
 ///    quality over speed.
-///
-/// MetaLearningEngine is treated as advisory context for the LLM, never
-/// as a hard override.
 ///
 /// No self-review runs here. The decision is one word taken out of the model's
 /// reply, and the stages above it are deterministic — a review of that reply
@@ -117,12 +118,23 @@ impl ModeSelectorActor {
             return result;
         }
 
-        // --- Stage 2: static profile rule (cheap, no I/O) ---
+        // --- Stage 2: recorded outcomes for this group (measured, in memory) ---
+        // Ahead of the static rule on purpose. The static rule is a guess about
+        // the request's shape; these are outcomes already measured for this
+        // group. When the evidence clears the configured sample and margin the
+        // engine returns a recommendation, and a measured result outranks the
+        // rule it would otherwise be tested against. Below that threshold it
+        // answers `UseDefault` and the static rule decides exactly as it did.
+        if let Some(decision) = self.recorded_prior(profile).await {
+            return decision;
+        }
+
+        // --- Stage 3: static profile rule (cheap, no I/O) ---
         if let Some(profile) = profile {
             return select_mode(profile);
         }
 
-        // --- Stage 3: Knowledge-backed historical context ---
+        // --- Stage 4: Knowledge-backed historical context ---
         let mut knowledge_context: Option<String> = None;
         if let Some(ref k) = self.knowledge {
             let synthetic_task = cog_core::Task::new(
@@ -145,14 +157,12 @@ impl ModeSelectorActor {
             }
         }
 
-        // --- Stage 4: Agent semantic judgment (expensive, last resort) ---
+        // --- Stage 5: Agent semantic judgment (expensive, last resort) ---
         if let Some(ref agent) = self.agent {
-            let ml_context = self.meta_learning_context(goal, profile).await;
             match self
                 .agent_decide(
                     goal,
                     profile,
-                    ml_context.as_ref(),
                     knowledge_context.as_ref(),
                     agent.as_ref(),
                     task_id,
@@ -164,7 +174,7 @@ impl ModeSelectorActor {
             }
         }
 
-        // --- Stage 5: default ---
+        // --- Stage 6: default ---
         RouteDecision {
             mode: PgeMode::Roundtable,
             stage: RouteStage::Default,
@@ -256,45 +266,50 @@ impl ModeSelectorActor {
         None
     }
 
-    async fn meta_learning_context(
-        &self,
-        _goal: &str,
-        profile: Option<&TaskProfile>,
-    ) -> Option<String> {
+    /// What measured outcomes say about this group, as a decision.
+    ///
+    /// `None` on a cold start or when the evidence does not clear the
+    /// configured sample and margin — the static rule then decides exactly as
+    /// it did. The lookup is an in-memory table read; the expensive question
+    /// is the one below it, not this one.
+    async fn recorded_prior(&self, profile: Option<&TaskProfile>) -> Option<RouteDecision> {
         let engine = self.meta_learning.as_ref()?;
-        // Still require a profile: without one the caller has nothing to
-        // classify the task by and the recommendation would be noise.
+        // Still require a profile: without one nothing was measured about the
+        // request, so there is no group to look outcomes up in and any answer
+        // would be a reading invented for a request that never declared one.
         profile?;
 
         // The same group the writing side records under — the recommendation
         // has to be looked up in the group the outcomes were recorded in.
         let group = crate::meta_features::squad_decision().group;
 
-        let rec = engine.recommend_mode(&group).await;
-        let text = match rec {
-            cog_core::ModeRecommendation::Pipeline => {
-                "Historical data strongly suggests Pipeline (fastest, sufficient for this task category)."
-            }
-            cog_core::ModeRecommendation::Roundtable => {
-                "Historical data strongly suggests Roundtable (higher quality for this task category)."
-            }
-            cog_core::ModeRecommendation::UseDefault => {
-                return None; // cold start — no useful historical context
-            }
+        let (mode, why) = match engine.recommend_mode(&group).await {
+            cog_core::ModeRecommendation::Pipeline => (
+                PgeMode::Pipeline,
+                "measured outcomes for this group favor Pipeline (fastest, sufficient here)",
+            ),
+            cog_core::ModeRecommendation::Roundtable => (
+                PgeMode::Roundtable,
+                "measured outcomes for this group favor Roundtable (higher quality here)",
+            ),
+            cog_core::ModeRecommendation::UseDefault => return None,
         };
-        Some(text.into())
+        Some(RouteDecision {
+            mode,
+            stage: RouteStage::HistoricalPrior,
+            reason: format!("Recorded prior: {why}"),
+        })
     }
 
     async fn agent_decide(
         &self,
         goal: &str,
         profile: Option<&TaskProfile>,
-        ml_context: Option<&String>,
         knowledge_context: Option<&String>,
         agent: &dyn Agent,
         task_id: Option<&str>,
     ) -> Option<RouteDecision> {
-        let input = self.build_input(goal, profile, ml_context, knowledge_context);
+        let input = self.build_input(goal, profile, knowledge_context);
 
         let result = match task_id {
             Some(tid) => agent.prompt_for_task(tid, input).await.ok()?,
@@ -336,7 +351,6 @@ impl ModeSelectorActor {
         &self,
         goal: &str,
         profile: Option<&TaskProfile>,
-        ml_context: Option<&String>,
         knowledge_context: Option<&String>,
     ) -> serde_json::Value {
         // The stable half: the question and the two words the answer may be.
@@ -360,10 +374,6 @@ impl ModeSelectorActor {
                 "historical_success": profile.historical_success,
                 "complexity_score": complexity_score(profile),
             });
-        }
-
-        if let Some(ctx) = ml_context {
-            input["historical_context"] = serde_json::json!(ctx);
         }
 
         if let Some(ctx) = knowledge_context {
@@ -397,11 +407,57 @@ impl Default for ModeSelectorActor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn profile(declared_scale: DeclaredScale) -> TaskProfile {
         TaskProfile {
             declared_scale,
             ..Default::default()
+        }
+    }
+
+    /// A meta-learning engine frozen at one answer, so the stage that reads it
+    /// can be measured without a database.
+    #[derive(Debug)]
+    struct FixedPrior(cog_core::ModeRecommendation);
+
+    #[async_trait::async_trait]
+    impl cog_core::MetaLearning for FixedPrior {
+        async fn recommend_mode(
+            &self,
+            _group: &cog_core::DecisionGroupKey,
+        ) -> cog_core::ModeRecommendation {
+            self.0
+        }
+
+        async fn record_outcome(
+            &self,
+            _group: &cog_core::DecisionGroupKey,
+            _features: &cog_core::TaskFeatures,
+            _selected_mode: &str,
+            _success: bool,
+            _score: f32,
+            _latency_ms: u64,
+        ) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn recommend(
+            &self,
+            _category: cog_core::DecisionCategory,
+            _group: &cog_core::DecisionGroupKey,
+        ) -> Option<String> {
+            None
+        }
+
+        async fn record(
+            &self,
+            _category: cog_core::DecisionCategory,
+            _group: &cog_core::DecisionGroupKey,
+            _decision: &str,
+            _outcome: cog_core::DecisionOutcome,
+        ) -> cog_core::SFResult<()> {
+            Ok(())
         }
     }
 
@@ -454,6 +510,54 @@ mod tests {
             decision.reason.contains("Keyword heuristic"),
             "{decision:?}"
         );
+    }
+
+    /// A measured outcome outranks the static rule, and the static rule keeps
+    /// deciding when the record is too thin to answer.
+    ///
+    /// Both halves go through the production argument shape — `Some(&profile)`,
+    /// what the only production caller passes. The previous arrangement had the
+    /// recommendation below a stage that returns for every `Some` profile, so
+    /// with the arguments production actually sends, the reader was unreachable
+    /// and the account's `landed` verdict measured a call site rather than a
+    /// behaviour. A test that passed `None` would measure the branch production
+    /// never reaches — the same false green one layer down.
+    #[tokio::test]
+    async fn a_recorded_prior_outranks_the_static_profile_rule() {
+        let p = profile(DeclaredScale::Unknown);
+        let goal = "polish the wording in `docs/quickstart.md`";
+
+        // The rule alone sends this shape to Pipeline: the prior below is the
+        // only thing that can move it, so the difference is attributable.
+        let static_only = ModeSelectorActor::new()
+            .select_mode(goal, Some(&p), None)
+            .await;
+        assert_eq!(static_only.stage, RouteStage::Score);
+        assert_eq!(static_only.mode, PgeMode::Pipeline);
+
+        let with_prior = ModeSelectorActor::new()
+            .with_meta_learning(Arc::new(FixedPrior(
+                cog_core::ModeRecommendation::Roundtable,
+            )))
+            .select_mode(goal, Some(&p), None)
+            .await;
+        assert_eq!(with_prior.stage, RouteStage::HistoricalPrior);
+        assert_eq!(with_prior.mode, PgeMode::Roundtable);
+        assert!(
+            with_prior.reason.contains("Recorded prior"),
+            "{with_prior:?}"
+        );
+
+        // Cold start: nothing measured, so the rule decides as it did before
+        // this stage existed.
+        let cold = ModeSelectorActor::new()
+            .with_meta_learning(Arc::new(FixedPrior(
+                cog_core::ModeRecommendation::UseDefault,
+            )))
+            .select_mode(goal, Some(&p), None)
+            .await;
+        assert_eq!(cold.stage, RouteStage::Score);
+        assert_eq!(cold.mode, PgeMode::Pipeline);
     }
 
     /// Every stage a decision can carry is one the observation surface knows
