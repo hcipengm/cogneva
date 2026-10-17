@@ -1327,7 +1327,7 @@ pub fn self_evolution_hook_dir(change_dir: impl AsRef<std::path::Path>) -> std::
 /// Every entry is executable. The family is judged by running these, never by
 /// asking someone: a topology change has an answer either way, and an answer
 /// that depends on a person being present is not a condition.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DeployAdmissionConfig {
     /// Commands run, in order, in the applied tree. Every one must succeed;
@@ -1345,15 +1345,6 @@ pub struct DeployAdmissionConfig {
     /// own API server from the judging process says so by leaving it out,
     /// rather than by the check failing every time.
     pub server_dry_run: Option<Vec<String>>,
-}
-
-impl Default for DeployAdmissionConfig {
-    fn default() -> Self {
-        Self {
-            commands: Vec::new(),
-            server_dry_run: None,
-        }
-    }
 }
 
 impl DeployAdmissionConfig {
