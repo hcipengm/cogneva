@@ -29,8 +29,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use cog_core::{SFError, SFResult, ToolExecutor};
-use cog_eval::{CaseEnv, EvalCase, ExecSeam, ToolathlonBackend, ToolathlonCheck, ToolathlonReport};
+use cog_core::{SFError, SFResult, ToolDefinition, ToolExecutor};
+use cog_eval::{
+    tools_bound_to, CaseEnv, EvalCase, ExecSeam, ToolFactory, ToolathlonBackend, ToolathlonCheck,
+    ToolathlonReport,
+};
+
+use crate::eval_mcp_in_pod::{
+    connect_declared, read_server_configs, sh_quote as shq, ServerPaths, ToolFace,
+};
+use crate::eval_toolathlon_local::LocalTools;
 
 /// pack 镜像里的工作根。官方 compose 里 agent 容器就是 `working_dir: /workspace`。
 const CONTAINER_WORK_DIR: &str = "/workspace";
@@ -46,7 +54,18 @@ const CONTAINER_PYTHON: &str = "/opt/venv/bin/python";
 const CONTAINER_PG_ISREADY: &str = "pg_isready";
 /// 这道题的 agent 工作区（容器内）。评估脚本按 `--agent_workspace` 读它，
 /// 要写的产物也落在这里——所以**两个方向用的是同一个常量**。
-const CONTAINER_AGENT_WORKSPACE: &str = "/workspace/cogneva-eval/agent_workspace";
+pub(crate) const CONTAINER_AGENT_WORKSPACE: &str = "/workspace/cogneva-eval/agent_workspace";
+/// 上游那 25 份 MCP server 配置在镜像里的位置。`COPY . .` 把整棵 gym 放进
+/// `/workspace`，所以它就是 `configs/mcp_servers/`——题面用的 server 名要在这一堆里找。
+const CONTAINER_MCP_CONFIGS_DIR: &str = "/workspace/configs/mcp_servers";
+/// 编译好的 local server 在镜像里的位置。
+///
+/// 它**不是** Python 那个缺省值 `./local_servers`：Dockerfile 把依赖装进
+/// `/opt/local_servers`（`/workspace` 会被卷盖住），而 compose、`run_parallel.sh`、
+/// `scripts/run_containerized.sh` 三处**都**显式给 `LOCAL_SERVERS_PATH=/opt/local_servers`。
+/// 配置里的 `${local_servers_paths}` 是按这个值替换的，所以这一处同时是 Pod env 与
+/// 占位符替换的来源——两处各写一遍就等于有第二份会漂的定义。
+const CONTAINER_LOCAL_SERVERS: &str = "/opt/local_servers";
 /// initContainer 复制 `db/init.sql.gz` 的中转目录（emptyDir）。
 const INIT_VOLUME_DIR: &str = "/cogneva-initdb";
 /// compose 里那一行挂的就是这个目录，postgres 官方入口脚本自己会处理 `.gz`。
@@ -86,11 +105,11 @@ const PG_READY_DEADLINE_SECS: u64 = 300;
 
 /// 一次 `kubectl` 调用的结局。
 #[derive(Debug, Clone)]
-struct RunOutcome {
-    stdout: String,
-    stderr: String,
+pub(crate) struct RunOutcome {
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
     /// `None` ＝ 被信号打断，没拿到退出码。
-    code: Option<i32>,
+    pub(crate) code: Option<i32>,
 }
 
 /// 这台宿主上的一台 Pod。`kubectl` 前缀在构造时**探**出来，不写死。
@@ -171,7 +190,7 @@ impl PodRuntime {
 
     /// 跑一条 `kubectl` 命令。超时是**失败**不是空结果：吞掉它，这一格的分就读成
     /// 「模型没做对」，而真相是「这台机器没跑完」。
-    async fn exec(&self, args: &[String]) -> anyhow::Result<RunOutcome> {
+    pub(crate) async fn exec(&self, args: &[String]) -> anyhow::Result<RunOutcome> {
         let mut cmd = self.command();
         cmd.args(args);
         let child = cmd
@@ -373,7 +392,7 @@ fn manifest(pod: &str, pack_image: &str, pg_image: &str) -> serde_json::Value {
                         { "name": "PGUSER", "value": PG_USER },
                         { "name": "PGPASSWORD", "value": PG_PASSWORD },
                         { "name": "PGDATABASE", "value": PG_DATABASE },
-                        { "name": "LOCAL_SERVERS_PATH", "value": "/opt/local_servers" },
+                        { "name": "LOCAL_SERVERS_PATH", "value": CONTAINER_LOCAL_SERVERS },
                         { "name": "PYTHON_BIN", "value": CONTAINER_PYTHON }
                     ],
                     "resources": {
@@ -578,7 +597,15 @@ impl ToolathlonBackend for PodToolathlonBackend {
             );
         }
 
-        Ok(Arc::new(ToolathlonPodEnv { pod }))
+        // 工具面在这里建，不在判分那一步：一端是 `task_config.json` 声明的名字，另一端是
+        // 镜像里那 25 份配置，两者在这一刻都在手上。失败**不**把这份环境推翻——关工具的
+        // 那一次跑照跑，要工具面的那一次到工厂里去读这条因。
+        let face = match build_face(&pod, case).await {
+            Ok(face) => PodToolFace::Ready(Arc::new(face)),
+            Err(e) => PodToolFace::Absent(format!("{e:#}")),
+        };
+
+        Ok(Arc::new(ToolathlonPodEnv { pod, face }))
     }
 
     async fn evaluate(
@@ -611,7 +638,7 @@ impl ToolathlonBackend for PodToolathlonBackend {
 }
 
 /// 一道题的 Pod。判分在同一台里跑——换一台判就是在判另一道题。
-struct ToolathlonPod {
+pub(crate) struct ToolathlonPod {
     runtime: Arc<PodRuntime>,
     name: String,
 }
@@ -619,7 +646,7 @@ struct ToolathlonPod {
 impl ToolathlonPod {
     /// 在 `app` 容器里跑一段 shell。工作目录**显式**切到 `/workspace`，不靠镜像的
     /// `workingDir`——那样这一层的行为会随清单改一处而静默变。
-    async fn exec(&self, script: &str) -> anyhow::Result<RunOutcome> {
+    pub(crate) async fn exec(&self, script: &str) -> anyhow::Result<RunOutcome> {
         let full = format!("cd {CONTAINER_WORK_DIR} && {{\n{script}\n}}");
         self.runtime
             .exec(&[
@@ -633,6 +660,77 @@ impl ToolathlonPod {
                 full,
             ])
             .await
+    }
+
+    /// 建一个目录（幂等）。本地工具把文件都落在这道题的 agent 工作区里，目录不预先存在。
+    pub(crate) async fn mkdir(&self, dir: &str) -> anyhow::Result<()> {
+        let out = self.exec(&format!("mkdir -p {}", shq(dir))).await?;
+        if out.code != Some(0) {
+            anyhow::bail!(
+                "cannot create {dir} in pod {}: {}",
+                self.name,
+                out.stderr.trim()
+            );
+        }
+        Ok(())
+    }
+
+    /// 把一段字节写进 Pod 的一个文件。
+    ///
+    /// 载荷走 base64：这些字节是**模型给的代码**，里面有引号、`$`、反引号，任何一层
+    /// shell 读懂它们就会就地改写它们。
+    pub(crate) async fn write_bytes(&self, path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        let script = format!(
+            "mkdir -p $(dirname {path})\n{write}",
+            path = shq(path),
+            write = crate::eval_toolathlon_local::b64_write_script(path, bytes)
+        );
+        let out = self.exec(&script).await?;
+        if out.code != Some(0) {
+            anyhow::bail!(
+                "cannot write {path} in pod {}: {}",
+                self.name,
+                out.stderr.trim()
+            );
+        }
+        Ok(())
+    }
+
+    /// 读回一个文件的文本。`Ok(None)` ＝ 这个文件不存在（与「读失败」分开：前者是工具
+    /// 的正常答复——「没有这件」——后者才是这一格出事了）。
+    pub(crate) async fn read_text(&self, path: &str) -> anyhow::Result<Option<String>> {
+        let out = self
+            .exec(&format!(
+                "if [ -f {p} ]; then cat {p}; else exit 44; fi",
+                p = shq(path)
+            ))
+            .await?;
+        match out.code {
+            Some(0) => Ok(Some(out.stdout)),
+            Some(44) => Ok(None),
+            code => anyhow::bail!(
+                "cannot read {path} in pod {} (exit {code:?}): {}",
+                self.name,
+                out.stderr.trim()
+            ),
+        }
+    }
+
+    /// 一台不起真 Pod 的实例，只给纯函数与 argv 的单测用。
+    #[cfg(test)]
+    pub(crate) fn for_test(name: &str) -> Self {
+        Self::for_test_in(name, vec!["kubectl".into()], "cogneva")
+    }
+
+    /// 同上，但把 `kubectl` 前缀与命名空间**显式**给出来——对着活 Pod 跑的那几条
+    /// `#[ignore]` 用例要的正是这一条：它们走的是真的 `kubectl`（宿主要 `sudo -n`），
+    /// 而 `for_test` 的单测不碰集群。
+    #[cfg(test)]
+    pub(crate) fn for_test_in(name: &str, prefix: Vec<String>, namespace: &str) -> Self {
+        Self {
+            runtime: Arc::new(PodRuntime::for_test(prefix, namespace)),
+            name: name.to_string(),
+        }
     }
 
     /// 回收。重复调用是空操作——一条 case 失败也要回收。
@@ -652,9 +750,76 @@ impl ToolathlonPod {
     }
 }
 
+/// 这道题的工具面**建起来了没有**。
+///
+/// 两件事分开：环境起来了（这道题能跑）与工具面建起来了（这道题的工具＝上游那一束）。
+/// 关工具的那一次跑不需要后者，把它并进前者会让一条与工具无关的诊断因一台 server
+/// 起不来而整题没跑成。所以失败留成一条**带原因的缺席**，到真要工具面的那一刻才报。
+enum PodToolFace {
+    Ready(Arc<TaskTools>),
+    Absent(String),
+}
+
+/// 一道题的**整张**工具面：镜像里那几台 MCP server ＋ 题面声明的本地工具。
+///
+/// 两者共处一张面不并成一层：模型看到的是一个工具列表，名字**全局唯一**（上游那侧也是
+/// 一个 `MCPToolkit` 加几个本地函数装进同一个函数表）。撞名时与 MCP 那一侧同一条规矩
+/// ——先来的留下——并把撞掉的那件记下来。
+struct TaskTools {
+    mcp: Arc<ToolFace>,
+    local: Arc<LocalTools>,
+    definitions: Vec<ToolDefinition>,
+}
+
+impl TaskTools {
+    fn build(mcp: ToolFace, local: LocalTools) -> Self {
+        let mut definitions = mcp.definitions.clone();
+        for def in local.definitions() {
+            if let Some(kept) = mcp.server_of(&def.name) {
+                tracing::warn!(
+                    tool = %def.name,
+                    kept_from = %kept,
+                    dropped_from = "local tools",
+                    "a local tool shares its name with an MCP tool; the MCP one is kept"
+                );
+                continue;
+            }
+            if definitions.iter().any(|d| d.name == def.name) {
+                continue;
+            }
+            definitions.push(def);
+        }
+        Self {
+            mcp: Arc::new(mcp),
+            local: Arc::new(local),
+            definitions,
+        }
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for TaskTools {
+    async fn execute(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> SFResult<serde_json::Value> {
+        if self.local.handles(name) {
+            return self
+                .local
+                .call(name, &arguments)
+                .await
+                .map(serde_json::Value::String)
+                .map_err(|e| SFError::Agent(format!("the local tool `{name}` failed: {e:#}")));
+        }
+        self.mcp.execute(name, arguments).await
+    }
+}
+
 /// 这道题的环境：一台 Pod（库 ＋ app 两个容器）。
 pub struct ToolathlonPodEnv {
     pod: Arc<ToolathlonPod>,
+    face: PodToolFace,
 }
 
 #[async_trait]
@@ -667,14 +832,18 @@ impl CaseEnv for ToolathlonPodEnv {
         self
     }
 
-    /// 这道题的工具面**今天还没有**。
+    /// 这道题的工具面：连上的那几台 MCP server。
     ///
-    /// 返回一个「跑得了 shell」的执行面是**错的**：这一列的工具面是 `task_config.json`
-    /// 点名的那几台 MCP server，今天没有任何东西把它们变成 `cog_core::Tool`。给一个能用
-    /// 的执行面，读的人会以为「环境是好的、只是模型不会用工具」；照实报错才分得清
-    /// 「这一列的工具面还没实现」与「模型做错了」——这两件事的处置正相反。
+    /// 没连上的那种返回一个**会说话**的执行面（[`NoToolFace`]）而不是 `None`：
+    /// `None` 是「这个基准本来就没有环境执行面」，而这里是「这道题的 server 没接上」，
+    /// 两者的处置正相反——前者正常，后者该被看见。真正拦住工具面的地方是工厂
+    /// （它拿不到 [`PodToolFace::Ready`] 就报那条因），执行面只是最后一道。
     fn executor(&self) -> Option<Arc<dyn ToolExecutor>> {
-        Some(Arc::new(NoToolFace))
+        let face: Arc<dyn ToolExecutor> = match &self.face {
+            PodToolFace::Ready(face) => face.clone(),
+            PodToolFace::Absent(_) => Arc::new(NoToolFace),
+        };
+        Some(face)
     }
 
     fn exec_seam(&self) -> ExecSeam {
@@ -703,6 +872,76 @@ impl ToolExecutor for NoToolFace {
              servers a task declares, and nothing in this build turns them into tools."
         )))
     }
+}
+
+/// 按题面声明的名字，把镜像里那几台 server 起起来、各自列一次工具。
+///
+/// 一道题没有声明任何 server 时给一张**空**工具面，不是报错：这类题的工具面本来就只有
+/// 本地的几件（`needed_local_tools`），把它读成「接不上」会让它永远跑不成。
+async fn build_face(pod: &Arc<ToolathlonPod>, case: &EvalCase) -> anyhow::Result<TaskTools> {
+    let declared: Vec<String> = serde_json::from_str(
+        case.metadata
+            .get("needed_mcp_servers")
+            .map(String::as_str)
+            .unwrap_or("[]"),
+    )?;
+    let mcp = if declared.is_empty() {
+        ToolFace::build(&[])
+    } else {
+        let configs =
+            read_server_configs(&pod.runtime, &pod.name, "app", CONTAINER_MCP_CONFIGS_DIR).await?;
+        let servers = connect_declared(
+            &pod.runtime,
+            &pod.name,
+            "app",
+            &configs,
+            &declared,
+            &ServerPaths {
+                local_servers: CONTAINER_LOCAL_SERVERS,
+                agent_workspace: CONTAINER_AGENT_WORKSPACE,
+                task_dir: &container_task_dir(case),
+            },
+        )
+        .await?;
+        ToolFace::build(&servers)
+    };
+    let local_declared: Vec<String> = serde_json::from_str(
+        case.metadata
+            .get("needed_local_tools")
+            .map(String::as_str)
+            .unwrap_or("[]"),
+    )?;
+    Ok(TaskTools::build(
+        mcp,
+        LocalTools::new(pod.clone(), &local_declared),
+    ))
+}
+
+/// toolathlon 的工具面：一个 MCP **工具**一件，名字就是 server 自己报的那个。
+///
+/// 这个口径不是随手定的：上游 `MCPClient.get_tools()` 里 `func_name = mcp_tool.name`，
+/// 不加 server 前缀；两台的 server 撞名时 `MCPToolkit.get_tools()` 丢掉后来的那件。
+/// 换成「每台 server 一件、名字＝server 名」会让表里那一列**同名不同实**。
+pub fn toolathlon_tools() -> Arc<ToolFactory> {
+    Arc::new(|_case, env| {
+        let own = env
+            .as_any()
+            .downcast_ref::<ToolathlonPodEnv>()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "this environment is not the toolathlon pod backend's own, so its tool face \
+                     would be bound to a machine that is not this task's"
+                )
+            })?;
+        match &own.face {
+            PodToolFace::Ready(face) => tools_bound_to(env, &face.definitions),
+
+            PodToolFace::Absent(why) => anyhow::bail!(
+                "this task's MCP servers did not come up, so its tool face would be smaller than \
+                 the task's and a score would carry this benchmark's name without its meaning: {why}"
+            ),
+        }
+    })
 }
 
 /// 截尾。读数的用处是让人看见现场，不是把整份日志搬进判词。

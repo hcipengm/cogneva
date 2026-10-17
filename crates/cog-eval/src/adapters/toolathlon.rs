@@ -9,7 +9,7 @@
 //! （[`ToolathlonBackend`]），MCP server 的实现也是（[`ToolathlonToolkit`] 只认名字）。
 //! 缺任何一件都必须**报错**，不是给一个空环境或空工具面让分数悄悄掉下去。
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -184,15 +184,19 @@ impl EnvProvider for ToolathlonEnvProvider {
     }
 }
 
-/// Toolathlon 的工具包：这道题声明的那些 MCP server。
+/// Toolathlon 的工具包：这道题的 server 上**每一个 MCP 工具**各一件。
 ///
 /// 工具集由**基准**定、不由方法定，但这里与 HLE / SWE-bench Pro 不同：要哪几件由**每题**
-/// 的 `task_config.json` 定，不是一个固定清单。所以这一层持的是「按题造工具」的工厂，
-/// 每次调用现造一批，再从里面挑出这道题声明的那几台；**声明里有、造出来的里面没有的
-/// server 直接报错**——少给一台 server 会让这一题的工具面比原题小，分数就不可归因了。
+/// 的 `task_config.json` 点名的 server 决定，而那几台 server 上有哪些工具，要到它们被
+/// 连上（`env` 拿到、工厂跑过）才知道。所以这一层持的是「按题现造」的工厂，工厂交回来
+/// 的那批就是这道题的工具面。
 ///
-/// 工厂而不是固定清单，是因为这些 server 由**这道题自己的** compose 工程暴露：
-/// 端口要到这题的环境起来（`env` 拿到）时才定得下来。
+/// **不按 server 名过滤**。上游给模型的工具名是 MCP 工具自己的名字（`MCPClient.get_tools`
+/// 里 `func_name = mcp_tool.name`，撞名时 `MCPToolkit` 丢掉后来的那件），名字里根本不
+/// 出现 server；按「每台 server 一件、名字＝server 名」去挑，会是**同名不同实**——表里
+/// 写着 toolathlon，量的是另一个函数面。所以「声明了 N 台、只起来 N-1 台」那一类缺失由
+/// **造工具的那一侧**报错（只有它知道谁真连上了），这一层留两条判据：名字不许重复、
+/// 声明了 server 的题不许交回空面。
 pub struct ToolathlonToolkit {
     /// `None` ＝ 关工具的那一次跑。
     factory: Option<Arc<ToolFactory>>,
@@ -239,34 +243,25 @@ impl Toolkit for ToolathlonToolkit {
         let Some(factory) = &self.factory else {
             return Ok(ToolSet::empty());
         };
+        let tools = factory(case, env)?;
+        check_registry(&tools)?;
         let wanted: Vec<String> = serde_json::from_str(
             case.metadata
                 .get("needed_mcp_servers")
                 .map(String::as_str)
                 .unwrap_or("[]"),
         )?;
-        let tools = factory(case, env)?;
-        check_registry(&tools)?;
-        let mut registry: BTreeMap<&str, &Tool> = BTreeMap::new();
-        for tool in &tools {
-            registry.insert(tool.name.as_str(), tool);
-        }
-        let mut picked = Vec::with_capacity(wanted.len());
-        let mut missing = Vec::new();
-        for name in &wanted {
-            match registry.get(name.as_str()) {
-                Some(tool) => picked.push((*tool).clone()),
-                None => missing.push(name.clone()),
-            }
-        }
-        if !missing.is_empty() {
+        // 空面只有这一层判得了：工厂交回空集时，它自己没有任何理由说话，而这一题会在
+        // 「模型不会用工具」的读数里过去——那是把「面没建起来」记成「模型没做对」。
+        if !wanted.is_empty() && tools.is_empty() {
             anyhow::bail!(
-                "case {} declares MCP servers that are not registered: {missing:?}; a smaller tool \
-                 face would score the task for the wrong reason",
+                "case {} declares MCP servers ({wanted:?}) but its tool face came back empty; a \
+                 score from a shell with no tools would read as a wrong answer rather than as a \
+                 face that failed to build",
                 case.id
             );
         }
-        ToolSet::new(picked)
+        ToolSet::new(tools)
     }
 }
 
@@ -480,40 +475,48 @@ mod tests {
     }
 
     #[test]
-    fn the_tool_face_is_exactly_what_the_task_declares() {
+    fn the_tool_face_is_what_the_factory_hands_over_and_never_an_empty_one() {
         let env: Arc<dyn CaseEnv> = Arc::new(NoEnv);
+        // 名字是 MCP 工具自己的名字：不按 server 名过滤，交回来的一束就是工具面。
         let kit =
-            ToolathlonToolkit::with_tools(vec![tool("notion"), tool("excel"), tool("filesystem")])
+            ToolathlonToolkit::with_tools(vec![tool("echo"), tool("query"), tool("read_file")])
                 .unwrap();
-        // 只给这道题声明的那几件。
         let set = kit
             .toolset(&case("t1", &["excel", "filesystem"]), &env)
             .unwrap();
-        assert_eq!(set.definitions().len(), 2);
-        // 声明里有、登记处里没有 ⇒ 报错，不给一个更小的工具面。
-        let err = kit
-            .toolset(&case("t2", &["excel", "woocommerce"]), &env)
+        assert_eq!(set.definitions().len(), 3);
+
+        // 声明了 server 却交回空面 ⇒ 报错：那会让这一题读成「模型不会用工具」。
+        let empty = ToolathlonToolkit::with_tools(vec![]).unwrap();
+        let err = empty
+            .toolset(&case("t2", &["excel"]), &env)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("woocommerce"), "{err}");
-        // 重复注册是错误。
-        assert!(ToolathlonToolkit::with_tools(vec![tool("excel"), tool("excel")]).is_err());
-        // 关工具的那一套。
+        assert!(err.contains("empty"), "{err}");
+        // 没声明 server 的题，空面是对的。
+        assert!(empty.toolset(&case("t3", &[]), &env).unwrap().is_empty());
+
+        // 名字重复是错误（造面那一步已按上游做法去重，重复到这一层就是造面的 bug）。
+        assert!(ToolathlonToolkit::with_tools(vec![tool("echo"), tool("echo")]).is_err());
+        // 关工具的那一套：声明了 server 也仍然给空面，这是那一臂的定义。
         assert!(ToolathlonToolkit::without_tools()
-            .toolset(&case("t3", &["excel"]), &env)
+            .toolset(&case("t4", &["excel"]), &env)
             .unwrap()
             .is_empty());
     }
 
-    /// 工厂按题现造：这道题的 server 由**这道题自己的** compose 工程暴露，端口到环境
-    /// 起来时才知道。现造的那批里少了一台声明的 server，仍要在这题被拦下。
+    /// 工厂按题现造：这道题的 server 由**这道题自己的** Pod 暴露，台上有什么工具要到
+    /// 连上才知道。工厂交回什么，这一题的工具面就是什么；交回空面仍要在这题被拦下。
     #[test]
-    fn a_factory_can_bind_the_servers_to_the_question() {
+    fn a_factory_can_bind_the_tools_to_the_question() {
         let env: Arc<dyn CaseEnv> = Arc::new(NoEnv);
         let per_case: Arc<ToolFactory> = Arc::new(|c, _| {
-            let wanted: Vec<String> =
+            let declared: Vec<String> =
                 serde_json::from_str(c.metadata.get("needed_mcp_servers").unwrap())?;
-            Ok(wanted.iter().map(|n| tool(n)).collect())
+            Ok(declared
+                .iter()
+                .flat_map(|n| [tool(&format!("{n}_run")), tool(&format!("{n}_list"))])
+                .collect())
         });
         assert_eq!(
             ToolathlonToolkit::with_factory(per_case)
@@ -521,18 +524,17 @@ mod tests {
                 .unwrap()
                 .definitions()
                 .len(),
-            2
+            4
         );
 
-        let only_excel: Arc<ToolFactory> = Arc::new(|_, _| Ok(vec![tool("excel")]));
-        let err = ToolathlonToolkit::with_factory(only_excel)
-            .toolset(&case("t2", &["excel", "woocommerce"]), &env)
+        let none: Arc<ToolFactory> = Arc::new(|_, _| Ok(vec![]));
+        let err = ToolathlonToolkit::with_factory(none)
+            .toolset(&case("t2", &["excel"]), &env)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("woocommerce"), "{err}");
+        assert!(err.contains("empty"), "{err}");
 
-        // 现造的那批里名字重复，同样说不清是哪台 server。
-        let dup: Arc<ToolFactory> = Arc::new(|_, _| Ok(vec![tool("excel"), tool("excel")]));
+        let dup: Arc<ToolFactory> = Arc::new(|_, _| Ok(vec![tool("x"), tool("x")]));
         assert!(ToolathlonToolkit::with_factory(dup)
             .toolset(&case("t3", &["excel"]), &env)
             .is_err());
