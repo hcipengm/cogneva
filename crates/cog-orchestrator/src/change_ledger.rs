@@ -2465,6 +2465,13 @@ fn dispatchable(
 /// A dispatched change's state is not touched. Handing work over is not doing it,
 /// and a row moved because a task was filed would have the ledger reporting a
 /// tree that nothing had looked at.
+///
+/// One parameter per collaborator the process may or may not publish, plus the
+/// sources whose readings this pass could not take; grouping them into a struct
+/// would only move the same list to a type that exists to hold it, and the list
+/// grows with the number of source accounts rather than with anything this pass
+/// decides.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_pass(
     store: &dyn ChangeLedgerStore,
     orchestrator: &Arc<dyn OrchestratorControl>,
