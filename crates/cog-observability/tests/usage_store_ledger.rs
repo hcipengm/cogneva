@@ -321,6 +321,29 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         .await
         .expect("read the spend");
     assert_eq!(spent, 1_050, "a paced refusal spends nothing");
+    // A served call with no classified refusal beside it is not a window: the
+    // newest success says where serving stopped, not where the allowance ran
+    // out, so there is no capacity to report. Answering with a sum around it
+    // would hand the pacer a number nobody measured.
+    let unwalled = format!("ledger-test-unwalled:{}", uuid::Uuid::new_v4());
+    let mut unwalled_call = record("unrelated-actor".to_string(), 0, None, None, None);
+    unwalled_call.upstream = unwalled.clone();
+    store
+        .record(&unwalled_call)
+        .await
+        .expect("record a served call with no wall");
+    let no_window = store
+        .upstream_window(&unwalled, 2_592_000)
+        .await
+        .expect("read a window with no wall");
+    assert!(
+        no_window.last_quota_refusal_unix.is_none(),
+        "without a refusal there is no boundary to pace from"
+    );
+    assert_eq!(
+        no_window.burned_window_tokens, 0,
+        "no wall means no measured capacity, not a sum around the last success"
+    );
     assert!(
         store
             .task_has_started(&paced_task)
