@@ -115,6 +115,7 @@ fn reading(slug: &str, source: &str) -> PrincipleReading {
         carrier_path: Some("memory/probe-intake.md".into()),
         carrier_sha256: None,
         host_gate: None,
+        where_red: None,
         check_kind: None,
     }
 }

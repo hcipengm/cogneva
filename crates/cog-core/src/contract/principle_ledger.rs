@@ -185,6 +185,16 @@ pub struct PrincipleReading {
     /// The shape of the check the host's own registry runs for it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_gate: Option<String>,
+    /// Where the carrier says it would go red, as the carrier wrote it.
+    ///
+    /// The other two gate columns answer *whether* one exists; this one answers
+    /// the question a person asks next -- which file, which test, which command.
+    /// It is the carrier's own sentence moved here, not a path this platform
+    /// verified: existence is judged where the sentence is written, against a
+    /// tree this side does not have. So a reader may show it and may not read it
+    /// as a claim that the thing named is still there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub where_red: Option<String>,
     /// How this principle is meant to be checked, when the reading knows.
     ///
     /// Declared rather than measured: it says where the check *belongs*, which is
@@ -256,6 +266,13 @@ pub struct PrincipleRow {
     pub carrier_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_gate: Option<String>,
+    /// Where the carrier says it would go red, or `None` until a reading says.
+    ///
+    /// Stored beside the verdict rather than looked up from the carrier, because
+    /// the account outlives any one checkout: a row answers "where would this go
+    /// red" without the caller having to find the memory's file first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub where_red: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub platform_gate: Option<String>,
     /// How the principle is meant to be checked, when a reading has declared it.

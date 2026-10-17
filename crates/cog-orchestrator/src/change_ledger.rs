@@ -3898,6 +3898,7 @@ mod tests {
             carrier_path: None,
             carrier_sha256: None,
             host_gate: None,
+            where_red: None,
             platform_gate: None,
             check_kind,
             state: None,

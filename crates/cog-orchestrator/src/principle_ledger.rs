@@ -754,6 +754,7 @@ mod tests {
             carrier_path: None,
             carrier_sha256: None,
             host_gate: host.map(str::to_string),
+            where_red: None,
             platform_gate: None,
             check_kind: None,
             state,
