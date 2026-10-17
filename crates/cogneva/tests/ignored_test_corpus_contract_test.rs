@@ -97,6 +97,24 @@ const UNNAMED: &[(&str, &str)] = &[
          eval_container::tests::the_foreign_run_gets_its_own_namespaces -- \
          --ignored --nocapture`.",
     ),
+    (
+        "crates/cogneva/src/eval_toolathlon_local.rs",
+        "The one test here runs a local tool inside a real toolathlon pack pod \
+         -- the code has to reach the container, run in the task's workspace, \
+         and read a paged file back. It needs a pod created by hand from an \
+         image built into this host's registry, which a CI runner has neither \
+         of, and its own doc comment carries the one-line way to run it where \
+         such a pod exists.",
+    ),
+    (
+        "crates/cogneva/src/eval_mcp_in_pod.rs",
+        "Same shape as the local-tools entry above it: read a real pack pod's \
+         server config, start the server, list its tools and call one. What it \
+         establishes -- that NUL framing survives `kubectl exec -i` and that the \
+         `${local_servers_paths}` placeholder points at the compiled tree -- \
+         only has an answer where the pack image is running, so it is a manual \
+         reading against a hand-built pod rather than a step.",
+    ),
 ];
 
 /// What a step selects, as far as naming tests goes.
@@ -284,9 +302,49 @@ fn collect_rs(dir: &Path, rel: &mut Vec<String>, out: &mut Vec<(PathBuf, Vec<Str
 /// Unreadable is a failure, not a "no": a file this cannot read is a file whose
 /// ignored tests are silently absent from the census.
 fn contains_marker(path: &Path) -> bool {
-    std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()))
-        .contains(IGNORE_MARKER)
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
+    carries_marker(&text)
+}
+
+/// Whether a line puts the marker in attribute position.
+///
+/// The census asks where an attribute is, not where the words appear: a comment
+/// that spells the attribute out -- and a live-service test's own doc comment
+/// does exactly that, to tell a reader how to run it -- is a mention, and
+/// counting it reports the file as a test binary no step names. So the marker
+/// only counts on a line that begins with `#` after indentation, which is the
+/// shape an attribute has in a formatted tree (an attribute never begins a
+/// line with anything else) and the shape prose does not have (a comment line
+/// begins with its slashes, not with `#`).
+///
+/// The scan keeps itself out of block comments: a `#[ignore]` written inside a
+/// multi-line comment is documentation too, and it can sit at the start of its
+/// line. Only a `/*` that opens its line counts as one — the same two bytes
+/// turn up inside globs and paths (`configs/*.yaml`), and reading those as a
+/// comment would hide every attribute after them, which is the direction that
+/// looks like a pass.
+fn carries_marker(text: &str) -> bool {
+    let mut in_block_comment = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if in_block_comment {
+            if trimmed.contains("*/") {
+                in_block_comment = false;
+            }
+            continue;
+        }
+        if trimmed.starts_with("/*") {
+            if !trimmed.contains("*/") {
+                in_block_comment = true;
+            }
+            continue;
+        }
+        if trimmed.starts_with('#') && trimmed.contains(IGNORE_MARKER) {
+            return true;
+        }
+    }
+    false
 }
 
 /// The crate directories of the workspace, by directory name.
@@ -391,6 +449,26 @@ impl Named {
             Site::Library => self.libraries.contains(&site.krate),
         }
     }
+}
+
+/// The marker counts as an attribute and not as a word. Both halves matter: a
+/// prose mention counted as a site reports a file that has no ignored test, and
+/// an attribute missed leaves its test out of the census — the direction that
+/// looks like a pass.
+#[test]
+fn the_marker_counts_only_in_attribute_position() {
+    let marker = concat!("#[ig", "nore");
+    assert!(carries_marker(&format!(
+        "    {marker} = \"needs a server\"\n"
+    )));
+    assert!(carries_marker(&format!("#[cfg(test)] {marker}\n")));
+    assert!(!carries_marker(&format!(
+        "/// mentions {marker} in prose\n"
+    )));
+    assert!(!carries_marker(&format!(
+        "    let doc = \"the {marker} attribute\";\n"
+    )));
+    assert!(!carries_marker(&format!("/*\n{marker}\n*/\n")));
 }
 
 /// A step that names a binary which is gone, or which no longer has an ignored

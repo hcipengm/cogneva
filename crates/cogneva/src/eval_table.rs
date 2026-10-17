@@ -1104,7 +1104,7 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
     let platform: Arc<dyn PlatformRunner> = wiring
         .platform
         .clone()
-        .unwrap_or_else(|| Arc::new(NoPlatform::new(platform_absence(&wiring))));
+        .unwrap_or_else(|| Arc::new(NoPlatform::new(platform_absence(wiring))));
 
     let checkpoint = run_checkpoint(args, &verified, subset.as_deref());
     let mut rig = Rig::new(

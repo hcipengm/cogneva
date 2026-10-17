@@ -443,8 +443,7 @@ pub async fn read_server_configs(
 
     let mut fields = out.stdout.split('\0');
     let mut records = Vec::new();
-    loop {
-        let Some(path) = fields.next() else { break };
+    while let Some(path) = fields.next() {
         if path.is_empty() {
             continue;
         }
