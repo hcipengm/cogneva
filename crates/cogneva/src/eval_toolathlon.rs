@@ -155,6 +155,20 @@ impl PodRuntime {
         cmd
     }
 
+    /// 拼一台不走环境探测的 runtime，只给单测用。
+    ///
+    /// [`Self::detect`] 要真跟集群说上话才返回 `Some`，所以它的结果**依赖这台机器当前
+    /// 的状态**——拿它去钉 argv 的形状，测的就不是 argv 了。argv 是纯函数，给它一组
+    /// 固定的前缀就能钉住。
+    #[cfg(test)]
+    pub(crate) fn for_test(prefix: Vec<String>, namespace: &str) -> Self {
+        Self {
+            prefix,
+            namespace: namespace.to_string(),
+            timeout: Duration::from_secs(60),
+        }
+    }
+
     /// 跑一条 `kubectl` 命令。超时是**失败**不是空结果：吞掉它，这一格的分就读成
     /// 「模型没做对」，而真相是「这台机器没跑完」。
     async fn exec(&self, args: &[String]) -> anyhow::Result<RunOutcome> {
@@ -178,6 +192,38 @@ impl PodRuntime {
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             code: out.status.code(),
         })
+    }
+
+    /// 一条**长命**的 `kubectl exec -i` 的程序与参数，交给 stdio 传输去起。
+    ///
+    /// 与 [`Self::exec`] 的差别只在寿命，不在命令：那条等一条命令跑完再把输出取回来，
+    /// 这条要一直握着两根管子（本地写的是远端程序的 stdin，读的是它的 stdout），整场
+    /// 对话共用一次 exec。所以它不能走 [`Self::exec`]——那个函数在命令结束时就把
+    /// 管子的两端都收了。
+    ///
+    /// `-i` 是这条的全部要点：没有它，本地这侧写不进去，远端 server 读不到请求。
+    pub fn stdio_exec_argv(
+        &self,
+        pod: &str,
+        container: &str,
+        remote_script: &str,
+    ) -> (String, Vec<String>) {
+        let mut args: Vec<String> = self.prefix[1..].to_vec();
+        args.push("-n".into());
+        args.push(self.namespace.clone());
+        args.extend(["exec".into(), "-i".into(), pod.into()]);
+        // 容器名显式给：一个 Pod 里不止一个容器（还有库），靠默认选中的那个是别人
+        // 的规则，选中谁不该由集群决定。
+        args.extend(["-c".into(), container.into()]);
+        // `--` 之后按 argv **逐字**交给远端，不经任何 shell 解释——远端那条命令串自己
+        // 要不要 shell 是它的事（本列要 `/bin/sh -c`，因为 cwd/env 只能写在串里）。
+        args.extend([
+            "--".into(),
+            "/bin/sh".into(),
+            "-c".into(),
+            remote_script.to_string(),
+        ]);
+        (self.prefix[0].clone(), args)
     }
 }
 
