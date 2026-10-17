@@ -487,6 +487,57 @@ async fn measure_pass(
         ),
     }
 
+    // The batch is debt first, and the judgement tier sorts behind all of it.
+    // That order was written when no judgement row could be settled: a row a
+    // person holds writes nothing, so it would sit at the head of every pass
+    // forever and take the bounded batch with it. A declaration is the exception
+    // -- a judgement row the platform's registry names *is* settleable -- and the
+    // ordering has no way to know which tier a file names, so such a row is
+    // never in the batch while the debt runs deeper than one pass takes, which is
+    // every pass: the declaration would be read every five minutes and recorded
+    // never. So the declared slugs the batch did not offer are asked for by slug,
+    // and the ones that are an unsettled judgement row go to the head of this
+    // pass's work.
+    let offered: HashSet<&str> = rows.iter().map(|row| row.slug.as_str()).collect();
+    let declared: Vec<String> = declarations.slugs().map(str::to_string).collect();
+    let mut rescued: Vec<PrincipleRow> = Vec::new();
+    let mut declared_unread: Vec<String> = Vec::new();
+    for slug in &declared {
+        if offered.contains(slug.as_str()) {
+            continue;
+        }
+        match store.get(slug).await {
+            Ok(Some(row))
+                if row.check_kind == Some(PrincipleCheckKind::Judgement)
+                    && row.state != Some(PrincipleState::Enforced) =>
+            {
+                rescued.push(row);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    slug = %slug,
+                    error = %e,
+                    "principle ledger: a principle the registry declares could not be read back"
+                );
+                declared_unread.push(slug.clone());
+            }
+        }
+    }
+    if !declared_unread.is_empty() {
+        warn!(
+            unread = declared_unread.len(),
+            principles = %declared_unread.join(", "),
+            "principle ledger: some declared principles could not be read back, so whether each \
+             is one a person holds is unanswered this pass"
+        );
+    }
+    let declared_judgement = rescued.len();
+    // In front rather than behind: the batch is bounded, and a row appended past
+    // that bound would be read and never judged -- the same silence this is
+    // here to end.
+    rows.splice(0..0, rescued);
+
     // The reverse direction, before any verdict: a declaration naming a slug the
     // account has no row for is reported by name and with the file that says it.
     // A mistyped slug and a principle the account never heard of are one count
@@ -640,6 +691,7 @@ async fn measure_pass(
         unsettled = %reason_summary(&by_reason),
         already_unsettled = known_unsettled,
         orphan_declarations = ?orphan_declarations,
+        declared_judgement,
         duplicate_declarations,
         revision = %revision,
         "principle ledger: judged the outstanding set against the two registries"
@@ -1316,6 +1368,121 @@ mod tests {
             "the row re-opened this pass was not judged until the next one"
         );
         assert_eq!(measured[0].slug, slug);
+        assert_eq!(measured[0].state, PrincipleState::Enforced);
+        assert_eq!(
+            measured[0].platform_gate.as_deref(),
+            Some("crates/x/tests/gate_test.rs")
+        );
+    }
+
+    /// A store whose outstanding set is all debt, and whose judgement row is
+    /// only reachable by slug -- which is what the real selector does: the whole
+    /// judgement tier sorts behind every unsettled row, and there is always more
+    /// debt than one pass takes.
+    #[derive(Default)]
+    struct StarvedStore {
+        measured: std::sync::Mutex<Vec<PrincipleMeasurement>>,
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PrincipleLedgerStore for StarvedStore {
+        async fn record_readings(
+            &self,
+            _: &[cog_core::PrincipleReading],
+        ) -> cog_core::SFResult<usize> {
+            unimplemented!()
+        }
+        async fn declare(&self, _: &[cog_core::PrincipleReading]) -> cog_core::SFResult<usize> {
+            unimplemented!()
+        }
+        async fn fold_declarations(&self, _: usize) -> cog_core::SFResult<cog_core::PrincipleFold> {
+            unimplemented!()
+        }
+        async fn pending_declarations(&self) -> cog_core::SFResult<u64> {
+            unimplemented!()
+        }
+        async fn apply_principle_measurement(
+            &self,
+            measurement: &PrincipleMeasurement,
+        ) -> cog_core::SFResult<()> {
+            self.measured.lock().unwrap().push(measurement.clone());
+            Ok(())
+        }
+        async fn outstanding(&self, _: usize) -> cog_core::SFResult<Vec<PrincipleRow>> {
+            Ok(vec![row("feedback_debt", Some("scripts/hook.sh"), None)])
+        }
+        async fn reopen_platform_gate_drift(
+            &self,
+            _: &HashMap<String, String>,
+        ) -> cog_core::SFResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn refused(&self, _: usize) -> cog_core::SFResult<Vec<PrincipleRow>> {
+            unimplemented!()
+        }
+        async fn get(&self, slug: &str) -> cog_core::SFResult<Option<PrincipleRow>> {
+            self.asked.lock().unwrap().push(slug.to_string());
+            if slug != "feedback_declared_judgement" {
+                return Ok(None);
+            }
+            let mut held = row(slug, Some("-"), None);
+            held.check_kind = Some(PrincipleCheckKind::Judgement);
+            Ok(Some(held))
+        }
+        async fn slugs(&self) -> cog_core::SFResult<Vec<String>> {
+            Ok(vec![
+                "feedback_debt".to_string(),
+                "feedback_declared_judgement".to_string(),
+            ])
+        }
+        async fn census(&self) -> cog_core::SFResult<PrincipleCensus> {
+            unimplemented!()
+        }
+        async fn check_kind_census(&self) -> cog_core::SFResult<PrincipleCheckKindCensus> {
+            unimplemented!()
+        }
+        async fn report_refusals(
+            &self,
+            _: &[cog_core::PrincipleRefusal],
+        ) -> cog_core::SFResult<usize> {
+            unimplemented!()
+        }
+        async fn fold_refusals(&self, _: usize) -> cog_core::SFResult<usize> {
+            unimplemented!()
+        }
+        async fn pending_refusals(&self) -> cog_core::SFResult<u64> {
+            unimplemented!()
+        }
+    }
+
+    /// A judgement row the platform declares is settled by the pass that reads
+    /// the declaration, even though the outstanding set never offers it.
+    ///
+    /// The tier sorts behind all debt by design, and the debt outnumbers one
+    /// pass on every pass, so the batch would leave such a row unjudged for as
+    /// long as the debt exists -- the declaration read every five minutes and
+    /// the account answering "no gate" forever.
+    #[tokio::test]
+    async fn a_declared_judgement_row_is_judged_even_though_the_batch_never_offers_it() {
+        let slug = "feedback_declared_judgement";
+        let dir = repo_declaring(slug);
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let store = StarvedStore::default();
+
+        measure_pass(&store, &tree, &HashSet::new(), &mut HashMap::new()).await;
+
+        // Asked for by slug, because the batch did not carry it.
+        assert!(
+            store.asked.lock().unwrap().iter().any(|s| s == slug),
+            "the pass never asked for the declared judgement row"
+        );
+        let measured = store.measured.lock().unwrap();
+        assert_eq!(
+            measured.first().map(|m| m.slug.as_str()),
+            Some(slug),
+            "the rescued row was judged behind the debt it was rescued from"
+        );
         assert_eq!(measured[0].state, PrincipleState::Enforced);
         assert_eq!(
             measured[0].platform_gate.as_deref(),
