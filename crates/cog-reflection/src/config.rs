@@ -42,6 +42,15 @@ pub struct PromotionGateConfig {
     pub failure_breaker_threshold: u32,
     /// 沙盒部署成功后试跑观察时长（秒），期间健康不劣化才允许晋级。
     pub soak_secs: u64,
+    /// 一条等待人工审批的记录最多挂多久（秒）。到点仍未决的，按判据决断并
+    /// 记因（见 `auto_promoter::sweep_expired_approvals`）。
+    ///
+    /// 为什么要有一个点：审批此前是终态——一条没人来批的变更既不会落地也
+    /// 不会消失，只会在审批台上一直排着。等待本身不是风险控制，决断才是。
+    /// 这个值是一个**覆盖位**，不是实测导出的：今天没有任何读数量过「人到
+    /// 底多久会来看」，默认取一天是「人能反应过来的一个自然周期」。要改它
+    /// 之前先量一次审批延迟，再把来源写在这段里。
+    pub awaiting_review_timeout_secs: u64,
     /// L1 白名单路径前缀（低风险代码，可自动晋级）。
     pub whitelist_prefixes: Vec<String>,
     /// L2 核心路径前缀（必须人工审批）。判定优先于白名单。
@@ -81,6 +90,7 @@ impl Default for PromotionGateConfig {
             rollback_breaker_threshold: 2,
             failure_breaker_threshold: 3,
             soak_secs: 600,
+            awaiting_review_timeout_secs: 86_400,
             // 白名单故意收窄（宁严勿宽）：只有纯工具实现、前端、文档。
             // 未列出的路径一律按 L2 转人工。
             // `docs/` 是仓库内的外部/产品文档目录（可入库）；内部文档
@@ -174,6 +184,12 @@ impl PromotionGateConfig {
         }
         if let Some(v) = get("COGNEVA_SELF_EVOLUTION_PROMOTION_SOAK_SECS") {
             self.soak_secs = parse("COGNEVA_SELF_EVOLUTION_PROMOTION_SOAK_SECS", &v)?;
+        }
+        if let Some(v) = get("COGNEVA_SELF_EVOLUTION_PROMOTION_AWAITING_REVIEW_TIMEOUT_SECS") {
+            self.awaiting_review_timeout_secs = parse(
+                "COGNEVA_SELF_EVOLUTION_PROMOTION_AWAITING_REVIEW_TIMEOUT_SECS",
+                &v,
+            )?;
         }
         if let Some(v) = get("COGNEVA_SELF_EVOLUTION_PROMOTION_ROLLBACK_BREAKER") {
             self.rollback_breaker_threshold =

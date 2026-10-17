@@ -6,7 +6,12 @@
 //! - 全部落在 L0 配置路径 → 热更新通道（不碰二进制）；
 //! - 触及 L2 核心路径（存储 / 调度 / 安全网关 / 凭证 / 部署）→ 人工审批；
 //! - 全部落在 L1 白名单且 diff 不超限 → 自动金丝雀晋级；
-//! - 其余模糊地带一律按 L2 转人工（宁严勿宽，fail-closed）。
+//! - 其余路径族 → 拒收，并点名是哪一族没有准入条件。
+//!
+//! 最后一条原来写的是「模糊地带一律转人工（宁严勿宽）」。`没想到` 不是风险
+//! 等级：把没列过的路径判成「等人批」，得到的是一条**永远没有人来批**的待办，
+//! 既不会落地也不会消失。所以这一格的结局是拒收——同一条路径族的准入条件由
+//! 配置补上之后，它才会走进前两档。
 //!
 //! 纯函数无 IO，配置来自 [`crate::PromotionGateConfig`]。
 
@@ -105,6 +110,18 @@ fn matches_any(path: &str, prefixes: &[String]) -> bool {
     prefixes.iter().any(|p| path.starts_with(p.as_str()))
 }
 
+/// `crates/<成员>/src/...`：工作区成员自己的源码。
+///
+/// 按**分量**判而不是按前缀：`crates/x/src` 与 `crates/x/src2` 是两回事，而
+/// 前者是这一族的边界。测试与夹具不在 `src/` 下，也就自然不落进这一族——它们
+/// 没有对应的准入条件，走的是拒收那一格。
+fn is_member_src(path: &str) -> bool {
+    let mut parts = path.split('/');
+    parts.next() == Some("crates")
+        && parts.next().is_some_and(|m| !m.is_empty())
+        && parts.next() == Some("src")
+}
+
 /// The directory components a change may not reach into, on the same terms as
 /// [`forbidden_names`].
 ///
@@ -130,9 +147,10 @@ fn forbidden_dir_segments<'a>(
 /// 3. diff 行数超上限 → RequireApproval；
 /// 4. 全部文件落在 L0 配置路径 → AutoConfig（配置路径是核心路径的
 ///    特例，必须先判；混入任何非配置文件会自然掉到后续判定）；
-/// 5. 任一文件命中 L2 核心路径 → RequireApproval；
-/// 6. 全部文件落在 L1 白名单 → AutoRollout；
-/// 7. 其余 → RequireApproval（模糊从严）。
+/// 5. 任一文件命中 L2 核心路径 → RequireApproval（准入条件里缺的那一条写进理由）；
+/// 6. 全部文件是成员 crate 的 `src/` → AutoRollout（编译 + 测试已在沙盒跑过）；
+/// 7. 全部文件落在 L1 白名单 → AutoRollout；
+/// 8. 其余 → Reject（这条路径族没有准入条件）。
 pub fn classify(files: &[String], diff_lines: usize, policy: &PromotionGateConfig) -> GateVerdict {
     if files.is_empty() {
         return GateVerdict::Reject {
@@ -182,10 +200,22 @@ pub fn classify(files: &[String], diff_lines: usize, policy: &PromotionGateConfi
     }
 
     if let Some(core) = files.iter().find(|f| matches_any(f, &policy.core_prefixes)) {
+        // 核心路径的准入条件写在表里，但其中一项今天还不可执行：回滚路径没有
+        // 在晋级链上被执行过一次的读数。缺条件的那一条要说出来是**哪一条**，
+        // 否则这一格又变成一句「要人看」。审批有时间上限，到点按这句判据决断。
         return GateVerdict::RequireApproval {
             kind: PromotionGateKind::ApprovalCorePath,
-            reason: format!("触及核心路径 {core}"),
+            reason: format!(
+                "触及核心路径 {core}：准入条件缺可回滚实证（回滚路径还没有在晋级链上被执行过一次）"
+            ),
         };
+    }
+
+    // 成员 crate 的源码族：准入条件是编译 + 测试，而这两件事在晋级门见到这条
+    // 变更之前就已经在沙盒里跑过了（沙盒 apply → test → build → switch 全过才
+    // 会有晋级判定）。所以这一族不需要人工，也不需要在这里重跑一遍。
+    if files.iter().all(|f| is_member_src(f)) {
+        return GateVerdict::AutoRollout;
     }
 
     if files
@@ -195,9 +225,16 @@ pub fn classify(files: &[String], diff_lines: usize, policy: &PromotionGateConfi
         return GateVerdict::AutoRollout;
     }
 
-    GateVerdict::RequireApproval {
-        kind: PromotionGateKind::ApprovalUnclassified,
-        reason: "触及未列入白名单的路径，模糊地带从严转人工".into(),
+    // 「没想到的路径」不再等于「要人批」。等人批的那条路没有下一个动作：一条
+    // 永远没有人来批的待办既不会落地也不会消失，它只会在审批台上把真正的待办
+    // 淹掉。这里拒收并点名缺条件的那一族——下一个动作是改配置，不是等人。
+    let unclassified = files.first().map(String::as_str).unwrap_or_default();
+    GateVerdict::Reject {
+        kind: PromotionGateKind::RejectUnclassified,
+        reason: format!(
+            "触及没有准入条件的路径族 {unclassified}：不是等人批，是这一族还没有可执行条件——\
+             把它加进白名单/配置前缀，或给这一族写一条准入条件"
+        ),
     }
 }
 
@@ -317,8 +354,16 @@ mod tests {
         // 这条轴碰到（前者是既有 carrier，后者是另一件事）。
         for path in ["eval_datasets/humaneval.jsonl", "docs/evaluation/notes.md"] {
             let v = classify(&files(&[path]), 5, &policy);
+            // 这两条只考目录轴，不考归属：前者落在没有准入条件的路径族，后者
+            // 落在白名单。它们共同的反面证据是**没有**被当成受保护目录拒收。
             assert!(
-                !matches!(v, GateVerdict::Reject { .. }),
+                !matches!(
+                    v,
+                    GateVerdict::Reject {
+                        kind: PromotionGateKind::RejectProtected,
+                        ..
+                    }
+                ),
                 "{path} 被目录轴误拒: {v:?}"
             );
         }
@@ -424,10 +469,45 @@ mod tests {
         }
     }
 
+    /// 没列过的路径族不再转人工：拒收，并点名是哪一族缺条件。
     #[test]
-    fn unlisted_path_fails_closed() {
+    fn unlisted_path_is_rejected_and_names_the_family() {
+        let v = classify(&files(&["scripts/run.py"]), 10, &policy());
+        match v {
+            GateVerdict::Reject { kind, reason } => {
+                assert_eq!(kind, PromotionGateKind::RejectUnclassified);
+                assert!(reason.contains("scripts/run.py"), "{reason}");
+            }
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    /// 拒收那一格**有下一个动作**：给这一族一条条件（这里用白名单）就走进 L1。
+    #[test]
+    fn a_rejected_family_walks_the_auto_tier_once_it_has_a_condition() {
+        let mut policy = PromotionGateConfig::default();
+        policy.whitelist_prefixes.push("scripts/".into());
+        let v = classify(&files(&["scripts/run.py"]), 10, &policy);
+        assert_eq!(v, GateVerdict::AutoRollout);
+    }
+
+    /// 成员 crate 的源码族有可执行条件（编译 + 测试已在沙盒跑过），不需要人。
+    #[test]
+    fn a_member_crate_src_file_is_auto_rollout() {
         let v = classify(&files(&["crates/cog-memory/src/causal.rs"]), 10, &policy());
-        assert!(matches!(v, GateVerdict::RequireApproval { .. }), "{v:?}");
+        assert_eq!(v, GateVerdict::AutoRollout);
+    }
+
+    /// 但 `src/` 之外的东西不沾这一族的光：分量相等才是边界。
+    #[test]
+    fn a_member_crate_test_file_is_not_in_the_src_family() {
+        for path in [
+            "crates/cog-memory/tests/causal.rs",
+            "crates/cog-memory/src2/x.rs",
+        ] {
+            let v = classify(&files(&[path]), 10, &policy());
+            assert!(matches!(v, GateVerdict::Reject { .. }), "{path}: {v:?}");
+        }
     }
 
     #[test]
@@ -453,7 +533,7 @@ mod tests {
         }
         .is_auto());
         assert!(!GateVerdict::RequireApproval {
-            kind: PromotionGateKind::ApprovalUnclassified,
+            kind: PromotionGateKind::ApprovalCorePath,
             reason: String::new(),
         }
         .is_auto());

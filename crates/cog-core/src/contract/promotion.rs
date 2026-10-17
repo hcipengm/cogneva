@@ -159,7 +159,16 @@ pub enum PromotionGateKind {
     /// 触及核心路径，转人工。
     ApprovalCorePath,
     /// 路径未列入白名单，模糊从严转人工。
+    ///
+    /// 只读历史：分级不再产出这一条。「没想到的路径」被判成「要人批」是把惰性
+    /// 写成风险等级，今天它走 [`Self::RejectUnclassified`]。留着这个变体是为了
+    /// 让已经落库的行还能按原样读回来。
     ApprovalUnclassified,
+    /// 路径族没有准入条件：拒收，并点名是哪一族缺条件。
+    ///
+    /// 与「转人工」的区别是它**有下一个动作**：写条件或加白名单，都是改配置。
+    /// 一条永远没人来批的待办没有下一个动作。
+    RejectUnclassified,
 }
 
 impl PromotionGateKind {
@@ -172,6 +181,7 @@ impl PromotionGateKind {
             PromotionGateKind::ApprovalDiffOverLimit => "approval_diff_over_limit",
             PromotionGateKind::ApprovalCorePath => "approval_core_path",
             PromotionGateKind::ApprovalUnclassified => "approval_unclassified",
+            PromotionGateKind::RejectUnclassified => "reject_unclassified",
         }
     }
 
@@ -184,6 +194,7 @@ impl PromotionGateKind {
             "approval_diff_over_limit" => Some(PromotionGateKind::ApprovalDiffOverLimit),
             "approval_core_path" => Some(PromotionGateKind::ApprovalCorePath),
             "approval_unclassified" => Some(PromotionGateKind::ApprovalUnclassified),
+            "reject_unclassified" => Some(PromotionGateKind::RejectUnclassified),
             _ => None,
         }
     }
@@ -240,6 +251,25 @@ pub trait PromotionLedger: Send + Sync {
     /// 取最近 limit 条记录（新在前），供熔断器判定连续失败/回滚。
     async fn recent(&self, limit: usize) -> SFResult<Vec<PromotionRecord>>;
 
+    /// 这一部台账里仍等人工审批的行（旧在前，先到点的先决断）。
+    ///
+    /// 与 `recent` 的差别是**按状态选行**，不是按时间截断：一条挂了很久的
+    /// 审批行会被后来的一批记录挤出按时间取的那个窗口，于是「到点决断」这件
+    /// 事永远轮不到它——等待正是这样变回终态的。缺省实现退回按时间取，只够
+    /// 测试替身用；真台账应当覆盖它，让自己的读取面按状态过滤。
+    async fn awaiting(&self, cluster: &str, limit: usize) -> SFResult<Vec<PromotionRecord>> {
+        let mut rows: Vec<PromotionRecord> = self
+            .recent(limit)
+            .await?
+            .into_iter()
+            .filter(|r| {
+                r.cluster == cluster && matches!(r.status, PromotionStatus::AwaitingApproval)
+            })
+            .collect();
+        rows.sort_by_key(|r| r.updated_at);
+        Ok(rows)
+    }
+
     /// 审计展示用列表（新在前）。
     async fn list(&self, limit: usize) -> SFResult<Vec<PromotionRecord>> {
         self.recent(limit).await
@@ -262,6 +292,7 @@ mod tests {
             PromotionGateKind::ApprovalDiffOverLimit,
             PromotionGateKind::ApprovalCorePath,
             PromotionGateKind::ApprovalUnclassified,
+            PromotionGateKind::RejectUnclassified,
         ] {
             assert_eq!(PromotionGateKind::parse(kind.as_str()), Some(kind));
         }
@@ -274,6 +305,7 @@ mod tests {
         for kind in [
             PromotionGateKind::RejectUnmeasured,
             PromotionGateKind::RejectProtected,
+            PromotionGateKind::RejectUnclassified,
             PromotionGateKind::AutoConfig,
             PromotionGateKind::AutoRollout,
         ] {

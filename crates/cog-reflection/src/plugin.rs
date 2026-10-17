@@ -1311,6 +1311,10 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                                         // 队列里），只有停摆告警一直读着它的出口，
                                         // 所以每轮顺手回收。
                                         p.reclaim_landed_approvals().await;
+                                        // 审批不是一个可以无限期停留的状态：到点
+                                        // 仍未决的按判据与理由决断，免得审批台上
+                                        // 排着永远不会有下文的行。
+                                        p.sweep_expired_approvals().await;
                                     }
                                     // 本轮是纯确定性消费：同步工作树、取出待验变更、apply/test/
                                     // build、落地、切二进制，全程不调 LLM。上游全灭时跳过它，只会让

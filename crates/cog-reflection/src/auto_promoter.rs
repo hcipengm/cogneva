@@ -17,6 +17,9 @@
 //!       RequireApproval  → 状态 AwaitingReview + 台账 awaiting_approval（审批台待办）
 //! ```
 //!
+//! 最后那一档不是终态：等待有上限（`awaiting_review_timeout_secs`），到点
+//! 仍未决的记录由 [`AutoPromoter::sweep_expired_approvals`] 按判据与理由决断。
+//!
 //! 晋级结果（含回滚原因）同时调 `record_change_outcome` 回流
 //! Reflection，喂给下一轮变更生成（全进化第六步的闭环回环）。
 
@@ -36,6 +39,10 @@ use crate::ReflectionEngine;
 /// 「判定说这条已有记录、审批台却说没有那一行」。台账是追加表，一周一行时
 /// 这个窗口按年计。
 const LEDGER_LOOKBACK: usize = 50;
+
+/// 一轮超时决断最多看多少条审批行。取旧在前，所以积压只会一轮轮往前推；
+/// 这个数是每轮的界，不是「最多只决断这么多」——到点的那些每一轮都会被关掉。
+const APPROVAL_SWEEP_LIMIT: usize = 1000;
 
 /// 待晋级提交的来源。沙盒变更提交在临时工作树里（detached HEAD，用完即弃），
 /// 推送端不能假设自己的检出就是待发布内容，必须显式拿到提交。
@@ -261,7 +268,14 @@ impl AutoPromoter {
             None => format!("分级判定 {}", verdict.kind().as_str()),
         };
         let downgrade = if !auto {
-            Some("分级判定需人工审批".to_string())
+            // 分级自己要求人批时，理由就是判据本身（哪条路径、缺什么条件）。
+            // 用一句通用文案顶掉它，行上就只剩"需要人看"，到点决断也无从记因。
+            Some(
+                verdict
+                    .reason()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "分级判定需人工审批".to_string()),
+            )
         } else if self.switch.as_ref().is_some_and(|s| s.is_paused()) {
             Some("运行时一键暂停（admin API）".to_string())
         } else if !self.policy.enabled {
@@ -575,6 +589,75 @@ impl AutoPromoter {
                     record_id = %rec.id,
                     error = %e,
                     "could not close an awaiting-approval row whose change is already live"
+                ),
+            }
+        }
+    }
+
+    /// 审批不许是终态：到点仍未决的记录，按判据决断并记因。
+    ///
+    /// 判据就是这条记录当初为什么被挂起——那句理由还在 `decision_reason` 里。
+    /// 到点之后它没有变成别的：没有自动通道可走，也没有人来批。于是结局是
+    /// 失败并留下理由，不是「再等等」。等待本身不是风险控制；一条永远挂着的
+    /// 记录既不落地也不消失，只会在审批台上把真正的待办淹掉。
+    ///
+    /// `awaiting_review_timeout_secs = 0` 表示关掉这一格（不设等待窗），不是
+    /// 「立刻全判死」：0 与「无限等待」是同一件事的两种写法，取前者是因为它
+    /// 有一个可读的开关，而 `u64::MAX` 只是一个碰巧够大的数。
+    ///
+    /// 只扫自己这一部台账（`cluster == self.cluster`），与销账同一条理由：另
+    /// 一部的行有它自己的判据、自己的时钟。
+    pub async fn sweep_expired_approvals(&self) {
+        let timeout = self.policy.awaiting_review_timeout_secs as i64;
+        if timeout == 0 {
+            return;
+        }
+        let waiting = match self
+            .ledger
+            .awaiting(&self.cluster, APPROVAL_SWEEP_LIMIT)
+            .await
+        {
+            Ok(waiting) => waiting,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "promotion ledger unreadable; no expired approval decided this round"
+                );
+                return;
+            }
+        };
+        let now = Utc::now();
+        for rec in waiting.iter() {
+            let age = (now - rec.updated_at).num_seconds();
+            if age < timeout {
+                continue;
+            }
+            let reason = format!(
+                "审批 {age} 秒未决（上限 {timeout} 秒），按判据决断：{}",
+                rec.decision_reason
+            );
+            match self
+                .ledger
+                .update_status(&rec.id, PromotionStatus::Failed, &reason)
+                .await
+            {
+                Ok(()) => {
+                    warn!(
+                        change_id = %rec.change_id,
+                        record_id = %rec.id,
+                        "approval window expired; the change is decided and closed"
+                    );
+                    self.set_change_status(&rec.change_id, EvolutionStatus::Rejected)
+                        .await;
+                    let _ = self
+                        .engine
+                        .record_change_outcome(&rec.change_id, false, &reason)
+                        .await;
+                }
+                Err(e) => warn!(
+                    record_id = %rec.id,
+                    error = %e,
+                    "could not close an approval row whose window expired"
                 ),
             }
         }
@@ -988,6 +1071,125 @@ mod tests {
         assert!(
             channel.published.lock().unwrap().is_empty(),
             "回收不发布：做完这件事的是落地通道，不是晋级通道"
+        );
+    }
+
+    /// 把落进来的记录整体做旧，用来考「等待窗到期」那一格。做旧在写入面而不在
+    /// 断言里，因为被考的正是读 `updated_at` 的那段代码：让记录一出生就老两天，
+    /// 才量得到同一条路径上的真实行为。
+    struct BackdatedLedger {
+        inner: cog_storage::MemoryStateBackend,
+        age: Duration,
+    }
+
+    #[async_trait]
+    impl cog_core::PromotionLedger for BackdatedLedger {
+        async fn record(&self, mut rec: cog_core::PromotionRecord) -> SFResult<()> {
+            rec.created_at -= self.age;
+            rec.updated_at -= self.age;
+            self.inner.record(rec).await
+        }
+        async fn update_status(
+            &self,
+            id: &str,
+            status: PromotionStatus,
+            outcome: &str,
+        ) -> SFResult<()> {
+            self.inner.update_status(id, status, outcome).await
+        }
+        async fn count_promoted_since(&self, since: DateTime<Utc>) -> SFResult<u64> {
+            self.inner.count_promoted_since(since).await
+        }
+        async fn recent(&self, limit: usize) -> SFResult<Vec<cog_core::PromotionRecord>> {
+            self.inner.recent(limit).await
+        }
+    }
+
+    /// 审批不是终态：到点仍未决的行要按判据与理由决断，且理由留在行上。
+    #[tokio::test]
+    async fn an_expired_approval_is_decided_and_closed() {
+        let ledger = Arc::new(BackdatedLedger {
+            inner: cog_storage::MemoryStateBackend::new(),
+            age: Duration::days(2),
+        });
+        let policy = crate::PromotionGateConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let p = AutoPromoter::new(policy, ledger.clone(), None, engine());
+
+        let core = "crates/cog-storage/src/postgres/state_backend.rs";
+        p.decide_and_promote(&change("expired", core))
+            .await
+            .unwrap();
+        assert_eq!(
+            ledger.recent(10).await.unwrap()[0].status,
+            PromotionStatus::AwaitingApproval
+        );
+
+        p.sweep_expired_approvals().await;
+
+        let row = &ledger.recent(10).await.unwrap()[0];
+        assert_eq!(
+            row.status,
+            PromotionStatus::Failed,
+            "到点是决断，不是再等等"
+        );
+        assert!(
+            row.outcome.contains("触及核心路径"),
+            "决断要带着当初挂起它的那句判据，否则事后读不出为什么没落地：{}",
+            row.outcome
+        );
+        assert!(
+            row.outcome.contains("按判据决断"),
+            "这一行要说得出它是被超时关掉的：{}",
+            row.outcome
+        );
+    }
+
+    /// 没到点的行一格都不能动：等待窗是窗，不是一个每轮重判的开关。
+    #[tokio::test]
+    async fn a_fresh_approval_is_left_waiting() {
+        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let policy = crate::PromotionGateConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let p = promoter(policy, ledger.clone(), None);
+        let core = "crates/cog-storage/src/postgres/state_backend.rs";
+        p.decide_and_promote(&change("waiting", core))
+            .await
+            .unwrap();
+
+        p.sweep_expired_approvals().await;
+
+        assert_eq!(
+            ledger.recent(10).await.unwrap()[0].status,
+            PromotionStatus::AwaitingApproval
+        );
+    }
+
+    /// `0` 是「关掉这一格」的可读写法，不是「立刻全判死」。
+    #[tokio::test]
+    async fn a_zero_window_does_not_close_anything() {
+        let ledger = Arc::new(BackdatedLedger {
+            inner: cog_storage::MemoryStateBackend::new(),
+            age: Duration::days(2),
+        });
+        let policy = crate::PromotionGateConfig {
+            enabled: true,
+            awaiting_review_timeout_secs: 0,
+            ..Default::default()
+        };
+        let p = AutoPromoter::new(policy, ledger.clone(), None, engine());
+        let core = "crates/cog-storage/src/postgres/state_backend.rs";
+        p.decide_and_promote(&change("kept", core)).await.unwrap();
+
+        p.sweep_expired_approvals().await;
+
+        assert_eq!(
+            ledger.recent(10).await.unwrap()[0].status,
+            PromotionStatus::AwaitingApproval
         );
     }
 

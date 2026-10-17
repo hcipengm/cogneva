@@ -1180,6 +1180,56 @@ impl StateBackend for PostgresStateBackend {
 
 // ─── PromotionLedger (Postgres) ───
 
+/// A promotion row as it comes back from `cog_evolution_promotions`, in the
+/// column order both queries select. One alias rather than a third copy of the
+/// tuple: `recent` and `awaiting` differ in their predicate, not their shape.
+type PromotionRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    chrono::DateTime<Utc>,
+    chrono::DateTime<Utc>,
+);
+
+fn promotion_record(
+    (
+        id,
+        change_id,
+        level,
+        gate_kind,
+        decision_reason,
+        cluster,
+        status,
+        outcome,
+        eval_summary,
+        created_at,
+        updated_at,
+    ): PromotionRow,
+) -> cog_core::PromotionRecord {
+    cog_core::PromotionRecord {
+        id,
+        change_id,
+        level,
+        gate_kind: gate_kind
+            .as_deref()
+            .and_then(cog_core::PromotionGateKind::parse),
+        decision_reason,
+        cluster,
+        status: cog_core::PromotionStatus::parse(&status)
+            .unwrap_or(cog_core::PromotionStatus::Failed),
+        outcome,
+        eval_summary,
+        created_at,
+        updated_at,
+    }
+}
+
 #[async_trait]
 impl cog_core::PromotionLedger for PostgresStateBackend {
     async fn record(&self, rec: cog_core::PromotionRecord) -> SFResult<()> {
@@ -1250,19 +1300,7 @@ impl cog_core::PromotionLedger for PostgresStateBackend {
     }
 
     async fn recent(&self, limit: usize) -> SFResult<Vec<cog_core::PromotionRecord>> {
-        let rows: Vec<(
-            String,
-            String,
-            String,
-            Option<String>,
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-            chrono::DateTime<Utc>,
-            chrono::DateTime<Utc>,
-        )> = sqlx::query_as(
+        let rows: Vec<PromotionRow> = sqlx::query_as(
             r#"
             SELECT id, change_id, level, gate_kind, decision_reason, cluster, status,
                    outcome, eval_summary, created_at, updated_at
@@ -1276,40 +1314,30 @@ impl cog_core::PromotionLedger for PostgresStateBackend {
         .await
         .map_err(|e| SFError::Database(e.to_string()))?;
 
-        Ok(rows
-            .into_iter()
-            .map(
-                |(
-                    id,
-                    change_id,
-                    level,
-                    gate_kind,
-                    decision_reason,
-                    cluster,
-                    status,
-                    outcome,
-                    eval_summary,
-                    created_at,
-                    updated_at,
-                )| {
-                    cog_core::PromotionRecord {
-                        id,
-                        change_id,
-                        level,
-                        gate_kind: gate_kind
-                            .as_deref()
-                            .and_then(cog_core::PromotionGateKind::parse),
-                        decision_reason,
-                        cluster,
-                        status: cog_core::PromotionStatus::parse(&status)
-                            .unwrap_or(cog_core::PromotionStatus::Failed),
-                        outcome,
-                        eval_summary,
-                        created_at,
-                        updated_at,
-                    }
-                },
-            )
-            .collect())
+        Ok(rows.into_iter().map(promotion_record).collect())
+    }
+
+    async fn awaiting(
+        &self,
+        cluster: &str,
+        limit: usize,
+    ) -> SFResult<Vec<cog_core::PromotionRecord>> {
+        let rows: Vec<PromotionRow> = sqlx::query_as(
+            r#"
+            SELECT id, change_id, level, gate_kind, decision_reason, cluster, status,
+                   outcome, eval_summary, created_at, updated_at
+            FROM cog_evolution_promotions
+            WHERE cluster = $1 AND status = 'awaiting_approval'
+            ORDER BY updated_at ASC
+            LIMIT $2
+            "#,
+        )
+        .bind(cluster)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+
+        Ok(rows.into_iter().map(promotion_record).collect())
     }
 }

@@ -1626,4 +1626,26 @@ impl cog_core::PromotionLedger for MemoryStateBackend {
         out.truncate(limit);
         Ok(out)
     }
+
+    async fn awaiting(
+        &self,
+        cluster: &str,
+        limit: usize,
+    ) -> SFResult<Vec<cog_core::PromotionRecord>> {
+        let guard = self
+            .store
+            .read()
+            .map_err(|_| SFError::Agent("promotion ledger lock poisoned".into()))?;
+        let mut out: Vec<_> = guard
+            .promotions
+            .iter()
+            .filter(|r| {
+                r.cluster == cluster && r.status == cog_core::PromotionStatus::AwaitingApproval
+            })
+            .cloned()
+            .collect();
+        out.sort_by_key(|r| r.updated_at);
+        out.truncate(limit);
+        Ok(out)
+    }
 }
