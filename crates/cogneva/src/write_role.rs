@@ -1,3 +1,6 @@
+//! principle: feedback_a_closed_set_of_exit_codes_must_not_ride_a_generic_error_return
+//! principle: feedback_a_config_key_guessed_from_its_name_may_be_unset_where_the_process_runs
+//!
 //! `cogneva write-role` — the out-of-band writer's ask, one round long.
 //!
 //! The in-band discovery loop holds a role, taken from the shared database so

@@ -1,3 +1,6 @@
+//! principle: feedback_a_census_gate_is_proven_with_a_probe_file_outside_the_module_tree
+//! principle: feedback_a_handwritten_census_list_must_be_checked_against_the_whole_tree
+//!
 //! The actor label on the LLM series is a closed set, and this is its census.
 //!
 //! `x-cogneva-actor` is what the cost and quota views group by, so a value that

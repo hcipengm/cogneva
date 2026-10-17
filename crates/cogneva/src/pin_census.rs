@@ -1,3 +1,5 @@
+//! principle: feedback_a_family_member_with_several_parties_is_one_series_not_one_per_party
+//!
 //! The pin-wiring census, as a scraped reading.
 //!
 //! The runner audits the pin graph once, at startup, and logs its verdict. For

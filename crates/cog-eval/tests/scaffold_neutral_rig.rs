@@ -1,3 +1,5 @@
+//! principle: feedback_the_rigs_vocabulary_must_not_reuse_a_shells_name
+//!
 //! 中立性判据：评测台里不许出现任何**外壳的专有名**。
 //!
 //! 方法无关性不是一句声明——声明会随着第一次「顺手在这里替某个外壳判一下」而失效。

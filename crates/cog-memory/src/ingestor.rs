@@ -1,3 +1,5 @@
+//! principle: feedback_a_bounded_batch_taken_from_one_end_starves_its_own_tail
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;

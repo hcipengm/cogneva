@@ -1,3 +1,5 @@
+//! principle: feedback_a_shape_check_bounds_the_form_a_closed_set_bounds_the_vocabulary
+//!
 //! The actors an LLM call may declare, as a closed set.
 //!
 //! Every call the platform makes to an upstream carries `x-cogneva-actor` so

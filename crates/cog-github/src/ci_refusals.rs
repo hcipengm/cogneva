@@ -1,3 +1,5 @@
+//! principle: feedback_a_corpus_that_carries_the_probes_own_command_hides_a_hit_in_itself
+//!
 //! What a red CI run says about the principles whose gates it built.
 //!
 //! A failing job names the file it failed in, and a file's own header names the
