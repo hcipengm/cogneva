@@ -14,6 +14,7 @@ pub mod eval_container;
 pub mod eval_platform;
 pub mod eval_subset;
 pub mod eval_table;
+pub mod eval_toolathlon;
 pub mod health_check;
 pub mod host_ledger;
 pub mod hot_reload;

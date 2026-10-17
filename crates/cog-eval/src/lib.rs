@@ -41,8 +41,9 @@ pub use adapters::{
     hle_benchmark, parse_test_list, swe_pro_benchmark, swe_pro_tool_definitions,
     toolathlon_benchmark, AgentBenchLoader, GaiaRunner, HleCaseSource, HleJudge, HleToolkit,
     SweBenchRunner, SweProBackend, SweProCaseSource, SweProJudge, SweProTestReport, SweProToolkit,
-    ToolathlonBackend, ToolathlonCaseSource, ToolathlonJudge, ToolathlonToolkit, HLE_JSONL,
-    SWE_PRO_JSONL, SWE_PRO_TOOL_BASH, SWE_PRO_TOOL_FILE_EDIT, TOOLATHLON_TASKS_DIR,
+    ToolathlonBackend, ToolathlonCaseSource, ToolathlonCheck, ToolathlonJudge, ToolathlonReport,
+    ToolathlonToolkit, HLE_JSONL, SWE_PRO_JSONL, SWE_PRO_TOOL_BASH, SWE_PRO_TOOL_FILE_EDIT,
+    TOOLATHLON_TASKS_DIR,
 };
 pub use bench::{
     tools_bound_to, Benchmark, CaseJudge, CaseSource, EnvProvider, NoEnvProvider, ToolFactory,
