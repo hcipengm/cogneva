@@ -228,6 +228,19 @@ pub struct LlmUsageRecord {
 /// subtract anything. Excluding it instead would make a group of refusals read
 /// as `calls > 0, failed = 0, tokens = 0` — a path that answered everything and
 /// spent nothing, which is the one reading that is certainly false.
+/// One upstream's quota window as the ledger tells it. See
+/// [`LlmUsageStore::upstream_window`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UpstreamWindowReading {
+    /// Last instant this upstream served a call; `None` when it never has.
+    pub last_ok_unix: Option<i64>,
+    /// Instant of the most recent refusal that said the window was spent;
+    /// `None` when no such refusal is on record.
+    pub last_quota_refusal_unix: Option<i64>,
+    /// What the window ending at the last success served.
+    pub burned_window_tokens: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorSpend {
     pub actor: String,
@@ -514,6 +527,148 @@ impl LlmUsageStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Everything a window pacer needs about one upstream, read in one pass.
+    ///
+    /// `burned_window_tokens` is the **capacity** reading: what this upstream
+    /// served in the window that ended at its wall. An upstream that refuses
+    /// with "you have reached this cycle's limit" has just proved that this sum
+    /// is at or below what its plan allows — measured, not claimed. What the
+    /// current window has used so far is asked separately
+    /// ([`Self::spent_since`]) because its starting instant is what this read
+    /// computes.
+    ///
+    /// `last_quota_refusal_unix` is the instant the previous window ran out,
+    /// taken from the row's own classification rather than guessed from a gap
+    /// in traffic: only a `quota_cycle` refusal says the window is spent, while
+    /// an `entitlement` refusal says the capacity never existed — pacing against
+    /// the latter would spread a quota that will never arrive. It is `None` for
+    /// rows written before the classification column existed, and the caller
+    /// then falls back to the last success, which is the same reading minus the
+    /// seconds between the last call and the wall.
+    pub async fn upstream_window(
+        &self,
+        upstream: &str,
+        window_secs: u64,
+    ) -> anyhow::Result<UpstreamWindowReading> {
+        let row = sqlx::query(&format!(
+            r#"
+            WITH ok AS (
+                SELECT ts, tokens_input + tokens_output AS tokens
+                FROM {LEDGER_TABLE}
+                WHERE upstream = $1 AND result = 'ok'
+            ),
+            last AS (SELECT MAX(ts) AS ts FROM ok),
+            wall AS (
+                SELECT MAX(ts) AS ts
+                  FROM {LEDGER_TABLE}
+                 WHERE upstream = $1 AND refusal_kind = 'quota_cycle'
+            )
+            SELECT
+                (SELECT EXTRACT(EPOCH FROM ts)::BIGINT FROM last) AS last_ok_unix,
+                (SELECT EXTRACT(EPOCH FROM ts)::BIGINT FROM wall) AS last_quota_refusal_unix,
+                -- Measured around the refusal when one is on record: that
+                -- instant is the window's end, whereas the last success keeps
+                -- moving once the next window starts serving. The fallback
+                -- (no classified refusal -- rows written before the column
+                -- existed) measures around the last success, which is the same
+                -- quantity minus the seconds between the last call and the
+                -- wall.
+                COALESCE(
+                    (SELECT SUM(o.tokens) FROM ok o, wall w
+                      WHERE w.ts IS NOT NULL
+                        AND o.ts > w.ts - make_interval(secs => $2)
+                        AND o.ts <= w.ts),
+                    (SELECT SUM(o.tokens) FROM ok o, last l
+                      WHERE o.ts > l.ts - make_interval(secs => $2)),
+                    0
+                )::BIGINT AS burned_window_tokens
+            "#
+        ))
+        .bind(upstream)
+        .bind(window_secs as f64)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(UpstreamWindowReading {
+            last_ok_unix: row.get("last_ok_unix"),
+            last_quota_refusal_unix: row.get("last_quota_refusal_unix"),
+            burned_window_tokens: row.get::<i64, _>("burned_window_tokens").max(0) as u64,
+        })
+    }
+
+    /// Tokens this upstream served from `since_unix` onwards.
+    ///
+    /// Asked separately from [`Self::upstream_window`] because the instant to
+    /// start from is only known after the capacity reading names the window's
+    /// boundary — the same pass cannot answer both without being told a fact it
+    /// is the one computing.
+    pub async fn spent_since(&self, upstream: &str, since_unix: i64) -> anyhow::Result<u64> {
+        let row = sqlx::query(&format!(
+            "SELECT COALESCE(SUM(tokens_input + tokens_output), 0)::BIGINT AS tokens
+               FROM {LEDGER_TABLE}
+              WHERE upstream = $1 AND result = 'ok'
+                AND ts >= to_timestamp($2::DOUBLE PRECISION)"
+        ))
+        .bind(upstream)
+        .bind(since_unix as f64)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<i64, _>("tokens").max(0) as u64)
+    }
+
+    /// Whether a job has already put anything on the wire under this identity.
+    ///
+    /// This is the only question that turns "a task is running" into a reading,
+    /// and it is asked before a paced refusal: refusing a job's later calls
+    /// strands the tokens it already spent on the work in flight, so the pace
+    /// may only hold a job at its start. Rows that name a refusal are not the
+    /// job starting — nothing was sent — and counting them would let a paced
+    /// job slip through on its own second attempt.
+    pub async fn task_has_started(&self, task: &str) -> anyhow::Result<bool> {
+        let row = sqlx::query(&format!(
+            "SELECT EXISTS(
+                 SELECT 1 FROM {LEDGER_TABLE}
+                  WHERE task_id = $1 AND result IN ('ok', 'error')
+             ) AS started"
+        ))
+        .bind(task)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get("started"))
+    }
+
+    /// A job's whole cost at a quantile, from `result = 'ok'` rows grouped by
+    /// the job identity the caller declared.
+    ///
+    /// A pace that only compares the spend against a line cut by the clock
+    /// starts a job whose remaining allowance is a fraction of what the job
+    /// costs and strands that fraction mid-flight. The reserve is therefore a
+    /// measured job size, and this is where it is measured — the task axis is
+    /// what makes it possible at all. `None` when no job has completed inside
+    /// the window (a fresh deployment, or a build that predates the column):
+    /// no reading, so no reserve, which is the same fail-open the missing
+    /// capacity reading gets.
+    pub async fn task_cost_quantile(
+        &self,
+        days: i64,
+        quantile: f64,
+    ) -> anyhow::Result<Option<u64>> {
+        let row = sqlx::query(&format!(
+            r#"
+            SELECT PERCENTILE_CONT($2) WITHIN GROUP (ORDER BY total) AS cost
+              FROM (SELECT task_id, SUM(tokens_input + tokens_output)::BIGINT AS total
+                      FROM {LEDGER_TABLE}
+                     WHERE result = 'ok' AND task_id IS NOT NULL
+                       AND ts > NOW() - make_interval(days => $1)
+                     GROUP BY task_id) jobs
+            "#
+        ))
+        .bind(days as i32)
+        .bind(quantile)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<Option<f64>, _>("cost").map(|v| v.max(0.0) as u64))
     }
 
     /// The window's token composition, grouped by `(actor, origin, upstream,

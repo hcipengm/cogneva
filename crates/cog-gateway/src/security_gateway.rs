@@ -1697,6 +1697,22 @@ struct AppState {
     pool_down: Arc<AtomicBool>,
     /// 自上次池判定以来是否出现过上游实证成功（清除 `pool_down` 的唯一凭据）。
     pool_recovered: Arc<AtomicBool>,
+    /// 本拍算出的窗口配速，连同它的发放速率（每秒允许的 token）。
+    ///
+    /// 请求路读这一格而不是每来一次请求就查一次账：账上的两个求和不变的条件
+    /// 是"没有新调用落库"，而那恰好是请求路自己会打破的。速率与判定一起存，
+    /// 是因为它只能按上游各自的容量／窗口分别算再相加，聚合后的三个数反推不出来。
+    window_pace: Arc<std::sync::Mutex<(cog_core::LlmWindowPace, f64)>>,
+    /// 逐上游**实测到的窗口容量**，按上游键暂存。
+    ///
+    /// 它必须被暂存而不是每拍重算：额度用尽那一刻账上的"最后一次成功"就是那次
+    /// 撞墙，可窗口一恢复，下一条成功立刻把这一格推到现在，重算出来的就成了
+    /// "刚开始的这一窗"而不是"上一窗烧掉的量"。有了它，配额读数的出处
+    /// （`refusal_kind = quota_cycle` 那一行）一出现就覆盖暂存值，因为那一行是
+    /// 这条推算的正本。
+    measured_windows: Arc<
+        std::sync::Mutex<std::collections::HashMap<String, crate::window_pace::MeasuredWindow>>,
+    >,
     /// Footprint of the volumes this pod alone can measure (the git mirror).
     ///
     /// For a directory-backed volume the per-volume capacity the kubelet reports
@@ -1932,6 +1948,7 @@ fn normalize_actor(raw: Option<&str>) -> String {
 }
 
 /// 一次上游调用的落点：指标 counter + 时序明细（上游、结果、调用来源、延迟）。
+#[allow(clippy::too_many_arguments)]
 async fn record_llm_call(
     state: &AppState,
     upstream: &LlmUpstream,
@@ -2086,6 +2103,91 @@ fn pooled_refusal_usage(
         task: task.map(str::to_string),
         latency_ms: 0,
     }
+}
+
+/// 窗口配速拒绝在台账 `result` 列上的取值。
+///
+/// 与 [`REFUSED_BY_CIRCUIT`] 分开是因为修法相反：熔断说"池里没有一家能接"，
+/// 该做的是补上游；配速说"这个窗口的额度摊到今天还不够开一件任务"，该做的
+/// 是等，而**等得越久越该等**——合成一类，读数面就只能看到"被拒了"，看不到
+/// 是被没有产能拒的、还是被我们自己按额度拒的。
+pub const REFUSED_BY_PACE: &str = "refused_by_pace";
+
+/// 配速拒绝的台账落点。与池级拒绝同形：一个上游都没试过，零用量是实情。
+fn paced_refusal_usage(
+    style: &str,
+    actor: &str,
+    origin: &str,
+    task: Option<&str>,
+) -> LlmUsageRecord {
+    LlmUsageRecord {
+        upstream: POOLED_REFUSAL_UNNAMED.to_string(),
+        api_style: style.to_string(),
+        model: POOLED_REFUSAL_UNNAMED.to_string(),
+        result: REFUSED_BY_PACE.to_string(),
+        actor: actor.to_string(),
+        origin: origin.to_string(),
+        tokens_input: 0,
+        tokens_output: 0,
+        tokens_cached: 0,
+        estimated_input: None,
+        // 拒绝发生在向上游发请求之前，没有正文可分类；把它记成某个上游的成因
+        // 会让这一行读成"那一家拒的"。
+        refusal_kind: None,
+        task: task.map(str::to_string),
+        latency_ms: 0,
+    }
+}
+
+/// 任务边界上的配速判定：返回要等多少秒，`None` 表示放行。
+///
+/// **只在任务边界拦**。一件任务要连续几十次调用才出结果，拦在中途，它已经
+/// 花掉的 token 就全白费了——那是把浪费从窗口尾部挪到任务中间，总量不降、
+/// 产出更少。所以判据是"这件任务在账上有没有真正发出过请求"：发过就是进行中，
+/// 一律放行；没发过（或被拒的那些没算），才是边界。
+///
+/// 没有任务身份可问的调用（后台抽取、自审、交互）按各自的边界算：它们每次
+/// 调用都是一小段独立工作，拦下一次不欠谁半截活。
+async fn paced_refusal(
+    state: &AppState,
+    style: &str,
+    actor: &str,
+    origin: &str,
+    task: Option<&str>,
+) -> Option<u64> {
+    let (pace, rate) = {
+        let guard = state.window_pace.lock().unwrap();
+        *guard
+    };
+    if !pace.blocked() {
+        return None;
+    }
+    // 人等着的那一路不配速：一次交互调用本来就是一段完整的工作，拦下来的代价
+    // 直接落在使用者面前，而它量级小、不构成"两天烧掉一个月"的那种形状。
+    // 配速要拦的是自动跑起来就没完的那一族。
+    if origin == LlmOrigin::Interactive.as_str() {
+        return None;
+    }
+    if let Some(task) = task {
+        let store = state.pool_obs.usage.as_ref()?;
+        match store.task_has_started(task).await {
+            Ok(true) => return None,
+            Ok(false) => {}
+            Err(e) => {
+                // 答不上"这件任务开没开"就放行：拦错方向的代价是一个任务被从
+                // 中间截断，那比多花这一窗的额度更贵。
+                tracing::warn!(
+                    task = %task,
+                    error = %e,
+                    "窗口配速：查不出任务是否已开始，这一拍不拦它"
+                );
+                return None;
+            }
+        }
+    }
+    let wait = crate::window_pace::wait_secs(&pace, rate).unwrap_or(60);
+    land_usage_record(state, paced_refusal_usage(style, actor, origin, task));
+    Some(wait)
 }
 
 /// 池级熔断的唯一出口：判定与落账在同一次调用里。
@@ -3019,6 +3121,9 @@ async fn publish_pool_status(
         // 上游有没有应答过"，这是唯一答得了它的读数；判定本身答不了——池
         // "可用"在刚起的进程上与"什么都没见过"同形。
         last_success_unix: state.llm_health.last_success_unix(),
+        // 配速与判定同一条载荷、同一次写入：分两个键写就会有一段时间里一边说
+        // 池能用、另一边说额度摊下来不够，而读者无从判断该信哪边。
+        pace: state.window_pace.lock().unwrap().0,
     };
     let ttl = pool_status_ttl_secs(state, bounds.next_attempt_unix());
     crate::upstream_pool::write_pool_status(store, &status, ttl).await
@@ -3218,6 +3323,136 @@ async fn sync_pool_alert(state: &AppState, down: bool) {
         Ok(AlertTransition::NoChange) => {}
         Err(e) => tracing::warn!(error = %e, "池告警落 PG 失败"),
     }
+}
+
+/// 配速预留用多少天的历史任务来量一件任务的成本。取近一个月：短了会被一次
+/// 异常便宜的批任务拉低，长了会把配置/提示词变更之前的形状带进来。
+const WINDOW_PACE_RESERVE_DAYS: i64 = 30;
+/// 预留取的分位数。中位数会让一半的任务**装不下**它自己，那正好是"开一半就
+/// 断"的那种坏法；75 分位让大多数任务整件装得下，代价是开头那一小段等得更久。
+const WINDOW_PACE_RESERVE_QUANTILE: f64 = 0.75;
+
+/// 一拍窗口配速：量出每个上游的容量、算出这一窗的允许量、把用量对上去。
+///
+/// 三个数各有一个出处，缺一个就整条不配速（而不是拿一个默认值顶上）：
+/// - 容量：上一个窗口烧穿的量，由撞墙那一行（`refusal_kind = quota_cycle`）
+///   与它之前的成功行求和得出，见 [`measure_window`]；
+/// - 窗口长度：上游自报，存在健康表里、随池载荷跨重启；
+/// - 用量：本窗口起点之后的成功行之和。
+///
+/// 聚合到池一级而不是逐上游判定，因为读它的调度器把活交给整个池、挑不了
+/// 谁来承接；池成员按构造可以互相顶替，所以它们的允许量可以相加。
+async fn refresh_window_pace(
+    state: &AppState,
+    readings: &[UpstreamReading],
+) -> (cog_core::LlmWindowPace, f64) {
+    let Some(store) = state.pool_obs.usage.clone() else {
+        return (cog_core::LlmWindowPace::default(), 0.0);
+    };
+    let now_unix = chrono::Utc::now().timestamp();
+    // 一件任务的成本按**跑完的**任务量，用的是账本自己的任务轴。量不出来就不预留：
+    // 没有读数的界不许凭空写一个数，那样拦下来的会是"一半的任务"。
+    let reserve = match store
+        .task_cost_quantile(WINDOW_PACE_RESERVE_DAYS, WINDOW_PACE_RESERVE_QUANTILE)
+        .await
+    {
+        Ok(value) => value.unwrap_or(0),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "窗口配速：量不出一件任务的成本，这一拍不预留整块"
+            );
+            0
+        }
+    };
+    let mut pace = cog_core::LlmWindowPace {
+        reserve_tokens: reserve,
+        ..Default::default()
+    };
+    let mut rate = 0.0;
+    for reading in readings {
+        let Some(window_secs) = reading.quota_window_secs.filter(|w| *w > 0) else {
+            continue;
+        };
+        let Some(measured) = measure_window(state, store.as_ref(), &reading.key, window_secs).await
+        else {
+            continue;
+        };
+        let window_start = measured.window_start_at(now_unix);
+        let spent = match store.spent_since(&reading.key, window_start).await {
+            Ok(value) => value,
+            Err(e) => {
+                tracing::warn!(
+                    upstream = %reading.key,
+                    error = %e,
+                    "窗口配速：读不出本窗口的用量，这一家不进这一拍的判定"
+                );
+                continue;
+            }
+        };
+        pace.measured_upstreams += 1;
+        pace.allowance_tokens = pace
+            .allowance_tokens
+            .saturating_add(measured.allowance_at(now_unix));
+        pace.spent_tokens = pace.spent_tokens.saturating_add(spent);
+        pace.window_secs = pace.window_secs.max(measured.window_secs);
+        pace.window_start_unix = match pace.window_start_unix {
+            0 => window_start,
+            current => current.min(window_start),
+        };
+        rate += crate::window_pace::allowance_rate(measured.capacity_tokens, measured.window_secs);
+    }
+    (pace, rate)
+}
+
+/// 一个上游的容量读数，优先用账上那一行撞墙记录，其次用本进程暂存的那一份。
+///
+/// 撞墙记录是**正本**：它把窗口的终点直接写在行上（`ts`），容量就是对它前一个
+/// 窗口求和。暂存那份只在没有撞墙记录时出场——那一代的行还没带成因列，只能按
+/// "最后一次成功"推算，而推算值一旦窗口恢复就会被下一条成功推着往前跑，所以
+/// 必须在它还算数的时候钉住。
+async fn measure_window(
+    state: &AppState,
+    store: &cog_observability::usage_store::LlmUsageStore,
+    key: &str,
+    window_secs: u64,
+) -> Option<crate::window_pace::MeasuredWindow> {
+    let latched = state.measured_windows.lock().unwrap().get(key).copied();
+    let reading = match store.upstream_window(key, window_secs).await {
+        Ok(reading) => reading,
+        Err(e) => {
+            tracing::warn!(
+                upstream = %key,
+                error = %e,
+                "窗口配速：读不出这一家的窗口，沿用上一次量到的容量"
+            );
+            return latched;
+        }
+    };
+    let (burned_at_unix, capacity_tokens) = match (
+        reading.last_quota_refusal_unix,
+        latched,
+        reading.last_ok_unix,
+    ) {
+        (Some(wall), _, _) => (wall, reading.burned_window_tokens),
+        (None, Some(measured), _) => return Some(measured),
+        (None, None, Some(last_ok)) => (last_ok, reading.burned_window_tokens),
+        (None, None, None) => return None,
+    };
+    let measured = crate::window_pace::MeasuredWindow {
+        capacity_tokens,
+        window_secs,
+        burned_at_unix,
+    };
+    if !measured.is_usable() {
+        return latched;
+    }
+    state
+        .measured_windows
+        .lock()
+        .unwrap()
+        .insert(key.to_string(), measured);
+    Some(measured)
 }
 
 /// 池状态节拍：刷新指标 → 续期跨进程信号 → 边沿处告警与日志。
@@ -3471,6 +3706,13 @@ async fn refresh_pool_state(state: &AppState) {
         &[],
     )
     .await;
+
+    // 配速先算、后发：载荷里的那一格与请求路读的那一格必须是同一次判定，
+    // 分两处算就会有一段时间里对外说"还能干"、对请求说"不许开"。
+    {
+        let pace = refresh_window_pace(state, &readings).await;
+        *state.window_pace.lock().unwrap() = pace;
+    }
 
     publish_pool_signal(state, down, bounds).await;
 
@@ -4077,6 +4319,42 @@ async fn stream_forward(
                     } else {
                         serde_json::json!(quota_window)
                     },
+                })
+                .to_string(),
+            ))
+            .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty())));
+    }
+
+    // 窗口配速：额度还在，但按这一窗的长度摊到今天，剩下来的不够开一件新任务。
+    // 位置在熔断之后：池里一家都没有时，说的是"没有产能"，不是"额度不够"，
+    // 两者同时成立时先报前者，否则读的人会去等一个根本不会到来的窗口。
+    if let Some(retry_after) = paced_refusal(&state, style, &actor, &origin, task.as_deref()).await
+    {
+        tracing::warn!(
+            // 自称的那一格：429 也是"没往上游发"的一种，与 503 熔断、与上游
+            // 自己的 429 在状态码上同形，唯一分得开的就是这一行。
+            refused_by_pace = true,
+            retry_after_secs = retry_after,
+            "窗口配速：本窗口摊到此刻的额度不够再开一件任务，快速失败 429"
+        );
+        let (pace, _) = {
+            let guard = state.window_pace.lock().unwrap();
+            *guard
+        };
+        return Ok(axum::response::Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header("retry-after", retry_after.to_string())
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::json!({
+                    "error": "本窗口的额度已经摊到这里，还不够再开一件任务",
+                    "retry_after_seconds": retry_after,
+                    // 摊开的三个数一起出去，调用方与读者据同一组数判断该不该等：
+                    // 剩下的额度要够一件整任务（预留），不是够一次调用。
+                    "window_allowance_tokens": pace.allowance_tokens,
+                    "window_spent_tokens": pace.spent_tokens,
+                    "window_reserve_tokens": pace.reserve_tokens,
+                    "quota_window_secs": pace.window_secs,
                 })
                 .to_string(),
             ))
@@ -6393,6 +6671,11 @@ pub async fn run(
         pool_down: Arc::new(AtomicBool::new(false)),
         pool_recovered: Arc::new(AtomicBool::new(false)),
         pool_seeded: Arc::new(AtomicBool::new(false)),
+        window_pace: Arc::new(std::sync::Mutex::new((
+            cog_core::LlmWindowPace::default(),
+            0.0,
+        ))),
+        measured_windows: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         volume_footprint,
         config: config.clone(),
     };
@@ -8877,6 +9160,43 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
 
     /// 那次故障的判据：网关与 Redis 同秒滚动，第一次建连失败，此后终生失明——
     /// 判定发布不出去，调度侧也读不回来，而池在观测面上照旧显示"可用"。这条把
+    /// 配速只在"开新的一件工作"时拦：没有任务身份的调用按各自边界算，人等着的那一路
+    /// 不拦，没越过线的窗口不拦。三种情形各一条断言——把任意一条删掉，另外两条照样绿，
+    /// 而删掉的那一条对应的正是"合法工作被压死"或"任务被从中间截断"。
+    #[tokio::test]
+    async fn the_pace_holds_only_where_a_job_has_not_started() {
+        let state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        assert!(
+            paced_refusal(&state, "openai", "agent:generator", "resident_worker", None)
+                .await
+                .is_none(),
+            "a pool with no measured window is not paced at all"
+        );
+        *state.window_pace.lock().unwrap() = (
+            cog_core::LlmWindowPace {
+                measured_upstreams: 1,
+                allowance_tokens: 100,
+                spent_tokens: 200,
+                reserve_tokens: 50,
+                window_secs: 2_592_000,
+                window_start_unix: 1_000_000,
+            },
+            1.0,
+        );
+        assert!(
+            paced_refusal(&state, "openai", "agent:generator", "resident_worker", None)
+                .await
+                .is_some(),
+            "a call with no job identity is its own boundary and is held when over the line"
+        );
+        assert!(
+            paced_refusal(&state, "openai", "ui", "interactive", None)
+                .await
+                .is_none(),
+            "a human waiting is not the shape this pacing exists to stop"
+        );
+    }
+
     /// "下一次再试"与"读到一次就落地"钉在同一对数上：同一个通道对象，先关后开。
     #[tokio::test]
     async fn a_seed_missed_while_the_channel_was_down_lands_once_the_peer_answers() {
@@ -8901,6 +9221,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             // 这一代还有一台上游应答过：载荷带的判定是"不可用"，实证纪元照样
             // 要如实带上——它答的是另一个问题，两个方向的载荷都得有。
             last_success_unix: now - 30,
+            pace: cog_core::LlmWindowPace::default(),
         })
         .unwrap();
         // 通道关着，但表里已经有上一任留下的载荷：它与这一侧的开关无关，
@@ -10418,6 +10739,11 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             pool_down: Arc::new(AtomicBool::new(false)),
             pool_recovered: Arc::new(AtomicBool::new(false)),
             pool_seeded: Arc::new(AtomicBool::new(true)),
+            window_pace: Arc::new(std::sync::Mutex::new((
+                cog_core::LlmWindowPace::default(),
+                0.0,
+            ))),
+            measured_windows: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             volume_footprint: Vec::new(),
             config: SecurityGatewayConfig {
                 llm_upstreams: upstreams,

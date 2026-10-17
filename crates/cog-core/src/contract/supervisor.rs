@@ -277,6 +277,55 @@ pub struct LlmUpstreamEvidence {
     pub suspect_until_unix: i64,
 }
 
+/// How the pool is pacing itself against the quota its current window has left.
+///
+/// The quota itself is not published anywhere we can read it, so every number
+/// here is derived from what the ledger observed: the tokens an upstream served
+/// in the window that it then refused as spent is its measured capacity, and
+/// the allowance at any instant is that capacity spread over the window's
+/// length. A pool with no measured capacity carries zeros here, which reads as
+/// "not paced" — never as "nothing allowed".
+///
+/// The pace travels in the same payload as the availability verdict because the
+/// consumers are the same: a scheduler that stops handing work over while the
+/// pool cannot serve stops for this reason too, and a second key would let the
+/// two disagree for as long as one writer lagged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmWindowPace {
+    /// Measured windows that went into this reading; `0` means not paced.
+    #[serde(default)]
+    pub measured_upstreams: usize,
+    /// Tokens the current window allows across the measured upstreams.
+    #[serde(default)]
+    pub allowance_tokens: u64,
+    /// Tokens the current window has served across them.
+    #[serde(default)]
+    pub spent_tokens: u64,
+    /// Tokens one whole job needs, measured from finished jobs; `0` when no job
+    /// has finished recently enough to be measured.
+    #[serde(default)]
+    pub reserve_tokens: u64,
+    /// Longest window any measured upstream stated, seconds.
+    #[serde(default)]
+    pub window_secs: u64,
+    /// When the current window started, unix seconds; `0` when not paced.
+    #[serde(default)]
+    pub window_start_unix: i64,
+}
+
+impl LlmWindowPace {
+    /// Whether the window cannot fit one more whole job.
+    ///
+    /// The reserve is part of the comparison rather than an optimization: a
+    /// window whose remaining allowance is a fraction of a job would admit the
+    /// job and then strand it, which moves waste from the tail of the window to
+    /// the middle of the work.
+    pub fn blocked(&self) -> bool {
+        self.measured_upstreams > 0
+            && self.spent_tokens.saturating_add(self.reserve_tokens) > self.allowance_tokens
+    }
+}
+
 /// Cross-process snapshot of LLM upstream pool health.
 ///
 /// Two bounds travel side by side instead of being collapsed into one number,
@@ -378,6 +427,13 @@ pub struct LlmPoolStatus {
     /// in this generation can still back.
     #[serde(default)]
     pub last_success_unix: i64,
+    /// How the pool is pacing itself against the quota its window has left.
+    ///
+    /// Defaults as a whole, so a payload written by a build that did not carry
+    /// it parses to "not paced" rather than failing and taking the availability
+    /// verdict with it.
+    #[serde(default)]
+    pub pace: LlmWindowPace,
 }
 
 impl LlmPoolStatus {

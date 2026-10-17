@@ -71,6 +71,7 @@ pub mod upstream_pool;
 pub mod websocket;
 pub mod websocket_protocol;
 pub mod wiki;
+pub mod window_pace;
 pub mod workspaces;
 
 pub use approval_gate::{

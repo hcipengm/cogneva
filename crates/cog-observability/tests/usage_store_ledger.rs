@@ -275,6 +275,81 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         "a default would make every non-refusal row name a cause it never had"
     );
 
+    // The window pacer reads the ledger three ways, and each one is a statement
+    // only PostgreSQL can run. They are exercised here because a query that can
+    // never run keeps every DB-free test green: the pacer would simply read
+    // nothing and pace nothing, which is indistinguishable from a pool that was
+    // never over its line.
+    let upstream = format!("ledger-test-window:{}", uuid::Uuid::new_v4());
+    let paced_task = format!("ledger-test-paced-task:{}", uuid::Uuid::new_v4());
+    let mut served = record(paced_task.clone(), 0, None, Some(paced_task.as_str()), None);
+    served.upstream = upstream.clone();
+    served.result = "ok".to_string();
+    store.record(&served).await.expect("record a served call");
+    // A job that was held at its boundary names the job but sent nothing; it
+    // must not read as the job having started.
+    let mut held = record(paced_task.clone(), 0, None, Some(paced_task.as_str()), None);
+    held.upstream = upstream.clone();
+    held.result = "refused_by_pace".to_string();
+    store.record(&held).await.expect("record a paced refusal");
+    let mut wall = record(
+        "unrelated-actor".to_string(),
+        0,
+        None,
+        None,
+        Some("quota_cycle"),
+    );
+    wall.upstream = upstream.clone();
+    wall.result = "error".to_string();
+    store.record(&wall).await.expect("record the wall");
+
+    let window = store
+        .upstream_window(&upstream, 2_592_000)
+        .await
+        .expect("read the window");
+    assert!(
+        window.last_quota_refusal_unix.is_some(),
+        "the classified refusal is the window's boundary; without it the pacer \
+         would measure the wrong window as soon as traffic resumes"
+    );
+    assert_eq!(
+        window.burned_window_tokens, 1_050,
+        "the capacity is what the window served, counted from the successful call only"
+    );
+    let spent = store
+        .spent_since(&upstream, window.last_ok_unix.expect("a served call"))
+        .await
+        .expect("read the spend");
+    assert_eq!(spent, 1_050, "a paced refusal spends nothing");
+    assert!(
+        store
+            .task_has_started(&paced_task)
+            .await
+            .expect("ask whether the job started"),
+        "a served call means the job is on the wire, so later calls must not be held"
+    );
+    assert!(
+        !store
+            .task_has_started(&format!("never-sent:{}", uuid::Uuid::new_v4()))
+            .await
+            .expect("ask about a job that never ran"),
+        "a job with no rows has not started"
+    );
+    assert!(
+        store
+            .task_cost_quantile(30, 0.75)
+            .await
+            .expect("measure a job's cost")
+            .is_some(),
+        "with a completed job on the ledger the reserve has a reading"
+    );
+
+    sqlx::query("DELETE FROM gateway_llm_usage WHERE upstream = $1")
+        .bind(&upstream)
+        .execute(&pool)
+        .await
+        .expect("clean up the window probe rows");
+
     for actor in [&before, &after, &unpriced, &refusal] {
         sqlx::query("DELETE FROM gateway_llm_usage WHERE actor = $1")
             .bind(actor)
