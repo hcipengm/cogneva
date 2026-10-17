@@ -490,6 +490,31 @@ impl CheckTree {
         Ok(Snapshot { rev, top_level })
     }
 
+    /// The paths that differ between two revisions, as the tree spells them.
+    ///
+    /// This is what lets a landed row be asked again because the bytes its check
+    /// reads moved, rather than because a quota happened to reach it: a check's
+    /// answer depends only on what its scope holds, so a revision that touched
+    /// no path under that scope cannot have changed the answer. A caller that
+    /// keeps the last pass's revision gets one diff per pass and re-asks exactly
+    /// the rows the tree has a reason to disagree with.
+    ///
+    /// Rename detection is off on purpose: a rename changes both paths, and
+    /// reporting only the new one would leave a row scoped to the old name
+    /// looking untouched until the slower sweep reached it.
+    pub async fn changed_paths(&self, since: &str, until: &str) -> Result<Vec<String>, String> {
+        let out = self
+            .git(&["diff", "--name-only", "--no-renames", since, until])
+            .await
+            .map_err(|e| format!("the paths between {since} and {until} cannot be read: {e}"))?;
+        Ok(out
+            .lines()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
     /// The line of development `revision` sits on, or why it could not be read.
     ///
     /// The revision is resolved rather than compared as written, because the two
@@ -1417,6 +1442,71 @@ mod tests {
         tree.snapshot()
             .await
             .expect("the fixture repository is readable")
+    }
+
+    /// What moved between two revisions, and the two sides a rename has: a row
+    /// scoped to the old name is as affected as one scoped to the new one, and a
+    /// diff that named only the destination would leave the first reading as
+    /// untouched until the slower sweep reached it.
+    #[tokio::test]
+    async fn the_paths_between_two_revisions_name_both_sides_of_a_rename() {
+        let dir = repo(&[
+            ("crates/a/src/lib.rs", "pub fn a() {}\n"),
+            ("crates/b/src/lib.rs", "pub fn b() {}\n"),
+        ]);
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let first = tree.rev().await.expect("the fixture head resolves");
+
+        let work = dir.path().join("work");
+        std::fs::rename(
+            work.join("crates/b/src/lib.rs"),
+            work.join("crates/b/src/moved.rs"),
+        )
+        .expect("a file the second revision renames");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .output()
+                .expect("git on the test host");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let bare = dir.path().join("bare");
+        let bare = bare.to_str().expect("a spellable path");
+        let work = work.to_str().expect("a spellable path");
+        git(&["--git-dir", bare, "--work-tree", work, "add", "--all"]);
+        git(&[
+            "--git-dir",
+            bare,
+            "--work-tree",
+            work,
+            "commit",
+            "-q",
+            "-m",
+            "second",
+        ]);
+
+        let head = tree.rev().await.expect("the second head resolves");
+        let changed = tree
+            .changed_paths(&first, &head)
+            .await
+            .expect("two commits this repository carries");
+
+        assert!(
+            changed.contains(&"crates/b/src/lib.rs".to_string()),
+            "the name the file left is changed too: {changed:?}"
+        );
+        assert!(
+            changed.contains(&"crates/b/src/moved.rs".to_string()),
+            "the name the file took is named: {changed:?}"
+        );
+        assert!(
+            !changed.contains(&"crates/a/src/lib.rs".to_string()),
+            "a file neither side of the rename names is not changed: {changed:?}"
+        );
     }
 
     /// The line a revision sits on is read once, and three things about it are

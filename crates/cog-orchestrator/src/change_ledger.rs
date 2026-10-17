@@ -184,6 +184,16 @@ const RETIREMENTS_PER_PASS: usize = 200;
 /// takes.
 const MEASUREMENTS_PER_PASS: usize = 200;
 
+/// How many landed rows one pass re-asks because a path their check reads moved.
+///
+/// The window in [`REOPEN_BOUND`] says how long a wrong `landed` may stand; this
+/// says how much of the correction one pass takes. A revision that touched most
+/// of the tree must not make one tick unbounded, so the batch is bounded the same
+/// way the measurement batch is. What the bound leaves behind is not lost: the
+/// window still reaches it, so a wide change costs latency on the rows that did
+/// not fit rather than their freshness.
+const TOUCHED_PER_PASS: usize = MEASUREMENTS_PER_PASS;
+
 /// How many owed rows one pass hands over.
 ///
 /// The same bound, of the same shape, as the three folds above: a pass is a
@@ -862,6 +872,13 @@ pub fn spawn_change_ledger_loop(
                 // read one period after the start rather than contending with
                 // startup for the same table.
                 ticker.tick().await;
+                // The revision the previous pass read, so this pass can name the
+                // paths that moved since and ask the landed rows they reach
+                // again. It is the last pass that finished, not the last that
+                // started: a pass that could not take the hold never read a
+                // revision, and widening the diff to the last one that did is
+                // what keeps that gap from becoming a window of unseen changes.
+                let mut previous_rev: Option<String> = None;
                 loop {
                     beat.beat();
                     tokio::select! {
@@ -884,6 +901,29 @@ pub fn spawn_change_ledger_loop(
                     // that enters then records no revision rather than a guessed
                     // one.
                     let first_seen_rev = tree.rev().await.ok();
+                    // The paths that moved since the last pass read this tree,
+                    // resolved before the passes that use them. A diff that
+                    // cannot be read is not a pass without changes: it is one
+                    // reason to fall back on the window, said once, with the
+                    // sweep still covering every landed row it would have
+                    // reached.
+                    let changed = match (&previous_rev, &first_seen_rev) {
+                        (Some(prev), Some(now)) if prev != now => {
+                            match tree.changed_paths(prev, now).await {
+                                Ok(paths) => paths,
+                                Err(why) => {
+                                    debug!(
+                                        why = %why,
+                                        "change ledger: the paths between this revision and the \
+                                         last one cannot be read, so landed rows are re-asked on \
+                                         the window alone this pass"
+                                    );
+                                    Vec::new()
+                                }
+                            }
+                        }
+                        _ => Vec::new(),
+                    };
                     read_pass(&*store, first_seen_rev.as_deref()).await;
                     // The tree's own registries are the second intake, and they
                     // go in after the fold and before the measurement for the
@@ -910,7 +950,7 @@ pub fn spawn_change_ledger_loop(
                     // gives: a fixture retired this pass is not measured and
                     // re-said as unsettled by the same pass.
                     retire_pass(&*store).await;
-                    measure_pass(&*store, &tree, &mut unsettled).await;
+                    measure_pass(&*store, &tree, &mut unsettled, &changed).await;
                     // The second face of "is it done", read after the
                     // measurement so that a row this pass just found landed is
                     // checked in the same pass it landed in -- the gap between
@@ -945,6 +985,10 @@ pub fn spawn_change_ledger_loop(
                             pool_posture = Some(read);
                         }
                     }
+                    // Set last, and only here: a pass that returns early never
+                    // reached the reads this revision describes, so advancing to
+                    // it would hide the paths between the two from the next diff.
+                    previous_rev = first_seen_rev;
                 }
             }
         },
@@ -1806,6 +1850,7 @@ async fn measure_pass(
     store: &dyn ChangeLedgerStore,
     tree: &CheckTree,
     unsettled: &mut HashMap<ChangeIdentity, UnsettledCheck>,
+    changed: &[String],
 ) {
     // The batch is read before the tree is opened, so that a revision which
     // cannot be resolved still reports how many rows it left unmeasured. Opening
@@ -1950,7 +1995,8 @@ async fn measure_pass(
         }
     }
 
-    let (rechecked, reopened) = reopen_pass(store, tree, &snapshot, unsettled).await;
+    let (rechecked, reopened, touched) =
+        reopen_pass(store, tree, &snapshot, unsettled, changed).await;
 
     info!(
         measured = considered,
@@ -1959,6 +2005,8 @@ async fn measure_pass(
         undecided,
         rechecked,
         reopened,
+        touched,
+        changed_paths = changed.len(),
         unsettled = %reason_summary(&by_reason),
         already_unsettled = known_unsettled,
         revision = snapshot.rev(),
@@ -1987,16 +2035,19 @@ async fn measure_pass(
 /// account's last word on it and a look that settled nothing has nothing to put
 /// in its place; the answer, not the asking, is what moves a row.
 ///
-/// Returns how many rows were re-asked and how many came back as something other
-/// than what they said. The second is the reading this whole pass exists for: a
-/// count of moments the account was wrong, and the rows it names are in
-/// `change_reopen`, which is where the identity survives the state it loses.
+/// Returns how many rows were re-asked, how many came back as something other
+/// than what they said, and how many of the re-asked rows were reached by a path
+/// that moved rather than by the window. The second is the reading this whole
+/// pass exists for: a count of moments the account was wrong, and the rows it
+/// names are in `change_reopen`, which is where the identity survives the state
+/// it loses. The third says which half of the freshness the pass is paying for.
 async fn reopen_pass(
     store: &dyn ChangeLedgerStore,
     tree: &CheckTree,
     snapshot: &Snapshot,
     unsettled: &mut HashMap<ChangeIdentity, UnsettledCheck>,
-) -> (usize, usize) {
+    changed: &[String],
+) -> (usize, usize, usize) {
     let landed = match store.census().await {
         Ok(census) => census
             .iter()
@@ -2008,12 +2059,12 @@ async fn reopen_pass(
                 error = %e,
                 "change ledger: the census could not be read, so no landed row was re-asked"
             );
-            return (0, 0);
+            return (0, 0, 0);
         }
     };
     let quota = reopen_quota(landed, CHANGE_LEDGER_PASS_INTERVAL, REOPEN_BOUND);
     if quota == 0 {
-        return (0, 0);
+        return (0, 0, 0);
     }
     // The batch is widened by the rows already known unsettleable, the same way
     // the outstanding pass widens its own, and for the same reason: a row whose
@@ -2026,16 +2077,44 @@ async fn reopen_pass(
     // Widened by the whole map rather than by its landed part: the read that
     // would filter it is the one being widened.
     let take = quota.saturating_add(unsettled.len());
-    let rows = match store.landed_due(take).await {
+    let mut rows = match store.landed_due(take).await {
         Ok(rows) => rows,
         Err(e) => {
             warn!(
                 error = %e,
                 "change ledger: the landed set could not be read, so nothing was re-asked"
             );
-            return (0, 0);
+            return (0, 0, 0);
         }
     };
+
+    // The event-shaped half of the same question. A check's answer is a property
+    // of the bytes under its scope, so a revision that touched one of those bytes
+    // owes the row a new answer now -- not when a quota of a sweep happens to
+    // reach it. Without this read the window in [`REOPEN_BOUND`] is the only
+    // thing keeping `landed` fresh, and the freshness of the account's strongest
+    // claim would be however long the sweep takes rather than however long the
+    // tree takes to change under it.
+    let mut touched = 0usize;
+    if !changed.is_empty() {
+        match store.landed_touching(changed, TOUCHED_PER_PASS).await {
+            Ok(due) => {
+                let mut seen: HashSet<ChangeIdentity> =
+                    rows.iter().map(|row| row.identity.clone()).collect();
+                for row in due {
+                    if seen.insert(row.identity.clone()) {
+                        rows.push(row);
+                        touched += 1;
+                    }
+                }
+            }
+            Err(e) => warn!(
+                error = %e,
+                "change ledger: the landed rows a moved path reaches could not be read, so this \
+                 pass re-asked only the ones the window made due"
+            ),
+        }
+    }
 
     let now = Instant::now();
     let mut rechecked = 0usize;
@@ -2120,7 +2199,7 @@ async fn reopen_pass(
             );
         }
     }
-    (rechecked, reopened)
+    (rechecked, reopened, touched)
 }
 
 /// Check the account's landed rows against the revision the workloads are
@@ -4313,11 +4392,16 @@ mod tests {
     struct FakeLedger {
         rows: Vec<ChangeLedgerRow>,
         written: std::sync::Mutex<Vec<DispatchState>>,
+        measured: std::sync::Mutex<Vec<ChangeIdentity>>,
     }
 
     impl FakeLedger {
         fn written(&self) -> Vec<DispatchState> {
             self.written.lock().unwrap().clone()
+        }
+
+        fn measured(&self) -> Vec<ChangeIdentity> {
+            self.measured.lock().unwrap().clone()
         }
     }
 
@@ -4349,7 +4433,11 @@ mod tests {
         async fn pending_retirements(&self) -> SFResult<u64> {
             Ok(0)
         }
-        async fn apply_measurement(&self, _measurement: &ChangeMeasurement) -> SFResult<()> {
+        async fn apply_measurement(&self, measurement: &ChangeMeasurement) -> SFResult<()> {
+            self.measured
+                .lock()
+                .unwrap()
+                .push(measurement.identity.clone());
             Ok(())
         }
         async fn outstanding(&self, limit: usize) -> SFResult<Vec<ChangeLedgerRow>> {
@@ -4366,6 +4454,21 @@ mod tests {
                 .rows
                 .iter()
                 .filter(|row| row.state == ChangeState::Landed)
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+        async fn landed_touching(
+            &self,
+            paths: &[String],
+            limit: usize,
+        ) -> SFResult<Vec<ChangeLedgerRow>> {
+            Ok(self
+                .rows
+                .iter()
+                .filter(|row| {
+                    row.state == ChangeState::Landed && scope_is_touched(&row.identity, paths)
+                })
                 .take(limit)
                 .cloned()
                 .collect())
@@ -4666,6 +4769,92 @@ mod tests {
             measured_rev: measured_rev.map(str::to_string),
             ..pending_row(scope)
         }
+    }
+
+    /// The same match the store's query makes: the whole tree is touched by any
+    /// path, a path equals the scope, or it sits below the scope read as a
+    /// directory. The spellings the account holds are folded first, because the
+    /// double has to answer for the same rows the query would.
+    fn scope_is_touched(identity: &ChangeIdentity, paths: &[String]) -> bool {
+        let scope = identity
+            .scope
+            .trim()
+            .trim_start_matches("./")
+            .trim_end_matches('/');
+        if scope.is_empty() || scope == "." {
+            return !paths.is_empty();
+        }
+        paths.iter().any(|path| {
+            let path = path.trim_start_matches("./");
+            path == scope || path.starts_with(&format!("{scope}/"))
+        })
+    }
+
+    /// The window and the diff answer the same question from two sides, and the
+    /// diff is the side that does not wait: a landed row whose scope a revision
+    /// moved is asked in the pass that sees the move, even though the window's
+    /// quota over this account reaches a different row first.
+    #[tokio::test]
+    async fn a_landed_row_whose_scope_moved_is_asked_without_waiting_for_the_window() {
+        let (dir, first, second) = two_revision_repo();
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let snapshot = tree.snapshot().await.expect("the fixture is readable");
+        // Two landed rows, so the window's quota is one. The double hands rows
+        // back in the order they were written, so the untouched row is the one
+        // the window reaches; the moved one is reached only by the diff.
+        let store = FakeLedger {
+            rows: vec![
+                landed_row("crates/untouched", Some(&second)),
+                landed_row("file", Some(&first)),
+            ],
+            ..Default::default()
+        };
+        let mut unsettled = HashMap::new();
+
+        let (_rechecked, _reopened, touched) = reopen_pass(
+            &store,
+            &tree,
+            &snapshot,
+            &mut unsettled,
+            &["file".to_string()],
+        )
+        .await;
+
+        let measured = store.measured();
+        assert_eq!(
+            touched, 1,
+            "the moved path reaches exactly the one landed row it names: {measured:?}"
+        );
+        assert!(
+            measured.contains(&ChangeIdentity::new("grep", "file", "fn thing")),
+            "the row whose file moved was asked again: {measured:?}"
+        );
+
+        // The same account with no moved path: the window alone reaches one row,
+        // which is what makes the assertion above a reading about the diff rather
+        // than about the pass asking everything it can see.
+        let quiet = FakeLedger {
+            rows: vec![
+                landed_row("crates/untouched", Some(&second)),
+                landed_row("file", Some(&first)),
+            ],
+            ..Default::default()
+        };
+        let mut unsettled = HashMap::new();
+        let (_rechecked, _reopened, touched) =
+            reopen_pass(&quiet, &tree, &snapshot, &mut unsettled, &[]).await;
+
+        assert_eq!(
+            touched, 0,
+            "no path moved, so nothing was reached by the diff"
+        );
+        assert!(
+            !quiet
+                .measured()
+                .contains(&ChangeIdentity::new("grep", "file", "fn thing")),
+            "without a moved path the row waits for the window: {:?}",
+            quiet.measured()
+        );
     }
 
     /// The revision the workloads are running, held fixed for one test.

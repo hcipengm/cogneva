@@ -692,6 +692,29 @@ pub trait ChangeLedgerStore: Send + Sync {
     /// `limit` rows has to sweep the state, not re-ask the same head of it.
     async fn landed_due(&self, limit: usize) -> SFResult<Vec<ChangeLedgerRow>>;
 
+    /// The landed rows whose check reads something one of `paths` could change,
+    /// stalest measurement first.
+    ///
+    /// [`Self::landed_due`] keeps the state fresh on a window; this read is the
+    /// event-shaped half of the same question. A check's answer depends only on
+    /// what its scope holds, so a revision that touched no path under that scope
+    /// cannot have changed the answer, and one that touched it should be asked
+    /// again now rather than when the sweep happens to reach it. Together the two
+    /// reads make a landed row's freshness a property of the tree moving, with
+    /// the window as the floor under changes no diff can name -- a check whose
+    /// own implementation changed, history that was rewritten.
+    ///
+    /// A scope is a path relative to the tree root; the whole tree (`.`, or the
+    /// empty scope) is touched by every path, and a directory is touched by
+    /// anything below it. Scopes are matched after normalizing the spellings the
+    /// account already holds -- a leading `./` and a trailing `/` name the same
+    /// location.
+    async fn landed_touching(
+        &self,
+        paths: &[String],
+        limit: usize,
+    ) -> SFResult<Vec<ChangeLedgerRow>>;
+
     /// Record that a row the account called done no longer holds.
     ///
     /// What this keeps is what the next write destroys. Moving a row out of

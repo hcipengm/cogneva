@@ -726,6 +726,45 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         )
     }
 
+    async fn landed_touching(
+        &self,
+        paths: &[String],
+        limit: usize,
+    ) -> SFResult<Vec<ChangeLedgerRow>> {
+        // Matched in the query rather than by reading the landed set and
+        // filtering it here: that set is in the thousands and this read runs on
+        // a pass timer, while the paths one revision touched are tens. The scope
+        // is normalized before the comparison because the account holds several
+        // spellings of the same location (`crates`, `crates/`, `./crates`), and a
+        // comparison that did not fold them would answer "untouched" for rows
+        // written in the other spelling -- exactly the rows a sweep is too slow
+        // to notice in time.
+        //
+        // `unnest` on one array binds one parameter regardless of how many paths
+        // a revision touched, which is what keeps a wide commit from making the
+        // statement's parameter count depend on the tree.
+        Self::entries(
+            sqlx::query(&format!(
+                "SELECT {ROW_COLUMNS} FROM change_ledger c \
+                 CROSS JOIN LATERAL ( \
+                     SELECT rtrim(regexp_replace(c.scope, '^\\./', ''), '/') AS s \
+                 ) n \
+                 WHERE c.state = 'landed' AND ( \
+                     n.s = '' OR n.s = '.' OR EXISTS ( \
+                         SELECT 1 FROM unnest($1::text[]) AS p(path) \
+                         WHERE p.path = n.s OR p.path LIKE n.s || '/%' \
+                     ) \
+                 ) \
+                 ORDER BY c.measured_at ASC NULLS FIRST, c.first_seen_at ASC \
+                 LIMIT $2"
+            ))
+            .bind(paths.to_vec())
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await,
+        )
+    }
+
     async fn record_reopen(&self, reopen: &ChangeReopen) -> SFResult<()> {
         sqlx::query(RECORD_REOPEN_SQL)
             .bind(&reopen.identity.kind)
