@@ -1603,23 +1603,46 @@ async fn measure_pass(
         }
     }
 
-    let (rechecked, reopened, touched) =
-        reopen_pass(store, tree, &snapshot, unsettled, changed).await;
+    let reopened_pass = reopen_pass(store, tree, &snapshot, unsettled, changed).await;
 
     info!(
         measured = considered,
         landed,
         absent,
         undecided,
-        rechecked,
-        reopened,
-        touched,
+        rechecked = reopened_pass.rechecked,
+        reopened = reopened_pass.reopened,
+        touched = reopened_pass.touched,
+        // The landed half of the same two readings the outstanding pass already
+        // gives. A row that cannot be settled keeps its old `measured_at`, so
+        // without these two numbers the staleness order reads the same whether a
+        // landed row was skipped inside its retry window or asked and answered
+        // with nothing.
+        landed_unsettleable = %reason_summary(&reopened_pass.unsettleable),
+        landed_held = reopened_pass.held,
         changed_paths = changed.len(),
         unsettled = %reason_summary(&by_reason),
         already_unsettled = known_unsettled,
         revision = snapshot.rev(),
         "change ledger: measured the outstanding set against the tree"
     );
+}
+
+/// What one pass over the landed set did, including what it could not do.
+///
+/// The last two fields are the difference between "the sweep finished" and "the
+/// sweep spent its batch": a landed row whose check cannot be settled keeps its
+/// `measured_at`, so it holds the head of the order and is skipped until its
+/// retry window is up. Counted by reason rather than left to the per-row line,
+/// because the rows are re-asked on a timer and a line per row per hour says
+/// less than the count that is on every pass.
+#[derive(Default)]
+struct ReopenPass {
+    rechecked: usize,
+    reopened: usize,
+    touched: usize,
+    unsettleable: HashMap<UnsettledReason, usize>,
+    held: usize,
 }
 
 /// Ask the rows the account calls done whether that is still true.
@@ -1643,19 +1666,28 @@ async fn measure_pass(
 /// account's last word on it and a look that settled nothing has nothing to put
 /// in its place; the answer, not the asking, is what moves a row.
 ///
-/// Returns how many rows were re-asked, how many came back as something other
-/// than what they said, and how many of the re-asked rows were reached by a path
-/// that moved rather than by the window. The second is the reading this whole
-/// pass exists for: a count of moments the account was wrong, and the rows it
-/// names are in `change_reopen`, which is where the identity survives the state
-/// it loses. The third says which half of the freshness the pass is paying for.
+/// Returns what the pass did: how many rows were re-asked, how many came back as
+/// something other than what they said, and how many of the re-asked rows were
+/// reached by a path that moved rather than by the window. The second is the
+/// reading this whole pass exists for: a count of moments the account was wrong,
+/// and the rows it names are in `change_reopen`, which is where the identity
+/// survives the state it loses. The third says which half of the freshness the
+/// pass is paying for.
+///
+/// It also returns the two counts that say the pass did *not* finish: the landed
+/// rows the tree could not settle, by reason, and the ones held back because
+/// their last failure is still inside [`UNMEASURABLE_RETRY`]. Without them a
+/// settled-row count reads the same whether the sweep reached every landed row
+/// or spent its batch walking into rows that answer nothing, and a landed row
+/// that cannot be settled keeps its `measured_at` -- so it sits at the head of
+/// the staleness order forever while every other reading says the set is fresh.
 async fn reopen_pass(
     store: &dyn ChangeLedgerStore,
     tree: &CheckTree,
     snapshot: &Snapshot,
     unsettled: &mut HashMap<ChangeIdentity, UnsettledCheck>,
     changed: &[String],
-) -> (usize, usize, usize) {
+) -> ReopenPass {
     let landed = match store.census().await {
         Ok(census) => census
             .iter()
@@ -1667,12 +1699,12 @@ async fn reopen_pass(
                 error = %e,
                 "change ledger: the census could not be read, so no landed row was re-asked"
             );
-            return (0, 0, 0);
+            return ReopenPass::default();
         }
     };
     let quota = reopen_quota(landed, CHANGE_LEDGER_PASS_INTERVAL, REOPEN_BOUND);
     if quota == 0 {
-        return (0, 0, 0);
+        return ReopenPass::default();
     }
     // The batch is widened by the rows already known unsettleable, the same way
     // the outstanding pass widens its own, and for the same reason: a row whose
@@ -1692,7 +1724,7 @@ async fn reopen_pass(
                 error = %e,
                 "change ledger: the landed set could not be read, so nothing was re-asked"
             );
-            return (0, 0, 0);
+            return ReopenPass::default();
         }
     };
 
@@ -1725,8 +1757,7 @@ async fn reopen_pass(
     }
 
     let now = Instant::now();
-    let mut rechecked = 0usize;
-    let mut reopened = 0usize;
+    let mut pass = ReopenPass::default();
     for row in rows {
         // The same window the outstanding pass keeps, for the same reason: a row
         // whose check cannot be settled keeps its old `measured_at`, so it would
@@ -1734,8 +1765,14 @@ async fn reopen_pass(
         // pass. Asking again before the window is up would buy nothing -- what
         // makes the check unsettleable is a property of the tree, and the tree is
         // what the window is waiting for.
+        //
+        // Counted rather than silently skipped: a batch spent on rows that are
+        // waiting out their window is a batch that did not reach the rest of the
+        // set, and the sweep's length is only the bound while this number is
+        // zero.
         if let Some(known) = unsettled.get(&row.identity) {
             if still_unanswered(known, now) {
+                pass.held += 1;
                 continue;
             }
         }
@@ -1746,23 +1783,34 @@ async fn reopen_pass(
                 .why()
                 .unwrap_or("the look settled nothing and gave no reason")
                 .to_string();
+            // Said when the wording is new, as the outstanding pass does: the row
+            // is re-asked on a timer, and a line per row per hour would bury the
+            // count below rather than add to it. Unlike that pass this one is a
+            // warning, because the row is one the account has already called
+            // done and the claim is now being made without a look.
+            if unsettled.get(&row.identity).map(|k| k.why.as_str()) != Some(why.as_str()) {
+                warn!(
+                    change = %row.identity,
+                    reason = reason.as_str(),
+                    why = %why,
+                    "change ledger: a landed row's check cannot be settled against the tree; \
+                     it keeps its state and its old measured time, so it stays at the head \
+                     of the staleness order"
+                );
+            }
             unsettled.insert(row.identity.clone(), UnsettledCheck { why, since: now });
-            debug!(
-                change = %row.identity,
-                reason = reason.as_str(),
-                "change ledger: a landed row's check cannot be settled, so it keeps its state"
-            );
+            *pass.unsettleable.entry(reason).or_default() += 1;
             continue;
         };
         unsettled.remove(&row.identity);
-        rechecked += 1;
+        pass.rechecked += 1;
         if state != ChangeState::Landed {
             // Written before the measurement, and that order is the point: the
             // measurement clears `landed_at` on the way out of `landed`, so
             // afterwards there is nothing left in the row that says it was ever
             // done. This is the only place that time survives, and it has to be
             // read off the row before the write that takes it away.
-            reopened += 1;
+            pass.reopened += 1;
             let reopen = ChangeReopen {
                 identity: row.identity.clone(),
                 was_landed_at: row.landed_at,
@@ -1807,7 +1855,7 @@ async fn reopen_pass(
             );
         }
     }
-    (rechecked, reopened, touched)
+    ReopenPass { touched, ..pass }
 }
 
 /// Check the account's landed rows against the revision the workloads are
@@ -4251,7 +4299,7 @@ mod tests {
         };
         let mut unsettled = HashMap::new();
 
-        let (_rechecked, _reopened, touched) = reopen_pass(
+        let pass = reopen_pass(
             &store,
             &tree,
             &snapshot,
@@ -4259,6 +4307,7 @@ mod tests {
             &["file".to_string()],
         )
         .await;
+        let touched = pass.touched;
 
         let measured = store.measured();
         assert_eq!(
@@ -4281,8 +4330,9 @@ mod tests {
             ..Default::default()
         };
         let mut unsettled = HashMap::new();
-        let (_rechecked, _reopened, touched) =
-            reopen_pass(&quiet, &tree, &snapshot, &mut unsettled, &[]).await;
+        let touched = reopen_pass(&quiet, &tree, &snapshot, &mut unsettled, &[])
+            .await
+            .touched;
 
         assert_eq!(
             touched, 0,
@@ -4294,6 +4344,61 @@ mod tests {
                 .contains(&ChangeIdentity::new("grep", "file", "fn thing")),
             "without a moved path the row waits for the window: {:?}",
             quiet.measured()
+        );
+    }
+
+    /// A landed row whose scope this revision does not hold cannot be settled,
+    /// and it keeps its `measured_at`, so it holds the head of the staleness
+    /// order forever. The pass has to say so: the settled-row count is the same
+    /// whether the sweep finished or spent its batch on rows that answer nothing,
+    /// and the second pass has to show the same row held rather than re-asked.
+    #[tokio::test]
+    async fn a_landed_row_the_tree_cannot_settle_is_counted_and_then_held() {
+        let (dir, first, _second) = two_revision_repo();
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let snapshot = tree.snapshot().await.expect("the fixture is readable");
+        let store = FakeLedger {
+            rows: vec![landed_row("file/inner", Some(&first))],
+            ..Default::default()
+        };
+        let mut unsettled = HashMap::new();
+
+        let pass = reopen_pass(&store, &tree, &snapshot, &mut unsettled, &[]).await;
+
+        assert_eq!(
+            pass.unsettleable
+                .get(&UnsettledReason::ScopeAbsentInRevision)
+                .copied(),
+            Some(1),
+            "the row the tree could not settle is counted by its reason: {:?}",
+            pass.unsettleable
+        );
+        assert_eq!(
+            pass.rechecked, 0,
+            "a row that settled nothing was not re-checked"
+        );
+        assert!(
+            store.measured().is_empty(),
+            "a row that settled nothing was not written back: {:?}",
+            store.measured()
+        );
+        assert!(
+            unsettled.contains_key(&ChangeIdentity::new("grep", "file/inner", "fn thing")),
+            "the row is remembered as unanswered"
+        );
+
+        // Inside its retry window the same row is skipped rather than asked
+        // again, and the skip is a number the pass reports: the batch was spent
+        // on waiting, not on the rest of the set.
+        let held = reopen_pass(&store, &tree, &snapshot, &mut unsettled, &[]).await;
+        assert_eq!(
+            held.held, 1,
+            "the row is held by its retry window, not re-asked"
+        );
+        assert!(
+            held.unsettleable.is_empty(),
+            "a held row was not asked, so it was not counted again: {:?}",
+            held.unsettleable
         );
     }
 
