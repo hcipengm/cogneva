@@ -2511,16 +2511,16 @@ mod tests {
         ensure_contribution_allowed(&diff).unwrap();
     }
 
+    /// 通道之外的那一格。`deploy/**` 已经从「被拒」那一侧移走了（拓扑也是要演进
+    /// 的东西），所以这里点名它就不再证明白名单在拦任何东西——判据要落在**确实
+    /// 不在名单上**的面上，否则这条测试会在白名单扩宽时静默变成一句废话。
     #[test]
     fn privacy_gate_rejects_diff_with_any_non_whitelisted_path() {
-        let diff = diff_touching(&[
-            "crates/cog-github/src/lib.rs",
-            "deploy/helm/cogneva/values.yaml",
-        ]);
+        let diff = diff_touching(&["crates/cog-github/src/lib.rs", "config/llm-upstreams.yaml"]);
         let err = ensure_contribution_allowed(&diff).unwrap_err();
         match err {
             CogGitHubError::PrivacyRejected(msg) => {
-                assert!(msg.contains("deploy/helm/cogneva/values.yaml"));
+                assert!(msg.contains("config/llm-upstreams.yaml"));
                 assert!(msg.contains("whitelist"));
             }
             other => panic!("expected PrivacyRejected, got {other:?}"),
@@ -2534,16 +2534,16 @@ mod tests {
     fn the_refused_paths_and_the_verdict_are_one_rule() {
         let diff = diff_touching(&[
             "crates/cog-github/src/lib.rs",
-            "deploy/helm/cogneva/values.yaml",
-            "deploy/k3s/evolution-configmap.yaml",
+            "config/llm-upstreams.yaml",
+            "data/eval/results.jsonl",
         ]);
 
         let denied = non_contributable_paths(&diff).unwrap();
         assert_eq!(
             denied,
             vec![
-                "deploy/helm/cogneva/values.yaml".to_string(),
-                "deploy/k3s/evolution-configmap.yaml".to_string(),
+                "config/llm-upstreams.yaml".to_string(),
+                "data/eval/results.jsonl".to_string(),
             ],
             "被拒的路径按 diff 里出现的顺序点名，放行的那条不在里面"
         );
