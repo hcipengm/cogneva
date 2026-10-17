@@ -1082,7 +1082,10 @@ impl ChangePipeline {
         // 部署拓扑这一族由可执行条件判，不由人判。判定放在应用之后：渲染和
         // parity 要读的正是被改过的那棵树。没有声明条件的部署，这一族就是拒收
         // ——「等人工」不是条件，一张没人认领的待办既不会落地也不会消失。
-        if let Some(reason) = self.deploy_admission_reason(workdir, &targets).await? {
+        if let Some(reason) = self
+            .deploy_admission_reason(workdir, &targets, &change.content)
+            .await?
+        {
             warn!(
                 change_id = %change.artifact_id,
                 reason = %reason,
@@ -1792,11 +1795,28 @@ impl ChangePipeline {
         change_content: &str,
         check_only: bool,
     ) -> SFResult<()> {
+        self.run_git_apply_args(
+            workdir,
+            change_content,
+            if check_only { &["--check"] } else { &[] },
+        )
+        .await
+    }
+
+    /// `git apply` with the caller's flags, patch on stdin.
+    ///
+    /// The reverse run goes through the same door as the forward one: a second
+    /// spawn site would be free to drift from this one's environment and its
+    /// error text, and the two would then disagree about what "applied" means.
+    async fn run_git_apply_args(
+        &self,
+        workdir: &Path,
+        change_content: &str,
+        flags: &[&str],
+    ) -> SFResult<()> {
         let mut cmd = tokio::process::Command::new("git");
         cmd.arg("apply").arg("-v").current_dir(workdir);
-        if check_only {
-            cmd.arg("--check");
-        }
+        cmd.args(flags);
 
         let mut child = cmd
             .stdin(std::process::Stdio::piped())
@@ -1824,7 +1844,7 @@ impl ChangePipeline {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(SFError::Agent(format!(
                 "git apply {}failed: {}",
-                if check_only { "--check " } else { "" },
+                flags.iter().map(|f| format!("{f} ")).collect::<String>(),
                 stderr
             )));
         }
@@ -1846,6 +1866,28 @@ impl ChangePipeline {
             return Err(SFError::IO(format!("git reset failed: {}", stderr)));
         }
         Ok(())
+    }
+
+    /// Run a git command and answer its stdout **byte for byte**, trailing
+    /// newline included.
+    ///
+    /// [`Self::git_try`] trims, which is right for reading a revision or a
+    /// status line and wrong for reading a patch: `git diff` output ends in a
+    /// newline, and feeding a trimmed copy back to `git apply` is a corrupt
+    /// patch. Two readers of the same command disagreeing about its last byte
+    /// is exactly the shape that would make a rollback look impossible.
+    async fn git_capture(&self, workdir: &Path, args: &[&str]) -> Option<String> {
+        let output = tokio::process::Command::new("git")
+            .args(args)
+            .current_dir(workdir)
+            .output()
+            .await
+            .ok()?;
+        if output.status.success() {
+            Some(String::from_utf8_lossy(&output.stdout).to_string())
+        } else {
+            None
+        }
     }
 
     /// Run a git command; Some(stdout) on success, None otherwise.
@@ -2028,6 +2070,7 @@ impl ChangePipeline {
         &self,
         workdir: &Path,
         targets: &[cog_core::DiffTarget],
+        change_content: &str,
     ) -> SFResult<Option<String>> {
         let touched = Self::deploy_targets(targets);
         if touched.is_empty() {
@@ -2070,6 +2113,108 @@ impl ChangePipeline {
                     )));
                 }
             }
+        }
+
+        // 拓扑与核心放开之后，平台能在无人值守下改自己的控制面；缓释不是留一个人，
+        // 而是「改得回去，且回去那条路被走过一次」。这里走的就是那一次：把这一笔
+        // 逆向执行、确认树回到 HEAD，再把它应用回来并确认树与之前逐字节一致。
+        // 只做 `git apply -R --check` 不够——那证明的是补丁能对上，不是这条路能跑完。
+        if let Some(reason) = self
+            .deploy_rollback_reason(workdir, &touched, change_content)
+            .await?
+        {
+            return Ok(Some(reason));
+        }
+
+        Ok(None)
+    }
+
+    /// Take the change back out, then put it in again, and report the reading.
+    ///
+    /// `Some(reason)` refuses: a tree the change cannot be rewound out of is one
+    /// the deployment cannot back out of, and the time to learn that is before
+    /// it lands rather than during an incident. The worktree is left holding the
+    /// change either way — a refusal resets it, a pass has already re-applied it.
+    async fn deploy_rollback_reason(
+        &self,
+        workdir: &Path,
+        touched: &[String],
+        change_content: &str,
+    ) -> SFResult<Option<String>> {
+        let Some(before) = self.git_capture(workdir, &["diff", "HEAD"]).await else {
+            return Ok(Some(
+                "回滚路径无法执行：判定工作树不是 git 工作树，这一笔改动出去之后没有可执行的倒回方式。"
+                    .to_string(),
+            ));
+        };
+        let untracked_of_change = |listing: &str| -> Vec<String> {
+            listing
+                .lines()
+                .map(str::trim)
+                .filter(|path| !path.is_empty() && touched.iter().any(|t| t == path))
+                .map(str::to_string)
+                .collect()
+        };
+        let added_before = untracked_of_change(
+            &self
+                .git_capture(workdir, &["ls-files", "--others", "--exclude-standard"])
+                .await
+                .unwrap_or_default(),
+        );
+
+        if !before.is_empty() {
+            if let Err(e) = self.run_git_apply_args(workdir, &before, &["-R"]).await {
+                return Ok(Some(format!(
+                    "回滚路径执行失败：逆向补丁打不回去（{e}）。这一笔改动落在树上之后没有可执行的回退。"
+                )));
+            }
+        }
+        for path in &added_before {
+            if let Err(e) = tokio::fs::remove_file(workdir.join(path)).await {
+                return Ok(Some(format!(
+                    "回滚路径执行失败：新增文件 {path} 删不掉（{e}）。"
+                )));
+            }
+        }
+
+        // 倒回之后，这一族在树里不该留下任何东西。别的会话或别的族留下的改动不在
+        // 判据里：这条读的是「这一笔能不能被完整拿掉」，不是「这棵树干净」。
+        let leftovers: Vec<String> = self
+            .git_try(workdir, &["status", "--porcelain"])
+            .await
+            .unwrap_or_default()
+            .lines()
+            .map(str::trim)
+            .filter(|line| touched.iter().any(|t| line.ends_with(t.as_str())))
+            .map(str::to_string)
+            .collect();
+        if !leftovers.is_empty() {
+            return Ok(Some(format!(
+                "回滚走过一遍之后，树上仍留着这一族的改动：{}。",
+                leftovers.join("、")
+            )));
+        }
+
+        if let Err(e) = self.git_apply(workdir, change_content).await {
+            return Ok(Some(format!(
+                "回滚走过一遍之后，这次变更重新应用失败（{e}）：它只能落一次，落不了第二次。"
+            )));
+        }
+        let after = self
+            .git_capture(workdir, &["diff", "HEAD"])
+            .await
+            .unwrap_or_default();
+        let added_after = untracked_of_change(
+            &self
+                .git_capture(workdir, &["ls-files", "--others", "--exclude-standard"])
+                .await
+                .unwrap_or_default(),
+        );
+        if after != before || added_after != added_before {
+            return Ok(Some(
+                "回滚并重新应用之后，树与之前读到的不是同一棵：这次变更的逆不是它的重复。"
+                    .to_string(),
+            ));
         }
 
         Ok(None)
@@ -5584,6 +5729,45 @@ index 1111111..2222222 100644\n\
             .collect()
     }
 
+    /// The change the admission tests apply: one field of a tracked file.
+    ///
+    /// A tracked file rather than a new one, because the reversal reads
+    /// `git diff HEAD` and a new file that was never staged shows up only in
+    /// the untracked list — the path a test should exercise is the ordinary one.
+    const PATCH: &str = "diff --git a/deploy/helm/x.yaml b/deploy/helm/x.yaml\n\
+                         --- a/deploy/helm/x.yaml\n\
+                         +++ b/deploy/helm/x.yaml\n\
+                         @@ -1 +1 @@\n\
+                         -x: 1\n\
+                         +x: 2\n";
+
+    /// A worktree that already holds [`PATCH`], so that "can this be taken
+    /// back out" has a tree to answer about.
+    fn worktree_holding_the_change(dir: &std::path::Path) {
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git should be on PATH for these tests");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "tests@cogneva.invalid"]);
+        git(&["config", "user.name", "admission tests"]);
+        std::fs::create_dir_all(dir.join("deploy/helm")).unwrap();
+        std::fs::write(dir.join("deploy/helm/x.yaml"), "x: 1\n").unwrap();
+        git(&["add", "deploy/helm/x.yaml"]);
+        git(&["commit", "-q", "-m", "base"]);
+        std::fs::write(dir.join("change.patch"), PATCH).unwrap();
+        git(&["apply", "change.patch"]);
+        std::fs::remove_file(dir.join("change.patch")).unwrap();
+    }
+
     /// 拓扑族按目录分量认，不按前缀认。
     #[test]
     fn the_deploy_family_is_a_directory_not_a_prefix() {
@@ -5611,7 +5795,11 @@ index 1111111..2222222 100644\n\
         let root = tempfile::tempdir().unwrap();
         let pipeline = ChangePipeline::new(root.path(), root.path(), false);
         let reason = pipeline
-            .deploy_admission_reason(root.path(), &targets(&["deploy/helm/cogneva/values.yaml"]))
+            .deploy_admission_reason(
+                root.path(),
+                &targets(&["deploy/helm/cogneva/values.yaml"]),
+                PATCH,
+            )
             .await
             .unwrap()
             .expect("a family with no executable condition has to be refused");
@@ -5634,6 +5822,7 @@ index 1111111..2222222 100644\n\
     #[tokio::test]
     async fn a_declared_condition_decides_the_family_by_its_exit_status() {
         let root = tempfile::tempdir().unwrap();
+        worktree_holding_the_change(root.path());
         let passing = ChangePipeline::new(root.path(), root.path(), false).with_deploy_admission(
             Some(cog_core::DeployAdmissionConfig {
                 commands: vec![vec!["true".into()]],
@@ -5642,11 +5831,17 @@ index 1111111..2222222 100644\n\
         );
         assert_eq!(
             passing
-                .deploy_admission_reason(root.path(), &targets(&["deploy/helm/x.yaml"]))
+                .deploy_admission_reason(root.path(), &targets(&["deploy/helm/x.yaml"]), PATCH)
                 .await
                 .unwrap(),
             None,
-            "命令全过就该准入"
+            "命令全过、且这一笔能被倒回再应用，就该准入"
+        );
+        // 回滚走过一遍之后，树必须还拿着这一笔：准入不是「把它撤掉了」。
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("deploy/helm/x.yaml")).unwrap(),
+            "x: 2\n",
+            "回滚证明之后必须把这一笔应用回来"
         );
 
         let failing = ChangePipeline::new(root.path(), root.path(), false).with_deploy_admission(
@@ -5656,7 +5851,7 @@ index 1111111..2222222 100644\n\
             }),
         );
         let reason = failing
-            .deploy_admission_reason(root.path(), &targets(&["deploy/helm/x.yaml"]))
+            .deploy_admission_reason(root.path(), &targets(&["deploy/helm/x.yaml"]), PATCH)
             .await
             .unwrap()
             .expect("a failing command is a refusal");
@@ -5681,6 +5876,7 @@ index 1111111..2222222 100644\n\
             .deploy_admission_reason(
                 root.path(),
                 &targets(&["deploy/rendered/k3s-single/30-service-cogneva.yaml"]),
+                PATCH,
             )
             .await
             .unwrap()
@@ -5691,13 +5887,39 @@ index 1111111..2222222 100644\n\
         );
 
         // 只改 chart、没动渲染产物时，dry-run 没有可问的对象，不该自己造一个。
+        let tree = tempfile::tempdir().unwrap();
+        worktree_holding_the_change(tree.path());
         assert_eq!(
             pipeline
-                .deploy_admission_reason(root.path(), &targets(&["deploy/helm/x.yaml"]))
+                .deploy_admission_reason(tree.path(), &targets(&["deploy/helm/x.yaml"]), PATCH)
                 .await
                 .unwrap(),
             None,
             "没有渲染产物被触及就不跑逐文件 dry-run"
+        );
+    }
+
+    /// 命令全过也不算准入：倒不回去的树不收。
+    ///
+    /// 判的是「这条路走过一次」，不是「补丁看起来能反向打」——所以这里用一棵**不是
+    /// git 工作树**的目录：`git diff` 跑不了，回滚路径无从执行，这一族就拒收。
+    #[tokio::test]
+    async fn a_family_the_tree_cannot_give_back_is_refused_even_when_every_command_passes() {
+        let root = tempfile::tempdir().unwrap();
+        let pipeline = ChangePipeline::new(root.path(), root.path(), false).with_deploy_admission(
+            Some(cog_core::DeployAdmissionConfig {
+                commands: vec![vec!["true".into()]],
+                server_dry_run: None,
+            }),
+        );
+        let reason = pipeline
+            .deploy_admission_reason(root.path(), &targets(&["deploy/helm/x.yaml"]), PATCH)
+            .await
+            .unwrap()
+            .expect("a tree with no rollback path is a refusal");
+        assert!(
+            reason.contains("回滚"),
+            "拒收要点名缺的是回滚路径：{reason}"
         );
     }
 
@@ -5708,7 +5930,7 @@ index 1111111..2222222 100644\n\
         let pipeline = ChangePipeline::new(root.path(), root.path(), false);
         assert_eq!(
             pipeline
-                .deploy_admission_reason(root.path(), &targets(&["crates/x/src/lib.rs"]))
+                .deploy_admission_reason(root.path(), &targets(&["crates/x/src/lib.rs"]), PATCH)
                 .await
                 .unwrap(),
             None
