@@ -1115,4 +1115,211 @@ mod tests {
         ));
         assert!(!still_unanswered(&fresh, now + UNMEASURABLE_RETRY));
     }
+
+    // ── The order inside a pass, not the store ──
+    //
+    // The store's half of the re-open is tested where it is written; what only
+    // this file can get wrong is the sequence. The batch this pass will judge is
+    // read *before* the registry is, so a row re-opened afterwards is not in the
+    // batch already in hand. Re-opening a row and then judging the old batch
+    // would leave it settled for another whole interval while the log says it was
+    // asked again -- the reading and the work would part company, and no count on
+    // the pass line would show it.
+    //
+    // Driven over a real repository, because the declaration the re-open turns on
+    // is read out of one.
+
+    /// A bare repository whose one Rust source declares `slug` at its head, plus
+    /// a work tree to write it from: the shape the platform's registry is read
+    /// out of.
+    fn repo_declaring(slug: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let bare = dir.path().join("bare");
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).expect("the scratch worktree");
+        let bare_s = bare.to_str().expect("a path this host can spell");
+        let work_s = work.to_str().expect("a path this host can spell");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .output()
+                .expect("git on the test host");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        git(&["init", "-q", "--bare", "-b", "main", bare_s]);
+        git(&["--git-dir", bare_s, "config", "user.email", "t@example.com"]);
+        git(&["--git-dir", bare_s, "config", "user.name", "t"]);
+        std::fs::create_dir_all(work.join("crates/x/tests")).expect("the fixture directory");
+        std::fs::write(
+            work.join("crates/x/tests/gate_test.rs"),
+            format!("//! principle: {slug}\n"),
+        )
+        .expect("the fixture file");
+        git(&["--git-dir", bare_s, "--work-tree", work_s, "add", "--all"]);
+        git(&[
+            "--git-dir",
+            bare_s,
+            "--work-tree",
+            work_s,
+            "commit",
+            "-q",
+            "-m",
+            "fixture",
+        ]);
+        dir
+    }
+
+    /// A store with exactly the two behaviours the re-open path reads: the row it
+    /// holds is not in the first outstanding set (a settled row is not offered)
+    /// and is in every set after the re-open that put it back.
+    #[derive(Default)]
+    struct ReopeningStore {
+        /// How many times the outstanding set was asked for. The second read is
+        /// the whole subject of the test, and a pass that skips it leaves
+        /// everything else looking identical.
+        outstanding_reads: std::sync::atomic::AtomicUsize,
+        /// The registry the re-open was asked about, as `slug -> file`.
+        gates: std::sync::Mutex<HashMap<String, String>>,
+        measured: std::sync::Mutex<Vec<PrincipleMeasurement>>,
+        row: std::sync::Mutex<Option<PrincipleRow>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PrincipleLedgerStore for ReopeningStore {
+        async fn record_readings(
+            &self,
+            _: &[cog_core::PrincipleReading],
+        ) -> cog_core::SFResult<usize> {
+            unimplemented!()
+        }
+        async fn declare(&self, _: &[cog_core::PrincipleReading]) -> cog_core::SFResult<usize> {
+            unimplemented!()
+        }
+        async fn fold_declarations(&self, _: usize) -> cog_core::SFResult<cog_core::PrincipleFold> {
+            unimplemented!()
+        }
+        async fn pending_declarations(&self) -> cog_core::SFResult<u64> {
+            unimplemented!()
+        }
+        async fn apply_principle_measurement(
+            &self,
+            measurement: &PrincipleMeasurement,
+        ) -> cog_core::SFResult<()> {
+            self.measured.lock().unwrap().push(measurement.clone());
+            Ok(())
+        }
+        async fn outstanding(&self, _: usize) -> cog_core::SFResult<Vec<PrincipleRow>> {
+            use std::sync::atomic::Ordering;
+            let read = self.outstanding_reads.fetch_add(1, Ordering::SeqCst) + 1;
+            if read == 1 {
+                Ok(Vec::new())
+            } else {
+                Ok(self.row.lock().unwrap().clone().into_iter().collect())
+            }
+        }
+        async fn reopen_platform_gate_drift(
+            &self,
+            gates: &HashMap<String, String>,
+        ) -> cog_core::SFResult<Vec<String>> {
+            *self.gates.lock().unwrap() = gates.clone();
+            let row = self.row.lock().unwrap();
+            Ok(match row.as_ref() {
+                Some(r) if gates.get(&r.slug) != r.platform_gate.as_ref() => {
+                    vec![r.slug.clone()]
+                }
+                _ => Vec::new(),
+            })
+        }
+        async fn refused(&self, _: usize) -> cog_core::SFResult<Vec<PrincipleRow>> {
+            unimplemented!()
+        }
+        async fn get(&self, _: &str) -> cog_core::SFResult<Option<PrincipleRow>> {
+            unimplemented!()
+        }
+        async fn slugs(&self) -> cog_core::SFResult<Vec<String>> {
+            Ok(self
+                .row
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|r| vec![r.slug.clone()])
+                .unwrap_or_default())
+        }
+        async fn census(&self) -> cog_core::SFResult<PrincipleCensus> {
+            unimplemented!()
+        }
+        async fn check_kind_census(&self) -> cog_core::SFResult<PrincipleCheckKindCensus> {
+            unimplemented!()
+        }
+        async fn report_refusals(
+            &self,
+            _: &[cog_core::PrincipleRefusal],
+        ) -> cog_core::SFResult<usize> {
+            unimplemented!()
+        }
+        async fn fold_refusals(&self, _: usize) -> cog_core::SFResult<usize> {
+            unimplemented!()
+        }
+        async fn pending_refusals(&self) -> cog_core::SFResult<u64> {
+            unimplemented!()
+        }
+    }
+
+    /// A row the registry has moved onto the platform is judged in the pass that
+    /// re-opened it. Without the second read the row would stay settled for
+    /// another interval while the pass line reported it as asked again.
+    #[tokio::test]
+    async fn a_row_reopened_by_the_registry_is_judged_in_the_same_pass() {
+        use std::sync::atomic::Ordering;
+
+        let slug = "feedback_example_gate";
+        let dir = repo_declaring(slug);
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+
+        let mut settled = row(
+            slug,
+            Some(crate::principle_measure::HOST_REGISTRY_READ_NO_GATE),
+            Some(PrincipleState::Enforced),
+        );
+        settled.platform_gate = Some("crates/old/tests/gate_test.rs".to_string());
+        let store = ReopeningStore {
+            row: std::sync::Mutex::new(Some(settled)),
+            ..Default::default()
+        };
+
+        let mut unsettled = HashMap::new();
+        measure_pass(&store, &tree, &HashSet::new(), &mut unsettled).await;
+
+        // The order this file owns: the set is read before the registry, and read
+        // again after the re-open.
+        assert_eq!(
+            store.outstanding_reads.load(Ordering::SeqCst),
+            2,
+            "the pass did not read the outstanding set again after re-opening a row"
+        );
+        // The registry the re-open was asked about is the tree's own declaration,
+        // not an empty map: a pass that asked about nothing would re-open nothing.
+        assert_eq!(
+            store.gates.lock().unwrap().get(slug).map(String::as_str),
+            Some("crates/x/tests/gate_test.rs")
+        );
+
+        let measured = store.measured.lock().unwrap();
+        assert_eq!(
+            measured.len(),
+            1,
+            "the row re-opened this pass was not judged until the next one"
+        );
+        assert_eq!(measured[0].slug, slug);
+        assert_eq!(measured[0].state, PrincipleState::Enforced);
+        assert_eq!(
+            measured[0].platform_gate.as_deref(),
+            Some("crates/x/tests/gate_test.rs")
+        );
+    }
 }
