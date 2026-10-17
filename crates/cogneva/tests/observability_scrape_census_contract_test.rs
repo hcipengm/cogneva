@@ -1,3 +1,4 @@
+//! principle: feedback_a_retired_name_is_a_third_face_the_census_must_read_from_the_list
 //! Every series this build can render is on a face that records it.
 //!
 //! A series reaches the scrape two ways. One is the metric store: a producer

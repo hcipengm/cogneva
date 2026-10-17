@@ -45,6 +45,7 @@
 //! extend — a wrong answer that is loud beats a resolver that is quietly wrong.
 //!
 //! principle: feedback_a_change_lands_only_if_it_reaches_a_build_target
+//! principle: feedback_a_gate_that_forbids_a_shape_must_judge_what_the_repository_carries
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
