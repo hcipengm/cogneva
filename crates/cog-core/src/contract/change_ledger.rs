@@ -171,14 +171,26 @@ pub enum RetireReason {
     /// The scope is outside the tree a criterion can read, so the row's check
     /// could only ever come back unsettled and no measurement will ever move it.
     OutOfScope,
+    /// The artifact left the tree the judge reads, by a decision taken outside
+    /// it: the work was real and was measured here, and the surface it was
+    /// measured on is now kept somewhere this account cannot read.
+    ///
+    /// Distinct from [`RetireReason::OutOfScope`], which names a scope this
+    /// account was never able to read. A reader asking whether the row can come
+    /// back -- the one question the two answers differ on -- needs the
+    /// difference: an `out_of_scope` row returns as soon as a tree is mounted
+    /// for it, while this one returns only if the surface itself comes back
+    /// into the measured tree.
+    SurfaceMoved,
 }
 
 impl RetireReason {
     /// Every reason, in the order the readings group them.
-    pub const ALL: [RetireReason; 3] = [
+    pub const ALL: [RetireReason; 4] = [
         RetireReason::Superseded,
         RetireReason::Fixture,
         RetireReason::OutOfScope,
+        RetireReason::SurfaceMoved,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -186,6 +198,7 @@ impl RetireReason {
             RetireReason::Superseded => "superseded",
             RetireReason::Fixture => "fixture",
             RetireReason::OutOfScope => "out_of_scope",
+            RetireReason::SurfaceMoved => "surface_moved",
         }
     }
 }
