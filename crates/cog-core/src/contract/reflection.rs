@@ -2670,6 +2670,7 @@ mod tests {
                 RejectionCause::LintRefused => "lint_refused",
                 RejectionCause::UnreachableDefault => "unreachable_default",
                 RejectionCause::ProjectKindUnusable => "project_kind_unusable",
+                RejectionCause::DeployAdmissionFailed => "deploy_admission_failed",
             };
             assert_eq!(cause.as_str(), spelling, "{cause:?} spells two ways");
             assert_eq!(
@@ -2680,7 +2681,7 @@ mod tests {
             assert!(!seen.contains(&spelling), "{spelling} is in the list twice");
             seen.push(spelling);
         }
-        assert_eq!(seen.len(), 13, "ALL is missing a cause: {seen:?}");
+        assert_eq!(seen.len(), 14, "ALL is missing a cause: {seen:?}");
         for (index, cause) in RejectionCause::ALL.iter().enumerate() {
             assert_eq!(cause.slot(), index, "{cause:?} does not sit at {index}");
         }
