@@ -99,6 +99,9 @@
 //!
 //! principle: feedback_a_version_bit_on_a_dispatch_id_must_keep_generation_zero_identical
 //! principle: feedback_a_typed_field_that_exists_may_never_have_been_filled
+//! principle: feedback_a_reader_that_knows_one_path_answers_no_product_about_a_product_that_was_produced
+//! principle: feedback_a_stronger_claim_may_not_be_checked_less_often_than_a_weaker_one
+//! principle: feedback_two_renderings_of_one_quantity_may_differ_by_a_declared_window
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;

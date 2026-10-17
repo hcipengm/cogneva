@@ -1,3 +1,4 @@
+//! principle: feedback_a_gate_built_on_a_literal_cannot_guard_a_declared_absence
 //! Releasing a retired metric name from every table that stores it, against a
 //! live PostgreSQL.
 //!

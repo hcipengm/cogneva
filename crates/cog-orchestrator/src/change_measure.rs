@@ -1,3 +1,4 @@
+//! principle: feedback_a_word_boundary_only_applies_where_both_ends_are_word_characters
 //! Measuring a change's own check against the project's tree.
 //!
 //! A ledger row names an artifact as a kind, a scope and a literal, and the state

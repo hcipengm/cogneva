@@ -1,3 +1,5 @@
+//! principle: feedback_a_role_renewed_through_the_shutdown_of_its_work_is_a_seat_nobody_can_take
+//! principle: feedback_a_verdict_grounded_in_a_state_of_the_code_goes_stale_wordlessly
 //! Gate: who may run the self-discovery loop is decided by a role, not by the
 //! change-executor flag — and the change-executor flag keeps its own reader.
 //!

@@ -1,3 +1,4 @@
+//! principle: feedback_a_brace_in_prose_is_read_as_a_placeholder_of_the_document_it_sits_in
 //! Infrastructure alert watcher — the producer side of persisted infra alerts.
 //!
 //! SupervisorEvents only cover what the supervisor itself observes (agents,

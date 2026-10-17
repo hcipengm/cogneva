@@ -1,4 +1,6 @@
 //! principle: feedback_a_corpus_that_carries_the_probes_own_command_hides_a_hit_in_itself
+//! principle: feedback_a_gate_whose_witness_input_fails_a_different_precondition_proves_nothing
+//! principle: feedback_a_repeated_observation_of_one_object_is_one_row_keyed_and_stamped_by_the_object
 //!
 //! What a red CI run says about the principles whose gates it built.
 //!

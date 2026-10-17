@@ -1,3 +1,7 @@
+//! principle: feedback_a_counter_series_born_with_its_first_burst_hides_that_burst_from_every_window
+//! principle: feedback_seed_zero_per_cell_not_per_name
+//! principle: feedback_two_builders_of_one_sentence_are_routed_to_readers_by_the_merge_criterion
+//! principle: feedback_two_renderers_of_one_verdict_must_name_the_same_derived_quantity
 //! 独立安全网关。
 //! 代持全部敏感凭证，沙盒零凭证。两个通道：
 //! - 外网代理（默认 8080）：`POST /proxy` 转发沙盒出站请求，域名白/黑名单 + 凭证脱敏审查；

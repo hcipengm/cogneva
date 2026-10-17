@@ -1,3 +1,4 @@
+//! principle: feedback_a_declaration_name_is_not_a_tool
 //! toolathlon 题面声明的**本地工具**：不属任何 MCP server，由外壳这一侧提供。
 //!
 //! 上游 `_build_local_tools` 按 `needed_local_tools` 现造这几件，而它们的实现全都落在

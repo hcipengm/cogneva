@@ -1,3 +1,4 @@
+//! principle: feedback_a_reading_must_ride_the_branch_the_deployment_runs
 //! Gate: every engine the reflection plugin builds reports the recurrence at
 //! its thresholds into the reading the process publishes.
 //!

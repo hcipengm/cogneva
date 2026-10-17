@@ -2,6 +2,7 @@
 //! principle: feedback_a_pair_exclusion_shipped_before_its_label_matches_nothing
 //! principle: feedback_a_registration_table_grows_only_where_its_consumers_are
 //! principle: feedback_an_aggregate_over_a_series_family_can_starve_while_every_element_has_a_reader
+//! principle: feedback_an_alarm_moved_off_a_published_series_orphans_it_and_costs_a_census_entry
 //!
 //! Every PromQL expression in the deployed alert rules reads series by name.
 //!

@@ -1,3 +1,4 @@
+//! principle: feedback_two_fallbacks_for_one_budget_need_an_equality_gate_where_both_crates_meet
 //! `cogneva validate-config` — 启动前校验配置与依赖（审计 Phase 2 任务 2.5）。
 //!
 //! 加载完整 5 层配置栈后执行结构与依赖检查，按 ✅/⚠️/❌ 输出报告；

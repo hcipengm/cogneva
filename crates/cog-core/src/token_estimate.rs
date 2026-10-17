@@ -1,3 +1,5 @@
+//! principle: feedback_an_estimate_used_as_a_lower_bound_must_be_monotone
+//! principle: feedback_fixing_a_blind_spot_recalls_the_bounds_written_against_it
 //! What a piece of text costs a window, estimated the same way on both sides.
 //!
 //! Two callers put a number on text and then act on it: the agent's window
