@@ -105,7 +105,7 @@ pub use baseline_port::{
 pub use change_pipeline::{ApplyResult, ChangePipeline};
 use cog_core::{DecisionCategory, DecisionOutcome, Learning};
 pub use config::{
-    BaselinePortConfig, ChangeJobConfig, GitOpsConfig, MainlineDeployerConfig,
+    BaselinePortConfig, ChangeJobConfig, GenerationLimits, GitOpsConfig, MainlineDeployerConfig,
     ObservabilityStackConfig, PromotionGateConfig,
 };
 pub use detector::{DefaultLearningDetector, LearningDetector};
@@ -410,6 +410,11 @@ impl ReflectionEngine {
         project_root: Option<std::path::PathBuf>,
         wiki: Option<cog_core::LateService<dyn cog_core::WikiBackend>>,
         change_dir: impl Into<std::path::PathBuf>,
+        // The line budget the landing side enforces, read from the key that side
+        // reads. Passed in rather than loaded here because a wrong config value
+        // has to fail the caller's startup, and this constructor cannot return
+        // an error.
+        generation_limits: crate::GenerationLimits,
         // Where the recurrence at each threshold is reported. Required rather
         // than optional: the count that this reports on was unread for three
         // weeks, and a default here would make "the reading is wired" something
@@ -443,7 +448,8 @@ impl ReflectionEngine {
         let effectiveness_tracker = Arc::new(SkillEffectivenessTracker::new(recorder.clone()));
         let mut evolution =
             EvolutionEngine::new(llm.clone(), skill_registry.clone(), prompt_manager.clone())
-                .with_change_dir(change_dir);
+                .with_change_dir(change_dir)
+                .with_max_changed_lines(generation_limits.max_changed_lines);
         if let Some(tx) = hook_sink {
             evolution = evolution.with_hook_sink(tx);
         }

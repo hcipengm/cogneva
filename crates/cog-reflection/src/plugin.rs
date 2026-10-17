@@ -393,6 +393,9 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         // Option 移进元组，else 那一支里就再也问不出它们了（借用检查器的要求，不是风格）。
         let has_memory_backend = memory_backend.is_some();
         let has_llm_provider = llm_provider.is_some();
+        // 生成侧的行数上限从落地侧读的那个配置键取。配置写错在这里响亮失败，
+        // 而不是让生成侧带着一个默认值跑到写盘时才发现两边不一致。
+        let generation_limits = crate::GenerationLimits::load()?;
         let engine = if let (Some(ref mb), Some(ref llm)) = (memory_backend, llm_provider) {
             info!("ReflectionEngine initialized in production mode (persistent learning)");
             // The wiki backend is published by another plugin in this layer and
@@ -412,6 +415,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 engine_root.clone(),
                 Some(wiki),
                 change_dir.clone(),
+                generation_limits,
                 recurrence_readings,
             )
         } else {

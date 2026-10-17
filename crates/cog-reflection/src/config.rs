@@ -396,6 +396,80 @@ impl ChangeJobConfig {
     }
 }
 
+/// 生成侧的行数上限，与落地侧同源。
+///
+/// 落地侧（`cog-github` 的 `LandingPolicy`）从 cogneva.json 的
+/// `github_integration.landing_policy.max_changed_lines` 读它；这里读**同一个键**，
+/// 不另起一个自进化配置段。两份数各写一个的后果实测过：生成侧放行一份 480 行的
+/// 变更、落地侧按 200 行判超限，变更在流水线末尾才被拦下，前面的构建与沙盒验证
+/// 全部白跑。
+///
+/// 生成侧越早知道上限，越能在写盘前让生成器缩小范围；把判据只写进 prompt 靠模型
+/// 自觉是不够的，模型数不准行数。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GenerationLimits {
+    pub max_changed_lines: usize,
+}
+
+impl Default for GenerationLimits {
+    fn default() -> Self {
+        // 落地侧 `LandingPolicy::max_changed_lines` 的默认值。这是**默认**不是
+        // 第二份定义：配置文件里有那一节时以它为准，两边读的是同一个键。
+        // `crates/cogneva` 的测试钉住这两个默认值相等，任一侧单独改动会红。
+        Self {
+            max_changed_lines: 200,
+        }
+    }
+}
+
+impl GenerationLimits {
+    /// 从 cogneva.json 的 `github_integration.landing_policy` 段读取，再叠加
+    /// env 覆盖。文件或段缺失时返回 Default；段存在但取值不是非负整数时返回
+    /// Err——配置写错必须响亮失败，不许静默降级成默认。
+    pub fn load() -> SFResult<Self> {
+        let path = std::env::var("COGNEVA_CONFIG_PATH")
+            .unwrap_or_else(|_| "/etc/cogneva/cogneva.json".into());
+        Self::load_from(Path::new(&path))
+    }
+
+    pub fn load_from(path: &Path) -> SFResult<Self> {
+        let mut cfg = match std::fs::read_to_string(path) {
+            Ok(text) => {
+                let root: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|e| SFError::Config(format!("{}: {e}", path.display())))?;
+                match root.pointer("/github_integration/landing_policy/max_changed_lines") {
+                    Some(v) => Self {
+                        max_changed_lines: v.as_u64().ok_or_else(|| {
+                            SFError::Config(format!(
+                                "{} github_integration.landing_policy.max_changed_lines: 要非负整数，读到 {v}",
+                                path.display()
+                            ))
+                        })? as usize,
+                    },
+                    None => Self::default(),
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) => return Err(SFError::Config(format!("{}: {e}", path.display()))),
+        };
+        cfg.apply_env_with(|k| std::env::var(k).ok())?;
+        Ok(cfg)
+    }
+
+    /// env 覆盖。取值经 `get` 读取（测试可注入假 env）；非法值返回 Err。
+    pub fn apply_env_with(&mut self, get: impl Fn(&str) -> Option<String>) -> SFResult<()> {
+        if let Some(v) = get("COGNEVA_GENERATION_MAX_CHANGED_LINES") {
+            self.max_changed_lines = v.parse().map_err(|_| {
+                SFError::Config(format!(
+                    "COGNEVA_GENERATION_MAX_CHANGED_LINES 值非法: {v:?}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+}
+
 /// 基线移植触发器配置（规则3：公版出新 release tag 后把历代晋级变更
 /// 自治移植到新基线）。porter 本体在沙盒进化 Pod 内运行，轮询上游 tag，
 /// 产出 `evol/<id>` 分支与 `gen-n` 代际 tag。
@@ -1525,5 +1599,57 @@ mod tests {
         assert_eq!(cfg.job_memory_request, "64Mi");
         assert_eq!(cfg.job_cpu_limit, "1");
         assert_eq!(cfg.job_memory_limit, "512Mi");
+    }
+
+    #[test]
+    fn generation_limits_read_the_key_the_landing_side_reads() {
+        let dir = std::env::temp_dir().join(format!("cog-reflection-gl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cogneva.json");
+        // 键在：取同一个数，不另起一个自进化配置段。
+        std::fs::write(
+            &path,
+            r#"{"github_integration": {"landing_policy": {"max_changed_lines": 137}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            GenerationLimits::load_from(&path)
+                .unwrap()
+                .max_changed_lines,
+            137
+        );
+        // 段缺失：落到落地侧的默认值。
+        std::fs::write(&path, r#"{"self_evolution": {"enabled": true}}"#).unwrap();
+        assert_eq!(
+            GenerationLimits::load_from(&path)
+                .unwrap()
+                .max_changed_lines,
+            200
+        );
+        // 类型不对：响亮失败，不静默取默认。
+        std::fs::write(
+            &path,
+            r#"{"github_integration": {"landing_policy": {"max_changed_lines": "many"}}}"#,
+        )
+        .unwrap();
+        assert!(GenerationLimits::load_from(&path).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn generation_limits_env_override_and_bad_value_is_loud() {
+        let mut cfg = GenerationLimits::default();
+        cfg.apply_env_with(|k| {
+            (k == "COGNEVA_GENERATION_MAX_CHANGED_LINES").then(|| "80".to_string())
+        })
+        .unwrap();
+        assert_eq!(cfg.max_changed_lines, 80);
+
+        let mut cfg = GenerationLimits::default();
+        assert!(cfg
+            .apply_env_with(|k| {
+                (k == "COGNEVA_GENERATION_MAX_CHANGED_LINES").then(|| "eighty".to_string())
+            })
+            .is_err());
     }
 }

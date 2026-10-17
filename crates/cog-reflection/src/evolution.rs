@@ -90,6 +90,10 @@ pub struct EvolutionEngine {
     /// copy: [`resident_record`] drops each artifact's text, whose durable copy
     /// lives in the change directory or the store that owns that artifact kind.
     results: Arc<tokio::sync::Mutex<std::collections::HashMap<String, EvolutionResult>>>,
+    /// 一份变更最多允许多少有效改动行。判据来自落地侧读的同一个配置键
+    /// （[`crate::GenerationLimits`]），在这里先在写盘前用一次：超限的变更不该
+    /// 走完构建与沙盒验证、到落地时才被拦下，那时每一次重跑都是白跑的。
+    max_changed_lines: usize,
 }
 
 /// Move a produced result into the shape the resident index stores.
@@ -137,7 +141,14 @@ impl EvolutionEngine {
             tool_sink: std::sync::Mutex::new(None),
             project_root: None,
             results: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            max_changed_lines: crate::GenerationLimits::default().max_changed_lines,
         }
+    }
+
+    /// 设置生成侧的行数上限，取落地侧读的同一个配置键所载的值。
+    pub fn with_max_changed_lines(mut self, max_changed_lines: usize) -> Self {
+        self.max_changed_lines = max_changed_lines;
+        self
     }
 
     /// Set the directory where code changes are written (default:
@@ -889,6 +900,19 @@ impl EvolutionEngine {
         // rather than handed to the apply gate.
         let content = repair_generated_diff(&change.content);
 
+        // 行数上限在写盘前判一次。落地侧按同一个数（同一个配置键）判超限，而
+        // 到那时变更已经走完构建、测试与沙盒验证——超限的变更在这里被拒，只花
+        // 掉生成那一轮；放它过去，花掉的是整条流水线，最后还是落不了地。
+        // 计数用 `cog_core::count_diff_lines`：生成侧、晋级门、落地侧必须是同一个
+        // 读数，第二份解析器会让同一份 diff 对不同读者给出不同的行数。
+        let diff_lines = cog_core::count_diff_lines(&content);
+        if diff_lines > self.max_changed_lines {
+            return Err(cog_core::SFError::Validation(format!(
+                "generated change is {diff_lines} changed lines, over the {} line budget shared with the landing policy; narrow the scope and regenerate rather than submitting an over-budget diff",
+                self.max_changed_lines
+            )));
+        }
+
         // Derive affected files from the change content if not supplied.
         let affected_files: Vec<std::path::PathBuf> = if change.affected_files.is_empty() {
             cog_core::parse_diff_affected_files(&content)?
@@ -1273,6 +1297,58 @@ mod tests {
         assert_eq!(
             pipeline.read_change_record("chg-2").await.map(|r| r.status),
             Some(EvolutionStatus::AwaitingReview)
+        );
+    }
+
+    /// 超限的变更在写盘前被拒，恰好等于上限时放行。
+    ///
+    /// 落地侧按同一个数判超限，但它判的时候变更已经走完构建、测试与沙盒验证。
+    /// 两半都要钉住：只钉「超限被拒」会让边界悄悄挪成「小于」也放行；只钉
+    /// 「等于上限放行」则放行一切。
+    #[tokio::test]
+    async fn a_generated_change_over_the_shared_line_budget_is_refused_before_it_is_written() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        let engine = engine_on(&change_dir).with_max_changed_lines(2);
+
+        let diff = |added: usize| {
+            let mut s = String::from(
+                "diff --git a/crates/cog-agent/src/x.rs b/crates/cog-agent/src/x.rs\n\
+                 --- a/crates/cog-agent/src/x.rs\n\
+                 +++ b/crates/cog-agent/src/x.rs\n\
+                 @@ -1,1 +1,1 @@\n",
+            );
+            for i in 0..added {
+                s.push_str(&format!("+line {i}\n"));
+            }
+            s
+        };
+        let mut change = cog_core::GeneratedChange {
+            change_id: "over-budget".into(),
+            goal: "over budget".into(),
+            affected_files: vec!["crates/cog-agent/src/x.rs".into()],
+            content: diff(3),
+            ..Default::default()
+        };
+        let err = engine
+            .write_generated_change(&change)
+            .await
+            .expect_err("3 行超过 2 行上限，必须被拒");
+        assert!(
+            err.to_string().contains("line budget"),
+            "拒绝的理由要点名那个预算，生成侧才知道该缩小范围：{err}"
+        );
+        assert!(
+            !change_dir.join("over-budget.diff").exists(),
+            "被拒的变更不该留下落盘的 diff"
+        );
+
+        change.change_id = "at-budget".into();
+        change.content = diff(2);
+        assert!(
+            engine.write_generated_change(&change).await.is_ok(),
+            "恰好等于上限要放行——边界不是「小于」"
         );
     }
 }

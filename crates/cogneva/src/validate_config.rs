@@ -169,3 +169,21 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nvalidate-config: OK");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    /// 生成侧与落地侧读同一个配置键，但两边各有一个「段缺失时」的默认值。
+    /// 那两个数是同一件事的两份写法，只能相等：任意一侧单独改动而另一侧没跟上，
+    /// 同一份 diff 就会在生成侧放行、在落地侧超限——中间那一整轮构建与沙盒验证
+    /// 白跑，而且两边都会「按自己那份数」说自己是自洽的。两个 crate 只在这一个
+    /// 二进制里相遇，所以这条相等判据也只能钉在这里。
+    #[test]
+    fn the_generation_and_landing_fallbacks_are_one_number() {
+        let generation = cog_reflection::GenerationLimits::default().max_changed_lines;
+        let landing = cog_github::config::LandingPolicy::default().max_changed_lines;
+        assert_eq!(
+            generation, landing,
+            "生成侧与落地侧的默认行数上限分叉了：一侧 200／另一侧另一份数时，同一份 diff 会对两个读者给出相反的判词"
+        );
+    }
+}

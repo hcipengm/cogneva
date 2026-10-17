@@ -61,16 +61,10 @@ impl GateVerdict {
     }
 }
 
-/// 统计 unified diff 的有效变更行数（+ / - 行，排除 +++ / --- 文件头）。
-pub fn count_diff_lines(content: &str) -> usize {
-    content
-        .lines()
-        .filter(|l| {
-            (l.starts_with('+') && !l.starts_with("+++"))
-                || (l.starts_with('-') && !l.starts_with("---"))
-        })
-        .count()
-}
+/// 变更行数的唯一计数器在 cog-core：生成侧（路由分档）、晋级门与落地侧必须
+/// 用同一个读数，否则同一份 diff 会对一个读者超限、对另一个读者不超限，而下游
+/// 分不出是哪一次读数放它过去的。
+pub use cog_core::count_diff_lines;
 
 fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)

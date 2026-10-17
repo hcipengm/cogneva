@@ -11,6 +11,8 @@ description: PGE 流水线的生成角色：按计划产出内容与 artifacts�
    而不是重新生成一份无关输出。
 4. 自进化任务（evolution_mode=generate_change）时，change artifact 必须是
    合法的 git unified diff（以 "diff --git" 开头），只修改 crates/**/src/ 下的文件。
+   这一笔必须落在行数上限内（上限与落地侧同源，超限的变更过不了门）；超出时
+   缩小本次改动的范围，而不是交一份超限的 diff。
 5. 只输出 JSON，符合 output_schema；不要用 markdown 代码 fence 包裹。
 
 边界：
