@@ -187,6 +187,16 @@ pub struct LlmUsageRecord {
     /// attempts and pooled refusals). Absent is not zero here: a row priced at
     /// zero would read as an empty prompt, and the two have opposite repairs.
     pub estimated_input: Option<u64>,
+    /// The unit of work this call was spent for, as the caller declared it --
+    /// the same identity the caller reports its own per-run totals under.
+    ///
+    /// Nullable on purpose, like `estimated_input` and for the same reason:
+    /// `NULL` is "this call was not attributed to a job", which is a different
+    /// statement from "it was spent for job `unknown`". A NOT NULL default would
+    /// put every unattributed call in one group and read as a single very
+    /// expensive job, so rows landed by paths that have no job identity keep it
+    /// empty rather than inventing one.
+    pub task: Option<String>,
     /// Wall time of the call; for streams this is first-byte to last-byte.
     pub latency_ms: u64,
 }
@@ -375,6 +385,16 @@ impl LlmUsageStore {
         )
         .execute(&self.pool)
         .await?;
+        // The per-job dimension. Nullable because "no job identity" is a state
+        // of its own: rows landed by paths that cannot name a job (an upstream
+        // failure recorded before routing, the gateway's own judgement calls)
+        // must not be gathered into one placeholder group that would then read
+        // as the most expensive job on the ledger. Text, not UUID: the caller
+        // declares whatever identity its own per-run census uses, and the
+        // reader's job is to join the two, not to funnel both through a type.
+        sqlx::query("ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS task_id TEXT")
+            .execute(&self.pool)
+            .await?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_gateway_llm_usage_ts ON gateway_llm_usage (ts)",
         )
@@ -452,8 +472,9 @@ impl LlmUsageStore {
             r#"
             INSERT INTO gateway_llm_usage
                 (id, upstream, api_style, model, result, actor, origin,
-                 tokens_input, tokens_output, tokens_cached, estimated_input, latency_ms)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                 tokens_input, tokens_output, tokens_cached, estimated_input,
+                 task_id, latency_ms)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             "#,
         )
         .bind(uuid::Uuid::new_v4())
@@ -467,6 +488,7 @@ impl LlmUsageStore {
         .bind(r.tokens_output as i64)
         .bind(r.tokens_cached as i64)
         .bind(r.estimated_input.map(|v| v as i64))
+        .bind(r.task.as_deref())
         .bind(r.latency_ms as i64)
         .execute(&self.pool)
         .await?;

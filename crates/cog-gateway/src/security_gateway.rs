@@ -1904,6 +1904,24 @@ fn record_event(state: &AppState, event: AnalyticsEvent) {
 /// someone meant to add. Declared values are listed in [`crate::actor_labels`];
 /// everything else lands on the unknown cell, which is where a caller that
 /// declared nothing is readable.
+/// 调用方声明的"这次调用为哪件事花钱"，原样带上账本；没有就是没有。
+///
+/// 与 `actor` 的归一化不同：那里有一个封闭取值域、落在域外一律读成 `unknown`，
+/// 因为组件种类是可枚举的；任务标识是开放集合，任何占位值都会变成一个谁也没
+/// 声明过的"最贵任务"。所以这里只做两件事：去掉首尾空白；长度超过上界的不收。
+///
+/// 上界取 128：实测账里 3,872 个任务标识的长度在 51–53 之间（`ralph-pipeline-`
+/// 加一个 UUID），128 是它的两倍多，留给更长的前缀。超长的不截断而是整个不收——
+/// 截断后的 id 与本来的任务对不上，落进账里会变成一件从来不存在的工作，比留空
+/// 更难查。
+fn normalize_task(raw: Option<&str>) -> Option<String> {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty() || trimmed.len() > 128 {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
 fn normalize_actor(raw: Option<&str>) -> String {
     match raw {
         Some(v) if !v.is_empty() && v.len() <= 32 && crate::actor_labels::declared(v) => {
@@ -1921,6 +1939,7 @@ async fn record_llm_call(
     latency_ms: u64,
     actor: &str,
     origin: &str,
+    task: Option<&str>,
 ) {
     let key = LlmHealthTable::key(upstream);
     // `model` travels alongside `upstream` rather than instead of it: a pool
@@ -1953,7 +1972,7 @@ async fn record_llm_call(
             .property("actor", serde_json::json!(actor))
             .property("latency_ms", serde_json::json!(latency_ms)),
     );
-    if let Some(record) = failed_attempt_usage(upstream, result, latency_ms, actor, origin) {
+    if let Some(record) = failed_attempt_usage(upstream, result, latency_ms, actor, origin, task) {
         land_usage_record(state, record);
     }
 }
@@ -1974,6 +1993,7 @@ fn failed_attempt_usage(
     latency_ms: u64,
     actor: &str,
     origin: &str,
+    task: Option<&str>,
 ) -> Option<LlmUsageRecord> {
     if result == "ok" {
         return None;
@@ -1993,6 +2013,8 @@ fn failed_attempt_usage(
         // "估算 X、真值 0"的一次超额。定价只落在有真值的那一行上。填 0 更糟：会读成
         // 空提示词。
         estimated_input: None,
+        // 这件工作由调用方声明，失败不会改变"这笔钱是为谁花的"。
+        task: task.map(str::to_string),
         latency_ms,
     })
 }
@@ -2020,7 +2042,12 @@ const POOLED_REFUSAL_UNNAMED: &str = "-";
 /// 在无人可承接时直接返回）。少了这一行，池全灭的窗口在台账里仍然是一条安静的
 /// 缝，与"本来就没有流量"同形，而那正是这次拒绝要区分开的两件事。零用量是实情：
 /// 一个上游都没发出去，所以 latency 记 0 也是实情，不是没量到。
-fn pooled_refusal_usage(style: &str, actor: &str, origin: &str) -> LlmUsageRecord {
+fn pooled_refusal_usage(
+    style: &str,
+    actor: &str,
+    origin: &str,
+    task: Option<&str>,
+) -> LlmUsageRecord {
     LlmUsageRecord {
         upstream: POOLED_REFUSAL_UNNAMED.to_string(),
         api_style: style.to_string(),
@@ -2034,6 +2061,9 @@ fn pooled_refusal_usage(style: &str, actor: &str, origin: &str) -> LlmUsageRecor
         // 同 [`failed_attempt_usage`]：这一行说的是"一个上游都没发出去"，那份请求的
         // 估算在这里没有真值可配对，不填。
         estimated_input: None,
+        // 拒绝发生在选上游之前，但"这次调用想为哪件事花钱"调用方已经说了，
+        // 照记：被拒的调用正是按任务配速时最该看见的那一族。
+        task: task.map(str::to_string),
         latency_ms: 0,
     }
 }
@@ -2053,10 +2083,11 @@ fn pooled_refusal(
     style: &str,
     actor: &str,
     origin: &str,
+    task: Option<&str>,
 ) -> Option<(u64, u64)> {
     let verdict = state.pool_circuit_break(candidates);
     if verdict.is_some() {
-        land_usage_record(state, pooled_refusal_usage(style, actor, origin));
+        land_usage_record(state, pooled_refusal_usage(style, actor, origin, task));
     }
     verdict
 }
@@ -2411,6 +2442,11 @@ fn price_request(serialized: &str) -> u64 {
 struct RequestSide {
     actor: String,
     origin: String,
+    /// 这次调用是为哪件事花的，由调用方在请求头上声明。`None` 是"没有声明"，
+    /// 不是"声明为某一件事"——和 `estimated_input` 一样，可空列正是为了让两者
+    /// 在读数面上分得开：不声明的调用不许被并进一个占位分组，那会让占位值读成
+    /// 全账最贵的那件事。
+    task: Option<String>,
     /// [`price_request`] 的读数。`None` 是"这条路径没量过"，不是"量出来是 0"：台账
     /// 那一列可空正是因为两者修法相反——一个说明装配面还没接上，一个是空提示词——
     /// 所以量不出来的路径一律传 `None`，绝不填 0 冒充量过。
@@ -2431,6 +2467,7 @@ async fn record_llm_tokens(
     let actor = request.actor.as_str();
     let origin = request.origin.as_str();
     let estimated_input = request.estimated_input;
+    let task = request.task.clone();
     let key = LlmHealthTable::key(upstream);
     // Zero is recorded, not skipped: the two cells answer "has this metering
     // path ever run for this upstream and actor", and a skipped zero leaves
@@ -2504,6 +2541,7 @@ async fn record_llm_tokens(
             tokens_output: reading.output,
             tokens_cached: reading.cached,
             estimated_input,
+            task,
             latency_ms,
         },
     );
@@ -3929,6 +3967,15 @@ async fn stream_forward(
     )
     .as_str()
     .to_string();
+    // The job axis, read from the same caller as the other two and defaulted to
+    // nothing at all. Unlike actor and origin there is no placeholder: those two
+    // have a domain of values that includes "unknown", while a job id is an open
+    // set and a made-up one would be read as a real job that spent a lot.
+    let task = normalize_task(
+        req.headers()
+            .get(cog_core::LLM_TASK_HEADER)
+            .and_then(|v| v.to_str().ok()),
+    );
     let body = axum::body::to_bytes(req.into_body(), 32 * 1024 * 1024)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -3980,7 +4027,7 @@ async fn stream_forward(
     // 池级熔断：同协议面没有一个上游当下能承接请求时，遍历重试只烧请求。
     // 直接 503 + Retry-After 让调用方立刻知道何时可再来。
     if let Some((retry_after, quota_window)) =
-        pooled_refusal(&state, &candidates, style, &actor, &origin)
+        pooled_refusal(&state, &candidates, style, &actor, &origin, task.as_deref())
     {
         tracing::warn!(
             // 拒绝面必须自称：503 是熔断期"一个上游都没试"的结果，与"试遍了
@@ -4167,6 +4214,7 @@ async fn stream_forward(
                     start.elapsed().as_millis() as u64,
                     &actor,
                     &origin,
+                    task.as_deref(),
                 )
                 .await;
                 mark_upstream_failure(&state, upstream, base, None, None, None).await;
@@ -4217,6 +4265,7 @@ async fn stream_forward(
                 start.elapsed().as_millis() as u64,
                 &actor,
                 &origin,
+                task.as_deref(),
             )
             .await;
             if request_shape_error {
@@ -4248,7 +4297,16 @@ async fn stream_forward(
         }
         let elapsed_ms = start.elapsed().as_millis() as u64;
         state.llm_stats.record(elapsed_ms);
-        record_llm_call(&state, upstream, "ok", elapsed_ms, &actor, &origin).await;
+        record_llm_call(
+            &state,
+            upstream,
+            "ok",
+            elapsed_ms,
+            &actor,
+            &origin,
+            task.as_deref(),
+        )
+        .await;
 
         let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let content_type = resp
@@ -4265,6 +4323,7 @@ async fn stream_forward(
             RequestSide {
                 actor: actor.clone(),
                 origin: origin.clone(),
+                task: task.clone(),
                 estimated_input: Some(estimated_input),
             },
             asked_for_usage,
@@ -4600,6 +4659,7 @@ async fn call_llm(
         POOLED_REFUSAL_UNNAMED,
         actor,
         origin,
+        None,
     ) {
         tracing::warn!(
             // 拒绝面必须自称：503 是熔断期"一个上游都没试"的结果，与"试遍了
@@ -4639,6 +4699,7 @@ async fn call_llm(
                     start.elapsed().as_millis() as u64,
                     actor,
                     origin,
+                    None,
                 )
                 .await;
                 return Ok(resp);
@@ -4653,6 +4714,7 @@ async fn call_llm(
                     start.elapsed().as_millis() as u64,
                     actor,
                     origin,
+                    None,
                 )
                 .await;
                 mark_upstream_failure(
@@ -4706,6 +4768,7 @@ async fn call_one_upstream(
         let request_side = RequestSide {
             actor: actor.to_string(),
             origin: origin.to_string(),
+            task: None,
             estimated_input: Some(estimated_input),
         };
         let resp = state
@@ -4765,6 +4828,7 @@ async fn call_one_upstream(
     let request_side = RequestSide {
         actor: actor.to_string(),
         origin: origin.to_string(),
+        task: None,
         estimated_input: Some(estimated_input),
     };
     let resp = state
@@ -6479,8 +6543,15 @@ mod tests {
     #[test]
     fn a_failed_attempt_lands_a_zero_token_row() {
         // 失败尝试没有用量可带，于是曾经一条台账都不落，result 列只剩 ok。
-        let row = failed_attempt_usage(&test_upstream(), "error", 12, "agent:generator", "sandbox")
-            .expect("a failed attempt must be visible in the ledger");
+        let row = failed_attempt_usage(
+            &test_upstream(),
+            "error",
+            12,
+            "agent:generator",
+            "sandbox",
+            None,
+        )
+        .expect("a failed attempt must be visible in the ledger");
         assert_eq!(row.result, "error");
         assert_eq!(row.tokens_input, 0);
         assert_eq!(row.tokens_output, 0);
@@ -6492,10 +6563,15 @@ mod tests {
     #[test]
     fn a_successful_call_is_not_landed_twice() {
         // 成功那条由 record_llm_tokens 带着真实用量落，这里必须让位。
-        assert!(
-            failed_attempt_usage(&test_upstream(), "ok", 12, "agent:generator", "sandbox")
-                .is_none()
-        );
+        assert!(failed_attempt_usage(
+            &test_upstream(),
+            "ok",
+            12,
+            "agent:generator",
+            "sandbox",
+            None
+        )
+        .is_none());
     }
 
     #[test]
@@ -6516,6 +6592,31 @@ mod tests {
         assert_eq!(normalize_actor(Some("Agent")), "unknown");
         assert_eq!(normalize_actor(Some("bad/actor")), "unknown");
         assert_eq!(normalize_actor(Some(&"a".repeat(33))), "unknown");
+    }
+
+    /// The job axis keeps the caller's own string instead of a bounded label,
+    /// so what it must reject is narrower than for the actor: anything that
+    /// names nothing, and anything too long to be the id the caller used.
+    #[test]
+    fn task_header_kept_verbatim_but_blank_and_oversized_dropped() {
+        // The shape the platform actually uses today: 51-53 bytes measured on
+        // every one of the 3,872 per-task rows.
+        let real = "ralph-pipeline-508ea1f3-9b4c-46ef-8085-a66ba974b9e3";
+        assert_eq!(normalize_task(Some(real)), Some(real.to_string()));
+        assert_eq!(
+            normalize_task(Some("  spaced-id  ")),
+            Some("spaced-id".to_string())
+        );
+        // 128 is the accepted ceiling; 129 is not, and is dropped whole rather
+        // than truncated -- a truncated id joins to no task at all.
+        assert_eq!(
+            normalize_task(Some(&"a".repeat(128))),
+            Some("a".repeat(128))
+        );
+        assert_eq!(normalize_task(Some(&"a".repeat(129))), None);
+        assert_eq!(normalize_task(None), None);
+        assert_eq!(normalize_task(Some("")), None);
+        assert_eq!(normalize_task(Some("   ")), None);
     }
 
     #[test]
@@ -6802,6 +6903,7 @@ mod tests {
             RequestSide {
                 actor: "agent:planner".to_string(),
                 origin: "gateway_pool".to_string(),
+                task: None,
                 // 这条夹具没有请求体可定价，取一个非零数只为了让这条路径落的是
                 // "量过"而不是"没量过"——被丢掉的流要带的就是请求侧钉下的那一份。
                 // 它到不到台账，在这个进程里看不见（测试的 `durable`/`usage` 都是
@@ -7940,7 +8042,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
     /// 修上游，一个是等窗口。
     #[tokio::test]
     async fn a_pooled_refusal_is_one_ledger_row_and_is_not_an_upstream_error() {
-        let row = pooled_refusal_usage("openai", "agent:planner", "resident_worker");
+        let row = pooled_refusal_usage("openai", "agent:planner", "resident_worker", None);
         assert_eq!(row.result, REFUSED_BY_CIRCUIT);
         assert_ne!(row.result, "ok", "记成 ok 就不进 failed_calls");
         assert_ne!(
@@ -7970,7 +8072,14 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             .llm_health
             .note_failure(&a, 300, Some(far), None, None);
         let all: Vec<&LlmUpstream> = state.config.llm_upstreams.iter().collect();
-        let verdict = pooled_refusal(&state, &all, "openai", "intent_gateway", "interactive");
+        let verdict = pooled_refusal(
+            &state,
+            &all,
+            "openai",
+            "intent_gateway",
+            "interactive",
+            None,
+        );
         let (wait, _) = verdict.expect("全灭时判定仍为真：落账不许改判定");
         assert!(wait >= 60, "重试窗下界照旧，落账没有把它挪走");
     }

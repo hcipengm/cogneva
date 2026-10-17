@@ -114,6 +114,7 @@ async fn a_window_folds_the_ledger_and_reruns_in_place_with_zeros_for_the_idle()
         tokens_output: output,
         tokens_cached: cached,
         estimated_input: None,
+        task: None,
         latency_ms: 10,
     };
 
@@ -298,6 +299,7 @@ async fn the_rolled_reader_sums_the_fold_over_the_windows_in_range() {
         tokens_output: output,
         tokens_cached: 0,
         estimated_input: None,
+        task: None,
         latency_ms: latency,
     };
 

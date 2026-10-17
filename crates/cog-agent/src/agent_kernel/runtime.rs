@@ -237,6 +237,14 @@ pub struct AgentRuntime {
     /// — the ending is decided at three different places, and only the exit is
     /// common to all of them.
     run_outcome: Option<crate::observable::RunOutcome>,
+    /// Identity of the run in flight, declared on every LLM call it makes.
+    ///
+    /// The same id the run reports its own token census under: without it the
+    /// spend of one run is only readable as "this component, this environment",
+    /// and "what did this task cost" cannot be answered from the ledger at all.
+    /// Held on the runtime rather than threaded through every call site because
+    /// it is a property of the run, exactly like the usage totals beside it.
+    run_task_id: Option<String>,
 }
 
 /// The token census of one run: every billed LLM call the run made, folded into
@@ -429,6 +437,7 @@ impl AgentRuntime {
             observability: None,
             tool_output_archive: None,
             run_usage: RunUsage::default(),
+            run_task_id: None,
             run_iterations: 0,
             run_outcome: None,
         }
@@ -789,8 +798,23 @@ impl AgentRuntime {
             ..Default::default()
         }
         .with_actor(&format!("agent:{}", self.config.role));
+        let options = self.stamp_task(options);
 
         llm.chat_stream(&messages, &options).await
+    }
+
+    /// Put the run's identity on a call's headers, when the run has one.
+    ///
+    /// The task identity is known only to whoever started the run; the
+    /// transport cannot derive it, and a table mapping components to tasks
+    /// would be wrong the moment one component serves two. A run started
+    /// without an identity makes unlabelled calls rather than a made-up one,
+    /// because a made-up id reads as a real job on the ledger.
+    fn stamp_task(&self, options: cog_core::ChatOptions) -> cog_core::ChatOptions {
+        match self.run_task_id.as_deref() {
+            Some(task) => options.with_task(task),
+            None => options,
+        }
     }
 
     /// Execute the agent loop with streaming LLM.
@@ -819,10 +843,14 @@ impl AgentRuntime {
         self.run_usage = RunUsage::default();
         self.run_iterations = 0;
         self.run_outcome = None;
+        // Set before the first call and cleared at the only exit, so a run that
+        // was started without an identity cannot inherit the previous one.
+        self.run_task_id = run_task_id.map(str::to_string);
         let started = std::time::Instant::now();
         let outcome = self.run_turns(input, llm, run_task_id).await;
         self.report_run_census(run_task_id, started.elapsed()).await;
         self.report_skill_outcome(started.elapsed()).await;
+        self.run_task_id = None;
         outcome
     }
 
@@ -1600,6 +1628,7 @@ impl AgentRuntime {
             ..Default::default()
         }
         .with_actor(&format!("agent:{}", self.config.role));
+        let options = self.stamp_task(options);
 
         // Stall-based hang protection: the clock resets on every stream event,
         // so a slow-but-alive generation is never aborted — only a connection
@@ -1788,6 +1817,7 @@ impl AgentRuntime {
             ..Default::default()
         }
         .with_actor(&format!("agent:{}", self.config.role));
+        let options = self.stamp_task(options);
 
         let reformat_timeout = Duration::from_secs(30);
         match tokio::time::timeout(reformat_timeout, llm.chat(&[user_msg], &options)).await {

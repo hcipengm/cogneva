@@ -48,20 +48,23 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
     let before = format!("usage-ledger-test-before:{}", uuid::Uuid::new_v4());
     let after = format!("usage-ledger-test-after:{}", uuid::Uuid::new_v4());
     let unpriced = format!("usage-ledger-test-unpriced:{}", uuid::Uuid::new_v4());
+    let task = format!("usage-ledger-test-task:{}", uuid::Uuid::new_v4());
 
-    let record = |actor: String, cached: u64, estimated: Option<u64>| LlmUsageRecord {
-        upstream: "ledger-test-upstream".to_string(),
-        api_style: "openai".to_string(),
-        model: "ledger-test-model".to_string(),
-        result: "ok".to_string(),
-        actor,
-        origin: "sandbox".to_string(),
-        tokens_input: 1000,
-        tokens_output: 50,
-        tokens_cached: cached,
-        estimated_input: estimated,
-        latency_ms: 12,
-    };
+    let record =
+        |actor: String, cached: u64, estimated: Option<u64>, task: Option<&str>| LlmUsageRecord {
+            upstream: "ledger-test-upstream".to_string(),
+            api_style: "openai".to_string(),
+            model: "ledger-test-model".to_string(),
+            result: "ok".to_string(),
+            actor,
+            origin: "sandbox".to_string(),
+            tokens_input: 1000,
+            tokens_output: 50,
+            tokens_cached: cached,
+            estimated_input: estimated,
+            task: task.map(str::to_string),
+            latency_ms: 12,
+        };
 
     store.init_schema().await.expect("init the schema");
 
@@ -70,11 +73,11 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
     // pass every other assertion in this file and still lose the one number the
     // ledger exists to carry.
     store
-        .record(&record(before.clone(), 800, Some(900)))
+        .record(&record(before.clone(), 800, Some(900), Some(&task)))
         .await
         .expect("record a cached call");
     let row = sqlx::query(
-        "SELECT tokens_input, tokens_output, tokens_cached, estimated_input \
+        "SELECT tokens_input, tokens_output, tokens_cached, estimated_input, task_id \
          FROM gateway_llm_usage WHERE actor = $1",
     )
     .bind(&before)
@@ -94,6 +97,12 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         "the estimate has to land on the same row as the upstream's count, or the two \
          rulers can only be read one call at a time"
     );
+    assert_eq!(
+        row.get::<Option<String>, _>("task_id"),
+        Some(task.clone()),
+        "the job identity has to survive the write under the exact string the caller \
+         used, or it cannot be joined to that run's own totals"
+    );
 
     // Second face: the table as it exists in production -- populated, and
     // without the columns. Dropping them here is what the real upgrade path does
@@ -103,7 +112,8 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
     // on: the cache column comes back with a default, the estimate column must
     // not, since "this row was never priced" is not "this row was priced at 0".
     sqlx::query(
-        "ALTER TABLE gateway_llm_usage DROP COLUMN tokens_cached, DROP COLUMN estimated_input",
+        "ALTER TABLE gateway_llm_usage DROP COLUMN tokens_cached, DROP COLUMN estimated_input, \
+         DROP COLUMN task_id",
     )
     .execute(&pool)
     .await
@@ -114,7 +124,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         .expect("re-init against a table without the columns");
 
     let row = sqlx::query(
-        "SELECT tokens_input, tokens_cached, estimated_input FROM gateway_llm_usage WHERE actor = $1",
+        "SELECT tokens_input, tokens_cached, estimated_input, task_id FROM gateway_llm_usage WHERE actor = $1",
     )
     .bind(&before)
     .fetch_one(&pool)
@@ -135,6 +145,12 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         None,
         "a row written before the estimate column existed reads NULL, not 0 -- a zero \
          would be read as a request whose prompt was empty"
+    );
+    assert_eq!(
+        row.get::<Option<String>, _>("task_id"),
+        None,
+        "a row that predates the job column is unattributed, and a placeholder would \
+         gather every such row into one job that never existed"
     );
 
     let shape = sqlx::query(
@@ -174,15 +190,15 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
     // including the estimate's own absence, which has to come back as an absence
     // rather than as the zero the reader would otherwise have to guess about.
     store
-        .record(&record(after.clone(), 640, Some(512)))
+        .record(&record(after.clone(), 640, Some(512), Some(&task)))
         .await
         .expect("record after the migration");
     store
-        .record(&record(unpriced.clone(), 0, None))
+        .record(&record(unpriced.clone(), 0, None, None))
         .await
         .expect("record a call whose path prices nothing");
     let row = sqlx::query(
-        "SELECT tokens_cached, estimated_input FROM gateway_llm_usage WHERE actor = $1",
+        "SELECT tokens_cached, estimated_input, task_id FROM gateway_llm_usage WHERE actor = $1",
     )
     .bind(&after)
     .fetch_one(&pool)
@@ -190,15 +206,23 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
     .expect("read the post-migration call back");
     assert_eq!(row.get::<i64, _>("tokens_cached"), 640);
     assert_eq!(row.get::<Option<i64>, _>("estimated_input"), Some(512));
-    let row = sqlx::query("SELECT estimated_input FROM gateway_llm_usage WHERE actor = $1")
-        .bind(&unpriced)
-        .fetch_one(&pool)
-        .await
-        .expect("read the unpriced call back");
+    assert_eq!(row.get::<Option<String>, _>("task_id"), Some(task.clone()));
+    let row =
+        sqlx::query("SELECT estimated_input, task_id FROM gateway_llm_usage WHERE actor = $1")
+            .bind(&unpriced)
+            .fetch_one(&pool)
+            .await
+            .expect("read the unpriced call back");
     assert_eq!(
         row.get::<Option<i64>, _>("estimated_input"),
         None,
         "a call the writer did not price must read as absent, not as a priced zero"
+    );
+    assert_eq!(
+        row.get::<Option<String>, _>("task_id"),
+        None,
+        "a call from a path with no job identity stays unattributed; it must not borrow \
+         a neighbour's task or invent one"
     );
 
     for actor in [&before, &after, &unpriced] {

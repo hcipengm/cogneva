@@ -587,6 +587,12 @@ jobs:
       # 生产者在会话侧，不在本仓，去树里找反而是错的）。
       - name: Check LLM origin wiring
         run: bash deploy/scripts/check-llm-origin-wiring.sh
+      # token 账的第三条轴（为哪件事烧的）。前两条轴答不了「这次改动值不值」
+      # 「某个任务花了多少」，而按秒摊的配速必然在任务中途拒调用。它的坏法与上面
+      # 那条同形：头名拼错、网关不再读、或运行时新加一条 LLM 调用路径忘了盖任务
+      # 身份，账照常落行、那一列只是空着，而空读作「没声明」，与「这条轴没接」同形。
+      - name: Check LLM task wiring
+        run: bash deploy/scripts/check-llm-task-wiring.sh
 
   bootstrap-cross-platform:
     name: Bootstrap Cross-Platform Check

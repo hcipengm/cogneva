@@ -32,6 +32,21 @@ pub const LLM_ACTOR_HEADER: &str = "x-cogneva-actor";
 /// itself, and a second spelling is a second value.
 pub const LLM_ORIGIN_HEADER: &str = "x-cogneva-origin";
 
+/// Inbound header carrying the identity of the unit of work a call is spent
+/// for, alongside the actor and origin headers on the same proxied request.
+///
+/// The other two axes answer "which component" and "which environment"; neither
+/// answers "for which job". A component runs many jobs in one environment, and
+/// spend is judged per job -- was this change worth its tokens, what does one
+/// task cost -- so the caller has to say which job, because only it knows. The
+/// value is the same identity the caller reports its own per-run totals under,
+/// which is what lets the two be reconciled instead of trusted separately.
+///
+/// Absent is a supported state and means "not attributed to a job"; it must not
+/// be defaulted to a placeholder, because a placeholder would become the group
+/// every unattributed call lands in and would read as one very expensive job.
+pub const LLM_TASK_HEADER: &str = "x-cogneva-task";
+
 /// The standard header an upstream uses to say when it can serve us again.
 pub const RETRY_AFTER_HEADER: &str = "retry-after";
 
@@ -241,6 +256,22 @@ impl ChatOptions {
     pub fn with_origin(mut self, origin: &str) -> Self {
         self.headers
             .insert(LLM_ORIGIN_HEADER.to_string(), origin.to_string());
+        self
+    }
+
+    /// Declare the unit of work this call is spent for.
+    ///
+    /// Unlike the environment, this is a property of the call rather than of the
+    /// process: one process runs many jobs one after another, so the caller
+    /// states it per run and a run's calls carry the same value. Blank is
+    /// treated as undeclared -- a task id that names nothing must not become a
+    /// group of its own on the ledger.
+    pub fn with_task(mut self, task: &str) -> Self {
+        let task = task.trim();
+        if !task.is_empty() {
+            self.headers
+                .insert(LLM_TASK_HEADER.to_string(), task.to_string());
+        }
         self
     }
 }
@@ -827,6 +858,58 @@ mod structured_output_tests {
         assert!(
             matches!(err, SFError::Serialization(_)),
             "a delivered body that does not parse is a serialization failure, got: {err:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod task_header_tests {
+    use super::*;
+
+    /// The job identity is copied onto the wire unchanged, so the ledger's
+    /// column holds the exact string the caller reports its own totals under.
+    /// A normalisation here -- lowercase, a prefix, a hash -- would still look
+    /// like an id and would join to nothing.
+    #[test]
+    fn the_declared_task_travels_verbatim() {
+        let options = ChatOptions::default().with_task("ralph-pipeline-abc");
+        assert_eq!(
+            options.headers.get(LLM_TASK_HEADER).map(String::as_str),
+            Some("ralph-pipeline-abc")
+        );
+    }
+
+    /// Blank is undeclared, not a task named "": the ledger treats absent as
+    /// "not attributed", and an empty string would be a group of its own.
+    #[test]
+    fn a_blank_task_declares_nothing() {
+        for blank in ["", "   "] {
+            let options = ChatOptions::default().with_task(blank);
+            assert!(
+                !options.headers.contains_key(LLM_TASK_HEADER),
+                "a blank task must leave the header off entirely"
+            );
+        }
+    }
+
+    /// Declaring a task must not disturb the axes read beside it.
+    #[test]
+    fn actor_origin_and_task_coexist() {
+        let options = ChatOptions::default()
+            .with_actor("agent:planner")
+            .with_origin("gateway_pool")
+            .with_task("task-1");
+        assert_eq!(
+            options.headers.get(LLM_ACTOR_HEADER).map(String::as_str),
+            Some("agent:planner")
+        );
+        assert_eq!(
+            options.headers.get(LLM_ORIGIN_HEADER).map(String::as_str),
+            Some("gateway_pool")
+        );
+        assert_eq!(
+            options.headers.get(LLM_TASK_HEADER).map(String::as_str),
+            Some("task-1")
         );
     }
 }

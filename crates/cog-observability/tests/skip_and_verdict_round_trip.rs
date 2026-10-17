@@ -134,6 +134,7 @@ async fn spend(store: &LlmUsageStore, actor: &str, tokens_input: u64, tokens_out
             tokens_output,
             tokens_cached: 0,
             estimated_input: None,
+            task: None,
             latency_ms: 1,
         })
         .await
