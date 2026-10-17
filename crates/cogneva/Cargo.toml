@@ -72,6 +72,10 @@ rustls = { workspace = true }
 reqwest = { workspace = true, features = ["multipart"] }
 tar = "0.4"
 zstd = { workspace = true }
+# 评测那一列要读上游那份 `configs/mcp_servers/*.yaml`，而读它的是**发布**路径
+# （起容器里的 MCP server），不是测试——放在 dev-dependencies 里只有测试 profile 编译得过，
+# `cargo build` 会红。
+serde_yaml = "0.9"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
@@ -83,4 +87,4 @@ filetime = "0.2"
 async-trait = "0.1"
 # The delivery-manifest contract test reads workloads, containers and volume
 # mounts out of the manifests as objects, not as text.
-serde_yaml = "0.9"
+# (`serde_yaml` itself lives in [dependencies]: the eval path needs it too.)

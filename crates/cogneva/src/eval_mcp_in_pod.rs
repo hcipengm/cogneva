@@ -24,6 +24,12 @@ use cog_protocol::{McpClient, StdioTransport};
 
 use crate::eval_toolathlon::PodRuntime;
 
+/// 配置没写 `client_session_timeout_seconds` 时用的那个数。
+///
+/// 60 秒取自上游（`cfg.get("client_session_timeout_seconds", 60)`），不由调用点另定：
+/// 两个地方各定一个默认值，同一条配置就有两个超时，而慢的那一台会被读成坏的那一台。
+pub const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// 配置里那三个占位符。上游 runner 做的替换逐字就是这三个（`utils/mcp/tool_servers.py`
 /// 的 `_resolve`），所以这里是照抄它，不是自己定点什么。
 ///
@@ -197,27 +203,48 @@ impl StdioServerSpec {
                 .iter()
                 .map(|(k, v)| (k.clone(), substitute(v)))
                 .collect(),
-            cwd: self.cwd.as_deref().map(substitute),
+            // 没钉 cwd 的配置**不是**「不 cd」：上游把缺省值取成 agent_workspace 并
+            // `os.makedirs(..., exist_ok=True)`。少了这一条，那些 server 会从镜像的
+            // 工作目录（`/workspace`）起，读写的相对路径就换了一个根。
+            cwd: Some(substitute(self.cwd.as_deref().unwrap_or(agent_workspace))),
             request_timeout: self.request_timeout,
         }
     }
 
-    /// /bin/sh 在 Pod 里要执行的那条命令串。
+    /// `/bin/sh` 在 Pod 里要执行的那条命令串。
+    ///
+    /// 三件事必须与上游一致，否则同一条配置在两个口径下跑出两棵树：
+    ///
+    /// 1. **cwd 缺省是 agent_workspace**，且缺目录要建出来（上游 `os.makedirs`）。
+    /// 2. **YAML 里的 `env` 是缺省值，不是覆盖值**。上游的合并是 `{**env, **os.environ}`——
+    ///    进程环境赢，正是为了让运行期注入的 `PGHOST=…` 不被配置里的 `PG_HOST: postgres`
+    ///    压住。写成 `exec env K=V`（照抄配置）会把方向反过来，而这四个按库取数的 server
+    ///    就连到另一只库上去。
+    /// 3. **libpq 名到 `PG_*` 名的桥接在合并之后**（上游 `_pg_bridge`）：容器里有 `PGHOST`
+    ///    就让它盖掉 `PG_HOST`，无论后者来自配置还是来自进程环境。
     pub fn remote_script(&self) -> String {
         let mut script = String::new();
         if let Some(cwd) = &self.cwd {
-            script.push_str("cd ");
-            script.push_str(&sh_quote(cwd));
-            script.push_str(" && ");
+            let quoted = sh_quote(cwd);
+            // 建不出来就当场停：继续下去 server 会在另一个目录里起，而那不是一个错误，
+            // 是一份看起来正常的错数据。
+            script.push_str(&format!("mkdir -p {quoted} || exit 1\n"));
+            script.push_str(&format!("cd {quoted} || exit 1\n"));
         }
-        script.push_str("exec env");
         for (key, value) in &self.env {
-            script.push(' ');
-            script.push_str(key);
-            script.push('=');
-            script.push_str(&sh_quote(value));
+            // `${K+x}` 只在**未设**时展开为空——与「进程环境里有没有这个键」同义，
+            // 而 `${K:-…}` 会把空串也算作没有，那是另一件事。
+            script.push_str(&format!(
+                "[ -n \"${{{key}+x}}\" ] || export {key}={}\n",
+                sh_quote(value)
+            ));
         }
-        script.push(' ');
+        for (libpq, pg) in LIBPQ_TO_PG {
+            script.push_str(&format!(
+                "[ -n \"${{{libpq}+x}}\" ] && export {pg}=\"${{{libpq}}}\"\n"
+            ));
+        }
+        script.push_str("exec ");
         script.push_str(&sh_quote(&self.command));
         for arg in &self.args {
             script.push(' ');
@@ -226,6 +253,17 @@ impl StdioServerSpec {
         script
     }
 }
+
+/// 标准 libpq 变量名 → MCP server 那一侧用的 `PG_*` 名。
+///
+/// 上游 `utils/mcp/tool_servers.py` 里逐字是这五对，桥接发生在环境合并**之后**。
+const LIBPQ_TO_PG: [(&str, &str); 5] = [
+    ("PGHOST", "PG_HOST"),
+    ("PGPORT", "PG_PORT"),
+    ("PGDATABASE", "PG_DATABASE"),
+    ("PGUSER", "PG_USER"),
+    ("PGPASSWORD", "PG_PASSWORD"),
+];
 
 fn is_env_name(name: &str) -> bool {
     let mut chars = name.chars();
@@ -265,10 +303,9 @@ pub fn client_in_pod(
     pod: &str,
     container: &str,
     spec: &StdioServerSpec,
-    default_timeout: Duration,
 ) -> anyhow::Result<McpClient> {
     let (program, args) = runtime.stdio_exec_argv(pod, container, &spec.remote_script());
-    let timeout = spec.request_timeout.unwrap_or(default_timeout);
+    let timeout = spec.request_timeout.unwrap_or(DEFAULT_SESSION_TIMEOUT);
     let transport = StdioTransport::new(program, args, timeout).map_err(|e| {
         anyhow::anyhow!("cannot reach mcp server `{}` in pod {pod}: {e}", spec.name)
     })?;
@@ -401,23 +438,42 @@ cache_tools_list: true
             "/workspace/agent_workspace",
             "",
         );
-        // 一条命令串，逐字钉住：cwd 先 cd、env 经 `env` 导出、然后 exec 掉 server 自己。
+        // 逐字钉住：先建出 cwd 再进去（进不去就停），env 是**缺省值**不是覆盖值，最后 exec。
         // `exec` 是必须的——不经它，server 就是 sh 的子进程，本地关掉 stdin 时死的是 sh。
         assert_eq!(
             spec.remote_script(),
             concat!(
-                "cd '/workspace/agent_workspace' && exec env ",
-                "OPENAPI_MCP_HEADERS='{\"Authorization\": \"Bearer ntn-placeholder\"}' ",
-                "'node' ",
-                "'/opt/local_servers/notion-mcp-server/bin/cli.mjs' '--page-id' ''"
+                "mkdir -p '/workspace/agent_workspace' || exit 1\n",
+                "cd '/workspace/agent_workspace' || exit 1\n",
+                "[ -n \"${OPENAPI_MCP_HEADERS+x}\" ] || export OPENAPI_MCP_HEADERS=",
+                "'{\"Authorization\": \"Bearer ntn-placeholder\"}'\n",
+                "[ -n \"${PGHOST+x}\" ] && export PG_HOST=\"${PGHOST}\"\n",
+                "[ -n \"${PGPORT+x}\" ] && export PG_PORT=\"${PGPORT}\"\n",
+                "[ -n \"${PGDATABASE+x}\" ] && export PG_DATABASE=\"${PGDATABASE}\"\n",
+                "[ -n \"${PGUSER+x}\" ] && export PG_USER=\"${PGUSER}\"\n",
+                "[ -n \"${PGPASSWORD+x}\" ] && export PG_PASSWORD=\"${PGPASSWORD}\"\n",
+                "exec 'node' '/opt/local_servers/notion-mcp-server/bin/cli.mjs' '--page-id' ''"
             )
         );
-        // 没钉 cwd 的那种：不许凭空 cd 到某个目录去。
+        // 没钉 cwd 的那种**不是**不 cd：上游把缺省值取成 agent_workspace。
         let no_cwd = StdioServerSpec::from_yaml(
             "type: stdio\nname: x\nparams:\n  command: node\n  args: [a.js]\n",
         )
-        .unwrap();
-        assert_eq!(no_cwd.remote_script(), "exec env 'node' 'a.js'");
+        .unwrap()
+        .resolve_paths("/opt/local_servers", "/workspace/agent_workspace", "");
+        assert_eq!(
+            no_cwd.remote_script(),
+            concat!(
+                "mkdir -p '/workspace/agent_workspace' || exit 1\n",
+                "cd '/workspace/agent_workspace' || exit 1\n",
+                "[ -n \"${PGHOST+x}\" ] && export PG_HOST=\"${PGHOST}\"\n",
+                "[ -n \"${PGPORT+x}\" ] && export PG_PORT=\"${PGPORT}\"\n",
+                "[ -n \"${PGDATABASE+x}\" ] && export PG_DATABASE=\"${PGDATABASE}\"\n",
+                "[ -n \"${PGUSER+x}\" ] && export PG_USER=\"${PGUSER}\"\n",
+                "[ -n \"${PGPASSWORD+x}\" ] && export PG_PASSWORD=\"${PGPASSWORD}\"\n",
+                "exec 'node' 'a.js'"
+            )
+        );
     }
 
     /// 逐字钉住跨进 Pod 的那条 argv——它是本模块唯一交给外部的形状。
@@ -431,7 +487,7 @@ cache_tools_list: true
             "cogneva",
         );
         let spec = StdioServerSpec::from_yaml(
-            "type: stdio\nname: probe\nparams:\n  command: /bin/sh\n  args: [/tmp/server.sh, --flag, \"\"]\n  env:\n    PROBE_MARK: \"x y'z\"\n  cwd: /tmp\n",
+            "type: stdio\nname: probe\nparams:\n  command: /bin/sh\n  args: [/tmp/server.sh, --flag, \"\"]\n  env:\n    PROBE_MARK: \"x y'z\"\n    PG_HOST: postgres\n  cwd: /tmp\n",
         )
         .unwrap();
         let (program, args) = runtime.stdio_exec_argv("ta-mcp-probe", "srv", &spec.remote_script());
@@ -451,9 +507,51 @@ cache_tools_list: true
                 "--",
                 "/bin/sh",
                 "-c",
-                "cd '/tmp' && exec env PROBE_MARK='x y'\\''z' '/bin/sh' '/tmp/server.sh' '--flag' ''",
+                "mkdir -p '/tmp' || exit 1\n\
+                 cd '/tmp' || exit 1\n\
+                 [ -n \"${PROBE_MARK+x}\" ] || export PROBE_MARK='x y'\\''z'\n\
+                 [ -n \"${PG_HOST+x}\" ] || export PG_HOST='postgres'\n\
+                 [ -n \"${PGHOST+x}\" ] && export PG_HOST=\"${PGHOST}\"\n\
+                 [ -n \"${PGPORT+x}\" ] && export PG_PORT=\"${PGPORT}\"\n\
+                 [ -n \"${PGDATABASE+x}\" ] && export PG_DATABASE=\"${PGDATABASE}\"\n\
+                 [ -n \"${PGUSER+x}\" ] && export PG_USER=\"${PGUSER}\"\n\
+                 [ -n \"${PGPASSWORD+x}\" ] && export PG_PASSWORD=\"${PGPASSWORD}\"\n\
+                 exec '/bin/sh' '/tmp/server.sh' '--flag' ''",
             ]
         );
-        eprintln!("PROBE_ARGV: {program} {}", args.join(" "));
+        // 印成 JSON：现场那条探针命令要由它**逐字**生成，多行脚本在 `join(" ")` 里读不回来。
+        let mut argv = vec![program.clone()];
+        argv.extend(args.iter().cloned());
+        eprintln!("PROBE_ARGV_JSON: {}", serde_json::to_string(&argv).unwrap());
+    }
+
+    /// YAML 里的 `env` 是**缺省值**，进程环境赢；libpq 名在合并之后盖掉 `PG_*`。
+    ///
+    /// 这条不是照抄一段实现，是照抄上游那一份合并顺序——反过来写会让四个按库取数的
+    /// server 拿到配置里的 `PG_HOST: postgres`，而 Pod 里没有叫这个名字的东西。
+    #[test]
+    fn the_server_env_is_a_default_and_the_process_env_wins() {
+        let script = StdioServerSpec::from_yaml(
+            "type: stdio\nname: x\nparams:\n  command: c\n  env:\n    PG_HOST: postgres\n    PG_DATABASE: toolathlon\n",
+        )
+        .unwrap()
+        .resolve_paths("/a", "/w", "")
+        .remote_script();
+        // 缺省先落，且是「未设才落」——`${K+x}` 对空串也算「已设」，与 dict 合并同义。
+        assert!(script.contains("[ -n \"${PG_HOST+x}\" ] || export PG_HOST='postgres'\n"));
+        // 桥接在后面，所以库那侧给的 `PGHOST` 能盖掉它。
+        let bridge = script.find("export PG_HOST=\"${PGHOST}\"").unwrap();
+        let default = script.find("|| export PG_HOST='postgres'").unwrap();
+        assert!(
+            bridge > default,
+            "the bridge has to run after the default:\n{script}"
+        );
+        // 五个 libpq 名一个不漏，顺序与上游那张表一致。
+        for (libpq, pg) in LIBPQ_TO_PG {
+            assert!(
+                script.contains(&format!("[ -n \"${{{libpq}+x}}\" ] && export {pg}=")),
+                "{libpq} -> {pg} missing from:\n{script}"
+            );
+        }
     }
 }
