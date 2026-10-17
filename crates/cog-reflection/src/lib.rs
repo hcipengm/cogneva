@@ -47,6 +47,7 @@ pub mod criteria_face;
 pub mod detector;
 pub mod diff_fidelity;
 pub mod discovery;
+pub mod discovery_outcome_readings;
 pub mod effectiveness;
 pub mod eval_harness;
 pub mod evolution;

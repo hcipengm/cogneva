@@ -5,6 +5,8 @@
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
+use crate::discovery_outcome_readings::{DiscoveryOutcomeReadings, OutcomeTally};
+
 /// Loop name reported through the background-loop liveness family.
 pub const MICROVM_EVOLUTION_LOOP: &str = "reflection_microvm_evolution";
 /// Loop name reported through the background-loop liveness family.
@@ -110,6 +112,13 @@ pub struct ReflectionPlugin {
     /// is created unconditionally so a deployment that runs no watcher can
     /// still say so, and the loop that arms it is what flips the role flag.
     signal_readings: Arc<crate::signal_readings::SignalWatcherReadings>,
+    /// What each round's discovery probes came back as, one series per exit.
+    /// Published in init next to the engine the loop reads; the handle lives on
+    /// the plugin so `start()` can hand it to the loop it arms there. Created
+    /// unconditionally, like the watcher readings above: a process that never
+    /// arms the loop still has an empty book, and publishing zero probes on it
+    /// is a true statement rather than a measurement nobody took.
+    discovery_outcome_readings: Arc<DiscoveryOutcomeReadings>,
     /// 被门禁拒绝的变更回流主流程那条支路的门与读数。init 建好并发布，
     /// `start()` 把编排器填进它的槽——跨插件消费只能在 start。
     rework_gate: Option<Arc<crate::change_rework::ChangeReworkGate>>,
@@ -136,6 +145,7 @@ impl ReflectionPlugin {
             registry_footprint: None,
             governance_drift: None,
             signal_readings: Arc::new(crate::signal_readings::SignalWatcherReadings::new()),
+            discovery_outcome_readings: Arc::new(DiscoveryOutcomeReadings::new()),
             rework_gate: None,
             promotion_eval_slot: Arc::new(std::sync::OnceLock::new()),
         }
@@ -484,6 +494,12 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         let engine_service: Arc<dyn cog_core::ReflectionEngine> = engine.clone();
         ctx.publish_service(engine_service);
         info!("ReflectionPlugin reflection engine published");
+
+        // 发现环九个出口的读数。发布在**这里**而不是 `start()` 里那条环旁边：
+        // 采集侧的快照是插件初始化期间抓的，从 `start()` 发布的句柄没人读——读数
+        // 会一直活在本进程里、一次都到不了抓取面，而它在抓取面上的缺席与「这条
+        // 环从来没收到过结局」逐字同形。句柄由 `start()` 交给那条环。
+        ctx.publish_observable(self.discovery_outcome_readings.clone());
 
         // 学习语料的定期复审由 `start()` 挂载，但那一步要拿到这个对象。此前
         // 它只挂在引擎上、没有任何人启动：复审循环是「谁调用谁跑」，而这份
@@ -1663,6 +1679,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     shutdown,
                     period,
                     self.pool_gate.clone(),
+                    self.discovery_outcome_readings.clone(),
                 );
                 spawn_skill_effectiveness_loop(
                     engine,
@@ -2081,31 +2098,6 @@ fn outcome_deadline(timeout_secs: u64, period: std::time::Duration) -> std::time
 /// 的覆盖位，所以是一个标了来源的数，而不是一条实测出来的界。
 const OUTCOME_QUEUE_MARGIN_ROUNDS: u32 = 3;
 
-/// 一拍里每条在册探针各走了哪个出口，一个出口一个数。
-///
-/// 不合并计数：`0 个已判` 在合并下有两种含义同形——册子是空的，和在册的全都
-/// 没带判词回来——而那两种含义指向完全不同的下一步（一个什么都不用做，一个是
-/// 「这条环没有判官」本身）。
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct OutcomeTally {
-    /// 结局带回判词且已记账。
-    pub validated: usize,
-    pub rejected: usize,
-    pub inconclusive: usize,
-    /// 结局读到了，里面没有判词。
-    pub unanswered: usize,
-    /// 任务以失败／取消收场，没有结果可读。
-    pub run_ended_without_result: usize,
-    /// 册子上的那条任务这一拍查不到了。
-    pub row_missing: usize,
-    /// 等过寿命，这条探针作废，不再等在册上。
-    pub expired: usize,
-    /// 还没结束，留在册上。
-    pub still_open: usize,
-    /// 判词读到了，学习没记进去（记录器报错）。
-    pub not_recorded: usize,
-}
-
 /// 把已经交出去的探针的结局收回来：每条只读一次，**不等它跑完**。
 ///
 /// 每轮每条探针读一次 `get_task`，读完立刻判：结局面里带着判词就交给引擎记账，
@@ -2118,6 +2110,7 @@ pub(crate) struct OutcomeTally {
 async fn settle_discovery_outcomes<G, FutG>(
     engine: &crate::ReflectionEngine,
     pending: &mut Vec<PendingProbe>,
+    readings: &DiscoveryOutcomeReadings,
     fetch: G,
 ) -> OutcomeTally
 where
@@ -2172,6 +2165,11 @@ where
         }
     }
     *pending = kept;
+    // 写在这里而不是调用点上：调用点是一个**位置**，而位置判据看不见提前 return
+    // 的控制流——这条函数只要多一支出路，那一支出路上的一拍就不会有人记账，而
+    // 读数上它长得像「这一拍什么都没有」。记账绑在产出这一份 tally 的地方，
+    // 产出与发布就没有第二次机会走散。
+    readings.record(&tally);
     tally
 }
 
@@ -2294,6 +2292,7 @@ fn spawn_discovery_loop(
     shutdown: cog_core::ShutdownSignal,
     period: std::time::Duration,
     pool_gate: Arc<PoolGate>,
+    readings: Arc<DiscoveryOutcomeReadings>,
 ) {
     // 三样在不在**先问一遍**再解构：`let … else` 的初始化式会把两个 Option 移进那个
     // 元组，else 那一支里就再也问不出它们了（这一句不是风格，是借用检查器的要求）。
@@ -2340,6 +2339,7 @@ fn spawn_discovery_loop(
             // 载荷。
             let outcome_engine = engine.clone();
             let pool_gate = pool_gate.clone();
+            let readings = readings.clone();
             let role_broker = role_broker.clone();
             let shutdown = shutdown.clone();
             let role_beat = beat.clone();
@@ -2451,11 +2451,12 @@ fn spawn_discovery_loop(
                     // 生成看的是池子（受理那一刻已过滤），与结局无关；但两件事放在同一拍
                     // 的日志里，读数才在同一个窗口上。
                     let waiting_before = pending.len();
-                    let outcomes = settle_discovery_outcomes(&outcome_engine, &mut pending, |id| {
-                        let orchestrator = orchestrator.clone();
-                        async move { orchestrator.get_task(&id).await }
-                    })
-                    .await;
+                    let outcomes =
+                        settle_discovery_outcomes(&outcome_engine, &mut pending, &readings, |id| {
+                            let orchestrator = orchestrator.clone();
+                            async move { orchestrator.get_task(&id).await }
+                        })
+                        .await;
                     if waiting_before > 0 {
                         // 一处出口、一行读数、每个出口一个数：合并成「收了 N 条」会让
                         // 「全都读到了判词」与「全都没带判词回来」逐字同形，而后者正是
@@ -5274,7 +5275,8 @@ mod tests {
             pending_probe(&probes[3], "p-unrecognized", 60),
         ];
 
-        let tally = settle_discovery_outcomes(&engine, &mut pending, |id| async move {
+        let readings = DiscoveryOutcomeReadings::new();
+        let tally = settle_discovery_outcomes(&engine, &mut pending, &readings, |id| async move {
             match id.as_str() {
                 "p-unmeasured" => Some(task_row(
                     "p-unmeasured",
@@ -5308,6 +5310,14 @@ mod tests {
                 ..Default::default()
             },
             "四个出口各一条，其余格必须是 0：多出来的那一格说明有探针走了别的路"
+        );
+        // 返回的那份 tally 与发布出去的那份必须是同一个：记账若挂在调用点上，
+        // 这一条是唯一会红的地方——上面那条断言读的是返回值，而返回值与
+        // `record` 走散恰恰是「有读数、读数没人写」这种失败的样子。
+        assert_eq!(
+            readings.last(),
+            tally,
+            "九格要同时到达抓取面，不能只在返回值上"
         );
         assert_eq!(pending.len(), 1, "只有还没结束的那条留在册上");
         assert_eq!(pending[0].task_id, "p-running");
