@@ -2032,10 +2032,11 @@ data:
         "health_check_max_retries": 6,
         "test_timeout_secs": 3600,
         "deploy_admission": {
-          "_comment": "触及 deploy/** 的变更按可执行条件准入，不转人工：chart 必须能渲染且 deploy/rendered 与 chart 一致（render-deploy.sh --check），chart 与 deploy/k3s 静态清单逐字段 parity（check-deploy-parity.sh）。两门都在应用后的树上跑，任一退出非零即拒收并点名。helm 由 Pod 内挂载的宿主二进制提供；宿主没有 helm 时这一族被点名缺条件而拒收，不退回「等人批」。服务端 dry-run 目前不声明：判定身份按 Role 只在本命名空间，dry-run 覆盖不了的集群级对象会一律报未授权，把整族误杀；扩权是属主的动作。",
+          "_comment": "触及 deploy/** 的变更按可执行条件准入，不转人工：chart 必须能渲染且 deploy/rendered 与 chart 一致（render-deploy.sh --check），chart 与 deploy/k3s 静态清单逐字段 parity（check-deploy-parity.sh），且渲染产物描述出来的控制面必须仍然可达（check-control-plane-reachability.sh：Service 的 selector 选中工作负载、targetPort 在选中的负载里声明过、工作负载 replicas 不为 0、探针按名字指的端口在同一个容器里声明过、卷引用的 PVC/ConfigMap 存在、Ingress 后端指向存在的 Service 与端口）。三门都在应用后的树上跑，任一退出非零即拒收并点名；第三条判不了的形状（没有产物、解析失败、缺 python3-yaml）退出码 2，不当 0 读。helm 由 Pod 内挂载的宿主二进制提供；宿主没有 helm 时这一族被点名缺条件而拒收，不退回「等人批」。服务端 dry-run 目前不声明：判定身份按 Role 只在本命名空间，dry-run 覆盖不了的集群级对象会一律报未授权，把整族误杀；扩权是属主的动作。",
           "commands": [
             ["bash", "deploy/scripts/render-deploy.sh", "--check"],
-            ["bash", "deploy/scripts/check-deploy-parity.sh"]
+            ["bash", "deploy/scripts/check-deploy-parity.sh"],
+            ["bash", "deploy/scripts/check-control-plane-reachability.sh"]
           ]
         },
         "build_timeout_secs": 3600,
