@@ -1767,11 +1767,13 @@ impl MemoryIngestor {
         let batch = self.config.aged_out_redrive_batch;
         // 欠账比批量深时，只从队首取会让队尾永远轮不到：每一拍都有新的欠账补进
         // 队首，界一到，最老的那条就一直排在界外——积压读数里有一截因此是死的，
-        // 而它正是「记忆静默丢失」的观测面。留四分之一给队尾，队尾每拍至少前进
-        // 一条。批量不足四条时不切：那里四分之一不足一条，抬成一条要占掉一半以
-        // 上，「新的先还」就反过来了。
-        let tail_take = if batch >= 4 && debt.len() > batch {
-            batch / 4
+        // 而它正是「记忆静默丢失」的观测面。留四分之一给队尾，但四分之一在批量小
+        // 于四条时不足一条，会退化成「一条也不留」，所以下限抬成一条：
+        // max(1, batch/4)（批量 2、3 时新的仍至少占一条，两头都走）。只有单槽
+        // （批量 1）没法同时满足两头，那里保持全给队首——「新的先还」优先，
+        // 这是唯一一个队尾仍可能被推迟的配置。
+        let tail_take = if batch >= 2 && debt.len() > batch {
+            (batch / 4).max(1)
         } else {
             0
         };
@@ -4151,6 +4153,55 @@ mod tests {
         assert!(
             re_driven.contains(&oldest.id),
             "the oldest debt must get a turn every round, got {re_driven:?}"
+        );
+    }
+
+    /// 批量小于四条时四分之一不足一条，但下限仍是一条：批量 2 时一拍里新的与
+    /// 最老的各走一条——否则「小批量配置」只是给队尾饿死换了个名字。
+    #[tokio::test]
+    async fn reconcile_keeps_a_tail_slot_when_the_batch_is_small() {
+        let backend = Arc::new(MemoryMemoryBackend::new());
+        let now = Utc::now();
+        let newest_debt = transcript_raw_at("debt-0", now - chrono::Duration::hours(48));
+        backend.archive_raw(&newest_debt).await.unwrap();
+        for i in 1..5 {
+            backend
+                .archive_raw(&transcript_raw_at(
+                    &format!("debt-{i}"),
+                    now - chrono::Duration::hours(48 + i),
+                ))
+                .await
+                .unwrap();
+        }
+        let oldest = transcript_raw_at("oldest", now - chrono::Duration::hours(96));
+        backend.archive_raw(&oldest).await.unwrap();
+
+        let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(RuleBasedExtractor::new()))
+            .with_config(MemoryIngestorConfig {
+                aged_out_redrive_batch: 2,
+                ..MemoryIngestorConfig::default()
+            });
+
+        let (job_tx, mut job_rx) = mpsc::unbounded_channel();
+        let backlog = std::sync::atomic::AtomicUsize::new(0);
+        ingestor.reconcile(&job_tx, &backlog, true).await;
+
+        let mut re_driven = Vec::new();
+        while let Ok(job) = job_rx.try_recv() {
+            re_driven.push(job.raw.id);
+        }
+        assert_eq!(
+            re_driven.len(),
+            2,
+            "the batch is still the cap; the floor is one slot, not one more slot"
+        );
+        assert!(
+            re_driven.contains(&oldest.id),
+            "a batch of two must still give the tail its one slot, got {re_driven:?}"
+        );
+        assert!(
+            re_driven.contains(&newest_debt.id),
+            "and the newest debt keeps the other slot, got {re_driven:?}"
         );
     }
 
