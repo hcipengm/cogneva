@@ -1,3 +1,5 @@
+//! principle: feedback_a_migration_version_is_a_namespace_the_runner_keys_on
+//!
 //! One version number, one migration -- and one set of them per dialect.
 //!
 //! The runner decides what to apply by version alone: it reads

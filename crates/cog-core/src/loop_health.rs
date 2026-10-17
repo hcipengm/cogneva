@@ -1,3 +1,5 @@
+//! principle: feedback_a_deliberate_yield_needs_its_state_in_the_series_the_rule_reads
+//!
 //! Which background loops this process started, and whether they are still
 //! running.
 //!

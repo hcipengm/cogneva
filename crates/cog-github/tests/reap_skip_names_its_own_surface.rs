@@ -1,3 +1,5 @@
+//! principle: feedback_making_a_skip_readable_must_not_loosen_the_guard_that_caused_it
+//!
 //! Gate: a round that cannot reap assess verdicts must say *which* of the three
 //! reasons stopped it, on a channel this platform collects.
 //!
