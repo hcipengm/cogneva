@@ -109,14 +109,18 @@ const PG_READY_DEADLINE_SECS: u64 = 300;
 
 /// pack 容器（跑题的那一个）的 limits。**这两个数是被额度逼出来的，不是拍的**：
 /// 命名空间的 `ResourceQuota` 按 limits 求和，而平台的常驻服务已经占掉其中七成半
-/// （实测 18100m / 23 CPU、41.6 / 46 GiB），剩下的只够一台这么宽的 Pod。
+/// （实测 18100m / 23 CPU、41.6 / 46 GiB），剩不到 5 CPU / 4.4 GiB。
 /// 超过它就是 API server 直接 403，一题都跑不起来——比「跑得慢」更糟，所以这里取余量，
-/// 不取「这道题最多能用多少」。两个值成对给：单独抬一个只会换一种方式撞墙。
-/// 缺省值来自一次真跑：3 CPU / 3 GiB 的 Pod 里，一道真题的 `preprocess/main.py` 6 秒、
-/// `evaluation/main.py` 2 秒跑完。
+/// 不取「这道题最多能用多少」：pack 2 CPU ＋ sidecar 1 CPU ＝ 3 CPU，剩下的额度还容得下
+/// 第二台 Pod 同时跑，而按 4 CPU 写就只容得下一台。两个值成对给：单独抬一个只会换一种
+/// 方式撞墙。
+/// 内存 3 GiB 有真跑支撑：3 GiB 的 Pod 里一道真题的 `preprocess/main.py` 6 秒、
+/// `evaluation/main.py` 2 秒跑完。CPU 没有同等的读数——那次跑的是 3 CPU 的 Pod，
+/// 2 CPU 是按「跑得动同一类脚本」外推的上界，不是量出来的下界。
 const DEFAULT_PACK_CPU_LIMIT: &str = "2";
 const DEFAULT_PACK_MEMORY_LIMIT: &str = "3Gi";
-/// postgres sidecar 的 limits。它只装一道题要用的那点数据，2 CPU 从来没有被用满过。
+/// postgres sidecar 的 limits。它只装一道题要用的那点数据，1 CPU / 1 GiB 与探针同一档——
+/// 探针那台在 1 CPU 下把一道真题的库初始化跑完了。
 const DEFAULT_PG_CPU_LIMIT: &str = "1";
 const DEFAULT_PG_MEMORY_LIMIT: &str = "1Gi";
 
