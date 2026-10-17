@@ -259,18 +259,18 @@ const GAPS_AT_SCRAPE_CENSUS: usize = 9;
 /// reading that parses the queries does not. That is the difference between the
 /// two, measured on the first run of this test.
 ///
-/// Seventeen, and the nine added at once are the discovery loop's per-exit
-/// counts. They arrive together because the family arrives together: the loop
-/// has always distinguished these nine exits and the counts reached a reader
-/// once per round through one `info!` line, so the whole family is registered
-/// in the dashboard contract's table in the round that publishes them. Nothing
-/// draws them yet -- the re-measure recipe next to the probe deadline is a
-/// procedure rather than a rule -- and no threshold is derivable until the
-/// first rounds put probes on the books, which is why they are registered here
-/// rather than filed as gaps: the face they are owed is a reader of the
-/// population, and naming the producer is what keeps them from drifting apart
-/// while that reader is written.
-const REGISTERED_BUT_UNREAD_AT_CENSUS: usize = 17;
+/// Seventeen once, and the nine that took it there were the discovery loop's
+/// per-exit counts. They arrived together because the family arrives together,
+/// and they arrived registered rather than filed as gaps: a series newly on the
+/// wire is owed a reader of the population, and naming its producer is what
+/// keeps the nine from drifting apart while that reader is written. The reader
+/// exists now -- the dashboard's "Discovery Probe Exits" panel draws the nine
+/// against each other, which is the reading the re-measure recipe next to the
+/// probe deadline asks for -- so they leave this count together, the way they
+/// joined it. Their rows stay in the produced table, because a panel reading a
+/// series is exactly what that table licenses. Eight again, and the eighth is
+/// still the prose-versus-query distinction above.
+const REGISTERED_BUT_UNREAD_AT_CENSUS: usize = 8;
 
 #[test]
 fn every_series_a_build_can_render_is_on_a_face_or_has_a_verdict() {

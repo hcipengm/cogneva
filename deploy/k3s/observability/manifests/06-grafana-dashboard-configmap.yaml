@@ -1807,6 +1807,101 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 46,
+          "title": "Discovery Probe Exits",
+          "description": "Each series is one exit of the discovery loop's round: how many probes on the books ended that way in the latest round. The counts are that round's book rather than a running total, so a quiet round draws zeros even when earlier rounds judged probes -- read the shape, not the area. `still open` standing above zero round after round is the finding this panel exists for: a probe's lifetime is supposed to retire it, so a book that never drains means expiry is not retiring what it should. `row missing` and `not recorded` are the two ways the loop itself failed to do its job.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 200
+          },
+          "targets": [
+            {
+              "expr": "cogneva_discovery_probe_validated",
+              "legendFormat": "validated",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_discovery_probe_rejected",
+              "legendFormat": "rejected",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_discovery_probe_inconclusive",
+              "legendFormat": "inconclusive",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_discovery_probe_unanswered",
+              "legendFormat": "unanswered",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_discovery_probe_run_ended_without_result",
+              "legendFormat": "run ended without result",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_discovery_probe_row_missing",
+              "legendFormat": "row missing",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_discovery_probe_expired",
+              "legendFormat": "expired",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_discovery_probe_still_open",
+              "legendFormat": "still open",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_discovery_probe_not_recorded",
+              "legendFormat": "not recorded",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {
