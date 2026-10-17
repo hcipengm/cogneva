@@ -2466,8 +2466,11 @@ impl MainlineDeployer {
         api_base: &str,
         repo: &str,
         rev: &str,
-    ) -> (Option<bool>, Option<CiNoVerdictReason>) {
+    ) -> (Option<bool>, Option<CiNoVerdictReason>, Vec<String>) {
         let mut conclusions: Vec<String> = Vec::new();
+        // 报失败的那几条检查的名字。日志只说「有一项」时，定位要绕到仓库外去问；
+        // 名字在这一次读里就有，不带出去等于把已经拿到的东西丢掉。
+        let mut failed_checks: Vec<String> = Vec::new();
         let mut saw_signal = false;
         let mut pending = false;
         // 原因由这一段的形状决定（读到内容 / 读失败），没有"默认值"这种中间态：
@@ -2482,7 +2485,16 @@ impl MainlineDeployer {
                     for run in runs {
                         saw_signal = true;
                         match run.get("conclusion").and_then(|c| c.as_str()) {
-                            Some(c) => conclusions.push(c.to_string()),
+                            Some(c) => {
+                                conclusions.push(c.to_string());
+                                if matches!(c, "failure" | "error") {
+                                    if let Some(name) = run.get("name").and_then(|n| n.as_str()) {
+                                        if !name.is_empty() {
+                                            failed_checks.push(name.to_string());
+                                        }
+                                    }
+                                }
+                            }
                             // 结论为 null = 这条检查还在跑。此刻下结论等于拿半个结果判死刑。
                             None => pending = true,
                         }
@@ -2499,7 +2511,7 @@ impl MainlineDeployer {
         if let Some(verdict) =
             cog_core::contract::ci::fold_ci_signals(saw_signal, pending, &conclusions)
         {
-            return (Some(verdict), None);
+            return (Some(verdict), None, failed_checks);
         }
         // 只用提交状态上报 CI 的仓库（没有 check runs），与落地通道同一条兜底。
         if let Ok(status) = self
@@ -2507,8 +2519,8 @@ impl MainlineDeployer {
             .await
         {
             match status.get("state").and_then(|s| s.as_str()) {
-                Some("success") => return (Some(true), None),
-                Some("failure") | Some("error") => return (Some(false), None),
+                Some("success") => return (Some(true), None, failed_checks),
+                Some("failure") | Some("error") => return (Some(false), None, failed_checks),
                 // 接口答了、状态字段却不可判。只有 check-runs 那边本来就什么也没说时才
                 // 换成这一格：两边都没给出可判的东西，这一格比 `no_runs` 更贴近实情。
                 // 反过来说，check-runs 说的是"还在跑"时不让它覆盖——那是两种话里更准的那个。
@@ -2518,7 +2530,7 @@ impl MainlineDeployer {
                 _ => {}
             }
         }
-        (None, Some(reason))
+        (None, Some(reason), failed_checks)
     }
 
     /// 要滚的这个 rev 在上游各平台的 CI 结论。`Some(false)` = 至少一个平台
@@ -2538,8 +2550,14 @@ impl MainlineDeployer {
     /// **结构上**就不会回答 check-runs，于是它的沉默是每一轮都加一的常数。常数本身
     /// 没有信息，却会把另一端真实的同名原因淹掉——不带平台时，读的人只能靠
     /// 「一轮里几条」去猜是哪一条在沉默。
-    async fn ci_verdict_for_rev(&self, rev: &str) -> Option<bool> {
+    /// 要滚的这个 rev 在上游各平台的 CI 结论，连同报失败的那几条检查的名字。
+    ///
+    /// 名字带平台前缀：同一次判据会把两端镜像仓库的检查折在一起，而两个仓库上同名的
+    /// 检查是两件事。名字只在有 check runs 时才有；结论来自提交状态兜底时它是空的——
+    /// 空不等于「没有失败项」，它等于「这个平台上没有可命名的检查」。
+    async fn ci_verdict_with_failures(&self, rev: &str) -> (Option<bool>, Vec<String>) {
         let mut verdicts = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
         let mut reasons: Vec<(&'static str, CiNoVerdictReason)> = Vec::new();
         for up in &self.cfg.upstreams {
             let platform = up.platform.slug();
@@ -2555,7 +2573,8 @@ impl MainlineDeployer {
                 continue;
             };
             let repo = up.repo.trim().trim_end_matches(".git");
-            let (verdict, reason) = self.platform_ci_verdict(base, repo, rev).await;
+            let (verdict, reason, names) = self.platform_ci_verdict(base, repo, rev).await;
+            failed.extend(names.into_iter().map(|n| format!("{platform}:{n}")));
             if let Some(v) = verdict {
                 verdicts.push(v);
             }
@@ -2574,7 +2593,7 @@ impl MainlineDeployer {
         if verdict.is_none() {
             self.record_ci_verdict_reason_reading(&reasons).await;
         }
-        verdict
+        (verdict, failed)
     }
 
     /// 上游 CI 已经给出明确的失败结论就扣住这个 rev；`Ok(true)` = 扣住了。
@@ -2599,12 +2618,20 @@ impl MainlineDeployer {
         state: &mut MainlineState,
         rev: &str,
     ) -> SFResult<bool> {
-        if self.ci_verdict_for_rev(rev).await != Some(false) {
+        let (verdict, failed_checks) = self.ci_verdict_with_failures(rev).await;
+        if verdict != Some(false) {
             self.record_ci_hold_reading(0).await;
             return Ok(false);
         }
         warn!(
             rev = %rev12(rev),
+            // 只说「有一项」的日志把定位推到仓库外去问；名字在这一次读里就有。
+            // 空列表是「结论来自提交状态兜底」，不是「没有失败项」。
+            failed_checks = %if failed_checks.is_empty() {
+                "<unnamed: no check runs>".to_string()
+            } else {
+                failed_checks.join(",")
+            },
             "upstream CI reports a failure for this rev; holding the rollout"
         );
         let now = chrono::Utc::now().timestamp();
@@ -10109,7 +10136,10 @@ exit 0
         cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
 
-        assert_eq!(deployer.ci_verdict_for_rev("abc123").await, Some(false));
+        assert_eq!(
+            deployer.ci_verdict_with_failures("abc123").await.0,
+            Some(false)
+        );
 
         let reqs = handle.await.unwrap();
         assert!(
@@ -10117,6 +10147,29 @@ exit 0
             "{:?}",
             reqs[0]
         );
+    }
+
+    /// 报失败的那几条检查的名字要跟着结论一起回来。只有布尔的那一版把定位推到
+    /// 仓库外（去读 check-runs 才知道是哪一项），而名字本来就在同一份响应里。
+    /// 平台前缀是必需的：两端的检查折在一次判据里，同名但是两件事。
+    #[tokio::test]
+    async fn ci_verdict_names_the_checks_that_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (endpoint, handle) = fake_registry(vec![http_200(
+            r#"{"check_runs":[{"name":"Clippy","conclusion":"failure"},{"name":"Test","conclusion":"success"}]}"#,
+        )])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+
+        let (verdict, failed) = deployer.ci_verdict_with_failures("abc123").await;
+        assert_eq!(verdict, Some(false));
+        // 只有报失败的那一条，且带平台前缀；成功的那条不进这一列。
+        assert_eq!(failed, vec!["github:Clippy".to_string()]);
+        let _ = handle.await.unwrap();
     }
 
     #[tokio::test]
@@ -10133,7 +10186,7 @@ exit 0
         cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
 
-        assert_eq!(deployer.ci_verdict_for_rev("abc123").await, None);
+        assert_eq!(deployer.ci_verdict_with_failures("abc123").await.0, None);
 
         // 检查还在跑时问不出结论，于是退到提交状态兜底这条路径上。
         let reqs = handle.await.unwrap();
@@ -10152,14 +10205,14 @@ exit 0
         // 没配基址：不发请求，也不判失败。
         let cfg = upstream_config(root, Path::new("/nonexistent"));
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
-        assert_eq!(deployer.ci_verdict_for_rev("abc123").await, None);
+        assert_eq!(deployer.ci_verdict_with_failures("abc123").await.0, None);
 
         // 配了但连不上：同样按没证据处理。
         let mut cfg = upstream_config(root, Path::new("/nonexistent"));
         cfg.upstreams.truncate(1);
         cfg.upstreams[0].api_base = Some("http://127.0.0.1:1/github".into());
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
-        assert_eq!(deployer.ci_verdict_for_rev("abc123").await, None);
+        assert_eq!(deployer.ci_verdict_with_failures("abc123").await.0, None);
     }
 
     /// 扣住的时长是这条读数的全部内容。
@@ -10266,7 +10319,7 @@ exit 0
         cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
             .with_metrics(metrics.clone());
-        assert_eq!(deployer.ci_verdict_for_rev("aaa").await, Some(true));
+        assert_eq!(deployer.ci_verdict_with_failures("aaa").await.0, Some(true));
         handle.await.unwrap();
 
         // 读到一条判死的。
@@ -10279,7 +10332,10 @@ exit 0
         cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
             .with_metrics(metrics.clone());
-        assert_eq!(deployer.ci_verdict_for_rev("bbb").await, Some(false));
+        assert_eq!(
+            deployer.ci_verdict_with_failures("bbb").await.0,
+            Some(false)
+        );
         handle.await.unwrap();
 
         // 平台不可达：没有证据。
@@ -10288,7 +10344,7 @@ exit 0
         cfg.upstreams[0].api_base = Some("http://127.0.0.1:1/github".into());
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
             .with_metrics(metrics.clone());
-        assert_eq!(deployer.ci_verdict_for_rev("ccc").await, None);
+        assert_eq!(deployer.ci_verdict_with_failures("ccc").await.0, None);
 
         let rows = metrics
             .query_counter_totals(MAINLINE_CI_VERDICT_TOTAL.as_str())
@@ -10398,14 +10454,14 @@ exit 0
         ])
         .await;
         let deployer = asks(&format!("http://{endpoint}/github"), &metrics);
-        assert_eq!(deployer.ci_verdict_for_rev("aaa").await, None);
+        assert_eq!(deployer.ci_verdict_with_failures("aaa").await.0, None);
         handle.await.unwrap();
 
         // 问到了、一条检查都没有：这是"没有东西"，不是"没问到"。
         let (endpoint, handle) =
             fake_registry(vec![http_200(r#"{"check_runs":[]}"#), HTTP_404.to_string()]).await;
         let deployer = asks(&format!("http://{endpoint}/github"), &metrics);
-        assert_eq!(deployer.ci_verdict_for_rev("bbb").await, None);
+        assert_eq!(deployer.ci_verdict_with_failures("bbb").await.0, None);
         handle.await.unwrap();
 
         // 兜底那条接口也答不出可判的东西：两处都没结论，这一格比"没有检查"更贴近实情。
@@ -10415,14 +10471,14 @@ exit 0
         ])
         .await;
         let deployer = asks(&format!("http://{endpoint}/github"), &metrics);
-        assert_eq!(deployer.ci_verdict_for_rev("ccc").await, None);
+        assert_eq!(deployer.ci_verdict_with_failures("ccc").await.0, None);
         handle.await.unwrap();
 
         // 凭证被拒（403 也含二级限流）：主人是网关那一侧的凭证。
         let (endpoint, handle) =
             fake_registry(vec![http_status(403, "Forbidden"), HTTP_404.to_string()]).await;
         let deployer = asks(&format!("http://{endpoint}/github"), &metrics);
-        assert_eq!(deployer.ci_verdict_for_rev("ddd").await, None);
+        assert_eq!(deployer.ci_verdict_with_failures("ddd").await.0, None);
         handle.await.unwrap();
 
         // 200 回来了、body 不是 JSON：响应在途中被弄坏了，主人在代理这一段。
@@ -10432,12 +10488,12 @@ exit 0
         ])
         .await;
         let deployer = asks(&format!("http://{endpoint}/github"), &metrics);
-        assert_eq!(deployer.ci_verdict_for_rev("eee").await, None);
+        assert_eq!(deployer.ci_verdict_with_failures("eee").await.0, None);
         handle.await.unwrap();
 
         // 配了这个上游却没给基址：一个请求都不会发出去，主人是配置面。
         let deployer = asks("   ", &metrics);
-        assert_eq!(deployer.ci_verdict_for_rev("fff").await, None);
+        assert_eq!(deployer.ci_verdict_with_failures("fff").await.0, None);
 
         // 一轮里两条上游都没说话：原因各记一次，各带自己的平台。这个倍数是可核的，
         // 但只自上游列表最后一次变更起成立。
@@ -10446,7 +10502,7 @@ exit 0
         cfg.upstreams[1].api_base = Some("http://127.0.0.1:1/gitee".into());
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
             .with_metrics(metrics.clone());
-        assert_eq!(deployer.ci_verdict_for_rev("ggg").await, None);
+        assert_eq!(deployer.ci_verdict_with_failures("ggg").await.0, None);
 
         let rows = metrics
             .query_counter_totals(MAINLINE_CI_NO_VERDICT_REASON_TOTAL.as_str())
