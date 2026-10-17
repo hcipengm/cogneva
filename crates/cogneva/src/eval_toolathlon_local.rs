@@ -401,8 +401,9 @@ mod tests {
         );
         assert!(out.contains("Return code: 0"), "{out}");
 
-        // 25000 字符 → 三页；第一页末尾不能是整段。
-        let long: String = (0..2500).map(|i| format!("{i:04}")).collect();
+        // 25000 字符 → 三页（每段 4 字符，所以要 6250 段；写 2500 段只有 10000 字符，
+        // 正好一页，翻页那三条断言会对着「page 3/1」红）。
+        let long: String = (0..6250).map(|i| format!("{i:04}")).collect();
         let saved = tools
             .call(
                 "save_overlong_output",
