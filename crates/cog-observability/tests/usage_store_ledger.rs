@@ -292,6 +292,21 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
     held.upstream = upstream.clone();
     held.result = "refused_by_pace".to_string();
     store.record(&held).await.expect("record a paced refusal");
+    // Put the served call in the second half of its second, ten seconds back so
+    // it still precedes the wall below. The instant a reading hands back has to
+    // contain the row it names: a cast that rounds to the nearest second puts
+    // this row *after* its own instant, and a reader summing from there loses
+    // it. Placing it deliberately makes that failure red on every run instead
+    // of on whichever runs happen to land past the half-second.
+    sqlx::query(
+        "UPDATE gateway_llm_usage \
+            SET ts = date_trunc('second', NOW()) - interval '10 seconds' + interval '0.9 seconds' \
+          WHERE actor = $1 AND result = 'ok'",
+    )
+    .bind(&paced_task)
+    .execute(&pool)
+    .await
+    .expect("place the served call in the second half of a second");
     let mut wall = record(
         "unrelated-actor".to_string(),
         0,
