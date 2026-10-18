@@ -959,8 +959,9 @@ pub async fn swe_pro_container_backend(
     let Some(runtime) = BuildahRuntime::detect().await.map_err(|e| e.to_string())? else {
         return Err(format!(
             "no container machine is usable on this host: this column runs each instance in its own \
-             image, and no `buildah` (tried `sudo -n buildah` then `buildah`) answered; point \
-             `{ENV_BUILDAH}` at one if it lives elsewhere"
+             image, and no `buildah` (tried `sudo -n buildah` then `buildah`) started a probe \
+             container — a binary that answers is not enough, the probe runs the same verb the \
+             column needs; point `{ENV_BUILDAH}` at one if it lives elsewhere"
         ));
     };
     let scripts_root = data_root.join(SWE_PRO_RUN_SCRIPTS_DIR);

@@ -1700,7 +1700,8 @@ async fn wiring_from_config(args: &EvalTableArgs) -> Wiring {
         Ok(Some(backend)) => wiring.toolathlon = Some(Arc::new(backend)),
         Ok(None) => {
             wiring.toolathlon_reason = Some(
-                "this host has no pod runtime the backend can drive: no `kubectl` answered, or \
+                "this host has no pod runtime the backend can drive: no `kubectl` could be shown \
+                 to be allowed to create pods (tried `sudo -n kubectl` then `kubectl`), or \
                  COGNEVA_EVAL_TOOLATHLON_RUNTIME is set to off"
                     .to_string(),
             )
