@@ -1417,13 +1417,15 @@ struct CiHold {
 /// `cogneva_mainline_ci_verdict_total` 的三个累计值不带 rev，滚动 Job 的日志里也没有
 /// 这一行（判词在进化 Pod 里算，Job 只负责 apply），而这个 Pod 自己的日志随滚动消失。
 /// 于是"这一版是判过才滚的，还是上游没给结论就放行的"在落地之后没有按 rev 可读的
-/// 载体。这一格就是那个载体：rev、判词、以及 `no_evidence` 时逐上游的原因。
+/// 载体。这一格就是那个载体：rev、判词、以及逐上游没给出结论的原因（与结论可以并存）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct CiVerdictRecord {
     rev: String,
     /// 闭集：`pass`（至少一条上游明确通过）/ `fail`（任一上游报失败）/ `no_evidence`。
     verdict: String,
-    /// 只在 `no_evidence` 时非空，形如 `<platform>:<reason>`，与原因计数器同一套取值域。
+    /// 逐上游的「这一版拿不到结论」原因，形如 `<platform>:<reason>`，与原因计数器同一套
+    /// 取值域。它与结论**可以并存**：一端给出通过、另一端这一版还没有任何运行记录时，
+    /// 判词是 `pass` 而这里带着另一端的 `no_runs`——两件都是事实，别把非空读成「没判过」。
     #[serde(default)]
     reasons: Vec<String>,
     /// 做出这个判词的时刻，unix 秒。
