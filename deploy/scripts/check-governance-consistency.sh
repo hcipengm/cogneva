@@ -327,11 +327,13 @@ for face, quota_key, unit in (('requests', 'requests.cpu', 'cpu'),
     # 存在已经把准入提前顶穿过一次，所以它进判词而不是只进说明。
     if face == 'limits':
         if isinstance(runtime_pods, dict) and 'error' in runtime_pods:
-            errors.append(
+            msg = (
                 f"ResourceQuota 缺少注解 {runtime_pods['error']}：运行期按需建的 Pod"
                 f"（评测台、验收演练）同样记在这只配额的 used 上，它的预算没有别的"
                 f"声明处；缺了就无从核「额度替它留够没有」。没有这类 Pod 也要写成 0，"
                 f"不要留空——留空在这里读作缺声明，不读作零")
+            if msg not in errors:
+                errors.append(msg)
         elif runtime_pods:
             ann_key = 'cogneva.io/runtime-pods-limits-' + unit
             budget = qty(runtime_pods[unit])
