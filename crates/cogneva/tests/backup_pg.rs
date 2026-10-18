@@ -201,3 +201,116 @@ async fn pg_backup_restore_round_trips_rows_partitions_and_sequences() {
         sqlx::query(&stmt).execute(&pool).await.unwrap();
     }
 }
+
+/// 旧导出写的包：表头里有生成列。
+///
+/// 保留窗口里的每一份包都是这个形状（导出改成点名搬迁列之前写的）。装载语句
+/// 不能把生成列点进去（`COPY` 直接拒），也不能把它的值留在流里改成按位置对齐
+/// （整表错位）——只能进临时表中转，再按「非生成列」搬进目标表。
+#[tokio::test]
+#[ignore = "requires COGNEVA_TEST_DATABASE_URL pointing at a live PostgreSQL"]
+async fn pg_restore_loads_a_package_that_still_carries_the_generated_column() {
+    // 这张表不叫 COMPUTED：`cargo test` 默认并行，而 `fresh_schema` 会先 DROP
+    // 另外两个探针表。共用一个库的两个用例各自建自己的表，「同一个库」才不等于
+    // 「同一张表」——撞表会表现成一次跟被测代码无关的建表失败。
+    const LEGACY: &str = "backup_probe_legacy_computed";
+    let pool = PgPool::connect(&database_url()).await.unwrap();
+    for stmt in [
+        format!("DROP TABLE IF EXISTS {LEGACY} CASCADE"),
+        format!(
+            "CREATE TABLE {LEGACY} (id BIGSERIAL PRIMARY KEY, half INTEGER NOT NULL, \
+             doubled INTEGER GENERATED ALWAYS AS (half * 2) STORED)"
+        ),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let pg_dir = dir.path().join("pg");
+    std::fs::create_dir_all(&pg_dir).unwrap();
+    // 旧导出的形状：`SELECT *` 把目标自己算的 `doubled` 也写进了包。
+    std::fs::write(
+        pg_dir.join(format!("public.{LEGACY}.csv")),
+        "id,half,doubled\n1,2,4\n2,3,6\n",
+    )
+    .unwrap();
+
+    let restored = restore_postgres(&pool, &pg_dir).await.unwrap();
+    assert_eq!(restored, vec![LEGACY.to_string()]);
+    assert_eq!(count_in(&pool, LEGACY).await, 2, "整包的行数必须回来");
+
+    // 包内的 id 与 half 原样，`doubled` 由目标按同一行重算——不搬它不丢数据。
+    let rows: Vec<(i64, i32, i32)> = sqlx::query_as(&format!(
+        "SELECT id, half, doubled FROM {LEGACY} ORDER BY id"
+    ))
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, vec![(1, 2, 4), (2, 3, 6)]);
+
+    sqlx::query(&format!("DROP TABLE IF EXISTS {LEGACY} CASCADE"))
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+/// 用保留窗口里**真实存在**的一份包验收恢复路径。
+///
+/// 上面那个用例的包是我自己按旧形状写出来的，它只证明「这条路径认得这个形状」，
+/// 证明不了「这一晚之前写的包装得回来」。真正的验收必须拿一个真包跑：包里有这个
+/// 镜像不认识的分区子表、有当前 DDL 之后才加的列、有导出改成点名搬迁列之前留下的
+/// 生成列。所以这个用例的输入由外部给，不自己造。
+///
+/// ```text
+/// COGNEVA_TEST_DATABASE_URL=postgres://…/cog_restore_probe \
+/// COGNEVA_TEST_PACKAGE_PG_DIR=/tmp/pkg/pg \
+/// COGNEVA_TEST_PACKAGE_MANIFEST=/tmp/pkg/manifest.json \
+///   cargo test -p cogneva --test backup_pg -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "requires COGNEVA_TEST_DATABASE_URL, COGNEVA_TEST_PACKAGE_PG_DIR and COGNEVA_TEST_PACKAGE_MANIFEST"]
+async fn pg_restore_loads_a_package_written_before_the_schema_moved_on() {
+    use cogneva::backup::BackupManifest;
+
+    let url = database_url();
+    let pg_dir = std::env::var("COGNEVA_TEST_PACKAGE_PG_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("set COGNEVA_TEST_PACKAGE_PG_DIR to the pg/ directory of an extracted package");
+    let manifest_path = std::env::var("COGNEVA_TEST_PACKAGE_MANIFEST")
+        .map(std::path::PathBuf::from)
+        .expect("set COGNEVA_TEST_PACKAGE_MANIFEST to that package's manifest.json");
+    let manifest: BackupManifest =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+
+    // 目标库必须是**这个镜像**自己的结构，而不是备份那一刻的结构：恢复只做
+    // TRUNCATE + COPY，空库的形状先由迁移与各 store 的 DDL 立出来。
+    let migrations =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cog-storage/migrations");
+    cog_storage::migrate::Migrator::new(&migrations)
+        .run(&url)
+        .await
+        .unwrap();
+    let pool = PgPool::connect(&url).await.unwrap();
+    cogneva::schema_bundle::apply(&pool).await.unwrap();
+
+    let restored = restore_postgres(&pool, &pg_dir).await.unwrap();
+    assert_eq!(
+        restored.len(),
+        manifest.postgres.tables.len(),
+        "包里声明的表与装回来的表不是同一批"
+    );
+    let mut disagreements = Vec::new();
+    for table in &manifest.postgres.tables {
+        let rows: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM \"{}\"", table.name))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        if rows != table.rows {
+            disagreements.push(format!("{}: {} != {}", table.name, rows, table.rows));
+        }
+    }
+    assert!(
+        disagreements.is_empty(),
+        "装回来的行数与包清单对不上：{disagreements:?}"
+    );
+}
