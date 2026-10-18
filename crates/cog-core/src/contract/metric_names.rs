@@ -1241,8 +1241,13 @@ metric_names! {
     // How many connections each PostgreSQL pool may hold, by `pool`
     // (users/messages/config/explain) and by `source`: `server` when the
     // server's own max_connections divided among the sharing processes and
-    // pools is what binds, `configured` when the configured ceiling is lower
-    // or the server could not be read at all.
+    // pools is what binds, `config_lower` when the configured ceiling is
+    // lower, `tied` when the two are equal and neither decided anything, and
+    // `server_unreadable` when the server was never read and the configured
+    // value stands unmeasured. The last one is a blind spot, not a design
+    // choice, and must not share a label value with it: one alert rule keyed
+    // on `source` should be able to wake somebody for the blindness without
+    // also firing on a ceiling somebody chose.
     //
     // The value has to be readable, not just obeyed. Four pools against one
     // database multiply the configured ceiling into a local allowance several

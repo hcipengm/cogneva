@@ -1055,13 +1055,20 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          superuser reserve, divided by the processes expected to share it and \
          by the number of pools, and the configured value is only an upper \
          bound. `source=\"server\"` means the derived quotient binds; \
-         `source=\"configured\"` means the configured value is lower, or the \
-         server could not be read and the configured value stands -- read it as \
-         unmeasured, not as the server's answer. The gauge is written once per \
+         `source=\"config_lower\"` means the configured value is lower; \
+         `source=\"tied\"` means the two are equal, so the value would read the \
+         same under either but neither one decided it; and \
+         `source=\"server_unreadable\"` means the server could not be read and \
+         the configured value stands -- read that one as unmeasured, not as the \
+         server's answer, and alert on it separately from a ceiling somebody \
+         chose. The gauge is written once per \
          pool at startup, so a series that changes value between restarts says \
          the binding source changed; four series are expected, and a missing \
          one means that pool was never created rather than that its ceiling is \
-         zero",
+         zero. The sample log is pruned by row count, not by age, and the \
+         pruner keeps the newest row of every gauge series, so this value does \
+         not age out of the log: absence means the process never published it, \
+         not that the row was old",
     ),
     (
         "cogneva_ready_admission_readings",

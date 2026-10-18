@@ -152,12 +152,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
                         sharing_processes,
                         POSTGRES_POOL_COUNT,
                     );
-                    let effective = pg_max_connections.min(derived);
-                    let source = if effective == derived {
-                        "server"
-                    } else {
-                        "configured"
-                    };
+                    let (effective, source) = bound_and_source(pg_max_connections, derived);
                     pg_pool_ceiling = Some((effective, source));
                     info!(
                         "PostgreSQL connection budget: server max={} reserved={} sharing processes={} pools={} => {} per pool (configured ceiling {})",
@@ -175,7 +170,11 @@ impl cog_core::SystemPlugin for StoragePlugin {
                         "PostgreSQL server connection ceiling unreadable; keeping the configured ceiling of {} per pool",
                         pg_max_connections
                     );
-                    pg_pool_ceiling = Some((pg_max_connections, "configured"));
+                    // Not a design choice but a blind spot: the derived bound
+                    // was never computed, so this value says nothing about the
+                    // server and must be alerted on differently from a
+                    // configured ceiling that is deliberately lower.
+                    pg_pool_ceiling = Some((pg_max_connections, "server_unreadable"));
                     pg_max_connections
                 }
             };
@@ -1381,6 +1380,21 @@ fn per_pool_ceiling(server_max: u32, reserved: u32, processes: u32, pools: u32) 
     (available / sharing).max(1)
 }
 
+/// Which of the two bounds decided, and the value it decided.
+///
+/// The value alone cannot say where it came from: when the configured ceiling
+/// equals the derived one, both answers produce it, and calling that "server"
+/// would name a source that did not decide anything. The gauge exists to say
+/// which bound was in force, so equality gets its own label rather than being
+/// folded into the arm that happens to be checked first.
+fn bound_and_source(configured: u32, derived: u32) -> (u32, &'static str) {
+    match derived.cmp(&configured) {
+        std::cmp::Ordering::Less => (derived, "server"),
+        std::cmp::Ordering::Greater => (configured, "config_lower"),
+        std::cmp::Ordering::Equal => (derived, "tied"),
+    }
+}
+
 #[cfg(test)]
 mod budget_tests {
     use super::*;
@@ -1406,5 +1420,17 @@ mod budget_tests {
         assert_eq!(configured.min(derived), 12);
         let small_configured = 4;
         assert_eq!(small_configured.min(derived), 4);
+    }
+
+    #[test]
+    fn equal_values_do_not_make_the_server_the_source() {
+        // The derived quotient is tighter, so it decided.
+        assert_eq!(bound_and_source(50, 12), (12, "server"));
+        // A lower configured value decided, and that is a choice, not a
+        // failure to read the server.
+        assert_eq!(bound_and_source(4, 12), (4, "config_lower"));
+        // Both produce the same value; neither bound decided it, so naming
+        // the server would misreport the provenance.
+        assert_eq!(bound_and_source(12, 12), (12, "tied"));
     }
 }
