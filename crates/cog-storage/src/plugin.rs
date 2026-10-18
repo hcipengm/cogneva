@@ -123,6 +123,52 @@ impl cog_core::SystemPlugin for StoragePlugin {
             let config_url = url.clone();
             let explain_url = url.clone();
 
+            // The pools below all point at the same database, and each used to
+            // take the configured ceiling. Four pools times the ceiling is one
+            // process's local capacity, and every process sharing the server
+            // multiplies that again: under a burst the pools try to open
+            // connections the server will not accept, each caller waits out its
+            // acquire timeout, and the reading says `pool timed out while
+            // waiting for an open connection` while `pg_stat_activity` still
+            // shows idle connections -- they belong to the other pools, and a
+            // pool cannot borrow from its siblings. The number that binds is the
+            // server's, divided among the processes and pools that share it; the
+            // configured value is only an upper bound this may lower.
+            let sharing_processes: u32 = std::env::var("COGNEVA_PG_SHARING_PROCESSES")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(2);
+            let pg_max_connections = match server_connection_ceiling(&url).await {
+                Some((server_max, reserved)) => {
+                    let derived = per_pool_ceiling(
+                        server_max,
+                        reserved,
+                        sharing_processes,
+                        POSTGRES_POOL_COUNT,
+                    );
+                    let effective = pg_max_connections.min(derived);
+                    info!(
+                        "PostgreSQL connection budget: server max={} reserved={} sharing processes={} pools={} => {} per pool (configured ceiling {})",
+                        server_max,
+                        reserved,
+                        sharing_processes,
+                        POSTGRES_POOL_COUNT,
+                        effective,
+                        pg_max_connections
+                    );
+                    effective
+                }
+                None => {
+                    warn!(
+                        "PostgreSQL server connection ceiling unreadable; keeping the configured ceiling of {} per pool",
+                        pg_max_connections
+                    );
+                    pg_max_connections
+                }
+            };
+            let pg_min_connections = pg_min_connections.min(pg_max_connections);
+
             async fn connect_pool(
                 u: String,
                 strict_persistence: bool,
@@ -1252,3 +1298,78 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     optional_requires: &[],
     factory: || Box::new(StoragePlugin::new()),
 };
+
+/// How many PostgreSQL pools this plugin opens against the same database.
+const POSTGRES_POOL_COUNT: u32 = 4;
+
+/// The server's own connection ceiling and its superuser reserve.
+///
+/// Read from the server rather than from our own configuration: the numbers
+/// that bind a pool are not the ones we set, they are the ones the database
+/// will honour when every process sharing it asks at once.
+async fn server_connection_ceiling(url: &str) -> Option<(u32, u32)> {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect(url)
+        .await
+        .ok()?;
+    let max = sqlx::query_scalar::<_, i64>(
+        "select setting::bigint from pg_settings where name = 'max_connections'",
+    )
+    .fetch_one(&pool)
+    .await
+    .ok();
+    let reserved = sqlx::query_scalar::<_, i64>(
+        "select setting::bigint from pg_settings where name = 'superuser_reserved_connections'",
+    )
+    .fetch_one(&pool)
+    .await
+    .ok();
+    pool.close().await;
+    match (max, reserved) {
+        (Some(max), Some(reserved)) if max > 0 => Some((max as u32, reserved.clamp(0, max) as u32)),
+        _ => None,
+    }
+}
+
+/// How many connections one pool may hold when the server's ceiling is binding.
+///
+/// The ceiling is the server's allowance minus the reserve kept for
+/// superusers, divided among the processes expected to share it and among
+/// this process's pools. A pool that is refused cannot borrow from a sibling
+/// pool's idle connections, so only the quotient keeps the sum under the
+/// server's limit.
+fn per_pool_ceiling(server_max: u32, reserved: u32, processes: u32, pools: u32) -> u32 {
+    let available = server_max.saturating_sub(reserved);
+    let sharing = processes.max(1).saturating_mul(pools.max(1));
+    (available / sharing).max(1)
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn the_budget_is_the_servers_allowance_divided_by_every_pool_that_shares_it() {
+        // 100 - 3 reserved, two processes, four pools each: twelve apiece.
+        assert_eq!(per_pool_ceiling(100, 3, 2, 4), 12);
+        // One process alone can take a quarter of the allowance.
+        assert_eq!(per_pool_ceiling(100, 3, 1, 4), 24);
+    }
+
+    #[test]
+    fn a_tiny_server_still_yields_a_pool_that_can_work() {
+        assert_eq!(per_pool_ceiling(3, 3, 2, 4), 1);
+        assert_eq!(per_pool_ceiling(0, 0, 2, 4), 1);
+    }
+
+    #[test]
+    fn the_configured_ceiling_is_only_an_upper_bound() {
+        let configured = 50;
+        let derived = per_pool_ceiling(100, 3, 2, 4);
+        assert_eq!(configured.min(derived), 12);
+        let small_configured = 4;
+        assert_eq!(small_configured.min(derived), 4);
+    }
+}
