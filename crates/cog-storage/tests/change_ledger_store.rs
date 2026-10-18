@@ -892,6 +892,136 @@ async fn entry_rev(pool: &PgPool, id: &ChangeIdentity) -> Option<String> {
     .expect("read the entry revision")
 }
 
+/// The events recorded for this run, oldest first: `(from_state, to_state,
+/// measured_rev)`.
+async fn events(pool: &PgPool, marker: &str) -> Vec<(Option<String>, String, Option<String>)> {
+    sqlx::query_as(
+        "SELECT from_state, to_state, measured_rev FROM change_ledger_event \
+          WHERE scope LIKE $1 ORDER BY id",
+    )
+    .bind(format!("{marker}/%"))
+    .fetch_all(pool)
+    .await
+    .expect("read the probe events")
+}
+
+/// The reasons each event carried, oldest first: `(to_state, retire_reason,
+/// unsettled_reason)`.
+async fn event_reasons(
+    pool: &PgPool,
+    marker: &str,
+) -> Vec<(String, Option<String>, Option<String>)> {
+    sqlx::query_as(
+        "SELECT to_state, retire_reason, unsettled_reason FROM change_ledger_event \
+          WHERE scope LIKE $1 ORDER BY id",
+    )
+    .bind(format!("{marker}/%"))
+    .fetch_all(pool)
+    .await
+    .expect("read the probe event reasons")
+}
+
+/// What the account overwrote, the event half keeps.
+///
+/// The account is read in the same test on purpose: the point of the event is
+/// not that the row exists but that it survives the statement which replaces
+/// what it describes. A row that landed at `rev-c` says nowhere that it was
+/// pending at `rev-a` -- the aim here is that this table is the only place that
+/// reading can come from.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn entering_and_moving_are_events_while_a_repeat_measurement_is_not() {
+    let (store, pool, marker) = store().await;
+    let id = identity(&marker, "moves");
+
+    store
+        .apply_measurement(
+            &ChangeMeasurement::new(id.clone(), ChangeState::Pending).at_revision("rev-a"),
+        )
+        .await
+        .expect("create the row by measuring it");
+    assert_eq!(
+        events(&pool, &marker).await,
+        vec![(None, "pending".to_string(), Some("rev-a".to_string()))],
+        "a row entering the account is one event, with no prior state"
+    );
+
+    store
+        .apply_measurement(
+            &ChangeMeasurement::new(id.clone(), ChangeState::Pending).at_revision("rev-b"),
+        )
+        .await
+        .expect("measure the row again in the same state");
+    assert_eq!(
+        events(&pool, &marker).await.len(),
+        1,
+        "a re-measurement that finds the same state is not a transition"
+    );
+
+    store
+        .apply_measurement(
+            &ChangeMeasurement::new(id.clone(), ChangeState::Landed).at_revision("rev-c"),
+        )
+        .await
+        .expect("land the row");
+    assert_eq!(
+        events(&pool, &marker).await,
+        vec![
+            (None, "pending".to_string(), Some("rev-a".to_string())),
+            (
+                Some("pending".to_string()),
+                "landed".to_string(),
+                Some("rev-c".to_string())
+            ),
+        ],
+        "both ends of the move survive the measurement that replaced them"
+    );
+
+    cleanup(&pool, &marker).await;
+}
+
+/// The reason a state carried travels with the transition, not only with the
+/// row.
+///
+/// A later measurement clears `unsettled_reason` from the account, so without
+/// this row the account has no record that the state ever had one. The second
+/// event is checked too: a reason that stayed attached to a move it does not
+/// describe would read as one.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn the_reason_of_a_transition_is_recorded_with_it() {
+    let (store, pool, marker) = store().await;
+    let id = identity(&marker, "reason");
+
+    store
+        .apply_measurement(
+            &ChangeMeasurement::undecided(id.clone(), "scope_outside_tree").at_revision("rev-a"),
+        )
+        .await
+        .expect("create the row as undecided");
+    store
+        .apply_measurement(
+            &ChangeMeasurement::new(id.clone(), ChangeState::Landed).at_revision("rev-b"),
+        )
+        .await
+        .expect("land the row");
+
+    assert_eq!(
+        event_reasons(&pool, &marker).await,
+        vec![
+            (
+                "undecided".to_string(),
+                None,
+                Some("scope_outside_tree".to_string())
+            ),
+            ("landed".to_string(), None, None),
+        ],
+        "the reason rides the move it belongs to and not the one after it"
+    );
+
+    cleanup(&pool, &marker).await;
+}
+
 async fn cleanup(pool: &PgPool, marker: &str) {
     sqlx::query("DELETE FROM change_ledger WHERE scope LIKE $1")
         .bind(format!("{marker}/%"))
@@ -912,4 +1042,12 @@ async fn cleanup(pool: &PgPool, marker: &str) {
         .execute(pool)
         .await
         .expect("clean up the probe reopens");
+    // The event half outlives the account by design, so it is deleted by its
+    // own identity rather than following the row: a cascade is exactly what the
+    // table was built not to have.
+    sqlx::query("DELETE FROM change_ledger_event WHERE scope LIKE $1")
+        .bind(format!("{marker}/%"))
+        .execute(pool)
+        .await
+        .expect("clean up the probe events");
 }

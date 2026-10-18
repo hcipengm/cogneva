@@ -284,33 +284,65 @@ ON CONFLICT (kind, scope, literal) DO UPDATE SET
 /// measurement's. A row that already existed, whether folded in from a reading or
 /// measured before, keeps the revision it entered at, which is why the conflict
 /// clause leaves the column alone.
+///
+/// One statement writes both halves. The account keeps the current state by
+/// overwriting it, so the transition has to be captured in the same statement
+/// that overwrites it -- a second statement could fail on its own and leave the
+/// account moved with no event saying it moved, which is the exact reading this
+/// table exists to make impossible. The `prior` branch reads the account at the
+/// statement's snapshot, i.e. the state the row had *before* this measurement,
+/// and the event is written only when the state actually differs: a
+/// re-measurement that finds the same state is already `measured_at`, and writing
+/// it here would make this table a copy of the measurement loop.
+///
+/// A row this statement creates has no prior state, so `from_state` is NULL and
+/// the event reads as "entered". That is also why the comparison is
+/// `IS DISTINCT FROM`: with plain `<>` a first measurement would compare against
+/// NULL, match nothing, and the row would enter the account silently.
 const APPLY_MEASUREMENT_SQL: &str = "\
-INSERT INTO change_ledger (
-    kind, scope, literal, state, measured_rev, retire_reason, unsettled_reason,
-    first_seen_rev,
-    measured_at, landed_at, retired_at
+WITH prior AS (
+    SELECT state AS before FROM change_ledger
+     WHERE kind = $1 AND scope = $2 AND literal = $3
+), applied AS (
+    INSERT INTO change_ledger (
+        kind, scope, literal, state, measured_rev, retire_reason, unsettled_reason,
+        first_seen_rev,
+        measured_at, landed_at, retired_at
+    )
+    VALUES (
+        $1, $2, $3, $4, $5, $6, $7,
+        $5,
+        now(),
+        CASE WHEN $4 = 'landed' THEN now() ELSE NULL END,
+        CASE WHEN $4 = 'retired' THEN now() ELSE NULL END
+    )
+    ON CONFLICT (kind, scope, literal) DO UPDATE SET
+        state = EXCLUDED.state,
+        measured_rev = EXCLUDED.measured_rev,
+        retire_reason = EXCLUDED.retire_reason,
+        unsettled_reason = EXCLUDED.unsettled_reason,
+        measured_at = now(),
+        landed_at = CASE
+            WHEN EXCLUDED.state = 'landed' THEN COALESCE(change_ledger.landed_at, now())
+            ELSE NULL
+        END,
+        retired_at = CASE
+            WHEN EXCLUDED.state = 'retired' THEN COALESCE(change_ledger.retired_at, now())
+            ELSE NULL
+        END
+    RETURNING state, measured_rev, retire_reason, unsettled_reason
+), moved AS (
+    INSERT INTO change_ledger_event (
+        kind, scope, literal, from_state, to_state, measured_rev,
+        retire_reason, unsettled_reason
+    )
+    SELECT $1::varchar, $2::varchar, $3::varchar,
+           prior.before, applied.state, applied.measured_rev,
+           applied.retire_reason, applied.unsettled_reason
+      FROM applied LEFT JOIN prior ON TRUE
+     WHERE prior.before IS DISTINCT FROM applied.state
 )
-VALUES (
-    $1, $2, $3, $4, $5, $6, $7,
-    $5,
-    now(),
-    CASE WHEN $4 = 'landed' THEN now() ELSE NULL END,
-    CASE WHEN $4 = 'retired' THEN now() ELSE NULL END
-)
-ON CONFLICT (kind, scope, literal) DO UPDATE SET
-    state = EXCLUDED.state,
-    measured_rev = EXCLUDED.measured_rev,
-    retire_reason = EXCLUDED.retire_reason,
-    unsettled_reason = EXCLUDED.unsettled_reason,
-    measured_at = now(),
-    landed_at = CASE
-        WHEN EXCLUDED.state = 'landed' THEN COALESCE(change_ledger.landed_at, now())
-        ELSE NULL
-    END,
-    retired_at = CASE
-        WHEN EXCLUDED.state = 'retired' THEN COALESCE(change_ledger.retired_at, now())
-        ELSE NULL
-    END";
+SELECT 1";
 
 /// Append one reopen: a row the account had as done whose check no longer holds.
 ///
@@ -333,8 +365,9 @@ const RECORD_DISPATCH_STATE_SQL: &str = "\
 INSERT INTO change_dispatch_state (
     decision, pool_reading, pending, submitted, already, failed,
     dead_environment, held_back, rearmed, unmeasurable,
-    resume_at_unix, evidenced_recovery_unix, quota_window_secs, sources_unread
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)";
+    resume_at_unix, evidenced_recovery_unix, quota_window_secs, sources_unread,
+    window_allowance_tokens, window_spent_tokens, window_reserve_tokens
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)";
 
 /// Refuse a reading whose identity or document does not fit its column.
 ///
@@ -847,6 +880,13 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
             .bind(state.evidenced_recovery_unix)
             .bind(state.quota_window_secs as i64)
             .bind(state.sources_unread.as_deref())
+            // The three travel as one `Option` on the contract: a pass that read
+            // no pace writes three NULLs, and a pass that read one writes all
+            // three, so a reader never sees a window figure without the two it
+            // is read against.
+            .bind(state.window_pace.map(|pace| pace.allowance_tokens as i64))
+            .bind(state.window_pace.map(|pace| pace.spent_tokens as i64))
+            .bind(state.window_pace.map(|pace| pace.reserve_tokens as i64))
             .execute(&self.pool)
             .await
             .map_err(|e| SFError::Database(format!("record dispatch state: {e}")))?;

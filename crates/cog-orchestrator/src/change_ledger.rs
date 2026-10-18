@@ -112,7 +112,7 @@ use tracing::{debug, info, warn};
 use cog_core::{
     metric_names, ChangeIdentity, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement,
     ChangePriority, ChangeReading, ChangeReopen, ChangeSource, ChangeState, DispatchDecision,
-    DispatchState, LiveRevision, LiveRevisionSource, LlmPoolStatus, MetricsBackend,
+    DispatchState, LiveRevision, LiveRevisionSource, LlmPoolStatus, LlmWindowPace, MetricsBackend,
     OrchestratorControl, OwnerLeaseBroker, PoolReading, PrincipleCheckKind, PrincipleLedgerStore,
     PrincipleRow, SFResult, ShutdownSignal, StateBackend, Task, TaskStatus, TaskType,
 };
@@ -213,6 +213,12 @@ const TOUCHED_PER_PASS: usize = MEASUREMENTS_PER_PASS;
 /// inside one tick" rather than borrowed. Until it exists this is a number a
 /// person may have to re-tune, and it says so instead of dressing the borrowing
 /// up as a derivation.
+///
+/// This is the **ceiling**, not the batch: a pass whose pool snapshot measured a
+/// quota window hands over the smaller of this and what the window's remaining
+/// allowance pays for ([`handovers_for_this_pass`]). The bound below therefore
+/// describes the largest batch a pass can make, which is the case the sweep
+/// promise has to hold for.
 ///
 /// What the bound buys is checked rather than asserted in prose: an owed set of
 /// up to `HANDOVERS_PER_PASS * UNMEASURABLE_RETRY / CHANGE_LEDGER_PASS_INTERVAL`
@@ -2203,6 +2209,12 @@ async fn dispatch_pass(
     // would be a reading face that is blind where it is read.
     let pausing = verdict.decision == DispatchDecision::PausedLlmPoolUnavailable;
 
+    // The batch this pass may hand over: the tick's own ceiling, lowered by what
+    // the window left when the snapshot measured one. Derived once, from the same
+    // verdict the pass writes down, so the row and the batch cannot disagree about
+    // which window they were sized against.
+    let handover_budget = handovers_for_this_pass(&verdict, HANDOVERS_PER_PASS);
+
     let rearm_limit = dispatch_rearm_limit();
     let mut counts = TickCounts::default();
     let mut readback = HandoverCensus::default();
@@ -2239,7 +2251,7 @@ async fn dispatch_pass(
                     counts.held_back += 1;
                     continue;
                 }
-                if counts.submitted >= HANDOVERS_PER_PASS {
+                if counts.submitted >= handover_budget {
                     // Owed, handable, and left for a later pass because this one
                     // has handed over its slice. Counted with the rows a paused
                     // pass withholds, because the fact about the row is the same
@@ -2731,6 +2743,7 @@ async fn record_dispatch_state(
         resume_at_unix: verdict.resume_at_unix,
         evidenced_recovery_unix: verdict.evidenced_recovery_unix,
         quota_window_secs: verdict.quota_window_secs,
+        window_pace: verdict.window_pace,
     };
     if let Err(e) = store.record_dispatch_state(&state).await {
         warn!(
@@ -2790,6 +2803,7 @@ fn pool_verdict(
             resume_at_unix: 0,
             evidenced_recovery_unix: 0,
             quota_window_secs: 0,
+            window_pace: None,
         };
     };
     let resume_at_unix = if status.unavailable {
@@ -2814,6 +2828,10 @@ fn pool_verdict(
         resume_at_unix,
         evidenced_recovery_unix: status.evidenced_recovery_unix,
         quota_window_secs: status.quota_window_secs,
+        // `measured_upstreams == 0` is "not paced" -- the field's own meaning --
+        // and writing that pace down would make "no window was measured" and
+        // "a window measured to allow nothing" the same three zeros.
+        window_pace: (status.pace.measured_upstreams > 0).then_some(status.pace),
     }
 }
 
@@ -2829,6 +2847,51 @@ struct PoolVerdict {
     resume_at_unix: i64,
     evidenced_recovery_unix: i64,
     quota_window_secs: u64,
+    /// The window pace the same snapshot carried, when it carried a measurement.
+    ///
+    /// It rides the verdict rather than being read a second time from the
+    /// snapshot: the batch bound and the recorded row then rest on one read of
+    /// one payload, so a pass cannot size its batch from one window and write
+    /// down another.
+    window_pace: Option<LlmWindowPace>,
+}
+
+/// How many rows this pass may hand over, given what the pool said about the
+/// window it is spending.
+///
+/// The ceiling is the tick's own bound -- a maintenance tick, not a queue drain
+/// -- and it stays as the answer whenever no window was measured, because a bound
+/// this pass cannot derive is not a bound it may invent. What the pace adds is the
+/// other direction: a window whose remaining allowance fits fewer than the ceiling
+/// lowers the batch to what the window can actually pay for. Handing over more
+/// than that is not extra throughput, it is a batch the same window refuses
+/// request by request -- measured on 2026-10-18: eleven minutes after the pool
+/// opened, 282 of one batch of 635 submissions came back 429 on a window whose
+/// allowance had been spread to zero.
+///
+/// `reserve_tokens` is one whole job, measured from finished jobs, and it is the
+/// right divisor rather than an average call: the pace's own `blocked` rule
+/// compares the same two numbers, so a batch of one is admitted exactly when the
+/// gateway would not refuse it. `measured_upstreams == 0` or a zero reserve is
+/// "nothing measured", which is the ceiling, never zero -- zero here would stop
+/// dispatch for a missing measurement, which is a driver traded for a reading.
+fn handovers_for_this_pass(verdict: &PoolVerdict, ceiling: usize) -> usize {
+    let Some(pace) = verdict.window_pace else {
+        return ceiling;
+    };
+    if pace.measured_upstreams == 0 || pace.reserve_tokens == 0 {
+        return ceiling;
+    }
+    let remaining = pace.allowance_tokens.saturating_sub(pace.spent_tokens);
+    let fits = remaining / pace.reserve_tokens;
+    // The cast cannot lose a real batch: `ceiling` is single digits in the
+    // hundreds and `fits` only matters below it, so saturating at `ceiling`
+    // first keeps a huge remaining allowance from wrapping anything.
+    if fits >= ceiling as u64 {
+        ceiling
+    } else {
+        fits as usize
+    }
 }
 
 /// Wall-clock seconds, for comparing against instants an upstream stated.
@@ -3865,6 +3928,105 @@ mod tests {
         assert_ne!(verdict.reading, PoolReading::Available);
     }
 
+    /// The verdict carries the window only when one was measured, so "not paced"
+    /// and "a window measured to allow nothing" stay two readings.
+    #[test]
+    fn the_verdict_carries_the_window_only_when_one_was_measured() {
+        let now = 1_760_000_000i64;
+        let measured = LlmPoolStatus {
+            pace: LlmWindowPace {
+                measured_upstreams: 2,
+                allowance_tokens: 10_000_000,
+                spent_tokens: 9_000_000,
+                reserve_tokens: 500_000,
+                window_secs: 604_800,
+                window_start_unix: now - 86_400,
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            pool_verdict(Some(&measured), now, 300).window_pace,
+            Some(measured.pace),
+            "a measured window rides the verdict"
+        );
+
+        let unmeasured = LlmPoolStatus {
+            pace: LlmWindowPace {
+                measured_upstreams: 0,
+                allowance_tokens: 0,
+                spent_tokens: 0,
+                reserve_tokens: 0,
+                window_secs: 0,
+                window_start_unix: 0,
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            pool_verdict(Some(&unmeasured), now, 300).window_pace,
+            None,
+            "no measurement is not a window of zero"
+        );
+        assert_eq!(pool_verdict(None, now, 300).window_pace, None);
+    }
+
+    /// The batch is what the remaining allowance pays for, never more than the
+    /// tick's ceiling, and never zero for a window nobody measured.
+    #[test]
+    fn the_handover_batch_is_bounded_by_what_the_window_can_pay_for() {
+        let now = 1_760_000_000i64;
+        let with_pace = |measured: usize, allowance: u64, spent: u64, reserve: u64| {
+            let status = LlmPoolStatus {
+                pace: LlmWindowPace {
+                    measured_upstreams: measured,
+                    allowance_tokens: allowance,
+                    spent_tokens: spent,
+                    reserve_tokens: reserve,
+                    window_secs: 604_800,
+                    window_start_unix: 0,
+                },
+                ..Default::default()
+            };
+            pool_verdict(Some(&status), now, 300)
+        };
+
+        // No snapshot at all, a snapshot with no measurement, and a window with
+        // no job cost yet are all "nothing to derive a bound from": the ceiling.
+        assert_eq!(
+            handovers_for_this_pass(&pool_verdict(None, now, 300), 200),
+            200
+        );
+        assert_eq!(handovers_for_this_pass(&with_pace(0, 0, 0, 0), 200), 200);
+        assert_eq!(
+            handovers_for_this_pass(&with_pace(1, 9_000_000, 0, 0), 200),
+            200
+        );
+
+        // Four whole jobs fit: four, not two hundred -- the point of the bound.
+        assert_eq!(
+            handovers_for_this_pass(&with_pace(1, 5_000_000, 3_000_000, 500_000), 200),
+            4
+        );
+
+        // A window with more than the ceiling left is capped by the ceiling.
+        assert_eq!(
+            handovers_for_this_pass(&with_pace(1, 100_000_000, 0, 500_000), 200),
+            200
+        );
+
+        // Less left than one job costs is zero handovers: every task this pass
+        // would hand over is one the gateway refuses on the same numbers.
+        assert_eq!(
+            handovers_for_this_pass(&with_pace(1, 1_000_000, 900_000, 500_000), 200),
+            0
+        );
+        // Spent past the allowance (a snapshot read after the window moved) is
+        // still zero, not a wrapped-around huge number.
+        assert_eq!(
+            handovers_for_this_pass(&with_pace(1, 1_000_000, 2_000_000, 500_000), 200),
+            0
+        );
+    }
+
     // ── The pass's own arithmetic, driven end to end ──
     //
     // The counts a pass writes are the only reading of what it did, and the way
@@ -4683,6 +4845,7 @@ mod tests {
             resume_at_unix: 1_760_000_000,
             evidenced_recovery_unix: 1_759_999_000,
             quota_window_secs: 2_592_000,
+            window_pace: None,
         };
 
         let read_back = dispatch_pass(
@@ -5424,6 +5587,7 @@ mod tests {
             evidenced_recovery_unix: 0,
             quota_window_secs: 0,
             sources_unread: Some(String::new()),
+            window_pace: None,
         };
         let readback = HandoverCensus {
             events: 40,

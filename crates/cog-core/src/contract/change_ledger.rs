@@ -839,6 +839,18 @@ pub struct DispatchState {
     /// keeps "this pass read everything" and "this row predates the column"
     /// distinguishable instead of both reading as empty.
     pub sources_unread: Option<String>,
+    /// The window pace the pool snapshot carried this pass, when it carried a
+    /// measurement; `None` when no snapshot answered and when the one that did
+    /// had measured no window.
+    ///
+    /// It is recorded, rather than only used to size the batch, because the two
+    /// numbers answer each other: a pass that handed over 200 rows while the
+    /// window allowed four is a pass whose batch outran its quota, and without
+    /// this row that comparison cannot be made after the fact. `None` is not a
+    /// pace of zero -- a snapshot from a build that did not carry the field, and
+    /// a pass that read no snapshot at all, both read as "nothing said", which
+    /// is why rows written before this column existed also read as `None`.
+    pub window_pace: Option<crate::contract::supervisor::LlmWindowPace>,
 }
 
 /// The decision a dispatch pass reached, as a closed set.
