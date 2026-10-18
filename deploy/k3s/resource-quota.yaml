@@ -16,6 +16,12 @@ kind: ResourceQuota
 metadata:
   name: cogneva-quota
   namespace: cogneva
+  # 运行期自建 Pod（评测台、验收演练）的额度预算，与 chart 的
+  # resourceGovernance.runtimePods 逐字段相等。渲染期门禁读这两个注解，
+  # 核「声明和 + 判据 Job + 预算 ≤ 额度」；缺注解报错，不当作 0。
+  annotations:
+    cogneva.io/runtime-pods-limits-cpu: "3"
+    cogneva.io/runtime-pods-limits-memory: 3.75Gi
   labels:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/component: resource-governance
@@ -26,8 +32,9 @@ spec:
     limits.cpu: "30"
     # 52Gi：稳态 43.7Gi（渲染期门禁自报）+ 判据 Job 512Mi + 运行期自建临时 Pod
     # 3.75Gi（eval 表 3Gi + 验收演练 768Mi）+ 替换重叠 3.4Gi = 51.35Gi。
-    # 运行期自建 Pod 不在门禁的和里，额度必须替它们留位，否则部署器的滚动 Job
-    # 会在准入被拒、每轮空转。完整算式见 chart values 的 resourceGovernance 段。
+    # 运行期自建 Pod 不是渲染集里的工作负载，但它们的预算写在上面的注解里，
+    # 渲染期门禁把预算加进同一条不等式；留不够就在渲染期红，而不是等到准入被拒、
+    # 部署器每轮空转。完整算式见 chart values 的 resourceGovernance 段。
     limits.memory: "52Gi"
     pods: "40"
     requests.storage: 300Gi

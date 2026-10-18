@@ -201,6 +201,10 @@ apiVersion: v1
 kind: ResourceQuota
 metadata:
   name: cogneva-quota
+  # A zero budget is still a declaration: an absent annotation is an error, not 0.
+  annotations:
+    cogneva.io/runtime-pods-limits-cpu: "0"
+    cogneva.io/runtime-pods-limits-memory: "0"
 spec:
   hard:
     limits.cpu: "8"
@@ -252,5 +256,136 @@ bash "${gate}" "${synth}" > "${work}/synth-without.out" 2>&1 || fail "the gate i
 read -r synth_alone _ < <(read_cpu "${work}/synth-without.out")
 [ "${synth_alone}" = "0" ] \
   || fail "the lower bound did not fall back to 0m without the Job (read ${synth_alone}m)"
+
+# The other runtime-born term: pods the operating face creates on demand (the eval
+# table, the drill Job). Nothing in the render set declares their size, so the quota
+# carries it as an annotation and the gate must fold it into the same inequality.
+# Deleting the annotation must be red -- an absent budget read as 0 is exactly the
+# reading that said "headroom 1.8Gi" while admission was already refusing the Job.
+# Reads the runtime-inclusive figure from the budget line (cpu face).
+read_budget_cpu() {
+  python3 - "$1" <<'PYEOF'
+import re, sys
+
+lines = open(sys.argv[1]).read().splitlines()
+for line in lines:
+    if "runtime-pods-limits-cpu" not in line or "再计入" not in line:
+        continue
+    m = re.search(r"= (\d+)m vs 配额", line)
+    if m:
+        print(m.group(1))
+        raise SystemExit
+sys.exit("the gate printed no runtime-pod budget line for cpu")
+PYEOF
+}
+
+budget_cpu_m() {
+  python3 - "$1" <<'PYEOF'
+import glob, os, sys, yaml
+
+for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.yaml"))):
+    for doc in yaml.safe_load_all(open(path)):
+        if (doc or {}).get("kind") != "ResourceQuota":
+            continue
+        raw = ((doc.get("metadata") or {}).get("annotations") or {}).get(
+            "cogneva.io/runtime-pods-limits-cpu")
+        if raw is None:
+            raise SystemExit("the rendered quota carries no cpu budget annotation")
+        text = str(raw).strip()
+        print(int(float(text[:-1])) if text.endswith("m") else int(float(text) * 1000))
+        raise SystemExit
+sys.exit("no ResourceQuota in the rendered set")
+PYEOF
+}
+
+for profile in k3s-single k3s-multi; do
+  dir="${repo}/deploy/rendered/${profile}"
+  bash "${gate}" "${dir}" > "${work}/budget-${profile}.out" 2>&1 \
+    || fail "the gate is red on ${profile}: $(tail -3 "${work}/budget-${profile}.out")"
+
+  job_m="$(declared_cpu_m "${dir}")"
+  bud_m="$(budget_cpu_m "${dir}")"
+  read -r alone _ < <(read_cpu "${work}/budget-${profile}.out")
+  covered="$(read_budget_cpu "${work}/budget-${profile}.out")"
+  [ $(( covered - alone )) -eq $(( job_m + bud_m )) ] \
+    || fail "${profile}: budget-inclusive ${covered}m minus rendered-set ${alone}m is not judgement Job ${job_m}m + budget ${bud_m}m"
+
+  # Mutation control: the printed figure follows the annotation, so it cannot be a
+  # constant computed from something else.
+  mutated="${work}/budget-mut-${profile}"
+  cp -r "${dir}" "${mutated}"
+  python3 - "${mutated}" <<'PYEOF'
+import glob, os, sys, yaml
+
+for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.yaml"))):
+    docs = [d for d in yaml.safe_load_all(open(path)) if d and d.get("kind")]
+    hit = False
+    for d in docs:
+        ann = ((d.get("metadata") or {}).get("annotations") or {})
+        if "cogneva.io/runtime-pods-limits-cpu" in ann:
+            ann["cogneva.io/runtime-pods-limits-cpu"] = "1.5"
+            hit = True
+    if hit:
+        with open(path, "w") as fh:
+            yaml.safe_dump_all(docs, fh)
+PYEOF
+  bash "${gate}" "${mutated}" > "${work}/budget-mut-${profile}.out" 2>&1 \
+    || fail "the gate is red on the mutated budget in ${profile}"
+  read -r mut_alone _ < <(read_cpu "${work}/budget-mut-${profile}.out")
+  mut_covered="$(read_budget_cpu "${work}/budget-mut-${profile}.out")"
+  [ $(( mut_covered - mut_alone )) -eq $(( job_m + 1500 )) ] \
+    || fail "${profile}: setting the budget to 1.5 cores moved the reading to ${mut_covered}m from ${mut_alone}m, not to Job ${job_m}m + 1500m"
+
+  # Absence control: no annotation means no declaration, and that is red. Reading it
+  # as 0 would restore the pre-incident illusion of headroom.
+  gone="${work}/budget-gone-${profile}"
+  cp -r "${dir}" "${gone}"
+  python3 - "${gone}" <<'PYEOF'
+import glob, os, sys, yaml
+
+for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.yaml"))):
+    docs = [d for d in yaml.safe_load_all(open(path)) if d and d.get("kind")]
+    hit = False
+    for d in docs:
+        ann = ((d.get("metadata") or {}).get("annotations") or {})
+        if "cogneva.io/runtime-pods-limits-memory" in ann:
+            del ann["cogneva.io/runtime-pods-limits-memory"]
+            hit = True
+    if hit:
+        with open(path, "w") as fh:
+            yaml.safe_dump_all(docs, fh)
+PYEOF
+  if bash "${gate}" "${gone}" > "${work}/budget-gone-${profile}.out" 2>&1; then
+    fail "${profile}: the gate stayed green with the runtime-pod budget annotation deleted"
+  fi
+  grep -q "cogneva.io/runtime-pods-limits-memory" "${work}/budget-gone-${profile}.out" \
+    || fail "${profile}: the missing-budget verdict did not name the annotation"
+
+  # Verdict control: a budget that no longer fits must turn the gate red, even when
+  # the rendered set plus the judgement Job alone still fit.
+  over="${work}/budget-over-${profile}"
+  cp -r "${dir}" "${over}"
+  python3 - "${over}" <<'PYEOF'
+import glob, os, sys, yaml
+
+for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.yaml"))):
+    docs = [d for d in yaml.safe_load_all(open(path)) if d and d.get("kind")]
+    hit = False
+    for d in docs:
+        ann = ((d.get("metadata") or {}).get("annotations") or {})
+        if "cogneva.io/runtime-pods-limits-cpu" in ann:
+            ann["cogneva.io/runtime-pods-limits-cpu"] = "9"
+            hit = True
+    if hit:
+        with open(path, "w") as fh:
+            yaml.safe_dump_all(docs, fh)
+PYEOF
+  if bash "${gate}" "${over}" > "${work}/budget-over-${profile}.out" 2>&1; then
+    fail "${profile}: the gate stayed green while rendered set + Job + budget passed the ceiling"
+  fi
+  grep -q "运行期自建 Pod 预算" "${work}/budget-over-${profile}.out" \
+    || fail "${profile}: the over-budget verdict did not name the runtime-pod budget"
+  echo "OK: ${profile}: budget ${bud_m}m follows the annotation, absence is red"
+done
 
 echo "OK: governance runtime-job headroom gate"

@@ -7,6 +7,12 @@ kind: ResourceQuota
 metadata:
   name: cogneva-quota
   namespace: cogneva
+  # 额度按「声明工作负载 + 部署器判据 Job + 运行期自建 Pod + 替换重叠」定，
+  # 而前两项之外的第三项没有任何声明处：评测台与验收演练的 Pod 是运行时按需
+  # 建的。预算写在这儿，渲染期门禁读它算不等式；缺注解不是零，是门禁报错。
+  annotations:
+    cogneva.io/runtime-pods-limits-cpu: "3"
+    cogneva.io/runtime-pods-limits-memory: "3.75Gi"
   labels:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/component: resource-governance

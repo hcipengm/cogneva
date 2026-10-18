@@ -76,8 +76,20 @@ storage:
 #   limitsMemory 46Gi → 52Gi：稳态 43.7Gi + 判据 Job 512Mi + 运行期自建 3.75Gi
 #     + 替换重叠 3.4Gi = 51.35Gi，取整 52Gi。
 #   稳态那两个数由渲染期门禁自报，不手抄——重算时先跑它。
+#
+# 运行期自建 Pod 的预算单独声明（下条），不留在上面那段散文里：散文里的数只有
+# 人记得，声明出来的数门禁才核得到。上面那两个额度按「声明和 + 判据 Job + 本预算
+# ≤ 额度」重算，任一项变了而额度没跟，渲染期门禁当场红。
 resourceGovernance:
   enabled: true
+  # 运行时按需建、不在渲染集任何工作负载里的 Pod 占多少额度（limits 面）：
+  # 评测台（`cogneva eval-table --admission`）与验收演练各一份。它们的大小没有
+  # 第二个声明处——评测台由命令参数给，演练 Job 由运行方给——所以只能在这里
+  # 写死一份预算，由门禁加进不等式。写成 0 也要写出来（空着＝门禁读不到，
+  # 报错而不是当作 0）。见 resource-quota.yaml 的两个注解。
+  runtimePods:
+    limitsCpu: "3"
+    limitsMemory: 3.75Gi
   quota:
     requestsCpu: "6"
     requestsMemory: 12Gi

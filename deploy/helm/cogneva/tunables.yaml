@@ -880,20 +880,37 @@ rows:
   - key: resourceGovernance.quota.limitsCpu
     source: override
     why: >-
-      Steady-state limits plus the judging Job, plus a budget for pods created at
-      runtime outside the declared workloads (ad-hoc eval and drill probes), plus
-      room for overlap during a replacement; recomputed by hand at each re-sizing
-      (the arithmetic is beside the chart field). The render-time gate recomputes
-      only the declared sum, so it cannot see the runtime-created term; the value
-      is still typed.
+      Steady-state limits plus the judging Job, plus the declared budget for pods
+      created at runtime outside the declared workloads (resourceGovernance.runtimePods),
+      plus room for overlap during a replacement; recomputed by hand at each
+      re-sizing (the arithmetic is beside the chart field). The render-time gate
+      recomputes the declared sum plus the Job plus that budget, so it now covers
+      the term it used to be blind to; the overlap slack is still uncovered.
 
   - key: resourceGovernance.quota.limitsMemory
     source: override
     why: >-
-      The same sum for memory, including the same runtime-created term. Every
-      resizing so far was a human recomputation checked by the render-time gate;
-      the gate compares the declared part, it neither supplies the number nor
-      covers the transient pods that made the quota bind.
+      The same sum for memory, including the same declared runtime-pod budget.
+      The gate checks declared + judging Job + budget against this ceiling, so a
+      resizing that leaves the runtime-born pods out goes red in the render rather
+      than in admission; the replacement-overlap component remains hand-judged.
+
+  - key: resourceGovernance.runtimePods.limitsCpu
+    source: override
+    why: >-
+      The CPU-limits budget for pods the operating face creates on demand (the
+      eval table, the drill Job). They are in no rendered workload, yet the quota
+      counts them; nothing else declares their size, so the quota carries it as an
+      annotation and the render-time gate folds it into the headroom inequality.
+      Zero is a declaration too -- an absent annotation is an error, not 0.
+
+  - key: resourceGovernance.runtimePods.limitsMemory
+    source: override
+    why: >-
+      The memory-limits budget for the same runtime-created pods. On 2026-10-19
+      their absence from the arithmetic is what let the gate report headroom while
+      admission was already refusing the deployer's rollout Job; the annotation is
+      the declaration that makes the gap checkable.
 
   - key: resourceGovernance.quota.pods
     source: override

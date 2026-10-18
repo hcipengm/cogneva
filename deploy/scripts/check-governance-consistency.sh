@@ -13,11 +13,14 @@
 #   3. 每个容器显式声明的 requests/limits 都在 LimitRange 的容器上下限内；
 #      LimitRange 自己的 default/defaultRequest 也要在上下限内
 #   4. 工作负载的单副本下限和（副本数 × 每 Pod 请求，DaemonSet 按 1 计），
-#      **加上部署器运行期必然自己创建的判据 Job**，≤ quota 的 cpu/memory 额度。
+#      **加上部署器运行期必然自己创建的判据 Job**，**再加 ResourceQuota 注解
+#      声明的运行期自建 Pod 预算**，≤ quota 的 cpu/memory 额度。
 #      渲染期拿不到节点数，DaemonSet 与滚动期的并发 Job 都按 1 计，所以这是一个
 #      **下限**：下限越界必定越界，下限不越界不等于多节点下也不越界（那是 values
-#      注释里运维 --set 的事）。运行期那个 Job 不是外推的下限——它每一次滚动都在，
-#      所以它在判词之内而不是只在头寸那行里（实测就是这么越界的）。
+#      注释里运维 --set 的事）。后两项不是外推的下限——判据 Job 每一次滚动都在，
+#      评测台 / 验收演练的 Pod 按需就在，且它们都记在同一只配额的 used 上；把它们
+#      挡在判词之外，就是让必然到达的量躲在「头寸」那行后面（两次实测都是这么
+#      越界的：判据 Job 一次、运行期自建 Pod 一次）。预算注解缺失报错，不当作 0。
 #
 # 本门读的是**声明值**（渲染产物里的 `spec.hard`），不与 live 集群那只 ResourceQuota
 # 比对。所以本门绿只说「声明的天花板容得下声明的工作负载」——**不等于**「集群此刻装得下」。
@@ -231,6 +234,29 @@ def runtime_rollout_job():
 
 runtime_job = runtime_rollout_job()
 
+
+# 运行期按需建的 Pod（评测台、验收演练）占多少 limits 额度，只在 ResourceQuota
+# 的注解里声明得出来：它们由运行方按需创建，没有任何渲染集工作负载能推出它们的
+# 大小。2026-10-19 的准入越界正是这一截——稳态 + 判据 Job 小于额度，而用了额度
+# 的一半以上被运行时 Pod 占着，部署器的滚动 Job 在准入被拒。
+# 缺注解不当作 0：那样门禁会替一个从没声明过的量算头寸，与事故前那行「头寸
+# 1.8Gi」是同一种错觉。返回错误标记，让判词点名缺的是哪一个。
+def runtime_pod_budget():
+    if not quotas:
+        return None
+    ann = (quotas[0].get('metadata') or {}).get('annotations') or {}
+    out = {}
+    for unit, key in (('cpu', 'cogneva.io/runtime-pods-limits-cpu'),
+                      ('memory', 'cogneva.io/runtime-pods-limits-memory')):
+        raw = ann.get(key)
+        if raw is None or not str(raw).strip():
+            return {'error': key}
+        out[unit] = str(raw).strip()
+    return out
+
+
+runtime_pods = runtime_pod_budget()
+
 # 工作负载的单副本下限和 vs quota（cpu/memory）。
 for face, quota_key, unit in (('requests', 'requests.cpu', 'cpu'),
                              ('requests', 'requests.memory', 'memory'),
@@ -297,10 +323,42 @@ for face, quota_key, unit in (('requests', 'requests.cpu', 'cpu'),
                 f"头寸 {shown(together)}。本脚本按每 Pod 容器与 init 之和计，而额度"
                 f"记账取两者较大者，所以这里的数只会偏大不会偏小")
 
+    # 再一截：运行时按需建的 Pod。这一截不在任何声明里，只能读注解；它的
+    # 存在已经把准入提前顶穿过一次，所以它进判词而不是只进说明。
+    if face == 'limits':
+        if isinstance(runtime_pods, dict) and 'error' in runtime_pods:
+            errors.append(
+                f"ResourceQuota 缺少注解 {runtime_pods['error']}：运行期按需建的 Pod"
+                f"（评测台、验收演练）同样记在这只配额的 used 上，它的预算没有别的"
+                f"声明处；缺了就无从核「额度替它留够没有」。没有这类 Pod 也要写成 0，"
+                f"不要留空——留空在这里读作缺声明，不读作零")
+        elif runtime_pods:
+            ann_key = 'cogneva.io/runtime-pods-limits-' + unit
+            budget = qty(runtime_pods[unit])
+            job_extra = 0.0
+            if runtime_job is not None and runtime_job.get(quota_key) is not None:
+                job_extra = qty(runtime_job[quota_key])
+            covered = ceiling - totals - job_extra - budget
+            if covered < 0:
+                errors.append(
+                    f"工作负载单副本{face}.{unit} 下限和 {shown(totals)} + 部署器判据 Job "
+                    f"{shown(job_extra)} + 运行期自建 Pod 预算（注解 {ann_key} = "
+                    f"{runtime_pods[unit]}）= {shown(totals + job_extra + budget)} 已超过"
+                    f"配额 {quota_key} = {hard[quota_key]}：运行期自建的 Pod 记在同一只"
+                    f"配额的 used 上，这一项留不够，准入会先拒掉下一次滚动 Job 而不是"
+                    f"等到声明和越界")
+            else:
+                notes.append(
+                    f"  └ 再计入运行期自建 Pod 预算（注解 {ann_key} = "
+                    f"{runtime_pods[unit]}）：{shown(totals)} + 判据 Job "
+                    f"{shown(job_extra)} + 预算 {shown(budget)} = "
+                    f"{shown(totals + job_extra + budget)} vs 配额 {hard[quota_key]}，"
+                    f"头寸 {shown(covered)}（仍不含替换重叠）")
+
 notes.append(
-    "limits 两维的头寸只算声明的工作负载与部署器自己创建的判据 Job；"
-    "运行时按需建的 Pod（评测表、验收演练）同样记在准入账上，"
-    "所以这一行不是准入余量——那一条看 check-cross-layer-reconcile.sh 的判据 3")
+    "limits 两维的头寸算的是声明的工作负载 + 部署器自己创建的判据 Job + 注解声明的"
+    "运行期自建 Pod 预算；它仍不是准入余量——替换重叠与负载波动没有承保，"
+    "那一条硬判据看 check-cross-layer-reconcile.sh 的判据 3")
 
 if errors:
     print(f"GOVERNANCE 校验失败 [{PROFILE}]：")
