@@ -91,6 +91,7 @@ pub async fn run_config_declaration_check(
     settle: Duration,
     store: Option<Arc<PostgresAlertStore>>,
     notifier: Option<Arc<AlertManager>>,
+    metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
 ) {
     let path = crate::config::config_path();
     let source = path.display().to_string();
@@ -102,7 +103,7 @@ pub async fn run_config_declaration_check(
     match decide(&first, &later, &source) {
         DeliveryAction::Fire(message) => {
             warn!(source = %source, "{}", message);
-            set_row(&store, &notifier, true, &source, &message).await;
+            set_row(&store, &notifier, metrics.as_ref(), true, &source, &message).await;
         }
         DeliveryAction::Resolve => {
             info!(
@@ -110,7 +111,7 @@ pub async fn run_config_declaration_check(
                 "{}",
                 config_sections::describe_delivery(&source, &first)
             );
-            set_row(&store, &notifier, false, &source, "").await;
+            set_row(&store, &notifier, metrics.as_ref(), false, &source, "").await;
         }
         DeliveryAction::Silent(reason) => {
             info!(source = %source, "config declaration check concluded nothing: {reason}");
@@ -139,6 +140,7 @@ fn judge(path: &std::path::Path) -> DocumentDelivery {
 async fn set_row(
     store: &Option<Arc<PostgresAlertStore>>,
     notifier: &Option<Arc<AlertManager>>,
+    metrics: Option<&Arc<dyn cog_core::MetricsBackend>>,
     firing: bool,
     source: &str,
     message: &str,
@@ -157,24 +159,26 @@ async fn set_row(
         Ok(_) => {
             // Only the firing edge interrupts anyone: a row closing is visible
             // on the surface people already read.
-            if let Some(notifier) = notifier.as_ref().filter(|_| firing) {
+            if firing {
                 let now = Utc::now();
                 let labels = HashMap::from([
                     ("source".to_string(), source.to_string()),
                     ("message".to_string(), message.to_string()),
                 ]);
-                notifier
-                    .notify(&[AlertEvent::Firing(AlertInstance {
-                        rule_name: CONFIG_DECLARATION_RULE.to_string(),
-                        labels,
-                        state: AlertState::Firing,
-                        severity: cog_core::AlertSeverity::Warning,
-                        value: 1.0,
-                        starts_at: now,
-                        ends_at: None,
-                        updated_at: now,
-                    })])
-                    .await;
+                let events = [AlertEvent::Firing(AlertInstance {
+                    rule_name: CONFIG_DECLARATION_RULE.to_string(),
+                    labels,
+                    state: AlertState::Firing,
+                    severity: cog_core::AlertSeverity::Warning,
+                    value: 1.0,
+                    starts_at: now,
+                    ends_at: None,
+                    updated_at: now,
+                })];
+                match notifier.as_ref() {
+                    Some(notifier) => notifier.notify(&events).await,
+                    None => crate::alerts::record_undelivered(metrics, 1).await,
+                }
             }
         }
         Err(e) => warn!(source = %source, error = %e, "config declaration alert persist failed"),

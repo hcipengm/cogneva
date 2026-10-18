@@ -698,6 +698,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             &alert_channels,
             alert_timeout,
             ctx.consume_service::<dyn cog_core::HttpClient>(),
+            ctx.consume_service::<dyn cog_core::MetricsBackend>(),
         );
         tokio::spawn(crate::config_delivery::run_config_declaration_check(
             std::time::Duration::from_secs(
@@ -708,6 +709,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             ),
             self.alert_store.clone(),
             declaration_notifier,
+            ctx.consume_service::<dyn cog_core::MetricsBackend>(),
         ));
 
         // ── Infra alert watcher: PromQL rules → persisted alerts ──
@@ -734,8 +736,13 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                             .build()
                         })
                         .collect();
-                    let notifier =
-                        alert_manager(rules, &alert_channels, alert_timeout, Some(http.clone()));
+                    let notifier = alert_manager(
+                        rules,
+                        &alert_channels,
+                        alert_timeout,
+                        Some(http.clone()),
+                        ctx.consume_service::<dyn cog_core::MetricsBackend>(),
+                    );
                     let shutdown = ctx
                         .consume::<cog_core::ShutdownSignal>()
                         .map(|s| (*s).clone())
@@ -743,6 +750,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                     let outlets = crate::infra_watch::InfraWatchOutlets {
                         store: self.alert_store.clone(),
                         notifier,
+                        metrics: ctx.consume_service::<dyn cog_core::MetricsBackend>(),
                     };
                     tokio::spawn(crate::infra_watch::run_infra_watch_loop(
                         infra, outlets, http, shutdown,
@@ -1071,16 +1079,19 @@ fn alert_manager(
     channels: &[AlertChannel],
     timeout_secs: u64,
     client: Option<Arc<dyn cog_core::HttpClient>>,
+    metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
 ) -> Option<Arc<crate::alerts::AlertManager>> {
     if channels.is_empty() {
         return None;
     }
     let client = client?;
-    Some(Arc::new(
-        crate::alerts::AlertManager::new(rules, channels.to_vec())
-            .with_timeout(timeout_secs)
-            .with_client(client),
-    ))
+    let manager = crate::alerts::AlertManager::new(rules, channels.to_vec())
+        .with_timeout(timeout_secs)
+        .with_client(client);
+    Some(Arc::new(match metrics {
+        Some(m) => manager.with_metrics(m),
+        None => manager,
+    }))
 }
 
 /// Spawn the alert bridge: subscribe to `SupervisorEvent`s, map each one once,
@@ -1106,7 +1117,13 @@ fn spawn_alert_bridge(
     metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
     stop: cog_core::ShutdownSignal,
 ) -> Option<Arc<crate::alerts::AlertManager>> {
-    let manager = alert_manager(Vec::new(), &channels, timeout_secs, http_client);
+    let manager = alert_manager(
+        Vec::new(),
+        &channels,
+        timeout_secs,
+        http_client,
+        metrics.clone(),
+    );
     // 订阅一次、跨重启共用：body 每次尝试都重建，重新订阅会落在通道当前的尾巴上，
     // 环死期间到达的事件就再也补不回来——而那正是它最该补上的那一段。
     let alert_rx = Arc::new(tokio::sync::Mutex::new(supervisor.subscribe()));
@@ -1169,8 +1186,14 @@ fn spawn_alert_bridge(
                     if alerts.is_empty() {
                         continue;
                     }
-                    if let Some(manager) = &manager_for_task {
-                        manager.notify(&alerts).await;
+                    match &manager_for_task {
+                        Some(manager) => manager.notify(&alerts).await,
+                        // Persisted, but there is no outlet to hand it to: the
+                        // row exists and the human was never told. Without this
+                        // cell the two are the same picture on every series.
+                        None => {
+                            crate::alerts::record_undelivered(metrics.as_ref(), alerts.len()).await
+                        }
                     }
                     if let Some(store) = &store {
                         persist_alerts(store, &alerts).await;

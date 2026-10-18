@@ -392,6 +392,21 @@ metric_names! {
     // up, and can see the skills it found on disk but could not load.
     SKILL_HOT_RELOAD_TOTAL => "cogneva_skill_hot_reload_total",
 
+    // cog-observability — how each dispatch of an alert batch to one channel
+    // ended, labelled by `channel` and `outcome`, the cell's value being how
+    // many events that dispatch carried.
+    //
+    // The manager's only trace was the WARN it logged when a channel refused a
+    // batch: an alert delivered to a human and an alert that reached no outlet
+    // at all read the same on every other series, because the alert row is
+    // written whether or not anyone was told. `channel` is the kind of outlet
+    // (`webhook|email|slack`, or `none` when the bridge has no manager), never
+    // its URL or its recipients; `outcome` is the closed set of ends
+    // (`delivered|failed|skipped|no_channel`), where `skipped` is a channel
+    // that is configured but has nowhere to send -- an email with an empty
+    // recipient list -- and deliberately does not count as delivered.
+    ALERT_NOTIFICATIONS_TOTAL => "cogneva_alert_notifications_total",
+
     // cog-observability — how each log-flush of the Loki pusher ended, labelled by
     // `outcome`, the cell's value being how many log entries that batch carried.
     //

@@ -473,6 +473,24 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          deployments: the sum would report the same total once per writer",
     ),
     (
+        "cogneva_alert_notifications_total",
+        "How each dispatch of an alert batch to one channel ended, summed over \
+         dispatches and labelled by `channel` and `outcome`; the cell's value is \
+         how many alert events that dispatch carried. The alert manager's only \
+         trace used to be the warning it logged when a channel refused a batch, \
+         so an alert that reached a person and an alert that reached no outlet at \
+         all were the same picture -- the persisted alert row is written either \
+         way, which makes 'nobody was told' look like 'nothing was wrong'. \
+         `channel` is the kind of outlet and never its URL or its recipients: \
+         webhook, email, slack, or none when the bridge has no manager at all. \
+         `outcome` is a closed set: delivered, failed, skipped (the channel is \
+         configured but has nowhere to send, e.g. an email with an empty \
+         recipient list -- deliberately not counted as delivered), and no_channel \
+         (no outlet was configured, so the batch was dropped). Read delivered \
+         against the others: a batch in the failed, skipped or no_channel cell is \
+         an alert a human never saw",
+    ),
+    (
         "cogneva_loki_flush_total",
         "How each log-flush of the Loki background pusher ended, summed over \
          flushes and labelled by the outcome; the cell's value is how many log \

@@ -70,6 +70,10 @@ pub const INFRA_WATCH_LOOP: &str = "infra_watch";
 pub struct InfraWatchOutlets {
     pub store: Option<Arc<PostgresAlertStore>>,
     pub notifier: Option<Arc<AlertManager>>,
+    /// Where a batch that has no notifier is counted as undelivered. The
+    /// watcher persists such a batch and returns; without this the persisted
+    /// row is the only trace and it reads as though a person was told.
+    pub metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
 }
 
 /// Background loop; same shutdown pattern as the alert bridge.
@@ -632,9 +636,6 @@ async fn notify_eval_failure(
     error: &str,
     outlets: &InfraWatchOutlets,
 ) {
-    let Some(notifier) = &outlets.notifier else {
-        return;
-    };
     let message = eval_failure_text(rule_name, streak, error);
     let labels = HashMap::from([
         ("watched_rule".to_string(), rule_name.to_string()),
@@ -652,7 +653,18 @@ async fn notify_eval_failure(
         ends_at: None,
         updated_at: now,
     };
-    notifier.notify(&[AlertEvent::Firing(inst)]).await;
+    deliver(outlets, vec![AlertEvent::Firing(inst)]).await;
+}
+
+/// Hand a batch to the notifier, or count it as reaching nobody.
+///
+/// The two states the watcher used to share: an alert the notifier took and an
+/// alert with no notifier wired. Both persisted a row; only one was ever seen.
+async fn deliver(outlets: &InfraWatchOutlets, events: Vec<AlertEvent>) {
+    match &outlets.notifier {
+        Some(notifier) => notifier.notify(&events).await,
+        None => crate::alerts::record_undelivered(outlets.metrics.as_ref(), events.len()).await,
+    }
 }
 
 /// Close one alert row and notify the resolution.
@@ -679,9 +691,7 @@ async fn resolve(key: &str, outlets: &InfraWatchOutlets) {
                     ends_at: Some(Utc::now()),
                     updated_at: Utc::now(),
                 };
-                if let Some(notifier) = &outlets.notifier {
-                    notifier.notify(&[AlertEvent::Resolved(inst)]).await;
-                }
+                deliver(outlets, vec![AlertEvent::Resolved(inst)]).await;
             }
             Ok(_) => {}
             Err(e) => warn!(key = %key, error = %e, "infra alert resolve failed"),
@@ -695,9 +705,6 @@ async fn notify(
     labels: &HashMap<String, String>,
     outlets: &InfraWatchOutlets,
 ) {
-    let Some(notifier) = &outlets.notifier else {
-        return;
-    };
     let now = Utc::now();
     let inst = AlertInstance {
         rule_name: rule.name.clone(),
@@ -709,7 +716,7 @@ async fn notify(
         ends_at: None,
         updated_at: now,
     };
-    notifier.notify(&[AlertEvent::Firing(inst)]).await;
+    deliver(outlets, vec![AlertEvent::Firing(inst)]).await;
 }
 
 /// What a comparison's side carries into the join.
@@ -1561,6 +1568,7 @@ mod tests {
         let outlets = InfraWatchOutlets {
             store: None,
             notifier: None,
+            metrics: None,
         };
         let http: Arc<dyn cog_core::HttpClient> = Arc::new(FlakyHttp::default());
         let mut known_firing = HashSet::new();
@@ -1668,6 +1676,7 @@ mod tests {
         let outlets = InfraWatchOutlets {
             store: None,
             notifier: None,
+            metrics: None,
         };
         let http: Arc<dyn cog_core::HttpClient> = Arc::new(FlakyHttp::default());
         let mut known_firing = HashSet::new();
