@@ -2588,6 +2588,21 @@ const UNREAD: &[(&str, Unread)] = &[
         "cogneva_observability_event_persist_failed_total",
         Unread::Gap("observability events whose insert failed, one per failed write, counted in the store where the outcome is known. A rule on any increase would look writable and is not, because the series it should be read against is the handoff attempt count above, and a failure there is already a loss by construction rather than a condition that turns into one at some level -- what a rule would add is a page for a defect the empty table already states, on a path whose repair is the write itself. The reason it stays a gap rather than becoming a rule is the same one the handoff entry gives: subtracting the two is what says how many events reached the table, and the row count it would be checked against is not on the metric surface. It is registered here so the census sees that this pair arrives together and that neither is dismissed for want of a reader nobody could write"),
     ),
+    // The other half of the pair the sweep writes when it decides whether the
+    // message it cannot see is lost. Its sibling has a reader -- the reclaim the
+    // wait gave up on is a fault and `dag_task_reclaimed_despite_backlog` reads
+    // it -- but a deferral is the wait doing its job: any amount of it is
+    // correct, and a rule on a nonzero would page on a healthy backlog. What
+    // would make a run of deferrals a fault is a backlog that never drains, and
+    // no series states that: the sweep counts the rows it left alone, not the
+    // messages still waiting, and the queue's undelivered count is read inside
+    // the process that asks rather than published. So the missing operand is a
+    // reader -- a published backlog depth -- and not a bound, which is why this
+    // is filed rather than given a threshold.
+    (
+        "cogneva_dag_stalled_scheduled_deferred_for_backlog_total",
+        Unread::Gap("rows the sweep left in Scheduled because their queue still held undelivered entries. Any nonzero is the wait working as designed, so a rule on it would page on a healthy backlog; what would make a run of deferrals a fault is a backlog that never drains, and the sweep cannot state that -- it counts the rows it left alone, not the messages still waiting, and the queue's undelivered count is read inside the process that asks rather than published as a series. Closing this entry means publishing that backlog depth and reading the two together, not inventing a threshold for this one"),
+    ),
 ];
 
 /// How many `Gap` entries the census left. A new series that no face reads and
@@ -2739,7 +2754,18 @@ const UNREAD: &[(&str, Unread)] = &[
 /// comparison a reading script has to make instead. They arrive together
 /// deliberately: one without the other still cannot say whether the fault is in
 /// the consumer or in the write.
-const GAPS_AT_CENSUS: usize = 23;
+///
+/// It went to 24 in the pass that gave the backlog guard its pair, and that
+/// number is the one this constant holds. The pair was minted to tell a drain
+/// from a loss: a task stuck in Scheduled past the transport's window is one
+/// thing, and whether its message is still in line is another. Half of the pair
+/// got a reader with it -- the reclaim that happened while the queue still
+/// reported undelivered entries is a fault, and a rule now reads it. The other
+/// half is the wait holding, which is what the sweep is supposed to do; a rule
+/// on it would page on a healthy backlog, and the reading that would make it a
+/// fault (how many messages are still waiting) is not published. So it is a
+/// debt whose missing operand is a reader rather than a bound.
+const GAPS_AT_CENSUS: usize = 24;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {
