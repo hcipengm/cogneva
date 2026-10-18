@@ -43,11 +43,43 @@
 
 set -euo pipefail
 
+# Two landing shapes are live at once. The older one names the change in the
+# subject (`chore(cogneva): land change <id>`); the current one files the commit
+# under the conventional type its diff earned and puts the id in a body trailer
+# (`Landing change <id>`). The cluster keeps writing the older shape until a
+# rollout replaces the binary that writes it, and history keeps both shapes
+# forever, so a guard that recognised only one of them would stop acting on the
+# commits it exists for while still reading as "not a landing".
 LANDING_PREFIX='chore(cogneva): land change '
+LANDING_TRAILER='Landing change '
 REVERT_PREFIX='revert(cogneva): '
 IDENTITY_DOMAIN='@cogneva.ai'
 
 log() { printf '%s\n' "$*"; }
+
+# The change id a commit names as its landing, or nothing.
+#
+# stdin: a commit body. stdout: the trailer's id, or no output.
+landing_id_from_body() {
+  sed -n "s/^${LANDING_TRAILER}\([^[:space:]]*\)[[:space:]]*\$/\\1/p" | head -1
+}
+
+# The change id a commit names as its landing, from the pair a reader has in
+# hand: the trailer is authoritative because it is what the current writer
+# emits; the subject prefix is kept because the older writer still emits it.
+#
+# $1: subject, $2: body. stdout: the id, or nothing.
+landing_change_id() {
+  local subject="$1" body="$2" id
+  id="$(printf '%s\n' "${body}" | landing_id_from_body)"
+  if [ -n "${id}" ]; then
+    printf '%s' "${id}"
+    return 0
+  fi
+  case "${subject}" in
+    "${LANDING_PREFIX}"*) printf '%s' "${subject#"${LANDING_PREFIX}"}" ;;
+  esac
+}
 
 # Fold a GitHub check-runs document into one verdict word.
 #
@@ -113,13 +145,14 @@ main() {
       log "tip ${sha} is itself a revert (\"${subject}\"); nothing to undo"
       return 0
       ;;
-    "${LANDING_PREFIX}"*)
-      ;;
-    *)
-      log "tip ${sha} is not a landing (\"${subject}\"); refusing to guess"
-      return 0
-      ;;
   esac
+
+  local change_id
+  change_id="$(landing_change_id "${subject}" "$(git log -1 --format=%b "${sha}")")"
+  if [ -z "${change_id}" ]; then
+    log "tip ${sha} is not a landing (\"${subject}\"); refusing to guess"
+    return 0
+  fi
   case "${email}" in
     *"${IDENTITY_DOMAIN}")
       ;;
@@ -140,9 +173,6 @@ main() {
     log "tip ${sha} verdict=${verdict} ($(verdict_note "${verdict}")); nothing to undo"
     return 0
   fi
-
-  local change_id
-  change_id="${subject#"${LANDING_PREFIX}"}"
 
   if [ "${dry_run}" != "false" ]; then
     log "DRY RUN: would revert ${sha} (change ${change_id}) on ${base}"
@@ -182,6 +212,42 @@ self_test() {
   check "all passing is green" green '{"check_runs":[{"status":"completed","conclusion":"success"},{"status":"completed","conclusion":"skipped"},{"status":"completed","conclusion":"neutral"}]}'
   check "an unseen conclusion is not a pass" red '{"check_runs":[{"status":"completed","conclusion":"stale"}]}'
   check "a missing conclusion on a completed run is not a pass" red '{"check_runs":[{"status":"completed"}]}'
+
+  landing() {
+    local name="$1" want="$2" subject="$3" body="$4" got
+    got="$(landing_change_id "${subject}" "${body}")"
+    if [ "${got}" = "${want}" ]; then
+      printf 'ok   %s\n' "${name}"
+    else
+      printf 'FAIL %s: want %q got %q\n' "${name}" "${want}" "${got}" >&2
+      failed=$(( failed + 1 ))
+    fi
+  }
+  # Both landing shapes are live at once: the current writer files the commit
+  # under the type its diff earned and names the change in a body trailer, while
+  # the writer still running in the cluster puts the id in a `chore(...)`
+  # subject. A guard that reads only one shape answers "not a landing" for the
+  # other and stands still on the commit it exists to undo, so each shape is
+  # pinned here.
+  landing "a trailer names the change under a typed subject" change-ledger-abc123 \
+    'fix(cog-storage): keep the index' \
+    'fix(cog-storage): keep the index
+
+Landing change change-ledger-abc123
+
+Change-Id: change-ledger-abc123'
+  landing "the older subject prefix still names the change" change-ledger-def456 \
+    'chore(cogneva): land change change-ledger-def456' ''
+  landing "a revert is not a landing" '' \
+    'revert(cogneva): undo change change-ledger-def456' \
+    'revert(cogneva): undo change change-ledger-def456
+
+This reverts commit deadbeef.'
+  landing "a prose mention is not a trailer" '' \
+    'docs(cogneva): explain Landing change handling' \
+    'docs(cogneva): explain Landing change handling
+
+See the Landing change paragraphs elsewhere.'
 
   if [ "${failed}" -ne 0 ]; then
     printf '%d case(s) failed\n' "${failed}" >&2
