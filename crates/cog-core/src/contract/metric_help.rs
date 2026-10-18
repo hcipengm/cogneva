@@ -689,7 +689,12 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          pays for), owed (tasks already scheduled or running on that queue) and \
          admitted (tasks put on the wire). window_jobs is written only when \
          bounded is 1: an unmeasured window is not a window that pays for zero \
-         jobs, and a zero there would read as the strongest possible refusal",
+         jobs, and a zero there would read as the strongest possible refusal. \
+         Every cell is per stream and window_jobs is not a budget split between \
+         streams: each queue is judged against its own owed count, so the two \
+         admitted values may sum to more than window_jobs when both queues are \
+         nearly empty. Do not read that sum as overshoot -- it is the price of \
+         not letting a backlog on one queue decide how much the other may send",
     ),
     (
         "cogneva_task_checkpoint_total",

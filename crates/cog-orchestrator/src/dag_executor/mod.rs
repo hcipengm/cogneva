@@ -42,6 +42,10 @@ pub struct DagExecutorConfig {
     pub result_claim_interval_secs: u64,
     /// 单轮最多认领多少条。
     pub result_claim_batch: usize,
+    /// 就绪发布循环的节拍，秒；`0` 表示调用方没有配置，也就没有「下一次
+    /// 什么时候看」可说。只用于把准入拒绝的等待时刻写进日志——真正驱动循环
+    /// 的节拍由发布方自己的 ticker 决定。
+    pub ready_task_poll_interval_secs: u64,
 }
 
 impl Default for DagExecutorConfig {
@@ -54,8 +58,22 @@ impl Default for DagExecutorConfig {
             result_claim_idle_secs: 600,
             result_claim_interval_secs: 60,
             result_claim_batch: 16,
+            ready_task_poll_interval_secs: 0,
         }
     }
+}
+
+/// What one pass may admit, together with the reading it was derived from.
+///
+/// The pace rides along so a refusal can be logged with the numbers that
+/// produced it: "held three back" alone cannot distinguish a window that is
+/// nearly spent from one that pays for nothing, and those are different
+/// outages.
+#[derive(Debug, Clone, Copy)]
+struct AdmissionBound {
+    window_jobs: u64,
+    pace: cog_core::LlmWindowPace,
+    pool_size: usize,
 }
 
 /// DagExecutor 运行时。
@@ -231,23 +249,55 @@ impl DagExecutorRuntime {
         ] {
             let ready = by_stream.get(&stream).map(|e| e.len()).unwrap_or(0) as u64;
             let owed = in_flight.get(&stream).copied().unwrap_or(0) as u64;
-            let admitted = crate::ready_queue::admitted(ready, owed, pays_for);
+            let admitted =
+                crate::ready_queue::admitted(ready, owed, pays_for.map(|b| b.window_jobs));
             admitted_by_stream.insert(stream.clone(), admitted);
-            self.record_admission(&stream, pays_for, owed, admitted, ready - admitted)
-                .await;
+            self.record_admission(
+                &stream,
+                pays_for.map(|b| b.window_jobs),
+                owed,
+                admitted,
+                ready - admitted,
+            )
+            .await;
         }
 
         for (stream, mut entries) in by_stream {
             if let Some(&admitted) = admitted_by_stream.get(&stream) {
                 if (entries.len() as u64) > admitted {
-                    tracing::warn!(
-                        stream = %stream,
-                        ready = entries.len(),
-                        admitted,
-                        owed = in_flight.get(&stream).copied().unwrap_or(0),
-                        window_jobs = pays_for,
-                        "holding ready tasks back: the pool's window cannot pay for them, so they stay pending until it can"
-                    );
+                    // The reading the refusal was decided on travels with it:
+                    // a hold that names only how many were held leaves the
+                    // reader unable to tell a window that is nearly spent from
+                    // one that pays for nothing, and those are different
+                    // outages. The wake instant is this loop's own next look,
+                    // not a promise about the upstream -- that promise lives in
+                    // the gateway's snapshot and is not ours to restate.
+                    match pays_for {
+                        Some(bound) => tracing::warn!(
+                            stream = %stream,
+                            ready = entries.len(),
+                            admitted,
+                            owed = in_flight.get(&stream).copied().unwrap_or(0),
+                            window_jobs = bound.window_jobs,
+                            allowance_tokens = bound.pace.allowance_tokens,
+                            spent_tokens = bound.pace.spent_tokens,
+                            reserve_tokens = bound.pace.reserve_tokens,
+                            measured_upstreams = bound.pace.measured_upstreams,
+                            pool_size = bound.pool_size,
+                            window_start_unix = bound.pace.window_start_unix,
+                            // Absolute, not "in N seconds": a relative figure
+                            // is wrong the moment anyone reads the line. `None`
+                            // when no cadence was configured -- a zero instant
+                            // would read as 1970 rather than as "unknown".
+                            next_look_unix = ?(self.config.ready_task_poll_interval_secs > 0).then(
+                                || chrono::Utc::now().timestamp().saturating_add(
+                                    self.config.ready_task_poll_interval_secs as i64
+                                )
+                            ),
+                            "holding ready tasks back: the pool's window cannot pay for them, so they stay pending until it can"
+                        ),
+                        None => {}
+                    }
                     entries.truncate(usize::try_from(admitted).unwrap_or(usize::MAX));
                 }
             }
@@ -279,18 +329,24 @@ impl DagExecutorRuntime {
         Ok(())
     }
 
-    /// Jobs the pool's window can still pay for, or `None` when nothing
-    /// measured one.
+    /// What the pool's window can still pay for, with the reading it was
+    /// derived from, or `None` when nothing measured one.
     ///
     /// A source that answers nothing this pass is not a healthy pool: both
     /// halves of the signal roll with the deployment, so an unanswered read is
     /// an ordinary sight during a rollout and it admits everything rather than
     /// freezing dispatch on a restart. The reading the publisher is asking for
     /// is a quota; only the quota's own report may close a queue.
-    async fn admission_bound(&self) -> Option<u64> {
+    async fn admission_bound(&self) -> Option<AdmissionBound> {
         let source = self.pool_source.get()?;
         let status = source.status().await?;
-        crate::ready_queue::jobs_the_window_can_pay_for(&status.pace, status.pool_size)
+        let window_jobs =
+            crate::ready_queue::jobs_the_window_can_pay_for(&status.pace, status.pool_size)?;
+        Some(AdmissionBound {
+            window_jobs,
+            pace: status.pace,
+            pool_size: status.pool_size,
+        })
     }
 
     /// Write one pass's admission arithmetic for one queue.
@@ -1528,6 +1584,7 @@ mod consumer_ack_tests {
             result_claim_idle_secs: 0,
             result_claim_interval_secs: 1,
             result_claim_batch: 16,
+            ready_task_poll_interval_secs: 0,
         };
         let runtime = test_runtime_with(backend.clone(), config);
 
@@ -1636,6 +1693,7 @@ mod consumer_ack_tests {
             result_claim_idle_secs: 600,
             result_claim_interval_secs: 1,
             result_claim_batch: 16,
+            ready_task_poll_interval_secs: 0,
         };
         let runtime = test_runtime_with(backend.clone(), config);
         let stream = "orchestrator:results:ws-observe-test".to_string();
@@ -1712,6 +1770,7 @@ mod consumer_ack_tests {
             result_claim_idle_secs: 600,
             result_claim_interval_secs: 1,
             result_claim_batch: 16,
+            ready_task_poll_interval_secs: 0,
         };
         let runtime = test_runtime_with(backend.clone(), config);
         let msg = DagMessage::TaskComplete {
