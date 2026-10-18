@@ -518,7 +518,7 @@ All communication layers are abstracted through `cog-core` Backend Traits — **
 | External API | — | HTTP / WebSocket | — |
 
 `MessageBackend` Trait definition (`crates/cog-core/src/contract/stream.rs`):
-- `publish` / `publish_batch` / `payload_limit` / `subscribe` / `subscribe_from` / `create_consumer_group` / `ack` / `claim_pending` / `pending_stats` / `dlq` / `delay_publish`
+- `publish` / `publish_batch` / `payload_limit` / `subscribe` / `subscribe_from` / `create_consumer_group` / `ack` / `claim_pending` / `pending_stats` / `stream_lag` / `dlq` / `delay_publish`
 - Implementations can optimize batching and delayed delivery for Redis pipelines, NATS concurrent publishing, in-memory single-lock, etc.
 
 ### 🗄️ Storage (hot-swappable Backend Traits)
