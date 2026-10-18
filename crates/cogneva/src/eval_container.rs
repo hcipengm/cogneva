@@ -401,22 +401,34 @@ impl BuildahRuntime {
 /// `--format` 并不报错，它把 `<no value>` 打到 stdout 且退出码为 0（实测：`{{.Store.GraphRoot}}`
 /// 大小写不对就是这个样子），只看「非空」会把这个前缀读成可用。
 async fn probe(prefix: &[String]) -> bool {
-    let mut cmd = tokio::process::Command::new(&prefix[0]);
-    cmd.args(&prefix[1..]);
-    cmd.arg("info").arg("--format").arg("{{.store.GraphRoot}}");
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let Ok(child) = cmd.kill_on_drop(true).spawn() else {
+    // 探的是**起容器的那个动词**，不是「store 在哪」。`buildah info` 只读配置：一台读得出
+    // store 的机器，照样可能在真起容器时被拒（集群 Pod 里就是这一种——overlay 驱动初始化
+    // 直接失败，而 `info` 与真操作在错误的机器上给出相反的答案）。`from scratch` 不带镜像、
+    // 不拉网络，走的是 `Container::create` 的同一条命令，只是省掉解 layer 那一段；那一段
+    // 的失败由 `create()` 的具名诊断翻成人话。
+    let name = format!("cogneva-eval-probe-{}", std::process::id());
+    let spawn = |args: &[&str]| {
+        let mut cmd = tokio::process::Command::new(&prefix[0]);
+        cmd.args(&prefix[1..])
+            .args(args.iter().copied())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        cmd.kill_on_drop(true).spawn()
+    };
+    let Ok(child) = spawn(&["from", "--name", &name, "scratch"]) else {
         return false;
     };
-    match tokio::time::timeout(Duration::from_secs(20), child.wait_with_output()).await {
-        Ok(Ok(out)) => {
-            let root = String::from_utf8_lossy(&out.stdout);
-            out.status.success() && root.trim().starts_with('/')
-        }
-        _ => false,
+    let started =
+        match tokio::time::timeout(Duration::from_secs(20), child.wait_with_output()).await {
+            Ok(Ok(out)) => out.status.success(),
+            _ => false,
+        };
+    // 探针容器不管成没成都收掉：留下一个同名容器会让下一次探测的 `from` 直接失败。
+    if let Ok(mut cleanup) = spawn(&["rm", &name]) {
+        let _ = tokio::time::timeout(Duration::from_secs(20), cleanup.wait()).await;
     }
+    started
 }
 
 /// buildah 的全局参数：驱动一旦定下，每条命令都要带。
@@ -443,6 +455,16 @@ fn args_with_driver(driver: Option<&str>, args: &[String]) -> Vec<String> {
 /// driver`。
 fn overlay_driver_cannot_nest(stderr: &str) -> bool {
     stderr.contains("is not supported over overlayfs")
+}
+
+/// 这条 stderr 是不是「解 layer 时被拒 `remount /`」——即执行面没有写 store 的权限。
+///
+/// 与上一条分开认，因为两条的补救正好相反：overlay 那条换驱动就能过，这一条换驱动无用
+/// （vfs 也会解 layer），只能换载体或提权。实测原文（2026-10-18，Pod 内 vfs 重试）：
+/// `While applying layer: ApplyLayer stdout: stderr: remount /, flags: 0x44000: permission
+/// denied`。两个词都要有：单看 `permission denied` 会把「镜像仓库 401」一并吞进来。
+fn layer_apply_denied(stderr: &str) -> bool {
+    stderr.contains("ApplyLayer") && stderr.contains("permission denied")
 }
 
 /// `buildah images --format '{{.Name}}:{{.Tag}}'` 的正文 → 一份 ref 集合。
@@ -490,8 +512,18 @@ impl Container {
                 .await?;
         }
         if out.code != Some(0) {
+            // 这一条只在**容器里**出现：镜像的 layer 要写进 store 时 buildah 会 remount `/`，
+            // 而普通的 Pod 没有这个权限。原文只写 `ApplyLayer … permission denied`，读的人
+            // 会去查镜像、查题、查网络——所以这里把成因翻成一句话，再附上原文当证据。
+            // 它是**载体**的性质，不是题的结局：换宿主跑或给 Pod 提权都能消掉。
+            let cause = if layer_apply_denied(&out.stderr) {
+                "this execution face cannot unpack image layers (buildah was refused `remount /`; \
+                 it needs a privileged container or the host's buildah): "
+            } else {
+                ""
+            };
             anyhow::bail!(
-                "cannot start a container from {image}: {}",
+                "cannot start a container from {image}: {cause}{}",
                 tail(&out.stderr, 800)
             );
         }
@@ -1311,6 +1343,25 @@ docker.m.daocloud.io/library/busybox:1.36
             "Error: running `buildah from` requires root"
         ));
         assert!(!overlay_driver_cannot_nest(""));
+    }
+
+    /// 解 layer 被拒只认 `ApplyLayer` ＋ `permission denied` **同时**出现的那一条。
+    /// 第一段原文是从评测 Pod 里逐字抄回来的（2026-10-18，vfs 重试）；反例是取镜像时的
+    /// 仓库鉴权失败——它同样写着 `permission denied`，但换载体或提权都救不了它，
+    /// 把它读成「执行面没权限」会让人去改 Pod 规格而不是修凭证。
+    #[test]
+    fn only_the_layer_apply_refusal_names_the_carrier() {
+        let refused = "Error: writing blob: adding layer with blob \"sha256:7e44806e\": \
+                       While applying layer: ApplyLayer stdout: stderr: remount /, \
+                       flags: 0x44000: permission denied";
+        assert!(layer_apply_denied(refused));
+        assert!(!layer_apply_denied(
+            "Error: initializing source docker://ghcr.io/x: reading manifest: permission denied"
+        ));
+        assert!(!layer_apply_denied(
+            "Error: running `buildah from` requires root"
+        ));
+        assert!(!layer_apply_denied(""));
     }
 
     /// 驱动旗标是 buildah 的**全局**参数，必须在子命令之前。放到后面时 buildah 会把它当成
