@@ -1,4 +1,5 @@
 //! principle: feedback_a_word_boundary_only_applies_where_both_ends_are_word_characters
+//! principle: feedback_the_pending_split_reads_only_two_kinds_so_the_absence_rows_are_never_measured
 //! Measuring a change's own check against the project's tree.
 //!
 //! A ledger row names an artifact as a kind, a scope and a literal, and the state
