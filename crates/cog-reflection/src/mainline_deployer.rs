@@ -1469,6 +1469,15 @@ struct MainlineState {
     /// 最近一次问上游 CI 得到的判词，连同它问的是哪个 rev。见 [`CiVerdictRecord`]。
     #[serde(default)]
     last_ci_verdict: Option<CiVerdictRecord>,
+    /// `last_good_rev` 落地的那一刻，unix 秒。
+    ///
+    /// `last_good_rev` 只说"是哪一版"，不说"上线多久了"。而时长是另一件事：同一份
+    /// 读数上，落地二十分钟与落地两天完全同形，处置却相反。滚动 Job 上的完成时刻能
+    /// 代答，但那个 Job 只留 24 小时（`ttlSecondsAfterFinished: 86400`）；过了这一
+    /// 段，验收读数连"这一版换上去过没有"的旁证都没有了——它会把 Job 被回收读成
+    /// "Job 缺席"。有这一格，缺席才敢按年龄分开判。
+    #[serde(default)]
+    last_good_unix: i64,
     /// 连续多少轮没从构建闸拿到槽。拿不到就原样回下一轮，不留状态，于是这一支
     /// 在读数上完全同形——无论撞的是一次别人的构建，还是槽被一个永远不松手的
     /// 持有者占着。落盘是因为重启正是这个进程自己会做的事：计数在内存里的话，
@@ -4206,6 +4215,7 @@ impl MainlineDeployer {
                 self.promote_local_tag(&inflight.rev).await?;
                 state.last_good_rev = Some(inflight.rev.clone());
                 state.last_good_tag = Some(main_image(&self.pull_endpoint(), &inflight.rev));
+                state.last_good_unix = chrono::Utc::now().timestamp();
                 state.in_flight = None;
                 state.failed_rev = None;
                 state.failed_signatures.clear();
@@ -8441,6 +8451,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             registry_gc_owed: false,
             buildah_store_unix: 0,
             last_ci_verdict: None,
+            last_good_unix: 0,
         };
         let msg = heartbeat_message(&state, "aabbccddeeff0011", "up-to-date(aabbccddeeff)", 1000);
         assert!(msg.contains("in_flight=aabbccddeeff@Pushed"), "{msg}");
@@ -8843,6 +8854,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
                 reasons: vec!["github:connect_failed".into()],
                 decided_unix: 1234,
             }),
+            last_good_unix: 1700000000,
         };
         let text = serde_json::to_string(&state).unwrap();
         let back: MainlineState = serde_json::from_str(&text).unwrap();
@@ -12614,6 +12626,13 @@ exit 0
         assert_eq!(
             state.last_good_tag.as_deref(),
             Some(main_image("localhost:30500", &rev_b).as_str())
+        );
+        // 落地时刻也要落盘：Job 只留 24 小时，之后"这一版上线多久了"只剩这一格。
+        let now = chrono::Utc::now().timestamp();
+        assert!(
+            state.last_good_unix > 0 && state.last_good_unix <= now,
+            "收敛时要写下落地时刻，记到的是 {}",
+            state.last_good_unix
         );
     }
 
