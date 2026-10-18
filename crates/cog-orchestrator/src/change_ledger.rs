@@ -2803,6 +2803,7 @@ fn pool_verdict(
             resume_at_unix: 0,
             evidenced_recovery_unix: 0,
             quota_window_secs: 0,
+            pool_size: 0,
             window_pace: None,
         };
     };
@@ -2828,6 +2829,7 @@ fn pool_verdict(
         resume_at_unix,
         evidenced_recovery_unix: status.evidenced_recovery_unix,
         quota_window_secs: status.quota_window_secs,
+        pool_size: status.pool_size,
         // `measured_upstreams == 0` is "not paced" -- the field's own meaning --
         // and writing that pace down would make "no window was measured" and
         // "a window measured to allow nothing" the same three zeros.
@@ -2847,6 +2849,13 @@ struct PoolVerdict {
     resume_at_unix: i64,
     evidenced_recovery_unix: i64,
     quota_window_secs: u64,
+    /// How many upstreams the pool is configured with, from the same snapshot.
+    ///
+    /// Carried so the batch bound can tell a pool-wide measurement from one
+    /// that covered a subset: the pace sums the upstreams that reported a
+    /// window, and a batch sized on that sum while other members went
+    /// unmeasured would be sized by one ruler and refused by another.
+    pool_size: usize,
     /// The window pace the same snapshot carried, when it carried a measurement.
     ///
     /// It rides the verdict rather than being read a second time from the
@@ -2881,11 +2890,14 @@ fn handovers_for_this_pass(verdict: &PoolVerdict, ceiling: usize) -> usize {
     let Some(pace) = verdict.window_pace else {
         return ceiling;
     };
-    if pace.measured_upstreams == 0 || pace.reserve_tokens == 0 {
+    // The same derivation the ready-queue publisher uses, so the two dispatch
+    // paths cannot size their batches by different rules. It also carries the
+    // guard this file used to lack: a pace summed over a subset of the pool is
+    // not a bound for the pool.
+    let Some(fits) = crate::ready_queue::jobs_the_window_can_pay_for(&pace, verdict.pool_size)
+    else {
         return ceiling;
-    }
-    let remaining = pace.allowance_tokens.saturating_sub(pace.spent_tokens);
-    let fits = remaining / pace.reserve_tokens;
+    };
     // The cast cannot lose a real batch: `ceiling` is single digits in the
     // hundreds and `fits` only matters below it, so saturating at `ceiling`
     // first keeps a huge remaining allowance from wrapping anything.
@@ -3941,6 +3953,7 @@ mod tests {
                 allowance_tokens: 10_000_000,
                 spent_tokens: 9_000_000,
                 reserve_tokens: 500_000,
+                reserve_population: 5,
                 window_secs: 604_800,
                 window_start_unix: now - 86_400,
             },
@@ -3958,6 +3971,7 @@ mod tests {
                 allowance_tokens: 0,
                 spent_tokens: 0,
                 reserve_tokens: 0,
+                reserve_population: 0,
                 window_secs: 0,
                 window_start_unix: 0,
             },
@@ -3983,6 +3997,7 @@ mod tests {
                     allowance_tokens: allowance,
                     spent_tokens: spent,
                     reserve_tokens: reserve,
+                    reserve_population: 5,
                     window_secs: 604_800,
                     window_start_unix: 0,
                 },
@@ -4026,6 +4041,27 @@ mod tests {
         assert_eq!(
             handovers_for_this_pass(&with_pace(1, 1_000_000, 2_000_000, 500_000), 200),
             0
+        );
+
+        // A pace summed over one member of a three-upstream pool is not a bound
+        // for the pool: the other two were never measured, so nothing says the
+        // batch they would serve is refused. The ceiling stands.
+        let partial_pool = LlmPoolStatus {
+            pace: LlmWindowPace {
+                measured_upstreams: 1,
+                allowance_tokens: 1_000_000,
+                spent_tokens: 900_000,
+                reserve_tokens: 500_000,
+                reserve_population: 5,
+                window_secs: 604_800,
+                window_start_unix: 0,
+            },
+            pool_size: 3,
+            ..Default::default()
+        };
+        assert_eq!(
+            handovers_for_this_pass(&pool_verdict(Some(&partial_pool), now, 300), 200),
+            200
         );
     }
 
@@ -4847,6 +4883,7 @@ mod tests {
             resume_at_unix: 1_760_000_000,
             evidenced_recovery_unix: 1_759_999_000,
             quota_window_secs: 2_592_000,
+            pool_size: 0,
             window_pace: None,
         };
 

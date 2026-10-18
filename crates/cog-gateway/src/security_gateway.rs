@@ -9675,23 +9675,25 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
     /// 拒绝就会读成"整池没额度"。
     #[test]
     fn a_refusal_carries_the_reading_it_was_decided_on() {
-        let upstreams = vec![
+        let upstreams = [
             stub_upstream("https://fast.example.com", "m1"),
             stub_upstream("https://slow.example.com", "m2"),
         ];
         let candidates: Vec<&LlmUpstream> = upstreams.iter().collect();
         let now = Utc::now().timestamp();
         let start = now - 1;
-        let mut reading = WindowPaceReading::default();
         // 池级报表：还有 5,000 额度没花。闸门看的是下面两条逐家读数。
-        reading.pool = cog_core::LlmWindowPace {
-            measured_upstreams: 2,
-            allowance_tokens: 5_000,
-            spent_tokens: 1_000,
-            reserve_tokens: 300,
-            reserve_population: 9,
-            window_secs: 1_000,
-            window_start_unix: start,
+        let mut reading = WindowPaceReading {
+            pool: cog_core::LlmWindowPace {
+                measured_upstreams: 2,
+                allowance_tokens: 5_000,
+                spent_tokens: 1_000,
+                reserve_tokens: 300,
+                reserve_population: 9,
+                window_secs: 1_000,
+                window_start_unix: start,
+            },
+            ..Default::default()
         };
         for (upstream, rate, missing) in [
             (upstreams[0].clone(), 1_000.0, 100_000u64),
