@@ -416,17 +416,27 @@ async fn probe(prefix: &[String]) -> bool {
             .stderr(Stdio::null());
         cmd.kill_on_drop(true).spawn()
     };
-    let Ok(child) = spawn(&["from", "--name", &name, "scratch"]) else {
-        return false;
-    };
-    let started =
-        match tokio::time::timeout(Duration::from_secs(20), child.wait_with_output()).await {
-            Ok(Ok(out)) => out.status.success(),
-            _ => false,
+    // 起不来再看一次：宿主上同时有构建在跑，store 的锁可能被占住，一次探测的失败不足以
+    // 判定「这台机器起不了容器」——那会把整列判成缺席，而机器其实只是忙。二进制本身不
+    // 存在时 spawn 直接失败，那种情况没有重试的意义。
+    let mut started = false;
+    for _ in 0..2 {
+        let Ok(child) = spawn(&["from", "--name", &name, "scratch"]) else {
+            return false;
         };
-    // 探针容器不管成没成都收掉：留下一个同名容器会让下一次探测的 `from` 直接失败。
-    if let Ok(mut cleanup) = spawn(&["rm", &name]) {
-        let _ = tokio::time::timeout(Duration::from_secs(20), cleanup.wait()).await;
+        started =
+            match tokio::time::timeout(Duration::from_secs(20), child.wait_with_output()).await {
+                Ok(Ok(out)) => out.status.success(),
+                _ => false,
+            };
+        // 探针容器不管成没成都收掉：留下一个同名容器会让下一次 `from` 直接失败
+        // （重试那一次也走这条清理，否则第二次会撞上自己）。
+        if let Ok(mut cleanup) = spawn(&["rm", &name]) {
+            let _ = tokio::time::timeout(Duration::from_secs(20), cleanup.wait()).await;
+        }
+        if started {
+            break;
+        }
     }
     started
 }
