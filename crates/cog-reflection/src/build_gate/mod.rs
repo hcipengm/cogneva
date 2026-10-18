@@ -3547,6 +3547,18 @@ unevictable 28532736
             // close exactly once.
             let fd = unsafe { libc::dup(file.as_raw_fd()) };
             assert!(fd >= 0, "dup failed");
+            // `dup` copies the description but not the close-on-exec flag, and the
+            // file it came from was opened with that flag set. Left clear, the copy
+            // would ride into any child another test in this binary spawns during
+            // the window and keep the lock held past the exec -- a reference this
+            // test cannot see and does not drop. Setting the flag back keeps the
+            // only references the ones this test holds.
+            // SAFETY: `fd` is open and this thread owns it.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(flags >= 0, "fcntl F_GETFD failed");
+            // SAFETY: as above; `F_SETFD` with a value built from the flags just read.
+            let set = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+            assert!(set >= 0, "fcntl F_SETFD failed");
             // SAFETY: `fd` is a fresh descriptor owned by nobody else.
             unsafe { OwnedFd::from_raw_fd(fd) }
         }
