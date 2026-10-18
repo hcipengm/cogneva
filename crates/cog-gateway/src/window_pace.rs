@@ -223,6 +223,12 @@ pub fn wait_secs(pace: &LlmWindowPace, rate_per_sec: f64, now_unix: i64) -> Opti
         if need as f64 <= capacity {
             // One more whole job fits the window: solve the ramp for the
             // instant it covers `need`, not for a shortfall measured from now.
+            //
+            // A reach already behind `now` is not a defect: `blocked()` was
+            // decided from a published pace snapshot, and time kept moving --
+            // the ramp has since covered the need, so the truthful answer is
+            // "now" (one second), not a wait invented to look deliberate. The
+            // next decision re-reads the pace either way.
             let reach = start as f64 + window_secs as f64 * need as f64 / capacity;
             return Some((reach - now_unix as f64).ceil().max(1.0) as u64);
         }
