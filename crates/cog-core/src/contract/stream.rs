@@ -171,16 +171,17 @@ pub trait MessageBackend: Send + Sync {
     /// number — a message still queued behind a backlog is not lost, and
     /// republishing it only adds a copy the queue has to carry.
     ///
-    /// `None` means this backend cannot say, and it is the default rather than
-    /// a required method on the same terms as `pending_stats`'s `None`: a
-    /// backend that has no notion of an undelivered backlog must not inherit a
-    /// made-up zero. Callers treat `None` as "no evidence of a backlog" and keep
-    /// their ordinary behavior, because an unreadable queue is not a reading of
-    /// an empty one.
-    async fn stream_lag(&self, stream: &str, group: &str) -> SFResult<Option<u64>> {
-        let _ = (stream, group);
-        Ok(None)
-    }
+    /// `None` means this backend cannot say. Callers treat it as "no evidence
+    /// of a backlog" and keep their ordinary behavior, because an unreadable
+    /// queue is not a reading of an empty one.
+    ///
+    /// Required rather than defaulted on the same terms as
+    /// [`Self::pending_stats`]: a backend that does hold undelivered messages
+    /// must not inherit "cannot say" through a trait object call, and a
+    /// backend that holds none has to say so itself. The two failures read
+    /// differently to the caller — one keeps re-arming a message that is still
+    /// in line, the other stops waiting for one that never will be.
+    async fn stream_lag(&self, stream: &str, group: &str) -> SFResult<Option<u64>>;
 
     /// Publish a message to the dead-letter queue for the given stream.
     ///

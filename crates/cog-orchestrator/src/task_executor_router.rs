@@ -707,6 +707,12 @@ mod ready_pipeline_tests {
         ) -> SFResult<Option<cog_core::PendingStats>> {
             Ok(None)
         }
+        /// These doubles carry the messages the router's own code hands over
+        /// and keep no per-group position, so they cannot say what a group has
+        /// not been handed.
+        async fn stream_lag(&self, _stream: &str, _group: &str) -> SFResult<Option<u64>> {
+            Ok(None)
+        }
         async fn dlq(
             &self,
             _stream: &str,
@@ -1027,6 +1033,12 @@ mod ready_pipeline_tests {
         ) -> SFResult<Option<cog_core::PendingStats>> {
             Ok(None)
         }
+        /// These doubles carry the messages the router's own code hands over
+        /// and keep no per-group position, so they cannot say what a group has
+        /// not been handed.
+        async fn stream_lag(&self, _stream: &str, _group: &str) -> SFResult<Option<u64>> {
+            Ok(None)
+        }
         async fn dlq(
             &self,
             _stream: &str,
@@ -1254,6 +1266,12 @@ mod ready_queue_placement_tests {
             _group: &str,
             _idle_threshold_ms: u64,
         ) -> SFResult<Option<cog_core::PendingStats>> {
+            Ok(None)
+        }
+        /// These doubles carry the messages the router's own code hands over
+        /// and keep no per-group position, so they cannot say what a group has
+        /// not been handed.
+        async fn stream_lag(&self, _stream: &str, _group: &str) -> SFResult<Option<u64>> {
             Ok(None)
         }
         async fn dlq(

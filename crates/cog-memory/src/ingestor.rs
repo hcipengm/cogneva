@@ -3005,6 +3005,10 @@ mod tests {
                 .pending_stats(stream, group, idle_threshold_ms)
                 .await
         }
+
+        async fn stream_lag(&self, stream: &str, group: &str) -> SFResult<Option<u64>> {
+            self.inner.stream_lag(stream, group).await
+        }
     }
 
     /// 认领循环每一轮都落一格结局，且三支互斥。

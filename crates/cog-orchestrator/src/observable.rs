@@ -629,6 +629,12 @@ mod tests {
                 Reply::Failing => Err(SFError::Redis("stub failure".into())),
             }
         }
+
+        /// This stub speaks for the pending reading only; a lag question is
+        /// not one it was built to answer.
+        async fn stream_lag(&self, _stream: &str, _group: &str) -> SFResult<Option<u64>> {
+            Ok(None)
+        }
     }
 
     const STREAM: &str = "orchestrator:results:ws-obs-test";

@@ -188,6 +188,14 @@ impl MessageBackend for MemoryMessageBackend {
         Ok(None)
     }
 
+    /// No group state, so nothing to count: a subscriber reads the in-process
+    /// buffer directly and the backend keeps no per-group position that would
+    /// say what has not been handed out. Zero would be a made-up reading of an
+    /// empty queue, so this answers "cannot say" instead.
+    async fn stream_lag(&self, _stream: &str, _group: &str) -> SFResult<Option<u64>> {
+        Ok(None)
+    }
+
     /// No reclaim path, and saying so is the whole answer. Messages live in a
     /// map inside this process, so a message a consumer never took is not
     /// anywhere a claim could reach; there is nothing to hand back and no way

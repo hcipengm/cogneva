@@ -562,6 +562,12 @@ mod tests {
             Ok(None)
         }
 
+        /// No per-group position is kept here, so there is no undelivered
+        /// count to give.
+        async fn stream_lag(&self, _stream: &str, _group: &str) -> SFResult<Option<u64>> {
+            Ok(None)
+        }
+
         async fn claim_pending(
             &self,
             _stream: &str,

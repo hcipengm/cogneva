@@ -1119,6 +1119,13 @@ mod consumer_ack_tests {
             };
             Ok(Some(unreclaimed))
         }
+
+        /// This double models what a consumer has taken and not acked, which
+        /// is the other question; it keeps no unread position a group could be
+        /// behind, so it answers "cannot say" rather than a made-up zero.
+        async fn stream_lag(&self, _stream: &str, _group: &str) -> SFResult<Option<u64>> {
+            Ok(None)
+        }
     }
 
     fn test_runtime(backend: ScriptedBackend) -> DagExecutorRuntime {
@@ -1708,6 +1715,12 @@ mod orphan_reconciler_tests {
             _group: &str,
             _idle_threshold_ms: u64,
         ) -> SFResult<Option<cog_core::PendingStats>> {
+            Ok(None)
+        }
+
+        /// A backend that carries nothing carries no backlog either; saying so
+        /// is the whole answer.
+        async fn stream_lag(&self, _stream: &str, _group: &str) -> SFResult<Option<u64>> {
             Ok(None)
         }
     }
