@@ -31,6 +31,14 @@
 //!   never been taken is not a reading of zero; serving the epoch here would
 //!   say the producer last delivered in 1970. The rule that catches the
 //!   never-delivered state reads the absence itself.
+//! - **The row says who started the run.** The same producer runs on its timer
+//!   and, sometimes, by hand. When both write one row, a manual run overwrites
+//!   the timer's evidence: the stopped rule then reads a fresh moment while the
+//!   timer has been dead for hours, and the proof of a stall can be supplied by
+//!   the very act that should not count as one. So a row is identified by
+//!   `(source, trigger)`, both rows are served, and the rules judge only
+//!   `trigger="timer"` -- a manual delivery stays visible without standing in
+//!   for a scheduled one.
 //!
 //! The reading is taken at scrape time rather than published once per pass by
 //! the account's resident loop, and that is the point of it: what this measures
@@ -48,21 +56,29 @@ use sqlx::{PgPool, Row};
 use cog_core::observability::{DimensionSpec, Observable, RawMetric, TraceFragment};
 use cog_core::{SFError, SFResult};
 
-/// The table the heartbeats are kept in: one row per producer, rewritten in
-/// place.
+/// The table the heartbeats are kept in: one row per producer and trigger,
+/// rewritten in place.
 ///
-/// One row per producer rather than one per delivery: this holds the *latest*
-/// delivery, and a row per delivery would make the reading a query over an
-/// append-only log that grows for as long as the deployment lives. What a
+/// One row per producer and trigger rather than one per delivery: this holds the
+/// *latest* delivery, and a row per delivery would make the reading a query over
+/// an append-only log that grows for as long as the deployment lives. What a
 /// history would answer -- how often the gaps happen -- is answered by the
 /// alert's own series, which Prometheus already keeps.
 pub const HEARTBEAT_TABLE: &str = "principle_producer_pushes";
 
-/// The producer this reading is about, as it names itself in the pushed row.
+/// What started the run that wrote a row: the producer's timer, or a person.
+///
+/// The values are a closed set because the rules select on the column: a typo
+/// would not fail anything, it would create a third trigger whose rows no rule
+/// reads -- a producer that looks alive only to itself.
+pub const TRIGGER_TIMER: &str = "timer";
+pub const TRIGGER_MANUAL: &str = "manual";
+
+/// The name the principle ledger's producer gives itself in the row it writes.
 ///
 /// The source is a column rather than an assumption because the row is written
 /// by the producer, not by this crate: a second producer of the same account
-/// needs no change here.
+/// needs no change here, and this crate never filters the table by name.
 pub const PRINCIPLE_PRODUCER_SOURCE: &str = "principle-ledger-tsv.sh";
 
 /// When the named producer last completed a delivery, as the platform's clock
@@ -81,9 +97,12 @@ pub const PRODUCER_PUSH_PERIOD: &str = "cogneva_principle_producer_push_period_s
 /// This store's schema, and the one a restore replays.
 pub const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS principle_producer_pushes (
-                source         TEXT PRIMARY KEY,
+                source         TEXT NOT NULL,
+                trigger        TEXT NOT NULL DEFAULT 'timer'
+                               CHECK (trigger IN ('timer', 'manual')),
                 pushed_at      TIMESTAMPTZ NOT NULL,
-                period_seconds BIGINT NOT NULL
+                period_seconds BIGINT NOT NULL,
+                PRIMARY KEY (source, trigger)
             );
 "#;
 
@@ -91,6 +110,7 @@ CREATE TABLE IF NOT EXISTS principle_producer_pushes (
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProducerHeartbeat {
     pub source: String,
+    pub trigger: String,
     pub pushed_at: DateTime<Utc>,
     pub period_seconds: i64,
 }
@@ -114,73 +134,90 @@ impl ProducerHeartbeatStore {
     /// already run against, and a reading that silently has nothing to read on a
     /// fresh deployment is indistinguishable from a producer that never ran.
     /// `IF NOT EXISTS` is what makes two creators agree rather than race.
+    ///
+    /// On a database that already holds the old one-column key, this statement
+    /// is a no-op; the `(source, trigger)` key and the column that goes with it
+    /// are applied by migration 061 in `cog-storage`, which also runs at
+    /// startup. A fresh database gets the final shape from here, and an existing
+    /// one gets it from there; neither path drops a row.
     pub async fn init_schema(&self) -> anyhow::Result<()> {
         sqlx::raw_sql(DDL).execute(&self.pool).await?;
         Ok(())
     }
 
-    /// The latest delivery of one producer, or `None` if it has never delivered.
+    /// The latest delivery of every producer and every trigger, or an empty set
+    /// if nothing has ever delivered.
     ///
-    /// `None` and a row from long ago are different findings and are not
+    /// An empty set and a row from long ago are different findings and are not
     /// collapsed: the first is a producer that has never run, the second one
     /// that ran and stopped.
-    pub async fn latest(&self, source: &str) -> SFResult<Option<ProducerHeartbeat>> {
-        let row = sqlx::query(&format!(
-            "SELECT source, pushed_at, period_seconds FROM {HEARTBEAT_TABLE} WHERE source = $1"
+    ///
+    /// Every row, not one row per source: a source has one row per trigger, and
+    /// a reader that picked one of them by source would silently drop the other
+    /// -- exactly the row the stopped rule needs when the timer is the one that
+    /// went quiet.
+    pub async fn latest_all(&self) -> SFResult<Vec<ProducerHeartbeat>> {
+        let rows = sqlx::query(&format!(
+            "SELECT source, \"trigger\", pushed_at, period_seconds FROM {HEARTBEAT_TABLE} \
+             ORDER BY source, \"trigger\""
         ))
-        .bind(source)
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await
         .map_err(|e| SFError::Database(format!("read {HEARTBEAT_TABLE}: {e}")))?;
-        Ok(row.map(|r| ProducerHeartbeat {
-            source: r.get("source"),
-            pushed_at: r.get("pushed_at"),
-            period_seconds: r.get("period_seconds"),
-        }))
+        Ok(rows
+            .into_iter()
+            .map(|r| ProducerHeartbeat {
+                source: r.get("source"),
+                trigger: r.get("trigger"),
+                pushed_at: r.get("pushed_at"),
+                period_seconds: r.get("period_seconds"),
+            })
+            .collect())
     }
 }
 
 /// Serves the producers' last deliveries to Prometheus.
 pub struct ProducerHeartbeatObservable {
     store: ProducerHeartbeatStore,
-    source: String,
 }
 
 impl ProducerHeartbeatObservable {
-    pub fn new(store: ProducerHeartbeatStore, source: impl Into<String>) -> Self {
-        Self {
-            store,
-            source: source.into(),
-        }
+    pub fn new(store: ProducerHeartbeatStore) -> Self {
+        Self { store }
     }
 }
 
-/// The two readings, from the row, or nothing at all.
+/// The two readings per row, or nothing at all.
 ///
 /// A free function rather than a method because the row already carries the
-/// name the label is taken from: which producer this is comes off the row, not
-/// off the handle that asked for it. That also keeps the whole of the shape
-/// testable without a database -- the pool a handle needs cannot even be built
-/// outside a runtime.
+/// names the labels are taken from: which producer this is, and what started
+/// it, come off the row, not off the handle that asked for it. That also keeps
+/// the whole of the shape testable without a database -- the pool a handle
+/// needs cannot even be built outside a runtime.
 ///
 /// The age is deliberately not computed here. Prometheus already knows the
 /// time, and a rule that subtracts the stored moment from `time()` reads the
 /// same number without this process having to decide when "now" was -- a
 /// decision that would freeze into the sample and make the age a function of
 /// the scrape interval rather than of the producer.
-fn readings(row: Option<ProducerHeartbeat>) -> Vec<RawMetric> {
-    match row {
-        Some(row) => vec![
-            RawMetric::new(
+fn readings(rows: Vec<ProducerHeartbeat>) -> Vec<RawMetric> {
+    let mut out = Vec::with_capacity(rows.len() * 2);
+    for row in rows {
+        for (name, value) in [
+            (
                 PRODUCER_LAST_PUSH_TIMESTAMP,
                 row.pushed_at.timestamp() as f64,
-            )
-            .with_label("source", row.source.clone()),
-            RawMetric::new(PRODUCER_PUSH_PERIOD, row.period_seconds as f64)
-                .with_label("source", row.source),
-        ],
-        None => Vec::new(),
+            ),
+            (PRODUCER_PUSH_PERIOD, row.period_seconds as f64),
+        ] {
+            out.push(
+                RawMetric::new(name, value)
+                    .with_label("source", row.source.clone())
+                    .with_label("trigger", row.trigger.clone()),
+            );
+        }
     }
+    out
 }
 
 #[async_trait]
@@ -191,11 +228,10 @@ impl Observable for ProducerHeartbeatObservable {
     /// whole scrape instead would take every other reading on this endpoint down
     /// with a fault that is about one table.
     async fn collect_metrics(&self, _dimension: &str) -> SFResult<Vec<RawMetric>> {
-        let row = match self.store.latest(&self.source).await {
-            Ok(row) => row,
+        let rows = match self.store.latest_all().await {
+            Ok(rows) => rows,
             Err(e) => {
                 tracing::warn!(
-                    source = %self.source,
                     error = %e,
                     "producer heartbeat could not be read; its series is absent from this \
                      scrape, and the rule that watches it reads that absence as a producer \
@@ -204,7 +240,7 @@ impl Observable for ProducerHeartbeatObservable {
                 return Ok(Vec::new());
             }
         };
-        Ok(readings(row))
+        Ok(readings(rows))
     }
 
     async fn collect_trace(&self, _task_id: &str) -> SFResult<Vec<TraceFragment>> {
@@ -222,9 +258,10 @@ impl Observable for ProducerHeartbeatObservable {
 mod tests {
     use super::*;
 
-    fn stamped(seconds: i64, period: i64) -> ProducerHeartbeat {
+    fn stamped(trigger: &str, seconds: i64, period: i64) -> ProducerHeartbeat {
         ProducerHeartbeat {
             source: PRINCIPLE_PRODUCER_SOURCE.to_string(),
+            trigger: trigger.to_string(),
             pushed_at: DateTime::from_timestamp(seconds, 0).expect("a valid instant"),
             period_seconds: period,
         }
@@ -234,7 +271,7 @@ mod tests {
     /// rule can subtract it from the platform's own `time()`.
     #[test]
     fn the_moment_is_served_as_the_instant_and_the_period_beside_it() {
-        let out = readings(Some(stamped(1_760_000_000, 1_832)));
+        let out = readings(vec![stamped(TRIGGER_TIMER, 1_760_000_000, 1_832)]);
         let by_name = |name: &str| {
             out.iter()
                 .find(|m| m.name == name)
@@ -249,6 +286,12 @@ mod tests {
                 "{} carries no source label",
                 metric.name
             );
+            assert_eq!(
+                metric.labels.get("trigger").map(String::as_str),
+                Some(TRIGGER_TIMER),
+                "{} carries no trigger label",
+                metric.name
+            );
         }
     }
 
@@ -258,7 +301,7 @@ mod tests {
     /// period would make the stopped rule divide by a number nothing declared.
     #[test]
     fn a_producer_that_has_never_delivered_publishes_nothing() {
-        assert!(readings(None).is_empty());
+        assert!(readings(Vec::new()).is_empty());
     }
 
     /// The two series are published together or not at all: a moment without a
@@ -266,8 +309,40 @@ mod tests {
     /// moment leaves it with nothing to measure.
     #[test]
     fn the_pair_is_never_split() {
-        let out = readings(Some(stamped(1, 1)));
+        let out = readings(vec![stamped(TRIGGER_TIMER, 1, 1)]);
         assert_eq!(out.len(), 2);
-        assert!(readings(None).is_empty());
+        assert!(readings(Vec::new()).is_empty());
+    }
+
+    /// A manual delivery and a scheduled one are two findings, and the later
+    /// manual row must not take the timer's place: the stopped rule subtracts
+    /// from the timer's moment, so replacing it would let a person keep a dead
+    /// timer looking alive by running the producer by hand.
+    #[test]
+    fn a_manual_delivery_stands_beside_the_timers_instead_of_replacing_it() {
+        let out = readings(vec![
+            stamped(TRIGGER_TIMER, 1_000, 1_800),
+            stamped(TRIGGER_MANUAL, 2_000, 1_800),
+        ]);
+        assert_eq!(out.len(), 4, "both rows must be served");
+        let mut timed: Vec<(String, f64)> = out
+            .iter()
+            .filter(|m| m.name == PRODUCER_LAST_PUSH_TIMESTAMP)
+            .map(|m| {
+                (
+                    m.labels.get("trigger").cloned().unwrap_or_default(),
+                    m.value,
+                )
+            })
+            .collect();
+        timed.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            timed,
+            vec![
+                ("manual".to_string(), 2_000.0),
+                ("timer".to_string(), 1_000.0)
+            ],
+            "the timer's moment must survive a later manual push"
+        );
     }
 }

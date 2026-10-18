@@ -363,10 +363,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                     Ok(store) => match store.init_schema().await {
                         Ok(()) => {
                             ctx.publish_observable(Arc::new(
-                                crate::producer_heartbeat::ProducerHeartbeatObservable::new(
-                                    store,
-                                    crate::producer_heartbeat::PRINCIPLE_PRODUCER_SOURCE,
-                                ),
+                                crate::producer_heartbeat::ProducerHeartbeatObservable::new(store),
                             ));
                             info!("producer heartbeat readings published");
                         }
