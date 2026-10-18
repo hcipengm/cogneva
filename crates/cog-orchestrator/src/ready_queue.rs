@@ -90,6 +90,41 @@ pub fn jobs_the_window_can_pay_for(
     Some(pace.allowance_tokens.saturating_sub(pace.spent_tokens) / pace.reserve_tokens)
 }
 
+/// How many pool members a pace measurement has to cover before it may bound
+/// the queue.
+///
+/// Members whose last refusal was `entitlement` cannot come back by waiting:
+/// the subscription, model, or account is not there, so the same refusal will
+/// be there for as long as the configuration stands. Counting them makes the
+/// measurement permanently partial -- two of the four upstreams in the pool
+/// this was written against answer that way -- and a partial measurement is
+/// deliberately `None`, which admits everything. That is the failure the bound
+/// exists to prevent, reintroduced through the denominator.
+///
+/// A member that is merely out of quota still counts: its window rolls, so it
+/// is part of what the pool will be able to pay for.
+pub fn measurable_pool_size(status: &cog_core::LlmPoolStatus) -> usize {
+    let permanently_out = status
+        .upstream_evidence
+        .iter()
+        .filter(|entry| entry.refusal_kind == "entitlement")
+        .count();
+    status.pool_size.saturating_sub(permanently_out)
+}
+
+/// The pool's own bound, read off the whole status rather than the pace alone.
+///
+/// `unavailable` is a statement about the pool, not about one member: the
+/// window's allowance keeps accruing while nothing serves, so a pool that is
+/// down would otherwise admit work the moment the allowance crosses one job's
+/// cost and hand the queue to a pool that cannot take it.
+pub fn jobs_the_window_can_pay_for_status(status: &cog_core::LlmPoolStatus) -> Option<u64> {
+    if status.unavailable {
+        return Some(0);
+    }
+    jobs_the_window_can_pay_for(&status.pace, measurable_pool_size(status))
+}
+
 /// How many of `ready` may go on the wire, given what the queue already owes.
 ///
 /// `window_jobs` is the pool's own bound, or `None` when nothing measured one
@@ -255,6 +290,75 @@ mod tests {
         assert_eq!(admitted(10, 20, Some(8)), 0);
         // Fewer ready than the window could pay for: the queue is the bound.
         assert_eq!(admitted(2, 1, Some(100)), 2);
+    }
+
+    fn status(
+        pool_size: usize,
+        measured: usize,
+        unavailable: bool,
+        kinds: &[&str],
+    ) -> cog_core::LlmPoolStatus {
+        cog_core::LlmPoolStatus {
+            unavailable,
+            pool_size,
+            pace: pace(measured, 5_000_000, 3_000_000, 500_000),
+            upstream_evidence: kinds
+                .iter()
+                .map(|kind| cog_core::LlmUpstreamEvidence {
+                    refusal_kind: (*kind).into(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn upstreams_that_can_never_come_back_do_not_make_the_measurement_partial() {
+        // Two of four members answer `entitlement`: no window rolls them back,
+        // so the measurement can cover the whole pool this reading can ever
+        // cover. Counting them made this `None`, which admits everything.
+        assert_eq!(
+            jobs_the_window_can_pay_for_status(&status(
+                4,
+                2,
+                false,
+                &["quota_cycle", "entitlement", "quota_cycle", "entitlement"]
+            )),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn a_pool_that_is_down_pays_for_nothing_while_its_allowance_accrues() {
+        // A window's allowance keeps growing whether or not anything serves.
+        // Without the whole-pool statement, the moment it crossed one job's
+        // cost this would start admitting work to a pool that cannot take it.
+        assert_eq!(
+            jobs_the_window_can_pay_for_status(&status(
+                4,
+                2,
+                true,
+                &["quota_cycle", "entitlement", "quota_cycle", "entitlement"]
+            )),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn a_measurement_that_covers_less_than_the_usable_pool_is_still_no_bound() {
+        // One of the two members that can come back reported. That is a subset
+        // of the usable pool, so it is still no bound -- the entitlement
+        // exclusion must not turn a partial reading into a usable one.
+        assert_eq!(
+            jobs_the_window_can_pay_for_status(&status(
+                4,
+                1,
+                false,
+                &["quota_cycle", "entitlement", "quota_cycle", "entitlement"]
+            )),
+            None
+        );
     }
 
     #[test]

@@ -345,8 +345,7 @@ impl DagExecutorRuntime {
     async fn admission_bound(&self) -> Option<AdmissionBound> {
         let source = self.pool_source.get()?;
         let status = source.status().await?;
-        let window_jobs =
-            crate::ready_queue::jobs_the_window_can_pay_for(&status.pace, status.pool_size);
+        let window_jobs = crate::ready_queue::jobs_the_window_can_pay_for_status(&status);
         Some(AdmissionBound {
             window_jobs,
             pace: status.pace,

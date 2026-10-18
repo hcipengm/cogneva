@@ -2818,6 +2818,7 @@ fn pool_verdict(
             quota_window_secs: 0,
             pool_size: 0,
             window_pace: None,
+            measurable_pool_size: 0,
         };
     };
     let resume_at_unix = if status.unavailable {
@@ -2847,6 +2848,10 @@ fn pool_verdict(
         // and writing that pace down would make "no window was measured" and
         // "a window measured to allow nothing" the same three zeros.
         window_pace: (status.pace.measured_upstreams > 0).then_some(status.pace),
+        // Members that answer `entitlement` can never be part of a measurement,
+        // so they leave the denominator rather than holding it below the pool
+        // size forever.
+        measurable_pool_size: crate::ready_queue::measurable_pool_size(status),
     }
 }
 
@@ -2876,6 +2881,14 @@ struct PoolVerdict {
     /// one payload, so a pass cannot size its batch from one window and write
     /// down another.
     window_pace: Option<LlmWindowPace>,
+    /// How many members the measurement has to cover, from the same snapshot.
+    ///
+    /// Not `pool_size`: a member whose last refusal was `entitlement` will
+    /// refuse the same way until someone changes the configuration, so a pool
+    /// that contains one can never have a full measurement in those terms and
+    /// the bound would fall back to the ceiling forever -- which is the
+    /// unbounded dispatch this gate exists to stop.
+    measurable_pool_size: usize,
 }
 
 /// How many rows this pass may hand over, given what the pool said about the
@@ -2925,7 +2938,8 @@ fn handovers_for_this_pass(verdict: &PoolVerdict, ceiling: usize) -> BatchBound 
     // paths cannot size their batches by different rules. It also carries the
     // guard this file used to lack: a pace summed over a subset of the pool is
     // not a bound for the pool.
-    let Some(fits) = crate::ready_queue::jobs_the_window_can_pay_for(&pace, verdict.pool_size)
+    let Some(fits) =
+        crate::ready_queue::jobs_the_window_can_pay_for(&pace, verdict.measurable_pool_size)
     else {
         // `window_pace` is only set when at least one upstream was measured, so
         // the remaining ways to get no bound are a missing job cost and a
@@ -4944,6 +4958,7 @@ mod tests {
             quota_window_secs: 2_592_000,
             pool_size: 0,
             window_pace: None,
+            measurable_pool_size: 0,
         };
 
         let read_back = dispatch_pass(
