@@ -706,6 +706,90 @@ pub struct Wiring {
     /// 声明读不出来时的那句原因。它是**整块**不成立的原因：一块声明里有一行写坏，
     /// 剩下的也不接——半块声明读起来像一次完整的实验，而它少了几行。
     pub foreign_reason: Option<String>,
+    /// 上游池在这一次跑开始那一刻的读数。
+    ///
+    /// 池子不可用时每一格都会在几秒内整列变成同一个 503，报表里就只剩几十句一样的 detail，
+    /// 读的人得自己从网关日志把「是配额、几点能重跑」拼回来。这一行把它提前写进 `## wiring`：
+    /// 那一列的数字是**池子的判词**，不是题的判词，读的人据此决定等还是重跑，而不是去改题。
+    pub pool: Option<PoolReading>,
+}
+
+/// 上游池的一次读数，取自网关自己的 `/metrics`。
+///
+/// 只收三个数，都是平台自己报的：可用上游条数、它给出的下一次可用时刻、它给出的下一次重试
+/// 时刻。后两个为 0 表示它**没有报**，不等于「不会自愈」——两者要分开读。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolReading {
+    pub available: u64,
+    pub evidenced_recovery_unix: u64,
+    pub next_attempt_unix: u64,
+    /// 读数取自哪个端点（配置里那条 base_url，去掉 `/v1`）。
+    pub base: String,
+    /// 读这一下的时刻（unix 秒）。瞬时量没有时刻就读不出「什么时候开始不够用的」。
+    pub probed_at_unix: u64,
+}
+
+impl PoolReading {
+    /// `## wiring` 里的那一行。第一格固定是 `pool`，与缺席那五行同一个位置，只是它不是缺席。
+    fn wiring_line(&self) -> String {
+        format!(
+            "pool\tavailable={}\tevidenced-recovery-unix={}\tnext-attempt-unix={}\t{} (read at {})",
+            self.available,
+            self.evidenced_recovery_unix,
+            self.next_attempt_unix,
+            self.base,
+            self.probed_at_unix
+        )
+    }
+}
+
+/// 网关的指标端点。配置里的 base_url 是 OpenAI 兼容的那一段（以 `/v1` 结尾），
+/// 指标不在它下面，而在同一个服务的根上。
+fn metrics_url(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    let root = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
+    format!("{root}/metrics")
+}
+
+/// 从 Prometheus 文本里取一个标量。名字要**整词**匹配：`llm_pool_available` 不能把
+/// `llm_pool_available_something` 读成自己。
+fn metric_value(body: &str, name: &str) -> Option<f64> {
+    body.lines().find_map(|line| {
+        let rest = line.strip_prefix(name)?;
+        let rest = rest.strip_prefix(' ')?;
+        rest.trim().parse::<f64>().ok()
+    })
+}
+
+/// 读一次池子。读不到就是 `None`：这一条是**附加**读数，不是依赖，它失败不该让整轮不出表。
+async fn read_pool(http: &Arc<dyn HttpClient>, base_url: &str) -> Option<PoolReading> {
+    let url = metrics_url(base_url);
+    let mut req = cog_core::HttpRequest::get(url);
+    req.timeout_secs = Some(3);
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(5), http.execute(req))
+        .await
+        .ok()?
+        .ok()?;
+    if !resp.is_success() {
+        return None;
+    }
+    let body = String::from_utf8_lossy(&resp.body);
+    let available = metric_value(&body, "llm_pool_available")?;
+    let num = |name: &str| {
+        metric_value(&body, name)
+            .map(|v| v.max(0.0) as u64)
+            .unwrap_or(0)
+    };
+    Some(PoolReading {
+        available: available.max(0.0) as u64,
+        evidenced_recovery_unix: num("llm_pool_evidenced_recovery_unix"),
+        next_attempt_unix: num("llm_pool_next_attempt_unix"),
+        base: base_url.trim_end_matches('/').to_string(),
+        probed_at_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    })
 }
 
 /// 一次跑的结果：要写出去的那段文本，以及这次跑是不是一次完整的实验。
@@ -1208,6 +1292,7 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
         WiringReport {
             missing: &missing,
             platform_base: wiring.platform_base.as_deref(),
+            pool: wiring.pool.as_ref(),
         },
         Readings {
             data_root: &data_root,
@@ -1294,6 +1379,8 @@ fn toolathlon_toolkit(with_tools: bool) -> ToolathlonToolkit {
 struct WiringReport<'a> {
     missing: &'a [Missing],
     platform_base: Option<&'a str>,
+    /// 这一次跑开始时池子的读数；读不到就是 `None`（这一条是附加读数，不是依赖）。
+    pool: Option<&'a PoolReading>,
 }
 
 /// 要渲染的那次跑读了什么、跑出了什么。
@@ -1407,6 +1494,12 @@ fn render(args: &EvalTableArgs, wiring: WiringReport<'_>, readings: Readings<'_>
     // 是这张表能被复跑的前提，不能只剩「接上了」三个字。
     if let Some(base) = wiring.platform_base {
         out.push_str(&format!("platform\t{base}\n"));
+    }
+    // 池子在这一轮开始时够不够用、它自己说几点能好：读的人据此决定等还是重跑。
+    // 排在 `missing` 之前，因为它是**先于题目**发生的那件事。
+    if let Some(pool) = &wiring.pool {
+        out.push_str(&pool.wiring_line());
+        out.push('\n');
     }
     if wiring.missing.is_empty() {
         out.push_str("complete\n");
@@ -1729,6 +1822,22 @@ async fn wiring_from_config(args: &EvalTableArgs) -> Wiring {
             return wiring;
         }
     };
+    // 池子的读数排在「pin 有没有人供」之前：一跑开始时就该知道这一轮的数字是不是池子的判词，
+    // 哪怕骨架根本建不出来也一样——这两件事互不相干，一个缺不该把另一个的读数吞掉。
+    // 取骨干那一条的端点：四条 LLM 列走的是同一口池，读一次就够。
+    let backend = routing
+        .backends
+        .iter()
+        .filter(|b| b.enabled)
+        .find(|b| b.model == args.backbone.model)
+        .or_else(|| routing.backends.iter().find(|b| b.enabled))
+        .and_then(|b| b.base_url.as_deref().map(|url| (b, url)));
+    if let (Some(http), Some((backend, base))) = (http.as_ref(), backend) {
+        wiring.pool = read_pool(http, base).await;
+        if wiring.pool.is_none() {
+            tracing::warn!(base = %backend.model, "the pool's own reading could not be read");
+        }
+    }
     let served: Vec<String> = routing
         .backends
         .iter()
@@ -2099,6 +2208,7 @@ mod tests {
             WiringReport {
                 missing: &[],
                 platform_base: None,
+                pool: None,
             },
             Readings {
                 data_root: Path::new("/data"),
@@ -2129,6 +2239,7 @@ mod tests {
             WiringReport {
                 missing: &[],
                 platform_base: None,
+                pool: None,
             },
             Readings {
                 data_root: Path::new("/data"),
@@ -2164,6 +2275,7 @@ mod tests {
             WiringReport {
                 missing: &[],
                 platform_base: None,
+                pool: None,
             },
             Readings {
                 data_root: Path::new("/data"),
@@ -2235,6 +2347,7 @@ mod tests {
             WiringReport {
                 missing: &[],
                 platform_base: None,
+                pool: None,
             },
             Readings {
                 data_root: Path::new("/data"),
@@ -2264,6 +2377,7 @@ mod tests {
             WiringReport {
                 missing: &[],
                 platform_base: None,
+                pool: None,
             },
             Readings {
                 data_root: Path::new("/data"),
@@ -2374,6 +2488,7 @@ mod tests {
             WiringReport {
                 missing: &[],
                 platform_base: None,
+                pool: None,
             },
             Readings {
                 data_root: Path::new("/data"),
@@ -2419,6 +2534,7 @@ mod tests {
             WiringReport {
                 missing: &[],
                 platform_base: None,
+                pool: None,
             },
             Readings {
                 data_root: Path::new("/data"),
@@ -2446,6 +2562,7 @@ mod tests {
             WiringReport {
                 missing: &[],
                 platform_base: None,
+                pool: None,
             },
             Readings {
                 data_root: Path::new("/data"),
@@ -2823,6 +2940,7 @@ mod tests {
             WiringReport {
                 missing: declared,
                 platform_base: None,
+                pool: None,
             },
             Readings {
                 data_root: Path::new("/data"),
@@ -2980,6 +3098,7 @@ mod tests {
             WiringReport {
                 missing: &declared,
                 platform_base: None,
+                pool: None,
             },
             Readings {
                 data_root: Path::new("/data"),
@@ -3043,6 +3162,65 @@ mod tests {
         assert!(
             !fallback.contains("no container backend is implemented"),
             "缺席的类别已经变了，这句会把人送去写一个已经写好的后端：{fallback}"
+        );
+    }
+
+    /// 指标在服务根的 `/metrics`，而配置里那一小段是 OpenAI 兼容的 `/v1`。
+    /// 读错地址只会让这一行永远缺，且看不出来是配置错还是池子真的没读数。
+    #[test]
+    fn the_pool_is_read_from_the_service_root_not_from_the_openai_suffix() {
+        assert_eq!(
+            metrics_url("http://cogneva-security-gateway:8081/v1"),
+            "http://cogneva-security-gateway:8081/metrics"
+        );
+        assert_eq!(
+            metrics_url("http://cogneva-security-gateway:8081/v1/"),
+            "http://cogneva-security-gateway:8081/metrics"
+        );
+        // 没有 `/v1` 的端点也要读得对：不是每个部署都挂在兼容前缀上。
+        assert_eq!(
+            metrics_url("http://127.0.0.1:18091"),
+            "http://127.0.0.1:18091/metrics"
+        );
+    }
+
+    /// 名字要整词匹配，且缺的那几个数不能把整行抹掉：`available` 有就是有读数。
+    #[test]
+    fn a_pool_metric_is_matched_by_its_whole_name_and_a_missing_one_is_not_a_missing_reading() {
+        let body = "\
+# HELP llm_pool_available upstreams currently serving
+llm_pool_available 0
+llm_pool_available_for_routing 7
+llm_pool_evidenced_recovery_unix 1792366931
+";
+        assert_eq!(metric_value(body, "llm_pool_available"), Some(0.0));
+        assert_eq!(
+            metric_value(body, "llm_pool_evidenced_recovery_unix"),
+            Some(1792366931.0),
+            "整词匹配：前缀相同的另一条不能顶上来"
+        );
+        assert_eq!(metric_value(body, "llm_pool_next_attempt_unix"), None);
+        assert_eq!(
+            metric_value("llm_pool_availableX 3\n", "llm_pool_available"),
+            None
+        );
+    }
+
+    /// 报表里那一行的形状：五格，第一格是 `pool`，两个「它没有报」的时刻写 0 而不是删掉。
+    #[test]
+    fn the_pool_line_says_what_the_platform_reported_and_when_it_was_read() {
+        let line = PoolReading {
+            available: 0,
+            evidenced_recovery_unix: 1792366931,
+            next_attempt_unix: 0,
+            base: "http://cogneva-security-gateway:8081/v1".into(),
+            probed_at_unix: 1792360000,
+        }
+        .wiring_line();
+        assert_eq!(
+            line,
+            "pool\tavailable=0\tevidenced-recovery-unix=1792366931\tnext-attempt-unix=0\t\
+             http://cogneva-security-gateway:8081/v1 (read at 1792360000)"
         );
     }
 }
