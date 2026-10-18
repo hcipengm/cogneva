@@ -435,9 +435,11 @@ struct PullGateState {
     /// 本地判据推出的暂停截止点与对应时长（时长用于下次翻倍）。
     local_until: Option<std::time::Instant>,
     local_secs: u64,
-    /// 快照判据的缓存：读到时刻与推断的暂停截止点。
+    /// 快照判据的缓存：读到时刻、推断的暂停截止点，以及那一拍是不是配速
+    /// 拦下来的（缓存命中时日志与读数要说出同一个原因，不能重新猜）。
     pool_checked_at: Option<std::time::Instant>,
     pool_until: Option<std::time::Instant>,
+    pool_pace: bool,
     /// 当前是否已经播报过"暂停中"。播报只认状态翻转，不认被挡下的条数。
     announced_pause: bool,
     /// 上一次把掌权者记到读数上时它是谁。`None` 表示还没记过——第一次求值就会
@@ -454,8 +456,13 @@ enum SharedReading {
     NoSource,
     /// 有来源，但这刻给不出快照（键缺失 / Redis 不可达 / JSON 坏）。
     Silent,
-    /// 读到了快照：`wait` 为 `Some` 表示池不可用、要求等待，`None` 表示池可用。
-    Read { wait: Option<Duration> },
+    /// 读到了快照：`wait` 为 `Some` 表示现在不该发请求，`None` 表示可以发。
+    ///
+    /// `pace` 分开记的是**为什么**：池不可用（上游承接不了）与本窗口的额度
+    /// 摊到此刻还不够一次调用，是两件事，恢复路径与时长都不同。合在一格里，
+    /// 日志与掌权者读数会把「额度还没攒够」写成「上游挂了」，而那个词会让人
+    /// 去查根本不存在的上游故障。
+    Read { wait: Option<Duration>, pace: bool },
 }
 
 /// 拉取闸门：把"现在该不该从事件面拉下一条"收敛成一个判据，输入有两路。
@@ -546,6 +553,7 @@ impl PullGate {
                     if let Some(until) = s.pool_until.filter(|t| *t > now) {
                         return SharedReading::Read {
                             wait: Some(until - now),
+                            pace: s.pool_pace,
                         };
                     }
                     // 缓存放算出的暂停时刻已到，不等于"池好了"——它只说明该
@@ -559,17 +567,36 @@ impl PullGate {
         let reading = match snapshot {
             Some(st) if st.unavailable => SharedReading::Read {
                 wait: Some(self.snapshot_wait(st)),
+                pace: false,
             },
-            Some(_) => SharedReading::Read { wait: None },
+            // 池可用，但这个窗口摊到此刻的额度还不够再开一件工作：此刻发出去
+            // 只会换回一个 429，并且那份尝试也要占一次往返。这不是上游故障，
+            // 是额度还没攒够——所以等的是自己的复查节拍，不是池的恢复时刻。
+            //
+            // 判据取池级那三个数，因为这是**调用方**在问「现在值不值得发」，
+            // 不是路由在替候选作决定：池级额度是各已量到窗口的上游之和，和为
+            // 零只在每一家都为零时成立，所以拦住的全是「发了也白发」的那些拍。
+            // 有一家还有额度，和就非零，闸门就开着——候选之间谁行谁不行仍然
+            // 是网关逐家的判定，这里不越位。
+            Some(st) if st.pace.blocked() => SharedReading::Read {
+                wait: Some(Duration::from_secs(self.check_secs.clamp(1, self.max_secs))),
+                pace: true,
+            },
+            Some(_) => SharedReading::Read {
+                wait: None,
+                pace: false,
+            },
             None => SharedReading::Silent,
         };
         let until = match reading {
-            SharedReading::Read { wait: Some(w) } => Some(now + w),
+            SharedReading::Read { wait: Some(w), .. } => Some(now + w),
             _ => None,
         };
+        let paced = matches!(reading, SharedReading::Read { pace: true, .. });
         let mut s = self.state.lock().unwrap();
         s.pool_checked_at = Some(now);
         s.pool_until = until;
+        s.pool_pace = paced;
         reading
     }
 
@@ -603,7 +630,7 @@ impl PullGate {
         };
         let shared = self.shared_reading().await;
         let shared_wait = match shared {
-            SharedReading::Read { wait } => wait,
+            SharedReading::Read { wait, .. } => wait,
             SharedReading::NoSource | SharedReading::Silent => None,
         };
         let wait = match (local, shared_wait) {
@@ -612,7 +639,8 @@ impl PullGate {
         };
         let holder =
             GateHolder::from_parts(local.is_some(), shared_wait.is_some(), shared.read_ok());
-        self.announce(wait, holder).await;
+        let paced = matches!(shared, SharedReading::Read { pace: true, .. });
+        self.announce(wait, holder, paced).await;
         wait
     }
 
@@ -622,7 +650,7 @@ impl PullGate {
     /// info），**掌权者的换手**给读数（每一格都被记一次）。它们不同步——闸门
     /// 开着但快照那一路哑了（[`GateHolder::Blind`]）是一次换手，却不是一次暂停，
     /// 只该进读数、不该刷出一条"重新暂停"的日志。
-    async fn announce(&self, wait: Option<Duration>, holder: GateHolder) {
+    async fn announce(&self, wait: Option<Duration>, holder: GateHolder, paced: bool) {
         let paused = wait.is_some();
         let (pause_flip, holder_changed) = {
             let mut s = self.state.lock().unwrap();
@@ -641,6 +669,12 @@ impl PullGate {
             (pause_flip, holder_changed)
         };
         match pause_flip {
+            // 两个原因各说各的：把一个"额度还没攒够"写成"上游不可用"，会让人
+            // 去查一个没有故障的上游，而真正要做的是等窗口。
+            Some(true) if paced => warn!(
+                wait_secs = wait.map(|d| d.as_secs()).unwrap_or(0),
+                "Memory ingest pull paused: this window's allowance does not yet cover one more extraction"
+            ),
             Some(true) => warn!(
                 wait_secs = wait.map(|d| d.as_secs()).unwrap_or(0),
                 "Memory ingest pull paused: LLM upstream unavailable"
@@ -2553,6 +2587,22 @@ mod tests {
         }
     }
 
+    /// 池健康、但窗口的额度摊到此刻还不够再开一件工作的快照。与
+    /// [`HealthyPool`] 只差 `pace` 那一格，所以拿这两条一对比，闸门到底读没
+    /// 读那一格就有判据了。
+    struct SqueezedPool(cog_core::LlmWindowPace);
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmPoolStatusSource for SqueezedPool {
+        async fn status(&self) -> Option<cog_core::LlmPoolStatus> {
+            Some(cog_core::LlmPoolStatus {
+                unavailable: false,
+                pace: self.0,
+                ..Default::default()
+            })
+        }
+    }
+
     /// 带可抽取实体的 raw：规则抽取器只认 `@entity:` 这类行，没有它 schema
     /// 层是空的，"已落库/缺失"就分不出来。
     fn entity_raw(id: &str) -> RawSource {
@@ -3420,6 +3470,51 @@ mod tests {
             metrics.counter_total(name, PULL_GATE_BLIND_OPERATION),
             None,
             "a read snapshot must never be filed as blind"
+        );
+
+        // 池健康、但这个窗口的额度不够再开一件：闸门要关。这一格此前只认
+        // `unavailable`，于是池「健康」、额度为零时，摄取器每 10 分钟的对账
+        // 照样把一批欠账推进队列，每一条都换回一个 429（2026-10-18 现网
+        // `actor=memory` 的那条失血）。
+        let squeezed = |allowance: u64, spent: u64, reserve: u64, measured: usize| {
+            MemoryIngestor::new(
+                Arc::new(MemoryMemoryBackend::new()),
+                Arc::new(UnreachableExtractor::new()),
+            )
+            .with_pool_status_source(Arc::new(SqueezedPool(cog_core::LlmWindowPace {
+                measured_upstreams: measured,
+                allowance_tokens: allowance,
+                spent_tokens: spent,
+                reserve_tokens: reserve,
+                reserve_population: 9,
+                window_secs: 604_800,
+                window_start_unix: 0,
+            })))
+            .with_config(MemoryIngestorConfig {
+                pool_check_secs: 1,
+                ..quick_retry_config()
+            })
+        };
+        let broke = squeezed(0, 0, 570_831, 1);
+        assert!(
+            broke.pull_gate.blocked_for().await.is_some(),
+            "a spent window is not a healthy pool: pulling would spend a round trip on a 429"
+        );
+        let short = squeezed(100_000, 0, 570_831, 1);
+        assert!(
+            short.pull_gate.blocked_for().await.is_some(),
+            "what the window has left has to cover a whole job, not one call"
+        );
+        let roomy = squeezed(2_000_000, 0, 570_831, 1);
+        assert!(
+            roomy.pull_gate.blocked_for().await.is_none(),
+            "a window that can pay for a job must let the ingestor pull"
+        );
+        // 一家都没量到窗口：池级那三个数不是一把尺子，不能拿它关闸。
+        let unmeasured = squeezed(0, 0, 570_831, 0);
+        assert!(
+            unmeasured.pull_gate.blocked_for().await.is_none(),
+            "no measured window is not a measured zero: an unmeasured pool must not be held"
         );
 
         // 快照那一路哑了、本地退避说停：本地路掌权。走一次真实抽取把本地退避
