@@ -38,7 +38,6 @@ series() { # series <名字> <行…>：每行是「相对 NOW 的秒数<TAB>结
         offset="${line%%|*}"
         verdict="${line#*|}"
         printf '%s\t%s\t1\t2\t3\t4\t5\n' "$((NOW - offset))" "${verdict}" >>"${path}"
-        LAST_OFFSET="${line%%|*}"
     done
     printf '%s' "${path}"
 }
