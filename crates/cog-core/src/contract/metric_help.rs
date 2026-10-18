@@ -1581,6 +1581,23 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          by the heartbeat's `ci_hold=` cell",
     ),
     (
+        crate::metric_names::MAINLINE_ADVANCE_DEFERRALS.as_str(),
+        "Consecutive rounds in which the mainline advance could not take the \
+         host's build slot; 0 on the round that takes one. It is the value form \
+         of the state file's `advance_deferrals`, and it exists because the \
+         refusal itself does not: the advance is the one caller that waits zero \
+         seconds, so a refused round logs one line identical to the last and \
+         returns, and a starvation that lasts does not accumulate anything a \
+         reader can see from outside the pod. Read it against the loop period \
+         beside it: the count times the period is how long the mainline has \
+         been unable to move, and three is the round at which the deployer \
+         stops queuing and claims a slot instead. A value that stops moving is \
+         not by itself starvation -- it also happens when there is nothing to \
+         advance -- so read it with whether the bare main is ahead of \
+         `last_good_rev`; the writing side is one number with no labels because \
+         the deployer is its only writer",
+    ),
+    (
         crate::metric_names::MAINLINE_BUILD_SECONDS.as_str(),
         "Duration in seconds of the most recent round's `cargo build --release`, \
          by `outcome`. The poll-cycles counter beside it answers whether the \

@@ -835,6 +835,16 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_mainline_poll_cycles_total",
         "crates/cog-reflection/src/mainline_deployer.rs",
     ),
+    // 连续多少轮没拿到构建槽。被拒的每一轮在日志里和上一轮逐字相同（同一个请求者、
+    // 同一句 "host is building"），而推进是唯一零等待的调用者——别的调用方会等下去、
+    // 到预算才失败，它这一轮直接回、下一轮再来。所以饿住的那一段留下的是一条没有任何
+    // 人处理的拒因，以及一个只有进得了演化 Pod 才读得到的 `advance_deferrals`。
+    // 这条读数把那一段搬进指标面，每轮写、含 0：共享表只增不改，饿住结束后必须有东西
+    // 把它写回去，否则规则点亮之后没有任何东西能灭它。
+    (
+        "cogneva_mainline_advance_deferrals",
+        "crates/cog-reflection/src/mainline_deployer.rs",
+    ),
     // 版本契约的另一半：判定跑过了。它上面那条（`cogneva_version_contract_violations`）是
     // 按条款读的常驻值，而判定停摆时那条读数停在零——与契约成立同一个零——所以这个计数
     // 是分开两者的那一面。它每轮、每条款各写一次，且停在共享存储里：判定停了，最后那个

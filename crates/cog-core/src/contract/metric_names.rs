@@ -705,6 +705,30 @@ metric_names! {
     // the state file's `ci_hold.rev`, the heartbeat's `ci_hold=` cell and the
     // log -- and it is read together with this number rather than inside it.
     MAINLINE_CI_HOLD_SECONDS => "cogneva_mainline_ci_hold_seconds",
+    // Consecutive rounds in which the advance could not take the host's build
+    // slot, as a gauge; 0 on the round that takes one.
+    //
+    // The same fact as a value rather than a sentence in a state file. A round
+    // that is refused logs the same line every time -- same asker, same "host
+    // is building" -- and the state file's `advance_deferrals` is written where
+    // only a reader already on the pod can see it; a run of refusals therefore
+    // leaves the operator asking why the mainline stopped with every published
+    // reading looking healthy. The count is the one quantity that separates
+    // "happened to meet a host that was building" from "never got a turn":
+    // measured under saturation, six consecutive refusals, one log line each.
+    //
+    // The advance is the only caller that waits zero seconds, so a starved
+    // advance never shows up as a refusal anybody acts on -- the other callers
+    // wait out the holder, this one returns and comes back next round. That is
+    // why the value has to be published rather than counted at the refusal:
+    // the refusal exists only where somebody asked, and the round after the
+    // asker gives up is silent.
+    //
+    // One number, no labels: the run is the deployer's own, and the deployer is
+    // the only writer. 0 is published on the round that takes the slot, so a
+    // starvation that ends is written back rather than left as its last value,
+    // for the reason MAINLINE_CI_HOLD_SECONDS gives above.
+    MAINLINE_ADVANCE_DEFERRALS => "cogneva_mainline_advance_deferrals",
     // Rounds the deployer's poll loop finished, by how they finished: `ok` when
     // the round ran to the end, `failed` when it returned an error.
     //

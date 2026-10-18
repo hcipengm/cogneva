@@ -2675,6 +2675,31 @@ impl MainlineDeployer {
             .await;
     }
 
+    /// 连续多少轮没拿到构建槽：0 是真读数，拿到槽的那一轮写回 0。
+    ///
+    /// 同一个数在盘上已经有一份（`state.advance_deferrals`），但那一份只有进得了
+    /// 演化 Pod 的人才读得到；被拒的每一轮在日志里又和上一轮逐字相同（同一个请求者、
+    /// 同一句 "host is building"），所以一段连续被拒从外面看就是「推进停了，而所有
+    /// 读数都健康」。这个数就是控制律自己在用的那个（`ADVANCE_CLAIM_AFTER_DEFERRALS`
+    /// 相邻），读数和动作阈值同一个坐标。
+    ///
+    /// 每轮都发、包括 0：共享表只增不改，一次饿住结束后必须有人把这一格写回去，
+    /// 否则最后那个值会一直留在库里、点着规则而没有任何东西能让它灭。第一拍发的是
+    /// **从 state.json 读回来的值**而不是默认 0——这个计数落盘的意义就在于重启之后
+    /// 还记得连输了几轮，重启丢掉它就是把这个读数的前提丢了。
+    async fn record_advance_deferrals(&self, deferrals: u32) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let _ = metrics
+            .record_gauge(
+                cog_core::metric_names::MAINLINE_ADVANCE_DEFERRALS,
+                deferrals as f64,
+                std::collections::HashMap::new(),
+            )
+            .await;
+    }
+
     /// The judgement's own reading: which question it asked upstream and which
     /// answer it got.
     ///
@@ -3946,6 +3971,13 @@ impl MainlineDeployer {
     pub async fn poll_once(&self) -> SFResult<()> {
         let mut state = self.load_state();
 
+        // 连输轮次也钉在本拍最早的位置，理由与下面那两处心跳相同：这里量的是
+        // 「上一拍到这一拍之间，推进有没有拿到槽」，而下面任何一条早退都不改变
+        // 这件事——尤其读不到裸仓库的那几轮，恰恰可能是被饿住的那几轮。写在早退
+        // 之后，一个长期读不到裸仓库的部署器会让这一格停在旧值上，读它的规则就把
+        // 「写者停了」读成「还在饿着」。
+        self.record_advance_deferrals(state.advance_deferrals).await;
+
         // 这两处钉在**本拍最早的位置**，谁不需要这一轮的产物谁就排在早退前面。
         // 它们量的是这一轮之外的事（两棵长命树的索引读数还在不在动、registry 这卷
         // 欠不欠账），这一轮走不走得完与它们无关，任何一条早退都不改变它们该不该
@@ -4350,6 +4382,9 @@ impl MainlineDeployer {
                 // 这一计数量的就是"连续多少轮没拿到槽"，拿到一次的下一轮就不再是连续。
                 state.advance_deferrals = state.advance_deferrals.saturating_add(1);
                 self.save_state(&state)?;
+                // 发出去的值就是刚落到盘上的那个：盘上是 3、指标上还是上一拍的 2，
+                // 会让读的人拿两格不同的数当同一件事。
+                self.record_advance_deferrals(state.advance_deferrals).await;
                 // 连输够多轮：认领下一个名额，让正在排队的构建方都让一步。零等待
                 // 那一半没变——这一轮照旧什么都不做地回下一轮（见
                 // `ADVANCE_CLAIM_AFTER_DEFERRALS`）。
@@ -4365,6 +4400,8 @@ impl MainlineDeployer {
             }
         };
         state.advance_deferrals = 0;
+        // 拿到槽就把这一格写回 0：共享表只增不改，一段饿住结束后只剩这里能把它灭掉。
+        self.record_advance_deferrals(0).await;
 
         // 叠层基底在这里才定：上面那条快路不需要它（不重建），而它自己要读 registry
         // 并可能改一个 tag，是"真要构建"才付的代价。它要留在槽里：基底 tag 由这
