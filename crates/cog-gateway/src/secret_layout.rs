@@ -319,4 +319,66 @@ mod tests {
             "并集判法此时必然报干净；若它反而报越界，本测试关于其为何不可作判据的前提就错了"
         );
     }
+
+    /// principle: feedback_credential_issuance_vs_delivery_layers
+    ///
+    /// 规则原文：外部签发凭证（平台 token / OAuth 应用密钥 / LLM 上游 key）的自洽问法是"谁能签发×怎么投递"。
+    /// 签发轴的答案是外部——集群里没有任何组件能派生平台 token、OAuth 应用密钥或 LLM 上游
+    /// key；那么投递轴就必须同时有答案，而且只能是带外片：内部片是整对象读，外部凭证一旦
+    /// 被投递进去，就等于铺给每一个持那一份的业务 Pod。塌掉任一轴——给不出投递答案，或把
+    /// 外部签发的凭证投递进内部片——这条都必须红。
+    #[test]
+    fn externally_issued_credentials_pair_an_external_issuer_with_oob_delivery() {
+        /// 规则点名的一类外部签发凭证：签发轴恒为外部，投递轴是承载它的具体键。
+        struct ExternalCredentialClass {
+            name: &'static str,
+            keys: &'static [&'static str],
+        }
+
+        // 三类外部签发凭证，键名取自本模块键位表——表是投递轴的单一真源；签发轴在集群
+        // 内没有对应格，这里也不设一个"集群签发"答案去和它配对。
+        let classes = [
+            ExternalCredentialClass {
+                name: "平台 token",
+                keys: &["github-token", "gitee-token"],
+            },
+            ExternalCredentialClass {
+                name: "OAuth 应用密钥",
+                keys: &["gitee-oauth-client-secret", "github-oauth-client-secret"],
+            },
+            ExternalCredentialClass {
+                name: "LLM 上游 key",
+                keys: &["llm-upstreams"],
+            },
+        ];
+
+        for class in &classes {
+            for &key in class.keys {
+                // 投递轴必须有答案：外部签发的凭证不允许查无此键，那等于签发答了外部、
+                // 投递答了空，两个轴塌了一个。
+                let Some(delivered_to) = secret_object_for_key(key) else {
+                    panic!(
+                        "{}的外部签发键 {key} 没有投递答案：谁能签发答了外部，怎么投递却缺位",
+                        class.name
+                    );
+                };
+                // 外部签发只能走带外投递：送进内部片就是铺给所有持那份的业务 Pod。
+                assert_eq!(
+                    delivered_to, SECRET_NAME_OOB,
+                    "{}的外部签发键 {key} 被投递进业务 Pod 读的内部片",
+                    class.name
+                );
+                assert!(
+                    OOB_SECRET_KEYS.contains(&key),
+                    "{}的外部签发键 {key} 必须列在带外片键位表",
+                    class.name
+                );
+                assert!(
+                    !INTERNAL_SECRET_KEYS.contains(&key),
+                    "{}的外部签发键 {key} 不许出现在内部片键位表",
+                    class.name
+                );
+            }
+        }
+    }
 }
