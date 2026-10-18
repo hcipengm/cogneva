@@ -516,6 +516,26 @@ impl CheckTree {
             .collect())
     }
 
+    /// The most recent `limit` commits on the reference, one record per commit:
+    /// the revision, a unit separator, the body, and a record separator.
+    ///
+    /// The caller parses it rather than this returning a shape, because what is
+    /// in a body is the landing machine's vocabulary and not the tree's: this
+    /// method's whole job is to read bytes out of a repository, and a parser here
+    /// would be a second copy of a format defined elsewhere.
+    ///
+    /// Bounded by a count rather than by a revision range, because the range a
+    /// caller holds is the one since *its* last pass, and a delivery that arrived
+    /// while the process was down is still a delivery. The count is what keeps a
+    /// repository with years of history from turning one pass into a full walk.
+    pub async fn landing_log(&self, limit: usize) -> Result<String, String> {
+        let bound = format!("-{limit}");
+        let format = "--format=%H%x1f%B%x1f%x1e";
+        self.git(&["log", bound.as_str(), format, self.reference.as_str()])
+            .await
+            .map_err(|e| format!("the commit log at {} cannot be read: {e}", self.reference))
+    }
+
     /// The line of development `revision` sits on, or why it could not be read.
     ///
     /// The revision is resolved rather than compared as written, because the two

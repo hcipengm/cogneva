@@ -350,6 +350,22 @@ pub struct ChangeLedgerRow {
     /// `measured_at` is `None`, and also for a measurement taken by a process
     /// with no revision to name.
     pub measured_rev: Option<String>,
+    /// The revision that delivered this change: the commit whose
+    /// [`LANDING_TRAILER`] names the task this row was handed over under.
+    ///
+    /// A different fact from `landed_at`, and kept apart on purpose. `landed` is
+    /// an answer about the tree -- the row's check measured true -- while this is
+    /// an answer about delivery: a diff reached the line. A change can be
+    /// delivered and never measure landed (the commit went in and the property
+    /// it was meant to establish did not), and a row can measure landed without
+    /// being delivered (the tree already satisfied it). Neither is evidence for
+    /// the other, so neither may be written by the other's reader.
+    ///
+    /// Set once, by the reader that finds the trailer, and never cleared: a
+    /// change that was delivered was delivered, even if a later revision took
+    /// the diff back out. That the tree no longer carries it is what `state` and
+    /// the reopen record are for.
+    pub delivered_rev: Option<String>,
     /// When a measurement last found the change satisfied. Set and cleared by
     /// measurement, so `state == Landed` and this being present agree by
     /// construction.
@@ -746,6 +762,20 @@ pub trait ChangeLedgerStore: Send + Sync {
     /// and an upserted row would only ever answer the last of them.
     async fn record_reopen(&self, reopen: &ChangeReopen) -> SFResult<()>;
 
+    /// Record that a commit delivered this row's change, and which commit.
+    ///
+    /// Written from a reader of the line, not from the landing process: the
+    /// landing process commits and then returns, and a record made after the
+    /// commit is a record that is missing for every change whose process died in
+    /// between -- while the commit itself is on the line and plainly readable.
+    ///
+    /// Writes no state and no measurement time. A delivered change has been
+    /// handed to the line; whether its claim holds is still the measurement's to
+    /// say, and this door may not say it. The write is first-one-wins: a change
+    /// landed twice keeps the delivery that was recorded first, which is the one
+    /// a reader asking "when did this reach the line" wants.
+    async fn record_delivery(&self, identity: &ChangeIdentity, rev: &str) -> SFResult<()>;
+
     /// One row, by the identity that names it.
     async fn get(&self, identity: &ChangeIdentity) -> SFResult<Option<ChangeLedgerRow>>;
 
@@ -770,6 +800,16 @@ pub trait ChangeLedgerStore: Send + Sync {
     /// dispatch stood still and how often, which an upserted row could not answer.
     async fn record_dispatch_state(&self, state: &DispatchState) -> SFResult<()>;
 }
+
+/// The line a landed commit carries, followed by the id of the change it landed.
+///
+/// One definition because there are two sides to it and they are in different
+/// crates: the landing machine writes it and the ledger reads it. A literal
+/// copied into both would drift the day one of them gained a space, and the
+/// failure would be silent -- the reader would keep finding nothing and report
+/// every delivered change as undelivered, which is exactly the reading the
+/// trailer exists to make possible.
+pub const LANDING_TRAILER: &str = "Landing change ";
 
 /// What one dispatch pass did, and the closed reason it did only that much.
 ///
@@ -806,6 +846,16 @@ pub struct DispatchState {
     /// submitted is in both numbers, and it is the pair that says how much of a
     /// pass's work went into getting back to where it started.
     pub rearmed: u64,
+    /// Rows still owed whose change a commit on the line names as the one it
+    /// landed. An annotation beside the outcome they reached, not an outcome of
+    /// its own, and the two are deliberately different facts: a committed change
+    /// has been delivered, while `landed` says the claim its row makes is true of
+    /// the tree. A change can be delivered and never measure landed -- the diff
+    /// went in and the property it was supposed to establish did not -- and
+    /// without this number that row is indistinguishable from one no task ever
+    /// finished. `None` when the commit log could not be read, because zero is a
+    /// measurement and "nothing said" is not.
+    pub delivered: Option<u64>,
     /// Rows this pass's own measurement could not settle, so they were not handed
     /// over. Counted apart from `pending` because the state alone cannot show
     /// them.
@@ -1171,6 +1221,7 @@ mod tests {
             first_seen_at: Utc::now(),
             measured_at: None,
             measured_rev: None,
+            delivered_rev: None,
             landed_at: None,
             unsettled_reason: None,
             retire_reason: None,

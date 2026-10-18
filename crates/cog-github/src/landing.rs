@@ -1895,10 +1895,11 @@ fn commit_message(identity: &BotIdentityConfig, change: &GeneratedChange) -> Str
         .take(70)
         .collect::<String>();
     let mut body = format!(
-        "{}({}): {}\n\nLanding change {}\n",
+        "{}({}): {}\n\n{}{}\n",
         commit_type(change),
         commit_scope(change),
         title,
+        cog_core::LANDING_TRAILER,
         change.change_id
     );
     if let Some(ref rationale) = change.rationale {

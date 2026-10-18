@@ -428,6 +428,72 @@ fn dispatch_task_id(identity: &ChangeIdentity, generation: u32) -> String {
     }
 }
 
+/// How far back one pass reads the commit log for delivery trailers.
+///
+/// A count rather than a revision range: a delivery that arrived while this
+/// process was down is still a delivery, and a range anchored at the last pass
+/// would forget it. The landing machine writes at most a few commits a day, and
+/// this bound is what keeps a repository with years of history from turning one
+/// pass into a walk of it.
+const LANDING_LOG_COMMITS: usize = 2_000;
+
+/// The changes a commit log says it landed, keyed by the id each commit names.
+///
+/// Read off the tree rather than written by the landing machine, because the
+/// writer and the reader are in different processes: a write-back would have to
+/// survive the landing process dying between the commit and the record, and then
+/// the record would be missing for a change that is plainly on the line.
+///
+/// The trailer carries the id of the task the change was handed over under, and
+/// one commit may name more than one change. First sighting wins as the log is
+/// read newest first, so a change that was landed twice is attributed to the
+/// later commit.
+fn landing_trailers(log: &str) -> HashMap<String, String> {
+    let mut landed = HashMap::new();
+    for record in log.split('\u{1e}') {
+        let mut fields = record.splitn(2, '\u{1f}');
+        let (Some(rev), Some(body)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let rev = rev.trim();
+        if rev.is_empty() {
+            continue;
+        }
+        for line in body.lines() {
+            let Some(named) = line.trim().strip_prefix(cog_core::LANDING_TRAILER) else {
+                continue;
+            };
+            let Some(id) = named.split_whitespace().next() else {
+                continue;
+            };
+            if !id.is_empty() {
+                landed
+                    .entry(id.to_string())
+                    .or_insert_with(|| rev.to_string());
+            }
+        }
+    }
+    landed
+}
+
+/// The revision that delivered this row, if one names it.
+///
+/// Matched by task-id prefix rather than by equality: a re-armed handover
+/// appends its generation to the id (`-r1`), and a change landed under any
+/// generation was delivered. The prefix is the identity's hash, so no other
+/// change's id begins with it.
+fn delivered_revision<'a>(
+    identity: &ChangeIdentity,
+    deliveries: &'a HashMap<String, String>,
+) -> Option<&'a str> {
+    let prefix = handover_task_prefix(identity);
+    deliveries
+        .iter()
+        .filter(|(id, _)| id.starts_with(&prefix))
+        .max_by(|a, b| a.0.cmp(b.0))
+        .map(|(_, rev)| rev.as_str())
+}
+
 /// The name a run's deliverable carries.
 ///
 /// Named rather than matched as a kind of artifact: the acceptance this reading
@@ -943,6 +1009,24 @@ pub fn spawn_change_ledger_loop(
                     // and a change this pass just found missing is handed over on
                     // the same pass that found it, rather than one period later.
                     if let Some(ref orchestrator) = orchestrator {
+                        // What the line says it has landed, read from the same
+                        // repository the measurement reads. A change whose diff
+                        // went in is still owed until its check holds, and the
+                        // two facts are only together in the pass -- which is
+                        // why the count is taken here rather than by a write
+                        // from the landing process, whose record would be lost
+                        // the day it died between the commit and the write.
+                        let deliveries = match tree.landing_log(LANDING_LOG_COMMITS).await {
+                            Ok(log) => Some(landing_trailers(&log)),
+                            Err(why) => {
+                                warn!(
+                                    why = %why,
+                                    "change ledger: the commit log could not be read, so this \
+                                     pass cannot say which owed changes were delivered"
+                                );
+                                None
+                            }
+                        };
                         let pool = pool.as_deref();
                         if let Some(read) = dispatch_pass(
                             &*store,
@@ -953,6 +1037,7 @@ pub fn spawn_change_ledger_loop(
                             metrics.as_ref(),
                             events.as_deref(),
                             &sources_unread,
+                            deliveries.as_ref(),
                         )
                         .await
                         {
@@ -2112,6 +2197,9 @@ async fn dispatch_pass(
     metrics: Option<&Arc<dyn MetricsBackend>>,
     events: Option<&dyn StateBackend>,
     sources_unread: &[&'static str],
+    // The changes the commit log says it landed, by task id. `None` when the
+    // log could not be read: delivery is then unmeasured, not zero.
+    deliveries: Option<&HashMap<String, String>>,
 ) -> Option<PoolVerdict> {
     // The read is bounded by the ledger's own census rather than by a number
     // chosen here, and it has to be that wide because of where pending rows sit
@@ -2139,7 +2227,7 @@ async fn dispatch_pass(
             return None;
         }
     };
-    let rows = match store.outstanding(outstanding_total as usize).await {
+    let mut rows = match store.outstanding(outstanding_total as usize).await {
         Ok(rows) => rows,
         Err(e) => {
             warn!(
@@ -2150,6 +2238,41 @@ async fn dispatch_pass(
             return None;
         }
     };
+
+    // Delivery is written before anything is counted, so a change a commit
+    // landed since the last pass is in this pass's reading rather than the
+    // next one's. Only rows that have never been delivered are written: the
+    // account keeps the first sighting, and re-writing the same fact on every
+    // pass would be a write that says nothing new.
+    if let Some(deliveries) = deliveries {
+        let mut recorded = 0usize;
+        for row in rows.iter_mut() {
+            if row.delivered_rev.is_some() {
+                continue;
+            }
+            let Some(rev) = delivered_revision(&row.identity, deliveries) else {
+                continue;
+            };
+            match store.record_delivery(&row.identity, rev).await {
+                Ok(()) => {
+                    row.delivered_rev = Some(rev.to_string());
+                    recorded += 1;
+                }
+                Err(e) => warn!(
+                    change = %row.identity,
+                    error = %e,
+                    "change ledger: a delivery could not be recorded, so the row will read as \
+                     never delivered until the next pass finds it again"
+                ),
+            }
+        }
+        if recorded > 0 {
+            info!(
+                recorded,
+                "change ledger: owed changes a commit on the line names as landed"
+            );
+        }
+    }
 
     let pending = dispatchable(&rows, unsettled);
 
@@ -2229,7 +2352,18 @@ async fn dispatch_pass(
     );
 
     let rearm_limit = dispatch_rearm_limit();
-    let mut counts = TickCounts::default();
+    let mut counts = TickCounts {
+        // Owed and delivered: the diff reached the line while the claim the row
+        // makes is still not true of the tree. An annotation over the outcomes
+        // counted below rather than one of them -- the row is still owed -- and
+        // the only reading that separates "nobody finished it" from "it went in
+        // and did not do what it said".
+        delivered: pending
+            .iter()
+            .filter(|row| row.delivered_rev.is_some())
+            .count(),
+        ..TickCounts::default()
+    };
     let mut readback = HandoverCensus::default();
     for row in &pending {
         // What the change's handovers left behind, read before anything is
@@ -2324,6 +2458,9 @@ async fn dispatch_pass(
             held_back = counts.held_back,
             already_handed_over = counts.already,
             already_dead_environment = counts.dead_environment,
+            // Owed, delivered by a commit, and still not true of the tree: the
+            // gap between the diff going in and the claim it makes holding.
+            delivered = counts.delivered,
             handovers_on_record = readback.events,
             handovers_with_product = readback.products,
             handovers_unreadable = readback.unreadable,
@@ -2344,6 +2481,7 @@ async fn dispatch_pass(
             rearmed = counts.rearmed,
             already_handed_over = counts.already,
             already_dead_environment = counts.dead_environment,
+            delivered = counts.delivered,
             failed = counts.failed,
             unmeasurable,
             handovers_on_record = readback.events,
@@ -2362,6 +2500,9 @@ async fn dispatch_pass(
         unmeasurable,
         &counts,
         sources_unread,
+        // `None`, not zero, when the log could not be read: a failed read is
+        // not a pass that found nothing delivered.
+        deliveries.map(|_| counts.delivered as u64),
     )
     .await;
     // The readback is published from here rather than from the row's own state:
@@ -2457,6 +2598,11 @@ struct TickCounts {
     held_back: usize,
     rearmed: usize,
     failed: usize,
+    /// Owed rows a commit on the line claims to have landed. An annotation over
+    /// the outcomes above, not one of them: the row is still owed until its
+    /// check measures true, and delivery is the separate fact that its diff
+    /// reached the line.
+    delivered: usize,
 }
 
 /// What one pass read back off the set it handed over.
@@ -2737,6 +2883,7 @@ async fn record_dispatch_state(
     unmeasurable: usize,
     counts: &TickCounts,
     sources_unread: &[&'static str],
+    delivered: Option<u64>,
 ) {
     let state = DispatchState {
         // Written for every pass, empty when every intake answered: `None` is
@@ -2752,6 +2899,7 @@ async fn record_dispatch_state(
         dead_environment: counts.dead_environment as u64,
         held_back: counts.held_back as u64,
         rearmed: counts.rearmed as u64,
+        delivered,
         unmeasurable: unmeasurable as u64,
         resume_at_unix: verdict.resume_at_unix,
         evidenced_recovery_unix: verdict.evidenced_recovery_unix,
@@ -3135,6 +3283,7 @@ mod tests {
             first_seen_at: Utc.timestamp_opt(1_760_000_000, 0).unwrap(),
             measured_at: measured_at.map(|s| Utc.timestamp_opt(s, 0).unwrap()),
             measured_rev: None,
+            delivered_rev: None,
             landed_at: None,
             unsettled_reason: None,
             retire_reason: None,
@@ -4157,11 +4306,16 @@ mod tests {
         rows: Vec<ChangeLedgerRow>,
         written: std::sync::Mutex<Vec<DispatchState>>,
         measured: std::sync::Mutex<Vec<ChangeIdentity>>,
+        delivered: std::sync::Mutex<Vec<(ChangeIdentity, String)>>,
     }
 
     impl FakeLedger {
         fn written(&self) -> Vec<DispatchState> {
             self.written.lock().unwrap().clone()
+        }
+
+        fn deliveries(&self) -> Vec<(ChangeIdentity, String)> {
+            self.delivered.lock().unwrap().clone()
         }
 
         fn measured(&self) -> Vec<ChangeIdentity> {
@@ -4177,6 +4331,13 @@ mod tests {
             _first_seen_rev: Option<&str>,
         ) -> SFResult<usize> {
             Ok(0)
+        }
+        async fn record_delivery(&self, identity: &ChangeIdentity, rev: &str) -> SFResult<()> {
+            self.delivered
+                .lock()
+                .unwrap()
+                .push((identity.clone(), rev.to_string()));
+            Ok(())
         }
         async fn declare(&self, _readings: &[ChangeReading]) -> SFResult<usize> {
             Ok(0)
@@ -4864,6 +5025,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await;
 
@@ -4919,6 +5081,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await;
 
@@ -4932,6 +5095,94 @@ mod tests {
         assert_eq!(state.held_back, 1, "and the row past the slice is counted");
         assert_eq!(graph.submitted().len(), HANDOVERS_PER_PASS);
         assert_the_counts_add_up(&state);
+    }
+
+    /// A change a commit names is recorded against its row, and stays owed.
+    ///
+    /// Delivery is not the account's `landed`: the diff reached the line, and
+    /// whether the claim the row makes is true of the tree is still the
+    /// measurement's to say. The pass therefore records the revision and hands
+    /// the change over like any other owed row -- what changes is that the row
+    /// now carries the one fact that tells "nobody finished this" apart from
+    /// "it went in and did not do what it said".
+    #[tokio::test]
+    async fn a_change_a_commit_names_is_recorded_as_delivered_and_still_owed() {
+        let store = FakeLedger {
+            rows: vec![pending_row("crates/delivered")],
+            ..Default::default()
+        };
+        let graph = Arc::new(FakeGraph::default());
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+        let mut deliveries = HashMap::new();
+        deliveries.insert(
+            dispatch_task_id(&store.rows[0].identity, 0),
+            "abcdef123456".to_string(),
+        );
+
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            Some(&deliveries),
+        )
+        .await;
+
+        let state = store.written().pop().expect("the pass wrote its row");
+        assert_eq!(
+            state.delivered,
+            Some(1),
+            "a change the line names is delivered"
+        );
+        assert_eq!(
+            state.submitted, 1,
+            "delivery does not take the change out of the owed set"
+        );
+        assert_eq!(
+            store.deliveries(),
+            vec![(store.rows[0].identity.clone(), "abcdef123456".to_string())],
+            "the revision is written against the row, not only counted"
+        );
+        assert_the_counts_add_up(&state);
+    }
+
+    /// A commit log that could not be read writes no delivery count at all.
+    ///
+    /// The unreadable branch is the whole reason the column is nullable: a pass
+    /// that wrote zero would report "nothing was delivered" on exactly the pass
+    /// that knew nothing, and the next reader would compare it with a pass that
+    /// read the log and found the same number.
+    #[tokio::test]
+    async fn a_commit_log_that_could_not_be_read_writes_no_delivery_count() {
+        let store = FakeLedger {
+            rows: vec![pending_row("crates/unread")],
+            ..Default::default()
+        };
+        let graph = Arc::new(FakeGraph::default());
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+        )
+        .await;
+
+        let state = store.written().pop().expect("the pass wrote its row");
+        assert_eq!(
+            state.delivered, None,
+            "unread is not zero: zero is a measurement this pass did not take"
+        );
     }
 
     /// A source that answers nothing does not become permission to hand work
@@ -4970,6 +5221,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await;
 
@@ -5019,6 +5271,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await;
 
@@ -5053,6 +5306,7 @@ mod tests {
             None,
             None,
             &[INTAKE_PRINCIPLES],
+            None,
         )
         .await;
         let state = store.written().pop().expect("the pass wrote its row");
@@ -5074,6 +5328,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await;
         let state = store.written().pop().expect("the pass wrote its row");
@@ -5097,6 +5352,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("a snapshot that said the pool is sick is a reading");
@@ -5132,6 +5388,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await;
 
@@ -5168,7 +5425,18 @@ mod tests {
         }
         let graph: Arc<dyn OrchestratorControl> = Arc::new(graph);
 
-        dispatch_pass(&store, &graph, &HashMap::new(), None, None, None, None, &[]).await;
+        dispatch_pass(
+            &store,
+            &graph,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+        )
+        .await;
 
         let state = store.written().pop().expect("the pass wrote its row");
         assert_eq!(state.pending, 1);
@@ -5190,7 +5458,18 @@ mod tests {
         };
         let graph: Arc<dyn OrchestratorControl> = Arc::new(FakeGraph::default().refusing());
 
-        dispatch_pass(&store, &graph, &HashMap::new(), None, None, None, None, &[]).await;
+        dispatch_pass(
+            &store,
+            &graph,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+        )
+        .await;
 
         let state = store.written().pop().expect("the pass wrote its row");
         assert_eq!(state.pending, 2);
@@ -5411,6 +5690,7 @@ mod tests {
             Some(&metrics),
             Some(&events),
             &[],
+            None,
         )
         .await;
 
@@ -5695,6 +5975,7 @@ mod tests {
             dead_environment: 7,
             held_back: 120,
             rearmed: 2,
+            delivered: None,
             unmeasurable: 5,
             resume_at_unix: 0,
             evidenced_recovery_unix: 0,
@@ -5837,5 +6118,72 @@ mod tests {
             "exactly this pass's combination reads as one; two ones is a reader asking which \
              pass is current and being told there are two"
         );
+    }
+
+    fn commit(rev: &str, body: &str) -> String {
+        format!("{rev}\u{1f}{body}\u{1f}\u{1e}")
+    }
+
+    #[test]
+    fn a_landing_trailer_names_the_change_and_the_commit_that_carried_it() {
+        let log = [
+            commit(
+                "aaaa",
+                "fix(x): something\n\nLanding change change-ledger-0123456789abcdef-abcd\n",
+            ),
+            commit("bbbb", "docs: nothing landed here\n"),
+        ]
+        .concat();
+        let landed = landing_trailers(&log);
+        assert_eq!(
+            landed.get("change-ledger-0123456789abcdef-abcd"),
+            Some(&"aaaa".to_string())
+        );
+        assert_eq!(landed.len(), 1, "a body with no trailer names nothing");
+    }
+
+    #[test]
+    fn a_change_landed_twice_is_attributed_to_the_commit_the_log_names_first() {
+        // The log is read newest first, so the first sighting is the later
+        // commit; taking the last would date the delivery to a superseded try.
+        let log = [
+            commit(
+                "newer",
+                "Landing change change-ledger-0123456789abcdef-abcd\n",
+            ),
+            commit(
+                "older",
+                "Landing change change-ledger-0123456789abcdef-abcd\n",
+            ),
+        ]
+        .concat();
+        assert_eq!(
+            landing_trailers(&log)
+                .get("change-ledger-0123456789abcdef-abcd")
+                .map(String::as_str),
+            Some("newer")
+        );
+    }
+
+    #[test]
+    fn a_re_armed_handover_still_names_the_change_it_was_dispatched_under() {
+        let identity = ChangeIdentity::new("grep", "crates/x", "fn thing");
+        let mut deliveries = HashMap::new();
+        deliveries.insert(dispatch_task_id(&identity, 1), "ccccc".to_string());
+        assert_eq!(
+            delivered_revision(&identity, &deliveries),
+            Some("ccccc"),
+            "the generation is appended to the id, so equality would miss every re-armed \
+             handover and read a delivered change as undelivered"
+        );
+    }
+
+    #[test]
+    fn another_changes_delivery_does_not_name_this_row() {
+        let identity = ChangeIdentity::new("grep", "crates/x", "fn thing");
+        let other = ChangeIdentity::new("grep", "crates/x", "fn other");
+        let mut deliveries = HashMap::new();
+        deliveries.insert(dispatch_task_id(&other, 0), "ddddd".to_string());
+        assert_eq!(delivered_revision(&identity, &deliveries), None);
     }
 }

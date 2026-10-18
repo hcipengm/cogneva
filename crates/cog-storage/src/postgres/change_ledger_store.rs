@@ -22,7 +22,7 @@ use cog_core::{
 /// Every read returns these, in one place so no two readers can come back with
 /// differently ordered columns.
 const ROW_COLUMNS: &str = "kind, scope, literal, state, title, assertion, sources, \
-                           first_seen_at, measured_at, measured_rev, landed_at, \
+                           first_seen_at, measured_at, measured_rev, delivered_rev, landed_at, \
                            unsettled_reason, retire_reason, retired_at";
 
 /// How wide each keyed identity part may be, taken from the columns that key
@@ -109,6 +109,9 @@ impl PostgresChangeLedgerStore {
             measured_rev: row
                 .try_get("measured_rev")
                 .map_err(|e| format!("measured_rev: {e}"))?,
+            delivered_rev: row
+                .try_get("delivered_rev")
+                .map_err(|e| format!("delivered_rev: {e}"))?,
             landed_at: row
                 .try_get("landed_at")
                 .map_err(|e| format!("landed_at: {e}"))?,
@@ -355,6 +358,20 @@ const RECORD_REOPEN_SQL: &str = "\
 INSERT INTO change_reopen (kind, scope, literal, was_landed_at, measured_rev) \
 VALUES ($1, $2, $3, $4, $5)";
 
+/// Stamp the commit that delivered a row's change, and only while nothing has.
+///
+/// The `delivered_rev IS NULL` guard is what makes the first sighting win: the
+/// log is read newest first, and a change landed twice would otherwise have its
+/// delivery moved to the later commit on every pass -- a reading that changes
+/// while the fact it reports does not.
+///
+/// A row that does not exist matches nothing, which is the right answer: the
+/// delivery arrives after the change entered the account, and a trailer whose
+/// row is not there is a commit for a change this ledger was never told about.
+const RECORD_DELIVERY_SQL: &str = "\
+UPDATE change_ledger SET delivered_rev = $4
+ WHERE kind = $1 AND scope = $2 AND literal = $3 AND delivered_rev IS NULL";
+
 /// Append one dispatch pass's own reading.
 ///
 /// Plain insert, no conflict clause: the row is an observation of a moment, and
@@ -366,8 +383,9 @@ INSERT INTO change_dispatch_state (
     decision, pool_reading, pending, submitted, already, failed,
     dead_environment, held_back, rearmed, unmeasurable,
     resume_at_unix, evidenced_recovery_unix, quota_window_secs, sources_unread,
-    window_allowance_tokens, window_spent_tokens, window_reserve_tokens, window_start_unix
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)";
+    window_allowance_tokens, window_spent_tokens, window_reserve_tokens, window_start_unix,
+    delivered
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)";
 
 /// Refuse a reading whose identity or document does not fit its column.
 ///
@@ -811,6 +829,18 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         Ok(())
     }
 
+    async fn record_delivery(&self, identity: &ChangeIdentity, rev: &str) -> SFResult<()> {
+        sqlx::query(RECORD_DELIVERY_SQL)
+            .bind(&identity.kind)
+            .bind(&identity.scope)
+            .bind(&identity.literal)
+            .bind(rev)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("record delivery: {e}")))?;
+        Ok(())
+    }
+
     async fn get(&self, identity: &ChangeIdentity) -> SFResult<Option<ChangeLedgerRow>> {
         let row = sqlx::query(&format!(
             "SELECT {ROW_COLUMNS} FROM change_ledger \
@@ -897,6 +927,10 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
                     .map(|pace| pace.window_start_unix)
                     .filter(|start| *start > 0),
             )
+            // `None` is not zero: a pass whose commit log could not be read
+            // says nothing about delivery, and writing zero would make that
+            // failure read as "nothing was delivered".
+            .bind(state.delivered.map(|count| count as i64))
             .execute(&self.pool)
             .await
             .map_err(|e| SFError::Database(format!("record dispatch state: {e}")))?;
