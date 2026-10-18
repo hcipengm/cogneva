@@ -372,7 +372,7 @@ impl BuildahRuntime {
     /// 而真相是「这台机器没跑完」。
     async fn exec(&self, args: &[String]) -> anyhow::Result<RunOutcome> {
         let mut cmd = self.command();
-        cmd.args(&args_with_driver(self.storage_driver(), args));
+        cmd.args(args_with_driver(self.storage_driver(), args));
         let child = cmd
             .kill_on_drop(true)
             .spawn()
