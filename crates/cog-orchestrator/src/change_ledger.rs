@@ -2875,6 +2875,12 @@ async fn publish_dispatch_verdict(
 /// working half for the recorded half. The failure is raised where it is a
 /// problem for a reader: it says the pause is not on record, which reads as a
 /// silent stop, and that is the one thing this table exists to prevent.
+///
+/// One parameter per column written, for the same reason the pass itself takes
+/// one per collaborator: a struct here would restate the row's shape in a type
+/// that exists only to hold it, and the next column would then have to be added
+/// in two places.
+#[allow(clippy::too_many_arguments)]
 async fn record_dispatch_state(
     store: &dyn ChangeLedgerStore,
     metrics: Option<&Arc<dyn MetricsBackend>>,
