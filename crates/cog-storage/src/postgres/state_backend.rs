@@ -51,6 +51,23 @@ CREATE TABLE IF NOT EXISTS cog_events (
 ;
 CREATE INDEX IF NOT EXISTS idx_cog_events_task_id ON cog_events(task_id)
 ;
+-- The offset is the backend's own assignment -- the sequence position a reader
+-- resumes from -- so two events of one task may not share one. The count and
+-- the insert are two round trips, and a task's owner is reclaimed on a lease,
+-- which presumes the previous holder stopped rather than stopping it, so the
+-- two writers only meet here: without the constraint the sequence can hand two
+-- events the same position and a reader resuming from it loses one for good.
+-- The sibling Redis backend gets this for free (its append returns the new
+-- length), so dropping it leaves Postgres alone in being able to break that.
+--
+-- The same index answers `EVENTS_PAGE_SQL`: `task_id` and `offset_num` in one
+-- btree, in the order the page asks for, so the read is an index scan instead
+-- of a filter-then-sort. `idx_cog_events_task_id` is its prefix and therefore
+-- redundant; it stays because removing it buys nothing measurable at one event
+-- per iteration.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cog_events_task_offset
+    ON cog_events(task_id, offset_num)
+;
 CREATE TABLE IF NOT EXISTS cog_context_boards (
                 task_id TEXT NOT NULL,
                 field_name TEXT NOT NULL,
