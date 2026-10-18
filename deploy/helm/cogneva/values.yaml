@@ -64,13 +64,25 @@ storage:
 #   **这两个数一起报**：只抬容器不抬配额，Pod 在准入就被拒；只抬配额不抬
 #   limitRange.maxCpu，容器声明本身进不来——三条是一对耦合，少一条就换一种方式
 #   失败（见 memory 里那条"有准入上限约束的旋钮是一对不是一个数"）。
+#
+# 2026-10-19 重算：运营面自己拉起的一次性 Pod 不在渲染期门禁的和里——门禁只读
+# 声明的工作负载，而 eval 表（3Gi/2 核）、验收演练（768Mi/1 核）这类探针是运行时
+# 按需建的。两者同时在场时额度用量 45.94Gi/24800m，部署器下一次主线滚动 Job
+# （512Mi/2000m）在准入就被拒（`exceeded quota: cogneva-quota, limited:
+# limits.memory=46Gi`），部署器从此每轮空转。额度必须把这一类"运行期自建 Pod"
+# 也记进预算，否则「稳态 + 判据 Job + 替换重叠」这套算式永远比实际少一截：
+#   limitsCpu 27 → 30：稳态 23500m + 判据 Job 2000m + 运行期自建 3000m
+#     + 替换重叠 1500m = 30000m。
+#   limitsMemory 46Gi → 52Gi：稳态 43.7Gi + 判据 Job 512Mi + 运行期自建 3.75Gi
+#     + 替换重叠 3.4Gi = 51.35Gi，取整 52Gi。
+#   稳态那两个数由渲染期门禁自报，不手抄——重算时先跑它。
 resourceGovernance:
   enabled: true
   quota:
     requestsCpu: "6"
     requestsMemory: 12Gi
-    limitsCpu: "27"
-    limitsMemory: 46Gi
+    limitsCpu: "30"
+    limitsMemory: 52Gi
     pods: "40"
     # 存储声明是**命名空间内全部 PVC 之和的上限**，不是某个卷的容量：目录型卷
     # 不强制 requests.storage，写多少都不影响落盘，它唯一的作用是拒绝一份声明

@@ -880,17 +880,20 @@ rows:
   - key: resourceGovernance.quota.limitsCpu
     source: override
     why: >-
-      Steady-state limits plus the judging Job plus room for overlap during a
-      replacement, recomputed by hand at each re-sizing (the arithmetic is beside
-      the chart field). The render-time gate recomputes the sum; the value is
-      still typed.
+      Steady-state limits plus the judging Job, plus a budget for pods created at
+      runtime outside the declared workloads (ad-hoc eval and drill probes), plus
+      room for overlap during a replacement; recomputed by hand at each re-sizing
+      (the arithmetic is beside the chart field). The render-time gate recomputes
+      only the declared sum, so it cannot see the runtime-created term; the value
+      is still typed.
 
   - key: resourceGovernance.quota.limitsMemory
     source: override
     why: >-
-      The same sum for memory: the declared limits plus the judging Job plus
-      headroom. Every resizing so far was a human recomputation checked by the
-      render-time gate; the gate compares, it does not supply the number.
+      The same sum for memory, including the same runtime-created term. Every
+      resizing so far was a human recomputation checked by the render-time gate;
+      the gate compares the declared part, it neither supplies the number nor
+      covers the transient pods that made the quota bind.
 
   - key: resourceGovernance.quota.pods
     source: override

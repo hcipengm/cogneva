@@ -23,11 +23,12 @@ spec:
   hard:
     requests.cpu: "6"
     requests.memory: 12Gi
-    limits.cpu: "27"
-    # 46Gi：42.1Gi（稳态单副本下限和，进化 Pod 由 8Gi 抬到 16Gi）+ 判据 Job 512Mi
-    # = 42.6Gi，头寸 3.4Gi。单容器上限同批 8Gi → 16Gi——它是准入面，不抬这份声明
-    # 根本进不来，理由与算式见 chart values 的 resourceGovernance 段。
-    limits.memory: "46Gi"
+    limits.cpu: "30"
+    # 52Gi：稳态 43.7Gi（渲染期门禁自报）+ 判据 Job 512Mi + 运行期自建临时 Pod
+    # 3.75Gi（eval 表 3Gi + 验收演练 768Mi）+ 替换重叠 3.4Gi = 51.35Gi。
+    # 运行期自建 Pod 不在门禁的和里，额度必须替它们留位，否则部署器的滚动 Job
+    # 会在准入被拒、每轮空转。完整算式见 chart values 的 resourceGovernance 段。
+    limits.memory: "52Gi"
     pods: "40"
     requests.storage: 300Gi
 ---
