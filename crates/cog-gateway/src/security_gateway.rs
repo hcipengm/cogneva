@@ -4452,6 +4452,12 @@ async fn stream_forward(
                     "window_spent_tokens": pace.spent_tokens,
                     "window_reserve_tokens": pace.reserve_tokens,
                     "quota_window_secs": pace.window_secs,
+                    // 这一窗的起点（Unix 秒），和上面三个数必须一起读：烧穿的
+                    // 窗口里 allowance 与 spent 都会是 0——起点还在将来时，斜坡
+                    // 没起、本窗的求和区间也是空的。没有这一格，两个 0 读起来
+                    // 像「一分没花、一分不许」，正是账看着坏了的形状；有了它，
+                    // 同一组数说的是「下一窗从这一刻起才开张」。
+                    "window_start_unix": pace.window_start_unix,
                 })
                 .to_string(),
             ))
