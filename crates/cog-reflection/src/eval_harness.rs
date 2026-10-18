@@ -5,6 +5,15 @@
 //! - 仅当「显著更好」时给出 Adopt，显著更差 Reject，其余 Inconclusive ——
 //!   配合「拒绝无统计显著的改动」原则，只有 Adopt 应被部署流水线接受；
 //! - `BenchReport` 产出可复现的 JSON / Markdown 报告工件。
+//!
+//! principle: feedback_a_set_difference_only_answers_the_direction_you_subtract
+//! Gate: 集合差判据只答它减出来的那个方向。The per-task regression reading this
+//! harness's comparison is judged by is a set difference — the tasks failing in
+//! `after` minus the tasks failing in `before` — and it answers only that
+//! direction: it names exactly the tasks the change regressed, and it is silent
+//! about the tasks the change fixed, which live in the reversed difference. The
+//! contract module at the bottom of this file pins both halves, including that
+//! the verdict `compare` reports flips when the operands do.
 
 use std::future::Future;
 
@@ -271,5 +280,128 @@ mod tests {
         let md = std::fs::read_to_string(md_path).unwrap();
         assert!(md.contains("成功率：50.0%"));
         assert!(md.contains("| t0 | true | 120 | 10 |"));
+    }
+}
+
+/// 集合差方向性契约测试：钉住「集合差判据只答它减出来的那个方向」——前向差为空
+/// 只是「没有引入新的失败」，对反方向（修好了什么）一言不发。
+#[cfg(test)]
+mod set_difference_direction_contract {
+    use std::collections::HashSet;
+
+    use super::{compare, EvalOutcome, EvalVerdict};
+
+    fn outcome(task_id: &str, success: bool) -> EvalOutcome {
+        EvalOutcome {
+            task_id: task_id.to_string(),
+            success,
+            latency_ms: 100,
+            cost_tokens: 10,
+        }
+    }
+
+    /// 一次运行中失败任务的 id 集合：集合差就取在它上面。
+    fn failures(run: &[EvalOutcome]) -> HashSet<&str> {
+        run.iter()
+            .filter(|o| !o.success)
+            .map(|o| o.task_id.as_str())
+            .collect()
+    }
+
+    /// 前向差恰好列出被该方向减出来的退化任务：在 after 失败、在 before 未失败。
+    #[test]
+    fn the_difference_names_exactly_the_tasks_regressed_in_its_direction() {
+        let before = vec![
+            outcome("steady-pass", true),
+            outcome("steady-fail", false),
+            outcome("flaky", false),
+        ];
+        let after = vec![
+            outcome("steady-pass", true),
+            outcome("steady-fail", false),
+            outcome("flaky", true),
+            outcome("newly-failing", false),
+        ];
+        let regressed: HashSet<&str> = failures(&after)
+            .difference(&failures(&before))
+            .copied()
+            .collect();
+        assert_eq!(
+            regressed,
+            HashSet::from(["newly-failing"]),
+            "A\\B must name the tasks B introduced and no others: steady-fail fails in both \
+             runs and flaky moved the other way"
+        );
+    }
+
+    /// 前向差为空只说明没有引入新的失败；它对反方向一言不发——反向差可以非空。
+    #[test]
+    fn an_empty_forward_difference_is_silent_about_the_reverse() {
+        let before = vec![
+            outcome("fixed-by-change", false),
+            outcome("still-failing", false),
+        ];
+        let after = vec![
+            outcome("fixed-by-change", true),
+            outcome("still-failing", false),
+        ];
+        let regressed: HashSet<&str> = failures(&after)
+            .difference(&failures(&before))
+            .copied()
+            .collect();
+        let fixed: HashSet<&str> = failures(&before)
+            .difference(&failures(&after))
+            .copied()
+            .collect();
+        assert!(
+            regressed.is_empty(),
+            "no task regressed, so the forward difference must be empty"
+        );
+        assert_eq!(
+            fixed,
+            HashSet::from(["fixed-by-change"]),
+            "the reversed difference carries the improvement the forward one cannot see"
+        );
+    }
+
+    /// 对调两个操作数回答的是另一个问题：两个方向的答案互不相交，
+    /// 于是一个方向的「绿」永远不能被读成另一个方向的判词。
+    #[test]
+    fn reversing_the_operands_answers_a_disjoint_question() {
+        let before = vec![outcome("a", false), outcome("b", true)];
+        let after = vec![outcome("a", true), outcome("b", false)];
+        let regressed: HashSet<&str> = failures(&after)
+            .difference(&failures(&before))
+            .copied()
+            .collect();
+        let fixed: HashSet<&str> = failures(&before)
+            .difference(&failures(&after))
+            .copied()
+            .collect();
+        assert_eq!(regressed, HashSet::from(["b"]));
+        assert_eq!(fixed, HashSet::from(["a"]));
+        assert!(
+            regressed.is_disjoint(&fixed),
+            "the two directions of one pair of runs are different questions"
+        );
+    }
+
+    /// 聚合判词沿同一方向走：对调 before/after 必须翻转判词，
+    /// 判定函数不得对两个方向报同一个答案。
+    #[test]
+    fn the_verdict_the_harness_reports_flips_with_the_direction() {
+        let improvement: Vec<EvalOutcome> =
+            (0..40).map(|i| outcome(&format!("t{i}"), true)).collect();
+        let regression: Vec<EvalOutcome> = (0..40)
+            .map(|i| outcome(&format!("t{i}"), i % 2 == 0))
+            .collect();
+        assert_eq!(
+            compare(&regression, &improvement).verdict,
+            EvalVerdict::Adopt
+        );
+        assert_eq!(
+            compare(&improvement, &regression).verdict,
+            EvalVerdict::Reject
+        );
     }
 }
