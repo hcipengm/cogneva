@@ -57,12 +57,7 @@ spec:
               fi
               exit $rc
           resources:
-            requests:
-              cpu: 10m
-              memory: 32Mi
-            limits:
-              cpu: 200m
-              memory: 256Mi
+{{ toYaml .Values.backends.redis.aofRepair.resources | indent 12 }}
           volumeMounts:
             - name: data
               mountPath: /data
@@ -126,12 +121,7 @@ spec:
               containerPort: 9100
               protocol: TCP
           resources:
-            requests:
-              cpu: 10m
-              memory: 16Mi
-            limits:
-              cpu: 100m
-              memory: 64Mi
+{{ toYaml .Values.backends.redis.aofReportExporter.resources | indent 12 }}
           volumeMounts:
             - name: aof-report
               mountPath: /report

@@ -66,14 +66,12 @@ spec:
                 - name: COGNEVA_BACKUP_OFFSITE_DIR
                   value: "/offsite"
               resources:
-                # 请求按流式作业实耗定（COPY→文件、tar.zst 流式压缩，常驻内存
-                # 极小）；定高了在资源紧张的小节点上会调度不出来。
-                requests:
-                  cpu: 100m
-                  memory: 64Mi
                 limits:
                   cpu: 1000m
                   memory: 1Gi
+                requests:
+                  cpu: 100m
+                  memory: 64Mi
               volumeMounts:
                 # 对象 raw 层来源（只读：备份绝不写数据卷）。
                 - name: data

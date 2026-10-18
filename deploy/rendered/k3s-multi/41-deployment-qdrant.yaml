@@ -60,12 +60,12 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 10
           resources:
-            requests:
-              cpu: 250m
-              memory: 512Mi
             limits:
               cpu: 2000m
               memory: 4Gi
+            requests:
+              cpu: 250m
+              memory: 512Mi
           volumeMounts:
             - name: data
               mountPath: /qdrant/storage

@@ -77,12 +77,7 @@ spec:
               port: http
 {{ toYaml .Values.healthProbes.readiness | indent 12 }}
           resources:
-            requests:
-              cpu: 100m
-              memory: 256Mi
-            limits:
-              cpu: 1000m
-              memory: 2Gi
+{{ toYaml .Values.backends.meilisearch.resources | indent 12 }}
           volumeMounts:
             - name: data
               mountPath: /meili_data

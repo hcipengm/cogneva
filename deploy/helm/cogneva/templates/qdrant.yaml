@@ -70,12 +70,7 @@ spec:
               port: http
 {{ toYaml .Values.healthProbes.readiness | indent 12 }}
           resources:
-            requests:
-              cpu: 250m
-              memory: 512Mi
-            limits:
-              cpu: 2000m
-              memory: 4Gi
+{{ toYaml .Values.backends.qdrant.resources | indent 12 }}
           volumeMounts:
             - name: data
               mountPath: /qdrant/storage

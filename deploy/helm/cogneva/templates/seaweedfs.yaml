@@ -94,12 +94,7 @@ spec:
                 - wget -qS -O /dev/null http://127.0.0.1:8333/ 2>&1 | grep -q 'HTTP/1.1'
 {{ toYaml .Values.healthProbes.readiness | indent 12 }}
           resources:
-            requests:
-              cpu: 100m
-              memory: 256Mi
-            limits:
-              cpu: 1000m
-              memory: 1Gi
+{{ toYaml .Values.backends.seaweedfs.resources | indent 12 }}
           volumeMounts:
             - name: data
               mountPath: /data

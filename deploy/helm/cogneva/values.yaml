@@ -171,6 +171,23 @@ backup:
   # 运行、落在外面的那次是卡死了——而卡死的那次不杀掉，Forbid 会让后面每
   # 一次都不再开始。
   runDeadlineSeconds: 3600
+  # 备份与演练都是流式作业（COPY→文件、tar.zst 流式压缩），常驻内存极小；
+  # 请求按实耗定低，免得在资源紧张的小节点上调度不出来。两个 Job 各一份界，
+  # 写在 values 里才进得了登记表（登记表只枚举本文件的数值叶子）。
+  resources:
+    requests:
+      cpu: 100m
+      memory: 64Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+  drillResources:
+    requests:
+      cpu: 100m
+      memory: 64Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
   storage: 10Gi
   # 恢复演练：把最新一个包装进一个跑完迁移的空库，逐表对数、把账行与源库逐格比，
   # 然后删库，答案落进 `backup_drills`。排在备份之后半小时：装的是当晚刚出的那一
@@ -712,6 +729,15 @@ backends:
     enabled: true
     image: postgres:16-alpine
     storage: 10Gi
+    # Resource bounds live here, not in the template, so the tunables registry can
+    # see them (it enumerates the numeric leaves of this file only).
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: 1000m
+        memory: 2Gi
   redis:
     enabled: true
     image: redis:7-alpine
@@ -731,23 +757,61 @@ backends:
       limits:
         cpu: 500m
         memory: 2Gi
+    # The one-shot AOF repair runs before redis starts; its footprint is a fixed
+    # bound on a rewrite of the whole AOF, not a measurement.
+    aofRepair:
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+        limits:
+          cpu: 200m
+          memory: 256Mi
     # Serves the AOF repair verdict beside redis as a scrapeable textfile gauge.
     # redis-server has no metrics endpoint of its own, so an exporter next to it
     # is the only way a one-shot container's reading can reach a scraper.
     aofReportExporter:
       image: quay.io/prometheus/node-exporter:v1.12.1-distroless
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          cpu: 100m
+          memory: 64Mi
   qdrant:
     enabled: true
     image: qdrant/qdrant:v1.13.4
     storage: 10Gi
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: 2000m
+        memory: 4Gi
   nats:
     enabled: true
     image: nats:2.10-alpine
     storage: 10Gi
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
   meilisearch:
     enabled: true
     image: getmeili/meilisearch:v1.10.3
     storage: 5Gi
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 1000m
+        memory: 2Gi
   # S3 兼容对象存储，承载永久记忆的 Raw 层与冷层。默认在集群内跑 SeaweedFS
   # 单进程（master + volume + filer + S3 网关），禁用即把 providers.storage
   # 指向外部 S3 兼容端点（MinIO / 云对象存储，代码路径相同）。
@@ -756,6 +820,13 @@ backends:
     image: chrislusf/seaweedfs:3.71
     # 承载永久记忆的 Raw 层与冷层：只增不减，实测已 15Gi，取 20Gi。
     storage: 20Gi
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 1000m
+        memory: 1Gi
 
 # 明文默认值仅用于开发；生产请用 --set-file 或外部 Secret（然后 secrets.create=false）
 secrets:

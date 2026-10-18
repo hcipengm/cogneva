@@ -62,13 +62,12 @@ spec:
                 - name: COGNEVA_BACKUP_OFFSITE_DIR
                   value: "/offsite"
               resources:
-                # 与备份同档：恢复是流式 COPY，常驻内存小，重活在 PG 那一侧。
-                requests:
-                  cpu: 100m
-                  memory: 64Mi
                 limits:
                   cpu: 1000m
                   memory: 1Gi
+                requests:
+                  cpu: 100m
+                  memory: 64Mi
               volumeMounts:
                 # 只读：演练打开包，绝不写卷。保留的一份都不动。
                 - name: backup

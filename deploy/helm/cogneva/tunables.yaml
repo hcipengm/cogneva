@@ -61,6 +61,25 @@ rows:
       against the volume's free space; the volume usage is alerted on, not fed
       back into the declaration.
 
+  - key: backends.meilisearch.resources.requests.cpu
+    source: override
+    why: >-
+      A scheduling claim, not a measured draw: the store's steady rate sits far below it and nothing reads a figure back into it.
+
+  - key: backends.meilisearch.resources.requests.memory
+    source: override
+    why: >-
+      Small enough that a tight node still schedules the store; the working set is carried by the limit, not by this claim.
+
+  - key: backends.meilisearch.resources.limits.cpu
+    source: override
+    why: >-
+      A burst bound for startup and compaction; the steady rate sits far below it and no measurement of the burst feeds back into it.
+
+  - key: backends.meilisearch.resources.limits.memory
+    source: override
+    why: >-
+      Sized for the search index this store holds with room for index rebuilds; no loop re-measures the index against the bound.
   - key: backends.nats.storage
     source: override
     why: >-
@@ -68,6 +87,25 @@ rows:
       derived value would read that retention against the message rate; nothing
       computes it.
 
+  - key: backends.nats.resources.requests.cpu
+    source: override
+    why: >-
+      A scheduling claim, not a measured draw: the store's steady rate sits far below it and nothing reads a figure back into it.
+
+  - key: backends.nats.resources.requests.memory
+    source: override
+    why: >-
+      Small enough that a tight node still schedules the store; the working set is carried by the limit, not by this claim.
+
+  - key: backends.nats.resources.limits.cpu
+    source: override
+    why: >-
+      A burst bound for startup and compaction; the steady rate sits far below it and no measurement of the burst feeds back into it.
+
+  - key: backends.nats.resources.limits.memory
+    source: override
+    why: >-
+      Sized for the JetStream backlog with room for file-store buffers; the backlog is measured elsewhere but never read back into this bound.
   - key: backends.postgres.storage
     source: override
     why: >-
@@ -75,12 +113,50 @@ rows:
       derived value would follow the measured growth of pg_database_size; no loop
       reads it back.
 
+  - key: backends.postgres.resources.requests.cpu
+    source: override
+    why: >-
+      A scheduling claim, not a measured draw: the store's steady rate sits far below it and nothing reads a figure back into it.
+
+  - key: backends.postgres.resources.requests.memory
+    source: override
+    why: >-
+      Small enough that a tight node still schedules the store; the working set is carried by the limit, not by this claim.
+
+  - key: backends.postgres.resources.limits.cpu
+    source: override
+    why: >-
+      A burst bound for startup and compaction; the steady rate sits far below it and no measurement of the burst feeds back into it.
+
+  - key: backends.postgres.resources.limits.memory
+    source: override
+    why: >-
+      Sized for the database already carried (962 MB on 2026-10-18) plus WAL and connections; no loop re-measures it.
   - key: backends.qdrant.storage
     source: override
     why: >-
       The vector store volume. Its size tracks the number of indexed chunks, which
       the application already knows; the declaration does not read that number.
 
+  - key: backends.qdrant.resources.requests.cpu
+    source: override
+    why: >-
+      A scheduling claim, not a measured draw: the store's steady rate sits far below it and nothing reads a figure back into it.
+
+  - key: backends.qdrant.resources.requests.memory
+    source: override
+    why: >-
+      Small enough that a tight node still schedules the store; the working set is carried by the limit, not by this claim.
+
+  - key: backends.qdrant.resources.limits.cpu
+    source: override
+    why: >-
+      A burst bound for startup and compaction; the steady rate sits far below it and no measurement of the burst feeds back into it.
+
+  - key: backends.qdrant.resources.limits.memory
+    source: override
+    why: >-
+      Sized for the vector index with room for segment merges; no loop re-measures it.
   - key: backends.redis.storage
     source: override
     why: >-
@@ -117,6 +193,69 @@ rows:
       patch raised it to 2Gi and the service has held with zero restarts since;
       the chart follows that value. A derived limit would read the loaded dataset
       size, and nothing does today.
+
+  - key: backends.redis.aofRepair.resources.requests.cpu
+    source: override
+    why: >-
+      A scheduling claim, not a measured draw: the store's steady rate sits far below it and nothing reads a figure back into it.
+
+  - key: backends.redis.aofRepair.resources.requests.memory
+    source: override
+    why: >-
+      Small enough that a tight node still schedules the store; the working set is carried by the limit, not by this claim.
+
+  - key: backends.redis.aofRepair.resources.limits.cpu
+    source: override
+    why: >-
+      A burst bound for startup and compaction; the steady rate sits far below it and no measurement of the burst feeds back into it.
+
+  - key: backends.redis.aofRepair.resources.limits.memory
+    source: override
+    why: >-
+      A one-shot rewrite of the whole AOF before redis starts: the bound is a practice, not a measurement.
+
+  - key: backends.redis.aofReportExporter.resources.requests.cpu
+    source: override
+    why: >-
+      A scheduling claim, not a measured draw: the store's steady rate sits far below it and nothing reads a figure back into it.
+
+  - key: backends.redis.aofReportExporter.resources.requests.memory
+    source: override
+    why: >-
+      Small enough that a tight node still schedules the store; the working set is carried by the limit, not by this claim.
+
+  - key: backends.redis.aofReportExporter.resources.limits.cpu
+    source: override
+    why: >-
+      A burst bound for startup and compaction; the steady rate sits far below it and no measurement of the burst feeds back into it.
+
+  - key: backends.redis.aofReportExporter.resources.limits.memory
+    source: override
+    why: >-
+      A textfile collector beside redis; the footprint is the process plus the file it serves, and no reading moves it.
+  - key: backends.seaweedfs.resources.requests.cpu
+    source: override
+    why: >-
+      The object store's steady draw is a fraction of a core; the request only
+      has to let a tight node schedule it.
+
+  - key: backends.seaweedfs.resources.requests.memory
+    source: override
+    why: >-
+      Volume-server buffers are small beside the data itself, which lives on the
+      volume; the limit carries the working set, not this claim.
+
+  - key: backends.seaweedfs.resources.limits.cpu
+    source: override
+    why: >-
+      A burst bound for compaction and S3 request handling; nothing measures the
+      burst back into the limit.
+
+  - key: backends.seaweedfs.resources.limits.memory
+    source: override
+    why: >-
+      The raw and cold layers only grow (15 GiB in use when sized), but this bound
+      covers buffers, not the data; no loop re-measures it.
 
   - key: backends.seaweedfs.storage
     source: override
@@ -156,6 +295,52 @@ rows:
       package size is measured per run; the declaration does not read it.
 
   # --- node image builds ------------------------------------------------------
+  - key: backup.resources.requests.cpu
+    source: override
+    why: >-
+      A streaming COPY-to-file job whose resident set is small by construction;
+      the request only has to let a tight node schedule it.
+
+  - key: backup.resources.requests.memory
+    source: override
+    why: >-
+      See requests.cpu above: the working set is small and no measurement feeds
+      back into this claim.
+
+  - key: backup.resources.limits.cpu
+    source: override
+    why: >-
+      A ceiling for a straggling compression pass; the run time is measured per
+      run, but nothing reads it back into this limit.
+
+  - key: backup.resources.limits.memory
+    source: override
+    why: >-
+      The tar.zst stream buffers only; the bound is a practice, not a reading.
+
+  - key: backup.drillResources.requests.cpu
+    source: override
+    why: >-
+      The drill restores the package into a scratch database; the request only
+      has to let a tight node schedule it.
+
+  - key: backup.drillResources.requests.memory
+    source: override
+    why: >-
+      The restore streams through COPY on the postgres side, so the client's
+      resident set is small and no measurement feeds back into this claim.
+
+  - key: backup.drillResources.limits.cpu
+    source: override
+    why: >-
+      A ceiling for a restore that has to finish inside the deadline; the
+      deadline is what bounds it and neither value is derived.
+
+  - key: backup.drillResources.limits.memory
+    source: override
+    why: >-
+      See the backup job's bound: a practice, not a reading.
+
   - key: buildah.resources.requests.cpu
     source: override
     why: >-

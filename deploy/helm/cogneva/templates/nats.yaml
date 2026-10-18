@@ -75,12 +75,7 @@ spec:
               port: monitor
 {{ toYaml .Values.healthProbes.readiness | indent 12 }}
           resources:
-            requests:
-              cpu: 100m
-              memory: 256Mi
-            limits:
-              cpu: 500m
-              memory: 1Gi
+{{ toYaml .Values.backends.nats.resources | indent 12 }}
           volumeMounts:
             - name: data
               mountPath: /data

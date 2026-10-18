@@ -274,6 +274,75 @@ fn every_numeric_leaf_of_the_chart_has_exactly_one_row() {
     );
 }
 
+/// The registry is only as wide as the file it enumerates: it reads
+/// `values.yaml`. A container's `resources:` block written straight into a
+/// template is the same dial with no row anywhere, and no reading built on the
+/// registry can see it -- which is how a memory limit below the data the store
+/// already held reached the cluster without any account being wrong.
+///
+/// The check is scoped by shape, because other things called `resources:` are
+/// legitimate literals: a PersistentVolumeClaim's `resources:` holds `storage`,
+/// and a Role's holds an inline list. A block that carries `cpu:` or `memory:`
+/// is a container bound, and that block has to come from values.
+#[test]
+fn container_resource_bounds_in_templates_come_from_values() {
+    let dir = repo_root().join("deploy/helm/cogneva/templates");
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|entry| entry.expect("template directory entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "yaml"))
+        .collect();
+    entries.sort();
+
+    let mut literals = Vec::new();
+    for path in entries {
+        let text = read(&path);
+        let lines: Vec<&str> = text.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            if line.trim() != "resources:" {
+                continue;
+            }
+            let indent = line.len() - line.trim_start().len();
+            let mut block = Vec::new();
+            let mut next = index + 1;
+            while next < lines.len() {
+                let child = lines[next];
+                if child.trim().is_empty() {
+                    next += 1;
+                    continue;
+                }
+                if child.len() - child.trim_start().len() <= indent {
+                    break;
+                }
+                block.push(child.trim());
+                next += 1;
+            }
+            let carries_bounds = block
+                .iter()
+                .any(|child| child.starts_with("cpu:") || child.starts_with("memory:"));
+            if !carries_bounds {
+                continue;
+            }
+            let by_reference = block
+                .iter()
+                .any(|child| child.contains("toYaml") || child.contains("include"));
+            if !by_reference {
+                let shown = path
+                    .strip_prefix(repo_root())
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|_| path.clone());
+                literals.push(format!("{}:{}", shown.display(), index + 1));
+            }
+        }
+    }
+
+    assert!(
+        literals.is_empty(),
+        "these container resource bounds are written into the template, so they \
+         are dials with no row in {REGISTRY} and no reading can see them: {literals:#?}"
+    );
+}
+
 #[test]
 fn every_row_says_why_it_is_not_derived() {
     let mut silent = Vec::new();

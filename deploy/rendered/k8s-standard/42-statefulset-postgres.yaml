@@ -64,12 +64,12 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 10
           resources:
-            requests:
-              cpu: 250m
-              memory: 512Mi
             limits:
               cpu: 1000m
               memory: 2Gi
+            requests:
+              cpu: 250m
+              memory: 512Mi
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
