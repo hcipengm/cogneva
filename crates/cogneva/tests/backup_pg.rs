@@ -28,11 +28,19 @@ fn database_url() -> String {
 
 const PARENT: &str = "backup_probe_events";
 const PLAIN: &str = "backup_probe_plain";
+const COMPUTED: &str = "backup_probe_computed";
 
 async fn fresh_schema(pool: &PgPool) {
     for stmt in [
         format!("DROP TABLE IF EXISTS {PARENT} CASCADE"),
         format!("DROP TABLE IF EXISTS {PLAIN} CASCADE"),
+        format!("DROP TABLE IF EXISTS {COMPUTED} CASCADE"),
+        // 生成列能进包的表头、却进不了 COPY FROM：包里带上它，整张表就恢复不了。
+        // 它与下面的 PLAIN 成对，一条路径证明搬迁，一条证明「算出来的列不搬」。
+        format!(
+            "CREATE TABLE {COMPUTED} (id BIGSERIAL PRIMARY KEY, half INTEGER NOT NULL, \
+             doubled INTEGER GENERATED ALWAYS AS (half * 2) STORED)"
+        ),
         format!(
             "CREATE TABLE {PARENT} (id BIGSERIAL, ts TIMESTAMPTZ NOT NULL, note TEXT) \
              PARTITION BY RANGE (ts)"
@@ -78,6 +86,10 @@ async fn pg_backup_restore_round_trips_rows_partitions_and_sequences() {
     .execute(&pool)
     .await
     .unwrap();
+    sqlx::query(&format!("INSERT INTO {COMPUTED} (half) VALUES (2), (3)"))
+        .execute(&pool)
+        .await
+        .unwrap();
 
     // 表发现必须包含分区父表、排除子表。
     let tables = discover_tables(&pool).await.unwrap();
@@ -114,8 +126,24 @@ async fn pg_backup_restore_round_trips_rows_partitions_and_sequences() {
 
     // 模拟换机：清空数据并推进序列（新库上迁移会重建表，但这里直接清表
     // 等价且更快；序列推进模拟"空库上又写过别的行"的漂移）。
+    // 包的表头是搬迁的列清单：生成列在这里出现，恢复时必然整表失败。
+    {
+        use std::io::BufRead;
+        let mut header = String::new();
+        std::io::BufReader::new(
+            std::fs::File::open(pg_dir.join(format!("public.{COMPUTED}.csv"))).unwrap(),
+        )
+        .read_line(&mut header)
+        .unwrap();
+        assert_eq!(
+            header.trim_end(),
+            "id,half",
+            "包不该带上目标表自己算出来的列"
+        );
+    }
+
     sqlx::query(&format!(
-        "TRUNCATE {PARENT}, {PLAIN} RESTART IDENTITY CASCADE"
+        "TRUNCATE {PARENT}, {PLAIN}, {COMPUTED} RESTART IDENTITY CASCADE"
     ))
     .execute(&pool)
     .await
@@ -141,6 +169,12 @@ async fn pg_backup_restore_round_trips_rows_partitions_and_sequences() {
         "COPY 进父表必须按分区键路由，DEFAULT 里的行也要回来"
     );
     assert_eq!(count_in(&pool, PLAIN).await, 2);
+    let doubled: Vec<i32> =
+        sqlx::query_scalar(&format!("SELECT doubled FROM {COMPUTED} ORDER BY id"))
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(doubled, vec![4, 6], "生成列必须由目标表自己算回来");
 
     let note: String = sqlx::query_scalar(&format!(
         "SELECT note FROM {PARENT} WHERE ts = '2027-01-01 00:00:00+00'"
@@ -162,6 +196,7 @@ async fn pg_backup_restore_round_trips_rows_partitions_and_sequences() {
     for stmt in [
         format!("DROP TABLE IF EXISTS {PARENT} CASCADE"),
         format!("DROP TABLE IF EXISTS {PLAIN} CASCADE"),
+        format!("DROP TABLE IF EXISTS {COMPUTED} CASCADE"),
     ] {
         sqlx::query(&stmt).execute(&pool).await.unwrap();
     }
