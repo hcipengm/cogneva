@@ -125,6 +125,22 @@ pub fn jobs_the_window_can_pay_for_status(status: &cog_core::LlmPoolStatus) -> O
     jobs_the_window_can_pay_for(&status.pace, measurable_pool_size(status))
 }
 
+/// Why a pass held work back, as the closed label the held counter carries.
+///
+/// The two zeros above arrive at the same place and mean opposite things: a
+/// spent window is fixed by waiting, an unavailable pool is fixed by the
+/// upstreams coming back. Labelling both `window_exhausted` files an outage
+/// under a budget and sends its reader to tune an allowance that is not the
+/// constraint -- which is possible here precisely because the pool verdict
+/// overrides an allowance that still pays for a job.
+pub fn hold_reason(pool_unavailable: bool) -> &'static str {
+    if pool_unavailable {
+        "pool_unavailable"
+    } else {
+        "window_exhausted"
+    }
+}
+
 /// How many of `ready` may go on the wire, given what the queue already owes.
 ///
 /// `window_jobs` is the pool's own bound, or `None` when nothing measured one
@@ -327,6 +343,24 @@ mod tests {
             )),
             Some(4)
         );
+    }
+
+    #[test]
+    fn a_hold_names_the_gate_that_produced_it_not_the_one_it_is_filed_under() {
+        // Both zeros reach the same hold; only the label says which repair.
+        assert_eq!(hold_reason(true), "pool_unavailable");
+        assert_eq!(hold_reason(false), "window_exhausted");
+        // The case that made this a defect: a pool that is down still has an
+        // allowance that pays for jobs, so the window is not the constraint
+        // while the bound is zero. Filing that under the window sends the
+        // reader to tune a budget.
+        let down = status(2, 2, true, &["quota_cycle", "quota_cycle"]);
+        assert_eq!(jobs_the_window_can_pay_for_status(&down), Some(0));
+        assert!(
+            jobs_the_window_can_pay_for(&down.pace, measurable_pool_size(&down)).unwrap_or(0) > 0,
+            "the fixture must keep paying for a job, or it cannot show the two reasons apart"
+        );
+        assert_eq!(hold_reason(down.unavailable), "pool_unavailable");
     }
 
     #[test]

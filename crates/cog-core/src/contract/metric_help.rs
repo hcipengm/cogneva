@@ -696,8 +696,11 @@ const COUNTER_HELP: &[(&str, &str)] = &[
     ),
     (
         "cogneva_ready_admission_held_total",
-        "Ready tasks the pool's window could not pay for, by stream (shared or \
-         local) and reason (window_exhausted). A gate holding work back and a \
+        "Ready tasks nothing admitted, by stream (shared or local) and reason \
+         (window_exhausted, or pool_unavailable when the gateway's own verdict \
+         held the pass while its window still paid for a job -- the two want \
+         opposite repairs, so they are separate cells and not one). A gate \
+         holding work back and a \
          publisher with nothing to publish leave the same trace -- no dispatch \
          -- so without this counter the two are indistinguishable on every \
          delivery reading. The label sets are closed; no task id or number \
@@ -1107,7 +1110,12 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          behaves under load, and owed is a different quantity, work already in \
          flight rather than work asking to leave), owed (tasks already \
          scheduled or running on that queue) and admitted (tasks put on the \
-         wire). window_jobs is written only when bounded is \
+         wire), and unavailable (1 when the pool's own verdict, not its \
+         allowance, is what held the pass: an unavailable pool answers zero \
+         jobs whatever the window pays for, so window_jobs=0 with \
+         unavailable=1 is an outage of the upstreams and not a spent window \
+         -- the two call for opposite repairs). window_jobs is written only \
+         when bounded is \
          1: an unmeasured window is not a window that pays for zero jobs, and \
          a zero there would read as the strongest possible refusal. covered, \
          pool and reserve are written on every pass, zeros included, because \

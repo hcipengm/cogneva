@@ -78,6 +78,13 @@ struct AdmissionBound {
     window_jobs: Option<u64>,
     pace: cog_core::LlmWindowPace,
     pool_size: usize,
+    /// The pool's own verdict, carried beside the arithmetic because it
+    /// overrides it: `jobs_the_window_can_pay_for_status` answers zero for an
+    /// unavailable pool whatever the allowance says, so a hold decided this way
+    /// has a zero that came from availability and not from the window. Without
+    /// this field the refusal prints the window's numbers as its reason, and
+    /// the reader is told to wait out a window that already pays for a job.
+    unavailable: bool,
 }
 
 /// DagExecutor 运行时。
@@ -293,7 +300,14 @@ impl DagExecutorRuntime {
                                     self.config.ready_task_poll_interval_secs as i64
                                 )
                             ),
-                            "holding ready tasks back: the pool's window cannot pay for them, so they stay pending until it can"
+                            // Which gate said zero. The window arithmetic below
+                            // is printed either way, and for an unavailable
+                            // pool it contradicts the hold -- the allowance
+                            // already covers a job while nothing is admitted.
+                            // A reader given only the numbers would tune the
+                            // pace for a pool that is simply down.
+                            refusal = crate::ready_queue::hold_reason(bound.unavailable),
+                            "holding ready tasks back: nothing may be admitted this pass, so they stay pending until the pool can serve them"
                         );
                     }
                     entries.truncate(usize::try_from(admitted).unwrap_or(usize::MAX));
@@ -350,6 +364,7 @@ impl DagExecutorRuntime {
             window_jobs,
             pace: status.pace,
             pool_size: status.pool_size,
+            unavailable: status.unavailable,
         })
     }
 
@@ -403,6 +418,13 @@ impl DagExecutorRuntime {
             ("covered", covered),
             ("pool", pool),
             ("reserve", reserve),
+            // Which of the causes above is in front of the reader: `bounded=1`
+            // with `window_jobs=0` is a spent window or a pool the gateway has
+            // declared unavailable, and only this cell separates them.
+            (
+                "unavailable",
+                f64::from(u8::from(bound.is_some_and(|bound| bound.unavailable))),
+            ),
             // The traffic face: whether this pass had anything to decide. An
             // output of zero with an input of zero says nothing about how the
             // gate behaves under pressure, and `owed` is a different quantity
@@ -435,7 +457,15 @@ impl DagExecutorRuntime {
         if held > 0 {
             let mut labels = HashMap::new();
             labels.insert("stream".to_string(), stream_kind.to_string());
-            labels.insert("reason".to_string(), "window_exhausted".to_string());
+            // The reason is the gate that said zero, not the gate that is
+            // always named: an unavailable pool refuses work while its window
+            // still pays for a job, and calling that `window_exhausted` sends
+            // the reader to tune a budget that is not the constraint.
+            labels.insert(
+                "reason".to_string(),
+                crate::ready_queue::hold_reason(bound.is_some_and(|bound| bound.unavailable))
+                    .to_string(),
+            );
             drop(
                 metrics
                     .record_counter(
