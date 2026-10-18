@@ -2788,6 +2788,60 @@ mod tests {
         drop(running);
     }
 
+    /// Every site in this crate that replaces the process image first takes
+    /// the build field.
+    ///
+    /// The hazard is an *order*, not a function: the switcher lives in a lower
+    /// crate that cannot reach this gate, so the order can only be enforced
+    /// where the switch is called. A third call site that forgets the wait
+    /// reintroduces the truncation in a place no other test looks, and it will
+    /// look correct until the one round where a build is in flight.
+    #[test]
+    fn every_switch_in_this_crate_waits_for_the_build_field() {
+        // Built in two pieces so this scan does not find its own needle.
+        let needle = concat!("switch_and_", "restart()");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sites = 0;
+        for path in rust_files(&root) {
+            let text = fs::read_to_string(&path).unwrap();
+            for (at, _) in text.match_indices(needle) {
+                // Only a call: `foo.switch_and_restart()` ends with a dot or a
+                // receiver, a declaration has none and the needle would not
+                // contain `()` there anyway.
+                let before = &text[..at];
+                let window: Vec<&str> = before.lines().rev().take(80).collect();
+                assert!(
+                    window.iter().any(|line| line.contains("await_exclusive")),
+                    "{}: this switch does not wait for the build field -- an exec \
+                     here kills whatever build is in flight and leaves its lock behind",
+                    path.display()
+                );
+                sites += 1;
+            }
+        }
+        assert!(
+            sites >= 2,
+            "the scan found {sites} switch sites in this crate; it is meant to see \
+             the auto-deploy and the admin paths, so it is looking in the wrong place"
+        );
+    }
+
+    fn rust_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()) {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
     /// A refusal used to name only the caller that was turned away, which says
     /// nothing about why: the permission carries no identity, so answering "who
     /// has it" meant a `ps` inside the container. The holder writes its own name
