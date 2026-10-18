@@ -871,6 +871,20 @@ pub async fn try_acquire_exclusive(what: &str) -> SFResult<Option<BuildPermit>> 
     }
 }
 
+/// Takes every slot for work that must not overlap a build, waiting for a
+/// running build to finish.
+///
+/// The waiting form of [`try_acquire_exclusive`], for work whose turn cannot be
+/// lost: a caller that is retried by something else can refuse and come back, a
+/// process switch cannot -- its staged binary stays staged until some later
+/// change asks for another switch.
+pub async fn await_exclusive(what: &str, budget: Duration) -> SFResult<Option<BuildPermit>> {
+    match global() {
+        Some(gate) => gate.await_exclusive(what, budget).await.map(Some),
+        None => Ok(None),
+    }
+}
+
 /// Which wall turned a build away, as the values the refusal counter carries.
 ///
 /// The counter used to be one number, and the walls behind it do not have the
@@ -1695,6 +1709,49 @@ impl BuildGate {
                     "build gate could not exclude builds for {what}: {reason}"
                 )))
             }
+        }
+    }
+
+    /// Takes the build field, waiting for a running build to finish.
+    ///
+    /// The waiting form of [`BuildGate::try_acquire_exclusive`], for a caller
+    /// whose work has no next round to come back on. Refusing is the right
+    /// answer for a sweep, which runs again on its own cycle; it is the wrong
+    /// one for a process switch, which would leave the staged binary unswitched
+    /// until some later change happens to ask for another switch.
+    ///
+    /// While it waits it claims the next build, so an arrival between two looks
+    /// stands down instead of slipping into the gap a running build leaves. The
+    /// claim lapses on its own if this process dies before its ask is answered,
+    /// and it is released the moment the field is taken.
+    ///
+    /// `budget` is the caller's, not the gate's: only the caller knows how long
+    /// its work can wait. A build on this host takes minutes, so a budget in the
+    /// same order as the build timeout is the shape a caller wants; a budget
+    /// short of one build turns every collision into a lost turn.
+    pub async fn await_exclusive(
+        self: &Arc<Self>,
+        what: &str,
+        budget: Duration,
+    ) -> SFResult<BuildPermit> {
+        if !self.in_force() {
+            return Ok(self.permit(what, Vec::new(), HoldKind::Excluding));
+        }
+        let started = Instant::now();
+        loop {
+            let refusal = match self.try_acquire_exclusive(what).await {
+                Ok(permit) => return Ok(permit),
+                Err(error) => error,
+            };
+            if started.elapsed() >= budget {
+                return Err(refusal);
+            }
+            // Asked for after the refusal, not before: the claim is what keeps
+            // the field from being taken while this work is between looks, and a
+            // claim made before the first look would stand down the very build
+            // it is waiting for.
+            self.reserve_build_field(what);
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
 
@@ -2656,6 +2713,79 @@ mod tests {
         drop(first);
         let third = gate.try_acquire("third").await.unwrap();
         assert!(third.held(), "dropping a permit frees its slot");
+    }
+
+    /// The self-replacement path has no next round to come back on: it stages a
+    /// binary and then execs the process image away. A refusal there leaves the
+    /// staged binary unswitched until some unrelated change asks again, so it
+    /// waits instead -- and it has to claim the next build while it waits, or a
+    /// build arriving in the gap the running one leaves takes the field first
+    /// and this wait never ends.
+    #[tokio::test]
+    async fn an_exclusive_wait_takes_the_field_once_the_build_leaves() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 0);
+        let running = gate.try_acquire("a change verification").await.unwrap();
+
+        let waiter = {
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move {
+                gate.await_exclusive("self-exec switch", Duration::from_secs(30))
+                    .await
+            })
+        };
+        tokio::time::sleep(POLL_INTERVAL * 2).await;
+        assert!(
+            !waiter.is_finished(),
+            "a build holds the field, so the switch cannot have taken it"
+        );
+        assert_eq!(
+            gate.reservation().map(|(what, _)| what).as_deref(),
+            Some("self-exec switch"),
+            "a wait that cannot take the field claims the next build"
+        );
+        assert!(
+            gate.try_acquire("an arrival").await.is_err(),
+            "an arrival must not take the build a waiting switch claimed"
+        );
+
+        drop(running);
+        let field = waiter
+            .await
+            .unwrap()
+            .expect("the wait ends when the build it was waiting for leaves");
+        assert!(field.held(), "the switch holds the field after the wait");
+        assert!(
+            gate.try_acquire("an arrival").await.is_err(),
+            "builds stay out for as long as the switch holds the field"
+        );
+
+        drop(field);
+        assert!(
+            gate.try_acquire("an arrival").await.is_ok(),
+            "releasing the switch releases the field"
+        );
+    }
+
+    /// The budget belongs to the caller: only it knows how long its work can
+    /// wait. Running out is a refusal, not a silent permit -- a switch that
+    /// believed it was alone and was not is the failure this guards.
+    #[tokio::test]
+    async fn an_exclusive_wait_gives_up_when_its_budget_runs_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 0);
+        let running = gate.try_acquire("a change verification").await.unwrap();
+
+        let refused = gate
+            .await_exclusive("self-exec switch", Duration::ZERO)
+            .await
+            .expect_err("the field is held, and the budget has no room to wait");
+        let text = refused.to_string();
+        assert!(
+            text.contains("self-exec switch") && text.contains("\"a change verification\""),
+            "a refusal has to name the switch that asked and the build that held it, got: {text}"
+        );
+        drop(running);
     }
 
     /// A refusal used to name only the caller that was turned away, which says

@@ -473,6 +473,25 @@ impl EvolutionAdminService {
             switcher.stage_new_binary(&artifact.new_binary_path).await?;
             info!(change_id = %artifact.change_id, "Admin-deploy staged new binary");
 
+            // 切换即 execve：本进程里正在跑的一切在那一刻消失，包括别的任务占着的
+            // 构建槽与它们没做完的收尾（推镜像、写状态、放锁）。实测一次构建跑到
+            // 第 17 分钟被切换抹掉，锁留在盘上，宿主此后一小时拒绝构建。先等构建
+            // 场空出来再切；等不到就当切换失败，让这一版留在暂存处。
+            let _switch_field = match crate::build_gate::await_exclusive(
+                "self-exec switch",
+                std::time::Duration::from_secs(3600),
+            )
+            .await
+            {
+                Ok(field) => field,
+                Err(e) => {
+                    warn!(change_id = %artifact.change_id, error = %e, "cannot exclude running builds for the admin switch");
+                    self.record_event(true).await;
+                    self.record_change_failed().await;
+                    return Err(e);
+                }
+            };
+
             if let Err(e) = switcher.switch_and_restart().await {
                 warn!(error = %e, "Admin switch failed; attempting rollback");
                 if let Err(rb_e) = switcher.rollback().await {

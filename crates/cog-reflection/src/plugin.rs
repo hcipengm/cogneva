@@ -4199,6 +4199,46 @@ async fn consume_executed_change(
             None
         };
 
+        // 切换就是本进程的 execve：进程里的所有任务在那一刻一起消失。别的任务可能正
+        // 占着宿主的构建槽在编译——主线推进与变更验证都是——exec 把槽的锁按描述符释放，
+        // 而构建还在另一个进程里跑，于是宿主以为槽空了出来；那个构建的收尾（推镜像、
+        // 写 state、放锁）随本进程一起没了，锁文件留在盘上，下一实例读成「有人正在
+        // 构建」。2026-10-18 实测：主线推进的构建跑到第 17 分钟被一次切换抹掉，宿主
+        // 此后一小时拒绝构建，而构建本来就要成功了。
+        //
+        // 先等构建场空出来再切。预算取构建超时的量级（一次构建十几分钟），等不到就
+        // 当切换失败：让调用方记一笔失败，比在别人的构建上切一刀要好。
+        let _switch_field = match crate::build_gate::await_exclusive(
+            "self-exec switch",
+            std::time::Duration::from_secs(3600),
+        )
+        .await
+        {
+            Ok(field) => field,
+            Err(e) => {
+                warn!(
+                    change_id = %artifact.change_id,
+                    error = %e,
+                    "cannot exclude running builds for the switch; the staged binary stays in place"
+                );
+                if let Some(path) = handed_off {
+                    crate::pending_promotions::withdraw(&path).await;
+                }
+                let _ = engine
+                    .record_change_outcome(
+                        &artifact.change_id,
+                        false,
+                        &format!("Switch not attempted: {e}"),
+                    )
+                    .await;
+                if let Some(m) = evolution_metrics {
+                    m.record_event(true).await;
+                    m.record_change_failed().await;
+                }
+                return Err(e);
+            }
+        };
+
         // switch_and_restart may exec the current process and never return.
         if let Err(e) = switcher.switch_and_restart().await {
             warn!(error = %e, "Switch failed; attempting rollback");
