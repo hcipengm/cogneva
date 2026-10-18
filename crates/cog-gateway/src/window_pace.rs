@@ -325,6 +325,7 @@ mod tests {
             allowance_tokens: 1_000_000,
             spent_tokens: 800_000,
             reserve_tokens: 300_000,
+            reserve_population: 7,
             window_secs: 30 * DAY as u64,
             window_start_unix: 0,
         };
@@ -340,6 +341,7 @@ mod tests {
         // With no measured job size the line alone decides.
         let unreserved = LlmWindowPace {
             reserve_tokens: 0,
+            reserve_population: 7,
             ..pace
         };
         assert!(!unreserved.blocked());
@@ -516,6 +518,7 @@ mod tests {
             allowance_tokens: 10_000_000,
             spent_tokens: 10_200_000,
             reserve_tokens: 300_000,
+            reserve_population: 7,
             window_secs: m.window_secs,
             window_start_unix: m.burned_at_unix,
         };
@@ -537,6 +540,7 @@ mod tests {
             allowance_tokens: 30_000_000,
             spent_tokens: 30_000_000,
             reserve_tokens: 1_000_000,
+            reserve_population: 7,
             window_secs: m.window_secs,
             window_start_unix: m.burned_at_unix,
         };
@@ -574,6 +578,7 @@ mod tests {
             allowance_tokens: 0,
             spent_tokens: 0,
             reserve_tokens: 570_831,
+            reserve_population: 7,
             window_secs: 604_800,
             window_start_unix: 1_792_339_200,
         };
@@ -592,6 +597,7 @@ mod tests {
             allowance_tokens: 10_000_000,
             spent_tokens: 10_000_000,
             reserve_tokens: 1_000_000,
+            reserve_population: 7,
             window_secs: m.window_secs,
             window_start_unix: m.burned_at_unix,
         };
@@ -612,6 +618,7 @@ mod tests {
             allowance_tokens: 10_000_000,
             spent_tokens: 10_200_000,
             reserve_tokens: 300_000,
+            reserve_population: 7,
             window_secs: m.window_secs,
             window_start_unix: 0,
         };

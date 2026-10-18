@@ -117,6 +117,7 @@ async fn a_window_folds_the_ledger_and_reruns_in_place_with_zeros_for_the_idle()
         refusal_kind: None,
         task: None,
         latency_ms: 10,
+        pace: None,
     };
 
     // Two successful calls and one failed one inside the window.
@@ -303,6 +304,7 @@ async fn the_rolled_reader_sums_the_fold_over_the_windows_in_range() {
         refusal_kind: None,
         task: None,
         latency_ms: latency,
+        pace: None,
     };
 
     // Two calls in the first in-range window, one in the second, and one in a

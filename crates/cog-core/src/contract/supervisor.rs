@@ -305,6 +305,14 @@ pub struct LlmWindowPace {
     /// has finished recently enough to be measured.
     #[serde(default)]
     pub reserve_tokens: u64,
+    /// How many finished jobs `reserve_tokens` was measured over.
+    ///
+    /// Travels with the reserve rather than beside it: a percentile over five
+    /// jobs and one over five hundred return numbers of the same shape, and
+    /// nothing else in this payload says which of the two a reader is looking
+    /// at. `0` means the reserve has no population behind it.
+    #[serde(default)]
+    pub reserve_population: u64,
     /// Longest window any measured upstream stated, seconds.
     #[serde(default)]
     pub window_secs: u64,
@@ -320,9 +328,17 @@ impl LlmWindowPace {
     /// window whose remaining allowance is a fraction of a job would admit the
     /// job and then strand it, which moves waste from the tail of the window to
     /// the middle of the work.
+    ///
+    /// A zero allowance is its own clause, not a case of the comparison. With
+    /// no job size measured the reserve is `0`, and `0 + 0 > 0` reads a window
+    /// that is already spent as one that is not pacing at all -- the one shape
+    /// where the reader cannot tell "no allowance" from "no measurement". The
+    /// window start is in the future (or the window is simply empty) and
+    /// nothing may be admitted until it opens; that is a refusal, not a pass.
     pub fn blocked(&self) -> bool {
         self.measured_upstreams > 0
-            && self.spent_tokens.saturating_add(self.reserve_tokens) > self.allowance_tokens
+            && (self.allowance_tokens == 0
+                || self.spent_tokens.saturating_add(self.reserve_tokens) > self.allowance_tokens)
     }
 }
 

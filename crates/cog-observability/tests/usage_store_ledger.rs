@@ -24,7 +24,9 @@
 //! writes carry a per-run marker and are deleted at the end, so the database is
 //! left as it was found.
 
-use cog_observability::usage_store::{LlmUsageRecord, LlmUsageStore, StoredWindow};
+use cog_observability::usage_store::{
+    LlmUsageRecord, LlmUsageStore, PaceEvidence, PaceUpstreamEvidence, StoredWindow,
+};
 use sqlx::{PgPool, Row};
 
 fn database_url() -> String {
@@ -71,6 +73,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         refusal_kind: refusal_kind.map(str::to_string),
         task: task.map(str::to_string),
         latency_ms: 12,
+        pace: None,
     };
 
     store.init_schema().await.expect("init the schema");
@@ -275,6 +278,102 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
             .get::<Option<String>, _>("column_default")
             .is_none(),
         "a default would make every non-refusal row name a cause it never had"
+    );
+
+    // The pace refusal carries the reading it was decided on, on its own row and
+    // in its own columns. Reusing `estimated_input` would say the request was
+    // priced, reusing `refusal_kind` would name an upstream as the refuser, and
+    // reusing `upstream` would put a set of identities in a column that answers
+    // "which single upstream is this row about". The gap a reader recomputes
+    // (`spent + reserve - allowance`) is only true of these columns.
+    let paced_evidence = format!("ledger-test-pace-evidence:{}", uuid::Uuid::new_v4());
+    let mut paced_row = record(paced_evidence.clone(), 0, None, None, None);
+    paced_row.result = "refused_by_pace".to_string();
+    paced_row.pace = Some(PaceEvidence {
+        measured_upstreams: 2,
+        allowance_tokens: 1_000,
+        spent_tokens: 1_200,
+        reserve_tokens: 300,
+        window_start_unix: 1_700_000_000,
+        upstreams: vec![PaceUpstreamEvidence {
+            upstream: "https://a.example.com|m1".to_string(),
+            allowance_tokens: 400,
+            spent_tokens: 900,
+            reserve_tokens: 300,
+            window_start_unix: 1_700_000_000,
+            wait_secs: 120,
+        }],
+    });
+    store
+        .record(&paced_row)
+        .await
+        .expect("record a paced refusal with its evidence");
+    let row = sqlx::query(
+        "SELECT pace_measured_upstreams, pace_allowance_tokens, pace_spent_tokens, \
+                pace_reserve_tokens, pace_window_start_unix, pace_upstreams \
+           FROM gateway_llm_usage WHERE actor = $1",
+    )
+    .bind(&paced_evidence)
+    .fetch_one(&pool)
+    .await
+    .expect("read the paced refusal back");
+    assert_eq!(
+        row.get::<Option<i16>, _>("pace_measured_upstreams"),
+        Some(2)
+    );
+    assert_eq!(
+        row.get::<Option<i64>, _>("pace_allowance_tokens"),
+        Some(1_000)
+    );
+    assert_eq!(row.get::<Option<i64>, _>("pace_spent_tokens"), Some(1_200));
+    assert_eq!(row.get::<Option<i64>, _>("pace_reserve_tokens"), Some(300));
+    assert_eq!(
+        row.get::<Option<i64>, _>("pace_window_start_unix"),
+        Some(1_700_000_000),
+        "the boundary has to land with the other three numbers: allowance alone cannot \
+         tell a window that has not opened yet from one burned down to nothing"
+    );
+    let upstreams = row
+        .get::<Option<serde_json::Value>, _>("pace_upstreams")
+        .expect("a paced refusal names the candidates it was refused on");
+    let first = &upstreams[0];
+    assert_eq!(first["upstream"], "https://a.example.com|m1");
+    assert_eq!(first["wait_secs"], 120);
+
+    // A row that was not paced has no reading to carry, and `NULL` is that
+    // absence. A zero here would recompute as "the gap was closed exactly",
+    // which is the one thing an unpaced row never said.
+    let row = sqlx::query(
+        "SELECT pace_measured_upstreams, pace_allowance_tokens, pace_spent_tokens, \
+                pace_reserve_tokens, pace_window_start_unix, pace_upstreams \
+           FROM gateway_llm_usage WHERE actor = $1",
+    )
+    .bind(&unpriced)
+    .fetch_one(&pool)
+    .await
+    .expect("read the unpaced row back");
+    assert_eq!(row.get::<Option<i16>, _>("pace_measured_upstreams"), None);
+    assert_eq!(row.get::<Option<i64>, _>("pace_allowance_tokens"), None);
+    assert_eq!(row.get::<Option<i64>, _>("pace_spent_tokens"), None);
+    assert_eq!(row.get::<Option<i64>, _>("pace_reserve_tokens"), None);
+    assert_eq!(row.get::<Option<i64>, _>("pace_window_start_unix"), None);
+    assert_eq!(
+        row.get::<Option<serde_json::Value>, _>("pace_upstreams"),
+        None
+    );
+    let pace_shape = sqlx::query(
+        "SELECT is_nullable, column_default FROM information_schema.columns \
+         WHERE table_name = 'gateway_llm_usage' AND column_name = 'pace_allowance_tokens'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the pace column must exist after the migration");
+    assert_eq!(pace_shape.get::<String, _>("is_nullable"), "YES");
+    assert!(
+        pace_shape
+            .get::<Option<String>, _>("column_default")
+            .is_none(),
+        "a default would give every unpaced row a reading it never had"
     );
 
     // The window pacer reads the ledger three ways, and each one is a statement

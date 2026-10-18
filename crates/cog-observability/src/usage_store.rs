@@ -144,6 +144,42 @@ impl LlmOrigin {
     }
 }
 
+/// 一次窗口配速拒绝的证据：这一拍的数与拒的是谁，和拒绝本身落在同一行。
+///
+/// 单独一组列而不是复用 `estimated_input` / `refusal_kind` / `upstream`：那三格
+/// 各有各的语义（估算的 prompt、上游拒的原因、这一行的主语），拿任何一个装配速
+/// 的额度缺口都是第二个语义，而两个语义共用一格，读的人就再也分不开它们。
+///
+/// 标量是**池级报表**（各已量到窗口的上游相加），与 429 body 上是同一组数；
+/// 真正判定的是 `upstreams` 里逐家各自的尺子——只留标量，一个"池里有额度、
+/// 但每一家自己的窗口都装不下"的拒绝会读成"整池没额度"。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PaceEvidence {
+    /// 这一拍量到窗口的上游家数。它与 `allowance_tokens` 必须一起读：没有它，
+    /// 0 额度分不清"量了一家且烧穿"与"一家都没量到"。
+    pub measured_upstreams: u32,
+    pub allowance_tokens: u64,
+    pub spent_tokens: u64,
+    pub reserve_tokens: u64,
+    /// 这一窗的起点。不能省：`allowance_tokens = 0` 本身分不清"窗口还没开张"
+    /// 与"已经烧到零"，边界时刻必须自带。
+    pub window_start_unix: i64,
+    /// 参与判定且各自都被自己那把尺子拦下的候选。空集不会出现在拒绝行上。
+    pub upstreams: Vec<PaceUpstreamEvidence>,
+}
+
+/// 一个候选自己被判拦那一刻的读数，键与健康表同形（`base_url|model`）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PaceUpstreamEvidence {
+    pub upstream: String,
+    pub allowance_tokens: u64,
+    pub spent_tokens: u64,
+    pub reserve_tokens: u64,
+    pub window_start_unix: i64,
+    /// 这一家自己最早什么时候承接得下下一件任务。
+    pub wait_secs: u64,
+}
+
 /// One metered LLM call.
 #[derive(Debug, Clone)]
 pub struct LlmUsageRecord {
@@ -224,6 +260,12 @@ pub struct LlmUsageRecord {
     pub task: Option<String>,
     /// Wall time of the call; for streams this is first-byte to last-byte.
     pub latency_ms: u64,
+    /// 窗口配速那一拍的读数，只在 `result = "refused_by_pace"` 的行上有。
+    ///
+    /// `None` 在非配速行上是"不适用"，不是"缺口为 0"——`NULL ≠ 0` 是这组列
+    /// 存在的全部理由：配速拒绝的缺口按 `spent + reserve − allowance` 复算，
+    /// 而别的行上没有这一拍的数，给它们写 0 会让缺口读成"正好不欠额度"。
+    pub pace: Option<PaceEvidence>,
 }
 
 /// One `(actor, upstream, api_style)` line of a window's token composition.
@@ -457,6 +499,24 @@ impl LlmUsageStore {
         sqlx::query("ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS refusal_kind TEXT")
             .execute(&self.pool)
             .await?;
+        // 配速拒绝的证据列。加列而不是复用上面三格，理由见 [`PaceEvidence`]。
+        // 全部可空、没有默认值：非配速行上 `NULL` 读作"不适用"，而任何
+        // `coalesce(…, 0)` 的读法都会把"这一行没有这一拍的数"变成"缺口为零"，
+        // 那正是这组列要分开的两件事。
+        for column in [
+            "pace_measured_upstreams SMALLINT",
+            "pace_allowance_tokens BIGINT",
+            "pace_spent_tokens BIGINT",
+            "pace_reserve_tokens BIGINT",
+            "pace_window_start_unix BIGINT",
+            "pace_upstreams JSONB",
+        ] {
+            sqlx::query(&format!(
+                "ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS {column}"
+            ))
+            .execute(&self.pool)
+            .await?;
+        }
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_gateway_llm_usage_ts ON gateway_llm_usage (ts)",
         )
@@ -549,13 +609,20 @@ impl LlmUsageStore {
     }
 
     pub async fn record(&self, r: &LlmUsageRecord) -> anyhow::Result<()> {
+        let pace_upstreams = r
+            .pace
+            .as_ref()
+            .and_then(|p| serde_json::to_value(&p.upstreams).ok());
         sqlx::query(
             r#"
             INSERT INTO gateway_llm_usage
                 (id, upstream, api_style, model, result, actor, origin,
                  tokens_input, tokens_output, tokens_cached, estimated_input,
-                 task_id, latency_ms, refusal_kind)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                 task_id, latency_ms, refusal_kind,
+                 pace_measured_upstreams, pace_allowance_tokens, pace_spent_tokens,
+                 pace_reserve_tokens, pace_window_start_unix, pace_upstreams)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                    $15, $16, $17, $18, $19, $20)
             "#,
         )
         .bind(uuid::Uuid::new_v4())
@@ -572,6 +639,12 @@ impl LlmUsageStore {
         .bind(r.task.as_deref())
         .bind(r.latency_ms as i64)
         .bind(r.refusal_kind.as_deref())
+        .bind(r.pace.as_ref().map(|p| p.measured_upstreams as i32))
+        .bind(r.pace.as_ref().map(|p| p.allowance_tokens as i64))
+        .bind(r.pace.as_ref().map(|p| p.spent_tokens as i64))
+        .bind(r.pace.as_ref().map(|p| p.reserve_tokens as i64))
+        .bind(r.pace.as_ref().map(|p| p.window_start_unix))
+        .bind(pace_upstreams)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -782,10 +855,11 @@ impl LlmUsageStore {
         &self,
         days: i64,
         quantile: f64,
-    ) -> anyhow::Result<Option<u64>> {
+    ) -> anyhow::Result<Option<(u64, u64)>> {
         let row = sqlx::query(&format!(
             r#"
-            SELECT PERCENTILE_CONT($2) WITHIN GROUP (ORDER BY total) AS cost
+            SELECT PERCENTILE_CONT($2) WITHIN GROUP (ORDER BY total) AS cost,
+                   COUNT(*)::BIGINT AS jobs
               FROM (SELECT task_id, SUM(tokens_input + tokens_output)::BIGINT AS total
                       FROM {LEDGER_TABLE}
                      WHERE result = 'ok' AND task_id IS NOT NULL
@@ -797,7 +871,15 @@ impl LlmUsageStore {
         .bind(quantile)
         .fetch_one(&self.pool)
         .await?;
-        Ok(row.get::<Option<f64>, _>("cost").map(|v| v.max(0.0) as u64))
+        // The population travels with the percentile: `PERCENTILE_CONT` answers
+        // with a plausible number over three jobs exactly as it does over three
+        // hundred, and a reader handed the cost alone cannot tell which one it
+        // is looking at. `COUNT(*)` over the same subquery is the same
+        // measurement, taken in the same statement so the two cannot disagree.
+        let jobs = row.get::<i64, _>("jobs").max(0) as u64;
+        Ok(row
+            .get::<Option<f64>, _>("cost")
+            .map(|v| (v.max(0.0) as u64, jobs)))
     }
 
     /// The window's token composition, grouped by `(actor, origin, upstream,
