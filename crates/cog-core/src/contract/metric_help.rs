@@ -672,6 +672,26 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          the first deferral",
     ),
     (
+        "cogneva_ready_admission_held_total",
+        "Ready tasks the pool's window could not pay for, by stream (shared or \
+         local) and reason (window_exhausted). A gate holding work back and a \
+         publisher with nothing to publish leave the same trace -- no dispatch \
+         -- so without this counter the two are indistinguishable on every \
+         delivery reading. The label sets are closed; no task id or number \
+         rides on them, because a value that changes with the tick would mint \
+         a series per tick",
+    ),
+    (
+        "cogneva_ready_admission_readings",
+        "The arithmetic behind one ready-publish pass's admission, by stream \
+         and kind: bounded (1 when the window's allowance bounded the pass, 0 \
+         when nothing measured one), window_jobs (jobs the remaining allowance \
+         pays for), owed (tasks already scheduled or running on that queue) and \
+         admitted (tasks put on the wire). window_jobs is written only when \
+         bounded is 1: an unmeasured window is not a window that pays for zero \
+         jobs, and a zero there would read as the strongest possible refusal",
+    ),
+    (
         "cogneva_task_checkpoint_total",
         "Task checkpoint outcomes, by outcome: saved, unpersisted, failed, \
          superseded, unsuperseded, no_agents. All six are published from the \

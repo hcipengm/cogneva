@@ -284,3 +284,97 @@ async fn change_generation_goes_to_the_process_local_queue() {
         "change generation belongs on the queue only the executor role reads"
     );
 }
+
+/// 池的窗口只剩一件任务的额度时，别的就绪任务不许上线：它们留在 Pending，
+/// 等窗口能付得起再来。上线了也是一条注定被网关按同一组数字拒绝的请求，
+/// 而拒绝不是吞吐。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_spent_window_holds_ready_tasks_back_until_it_can_pay() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    /// 只报一个上游、只改额度的桩：测试要动的是「窗口还剩多少」。
+    struct ScriptedWindow {
+        allowance: Arc<AtomicU64>,
+        spent: u64,
+        reserve: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmPoolStatusSource for ScriptedWindow {
+        async fn status(&self) -> Option<cog_core::LlmPoolStatus> {
+            Some(cog_core::LlmPoolStatus {
+                pace: cog_core::LlmWindowPace {
+                    measured_upstreams: 1,
+                    allowance_tokens: self.allowance.load(Ordering::Relaxed),
+                    spent_tokens: self.spent,
+                    reserve_tokens: self.reserve,
+                    reserve_population: 5,
+                    window_secs: 604_800,
+                    window_start_unix: 0,
+                },
+                pool_size: 1,
+                ..Default::default()
+            })
+        }
+    }
+
+    let backend = MemoryMessageBackend::new();
+    let runtime = DagExecutorRuntime::new_with_backend(
+        DagExecutorConfig {
+            redis_url: "redis://localhost".into(),
+            workspace_id: "ws-admit".into(),
+            consumer_group: "cg-admit".into(),
+            max_retries: 3,
+            ..DagExecutorConfig::default()
+        },
+        backend.clone(),
+    );
+    let allowance = Arc::new(AtomicU64::new(3_000_000));
+    runtime.attach_pool_status_source(Arc::new(ScriptedWindow {
+        allowance: allowance.clone(),
+        spent: 2_500_000,
+        reserve: 500_000,
+    }));
+
+    let tasks: Vec<Task> = (0..4)
+        .map(|i| make_test_task(&format!("adm-{i}")))
+        .collect();
+    runtime.submit_goal("admission-goal", tasks).await.unwrap();
+
+    // 还剩 500_000，正好一件。任务表按 id 顺序提交，准入截的是就绪表尾部。
+    runtime.publish_ready_tasks().await.unwrap();
+    let scheduled = count_status(&runtime, TaskStatus::Scheduled).await;
+    let pending = count_status(&runtime, TaskStatus::Pending).await;
+    assert_eq!(scheduled, 1, "one job of allowance admits exactly one task");
+    assert_eq!(pending, 3, "the rest stay ready for a pass that can pay");
+
+    // 第二拍：窗口没变，已欠一件，所以一件也不放行——不是每拍都重放一次额度。
+    runtime.publish_ready_tasks().await.unwrap();
+    assert_eq!(
+        count_status(&runtime, TaskStatus::Scheduled).await,
+        1,
+        "a bound compared with what is owed does not re-admit the same allowance"
+    );
+
+    // 额度涨到能付四件（4_500_000 − 2_500_000 = 4 × 500_000）：已欠一件，
+    // 这一拍补三件。
+    allowance.store(4_500_000, Ordering::Relaxed);
+    runtime.publish_ready_tasks().await.unwrap();
+    assert_eq!(
+        count_status(&runtime, TaskStatus::Scheduled).await,
+        4,
+        "once the window can pay, the held tasks go out"
+    );
+    assert_eq!(count_status(&runtime, TaskStatus::Pending).await, 0);
+}
+
+async fn count_status(runtime: &DagExecutorRuntime, status: TaskStatus) -> usize {
+    runtime
+        .orchestrator()
+        .get_all_tasks()
+        .await
+        .into_iter()
+        .filter(|t| t.status == status)
+        .count()
+}

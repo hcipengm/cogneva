@@ -186,9 +186,6 @@ impl DagExecutorRuntime {
     /// the queue every worker competes for; see [`crate::ready_queue`].
     pub async fn publish_ready_tasks(&self) -> SFResult<()> {
         let (ready_tasks, in_flight) = self.orchestrator.ready_tasks_and_in_flight().await;
-        if ready_tasks.is_empty() {
-            return Ok(());
-        }
         // What the pool's window can still pay for, if it measured one. `None`
         // admits everything: a missing reading is not a closed window, and a
         // publisher that stopped on a missing reading would be driving the
@@ -208,33 +205,50 @@ impl DagExecutorRuntime {
                 .push((task, payload));
         }
 
+        // Admission is decided for both queues and written down before any
+        // state changes, and on every pass -- including the passes with nothing
+        // ready. A reading that only appeared when something was held would
+        // freeze its last value on the idle passes and serve a stale refusal as
+        // a live one.
+        //
+        // It is measured against what the queue already owes rather than
+        // against zero. A bound compared with zero every pass admits the same
+        // allowance again while the previous batch is still queued, which is a
+        // burst shaped exactly like no bound at all. `Scheduled` counts as owed
+        // even if nothing has picked the task up: it has been handed a slot, and
+        // the window has not been charged for it yet.
+        //
+        // Each queue is judged by its own owed count against the pool's whole
+        // allowance. The two queues can therefore each admit up to one window's
+        // worth in a pass; that is one batch of overshoot, bounded, and the
+        // alternative -- splitting one allowance between queues -- lets a
+        // backlog on one queue decide how much the other may dispatch, which is
+        // how a stalled queue starves a healthy one.
+        let mut admitted_by_stream: HashMap<String, u64> = HashMap::new();
+        for stream in [
+            crate::ready_queue::ready_stream(&self.config.workspace_id),
+            crate::ready_queue::process_local_ready_stream(&self.config.workspace_id),
+        ] {
+            let ready = by_stream.get(&stream).map(|e| e.len()).unwrap_or(0) as u64;
+            let owed = in_flight.get(&stream).copied().unwrap_or(0) as u64;
+            let admitted = crate::ready_queue::admitted(ready, owed, pays_for);
+            admitted_by_stream.insert(stream.clone(), admitted);
+            self.record_admission(&stream, pays_for, owed, admitted, ready - admitted)
+                .await;
+        }
+
         for (stream, mut entries) in by_stream {
-            // Admission, measured against what this queue already owes rather
-            // than against zero. A bound compared with zero every pass admits
-            // the same allowance again while the previous batch is still queued,
-            // which is a burst shaped exactly like no bound at all. `Scheduled`
-            // counts as owed even if nothing has picked the task up: it has been
-            // handed a slot, and the window has not been charged for it yet.
-            //
-            // Each queue is judged by its own owed count against the pool's
-            // whole allowance. The two queues can therefore each admit up to
-            // one window's worth in a pass; that is one batch of overshoot,
-            // bounded, and the alternative -- splitting one allowance between
-            // queues -- lets a backlog on one queue decide how much the other
-            // may dispatch, which is how a stalled queue starves a healthy one.
-            if let Some(pays_for) = pays_for {
-                let owed = in_flight.get(&stream).copied().unwrap_or(0) as u64;
-                let can_admit = pays_for.saturating_sub(owed);
-                if entries.len() as u64 > can_admit {
+            if let Some(&admitted) = admitted_by_stream.get(&stream) {
+                if (entries.len() as u64) > admitted {
                     tracing::warn!(
                         stream = %stream,
                         ready = entries.len(),
-                        admitted = can_admit,
-                        owed,
+                        admitted,
+                        owed = in_flight.get(&stream).copied().unwrap_or(0),
                         window_jobs = pays_for,
                         "holding ready tasks back: the pool's window cannot pay for them, so they stay pending until it can"
                     );
-                    entries.truncate(usize::try_from(can_admit).unwrap_or(usize::MAX));
+                    entries.truncate(usize::try_from(admitted).unwrap_or(usize::MAX));
                 }
             }
             let limit = self.backend.payload_limit(&stream).await?;
@@ -277,6 +291,75 @@ impl DagExecutorRuntime {
         let source = self.pool_source.get()?;
         let status = source.status().await?;
         crate::ready_queue::jobs_the_window_can_pay_for(&status.pace, status.pool_size)
+    }
+
+    /// Write one pass's admission arithmetic for one queue.
+    ///
+    /// A pass with no metrics backend attached says nothing here, which is the
+    /// same shape as a pass that was never run -- the loop that attaches the
+    /// backend reports that separately rather than letting a missing surface
+    /// read as a quiet one.
+    async fn record_admission(
+        &self,
+        stream: &str,
+        window_jobs: Option<u64>,
+        owed: u64,
+        admitted: u64,
+        held: u64,
+    ) {
+        let Some(metrics) = self.orchestrator.metrics_backend() else {
+            return;
+        };
+        let stream_kind = crate::ready_queue::stream_kind(stream, &self.config.workspace_id);
+        let cell = |kind: &str| {
+            let mut labels = HashMap::new();
+            labels.insert("stream".to_string(), stream_kind.to_string());
+            labels.insert("kind".to_string(), kind.to_string());
+            labels
+        };
+        // `bounded` first: it is what tells a reader whether `window_jobs` is a
+        // measurement from this pass or a value left over from the last pass
+        // that had one.
+        for (kind, value) in [
+            ("bounded", f64::from(u8::from(window_jobs.is_some()))),
+            ("owed", owed as f64),
+            ("admitted", admitted as f64),
+        ] {
+            drop(
+                metrics
+                    .record_gauge(
+                        cog_core::metric_names::READY_ADMISSION_READINGS,
+                        value,
+                        cell(kind),
+                    )
+                    .await,
+            );
+        }
+        if let Some(window_jobs) = window_jobs {
+            drop(
+                metrics
+                    .record_gauge(
+                        cog_core::metric_names::READY_ADMISSION_READINGS,
+                        window_jobs as f64,
+                        cell("window_jobs"),
+                    )
+                    .await,
+            );
+        }
+        if held > 0 {
+            let mut labels = HashMap::new();
+            labels.insert("stream".to_string(), stream_kind.to_string());
+            labels.insert("reason".to_string(), "window_exhausted".to_string());
+            drop(
+                metrics
+                    .record_counter(
+                        cog_core::metric_names::READY_ADMISSION_HELD_TOTAL,
+                        held as f64,
+                        labels,
+                    )
+                    .await,
+            );
+        }
     }
 
     /// Consume task-result messages from the backend and drive DAG state transitions.

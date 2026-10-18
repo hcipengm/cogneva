@@ -948,6 +948,33 @@ metric_names! {
     // reason -- the state it describes clears itself.
     DAG_STALLED_SCHEDULED_DEFERRED_FOR_BACKLOG => "cogneva_dag_stalled_scheduled_deferred_for_backlog_total",
 
+    // cog-orchestrator — ready tasks the pool's window could not pay for, and
+    // the counts that decision was made on.
+    //
+    // The gate itself is only observable through this pair. A gate that is
+    // holding work back and a publisher with nothing to publish leave exactly
+    // the same trace: no dispatch. The counter says the gate refused, labelled
+    // by `stream` and `reason` -- both closed sets, `shared`/`local` and
+    // `window_exhausted` -- so a reader can tell which queue is starved instead
+    // of seeing one anonymous refusal.
+    //
+    // Deliberately not labelled by a number or a task id: a label value that
+    // changes with the tick is not part of a series' identity, and the gauge
+    // store freezes the last value of every label combination it has seen.
+    READY_ADMISSION_HELD_TOTAL => "cogneva_ready_admission_held_total",
+
+    // The same pass's arithmetic, as one cell per `stream` × `kind` pair.
+    //
+    // `kind` is a closed set: `bounded` (1 when the window's allowance bounded
+    // this pass, 0 when nothing measured one), `window_jobs` (how many jobs the
+    // remaining allowance pays for), `owed` (tasks already scheduled or running
+    // on that queue) and `admitted` (what this pass put on the wire). Every pass
+    // writes `bounded`, `owed` and `admitted`; `window_jobs` is written only
+    // when a bound exists, because a window that was never measured is not a
+    // window that pays for zero jobs, and a zero there would read as the
+    // strongest possible refusal. A reader tells the two apart by `bounded`.
+    READY_ADMISSION_READINGS => "cogneva_ready_admission_readings",
+
     // cog-orchestrator — what one change-ledger dispatch pass did with the set
     // still owed, per tick.
     //

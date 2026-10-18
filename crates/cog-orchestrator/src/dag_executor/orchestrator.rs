@@ -200,7 +200,7 @@ impl DagExecutor {
     /// One way to reach the handle: a reader that takes the lock itself gets a
     /// snapshot of a different moment than its neighbours, and the three
     /// readings below all have to be answers about the same attachment.
-    fn metrics_backend(&self) -> Option<Arc<dyn cog_core::MetricsBackend>> {
+    pub(crate) fn metrics_backend(&self) -> Option<Arc<dyn cog_core::MetricsBackend>> {
         self.metrics
             .read()
             .unwrap_or_else(|e| e.into_inner())

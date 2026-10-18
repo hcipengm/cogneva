@@ -90,6 +90,33 @@ pub fn jobs_the_window_can_pay_for(
     Some(pace.allowance_tokens.saturating_sub(pace.spent_tokens) / pace.reserve_tokens)
 }
 
+/// How many of `ready` may go on the wire, given what the queue already owes.
+///
+/// `window_jobs` is the pool's own bound, or `None` when nothing measured one
+/// -- and `None` admits everything. The subtraction is what keeps a pass from
+/// re-admitting the same allowance while the previous batch is still queued;
+/// saturating, because spend recorded after the window rolled can leave `owed`
+/// above the allowance, and a wrapped-around count would admit the whole queue.
+pub fn admitted(ready: u64, owed: u64, window_jobs: Option<u64>) -> u64 {
+    match window_jobs {
+        Some(window_jobs) => ready.min(window_jobs.saturating_sub(owed)),
+        None => ready,
+    }
+}
+
+/// Which queue this is, as the label an admission reading carries.
+///
+/// A closed set of two, derived rather than passed: a label value taken from a
+/// caller is a label value that will one day hold a task id, and a series named
+/// by a value that changes with the tick is a series per tick.
+pub fn stream_kind(stream: &str, workspace_id: &str) -> &'static str {
+    if stream == process_local_ready_stream(workspace_id) {
+        "local"
+    } else {
+        "shared"
+    }
+}
+
 /// The queues a deployment consumes. Every worker reads the shared one; only
 /// the executor role reads the process-local one.
 pub fn consumed_ready_streams(workspace_id: &str, owns_executor_role: bool) -> Vec<String> {
@@ -213,6 +240,21 @@ mod tests {
             jobs_the_window_can_pay_for(&pace(2, 5_000_000, 0, 0), 2),
             None
         );
+    }
+
+    #[test]
+    fn admission_is_measured_against_what_the_queue_already_owes() {
+        // Nothing measured: everything ready goes out.
+        assert_eq!(admitted(10, 5, None), 10);
+        // Ten ready, five already owed, a window that pays for eight: three.
+        // Compared with zero instead, this would be eight every pass -- the
+        // same allowance re-admitted while the previous batch is still queued.
+        assert_eq!(admitted(10, 5, Some(8)), 3);
+        // A queue that owes more than the window pays for admits nothing, and
+        // the count does not wrap around.
+        assert_eq!(admitted(10, 20, Some(8)), 0);
+        // Fewer ready than the window could pay for: the queue is the bound.
+        assert_eq!(admitted(2, 1, Some(100)), 2);
     }
 
     #[test]
