@@ -242,12 +242,13 @@ const READOUT_READERS: [(BackupReadout, ReadoutReader); BackupReadout::ALL.len()
         ReadoutReader::Rule("backup_oldest_package_past_its_retention"),
     ),
     (
+        // The size of the newest package, judged against this series' own
+        // largest over the past week rather than a fixed floor: what the rule
+        // has to see is a backup that stopped capturing while every other
+        // reading stayed healthy, and only a proportion survives differing
+        // database sizes.
         BackupReadout::NewestPackageBytes,
-        ReadoutReader::Unread {
-            why: "a backup that stops capturing shrinks, and nothing else on this series moves when \
-                  it does -- a run that wrote a smaller package still concluded ok. Owed a rule; \
-                  being a size, its bound belongs to the rule rather than here.",
-        },
+        ReadoutReader::Rule("backup_newest_package_shrank_below_its_own_recent_shape"),
     ),
     // The drill's four. A drill that never ran publishes none of them, so the
     // rule below fires on absence by a second expression that reads the same

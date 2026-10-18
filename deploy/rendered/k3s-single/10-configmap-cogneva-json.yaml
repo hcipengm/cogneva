@@ -2115,6 +2115,15 @@ data:
               },
               "severity": "warning",
               "summary": "最新一次成功运行报的最老一件包的年龄是 {value} 秒，越过了「该留几件」所允许的最大年龄：keep_target 天再添上 93600 秒。为什么需要它：这是件数永远证伪不了的那一半。裁剪若停了而每一次运行照样成功，包一直留在原地，kept 恒等于 keep_target，运行计数一条不动，账面上每一格都健康——2026-10-18 实测这一族此前没有任何规则读 kept、keep_target、oldest_kept_age_seconds 这三个值，保留策略是否真在生效只能靠人去卷上数文件。天数不是写在规则里的 7，是拿这一族自己发布的 keep_target 乘的：保留旋钮改了，允许的年龄跟着改，规则不用改。93600 不是新数，它就是 backup_no_recent_success 带的那一个界——一天排班、一份 startingDeadlineSeconds 的迟到宽限、一份 runDeadlineSeconds 的运行时长，取到一天的整点之上——这里复用它，是为了让「一天的余量」在整族里只有一个数，而不是让第二条规则再推一份。它按每天一次排班算：若排班改成一天多次，keep_target 件只跨 keep_target 一半的天数，这条规则会比实际允许的晚一些才亮；那个方向的错是迟报而不是误报，收紧它需要另一条按排班推周期的读数。两侧的 1800 秒合取与同族一样，把「保留停了」与「没有任何人在读账」分开，后者归 background_loop_stalled 在自己的拍子上报。任一侧缺席时表达式为空：还没有一次带保留时刻的成功运行，就还没有可判的保留承诺。它由下一次真裁掉老包的成功运行自己熄灭：最老一件的年龄落回界内。"
+            },
+            {
+              "name": "backup_newest_package_shrank_below_its_own_recent_shape",
+              "promql": "(max(cogneva_backup_run_readings{readout=\"newest_package_bytes\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds{readout=\"newest_package_bytes\"}) < 1800)) / max_over_time(max(cogneva_backup_run_readings{readout=\"newest_package_bytes\"})[7d:1h]))",
+              "condition": {
+                "less_than": 0.5
+              },
+              "severity": "warning",
+              "summary": "最新一份备份包只有过去七天里最大一份的 {value}（比值，1 表示与最大那份一样大），小到不像是同一份数据导出来的一半以上。这条读的是备份「装进去了多少」，不是它成没成：一次成功但只截到部分数据的运行，finish 时刻照常前进、包照样写出、件数照样对得上，整族里没有任何一条会动——只有这个字节数会掉。基线不用写死一个数，因为每套部署的库大小不同、同一个库里也会变；这里拿同一序列自己过去七天的最大一份作分母，于是判的是「相对它自己的形状缩了」，而不是「比某个固定值小」。分母含当前这一份，所以全新部署、或历史还不够七天时比值就是 1，不会在还没有形状可言的时候亮。比值的另一半是要它自己新鲜：两侧各自都带 1800 秒合取，读数停了则分子为空、整条为空，那种状态归 background_loop_stalled 在自己的拍子上报。阈值 0.5 是起点而不是量出来的界：真的删掉一半数据是它要拦的那件事，而一次合法的清理、一次表被归档，也会让它亮——这是 warning 不是 critical 的原因，读数是要人去看一眼那份包为什么小，不是叫醒人。它由下一份至少回到基线一半的包自己熄灭：同一条读数、同一个比值。0 字节的包比值是 0，同样会亮，那已经是写出坏了而不是变小。"
             }
           ]
         },
