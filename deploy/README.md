@@ -34,6 +34,7 @@ Kubernetes 节）。用户不需要在 K3s / 标准 K8s / Helm 之间做选择�
 | `render-deploy.sh` | 用 `helm template -f profiles/<p>.yaml` 把 chart 渲染进 `rendered/<profile>/`；`--check` 做 CI 新鲜度门禁（重渲染有 diff 即红） |
 | `check-deploy-parity.sh` | chart k3s profile 渲染 vs `k3s/` 静态清单的**字段级 parity** 门禁：资源集合、每工作负载的 Pod 模板标签与容器内外全部字段、Service/NetworkPolicy/Ingress/StorageClass/Namespace/ServiceAccount/CronJob 的整份对象、治理对象与 ConfigMap 的整份 spec（安装来源标签除外）。比了多少资源、多少类由脚本自己报（资源随拓扑增减，别在文档里钉死），CI 强制 |
 | `check-cross-layer-reconcile.sh` | 资源账三层对账读数：配额记账的 `used` ≤ 节点 `allocatable`，且每节点 `Σanon` + 该节点 file 的 7 天最低 < `MemTotal`（并列 PSI full）。某层读不到报 2 而不是报绿。定时载体见 `install-cross-layer-reconcile.sh` |
+| `check-container-headroom.sh` | 容器内存余量读数：窗口内峰值 RSS 对声明上限（逐容器，默认红线 0.85），加窗口内 `OOMKilled` 终止记录。判的是**单个容器**上「实际要过的量 vs 它的上限」——集群总量全绿时它仍可以是红的。定时载体见 `install-container-headroom.sh` |
 | `init-secrets.sh` | 安装时**随机生成**内部密钥（pg/redis/内部签名）并创建 Secret；幂等不覆盖已有值；元启动 apply 前自动跑 |
 | `distribute-image.sh` | 多节点镜像增量升级：把镜像 tar 分发到全部节点并滚动重启 |
 | `build-release-image.sh` | release 预构建运行时镜像的**本机单源**构建（产物 tar.gz + sha256） |
