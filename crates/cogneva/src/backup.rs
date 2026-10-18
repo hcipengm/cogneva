@@ -266,6 +266,41 @@ fn columns_without_a_home<'a>(package: &'a [String], current: &[String]) -> Vec<
         .collect()
 }
 
+/// 包里的列中，目标表接受写入的那些：生成列由目标自己算，不在这份名单里。
+fn writable_columns<'a>(package: &'a [String], computed: &[String]) -> Vec<&'a String> {
+    package
+        .iter()
+        .filter(|column| !computed.iter().any(|c| c == *column))
+        .collect()
+}
+
+/// 把包内这一张表的 CSV 按块直送进 `target`，列由包自己的表头点名。
+///
+/// 分块流式灌入：整表读进内存会在大表上把容器打 OOM
+/// （metrics 类表 CSV 可达数百 MB 并随时间增长）。
+async fn copy_package_table_into(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    target: &str,
+    path: &Path,
+    columns: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut file = std::fs::File::open(path)?;
+    let mut copy_in = tx
+        .copy_in_raw(&copy_from_statement(target, columns))
+        .await?;
+    use std::io::Read;
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        copy_in.send(buf[..n].to_vec()).await?;
+    }
+    copy_in.finish().await?;
+    Ok(())
+}
+
 fn copy_from_statement(table: &str, columns: &[String]) -> String {
     let list: Vec<String> = columns.iter().map(|c| format!("\"{c}\"")).collect();
     format!(
@@ -439,42 +474,42 @@ pub async fn restore_postgres(
             }
             // 生成列在包里有、在目标表里也有，`columns_without_a_home` 因此判它
             // 「有家」；但它的家不接受外人：`COPY FROM` 一点名就整表失败。包是旧
-            // 导出写的（那时导出还带 `SELECT *`），只能拒绝并把名字报出来——按行
-            // 剪掉它得一列一列重写流，与这套按块直送的形状不相容，而静默少一列
-            // 会让行数比对看不出任何差别。
+            // 导出写的（那时导出还带 `SELECT *`），而这类列的值由同行其它列算出，
+            // 不搬并不丢数据：把包按原样灌进一张 `LIKE` 目标表的临时表（`LIKE`
+            // 默认不复制生成表达式，生成列在那里退化成普通列），再把非生成列搬进
+            // 目标表。直接 COPY 会少一遍写入，但那份 CSV 的行里夹着生成列的值，
+            // 按块直送的形状改不动它——拒绝整包则等于让保留窗口里的每一份旧包都
+            // 不可恢复。
             let computed: Vec<String> = sqlx::query_scalar(GENERATED_COLUMNS_SQL)
                 .bind(table)
                 .fetch_all(&mut *tx)
                 .await?;
-            let carried: Vec<&String> = columns
-                .iter()
-                .filter(|column| computed.iter().any(|c| c == *column))
-                .collect();
-            if !carried.is_empty() {
-                return Err(format!(
-                    "package for {table} carries generated columns the target computes itself: {}",
-                    carried
-                        .iter()
-                        .map(|c| c.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-                .into());
-            }
-            let mut file = std::fs::File::open(&path)?;
-            let mut copy_in = tx
-                .copy_in_raw(&copy_from_statement(table, &columns))
+            let writable = writable_columns(&columns, &computed);
+            if writable.len() == columns.len() {
+                copy_package_table_into(&mut tx, table, &path, &columns).await?;
+            } else {
+                // 临时表固定名字足够：逐表用、用完即丢，同一时刻只有一张。
+                const STAGING: &str = "_drill_stage";
+                sqlx::query(&format!(
+                    "CREATE TEMP TABLE \"{STAGING}\" (LIKE public.\"{table}\")"
+                ))
+                .execute(&mut *tx)
                 .await?;
-            use std::io::Read;
-            let mut buf = vec![0u8; 1024 * 1024];
-            loop {
-                let n = file.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                copy_in.send(buf[..n].to_vec()).await?;
+                copy_package_table_into(&mut tx, STAGING, &path, &columns).await?;
+                let list: Vec<String> = writable.iter().map(|c| format!("\"{c}\"")).collect();
+                // `OVERRIDING SYSTEM VALUE` 保住 identity 列的包内取值；没有
+                // identity 的表上它也合法。
+                sqlx::query(&format!(
+                    "INSERT INTO public.\"{table}\" ({list}) OVERRIDING SYSTEM VALUE \
+                     SELECT {list} FROM \"{STAGING}\"",
+                    list = list.join(", ")
+                ))
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(&format!("DROP TABLE \"{STAGING}\""))
+                    .execute(&mut *tx)
+                    .await?;
             }
-            copy_in.finish().await?;
         }
         tx.commit().await?;
     }
@@ -1827,6 +1862,24 @@ mod tests {
             !err.contains("DROP"),
             "the rejected header must not be echoed: {err}"
         );
+    }
+
+    #[test]
+    fn a_generated_column_is_left_out_of_the_load_rather_than_condemning_the_package() {
+        // A package the old export wrote carries the generated column. Its values
+        // are recomputed by the target from the same row, so the load names only
+        // the writable columns -- the reason a package of this shape still
+        // restores instead of being refused.
+        let package = vec!["id".to_string(), "body".to_string(), "is_hot".to_string()];
+        let computed = vec!["is_hot".to_string()];
+        assert_eq!(
+            writable_columns(&package, &computed),
+            vec![&"id".to_string(), &"body".to_string()]
+        );
+
+        // Nothing to leave out is what selects the direct load instead of the
+        // staging table; the two branches must be told apart by the same list.
+        assert_eq!(writable_columns(&package, &[]).len(), package.len());
     }
 
     #[test]
