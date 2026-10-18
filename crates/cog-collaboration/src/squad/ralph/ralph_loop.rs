@@ -7,7 +7,7 @@
 //!   不是被消耗掉的额度。
 
 use crate::actors::{EvaluatorActor, GeneratorActor, PlannerActor};
-use crate::squad::classify::{classify, declared_in};
+use crate::squad::classify::{classify, declared_in, PACED_CLASS};
 use crate::squad::pge::pipeline::{PgePipeline, PlanScope};
 use crate::squad::pge::roundtable::{PgeRoundtable, PgeRoundtableResult};
 use crate::squad::pge::stall::{made_progress, ProgressSignals};
@@ -527,6 +527,9 @@ impl RalphLoop {
                     progress: None,
                 })
                 .await;
+                if sleep_through_pace(&reason).await {
+                    continue;
+                }
                 return self.unrecoverable_verdict(reason);
             }
 
@@ -733,6 +736,9 @@ impl RalphLoop {
             // 确定性失败的结论优先于停滞：环境/协议的失败自带"重试无用"
             // 的语义，比笼统的"没进展"更该被上层看到。
             if let FailureAnalysis::Unrecoverable(reason) = &analysis {
+                if sleep_through_pace(reason).await {
+                    continue;
+                }
                 return self.unrecoverable_verdict(reason.clone());
             }
 
@@ -826,6 +832,9 @@ impl RalphLoop {
             }
 
             if let FailureAnalysis::Unrecoverable(reason) = &analysis {
+                if sleep_through_pace(reason).await {
+                    continue;
+                }
                 return self.unrecoverable_verdict(reason.clone());
             }
 
@@ -1102,12 +1111,93 @@ History of previous attempts:\n{history_json}"
     }
 }
 
+/// 被窗口配速拒绝时，睡到拒绝自报的时刻，再让同一轮重来；返回是否继续。
+///
+/// 配速拒绝不是对目标的判词：同一份工作在窗口打开后照样能跑。把它当成终止，
+/// 任务几秒钟就以失败收场，它的主管随即再起一件，下一件撞的是同一堵墙——
+/// 这就是一次额度用尽被放大成一串零 token 重启的形状。等待取拒绝自己给的
+/// 那个数：它是从额度与窗口直接算出来的时刻，比循环在本地猜一个退避更贴近
+/// 事实。拒绝没给时刻时**不猜**——那正是调用方重试策略该管的事，这里凭空
+/// 睡一觉只会把"没有依据"包装成"有依据"。
+///
+/// 睡着的那一轮已经记过一次迭代，也照常从预算里扣：预算是尝试次数的上界，
+/// 而这次尝试确实发生了（只是没花出去 token）。
+///
+/// 判定与睡眠分开：睡多久是一个可以钉住的读数，睡本身在测试里没有意义。
+fn pace_sleep_secs(reason: &str) -> Option<u64> {
+    if classify(reason) != PACED_CLASS {
+        return None;
+    }
+    cog_core::contract::llm::retry_after_hint_in(reason)
+}
+
+async fn sleep_through_pace(reason: &str) -> bool {
+    let Some(secs) = pace_sleep_secs(reason) else {
+        return false;
+    };
+    tracing::warn!(
+        wait_secs = secs,
+        reason = %reason,
+        "Ralph Loop：窗口配速拒绝了这一轮，睡到它自报的时刻再试，不结束本次运行"
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::squad::pge::types::{StopCause, StoppedProduct};
     use crate::squad::pge::{PgePipeline, PgePipelineConfig, PgeRoundtable, PgeRoundtableConfig};
     use std::sync::Arc;
+
+    /// 被配速拒绝时睡多久：取拒绝自报的那个数，不再在本地按斜坡重算一遍。
+    /// 窗口花光后旧算式给的是 41 分钟（稳态放行间隔），而真正能再花的时刻在
+    /// 11.5 小时后——按前者醒来的每一轮都只是再撞一次同一堵墙。
+    #[test]
+    fn a_paced_refusal_sleeps_for_the_wait_it_states() {
+        use cog_core::contract::outcome::UPSTREAM_UNAVAILABLE_PREFIX;
+
+        let refused = |secs: u64| {
+            format!(
+                "{UPSTREAM_UNAVAILABLE_PREFIX}: environment_error: \
+                 LLM upstream refused (rate_limited): HTTP 429 [retry_after_secs={secs}]"
+            )
+        };
+        // 拒绝自报的数原样使用。
+        assert_eq!(pace_sleep_secs(&refused(600)), Some(600));
+        // 自由文本里读出的等待有上限；超过上限就先睡到上限，醒来再问一次
+        // 拒绝，而不是相信一段散文能把任务停任意长。
+        assert_eq!(
+            pace_sleep_secs(&refused(41_400)),
+            Some(cog_core::MAX_RECOVERED_RETRY_AFTER_SECS)
+        );
+    }
+
+    /// 接不住的情况必须落到 `None`，让调用方照原样终止：额度成墙要走这一跳，
+    /// 上游坏掉与没有依据的等待都不走。
+    #[test]
+    fn only_a_paced_refusal_with_a_stated_wait_is_slept_through() {
+        use cog_core::contract::outcome::UPSTREAM_UNAVAILABLE_PREFIX;
+
+        // 配速拒绝但没说自己要等多久：不猜，交给调用方的重试策略。
+        assert_eq!(
+            pace_sleep_secs(&format!(
+                "{UPSTREAM_UNAVAILABLE_PREFIX}: environment_error: \
+                 LLM upstream refused (rate_limited): HTTP 429"
+            )),
+            None
+        );
+        // 同前缀下的服务端故障不是额度在工作，睡多久都等不到它自己好。
+        assert_eq!(
+            pace_sleep_secs(&format!(
+                "{UPSTREAM_UNAVAILABLE_PREFIX}: environment_error: \
+                 LLM upstream refused (server_error): HTTP 503 [retry_after_secs=30]"
+            )),
+            None
+        );
+        assert_eq!(pace_sleep_secs("Ralph Loop stagnated"), None);
+    }
 
     /// Test-only mock implementing the object-level [`cog_core::Agent`] trait.
     struct MockAgent {

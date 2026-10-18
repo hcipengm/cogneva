@@ -9,6 +9,7 @@ use std::sync::Arc;
 use crate::actors::{EvaluatorActor, GeneratorActor, PlannerActor};
 use crate::hierarchy::{HierarchicalCommunication, HierarchicalMessage};
 use crate::profile::PgeMode;
+use crate::squad::classify::{classify, PACED_CLASS};
 use crate::squad::pge::pipeline::{PgePipeline, PgePipelineConfig};
 use crate::squad::pge::roundtable::{PgeRoundtable, PgeRoundtableConfig};
 use crate::squad::ralph::ralph_loop::{RalphLoop, RalphLoopConfig, RalphVerdict};
@@ -1242,11 +1243,17 @@ async fn run_squad_reflection(
 /// expensive topology. The reasons travel wrapped by the layer that added
 /// context, which is why the decision is asked of the shared predicate rather
 /// than of the reason's first bytes.
+/// 换一套策略也修不好的失败。
+///
+/// 除了"同一份输入再试多少次都一样"的那一类，还要算上额度成墙：升到 Roundtable
+/// 只是换一种花钱的方式，而这一格买不起任何一次花钱。把它漏在可升级一侧，每次
+/// 被配速拒绝都会再买一次同样被拒的尝试，把一次墙变成两次开销、零产出。
 fn declared_unfixable(verdict: &RalphVerdict) -> bool {
     matches!(
         verdict,
         RalphVerdict::Unrecoverable { reason, .. }
             if cog_core::contract::outcome::is_deterministic_failure(reason)
+                || classify(reason) == PACED_CLASS
     )
 }
 
@@ -1305,6 +1312,26 @@ mod tests {
                 "an upgrade must not be bought for a declared cause: {declared:?}"
             );
         }
+
+        // 额度成墙：`is_deterministic_failure` 故意不把它算进来（任务层还要等
+        // 窗口重试），但"升级策略能不能修好"的答案是明确的不能——升级是再花
+        // 一次钱，而这一格买不起任何一次。
+        let paced = format!(
+            "{}: environment_error: LLM upstream refused (rate_limited): HTTP 429",
+            cog_core::contract::outcome::UPSTREAM_UNAVAILABLE_PREFIX
+        );
+        assert!(
+            declared_unfixable(&verdict(paced.clone())),
+            "a quota wall must not buy a strategy upgrade: {paced:?}"
+        );
+        // 同前缀下的上游故障仍保留升级：换一条路可能真的能走通。
+        assert!(
+            !declared_unfixable(&verdict(format!(
+                "{}: environment_error: LLM upstream refused (server_error): HTTP 503",
+                cog_core::contract::outcome::UPSTREAM_UNAVAILABLE_PREFIX
+            ))),
+            "an upstream outage keeps its upgrade"
+        );
 
         // A failure that declares nothing is the one an upgrade can still help:
         // the guard must not become "every failure is terminal".

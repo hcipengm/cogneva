@@ -2189,7 +2189,7 @@ async fn paced_refusal(
             }
         }
     }
-    let wait = crate::window_pace::wait_secs(&pace, rate).unwrap_or(60);
+    let wait = crate::window_pace::wait_secs(&pace, rate, Utc::now().timestamp()).unwrap_or(60);
     land_usage_record(state, paced_refusal_usage(style, actor, origin, task));
     Some(wait)
 }

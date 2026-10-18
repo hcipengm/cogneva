@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 
+use cog_core::contract::llm::UpstreamFailure;
 use cog_core::contract::outcome::{
     DEGENERATE_LOOP_PREFIX, TERMINAL_ENV_FAILURE_PREFIX, UPSTREAM_UNAVAILABLE_PREFIX,
 };
@@ -27,6 +28,26 @@ pub const TERMINAL_ENV_FAILURE_CLASS: &str = "terminal_env_failure";
 /// 「终态」、而重试梯子（读 typed 因）当场排了下一次尝试。分类只能有一个
 /// 答案，答案由原因自己带的那个前缀给出。
 pub const UPSTREAM_UNAVAILABLE_CLASS: &str = "upstream_unavailable";
+
+/// Class for a refusal whose wall is a rate: the call was not served because
+/// some window's allowance is used up, and the same call before that window
+/// resets hits the same wall. Retrying it immediately is the one thing that
+/// cannot work; waiting until the refusal's own instant is the one thing that
+/// can.
+///
+/// Split out of [`UPSTREAM_UNAVAILABLE_CLASS`] because the two classes ask for
+/// opposite handling. An unavailable upstream is an outage -- something is
+/// broken and a restart, a failover or an escalation may be the right repair.
+/// A paced refusal is the quota working as designed, and the only repair is to
+/// not spend until it opens. Collapsed into one label, the termination series
+/// cannot tell "we are spinning against a wall we know the height of" from "a
+/// provider is down", and the criterion that would catch the spin (terminations
+/// should approach zero while the allowance is zero) is never readable.
+///
+/// The label follows the vocabulary the ledger already publishes for the same
+/// event, `result = refused_by_pace`, so a reader does not translate between
+/// the two faces.
+pub const PACED_CLASS: &str = "paced";
 
 /// 退化环（花费买不到进展）的分类标签，与 [`DEGENERATE_LOOP_PREFIX`] 配对。
 pub const DEGENERATE_LOOP_CLASS: &str = "degenerate_loop";
@@ -53,7 +74,27 @@ pub fn declared_in(text: &str) -> Option<&'static str> {
     DECLARED_CLASSES
         .iter()
         .find(|(prefix, _)| cog_core::contract::outcome::declares(text, prefix))
-        .map(|(_, class)| *class)
+        .map(|(_, class)| refine_by_cause(*class, text))
+}
+
+/// Narrow a prefix class by the typed cause the same text carries.
+///
+/// The prefix table is one-to-one by construction, so a refinement cannot live
+/// in it: two rows sharing a prefix would make `declared_in` return whichever
+/// row happens to come first. The typed cause is already in the text
+/// (`LLM upstream refused (rate_limited): ...`) and its vocabulary is owned by
+/// the contract, so splitting here keeps one reader for both the announcement
+/// and the recording -- the reachability self-check compares the same two
+/// functions' outputs, and a split applied on only one side would report the
+/// parent class as announced-but-never-recorded.
+fn refine_by_cause(class: &'static str, text: &str) -> &'static str {
+    if class == UPSTREAM_UNAVAILABLE_CLASS
+        && UpstreamFailure::named_in(text) == Some(UpstreamFailure::RateLimited)
+    {
+        PACED_CLASS
+    } else {
+        class
+    }
 }
 
 /// 文本所属的分类标签；没有声明前缀的落 [`UNCLASSIFIED_CLASS`]。
@@ -133,6 +174,31 @@ mod tests {
         assert_eq!(
             classify("Ralph Loop stagnated: no progress signal"),
             UNCLASSIFIED_CLASS
+        );
+    }
+
+    /// 配速拒绝与上游故障在同一个前缀下：前者是额度按设计在工作，唯一有用的
+    /// 修法是「到点之前不要再花」；后者是上游坏了，重启、切换、升级都可能有用。
+    /// 合成一个标签，终止序列就读不出「我们在对着一个知道高度的墙自旋」。
+    #[test]
+    fn a_rate_limited_refusal_is_classified_paced() {
+        let reason = format!(
+            "{UPSTREAM_UNAVAILABLE_PREFIX}: environment_error: \
+             LLM upstream refused (rate_limited): HTTP 429"
+        );
+        assert_eq!(classify(&reason), PACED_CLASS);
+        assert_eq!(declared_in(&reason), Some(PACED_CLASS));
+        // 声明端与记录端必须给同一个答案，否则自查会把父分类报成
+        // 「声明过却从未被记录」。两者都走 `declared_in`，所以这里直接钉住它。
+        assert_eq!(declared_in(&declare_for(reason)), Some(PACED_CLASS));
+
+        // 同前缀下的服务端错误仍是故障，不能被拆走。
+        assert_eq!(
+            classify(&format!(
+                "{UPSTREAM_UNAVAILABLE_PREFIX}: environment_error: \
+                 LLM upstream refused (server_error): HTTP 503"
+            )),
+            UPSTREAM_UNAVAILABLE_CLASS
         );
     }
 

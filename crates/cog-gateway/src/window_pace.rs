@@ -199,15 +199,56 @@ pub fn measured_window(
 ///
 /// Used for the refusal's `Retry-After`: an answer that names no instant leaves
 /// the caller retrying into the same line.
-pub fn wait_secs(pace: &LlmWindowPace, rate_per_sec: f64) -> Option<u64> {
+///
+/// The allowance is a **bounded** ramp, not a rate that keeps accruing from
+/// wherever the shortfall is measured. The difference is invisible while the
+/// window still has room and decisive exactly when it has none: with the whole
+/// capacity spent, the shortfall against the live allowance keeps answering
+/// "one job's worth of ramp", which is the steady-state admission interval and
+/// never arrives, while the only instant that serves the caller is after the
+/// window resets. A caller that honours the first answer comes back roughly
+/// once per steady-state interval and is refused each time.
+pub fn wait_secs(pace: &LlmWindowPace, rate_per_sec: f64, now_unix: i64) -> Option<u64> {
     if !pace.blocked() || rate_per_sec <= 0.0 {
         return None;
     }
-    let need = pace
-        .spent_tokens
-        .saturating_add(pace.reserve_tokens)
-        .saturating_sub(pace.allowance_tokens);
-    Some((need as f64 / rate_per_sec).ceil().max(1.0) as u64)
+    let need = pace.spent_tokens.saturating_add(pace.reserve_tokens);
+    let window_secs = pace.window_secs as i64;
+    let start = pace.window_start_unix;
+
+    // The slope and span together are the ramp: their product is the capacity
+    // it climbs to, which is the height the target has to fit under.
+    let capacity = rate_per_sec * window_secs as f64;
+    if start > 0 && window_secs > 0 && capacity > 0.0 {
+        if need as f64 <= capacity {
+            // One more whole job fits the window: solve the ramp for the
+            // instant it covers `need`, not for a shortfall measured from now.
+            let reach = start as f64 + window_secs as f64 * need as f64 / capacity;
+            return Some((reach - now_unix as f64).ceil().max(1.0) as u64);
+        }
+        // The window cannot fit one more whole job before it resets, so no
+        // instant inside it serves the caller. The next window starts at zero
+        // and has to accrue the reserve before that job fits; the answer is
+        // the boundary plus that ramp, not the shortfall against a ramp which
+        // has already topped out.
+        //
+        // A start still in the future is itself the next boundary: the pace
+        // anchors the current window at the named reset, so its clock has not
+        // begun. Adding a whole window to that instant would name a boundary a
+        // cycle too late.
+        let reset = if start >= now_unix {
+            start as f64
+        } else {
+            (start + window_secs) as f64
+        };
+        let resume = reset + pace.reserve_tokens as f64 / rate_per_sec;
+        return Some((resume - now_unix as f64).ceil().max(1.0) as u64);
+    }
+
+    // No window start was published, so the ramp's origin is unknown and the
+    // shortfall against the live allowance is the only reading left.
+    let shortfall = need.saturating_sub(pace.allowance_tokens);
+    Some((shortfall as f64 / rate_per_sec).ceil().max(1.0) as u64)
 }
 
 /// The rate a [`MeasuredWindow`] hands out allowance at, tokens per second.
@@ -473,8 +514,103 @@ mod tests {
             window_start_unix: m.burned_at_unix,
         };
         let rate = allowance_rate(m.capacity_tokens, m.window_secs);
-        let wait = wait_secs(&pace, rate).expect("blocked, so it names a wait");
+        let now = m.burned_at_unix + 10 * DAY;
+        let wait = wait_secs(&pace, rate, now).expect("blocked, so it names a wait");
         // 500k short at 1M/day is about half a day.
+        assert!((wait as i64 - DAY / 2).abs() <= 5, "waited {wait}s");
+    }
+
+    #[test]
+    fn a_spent_window_waits_past_its_reset_and_the_next_ramp() {
+        let m = month();
+        // The whole capacity is spent: the shortfall against the live allowance
+        // is one job's worth, which is also the steady-state admission interval
+        // -- exactly the number that never becomes true.
+        let pace = LlmWindowPace {
+            measured_upstreams: 1,
+            allowance_tokens: 30_000_000,
+            spent_tokens: 30_000_000,
+            reserve_tokens: 1_000_000,
+            window_secs: m.window_secs,
+            window_start_unix: m.burned_at_unix,
+        };
+        let rate = allowance_rate(m.capacity_tokens, m.window_secs);
+        let now = m.burned_at_unix + 10 * DAY;
+        let wait = wait_secs(&pace, rate, now).expect("blocked, so it names a wait");
+        // 20 days to the boundary, then one more day for the reserve to accrue.
+        let expected = 21 * DAY;
+        assert!(
+            (wait as i64 - expected).abs() <= 5,
+            "a spent window must wait for the reset plus the next ramp: waited {wait}s"
+        );
+
+        // The shortfall reading would have said one day, and a caller honouring
+        // that comes back into the same wall ~21 times before it can serve.
+        let shortfall =
+            (pace.spent_tokens + pace.reserve_tokens - pace.allowance_tokens) as f64 / rate;
+        assert!(
+            shortfall.ceil() as i64 <= DAY,
+            "the old reading was {shortfall}s"
+        );
+    }
+
+    /// 2026-10-18 的现场数字，整组钉住：上一窗烧穿（138,762,822 / 138,762,822），
+    /// 边界 1,792,339,200 在 11.5 小时后，reserve 570,831。
+    ///
+    /// 旧算式按「短差 ÷ 速率」报 2,488 秒（41 分钟，那正是稳态放行间隔），与
+    /// 真实可入账时刻差 17 倍。新算式报「到边界的 41,549 秒 + 新窗斜坡补满一件
+    /// 任务的 2,488 秒」= 44,037 秒。边界那一刻的 allowance 恰好是 0，提前一秒
+    /// 回来照样被拒——答案是边界加斜坡，不是边界本身。
+    #[test]
+    fn the_live_burned_window_names_the_boundary_plus_the_ramp() {
+        let pace = LlmWindowPace {
+            measured_upstreams: 1,
+            allowance_tokens: 0,
+            spent_tokens: 0,
+            reserve_tokens: 570_831,
+            window_secs: 604_800,
+            window_start_unix: 1_792_339_200,
+        };
+        let rate = allowance_rate(138_762_822, 604_800);
+        assert_eq!(wait_secs(&pace, rate, 1_792_297_651), Some(44_037));
+    }
+
+    #[test]
+    fn a_window_that_still_fits_reports_the_ramp_and_not_the_reset() {
+        let m = month();
+        // Room for one more whole job, but not right now: the ramp reaches the
+        // target in the middle of the window, so the answer is that instant --
+        // not the boundary.
+        let pace = LlmWindowPace {
+            measured_upstreams: 1,
+            allowance_tokens: 10_000_000,
+            spent_tokens: 10_000_000,
+            reserve_tokens: 1_000_000,
+            window_secs: m.window_secs,
+            window_start_unix: m.burned_at_unix,
+        };
+        let rate = allowance_rate(m.capacity_tokens, m.window_secs);
+        let now = m.burned_at_unix + 10 * DAY;
+        let wait = wait_secs(&pace, rate, now).expect("blocked, so it names a wait");
+        assert!(
+            (wait as i64 - DAY).abs() <= 5,
+            "one day of ramp, not the twenty left in the window: waited {wait}s"
+        );
+    }
+
+    #[test]
+    fn without_a_published_window_start_the_shortfall_is_the_only_reading() {
+        let m = month();
+        let pace = LlmWindowPace {
+            measured_upstreams: 1,
+            allowance_tokens: 10_000_000,
+            spent_tokens: 10_200_000,
+            reserve_tokens: 300_000,
+            window_secs: m.window_secs,
+            window_start_unix: 0,
+        };
+        let rate = allowance_rate(m.capacity_tokens, m.window_secs);
+        let wait = wait_secs(&pace, rate, m.burned_at_unix).expect("blocked, so it names a wait");
         assert!((wait as i64 - DAY / 2).abs() <= 5, "waited {wait}s");
     }
 }
