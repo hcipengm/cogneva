@@ -105,6 +105,32 @@ impl IngestPurpose {
     }
 }
 
+/// 学习面的拒收判据：一条载荷**没抽出任何结构**，而它的摘要又正好是载荷被
+/// 截断的真前缀，那这条摘要就是「前 200 字」在冒充结论——归档载荷当初就是
+/// 这样落地的，换个 `purpose` 并不能把它变成学习材料。
+///
+/// 判「是不是预览」用**形状**而不是字数：摘要恰是被发送正文的真前缀，说明它
+/// 是从载荷里切下来的；LLM 抽取器给的摘要是改写，不会命中原字节。所以这条
+/// 判据不会误伤真的摘要，也不在网关里重抄抽取器的窗口长度。
+fn truncated_learning_payload(
+    schema_len: usize,
+    summary_text: &str,
+    payload_text: &str,
+) -> Option<String> {
+    if schema_len > 0 {
+        return None;
+    }
+    let is_cut = payload_text.len() > summary_text.len() && payload_text.starts_with(summary_text);
+    if !is_cut {
+        return None;
+    }
+    Some(format!(
+        "nothing was extracted from this payload and its summary would be the first {} characters: \
+         send it with purpose \"archive\", or include @entity:/@relation:/@event: lines",
+        summary_text.chars().count()
+    ))
+}
+
 #[derive(Debug, Serialize)]
 pub struct BatchIngestResponse {
     pub processed: usize,
@@ -285,6 +311,16 @@ pub async fn ingest_handler(
         }
     };
 
+    // 拒收排在归档之前：调用方拿到 400 之后不会重试成归档，raw 层也不该留下
+    // 这一份半成品。
+    if let Some(reason) = truncated_learning_payload(
+        schema.len(),
+        &summary.text,
+        &String::from_utf8_lossy(&raw.payload),
+    ) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": reason}))).into_response();
+    }
+
     let raw_uri = match backend.archive_raw(&raw).await {
         Ok(uri) => uri,
         Err(e) => {
@@ -392,6 +428,21 @@ pub async fn batch_ingest_handler(
                 }
             },
         };
+
+        // 与单条入口同一条判据；拒收排在归档之前，raw 层不留半成品。
+        if let Some((schema, summary)) = ingested.as_ref() {
+            if let Some(reason) = truncated_learning_payload(
+                schema.len(),
+                &summary.text,
+                &String::from_utf8_lossy(&raw.payload),
+            ) {
+                errors.push(BatchIngestError {
+                    id: item.id,
+                    error: reason,
+                });
+                continue;
+            }
+        }
 
         let raw_uri = match backend.archive_raw(&raw).await {
             Ok(uri) => uri,
@@ -1185,5 +1236,33 @@ mod tests {
         // 学习材料，回一段 200 字前缀冒充摘要。
         assert!(IngestPurpose::parse("summarize").is_err());
         assert!(IngestPurpose::parse("Archive").is_err());
+    }
+
+    #[test]
+    fn a_summary_that_is_a_cut_of_the_payload_is_not_a_learning_result() {
+        // 整段都在（短笔记）：摘要没有丢字节，放行。
+        assert_eq!(
+            truncated_learning_payload(
+                0,
+                "Charlie deploys to staging.",
+                "Charlie deploys to staging."
+            ),
+            None
+        );
+        // 抽不出结构、摘要又是前缀、载荷更长：这正是归档载荷当初落地的格子。
+        assert!(
+            truncated_learning_payload(0, "first 200 chars", "first 200 chars and the rest")
+                .is_some()
+        );
+        // 有结构时摘要只是预览，claim 在 schema 里，放行。
+        assert_eq!(
+            truncated_learning_payload(2, "first 200 chars", "first 200 chars and the rest"),
+            None
+        );
+        // 改写过的摘要（LLM 抽取器）不是载荷的前缀，放行。
+        assert_eq!(
+            truncated_learning_payload(0, "Alice and Bob met", "the full transcript ..."),
+            None
+        );
     }
 }
