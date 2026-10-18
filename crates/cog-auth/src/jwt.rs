@@ -8,6 +8,12 @@ use cog_core::{Claims, Permission, Role, User, UserType};
 /// JWT configuration.
 #[derive(Debug, Clone)]
 pub struct JwtConfig {
+    /// HMAC secret for HS256 signing. Never reuse a public or default value:
+    /// anyone who knows it can forge admin tokens offline. Production
+    /// deployments inject it from the install-time generated cluster Secret
+    /// (see `COGNEVA_JWT_SECRET` handling in `plugin::resolve_jwt_config`);
+    /// the `Default` value is a fresh random secret per process, safe for
+    /// tests and local development only (tokens die on restart).
     pub secret: String,
     pub issuer: String,
     pub audience: String,
@@ -22,7 +28,12 @@ pub struct JwtConfig {
 impl Default for JwtConfig {
     fn default() -> Self {
         Self {
-            secret: "change-me-in-production".into(),
+            // A known literal here would let anyone forge tokens for any
+            // deployment that ever fell back to defaults. Generate a fresh
+            // random secret per process instead: unforgeable, at the cost of
+            // invalidating tokens on restart — acceptable for the tests and
+            // throwaway dev runs this default serves.
+            secret: format!("dev-only-{}-{}", Uuid::new_v4(), Uuid::new_v4()),
             issuer: "cogneva".into(),
             audience: "cogneva-api".into(),
             access_token_ttl_minutes: 15,
@@ -46,11 +57,28 @@ impl JwtManager {
         let (encoding_key, decoding_key, algorithm) = if let (Some(ref private), Some(ref public)) =
             (&config.private_key_pem, &config.public_key_pem)
         {
-            let enc =
-                EncodingKey::from_rsa_pem(private.as_bytes()).expect("invalid RSA private key PEM");
-            let dec =
-                DecodingKey::from_rsa_pem(public.as_bytes()).expect("invalid RSA public key PEM");
-            (enc, dec, Algorithm::RS256)
+            // Never panic on configuration: a malformed PEM must not take the
+            // process down. Fall back to an HS256 manager keyed by a fresh
+            // random secret — unforgeable, and it fails closed (existing
+            // tokens stop verifying) rather than crashing or trusting input.
+            match (
+                EncodingKey::from_rsa_pem(private.as_bytes()),
+                DecodingKey::from_rsa_pem(public.as_bytes()),
+            ) {
+                (Ok(enc), Ok(dec)) => (enc, dec, Algorithm::RS256),
+                (enc, dec) => {
+                    let reason = match (enc, dec) {
+                        (Err(e), _) | (_, Err(e)) => e.to_string(),
+                        _ => unreachable!(),
+                    };
+                    tracing::error!(
+                        "invalid RSA key PEM ({reason}); refusing RS256 and falling back to a \
+                         per-process random HS256 secret — previously issued tokens will not \
+                         verify"
+                    );
+                    Self::ephemeral_hs256_keys()
+                }
+            }
         } else {
             let enc = EncodingKey::from_secret(config.secret.as_bytes());
             let dec = DecodingKey::from_secret(config.secret.as_bytes());
@@ -63,6 +91,17 @@ impl JwtManager {
             decoding_key,
             algorithm,
         }
+    }
+
+    /// HS256 key pair backed by a fresh random secret, used as the fail-closed
+    /// fallback when configured RSA keys cannot be parsed.
+    fn ephemeral_hs256_keys() -> (EncodingKey, DecodingKey, Algorithm) {
+        let secret = format!("fallback-{}-{}", Uuid::new_v4(), Uuid::new_v4());
+        (
+            EncodingKey::from_secret(secret.as_bytes()),
+            DecodingKey::from_secret(secret.as_bytes()),
+            Algorithm::HS256,
+        )
     }
 
     /// Returns the algorithm currently in use.
@@ -226,6 +265,13 @@ pub fn generate_test_rsa_keypair() -> (String, String) {
 mod tests {
     use super::*;
 
+    /// Strong, unique-per-run HS256 secret for the tests below. Never use a
+    /// shared literal: a public test secret that reached a real config would
+    /// be a forgery key.
+    fn test_config() -> JwtConfig {
+        JwtConfig::default()
+    }
+
     fn test_user() -> User {
         User {
             id: Uuid::new_v4(),
@@ -243,7 +289,7 @@ mod tests {
 
     #[test]
     fn generate_and_verify_token() {
-        let mgr = JwtManager::new(JwtConfig::default());
+        let mgr = JwtManager::new(test_config());
         let user = test_user();
         let (access, refresh) = mgr
             .generate_token(&user, vec!["ws-001".into()], vec![Permission::AgentRead])
@@ -260,7 +306,7 @@ mod tests {
 
     #[test]
     fn refresh_access_token_ok() {
-        let mgr = JwtManager::new(JwtConfig::default());
+        let mgr = JwtManager::new(test_config());
         let user = test_user();
         let (access, refresh) = mgr.generate_token(&user, vec![], vec![]).unwrap();
 
@@ -276,7 +322,7 @@ mod tests {
     fn expired_token_fails() {
         let config = JwtConfig {
             access_token_ttl_minutes: -5,
-            ..Default::default()
+            ..test_config()
         };
         let mgr = JwtManager::new(config);
         let user = test_user();
@@ -287,12 +333,29 @@ mod tests {
     }
 
     #[test]
+    fn invalid_rsa_pem_falls_back_without_panicking() {
+        let config = JwtConfig {
+            private_key_pem: Some("not-a-pem".into()),
+            public_key_pem: Some("also-not-a-pem".into()),
+            ..test_config()
+        };
+        let mgr = JwtManager::new(config);
+        // Fail-closed fallback: HS256 with a random per-process secret.
+        assert_eq!(mgr.algorithm(), Algorithm::HS256);
+
+        let user = test_user();
+        let (access, _) = mgr.generate_token(&user, vec![], vec![]).unwrap();
+        let claims = mgr.verify_token(&access).unwrap();
+        assert_eq!(claims.sub, user.id.to_string());
+    }
+
+    #[test]
     fn rs256_generate_and_verify_token() {
         let (private_pem, public_pem) = generate_test_rsa_keypair();
         let config = JwtConfig {
             private_key_pem: Some(private_pem),
             public_key_pem: Some(public_pem),
-            ..Default::default()
+            ..test_config()
         };
         let mgr = JwtManager::new(config);
         assert_eq!(mgr.algorithm(), Algorithm::RS256);
@@ -316,7 +379,7 @@ mod tests {
         let config = JwtConfig {
             private_key_pem: Some(private_pem),
             public_key_pem: Some(public_pem),
-            ..Default::default()
+            ..test_config()
         };
         let mgr = JwtManager::new(config);
         let user = test_user();
@@ -338,7 +401,7 @@ mod tests {
         let config = JwtConfig {
             private_key_pem: Some(private_pem),
             public_key_pem: Some(other_public),
-            ..Default::default()
+            ..test_config()
         };
         let mgr = JwtManager::new(config);
         let user = test_user();
