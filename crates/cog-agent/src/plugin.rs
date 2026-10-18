@@ -295,7 +295,11 @@ impl cog_core::SystemPlugin for AgentPlugin {
         .with_default_runtime_config(agent_loop_config)
         .with_heartbeat_interval_secs(agent_config.heartbeat_interval_secs)
         .with_tools(tool_registry)
-        .with_sandbox_backend(sandbox_backend_for_pool);
+        .with_sandbox_backend(sandbox_backend_for_pool)
+        // The pool is the only place its own size is known. Without this the
+        // roster exists solely as the binding nobody reads, and the only
+        // reachable evidence of it is a connection count taken somewhere else.
+        .with_roster_observer(crate::observable::global_observable());
         if let Some(ref archive) = tool_output_archive {
             pool_builder = pool_builder.with_tool_output_archive(archive.clone());
         }

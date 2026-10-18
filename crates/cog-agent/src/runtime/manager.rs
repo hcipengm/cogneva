@@ -37,6 +37,21 @@ async fn runtime_config_for(
     config
 }
 
+/// The one agent created outside any task, and therefore the one that is
+/// expected to live as long as the process.
+///
+/// The role of every other agent is derived from a task, so a roster entry for
+/// it carries a lifetime that ends with that task. This one does not, and the
+/// age reading is unusable while it is mixed in with the rest: it alone makes
+/// the oldest age climb to the process uptime, hiding any task agent that was
+/// never retired behind a number that always looks old.
+///
+/// A name rather than a role because the caller names this agent, not a role
+/// class. It becomes `task_id.is_none()` once the manager records which task
+/// each agent belongs to; until then this is where the exception is written
+/// down, in one place, next to the field it qualifies.
+const PROCESS_LIFETIME_AGENT_ID: &str = "mode-selector";
+
 /// Handle to a spawned worker agent.
 #[derive(Clone)]
 pub struct WorkerHandle {
@@ -44,6 +59,12 @@ pub struct WorkerHandle {
     pub role: String,
     pub capabilities: Vec<String>,
     pub agent: Arc<Agent>,
+    /// When this object was put on the roster.
+    ///
+    /// Kept so the age of the oldest agent can be read out. The count alone
+    /// cannot tell a roster that is working from one that never lets anything
+    /// go: both grow, and the difference is only visible as age.
+    created_at: std::time::Instant,
 }
 
 /// Global agent manager for production multi-agent parallelism.
@@ -114,6 +135,15 @@ pub struct GlobalAgentManager {
     /// the number lives in one place: an interval written here as a second
     /// constant would be the one that wins, silently.
     heartbeat_interval_secs: u64,
+    /// Where the roster is published for the scrape to read.
+    ///
+    /// The roster is the only place the pool's own size is known, and until it
+    /// is published the size exists only as a connection count elsewhere --
+    /// which is a different quantity, since a connection can outlive the object
+    /// that opened it and an object can exist with no connection at all. A
+    /// reader comparing the two needs both, so this is not optional in
+    /// production wiring even though the field is.
+    roster_observer: Option<Arc<crate::observable::AgentObservable>>,
 }
 
 impl GlobalAgentManager {
@@ -149,6 +179,39 @@ impl GlobalAgentManager {
             tool_output_archive: None,
             heartbeat_interval_secs: cog_core::config::AgentConfig::default()
                 .heartbeat_interval_secs,
+            roster_observer: None,
+        }
+    }
+
+    /// Publish the roster to `observer` whenever it changes.
+    pub fn with_roster_observer(
+        mut self,
+        observer: Arc<crate::observable::AgentObservable>,
+    ) -> Self {
+        self.roster_observer = Some(observer);
+        self
+    }
+
+    /// Hand the current roster to the observer, if one is attached.
+    ///
+    /// Called while the caller still holds the write lock, so the list it sees
+    /// is the roster at that instant rather than a second read that could have
+    /// moved on. The observer's lock is an ordinary `Mutex` and is never held
+    /// across an await, so this cannot deadlock against the roster's own lock.
+    fn publish_roster(&self, workers: &[WorkerHandle]) {
+        if let Some(ref observer) = self.roster_observer {
+            observer.publish_roster(
+                workers
+                    .iter()
+                    .map(|w| {
+                        (
+                            w.role.clone(),
+                            w.created_at,
+                            w.agent_id != PROCESS_LIFETIME_AGENT_ID,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
         }
     }
 
@@ -367,10 +430,12 @@ impl GlobalAgentManager {
             role: role.to_string(),
             capabilities,
             agent: Arc::new(agent),
+            created_at: std::time::Instant::now(),
         };
 
         let mut workers = self.workers.write().await;
         workers.push(handle.clone());
+        self.publish_roster(&workers);
         Ok(handle)
     }
 
@@ -515,6 +580,7 @@ impl cog_core::AgentManager for GlobalAgentManager {
             role: role.to_string(),
             capabilities,
             agent: std::sync::Arc::new(agent),
+            created_at: std::time::Instant::now(),
         };
 
         let arc_agent: std::sync::Arc<dyn cog_core::Agent> = handle.agent.clone();
@@ -526,6 +592,7 @@ impl cog_core::AgentManager for GlobalAgentManager {
             return Ok(existing.agent.clone());
         }
         workers.push(handle);
+        self.publish_roster(&workers);
         Ok(arc_agent)
     }
 

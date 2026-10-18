@@ -32,6 +32,42 @@ pub struct AgentObservable {
     /// or a path, which would grow without bound. The sample itself is a recent
     /// window (see [`BUDGET_SAMPLE_WINDOW`]), so the map stays bounded too.
     role_calibrations: Arc<Mutex<HashMap<String, RoleCalibration>>>,
+    /// The agents the manager currently holds, one entry per live object.
+    ///
+    /// Published by the manager on every change and read at scrape time, so the
+    /// count is the roster as it stands rather than the last event that touched
+    /// it. The age is computed here for the same reason: an age written at the
+    /// moment an agent was created stops growing the moment nothing else
+    /// happens, and "nothing else happened" is exactly the state a leaked agent
+    /// is in.
+    ///
+    /// The roster exists beside `role_calibrations` rather than inside it
+    /// because they answer different questions about the same role: calibration
+    /// is what a role's finished runs needed, this is how many of its objects
+    /// are still alive. A leak shows up as the count and the age rising while
+    /// the runs behind the calibration stop arriving.
+    roster: Mutex<Vec<RosterEntry>>,
+    /// Every role the roster has ever held.
+    ///
+    /// A gauge has no delete: a role whose last agent goes away simply stops
+    /// being written, and the last nonzero value stays in the store reading as
+    /// "still N alive". So the scrape writes an explicit zero for every role
+    /// it has seen, and needs this set to know which those are.
+    roster_roles: Mutex<HashMap<String, bool>>,
+}
+
+/// One live agent as the manager holds it.
+#[derive(Clone)]
+struct RosterEntry {
+    role: String,
+    created_at: std::time::Instant,
+    /// Whether this object is scoped to a task or lives as long as the process.
+    ///
+    /// Carried into the exposition because the age reading is only judgeable
+    /// within one of the two: one process-lifetime agent makes the age of the
+    /// oldest object climb to the process uptime forever, and every forgotten
+    /// task-scoped agent hides behind it.
+    task_scoped: bool,
 }
 
 /// How many of a role's most recent completed runs feed its budget.
@@ -112,6 +148,41 @@ impl RunOutcome {
 impl AgentObservable {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Replace the published roster with `entries` (role, creation instant).
+    ///
+    /// Replaced wholesale rather than incremented on create and on retire: a
+    /// reader comparing a count that was incremented and decremented on two
+    /// separate paths can only ask whether the two balanced, and a path that
+    /// failed to decrement looks exactly like a path that never ran. Publishing
+    /// the list makes the manager the single owner of the truth and the scrape
+    /// a plain view of it.
+    pub fn publish_roster(
+        &self,
+        entries: impl IntoIterator<Item = (String, std::time::Instant, bool)>,
+    ) {
+        let next: Vec<RosterEntry> = entries
+            .into_iter()
+            .map(|(role, created_at, task_scoped)| RosterEntry {
+                role,
+                created_at,
+                task_scoped,
+            })
+            .collect();
+        {
+            let mut roles = self
+                .roster_roles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for entry in &next {
+                roles.insert(entry.role.clone(), entry.task_scoped);
+            }
+        }
+        *self
+            .roster
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
     }
 
     /// Record a high-level agent run (called by AgentRuntime::run).
@@ -271,6 +342,53 @@ impl Observable for AgentObservable {
             );
         }
 
+        // The manager's roster, published on every change and read here. Two
+        // series per role because either one alone can be read as healthy: a
+        // count that stopped falling says nothing about how long the oldest
+        // object has been there, and one agent created at boot looks exactly
+        // like a busy role on the count alone.
+        {
+            let roster = self
+                .roster
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut by_role: HashMap<&str, (u64, f64)> = HashMap::new();
+            for entry in roster.iter() {
+                let age = entry.created_at.elapsed().as_secs_f64();
+                let slot = by_role.entry(entry.role.as_str()).or_insert((0, 0.0));
+                slot.0 += 1;
+                if age > slot.1 {
+                    slot.1 = age;
+                }
+            }
+            let roles = self
+                .roster_roles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (role, task_scoped) in roles.iter() {
+                let lifetime = if *task_scoped { "task" } else { "process" };
+                let (count, oldest_age) =
+                    by_role.get(role.as_str()).copied().unwrap_or((0, f64::NAN));
+                metrics.push(
+                    RawMetric::new("agent_roster", count as f64)
+                        .with_label("role", role)
+                        .with_label("lifetime", lifetime),
+                );
+                // Only while the role still holds something. An age with no
+                // object behind it would be a number left over from the last
+                // scrape, and a reader who takes it as the age of the oldest
+                // live agent reads a leak where there is none. The count is the
+                // gate: zero there means the age of this role is not a reading.
+                if count > 0 {
+                    metrics.push(
+                        RawMetric::new("agent_roster_oldest_age_seconds", oldest_age)
+                            .with_label("role", role)
+                            .with_label("lifetime", lifetime),
+                    );
+                }
+            }
+        }
+
         Ok(metrics)
     }
 
@@ -308,6 +426,65 @@ mod tests {
             read("agent_success_count"),
             read("agent_budget_exhausted_count"),
         )
+    }
+
+    /// A role whose last agent was removed must still be written, as zero.
+    ///
+    /// A gauge has no delete. If the empty role is simply left out of the
+    /// scrape, the store keeps the last nonzero value and every reader of it
+    /// sees a role that still holds agents, forever.
+    #[tokio::test]
+    async fn an_emptied_role_is_written_as_zero_rather_than_left_out() {
+        let o = AgentObservable::new();
+        let now = std::time::Instant::now();
+        o.publish_roster(vec![("planner".to_string(), now, true)]);
+        o.publish_roster(Vec::<(String, std::time::Instant, bool)>::new());
+
+        let metrics = o.collect_metrics("").await.expect("collect_metrics");
+        let count = metrics
+            .iter()
+            .find(|m| {
+                m.name == "agent_roster"
+                    && m.labels.get("role").map(String::as_str) == Some("planner")
+            })
+            .expect("the role is still reported after it emptied");
+        assert_eq!(count.value, 0.0);
+        assert_eq!(
+            count.labels.get("lifetime").map(String::as_str),
+            Some("task")
+        );
+        assert!(
+            !metrics
+                .iter()
+                .any(|m| m.name == "agent_roster_oldest_age_seconds"),
+            "an age with nothing behind it would be the previous scrape's number"
+        );
+    }
+
+    /// The process-lifetime agent must be separable, or the age reading cannot
+    /// be judged: it alone would hold the oldest age at the process uptime and
+    /// hide every task agent that was never retired.
+    #[tokio::test]
+    async fn a_process_lifetime_agent_is_labelled_apart_from_task_agents() {
+        let o = AgentObservable::new();
+        let now = std::time::Instant::now();
+        o.publish_roster(vec![
+            ("planner".to_string(), now, true),
+            ("mode_selector".to_string(), now, false),
+        ]);
+
+        let metrics = o.collect_metrics("").await.expect("collect_metrics");
+        let lifetime_of = |role: &str| {
+            metrics
+                .iter()
+                .find(|m| {
+                    m.name == "agent_roster"
+                        && m.labels.get("role").map(String::as_str) == Some(role)
+                })
+                .and_then(|m| m.labels.get("lifetime").map(String::as_str))
+        };
+        assert_eq!(lifetime_of("planner"), Some("task"));
+        assert_eq!(lifetime_of("mode_selector"), Some("process"));
     }
 
     #[tokio::test]
