@@ -5171,6 +5171,57 @@ mod tests {
         assert_the_counts_add_up(&state);
     }
 
+    /// A settled row is not one the delivery pass walks, so a commit naming it
+    /// records nothing against it.
+    ///
+    /// The pass reads the outstanding set, and `landed` / `retired` are not in
+    /// it -- so "which commit carried this change" is answered only for rows
+    /// that were still owed when the line carried them. A change that landed
+    /// and settled before this column existed never gets the annotation, which
+    /// is why the first reading of the count is the number of owed rows with a
+    /// landing commit, not the number of landing commits on the line: the two
+    /// counts are of different sets, and reading the larger one as the expected
+    /// value would call a healthy zero a broken reader.
+    #[tokio::test]
+    async fn a_settled_row_is_never_walked_so_its_landing_commit_records_nothing() {
+        let store = FakeLedger {
+            rows: vec![landed_row("crates/settled", Some("111111111111"))],
+            ..Default::default()
+        };
+        let graph = Arc::new(FakeGraph::default());
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+        let mut deliveries = HashMap::new();
+        deliveries.insert(
+            dispatch_task_id(&store.rows[0].identity, 0),
+            "abcdef123456".to_string(),
+        );
+
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            Some(&deliveries),
+        )
+        .await;
+
+        assert!(
+            store.deliveries().is_empty(),
+            "a settled row is not walked, so its landing commit is written nowhere"
+        );
+        let state = store.written().pop().expect("the pass wrote its row");
+        assert_eq!(
+            state.delivered,
+            Some(0),
+            "the pass measured: zero of the owed rows carries a landing commit"
+        );
+        assert_the_counts_add_up(&state);
+    }
+
     /// A commit log that could not be read writes no delivery count at all.
     ///
     /// The unreadable branch is the whole reason the column is nullable: a pass
