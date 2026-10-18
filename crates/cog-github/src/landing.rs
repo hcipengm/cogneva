@@ -1888,13 +1888,17 @@ fn commit_message(identity: &BotIdentityConfig, change: &GeneratedChange) -> Str
     let title = change
         .goal
         .lines()
-        .next()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
         .unwrap_or("autonomous change")
         .chars()
         .take(70)
         .collect::<String>();
     let mut body = format!(
-        "chore(cogneva): land change {}\n\n{title}\n",
+        "{}({}): {}\n\nLanding change {}\n",
+        commit_type(change),
+        commit_scope(change),
+        title,
         change.change_id
     );
     if let Some(ref rationale) = change.rationale {
@@ -1921,6 +1925,66 @@ fn commit_message(identity: &BotIdentityConfig, change: &GeneratedChange) -> Str
         identity_signoff(identity)
     ));
     body
+}
+
+/// The Conventional Commits type this change is filed under.
+///
+/// Every landed change used to be labelled `chore`, the type that says none of
+/// the others apply, so release tooling grouped fixes with housekeeping. The
+/// type is derived from the paths the diff touches, not from the goal text: a
+/// producer calling its change a fix is a claim, while a path under `tests/` is
+/// the diff itself. Anything that does not name a narrower type is a `fix`,
+/// because a change that reached landing corrected something on the tree.
+fn commit_type(change: &GeneratedChange) -> &'static str {
+    if change.affected_files.is_empty() {
+        return "fix";
+    }
+    if change.affected_files.iter().all(|path| is_test_path(path)) {
+        return "test";
+    }
+    if change.affected_files.iter().all(|path| is_docs_path(path)) {
+        return "docs";
+    }
+    if change.affected_files.iter().all(|path| is_build_path(path)) {
+        return "build";
+    }
+    "fix"
+}
+
+fn is_test_path(path: &str) -> bool {
+    path.contains("/tests/")
+        || path.starts_with("tests/")
+        || path.ends_with("_test.rs")
+        || path.contains("/testdata/")
+}
+
+fn is_docs_path(path: &str) -> bool {
+    path.ends_with(".md") || path.starts_with("docs/") || path.contains("/docs/")
+}
+
+fn is_build_path(path: &str) -> bool {
+    path.ends_with("Cargo.toml")
+        || path.ends_with("Cargo.lock")
+        || path.starts_with("deploy/")
+        || path.starts_with(".github/")
+        || path.ends_with("Makefile")
+}
+
+/// The scope in the commit header: the crate whose code the change touches.
+///
+/// Conventional Commits reads the scope as the area affected. The crate name is
+/// the coarsest honest answer; a change outside `crates/` falls back to the
+/// repository name rather than inventing an area.
+fn commit_scope(change: &GeneratedChange) -> &str {
+    change
+        .affected_files
+        .iter()
+        .find_map(|path| {
+            let rest = path.strip_prefix("crates/")?;
+            let name = rest.split('/').next()?;
+            (!name.is_empty()).then_some(name)
+        })
+        .unwrap_or("cogneva")
 }
 
 fn identity_signoff(identity: &BotIdentityConfig) -> String {
@@ -3189,6 +3253,43 @@ mod tests {
         let msg = commit_message(&BotIdentityConfig::default(), &change("chg-42", "diff"));
         assert!(msg.contains("Change-Id: chg-42"));
         assert!(msg.contains("Signed-off-by:"));
+    }
+
+    /// A landed change is a change to the tree, so it is filed under the type
+    /// its diff describes. `chore` is reserved for housekeeping; filing every
+    /// landing there hid fixes from anything that groups by type.
+    #[test]
+    fn a_landed_change_is_filed_under_its_diff_not_chore() {
+        let msg = commit_message(&BotIdentityConfig::default(), &change("chg-42", "diff"));
+        assert!(msg.starts_with("fix(cog-github): fix the thing"), "{msg}");
+        assert!(!msg.starts_with("chore("), "{msg}");
+    }
+
+    #[test]
+    fn a_change_that_only_touches_tests_is_filed_as_a_test() {
+        let mut ch = change("chg-43", "diff");
+        ch.affected_files = vec!["crates/cog-github/tests/landing_test.rs".into()];
+        let msg = commit_message(&BotIdentityConfig::default(), &ch);
+        assert!(msg.starts_with("test(cog-github):"), "{msg}");
+    }
+
+    #[test]
+    fn a_change_outside_the_crates_uses_the_repository_as_its_scope() {
+        let mut ch = change("chg-44", "diff");
+        ch.affected_files = vec!["docs/deploy.md".into()];
+        let msg = commit_message(&BotIdentityConfig::default(), &ch);
+        assert!(msg.starts_with("docs(cogneva):"), "{msg}");
+    }
+
+    #[test]
+    fn an_empty_goal_line_does_not_produce_an_empty_header() {
+        let mut ch = change("chg-45", "diff");
+        ch.goal = "\n\n   \n".into();
+        let msg = commit_message(&BotIdentityConfig::default(), &ch);
+        assert!(
+            msg.starts_with("fix(cog-github): autonomous change"),
+            "{msg}"
+        );
     }
 
     /// The eval-gate design's third acceptance: the squad's self-reported score

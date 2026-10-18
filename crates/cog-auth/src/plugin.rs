@@ -3,9 +3,9 @@
 use std::sync::Arc;
 use tracing::{info, warn};
 
-/// Well-known placeholder from `JwtConfig::default()`. Refused at startup
-/// outside demo mode: HS256 with a public secret means anyone can forge an
-/// admin token offline.
+/// The placeholder an operator copies from an old config or a template.
+/// Refused at startup outside demo mode: HS256 with a public secret means
+/// anyone can forge an admin token offline.
 const KNOWN_WEAK_SECRET: &str = "change-me-in-production";
 
 /// Auth plugin that self-assembles and publishes JWT manager and session manager.
