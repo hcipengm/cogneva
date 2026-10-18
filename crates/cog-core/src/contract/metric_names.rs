@@ -1127,6 +1127,44 @@ metric_names! {
     // reading from the offering side.
     EVENT_BUS_EMITTED_TOTAL => "cogneva_event_bus_emitted_total",
 
+    // What one batch consumer did with the events it took: `stage="taken"` is
+    // what its drain removed from the channel this pass, `stage="attempted"` is
+    // how many of those it handed on for storage.
+    //
+    // Not a new `consumer` value on `..._consumed_total`. That counter is
+    // incremented once per event, and its help says a consumer whose write
+    // covers a whole pass has to mint its own name, or `rate()` means two
+    // different things under one family and two label values stop being
+    // comparable. This is that name: one write per pass, carrying that pass's
+    // event count, so both sides of the comparison are measured in events.
+    //
+    // The pair answers what neither loss counter can ask. A pass that took
+    // events and handed none on is a consumer that is running and a handoff that
+    // is not -- from the lag counter alone that is identical to a consumer with
+    // nothing to do, and from the table's row count it is identical to a channel
+    // nothing was ever offered. `taken` against `attempted` says the first;
+    // either against the store's rows says the second.
+    EVENT_BUS_HANDOFF_TOTAL => "cogneva_event_bus_handoff_total",
+
+    // The store's half of that handoff: a write whose persistence failed.
+    //
+    // Same unit as the handoff above -- events -- which is what makes
+    // subtraction valid, but a different writer and a different cadence: the
+    // handoff is written by the consumer once per pass with that pass's event
+    // count, while this one is written where the outcome is known, once per
+    // failed event. They stay two names rather than one family with a label
+    // because one side is a batch written before the outcome exists and the
+    // other is a count written after it; folding them would put two write
+    // cadences and two sets of labels under one name. Subtracting this from
+    // `..._handoff_total{stage="attempted"}` is what turns "the events reached
+    // the handoff" into "the events reached the table".
+    //
+    // It exists because the alternative was a log line. An empty table with a
+    // warning per failed write reads the same, at the metric surface, as a table
+    // nothing was ever offered -- exactly the pair this family was added to
+    // separate.
+    OBSERVABILITY_EVENT_PERSIST_FAILED_TOTAL => "cogneva_observability_event_persist_failed_total",
+
     // cog-agent — what happened to a tool output too large for the context.
     //
     // Two cells that must be read together. `truncated` says a tool's output did

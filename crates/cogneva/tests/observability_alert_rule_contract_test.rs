@@ -2572,6 +2572,18 @@ const UNREAD: &[(&str, Unread)] = &[
         "sop_unmapped_role_total",
         Unread::Gap("tasks whose declared `role` named no row in the executor table, by `face`. The role is carried through verbatim and the dispatch path maps it to nothing, so a task can be injected with `is_executable` set and a role no hand answers to -- and that is a fact no other series states, since the injected count beside it is the same whether or not anything can pick the work up. The lookup itself is not missing: the executor table already answers it through its own role-to-skill mapping, and the count is taken against that answer rather than against a table spelled here. What a rule would have to say is which of these are faults, and that turns on a mapping nobody has declared: the roles a face's document uses and the role kinds the executor table registers are two vocabularies with no published correspondence between them, so at the moment this name is minted every role a face declares is unmapped until an operator adds a row for it, and a rule firing on any nonzero would flag the wiring of a new face rather than a fault. The bound is what the actor loop's own entry says is missing -- the population that needs a threshold is the one that took a fallback -- and here the fallback is simply that nobody picks the task up"),
     ),
+    // The pair minted when a batch consumer's handoff turned out to be
+    // unreadable. Neither can be read by a rule, and both are gaps for the same
+    // reason: the thing they are compared against lives in a Postgres table,
+    // which no query over the metric store can address.
+    (
+        "cogneva_event_bus_handoff_total",
+        Unread::Gap("what one drain pass took off a broadcast channel and how much of that it handed on, by `consumer` and `stage`. It was minted because the loss counters either side of it cannot express the defect that prompted it: a pass that takes events and hands none on leaves `cogneva_event_bus_lagged_total` flat, exactly like a consumer with nothing to do, and leaves the store it writes to empty, exactly like a channel nothing was offered. A rule cannot close that, because the operand that decides it is the row count of the table the handoff writes -- a number that no query over the metric store can read -- so the comparison is a reading-script job rather than a threshold: `stage=\"taken\"` greater than `stage=\"attempted\"` over the same window is the fault, and it needs the second sample a rule would also have. Filed as a gap rather than given an invented threshold because any bound on its own would fire on an idle channel"),
+    ),
+    (
+        "cogneva_observability_event_persist_failed_total",
+        Unread::Gap("observability events whose insert failed, one per failed write, counted in the store where the outcome is known. A rule on any increase would look writable and is not, because the series it should be read against is the handoff attempt count above, and a failure there is already a loss by construction rather than a condition that turns into one at some level -- what a rule would add is a page for a defect the empty table already states, on a path whose repair is the write itself. The reason it stays a gap rather than becoming a rule is the same one the handoff entry gives: subtracting the two is what says how many events reached the table, and the row count it would be checked against is not on the metric surface. It is registered here so the census sees that this pair arrives together and that neither is dismissed for want of a reader nobody could write"),
+    ),
 ];
 
 /// How many `Gap` entries the census left. A new series that no face reads and
@@ -2712,7 +2724,18 @@ const UNREAD: &[(&str, Unread)] = &[
 /// discipline this constant's own history asks for, and this is the first entry
 /// whose reason named the series that would close it rather than a bound nobody
 /// had declared.
-const GAPS_AT_CENSUS: usize = 21;
+///
+/// It went to 23 in the pass that published the handoff pair. The defect that
+/// prompted them was a table that had never been written to while every series
+/// around it looked healthy, so both were minted to make the middle of that path
+/// visible: what a drain took, what it handed on, and how many writes failed.
+/// Neither has a reader, and neither can have one of the kind this census
+/// counts -- their deciding operand is a row count in Postgres, which no rule or
+/// panel can query -- so both are filed as gaps whose reason names the
+/// comparison a reading script has to make instead. They arrive together
+/// deliberately: one without the other still cannot say whether the fault is in
+/// the consumer or in the write.
+const GAPS_AT_CENSUS: usize = 23;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {

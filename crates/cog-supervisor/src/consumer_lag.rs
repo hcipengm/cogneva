@@ -62,3 +62,42 @@ pub async fn record_consumer_lag(
         tracing::warn!(error = %e, consumer, "could not record the events this consumer missed");
     }
 }
+
+/// 记下这一趟 drain 取走了几条、又交出几条。
+///
+/// 每趟写一次，写入的值是这一趟取走 / 交出的事件条数。`consumed` 那本登记表的 HELP
+/// 明说按事件写的族不许混进按趟写的量（同一个名字下 `rate()` 会变成两种意思），而这条
+/// drain 一趟最多取 1024 条，按事件写就是每个事件两次 SQL——一条把被测量者拖慢的读数。
+/// 单位仍是事件数，所以同窗口 `taken_sum` 与 `attempted_sum` 可以直接比，也可以与存储
+/// 侧的失败计数相减。
+///
+/// 两个 stage 是一对：`taken` 大于 `attempted` 就是「这一趟取到了、没交出去」——
+/// 只看 lag 计数器，它与「这一趟没事干」同形；只看下游表的行数，它与「上游从没
+/// 发过」同形。交出后有没有落库不在这里判：那一片由存储侧的
+/// `cogneva_observability_event_persist_failed_total` 记账，两者相减才是进表的条数。
+pub async fn record_handoff(
+    metrics: &Option<Arc<dyn MetricsBackend>>,
+    consumer: &str,
+    taken: u64,
+    attempted: u64,
+) {
+    let Some(backend) = metrics.as_ref() else {
+        return;
+    };
+    for (stage, count) in [("taken", taken), ("attempted", attempted)] {
+        let labels = HashMap::from([
+            ("consumer".to_string(), consumer.to_string()),
+            ("stage".to_string(), stage.to_string()),
+        ]);
+        if let Err(e) = backend
+            .record_counter(
+                cog_core::metric_names::EVENT_BUS_HANDOFF_TOTAL,
+                count as f64,
+                labels,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, consumer, stage, "cannot record a drain's handoff");
+        }
+    }
+}

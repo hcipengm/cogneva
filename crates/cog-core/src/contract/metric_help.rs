@@ -874,6 +874,41 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          by whoever read it.",
     ),
     (
+        crate::metric_names::EVENT_BUS_HANDOFF_TOTAL.as_str(),
+        "What one batch consumer's drain did in one pass, labelled by \
+         `consumer` and `stage`, written once per pass per stage. The value \
+         on each write is an event count: `stage=\"taken\"` is how many events \
+         the pass removed from its channel and `stage=\"attempted\"` how many \
+         of those it handed to the observability gateway for storage. One \
+         write per pass rather than one per event because each write costs a \
+         sample insert and a total upsert, and paying that per event would \
+         make the reading slow the thing it reads; the per-event counter \
+         beside it keeps its own name for the mirror reason. The pair is what \
+         separates a consumer that runs and hands nothing on from one with \
+         nothing to take: `taken` greater than `attempted` is the first, and \
+         both flat is the second. Both sides are measured in events, so \
+         subtracting the store's own failure count from `attempted` says how \
+         many reached the table -- but read `attempted` against the store's \
+         row count to ask whether the handoff landed at all, because a write \
+         that failed is still counted here.",
+    ),
+    (
+        crate::metric_names::OBSERVABILITY_EVENT_PERSIST_FAILED_TOTAL.as_str(),
+        "Observability events whose write to PostgreSQL failed, one increment \
+         per failed insert. Counted in the store, where the outcome is known, \
+         and deliberately a separate name from the handoff it belongs to: both \
+         are measured in events, but the handoff is a batch written once per \
+         pass by the consumer and this is written once per failure by the \
+         store, so one name for both would put two write cadences and two sets \
+         of labels in one family. It exists because the write \
+         already failed quietly -- the only trace was a warning, which no \
+         reading surface samples -- and a table that stays empty because every \
+         write failed reads the same as one nothing was ever offered. Subtract \
+         it from `cogneva_event_bus_handoff_total{stage=\"attempted\"}` to get \
+         the events that reached the table; alert on this series itself when \
+         the subtraction is the only place the loss shows.",
+    ),
+    (
         crate::metric_names::TOOL_OUTPUT_FETCH_BUDGET_EXHAUSTED_TOTAL.as_str(),
         "Reads of an archived tool output that found the source but stopped \
          short of its bytes because the payload outgrew the byte budget the \

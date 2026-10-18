@@ -494,6 +494,15 @@ impl Supervisor {
             )
             .await;
         }
+        // 每趟都记，包括都是 0 的那一趟：`taken=0` 是一条 0 样本，序列不动才是
+        // 「没跑」——把两者印成同一种安静，正是这条读数要拆开的那一对。
+        crate::consumer_lag::record_handoff(
+            &self.metrics,
+            crate::consumer_lag::LAG_CONSUMER_SUPERVISOR_EVENT_AGGREGATOR,
+            stats.received,
+            stats.republished,
+        )
+        .await;
         if let Some(event) = EventAggregator::build_supervisor_event(
             &stats,
             self.config
