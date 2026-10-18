@@ -23,7 +23,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use cog_core::build_gate::BuildGate;
 use cog_core::config::BuildGateConfig;
 use cog_core::fs_size;
 use cog_core::observability::Observable;
@@ -32,6 +31,7 @@ use cog_reflection::build_cache_readings::{
     OUTCOME_LABEL, OUTCOME_RECLAIMED,
 };
 use cog_reflection::build_cache_reclaim::{plan_reclaim, DISCARDABLE_LEAVES, RESULT_LEAVES};
+use cog_reflection::build_gate::{BuildGate, Exclusion};
 
 /// A two-crate workspace with one path dependency: enough for cargo to hold a
 /// compiled result it can reuse and an incremental state it can keep, and small
@@ -121,13 +121,13 @@ fn build(target: &Path, workspace: &Path, args: &[&str]) -> String {
 
 /// A build gate in force over its own slot directory, so the pass holds the slot
 /// the way the watcher does.
-fn gate(lock_dir: &Path) -> Arc<BuildGate> {
-    Arc::new(BuildGate::new(&BuildGateConfig {
+fn gate(lock_dir: &Path) -> Exclusion {
+    Exclusion(Arc::new(BuildGate::new(&BuildGateConfig {
         enabled: true,
         max_concurrent: 1,
         wait_secs: 0,
         lock_dir: lock_dir.display().to_string(),
-    }))
+    })))
 }
 
 /// Build the fixture from cold, then read the cache the way the watcher does.

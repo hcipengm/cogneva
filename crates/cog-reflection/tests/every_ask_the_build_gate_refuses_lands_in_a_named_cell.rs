@@ -1,7 +1,7 @@
 //! Gate: the works that ask the host-wide build gate for a slot are a closed set.
 //!
 //! `cogneva_build_gate_refused_total` carries an `asker` label and its values are
-//! fixed (`cog_core::build_gate::BUILD_GATE_ASKERS`), because the caller's own
+//! fixed (`cog_reflection::build_gate::BUILD_GATE_ASKERS`), because the caller's own
 //! words are free text — the same words a holder writes into its slot file and a
 //! refusal prints in its warn line — and a free text as a label value would grow
 //! the series set with every call site. The set is what makes the label
@@ -32,7 +32,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use cog_core::build_gate::{BUILD_GATE_ASKERS, BUILD_GATE_ASKER_UNNAMED};
+use cog_reflection::build_gate::{BUILD_GATE_ASKERS, BUILD_GATE_ASKER_UNNAMED};
 
 /// The openings a call site asks through, as the text each one starts with.
 ///

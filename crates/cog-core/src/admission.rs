@@ -1,6 +1,6 @@
 //! 评测驱动的准入闸门：同一台宿主上，这一刻放行几例。
 //!
-//! 与 [`crate::build_gate`] 是两件事，故意不合并。构建闸门的语义是「槽位＝一次构建，
+//! 与 [`crate::contract::build_gate`] 是两件事，故意不合并。构建闸门的语义是「槽位＝一次构建，
 //! 持有一把 flock」；这里的语义是「一个控制器 ＋ 一个会动的界」。两者的持有者、读数与
 //! 生命周期都不同：把「一次构建」与「一格的例」记进同一套会计，谁在占机器就读不出来
 //! 了。共用的是**目录身份**——同一台宿主上的构建方与评测方必须看同一个目录，否则各卡
@@ -156,7 +156,13 @@ fn read_mem_available() -> Option<u64> {
 /// 目录里有哪些 `slot-*.lock`，就是构建方允许有几种槽。目录里没有槽位文件时答案是 0，
 /// 而这与「构建方在另一个目录里」在读数上同形——所以目录身份（`dev:ino`）跟着报出去，
 /// 让读的人自己判断两边是不是同一个目录。
-pub(crate) fn build_slots_held(dir: &Path) -> usize {
+/// Slot files under `dir` that a process is holding right now.
+///
+/// Public because the build gate moved out of this crate and still needs this
+/// count: the occupancy a bound is actually holding is read from the locks
+/// themselves, and a second implementation of "is this slot held" would be a
+/// second answer to the one question two readings are joined on.
+pub fn build_slots_held(dir: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
@@ -554,7 +560,7 @@ pub struct GateReading {
 /// 复用构建闸门那一份，不在这里再写一遍：这两个读数要能**并到同一个目录上**，各写一份
 /// 就等于有两个「同一个目录」的判据，而它们完全可以不一致。
 fn dir_identity(dir: &Path) -> String {
-    crate::build_gate::dir_identity(dir)
+    crate::contract::build_gate::dir_identity(dir)
 }
 
 fn bound_path(dir: &Path) -> PathBuf {

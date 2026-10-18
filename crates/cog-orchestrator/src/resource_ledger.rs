@@ -282,7 +282,7 @@ async fn publish_drops_once(metrics: Option<&Arc<dyn MetricsBackend>>, reported:
     let Some(metrics) = metrics else {
         return;
     };
-    let total = cog_core::build_gate::dropped_resource_events();
+    let total = cog_core::contract::build_gate::dropped_resource_events();
     if total <= *reported {
         return;
     }
@@ -367,7 +367,7 @@ pub fn spawn_resource_ledger_loop(
                     // Drained before the seat is consulted, and unconditionally:
                     // see the module header for why the writing half does not
                     // wait for it.
-                    let events = cog_core::build_gate::drain_resource_events();
+                    let events = cog_core::contract::build_gate::drain_resource_events();
                     pass(&*store, metrics.as_ref(), seated, &mut carry, events).await;
                     publish_drops_once(metrics.as_ref(), &mut reported_drops).await;
                 }

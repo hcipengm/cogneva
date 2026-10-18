@@ -180,7 +180,7 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
     (
         "cogneva_build_gate_slots",
         &["dir", "role"],
-        "crates/cog-core/src/build_gate.rs",
+        "crates/cog-core/src/contract/build_gate.rs",
     ),
     // What the machine could take, against what is being admitted. Its own row
     // because the difference between the two is the whole reading: the ceiling
@@ -189,17 +189,17 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
     (
         "cogneva_build_gate_ceiling",
         &["dir", "role", "dimension"],
-        "crates/cog-core/src/build_gate.rs",
+        "crates/cog-core/src/contract/build_gate.rs",
     ),
     (
         "cogneva_build_gate_in_flight",
         &["dir", "role"],
-        "crates/cog-core/src/build_gate.rs",
+        "crates/cog-core/src/contract/build_gate.rs",
     ),
     (
         "cogneva_build_gate_waiting",
         &["dir", "role"],
-        "crates/cog-core/src/build_gate.rs",
+        "crates/cog-core/src/contract/build_gate.rs",
     ),
     // The two gauges drawn beside the bound. Neither states how much of the
     // bound this process is using -- occupied counts the slot files locked in
@@ -210,47 +210,47 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
     (
         "cogneva_build_gate_occupied",
         &["dir", "role"],
-        "crates/cog-core/src/build_gate.rs",
+        "crates/cog-core/src/contract/build_gate.rs",
     ),
     (
         "cogneva_build_gate_excluded",
         &["dir", "role"],
-        "crates/cog-core/src/build_gate.rs",
+        "crates/cog-core/src/contract/build_gate.rs",
     ),
     (
         "cogneva_build_gate_acquired_total",
         &["dir", "role"],
-        "crates/cog-core/src/build_gate.rs",
+        "crates/cog-core/src/contract/build_gate.rs",
     ),
     (
         "cogneva_build_gate_refused_total",
         &["dir", "role", "reason", "asker"],
-        "crates/cog-core/src/build_gate.rs",
+        "crates/cog-core/src/contract/build_gate.rs",
     ),
     (
         "cogneva_build_gate_wait_ms_total",
         &["dir", "role"],
-        "crates/cog-core/src/build_gate.rs",
+        "crates/cog-core/src/contract/build_gate.rs",
     ),
     (
         "cogneva_build_gate_wait_ms_max",
         &["dir", "role"],
-        "crates/cog-core/src/build_gate.rs",
+        "crates/cog-core/src/contract/build_gate.rs",
     ),
     (
         "cogneva_build_gate_held_ms_total",
         &["dir", "role"],
-        "crates/cog-core/src/build_gate.rs",
+        "crates/cog-core/src/contract/build_gate.rs",
     ),
     (
         "cogneva_build_gate_held_ms_max",
         &["dir", "role"],
-        "crates/cog-core/src/build_gate.rs",
+        "crates/cog-core/src/contract/build_gate.rs",
     ),
     (
         "cogneva_build_gate_wait_budget_ms",
         &["dir", "role"],
-        "crates/cog-core/src/build_gate.rs",
+        "crates/cog-core/src/contract/build_gate.rs",
     ),
     // What each change's release build cost the host. Every reading carries the
     // change kind, because the decision these panels feed is which kind of

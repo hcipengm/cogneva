@@ -57,7 +57,7 @@ async fn a_refused_slot_leaves_the_tree_uncommitted() {
     std::fs::write(repo.path().join("b.txt"), "change\n").unwrap();
 
     let lock_dir = tempfile::tempdir().unwrap();
-    let gate = cog_core::build_gate::install(&cog_core::config::BuildGateConfig {
+    let gate = cog_reflection::build_gate::install(&cog_core::config::BuildGateConfig {
         enabled: true,
         max_concurrent: 1,
         wait_secs: 0,

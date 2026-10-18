@@ -2399,7 +2399,7 @@ impl ChangePipeline {
         // The heaviest build this host runs, so it is the one the slot exists
         // for. Bound to a named variable, not `_`: an underscore drops the
         // permit on the spot and would bound nothing at all.
-        let _slot = cog_core::build_gate::acquire("change verification").await?;
+        let _slot = crate::build_gate::acquire("change verification").await?;
         let mut cmd = tokio::process::Command::new(program);
         cmd.args(&self.test_command[1..])
             .current_dir(workdir)
@@ -2527,7 +2527,7 @@ impl ChangePipeline {
             Some(argv) => Some(argv),
             None => None,
         };
-        let _slot = cog_core::build_gate::acquire("change lint verification").await?;
+        let _slot = crate::build_gate::acquire("change lint verification").await?;
         let (line, passed, output) = match declared {
             Some(argv) => {
                 let line = argv.join(" ");

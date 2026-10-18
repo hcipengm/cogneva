@@ -9,7 +9,7 @@
 //!
 //! The `dir` label carries a `dev:ino` identity rather than a path, which is
 //! what makes two caches behind one path two series instead of one sum. See
-//! [`crate::build_gate::dir_identity`].
+//! [`crate::contract::build_gate::dir_identity`].
 //!
 //! What each series says, and the rules that read them, are documented where
 //! they are produced: the cap family's semantics are the ones a reclaim pass

@@ -1838,6 +1838,7 @@ dependencies = [
  "cog-core",
  "cog-prompt",
  "cog-storage",
+ "libc",
  "schemars",
  "serde",
  "serde_json",

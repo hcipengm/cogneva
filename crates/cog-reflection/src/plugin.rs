@@ -1164,8 +1164,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 // instead of locking a private copy of the directory. Here
                 // because nothing above builds and the spawns below move the
                 // config into their closures.
-                let build_gate =
-                    cog_core::build_gate::install_for(&build_gate_cfg, executor_enabled);
+                let build_gate = crate::build_gate::install_for(&build_gate_cfg, executor_enabled);
                 ctx.publish_observable(build_gate);
 
                 // What the shared build cache holds, layer by layer. Published

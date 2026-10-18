@@ -114,8 +114,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use tracing::{info, warn};
 
-use crate::build_gate::{dir_identity, BuildGate};
 use crate::config::CacheCapSetting;
+use crate::contract::build_gate::dir_identity;
 use crate::fs_size::{self, FileEntry};
 use crate::observability::{DimensionSpec, Observable, RawMetric, TraceFragment};
 use crate::{SFResult, ShutdownSignal};
@@ -160,24 +160,6 @@ pub trait CacheSlot: Send + Sync {
     /// forever rather than handing one out -- refusing to delete is the only
     /// safe answer to "I do not know", and it is counted as [`OUTCOME_BUSY`].
     async fn take(&self) -> Option<Box<dyn Send + Sync>>;
-}
-
-/// The host-wide build gate *is* the slot for the process that runs a
-/// deployment's own builds: it is what bounds how many of them run at once, and
-/// a pass excludes itself from all of them rather than from one, because the
-/// files it deletes are ones any build could be reading.
-#[async_trait]
-impl CacheSlot for Arc<BuildGate> {
-    fn in_force(&self) -> bool {
-        self.as_ref().in_force()
-    }
-
-    async fn take(&self) -> Option<Box<dyn Send + Sync>> {
-        match self.try_acquire_exclusive("build-cache-reclaim").await {
-            Ok(permit) => Some(Box::new(permit)),
-            Err(_) => None,
-        }
-    }
 }
 
 /// What the last pass left behind.
@@ -852,7 +834,7 @@ pub fn spawn_build_cache_watch(
                             // built beside it, so a slot captured once could be
                             // the empty one and the cap would then be reported as
                             // unenforceable for the life of the process.
-                            let slot = crate::build_gate::global();
+                            let slot = crate::contract::build_gate::cache_slot();
                             readings
                                 .measure_and_enforce(slot.as_ref().map(|g| g as &dyn CacheSlot))
                                 .await;
@@ -1146,14 +1128,48 @@ mod tests {
         assert_ne!(published[0].1, dir.display().to_string());
     }
 
-    /// A gate in force, over its own slot directory.
-    fn gate(lock_dir: &Path, slots: usize, enabled: bool) -> Arc<BuildGate> {
-        Arc::new(BuildGate::new(&crate::config::BuildGateConfig {
-            enabled,
-            max_concurrent: slots,
-            wait_secs: 0,
-            lock_dir: lock_dir.display().to_string(),
-        }))
+    /// A cache slot a test controls, in place of the host-wide build gate.
+    ///
+    /// The gate itself lives where builds run (`cog-reflection::build_gate`),
+    /// and this crate cannot name it. What the pass reads from a slot is two
+    /// answers -- whether anything bounds builds here, and a hold that is
+    /// `None` while one is running -- so these tests vary exactly those two.
+    /// That the real gate answers them, and answers them over the slot
+    /// directory, is asserted where the gate is defined.
+    fn gate(in_force: bool) -> Arc<TestSlot> {
+        Arc::new(TestSlot {
+            in_force,
+            held: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    struct TestSlot {
+        in_force: bool,
+        held: std::sync::atomic::AtomicBool,
+    }
+
+    /// The hold `take` hands out; dropping it releases the slot, as dropping a
+    /// build's permit does.
+    struct Held(Arc<TestSlot>);
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            self.0.held.store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl CacheSlot for Arc<TestSlot> {
+        fn in_force(&self) -> bool {
+            self.in_force
+        }
+
+        async fn take(&self) -> Option<Box<dyn Send + Sync>> {
+            if self.held.swap(true, Ordering::SeqCst) {
+                return None;
+            }
+            Some(Box::new(Held(self.clone())))
+        }
     }
 
     /// A cache on disk: `(relative path, bytes)` under a fresh directory.
@@ -1188,7 +1204,7 @@ mod tests {
     async fn run_a_pass_when_the_slot_is_free(
         readings: &BuildCacheReadings,
         files: &[FileEntry],
-        gate: &Arc<BuildGate>,
+        gate: &Arc<TestSlot>,
     ) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
@@ -1231,7 +1247,6 @@ mod tests {
     /// it.
     #[tokio::test]
     async fn a_cache_over_its_cap_is_brought_under_it() {
-        let lock = tempfile::tempdir().unwrap();
         let (root, files) = cache(&[
             ("release/incremental/one", 1000),
             ("release/incremental/two", 1000),
@@ -1240,9 +1255,7 @@ mod tests {
         ]);
         let readings = BuildCacheReadings::new(root.path()).with_cap(3000, 300);
 
-        readings
-            .enforce_cap(&files, Some(&gate(lock.path(), 1, true)))
-            .await;
+        readings.enforce_cap(&files, Some(&gate(true))).await;
 
         assert_eq!(on_disk(root.path()), 3000, "the excess must leave the disk");
         assert_eq!(
@@ -1275,9 +1288,8 @@ mod tests {
     /// waits for the next walk, and says which of the two it was.
     #[tokio::test]
     async fn a_build_in_flight_defers_the_pass_rather_than_deleting() {
-        let lock = tempfile::tempdir().unwrap();
-        let gate = gate(lock.path(), 1, true);
-        let held = gate.try_acquire("a build").await.unwrap();
+        let gate = gate(true);
+        let held = CacheSlot::take(&gate).await.unwrap();
         let (root, files) = cache(&[
             ("release/incremental/one", 1000),
             ("release/incremental/two", 1000),
@@ -1325,14 +1337,11 @@ mod tests {
     /// its own.
     #[tokio::test]
     async fn nothing_is_removed_without_a_slot_in_force() {
-        let lock = tempfile::tempdir().unwrap();
         let (root, files) = cache(&[("release/incremental/one", 1000)]);
         let readings = BuildCacheReadings::new(root.path()).with_cap(1, 300);
 
         readings.enforce_cap(&files, None).await;
-        readings
-            .enforce_cap(&files, Some(&gate(lock.path(), 1, false)))
-            .await;
+        readings.enforce_cap(&files, Some(&gate(false))).await;
 
         assert_eq!(on_disk(root.path()), 1000);
         assert_eq!(
@@ -1355,13 +1364,10 @@ mod tests {
     /// silence, and the floor's file is still on disk.
     #[tokio::test]
     async fn a_cap_under_the_floor_is_reported_as_unmet() {
-        let lock = tempfile::tempdir().unwrap();
         let (root, files) = cache(&[("release/incremental/one", 1000)]);
         let readings = BuildCacheReadings::new(root.path()).with_cap(1, 300);
 
-        readings
-            .enforce_cap(&files, Some(&gate(lock.path(), 1, true)))
-            .await;
+        readings.enforce_cap(&files, Some(&gate(true))).await;
 
         assert_eq!(on_disk(root.path()), 1000, "the floor holds the only file");
         assert_eq!(
@@ -1380,13 +1386,10 @@ mod tests {
     /// bytes that is inside it.
     #[tokio::test]
     async fn an_uncapped_cache_is_measured_and_left_alone() {
-        let lock = tempfile::tempdir().unwrap();
         let (root, files) = cache(&[("release/incremental/one", 1000)]);
         let readings = BuildCacheReadings::new(root.path());
 
-        readings
-            .enforce_cap(&files, Some(&gate(lock.path(), 1, true)))
-            .await;
+        readings.enforce_cap(&files, Some(&gate(true))).await;
 
         assert_eq!(on_disk(root.path()), 1000);
         readings.set_layers(
@@ -1423,8 +1426,7 @@ mod tests {
     /// pass, which a cache that spent the hour under its cap has too.
     #[tokio::test]
     async fn the_over_cap_run_is_ended_by_a_walk_under_the_cap_and_not_by_a_pass() {
-        let lock = tempfile::tempdir().unwrap();
-        let gate = gate(lock.path(), 1, true);
+        let gate = gate(true);
         let (root, over) = cache(&[("release/incremental/one", 4000)]);
         let readings = BuildCacheReadings::new(root.path()).with_cap(1000, 300);
 

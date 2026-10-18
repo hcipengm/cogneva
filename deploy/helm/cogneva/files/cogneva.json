@@ -1037,6 +1037,15 @@
           "summary": "a process that runs builds has had no build gate in force for 5 minutes: concurrent builds in it are unbounded again, and the refusal counter cannot show this because nothing is being refused -- nothing is being bounded. Usually the slot directory could not be created or written (the gate is installed but not in force, and the reason is in the warning it logged at startup), or the gate is switched off in configuration. Read the dir label on cogneva_build_gate_slots: a builder whose dir differs from the other builders' is bounding only itself The label set is reduced to the dir and role that identify the builder: the pod running it is recreated on every rollout, and keying on it re-opened this alert for a builder whose gate state had not changed."
         },
         {
+          "name": "build_gate_slot_held_too_long",
+          "promql": "max by (dir, role, slot, what) (cogneva_build_gate_holder_seconds) > on(dir, role) (2 * max by (dir, role) (cogneva_build_gate_wait_budget_ms) / 1000)",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "the work {what} has held build slot {slot} for {value} seconds, more than twice the wait budget every builder is given: a hold that outlives the budget is a slot nobody else can have, and the refusal counter cannot show it -- that counter exists only where somebody asked while the hold was in force, and the starved case is the ask that stopped being made. The row is read from the lock at scrape time, so a slot whose holder died leaves no row: the lock is asked before the record below it is believed. The holder is named in its own words rather than under a label from a closed set, because the works that take a slot are open, and an unknown holder folded into `other` would be exactly the one to find. The wall is the published wait budget times two, not a fixed number: the budget is what every builder measures its wait against, so a deployment that changes it moves this rule with it. A hold is not by itself wrong -- a build takes as long as it takes -- it is wrong when it is longer than anyone else is willing to wait. Read cogneva_build_gate_slots and cogneva_build_gate_occupied beside it to tell a long hold on a busy gate from a long hold with room to spare, and cogneva_build_gate_ceiling for whether the gate is pressing the bound below what the host could take while this hold lasts."
+        },
+        {
           "name": "evolution_build_failed",
           "promql": "sum by (intent) (increase(cogneva_evolution_build_outcomes_total{outcome=\"failed\"}[6h])) > 0",
           "condition": {

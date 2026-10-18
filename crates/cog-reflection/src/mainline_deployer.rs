@@ -181,7 +181,7 @@ const BUILDAH_STEP_WALLS: &[(&str, u64)] = &[
 ];
 
 /// 推进连输几轮之后，这一方就去**认领下一个构建名额**（见
-/// `cog_core::build_gate::reserve_build_field`）。
+/// `crate::build_gate::reserve_build_field`）。
 ///
 /// 这一方每次都是"顺路看一眼"（零等待），而变更验证是"死等"：界只有 1 的时候，
 /// 死等的那方可以把槽一直握在手里，顺路看的这方每轮都被挡回去，实测连输 20 轮以上
@@ -3145,7 +3145,7 @@ impl MainlineDeployer {
     /// 与回收轮同一个理由要拿构建闸——重启 registry 就是把别人正在推镜像的那个服务端
     /// 换掉。拿不到就下一轮再说：欠账不因为晚一轮变得更多，而一轮里重启两次比晚一轮贵。
     async fn reissue_owed_registry_gc(&self, state: &mut MainlineState, now: i64) {
-        let _slot = match cog_core::build_gate::try_acquire_exclusive("registry gc reissue").await {
+        let _slot = match crate::build_gate::try_acquire_exclusive("registry gc reissue").await {
             Ok(slot) => slot,
             Err(e) => {
                 info!(error = %e, "host is building; deferring the owed registry gc to the next cycle");
@@ -3340,8 +3340,7 @@ impl MainlineDeployer {
         // 排他要拿**每一个**槽（不是"拿一个"）：闸门允许的构建条数是配置项，
         // 拿一个只在这个条数恰好是 1 时才排掉别的构建——那条不变式必须是调用的
         // 性质，不是配置的性质。见 `BuildGate::try_acquire_exclusive`。
-        let _slot = match cog_core::build_gate::try_acquire_exclusive("registry maintenance").await
-        {
+        let _slot = match crate::build_gate::try_acquire_exclusive("registry maintenance").await {
             Ok(slot) => slot,
             Err(e) => {
                 info!(error = %e, "host is building; deferring registry maintenance to the next cycle");
@@ -3474,8 +3473,7 @@ impl MainlineDeployer {
         }
         // 删的是别人可能正在用的基镜像，所以与构建互斥。拿不到就下一轮再看：
         // 宿主在构建时，库恰好也是它正在写的时候。
-        let _slot = match cog_core::build_gate::try_acquire_exclusive("buildah store reclaim").await
-        {
+        let _slot = match crate::build_gate::try_acquire_exclusive("buildah store reclaim").await {
             Ok(slot) => slot,
             Err(e) => {
                 info!(error = %e, "host is building; deferring buildah store reclaim");
@@ -4342,7 +4340,7 @@ impl MainlineDeployer {
         // 罩着整段推进的话，`cogneva_build_gate_held_ms_*` 量到的就不再是"一个
         // 构建占住宿主多久"，别的构建者也在这两段里被拒、而拒因读起来像"宿主在
         // 构建"。拿不到就什么都不做地回下一轮：这时状态还没写。
-        let build_slot = match cog_core::build_gate::try_acquire("mainline advance").await {
+        let build_slot = match crate::build_gate::try_acquire("mainline advance").await {
             Ok(slot) => slot,
             Err(e) => {
                 // 被挡住的每一轮在日志里都和上一轮一模一样：同一个请求者、同一句
@@ -4356,7 +4354,7 @@ impl MainlineDeployer {
                 // 那一半没变——这一轮照旧什么都不做地回下一轮（见
                 // `ADVANCE_CLAIM_AFTER_DEFERRALS`）。
                 if state.advance_deferrals >= ADVANCE_CLAIM_AFTER_DEFERRALS {
-                    cog_core::build_gate::reserve_build_field("mainline advance");
+                    crate::build_gate::reserve_build_field("mainline advance");
                 }
                 info!(
                     deferrals = state.advance_deferrals,

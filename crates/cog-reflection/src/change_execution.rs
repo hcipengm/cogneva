@@ -521,7 +521,7 @@ pub async fn execute(request: &ChangeExecutionRequest) -> (i32, ChangeExecutionO
     // 构建闸门装在本进程里：执行方也是一个构建方，槽位文件在共享文件系统上，与
     // 常驻进程用的是同一个目录。不装的话「宿主同时只跑一个构建」就退化成每个进程
     // 各自成立的空话，而这一项的整个前提正是两个执行器不会互相踩。
-    let _ = cog_core::build_gate::install_for(&world.build_gate, true);
+    let _ = crate::build_gate::install_for(&world.build_gate, true);
 
     let workspaces =
         WorkspaceManager::new(&world.bare_repo, &world.workspace_root, &world.target_dir);

@@ -79,11 +79,26 @@ const PRODUCED: &[(&str, &str)] = &[
     ),
     (
         "cogneva_build_gate_refused_total",
-        "crates/cog-core/src/build_gate.rs",
+        "crates/cog-core/src/contract/build_gate.rs",
     ),
     (
         "cogneva_build_gate_slots",
-        "crates/cog-core/src/build_gate.rs",
+        "crates/cog-core/src/contract/build_gate.rs",
+    ),
+    // How long each held slot has been held, read by the rule that fires on a
+    // hold longer than anyone is willing to wait. The refusal counter beside it
+    // only exists where someone asked, and the starved case is the ask that
+    // stopped being made.
+    (
+        "cogneva_build_gate_holder_seconds",
+        "crates/cog-core/src/contract/build_gate.rs",
+    ),
+    // The wall the hold rule is measured against. Published rather than
+    // written into the rule as a constant so a deployment that changes the
+    // budget moves the alert with it.
+    (
+        "cogneva_build_gate_wait_budget_ms",
+        "crates/cog-core/src/contract/build_gate.rs",
     ),
     // The cap family, as far as the rules read it. `unmet` is what says a pass
     // ran and could not reach the cap; the other two are the pair a stalled cap

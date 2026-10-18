@@ -1,5 +1,13 @@
 //! A host-wide gate on how many builds run at once.
 //!
+//! The gate lives here, beside the builds it bounds, and not in `cog-core`:
+//! what it does is take locks and sample the host, which is the business of the
+//! crate that runs builds. The names it publishes under, the identity of the
+//! slot directory and the registration point through which the rest of the
+//! workspace reaches the installed gate are in `cog_core::contract::build_gate`
+//! -- a crate that only reads these series must not have to depend on the
+//! machinery that produces them.
+//!
 //! Builds and the cluster share one host, and a `cargo build --release` plus a
 //! `cargo test --workspace` in parallel is enough to take that host to its
 //! knees: the machine pages instead of refusing, so every workload on it
@@ -98,6 +106,10 @@
 //! Counting them into the maximum instead would compare two different events
 //! under one name.
 
+pub mod arming;
+
+pub use arming::{effective_config, effective_gate_for};
+
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -106,124 +118,13 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
-use crate::admission::{sample, Pressure};
-use crate::config::BuildGateConfig;
-use crate::contract::observability::{DimensionSpec, Observable, RawMetric, TraceFragment};
-use crate::contract::resource_ledger::{ResourceEvent, ResourceEventKind, ResourceEventOutcome};
-use crate::{SFError, SFResult};
-
-/// Builds holding a slot in this process, as a gauge.
-pub const BUILD_GATE_IN_FLIGHT: &str = "cogneva_build_gate_in_flight";
-/// Slot files locked right now in the shared directory, as a gauge: every
-/// builder on the host counted, this process and any other alike.
-///
-/// Published beside [`BUILD_GATE_IN_FLIGHT`] because the two answer different
-/// questions, and only the difference between them is the one this series
-/// exists for. The in-flight gauge counts what *this* process is running, so a
-/// builder that is not this process is invisible in it; this one is read from
-/// the locks themselves, which is the only reading that does not depend on the
-/// other builder being cooperative. What it is for: the bound in
-/// [`BUILD_GATE_SLOTS`] is a number of slot files, and the claim a bound is
-/// actually holding is that at most that many builds run on this host at once.
-/// Two series of build activity that never meet leave that claim unreadable --
-/// one process admitting up to its bound while another builds beside it looks
-/// exactly like one process admitting up to its bound, and the difference is
-/// whether the host is carrying one build or two.
-pub const BUILD_GATE_OCCUPIED: &str = "cogneva_build_gate_occupied";
-/// Holders that are not builds and hold every slot to keep them out, as a gauge:
-/// 1 while such a caller is excluding builds, 0 otherwise.
-///
-/// Its own series because it answers the question a refusal raises — "who took
-/// the slot, a build or something else?" — and every other reading here answers
-/// it wrongly: the in-flight gauge and the held readings count builds, so
-/// folding a cache sweep or a registry restart into them would report it as a
-/// build that occupied the host for as long as it ran, and would leave a refusal
-/// it caused pointing at a build that does not exist. What the exclusion
-/// *achieves* is counted by its own callers, at the work being deferred.
-pub const BUILD_GATE_EXCLUDED: &str = "cogneva_build_gate_excluded";
-/// Builds waiting for a slot in this process, as a gauge.
-pub const BUILD_GATE_WAITING: &str = "cogneva_build_gate_waiting";
-/// Slots this gate permits, as a gauge; 0 when the gate is not in force.
-///
-/// The bound in force right now, which on a gate that derives its bound is a
-/// measurement rather than a setting: it moves with the host, and it is read
-/// beside [`BUILD_GATE_CEILING`], which is the same quantity before the
-/// control law has had its say.
-pub const BUILD_GATE_SLOTS: &str = "cogneva_build_gate_slots";
-/// The most builds the host could take right now, as a gauge, carrying the
-/// dimension that is setting it.
-///
-/// Published apart from [`BUILD_GATE_SLOTS`] because the two answer different
-/// questions and only their difference is actionable: the ceiling says what the
-/// machine can absorb, the bound says what is being admitted, and a bound below
-/// its ceiling is the control law holding back (which is what it is told to do
-/// until the host has been calm for a while). The `dimension` label is which one
-/// is tightest — a bound of one because the disk is saturated is a different
-/// fact from a bound of one because the memory floor is in sight, or because the
-/// container's own limit is, and the number alone cannot tell them apart.
-pub const BUILD_GATE_CEILING: &str = "cogneva_build_gate_ceiling";
-/// Builds that have taken a slot, as a counter.
-pub const BUILD_GATE_ACQUIRED_TOTAL: &str = "cogneva_build_gate_acquired_total";
-/// Builds that were refused a slot, as a counter, by `reason`: the wall that
-/// turned the build away.
-///
-/// The walls do not all share an owner — a build that found every slot taken
-/// (`busy`, `waited_out`) is a capacity reading, a sweep or registry restart
-/// holding the field (`maintenance_hold`) is maintenance standing the builds
-/// down on purpose, and another work's reservation (`queue_ahead`) is the queue
-/// doing its job — and one number over all four cannot say which of them is
-/// happening. Summed over `reason` this is the number the counter carried
-/// before the label existed, so a reader that wants the old total keeps it.
-///
-/// It carries `asker` for the same reason read the other way: the walls do not
-/// fall on the works alike, so a refusal count says which wall and not who paid
-/// for it, and a work refused every round is the one a reader has to find. See
-/// [`BUILD_GATE_ASKERS`] for the closed set and for why the caller's own words
-/// are not the label. Summed over `asker` this is likewise the number the
-/// counter carried before that label existed.
-pub const BUILD_GATE_REFUSED_TOTAL: &str = "cogneva_build_gate_refused_total";
-/// Time builds have spent waiting for a slot, in milliseconds, summed over the
-/// builds that went on to take one.
-///
-/// Divided by [`BUILD_GATE_ACQUIRED_TOTAL`] this is the queue delay of a build
-/// that ran; it is not divided here because the division belongs to whoever
-/// picks the window, and a mean published by the producer would be a mean over
-/// the process's whole life, which is history rather than a reading.
-pub const BUILD_GATE_WAIT_MS_TOTAL: &str = "cogneva_build_gate_wait_ms_total";
-/// The longest a single build has waited before taking a slot, in milliseconds.
-///
-/// A mean cannot show whether a bound is mildly tight or whether one build
-/// waited out the whole budget while others walked straight in, and the second
-/// is the case that sizes the bound. A high-water mark of this process: after a
-/// restart it reads lower than the host has seen, so it is a floor.
-pub const BUILD_GATE_WAIT_MS_MAX: &str = "cogneva_build_gate_wait_ms_max";
-/// Time builds have spent holding slots, in milliseconds, summed over the same
-/// builds as [`BUILD_GATE_WAIT_MS_TOTAL`].
-///
-/// This is what a build occupies the host for, and the budget on it is the wait
-/// budget: a builder that holds a slot for longer than everyone is willing to
-/// wait is a bound that refuses everyone else.
-pub const BUILD_GATE_HELD_MS_TOTAL: &str = "cogneva_build_gate_held_ms_total";
-/// The longest single slot hold, in milliseconds. A high-water mark.
-pub const BUILD_GATE_HELD_MS_MAX: &str = "cogneva_build_gate_held_ms_max";
-/// How long a build is willing to wait for a slot, in milliseconds; 0 when no
-/// gate is in force.
-///
-/// The wall the wait is measured against: a wait that reached this value either
-/// took the slot at the buzzer or was refused, and without the wall on the same
-/// axis a wait of 25s reads as small or as enormous depending on the deployment
-/// it is not shown beside.
-pub const BUILD_GATE_WAIT_BUDGET_MS: &str = "cogneva_build_gate_wait_budget_ms";
-/// Name of the rule that reads the refusal counter, so the pairing can be asserted.
-pub const BUILD_GATE_RULE: &str = "build_gate_refused";
-/// Name of the rule that reads the slot count of a process that runs builds, so
-/// the pairing can be asserted.
-pub const BUILD_GATE_IN_FORCE_RULE: &str = "build_gate_not_in_force";
-
-/// Label value for a process that runs builds and therefore took the gate.
-pub const BUILD_GATE_ROLE_BUILDER: &str = "builder";
-/// Label value for a process that runs no builds and publishes zero rows.
-pub const BUILD_GATE_ROLE_CONTROL_PLANE: &str = "control-plane";
+use cog_core::admission::{sample, Pressure};
+use cog_core::build_cache_readings::CacheSlot;
+use cog_core::config::BuildGateConfig;
+use cog_core::contract::build_gate::*;
+use cog_core::contract::observability::{DimensionSpec, Observable, RawMetric, TraceFragment};
+use cog_core::contract::resource_ledger::{ResourceEvent, ResourceEventKind, ResourceEventOutcome};
+use cog_core::{SFError, SFResult};
 
 /// How much of one cpu a build of this workspace draws on the host, over its
 /// life.
@@ -369,6 +270,10 @@ pub fn install(cfg: &BuildGateConfig) -> Arc<BuildGate> {
     GLOBAL
         .get_or_init(|| {
             let gate = Arc::new(BuildGate::new(cfg));
+            // The same object, reachable from `cog-core`: the cache pass reads
+            // it as its slot and the resource account drains the events it
+            // queued, and neither of them can name this crate.
+            install_global(Arc::new(RegisteredGate(Arc::clone(&gate))));
             if gate.in_force() {
                 tracing::info!(
                     configured = cfg.max_concurrent,
@@ -395,17 +300,65 @@ pub fn global() -> Option<Arc<BuildGate>> {
     GLOBAL.get().cloned()
 }
 
-/// Hands this process's queued resource events to the account's consumer.
+/// The gate as `cog-core` reaches it.
 ///
-/// Empty when no gate is in force: a process that bounds no builds makes no
-/// decisions about the host, so it has no events about the bound to report.
-pub fn drain_resource_events() -> Vec<ResourceEvent> {
-    global().map(|gate| gate.drain_events()).unwrap_or_default()
+/// The wrapper exists because the exclusion is asked for on an `Arc<BuildGate>`
+/// -- the permit keeps the gate alive while it is held -- and because the gate
+/// itself does not depend on `cog-core`'s traits. What the account and the cache
+/// pass see is the three answers below, taken from the process-wide gate.
+
+/// The host-wide build gate, handed to the cache pass as its exclusion.
+///
+/// The wrapper rather than a bare `Arc<BuildGate>` because `CacheSlot` is
+/// `cog-core`'s trait and neither it nor `Arc` is this crate's to implement
+/// against: the hold, the lock it takes and the refusal it reports are the
+/// gate's own, and this only names them.
+pub struct Exclusion(pub Arc<BuildGate>);
+
+/// The host-wide build gate *is* the slot for the process that runs a
+/// deployment's own builds: it is what bounds how many of them run at once,
+/// and a pass excludes itself from all of them rather than from one, because
+/// the files it deletes are ones any build could be reading.
+#[async_trait]
+impl CacheSlot for Exclusion {
+    fn in_force(&self) -> bool {
+        self.0.in_force()
+    }
+
+    async fn take(&self) -> Option<Box<dyn Send + Sync>> {
+        match self.0.try_acquire_exclusive("build-cache-reclaim").await {
+            Ok(permit) => Some(Box::new(permit)),
+            Err(_) => None,
+        }
+    }
 }
 
-/// How many events a full ring pushed out before a consumer took them.
-pub fn dropped_resource_events() -> u64 {
-    global().map(|gate| gate.events_dropped()).unwrap_or(0)
+struct RegisteredGate(Arc<BuildGate>);
+
+#[async_trait]
+impl ProcessGate for RegisteredGate {
+    fn in_force(&self) -> bool {
+        self.0.in_force()
+    }
+
+    /// The host-wide build gate *is* the slot for the process that runs a
+    /// deployment's own builds: it is what bounds how many of them run at once,
+    /// and a pass excludes itself from all of them rather than from one,
+    /// because the files it deletes are ones any build could be reading.
+    async fn take_for_reclaim(&self) -> Option<Box<dyn Send + Sync>> {
+        match self.0.try_acquire_exclusive("build-cache-reclaim").await {
+            Ok(permit) => Some(Box::new(permit)),
+            Err(_) => None,
+        }
+    }
+
+    fn drain_events(&self) -> Vec<ResourceEvent> {
+        BuildGate::drain_events(&self.0)
+    }
+
+    fn events_dropped(&self) -> u64 {
+        BuildGate::events_dropped(&self.0)
+    }
 }
 
 /// What a process should publish about the build bound, given whether it runs
@@ -818,6 +771,7 @@ fn cpu_times() -> Option<(usize, u64, u64)> {
 /// One value rather than two, because the two label every metric in the set and
 /// neither means anything without the other: a `role` with no `dir` names a side
 /// of no particular gate, and two gates on one host would merge into one series.
+#[derive(Clone, Copy)]
 struct Origin<'a> {
     dir: &'a str,
     role: &'a str,
@@ -1995,8 +1949,10 @@ impl Drop for BuildPermit {
 /// wrongly: that counter is per requester, so sixty refusals of one work read
 /// the same whether they were sixty different holders or one work that never let
 /// go. The holder's own `what` is what tells those apart, which is why it is
-/// carried on the refusal rather than published as a series of its own with no
-/// rule to read it.
+/// carried on the refusal; [`BUILD_GATE_HOLDER_SECONDS`] publishes the same
+/// holder as a value, because a refusal only exists for an ask that was made
+/// while the hold was in force, and the starved ask is the one that stopped
+/// being made.
 struct Holder {
     what: String,
     pid: u32,
@@ -2117,6 +2073,30 @@ fn holder_report(dir: &Path, slots: usize) -> String {
     }
 }
 
+/// The same holders as [`holder_report`], as a series rather than a sentence.
+///
+/// Read at scrape time and not written by the holders: a holder that only
+/// published at acquisition would leave its row behind after it died, and a
+/// holder that publishes on a timer is a writer that has to be added to every
+/// caller. The lock already says whether the record below it still has a
+/// subject, so the reading is taken from the same place the refusal takes its
+/// answer from.
+///
+/// Rows exist only for slots that are held: a free slot has no `what` to carry,
+/// and `BUILD_GATE_OCCUPIED` already counts how many are taken.
+fn holder_metrics(dir: &Path, slots: usize, origin: &Origin<'_>) -> Vec<RawMetric> {
+    (0..slots)
+        .filter_map(|slot| read_holder(dir, slot).map(|(h, held)| (slot, h, held)))
+        .map(|(slot, holder, held)| {
+            RawMetric::new(BUILD_GATE_HOLDER_SECONDS, held.as_secs_f64())
+                .with_label("dir", origin.dir.to_string())
+                .with_label("role", origin.role.to_string())
+                .with_label("slot", slot.to_string())
+                .with_label("what", holder.what)
+        })
+        .collect()
+}
+
 fn create_slot_dir(dir: &Path) -> SFResult<()> {
     std::fs::create_dir_all(dir)
         .map_err(|e| SFError::IO(format!("create build gate dir {}: {e}", dir.display())))?;
@@ -2231,28 +2211,6 @@ fn open_gate_dir(dir: &Path) {
             );
         }
     }
-}
-
-/// `dev:ino` of a directory, read from the filesystem rather than remembered, so
-/// the reading follows the directory the gate actually bounds.
-///
-/// Public because it is the identity of a directory rather than of the gate: any
-/// reading that has to tell "the same path" from "the same directory" publishes
-/// this value, and a reader can then join those readings to one directory. Two
-/// workloads mount different volumes at the same path, and a label carrying the
-/// path would merge their readings into one number.
-#[cfg(unix)]
-pub fn dir_identity(dir: &Path) -> String {
-    use std::os::unix::fs::MetadataExt;
-    match std::fs::metadata(dir) {
-        Ok(md) => format!("{}:{}", md.dev(), md.ino()),
-        Err(_) => "absent".to_string(),
-    }
-}
-
-#[cfg(not(unix))]
-pub fn dir_identity(_dir: &Path) -> String {
-    "unsupported".to_string()
 }
 
 /// Takes the exclusive lock on one slot file, or reports that someone else has it.
@@ -2435,18 +2393,27 @@ impl Observable for BuildGate {
         // is what the host is carrying and not what this process is doing with
         // it: a builder that is not this process does not report to this
         // process, and its hold is visible exactly where it put it.
-        Ok(readings(
+        let identity = self.identity();
+        let origin = Origin {
+            dir: &identity,
+            role: BUILD_GATE_ROLE_BUILDER,
+        };
+        let mut metrics = readings(
             slots,
-            crate::admission::build_slots_held(&self.dir),
+            cog_core::admission::build_slots_held(&self.dir),
             ceiling,
             dimension,
             self.counters(),
-            Origin {
-                dir: &self.identity(),
-                role: BUILD_GATE_ROLE_BUILDER,
-            },
+            origin,
             self.wait_budget_ms(),
-        ))
+        );
+        // The holds are read from the same directory the occupancy count comes
+        // from, and for the same reason: what matters is who is on the host, not
+        // who asked this process. Published as a value beside the refusal that
+        // names the same holder, because the refusal only exists for an ask that
+        // happened to be made while the hold was in force.
+        metrics.extend(holder_metrics(&self.dir, slots, &origin));
+        Ok(metrics)
     }
 
     async fn collect_trace(&self, _task_id: &str) -> SFResult<Vec<TraceFragment>> {
@@ -2630,6 +2597,42 @@ mod tests {
         );
 
         drop(held);
+    }
+
+    /// The hold as a value, not only as a sentence inside a refusal: a refusal
+    /// exists only for an ask that was made while the hold was in force, and the
+    /// starved case is the one where the waiter stopped asking. Published at
+    /// scrape time so it can be read long after the last refusal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_held_slot_publishes_its_holder_and_its_tenure() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 0);
+
+        let held = gate.try_acquire("change verification").await.unwrap();
+        let metrics = gate.collect_metrics("D5").await.unwrap();
+        let row = metrics
+            .iter()
+            .find(|m| m.name == BUILD_GATE_HOLDER_SECONDS)
+            .expect("a taken slot is a hold, and a hold names its holder");
+        assert_eq!(
+            row.labels.get("what").map(String::as_str),
+            Some("change verification"),
+            "the holder's own words, not a label from a closed set"
+        );
+        assert_eq!(
+            row.labels.get("slot").map(String::as_str),
+            Some("0"),
+            "which slot the hold is on"
+        );
+        assert!(row.value >= 0.0, "tenure is seconds since the claim");
+
+        drop(held);
+        let after = gate.collect_metrics("D5").await.unwrap();
+        assert!(
+            !after.iter().any(|m| m.name == BUILD_GATE_HOLDER_SECONDS),
+            "a free slot has no holder to publish"
+        );
     }
 
     /// The record outlives the holder: a process that dies leaves the line it

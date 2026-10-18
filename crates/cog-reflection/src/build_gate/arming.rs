@@ -1,8 +1,8 @@
-//! How the executor arms the host-wide build gate (`cog_core::build_gate`)
+//! How the executor arms the host-wide build gate (`crate::build_gate`)
 //! from the configuration it was handed.
 //!
 //! The gate itself — slot files, flocks, counters — lives in
-//! `cog_core::build_gate`. What lives here is the decision about the *numbers*,
+//! `crate::build_gate`. What lives here is the decision about the *numbers*,
 //! because the one mis-set number that keeps hurting is the wait budget: with a
 //! bound of a single slot, a queued one-shot build (a change verification has no
 //! next cycle to come back to) waits behind a holder whose own work is bounded

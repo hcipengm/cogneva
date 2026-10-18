@@ -169,7 +169,7 @@ impl EvolutionDeployer {
         // refuses with the one error it has, and nothing after this point can
         // produce it, so a refused build never reaches the rollback. It is
         // recorded as a build that never ran, which is what it was.
-        let build_slot = match cog_core::build_gate::acquire("evolution build").await {
+        let build_slot = match crate::build_gate::acquire("evolution build").await {
             Ok(slot) => slot,
             Err(e) => {
                 warn!(
@@ -297,7 +297,7 @@ impl EvolutionDeployer {
     async fn run_cargo_build(
         &self,
         workdir: &Path,
-        _slot: Option<cog_core::build_gate::BuildPermit>,
+        _slot: Option<crate::build_gate::BuildPermit>,
         intent: Option<EvolutionIntent>,
     ) -> SFResult<()> {
         let mut cmd = tokio::process::Command::new("cargo");

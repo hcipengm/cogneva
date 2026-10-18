@@ -74,7 +74,7 @@ async fn a_refused_slot_keeps_the_change_alive_and_the_tree_clean() {
     };
 
     let lock_dir = tempfile::tempdir().unwrap();
-    let gate = cog_core::build_gate::install(&BuildGateConfig {
+    let gate = cog_reflection::build_gate::install(&BuildGateConfig {
         enabled: true,
         max_concurrent: 1,
         wait_secs: 0,
