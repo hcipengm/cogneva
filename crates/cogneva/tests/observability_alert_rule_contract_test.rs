@@ -2643,6 +2643,19 @@ const UNREAD: &[(&str, Unread)] = &[
         "cogneva_ready_admission_readings",
         Unread::Gap("the admission pass's own arithmetic, by `stream` and `kind`: the bound it applied (`bounded`, written every pass), the jobs the window could pay for (`window_jobs`, written only when a bound exists), what the queue already owed, and what it admitted. This is a reading rather than a signal -- being bounded is the gate working -- so it has no threshold to fire on, and a rule over it would have to invent a level where bounded becomes wrong. Its reader is the panel above, drawn as the four cells of one pass so an idle pass cannot leave a refusal frozen; that panel is what this debt is owed to"),
     ),
+    // The ceiling each pool was given, by `pool` and by `source`. Being below
+    // the server's allowance is the fix working, so a threshold on the value
+    // would page on health; the reading that matters is `source`, and the rule
+    // that would read it fires on `server_unreadable` alone -- not on
+    // `source != "server"`, which would also wake somebody for `tied` and for a
+    // ceiling deliberately configured lower. That rule was not written in this
+    // pass because it lives in the chart config that three rendered profiles
+    // embed and the static k3s copy mirrors, so it needs a re-render and a
+    // parity sync in the same commit rather than one line in this table.
+    (
+        "cogneva_pg_pool_max_connections",
+        Unread::Gap("this series is the ceiling one pool was given, not how many connections it is holding, so a threshold on the value would page on the fix working. The reader it is owed is an alert rule that fires on `source=\"server_unreadable\"` -- the one value that means the ceiling was never measured against the server -- and adding that rule changes the chart config embedded in three rendered profiles plus the static k3s copy, so it needs a re-render and a parity sync rather than a one-line edit"),
+    ),
 ];
 
 /// How many `Gap` entries the census left. A new series that no face reads and
@@ -2817,7 +2830,7 @@ const UNREAD: &[(&str, Unread)] = &[
 /// drawing the four cells of one pass beside the remaining allowance, and that
 /// panel is what this pass did not write. Recording both is what keeps the
 /// increase a decision rather than a drift.
-const GAPS_AT_CENSUS: usize = 26;
+const GAPS_AT_CENSUS: usize = 27;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {
