@@ -716,6 +716,18 @@ backends:
     enabled: true
     image: redis:7-alpine
     storage: 5Gi
+    # 内存上限走 values，不再写死在模板里：数据集本身就有 485MB（启动日志里的
+    # 「RDB memory usage when created: 485.56 Mb」），512Mi 只剩约 27MB 给 AOF
+    # 增量与写缓冲，2026-10-19 的那一轮重建后每轮启动约 20 秒即 OOMKilled。
+    # 抬到 1Gi 买的是头寸、不丢数据、可回滚；它不是策略决定——`maxmemory`／淘汰
+    # 或清键会丢数据，属于「这个存储是缓存还是可靠队列」的属主决定，另案。
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
     # Serves the AOF repair verdict beside redis as a scrapeable textfile gauge.
     # redis-server has no metrics endpoint of its own, so an exporter next to it
     # is the only way a one-shot container's reading can reach a scraper.

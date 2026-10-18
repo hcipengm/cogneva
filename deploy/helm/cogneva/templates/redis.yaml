@@ -104,12 +104,7 @@ spec:
                 - redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping
 {{ toYaml .Values.healthProbes.readiness | indent 12 }}
           resources:
-            requests:
-              cpu: 100m
-              memory: 128Mi
-            limits:
-              cpu: 500m
-              memory: 512Mi
+{{ toYaml .Values.backends.redis.resources | indent 12 }}
           volumeMounts:
             - name: data
               mountPath: /data
