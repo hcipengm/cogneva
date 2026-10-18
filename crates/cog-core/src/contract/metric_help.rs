@@ -682,33 +682,6 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          a series per tick",
     ),
     (
-        "cogneva_ready_admission_readings",
-        "The arithmetic behind one ready-publish pass's admission, by stream \
-         and kind: bounded (1 when the window's allowance bounded the pass, 0 \
-         when nothing measured one), covered and pool (how many upstreams the \
-         measurement covered and how many the pool holds -- a pool is only \
-         bounded when every member is measured), reserve (tokens one job was \
-         measured to need; 0 when no job size was measured or no status was \
-         read at all), window_jobs (jobs the remaining allowance pays for), \
-         ready (tasks that asked to go out this pass -- the traffic face: an \
-         admitted of zero with a ready of zero says nothing about how the gate \
-         behaves under load, and owed is a different quantity, work already in \
-         flight rather than work asking to leave), owed (tasks already \
-         scheduled or running on that queue) and admitted (tasks put on the \
-         wire). window_jobs is written only when bounded is \
-         1: an unmeasured window is not a window that pays for zero jobs, and \
-         a zero there would read as the strongest possible refusal. covered, \
-         pool and reserve are written on every pass, zeros included, because \
-         bounded=0 has four causes -- no status read, nothing measured, a \
-         reserve of zero, and a ruler covering only part of the pool -- and \
-         the bounded cell alone prints all four the same way. Every cell is \
-         per stream and window_jobs is not a budget split between \
-         streams: each queue is judged against its own owed count, so the two \
-         admitted values may sum to more than window_jobs when both queues are \
-         nearly empty. Do not read that sum as overshoot -- it is the price of \
-         not letting a backlog on one queue decide how much the other may send",
-    ),
-    (
         "cogneva_task_checkpoint_total",
         "Task checkpoint outcomes, by outcome: saved, unpersisted, failed, \
          superseded, unsuperseded, no_agents. All six are published from the \
@@ -1066,6 +1039,33 @@ const HISTOGRAM_HELP: &[(&str, &str)] = &[
 
 /// Descriptions for the gauge series. See [`COUNTER_HELP`].
 const GAUGE_HELP: &[(&str, &str)] = &[
+    (
+        "cogneva_ready_admission_readings",
+        "The arithmetic behind one ready-publish pass's admission, by stream \
+         and kind: bounded (1 when the window's allowance bounded the pass, 0 \
+         when nothing measured one), covered and pool (how many upstreams the \
+         measurement covered and how many the pool holds -- a pool is only \
+         bounded when every member is measured), reserve (tokens one job was \
+         measured to need; 0 when no job size was measured or no status was \
+         read at all), window_jobs (jobs the remaining allowance pays for), \
+         ready (tasks that asked to go out this pass -- the traffic face: an \
+         admitted of zero with a ready of zero says nothing about how the gate \
+         behaves under load, and owed is a different quantity, work already in \
+         flight rather than work asking to leave), owed (tasks already \
+         scheduled or running on that queue) and admitted (tasks put on the \
+         wire). window_jobs is written only when bounded is \
+         1: an unmeasured window is not a window that pays for zero jobs, and \
+         a zero there would read as the strongest possible refusal. covered, \
+         pool and reserve are written on every pass, zeros included, because \
+         bounded=0 has four causes -- no status read, nothing measured, a \
+         reserve of zero, and a ruler covering only part of the pool -- and \
+         the bounded cell alone prints all four the same way. Every cell is \
+         per stream and window_jobs is not a budget split between \
+         streams: each queue is judged against its own owed count, so the two \
+         admitted values may sum to more than window_jobs when both queues are \
+         nearly empty. Do not read that sum as overshoot -- it is the price of \
+         not letting a backlog on one queue decide how much the other may send",
+    ),
     (
         crate::metric_names::PROMOTION_WEEK_CHANGES.as_str(),
         "Promotion-ledger entries of one ISO week, by how they ended: \
@@ -1740,6 +1740,21 @@ pub fn metric_help_text(kind: MetricType, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A description filed under the wrong kind is not a description: the
+    /// lookup is by kind, so a gauge described in the counter table serves the
+    /// placeholder on every scrape while the source tree looks documented.
+    ///
+    /// Pinned here for the series this was found on. The general shape -- a
+    /// kind declared wherever a name is -- has no registry to check against
+    /// yet, so only the instance is guarded rather than the class.
+    #[test]
+    fn a_gauge_is_not_described_in_the_counter_table() {
+        let name = crate::metric_names::READY_ADMISSION_READINGS.as_str();
+        assert!(metric_description(MetricType::Gauge, name).is_some());
+        assert!(metric_description(MetricType::Counter, name).is_none());
+        assert!(metric_description(MetricType::Histogram, name).is_none());
+    }
 
     /// A name is described once, for one kind. Two entries for the same name
     /// would be two answers to one question, and the lookup returning the first
