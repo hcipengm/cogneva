@@ -20,7 +20,7 @@ spec:
         cpu: "50m"
         memory: "64Mi"
       max:
-        cpu: "4"
+        cpu: "8"
         memory: "16Gi"
       min:
         cpu: "10m"

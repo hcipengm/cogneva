@@ -329,7 +329,12 @@ spec:
               cpu: 500m
               memory: 2Gi
             limits:
-              cpu: 4000m
+              # 8 核：一轮 release 构建打满的就是这条配额（`build_gate` 里
+              # BUILD_DEMAND_CORES 的 4.1 核本身是在 4 核配额下量的，量到的是
+              # 被削平后的需求），实测这一格 CFS 周期被限流 44%，主线构建因此
+              # 跑了 60 分钟撞上构建上限。推导与证伪条件见 chart values 的
+              # evolution.resources 旁。
+              cpu: 8000m
               # 16Gi：宿主级构建闸门的 cgroup_memory 维要它所在 cgroup 容得下两个
               # 并发构建（(memory.max − current) / 4481MiB ≥ 2），推导见 chart
               # values 的 evolution.resources 旁；同时必须 ≤ LimitRange 单容器上限。

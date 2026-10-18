@@ -23,7 +23,7 @@ spec:
   hard:
     requests.cpu: "6"
     requests.memory: 12Gi
-    limits.cpu: "23"
+    limits.cpu: "27"
     # 46Gi：42.1Gi（稳态单副本下限和，进化 Pod 由 8Gi 抬到 16Gi）+ 判据 Job 512Mi
     # = 42.6Gi，头寸 3.4Gi。单容器上限同批 8Gi → 16Gi——它是准入面，不抬这份声明
     # 根本进不来，理由与算式见 chart values 的 resourceGovernance 段。
@@ -49,7 +49,7 @@ spec:
         cpu: 50m
         memory: 64Mi
       max:
-        cpu: "4"
+        cpu: "8"
         memory: 16Gi
       min:
         cpu: 10m

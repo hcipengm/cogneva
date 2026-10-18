@@ -55,12 +55,21 @@ storage:
 #   单容器上限（limitRange.maxMemory）同批 8Gi → 16Gi。它是**准入面**而不是策略偏
 #   好：不跟着抬，这份 16Gi 的声明在准入就被拒，报出来的是"超过单容器上限"，与
 #   "闸门能不能并发"看起来毫无关系。渲染期门禁第 3 条核的就是这条不变式。
+#
+# 2026-10-18 重算：进化 Pod 的构建配额 4000m → 8000m（理由见 evolution.resources
+# 旁：一轮主线构建在自己的 4 核配额上连续跑了 60 分钟、撞 3600s 上限被杀，而同一
+# 时刻这一格被 CFS 限流 44% 的周期）。
+#   稳态合计（渲染期门禁自报，不手抄）里进化 +4000m；加判据 Job 2000m 后仍须留
+#   替换期重叠的头寸，故 limitsCpu 23 → 27（与 10-10 那档同口径：需求 + 1500m）。
+#   **这两个数一起报**：只抬容器不抬配额，Pod 在准入就被拒；只抬配额不抬
+#   limitRange.maxCpu，容器声明本身进不来——三条是一对耦合，少一条就换一种方式
+#   失败（见 memory 里那条"有准入上限约束的旋钮是一对不是一个数"）。
 resourceGovernance:
   enabled: true
   quota:
     requestsCpu: "6"
     requestsMemory: 12Gi
-    limitsCpu: "23"
+    limitsCpu: "27"
     limitsMemory: 46Gi
     pods: "40"
     # 存储声明是**命名空间内全部 PVC 之和的上限**，不是某个卷的容量：目录型卷
@@ -79,7 +88,10 @@ resourceGovernance:
     defaultMemory: 512Mi
     defaultRequestCpu: 50m
     defaultRequestMemory: 64Mi
-    maxCpu: "4"
+    # 与 maxMemory 同一条耦合：它是**准入面**，任何一份容器 limits.cpu 高过它，
+    # 那份声明就在 apiserver 被拒（新 Pod 建不出来，旧 Pod 已被滚动删）。所以它随
+    # 进化 Pod 的构建配额一起抬，抬哪个都必须同批抬这一个。
+    maxCpu: "8"
     # 单容器上限必须 ≥ 本 chart 自己声明的最大那份容器 limits.memory：它是准入
     # 面，低了不是"更安全"，是那份声明根本进不来（渲染期门禁第 3 条核这条）。
     # 当前最大的是进化 Pod（16Gi，构建闸门的 cgroup_memory 维要它的 cgroup 容得
@@ -409,7 +421,17 @@ evolution:
       cpu: 500m
       memory: 2Gi
     limits:
-      cpu: 4000m
+      # 4 核是一轮 release 构建**打满**的配额，不是够用的配额：2026-10-18 实测
+      # （容器自己的 cgroup，不是 ps 的生命期均值）这一格 60 秒窗口消耗 3.26 核、
+      # CFS 周期被限流 265/600（44%），而 `build_gate` 里 `BUILD_DEMAND_CORES`
+      # 那条「一次构建中位 4.1 核 / 峰值 4.7 核」本身就是**在这条 4 核配额下量的**
+      # ——它量到的是被削平后的需求，真实需求在它之上而不是之下。同日一轮主线构建
+      # 因此连续跑了 60 分钟、在 3600s 构建上限处被杀，产物一件没落地。
+      # 宿主 24 核、同一时刻约 9–10 核在用，抬到 8 核仍在余量内；命名空间配额
+      # `limitsCpu` 也容得下（抬完稳态声明和 + 判据 Job 仍在 23 核以内）。
+      # Falsification：抬完看主线构建的墙钟是否落到构建上限之下，以及这一格的
+      # `nr_throttled` 增量是否明显下降。两个都没动，说明瓶颈不在配额，就抬回来。
+      cpu: 8000m
       # 宿主级构建闸门的 cgroup_memory 维读的就是这个数：它容得下几个并发构建
       # = (memory.max − memory.current) / BUILD_PEAK_RSS_BYTES（实测工作区一次
       # 构建的峰值 4481MiB）。8Gi 时这一维恒为 1：实测 memory.current 已 6.48GiB
