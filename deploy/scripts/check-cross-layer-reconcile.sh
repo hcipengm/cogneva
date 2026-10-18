@@ -8,7 +8,7 @@
 # 了「页缓存该占的那一份」。这两种越界都不在任何一层的读数里，因为它们都是**两个
 # 层的差**。
 #
-# 判的两条，都是差，不是某一层自己的性质：
+# 判的三条，都是差，不是某一层自己的性质：
 #
 #   1. 准入 ≤ 容量：`Σrequests/limits`（集群自己在配额 used 里记的数）不超过节点
 #      allocatable。超过 ⇒ 声明装得下配额只是配额比机器大，调度会以 Pending 的
@@ -19,6 +19,11 @@
 #      full 会开始计秒。这里不拿 file 当期值去比（它是一个平台期，当期值高说明
 #      缓存多、机器健康），而是拿它**7 天里最低到过哪**：那个位置是内核实际被
 #      压过的证据，把它当作页缓存不能失守的底线。
+#   3. 准入余量 ≥ 部署器下一次滚动 Job：`hard - used`（limits 两维）必须装得下
+#      部署器要建的那个 Job 的声明上限（从 live 的 evolution ConfigMap 读）。`used`
+#      记的是**所有非终态 Pod**，包括渲染期清单之外、运行时按需建的那些（评测表、
+#      验收演练）；渲染期门禁只把声明的工作负载加进它的和，所以它能一路绿着而准入
+#      已经在拒人。这一条就是把那个差摆出来。
 #
 # 两条都必须并列 PSI 的 `full`（不是只看 `some`）。anon 之和与 MemAvailable 回答的是
 # 「还装得下多少不可回收的」，PSI 回答的是「这一刻有没有人真的被挡住」；两者可以
@@ -84,6 +89,11 @@ ${KUBECTL} -n "${NS}" get resourcequota "${QUOTA_NAME}" -o json >"${work}/quota.
     || die "读不到 resourcequota/${QUOTA_NAME}：$(head -c 400 "${work}/quota.err")"
 ${KUBECTL} get nodes -o json >"${work}/nodes.json" 2>"${work}/nodes.err" \
     || die "读不到 nodes：$(head -c 400 "${work}/nodes.err")"
+
+# 部署器滚动 Job 的声明上限：判据 3 的右边。读不到不在这里整条退出——它是三条
+# 判据里一条的输入，缺席要在那一条上点名，而不是把另外两条也一起判成读不到。
+${KUBECTL} -n "${NS}" get configmap cogneva-evolution-config -o json \
+    >"${work}/evolution-config.json" 2>"${work}/evolution-config.err" || true
 
 # ---- 物理面：Prometheus 端点 ----
 PROM_URL="${COGNEVA_PROMETHEUS_URL:-}"
@@ -243,6 +253,42 @@ for res, total in (('cpu', sum_cpu), ('memory', sum_mem)):
     else:
         print(f"  判据1 {key}: used {show(res, u)} ≤ allocatable {show(res, total)}  ✓"
               f"（配额 {show(res, h)}，{'比机器大' if h > total else '在机器之内'}）")
+
+# ---- 判据 3：准入余量 ≥ 部署器下一次滚动 Job ----
+# used 记的是所有非终态 Pod（含运行时按需建的那些），所以这个差问的是「下一次要建
+# 的 Pod 进不进得来」；渲染期门禁问的是「声明和装不装得进配额」，两个问题的答案
+# 可以相反，而只有前者决定闭环能不能继续落地。
+try:
+    with open(os.path.join(work, 'evolution-config.json'), encoding='utf-8') as f:
+        evdata = json.load(f).get('data') or {}
+except (OSError, ValueError):
+    evdata = None
+if evdata is None:
+    unreadable.append("读不到 configmap/cogneva-evolution-config：判据 3 读不出部署器滚动 Job 的声明上限")
+else:
+    for res, label, key in (
+            ('cpu', 'limits.cpu', 'COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_CPU_LIMIT'),
+            ('memory', 'limits.memory', 'COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_MEMORY_LIMIT')):
+        raw = (evdata.get(key) or '').strip()
+        if not raw:
+            unreadable.append(f"evolution ConfigMap 里没有 {key}：判据 3 读不出滚动 Job 的 {label}")
+            continue
+        if label not in used or label not in hard:
+            unreadable.append(f"resourcequota 的 used/hard 里没有 {label}，判据 3 读不出来")
+            continue
+        try:
+            job, u, h = qty(raw), qty(used[label]), qty(hard[label])
+        except ValueError as e:
+            unreadable.append(f"判据 3 的数量解析不了：{e}")
+            continue
+        if h - u < job:
+            problems.append(
+                f"判据3 {label}：used {show(res, u)} + 部署器滚动 Job {show(res, job)} "
+                f"> 配额 {show(res, h)}——下一次滚动 Job 在准入就被拒，部署器每轮空转；"
+                f"used 含渲染期清单之外的运行期自建 Pod，所以只查声明和的门禁看不见它")
+        else:
+            print(f"  判据3 {label}: used {show(res, u)} + 滚动 Job {show(res, job)} "
+                  f"≤ 配额 {show(res, h)}  ✓（准入余量 {show(res, h - u)}）")
 
 # 有 anon 或 file 样本、但 node-exporter 没报这个节点 MemTotal 的：判据 2 的分母不在，
 # 这个节点会被下面的循环整个跳过 —— 跳过与成立在读出来的那一行上长得一样，所以在这里点名。

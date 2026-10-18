@@ -297,6 +297,11 @@ for face, quota_key, unit in (('requests', 'requests.cpu', 'cpu'),
                 f"头寸 {shown(together)}。本脚本按每 Pod 容器与 init 之和计，而额度"
                 f"记账取两者较大者，所以这里的数只会偏大不会偏小")
 
+notes.append(
+    "limits 两维的头寸只算声明的工作负载与部署器自己创建的判据 Job；"
+    "运行时按需建的 Pod（评测表、验收演练）同样记在准入账上，"
+    "所以这一行不是准入余量——那一条看 check-cross-layer-reconcile.sh 的判据 3")
+
 if errors:
     print(f"GOVERNANCE 校验失败 [{PROFILE}]：")
     for e in errors:

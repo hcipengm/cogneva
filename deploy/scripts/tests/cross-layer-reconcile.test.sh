@@ -11,7 +11,10 @@
 #   4. 两个节点里只有一个越界 -> 1，红只点名那个节点（不是「有节点越界」）；
 #   5. 某节点没有 anon 序列 -> 2（缺席不是 0，是判不了）；
 #   6. 某节点的 7 天窗口里没有 file 样本 -> 2；
-#   7. 判据 2 绿但 PSI full 在计秒 -> 0，并且把「不一致本身就是结论」印出来。
+#   7. 判据 2 绿但 PSI full 在计秒 -> 0，并且把「不一致本身就是结论」印出来；
+#  10. 准入余量装不下部署器滚动 Job -> 1，点名判据 3 与资源名（used 含运行期自建
+#      Pod，声明和仍装得进配额）；
+#  11. evolution ConfigMap 里没有滚动 Job 的上限 -> 2（缺席不是「装得下」）。
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,6 +36,7 @@ scen="${SCEN:?}"
 case " $* " in
     *" get resourcequota "*) cat "${scen}/quota.json" ;;
     *" get nodes "*)         cat "${scen}/nodes.json" ;;
+    *" get configmap "*)     cat "${scen}/evcfg.json" ;;
     *" get svc "*)           echo "10.0.0.1" ;;
     *) echo "fake-kubectl: 不认识的参数：$*" >&2; exit 1 ;;
 esac
@@ -87,6 +91,13 @@ state = {
         "metadata": {"name": "cogneva"},
         "status": {"allocatable": {"cpu": "23860m", "memory": "55706256Ki"}},
     }]},
+    # 部署器滚动 Job 的声明上限（判据 3 的右边）：与现网 evolution ConfigMap 同量级。
+    "evcfg": {"data": {
+        "COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_CPU_REQUEST": "200m",
+        "COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_MEMORY_REQUEST": "64Mi",
+        "COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_CPU_LIMIT": "2",
+        "COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_MEMORY_LIMIT": "512Mi",
+    }},
     "prom": {
         "anon": [{"metric": {"node": "cogneva", "slice": "user.slice"},
                   "value": [0, str(int(4.31 * Gi))]},
@@ -104,7 +115,7 @@ state = {
 
 exec(mutation, {"state": state, "Gi": Gi, "Mi": Mi})
 
-for key in ("quota", "nodes", "prom"):
+for key in ("quota", "nodes", "prom", "evcfg"):
     with open(os.path.join(out, key + ".json"), "w", encoding="utf-8") as f:
         json.dump(state[key], f)
 PY
@@ -209,6 +220,17 @@ expect quota-key-missing 2 "判据 1 读不出来" '
 del state["quota"]["status"]["used"]["requests.memory"]
 '
 
+# 10. 声明和装得进配额，但准入余量装不下部署器滚动 Job：used 里含着运行期自建
+#     的 Pod，渲染期门禁只加声明的工作负载，所以它绿着而准入已经拒人。
+expect admission-headroom-short 1 "判据3 limits.memory" '
+state["quota"]["status"]["used"]["limits.memory"] = str(int(46 * Gi) - 256 * Mi)
+'
+
+# 11. evolution ConfigMap 里没有滚动 Job 的内存上限：判据 3 的右边不在，判不了。
+expect job-limit-missing 2 "没有 COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_MEMORY_LIMIT" '
+del state["evcfg"]["data"]["COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_MEMORY_LIMIT"]
+'
+
 # ---- 序列模式：每一拍落一行，红了、读不到也各落一行 ----
 #
 # 判据是「拍子之间有没有洞」，所以**判红的那一拍也必须是拍子**：只在绿的时候写，
@@ -271,4 +293,4 @@ COGNEVA_RECONCILE_SERIES="${rec}" \
 [ ! -e "${rec}" ] || fail "record-off: 没带 --record 却写了序列：$(cat "${rec}")"
 echo "ok   record-off：不带 --record 时一个字节也不写"
 
-echo "cross-layer-reconcile: 13 passed"
+echo "cross-layer-reconcile: 15 passed"
