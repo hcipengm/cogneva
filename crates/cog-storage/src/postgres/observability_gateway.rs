@@ -116,6 +116,34 @@ impl PostgresObservabilityGateway {
         self
     }
 
+    /// 在第一个事件到来之前，先把失败计数按 0 写一条。
+    ///
+    /// 失败计数是「一次落库失败加一」，不失败就一行都没有。那样「这一段没有
+    /// 失败」与「落库这条通路根本没接上」在读数面上逐字同形，而两种情形要走的
+    /// 下一步相反：前者去看上游，后者说明写者压根没装配。留下来自写者自己的
+    /// 指标句柄，而不是由提这个问题的一方去读侧补一条 0——读的人记的 0 只能
+    /// 证明读的人活着。
+    ///
+    /// 写 0 是增量而不是赋值，所以重启不会抹掉另一个进程已经累上去的总数。
+    pub async fn seed_persist_failure_series(&self) {
+        let Some(ref metrics) = self.metrics else {
+            return;
+        };
+        if let Err(e) = metrics
+            .record_counter(
+                cog_core::metric_names::OBSERVABILITY_EVENT_PERSIST_FAILED_TOTAL,
+                0.0,
+                std::collections::HashMap::new(),
+            )
+            .await
+        {
+            tracing::warn!(
+                "cannot seed the observability persist failure counter: {}",
+                e
+            );
+        }
+    }
+
     pub fn new(pool: PgPool) -> Self {
         let (event_tx, _event_rx) = broadcast::channel(256);
         Self {
@@ -822,5 +850,55 @@ fn parse_squad_status(s: &str) -> SFResult<SquadStatus> {
         "failed" => Ok(SquadStatus::Failed),
         "retrying" => Ok(SquadStatus::Retrying),
         other => Err(SFError::Agent(format!("unknown squad status: {}", other))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cog_core::MetricsBackend;
+
+    fn gateway_with(
+        metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
+    ) -> PostgresObservabilityGateway {
+        // No connection is made: the seed only touches the metrics backend, and
+        // a test that needed a live server would not run where this question
+        // gets asked.
+        let pool =
+            PgPool::connect_lazy("postgres://nobody@127.0.0.1:1/nothing").expect("a lazy pool");
+        PostgresObservabilityGateway::new(pool).with_metrics(metrics)
+    }
+
+    /// 装配完成的写者要在读数面上留下一条 0。没有这一条，一个从未失败的
+    /// 存储与一个根本没接上的存储导出同一份空读数。
+    #[tokio::test]
+    async fn the_writer_declares_the_persist_failure_series_at_zero() {
+        let backend = Arc::new(crate::mem::MemoryMetricsBackend::new());
+        let metrics: Arc<dyn cog_core::MetricsBackend> = backend.clone();
+
+        gateway_with(Some(metrics))
+            .seed_persist_failure_series()
+            .await;
+
+        let totals = backend
+            .query_counter_totals(
+                cog_core::metric_names::OBSERVABILITY_EVENT_PERSIST_FAILED_TOTAL.as_str(),
+            )
+            .await
+            .expect("the in-memory backend answers");
+        assert_eq!(totals.len(), 1, "the seed must create exactly one series");
+        assert_eq!(totals[0].value, 0.0, "the seed must not count a failure");
+        assert!(
+            totals[0].labels.is_empty(),
+            "the seed's label set must be the one the failure arm writes, \
+             otherwise it declares a different series"
+        );
+    }
+
+    /// 没有指标后端的部署（嵌入式运行）既不写也不报错：能记的东西本来就不
+    /// 存在，这不是故障，启动不该为它停下。
+    #[tokio::test]
+    async fn a_writer_without_a_backend_seeds_nothing_and_survives() {
+        gateway_with(None).seed_persist_failure_series().await;
     }
 }

@@ -506,6 +506,10 @@ impl cog_core::SystemPlugin for StoragePlugin {
                 match gateway.init_schema().await {
                     Ok(()) => {
                         info!("PostgresObservabilityGateway initialized");
+                        // 写者装配完成的那一刻宣告自己存在：失败计数平时一条
+                        // 都不写，缺了这条 0，「从没失败」与「没接上」在导出
+                        // 面上同形。
+                        gateway.seed_persist_failure_series().await;
                         Arc::new(gateway)
                     }
                     Err(e) => {
