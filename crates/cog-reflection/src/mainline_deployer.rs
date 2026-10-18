@@ -1411,6 +1411,26 @@ struct CiHold {
     since_unix: i64,
 }
 
+/// 上一次问上游 CI 得到的判词，按 rev 落盘。
+///
+/// 三支放行面里有两支长得一样（`pass` 与 `no_evidence`），区别只在事后：
+/// `cogneva_mainline_ci_verdict_total` 的三个累计值不带 rev，滚动 Job 的日志里也没有
+/// 这一行（判词在进化 Pod 里算，Job 只负责 apply），而这个 Pod 自己的日志随滚动消失。
+/// 于是"这一版是判过才滚的，还是上游没给结论就放行的"在落地之后没有按 rev 可读的
+/// 载体。这一格就是那个载体：rev、判词、以及 `no_evidence` 时逐上游的原因。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct CiVerdictRecord {
+    rev: String,
+    /// 闭集：`pass`（至少一条上游明确通过）/ `fail`（任一上游报失败）/ `no_evidence`。
+    verdict: String,
+    /// 只在 `no_evidence` 时非空，形如 `<platform>:<reason>`，与原因计数器同一套取值域。
+    #[serde(default)]
+    reasons: Vec<String>,
+    /// 做出这个判词的时刻，unix 秒。
+    #[serde(default)]
+    decided_unix: i64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct MainlineState {
     last_good_tag: Option<String>,
@@ -1446,6 +1466,9 @@ struct MainlineState {
     /// 进程正是它自己会做的事，而重启正是"已经等了多久"最容易被抹掉的时候。
     #[serde(default)]
     ci_hold: Option<CiHold>,
+    /// 最近一次问上游 CI 得到的判词，连同它问的是哪个 rev。见 [`CiVerdictRecord`]。
+    #[serde(default)]
+    last_ci_verdict: Option<CiVerdictRecord>,
     /// 连续多少轮没从构建闸拿到槽。拿不到就原样回下一轮，不留状态，于是这一支
     /// 在读数上完全同形——无论撞的是一次别人的构建，还是槽被一个永远不松手的
     /// 持有者占着。落盘是因为重启正是这个进程自己会做的事：计数在内存里的话，
@@ -2614,7 +2637,10 @@ impl MainlineDeployer {
     /// 名字带平台前缀：同一次判据会把两端镜像仓库的检查折在一起，而两个仓库上同名的
     /// 检查是两件事。名字只在有 check runs 时才有；结论来自提交状态兜底时它是空的——
     /// 空不等于「没有失败项」，它等于「这个平台上没有可命名的检查」。
-    async fn ci_verdict_with_failures(&self, rev: &str) -> (Option<bool>, Vec<String>) {
+    async fn ci_verdict_with_failures(
+        &self,
+        rev: &str,
+    ) -> (Option<bool>, Vec<String>, Vec<String>) {
         let mut verdicts = Vec::new();
         let mut failed: Vec<String> = Vec::new();
         let mut reasons: Vec<(&'static str, CiNoVerdictReason)> = Vec::new();
@@ -2652,7 +2678,12 @@ impl MainlineDeployer {
         if verdict.is_none() {
             self.record_ci_verdict_reason_reading(&reasons).await;
         }
-        (verdict, failed)
+        // 原因按「平台:原因」拼回去，与原因计数器同一套取值域；判出结论的轮次没有原因。
+        let reason_slugs: Vec<String> = reasons
+            .iter()
+            .map(|(platform, reason)| format!("{platform}:{}", reason.label()))
+            .collect();
+        (verdict, failed, reason_slugs)
     }
 
     /// 上游 CI 已经给出明确的失败结论就扣住这个 rev；`Ok(true)` = 扣住了。
@@ -2677,7 +2708,8 @@ impl MainlineDeployer {
         state: &mut MainlineState,
         rev: &str,
     ) -> SFResult<bool> {
-        let (verdict, failed_checks) = self.ci_verdict_with_failures(rev).await;
+        let (verdict, failed_checks, reasons) = self.ci_verdict_with_failures(rev).await;
+        self.record_ci_verdict_in_state(state, rev, verdict, reasons)?;
         if verdict != Some(false) {
             self.record_ci_hold_reading(0).await;
             return Ok(false);
@@ -2759,6 +2791,39 @@ impl MainlineDeployer {
             .await;
     }
 
+    /// 把这一轮的判词按 rev 记进状态文件（见 [`CiVerdictRecord`]）。
+    ///
+    /// 只在内容真的变了的时候写盘：这个判据一轮问两次，两次答案常常相同，而
+    /// 每次落盘都是一次 tmp+rename。变了就写，包括从 `no_evidence` 变成 `pass`
+    /// 这一次——那正是"构建期间上游跑完了"的形状，也是派发前那次提问存在的理由。
+    fn record_ci_verdict_in_state(
+        &self,
+        state: &mut MainlineState,
+        rev: &str,
+        verdict: Option<bool>,
+        reasons: Vec<String>,
+    ) -> SFResult<()> {
+        let slug = match verdict {
+            Some(true) => "pass",
+            Some(false) => "fail",
+            None => "no_evidence",
+        };
+        let unchanged = state
+            .last_ci_verdict
+            .as_ref()
+            .is_some_and(|r| r.rev == rev && r.verdict == slug && r.reasons == reasons);
+        if unchanged {
+            return Ok(());
+        }
+        state.last_ci_verdict = Some(CiVerdictRecord {
+            rev: rev.to_string(),
+            verdict: slug.to_string(),
+            reasons,
+            decided_unix: chrono::Utc::now().timestamp(),
+        });
+        self.save_state(state)
+    }
+
     /// The judgement's own reading: which question it asked upstream and which
     /// answer it got.
     ///
@@ -2766,12 +2831,15 @@ impl MainlineDeployer {
     /// ahead indistinguishable, and they are the two that need telling apart:
     /// the gate fails open by design, so "the platforms reported green" and
     /// "this round could not read them at all" both end in the same dispatch.
-    /// The state file keeps a hold and nothing else, and the log line that used
-    /// to be the only trace dies with the pod that wrote it. One of the three
-    /// labels gains a count each time the question is asked, and a round asks it
-    /// twice -- before the build and again before the dispatch -- so a round
-    /// that reads a verdict for a revision and rolls it adds two. All three
-    /// missing means neither call site is there.
+    /// The log line that used to be the only trace dies with the pod that wrote
+    /// it. One of the three labels gains a count each time the question is
+    /// asked, and a round asks it twice -- before the build and again before the
+    /// dispatch -- so a round that reads a verdict for a revision and rolls it
+    /// adds two. All three missing means neither call site is there.
+    ///
+    /// The counters answer "how often", not "which revision": they are
+    /// cumulative and carry no rev, so per-revision attribution comes from the
+    /// state file's [`CiVerdictRecord`], written at the same call.
     async fn record_ci_verdict_reading(&self, verdict: Option<bool>) {
         let Some(metrics) = &self.metrics else {
             return;
@@ -8372,6 +8440,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             registry_restart_unix: Some(940),
             registry_gc_owed: false,
             buildah_store_unix: 0,
+            last_ci_verdict: None,
         };
         let msg = heartbeat_message(&state, "aabbccddeeff0011", "up-to-date(aabbccddeeff)", 1000);
         assert!(msg.contains("in_flight=aabbccddeeff@Pushed"), "{msg}");
@@ -8768,6 +8837,12 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             registry_restart_unix: None,
             registry_gc_owed: false,
             buildah_store_unix: 0,
+            last_ci_verdict: Some(CiVerdictRecord {
+                rev: "bb".into(),
+                verdict: "no_evidence".into(),
+                reasons: vec!["github:connect_failed".into()],
+                decided_unix: 1234,
+            }),
         };
         let text = serde_json::to_string(&state).unwrap();
         let back: MainlineState = serde_json::from_str(&text).unwrap();
@@ -10343,7 +10418,7 @@ exit 0
         cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
 
-        let (verdict, failed) = deployer.ci_verdict_with_failures("abc123").await;
+        let (verdict, failed, _reasons) = deployer.ci_verdict_with_failures("abc123").await;
         assert_eq!(verdict, Some(false));
         // 只有报失败的那一条，且带平台前缀；成功的那条不进这一列。
         assert_eq!(failed, vec!["github:Clippy".to_string()]);
@@ -10438,6 +10513,14 @@ exit 0
             .unwrap());
         let held = deployer.load_state().ci_hold.expect("扣住了就要有起点");
         assert_eq!(held.rev, "abc123");
+        // 判词也要按 rev 落盘：落地之后"这一版是判过才滚的"只能从这里读。
+        let recorded = deployer
+            .load_state()
+            .last_ci_verdict
+            .expect("判词要按 rev 落盘");
+        assert_eq!(recorded.rev, "abc123");
+        assert_eq!(recorded.verdict, "fail");
+        assert!(recorded.reasons.is_empty(), "判出结论的轮次没有原因");
         let first = read().await.expect("按住这一支也要写这一格");
         assert!(first < 5.0, "刚按住，读出来的是 {first}");
 
@@ -10469,7 +10552,47 @@ exit 0
             0.0,
             "扣住结束必须写回 0，否则最后那个值会一直在库里"
         );
+        // 放行那一支同样要留下判词，而且是从 `fail` 改写到 `pass`：
+        // "构建期间上游跑完了结论"正是派发前那次提问存在的理由。
+        let recorded = state.last_ci_verdict.as_ref().expect("放行也要留判词");
+        assert_eq!(recorded.rev, "abc123");
+        assert_eq!(recorded.verdict, "pass");
         handle.await.unwrap();
+    }
+
+    /// 没有证据就放行的那一版，落地之后要能答"上游当时为什么没给结论"。
+    ///
+    /// 三个累计计数器只答"这一类各多少"，不带 rev；滚动 Job 的日志里没有这一行
+    /// （判词在进化 Pod 里算）。所以按 rev 追"这一版是判过才滚还是 pending 放的"，
+    /// 在落地之后唯一的载体就是这一格。
+    #[tokio::test]
+    async fn a_rollout_let_through_without_evidence_says_so_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some("http://127.0.0.1:1/github".into());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+
+        let mut state = deployer.load_state();
+        assert!(!deployer
+            .hold_if_ci_reports_failure(&mut state, "abc123")
+            .await
+            .unwrap());
+        let recorded = deployer
+            .load_state()
+            .last_ci_verdict
+            .expect("放行也要留下判词");
+        assert_eq!(recorded.rev, "abc123");
+        assert_eq!(recorded.verdict, "no_evidence");
+        assert!(
+            recorded
+                .reasons
+                .iter()
+                .any(|r| r.ends_with(":connect_failed")),
+            "连不上要留下原因，记到的是 {:?}",
+            recorded.reasons
+        );
     }
 
     /// 三支判定各自留下的是哪一支。
