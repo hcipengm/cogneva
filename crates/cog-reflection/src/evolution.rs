@@ -1075,6 +1075,55 @@ mod tests {
         assert_eq!(cog_core::diff_structural_defect(&repaired), None);
     }
 
+    /// principle: feedback_a_format_gate_is_landed_on_the_diff_and_censused_before_it_is_written
+    ///
+    /// 落一扇「写法」的门之前，先把它的两种形状各量一次：同一句原则既能落成
+    /// 「判存量」——照存量字节判——也能落成「判新增」——只判修好之后要写进去的
+    /// +/- 行。同一份样本、同一个修订、同一个结构 oracle：存量读数点名缺陷，
+    /// 新增读数干净；普查在写之前数，修复不得改变所数的变更行数，已经合身的
+    /// diff 一个字节都不许被重写。
+    #[test]
+    fn a_format_gate_is_censused_in_its_two_shapes_before_it_is_written() {
+        // 一份固定样本，在这棵树的同一个修订上量两次：身体是对的，最后一行
+        // 没有结束符，git apply 会以 corrupt patch 拒收。
+        let stock = "diff --git a/x.rs b/x.rs\n\
+                     --- a/x.rs\n\
+                     +++ b/x.rs\n\
+                     @@ -1,1 +1,1 @@\n\
+                     -old\n\
+                     +new";
+        // 判存量：存量形状在门下必须被点名，而不是被静默放过。
+        assert!(
+            cog_core::diff_structural_defect(stock).is_some(),
+            "the stock reading must name the defect already present in the bytes"
+        );
+
+        // 判新增：同一个结构 oracle 判修好之后要新增进树里的形状。
+        let repaired = repair_generated_diff(stock);
+        assert_eq!(cog_core::diff_structural_defect(&repaired), None);
+        assert!(repaired.ends_with('\n'));
+        assert!(repaired.contains("-old\n"));
+        assert!(repaired.contains("+new\n"));
+
+        // 普查在写之前进行：write_generated_change 先 repair，再用同一个
+        // cog_core::count_diff_lines 量修复后的文本。修复只补结构，不许改变
+        // 普查所数的变更行数——存量身体两行，新增形状还是两行，门无法借修复
+        // 夹带额外的改动过门。
+        assert_eq!(
+            cog_core::count_diff_lines(stock),
+            cog_core::count_diff_lines(&repaired)
+        );
+
+        // 已经合身的存量是这扇门的另一种形状：门对它一个字节都不能动。
+        let sound = "diff --git a/x.rs b/x.rs\n\
+                     --- a/x.rs\n\
+                     +++ b/x.rs\n\
+                     @@ -1,1 +1,1 @@\n\
+                     -old\n\
+                     +new\n";
+        assert_eq!(repair_generated_diff(sound), sound);
+    }
+
     fn make_result(id: &str, created_at: chrono::DateTime<chrono::Utc>) -> EvolutionResult {
         EvolutionResult {
             kind: EvolutionKind::CodeChange,
