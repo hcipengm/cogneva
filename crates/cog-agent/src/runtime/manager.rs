@@ -127,10 +127,13 @@ pub struct GlobalAgentManager {
     /// How often every worker renews its registration.
     ///
     /// Read from the `agent` section at startup and handed to each spawned
-    /// agent. Left at the config surface's own default when nothing sets it, so
-    /// the number lives in one place: an interval written here as a second
-    /// constant would be the one that wins, silently.
-    heartbeat_interval_secs: u64,
+    /// agent. `None` means nobody set it, and the agent keeps its own default
+    /// rather than being handed a number that came from somewhere else: the
+    /// configuration type's `Default` is derived, so "the config surface's
+    /// default" is zero, and a zero interval makes the heartbeat task panic on
+    /// its first tick -- an agent that never renews its registration, reported
+    /// as a panic inside a task nobody joins.
+    heartbeat_interval_secs: Option<u64>,
     /// Where the roster is published for the scrape to read.
     ///
     /// The roster is the only place the pool's own size is known, and until it
@@ -173,8 +176,7 @@ impl GlobalAgentManager {
             wal_backend: None,
             wal_missing_reported: AtomicBool::new(false),
             tool_output_archive: None,
-            heartbeat_interval_secs: cog_core::config::AgentConfig::default()
-                .heartbeat_interval_secs,
+            heartbeat_interval_secs: None,
             roster_observer: None,
         }
     }
@@ -208,7 +210,7 @@ impl GlobalAgentManager {
     /// Set how often every worker renews its registration, from the `agent`
     /// section of the delivered configuration.
     pub fn with_heartbeat_interval_secs(mut self, secs: u64) -> Self {
-        self.heartbeat_interval_secs = secs;
+        self.heartbeat_interval_secs = Some(secs);
         self
     }
 
@@ -380,8 +382,10 @@ impl GlobalAgentManager {
                 .with_registry(self.registry.clone())
                 .with_registration(registration)
                 .with_message_backend(self.message_backend.clone())
-                .with_state_backend(self.state_backend.clone())
-                .with_heartbeat_interval(self.heartbeat_interval_secs);
+                .with_state_backend(self.state_backend.clone());
+            if let Some(secs) = self.heartbeat_interval_secs {
+                a = a.with_heartbeat_interval(secs);
+            }
             if let Some(wal) = self.wal_for(&agent_id).await {
                 a = a.with_wal(wal);
             }
@@ -612,8 +616,10 @@ impl cog_core::AgentManager for GlobalAgentManager {
                 .with_registry(self.registry.clone())
                 .with_registration(registration)
                 .with_message_backend(self.message_backend.clone())
-                .with_state_backend(self.state_backend.clone())
-                .with_heartbeat_interval(self.heartbeat_interval_secs);
+                .with_state_backend(self.state_backend.clone());
+            if let Some(secs) = self.heartbeat_interval_secs {
+                a = a.with_heartbeat_interval(secs);
+            }
             if let Some(wal) = self.wal_for(&agent_id).await {
                 a = a.with_wal(wal);
             }

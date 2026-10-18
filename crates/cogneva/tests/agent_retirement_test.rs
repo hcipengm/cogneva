@@ -29,6 +29,15 @@ struct RecordingBackend {
     inner: Arc<MemoryMessageBackend>,
     subscribes: Mutex<Vec<(String, String)>>,
     stops: Mutex<Vec<(String, String)>>,
+    /// When present, `stop_stream` waits here before it stops anything, so a
+    /// test can hold a retirement halfway through and do something else at
+    /// exactly that instant.
+    stop_gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// When present, a stop does not return until `parties` stops are waiting
+    /// at the same time. A retirement loop that stops its agents one after
+    /// another never gets past the first, which is how "they were retired
+    /// together" becomes a reading instead of a claim about the code.
+    stop_barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 
 impl RecordingBackend {
@@ -37,11 +46,53 @@ impl RecordingBackend {
             inner: Arc::new(MemoryMessageBackend::new()),
             subscribes: Mutex::new(Vec::new()),
             stops: Mutex::new(Vec::new()),
+            stop_gate: None,
+            stop_barrier: None,
         })
+    }
+
+    /// A backend whose stops all have to be waiting at once: the first one
+    /// does not return until the `parties`-th arrives.
+    fn barriered(parties: usize) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::new(MemoryMessageBackend::new()),
+            subscribes: Mutex::new(Vec::new()),
+            stops: Mutex::new(Vec::new()),
+            stop_gate: None,
+            stop_barrier: Some(Arc::new(tokio::sync::Barrier::new(parties))),
+        })
+    }
+
+    /// A backend whose stops block until `release_stop`: the retirement is
+    /// asked for and recorded, but has not finished.
+    fn gated() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::new(MemoryMessageBackend::new()),
+            subscribes: Mutex::new(Vec::new()),
+            stops: Mutex::new(Vec::new()),
+            stop_gate: Some(Arc::new(tokio::sync::Semaphore::new(0))),
+            stop_barrier: None,
+        })
+    }
+
+    fn release_stop(&self) {
+        if let Some(gate) = &self.stop_gate {
+            gate.add_permits(1);
+        }
     }
 
     fn stops(&self) -> Vec<(String, String)> {
         self.stops.lock().unwrap().clone()
+    }
+
+    async fn wait_for_stop(&self) {
+        for _ in 0..2000 {
+            if !self.stops.lock().unwrap().is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("the retirement never asked to stop anything");
     }
 
     /// Wait until the consumer loop has subscribed to `subject`, or give up
@@ -96,6 +147,12 @@ impl MessageBackend for RecordingBackend {
             .lock()
             .unwrap()
             .push((subject.to_string(), group.to_string()));
+        if let Some(gate) = &self.stop_gate {
+            gate.acquire().await.expect("stop gate").forget();
+        }
+        if let Some(barrier) = &self.stop_barrier {
+            barrier.wait().await;
+        }
         self.inner.stop_stream(subject, group).await;
     }
 
@@ -275,4 +332,94 @@ async fn a_create_finds_the_new_object_when_the_roster_still_holds_the_retired_o
         live[0].agent_id == name && !live[0].agent.is_retired(),
         "the roster must hold the new object, not the retired one"
     );
+}
+
+/// 退役的收尾发生在「新对象已经挂到同一个名字下」之后：收尾只能放掉自己退掉的
+/// 那一个对象，新来的那一个要留在名册里。
+///
+/// 这是「按身份摘」与「按名字摘」唯一可分辨的交错。实测：把收尾换成按名字摘
+/// （名字从待退目标上带下来，实现者手上本来就有它），名册被清空，这一条红；
+/// 前四条仍然全绿。反过来，若「按名字摘」是收尾时才去名册里查名字，它查不到
+/// 已经退场的空壳、也就不摘任何东西——那种写法是失效而不是等价，测不出差别，
+/// 这正说明判据要对着「名字从哪儿来」而不是对着「名字用没用」。
+#[tokio::test]
+async fn a_late_retirement_cleanup_does_not_take_the_new_object_with_it() {
+    let backend = RecordingBackend::gated();
+    let manager = Arc::new(manager(Arc::clone(&backend)));
+    let name = cog_core::agent_id_for("task-1", "planner");
+    let first = manager
+        .create_agent(&name, "planner", llm(), Some("task-1"))
+        .await
+        .expect("first create");
+    backend
+        .wait_for_subscribe(&format!("orchestrator:agent:{name}:inbox"))
+        .await;
+
+    // 退役停在半路：对象已标记退役、停的动作已被记录，但管理器还没把它摘掉。
+    let retirer = {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move { manager.retire_task_agents("task-1").await })
+    };
+    backend.wait_for_stop().await;
+
+    // 此刻另一次重跑给同一个名字建了新的对象。
+    let second = manager
+        .create_agent(&name, "planner", llm(), Some("task-1"))
+        .await
+        .expect("second create");
+    assert!(!Arc::ptr_eq(&first, &second), "a new life, a new object");
+
+    backend.release_stop();
+    assert_eq!(retirer.await.expect("join"), 1, "one object was retired");
+
+    let live = manager.list_workers().await;
+    assert_eq!(
+        live.len(),
+        1,
+        "the cleanup took the new object with it: it removed by name, not by \
+         the object it had retired"
+    );
+    let kept: Arc<dyn cog_core::Agent> = live[0].agent.clone();
+    assert!(
+        Arc::ptr_eq(&kept, &second),
+        "the roster must keep the object created while the retirement was \
+         still finishing"
+    );
+}
+
+/// 一件任务名下的多个对象是一起退的：三个消费者都停在闸门上，收尾才走得下去。
+///
+/// 这条判据量的不是快慢，是「它们同时在下」。串行退的实现永远等不到第三个到达——
+/// 第一个就卡在闸门上——所以把 `join_all` 改回 `for` 循环，它会在这里超时失败。
+#[tokio::test]
+async fn a_tasks_agents_stop_together_rather_than_one_after_another() {
+    let roles = ["planner", "coder", "reviewer"];
+    let backend = RecordingBackend::barriered(roles.len());
+    let manager = manager(Arc::clone(&backend));
+    for role in roles {
+        let name = cog_core::agent_id_for("task-1", role);
+        manager
+            .create_agent(&name, role, llm(), Some("task-1"))
+            .await
+            .expect("create");
+        backend
+            .wait_for_subscribe(&format!("orchestrator:agent:{name}:inbox"))
+            .await;
+    }
+
+    let retired =
+        tokio::time::timeout(Duration::from_secs(2), manager.retire_task_agents("task-1"))
+            .await
+            .expect(
+                "the remaining stops never arrived: the agents were retired one after \
+             another, so the first one held the barrier alone",
+            );
+
+    assert_eq!(retired, roles.len(), "every object was retired");
+    assert_eq!(
+        backend.stops().len(),
+        roles.len(),
+        "each agent's own inbox was stopped"
+    );
+    assert!(manager.list_workers().await.is_empty());
 }

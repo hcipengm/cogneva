@@ -1,7 +1,15 @@
-use cog_core::{DagMessage, MessageBackend, ShutdownSignal, Task, TaskStatus};
+mod common;
+
+use cog_agent::GlobalAgentManager;
+use cog_core::{
+    AgentManager, DagMessage, MessageBackend, ShutdownSignal, StateBackend, Task, TaskStatus,
+};
 use cog_orchestrator::dag_executor::{DagExecutorConfig, DagExecutorRuntime};
+use cog_storage::{MemoryAgentRegistry, MemoryStateBackend};
 use cog_stream::MemoryMessageBackend;
+use common::mocks::MockLLMProvider;
 use futures::StreamExt;
+use std::sync::Arc;
 
 fn make_test_task(id: &str) -> Task {
     Task {
@@ -154,6 +162,194 @@ async fn consumer_loop_retries_on_task_failed_result() {
             .is_some_and(|due| due > chrono::Utc::now()),
         "a retried task must carry a future backoff deadline, got {:?}",
         t.retry_not_before
+    );
+}
+
+/// 回队列的重试不是终态：这一次失败之后还要用同一个 agent 再跑一遍，所以名册
+/// 里那一个必须留着。
+///
+/// 没有这一条时，「回收只挂在终态路径上」只是读代码读出来的结论——把回收挪到
+/// 失败分支上，别的用例一条都不会红。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retried_failure_keeps_the_agent_it_will_run_with_again() {
+    let backend = MemoryMessageBackend::new();
+    let runtime = DagExecutorRuntime::new_with_backend(
+        DagExecutorConfig {
+            redis_url: "redis://localhost".into(),
+            workspace_id: "ws-retry".into(),
+            consumer_group: "cg-retry".into(),
+            max_retries: 3,
+            ..DagExecutorConfig::default()
+        },
+        backend.clone(),
+    );
+
+    let messages: Arc<dyn MessageBackend> = Arc::new(backend.clone());
+    let state: Arc<dyn StateBackend> = Arc::new(MemoryStateBackend::new());
+    let manager = Arc::new(GlobalAgentManager::new(
+        Arc::new(MemoryAgentRegistry::new()),
+        messages,
+        state,
+    ));
+    runtime
+        .orchestrator()
+        .attach_agent_manager(manager.clone() as Arc<dyn AgentManager>);
+
+    let name = cog_core::agent_id_for("task-retried", "executor");
+    manager
+        .create_agent(
+            &name,
+            "executor",
+            Arc::new(MockLLMProvider::new()),
+            Some("task-retried"),
+        )
+        .await
+        .expect("create");
+    assert_eq!(
+        manager.list_workers().await.len(),
+        1,
+        "the task starts with one agent"
+    );
+
+    runtime
+        .submit_goal("retry-goal", vec![make_test_task("task-retried")])
+        .await
+        .unwrap();
+    runtime.publish_ready_tasks().await.unwrap();
+    runtime
+        .orchestrator()
+        .start_task("task-retried")
+        .await
+        .unwrap();
+
+    backend
+        .publish(
+            "orchestrator:results:ws-retry",
+            &serde_json::to_vec(&DagMessage::TaskFailed {
+                message_id: "msg-retried".into(),
+                timestamp: chrono::Utc::now(),
+                task_id: "task-retried".into(),
+                error: "simulated transient failure".into(),
+                error_cause: None,
+                retry_after_secs: None,
+                sender: "executor".into(),
+                recipient: "orchestrator".into(),
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let shutdown = ShutdownSignal::new();
+    let s = shutdown.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        s.trigger();
+    });
+    runtime.run_consumer(shutdown).await.unwrap();
+
+    let t = runtime
+        .orchestrator()
+        .get_task("task-retried")
+        .await
+        .unwrap();
+    assert_eq!(t.retry_count, 1, "the failure must have been a retry");
+    assert_eq!(t.status, TaskStatus::Pending);
+    let live = manager.list_workers().await;
+    assert_eq!(
+        live.len(),
+        1,
+        "a retry is not a terminal state: retiring here costs the retry the \
+         object it was going to run with, and the run after it builds another"
+    );
+    assert!(!live[0].agent.is_retired());
+}
+
+/// 终态任务都要收，不能只收汇点：一件没有声明 `sink_task_id` 的任务跑完了，
+/// 它名下的对象也得放掉。
+///
+/// 汇点只是终态任务里的一小类；把回收排在 `parent_task_id` 的提前返回之后，
+/// 其它终态任务就全部漏收，而漏收在读数面上长得和「本来就没多少任务结束」一样。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_terminal_task_that_is_not_a_sink_releases_its_agent() {
+    let backend = MemoryMessageBackend::new();
+    let runtime = DagExecutorRuntime::new_with_backend(
+        DagExecutorConfig {
+            redis_url: "redis://localhost".into(),
+            workspace_id: "ws-plain".into(),
+            consumer_group: "cg-plain".into(),
+            max_retries: 3,
+            ..DagExecutorConfig::default()
+        },
+        backend.clone(),
+    );
+
+    let messages: Arc<dyn MessageBackend> = Arc::new(backend.clone());
+    let manager = Arc::new(GlobalAgentManager::new(
+        Arc::new(MemoryAgentRegistry::new()),
+        messages,
+        Arc::new(MemoryStateBackend::new()) as Arc<dyn StateBackend>,
+    ));
+    runtime
+        .orchestrator()
+        .attach_agent_manager(manager.clone() as Arc<dyn AgentManager>);
+
+    let name = cog_core::agent_id_for("task-plain", "executor");
+    manager
+        .create_agent(
+            &name,
+            "executor",
+            Arc::new(MockLLMProvider::new()),
+            Some("task-plain"),
+        )
+        .await
+        .expect("create");
+
+    runtime
+        .submit_goal("plain-goal", vec![make_test_task("task-plain")])
+        .await
+        .unwrap();
+    runtime.publish_ready_tasks().await.unwrap();
+    runtime
+        .orchestrator()
+        .start_task("task-plain")
+        .await
+        .unwrap();
+
+    backend
+        .publish(
+            "orchestrator:results:ws-plain",
+            &serde_json::to_vec(&DagMessage::TaskComplete {
+                message_id: "msg-plain".into(),
+                timestamp: chrono::Utc::now(),
+                task_id: "task-plain".into(),
+                result: serde_json::json!({"status": "ok"}),
+                sender: "executor".into(),
+                recipient: "orchestrator".into(),
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let shutdown = ShutdownSignal::new();
+    let s = shutdown.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        s.trigger();
+    });
+    runtime.run_consumer(shutdown).await.unwrap();
+
+    let t = runtime.orchestrator().get_task("task-plain").await.unwrap();
+    assert_eq!(t.status, TaskStatus::Completed);
+    assert!(
+        t.sink_task_id.is_none() && t.parent_task_id.is_none(),
+        "this task declares no sink: it is the case that a sink-only hook misses"
+    );
+    assert!(
+        manager.list_workers().await.is_empty(),
+        "a task in a terminal state still holds its agent: the release is on \
+         the sink path rather than on every terminal path"
     );
 }
 
