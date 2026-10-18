@@ -300,13 +300,6 @@ pub fn global() -> Option<Arc<BuildGate>> {
     GLOBAL.get().cloned()
 }
 
-/// The gate as `cog-core` reaches it.
-///
-/// The wrapper exists because the exclusion is asked for on an `Arc<BuildGate>`
-/// -- the permit keeps the gate alive while it is held -- and because the gate
-/// itself does not depend on `cog-core`'s traits. What the account and the cache
-/// pass see is the three answers below, taken from the process-wide gate.
-
 /// The host-wide build gate, handed to the cache pass as its exclusion.
 ///
 /// The wrapper rather than a bare `Arc<BuildGate>` because `CacheSlot` is
