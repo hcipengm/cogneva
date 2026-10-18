@@ -9837,7 +9837,7 @@ exit 0
         // already paid for goes out, and the next round takes the newer tip.
         let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap_or_default();
         assert!(
-            calls.contains(&job_name(&rev_a)) || calls.contains(&rev12(&rev_a)),
+            calls.contains(&job_name(&rev_a)) || calls.contains(rev12(&rev_a)),
             "a revision the tip still contains has to be rolled out: {calls}"
         );
         assert!(
@@ -9964,7 +9964,7 @@ exit 0
 
         let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap_or_default();
         assert!(
-            calls.contains(&job_name(&rev_a)) || calls.contains(&rev12(&rev_a)),
+            calls.contains(&job_name(&rev_a)) || calls.contains(rev12(&rev_a)),
             "the built revision is dispatched even though the tip moved on: {calls}"
         );
         assert!(
