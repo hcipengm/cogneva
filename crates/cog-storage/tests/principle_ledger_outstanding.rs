@@ -69,6 +69,18 @@ async fn store() -> (PostgresPrincipleLedgerStore, PgPool, String) {
         .await
         .expect("connect to the database");
     let store = PostgresPrincipleLedgerStore::new(pool.clone());
+    // A case that panics skips its own cleanup, and the pass bound is global:
+    // debris from an earlier run takes the head of the set and reddens cases
+    // that are themselves sound. Clearing this probe's prefix at setup makes a
+    // rerun mean what a first run meant.
+    for table in ["principle_ledger", "principle_ledger_declared"] {
+        sqlx::query(&format!(
+            "DELETE FROM {table} WHERE slug LIKE 'probe-principle-outstanding:%'"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("clear leftover rows in {table}: {e}"));
+    }
     (
         store,
         pool,
@@ -358,15 +370,17 @@ async fn the_rows_a_person_holds_are_still_in_the_set() {
     cleanup(&pool, &marker).await;
 }
 
-/// File one row whose host column carries `host_gate`, and return its slug.
+/// File one row of tier `tier` whose host column carries `host_gate`, and return
+/// its slug.
 async fn file_with_gate(
     store: &PostgresPrincipleLedgerStore,
     marker: &str,
     label: &str,
+    tier: PrincipleCheckKind,
     host_gate: &str,
 ) -> String {
     let slug = format!("{marker}/{label}");
-    let mut row = reading(&slug, PrincipleCheckKind::Tree);
+    let mut row = reading(&slug, tier);
     row.host_gate = Some(host_gate.to_string());
     store.declare(&[row]).await.expect("queue the reading");
     for _ in 0..4 {
@@ -396,7 +410,14 @@ async fn file_with_gate(
 async fn a_retired_row_leaves_the_pass_and_returns_when_its_carrier_does() {
     let _pass = PASS.lock().await;
     let (store, pool, marker) = store().await;
-    let slug = file_with_gate(&store, &marker, "gone", "retired:carrier_not_in_tree").await;
+    let slug = file_with_gate(
+        &store,
+        &marker,
+        "gone",
+        PrincipleCheckKind::Tree,
+        "retired:carrier_not_in_tree",
+    )
+    .await;
 
     let mut measurement =
         cog_core::PrincipleMeasurement::new(slug.clone(), cog_core::PrincipleState::Retired);
@@ -421,7 +442,7 @@ async fn a_retired_row_leaves_the_pass_and_returns_when_its_carrier_does() {
 
     // The carrier comes back: the host's next reading no longer carries the
     // retire marker, and that value change is the whole signal.
-    file_with_gate(&store, &marker, "gone", "-").await;
+    file_with_gate(&store, &marker, "gone", PrincipleCheckKind::Tree, "-").await;
     let looked: Vec<String> = store
         .outstanding(PASS_BOUND)
         .await
@@ -433,6 +454,47 @@ async fn a_retired_row_leaves_the_pass_and_returns_when_its_carrier_does() {
     assert!(
         looked.contains(&slug),
         "a row whose carrier returned must be measured again; got {looked:?}"
+    );
+    cleanup(&pool, &marker).await;
+}
+
+/// A retirement reading for a `judgement` row is not buried by the debt ahead of
+/// it.
+///
+/// The tier ordering exists because a person-held row never leaves the set; it
+/// is wrong for a row that is about to leave. A retired `judgement` row has no
+/// declaration left to rescue it either -- the carrier's removal is what removed
+/// the declaration -- so with more debt than one pass takes it would keep the
+/// marker and never reach the state the marker stands for, and every reader of
+/// the state column would see the same empty cell as a row nobody has got to.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_retirement_reading_is_not_buried_by_the_debt_ahead_of_it() {
+    let _pass = PASS.lock().await;
+    let (store, pool, marker) = store().await;
+    file(&store, &marker, "debt", 3, PrincipleCheckKind::Tree).await;
+    let slug = file_with_gate(
+        &store,
+        &marker,
+        "gone",
+        PrincipleCheckKind::Judgement,
+        "retired:carrier_not_in_tree",
+    )
+    .await;
+
+    let looked: Vec<String> = store
+        .outstanding(2)
+        .await
+        .expect("read the outstanding set")
+        .into_iter()
+        .map(|row| row.slug)
+        .filter(|s| s.starts_with(&marker))
+        .collect();
+
+    assert!(
+        looked.contains(&slug),
+        "a pass with room for two must reach the row that is waiting to leave; \
+         got {looked:?}"
     );
     cleanup(&pool, &marker).await;
 }

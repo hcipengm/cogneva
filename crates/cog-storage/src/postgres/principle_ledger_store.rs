@@ -342,13 +342,25 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
         // later measurement can move, not a tombstone. The comparison lives here
         // rather than in the fold because the fold is also the path that writes
         // the marker: one place would have to be read twice to see both halves.
+        //
+        // A row still carrying the marker sorts ahead of everything. The tier
+        // ordering below would otherwise put a retirement reading for a
+        // `judgement` row behind every unsettled row, and there is always more
+        // unsettled work than one pass takes -- while the rescue path cannot
+        // reach it either, because the carrier's removal is what removed the
+        // declaration. That row would keep the marker and never reach the state
+        // the marker stands for, which is the one thing the retirement reading
+        // was written to prevent. Retirement readings are bounded by how many
+        // carriers leave the roster and they clear as the marker is folded, so
+        // spending the head of the pass on them costs nothing that was waiting.
         let rows = sqlx::query(&format!(
             "SELECT {ROW_COLUMNS} FROM principle_ledger \
              WHERE state IS DISTINCT FROM 'enforced' \
                AND (state IS DISTINCT FROM 'retired' \
                     OR host_gate IS NULL \
                     OR host_gate NOT LIKE 'retired:%') \
-             ORDER BY (check_kind IS NOT DISTINCT FROM 'judgement') ASC, \
+             ORDER BY (COALESCE(host_gate, '') LIKE 'retired:%') DESC, \
+                      (check_kind IS NOT DISTINCT FROM 'judgement') ASC, \
                       measured_at ASC NULLS FIRST, first_seen_at ASC \
              LIMIT $1"
         ))
