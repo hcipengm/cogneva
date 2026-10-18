@@ -404,6 +404,11 @@ impl DagExecutorRuntime {
             ("covered", covered),
             ("pool", pool),
             ("reserve", reserve),
+            // The traffic face: whether this pass had anything to decide. An
+            // output of zero with an input of zero says nothing about how the
+            // gate behaves under pressure, and `owed` is a different quantity
+            // -- work already in flight, not work asking to go out.
+            ("ready", (admitted + held) as f64),
             ("owed", owed as f64),
             ("admitted", admitted as f64),
         ] {

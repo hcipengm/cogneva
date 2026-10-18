@@ -690,8 +690,12 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          bounded when every member is measured), reserve (tokens one job was \
          measured to need; 0 when no job size was measured or no status was \
          read at all), window_jobs (jobs the remaining allowance pays for), \
-         owed (tasks already scheduled or running on that queue) and admitted \
-         (tasks put on the wire). window_jobs is written only when bounded is \
+         ready (tasks that asked to go out this pass -- the traffic face: an \
+         admitted of zero with a ready of zero says nothing about how the gate \
+         behaves under load, and owed is a different quantity, work already in \
+         flight rather than work asking to leave), owed (tasks already \
+         scheduled or running on that queue) and admitted (tasks put on the \
+         wire). window_jobs is written only when bounded is \
          1: an unmeasured window is not a window that pays for zero jobs, and \
          a zero there would read as the strongest possible refusal. covered, \
          pool and reserve are written on every pass, zeros included, because \
