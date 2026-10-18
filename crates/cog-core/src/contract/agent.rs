@@ -394,12 +394,34 @@ pub struct WorkerInfo {
 pub trait AgentManager: Send + Sync {
     /// Create and start a new agent worker with the given role and LLM provider.
     /// Returns a shareable handle to the object-level [`Agent`] trait.
+    ///
+    /// `task_id` is the task this agent works for, or `None` for an agent that
+    /// lives as long as the process. It is the only thing that ties an object
+    /// to the task whose terminal state should let it go: names differ per role
+    /// and per branch, so nothing can recover the owner from the name, and a
+    /// name-shaped guess would retire an agent on another task's completion.
     async fn create_agent(
         &self,
         agent_id: &str,
         role: &str,
         llm: std::sync::Arc<dyn crate::llm::LlmClient>,
+        task_id: Option<&str>,
     ) -> crate::SFResult<std::sync::Arc<dyn crate::Agent>>;
+
+    /// Retire every agent this manager created for `task_id`, returning how many
+    /// it let go.
+    ///
+    /// Called once a task has reached a terminal state, which is the only point
+    /// where this is safe: a task that goes back on the queue is executed again
+    /// and must keep the object it already has, while a terminal task is never
+    /// requeued, so nothing can create a same-named successor underneath the
+    /// retirement.
+    ///
+    /// An agent whose retirement could not stop its consumer inside the budget
+    /// is still retired: the count reports what left the roster, and the
+    /// timeout is reported as its own series rather than folding the two into
+    /// one number.
+    async fn retire_task_agents(&self, task_id: &str) -> crate::SFResult<usize>;
 
     /// Dispatch a message using round-robin selection among managed agents.
     async fn dispatch(&self, msg: InboxMessage) -> crate::SFResult<()>;

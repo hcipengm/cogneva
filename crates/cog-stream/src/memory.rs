@@ -24,6 +24,12 @@ struct MemoryChannelState {
 pub struct MemoryMessageBackend {
     channels: Arc<Mutex<HashMap<String, MemoryChannelState>>>,
     broadcast_capacity: usize,
+    /// Where a caller says "stop reading" to a stream this backend opened.
+    ///
+    /// A watch channel rather than a flag: the reader is parked on a broadcast
+    /// receive, and a flag it only reads between messages would never be seen
+    /// by an idle subscriber.
+    stops: Arc<Mutex<HashMap<(String, String), tokio::sync::watch::Sender<bool>>>>,
 }
 
 impl MemoryMessageBackend {
@@ -31,7 +37,16 @@ impl MemoryMessageBackend {
         Self {
             channels: Arc::new(Mutex::new(HashMap::new())),
             broadcast_capacity: 1024,
+            stops: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Register a fresh stop signal for a subscription and return its receiver.
+    fn register_stop(&self, subject: &str, group: &str) -> tokio::sync::watch::Receiver<bool> {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let mut stops = self.stops.lock().unwrap();
+        stops.insert((subject.to_string(), group.to_string()), tx);
+        rx
     }
 
     pub fn with_broadcast_capacity(mut self, capacity: usize) -> Self {
@@ -102,9 +117,10 @@ impl MessageBackend for MemoryMessageBackend {
         Ok(())
     }
 
-    async fn subscribe(&self, subject: &str, _group: &str) -> SFResult<MessageStream> {
+    async fn subscribe(&self, subject: &str, group: &str) -> SFResult<MessageStream> {
         let state = self.get_or_create_state(subject);
         let mut rx = state.sender.subscribe();
+        let stop = self.register_stop(subject, group);
 
         let mut pending: Vec<(String, Vec<u8>)> = state.buffer.clone();
         while let Ok(msg) = rx.try_recv() {
@@ -112,18 +128,36 @@ impl MessageBackend for MemoryMessageBackend {
         }
 
         let stream = futures::stream::iter(pending.into_iter().map(Ok)).chain(
-            futures::stream::unfold(rx, |mut rx| async move {
-                match rx.recv().await {
-                    Ok((id, bytes)) => Some((Ok((id, bytes)), rx)),
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        Some((Err(SFError::Backpressure), rx))
-                    }
+            futures::stream::unfold((rx, stop), |(mut rx, mut stop)| async move {
+                tokio::select! {
+                    received = rx.recv() => match received {
+                        Ok((id, bytes)) => Some((Ok((id, bytes)), (rx, stop))),
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            Some((Err(SFError::Backpressure), (rx, stop)))
+                        }
+                    },
+                    // Both a signalled stop and a dropped sender end the read:
+                    // nothing will be delivered either way, and a subscriber
+                    // that stays parked would never find that out.
+                    _ = stop.changed() => None,
                 }
             }),
         );
 
         Ok(Box::pin(stream))
+    }
+
+    async fn stop_stream(&self, subject: &str, group: &str) {
+        let sender = {
+            let stops = self.stops.lock().unwrap();
+            stops
+                .get(&(subject.to_string(), group.to_string()))
+                .cloned()
+        };
+        if let Some(sender) = sender {
+            let _ = sender.send(true);
+        }
     }
 
     async fn subscribe_from(

@@ -1,4 +1,5 @@
 use cog_core::{AgentEvent, AgentState, InboxMessage, SFError, SFResult};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 
@@ -8,6 +9,42 @@ use crate::tools::ToolRegistry;
 use cog_core::RuntimeConfig;
 
 use futures::StreamExt;
+
+/// How long a retirement waits for the consumer to end.
+///
+/// Two things set the floor: a backend read blocks for at most one block period
+/// (five seconds by default) and the stop flag is only seen between reads, and
+/// then the message the handler is inside has to finish. Ten seconds is where
+/// an idle consumer always makes it and a busy one is always worth a line — it
+/// is a judgement about the wait, not a percentile of task duration.
+const AGENT_RETIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What one call to [`Agent::retire`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetireReport {
+    /// Whether this call is the one that retired the object. False on a repeat,
+    /// and the other two fields then describe nothing that happened.
+    pub performed: bool,
+    /// Whether the consumer task ended inside the budget.
+    pub consumer_ended: bool,
+    /// Whether the agent was running a turn when it was asked to leave.
+    ///
+    /// Kept apart from `consumer_ended` because the two misses are different
+    /// faults: a busy agent that does not stop means the budget is smaller than
+    /// its turns, an idle one that does not stop means the read loop never saw
+    /// the signal.
+    pub was_busy: bool,
+}
+
+impl RetireReport {
+    fn already_retired() -> Self {
+        Self {
+            performed: false,
+            consumer_ended: true,
+            was_busy: false,
+        }
+    }
+}
 
 pub enum AgentCommand {
     Prompt {
@@ -103,6 +140,13 @@ pub struct Agent {
     heartbeat_interval_secs: u64,
     /// Poll interval for wait_for_idle in milliseconds.
     wait_for_idle_poll_ms: u64,
+    /// Set once this object has been retired, and never cleared.
+    ///
+    /// It is what keeps a retired object out of circulation: the manager's
+    /// create path checks it under the lock it inserts into, so a name whose
+    /// object was retired is given a new one instead of the dead consumer that
+    /// would accept messages and answer none of them.
+    retired: AtomicBool,
 }
 
 struct AgentInner {
@@ -161,6 +205,7 @@ impl Agent {
             loop_event_channel_capacity,
             heartbeat_interval_secs: 10,
             wait_for_idle_poll_ms: 50,
+            retired: AtomicBool::new(false),
         }
     }
 
@@ -696,6 +741,127 @@ impl Agent {
         // Restart the background task
         self.start().await;
         Ok(())
+    }
+
+    /// Whether [`Self::retire`] has been called on this object.
+    pub fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::SeqCst)
+    }
+
+    /// Leave for good: stop the consumer, stop the heartbeat, deregister, and
+    /// mark the object so no caller is ever handed it again.
+    ///
+    /// This is not [`Self::abort`]. `abort` cancels the current run and then
+    /// starts the agent again — it resets, it does not leave. Everything that
+    /// makes an agent cost something (a consumer, a socket, a registry entry)
+    /// survives it. `retire` is the one-way door.
+    ///
+    /// The consumer is stopped by telling its read loop to finish, not by
+    /// dropping the loop's future. A cancelled `XREADGROUP` may already have
+    /// been answered — the server put the message in the group's pending list
+    /// while the client threw the answer away without acking it — and nothing
+    /// in this tree reclaims a pending entry. The flag is read between reads,
+    /// so leaving costs at most one block period and loses nothing.
+    ///
+    /// Idempotent: the second call reports `performed: false` and touches
+    /// nothing, so a task that reaches its terminal state twice does not pay
+    /// for the same retirement twice.
+    ///
+    /// A consumer that outlasts the budget is reported, not raised: the object
+    /// has left the roster by then either way, and an error would leave the
+    /// caller unable to tell "the message outlived the wait" from "the
+    /// retirement did not happen".
+    pub async fn retire(&self) -> RetireReport {
+        if self.retired.swap(true, Ordering::SeqCst) {
+            return RetireReport::already_retired();
+        }
+
+        // Read before anything is torn down: afterwards the state says Inactive
+        // no matter what the agent was doing, and "it was busy" is the
+        // difference between a retirement that waited for a turn and one that
+        // gave up on it.
+        let was_busy = {
+            let inner = self.inner.lock().await;
+            matches!(inner.state, AgentState::Active | AgentState::Completing)
+        };
+
+        let consumer_stopped = self.stop_consumer().await;
+
+        if let Some(ref lifecycle) = self.lifecycle {
+            let agent_id = &self.config.agent_id;
+            let _ = lifecycle.stop_heartbeat(agent_id).await;
+            let _ = lifecycle.transition(agent_id, AgentState::Inactive).await;
+        }
+        if let Some(ref registry) = self.registry {
+            if let Err(e) = registry.deregister(&self.config.agent_id).await {
+                // A registry that cannot drop the entry is worth a line, but it
+                // does not make the object live again: the local roster is what
+                // decides who is handed out, and it is about to lose this one.
+                tracing::warn!(
+                    agent_id = %self.config.agent_id,
+                    "retire could not deregister the agent: {e}"
+                );
+            }
+        }
+
+        {
+            let mut inner = self.inner.lock().await;
+            if let Some(handle) = inner.registry_heartbeat_handle.take() {
+                handle.abort();
+            }
+            if let Some(handle) = inner.task_handle.take() {
+                handle.abort();
+            }
+            inner.cmd_tx = None;
+            inner.state = AgentState::Inactive;
+        }
+
+        if !consumer_stopped {
+            // The loop is told either way; what timed out is only the wait for
+            // it to finish, which means the handler it is inside is still
+            // running. This is a reading, not a failure of the retirement: the
+            // object is out of the roster either way, and a caller that turned
+            // it into an error would have no way to say which of "the message
+            // outlived the budget" and "the retirement did not happen" it saw.
+            tracing::warn!(
+                agent_id = %self.config.agent_id,
+                busy = was_busy,
+                budget_secs = AGENT_RETIRE_TIMEOUT.as_secs(),
+                "agent retired, but its consumer was still running when the budget ran out"
+            );
+        }
+        RetireReport {
+            performed: true,
+            consumer_ended: consumer_stopped,
+            was_busy,
+        }
+    }
+
+    /// Tell this agent's read loop to finish and wait for its task to end.
+    ///
+    /// Returns whether the loop ended inside the retirement budget. A backend
+    /// the agent never attached has no loop to stop, which counts as stopped:
+    /// there is nothing left running behind the object.
+    async fn stop_consumer(&self) -> bool {
+        let Some(backend) = self.message_backend.clone() else {
+            return true;
+        };
+        let consumer = crate::consumer::AgentConsumer::new(&self.config.agent_id, backend.clone());
+        let inbox = consumer.inbox_stream().to_string();
+        let group = format!("agent-{}", self.config.agent_id);
+
+        let handle = {
+            let mut inner = self.inner.lock().await;
+            inner.consumer_handle.take()
+        };
+        backend.stop_stream(&inbox, &group).await;
+        let Some(handle) = handle else {
+            return true;
+        };
+        matches!(
+            tokio::time::timeout(AGENT_RETIRE_TIMEOUT, handle).await,
+            Ok(_)
+        )
     }
 
     /// Wait until the agent is no longer active or completing.

@@ -32,7 +32,12 @@ pub(crate) async fn create_role_agent(
     role: &str,
 ) -> SFResult<Arc<dyn Agent>> {
     let agent = manager
-        .create_agent(&cog_core::agent_id_for(task_id, role), role, llm.clone())
+        .create_agent(
+            &cog_core::agent_id_for(task_id, role),
+            role,
+            llm.clone(),
+            Some(task_id),
+        )
         .await?;
     resume_if_checkpointed(state, &agent, task_id, role).await;
     Ok(agent)

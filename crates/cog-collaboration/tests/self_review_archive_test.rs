@@ -172,6 +172,7 @@ impl AgentManager for MockAgentManager {
         _agent_id: &str,
         role: &str,
         _llm: Arc<dyn LlmClient>,
+        _task_id: Option<&str>,
     ) -> cog_core::SFResult<Arc<dyn Agent>> {
         let response = match role {
             "generator" => serde_json::json!({
@@ -206,6 +207,11 @@ impl AgentManager for MockAgentManager {
 
     async fn shutdown(&self) -> cog_core::SFResult<()> {
         Ok(())
+    }
+
+    async fn retire_task_agents(&self, _task_id: &str) -> cog_core::SFResult<usize> {
+        // 每次调用现造一个替身，没有名册可收。
+        Ok(0)
     }
 
     async fn get_agent(&self, _agent_id: &str) -> cog_core::SFResult<Option<Arc<dyn Agent>>> {

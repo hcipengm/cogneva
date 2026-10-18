@@ -130,6 +130,7 @@ impl cog_core::AgentManager for MockAgentManager {
         _agent_id: &str,
         role: &str,
         _llm: Arc<dyn cog_core::LlmClient>,
+        _task_id: Option<&str>,
     ) -> cog_core::SFResult<Arc<dyn cog_core::Agent>> {
         let response = match role {
             "planner" => serde_json::json!({
@@ -162,6 +163,11 @@ impl cog_core::AgentManager for MockAgentManager {
 
     async fn shutdown(&self) -> cog_core::SFResult<()> {
         Ok(())
+    }
+
+    async fn retire_task_agents(&self, _task_id: &str) -> cog_core::SFResult<usize> {
+        // 这个替身不持有名册，没有对象可以回收。
+        Ok(0)
     }
 
     async fn get_agent(

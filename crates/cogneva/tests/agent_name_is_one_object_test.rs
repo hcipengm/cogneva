@@ -33,11 +33,11 @@ async fn creating_the_same_name_twice_returns_the_same_agent() {
     let name = cog_core::agent_id_for("task-1", "planner");
 
     let first = manager
-        .create_agent(&name, "planner", llm.clone())
+        .create_agent(&name, "planner", llm.clone(), Some("task-1"))
         .await
         .expect("first create");
     let second = manager
-        .create_agent(&name, "planner", llm.clone())
+        .create_agent(&name, "planner", llm.clone(), Some("task-1"))
         .await
         .expect("second create");
 
@@ -62,6 +62,7 @@ async fn a_different_task_gets_its_own_agent() {
             &cog_core::agent_id_for("task-a", "planner"),
             "planner",
             llm.clone(),
+            Some("task-a"),
         )
         .await
         .expect("create a");
@@ -70,6 +71,7 @@ async fn a_different_task_gets_its_own_agent() {
             &cog_core::agent_id_for("task-b", "planner"),
             "planner",
             llm.clone(),
+            Some("task-b"),
         )
         .await
         .expect("create b");

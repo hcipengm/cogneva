@@ -11,7 +11,9 @@
 use async_trait::async_trait;
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, RedisError};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::read_health::{ReadHealth, ReadRefusal};
 use cog_core::{MessageBackend, MessageStream, SFError, SFResult};
@@ -40,6 +42,13 @@ pub struct RedisMessageBackend {
     /// itself stays in milliseconds.
     read_block_ms: usize,
     resume_block_ms: usize,
+    /// Where a caller says "stop reading" to the loop `subscribe` opened, keyed
+    /// by stream and group.
+    ///
+    /// The loop reads this between requests, never while one is on the wire: a
+    /// cancelled `XREADGROUP` can have been answered, and the message the
+    /// server already put in the pending list would then be lost without an ack.
+    stops: Mutex<HashMap<(String, String), Arc<AtomicBool>>>,
 }
 
 impl RedisMessageBackend {
@@ -83,7 +92,20 @@ impl RedisMessageBackend {
             health,
             read_block_ms: read_block_ms as usize,
             resume_block_ms: resume_block_ms as usize,
+            stops: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Register a fresh stop flag for a read loop and return it.
+    ///
+    /// Replacing the entry rather than reusing it matters when a name is
+    /// subscribed again after its previous consumer was retired: the old loop
+    /// holds its own clone and the new one must start unsignalled.
+    fn register_stop(&self, subject: &str, group: &str) -> Arc<AtomicBool> {
+        let fresh = Arc::new(AtomicBool::new(false));
+        let mut stops = self.stops.lock().unwrap_or_else(|e| e.into_inner());
+        stops.insert((subject.to_string(), group.to_string()), fresh.clone());
+        fresh
     }
 
     /// The read health of this process's consumers, for publishing.
@@ -192,17 +214,30 @@ impl MessageBackend for RedisMessageBackend {
         let health = self.read_health();
         let guard = ReadHealth::track(&health, &subject, &group);
         let block_ms = self.read_block_ms;
+        let stop = self.register_stop(&subject, &group);
         let stream = futures::stream::try_unfold(
-            (conn, 0u64, guard),
-            move |(mut conn, mut backoff, guard)| {
+            (conn, 0u64, guard, stop),
+            move |(mut conn, mut backoff, guard, stop)| {
                 let subject = subject.clone();
                 let group = group.clone();
                 async move {
                     loop {
+                        // Asked between reads, not raced against one: the read
+                        // below has already been answered when it returns, so a
+                        // stop seen here costs at most one block period and
+                        // leaves nothing delivered-but-unacked.
+                        if stop.load(Ordering::Relaxed) {
+                            tracing::debug!(
+                                stream = %subject,
+                                group = %group,
+                                "read loop stopped by request"
+                            );
+                            return Ok(None);
+                        }
                         match group_read(&mut conn, &subject, &group, ">", block_ms).await {
                             Ok(Some(item)) => {
                                 guard.note_ok();
-                                return Ok(Some((item, (conn, 0, guard))));
+                                return Ok(Some((item, (conn, 0, guard, stop))));
                             }
                             Ok(None) => {
                                 guard.note_ok();
@@ -223,6 +258,26 @@ impl MessageBackend for RedisMessageBackend {
         );
 
         Ok(Box::pin(stream))
+    }
+
+    async fn stop_stream(&self, subject: &str, group: &str) {
+        let flag = {
+            let stops = self.stops.lock().unwrap_or_else(|e| e.into_inner());
+            stops
+                .get(&(subject.to_string(), group.to_string()))
+                .map(Arc::clone)
+        };
+        match flag {
+            Some(flag) => flag.store(true, Ordering::Relaxed),
+            // No loop is reading this pair in this process. Nothing to stop,
+            // and nothing to report: a caller retiring an agent whose consumer
+            // already ended is the normal case when the loop failed on start.
+            None => tracing::debug!(
+                stream = %subject,
+                group = %group,
+                "stop requested for a stream this process is not reading"
+            ),
+        }
     }
 
     async fn subscribe_from(

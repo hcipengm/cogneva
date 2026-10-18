@@ -107,6 +107,27 @@ pub trait MessageBackend: Send + Sync {
         start_id: &str,
     ) -> SFResult<MessageStream>;
 
+    /// End the read loop that [`Self::subscribe`] opened for `subject` and
+    /// `group` in this process, by letting the read already on the wire finish
+    /// rather than by dropping its future.
+    ///
+    /// The distinction is the whole point of this method. A cancelled
+    /// `XREADGROUP` may already have been answered: the server put the message
+    /// in the group's pending list and the client threw the answer away without
+    /// acking it, and nothing in this tree reclaims a pending entry. A loop
+    /// that checks a flag between reads leaves with at most one block period of
+    /// latency and no message in flight, so that is the only way a consumer may
+    /// be asked to stop.
+    ///
+    /// Returns once the loop has been told; the caller still joins its own
+    /// task, because the loop ends after the read it is waiting on.
+    ///
+    /// Required rather than defaulted: an empty default would let a backend
+    /// that really does block on a read inherit "stopped nothing" while every
+    /// caller believes the read has ended, and the difference is only visible
+    /// as a consumer that never exits.
+    async fn stop_stream(&self, subject: &str, group: &str);
+
     /// Create a consumer group on the target stream if it does not exist.
     async fn create_consumer_group(&self, stream: &str, group: &str) -> SFResult<()>;
 

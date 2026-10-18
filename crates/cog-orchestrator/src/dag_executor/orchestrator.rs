@@ -64,6 +64,15 @@ pub struct DagExecutor {
     /// after this crate; absent, a repair is only a log line, which is the one
     /// place a recurring fault can go on happening unread.
     metrics: std::sync::RwLock<Option<Arc<dyn cog_core::MetricsBackend>>>,
+    /// Where the agents a task created are let go once it reaches a terminal
+    /// state.
+    ///
+    /// Attached after construction, like the metrics backend: the pool is built
+    /// after this executor, so a constructor argument would mean building them
+    /// in the other order for the sake of one field. Absent, a terminal task
+    /// retires nothing and the roster keeps growing — which is the state this
+    /// field exists to end, so it is wired in the same place the pool is.
+    agent_manager: std::sync::RwLock<Option<Arc<dyn cog_core::AgentManager>>>,
 }
 
 /// 为什么一个 Running 任务需要被回收。
@@ -185,7 +194,17 @@ impl DagExecutor {
             archive_after_secs: 3600,
             archive_poll_interval_secs: 300,
             metrics: std::sync::RwLock::new(None),
+            agent_manager: std::sync::RwLock::new(None),
         }
+    }
+
+    /// Attach the pool whose agents this executor retires at a task's terminal
+    /// state. Called once at start-up; a second call replaces the first.
+    pub fn attach_agent_manager(&self, manager: Arc<dyn cog_core::AgentManager>) {
+        *self
+            .agent_manager
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(manager);
     }
 
     /// Attach the metrics backend the DAG's own repairs report to. Called once
@@ -1992,16 +2011,18 @@ impl DagExecutor {
         Ok(())
     }
 
-    /// 汇点走到终态时，把它的终态与答案抄到声明了它的那一行上。
+    /// 任务走到终态时要做的事：先把它名下的 agent 放掉，再把它的终态与答案
+    /// 抄到声明了它的那一行上。
+    ///
+    /// 两件事共用这一个判据，因为**终态只有一处定义**：多叫一次只是多读一行、
+    /// 多回收一次（回收是幂等的），叫漏一次不会写错——漏掉的那条路只会让目标行
+    /// 停在 Pending，由孤儿对账器兜住；而漏掉的回收会让名册一直涨。
     ///
     /// 目标行（不可执行的父占位）自己不执行，谁也不会按它跑出一个结果来——它的终态只能是
     /// 抄来的。抄谁由**声明**说了算：`parent_task_id` 指向的那一行上写着 `sink_task_id`，
     /// 只有它等于本任务的 id 时才抄。读的是声明，不是「谁没有下游」——按后者全局重算，会把
     /// 别的目标的行、单独提交的行一起算成汇点，那正是声明要替掉的那种算法。
-    ///
-    /// 判据（终态）留在这里，不在调用点：多叫一次只是多读一行，叫漏一次不会写错——漏掉的
-    /// 那条路只会让目标行停在 Pending，由孤儿对账器兜住。
-    async fn derive_sink_terminal(&self, task_id: &str) {
+    async fn on_task_terminal(&self, task_id: &str) {
         let Some(mut sink) = self.get_task(task_id).await else {
             return;
         };
@@ -2011,6 +2032,12 @@ impl DagExecutor {
         ) {
             return;
         }
+        // 回收排在抄写之前，且对每个终态任务都做——汇点只是终态任务里的一小类。
+        //
+        // 只按终态回收：回队列的重试（`retried == true`）本来就不调这里，它们下一次
+        // 执行接的应该是同一个对象；按失败回收会让每次记账重试都换一个新对象、丢一次
+        // 上下文、重开一条连接。
+        self.retire_task_agents(task_id).await;
         let Some(parent_id) = sink.parent_task_id.clone() else {
             return;
         };
@@ -2059,6 +2086,34 @@ impl DagExecutor {
         );
     }
 
+    /// 放掉一个终态任务名下的 agent。
+    ///
+    /// 拿不到池子就什么都不做、也不报错：`attach_agent_manager` 与其它启动期装配
+    /// 走同一条路，缺了它这一格，回收就不存在——但这与「任务没有 agent」在行为上
+    /// 是同一件事，只有名册会一直涨。这条缺口由名册的年龄读数现形，不由这里报错。
+    async fn retire_task_agents(&self, task_id: &str) {
+        let manager = self
+            .agent_manager
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(manager) = manager else {
+            return;
+        };
+        match manager.retire_task_agents(task_id).await {
+            Ok(retired) if retired > 0 => tracing::info!(
+                task_id,
+                retired,
+                "retired the agents of a task that reached its terminal state"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                task_id,
+                "could not retire the agents of a terminal task: {e}"
+            ),
+        }
+    }
+
     pub async fn complete_task(
         &self,
         task_id: &str,
@@ -2066,7 +2121,7 @@ impl DagExecutor {
     ) -> SFResult<Vec<String>> {
         if self.fg().is_some() {
             let scheduled = self.complete_task_store(task_id, result).await?;
-            self.derive_sink_terminal(task_id).await;
+            self.on_task_terminal(task_id).await;
             return Ok(scheduled);
         }
         self.ensure_task_present(task_id).await?;
@@ -2153,7 +2208,7 @@ impl DagExecutor {
         crate::observable::global_observable().record_task(true);
 
         self.force_checkpoint().await;
-        self.derive_sink_terminal(task_id).await;
+        self.on_task_terminal(task_id).await;
         Ok(scheduled)
     }
 
@@ -2275,11 +2330,11 @@ impl DagExecutor {
                 .await?;
             // 判死才算终态：回队列的两种（记账重试、环境付账回投）都还没走到头。
             if !retried {
-                self.derive_sink_terminal(task_id).await;
+                self.on_task_terminal(task_id).await;
             }
             // 级联取消也是一条终态——被判死的上游拖下水的那种。
             for dep_id in &cancelled {
-                self.derive_sink_terminal(dep_id).await;
+                self.on_task_terminal(dep_id).await;
             }
             return Ok((retried, cancelled, dlq_pushed));
         }
@@ -2467,9 +2522,9 @@ impl DagExecutor {
 
             crate::observable::global_observable().record_task(false);
             self.force_checkpoint().await;
-            self.derive_sink_terminal(task_id).await;
+            self.on_task_terminal(task_id).await;
             for dep_id in &cancelled {
-                self.derive_sink_terminal(dep_id).await;
+                self.on_task_terminal(dep_id).await;
             }
             Ok((false, cancelled, dlq_pushed)) // permanently failed
         }
@@ -2525,9 +2580,9 @@ impl DagExecutor {
     pub async fn cancel_task(&self, task_id: &str) -> SFResult<Vec<String>> {
         if self.fg().is_some() {
             let cancelled = self.cancel_task_store(task_id).await?;
-            self.derive_sink_terminal(task_id).await;
+            self.on_task_terminal(task_id).await;
             for dep_id in &cancelled {
-                self.derive_sink_terminal(dep_id).await;
+                self.on_task_terminal(dep_id).await;
             }
             return Ok(cancelled);
         }
@@ -2594,9 +2649,9 @@ impl DagExecutor {
 
         drop(inner);
         self.persist_state().await;
-        self.derive_sink_terminal(task_id).await;
+        self.on_task_terminal(task_id).await;
         for dep_id in &cancelled {
-            self.derive_sink_terminal(dep_id).await;
+            self.on_task_terminal(dep_id).await;
         }
         Ok(cancelled)
     }

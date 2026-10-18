@@ -37,21 +37,6 @@ async fn runtime_config_for(
     config
 }
 
-/// The one agent created outside any task, and therefore the one that is
-/// expected to live as long as the process.
-///
-/// The role of every other agent is derived from a task, so a roster entry for
-/// it carries a lifetime that ends with that task. This one does not, and the
-/// age reading is unusable while it is mixed in with the rest: it alone makes
-/// the oldest age climb to the process uptime, hiding any task agent that was
-/// never retired behind a number that always looks old.
-///
-/// A name rather than a role because the caller names this agent, not a role
-/// class. It becomes `task_id.is_none()` once the manager records which task
-/// each agent belongs to; until then this is where the exception is written
-/// down, in one place, next to the field it qualifies.
-const PROCESS_LIFETIME_AGENT_ID: &str = "mode-selector";
-
 /// Handle to a spawned worker agent.
 #[derive(Clone)]
 pub struct WorkerHandle {
@@ -65,6 +50,17 @@ pub struct WorkerHandle {
     /// cannot tell a roster that is working from one that never lets anything
     /// go: both grow, and the difference is only visible as age.
     created_at: std::time::Instant,
+    /// The task this agent works for, when it has one.
+    ///
+    /// A field rather than something read back out of the name. Names are
+    /// derived per role and per branch (`{task}-branch-{n}-{role}`), so parsing
+    /// the task back out of them means the roster's idea of "which task owns
+    /// this" changes shape with every call site that names an agent. The call
+    /// sites already have the task in hand; this is what keeps them from having
+    /// to spell it into a string and hope the reader agrees.
+    ///
+    /// `None` is the process-lifetime agent, which no task will ever retire.
+    task_id: Option<String>,
 }
 
 /// Global agent manager for production multi-agent parallelism.
@@ -203,13 +199,7 @@ impl GlobalAgentManager {
             observer.publish_roster(
                 workers
                     .iter()
-                    .map(|w| {
-                        (
-                            w.role.clone(),
-                            w.created_at,
-                            w.agent_id != PROCESS_LIFETIME_AGENT_ID,
-                        )
-                    })
+                    .map(|w| (w.role.clone(), w.created_at, w.task_id.is_some()))
                     .collect::<Vec<_>>(),
             );
         }
@@ -431,6 +421,10 @@ impl GlobalAgentManager {
             capabilities,
             agent: Arc::new(agent),
             created_at: std::time::Instant::now(),
+            // A worker spawned with a caller-supplied handler is not tied to a
+            // task: nothing here knows one, and inventing an owner would make
+            // an unrelated task's terminal state retire it.
+            task_id: None,
         };
 
         let mut workers = self.workers.write().await;
@@ -472,8 +466,87 @@ impl GlobalAgentManager {
     }
 
     /// Return a snapshot of currently live workers.
+    ///
+    /// Retired objects are left out even while they are still in the roster:
+    /// the roster is also the resume index, and a retired agent handed back to
+    /// a resume pass is an id that resolves to nothing.
     pub async fn list_workers(&self) -> Vec<WorkerHandle> {
-        self.workers.read().await.clone()
+        self.workers
+            .read()
+            .await
+            .iter()
+            .filter(|w| !w.agent.is_retired())
+            .cloned()
+            .collect()
+    }
+
+    /// Retire one agent by name, returning whether it was there to retire.
+    ///
+    /// The retirement itself happens before the roster is touched: an object
+    /// that is already stopped but still listed is one a caller can still reach
+    /// and hand messages to, while an object that is gone from the list but
+    /// still reading is one nobody can find.
+    pub async fn retire_agent(&self, agent_id: &str) -> bool {
+        let target = {
+            let workers = self.workers.read().await;
+            workers
+                .iter()
+                .find(|w| w.agent_id == agent_id)
+                .map(|w| (w.agent.clone(), w.role.clone(), w.task_id.is_some()))
+        };
+        let Some((agent, role, task_scoped)) = target else {
+            return false;
+        };
+        let report = agent.retire().await;
+        self.finish_retirement(&agent, &role, task_scoped, report)
+            .await;
+        true
+    }
+
+    /// Retire every agent this manager created for `task_id`.
+    pub async fn retire_task_agents(&self, task_id: &str) -> usize {
+        let targets: Vec<(Arc<Agent>, String)> = {
+            let workers = self.workers.read().await;
+            workers
+                .iter()
+                .filter(|w| w.task_id.as_deref() == Some(task_id))
+                .map(|w| (w.agent.clone(), w.role.clone()))
+                .collect()
+        };
+        let mut retired = 0;
+        for (agent, role) in targets {
+            let report = agent.retire().await;
+            if report.performed {
+                retired += 1;
+            }
+            self.finish_retirement(&agent, &role, true, report).await;
+        }
+        retired
+    }
+
+    /// Take a retired object out of the roster and count what happened.
+    ///
+    /// Removed by identity rather than by name: a concurrent create may already
+    /// have pushed a fresh object under the same name, and removing by name
+    /// would take that one with it. The counting happens before the early
+    /// return so that a repeat call is still recorded as `performed: false`
+    /// rather than silently vanished.
+    async fn finish_retirement(
+        &self,
+        agent: &Arc<Agent>,
+        role: &str,
+        task_scoped: bool,
+        report: crate::agent::RetireReport,
+    ) {
+        if let Some(observer) = &self.roster_observer {
+            observer.record_retirement(role, task_scoped, report);
+        }
+        if !report.performed {
+            return;
+        }
+        let mut workers = self.workers.write().await;
+        workers.retain(|w| !Arc::ptr_eq(&w.agent, agent));
+        self.publish_roster(&workers);
     }
 
     /// Gracefully shutdown all workers: abort consumers and deregister from registry.
@@ -493,6 +566,7 @@ impl cog_core::AgentManager for GlobalAgentManager {
         agent_id: &str,
         role: &str,
         llm: std::sync::Arc<dyn cog_core::LlmClient>,
+        task_id: Option<&str>,
     ) -> cog_core::SFResult<std::sync::Arc<dyn cog_core::Agent>> {
         // 同一个名字只对应一个活的对象。
         //
@@ -581,6 +655,7 @@ impl cog_core::AgentManager for GlobalAgentManager {
             capabilities,
             agent: std::sync::Arc::new(agent),
             created_at: std::time::Instant::now(),
+            task_id: task_id.map(str::to_string),
         };
 
         let arc_agent: std::sync::Arc<dyn cog_core::Agent> = handle.agent.clone();
@@ -589,11 +664,21 @@ impl cog_core::AgentManager for GlobalAgentManager {
         // 后到的那个把自己刚建好的交出去，交出去的对象随即被丢弃，其消费者
         // 在 `Drop` 里中止。名字下仍然只有一个。
         if let Some(existing) = workers.iter().find(|w| w.agent_id == agent_id) {
-            return Ok(existing.agent.clone());
+            if !existing.agent.is_retired() {
+                return Ok(existing.agent.clone());
+            }
+            // 名下那一个已经退役了。它不是「同一个名字还活着」，而是上一次
+            // 生命留下的空壳：把它交出去，调用方拿到的消费者收得下消息、
+            // 答不出一条。所以摘掉它，让这次新建的接上这个名字。
+            workers.retain(|w| w.agent_id != agent_id);
         }
         workers.push(handle);
         self.publish_roster(&workers);
         Ok(arc_agent)
+    }
+
+    async fn retire_task_agents(&self, task_id: &str) -> cog_core::SFResult<usize> {
+        Ok(self.retire_task_agents(task_id).await)
     }
 
     async fn dispatch(&self, msg: cog_core::InboxMessage) -> cog_core::SFResult<()> {
@@ -622,7 +707,10 @@ impl cog_core::AgentManager for GlobalAgentManager {
     ) -> cog_core::SFResult<Option<std::sync::Arc<dyn cog_core::Agent>>> {
         let workers = self.workers.read().await;
         for w in workers.iter() {
-            if w.agent_id == agent_id {
+            // A retired object is not "the agent under this name" any more: it
+            // accepts messages and answers none, so handing it back is worse
+            // than finding nothing and creating a live one.
+            if w.agent_id == agent_id && !w.agent.is_retired() {
                 let agent: std::sync::Arc<dyn cog_core::Agent> = w.agent.clone();
                 return Ok(Some(agent));
             }

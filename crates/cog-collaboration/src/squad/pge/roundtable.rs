@@ -948,15 +948,30 @@ impl PgeRoundtable {
 
         let prefix = format!("{}-branch-{}", task.id, branch_id);
         let planner = manager
-            .create_agent(&format!("{}-planner", prefix), "planner", llm.clone())
+            .create_agent(
+                &format!("{}-planner", prefix),
+                "planner",
+                llm.clone(),
+                Some(&task.id),
+            )
             .await
             .ok()?;
         let generator = manager
-            .create_agent(&format!("{}-generator", prefix), "generator", llm.clone())
+            .create_agent(
+                &format!("{}-generator", prefix),
+                "generator",
+                llm.clone(),
+                Some(&task.id),
+            )
             .await
             .ok()?;
         let evaluator = manager
-            .create_agent(&format!("{}-evaluator", prefix), "evaluator", llm.clone())
+            .create_agent(
+                &format!("{}-evaluator", prefix),
+                "evaluator",
+                llm.clone(),
+                Some(&task.id),
+            )
             .await
             .ok()?;
 

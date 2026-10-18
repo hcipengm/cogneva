@@ -35,6 +35,12 @@ pub struct NatsMessageBackend {
     pending_acks: Arc<RwLock<HashMap<String, async_nats::jetstream::Message>>>,
     consumer_tuning: ConsumerTuning,
     stream_retention: RetentionPolicy,
+    /// Where a caller says "stop reading" to a subscription this backend
+    /// opened, keyed by subject and group.
+    ///
+    /// A watch channel because a reader parked on the next delivery would never
+    /// look at a flag it only checks between messages.
+    stops: Arc<RwLock<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
 }
 
 /// Key for the in-flight map, and for the lookup `ack` does in it.
@@ -128,6 +134,7 @@ impl NatsMessageBackend {
                 max_ack_pending: config.consumer_max_ack_pending,
             },
             stream_retention: parse_retention(&config.stream_retention)?,
+            stops: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -249,6 +256,17 @@ impl NatsMessageBackend {
         );
         Ok((stream, limit))
     }
+
+    /// Register a fresh stop signal for a subscription and return its receiver.
+    ///
+    /// The entry is replaced rather than reused so a name subscribed again
+    /// after its previous consumer stopped starts unsignalled.
+    fn register_stop(&self, subject: &str, group: &str) -> tokio::sync::watch::Receiver<bool> {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let mut stops = self.stops.write().unwrap_or_else(|e| e.into_inner());
+        stops.insert(pending_key(subject, group, ""), tx);
+        rx
+    }
 }
 
 #[async_trait]
@@ -310,6 +328,23 @@ impl MessageBackend for NatsMessageBackend {
         Ok(())
     }
 
+    async fn stop_stream(&self, subject: &str, group: &str) {
+        let sender = {
+            let stops = self.stops.read().unwrap_or_else(|e| e.into_inner());
+            stops.get(&pending_key(subject, group, "")).cloned()
+        };
+        match sender {
+            Some(sender) => {
+                let _ = sender.send(true);
+            }
+            None => tracing::debug!(
+                stream = %subject,
+                group = %group,
+                "stop requested for a subscription this process is not reading"
+            ),
+        }
+    }
+
     async fn subscribe(&self, subject: &str, group: &str) -> SFResult<MessageStream> {
         let (stream, _limit) = self.ensure_stream(subject).await?;
         let consumer: jetstream::consumer::Consumer<pull::Config> = stream
@@ -327,11 +362,27 @@ impl MessageBackend for NatsMessageBackend {
         // than as the borrowed arguments they arrived as.
         let key_scope = Arc::new((subject.to_string(), group.to_string()));
         let pending = Arc::clone(&self.pending_acks);
-        let stream =
-            futures::stream::try_unfold((messages, pending), move |(mut msgs, pending)| {
+        let stop = self.register_stop(subject, group);
+        let stream = futures::stream::try_unfold(
+            (messages, pending, stop),
+            move |(mut msgs, pending, mut stop)| {
                 let key_scope = Arc::clone(&key_scope);
                 async move {
-                    match msgs.next().await {
+                    // Ending here rather than by dropping the pull is what keeps
+                    // a delivery the broker already made from being lost: an
+                    // unacked message would only come back after its ack window.
+                    let delivered = tokio::select! {
+                        delivered = msgs.next() => delivered,
+                        _ = stop.changed() => {
+                            tracing::debug!(
+                                stream = %key_scope.0,
+                                group = %key_scope.1,
+                                "read loop stopped by request"
+                            );
+                            return Ok(None);
+                        }
+                    };
+                    match delivered {
                         Some(Ok(msg)) => {
                             let seq = msg.info().map(|i| i.stream_sequence).unwrap_or(0);
                             let id = seq.to_string();
@@ -340,7 +391,7 @@ impl MessageBackend for NatsMessageBackend {
                                 .write()
                                 .map_err(|_| SFError::Agent("ack lock poisoned".into()))?
                                 .insert(pending_key(&key_scope.0, &key_scope.1, &id), msg);
-                            Ok(Some(((id, payload), (msgs, pending))))
+                            Ok(Some(((id, payload), (msgs, pending, stop))))
                         }
                         Some(Err(e)) => Err(SFError::DagExecutor(format!(
                             "JetStream message error: {e}"
@@ -348,7 +399,8 @@ impl MessageBackend for NatsMessageBackend {
                         None => Ok(None),
                     }
                 }
-            });
+            },
+        );
 
         Ok(Box::pin(stream))
     }
@@ -387,11 +439,27 @@ impl MessageBackend for NatsMessageBackend {
         // than as the borrowed arguments they arrived as.
         let key_scope = Arc::new((subject.to_string(), group.to_string()));
         let pending = Arc::clone(&self.pending_acks);
-        let stream =
-            futures::stream::try_unfold((messages, pending), move |(mut msgs, pending)| {
+        let stop = self.register_stop(subject, group);
+        let stream = futures::stream::try_unfold(
+            (messages, pending, stop),
+            move |(mut msgs, pending, mut stop)| {
                 let key_scope = Arc::clone(&key_scope);
                 async move {
-                    match msgs.next().await {
+                    // Ending here rather than by dropping the pull is what keeps
+                    // a delivery the broker already made from being lost: an
+                    // unacked message would only come back after its ack window.
+                    let delivered = tokio::select! {
+                        delivered = msgs.next() => delivered,
+                        _ = stop.changed() => {
+                            tracing::debug!(
+                                stream = %key_scope.0,
+                                group = %key_scope.1,
+                                "read loop stopped by request"
+                            );
+                            return Ok(None);
+                        }
+                    };
+                    match delivered {
                         Some(Ok(msg)) => {
                             let seq = msg.info().map(|i| i.stream_sequence).unwrap_or(0);
                             let id = seq.to_string();
@@ -400,7 +468,7 @@ impl MessageBackend for NatsMessageBackend {
                                 .write()
                                 .map_err(|_| SFError::Agent("ack lock poisoned".into()))?
                                 .insert(pending_key(&key_scope.0, &key_scope.1, &id), msg);
-                            Ok(Some(((id, payload), (msgs, pending))))
+                            Ok(Some(((id, payload), (msgs, pending, stop))))
                         }
                         Some(Err(e)) => Err(SFError::DagExecutor(format!(
                             "JetStream message error: {e}"
@@ -408,7 +476,8 @@ impl MessageBackend for NatsMessageBackend {
                         None => Ok(None),
                     }
                 }
-            });
+            },
+        );
 
         Ok(Box::pin(stream))
     }
@@ -513,6 +582,7 @@ impl Clone for NatsMessageBackend {
             pending_acks: Arc::clone(&self.pending_acks),
             consumer_tuning: self.consumer_tuning,
             stream_retention: self.stream_retention,
+            stops: Arc::clone(&self.stops),
         }
     }
 }

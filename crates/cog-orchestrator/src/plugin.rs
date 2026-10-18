@@ -328,6 +328,16 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
             } else {
                 warn!("no MetricsBackend; DAG self-repairs report as log lines only");
             }
+            // Who lets go of a task's agents once the task is terminal. Absent,
+            // every task-scoped agent outlives its task: its object, its bus
+            // connection and its inbox subscription all stay, and a rerun adds
+            // another set beside them. That is a leak that grows with every
+            // retry, so say so here rather than trace it from a rising gauge.
+            if let Some(manager) = ctx.consume_service::<dyn cog_core::AgentManager>() {
+                orch.attach_agent_manager(manager);
+            } else {
+                warn!("no AgentManager; task-scoped agents are never retired at task end");
+            }
             // Start archive background loop
             if ctx.config().dag_executor.archive_enabled {
                 orch.start_archive_loop();

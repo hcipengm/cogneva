@@ -669,6 +669,11 @@ mod ready_pipeline_tests {
                 .push((subject.to_string(), payload.to_vec()));
             Ok(())
         }
+        async fn stop_stream(&self, _subject: &str, _group: &str) {
+            // 这个夹具没有长轮询：它的流要么立刻结束，要么永久 pending，
+            // 没有一条已发出的读需要等它返回，所以没有可停的东西。
+        }
+
         async fn subscribe(&self, _subject: &str, _group: &str) -> SFResult<MessageStream> {
             Ok(Box::pin(futures::stream::pending()))
         }
@@ -991,6 +996,11 @@ mod ready_pipeline_tests {
                 .push((subject.to_string(), payload.to_vec()));
             Ok(())
         }
+        async fn stop_stream(&self, _subject: &str, _group: &str) {
+            // 这个夹具没有长轮询：它的流要么立刻结束，要么永久 pending，
+            // 没有一条已发出的读需要等它返回，所以没有可停的东西。
+        }
+
         async fn subscribe(&self, _subject: &str, _group: &str) -> SFResult<MessageStream> {
             // 吐出预置消息后永久 pending，模拟空流长轮询。
             let items: Vec<(String, Vec<u8>)> = self.queue.lock().await.drain(..).collect();
@@ -1222,6 +1232,11 @@ mod ready_queue_placement_tests {
         async fn publish(&self, _subject: &str, _payload: &[u8]) -> SFResult<()> {
             Ok(())
         }
+        async fn stop_stream(&self, _subject: &str, _group: &str) {
+            // 这个夹具没有长轮询：它的流要么立刻结束，要么永久 pending，
+            // 没有一条已发出的读需要等它返回，所以没有可停的东西。
+        }
+
         async fn subscribe(&self, subject: &str, _group: &str) -> SFResult<MessageStream> {
             self.subscribed.lock().await.push(subject.to_string());
             let items: Vec<(String, Vec<u8>)> = self

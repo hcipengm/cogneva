@@ -54,6 +54,29 @@ pub struct AgentObservable {
     /// "still N alive". So the scrape writes an explicit zero for every role
     /// it has seen, and needs this set to know which those are.
     roster_roles: Mutex<HashMap<String, bool>>,
+    /// How many objects have been retired, keyed by role and lifetime class.
+    ///
+    /// The roster count answers "how many are alive"; this answers "is
+    /// retirement running at all". A roster that stops growing is also what a
+    /// system that stopped creating agents looks like, so the count alone can
+    /// never say whether anything was ever let go.
+    retired_total: Mutex<HashMap<(String, bool), u64>>,
+    /// Retirements whose consumer outlived the budget, keyed by role, lifetime
+    /// class and whether the agent was busy when it was asked to leave.
+    ///
+    /// The two states are kept apart because they call for different repairs: a
+    /// busy agent that will not stop means the budget is smaller than a turn, an
+    /// idle one means the read loop never looked at the signal.
+    retire_timeout_total: Mutex<HashMap<(String, bool, bool), u64>>,
+}
+
+/// The label a role's lifetime class is published under.
+fn lifetime_label(task_scoped: bool) -> &'static str {
+    if task_scoped {
+        "task"
+    } else {
+        "process"
+    }
 }
 
 /// One live agent as the manager holds it.
@@ -183,6 +206,39 @@ impl AgentObservable {
             .roster
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
+    }
+
+    /// Record one retirement, and whether its consumer ended on time.
+    ///
+    /// A repeated call on an already-retired object reports `performed: false`
+    /// and is not counted: a task that reaches its terminal state twice would
+    /// otherwise double its own retirement in the series, and the number would
+    /// stop being "how many objects were let go".
+    pub fn record_retirement(
+        &self,
+        role: &str,
+        task_scoped: bool,
+        report: crate::agent::RetireReport,
+    ) {
+        if !report.performed {
+            return;
+        }
+        {
+            let mut retired = self
+                .retired_total
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *retired.entry((role.to_string(), task_scoped)).or_insert(0) += 1;
+        }
+        if !report.consumer_ended {
+            let mut timeouts = self
+                .retire_timeout_total
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *timeouts
+                .entry((role.to_string(), task_scoped, report.was_busy))
+                .or_insert(0) += 1;
+        }
     }
 
     /// Record a high-level agent run (called by AgentRuntime::run).
@@ -366,7 +422,7 @@ impl Observable for AgentObservable {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             for (role, task_scoped) in roles.iter() {
-                let lifetime = if *task_scoped { "task" } else { "process" };
+                let lifetime = lifetime_label(*task_scoped);
                 let (count, oldest_age) =
                     by_role.get(role.as_str()).copied().unwrap_or((0, f64::NAN));
                 metrics.push(
@@ -386,6 +442,38 @@ impl Observable for AgentObservable {
                             .with_label("lifetime", lifetime),
                     );
                 }
+            }
+        }
+
+        // Retirements, by role and lifetime class. A counter rather than a
+        // gauge: the roster above already says how many are alive, and a roster
+        // that merely stops growing is also what a system that stopped creating
+        // agents looks like. Only this counter tells the two apart.
+        {
+            let retired = self
+                .retired_total
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for ((role, task_scoped), count) in retired.iter() {
+                metrics.push(
+                    RawMetric::new("agent_retired_total", *count as f64)
+                        .with_label("role", role)
+                        .with_label("lifetime", lifetime_label(*task_scoped)),
+                );
+            }
+        }
+        {
+            let timeouts = self
+                .retire_timeout_total
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for ((role, task_scoped, was_busy), count) in timeouts.iter() {
+                metrics.push(
+                    RawMetric::new("agent_retire_timeout_total", *count as f64)
+                        .with_label("role", role)
+                        .with_label("lifetime", lifetime_label(*task_scoped))
+                        .with_label("state", if *was_busy { "busy" } else { "idle" }),
+                );
             }
         }
 

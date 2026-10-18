@@ -272,8 +272,9 @@ impl CollaborationExecutor {
     async fn mode_selector_with_agent(&self) -> ModeSelectorActor {
         let mut ms = self.mode_selector.clone();
         if let (Some(ref manager), Some(ref llm)) = (&self.agent_manager, &self.llm_provider) {
+            // 全进程一个：它不属于任何任务，任何任务的终态都不该把它摘掉。
             match manager
-                .create_agent("mode-selector", "mode_selector", llm.clone())
+                .create_agent("mode-selector", "mode_selector", llm.clone(), None)
                 .await
             {
                 Ok(agent) => ms = ms.with_agent(agent),
@@ -308,6 +309,7 @@ impl CollaborationExecutor {
                 &format!("intent-assessor-{}", task.id),
                 "intent_assessor",
                 llm.clone(),
+                Some(&task.id),
             )
             .await?;
 
@@ -1796,8 +1798,15 @@ mod tests {
             _agent_id: &str,
             _role: &str,
             _llm: std::sync::Arc<dyn cog_core::LlmClient>,
+            _task_id: Option<&str>,
         ) -> cog_core::SFResult<std::sync::Arc<dyn cog_core::Agent>> {
             Ok(std::sync::Arc::clone(&self.agent))
+        }
+
+        async fn retire_task_agents(&self, _task_id: &str) -> cog_core::SFResult<usize> {
+            // 这个替身每次调用交回的都是同一个对象，没有按任务收的名册，
+            // 也就没有可回收的东西。
+            Ok(0)
         }
 
         async fn dispatch(&self, _msg: cog_core::InboxMessage) -> cog_core::SFResult<()> {
