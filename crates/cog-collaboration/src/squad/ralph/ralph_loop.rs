@@ -1111,14 +1111,18 @@ History of previous attempts:\n{history_json}"
     }
 }
 
-/// 被窗口配速拒绝时，睡到拒绝自报的时刻，再让同一轮重来；返回是否继续。
+/// 被窗口配速拒绝时等多久，以及这个等待归谁管；返回「是否就地睡过去」。
 ///
-/// 配速拒绝不是对目标的判词：同一份工作在窗口打开后照样能跑。把它当成终止，
-/// 任务几秒钟就以失败收场，它的主管随即再起一件，下一件撞的是同一堵墙——
-/// 这就是一次额度用尽被放大成一串零 token 重启的形状。等待取拒绝自己给的
+/// 配速拒绝不是对目标的判词：同一份工作在窗口打开后照样能跑。等待取拒绝自己给的
 /// 那个数：它是从额度与窗口直接算出来的时刻，比循环在本地猜一个退避更贴近
 /// 事实。拒绝没给时刻时**不猜**——那正是调用方重试策略该管的事，这里凭空
 /// 睡一觉只会把"没有依据"包装成"有依据"。
+///
+/// 短等待就地睡；长等待交回调度面（见 [`PACED_SLEEP_MAX_SECS`]）。两条路的区别
+/// 不在「等多久」而在「谁在等」：就地睡的那一轮占着派工侧的执行槽，而回投之后
+/// 任务停在队里，不占任何人的槽。所以这里的返回值为 `false` 已经不再等于
+/// 「这一次记死在任务头上」——错误文本里带着自报时长，环境付账那条路会不记账地
+/// 把它放回队列。
 ///
 /// 睡着的那一轮已经记过一次迭代，也照常从预算里扣：预算是尝试次数的上界，
 /// 而这次尝试确实发生了（只是没花出去 token）。
@@ -1131,10 +1135,45 @@ fn pace_sleep_secs(reason: &str) -> Option<u64> {
     cog_core::contract::llm::retry_after_hint_in(reason)
 }
 
+/// 就地睡过的上限。超过它的等待不是「这一轮慢」，是窗口级事件。
+///
+/// 睡着的那一轮占着派工侧的执行槽：订阅循环读到一条消息后先取在途许可再派发，
+/// 许可满了连下一次 `XREADGROUP` 都不再发。于是睡着的任务在消费者眼里与正在
+/// 执行的任务同形，而它其实什么都做不了。
+///
+/// 实测（2026-10-18）：窗口额度为零，拒绝自报 `retry_after_secs=35307`（9.8 小时），
+/// 任务的 `timeout_seconds` 是 3600——这个睡眠永远等不到它要等的时刻，只把一个
+/// 执行槽按满整个时限，四条这样的任务就把 `CLAIM_CONCURRENCY=4` 全部占住，
+/// 整条 ready 流投递停摆。所以超过上限的等待交回调度面：错误文本里带着拒绝自报
+/// 的时长，`the_environment_pays` 凭它回投而不记重试，任务停在队里等那个时刻，
+/// 槽立刻还给下一条。
+///
+/// 已知的读数代价：交回的那一轮在 ralph 面上仍记一次 `Unrecoverable` 终止
+/// （`record_ralph_termination` 带的是 `classify` 出来的 `upstream_unavailable`，
+/// 不是「判死」那一类），下游 hook 也会收到一次 `OnRalphUnrecoverable`。
+/// 分开它们要一个新的 verdict 变体，那会牵动 squad 执行器的分支；今天先记在这里。
+const PACED_SLEEP_MAX_SECS: u64 = 60;
+
+/// 这一轮的等待是在这里睡过去，还是交回调度面。
+///
+/// 单独成函数是为了把边界钉在测试里：睡与不睡是两种处置，不是同一个数的大小。
+fn pace_sleeps_in_place(secs: u64) -> bool {
+    secs <= PACED_SLEEP_MAX_SECS
+}
+
 async fn sleep_through_pace(reason: &str) -> bool {
     let Some(secs) = pace_sleep_secs(reason) else {
         return false;
     };
+    if !pace_sleeps_in_place(secs) {
+        tracing::warn!(
+            wait_secs = secs,
+            max_in_place_secs = PACED_SLEEP_MAX_SECS,
+            reason = %reason,
+            "Ralph Loop：拒绝自报的等待超过就地睡的上限，交回调度面回投，不占着执行槽干等"
+        );
+        return false;
+    }
     tracing::warn!(
         wait_secs = secs,
         reason = %reason,
@@ -1172,6 +1211,21 @@ mod tests {
             pace_sleep_secs(&refused(41_400)),
             Some(cog_core::MAX_RECOVERED_RETRY_AFTER_SECS)
         );
+    }
+
+    /// 窗口级的等待不在这里睡：睡着的任务占着派工侧的执行槽，而消费者分不出
+    /// 「睡着」与「在跑」。实测四条这样的任务把 4 个在途许可占满，整条 ready
+    /// 流投递停摆 20 分钟以上。
+    #[test]
+    fn a_window_scale_wait_is_handed_back_instead_of_slept_through() {
+        // 短等待照旧睡过去：回投一次要重新入队、重新派发，比等一分钟贵。
+        assert!(pace_sleeps_in_place(1));
+        assert!(pace_sleeps_in_place(PACED_SLEEP_MAX_SECS));
+        // 边界之上交回调度面——错误文本里带着自报时长，环境付账、不记重试。
+        assert!(!pace_sleeps_in_place(PACED_SLEEP_MAX_SECS + 1));
+        // 真实读数：窗口额度为零时拒绝自报 35307 秒，被钳到 21600 秒，
+        // 而任务的 timeout_seconds 是 3600——就地睡永远等不到，只占槽。
+        assert!(!pace_sleeps_in_place(21_600));
     }
 
     /// 接不住的情况必须落到 `None`，让调用方照原样终止：额度成墙要走这一跳，

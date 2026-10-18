@@ -429,6 +429,25 @@ impl cog_core::AgentManager for GlobalAgentManager {
         role: &str,
         llm: std::sync::Arc<dyn cog_core::LlmClient>,
     ) -> cog_core::SFResult<std::sync::Arc<dyn cog_core::Agent>> {
+        // 同一个名字只对应一个活的对象。
+        //
+        // 名字是按 (task, role) 推出来的（`agent_id_for`），所以同一件任务被
+        // 重跑一次就会再来这里一次——而重跑在这套系统里是常态：清扫器把
+        // `Scheduled` 到期的任务放回队列、任务失败后回投，走的都是同一条路。
+        // 每次重跑都新建一个对象，就变成同一个名字下挂着若干个互不认识的
+        // 消费者：它们订阅同一条 inbox，各自占一条到总线的连接，注册表里
+        // 后一个覆盖前一个，而谁也不会被回收（管理器对它们持有强引用）。
+        // 实测 2026-10-18：稳态 ~8800 条连接、10.8 GiB 常驻。
+        //
+        // 所以创建是幂等的：名字已经活着就把它交回去，重跑接上的是同一个对象。
+        if let Some(existing) = self.get_agent(agent_id).await? {
+            tracing::debug!(
+                agent_id,
+                "agent already exists under this name; handing back the live one"
+            );
+            return Ok(existing);
+        }
+
         let config = self.runtime_config_for(agent_id, role).await;
 
         let capabilities = vec![role.to_string()];
@@ -500,6 +519,12 @@ impl cog_core::AgentManager for GlobalAgentManager {
 
         let arc_agent: std::sync::Arc<dyn cog_core::Agent> = handle.agent.clone();
         let mut workers = self.workers.write().await;
+        // 上面的检查在锁外（建对象要 await），两个同名创建可能同时走到这里：
+        // 后到的那个把自己刚建好的交出去，交出去的对象随即被丢弃，其消费者
+        // 在 `Drop` 里中止。名字下仍然只有一个。
+        if let Some(existing) = workers.iter().find(|w| w.agent_id == agent_id) {
+            return Ok(existing.agent.clone());
+        }
         workers.push(handle);
         Ok(arc_agent)
     }
