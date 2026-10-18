@@ -389,6 +389,16 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
 
         // ── DagExecutorRuntime consumers (message-queue-driven mode) ──
         if let Some(runtime_holder) = ctx.consume::<crate::DagExecutorRuntime>() {
+            // 入队准入读的是池自己的读数。在这里取而不是 init：supervisor 与
+            // 本插件都在 init 发布，谁先谁后不由本 crate 决定，而 start 是所有
+            // init 都跑完之后才开始的。取不到就是一个进程内的部署——池的判定
+            // 本来也没有第二个读者，准入随之不设界（读不到不等于关窗）。
+            match ctx.consume_service::<dyn cog_core::LlmPoolStatusSource>() {
+                Some(source) => runtime_holder.attach_pool_status_source(source),
+                None => info!(
+                    "OrchestratorPlugin: no LLM pool status source; ready-queue admission admits everything"
+                ),
+            }
             if let Some(ref exec_loop) = self.exec_loop {
                 if let Some(backend) = ctx.consume_service::<dyn cog_core::MessageBackend>() {
                     if let Some(broadcast_tx) = ctx.consume::<cog_core::ShutdownBroadcastTx>() {

@@ -55,6 +55,41 @@ pub fn ready_group(workspace_id: &str) -> String {
     format!("executor-loop-{workspace_id}")
 }
 
+/// How many more jobs the pool's window can pay for, before one is put on a
+/// queue.
+///
+/// `None` is "no bound is derivable", and it is never zero: a missing
+/// measurement read as a zero bound would stop dispatch for the whole length of
+/// a rollout, which is a driver traded for a reading. Three cases return it --
+/// nothing measured (`measured_upstreams == 0`), no job cost to divide by
+/// (`reserve_tokens == 0`), and a measurement that covers fewer upstreams than
+/// the pool has. The last one is the guard that keeps this from repeating the
+/// refusal's old mistake: allowance and spend are summed over the upstreams
+/// that reported a window, so a pool where only one member reports would be
+/// sized by that member's ruler and the rest of the pool judged by it. A subset
+/// says nothing about the pool, and `pool_size == 0` is "not reported" rather
+/// than an empty pool.
+///
+/// `reserve_tokens` is one whole job, measured over finished jobs, so this is a
+/// count of jobs and not an average call -- the gateway's own `blocked` test
+/// compares the same two numbers, which makes one admitted job exactly one job
+/// the gateway would not refuse on these same readings.
+///
+/// Spend past the allowance (a snapshot read after the window rolled) yields
+/// zero rather than a wrapped-around huge number: saturated subtraction.
+pub fn jobs_the_window_can_pay_for(
+    pace: &cog_core::LlmWindowPace,
+    pool_size: usize,
+) -> Option<u64> {
+    if pace.measured_upstreams == 0 || pace.reserve_tokens == 0 {
+        return None;
+    }
+    if pool_size > 0 && pace.measured_upstreams < pool_size {
+        return None;
+    }
+    Some(pace.allowance_tokens.saturating_sub(pace.spent_tokens) / pace.reserve_tokens)
+}
+
 /// The queues a deployment consumes. Every worker reads the shared one; only
 /// the executor role reads the process-local one.
 pub fn consumed_ready_streams(workspace_id: &str, owns_executor_role: bool) -> Vec<String> {
@@ -138,6 +173,60 @@ mod tests {
         assert_eq!(
             executor,
             vec![ready_stream("ws"), process_local_ready_stream("ws")]
+        );
+    }
+
+    fn pace(measured: usize, allowance: u64, spent: u64, reserve: u64) -> cog_core::LlmWindowPace {
+        cog_core::LlmWindowPace {
+            measured_upstreams: measured,
+            allowance_tokens: allowance,
+            spent_tokens: spent,
+            reserve_tokens: reserve,
+            reserve_population: 5,
+            window_secs: 604_800,
+            window_start_unix: 0,
+        }
+    }
+
+    #[test]
+    fn a_measured_pool_yields_the_jobs_its_remaining_allowance_pays_for() {
+        assert_eq!(
+            jobs_the_window_can_pay_for(&pace(2, 5_000_000, 3_000_000, 500_000), 2),
+            Some(4)
+        );
+        // Spent past the allowance is zero, not a wrapped-around huge count.
+        assert_eq!(
+            jobs_the_window_can_pay_for(&pace(2, 1_000_000, 2_000_000, 500_000), 2),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn nothing_measured_is_no_bound_and_never_zero() {
+        // A missing measurement read as a zero bound would stop dispatch for
+        // as long as the reading is missing.
+        assert_eq!(
+            jobs_the_window_can_pay_for(&pace(0, 0, 0, 500_000), 2),
+            None
+        );
+        assert_eq!(
+            jobs_the_window_can_pay_for(&pace(2, 5_000_000, 0, 0), 2),
+            None
+        );
+    }
+
+    #[test]
+    fn a_measurement_covering_part_of_the_pool_is_no_bound() {
+        // One member's window summed as if it were the pool's repeats the
+        // refusal's old category error on the enqueue side.
+        assert_eq!(
+            jobs_the_window_can_pay_for(&pace(1, 5_000_000, 0, 500_000), 3),
+            None
+        );
+        // `pool_size == 0` is "not reported", not a pool of no upstreams.
+        assert_eq!(
+            jobs_the_window_can_pay_for(&pace(1, 5_000_000, 0, 500_000), 0),
+            Some(10)
         );
     }
 }

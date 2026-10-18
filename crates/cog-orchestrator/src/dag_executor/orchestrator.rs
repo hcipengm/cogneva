@@ -1608,7 +1608,38 @@ impl DagExecutor {
     }
 
     pub async fn find_ready_tasks(&self) -> Vec<Task> {
+        self.ready_tasks_and_in_flight().await.0
+    }
+
+    /// The ready tasks, plus how many tasks are already owed on each ready
+    /// queue, from one read of the graph.
+    ///
+    /// The second half exists because admission asks "how many may run" and
+    /// that question is only answerable against what is already owed: a bound
+    /// compared with zero every pass admits the whole allowance again while the
+    /// previous batch is still queued. `Scheduled` counts as owed -- the
+    /// publisher marks a task scheduled before it writes it to the transport, so
+    /// a task in this set has already been handed a slot even if nothing has
+    /// picked it up. `Running` does too. Everything else is settled or waiting
+    /// on a dependency, and neither is spending this window.
+    ///
+    /// Per queue, not per process: the process-local queue can hold a backlog
+    /// of its own for weeks while the shared queue is empty, and one combined
+    /// count would let that backlog stop work that is not behind it.
+    pub async fn ready_tasks_and_in_flight(
+        &self,
+    ) -> (Vec<Task>, std::collections::HashMap<String, usize>) {
         let tasks = self.all_tasks_unified().await;
+        let mut in_flight: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for t in tasks
+            .iter()
+            .filter(|t| matches!(t.status, TaskStatus::Scheduled | TaskStatus::Running))
+        {
+            *in_flight
+                .entry(crate::ready_queue::ready_stream_for(t, &self.workspace_id))
+                .or_default() += 1;
+        }
         let by_id: std::collections::HashMap<&str, &Task> =
             tasks.iter().map(|t| (t.id.as_str(), t)).collect();
         let now = chrono::Utc::now();
@@ -1630,7 +1661,7 @@ impl DagExecutor {
             .cloned()
             .collect();
         ready.sort_by_key(|t| -t.priority);
-        ready
+        (ready, in_flight)
     }
 
     /// Return all tasks that are ready for execution (Pending or Scheduled).

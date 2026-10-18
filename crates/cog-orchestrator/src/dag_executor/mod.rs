@@ -67,6 +67,16 @@ pub struct DagExecutorRuntime {
     orchestrator: Arc<DagExecutor>,
     action_planner: Option<Arc<dyn cog_core::ActionPlanner>>,
     skill_registry: Option<Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>>,
+    /// Where the pool's window allowance is read from, attached at start.
+    ///
+    /// A cell rather than a plain field because the publisher is built during
+    /// `init`, when the service table does not yet hold the supervisor's
+    /// source -- plugins publish in a dependency order this crate does not
+    /// control. `start` runs after every `init` has finished, so the attachment
+    /// happens there and the cell is shared by every clone of the runtime.
+    /// Empty means no source was published (a single-process deployment),
+    /// which admits everything: an unread pool is not an empty one.
+    pool_source: Arc<tokio::sync::OnceCell<Arc<dyn cog_core::LlmPoolStatusSource>>>,
 }
 
 impl DagExecutorRuntime {
@@ -81,6 +91,7 @@ impl DagExecutorRuntime {
             orchestrator: Arc::new(orchestrator),
             action_planner: None,
             skill_registry: None,
+            pool_source: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -95,6 +106,17 @@ impl DagExecutorRuntime {
             orchestrator: Arc::new(orchestrator),
             action_planner: None,
             skill_registry: None,
+            pool_source: Arc::new(tokio::sync::OnceCell::new()),
+        }
+    }
+
+    /// Point the ready-queue publisher at the pool's own reading.
+    ///
+    /// Called from `start`; setting it a second time is a no-op and says so,
+    /// because two sources would mean two rulers for one budget.
+    pub fn attach_pool_status_source(&self, source: Arc<dyn cog_core::LlmPoolStatusSource>) {
+        if self.pool_source.set(source).is_err() {
+            tracing::warn!("pool status source already attached; keeping the first one");
         }
     }
 
@@ -150,13 +172,28 @@ impl DagExecutorRuntime {
     /// separate decision about a terminal state, not something to invent here.
     /// The publish path keeps its own check as the last line of defence.
     ///
+    /// Admission is the second bound, and it is the pool's rather than the
+    /// transport's: a task whose request the gateway is going to refuse is not
+    /// dispatched, however well it fits. It is measured here, before the
+    /// transition, for the same reason the payload check is: a task held back
+    /// stays ready for the next pass, while a task marked scheduled and then
+    /// dropped is one the ready scan never returns to. What the window cannot
+    /// pay for stays `Pending`, which is the same state a task waiting on a
+    /// dependency sits in — no new state, and no reading that claims a task is
+    /// running when nothing picked it up.
+    ///
     /// A task whose artifact is only readable by its producer does not go on
     /// the queue every worker competes for; see [`crate::ready_queue`].
     pub async fn publish_ready_tasks(&self) -> SFResult<()> {
-        let ready_tasks: Vec<Task> = self.orchestrator.find_ready_tasks().await;
+        let (ready_tasks, in_flight) = self.orchestrator.ready_tasks_and_in_flight().await;
         if ready_tasks.is_empty() {
             return Ok(());
         }
+        // What the pool's window can still pay for, if it measured one. `None`
+        // admits everything: a missing reading is not a closed window, and a
+        // publisher that stopped on a missing reading would be driving the
+        // platform by the presence of a metric rather than by the quota.
+        let pays_for = self.admission_bound().await;
 
         // Serialise and group first, changing no state.
         let mut by_stream: HashMap<String, Vec<(Task, Vec<u8>)>> = HashMap::new();
@@ -171,7 +208,35 @@ impl DagExecutorRuntime {
                 .push((task, payload));
         }
 
-        for (stream, entries) in by_stream {
+        for (stream, mut entries) in by_stream {
+            // Admission, measured against what this queue already owes rather
+            // than against zero. A bound compared with zero every pass admits
+            // the same allowance again while the previous batch is still queued,
+            // which is a burst shaped exactly like no bound at all. `Scheduled`
+            // counts as owed even if nothing has picked the task up: it has been
+            // handed a slot, and the window has not been charged for it yet.
+            //
+            // Each queue is judged by its own owed count against the pool's
+            // whole allowance. The two queues can therefore each admit up to
+            // one window's worth in a pass; that is one batch of overshoot,
+            // bounded, and the alternative -- splitting one allowance between
+            // queues -- lets a backlog on one queue decide how much the other
+            // may dispatch, which is how a stalled queue starves a healthy one.
+            if let Some(pays_for) = pays_for {
+                let owed = in_flight.get(&stream).copied().unwrap_or(0) as u64;
+                let can_admit = pays_for.saturating_sub(owed);
+                if entries.len() as u64 > can_admit {
+                    tracing::warn!(
+                        stream = %stream,
+                        ready = entries.len(),
+                        admitted = can_admit,
+                        owed,
+                        window_jobs = pays_for,
+                        "holding ready tasks back: the pool's window cannot pay for them, so they stay pending until it can"
+                    );
+                    entries.truncate(usize::try_from(can_admit).unwrap_or(usize::MAX));
+                }
+            }
             let limit = self.backend.payload_limit(&stream).await?;
             let mut payloads = Vec::with_capacity(entries.len());
             for (task, payload) in entries {
@@ -198,6 +263,20 @@ impl DagExecutorRuntime {
             self.backend.publish_batch(&stream, &payloads).await?;
         }
         Ok(())
+    }
+
+    /// Jobs the pool's window can still pay for, or `None` when nothing
+    /// measured one.
+    ///
+    /// A source that answers nothing this pass is not a healthy pool: both
+    /// halves of the signal roll with the deployment, so an unanswered read is
+    /// an ordinary sight during a rollout and it admits everything rather than
+    /// freezing dispatch on a restart. The reading the publisher is asking for
+    /// is a quota; only the quota's own report may close a queue.
+    async fn admission_bound(&self) -> Option<u64> {
+        let source = self.pool_source.get()?;
+        let status = source.status().await?;
+        crate::ready_queue::jobs_the_window_can_pay_for(&status.pace, status.pool_size)
     }
 
     /// Consume task-result messages from the backend and drive DAG state transitions.
