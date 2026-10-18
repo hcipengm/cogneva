@@ -685,12 +685,20 @@ const COUNTER_HELP: &[(&str, &str)] = &[
         "cogneva_ready_admission_readings",
         "The arithmetic behind one ready-publish pass's admission, by stream \
          and kind: bounded (1 when the window's allowance bounded the pass, 0 \
-         when nothing measured one), window_jobs (jobs the remaining allowance \
-         pays for), owed (tasks already scheduled or running on that queue) and \
-         admitted (tasks put on the wire). window_jobs is written only when \
-         bounded is 1: an unmeasured window is not a window that pays for zero \
-         jobs, and a zero there would read as the strongest possible refusal. \
-         Every cell is per stream and window_jobs is not a budget split between \
+         when nothing measured one), covered and pool (how many upstreams the \
+         measurement covered and how many the pool holds -- a pool is only \
+         bounded when every member is measured), reserve (tokens one job was \
+         measured to need; 0 when no job size was measured or no status was \
+         read at all), window_jobs (jobs the remaining allowance pays for), \
+         owed (tasks already scheduled or running on that queue) and admitted \
+         (tasks put on the wire). window_jobs is written only when bounded is \
+         1: an unmeasured window is not a window that pays for zero jobs, and \
+         a zero there would read as the strongest possible refusal. covered, \
+         pool and reserve are written on every pass, zeros included, because \
+         bounded=0 has four causes -- no status read, nothing measured, a \
+         reserve of zero, and a ruler covering only part of the pool -- and \
+         the bounded cell alone prints all four the same way. Every cell is \
+         per stream and window_jobs is not a budget split between \
          streams: each queue is judged against its own owed count, so the two \
          admitted values may sum to more than window_jobs when both queues are \
          nearly empty. Do not read that sum as overshoot -- it is the price of \

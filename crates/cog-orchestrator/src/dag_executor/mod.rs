@@ -71,7 +71,11 @@ impl Default for DagExecutorConfig {
 /// outages.
 #[derive(Debug, Clone, Copy)]
 struct AdmissionBound {
-    window_jobs: u64,
+    /// The bound, or `None` when a status was read but its measurement cannot
+    /// bound the whole pool. That is not the same as "no status at all", which
+    /// is `None` at the call site: the coverage cells are what tell a reader
+    /// which of the two it is looking at.
+    window_jobs: Option<u64>,
     pace: cog_core::LlmWindowPace,
     pool_size: usize,
 }
@@ -204,11 +208,13 @@ impl DagExecutorRuntime {
     /// the queue every worker competes for; see [`crate::ready_queue`].
     pub async fn publish_ready_tasks(&self) -> SFResult<()> {
         let (ready_tasks, in_flight) = self.orchestrator.ready_tasks_and_in_flight().await;
-        // What the pool's window can still pay for, if it measured one. `None`
-        // admits everything: a missing reading is not a closed window, and a
-        // publisher that stopped on a missing reading would be driving the
-        // platform by the presence of a metric rather than by the quota.
+        // What the pool's window can still pay for, together with how much of
+        // the pool the measurement covered. No bound admits everything: a
+        // missing reading is not a closed window, and a publisher that stopped
+        // on a missing reading would be driving the platform by the presence
+        // of a metric rather than by the quota.
         let pays_for = self.admission_bound().await;
+        let window_jobs = pays_for.and_then(|bound| bound.window_jobs);
 
         // Serialise and group first, changing no state.
         let mut by_stream: HashMap<String, Vec<(Task, Vec<u8>)>> = HashMap::new();
@@ -249,17 +255,10 @@ impl DagExecutorRuntime {
         ] {
             let ready = by_stream.get(&stream).map(|e| e.len()).unwrap_or(0) as u64;
             let owed = in_flight.get(&stream).copied().unwrap_or(0) as u64;
-            let admitted =
-                crate::ready_queue::admitted(ready, owed, pays_for.map(|b| b.window_jobs));
+            let admitted = crate::ready_queue::admitted(ready, owed, window_jobs);
             admitted_by_stream.insert(stream.clone(), admitted);
-            self.record_admission(
-                &stream,
-                pays_for.map(|b| b.window_jobs),
-                owed,
-                admitted,
-                ready - admitted,
-            )
-            .await;
+            self.record_admission(&stream, pays_for, owed, admitted, ready - admitted)
+                .await;
         }
 
         for (stream, mut entries) in by_stream {
@@ -278,7 +277,7 @@ impl DagExecutorRuntime {
                             ready = entries.len(),
                             admitted,
                             owed = in_flight.get(&stream).copied().unwrap_or(0),
-                            window_jobs = bound.window_jobs,
+                            window_jobs = ?bound.window_jobs,
                             allowance_tokens = bound.pace.allowance_tokens,
                             spent_tokens = bound.pace.spent_tokens,
                             reserve_tokens = bound.pace.reserve_tokens,
@@ -329,18 +328,25 @@ impl DagExecutorRuntime {
     }
 
     /// What the pool's window can still pay for, with the reading it was
-    /// derived from, or `None` when nothing measured one.
+    /// derived from, or `None` when no status was read at all.
     ///
     /// A source that answers nothing this pass is not a healthy pool: both
     /// halves of the signal roll with the deployment, so an unanswered read is
     /// an ordinary sight during a rollout and it admits everything rather than
     /// freezing dispatch on a restart. The reading the publisher is asking for
     /// is a quota; only the quota's own report may close a queue.
+    ///
+    /// A status that was read is returned even when no bound follows from it,
+    /// because "the measurement cannot bound this pool" has three causes --
+    /// nothing measured, a reserve of zero, and a ruler that covers only part
+    /// of the pool -- and those are different incidents. Carrying the status
+    /// out is what lets the reading face say which one is in front of it
+    /// instead of printing the same unbounded zero for all three.
     async fn admission_bound(&self) -> Option<AdmissionBound> {
         let source = self.pool_source.get()?;
         let status = source.status().await?;
         let window_jobs =
-            crate::ready_queue::jobs_the_window_can_pay_for(&status.pace, status.pool_size)?;
+            crate::ready_queue::jobs_the_window_can_pay_for(&status.pace, status.pool_size);
         Some(AdmissionBound {
             window_jobs,
             pace: status.pace,
@@ -357,7 +363,7 @@ impl DagExecutorRuntime {
     async fn record_admission(
         &self,
         stream: &str,
-        window_jobs: Option<u64>,
+        bound: Option<AdmissionBound>,
         owed: u64,
         admitted: u64,
         held: u64,
@@ -372,11 +378,32 @@ impl DagExecutorRuntime {
             labels.insert("kind".to_string(), kind.to_string());
             labels
         };
+        // What the measurement covered, printed even when it bounded nothing:
+        // `bounded=0` has four causes -- no status read, nothing measured, a
+        // reserve of zero, and a ruler covering part of the pool -- and they
+        // call for completely different repairs. Zeros here mean "not known",
+        // not "covered nothing measured over a pool of no members".
+        let (covered, pool, reserve) = match bound {
+            Some(bound) => (
+                bound.pace.measured_upstreams as f64,
+                bound.pool_size as f64,
+                bound.pace.reserve_tokens as f64,
+            ),
+            None => (0.0, 0.0, 0.0),
+        };
         // `bounded` first: it is what tells a reader whether `window_jobs` is a
         // measurement from this pass or a value left over from the last pass
         // that had one.
         for (kind, value) in [
-            ("bounded", f64::from(u8::from(window_jobs.is_some()))),
+            (
+                "bounded",
+                f64::from(u8::from(
+                    bound.and_then(|bound| bound.window_jobs).is_some(),
+                )),
+            ),
+            ("covered", covered),
+            ("pool", pool),
+            ("reserve", reserve),
             ("owed", owed as f64),
             ("admitted", admitted as f64),
         ] {
@@ -390,7 +417,7 @@ impl DagExecutorRuntime {
                     .await,
             );
         }
-        if let Some(window_jobs) = window_jobs {
+        if let Some(window_jobs) = bound.and_then(|bound| bound.window_jobs) {
             drop(
                 metrics
                     .record_gauge(
