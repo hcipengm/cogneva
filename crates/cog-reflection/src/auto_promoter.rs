@@ -1,3 +1,4 @@
+//! principle: feedback_one_switch_read_at_two_call_sites_gates_half_the_rule
 //! 晋级触发器。
 //!
 //! 沙盒内 change 部署成功（apply → test → build → switch 全过）后，
@@ -1273,6 +1274,55 @@ mod tests {
         let records = ledger.recent(10).await.unwrap();
         assert_eq!(records[0].status, PromotionStatus::Promoted);
         assert_eq!(channel.published.lock().unwrap().len(), 1);
+    }
+
+    /// principle: feedback_one_switch_read_at_two_call_sites_gates_half_the_rule
+    ///
+    /// 规则原文：一个总开关的两个调用点读法不同，未必是缺陷——先判「哪个轴本来
+    /// 就不属于这个开关」。PromotionSwitch 的两个读法正是如此：decide_and_promote
+    /// 的降级链读 is_paused()（排队晋级转人工），promote_approved 故意不读——人批
+    /// 那一轴不属于这个开关。这条测试把两半一起门住：运行时开关暂停下，一条自动
+    /// 分级为 Auto 的变更先被判 AwaitingApproval（开关管的这一半生效），随后
+    /// promote_approved 仍能把它发布出去、把台账同一行推进 Promoted（开关不得拦
+    /// 第二次）。若有人把 is_paused() 检查加进 promote_approved，这条测试必须红。
+    #[tokio::test]
+    async fn a_paused_switch_gates_the_queue_but_not_the_human_approval() {
+        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let channel = Arc::new(FakeChannel {
+            published: Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let switch = Arc::new(crate::PromotionSwitch::new());
+        switch.set_paused(true, "人工介入");
+        let policy = crate::PromotionGateConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let p = promoter(policy, ledger.clone(), Some(channel.clone())).with_switch(switch);
+        let c = change("switch-axis", "crates/cog-agent/src/tools.rs");
+        p.decide_and_promote(&c).await.unwrap();
+
+        let before = ledger.recent(10).await.unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].status, PromotionStatus::AwaitingApproval);
+        assert!(
+            before[0].outcome.contains("运行时一键暂停"),
+            "挂起原因必须是开关管的这一半，否则对错误的降级理由这条测试也能过：{}",
+            before[0].outcome
+        );
+
+        let reference = p.promote_approved(&c).await.unwrap();
+        assert_eq!(reference, "commit-switch-axis");
+
+        let after = ledger.recent(10).await.unwrap();
+        assert_eq!(after.len(), 1, "批准更新那一行，不该再追加一行");
+        assert_eq!(after[0].id, before[0].id);
+        assert_eq!(after[0].status, PromotionStatus::Promoted);
+        assert_eq!(channel.published.lock().unwrap().len(), 1);
+        assert!(
+            p.awaiting_approval("switch-axis").await.unwrap().is_none(),
+            "人批那一轴不属于这个开关：批准之后待办里不得再有它"
+        );
     }
 
     #[tokio::test]
