@@ -237,6 +237,26 @@ impl cog_core::TaskExecutor for CollaborationExecutor {
     }
 
     async fn execute(&self, task: &Task) -> SFResult<TaskResult> {
+        // 这一笔任务名下的 agent 只服务这一次执行：结果交出去之后，没有任何
+        // 一条路会再回来读它们。回收因此必须落在这个入口上，而不是等调用方
+        // 各自的任务终态钩子——分解、原子执行、意图判定三条路都从这个入口出，
+        // 但只有 DAG 那一条有终态钩子；另两条（例如分解任务，它连任务表都不进）
+        // 永远等不到那一声，每跑一轮就在进程里留下几个只会阻塞在 inbox 上的
+        // 消费者，而管理器对它们持有强引用。实测 2026-10-18：10542 个 agent
+        // 名下只有 1691 个任务进过 DAG 表，另有 1283 条分解链与 391 条自信号链
+        // 的 agent 从来没有人退过。
+        //
+        // 失败也要回收：出错的那一次执行同样不会再回来用它，留着它只会让
+        // 重跑接到一个状态停在半截的旧对象上（重跑本该从续跑点恢复）。
+        let result = self.execute_unretired(task).await;
+        self.release_task_agents(&task.id).await;
+        result
+    }
+}
+
+impl CollaborationExecutor {
+    /// [`cog_core::TaskExecutor::execute`] 的主体，不含回收。
+    async fn execute_unretired(&self, task: &Task) -> SFResult<TaskResult> {
         // External-intent actionability assessment is a lightweight single-agent
         // multimodal call, not the Squad→PGE→SelfReview codegen pipeline. It must
         // be intercepted before the squad paths (the task carries no
@@ -264,9 +284,30 @@ impl cog_core::TaskExecutor for CollaborationExecutor {
             self.execute_atomic_via_squad(task).await
         }
     }
-}
 
-impl CollaborationExecutor {
+    /// 放掉一个任务名下的 agent。
+    ///
+    /// 没接上管理器就什么都不做：`with_agent_manager` 与其它装配走同一条路，
+    /// 缺了这一格回收就不存在——但那与「这个任务没有 agent」在行为上是同一
+    /// 件事，只有名册会一直涨，而名册的年龄读数正是为这条缺口准备的。
+    async fn release_task_agents(&self, task_id: &str) {
+        let Some(manager) = self.agent_manager.as_ref() else {
+            return;
+        };
+        match manager.retire_task_agents(task_id).await {
+            Ok(retired) if retired > 0 => tracing::info!(
+                task_id,
+                retired,
+                "released the agents of a task that finished executing"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                task_id,
+                "could not release the agents of a task that finished executing: {e}"
+            ),
+        }
+    }
+
     /// Ensure ModeSelectorActor has an Agent wired. If not, try to create one
     /// via AgentManager when both manager and LLM provider are available.
     async fn mode_selector_with_agent(&self) -> ModeSelectorActor {
@@ -1829,6 +1870,62 @@ mod tests {
         }
     }
 
+    /// [`OneAgentManager`] 加上一本按任务回收的账。
+    struct RetirementRecorder {
+        inner: OneAgentManager,
+        retired: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RetirementRecorder {
+        fn new(agent: std::sync::Arc<dyn cog_core::Agent>) -> Self {
+            Self {
+                inner: OneAgentManager { agent },
+                retired: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn retired(&self) -> Vec<String> {
+            self.retired.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::AgentManager for RetirementRecorder {
+        async fn create_agent(
+            &self,
+            agent_id: &str,
+            role: &str,
+            llm: std::sync::Arc<dyn cog_core::LlmClient>,
+            task_id: Option<&str>,
+        ) -> cog_core::SFResult<std::sync::Arc<dyn cog_core::Agent>> {
+            self.inner.create_agent(agent_id, role, llm, task_id).await
+        }
+
+        async fn retire_task_agents(&self, task_id: &str) -> cog_core::SFResult<usize> {
+            self.retired.lock().unwrap().push(task_id.to_string());
+            Ok(1)
+        }
+
+        async fn dispatch(&self, msg: cog_core::InboxMessage) -> cog_core::SFResult<()> {
+            self.inner.dispatch(msg).await
+        }
+
+        async fn list_workers(&self) -> cog_core::SFResult<Vec<cog_core::WorkerInfo>> {
+            self.inner.list_workers().await
+        }
+
+        async fn shutdown(&self) -> cog_core::SFResult<()> {
+            self.inner.shutdown().await
+        }
+
+        async fn get_agent(
+            &self,
+            agent_id: &str,
+        ) -> cog_core::SFResult<Option<std::sync::Arc<dyn cog_core::Agent>>> {
+            self.inner.get_agent(agent_id).await
+        }
+    }
+
     struct UnusedLlm;
 
     #[async_trait::async_trait]
@@ -2039,6 +2136,59 @@ mod tests {
         assert!(
             error.to_string().contains("stream ended without a reply"),
             "the wording is the only evidence there is: {error}"
+        );
+    }
+
+    /// 一次执行结束（无论成败）就把这次执行建出来的 agent 放掉。
+    ///
+    /// 判的是**入口**，不是某一条路：分解、原子执行、意图判定都从
+    /// `TaskExecutor::execute` 出，而此前只有 DAG 的任务终态钩子会回收，
+    /// 分解链与自信号链根本不进任务表，它们的 agent 于是永远留在名册里。
+    /// 这条测试走的是最便宜的一条路（意图判定），红了说明回收不在入口上；
+    /// 它不区分「回收写在哪条路内部」——那正是要避免的形状。
+    #[tokio::test]
+    async fn a_run_that_finished_releases_the_task_agents_that_served_it() {
+        let agent = ScriptedAssessAgent::answering(
+            r#"{"decision":"fix","question":"","priority":2,"reason":"clear repro"}"#,
+        );
+        let manager = std::sync::Arc::new(RetirementRecorder::new(agent));
+        let executor = CollaborationExecutor::new()
+            .with_llm_provider(std::sync::Arc::new(UnusedLlm))
+            .with_agent_manager(manager.clone());
+
+        cog_core::TaskExecutor::execute(&executor, &assess_task())
+            .await
+            .expect("一条答复了判词的流要读出判词");
+
+        assert_eq!(
+            manager.retired(),
+            vec!["github-issue-56".to_string()],
+            "执行结束了，这次执行名下的 agent 必须按这个任务的名字被放掉"
+        );
+    }
+
+    /// 失败的那一次同样要放掉：出错的任务不会再回来用这些对象，留着它们只会
+    /// 让重跑接到一个停在半截的旧对象上，而重跑本该从续跑点恢复。
+    #[tokio::test]
+    async fn a_run_that_failed_releases_the_task_agents_that_served_it() {
+        let agent = std::sync::Arc::new(ScriptedAssessAgent::refusing(
+            "upstream said no",
+            None,
+            None,
+        ));
+        let manager = std::sync::Arc::new(RetirementRecorder::new(agent));
+        let executor = CollaborationExecutor::new()
+            .with_llm_provider(std::sync::Arc::new(UnusedLlm))
+            .with_agent_manager(manager.clone());
+
+        cog_core::TaskExecutor::execute(&executor, &assess_task())
+            .await
+            .expect_err("一次被上游拒掉的判定不该产出判词");
+
+        assert_eq!(
+            manager.retired(),
+            vec!["github-issue-56".to_string()],
+            "失败也要按任务名放掉；回收挂在成功分支上就等于只有一半"
         );
     }
 
