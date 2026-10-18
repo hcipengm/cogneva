@@ -57,7 +57,24 @@ pub fn statements() -> Vec<String> {
             .iter()
             .map(|sql| sql.to_string()),
     );
-    statements
+    statements.into_iter().map(terminated).collect()
+}
+
+/// Make sure a run of text ends where the driver will see the end of a
+/// statement.
+///
+/// A store runs its own text as the whole of a query, so a single statement
+/// does not need a semicolon and several of them were written without one.
+/// Glued one after another, a text without one would make the next statement's
+/// opening words part of its own syntax — and the error names the statement
+/// after the boundary rather than the one that is actually unfinished.
+fn terminated(sql: String) -> String {
+    let sql = sql.trim_end();
+    if sql.ends_with(';') {
+        sql.to_string()
+    } else {
+        format!("{sql}\n;")
+    }
 }
 
 /// Run the list against a database that already has the migrations.
@@ -116,6 +133,19 @@ mod tests {
             }
         }
         names
+    }
+
+    /// Gluing in a text that ends mid-statement makes the *next* statement
+    /// the one the error names, so the boundary is checked here rather than
+    /// left to be rediscovered from a syntax error pointing at the wrong line.
+    #[test]
+    fn every_entry_ends_where_the_driver_sees_a_statement_end() {
+        for statement in statements() {
+            assert!(
+                statement.trim_end().ends_with(';'),
+                "entry does not end with a semicolon: {statement:.80}"
+            );
+        }
     }
 
     /// A table a bundled store creates must be in the bundle, and the bundle
