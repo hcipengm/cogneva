@@ -294,9 +294,12 @@ pub struct LlmExchangeRecord {
     pub response_sha256: Option<String>,
     pub request_bytes: u64,
     pub response_bytes: u64,
-    /// Redacted text, capped by the caller. `None` means the body was over the
-    /// cap and was not stored at all -- a truncated body would read like a
-    /// complete one to anyone replaying it.
+    /// Redacted text, capped by the caller and marked in `truncated` when it
+    /// was cut. `None` is the shape a caller uses when there were no bytes at
+    /// all -- a request path that builds no body of its own, for instance --
+    /// and is therefore distinct from `Some("")`, which is a body that was
+    /// empty. Both the size and the hash are taken before the cut, so a reader
+    /// can tell a short body from a long one that was clipped.
     pub request_body: Option<String>,
     pub response_body: Option<String>,
     /// Which side was dropped for size: `""`, `request`, `response`, `both`.
