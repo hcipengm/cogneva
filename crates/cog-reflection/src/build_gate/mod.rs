@@ -1913,6 +1913,24 @@ impl Drop for BuildPermit {
         if self.held.is_empty() {
             return;
         }
+        // Released by the descriptor rather than by closing it. A `flock` lock
+        // belongs to the open file description, and this process is not the
+        // only holder of that description: a child forked while the slot was
+        // held carries a copy in its own descriptor table until it reaches
+        // `exec` (the close-on-exec flag fires there, not at the fork), and a
+        // `dup` can leave a second reference behind in this process. Closing
+        // the permit's handles therefore does not free the slot; it frees it
+        // once the last copy goes away, and the next builder arriving inside
+        // that window is told the slot is still taken. Unlocking reaches the
+        // description itself, so the slot is free for the very next ask.
+        #[cfg(unix)]
+        for file in &self.held {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: `flock` touches only this process's descriptor table for
+            // a descriptor this permit owns, and an unlock carries no memory
+            // obligations.
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        }
         match self.kind {
             HoldKind::Building => {
                 self.gate.in_flight.fetch_sub(1, Ordering::Relaxed);
@@ -3518,27 +3536,32 @@ unevictable 28532736
         );
     }
 
-    /// A slot comes back when the last copy of its open file description goes, not
-    /// when the holder drops its handle.
+    /// A slot comes back with the permit that took it, not with the last copy of
+    /// its open file description.
     ///
-    /// `flock` is owned by the open file description, so a second handle onto the same
-    /// description is another reference that keeps the slot taken after `BuildPermit`
-    /// is dropped. A `dup` is one way to get such a handle; the copy a fork leaves in
-    /// a child that has not exec'd yet is another, and that is the window a caller can
-    /// be refused in even though it just released its own permit — the gate reads what
-    /// the kernel reports, and while a copy is open the kernel is right to say taken.
+    /// `flock` is owned by the open file description, and this process is not the
+    /// only holder of that description: a child forked while the slot is held
+    /// carries a copy until it reaches `exec`, and a `dup` leaves a second
+    /// reference for as long as its owner keeps it. Letting the slot come back
+    /// only when the last copy closes meant a caller arriving inside that window
+    /// -- microseconds after the holder dropped its permit -- was told the slot
+    /// was still taken, and on a host with one slot a stray child could pin it
+    /// long after the work that took it had finished. The permit releases the
+    /// lock on the description before its handles close, so the copy cannot
+    /// outlive the permit's decision.
     ///
-    /// The copy below is a `dup` rather than a forked child, because a fork copies the
-    /// whole fd table: forked before it narrows that table, the child also holds what
-    /// every other test in this binary has open, and each of those is a reference on
-    /// somebody else's lock. This binary starts no processes, so the `dup` here is the
-    /// only second reference that exists while the test runs.
+    /// The copy below is a `dup` rather than a forked child, because a fork copies
+    /// the whole fd table: forked before it narrows that table, the child also holds
+    /// what every other test in this binary has open, and each of those is a
+    /// reference on somebody else's lock. The `dup` shares the description exactly
+    /// as a forked child does, so it keeps the slot taken for as long as a child
+    /// would have.
     ///
     /// Both files a permit holds are checked, because they are held for different
     /// readers: the slot is what the next build waits for, and the claim is what a
-    /// cache sweep waits for, so a copy of either keeps *its* readers out.
+    /// cache sweep waits for.
     #[tokio::test]
-    async fn a_slot_comes_back_when_the_last_copy_of_the_lock_file_goes() {
+    async fn a_slot_comes_back_with_the_permit_though_a_copy_of_the_lock_file_survives() {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
         fn duplicate(file: &std::fs::File) -> OwnedFd {
@@ -3573,25 +3596,20 @@ unevictable 28532736
 
         drop(permit);
         assert!(
-            gate.try_acquire("the next build").await.is_err(),
-            "a second handle on the slot file keeps the slot taken"
-        );
-        drop(slot_copy);
-        let next = gate.try_acquire("the next build").await.unwrap();
-        assert!(
-            gate.try_acquire_exclusive("sweeping the build cache")
-                .await
-                .is_err(),
-            "a second handle on the claim file keeps the field taken from a sweep"
-        );
-        drop(claim_copy);
-        drop(next);
-        assert!(
             gate.try_acquire_exclusive("sweeping the build cache")
                 .await
                 .is_ok(),
-            "the field comes back with the last copy of the claim"
+            "the field comes back with the permit, not with a copy of its claim"
         );
+        let next = gate
+            .try_acquire("the next build")
+            .await
+            .expect("the slot comes back with the permit, not with a copy of its descriptor");
+        assert!(next.held());
+
+        drop(next);
+        drop(claim_copy);
+        drop(slot_copy);
     }
 
     /// A waiting build is a reading of its own: a gate at its bound with nothing
