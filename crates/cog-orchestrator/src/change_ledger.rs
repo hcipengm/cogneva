@@ -2213,7 +2213,20 @@ async fn dispatch_pass(
     // the window left when the snapshot measured one. Derived once, from the same
     // verdict the pass writes down, so the row and the batch cannot disagree about
     // which window they were sized against.
-    let handover_budget = handovers_for_this_pass(&verdict, HANDOVERS_PER_PASS);
+    let bound = handovers_for_this_pass(&verdict, HANDOVERS_PER_PASS);
+    let handover_budget = bound.budget;
+    // The reason is logged because three of these five branches return the
+    // ceiling: without it, a pass that could derive no bound at all (a degraded
+    // pool, or a ledger too thin to price a job) is indistinguishable from one
+    // whose window simply pays for more than a pass carries.
+    info!(
+        handover_budget,
+        bound_reason = bound.reason,
+        pending = pending.len(),
+        pool_size = verdict.pool_size,
+        decision = verdict.decision.as_str(),
+        "change ledger: dispatch batch"
+    );
 
     let rearm_limit = dispatch_rearm_limit();
     let mut counts = TickCounts::default();
@@ -2886,9 +2899,27 @@ struct PoolVerdict {
 /// gateway would not refuse it. `measured_upstreams == 0` or a zero reserve is
 /// "nothing measured", which is the ceiling, never zero -- zero here would stop
 /// dispatch for a missing measurement, which is a driver traded for a reading.
-fn handovers_for_this_pass(verdict: &PoolVerdict, ceiling: usize) -> usize {
+/// What this pass may hand over, and which branch produced that number.
+///
+/// The reason travels with the number because every fallback lands on the same
+/// ceiling: "the window pays for more than one pass may carry" and "no bound
+/// could be derived" are the same integer and opposite facts, and the second is
+/// what happens on a degraded pool -- only the upstreams that still report a
+/// window are measured, which is exactly the state this gate exists for. A pass
+/// that handed over unbounded must not read like a healthy one, so the pass
+/// logs this pair rather than only the arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BatchBound {
+    budget: usize,
+    reason: &'static str,
+}
+
+fn handovers_for_this_pass(verdict: &PoolVerdict, ceiling: usize) -> BatchBound {
     let Some(pace) = verdict.window_pace else {
-        return ceiling;
+        return BatchBound {
+            budget: ceiling,
+            reason: "no_measurement",
+        };
     };
     // The same derivation the ready-queue publisher uses, so the two dispatch
     // paths cannot size their batches by different rules. It also carries the
@@ -2896,15 +2927,34 @@ fn handovers_for_this_pass(verdict: &PoolVerdict, ceiling: usize) -> usize {
     // not a bound for the pool.
     let Some(fits) = crate::ready_queue::jobs_the_window_can_pay_for(&pace, verdict.pool_size)
     else {
-        return ceiling;
+        // `window_pace` is only set when at least one upstream was measured, so
+        // the remaining ways to get no bound are a missing job cost and a
+        // measurement that covers fewer upstreams than the pool has. They are
+        // different operational facts: the first says the ledger of finished
+        // jobs is too thin to price one, the second says the pool is degraded.
+        let reason = if pace.reserve_tokens == 0 {
+            "no_reserve"
+        } else {
+            "partial_pool"
+        };
+        return BatchBound {
+            budget: ceiling,
+            reason,
+        };
     };
     // The cast cannot lose a real batch: `ceiling` is single digits in the
     // hundreds and `fits` only matters below it, so saturating at `ceiling`
     // first keeps a huge remaining allowance from wrapping anything.
     if fits >= ceiling as u64 {
-        ceiling
+        BatchBound {
+            budget: ceiling,
+            reason: "ceiling",
+        }
     } else {
-        fits as usize
+        BatchBound {
+            budget: fits as usize,
+            reason: "window",
+        }
     }
 }
 
@@ -4006,41 +4056,50 @@ mod tests {
             pool_verdict(Some(&status), now, 300)
         };
 
-        // No snapshot at all, a snapshot with no measurement, and a window with
-        // no job cost yet are all "nothing to derive a bound from": the ceiling.
+        // The reason rides with the number: three of these branches return the
+        // ceiling, and the pass's log line has to be able to say which one.
+        let bound = |verdict: &PoolVerdict, ceiling: usize| {
+            let b = handovers_for_this_pass(verdict, ceiling);
+            (b.budget, b.reason)
+        };
+
+        // Nothing to derive a bound from: no snapshot, a snapshot with no
+        // measurement, and a window with no job cost yet. All three are the
+        // ceiling, and the first two are one reason because the verdict keeps
+        // only a measured pace (`measured_upstreams == 0` is not a pace).
         assert_eq!(
-            handovers_for_this_pass(&pool_verdict(None, now, 300), 200),
-            200
+            bound(&pool_verdict(None, now, 300), 200),
+            (200, "no_measurement")
         );
-        assert_eq!(handovers_for_this_pass(&with_pace(0, 0, 0, 0), 200), 200);
+        assert_eq!(bound(&with_pace(0, 0, 0, 0), 200), (200, "no_measurement"));
         assert_eq!(
-            handovers_for_this_pass(&with_pace(1, 9_000_000, 0, 0), 200),
-            200
+            bound(&with_pace(1, 9_000_000, 0, 0), 200),
+            (200, "no_reserve")
         );
 
         // Four whole jobs fit: four, not two hundred -- the point of the bound.
         assert_eq!(
-            handovers_for_this_pass(&with_pace(1, 5_000_000, 3_000_000, 500_000), 200),
-            4
+            bound(&with_pace(1, 5_000_000, 3_000_000, 500_000), 200),
+            (4, "window")
         );
 
         // A window with more than the ceiling left is capped by the ceiling.
         assert_eq!(
-            handovers_for_this_pass(&with_pace(1, 100_000_000, 0, 500_000), 200),
-            200
+            bound(&with_pace(1, 100_000_000, 0, 500_000), 200),
+            (200, "ceiling")
         );
 
         // Less left than one job costs is zero handovers: every task this pass
         // would hand over is one the gateway refuses on the same numbers.
         assert_eq!(
-            handovers_for_this_pass(&with_pace(1, 1_000_000, 900_000, 500_000), 200),
-            0
+            bound(&with_pace(1, 1_000_000, 900_000, 500_000), 200),
+            (0, "window")
         );
         // Spent past the allowance (a snapshot read after the window moved) is
         // still zero, not a wrapped-around huge number.
         assert_eq!(
-            handovers_for_this_pass(&with_pace(1, 1_000_000, 2_000_000, 500_000), 200),
-            0
+            bound(&with_pace(1, 1_000_000, 2_000_000, 500_000), 200),
+            (0, "window")
         );
 
         // A pace summed over one member of a three-upstream pool is not a bound
@@ -4060,8 +4119,8 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            handovers_for_this_pass(&pool_verdict(Some(&partial_pool), now, 300), 200),
-            200
+            bound(&pool_verdict(Some(&partial_pool), now, 300), 200),
+            (200, "partial_pool")
         );
     }
 
