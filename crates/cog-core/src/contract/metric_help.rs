@@ -936,7 +936,13 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          the events that reached the table -- never read `attempted` alone as \
          the rows the table should have gained, since every failed write is \
          still counted there. Alert on this series itself when the \
-         subtraction is the only place the loss shows.",
+         subtraction is the only place the loss shows. The writer seeds it at \
+         zero when it finishes assembling, so the series' presence means the \
+         writer was wired, and its value means how many writes failed: a \
+         table that stays empty with `attempted` above zero and this series \
+         present at a flat zero points at something between the handoff and \
+         the write, while an absent series points at the writer never being \
+         assembled at all.",
     ),
     (
         crate::metric_names::TOOL_OUTPUT_FETCH_BUDGET_EXHAUSTED_TOTAL.as_str(),
