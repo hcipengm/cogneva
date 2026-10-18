@@ -1,3 +1,4 @@
+//! principle: feedback_a_read_only_subcommand_is_not_the_one_that_writes_the_artifact
 //! Command-line dispatch for the `cogneva` binary.
 //!
 //! Parsing is a pure function so that the rule below is testable: **an argument
@@ -66,6 +67,27 @@ const FLAGS: [(&str, Command); 6] = [
     ("--service", Command::WindowsService),
 ];
 
+/// Subcommands that only ever read: they print or serve a projection out of
+/// state they hold no lease on, then exit. A subcommand whose name reads like
+/// "generate a projection" — a lister that prints its kind-to-path table and
+/// exits 0 — belongs here, and the principle
+/// `feedback_a_read_only_subcommand_is_not_the_one_that_writes_the_artifact`
+/// is the rule that it must never grow the write it prints. The set is a list
+/// rather than a name pattern because the pattern is what the test scans the
+/// names with: a lister whose name says what it is fails that test until it is
+/// classified here, which is what decides the question at parse time, before
+/// the handler runs.
+///
+/// Writers are everything not in this list, so the read-only set and the
+/// writer set are disjoint by construction rather than by two tables kept in
+/// step by hand.
+const READ_ONLY_SUBCOMMANDS: &[Command] = &[
+    Command::ValidateConfig,
+    Command::HostLedger,
+    Command::VolumeWalker,
+    Command::McpServe,
+];
+
 pub const USAGE: &str = "\
 Cogneva — AI multi-agent collaboration platform
 
@@ -105,6 +127,16 @@ OPTIONS:
         --service          Run as a Windows service (Windows only)";
 
 impl Command {
+    /// Whether this command only ever reads.
+    ///
+    /// Decided from the one classification rather than in the handler, so the
+    /// answer is known at parse time — before the act — and no handler can
+    /// disagree with it. A read-only command prints or serves a projection and
+    /// exits; it is never the branch that writes the artifact it prints.
+    pub fn reads_only(&self) -> bool {
+        READ_ONLY_SUBCOMMANDS.contains(self)
+    }
+
     /// Parse `argv` without the program name.
     ///
     /// `Err` carries the first argument that names no command and no flag; the
@@ -242,6 +274,83 @@ mod tests {
         // make `cogneva <name>` resolve to it instead of the subcommand.
         for (flag, _) in FLAGS {
             assert!(flag.starts_with('-'), "{flag} is not flag-shaped");
+        }
+    }
+
+    /// principle: feedback_a_read_only_subcommand_is_not_the_one_that_writes_the_artifact
+    ///
+    /// A subcommand whose name reads like "generate a projection" — a lister
+    /// that prints its kind-to-path table and exits 0 — may only ever print
+    /// it. The gate answers from the shape of the act it rules out, and it
+    /// answers before the act: the classification is read off the parse table,
+    /// so a projection-shaped name nobody classified fails here, before any
+    /// handler of it could run.
+    #[test]
+    fn a_projection_shaped_subcommand_is_classified_read_only() {
+        // The prefixes a projection printer's name is spelled with. A name
+        // carrying one claims to print a view of state rather than to change
+        // it, so the classification has to agree.
+        const PROJECTION_PREFIXES: [&str; 6] = [
+            "list-",
+            "print-",
+            "render-",
+            "show-",
+            "describe-",
+            "project-",
+        ];
+        for (name, command) in SUBCOMMANDS {
+            if PROJECTION_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+            {
+                assert!(
+                    command.reads_only(),
+                    "{name} names a projection printer but is not classified read-only"
+                );
+            }
+        }
+    }
+
+    /// The other half of the rule: the read-only set and the writer set are
+    /// one classification read two ways, so they are disjoint by construction
+    /// — a command is a writer exactly when it is not listed. What can still
+    /// drift is the name, so a name that promises to change state must never
+    /// be classified read-only: that is the writer hiding behind a lister's
+    /// answer.
+    #[test]
+    fn a_writer_shaped_subcommand_is_never_classified_read_only() {
+        const WRITER_PREFIXES: [&str; 6] = [
+            "write-",
+            "execute-",
+            "repair-",
+            "restore",
+            "backup",
+            "mainline-",
+        ];
+        for (name, command) in SUBCOMMANDS {
+            if WRITER_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+            {
+                assert!(
+                    !command.reads_only(),
+                    "{name} names a writer but is classified read-only"
+                );
+            }
+        }
+    }
+
+    /// One classification with one answer per command: a command listed twice
+    /// would be two answers to the same question, and the writer set —
+    /// everything not listed — stays disjoint from this one only while this
+    /// one carries no duplicates.
+    #[test]
+    fn the_read_only_classification_has_one_answer_per_command() {
+        for (index, command) in READ_ONLY_SUBCOMMANDS.iter().enumerate() {
+            assert!(
+                !READ_ONLY_SUBCOMMANDS[..index].contains(command),
+                "{command:?} is classified read-only twice"
+            );
         }
     }
 }
