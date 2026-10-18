@@ -238,6 +238,82 @@ pub struct BackupAccountReading {
     pub newest_package: Option<BackupPackageRecord>,
 }
 
+/// One restore drill's answer: what a package was opened up and found to hold.
+///
+/// The account says a run produced a package; this says the package can be put
+/// back. They are separate records because they are produced by separate
+/// processes at separate times, and because the second one is allowed to fail
+/// while the first is healthy -- that gap is exactly what a drill exists to
+/// find.
+///
+/// The fields are the evidence rather than a verdict: the two counts the
+/// manifest promised, the two the restored copy actually held, whether the
+/// account table matched the source row for row, and the walk of the volume.
+/// [`Self::ok`] is derived from them and not stored separately, so a row cannot
+/// say "restorable" while carrying measurements that disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupDrillRecord {
+    pub drill_id: String,
+    pub started_at: DateTime<Utc>,
+    /// When the drill finished. A drill writes its row once, at the end: there
+    /// is no open state, because a drill that is killed leaves nothing behind
+    /// and the age of the newest row is what tells a reader so.
+    pub finished_at: DateTime<Utc>,
+    /// The package that was restored, when the volume had one to offer.
+    pub package: Option<String>,
+    /// The instant in that package's name -- the clock of the run that wrote it.
+    pub package_written_at: Option<DateTime<Utc>>,
+    /// The size the drill itself found on disk, which is a measurement of the
+    /// file rather than a repetition of what the run recorded about it.
+    pub package_bytes: Option<i64>,
+    /// How many packages the drill's own walk of the volume found, and the
+    /// instant in the oldest one's name. These come from the directory and not
+    /// from the writer's retention pass, which is the whole point of walking it.
+    pub packages_on_volume: i32,
+    pub oldest_package_at: Option<DateTime<Utc>>,
+    /// The instant in the name of the newest package found outside the backup
+    /// volume's directory -- the second copy. `None` when there is no second
+    /// copy at all, which is a fact about the installation and not about this
+    /// package's restorability: the drill does not need it to be ok.
+    pub offsite_newest_at: Option<DateTime<Utc>>,
+    /// Whether that second copy is the very file the drill restored: same name,
+    /// same byte count. `None` when there was nothing to compare. This is a
+    /// separate reading from the age of the copy -- a copy that is present but
+    /// a day behind has an age, and this says the copy is the wrong day's.
+    pub offsite_matches_newest: Option<bool>,
+    /// Tables the scratch database held after the copy, against the tables the
+    /// package's own manifest declared.
+    pub tables_restored: Option<i32>,
+    pub tables_expected: Option<i32>,
+    pub rows_restored: Option<i64>,
+    pub rows_expected: Option<i64>,
+    /// Whether the account table came back identical, row for row, to the same
+    /// rows in the live database. `None` when the comparison could not be made.
+    pub source_runs_matched: Option<bool>,
+    /// Why the drill did not prove the package restorable. Empty on a drill
+    /// whose evidence agrees.
+    pub error: Option<String>,
+}
+
+impl BackupDrillRecord {
+    /// Whether this drill proved the package restorable.
+    ///
+    /// Every measurement has to be present and agreeing. A count that was never
+    /// taken is not a count of zero, and a comparison that could not be made is
+    /// not a match -- both leave the drill failed, which is the honest reading:
+    /// nothing was proven.
+    pub fn ok(&self) -> bool {
+        self.error.is_none()
+            && self.package.is_some()
+            && self.package_written_at.is_some()
+            && self.tables_restored.is_some()
+            && self.tables_restored == self.tables_expected
+            && self.rows_restored.is_some()
+            && self.rows_restored == self.rows_expected
+            && self.source_runs_matched == Some(true)
+    }
+}
+
 /// Durable storage for the backup account.
 ///
 /// Four calls, and the split between the first two is the run itself: one
@@ -298,6 +374,20 @@ pub trait BackupRunStore: Send + Sync {
     /// Read the account: how many runs of each outcome, and the instants and the
     /// newest package that the counts cannot carry.
     async fn read_account(&self) -> SFResult<BackupAccountReading>;
+
+    /// Write down one drill's answer.
+    ///
+    /// The row is written once and never moved: a drill that runs twice is two
+    /// rows, because the second run's evidence is the second run's, and a
+    /// rewritten row would read as if the first had never disagreed.
+    async fn record_drill(&self, drill: &BackupDrillRecord) -> SFResult<()>;
+
+    /// The newest drill, whatever it concluded, or `None` when none ever ran.
+    ///
+    /// A failed drill is returned as readily as a successful one: "the last
+    /// drill failed" and "no drill has run" are different facts, and a reader
+    /// that only saw successes could not tell them apart.
+    async fn read_latest_drill(&self) -> SFResult<Option<BackupDrillRecord>>;
 }
 
 #[cfg(test)]
@@ -317,6 +407,92 @@ mod tests {
         assert!(BackupOutcome::ALL
             .iter()
             .all(|o| o.as_str().chars().all(|c| c.is_ascii_lowercase())));
+    }
+
+    fn agreeing_drill() -> BackupDrillRecord {
+        let at = Utc::now();
+        BackupDrillRecord {
+            drill_id: "d1".into(),
+            started_at: at,
+            finished_at: at,
+            package: Some("cogneva-backup-20261018T031700Z.tar.zst".into()),
+            package_written_at: Some(at),
+            package_bytes: Some(1024),
+            packages_on_volume: 7,
+            oldest_package_at: Some(at),
+            offsite_newest_at: Some(at),
+            offsite_matches_newest: Some(true),
+            tables_restored: Some(46),
+            tables_expected: Some(46),
+            rows_restored: Some(1000),
+            rows_expected: Some(1000),
+            source_runs_matched: Some(true),
+            error: None,
+        }
+    }
+
+    /// A drill is ok only when every measurement was taken and they agree.
+    ///
+    /// The point of deriving the verdict from the evidence rather than storing
+    /// a boolean is that no caller can write "ok" past a missing number. Each
+    /// case below is one way of being unresolvably short of proof: a comparison
+    /// that was never made (`None`) and a comparison that came out false are
+    /// different, but neither is a success.
+    #[test]
+    fn a_drill_is_ok_only_with_all_of_its_evidence_agreeing() {
+        assert!(agreeing_drill().ok());
+
+        let mut d = agreeing_drill();
+        d.error = Some("restore failed".into());
+        assert!(!d.ok(), "a drill that wrote an error proved nothing");
+
+        let mut d = agreeing_drill();
+        d.package = None;
+        assert!(!d.ok(), "no package restored");
+
+        let mut d = agreeing_drill();
+        d.package_written_at = None;
+        assert!(!d.ok(), "no instant to date the package by");
+
+        let mut d = agreeing_drill();
+        d.tables_restored = None;
+        assert!(
+            !d.ok(),
+            "a count that was never taken is not a count of zero"
+        );
+
+        let mut d = agreeing_drill();
+        d.tables_restored = Some(45);
+        assert!(!d.ok(), "one table missing is a failed restore");
+
+        let mut d = agreeing_drill();
+        d.rows_expected = None;
+        assert!(!d.ok());
+
+        let mut d = agreeing_drill();
+        d.rows_restored = Some(999);
+        assert!(!d.ok());
+
+        let mut d = agreeing_drill();
+        d.source_runs_matched = None;
+        assert!(
+            !d.ok(),
+            "a comparison that could not be made is not a match"
+        );
+
+        let mut d = agreeing_drill();
+        d.source_runs_matched = Some(false);
+        assert!(!d.ok());
+
+        // The second copy is not part of this verdict. A package that restores
+        // is restorable whether or not a copy exists elsewhere; a copy that
+        // stopped being written is its own failure, reported by its own rules,
+        // so folding it in here would make a missing copy read as a broken
+        // backup.
+        let mut d = agreeing_drill();
+        d.offsite_newest_at = None;
+        d.offsite_matches_newest = None;
+        assert!(d.ok());
     }
 
     /// The two states a run cannot report about itself, and the two it can.

@@ -64,6 +64,10 @@ spec:
                   valueFrom:
                     fieldRef:
                       fieldPath: metadata.namespace
+                # 卷外那一份的落点。写者只负责复制；「有没有、是不是今晚的」
+                # 由演练那一跑自己遍历目录来判。
+                - name: COGNEVA_BACKUP_OFFSITE_DIR
+                  value: "/offsite"
               resources:
                 # 请求按流式作业实耗定（COPY→文件、tar.zst 流式压缩，常驻内存
                 # 极小）；定高了在资源紧张的小节点上会调度不出来。
@@ -91,6 +95,8 @@ spec:
                   readOnly: true
                 - name: backup
                   mountPath: /backups
+                - name: offsite
+                  mountPath: /offsite
           volumes:
             - name: data
               persistentVolumeClaim:
@@ -107,3 +113,9 @@ spec:
             - name: backup
               persistentVolumeClaim:
                 claimName: cogneva-backup-pvc
+            # 宿主机上的一条路径，与备份卷不在同一个卷对象里：删 PVC、卷被回收
+            # 都不动它。与备份卷同一个故障域——跨路径不等于跨机器。
+            - name: offsite
+              hostPath:
+                path: "/var/lib/cogneva-offsite"
+                type: DirectoryOrCreate

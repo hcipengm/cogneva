@@ -45,6 +45,7 @@ resources:
   - cluster-registry.yaml
   - backup-pvc.yaml
   - backup-cronjob.yaml
+  - backup-drill-cronjob.yaml
   - network-policy.yaml
   - ingress.yaml
   - middleware-websocket-headers.yaml

@@ -21,7 +21,9 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use chrono::{SecondsFormat, Utc};
-use cog_core::{BackupOutcome, BackupRunClosing, BackupRunOpening, BackupRunStore};
+use cog_core::{
+    BackupDrillRecord, BackupOutcome, BackupRunClosing, BackupRunOpening, BackupRunStore,
+};
 use cog_storage::PostgresBackupRunStore;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -148,6 +150,17 @@ pub struct BackupConfig {
     /// 一行运行中的记录没人在跑，只有拿**它自己被开出来时**的期限才能判，用
     /// 今天的旋钮去判昨天那一次是两回事。
     pub run_deadline_seconds: i32,
+    /// 备份卷之外的第二个落点：每跑完一次，新包再往这里复制一份。
+    ///
+    /// **它换掉的是什么，写清楚**：备份卷是一块 local-path PV，删除 PVC、卷被
+    /// 回收、`helm uninstall` 之后换个名字重装，都会让那个卷上的包一起消失。
+    /// 复制到卷外的一条路径上，救的是这些；**不救宿主丢失**——同一台机器上的
+    /// 另一条路径和备份卷在同一个故障域里，「跨路径」不等于「跨机器」。真正的
+    /// 异地落点要跨机器或对象存储，需要凭证，不属于这个进程能自己闭合的事。
+    ///
+    /// `None` = 没有配置落点。这时不复制，演练侧也量不到副本，于是「备份卷之外
+    /// 有没有一份」这件事会由规则报红，而不是悄悄当作已覆盖。
+    pub offsite_dir: Option<PathBuf>,
     pub namespace: String,
 }
 
@@ -181,6 +194,10 @@ impl BackupConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_RUN_DEADLINE_SECONDS),
+            offsite_dir: std::env::var("COGNEVA_BACKUP_OFFSITE_DIR")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
             namespace: std::env::var("COGNEVA_NAMESPACE").unwrap_or_else(|_| "cogneva".into()),
         })
     }
@@ -677,10 +694,7 @@ async fn open_run_store(cfg: &BackupConfig) -> Option<PostgresBackupRunStore> {
 /// 值整段换掉——错误多半来自 PG 客户端，而它会把整条 URL 连同口令一起抄进
 /// 错误消息里，行一旦落库，口令就跟着备份包走到恢复端去了。
 fn recordable_error(err: &dyn std::error::Error, cfg: &BackupConfig) -> String {
-    let scrubbed = url_password(&cfg.database_url)
-        .map(|secret| cog_core::redact_secrets(&err.to_string()).replace(&secret, "[redacted]"))
-        .unwrap_or_else(|| cog_core::redact_secrets(&err.to_string()));
-    scrubbed.chars().take(ERROR_TEXT_MAX_CHARS).collect()
+    scrub_error(&err.to_string(), &cfg.database_url)
 }
 
 /// 连接串里的口令，取「scheme://user:password@host」的这一段。取不到就没有要
@@ -787,6 +801,55 @@ pub async fn run_backup(cfg: &BackupConfig) -> Result<PathBuf, Box<dyn std::erro
     }
 }
 
+/// 把刚打好的包再复制一份到卷外，并按同样的份数裁掉旧的。
+///
+/// 复制走临时名再改名：演练是**遍历目录**找最新包的，一个写到一半的包出现在
+/// 目录里会被它读成「最新那份」，于是下一次演练证明的是半份文件。临时名的后缀
+/// 不匹配包名形状，遍历看不到它。
+///
+/// 复制失败只留日志，不改这次运行的结局：卷上那份是完整的，第二份没落成是第二
+/// 份自己的事——它由演练那一跑的读数报出来，不让它把一次成功的备份改判成失败。
+fn copy_offsite(dir: &Path, package: &Path, keep: usize) {
+    let Some(name) = package.file_name() else {
+        tracing::warn!(package = %package.display(), "offsite: 包没有文件名，无法复制");
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::warn!(dir = %dir.display(), error = %e, "offsite: 落点建不出来，第二份没写");
+        return;
+    }
+    let dest = dir.join(name);
+    let partial = dir.join(format!("{}.partial", name.to_string_lossy()));
+    let copied = std::fs::copy(package, &partial).and_then(|bytes| {
+        let want = std::fs::metadata(package)?.len();
+        if bytes != want {
+            return Err(std::io::Error::other(format!(
+                "复制了 {bytes} 字节，源是 {want} 字节"
+            )));
+        }
+        std::fs::rename(&partial, &dest)
+    });
+    match copied {
+        Ok(()) => {}
+        Err(e) => {
+            let _ = std::fs::remove_file(&partial);
+            tracing::warn!(
+                package = %package.display(),
+                dir = %dir.display(),
+                error = %e,
+                "offsite: 第二份没写进去"
+            );
+            return;
+        }
+    }
+    let pruned = enforce_retention(dir, keep);
+    tracing::info!(
+        package = %dest.display(),
+        pruned = pruned.len(),
+        "offsite copy complete"
+    );
+}
+
 /// 真正跑一次备份并收尾：导出、写清单、打包、清 staging、裁保留。
 async fn finish_backup(
     cfg: &BackupConfig,
@@ -802,6 +865,9 @@ async fn finish_backup(
             tar_package(staging, staging_name, &package)?;
             std::fs::remove_dir_all(staging)?;
             let deleted = enforce_retention(&cfg.backup_dir, cfg.keep_count);
+            if let Some(dir) = &cfg.offsite_dir {
+                copy_offsite(dir, &package, cfg.keep_count);
+            }
             let (kept_after, oldest_kept_at) = retained_state(&cfg.backup_dir);
             tracing::info!(
                 package = %package.display(),
@@ -1191,6 +1257,335 @@ pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// 演练用的临时库名：固定一个，不按次取。
+///
+/// 固定的名字让「上一次崩掉的演练留下了什么」有确定的答案——这一次开工先把它
+/// 删掉。按次取名字会让每一次崩溃都在集群的 PG 里留下一个 1 GB 的残库，而没人
+/// 会去数有几个。
+pub const DRILL_DATABASE: &str = "cogneva_drill";
+
+/// 演练配置。只要库、卷与迁移目录。
+///
+/// 不复用 [`BackupConfig`]：它要求 qdrant 端点，而演练不碰向量与对象层——那两段
+/// 要真恢复就得有一个空白目标环境，这一趟要证明的是「包里的关系数据与它自己的账
+/// 能装回一个跑完迁移的空库」。让演练 Job 为此背上一个 qdrant 地址，是把一个能
+/// 跑的进程挡在一个它用不上的依赖后面。
+pub struct DrillConfig {
+    pub database_url: String,
+    pub backup_dir: PathBuf,
+    /// 备份卷之外的第二个落点，与写者读同一个 env。`None` = 这个安装没有第二
+    /// 个落点，演练会把这件事实记成空列；读那一面的规则由「从来没有过一份」来判。
+    pub offsite_dir: Option<PathBuf>,
+    /// 迁移目录：演练要在一个空库上把表结构建出来，用的必须是**这个镜像**里的
+    /// 迁移，而不是别处的。镜像把迁移装在 `/opt/cogneva/crates/cog-storage/migrations`。
+    pub migrations_dir: PathBuf,
+}
+
+impl DrillConfig {
+    pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
+        let database_url = std::env::var("COGNEVA_DATABASE_URL")
+            .map_err(|_| "COGNEVA_DATABASE_URL is required for backup-drill")?;
+        let app_dir = std::env::var("COGNEVA_APP_DIR").unwrap_or_else(|_| "/opt/cogneva".into());
+        Ok(Self {
+            database_url,
+            backup_dir: PathBuf::from(
+                std::env::var("COGNEVA_BACKUP_DIR").unwrap_or_else(|_| "/backups".into()),
+            ),
+            offsite_dir: std::env::var("COGNEVA_BACKUP_OFFSITE_DIR")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
+            migrations_dir: cog_storage::migrate::migrations_dir(&app_dir),
+        })
+    }
+}
+
+/// 解包用的临时目录，离开作用域就删。
+///
+/// 包解出来是几 GB 的 CSV，失败路径上也必须清掉：演练每天跑一次，一个不清的
+/// 失败路径会按天把容器的可写层填满。
+struct TempTree(PathBuf);
+
+impl Drop for TempTree {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// 从连接串里换掉数据库名。
+///
+/// 口令里可能有 `/`、`?` 之类会破坏朴素字符串替换的字符，所以从 `://` 之后
+/// **第一个** `/` 切——那之前的整段是 authority（含 userinfo 与端口），不碰它。
+fn with_database(url: &str, database: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    match rest.split_once('/') {
+        Some((authority, path_and_query)) => {
+            let query = path_and_query
+                .split_once('?')
+                .map(|(_, q)| format!("?{q}"))
+                .unwrap_or_default();
+            format!("{scheme}://{authority}/{database}{query}")
+        }
+        // 连接串里没有路径：数据库名取默认值，换名就是把路径补上。
+        None => format!("{scheme}://{rest}/{database}"),
+    }
+}
+
+/// 删掉演练库，连同它上面可能还挂着的连接。
+///
+/// `DROP DATABASE` 在有别的连接时拒绝执行，而崩溃过一次的演练会在服务端留下
+/// 一个自己的连接直到 TCP 超时。先掐掉再删，否则「重新开始」会被上一次的残骸
+/// 挡住，且挡住的形状是一个数据库错误而不是「上次没清干净」。
+async fn drop_drill_database(live: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+         WHERE datname = $1 AND pid <> pg_backend_pid()",
+    )
+    .bind(DRILL_DATABASE)
+    .execute(live)
+    .await?;
+    sqlx::query(&format!("DROP DATABASE IF EXISTS {DRILL_DATABASE}"))
+        .execute(live)
+        .await?;
+    Ok(())
+}
+
+/// `backup_runs` 逐格比对的摘要：把给定标识的那些行按列文本拼起来取 md5。
+///
+/// 比的是**行文本**而不是几列：包里的 CSV 灌回来之后，任何一列不同都会让摘要
+/// 不同，而逐列比较要在这里再抄一遍表结构，抄漏的那一列就永远比不到。
+/// 标识由调用方从演练库读出来，两边都用同一份——用「源库有哪些行」去问会让
+/// 备份之后才终局的行混进来，那种行在包里本来就不存在。
+const RUNS_DIGEST_SQL: &str = "\
+SELECT coalesce(md5(string_agg(t::text, E'\\n' ORDER BY t.run_id)), '') \
+FROM backup_runs t WHERE run_id = ANY($1)";
+
+/// 演练：把一个包装进空库，读它装成了什么。
+///
+/// 失败不返回 `Err` 而是落进 `error`：一次演练的失败是要**被记录下来**的结果，
+/// 不是这个函数自己的故障。调用方连不上源库是唯一的例外——那时也没有地方把结果
+/// 写下去了。
+pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
+    let started_at = Utc::now();
+    let mut drill = BackupDrillRecord {
+        drill_id: format!("drill-{}", started_at.format(TIMESTAMP_FORMAT)),
+        started_at,
+        finished_at: started_at,
+        package: None,
+        package_written_at: None,
+        package_bytes: None,
+        packages_on_volume: 0,
+        oldest_package_at: None,
+        offsite_newest_at: None,
+        offsite_matches_newest: None,
+        tables_restored: None,
+        tables_expected: None,
+        rows_restored: None,
+        rows_expected: None,
+        source_runs_matched: None,
+        error: None,
+    };
+
+    // 先自己走一遍目录。这一对数不取自写者的 kept_after：演练存在的理由之一
+    // 就是「写者说自己留了几个」需要一个不靠它的读者。
+    let packages = packages_in(&cfg.backup_dir);
+    drill.packages_on_volume = packages.len() as i32;
+    drill.oldest_package_at = packages
+        .first()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .and_then(package_instant);
+
+    // 卷外那一份也自己走一遍。和卷上那一对数同一个道理：写者说它复制了，不如
+    // 读者自己看见它在。没有配置落点时这一列留空，「从来没有过一份」与「复制
+    // 停了」于是由两条不同的读数分开说。
+    if let Some(dir) = &cfg.offsite_dir {
+        drill.offsite_newest_at = packages_in(dir)
+            .last()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .and_then(package_instant);
+    }
+
+    if let Err(e) = drill_once(cfg, live, packages, &mut drill).await {
+        drill.error = Some(scrub_error(&e.to_string(), &cfg.database_url));
+    }
+    drill.finished_at = Utc::now();
+    drill
+}
+
+async fn drill_once(
+    cfg: &DrillConfig,
+    live: &PgPool,
+    packages: Vec<PathBuf>,
+    drill: &mut BackupDrillRecord,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let package = packages
+        .last()
+        .cloned()
+        .ok_or_else(|| format!("{} 里没有任何备份包", cfg.backup_dir.display()))?;
+    let name = package
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("backup package name is not valid UTF-8")?
+        .to_string();
+    drill.package_written_at = package_instant(&name);
+    if drill.package_written_at.is_none() {
+        return Err(format!("包名 {name} 里读不出时刻，无法判断它是什么时候写的").into());
+    }
+    drill.package_bytes = std::fs::metadata(&package).ok().map(|m| m.len() as i64);
+    drill.package = Some(name);
+
+    // 卷外那一份是不是**这个**包：同名、同字节数。名字相同而大小不同是复制写到
+    // 一半，名字不同是它停在了更早的那一晚——两种都是「第二份不是今晚的备份」，
+    // 但它们各自对应不同的修法，所以这里只回答「是不是同一份」，原因留给读的人。
+    if let Some(dir) = &cfg.offsite_dir {
+        drill.offsite_matches_newest = packages_in(dir).last().map(|copy| {
+            copy.file_name() == package.file_name()
+                && std::fs::metadata(copy).ok().map(|m| m.len() as i64) == drill.package_bytes
+        });
+    }
+
+    // 解包先做：包本身坏了要在这里停，不能等到把库删了再发现。
+    let extract_root = std::env::temp_dir().join(format!("cogneva-drill-{}", uuid::Uuid::new_v4()));
+    let tree = TempTree(extract_root.clone());
+    let pkg_dir = untar_package(&package, &extract_root)?;
+
+    let manifest: BackupManifest =
+        serde_json::from_str(&std::fs::read_to_string(pkg_dir.join("manifest.json"))?)?;
+    tracing::info!(
+        package = %package.display(),
+        created_at = %manifest.created_at,
+        revision = %manifest.revision,
+        "drill: package opened"
+    );
+    // 清单说这个包里有什么，此刻盘上是事实。这一段覆盖的是 qdrant 与对象层：
+    // 它们不进空库，能核的就是「清单声明的字节与文件数是不是真的在包里」。
+    verify_package_against_manifest(&pkg_dir, &manifest)?;
+    if manifest.postgres.tables.is_empty() {
+        return Err("包的清单没有声明任何表，装回去之后无论对不对都证明不了什么".into());
+    }
+
+    // 空库：先删上一次的残骸，再建。删在建之前而不是用完就删，是因为「崩溃
+    // 留下了一份旧数据」和「这次装回来的数据」混在一起时，计数会照样对得上。
+    drop_drill_database(live).await?;
+    sqlx::query(&format!("CREATE DATABASE {DRILL_DATABASE}"))
+        .execute(live)
+        .await?;
+    let scratch_url = with_database(&cfg.database_url, DRILL_DATABASE);
+    tracing::info!(database = DRILL_DATABASE, "drill: scratch database created");
+
+    let result = restore_and_compare(cfg, live, &scratch_url, &pkg_dir, &manifest, drill).await;
+    // 无论成败都把库删掉：留着它下一次会先删，但磁盘里那份 1 GB 的残库会一直在。
+    if let Err(e) = drop_drill_database(live).await {
+        tracing::warn!(error = %e, "drill: 临时库没删掉，下一次演练开工时会再删一次");
+    }
+    drop(tree);
+    result
+}
+
+async fn restore_and_compare(
+    cfg: &DrillConfig,
+    live: &PgPool,
+    scratch_url: &str,
+    pkg_dir: &Path,
+    manifest: &BackupManifest,
+    drill: &mut BackupDrillRecord,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // 表结构必须由**这个镜像**的迁移建出来：恢复只做 TRUNCATE + COPY，目标是
+    // 一个跑完迁移的空库。改用模板库复制会更快，但那要求源库上没有别的连接——
+    // 而源库此刻正被整个平台用着。
+    cog_storage::migrate::Migrator::new(&cfg.migrations_dir)
+        .run(scratch_url)
+        .await?;
+    tracing::info!(database = DRILL_DATABASE, "drill: migrations applied");
+
+    let scratch = PgPool::connect(scratch_url).await?;
+    let pg_dir = pkg_dir.join("pg");
+    if !pg_dir.exists() {
+        return Err("包里没有 pg 段，这次演练无表可恢复".into());
+    }
+    let restored = restore_postgres(&scratch, &pg_dir).await?;
+    tracing::info!(tables = restored.len(), "drill: postgres segment restored");
+
+    // 逐表把「装回来几行」与清单声明比。清单里的表在当前 schema 上缺一张，
+    // 下面的 count 会直接报错——那也是一次真实的失败：这个包装不回今天的结构。
+    let mut conn = scratch.acquire().await?;
+    let expected_tables = manifest.postgres.tables.len() as i32;
+    let mut matched_tables = 0i32;
+    let mut rows_restored = 0i64;
+    let mut rows_expected = 0i64;
+    let mut disagreements = Vec::new();
+    for table in &manifest.postgres.tables {
+        validate_table_name(&table.name)?;
+        let rows: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM \"{}\"", table.name))
+            .fetch_one(&mut *conn)
+            .await?;
+        rows_restored += rows;
+        rows_expected += table.rows;
+        if rows == table.rows {
+            matched_tables += 1;
+        } else {
+            disagreements.push(format!(
+                "`{}` 装回 {rows} 行，清单 {} 行",
+                table.name, table.rows
+            ));
+        }
+    }
+    drop(conn);
+    drill.tables_restored = Some(matched_tables);
+    drill.tables_expected = Some(expected_tables);
+    drill.rows_restored = Some(rows_restored);
+    drill.rows_expected = Some(rows_expected);
+
+    // 账表的逐格比对：只在**装回来之后就是终局**的行上比。包是在它自己那一行
+    // 还开着的时候打出来的，那一行随后由运行自己收尾——拿它去比，比到的是
+    // 「备份之后发生的事」，不是恢复对不对。
+    let terminal_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT run_id FROM backup_runs WHERE outcome IN ('ok', 'failed') ORDER BY run_id",
+    )
+    .fetch_all(&scratch)
+    .await?;
+    let restored_digest: String = sqlx::query_scalar(RUNS_DIGEST_SQL)
+        .bind(&terminal_ids)
+        .fetch_one(&scratch)
+        .await?;
+    let source_digest: String = sqlx::query_scalar(RUNS_DIGEST_SQL)
+        .bind(&terminal_ids)
+        .fetch_one(live)
+        .await?;
+    drill.source_runs_matched = Some(restored_digest == source_digest);
+    if drill.source_runs_matched != Some(true) {
+        return Err(format!(
+            "backup_runs 的 {} 行终局记录与源库不一致：装回来是 {restored_digest}，源库是 \
+             {source_digest}",
+            terminal_ids.len()
+        )
+        .into());
+    }
+
+    if !disagreements.is_empty() {
+        return Err(format!(
+            "{}/{} 张表的行数与清单不符：{}",
+            expected_tables - matched_tables,
+            expected_tables,
+            disagreements.join("；")
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// 落库前把错误文本洗干净：口令整段换掉，再交给公共脱敏。
+fn scrub_error(text: &str, database_url: &str) -> String {
+    let scrubbed = url_password(database_url)
+        .map(|secret| cog_core::redact_secrets(text).replace(&secret, "[redacted]"))
+        .unwrap_or_else(|| cog_core::redact_secrets(text));
+    scrubbed.chars().take(ERROR_TEXT_MAX_CHARS).collect()
+}
+
 fn install_subscriber() {
     // 子命令不经 run_app，没有早鸟订阅者；Job Pod 日志全靠这里装。
     tracing_subscriber::fmt()
@@ -1207,6 +1602,32 @@ pub async fn run_backup_from_env() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = BackupConfig::from_env()?;
     let package = run_backup(&cfg).await?;
     println!("{}", package.display());
+    Ok(())
+}
+
+/// `cogneva backup-drill`：演练 CronJob 的入口。
+///
+/// 演练的结果先落库再决定退出码：一行「证明不了」的记录比一个失败的 Job 更有
+/// 用，但两者都要有——只落库不退出非零，集群面看不到这次失败；只退出非零不落库，
+/// 读数面看不到为什么。
+pub async fn run_drill_from_env() -> Result<(), Box<dyn std::error::Error>> {
+    install_subscriber();
+    let cfg = DrillConfig::from_env()?;
+    let live = PgPool::connect(&cfg.database_url).await?;
+    let drill = run_drill(&cfg, &live).await;
+    let store = PostgresBackupRunStore::new(live.clone());
+    store.record_drill(&drill).await?;
+    println!(
+        "{} {}",
+        drill.drill_id,
+        if drill.ok() { "ok" } else { "failed" }
+    );
+    if let Some(error) = &drill.error {
+        return Err(format!("演练没有证明这个包可恢复：{error}").into());
+    }
+    if !drill.ok() {
+        return Err("演练的测量没有全部对上，这一行没有留下错误文本".into());
+    }
     Ok(())
 }
 
@@ -1540,6 +1961,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             keep_count: 7,
             run_deadline_seconds: DEFAULT_RUN_DEADLINE_SECONDS,
+            offsite_dir: None,
             namespace: "cogneva".into(),
         };
         let err: Box<dyn std::error::Error> = Box::new(std::io::Error::other(
@@ -1556,6 +1978,78 @@ mod tests {
             recorded.contains("[redacted]"),
             "抹掉之后要留下痕迹，不然读的人以为错误本来就没写 URL：{recorded}"
         );
+    }
+
+    #[test]
+    fn the_second_copy_is_written_and_pruned_by_the_same_count() {
+        let volume = tempfile::tempdir().unwrap();
+        let offsite = tempfile::tempdir().unwrap();
+        for day in [16, 17] {
+            let name = package_name(Utc.with_ymd_and_hms(2026, 10, day, 3, 17, 0).unwrap());
+            std::fs::write(offsite.path().join(name), b"old").unwrap();
+        }
+        let newest = package_name(Utc.with_ymd_and_hms(2026, 10, 18, 3, 17, 0).unwrap());
+        let package = volume.path().join(&newest);
+        std::fs::write(&package, b"new bytes").unwrap();
+
+        copy_offsite(offsite.path(), &package, 2);
+
+        assert!(
+            offsite.path().join(&newest).exists(),
+            "第二份必须是这一晚的包"
+        );
+        assert_eq!(
+            std::fs::read(offsite.path().join(&newest)).unwrap(),
+            b"new bytes"
+        );
+        assert_eq!(
+            packages_in(offsite.path()).len(),
+            2,
+            "卷外也要按同一个份数裁，不然它只涨不落"
+        );
+    }
+
+    #[test]
+    fn a_half_written_copy_never_looks_like_a_package() {
+        // 复制先写 `<包名>.partial` 再改名。演练是遍历目录找最新包的，一个半份
+        // 文件如果匹配包名形状，就会被它当成「最新那份」去装。
+        let dir = tempfile::tempdir().unwrap();
+        let name = package_name(Utc.with_ymd_and_hms(2026, 10, 18, 3, 17, 0).unwrap());
+        std::fs::write(dir.path().join(format!("{name}.partial")), b"half").unwrap();
+
+        assert!(packages_in(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn with_database_swaps_only_the_path_and_keeps_the_query() {
+        // 演练库和源库只差一个库名：把整条 URL 除了路径原样搬过去，连接参数
+        // （sslmode、连接超时）才不会在演练那一侧悄悄变掉。
+        assert_eq!(
+            with_database(
+                "postgres://cog_user:s3cret@postgres:5432/cogneva",
+                DRILL_DATABASE
+            ),
+            "postgres://cog_user:s3cret@postgres:5432/cogneva_drill"
+        );
+        assert_eq!(
+            with_database(
+                "postgres://cog_user:s3cret@postgres:5432/cogneva?sslmode=disable",
+                DRILL_DATABASE
+            ),
+            "postgres://cog_user:s3cret@postgres:5432/cogneva_drill?sslmode=disable"
+        );
+        // 路径为空（`/` 结尾）：库名照样要补上，不能拼出一个空库名的 URL。
+        assert_eq!(
+            with_database("postgres://cog_user@postgres:5432/", DRILL_DATABASE),
+            "postgres://cog_user@postgres:5432/cogneva_drill"
+        );
+        // 连路径都没有：补路径。没有 `://` 的串不是 URL，原样返回——猜一个
+        // 出来只会在建库的时候炸在一个更难读的地方。
+        assert_eq!(
+            with_database("postgres://cog_user@postgres:5432", DRILL_DATABASE),
+            "postgres://cog_user@postgres:5432/cogneva_drill"
+        );
+        assert_eq!(with_database("not a url", DRILL_DATABASE), "not a url");
     }
 
     #[test]

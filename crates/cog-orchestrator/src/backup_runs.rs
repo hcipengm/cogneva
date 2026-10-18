@@ -26,8 +26,8 @@ use chrono::{DateTime, Utc};
 use tracing::{debug, info, warn};
 
 use cog_core::{
-    metric_names, BackupAccountReading, BackupRunStore, MetricsBackend, OwnerLeaseBroker,
-    ShutdownSignal,
+    metric_names, BackupAccountReading, BackupDrillRecord, BackupRunStore, MetricsBackend,
+    OwnerLeaseBroker, ShutdownSignal,
 };
 
 /// This loop's name in the process liveness registry, and the value of
@@ -88,6 +88,19 @@ enum BackupReadout {
     OldestKeptAgeSeconds,
     /// The newest package's size on disk.
     NewestPackageBytes,
+    /// How long ago the newest restore drill finished, whatever it concluded.
+    DrillLatestAgeSeconds,
+    /// Whether that drill proved its package restorable: 1 or 0.
+    DrillLatestOk,
+    /// How many packages the newest drill's own walk of the volume found.
+    VolumePackages,
+    /// How long ago the oldest of those was written, by the instant in its name.
+    VolumeOldestPackageAgeSeconds,
+    /// How long ago the newest package outside the backup volume was written.
+    /// Absent when there is no second copy at all.
+    OffsiteNewestAgeSeconds,
+    /// Whether that second copy is the very package the drill restored: 1 or 0.
+    OffsiteMatchesVolume,
 }
 
 impl BackupReadout {
@@ -104,6 +117,12 @@ impl BackupReadout {
         BackupReadout::KeepTarget,
         BackupReadout::OldestKeptAgeSeconds,
         BackupReadout::NewestPackageBytes,
+        BackupReadout::DrillLatestAgeSeconds,
+        BackupReadout::DrillLatestOk,
+        BackupReadout::VolumePackages,
+        BackupReadout::VolumeOldestPackageAgeSeconds,
+        BackupReadout::OffsiteNewestAgeSeconds,
+        BackupReadout::OffsiteMatchesVolume,
     ];
 
     fn as_str(self) -> &'static str {
@@ -120,6 +139,12 @@ impl BackupReadout {
             BackupReadout::KeepTarget => "keep_target",
             BackupReadout::OldestKeptAgeSeconds => "oldest_kept_age_seconds",
             BackupReadout::NewestPackageBytes => "newest_package_bytes",
+            BackupReadout::DrillLatestAgeSeconds => "drill_latest_age_seconds",
+            BackupReadout::DrillLatestOk => "drill_latest_ok",
+            BackupReadout::VolumePackages => "volume_packages",
+            BackupReadout::VolumeOldestPackageAgeSeconds => "volume_oldest_package_age_seconds",
+            BackupReadout::OffsiteNewestAgeSeconds => "offsite_newest_age_seconds",
+            BackupReadout::OffsiteMatchesVolume => "offsite_matches_volume",
         }
     }
 }
@@ -224,6 +249,53 @@ const READOUT_READERS: [(BackupReadout, ReadoutReader); BackupReadout::ALL.len()
                   being a size, its bound belongs to the rule rather than here.",
         },
     ),
+    // The drill's four. A drill that never ran publishes none of them, so the
+    // rule below fires on absence by a second expression that reads the same
+    // selector -- `backup_restore_drill_never_ran` multiplies `absent()` of this
+    // name by how long the CronJob has existed. The line names the age rule
+    // because that is the one whose subject is this value.
+    (
+        BackupReadout::DrillLatestAgeSeconds,
+        ReadoutReader::Rule("backup_restore_drill_is_stale"),
+    ),
+    (
+        BackupReadout::DrillLatestOk,
+        ReadoutReader::Rule("backup_restore_drill_failed"),
+    ),
+    // The writer's own count, read by a rule only where a second, independent
+    // count exists: `kept` comes from the run's retention pass and this one from
+    // the drill's walk, and the rule is the difference between them.
+    (
+        BackupReadout::VolumePackages,
+        ReadoutReader::Rule("backup_volume_package_count_disagrees_with_the_last_run"),
+    ),
+    (
+        // The oldest instant the walk found. It is the walk's own evidence that
+        // the count means what it says -- seven packages whose oldest was written
+        // yesterday is not the state seven with a week-old oldest describes --
+        // and it is published for whoever looks. A rule over it would compare it
+        // with `oldest_kept_age_seconds`, and the two agree by construction
+        // whenever the walk and the run describe the same directory; when they
+        // do not, the drill's own staleness is the fact, and the rule above this
+        // one already reports it. A second rule would only say it twice.
+        BackupReadout::VolumeOldestPackageAgeSeconds,
+        ReadoutReader::Unread {
+            why: "the walk's evidence for the count, read by whoever checks that the count is of \
+                  the directory they think it is. Its disagreement with oldest_kept_age_seconds is \
+                  the drill being old, which backup_restore_drill_is_stale reports already.",
+        },
+    ),
+    (
+        // The age of the second copy. Absent until one is written, so the rule
+        // that asks whether one ever appeared reads the absence, and this one
+        // only answers how old the newest is.
+        BackupReadout::OffsiteNewestAgeSeconds,
+        ReadoutReader::Rule("backup_offsite_copy_is_stale"),
+    ),
+    (
+        BackupReadout::OffsiteMatchesVolume,
+        ReadoutReader::Rule("backup_offsite_copy_is_not_the_latest_package"),
+    ),
 ];
 
 /// How old an instant is, in whole seconds, floored at zero.
@@ -248,6 +320,7 @@ fn age_seconds(now: DateTime<Utc>, instant: DateTime<Utc>) -> f64 {
 fn value_of(
     readout: BackupReadout,
     account: &BackupAccountReading,
+    drill: Option<&BackupDrillRecord>,
     now: DateTime<Utc>,
 ) -> Option<f64> {
     match readout {
@@ -295,6 +368,30 @@ fn value_of(
             .as_ref()
             .and_then(|pkg| pkg.bytes)
             .map(|bytes| bytes as f64),
+        // The drill's values all come from one row and all disappear with it.
+        // A drill that never ran publishes nothing here rather than a zero:
+        // "no drill has ever finished" and "a drill just finished" are the same
+        // number and opposite facts, and the rule that asks whether a drill is
+        // owed reads the absence, not the zero.
+        BackupReadout::DrillLatestAgeSeconds => drill.map(|d| age_seconds(now, d.finished_at)),
+        BackupReadout::DrillLatestOk => drill.map(|d| if d.ok() { 1.0 } else { 0.0 }),
+        BackupReadout::VolumePackages => drill.map(|d| d.packages_on_volume as f64),
+        // Absent when the walk found nothing to take the oldest instant from,
+        // which is the same state as "no package has ever been written" -- and
+        // there is no age to publish for a package that is not there.
+        BackupReadout::VolumeOldestPackageAgeSeconds => drill
+            .and_then(|d| d.oldest_package_at)
+            .map(|at| age_seconds(now, at)),
+        // The second copy's two readings are absent together when there is no
+        // copy, and that absence is not an error: the rule that asks whether a
+        // second copy was ever written reads the absence itself, and the one
+        // that asks whether the copy is current reads this age.
+        BackupReadout::OffsiteNewestAgeSeconds => drill
+            .and_then(|d| d.offsite_newest_at)
+            .map(|at| age_seconds(now, at)),
+        BackupReadout::OffsiteMatchesVolume => drill
+            .and_then(|d| d.offsite_matches_newest)
+            .map(|same| if same { 1.0 } else { 0.0 }),
     }
 }
 
@@ -338,9 +435,26 @@ async fn publish_account_once(
 
     let account = store.read_account().await?;
 
+    // A drill table that cannot be read is not a reason to withhold the account:
+    // the two records answer different questions, and losing the older one
+    // because the newer one is broken would take a working reading away. The
+    // failure is loud in the log, and the drill's own rules go quiet -- which is
+    // exactly the shape their freshness companions are there to make visible.
+    let drill = match store.read_latest_drill().await {
+        Ok(drill) => drill,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "backup account: the newest restore drill could not be read this round, so the \
+                 drill's readings are absent from the face even though the account's are not"
+            );
+            None
+        }
+    };
+
     if let Some(metrics) = metrics {
         for readout in BackupReadout::ALL {
-            let Some(value) = value_of(*readout, &account, now) else {
+            let Some(value) = value_of(*readout, &account, drill.as_ref(), now) else {
                 continue;
             };
             let mut labels = HashMap::new();

@@ -60,11 +60,20 @@ import sys
 
 config_path, values_path, template_path = sys.argv[1:4]
 
-# 日尺度那三条：界写在 condition 上。
+# 日尺度的那几条：界写在 condition 上。
+#
+# 演练与卷外副本那四条是同一族的第二个读者面：它们各自也在判「一天」以内有没有
+# 东西落地，用的必须是同一个数。把它们留在名单外，界就在这里漂——一条规则改了
+# 排班或运行时长，另外两条照旧写着昨天的 26 小时，而谁都没在核它们。
 BY_CONDITION = [
     "backup_no_recent_success",
     "backup_never_succeeded_by_the_cronjob",
     "backup_nothing_ever_recorded",
+    "backup_restore_drill_never_ran",
+    "backup_restore_drill_is_stale",
+    "backup_offsite_copy_never_written",
+    "backup_offsite_copy_is_stale",
+    "backup_cronjob_stopped_scheduling",
 ]
 # 成功那条：界写在 promql 里（`(time() - …) < 93600`），不在 condition 上。
 BY_PROMQL = "backup_success_not_recorded"
@@ -101,6 +110,32 @@ if len(bounds) != 1:
     detail = "、".join(f"{n}={v:g}" for n, v in sorted(occurrences.items()))
     fail(f"备份族的界不止一个数（{detail}）——摘要承诺它们「不会在一天上漂开」")
 bound = bounds.pop()
+
+# 覆盖：名单是手写的，而手写的名单只覆盖写它那天想到的规则。后来加进来的规则
+# 若也把族界写进 condition 或 promql，名单不会自己长出这一条，界就只在它身上
+# 无声地漂——所以这里反向扫一遍：带着这个数的规则必须**已经在名单上**。
+# 判据取的是「数是这个界」，不是「文本里出现过」：摘要里复述这个数是被允许的，
+# 真正会被拿来判超期的是 condition 与 promql。
+carriers = []
+# 只扫本族的规则：族是按名字划的（`backup_`），别的族碰巧用同一个数不是
+# 漂移，把它们也收进来等于让这条门禁去管别人的界。
+for name, rule in rules.items():
+    if name in occurrences or not name.startswith("backup_"):
+        continue
+    numbers = [
+        float(v)
+        for k, v in rule.get("condition", {}).items()
+        if k in ("greater_than", "less_than") and isinstance(v, (int, float))
+    ]
+    numbers += [float(x) for x in re.findall(r"[<>]\s*(\d+(?:\.\d+)?)", rule.get("promql", ""))]
+    if any(n == bound for n in numbers):
+        carriers.append(name)
+if carriers:
+    fail(
+        f"这些规则带着备份族的界 {bound:g} 却不在名单上：{'、'.join(sorted(carriers))}。"
+        f"把它们加进 BY_CONDITION（或 BY_PROMQL）——不在名单上的规则，界随排班 / "
+        f"宽限 / 运行时长改动时不会被这里核到"
+    )
 
 # 从 chart 自己读那两个操作数，不抄。
 values_text = open(values_path, encoding="utf-8").read()
@@ -168,7 +203,9 @@ if not bound < ceiling:
 #      递归地查，不是「提了别人的名字就算数」。
 DEFERRAL = re.compile(r"the bound ([a-z0-9_]+) carries")
 OPERAND_TOKENS = [
-    ("每天一次", ("once a day", "daily run", "run a day", "once per day")),
+    # 同一个操作数的几种正当写法；`once-a-day` 是既有摘要用的那一种，
+    # 认不出来就等于逼人为了过门禁改句子，而不是把话写清楚。
+    ("每天一次", ("once a day", "once-a-day", "daily run", "run a day", "once per day")),
     ("startingDeadlineSeconds", ("startingDeadlineSeconds",)),
     ("runDeadlineSeconds", ("runDeadlineSeconds",)),
 ]
@@ -254,8 +291,11 @@ for name in list(BY_CONDITION) + [BY_PROMQL]:
         )
 
 print(
-    f"OK: 四条出现一致（{bound:g} = {bound / 3600:.2f}h）；"
-    f"四条摘要都交代了门禁相加的三个操作数（排班周期、startingDeadlineSeconds、"
+    # 条数由名单自己数出来，不写死：名单加一条而这句话没加，读的人会以为
+    # 「四条都在核」——这正是本脚本要防的那种散文漂移。
+    f"OK: {len(occurrences)} 条出现一致（{bound:g} = {bound / 3600:.2f}h）；"
+    f"这 {len(occurrences)} 条摘要都交代了门禁相加的三个操作数（排班周期、"
+    f"startingDeadlineSeconds、"
     f"runDeadlineSeconds——自己点名，或点名它复用界的那条）；"
     f"摘要里点名的派生数（整点小时数 == {bound:g}、余量 == {bound - floor:g}）"
     f"与门算出的相符；"

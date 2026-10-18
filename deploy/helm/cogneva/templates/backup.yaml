@@ -82,6 +82,12 @@ spec:
                   valueFrom:
                     fieldRef:
                       fieldPath: metadata.namespace
+                {{- with .Values.backup.offsiteHostPath }}
+                # 卷外那一份的落点。写者只负责复制，判「有没有、是不是今晚的」
+                # 由演练那一跑自己遍历目录——写者说自己复制了不算读数。
+                - name: COGNEVA_BACKUP_OFFSITE_DIR
+                  value: "/offsite"
+                {{- end }}
               resources:
                 # 请求按流式作业实耗定（COPY→文件、tar.zst 流式压缩，常驻内存
                 # 极小）；定高了在资源紧张的小节点上会调度不出来。
@@ -109,6 +115,10 @@ spec:
                   readOnly: true
                 - name: backup
                   mountPath: /backups
+                {{- with .Values.backup.offsiteHostPath }}
+                - name: offsite
+                  mountPath: /offsite
+                {{- end }}
           volumes:
             - name: data
               persistentVolumeClaim:
@@ -125,4 +135,102 @@ spec:
             - name: backup
               persistentVolumeClaim:
                 claimName: cogneva-backup-pvc
+            {{- with .Values.backup.offsiteHostPath }}
+            # 宿主机上的一条路径，与备份卷不在同一个卷对象里：删 PVC、卷被回收
+            # 都不动它。（同一个故障域，见 values.yaml 里的说明。）
+            - name: offsite
+              hostPath:
+                path: {{ . | quote }}
+                type: DirectoryOrCreate
+            {{- end }}
+---
+# 恢复演练：把最新一个包装进一个**空库**，读它装成了什么，然后删库。
+#
+# 为什么是一个独立的 CronJob 而不是备份那一跑的一部分：演练要连源库、要建库、
+# 要灌一整个库，任何一步出错都不该让当晚的备份算失败。两件事共用同一个包，但
+# 一件的失败不能变成另一件的结果。
+#
+# 为什么是空库而不是空白命名空间：`CREATE DATABASE` 给的是一个没有表、没有行的
+# 目标，这正是「恢复到一个干净的地方」要的东西；而空白命名空间要再拉一套
+# Postgres/Qdrant/Secret，演练还没开始就先考验了一遍安装。演练跑在自己的 Pod、
+# 自己的库名里，源 schema 一个字节都不碰——账表是同一批人要看的那张表，拿它当
+# 演练场就是把要证明的东西押上去。
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cogneva-backup-drill
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: backup-drill
+spec:
+  schedule: {{ .Values.backup.drillSchedule | quote }}
+  timeZone: {{ .Values.backup.timeZone | quote }}
+  # 同备份：两次演练同时在跑只会在同一个库名上互相删库。
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 1800
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # 演练失败不重试成串：答案已经落进 backup_drills 了，下一晚自然再来。
+      backoffLimit: 0
+      activeDeadlineSeconds: {{ .Values.backup.drillDeadlineSeconds }}
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: cogneva
+            app.kubernetes.io/component: backup-drill
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: drill
+              image: {{ include "cogneva.image" . }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              args: ["backup-drill"]
+              env:
+                - name: PG_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: cogneva-secrets
+                      key: pg-password
+                # 演练连的是**源库**：它要在同一个服务器上建演练库，并把装回来的
+                # 账行与源库那几行逐格比。这不违反「不在源库上做演练」——遍历的
+                # 是另一个数据库名，源 schema 只被读。
+                - name: COGNEVA_DATABASE_URL
+                  value: "postgres://cog_user:$(PG_PASSWORD)@postgres.{{ include "cogneva.namespace" . }}.svc.cluster.local:5432/cogneva"
+                {{- with .Values.backup.offsiteHostPath }}
+                # 只读：演练遍历卷外那一份，看它是不是刚装回去的这个包。
+                - name: COGNEVA_BACKUP_OFFSITE_DIR
+                  value: "/offsite"
+                {{- end }}
+              resources:
+                # 与备份同档：恢复是流式 COPY，常驻内存小，重活在 PG 那一侧。
+                requests:
+                  cpu: 100m
+                  memory: 64Mi
+                limits:
+                  cpu: 1000m
+                  memory: 1Gi
+              volumeMounts:
+                # 只读：演练打开包，绝不写卷。保留的一份都不动。
+                - name: backup
+                  mountPath: /backups
+                  readOnly: true
+                {{- with .Values.backup.offsiteHostPath }}
+                - name: offsite
+                  mountPath: /offsite
+                  readOnly: true
+                {{- end }}
+          volumes:
+            - name: backup
+              persistentVolumeClaim:
+                claimName: cogneva-backup-pvc
+            {{- with .Values.backup.offsiteHostPath }}
+            - name: offsite
+              hostPath:
+                path: {{ . | quote }}
+                type: DirectoryOrCreate
+            {{- end }}
 {{- end }}

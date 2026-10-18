@@ -115,6 +115,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 数据面备份与恢复：CronJob 每日打包，换机/重装由一次性恢复 Job 消费。
         Command::Backup => cogneva::backup::run_backup_from_env().await,
         Command::Restore => cogneva::backup::run_restore_from_env().await,
+        // 恢复演练：把最新一个包装进一个跑完迁移的空库，逐表对数、把账行与源库
+        // 逐格比，然后删库。跑在独立的 CronJob 里，所以源库哪怕连不上也不影响
+        // 主应用——但它必须连得上才谈得上演练。
+        Command::BackupDrill => cogneva::backup::run_drill_from_env().await,
         // Torn AOF tail repair: runs in the redis Pod's init container, which is
         // what moves "a host that died uncleanly means truncating the AOF by
         // hand" onto the startup path.

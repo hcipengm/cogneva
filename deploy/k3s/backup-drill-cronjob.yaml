@@ -1,0 +1,79 @@
+# 恢复演练 CronJob：把最新一个备份包装进一个跑完迁移的**空库**，逐表对数、
+# 把账行与源库逐格比，然后把库删掉，答案落进 `backup_drills`。
+#
+# 与 chart 的 `backup.drillSchedule` / `drillDeadlineSeconds` 同值；改这里就是
+# 改那一份，两边由 field-level parity 门禁对齐。
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cogneva-backup-drill
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: backup-drill
+spec:
+  # 备份在 03:17 出包，演练在半小时后装它——装的是当晚那个包，不是昨天的。
+  schedule: "47 3 * * *"
+  timeZone: "Etc/UTC"
+  # 两次演练同时在跑只会在同一个库名上互相删库。
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 1800
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # 演练失败不重试成串：答案已经落进 backup_drills 了，下一晚自然再来。
+      backoffLimit: 0
+      # 恢复要灌进一整个库（2026-10-18 实测源库 962 MB），比只导出慢；不设界的话
+      # 一次挂住的演练会在 Forbid 下把后面每一次都挡掉。
+      activeDeadlineSeconds: 3600
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: cogneva
+            app.kubernetes.io/component: backup-drill
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: drill
+              image: localhost:30500/cogneva:local
+              imagePullPolicy: Always
+              args: ["backup-drill"]
+              env:
+                - name: PG_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: cogneva-secrets
+                      key: pg-password
+                # 连的是**源库**：演练要在同一个服务器上建演练库，并把装回来的
+                # 账行与源库那几行逐格比。遍历的是另一个数据库名，源 schema 只被读。
+                - name: COGNEVA_DATABASE_URL
+                  value: "postgres://cog_user:$(PG_PASSWORD)@postgres.cogneva.svc.cluster.local:5432/cogneva"
+                # 只读：演练遍历卷外那一份，看它是不是刚装回去的这个包。
+                - name: COGNEVA_BACKUP_OFFSITE_DIR
+                  value: "/offsite"
+              resources:
+                # 与备份同档：恢复是流式 COPY，常驻内存小，重活在 PG 那一侧。
+                requests:
+                  cpu: 100m
+                  memory: 64Mi
+                limits:
+                  cpu: 1000m
+                  memory: 1Gi
+              volumeMounts:
+                # 只读：演练打开包，绝不写卷。保留的一份都不动。
+                - name: backup
+                  mountPath: /backups
+                  readOnly: true
+                - name: offsite
+                  mountPath: /offsite
+                  readOnly: true
+          volumes:
+            - name: backup
+              persistentVolumeClaim:
+                claimName: cogneva-backup-pvc
+            - name: offsite
+              hostPath:
+                path: "/var/lib/cogneva-offsite"
+                type: DirectoryOrCreate

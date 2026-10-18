@@ -75,11 +75,16 @@ def rule(rules, name):
 
 
 def widen(rules, value):
-    """把**四条出现**一起抬上去：这一格的判据是「带子」，不是「一致」，
-    所以四者必须仍然相等，否则红的是上一格的一致性检查。"""
-    for name in ("backup_no_recent_success", "backup_never_succeeded_by_the_cronjob",
-                 "backup_nothing_ever_recorded"):
-        rule(rules, name)["condition"]["greater_than"] = float(value)
+    """把**所有带着族界的出现**一起抬上去：这一格的判据是「带子」，不是「一致」，
+    所以每一条都必须仍然相等，否则红的是上一格的一致性检查。
+
+    旧的写法是点名那三条日尺度规则。名单后来长了（演练、卷外副本、CronJob 停排），
+    夹具没跟，于是「界抬到两天以上」这一格在**一致性**上先红了，红得和它宣称的
+    理由无关。按出现形式取（谁的 `greater_than` 就是这个数），夹具不再需要跟着
+    名单改。"""
+    for r in rules:
+        if r.get("condition", {}).get("greater_than") == 93600.0:
+            r["condition"]["greater_than"] = float(value)
     r = rule(rules, "backup_success_not_recorded")
     # 按**出现形式**改（`<(数字)`），不绑字面量：上一版写 `replace("< 93600", …)`，
     # 源配置里只要空格变一下（`<93600`）这个替换就静默不动，夹具少了第四条、门在
@@ -121,6 +126,21 @@ def reword_but_keep(rules):
 
 dump("summary-drops-operand", drop_operand)
 dump("summary-reworded", reword_but_keep)
+
+
+def off_roster(rules):
+    """本族后来长出来的一条规则，界写对了、但没进名单——名单是手写的，
+    不会自己长出这一条。"""
+    rules.append({
+        "name": "backup_new_face",
+        "promql": "max(some_reading)",
+        "condition": {"greater_than": 93600.0},
+        "severity": "warning",
+        "summary": "a new face of the backup family.",
+    })
+
+
+dump("off-roster", off_roster)
 
 
 def reword_derived_keeping_numbers(rules):
@@ -226,7 +246,15 @@ fi
 grep -q 'runDeadlineSeconds' <<<"${out}" || fail "红的时候没点名摘要缺的那个操作数：${out}"
 grep -q 'backup_no_recent_success' <<<"${out}" || fail "红的时候没点名是哪条规则的摘要：${out}"
 
-# 10. 负对照：摘要**改写**但仍点名那三个操作数 -> 仍绿。
+# 11. 本族新规则带着族界却不在名单上：红，并点名它。
+#     这一格测的是覆盖：名单是手写的，不带反向扫描时，后来加的规则拿着昨天的界
+#     漂走而门禁照样绿——这一轮就是这么长出来的（演练与卷外副本四条）。
+if out="$(run_gate "${work}/off-roster.json" "${values}" "${template}")"; then
+    fail "本族新规则带着族界却没进名单，这条门禁还是绿的——界在它身上无人核"
+fi
+grep -q 'backup_new_face' <<<"${out}" || fail "红的时候没点名那条没进名单的规则：${out}"
+
+# 12. 负对照：摘要**改写**但仍点名那三个操作数 -> 仍绿。
 #     判据取的是「点没点名」，不是「原文一字不差」；写成逐字比对会把每一次正当改写
 #     都判红，而正当改写正是这条门禁希望发生的事。
 if ! out="$(run_gate "${work}/summary-reworded.json" "${values}" "${template}")"; then

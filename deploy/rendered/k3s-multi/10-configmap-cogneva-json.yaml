@@ -1966,6 +1966,76 @@ data:
               "summary": "The CronJob's own record has not scheduled a run in {value} seconds, past the 26 hours this family allows, so the object that makes the packages has stopped making them: it is suspended, its controller has stopped reaching it, or the object was edited to a schedule the day no longer contains. The instant read is status_last_schedule_time, the controller's record of the last run it created, and not next_schedule_time, which kube-state-metrics recomputes at every scrape from the spec: a projection of the future is always ahead of now while the scrape is alive, so comparing it to now measures the scrape's freshness rather than whether a run was made, and it crosses now on any scrape gap that spans the daily minute. The cluster's record and the account's answer are two faces of this state, and this rule is the cluster's half: backup_no_recent_success reads the newest successful row from the account and goes silent when the account's publish loop stops refreshing it, while this rule keeps reading the object, so the pair separates 'the runs are not being made' from 'the runs are being made and not recorded'. 93600 is not a new number: the bound backup_no_recent_success carries, reused so the two cannot drift apart on what a day means, and the operands behind it are the same once-a-day schedule, the same startingDeadlineSeconds and the same runDeadlineSeconds. A deployment inside its first day is kept out by construction rather than by a special case: before the first run is created this series does not exist, so the rule is empty rather than lit, and a deployment that never scheduled at all is the state backup_never_succeeded_by_the_cronjob and backup_nothing_ever_recorded answer, each from its own side. The source's own absence is the source's to report: were the object gone, or kube-state-metrics gone with it, max over nothing is empty and so is this rule. It clears on the next scheduled run, which is the same reading that raised it. Measured against the live face on 2026-10-18 in three directions: as written, 575 seconds, silent against the bound; with the bound replaced by 300 the same age comes through above it, which is the shape firing; with the cronjob label renamed to one that matches nothing, empty."
             },
             {
+              "name": "backup_restore_drill_never_ran",
+              "promql": "(time() - max(kube_cronjob_created{cronjob=\"cogneva-backup-drill\"})) * max(absent(cogneva_backup_run_readings{readout=\"drill_latest_age_seconds\"}))",
+              "condition": {
+                "greater_than": 93600.0
+              },
+              "severity": "critical",
+              "summary": "The CronJob that drills the backup has existed for {value} seconds, past the 26 hours this family allows, and no drill has ever written a row: every package this installation has produced is a package nobody has opened. The expression has two factors for the same reason backup_nothing_ever_recorded has them -- the object's age says what should have happened by now, the absence says what has not, and multiplying them keeps the rule silent on an installation whose drill CronJob was deployed a minute ago. A drill is not a backup: a run that concluded ok says the package was written, and writing is not restoring. A truncated archive, a table whose CSV was cut short, a schema that moved under the data -- each leaves a package of ordinary size behind a successful run. This rule is the only one that can see that state, because the package's own record was written by the same process that believed it had succeeded. The bound is the family bound, a daily run scheduled once a day plus startingDeadlineSeconds plus runDeadlineSeconds, the longest a run may take.",
+              "_comment_why_absent": "the reading is absent, not zero, when no drill exists: the publisher writes nothing for a drill it has never read, so a zero would have to be invented here, and a zero in a seconds field means a drill just finished."
+            },
+            {
+              "name": "backup_restore_drill_is_stale",
+              "promql": "max(cogneva_backup_run_readings{readout=\"drill_latest_age_seconds\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds{readout=\"drill_latest_age_seconds\"}) < 1800))",
+              "condition": {
+                "greater_than": 93600.0
+              },
+              "severity": "critical",
+              "summary": "The newest restore drill finished {value} seconds ago, past the 26 hours this family allows, so the packages this installation is producing have not been opened in over a day. 93600 is the same number backup_no_recent_success carries and for the same reason, the same three operands: a daily run scheduled once a day, plus startingDeadlineSeconds, plus runDeadlineSeconds, the longest a run may take. The drill is scheduled off the backup and inherits all of them, which is why it is the 26 hours and not a number of its own. What separates this rule from that one: the backup can be perfectly healthy while the drill is not. The drill is the only reading that opens the package, and it is the one that fails when the image, the credentials or the scratch database are wrong -- none of which stops a package from being written. The freshness conjunction is on the observed timestamp and not on the age: the value is republished every five minutes and is the age as of that publish, so a publisher that stopped would otherwise leave a plausible-looking number in place forever.",
+              "_comment_why_not_absent": "absence is backup_restore_drill_never_ran's to report; this rule only speaks about a drill that exists."
+            },
+            {
+              "name": "backup_restore_drill_failed",
+              "promql": "max(cogneva_backup_run_readings{readout=\"drill_latest_ok\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds{readout=\"drill_latest_ok\"}) < 1800))",
+              "condition": {
+                "less_than": 1.0
+              },
+              "severity": "warning",
+              "summary": "The newest restore drill did not prove its package restorable: {value} is the flag the drill publishes, 1 meaning every measurement agreed. The drill writes ok only when all of them do -- the manifest's table and row counts match the restored copy, and the account table comes back identical row for row -- so this rule fires on any one of them disagreeing, and the row it fired on carries which. A drill that cannot run at all (no package on the volume, the scratch database refused, a migration missing from the image) lands here too, with the reason in its error column. It is a warning rather than a critical because the backup itself is not known to be broken: what is known is that it has not been shown to be restorable, which is the state this whole face exists to make visible.",
+              "_comment_why_less_than": "the value is 1 or 0 and the condition is '< 1', not '== 0': a rule that matches only the exact zero stops matching the moment anyone adds a third state, while 'less than 1' keeps meaning 'not proven'."
+            },
+            {
+              "name": "backup_volume_package_count_disagrees_with_the_last_run",
+              "promql": "abs((max(cogneva_backup_run_readings{readout=\"volume_packages\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds{readout=\"volume_packages\"}) < 1800))) - (max(cogneva_backup_run_readings{readout=\"kept\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds{readout=\"kept\"}) < 1800))))",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "The drill's walk of the backup volume counted a different number of packages than the last successful run said it left: {value} is the size of the difference, and the two numbers are in the drill's row and the run's. This is the one reading in the family where the count is not taken from the writer. kept and retained_state are the run's own answer about its own retention pass, and a run that pruned nothing because it failed still concluded ok about everything else -- so a volume that is filling up and a volume that is being trimmed produce the same self-report. The walk is a separate process that opens the directory and counts what is in it. Either direction fires: more packages than the last run left means a package nothing accounts for, fewer means files left the volume without a run saying so, and both are visible nowhere else.",
+              "_comment_why_abs": "a difference in either direction is the same fact -- the writer's count and the directory's disagree -- and a rule that only watched the growth direction would stay silent while packages disappeared."
+            },
+            {
+              "name": "backup_offsite_copy_never_written",
+              "promql": "(time() - max(kube_cronjob_created{cronjob=\"cogneva-backup\"})) * max(absent(cogneva_backup_run_readings{readout=\"offsite_newest_age_seconds\"}))",
+              "condition": {
+                "greater_than": 93600.0
+              },
+              "severity": "critical",
+              "summary": "The backup CronJob has existed for {value} seconds, past the 26 hours this family allows, and no second copy of any package has ever been written outside the backup volume. The expression has the same two factors as backup_restore_drill_never_ran: the object's age says what should have happened by now, absent() says what has not, and multiplying them keeps the rule quiet on an installation whose CronJob was deployed a minute ago. A daily run copies its package to the offsite directory after writing it, so this state is a destination that was never set, never mounted or never writable -- and the first copy is exactly as complete as it was, which is why nothing else in this family would notice. What the second copy buys: the volume is a local-path PV, and deleting the claim, losing the volume or reinstalling under another name takes every package on it. What it does not buy: the destination is another path on the same host, so it shares the host's failure domain -- crossing a path is not crossing a machine. 93600 is the family bound: a daily run scheduled once a day, plus startingDeadlineSeconds, plus runDeadlineSeconds, the longest a run may take.",
+              "_comment_why_absent": "the reading is absent, not zero, when no copy exists: the publisher writes nothing for a package it has never seen outside the volume, so a zero would have to be invented by the reader and would then be indistinguishable from a copy that was written and failed to match."
+            },
+            {
+              "name": "backup_offsite_copy_is_stale",
+              "promql": "max(cogneva_backup_run_readings{readout=\"offsite_newest_age_seconds\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds{readout=\"offsite_newest_age_seconds\"}) < 1800))",
+              "condition": {
+                "greater_than": 93600.0
+              },
+              "severity": "critical",
+              "summary": "The newest package outside the backup volume was written {value} seconds ago, past the 26 hours this family allows, so the second copy has stopped following the volume. This is not backup_no_recent_success's state: the volume can be written every day while the copy is not, and the two failures have nothing in common except the bound. The age is taken from the instant in the file's name rather than its mtime -- a copy rewrites the mtime, so a copy that ran and a copy that was merely re-read would look the same. It comes from the same three operands as every other bound here: a daily run scheduled once a day, plus startingDeadlineSeconds, plus runDeadlineSeconds, the longest a run may take. The freshness conjunction is on the observed timestamp and not on the age, for the reason the other age rules give: a publisher that stopped would otherwise leave a plausible number in place forever.",
+              "_comment_why_not_absent": "absence is backup_offsite_copy_never_written's to report; this rule only answers how old the copy that does exist is, and firing on absence too would report the same fact twice."
+            },
+            {
+              "name": "backup_offsite_copy_is_not_the_latest_package",
+              "promql": "max(cogneva_backup_run_readings{readout=\"offsite_matches_volume\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds{readout=\"offsite_matches_volume\"}) < 1800))",
+              "condition": {
+                "less_than": 1.0
+              },
+              "severity": "warning",
+              "summary": "The second copy is not the package the drill just restored: {value} is the flag, 1 meaning the same name and the same byte count were found outside the backup volume and 0 meaning they were not. Both ways of failing matter and they differ: a different name means the copy stopped at an earlier night, while the same name at a different size means a copy that was interrupted -- the drill never sees a partial file because it is written under a name the walk does not match, so a size that disagrees is a file that was renamed after being written. The package on the volume can still restore perfectly; this rule reports that the second copy no longer equals it, which is the state in which the second copy would not save anyone. It is a warning because the copy exists and is being made; what has stopped being true is that it is the same file.",
+              "_comment_why_not_absent": "an installation with no second copy at all publishes nothing here and is reported by backup_offsite_copy_never_written; firing on absence would make this rule say the same thing a second time, in a message about a file that is not there."
+            },
+            {
               "name": "backup_run_over_its_own_deadline",
               "promql": "(max(cogneva_backup_run_readings{readout=\"oldest_running_age_seconds\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds) < 1800)) > max(cogneva_backup_run_readings{readout=\"oldest_running_deadline_seconds\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds) < 1800)))",
               "condition": {

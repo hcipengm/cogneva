@@ -27,6 +27,7 @@ pub enum Command {
     ExecuteChange,
     Backup,
     Restore,
+    BackupDrill,
     RepairAof,
     EvalTable,
     EvalCaseSubset,
@@ -37,7 +38,7 @@ pub enum Command {
 
 /// Subcommands, in the order they appear in [`USAGE`]. A command added here but
 /// not documented fails the usage test.
-const SUBCOMMANDS: [(&str, Command); 14] = [
+const SUBCOMMANDS: [(&str, Command); 15] = [
     ("security-gateway", Command::SecurityGateway),
     ("sandbox-executor", Command::SandboxExecutor),
     ("volume-walker", Command::VolumeWalker),
@@ -47,6 +48,7 @@ const SUBCOMMANDS: [(&str, Command); 14] = [
     ("execute-change", Command::ExecuteChange),
     ("backup", Command::Backup),
     ("restore", Command::Restore),
+    ("backup-drill", Command::BackupDrill),
     ("repair-aof", Command::RepairAof),
     ("eval-table", Command::EvalTable),
     ("eval-case-subset", Command::EvalCaseSubset),
@@ -80,6 +82,8 @@ COMMANDS:
     execute-change         Apply, verify, commit and build one evolution change, then exit
     backup                 Package the data plane into a backup file
     restore <package>      Restore the data plane from a backup file
+    backup-drill           Restore the newest package into a scratch database, record what it
+                           held, then drop it
     repair-aof <aof-dir>   Drop a torn tail from Redis' AOF files, then exit
     eval-table [OPTIONS]   Run the main comparison table (benchmarks x scaffolds x seeds)
                            against a pinned data root, then exit; --pins names the pins file

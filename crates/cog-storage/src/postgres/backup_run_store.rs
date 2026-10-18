@@ -24,8 +24,8 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 
 use cog_core::{
-    BackupAccountReading, BackupPackageRecord, BackupRunClosing, BackupRunOpening, BackupRunStore,
-    SFError, SFResult,
+    BackupAccountReading, BackupDrillRecord, BackupPackageRecord, BackupRunClosing,
+    BackupRunOpening, BackupRunStore, SFError, SFResult,
 };
 
 /// PostgreSQL backup account store.
@@ -128,6 +128,39 @@ LEFT JOIN LATERAL ( \
 LEFT JOIN LATERAL ( \
     SELECT * FROM snapshot WHERE outcome = 'ok' ORDER BY started_at DESC LIMIT 1 \
 ) AS newest ON TRUE";
+
+/// One drill's answer, written once.
+///
+/// The outcome is derived from the record rather than taken from a caller's
+/// word -- `backup_drills_ok_carries_its_evidence` refuses an `ok` row whose
+/// measurements are missing or disagreeing, and deriving the value here means
+/// the writer cannot ask for one those measurements do not support.
+///
+/// A row for a drill identity that already exists is left alone: two drills of
+/// the same package are two answers taken at two instants, and the second one
+/// nobody can see is the second one that disagrees.
+const RECORD_DRILL_SQL: &str = "\
+INSERT INTO backup_drills ( \
+    drill_id, started_at, finished_at, outcome, package, package_written_at, package_bytes, \
+    packages_on_volume, oldest_package_at, offsite_newest_at, offsite_matches_newest, \
+    tables_restored, tables_expected, \
+    rows_restored, rows_expected, source_runs_matched, error \
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) \
+ON CONFLICT (drill_id) DO NOTHING";
+
+/// The newest drill, failed or not.
+///
+/// Ordered by the instant the drill finished and broken by its identity, so two
+/// drills that finished within the same clock second still resolve to one row
+/// and the same one on every read.
+const READ_LATEST_DRILL_SQL: &str = "\
+SELECT drill_id, started_at, finished_at, outcome, package, package_written_at, package_bytes, \
+       packages_on_volume, oldest_package_at, offsite_newest_at, offsite_matches_newest, \
+       tables_restored, tables_expected, \
+       rows_restored, rows_expected, source_runs_matched, error \
+FROM backup_drills \
+ORDER BY finished_at DESC, drill_id DESC \
+LIMIT 1";
 
 #[async_trait]
 impl BackupRunStore for PostgresBackupRunStore {
@@ -275,5 +308,114 @@ impl BackupRunStore for PostgresBackupRunStore {
             oldest_running_deadline_seconds,
             newest_package,
         })
+    }
+
+    async fn record_drill(&self, drill: &BackupDrillRecord) -> SFResult<()> {
+        if drill.drill_id.trim().is_empty() {
+            return Err(SFError::Validation(
+                "a drill's identity cannot be empty: the row would be unreadable as a name for \
+                 the pass it records"
+                    .into(),
+            ));
+        }
+        // A drill that did not prove the package restorable has to say what it
+        // found instead. The column's check holds the same rule, but reaching it
+        // would report a constraint name where the caller can be told which
+        // field is missing.
+        if !drill.ok() && drill.error.as_deref().is_none_or(|e| e.trim().is_empty()) {
+            return Err(SFError::Validation(format!(
+                "drill {} did not prove its package restorable and carries no error text, so the \
+                 row would record a failure without a reason",
+                drill.drill_id
+            )));
+        }
+        let outcome = if drill.ok() { "ok" } else { "failed" };
+        sqlx::query(RECORD_DRILL_SQL)
+            .bind(&drill.drill_id)
+            .bind(drill.started_at)
+            .bind(drill.finished_at)
+            .bind(outcome)
+            .bind(drill.package.as_deref())
+            .bind(drill.package_written_at)
+            .bind(drill.package_bytes)
+            .bind(drill.packages_on_volume)
+            .bind(drill.oldest_package_at)
+            .bind(drill.offsite_newest_at)
+            .bind(drill.offsite_matches_newest)
+            .bind(drill.tables_restored)
+            .bind(drill.tables_expected)
+            .bind(drill.rows_restored)
+            .bind(drill.rows_expected)
+            .bind(drill.source_runs_matched)
+            .bind(drill.error.as_deref())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                SFError::Database(format!("record backup drill {}: {e}", drill.drill_id))
+            })?;
+        Ok(())
+    }
+
+    async fn read_latest_drill(&self) -> SFResult<Option<BackupDrillRecord>> {
+        let row = sqlx::query(READ_LATEST_DRILL_SQL)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("read the newest backup drill: {e}")))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let drill_id: String = row
+            .try_get("drill_id")
+            .map_err(|e| SFError::Database(format!("drill_id: {e}")))?;
+        let started_at: DateTime<Utc> = row
+            .try_get("started_at")
+            .map_err(|e| SFError::Database(format!("drill started_at: {e}")))?;
+        let finished_at: DateTime<Utc> = row
+            .try_get("finished_at")
+            .map_err(|e| SFError::Database(format!("drill finished_at: {e}")))?;
+        Ok(Some(BackupDrillRecord {
+            drill_id,
+            started_at,
+            finished_at,
+            package: row
+                .try_get("package")
+                .map_err(|e| SFError::Database(format!("drill package: {e}")))?,
+            package_written_at: row
+                .try_get("package_written_at")
+                .map_err(|e| SFError::Database(format!("drill package_written_at: {e}")))?,
+            package_bytes: row
+                .try_get("package_bytes")
+                .map_err(|e| SFError::Database(format!("drill package_bytes: {e}")))?,
+            packages_on_volume: row
+                .try_get("packages_on_volume")
+                .map_err(|e| SFError::Database(format!("drill packages_on_volume: {e}")))?,
+            oldest_package_at: row
+                .try_get("oldest_package_at")
+                .map_err(|e| SFError::Database(format!("drill oldest_package_at: {e}")))?,
+            offsite_newest_at: row
+                .try_get("offsite_newest_at")
+                .map_err(|e| SFError::Database(format!("drill offsite_newest_at: {e}")))?,
+            offsite_matches_newest: row
+                .try_get("offsite_matches_newest")
+                .map_err(|e| SFError::Database(format!("drill offsite_matches_newest: {e}")))?,
+            tables_restored: row
+                .try_get("tables_restored")
+                .map_err(|e| SFError::Database(format!("drill tables_restored: {e}")))?,
+            tables_expected: row
+                .try_get("tables_expected")
+                .map_err(|e| SFError::Database(format!("drill tables_expected: {e}")))?,
+            rows_restored: row
+                .try_get("rows_restored")
+                .map_err(|e| SFError::Database(format!("drill rows_restored: {e}")))?,
+            rows_expected: row
+                .try_get("rows_expected")
+                .map_err(|e| SFError::Database(format!("drill rows_expected: {e}")))?,
+            source_runs_matched: row
+                .try_get("source_runs_matched")
+                .map_err(|e| SFError::Database(format!("drill source_runs_matched: {e}")))?,
+            error: row
+                .try_get("error")
+                .map_err(|e| SFError::Database(format!("drill error: {e}")))?,
+        }))
     }
 }
