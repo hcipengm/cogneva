@@ -267,16 +267,18 @@ impl PodRuntime {
     }
 }
 
-/// 这个前缀能不能真跟集群说上话。
+/// 这个前缀能不能真把这一列的题跑起来。
 ///
-/// 判据是「读得出一个像名字的东西」，不是「二进制在不在」——`kubectl version --client`
-/// 在没有 kubeconfig 的机器上一样成功，那台机器却起不了任何 Pod。所以这里只认一次
-/// `get namespace <n> -o name` 能退 0 且印出 `namespace/<n>`：字段名写错时 `--format`
-/// 不报错、退出码还是 0（这条形状在本仓已经栽过一次），所以**判输出形状不判退出码**。
+/// 探的必须是**它接下来要做的那个动作的权限**。旧版本跑 `get namespace <n> -o name`：
+/// 读的是命名空间这个资源，而这一列真正要做的是 `apply` 建 Pod、`exec` 进去。
+/// RBAC 里 `get namespaces` 与 `create pods` 是两条独立授权，一个只读身份（观测、审计、
+/// 任何 `view` ClusterRole）能过旧探针，然后在第一道题上拿 403——480 例于是从「这一列没有
+/// 后端」变成「480 例跑错了」，而报表里这两格是要分开的。
+/// `auth can-i create pods` 问的就是建 Pod 这个动作，答案只有 `yes`/`no`，不需要解析正文。
 async fn probe(prefix: &[String], namespace: &str) -> bool {
     let mut cmd = tokio::process::Command::new(&prefix[0]);
     cmd.args(&prefix[1..])
-        .args(["-n", namespace, "get", "namespace", namespace, "-o", "name"])
+        .args(["-n", namespace, "auth", "can-i", "create", "pods"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -284,11 +286,13 @@ async fn probe(prefix: &[String], namespace: &str) -> bool {
         return false;
     };
     match tokio::time::timeout(Duration::from_secs(20), child.wait_with_output()).await {
+        // 有的版本对 `no` 也退 0，所以判输出而不只判退出码；反过来 `yes` 却退非 0
+        // 只可能是包装脚本出错，那时也不能算「能建」。
         Ok(Ok(out)) => {
             out.status.success()
                 && String::from_utf8_lossy(&out.stdout)
                     .trim()
-                    .starts_with("namespace/")
+                    .eq_ignore_ascii_case("yes")
         }
         _ => false,
     }
@@ -1149,5 +1153,44 @@ mod tests {
         let report = report_from(&out);
         assert_ne!(report.exit_code, 0);
         assert!(report.raw.contains("killed"));
+    }
+
+    /// 能读命名空间**不等于**能建 Pod。假 kubectl 对前者答得像模像样、对后者答 `no`，
+    /// 探针必须说「不能」——它接下来要做的恰恰是建 Pod。旧探针在这里会返回真，
+    /// 于是这一列不进缺席声明，480 例逐格撞 403，报表把它们记成「跑错了」。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_namespace_read_does_not_stand_in_for_permission_to_create_pods() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let write = |name: &str, answer: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\n\
+                     case \"$*\" in\n\
+                     *\"auth can-i create pods\"*) echo {answer}; exit 0;;\n\
+                     *\"get namespace\"*) echo namespace/probe; exit 0;;\n\
+                     esac\n\
+                     exit 1\n"
+                ),
+            )
+            .expect("write fake kubectl");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake kubectl");
+            vec![path.to_string_lossy().into_owned()]
+        };
+
+        let refused = write("kubectl-no", "no");
+        assert!(
+            !probe(&refused, "cogneva").await,
+            "读得到命名空间不等于建得出 Pod"
+        );
+
+        // 对照：同一个假二进制答 `yes` 时探针必须过，否则上面那句只是「探针永远说不」。
+        let granted = write("kubectl-yes", "yes");
+        assert!(probe(&granted, "cogneva").await);
     }
 }
