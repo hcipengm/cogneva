@@ -223,6 +223,41 @@ fn validate_table_name(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Columns the package's own header names, in the order the rows carry them.
+///
+/// `COPY ... FROM STDIN WITH (HEADER true)` skips the header row and then maps
+/// the remaining values **by position**, not by name. A package written before
+/// a column was added therefore fails against today's schema with
+/// `missing data for column "..."` -- which rejects every package older than
+/// the newest column, the ordinary case for a restore. Naming the columns the
+/// package carries inserts exactly what it has and lets the newer columns take
+/// their defaults.
+fn csv_columns(header: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let columns: Vec<String> = header
+        .trim_end_matches(['\r', '\n'])
+        .split(',')
+        .map(|column| column.trim_matches('"').to_string())
+        .collect();
+    for column in &columns {
+        if column.is_empty()
+            || !column
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        {
+            return Err(format!("unsafe column name in package: {column:?}").into());
+        }
+    }
+    Ok(columns)
+}
+
+fn copy_from_statement(table: &str, columns: &[String]) -> String {
+    let list: Vec<String> = columns.iter().map(|c| format!("\"{c}\"")).collect();
+    format!(
+        "COPY \"{table}\" ({}) FROM STDIN WITH (FORMAT csv, HEADER true)",
+        list.join(", ")
+    )
+}
+
 /// 运行时发现表清单：新表随迁移自动进备份，不维护手工列表。
 pub async fn discover_tables(pool: &PgPool) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let tables: Vec<String> = sqlx::query_scalar(DISCOVER_TABLES_SQL)
@@ -330,11 +365,16 @@ pub async fn restore_postgres(
         for table in &tables {
             // 分块流式灌入：整表读进内存会在大表上把容器打 OOM
             // （metrics 类表 CSV 可达数百 MB 并随时间增长）。
-            let mut file = std::fs::File::open(pkg_pg_dir.join(format!("public.{table}.csv")))?;
+            let path = pkg_pg_dir.join(format!("public.{table}.csv"));
+            let columns = csv_columns(&{
+                use std::io::BufRead;
+                let mut header = String::new();
+                std::io::BufReader::new(std::fs::File::open(&path)?).read_line(&mut header)?;
+                header
+            })?;
+            let mut file = std::fs::File::open(&path)?;
             let mut copy_in = tx
-                .copy_in_raw(&format!(
-                    "COPY \"{table}\" FROM STDIN WITH (FORMAT csv, HEADER true)"
-                ))
+                .copy_in_raw(&copy_from_statement(table, &columns))
                 .await?;
             use std::io::Read;
             let mut buf = vec![0u8; 1024 * 1024];
@@ -1658,6 +1698,31 @@ mod tests {
         let b = package_name(Utc.with_ymd_and_hms(2026, 9, 14, 2, 0, 0).unwrap());
         assert!(a < b, "时间戳命名必须字典序可排：{a} vs {b}");
         assert!(a.starts_with(PACKAGE_PREFIX) && a.ends_with(PACKAGE_SUFFIX));
+    }
+
+    #[test]
+    fn the_restore_names_the_columns_the_package_carries() {
+        // A package written before a column was added must still load: the
+        // statement has to name the columns the CSV holds instead of letting
+        // the driver map them by position against today's wider table.
+        let columns = csv_columns("id,name,created_at\r\n").unwrap();
+        assert_eq!(columns, vec!["id", "name", "created_at"]);
+
+        let statement = copy_from_statement("cog_events", &columns);
+        assert!(
+            statement.contains("(\"id\", \"name\", \"created_at\")"),
+            "the column list is what keeps an older package loadable: {statement}"
+        );
+
+        // The header comes out of the package, so it is untrusted input to a
+        // statement: anything that is not a plain identifier is refused rather
+        // than quoted and handed to the server.
+        for header in ["id; DROP TABLE users", "id,na\"me", "id,,name", ""] {
+            assert!(
+                csv_columns(header).is_err(),
+                "header {header:?} should not become a column list"
+            );
+        }
     }
 
     #[test]
