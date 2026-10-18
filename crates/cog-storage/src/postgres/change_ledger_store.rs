@@ -366,8 +366,8 @@ INSERT INTO change_dispatch_state (
     decision, pool_reading, pending, submitted, already, failed,
     dead_environment, held_back, rearmed, unmeasurable,
     resume_at_unix, evidenced_recovery_unix, quota_window_secs, sources_unread,
-    window_allowance_tokens, window_spent_tokens, window_reserve_tokens
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)";
+    window_allowance_tokens, window_spent_tokens, window_reserve_tokens, window_start_unix
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)";
 
 /// Refuse a reading whose identity or document does not fit its column.
 ///
@@ -887,6 +887,16 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
             .bind(state.window_pace.map(|pace| pace.allowance_tokens as i64))
             .bind(state.window_pace.map(|pace| pace.spent_tokens as i64))
             .bind(state.window_pace.map(|pace| pace.reserve_tokens as i64))
+            // The ramp's anchor, so the batch can be read against how long the
+            // allowance had been accruing when it was sized. A pace that states
+            // no window start keeps it NULL rather than writing epoch zero,
+            // which would read as a window that began in 1970.
+            .bind(
+                state
+                    .window_pace
+                    .map(|pace| pace.window_start_unix)
+                    .filter(|start| *start > 0),
+            )
             .execute(&self.pool)
             .await
             .map_err(|e| SFError::Database(format!("record dispatch state: {e}")))?;

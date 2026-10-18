@@ -1303,8 +1303,15 @@ impl MemoryObservabilityGateway {
     }
 
     /// Publish an event to all active subscribers.
+    ///
+    /// Forwards to the trait arm so this backend has one implementation, not
+    /// two. The two used to be identical, and an identical pair is still a
+    /// pair: the persistent backend's copies drifted (one wrote the row, the
+    /// other did not) and callers through `dyn` silently took the arm that did
+    /// not. Nothing here can drift while there is only one method that does the
+    /// work.
     pub fn publish_event(&self, event: AgentEvent) {
-        let _ = self.event_tx.send(event);
+        <Self as ObservabilityGateway>::publish_event(self, event);
     }
 
     /// Record a log entry for the given task.

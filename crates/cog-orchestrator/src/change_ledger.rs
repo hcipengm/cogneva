@@ -2865,9 +2865,11 @@ struct PoolVerdict {
 /// other direction: a window whose remaining allowance fits fewer than the ceiling
 /// lowers the batch to what the window can actually pay for. Handing over more
 /// than that is not extra throughput, it is a batch the same window refuses
-/// request by request -- measured on 2026-10-18: eleven minutes after the pool
-/// opened, 282 of one batch of 635 submissions came back 429 on a window whose
-/// allowance had been spread to zero.
+/// request by request: a weekly window is spent in about twenty-six hours of
+/// dispatch, and after it resets the allowance comes back along a time ramp, so
+/// a batch sized to the ceiling meets a window that can pay for a fraction of
+/// it. The refusal is not caused by the batch -- a smaller batch meets the same
+/// wall -- but the batch is what turns one refusal into one per row.
 ///
 /// `reserve_tokens` is one whole job, measured from finished jobs, and it is the
 /// right divisor rather than an average call: the pace's own `blocked` rule

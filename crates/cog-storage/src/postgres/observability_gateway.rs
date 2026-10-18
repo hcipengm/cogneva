@@ -161,23 +161,6 @@ impl PostgresObservabilityGateway {
         Ok(())
     }
 
-    /// Publish an event to all active subscribers and persist it to PostgreSQL.
-    /// This is a synchronous method (matching the surface of
-    /// [`crate::mem::MemoryObservabilityGateway::publish_event`]) so that it
-    /// can be used as a drop-in replacement in the event-gateway-sink path.
-    /// The PG write
-    /// is performed in a spawned task so the caller never blocks.
-    pub fn publish_event(&self, event: AgentEvent) {
-        let _ = self.event_tx.send(event.clone());
-
-        let pool = self.pool.clone();
-        tokio::spawn(async move {
-            if let Err(e) = Self::persist_event(&pool, &event).await {
-                tracing::warn!("Failed to persist observability event: {}", e);
-            }
-        });
-    }
-
     /// Record a structured log entry for the given task.
     pub async fn record_log(&self, task_id: &str, entry: LogEntry) -> SFResult<()> {
         sqlx::query(
@@ -635,8 +618,48 @@ impl ObservabilityGateway for PostgresObservabilityGateway {
         }
     }
 
+    /// Publish to the in-process subscribers **and** persist the event, in one
+    /// method.
+    ///
+    /// It used to be two: an inherent `publish_event` that did both and this
+    /// trait arm that only sent to the broadcast. Production reaches the
+    /// gateway as `Arc<dyn ObservabilityGateway>`, so it took the arm that does
+    /// not write, and `cog_observability_events` stayed empty while nothing
+    /// failed -- the send succeeded, no warning fired, and the table read as
+    /// "no events happened". The two implementations had the same name, so
+    /// every call site looked like it persisted.
+    ///
+    /// The write is spawned so the caller never blocks on PostgreSQL: this sits
+    /// on the event-gateway-sink path, and a subscriber that blocks there slows
+    /// the broadcast it is reading from.
+    ///
+    /// A failed write is counted, not only logged. The log line dies with the
+    /// pod, and the reading that matters afterwards -- "the events were
+    /// delivered and the table still did not grow" -- has to survive that, or
+    /// the next reader repeats the search that found this bug. The count is
+    /// what turns the consumer's `handoff_total{stage="attempted"}` into "how
+    /// many reached the table": it is one per failed event, while the handoff
+    /// is one per pass, so it gets its own name rather than a label on a
+    /// counter with a different unit.
     fn publish_event(&self, event: AgentEvent) {
-        let _ = self.event_tx.send(event);
+        let _ = self.event_tx.send(event.clone());
+
+        let pool = self.pool.clone();
+        let metrics = self.metrics.clone();
+        tokio::spawn(async move {
+            if let Err(e) = Self::persist_event(&pool, &event).await {
+                tracing::warn!("Failed to persist observability event: {}", e);
+                if let Some(metrics) = metrics {
+                    let _ = metrics
+                        .record_counter(
+                            cog_core::metric_names::OBSERVABILITY_EVENT_PERSIST_FAILED_TOTAL,
+                            1.0,
+                            std::collections::HashMap::new(),
+                        )
+                        .await;
+                }
+            }
+        });
     }
 }
 
