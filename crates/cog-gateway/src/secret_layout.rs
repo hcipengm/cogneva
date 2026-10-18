@@ -189,6 +189,10 @@ async fn patch_groups(
 
 #[cfg(test)]
 mod tests {
+    //! principle: feedback_a_boundary_verdict_across_profiles_must_be_taken_per_profile_not_by_union
+    //!
+    //! 门挂在 an_oob_mount_illegal_in_one_profile_is_caught_per_profile_not_by_union 的
+    //! 测试头上；这里留模块级同款声明，让只认 `//! principle:` 的读法不必进函数体。
     use super::*;
 
     #[test]
@@ -229,5 +233,90 @@ mod tests {
     fn an_undeclared_key_is_an_error_not_a_default() {
         let err = group_fields_by_object(&serde_json::json!({"who-knows": "v"})).unwrap_err();
         assert!(err.contains("who-knows"), "报错要带上键名: {err}");
+    }
+
+    /// principle: feedback_a_boundary_verdict_across_profiles_must_be_taken_per_profile_not_by_union
+    ///
+    /// 规则原文：同一份拓扑有三种部署形态时，把各形态的持有者/读者取并集再判，
+    /// 会把「只在一种形态里存在」的越界静默抹平。两片 Secret 的分界是读者面：带外片
+    /// 只该被该形态的安全网关侧持有。同一组负载在不同形态里的角色可以不同——HA 形态
+    /// 里 worker-b 本是网关侧副本，边缘形态里它被部署成业务 Pod 却仍挂着带外片，于是
+    /// 能读到 github-token 这类只属于带外片的键。按形态判（该形态的带外片持有者必须
+    /// 是该形态的网关侧），只有边缘形态点名 worker-b；取并集再判时，它凭自己在 HA 形态
+    /// 的合法身份被并集网关集收容，越界被抹平。若有人把逐形态判定换成跨形态并集，这条
+    /// 必须红。
+    #[test]
+    fn an_oob_mount_illegal_in_one_profile_is_caught_per_profile_not_by_union() {
+        /// 一种部署形态：该形态里哪些负载是安全网关侧，哪些负载挂到了带外片。
+        struct Profile {
+            name: &'static str,
+            gateway: &'static [&'static str],
+            oob_mounters: &'static [&'static str],
+        }
+
+        impl Profile {
+            /// 按形态判：挂着带外片却不是该形态网关侧的负载，即越界持有者。
+            fn trespassers(&self) -> Vec<&'static str> {
+                self.oob_mounters
+                    .iter()
+                    .copied()
+                    .filter(|holder| !self.gateway.contains(holder))
+                    .collect()
+            }
+        }
+
+        // 同一份拓扑的三种形态：单体形态一个负载兼任网关；HA 形态里 worker-b 本是
+        // 网关侧副本；边缘形态里它是业务 Pod 却仍挂带外片——只存在于边缘形态的越界。
+        let profiles = [
+            Profile {
+                name: "standalone",
+                gateway: &["allinone"],
+                oob_mounters: &["allinone"],
+            },
+            Profile {
+                name: "ha",
+                gateway: &["security-gateway", "worker-b"],
+                oob_mounters: &["security-gateway", "worker-b"],
+            },
+            Profile {
+                name: "edge",
+                gateway: &["edge-gateway"],
+                oob_mounters: &["edge-gateway", "worker-b"],
+            },
+        ];
+
+        // 越界者经带外片读到的键，确实是只该网关读的带外键；分界以本模块键位表为真源。
+        assert_eq!(
+            secret_object_for_key("contribution-config"),
+            Some(SECRET_NAME_INTERNAL)
+        );
+        assert_eq!(secret_object_for_key("github-token"), Some(SECRET_NAME_OOB));
+
+        // 按形态判：只有 edge 形态点名 worker-b，另两个形态干净。
+        let mut flagged: Vec<(&str, &str)> = Vec::new();
+        for profile in &profiles {
+            for holder in profile.trespassers() {
+                flagged.push((profile.name, holder));
+            }
+        }
+        assert_eq!(flagged, vec![("edge", "worker-b")]);
+
+        // 取并集再判：worker-b 凭它在 HA 形态的网关身份被并集网关集收容，越界被抹平，
+        // 所以并集判法在这份构造下必然误报干净——这正说明它不能充当这条边界的判据。
+        let gateway_union: Vec<&str> = profiles
+            .iter()
+            .flat_map(|p| p.gateway.iter().copied())
+            .collect();
+        let mounters_union: Vec<&str> = profiles
+            .iter()
+            .flat_map(|p| p.oob_mounters.iter().copied())
+            .collect();
+        let union_says_clean = mounters_union
+            .iter()
+            .all(|holder| gateway_union.contains(holder));
+        assert!(
+            union_says_clean,
+            "并集判法此时必然报干净；若它反而报越界，本测试关于其为何不可作判据的前提就错了"
+        );
     }
 }
