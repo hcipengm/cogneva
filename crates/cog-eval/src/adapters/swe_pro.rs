@@ -442,6 +442,11 @@ impl SweProJudge {
 ///
 /// `fail_to_pass` 为空是**这一行没得判**（判不了），不是失败——报错交回运行器记 `errored`。
 /// `pass_to_pass` 为空是合法的（公开集里有这种行），那时只要求 `fail_to_pass` 全过。
+///
+/// 覆盖判据有两个方向。「缺」（清单里有、passed 里没有）是失败；「多」（passed 里两份清单
+/// 都没声明的名字，比如后端从测试输出里误解析出的一个名字）**不改变判词**——基准的规则就
+/// 是 fail_to_pass / pass_to_pass 覆盖——但它必须落进 `extra_passed` 这个读数：补集也要有
+/// 读者，否则一个没人声明的测试名会被悄悄并进通过数。
 fn grade(
     fail_to_pass: &[String],
     pass_to_pass: &[String],
@@ -459,6 +464,17 @@ fn grade(
         .iter()
         .filter(|t| !passed.contains(t.as_str()))
         .map(String::as_str)
+        .collect();
+    // 「多」的那一向：passed 里落在 fail_to_pass ∪ pass_to_pass 之外的名字。
+    let declared: BTreeSet<&str> = fail_to_pass
+        .iter()
+        .chain(pass_to_pass.iter())
+        .map(String::as_str)
+        .collect();
+    let extra: Vec<&str> = passed
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !declared.contains(name))
         .collect();
 
     let f2p_passed = fail_to_pass.len() - missing.len();
@@ -491,6 +507,14 @@ fn grade(
     verdict
         .readings
         .insert("pass_to_pass_passed".into(), p2p_passed.to_string());
+    verdict
+        .readings
+        .insert("extra_passed".into(), extra.len().to_string());
+    if !extra.is_empty() {
+        verdict
+            .readings
+            .insert("extra_passed_names".into(), sample(&extra));
+    }
     Ok(verdict)
 }
 
@@ -831,6 +855,39 @@ mod tests {
             .await
             .unwrap();
         assert!(v.resolved, "{}", v.detail);
+    }
+
+    /// principle: feedback_a_coverage_assertion_only_reads_one_direction
+    ///
+    /// 覆盖式判据（断言 passed ⊇ fail_to_pass、passed ⊇ pass_to_pass）只给「缺」立了读者；
+    /// 「多」——passed 里两份清单都没声明的名字——落在补集里没人读。这里给补集立一个读者
+    /// `extra_passed`：多出来的名字不改变判词（基准的规则就是覆盖），但必须能被读到，而不
+    /// 是被悄悄并进通过数。
+    #[tokio::test]
+    async fn coverage_reads_the_extra_direction_as_well_as_the_missing_one() {
+        let env: Arc<dyn CaseEnv> = Arc::new(NoEnv);
+
+        // 「缺」的一向（既有行为）：fail_to_pass 有一条没过 ⇒ 失败，判词点名那条。
+        let judge = SweProJudge::new(Some(backend(vec!["t1", "p1"])));
+        let v = judge
+            .judge(&case("c1", "['t1', 't2']", "['p1']"), &env, &output())
+            .await
+            .unwrap();
+        assert!(!v.resolved);
+        assert!(v.detail.contains("t2"), "{}", v.detail);
+        assert_eq!(v.readings["extra_passed"], "0");
+        assert!(!v.readings.contains_key("extra_passed_names"));
+
+        // 「多」的一向：passed 里有一个两份清单都没声明的名字（后端误解析出来的）⇒
+        // 判词不变（仍然通过），但这个名字落进 `extra_passed` 读数，而不是被吞掉。
+        let judge = SweProJudge::new(Some(backend(vec!["t1", "t2", "p1", "t3_misparsed"])));
+        let v = judge
+            .judge(&case("c2", "['t1', 't2']", "['p1']"), &env, &output())
+            .await
+            .unwrap();
+        assert!(v.resolved, "{}", v.detail);
+        assert_eq!(v.readings["extra_passed"], "1");
+        assert_eq!(v.readings["extra_passed_names"], "t3_misparsed");
     }
 
     #[tokio::test]
