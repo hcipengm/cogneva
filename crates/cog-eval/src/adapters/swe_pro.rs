@@ -890,6 +890,99 @@ mod tests {
         assert_eq!(v.readings["extra_passed_names"], "t3_misparsed");
     }
 
+    /// principle: feedback_a_test_double_must_name_its_keys_by_the_real_backends_rule
+    ///
+    /// `ScriptedBackend` 是 `SweProBackend` 的测试替身：它回报的 `passed` 就是真实容器后端
+    /// 要回报的那套测试名。替身若在「键/命名规则」这种契约级细节上和真实实现分叉（换分隔
+    /// 符、换成 node-id 形态、自行归一化空格），它证不了判分器的任何结论——只会把真行为判
+    /// 红、把真缺陷遮绿。所以替身的键必须与真实清单出自**同一个命名来源**：替身回报的名
+    /// 字与喂给判分器的 fail_to_pass / pass_to_pass 清单取自同一组常量，并由 parse_test_list
+    /// 钉死二者逐字符相等；任何一侧手改一套名字，都会把本测试判红。
+    #[tokio::test]
+    async fn the_backend_double_names_passed_by_the_real_naming_rule() {
+        // 唯一命名来源：真实数据行 fail_to_pass / pass_to_pass 用的「路径 | 用例名」。
+        const REAL_F2P: &[&str] = &[
+            "test/feed.js | posts to a feed",
+            "test/feed.js | reads it back",
+        ];
+        const REAL_P2P: &[&str] = &["test/feed.js | page still renders"];
+        let python_list = |names: &[&str]| {
+            names
+                .iter()
+                .map(|n| format!("'{n}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let f2p_raw = format!("[{}]", python_list(REAL_F2P));
+        let p2p_raw = format!("[{}]", python_list(REAL_P2P));
+        // 替身要回报的键与清单解析结果逐字符相同：测试不得另造一套名字。
+        assert_eq!(parse_test_list(&f2p_raw).unwrap(), REAL_F2P.to_vec());
+        assert_eq!(parse_test_list(&p2p_raw).unwrap(), REAL_P2P.to_vec());
+
+        let env: Arc<dyn CaseEnv> = Arc::new(NoEnv);
+
+        // 对照组：替身严格按真实命名规则回报全过 ⇒ 通过；闸门不是「永远不让过」。
+        let passed: Vec<&'static str> = REAL_F2P.iter().chain(REAL_P2P.iter()).copied().collect();
+        let judge = SweProJudge::new(Some(backend(passed)));
+        let v = judge
+            .judge(&case("c0", &f2p_raw, &p2p_raw), &env, &output())
+            .await
+            .unwrap();
+        assert!(v.resolved, "{}", v.detail);
+
+        // 方向一（真行为判红）：测试其实全过，但替身按分叉的命名规则回报——分隔符换成
+        // node-id 式的 `::`、空格再自行归一化成下划线。清单里的名字必须一个都匹配不上：
+        // 三条真通过全部落进 missing/broken，分叉键全部落进 extra，而不是被模糊匹配吞掉。
+        let judge = SweProJudge::new(Some(backend(vec![
+            "test/feed.js::posts_to_a_feed",
+            "test/feed.js::reads_it_back",
+            "test/feed.js::page_still_renders",
+        ])));
+        let v = judge
+            .judge(&case("c1", &f2p_raw, &p2p_raw), &env, &output())
+            .await
+            .unwrap();
+        assert!(!v.resolved, "{}", v.detail);
+        assert_eq!(v.readings["fail_to_pass_passed"], "0");
+        assert_eq!(v.readings["pass_to_pass_passed"], "0");
+        assert_eq!(v.readings["extra_passed"], "3");
+        assert!(
+            v.readings["extra_passed_names"].contains("::"),
+            "分叉键必须被点名，而不是被吞进通过数: {}",
+            v.readings["extra_passed_names"]
+        );
+        for name in REAL_F2P {
+            assert!(
+                v.detail.contains(*name),
+                "真通过的用例必须被点名为缺失: {name}"
+            );
+        }
+
+        // 方向二（真缺陷遮绿）：第一条真通过、按真名回报；第二条没过，替身却把它改名/归一
+        // 化成另一种形态回报。未真正通过的条目不得因此变绿：第二条仍是 missing，分叉键落入
+        // extra，一个键不能顶替清单里的另一个名字。
+        let judge = SweProJudge::new(Some(backend(vec![
+            "test/feed.js | posts to a feed",
+            "test/feed.js::reads_it_back",
+        ])));
+        let v = judge
+            .judge(&case("c2", &f2p_raw, &p2p_raw), &env, &output())
+            .await
+            .unwrap();
+        assert!(!v.resolved, "{}", v.detail);
+        assert_eq!(v.readings["fail_to_pass_passed"], "1");
+        assert_eq!(v.readings["extra_passed"], "1");
+        assert_eq!(
+            v.readings["extra_passed_names"],
+            "test/feed.js::reads_it_back"
+        );
+        assert!(
+            v.detail.contains("test/feed.js | reads it back"),
+            "没真正通过的条目必须仍被点名为缺失: {}",
+            v.detail
+        );
+    }
+
     #[tokio::test]
     async fn a_case_that_cannot_be_judged_errors_rather_than_failing() {
         let env: Arc<dyn CaseEnv> = Arc::new(NoEnv);
