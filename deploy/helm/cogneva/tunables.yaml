@@ -88,6 +88,36 @@ rows:
       dataset on disk, which is why the declaration is not the dataset size. A
       derived value would read the rewritten file size; nothing does.
 
+  - key: backends.redis.resources.requests.cpu
+    source: override
+    why: >-
+      The store's steady draw is well under a core; the request exists so the
+      scheduler places it, not to express measured load. Nothing reads a measured
+      figure back into it.
+
+  - key: backends.redis.resources.requests.memory
+    source: override
+    why: >-
+      Small enough that a tight node still schedules the store; the working set
+      is carried by the limit. A request at working-set size would be a permanent
+      claim for a figure that only exists after the RDB is loaded.
+
+  - key: backends.redis.resources.limits.cpu
+    source: override
+    why: >-
+      A burst bound for startup loading and AOF rewrites; the steady rate sits far
+      below it and no measurement of the burst is fed back into the limit.
+
+  - key: backends.redis.resources.limits.memory
+    source: override
+    why: >-
+      The dataset loads 485.56 MB from RDB before the store accepts a connection,
+      and 512Mi left about 27MB for AOF increments and write buffers, so the
+      container was killed roughly twenty seconds after every start. The live
+      patch raised it to 2Gi and the service has held with zero restarts since;
+      the chart follows that value. A derived limit would read the loaded dataset
+      size, and nothing does today.
+
   - key: backends.seaweedfs.storage
     source: override
     why: >-
