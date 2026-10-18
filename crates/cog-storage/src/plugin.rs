@@ -103,6 +103,11 @@ impl cog_core::SystemPlugin for StoragePlugin {
         };
 
         // ── PostgreSQL pools ──
+        // The ceiling and the source that bound it, kept past the pool block so
+        // the metrics backend can publish them once it exists. The value is
+        // what the next reader needs: obeying the budget and not saying which
+        // ceiling was in force leaves the fix's effect unreadable.
+        let mut pg_pool_ceiling: Option<(u32, &'static str)> = None;
         let (users_pool, messages_pool, config_pool, explain_pool) = if let Some(url) = db_url {
             let migrator = crate::migrate::Migrator::new(crate::migrate::migrations_dir(&app_dir));
             match migrator.run(&url).await {
@@ -148,6 +153,12 @@ impl cog_core::SystemPlugin for StoragePlugin {
                         POSTGRES_POOL_COUNT,
                     );
                     let effective = pg_max_connections.min(derived);
+                    let source = if effective == derived {
+                        "server"
+                    } else {
+                        "configured"
+                    };
+                    pg_pool_ceiling = Some((effective, source));
                     info!(
                         "PostgreSQL connection budget: server max={} reserved={} sharing processes={} pools={} => {} per pool (configured ceiling {})",
                         server_max,
@@ -164,6 +175,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
                         "PostgreSQL server connection ceiling unreadable; keeping the configured ceiling of {} per pool",
                         pg_max_connections
                     );
+                    pg_pool_ceiling = Some((pg_max_connections, "configured"));
                     pg_max_connections
                 }
             };
@@ -333,6 +345,29 @@ impl cog_core::SystemPlugin for StoragePlugin {
         };
         ctx.publish_service(metrics_backend.clone());
         info!("StoragePlugin metrics backend published");
+
+        // Publish the ceiling each pool was actually given, once per pool.
+        // The startup log line says the same thing to whoever is watching the
+        // process start; this says it to whoever reads the store later, and
+        // `source` keeps a lowered ceiling from being read as the server's
+        // answer when the server was never asked.
+        if let Some((ceiling, source)) = pg_pool_ceiling {
+            for pool in ["users", "messages", "config", "explain"] {
+                let mut labels = std::collections::HashMap::new();
+                labels.insert("pool".to_string(), pool.to_string());
+                labels.insert("source".to_string(), source.to_string());
+                if let Err(e) = metrics_backend
+                    .record_gauge(
+                        cog_core::metric_names::PG_POOL_MAX_CONNECTIONS,
+                        f64::from(ceiling),
+                        labels,
+                    )
+                    .await
+                {
+                    warn!("cannot record the PostgreSQL pool ceiling: {}", e);
+                }
+            }
+        }
 
         // ── CheckpointStore (must happen before explain_pool is moved into ExplainPool) ──
         let snapshot_store: Arc<dyn cog_core::CheckpointStore> = {

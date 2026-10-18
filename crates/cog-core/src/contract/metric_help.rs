@@ -1040,6 +1040,30 @@ const HISTOGRAM_HELP: &[(&str, &str)] = &[
 /// Descriptions for the gauge series. See [`COUNTER_HELP`].
 const GAUGE_HELP: &[(&str, &str)] = &[
     (
+        crate::metric_names::PG_POOL_MAX_CONNECTIONS.as_str(),
+        "The ceiling one PostgreSQL pool may hold, labelled by `pool` \
+         (users, messages, config, explain) and by `source`. The plugin opens \
+         four pools against the same database; each used to take the \
+         configured ceiling, so one process offered four times it and every \
+         process sharing the server multiplied that again. When the sum \
+         exceeds what the server accepts, the pools try to open connections it \
+         refuses, every writer waits out its acquire timeout, and the failure \
+         reads as `pool timed out while waiting for an open connection` while \
+         `pg_stat_activity` still shows idle connections -- they belong to the \
+         sibling pools, and a pool cannot borrow from its siblings. The ceiling \
+         is therefore derived from the server's `max_connections` minus its \
+         superuser reserve, divided by the processes expected to share it and \
+         by the number of pools, and the configured value is only an upper \
+         bound. `source=\"server\"` means the derived quotient binds; \
+         `source=\"configured\"` means the configured value is lower, or the \
+         server could not be read and the configured value stands -- read it as \
+         unmeasured, not as the server's answer. The gauge is written once per \
+         pool at startup, so a series that changes value between restarts says \
+         the binding source changed; four series are expected, and a missing \
+         one means that pool was never created rather than that its ceiling is \
+         zero",
+    ),
+    (
         "cogneva_ready_admission_readings",
         "The arithmetic behind one ready-publish pass's admission, by stream \
          and kind: bounded (1 when the window's allowance bounded the pass, 0 \

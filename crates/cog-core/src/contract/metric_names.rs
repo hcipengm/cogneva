@@ -1238,6 +1238,23 @@ metric_names! {
     // separate.
     OBSERVABILITY_EVENT_PERSIST_FAILED_TOTAL => "cogneva_observability_event_persist_failed_total",
 
+    // How many connections each PostgreSQL pool may hold, by `pool`
+    // (users/messages/config/explain) and by `source`: `server` when the
+    // server's own max_connections divided among the sharing processes and
+    // pools is what binds, `configured` when the configured ceiling is lower
+    // or the server could not be read at all.
+    //
+    // The value has to be readable, not just obeyed. Four pools against one
+    // database multiply the configured ceiling into a local allowance several
+    // times the server's, and the failure that follows -- every writer waiting
+    // out its acquire timeout while `pg_stat_activity` still shows idle
+    // connections held by the sibling pools -- says nothing about which
+    // ceiling was in force. A reader is told what the fix did only by this
+    // gauge; without it the only witness is a startup log line that a later
+    // reader of the store never sees. `source` is what keeps a lowered ceiling
+    // from being read as the server's answer when the server was never asked.
+    PG_POOL_MAX_CONNECTIONS => "cogneva_pg_pool_max_connections",
+
     // cog-agent — what happened to a tool output too large for the context.
     //
     // Two cells that must be read together. `truncated` says a tool's output did
