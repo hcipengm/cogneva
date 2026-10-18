@@ -74,7 +74,7 @@ pub fn declared_in(text: &str) -> Option<&'static str> {
     DECLARED_CLASSES
         .iter()
         .find(|(prefix, _)| cog_core::contract::outcome::declares(text, prefix))
-        .map(|(_, class)| refine_by_cause(*class, text))
+        .map(|(_, class)| refine_by_cause(class, text))
 }
 
 /// Narrow a prefix class by the typed cause the same text carries.
