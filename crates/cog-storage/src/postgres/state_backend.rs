@@ -25,7 +25,93 @@ pub const EVENTS_PAGE_SQL: &str = r#"
     LIMIT $3
 "#;
 
-/// PostgreSQL-backed state backend.
+/// This store's schema, and the one a restore replays.
+pub const DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS cog_agent_states (
+                agent_id TEXT PRIMARY KEY,
+                state TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+;
+CREATE TABLE IF NOT EXISTS cog_checkpoints (
+                task_id TEXT PRIMARY KEY,
+                snapshot_id TEXT NOT NULL,
+                event_offset BIGINT NOT NULL,
+                timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+;
+CREATE TABLE IF NOT EXISTS cog_events (
+                id SERIAL PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                payload JSONB NOT NULL,
+                offset_num BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+;
+CREATE INDEX IF NOT EXISTS idx_cog_events_task_id ON cog_events(task_id)
+;
+CREATE TABLE IF NOT EXISTS cog_context_boards (
+                task_id TEXT NOT NULL,
+                field_name TEXT NOT NULL,
+                field_value TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (task_id, field_name)
+            )
+;
+CREATE TABLE IF NOT EXISTS cog_dag_state (
+                workspace_id TEXT PRIMARY KEY,
+                state JSONB NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+;
+CREATE TABLE IF NOT EXISTS cog_dag_tasks (
+                workspace_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                task JSONB NOT NULL,
+                status TEXT NOT NULL,
+                retry_history JSONB NOT NULL DEFAULT '[]'::jsonb,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (workspace_id, task_id)
+            )
+;
+CREATE INDEX IF NOT EXISTS idx_cog_dag_tasks_status
+            ON cog_dag_tasks(workspace_id, status)
+;
+CREATE TABLE IF NOT EXISTS cog_evolution_promotions (
+                id TEXT PRIMARY KEY,
+                change_id TEXT NOT NULL,
+                level TEXT NOT NULL,
+                gate_kind TEXT,
+                decision_reason TEXT NOT NULL,
+                cluster TEXT NOT NULL,
+                status TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                eval_summary TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+;
+ALTER TABLE cog_evolution_promotions
+            ADD COLUMN IF NOT EXISTS gate_kind TEXT
+;
+CREATE INDEX IF NOT EXISTS idx_cog_evolution_promotions_updated
+            ON cog_evolution_promotions(updated_at DESC)
+;
+DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'cog_evolution_promotions' AND column_name = 'patch_id'
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'cog_evolution_promotions' AND column_name = 'change_id'
+                ) THEN
+                    ALTER TABLE cog_evolution_promotions RENAME COLUMN patch_id TO change_id;
+                END IF;
+            END $$;
+"#;
+
 pub struct PostgresStateBackend {
     pool: PgPool,
 }
@@ -65,210 +151,7 @@ impl PostgresStateBackend {
 
     /// Auto-create the required tables and indexes if they do not exist.
     pub async fn init_schema(&self) -> SFResult<()> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS cog_agent_states (
-                agent_id TEXT PRIMARY KEY,
-                state TEXT NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS cog_checkpoints (
-                task_id TEXT PRIMARY KEY,
-                snapshot_id TEXT NOT NULL,
-                event_offset BIGINT NOT NULL,
-                timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS cog_events (
-                id SERIAL PRIMARY KEY,
-                task_id TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                payload JSONB NOT NULL,
-                offset_num BIGINT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_cog_events_task_id ON cog_events(task_id)
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        // The offset is the backend's own assignment -- the sequence position a
-        // reader resumes from -- so two events of one task may not share one.
-        // Uniqueness has to be a property of the table rather than of nobody
-        // appending at the same time: a task's owner is reclaimed on a lease,
-        // which presumes the previous holder stopped rather than stopping it,
-        // and the two writers only meet here. The sibling Redis backend gets
-        // this for free (the offset is what its append returns), so without the
-        // constraint Postgres alone can hand two readers the same position, and
-        // a reader that resumes from a position would miss the second event for
-        // good.
-        //
-        // The same index answers the page read: `task_id` and `offset_num` in
-        // one btree, in the order `EVENTS_PAGE_SQL` asks for, so the read is an
-        // index scan instead of a filter-then-sort. It leaves
-        // `idx_cog_events_task_id` redundant (it is this index's prefix); it is
-        // kept because removing it buys nothing measurable at one event per
-        // iteration, and a second change of purpose here would want its own
-        // reading.
-        sqlx::query(
-            r#"
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_cog_events_task_offset
-                ON cog_events(task_id, offset_num)
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS cog_context_boards (
-                task_id TEXT NOT NULL,
-                field_name TEXT NOT NULL,
-                field_value TEXT NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (task_id, field_name)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS cog_dag_state (
-                workspace_id TEXT PRIMARY KEY,
-                state JSONB NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        // 存储权威模式的单任务表：task 存完整序列化，status 冗余一列供
-        // CAS 与就绪扫描，依赖边不落地（从 task.blocked_by 派生查询，
-        // 消掉反向索引双写竞态），retry_history 随行原子追加。
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS cog_dag_tasks (
-                workspace_id TEXT NOT NULL,
-                task_id TEXT NOT NULL,
-                task JSONB NOT NULL,
-                status TEXT NOT NULL,
-                retry_history JSONB NOT NULL DEFAULT '[]'::jsonb,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (workspace_id, task_id)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_cog_dag_tasks_status
-            ON cog_dag_tasks(workspace_id, status)
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        // 晋级台账：每次晋级（推送端与各集群拉取端）全字段留档，
-        // 配额/熔断/审计共用一份事实源。
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS cog_evolution_promotions (
-                id TEXT PRIMARY KEY,
-                change_id TEXT NOT NULL,
-                level TEXT NOT NULL,
-                gate_kind TEXT,
-                decision_reason TEXT NOT NULL,
-                cluster TEXT NOT NULL,
-                status TEXT NOT NULL,
-                outcome TEXT NOT NULL,
-                eval_summary TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        // 迁移：分级判定按类型留档（可空，旧记录与拉取端不产生该列值时留空）。
-        sqlx::query(
-            r#"
-            ALTER TABLE cog_evolution_promotions
-            ADD COLUMN IF NOT EXISTS gate_kind TEXT
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_cog_evolution_promotions_updated
-            ON cog_evolution_promotions(updated_at DESC)
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        // 迁移：旧库台账列名 patch_id → change_id（新库无 patch_id 列，自动跳过）。
-        sqlx::query(
-            r#"
-            DO $$
-            BEGIN
-                IF EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name = 'cog_evolution_promotions' AND column_name = 'patch_id'
-                ) AND NOT EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name = 'cog_evolution_promotions' AND column_name = 'change_id'
-                ) THEN
-                    ALTER TABLE cog_evolution_promotions RENAME COLUMN patch_id TO change_id;
-                END IF;
-            END $$;
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        Ok(())
+        crate::schema_ddl::apply(&self.pool, DDL).await
     }
 }
 

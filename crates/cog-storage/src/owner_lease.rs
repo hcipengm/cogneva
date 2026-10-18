@@ -39,6 +39,16 @@ use cog_core::{OwnerLease, OwnerLeaseBroker, SFError, SFResult};
 /// the loops that take a lease rather than by anything they do.
 pub const LEASE_TABLE: &str = "cogneva_owner_leases";
 
+/// This store's schema, and the one a restore replays. Spelled with the table
+/// name inline because a schema run through the simple-query path cannot bind
+/// a parameter into a statement.
+pub const DDL: &str = "CREATE TABLE IF NOT EXISTS cogneva_owner_leases (
+                 role TEXT PRIMARY KEY,
+                 holder TEXT NOT NULL,
+                 acquired_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                 expires_at TIMESTAMPTZ NOT NULL
+             )";
+
 /// The identity a lease is held under: the process, not the instance.
 ///
 /// Every other name in this system that has to survive a restart is derived
@@ -157,17 +167,7 @@ impl PgOwnerLeaseBroker {
     /// not run, and the arbitration is precisely the thing that must not rest on
     /// a reading taken by hand.
     pub async fn with_holder(pool: PgPool, holder: impl Into<String>) -> SFResult<Self> {
-        sqlx::query(&format!(
-            "CREATE TABLE IF NOT EXISTS {LEASE_TABLE} (
-                 role TEXT PRIMARY KEY,
-                 holder TEXT NOT NULL,
-                 acquired_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                 expires_at TIMESTAMPTZ NOT NULL
-             )"
-        ))
-        .execute(&pool)
-        .await
-        .map_err(|e| SFError::Database(format!("create {LEASE_TABLE}: {e}")))?;
+        crate::schema_ddl::apply(&pool, DDL).await?;
         Ok(Self {
             pool,
             holder: holder.into(),

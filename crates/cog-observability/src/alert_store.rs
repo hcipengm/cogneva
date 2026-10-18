@@ -11,6 +11,26 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 
+/// This store's schema, and the one a restore replays.
+pub const DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS alerts (
+                id          TEXT PRIMARY KEY,
+                rule        TEXT        NOT NULL,
+                dedup_key   TEXT        NOT NULL UNIQUE,
+                severity    TEXT        NOT NULL,
+                state       TEXT        NOT NULL,
+                message     TEXT        NOT NULL,
+                labels      JSONB       NOT NULL DEFAULT '{}'::jsonb,
+                fired_at    TIMESTAMPTZ NOT NULL,
+                resolved_at TIMESTAMPTZ,
+                updated_at  TIMESTAMPTZ NOT NULL
+            )
+;
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ
+;
+CREATE INDEX IF NOT EXISTS idx_alerts_state ON alerts(state, fired_at DESC);
+"#;
+
 /// A new alert condition to raise (or close).
 #[derive(Debug, Clone)]
 pub struct NewAlert {
@@ -146,36 +166,7 @@ impl PostgresAlertStore {
     }
 
     pub async fn init_schema(&self) -> anyhow::Result<()> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS alerts (
-                id          TEXT PRIMARY KEY,
-                rule        TEXT        NOT NULL,
-                dedup_key   TEXT        NOT NULL UNIQUE,
-                severity    TEXT        NOT NULL,
-                state       TEXT        NOT NULL,
-                message     TEXT        NOT NULL,
-                labels      JSONB       NOT NULL DEFAULT '{}'::jsonb,
-                fired_at    TIMESTAMPTZ NOT NULL,
-                resolved_at TIMESTAMPTZ,
-                updated_at  TIMESTAMPTZ NOT NULL
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-        // Additive migration. Deliberately no backfill from `updated_at`: for
-        // the rules whose payload is stable that value is the firing edge, not
-        // a sighting, and copying it here would manufacture the very
-        // conflation the column exists to end. Rows predating the column read
-        // as "not yet confirmed" and pick up a real value on their next
-        // evaluation, which any firing condition reaches within one tick.
-        sqlx::query("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_alerts_state ON alerts(state, fired_at DESC)")
-            .execute(&self.pool)
-            .await?;
+        sqlx::raw_sql(DDL).execute(&self.pool).await?;
         Ok(())
     }
 

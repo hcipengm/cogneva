@@ -78,6 +78,15 @@ pub const PRODUCER_LAST_PUSH_TIMESTAMP: &str =
 /// the number the judgement was made against.
 pub const PRODUCER_PUSH_PERIOD: &str = "cogneva_principle_producer_push_period_seconds";
 
+/// This store's schema, and the one a restore replays.
+pub const DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS principle_producer_pushes (
+                source         TEXT PRIMARY KEY,
+                pushed_at      TIMESTAMPTZ NOT NULL,
+                period_seconds BIGINT NOT NULL
+            );
+"#;
+
 /// The row as the reader sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProducerHeartbeat {
@@ -106,17 +115,7 @@ impl ProducerHeartbeatStore {
     /// fresh deployment is indistinguishable from a producer that never ran.
     /// `IF NOT EXISTS` is what makes two creators agree rather than race.
     pub async fn init_schema(&self) -> anyhow::Result<()> {
-        sqlx::query(&format!(
-            r#"
-            CREATE TABLE IF NOT EXISTS {HEARTBEAT_TABLE} (
-                source         TEXT PRIMARY KEY,
-                pushed_at      TIMESTAMPTZ NOT NULL,
-                period_seconds BIGINT NOT NULL
-            )
-            "#
-        ))
-        .execute(&self.pool)
-        .await?;
+        sqlx::raw_sql(DDL).execute(&self.pool).await?;
         Ok(())
     }
 

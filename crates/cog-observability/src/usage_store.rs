@@ -452,6 +452,172 @@ pub fn windows_to_roll(
 }
 
 /// PostgreSQL usage store.
+/// This store's schema, and the one a restore replays.
+///
+/// One text because the list has an order: the ledger's additive columns are
+/// meaningless without its table, and the rollup's guarded block inspects a
+/// table it must find already there. The table names are spelled inline — a
+/// const string cannot fold another const into itself — and the test below
+/// keeps those spellings and the [`LEDGER_TABLE`]/[`WINDOW_TABLE`]/
+/// [`ROLLUP_TABLE`] constants from drifting apart.
+pub const DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS gateway_llm_usage (
+    id            UUID PRIMARY KEY,
+    ts            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    upstream      TEXT NOT NULL,
+    api_style     TEXT NOT NULL,
+    model         TEXT NOT NULL,
+    result        TEXT NOT NULL,
+    tokens_input  BIGINT NOT NULL DEFAULT 0,
+    tokens_output BIGINT NOT NULL DEFAULT 0,
+    tokens_cached BIGINT NOT NULL DEFAULT 0,
+    latency_ms    BIGINT NOT NULL DEFAULT 0
+);
+-- Additive migration for the per-actor dimension; old rows stay attributable
+-- as "unknown" without a table rewrite.
+ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS actor TEXT NOT NULL DEFAULT 'unknown';
+-- Same shape for the cache dimension. Rows written before this column existed
+-- default to 0, and 0 is honest for them as long as the reader treats "cached"
+-- on a row whose input is also 0 as "not metered" rather than "nothing was
+-- cached" -- the two are indistinguishable after the fact, which is exactly
+-- why the column is written going forward rather than reconstructed backward.
+ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS tokens_cached BIGINT NOT NULL DEFAULT 0;
+-- Additive migration for the environment dimension, same shape as the actor
+-- one above. Rows written before it existed default to `unknown`, which is the
+-- honest reading -- they are not attributable to any one environment and must
+-- not be counted into one.
+ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'unknown';
+-- Additive migration for the estimate dimension, and the one column here that
+-- is nullable on purpose. "This row was not priced" (older rows, and rows
+-- landed by the failure path) is not "this row was priced at zero" -- a NOT
+-- NULL DEFAULT 0 would make both read as an empty prompt, and a reader
+-- grouping by the gap between the two rulers has to handle the absence rather
+-- than silently pair it with the truth.
+ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS estimated_input BIGINT;
+-- The per-job dimension. Nullable because "no job identity" is a state of its
+-- own: rows landed by paths that cannot name a job (an upstream failure
+-- recorded before routing, the gateway's own judgement calls) must not be
+-- gathered into one placeholder group that would then read as the most
+-- expensive job on the ledger. Text, not UUID: the caller declares whatever
+-- identity its own per-run census uses, and the reader's job is to join the
+-- two, not to funnel both through a type.
+ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS task_id TEXT;
+-- Why a refused attempt was refused. Additive and nullable for the same reason
+-- as the two columns above: rows written before it existed have no kind to
+-- report, and inventing one would make a past window's failures read as a
+-- cause nobody ever observed.
+ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS refusal_kind TEXT;
+-- 配速拒绝的证据列。加列而不是复用上面三格，理由见 [`PaceEvidence`]。
+-- 全部可空、没有默认值：非配速行上 `NULL` 读作"不适用"，而任何
+-- `coalesce(…, 0)` 的读法都会把"这一行没有这一拍的数"变成"缺口为零"，
+-- 那正是这组列要分开的两件事。
+ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS pace_measured_upstreams SMALLINT;
+ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS pace_allowance_tokens BIGINT;
+ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS pace_spent_tokens BIGINT;
+ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS pace_reserve_tokens BIGINT;
+ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS pace_window_start_unix BIGINT;
+ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS pace_upstreams JSONB;
+CREATE INDEX IF NOT EXISTS idx_gateway_llm_usage_ts ON gateway_llm_usage (ts);
+-- One row per upstream, not one per measurement: the pacer only ever acts on
+-- the newest window it has an observation for, and a history of stale
+-- boundaries would make "which one is in force" a question the reader has to
+-- answer. The key is the upstream identity, which is what the pacing pass
+-- selects by.
+CREATE TABLE IF NOT EXISTS gateway_llm_window (
+    upstream        TEXT PRIMARY KEY,
+    boundary_unix   BIGINT NOT NULL,
+    window_secs     BIGINT NOT NULL,
+    capacity_tokens BIGINT NOT NULL,
+    source          TEXT NOT NULL,
+    measured_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+-- The window fold. `window_start`/`window_end` are the row's own boundary
+-- fields, not a `now()` stamped at insert: a rerun has to key and compare on
+-- the window it is recomputing, and a timestamp taken when the row happened to
+-- be written would make the same window look like a new one. The primary key
+-- is the whole identity of a rollup row, which is what makes a rerun collide
+-- with itself and update in place.
+CREATE TABLE IF NOT EXISTS cog_llm_usage_rollup (
+    window_start   TIMESTAMPTZ NOT NULL,
+    window_end     TIMESTAMPTZ NOT NULL,
+    actor          TEXT NOT NULL,
+    origin         TEXT NOT NULL,
+    upstream       TEXT NOT NULL,
+    api_style      TEXT NOT NULL,
+    calls          BIGINT NOT NULL DEFAULT 0,
+    failed_calls   BIGINT NOT NULL DEFAULT 0,
+    tokens_input   BIGINT NOT NULL DEFAULT 0,
+    tokens_output  BIGINT NOT NULL DEFAULT 0,
+    tokens_cached  BIGINT NOT NULL DEFAULT 0,
+    avg_latency_ms BIGINT NOT NULL DEFAULT 0,
+    first_rolled_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (window_start, window_end, actor, origin, upstream, api_style)
+);
+-- The environment dimension reaches the fold as well as the ledger: a fold
+-- that dropped an axis the ledger carries would lose it, and the question this
+-- axis exists for is read again and again -- which is what the fold is for.
+-- Both steps are guarded, so a table already carrying the column and key is
+-- left alone. The new column goes **last** in the key: every row written
+-- before it existed carries the same default, so the enlarged key is still
+-- unique and the swap is safe in place, with no rebuild -- which matters
+-- because a first fold is bounded by the lookback and could not re-create
+-- history older than it.
+DO $mig$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'cog_llm_usage_rollup' AND column_name = 'origin'
+    ) THEN
+        ALTER TABLE cog_llm_usage_rollup
+            ADD COLUMN origin TEXT NOT NULL DEFAULT 'unknown';
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'cog_llm_usage_rollup'::regclass AND contype = 'p'
+          AND pg_get_constraintdef(oid) NOT LIKE '%origin%'
+    ) THEN
+        ALTER TABLE cog_llm_usage_rollup DROP CONSTRAINT cog_llm_usage_rollup_pkey;
+        ALTER TABLE cog_llm_usage_rollup
+            ADD PRIMARY KEY
+                (window_start, window_end, actor, origin, upstream, api_style);
+    END IF;
+END
+$mig$;
+-- The exchange itself: the bytes we sent and the bytes that came back. The
+-- usage row above answers "how much did this call cost"; it cannot answer
+-- "what was asked", so a re-run, a duplicate count, a context breakdown or a
+-- regression against an old prompt all had to be re-bought from the upstream.
+-- Kept in its own table rather than in the ledger row because the ledger is
+-- read by the pacing pass on every window boundary and must stay narrow; the
+-- bodies are read rarely and only by a person asking a question about a
+-- specific call.
+CREATE TABLE IF NOT EXISTS gateway_llm_exchange (
+    id              UUID PRIMARY KEY,
+    ts              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    upstream        TEXT NOT NULL,
+    api_style       TEXT NOT NULL,
+    model           TEXT NOT NULL,
+    actor           TEXT NOT NULL DEFAULT 'unknown',
+    origin          TEXT NOT NULL DEFAULT 'unknown',
+    task_id         TEXT,
+    result          TEXT NOT NULL,
+    latency_ms      BIGINT NOT NULL DEFAULT 0,
+    request_sha256  TEXT NOT NULL,
+    response_sha256 TEXT,
+    request_bytes   BIGINT NOT NULL DEFAULT 0,
+    response_bytes  BIGINT NOT NULL DEFAULT 0,
+    request_body    TEXT,
+    response_body   TEXT,
+    truncated       TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_gateway_llm_exchange_ts ON gateway_llm_exchange (ts);
+-- The hash index is what turns "did we already buy this exact prompt" from a
+-- full scan into a lookup; without it the question is only answerable for a
+-- window small enough to sit in memory.
+CREATE INDEX IF NOT EXISTS idx_gateway_llm_exchange_req ON gateway_llm_exchange (request_sha256);
+CREATE INDEX IF NOT EXISTS idx_gateway_llm_exchange_actor ON gateway_llm_exchange (actor, ts DESC);
+"#;
+
 #[derive(Clone)]
 pub struct LlmUsageStore {
     pool: PgPool,
@@ -463,237 +629,12 @@ impl LlmUsageStore {
         Ok(Self { pool })
     }
 
+    /// Auto-create every table, column and index this store owns.
+    ///
+    /// The statements themselves are [`DDL`]: a restore replays that same list
+    /// instead of keeping a second copy of the schema that only it would run.
     pub async fn init_schema(&self) -> anyhow::Result<()> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS gateway_llm_usage (
-                id            UUID PRIMARY KEY,
-                ts            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                upstream      TEXT NOT NULL,
-                api_style     TEXT NOT NULL,
-                model         TEXT NOT NULL,
-                result        TEXT NOT NULL,
-                tokens_input  BIGINT NOT NULL DEFAULT 0,
-                tokens_output BIGINT NOT NULL DEFAULT 0,
-                tokens_cached BIGINT NOT NULL DEFAULT 0,
-                latency_ms    BIGINT NOT NULL DEFAULT 0
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-        // Additive migration for the per-actor dimension; old rows stay
-        // attributable as "unknown" without a table rewrite.
-        sqlx::query(
-            "ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS actor TEXT NOT NULL DEFAULT 'unknown'",
-        )
-        .execute(&self.pool)
-        .await?;
-        // Same shape for the cache dimension. Rows written before this column
-        // existed default to 0, and 0 is honest for them as long as the reader
-        // treats "cached" on a row whose input is also 0 as "not metered"
-        // rather than "nothing was cached" -- the two are indistinguishable
-        // after the fact, which is exactly why the column is written going
-        // forward rather than reconstructed backward.
-        sqlx::query(
-            "ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS tokens_cached BIGINT NOT NULL DEFAULT 0",
-        )
-        .execute(&self.pool)
-        .await?;
-        // Additive migration for the environment dimension, same shape as the
-        // actor one above. Rows written before it existed default to `unknown`,
-        // which is the honest reading -- they are not attributable to any one
-        // environment and must not be counted into one.
-        sqlx::query(
-            "ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'unknown'",
-        )
-        .execute(&self.pool)
-        .await?;
-        // Additive migration for the estimate dimension, and the one column here
-        // that is nullable on purpose. "This row was not priced" (older rows, and
-        // rows landed by the failure path) is not "this row was priced at zero" --
-        // a NOT NULL DEFAULT 0 would make both read as an empty prompt, and a
-        // reader grouping by the gap between the two rulers has to handle the
-        // absence rather than silently pair it with the truth.
-        sqlx::query(
-            "ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS estimated_input BIGINT",
-        )
-        .execute(&self.pool)
-        .await?;
-        // The per-job dimension. Nullable because "no job identity" is a state
-        // of its own: rows landed by paths that cannot name a job (an upstream
-        // failure recorded before routing, the gateway's own judgement calls)
-        // must not be gathered into one placeholder group that would then read
-        // as the most expensive job on the ledger. Text, not UUID: the caller
-        // declares whatever identity its own per-run census uses, and the
-        // reader's job is to join the two, not to funnel both through a type.
-        sqlx::query("ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS task_id TEXT")
-            .execute(&self.pool)
-            .await?;
-        // Why a refused attempt was refused. Additive and nullable for the same
-        // reason as the two columns above: rows written before it existed have
-        // no kind to report, and inventing one would make a past window's
-        // failures read as a cause nobody ever observed.
-        sqlx::query("ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS refusal_kind TEXT")
-            .execute(&self.pool)
-            .await?;
-        // 配速拒绝的证据列。加列而不是复用上面三格，理由见 [`PaceEvidence`]。
-        // 全部可空、没有默认值：非配速行上 `NULL` 读作"不适用"，而任何
-        // `coalesce(…, 0)` 的读法都会把"这一行没有这一拍的数"变成"缺口为零"，
-        // 那正是这组列要分开的两件事。
-        for column in [
-            "pace_measured_upstreams SMALLINT",
-            "pace_allowance_tokens BIGINT",
-            "pace_spent_tokens BIGINT",
-            "pace_reserve_tokens BIGINT",
-            "pace_window_start_unix BIGINT",
-            "pace_upstreams JSONB",
-        ] {
-            sqlx::query(&format!(
-                "ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS {column}"
-            ))
-            .execute(&self.pool)
-            .await?;
-        }
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_gateway_llm_usage_ts ON gateway_llm_usage (ts)",
-        )
-        .execute(&self.pool)
-        .await?;
-        // One row per upstream, not one per measurement: the pacer only ever
-        // acts on the newest window it has an observation for, and a history
-        // of stale boundaries would make "which one is in force" a question the
-        // reader has to answer. The key is the upstream identity, which is what
-        // the pacing pass selects by.
-        sqlx::query(&format!(
-            r#"
-            CREATE TABLE IF NOT EXISTS {WINDOW_TABLE} (
-                upstream        TEXT PRIMARY KEY,
-                boundary_unix   BIGINT NOT NULL,
-                window_secs     BIGINT NOT NULL,
-                capacity_tokens BIGINT NOT NULL,
-                source          TEXT NOT NULL,
-                measured_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            "#
-        ))
-        .execute(&self.pool)
-        .await?;
-        // The window fold. `window_start`/`window_end` are the row's own
-        // boundary fields, not a `now()` stamped at insert: a rerun has to key
-        // and compare on the window it is recomputing, and a timestamp taken
-        // when the row happened to be written would make the same window look
-        // like a new one. The primary key is the whole identity of a rollup row,
-        // which is what makes a rerun collide with itself and update in place.
-        sqlx::query(&format!(
-            r#"
-            CREATE TABLE IF NOT EXISTS {ROLLUP_TABLE} (
-                window_start   TIMESTAMPTZ NOT NULL,
-                window_end     TIMESTAMPTZ NOT NULL,
-                actor          TEXT NOT NULL,
-                origin         TEXT NOT NULL,
-                upstream       TEXT NOT NULL,
-                api_style      TEXT NOT NULL,
-                calls          BIGINT NOT NULL DEFAULT 0,
-                failed_calls   BIGINT NOT NULL DEFAULT 0,
-                tokens_input   BIGINT NOT NULL DEFAULT 0,
-                tokens_output  BIGINT NOT NULL DEFAULT 0,
-                tokens_cached  BIGINT NOT NULL DEFAULT 0,
-                avg_latency_ms BIGINT NOT NULL DEFAULT 0,
-                first_rolled_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (window_start, window_end, actor, origin, upstream, api_style)
-            )
-            "#
-        ))
-        .execute(&self.pool)
-        .await?;
-        // The environment dimension reaches the fold as well as the ledger: a
-        // fold that dropped an axis the ledger carries would lose it, and the
-        // question this axis exists for is read again and again -- which is what
-        // the fold is for. Both steps are guarded, so a table already carrying
-        // the column and key is left alone. The new column goes **last** in the
-        // key: every row written before it existed carries the same default, so
-        // the enlarged key is still unique and the swap is safe in place, with
-        // no rebuild -- which matters because a first fold is bounded by the
-        // lookback and could not re-create history older than it.
-        sqlx::query(&format!(
-            r#"
-            DO $mig$
-            BEGIN
-                IF NOT EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name = '{ROLLUP_TABLE}' AND column_name = 'origin'
-                ) THEN
-                    ALTER TABLE {ROLLUP_TABLE}
-                        ADD COLUMN origin TEXT NOT NULL DEFAULT 'unknown';
-                END IF;
-                IF EXISTS (
-                    SELECT 1 FROM pg_constraint
-                    WHERE conrelid = '{ROLLUP_TABLE}'::regclass AND contype = 'p'
-                      AND pg_get_constraintdef(oid) NOT LIKE '%origin%'
-                ) THEN
-                    ALTER TABLE {ROLLUP_TABLE} DROP CONSTRAINT {ROLLUP_TABLE}_pkey;
-                    ALTER TABLE {ROLLUP_TABLE}
-                        ADD PRIMARY KEY
-                            (window_start, window_end, actor, origin, upstream, api_style);
-                END IF;
-            END
-            $mig$;
-            "#
-        ))
-        .execute(&self.pool)
-        .await?;
-        // The exchange itself: the bytes we sent and the bytes that came back.
-        // The usage row above answers "how much did this call cost"; it cannot
-        // answer "what was asked", so a re-run, a duplicate count, a context
-        // breakdown or a regression against an old prompt all had to be
-        // re-bought from the upstream. Kept in its own table rather than in the
-        // ledger row because the ledger is read by the pacing pass on every
-        // window boundary and must stay narrow; the bodies are read rarely and
-        // only by a person asking a question about a specific call.
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS gateway_llm_exchange (
-                id              UUID PRIMARY KEY,
-                ts              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                upstream        TEXT NOT NULL,
-                api_style       TEXT NOT NULL,
-                model           TEXT NOT NULL,
-                actor           TEXT NOT NULL DEFAULT 'unknown',
-                origin          TEXT NOT NULL DEFAULT 'unknown',
-                task_id         TEXT,
-                result          TEXT NOT NULL,
-                latency_ms      BIGINT NOT NULL DEFAULT 0,
-                request_sha256  TEXT NOT NULL,
-                response_sha256 TEXT,
-                request_bytes   BIGINT NOT NULL DEFAULT 0,
-                response_bytes  BIGINT NOT NULL DEFAULT 0,
-                request_body    TEXT,
-                response_body   TEXT,
-                truncated       TEXT NOT NULL DEFAULT ''
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_gateway_llm_exchange_ts ON gateway_llm_exchange (ts)",
-        )
-        .execute(&self.pool)
-        .await?;
-        // The hash index is what turns "did we already buy this exact prompt"
-        // from a full scan into a lookup; without it the question is only
-        // answerable for a window small enough to sit in memory.
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_gateway_llm_exchange_req ON gateway_llm_exchange (request_sha256)",
-        )
-        .execute(&self.pool)
-        .await?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_gateway_llm_exchange_actor ON gateway_llm_exchange (actor, ts DESC)",
-        )
-        .execute(&self.pool)
-        .await?;
+        sqlx::raw_sql(DDL).execute(&self.pool).await?;
         Ok(())
     }
 

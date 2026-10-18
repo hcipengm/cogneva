@@ -12,15 +12,10 @@ pub struct PostgresSnapshotStore {
     pool: PgPool,
 }
 
-impl PostgresSnapshotStore {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
-    }
-
-    /// Auto-create the required table and index if they do not exist.
-    pub async fn init_schema(&self) -> SFResult<()> {
-        sqlx::query(
-            r#"
+/// This store's slice of the schema. The same statements are the ones a
+/// restore replays, so the table cannot exist for the app and be missing for
+/// the drill.
+pub const DDL: &str = r#"
             CREATE TABLE IF NOT EXISTS cog_snapshots (
                 snapshot_id TEXT PRIMARY KEY,
                 task_id TEXT NOT NULL,
@@ -28,23 +23,18 @@ impl PostgresSnapshotStore {
                 context_window JSONB NOT NULL,
                 event_offset BIGINT NOT NULL,
                 timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
+            );
+            CREATE INDEX IF NOT EXISTS idx_cog_snapshots_task_id ON cog_snapshots(task_id);
+            "#;
 
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_cog_snapshots_task_id ON cog_snapshots(task_id)
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
+impl PostgresSnapshotStore {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
 
-        Ok(())
+    /// Auto-create the required table and index if they do not exist.
+    pub async fn init_schema(&self) -> SFResult<()> {
+        crate::schema_ddl::apply(&self.pool, DDL).await
     }
 }
 

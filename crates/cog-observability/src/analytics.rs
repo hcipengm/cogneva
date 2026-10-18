@@ -487,6 +487,37 @@ fn parse_clickhouse_datetime(value: &Value) -> DateTime<Utc> {
 
 // ─── PostgreSQL Fallback Implementation ───────────────────────────
 
+/// The table name a backend gets when none is given.
+pub const DEFAULT_TABLE: &str = "analytics_events";
+
+/// The schema for one events table.
+///
+/// A function rather than a constant because the name is configurable, and
+/// the table, both indexes and their names all derive from it -- writing the
+/// text twice, once per entry point, is how a restore and a first start come
+/// to know different schemas. `init_table` and the restore bundle both call
+/// this, so neither can drift from the other.
+pub fn postgres_table_ddl(table: &str) -> String {
+    format!(
+        r#"
+        CREATE TABLE IF NOT EXISTS {table} (
+            id BIGSERIAL PRIMARY KEY,
+            event_id VARCHAR(64) NOT NULL UNIQUE,
+            event_type VARCHAR(32) NOT NULL,
+            timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            user_id VARCHAR(64),
+            session_id VARCHAR(64),
+            task_id VARCHAR(64),
+            agent_id VARCHAR(64),
+            properties JSONB NOT NULL DEFAULT '{{}}',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_{table}_type_time ON {table}(event_type, timestamp DESC);
+        CREATE INDEX IF NOT EXISTS idx_{table}_time ON {table}(timestamp DESC);
+        "#
+    )
+}
+
 /// PostgreSQL-backed analytics backend for Phase 1.
 /// Stores events in a JSONB table, suitable for moderate volumes
 /// (< 100M events/month).  The design doc recommends ClickHouse
@@ -500,7 +531,7 @@ impl PostgresAnalyticsBackend {
     pub fn new(pool: sqlx::PgPool) -> Self {
         Self {
             pool,
-            table: "analytics_events".into(),
+            table: DEFAULT_TABLE.into(),
         }
     }
 
@@ -511,26 +542,8 @@ impl PostgresAnalyticsBackend {
 
     /// Initialize the events table.
     pub async fn init_table(&self) -> anyhow::Result<()> {
-        let ddl = format!(
-            r#"
-            CREATE TABLE IF NOT EXISTS {} (
-                id BIGSERIAL PRIMARY KEY,
-                event_id VARCHAR(64) NOT NULL UNIQUE,
-                event_type VARCHAR(32) NOT NULL,
-                timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                user_id VARCHAR(64),
-                session_id VARCHAR(64),
-                task_id VARCHAR(64),
-                agent_id VARCHAR(64),
-                properties JSONB NOT NULL DEFAULT '{{}}',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-            CREATE INDEX IF NOT EXISTS idx_{}_type_time ON {}(event_type, timestamp DESC);
-            CREATE INDEX IF NOT EXISTS idx_{}_time ON {}(timestamp DESC);
-            "#,
-            self.table, self.table, self.table, self.table, self.table
-        );
-        sqlx::query(&ddl).execute(&self.pool).await?;
+        let ddl = postgres_table_ddl(&self.table);
+        sqlx::raw_sql(&ddl).execute(&self.pool).await?;
         Ok(())
     }
 }

@@ -95,6 +95,25 @@ pub const PERIOD: Duration = Duration::from_secs(600);
 /// this loop was down is caught up rather than skipped.
 pub const LOOKBACK_SECS: i64 = 0;
 
+/// This store's schema, and the one a restore replays.
+pub const DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS cog_llm_spend_verdict (
+                window_start  TIMESTAMPTZ NOT NULL,
+                window_end    TIMESTAMPTZ NOT NULL,
+                actor         TEXT NOT NULL,
+                verdict       TEXT NOT NULL,
+                skip_reason   TEXT NOT NULL DEFAULT '',
+                skips   BIGINT NOT NULL DEFAULT 0,
+                calls         BIGINT NOT NULL DEFAULT 0,
+                tokens_input  BIGINT NOT NULL DEFAULT 0,
+                tokens_output BIGINT NOT NULL DEFAULT 0,
+                decided_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (window_start, window_end, actor, verdict, skip_reason)
+            )
+;
+CREATE INDEX IF NOT EXISTS idx_cog_llm_spend_verdict_window ON cog_llm_spend_verdict (window_start, window_end);
+"#;
+
 /// What one call site's window amounts to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SpendVerdict {
@@ -513,30 +532,7 @@ impl SpendVerdictStore {
     }
 
     pub async fn init_schema(&self) -> anyhow::Result<()> {
-        sqlx::query(&format!(
-            r#"
-            CREATE TABLE IF NOT EXISTS {VERDICT_TABLE} (
-                window_start  TIMESTAMPTZ NOT NULL,
-                window_end    TIMESTAMPTZ NOT NULL,
-                actor         TEXT NOT NULL,
-                verdict       TEXT NOT NULL,
-                skip_reason   TEXT NOT NULL DEFAULT '',
-                skips   BIGINT NOT NULL DEFAULT 0,
-                calls         BIGINT NOT NULL DEFAULT 0,
-                tokens_input  BIGINT NOT NULL DEFAULT 0,
-                tokens_output BIGINT NOT NULL DEFAULT 0,
-                decided_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (window_start, window_end, actor, verdict, skip_reason)
-            )
-            "#
-        ))
-        .execute(&self.pool)
-        .await?;
-        sqlx::query(&format!(
-            "CREATE INDEX IF NOT EXISTS idx_{VERDICT_TABLE}_window ON {VERDICT_TABLE} (window_start, window_end)"
-        ))
-        .execute(&self.pool)
-        .await?;
+        sqlx::raw_sql(DDL).execute(&self.pool).await?;
         Ok(())
     }
 

@@ -25,6 +25,7 @@ pub mod pidfile;
 pub mod pin_census;
 pub mod platform;
 pub mod plugin_registry;
+pub mod schema_bundle;
 pub mod shutdown_coordinator;
 pub mod startup_guard;
 pub mod validate_config;

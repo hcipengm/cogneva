@@ -5,6 +5,24 @@ use sqlx::PgPool;
 
 use cog_core::{HookArchive, SFError, SFResult};
 
+/// This store's schema, and the one a restore replays.
+pub const DDL: &str = r#"
+            CREATE TABLE IF NOT EXISTS cog_hook_events (
+                id SERIAL PRIMARY KEY,
+                trigger_type TEXT NOT NULL,
+                dedup_key TEXT,
+                agent_id TEXT,
+                task_id TEXT,
+                crew_id TEXT,
+                squad_id TEXT,
+                payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+                timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_cog_hook_events_agent_id ON cog_hook_events(agent_id);
+            CREATE INDEX IF NOT EXISTS idx_cog_hook_events_task_id ON cog_hook_events(task_id);
+            CREATE INDEX IF NOT EXISTS idx_cog_hook_events_timestamp ON cog_hook_events(timestamp);
+            "#;
+
 /// PostgreSQL-backed archive for Hook events.
 /// Stores every emitted hook event in a single append-only table for
 /// audit, replay, and long-term analytics.
@@ -19,53 +37,7 @@ impl PostgresHookArchive {
 
     /// Auto-create the required table and index if they do not exist.
     pub async fn init_schema(&self) -> SFResult<()> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS cog_hook_events (
-                id SERIAL PRIMARY KEY,
-                trigger_type TEXT NOT NULL,
-                dedup_key TEXT,
-                agent_id TEXT,
-                task_id TEXT,
-                crew_id TEXT,
-                squad_id TEXT,
-                payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-                timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_cog_hook_events_agent_id ON cog_hook_events(agent_id)
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_cog_hook_events_task_id ON cog_hook_events(task_id)
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_cog_hook_events_timestamp ON cog_hook_events(timestamp)
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        Ok(())
+        crate::schema_ddl::apply(&self.pool, DDL).await
     }
 
     /// Archive a single hook event.

@@ -15,6 +15,41 @@ use cog_core::{
     UserType, UserUpdate,
 };
 
+/// This store's schema, and the one a restore replays.
+pub const DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS users (
+                id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+                phone VARCHAR(20) UNIQUE,
+                email VARCHAR(255) UNIQUE,
+                username VARCHAR(64) NOT NULL UNIQUE,
+                display_name VARCHAR(128),
+                avatar_url VARCHAR(512),
+                status VARCHAR(16) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive', 'disabled', 'locked')),
+                user_type VARCHAR(16) NOT NULL DEFAULT 'standard' CHECK (user_type IN ('admin', 'standard', 'guest')),
+                password_hash VARCHAR(255),
+                token_quota_daily BIGINT DEFAULT 0,
+                token_used_today BIGINT DEFAULT 0,
+                last_login_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+;
+CREATE TABLE IF NOT EXISTS platform_identities (
+                id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                provider VARCHAR(16) NOT NULL,
+                provider_user_id VARCHAR(64) NOT NULL,
+                login VARCHAR(128) NOT NULL,
+                access_token_ref VARCHAR(255),
+                refresh_token_ref VARCHAR(255),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (provider, provider_user_id)
+            )
+;
+CREATE INDEX IF NOT EXISTS idx_platform_identities_user ON platform_identities(user_id);
+"#;
+
 pub struct PostgresUserStore {
     pool: PgPool,
 }
@@ -79,59 +114,7 @@ impl PostgresUserStore {
     /// Auto-create the tables. Matches migrations 001_users plus the
     /// platform_identities table (tokens stay out — references only).
     pub async fn init_schema(&self) -> SFResult<()> {
-        sqlx::query(r#"CREATE EXTENSION IF NOT EXISTS "uuid-ossp""#)
-            .execute(&self.pool)
-            .await
-            .map_err(to_sf)?;
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS users (
-                id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-                phone VARCHAR(20) UNIQUE,
-                email VARCHAR(255) UNIQUE,
-                username VARCHAR(64) NOT NULL UNIQUE,
-                display_name VARCHAR(128),
-                avatar_url VARCHAR(512),
-                status VARCHAR(16) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive', 'disabled', 'locked')),
-                user_type VARCHAR(16) NOT NULL DEFAULT 'standard' CHECK (user_type IN ('admin', 'standard', 'guest')),
-                password_hash VARCHAR(255),
-                token_quota_daily BIGINT DEFAULT 0,
-                token_used_today BIGINT DEFAULT 0,
-                last_login_at TIMESTAMPTZ,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(to_sf)?;
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS platform_identities (
-                id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                provider VARCHAR(16) NOT NULL,
-                provider_user_id VARCHAR(64) NOT NULL,
-                login VARCHAR(128) NOT NULL,
-                access_token_ref VARCHAR(255),
-                refresh_token_ref VARCHAR(255),
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                UNIQUE (provider, provider_user_id)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(to_sf)?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_platform_identities_user ON platform_identities(user_id)",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(to_sf)?;
-        Ok(())
+        crate::schema_ddl::apply(&self.pool, DDL).await
     }
 
     async fn fetch_user(&self, clause: &str, bind: Bind<'_>) -> SFResult<Option<User>> {

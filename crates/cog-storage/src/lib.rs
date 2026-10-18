@@ -45,6 +45,7 @@ pub mod metrics_sample_cap;
 pub mod migrate;
 pub mod owner_lease;
 pub mod partition_maintainer;
+pub mod schema_ddl;
 
 // ─── Crate-level re-exports (backward-compatible with old `cog-db` usage) ───
 

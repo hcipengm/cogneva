@@ -3,25 +3,11 @@ use cog_core::{CheckType, GuardAuditRecorder, GuardResult};
 use cog_core::{Message, ToolCall};
 use sqlx::PgPool;
 
-/// PostgreSQL-backed audit recorder for guardrail decisions.
-/// Stores every input check, output check, and tool call check in an
-/// append-only table for compliance, audit, and security analytics.
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-pub struct PostgresAuditRecorder {
-    pool: PgPool,
-}
-
-impl PostgresAuditRecorder {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
-    }
-
-    /// Auto-create the required table and indexes if they do not exist.
-    pub async fn init_schema(&self) -> cog_core::SFResult<()> {
-        sqlx::query(
-            r#"
+/// This store's schema, and the one a restore replays.
+pub const DDL: &str = r#"
             CREATE TABLE IF NOT EXISTS cog_guard_audit_log (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                 timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -34,32 +20,26 @@ impl PostgresAuditRecorder {
                 messages JSONB,
                 response TEXT,
                 tool_call JSONB
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| cog_core::SFError::Database(e.to_string()))?;
+            );
+            CREATE INDEX IF NOT EXISTS idx_guard_audit_timestamp ON cog_guard_audit_log(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_guard_audit_verdict ON cog_guard_audit_log(verdict);
+            "#;
 
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_guard_audit_timestamp ON cog_guard_audit_log(timestamp)
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| cog_core::SFError::Database(e.to_string()))?;
+/// PostgreSQL-backed audit recorder for guardrail decisions.
+/// Stores every input check, output check, and tool call check in an
+/// append-only table for compliance, audit, and security analytics.
+pub struct PostgresAuditRecorder {
+    pool: PgPool,
+}
 
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_guard_audit_verdict ON cog_guard_audit_log(verdict)
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| cog_core::SFError::Database(e.to_string()))?;
+impl PostgresAuditRecorder {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
 
-        Ok(())
+    /// Auto-create the required table and indexes if they do not exist.
+    pub async fn init_schema(&self) -> cog_core::SFResult<()> {
+        crate::schema_ddl::apply(&self.pool, DDL).await
     }
 
     fn hash_input(messages: &[Message]) -> String {

@@ -38,6 +38,21 @@ const ROW_COLUMNS: &str =
     "id, subject, submitted_by, submitted_at, payload, evidence_refs, task_id";
 
 /// PostgreSQL taste intent store.
+/// This store's schema, and the one a restore replays.
+pub const DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS cog_taste_intents (
+                id            UUID        PRIMARY KEY,
+                subject       TEXT        NOT NULL,
+                submitted_by  TEXT        NOT NULL,
+                submitted_at  TIMESTAMPTZ NOT NULL,
+                payload       JSONB       NOT NULL,
+                evidence_refs JSONB       NOT NULL DEFAULT '[]'::jsonb,
+                status        TEXT        NOT NULL,
+                task_id       TEXT,
+                disposed_at   TIMESTAMPTZ
+            );
+"#;
+
 #[derive(Clone)]
 pub struct PostgresTasteIntentStore {
     pool: PgPool,
@@ -50,52 +65,7 @@ impl PostgresTasteIntentStore {
 
     /// Auto-create the table and index if they do not exist.
     pub async fn init_schema(&self) -> SFResult<()> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS cog_taste_intents (
-                id            UUID        PRIMARY KEY,
-                subject       TEXT        NOT NULL,
-                submitted_by  TEXT        NOT NULL,
-                submitted_at  TIMESTAMPTZ NOT NULL,
-                payload       JSONB       NOT NULL,
-                evidence_refs JSONB       NOT NULL DEFAULT '[]'::jsonb,
-                status        TEXT        NOT NULL,
-                task_id       TEXT,
-                disposed_at   TIMESTAMPTZ
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        // Additive migration for the material references. A row written before
-        // the column existed gets the empty list, which is exactly what a
-        // submission that named no material means — so an old row stays
-        // readable and stays honest about having offered nothing, and no
-        // rewrite of the table is needed to say so.
-        sqlx::query(
-            "ALTER TABLE cog_taste_intents \
-                 ADD COLUMN IF NOT EXISTS evidence_refs JSONB NOT NULL DEFAULT '[]'::jsonb",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        // Readers ask for one status in submission order, which is the order
-        // both of them act in: oldest first, so a submission cannot be starved
-        // by newer ones arriving every round.
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_cog_taste_intents_status
-                ON cog_taste_intents(status, submitted_at)
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        Ok(())
+        crate::schema_ddl::apply(&self.pool, DDL).await
     }
 
     /// Read one row into the shape callers see, or report why it cannot be one.

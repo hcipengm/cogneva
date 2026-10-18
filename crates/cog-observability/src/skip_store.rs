@@ -39,6 +39,18 @@ use sqlx::{PgPool, Row};
 /// revision it may have asked for — so the calls behind one decision are one or
 /// two depending on how the loop would have ended, which nothing here can know.
 /// Multiplying by a fixed number would put a figure in the account that no
+/// This store's schema, and the one a restore replays.
+pub const DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS cog_llm_skip (
+                id     UUID PRIMARY KEY,
+                ts     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                stage  TEXT NOT NULL,
+                reason TEXT NOT NULL
+            )
+;
+CREATE INDEX IF NOT EXISTS idx_cog_llm_skip_ts ON cog_llm_skip (ts);
+"#;
+
 /// measurement produced; a reader that wants calls has to say how it got there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageSkip {
@@ -65,25 +77,7 @@ impl LlmSkipStore {
     }
 
     pub async fn init_schema(&self) -> anyhow::Result<()> {
-        sqlx::query(&format!(
-            r#"
-            CREATE TABLE IF NOT EXISTS {SKIP_TABLE} (
-                id     UUID PRIMARY KEY,
-                ts     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                stage  TEXT NOT NULL,
-                reason TEXT NOT NULL
-            )
-            "#
-        ))
-        .execute(&self.pool)
-        .await?;
-        // The window scan is the only read this table has, so the index is on
-        // the one column every query filters by.
-        sqlx::query(&format!(
-            "CREATE INDEX IF NOT EXISTS idx_{SKIP_TABLE}_ts ON {SKIP_TABLE} (ts)"
-        ))
-        .execute(&self.pool)
-        .await?;
+        sqlx::raw_sql(DDL).execute(&self.pool).await?;
         Ok(())
     }
 

@@ -1503,6 +1503,13 @@ async fn restore_and_compare(
     tracing::info!(database = DRILL_DATABASE, "drill: migrations applied");
 
     let scratch = PgPool::connect(scratch_url).await?;
+    // 迁移只建得出迁移文件里有的表；各 store 首次启动时自己建的那批表也要先建，
+    // 否则下一段的 COPY 会在第一张缺失的表上失败——那是镜像建不出自己的结构，
+    // 不是包不可恢复。
+    crate::schema_bundle::apply(&scratch)
+        .await
+        .map_err(|e| format!("drill: schema bundle failed: {e}"))?;
+    tracing::info!("drill: store schema applied");
     let pg_dir = pkg_dir.join("pg");
     if !pg_dir.exists() {
         return Err("包里没有 pg 段，这次演练无表可恢复".into());

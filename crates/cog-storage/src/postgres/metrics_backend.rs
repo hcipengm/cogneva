@@ -74,7 +74,50 @@ pub const GAUGE_LATEST_SQL: &str = r#"
             WHERE series.labels IS NOT NULL
             "#;
 
-/// PostgreSQL-backed metrics backend.
+/// This store's schema, and the one a restore replays.
+pub const DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS cog_metrics_samples (
+                id SERIAL PRIMARY KEY,
+                metric_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                value DOUBLE PRECISION NOT NULL,
+                labels JSONB NOT NULL DEFAULT '{}',
+                timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+;
+CREATE INDEX IF NOT EXISTS idx_cog_metrics_name_type ON cog_metrics_samples(name, metric_type)
+;
+CREATE INDEX IF NOT EXISTS idx_cog_metrics_timestamp ON cog_metrics_samples(timestamp)
+;
+CREATE INDEX IF NOT EXISTS idx_cog_metrics_latest_series
+                ON cog_metrics_samples(name, metric_type, labels, timestamp DESC)
+                INCLUDE (value)
+;
+CREATE TABLE IF NOT EXISTS cog_metric_counter_totals (
+                name TEXT NOT NULL,
+                labels JSONB NOT NULL DEFAULT '{}',
+                value DOUBLE PRECISION NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (name, labels)
+            )
+;
+CREATE TABLE IF NOT EXISTS cog_metric_histogram_buckets (
+                name TEXT NOT NULL,
+                labels JSONB NOT NULL DEFAULT '{}',
+                bucket INTEGER NOT NULL,
+                observations BIGINT NOT NULL,
+                PRIMARY KEY (name, labels, bucket)
+            )
+;
+CREATE TABLE IF NOT EXISTS cog_metric_histogram_sums (
+                name TEXT NOT NULL,
+                labels JSONB NOT NULL DEFAULT '{}',
+                sum DOUBLE PRECISION NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (name, labels)
+            );
+"#;
+
 pub struct PostgresMetricsBackend {
     pool: PgPool,
 }
@@ -86,133 +129,7 @@ impl PostgresMetricsBackend {
 
     /// Auto-create the required table and indexes if they do not exist.
     pub async fn init_schema(&self) -> SFResult<()> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS cog_metrics_samples (
-                id SERIAL PRIMARY KEY,
-                metric_type TEXT NOT NULL,
-                name TEXT NOT NULL,
-                value DOUBLE PRECISION NOT NULL,
-                labels JSONB NOT NULL DEFAULT '{}',
-                timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_cog_metrics_name_type ON cog_metrics_samples(name, metric_type)
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_cog_metrics_timestamp ON cog_metrics_samples(timestamp)
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        // The other half of the counter-totals decision below: gauges do read
-        // their current value out of this log, because a gauge's newest sample
-        // *is* its value, so the per-series read is on the same path a scrape
-        // endpoint hits continuously. `(name, metric_type)` alone cannot order
-        // that read, so the planner sorted every sample of the series --
-        // measured at 124,631 rows returning 32, external merge of 8 MB to a
-        // temporary file, 1.7 s -- to answer a question whose answer is one row
-        // per series. Labels and the descending timestamp after the equality
-        // columns are what turn both parts of that read into one index descent
-        // per series: the label walk uses the labels column, the newest-sample
-        // probe the descending timestamp, and `value` rides along so neither
-        // has to visit the heap. The two are held together by
-        // `GAUGE_LATEST_SQL`, which is written so that no plan can spend more
-        // than one row per series on them, whatever the planner makes of this
-        // index's cost.
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_cog_metrics_latest_series
-                ON cog_metrics_samples(name, metric_type, labels, timestamp DESC)
-                INCLUDE (value)
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        // Cumulative counter totals live in their own row per label set and are
-        // incremented in place. Deriving them from the sample log instead would
-        // mean an aggregate over every sample ever written -- hundreds of
-        // megabytes and seconds of latency -- on a path a scrape endpoint hits
-        // continuously. `labels` is JSONB, whose btree equality is canonical, so
-        // the primary key does not depend on caller key ordering.
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS cog_metric_counter_totals (
-                name TEXT NOT NULL,
-                labels JSONB NOT NULL DEFAULT '{}',
-                value DOUBLE PRECISION NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (name, labels)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        // Histogram buckets are accumulations for the same reason counters are,
-        // and live one row per (series, bucket) rather than as an array column:
-        // an array would have to be grown in place when an observation lands
-        // above the top bound, and Postgres array element assignment is not
-        // available in the upsert form this path needs. A row per bucket makes
-        // the increment uniform and leaves no separate overflow column to keep
-        // in step with the count it belongs to.
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS cog_metric_histogram_buckets (
-                name TEXT NOT NULL,
-                labels JSONB NOT NULL DEFAULT '{}',
-                bucket INTEGER NOT NULL,
-                observations BIGINT NOT NULL,
-                PRIMARY KEY (name, labels, bucket)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        // The sum of observations has no bucket to live in — it is not a count
-        // and cannot be recovered from the bucket counts without the raw values.
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS cog_metric_histogram_sums (
-                name TEXT NOT NULL,
-                labels JSONB NOT NULL DEFAULT '{}',
-                sum DOUBLE PRECISION NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (name, labels)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))?;
-
-        // The table starts empty on purpose. Seeding it from the counter samples
-        // already logged would restore every series ever recorded, and the ones
-        // keyed on an object id never recur — the exposition would carry
-        // thousands of series that stopped moving long ago. A counter that
-        // restarts at zero is an event Prometheus reads natively; resurrecting
-        // dead series is not.
-        Ok(())
+        crate::schema_ddl::apply(&self.pool, DDL).await
     }
 
     /// Add one observation to the bucket it falls in.

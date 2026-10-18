@@ -13,7 +13,8 @@ use cog_core::{
 
 // ─── DDL ───
 
-const OBSERVABILITY_DDL: &str = r#"
+/// This store's schema, and the one a restore replays.
+pub const OBSERVABILITY_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS cog_observability_events (
     id          SERIAL PRIMARY KEY,
     event_type  TEXT        NOT NULL,
