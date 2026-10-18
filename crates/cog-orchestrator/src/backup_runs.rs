@@ -206,28 +206,15 @@ const READOUT_READERS: [(BackupReadout, ReadoutReader); BackupReadout::ALL.len()
     ),
     (
         BackupReadout::Kept,
-        ReadoutReader::Unread {
-            why: "read with keep_target: a retention pass that keeps nothing is invisible to a \
-                  count of runs, since the run still succeeded. Owed a rule; its absence means the \
-                  newest successful run was older than any package age recorded, which the rule \
-                  reading it would have to say.",
-        },
+        ReadoutReader::Rule("backup_retention_left_more_than_its_target"),
     ),
     (
         BackupReadout::KeepTarget,
-        ReadoutReader::Unread {
-            why: "the bound that kept is measured against. Published so that the pair is read \
-                  together rather than by comparing a count against a number baked into a rule; \
-                  owed a rule that reads the two against each other.",
-        },
+        ReadoutReader::Rule("backup_retention_left_more_than_its_target"),
     ),
     (
         BackupReadout::OldestKeptAgeSeconds,
-        ReadoutReader::Unread {
-            why: "the half a count cannot falsify: packages can stop being pruned while every run \
-                  keeps succeeding, and then the surviving set ages without any other value on this \
-                  series moving. Owed a rule.",
-        },
+        ReadoutReader::Rule("backup_oldest_package_past_its_retention"),
     ),
     (
         BackupReadout::NewestPackageBytes,
