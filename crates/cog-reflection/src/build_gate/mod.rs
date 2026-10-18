@@ -1699,12 +1699,7 @@ impl BuildGate {
     }
 
     /// A permit with the accounting of one kind of hold.
-    fn permit(
-        self: &Arc<Self>,
-        what: &str,
-        held: Vec<std::fs::File>,
-        kind: HoldKind,
-    ) -> BuildPermit {
+    fn permit(self: &Arc<Self>, what: &str, held: Vec<GateLock>, kind: HoldKind) -> BuildPermit {
         BuildPermit {
             gate: Arc::clone(self),
             held,
@@ -1738,9 +1733,19 @@ impl BuildGate {
             // Why this pass got nowhere, when it was not the slot count that
             // stopped it: which wall, and who was holding what put it there.
             let mut blocked_by: Option<(RefusedBy, String)> = None;
+            // A slot whose lock call failed for a reason that is not a holder.
+            // Kept apart from `blocked_by` because the two say different things:
+            // one is somebody working, the other is the gate not being able to
+            // ask.
+            let mut unavailable: Option<std::io::Error> = None;
             for slot in 0..bound {
-                let Some(file) = lock_slot(&self.dir, slot) else {
-                    continue;
+                let file = match lock_slot(&self.dir, slot) {
+                    Ok(file) => file,
+                    Err(SlotLock::Held) => continue,
+                    Err(SlotLock::Unavailable(error)) => {
+                        unavailable = Some(error);
+                        continue;
+                    }
                 };
                 // The claim is what says a build is *running* as opposed to
                 // having taken a slot: an exclusion holds it alone, and while it
@@ -1810,7 +1815,14 @@ impl BuildGate {
                 // carries what did instead.
                 let held = match blocked_by.as_ref() {
                     Some((_, holder)) => holder.clone(),
-                    None => holder_report(&self.dir, bound),
+                    // Neither a holder nor a wait: the kernel would not answer
+                    // whether the slot is free. Saying so turns a refusal that
+                    // would otherwise name the last work to have written its
+                    // line into a refusal that names its own cause.
+                    None => match &unavailable {
+                        Some(error) => format!("the slot could not be locked: {error}"),
+                        None => holder_report(&self.dir, bound),
+                    },
                 };
                 // The wall's own sentence, whenever the wall is what stopped the
                 // ask: four walls, four sentences, so the same wall reads the
@@ -1888,11 +1900,11 @@ enum HoldKind {
 #[derive(Debug)]
 pub struct BuildPermit {
     gate: Arc<BuildGate>,
-    /// The locked files, when slots were actually taken. Closing them -- which
-    /// drop does -- is what releases the locks. Empty for one of two reasons,
-    /// told apart by `taken_at`: the gate is not in force, or the permit is an
-    /// exclusion over a gate that bounds nothing.
-    held: Vec<std::fs::File>,
+    /// The locked files, when slots were actually taken. Their locks go when
+    /// the permit does. Empty for one of two reasons, told apart by `taken_at`:
+    /// the gate is not in force, or the permit is an exclusion over a gate that
+    /// bounds nothing.
+    held: Vec<GateLock>,
     /// When the slot was taken, set for a build that took one and read only
     /// there: a permit that holds nothing was never counted as a build that ran,
     /// so it contributes no hold to the readings either.
@@ -1913,24 +1925,9 @@ impl Drop for BuildPermit {
         if self.held.is_empty() {
             return;
         }
-        // Released by the descriptor rather than by closing it. A `flock` lock
-        // belongs to the open file description, and this process is not the
-        // only holder of that description: a child forked while the slot was
-        // held carries a copy in its own descriptor table until it reaches
-        // `exec` (the close-on-exec flag fires there, not at the fork), and a
-        // `dup` can leave a second reference behind in this process. Closing
-        // the permit's handles therefore does not free the slot; it frees it
-        // once the last copy goes away, and the next builder arriving inside
-        // that window is told the slot is still taken. Unlocking reaches the
-        // description itself, so the slot is free for the very next ask.
-        #[cfg(unix)]
-        for file in &self.held {
-            use std::os::unix::io::AsRawFd;
-            // SAFETY: `flock` touches only this process's descriptor table for
-            // a descriptor this permit owns, and an unlock carries no memory
-            // obligations.
-            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-        }
+        // The locks go with the values in `held`, by [`GateLock`]'s drop rather
+        // than by these handles closing: see there for why the distinction is
+        // the difference between a release and a wait.
         match self.kind {
             HoldKind::Building => {
                 self.gate.in_flight.fetch_sub(1, Ordering::Relaxed);
@@ -2023,14 +2020,23 @@ fn read_holder_at(path: &Path) -> Option<(Holder, std::time::Duration)> {
     use std::os::unix::io::AsRawFd;
 
     let file = open_gate_file(path, false)?;
-    // SAFETY: as in `lock_slot` — flock touches only this process's descriptor
-    // table for a descriptor this scope owns, and EWOULDBLOCK is the expected
-    // answer.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        // Nobody holds it, so the line below is a leftover.
-        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-        return None;
+    loop {
+        // SAFETY: as in `lock_slot` — flock touches only this process's
+        // descriptor table for a descriptor this scope owns, and EWOULDBLOCK is
+        // the expected answer.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            // Nobody holds it, so the line below is a leftover.
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+            return None;
+        }
+        // A signal is not a holder. Asked again rather than read as one: the
+        // record below is only the truth about a file that is actually held, and
+        // naming it otherwise blames whoever wrote the line last.
+        if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        break;
     }
     let mut text = String::new();
     (&file).read_to_string(&mut text).ok()?;
@@ -2226,7 +2232,7 @@ fn open_gate_dir(dir: &Path) {
 
 /// Takes the exclusive lock on one slot file, or reports that someone else has it.
 #[cfg(unix)]
-fn lock_slot(dir: &Path, slot: usize) -> Option<std::fs::File> {
+fn lock_slot(dir: &Path, slot: usize) -> Result<GateLock, SlotLock> {
     file_lock(
         &dir.join(format!("slot-{slot}.lock")),
         libc::LOCK_EX | libc::LOCK_NB,
@@ -2236,29 +2242,29 @@ fn lock_slot(dir: &Path, slot: usize) -> Option<std::fs::File> {
 /// Without `flock` there is no cross-process bound to enforce, so the gate
 /// refuses to pretend it has one.
 #[cfg(not(unix))]
-fn lock_slot(_dir: &Path, _slot: usize) -> Option<std::fs::File> {
-    None
+fn lock_slot(_dir: &Path, _slot: usize) -> Result<GateLock, SlotLock> {
+    Err(SlotLock::Held)
 }
 
 /// Takes the claim a build holds while it runs, shared with the other builds.
 #[cfg(unix)]
-fn lock_claim_shared(dir: &Path) -> Option<std::fs::File> {
-    file_lock(&dir.join(CLAIM_FILE), libc::LOCK_SH | libc::LOCK_NB)
+fn lock_claim_shared(dir: &Path) -> Option<GateLock> {
+    file_lock(&dir.join(CLAIM_FILE), libc::LOCK_SH | libc::LOCK_NB).ok()
 }
 
 #[cfg(not(unix))]
-fn lock_claim_shared(_dir: &Path) -> Option<std::fs::File> {
+fn lock_claim_shared(_dir: &Path) -> Option<GateLock> {
     None
 }
 
 /// Takes the claim alone: while this is held no build can start.
 #[cfg(unix)]
-fn lock_claim_exclusive(dir: &Path) -> Option<std::fs::File> {
-    file_lock(&dir.join(CLAIM_FILE), libc::LOCK_EX | libc::LOCK_NB)
+fn lock_claim_exclusive(dir: &Path) -> Option<GateLock> {
+    file_lock(&dir.join(CLAIM_FILE), libc::LOCK_EX | libc::LOCK_NB).ok()
 }
 
 #[cfg(not(unix))]
-fn lock_claim_exclusive(_dir: &Path) -> Option<std::fs::File> {
+fn lock_claim_exclusive(_dir: &Path) -> Option<GateLock> {
     None
 }
 
@@ -2376,17 +2382,83 @@ fn write_gate_file(path: &Path, text: &str) -> std::io::Result<()> {
 /// takes that lock before it removes anything, so the names go while each one is
 /// provably empty.
 #[cfg(unix)]
-fn file_lock(path: &Path, how: libc::c_int) -> Option<std::fs::File> {
-    let file = open_gate_file(path, true)?;
+fn file_lock(path: &Path, how: libc::c_int) -> Result<GateLock, SlotLock> {
+    let file = open_gate_file(path, true).ok_or(SlotLock::Held)?;
     use std::os::unix::io::AsRawFd;
-    // SAFETY: flock only touches the descriptor table of this process for a
-    // descriptor this scope owns; EWOULDBLOCK is the expected "someone else has
-    // it" answer and carries no memory obligations.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), how) };
-    if rc == 0 {
-        Some(file)
-    } else {
-        None
+    loop {
+        // SAFETY: flock only touches the descriptor table of this process for a
+        // descriptor this scope owns; EWOULDBLOCK is the expected "someone else
+        // has it" answer and carries no memory obligations.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), how) };
+        if rc == 0 {
+            return Ok(GateLock(file));
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            // Somebody else has it: the one answer that may be read as "busy".
+            Some(code) if code == libc::EWOULDBLOCK => return Err(SlotLock::Held),
+            // A signal arrived before the call could decide. This is a retry,
+            // not a refusal: reading it as "taken" turned the gate's own next
+            // ask into a refusal of a slot that was free, and the refusal named
+            // whoever had written its line there last.
+            Some(code) if code == libc::EINTR => continue,
+            // Anything else -- a lock table with no room, a descriptor the
+            // kernel will not act on -- is neither a holder nor a wait, and is
+            // kept as itself so a refusal can say what it actually met.
+            _ => return Err(SlotLock::Unavailable(error)),
+        }
+    }
+}
+
+/// Why a slot could not be taken.
+///
+/// The distinction is the whole point: [`Held`](Self::Held) is another work
+/// doing something, and every reading built on a refusal means "the host is
+/// busy" only for that one. A call the kernel refused is the gate failing to
+/// ask, and folding it into "taken" produces a refusal that names the last work
+/// to have written its line into the slot as though it were the cause.
+#[derive(Debug)]
+enum SlotLock {
+    /// Somebody else holds it.
+    Held,
+    /// The kernel refused the call itself.
+    Unavailable(std::io::Error),
+}
+
+/// One of the gate's locks, released when the value goes.
+///
+/// `flock` belongs to the open file description, and closing a handle is not the
+/// same as releasing the lock: a child forked while it is held carries a copy of
+/// the description into its own table until it reaches `exec` (close-on-exec
+/// fires there, not at the fork), and a `dup` leaves a second reference for as
+/// long as its owner keeps it. A lock released by closing therefore stays taken
+/// until the last copy goes -- so the gate's own next ask, microseconds later,
+/// is refused by the copy of a lock the gate has already given up. That is not a
+/// theory: on a host with one slot a single leaked child pinned it indefinitely,
+/// and the tests that drop a permit and immediately ask again failed in CI.
+/// Unlocking here reaches the description itself, so the lock ends with the
+/// value that took it.
+#[derive(Debug)]
+struct GateLock(std::fs::File);
+
+impl std::ops::Deref for GateLock {
+    type Target = std::fs::File;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for GateLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: `flock` touches only this process's descriptor table for
+            // a descriptor this value owns, and an unlock carries no memory
+            // obligations.
+            unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+        }
     }
 }
 
