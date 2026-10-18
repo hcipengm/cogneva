@@ -38,7 +38,8 @@ use cog_observability::config::ObservabilityExportersConfig;
 use cog_observability::logs::{init_subscriber_with_pusher, LokiBackgroundPusher, LokiPushClient};
 use cog_observability::metrics::PrometheusMetricsBackend;
 use cog_observability::usage_store::{
-    LlmOrigin, LlmUsageRecord, LlmUsageStore, PaceEvidence, PaceUpstreamEvidence, LLM_ORIGIN_HEADER,
+    LlmExchangeRecord, LlmOrigin, LlmUsageRecord, LlmUsageStore, PaceEvidence,
+    PaceUpstreamEvidence, LLM_ORIGIN_HEADER,
 };
 use serde::{Deserialize, Serialize};
 
@@ -2684,6 +2685,79 @@ struct RequestSide {
     /// 那一列可空正是因为两者修法相反——一个说明装配面还没接上，一个是空提示词——
     /// 所以量不出来的路径一律传 `None`，绝不填 0 冒充量过。
     estimated_input: Option<u64>,
+    /// 发出去的那份字节，逐字节留底。`None` 是"这条路径手上没有 body"（探测类调用
+    /// 自己拼 JSON），不是"body 为空"——空 body 是另一种形状，存成 `Some(vec![])`。
+    ///
+    /// 用 `Arc` 而不是 `Vec`：`Drop` 那条路会把它克隆一次（活着的流与正在被丢弃的
+    /// 流不能同时拥有同一份），而一次请求的 body 常常是几十 KB。
+    request_body: Option<Arc<Vec<u8>>>,
+}
+
+/// 留底表的单边上限。流式响应的原文扫描本来就只留 1 MiB（见 [`UsageScanner::feed`]），
+/// 请求侧对齐同一个界：两边都是"一次调用的规模"，而把它调大只会让一张诊断表变成
+/// 库里最大的一张。
+const EXCHANGE_BODY_CAP: usize = 1024 * 1024;
+
+/// 留底保留天数。定在 30 天：足够跨过"改完之后等一次滚动再看效果"的周期，也让表
+/// 的体积有个上界（按今天 425 次成功调用约 26 MB/天算，满打满算不到 1 GB）。
+const EXCHANGE_KEEP_DAYS: i64 = 30;
+
+/// 留底开关。默认开，`COGNEVA_GATEWAY_EXCHANGE_STORE=0` 关——关掉之后台账照写，
+/// 只是正文不落库；这是给"这台部署不该把提示词写进数据库"的准备，而不是故障开关。
+fn exchange_store_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("COGNEVA_GATEWAY_EXCHANGE_STORE") {
+        Ok(v) => !matches!(v.trim(), "0" | "false" | "off" | "no"),
+        Err(_) => true,
+    })
+}
+
+/// 留底正文里不该出现的凭证形状。上游的 key 在请求头里，正常不会进 body；但调用方
+/// 可能把自家的 token 写进提示词（贴代码、贴配置），而这张表的读者比请求路径多得多。
+///
+/// 只抹看起来像密钥的那一段，不整段丢弃：丢掉整条正文等于把这一次调用从留底里删掉，
+/// 而"这里有一处密钥"本身是值得知道的事。
+fn redact_exchange(text: &str) -> String {
+    use std::sync::OnceLock;
+    static PATTERNS: OnceLock<Vec<regex::Regex>> = OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        [
+            r"(?i)(bearer\s+)[A-Za-z0-9._\-]{16,}",
+            r"\bsk-[A-Za-z0-9_\-]{16,}",
+            r#"(?i)("(?:api_key|apikey|authorization|access_token|refresh_token|secret)"\s*:\s*")[^"]{8,}(")"#,
+            r"(?i)(\b(?:api[_-]?key|access[_-]?token|secret)\s*[=:]\s*)[A-Za-z0-9._\-]{16,}",
+        ]
+        .iter()
+        .filter_map(|p| regex::Regex::new(p).ok())
+        .collect()
+    });
+    let mut out = text.to_string();
+    for re in patterns.iter() {
+        out = re.replace_all(&out, "${1}[redacted]${2}").into_owned();
+    }
+    out
+}
+
+/// 把一段字节切成"能存的那一份 + 有没有被切"。按字符边界切，否则 PostgreSQL 的
+/// `TEXT` 会拒掉半截 UTF-8，而一次 1 MiB 的截断正好会切在中文中间。
+fn capped_body(raw: &[u8], cap: usize) -> (String, bool) {
+    let text = String::from_utf8_lossy(raw);
+    if text.len() <= cap {
+        return (text.into_owned(), false);
+    }
+    let mut cut = cap;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    (text[..cut].to_string(), true)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    hex::encode(h.finalize())
 }
 
 /// 一次调用的 token 计量落点（三处同写）：Prometheus counter、ClickHouse 明细、
@@ -2781,6 +2855,80 @@ async fn record_llm_tokens(
             pace: None,
         },
     );
+}
+
+/// 把这次调用的两边字节落进留底表。
+///
+/// 与用量行分开写：用量是每窗口边界都要读的窄行，正文是"某一次调用到底问了什么"
+/// 才去读的宽行。写失败只 WARN——留底是观测，不是请求路径的一部分，和记账同一条
+/// 降级约定。
+///
+/// `response` 是**上游回来的原始字节**（流式就是整段 SSE 转录），不是重新拼的
+/// 正文：重拼要经过一层协议解释，而解释会随上游习惯变；留底的价值正在于它不经解释。
+async fn record_exchange(
+    state: &AppState,
+    upstream: &LlmUpstream,
+    request: &RequestSide,
+    result: &str,
+    response: Option<&[u8]>,
+    latency_ms: u64,
+) {
+    if !exchange_store_enabled() {
+        return;
+    }
+    let Some(store) = state.pool_obs.usage.clone() else {
+        return;
+    };
+    // 请求侧手上没有字节（探测类路径），这张表就没什么可留的：一条只有响应、
+    // 没有问题的行，既回放不了也去不了重。宁可少一行，不留半行。
+    let Some(body) = request.request_body.as_ref() else {
+        return;
+    };
+    let request_sha256 = sha256_hex(body);
+    let (request_body, request_cut) = capped_body(body, EXCHANGE_BODY_CAP);
+    let (response_body, response_cut) = match response {
+        Some(bytes) => {
+            let (text, cut) = capped_body(bytes, EXCHANGE_BODY_CAP);
+            (Some(text), cut)
+        }
+        None => (None, false),
+    };
+    let truncated = match (request_cut, response_cut) {
+        (true, true) => "both",
+        (true, false) => "request",
+        (false, true) => "response",
+        (false, false) => "",
+    };
+    // 模型名从请求体里读：上游条目的 `model` 是被改写之后的真相，但调用方声明的
+    // 那个名字在改写中丢了；两个都留着才回答得了"哪一边的模型在花钱"。
+    let model = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+        .unwrap_or_else(|| upstream.model.clone());
+    let record = LlmExchangeRecord {
+        upstream: LlmHealthTable::key(upstream),
+        api_style: upstream.api_style.clone(),
+        model,
+        actor: request.actor.clone(),
+        origin: request.origin.clone(),
+        task: request.task.clone(),
+        result: result.to_string(),
+        latency_ms,
+        request_sha256,
+        response_sha256: response.map(sha256_hex),
+        request_bytes: body.len() as u64,
+        response_bytes: response.map(|b| b.len() as u64).unwrap_or(0),
+        request_body: Some(redact_exchange(&request_body)),
+        response_body: response_body.map(|t| redact_exchange(&t)),
+        truncated: truncated.to_string(),
+    };
+    // 与用量行同一条写法：spawn 出去。留底挂在响应流的尾巴上，而调用方的流要到
+    // 这里返回才真正结束——为一次诊断写入多等一个往返，等于让每个用户替观测买单。
+    tokio::spawn(async move {
+        if let Err(e) = store.record_exchange(&record).await {
+            tracing::warn!(error = %e, "LLM 调用留底写入失败（用量台账不受影响）");
+        }
+    });
 }
 
 /// 从一条 SSE `data:` 负载或非流式 JSON body 里提取 token usage。
@@ -3007,20 +3155,26 @@ impl UsageRecorder {
     /// Claiming here rather than after the write is deliberate: a stream
     /// dropped mid-write has still had its reading taken, and writing it twice
     /// would be worse than writing it once.
-    fn reading(&mut self, abandoned: bool) -> UsageReading {
+    fn reading(&mut self, abandoned: bool) -> (UsageReading, Vec<u8>) {
         self.claimed = true;
         let mut s = self.scanner.lock().unwrap();
         s.finish();
-        UsageReading {
-            input: s.tokens_input,
-            output: s.tokens_output,
-            cached: s.tokens_cached,
-            outcome: if abandoned {
-                s.outcome_abandoned()
-            } else {
-                s.outcome()
+        // 响应原文在这里一并取走：扫描器本来就留着（上限 1 MiB，见 `feed`），
+        // 留底要的就是它，不必再从流里抄第二份。
+        let raw = s.raw.clone();
+        (
+            UsageReading {
+                input: s.tokens_input,
+                output: s.tokens_output,
+                cached: s.tokens_cached,
+                outcome: if abandoned {
+                    s.outcome_abandoned()
+                } else {
+                    s.outcome()
+                },
             },
-        }
+            raw,
+        )
     }
 }
 
@@ -3029,7 +3183,7 @@ impl Drop for UsageRecorder {
         if self.claimed {
             return;
         }
-        let reading = self.reading(true);
+        let (reading, raw) = self.reading(true);
         let state = self.state.clone();
         let upstream = self.upstream.clone();
         // Cloned, not taken: an empty request side is a shape this type exists to
@@ -3044,6 +3198,17 @@ impl Drop for UsageRecorder {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 record_llm_tokens(&state, &upstream, "ok", reading, latency_ms, &request).await;
+                // 被丢弃的流也要留底：它的正文是"这次调用问到一半没了"的唯一现场，
+                // 而用量行只留下三个计数。
+                record_exchange(
+                    &state,
+                    &upstream,
+                    &request,
+                    "abandoned",
+                    Some(&raw),
+                    latency_ms,
+                )
+                .await;
             });
         }
     }
@@ -3090,7 +3255,7 @@ fn wrap_usage_scan(
         claimed: false,
     };
     let finalize = futures::stream::once(async move {
-        let reading = recorder.reading(false);
+        let (reading, raw) = recorder.reading(false);
         let latency_ms = recorder.start.elapsed().as_millis() as u64;
         record_llm_tokens(
             &recorder.state,
@@ -3099,6 +3264,15 @@ fn wrap_usage_scan(
             reading,
             latency_ms,
             &recorder.request,
+        )
+        .await;
+        record_exchange(
+            &recorder.state,
+            &recorder.upstream,
+            &recorder.request,
+            "ok",
+            Some(&raw),
+            latency_ms,
         )
         .await;
         Ok(axum::body::Bytes::new())
@@ -4753,6 +4927,9 @@ async fn stream_forward(
         // 那一份（模型名与兼容改写都已落进 body），而它一旦被 `.body(body)` 移走就
         // 只剩流里那份可以配对，重算就要把装配面搬进响应侧——那是另一条会漂移的路。
         let estimated_input = price_request(&String::from_utf8_lossy(&body));
+        // 留底取的就是即将发出去的这一份：模型名与兼容改写都已落进 body，它一旦被
+        // `.body(body)` 移走，这次调用说的"问了什么"就只剩流里那份响应能反推。
+        let request_body = Arc::new(body.clone());
 
         let start = std::time::Instant::now();
         let builder = state
@@ -4804,6 +4981,23 @@ async fn stream_forward(
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
             let text = resp.text().await.unwrap_or_default();
+            // 上游拒了这一份请求：问题与答复都留底。这是"为什么被拒"唯一不经解释的
+            // 现场——拒绝分类是从这段文本里解析出来的，解析错的争议要靠它来判。
+            record_exchange(
+                &state,
+                upstream,
+                &RequestSide {
+                    actor: actor.clone(),
+                    origin: origin.clone(),
+                    task: task.clone(),
+                    estimated_input: Some(estimated_input),
+                    request_body: Some(request_body.clone()),
+                },
+                "error",
+                Some(text.as_bytes()),
+                start.elapsed().as_millis() as u64,
+            )
+            .await;
             let quota_reset = parse_quota_reset(&text, retry_after.as_deref());
             let quota_window = parse_quota_window_secs(&text);
             // 请求形态错误（400/404/422：坏消息链、不支持的参数、端点不存在）
@@ -4898,6 +5092,7 @@ async fn stream_forward(
                 origin: origin.clone(),
                 task: task.clone(),
                 estimated_input: Some(estimated_input),
+                request_body: Some(request_body.clone()),
             },
             asked_for_usage,
         );
@@ -5347,6 +5542,8 @@ async fn call_one_upstream(
             origin: origin.to_string(),
             task: None,
             estimated_input: Some(estimated_input),
+            // 这条路自己拼 JSON，不经过可留底的那份字节。
+            request_body: None,
         };
         let resp = state
             .client
@@ -5407,6 +5604,8 @@ async fn call_one_upstream(
         origin: origin.to_string(),
         task: None,
         estimated_input: Some(estimated_input),
+        // 这条路自己拼 JSON，不经过可留底的那份字节。
+        request_body: None,
     };
     let resp = state
         .client
@@ -6825,6 +7024,21 @@ async fn build_pool_observability(
             Ok(store) => match store.init_schema().await {
                 Ok(()) => {
                     tracing::info!("LLM token 计量明细已落 PostgreSQL");
+                    // 留底表的体积由正文长度决定，不由调用数决定；不设保留期，它会
+                    // 长成库里最大的一张。启动时清一次：进程滚得勤，漏一拍只少清一天。
+                    match store.prune_exchanges(EXCHANGE_KEEP_DAYS).await {
+                        Ok(removed) if removed > 0 => {
+                            tracing::info!(
+                                removed,
+                                days = EXCHANGE_KEEP_DAYS,
+                                "LLM 调用留底过期行已清理"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, "LLM 调用留底清理失败（不影响启动）");
+                        }
+                    }
                     Some(Arc::new(store))
                 }
                 Err(e) => {
@@ -7150,6 +7364,39 @@ mod tests {
             requires_temperature_one: None,
             supports_usage_in_streaming: None,
         }
+    }
+
+    /// 留底正文里抹掉的是密钥那一段，不是整条正文：整条丢掉等于把这次调用从留底里
+    /// 删掉，而"这里有一处密钥"本身是值得知道的事。
+    #[test]
+    fn an_exchange_body_drops_the_credential_and_keeps_the_prompt() {
+        let raw = r#"{"api_key":"sk-abcdefghijklmnopqrstuvwx","text":"keep me"}"#;
+        let redacted = redact_exchange(raw);
+        assert!(redacted.contains("keep me"), "{redacted}");
+        assert!(!redacted.contains("abcdefghijklmnopqrstuvwx"), "{redacted}");
+        assert!(redacted.contains("[redacted]"), "{redacted}");
+        // 反方向：一句没有密钥的正文原样留下。少了这格，抹掉一切也能让上面全绿。
+        let plain = r#"{"messages":[{"role":"user","content":"hello"}]}"#;
+        assert_eq!(redact_exchange(plain), plain);
+    }
+
+    /// 上限要到**字符边界**上切：PostgreSQL 的 TEXT 拒半截 UTF-8，而 1 MiB 的截断
+    /// 正好会切在中文中间。
+    #[test]
+    fn a_capped_body_is_cut_on_a_character_boundary_and_flagged() {
+        let raw = "中".repeat(10).into_bytes();
+        let (text, cut) = capped_body(&raw, 4);
+        assert!(cut, "超过上限必须标出来");
+        assert_eq!(text, "中");
+        // 恰好等于上限：不截断、也不标记。少了这格，`>` 写成 `>=` 也全绿。
+        let exact = "abcd".as_bytes().to_vec();
+        let (text, cut) = capped_body(&exact, 4);
+        assert!(!cut);
+        assert_eq!(text, "abcd");
+        // 空 body 与"没有 body"是两回事：前者留一行空正文，后者才是不写。
+        let (text, cut) = capped_body(b"", 4);
+        assert!(!cut);
+        assert_eq!(text, "");
     }
 
     /// 上游自述过何时恢复时，任何"已成定论"的状态码都降级成一次等待；没自述过
@@ -7578,6 +7825,8 @@ mod tests {
                 // 它到不到台账，在这个进程里看不见（测试的 `durable`/`usage` 都是
                 // None），所以这里断言的是计数器那一面。
                 estimated_input: Some(4),
+                // 夹具没有请求字节；留底那一支不在这格断言里。
+                request_body: None,
             },
             true,
         ));

@@ -268,6 +268,41 @@ pub struct LlmUsageRecord {
     pub pace: Option<PaceEvidence>,
 }
 
+/// One LLM exchange, bodies included.
+///
+/// The usage record beside it answers "how much"; this answers "what was
+/// asked and what came back". They are separate rows in separate tables
+/// because the two are written by the same call but read by different
+/// consumers: pacing and billing read the usage row on every window boundary
+/// and must not pay for text they never look at, while a person asking why a
+/// run burned 850k tokens reads one exchange and nothing else.
+#[derive(Debug, Clone)]
+pub struct LlmExchangeRecord {
+    pub upstream: String,
+    pub api_style: String,
+    pub model: String,
+    pub actor: String,
+    pub origin: String,
+    pub task: Option<String>,
+    /// `ok`, `abandoned` (the caller dropped the stream mid-flight), or
+    /// `error` (the upstream answered with a non-2xx body).
+    pub result: String,
+    pub latency_ms: u64,
+    /// SHA-256 of the exact bytes sent upstream, before redaction.
+    pub request_sha256: String,
+    /// SHA-256 of the response bytes; `None` when no response body existed.
+    pub response_sha256: Option<String>,
+    pub request_bytes: u64,
+    pub response_bytes: u64,
+    /// Redacted text, capped by the caller. `None` means the body was over the
+    /// cap and was not stored at all -- a truncated body would read like a
+    /// complete one to anyone replaying it.
+    pub request_body: Option<String>,
+    pub response_body: Option<String>,
+    /// Which side was dropped for size: `""`, `request`, `response`, `both`.
+    pub truncated: String,
+}
+
 /// One `(actor, upstream, api_style)` line of a window's token composition.
 ///
 /// `failed_calls` is not folded into `calls`: an error row carries zero tokens
@@ -605,6 +640,57 @@ impl LlmUsageStore {
         ))
         .execute(&self.pool)
         .await?;
+        // The exchange itself: the bytes we sent and the bytes that came back.
+        // The usage row above answers "how much did this call cost"; it cannot
+        // answer "what was asked", so a re-run, a duplicate count, a context
+        // breakdown or a regression against an old prompt all had to be
+        // re-bought from the upstream. Kept in its own table rather than in the
+        // ledger row because the ledger is read by the pacing pass on every
+        // window boundary and must stay narrow; the bodies are read rarely and
+        // only by a person asking a question about a specific call.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS gateway_llm_exchange (
+                id              UUID PRIMARY KEY,
+                ts              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                upstream        TEXT NOT NULL,
+                api_style       TEXT NOT NULL,
+                model           TEXT NOT NULL,
+                actor           TEXT NOT NULL DEFAULT 'unknown',
+                origin          TEXT NOT NULL DEFAULT 'unknown',
+                task_id         TEXT,
+                result          TEXT NOT NULL,
+                latency_ms      BIGINT NOT NULL DEFAULT 0,
+                request_sha256  TEXT NOT NULL,
+                response_sha256 TEXT,
+                request_bytes   BIGINT NOT NULL DEFAULT 0,
+                response_bytes  BIGINT NOT NULL DEFAULT 0,
+                request_body    TEXT,
+                response_body   TEXT,
+                truncated       TEXT NOT NULL DEFAULT ''
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_gateway_llm_exchange_ts ON gateway_llm_exchange (ts)",
+        )
+        .execute(&self.pool)
+        .await?;
+        // The hash index is what turns "did we already buy this exact prompt"
+        // from a full scan into a lookup; without it the question is only
+        // answerable for a window small enough to sit in memory.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_gateway_llm_exchange_req ON gateway_llm_exchange (request_sha256)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_gateway_llm_exchange_actor ON gateway_llm_exchange (actor, ts DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -648,6 +734,60 @@ impl LlmUsageStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// One exchange: the request bytes that went upstream and the response
+    /// bytes that came back.
+    ///
+    /// The two hashes are over the **raw** bytes, before any redaction, so a
+    /// duplicate is a duplicate of what was actually sent. The bodies are the
+    /// redacted text, capped by the caller; `truncated` names which side was
+    /// cut, because a body that ends early and a body that ended at the
+    /// upstream look the same once stored.
+    pub async fn record_exchange(&self, r: &LlmExchangeRecord) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO gateway_llm_exchange
+                (id, upstream, api_style, model, actor, origin, task_id, result,
+                 latency_ms, request_sha256, response_sha256, request_bytes,
+                 response_bytes, request_body, response_body, truncated)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            "#,
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(&r.upstream)
+        .bind(&r.api_style)
+        .bind(&r.model)
+        .bind(&r.actor)
+        .bind(&r.origin)
+        .bind(r.task.as_deref())
+        .bind(&r.result)
+        .bind(r.latency_ms as i64)
+        .bind(&r.request_sha256)
+        .bind(r.response_sha256.as_deref())
+        .bind(r.request_bytes as i64)
+        .bind(r.response_bytes as i64)
+        .bind(r.request_body.as_deref())
+        .bind(r.response_body.as_deref())
+        .bind(r.truncated.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Drop exchanges older than `keep_days`. Bodies are the only part of the
+    /// ledger whose size is set by the caller rather than by the request count,
+    /// so leaving them unbounded turns a diagnostic table into the largest one
+    /// in the database. Run at startup: the process is rolled often, and a
+    /// missed pass costs rows, not correctness.
+    pub async fn prune_exchanges(&self, keep_days: i64) -> anyhow::Result<u64> {
+        let done = sqlx::query(
+            "DELETE FROM gateway_llm_exchange WHERE ts < NOW() - ($1::bigint * INTERVAL '1 day')",
+        )
+        .bind(keep_days)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected())
     }
 
     /// Everything a window pacer needs about one upstream, read in one pass.
