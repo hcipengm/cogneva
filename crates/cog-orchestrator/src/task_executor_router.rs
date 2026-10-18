@@ -138,7 +138,7 @@ impl TaskExecutorRouter {
         // lost when a new pod takes over. The group name intentionally omits
         // a random UUID; Redis Streams consumer groups are persistent and a
         // restarted consumer will resume from the last acknowledged ID.
-        let group = format!("executor-loop-{workspace_id}");
+        let group = crate::ready_queue::ready_group(&workspace_id);
         // One loop instance per consumed ready stream, so the liveness name has to
         // carry the stream: a shared name would let a dead stream's consumer hide
         // behind the beats of the stream that is still being served.

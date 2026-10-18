@@ -909,6 +909,21 @@ metric_names! {
     // cog-orchestrator — task delivery.
     DAG_STALLED_SCHEDULED_RECLAIMED => "cogneva_dag_stalled_scheduled_reclaimed_total",
 
+    // The same repair, on the rows it took back while the queue still reported
+    // undelivered entries. Kept apart from the total above because the two say
+    // opposite things about the message: without a backlog the repair is
+    // acting on a message that is gone, with one it is acting on a message
+    // that may still be in line. A single total would make a backlog that
+    // never drains -- the case the wait is supposed to cover -- read exactly
+    // like the loss it is meant to distinguish.
+    DAG_STALLED_SCHEDULED_RECLAIMED_WITH_BACKLOG => "cogneva_dag_stalled_scheduled_reclaimed_with_backlog_total",
+
+    // Rows the repair left in `Scheduled` because their queue reports
+    // undelivered entries. This is the other half of the pair above: it is the
+    // wait doing its job, and it is a counter rather than a gauge for the same
+    // reason -- the state it describes clears itself.
+    DAG_STALLED_SCHEDULED_DEFERRED_FOR_BACKLOG => "cogneva_dag_stalled_scheduled_deferred_for_backlog_total",
+
     // cog-orchestrator — what one change-ledger dispatch pass did with the set
     // still owed, per tick.
     //

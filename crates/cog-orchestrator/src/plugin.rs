@@ -13,6 +13,18 @@ pub const TASK_LEASE_RENEWER_LOOP: &str = "orchestrator_task_lease_renewer";
 /// Loop name reported through the background-loop liveness family.
 pub const TASK_CHECKPOINT_LOOP: &str = "orchestrator_task_checkpoint";
 
+/// How many stall windows a task may wait behind a queue's undelivered
+/// entries before the sweep takes it back anyway.
+///
+/// A backlog explains a slow message, not an absent one, but only for as long
+/// as it could plausibly drain: the count says how many entries are waiting,
+/// not whether anything is reading them. Three windows is long enough that a
+/// queue merely behind on capacity still gets its turn, and short enough that
+/// a queue nobody drains stops being an excuse — past it the row is re-armed
+/// and counted apart, so the queue's refusal to move becomes a reading instead
+/// of an indefinite silence.
+pub const BACKLOG_WINDOWS_BEFORE_RECLAIM: u64 = 3;
+
 /// Orchestrator plugin that self-assembles the DAG executor and related services.
 pub struct OrchestratorPlugin {
     initialized: bool,
@@ -396,6 +408,9 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                             &workspace_id,
                             owns_executor_role,
                         );
+                        // 与消费者同一个组名：问积压和收消息必须是同一组，否则
+                        // 问到的是一条不存在的组，读出来永远是「没有积压」。
+                        let ready_group = crate::ready_queue::ready_group(&workspace_id);
 
                         // Seeded before either consumer starts, so the series is
                         // present from the first scrape rather than from the
@@ -452,6 +467,8 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                         let pub_shutdown = dag_shutdown.clone();
                         let publisher_runtime = runtime.clone();
                         let publisher_served_streams = served_ready_streams.clone();
+                        let publisher_backend = backend.clone();
+                        let publisher_ready_group = ready_group.clone();
                         drop(cog_core::loop_health::spawn(
                             READY_TASK_PUBLISHER_LOOP,
                             cog_core::loop_health::Cadence::Periodic(
@@ -463,6 +480,8 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                                 let publisher_runtime = publisher_runtime.clone();
                                 let pub_shutdown = pub_shutdown.clone();
                                 let served_ready_streams = publisher_served_streams.clone();
+                                let publisher_backend = publisher_backend.clone();
+                                let ready_group = publisher_ready_group.clone();
                                 async move {
                                     let mut interval =
                                         tokio::time::interval(std::time::Duration::from_secs(
@@ -486,11 +505,38 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                                                     // 那条上，堆积就是任务在等执行器回来，
                                                     // 每窗重投一次只会在没人读的队列里
                                                     // 复制出更多消息。
+                                                    //
+                                                    // 每条被扫的队列再问一句「还有多少条
+                                                    // 没投出去」：有积压时消息可能正排在
+                                                    // 队伍里，这时重投只是给同一条队伍再
+                                                    // 添一份。传达不到就按「没有读数」
+                                                    // 扫，与问不出积压的传输层同一条路。
+                                                    let mut undelivered =
+                                                        std::collections::HashMap::new();
+                                                    for stream in &served_ready_streams {
+                                                        let lag = match publisher_backend
+                                                            .stream_lag(stream, &ready_group)
+                                                            .await
+                                                        {
+                                                            Ok(lag) => lag,
+                                                            Err(e) => {
+                                                                tracing::warn!(
+                                                                    stream = %stream,
+                                                                    error = %e,
+                                                                    "cannot read how many entries the ready stream still owes this group; sweeping it as if there were no backlog"
+                                                                );
+                                                                None
+                                                            }
+                                                        };
+                                                        undelivered.insert(stream.clone(), lag);
+                                                    }
                                                     let reclaimed = publisher_runtime
                                                         .orchestrator()
                                                         .reclaim_stalled_scheduled(
                                                             scheduled_task_stall_secs,
                                                             &served_ready_streams,
+                                                            &undelivered,
+                                                            BACKLOG_WINDOWS_BEFORE_RECLAIM,
                                                         )
                                                         .await;
                                                     if reclaimed > 0 {

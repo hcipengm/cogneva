@@ -44,6 +44,17 @@ pub fn ready_stream_for(task: &Task, workspace_id: &str) -> String {
     }
 }
 
+/// The consumer group every deployment joins on a ready stream.
+///
+/// One per workspace, not per pod: the group is what survives a pod restart and
+/// what lets a new pod resume from the last acknowledged entry instead of
+/// re-reading the queue. Both the consumer that joins it and any reader that
+/// asks the transport about its backlog have to name the same group, so the
+/// name is derived here rather than written out at each call site.
+pub fn ready_group(workspace_id: &str) -> String {
+    format!("executor-loop-{workspace_id}")
+}
+
 /// The queues a deployment consumes. Every worker reads the shared one; only
 /// the executor role reads the process-local one.
 pub fn consumed_ready_streams(workspace_id: &str, owns_executor_role: bool) -> Vec<String> {

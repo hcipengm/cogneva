@@ -220,26 +220,57 @@ impl DagExecutor {
     /// So this total cannot say whether the repair worked: being re-armed is
     /// what the repair does either way. The reading that does say so is the
     /// charge's absence — a re-armed task keeps the `retry_count` it had.
-    async fn record_stalled_scheduled_reclaimed(&self, count: usize) {
-        if count == 0 {
+    async fn record_stalled_scheduled_reclaimed(
+        &self,
+        reclaimed: usize,
+        reclaimed_with_backlog: usize,
+        deferred: usize,
+    ) {
+        if reclaimed == 0 && reclaimed_with_backlog == 0 && deferred == 0 {
             return;
         }
         let Some(backend) = self.metrics_backend() else {
             tracing::debug!(
-                count,
+                reclaimed,
+                reclaimed_with_backlog,
+                deferred,
                 "reclaimed stalled scheduled tasks; no metrics backend attached"
             );
             return;
         };
-        if let Err(e) = backend
-            .record_counter(
+        // Three cells, recorded together: `reclaimed` counts the repair's
+        // ordinary work, `with_backlog` the rows it took back although their
+        // queue still held undelivered entries (the wait ran out of credit),
+        // and `deferred` the rows it left alone because that queue still held
+        // them. Separate totals, because one total cannot tell a drain from a
+        // loss -- and the loss is the case this sweep exists for.
+        for (name, count) in [
+            (
                 cog_core::metric_names::DAG_STALLED_SCHEDULED_RECLAIMED,
-                count as f64,
-                HashMap::new(),
-            )
-            .await
-        {
-            tracing::warn!(error = %e, "cannot record the stalled-scheduled reclaim count");
+                reclaimed,
+            ),
+            (
+                cog_core::metric_names::DAG_STALLED_SCHEDULED_RECLAIMED_WITH_BACKLOG,
+                reclaimed_with_backlog,
+            ),
+            (
+                cog_core::metric_names::DAG_STALLED_SCHEDULED_DEFERRED_FOR_BACKLOG,
+                deferred,
+            ),
+        ] {
+            if count == 0 {
+                continue;
+            }
+            if let Err(e) = backend
+                .record_counter(name, count as f64, HashMap::new())
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    series = name.as_str(),
+                    "cannot record the stalled-scheduled reclaim count"
+                );
+            }
         }
     }
 
@@ -274,11 +305,37 @@ impl DagExecutor {
     /// stream whose consumer was switched off, 8,815 messages queued behind
     /// it). Those rows are left to the reader that will arrive.
     ///
+    /// `undelivered` is, per stream, how many entries the transport says the
+    /// consumer group has not been handed yet ([`cog_core::MessageBackend::stream_lag`]).
+    /// A transport that cannot answer leaves its stream out of the map, and a
+    /// stream left out is swept exactly as before — an unreadable queue is not
+    /// a reading of an empty one.
+    ///
+    /// A non-zero backlog changes what the age means. The row is old, but its
+    /// message may be sitting in a queue that is simply longer than the claim
+    /// pool, and re-arming then adds a second copy to the very queue that is
+    /// behind. So the sweep waits: while the backlog is non-zero the row is
+    /// left alone, but only up to `max_backlog_windows` stall windows. Past
+    /// that the backlog is no longer an explanation — a queue that has not
+    /// moved in that many windows is not "about to get to it", and the row was
+    /// re-armed by a sweep that would otherwise wait forever for a queue that
+    /// never drains. Those rows are counted apart
+    /// ([`cog_core::metric_names::DAG_STALLED_SCHEDULED_RECLAIMED_WITH_BACKLOG`])
+    /// so a backlog that never clears is visible instead of being either
+    /// silently waited on or silently folded into the ordinary total.
+    ///
+    /// The cap is read off the row's own age rather than stored per task: the
+    /// row already carries `updated_at`, and a second field recording "how many
+    /// times this was deferred" would be state the sweep would have to keep
+    /// consistent against the very sweeps it is racing.
+    ///
     /// Returns how many tasks it re-armed.
     pub async fn reclaim_stalled_scheduled(
         &self,
         stall_after_secs: u64,
         served_streams: &[String],
+        undelivered: &HashMap<String, Option<u64>>,
+        max_backlog_windows: u64,
     ) -> usize {
         // Floored at the window the transport itself uses before it re-delivers
         // an unacknowledged message. Below it, a message that is merely slow is
@@ -290,18 +347,38 @@ impl DagExecutor {
         let stall_before = chrono::Utc::now() - chrono::Duration::seconds(stall_after_secs as i64);
         let stalled = self.find_stalled_scheduled_tasks(stall_before).await;
         let mut reclaimed = 0usize;
+        let mut reclaimed_with_backlog = 0usize;
         let mut unserved = 0usize;
+        let mut deferred = 0usize;
+        let now = chrono::Utc::now();
         for task in stalled {
             let stream = crate::ready_queue::ready_stream_for(&task, &self.workspace_id);
             if !served_streams.iter().any(|served| served == &stream) {
                 unserved += 1;
                 continue;
             }
+            // `None` (no reading, or a transport that cannot say) keeps the
+            // ordinary path: silence is not evidence of a backlog.
+            let lag = undelivered.get(&stream).copied().flatten();
+            let has_backlog = lag.map(|lag| lag > 0).unwrap_or(false);
+            if has_backlog {
+                let age_secs = (now - task.updated_at).num_seconds().max(0);
+                let cap_secs = (stall_after_secs as i64).saturating_mul(max_backlog_windows as i64);
+                if age_secs < cap_secs {
+                    deferred += 1;
+                    continue;
+                }
+            }
             let error = format!(
                 "never started: the task sat in Scheduled for more than {stall_after_secs}s without ever being started, so it was put back in line without charging an attempt"
             );
             match self.reclaim_one_stalled(&task.id, error).await {
-                Ok(true) => reclaimed += 1,
+                Ok(true) => {
+                    reclaimed += 1;
+                    if has_backlog {
+                        reclaimed_with_backlog += 1;
+                    }
+                }
                 Ok(false) => {}
                 Err(e) => tracing::warn!(
                     task_id = %task.id,
@@ -318,7 +395,15 @@ impl DagExecutor {
                  leaving them queued for the executor rather than republishing them"
             );
         }
-        self.record_stalled_scheduled_reclaimed(reclaimed).await;
+        if deferred > 0 {
+            // 推迟也要说一句：不计数的等待读起来和清扫器没在跑是同一件事。
+            tracing::info!(
+                deferred,
+                "tasks stayed in Scheduled because their ready stream still reports undelivered entries"
+            );
+        }
+        self.record_stalled_scheduled_reclaimed(reclaimed, reclaimed_with_backlog, deferred)
+            .await;
         reclaimed
     }
 
@@ -3177,6 +3262,111 @@ mod tests {
         crate::ready_queue::consumed_ready_streams(workspace, executor_role)
     }
 
+    /// 一次清扫，带着各队列的未投递读数——即运行期问传输层拿到的那张表。
+    async fn sweep_with(
+        dag: &DagExecutor,
+        stall_after_secs: u64,
+        streams: &[String],
+        undelivered: &HashMap<String, Option<u64>>,
+    ) -> usize {
+        dag.reclaim_stalled_scheduled(stall_after_secs, streams, undelivered, 3)
+            .await
+    }
+
+    /// 传输层答不出积压时的清扫：大多数测试只关心「超过窗就收回」这一条。
+    async fn sweep(dag: &DagExecutor, stall_after_secs: u64, streams: &[String]) -> usize {
+        sweep_with(dag, stall_after_secs, streams, &HashMap::new()).await
+    }
+
+    /// 记下每一次计数的序列名：断言的是「这条曲线被记过没有」，不是内部原子。
+    #[derive(Default)]
+    struct RecordingMetrics(std::sync::Mutex<Vec<&'static str>>);
+
+    impl RecordingMetrics {
+        fn recorded(&self, name: cog_core::MetricName) -> usize {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|recorded| **recorded == name.as_str())
+                .count()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::MetricsBackend for RecordingMetrics {
+        async fn record_gauge(
+            &self,
+            _name: cog_core::MetricName,
+            _value: f64,
+            _labels: HashMap<String, String>,
+        ) -> SFResult<()> {
+            Ok(())
+        }
+        async fn record_counter(
+            &self,
+            name: cog_core::MetricName,
+            _value: f64,
+            _labels: HashMap<String, String>,
+        ) -> SFResult<()> {
+            self.0.lock().unwrap().push(name.as_str());
+            Ok(())
+        }
+        async fn record_histogram(
+            &self,
+            _name: cog_core::MetricName,
+            _value: f64,
+            _labels: HashMap<String, String>,
+        ) -> SFResult<()> {
+            Ok(())
+        }
+        async fn query_gauge_range(
+            &self,
+            _name: &str,
+            _start: chrono::DateTime<chrono::Utc>,
+            _end: chrono::DateTime<chrono::Utc>,
+        ) -> SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+        async fn query_gauge_latest(&self, _name: &str) -> SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+        async fn query_counter_range(
+            &self,
+            _name: &str,
+            _start: chrono::DateTime<chrono::Utc>,
+            _end: chrono::DateTime<chrono::Utc>,
+        ) -> SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+        async fn query_counter_totals(&self, _name: &str) -> SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+        async fn query_histogram_totals(
+            &self,
+            _name: &str,
+        ) -> SFResult<Vec<cog_core::HistogramTotals>> {
+            Ok(Vec::new())
+        }
+        async fn query_histogram_range(
+            &self,
+            _name: &str,
+            _start: chrono::DateTime<chrono::Utc>,
+            _end: chrono::DateTime<chrono::Utc>,
+        ) -> SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+        async fn list_metric_names(
+            &self,
+            _metric_type: cog_core::MetricType,
+        ) -> SFResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn health_check(&self) -> SFResult<()> {
+            Ok(())
+        }
+    }
+
     /// 只实现 DAG 快照存取的最小 StateBackend，模拟两个 pod 共享的存储。
     #[derive(Default)]
     struct StubStateBackend {
@@ -4483,8 +4673,7 @@ mod tests {
         }
 
         assert_eq!(
-            dag.reclaim_stalled_scheduled(60, &served("ws-stalled-floor", true))
-                .await,
+            sweep(&dag, 60, &served("ws-stalled-floor", true)).await,
             0,
             "a caller asking for a window below the transport's own re-delivery window is \
              asking for the duplicate, and does not get one"
@@ -4510,8 +4699,7 @@ mod tests {
         }
 
         assert_eq!(
-            dag.reclaim_stalled_scheduled(600, &served("ws-stalled-reclaim", true))
-                .await,
+            sweep(&dag, 600, &served("ws-stalled-reclaim", true)).await,
             1
         );
 
@@ -4534,8 +4722,7 @@ mod tests {
         // One re-arm per stall, not one per sweep: the task is no longer
         // `Scheduled`, so the next sweep has nothing to pick up.
         assert_eq!(
-            dag.reclaim_stalled_scheduled(600, &served("ws-stalled-reclaim", true))
-                .await,
+            sweep(&dag, 600, &served("ws-stalled-reclaim", true)).await,
             0
         );
         assert_eq!(dag.get_task("stalled").await.unwrap().retry_count, 0);
@@ -4571,8 +4758,7 @@ mod tests {
         assert!(dag.get_task("generate").await.unwrap().is_self_evolution());
 
         assert_eq!(
-            dag.reclaim_stalled_scheduled(600, &served("ws-stalled-unserved", false))
-                .await,
+            sweep(&dag, 600, &served("ws-stalled-unserved", false)).await,
             0,
             "no reader means the queue is the holder, not a lost message: re-arming here \
              republished the whole backlog every stall window"
@@ -4582,8 +4768,7 @@ mod tests {
         assert_eq!(waiting.retry_count, 0);
 
         assert_eq!(
-            dag.reclaim_stalled_scheduled(600, &served("ws-stalled-unserved", true))
-                .await,
+            sweep(&dag, 600, &served("ws-stalled-unserved", true)).await,
             1,
             "the deployment that reads the queue is the one that can tell a lost message \
              from a queued one, so it is the one that repairs it"
@@ -4591,6 +4776,141 @@ mod tests {
         assert_eq!(
             dag.get_task("generate").await.unwrap().status,
             TaskStatus::Pending
+        );
+    }
+
+    /// 队列还压着没投出去的消息时，停在 `Scheduled` 不是「消息丢了」。
+    ///
+    /// 年龄对「消息排在队伍里」与「消息丢了」同值，能分开这两件事的只有队列
+    /// 自己的读数。判据：同一笔任务、同一个年龄，传输层报积压 ⇒ 不动，报
+    /// 清零 ⇒ 收回；推迟这件事本身也要留一条曲线，否则「在等」读起来和
+    /// 「清扫器没跑」是同一个样子。
+    #[tokio::test]
+    async fn a_backlog_of_undelivered_entries_defers_the_sweep() {
+        let dag = DagExecutor::new("ws-stalled-backlog".into());
+        dag.add_task(Task::new(
+            "queued",
+            TaskType::LlmCall,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        dag.schedule_task("queued").await.unwrap();
+        {
+            let mut inner = dag.inner.write().await;
+            // 一个多窗、但还没到「等太久」上限的年龄：推迟要看的是积压，
+            // 上限要的是三个窗，两者分开才测得出来是哪一个在起作用。
+            inner.tasks.get_mut("queued").unwrap().updated_at =
+                chrono::Utc::now() - chrono::Duration::minutes(15);
+        }
+        let metrics = Arc::new(RecordingMetrics::default());
+        dag.attach_metrics(metrics.clone());
+        let streams = served("ws-stalled-backlog", true);
+        let stream = crate::ready_queue::ready_stream("ws-stalled-backlog");
+
+        let mut undelivered = HashMap::new();
+        undelivered.insert(stream.clone(), Some(8_815u64));
+        assert_eq!(
+            sweep_with(&dag, 600, &streams, &undelivered).await,
+            0,
+            "the message may still be in line: re-arming here adds a second copy to the \
+             queue that is already behind"
+        );
+        let still = dag.get_task("queued").await.unwrap();
+        assert_eq!(still.status, TaskStatus::Scheduled);
+        assert_eq!(still.retry_count, 0);
+        assert_eq!(
+            metrics.recorded(cog_core::metric_names::DAG_STALLED_SCHEDULED_DEFERRED_FOR_BACKLOG),
+            1,
+            "a wait nobody counts is indistinguishable from a sweep that never ran"
+        );
+
+        // 积压排空的那一刻，同一个年龄就该被收回。
+        undelivered.insert(stream, Some(0));
+        assert_eq!(sweep_with(&dag, 600, &streams, &undelivered).await, 1);
+        assert_eq!(
+            dag.get_task("queued").await.unwrap().status,
+            TaskStatus::Pending
+        );
+        assert_eq!(
+            metrics.recorded(cog_core::metric_names::DAG_STALLED_SCHEDULED_RECLAIMED_WITH_BACKLOG),
+            0,
+            "no backlog at the moment of the reclaim, so this one is the ordinary repair"
+        );
+    }
+
+    /// 积压只是「消息还可能在队伍里」的解释，不是无限期的豁免。
+    ///
+    /// 计数说的是有多少条在等，不是有没有人在读。等满 N 个窗仍不动，这条队列
+    /// 已经不是「慢」；照常收回，但记到另一条曲线上——否则一条永远排不空的
+    /// 队列要么被无限期地等下去，要么被静默折进普通总数里，两种都读不出来。
+    #[tokio::test]
+    async fn a_backlog_that_never_drains_stops_being_an_explanation() {
+        let dag = DagExecutor::new("ws-stalled-backlog-cap".into());
+        dag.add_task(Task::new(
+            "stranded",
+            TaskType::LlmCall,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        dag.schedule_task("stranded").await.unwrap();
+        {
+            let mut inner = dag.inner.write().await;
+            inner.tasks.get_mut("stranded").unwrap().updated_at =
+                chrono::Utc::now() - chrono::Duration::minutes(60);
+        }
+        let metrics = Arc::new(RecordingMetrics::default());
+        dag.attach_metrics(metrics.clone());
+        let streams = served("ws-stalled-backlog-cap", true);
+        let stream = crate::ready_queue::ready_stream("ws-stalled-backlog-cap");
+
+        let mut undelivered = HashMap::new();
+        undelivered.insert(stream, Some(8_815u64));
+        assert_eq!(
+            sweep_with(&dag, 600, &streams, &undelivered).await,
+            1,
+            "60 minutes is three stall windows: a queue that has not moved in that long \
+             is not about to get to this row"
+        );
+        assert_eq!(
+            dag.get_task("stranded").await.unwrap().status,
+            TaskStatus::Pending
+        );
+        assert_eq!(
+            metrics.recorded(cog_core::metric_names::DAG_STALLED_SCHEDULED_RECLAIMED_WITH_BACKLOG),
+            1,
+            "this reclaim is the one that has to be visible apart from the ordinary total"
+        );
+    }
+
+    /// 传输层答不出（`None`）不等于队列是空的：照旧走普通路径。
+    #[tokio::test]
+    async fn an_unreadable_queue_is_not_an_empty_one() {
+        let dag = DagExecutor::new("ws-stalled-unknown".into());
+        dag.add_task(Task::new(
+            "stalled",
+            TaskType::LlmCall,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        dag.schedule_task("stalled").await.unwrap();
+        {
+            let mut inner = dag.inner.write().await;
+            inner.tasks.get_mut("stalled").unwrap().updated_at =
+                chrono::Utc::now() - chrono::Duration::minutes(30);
+        }
+        let streams = served("ws-stalled-unknown", true);
+        let stream = crate::ready_queue::ready_stream("ws-stalled-unknown");
+
+        let mut undelivered = HashMap::new();
+        undelivered.insert(stream, None);
+        assert_eq!(
+            sweep_with(&dag, 600, &streams, &undelivered).await,
+            1,
+            "a backend that cannot answer must not inherit a made-up zero, nor a made-up \
+             backlog: silence keeps the ordinary behaviour"
         );
     }
 
@@ -4622,8 +4942,7 @@ mod tests {
         }
 
         assert_eq!(
-            dag.reclaim_stalled_scheduled(600, &served("ws-stalled-budget", true))
-                .await,
+            sweep(&dag, 600, &served("ws-stalled-budget", true)).await,
             1
         );
 
@@ -4662,16 +4981,9 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(sweep(&pod_a, 600, &served("ws-stalled-fg", true)).await, 1);
         assert_eq!(
-            pod_a
-                .reclaim_stalled_scheduled(600, &served("ws-stalled-fg", true))
-                .await,
-            1
-        );
-        assert_eq!(
-            pod_b
-                .reclaim_stalled_scheduled(600, &served("ws-stalled-fg", true))
-                .await,
+            sweep(&pod_b, 600, &served("ws-stalled-fg", true)).await,
             0,
             "the second sweep finds the task already requeued and leaves it alone"
         );

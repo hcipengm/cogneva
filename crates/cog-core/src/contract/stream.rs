@@ -162,6 +162,26 @@ pub trait MessageBackend: Send + Sync {
         idle_threshold_ms: u64,
     ) -> SFResult<Option<PendingStats>>;
 
+    /// How many entries in `stream` this group has not received yet.
+    ///
+    /// It answers a different question from [`Self::pending_stats`]: those are
+    /// messages already handed to a consumer that have not been acknowledged,
+    /// while these have not been handed out at all. A scheduler deciding
+    /// whether a task stuck in `Scheduled` lost its message needs the second
+    /// number — a message still queued behind a backlog is not lost, and
+    /// republishing it only adds a copy the queue has to carry.
+    ///
+    /// `None` means this backend cannot say, and it is the default rather than
+    /// a required method on the same terms as `pending_stats`'s `None`: a
+    /// backend that has no notion of an undelivered backlog must not inherit a
+    /// made-up zero. Callers treat `None` as "no evidence of a backlog" and keep
+    /// their ordinary behavior, because an unreadable queue is not a reading of
+    /// an empty one.
+    async fn stream_lag(&self, stream: &str, group: &str) -> SFResult<Option<u64>> {
+        let _ = (stream, group);
+        Ok(None)
+    }
+
     /// Publish a message to the dead-letter queue for the given stream.
     ///
     /// `payload` is the message's own bytes, and it is a parameter because a

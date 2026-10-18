@@ -448,6 +448,33 @@ impl MessageBackend for RedisMessageBackend {
         Ok(Some(stats))
     }
 
+    async fn stream_lag(&self, stream: &str, group: &str) -> SFResult<Option<u64>> {
+        let mut conn = self.connection.clone();
+        // `xinfo_groups` carries the server's own `lag` (Redis >= 7), which is
+        // exactly "entries still waiting to be delivered to this group".
+        // NOGROUP is the same benign race `pending_stats` answers with `None`:
+        // nothing has been delivered, so nothing can be waiting behind us.
+        let reply: redis::streams::StreamInfoGroupsReply = match redis::cmd("XINFO")
+            .arg("GROUPS")
+            .arg(stream)
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(reply) => reply,
+            Err(e) if e.code() == Some("NOGROUP") => return Ok(None),
+            Err(e) if e.code() == Some("ERR") && e.to_string().contains("no such key") => {
+                return Ok(None)
+            }
+            Err(e) => return Err(SFError::Redis(e.to_string())),
+        };
+        Ok(reply
+            .groups
+            .iter()
+            .find(|g| g.name == group)
+            .and_then(|g| g.lag)
+            .map(|lag| lag as u64))
+    }
+
     async fn dlq(&self, stream: &str, msg_id: &str, payload: &[u8], reason: &str) -> SFResult<()> {
         // Redis Streams gets the record appended with XADD rather than
         // published, which is why this is an override and not the default: the
@@ -1011,6 +1038,123 @@ mod tests {
         assert!(
             stats.is_none(),
             "a missing consumer group has no pending state to report, got {stats:?}"
+        );
+
+        let _: i64 = redis::cmd("DEL")
+            .arg(stream.as_str())
+            .query_async(&mut raw)
+            .await
+            .expect("del");
+    }
+
+    /// 未投递的条数与 PEL 里的条数是两个问题：清扫器要的是前者——消息还压在
+    /// 队伍里就不是丢了，重投一份只是把队伍再加长一格。
+    #[tokio::test]
+    async fn stream_lag_counts_what_the_group_has_not_been_handed() {
+        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let raw_client = redis::Client::open(redis_url.as_str()).expect("redis client");
+        let mut raw = match raw_client.get_multiplexed_async_connection().await {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("SKIP: Redis not available");
+                return;
+            }
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let stream = format!("cog-test:lag-{suffix}");
+        let group = format!("lag-{suffix}");
+
+        let backend: Arc<dyn MessageBackend> =
+            Arc::new(RedisMessageBackend::new(&redis_url).await.unwrap());
+        // Group first, at the tip: everything published afterwards is what the
+        // group has not been handed yet.
+        backend
+            .create_consumer_group(&stream, &group)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.stream_lag(&stream, &group).await.unwrap(),
+            Some(0),
+            "a group that has been handed nothing yet, on an empty stream"
+        );
+
+        backend.publish(&stream, b"one").await.unwrap();
+        backend.publish(&stream, b"two").await.unwrap();
+        backend.publish(&stream, b"three").await.unwrap();
+        assert_eq!(
+            backend.stream_lag(&stream, &group).await.unwrap(),
+            Some(3),
+            "three entries are waiting for this group and none has been delivered"
+        );
+
+        // Deliver one and leave it unacked: it leaves the lag (it has been
+        // handed out) and enters the PEL -- the two figures answering
+        // different questions is the whole point.
+        let delivered: redis::streams::StreamReadReply = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg(&group)
+            .arg("consumer-1")
+            .arg("COUNT")
+            .arg(1)
+            .arg("STREAMS")
+            .arg(&stream)
+            .arg(">")
+            .query_async(&mut raw)
+            .await
+            .expect("xreadgroup");
+        assert_eq!(delivered.keys.len(), 1);
+        assert_eq!(
+            backend.stream_lag(&stream, &group).await.unwrap(),
+            Some(2),
+            "the delivered-but-unacked entry is pending, not lagging"
+        );
+        assert_eq!(
+            backend
+                .pending_stats(&stream, &group, 0)
+                .await
+                .unwrap()
+                .map(|stats| stats.count),
+            Some(1)
+        );
+
+        let _: i64 = redis::cmd("DEL")
+            .arg(stream.as_str())
+            .query_async(&mut raw)
+            .await
+            .expect("del");
+    }
+
+    /// 组不存在时没有「还欠多少条」可报：那是这个后端答不出，不是零。
+    #[tokio::test]
+    async fn stream_lag_without_a_group_is_not_a_reading() {
+        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let raw_client = redis::Client::open(redis_url.as_str()).expect("redis client");
+        let mut raw = match raw_client.get_multiplexed_async_connection().await {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("SKIP: Redis not available");
+                return;
+            }
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let stream = format!("cog-test:lag-nogroup-{suffix}");
+        let group = format!("lag-nogroup-{suffix}");
+
+        let backend: Arc<dyn MessageBackend> =
+            Arc::new(RedisMessageBackend::new(&redis_url).await.unwrap());
+        backend.publish(&stream, b"one").await.unwrap();
+        assert_eq!(
+            backend.stream_lag(&stream, &group).await.unwrap(),
+            None,
+            "no group means nothing has been delivered, so there is no backlog to report"
         );
 
         let _: i64 = redis::cmd("DEL")

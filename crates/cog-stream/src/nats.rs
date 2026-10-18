@@ -457,6 +457,27 @@ impl MessageBackend for NatsMessageBackend {
         Ok(None)
     }
 
+    /// Entries on the stream this group has not been handed yet.
+    ///
+    /// Unlike [`Self::pending_stats`], this one JetStream *can* answer broker-
+    /// side: `num_pending` is the consumer's own count of undelivered entries,
+    /// which is precisely "the message may still be in line". The consumer is
+    /// created with the same config `subscribe` uses, so asking does not change
+    /// where a group that does not exist yet would start — it starts where
+    /// subscribing would have started it.
+    async fn stream_lag(&self, stream: &str, group: &str) -> SFResult<Option<u64>> {
+        let (js_stream, _limit) = self.ensure_stream(stream).await?;
+        let mut consumer: jetstream::consumer::Consumer<pull::Config> = js_stream
+            .get_or_create_consumer(group, self.consumer_config(group, DeliverPolicy::New))
+            .await
+            .map_err(|e| SFError::DagExecutor(format!("JetStream consumer create failed: {e}")))?;
+        let info = consumer
+            .info()
+            .await
+            .map_err(|e| SFError::DagExecutor(format!("JetStream consumer info failed: {e}")))?;
+        Ok(Some(info.num_pending))
+    }
+
     /// No reclaim path: JetStream redelivers on its own once `ack_wait` lapses,
     /// so nothing here has to be claimed back and nothing is lost by not
     /// claiming. Saying "nothing pending" instead would be the wrong answer in
