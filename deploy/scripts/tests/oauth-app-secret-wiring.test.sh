@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # principle: feedback_a_declaration_nobody_delivers_reads_exactly_like_one_nobody_made
+# principle: feedback_an_extractor_that_scans_between_two_markers_swallows_prose
 # Deterministic gate for out-of-band credential delivery.
 #
 # Three silent failures are being judged here:
