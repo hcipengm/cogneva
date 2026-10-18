@@ -357,3 +357,82 @@ async fn the_rows_a_person_holds_are_still_in_the_set() {
     }
     cleanup(&pool, &marker).await;
 }
+
+/// File one row whose host column carries `host_gate`, and return its slug.
+async fn file_with_gate(
+    store: &PostgresPrincipleLedgerStore,
+    marker: &str,
+    label: &str,
+    host_gate: &str,
+) -> String {
+    let slug = format!("{marker}/{label}");
+    let mut row = reading(&slug, PrincipleCheckKind::Tree);
+    row.host_gate = Some(host_gate.to_string());
+    store.declare(&[row]).await.expect("queue the reading");
+    for _ in 0..4 {
+        let fold = store
+            .fold_declarations(PASS_BOUND * 2)
+            .await
+            .expect("fold the queue");
+        if fold.folded == 0 {
+            break;
+        }
+    }
+    slug
+}
+
+/// A retired row leaves the outstanding set, and a carrier that comes back puts
+/// it back in.
+///
+/// The first half is the point of the state: without it the row is looked at on
+/// every pass, settles nothing, and returns to the head of the next one, while
+/// every surface that reads "no state" reports it exactly like a principle
+/// nobody has got to. The second half is what keeps that from being a delete:
+/// the row's host column is written by the fold from the host's reading, so a
+/// carrier that returns to the roster arrives as a changed value and the row is
+/// measured again.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_retired_row_leaves_the_pass_and_returns_when_its_carrier_does() {
+    let _pass = PASS.lock().await;
+    let (store, pool, marker) = store().await;
+    let slug = file_with_gate(&store, &marker, "gone", "retired:carrier_not_in_tree").await;
+
+    let mut measurement =
+        cog_core::PrincipleMeasurement::new(slug.clone(), cog_core::PrincipleState::Retired);
+    measurement.measured_rev = Some("probe-retired-rev".to_string());
+    store
+        .apply_principle_measurement(&measurement)
+        .await
+        .expect("write the retirement");
+
+    let looked: Vec<String> = store
+        .outstanding(PASS_BOUND)
+        .await
+        .expect("read the outstanding set")
+        .into_iter()
+        .map(|row| row.slug)
+        .filter(|s| s.starts_with(&marker))
+        .collect();
+    assert!(
+        !looked.contains(&slug),
+        "a retired row is not waiting for a look; got {looked:?}"
+    );
+
+    // The carrier comes back: the host's next reading no longer carries the
+    // retire marker, and that value change is the whole signal.
+    file_with_gate(&store, &marker, "gone", "-").await;
+    let looked: Vec<String> = store
+        .outstanding(PASS_BOUND)
+        .await
+        .expect("read the outstanding set")
+        .into_iter()
+        .map(|row| row.slug)
+        .filter(|s| s.starts_with(&marker))
+        .collect();
+    assert!(
+        looked.contains(&slug),
+        "a row whose carrier returned must be measured again; got {looked:?}"
+    );
+    cleanup(&pool, &marker).await;
+}

@@ -374,7 +374,13 @@ fn measurement_of(
 ) -> Option<PrincipleMeasurement> {
     let state = verdict.state()?;
     let mut measurement = PrincipleMeasurement::new(row.slug.clone(), state).at_revision(revision);
-    measurement.platform_gate = declarations.gate_for(&row.slug).map(str::to_string);
+    // A retired row has no gate to record: the principle is no longer held, so a
+    // declaration that still names it is about a row this account has stopped
+    // asking about. Writing `None` clears what the last live measurement found
+    // rather than carrying a gate beside a retirement.
+    if state != cog_core::PrincipleState::Retired {
+        measurement.platform_gate = declarations.gate_for(&row.slug).map(str::to_string);
+    }
     Some(measurement)
 }
 
@@ -604,6 +610,7 @@ async fn measure_pass(
     let now = Instant::now();
     let mut enforced = 0usize;
     let mut unenforced = 0usize;
+    let mut retired = 0usize;
     let mut human_only = 0usize;
     let mut by_reason: HashMap<UnsettledReason, usize> = HashMap::new();
     let mut known_unsettled = 0usize;
@@ -669,6 +676,10 @@ async fn measure_pass(
         match measurement.state {
             PrincipleState::Enforced => enforced += 1,
             PrincipleState::Unenforced => unenforced += 1,
+            // Only reachable when the host says the carrier left and a later
+            // reading brought it back inside the same pass; counted so the line
+            // adds up to the rows it judged.
+            PrincipleState::Retired => retired += 1,
         }
         if let Err(e) = store.apply_principle_measurement(&measurement).await {
             // Counted as judged because it was, not because it was stored: the
@@ -686,6 +697,7 @@ async fn measure_pass(
         judged = considered,
         enforced,
         unenforced,
+        retired,
         human_only,
         held_back_for_drift,
         unsettled = %reason_summary(&by_reason),
@@ -763,10 +775,11 @@ fn account_summary(census: &PrincipleCensus) -> String {
         None => "no rows".to_string(),
     };
     format!(
-        "enforced {} unenforced {} unmeasured {} total {} coverage {}",
+        "enforced {} unenforced {} unmeasured {} retired {} total {} coverage {}",
         census.enforced,
         census.unenforced,
         census.unmeasured,
+        census.retired,
         census.total(),
         coverage
     )
@@ -941,20 +954,35 @@ mod tests {
             enforced: 5,
             unenforced: 556,
             unmeasured: 0,
+            retired: 0,
         };
         assert_eq!(
             account_summary(&census),
-            "enforced 5 unenforced 556 unmeasured 0 total 561 coverage 0.9%"
+            "enforced 5 unenforced 556 unmeasured 0 retired 0 total 561 coverage 0.9%"
         );
 
         let partly = PrincipleCensus {
             enforced: 1,
             unenforced: 0,
             unmeasured: 2,
+            retired: 0,
         };
         assert_eq!(
             account_summary(&partly),
-            "enforced 1 unenforced 0 unmeasured 2 total 3 coverage 33.3%"
+            "enforced 1 unenforced 0 unmeasured 2 retired 0 total 3 coverage 33.3%"
+        );
+
+        // A retired row is in the account but not in its coverage: counting it
+        // would lower coverage every time a principle left the roster.
+        let with_retired = PrincipleCensus {
+            enforced: 1,
+            unenforced: 1,
+            unmeasured: 1,
+            retired: 7,
+        };
+        assert_eq!(
+            account_summary(&with_retired),
+            "enforced 1 unenforced 1 unmeasured 1 retired 7 total 3 coverage 33.3%"
         );
     }
 
@@ -964,7 +992,7 @@ mod tests {
     fn an_empty_account_has_no_coverage_rather_than_none() {
         assert_eq!(
             account_summary(&PrincipleCensus::default()),
-            "enforced 0 unenforced 0 unmeasured 0 total 0 coverage no rows"
+            "enforced 0 unenforced 0 unmeasured 0 retired 0 total 0 coverage no rows"
         );
     }
 
@@ -1086,6 +1114,21 @@ mod tests {
             Some("crates/cogneva/tests/a.rs")
         );
         assert_eq!(platformed.measured_rev.as_deref(), Some("rev1"));
+    }
+
+    /// A retirement writes no gate, even when the platform's registry still
+    /// names one: the row is no longer a question about gates, and carrying a
+    /// gate beside it would keep answering "enforced somewhere" for a principle
+    /// the host's roster has dropped.
+    #[test]
+    fn a_retirement_carries_no_gate() {
+        let registry = declarations(&[("crates/cogneva/tests/a.rs", "//! principle: feedback_x")]);
+        let judged = row("feedback_x", Some("retired:carrier_not_in_tree"), None);
+        let verdict = judge(&judged, &registry);
+        let retired =
+            measurement_of(&judged, &verdict, &registry, "rev1").expect("a retirement is a state");
+        assert_eq!(retired.state, PrincipleState::Retired);
+        assert_eq!(retired.platform_gate, None);
     }
 
     /// A look that settled nothing produces no measurement at all: there is no

@@ -333,9 +333,21 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
         // log as a pass that judged 200 rows, not as a pass that stopped. They
         // are kept in the set rather than filtered out so the line still reports
         // how many rows a person holds.
+        //
+        // Retired rows leave the set, with one exception: a row whose stored host
+        // value no longer carries the retire marker. That marker is what the fold
+        // wrote from the host's last reading, so a carrier that returns to the
+        // roster arrives as a changed value, the row comes back into the set, and
+        // the next look writes whatever it finds -- the retirement is a state a
+        // later measurement can move, not a tombstone. The comparison lives here
+        // rather than in the fold because the fold is also the path that writes
+        // the marker: one place would have to be read twice to see both halves.
         let rows = sqlx::query(&format!(
             "SELECT {ROW_COLUMNS} FROM principle_ledger \
              WHERE state IS DISTINCT FROM 'enforced' \
+               AND (state IS DISTINCT FROM 'retired' \
+                    OR host_gate IS NULL \
+                    OR host_gate NOT LIKE 'retired:%') \
              ORDER BY (check_kind IS NOT DISTINCT FROM 'judgement') ASC, \
                       measured_at ASC NULLS FIRST, first_seen_at ASC \
              LIMIT $1"
@@ -472,6 +484,7 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
                 Some(text) => match PrincipleState::parse(text) {
                     Some(PrincipleState::Enforced) => census.enforced += n,
                     Some(PrincipleState::Unenforced) => census.unenforced += n,
+                    Some(PrincipleState::Retired) => census.retired += n,
                     None => {
                         return Err(SFError::Database(format!(
                             "state column holds `{text}`, which is not a state"

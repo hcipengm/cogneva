@@ -45,6 +45,18 @@ pub const HOST_REGISTRY_READ_NO_GATE: &str = "-";
 /// unknown to the host side, which is a different fact and a different answer.
 pub const HOST_JUDGEMENT_STALE_PREFIX: &str = "stale:";
 
+/// What the host prefixes a row with when the principle's own carrier -- the
+/// memory file the slug names -- is no longer in its roster.
+///
+/// The distinction from `stale:` is the subject. `stale:` is about the check a
+/// row points at leaving the tree; the principle itself is still there and its
+/// gate status is merely unknown. This one is about the principle leaving: the
+/// row is a record of something the account no longer holds, and there is
+/// nothing left for a look to find. Without this value the row would stay
+/// unsettled forever and read on every surface like a principle nobody has got
+/// to yet.
+pub const HOST_RETIRED_PREFIX: &str = "retired:";
+
 /// The shape of a platform-side declaration, as a line of the platform's own
 /// source.
 ///
@@ -134,6 +146,9 @@ pub enum GateSide {
 pub enum Verdict {
     /// A gate exists, in this registry.
     Enforced(GateSide),
+    /// The host's roster no longer holds the principle's carrier. Not a debt and
+    /// not an unanswered question: there is nothing left to look at.
+    Retired,
     /// Both registries were read and neither names a gate. A debt.
     Unenforced,
     /// The principle is one a person holds: no machine gate is meant to exist, so
@@ -166,6 +181,7 @@ impl Verdict {
         match self {
             Verdict::Enforced(_) => Some(cog_core::PrincipleState::Enforced),
             Verdict::Unenforced => Some(cog_core::PrincipleState::Unenforced),
+            Verdict::Retired => Some(cog_core::PrincipleState::Retired),
             Verdict::HumanOnly => None,
             Verdict::Unsettled { .. } => None,
         }
@@ -351,6 +367,18 @@ fn is_slug(slug: &str) -> bool {
 /// is no fallback: a host column that is empty or absent is *not* a gate, and it
 /// is not the absence of one either.
 pub fn judge(row: &PrincipleRow, declarations: &Declarations) -> Verdict {
+    // Asked first, before either registry: a row whose carrier left the host's
+    // roster is not a question about gates. Reading the platform registry for it
+    // would keep answering "a file declares this" about a principle the account
+    // no longer holds, which is the stale reading this state exists to replace.
+    if row
+        .host_gate
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|host| host.starts_with(HOST_RETIRED_PREFIX))
+    {
+        return Verdict::Retired;
+    }
     let platform = declarations.gate_for(&row.slug);
     // A principle whose tier a person holds settles here unless the platform's
     // registry names a gate for it. The host's silence is still not a finding:
@@ -567,6 +595,35 @@ mod tests {
         assert_eq!(verdict.state(), None);
         assert_eq!(verdict.reason(), Some(UnsettledReason::CarrierNotInTree));
         assert!(verdict.why().unwrap().contains("stale:SOME_RE"));
+    }
+
+    /// A row whose own carrier left the roster is retired, and that answer wins
+    /// over both registries: a platform declaration about a principle the host
+    /// no longer holds is a stale reading, and letting it win would keep the row
+    /// reported as enforced for good.
+    #[test]
+    fn a_carrier_that_left_the_roster_retires_the_row() {
+        let declared = declarations(&[("crates/cogneva/tests/x.rs", "//! principle: feedback_x")]);
+        for declarations in [&Declarations::default(), &declared] {
+            let verdict = judge(
+                &row("feedback_x", Some("retired:carrier_not_in_tree")),
+                declarations,
+            );
+            assert_eq!(verdict, Verdict::Retired);
+            assert_eq!(verdict.state(), Some(cog_core::PrincipleState::Retired));
+            assert_eq!(verdict.reason(), None);
+        }
+    }
+
+    /// The marker is a prefix, not a substring: a host value that merely
+    /// mentions retirement is a gate name like any other.
+    #[test]
+    fn a_host_value_that_mentions_retirement_is_not_a_retirement() {
+        let verdict = judge(
+            &row("feedback_x", Some("SOME_RE_about_retired:rows")),
+            &Declarations::default(),
+        );
+        assert_eq!(verdict, Verdict::Enforced(GateSide::Host));
     }
 
     /// One unreadable declaration makes every "no gate" provisional, because the

@@ -35,9 +35,18 @@ use crate::SFResult;
 
 /// What a look at the registries concluded about one principle.
 ///
-/// Two values, and no third: the third answer a reader needs -- "nobody could
-/// tell" -- is the absence of this value on the row rather than a variant of it,
-/// which is what stops a failed look from being written down as a missing gate.
+/// Two answers about a live row, and the third answer a reader needs -- "nobody
+/// could tell" -- is the absence of this value on the row rather than a variant
+/// of it, which is what stops a failed look from being written down as a missing
+/// gate.
+///
+/// `Retired` is not a third kind of look: it is the answer for a row whose own
+/// carrier has left the host's roster, and without it that row has no exit. It
+/// would stay unsettled forever, sorted to the head of every pass by its null
+/// `measured_at`, and "retired" would read on every surface exactly like "never
+/// looked at". The account is append-only, so the exit is a state rather than a
+/// delete. It is re-examinable like any other state: a carrier that comes back
+/// gives the row a reading again, and the next look writes whatever it finds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PrincipleState {
@@ -47,16 +56,25 @@ pub enum PrincipleState {
     /// Both registries were read and neither names it. This is a debt rather
     /// than a silence, which is the distinction the whole ledger is for.
     Unenforced,
+    /// The host's roster no longer holds this principle's carrier. The row stays
+    /// in the account -- what was asked for is part of its history -- but it is
+    /// not a debt and it is not waiting for a look.
+    Retired,
 }
 
 impl PrincipleState {
     /// Every value the column may take, so a census can report the zeroes.
-    pub const ALL: [PrincipleState; 2] = [PrincipleState::Enforced, PrincipleState::Unenforced];
+    pub const ALL: [PrincipleState; 3] = [
+        PrincipleState::Enforced,
+        PrincipleState::Unenforced,
+        PrincipleState::Retired,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             PrincipleState::Enforced => "enforced",
             PrincipleState::Unenforced => "unenforced",
+            PrincipleState::Retired => "retired",
         }
     }
 
@@ -369,16 +387,27 @@ pub struct PrincipleFold {
 /// not one: a row whose state is unset is a row no look has settled, and folding
 /// it into `unenforced` would report every principle nobody has got to yet as a
 /// principle with no gate. Both are work, and they are not the same work.
+///
+/// `retired` is counted apart and kept out of `total()`: those rows are in the
+/// account for its history, not for its coverage, and counting them would make
+/// coverage fall every time a principle leaves the roster even though no live
+/// principle changed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrincipleCensus {
     pub enforced: u64,
     pub unenforced: u64,
     pub unmeasured: u64,
+    pub retired: u64,
 }
 
 impl PrincipleCensus {
     pub fn total(&self) -> u64 {
         self.enforced + self.unenforced + self.unmeasured
+    }
+
+    /// Every row the account holds, retired ones included.
+    pub fn rows(&self) -> u64 {
+        self.total() + self.retired
     }
 
     /// The share of the account a gate exists for, or `None` when it holds
