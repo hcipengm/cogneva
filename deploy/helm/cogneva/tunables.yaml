@@ -236,12 +236,12 @@ rows:
     published:
       # The file that builds the value and the file that publishes the reading are
       # the same one here: the gate derives the ceiling and reports it.
-      owner: crates/cog-core/src/build_gate.rs
-      file: crates/cog-core/src/build_gate.rs
+      owner: crates/cog-reflection/src/build_gate/mod.rs
+      file: crates/cog-reflection/src/build_gate/mod.rs
       metric: BUILD_GATE_CEILING
       label: dimension
     proof:
-      file: crates/cog-core/src/build_gate.rs
+      file: crates/cog-reflection/src/build_gate/mod.rs
       test: the_ceiling_is_the_tightest_dimension
 
   - key: evolution.buildGate.waitSecs
