@@ -180,10 +180,17 @@ pub async fn post_raw(
         return Err(WriteFailure::Unconfigured);
     };
     let url = format!("{}{MEMORY_INGEST_PATH}", base.trim_end_matches('/'));
+    // `purpose: "archive"` is written here rather than taken from the caller:
+    // every call site of this function stores bytes and none of them learned
+    // anything from them, so the intent belongs to the delivery shape. Without
+    // it the API reads the body as a learning payload and answers with a
+    // summary of the first 200 characters, which is a preview presented as a
+    // claim.
     let body = serde_json::json!({
         "id": id,
         "content_type": content_type,
         "text": text,
+        "purpose": "archive",
     });
     // A body that will not serialize is a bug in this function, not a property
     // of the deployment, and there is no cause for it.
@@ -447,6 +454,10 @@ mod tests {
         let body = String::from_utf8(req.body.clone().unwrap()).unwrap();
         assert!(body.contains("\"id\":\"task-0001-0002\""));
         assert!(body.contains("{\\\"big\\\":true}"));
+        // Dropping this field turns the archive back into a learning write:
+        // the API would answer with a 200-character preview of a tool output
+        // and store it as a summary.
+        assert!(body.contains("\"purpose\":\"archive\""));
     }
 
     #[tokio::test]

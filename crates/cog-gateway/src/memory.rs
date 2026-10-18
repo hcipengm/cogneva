@@ -33,13 +33,20 @@ pub struct IngestRequest {
     pub text: String,
     #[serde(default)]
     pub content_type: String,
+    /// 这批字节要拿来干什么，缺省 `learn`（历史调用的行为）。
+    /// 归档与学习对同一段正文要的处理是相反的，所以目的必须随请求来。
+    #[serde(default)]
+    pub purpose: String,
 }
 
 #[derive(Debug, Serialize)]
 pub struct IngestResponse {
     pub raw_uri: String,
     pub schema_count: usize,
-    pub summary_id: String,
+    /// 归档请求没有摘要：`null` 是「没要」，不是「要了没拿到」。
+    pub summary_id: Option<String>,
+    /// 网关实际执行的是哪一种目的。调用方按它解释上面的两个字段。
+    pub purpose: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +55,8 @@ pub struct BatchIngestItem {
     pub text: String,
     #[serde(default)]
     pub content_type: String,
+    #[serde(default)]
+    pub purpose: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,7 +69,40 @@ pub struct BatchIngestResult {
     pub id: String,
     pub raw_uri: String,
     pub schema_count: usize,
-    pub summary_id: String,
+    pub summary_id: Option<String>,
+    pub purpose: String,
+}
+
+/// 写入面接受的两件事，别无第三件。
+///
+/// 归档写进来的正文是**产物**（工具输出的尾巴、抓下来的页面），学习写进来的
+/// 才是**材料**。此前两者走同一条路：入口不看 `content_type`、无条件问抽取器，
+/// 于是一次归档回来的是一段 200 字前缀被当成摘要存了下来——预览被读成结论。
+/// 目的因此成为请求的一部分，缺省 `learn` 保住历史调用，认不出的目的直接拒，
+/// 不许悄悄落回 `learn` 再截一段出去。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IngestPurpose {
+    Archive,
+    Learn,
+}
+
+impl IngestPurpose {
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim() {
+            "" | "learn" => Ok(Self::Learn),
+            "archive" => Ok(Self::Archive),
+            other => Err(format!(
+                "unknown purpose {other:?}: expected \"archive\" or \"learn\""
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Archive => "archive",
+            Self::Learn => "learn",
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -169,6 +211,11 @@ pub async fn ingest_handler(
             .into_response();
     }
 
+    let purpose = match IngestPurpose::parse(&req.purpose) {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
+    };
+
     let ns = effective_ns(claims_ref(&claims));
     let backend = match state.memory_backend.as_ref() {
         Some(b) => b.clone(),
@@ -181,15 +228,19 @@ pub async fn ingest_handler(
         }
     };
 
-    let ingestor = match state.memory_ingestor.as_ref() {
-        Some(i) => i.clone(),
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "memory ingestor disabled"})),
-            )
-                .into_response();
-        }
+    // 归档只要原文：抽取器装没装与它无关，所以这一支不问、也不因它缺而失败。
+    let ingestor = match purpose {
+        IngestPurpose::Archive => None,
+        IngestPurpose::Learn => match state.memory_ingestor.as_ref() {
+            Some(i) => Some(i.clone()),
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error": "memory ingestor disabled"})),
+                )
+                    .into_response();
+            }
+        },
     };
 
     let content_type = if req.content_type.is_empty() {
@@ -200,45 +251,71 @@ pub async fn ingest_handler(
 
     let raw = RawSource::new(&req.id, &ns, content_type, req.text.into_bytes());
 
-    match ingestor.ingest(&raw).await {
-        Ok((schema, summary)) => {
-            let raw_uri = match backend.archive_raw(&raw).await {
-                Ok(uri) => uri,
-                Err(e) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": format!("archive failed: {}", e)})),
-                    )
-                        .into_response();
-                }
-            };
-
-            for entry in &schema {
-                if let Err(e) = backend.store_schema(&ns, entry).await {
-                    tracing::warn!("Schema store failed: {}", e);
-                }
+    let Some(ingestor) = ingestor else {
+        let raw_uri = match backend.archive_raw(&raw).await {
+            Ok(uri) => uri,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("archive failed: {}", e)})),
+                )
+                    .into_response();
             }
-
-            if let Err(e) = backend.store_summary(&ns, &summary).await {
-                tracing::warn!("Summary store failed: {}", e);
-            }
-
-            (
-                StatusCode::OK,
-                Json(IngestResponse {
-                    raw_uri,
-                    schema_count: schema.len(),
-                    summary_id: summary.id,
-                }),
-            )
-                .into_response()
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("ingestion failed: {}", e)})),
+        };
+        return (
+            StatusCode::OK,
+            Json(IngestResponse {
+                raw_uri,
+                schema_count: 0,
+                summary_id: None,
+                purpose: purpose.as_str().to_string(),
+            }),
         )
-            .into_response(),
+            .into_response();
+    };
+
+    let (schema, summary) = match ingestor.ingest(&raw).await {
+        Ok(entries) => entries,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("ingestion failed: {}", e)})),
+            )
+                .into_response();
+        }
+    };
+
+    let raw_uri = match backend.archive_raw(&raw).await {
+        Ok(uri) => uri,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("archive failed: {}", e)})),
+            )
+                .into_response();
+        }
+    };
+
+    for entry in &schema {
+        if let Err(e) = backend.store_schema(&ns, entry).await {
+            tracing::warn!("Schema store failed: {}", e);
+        }
     }
+
+    if let Err(e) = backend.store_summary(&ns, &summary).await {
+        tracing::warn!("Summary store failed: {}", e);
+    }
+
+    (
+        StatusCode::OK,
+        Json(IngestResponse {
+            raw_uri,
+            schema_count: schema.len(),
+            summary_id: Some(summary.id),
+            purpose: purpose.as_str().to_string(),
+        }),
+    )
+        .into_response()
 }
 
 pub async fn batch_ingest_handler(
@@ -258,16 +335,9 @@ pub async fn batch_ingest_handler(
         }
     };
 
-    let ingestor = match state.memory_ingestor.as_ref() {
-        Some(i) => i.clone(),
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "memory ingestor disabled"})),
-            )
-                .into_response();
-        }
-    };
+    // 一批里可以混着两种目的，所以抽取器只在真有 learn 条目时才需要：
+    // 缺抽取器不再是整批 503，而是每条 learn 各自报错，归档条目照存。
+    let ingestor = state.memory_ingestor.as_ref().cloned();
 
     let mut results = Vec::new();
     let mut errors = Vec::new();
@@ -281,6 +351,17 @@ pub async fn batch_ingest_handler(
             continue;
         }
 
+        let purpose = match IngestPurpose::parse(&item.purpose) {
+            Ok(p) => p,
+            Err(e) => {
+                errors.push(BatchIngestError {
+                    id: item.id,
+                    error: e,
+                });
+                continue;
+            }
+        };
+
         let content_type = if item.content_type.is_empty() {
             "text/plain"
         } else {
@@ -289,19 +370,42 @@ pub async fn batch_ingest_handler(
 
         let raw = RawSource::new(&item.id, &ns, content_type, item.text.into_bytes());
 
-        match ingestor.ingest(&raw).await {
-            Ok((schema, summary)) => {
-                let raw_uri = match backend.archive_raw(&raw).await {
-                    Ok(uri) => uri,
+        let ingested = match purpose {
+            IngestPurpose::Archive => None,
+            IngestPurpose::Learn => match ingestor.as_ref() {
+                Some(i) => match i.ingest(&raw).await {
+                    Ok(entries) => Some(entries),
                     Err(e) => {
                         errors.push(BatchIngestError {
                             id: item.id,
-                            error: format!("archive failed: {}", e),
+                            error: format!("ingestion failed: {}", e),
                         });
                         continue;
                     }
-                };
+                },
+                None => {
+                    errors.push(BatchIngestError {
+                        id: item.id,
+                        error: "memory ingestor disabled".to_string(),
+                    });
+                    continue;
+                }
+            },
+        };
 
+        let raw_uri = match backend.archive_raw(&raw).await {
+            Ok(uri) => uri,
+            Err(e) => {
+                errors.push(BatchIngestError {
+                    id: item.id,
+                    error: format!("archive failed: {}", e),
+                });
+                continue;
+            }
+        };
+
+        let (schema_count, summary_id) = match ingested {
+            Some((schema, summary)) => {
                 for entry in &schema {
                     if let Err(e) = backend.store_schema(&ns, entry).await {
                         tracing::warn!("Schema store failed: {}", e);
@@ -312,20 +416,18 @@ pub async fn batch_ingest_handler(
                     tracing::warn!("Summary store failed: {}", e);
                 }
 
-                results.push(BatchIngestResult {
-                    id: item.id,
-                    raw_uri,
-                    schema_count: schema.len(),
-                    summary_id: summary.id,
-                });
+                (schema.len(), Some(summary.id))
             }
-            Err(e) => {
-                errors.push(BatchIngestError {
-                    id: item.id,
-                    error: format!("ingestion failed: {}", e),
-                });
-            }
-        }
+            None => (0, None),
+        };
+
+        results.push(BatchIngestResult {
+            id: item.id,
+            raw_uri,
+            schema_count,
+            summary_id,
+            purpose: purpose.as_str().to_string(),
+        });
     }
 
     (
@@ -1067,5 +1169,21 @@ mod tests {
     fn ns_derives_from_first_workspace() {
         let c = claims_with_workspaces(vec!["ws-alpha".into(), "ws-beta".into()]);
         assert_eq!(effective_ns(Some(&c)), "ws-alpha");
+    }
+
+    #[test]
+    fn an_archive_write_is_not_silently_read_as_a_learning_write() {
+        // 缺省仍是 learn：不带 purpose 的老调用方行为不变。
+        assert_eq!(IngestPurpose::parse(""), Ok(IngestPurpose::Learn));
+        assert_eq!(IngestPurpose::parse("learn"), Ok(IngestPurpose::Learn));
+        assert_eq!(IngestPurpose::parse("archive"), Ok(IngestPurpose::Archive));
+        assert_eq!(
+            IngestPurpose::parse(" archive "),
+            Ok(IngestPurpose::Archive)
+        );
+        // 认不出的目的不许落回 learn：落回就意味着又把工具输出的尾巴当成
+        // 学习材料，回一段 200 字前缀冒充摘要。
+        assert!(IngestPurpose::parse("summarize").is_err());
+        assert!(IngestPurpose::parse("Archive").is_err());
     }
 }
