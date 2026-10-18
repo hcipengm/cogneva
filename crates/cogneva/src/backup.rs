@@ -274,6 +274,31 @@ fn copy_from_statement(table: &str, columns: &[String]) -> String {
     )
 }
 
+/// The columns a package may carry: everything the table stores itself.
+///
+/// A generated column is refused by `COPY ... FROM STDIN` the moment it is
+/// named — `Generated columns cannot be used in COPY.` — so a package that
+/// carries one is a package of a whole table that cannot be restored. The value
+/// is not lost by leaving it out: PostgreSQL computes it from the other columns
+/// on every insert. The header and the rows are written from this same list, so
+/// naming the columns on one side and the other stays one decision.
+const MOVABLE_COLUMNS_SQL: &str = "SELECT column_name::text FROM information_schema.columns \
+     WHERE table_schema = 'public' AND table_name = $1 \
+       AND (is_generated IS NULL OR is_generated = 'NEVER') \
+     ORDER BY ordinal_position";
+
+/// The columns a table computes rather than stores, which a restore cannot name.
+const GENERATED_COLUMNS_SQL: &str = "SELECT column_name::text FROM information_schema.columns \
+     WHERE table_schema = 'public' AND table_name = $1 AND is_generated = 'ALWAYS'";
+
+fn copy_to_statement(table: &str, columns: &[String]) -> String {
+    let list: Vec<String> = columns.iter().map(|c| format!("\"{c}\"")).collect();
+    format!(
+        "COPY (SELECT {} FROM \"{table}\") TO STDOUT WITH (FORMAT csv, HEADER true)",
+        list.join(", ")
+    )
+}
+
 /// 运行时发现表清单：新表随迁移自动进备份，不维护手工列表。
 pub async fn discover_tables(pool: &PgPool) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let tables: Vec<String> = sqlx::query_scalar(DISCOVER_TABLES_SQL)
@@ -284,8 +309,9 @@ pub async fn discover_tables(pool: &PgPool) -> Result<Vec<String>, Box<dyn std::
 
 /// PG 逻辑导出：逐表 COPY TO CSV + 全部序列的 setval 语句。
 /// 运行中实例的数据目录文件级拷贝不保证一致，逻辑导出是唯一安全形态。
-/// 导出一律用 COPY (SELECT *) 形式：PG 不允许 COPY <分区父表> TO，
-/// 而 SELECT 形式对普通表与分区父表都成立，列序同为表定义序。
+/// 导出一律用 COPY (SELECT …) 形式：PG 不允许 COPY <分区父表> TO，
+/// 而 SELECT 形式对普通表与分区父表都成立。列名逐个点出而不是 `SELECT *`：
+/// 生成列进得了包、却进不了 `COPY FROM`，一个包只要带上它就整表恢复不了。
 pub async fn backup_postgres(
     pool: &PgPool,
     out_dir: &Path,
@@ -304,11 +330,15 @@ pub async fn backup_postgres(
             .fetch_one(&mut *conn)
             .await?;
         let path = out_dir.join(format!("public.{table}.csv"));
+        // 只搬表自己存的列：生成列在这里点名会在恢复时被 Postgres 拒掉，
+        // 而它的值是别的列算出来的，不搬不丢信息。
+        let movable: Vec<String> = sqlx::query_scalar(MOVABLE_COLUMNS_SQL)
+            .bind(table)
+            .fetch_all(&mut *conn)
+            .await?;
         let mut file = std::fs::File::create(&path)?;
         let mut copy_out = conn
-            .copy_out_raw(&format!(
-                "COPY (SELECT * FROM \"{table}\") TO STDOUT WITH (FORMAT csv, HEADER true)"
-            ))
+            .copy_out_raw(&copy_to_statement(table, &movable))
             .await?;
         use futures::StreamExt;
         use std::io::Write;
@@ -400,6 +430,30 @@ pub async fn restore_postgres(
                 return Err(format!(
                     "package for {table} carries columns the current schema no longer has: {}",
                     vanished
+                        .iter()
+                        .map(|c| c.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+                .into());
+            }
+            // 生成列在包里有、在目标表里也有，`columns_without_a_home` 因此判它
+            // 「有家」；但它的家不接受外人：`COPY FROM` 一点名就整表失败。包是旧
+            // 导出写的（那时导出还带 `SELECT *`），只能拒绝并把名字报出来——按行
+            // 剪掉它得一列一列重写流，与这套按块直送的形状不相容，而静默少一列
+            // 会让行数比对看不出任何差别。
+            let computed: Vec<String> = sqlx::query_scalar(GENERATED_COLUMNS_SQL)
+                .bind(table)
+                .fetch_all(&mut *tx)
+                .await?;
+            let carried: Vec<&String> = columns
+                .iter()
+                .filter(|column| computed.iter().any(|c| c == *column))
+                .collect();
+            if !carried.is_empty() {
+                return Err(format!(
+                    "package for {table} carries generated columns the target computes itself: {}",
+                    carried
                         .iter()
                         .map(|c| c.as_str())
                         .collect::<Vec<_>>()
