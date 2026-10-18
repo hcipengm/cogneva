@@ -2628,6 +2628,21 @@ const UNREAD: &[(&str, Unread)] = &[
         "cogneva_dag_stalled_scheduled_deferred_for_backlog_total",
         Unread::Gap("rows the sweep left in Scheduled because their queue still held undelivered entries. Any nonzero is the wait working as designed, so a rule on it would page on a healthy backlog; what would make a run of deferrals a fault is a backlog that never drains, and the sweep cannot state that -- it counts the rows it left alone, not the messages still waiting, and the queue's undelivered count is read inside the process that asks rather than published as a series. Closing this entry means publishing that backlog depth and reading the two together, not inventing a threshold for this one"),
     ),
+    // The pair minted when the publisher started holding ready tasks back on
+    // what the window can pay for. Both arrive in the pass that made the hold
+    // visible, and both are debts whose reader is a panel rather than a rule:
+    // each of their cells is the gate working as designed at some level, so a
+    // threshold on either would page on the mechanism doing its job. Filing
+    // them here is the deliberate admission that the panel was not written in
+    // this pass, not a claim that no reader can exist.
+    (
+        "cogneva_ready_admission_held_total",
+        Unread::Gap("tasks the publisher refused to dispatch because the pool's window could not pay for them, by `stream` and `reason`. A rule cannot close it: any nonzero is the admission gate holding correctly while the window is spent, and what would make a hold a fault is one that outlasts the window that justified it -- a bound nobody has declared, since the only operand for it is the window's own reset time, which the readings series beside this one carries. Its reader is a panel drawing this count beside the remaining allowance and the reset, which is a panel because the healthy state is a nonzero count for as long as the window is spent. No such panel was written in this pass"),
+    ),
+    (
+        "cogneva_ready_admission_readings",
+        Unread::Gap("the admission pass's own arithmetic, by `stream` and `kind`: the bound it applied (`bounded`, written every pass), the jobs the window could pay for (`window_jobs`, written only when a bound exists), what the queue already owed, and what it admitted. This is a reading rather than a signal -- being bounded is the gate working -- so it has no threshold to fire on, and a rule over it would have to invent a level where bounded becomes wrong. Its reader is the panel above, drawn as the four cells of one pass so an idle pass cannot leave a refusal frozen; that panel is what this debt is owed to"),
+    ),
 ];
 
 /// How many `Gap` entries the census left. A new series that no face reads and
@@ -2790,7 +2805,19 @@ const UNREAD: &[(&str, Unread)] = &[
 /// on it would page on a healthy backlog, and the reading that would make it a
 /// fault (how many messages are still waiting) is not published. So it is a
 /// debt whose missing operand is a reader rather than a bound.
-const GAPS_AT_CENSUS: usize = 24;
+///
+/// It went to 26 in the pass that stopped the publisher from dispatching work
+/// the pool's window cannot pay for. The hold had been invisible in exactly the
+/// shape that let the pacing defect run for days -- a gate doing its job and a
+/// publisher with nothing to publish leave the same trace, no dispatch -- so the
+/// pass minted two series, the refused count and the arithmetic behind it. Both
+/// are debts with the same creditor and neither is a threshold: every cell says
+/// the gate is working, and what would make a hold wrong is its duration, which
+/// only the window's reset time can bound. The reader they need is a panel
+/// drawing the four cells of one pass beside the remaining allowance, and that
+/// panel is what this pass did not write. Recording both is what keeps the
+/// increase a decision rather than a drift.
+const GAPS_AT_CENSUS: usize = 26;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {
