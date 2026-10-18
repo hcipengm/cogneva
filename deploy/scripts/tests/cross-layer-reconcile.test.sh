@@ -209,4 +209,66 @@ expect quota-key-missing 2 "判据 1 读不出来" '
 del state["quota"]["status"]["used"]["requests.memory"]
 '
 
-echo "cross-layer-reconcile: 9 passed"
+# ---- 序列模式：每一拍落一行，红了、读不到也各落一行 ----
+#
+# 判据是「拍子之间有没有洞」，所以**判红的那一拍也必须是拍子**：只在绿的时候写，
+# 序列上的洞就同时代表「没跑」和「跑了但红了」，而这两件事要修的地方不同。
+
+run_gate_record() { # run_gate_record <场景目录> <序列文件>：带 --record 跑一次
+  local scen="$1" series="$2"
+  set +e
+  SCEN="${scen}" COGNEVA_KUBECTL="${work}/fake-kubectl" \
+  COGNEVA_PROM_QUERY_CMD="${work}/fake-prom" \
+  COGNEVA_RECONCILE_SERIES="${series}" \
+      bash "${gate}" --record >"${work}/out.txt" 2>&1
+  RC=$?
+  set -e
+  LAST_OUT="$(cat "${work}/out.txt")"
+}
+
+field() { awk -F'\t' -v n="$2" 'NR == 1 { print $n }' "$1"; }
+
+# 10. 绿的一拍照样落一行，数值是这一拍读到的（allocatable = 55706256Ki、used = 6864Mi）。
+scen="$(make_scenario record-ok 'pass')"
+rec="${work}/series-ok.tsv"
+run_gate_record "${scen}" "${rec}"
+[ "${RC}" -eq 0 ] || fail "record-ok: 期望退出码 0，实得 ${RC}；输出：${LAST_OUT}"
+[ "$(wc -l <"${rec}")" -eq 1 ] || fail "record-ok: 序列不是一行：$(cat "${rec}")"
+[ "$(awk -F'\t' 'NR == 1 { print NF }' "${rec}")" -eq 7 ] \
+    || fail "record-ok: 序列不是 7 列：$(cat "${rec}")"
+[ "$(field "${rec}" 2)" = "ok" ] || fail "record-ok: 结局不是 ok：$(cat "${rec}")"
+[ "$(field "${rec}" 3)" = "7197425664" ] || fail "record-ok: used_memory 不对：$(cat "${rec}")"
+[ "$(field "${rec}" 4)" = "57043206144" ] || fail "record-ok: allocatable 不对：$(cat "${rec}")"
+echo "ok   record-ok：一行 7 列，结局 ok，allocatable 是这一拍读到的数"
+
+# 11. 判红的一拍也落一行（结局 broken，数值仍在）。
+scen="$(make_scenario record-broken '
+state["quota"]["status"]["used"]["requests.memory"] = str(80 * Gi)
+')"
+rec="${work}/series-broken.tsv"
+run_gate_record "${scen}" "${rec}"
+[ "${RC}" -eq 1 ] || fail "record-broken: 期望退出码 1，实得 ${RC}；输出：${LAST_OUT}"
+[ "$(field "${rec}" 2)" = "broken" ] || fail "record-broken: 结局不是 broken：$(cat "${rec}")"
+[ "$(field "${rec}" 3)" = "85899345920" ] || fail "record-broken: used_memory 不对：$(cat "${rec}")"
+echo "ok   record-broken：红了照样是一拍，数值留在序列里"
+
+# 12. 读不到的一拍也落一行（结局 unreadable，数值记 '-'）。
+mkdir -p "${work}/no-scenario"
+rec="${work}/series-unreadable.tsv"
+run_gate_record "${work}/no-scenario" "${rec}"
+[ "${RC}" -eq 2 ] || fail "record-unreadable: 期望退出码 2，实得 ${RC}；输出：${LAST_OUT}"
+[ "$(field "${rec}" 2)" = "unreadable" ] || fail "record-unreadable: 结局不是 unreadable：$(cat "${rec}")"
+[ "$(field "${rec}" 3)" = "-" ] || fail "record-unreadable: 读不到的数没有记 '-'：$(cat "${rec}")"
+echo "ok   record-unreadable：读不到也是一拍，不写成洞"
+
+# 13. 不带 --record 不写任何东西：日跑与测试都靠这个默认。
+scen="$(make_scenario record-off 'pass')"
+rec="${work}/series-off.tsv"
+SCEN="${scen}" COGNEVA_KUBECTL="${work}/fake-kubectl" \
+COGNEVA_PROM_QUERY_CMD="${work}/fake-prom" \
+COGNEVA_RECONCILE_SERIES="${rec}" \
+    bash "${gate}" >/dev/null 2>&1 || fail "record-off: 不带 --record 时退出码不是 0"
+[ ! -e "${rec}" ] || fail "record-off: 没带 --record 却写了序列：$(cat "${rec}")"
+echo "ok   record-off：不带 --record 时一个字节也不写"
+
+echo "cross-layer-reconcile: 13 passed"

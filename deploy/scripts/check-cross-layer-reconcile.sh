@@ -29,8 +29,16 @@
 # 序列、7 天窗口里没有 file 样本）⇒ 2。把「没人看」写成「一致」是这条读数最容易犯的错：
 # 一个 DaemonSet 在某个节点没起来，读出来是**没有序列**而不是 0。
 #
-# 用法：bash deploy/scripts/check-cross-layer-reconcile.sh
+# 用法：bash deploy/scripts/check-cross-layer-reconcile.sh [--record]
 # 退出码：0 成立；1 有不成立（逐条点名层与不等式）；2 判不了（某层读不到）。
+#
+# `--record` 把这一拍追加成序列文件的一行（默认
+# `${XDG_STATE_HOME:-$HOME/.local/state}/cogneva/cross-layer-reconcile.tsv`）：
+#   时刻 <TAB> 结局 <TAB> used_memory <TAB> allocatable_memory <TAB> Σanon <TAB>
+#   file 7d 最小 <TAB> MemTotal        （数值一律字节，读不到记 `-`）
+# 结局取 ok / broken / unreadable。**判红与读不到也各写一行**：只在绿的时候写，
+# 序列上的空洞就同时代表「没跑」与「跑了但红了」，而这两件事要修的地方不同。
+# 有了这份序列，「昨天 14:00 的 allocatable 是多少」是读文件，不是重跑一次。
 #
 # 环境：
 #   COGNEVA_KUBECTL          默认 "sudo -n k3s kubectl"
@@ -38,13 +46,33 @@
 #   COGNEVA_PROM_QUERY_CMD   测试注入点：给它一个可执行文件，参数是 PromQL，
 #                            标准输出当作 /api/v1/query 的响应体，不再走 curl
 #   COGNEVA_RECONCILE_NS     默认 cogneva
+#   COGNEVA_RECONCILE_SERIES 序列文件路径（`--record` 时写）
 set -euo pipefail
 
 KUBECTL="${COGNEVA_KUBECTL:-sudo -n k3s kubectl}"
 NS="${COGNEVA_RECONCILE_NS:-cogneva}"
 QUOTA_NAME="${COGNEVA_RECONCILE_QUOTA:-cogneva-quota}"
+SERIES="${COGNEVA_RECONCILE_SERIES:-${XDG_STATE_HOME:-$HOME/.local/state}/cogneva/cross-layer-reconcile.tsv}"
+record=0
+for arg in "$@"; do
+    case "$arg" in
+        --record) record=1 ;;
+        *) printf 'CROSS-LAYER: 不认识的参数：%s（只有 --record）\n' "$arg" >&2; exit 2 ;;
+    esac
+done
 
-die() { printf 'CROSS-LAYER: %s\n' "$*" >&2; exit 2; }
+# 写不进序列时只告警、不改判词：这一步是读数，不是判据；但它必须留痕，
+# 否则「文件没长」与「这一拍没跑」在读数面上同形。
+series_append() { # <结局> <used_mem> <alloc_mem> <Σanon> <file_min> <MemTotal>
+    [ "${record}" = 1 ] || return 0
+    mkdir -p -- "$(dirname -- "${SERIES}")" 2>/dev/null \
+        || { printf 'CROSS-LAYER: 建不出序列目录，这一拍没有留下读数：%s\n' "${SERIES}" >&2; return 0; }
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$@" >>"${SERIES}" 2>/dev/null \
+        || printf 'CROSS-LAYER: 序列写不进去，这一拍没有留下读数：%s\n' "${SERIES}" >&2
+}
+
+# 读不到任何一层时也记一行：这一拍确实跑了，只是它没判成。
+die() { series_append unreadable - - - - -; printf 'CROSS-LAYER: %s\n' "$*" >&2; exit 2; }
 
 command -v python3 >/dev/null || die "缺少依赖：python3，判不了三层对账"
 
@@ -93,6 +121,9 @@ prom 'node_memory_MemTotal_bytes * on (instance) group_left (nodename) node_unam
 prom 'rate(node_pressure_memory_stalled_seconds_total[5m]) * on (instance) group_left (nodename) node_uname_info' \
     "${work}/psi_full.json"
 
+if [ "${record}" = 1 ]; then
+    export CROSS_LAYER_RECORD_FILE="${SERIES}"
+fi
 python3 - "${work}" "${NS}/${QUOTA_NAME}" <<'PYEOF'
 import json
 import os
@@ -146,6 +177,27 @@ file_min = vector('file_min.json')
 memtotal = vector('memtotal.json')
 psi_full = vector('psi_full.json')
 
+
+def record(verdict, used_mem=None, alloc_mem=None):
+    """这一拍追加成序列的一行。写不进去只告警：它是读数，不是判据。"""
+    path = os.environ.get('CROSS_LAYER_RECORD_FILE')
+    if not path:
+        return
+
+    def cell(v):
+        return '-' if v is None else str(int(round(v)))
+
+    row = '\t'.join([
+        str(int(__import__('time').time())), verdict,
+        cell(used_mem), cell(alloc_mem),
+        cell(sum(anon.values())), cell(sum(file_min.values())), cell(sum(memtotal.values())),
+    ])
+    try:
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write(row + '\n')
+    except OSError as e:
+        print(f"CROSS-LAYER: 序列写不进去，这一拍没有留下读数：{e}", file=sys.stderr)
+
 alloc = {}
 for n in nodes.get('items', []):
     name = n['metadata']['name']
@@ -172,6 +224,7 @@ def show(res, n):
     return f"{n:.3g}" if res == 'cpu' else gib(n)
 
 
+observed = {}
 for res, total in (('cpu', sum_cpu), ('memory', sum_mem)):
     key = f'requests.{res}'
     if key not in used or key not in hard:
@@ -180,6 +233,7 @@ for res, total in (('cpu', sum_cpu), ('memory', sum_mem)):
                           f"（used 有的键：{sorted(used)}）")
         continue
     u = qty(used[key])
+    observed[res] = u
     h = qty(hard[key])
     if u > total:
         problems.append(
@@ -227,16 +281,21 @@ for node in sorted(memtotal):
               f"压力不在不可回收内存上，去 io / 回写那条线找")
 
 if unreadable:
+    # 判不了也记一行：这一拍跑过了，只是没读全——不记的话，序列上的空洞会把
+    # 「没跑」和「跑了但读不到」混成同一件事。
+    record('unreadable', observed.get('memory'), sum_mem)
     print("CROSS-LAYER 判不了：")
     for u in unreadable:
         print("  - " + u)
     sys.exit(2)
 
 if problems:
+    record('broken', observed.get('memory'), sum_mem)
     print(f"CROSS-LAYER 不成立 [{quota_id}]：")
     for p in problems:
         print("  - " + p)
     sys.exit(1)
 
+record('ok', observed.get('memory'), sum_mem)
 print(f"CROSS-LAYER OK [{quota_id}]：三层在同一行上仍彼此装得下")
 PYEOF

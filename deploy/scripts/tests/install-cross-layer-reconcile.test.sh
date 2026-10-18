@@ -45,13 +45,41 @@ fi
 #    删掉它，下一个人会把标志加回去，然后得到「每次退出码 2、is-active 仍绿」。
 grep -q 'NoNewPrivileges' "${svc}" || fail "service 丢了 NoNewPrivileges 的说明"
 
-# 4. ExecStart 指向的脚本得真的在、真的可执行。
+# 4. ExecStart 指向的脚本得真的在、真的可执行（`--record` 是参数，不是路径的一部分）。
 exec_line="$(grep -m1 '^ExecStart=' "${svc}")" || fail "service 没有 ExecStart"
-target="${exec_line#ExecStart=}"
+read -r -a exec_words <<<"${exec_line#ExecStart=}"
+target="${exec_words[0]}"
 [ -x "${target}" ] || fail "ExecStart 指向的脚本不可执行：${target}"
 
 # 5. timer 的拍子与启用面。
 grep -q '^OnCalendar=' "${tmr}" || fail "timer 没有 OnCalendar"
 grep -q '^WantedBy=timers.target' "${tmr}" || fail "timer 没有 WantedBy=timers.target"
 
-echo "install-cross-layer-reconcile: 5 passed"
+# 6. 产出单元必须带 --record，否则序列永远是空的，而检查器会把「没在记」读成「没在跑」。
+printf '%s\n' "${exec_line}" | grep -q -- ' --record' \
+    || fail "service 的 ExecStart 没有 --record：${exec_line}"
+
+# 7. 检查器单元与 timer：脚本可执行、读的是同一个序列、红不被包装成成功。
+chk="${unit_dir}/cogneva-cross-layer-reconcile-series-check.service"
+chkt="${unit_dir}/cogneva-cross-layer-reconcile-series-check.timer"
+[ -f "${chk}" ] || fail "没有写出检查器 service：${chk}"
+[ -f "${chkt}" ] || fail "没有写出检查器 timer：${chkt}"
+chk_line="$(grep -m1 '^ExecStart=' "${chk}")" || fail "检查器 service 没有 ExecStart"
+read -r -a chk_words <<<"${chk_line#ExecStart=}"
+[ -x "${chk_words[0]}" ] || fail "检查器的脚本不可执行：${chk_words[0]}"
+chk_file="$(printf '%s\n' "${chk_words[@]}" | awk 'p { print; exit } $0 == "--file" { p = 1 }')"
+env_series="$(grep -m1 '^Environment=COGNEVA_RECONCILE_SERIES=' "${svc}")"
+env_series="${env_series#Environment=COGNEVA_RECONCILE_SERIES=}"
+[ -n "${chk_file}" ] || fail "检查器没有 --file 参数：${chk_line}"
+[ "${chk_file}" = "${env_series}" ] \
+    || fail "产出与检查读的不是同一个序列：${env_series} vs ${chk_file}"
+grep -q '^SuccessExitStatus=' "${chk}" \
+    && fail "检查器把退出码 1 包装成了成功——缺拍就再也不会出现在 systemctl --failed 上"
+grep -q '^WantedBy=timers.target' "${chkt}" || fail "检查器 timer 没有 WantedBy=timers.target"
+
+# 8. 两个 timer 不能同刻：同刻跑的话，一次迟到会同时被算成「缺拍」与「正常」。
+prod_cal="$(grep -m1 '^OnCalendar=' "${tmr}")"
+chk_cal="$(grep -m1 '^OnCalendar=' "${chkt}")"
+[ "${prod_cal}" != "${chk_cal}" ] || fail "两个 timer 的拍子相同：${prod_cal}"
+
+echo "install-cross-layer-reconcile: 8 passed"
