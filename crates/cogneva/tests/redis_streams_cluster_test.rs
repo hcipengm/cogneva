@@ -356,6 +356,7 @@ async fn test_pending_result_is_reclaimed_and_applied() {
             result_claim_idle_secs: 0,
             result_claim_interval_secs: 1,
             result_claim_batch: 16,
+            ..DagExecutorConfig::default()
         },
         backend,
     ));

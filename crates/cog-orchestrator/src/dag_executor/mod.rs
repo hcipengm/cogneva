@@ -272,8 +272,8 @@ impl DagExecutorRuntime {
                     // outages. The wake instant is this loop's own next look,
                     // not a promise about the upstream -- that promise lives in
                     // the gateway's snapshot and is not ours to restate.
-                    match pays_for {
-                        Some(bound) => tracing::warn!(
+                    if let Some(bound) = pays_for {
+                        tracing::warn!(
                             stream = %stream,
                             ready = entries.len(),
                             admitted,
@@ -295,8 +295,7 @@ impl DagExecutorRuntime {
                                 )
                             ),
                             "holding ready tasks back: the pool's window cannot pay for them, so they stay pending until it can"
-                        ),
-                        None => {}
+                        );
                     }
                     entries.truncate(usize::try_from(admitted).unwrap_or(usize::MAX));
                 }
