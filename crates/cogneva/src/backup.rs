@@ -238,16 +238,32 @@ fn csv_columns(header: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> 
         .split(',')
         .map(|column| column.trim_matches('"').to_string())
         .collect();
-    for column in &columns {
-        if column.is_empty()
-            || !column
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-        {
-            return Err(format!("unsafe column name in package: {column:?}").into());
+    for (index, column) in columns.iter().enumerate() {
+        // 表头来自包内文件，是外部输入：先按普通标识符白名单判，
+        // 不合格就不回显原文（错误信息会进 backup_drills.error 并随备份保存）。
+        let mut chars = column.chars();
+        let starts_well = matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c == '_');
+        let rest_well = chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        if !starts_well || !rest_well {
+            return Err(
+                format!("column {index} of the package header is not a plain identifier").into(),
+            );
         }
     }
     Ok(columns)
+}
+
+/// 包里有、当前 schema 里已经没有的列。
+///
+/// 这类列的数据恢复时无处可放：显式点名会被 Postgres 判未知列，而不点名
+/// （按位置对齐）会静默把值错位到别的列上——两种都不能接受。恢复因此要
+/// 拒绝整包并把名字报出来，由人决定是找回旧 schema 还是放弃那段数据；
+/// 悄悄少恢复一列的话，行数比对完全看不出来。
+fn columns_without_a_home<'a>(package: &'a [String], current: &[String]) -> Vec<&'a String> {
+    package
+        .iter()
+        .filter(|column| !current.contains(*column))
+        .collect()
 }
 
 fn copy_from_statement(table: &str, columns: &[String]) -> String {
@@ -372,6 +388,25 @@ pub async fn restore_postgres(
                 std::io::BufReader::new(std::fs::File::open(&path)?).read_line(&mut header)?;
                 header
             })?;
+            let current: Vec<String> = sqlx::query_scalar(
+                "SELECT column_name::text FROM information_schema.columns \
+                 WHERE table_schema = 'public' AND table_name = $1",
+            )
+            .bind(table)
+            .fetch_all(&mut *tx)
+            .await?;
+            let vanished = columns_without_a_home(&columns, &current);
+            if !vanished.is_empty() {
+                return Err(format!(
+                    "package for {table} carries columns the current schema no longer has: {}",
+                    vanished
+                        .iter()
+                        .map(|c| c.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+                .into());
+            }
             let mut file = std::fs::File::open(&path)?;
             let mut copy_in = tx
                 .copy_in_raw(&copy_from_statement(table, &columns))
@@ -1717,12 +1752,46 @@ mod tests {
         // The header comes out of the package, so it is untrusted input to a
         // statement: anything that is not a plain identifier is refused rather
         // than quoted and handed to the server.
-        for header in ["id; DROP TABLE users", "id,na\"me", "id,,name", ""] {
+        for header in [
+            "id; DROP TABLE users",
+            "id,na\"me",
+            "id,,name",
+            "",
+            "0id",
+            "Id",
+        ] {
             assert!(
                 csv_columns(header).is_err(),
                 "header {header:?} should not become a column list"
             );
         }
+
+        // The refusal must not carry the header back out: the error lands in
+        // backup_drills.error and in the package's own logs.
+        let err = csv_columns("id; DROP TABLE users").unwrap_err().to_string();
+        assert!(
+            !err.contains("DROP"),
+            "the rejected header must not be echoed: {err}"
+        );
+    }
+
+    #[test]
+    fn a_column_the_schema_dropped_stops_the_restore_instead_of_losing_its_values() {
+        // Naming the package's columns fixes added columns. A column the schema
+        // since *dropped* is the other direction: it has no home in the target,
+        // so naming it fails loudly and skipping it silently discards data that
+        // a row-count comparison cannot see. Restore must refuse and say which.
+        let package = vec!["id".to_string(), "retired_at".to_string()];
+        let current = vec!["id".to_string(), "created_at".to_string()];
+        assert_eq!(
+            columns_without_a_home(&package, &current),
+            vec![&"retired_at".to_string()]
+        );
+
+        // Columns added after the package was written are supplied by defaults,
+        // which is the ordinary case and must not be treated as an error.
+        let older = vec!["id".to_string()];
+        assert!(columns_without_a_home(&older, &current).is_empty());
     }
 
     #[test]
