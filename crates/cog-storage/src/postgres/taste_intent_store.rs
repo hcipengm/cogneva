@@ -51,6 +51,16 @@ CREATE TABLE IF NOT EXISTS cog_taste_intents (
                 task_id       TEXT,
                 disposed_at   TIMESTAMPTZ
             );
+
+-- A table created before the column existed is brought forward here: the
+-- CREATE above does nothing to an existing table, so without this every
+-- deployment that predates evidence_refs would reject its own submissions
+-- until somebody dropped the table by hand.
+ALTER TABLE cog_taste_intents
+    ADD COLUMN IF NOT EXISTS evidence_refs JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+CREATE INDEX IF NOT EXISTS idx_cog_taste_intents_status
+    ON cog_taste_intents(status, submitted_at);
 "#;
 
 #[derive(Clone)]
