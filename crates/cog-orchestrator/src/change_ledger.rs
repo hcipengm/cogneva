@@ -444,6 +444,26 @@ const LANDING_LOG_COMMITS: usize = 2_000;
 /// survive the landing process dying between the commit and the record, and then
 /// the record would be missing for a change that is plainly on the line.
 ///
+/// Two forms of trailer name the same fact. The current one is
+/// [`cog_core::LANDING_TRAILER`]; the producer generation that landed every
+/// change before it wrote the id only in a `Change-Id:` trailer (with a
+/// `chore(<scope>): land change <id>` subject, which this also covers through
+/// the trailer). Reading only the current form would report the whole existing
+/// history as undelivered -- which is the inversion the trailer exists to make
+/// impossible -- so both are accepted. Neither can name a row by accident: the
+/// id is matched against ledger ids, whose hash prefix no other commit knows.
+const CHANGE_ID_TRAILER: &str = "Change-Id: ";
+
+/// The change id a line names, if the line is a landing trailer.
+fn trailer_named_change(line: &str) -> Option<&str> {
+    let named = line
+        .trim()
+        .strip_prefix(cog_core::LANDING_TRAILER)
+        .or_else(|| line.trim().strip_prefix(CHANGE_ID_TRAILER))?;
+    let id = named.split_whitespace().next()?;
+    (!id.is_empty()).then_some(id)
+}
+
 /// The trailer carries the id of the task the change was handed over under, and
 /// one commit may name more than one change. First sighting wins as the log is
 /// read newest first, so a change that was landed twice is attributed to the
@@ -460,17 +480,12 @@ fn landing_trailers(log: &str) -> HashMap<String, String> {
             continue;
         }
         for line in body.lines() {
-            let Some(named) = line.trim().strip_prefix(cog_core::LANDING_TRAILER) else {
+            let Some(id) = trailer_named_change(line) else {
                 continue;
             };
-            let Some(id) = named.split_whitespace().next() else {
-                continue;
-            };
-            if !id.is_empty() {
-                landed
-                    .entry(id.to_string())
-                    .or_insert_with(|| rev.to_string());
-            }
+            landed
+                .entry(id.to_string())
+                .or_insert_with(|| rev.to_string());
         }
     }
     landed
@@ -6146,6 +6161,43 @@ mod tests {
             Some(&"aaaa".to_string())
         );
         assert_eq!(landed.len(), 1, "a body with no trailer names nothing");
+    }
+
+    #[test]
+    fn a_landing_from_before_the_trailer_existed_is_still_a_delivery() {
+        // Every landing already on the tree was written by the generation that
+        // named the change in a `Change-Id:` trailer and in the subject, not in
+        // a `Landing change` line. A reader that knew only the current form
+        // would read the entire history as never delivered.
+        let log = commit(
+            "ffff",
+            "chore(cogneva): land change change-ledger-0123456789abcdef-abcd\n\n\
+             Change-Id: change-ledger-0123456789abcdef-abcd\n\
+             Signed-off-by: Luna#1822ab0e <luna-1822ab0e@cogneva.ai>\n",
+        );
+        assert_eq!(
+            landing_trailers(&log)
+                .get("change-ledger-0123456789abcdef-abcd")
+                .map(String::as_str),
+            Some("ffff")
+        );
+    }
+
+    #[test]
+    fn a_trailer_shaped_line_in_the_rationale_names_a_change_too() {
+        // The rationale is free text. It is read like any other body line on
+        // purpose: the id has to match a ledger row to matter, and a producer
+        // quoting the trailer it was told to write is still naming that id.
+        let log = commit(
+            "gggg",
+            "fix(x): something\n\n## Rationale\n\nLanding change change-ledger-0123456789abcdef-abcd\n",
+        );
+        assert_eq!(
+            landing_trailers(&log)
+                .get("change-ledger-0123456789abcdef-abcd")
+                .map(String::as_str),
+            Some("gggg")
+        );
     }
 
     #[test]
