@@ -75,6 +75,10 @@ const ENV_IMAGE_MIRROR: &str = "COGNEVA_EVAL_IMAGE_MIRROR";
 /// 变成一次带原因的失败，而不是一个永远挂在那里的格子。
 const ENV_TIMEOUT_SECS: &str = "COGNEVA_EVAL_CONTAINER_TIMEOUT_SECS";
 const DEFAULT_TIMEOUT_SECS: u64 = 900;
+/// 默认那份（overlay）起不来时换的那一份。选 vfs 而不是 fuse-overlayfs：后者要 Pod 里再装
+/// 一个二进制与一份 `/etc/containers/storage.conf`，而 vfs 是 buildah 自带的、只要一个参数。
+/// 代价写在 `adopt_storage_driver` 上——那是一次性的，而这一族现在一次都跑不起来。
+const FALLBACK_STORAGE_DRIVER: &str = "vfs";
 /// 运行时的开关：设成 `off` 就是这一次不接。
 const ENV_RUNTIME: &str = "COGNEVA_EVAL_CONTAINER_RUNTIME";
 
@@ -241,7 +245,17 @@ pub struct BuildahRuntime {
     /// 这台宿主的 store 里现在有哪些镜像 ref。**问一次，整跑记着**：这是一条普查读数，
     /// 每道题各问一遍等于把一次便宜的问摊成题数那么多次。`None` ＝ 问不出来（命令失败或
     /// 这份 buildah 不认 `images`），这时调用方不许把「问不出来」当成「本地没有」。
-    images: tokio::sync::OnceCell<Option<HashSet<String>>>,
+    ///
+    /// 缓存要能被**清**：存储驱动一换，那份 store 就是另一份了，旧普查答的是另一个问题。
+    images: tokio::sync::Mutex<Option<Option<HashSet<String>>>>,
+    /// 用的哪份存储驱动。`None` 的 cell ＝ 还没试过默认那份；`Some(None)` ＝ 默认那份能用；
+    /// `Some(Some(d))` ＝ 默认那份起不来，之后每条命令都带上 `--storage-driver=<d>`。
+    ///
+    /// 为什么需要它：Pod 的根文件系统本身就是 overlayfs，buildah 的 overlay 驱动不能在
+    /// overlayfs 上再叠一层（`'overlay' is not supported over overlayfs, a mount_program is
+    /// required`）。这条错误只在**建第一台容器**时才出现，而那时镜像已经在解析了——所以它
+    /// 既不能靠 `--version` 探出来，也不能在编译期定死。
+    storage: tokio::sync::OnceCell<Option<String>>,
 }
 
 impl BuildahRuntime {
@@ -285,7 +299,8 @@ impl BuildahRuntime {
                     prefix,
                     mirror,
                     timeout,
-                    images: tokio::sync::OnceCell::new(),
+                    images: tokio::sync::Mutex::new(None),
+                    storage: tokio::sync::OnceCell::new(),
                 }));
             }
         }
@@ -305,24 +320,43 @@ impl BuildahRuntime {
     /// 分不出缺的是一份镜像、还是这台机器坏了。实测（2026-10-17，本机）：宿主默认路由换到了
     /// WiFi，实测吞吐 150–220 KB/s，一题 2.26 GB 的镜像在 900 秒的界里拉不完，整整一跑报回来
     /// 的却是 `sudo -n buildah from did not finish within 900s`。
-    async fn image_refs(&self) -> Option<&HashSet<String>> {
-        self.images
-            .get_or_init(|| async {
-                let out = self
-                    .exec(&[
-                        "images".into(),
-                        "--format".into(),
-                        "{{.Name}}:{{.Tag}}".into(),
-                    ])
-                    .await
-                    .ok()?;
-                if out.code != Some(0) {
-                    return None;
-                }
-                Some(parse_image_refs(&out.stdout))
-            })
+    async fn image_refs(&self) -> Option<HashSet<String>> {
+        let mut slot = self.images.lock().await;
+        if let Some(cached) = slot.as_ref() {
+            return cached.clone();
+        }
+        let out = self
+            .exec(&[
+                "images".into(),
+                "--format".into(),
+                "{{.Name}}:{{.Tag}}".into(),
+            ])
             .await
-            .as_ref()
+            .ok();
+        let answer = match out {
+            Some(out) if out.code == Some(0) => Some(parse_image_refs(&out.stdout)),
+            _ => None,
+        };
+        *slot = Some(answer.clone());
+        answer
+    }
+
+    /// 这一跑用的存储驱动。`None` ＝ 默认那份（还没被证伪过，或者它本来就能用）。
+    fn storage_driver(&self) -> Option<&str> {
+        self.storage.get().and_then(|driver| driver.as_deref())
+    }
+
+    /// 默认那份起不来时换一份，并**同时丢掉旧普查**：镜像问的是「这份 store 里有什么」，
+    /// 换驱动后那份答案是另一个 store 的。返回 false ＝ 已经定过驱动了，不再换第二次。
+    async fn adopt_storage_driver(&self, driver: &str) -> bool {
+        if self.storage.get().is_some() {
+            return false;
+        }
+        if self.storage.set(Some(driver.to_string())).is_err() {
+            return false;
+        }
+        *self.images.lock().await = None;
+        true
     }
 
     fn command(&self) -> tokio::process::Command {
@@ -338,7 +372,7 @@ impl BuildahRuntime {
     /// 而真相是「这台机器没跑完」。
     async fn exec(&self, args: &[String]) -> anyhow::Result<RunOutcome> {
         let mut cmd = self.command();
-        cmd.args(args);
+        cmd.args(&args_with_driver(self.storage_driver(), args));
         let child = cmd
             .kill_on_drop(true)
             .spawn()
@@ -385,6 +419,32 @@ async fn probe(prefix: &[String]) -> bool {
     }
 }
 
+/// buildah 的全局参数：驱动一旦定下，每条命令都要带。
+///
+/// 写在子命令**前面**：`--storage-driver` 是全局旗标，`buildah from --storage-driver=vfs`
+/// 会被当成 `from` 自己的参数而报未知旗标。这条顺序是这一层唯一能让「换驱动」生效的地方，
+/// 所以它单独成一个纯函数，由测试钉住。
+fn args_with_driver(driver: Option<&str>, args: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len() + 1);
+    if let Some(driver) = driver {
+        out.push(format!("--storage-driver={driver}"));
+    }
+    out.extend(args.iter().cloned());
+    out
+}
+
+/// 这段 stderr 是不是「overlay 驱动叠在 overlayfs 上」这一条。
+///
+/// 只认这一条错误，不认「建容器失败」这一类：换驱动是有代价的（换了一份 store，镜像要重取），
+/// 把它挂在任何失败上，一次普通的缺镜像也会被读成「机器要换驱动」，而真正的成因就被这句话
+/// 盖住了。实测原文（2026-10-18，Pod 内）：
+/// `[graphdriver] prior storage driver overlay failed: 'overlay' is not supported over
+/// overlayfs, a mount_program is required: backing file system is unsupported for this graph
+/// driver`。
+fn overlay_driver_cannot_nest(stderr: &str) -> bool {
+    stderr.contains("is not supported over overlayfs")
+}
+
 /// `buildah images --format '{{.Name}}:{{.Tag}}'` 的正文 → 一份 ref 集合。
 ///
 /// 单独成一个不吃运行时的函数，是因为这里有一处**会静默读错**的形状：buildah 对没有 tag 的
@@ -415,9 +475,20 @@ impl Container {
     /// 半成品，不该拦住这一次。
     async fn create(runtime: Arc<BuildahRuntime>, image: &str, name: &str) -> anyhow::Result<Self> {
         let _ = runtime.exec(&["rm".into(), name.into()]).await;
-        let out = runtime
+        let mut out = runtime
             .exec(&["from".into(), "--name".into(), name.into(), image.into()])
             .await?;
+        // 起第一台容器时才看得见的那条失败：overlay 驱动要叠在 overlayfs 上。这时换 vfs
+        // 重来一次，而不是把「这台机器不支持」当成题的结局——它挡的是整个族，不是这一道题。
+        if out.code != Some(0)
+            && overlay_driver_cannot_nest(&out.stderr)
+            && runtime.adopt_storage_driver(FALLBACK_STORAGE_DRIVER).await
+        {
+            let _ = runtime.exec(&["rm".into(), name.into()]).await;
+            out = runtime
+                .exec(&["from".into(), "--name".into(), name.into(), image.into()])
+                .await?;
+        }
         if out.code != Some(0) {
             anyhow::bail!(
                 "cannot start a container from {image}: {}",
@@ -948,11 +1019,11 @@ impl SweProBackend for SweProContainerBackend {
         // 在缺镜像时顺手去拉——改的只是它失败时那句话说得清缺的是哪一样：与「这台机器坏了」
         // 共用一句「命令没跑完」时，读的人会被送去查 buildah，而真正缺的是一份没取下来的镜像。
         let refs = self.runtime.image_refs().await;
-        let present = refs.map(|set| set.contains(&image));
+        let present = refs.as_ref().map(|set| set.contains(&image));
         if present == Some(false) {
             tracing::warn!(
                 image = %image,
-                local_refs = refs.map(|set| set.len()).unwrap_or(0),
+                local_refs = refs.as_ref().map(HashSet::len).unwrap_or(0),
                 "this instance's image is not in the host's container store; starting a container \
                  from it means fetching it first"
             );
@@ -966,7 +1037,7 @@ impl SweProBackend for SweProContainerBackend {
                  and starting a container from it did not finish: this is the fetch, not the case \
                  failing to run. Fetch it once (`buildah pull {image}`) and the case can run; the \
                  underlying failure was: {e}",
-                refs.map(|set| set.len()).unwrap_or(0)
+                refs.as_ref().map(HashSet::len).unwrap_or(0)
             ),
             Err(e) => return Err(e),
         };
@@ -1224,6 +1295,40 @@ docker.m.daocloud.io/library/busybox:1.36
         assert!(parse_image_refs("").is_empty());
     }
 
+    /// 换驱动只认**那一条**错误。这段 stderr 是从评测 Pod 里逐字抄回来的（2026-10-18），
+    /// 另外两条反例都是同一台机器上真实见过的失败：缺镜像与权限。把它们也读成「要换驱动」，
+    /// 一次普通的取镜像失败就会变成一句「这台机器不支持」，真正的成因被盖上。
+    #[test]
+    fn only_the_nested_overlay_failure_asks_for_a_different_driver() {
+        let nested = "[graphdriver] prior storage driver overlay failed: 'overlay' is not \
+                      supported over overlayfs, a mount_program is required: backing file system \
+                      is unsupported for this graph driver";
+        assert!(overlay_driver_cannot_nest(nested));
+        assert!(!overlay_driver_cannot_nest(
+            "error creating build container: initializing source docker://x: reading manifest: not found"
+        ));
+        assert!(!overlay_driver_cannot_nest(
+            "Error: running `buildah from` requires root"
+        ));
+        assert!(!overlay_driver_cannot_nest(""));
+    }
+
+    /// 驱动旗标是 buildah 的**全局**参数，必须在子命令之前。放到后面时 buildah 会把它当成
+    /// 子命令自己的参数而拒绝这一条命令——那时换驱动这件事就静默地没发生，而这一族的读数
+    /// 还是同一句 overlay 报错，读的人会以为换驱动也没用。
+    #[test]
+    fn the_driver_flag_lands_before_the_subcommand() {
+        let args: Vec<String> = ["from", "--name", "cog-1", "img:tag"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let with = args_with_driver(Some("vfs"), &args);
+        assert_eq!(with[0], "--storage-driver=vfs");
+        assert_eq!(&with[1..], args.as_slice());
+        // 没换驱动时逐字不动：默认那份能用的机器上不该多出一条参数。
+        assert_eq!(args_with_driver(None, &args), args);
+    }
+
     /// 我们拿去查的那个 ref，必须与普查印出来的**逐字节同形**。
     ///
     /// 这是这一层唯一会**静默**读错的地方：形状一旦分家（换过镜像站、`Name` 打出来带上了
@@ -1264,7 +1369,8 @@ docker.m.daocloud.io/library/busybox:1.36
             prefix: vec!["sudo".into(), "-n".into(), "buildah".into()],
             mirror: mirror.map(str::to_string),
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-            images: tokio::sync::OnceCell::new(),
+            images: tokio::sync::Mutex::new(None),
+            storage: tokio::sync::OnceCell::new(),
         }
     }
 
