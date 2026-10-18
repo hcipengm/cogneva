@@ -1240,6 +1240,18 @@ fn normalize_deployed(deployed: &DeployedState, has_in_flight: bool) -> Deployed
     }
 }
 
+/// 已经付过构建钱之后，还要不要把这一版丢掉。
+///
+/// 两个祖先判定分开传进来，是为了让调用方短路那两次 git 读；这里只命名规则：
+/// 只有「上游的 tip 里已经不含这一版」才算丢弃的理由，也就是两支互不包含（历史被
+/// 改写）。tip 是本 rev 的后代**不**算——那只是上游往前走，这一版仍在它的历史里，
+/// 滚出去只是落后一版。判据这么定的依据是实测：冷构建 16m47s、上游约每 4 分钟落
+/// 一笔，于是「被越过就丢」在一轮里被命中的概率接近 1，它等价于「永不滚上线」；
+/// 而丢弃一个付过钱的产物换来的只是「这一版早了十七分钟」。
+fn tip_dropped_the_revision(tip_contains_rev: bool, rev_contains_tip: bool) -> bool {
+    !tip_contains_rev && !rev_contains_tip
+}
+
 /// 前进判定（纯函数）。`is_ancestor` = deployed rev 是 bare rev 的祖先
 /// （git merge-base 判定结果，作为参数传入保持本函数无 IO）。
 ///
@@ -1321,8 +1333,53 @@ fn evaluate_advance(
 }
 
 /// 构建锁陈旧判定：持锁进程已死，或锁龄超过构建超时（进程僵死/被杀）。
-fn lock_is_stale(age_secs: u64, timeout_secs: u64, pid_alive: bool) -> bool {
-    !pid_alive || age_secs > timeout_secs
+fn lock_is_stale(age_secs: u64, timeout_secs: u64, owner_still_alive: bool) -> bool {
+    !owner_still_alive || age_secs > timeout_secs
+}
+
+/// 这一次进程启动的标记。
+///
+/// `execve` 换掉的是进程镜像，pid、`/proc/<pid>`、甚至 `/proc/<pid>/stat` 里的
+/// 启动时刻都不变——内核同一个 task_struct 借用下去。所以「另一个 pid」以外的
+/// 启动身份只能由进程自己给：静态量在 exec 之后随新镜像重新初始化，正好每一次
+/// 启动取一个不同的值。用它来认「写锁的那一次启动已经不在了」。
+fn launch_token() -> u64 {
+    static TOKEN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *TOKEN.get_or_init(|| {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        // 与 pid 混一下：同一纳秒里两次启动也不会撞。
+        nanos ^ ((std::process::id() as u64) << 32)
+    })
+}
+
+/// 写锁的那个人是不是**还是**写锁的那个人。
+///
+/// 只按 pid 判活在这套部署里正好判不出最要紧的那一种死法：`self_exec` 用
+/// `execve` 把自己换成新二进制，pid 不变、`/proc/<pid>` 一直在，可写锁的那个
+/// 进程镜像已经不在了，它那轮构建也随之消失。实测 2026-10-18 11:54:46 一次
+/// 切换之后，锁被下一个进程判成「仍在构建」，白等满 `build_timeout_secs`
+/// （3600 秒）才抢占，而事实上那一轮在 exec 那一刻就死了。
+///
+/// 同一个 pid 只可能属于本进程（pid 在一个命名空间里唯一），所以「pid 是我们
+/// 自己的、标记却不是这一次启动的」只有一种解释：锁是同一个 pid 的上一次
+/// 启动留下的，而那次启动已经连同它在飞的构建一起没了。
+///
+/// 锁文件旧格式只有一行 pid：读不出标记时退回原来的判据（pid 活着就算活着），
+/// 免得滚动升级期间把别人正在构建的锁抢掉。
+fn lock_owner_still_alive(pid: u32, recorded_token: Option<u64>) -> bool {
+    if pid == 0 || !Path::new(&format!("/proc/{pid}")).exists() {
+        return false;
+    }
+    match recorded_token {
+        None => true,
+        // 别人的 pid：它在别处是不是同一次启动，这里无从对照，只能信活着的进程。
+        Some(_) if pid != std::process::id() => true,
+        Some(token) => token == launch_token(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1669,19 +1726,18 @@ impl MainlineDeployer {
     fn acquire_lock(&self) -> Option<BuildLock> {
         let path = self.lock_path();
         if let Ok(text) = std::fs::read_to_string(&path) {
-            let pid: u32 = text
-                .lines()
-                .next()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(0);
+            let mut lines = text.lines();
+            let pid: u32 = lines.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+            // 第二行（若有）是持锁那一次启动的标记，见 `lock_owner_still_alive`。
+            let recorded_token: Option<u64> = lines.next().and_then(|s| s.trim().parse().ok());
             let age = std::fs::metadata(&path)
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|t| t.elapsed().ok())
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let pid_alive = pid != 0 && Path::new(&format!("/proc/{pid}")).exists();
-            if !lock_is_stale(age, self.cfg.build_timeout_secs, pid_alive) {
+            let owner_alive = lock_owner_still_alive(pid, recorded_token);
+            if !lock_is_stale(age, self.cfg.build_timeout_secs, owner_alive) {
                 info!(
                     pid,
                     age_secs = age,
@@ -1693,7 +1749,10 @@ impl MainlineDeployer {
             let _ = std::fs::remove_file(&path);
         }
         let _ = std::fs::create_dir_all(&self.cfg.state_dir);
-        std::fs::write(&path, format!("{}\n", std::process::id())).ok()?;
+        // pid 占第一行：只认第一行的旧二进制照样能读这份锁；第二行是这一次启动的
+        // 标记，给认得它的读者用来认出「同一个 pid 的另一次启动」。
+        let body = format!("{}\n{}\n", std::process::id(), launch_token());
+        std::fs::write(&path, body).ok()?;
         Some(BuildLock { path })
     }
 
@@ -4335,9 +4394,11 @@ impl MainlineDeployer {
         // 开始构建之前再核一次上游。轮首那次核（`poll_once` 开头）与这里之间隔着
         // 整段回收与收敛判定，而从这里往下要独占唯一的构建槽十分钟；`roll_out`
         // 里那次复查（派发前）是同一件事，只是要等一次全程构建跑完才发现白跑了。
-        // 判据与它逐字一致：新 tip 是本 rev 的后代才让位——读不到上游照旧推进，
-        // 把主线钉在一个没读到的上游上比白建一轮更糟；不是后代的（上游被改写）
-        // 是分叉，归这一轮自己的推进判断。
+        // 这次复查的结论**只写日志**：构建没付钱时让位确实省一次构建，但轮首到这里之
+        // 间上游又落一笔是常态（实测约每 4 分钟一笔），让位于是把一整轮变成空轮——与
+        // `roll_out` 那一侧合起来，结果是「永远不开始构建」，今天部署面停在几小时前的
+        // rev 上就是这么来的。读不到上游照旧推进：把主线钉在一个没读到的上游上比白建
+        // 一轮更糟。
         // 这一步刻意放在拿槽**之前**：它是读 git 与拉上游，不是构建，而那个槽的
         // 契约是只罩"真要构建"的那一段。
         let tip = match self.bare_main_rev().await {
@@ -4351,19 +4412,15 @@ impl MainlineDeployer {
             }
         };
         if tip != bare && self.is_ancestor(&bare, &tip).await {
+            // 只写日志，不让位。轮首取定 tip 到这里之间上游又落一笔是常态（实测约每
+            // 4 分钟一笔），每命中一次就是一个空轮；而「落后一版」已经是接受的状态，
+            // 让位换来的「更新的 tip」下一轮照样拿得到。原来这一支与 `roll_out` 里那
+            // 一支一起，把「上一版已经过期」变成了「永远不开始构建」。
             info!(
                 rev = %rev12(&bare),
                 tip = %rev12(&tip),
-                "upstream moved past this revision before the build started; skipping the build and taking the new tip next round"
+                "upstream moved past this revision before the build started; building it anyway and taking the new tip next round"
             );
-            state.in_flight = None;
-            self.save_state(&state)?;
-            // 这一条让位路径也要记 attempt：它是一轮真正走到「要不要把这一版滚出去」
-            // 并问了守卫的轮。不记的话差会被推向负值，而判据只看 `> 0` —— 一侧的
-            // 判据配上能双向漂移的差，「守卫没被问」的那一侧会被这个偏移垫掉一部分。
-            self.record_rollout_attempt().await;
-            self.record_supersession_reading(true).await;
-            return Ok(());
         }
 
         // 宿主构建闸只界**真要构建**的那一段，所以它在这里才拿，并且在镜像推完
@@ -4463,18 +4520,26 @@ impl MainlineDeployer {
         Ok(())
     }
 
-    /// Roll `rev` out, unless the upstream has moved past it -- or has since
-    /// reported a failing check on it -- while this round was working on it.
+    /// Roll `rev` out, unless the upstream has since reported a failing check
+    /// on it -- or has rewritten the history it sits on -- while this round was
+    /// working on it.
     ///
     /// The advance decision is taken against the tip read at the top of the
     /// round, and the round's own work sits between that decision and the
     /// dispatch — a cold release build on the main path, the rollout that was
     /// reverted on the re-dispatch path. That window is long enough for the
-    /// upstream to land the very change this revision reverts, and rolling it
-    /// anyway converges the deployments onto a revision the upstream has
-    /// already left — the next round then pays a second rollout Job and a
-    /// second set of workload restarts to reach a tip that was already known.
-    /// Asking again here costs one git read.
+    /// upstream to land more commits, and this guard used to answer that by
+    /// leaving the revision unrolled. It does not any more, and the measurement
+    /// is why: a cold build takes 16m47s while the upstream lands a commit
+    /// every few minutes, so "never roll a revision the upstream has passed"
+    /// is not a rare waste here — it is equivalent to never rolling at all.
+    /// Measured 2026-10-18: the deployments stood on a revision from hours
+    /// earlier while round after round either yielded here or found the tip had
+    /// already moved before the build. The owner's call is that being one build
+    /// behind is the accepted cost; the next round still takes the tip. What is
+    /// still refused here is a revision the tip's history no longer contains —
+    /// a rewritten upstream is not a stale revision, it is one nobody's main
+    /// carries.
     ///
     /// The CI verdict is the other decision this round takes that early, and it
     /// is re-asked here for the same reason. The round reads it before paying
@@ -4488,10 +4553,7 @@ impl MainlineDeployer {
     ///
     /// Returns whether the rollout was dispatched. A tip that could not be read
     /// is not an advance: holding a rollout on an unread upstream would trade a
-    /// wasted cycle for a stalled mainline, which is the worse of the two. Nor
-    /// is a tip that does not contain this revision one — a rewritten upstream
-    /// is a divergence, and the round's own advance judgement is where that
-    /// belongs.
+    /// wasted cycle for a stalled mainline, which is the worse of the two.
     async fn roll_out(
         &self,
         state: &mut MainlineState,
@@ -4517,18 +4579,37 @@ impl MainlineDeployer {
         // 两半仍是**两个独立语句**，不是一次调用写两条：提问那一句真被删掉时，上面这句
         // 还在、每轮照涨，差就是那个信号——这正是这对计数存在的理由。
         self.record_rollout_attempt().await;
-        if tip != rev && self.is_ancestor(rev, &tip).await {
+        // 判据是**分叉**，不是「不是最新 tip」。新 tip 是本 rev 的后代＝上游只是往前走，
+        // 这一版仍在它的历史里，滚出去只是落后一版（属主 2026-10-18 拍板接受）；两支都
+        // 互不包含才是历史被改写，那一版谁的主线都不认，才让位。
+        //
+        // 改这一条的直接原因是实测：冷构建 16m47s，而上游几分钟就落一笔，于是「越过了
+        // 就不滚」在一轮里被命中的概率接近 1 —— 它等价于「永不滚上线」。今天部署面停在
+        // 几小时前的 rev 上，就是这么来的。
+        let tip_contains_rev = tip == rev || self.is_ancestor(rev, &tip).await;
+        let rev_contains_tip = tip != rev && self.is_ancestor(&tip, rev).await;
+        let diverged = tip_dropped_the_revision(tip_contains_rev, rev_contains_tip);
+        if diverged {
             info!(
                 rev = %rev12(rev),
                 tip = %rev12(&tip),
-                "upstream moved past this revision while the round was working on it; leaving it unrolled and taking the new tip next round"
+                "upstream no longer contains this revision while the round was working on it; leaving it unrolled and taking the new tip next round"
             );
             state.in_flight = None;
             self.save_state(state)?;
             self.record_supersession_reading(true).await;
             return Ok(false);
         }
+        // 被越过但仍在这一版的后代历史里：滚，下一轮再取新 tip。这里仍要记一次提问，
+        // 计数对（attempts 与 checks）靠它保持同增。
         self.record_supersession_reading(false).await;
+        if tip != rev {
+            info!(
+                rev = %rev12(rev),
+                tip = %rev12(&tip),
+                "upstream moved past this revision while the round was working on it; rolling it out anyway and taking the new tip next round"
+            );
+        }
         // 派发前的第二次 CI 提问。第一次在调用者那里、轮首就问了，那时读到的
         // rev 通常刚落上来、检查还没跑完；从这里到派发之间隔着一整段构建，那段
         // 时间足够检查跑出结论。扣住时把 `in_flight` 一起清掉——这一轮对这份
@@ -8449,6 +8530,27 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         );
     }
 
+    /// 付过构建钱之后只在分叉时丢掉这一版。三种成分各一格：只是被越过（tip 含本
+    /// rev）不丢，因为那正是「落后一版」这个被接受的状态；两支互不包含才丢；同 rev
+    /// 自然不丢。以前「被越过就丢」是 1 那一格，今天它必须是 0——否则 16 分钟的构建
+    /// 对 4 分钟一笔的提交节奏，永远换不来一次上线。
+    #[test]
+    fn a_built_revision_is_dropped_only_when_the_tip_no_longer_contains_it() {
+        assert!(
+            !tip_dropped_the_revision(true, false),
+            "只是被越过：滚，下一轮再取新 tip"
+        );
+        assert!(!tip_dropped_the_revision(true, true), "同 rev");
+        assert!(
+            tip_dropped_the_revision(false, false),
+            "两支互不包含：分叉，丢"
+        );
+        assert!(
+            !tip_dropped_the_revision(false, true),
+            "本 rev 反而包含 tip（上游倒退）：与改判据之前一致，不丢"
+        );
+    }
+
     #[test]
     fn advance_decisions() {
         let bare = "bb2222222222";
@@ -8625,6 +8727,25 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         assert!(!lock_is_stale(10, 3600, true));
         assert!(lock_is_stale(4000, 3600, true), "age over timeout is stale");
         assert!(lock_is_stale(10, 3600, false), "dead pid is stale");
+    }
+
+    #[test]
+    fn a_lock_written_by_an_earlier_incarnation_of_the_same_pid_is_stale() {
+        // self_exec 换掉进程而 pid 不变：标记对不上，就是写锁那一次启动已经不在了，
+        // 锁该立刻可抢，而不是等满 build_timeout。
+        let own = std::process::id();
+        let token = launch_token();
+        assert!(
+            lock_owner_still_alive(own, Some(token)),
+            "this very launch still holds it"
+        );
+        assert!(
+            !lock_owner_still_alive(own, Some(token ^ 1)),
+            "a previous launch of the same pid is gone"
+        );
+        // 旧格式（只有一行 pid）沿用原来的判据。
+        assert!(lock_owner_still_alive(own, None));
+        assert!(!lock_owner_still_alive(0, None));
     }
 
     #[test]

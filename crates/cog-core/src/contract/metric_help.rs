@@ -520,9 +520,14 @@ const COUNTER_HELP: &[(&str, &str)] = &[
     (
         "cogneva_mainline_superseded_rollout_total",
         "Rounds the deployer's guard answered that the revision it was carrying \
-         had been overtaken upstream: 1 when it had (nothing is rolled out, the \
-         revision is left alone and the new tip is taken next round), 0 when it \
-         had not. It counts answers, not questions — the producer writes a zero \
+         was no longer on the upstream's history -- the upstream had rewritten \
+         it, not merely landed commits on top of it: 1 when it had (nothing is \
+         rolled out, the revision is left alone and the new tip is taken next \
+         round), 0 when it had not. An upstream that only moved on is not \
+         counted here: since 2026-10-18 the deployer rolls the build it already \
+         paid for and takes the new tip next round, because with a cold build \
+         of 16m47s against a commit every few minutes the stricter answer meant \
+         nothing was ever deployed. It counts answers, not questions — the producer writes a zero \
          on an unskipped round, and a zero sample does not move a counter's \
          value, so 'this round asked and was told no' is not readable here. The \
          questions are counted by cogneva_mainline_supersession_checks_total, \
