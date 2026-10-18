@@ -666,6 +666,69 @@ mod tests {
         );
     }
 
+    /// The counters carry the same two populations the roster does.
+    ///
+    /// "One object of this lifetime was let go" and "one of the other was" are
+    /// different facts — one is the long-lived member being replaced, the other
+    /// is a task's agent being released — and a counter keyed by role alone
+    /// reports them as one number. The same goes for a consumer that overran
+    /// its budget: which lifetime it belonged to decides whether the observer
+    /// is looking at a turn that outlasted the budget or a permanent member
+    /// that went down.
+    #[tokio::test]
+    async fn retirement_counters_keep_the_two_lifetimes_apart() {
+        let o = AgentObservable::new();
+        let retired = |consumer_ended, was_busy| crate::agent::RetireReport {
+            performed: true,
+            consumer_ended,
+            was_busy,
+        };
+        o.record_retirement("planner", true, retired(true, false));
+        o.record_retirement("planner", false, retired(false, true));
+
+        let metrics = o.collect_metrics("").await.expect("collect_metrics");
+        let read = |name: &str, role: &str, lifetime: &str, state: Option<&str>| {
+            metrics
+                .iter()
+                .find(|m| {
+                    m.name == name
+                        && m.labels.get("role").map(String::as_str) == Some(role)
+                        && m.labels.get("lifetime").map(String::as_str) == Some(lifetime)
+                        && state.map(|s| m.labels.get("state").map(String::as_str) == Some(s))
+                            != Some(false)
+                })
+                .map(|m| m.value)
+        };
+        assert_eq!(
+            read("agent_retired_total", "planner", "task", None),
+            Some(1.0)
+        );
+        assert_eq!(
+            read("agent_retired_total", "planner", "process", None),
+            Some(1.0)
+        );
+        assert_eq!(
+            read(
+                "agent_retire_timeout_total",
+                "planner",
+                "process",
+                Some("busy")
+            ),
+            Some(1.0),
+            "the permanent member that overran is one timeout, on the process row"
+        );
+        assert_eq!(
+            read(
+                "agent_retire_timeout_total",
+                "planner",
+                "task",
+                Some("busy")
+            ),
+            None,
+            "the task agent ended on time and must not appear as a timeout"
+        );
+    }
+
     #[tokio::test]
     async fn a_run_that_spent_its_budget_is_counted_as_an_exhaustion_not_a_success() {
         let o = AgentObservable::new();
