@@ -107,7 +107,19 @@ pub struct PostgresObservabilityGateway {
     /// [`crate::consumer_lag::record_consumer_lag`]：缺席时那一格只剩订阅方看见的
     /// **少了的事件**，没有任何地方记着「它漏了几条」。
     metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
+    /// 已失败、还没落进计数器的条数。失败是**成批**来的（一次洪水里成千上万），
+    /// 而每失败一次就 upsert 同一行，会把「记一次失败」变成第二个故障源：
+    /// 2026-10-18 现场里这条写入和失败的插入抢同一张热表，失败越多越堵、
+    /// 越堵越失败，池被它自己占满。所以失败只在这里加一，最多每
+    /// [`FAILURE_FLUSH_SECS`] 秒落一次。
+    failed_pending: Arc<std::sync::atomic::AtomicU64>,
+    /// 上一次把待落量写进库的时刻。
+    failed_last_flush: Arc<std::sync::Mutex<std::time::Instant>>,
 }
+
+/// 失败计数最多多久落一次库。选 5 秒是因为它要明显短于一条告警的判定窗
+/// （分钟级），又足以把「每次失败一行」压成「每 5 秒一行」。
+const FAILURE_FLUSH_SECS: u64 = 5;
 
 impl PostgresObservabilityGateway {
     /// 接上指标面。缺席是正常的（嵌入式运行没有后端），不是错误。
@@ -152,6 +164,8 @@ impl PostgresObservabilityGateway {
             event_channel_capacity: 256,
             state_backend: None,
             metrics: None,
+            failed_pending: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            failed_last_flush: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
         }
     }
 
@@ -674,21 +688,60 @@ impl ObservabilityGateway for PostgresObservabilityGateway {
 
         let pool = self.pool.clone();
         let metrics = self.metrics.clone();
+        let failed_pending = Arc::clone(&self.failed_pending);
+        let failed_last_flush = Arc::clone(&self.failed_last_flush);
         tokio::spawn(async move {
             if let Err(e) = Self::persist_event(&pool, &event).await {
                 tracing::warn!("Failed to persist observability event: {}", e);
                 if let Some(metrics) = metrics {
-                    let _ = metrics
-                        .record_counter(
-                            cog_core::metric_names::OBSERVABILITY_EVENT_PERSIST_FAILED_TOTAL,
-                            1.0,
-                            std::collections::HashMap::new(),
-                        )
-                        .await;
+                    note_persist_failure(&metrics, &failed_pending, &failed_last_flush).await;
                 }
             }
         });
     }
+}
+
+/// 记一次落库失败：本地加一，最多每 [`FAILURE_FLUSH_SECS`] 秒落一次库。
+///
+/// 为什么不是「失败一次写一次」：这条计数和失败的插入写在同一张表的同一行上
+/// （`cog_metric_counter_totals` 按 `(name, labels)` upsert），一次洪水里每失败
+/// 一条就再排一次队，于是失败越多越堵、越堵越失败。2026-10-18 现场实测：15 条
+/// 会话卡在同一个 upsert 上，池被占满，而失败在继续产生新的写。
+///
+/// 代价写在明处：进程在这 5 秒里死掉，待落的条数随之丢失；把这批数写回库的那次
+/// 调用本身失败时也丢失（它要和失败写抢同一张表，这是无法回避的）。这两处都只影响
+/// 「计数的精度」，不影响它回答的那个问题——这一段有没有失败。计数器是累加的
+/// （`record_counter` 是加不是赋），所以分批落不会改变总量。
+async fn note_persist_failure(
+    metrics: &Arc<dyn cog_core::MetricsBackend>,
+    pending: &std::sync::atomic::AtomicU64,
+    last: &std::sync::Mutex<std::time::Instant>,
+) {
+    use std::sync::atomic::Ordering;
+
+    pending.fetch_add(1, Ordering::Relaxed);
+    {
+        // 这段不 await：std 的锁跨 await 会同时挡住 tokio 的任务迁移和下一个失败。
+        let mut last = match last.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if last.elapsed() < std::time::Duration::from_secs(FAILURE_FLUSH_SECS) {
+            return;
+        }
+        *last = std::time::Instant::now();
+    }
+    let batch = pending.swap(0, Ordering::Relaxed);
+    if batch == 0 {
+        return;
+    }
+    let _ = metrics
+        .record_counter(
+            cog_core::metric_names::OBSERVABILITY_EVENT_PERSIST_FAILED_TOTAL,
+            batch as f64,
+            std::collections::HashMap::new(),
+        )
+        .await;
 }
 
 // ─── Event meta extraction ───
@@ -867,6 +920,46 @@ mod tests {
         let pool =
             PgPool::connect_lazy("postgres://nobody@127.0.0.1:1/nothing").expect("a lazy pool");
         PostgresObservabilityGateway::new(pool).with_metrics(metrics)
+    }
+
+    /// 失败按批落库：同一窗口里的第二次失败不再写库。
+    ///
+    /// 这条钉的是**写入口的分寸**，不是计数本身——一次洪水里每个失败都 upsert
+    /// 同一行，会把记账变成第二个故障源。窗口内的失败只加本地计数，到点才落一次，
+    /// 落下去的是这段时间的总数（计数器是加不是赋）。
+    #[tokio::test]
+    async fn failures_are_recorded_once_per_window_not_once_per_failure() {
+        use std::sync::atomic::AtomicU64;
+        use std::time::{Duration as StdDuration, Instant};
+
+        let backend = Arc::new(crate::mem::MemoryMetricsBackend::new());
+        let metrics: Arc<dyn cog_core::MetricsBackend> = backend.clone();
+        let pending = AtomicU64::new(0);
+        // 窗口已经到期，所以第一次失败就该落库。
+        let last = std::sync::Mutex::new(Instant::now() - StdDuration::from_secs(60));
+        let name = cog_core::metric_names::OBSERVABILITY_EVENT_PERSIST_FAILED_TOTAL.as_str();
+
+        note_persist_failure(&metrics, &pending, &last).await;
+        let totals = backend.query_counter_totals(name).await.unwrap();
+        assert_eq!(totals.len(), 1, "第一次失败要落一条");
+        assert_eq!(totals[0].value, 1.0, "落的是这一窗口里的失败条数");
+
+        // 同一窗口里的第二次失败只加本地计数，不写库。
+        note_persist_failure(&metrics, &pending, &last).await;
+        let totals = backend.query_counter_totals(name).await.unwrap();
+        assert_eq!(
+            totals[0].value, 1.0,
+            "窗口没到就再写一次库，等于把每个失败都变成一次热行写入"
+        );
+
+        // 窗口到期，攒下的两条一起落，总数是累加的。
+        *last.lock().unwrap() = Instant::now() - StdDuration::from_secs(60);
+        note_persist_failure(&metrics, &pending, &last).await;
+        let totals = backend.query_counter_totals(name).await.unwrap();
+        assert_eq!(
+            totals[0].value, 3.0,
+            "攒下的失败要一条不少地加上去：1 次已落 ＋ 1 次待落 ＋ 1 次本次"
+        );
     }
 
     /// 装配完成的写者要在读数面上留下一条 0。没有这一条，一个从未失败的
