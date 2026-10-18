@@ -263,8 +263,23 @@ impl DagExecutor {
     /// it acked without ever starting the task. That reader lives in
     /// [`crate::task_executor_router`], where the acks happen.
     ///
+    /// `served_streams` is what this deployment consumes
+    /// ([`crate::ready_queue::consumed_ready_streams`]). The repair is only
+    /// meaningful on a stream with a reader: on a queue nobody reads, every row
+    /// sits in `Scheduled` by construction — that is the intended state while an
+    /// executor is away, and it is the queue that holds the work, not a lost
+    /// message. Sweeping it would re-arm and republish the whole backlog every
+    /// stall window and grow the queue instead of draining it (measured
+    /// 2026-10-18: 1,499 tasks re-armed every 600 s against a process-local
+    /// stream whose consumer was switched off, 8,815 messages queued behind
+    /// it). Those rows are left to the reader that will arrive.
+    ///
     /// Returns how many tasks it re-armed.
-    pub async fn reclaim_stalled_scheduled(&self, stall_after_secs: u64) -> usize {
+    pub async fn reclaim_stalled_scheduled(
+        &self,
+        stall_after_secs: u64,
+        served_streams: &[String],
+    ) -> usize {
         // Floored at the window the transport itself uses before it re-delivers
         // an unacknowledged message. Below it, a message that is merely slow is
         // still claimable by the transport, so acting here would run work that
@@ -275,7 +290,13 @@ impl DagExecutor {
         let stall_before = chrono::Utc::now() - chrono::Duration::seconds(stall_after_secs as i64);
         let stalled = self.find_stalled_scheduled_tasks(stall_before).await;
         let mut reclaimed = 0usize;
+        let mut unserved = 0usize;
         for task in stalled {
+            let stream = crate::ready_queue::ready_stream_for(&task, &self.workspace_id);
+            if !served_streams.iter().any(|served| served == &stream) {
+                unserved += 1;
+                continue;
+            }
             let error = format!(
                 "never started: the task sat in Scheduled for more than {stall_after_secs}s without ever being started, so it was put back in line without charging an attempt"
             );
@@ -287,6 +308,15 @@ impl DagExecutor {
                     "cannot reclaim a task stalled in Scheduled: {e}"
                 ),
             }
+        }
+        if unserved > 0 {
+            // 静默跳过就是另一处「看起来像空闲」：这些行会一直停在 Scheduled，
+            // 直到读这队列的部署回来。说一句谁在等，别让这段空白被读成清扫器坏了。
+            tracing::info!(
+                unserved,
+                "tasks in Scheduled belong to a ready stream this deployment does not read; \
+                 leaving them queued for the executor rather than republishing them"
+            );
         }
         self.record_stalled_scheduled_reclaimed(reclaimed).await;
         reclaimed
@@ -3142,6 +3172,11 @@ mod tests {
         AgentState, ContextBoard, Event, MetricsBackend, StateBackend, TaskCheckpoint, TaskType,
     };
 
+    /// 本部署读哪些就绪队列——清扫器的范围判据，与运行期同一个函数。
+    fn served(workspace: &str, executor_role: bool) -> Vec<String> {
+        crate::ready_queue::consumed_ready_streams(workspace, executor_role)
+    }
+
     /// 只实现 DAG 快照存取的最小 StateBackend，模拟两个 pod 共享的存储。
     #[derive(Default)]
     struct StubStateBackend {
@@ -4448,7 +4483,8 @@ mod tests {
         }
 
         assert_eq!(
-            dag.reclaim_stalled_scheduled(60).await,
+            dag.reclaim_stalled_scheduled(60, &served("ws-stalled-floor", true))
+                .await,
             0,
             "a caller asking for a window below the transport's own re-delivery window is \
              asking for the duplicate, and does not get one"
@@ -4473,7 +4509,11 @@ mod tests {
                 chrono::Utc::now() - chrono::Duration::minutes(30);
         }
 
-        assert_eq!(dag.reclaim_stalled_scheduled(600).await, 1);
+        assert_eq!(
+            dag.reclaim_stalled_scheduled(600, &served("ws-stalled-reclaim", true))
+                .await,
+            1
+        );
 
         let stalled = dag.get_task("stalled").await.unwrap();
         assert_eq!(stalled.status, TaskStatus::Pending);
@@ -4493,12 +4533,65 @@ mod tests {
 
         // One re-arm per stall, not one per sweep: the task is no longer
         // `Scheduled`, so the next sweep has nothing to pick up.
-        assert_eq!(dag.reclaim_stalled_scheduled(600).await, 0);
+        assert_eq!(
+            dag.reclaim_stalled_scheduled(600, &served("ws-stalled-reclaim", true))
+                .await,
+            0
+        );
         assert_eq!(dag.get_task("stalled").await.unwrap().retry_count, 0);
 
         let fresh = dag.get_task("fresh").await.unwrap();
         assert_eq!(fresh.status, TaskStatus::Scheduled);
         assert_eq!(fresh.retry_count, 0);
+    }
+
+    /// 本部署不读的那条队列上，停在 `Scheduled` 不是坏消息，是任务在等执行器。
+    ///
+    /// 2026-10-18 现场：执行器角色被关掉后，进程本地队列只剩发布器，没有消费者；
+    /// 清扫器每 600 s 把 1,499 笔任务放回队列并重发，消息总数从几千涨到 8,815，
+    /// 队列越扫越长。判据：同一个任务，同一个年龄，读这条队列的部署收回它，
+    /// 不读的部署不碰它。
+    #[tokio::test]
+    async fn a_queue_this_deployment_does_not_read_waits_for_its_executor() {
+        let generate = || {
+            Task::new(
+                "generate",
+                TaskType::Custom("platform_issue_fix".into()),
+                serde_json::json!({"evolution_mode": "generate_change"}),
+            )
+        };
+        let dag = DagExecutor::new("ws-stalled-unserved".into());
+        dag.add_task(generate()).await.unwrap();
+        dag.schedule_task("generate").await.unwrap();
+        {
+            let mut inner = dag.inner.write().await;
+            inner.tasks.get_mut("generate").unwrap().updated_at =
+                chrono::Utc::now() - chrono::Duration::minutes(30);
+        }
+        assert!(dag.get_task("generate").await.unwrap().is_self_evolution());
+
+        assert_eq!(
+            dag.reclaim_stalled_scheduled(600, &served("ws-stalled-unserved", false))
+                .await,
+            0,
+            "no reader means the queue is the holder, not a lost message: re-arming here \
+             republished the whole backlog every stall window"
+        );
+        let waiting = dag.get_task("generate").await.unwrap();
+        assert_eq!(waiting.status, TaskStatus::Scheduled);
+        assert_eq!(waiting.retry_count, 0);
+
+        assert_eq!(
+            dag.reclaim_stalled_scheduled(600, &served("ws-stalled-unserved", true))
+                .await,
+            1,
+            "the deployment that reads the queue is the one that can tell a lost message \
+             from a queued one, so it is the one that repairs it"
+        );
+        assert_eq!(
+            dag.get_task("generate").await.unwrap().status,
+            TaskStatus::Pending
+        );
     }
 
     /// 一个在 `Scheduled` 上停多久的任务都不会被这条扫描判终态，哪怕它的预算
@@ -4528,7 +4621,11 @@ mod tests {
             task.retry_count = budget;
         }
 
-        assert_eq!(dag.reclaim_stalled_scheduled(600).await, 1);
+        assert_eq!(
+            dag.reclaim_stalled_scheduled(600, &served("ws-stalled-budget", true))
+                .await,
+            1
+        );
 
         let stalled = dag.get_task("stalled").await.unwrap();
         assert_eq!(stalled.status, TaskStatus::Pending);
@@ -4565,9 +4662,16 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(pod_a.reclaim_stalled_scheduled(600).await, 1);
         assert_eq!(
-            pod_b.reclaim_stalled_scheduled(600).await,
+            pod_a
+                .reclaim_stalled_scheduled(600, &served("ws-stalled-fg", true))
+                .await,
+            1
+        );
+        assert_eq!(
+            pod_b
+                .reclaim_stalled_scheduled(600, &served("ws-stalled-fg", true))
+                .await,
             0,
             "the second sweep finds the task already requeued and leaves it alone"
         );

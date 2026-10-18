@@ -389,6 +389,13 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                         // 执行器部署里跑：谁执行生成，谁就得是扫得动那份产物的进程。
                         // 这个开关和执行器循环、基线移植、自我发现用的是同一个。
                         let owns_executor_role = ctx.config().self_evolution.executor_enabled;
+                        // 本部署真正在读的就绪队列。清扫器与发布器都按它划界：
+                        // 不读的那条队列上，任务停在 Scheduled 是"等执行器回来"，
+                        // 不是"消息丢了"。
+                        let served_ready_streams = crate::ready_queue::consumed_ready_streams(
+                            &workspace_id,
+                            owns_executor_role,
+                        );
 
                         // Seeded before either consumer starts, so the series is
                         // present from the first scrape rather than from the
@@ -444,6 +451,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                         .max(1);
                         let pub_shutdown = dag_shutdown.clone();
                         let publisher_runtime = runtime.clone();
+                        let publisher_served_streams = served_ready_streams.clone();
                         drop(cog_core::loop_health::spawn(
                             READY_TASK_PUBLISHER_LOOP,
                             cog_core::loop_health::Cadence::Periodic(
@@ -454,6 +462,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                             move |beat| {
                                 let publisher_runtime = publisher_runtime.clone();
                                 let pub_shutdown = pub_shutdown.clone();
+                                let served_ready_streams = publisher_served_streams.clone();
                                 async move {
                                     let mut interval =
                                         tokio::time::interval(std::time::Duration::from_secs(
@@ -473,10 +482,15 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                                                 ticks_since_reclaim += 1;
                                                 if ticks_since_reclaim >= reclaim_every_ticks {
                                                     ticks_since_reclaim = 0;
+                                                    // 只扫本部署真的在读的队列：不读的
+                                                    // 那条上，堆积就是任务在等执行器回来，
+                                                    // 每窗重投一次只会在没人读的队列里
+                                                    // 复制出更多消息。
                                                     let reclaimed = publisher_runtime
                                                         .orchestrator()
                                                         .reclaim_stalled_scheduled(
                                                             scheduled_task_stall_secs,
+                                                            &served_ready_streams,
                                                         )
                                                         .await;
                                                     if reclaimed > 0 {
