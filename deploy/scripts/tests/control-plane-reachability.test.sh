@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# principle: feedback_agreement_between_copies_says_nothing_about_the_relations_inside_them
 # check-control-plane-reachability.sh 的定向测试：门禁只读退出码，所以「它判得出来」
 # 这句话只能由反例证明——在一份真渲染产物的副本上只改一处，断言它红的正是那一处。
 #

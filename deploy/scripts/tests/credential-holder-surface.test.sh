@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# principle: feedback_a_pinned_reading_that_grows_with_the_tree_must_be_derived_from_it
 # check-credential-holder-surface.sh 的定向测试：它判的是"谁碰得到那两个 Secret
 # 对象里的哪个键"，而这个面**出错时渲染期没有症状**——多一个持有者清单照旧合法、
 # parity 照旧绿、Pod 照常起来，只是那个 Pod 从此握着平台 token。

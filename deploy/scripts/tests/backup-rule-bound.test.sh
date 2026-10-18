@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# principle: feedback_several_carriers_citing_each_other_are_not_corroboration
 # check-backup-rule-bound.sh 的定向测试：备份族那个「一天」的数，两个前提各自
 # 都要红得起来、而且要红到点名那一条。
 #
