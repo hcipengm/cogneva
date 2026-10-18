@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# principle: feedback_a_declaration_nobody_delivers_reads_exactly_like_one_nobody_made
 # Deterministic gate for out-of-band credential delivery.
 #
 # Three silent failures are being judged here:

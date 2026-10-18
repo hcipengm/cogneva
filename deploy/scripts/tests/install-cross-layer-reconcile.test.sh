@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# principle: feedback_a_comment_inside_an_unquoted_heredoc_is_still_executed
 # install-cross-layer-reconcile.sh 的定向测试：判它**写出来的两份单元文件**本身。
 #
 # 为什么这两个断言值得单独一条测试：systemd 对不认识的行走的是「告警然后忽略」——

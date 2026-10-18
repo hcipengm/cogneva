@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# principle: feedback_a_function_in_a_set_eu_script_must_be_called_the_way_its_caller_calls_it
+# principle: feedback_a_silent_fallback_makes_the_fast_path_and_the_slow_path_look_alike
 # 判据测试：预编译引导器的**第一跳**，以及它取不到时那个结局叫什么。
 #
 # `fetch_prebuilt_bootstrap` 是元启动默认路径的第一步。它成功与否决定这次安装是
