@@ -225,6 +225,16 @@ jobs:
         run: cargo test -p cog-storage --test events_payload_round_trip -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # Whether an event published through the trait object reaches the table
+      # is a question the concrete type cannot answer: production holds the
+      # gateway as `dyn ObservabilityGateway`, and the fault this pins is that
+      # the trait arm sent without writing while the table stayed empty and
+      # read as "no events happened". The write is spawned, so the wait for the
+      # row and the schema it lands in are both the server's to settle.
+      - name: Live-DB observability event persistence
+        run: cargo test -p cog-storage --test observability_event_persistence -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       - name: Live-DB retires a metrics name
         run: cargo test -p cog-storage --test metrics_retirement -- --ignored
         env:
