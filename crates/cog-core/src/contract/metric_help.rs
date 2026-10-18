@@ -650,6 +650,28 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          Absent until the first such repair",
     ),
     (
+        "cogneva_dag_stalled_scheduled_reclaimed_with_backlog_total",
+        "The subset of the reclaims above taken back while the task's queue \
+         still reported undelivered entries. Same repair, opposite reading: \
+         without a backlog the sweep is acting on a message that is gone, with \
+         one it is acting on a message that may still be in line. Kept as its \
+         own total rather than folded into the one above because a single sum \
+         cannot tell a drain from a loss, and the loss is the case the sweep \
+         exists for. Counter for the same reason as its sibling: the state it \
+         repairs clears itself. Absent until the first reclaim with a backlog",
+    ),
+    (
+        "cogneva_dag_stalled_scheduled_deferred_for_backlog_total",
+        "Rows the sweep left in Scheduled because their queue still held \
+         undelivered entries, summed over passes. This is the wait doing its \
+         job, and the other half of the pair above: reclaims with a backlog and \
+         deferrals together say whether the wait is draining a queue or giving \
+         up on it, while either one alone cannot. A counter rather than a gauge \
+         for the same reason as the reclaims -- the state it describes clears \
+         itself, so a gauge would read zero both before and after. Absent until \
+         the first deferral",
+    ),
+    (
         "cogneva_task_checkpoint_total",
         "Task checkpoint outcomes, by outcome: saved, unpersisted, failed, \
          superseded, unsuperseded, no_agents. All six are published from the \
