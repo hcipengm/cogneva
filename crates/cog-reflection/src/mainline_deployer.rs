@@ -9755,23 +9755,26 @@ exit 0
         );
     }
 
-    /// A revision the upstream passes while this round is building it must not
-    /// be rolled out.
+    /// A revision the upstream merely passed while this round was building it
+    /// is still rolled out; the next round takes the newer tip.
     ///
     /// The tip read at the top of the round fixes the round's target; a cold
-    /// release build follows, and the upstream can land the very change that
-    /// reverts this revision inside that window (measured: land→revert 10.7
-    /// minutes apart, so the window catches it every time). Rolling it anyway
-    /// converges the deployments onto a revision the upstream has left, and the
-    /// next round pays a second rollout Job and a second set of workload
-    /// restarts to reach a tip that was already known.
+    /// release build follows, and the upstream can land more commits inside
+    /// that window. Leaving the revision unrolled was the old answer, and the
+    /// measurement is why it changed: a cold build takes 16m47s while the
+    /// upstream lands a commit every few minutes, so the window catches the
+    /// revision almost every round, which makes "never roll a revision the
+    /// upstream has passed" equivalent to never rolling anything. What is still
+    /// refused is a revision the tip's history no longer contains — a rewritten
+    /// upstream — and that decision is pinned by
+    /// `a_built_revision_is_dropped_only_when_the_tip_no_longer_contains_it`.
     ///
     /// The measured shape is reproduced by a cargo double that moves the bare
     /// main at the moment it "compiles" the round's revision.
     #[tokio::test]
     // ENV_LOCK 是进程级 PATH 串行锁：PATH 是进程全局状态，必须跨 await 持有
     // 直到被测命令跑完。
-    async fn a_rev_the_upstream_passed_while_building_is_not_rolled() {
+    async fn a_rev_the_upstream_passed_while_building_is_rolled() {
         let _env = ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -9830,21 +9833,24 @@ exit 0
             "this round has to have built the revision under test: {buildah_calls}"
         );
 
-        // The compile and the push are already paid; asking before the dispatch
-        // is the whole saving.
+        // Being one revision behind is the accepted cost: the image the round
+        // already paid for goes out, and the next round takes the newer tip.
         let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap_or_default();
         assert!(
-            !calls.contains(rev12(&rev_a)),
-            "the upstream has passed this revision; no rollout job may be dispatched for it: {calls}"
+            calls.contains(&job_name(&rev_a)) || calls.contains(&rev12(&rev_a)),
+            "a revision the tip still contains has to be rolled out: {calls}"
         );
         assert!(
-            !calls.contains("apply -f -"),
-            "a revision the upstream has passed gets no manifest applied: {calls}"
+            calls.contains("apply -f -"),
+            "the round applies the manifests pinned to its revision: {calls}"
         );
         let state = deployer.load_state();
         assert!(
-            state.in_flight.is_none(),
-            "a skipped round must not leave the revision as its in-flight rollout: {:?}",
+            matches!(
+                &state.in_flight,
+                Some(f) if f.rev == rev_a && f.phase == Phase::Dispatched
+            ),
+            "the rolled-out revision stays in flight until the judge converges: {:?}",
             state.in_flight
         );
         let skipped = metrics
@@ -9856,9 +9862,19 @@ exit 0
         assert_eq!(
             skipped.len(),
             1,
-            "a skip has to leave a reading; otherwise it is indistinguishable from a round that asked and had nothing to skip: {skipped:?}"
+            "the guard's answer has to leave a reading; otherwise it is indistinguishable from a round that never asked: {skipped:?}"
         );
-        assert_eq!(skipped[0].value, 1.0);
+        assert_eq!(
+            skipped[0].value, 0.0,
+            "the guard was asked and answered 'roll it'; a skip answers 1"
+        );
+        let (attempts, checks) = rollout_counter_pair(&metrics).await;
+        assert_eq!(
+            (attempts, checks),
+            (1.0, 1.0),
+            "a round that reached the decision and asked must move both counters once: \
+             attempts={attempts} checks={checks}"
+        );
     }
 
     /// 一对轮级计数的读数。
@@ -9886,17 +9902,16 @@ exit 0
         )
     }
 
-    /// 同一个让位判据的第二个位置：上游在轮首读数之后、**构建开始之前**走过去了。
+    /// 同一个判据的第二个位置：上游在轮首读数之后、**构建开始之前**走过去了。
     ///
-    /// 上面那条测试里上游是在"编译"期间动的，所以那一轮照付了全程构建，只是在派发前
-    /// 让位——白烧唯一的构建槽十分钟（实测：21:33 起建，21:43:43 建完，21:44:09 发现
-    /// main 已走到下一笔，整个丢弃）。同一件事在建之前问一次只要一次 git 读。
-    ///
-    /// 让位本身与上面那条是同一个判据、同一个读数，所以这里量的是**代价**：这一轮
-    /// 一个字节都不该编。做不到这一点，这次改动就只是把同一笔浪费挪了个位置。
+    /// 上面那条测试里上游是在"编译"期间动的；这里动在构建之前，所以它量的是
+    /// 「轮首决定的那一版还值不值得编」。按今天的判据值得：新 tip 是它的后代，
+    /// 编出来的镜像仍在上游历史里，滚出去只落后一版。构建之前的那次复查因此只留
+    /// 一条日志——让位只发生在**分叉**（那本纯函数的四格由
+    /// `a_built_revision_is_dropped_only_when_the_tip_no_longer_contains_it` 钉住）。
     #[tokio::test]
     // 同上：ENV_LOCK 串行化进程级 PATH 修改，需跨 await 持有。
-    async fn a_rev_the_upstream_passed_before_the_build_is_not_built() {
+    async fn a_rev_the_upstream_passed_before_the_build_is_still_built_and_rolled() {
         let _env = ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -9932,33 +9947,37 @@ exit 0
         deployer.poll_once().await.unwrap();
         std::env::set_var("PATH", old_path);
 
-        // 这一轮从没编译过：编译器 double 只在真正答复一次 release build 时写日志，
-        // 所以"日志不存在"就是"没付构建"。
+        // 编译器 double 只在真正答复一次 release build 时写日志，所以"日志非空"
+        // 就是"这一轮付了构建"——被越过之后仍然要付，这是接受落后一版的代价面。
         let built = std::fs::read_to_string(bin_dir.join("cargo.log")).unwrap_or_default();
         assert!(
-            built.is_empty(),
-            "the upstream had already left this revision; nothing may be compiled for it: {built}"
+            !built.is_empty(),
+            "the round builds the revision it decided on: {built}"
         );
         let buildah_calls =
             std::fs::read_to_string(bin_dir.join("buildah.log")).unwrap_or_default();
+        let push_tag = main_image("reg.local:5000", &rev_a);
         assert!(
-            !buildah_calls.contains("commit"),
-            "no image may be assembled for a revision the upstream has passed: {buildah_calls}"
+            buildah_calls.contains(&format!("commit ctr-test-123 {push_tag}")),
+            "the image for the round's revision is assembled and tagged: {buildah_calls}"
         );
 
         let calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap_or_default();
         assert!(
-            !calls.contains(&job_name(&rev_a)),
-            "no rollout job may be dispatched for it: {calls}"
+            calls.contains(&job_name(&rev_a)) || calls.contains(&rev12(&rev_a)),
+            "the built revision is dispatched even though the tip moved on: {calls}"
         );
         assert!(
-            !calls.contains("apply -f -"),
-            "a revision the upstream has passed gets no manifest applied: {calls}"
+            calls.contains("apply -f -"),
+            "the round applies the manifests pinned to its revision: {calls}"
         );
         let state = deployer.load_state();
         assert!(
-            state.in_flight.is_none(),
-            "a skipped round must not leave the revision as its in-flight rollout: {:?}",
+            matches!(
+                &state.in_flight,
+                Some(f) if f.rev == rev_a && f.phase == Phase::Dispatched
+            ),
+            "the rolled-out revision stays in flight until the judge converges: {:?}",
             state.in_flight
         );
         let skipped = metrics
@@ -9970,9 +9989,12 @@ exit 0
         assert_eq!(
             skipped.len(),
             1,
-            "the skip has to leave the same reading the later guard leaves: {skipped:?}"
+            "the later guard's answer has to leave the same reading: {skipped:?}"
         );
-        assert_eq!(skipped[0].value, 1.0);
+        assert_eq!(
+            skipped[0].value, 0.0,
+            "the guard was asked and answered 'roll it'; a skip answers 1"
+        );
         // 这一轮走到决策点并问了守卫，所以一对轮级计数必须**各涨一次**。只记提问不记
         // attempt 的话差会读到 1，而判据的名字是「守卫的调用点没了」——一个只是让位的
         // 轮会被报成守卫失踪，而且这一笔永久留在差里，六小时窗口过了也还是它。
