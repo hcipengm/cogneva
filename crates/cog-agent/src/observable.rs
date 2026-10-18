@@ -47,13 +47,19 @@ pub struct AgentObservable {
     /// are still alive. A leak shows up as the count and the age rising while
     /// the runs behind the calibration stop arriving.
     roster: Mutex<Vec<RosterEntry>>,
-    /// Every role the roster has ever held.
+    /// Every (role, lifetime class) pair the roster has ever held.
     ///
     /// A gauge has no delete: a role whose last agent goes away simply stops
     /// being written, and the last nonzero value stays in the store reading as
     /// "still N alive". So the scrape writes an explicit zero for every role
     /// it has seen, and needs this set to know which those are.
-    roster_roles: Mutex<HashMap<String, bool>>,
+    ///
+    /// Paired with the lifetime class, not just the role: the two classes are
+    /// two populations under one name, and the age reading only means anything
+    /// within one of them. A role that has held both would otherwise be one
+    /// key, so one of the two series would never be written zero and the other
+    /// would be born from whatever count the role happened to have.
+    roster_roles: Mutex<HashMap<(String, bool), ()>>,
     /// How many objects have been retired, keyed by role and lifetime class.
     ///
     /// The roster count answers "how many are alive"; this answers "is
@@ -199,7 +205,7 @@ impl AgentObservable {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             for entry in &next {
-                roles.insert(entry.role.clone(), entry.task_scoped);
+                roles.insert((entry.role.clone(), entry.task_scoped), ());
             }
         }
         *self
@@ -408,10 +414,18 @@ impl Observable for AgentObservable {
                 .roster
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mut by_role: HashMap<&str, (u64, f64)> = HashMap::new();
+            // Counted per (role, lifetime), not per role. A role can hold both
+            // a process-lifetime object and task-scoped ones at the same time,
+            // and a count that adds them together answers neither question: the
+            // task-scoped series would be inflated by the one object that never
+            // dies, so it could sit above its own ceiling forever without any
+            // leak, and the process series would move with the workload.
+            let mut by_lifetime: HashMap<(&str, bool), (u64, f64)> = HashMap::new();
             for entry in roster.iter() {
                 let age = entry.created_at.elapsed().as_secs_f64();
-                let slot = by_role.entry(entry.role.as_str()).or_insert((0, 0.0));
+                let slot = by_lifetime
+                    .entry((entry.role.as_str(), entry.task_scoped))
+                    .or_insert((0, 0.0));
                 slot.0 += 1;
                 if age > slot.1 {
                     slot.1 = age;
@@ -421,10 +435,12 @@ impl Observable for AgentObservable {
                 .roster_roles
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for (role, task_scoped) in roles.iter() {
+            for ((role, task_scoped), ()) in roles.iter() {
                 let lifetime = lifetime_label(*task_scoped);
-                let (count, oldest_age) =
-                    by_role.get(role.as_str()).copied().unwrap_or((0, f64::NAN));
+                let (count, oldest_age) = by_lifetime
+                    .get(&(role.as_str(), *task_scoped))
+                    .copied()
+                    .unwrap_or((0, f64::NAN));
                 metrics.push(
                     RawMetric::new("agent_roster", count as f64)
                         .with_label("role", role)
@@ -573,6 +589,81 @@ mod tests {
         };
         assert_eq!(lifetime_of("planner"), Some("task"));
         assert_eq!(lifetime_of("mode_selector"), Some("process"));
+    }
+
+    /// One role can hold both lifetimes at once, and they are two populations.
+    ///
+    /// A series that adds them together answers neither question: the task
+    /// series would be inflated by the one object that never dies, so it could
+    /// sit above its own ceiling with no leak behind it, and the process series
+    /// would move with the workload. The age has the same problem one step
+    /// further — merging makes the process-lifetime object's age the age of
+    /// every task agent under that role, which is the reading that lets a leak
+    /// hide.
+    ///
+    /// Judged as two rows, each carrying its own population's count and oldest
+    /// age: a role-only key produces one row with the sum, so both of these
+    /// assertions are exactly what it cannot produce.
+    #[tokio::test]
+    async fn a_role_holding_both_lifetimes_reports_each_population_on_its_own() {
+        let o = AgentObservable::new();
+        let now = std::time::Instant::now();
+        let long_lived = now - std::time::Duration::from_secs(30);
+        o.publish_roster(vec![
+            ("planner".to_string(), now, true),
+            ("planner".to_string(), now, true),
+            ("planner".to_string(), long_lived, false),
+        ]);
+
+        let metrics = o.collect_metrics("").await.expect("collect_metrics");
+        let rows: Vec<_> = metrics
+            .iter()
+            .filter(|m| {
+                m.name == "agent_roster"
+                    && m.labels.get("role").map(String::as_str) == Some("planner")
+            })
+            .collect();
+        assert_eq!(
+            rows.len(),
+            2,
+            "both lifetimes of one role need a row of their own, not one merged row"
+        );
+        let count = |lifetime: &str| {
+            rows.iter()
+                .find(|m| m.labels.get("lifetime").map(String::as_str) == Some(lifetime))
+                .map(|m| m.value)
+        };
+        assert_eq!(
+            count("task"),
+            Some(2.0),
+            "the two task agents, without the permanent one"
+        );
+        assert_eq!(
+            count("process"),
+            Some(1.0),
+            "the permanent one, without the task agents"
+        );
+
+        let age = |lifetime: &str| {
+            metrics
+                .iter()
+                .find(|m| {
+                    m.name == "agent_roster_oldest_age_seconds"
+                        && m.labels.get("role").map(String::as_str) == Some("planner")
+                        && m.labels.get("lifetime").map(String::as_str) == Some(lifetime)
+                })
+                .map(|m| m.value)
+        };
+        let process_age = age("process").expect("the permanent object has an age");
+        let task_age = age("task").expect("the task agents have an age");
+        assert!(
+            process_age >= 29.0,
+            "the permanent object is the old one, measured {process_age}"
+        );
+        assert!(
+            task_age < 29.0,
+            "the task agents must not inherit the permanent object's age, measured {task_age}"
+        );
     }
 
     #[tokio::test]
