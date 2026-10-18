@@ -310,6 +310,9 @@ async fn pg_restore_loads_a_package_that_still_carries_the_generated_column() {
 /// COGNEVA_TEST_PACKAGE_MANIFEST=/tmp/pkg/manifest.json \
 ///   cargo test -p cogneva --test backup_pg -- --ignored --nocapture
 /// ```
+///
+/// 这是这个二进制里唯一需要外部输入的一条：CI 的步骤按名字跳过它（没有包时它会
+/// 拒绝而不是通过），其余三条在那里跑。它是一场**手工读数**，不是 CI 的一格。
 #[tokio::test]
 #[ignore = "requires COGNEVA_TEST_DATABASE_URL, COGNEVA_TEST_PACKAGE_PG_DIR and COGNEVA_TEST_PACKAGE_MANIFEST"]
 async fn pg_restore_loads_a_package_written_before_the_schema_moved_on() {
