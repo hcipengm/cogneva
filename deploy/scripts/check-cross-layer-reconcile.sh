@@ -8,7 +8,7 @@
 # 了「页缓存该占的那一份」。这两种越界都不在任何一层的读数里，因为它们都是**两个
 # 层的差**。
 #
-# 判的三条，都是差，不是某一层自己的性质：
+# 判的四条。前三条都是差，不是某一层自己的性质；第四条是投影与正本的相等——
 #
 #   1. 准入 ≤ 容量：`Σrequests/limits`（集群自己在配额 used 里记的数）不超过节点
 #      allocatable。超过 ⇒ 声明装得下配额只是配额比机器大，调度会以 Pending 的
@@ -24,6 +24,11 @@
 #      记的是**所有非终态 Pod**，包括渲染期清单之外、运行时按需建的那些（评测表、
 #      验收演练）；渲染期门禁只把声明的工作负载加进它的和，所以它能一路绿着而准入
 #      已经在拒人。这一条就是把那个差摆出来。
+#   4. live 的治理对象 == 树内声明的那一份：ResourceQuota 的 `spec.hard` 与
+#      LimitRange 的上下限逐字段相等，声明里 `cogneva.io/*` 的注解在 live 上同名同值。
+#      这一条不是「装得下」，是「集群上跑的到底是不是这棵树」——前三条可以在
+#      一只从未 apply 过本树、但数值刚好装得下的集群上全绿。2026-10-19 的标本：
+#      树内已抬到 52Gi，live 还停在 46Gi，没有任何读数说得出，是人翻对象翻出来的。
 #
 # 两条都必须并列 PSI 的 `full`（不是只看 `some`）。anon 之和与 MemAvailable 回答的是
 # 「还装得下多少不可回收的」，PSI 回答的是「这一刻有没有人真的被挡住」；两者可以
@@ -51,6 +56,8 @@
 #   COGNEVA_PROM_QUERY_CMD   测试注入点：给它一个可执行文件，参数是 PromQL，
 #                            标准输出当作 /api/v1/query 的响应体，不再走 curl
 #   COGNEVA_RECONCILE_NS     默认 cogneva
+#   COGNEVA_RECONCILE_PROFILE     判据 4 读哪一份渲染产物，默认 k3s-single
+#   COGNEVA_RECONCILE_DECLARED    直接指定渲染产物目录（覆盖 PROFILE）
 #   COGNEVA_RECONCILE_SERIES 序列文件路径（`--record` 时写）
 set -euo pipefail
 
@@ -95,6 +102,16 @@ ${KUBECTL} get nodes -o json >"${work}/nodes.json" 2>"${work}/nodes.err" \
 ${KUBECTL} -n "${NS}" get configmap cogneva-evolution-config -o json \
     >"${work}/evolution-config.json" 2>"${work}/evolution-config.err" || true
 
+# 判据 4 的左边：树内声明。定时载体从工作树跑这条脚本，仓库根由脚本自身位置算；
+# 读的是**已提交的渲染产物**而不是 values.yaml——values 可能正被别的会话改着，而
+# 集群上那份是上一次渲染 apply 上去的。读不到照样不在整条退出：缺席在那一条上点名。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+DECLARED_DIR="${COGNEVA_RECONCILE_DECLARED:-${REPO_ROOT}/deploy/rendered/${COGNEVA_RECONCILE_PROFILE:-k3s-single}}"
+# 准入面上另一只治理对象。读不到时判据 4 点名，不在这里整条退出。
+${KUBECTL} -n "${NS}" get limitrange -o json \
+    >"${work}/limitranges.json" 2>"${work}/limitranges.err" || true
+
 # ---- 物理面：Prometheus 端点 ----
 PROM_URL="${COGNEVA_PROMETHEUS_URL:-}"
 if [ -z "${COGNEVA_PROM_QUERY_CMD:-}" ] && [ -z "${PROM_URL}" ]; then
@@ -134,13 +151,13 @@ prom 'rate(node_pressure_memory_stalled_seconds_total[5m]) * on (instance) group
 if [ "${record}" = 1 ]; then
     export CROSS_LAYER_RECORD_FILE="${SERIES}"
 fi
-python3 - "${work}" "${NS}/${QUOTA_NAME}" <<'PYEOF'
+python3 - "${work}" "${NS}/${QUOTA_NAME}" "${DECLARED_DIR}" <<'PYEOF'
 import json
 import os
 import re
 import sys
 
-work, quota_id = sys.argv[1], sys.argv[2]
+work, quota_id, declared_dir = sys.argv[1], sys.argv[2], sys.argv[3]
 
 _SUFFIX = {
     '': 1, 'm': 1e-3,
@@ -326,6 +343,105 @@ for node in sorted(memtotal):
         print(f"    └ 不一致本身就是结论：anon 这条线仍有头寸，PSI full 却在计秒，"
               f"压力不在不可回收内存上，去 io / 回写那条线找")
 
+# ---- 判据 4：live 的治理对象就是树内声明的那一份 ----
+# 声明是正本，live 是它的投影；而投影滞后与「值本来就不同」在读数上同形，两者
+# 要修的地方却不同。判的是**逐字段相等**，不是「装得下」——后者可能答对，而对象
+# 根本不是从这棵树 apply 上去的（2026-10-19：树内已抬到 52Gi，live 还停在 46Gi，
+# 没有任何一条读数说得出这件事，是靠人翻对象翻出来的）。
+def qty_or_str(v):
+    try:
+        return ('q', qty(v))
+    except (TypeError, ValueError):
+        return ('s', str(v))
+
+
+def face_diff(where, d, l):
+    out = []
+    for k in sorted(set(d) | set(l)):
+        if k not in l:
+            out.append(f"{where}.{k}：树内声明 {d[k]!r}，live 没有这一项")
+        elif k not in d:
+            out.append(f"{where}.{k}：live 有 {l[k]!r}，树内声明没有")
+        elif qty_or_str(d[k]) != qty_or_str(l[k]):
+            out.append(f"{where}.{k}：live {l[k]!r} ≠ 树内声明 {d[k]!r}")
+    return out
+
+
+declared = {}
+try:
+    import glob
+    import yaml
+except ImportError:
+    yaml = None
+if yaml is None:
+    unreadable.append("没有 PyYAML：判据 4 读不出树内声明")
+else:
+    try:
+        for path in sorted(glob.glob(os.path.join(declared_dir, '*.yaml'))):
+            with open(path, encoding='utf-8') as f:
+                for d in yaml.safe_load_all(f):
+                    if d and d.get('kind') in ('ResourceQuota', 'LimitRange'):
+                        declared[(d['kind'], d['metadata']['name'])] = d
+    except (OSError, ValueError) as e:
+        unreadable.append(f"读不出树内声明（{declared_dir}）：{e}")
+    if not declared:
+        unreadable.append(f"树内声明目录里没有 ResourceQuota/LimitRange：{declared_dir}")
+
+live_objs = {('ResourceQuota', quota['metadata']['name']): quota}
+try:
+    with open(os.path.join(work, 'limitranges.json'), encoding='utf-8') as f:
+        for item in json.load(f).get('items', []):
+            live_objs[('LimitRange', item['metadata']['name'])] = item
+except (OSError, ValueError):
+    unreadable.append("读不到 live 的 limitrange 列表：判据 4 判不了 LimitRange")
+
+for (kind, name), d in sorted(declared.items()):
+    live_obj = live_objs.get((kind, name))
+    if live_obj is None:
+        problems.append(
+            f"判据4 {kind}/{name}：树内声明有它，live 没有——这套声明没有 apply 到"
+            f"这只集群（或对象被删了）；「装得下」可能照样成立，但那不是这份声明")
+        continue
+    diffs = []
+    if kind == 'ResourceQuota':
+        diffs += face_diff(f"{kind}/{name} spec.hard",
+                           d.get('spec', {}).get('hard') or {},
+                           live_obj.get('spec', {}).get('hard') or {})
+    else:
+        want = {e.get('type'): e for e in (d.get('spec', {}).get('limits') or [])}
+        have = {e.get('type'): e for e in (live_obj.get('spec', {}).get('limits') or [])}
+        for typ in sorted(set(want) | set(have), key=str):
+            if typ not in have:
+                diffs.append(f"{kind}/{name} limits[{typ}]：树内声明有，live 没有")
+                continue
+            if typ not in want:
+                diffs.append(f"{kind}/{name} limits[{typ}]：live 有，树内声明没有")
+                continue
+            for face in ('default', 'defaultRequest', 'max', 'min'):
+                diffs += face_diff(f"{kind}/{name} limits[{typ}].{face}",
+                                   want[typ].get(face) or {}, have[typ].get(face) or {})
+    # 声明里带 cogneva.io/ 前缀的注解是这棵树对这只对象的声明面（运行期预算等）；
+    # live 上别的注解（安装来源）不在比较范围内。
+    want_ann = {k: v for k, v in ((d.get('metadata') or {}).get('annotations') or {}).items()
+                if k.startswith('cogneva.io/')}
+    have_ann = (live_obj.get('metadata') or {}).get('annotations') or {}
+    for k, v in sorted(want_ann.items()):
+        if k not in have_ann:
+            diffs.append(f"{kind}/{name} 注解 {k}：树内声明 {v!r}，live 没有"
+                         f"（这份声明没有 apply 到这只对象）")
+        elif str(have_ann[k]) != str(v):
+            diffs.append(f"{kind}/{name} 注解 {k}：live {have_ann[k]!r} ≠ 树内声明 {v!r}")
+    if diffs:
+        problems.append(
+            f"判据4 {kind}/{name}：live 与树内声明不一致（{len(diffs)} 处，"
+            f"第一处：{diffs[0]}）——改了声明没 apply，或有人手工改过 live；"
+            f"两种都把「声明」这张正本变成了没人兑现的纸")
+        for extra in diffs[:6]:
+            print(f"    └ {extra}")
+    else:
+        print(f"  判据4 {kind}/{name}: 与树内声明逐字段相等"
+              f"（cogneva.io/* 注解 {len(want_ann)} 个）  ✓")
+
 if unreadable:
     # 判不了也记一行：这一拍跑过了，只是没读全——不记的话，序列上的空洞会把
     # 「没跑」和「跑了但读不到」混成同一件事。
@@ -343,5 +459,6 @@ if problems:
     sys.exit(1)
 
 record('ok', observed.get('memory'), sum_mem)
-print(f"CROSS-LAYER OK [{quota_id}]：三层在同一行上仍彼此装得下")
+print(f"CROSS-LAYER OK [{quota_id}]：三层在同一行上仍彼此装得下，"
+      f"live 的治理对象与树内声明逐字段相等")
 PYEOF

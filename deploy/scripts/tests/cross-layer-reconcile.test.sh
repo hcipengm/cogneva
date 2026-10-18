@@ -14,7 +14,11 @@
 #   7. 判据 2 绿但 PSI full 在计秒 -> 0，并且把「不一致本身就是结论」印出来；
 #  10. 准入余量装不下部署器滚动 Job -> 1，点名判据 3 与资源名（used 含运行期自建
 #      Pod，声明和仍装得进配额）；
-#  11. evolution ConfigMap 里没有滚动 Job 的上限 -> 2（缺席不是「装得下」）。
+#  11. evolution ConfigMap 里没有滚动 Job 的上限 -> 2（缺席不是「装得下」）；
+#  12. live 的配额上限与树内声明不同（其余三层仍装得下）-> 1，点名判据 4 与对象；
+#  13. live 少一个声明面注解 -> 1，点名那个注解（缺席读作「没 apply 过」）；
+#  14. 树内声明目录不在 -> 2（判不了，不是绿）；
+#  15. LimitRange 逐字段不同 -> 1，判词点到那个字段。
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,6 +39,7 @@ cat >"${work}/fake-kubectl" <<'EOF'
 scen="${SCEN:?}"
 case " $* " in
     *" get resourcequota "*) cat "${scen}/quota.json" ;;
+    *" get limitrange "*)    cat "${scen}/limitranges.json" ;;
     *" get nodes "*)         cat "${scen}/nodes.json" ;;
     *" get configmap "*)     cat "${scen}/evcfg.json" ;;
     *" get svc "*)           echo "10.0.0.1" ;;
@@ -78,14 +83,44 @@ mutation = sys.argv[1]
 Gi = 2 ** 30
 Mi = 2 ** 20
 
+# 判据 4 的左边与现网同量级：声明侧挂在 quota 上，live 侧是 quota.json。
+hard = {"requests.cpu": "6", "requests.memory": "12Gi",
+        "limits.cpu": "23", "limits.memory": "46Gi", "pods": "40"}
+budget = {"cogneva.io/runtime-pods-limits-cpu": "3",
+          "cogneva.io/runtime-pods-limits-memory": "3.75Gi"}
+container = {"type": "Container",
+             "default": {"cpu": "500m", "memory": "512Mi"},
+             "defaultRequest": {"cpu": "50m", "memory": "64Mi"},
+             "max": {"cpu": "8", "memory": "16Gi"},
+             "min": {"cpu": "10m", "memory": "16Mi"}}
+pvc = {"type": "PersistentVolumeClaim", "max": {"storage": "80Gi"},
+       "min": {"storage": "1Gi"}}
+
 state = {
     "quota": {
-        "metadata": {"name": "cogneva-quota", "namespace": "cogneva"},
-        "spec": {"hard": {"requests.cpu": "6", "requests.memory": "12Gi",
-                          "limits.cpu": "23", "limits.memory": "46Gi", "pods": "40"}},
+        "metadata": {"name": "cogneva-quota", "namespace": "cogneva",
+                     "annotations": dict(budget)},
+        "spec": {"hard": dict(hard)},
         "status": {"used": {"requests.cpu": "2410m", "requests.memory": "6864Mi",
                             "limits.cpu": "18100m", "limits.memory": "41664Mi",
                             "pods": "13"}},
+    },
+    # live 的 LimitRange：与声明逐字段相等（判据 4 的另一个对象）。
+    # 深拷贝：用例改 live 一侧时，声明侧必须保持原值，否则「差」被自己抹平。
+    "limitranges": {"items": [{
+        "metadata": {"name": "cogneva-limits", "namespace": "cogneva"},
+        "spec": {"limits": [json.loads(json.dumps(container)),
+                            json.loads(json.dumps(pvc))]},
+    }]},
+    # 树内渲染出来的那一份（判据 4 的左边）。改动只落在 live 侧时，它就是对照。
+    "declared": {
+        "ResourceQuota": {"apiVersion": "v1", "kind": "ResourceQuota",
+                          "metadata": {"name": "cogneva-quota", "namespace": "cogneva",
+                                       "annotations": dict(budget)},
+                          "spec": {"hard": dict(hard)}},
+        "LimitRange": {"apiVersion": "v1", "kind": "LimitRange",
+                       "metadata": {"name": "cogneva-limits", "namespace": "cogneva"},
+                       "spec": {"limits": [dict(container), dict(pvc)]}},
     },
     "nodes": {"items": [{
         "metadata": {"name": "cogneva"},
@@ -115,18 +150,30 @@ state = {
 
 exec(mutation, {"state": state, "Gi": Gi, "Mi": Mi})
 
-for key in ("quota", "nodes", "prom", "evcfg"):
+for key in ("quota", "nodes", "prom", "evcfg", "limitranges"):
     with open(os.path.join(out, key + ".json"), "w", encoding="utf-8") as f:
         json.dump(state[key], f)
+
+# 树内声明写成渲染出来的样子。JSON 是 YAML 的子集，所以直接落 JSON，多个对象用
+# `---` 分开——测试里不必再依赖 PyYAML 的 dump。
+declared = os.path.join(out, "declared")
+os.makedirs(declared, exist_ok=True)
+with open(os.path.join(declared, "01-governance.yaml"), "w", encoding="utf-8") as f:
+    for i, obj in enumerate(state["declared"].values()):
+        if i:
+            f.write("---\n")
+        json.dump(obj, f, ensure_ascii=False)
+        f.write("\n")
 PY
   printf '%s' "${dir}"
 }
 
-run_gate() { # run_gate <场景目录>：输出进 LAST_OUT，退出码进 RC（命令替换会丢退出码）
-  local scen="$1"
+run_gate() { # run_gate <场景目录> [声明目录]：输出进 LAST_OUT，退出码进 RC（命令替换会丢退出码）
+  local scen="$1" declared="${2:-${scen}/declared}"
   set +e
   SCEN="${scen}" COGNEVA_KUBECTL="${work}/fake-kubectl" \
   COGNEVA_PROM_QUERY_CMD="${work}/fake-prom" \
+  COGNEVA_RECONCILE_DECLARED="${declared}" \
       bash "${gate}" >"${work}/out.txt" 2>&1
   RC=$?
   set -e
@@ -231,6 +278,34 @@ expect job-limit-missing 2 "没有 COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_MEMORY_
 del state["evcfg"]["data"]["COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_MEMORY_LIMIT"]
 '
 
+# ---- 判据 4：live 的治理对象 == 树内声明 ----
+# 这四条改的都只是 live 一侧（或树的读入路径），三层「装得下」照样成立——判据 4 要
+# 证明的正是「装得下」回答不了的那件事：live 上的对象是不是这棵树的那一份。
+
+# 12. live 的配额被人手工抬高，树内声明没动：判据 1/2/3 全绿，判据 4 红。
+expect live-hard-drift 1 "判据4 ResourceQuota/cogneva-quota" '
+state["quota"]["spec"]["hard"]["limits.memory"] = "50Gi"
+'
+
+# 13. live 少了一个声明面注解（运行期预算）：缺席在这里读作「没 apply 过」。
+expect live-annotation-missing 1 "注解 cogneva.io/runtime-pods-limits-memory" '
+del state["quota"]["metadata"]["annotations"]["cogneva.io/runtime-pods-limits-memory"]
+'
+
+# 14. 树内没有声明可对照（目录不在）：不是绿，是判不了。
+scen="$(make_scenario declared-dir-missing-2 'pass')"
+run_gate "${scen}" "${scen}/no-such-dir"
+[ "${RC}" -eq 2 ] \
+    || fail "declared-dir-missing-2: 期望退出码 2，实得 ${RC}；输出：${LAST_OUT}"
+printf '%s' "${LAST_OUT}" | grep -Fq "树内声明目录里没有 ResourceQuota/LimitRange" \
+    || fail "declared-dir-missing-2: 判词没有点名声明目录；输出：${LAST_OUT}"
+echo "ok   declared-dir-missing-2：声明目录不在时判不了（退出码 2）"
+
+# 15. LimitRange 的一个字段与 live 不同：判词点到那个字段，不是笼统说「不一致」。
+expect limitrange-drift 1 "limits[Container].max.cpu" '
+state["limitranges"]["items"][0]["spec"]["limits"][0]["max"]["cpu"] = "12"
+'
+
 # ---- 序列模式：每一拍落一行，红了、读不到也各落一行 ----
 #
 # 判据是「拍子之间有没有洞」，所以**判红的那一拍也必须是拍子**：只在绿的时候写，
@@ -242,6 +317,7 @@ run_gate_record() { # run_gate_record <场景目录> <序列文件>：带 --reco
   SCEN="${scen}" COGNEVA_KUBECTL="${work}/fake-kubectl" \
   COGNEVA_PROM_QUERY_CMD="${work}/fake-prom" \
   COGNEVA_RECONCILE_SERIES="${series}" \
+  COGNEVA_RECONCILE_DECLARED="${scen}/declared" \
       bash "${gate}" --record >"${work}/out.txt" 2>&1
   RC=$?
   set -e
@@ -289,8 +365,9 @@ rec="${work}/series-off.tsv"
 SCEN="${scen}" COGNEVA_KUBECTL="${work}/fake-kubectl" \
 COGNEVA_PROM_QUERY_CMD="${work}/fake-prom" \
 COGNEVA_RECONCILE_SERIES="${rec}" \
+COGNEVA_RECONCILE_DECLARED="${scen}/declared" \
     bash "${gate}" >/dev/null 2>&1 || fail "record-off: 不带 --record 时退出码不是 0"
 [ ! -e "${rec}" ] || fail "record-off: 没带 --record 却写了序列：$(cat "${rec}")"
 echo "ok   record-off：不带 --record 时一个字节也不写"
 
-echo "cross-layer-reconcile: 15 passed"
+echo "cross-layer-reconcile: 20 passed"
