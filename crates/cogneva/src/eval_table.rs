@@ -956,6 +956,20 @@ fn missing_dependencies(
             Absence::OutOfArm,
             "this run used the tools-off diagnostic arm, so it is not a main-table row",
         ));
+        // codeact 的动作空间就是代码本身：没有代码工具，它每一题都只能拒跑
+        // （`this benchmark offers no code tool`）。这不是题跑错了，是这一臂没有给它
+        // 能用的动作，所以盖**整行**记成缺席。不盖整跑：同一臂里 gepa/agentflow/nql
+        // 照跑照有读数，上面那条 `Run` 的理由对它们仍然成立——把整跑盖掉会连这些
+        // 读数一起抹掉。
+        if scaffolds.iter().any(|name| name == "codeact") {
+            missing.push(Missing::new(
+                "codeact",
+                MissingScope::Row("codeact".to_string()),
+                Absence::OutOfArm,
+                "this scaffold's action space is code; the tools-off diagnostic arm gives it no \
+                 code tool, so every case would refuse to run rather than measure something",
+            ));
+        }
     }
     if wiring.backbone.is_none() {
         missing.push(Missing::new(
@@ -2891,6 +2905,34 @@ mod tests {
         );
         // 四格全没被盖住：160 条跑不动，一条都不进 `blocked`。
         assert!(text.contains("\nerrored\t160\tblocked\t0\n"), "{text}");
+    }
+
+    /// 诊断臂里 codeact 是**按定义跑不了**，不是跑错了。
+    ///
+    /// 它的动作空间就是代码；`--tools none` 不给它任何代码工具，于是每一题都在起跑时
+    /// 拒跑（`this benchmark offers no code tool`）。把 120 例记成 `errored` 会让读的人
+    /// 去查这一格为什么坏，而真相是这一臂没有给它能用的动作。盖整行、不算整跑：同一臂里
+    /// gepa/agentflow/nql 照跑照有读数。
+    #[test]
+    fn the_tools_off_arm_declares_codeact_out_of_arm_as_a_whole_row() {
+        let wiring = Wiring::default();
+        let scaffolds = ["codeact".to_string(), "gepa".to_string()];
+        let off = missing_dependencies(ToolArm::None, &["hle"], &scaffolds, &wiring);
+        let codeact = off
+            .iter()
+            .find(|m| m.subject == "codeact")
+            .expect("诊断臂必须声明 codeact 不在这一臂里");
+        assert_eq!(codeact.scope, MissingScope::Row("codeact".to_string()));
+        assert_eq!(codeact.kind, Absence::OutOfArm);
+        // 行声明只盖 codeact，不盖 gepa：同一臂里 gepa 的读数是诊断的全部用处。
+        assert!(codeact.covers("hle", "codeact"));
+        assert!(!codeact.covers("hle", "gepa"));
+
+        let platform = missing_dependencies(ToolArm::Platform, &["hle"], &scaffolds, &wiring);
+        assert!(
+            !platform.iter().any(|m| m.subject == "codeact"),
+            "主表那一臂给 codeact 工具，不该把它声明成缺席"
+        );
     }
 
     /// 另一向的整次跑缺席：骨干与裁判缺了，**每一格**都没读数，所以它们算没轮到跑。
