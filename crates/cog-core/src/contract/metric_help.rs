@@ -886,11 +886,17 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          beside it keeps its own name for the mirror reason. The pair is what \
          separates a consumer that runs and hands nothing on from one with \
          nothing to take: `taken` greater than `attempted` is the first, and \
-         both flat is the second. Both sides are measured in events, so \
-         subtracting the store's own failure count from `attempted` says how \
-         many reached the table -- but read `attempted` against the store's \
-         row count to ask whether the handoff landed at all, because a write \
-         that failed is still counted here.",
+         both flat is the second. In today's aggregator the two stages are \
+         equal by construction, because every event a pass receives is handed \
+         on: the pair is kept apart for a consumer that starts filtering, and \
+         the identity is not evidence that a handoff happened -- read it as one \
+         number until the two diverge. `taken` counts only what survived the \
+         broadcast: events this consumer lagged past are in \
+         `cogneva_event_bus_lagged_total` for the same `consumer` and never \
+         reach either stage, so read that series first. Both stages are \
+         measured in events, and `attempted` means handed on, not stored: a \
+         write that failed is still counted here, so subtract the store's own \
+         failure count from it to get the events that reached the table.",
     ),
     (
         crate::metric_names::OBSERVABILITY_EVENT_PERSIST_FAILED_TOTAL.as_str(),
@@ -905,8 +911,10 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          reading surface samples -- and a table that stays empty because every \
          write failed reads the same as one nothing was ever offered. Subtract \
          it from `cogneva_event_bus_handoff_total{stage=\"attempted\"}` to get \
-         the events that reached the table; alert on this series itself when \
-         the subtraction is the only place the loss shows.",
+         the events that reached the table -- never read `attempted` alone as \
+         the rows the table should have gained, since every failed write is \
+         still counted there. Alert on this series itself when the \
+         subtraction is the only place the loss shows.",
     ),
     (
         crate::metric_names::TOOL_OUTPUT_FETCH_BUDGET_EXHAUSTED_TOTAL.as_str(),

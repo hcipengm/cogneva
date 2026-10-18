@@ -1144,6 +1144,13 @@ metric_names! {
     // nothing to do, and from the table's row count it is identical to a channel
     // nothing was ever offered. `taken` against `attempted` says the first;
     // either against the store's rows says the second.
+    //
+    // Today's aggregator makes the two stages equal by construction: every
+    // event a pass receives is handed on. The second stage is here for the
+    // filter a future consumer will add, and the identity must not be read as
+    // proof that the handoff worked -- it is one number until the stages
+    // diverge. Events this consumer lagged past never reach either stage; they
+    // are counted under the same `consumer` in `..._lagged_total`.
     EVENT_BUS_HANDOFF_TOTAL => "cogneva_event_bus_handoff_total",
 
     // The store's half of that handoff: a write whose persistence failed.
