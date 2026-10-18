@@ -411,6 +411,18 @@ pub async fn backup_postgres(
     Ok(report)
 }
 
+/// 恢复做了什么。
+///
+/// `tables` 是装回去的表；`recomputed` 是包里有值、装载时却由目标自己算回来的
+/// 列，记作 `表.列`。后者不进成败判决——值由同一行的其它列算出，不搬不丢数据
+/// ——但必须被写下来：生成表达式一旦改动，旧包会被装成「当时不曾有过」的值，
+/// 而表数、行数、源库比对三项全都照旧是全绿，这一格是唯一会露出来的地方。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RestoreReport {
+    pub tables: Vec<String>,
+    pub recomputed: Vec<String>,
+}
+
 /// PG 恢复：整包表一次性 TRUNCATE ... RESTART IDENTITY CASCADE，
 /// 同一事务内关掉触发器（含外键检查）逐表 COPY FROM，最后序列归位。
 /// 目标必须是跑完迁移的库（fresh install 天然是）；session_replication_role
@@ -418,8 +430,9 @@ pub async fn backup_postgres(
 pub async fn restore_postgres(
     pool: &PgPool,
     pkg_pg_dir: &Path,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+) -> Result<RestoreReport, Box<dyn std::error::Error>> {
     let mut tables = Vec::new();
+    let mut recomputed = Vec::new();
     for entry in std::fs::read_dir(pkg_pg_dir)? {
         let name = entry?.file_name().to_string_lossy().into_owned();
         if let Some(rest) = name.strip_prefix("public.") {
@@ -488,6 +501,12 @@ pub async fn restore_postgres(
             if writable.len() == columns.len() {
                 copy_package_table_into(&mut tx, table, &path, &columns).await?;
             } else {
+                recomputed.extend(
+                    computed
+                        .iter()
+                        .filter(|column| columns.iter().any(|c| c == *column))
+                        .map(|column| format!("{table}.{column}")),
+                );
                 // 临时表固定名字足够：逐表用、用完即丢，同一时刻只有一张。
                 const STAGING: &str = "_drill_stage";
                 sqlx::query(&format!(
@@ -521,7 +540,7 @@ pub async fn restore_postgres(
             sqlx::query(line).execute(pool).await?;
         }
     }
-    Ok(tables)
+    Ok(RestoreReport { tables, recomputed })
 }
 
 /// Secret 卷（只读挂载，key 一文件）打成 apply-able manifest。
@@ -1386,8 +1405,12 @@ pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let pg_dir = pkg_dir.join("pg");
     if pg_dir.exists() {
         let pool = PgPool::connect(&database_url).await?;
-        let tables = restore_postgres(&pool, &pg_dir).await?;
-        tracing::info!(tables = tables.len(), "postgres restored");
+        let report = restore_postgres(&pool, &pg_dir).await?;
+        tracing::info!(
+            tables = report.tables.len(),
+            recomputed = report.recomputed.len(),
+            "postgres restored"
+        );
     }
 
     let qdrant_dir = pkg_dir.join("qdrant");
@@ -1549,6 +1572,7 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
         rows_restored: None,
         rows_expected: None,
         source_runs_matched: None,
+        generated_columns_recomputed: Vec::new(),
         error: None,
     };
 
@@ -1679,7 +1703,14 @@ async fn restore_and_compare(
         return Err("包里没有 pg 段，这次演练无表可恢复".into());
     }
     let restored = restore_postgres(&scratch, &pg_dir).await?;
-    tracing::info!(tables = restored.len(), "drill: postgres segment restored");
+    // 装回来的列清单要跟着这一行一起留在账上：一份按旧导出写的包被装回时，
+    // 生成列的值不是包里的、是目标此刻算出来的。表数与行数看不见这件事。
+    drill.generated_columns_recomputed = restored.recomputed.clone();
+    tracing::info!(
+        tables = restored.tables.len(),
+        recomputed = restored.recomputed.len(),
+        "drill: postgres segment restored"
+    );
 
     // 逐表把「装回来几行」与清单声明比。清单里的表在当前 schema 上缺一张，
     // 下面的 count 会直接报错——那也是一次真实的失败：这个包装不回今天的结构。

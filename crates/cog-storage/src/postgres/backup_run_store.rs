@@ -144,8 +144,9 @@ INSERT INTO backup_drills ( \
     drill_id, started_at, finished_at, outcome, package, package_written_at, package_bytes, \
     packages_on_volume, oldest_package_at, offsite_newest_at, offsite_matches_newest, \
     tables_restored, tables_expected, \
-    rows_restored, rows_expected, source_runs_matched, error \
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) \
+    rows_restored, rows_expected, source_runs_matched, error, \
+    generated_columns_recomputed \
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
 ON CONFLICT (drill_id) DO NOTHING";
 
 /// The newest drill, failed or not.
@@ -157,7 +158,8 @@ const READ_LATEST_DRILL_SQL: &str = "\
 SELECT drill_id, started_at, finished_at, outcome, package, package_written_at, package_bytes, \
        packages_on_volume, oldest_package_at, offsite_newest_at, offsite_matches_newest, \
        tables_restored, tables_expected, \
-       rows_restored, rows_expected, source_runs_matched, error \
+       rows_restored, rows_expected, source_runs_matched, error, \
+       generated_columns_recomputed \
 FROM backup_drills \
 ORDER BY finished_at DESC, drill_id DESC \
 LIMIT 1";
@@ -348,6 +350,7 @@ impl BackupRunStore for PostgresBackupRunStore {
             .bind(drill.rows_expected)
             .bind(drill.source_runs_matched)
             .bind(drill.error.as_deref())
+            .bind(&drill.generated_columns_recomputed)
             .execute(&self.pool)
             .await
             .map_err(|e| {
@@ -413,6 +416,9 @@ impl BackupRunStore for PostgresBackupRunStore {
             source_runs_matched: row
                 .try_get("source_runs_matched")
                 .map_err(|e| SFError::Database(format!("drill source_runs_matched: {e}")))?,
+            generated_columns_recomputed: row.try_get("generated_columns_recomputed").map_err(
+                |e| SFError::Database(format!("drill generated_columns_recomputed: {e}")),
+            )?,
             error: row
                 .try_get("error")
                 .map_err(|e| SFError::Database(format!("drill error: {e}")))?,

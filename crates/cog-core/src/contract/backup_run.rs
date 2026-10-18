@@ -290,6 +290,19 @@ pub struct BackupDrillRecord {
     /// Whether the account table came back identical, row for row, to the same
     /// rows in the live database. `None` when the comparison could not be made.
     pub source_runs_matched: Option<bool>,
+    /// The `table.column` pairs whose values the package carried but the target
+    /// recomputed instead of loading -- columns the schema derives from other
+    /// columns of the same row.
+    ///
+    /// This is not part of [`Self::ok`]: a restore that leaves those columns to
+    /// the target is still a restore. It is recorded because the alternative is
+    /// silence. If a generated expression is ever changed, every older package
+    /// comes back with values the package never held, while the table count, the
+    /// row count and the account comparison all still agree -- the three
+    /// measurements that make up the verdict cannot see it. The names are the
+    /// only place that rewrite would show, so a row without them would say
+    /// "restorable" about data that came back different.
+    pub generated_columns_recomputed: Vec<String>,
     /// Why the drill did not prove the package restorable. Empty on a drill
     /// whose evidence agrees.
     pub error: Option<String>,
@@ -427,6 +440,7 @@ mod tests {
             rows_restored: Some(1000),
             rows_expected: Some(1000),
             source_runs_matched: Some(true),
+            generated_columns_recomputed: Vec::new(),
             error: None,
         }
     }
@@ -441,6 +455,15 @@ mod tests {
     #[test]
     fn a_drill_is_ok_only_with_all_of_its_evidence_agreeing() {
         assert!(agreeing_drill().ok());
+
+        // 由目标重算的列不影响判决：它的值从同一行的其它列算出来，不搬不丢数据。
+        // 这一格存在的理由是「表达式改了就没人看得见」，不是「恢复可疑」。
+        let mut d = agreeing_drill();
+        d.generated_columns_recomputed = vec!["raw_log_index.is_hot".into()];
+        assert!(
+            d.ok(),
+            "a target-recomputed column is not a missing measurement"
+        );
 
         let mut d = agreeing_drill();
         d.error = Some("restore failed".into());
