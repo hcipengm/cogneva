@@ -46,7 +46,7 @@ async fn creating_the_same_name_twice_returns_the_same_agent() {
         "the second create must hand back the live agent, not a second one"
     );
     assert_eq!(
-        manager.list_workers().await.expect("list").len(),
+        manager.list_workers().await.len(),
         1,
         "one name must be one worker in the roster"
     );
@@ -78,5 +78,5 @@ async fn a_different_task_gets_its_own_agent() {
         !Arc::ptr_eq(&a, &b),
         "two tasks must not share one agent object"
     );
-    assert_eq!(manager.list_workers().await.expect("list").len(), 2);
+    assert_eq!(manager.list_workers().await.len(), 2);
 }
