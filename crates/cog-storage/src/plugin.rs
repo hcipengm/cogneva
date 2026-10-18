@@ -1423,6 +1423,27 @@ mod budget_tests {
     }
 
     #[test]
+    fn every_source_label_the_code_can_emit_is_named_in_the_help_text() {
+        let help = cog_core::metric_help_text(
+            cog_core::MetricType::Gauge,
+            cog_core::metric_names::PG_POOL_MAX_CONNECTIONS.as_str(),
+        );
+        // Every label value a reader can meet is described there; a new arm
+        // added without a sentence would otherwise reach the store as an
+        // unexplained word.
+        for (configured, derived) in [(50, 12), (4, 12), (12, 12)] {
+            let (_, source) = bound_and_source(configured, derived);
+            assert!(
+                help.contains(source),
+                "help text does not name source={source}"
+            );
+        }
+        // The unreadable case does not come out of that function, so it is
+        // named here rather than inferred.
+        assert!(help.contains("server_unreadable"));
+    }
+
+    #[test]
     fn equal_values_do_not_make_the_server_the_source() {
         // The derived quotient is tighter, so it decided.
         assert_eq!(bound_and_source(50, 12), (12, "server"));
