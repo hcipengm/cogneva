@@ -17,6 +17,71 @@
 //!
 //! 纯函数无 IO，配置来自 [`crate::PromotionGateConfig`]。
 
+#[cfg(test)]
+mod feedback_verification_surface {
+    use crate::criteria_face::{is_carrier_path, Tier, TierReason, Tiering};
+
+    /// The face a verdict about a change is scored against.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum JudgmentFace {
+        /// The checkout the change landed in. Usable only when the change did
+        /// not move the criteria it is being judged by.
+        ChangedCheckout,
+        /// A pristine revision the change cannot have reached.
+        PristineCheckout,
+    }
+
+    /// Where a tiering's verdict has to come from: a change that touches the
+    /// criteria code cannot be judged by the surface it just rewrote.
+    fn judgment_face(tiering: &Tiering) -> JudgmentFace {
+        if tiering.touches_criteria_code {
+            JudgmentFace::PristineCheckout
+        } else {
+            JudgmentFace::ChangedCheckout
+        }
+    }
+
+    fn tiering_for(paths: &[&str]) -> Tiering {
+        if paths.iter().copied().any(is_carrier_path) {
+            Tiering {
+                tier: Tier::RealGate,
+                reasons: vec![TierReason::CriteriaCarrier],
+                touches_criteria_code: true,
+            }
+        } else {
+            Tiering {
+                tier: Tier::Tests,
+                reasons: vec![TierReason::Code],
+                touches_criteria_code: false,
+            }
+        }
+    }
+
+    /// principle: feedback_verification_must_not_run_on_the_surface_under_repair
+    ///
+    /// 修 A 的验证若跑在 A 自己的判据面上就是自指——既可能被 A 的缺陷误伤，也可能
+    /// 为验证给被检面注入病因。因此触及判据代码的变更，裁决只能取自该变更无法抵达
+    /// 的独立面；把裁决路回被修改的判据面，必须失败关闭。
+    #[test]
+    fn a_change_that_touches_the_criteria_face_is_judged_off_that_face() {
+        // The classifier file names itself as a carrier, so a change rewriting
+        // it is exactly the self-verification case.
+        let repaired = tiering_for(&["crates/cog-reflection/src/criteria_face.rs"]);
+        assert!(repaired.touches_criteria_code);
+        assert_eq!(repaired.tier, Tier::RealGate);
+        assert_eq!(judgment_face(&repaired), JudgmentFace::PristineCheckout);
+        // Fail closed: scoring the verdict against the repaired surface is
+        // rejected rather than routed back at the changed checkout.
+        assert_ne!(judgment_face(&repaired), JudgmentFace::ChangedCheckout);
+
+        // The rule is about the criteria face, not every change: ordinary
+        // source keeps its verdict in the checkout it changed.
+        let ordinary = tiering_for(&["crates/cog-reflection/src/promoter.rs"]);
+        assert!(!ordinary.touches_criteria_code);
+        assert_eq!(judgment_face(&ordinary), JudgmentFace::ChangedCheckout);
+    }
+}
+
 use crate::PromotionGateConfig;
 use cog_core::PromotionGateKind;
 
