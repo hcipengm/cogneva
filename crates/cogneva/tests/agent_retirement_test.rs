@@ -190,9 +190,19 @@ async fn a_retired_agent_is_not_listed_and_cannot_be_looked_up() {
     // 直接退这一个对象，名册的清理留给循环——验的是名册的读者看不到它，
     // 而不是它已经被摘掉。
     let agent = manager.list_workers().await.remove(0).agent;
-    agent.retire().await;
+    let report = agent.retire().await;
 
     assert!(agent.is_retired());
+    assert!(
+        report.performed,
+        "the first retire is the one that removes it"
+    );
+    assert!(
+        report.consumer_ended,
+        "the consumer must be joined out, not merely asked to stop: a flag \
+         read between reads leaves at most one block period to wait"
+    );
+    assert!(!report.was_busy, "an idle agent has nothing in flight");
     assert!(
         manager.list_workers().await.is_empty(),
         "list_workers is read by the resume path; a retired id resolving to \
