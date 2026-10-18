@@ -858,10 +858,9 @@ impl Agent {
         let Some(handle) = handle else {
             return true;
         };
-        matches!(
-            tokio::time::timeout(AGENT_RETIRE_TIMEOUT, handle).await,
-            Ok(_)
-        )
+        tokio::time::timeout(AGENT_RETIRE_TIMEOUT, handle)
+            .await
+            .is_ok()
     }
 
     /// Wait until the agent is no longer active or completing.

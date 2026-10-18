@@ -513,9 +513,16 @@ impl GlobalAgentManager {
                 .map(|w| (w.agent.clone(), w.role.clone()))
                 .collect()
         };
+        // Retired together, not one after another. Each retirement may wait out
+        // the whole budget for a consumer that is inside a handler, so a task
+        // with many branch agents would otherwise hold the terminal path for
+        // the object count times that budget. They share nothing -- each stops
+        // its own inbox and joins its own handle -- so the whole task costs one
+        // budget rather than one per object.
+        let reports =
+            futures::future::join_all(targets.iter().map(|(agent, _)| agent.retire())).await;
         let mut retired = 0;
-        for (agent, role) in targets {
-            let report = agent.retire().await;
+        for ((agent, role), report) in targets.into_iter().zip(reports) {
             if report.performed {
                 retired += 1;
             }

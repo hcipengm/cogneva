@@ -6,6 +6,10 @@ use futures::StreamExt;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+/// One stop signal per (subject, group): the sender lives here, the receiver
+/// travels with the stream that subscription handed out.
+type StopSignals = HashMap<(String, String), tokio::sync::watch::Sender<bool>>;
+
 #[derive(Debug, Clone)]
 struct MemoryChannelState {
     sender: tokio::sync::broadcast::Sender<(String, Vec<u8>)>,
@@ -29,7 +33,7 @@ pub struct MemoryMessageBackend {
     /// A watch channel rather than a flag: the reader is parked on a broadcast
     /// receive, and a flag it only reads between messages would never be seen
     /// by an idle subscriber.
-    stops: Arc<Mutex<HashMap<(String, String), tokio::sync::watch::Sender<bool>>>>,
+    stops: Arc<Mutex<StopSignals>>,
 }
 
 impl MemoryMessageBackend {
