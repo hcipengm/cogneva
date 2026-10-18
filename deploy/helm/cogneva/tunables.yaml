@@ -109,6 +109,16 @@ rows:
       already records started_at/finished_at per run, so a derived deadline could
       be a multiple of the observed run time; nothing computes it.
 
+  - key: backup.drillDeadlineSeconds
+    source: override
+    why: >-
+      One hour, the same as a backup run, though the drill does more work: it
+      restores the package into a scratch database before comparing. The flow
+      records each drill's own elapsed time, so a derived deadline could be a
+      multiple of the observed one; nothing computes it. The deadline is there
+      to bound a restore that hangs, not to track a normal one -- with Forbid,
+      a stuck drill would otherwise block every drill after it.
+
   - key: backup.storage
     source: override
     why: >-

@@ -1262,7 +1262,7 @@ pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
 /// 固定的名字让「上一次崩掉的演练留下了什么」有确定的答案——这一次开工先把它
 /// 删掉。按次取名字会让每一次崩溃都在集群的 PG 里留下一个 1 GB 的残库，而没人
 /// 会去数有几个。
-pub const DRILL_DATABASE: &str = "cogneva_drill";
+pub const DRILL_DATABASE: &str = "cog_drill";
 
 /// 演练配置。只要库、卷与迁移目录。
 ///
@@ -2029,25 +2029,25 @@ mod tests {
                 "postgres://cog_user:s3cret@postgres:5432/cogneva",
                 DRILL_DATABASE
             ),
-            "postgres://cog_user:s3cret@postgres:5432/cogneva_drill"
+            "postgres://cog_user:s3cret@postgres:5432/cog_drill"
         );
         assert_eq!(
             with_database(
                 "postgres://cog_user:s3cret@postgres:5432/cogneva?sslmode=disable",
                 DRILL_DATABASE
             ),
-            "postgres://cog_user:s3cret@postgres:5432/cogneva_drill?sslmode=disable"
+            "postgres://cog_user:s3cret@postgres:5432/cog_drill?sslmode=disable"
         );
         // 路径为空（`/` 结尾）：库名照样要补上，不能拼出一个空库名的 URL。
         assert_eq!(
             with_database("postgres://cog_user@postgres:5432/", DRILL_DATABASE),
-            "postgres://cog_user@postgres:5432/cogneva_drill"
+            "postgres://cog_user@postgres:5432/cog_drill"
         );
         // 连路径都没有：补路径。没有 `://` 的串不是 URL，原样返回——猜一个
         // 出来只会在建库的时候炸在一个更难读的地方。
         assert_eq!(
             with_database("postgres://cog_user@postgres:5432", DRILL_DATABASE),
-            "postgres://cog_user@postgres:5432/cogneva_drill"
+            "postgres://cog_user@postgres:5432/cog_drill"
         );
         assert_eq!(with_database("not a url", DRILL_DATABASE), "not a url");
     }
