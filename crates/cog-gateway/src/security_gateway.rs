@@ -4736,6 +4736,26 @@ async fn stream_forward(
             .get(cog_core::LLM_TASK_HEADER)
             .and_then(|v| v.to_str().ok()),
     );
+    // 账本记到 `unknown` 就到此为止：它数得出"有一次调用没声明"，点不出是谁。
+    // 规则 `llm_call_without_declared_actor` 的自述里把这条边界写死了。请求离开
+    // 网关的这一刻还知道答案，所以在这里留一行：调用方自报的 User-Agent、两个
+    // 身份头在不在。只在身份缺失时记，声明正确的一次请求一行也不写——否则这行
+    // 本身就是噪声，而噪声里的名字没人找。
+    if actor == crate::actor_labels::UNKNOWN_ACTOR {
+        tracing::warn!(
+            style,
+            actor_header = req
+                .headers()
+                .contains_key(cog_core::LLM_ACTOR_HEADER),
+            origin_header = req.headers().contains_key(LLM_ORIGIN_HEADER),
+            user_agent = req
+                .headers()
+                .get(axum::http::header::USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or(""),
+            "LLM 代理收到未声明身份的调用：账本上它只会落在 unknown 格，日志是唯一能点名调用者的地方"
+        );
+    }
     let body = axum::body::to_bytes(req.into_body(), 32 * 1024 * 1024)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
