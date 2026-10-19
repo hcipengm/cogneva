@@ -2153,6 +2153,16 @@ data:
               "_comment_why_not_absent": "an installation with no second copy at all publishes nothing here and is reported by backup_offsite_copy_never_written; firing on absence would make this rule say the same thing a second time, in a message about a file that is not there."
             },
             {
+              "name": "backup_offsite_copy_missing_from_window",
+              "promql": "max(cogneva_backup_run_readings{readout=\"offsite_missing_packages\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds{readout=\"offsite_missing_packages\"}) < 1800))",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "Packages in the retention window have no copy outside the backup volume: {value} is how many of them the drill could not find a same-named file for in the offsite directory. This is not the same question as whether the second copy is current -- that rule walks one file, the newest one, and a copy switched on yesterday is perfectly current while everything written before it still exists in exactly one place. The number falls only as the window rotates, so a fresh installation reads high for a retention period and that is coverage, not breakage; it becomes a fault when the window has rotated past a package and the count did not move, which is why the drill that counts it runs every night. It is a warning because no package is known to be lost: the window is intact on the volume, and what is missing is the second place it would be found if that volume went away.",
+              "_comment_why_not_absent": "an installation with no offsite directory at all publishes nothing here: the question does not apply, and backup_offsite_copy_never_written already reports that there is no second copy anywhere. A zero is published as a zero -- full coverage is a measured value, not a silence."
+            },
+            {
               "name": "backup_offsite_remote_copy_is_stale",
               "promql": "max(cogneva_backup_run_readings{readout=\"offsite_remote_newest_age_seconds\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds{readout=\"offsite_remote_newest_age_seconds\"}) < 1800))",
               "condition": {

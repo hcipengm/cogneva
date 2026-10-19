@@ -101,6 +101,10 @@ enum BackupReadout {
     OffsiteNewestAgeSeconds,
     /// Whether that second copy is the very package the drill restored: 1 or 0.
     OffsiteMatchesVolume,
+    /// How many packages on the volume have no same-named copy outside it.
+    /// Absent when the drill was given no offsite directory: the question does
+    /// not apply, and a zero would read as full coverage.
+    OffsiteMissingPackages,
     /// How long ago the host last looked at the offsite repository. This is
     /// the channel's own liveness, separate from what it found: absent means
     /// nobody observes, while a value here with the two repository ages absent
@@ -114,6 +118,13 @@ enum BackupReadout {
     /// long the key has gone unrotated, from the repository's own key list.
     /// Absent until somebody observes it.
     OffsiteRepositoryKeyAgeSeconds,
+    /// How far apart the newest opened package's own segments were, and the
+    /// bound that same package declared. The drill refuses a package over its
+    /// bound, so an ok drill always carries skew <= bound; the pair is
+    /// published so a reader can see the distance to the edge before the night
+    /// it crosses, which the verdict alone cannot show.
+    SegmentSkewSeconds,
+    SegmentSkewBoundSeconds,
     /// How many packages in the retention window have no successful drill
     /// behind them, counted by the store across the window rather than read off
     /// the newest drill's row.
@@ -140,9 +151,12 @@ impl BackupReadout {
         BackupReadout::VolumeOldestPackageAgeSeconds,
         BackupReadout::OffsiteNewestAgeSeconds,
         BackupReadout::OffsiteMatchesVolume,
+        BackupReadout::OffsiteMissingPackages,
         BackupReadout::OffsiteObservationAgeSeconds,
         BackupReadout::OffsiteRemoteNewestAgeSeconds,
         BackupReadout::OffsiteRepositoryKeyAgeSeconds,
+        BackupReadout::SegmentSkewSeconds,
+        BackupReadout::SegmentSkewBoundSeconds,
         BackupReadout::DrillWindowUnprovenPackages,
     ];
 
@@ -166,9 +180,12 @@ impl BackupReadout {
             BackupReadout::VolumeOldestPackageAgeSeconds => "volume_oldest_package_age_seconds",
             BackupReadout::OffsiteNewestAgeSeconds => "offsite_newest_age_seconds",
             BackupReadout::OffsiteMatchesVolume => "offsite_matches_volume",
+            BackupReadout::OffsiteMissingPackages => "offsite_missing_packages",
             BackupReadout::OffsiteObservationAgeSeconds => "offsite_observation_age_seconds",
             BackupReadout::OffsiteRemoteNewestAgeSeconds => "offsite_remote_newest_age_seconds",
             BackupReadout::OffsiteRepositoryKeyAgeSeconds => "offsite_repository_key_age_seconds",
+            BackupReadout::SegmentSkewSeconds => "segment_skew_seconds",
+            BackupReadout::SegmentSkewBoundSeconds => "segment_skew_bound_seconds",
             BackupReadout::DrillWindowUnprovenPackages => "drill_window_unproven_packages",
         }
     }
@@ -322,6 +339,15 @@ const READOUT_READERS: [(BackupReadout, ReadoutReader); BackupReadout::ALL.len()
         BackupReadout::OffsiteMatchesVolume,
         ReadoutReader::Rule("backup_offsite_copy_is_not_the_latest_package"),
     ),
+    // The other question about the same directory walk, and the one the
+    // newest-file column cannot answer: how much of the window has no second
+    // copy at all. Firing on it is ordinary after the copy is first enabled --
+    // the backlog shrinks only as the window rotates -- so it names coverage,
+    // not breakage.
+    (
+        BackupReadout::OffsiteMissingPackages,
+        ReadoutReader::Rule("backup_offsite_copy_missing_from_window"),
+    ),
     // The repository's own answer, as opposed to the directory walk above: the
     // walk sees a file on this machine, this sees a snapshot in the repository.
     // Absent when nobody observes, so the never-observed shape is a separate
@@ -339,6 +365,31 @@ const READOUT_READERS: [(BackupReadout, ReadoutReader); BackupReadout::ALL.len()
     (
         BackupReadout::OffsiteRepositoryKeyAgeSeconds,
         ReadoutReader::Rule("backup_offsite_repository_key_is_old"),
+    ),
+    // The margin behind the drill's verdict. A package under its own declared
+    // bound is not a fault, and the bound is the package's number rather than
+    // the deployment's, so a rule would have to invent a fraction of "close"
+    // for a distance the system already refuses at 100%. The verdict at the
+    // bound is `drill_latest_ok`; this pair is for whoever wants to see the
+    // drift before the cliff. Both are published together: a skew without its
+    // bound cannot say whether it is near anything, and a bound without the
+    // skew is not a reading at all.
+    (
+        BackupReadout::SegmentSkewSeconds,
+        ReadoutReader::Unread {
+            why: "the distance the drill judged against the package's own bound; a package under \
+                  that bound is healthy by definition, so there is no threshold to alert on. \
+                  Published so the drift toward the cliff is visible on a panel; the cliff itself \
+                  is backup_restore_drill_failed.",
+        },
+    ),
+    (
+        BackupReadout::SegmentSkewBoundSeconds,
+        ReadoutReader::Unread {
+            why: "the other half of segment_skew_seconds: the bound that package declared. It is a \
+                  per-package value, so a rule cannot compare it with a configured constant; it is \
+                  meaningful only beside the skew from the same row.",
+        },
     ),
     // The one drill value that is not a look at a row: the store counts the
     // window, because the loop has no directory to walk and no history of its
@@ -445,6 +496,12 @@ fn value_of(
         BackupReadout::OffsiteMatchesVolume => drill
             .and_then(|d| d.offsite_matches_newest)
             .map(|same| if same { 1.0 } else { 0.0 }),
+        // The window, not one file: a copy that is current still leaves the
+        // packages written before it was switched on without a second place to
+        // be. Absent (no offsite directory) is not zero coverage.
+        BackupReadout::OffsiteMissingPackages => drill
+            .and_then(|d| d.offsite_missing_packages)
+            .map(|missing| missing as f64),
         // Observed by the host timer on the repository itself, not by the
         // writer: the newest snapshot the repository reports, and when its
         // newest key was created. Both are absent when nobody observes, which
@@ -459,6 +516,17 @@ fn value_of(
         BackupReadout::OffsiteRepositoryKeyAgeSeconds => drill
             .and_then(|d| d.offsite_key_created_at)
             .map(|at| age_seconds(now, at)),
+        // The package's own declaration, not an age: the distance between its
+        // segment stamps and the bound it carried. Both come from one row and
+        // disappear together -- a package with no segment table, or no package
+        // at all, has no distance to report, and zero would read as a measured
+        // perfect one.
+        BackupReadout::SegmentSkewSeconds => drill
+            .and_then(|d| d.segment_skew_seconds)
+            .map(|skew| skew as f64),
+        BackupReadout::SegmentSkewBoundSeconds => drill
+            .and_then(|d| d.segment_skew_bound_seconds)
+            .map(|bound| bound as f64),
         // Not read off the newest drill's row: that row answers "did the
         // package it opened restore", and this counts the window it did not
         // open. A green newest row and a window nobody has opened are both

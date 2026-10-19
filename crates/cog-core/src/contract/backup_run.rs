@@ -281,6 +281,19 @@ pub struct BackupDrillRecord {
     /// The size the drill itself found on disk, which is a measurement of the
     /// file rather than a repetition of what the run recorded about it.
     pub package_bytes: Option<i64>,
+    /// How far apart the package's own segment stamps were, and the bound the
+    /// package declared for that distance. Both `None` for a package with no
+    /// segment table, and both `None` when no package was opened.
+    ///
+    /// The drill rejects a package whose segments are further apart than its
+    /// declared bound, so an `ok` row always carries a skew at or below the
+    /// bound. The pair is published anyway: that verdict is a cliff, and a
+    /// reader watching only the verdict cannot see a package drifting toward
+    /// the edge until the night it crosses. The two numbers come from the same
+    /// manifest and are read together, because a skew is only "close" relative
+    /// to the bound that same package declared.
+    pub segment_skew_seconds: Option<i64>,
+    pub segment_skew_bound_seconds: Option<i64>,
     /// How many packages the drill's own walk of the volume found, and the
     /// instant in the oldest one's name. These come from the directory and not
     /// from the writer's retention pass, which is the whole point of walking it.
@@ -296,6 +309,16 @@ pub struct BackupDrillRecord {
     /// separate reading from the age of the copy -- a copy that is present but
     /// a day behind has an age, and this says the copy is the wrong day's.
     pub offsite_matches_newest: Option<bool>,
+    /// How many packages on the volume have no same-named file in the offsite
+    /// directory. `None` when the drill was given no offsite directory: the
+    /// question does not apply, and a zero there would read as full coverage.
+    ///
+    /// This is a different subject from `offsite_matches_newest`, which asks
+    /// about one file -- the newest one. The copy can be perfectly current and
+    /// still cover only part of the retention window: it was switched on after
+    /// the older packages were written, and nothing ever copied them. A window
+    /// that exists in one place only reads green on the newest-file column.
+    pub offsite_missing_packages: Option<i32>,
     /// What the offsite repository itself reported, as observed by the host
     /// timer that pushes to it: the instant of the newest snapshot in the
     /// repository, and when its newest encryption key was created.
@@ -482,10 +505,13 @@ mod tests {
             package: Some("cogneva-backup-20261018T031700Z.tar.zst".into()),
             package_written_at: Some(at),
             package_bytes: Some(1024),
+            segment_skew_seconds: Some(38),
+            segment_skew_bound_seconds: Some(300),
             packages_on_volume: 7,
             oldest_package_at: Some(at),
             offsite_newest_at: Some(at),
             offsite_matches_newest: Some(true),
+            offsite_missing_packages: Some(0),
             offsite_observed_at: Some(at),
             offsite_remote_newest_at: Some(at),
             offsite_key_created_at: Some(at),

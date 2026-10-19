@@ -955,6 +955,26 @@ pub fn packages_in(dir: &Path) -> Vec<PathBuf> {
     packages
 }
 
+/// 卷上这些包里，有多少份在卷外目录里没有同名的那一份。
+///
+/// 「卷外那份是不是最新」只问一份文件，副本可以完全跟得上而窗口只覆盖了一半：
+/// 复制是在更早的几份写出来之后才打开的，那些包从头到尾只有一份。这里数的是
+/// 窗口而不是一份，两个读数的读者与修法都不同。
+fn missing_from_window(volume: &[PathBuf], copies: &[PathBuf]) -> i32 {
+    let names: std::collections::HashSet<&str> = copies
+        .iter()
+        .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+        .collect();
+    volume
+        .iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_none_or(|n| !names.contains(n))
+        })
+        .count() as i32
+}
+
 /// 包名里的时刻。保留策略靠「名字字典序即时间序」，账上要判「最老的包有多老」
 /// 也只能从这个时刻来：mtime 会被拷贝、rsync、恢复 drill 改写，而包名就是产生
 /// 它的那次运行写在行上的 `started_at` 的来源——两边同一个钟读出来的数才可比。
@@ -3145,10 +3165,13 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
         package: None,
         package_written_at: None,
         package_bytes: None,
+        segment_skew_seconds: None,
+        segment_skew_bound_seconds: None,
         packages_on_volume: 0,
         oldest_package_at: None,
         offsite_newest_at: None,
         offsite_matches_newest: None,
+        offsite_missing_packages: None,
         offsite_observed_at: None,
         offsite_remote_newest_at: None,
         offsite_key_created_at: None,
@@ -3184,6 +3207,13 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             .and_then(package_instant);
+    }
+
+    // 卷外覆盖了窗口的多少份：卷上每一份去卷外目录找同名的那一份，找不到的就是
+    // 「只有这一份」。只比最新那份回答不了这件事——复制是后来才打开的时候，更早
+    // 写出来的几份从来没被复制过，而最新那一列照样是绿的、照样是今晚的。
+    if let Some(dir) = &cfg.offsite_dir {
+        drill.offsite_missing_packages = Some(missing_from_window(&packages, &packages_in(dir)));
     }
 
     // 仓库侧的两个时刻：宿主那一跑把 `restic snapshots` / `restic key list` 读到的
@@ -3257,6 +3287,12 @@ async fn drill_once(
     // 是「包能解开」。跨段偏差是恢复端的第一道拒绝，这里先问同一句话。
     if let Err(e) = check_segment_skew(&manifest) {
         return Err(format!("恢复端会拒绝这个包：{e}").into());
+    }
+    // 判过界之后再记读数：这个包自己声明的偏差与界一起进账本，面板上才看得见
+    // 「离界还有多远」。旧包没有分段表，两列留空——没有声明就没有可比的数。
+    if let Ok((_, _, skew)) = segment_span(&manifest.segments) {
+        drill.segment_skew_seconds = Some(skew);
+        drill.segment_skew_bound_seconds = Some(manifest.max_segment_skew_seconds as i64);
     }
     verify_artifact_stores(&pkg_dir, &manifest, drill).await;
     if manifest.postgres.tables.is_empty() {
@@ -3915,6 +3951,43 @@ mod tests {
         std::fs::write(vol.join(older), vec![0u8; 10]).unwrap();
         std::fs::write(off.join(older), vec![0u8; 10]).unwrap();
         assert!(!same_file(&vol.join(older), &off.join(name)));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_window_counts_the_packages_the_second_copy_never_had() {
+        // 卷外那份是今晚的，不等于窗口里每一份都有第二份：复制是后来才打开的，
+        // 更早的几份从没被复制过。「是不是最新」对这一列是无害的绿。
+        let root = std::env::temp_dir().join(format!("cogneva-window-{}", uuid::Uuid::new_v4()));
+        let vol = root.join("vol");
+        let off = root.join("off");
+        std::fs::create_dir_all(&vol).unwrap();
+        std::fs::create_dir_all(&off).unwrap();
+        let newest = "cogneva-backup-20261019T031700Z.tar.zst";
+        let middle = "cogneva-backup-20261018T031700Z.tar.zst";
+        let oldest = "cogneva-backup-20261017T031700Z.tar.zst";
+        for name in [newest, middle, oldest] {
+            std::fs::write(vol.join(name), vec![0u8; 10]).unwrap();
+        }
+        std::fs::write(off.join(newest), vec![0u8; 10]).unwrap();
+
+        let count = |vol: &std::path::Path, off: &std::path::Path| {
+            missing_from_window(&packages_in(vol), &packages_in(off))
+        };
+        assert_eq!(count(&vol, &off), 2);
+
+        // 补上中间那份，只差最老那份。
+        std::fs::write(off.join(middle), vec![0u8; 10]).unwrap();
+        assert_eq!(count(&vol, &off), 1);
+
+        // 窗口全覆盖是零，不是缺席。
+        std::fs::write(off.join(oldest), vec![0u8; 10]).unwrap();
+        assert_eq!(count(&vol, &off), 0);
+
+        // 卷外比卷上多不是欠账：多出来的那份不在这窗口里。
+        std::fs::write(off.join("cogneva-backup-20261016T031700Z.tar.zst"), b"x").unwrap();
+        assert_eq!(count(&vol, &off), 0);
 
         std::fs::remove_dir_all(&root).ok();
     }

@@ -177,9 +177,10 @@ INSERT INTO backup_drills ( \
     tables_restored, tables_expected, \
     rows_restored, rows_expected, source_runs_matched, error, \
     generated_columns_recomputed, artifacts_expected, artifacts_restored, \
-    artifact_readings, artifact_errors, offsite_observed_at, offsite_remote_newest_at, offsite_key_created_at \
+    artifact_readings, artifact_errors, offsite_observed_at, offsite_remote_newest_at, offsite_key_created_at, \
+    segment_skew_seconds, segment_skew_bound_seconds, offsite_missing_packages \
 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
-          $19, $20, $21, $22, $23, $24, $25) \
+          $19, $20, $21, $22, $23, $24, $25, $26, $27, $28) \
 ON CONFLICT (drill_id) DO NOTHING";
 
 /// The newest drill, failed or not.
@@ -193,7 +194,8 @@ SELECT drill_id, started_at, finished_at, outcome, package, package_written_at, 
        tables_restored, tables_expected, \
        rows_restored, rows_expected, source_runs_matched, error, \
        generated_columns_recomputed, artifacts_expected, artifacts_restored, \
-       artifact_readings, artifact_errors, offsite_observed_at, offsite_remote_newest_at, offsite_key_created_at \
+       artifact_readings, artifact_errors, offsite_observed_at, offsite_remote_newest_at, offsite_key_created_at, \
+       segment_skew_seconds, segment_skew_bound_seconds, offsite_missing_packages \
 FROM backup_drills \
 ORDER BY finished_at DESC, drill_id DESC \
 LIMIT 1";
@@ -404,6 +406,9 @@ impl BackupRunStore for PostgresBackupRunStore {
             .bind(drill.offsite_observed_at)
             .bind(drill.offsite_remote_newest_at)
             .bind(drill.offsite_key_created_at)
+            .bind(drill.segment_skew_seconds)
+            .bind(drill.segment_skew_bound_seconds)
+            .bind(drill.offsite_missing_packages)
             .execute(&self.pool)
             .await
             .map_err(|e| {
@@ -493,6 +498,15 @@ impl BackupRunStore for PostgresBackupRunStore {
             offsite_key_created_at: row
                 .try_get("offsite_key_created_at")
                 .map_err(|e| SFError::Database(format!("drill offsite_key_created_at: {e}")))?,
+            segment_skew_seconds: row
+                .try_get("segment_skew_seconds")
+                .map_err(|e| SFError::Database(format!("drill segment_skew_seconds: {e}")))?,
+            segment_skew_bound_seconds: row
+                .try_get("segment_skew_bound_seconds")
+                .map_err(|e| SFError::Database(format!("drill segment_skew_bound_seconds: {e}")))?,
+            offsite_missing_packages: row
+                .try_get("offsite_missing_packages")
+                .map_err(|e| SFError::Database(format!("drill offsite_missing_packages: {e}")))?,
             error: row
                 .try_get("error")
                 .map_err(|e| SFError::Database(format!("drill error: {e}")))?,
