@@ -1888,7 +1888,7 @@ async fn redrive(
 /// be applied to the goal text alone and by character count, which is what
 /// made consecutive principle landings read alike: the shared `feedback_`
 /// prefix filled most of the budget and the cut fell inside a word.
-const SUBJECT_LIMIT: usize = 72;
+const SUBJECT_LIMIT: usize = 80;
 
 /// Commit message for a landed change: what it does, why, and the trailer the
 /// landing idempotency check reads.
@@ -1962,10 +1962,54 @@ fn commit_subject(kind: &str, scope: &str, summary: &str) -> String {
     let prefix = format!("{kind}({scope}): ");
     let budget = SUBJECT_LIMIT.saturating_sub(prefix.chars().count());
     let title = match principle_slug(summary) {
-        Some(slug) => format!("Gate the principle \"{}\"", principle_phrase(slug)),
-        None => summary.to_string(),
+        Some(slug) => principle_title(slug, budget),
+        None => clip_at_word_boundary(summary, budget),
     };
-    format!("{prefix}{}", clip_at_word_boundary(&title, budget))
+    format!("{prefix}{title}")
+}
+
+/// The subject's own words for a principle handover, fitted to `budget`.
+///
+/// The rule in words comes first because that is what a reader scans. When the
+/// words have to be shortened, a short handle derived from the full slug keeps
+/// the subject distinguishable: two rules can share a long beginning -- one
+/// corpus has a pair sharing the first 43 characters of its slug -- and then
+/// the readable part is the same line while the rules are not. The handle is
+/// derived rather than copied because it is not a name, only a tie-breaker;
+/// the exact slug is in the body.
+fn principle_title(slug: &str, budget: usize) -> String {
+    const OPEN: &str = "Gate the principle \"";
+    let phrase = principle_phrase(slug);
+    let whole = format!("{OPEN}{phrase}\"");
+    if whole.chars().count() <= budget {
+        return whole;
+    }
+    let tag = format!(" [{}]", slug_tag(slug));
+    // The template, the closing quote and the handle come out of the same
+    // budget as the words.
+    let room = budget.saturating_sub(OPEN.chars().count() + tag.chars().count() + 1);
+    if room < 2 {
+        // A scope wide enough to leave no room for the template is not a
+        // subject the template can be written in; shorten what there is.
+        return clip_at_word_boundary(&whole, budget);
+    }
+    let words = clip_at_word_boundary(&phrase, room);
+    format!("{OPEN}{words}\"{tag}")
+}
+
+/// A short, build-independent handle for a slug.
+///
+/// FNV-1a rather than the standard hasher: the tag is compared by people
+/// looking at two log lines, so the same slug has to produce the same tag on
+/// every machine and every build. Only 32 of the 64 bits are shown, which is
+/// enough to separate the few thousand rules a corpus holds.
+fn slug_tag(slug: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in slug.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{:08x}", hash as u32)
 }
 
 /// The slug of the principle a goal is handing a gate to, if that is the job.
@@ -2004,9 +2048,10 @@ fn principle_phrase(slug: &str) -> String {
 /// followed by an ellipsis.
 ///
 /// The ellipsis is part of the contract: it is the only thing that tells a
-/// reader the title was shortened, so a goal that ends a word owns its ending.
-/// A single token longer than the budget has no boundary to cut at, and there
-/// the cut falls where the budget does; the alternative is an empty subject.
+/// reader the title was shortened rather than written that way, and a silent
+/// cut is indistinguishable from a typo. A single token longer than the budget
+/// has no boundary to cut at, and there the cut falls where the budget does;
+/// the alternative is an empty subject.
 fn clip_at_word_boundary(title: &str, limit: usize) -> String {
     let title = title.trim();
     if title.chars().count() <= limit {
@@ -3412,6 +3457,24 @@ mod tests {
         msg.lines().next().unwrap_or_default()
     }
 
+    fn principle_subject(slug: &str) -> String {
+        let mut ch = change("chg-50", "diff");
+        ch.goal = principle_goal(slug);
+        commit_message(&BotIdentityConfig::default(), &ch)
+    }
+
+    /// The words shown between the template's quotes and, when they were
+    /// shortened, the handle that follows them.
+    fn principle_parts(subject: &str) -> (&str, Option<&str>) {
+        let rest = subject
+            .strip_prefix("fix(cog-github): Gate the principle \"")
+            .expect("a principle subject uses the template");
+        match rest.rsplit_once("\" [") {
+            Some((words, tag)) => (words, Some(tag.strip_suffix(']').expect("a closed handle"))),
+            None => (rest.strip_suffix('"').expect("a closing quote"), None),
+        }
+    }
+
     /// A principle landing's subject says what the change does and which rule
     /// it is about. Copying the goal's own opening put the shared `feedback_`
     /// prefix in the header and cut the rule's name mid-word, so every
@@ -3434,21 +3497,24 @@ mod tests {
             !subject.contains("feedback_"),
             "the category prefix must not spend the subject's budget: {subject}"
         );
-        // Whether or not the budget clipped the title, what shows is whole
-        // words of the rule: the character after it is a space or nothing.
-        let title =
-            "Gate the principle \"a claim needs a lifetime and that its owner keeps renewing it\"";
-        let visible = subject
-            .strip_prefix("fix(cog-github): ")
-            .expect("header shape")
-            .trim_end_matches('…');
-        assert!(title.starts_with(visible), "severed word: {subject}");
+        // What shows is whole words of the rule: the character after the
+        // visible part is a space or nothing.
+        let phrase = "a claim needs a lifetime and that its owner keeps renewing it";
+        let (words, tag) = principle_parts(subject);
+        let visible = words.trim_end_matches('…');
+        assert!(phrase.starts_with(visible), "severed word: {subject}");
         assert!(
-            title[visible.len()..]
+            phrase[visible.len()..]
                 .chars()
                 .next()
                 .is_none_or(char::is_whitespace),
             "severed word: {subject}"
+        );
+        let tag =
+            tag.unwrap_or_else(|| panic!("a shortened rule name carries a handle: {subject}"));
+        assert!(
+            tag.len() == 8 && tag.chars().all(|c| c.is_ascii_hexdigit()),
+            "the handle is a short hex tag: {subject}"
         );
         assert!(
             msg.contains(
@@ -3459,27 +3525,24 @@ mod tests {
     }
 
     /// The acceptance in the ticket: consecutive principle landings have to be
-    /// distinguishable from their subjects alone.
+    /// distinguishable from their subjects alone. These are two slugs from the
+    /// corpus sharing their first 43 characters, so the readable part is the
+    /// same line for both; the handle is what keeps them apart.
     #[test]
     fn consecutive_principle_landings_have_distinct_subjects() {
-        let first = {
-            let mut ch = change("chg-47", "diff");
-            ch.goal = principle_goal(
-                "feedback_a_claim_needs_a_lifetime_and_that_its_owner_keeps_renewing_it",
-            );
-            commit_message(&BotIdentityConfig::default(), &ch)
-        };
-        let second = {
-            let mut ch = change("chg-48", "diff");
-            ch.goal =
-                principle_goal("feedback_a_zero_callsite_claim_that_counted_inner_calls_as_calls");
-            commit_message(&BotIdentityConfig::default(), &ch)
-        };
+        let first = principle_subject("feedback_an_absence_claim_needs_the_reader_s_own_root");
+        let second =
+            principle_subject("feedback_an_absence_claim_needs_the_reader_that_could_answer_it");
 
+        assert_eq!(
+            principle_parts(subject_of(&first)).0,
+            principle_parts(subject_of(&second)).0,
+            "precondition: the readable part alone cannot tell these apart"
+        );
         assert_ne!(
             subject_of(&first),
             subject_of(&second),
-            "the header alone must tell two principle landings apart"
+            "the handle keeps two long-shared-prefix rules distinguishable"
         );
     }
 
