@@ -397,10 +397,17 @@ async fn project(
     );
 
     let mut faces_tsv = String::from(&stamp);
-    faces_tsv.push_str("face\tkind\towner\tdeputy\twitness\tvacancy_until\trevision\n");
+    // A vacancy is a claim with three parts: by when, who fills it, and the
+    // task expected to close it. A projection that carried only the deadline
+    // would let a reader -- and every gate reading this file -- mistake a bare
+    // date for a declared vacancy, which is exactly the difference between a
+    // staffed face and `no_owner`.
+    faces_tsv.push_str(
+        "face\tkind\towner\tdeputy\twitness\tvacancy_until\tvacancy_assigner\tgap_task\trevision\n",
+    );
     for face in &faces {
         faces_tsv.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             face.face_id,
             face.spec.kind.as_str(),
             face.owner_unit.as_deref().unwrap_or("-"),
@@ -410,6 +417,8 @@ async fn project(
                 .vacancy_until
                 .map(|t| t.to_rfc3339())
                 .unwrap_or_else(|| "-".into()),
+            face.spec.vacancy_assigner.as_deref().unwrap_or("-"),
+            face.spec.gap_task_id.as_deref().unwrap_or("-"),
             face.revision(),
         ));
     }
