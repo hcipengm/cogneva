@@ -37,6 +37,25 @@ spec:
             app.kubernetes.io/component: backup-drill
         spec:
           restartPolicy: Never
+          # 凭证面的根目录由 kubelet 按宿主 umask 建（DirectoryOrCreate → 0755），
+          # 演练会把它量成一条违例。只修一次不够，目录重建后又回到默认模式，
+          # 所以每次开工前收紧。主容器为了不写卷是只读挂载，chmod 只能放在 init。
+          initContainers:
+            - name: tighten-credential-surface
+              image: localhost:30500/cogneva:local
+              imagePullPolicy: Always
+              command:
+                - sh
+                - -c
+                - >-
+                  chmod 0700 /backups /offsite /offsite-state
+              volumeMounts:
+                - name: backup
+                  mountPath: /backups
+                - name: offsite
+                  mountPath: /offsite
+                - name: offsite-state
+                  mountPath: /offsite-state
           containers:
             - name: drill
               image: localhost:30500/cogneva:local

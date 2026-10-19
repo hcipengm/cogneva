@@ -69,6 +69,26 @@ spec:
                       app.kubernetes.io/component: evolution
                   topologyKey: kubernetes.io/hostname
           {{- end }}
+          # 凭证面的根目录由 kubelet 在卷第一次挂上时创建，模式跟宿主的 umask 走
+          # （DirectoryOrCreate 常见是 0755）。演练会把「不是 0700 的目录」量成一条
+          # 违例并让整条规则亮红，所以这里每次开工前把它收紧。只修一次不够：目录
+          # 被删掉重建后又会回到默认模式，修在每一次运行里才跟得上。
+          initContainers:
+            - name: tighten-credential-surface
+              image: {{ include "cogneva.image" . }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command:
+                - sh
+                - -c
+                - >-
+                  chmod 0700 /backups{{ if .Values.backup.offsiteHostPath }} /offsite{{ end }}
+              volumeMounts:
+                - name: backup
+                  mountPath: /backups
+                {{- with .Values.backup.offsiteHostPath }}
+                - name: offsite
+                  mountPath: /offsite
+                {{- end }}
           containers:
             - name: backup
               image: {{ include "cogneva.image" . }}
@@ -244,6 +264,29 @@ spec:
             app.kubernetes.io/component: backup-drill
         spec:
           restartPolicy: Never
+          # 同备份：演练是唯一同时看得到三处凭证目录的进程，它把「不是 0700 的
+          # 目录」量成违例。主容器为了不写卷是只读挂载，收紧权限放在 init 里、
+          # 用可写挂载做——只读挂载上 chmod 会直接失败。
+          initContainers:
+            - name: tighten-credential-surface
+              image: {{ include "cogneva.image" . }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command:
+                - sh
+                - -c
+                - >-
+                  chmod 0700 /backups{{ if .Values.backup.offsiteHostPath }} /offsite{{ end }}{{ if .Values.backup.offsiteStateHostPath }} /offsite-state{{ end }}
+              volumeMounts:
+                - name: backup
+                  mountPath: /backups
+                {{- with .Values.backup.offsiteHostPath }}
+                - name: offsite
+                  mountPath: /offsite
+                {{- end }}
+                {{- with .Values.backup.offsiteStateHostPath }}
+                - name: offsite-state
+                  mountPath: /offsite-state
+                {{- end }}
           containers:
             - name: drill
               image: {{ include "cogneva.image" . }}

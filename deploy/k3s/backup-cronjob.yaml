@@ -48,6 +48,23 @@ spec:
                       app.kubernetes.io/name: cogneva-evolution
                       app.kubernetes.io/component: evolution
                   topologyKey: kubernetes.io/hostname
+          # 凭证面的根目录由 kubelet 按宿主 umask 建（DirectoryOrCreate → 0755），
+          # 演练会把它量成一条违例。只修一次不够，目录重建后又回到默认模式，
+          # 所以每次开工前收紧。
+          initContainers:
+            - name: tighten-credential-surface
+              image: localhost:30500/cogneva:local
+              imagePullPolicy: Always
+              command:
+                - sh
+                - -c
+                - >-
+                  chmod 0700 /backups /offsite
+              volumeMounts:
+                - name: backup
+                  mountPath: /backups
+                - name: offsite
+                  mountPath: /offsite
           containers:
             - name: backup
               image: localhost:30500/cogneva:local

@@ -42,6 +42,25 @@ spec:
             app.kubernetes.io/component: backup-drill
         spec:
           restartPolicy: Never
+          # 同备份：演练是唯一同时看得到三处凭证目录的进程，它把「不是 0700 的
+          # 目录」量成违例。主容器为了不写卷是只读挂载，收紧权限放在 init 里、
+          # 用可写挂载做——只读挂载上 chmod 会直接失败。
+          initContainers:
+            - name: tighten-credential-surface
+              image: localhost:30500/cogneva:local
+              imagePullPolicy: Always
+              command:
+                - sh
+                - -c
+                - >-
+                  chmod 0700 /backups /offsite /offsite-state
+              volumeMounts:
+                - name: backup
+                  mountPath: /backups
+                - name: offsite
+                  mountPath: /offsite
+                - name: offsite-state
+                  mountPath: /offsite-state
           containers:
             - name: drill
               image: localhost:30500/cogneva:local
