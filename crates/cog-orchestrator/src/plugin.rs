@@ -292,6 +292,10 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
         // holding unacked, not a per-dimension rollup, so it goes up as its own
         // observable that answers whatever dimension is asked.
         ctx.publish_observable(crate::observable::stream_pending_observable());
+        // The other half of the same question. A read loop can be quiet because
+        // the bus stopped answering or because this process had no permit to
+        // take another message, and only these series can tell a reader which.
+        ctx.publish_observable(crate::observable::claim_slots_observable());
         // The current shape of the task graph, read from the executor that owns
         // it. Separate from the D1 counters above: those meter this process's
         // outcomes, this one reports the graph itself, which outlives the

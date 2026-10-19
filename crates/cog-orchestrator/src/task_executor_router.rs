@@ -157,6 +157,15 @@ impl TaskExecutorRouter {
             workspace_id,
         });
 
+        // 读取侧背压的读数：许可打满时订阅循环停在这里、不再发 XREADGROUP，
+        // 而「读循环安静」这件事本身分不清是总线不回还是本进程没有位置。
+        // 许可的预算与等待时长从这一处报出去，和流读取的安静时长并排读。
+        crate::observable::claim_slots_observable().register(
+            &ready_stream,
+            claim_slots.clone(),
+            CLAIM_CONCURRENCY,
+        );
+
         // 观测面单独成任务，不搭清扫器的节拍：清扫卡在认领上时指标序列会跟着
         // 静止，而抓取面上一条静止的序列和一条干净流量的序列是同一个样子——
         // 刚好把最该被看见的停滞藏了起来。
@@ -224,11 +233,18 @@ impl TaskExecutorRouter {
                                                         Err(_) => break,
                                                     },
                                                 };
+                                                // 清扫器与订阅循环共用同一份许可，所以
+                                                // 它拿到的每一条都计入在途数与持有上界：
+                                                // 只报订阅循环那几条，会让「在途打满」
+                                                // 恰好在许可靠清扫器维持时读不出来。
+                                                let hold = crate::observable::claim_slots_observable()
+                                                    .permit_taken(&sweep_pipe.ready_stream);
                                                 sweeper.spawn_ready_processing(
                                                     sweep_pipe.clone(),
                                                     msg_id,
                                                     bytes,
                                                     permit,
+                                                    hold,
                                                 );
                                             }
                                         }
@@ -297,18 +313,27 @@ impl TaskExecutorRouter {
                                     // 许可在读取侧获取：在途执行打满时订阅自然背压，
                                     // 不会无限派发。
                                     Some(Ok((msg_id, bytes))) => {
-                                        let permit = tokio::select! {
-                                            _ = shutdown.wait() => break 'subscribe,
-                                            acquired = claim_slots.clone().acquire_owned() => match acquired {
-                                                Ok(permit) => permit,
-                                                Err(_) => break 'subscribe,
-                                            },
+                                        let claims = crate::observable::claim_slots_observable();
+                                        claims.wait_started(&ready_stream);
+                                        let acquired = tokio::select! {
+                                            _ = shutdown.wait() => {
+                                                claims.wait_ended(&ready_stream);
+                                                break 'subscribe;
+                                            }
+                                            acquired = claim_slots.clone().acquire_owned() => acquired,
                                         };
+                                        claims.wait_ended(&ready_stream);
+                                        let permit = match acquired {
+                                            Ok(permit) => permit,
+                                            Err(_) => break 'subscribe,
+                                        };
+                                        let hold = claims.permit_taken(&ready_stream);
                                         this.spawn_ready_processing(
                                             pipe.clone(),
                                             msg_id,
                                             bytes,
                                             permit,
+                                            hold,
                                         );
                                     }
                                     Some(Err(e)) => {
@@ -346,11 +371,16 @@ impl TaskExecutorRouter {
         msg_id: String,
         bytes: Vec<u8>,
         permit: tokio::sync::OwnedSemaphorePermit,
+        hold: crate::observable::ClaimHold,
     ) {
         let this = self.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let guarded = AssertUnwindSafe(this.process_ready_message(&pipe, msg_id, &bytes));
+            // Kept for the life of the task so the permit accounting is released
+            // with the permit, including when the processing future panics.
+            let hold = hold;
+            let guarded =
+                AssertUnwindSafe(this.process_ready_message(&pipe, msg_id, &bytes, &hold));
             if let Err(payload) = guarded.catch_unwind().await {
                 tracing::warn!(
                     "ready message processing panicked: {}",
@@ -362,7 +392,13 @@ impl TaskExecutorRouter {
 
     /// 执行一条 ready 消息的全管线：反序列化 → start_task → execute →
     /// 发布结果 → ack。主订阅循环与 pending 恢复清扫器共用。
-    async fn process_ready_message(&self, pipe: &ReadyPipeline, msg_id: String, bytes: &[u8]) {
+    async fn process_ready_message(
+        &self,
+        pipe: &ReadyPipeline,
+        msg_id: String,
+        bytes: &[u8],
+        hold: &crate::observable::ClaimHold,
+    ) {
         let task: Task = match serde_json::from_slice(bytes) {
             Ok(t) => t,
             Err(e) => {
@@ -461,6 +497,10 @@ impl TaskExecutorRouter {
         // 返回，后续 ready 消息全部队头阻塞）。超时按执行失败处理，结果
         // 走既有发布路径，重试/DLQ 由 DAG 侧决定。
         let timeout = Duration::from_secs(task.timeout_seconds.max(1));
+        // 许可的持有上界随之公布：等待许可的读循环只有超过在途任务自己声明的
+        // 执行时长，才说明「没有人能把它放出来」；没有这一条，安静读循环只能
+        // 靠猜。
+        hold.note_timeout(task.timeout_seconds.max(1));
         let result = match tokio::time::timeout(timeout, self.execute(&task)).await {
             Ok(result) => result,
             Err(_) => Err(SFError::Agent(format!(
@@ -791,6 +831,15 @@ mod ready_pipeline_tests {
         task
     }
 
+    /// The permit accounting a processing task carries. The tests call the
+    /// pipeline directly rather than through a read loop, so the guard is one
+    /// nobody registered a stream for; it still has to be passed, because the
+    /// timeout it carries is what the claim-stall rule compares a wait against.
+    fn test_hold() -> crate::observable::ClaimHold {
+        let observer = Arc::new(crate::observable::ClaimSlotsObservable::new());
+        observer.permit_taken("test-ready")
+    }
+
     fn test_pipe(backend: Arc<ScriptedBackend>) -> Arc<ReadyPipeline> {
         Arc::new(ReadyPipeline {
             task_backend: backend.clone(),
@@ -820,6 +869,7 @@ mod ready_pipeline_tests {
                 &pipe,
                 "m1".into(),
                 &serde_json::to_vec(&test_task(1)).unwrap(),
+                &test_hold(),
             )
             .await;
         assert!(
@@ -857,6 +907,7 @@ mod ready_pipeline_tests {
                 &pipe,
                 "m1".into(),
                 &serde_json::to_vec(&test_task(30)).unwrap(),
+                &test_hold(),
             )
             .await;
 
@@ -889,7 +940,7 @@ mod ready_pipeline_tests {
             .await;
 
         router
-            .process_ready_message(&pipe, "m-poison".into(), b"not-json")
+            .process_ready_message(&pipe, "m-poison".into(), b"not-json", &test_hold())
             .await;
 
         assert!(backend.published.lock().await.is_empty());
@@ -938,6 +989,7 @@ mod ready_pipeline_tests {
                 &pipe,
                 "m-ok".into(),
                 &serde_json::to_vec(&test_task(60)).unwrap(),
+                &test_hold(),
             )
             .await;
 
@@ -1180,6 +1232,7 @@ mod ready_pipeline_tests {
             &pipe,
             "m-boom".into(),
             &serde_json::to_vec(&test_task(5)).unwrap(),
+            &test_hold(),
         ))
         .catch_unwind()
         .await;

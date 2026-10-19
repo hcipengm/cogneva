@@ -248,6 +248,31 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_task_checkpoint_total",
         "crates/cog-orchestrator/src/dag_executor/orchestrator.rs",
     ),
+    // The read loop's execution permits. A ready loop issues no further read
+    // while it waits for one, so its silence has two causes -- a bus that
+    // stopped answering and a process with no room -- and
+    // `stream_consumer_stalled` can only see the first. The wait is compared
+    // against the longest timeout of the tasks the permits are running, which
+    // is why the bound is a published series rather than a constant: the wall
+    // is the task's own contract, and a deployment that changes it moves the
+    // rule with it. The in-flight and slot gauges are read by the same rule as
+    // the guards that the permits are held and the bound is in force.
+    (
+        "cogneva_task_router_claim_slots",
+        "crates/cog-orchestrator/src/observable.rs",
+    ),
+    (
+        "cogneva_task_router_claim_in_flight",
+        "crates/cog-orchestrator/src/observable.rs",
+    ),
+    (
+        "cogneva_task_router_claim_wait_seconds",
+        "crates/cog-orchestrator/src/observable.rs",
+    ),
+    (
+        "cogneva_task_router_claim_hold_bound_seconds",
+        "crates/cog-orchestrator/src/observable.rs",
+    ),
     (
         "collab_task_resume_total",
         "crates/cog-collaboration/src/observable.rs",

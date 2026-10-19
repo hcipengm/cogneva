@@ -325,6 +325,234 @@ impl Observable for StreamPendingObservable {
     }
 }
 
+// -- execution permits of the ready-task read loops --
+
+/// Execution permits the ready read loops may hold at once, as a gauge.
+///
+/// One budget per process, shared by every ready stream that process reads and
+/// by the pending-reclaim sweeper beside them: a second queue is not a second
+/// allowance of concurrent work. The series is per stream because the loops are,
+/// but it is the same number on each of them.
+pub const TASK_ROUTER_CLAIM_SLOTS_METRIC: &str = "cogneva_task_router_claim_slots";
+/// Permits held right now, as a gauge — task work this process is running and
+/// has not finished. Read from the semaphore itself, so a permit taken by the
+/// reclaim sweeper is counted exactly as one taken by the read loop.
+pub const TASK_ROUTER_CLAIM_IN_FLIGHT_METRIC: &str = "cogneva_task_router_claim_in_flight";
+/// How long the read loop for this stream has been blocked waiting for a
+/// permit, in seconds; 0 when it is not waiting.
+///
+/// The read loop asks the bus for a message first and only then asks for a
+/// permit, and while it waits no further read is issued. A silent read loop is
+/// therefore ambiguous on its own — `cogneva_stream_read_silent_seconds` grows
+/// both when the bus stopped answering and when this process simply had no
+/// room — and this is the series that has to be read beside it to tell the two
+/// apart.
+pub const TASK_ROUTER_CLAIM_WAIT_SECONDS_METRIC: &str = "cogneva_task_router_claim_wait_seconds";
+/// The longest execution the permits held right now are still allowed, in
+/// seconds; 0 when no held permit has reached execution yet.
+///
+/// Every permit carries the timeout of the task it is running, and the task
+/// executor enforces it, so a permit held by this process for longer than its
+/// bound is not something the work itself can explain. Published as a wall
+/// rather than a constant so the rule that reads it moves with the task
+/// timeouts instead of going stale when one of them changes.
+pub const TASK_ROUTER_CLAIM_HOLD_BOUND_SECONDS_METRIC: &str =
+    "cogneva_task_router_claim_hold_bound_seconds";
+/// The deployed rule that reads the pair above.
+pub const TASK_ROUTER_CLAIM_STALL_RULE: &str = "task_router_claim_stall";
+
+static CLAIM_SLOTS: OnceLock<Arc<ClaimSlotsObservable>> = OnceLock::new();
+
+/// The process-wide record of the execution permits the ready read loops share.
+pub fn claim_slots_observable() -> Arc<ClaimSlotsObservable> {
+    CLAIM_SLOTS
+        .get_or_init(|| Arc::new(ClaimSlotsObservable::new()))
+        .clone()
+}
+
+/// One permit this process took, identified so the timeout of the task that
+/// ends up running on it can be attached to it. Dropped when the permit is.
+pub struct ClaimHold {
+    observable: Arc<ClaimSlotsObservable>,
+    stream: String,
+    token: u64,
+}
+
+impl ClaimHold {
+    /// Record the execution contract of the task running on this permit. Called
+    /// once the payload parsed into a task whose timeout is known; a permit held
+    /// by a payload that never parsed carries no bound, because there is no
+    /// work it could be running.
+    pub fn note_timeout(&self, seconds: u64) {
+        self.observable
+            .set_timeout(&self.stream, self.token, seconds);
+    }
+}
+
+impl Drop for ClaimHold {
+    fn drop(&mut self) {
+        self.observable.release(&self.stream, self.token);
+    }
+}
+
+struct ClaimStreamState {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    slots: usize,
+    waiting_since: Option<std::time::Instant>,
+    held: HashMap<u64, u64>,
+}
+
+impl ClaimStreamState {
+    fn in_flight(&self) -> usize {
+        self.slots
+            .saturating_sub(self.semaphore.available_permits())
+    }
+
+    /// The longest timeout among the holds that have one. A hold with no parsed
+    /// task yet contributes nothing: its payload may be a poison one that never
+    /// reaches execution, and inventing a bound for it would let a wall be
+    /// compared against a number nothing stated.
+    fn hold_bound_seconds(&self) -> u64 {
+        self.held.values().copied().max().unwrap_or(0)
+    }
+}
+
+/// The permits, and what is holding them, as this process sees them.
+///
+/// Written on the task router's hot path and read at scrape time, so the state
+/// is behind a plain `std::sync::Mutex` and no lock is ever held across an
+/// await. Nothing here awaits at all: the numbers are computed at the scrape
+/// from state the router keeps current.
+#[derive(Default)]
+pub struct ClaimSlotsObservable {
+    streams: std::sync::Mutex<HashMap<String, ClaimStreamState>>,
+    next_token: AtomicU64,
+}
+
+impl ClaimSlotsObservable {
+    pub fn new() -> Self {
+        Self {
+            streams: std::sync::Mutex::new(HashMap::new()),
+            next_token: AtomicU64::new(0),
+        }
+    }
+
+    fn streams(&self) -> std::sync::MutexGuard<'_, HashMap<String, ClaimStreamState>> {
+        // A panic elsewhere must not take the reading surface down with it; the
+        // state behind the lock is a set of counters, and the worst a poisoned
+        // guard can hide is one scrape's accounting.
+        self.streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Declare the budget a stream's read loop draws from. Called once per
+    /// consumed stream before it starts reading; idempotent across resubscribes.
+    pub fn register(
+        self: &Arc<Self>,
+        stream: &str,
+        semaphore: Arc<tokio::sync::Semaphore>,
+        slots: usize,
+    ) {
+        self.streams()
+            .entry(stream.to_string())
+            .or_insert_with(|| ClaimStreamState {
+                semaphore,
+                slots,
+                waiting_since: None,
+                held: HashMap::new(),
+            });
+    }
+
+    /// The read loop has asked for a permit and cannot have one yet.
+    pub fn wait_started(&self, stream: &str) {
+        if let Some(state) = self.streams().get_mut(stream) {
+            state
+                .waiting_since
+                .get_or_insert_with(std::time::Instant::now);
+        }
+    }
+
+    /// The wait is over — a permit came, shutdown arrived, or the semaphore
+    /// closed. All three end the wait, and leaving the start time behind would
+    /// report a blocked loop that is not blocked.
+    pub fn wait_ended(&self, stream: &str) {
+        if let Some(state) = self.streams().get_mut(stream) {
+            state.waiting_since = None;
+        }
+    }
+
+    /// A permit was taken. The returned guard releases the accounting when the
+    /// permit is dropped, so a panicking or cancelled processing task cannot
+    /// leave a hold behind.
+    pub fn permit_taken(self: &Arc<Self>, stream: &str) -> ClaimHold {
+        let token = self.next_token.fetch_add(1, Ordering::Relaxed);
+        if let Some(state) = self.streams().get_mut(stream) {
+            state.held.insert(token, 0);
+        }
+        ClaimHold {
+            observable: Arc::clone(self),
+            stream: stream.to_string(),
+            token,
+        }
+    }
+
+    fn set_timeout(&self, stream: &str, token: u64, seconds: u64) {
+        if let Some(state) = self.streams().get_mut(stream) {
+            if let Some(bound) = state.held.get_mut(&token) {
+                *bound = seconds;
+            }
+        }
+    }
+
+    fn release(&self, stream: &str, token: u64) {
+        if let Some(state) = self.streams().get_mut(stream) {
+            state.held.remove(&token);
+        }
+    }
+}
+
+#[async_trait]
+impl Observable for ClaimSlotsObservable {
+    /// Dimensionless for the same reason the pending observer is: these are
+    /// facts about this process's work queue, not rollups of an outcome, and a
+    /// dimension declaration would have the scrape skip them.
+    async fn collect_metrics(&self, _dimension: &str) -> SFResult<Vec<RawMetric>> {
+        let streams = self.streams();
+        let mut out = Vec::new();
+        for (stream, state) in streams.iter() {
+            // Only the streams that registered exist here, so a stream this
+            // process does not read publishes nothing rather than a zero.
+            for (name, value) in [
+                (TASK_ROUTER_CLAIM_SLOTS_METRIC, state.slots as f64),
+                (TASK_ROUTER_CLAIM_IN_FLIGHT_METRIC, state.in_flight() as f64),
+                (
+                    TASK_ROUTER_CLAIM_WAIT_SECONDS_METRIC,
+                    state
+                        .waiting_since
+                        .map(|since| since.elapsed().as_secs_f64())
+                        .unwrap_or(0.0),
+                ),
+                (
+                    TASK_ROUTER_CLAIM_HOLD_BOUND_SECONDS_METRIC,
+                    state.hold_bound_seconds() as f64,
+                ),
+            ] {
+                out.push(RawMetric::new(name, value).with_label("stream", stream.as_str()));
+            }
+        }
+        Ok(out)
+    }
+
+    async fn collect_trace(&self, _task_id: &str) -> SFResult<Vec<TraceFragment>> {
+        Ok(Vec::new())
+    }
+
+    fn available_dimensions(&self) -> Vec<DimensionSpec> {
+        Vec::new()
+    }
+}
+
 /// Tasks in the graph right now, one series per status.
 pub const TASKS_CURRENT_METRIC: &str = "cogneva_tasks_current";
 /// How long the oldest task an agent still owes has gone without changing
@@ -847,6 +1075,14 @@ mod tests {
                 STREAM_PENDING_FAILURES_METRIC_RULE,
                 STREAM_PENDING_MEASURE_FAILURES_METRIC,
             ),
+            (
+                TASK_ROUTER_CLAIM_STALL_RULE,
+                TASK_ROUTER_CLAIM_WAIT_SECONDS_METRIC,
+            ),
+            (
+                TASK_ROUTER_CLAIM_STALL_RULE,
+                TASK_ROUTER_CLAIM_HOLD_BOUND_SECONDS_METRIC,
+            ),
         ] {
             let rule = rules
                 .iter()
@@ -858,6 +1094,161 @@ mod tests {
                 "rule {rule_name} must query {metric}, got: {promql}"
             );
         }
+    }
+
+    /// The permit gauges exist only for streams this process declared, and each
+    /// carries the stream: a bare number would leave the reader unable to say
+    /// which read loop is starved.
+    #[tokio::test]
+    async fn claim_gauges_are_published_per_registered_stream() {
+        let observer = Arc::new(ClaimSlotsObservable::new());
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+        observer.register(STREAM, semaphore.clone(), 4);
+
+        let metrics = observer.collect_metrics("D8").await.unwrap();
+        for name in [
+            TASK_ROUTER_CLAIM_SLOTS_METRIC,
+            TASK_ROUTER_CLAIM_IN_FLIGHT_METRIC,
+            TASK_ROUTER_CLAIM_WAIT_SECONDS_METRIC,
+            TASK_ROUTER_CLAIM_HOLD_BOUND_SECONDS_METRIC,
+        ] {
+            let m = metric(&metrics, name).unwrap_or_else(|| panic!("{name} missing"));
+            assert_eq!(m.labels.get("stream").map(String::as_str), Some(STREAM));
+        }
+        assert_eq!(
+            metric(&metrics, TASK_ROUTER_CLAIM_SLOTS_METRIC)
+                .unwrap()
+                .value,
+            4.0
+        );
+        assert_eq!(
+            metric(&metrics, TASK_ROUTER_CLAIM_IN_FLIGHT_METRIC)
+                .unwrap()
+                .value,
+            0.0
+        );
+
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let hold = observer.permit_taken(STREAM);
+        let held = observer.collect_metrics("D8").await.unwrap();
+        assert_eq!(
+            metric(&held, TASK_ROUTER_CLAIM_IN_FLIGHT_METRIC)
+                .unwrap()
+                .value,
+            1.0
+        );
+        // Nothing parsed into a task yet, so no execution bound is stated. Zero
+        // here is "nothing to compare against", which is what keeps the rule
+        // from reading an invented wall.
+        assert_eq!(
+            metric(&held, TASK_ROUTER_CLAIM_HOLD_BOUND_SECONDS_METRIC)
+                .unwrap()
+                .value,
+            0.0
+        );
+
+        hold.note_timeout(300);
+        let bounded = observer.collect_metrics("D8").await.unwrap();
+        assert_eq!(
+            metric(&bounded, TASK_ROUTER_CLAIM_HOLD_BOUND_SECONDS_METRIC)
+                .unwrap()
+                .value,
+            300.0
+        );
+
+        // Releasing the guard is what the processing task does by dropping the
+        // permit, and it must be visible without a second call from the caller.
+        drop(hold);
+        drop(permit);
+        let released = observer.collect_metrics("D8").await.unwrap();
+        assert_eq!(
+            metric(&released, TASK_ROUTER_CLAIM_IN_FLIGHT_METRIC)
+                .unwrap()
+                .value,
+            0.0
+        );
+        assert_eq!(
+            metric(&released, TASK_ROUTER_CLAIM_HOLD_BOUND_SECONDS_METRIC)
+                .unwrap()
+                .value,
+            0.0
+        );
+    }
+
+    /// The wait is a state, not a history: once the permit arrives the reading
+    /// must go back to zero, or the rule would keep firing on a loop that is
+    /// reading again.
+    /// The state this pair exists for: the budget is spent, the loop is waiting,
+    /// and another message is in hand. Everything about this process looks
+    /// healthy from the stream's own readings — the bus answered, no read was
+    /// refused — so only these gauges can say the queue stopped being consumed
+    /// because of this process's own concurrency budget.
+    #[tokio::test]
+    async fn an_exhausted_budget_and_a_waiting_loop_are_readable() {
+        let observer = Arc::new(ClaimSlotsObservable::new());
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        observer.register(STREAM, semaphore.clone(), 1);
+
+        // The one permit is running a task; the next message arrives and the
+        // loop blocks on the semaphore.
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let hold = observer.permit_taken(STREAM);
+        hold.note_timeout(600);
+        observer.wait_started(STREAM);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let waiting = observer.collect_metrics("D8").await.unwrap();
+        assert_eq!(
+            metric(&waiting, TASK_ROUTER_CLAIM_SLOTS_METRIC)
+                .unwrap()
+                .value,
+            1.0
+        );
+        assert_eq!(
+            metric(&waiting, TASK_ROUTER_CLAIM_IN_FLIGHT_METRIC)
+                .unwrap()
+                .value,
+            1.0
+        );
+        assert!(
+            metric(&waiting, TASK_ROUTER_CLAIM_WAIT_SECONDS_METRIC)
+                .unwrap()
+                .value
+                > 0.0
+        );
+        assert_eq!(
+            metric(&waiting, TASK_ROUTER_CLAIM_HOLD_BOUND_SECONDS_METRIC)
+                .unwrap()
+                .value,
+            600.0
+        );
+
+        drop(hold);
+        drop(permit);
+        observer.wait_ended(STREAM);
+
+        let ended = observer.collect_metrics("D8").await.unwrap();
+        assert_eq!(
+            metric(&ended, TASK_ROUTER_CLAIM_WAIT_SECONDS_METRIC)
+                .unwrap()
+                .value,
+            0.0
+        );
+        assert_eq!(
+            metric(&ended, TASK_ROUTER_CLAIM_IN_FLIGHT_METRIC)
+                .unwrap()
+                .value,
+            0.0
+        );
+    }
+
+    /// A stream nobody registered publishes nothing at all: an absent series is
+    /// the truth about "this process does not read that queue", while a zero
+    /// would claim it reads it and is never blocked.
+    #[tokio::test]
+    async fn an_unregistered_stream_publishes_nothing() {
+        let observer = ClaimSlotsObservable::new();
+        assert!(observer.collect_metrics("D8").await.unwrap().is_empty());
     }
 
     /// The orchestrator's published set is pinned to the outcomes it itself
