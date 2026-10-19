@@ -160,7 +160,7 @@ async fn only_the_reserved_workspace_rows_typed_as_faces_are_faces() {
         .await
         .expect("read the roster")
         .iter()
-        .filter_map(|task| Face::from_task(task))
+        .filter_map(Face::from_task)
         .collect();
     let ids: Vec<&str> = faces.iter().map(|face| face.face_id.as_str()).collect();
     assert!(ids.contains(&face_id.as_str()), "the face is in the roster");
@@ -168,7 +168,7 @@ async fn only_the_reserved_workspace_rows_typed_as_faces_are_faces() {
         !ids.contains(&product_id.as_str()),
         "a face-typed row outside the reserved workspace is work, not a face: {ids:?}"
     );
-    assert!(ids.len() >= 1);
+    assert!(!ids.is_empty());
 
     let handovers = store
         .governance_nodes(HANDOVER_TASK_TYPE)
@@ -410,7 +410,7 @@ async fn applying_a_handover_moves_the_face_and_the_unstarted_work_only() {
         .await
         .expect("read the roster")
         .iter()
-        .filter_map(|task| Face::from_task(task))
+        .filter_map(Face::from_task)
         .collect();
     let stored = faces
         .iter()

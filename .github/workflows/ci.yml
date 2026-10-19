@@ -199,6 +199,20 @@ jobs:
         run: cargo test -p cog-storage --test task_ownership_store -- --ignored --test-threads=1
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # A face is a task row, and every rule the governance layer trusts is a
+      # claim about which rows a query selects -- which rows are faces, which
+      # are open work for one, and which a handover moves. A read that matches
+      # the wrong type returns an empty registry, which reads as "no faces"
+      # rather than as a broken query, and a handover that moved a running task
+      # would leave its lease and its owner describing two units. Those shapes
+      # are invisible without a server, so the statements are run against one.
+      # One thread, because each test builds the schema on the shared database
+      # first: run together they create the same types at once and the catalog
+      # refuses the second.
+      - name: Live-DB governance store reads
+        run: cargo test -p cog-storage --test governance_store -- --ignored --test-threads=1
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # What a single pruning statement costs, and which rows it takes. The
       # rank question is a plan question: ranking every row of the log first
       # answers it for the whole table, which is a cost no reading of the
