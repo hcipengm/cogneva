@@ -209,14 +209,34 @@ impl StoreReadouts {
             return;
         }
         let data_dir = self.data_dir.display().to_string();
+        let labels_for = |store: &str, readout: &str| {
+            let mut labels = HashMap::new();
+            labels.insert("readout".to_string(), readout.to_string());
+            labels.insert("data_dir".to_string(), data_dir.clone());
+            labels.insert("store".to_string(), store.to_string());
+            labels
+        };
         let mut agreed = true;
         for expected in &expectation.policy_stores {
             let Some((name, store)) = self.stores.iter().find(|(n, _)| n == &expected.name) else {
-                // 包里有的库这个进程没有加载：这本身就是不一致，而且它没有实读可发布。
+                // 包里有的库这个进程没有加载：这本身就是不一致，而且它没有实读可
+                // 发布。只写一条 warn 等于让这件事在读数面上不存在——告警面读不
+                // 到它，读日志的人也不会被叫醒。把实读那一侧发布成 -1（与 ACTIVE
+                // 读不出来共用同一个哨兵），两个读数之间的差就替这条 warn 说话。
                 tracing::warn!(
                     store = %expected.name,
                     "the package restored a policy store this process does not load"
                 );
+                self.record(
+                    labels_for(&expected.name, "restore_expected_active_version"),
+                    expected.active_version as f64,
+                )
+                .await;
+                self.record(
+                    labels_for(&expected.name, "restore_loaded_active_version"),
+                    -1.0,
+                )
+                .await;
                 agreed = false;
                 continue;
             };
@@ -228,19 +248,12 @@ impl StoreReadouts {
                     -1.0
                 }
             };
-            let labels = |readout: &str| {
-                let mut labels = HashMap::new();
-                labels.insert("readout".to_string(), readout.to_string());
-                labels.insert("data_dir".to_string(), data_dir.clone());
-                labels.insert("store".to_string(), name.clone());
-                labels
-            };
             self.record(
-                labels("restore_expected_active_version"),
+                labels_for(name, "restore_expected_active_version"),
                 expected.active_version as f64,
             )
             .await;
-            self.record(labels("restore_loaded_active_version"), loaded)
+            self.record(labels_for(name, "restore_loaded_active_version"), loaded)
                 .await;
             if (expected.active_version as f64) != loaded {
                 agreed = false;
@@ -261,20 +274,16 @@ impl StoreReadouts {
                 .flat_map(|g| g.values())
                 .map(|(attempts, _)| f64::from(*attempts))
                 .sum();
-            let labels = |readout: &str| {
-                let mut labels = HashMap::new();
-                labels.insert("readout".to_string(), readout.to_string());
-                labels.insert("data_dir".to_string(), data_dir.clone());
-                labels.insert("store".to_string(), META_LEARNING_POLICY.to_string());
-                labels
-            };
             self.record(
-                labels("restore_expected_decision_trials"),
+                labels_for(META_LEARNING_POLICY, "restore_expected_decision_trials"),
                 expected_trials as f64,
             )
             .await;
-            self.record(labels("restore_loaded_decision_trials"), loaded_trials)
-                .await;
+            self.record(
+                labels_for(META_LEARNING_POLICY, "restore_loaded_decision_trials"),
+                loaded_trials,
+            )
+            .await;
             // 只判「少了」：包之后演化出来的证据会让实读更大，那是正常的；包里的
             // 一条证据不见了才是恢复没落到这个进程上。
             if loaded_trials < expected_trials as f64 {
@@ -608,6 +617,62 @@ mod tests {
         assert_eq!(by_readout["restore_loaded_active_version"], 1.0);
         assert_eq!(by_readout["restore_expected_decision_trials"], 4.0);
         assert_eq!(by_readout["restore_loaded_decision_trials"], 0.0);
+        assert!(path.exists(), "没核对上就不能把单子拿掉");
+    }
+
+    /// 包里点名的库这个进程没加载：实读那一侧发布 -1，不是「没有这一格」。
+    /// 只写一条 warn 时，这件事在读数面上不存在，而告警读的正是读数面。
+    #[tokio::test]
+    async fn a_store_the_package_names_but_this_process_does_not_load_is_published_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, engine, metrics) = fixture(dir.path()).await;
+        let readouts = StoreReadouts::new(
+            dir.path(),
+            vec![(META_LEARNING_POLICY.to_string(), store)],
+            engine,
+            Some(metrics.clone()),
+        );
+        let path = RestoreExpectation::path_in(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&RestoreExpectation {
+                version: RestoreExpectation::VERSION,
+                package_created_at: "2026-10-19T00:00:00Z".into(),
+                package_revision: "abc".into(),
+                policy_stores: vec![ExpectedStore {
+                    name: "evolution.policy".into(),
+                    active_version: 3,
+                }],
+                decision_trials: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let expectation = RestoreExpectation::take(dir.path()).unwrap();
+        readouts.check_restore(&expectation).await;
+
+        let samples = metrics
+            .query_gauge_latest(metric_names::POLICY_STORE_READINGS.as_str())
+            .await
+            .unwrap();
+        let value = |readout: &str| {
+            samples
+                .iter()
+                .find(|s| {
+                    let (r, _, store) = labels_of(s);
+                    r == readout && store == "evolution.policy"
+                })
+                .unwrap_or_else(|| panic!("缺少 evolution.policy 的 {readout} 那一格"))
+                .value
+        };
+        assert_eq!(value("restore_expected_active_version"), 3.0);
+        assert_eq!(
+            value("restore_loaded_active_version"),
+            -1.0,
+            "这个进程没有这个库，实读要报「拿不到」而不是干脆不发布"
+        );
         assert!(path.exists(), "没核对上就不能把单子拿掉");
     }
 

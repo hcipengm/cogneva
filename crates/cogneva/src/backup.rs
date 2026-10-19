@@ -2378,7 +2378,7 @@ fn seed_evolution_bundle_into(
     }
     // 临时命名空间不留在目标仓里：下一轮恢复再建一份，名字不会越攒越多。
     let leftovers = git_ok(
-        &target,
+        target,
         &["for-each-ref", "--format=%(refname)", "refs/restore/"],
     )?;
     for refname in leftovers.lines().map(str::trim).filter(|s| !s.is_empty()) {

@@ -2180,21 +2180,21 @@ data:
             },
             {
               "name": "restore_loaded_version_is_not_the_packages",
-              "promql": "abs((max(cogneva_policy_store_readings{readout=\"restore_loaded_active_version\"} and ((time() - cogneva_policy_store_readings_observed_timestamp_seconds{readout=\"restore_loaded_active_version\"}) < 1800))) - (max(cogneva_policy_store_readings{readout=\"restore_expected_active_version\"} and ((time() - cogneva_policy_store_readings_observed_timestamp_seconds{readout=\"restore_expected_active_version\"}) < 1800))))",
+              "promql": "abs((max by (store, data_dir) (cogneva_policy_store_readings{readout=\"restore_loaded_active_version\"} and ((time() - cogneva_policy_store_readings_observed_timestamp_seconds{readout=\"restore_loaded_active_version\"}) < 1800))) - on (store, data_dir) (max by (store, data_dir) (cogneva_policy_store_readings{readout=\"restore_expected_active_version\"} and ((time() - cogneva_policy_store_readings_observed_timestamp_seconds{readout=\"restore_expected_active_version\"}) < 1800))))",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "critical",
-              "summary": "恢复包里的策略库是第几版，和新进程实际加载的是第几版，差的这个数是 {value}：`restore_expected_active_version` 是包清单写进数据根的交接单，`restore_loaded_active_version` 是进程自己打开策略库读到的 ACTIVE，两者在同一次启动、同一刻发布，所以这不是一个先后差，是同一时刻的两个答案。它拦的是整条恢复流程里唯一没人能代答的一问：写回成功不等于加载成功。恢复 Job 把字节写进卷、演练把包读回、回执写着 done，三件事都发生在卷上；而新进程如果挂在另一块 PVC 上、`data_dir` 指到别处、或者挂载还没就绪就起来了，它会安静地跑在一个空库上，上面那三件事一件都不会变。ABS 取两侧之差而不是只读一侧：版本往后走是进化在做的事，只有包里的那一个版本没被加载才该亮，方向不是判断依据，相等才是。0 不亮，差 1 就亮；它不会自己熄灭——交接单核对通过才会被删掉，核不上就留在数据根里，下一次启动仍然把这个差再报一遍。severity 是 critical 而不是 warning：这条亮着的时候，这台机器是带着一次没有落到进程上的恢复在跑，后面所有「进化学到了什么」都建立在一个空库上。要消掉它，得让进程真的从恢复出来的数据根启动：修好挂载或 `data_dir`，重启，然后核对通过、交接单被消费掉。两侧各自带 1800 秒的新鲜合取：读数停了则整条为空，那种状态归 background_loop_stalled 在循环自己的拍子上报，不归这里——一个停了的写者不该被读成「版本对不上」。"
+              "summary": "恢复包里的策略库是第几版，和新进程实际加载的是第几版，差的这个数是 {value}：`restore_expected_active_version` 是包清单写进数据根的交接单，`restore_loaded_active_version` 是进程自己打开策略库读到的 ACTIVE，两者在同一次启动、同一刻发布，所以这不是一个先后差，是同一时刻的两个答案。它拦的是整条恢复流程里唯一没人能代答的一问：写回成功不等于加载成功。恢复 Job 把字节写进卷、演练把包读回、回执写着 done，三件事都发生在卷上；而新进程如果挂在另一块 PVC 上、`data_dir` 指到别处、或者挂载还没就绪就起来了，它会安静地跑在一个空库上，上面那三件事一件都不会变。ABS 取两侧之差而不是只读一侧：版本往后走是进化在做的事，只有包里的那一个版本没被加载才该亮，方向不是判断依据，相等才是。0 不亮，差 1 就亮；它不会自己熄灭——交接单核对通过才会被删掉，核不上就留在数据根里，下一次启动仍然把这个差再报一遍。severity 是 critical 而不是 warning：这条亮着的时候，这台机器是带着一次没有落到进程上的恢复在跑，后面所有「进化学到了什么」都建立在一个空库上。要消掉它，得让进程真的从恢复出来的数据根启动：修好挂载或 `data_dir`，重启，然后核对通过、交接单被消费掉。两侧各自带 1800 秒的新鲜合取：读数停了则整条为空，那种状态归 background_loop_stalled 在循环自己的拍子上报，不归这里——一个停了的写者不该被读成「版本对不上」。两侧按 (store, data_dir) 分组逐库比：跨库取 max 会让另一个库更大的版本号盖住这一个库的缺失，而缺失的那个库根本没有可发布的值；包里有、这个进程没加载的库，实读一侧发布 -1（与 ACTIVE 读不出来共用同一个哨兵），差值是版本号加一。"
             },
             {
               "name": "restore_loaded_less_decision_evidence_than_the_package",
-              "promql": "(max(cogneva_policy_store_readings{readout=\"restore_expected_decision_trials\"} and ((time() - cogneva_policy_store_readings_observed_timestamp_seconds{readout=\"restore_expected_decision_trials\"}) < 1800)) - max(cogneva_policy_store_readings{readout=\"restore_loaded_decision_trials\"} and ((time() - cogneva_policy_store_readings_observed_timestamp_seconds{readout=\"restore_loaded_decision_trials\"}) < 1800)))",
+              "promql": "((max by (data_dir) (cogneva_policy_store_readings{readout=\"restore_expected_decision_trials\"} and ((time() - cogneva_policy_store_readings_observed_timestamp_seconds{readout=\"restore_expected_decision_trials\"}) < 1800))) - on (data_dir) (max by (data_dir) (cogneva_policy_store_readings{readout=\"restore_loaded_decision_trials\"} and ((time() - cogneva_policy_store_readings_observed_timestamp_seconds{readout=\"restore_loaded_decision_trials\"}) < 1800))))",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "包里有 {value} 次决策试验在新进程里没有出现：交接单记的是包里 `decision_stats` 的试验数，实读的是引擎启动后手上的聚合。只判「少了」，不判差值：包里那一份之后又被记了新的决策，实读就会更大，那是正常的历史往前长；而恢复要保证的是包里已经有的那部分一条不少。少了意味着卷上那份统计没有被这个进程读到——空卷、挂载点不对、或者快照文件在包里就坏了——而这正是「攒够证据才调参」被清零的样子：从第一次重启起，`min_trials` 就要重新攒，参数搜索在每次换版都重建 Pod 的部署上永远到不了门槛，而所有读数里只有这一个数字会掉。与版本那条分开成两条规则而不是合成一条：修法不同——版本对不上要修的是进程读的是哪一份数据根，试验数少了要查的是那一份快照本身有没有被写回、有没有被读到，两个故障一个判词各自没有用。它同样只在恢复后的第一次启动发布一次，核对不上就不消费交接单，下一次启动继续报。两侧各带 1800 秒新鲜合取，理由与版本那条相同。"
+              "summary": "包里有 {value} 次决策试验在新进程里没有出现：交接单记的是包里 `decision_stats` 的试验数，实读的是引擎启动后手上的聚合。只判「少了」，不判差值：包里那一份之后又被记了新的决策，实读就会更大，那是正常的历史往前长；而恢复要保证的是包里已经有的那部分一条不少。少了意味着卷上那份统计没有被这个进程读到——空卷、挂载点不对、或者快照文件在包里就坏了——而这正是「攒够证据才调参」被清零的样子：从第一次重启起，`min_trials` 就要重新攒，参数搜索在每次换版都重建 Pod 的部署上永远到不了门槛，而所有读数里只有这一个数字会掉。与版本那条分开成两条规则而不是合成一条：修法不同——版本对不上要修的是进程读的是哪一份数据根，试验数少了要查的是那一份快照本身有没有被写回、有没有被读到，两个故障一个判词各自没有用。它同样只在恢复后的第一次启动发布一次，核对不上就不消费交接单，下一次启动继续报。两侧各带 1800 秒新鲜合取，理由与版本那条相同。两侧按 data_dir 分组逐根比：跨根取 max 会让证据更多的那个根盖住另一个根的丢失，而两个根各自恢复各自的那一份。"
             },
             {
               "name": "policy_store_announced_without_a_version",
