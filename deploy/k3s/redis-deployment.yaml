@@ -153,12 +153,39 @@ spec:
             - |
               report=/report/redis-info.prom
               props=/report/.redis-info.props
+              walprops=/report/.redis-wal.props
               interval=30
+              wal_interval=300
+              # How many keys start with `wal:` and how long the longest one is.
+              # The log list of each agent is never deleted, so this is the pair
+              # that says whether the per-session cap is holding and how much of
+              # the dataset the logs are. One EVAL walks the keyspace server side
+              # and LLENs each match, because the shell would otherwise fork a
+              # client per key; that walk is why it runs on its own slower clock
+              # rather than with every INFO. It reads keys, never writes them.
+              wal_census='local c=0 local n=0 local cur="0" repeat local r=redis.call("SCAN",cur,"MATCH","wal:*","COUNT",1000) cur=r[1] for i=1,#r[2] do local l=redis.call("LLEN",r[2][i]) if l>n then n=l end c=c+1 end until cur=="0" return {c,n}'
               value() { sed -n "s/^$1://p" "$props" | head -n 1 | tr -d '\r'; }
+              line() { sed -n "$2p" "$1" 2>/dev/null | head -n 1; }
+              scanned=0
               while true; do
                 if redis-cli -h 127.0.0.1 -p 6379 -a "$REDIS_PASSWORD" --no-auth-warning INFO \
                     > "$props" 2>/dev/null && grep -q '^used_memory:' "$props"; then
                   now=$(date +%s)
+                  # The census writes its own file and is read back from it, so a
+                  # failed scan leaves the last pair and an ageing timestamp
+                  # rather than dropping the series out of the exposition.
+                  if [ $((now - scanned)) -ge "$wal_interval" ]; then
+                    census=$(redis-cli -h 127.0.0.1 -p 6379 -a "$REDIS_PASSWORD" --no-auth-warning \
+                      EVAL "$wal_census" 0 2>/dev/null)
+                    wal_keys=$(printf '%s\n' "$census" | sed -n '1p')
+                    wal_max=$(printf '%s\n' "$census" | sed -n '2p')
+                    case "$wal_keys$wal_max" in
+                      ''|*[!0-9]*) : ;;
+                      *) printf '%s\n%s\n%s\n' "$wal_keys" "$wal_max" "$now" \
+                           > "$walprops.tmp" && mv "$walprops.tmp" "$walprops"
+                         scanned=$now ;;
+                    esac
+                  fi
                   db0=$(value db0)
                   keys=${db0#*keys=}
                   keys=${keys%%,*}
@@ -171,6 +198,13 @@ spec:
                     printf '%s{db="db0"} %s\n' "cogneva_redis_db_keys" "${keys:-0}"
                     printf '%s %s\n' "cogneva_redis_info_interval_seconds" "$interval"
                     printf '%s %s\n' "cogneva_redis_info_updated_timestamp_seconds" "$now"
+                    printf '%s %s\n' "cogneva_redis_wal_scan_interval_seconds" "$wal_interval"
+                    wal_keys=$(line "$walprops" 1)
+                    wal_max=$(line "$walprops" 2)
+                    wal_at=$(line "$walprops" 3)
+                    [ -n "$wal_keys" ] && printf '%s %s\n' "cogneva_redis_wal_keys" "$wal_keys"
+                    [ -n "$wal_max" ] && printf '%s %s\n' "cogneva_redis_wal_max_length" "$wal_max"
+                    [ -n "$wal_at" ] && printf '%s %s\n' "cogneva_redis_wal_scan_timestamp_seconds" "$wal_at"
                   } > "$report.tmp" && mv "$report.tmp" "$report"
                 fi
                 sleep "$interval"

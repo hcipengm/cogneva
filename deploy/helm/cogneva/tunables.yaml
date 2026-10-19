@@ -241,6 +241,17 @@ rows:
       never the reason two scrapes carry the same sample. The value is published
       as cogneva_redis_info_interval_seconds, so the staleness rule derives its
       bound from it instead of holding a second copy that can drift.
+  - key: backends.redis.infoExporter.walScanIntervalSeconds
+    source: override
+    why: >-
+      The WAL census is a full keyspace walk with an LLEN per matching key,
+      which is the one reading here that costs the server work rather than a
+      reply it already has. Five minutes is far slower than the cap it watches:
+      the longest log moves by one append at a time, so the question "is the
+      cap holding" is answered at any cadence well under the time a log takes
+      to grow from the cap to twice it. The value is published as
+      cogneva_redis_wal_scan_interval_seconds, so a staleness rule reads the
+      cadence it was configured with instead of holding a second copy.
   - key: backends.redis.infoExporter.resources.requests.cpu
     source: override
     why: >-

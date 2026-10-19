@@ -809,6 +809,7 @@ backends:
     # rather than from a constant written next to the alert rule.
     infoExporter:
       intervalSeconds: 30
+      walScanIntervalSeconds: 300
       resources:
         requests:
           cpu: 10m
