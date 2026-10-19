@@ -1,3 +1,5 @@
+//! principle: feedback_bidirectional_agent_hook
+//!
 //! Hierarchical lifecycle hook engine — routes [`AgentEvent`]s into scope-aware
 //! 与广播规则").
 //! ## Why a second engine?
@@ -801,5 +803,51 @@ mod tests {
             .await;
         let got = forward_rx.recv().await.unwrap();
         assert!(matches!(got, AgentEvent::AgentStart { .. }));
+    }
+
+    /// The Agent → Hook half of bidirectional feedback: an Agent-originated
+    /// lifecycle event pushed into the engine's own input channel -- not
+    /// produced by a Supervisor pull -- is actively reported onward on the
+    /// forward channel, and the report keeps the Agent's identity and payload.
+    #[tokio::test]
+    async fn agent_initiated_hook_event_is_reported_upstream_without_a_pull() {
+        let (forward_tx, mut forward_rx) = mpsc::channel::<AgentEvent>(1);
+        let engine = Arc::new(LifecycleHookEngine::new().with_forward(forward_tx));
+        let (tx, _join) = engine.clone().spawn_arc();
+
+        let reported_at = Utc::now();
+        let report = AgentEvent::CheckpointSaved {
+            agent_id: "agent-reporter-7".into(),
+            checkpoint_id: "checkpoint-42".into(),
+            task_id: "task-9".into(),
+            crew_id: Some("crew:upward".into()),
+            squad_id: None,
+            timestamp: reported_at,
+        };
+        let hook_event = LifecycleHookEvent::from_agent_event("agent-reporter-7", report.clone())
+            .with_crew_id("crew:upward");
+        assert_eq!(hook_event.hook_type, HookType::CheckpointSaved);
+
+        // The Agent pushes its own report; nothing polls on its behalf.
+        tx.send(hook_event).await.unwrap();
+
+        let forwarded = forward_rx.recv().await.unwrap();
+        match forwarded {
+            AgentEvent::CheckpointSaved {
+                agent_id,
+                checkpoint_id,
+                task_id,
+                crew_id,
+                timestamp,
+                ..
+            } => {
+                assert_eq!(agent_id, "agent-reporter-7");
+                assert_eq!(checkpoint_id, "checkpoint-42");
+                assert_eq!(task_id, "task-9");
+                assert_eq!(crew_id.as_deref(), Some("crew:upward"));
+                assert_eq!(timestamp, reported_at);
+            }
+            other => panic!("expected the agent's checkpoint report, got {other:?}"),
+        }
     }
 }
