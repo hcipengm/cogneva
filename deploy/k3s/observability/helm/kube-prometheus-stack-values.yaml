@@ -401,6 +401,12 @@ prometheusOperator:
 # ─── defaultRules ────────────────────────────────────────────────
 defaultRules:
   create: true
+  disabled:
+    # Prometheus 3 删掉了聚合计数器 prometheus_sd_refresh_failures_total，上游模板
+    # 仍引用它（91.5.2 与 main 都未修），这条规则因此永远不触发。关掉 chart 里那条，
+    # 由下面的 additionalPrometheusRulesMap 按现网真有的
+    # prometheus_sd_kubernetes_failures_total 重写同名规则。
+    PrometheusSDRefreshFailure: true
   rules:
     alertmanager: true
     etcd: true
@@ -429,3 +435,21 @@ defaultRules:
     nodeExporterRecording: true
     prometheus: true
     prometheusOperator: true
+
+# ─── 补回被关掉的规则 ─────────────────────────────────────────────
+# 只放需要重写的规则；其余默认规则保持 chart 原样。与缩配档同一条规则、同一个理由。
+additionalPrometheusRulesMap:
+  cogneva-prometheus-self:
+    groups:
+      - name: cogneva-prometheus-self
+        rules:
+          - alert: PrometheusSDRefreshFailure
+            expr: |-
+              increase(prometheus_sd_kubernetes_failures_total{job="cog-observability-prometheus",namespace="monitoring"}[10m]) > 0
+            for: 20m
+            labels:
+              severity: warning
+            annotations:
+              summary: Failed Prometheus SD refresh.
+              description: Prometheus {{$labels.namespace}}/{{$labels.pod}} has failed to refresh Kubernetes service discovery.
+              runbook_url: https://runbooks.prometheus-operator.dev/runbooks/prometheus/prometheussdrefreshfailure

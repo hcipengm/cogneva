@@ -177,3 +177,32 @@ kubeProxy:
 # 全量保留：规则只是 ConfigMap，被停用的组件（etcd 等）对应规则自然无数据
 defaultRules:
   create: true
+  disabled:
+    # Prometheus 3 删掉了聚合计数器 prometheus_sd_refresh_failures_total，上游模板
+    # 仍引用它（91.5.2 与 main 都未修），这条规则因此永远不触发。关掉 chart 里那条，
+    # 由下面的 additionalPrometheusRulesMap 按现网真有的
+    # prometheus_sd_kubernetes_failures_total 重写同名规则。
+    PrometheusSDRefreshFailure: true
+
+# ─── 补回被关掉的规则 ─────────────────────────────────────────────
+# 只放需要重写的规则；其余默认规则保持 chart 原样。
+additionalPrometheusRulesMap:
+  cogneva-prometheus-self:
+    groups:
+      - name: cogneva-prometheus-self
+        rules:
+          - alert: PrometheusSDRefreshFailure
+            # 本集群的服务发现只有 Kubernetes 一种机制（ServiceMonitor/PodMonitor），
+            # 所以聚合计数器换成它的按机制对应物即可；window/for 沿用 chart 原值。
+            # 注意同组已有一条 PrometheusKubernetesListWatchFailures 读同一个计数器
+            # （5m/15m）：两条都留是有意的——一条是列表/监听失败，一条是刷新失败，
+            # 都落在同一次 SD 坏掉上；若要只留一条，删本条。
+            expr: |-
+              increase(prometheus_sd_kubernetes_failures_total{job="cog-observability-prometheus",namespace="monitoring"}[10m]) > 0
+            for: 20m
+            labels:
+              severity: warning
+            annotations:
+              summary: Failed Prometheus SD refresh.
+              description: Prometheus {{$labels.namespace}}/{{$labels.pod}} has failed to refresh Kubernetes service discovery.
+              runbook_url: https://runbooks.prometheus-operator.dev/runbooks/prometheus/prometheussdrefreshfailure

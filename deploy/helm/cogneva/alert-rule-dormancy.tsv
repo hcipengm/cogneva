@@ -60,7 +60,6 @@ KubeletClientCertificateExpiration	kubelet_certificate_manager_client_ttl_second
 KubeletClientCertificateRenewalErrors	kubelet_certificate_manager_client_expiration_renew_errors	exporter_version	Same missing kubelet certificate-manager family; renewal errors are silent.
 KubeletServerCertificateExpiration	kubelet_certificate_manager_server_ttl_seconds	exporter_version	Same missing kubelet certificate-manager family; serving-certificate expiry is silent.
 KubeletServerCertificateRenewalErrors	kubelet_server_expiration_renew_errors	exporter_version	Same missing kubelet certificate-manager family; serving-certificate renewal errors are silent.
-PrometheusSDRefreshFailure	prometheus_sd_refresh_failures_total	series_renamed	Prometheus 3 removed the aggregated SD failure counter; the per-mechanism prometheus_sd_kubernetes_failures_total is the live counterpart -- rewrite the rule.
 
 # --- collector_off (5 rules): node-exporter collectors not enabled ----------
 NodeBondingDegraded	node_bonding_active,node_bonding_slaves	collector_off	The node-exporter bond collector is not enabled; bond link degradation is unobserved.
