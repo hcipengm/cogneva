@@ -1,0 +1,16 @@
+# 空白机恢复的步骤图。制表符分隔，列固定为：
+#   id	requires	produces	needs_gateway	what
+#
+# 这张表声明「每一步要什么、装出什么」，`deploy/scripts/check-restore-order.sh`
+# 判两件事：每个 requires 都由**更早**的一步 produces（或由空白机自带的
+# `host_shell` 提供），以及 `needs_gateway=1` 的步骤之前已经有一步产出了
+# `gateway`。最后一条在空白机这条路径上是空集——空白机上没有网关，所以这条腿
+# 的任何一步都不许等网关签发的东西；等网关的是一次性地址那条腿，它另有一张表。
+#
+# `host_shell` 是空白机自带的唯一前置：一个能跑 sh 与 curl 的宿主。
+# 表与脚本是双向耦合的：这里每个 id 必须在脚本里有 `run_step <id>`，脚本里
+# 每个 `run_step` 也必须在表里有行。少一边就红，新增步骤时不会漏登记。
+package	host_shell	package_bytes	0	属主带来的加密包落在宿主上并核过 sha256；后面每一段读的都是这一份字节
+engine	host_shell	engine,cluster_api,managed_pvcs	0	公开仓库元启动：装镜像、建集群与 PVC、跑迁移；不需要任何包内数据
+restore	cluster_api,engine,package_bytes	data_roots,restore_job	0	恢复 Job：实例身份 Secret、PG、Qdrant、对象层、各数据根的产物层
+verify	data_roots,restore_job	data_roots_readings	0	拿恢复 Job 的逐库读数与包内声明对账，写回执

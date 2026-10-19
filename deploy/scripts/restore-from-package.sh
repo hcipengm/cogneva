@@ -19,7 +19,9 @@ command -v kubectl >/dev/null || { echo "缺少 kubectl" >&2; exit 2; }
 
 BASE="$(basename "$PKG")"
 STAGE_POD="cogneva-restore-stage"
-JOB_NAME="cogneva-restore-$(date +%s)"
+# 调用方可以把名字定下来（空白机恢复要把 Job 名写进回执、事后按名字取日志）；
+# 没给就按时刻取一个。
+JOB_NAME="${COGNEVA_RESTORE_JOB_NAME:-cogneva-restore-$(date +%s)}"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT

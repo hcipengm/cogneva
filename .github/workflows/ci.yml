@@ -616,6 +616,11 @@ jobs:
       # parity 也绿，只是那个 Pod 从此握着平台 token。
       - name: Check credential holder surface
         run: bash deploy/scripts/check-credential-holder-surface.sh
+      # 空白机恢复的步骤顺序：每一步的 requires 都要由更早的一步产出，等网关的
+      # 步骤之前要真有一个网关。这条在渲染期同样没有症状——步骤清单读起来是
+      # 对的，坏在「第 3 步在第 2 步之前」，只有空白机上跑到一半才会发现。
+      - name: Check restore step order
+        run: bash deploy/scripts/check-restore-order.sh
       # 告警去重身份＝规则名＋返回序列的标签：表达式没把 pod/container 聚合掉的规则，
       # 身份会随报信的 Pod 重建而换新，同一个持续中的状况每次滚动都以全新告警再报一次。
       # 判据读的是表达式结构而不是求值结果（条件此刻不成立时返回零条序列，
