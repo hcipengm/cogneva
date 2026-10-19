@@ -2814,6 +2814,16 @@ async fn deploy_via_helm(profile: Profile) -> Result<()> {
 /// `upgrade --install` 与 `template` 的公共入参（release 名、chart、命名空间、
 /// values、镜像站覆盖）。两处共用一份，是为了让"清理依据的清单"与"交付的清单"
 /// 不可能不同。
+///
+/// `mainlineDeployer.enabled=false` 不是默认值覆盖，而是**单写者边界**：helm 投递
+/// 的集群里，chart 自带的部署器会用 `kubectl apply` 写同一批对象（Deployment 的
+/// image、支撑 ConfigMap 等），而 helm 下一次升级走 server-side apply，会在这些
+/// 字段上与 `kubectl-client-side-apply` 冲突——2026-10-19 实测，一次从未改过拓扑的
+/// 升级失败在 20+ 个对象的所有权上。部署器那侧也不该反向拿起 helm：它的 Role
+/// 刻意没有 Secret 与集群级写权限，而 helm 要写 release 状态 Secret。所以在
+/// helm 投递的集群上关掉它，交付路径只剩 helm 一个写者；apply 投递的集群由
+/// `deploy/k3s` 里的 `COGNEVA_MAINLINE_DEPLOYER_ENABLED=true` 打开，那条链上
+/// 只有 kubectl apply 一个写者。
 fn helm_common_args(chart: &Path, values: &Path, overrides: &[(String, String)]) -> Vec<String> {
     let mut out: Vec<String> = vec![
         "cogneva".into(),
@@ -2824,6 +2834,8 @@ fn helm_common_args(chart: &Path, values: &Path, overrides: &[(String, String)])
         values.to_string_lossy().into_owned(),
         "--set".into(),
         "secrets.create=true".into(),
+        "--set".into(),
+        "mainlineDeployer.enabled=false".into(),
     ];
     for (key, val) in overrides {
         out.push("--set".into());
@@ -4069,5 +4081,37 @@ mod ingress_preflight_tests {
                 "前门校验必须排在 {delivery} 之前（下发之后再校验，ingress 已经没人认领）"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod helm_delivery_single_writer_tests {
+    use super::*;
+
+    /// helm 投递的集群上不能同时跑 apply 部署器：部署器用 `kubectl apply` 写
+    /// Deployment 的 image 与支撑 ConfigMap，helm 下一次升级走 server-side apply，
+    /// 会在这些字段上与 `kubectl-client-side-apply` 冲突。断言钉在**公共入参**里，
+    /// 因为 `template` 与 `upgrade` 共用同一份——只给 `upgrade` 加，清理依据的
+    /// 清单就会与真正交付的清单不同。
+    #[test]
+    fn helm_delivery_turns_the_apply_deployer_off() {
+        let args = helm_common_args(
+            Path::new("/repo/deploy/helm/cogneva"),
+            Path::new("/repo/deploy/helm/cogneva/profiles/k3s-single.yaml"),
+            &[],
+        );
+        let sets: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "--set")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert!(
+            sets.contains(&"mainlineDeployer.enabled=false"),
+            "helm 投递必须关掉 apply 部署器，否则下一次 upgrade 会撞字段所有权；实得 {args:?}"
+        );
+        assert!(
+            sets.contains(&"secrets.create=true"),
+            "helm 投递仍要由 chart 生成安装期 Secret；实得 {args:?}"
+        );
     }
 }
