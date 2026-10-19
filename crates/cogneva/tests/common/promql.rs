@@ -177,6 +177,163 @@ pub fn metric_names_in(expr: &str) -> BTreeSet<String> {
     names
 }
 
+/// The operand of every `sum`/`avg` aggregation in the expression.
+///
+/// The operand is taken by matching parentheses, not by taking the first
+/// parenthesised span after the operator: an aggregation with a `by (...)`
+/// clause has two, and the first is the label list. Taking that one would read
+/// every expression as aggregating nothing.
+pub fn summed_spans(expr: &str) -> Vec<String> {
+    let s = strip_braces(&strip_quoted(expr));
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if !(c.is_ascii_alphabetic() || c == '_') {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && {
+            let ch = bytes[i] as char;
+            ch.is_ascii_alphanumeric() || ch == '_'
+        } {
+            i += 1;
+        }
+        if !matches!(&s[start..i], "sum" | "avg") {
+            continue;
+        }
+        let Some(close) = operand_close(&s, i) else {
+            continue;
+        };
+        let Some(open) = open_of_close(&s, close) else {
+            continue;
+        };
+        out.push(s[open + 1..close].to_string());
+        i = close + 1;
+    }
+    out
+}
+
+/// Series names every `sum`/`avg` aggregation in the expression reads.
+pub fn summed_metric_names(expr: &str) -> BTreeSet<String> {
+    summed_spans(expr)
+        .iter()
+        .flat_map(|span| metric_names_in(span))
+        .collect()
+}
+
+/// Whether the span aggregates `name` through an operator that keeps one
+/// value per label set, so the caller may aggregate the result again.
+///
+/// A store-derived series is one fact seen once per process; `max by (...)` is
+/// the operation that turns those copies back into one, and `sum` over its
+/// result then adds facts rather than copies. `count`, `group` and `topk` keep
+/// a value rather than combining values, so they qualify for the same reason.
+pub fn deduplicated_over(span: &str, name: &str) -> bool {
+    let s = strip_braces(&strip_quoted(span));
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if !(c.is_ascii_alphabetic() || c == '_') {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && {
+            let ch = bytes[i] as char;
+            ch.is_ascii_alphanumeric() || ch == '_'
+        } {
+            i += 1;
+        }
+        if !matches!(
+            &s[start..i],
+            "max" | "min" | "topk" | "bottomk" | "count" | "group"
+        ) {
+            continue;
+        }
+        let Some(close) = operand_close(&s, i) else {
+            continue;
+        };
+        let Some(open) = open_of_close(&s, close) else {
+            continue;
+        };
+        if metric_names_in(&s[open + 1..close]).contains(name) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The index of the `)` closing the operand that follows `operator_end`,
+/// skipping an optional `by (...)` / `without (...)` clause.
+fn operand_close(s: &str, operator_end: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut j = operator_end;
+    while j < bytes.len() && (bytes[j] as char).is_ascii_whitespace() {
+        j += 1;
+    }
+    let keyword = ["by", "without"]
+        .into_iter()
+        .find(|kw| s[j..].starts_with(kw));
+    if let Some(kw) = keyword {
+        j += kw.len();
+        while j < bytes.len() && (bytes[j] as char).is_ascii_whitespace() {
+            j += 1;
+        }
+        if j < bytes.len() && bytes[j] as char == '(' {
+            j = matching_paren(s, j)? + 1;
+        }
+    }
+    while j < bytes.len() && (bytes[j] as char).is_ascii_whitespace() {
+        j += 1;
+    }
+    if j >= bytes.len() || bytes[j] as char != '(' {
+        return None;
+    }
+    matching_paren(s, j)
+}
+
+/// The index of the `(` matching the `)` at `close`, if the text balances.
+fn open_of_close(s: &str, close: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 0usize;
+    for index in (0..=close).rev() {
+        match bytes[index] {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The index of the `)` matching the `(` at `open`, if the text balances.
+fn matching_paren(s: &str, open: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 0usize;
+    for (offset, byte) in bytes[open..].iter().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// The label sets each aggregation's `by (...)` clause keeps, in expression
 /// order.
 ///
@@ -253,6 +410,7 @@ const BINARY_OPERATORS: &[&str] = &[
 pub const AGGREGATIONS: &[&str] = &[
     "sum",
     "avg",
+    "min",
     "min",
     "max",
     "count",

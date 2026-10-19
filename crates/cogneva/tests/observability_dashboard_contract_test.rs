@@ -18,6 +18,8 @@ use std::collections::BTreeSet;
 
 #[path = "common/closed_set.rs"]
 mod closed_set;
+#[path = "common/derivation.rs"]
+mod derivation;
 #[path = "common/producer.rs"]
 mod producer;
 #[path = "common/promql.rs"]
@@ -30,7 +32,7 @@ use dashboard::{
     is_log_query, json_field, metric_exprs, repo_root, text as dashboard_text, PanelExpr,
 };
 use producer::carries_the_producer;
-use promql::{metric_names_in, shape_complaints, uses_an_aggregation, AGGREGATIONS};
+use promql::{metric_names_in, shape_complaints, summed_spans, uses_an_aggregation, AGGREGATIONS};
 
 /// Series this workspace produces: the labels each one carries, and the file
 /// that publishes it.
@@ -1158,5 +1160,51 @@ fn a_panel_that_judges_a_series_this_build_publishes_is_counted() {
         judging.len(),
         PANELS_JUDGING_A_SERIES_THIS_BUILD_PUBLISHES,
         judging.join("\n")
+    );
+}
+
+/// The dashboard answers the same question the alert rules do, and owes the
+/// same declaration: a panel that aggregates a store-derived series shows one
+/// fact multiplied by the number of processes rendering it, and a panel is read
+/// as a fact rather than as a candidate alert.
+///
+/// The registry is asked, not the text. A store-derived series may only be
+/// aggregated after the process copies have been reduced to one with
+/// `max`/`min`/`topk`/`count`; see `METRIC_DERIVATIONS` in `cog-core` for why
+/// the distinction is invisible in the name.
+#[test]
+fn no_panel_aggregates_a_series_whose_derivation_makes_the_aggregate_wrong() {
+    let mut complaints: Vec<String> = Vec::new();
+    for panel in metric_exprs(&dashboard_text()) {
+        for span in summed_spans(&panel.expr) {
+            for name in metric_names_in(&span) {
+                if !cog_core::is_registered_metric(&name) {
+                    continue;
+                }
+                match derivation::metric_derivation(&name) {
+                    Some(derivation::MetricDerivation::Store)
+                        if !promql::deduplicated_over(&span, &name) =>
+                    {
+                        complaints.push(format!(
+                            "a panel aggregates {name}, rendered from the store: every \
+                             process reports the same fact and the aggregate multiplies it.\n    {}",
+                            panel.expr
+                        ));
+                    }
+                    Some(_) => {}
+                    None => complaints.push(format!(
+                        "a panel aggregates {name} without declaring its derivation in \
+                         METRIC_DERIVATIONS.\n    {}",
+                        panel.expr
+                    )),
+                }
+            }
+        }
+    }
+
+    assert!(
+        complaints.is_empty(),
+        "这些面板聚合了来历未声明或状态派生的序列:\n{}",
+        complaints.join("\n")
     );
 }

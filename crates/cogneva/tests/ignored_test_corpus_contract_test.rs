@@ -107,6 +107,16 @@ const UNNAMED: &[(&str, &str)] = &[
          such a pod exists.",
     ),
     (
+        "crates/cogneva/tests/store_derived_reading.rs",
+        "The probe compares what two live processes report for the series the \
+         registry calls store-derived, so it needs addresses CI does not have: \
+         a running cluster with the app and evolution pods, port-forwarded. Its \
+         subject is the live system, not the tree — the tree-side gate next to \
+         it (`observability_alert_rule_contract_test` and the dashboard contract) \
+         runs in CI. Manual reading: `COGNEVA_METRICS_URLS=<a>/metrics,<b>/metrics \
+         cargo test -p cogneva --test store_derived_reading -- --ignored --nocapture`.",
+    ),
+    (
         "crates/cogneva/src/eval_mcp_in_pod.rs",
         "Same shape as the local-tools entry above it: read a real pack pod's \
          server config, start the server, list its tools and call one. What it \

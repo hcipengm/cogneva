@@ -31,6 +31,8 @@ use cog_gateway::security_gateway::{RangeReadBaseline, RANGE_READ_BASELINES};
 mod closed_set;
 #[path = "common/dashboard.rs"]
 mod dashboard;
+#[path = "common/derivation.rs"]
+mod derivation;
 #[path = "common/producer.rs"]
 mod producer;
 #[path = "common/promql.rs"]
@@ -514,6 +516,18 @@ const PRODUCED: &[(&str, &str)] = &[
     (
         "cogneva_process_zombies",
         "crates/cog-observability/src/process_zombies.rs",
+    ),
+    (
+        "cogneva_redis_info_interval_seconds",
+        "deploy/helm/cogneva/templates/redis.yaml",
+    ),
+    (
+        "cogneva_redis_info_updated_timestamp_seconds",
+        "deploy/helm/cogneva/templates/redis.yaml",
+    ),
+    (
+        "cogneva_redis_memory_used_bytes",
+        "deploy/helm/cogneva/templates/redis.yaml",
     ),
     (
         "cogneva_redrive_budget_losses_total",
@@ -3955,4 +3969,93 @@ fn no_written_rule_maps_a_set_operand_instead_of_filtering_it() {
         "这些规则的集合算子操作数没有被当成过滤读:\n{}",
         complaints.join("\n")
     );
+}
+
+/// An aggregation's answer depends on where the value comes from, so a rule
+/// that aggregates a series has to say which answer it means.
+///
+/// `sum` over a process-local counter counts events, and is right. `sum` over a
+/// series every process renders from the same store row multiplies one fact by
+/// the number of processes that happened to be running — 2026-10-19 measured 53
+/// such counters, two live processes each reporting byte-identical totals, and
+/// the error grows further inside a window because dead pods' last samples stay
+/// in it. The distinction is not in the name: `_total` suffixes both kinds.
+///
+/// So this test asks the registry, not the text. A name the registry knows and
+/// has not classified fails here; a name classified as store-derived fails here
+/// too, unless the span already reduced the process copies to one with
+/// `max`/`min`/`topk`/`count`, after which summing facts is exactly what the
+/// outer aggregation is for. Series from outside the registry (`kube_*`,
+/// `ALERTS`) are out of scope for the same reason as everywhere else in this
+/// file: their answer is not this repository's to declare.
+#[test]
+fn no_rule_aggregates_a_series_whose_derivation_makes_the_aggregate_wrong() {
+    let mut complaints: Vec<String> = Vec::new();
+    for (rule, promql) in chart_rules() {
+        for span in promql::summed_spans(&promql) {
+            for name in promql::metric_names_in(&span) {
+                if !cog_core::is_registered_metric(&name) {
+                    continue;
+                }
+                match derivation::metric_derivation(&name) {
+                    Some(derivation::MetricDerivation::Store)
+                        if !promql::deduplicated_over(&span, &name) =>
+                    {
+                        complaints.push(format!(
+                            "{rule} aggregates {name}, which is rendered from the store: \
+                             every process reports the same fact and the aggregate \
+                             multiplies it. Put `max by (...)` (or any one-per-label-set \
+                             operator) between the series and the sum.\n    {promql}"
+                        ));
+                    }
+                    Some(_) => {}
+                    None => complaints.push(format!(
+                        "{rule} aggregates {name} without declaring its derivation. \
+                         Add it to METRIC_DERIVATIONS: `sum` is only an answer once \
+                         someone says whether the value is per-process or from the store.\n    {promql}"
+                    )),
+                }
+            }
+        }
+    }
+
+    assert!(
+        complaints.is_empty(),
+        "这些规则聚合了来历未声明或状态派生的序列:\n{}",
+        complaints.join("\n")
+    );
+}
+
+/// The reverse control for the gate above: the reader has to find the operand
+/// of an aggregation and not the `by (...)` label list next to it, and it has to
+/// tell a deduplicated aggregate from a plain one.
+///
+/// Without this, a reader that returns nothing for every expression would pass
+/// the gate by never complaining — the file it judges currently has no
+/// store-derived aggregate that is also correct, so the green corpus cannot
+/// show the difference.
+#[test]
+fn the_derivation_gate_separates_a_label_list_from_an_operand() {
+    let spans = promql::summed_spans(
+        r#"sum by (tier) (increase(cogneva_change_tier_total[24h])) unless sum(increase(X_total[1h])) > 0"#,
+    );
+    assert_eq!(
+        spans,
+        vec![
+            "increase(cogneva_change_tier_total[24h])".to_string(),
+            "increase(X_total[1h])".to_string(),
+        ]
+    );
+
+    // A plain aggregate over the series: the copies are still being added.
+    assert!(!promql::deduplicated_over(
+        &spans[0],
+        "cogneva_change_tier_total"
+    ));
+    // Reduced to one value per label set first: the outer sum adds facts.
+    assert!(promql::deduplicated_over(
+        "max by (tier) (increase(cogneva_change_tier_total[24h]))",
+        "cogneva_change_tier_total"
+    ));
+    assert!(promql::summed_metric_names("sum(max by (tier) (X_total))").contains("X_total"));
 }

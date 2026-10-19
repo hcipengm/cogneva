@@ -532,6 +532,24 @@
           "summary": "the message queue restarted ({value} times in 1h). A restart is either a planned spec change or an unclean stop of its host; after an unclean stop Redis had a torn AOF tail that the aof-repair init container drops at startup, and the number of bytes given up is published by that container as cogneva_aof_repair_dropped_bytes. pod_restarting_fast only counts fast loops and pod_restarting_repeatedly needs three in 6h, so a single restart shows up nowhere else"
         },
         {
+          "name": "redis_memory_near_limit",
+          "promql": "max by (pod) (cogneva_redis_memory_used_bytes{namespace=\"cogneva\"}) / on(pod) max by (pod) (kube_pod_container_resource_limits{namespace=\"cogneva\", container=\"redis\", resource=\"memory\", unit=\"byte\"})",
+          "condition": {
+            "greater_than": 0.9
+          },
+          "severity": "warning",
+          "summary": "The message queue is holding {value} of the memory limit its container was given. The two sides come from different faces on purpose: the numerator is what Redis accounts for in INFO, which separates a growing dataset from reclaimable page cache, and the denominator is the limit kube-state-metrics reports from the statefulset the chart rendered, so neither side writes 2 GiB into a rule. This rule sits behind container_memory_near_limit rather than in front of it: that rule reads RSS over the same limit at 0.81, and on the live instance the two numerators agree to within 9 MB, so a 0.9 here cannot fire first. It is kept because the readings answer different questions -- RSS is what the kernel cannot reclaim, used_memory is what the store believes it owns, and maxmemory is 0, so the container limit is the only bound -- and when they disagree the gap is the answer; the log side of the same instance is cogneva_redis_wal_max_length against cogneva_redis_wal_keys"
+        },
+        {
+          "name": "redis_info_stale",
+          "promql": "(time() - max by (pod) (cogneva_redis_info_updated_timestamp_seconds{namespace=\"cogneva\"})) > 3 * scalar(max(cogneva_redis_info_interval_seconds{namespace=\"cogneva\"}))",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "The Redis INFO reading is {value} second(s) older than its expected refresh. The sidecar rewrites the textfile each interval; if it dies, loses the password, or the textfile directory goes away, node-exporter keeps serving the last file it got, so every cogneva_redis_* value stays at its last number and reads as healthy. This rule is the one that says the reading stopped, and it asks the reading itself how often it is supposed to move instead of writing a period into the rule. Three intervals, because one missed pass is a slow Redis and not a stopped writer"
+        },
+        {
           "name": "aof_repair_gave_up_bytes",
           "promql": "max without (pod, container, instance) (cogneva_aof_repair_dropped_bytes) > 0",
           "condition": {
@@ -1092,7 +1110,7 @@
         },
         {
           "name": "change_tier_routing_inert",
-          "promql": "sum(increase(cogneva_change_tier_total[24h])) unless sum(increase(cogneva_change_tier_total{tier=\"real_gate\"}[24h])) > 0",
+          "promql": "max(increase(cogneva_change_tier_total[24h])) unless max(increase(cogneva_change_tier_total{tier=\"real_gate\"}[24h])) > 0",
           "condition": {
             "greater_than": 0.0
           },
@@ -1317,7 +1335,7 @@
         },
         {
           "name": "llm_pool_capacity_degraded",
-          "promql": "(sum(llm_upstream_healthy{upstream=~\".+\"}) >= 1) and ((count(llm_upstream_healthy{upstream=~\".+\"}) - sum(llm_upstream_healthy{upstream=~\".+\"})) >= 1)",
+          "promql": "(sum(max by (upstream) (llm_upstream_healthy{upstream=~\".+\"})) >= 1) and ((count(max by (upstream) (llm_upstream_healthy{upstream=~\".+\"})) - sum(max by (upstream) (llm_upstream_healthy{upstream=~\".+\"}))) >= 1)",
           "condition": {
             "greater_than": 0.0
           },
@@ -1479,7 +1497,7 @@
         },
         {
           "name": "memory_raw_backlog_aged_out",
-          "promql": "(max without (pod, container, instance) (max_over_time(memory_unextracted_raw_aged_out[30m]) and ((time() - memory_unextracted_raw_aged_out_observed_timestamp_seconds) < 1800))) > 0 and (sum without (pod, container, instance, operation) (increase(memory_operations_total{operation=\"aged_out_redrive\"}[30m])) == 0) unless on () (max without (operation) (cogneva_memory_pull_gate_holder{operation=~\"pull_gate_local|pull_gate_shared|pull_gate_both\"}) == 1)",
+          "promql": "(max without (pod, container, instance) (max_over_time(memory_unextracted_raw_aged_out[30m]) and ((time() - memory_unextracted_raw_aged_out_observed_timestamp_seconds) < 1800))) > 0 and (max without (pod, container, instance, operation) (increase(memory_operations_total{operation=\"aged_out_redrive\"}[30m])) == 0) unless on () (max without (operation) (cogneva_memory_pull_gate_holder{operation=~\"pull_gate_local|pull_gate_shared|pull_gate_both\"}) == 1)",
           "condition": {
             "greater_than": 0.0
           },
@@ -1497,7 +1515,7 @@
         },
         {
           "name": "memory_discarded_to_dead_letter",
-          "promql": "(sum without (pod, container, instance, operation) (increase(memory_operations_total{operation=\"dlq_written\"}[30m])) > 0)",
+          "promql": "(max without (pod, container, instance, operation) (increase(memory_operations_total{operation=\"dlq_written\"}[30m])) > 0)",
           "condition": {
             "greater_than": 0.0
           },
@@ -1506,7 +1524,7 @@
         },
         {
           "name": "benchmark_payload_refused_by_canary",
-          "promql": "(sum without (pod, container, instance, operation) (increase(memory_operations_total{operation=\"benchmark_canary_refused\"}[30m])) > 0)",
+          "promql": "(max without (pod, container, instance, operation) (increase(memory_operations_total{operation=\"benchmark_canary_refused\"}[30m])) > 0)",
           "condition": {
             "greater_than": 0.0
           },
@@ -2116,7 +2134,7 @@
         },
           {
             "name": "alert_batch_reached_no_outlet",
-            "promql": "sum(increase(cogneva_alert_notifications_total{outcome=\"no_channel\"}[30m]))",
+            "promql": "max(increase(cogneva_alert_notifications_total{outcome=\"no_channel\"}[30m]))",
             "condition": {
               "greater_than": 0.0
             },
