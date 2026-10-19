@@ -48,13 +48,21 @@ tests
 # Scripts (not needed in image)
 scripts
 
-# Deploy configs (not needed in image) —— 但 cog-reflection 在编译期
-# include_str! 了 deploy/overlay-assets.json（overlay 资产表的兜底副本，
-# 见 crates/cog-reflection/src/runtime_assets.rs），整目录排除会让 release
-# 构建直接编译失败。必须写成 deploy/* + 取反：Docker 的忽略规则不允许在
-# **父目录被排除**的情况下重新包含其子文件，排除子项则可以。
+# Deploy configs (not needed in image) —— 但有两处在编译期被 include_str! 读进二进制，
+# 整目录排除会让从构建上下文出发的 release 构建直接编译失败：
+#   deploy/overlay-assets.json                  overlay 资产表的兜底副本
+#                                               （crates/cog-reflection/src/runtime_assets.rs）
+#   deploy/helm/cogneva/files/cogneva.json      已发布配置文档的参照副本
+#                                               （crates/cog-observability/src/config.rs）
+# Docker 的忽略规则不允许在**父目录被排除**的情况下重新包含其子文件，所以第二条要
+# 逐层放行目录再放行文件。哪一处在不在上下文里由 deploy/scripts/check-docker-context.sh
+# 判，不要靠这条注释。
 deploy/*
 !deploy/overlay-assets.json
+!deploy/helm
+!deploy/helm/cogneva
+!deploy/helm/cogneva/files
+!deploy/helm/cogneva/files/cogneva.json
 
 # Local data
 /var/lib/sf-data

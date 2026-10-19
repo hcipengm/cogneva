@@ -155,6 +155,12 @@ COPY crates/ ./crates/
 # lib.rs，碰不到这条 include_str!，放进去只会白废一层缓存。
 COPY deploy/overlay-assets.json ./deploy/
 
+# 同一类：已发布配置文档的参照副本，被 cog-observability 的 include_str! 编进二进制。
+# 少了这一行，从构建上下文出发的编译在 cog-observability 直接失败——而开发树与
+# 本机发布用的是整棵树，看不见这条。哪些文件必须在这里，由
+# deploy/scripts/check-docker-context.sh 判。
+COPY deploy/helm/cogneva/files/cogneva.json ./deploy/helm/cogneva/files/
+
 # Touch source files to invalidate cached object files only
 RUN touch crates/*/src/lib.rs crates/*/src/main.rs 2>/dev/null || true
 

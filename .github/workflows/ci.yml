@@ -418,6 +418,12 @@ jobs:
       # 是个死指针。判的是反引号括起来、带扩展名的串（口径见脚本头部）。
       - name: Check README paths exist
         run: bash deploy/scripts/check-readme-paths.sh
+      # 编译期内嵌的文件必须真的在镜像构建上下文里。这条失败只在 tag 发版的镜像
+      # job 上现形：从开发树（以及本机发布脚本）编永远看得见那些文件，
+      # `.dockerignore` 却把它们挡在上下文之外。2026-10-19 实测它静默红了一个多月，
+      # 期间没有一次普通推送会走到那条路上——所以判据要挪到每一次推送都跑的地方。
+      - name: Check the image build context carries embedded files
+        run: bash deploy/scripts/check-docker-context.sh
       # 提交信息不得带 AI 署名。署名在 message 里，diff 与评审都看不见，推出去之后
       # 唯一的修法是重写 history——所以判的是**本次推送新增的提交**，不是整部 history：
       # 整部扫一次等于「第一次失手之后永久红」，而永久红的门最后会被删掉。
