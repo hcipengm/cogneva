@@ -83,3 +83,112 @@ pub use system_harness::{
 pub use trend::{
     render_ablation_stacked_bar, render_trend_chart, ConvergenceAnalysis, TrendPoint, TrendReport,
 };
+
+#[cfg(test)]
+mod failure_reading_carries_the_criterion_value {
+    //! principle: feedback_failure_reading_must_carry_the_value
+    //!
+    //! 失败读数（CI 注解/告警/日志）必须带上判据比较的值，只有位置时同一次失败的不同
+    //! 分支不可分。
+    //!
+    //! One range criterion is checked at one position and has two failure
+    //! branches: the observed value fell below the lower bound, or rose above
+    //! the upper one. A reading printing only the position emits the same line
+    //! for both, so a reader of the CI annotation cannot tell which branch
+    //! failed. The gate pins the renderer's contract: the reading carries the
+    //! compared value and the bound it was judged against, and the two branches
+    //! are separable by that line alone.
+
+    /// A single criterion comparison at one fixed position.
+    ///
+    /// Both branches carry the *same* location by construction: location is the
+    /// one thing that does not separate them.
+    enum Branch {
+        Below { observed: f64, bound: f64 },
+        Above { observed: f64, bound: f64 },
+    }
+
+    const LOCATION: &str = "crates/cog-eval/src/harness.rs:96";
+
+    impl Branch {
+        /// The CI annotation/log line a reader gets when this branch fails.
+        ///
+        /// The comparison is rendered, not just the verdict: `observed <op>
+        /// bound` is the value the criterion compared, and it is the only part
+        /// of the line that differs between the two branches.
+        fn render_failure(self) -> String {
+            match self {
+                Branch::Below { observed, bound } => {
+                    format!("{LOCATION}: criterion failed: {observed:.1} < {bound:.1}")
+                }
+                Branch::Above { observed, bound } => {
+                    format!("{LOCATION}: criterion failed: {observed:.1} > {bound:.1}")
+                }
+            }
+        }
+    }
+
+    /// The position half of a failure line -- everything before the compared
+    /// value. It is the whole reading a location-only annotation would carry.
+    fn position_head(line: &str) -> &str {
+        line.split_once(": criterion failed: ")
+            .map(|(head, _)| head)
+            .expect("a failure line has to carry its criterion comparison")
+    }
+
+    /// The gate: two failure branches at one position are separable only by the
+    /// value the criterion compared.
+    #[test]
+    fn two_failure_branches_at_one_position_carry_distinct_compared_values() {
+        let below = Branch::Below {
+            observed: 70.0,
+            bound: 85.0,
+        };
+        let above = Branch::Above {
+            observed: 92.0,
+            bound: 90.0,
+        };
+
+        let low_line = below.render_failure();
+        let high_line = above.render_failure();
+
+        // Control: the two branches genuinely share one position. Without this,
+        // the separation below could be carried by two different locations.
+        assert_eq!(position_head(&low_line), LOCATION);
+        assert_eq!(position_head(&high_line), LOCATION);
+
+        assert_ne!(
+            low_line, high_line,
+            "both branches fail at {LOCATION}, so a reading that dropped the \
+             compared value could not name which one failed"
+        );
+
+        // Each line carries its own branch's compared value and the bound it
+        // was judged against, and never the other branch's value.
+        assert!(low_line.contains("70.0 < 85.0"), "{low_line}");
+        assert!(high_line.contains("92.0 > 90.0"), "{high_line}");
+        assert!(!low_line.contains("92.0"), "{low_line}");
+        assert!(!high_line.contains("70.0"), "{high_line}");
+    }
+
+    /// The rejected shape, witnessed directly: a location-only renderer emits
+    /// one identical reading for the two different failures.
+    #[test]
+    fn a_location_only_reading_collapses_the_two_branches() {
+        let location_only = |_: Branch| format!("{LOCATION}: criterion failed");
+        let below = Branch::Below {
+            observed: 70.0,
+            bound: 85.0,
+        };
+        let above = Branch::Above {
+            observed: 92.0,
+            bound: 90.0,
+        };
+        assert_eq!(
+            location_only(below),
+            location_only(above),
+            "without the compared value the below and above branches are the same \
+             annotation -- the indistinguishability the rule forbids"
+        );
+    }
+}
