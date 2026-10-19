@@ -1506,6 +1506,20 @@ fn render(args: &EvalTableArgs, wiring: WiringReport<'_>, readings: Readings<'_>
         out.push_str(&pool.wiring_line());
         out.push('\n');
     }
+    // 调用侧在拒绝之后等多久，也排在 `missing` 之前：它同样是**先于题目**发生的那件事。
+    // 只印界不印次数，「装了退避」与「退避从没咬合过」在产物上同形；只印次数不印界，
+    // 读的人没法判断那次等待是撞上了多长的一界。没跑过评测台的旧表印未知，不印 0。
+    out.push_str("refusal-backoff\t");
+    match &table.backoff {
+        Some(b) => out.push_str(&format!(
+            "attempts-per-minute={}\tunstated-wait-secs={}\trefusals={}\twaited-secs={}\n",
+            b.attempts_per_minute, b.default_wait_secs, b.refusals, b.waited_secs
+        )),
+        None => out.push_str(
+            "unknown: this table was not produced by the eval rig, so the caller-side wait is \
+             not recorded here\n",
+        ),
+    }
     if wiring.missing.is_empty() {
         out.push_str("complete\n");
     } else {
@@ -2299,6 +2313,7 @@ mod tests {
             wanted_seeds: 3,
             unreadable: vec![],
             gate: None,
+            backoff: None,
             // 这一列自己的隔离上界：hle 各例不共享状态，所以它不加界。
             column_ceilings: vec![("hle".into(), None)],
         }
@@ -3033,6 +3048,7 @@ mod tests {
             wanted_seeds: 1,
             unreadable: vec![],
             gate: None,
+            backoff: None,
             column_ceilings: vec![("hle".into(), None), ("swe-bench-pro".into(), None)],
         }
     }
@@ -3057,6 +3073,37 @@ mod tests {
                 table,
             },
         )
+    }
+
+    /// 调用侧的退避界与咬合次数要随表出：只印界，「装了退避」与「退避从没咬合过」
+    /// 在产物上同形；没跑过评测台的表印未知，**不许印 0**——0 读作「不用等」。
+    #[test]
+    fn the_caller_side_wait_is_printed_with_its_bound_and_how_often_it_bit() {
+        let mut table = table_with_cells();
+        table.backoff = Some(cog_eval::backoff::BackoffReading {
+            attempts_per_minute: 600,
+            default_wait_secs: 1,
+            refusals: 7,
+            waited_secs: 42,
+        });
+        let text = render_with(&table, &[]);
+        assert!(
+            text.contains(
+                "refusal-backoff\tattempts-per-minute=600\tunstated-wait-secs=1\trefusals=7\twaited-secs=42\n"
+            ),
+            "wiring must carry the bound and how often it bit:\n{text}"
+        );
+
+        table.backoff = None;
+        let text = render_with(&table, &[]);
+        assert!(
+            text.contains("refusal-backoff\tunknown:"),
+            "a table not produced by the rig must say unknown, not zero:\n{text}"
+        );
+        assert!(
+            !text.contains("refusal-backoff\tattempts-per-minute=0"),
+            "zero would read as «no wait is needed»:\n{text}"
+        );
     }
 
     /// 声明过的缺席**不许**再在它盖住的那一格上印 `errored>0`；没被点名的格子**必须**照印。

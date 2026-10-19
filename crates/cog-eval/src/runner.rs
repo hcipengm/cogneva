@@ -98,7 +98,7 @@ async fn run_single_case(
     let mut output = serde_json::Value::Null;
     let mut tool_calls: Vec<String> = vec![];
 
-    for _ in 0..=config.retry_count {
+    for attempt in 0..=config.retry_count {
         match tokio::time::timeout(
             std::time::Duration::from_secs(config.timeout_seconds),
             async {
@@ -125,6 +125,13 @@ async fn run_single_case(
             Err(_) => {
                 last_error = Some("Timeout".into());
             }
+        }
+        // 失败之后不许立刻再发：紧循环重试会把一个上游拒绝放大成一场风暴
+        // （2026-10-19T01:23Z 实测一分钟 455 条，客户端没有任何间隔）。
+        // 读得到「下次几点再来」就按它等；读不到也有一个有界的下限，
+        // 「没说等多久」不等于「可以立刻再试」。
+        if attempt < config.retry_count {
+            tokio::time::sleep(retry_wait(last_error.as_deref())).await;
         }
     }
 
@@ -441,5 +448,44 @@ async fn judge_subjective(
             tracing::warn!(metric = %metric.name(), error = %e, "LLM Judge failed, falling back to heuristic");
             None
         }
+    }
+}
+
+/// 一次失败之后到下一次尝试之间等多久。
+///
+/// 错误在这里已经被压成字符串（它离开了产生它的那一层），所以提示要从渲染里读回来；
+/// 读不到就用一个有界下限——超时、`Timeout`、没有任何原因的错误都不是
+/// 「可以立刻再试」，它们只是没说等多久。
+fn retry_wait(last_error: Option<&str>) -> std::time::Duration {
+    last_error
+        .and_then(cog_core::contract::llm::retry_after_hint_in)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(crate::backoff::DEFAULT_REFUSAL_BACKOFF)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stated_wait_is_honoured_and_an_unstated_one_is_bounded() {
+        let stated = format!(
+            "503 refused {}",
+            cog_core::contract::llm::render_retry_after(42)
+        );
+        assert_eq!(
+            retry_wait(Some(&stated)),
+            std::time::Duration::from_secs(42)
+        );
+        assert_eq!(
+            retry_wait(Some("Timeout")),
+            crate::backoff::DEFAULT_REFUSAL_BACKOFF
+        );
+        assert_eq!(retry_wait(None), crate::backoff::DEFAULT_REFUSAL_BACKOFF);
+        assert_ne!(
+            retry_wait(Some("Timeout")),
+            std::time::Duration::ZERO,
+            "an unstated wait must not be a zero-length one"
+        );
     }
 }

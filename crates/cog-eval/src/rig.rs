@@ -13,6 +13,7 @@ use std::time::Instant;
 use cog_core::LlmClient;
 use tokio::sync::Semaphore;
 
+use crate::backoff::{BackoffLlm, BackoffReading, RefusalBackoff, ATTEMPTS_PER_MINUTE};
 use crate::bench::Benchmark;
 use crate::dataset::EvalCase;
 use crate::scaffold::{AgentScaffold, SolveContext};
@@ -456,6 +457,13 @@ pub struct Table {
     /// 分得开。
     #[serde(default)]
     pub gate: Option<cog_core::admission::GateReading>,
+    /// 调用侧的退避界，以及它在这一跑里咬合了多少次。
+    ///
+    /// 与 `gate` 同理，随表一起出：读的人要能从同一份产物里看到「这一跑有没有在拒绝
+    /// 之后立刻重试」，而不是从别处的常量猜。`None` ＝这条表不是 [`crate::rig::Rig`]
+    /// 跑的（旧检查点、或别处构造的表）。
+    #[serde(default)]
+    pub backoff: Option<crate::backoff::BackoffReading>,
     /// 每一列的隔离上界（基准名，上界）。`None` ＝这一列的例环境彼此隔离，这一列自己不设上界。
     ///
     /// 有效并发是三个因子取小，其中闸门的界与静态名额都在报表里单列着，只有这一项长在
@@ -545,14 +553,20 @@ struct Ticket {
 /// 运行器。
 pub struct Rig {
     llm: Arc<dyn LlmClient>,
+    /// 调用侧的退避。外壳内部每一次上游调用都过它——调用点在外面看不到那些调用，
+    /// 只有在客户端这一层才能让「拒绝之后的下一次」真的等到上游说的时刻。
+    backoff: Arc<RefusalBackoff>,
     scaffolds: Vec<Arc<dyn AgentScaffold>>,
     config: RunConfig,
 }
 
 impl Rig {
     pub fn new(llm: Arc<dyn LlmClient>, config: RunConfig) -> Self {
+        let backoff = Arc::new(RefusalBackoff::new(ATTEMPTS_PER_MINUTE));
+        let llm: Arc<dyn LlmClient> = Arc::new(BackoffLlm::new(llm, backoff.clone()));
         Self {
             llm,
+            backoff,
             scaffolds: Vec::new(),
             config,
         }
@@ -571,6 +585,11 @@ impl Rig {
 
     pub fn data_root(&self) -> &std::path::Path {
         &self.config.data_root
+    }
+
+    /// 这一跑的调用侧退避界与咬合次数。报表与 `## wiring` 用它把「当时装了什么」写进产物。
+    pub fn backoff_reading(&self) -> BackoffReading {
+        self.backoff.reading()
     }
 
     /// 跑整张表。
@@ -659,6 +678,7 @@ impl Rig {
             wanted_seeds: self.config.seeds.len(),
             unreadable,
             gate: self.config.admission.as_ref().map(|g| g.reading()),
+            backoff: Some(self.backoff_reading()),
             column_ceilings: benchmarks
                 .iter()
                 .map(|b| (b.name.clone(), b.column_ceiling))
