@@ -62,6 +62,13 @@
 //! sit unheld behind a row that looks renewed. So the holder is a pod name, or
 //! the pid where there is no pod — volatile by construction, which is what the
 //! takeover needs.
+//!
+//! principle: feedback_a_claim_needs_a_lifetime_and_that_lifetime_needs_a_reader
+//!
+//! Gate: a claim on work already handed out lands only with a bounded lifetime,
+//! and the same hold that renews that lifetime is the reader that reclaims it on
+//! drop; the test that carries this principle is
+//! `a_claim_and_its_lifetime_land_together_and_are_reclaimed_together`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -541,6 +548,61 @@ mod tests {
             *lease.asked.lock().unwrap(),
             settled,
             "the renewal task must stop when the hold is dropped"
+        );
+    }
+
+    /// A claim on work already handed out exists only while its bounded
+    /// lifetime is renewed for it, and the object carrying the lifetime is the
+    /// reader that reclaims it: the paired path renews while alive and stops the
+    /// moment the hold is dropped. Either half alone is the failure the rule
+    /// names — a claim with no renewing lifetime expires under long-running
+    /// work, and a lifetime with no reclaiming drop keeps a dead process's term
+    /// alive so the work it already read stays blocked until a repeated dispatch
+    /// re-drives it.
+    #[tokio::test]
+    async fn a_claim_and_its_lifetime_land_together_and_are_reclaimed_together() {
+        let beat = beat_for("claim_with_lifetime");
+        let lease = answering(false);
+        let hold = holding(Arc::clone(&lease), &beat, Duration::from_millis(5));
+
+        // The work is already held elsewhere: a fresh claim on it must not act.
+        assert!(
+            !hold.may_act().await,
+            "work handed out to another holder is not this process's to do"
+        );
+
+        // The lifetime lands with the claim and is renewed by the hold itself,
+        // on the lease's cadence rather than the loop's: renewals landing while
+        // the loop never asks are the paired lifetime.
+        lease.held.store(true, Ordering::Relaxed);
+        let mut asks = 0;
+        for _ in 0..400 {
+            asks = *lease.asked.lock().unwrap();
+            if asks >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            asks >= 3,
+            "the claim has no lifetime: nothing renewed its term while the work ran"
+        );
+        assert!(
+            hold.may_act().await,
+            "the paired claim and lifetime hold the role once it is free"
+        );
+
+        // The same hold is the reader that reclaims: dropped, the renewals stop
+        // and the term is left to expire instead of being held by a process that
+        // no longer acts — the read-but-unreclaimed blockage the rule forbids.
+        drop(hold);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let settled = *lease.asked.lock().unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            *lease.asked.lock().unwrap(),
+            settled,
+            "the lifetime outlived the claim: a dropped hold kept renewing a term nobody acts on"
         );
     }
 }
