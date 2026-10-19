@@ -674,11 +674,14 @@ pub async fn import_face(
         updated.spec.revision = current.revision();
         updated
     };
-    merged.updated_at = Utc::now();
 
+    // Compare before stamping: `Face` equality includes `updated_at`, so a
+    // timestamp written first would make this branch unreachable and turn every
+    // idempotent import into a write.
     if merged == current {
         return Ok(FaceImportOutcome::Unchanged);
     }
+    merged.updated_at = Utc::now();
 
     let wrote = store
         .save_face_node_if_revision(&merged.to_task(None), current.revision())

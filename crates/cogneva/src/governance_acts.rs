@@ -1234,23 +1234,34 @@ mod tests {
     #[async_trait::async_trait]
     impl cog_core::GovernanceStore for MemoryStore {
         async fn face_nodes(&self) -> cog_core::SFResult<Vec<cog_core::Task>> {
-            Ok(Vec::new())
+            Ok(self.of_type(cog_core::FACE_TASK_TYPE))
         }
 
         async fn open_face_bound_tasks(&self) -> cog_core::SFResult<Vec<cog_core::Task>> {
             Ok(Vec::new())
         }
 
-        async fn save_face_node(&self, _task: &cog_core::Task) -> cog_core::SFResult<()> {
-            Ok(())
+        async fn save_face_node(&self, task: &cog_core::Task) -> cog_core::SFResult<()> {
+            self.save_governance_node(task).await
         }
 
         async fn save_face_node_if_revision(
             &self,
-            _task: &cog_core::Task,
-            _expected: i64,
+            task: &cog_core::Task,
+            expected: i64,
         ) -> cog_core::SFResult<bool> {
-            Ok(false)
+            let mut rows = self.rows.lock().unwrap();
+            match rows.iter_mut().find(|row| row.id == task.id) {
+                Some(row)
+                    if cog_core::Face::from_task(row)
+                        .map(|face| face.revision() == expected)
+                        .unwrap_or(false) =>
+                {
+                    *row = task.clone();
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
         }
 
         async fn governance_nodes(
@@ -1647,6 +1658,31 @@ mod tests {
             now,
         });
         assert_eq!(reading.state, cog_core::DriftState::OnTarget);
+    }
+
+    // Importing the same roster row twice must be a no-op that says so. The
+    // `Unchanged` outcome is what a caller uses to report "nothing moved"; if
+    // the timestamp were stamped before the comparison, every import would
+    // write and the promise would only hold in effect, never in the answer.
+    #[tokio::test]
+    async fn importing_the_same_row_twice_is_unchanged_and_writes_nothing() {
+        let store = MemoryStore::new();
+        let now = Utc::now();
+        let face = |at| cog_core::Face {
+            face_id: "face".into(),
+            owner_unit: Some("b4".into()),
+            bound_by_handover_id: None,
+            spec: cog_core::FaceSpec::first("face", cog_core::FaceKind::Face),
+            updated_at: at,
+        };
+
+        let first = cog_core::import_face(&store, &face(now)).await.unwrap();
+        assert_eq!(first, cog_core::FaceImportOutcome::Inserted);
+        let before = store.row("face").updated_at;
+
+        let again = cog_core::import_face(&store, &face(now)).await.unwrap();
+        assert_eq!(again, cog_core::FaceImportOutcome::Unchanged);
+        assert_eq!(store.row("face").updated_at, before);
     }
 
     #[tokio::test]
