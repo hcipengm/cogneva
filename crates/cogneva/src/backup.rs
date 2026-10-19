@@ -3097,7 +3097,7 @@ fn replace_dir(staged: &Path, live: &Path) -> std::io::Result<()> {
 pub const DRILL_DATABASE: &str = "cog_drill";
 
 /// 演练互斥锁的键。取自 `cog_dril` 的 ASCII，只要求集群内不与人撞车，不承担含义。
-const DRILL_LOCK_KEY: i64 = 0x636f67_5f64_7269_6c;
+const DRILL_LOCK_KEY: i64 = 0x636f_675f_6472_696c;
 
 /// 演练配置。只要库、卷与迁移目录。
 ///
@@ -3515,7 +3515,9 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
 /// 返回的连接必须活到这一跑结束：锁挂在会话上，会话结束锁才释放。用一条**池外**的
 /// 独立连接而不是池里借来的：池里的会话被归还后仍活着，锁会跟着它留给下一个借用者，
 /// 而这一跑的每一条提前返回（某一份包失败就停）都不该需要记得手动释放。
-async fn claim_drill_lock(database_url: &str) -> Result<Option<sqlx::PgConnection>, sqlx::Error> {
+pub async fn claim_drill_lock(
+    database_url: &str,
+) -> Result<Option<sqlx::PgConnection>, sqlx::Error> {
     use sqlx::Connection as _;
     let mut conn = sqlx::PgConnection::connect(database_url).await?;
     let held: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
@@ -4217,28 +4219,6 @@ mod tests {
             .unwrap()
             .expect("包是密文、这一跑没口令，演练必须拒绝判绿");
         assert!(reason.contains("密文"), "reason={reason}");
-    }
-
-    #[tokio::test]
-    #[ignore = "需要真库：COGNEVA_TEST_DATABASE_URL"]
-    async fn two_drills_at_once_do_not_drop_each_others_database() {
-        // 这条问的是 2026-10-19 那场互杀：两场演练同用一个固定库名，后一场的
-        // DROP DATABASE 把前一场杀掉并判 failed。锁要在库里问，不能靠部署里约定。
-        let url = std::env::var("COGNEVA_TEST_DATABASE_URL").expect("COGNEVA_TEST_DATABASE_URL");
-        use sqlx::Connection as _;
-        let first = claim_drill_lock(&url)
-            .await
-            .unwrap()
-            .expect("第一场应当拿到锁");
-        assert!(
-            claim_drill_lock(&url).await.unwrap().is_none(),
-            "第二场必须被拒绝：拿到锁它就会 DROP 掉第一场正在恢复的那个库"
-        );
-        first.close().await.unwrap();
-        assert!(
-            claim_drill_lock(&url).await.unwrap().is_some(),
-            "第一场的会话关掉之后锁必须能再取到，否则一次崩溃会让演练永远开不了工"
-        );
     }
 
     #[test]

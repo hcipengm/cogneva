@@ -23,7 +23,7 @@
 
 use sqlx::PgPool;
 
-use cogneva::backup::{backup_postgres, discover_tables, restore_postgres};
+use cogneva::backup::{backup_postgres, claim_drill_lock, discover_tables, restore_postgres};
 
 fn database_url() -> String {
     std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
@@ -453,5 +453,33 @@ async fn pg_a_drill_row_keeps_the_columns_the_target_recomputed() {
         read.offsite_missing_packages,
         Some(3),
         "窗口里没有卷外副本的包数没有原样回来"
+    );
+}
+
+/// Two drills must not drop each other's database.
+///
+/// The drill's throwaway database name is fixed, so a second drill starting while
+/// the first is running `DROP DATABASE`s the very database the first one is
+/// restoring into -- on 2026-10-19 a drill that began at 17:27 was killed by one
+/// that began at 17:35 and recorded as `failed`, a verdict about the schedule
+/// rather than about the package. The exclusion has to be asked of the database,
+/// because a deployment convention cannot be checked.
+#[tokio::test]
+#[ignore = "needs a live database: COGNEVA_TEST_DATABASE_URL"]
+async fn two_drills_at_once_do_not_drop_each_others_database() {
+    let url = std::env::var("COGNEVA_TEST_DATABASE_URL").expect("COGNEVA_TEST_DATABASE_URL");
+    use sqlx::Connection as _;
+    let first = claim_drill_lock(&url)
+        .await
+        .unwrap()
+        .expect("第一场应当拿到锁");
+    assert!(
+        claim_drill_lock(&url).await.unwrap().is_none(),
+        "第二场必须被拒绝：拿到锁它就会 DROP 掉第一场正在恢复的那个库"
+    );
+    first.close().await.unwrap();
+    assert!(
+        claim_drill_lock(&url).await.unwrap().is_some(),
+        "第一场的会话关掉之后锁必须能再取到，否则一次崩溃会让演练永远开不了工"
     );
 }
