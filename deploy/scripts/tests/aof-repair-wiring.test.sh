@@ -147,23 +147,32 @@ def check_workload(doc, origin):
         return bad
 
     # Link three: something serves that directory as Prometheus textfiles.
+    #
+    # A mount is not a role. The sidecar that writes the Redis readings lives in
+    # the same directory as the verdict, and a writer is not a server: judging
+    # every mount as one made the pair undecidable, since the writer can never
+    # satisfy the server's half. Classify by the flag that does the serving --
+    # what this link is for is that *nobody* serves the directory, not that
+    # somebody else writes into it.
+    def serves(c):
+        return (
+            f"--collector.textfile.directory={report_dir}"
+            in " ".join(str(a) for a in (c.get("args") or [])) + " " + command_of(c)
+        )
+
     servers = [
         (name, c)
         for name, c in containers.items()
         if name != REDIS_CONTAINER
         and any(m.get("mountPath") == report_dir for m in c.get("volumeMounts", []))
+        and serves(c)
     ]
     if not servers:
         bad.append(
-            f"{origin}: nothing beside {INIT_NAME} mounts {report_dir}, so the verdict is "
-            "written where no scraper can read it"
+            f"{origin}: nothing beside {INIT_NAME} serves {report_dir} as a textfile directory, "
+            "so the verdict is written where no scraper can read it"
         )
     for name, c in servers:
-        served = " ".join(str(a) for a in (c.get("args") or [])) + " " + command_of(c)
-        if f"--collector.textfile.directory={report_dir}" not in served:
-            bad.append(
-                f"{origin}: {name} mounts {report_dir} but does not serve it as a textfile directory"
-            )
         ports = {p.get("name") for p in c.get("ports", []) if p.get("name")}
         if not ports:
             bad.append(f"{origin}: {name} declares no named port, so there is nothing to scrape")
@@ -294,6 +303,9 @@ spec:
           args: ["--collector.textfile.directory=/report"]
           ports: [{name: textfile, containerPort: 9100}]
           volumeMounts: [{name: report, mountPath: /report}]
+        - name: readings-writer
+          command: [sh, -c, "while true; do echo x > /report/readings.prom; sleep 30; done"]
+          volumeMounts: [{name: report, mountPath: /report}]
 """
 clean = check_workload(yaml.safe_load(GOOD), "control")
 if clean:
@@ -310,9 +322,9 @@ MUTATIONS = [
     ("if [ ! -s \"$report\" ]; then", "if false; then",
      "cannot state that it published nothing"),
     ("          volumeMounts: [{name: report, mountPath: /report}]\n", "",
-     "nothing beside aof-repair mounts /report"),
+     "nothing beside aof-repair serves /report"),
     ("args: [\"--collector.textfile.directory=/report\"]", "args: []",
-     "does not serve it as a textfile directory"),
+     "nothing beside aof-repair serves /report"),
     ("ports: [{name: textfile, containerPort: 9100}]", "",
      "declares no named port"),
 ]
