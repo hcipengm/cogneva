@@ -1561,6 +1561,13 @@ struct CiVerdictRecord {
     /// 判词是 `pass` 而这里带着另一端的 `no_runs`——两件都是事实，别把非空读成「没判过」。
     #[serde(default)]
     reasons: Vec<String>,
+    /// 报失败的那几条检查的名字，形如 `<platform>:<check name>`，与日志里那一行同形。
+    ///
+    /// `verdict` 说「红」，这一格说「红在哪」：没有它，读状态文件的人只知道要回去问
+    /// 上游，而失败名在这一次读里本来就有。空列表有两种来源——判词不是 `fail`，或者
+    /// 结论来自提交状态兜底（那个接口不逐条给名字），后者不等于「没有失败项」。
+    #[serde(default)]
+    failed_checks: Vec<String>,
     /// 做出这个判词的时刻，unix 秒。
     #[serde(default)]
     decided_unix: i64,
@@ -2984,7 +2991,7 @@ impl MainlineDeployer {
         rev: &str,
     ) -> SFResult<bool> {
         let (verdict, failed_checks, reasons) = self.ci_verdict_with_failures(rev).await;
-        self.record_ci_verdict_in_state(state, rev, verdict, reasons)?;
+        self.record_ci_verdict_in_state(state, rev, verdict, reasons, failed_checks.clone())?;
         if verdict != Some(false) {
             self.record_ci_hold_reading(0).await;
             return Ok(false);
@@ -3093,16 +3100,19 @@ impl MainlineDeployer {
         rev: &str,
         verdict: Option<bool>,
         reasons: Vec<String>,
+        failed_checks: Vec<String>,
     ) -> SFResult<()> {
         let slug = match verdict {
             Some(true) => "pass",
             Some(false) => "fail",
             None => "no_evidence",
         };
-        let unchanged = state
-            .last_ci_verdict
-            .as_ref()
-            .is_some_and(|r| r.rev == rev && r.verdict == slug && r.reasons == reasons);
+        let unchanged = state.last_ci_verdict.as_ref().is_some_and(|r| {
+            r.rev == rev
+                && r.verdict == slug
+                && r.reasons == reasons
+                && r.failed_checks == failed_checks
+        });
         if unchanged {
             return Ok(());
         }
@@ -3110,6 +3120,7 @@ impl MainlineDeployer {
             rev: rev.to_string(),
             verdict: slug.to_string(),
             reasons,
+            failed_checks,
             decided_unix: chrono::Utc::now().timestamp(),
         });
         self.save_state(state)
@@ -9167,6 +9178,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             rev: "aaaa1111bbbb".into(),
             verdict: v.into(),
             reasons: vec!["github:pending".into()],
+            failed_checks: Vec::new(),
             decided_unix: 190,
         };
 
@@ -9592,8 +9604,9 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             buildah_store_unix: 0,
             last_ci_verdict: Some(CiVerdictRecord {
                 rev: "bb".into(),
-                verdict: "no_evidence".into(),
+                verdict: "fail".into(),
                 reasons: vec!["github:connect_failed".into()],
+                failed_checks: vec!["github:Test".into()],
                 decided_unix: 1234,
             }),
             last_good_unix: 1700000000,
@@ -11347,6 +11360,39 @@ exit 0
             "连不上要留下原因，记到的是 {:?}",
             recorded.reasons
         );
+    }
+
+    /// 判红要写「红在哪」：失败检查名在这一次读里本来就有，不落盘等于把它丢掉。
+    ///
+    /// 只有 `verdict` 那一格时，看状态文件的人知道被扣住了，却不知道是 Test、Clippy
+    /// 还是 Coverage——只能回到上游一条条问。名字与日志里那一行同形（带平台前缀），
+    /// 因为它与日志出自同一次读取。
+    #[tokio::test]
+    async fn a_failed_verdict_on_disk_names_the_checks_that_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (endpoint, handle) = fake_registry(vec![http_200(
+            r#"{"check_runs":[{"name":"Test","conclusion":"failure"},{"name":"Clippy","conclusion":"success"}]}"#,
+        )])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+
+        let mut state = deployer.load_state();
+        assert!(deployer
+            .hold_if_ci_reports_failure(&mut state, "abc123")
+            .await
+            .unwrap());
+        let recorded = deployer.load_state().last_ci_verdict.expect("判红要留判词");
+        assert_eq!(recorded.verdict, "fail");
+        assert_eq!(
+            recorded.failed_checks,
+            vec!["github:Test".to_string()],
+            "失败检查名要跟着判词落盘，且只带报失败的那几条"
+        );
+        handle.await.unwrap();
     }
 
     /// 三支判定各自留下的是哪一支。
